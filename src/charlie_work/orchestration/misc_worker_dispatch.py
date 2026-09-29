@@ -157,15 +157,33 @@ def _route_phantom_live_worker(
             ),
             now=datetime.now(UTC),
         )
-        # FLIP 1: legacy preserves on the raw local `ahead_count` or the bare
-        # self-reported push claim regardless of what `fate` resolves to --
-        # e.g. a fresh `blocked` declaration with local commits still
-        # present resolves to `fate=Blocked` here (row 1 beats everything),
-        # not `Stranded`, yet legacy's unconditioned `ahead_count > 0` still
-        # preserves the sidecar for salvage either way. Rule 1/2 would gate
-        # this on freshness and let a blocked declaration route separately
-        # instead of folding it into the same preserve-for-salvage check.
-        if inspection.ahead_count > 0 or reported_push:
+        # Rule 1/2 (design doc §8, step B5): preserve for salvage when the
+        # resolved fate is `Stranded` (local-only commits) -- a fresh
+        # `blocked` declaration now resolves to `fate=Blocked` (rule 2:
+        # fresh blocked beats push flags) and no longer gets folded into
+        # the salvage-preserve branch just because local commits or a push
+        # claim are also present.
+        #
+        # `PushedWithoutPr` is named alongside `Stranded` for the case it
+        # can prove, but `_is_pushed` (row 2/3) needs `branch.remote_ahead`
+        # or a matching `remote_head_sha` to confirm a push, and neither is
+        # ever populated here -- this call site deliberately does no
+        # remote read at dispatch time (see the evidence-construction
+        # comment above), so `resolve_fate` alone can never *return*
+        # `PushedWithoutPr`/`Completed` from this evidence shape; an
+        # unconfirmable, fresh, self-reported push falls through to
+        # `Crashed` (row 10) instead. `fate.basis.outcome` still carries
+        # the rule-1-freshness-gated winning candidate regardless of which
+        # row picked it, so `declared_push` reads the same self-reported
+        # claim the legacy `reported_push` check trusted directly, gated
+        # on rule 1 instead of trusted unconditionally.
+        fresh_outcome = fate.basis.outcome
+        declared_push = (
+            fresh_outcome is not None
+            and fresh_outcome.push_succeeded is True
+            and fresh_outcome.pr_created is not True
+        )
+        if isinstance(fate, (worker_fate.Stranded, worker_fate.PushedWithoutPr)) or declared_push:
             # Preserve the sidecar so the reaper lane can salvage. Do NOT
             # strip labels -- the issue should stay in its active state
             # until salvage moves it to pr_open, preventing re-dispatch

@@ -273,6 +273,72 @@ def fresh_completed_worker_outcome(
     return None
 
 
+def blocked_worker_outcome(
+    worktree_path: Path | None,
+    *,
+    dispatched_at: datetime | None,
+) -> dict[str, Any] | None:
+    """Return a worktree ``.worker-outcome.json`` that proves a dead worker
+    declared itself blocked (rule 2, wf-design.md §9: FLIP 2).
+
+    Sibling to ``fresh_completed_worker_outcome`` above, same freshness
+    contract (``written_at`` must postdate ``dispatched_at``) and the same
+    single-read shape -- deliberately not sharing its ``resolve_fate`` call:
+    the two functions answer different questions for different callers
+    (``handle_dead_worker_completed_outcome`` already returns ``bool``, not
+    a fate, and threading one back out is a larger seam change than this
+    flip needs), and both fail safe to ``None`` on any missing/stale/
+    unreadable outcome. No live-head/remote data is available at this call
+    site either, so -- as in the sibling -- rule 2's ``Blocked`` fate is
+    reachable without it (it only depends on the outcome's own freshness
+    and declared kind, never on branch/PR evidence).
+
+    Distinguishing a fresh ``blocked`` declaration from "no evidence at
+    all" lets the caller escalate it instead of silently folding it into
+    the same ``rework_requested`` reset a genuinely silent death gets.
+    """
+    if worktree_path is None or dispatched_at is None:
+        return None
+    try:
+        outcome_mtime = datetime.fromtimestamp(
+            (worktree_path / WORKER_OUTCOME_FILENAME).stat().st_mtime, tz=UTC
+        )
+    except OSError:
+        return None
+    outcome_evidence = _outcome_evidence(
+        read_worker_outcome(worktree_path),
+        source=worker_fate.EvidenceSource.WORKTREE,
+        written_at=outcome_mtime,
+    )
+    if outcome_evidence is None:
+        return None
+
+    fate = worker_fate.resolve_fate(
+        worker_fate.FateEvidence(
+            issue_number=0,  # not carried by this function's signature; unused by resolve_fate
+            adapter="unknown",
+            dispatched_at=dispatched_at,
+            pid_alive=False,
+            health=None,
+            terminal=None,
+            worktree_outcome=outcome_evidence,
+            branch=worker_fate.BranchEvidence(
+                has_remote=True,
+                remote_head_sha=None,
+                remote_ahead=None,
+                unpushed=None,
+                open_pr_number=None,
+                pr_known=False,
+            ),
+            failure=None,
+        ),
+        now=datetime.now(UTC),
+    )
+    if isinstance(fate, worker_fate.Blocked) and fate.basis.outcome is not None:
+        return dict(fate.basis.outcome.raw)
+    return None
+
+
 def apply_rework_worker_outcome(
     gh: GitHubLike,
     *,

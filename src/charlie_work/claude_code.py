@@ -566,13 +566,11 @@ def _classify_session_failure(
     ``adapter_kind`` selects provider-auth/suspension classification (issue
     #484/#1342, api only) via ``account_error_detection``.
 
-    # FLIP 6 (wf-design.md §9): claude-code/api still anchor a
-    # ``rate_limited`` cooldown at classification time
-    # (``legacy_classification_anchor=True``), not the message's emission
-    # time (issue #1997, already live for devin via
-    # ``worker_fate.classify_failure``'s default). Porting #1997 to
-    # claude-code/api fleet-wide is a real behaviour change tracked as its
-    # own flip commit, not this refactor.
+    Rule 6 (wf-design.md §9): claude-code/api anchor a ``rate_limited``
+    cooldown at the message's emission time, same as devin (issue #1997,
+    via ``worker_fate.classify_failure``) -- classification can run tens of
+    minutes after the log line was written, so anchoring "now" plus a fixed
+    cooldown used to overshoot the real provider reset by that much.
     """
     from .worker_fate import classify_failure
 
@@ -583,7 +581,6 @@ def _classify_session_failure(
         resume_margin_seconds=resume_margin_seconds,
         account_error_detection=adapter_kind == "api",
         headless_permission_detection=True,  # issue #2010
-        legacy_classification_anchor=True,  # FLIP 6
         now=now,
     )
 

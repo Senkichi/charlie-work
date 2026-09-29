@@ -68,7 +68,14 @@ def _write_outcome(worktree_path: Path, outcome: dict, *, age_seconds: float) ->
     return outcome_path
 
 
-def _seed_dispatched_issue(paths, *, issue_number: int, branch: str, pid: int = 99999) -> None:
+def _seed_dispatched_issue(
+    paths,
+    *,
+    issue_number: int,
+    branch: str,
+    pid: int = 99999,
+    dispatched_at: str = "2024-01-01T00:00:00Z",
+) -> None:
     from charlie_work.state import load_state, save_state
 
     state = load_state(paths.state_file)
@@ -76,7 +83,7 @@ def _seed_dispatched_issue(paths, *, issue_number: int, branch: str, pid: int = 
         "status": "dispatched",
         "worker_pid": pid,
         "worker_process_start_time": 1234567890.0,
-        "dispatched_at": "2024-01-01T00:00:00Z",
+        "dispatched_at": dispatched_at,
         "branch_name": branch,
     }
     save_state(paths.state_file, state)
@@ -196,9 +203,14 @@ def test_live_pid_stale_outcome_opens_pr_without_waiting_for_exit(tmp_path: Path
 
 
 def test_live_pid_fresh_outcome_does_not_finalize(tmp_path: Path) -> None:
-    """A just-written outcome file belongs to a worker that may still be
-    finishing its exit -- only an outcome older than the finalize threshold
-    is treated as a stale handoff."""
+    """FLIP 1: was outcome-age-vs-``worker_outcome_finalize_minutes``
+    (younger than 15 minutes = "may still be finishing", so wait); now
+    freshness is judged against ``dispatched_at`` (rule 1), not elapsed
+    wall-clock time. An outcome file written BEFORE the current dispatch is
+    a leftover from a prior run of this branch and is rejected regardless
+    of how few minutes old it is -- the scenario this test now pins."""
+    from datetime import UTC, datetime, timedelta
+
     from charlie_work.paths import resolved_layout, runtime_paths
     from charlie_work.state import load_state
     from charlie_work.workflow import _detect_and_handle_orphaned_workers
@@ -209,7 +221,8 @@ def test_live_pid_fresh_outcome_does_not_finalize(tmp_path: Path) -> None:
 
     branch = "agent/issue-1867-stale-outcome-live-pid"
     repo_root = _make_repo_with_pushed_branch(tmp_path, branch)
-    _seed_dispatched_issue(paths, issue_number=1867, branch=branch)
+    dispatched_at = (datetime.now(UTC) - timedelta(minutes=5)).isoformat()
+    _seed_dispatched_issue(paths, issue_number=1867, branch=branch, dispatched_at=dispatched_at)
 
     worktrees_dir = resolved_layout(config, repo_root).worktrees
     worktree_path = worktree_path_for_branch(repo_root, branch, worktrees_dir)
@@ -221,7 +234,7 @@ def test_live_pid_fresh_outcome_does_not_finalize(tmp_path: Path) -> None:
             "pr_title": "fix: fresh outcome",
             "pr_body": "Closes #1867",
         },
-        age_seconds=60,  # 1 minute old -- inside the 15-minute grace window
+        age_seconds=3600,  # written an hour ago -- before the 5-minute-old dispatch
     )
 
     fake_gh = _fake_gh(

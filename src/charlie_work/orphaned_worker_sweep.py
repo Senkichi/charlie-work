@@ -43,6 +43,7 @@ from .process_utils import find_worker_terminal_status
 from .review_decision import review_decision
 from .rework_outcome import (
     APPLIED_HEADS_KEY,
+    blocked_worker_outcome,
     fresh_completed_worker_outcome,
 )
 from .state import PASSIVE_OPEN_STATUS
@@ -234,12 +235,14 @@ def handle_dead_worker_completed_outcome(
 ) -> bool:
     """Recover a dead worker that provably completed its handoff (#1911).
 
-    Returns ``True`` only when there is no terminal record
-    (``terminal_exit_code is None``) AND the worktree holds a fresh,
-    on-target ``.worker-outcome.json`` -- written after this dispatch's
-    ``dispatched_at`` (a previous session's leftover does not count),
-    reporting ``push_succeeded``, and pinning ``head_sha`` to the live
-    head. In that case the outcome is queued for the post-lock #1877
+    Returns ``True`` only when there is no confirmed-crash terminal record
+    (``terminal_exit_code`` is ``None`` or ``0`` -- rule 4, design doc §9:
+    a fresh outcome outranks a recorded clean exit, so ``0`` no longer
+    short-circuits before the outcome check) AND the worktree holds a
+    fresh, on-target ``.worker-outcome.json`` -- written after this
+    dispatch's ``dispatched_at`` (a previous session's leftover does not
+    count), reporting ``push_succeeded``, and pinning ``head_sha`` to the
+    live head. In that case the outcome is queued for the post-lock #1877
     apply pass (idempotent: ``APPLIED_HEADS_KEY`` dedups on the reported
     head, so a transient failure retries next pass while an
     already-applied outcome is never re-queued) and -- when a review
@@ -260,10 +263,10 @@ def handle_dead_worker_completed_outcome(
     reap backstop either way so a route that never resolves still
     converges.
 
-    Every negative answer (a recorded exit code -- zero handled by the
-    caller's own branch, non-zero being a confirmed crash -- a missing
-    branch/worktree/timestamp, a stale or off-target outcome) returns
-    ``False`` and leaves the caller's worker-death path untouched.
+    Every negative answer (a confirmed non-zero exit code, a missing
+    branch/worktree/timestamp, or a stale/off-target/absent outcome)
+    returns ``False`` and leaves the caller's own ``terminal_exit_code
+    == 0`` no-op branch / worker-death reset path untouched.
 
     B2 wiring note: this function does not call ``worker_fate`` directly.
     ``fresh_completed_worker_outcome`` (B1) already resolves the fate
@@ -279,7 +282,11 @@ def handle_dead_worker_completed_outcome(
     # also keeps suite patches on ``charlie_work.workflow.<name>`` live.
     import charlie_work.workflow as _wf
 
-    if terminal_exit_code is not None or not live_head_sha:
+    # Rule 4 (design doc §9): a recorded exit code of 0 no longer
+    # short-circuits here -- only a confirmed non-zero exit (a genuine
+    # crash) does. This lets a fresh, on-target, confirmed-push outcome
+    # file outrank a clean exit instead of being unreachable behind it.
+    if terminal_exit_code not in (None, 0) or not live_head_sha:
         return False
     branch = pr_data.get("headRefName") or entry.get("branch_name")
     if not branch or not isinstance(repo_root, Path) or worktrees_dir is None:
@@ -428,52 +435,13 @@ def handle_dead_worker_with_pr(
 
     if last_decision == "request_changes" and reviewed_head_sha and live_head_sha:
         if reviewed_head_sha == live_head_sha:
-            # FLIP 4: legacy; fate (rule 4) says a fresh, on-target,
-            # confirmed-push outcome file should outrank a recorded exit_code
-            # of 0. This short-circuit runs first regardless, so a genuinely
-            # completed handoff that also exited cleanly is misread as a
-            # no-op and never reaches `handle_dead_worker_completed_outcome`
-            # below. Kept literal for this wiring step; test_flip4_* pins it.
-            if terminal_exit_code == 0:
-                # The worker exited cleanly (exit code 0) rather
-                # than crashing -- e.g. it was handed an empty
-                # rework brief with nothing left to act on. Do NOT
-                # auto-reset to rework_requested: that would spend
-                # one of max_auto_redispatch's attempts on a
-                # worker that never had anything to change,
-                # eventually escalating a benign no-op to
-                # agent:human-needed (issue #773). Surface it once
-                # instead, via the same fingerprinted
-                # surface-once convergence the other drift
-                # branches below already use, so a human/janitor
-                # can decide whether the review itself needs
-                # revisiting -- retrying a dispatch that already
-                # proved it produces no change on this exact head
-                # would just repeat the no-op.
-                fingerprint = drift_fingerprint(
-                    reason="dead_worker_clean_exit_no_op",
-                    reviewed_head_sha=reviewed_head_sha,
-                )
-                if entry.get("orphan_drift_fingerprint") == fingerprint:
-                    state["issues"][str(issue_number)] = entry
-                    return
-                entry["orphan_drift_fingerprint"] = fingerprint
-                entry["orphan_drift_at"] = _wf.utc_now()
-                sweep_events.append(
-                    (
-                        "orphaned_worker_drift",
-                        {
-                            "issue_number": issue_number,
-                            "pr_number": pr_number,
-                            "previous_status": "dispatched",
-                            "reason": "dead_worker_clean_exit_no_op",
-                            "pid": terminal_pid,
-                            "exit_code": terminal_exit_code,
-                            "duration_seconds": terminal_duration_seconds,
-                        },
-                    )
-                )
-            elif not handle_dead_worker_completed_outcome(
+            # Rule 4 (design doc §9): `handle_dead_worker_completed_outcome`
+            # is checked unconditionally, before the exit_code == 0 no-op
+            # branch -- a fresh, on-target, confirmed-push outcome file now
+            # outranks a recorded clean exit instead of being unreachable
+            # behind it (the function's own guard now lets exit_code == 0
+            # through so this can take effect).
+            if not handle_dead_worker_completed_outcome(
                 state=state,
                 sweep_events=sweep_events,
                 entry=entry,
@@ -492,61 +460,152 @@ def handle_dead_worker_with_pr(
                 review_callback=review_callback,
                 drift_fingerprint=drift_fingerprint,
             ):
-                # No terminal record and no fresh on-target
-                # outcome file, or a non-zero exit code (a
-                # recorded crash never counts as a completed
-                # outcome -- issue #1911): unchanged from
-                # pre-#773 behavior -- safe to reset
-                # to rework_requested (PR head unchanged since
-                # request_changes).
-                #
-                # FLIP 2: legacy; fate (rule 2) says a fresh, on-target
-                # "blocked" outcome file should be distinguished from "no
-                # evidence at all" and escalated rather than silently
-                # redispatched. `handle_dead_worker_completed_outcome` above
-                # returns False for both populations alike (it only answers
-                # "is this provably a completion"), so a worker that declared
-                # itself blocked lands here and is reset exactly like a
-                # worker that said nothing. Kept literal for this wiring
-                # step; test_flip2_with_pr_fresh_blocked_* pins it.
-                entry["status"] = "rework_requested"
-                entry["dispatched_at"] = None
-                # Issue #1134: record this as a worker death, not
-                # a no-op.  A death redispatch must not count
-                # against the no-op rework cap — the worker may
-                # have completed its work but died before pushing
-                # (salvageable stranded commits).  A separate
-                # death counter with its own escalation reason
-                # (worker_death_loop) lets the operator triage
-                # "check the worktree" vs. "worker is spinning."
-                # Issue #1917: skip the credit entirely for a
-                # provider-throttle-classified death — the same
-                # #1684 exemption the rework lanes apply, so the
-                # death can never inflate ``worker_death_at`` for a
-                # later, genuinely different death's cap check.
-                # Issue #2002: classify the dead worker's sidecar
-                # log at credit time — see dead_worker_classification.
-                death_ts = _wf.utc_now()
-                death_kind = classify_and_credit_dead_worker(
-                    entry, sessions_dir, issue_number, state, config, at=death_ts
-                )
-                sweep_events.append(
-                    (
-                        "orphaned_worker_recovered",
-                        {
-                            "issue_number": issue_number,
-                            "pr_number": pr_number,
-                            "previous_status": "dispatched",
-                            "new_status": "rework_requested",
-                            "reason": "dead_worker_with_request_changes",
-                            "pid": terminal_pid,
-                            "exit_code": terminal_exit_code,
-                            "duration_seconds": terminal_duration_seconds,
-                            "worker_death_at": death_ts,
-                            "failure_kind": death_kind,
-                        },
+                if terminal_exit_code == 0:
+                    # The worker exited cleanly (exit code 0) rather
+                    # than crashing -- e.g. it was handed an empty
+                    # rework brief with nothing left to act on. Do NOT
+                    # auto-reset to rework_requested: that would spend
+                    # one of max_auto_redispatch's attempts on a
+                    # worker that never had anything to change,
+                    # eventually escalating a benign no-op to
+                    # agent:human-needed (issue #773). Surface it once
+                    # instead, via the same fingerprinted
+                    # surface-once convergence the other drift
+                    # branches below already use, so a human/janitor
+                    # can decide whether the review itself needs
+                    # revisiting -- retrying a dispatch that already
+                    # proved it produces no change on this exact head
+                    # would just repeat the no-op.
+                    fingerprint = drift_fingerprint(
+                        reason="dead_worker_clean_exit_no_op",
+                        reviewed_head_sha=reviewed_head_sha,
                     )
-                )
+                    if entry.get("orphan_drift_fingerprint") == fingerprint:
+                        state["issues"][str(issue_number)] = entry
+                        return
+                    entry["orphan_drift_fingerprint"] = fingerprint
+                    entry["orphan_drift_at"] = _wf.utc_now()
+                    sweep_events.append(
+                        (
+                            "orphaned_worker_drift",
+                            {
+                                "issue_number": issue_number,
+                                "pr_number": pr_number,
+                                "previous_status": "dispatched",
+                                "reason": "dead_worker_clean_exit_no_op",
+                                "pid": terminal_pid,
+                                "exit_code": terminal_exit_code,
+                                "duration_seconds": terminal_duration_seconds,
+                            },
+                        )
+                    )
+                else:
+                    # Rule 2: a fresh, on-target "blocked" outcome file is
+                    # distinguished from "no evidence at all" and escalated
+                    # rather than silently folded into the same
+                    # `rework_requested` reset a genuinely silent death
+                    # gets. `handle_dead_worker_completed_outcome` above
+                    # only answers "is this provably a completion" -- it
+                    # returns False for both populations alike -- so the
+                    # blocked check is a separate, explicit read here.
+                    branch = pr_data.get("headRefName") or entry.get("branch_name")
+                    blocked_outcome = None
+                    if branch and isinstance(repo_root, Path) and worktrees_dir is not None:
+                        blocked_outcome = blocked_worker_outcome(
+                            worktree_path_for_branch(repo_root, branch, worktrees_dir),
+                            dispatched_at=_wf._parse_iso_timestamp(entry.get("dispatched_at")),
+                        )
+                    if blocked_outcome is not None:
+                        state = _wf._escalate_issue(
+                            state,
+                            issue_number,
+                            reason="worker_declared_blocked",
+                            reason_class="mechanical",
+                            pr_number=pr_number,
+                            issue_extra={"dispatched_at": None},
+                        )
+                        # `_escalate_issue` rebuilds `state["issues"][key]` as a
+                        # brand-new dict rather than mutating the one passed in
+                        # (see escalation.py / CLAUDE.md). This function has no
+                        # explicit write-back on this path -- it falls off the
+                        # end and relies on the caller's loop tail in
+                        # `workflow.py` doing `state["issues"][str(issue_number)]
+                        # = entry` with the *same* `entry` object identity it
+                        # fetched before calling us. Rebinding the local `entry`
+                        # name here (as the naive `entry =
+                        # state["issues"][str(issue_number)]` would) only
+                        # updates this function's own local variable -- the
+                        # caller's `entry` reference is untouched, so its
+                        # stale, pre-escalation loop-tail write-back would
+                        # silently clobber the escalation. Mutate the
+                        # caller-owned `entry` object in place instead, so its
+                        # identity (and thus the loop tail's write-back) stays
+                        # correct.
+                        entry.clear()
+                        entry.update(state["issues"][str(issue_number)])
+                        state["issues"][str(issue_number)] = entry
+                        sweep_events.append(
+                            (
+                                "worker_declared_blocked",
+                                {
+                                    "issue_number": issue_number,
+                                    "pr_number": pr_number,
+                                    "previous_status": "dispatched",
+                                    "reason": "worker_declared_blocked",
+                                    "reason_kind": str(
+                                        blocked_outcome.get("reason_kind") or "unknown"
+                                    ),
+                                    "detail": str(blocked_outcome.get("detail") or ""),
+                                    "pid": terminal_pid,
+                                    "exit_code": terminal_exit_code,
+                                    "duration_seconds": terminal_duration_seconds,
+                                },
+                            )
+                        )
+                    else:
+                        # No terminal record and no fresh on-target outcome
+                        # file, or a non-zero exit code (a recorded crash
+                        # never counts as a completed outcome -- issue
+                        # #1911): unchanged from pre-#773 behavior -- safe
+                        # to reset to rework_requested (PR head unchanged
+                        # since request_changes).
+                        entry["status"] = "rework_requested"
+                        entry["dispatched_at"] = None
+                        # Issue #1134: record this as a worker death, not
+                        # a no-op.  A death redispatch must not count
+                        # against the no-op rework cap — the worker may
+                        # have completed its work but died before pushing
+                        # (salvageable stranded commits).  A separate
+                        # death counter with its own escalation reason
+                        # (worker_death_loop) lets the operator triage
+                        # "check the worktree" vs. "worker is spinning."
+                        # Issue #1917: skip the credit entirely for a
+                        # provider-throttle-classified death — the same
+                        # #1684 exemption the rework lanes apply, so the
+                        # death can never inflate ``worker_death_at`` for a
+                        # later, genuinely different death's cap check.
+                        death_ts = _wf.utc_now()
+                        # Issue #2002: classify the sidecar log before crediting.
+                        death_kind = classify_and_credit_dead_worker(
+                            entry, sessions_dir, issue_number, state, config, at=death_ts
+                        )
+                        sweep_events.append(
+                            (
+                                "orphaned_worker_recovered",
+                                {
+                                    "issue_number": issue_number,
+                                    "pr_number": pr_number,
+                                    "previous_status": "dispatched",
+                                    "new_status": "rework_requested",
+                                    "reason": "dead_worker_with_request_changes",
+                                    "pid": terminal_pid,
+                                    "exit_code": terminal_exit_code,
+                                    "duration_seconds": terminal_duration_seconds,
+                                    "worker_death_at": death_ts,
+                                    "failure_kind": death_kind,
+                                },
+                            )
+                        )
         else:
             # PR head has changed - route to review if possible,
             # otherwise surface as a drift finding (once per fingerprint).
@@ -638,42 +697,11 @@ def handle_dead_worker_with_pr(
             and live_head_sha
             and reviewed_head_sha == live_head_sha
         ):
-            # FLIP 4: legacy; fate (rule 4) says a fresh, on-target,
-            # confirmed-push outcome file should outrank a recorded
-            # exit_code of 0 here too -- the same disagreement as the
+            # Rule 4 (design doc §9): checked unconditionally, before the
+            # exit_code == 0 no-op branch -- the same disagreement as the
             # request_changes branch above, duplicated at this second call
-            # site. Kept literal for this wiring step; test_flip4_* pins it.
-            if terminal_exit_code == 0:
-                # Clean exit with no push -- same #773 rationale
-                # as the request_changes branch: do not spend a
-                # redispatch attempt on a worker that produced no
-                # change on this exact head.
-                fingerprint = drift_fingerprint(
-                    reason="dead_worker_clean_exit_no_op",
-                    reviewed_head_sha=reviewed_head_sha,
-                )
-                if entry.get("orphan_drift_fingerprint") == fingerprint:
-                    state["issues"][str(issue_number)] = entry
-                    return
-                entry["orphan_drift_fingerprint"] = fingerprint
-                entry["orphan_drift_at"] = _wf.utc_now()
-                sweep_events.append(
-                    (
-                        "orphaned_worker_drift",
-                        {
-                            "issue_number": issue_number,
-                            "pr_number": pr_number,
-                            "previous_status": "dispatched",
-                            "reason": "dead_worker_clean_exit_no_op",
-                            "decision": "approved",
-                            "pr_state_status": pr_state_status,
-                            "pid": terminal_pid,
-                            "exit_code": terminal_exit_code,
-                            "duration_seconds": terminal_duration_seconds,
-                        },
-                    )
-                )
-            elif not handle_dead_worker_completed_outcome(
+            # site.
+            if not handle_dead_worker_completed_outcome(
                 state=state,
                 sweep_events=sweep_events,
                 entry=entry,
@@ -696,50 +724,135 @@ def handle_dead_worker_with_pr(
                     "pr_state_status": pr_state_status,
                 },
             ):
-                # No terminal record and no fresh on-target
-                # outcome file, or a non-zero exit code
-                # (issue #1911): safe to reset to rework_requested
-                # (PR head
-                # unchanged since the approved review, and the
-                # post-approval rework lane dispatched this
-                # worker). Records this as a worker death with a
-                # distinct reason so the death counter (issue
-                # #1134) and the redispatch cap (issue #165) apply
-                # exactly as they do for request_changes.
-                #
-                # FLIP 2: legacy; fate (rule 2) says a fresh, on-target
-                # "blocked" outcome should escalate rather than fall through
-                # to this same reset -- the same gap as the request_changes
-                # branch above. Kept literal for this wiring step;
-                # test_flip2_with_pr_fresh_blocked_* pins the sibling case.
-                entry["status"] = "rework_requested"
-                entry["dispatched_at"] = None
-                death_ts = _wf.utc_now()
-                # Issue #1917: provider-throttle deaths are not credited —
-                # same #1684 exemption as the request_changes branch above.
-                # Issue #2002: classify the sidecar log before crediting.
-                death_kind = classify_and_credit_dead_worker(
-                    entry, sessions_dir, issue_number, state, config, at=death_ts
-                )
-                sweep_events.append(
-                    (
-                        "orphaned_worker_recovered",
-                        {
-                            "issue_number": issue_number,
-                            "pr_number": pr_number,
-                            "previous_status": "dispatched",
-                            "new_status": "rework_requested",
-                            "reason": "dead_worker_with_approved_rework",
-                            "decision": "approved",
-                            "pr_state_status": pr_state_status,
-                            "pid": terminal_pid,
-                            "exit_code": terminal_exit_code,
-                            "duration_seconds": terminal_duration_seconds,
-                            "worker_death_at": death_ts,
-                            "failure_kind": death_kind,
-                        },
+                if terminal_exit_code == 0:
+                    # Clean exit with no push -- same #773 rationale
+                    # as the request_changes branch: do not spend a
+                    # redispatch attempt on a worker that produced no
+                    # change on this exact head.
+                    fingerprint = drift_fingerprint(
+                        reason="dead_worker_clean_exit_no_op",
+                        reviewed_head_sha=reviewed_head_sha,
                     )
-                )
+                    if entry.get("orphan_drift_fingerprint") == fingerprint:
+                        state["issues"][str(issue_number)] = entry
+                        return
+                    entry["orphan_drift_fingerprint"] = fingerprint
+                    entry["orphan_drift_at"] = _wf.utc_now()
+                    sweep_events.append(
+                        (
+                            "orphaned_worker_drift",
+                            {
+                                "issue_number": issue_number,
+                                "pr_number": pr_number,
+                                "previous_status": "dispatched",
+                                "reason": "dead_worker_clean_exit_no_op",
+                                "decision": "approved",
+                                "pr_state_status": pr_state_status,
+                                "pid": terminal_pid,
+                                "exit_code": terminal_exit_code,
+                                "duration_seconds": terminal_duration_seconds,
+                            },
+                        )
+                    )
+                else:
+                    # Rule 2: a fresh, on-target "blocked" outcome escalates
+                    # rather than falling through to the same reset -- the
+                    # same gap as the request_changes branch above.
+                    branch = pr_data.get("headRefName") or entry.get("branch_name")
+                    blocked_outcome = None
+                    if branch and isinstance(repo_root, Path) and worktrees_dir is not None:
+                        blocked_outcome = blocked_worker_outcome(
+                            worktree_path_for_branch(repo_root, branch, worktrees_dir),
+                            dispatched_at=_wf._parse_iso_timestamp(entry.get("dispatched_at")),
+                        )
+                    if blocked_outcome is not None:
+                        state = _wf._escalate_issue(
+                            state,
+                            issue_number,
+                            reason="worker_declared_blocked",
+                            reason_class="mechanical",
+                            pr_number=pr_number,
+                            issue_extra={"dispatched_at": None},
+                        )
+                        # `_escalate_issue` rebuilds `state["issues"][key]` as a
+                        # brand-new dict rather than mutating the one passed in
+                        # (see escalation.py / CLAUDE.md). This function has no
+                        # explicit write-back on this path -- it falls off the
+                        # end and relies on the caller's loop tail in
+                        # `workflow.py` doing `state["issues"][str(issue_number)]
+                        # = entry` with the *same* `entry` object identity it
+                        # fetched before calling us. Rebinding the local `entry`
+                        # name here (as the naive `entry =
+                        # state["issues"][str(issue_number)]` would) only
+                        # updates this function's own local variable -- the
+                        # caller's `entry` reference is untouched, so its
+                        # stale, pre-escalation loop-tail write-back would
+                        # silently clobber the escalation. Mutate the
+                        # caller-owned `entry` object in place instead, so its
+                        # identity (and thus the loop tail's write-back) stays
+                        # correct.
+                        entry.clear()
+                        entry.update(state["issues"][str(issue_number)])
+                        state["issues"][str(issue_number)] = entry
+                        sweep_events.append(
+                            (
+                                "worker_declared_blocked",
+                                {
+                                    "issue_number": issue_number,
+                                    "pr_number": pr_number,
+                                    "previous_status": "dispatched",
+                                    "reason": "worker_declared_blocked",
+                                    "decision": "approved",
+                                    "pr_state_status": pr_state_status,
+                                    "reason_kind": str(
+                                        blocked_outcome.get("reason_kind") or "unknown"
+                                    ),
+                                    "detail": str(blocked_outcome.get("detail") or ""),
+                                    "pid": terminal_pid,
+                                    "exit_code": terminal_exit_code,
+                                    "duration_seconds": terminal_duration_seconds,
+                                },
+                            )
+                        )
+                    else:
+                        # No terminal record and no fresh on-target
+                        # outcome file, or a non-zero exit code
+                        # (issue #1911): safe to reset to rework_requested
+                        # (PR head unchanged since the approved review, and
+                        # the post-approval rework lane dispatched this
+                        # worker). Records this as a worker death with a
+                        # distinct reason so the death counter (issue
+                        # #1134) and the redispatch cap (issue #165) apply
+                        # exactly as they do for request_changes.
+                        entry["status"] = "rework_requested"
+                        entry["dispatched_at"] = None
+                        death_ts = _wf.utc_now()
+                        # Issue #1917: provider-throttle deaths are not
+                        # credited — same #1684 exemption as the
+                        # request_changes branch above.
+                        # Issue #2002: classify the sidecar log before crediting.
+                        death_kind = classify_and_credit_dead_worker(
+                            entry, sessions_dir, issue_number, state, config, at=death_ts
+                        )
+                        sweep_events.append(
+                            (
+                                "orphaned_worker_recovered",
+                                {
+                                    "issue_number": issue_number,
+                                    "pr_number": pr_number,
+                                    "previous_status": "dispatched",
+                                    "new_status": "rework_requested",
+                                    "reason": "dead_worker_with_approved_rework",
+                                    "decision": "approved",
+                                    "pr_state_status": pr_state_status,
+                                    "pid": terminal_pid,
+                                    "exit_code": terminal_exit_code,
+                                    "duration_seconds": terminal_duration_seconds,
+                                    "worker_death_at": death_ts,
+                                    "failure_kind": death_kind,
+                                },
+                            )
+                        )
         else:
             # Not the #1109 approved+rework_requested classified
             # case. This branch covers two populations that share

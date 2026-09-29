@@ -10,6 +10,7 @@ Track 1) -- bodies are verbatim relocations; shared helpers live in
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 from charlie_work.config import (
@@ -65,7 +66,12 @@ def test_classify_session_failure_quota_exhausted(tmp_path: Path) -> None:
 
 
 def test_classify_session_failure_includes_resume_margin(tmp_path: Path) -> None:
-    """Issue #499: killed-worker rate-limit classification must include the resume margin."""
+    """Issue #499: killed-worker rate-limit classification must include the resume margin.
+
+    Rule 6 (wf-design.md §9): claude-code anchors at the log's emission
+    time now, not classification time, so the mtime is pinned to ``now``
+    (matching the devin sibling test's pattern) to keep this deterministic.
+    """
     from datetime import UTC, datetime, timedelta
 
     from charlie_work.claude_code import _classify_session_failure
@@ -77,6 +83,7 @@ def test_classify_session_failure_includes_resume_margin(tmp_path: Path) -> None
     )
 
     now = datetime.now(UTC)
+    os.utime(log_path, (now.timestamp(), now.timestamp()))
     failure_kind, throttled_until = _classify_session_failure(
         log_path, resume_margin_seconds=90, now=now
     )
@@ -135,7 +142,12 @@ def test_update_worker_record_with_failure_classification(tmp_path: Path) -> Non
 def test_update_worker_record_with_failure_classification_includes_resume_margin(
     tmp_path: Path,
 ) -> None:
-    """Issue #499: update wrapper applies config.runtime.throttle_resume_margin_s."""
+    """Issue #499: update wrapper applies config.runtime.throttle_resume_margin_s.
+
+    Rule 6 (wf-design.md §9): the log's mtime is pinned to ``now`` so the
+    emission-time anchor (issue #1997, now fleet-wide) produces the exact
+    expected value deterministically.
+    """
     from datetime import UTC, datetime, timedelta
 
     sessions_dir = tmp_path / "sessions"
@@ -167,6 +179,7 @@ def test_update_worker_record_with_failure_classification_includes_resume_margin
 
     config = OrchestratorConfig(runtime=RuntimeConfig(throttle_resume_margin_s=90))
     now = datetime.now(UTC)
+    os.utime(log_path, (now.timestamp(), now.timestamp()))
     failure_kind, throttled_until = update_worker_record_with_failure_classification(
         sessions_dir, 42, config=config, now=now
     )

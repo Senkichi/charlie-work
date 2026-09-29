@@ -23,12 +23,12 @@ subject). ``classify_worker_health`` and ``is_worker_confirmed_dead`` stay in
 ``worker.py`` — they own the inconclusive-probe deferral counter (#755) and
 this module only consumes their output through ``FateEvidence.health``.
 
-``wf-4-wire-a`` (this commit) adds the internal Adapter seam (design doc
-§7): ``classify_failure`` merges ``claude_code._classify_session_failure``
-and ``devin_failure_classification._classify_session_failure`` (issue
-#1997 — the devin-only emission-time throttle anchor becomes a profile
-flag, ``legacy_classification_anchor``, rather than two copies of the
-function); ``AdapterFateProfile``/``profile_for`` replace the 14
+``wf-4-wire-a`` adds the internal Adapter seam (design doc §7):
+``classify_failure`` merges ``claude_code._classify_session_failure`` and
+``devin_failure_classification._classify_session_failure`` (issue #1997 —
+the devin-only emission-time throttle anchor, later ported fleet-wide by
+rule 6, so it is no longer a per-profile flag); ``AdapterFateProfile``/
+``profile_for`` replace the 14
 ``w.adapter_kind ==`` branches in ``dead_worker_reap.py`` and the two
 ``_classify_session_failure`` duplicates in ``claude_code.py`` /
 ``devin_shell.py`` (now thin wrappers around ``classify_failure``).
@@ -629,14 +629,13 @@ def worker_fate(subject: WorkerSubject, readers: FateReaders, *, now: datetime) 
 # the function:
 #   - account-error detection (``provider_suspended``/``provider_auth``,
 #     api only) was ``adapter_kind == "api"``; now ``account_error_detection``.
-#   - the ``rate_limited`` cooldown anchor: devin already anchors at the
+#   - the ``rate_limited`` cooldown anchor: devin already anchored at the
 #     message's *emission* time (issue #1997 -- classification can run tens
 #     of minutes after the log line was written, so anchoring "now" plus a
 #     15-minute cooldown overshoots the real provider reset by that much);
-#     claude-code/api still anchor at *classification* time. Porting #1997
-#     to claude-code/api fleet-wide is a real behaviour change, so it stays
-#     opt-in per profile (``legacy_classification_anchor``) behind FLIP 6
-#     (wf-design.md §9) until its own dedicated flip commit.
+#     claude-code/api used to anchor at *classification* time instead.
+#     Rule 6 (wf-design.md §9) ports #1997 to claude-code/api fleet-wide:
+#     every harness now anchors at emission time, unconditionally.
 # --------------------------------------------------------------------------
 
 _CLASSIFY_DEFAULT_THROTTLE_ERROR_MARKERS = OrchestratorConfig().runtime.throttle_error_markers
@@ -755,7 +754,6 @@ def classify_failure(
     resume_margin_seconds: int = 0,
     account_error_detection: bool = False,
     headless_permission_detection: bool = False,
-    legacy_classification_anchor: bool = False,
     now: datetime | None = None,
 ) -> tuple[str | None, str | None]:
     """Classify a session failure by matching the log tail against provider
@@ -775,13 +773,14 @@ def classify_failure(
     ``permission_denied`` check. It is checked LAST so throttle/auth
     signatures still win.
 
-    ``legacy_classification_anchor`` picks the ``rate_limited`` anchor: True
-    (claude-code/api, FLIP 6) anchors at classification time
-    (``resolved_now + cooldown``); False (devin) anchors at the message's
-    emission time (issue #1997 -- see ``_throttle_emission_anchor``).
-    ``quota_exhausted`` always anchors at classification time on both paths
-    -- its fixed 24h cooldown has no provider-stated reset to anchor
-    against, so this flag does not affect it.
+    The ``rate_limited`` anchor is always the message's emission time
+    (issue #1997 -- see ``_throttle_emission_anchor``), for every harness.
+    Rule 6 (design doc, FLIP 6): claude-code/api used to anchor at
+    classification time instead; devin already used the emission anchor, so
+    this is the one fleet-wide throttle-timing change in the nine-rule
+    resolution. ``quota_exhausted`` always anchors at classification time --
+    its fixed 24h cooldown has no provider-stated reset to anchor against,
+    so rule 6 does not affect it.
 
     ``now`` is the injectable clock: defaults to ``datetime.now(UTC)`` when
     not supplied, so production behaviour is byte-identical (issue #822).
@@ -833,12 +832,8 @@ def classify_failure(
             else _DEFAULT_RATE_LIMIT_COOLDOWN_MINUTES,
             seconds=resume_margin_seconds,
         )
-        if legacy_classification_anchor:
-            # FLIP 6: claude-code/api still anchor at classification time.
-            throttled_until = resolved_now + cooldown
-        else:
-            emitted_at = _throttle_emission_anchor(log_path, tail, now=resolved_now)
-            throttled_until = max(resolved_now, emitted_at + cooldown)
+        emitted_at = _throttle_emission_anchor(log_path, tail, now=resolved_now)
+        throttled_until = max(resolved_now, emitted_at + cooldown)
         return "rate_limited", throttled_until.replace(microsecond=0).isoformat().replace(
             "+00:00", "Z"
         )
@@ -862,7 +857,6 @@ class AdapterFateProfile:
     writes_terminal_record: bool  # claude-code, api: True; devin-shell: False (follow-up)
     probes_process: bool  # manual: False (no PID); others: True
     account_error_detection: bool  # api only: provider_suspended / provider_auth
-    legacy_classification_anchor: bool  # FLIP 6 (see classify_failure's docstring)
     record_failure: Callable[..., tuple[str | None, str | None]] | None
     # (sessions_dir, issue_number, *, fallback_kind, config, now) -> the
     # existing update_worker_record_with_failure_classification /
@@ -907,7 +901,6 @@ def _build_profiles() -> dict[str, AdapterFateProfile]:
             writes_terminal_record=False,
             probes_process=True,
             account_error_detection=False,
-            legacy_classification_anchor=False,
             record_failure=update_session_record_with_failure_classification,
             over_budget=None,
         ),
@@ -917,7 +910,6 @@ def _build_profiles() -> dict[str, AdapterFateProfile]:
             writes_terminal_record=True,
             probes_process=True,
             account_error_detection=False,
-            legacy_classification_anchor=True,  # FLIP 6
             record_failure=partial(
                 update_worker_record_with_failure_classification, adapter_kind="claude-code"
             ),
@@ -929,7 +921,6 @@ def _build_profiles() -> dict[str, AdapterFateProfile]:
             writes_terminal_record=True,
             probes_process=True,
             account_error_detection=True,
-            legacy_classification_anchor=True,  # FLIP 6
             record_failure=partial(
                 update_worker_record_with_failure_classification, adapter_kind="api"
             ),
@@ -951,7 +942,6 @@ def _build_profiles() -> dict[str, AdapterFateProfile]:
             writes_terminal_record=False,
             probes_process=True,
             account_error_detection=False,
-            legacy_classification_anchor=False,
             record_failure=None,
             over_budget=None,
         ),
@@ -961,7 +951,6 @@ def _build_profiles() -> dict[str, AdapterFateProfile]:
             writes_terminal_record=False,
             probes_process=False,
             account_error_detection=False,
-            legacy_classification_anchor=False,
             record_failure=None,
             over_budget=None,
         ),

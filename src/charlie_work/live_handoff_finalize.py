@@ -38,7 +38,7 @@ in strict order:
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable
 
@@ -167,19 +167,28 @@ def collect_stale_live_handoff_pids(
             now=now,
         )
 
-        # FLIP 1: legacy gates freshness on outcome-age-vs-`now`, never on
-        # `dispatched_at` -- rule 1 would ignore a leftover outcome file from
-        # a prior dispatch of this branch instead of accepting it here.
-        # FLIP 5: legacy also withholds routing until `outcome_age` exceeds
-        # the same threshold the kill decision uses -- rule 5 says a
-        # `PushedWithoutPr`/`Completed` fate with `pid_alive=True` should
-        # route immediately, independent of that threshold.
-        if outcome_age <= timedelta(minutes=worker_outcome_finalize_minutes):
-            continue
-        if not (
-            isinstance(worker_outcome, dict)
-            and worker_outcome.get("push_succeeded") is True
-            and worker_outcome.get("pr_created") is False
+        # Rule 1: freshness is gated on `dispatched_at`/`head_sha`, not on
+        # outcome-age-vs-`now` -- a leftover outcome file from a prior
+        # dispatch of this branch is rejected once, by evidence, rather
+        # than by an elapsed-time proxy. `resolve_fate` itself can only
+        # ever return `Live` here (row 5): with no remote read at this
+        # pure-filesystem stage, `_is_pushed` can never confirm the push,
+        # so rows 2-4 (`PushedWithoutPr`/`Completed`) are unreachable from
+        # this call site's evidence shape. What we actually need is
+        # `resolve_fate`'s freshness *step* (rule 1), which survives onto
+        # `fate.basis.outcome`: the winning candidate if it passed the
+        # `dispatched_at`/`head_sha` check, else `None`. The routing
+        # decision below reads that rule-1-gated candidate's self-reported
+        # claim directly -- the legacy code trusted the same claim, just
+        # without the freshness gate in front of it.
+        # Rule 5: a live PID with a fresh declared-push claim routes
+        # immediately -- `worker_outcome_finalize_minutes` only gates the
+        # kill decision elsewhere, never this routing check.
+        fresh_outcome = fate.basis.outcome
+        if (
+            fresh_outcome is None
+            or fresh_outcome.push_succeeded is not True
+            or fresh_outcome.pr_created is True
         ):
             continue
         candidates[issue_number] = {

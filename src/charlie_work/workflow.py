@@ -28,6 +28,7 @@ from .checks import (
     summarize_checks,
 )
 from .config import (
+    WORKER_OUTCOME_FILENAME,
     ApiWorkerConfig,
     AutoMergeConfig,
     OrchestratorConfig,
@@ -1654,19 +1655,23 @@ def operator_queue_depth(state: dict[str, Any]) -> set[int]:
 
 def _no_pr_outcome_evidence(
     raw: dict[str, Any] | None,
+    *,
+    source: worker_fate.EvidenceSource,
+    written_at: datetime | None,
 ) -> worker_fate.OutcomeEvidence | None:
     """Build one ``OutcomeEvidence`` from a raw ``.worker-outcome.json`` dict
-    for the no-PR orphan lane (B3). ``if not raw`` mirrors the Python-truthy
-    ``terminal_outcome or worktree_outcome`` precedence the caller already
-    resolved (an empty dict is treated as absent, same as ``None``) -- this
-    helper wraps the CALLER'S already-chosen value, it does not re-arbitrate
-    terminal vs. worktree itself.
+    for the no-PR orphan lane (B3, rule 1/7). ``None`` in, ``None`` out (no
+    claim) -- matches ``rework_outcome._outcome_evidence``'s contract. The
+    caller builds one of these per candidate (terminal, worktree) with a
+    real ``written_at`` and lets ``resolve_fate``'s freshness step (rules
+    1/7) arbitrate between them, rather than pre-collapsing via a Python
+    ``or`` before either has a timestamp attached.
     """
-    if not raw:
+    if not isinstance(raw, dict):
         return None
     return worker_fate.OutcomeEvidence(
-        source=worker_fate.EvidenceSource.WORKTREE,
-        written_at=None,
+        source=source,
+        written_at=written_at,
         outcome=raw.get("outcome"),
         push_succeeded=raw.get("push_succeeded"),
         pr_created=raw.get("pr_created"),
@@ -1872,26 +1877,57 @@ def _detect_and_handle_orphaned_workers(
             worktree_path = None
             if repo_root is not None and worktrees_dir is not None:
                 worktree_path = worktree_path_for_branch(repo_root, branch, worktrees_dir)
+            # Rule 1/7 (design doc §9): real evidence, not a pre-collapsed
+            # ``terminal_outcome or worktree_outcome``. `dispatched_at` gates
+            # freshness (rule 1); the terminal candidate's `written_at` is
+            # its own `ended_at` (the moment the watcher recorded it, same
+            # anchor the exit_code freshness check below uses); the worktree
+            # candidate's `written_at` is the outcome file's own mtime.
+            # `resolve_fate`'s freshness step (rule 7) then arbitrates
+            # terminal vs. worktree itself instead of this loop doing it by
+            # hand.
+            dispatched_at = (
+                _parse_iso_timestamp(entry.get("dispatched_at"))
+                if isinstance(entry, dict)
+                else None
+            )
             terminal = find_worker_terminal_status(sessions_dir, issue_number)
-            terminal_outcome = terminal.get("worker_outcome") if terminal else None
-            worktree_outcome = read_worker_outcome(worktree_path) if worktree_path else None
-            # FLIP 1, FLIP 7: legacy; kept literal. Rule 1 would gate this
-            # read on ``dispatched_at`` freshness, and rule 7 would let
-            # ``resolve_fate`` arbitrate terminal vs. worktree itself rather
-            # than this unconditional ``or``. test_flip1_a9_*/test_flip7_*
-            # pin the current (ungated, terminal-or-worktree) behaviour.
-            worker_outcomes[issue_number] = terminal_outcome or worktree_outcome
+            terminal_evidence: worker_fate.TerminalEvidence | None = None
+            if isinstance(terminal, dict):
+                ended_at = _parse_iso_timestamp(terminal.get("ended_at")) or now
+                terminal_evidence = worker_fate.TerminalEvidence(
+                    ended_at=ended_at,
+                    exit_code=terminal.get("exit_code"),
+                    outcome=_no_pr_outcome_evidence(
+                        terminal.get("worker_outcome"),
+                        source=worker_fate.EvidenceSource.TERMINAL,
+                        written_at=ended_at,
+                    ),
+                )
+            worktree_outcome_evidence: worker_fate.OutcomeEvidence | None = None
+            if worktree_path is not None:
+                try:
+                    worktree_mtime = datetime.fromtimestamp(
+                        (worktree_path / WORKER_OUTCOME_FILENAME).stat().st_mtime, tz=UTC
+                    )
+                except OSError:
+                    worktree_mtime = None
+                worktree_outcome_evidence = _no_pr_outcome_evidence(
+                    read_worker_outcome(worktree_path),
+                    source=worker_fate.EvidenceSource.WORKTREE,
+                    written_at=worktree_mtime,
+                )
             fates[issue_number] = worker_fate.resolve_fate(
                 worker_fate.FateEvidence(
                     issue_number=issue_number,
                     adapter=str(entry.get("adapter") or "unknown")
                     if isinstance(entry, dict)
                     else "unknown",
-                    dispatched_at=None,
+                    dispatched_at=dispatched_at,
                     pid_alive=False,
                     health=None,
-                    terminal=None,
-                    worktree_outcome=_no_pr_outcome_evidence(worker_outcomes[issue_number]),
+                    terminal=terminal_evidence,
+                    worktree_outcome=worktree_outcome_evidence,
                     branch=worker_fate.BranchEvidence(
                         has_remote=True,
                         remote_head_sha=None,
@@ -1903,6 +1939,10 @@ def _detect_and_handle_orphaned_workers(
                     failure=None,
                 ),
                 now=now,
+            )
+            resolved_outcome = fates[issue_number].basis.outcome
+            worker_outcomes[issue_number] = (
+                dict(resolved_outcome.raw) if resolved_outcome is not None else None
             )
 
         for issue_number in no_pr_orphans:
@@ -1943,12 +1983,13 @@ def _detect_and_handle_orphaned_workers(
             # ``reap_escalations`` transition applies the operator-queue
             # label edge.
             worker_outcome = worker_outcomes.get(issue_number)
-            # B3: obtains the worker's fate from the module. Rule 1 (Blocked)
-            # already agrees with this lane's own pre-#1453 check byte for
-            # byte -- both read the same fresh ``worker_outcomes[issue_number]``
-            # via legacy-mode (``dispatched_at=None``) freshness, which is
-            # unconditional here -- so this replaces the literal dict check
-            # directly, no FLIP marker needed.
+            # B3, rule 1: obtains the worker's fate from the module. The
+            # precompute loop above now resolves this fate with a real
+            # ``dispatched_at`` (rule 1) instead of legacy mode, so
+            # ``worker_outcome``/``fates[issue_number]`` are the same
+            # freshness-gated pair the resolved fate itself is built from --
+            # this is the module's own answer, not a byte-for-byte replica
+            # of a separately-computed legacy check.
             #
             # Issue #2010: a ``blocked`` outcome (or log tail) that is just the
             # headless permission-denial signature is a worker-config defect,
@@ -2040,18 +2081,24 @@ def _detect_and_handle_orphaned_workers(
             # gate contract lives in park_or_reclaim_local_orphan's
             # docstring (local_work_park.py).
             #
-            # FLIP 3/9: legacy; this call site's park-vs-reclaim decision is
-            # made inside local_work_park.py on the local worktree's raw
-            # ahead-of-base count, the same "local commits, not yet
-            # reconciled against the remote" fact rule 3 folds into
-            # ``Stranded`` -- park (this lane, no remote) vs. auto-salvage
-            # (dead_worker_reap.py's ``_attempt_salvage``, FLIP 3's sibling
-            # site) vs. judgment-escalation (misc_worker_dispatch.py's
-            # ``_worktree_still_unsafe``, FLIP 3's other sibling). Kept
-            # literal here: ``local_work_park.py`` is not one of this
-            # commit's named consumer files, and its own ahead-count read is
-            # unrelated to ``worker_outcomes``/``fates`` above. test_flip3_*
-            # pins the sibling call sites' current behaviour.
+            # Rule 3/9 sibling (design doc §9): this call site's
+            # park-vs-reclaim decision is made inside local_work_park.py on
+            # the local worktree's raw ahead-of-base count, the same "local
+            # commits, not yet reconciled against the remote" fact rule 3
+            # folds into ``Stranded`` -- park (this lane, no remote) vs.
+            # auto-salvage (dead_worker_reap.py's ``_attempt_salvage``) vs.
+            # judgment-escalation (misc_worker_dispatch.py's
+            # ``_worktree_still_unsafe``). Deliberately left as its own
+            # sibling call site: ``local_work_park.py`` is not one of this
+            # flip's named consumer files, its own ahead-count read is
+            # unrelated to ``worker_outcomes``/``fates`` above, and unlike
+            # ``_worktree_still_unsafe`` (which fails closed on a probe
+            # error) reconciling it here would mean this no-open-PR lane's
+            # dead-worker classification depends on a second, redundant
+            # ``inspect_worktree_state``-equivalent read with no
+            # behavioural payoff. ``test_flip3_*`` pins this and its two
+            # sibling call sites' current behaviour; none of the three
+            # change in this flip.
             if park_or_reclaim_local_orphan(
                 gh=gh,
                 config=config,
@@ -2173,12 +2220,16 @@ def _detect_and_handle_orphaned_workers(
         # pre-lock loop) instead of re-reading the terminal status and
         # worktree file.  The blocked-outcome check already ran in the first
         # loop; here we only need the outcome for the push/PR-failure signal.
+        # Rule 1: this is already the freshness-gated value the first loop's
+        # ``resolve_fate`` chose (real ``dispatched_at``), not the raw
+        # ``terminal_outcome or worktree_outcome`` a prior version read.
         worker_outcome = worker_outcomes.get(issue_number)
-
-        # FLIP 1: legacy; ``worker_outcome`` is the same ungated
-        # ``worker_outcomes[issue_number]`` value from the precompute loop
-        # above (no ``dispatched_at`` freshness check) -- test_flip1_a9_*
-        # pins it.
+        dispatched_at = (
+            _parse_iso_timestamp(entry.get("dispatched_at")) if isinstance(entry, dict) else None
+        )
+        # Descriptive only now (event payload / worker_handoff_pr_opened vs.
+        # orphaned_worker_opened_pr kind choice below) -- the admission gate
+        # itself is the fate check further down, not this boolean.
         reported_push = (
             isinstance(worker_outcome, dict)
             and worker_outcome.get("push_succeeded") is True
@@ -2188,12 +2239,15 @@ def _detect_and_handle_orphaned_workers(
         ahead_count = None
         ahead_error = None
         if repo_root is not None:
-            # FLIP 3/9: legacy; fate (rule 3/9) would also need ``unpushed``
-            # (local-vs-remote) to tell "fully pushed, PR missing" apart from
-            # "partially pushed with additional local-only commits" --
-            # ``remote_branch_ahead_count`` only answers remote-vs-base, so a
-            # candidate here can never be resolved to ``Stranded`` the way
-            # rule 3/9 would. Kept literal; test_flip3_*/test_flip9_* pin it.
+            # Rule 9: only the remote-vs-base ahead count feeds
+            # ``BranchEvidence.remote_ahead`` below -- ``unpushed`` (the
+            # local-worktree-vs-remote count rule 3/9 uses to detect
+            # additional stranded commits) stays unset here. This loop only
+            # ever resolves to `PushedWithoutPr` (never `Stranded`, which
+            # needs `unpushed`): `open_pr_number` is always `None` for a
+            # no-PR orphan, so `Completed` is equally unreachable, and a
+            # candidate needing salvage of local-only commits is the park/
+            # reclaim lane's job above, not this one's.
             ahead_count, ahead_error = remote_branch_ahead_count(
                 repo_root, branch, config.dispatch.base_ref
             )
@@ -2217,12 +2271,37 @@ def _detect_and_handle_orphaned_workers(
             }
         )
 
-        # Treat a branch as a PR-open candidate when:
-        # - the worker itself reported a successful push with a failed PR, OR
-        # - the branch exists on origin and is ahead of the base (has commits).
-        # FLIP 1/8/9: legacy; ``reported_push``/``ahead_count`` above are the
-        # pre-fate signals this OR combines. See their own FLIP comments.
-        if reported_push or (ahead_count is not None and ahead_count > 0):
+        # Rule 1/8/9 (design doc §9): treat a branch as a PR-open candidate
+        # exactly when the resolved fate is `PushedWithoutPr` -- rule 8
+        # (a `pr_created` claim is never trusted; this is a no-PR orphan by
+        # construction, `open_pr_number=None`) and rule 9 (only the remote
+        # ahead count, never `reported_push`/`ahead_count` combined by a
+        # raw ``or``) replace the two pre-fate signals above, which now
+        # exist only for descriptive event payloads.
+        pushed_fate = worker_fate.resolve_fate(
+            worker_fate.FateEvidence(
+                issue_number=issue_number,
+                adapter=str(entry.get("adapter") or "unknown")
+                if isinstance(entry, dict)
+                else "unknown",
+                dispatched_at=dispatched_at,
+                pid_alive=False,
+                health=None,
+                terminal=None,
+                worktree_outcome=fates[issue_number].basis.outcome,
+                branch=worker_fate.BranchEvidence(
+                    has_remote=True,
+                    remote_head_sha=remote_head_sha,
+                    remote_ahead=ahead_count,
+                    unpushed=None,
+                    open_pr_number=None,
+                    pr_known=True,
+                ),
+                failure=None,
+            ),
+            now=now,
+        )
+        if isinstance(pushed_fate, worker_fate.PushedWithoutPr):
             pushed_branch_candidates[issue_number] = {
                 "branch": branch,
                 "worktree_path": worktree_path,

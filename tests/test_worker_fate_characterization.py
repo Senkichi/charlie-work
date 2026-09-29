@@ -100,17 +100,15 @@ def _no_pr_fake_gh(tmp_path: Path, config: OrchestratorConfig, issue_number: int
 
 
 def test_flip1_a9_workflow_uses_stale_worker_outcome_from_prior_dispatch(tmp_path: Path) -> None:
-    """FLIP 1: current behaviour; rule 1 will change this to reject stale evidence.
-
-    `workflow.py`'s no-PR orphan lane pre-reads
-    `worker_outcomes[issue_number] = terminal_outcome or worktree_outcome`
-    once (no dispatched_at comparison anywhere), then the pushed-branch
-    candidate check (`reported_push = ... worker_outcome.get("push_succeeded")
-    is True and worker_outcome.get("pr_created") is False`) reuses that same
-    value with no freshness gate either. A `.worker-outcome.json` left over
-    from a PRIOR dispatch of this issue/branch -- written well before the
-    CURRENT dispatch even started -- is still accepted as proof the current
-    session pushed, and a PR is opened for it.
+    """FLIP 1: was `worker_outcomes[issue_number] = terminal_outcome or
+    worktree_outcome` with no `dispatched_at` comparison anywhere (a
+    `.worker-outcome.json` left over from a PRIOR dispatch of this
+    issue/branch was accepted as proof the current session pushed, and a
+    PR was opened from it); now `workflow.py`'s no-PR orphan lane builds
+    real `worker_fate.TerminalEvidence`/`OutcomeEvidence` and arbitrates
+    them through `resolve_fate`, whose freshness step (rule 1) rejects any
+    candidate whose `written_at` does not postdate `dispatched_at` (rule
+    1).
     """
     from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
@@ -150,28 +148,24 @@ def test_flip1_a9_workflow_uses_stale_worker_outcome_from_prior_dispatch(tmp_pat
 
     st = load_state(state_file)
     entry = st["issues"][str(issue_number)]
-    # Current (disagreeing) behaviour: the stale outcome's push claim is
-    # trusted -- a PR gets opened from it -- with no comparison against
-    # dispatched_at at all.
-    assert entry["status"] == "open_passive"
-    assert entry.get("pr_number") is not None
+    # New (rule 1) behaviour: the outcome predates dispatched_at, so
+    # resolve_fate's freshness step rejects it -- no PR is opened and the
+    # issue is left for the dead-PID lane to handle on its own terms.
+    assert entry["status"] == "dispatched"
+    assert entry.get("pr_number") is None
     events = st.get("events", [])
-    assert any(
-        e.get("kind") == "worker_handoff_pr_opened"
-        and e["payload"].get("reason") == "worker_handoff_clean_exit"
-        for e in events
-    )
+    assert not any(e.get("kind") == "worker_handoff_pr_opened" for e in events)
 
 
 def test_flip1_a5_live_handoff_finalize_ignores_dispatched_at(tmp_path: Path) -> None:
-    """FLIP 1: current behaviour; rule 1 will change this to reject stale evidence.
-
-    `collect_stale_live_handoff_pids` (`live_handoff_finalize.py`) takes no
-    `dispatched_at` parameter at all and never compares the outcome file's
-    age to when the current dispatch began -- only to `now`. A leftover
-    outcome file from a PREVIOUS dispatch of this branch, written well
-    before the current dispatch started, still counts as valid completion
-    evidence once it is merely old enough relative to `now`.
+    """FLIP 1: was no `dispatched_at` comparison at all in
+    `collect_stale_live_handoff_pids` (only an age-vs-`now` check), so a
+    leftover outcome file from a PREVIOUS dispatch of this branch still
+    counted as valid completion evidence once merely old enough; now the
+    function resolves each candidate's fate through `worker_fate`, whose
+    freshness step (rule 1) rejects an outcome whose `written_at` predates
+    the live entry's `dispatched_at`, regardless of how old it is by wall
+    clock.
     """
     from charlie_work.live_handoff_finalize import collect_stale_live_handoff_pids
 
@@ -206,10 +200,10 @@ def test_flip1_a5_live_handoff_finalize_ignores_dispatched_at(tmp_path: Path) ->
         now=now,
     )
 
-    # Current (disagreeing) behaviour: no dispatched_at comparison exists in
-    # this function at all -- the 2-hour-old leftover is accepted.
-    assert 9102 in candidates
-    assert candidates[9102]["worker_outcome"]["head_sha"] == "deadbeef"
+    # New (rule 1) behaviour: the outcome predates the current dispatch by
+    # ~1h50m, so it is rejected as a leftover from a prior run -- no
+    # candidate is produced for it.
+    assert candidates == {}
 
 
 # ---------------------------------------------------------------------------
@@ -222,16 +216,15 @@ def test_flip1_a5_live_handoff_finalize_ignores_dispatched_at(tmp_path: Path) ->
 def test_flip5_live_handoff_finalize_withholds_fresh_outcome_until_threshold(
     tmp_path: Path,
 ) -> None:
-    """FLIP 5: current behaviour; rule 5 will change this to route immediately.
-
-    `collect_stale_live_handoff_pids` skips (does not return as a candidate)
-    any outcome whose age is `<= worker_outcome_finalize_minutes` --
-    `if outcome_age <= timedelta(minutes=worker_outcome_finalize_minutes):
-    continue`. A live PID with a fresh, on-target, confirmed-push outcome is
-    thus NOT routed yet: the same threshold that governs when the stall
-    watchdog is allowed to kill the process also gates when the completion
-    evidence is even considered, rather than the kill waiting while routing
-    fires immediately.
+    """FLIP 5: was `if outcome_age <= timedelta(minutes=
+    worker_outcome_finalize_minutes): continue` -- a live PID with a
+    fresh, on-target, confirmed-push outcome was NOT routed yet, because
+    the same threshold that governs when the stall watchdog is allowed to
+    kill the process also gated when the completion evidence was even
+    considered; now a live PID with a declared push that survives rule 1's
+    freshness gate (`written_at` after `dispatched_at`) routes immediately
+    regardless of `worker_outcome_finalize_minutes` -- that threshold now
+    only gates the kill decision elsewhere (rule 5).
     """
     from charlie_work.live_handoff_finalize import collect_stale_live_handoff_pids
 
@@ -258,10 +251,12 @@ def test_flip5_live_handoff_finalize_withholds_fresh_outcome_until_threshold(
         now=now,
     )
 
-    # Current (disagreeing) behaviour: a fresh, on-target, confirmed-push
-    # outcome is withheld from routing until it ages past the same
-    # threshold the kill decision uses.
-    assert candidates == {}
+    # New (rule 5) behaviour: a fresh, on-target, declared-push outcome
+    # routes immediately -- 2 minutes old is well inside the 15-minute
+    # `worker_outcome_finalize_minutes` threshold, but that threshold no
+    # longer gates this routing decision.
+    assert 9105 in candidates
+    assert candidates[9105]["worker_outcome"]["head_sha"] == "cafefeed"
 
 
 # ---------------------------------------------------------------------------
@@ -276,18 +271,18 @@ def test_flip5_live_handoff_finalize_withholds_fresh_outcome_until_threshold(
 
 
 def test_flip2_with_pr_fresh_blocked_outcome_falls_through_to_redispatch(tmp_path: Path) -> None:
-    """FLIP 2: current behaviour; rule 2 will change this so blocked escalates
-    on every lane, not just the no-PR one.
+    """FLIP 2: was a fresh, on-target `blocked` outcome on the with-PR lane
+    silently indistinguishable from no evidence at all (auto-reset to
+    `rework_requested` and redispatched); now the with-PR lane escalates it
+    the same way the no-PR lane always has (rule 2).
 
     A fresh, on-target outcome file (matching the live PR head, written
     after dispatched_at) that also carries `"outcome": "blocked"` on a dead
-    worker whose branch already has an open PR is not distinguished from
-    having no outcome evidence at all: `fresh_completed_worker_outcome`
-    refuses it (correctly, it is not a completion), but
-    `handle_dead_worker_with_pr` has no separate check for a blocked
-    declaration the way the no-PR lane does -- it just resets the issue to
-    `rework_requested` and redispatches, exactly as it would with zero
-    signal from the worker.
+    worker whose branch already has an open PR is now distinguished from
+    having no outcome evidence at all: `handle_dead_worker_with_pr` reads
+    `blocked_worker_outcome` directly (the same helper the no-PR lane uses)
+    and escalates via `_escalate_issue` instead of falling through to the
+    generic `rework_requested` reset.
     """
     config, paths, fake_gh, dispatched_at = _dead_worker_rework_bed(
         tmp_path, decision="request_changes"
@@ -310,19 +305,22 @@ def test_flip2_with_pr_fresh_blocked_outcome_falls_through_to_redispatch(tmp_pat
 
     state = load_state(paths.state_file)
     entry = state["issues"]["207"]
-    # Current (disagreeing) behaviour: the blocked declaration is ignored --
-    # the dead worker on an open PR is auto-reset to rework_requested exactly
-    # as it would be with no outcome file at all.
-    assert entry["status"] == "rework_requested"
+    # New behaviour: the blocked declaration escalates the issue instead of
+    # silently redispatching it.
+    assert entry["status"] == "escalated"
+    assert entry["escalation_reason"] == "worker_declared_blocked"
     events = state.get("events", [])
     assert any(
+        e.get("kind") == "worker_declared_blocked"
+        and e["payload"].get("reason_kind") == "ambiguous_scope"
+        for e in events
+    )
+    # The generic no-signal reset path must not also fire.
+    assert not any(
         e.get("kind") == "orphaned_worker_recovered"
         and e["payload"].get("reason") == "dead_worker_with_request_changes"
         for e in events
     )
-    # worker_declared_blocked is emitted only by the no-PR lane
-    # (workflow.py); the with-PR lane never inspects outcome["outcome"].
-    assert not any(e.get("kind") == "worker_declared_blocked" for e in events)
 
 
 # ---------------------------------------------------------------------------
@@ -439,16 +437,24 @@ def _seed_dead_worker_fresh_outcome_and_clean_exit(
 
 
 def test_flip4_request_changes_exit0_discards_fresh_outcome(tmp_path: Path) -> None:
-    """FLIP 4: current behaviour; rule 4 will change this to prefer the
-    fresh outcome file over the recorded exit code.
+    """FLIP 4: was a clean exit code short-circuiting before the fresh
+    outcome file was ever consulted; now the with-PR lane consults the
+    fresh outcome first and only falls back to the exit code when there is
+    none (rule 4).
 
     `orphaned_worker_sweep.handle_dead_worker_with_pr`'s `request_changes`
-    branch checks `if terminal_exit_code == 0:` BEFORE calling
-    `handle_dead_worker_completed_outcome` (which is what consults
-    `fresh_completed_worker_outcome`) -- so a terminal record reporting a
-    clean exit short-circuits straight to the `dead_worker_clean_exit_no_op`
-    drift event, even though a fresh, on-target, confirmed-push outcome
-    file sits right there in the worktree.
+    branch now calls `handle_dead_worker_completed_outcome` (which consults
+    `fresh_completed_worker_outcome`) ahead of the `terminal_exit_code == 0`
+    check. In this test environment there is no real git remote to confirm
+    the declared push against, so the outcome cannot be *applied* -- but it
+    is no longer *ignored* either: the drift reason changes from
+    `dead_worker_clean_exit_no_op` (exit code never questioned) to
+    `dead_worker_completed_outcome` (fresh outcome seen, push unconfirmed),
+    paired with an explicit `rework_outcome_skipped` /
+    `remote_head_unavailable` event recording exactly why it could not be
+    applied. The issue is left `dispatched` either way -- rule 4 changes
+    *what the worker's claim is checked against*, not the fallback status
+    when it can't be verified.
     """
     config, paths, fake_gh, dispatched_at = _dead_worker_rework_bed(
         tmp_path, decision="request_changes"
@@ -461,11 +467,22 @@ def test_flip4_request_changes_exit0_discards_fresh_outcome(tmp_path: Path) -> N
 
     state = load_state(paths.state_file)
     entry = state["issues"]["207"]
-    # Current (disagreeing) behaviour: exit_code == 0 wins, the fresh
-    # outcome is never consulted.
     assert entry["status"] == "dispatched"
     events = state.get("events", [])
+    # New behaviour: the fresh outcome is consulted (and its head_sha
+    # surfaced) instead of the exit code short-circuiting first.
     assert any(
+        e.get("kind") == "orphaned_worker_drift"
+        and e["payload"].get("reason") == "dead_worker_completed_outcome"
+        and e["payload"].get("worker_outcome_head_sha") == "abc123"
+        for e in events
+    )
+    assert any(
+        e.get("kind") == "rework_outcome_skipped"
+        and e["payload"].get("reason") == "remote_head_unavailable"
+        for e in events
+    )
+    assert not any(
         e.get("kind") == "orphaned_worker_drift"
         and e["payload"].get("reason") == "dead_worker_clean_exit_no_op"
         for e in events
@@ -474,13 +491,14 @@ def test_flip4_request_changes_exit0_discards_fresh_outcome(tmp_path: Path) -> N
 
 
 def test_flip4_approved_rework_exit0_discards_fresh_outcome(tmp_path: Path) -> None:
-    """FLIP 4: current behaviour; contrast/companion to the test above.
+    """FLIP 4: was a clean exit code short-circuiting before the fresh
+    outcome file was ever consulted; now the with-PR lane consults the
+    fresh outcome first (rule 4). Contrast/companion to the test above.
 
     The `approved` + `rework_requested`-PR-state branch of
-    `handle_dead_worker_with_pr` has its own, separately-written
-    `if terminal_exit_code == 0:` short-circuit ahead of
-    `handle_dead_worker_completed_outcome` -- the same disagreement,
-    duplicated at a second call site rather than shared.
+    `handle_dead_worker_with_pr` has its own, separately-written call into
+    `handle_dead_worker_completed_outcome` ahead of the exit-code check --
+    the same fix, duplicated at this second call site rather than shared.
     """
     config, paths, fake_gh, dispatched_at = _dead_worker_rework_bed(
         tmp_path, decision="approved", pr_state_status="rework_requested"
@@ -496,6 +514,17 @@ def test_flip4_approved_rework_exit0_discards_fresh_outcome(tmp_path: Path) -> N
     assert entry["status"] == "dispatched"
     events = state.get("events", [])
     assert any(
+        e.get("kind") == "orphaned_worker_drift"
+        and e["payload"].get("reason") == "dead_worker_completed_outcome"
+        and e["payload"].get("worker_outcome_head_sha") == "abc123"
+        for e in events
+    )
+    assert any(
+        e.get("kind") == "rework_outcome_skipped"
+        and e["payload"].get("reason") == "remote_head_unavailable"
+        for e in events
+    )
+    assert not any(
         e.get("kind") == "orphaned_worker_drift"
         and e["payload"].get("reason") == "dead_worker_clean_exit_no_op"
         for e in events

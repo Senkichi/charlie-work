@@ -50,10 +50,11 @@ def _classify_session_failure(
 ) -> tuple[str | None, str | None]:
     """Classify a session failure from its log tail. Thin wrapper around
     ``worker_fate.classify_failure`` (design doc §7) — devin has no
-    account-error detection (``account_error_detection=False``) and already
-    uses the emission-time throttle anchor (``legacy_classification_
-    anchor=False``, issue #1997), so no FLIP marker applies here: this
-    module's observable behaviour is unchanged by the merge.
+    account-error detection (``account_error_detection=False``). The
+    emission-time throttle anchor (issue #1997) devin has always used is
+    now the only anchor ``classify_failure`` has (rule 6, wf-design.md §9,
+    ported it to claude-code/api too), so this module's observable
+    behaviour is unchanged by that flip.
 
     Returns (failure_kind, throttled_until_iso):
     - failure_kind: "rate_limited" | "quota_exhausted" | None
@@ -67,7 +68,6 @@ def _classify_session_failure(
         quota_error_markers=quota_error_markers,
         resume_margin_seconds=resume_margin_seconds,
         account_error_detection=False,
-        legacy_classification_anchor=False,
         now=now,
     )
 
