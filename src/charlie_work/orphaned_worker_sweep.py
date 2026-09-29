@@ -63,6 +63,7 @@ def maybe_reap_dead_dispatched_worker(
     dead_dispatched_reap_minutes: float,
     now: datetime,
     sweep_events: list[tuple[str, dict[str, Any]]],
+    max_throttle_rearms: int,
 ) -> tuple[dict[str, Any], bool]:
     """Timed dead-dispatched backstop (issue #654), run per dead-PID entry.
 
@@ -108,6 +109,15 @@ def maybe_reap_dead_dispatched_worker(
     would reintroduce exactly the wedge this backstop fixes. An expired
     or unparseable window fails closed to the normal reap timer.
 
+    Issue #1993: after the window, the grace runs from ``max(orphan_drift_at,
+    throttled_until)`` (#1976 was reaped 4 dispatchable minutes after its
+    window). With no linked PR the reclaim already re-pooled the issue, so a
+    lapsed grace means dispatch is merely pending (capacity, #1986): the
+    clock re-arms (``dead_dispatched_throttle_rearmed``) up to
+    ``max_throttle_rearms`` times per death, then the #654 escalation fires.
+    PR-linked entries hold the branch mutex; they escalate on the anchored
+    grace.
+
     Returns the (possibly replaced) ``state`` mapping -- the escalation
     helpers rebuild it -- and ``True`` when the entry was escalated, so the
     caller appends to ``reap_escalations`` and moves to the next issue.
@@ -119,14 +129,36 @@ def maybe_reap_dead_dispatched_worker(
     import charlie_work.workflow as _wf
 
     orphan_drift_at = entry.get("orphan_drift_at")
-    if orphan_drift_at is None or dead_dispatched_reap_minutes <= 0:
+    drift_dt = _wf._parse_iso_timestamp(orphan_drift_at) if orphan_drift_at else None
+    if drift_dt is None or dead_dispatched_reap_minutes <= 0:
         return state, False
-    if is_provider_throttle_failure(entry.get("dead_worker_failure_kind")):
+    grace_anchor = drift_dt
+    provider_throttled = is_provider_throttle_failure(entry.get("dead_worker_failure_kind"))
+    if provider_throttled:
         throttled_until_dt = _wf._parse_iso_timestamp(state.get("throttled_until"))
-        if throttled_until_dt is not None and throttled_until_dt > now:
-            return state, False
-    drift_dt = _wf._parse_iso_timestamp(orphan_drift_at)
-    if drift_dt is None or (now - drift_dt).total_seconds() / 60 < dead_dispatched_reap_minutes:
+        if throttled_until_dt is not None:
+            if throttled_until_dt > now:
+                return state, False
+            grace_anchor = max(drift_dt, throttled_until_dt)
+    if (now - grace_anchor).total_seconds() / 60 < dead_dispatched_reap_minutes:
+        return state, False
+    rearm_count = int(entry.get("throttle_reap_rearm_count") or 0)
+    if provider_throttled and pr_data is None and rearm_count < max_throttle_rearms:
+        entry["orphan_drift_at"] = now.isoformat().replace("+00:00", "Z")
+        entry["throttle_reap_rearm_count"] = rearm_count + 1
+        sweep_events.append(
+            (
+                "dead_dispatched_throttle_rearmed",
+                {
+                    "issue_number": issue_number,
+                    "failure_kind": entry.get("dead_worker_failure_kind"),
+                    "previous_orphan_drift_at": orphan_drift_at,
+                    "throttled_until": state.get("throttled_until"),
+                    "rearm_count": rearm_count + 1,
+                    "max_rearms": max_throttle_rearms,
+                },
+            )
+        )
         return state, False
     pr_number = int(pr_data["number"]) if pr_data else None
     terminal = find_worker_terminal_status(sessions_dir, issue_number)

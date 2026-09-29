@@ -716,6 +716,45 @@ def test_rework_restore_stalled_death_counts_caps(tmp_path: Path) -> None:
     assert len(entry.get("worker_death_at") or []) == 1
 
 
+@pytest.mark.parametrize(
+    ("failure_kind", "expect_escalated"),
+    [("rate_limited", False), ("quota_exhausted", False), ("stalled", True)],
+)
+def test_rework_restore_throttle_death_never_trips_full_death_loop_cap(
+    tmp_path: Path, failure_kind: str, expect_escalated: bool
+) -> None:
+    """Issue #1993: with the death-loop cap already full from earlier deaths,
+    a throttle death must not be the one that escalates -- not crediting it
+    is not enough. ``stalled`` is the control proving the seed trips it."""
+    issue_number, pr_number, branch = 1993, 502, "agent/issue-1993"
+    state_file, open_prs = _seed_dispatched_rework(tmp_path, issue_number, pr_number, branch)
+    config = OrchestratorConfig()
+    now_iso = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    prior = [now_iso] * (config.watchdog.max_auto_redispatch + 1)
+    state = load_state(state_file)
+    state["issues"][str(issue_number)].update(redispatch_at=prior, worker_death_at=prior)
+    state_file.write_text(json.dumps(state), encoding="utf-8")
+
+    _reap_restore_rework_requested(
+        state_file,
+        FakeGitHub(),
+        config,
+        open_prs,
+        _worker_view(issue_number, branch, tmp_path),
+        failure_kind=failure_kind,
+        repo_root=None,
+        write_gate=_wg(state_file),
+    )
+
+    entry = load_state(state_file)["issues"][str(issue_number)]
+    if expect_escalated:
+        assert entry["status"] == "escalated"
+        assert entry["escalation_reason"] == "worker_death_loop"
+    else:
+        assert entry["status"] == "rework_requested"
+        assert entry.get("escalation_reason") is None
+
+
 def test_pre_review_rework_quota_death_does_not_burn_cap(tmp_path: Path) -> None:
     """``_route_dead_worker_to_pre_review_rework``: with the cap already at
     ``max_auto_redispatch``, a provider-throttle death must not push the

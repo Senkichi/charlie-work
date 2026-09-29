@@ -1030,8 +1030,13 @@ def clear_dead_worker_failure_kind(entry: dict[str, Any]) -> None:
 
     Mutates ``entry`` in place; every call site has already spread the
     stored issue entry into a fresh mapping it owns before calling.
+
+    Issue #1993: ``throttle_reap_rearm_count`` (the orphan sweep's bounded
+    re-arm of the timed reap for a throttle death) belongs to the same
+    classification and is dropped with it.
     """
     entry.pop("dead_worker_failure_kind", None)
+    entry.pop("throttle_reap_rearm_count", None)
 
 
 def _reviewer_quota(data: dict[str, Any]) -> dict[str, Any]:
