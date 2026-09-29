@@ -499,6 +499,26 @@ def body_has_crash_signature(text: str) -> bool:
     )
 
 
+# Devin CLI's headless (--print, ``auto`` permission mode) rejection notice: an
+# exec the classifier does not auto-approve is auto-rejected and the whole
+# session ENDS with no result event (issue #2011). The signature lands in the
+# process log, so it is matched there.
+EXEC_REJECTED_LOG_SIGNATURE = "rejected a tool call that requires confirmation"
+CAUSE_REVIEWER_EXEC_REJECTED = "reviewer_exec_rejected"
+
+
+def _log_reports_exec_rejection(log_path: Path) -> bool:
+    """True when the reviewer's log carries Devin's exec-rejection signature.
+
+    Never raises: an unreadable/missing log is "no signal".
+    """
+    try:
+        text = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    return EXEC_REJECTED_LOG_SIGNATURE in text.lower()
+
+
 # Fields extracted from the stream-json ``result`` event's terminal payload
 # (issue #1354). These are the fields that diagnose WHY the session ended:
 # ``is_error`` / ``subtype`` / ``api_error_status`` / ``terminal_reason`` /
@@ -606,7 +626,12 @@ def _extract_terminating_cause(
     # stream-cut signal; when only an exit code is available, the cause
     # is the exit code.
     if "cause" not in cause:
-        if result_event is not None:
+        if result_event is None and _log_reports_exec_rejection(log_path):
+            # Issue #2011: the session ran, then ended on a rejected exec.
+            # Distinct from a stream cut (and from exit_code:N, which a
+            # rejected-exec session also carries).
+            cause["cause"] = CAUSE_REVIEWER_EXEC_REJECTED
+        elif result_event is not None:
             terminal_reason = result_event.get("terminal_reason")
             subtype = result_event.get("subtype")
             is_error = result_event.get("is_error")
@@ -774,7 +799,24 @@ def _extract_review_session_summary(
     else:
         reason = REVIEW_MISS_DIED_MID_SESSION
 
-    if reason == REVIEW_MISS_LAUNCH_FAILED:
+    # Issue #2011: a session ended by Devin's exec rejection did run; the
+    # "failed to start" heading would be false. ``reason`` is deliberately left
+    # untouched (launch_failed / died_mid_session) because it feeds the #583
+    # rollback guard and many consumers; only the comment text and the
+    # terminating cause distinguish it.
+    exec_rejected = _log_reports_exec_rejection(log_path)
+
+    if exec_rejected:
+        parts = [f"{REVIEW_SESSION_SUMMARY_HEADING}\n"]
+        parts.append(
+            "The automated reviewer started and ran, then its session was ended "
+            "when it attempted a shell command that headless mode does not "
+            "auto-approve (the command was rejected and the session stopped). "
+            "No verdict was produced. This is a reviewer permission-policy "
+            "failure, not a judgement about this PR.\n"
+        )
+        parts.append("\n### Reviewer process output:\n")
+    elif reason == REVIEW_MISS_LAUNCH_FAILED:
         parts = [f"{REVIEW_SESSION_FAILED_HEADING}\n"]
         parts.append(
             "The automated reviewer exited before running a single turn, so no "
