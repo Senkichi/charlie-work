@@ -61,6 +61,7 @@ from .base_branch import resolve_base_branch_name  # noqa: F401  (deliberate re-
 from .non_worker_product import (  # noqa: F401  (deliberate re-export)
     _LAUNCHER_OWNED_PR_BODY_RE,
     _declared_scaffolding_matcher,
+    _is_adapter_shim_path,
     _launcher_owned_file_matcher,
     _launcher_owned_matcher,
     _non_worker_product_matcher,
@@ -140,9 +141,18 @@ def _run_remote_captured(
 # unrepresentable.
 WORKTREE_UNSAFE_KIND_SHIM_DIRT = "worktree_unsafe_shim_dirt"
 WORKTREE_UNSAFE_KIND_LOCAL_COMMITS = "worktree_unsafe_local_commits"
+# Issue #2019: uncommitted edits to source/test files (a dead worker's real,
+# unpaid-for output) are NOT shim dirt. Judgment class: never auto-cleared.
+WORKTREE_UNSAFE_KIND_UNCOMMITTED_WORK = "worktree_unsafe_uncommitted_work"
 WORKTREE_UNSAFE_KINDS: frozenset[str] = frozenset(
-    {WORKTREE_UNSAFE_KIND_SHIM_DIRT, WORKTREE_UNSAFE_KIND_LOCAL_COMMITS}
+    {
+        WORKTREE_UNSAFE_KIND_SHIM_DIRT,
+        WORKTREE_UNSAFE_KIND_LOCAL_COMMITS,
+        WORKTREE_UNSAFE_KIND_UNCOMMITTED_WORK,
+    }
 )
+_UNCOMMITTED_WORK_REASON_PREFIX = "worktree has uncommitted source work"
+_UNCOMMITTED_REASON_PATH_LIMIT = 5
 
 
 def _worktree_unsafe_kind_from_reason(reason: str) -> str:
@@ -164,6 +174,8 @@ def _worktree_unsafe_kind_from_reason(reason: str) -> str:
     """
     if "local commit" in reason:
         return WORKTREE_UNSAFE_KIND_LOCAL_COMMITS
+    if _UNCOMMITTED_WORK_REASON_PREFIX in reason:
+        return WORKTREE_UNSAFE_KIND_UNCOMMITTED_WORK
     if "uncommitted modifications" in reason:
         return WORKTREE_UNSAFE_KIND_SHIM_DIRT
     return WORKTREE_UNSAFE_KIND_LOCAL_COMMITS
@@ -1960,7 +1972,28 @@ def _worker_authored_dirty(
     materialize_dirs: tuple[str, ...] = (),
 ) -> bool:
     """Return True if the worktree has uncommitted changes that are NOT
-    orchestrator scaffolding.
+    orchestrator scaffolding (see ``_worker_authored_dirty_paths``)."""
+    return bool(_worker_authored_dirty_paths(worktree_path, injected_paths, materialize_dirs))
+
+
+def _dirty_reason_for_paths(dirty_paths: list[str]) -> str:
+    """Issue #2019: name the dirt by content. Any path outside the adapter
+    shim namespace is source work and gets the distinct reason (and kind)."""
+    source_paths = [p for p in dirty_paths if not _is_adapter_shim_path(p)]
+    if not source_paths:
+        return "worktree has uncommitted modifications"
+    shown = ", ".join(source_paths[:_UNCOMMITTED_REASON_PATH_LIMIT])
+    extra = len(source_paths) - _UNCOMMITTED_REASON_PATH_LIMIT
+    suffix = f", +{extra} more" if extra > 0 else ""
+    return f"{_UNCOMMITTED_WORK_REASON_PREFIX} ({len(source_paths)} path(s): {shown}{suffix})"
+
+
+def _worker_authored_dirty_paths(
+    worktree_path: Path,
+    injected_paths: tuple[str, ...] = (),
+    materialize_dirs: tuple[str, ...] = (),
+) -> list[str]:
+    """Return the uncommitted paths that are NOT orchestrator scaffolding.
 
     ``injected_paths`` and ``materialize_dirs`` are worktree-relative paths
     (files or directories) that the orchestrator writes into the worktree
@@ -2007,11 +2040,11 @@ def _worker_authored_dirty(
     is_non_worker_product = _non_worker_product_matcher(
         injected_paths, materialize_dirs, include_launcher_dirs=True
     )
-    for raw_path in _parse_status_v2_paths(status_result.stdout):
-        if is_non_worker_product(raw_path):
-            continue
-        return True
-    return False
+    return [
+        raw_path
+        for raw_path in _parse_status_v2_paths(status_result.stdout)
+        if not is_non_worker_product(raw_path)
+    ]
 
 
 def _capture_worktree_work_to_rescue_ref(
@@ -2157,8 +2190,9 @@ def _worktree_refuse_to_reset_reason(
     """
     # Uncommitted modifications are only meaningful when the worktree directory exists.
     if worktree_path is not None and worktree_path.is_dir():
-        if _worker_authored_dirty(worktree_path, injected_paths, materialize_dirs):
-            return "worktree has uncommitted modifications"
+        dirty_paths = _worker_authored_dirty_paths(worktree_path, injected_paths, materialize_dirs)
+        if dirty_paths:
+            return _dirty_reason_for_paths(dirty_paths)
         local_tip_result = run_captured(
             ["git", "rev-parse", "--verify", "-q", "HEAD"],
             cwd=worktree_path,
@@ -2312,8 +2346,9 @@ def _worktree_dirty_reason(
     """
     if not worktree_path.is_dir():
         return None
-    if _worker_authored_dirty(worktree_path, injected_paths, materialize_dirs):
-        return "worktree has uncommitted modifications"
+    dirty_paths = _worker_authored_dirty_paths(worktree_path, injected_paths, materialize_dirs)
+    if dirty_paths:
+        return _dirty_reason_for_paths(dirty_paths)
     return None
 
 

@@ -127,7 +127,7 @@ DETERMINISTIC_ESCALATION_FAILURE_KINDS: frozenset[str] = frozenset(
 # actively fights the safety system that raised the escalation and risks a
 # second writer on a branch that already has divergent local work.
 DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS: frozenset[str] = frozenset(
-    {"worktree_unsafe_local_commits"}
+    {"worktree_unsafe_local_commits", "worktree_unsafe_uncommitted_work"}
 )
 # Deliberately excluded: "worktree_probe_failed" (see worktree.WorktreeProbeFailedError).
 # A failed safety probe (e.g. git status --porcelain hitting an index lock) is

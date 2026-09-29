@@ -130,6 +130,18 @@ def _declared_scaffolding_matcher(
     return _is_declared
 
 
+def _is_adapter_shim_path(raw_path: str) -> bool:
+    """True for a root-level dot-entry (``.devin/``, ``.claude/``, ``.env``…).
+
+    Issue #2019: dirt that survives the scaffolding filter is classified on
+    content. Adapter/tool config lives in root-level dot-entries; anything
+    else (``src/``, ``tests/``, …) is worker-authored source whose loss is
+    unacceptable, so it must not share the mechanical ``shim_dirt`` kind.
+    """
+    parts = PurePosixPath(str(raw_path).replace("\\", "/")).parts
+    return bool(parts) and parts[0].startswith(".")
+
+
 def _non_worker_product_matcher(
     injected_paths: tuple[str, ...] = (),
     materialize_dirs: tuple[str, ...] = (),
