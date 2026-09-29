@@ -54,7 +54,7 @@ UNESCALATE_PR_RESET_FIELDS = (
     "conflict_rework_attempts_stall_since",
     "conflict_rework_attempts_stall_head",
     # Issue #1972: the local merge gate's per-kind rework counters and the
-    # last-failure-kind marker (``local_lanes._local_route_merge_rework``).
+    # last-failure-kind marker (``local_merge_rework._local_route_merge_rework``).
     # A re-arm that left them behind would re-escalate on the next gate
     # failure without a single fresh rework attempt.
     "local_merge_conflict_rework_attempts",
