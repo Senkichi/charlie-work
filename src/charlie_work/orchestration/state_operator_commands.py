@@ -6,6 +6,11 @@ Track 2 Phase B leaf L01 batch 4 (issue #1647, parent #1632, umbrella
 ``app.<name>(...)`` -- moved verbatim from ``OrchestratorApp`` in
 ``charlie_work.workflow``; the ``workflow_delegation`` installer re-attaches
 each ``def`` onto the class.
+
+``unescalate``'s no-remote park delegates (``_local_finished_branch`` and
+``_local_park_reentry_target``, issue #1970) live in the sibling module
+``state_unescalate_local_park.py`` -- extracted when this file crossed its
+file-size ratchet mark, same pattern as ``state_review_reap.py`` (#1874).
 """
 
 from __future__ import annotations
@@ -16,14 +21,8 @@ import json
 
 from charlie_work.github import GitHubError
 from charlie_work.labels import TransitionOutcome
-from charlie_work.local_lane import (
-    LOCAL_PENDING_STATUS,
-    branch_diff,
-    branch_head_sha,
-    is_local_pr_record,
-    local_base_branch,
-)
-from charlie_work.local_work_park import _post_branch_comment, publishes_pull_requests
+from charlie_work.local_lane import LOCAL_PENDING_STATUS, is_local_pr_record
+from charlie_work.local_work_park import _post_branch_comment
 from charlie_work.review_decision import record_decision
 from charlie_work.state import (
     PASSIVE_OPEN_STATUS,
@@ -37,16 +36,6 @@ from charlie_work.worktree import (
 )
 import charlie_work.workflow as _wf
 
-
-# Local-lane record statuses a parked issue can re-enter WITHOUT this
-# command touching the record: ``_local_review_packets`` rebuilds a
-# ``local_pending`` record's packet, ``_local_dispatch_reviewers`` claims a
-# ``reviewing`` one, and ``_local_merge_approved`` consumes an ``approved``
-# one. Every other status strands the record under an ``unescalate`` park --
-# the packet pass skips ``escalated``/``blocked`` outright, and
-# ``rework_requested``'s dispatch lane keys off the *issue* status the park
-# just reset to ``open_passive``.
-_LOCAL_LANE_REENTRY_STATUSES = frozenset({LOCAL_PENDING_STATUS, "reviewing", "approved"})
 
 # ``unescalate`` record targets that trigger the full counter/cache reset in
 # ``_apply_pr_reset``: the remote passive-open re-entry plus the two local
@@ -557,35 +546,19 @@ def unescalate(
     local_still_valid: tuple[dict[str, Any], str] | None = None
     local_record_head: str | None = None
     if parked_branch is not None and local_lane_record:
-        # Issue #1970 rework: the park above re-parks the issue for the
-        # local lane, but when a lane record already exists for the issue
-        # (``pr_number`` resolved through ``prs[N].issue_number`` -- e.g.
-        # the reviewer-attempt cap escalated it with a current packet) the
-        # plain ``open_passive`` reset would leave it adopted-in-name-only:
-        # the adoption pass skips issues that already have a record, the
-        # packet pass sees a current packet and does not rebuild, and
-        # ``_local_dispatch_reviewers`` / ``_local_merge_approved`` /
-        # ``_local_dispatch_rework`` only select ``reviewing`` /
-        # ``approved`` / issue-keyed ``rework_requested`` records. Nothing
-        # would ever pick the record up again -- a silent strand where the
-        # old drop at least re-dispatched a worker. A parked local record
-        # must instead re-enter the lane: ``approved`` when a still-valid
-        # approval is on file (the merge gate resumes it), otherwise
-        # ``local_pending`` so the next packet pass rebuilds and
-        # re-dispatches a reviewer; a still-valid request_changes/blocked
-        # verdict is voided below exactly as the remote path voids one, or
-        # dispatch would skip the rebuilt record on the terminal decision.
-        local_branch = str(pr_state.get("branch") or pr_state.get("headRefName") or "")
-        local_record_head = branch_head_sha(self.repo_root, local_branch) if local_branch else None
-        local_still_valid = self._still_valid_recorded_verdict(pr_number, local_record_head)
-        if local_still_valid is not None and local_still_valid[0].get("decision") == "approved":
-            pr_status_target = "approved"
-        elif (
-            local_still_valid is not None
-            or pr_stuck
-            or pr_state.get("status") not in _LOCAL_LANE_REENTRY_STATUSES
-        ):
-            pr_status_target = LOCAL_PENDING_STATUS
+        # Issue #1970 rework: a parked local record must re-enter the lane
+        # (approved/local_pending) rather than be left adopted-in-name-only
+        # -- see _local_park_reentry_target for the strand analysis.
+        (
+            pr_status_target,
+            local_still_valid,
+            local_record_head,
+        ) = self._local_park_reentry_target(
+            pr_number,
+            pr_state,
+            pr_stuck=pr_stuck,
+            pr_status_target=pr_status_target,
+        )
 
     # Issue #1765: resetting the PR to the passive-open state is meant to
     # make review_queue() reachable again, but review_queue() skips any PR
@@ -901,45 +874,6 @@ def unescalate(
             "changed": True,
         },
     )
-
-
-def _local_finished_branch(
-    self,
-    issue_number: int,
-    issue_entry: dict[str, Any],
-    pr_entry: dict[str, Any] | None = None,
-) -> str | None:
-    """The issue's worker branch when it still holds parkable work, else None.
-
-    Issue #1970: ``unescalate``'s no-live-PR branch uses this to decide
-    whether an escalated issue on a no-remote backend has a deliverable
-    worth handing to the local path (``agent:review-ready``) rather than
-    dropping back to the never-dispatched baseline.
-
-    Returns None -- keep the drop -- when the backend publishes pull
-    requests (there is nothing to park), when no worker branch resolves,
-    or when the branch carries no diff against the local base. A
-    ``branch_diff`` failure (missing ref, no merge base) returns None just
-    like an empty diff: uncertainty is never proof of work, matching
-    ``park_salvageable_local_orphan``'s fallback rule. The branch is
-    resolved by ``_local_branch_for_issue`` -- the same resolver the
-    adoption pass uses -- with ``pr_entry``'s ``branch``/``headRefName`` as
-    fallback when a lane record already exists (an escalated record's
-    recorded branch outlives the issue entry's ``branch_name``), so a name
-    this returns is one the local path can actually adopt on the next
-    pass.
-    """
-    if publishes_pull_requests(self.gh):
-        return None
-    branch = self._local_branch_for_issue(issue_number, issue_entry)
-    if not branch and is_local_pr_record(pr_entry):
-        branch = str(pr_entry.get("branch") or pr_entry.get("headRefName") or "")
-    if not branch:
-        return None
-    base_branch = local_base_branch(self.repo_root) or "HEAD"
-    if not branch_diff(self.repo_root, base_branch, branch):
-        return None
-    return branch
 
 
 def ack_unauthorized_merge(

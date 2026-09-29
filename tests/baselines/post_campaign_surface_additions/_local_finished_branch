@@ -1,7 +1,10 @@
-issue #1970: probe added in orchestration/state_operator_commands.py for
-unescalate's no-live-PR branch -- on a no-remote backend it resolves
-whether the issue's worker branch still carries a diff against the local
-base, selecting the local_work_ready park over the unescalated_requeued
-drop. Net-new OrchestratorApp member declared here so the member-surface
-conservation check in tests/test_workflow_delegation_l00.py subtracts it
-before comparing moved delegates against the pre-campaign total (133).
+issue #1970: probe added for unescalate's no-live-PR branch -- on a
+no-remote backend it resolves whether the issue's worker branch still
+carries a diff against the local base, selecting the local_work_ready
+park over the unescalated_requeued drop. Net-new OrchestratorApp member
+declared here so the member-surface conservation check in
+tests/test_workflow_delegation_l00.py subtracts it before comparing moved
+delegates against the pre-campaign total (133). Originally landed in
+orchestration/state_operator_commands.py; relocated to
+orchestration/state_unescalate_local_park.py in PR #1987's second rework
+round when the parent module crossed its file-size ratchet mark.

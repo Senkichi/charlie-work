@@ -1,0 +1,10 @@
+issue #1970 (PR #1987 rework round 2): re-entry target/verdict
+computation for unescalate's local-lane park -- when the park resolves an
+EXISTING local lane record, this member decides whether the record
+re-enters as approved (still-valid approval on file) or local_pending
+(rebuild + re-dispatch), returning the still-valid verdict and resolved
+branch head the caller needs for the verdict void and pending-stub pin.
+Net-new OrchestratorApp member declared here so the member-surface
+conservation check in tests/test_workflow_delegation_l00.py subtracts it
+before comparing moved delegates against the pre-campaign total (133).
+Lives in orchestration/state_unescalate_local_park.py.
