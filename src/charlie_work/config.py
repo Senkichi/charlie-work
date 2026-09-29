@@ -519,6 +519,18 @@ class DispatchConfig:
     # authenticated orchestrator applies them (see ``rework_outcome.py``).
     # The staged-rollout plan this flag served (issue #1224) is superseded.
     require_worker_github_token: bool = False
+    # Issue #1944: on a repo with no remote, an agent branch whose commits are
+    # unreachable from the default branch can never become "pushed" — there is
+    # nowhere to push — so refusing to reset it escalates the issue on every
+    # requeue until someone deletes the branch by hand. When ON (default), the
+    # refuse-to-reset path in ``create_worktree`` archives the tip to a local
+    # ``archive/<branch>-<utc-date>`` branch and resets/recreates from the
+    # default branch instead of escalating; a ``worktree_local_commits_archived``
+    # event records the archive ref. Set to false to restore the
+    # refuse-and-escalate behavior. Repos WITH an origin remote are unaffected —
+    # unpushed commits there keep refusing either way, because a salvage push
+    # is real.
+    archive_unreachable_local_commits: bool = True
 
     def __post_init__(self) -> None:
         # Normalize to a tuple of forward-slash strings. The writer marker is
@@ -2611,6 +2623,12 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
         raise ConfigError(
             "config section 'dispatch' key 'require_worker_github_token' must be a bool, "
             f"got {type(_rwt).__name__}"
+        )
+    _aulc = dispatch_data.get("archive_unreachable_local_commits")
+    if _aulc is not None and not isinstance(_aulc, bool):
+        raise ConfigError(
+            "config section 'dispatch' key 'archive_unreachable_local_commits' must be "
+            f"a bool, got {type(_aulc).__name__}"
         )
     # Issue #1129: int validation for max_open_agent_prs.
     _mop = dispatch_data.get("max_open_agent_prs")
