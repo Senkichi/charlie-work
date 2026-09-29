@@ -1212,12 +1212,12 @@ class AutoMergeConfig:
 @dataclass(frozen=True)
 class PreflightConfig:
     """Thresholds and fatal/non-fatal classification for ``preflight.py``'s
-    four host-precondition checks (issue #1363). Defaults match the issue's
-    explicit design: disk_floor and venv_identity are fatal (refuse the
-    pass); clock_sanity and config_freshness are non-fatal tripwires (emit
-    an event, pass proceeds). Never hardcode these values at a call site --
-    read them from here so an operator can retune per host without a code
-    change.
+    five host-precondition checks (issue #1363; fifth check #1950). Defaults
+    match the issues' explicit design: disk_floor, venv_identity, and
+    git_identity are fatal (refuse the pass); clock_sanity and
+    config_freshness are non-fatal tripwires (emit an event, pass proceeds).
+    Never hardcode these values at a call site -- read them from here so an
+    operator can retune per host without a code change.
     """
 
     #: Minimum free disk space, in GB, on each volume hosting state_dir/repo
@@ -1232,6 +1232,13 @@ class PreflightConfig:
     clock_sanity_fatal: bool = False
     venv_identity_fatal: bool = True
     config_freshness_fatal: bool = False
+    #: Fatal by default (issue #1950): a repo-local ``user.email``/
+    #: ``user.name`` override that differs from the global identity makes
+    #: every commit in every worktree of the managed checkout carry the
+    #: bogus identity -- exactly the misattribution this check exists to
+    #: stop, so the pass refuses rather than dispatching through it. Set
+    #: false on a host that deliberately pins a per-repo commit identity.
+    git_identity_fatal: bool = True
 
 
 @dataclass(frozen=True)
@@ -3354,6 +3361,7 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
             "clock_sanity_fatal",
             "venv_identity_fatal",
             "config_freshness_fatal",
+            "git_identity_fatal",
         ):
             bool_value = preflight_data.get(bool_key)
             if bool_value is not None and not isinstance(bool_value, bool):
