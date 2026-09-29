@@ -580,8 +580,11 @@ def test_dispatch_defers_after_stall_reap_sets_throttled_until(tmp_path: Path) -
         sessions_dir,
         4055,
         log_text=(
+            # Issue #1997: the cooldown anchors at the log's emission time —
+            # the fixture ages the mtime ~25 minutes — so the reset must
+            # exceed that for the window to still be live at classification.
             "Error: Reached overall message rate limit. Please try again "
-            "later. Your limit will reset in 9 minutes.\n"
+            "later. Your limit will reset in 45 minutes.\n"
         ),
     )
 
