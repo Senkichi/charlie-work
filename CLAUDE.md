@@ -1,5 +1,9 @@
 # CLAUDE.md — Project Invariants for Worker Agents
 
+**Vocabulary:** use the canonical terms in [`CONTEXT.md`](CONTEXT.md) in code, comments,
+and PR text — and avoid the synonyms it lists. Past architectural decisions and their
+rationale live in [`docs/adr/`](docs/adr/).
+
 ## Commands
 
 ```bash
