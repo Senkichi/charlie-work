@@ -26,6 +26,7 @@ from pathlib import Path
 
 import pytest
 
+from _local_gate_helpers import drive_merge_gate
 from charlie_work.adapters import SessionDispatchResult, SessionRequest
 from charlie_work.claude_code import ClaudeWorkerRecord
 from charlie_work.config import OrchestratorConfig, build_config_from_data
@@ -641,7 +642,9 @@ class TestLocalMergeGate:
     def test_approved_branch_merges_and_issue_closes(self, repo: Path) -> None:
         app, head, _ = self._approved(repo)
 
-        results = app._local_merge_approved()
+        # Async gate (issue #1974): first call launches the detached suite,
+        # a later call resolves the green result into the merge.
+        results = drive_merge_gate(app, 7)
 
         assert results[0]["outcome"] in ("merged", "already_merged")
         # Base advanced to the reviewed content.
@@ -675,7 +678,7 @@ class TestLocalMergeGate:
             7, "approved", reviewed_head=head, verdict_provenance="fresh_llm_review"
         )
 
-        results = app._local_merge_approved()
+        results = drive_merge_gate(app, 7)
 
         assert results[0]["outcome"] == "suite_failed"
         state = load_state_locked(app.paths.state_file)
@@ -695,7 +698,7 @@ class TestLocalMergeGate:
         # branch adds makes ``git merge --ff-only`` refuse.
         (repo / "a.py").write_text("untracked = True\n", encoding="utf-8")
 
-        results = app._local_merge_approved()
+        results = drive_merge_gate(app, 7)
 
         assert results[0]["outcome"] == "deferred"
         state = load_state_locked(app.paths.state_file)
@@ -774,7 +777,7 @@ class TestLocalMergeGate:
             7, "approved", reviewed_head=head, verdict_provenance="fresh_llm_review"
         )
 
-        results = app._local_merge_approved()
+        results = drive_merge_gate(app, 7)
 
         assert results[0]["outcome"] in ("merged", "already_merged")
         assert is_ancestor(repo, head, branch_head_sha(repo, "main"))
@@ -835,7 +838,7 @@ class TestLocalMergeGate:
         )
         _commit_file(repo, "unrelated.py", "u = 1\n", "base moved")
 
-        results = app._local_merge_approved()
+        results = drive_merge_gate(app, 7)
 
         assert results[0]["outcome"] == "merged"
         main_head = branch_head_sha(repo, "main")

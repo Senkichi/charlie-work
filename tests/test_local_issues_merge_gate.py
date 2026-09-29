@@ -20,6 +20,7 @@ from pathlib import Path
 
 import pytest
 
+from _local_gate_helpers import drive_merge_gate
 from charlie_work.backlog_reachability import _get_open_blockers_for_issue
 from charlie_work.config import OrchestratorConfig, build_config_from_data
 from charlie_work.labels import transition
@@ -462,7 +463,9 @@ class TestLocalMergeReworkCaps:
         app = _lane_app(lane_repo, issues_dir, config=config)
         _adopt_and_approve(app, issues_dir, "agent/issue-7-x", head)
 
-        results = app._local_merge_approved()
+        # Async gate (issue #1974): the suite runs detached -- launch pass,
+        # wait for the result file, then the resolving pass routes to rework.
+        results = drive_merge_gate(app, 7)
 
         assert results[0]["outcome"] == "suite_failed"
         assert results[0]["routed_to"] == "rework"
@@ -483,7 +486,7 @@ class TestLocalMergeReworkCaps:
         state = load_state_locked(app.paths.state_file)
         assert state["prs"]["7"]["local_suite_failed_rework_attempts"] == 1
 
-        results = app._local_merge_approved()
+        results = drive_merge_gate(app, 7)
 
         assert results[0]["outcome"] == "suite_failed"
         assert results[0]["routed_to"] == "escalated"
@@ -531,7 +534,7 @@ class TestLocalMergeReworkCaps:
         )
         assert result.ok, result.message
 
-        results = app._local_merge_approved()
+        results = drive_merge_gate(app, 7)
 
         assert results[0]["outcome"] in ("merged", "already_merged")
         state = load_state_locked(app.paths.state_file)
