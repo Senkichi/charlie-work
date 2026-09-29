@@ -26,7 +26,11 @@ Covered here:
   failure), and a PR-capable backend on identical git state -- the
   capability probe, not the git state, selects the lane;
 - dry-run reports ``local_work_ready`` without mutating labels or state;
-- CLI wiring: ``--requeue`` reaches ``OrchestratorApp.unescalate``.
+- CLI wiring: ``--requeue`` reaches ``OrchestratorApp.unescalate``;
+- the rework finding (PR #1987 review): an EXISTING local lane record for
+  the issue is re-armed into the lane by the park (``local_pending``, or
+  ``approved`` when a still-valid approval is on file, with a still-valid
+  terminal verdict voided) instead of being stranded at ``open_passive``.
 """
 
 from __future__ import annotations
@@ -37,6 +41,7 @@ from pathlib import Path
 from _cli_fixtures import _FakeGitHub, _make_repo
 from _unescalate_fixtures import _app, _events
 from charlie_work import cli
+from charlie_work.claude_code import ClaudeWorkerRecord
 from charlie_work.config import build_config_from_data
 from charlie_work.local_issues import LocalFileGitHub
 from charlie_work.paths import runtime_paths
@@ -137,6 +142,63 @@ def _seed_escalated(app: OrchestratorApp, issue_number: int, *, branch: str | No
 
 def _label_names(gh: LocalFileGitHub, issue_number: int) -> set[str]:
     return {entry["name"] for entry in gh.issue_view(issue_number)["labels"]}
+
+
+def _seed_reviewing_lane_record(
+    app: OrchestratorApp,
+    issues_dir: Path,
+    issue_number: int,
+    branch: str,
+    head: str,
+) -> None:
+    """Drive the real adoption + packet build so ``prs[N]`` is a live lane
+    record with a current packet (status ``reviewing``) -- the shape an
+    already-in-flight local issue has before something escalates it."""
+    labels = app.config.labels
+    _write_issue(issues_dir, issue_number, labels=(labels.review_ready,))
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state.setdefault("issues", {})[str(issue_number)] = {
+            "number": issue_number,
+            "title": "Test issue",
+            "status": PASSIVE_OPEN_STATUS,
+            "branch_name": branch,
+        }
+        save_state(app.paths.state_file, state)
+    built = app._local_review_packets()
+    assert built["adopted"] == [{"issue": issue_number, "branch": branch, "head": head}]
+    state = load_state(app.paths.state_file)
+    assert state["prs"][str(issue_number)]["status"] == "reviewing"
+    assert (app.paths.prs / f"pr-{issue_number}" / "review-prompt.md").is_file()
+
+
+def _escalate_lane(
+    app: OrchestratorApp,
+    issues_dir: Path,
+    issue_number: int,
+    *,
+    reason: str = "max_review_dispatch_attempts_exceeded",
+) -> None:
+    """The reviewer-attempt-cap escalation shape: record AND issue in the
+    sink, ``agent:human-needed`` on the issue file, attempt budget spent."""
+    labels = app.config.labels
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["prs"][str(issue_number)] = {
+            **state["prs"][str(issue_number)],
+            "status": "escalated",
+            "escalation_reason": reason,
+            "review_dispatch_attempt_count": (
+                app.config.review_dispatch.max_review_dispatch_attempts
+            ),
+        }
+        state["issues"][str(issue_number)] = {
+            **state["issues"][str(issue_number)],
+            "status": "escalated",
+            "escalation_reason": reason,
+        }
+        save_state(app.paths.state_file, state)
+    _write_issue(issues_dir, issue_number, labels=(labels.human_needed,))
 
 
 # ---------------------------------------------------------------------------
@@ -399,3 +461,160 @@ def test_cli_unescalate_requeue_flag_reaches_app(tmp_path: Path, monkeypatch) ->
 
     assert rc == 0
     assert captured["requeue"] is False
+
+
+# ---------------------------------------------------------------------------
+# PR #1987 rework finding: a local lane record that ALREADY exists for the
+# issue must re-enter the lane under the park. The old behavior reset the
+# record to ``open_passive`` -- a status no local lane phase consumes:
+# adoption skips issues that already have a record, the packet pass sees a
+# current packet and does not rebuild, and the reviewer/merge lanes only
+# select ``reviewing``/``approved`` records. The issue sat at
+# agent:review-ready forever -- a silent strand.
+# ---------------------------------------------------------------------------
+
+
+def test_unescalate_park_rearms_existing_lane_record(tmp_path: Path, monkeypatch) -> None:
+    """Escalated lane record with a CURRENT packet + branch ahead of base:
+    ``unescalate --issue`` parks the issue AND re-arms the record to
+    ``local_pending`` so the next packet pass rebuilds it and the reviewer
+    dispatcher can claim it -- the issue is not stranded."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    issues_dir = repo_root / "docs" / "issues"
+    branch = "agent/issue-1970-thing"
+    head = _make_branch(repo_root, branch)
+    app = _local_app(repo_root, issues_dir)
+    labels = app.config.labels
+    _seed_reviewing_lane_record(app, issues_dir, 1970, branch, head)
+    _escalate_lane(app, issues_dir, 1970)
+
+    result = app.unescalate(issue_number=1970)
+
+    assert result.ok is True
+    assert result.data["label_edge"] == "local_work_ready"
+    assert result.data["parked_branch"] == branch
+
+    state = load_state(app.paths.state_file)
+    record = state["prs"]["1970"]
+    # Not open_passive: the record re-enters the lane at local_pending,
+    # with the spent attempt budget and the escalation bookkeeping reset.
+    assert record["status"] == "local_pending"
+    assert record["review_dispatch_attempt_count"] == 0
+    assert "escalation_reason" not in record
+    assert record["branch"] == branch
+    issue_entry = state["issues"]["1970"]
+    assert issue_entry["status"] == PASSIVE_OPEN_STATUS
+    assert _label_names(app.gh, 1970) == {labels.review_ready}
+    transitions = _events(state, "unescalate")[0]["payload"]["transitions"]
+    assert transitions["pr.status"] == ["escalated", "local_pending"]
+
+    # The next packet pass rebuilds the existing record (no fresh
+    # adoption) and re-enters it into review.
+    rebuilt = app._local_review_packets()
+    assert rebuilt["adopted"] == []
+    state = load_state(app.paths.state_file)
+    assert state["prs"]["1970"]["status"] == "reviewing"
+
+    # And the reviewer dispatcher really can claim it -- no strand.
+    def _fake_launch(*args, **kwargs) -> ClaudeWorkerRecord:
+        return ClaudeWorkerRecord(
+            issue_number=1970,
+            branch=branch,
+            worktree_path="/fake/wt",
+            prompt_path="/fake/prompt.md",
+            command=("claude", "-p"),
+            pid=4242,
+            started_at="2026-09-29T00:00:00Z",
+            log_path="/fake/log.log",
+            error=None,
+            process_start_time=1.0,
+        )
+
+    monkeypatch.setattr("charlie_work.workflow.launch_claude_worker", _fake_launch)
+    dispatched = app._local_dispatch_reviewers()
+    assert dispatched["claimed"] == [1970]
+    assert dispatched["launched"][0]["pr"] == 1970
+
+
+def test_unescalate_park_voids_still_valid_terminal_verdict(tmp_path: Path) -> None:
+    """An escalated lane record carrying a request_changes verdict still
+    valid at the branch head gets the same void the remote path performs:
+    the verdict is archived to a pending stub so the rebuilt record is
+    dispatchable -- a still-valid terminal decision would make
+    ``_local_dispatch_reviewers`` skip it forever."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    issues_dir = repo_root / "docs" / "issues"
+    branch = "agent/issue-1970-thing"
+    head = _make_branch(repo_root, branch)
+    app = _local_app(repo_root, issues_dir)
+    _seed_reviewing_lane_record(app, issues_dir, 1970, branch, head)
+    verdict = app.record_local_review(
+        1970,
+        "request_changes",
+        summary="Add coverage for the new path.",
+        reviewed_head=head,
+        verdict_provenance="fresh_llm_review",
+    )
+    assert verdict.ok, verdict.message
+    _escalate_lane(app, issues_dir, 1970)
+
+    result = app.unescalate(issue_number=1970)
+
+    assert result.ok is True
+    assert result.data["parked_branch"] == branch
+    assert result.data["verdict_voided"] is True
+    state = load_state(app.paths.state_file)
+    assert state["prs"]["1970"]["status"] == "local_pending"
+    # The flat decision file is a pending stub again -- not the terminal
+    # verdict that would make dispatch skip the record.
+    decision = app._review_decision(1970)
+    assert decision["decision"] == "pending"
+    assert decision["reviewed_head_sha"] == head
+    # The voided verdict is preserved in the rounds archive.
+    assert (app.paths.prs / "pr-1970" / "rounds").is_dir()
+
+    rebuilt = app._local_review_packets()
+    assert rebuilt["adopted"] == []
+    state = load_state(app.paths.state_file)
+    assert state["prs"]["1970"]["status"] == "reviewing"
+
+
+def test_unescalate_park_restores_valid_approval_to_merge_lane(tmp_path: Path) -> None:
+    """An escalated lane record whose approval is still valid at the
+    branch head re-enters through ``approved`` -- the merge gate's own
+    selection status -- instead of going back through review (the remote
+    path's deliberate never-void-approved rule, applied to the local
+    lane)."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    issues_dir = repo_root / "docs" / "issues"
+    branch = "agent/issue-1970-thing"
+    head = _make_branch(repo_root, branch)
+    app = _local_app(repo_root, issues_dir)
+    _seed_reviewing_lane_record(app, issues_dir, 1970, branch, head)
+    verdict = app.record_local_review(
+        1970,
+        "approved",
+        reviewed_head=head,
+        verdict_provenance="fresh_llm_review",
+    )
+    assert verdict.ok, verdict.message
+    _escalate_lane(app, issues_dir, 1970)
+
+    result = app.unescalate(issue_number=1970)
+
+    assert result.ok is True
+    assert result.data["parked_branch"] == branch
+    assert result.data["verdict_voided"] is False
+    state = load_state(app.paths.state_file)
+    record = state["prs"]["1970"]
+    # ``_local_merge_approved`` selects exactly this status -- the record
+    # is back in a lane instead of stranded.
+    assert record["status"] == "approved"
+    assert record["review_dispatch_attempt_count"] == 0
+    assert "escalation_reason" not in record
+    decision = app._review_decision(1970)
+    assert decision["decision"] == "approved"
+    assert decision["reviewed_head_sha"] == head

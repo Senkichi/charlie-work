@@ -298,9 +298,10 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Drop the issue back to the never-dispatched baseline even on a "
             "no-remote repo whose finished worker branch would otherwise be "
-            "parked for the local path (agent:review-ready). Use when a "
-            "fresh worker should start over instead of reviewing the parked "
-            "work (issue #1970)."
+            "parked for the local path (agent:review-ready). Only affects "
+            "the no-live-PR issue path -- it changes nothing for an "
+            "unescalated open PR. Use when a fresh worker should start over "
+            "instead of reviewing the parked work (issue #1970)."
         ),
     )
     _add_dry_run(unescalate)
