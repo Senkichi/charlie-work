@@ -22,7 +22,9 @@ remote-only consumer can tell them apart.
 from __future__ import annotations
 
 import shlex
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -492,3 +494,119 @@ def synthesize_open_pr(local_entry: dict[str, Any]) -> dict[str, Any] | None:
         "body": "",
         "labels": [],
     }
+
+
+def disabled_lane_switches(
+    *, review_dispatch_enabled: bool, auto_merge_enabled: bool
+) -> tuple[str, ...]:
+    """The config keys of the local lane's kill switches currently turned off.
+
+    On a ``local_issues`` repo an off value here is always an explicit
+    operator choice: ``load_config`` re-defaults ``review_dispatch.enabled``
+    on when the key is absent, and ``auto_merge.enabled`` defaults on -- so
+    either reading ``False`` on such a repo is a kill switch in effect, not
+    a missing default.
+    """
+    return tuple(
+        key
+        for key, enabled in (
+            ("review_dispatch.enabled", review_dispatch_enabled),
+            ("auto_merge.enabled", auto_merge_enabled),
+        )
+        if not enabled
+    )
+
+
+def _iso_dt(value: Any) -> datetime | None:
+    """Parse a ``Z``/offset ISO-8601 string (or ``datetime``) to an aware value.
+
+    Naive inputs are read as UTC -- the convention ``state.utc_now`` and the
+    local issue-file scanner (file mtime stamped as ``...Z``) both write.
+    """
+    if isinstance(value, datetime):
+        return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
+def stalled_review_ready_issues(
+    parked: Sequence[Mapping[str, Any]],
+    issues_state: Mapping[str, Any] | None,
+    *,
+    stall_hours: float,
+    now: datetime | None = None,
+) -> tuple[list[int], float]:
+    """Issue numbers parked past ``stall_hours``, plus the oldest age in hours.
+
+    ``parked`` is the backend's review-ready issue list (``gh.issue_list``
+    dicts); ``issues_state`` is ``state["issues"]``. Age comes from the state
+    entry's ``updated_at`` first -- it is the timestamp intake last observed
+    for the issue -- falling back to the issue dict's ``updatedAt`` (the
+    issue file's mtime on this backend, i.e. when the ``review_ready`` label
+    write last touched the file). A parked issue with no usable timestamp is
+    skipped rather than alarmed on: "age unknown" is a data gap, not
+    evidence of a stall.
+    """
+    resolved_now = now if now is not None else datetime.now(UTC)
+    stalled: list[int] = []
+    oldest = 0.0
+    for issue in parked:
+        number = issue.get("number")
+        if not isinstance(number, int):
+            continue
+        entry = (issues_state or {}).get(str(number))
+        ts = _iso_dt(entry.get("updated_at")) if isinstance(entry, Mapping) else None
+        if ts is None:
+            ts = _iso_dt(issue.get("updatedAt"))
+        if ts is None:
+            continue
+        age_hours = (resolved_now - ts).total_seconds() / 3600.0
+        if age_hours > stall_hours:
+            stalled.append(number)
+            oldest = max(oldest, age_hours)
+    return sorted(stalled), round(oldest, 1)
+
+
+def kill_switch_stall_payloads(
+    *,
+    review_dispatch_enabled: bool,
+    auto_merge_enabled: bool,
+    parked: Sequence[Mapping[str, Any]],
+    issues_state: Mapping[str, Any] | None,
+    stall_hours: float,
+    now: datetime | None = None,
+) -> list[dict[str, Any]]:
+    """One ``local_lane_kill_switch_stalled`` payload per disabled lane switch.
+
+    The single shared evaluation of the issue #1968 stall condition --
+    ``_local_kill_switch_stall_alarm``'s emit site and ``charlie doctor``'s
+    matching check both derive from this so they can never disagree about
+    which switches count as off or which issues count as stalled. An empty
+    list is healthy: no disabled switch, the alarm muted (``stall_hours``
+    <= 0), or no review-ready issue parked past the threshold.
+    """
+    disabled = disabled_lane_switches(
+        review_dispatch_enabled=review_dispatch_enabled,
+        auto_merge_enabled=auto_merge_enabled,
+    )
+    if not disabled or stall_hours <= 0:
+        return []
+    stalled, oldest = stalled_review_ready_issues(
+        parked, issues_state, stall_hours=stall_hours, now=now
+    )
+    if not stalled:
+        return []
+    return [
+        {
+            "switch": switch,
+            "issue_numbers": stalled,
+            "oldest_age_hours": oldest,
+            "threshold_hours": stall_hours,
+        }
+        for switch in disabled
+    ]

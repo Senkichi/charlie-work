@@ -1,13 +1,15 @@
 """Extraction-contract tests for ``scripts/heartbeat_event_alarms.py`` (issue #1895).
 
-The five per-repo ``events.db`` kind/level anomaly checks
+The per-repo ``events.db`` kind/level anomaly checks
 (``check_error_events``, ``check_warning_events``,
 ``check_infra_blocked_events``, ``check_draft_pr_blocked_events``,
-``check_ci_headroom_unavailable``) were extracted verbatim out of
-``scripts/heartbeat_check.py`` into the sibling module
-``scripts/heartbeat_event_alarms.py`` for file-size-ratchet headroom.
+``check_ci_headroom_unavailable`` -- extracted verbatim out of
+``scripts/heartbeat_check.py`` under issue #1895 for file-size-ratchet
+headroom -- plus ``check_local_lane_kill_switch_stalled`` added under
+issue #1968) live in the sibling module
+``scripts/heartbeat_event_alarms.py``.
 ``heartbeat_check`` loads the sibling via ``importlib`` from its own
-directory and re-exports all five names plus ``EXPECTED_OPERATIONAL_KINDS``.
+directory and re-exports all six names plus ``EXPECTED_OPERATIONAL_KINDS``.
 
 The behavioral coverage in ``tests/test_heartbeat_check_event_db_checks.py``
 and ``tests/test_heartbeat_event_consumers.py`` keeps exercising the moved
@@ -59,6 +61,7 @@ _CHECK_NAMES = (
     "check_infra_blocked_events",
     "check_draft_pr_blocked_events",
     "check_ci_headroom_unavailable",
+    "check_local_lane_kill_switch_stalled",
 )
 
 
@@ -81,7 +84,7 @@ def alarms() -> ModuleType:
 # ---------------------------------------------------------------------------
 
 
-def test_sibling_module_loads_standalone_and_defines_all_five_checks(
+def test_sibling_module_loads_standalone_and_defines_all_checks(
     alarms: ModuleType,
 ) -> None:
     for name in _CHECK_NAMES:
@@ -387,3 +390,93 @@ def test_check_ci_headroom_unavailable_anomaly_when_db_missing(
     alarms.check_ci_headroom_unavailable(report, repo, baseline)
     assert report.anomaly
     assert "no events.db" in report.lines[-1]
+
+
+# ---------------------------------------------------------------------------
+# check_local_lane_kill_switch_stalled (issue #1968)
+# ---------------------------------------------------------------------------
+
+
+def test_local_lane_kill_switch_stalled_anomaly_on_seeded_row(
+    alarms: ModuleType, tmp_path: Path
+) -> None:
+    """A seeded ``local_lane_kill_switch_stalled`` row newer than baseline
+    surfaces as ANOMALY with the payload's switch and stranded issues --
+    the heartbeat forwards the event verbatim and never reparses config."""
+    repo = _make_duck_repo(tmp_path)
+    _write_events_db(repo.state_dir, [])
+    _insert_event(
+        repo.state_dir,
+        _iso(1),
+        "local_lane_kill_switch_stalled",
+        "warning",
+        '{"switch": "review_dispatch.enabled", "issue_numbers": [5, 9], '
+        '"oldest_age_hours": 30.5, "threshold_hours": 12.0}',
+    )
+    baseline = datetime.now(timezone.utc) - timedelta(minutes=10)
+    report = _RecordingReport()
+    alarms.check_local_lane_kill_switch_stalled(report, repo, baseline)
+    assert report.anomaly
+    line = report.lines[-1]
+    assert line.startswith("ANOMALY local_lane_kill_switch_stalled")
+    assert "review_dispatch.enabled" in line
+    assert "5" in line and "9" in line
+    assert "new_since_last_beat=1" in line
+
+
+def test_local_lane_kill_switch_stalled_ok_when_no_new_rows(
+    alarms: ModuleType, tmp_path: Path
+) -> None:
+    """Positive control: rows older than baseline and unrelated kinds leave
+    the check OK -- only a fresh stall event alarms."""
+    repo = _make_duck_repo(tmp_path)
+    _write_events_db(
+        repo.state_dir,
+        [
+            (_iso(60), "local_lane_kill_switch_stalled", "warning"),
+            (_iso(1), "dispatch_started", "info"),
+        ],
+    )
+    baseline = datetime.now(timezone.utc) - timedelta(minutes=10)
+    report = _RecordingReport()
+    alarms.check_local_lane_kill_switch_stalled(report, repo, baseline)
+    assert not report.anomaly, report.lines
+    line = report.lines[-1]
+    assert line.startswith("OK ")
+    assert "stalled_rows=1" in line
+    assert "new_since_last_beat=0" in line
+
+
+def test_local_lane_kill_switch_stalled_anomaly_when_db_missing(
+    alarms: ModuleType, tmp_path: Path
+) -> None:
+    """Same posture as the sibling checks: a registered repo this check
+    cannot read is a repo it cannot vouch for."""
+    repo = _make_duck_repo(tmp_path)
+    repo.state_dir.mkdir(parents=True, exist_ok=True)
+    baseline = datetime.now(timezone.utc) - timedelta(minutes=10)
+    report = _RecordingReport()
+    alarms.check_local_lane_kill_switch_stalled(report, repo, baseline)
+    assert report.anomaly
+    assert "no events.db" in report.lines[-1]
+
+
+def test_local_lane_kill_switch_stalled_counts_unparseable_ts_as_new(
+    alarms: ModuleType, tmp_path: Path
+) -> None:
+    """An unparseable ``ts`` fails toward visibility, not silence -- same
+    convention as the sibling checks."""
+    repo = _make_duck_repo(tmp_path)
+    _write_events_db(repo.state_dir, [])
+    _insert_event(
+        repo.state_dir,
+        "not-a-timestamp",
+        "local_lane_kill_switch_stalled",
+        "warning",
+        "not-json",
+    )
+    baseline = datetime.now(timezone.utc) - timedelta(minutes=10)
+    report = _RecordingReport()
+    alarms.check_local_lane_kill_switch_stalled(report, repo, baseline)
+    assert report.anomaly
+    assert "1 event(s) since last beat" in report.lines[-1]

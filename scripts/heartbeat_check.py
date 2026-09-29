@@ -38,11 +38,12 @@ from typing import Any
 import psutil
 import yaml
 
-# Issue #1895: the five events.db kind/level anomaly checks
+# Issue #1895: the events.db kind/level anomaly checks
 # (check_error_events, check_warning_events, check_infra_blocked_events,
-# check_draft_pr_blocked_events, check_ci_headroom_unavailable) live in the
-# sibling module scripts/heartbeat_event_alarms.py -- a verbatim extraction
-# for file-size-ratchet headroom, no behavior change. Loaded via importlib
+# check_draft_pr_blocked_events, check_ci_headroom_unavailable, and --
+# since #1968 -- check_local_lane_kill_switch_stalled) live in the
+# sibling module scripts/heartbeat_event_alarms.py -- extracted for
+# file-size-ratchet headroom. Loaded via importlib
 # from the sibling script path (never a bare `import`: scripts/ is not a
 # package and tests/_script_loader.py deliberately keeps it off sys.path) --
 # the same pattern #1879 uses for heartbeat_local_repo.py and
@@ -66,6 +67,7 @@ check_warning_events = _event_alarms.check_warning_events
 check_infra_blocked_events = _event_alarms.check_infra_blocked_events
 check_draft_pr_blocked_events = _event_alarms.check_draft_pr_blocked_events
 check_ci_headroom_unavailable = _event_alarms.check_ci_headroom_unavailable
+check_local_lane_kill_switch_stalled = _event_alarms.check_local_lane_kill_switch_stalled
 
 # Issue #1476: the config + worktree-path resolution helpers
 # (``load_orchestrator_config``, ``_slugify_branch``,
@@ -2684,6 +2686,7 @@ def main() -> int:
         check_infra_blocked_events(report, repo, baseline)
         check_draft_pr_blocked_events(report, repo, baseline)
         check_ci_headroom_unavailable(report, repo, baseline)
+        check_local_lane_kill_switch_stalled(report, repo, baseline)
         check_log_freshness(report, repo, now=now)
         check_loop_pass_freshness(report, repo, now=now)
         check_merge_flow(report, repo, prev_repo_state, new_repo_state, skip_delta)

@@ -2083,6 +2083,24 @@ class LocalIssuesConfig:
 
 
 @dataclass(frozen=True)
+class LocalLaneConfig:
+    """Knobs for the local (no-remote) review/merge lane (``local_lanes.py``).
+
+    ``kill_switch_stall_hours``: on a ``local_issues`` repo an explicit
+    ``review_dispatch.enabled: false`` or ``auto_merge.enabled: false`` is a
+    deliberate kill switch and stays honored -- but it dead-ends every
+    finished ticket at ``agent:review-ready`` with no signal (issue #1968).
+    While a disabled switch coexists with a review-ready issue older than
+    this many hours, the lane emits a ``local_lane_kill_switch_stalled``
+    warning event each pass (surfaced by ``charlie doctor``'s matching check
+    and the heartbeat's ``local_lane_kill_switch_stalled`` anomaly). ``0``
+    mutes the alarm only -- the kill switches themselves are unaffected.
+    """
+
+    kill_switch_stall_hours: float = 12.0
+
+
+@dataclass(frozen=True)
 class RunnersConfig:
     """GitHub Actions runner management.
 
@@ -2327,6 +2345,7 @@ class OrchestratorConfig:
     fleet: FleetConfig = field(default_factory=FleetConfig)
     notify: NotifyConfig = field(default_factory=NotifyConfig)
     local_issues: LocalIssuesConfig = field(default_factory=LocalIssuesConfig)
+    local_lane: LocalLaneConfig = field(default_factory=LocalLaneConfig)
     runners: RunnersConfig = field(default_factory=RunnersConfig)
     main_ci_reclaim: MainCiReclaimConfig = field(default_factory=MainCiReclaimConfig)
     runner_scaling: RunnerScalingConfig = field(default_factory=RunnerScalingConfig)
@@ -3963,6 +3982,20 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
     # ``review_dispatch.enabled`` (either value) wins: only the default moves.
     if local_issues.enabled and "enabled" not in review_dispatch_data:
         review_dispatch = replace(review_dispatch, enabled=True)
+    local_lane_data = _section(data, "local_lane")
+    stall_hours = local_lane_data.get("kill_switch_stall_hours")
+    if stall_hours is not None:
+        if isinstance(stall_hours, bool) or not isinstance(stall_hours, (int, float)):
+            raise ConfigError(
+                "config section 'local_lane' key 'kill_switch_stall_hours' must be a "
+                f"number, got {type(stall_hours).__name__}"
+            )
+        if stall_hours < 0:
+            raise ConfigError(
+                "config section 'local_lane' key 'kill_switch_stall_hours' must be "
+                f">= 0, got {stall_hours}"
+            )
+    local_lane = _build_section(LocalLaneConfig, "local_lane", local_lane_data)
     runners_data = _section(data, "runners")
     # Validate runners config fields
     for bool_key in ("enabled", "cancel_superseded_main_runs"):
@@ -4207,6 +4240,7 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
         fleet=fleet,
         notify=notify,
         local_issues=local_issues,
+        local_lane=local_lane,
         runners=runners,
         main_ci_reclaim=main_ci_reclaim,
         runner_scaling=runner_scaling,
