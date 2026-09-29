@@ -491,6 +491,28 @@ _ALLOWED_UNRESOLVED_KIND_SITES: tuple[_UnresolvedKindSite, ...] = (
         ),
     ),
     _UnresolvedKindSite(
+        path="orchestration/local_merge_gate.py",
+        scope="_local_gate_event",
+        source="kind",
+        reason=(
+            "_local_gate_event forwards its own `kind` parameter to "
+            "self._record_event. Every self._local_gate_event(...) call "
+            "site passes a literal kind and is itself scanned (issue #1974; "
+            "same pass-through shape as the write_gate.py entries above)."
+        ),
+    ),
+    _UnresolvedKindSite(
+        path="orchestration/local_merge_gate.py",
+        scope="_local_gate_update",
+        source="kind",
+        reason=(
+            "_local_gate_update forwards the `kind` unpacked from its "
+            "`event` tuple parameter to self._record_event. Every call site "
+            "builds the tuple with a literal kind and is itself scanned "
+            "(issue #1974)."
+        ),
+    ),
+    _UnresolvedKindSite(
         path="stalled_review_reap.py",
         scope="_append_sweep_events",
         source="kind",

@@ -1,0 +1,5 @@
+info
+# Issue #1974: the merge gate's detached suite finished green on a later
+# pass -- the semantic outcome counterpart of ``local_suite_result`` (which
+# still carries the technical record for both outcomes) and of
+# ``local_suite_failed`` on the red path.

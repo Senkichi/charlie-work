@@ -15,9 +15,11 @@ This module implements the local equivalent of the remote lane:
     ``review-decision.json``) -> ``_local_dispatch_reviewers`` claims and
     launches a reviewer in the same detached read-only checkout shape ->
     ``record_local_review`` ingests the verdict (same decision file, same
-    labels, same rework routing) -> ``_local_merge_approved`` merges the base
-    into the branch worktree, runs the full suite there, then advances the
-    base branch (fast-forward or ``--no-ff``) and reaps the worktree ->
+    labels, same rework routing) -> ``_local_merge_approved`` sync-merges the
+    base into the branch worktree, launches the full suite there as a
+    detached runner, and advances the base branch on a later pass once the
+    suite's result file lands (issue #1974 -- the gate lives in
+    ``orchestration/local_merge_gate.py`` and never blocks the pass) ->
     ``_local_dispatch_rework`` re-dispatches a worker on the same branch for
     ``request_changes``/suite-failure/conflict outcomes (suspended when the
     pass carries an explicit dispatch budget of 0 -- the ``fleet stop
@@ -46,14 +48,10 @@ from charlie_work.labels import TransitionOutcome
 from charlie_work.local_lane import (
     branch_diff,
     branch_head_sha,
-    ensure_branch_worktree,
     is_local_pr_record,
     local_base_branch,
     local_pr_dict,
     local_pr_records,
-    merge_branch_into_base,
-    run_full_suite,
-    suite_command_argv,
 )
 from charlie_work.local_work_park import publishes_pull_requests
 from charlie_work.prompts import prompt_template_digest
@@ -61,15 +59,9 @@ from charlie_work.review_decision import (
     record_decision,
     reclassify_human_call_verdict,
 )
-from charlie_work.safe_path import contains
 from charlie_work.state import is_claim_stale, without_review_dispatch_claim
 from charlie_work.worker import iter_workers
-from charlie_work.worktree import (
-    _merge_update_rework_branch,
-    list_worktrees,
-    remove_review_checkout,
-    remove_worktree,
-)
+from charlie_work.worktree import list_worktrees
 
 # Local review-record statuses. These deliberately reuse the remote lane's
 # vocabulary wherever the remote state machine already understands it
@@ -86,10 +78,12 @@ _LIVE_DISPATCH_STATUSES = frozenset({"dispatched", "dispatch_pending", "manifest
 # applies the same stale-claim timeout the remote stalled-review sweep uses.
 _REVIEW_STALE_CLAIM_TIMEOUT_MINUTES = 5
 
-# Issue #1972: the merge gate's per-failure-kind rework budgets and the
-# below-cap routing / cap-th-escalation delegates live in
-# ``orchestration/local_merge_rework.py`` -- this module is at its
-# file-size-ratchet mark, so the block follows the same
+# The merge gate itself lives in ``orchestration/local_merge_gate.py``
+# (issue #1974 turned it asynchronous; this module stays under its
+# file-size-ratchet mark): ``_local_merge_approved`` plus the gate helpers
+# and ``_local_merge_error_escalate``. Issue #1972's per-failure-kind rework
+# budgets and the below-cap routing / cap-th-escalation delegates live in
+# ``orchestration/local_merge_rework.py`` -- the same
 # net-new-member-in-its-own-submodule pattern as
 # ``local_lane_stall_alarm.py`` (#1968).
 
@@ -1461,340 +1455,6 @@ def record_local_review(
             "label_error": label_error,
             "local": True,
         },
-    )
-
-
-def _local_merge_approved(self) -> list[dict[str, Any]]:
-    """Merge approved local branches: base-sync, full suite, advance base.
-
-    For every lane record whose recorded verdict is ``approved``:
-
-    1. Merge the current base branch into the branch worktree
-       (``_merge_update_rework_branch`` -- the same sync-merge the remote
-       rework lane performs; a real conflict routes to rework, escalating
-       only once the per-kind rework cap is exhausted, issue #1972).
-    2. Run the full test suite inside the updated branch worktree
-       (``resolve_test_commands``'s full-suite argv; failure routes to
-       rework under the same cap).
-    3. Advance the base branch -- fast-forward when possible, ``--no-ff``
-       otherwise (``merge_branch_into_base``).
-    4. Remove the worker worktree with ``git worktree remove``, mark the
-       record ``merged``, and close/label the issue via the ``merged`` edge.
-    """
-    results: list[dict[str, Any]] = []
-    worktrees_dir = self._layout.worktrees
-    state = _wf.load_state_locked(self.paths.state_file)
-
-    for pr_key, record in sorted(local_pr_records(state).items(), key=lambda kv: int(kv[0])):
-        if record.get("status") != "approved":
-            continue
-        pr_number = int(pr_key)
-        issue_number = int(record.get("issue_number") or pr_number)
-        entry: dict[str, Any] = {"issue": issue_number, "pr": pr_number}
-        branch = str(record.get("branch") or record.get("headRefName") or "")
-        base_ref = str(record.get("baseRefName") or local_base_branch(self.repo_root) or "HEAD")
-        decision = self._review_decision(pr_number)
-        reviewed_head = decision.get("reviewed_head_sha")
-        live_head = branch_head_sha(self.repo_root, branch) if branch else None
-
-        # The merge gate only ever merges the exact head the reviewer
-        # approved -- a verdict pinned to a superseded head is voided by the
-        # packet builder's stale-verdict reset, but double-check here anyway
-        # so a torn state can never authorize the wrong head.
-        if live_head is None:
-            entry["outcome"] = "error"
-            entry["detail"] = f"branch {branch!r} does not resolve"
-            results.append(entry)
-            continue
-        if reviewed_head and reviewed_head != live_head:
-            # Head moved after approval. The common cause is this gate's own
-            # base-sync merge (step 1 below) followed by a deferral or a
-            # crash -- the reviewed delta is unchanged, only the head moved.
-            # Honour the approval when the live diff still matches the
-            # recorded patch-id; any genuinely new content (a rogue push,
-            # rework landing mid-gate) falls through to the packet phase's
-            # rebuild + re-review.
-            reviewed_patch = decision.get("reviewed_patch_id")
-            live_diff = branch_diff(self.repo_root, base_ref, branch)
-            if not (
-                reviewed_patch
-                and live_diff is not None
-                and _wf._calculate_patch_id(live_diff) == reviewed_patch
-            ):
-                entry["outcome"] = "skipped_head_moved"
-                results.append(entry)
-                continue
-
-        worktree_path = ensure_branch_worktree(self.repo_root, branch, worktrees_dir)
-        if worktree_path is None:
-            entry["outcome"] = "error"
-            entry["detail"] = f"could not attach a worktree for {branch!r}"
-            results.append(entry)
-            continue
-
-        # (1) merge base into the branch worktree.
-        try:
-            conflict = _merge_update_rework_branch(
-                self.repo_root,
-                worktree_path,
-                branch,
-                base_ref,
-                self.config.dispatch.injected_paths,
-                self.config.dispatch.materialize_dirs,
-            )
-        except Exception as exc:  # ReworkBranchConflictError / RuntimeError
-            entry["outcome"] = "error"
-            entry["detail"] = f"base sync merge failed: {exc}"
-            results.append(entry)
-            self._local_merge_error_escalate(
-                pr_number, issue_number, branch, f"base sync merge failed: {exc}"
-            )
-            continue
-        if conflict is not None:
-            entry["outcome"] = "conflict"
-            entry["conflicted_paths"] = list(conflict.conflicted_files)
-            entry["routed_to"] = self._local_route_merge_rework(
-                pr_number,
-                issue_number,
-                record,
-                decision,
-                reason="merge_conflict",
-                note=(
-                    f"Merging the base branch {base_ref!r} into {branch!r} "
-                    f"conflicted ({len(conflict.conflicted_files)} path(s)). "
-                    "Merge the base into your branch and resolve the conflicts. "
-                    "The code changes are already approved; do not re-litigate "
-                    "the review."
-                ),
-            )
-            results.append(entry)
-            continue
-
-        # (2) full suite in the updated branch worktree.
-        argv = suite_command_argv(self.config.dispatch.test_command, self.repo_root)
-        if argv is None:
-            # No resolvable suite command: fail closed. A lane that cannot
-            # verify must not merge -- escalate mechanically so a human can
-            # either configure a runner or merge by hand.
-            entry["outcome"] = "error"
-            entry["detail"] = "no test command resolvable for full-suite gate"
-            results.append(entry)
-            self._local_merge_error_escalate(
-                pr_number,
-                issue_number,
-                branch,
-                "no test command resolvable for the local full-suite gate",
-            )
-            continue
-        suite = run_full_suite(worktree_path, argv)
-        suite_head = branch_head_sha(self.repo_root, branch)
-        with _wf.state_lock(self.paths.state_file):
-            state = _wf.load_state(self.paths.state_file)
-            state["prs"][pr_key] = {
-                **(state["prs"].get(pr_key) or {}),
-                "local_suite_ok": suite.ok,
-                "local_suite_argv": list(suite.argv),
-                "local_suite_at": _wf.utc_now(),
-                "local_suite_head": suite_head,
-            }
-            state = self._record_event(
-                state,
-                "local_suite_result",
-                {
-                    "pr_number": pr_number,
-                    "issue_number": issue_number,
-                    "ok": suite.ok,
-                    "argv": list(suite.argv),
-                    "returncode": suite.returncode,
-                    "head_sha": suite_head,
-                    "tail": _wf._truncate_for_event(suite.tail),
-                },
-            )
-            self.write_gate.save_state(state)
-        if not suite.ok:
-            entry["outcome"] = "suite_failed"
-            entry["returncode"] = suite.returncode
-            entry["routed_to"] = self._local_route_merge_rework(
-                pr_number,
-                issue_number,
-                record,
-                decision,
-                reason="suite_failed",
-                note=(
-                    "The full test suite failed on your branch after the base "
-                    f"merge ({' '.join(suite.argv)}, exit {suite.returncode}). "
-                    "The code changes are already approved; fix the failing "
-                    "tests. Tail of the suite output:\n\n"
-                    f"```\n{suite.tail}\n```"
-                ),
-            )
-            results.append(entry)
-            continue
-
-        # (3) advance the base.
-        outcome = merge_branch_into_base(
-            self.repo_root, base_ref, branch, worktrees_dir=worktrees_dir
-        )
-        if outcome.status == "deferred":
-            entry["outcome"] = "deferred"
-            entry["detail"] = outcome.detail
-            with _wf.state_lock(self.paths.state_file):
-                state = _wf.load_state(self.paths.state_file)
-                state = self._record_event(
-                    state,
-                    "local_merge_deferred",
-                    {
-                        "pr_number": pr_number,
-                        "issue_number": issue_number,
-                        "detail": outcome.detail,
-                    },
-                )
-                self.write_gate.save_state(state)
-            results.append(entry)
-            continue
-        if outcome.status == "conflict":
-            entry["outcome"] = "conflict"
-            entry["conflicted_paths"] = list(outcome.conflicted_paths)
-            entry["routed_to"] = self._local_route_merge_rework(
-                pr_number,
-                issue_number,
-                record,
-                decision,
-                reason="merge_conflict",
-                note=(
-                    f"Merging {branch!r} into the base branch {base_ref!r} "
-                    f"conflicted ({len(outcome.conflicted_paths)} path(s)). "
-                    "Merge the base into your branch and resolve the "
-                    "conflicts. The code changes are already approved; do not "
-                    "re-litigate the review."
-                ),
-            )
-            results.append(entry)
-            continue
-        if outcome.status == "error":
-            entry["outcome"] = "error"
-            entry["detail"] = outcome.detail
-            self._local_merge_error_escalate(pr_number, issue_number, branch, outcome.detail)
-            results.append(entry)
-            continue
-
-        # (4) merged (or already contained): terminal bookkeeping.
-        merged_sha = outcome.merged_sha or suite_head or live_head
-        entry["outcome"] = "merged" if outcome.status == "merged" else "already_merged"
-        entry["fast_forward"] = outcome.fast_forward
-        entry["merged_sha"] = merged_sha
-        # force=True like every other worker-worktree teardown: the branch
-        # content is committed to base by construction, so remaining
-        # uncommitted material is worker scratch (.venv, build output,
-        # worker-tmp) -- a plain remove would refuse on a real .venv dir and
-        # leak a worktree per merged issue. ``branch`` also deletes the
-        # merged branch ref when auto_merge.delete_branch is configured,
-        # matching the remote lane's post-merge cleanup.
-        # Issue #1476: a worktree outside the managed dir is a foreign
-        # checkout (``ensure_branch_worktree`` returns the registered path
-        # wherever the branch happens to live) — it belongs to whoever
-        # created it and is never removed; the branch ref can't be deleted
-        # while checked out anyway.
-        if contains(worktrees_dir, worktree_path):
-            remove_worktree(
-                self.repo_root,
-                worktree_path,
-                force=True,
-                branch=(branch if self.config.auto_merge.delete_branch else None),
-            )
-        remove_review_checkout(self.repo_root, pr_number, reviews_dir=self._layout.reviews_dir)
-        with _wf.state_lock(self.paths.state_file):
-            state = _wf.load_state(self.paths.state_file)
-            pr_state = state["prs"].get(pr_key, {})
-            state["prs"][pr_key] = {
-                **without_review_dispatch_claim(pr_state),
-                "number": pr_number,
-                "local": True,
-                "status": "merged",
-                "merged_at": _wf.utc_now(),
-                "merged_sha": merged_sha,
-                "merge_method": "ff" if outcome.fast_forward else "no-ff",
-                # Issue #1972: the merge-gate rework episode is resolved --
-                # both per-kind attempt counters restart from zero. They
-                # deliberately survive packet re-mints and rework routing;
-                # this write plus the unescalate/de-escalation reset maps
-                # are the only resets.
-                "local_merge_conflict_rework_attempts": 0,
-                "local_suite_failed_rework_attempts": 0,
-                "local_merge_rework_reason": None,
-            }
-            issue_entry = state["issues"].get(str(issue_number), {})
-            state["issues"][str(issue_number)] = _wf._merged_issue_fields(
-                issue_entry, issue_number
-            )
-            state = self._record_event(
-                state,
-                "merge_succeeded",
-                {
-                    "pr_number": pr_number,
-                    "issue_number": issue_number,
-                    "local": True,
-                    "fast_forward": outcome.fast_forward,
-                    "merged_sha": merged_sha,
-                    "detail": outcome.detail,
-                },
-            )
-            self.write_gate.save_state(state)
-        transition_result = self.write_gate.transition(
-            self.gh, self.config.labels, issue_number, "merged"
-        )
-        if transition_result.outcome != TransitionOutcome.APPLIED:
-            entry["label_error"] = {
-                "edge": "merged",
-                "outcome": transition_result.outcome.value,
-            }
-        # The issue itself closes on merge, same as a merged remote PR.
-        try:
-            self.gh.close_issue(issue_number)
-        except Exception:
-            entry["close_error"] = True
-        results.append(entry)
-    return results
-
-
-def _local_merge_error_escalate(
-    self, pr_number: int, issue_number: int, branch: str, detail: str
-) -> None:
-    """Escalate a merge-gate infrastructure failure (never a silent merge)."""
-    with _wf.state_lock(self.paths.state_file):
-        state = _wf.load_state(self.paths.state_file)
-        # Local-bound "escalated" (issue #750 guard): the issue half runs
-        # through ``_escalate_issue`` just below; this is the PR-record half.
-        status = "escalated"
-        state["prs"][str(pr_number)] = {
-            **(state["prs"].get(str(pr_number)) or {}),
-            "status": status,
-            "escalation_reason": "local_merge_error",
-        }
-        state = _wf._escalate_issue(
-            state,
-            issue_number,
-            reason="local_merge_error",
-            reason_class="mechanical",
-            issue_extra={"merge_alert": detail},
-        )
-        state = self._record_event(
-            state,
-            "local_merge_failed",
-            {
-                "pr_number": pr_number,
-                "issue_number": issue_number,
-                "branch": branch,
-                "detail": _wf._truncate_for_event(detail),
-            },
-            level="error",
-        )
-        self.write_gate.save_state(state)
-    self.write_gate.transition(
-        self.gh,
-        self.config.labels,
-        issue_number,
-        _wf._escalation_edge("escalated", "mechanical"),
     )
 
 
