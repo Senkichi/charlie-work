@@ -1,0 +1,7 @@
+info
+# Issue #1967: a closed local-backend issue stopped counting as an open
+# blocker because ``git cherry`` proved every patch on its worker branch
+# already landed on HEAD (rebase/cherry-pick landing -- the branch tip is
+# not an ancestor of HEAD, but has no ``+`` commits). Info, not warning:
+# the gate correctly recognising landed work is routine operation; the
+# event exists so the un-blocking is auditable once per issue.

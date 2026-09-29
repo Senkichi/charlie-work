@@ -54,7 +54,12 @@ from .local_issue_files import (
     scan_issues,
     write_text_atomic,
 )
-from .local_lane import branch_head_sha, is_ancestor, worker_branch_heads
+from .local_lane import (
+    branch_head_sha,
+    is_ancestor,
+    is_patch_equivalent,
+    worker_branch_heads,
+)
 from .safe_path import require_contained
 
 logger = logging.getLogger(__name__)
@@ -66,8 +71,20 @@ _NO_REMOTE = "local-file issue source: this repo has no GitHub remote"
 _PARK_COMMENT_BRANCH_RE = re.compile(r"committed on branch `([^`]+)`")
 
 
-def _closed_issue_work_unlanded(repo_root: Path, branch_prefix: str, issue: LocalIssue) -> bool:
-    """True when a closed issue's worker branch is not contained in local HEAD.
+def _closed_issue_work_unlanded(
+    repo_root: Path, branch_prefix: str, issue: LocalIssue
+) -> tuple[bool, list[str]]:
+    """Whether a closed issue's worker branch is not contained in local HEAD.
+
+    Returns ``(unlanded, patch_equivalent)``: ``unlanded`` is True when some
+    candidate tip is neither an ancestor of ``HEAD`` nor patch-equivalent to
+    it; ``patch_equivalent`` names the candidate branches whose tips failed
+    the ancestry check but carry no ``+`` commit under ``git cherry`` --
+    the rebase/cherry-pick landing shape, where the deliverable IS on
+    ``HEAD`` but the tip is not an ancestor of it (issue #1967). Callers
+    that treat ``patch_equivalent`` should only do so when ``unlanded`` is
+    False: a second genuinely-unlanded branch means the fallback did not
+    satisfy the blocker.
 
     On this backend nothing sits between "worker finished" and "issue
     closed": a human flips ``state: closed`` by hand, and can do it before
@@ -88,10 +105,11 @@ def _closed_issue_work_unlanded(repo_root: Path, branch_prefix: str, issue: Loca
 
     Fails open on a non-git ``repo_root``: with no repository there is no
     branch evidence to weigh, and ``state: closed`` keeps its historical
-    verdict.
+    verdict. A ``git cherry`` failure also keeps the unlanded verdict --
+    the fallback only ever *removes* a blocker on positive patch-id proof.
     """
     if not (repo_root / ".git").exists():
-        return False
+        return False, []
     heads = worker_branch_heads(repo_root, branch_prefix, issue.number)
     for comment in issue.comments:
         for match in _PARK_COMMENT_BRANCH_RE.finditer(comment):
@@ -100,7 +118,16 @@ def _closed_issue_work_unlanded(repo_root: Path, branch_prefix: str, issue: Loca
                 tip = branch_head_sha(repo_root, name)
                 if tip is not None:
                     heads[name] = tip
-    return any(not is_ancestor(repo_root, tip, "HEAD") for tip in heads.values())
+    unlanded = False
+    patch_equivalent: list[str] = []
+    for name, tip in heads.items():
+        if is_ancestor(repo_root, tip, "HEAD"):
+            continue
+        if is_patch_equivalent(repo_root, tip):
+            patch_equivalent.append(name)
+        else:
+            unlanded = True
+    return unlanded, patch_equivalent
 
 
 # ``check_graphql_rate_limit`` reports (sufficient, remaining, reset_at). There
@@ -156,6 +183,17 @@ class LocalFileGitHub:
     # branch work -- one warning per issue per instance, matching
     # ``_reported``'s per-pass dedupe rationale.
     _unmerged_blocker_warned: set[int] = field(default_factory=set, compare=False, repr=False)
+    # Issue #1967: closed issues whose blocker verdict the patch-equivalence
+    # fallback satisfied -- issue number -> (satisfied branch names, base
+    # ref). ``are_issues_open`` has no event channel, so the orchestrator
+    # drains this map once per pass (``drain_patch_equiv_satisfied``) and
+    # emits ``local_blocker_satisfied_by_patch_equivalence`` per issue.
+    # ``_patch_equiv_noted`` bounds collection to once per issue per
+    # instance, matching ``_unmerged_blocker_warned``'s dedupe rationale.
+    _patch_equiv_satisfied: dict[int, tuple[tuple[str, ...], str]] = field(
+        default_factory=dict, compare=False, repr=False
+    )
+    _patch_equiv_noted: set[int] = field(default_factory=set, compare=False, repr=False)
 
     def __post_init__(self) -> None:
         # Boundary check, once: ``issues_dir`` is config-derived, and every
@@ -265,16 +303,25 @@ class LocalFileGitHub:
         close would otherwise be caught. A closed issue with no resolvable
         worker branch (never dispatched, or merged and the ref cleaned up)
         keeps the plain frontmatter verdict.
+
+        Issue #1967: reachability alone under-reports landed work -- a
+        branch whose commits were rebased or cherry-picked onto ``HEAD`` is
+        never an ancestor of it. A non-ancestor tip therefore still counts
+        as landed when ``git cherry`` finds no ``+`` commit on it (patch-id
+        equivalence); the issues that fallback un-blocks are collected on
+        ``_patch_equiv_satisfied`` for the orchestrator to drain into a
+        ``local_blocker_satisfied_by_patch_equivalence`` event per issue.
         """
         by_number = self._scan().by_number()
         open_numbers = {n for n in issue_numbers if n in by_number and by_number[n].is_open}
         for n in issue_numbers:
             issue = by_number.get(n)
-            if (
-                issue is not None
-                and not issue.is_open
-                and _closed_issue_work_unlanded(self.repo_root, self.branch_prefix, issue)
-            ):
+            if issue is None or issue.is_open:
+                continue
+            unlanded, patch_equivalent = _closed_issue_work_unlanded(
+                self.repo_root, self.branch_prefix, issue
+            )
+            if unlanded:
                 if n not in self._unmerged_blocker_warned:
                     self._unmerged_blocker_warned.add(n)
                     logger.warning(
@@ -283,6 +330,9 @@ class LocalFileGitHub:
                         n,
                     )
                 open_numbers.add(n)
+            elif patch_equivalent and n not in self._patch_equiv_noted:
+                self._patch_equiv_noted.add(n)
+                self._patch_equiv_satisfied[n] = (tuple(sorted(patch_equivalent)), "HEAD")
         return open_numbers
 
     def issue_dependencies(self, issue_numbers: list[int]) -> dict[int, list[int]]:
@@ -482,6 +532,27 @@ class LocalFileGitHub:
 
     def check_graphql_rate_limit(self, threshold: int = 0) -> tuple[bool, int, int | None]:
         return True, _UNLIMITED_REMAINING, None
+
+
+def drain_patch_equiv_satisfied(
+    github: GitHubLike,
+) -> dict[int, tuple[tuple[str, ...], str]]:
+    """Pop a backend's collected patch-equivalence satisfactions (issue #1967).
+
+    ``LocalFileGitHub.are_issues_open`` has no event channel, so when the
+    patch-equivalence fallback is what lets a closed issue stop blocking,
+    the client records it on ``_patch_equiv_satisfied`` -- issue number ->
+    (satisfied branch names, base ref). The orchestrator drains that map
+    once per pass and emits ``local_blocker_satisfied_by_patch_equivalence``
+    for each entry. Returns ``{}`` for any backend that does not collect
+    (the remote ``GitHub`` client included) or when nothing new satisfied.
+    """
+    pending = getattr(github, "_patch_equiv_satisfied", None)
+    if not pending:
+        return {}
+    drained = dict(pending)
+    pending.clear()
+    return drained
 
 
 def github_client_for(
