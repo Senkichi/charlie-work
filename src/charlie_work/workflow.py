@@ -1853,7 +1853,7 @@ def _detect_and_handle_orphaned_workers(
             # present, matching reconcile.py's issue_active_label_no_open_pr
             # pattern (~536-580) so all three sites agree. An issue with no
             # active label -- e.g. one carrying only a terminal label like
-            # agent:human-needed/agent:done/agent:blocked -- has nothing here
+            # agent:human-needed/agent:done -- has nothing here
             # to reclaim. A prior `if not active_labels and not needs_ready`
             # gate proceeded whenever EITHER half was false, which wrongly
             # added `ready` back onto a terminal-only issue that also had a

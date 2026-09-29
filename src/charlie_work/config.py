@@ -219,7 +219,6 @@ class LabelConfig:
     pr_open: str = "agent:pr-open"
     reviewing: str = "agent:reviewing"
     needs_rework: str = "agent:needs-rework"
-    blocked: str = "agent:blocked"
     done: str = "agent:done"
     human_needed: str = "agent:human-needed"
     prose_only_deps: str = "agent:prose-only-deps"
@@ -273,7 +272,6 @@ class LabelConfig:
     @property
     def terminal(self) -> set[str]:
         return {
-            self.blocked,
             self.done,
             self.human_needed,
             self.prose_only_deps,
@@ -294,7 +292,6 @@ class LabelConfig:
             self.pr_open,
             self.reviewing,
             self.needs_rework,
-            self.blocked,
             self.done,
             self.human_needed,
             self.prose_only_deps,
@@ -322,7 +319,6 @@ class LabelConfig:
             self.pr_open,
             self.reviewing,
             self.needs_rework,
-            self.blocked,
             self.done,
             self.human_needed,
             self.operator_queue,
@@ -1411,7 +1407,7 @@ class RuntimeConfig:
 # empty worker/reviewer model pin) so they cannot silently drift apart --
 # CLAUDE.md's "no hardcoded lists" rule applied to a scalar default instead
 # of a list.
-_DEFAULT_CLAUDE_MODEL: str = "claude-sonnet-5"
+_DEFAULT_CLAUDE_MODEL: str = "claude-sonnet-5-5"
 
 
 @dataclass(frozen=True)
@@ -1772,7 +1768,7 @@ class RescueConfig:
 
     enabled: bool = False
     worker_adapter: str = "claude-code"
-    worker_model: str = "claude-opus-4-1"
+    worker_model: str = "claude-opus-5-5"
     reviewer_adapter: str = "devin"
     reviewer_model: str = "codex"
     # Standard Devin CLI invocation shape -- override only if the rescue
@@ -1787,7 +1783,7 @@ class RescueConfig:
     )
     reviewer_timeout_seconds: int = 300
     worker: WorkerRoleConfig = field(
-        default_factory=lambda: WorkerRoleConfig(harness="claude-code", model="claude-opus-4-1")
+        default_factory=lambda: WorkerRoleConfig(harness="claude-code", model="claude-opus-5-5")
     )
     reviewer: WorkerRoleConfig = field(
         default_factory=lambda: WorkerRoleConfig(harness="devin", model="codex")
@@ -2460,7 +2456,17 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
             f"unknown config section(s): {', '.join(unknown)} "
             f"(valid: {', '.join(sorted(known_sections))})"
         )
-    labels = _build_section(LabelConfig, "labels", _section(data, "labels"))
+    labels_data = _section(data, "labels")
+    # Issue #1963: ``blocked`` was removed from ``LabelConfig`` -- the
+    # "blocked" verdict edge maps to ``human_needed`` and no transition ever
+    # applied ``agent:blocked``. Tolerate a stale ``blocked:`` key in a live
+    # ``labels:`` section rather than letting ``_build_section``'s
+    # unknown-key rejection brick a repo that still carries it (same
+    # scoped-extraction reasoning as the ``deescalation`` section below).
+    # The override is dead weight -- nothing read the field even while it
+    # existed -- so it is silently dropped, not honored.
+    labels_data.pop("blocked", None)
+    labels = _build_section(LabelConfig, "labels", labels_data)
     dispatch_data = _section(data, "dispatch")
     materialize_dirs = dispatch_data.get("materialize_dirs")
     if materialize_dirs is not None:
@@ -3629,7 +3635,7 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
     # rescue_data entirely so _build_section's cls(**data) below does NOT
     # pass worker=/reviewer= at all -- letting RescueConfig's own
     # field-level default_factory apply (harness="claude-code",
-    # model="claude-opus-4-1" for worker; harness="devin", model="codex"
+    # model="claude-opus-5-5" for worker; harness="devin", model="codex"
     # for reviewer). Unconditionally constructing a bare WorkerRoleConfig()
     # here regardless of presence used to silently override those
     # RescueConfig-specific defaults with WorkerRoleConfig's OWN bare

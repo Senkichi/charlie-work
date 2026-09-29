@@ -82,6 +82,14 @@ def test_failure_exit_does_not_relaunch() -> None:
     assert result.cap_reached is False
 
 
+def test_exit_restart_requested_literal_is_pinned() -> None:
+    """ADR 0004: the value is a cross-version wire contract between a stale
+    in-memory wrapper and a freshly loaded child. Every other test imports the
+    symbol, so a renumbering would pass them all -- only a literal catches it.
+    """
+    assert EXIT_RESTART_REQUESTED == 3
+
+
 def test_preflight_refusal_exit_code_does_not_relaunch() -> None:
     """Issue #1363 AC6: a fatal preflight failure at supervisor startup exits
     PREFLIGHT_REFUSAL_EXIT_CODE (4), not EXIT_RESTART_REQUESTED (3) -- the

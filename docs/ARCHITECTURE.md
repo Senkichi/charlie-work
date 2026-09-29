@@ -158,7 +158,7 @@ Notes tying the diagram to `_edges()` exactly:
   dispatch until a human reviews, merges, and closes it by hand. See
   [README.md#local-file-issue-source](../README.md#local-file-issue-source).
 
-`LabelConfig.terminal` = `{blocked, done, human_needed, prose_only_deps,
+`LabelConfig.terminal` = `{done, human_needed, prose_only_deps,
 operator_queue, review_ready}`;
 `LabelConfig.active` = `{queued, in_progress, pr_open, reviewing,
 needs_rework}`. `OrchestratorApp._is_dispatchable()` requires the `ready`
@@ -216,8 +216,9 @@ sorted keys. Schema version pinned by `state.STATE_VERSION = 1`.
 }
 ```
 
-`events` is append-only up to a 200-entry cap and is the closest thing to an
-audit trail; `issues`/`prs` are best-effort mutable projections that
+`events` is a ring capped at `state.DEFAULT_EVENT_RING_SIZE` (2000 entries,
+overridable via `runtime.event_ring_size`) and is the closest thing to an
+audit trail (the complete one is `events.db`); `issues`/`prs` are best-effort mutable projections that
 **merge-update, never dict-replace** (see [Invariants](#invariants)). A
 missing or corrupt `state.json` never crashes the orchestrator: `load_state`
 quarantines an unparseable file to `state.json.corrupt-<UTC-timestamp>`
@@ -229,7 +230,7 @@ In addition to the capped `events` array in `state.json`, every event is
 dual-written to an **unlimited append-only** SQLite database (`events.db`)
 that lives next to `state.json`. This database is the primary audit trail
 for root-cause analysis — it never trims or loses entries the way the
-200-entry `state.json` buffer can.
+capped `state.json` ring (2000 entries by default) can.
 
 The `events` table has the following schema:
 

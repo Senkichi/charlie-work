@@ -423,7 +423,7 @@ def test_transition_no_labels_returns_nothing_changed() -> None:
 
 
 def test_terminal_transition_clears_sibling_workflow_labels() -> None:
-    """Issue #215: terminal transitions (agent:done, agent:blocked, agent:human-needed) must clear sibling agent:* workflow labels."""
+    """Issue #215: terminal transitions (agent:done, agent:human-needed, agent:operator-queue) must clear sibling agent:* workflow labels."""
     from charlie_work.labels import transition, TransitionOutcome as TO
 
     config = OrchestratorConfig()
