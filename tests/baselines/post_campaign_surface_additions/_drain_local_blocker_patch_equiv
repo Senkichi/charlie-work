@@ -1,0 +1,6 @@
+issue #1967: drains the LocalFileGitHub client's collected
+patch-equivalence satisfactions (closed blockers whose branch work landed
+by rebase/cherry-pick rather than ancestry merge) into once-per-issue
+``local_blocker_satisfied_by_patch_equivalence`` events; installed from
+``orchestration/github_ops_blockers.py``. Net-new OrchestratorApp member
+added after the Track 2 Phase B surface baseline was pinned.
