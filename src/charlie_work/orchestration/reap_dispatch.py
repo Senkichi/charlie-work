@@ -24,6 +24,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 import charlie_work.workflow as _wf
+from charlie_work.dispatch_deferral import records_deferral
 from charlie_work import layout
 from charlie_work.ci_headroom import ci_headroom_available
 from charlie_work.fleet_paths import fleet_dir
@@ -395,6 +396,7 @@ def _apply_concurrency_governor(
     )
 
 
+@records_deferral("dispatch")
 def dispatch(
     self,
     limit: int | None = None,

@@ -1,0 +1,5 @@
+error
+# Issue #1986: one lane (dispatch or dispatch_rework) of one repo deferred
+# N consecutive passes without a successful dispatch in between. Error so
+# heartbeat_check's error-events check surfaces starvation; fires once per
+# episode (the pass the streak reaches the threshold).
