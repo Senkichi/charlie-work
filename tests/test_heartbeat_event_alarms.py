@@ -55,14 +55,25 @@ _SCRIPTS_DIR = Path(__file__).parent.parent / "scripts"
 _HEARTBEAT_CHECK = _SCRIPTS_DIR / "heartbeat_check.py"
 _EVENT_ALARMS = _SCRIPTS_DIR / "heartbeat_event_alarms.py"
 
-_CHECK_NAMES = (
+# The five checks extracted verbatim under issue #1895 -- the set pinned by
+# ``test_sibling_module_loads_standalone_and_defines_all_five_checks`` below.
+# That leaf keeps its five-name name deliberately: the collect-only gate
+# (issue #1538) treats a test-function rename as a removal and fails the
+# required check, so the leaf is frozen and the newer sibling check is
+# pinned by its own functional block instead.
+_EXTRACTION_CHECK_NAMES = (
     "check_error_events",
     "check_warning_events",
     "check_infra_blocked_events",
     "check_draft_pr_blocked_events",
     "check_ci_headroom_unavailable",
-    "check_local_lane_kill_switch_stalled",
 )
+
+# The full re-exported check surface: the #1895 extraction set plus
+# ``check_local_lane_kill_switch_stalled`` (issue #1968). The re-export
+# identity and no-shadowing sweeps below iterate this -- they must cover
+# every name ``heartbeat_check`` re-exports, not just the original five.
+_CHECK_NAMES = _EXTRACTION_CHECK_NAMES + ("check_local_lane_kill_switch_stalled",)
 
 
 @pytest.fixture(scope="module")
@@ -84,10 +95,14 @@ def alarms() -> ModuleType:
 # ---------------------------------------------------------------------------
 
 
-def test_sibling_module_loads_standalone_and_defines_all_checks(
+def test_sibling_module_loads_standalone_and_defines_all_five_checks(
     alarms: ModuleType,
 ) -> None:
-    for name in _CHECK_NAMES:
+    """Pins the five-name #1895 extraction set. The leaf name is frozen by
+    the collect-only gate (renames fail it); the sixth sibling check added
+    under #1968 is covered by the ``check_local_lane_kill_switch_stalled``
+    block below and by the ``_CHECK_NAMES`` sweeps."""
+    for name in _EXTRACTION_CHECK_NAMES:
         assert callable(getattr(alarms, name, None)), (
             f"heartbeat_event_alarms.py no longer defines {name} -- "
             "heartbeat_check.py's re-export of it would AttributeError at import"
@@ -115,9 +130,9 @@ def test_heartbeat_check_reexports_are_the_sibling_objects(hb: ModuleType) -> No
 
 
 def test_heartbeat_check_has_no_local_check_defs_to_shadow_the_reexports() -> None:
-    """Source-level belt for the identity test above: the five names must not
-    reappear as module-scope ``def``s in ``heartbeat_check.py`` -- the
-    extraction moved them, it did not fork them."""
+    """Source-level belt for the identity test above: the ``_CHECK_NAMES``
+    must not reappear as module-scope ``def``s in ``heartbeat_check.py`` --
+    the extraction moved them, it did not fork them."""
     tree = ast.parse(_HEARTBEAT_CHECK.read_text(encoding="utf-8"))
     local_defs = {
         node.name
