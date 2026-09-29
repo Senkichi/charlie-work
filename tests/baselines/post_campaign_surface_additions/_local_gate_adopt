@@ -1,0 +1,6 @@
+issue #1974: part of the asynchronous local merge-gate state
+machine -- the gates suite now runs detached via a small runner
+process and resolves on later supervisor passes instead of blocking
+the fleet for the suites duration. Installed from
+``orchestration/local_merge_gate.py``. Net-new OrchestratorApp member
+added after the Track 2 Phase B surface baseline was pinned.

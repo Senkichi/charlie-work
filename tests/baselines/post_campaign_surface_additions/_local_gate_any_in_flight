@@ -1,0 +1,7 @@
+issue #1974 (round-2 rework): seeds ``gate_in_flight`` before
+``_local_merge_approved``'s ordered walk so the one-gate-per-repo bound
+does not depend on iteration order -- a claimed or adoptable
+higher-numbered record must defer an unclaimed lower-numbered one
+instead of letting it launch a second concurrent suite. Installed from
+``orchestration/local_merge_gate.py``. Net-new OrchestratorApp member
+added after the Track 2 Phase B surface baseline was pinned.

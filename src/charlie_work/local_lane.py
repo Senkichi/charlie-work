@@ -85,6 +85,24 @@ def branch_head_sha(repo_root: Path, branch: str) -> str | None:
     return sha or None
 
 
+def resolve_ref_sha(repo_root: Path, ref: str) -> str | None:
+    """Resolve any revision expression (branch, tag, ``HEAD``) to a commit SHA.
+
+    Unlike ``branch_head_sha`` the ref is not prefixed with ``refs/heads/`` --
+    the merge gate's base can be a branch name or the ``HEAD`` fallback, and
+    both need a stable SHA for the post-suite base-moved check.
+    """
+    if not ref:
+        return None
+    result = run_captured(
+        ["git", "rev-parse", "--verify", f"{ref}^{{commit}}"],
+        cwd=repo_root,
+        timeout_seconds=GIT_OP_TIMEOUT_SECONDS,
+    )
+    sha = result.stdout.strip() if result.ok else ""
+    return sha or None
+
+
 def local_base_branch(repo_root: Path) -> str | None:
     """The branch the main worktree currently has checked out, or None detached.
 
