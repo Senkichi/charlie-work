@@ -67,12 +67,12 @@ def _allocation_pass_runtime_cap(
     The cap's primary source is the supervisor heartbeat's
     ``max_pass_runtime_seconds`` — the running daemon's own record of the
     bound it is operating under — falling back to
-    ``config.supervisor.max_pass_runtime_seconds`` when the file is absent,
-    unreadable, or predates the field (the same "written before the field
-    existed" shape as the recorded-interval fallback below), and to ``0``
-    when neither provides a usable value — e.g. a config object built by
-    code that predates the knob — which collapses the bound to the pre-#1852
-    ``3 × interval``.
+    ``config.fleet_supervisor.max_pass_runtime_seconds`` when the file is
+    absent, unreadable, or predates the field (the same "written before the
+    field existed" shape as the recorded-interval fallback below), and to
+    ``0`` when neither provides a usable value — e.g. a config object built
+    by code that predates the knob — which collapses the bound to the
+    pre-#1852 ``3 × interval``.
 
     Returns ``(cap_seconds, source_label)``; the label names where the cap
     came from so the warning detail can state the bound it actually used.
@@ -80,9 +80,11 @@ def _allocation_pass_runtime_cap(
     cap = _positive_seconds((heartbeat or {}).get("max_pass_runtime_seconds"))
     if cap is not None:
         return cap, "supervisor-heartbeat.json"
-    cap = _positive_seconds(getattr(config.supervisor, "max_pass_runtime_seconds", None))
+    cap = _positive_seconds(
+        getattr(getattr(config, "fleet_supervisor", None), "max_pass_runtime_seconds", None)
+    )
     if cap is not None:
-        return cap, "config supervisor.max_pass_runtime_seconds"
+        return cap, "config fleet_supervisor.max_pass_runtime_seconds"
     return 0, "none"
 
 

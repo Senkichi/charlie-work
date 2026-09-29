@@ -320,27 +320,30 @@ def test_load_config_quota_probe_enabled_rejects_non_bool(tmp_path: Path) -> Non
         load_config(config_file)
 
 
-def test_load_config_supervisor_self_deploy_pull_ci_fleet_default() -> None:
-    """SupervisorConfig.self_deploy_pull_ci_fleet defaults to False (issue #552)."""
+def test_load_config_fleet_supervisor_self_deploy_pull_ci_fleet_default() -> None:
+    """FleetSupervisorConfig.self_deploy_pull_ci_fleet defaults to False (issue #552)."""
     config = load_config(Path("nonexistent.yaml"))
-    assert config.supervisor.self_deploy_pull_ci_fleet is False
+    assert config.fleet_supervisor.self_deploy_pull_ci_fleet is False
 
 
-def test_load_config_supervisor_self_deploy_pull_ci_fleet_accepts_true(tmp_path: Path) -> None:
+def test_load_config_fleet_supervisor_self_deploy_pull_ci_fleet_accepts_true(
+    tmp_path: Path,
+) -> None:
     config_file = tmp_path / "orchestrator.config.yaml"
     _write_config(
         config_file,
-        """supervisor:
+        """fleet_supervisor:
   self_deploy_pull_ci_fleet: true
 """,
     )
     config = load_config(config_file)
-    assert config.supervisor.self_deploy_pull_ci_fleet is True
+    assert config.fleet_supervisor.self_deploy_pull_ci_fleet is True
 
 
 def test_load_config_supervisor_self_deploy_pull_ci_fleet_rejects_non_bool(
     tmp_path: Path,
 ) -> None:
+    """A non-bool under the legacy ``supervisor:`` location still errors."""
     config_file = tmp_path / "orchestrator.config.yaml"
     _write_config(config_file, "supervisor:\n  self_deploy_pull_ci_fleet: not-a-bool\n")
     with pytest.raises(ConfigError, match="supervisor.*self_deploy_pull_ci_fleet.*must be a bool"):

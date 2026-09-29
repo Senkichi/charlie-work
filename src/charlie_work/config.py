@@ -66,6 +66,17 @@ from .deescalation_config import parse_deescalation_overrides
 # view) without this over-cap monolith growing a second registry.
 from .config_deprecations import emit_deprecated_key_reads, repo_state_path
 
+# Re-exported from the domain module (issue #1978) for the same reason
+# ``RunnerCapacityEscalationConfig`` is re-exported above: the dataclass and
+# its section parser live in their own module so new fleet-scoped knobs do
+# not land in this over-cap monolith (file-size ratchet, issue #1442);
+# ``config.py`` wires the dataclass into ``OrchestratorConfig`` and delegates
+# parsing (including the legacy ``supervisor.<key>`` fallback) to it.
+from .fleet_supervisor_config import (  # noqa: F401  (deliberate re-export)
+    FleetSupervisorConfig,
+    parse_fleet_supervisor,
+)
+
 from . import layout
 from .harnesses import REVIEWER_HARNESSES, WORKER_HARNESSES
 from .issue_comments import DEFAULT_INCLUDED_ASSOCIATIONS as DEFAULT_COMMENT_ASSOCIATIONS
@@ -2191,79 +2202,25 @@ class SupervisorConfig:
     ``active_cooldown_seconds``: sleep after a pass that dispatched or merged
     something (default 30 s — stagger starts, respect rate limits).
     ``max_runtime_minutes``: hard wall-clock cap; 0 = unlimited (default).
-    ``max_pass_runtime_seconds``: upper bound on a single pass's wall-clock
-    duration. The supervisor heartbeat freshness check uses this bound so a
-    long-running pass is not mistaken for a dead supervisor (default 1800 s /
-    30 min).
-    ``self_deploy_failure_alarm``: consecutive ``self_deploy`` failures before
-    a ``self_deploy_alarm`` events.db entry fires (default 3, mirrors
-    ``AutoMergeConfig.failed_attempt_alarm``). 0 disables the alarm.
-    ``zero_pass_alarm``: consecutive fleet-supervisor cycles that complete
-    with zero repo passes, despite at least one repo being configured,
-    before a ``supervisor_zero_pass_alarm`` events.db entry fires (default 3,
-    mirrors ``self_deploy_failure_alarm``). 0 disables the alarm. A cycle
-    with zero repos configured never counts toward this streak in either
-    direction -- that is a configuration state, not an incident (issue #855).
-    ``self_deploy_pull_ci_fleet``: when true, ``self_deploy`` also FF-pulls
-    ``origin/main`` in the declared ``ci-fleet`` sibling checkout after a
-    successful orchestrator pull, but only when that sibling is clean and on
-    ``main``. Default false: in a development layout the sibling is a working
-    repo whose HEAD must never be moved out from under a session. Enable it
-    only for a dedicated deploy clone (issue #552), where the sibling exists
-    solely to be deployed to -- without it the daemon's editable ``ci_fleet``
-    is a silent version freeze, since ``self_deploy`` otherwise only ever
-    pulls the orchestrator checkout.
-    ``wedge_kill_loop_alarm``: consecutive ``supervisor_wedged_killed`` events
-    with no ``fleet_pass_completed`` event in between (i.e. the wedge-kill
-    backstop firing without the supervisor ever completing a pass again)
-    before a ``supervisor_wedge_loop`` events.db entry fires (default 3,
-    mirrors ``self_deploy_failure_alarm``/``zero_pass_alarm``). 0 disables
-    the alarm (issue #1832).
-    ``dependency_sync_starvation_seconds``: upper bound on how long a deferred
-    self-deploy ``uv sync`` may stay pending while fleet workers are live
-    before the supervisor stops admitting new dispatches (drain posture:
-    workers in flight are untouched) so the live-worker count can reach zero
-    and the sync can land (issue #1855). Measured wall-clock from the
-    pending-sync marker's ``written_at`` -- the first deferral of the
-    episode -- so it is robust to supervisor restarts. Default 14400 s (4 h):
-    comfortably above observed worker session durations, and far below the
-    multi-hour continuous deferral observed under sustained fleet load.
-    <= 0 disables the bound.
-    ``fleet_lane_concurrency``: maximum number of per-repo lanes one
-    ``fleet_loop`` pass runs concurrently (issue #1934). Per-repo lane work is
-    I/O-bound and repo-isolated (own config, GitHub client, supervisor lock,
-    state files), so lanes run on a bounded thread pool: a pass's wall-clock
-    approximates the slowest lane instead of the sum of every lane (~35-42
-    min observed across 6 repos for a configured 5-minute cadence). When the
-    cap meets or exceeds the registered repo count, a repo's lane-to-lane gap
-    is bounded by its own lane duration plus the supervisor's pass cadence --
-    decoupled from sibling lanes' workloads. <= 0 falls back to the built-in
-    default at the call site; 1 restores the pre-#1934 strict-serial order.
-    ``reap_sweep_interval_seconds``: cadence for the fleet supervisor's
-    out-of-band review-claim reap scheduler (issue #1934). The
-    dead-reviewer-claim sweep set (``OrchestratorApp._run_review_reap_sweeps``
-    -- the identical block ``dispatch_reviews`` and ``reap_reviews`` run)
-    executes once per registered repo on this interval from a dedicated
-    thread, independent of whether a fleet pass is due or in flight, so a
-    dead claim is freed on a ~5-minute cadence instead of once per fleet-wide
-    round. The sweeps launch nothing and are ``state_lock``-serialized /
-    merge-on-write safe against a concurrent lane (issue #1874's design), so
-    they run even while a repo's supervisor lock is held. <= 0 disables the
-    scheduler.
+
+    Issue #1978: the knobs only the cross-repo fleet supervisor daemon reads
+    (``max_pass_runtime_seconds``, ``self_deploy_failure_alarm``,
+    ``self_deploy_pull_ci_fleet``, ``zero_pass_alarm``,
+    ``wedge_kill_loop_alarm``, ``dependency_sync_starvation_seconds``,
+    ``fleet_lane_concurrency``, ``reap_sweep_interval_seconds``) moved to
+    ``FleetSupervisorConfig`` under the ``fleet_supervisor:`` section. The
+    four fields below are the ones both loops share -- ``run_supervised``
+    (per-repo) and ``run_fleet_supervise`` (fleet) each poll, cool down, and
+    bound their own runtime on the same cadence knobs. A moved key still
+    written under ``supervisor:`` keeps working during the migration window
+    (``parse_fleet_supervisor`` honors it and ``DEPRECATED_CONFIG_KEYS``
+    reports the read); issue #1979 removes the legacy locations.
     """
 
     poll_interval_seconds: int = 20
     full_pass_interval_seconds: int = 300
     active_cooldown_seconds: int = 30
     max_runtime_minutes: int = 0
-    max_pass_runtime_seconds: int = 1800
-    self_deploy_failure_alarm: int = 3
-    self_deploy_pull_ci_fleet: bool = False
-    zero_pass_alarm: int = 3
-    wedge_kill_loop_alarm: int = 3
-    dependency_sync_starvation_seconds: int = 14400
-    fleet_lane_concurrency: int = 8
-    reap_sweep_interval_seconds: int = 300
 
 
 @dataclass(frozen=True)
@@ -2390,6 +2347,7 @@ class OrchestratorConfig:
         default_factory=RunnerCapacityEscalationConfig
     )
     supervisor: SupervisorConfig = field(default_factory=SupervisorConfig)
+    fleet_supervisor: FleetSupervisorConfig = field(default_factory=FleetSupervisorConfig)
     post_mortem: PostMortemConfig = field(default_factory=PostMortemConfig)
 
     # Provenance, not values (issue #943). Paths of the config files that were
@@ -4193,19 +4151,18 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
             "allocation floor."
         )
     runner_capacity_escalation = parse_runner_capacity_escalation(data)
+    # Issue #1978: parse the fleet-scoped section BEFORE the supervisor one --
+    # the parser pops the relocated keys out of ``data['supervisor']`` (the
+    # private deepcopy above, so the caller's dict is untouched) and applies
+    # the new-location > legacy > default precedence itself, raising
+    # ConfigError when both locations disagree.
+    fleet_supervisor = parse_fleet_supervisor(data)
     supervisor_data = _section(data, "supervisor")
     for int_key in (
         "poll_interval_seconds",
         "full_pass_interval_seconds",
         "active_cooldown_seconds",
         "max_runtime_minutes",
-        "max_pass_runtime_seconds",
-        "self_deploy_failure_alarm",
-        "zero_pass_alarm",
-        "wedge_kill_loop_alarm",
-        "dependency_sync_starvation_seconds",
-        "fleet_lane_concurrency",
-        "reap_sweep_interval_seconds",
     ):
         value = supervisor_data.get(int_key)
         if value is not None and not isinstance(value, int):
@@ -4213,12 +4170,6 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
                 f"config section 'supervisor' key '{int_key}' must be an int, "
                 f"got {type(value).__name__}"
             )
-    pull_ci_fleet = supervisor_data.get("self_deploy_pull_ci_fleet")
-    if pull_ci_fleet is not None and not isinstance(pull_ci_fleet, bool):
-        raise ConfigError(
-            "config section 'supervisor' key 'self_deploy_pull_ci_fleet' must be "
-            f"a bool, got {type(pull_ci_fleet).__name__}"
-        )
     supervisor = _build_section(SupervisorConfig, "supervisor", supervisor_data)
     post_mortem_data = _section(data, "post_mortem")
     pm_enabled = post_mortem_data.get("enabled")
@@ -4316,6 +4267,7 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
         runner_allocation=runner_allocation,
         runner_capacity_escalation=runner_capacity_escalation,
         supervisor=supervisor,
+        fleet_supervisor=fleet_supervisor,
         post_mortem=post_mortem,
         # ``sources`` is left at its dataclass default here -- this function
         # only ever sees a dict, never a path. ``load_config`` below (and

@@ -1332,12 +1332,12 @@ def run_fleet_bash_rats(args: argparse.Namespace) -> CommandResult:
         fleet_dir_override=args.fleet_dir,
         dry_run=args.dry_run,
         pull_ci_fleet=(
-            global_config.supervisor.self_deploy_pull_ci_fleet
+            global_config.fleet_supervisor.self_deploy_pull_ci_fleet
             if global_config is not None
             else False
         ),
         starvation_seconds=(
-            global_config.supervisor.dependency_sync_starvation_seconds
+            global_config.fleet_supervisor.dependency_sync_starvation_seconds
             if global_config is not None
             else DEFAULT_SYNC_STARVATION_SECONDS
         ),

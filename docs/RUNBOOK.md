@@ -794,6 +794,12 @@ supervisor:
   max_runtime_minutes: 0           # 0 = unlimited
 ```
 
+The knobs only `charlie fleet supervise` reads — pass deadline, lane
+concurrency, reap cadence, alarm thresholds, self-deploy sibling-pull and
+starvation bounds — live under `fleet_supervisor:` (issue #1978; the legacy
+`supervisor.<key>` spellings still parse but emit `config_key_deprecated_read`,
+removal tracked by #1979). See `examples/orchestrator.config.*.yaml`.
+
 ### Detection latency
 
 - **Local events** (worker exits/starts, verdict files written): detected within

@@ -96,7 +96,7 @@ def test_run_fleet_bash_rats_drains_pass_when_sync_starved(
     mode -- ``drain=True`` suppresses new dispatch for this pass, matching
     the supervisor's posture -- and the configured bound is plumbed through.
     """
-    from charlie_work.config import OrchestratorConfig, SupervisorConfig
+    from charlie_work.config import FleetSupervisorConfig, OrchestratorConfig
 
     deploy_mock = MagicMock(
         return_value=SelfDeployResult(
@@ -120,7 +120,7 @@ def test_run_fleet_bash_rats_drains_pass_when_sync_starved(
         cli,
         "load_layered_config",
         lambda *_a, **_k: OrchestratorConfig(
-            supervisor=SupervisorConfig(dependency_sync_starvation_seconds=600)
+            fleet_supervisor=FleetSupervisorConfig(dependency_sync_starvation_seconds=600)
         ),
     )
 
