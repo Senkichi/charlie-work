@@ -23,6 +23,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -34,19 +35,23 @@ from charlie_work.labels import LabelConfig, transition
 from charlie_work.local_issues import LocalFileGitHub
 from charlie_work.local_lane import (
     branch_diff,
+    branch_diff_result,
     branch_head_sha,
+    branch_ref_exists,
     is_ancestor,
     is_local_pr_record,
     local_base_branch,
     local_pr_dict,
     local_pr_records,
     merge_branch_into_base,
+    probe_branch_ref,
     run_full_suite,
     suite_command_argv,
     synthesize_open_pr,
     worktree_for_branch,
 )
 from charlie_work.paths import runtime_paths
+from charlie_work.subprocess_runner import RunResult
 from charlie_work.reconcile import detect_drift
 from charlie_work.state import load_state, load_state_locked, save_state, state_lock
 from charlie_work.workflow import OrchestratorApp
@@ -224,6 +229,29 @@ class TestLocalLanePrimitives:
     def test_branch_diff_missing_branch_returns_none(self, repo: Path) -> None:
         _init_repo(repo)
         assert branch_diff(repo, "main", "ghost-branch") is None
+
+    def test_branch_diff_result_carries_git_stderr_on_failure(self, repo: Path) -> None:
+        _init_repo(repo)
+        diff, error = branch_diff_result(repo, "main", "ghost-branch")
+        assert diff is None
+        assert error is not None and "ghost-branch" in error  # git's own stderr
+
+    def test_branch_ref_exists_true_false_and_none(self, repo: Path) -> None:
+        """rc 0 -> True, rc 1 -> False, rc >= 2 / spawn error -> None."""
+        _init_repo(repo)
+        _make_branch(repo, "agent/issue-7-x", "feature.py", "x = 1\n")
+        assert branch_ref_exists(repo, "agent/issue-7-x") is True  # rc 0
+        assert branch_ref_exists(repo, "ghost-branch") is False  # rc 1
+
+        for result in (
+            RunResult(returncode=128, stdout="", stderr="fatal: not a git repository"),
+            RunResult(returncode=None, stdout="", stderr="", error="spawn failed"),
+            RunResult(returncode=None, stdout="", stderr="", timed_out=True, error="timeout"),
+        ):
+            with patch("charlie_work.local_lane.run_captured", return_value=result):
+                assert branch_ref_exists(repo, "agent/issue-7-x") is None
+                exists, detail = probe_branch_ref(repo, "agent/issue-7-x")
+                assert exists is None and detail  # the third state carries a reason
 
     def test_is_ancestor(self, repo: Path) -> None:
         _init_repo(repo)

@@ -18,6 +18,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
+from .dead_dispatched_timer import LOCAL_PARK_DEFER_FIELDS
+
 # PR-record bookkeeping that must not survive an operator re-arm: attempt
 # counters and caches that would otherwise instantly re-escalate the PR
 # (counters at cap) or feed the pipeline frozen pre-escalation data
@@ -126,6 +128,9 @@ UNESCALATE_ISSUE_RESET_FIELDS = (
     "dead_worker_failure_kind",
     # Issue #1993: companion of the stamp above (bounded re-arm counter).
     "throttle_reap_rearm_count",
+    # Issue #1971: the bounded local-park deferral bookkeeping is per death
+    # episode; a re-arm starts the deferral budget fresh.
+    *LOCAL_PARK_DEFER_FIELDS,
     # Issue #2002: ``worker_death_failure_kinds`` (the per-death timestamp ->
     # classified-kind map written by ``_credit_worker_death``) is deliberately
     # ABSENT from this tuple: it is the forensic record of WHICH classification

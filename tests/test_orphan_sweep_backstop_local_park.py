@@ -327,7 +327,10 @@ def test_backstop_due_probe_failure_defers_escalation(tmp_path: Path, shallow_wt
 
     # Pass 1: the branch-diff probe errors (transient git failure) while the
     # ref provably exists -> probe_failed -> deferred, not escalated.
-    with patch("charlie_work.local_work_park.branch_diff", return_value=None):
+    with patch(
+        "charlie_work.local_work_park.branch_diff_result",
+        return_value=(None, "git diff main...b: fatal: bad revision"),
+    ):
         _run_sweep(
             sessions_dir, paths.state_file, config, gh, _wg(paths.state_file), tmp_path / "fleet"
         )

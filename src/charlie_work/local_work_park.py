@@ -25,17 +25,23 @@ delegates in ``orchestration/state_pr_capability_lanes.py`` consult
 from __future__ import annotations
 
 import logging
-from collections.abc import Collection, Iterable, Mapping
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 from .config import OrchestratorConfig
-from .dead_dispatched_timer import dead_dispatched_reap_due
+from .dead_dispatched_timer import (
+    LOCAL_PARK_DEFER_FIELDS,
+    LOCAL_PARK_DEFER_MAX_PASSES,
+    clear_local_park_deferral,
+    dead_dispatched_reap_due,
+    defer_or_expire_local_park,
+)
 from .github import GitHubError, GitHubLike, label_names
 from .labels import TransitionOutcome
-from .local_lane import branch_diff, branch_ref_exists, local_base_branch
+from .local_lane import branch_diff_result, local_base_branch, probe_branch_ref
 from .paths import resolved_layout, runtime_paths
 from .rework_prompts import _write_text_atomic
 from .state import PASSIVE_OPEN_STATUS, load_state, load_state_locked, state_lock
@@ -134,6 +140,7 @@ def park_unpublishable_work(
                 issue_entry.pop("orphan_flagged_at", None)
                 issue_entry.pop("orphan_drift_fingerprint", None)
                 issue_entry.pop("orphan_drift_at", None)
+                clear_local_park_deferral(issue_entry)
                 state["issues"][str(issue_number)] = issue_entry
         state = write_gate.append_event(
             state,
@@ -250,7 +257,7 @@ def park_salvageable_local_orphan(
     The worktree-missing case still probes the branch ref directly: on a
     no-remote repo the branch is the deliverable, so a reclaimed worktree
     must not strand committed work that still exists in the main checkout.
-    The fallback measures a content delta (``branch_diff`` against the
+    The fallback measures a content delta (``branch_diff_result`` against the
     local base), not a bare commit count.
     """
     # Deferred: workflow.py imports this module for the sweep call site, so
@@ -289,23 +296,22 @@ def park_salvageable_local_orphan(
         # Branch-ref fallback: the worktree is gone (reclaimed) or
         # uninspectable while the branch still carries the worker's
         # commits. A non-empty diff against the local base means real work
-        # is salvageable. ``branch_diff`` returns None for ANY git error,
-        # though -- including a missing branch ref (a determinate "no work"
-        # answer) and transient failures alike -- so on None disambiguate
-        # with the ref probe: a provably absent ref is ``no_commits``,
-        # anything else is ``probe_failed`` (issue #1971: an inconclusive
-        # probe must defer the reap, never read as no-work).
+        # is salvageable. ``branch_diff_result`` returns no diff for ANY git
+        # error, though -- including a missing branch ref (a determinate "no
+        # work" answer) and transient failures alike -- so on failure
+        # disambiguate with the ref probe: a provably absent ref is
+        # ``no_commits``, anything else is ``probe_failed`` (issue #1971: an
+        # inconclusive probe must defer the reap, never read as no-work),
+        # carrying git's own stderr so the deferral/escalation reason names
+        # the actual failure (missing base ref, no merge base, ...).
         base_branch = resolved_base_ref or local_base_branch(repo_root) or "HEAD"
-        diff = branch_diff(repo_root, base_branch, branch)
+        diff, diff_error = branch_diff_result(repo_root, base_branch, branch)
         if diff is None:
-            ref_state = branch_ref_exists(repo_root, branch)
-            if ref_state is False:
+            ref_exists, ref_error = probe_branch_ref(repo_root, branch)
+            if ref_exists is False:
                 return LocalParkResult("no_commits")
-            return LocalParkResult(
-                "probe_failed",
-                f"git diff {base_branch}...{branch} failed "
-                f"(branch ref {'exists' if ref_state else 'unverifiable'})",
-            )
+            ref_note = "exists" if ref_exists else f"unverifiable ({ref_error})"
+            return LocalParkResult("probe_failed", f"{diff_error} (branch ref {ref_note})")
         if diff:
             ahead_count = 1
             resolved_base_ref = base_branch
@@ -334,6 +340,62 @@ def park_salvageable_local_orphan(
     return LocalParkResult("park_failed", salvage_error)
 
 
+def _defer_probe_failure(
+    write_gate: WriteGate, issue_number: int, *, reason: str, now: datetime
+) -> bool:
+    """Count one inconclusive-probe pass on the state entry; True while deferring.
+
+    Runs pre-lock in the reclaim lane, so it takes ``state_lock`` itself and
+    persists the counter (and the fingerprinted ``orphaned_worker_drift``
+    audit event) for the next pass. Delegates to the same
+    :func:`defer_or_expire_local_park` the in-lock backstop uses, so the two
+    lanes share ONE budget (``LOCAL_PARK_DEFER_MAX_PASSES``, keyed on the
+    sweep's ``now`` so a pass is never counted twice) and one event per
+    distinct reason.
+    """
+    state_file = write_gate.state_path
+    events: list[tuple[str, dict[str, Any]]] = []
+    with state_lock(state_file):
+        state = load_state(state_file)
+        entry = (state.get("issues") or {}).get(str(issue_number))
+        if not isinstance(entry, dict):
+            return True
+        entry = dict(entry)
+        deferred = defer_or_expire_local_park(
+            entry,
+            issue_number=issue_number,
+            reason=reason,
+            now=now,
+            orphan_drift_at=entry.get("orphan_drift_at"),
+            sweep_events=events,
+        )
+        state["issues"][str(issue_number)] = entry
+        for kind, payload in events:
+            state = write_gate.append_event(state, kind, payload)
+        write_gate.save_state(state)
+    return deferred
+
+
+def _reset_probe_deferral(write_gate: WriteGate, state: dict[str, Any], issue_number: int) -> None:
+    """Drop stale deferral bookkeeping once a pass gets a conclusive verdict.
+
+    ``state`` is the sweep's pre-lock snapshot and only gates the lock: the
+    common case (no counter on the entry) costs no lock or write.
+    """
+    snapshot = (state.get("issues") or {}).get(str(issue_number))
+    if not isinstance(snapshot, dict) or not any(f in snapshot for f in LOCAL_PARK_DEFER_FIELDS):
+        return
+    state_file = write_gate.state_path
+    with state_lock(state_file):
+        fresh = load_state(state_file)
+        entry = (fresh.get("issues") or {}).get(str(issue_number))
+        if isinstance(entry, dict):
+            entry = dict(entry)
+            clear_local_park_deferral(entry)
+            fresh["issues"][str(issue_number)] = entry
+            write_gate.save_state(fresh)
+
+
 def park_or_reclaim_local_orphan(
     *,
     gh: GitHubLike,
@@ -349,29 +411,36 @@ def park_or_reclaim_local_orphan(
     worker_outcome: dict[str, Any] | None,
     write_gate: WriteGate,
     reclaim_results: dict[int, dict[str, Any]],
-) -> LocalParkResult | None:
+    park_verdicts: dict[int, LocalParkResult],
+    now: datetime,
+) -> bool:
     """Issue #1923: the no-open-PR sweep tail -- park salvageable work, else reclaim.
 
     Runs :func:`park_salvageable_local_orphan` (whose docstring carries the
-    full gate contract) and returns its verdict so the caller can record it
-    -- the ``dead_dispatched_reap_minutes`` backstop consults the same
-    verdicts to decide whether a timed escalation may proceed (issue #1971).
+    full gate contract), records its verdict in ``park_verdicts`` -- the
+    ``dead_dispatched_reap_minutes`` backstop consults the same verdicts to
+    decide whether a timed escalation may proceed (issue #1971) -- and
+    returns True when the caller must ``continue`` without reclaiming.
 
-    A ``parked`` or ``probe_failed`` verdict means the caller ``continue``s
-    without reclaiming: ``parked`` because the work is safely held on the
-    branch, ``probe_failed`` because the probe could not disprove committed
-    work -- reclaiming (strip active, re-add ``ready``, redispatch) on a
-    transient git failure is exactly the discard path issue #1971 removes;
-    the active label stays in place and the probe retries next pass.
+    ``parked`` continues because the work is safely held on the branch.
+    ``probe_failed`` continues WHILE the bounded deferral budget remains
+    (:func:`_defer_probe_failure`): the probe could not disprove committed
+    work, and reclaiming (strip active, re-add ``ready``, redispatch) on a
+    transient git failure is the discard path issue #1971 removes; the
+    active label stays in place, an ``orphaned_worker_drift`` event names
+    the probe error, and the probe retries next pass. Once
+    ``LOCAL_PARK_DEFER_MAX_PASSES`` consecutive passes fail, the failure is
+    deterministic (a missing base ref, no merge base) and would wedge the
+    entry forever, so the reclaim runs and carries the probe error.
 
     On any other outcome -- a PR-capable backend, a proven ``no_commits``
-    verdict, or a failed park -- the sweep's normal reclaim runs here
-    instead: strip the active labels, re-add ``ready``, record the outcome
-    in ``reclaim_results``. A failed park additionally stamps
-    ``salvage_failed``/``salvage_error`` onto the recorded reclaim so the
-    ``session_failed_relabeled`` event carries *why* an issue with
-    committed work fell through -- the loud outcome, matching the sibling
-    lane's salvage-failure contract.
+    verdict, a failed park, or a spent probe budget -- the sweep's normal
+    reclaim runs here instead: strip the active labels, re-add ``ready``,
+    record the outcome in ``reclaim_results``. A failed park or spent probe
+    budget additionally stamps ``salvage_failed``/``salvage_error`` onto the
+    recorded reclaim so the ``session_failed_relabeled`` event carries *why*
+    an issue with possibly-committed work fell through -- the loud outcome,
+    matching the sibling lane's salvage-failure contract.
 
     Lives here rather than inline in ``_detect_and_handle_orphaned_workers``
     because ``workflow.py`` sits over its file-size ratchet mark -- the same
@@ -391,8 +460,17 @@ def park_or_reclaim_local_orphan(
         worker_outcome=worker_outcome,
         write_gate=write_gate,
     )
-    if park_result is not None and park_result.status in ("parked", "probe_failed"):
-        return park_result
+    if park_result is not None:
+        park_verdicts[issue_number] = park_result
+    if park_result is not None and park_result.status == "parked":
+        return True
+    probe_error: str | None = None
+    if park_result is not None and park_result.status == "probe_failed":
+        probe_error = park_result.error or park_result.status
+        if _defer_probe_failure(write_gate, issue_number, reason=probe_error, now=now):
+            return True
+    else:
+        _reset_probe_deferral(write_gate, state, issue_number)
 
     needs_ready = config.labels.ready not in issue_labels
     label_write_ok = True
@@ -413,7 +491,19 @@ def park_or_reclaim_local_orphan(
         # not be parked.
         reclaim_results[issue_number]["salvage_failed"] = True
         reclaim_results[issue_number]["salvage_error"] = park_result.error
-    return park_result
+    elif probe_error is not None:
+        # Issue #1971: the deferral budget is spent -- the reclaim proceeds
+        # (a deterministic probe failure must not wedge the entry) and the
+        # event carries git's own error, never a bare status.
+        reclaim_results[issue_number]["salvage_failed"] = True
+        reclaim_results[issue_number]["salvage_error"] = (
+            f"branch probe failed {LOCAL_PARK_DEFER_MAX_PASSES} consecutive passes: {probe_error}"
+        )
+        # The verdict is spent: recording it would make the in-lock backstop
+        # re-defer an issue this pass already reclaimed.
+        park_verdicts.pop(issue_number, None)
+        _reset_probe_deferral(write_gate, state, issue_number)
+    return False
 
 
 def park_backstop_due_local_orphans(
@@ -428,7 +518,7 @@ def park_backstop_due_local_orphans(
     issues_by_number: Mapping[int, dict[str, Any]],
     worker_outcomes: Mapping[int, dict[str, Any] | None],
     reclaim_results: Mapping[int, dict[str, Any]],
-    escalated: Collection[int],
+    escalations: Sequence[Collection[int]],
     park_verdicts: Mapping[int, "LocalParkResult"],
     dead_dispatched_reap_minutes: float,
     now: datetime,
@@ -453,7 +543,7 @@ def park_backstop_due_local_orphans(
 
     * issues already handled this pass -- a recorded park verdict
       (``park_verdicts``), a completed reclaim (``reclaim_results``), or a
-      same-pass escalation (``escalated``: worker-blocked, zero-artifact,
+      same-pass escalation (``escalations``: worker-blocked, zero-artifact,
       or cross-repo -- each already stripped the active labels and applied
       ``human_needed``, which a park's ``local_work_ready`` edge would
       otherwise silently strip);
@@ -478,6 +568,7 @@ def park_backstop_due_local_orphans(
     """
     if not isinstance(repo_root, Path) or publishes_pull_requests(gh):
         return {}
+    escalated = {number for group in escalations for number in group}
     deferred: dict[int, str] = {}
     for issue_number in no_pr_orphans:
         prior_verdict = park_verdicts.get(issue_number)

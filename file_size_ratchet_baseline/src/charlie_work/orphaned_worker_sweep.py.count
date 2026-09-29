@@ -1,5 +1,0 @@
-1000
-# Issue #1997 / PR #1998: the emission-anchored throttle-window change grew
-# the module's bounded-exemption docstring and born-expired-window comment
-# past the 800 cap (799 -> 813). First crossing -- reviewed mark set at the
-# next MARK_QUANTUM multiple per the ratchet's hand-raise rule.
