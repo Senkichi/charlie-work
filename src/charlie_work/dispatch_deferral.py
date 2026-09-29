@@ -121,6 +121,7 @@ def record_lane_result(app: Any, lane: str, result: Any) -> None:
             result.message,
             streak if streak > 0 else "?",
         )
+        # write-gate-exempt(issue=1986): dispatch-lane diagnostics; record_lane_result returns before any write under dry_run and the decorated app carries no write_gate.
         log_event(
             state_file,
             DISPATCH_DEFERRED_KIND,
@@ -128,6 +129,7 @@ def record_lane_result(app: Any, lane: str, result: Any) -> None:
             repo=repo,
         )
         if streak == DEFAULT_STARVATION_THRESHOLD:
+            # write-gate-exempt(issue=1986): dispatch-lane diagnostics; record_lane_result returns before any write under dry_run and the decorated app carries no write_gate.
             log_event(
                 state_file,
                 DISPATCH_STARVED_KIND,
