@@ -417,6 +417,7 @@ def _credit_worker_death(
     entry: dict[str, Any],
     *,
     at: str | None = None,
+    kind: str | None = None,
 ) -> list[str]:
     """Return ``entry``'s ``worker_death_at`` timestamps with one death appended.
 
@@ -442,8 +443,28 @@ def _credit_worker_death(
     ``redispatch_window_minutes`` at write time silently discards
     timestamps a later, wider window would want to see. Only the read-time
     windowed accessors bound what a cap check considers "recent".
+
+    Issue #2002: ``kind`` records the credited death's resolved
+    ``failure_kind`` alongside the timestamp on
+    ``entry["worker_death_failure_kinds"]`` — a timestamp-keyed map that is
+    deliberately NOT in ``UNESCALATE_ISSUE_RESET_FIELDS`` and not popped by
+    ``clear_dead_worker_failure_kind``. The per-death classification must
+    survive an unescalate (which clears ``worker_death_at`` and the
+    epoch-scoped ``dead_worker_failure_kind`` stamp) so a credited death's
+    attribution — in particular "this death was a provider-throttle death
+    that should never have counted" — stays recoverable from state even
+    after the operator re-arms the issue. ``None`` is recorded as JSON
+    ``null``: "the sweep credited this death with no resolvable
+    classification", distinguishable from a credit that predates the map.
+    Mutates ``entry`` in place for the kinds map, the same entry the caller
+    reassigns ``worker_death_at`` on — one credit, one attribution.
     """
     timestamp = at if at is not None else datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    kinds = entry.get("worker_death_failure_kinds")
+    if not isinstance(kinds, dict):
+        kinds = {}
+    kinds[timestamp] = kind
+    entry["worker_death_failure_kinds"] = kinds
     return _normalized_timestamps(entry.get("worker_death_at")) + [timestamp]
 
 

@@ -126,6 +126,12 @@ UNESCALATE_ISSUE_RESET_FIELDS = (
     "dead_worker_failure_kind",
     # Issue #1993: companion of the stamp above (bounded re-arm counter).
     "throttle_reap_rearm_count",
+    # Issue #2002: ``worker_death_failure_kinds`` (the per-death timestamp ->
+    # classified-kind map written by ``_credit_worker_death``) is deliberately
+    # ABSENT from this tuple: it is the forensic record of WHICH classification
+    # each historical death credit carried, and the point of recording it is
+    # that the attribution survives exactly this reset -- ``worker_death_at``
+    # and ``dead_worker_failure_kind`` are re-armed, the map is not.
     "escalation_reason",
     # Issue #1461: clear the append-only escalation history so a re-arm
     # gives every lane a genuinely fresh dedup slate.
