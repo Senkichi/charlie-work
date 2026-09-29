@@ -160,7 +160,7 @@ def review_queue(self) -> _wf.CommandResult:
                     # against has drifted, meaning its body-scoped findings
                     # may already be fixed. Firing the stranded-verdict
                     # reroute below is exactly the rework loop the issue
-                    # reports (the job-cannon #2201 incident), so queue a
+                    # reports (the downstream-repo #2201 incident), so queue a
                     # FRESH review instead -- same contract as the #1111
                     # stale-CI branch above: superseded by a new recorded
                     # verdict, never auto-approved.

@@ -6,7 +6,7 @@ the live body now differs from the verdict's ``reviewed_body_sha256``
 baseline, ``review_queue()`` must queue a FRESH review (never auto-approve)
 instead of carrying the verdict forward onto a content-identical head or
 re-routing it to rework. Before this fix a body-only rework looped through
-``dispatch_rework`` until the redispatch cap escalated the issue (job-cannon
+``dispatch_rework`` until the redispatch cap escalated the issue (downstream-repo
 PR #2201). Shared fakes and helpers in ``tests/_review_fixtures.py``.
 """
 
