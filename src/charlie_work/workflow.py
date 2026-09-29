@@ -1903,7 +1903,15 @@ def _detect_and_handle_orphaned_workers(
             # 0`` in *this* repo's tree -- swept as a dead worker with no
             # open PR, relabeled, redispatched, forever. Escalate to
             # ``agent:human-needed`` instead of burning another dispatch.
-            if _is_zero_artifact_dispatch_loop(sessions_dir, issue_number):
+            # Issue #1993: a throttle-classified death produced zero
+            # artifacts because the provider refused it, not because the
+            # work loops -- it must not trip this guard (2026-09-29: #1983
+            # escalated twice in 11 minutes on ``rate_limited`` deaths).
+            orphan_entry = state["issues"].get(str(issue_number))
+            throttle_death = isinstance(orphan_entry, dict) and is_provider_throttle_failure(
+                orphan_entry.get("dead_worker_failure_kind")
+            )
+            if not throttle_death and _is_zero_artifact_dispatch_loop(sessions_dir, issue_number):
                 label_write_ok = True
                 for label in sorted(active_labels):
                     if not gh.remove_issue_label(issue_number, label):
@@ -2281,6 +2289,7 @@ def _detect_and_handle_orphaned_workers(
                     dead_dispatched_reap_minutes=(config.watchdog.dead_dispatched_reap_minutes),
                     now=now,
                     sweep_events=sweep_events,
+                    max_throttle_rearms=config.watchdog.max_auto_redispatch,
                 )
             )
             if dead_dispatched_reaped:

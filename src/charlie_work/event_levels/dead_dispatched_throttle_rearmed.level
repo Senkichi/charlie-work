@@ -1,0 +1,6 @@
+info
+# Issue #1993: a dead dispatched worker whose death was classified as a
+# provider throttle (rate_limited / quota_exhausted) sat past the timed-reap
+# grace with no linked PR. The issue is already back in the dispatchable pool,
+# so the backstop re-armed its clock instead of escalating. Bounded by
+# watchdog.max_auto_redispatch; past that, dead_dispatched_worker_reaped fires.
