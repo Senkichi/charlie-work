@@ -47,6 +47,15 @@ _MERGE_WORKTREE_PREFIX = "local-merge"
 GIT_OP_TIMEOUT_SECONDS = 120
 
 
+# The adopted record's status between creation and its first packet commit
+# (orchestration/local_lanes.py writes and reads it; ``unescalate`` re-arms a
+# stranded lane record back to it). Kept here -- next to the record
+# predicates below -- rather than in the delegate module so any consumer of
+# the record vocabulary can import it without pulling in the orchestration
+# package.
+LOCAL_PENDING_STATUS = "local_pending"
+
+
 def is_local_pr_record(entry: Any) -> bool:
     """Whether a ``state["prs"]`` entry belongs to the local (no-remote) lane.
 
