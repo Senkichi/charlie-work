@@ -244,6 +244,7 @@ from .escalation import (  # noqa: F401  (deliberate re-export)
     _deescalation_skip,
     _record_issue_label_error,
     _escalate_issue,
+    _strip_active_and_flag_human_needed,
     _escalated_label_needs_repair,
     _collect_escalated_label_subjects,
     _escalation_edge,
@@ -1901,13 +1902,9 @@ def _detect_and_handle_orphaned_workers(
                     sessions_dir, issue_number, str(worker_outcome.get("detail") or "")
                 )
             ):
-                label_write_ok = True
-                for label in sorted(active_labels):
-                    if not gh.remove_issue_label(issue_number, label):
-                        label_write_ok = False
-                if config.labels.human_needed not in issue_labels:
-                    if not gh.add_issue_label(issue_number, config.labels.human_needed):
-                        label_write_ok = False
+                label_write_ok = _strip_active_and_flag_human_needed(
+                    gh, config, issue_number, active_labels, issue_labels
+                )
                 worker_declared_blocked_escalations[issue_number] = {
                     "removed_labels": sorted(active_labels),
                     "label_write_ok": label_write_ok,
@@ -1934,13 +1931,9 @@ def _detect_and_handle_orphaned_workers(
                 orphan_entry.get("dead_worker_failure_kind")
             )
             if not throttle_death and _is_zero_artifact_dispatch_loop(sessions_dir, issue_number):
-                label_write_ok = True
-                for label in sorted(active_labels):
-                    if not gh.remove_issue_label(issue_number, label):
-                        label_write_ok = False
-                if config.labels.human_needed not in issue_labels:
-                    if not gh.add_issue_label(issue_number, config.labels.human_needed):
-                        label_write_ok = False
+                label_write_ok = _strip_active_and_flag_human_needed(
+                    gh, config, issue_number, active_labels, issue_labels
+                )
                 zero_artifact_escalations[issue_number] = {
                     "removed_labels": sorted(active_labels),
                     "label_write_ok": label_write_ok,
@@ -1962,13 +1955,9 @@ def _detect_and_handle_orphaned_workers(
                 sweep_fleet_repos,
             )
             if not scope_result.passed:
-                label_write_ok = True
-                for label in sorted(active_labels):
-                    if not gh.remove_issue_label(issue_number, label):
-                        label_write_ok = False
-                if config.labels.human_needed not in issue_labels:
-                    if not gh.add_issue_label(issue_number, config.labels.human_needed):
-                        label_write_ok = False
+                label_write_ok = _strip_active_and_flag_human_needed(
+                    gh, config, issue_number, active_labels, issue_labels
+                )
                 cross_repo_scope_escalations[issue_number] = {
                     "removed_labels": sorted(active_labels),
                     "label_write_ok": label_write_ok,
