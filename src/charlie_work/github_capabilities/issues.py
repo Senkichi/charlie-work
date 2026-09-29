@@ -48,6 +48,7 @@ from ci_fleet.github import GitHubError
 # bare global.
 from ._base import CapabilityCollaborator, GitHubRunResult, _LIST_LIMIT
 from .circuit_breaker_transport import circuit_breaker_state_path
+from .cross_repo_blockers import CrossRepoBlocker, make_blocker, repo_from_repository_url
 from ..instrumentation import log_event
 
 if TYPE_CHECKING:
@@ -93,6 +94,20 @@ ISSUE_VIEW_FIELDS = (
 # GitHub's secondary rate limits while still cutting a serial N x ~2s loop down
 # substantially.
 _MAX_ISSUE_STATE_WORKERS = 8
+
+
+def _current_repo_slug(gh: Any) -> str | None:
+    """``owner/name`` of ``gh``'s repo, or None when it cannot be determined.
+
+    Test doubles have no ``_repo_owner_name``; a failed remote lookup is a
+    ``GitHubError``. Either way the caller treats a qualified dependency as
+    foreign (see ``make_blocker``), which is the fail-closed direction.
+    """
+    try:
+        owner, name = gh._repo_owner_name()
+    except (AttributeError, GitHubError, TypeError, ValueError):
+        return None
+    return f"{owner}/{name}"
 
 
 # Moved verbatim from ``github.py`` alongside ``issue_dependencies`` (Track 2,
@@ -188,7 +203,21 @@ def get_github_issue_dependencies(gh: GitHubLike, issue_number: int) -> list[int
     elif isinstance(value, list):
         # Extract issue numbers from the dependency list — a real, successful
         # resolution, cached.
-        deps = [int(dep.get("number", 0)) for dep in value if dep.get("number")]
+        # Issue #2005: a dependency in another repo keeps its repo identity
+        # (``CrossRepoBlocker``) instead of collapsing to a bare number.
+        # The current repo is resolved only if some dependency is qualified
+        # (it costs a ``git remote`` call on a cold cache).
+        current_repo: str | None = None
+        current_repo_resolved = False
+        deps: list[int] = []
+        for dep in value:
+            if not isinstance(dep, dict) or not dep.get("number"):
+                continue
+            dep_repo = repo_from_repository_url(dep.get("repository_url"))
+            if dep_repo and not current_repo_resolved:
+                current_repo = _current_repo_slug(gh)
+                current_repo_resolved = True
+            deps.append(make_blocker(int(dep["number"]), dep_repo, current_repo))
         if cache is not None:
             cache[cache_key] = deps
         return deps
@@ -347,6 +376,36 @@ class Issues(CapabilityCollaborator):
         except GitHubError:
             return False
 
+    def _foreign_blocker_is_open(self, blocker: CrossRepoBlocker) -> bool:
+        """Open/closed state of a cross-repo blocker, in the blocker's own repo.
+
+        Fail closed (issue #2005): any lookup failure or unrecognised payload
+        counts as open, so an unverifiable prerequisite keeps blocking. Only a
+        definite ``state`` is cached (pass-scoped ``_list_cache``), so a
+        failure is retried on the next lookup rather than locked in.
+        """
+        cache_key = ("issue_open", blocker.repo, int(blocker))
+        cached = self._list_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        try:
+            result = self.run(
+                ["api", f"repos/{blocker.repo}/issues/{int(blocker)}"],
+                json_output=True,
+                allow_failure=True,
+            )
+        except (GitHubError, OSError, ValueError, TypeError):
+            logger.warning("Cross-repo blocker %r lookup raised - treating as open", blocker)
+            return True
+        value = result.value if isinstance(result, GitHubRunResult) else result
+        state = str(value.get("state") or "").upper() if isinstance(value, dict) else ""
+        if state not in ("OPEN", "CLOSED"):
+            logger.warning("Cross-repo blocker %r state unresolved - treating as open", blocker)
+            return True
+        is_open = state == "OPEN"
+        self._list_cache[cache_key] = is_open
+        return is_open
+
     def are_issues_open(self, issue_numbers: list[int]) -> set[int]:
         """Check which of the given issue numbers are currently open.
 
@@ -375,6 +434,11 @@ class Issues(CapabilityCollaborator):
         open_issues: set[int] = set()
         uncached: list[int] = []
         for number in issue_numbers:
+            if isinstance(number, CrossRepoBlocker):
+                # Issue #2005: resolved in its own repo, never by bare number.
+                if self._foreign_blocker_is_open(number):
+                    open_issues.add(number)
+                continue
             cached = self._list_cache.get(("issue_open", number))
             if cached is None:
                 uncached.append(number)
