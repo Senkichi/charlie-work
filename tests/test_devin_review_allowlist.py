@@ -144,18 +144,38 @@ def test_allowlist_write_failure_does_not_raise(
 
 
 _FORBIDDEN = re.compile(
-    r"\b(rm|push|commit|checkout|reset|python\d?|uv|bash|sh|pwsh|find|sed|awk|gh)\b"
+    r"\b(rm|push|commit|checkout|reset|python\d?|uv|node|bash|sh|pwsh|find|sed|awk"
+    r"|rg|sort|uniq|api|grep -O|git grep|git diff|git log|git show)\b"
 )
+
+# Exact read-only gh subcommands; anything else under ``gh`` is forbidden
+# (``gh api`` can write, ``gh pr merge``/``edit``/``comment`` mutate).
+_ALLOWED_GH = {
+    "Exec(gh issue view)",
+    "Exec(gh pr view)",
+    "Exec(gh pr diff)",
+    "Exec(gh pr checks)",
+}
 
 
 def test_allowlist_entries_are_readonly_exec_rules() -> None:
     assert _REVIEW_EXEC_ALLOWLIST
     for entry in _REVIEW_EXEC_ALLOWLIST:
         assert entry.startswith("Exec(") and entry.endswith(")"), entry
+        if entry.startswith("Exec(gh"):
+            assert entry in _ALLOWED_GH, entry
+            continue
         assert not _FORBIDDEN.search(entry), entry
-    assert "Exec(git)" not in _REVIEW_EXEC_ALLOWLIST
-    assert "Exec(git branch)" not in _REVIEW_EXEC_ALLOWLIST
+    for bare in ("Exec(git)", "Exec(gh)", "Exec(git branch)", "Exec(gh pr)", "Exec(gh issue)"):
+        assert bare not in _REVIEW_EXEC_ALLOWLIST
     assert len(set(_REVIEW_EXEC_ALLOWLIST)) == len(_REVIEW_EXEC_ALLOWLIST)
+
+
+def test_allowlist_covers_the_commands_that_ended_2011_sessions() -> None:
+    # Regression anchor: these were the prompted-then-rejected commands that
+    # ended the missed #2011 reviews (Devin sessions.db, 2026-09-29).
+    for rule in ("Exec(gh issue view)", "Exec(gh pr view)"):
+        assert rule in _REVIEW_EXEC_ALLOWLIST
 
 
 def test_sanitizer_still_strips_dangerous() -> None:

@@ -117,28 +117,32 @@ _REVIEW_COMMAND_TEMPLATE: tuple[str, ...] = (
 # chaining (``git log && rm x``) cannot escape the list. Allow rules only: a
 # deny rule also ends the session silently.
 #
-# Deliberately EXCLUDED (keep it that way):
-# - bare ``Exec(git)`` / bare ``git branch``: would admit push, commit,
-#   checkout, reset, branch -D, etc.
-# - ``find`` (-delete, -exec), ``sed`` (-i), ``awk`` (system(), redirection):
-#   in-place writes / arbitrary execution.
-# - any interpreter (python, uv, node, bash, sh, pwsh): arbitrary code.
-# - ``rm`` and other mutators; ``gh`` (network + PR/issue writes).
+# Anything NOT listed still goes to Devin's own classifier, which judges the
+# FULL command line: it already auto-approved ``git status``/``git diff``/
+# ``git log``/``git rev-parse`` in the #2011 sessions, and it can refuse a
+# flag-level escape (``git diff --output=<path>``) that a whole-word prefix
+# rule cannot express. So the list holds only (a) what the classifier
+# actually prompted on -- the read-only ``gh ... view`` family, which ended 4
+# of the 5 missed #2011 sessions -- and (b) commands with no exec/write flag.
+#
+# Deliberately EXCLUDED (keep it that way; the reviewer reads attacker-
+# influenced diffs, so every entry must be safe against prompt injection):
+# - bare ``Exec(git)``/``Exec(gh)`` and any git/gh subcommand with a write or
+#   exec flag: ``git diff|log|show`` (``--output=<path>`` writes anywhere),
+#   ``git grep`` (``-O<cmd>`` runs a pager command), ``gh api`` (arbitrary
+#   REST incl. writes).
+# - ``rg`` (``--pre <cmd>`` runs a program), ``sort`` (``-o``,
+#   ``--compress-program``), ``uniq`` (writes its 2nd arg), ``find``
+#   (``-delete``/``-exec``), ``sed``/``awk`` (in-place writes, system()).
+# - any interpreter or runner (python, uv, node, bash, sh, pwsh): arbitrary
+#   code -- the #2011 mdls session was ended by ``uv run ... python -c``, and
+#   that refusal is correct.
 # ``--permission-mode dangerous`` stays impossible (see the sanitizer below).
 _REVIEW_EXEC_ALLOWLIST: tuple[str, ...] = (
-    "Exec(git log)",
-    "Exec(git diff)",
-    "Exec(git show)",
-    "Exec(git status)",
-    "Exec(git rev-parse)",
-    "Exec(git ls-files)",
-    "Exec(git blame)",
-    "Exec(git merge-base)",
-    "Exec(git cat-file)",
-    "Exec(git grep)",
-    "Exec(git branch --show-current)",
-    "Exec(git worktree list)",
-    "Exec(rg)",
+    "Exec(gh issue view)",
+    "Exec(gh pr view)",
+    "Exec(gh pr diff)",
+    "Exec(gh pr checks)",
     "Exec(grep)",
     "Exec(cat)",
     "Exec(head)",
@@ -146,8 +150,6 @@ _REVIEW_EXEC_ALLOWLIST: tuple[str, ...] = (
     "Exec(wc)",
     "Exec(ls)",
     "Exec(pwd)",
-    "Exec(sort)",
-    "Exec(uniq)",
 )
 
 
