@@ -752,10 +752,19 @@ def handle_dead_worker_with_pr(
                         # Issue #1917: provider-throttle deaths are
                         # not credited — same #1684 exemption as the
                         # branches above.
-                        # Issue #2002: classify the sidecar log before crediting.
+                        # Issue #2002: an open PR proves the worker produced
+                        # real work and this site has no clean-exit guard, so
+                        # do NOT log-classify (#656 false-positive class) --
+                        # only an existing stamp is consulted.
                         death_ts = _wf.utc_now()
                         death_kind = classify_and_credit_dead_worker(
-                            entry, sessions_dir, issue_number, state, config, at=death_ts
+                            entry,
+                            sessions_dir,
+                            issue_number,
+                            state,
+                            config,
+                            at=death_ts,
+                            classify_log=False,
                         )
                         sweep_events.append(
                             (

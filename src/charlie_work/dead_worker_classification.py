@@ -20,6 +20,11 @@ reason). By the time the classifier stamped the kind on a later pass, the
 credit was already persisted, and the operator's subsequent unescalate
 erased the stamp -- the attribution was unrecoverable.
 
+Classification is scoped to deaths that could plausibly be provider
+kills: the unreviewed-PR advance site (an open PR proves real work, and it
+has no clean-exit guard) passes ``classify_log=False`` and only consults an
+existing stamp -- see ``classify_and_credit_dead_worker``.
+
 This module is the single point the sweep's credit sites call so the
 death's own log is classified at credit time rather than relying on a
 stamp another lane may not have written yet. It deliberately does NOT
@@ -85,6 +90,7 @@ def resolve_dead_worker_failure_kind(
     config: OrchestratorConfig,
     *,
     now: datetime | None = None,
+    classify_log: bool = True,
 ) -> str | None:
     """Resolve the death's ``failure_kind``, stamping the entry when new.
 
@@ -111,6 +117,12 @@ def resolve_dead_worker_failure_kind(
     ``throttled_until`` comes back None there and the cooldown would never
     be set if this lane skipped it.
 
+    ``classify_log=False`` restricts resolution to the existing stamp: the
+    sidecar log is never read, no sidecar ``failure_kind`` is written, and no
+    cooldown is armed. Callers pass it for a death whose worker demonstrably
+    produced real work (see ``classify_and_credit_dead_worker``), where a log
+    tail quoting throttle markers is the #656 false-positive class.
+
     ``state`` is mutated in place (``set_throttled_until`` returns a new
     mapping; ``update`` folds its keys back into the locked dict). Returns
     the resolved kind, or None when the death stays unclassified -- the
@@ -120,6 +132,8 @@ def resolve_dead_worker_failure_kind(
     stamped = entry.get("dead_worker_failure_kind")
     if stamped is not None:
         return stamped
+    if not classify_log:
+        return None
     view = _worker_view_for_entry(sessions_dir, entry, issue_number)
     if view is None:
         return None
@@ -168,6 +182,7 @@ def classify_and_credit_dead_worker(
     *,
     at: str,
     now: datetime | None = None,
+    classify_log: bool = True,
 ) -> str | None:
     """Classify the dead worker, then credit its death unless throttle-caused.
 
@@ -176,10 +191,15 @@ def classify_and_credit_dead_worker(
     restore, approved-rework restore, unreviewed-PR advance) call this once
     each instead of gating on a possibly-absent
     ``dead_worker_failure_kind`` stamp. Resolution runs lazily at the
-    credit site -- never on the clean-exit, completed-outcome, or
-    head-advanced lanes -- so a worker that produced real work is not
-    log-classified at all (the #656 false-positive class: a session's own
-    completion prose quoting throttle markers).
+    credit site. The request_changes and approved-rework restore sites are
+    only reached after their clean-exit (``terminal_exit_code == 0``) and
+    completed-outcome guards, so they log-classify (``classify_log=True``).
+    The unreviewed-PR advance site has NO such guard -- it is reached with
+    an open PR (real work) whether or not the worker exited cleanly -- so it
+    passes ``classify_log=False`` and only consults an existing stamp: a
+    session's own completion prose quoting throttle markers (the #656
+    false-positive class) must not arm a fleet-wide throttle from a worker
+    that produced a PR. That death is still credited, as unclassified.
 
     A provider-throttle kind (``is_provider_throttle_failure`` -- the
     #1684/#1917 exemption) suppresses the credit: the death is a global
@@ -192,7 +212,7 @@ def classify_and_credit_dead_worker(
     call site can record it in its event payload.
     """
     failure_kind = resolve_dead_worker_failure_kind(
-        entry, sessions_dir, issue_number, state, config, now=now
+        entry, sessions_dir, issue_number, state, config, now=now, classify_log=classify_log
     )
     if not is_provider_throttle_failure(failure_kind):
         entry["worker_death_at"] = _credit_worker_death(entry, at=at, kind=failure_kind)
