@@ -366,6 +366,17 @@ def _fetch_prs(gh: GitHubLike) -> list[dict[str, Any]]:
     The REST ``pulls`` endpoint is paged and has no hard cap, so we walk it
     until a page comes back with fewer items than requested.
     """
+    # Issue #1969: a backend that cannot host pull requests
+    # (``publishes_pull_requests`` False -- ``LocalFileGitHub``) has an empty
+    # PR set *by definition*, so ``[]`` is the truthful snapshot rather than
+    # a degraded read. ``gh.run`` raises ``GitHubError`` there; this one
+    # check covers ``detect_aviator_stale_blocked``,
+    # ``detect_mergequeue_not_approved``, and ``detect_mergequeue_wedged`` --
+    # every detector whose contract is "scan the PR surface" -- and keeps
+    # the loop's reconcile pass (and ``charlie mop-up``) from failing
+    # structurally on a local-issue repository.
+    if not publishes_pull_requests(gh):
+        return []
     per_page = 100
     all_prs: list[dict[str, Any]] = []
     page = 1

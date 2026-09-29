@@ -320,3 +320,40 @@ class _EmptyStdoutGitHub:
 
     def invalidate_list_cache(self) -> None:
         return None
+
+
+# ---------------------------------------------------------------------------
+# LocalFileGitHub fixtures (issue #1969)
+# ---------------------------------------------------------------------------
+
+
+def _write_local_issue(
+    issues_dir: Path,
+    number: int,
+    slug: str,
+    title: str,
+    state: str,
+    labels: str,
+    body: str,
+) -> Path:
+    """Write one local issue repository markdown file (``{number:03d}_{slug}.md``).
+
+    Mirrors ``test_local_issues.py``'s private ``_write_issue`` so reconcile
+    tests can serve issue snapshots from a real ``LocalFileGitHub`` instead
+    of a fake -- the point of the #1969 regression coverage is exercising
+    ``detect_drift``/``apply_fixes`` against the actual no-remote backend.
+    ``labels`` is the raw YAML inline list (e.g. ``"[agent:done]"``).
+    """
+    path = issues_dir / f"{number:03d}_{slug}.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "---\n"
+        f'title: "{title}"\n'
+        f"state: {state}\n"
+        f"labels: {labels}\n"
+        f"issue_number: {number}\n"
+        "---\n\n"
+        f"{body}\n",
+        encoding="utf-8",
+    )
+    return path

@@ -24,9 +24,16 @@ from pathlib import Path
 
 import pytest
 
-from charlie_work.config import OrchestratorConfig
+from charlie_work.config import AutoMergeConfig, OrchestratorConfig
+from charlie_work.local_issues import LocalFileGitHub
 from charlie_work.paths import resolved_layout, runtime_paths
-from charlie_work.reconcile import apply_fixes, detect_drift
+from charlie_work.reconcile import (
+    apply_fixes,
+    detect_aviator_stale_blocked,
+    detect_drift,
+    detect_mergequeue_not_approved,
+    detect_mergequeue_wedged,
+)
 from charlie_work.state import (
     ORCHESTRATOR_OWNED_ISSUE_STATUSES,
     PASSIVE_OPEN_STATUS,
@@ -37,7 +44,7 @@ from charlie_work.state import (
 from charlie_work.workflow import _detect_and_handle_stalled_reviews
 from charlie_work.write_gate import WriteGate
 
-from _reconcile_fixtures import FakeGitHub, _issue, _pr
+from _reconcile_fixtures import FakeGitHub, _issue, _pr, _write_local_issue
 
 
 # Issue #1264 (W6 PR2): the WriteGate must carry THIS test's own state_file
@@ -681,3 +688,96 @@ def test_active_state_statuses_is_valid_minus_deliberate_exclusions() -> None:
 
     deliberate_exclusions = {"closed", "approved", "blocked"}
     assert ACTIVE_STATE_STATUSES == VALID_ISSUE_STATUSES - deliberate_exclusions
+
+
+def test_detect_drift_finalizes_closed_escalated_issue_on_local_backend(
+    tmp_path: Path,
+) -> None:
+    """Issue #1969: ``detect_drift`` takes its local issue branch on a
+    ``LocalFileGitHub`` and ``state_active_status_issue_closed`` fires for a
+    state entry still parked at ``escalated`` after the issue file was
+    closed -- the repair path ``_maybe_reconcile_drift`` made unreachable by
+    skipping every pass on a non-publishing backend.
+    """
+    config = OrchestratorConfig()
+    issues_dir = tmp_path / "docs" / "issues"
+    _write_local_issue(
+        issues_dir,
+        131,
+        "closed-escalated",
+        "closed escalated",
+        "closed",
+        f"[{config.labels.done}]",
+        "merged already.",
+    )
+    gh = LocalFileGitHub(
+        repo_root=tmp_path,
+        issues_dir=issues_dir,
+        state_dir=".var/charlie-work",
+    )
+    state = empty_state()
+    state["issues"]["131"] = {"number": 131, "status": "escalated"}
+
+    drift = detect_drift(gh, state, config)
+
+    assert [item.kind for item in drift] == ["state_active_status_issue_closed"]
+    new_state = apply_fixes(gh, state, drift, config)
+    assert new_state["issues"]["131"]["status"] == "closed"
+
+
+def test_open_escalated_issue_is_untouched_on_local_backend(tmp_path: Path) -> None:
+    """D-2 invariant on a real ``LocalFileGitHub``: an issue that is still
+    OPEN with the escalation label matching its state entry produces no
+    drift at all -- reconcile must never strip a live escalation.
+    """
+    config = OrchestratorConfig()
+    issues_dir = tmp_path / "docs" / "issues"
+    _write_local_issue(
+        issues_dir,
+        132,
+        "open-escalated",
+        "open escalated",
+        "open",
+        f"[{config.labels.human_needed}]",
+        "waiting on human.",
+    )
+    gh = LocalFileGitHub(
+        repo_root=tmp_path,
+        issues_dir=issues_dir,
+        state_dir=".var/charlie-work",
+    )
+    state = empty_state()
+    state["issues"]["132"] = {
+        "number": 132,
+        "status": "escalated",
+        # Stamped now so terminal_state_stale's >=2-day alert does not add an
+        # unrelated drift item -- this test pins "no drift", not "no repair".
+        "terminal_since": datetime.now(UTC).isoformat(),
+    }
+
+    assert detect_drift(gh, state, config) == []
+
+
+def test_pr_surface_detectors_answer_empty_on_local_backend(tmp_path: Path) -> None:
+    """Issue #1969: the three PR-surface detectors ``_reconcile_locked``
+    composes must return ``[]`` on a backend that cannot host pull requests
+    rather than letting ``_fetch_prs``'s ``gh.run`` raise ``GitHubError``.
+
+    ``mergequeue_label`` is configured so the mergequeue detectors actually
+    reach the fetch -- an unset label would short-circuit them earlier and
+    mask a missing capability guard.
+    """
+    issues_dir = tmp_path / "docs" / "issues"
+    issues_dir.mkdir(parents=True)
+    gh = LocalFileGitHub(
+        repo_root=tmp_path,
+        issues_dir=issues_dir,
+        state_dir=".var/charlie-work",
+    )
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(mergequeue_label="mergequeue"),
+    )
+
+    assert detect_aviator_stale_blocked(gh, config, repo_root=tmp_path) == []
+    assert detect_mergequeue_not_approved(gh, config, repo_root=tmp_path) == []
+    assert detect_mergequeue_wedged(gh, config, empty_state(), repo_root=tmp_path) == []
