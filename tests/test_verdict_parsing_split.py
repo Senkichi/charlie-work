@@ -343,14 +343,16 @@ def test_all_verdict_parsing_names_are_reexported_by_identity() -> None:
     ``_log_reports_exec_rejection`` (1 function: 13 -> 14), for 29 -> 32.
     Issue #2029's fix adds ``_session_mtime_cutoff`` (1 function: 14 -> 15),
     for 32 -> 33.
+    Architecture-deepening candidate 3 ("markdown structure") adds
+    ``_strip_fenced_blocks`` (1 function: 15 -> 16), for 33 -> 34 overall.
     """
     import charlie_work.verdict_parsing as verdict_parsing
     import charlie_work.workflow as workflow
 
     names = _module_level_defined_names(_VERDICT_PARSING_PATH)
     assert names, "AST derivation found zero module-level names -- derivation is broken"
-    assert len(names) == 33, (
-        f"expected 33 moved units (15 functions + ReviewSessionOutcome + 17 constants), "
+    assert len(names) == 34, (
+        f"expected 34 moved units (16 functions + ReviewSessionOutcome + 17 constants), "
         f"found {len(names)}: {sorted(names)}"
     )
 

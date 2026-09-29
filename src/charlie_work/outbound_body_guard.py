@@ -44,7 +44,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
-from . import layout
+from . import layout, markdown_fence
 
 logger = logging.getLogger(__name__)
 
@@ -62,10 +62,6 @@ REFUSAL_EVENT_KIND = "outbound_body_secret_refused"
 _EXAMPLE_FENCE_INFO = "example-secret"
 
 _RULES_PATH = Path(__file__).parent / "_vendor" / "gitleaks" / "secrets.toml"
-
-# CommonMark fenced-code-block opening: up to 3 spaces of indent, then at
-# least three backticks or tildes, then an optional info string.
-_FENCE_OPEN_RE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})[ \t]*(.*)$")
 
 
 class OutboundBodyGuardError(RuntimeError):
@@ -116,37 +112,25 @@ def _mask_example_secret_fences(text: str) -> str:
     numbers still refer to the submitted document. Unclosed blocks mask to
     end-of-file (CommonMark semantics).
 
-    ``in_fence`` tracks *any* open fence, not just exempt ones: inside an
-    ordinary block an `````example-secret`` line is literal content (a closing
-    fence cannot carry an info string), so it must not start masking -- that
-    would let a real credential hide inside a nested-looking fence.
+    Fence detection (including the backtick-in-info-string exclusion this
+    module's ``_FENCE_OPEN_RE`` used to enforce by hand) is
+    ``markdown_fence.scan`` -- architecture-deepening candidate 3, "markdown
+    structure"; this module's own fence/closer model was in fact the one
+    ported INTO that shared scan side (see its module docstring), since it
+    was the only consumer already satisfying every CommonMark rule the
+    recon checked, so this wiring is behavior-preserving. Only the masking
+    concern -- blank every line of a fence whose info string is exactly
+    ``example-secret``, opener and closer lines included -- stays here; it
+    is not itself CommonMark structure.
     """
     lines = text.split("\n")
-    in_fence = False
-    exempt = False
-    close_re: re.Pattern[str] | None = None
-    for i, line in enumerate(lines):
-        stripped = line.rstrip("\r")
-        if not in_fence:
-            m = _FENCE_OPEN_RE.match(stripped)
-            if m is None:
-                continue
-            fence, info = m.group(1), m.group(2).strip()
-            # CommonMark: a backtick fence's info string may not contain `.
-            if fence[0] == "`" and "`" in info:
-                continue
-            in_fence = True
-            exempt = info == _EXAMPLE_FENCE_INFO
-            close_re = re.compile(rf"^[ \t]{{0,3}}{re.escape(fence[0])}{{{len(fence)},}}[ \t]*$")
-            if exempt:
-                lines[i] = ""
-        else:
-            if exempt:
-                lines[i] = ""
-            if close_re is not None and close_re.match(stripped):
-                in_fence = False
-                exempt = False
-                close_re = None
+    structure = markdown_fence.scan(text)
+    for fence in structure.fences:
+        if fence.info != _EXAMPLE_FENCE_INFO:
+            continue
+        end = fence.end if fence.closed else len(lines)
+        for i in range(fence.start, end):
+            lines[i] = ""
     return "\n".join(lines)
 
 

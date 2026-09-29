@@ -27,6 +27,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import markdown_fence
 from .env_sanitize import sanitize_env
 from .subprocess_runner import no_console_window_kwargs
 
@@ -90,24 +91,19 @@ _SEVERITY_RE = re.compile(
     re.MULTILINE,
 )
 
-# Fenced ```json ... ``` (or bare ``` ... ``` or ```<any-language-tag> ... ```)
-# block, mirroring ``workflow._VERDICT_FENCE_RE``. Not imported from
-# ``workflow`` because ``workflow`` imports this module, not the reverse.
-#
-# The language-tag group MUST accept any tag, not just ``json``: a prior
-# ``(?:json)?`` version only recognized an opening fence tagged bare or
-# ``json``, so a report with e.g. ``` ```python ``` citation blocks before its
-# final ```json verdict block desynchronized entirely -- the regex failed to
-# match the ```python fence's own OPENING backtick (its "python" tag isn't
-# "json" and isn't followed by whitespace-then-newline), so ``finditer``
-# skipped past it and instead matched the ```python block's *closing* bare
-# ``` as a spurious new opening, pairing it with the *next* fence's opening
-# as its "closing" -- silently merging two unrelated fenced blocks into one
-# corrupted match and permanently misaligning every fence pair after it in
-# the document (confirmed byte-for-byte against PR #802's real report, whose
-# genuinely well-formed trailing ```json verdict was never found because of
-# this).
-_VERDICT_FENCE_RE = re.compile(r"```(?:[a-zA-Z0-9_+-]*)\s*\n(.*?)```", re.DOTALL)
+# Fence detection for ``_find_json_verdict`` is ``markdown_fence.scan``
+# (architecture-deepening candidate 3, "markdown structure"), not a
+# hand-rolled regex any more -- this used to be a byte-identical duplicate
+# of ``verdict_parsing._VERDICT_FENCE_RE`` (deliberately, since ``workflow``
+# imports this module, not the reverse, so it could not be shared as code);
+# now both wire onto the same shared scan side instead, which is the actual
+# fix for the duplication this comment used to document. CommonMark's
+# line-anchored fence rule (a ``` run only delimits a block when it is the
+# first thing on its own line) is what makes the desync in the old comment's
+# PR #802 story structurally impossible rather than merely patched for one
+# more tag shape: a ```python citation block's own embedded ``` characters,
+# wherever they appear mid-line, can never be misread as that fence's own
+# closer or a fresh opener.
 
 
 def _looks_transient(*texts: str) -> bool:
@@ -419,19 +415,22 @@ class CrossFamilyVerdict:
 def _find_json_verdict(body: str) -> CrossFamilyVerdict | None:
     """Return the last shape-valid JSON verdict block in ``body``, or None.
 
-    Scans fenced code blocks from the last one backwards — mirroring
-    ``workflow._extract_verdict_from_text`` — so a reviewer's actual final
-    answer wins over an earlier echo (e.g. of the example block in its own
-    prompt). A block is shape-valid when ``decision`` is ``"approved"`` or
-    ``"request_changes"`` (cross-family review never gates a merge on its
-    own, so unlike the primary reviewer it has no ``"blocked"`` decision)
-    and ``summary`` is a non-empty, non-placeholder string.
-    ``required_changes``, if present, must be a list of strings; a
-    malformed one rejects that block (an earlier fence, if any, is tried
-    next) rather than silently discarding the bad data.
+    Scans fenced code blocks (``markdown_fence.scan``) from the last one
+    backwards — mirroring ``verdict_parsing._extract_verdict_from_text`` —
+    so a reviewer's actual final answer wins over an earlier echo (e.g. of
+    the example block in its own prompt). A block is shape-valid when
+    ``decision`` is ``"approved"`` or ``"request_changes"`` (cross-family
+    review never gates a merge on its own, so unlike the primary reviewer it
+    has no ``"blocked"`` decision) and ``summary`` is a non-empty,
+    non-placeholder string. ``required_changes``, if present, must be a list
+    of strings; a malformed one rejects that block (an earlier fence, if
+    any, is tried next) rather than silently discarding the bad data.
     """
-    for match in reversed(list(_VERDICT_FENCE_RE.finditer(body))):
-        candidate = match.group(1).strip()
+    structure = markdown_fence.scan(body)
+    lines = body.splitlines()
+    for fence in reversed(structure.fences):
+        content_end = fence.end - 1 if fence.closed else fence.end
+        candidate = "\n".join(lines[fence.start + 1 : content_end]).strip()
         if not candidate:
             continue
         try:

@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import re
 
+from . import markdown_fence
+
 _CLAUSE_BOUNDARY_CHARS = ".!?\n"
 
 # Markdown backtick code span: an opening run of backticks, content, and a
@@ -271,5 +273,12 @@ def _clause_bounds(text: str, match_start: int, match_end: int) -> tuple[int, in
 
 
 def _is_blockquote_line(line: str) -> bool:
-    """True if the line's first non-space character is ``>`` (a Markdown blockquote)."""
-    return line.lstrip(" \t").startswith(">")
+    """True if ``line`` opens with a CommonMark blockquote marker.
+
+    Delegates to ``markdown_fence.is_blockquote_marker`` (architecture-
+    deepening candidate 3, "markdown structure"): 0-3 leading spaces/tabs,
+    then ``>`` -- CommonMark bounds a blockquote marker's indent, so a 4+
+    space-indented ``>`` is an indented code block's literal content, not a
+    blockquote marker.
+    """
+    return markdown_fence.is_blockquote_marker(line)

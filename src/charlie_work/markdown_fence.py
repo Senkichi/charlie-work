@@ -61,6 +61,7 @@ __all__ = [
     "Heading",
     "MarkdownStructure",
     "scan",
+    "is_blockquote_marker",
 ]
 
 # CommonMark's minimum fence. A shorter run is inline code, not a block.
@@ -243,6 +244,19 @@ class MarkdownStructure:
         if line in self.heading_lines:
             return LineKind.HEADING
         return LineKind.PROSE
+
+
+def is_blockquote_marker(line: str) -> bool:
+    """True if ``line`` opens with a CommonMark blockquote marker (0-3
+    leading spaces/tabs, then ``>``).
+
+    A single-line primitive for consumers (e.g. ``github_prose_dependencies.
+    _is_blockquote_line``) that only need the boolean for one line at a
+    time -- not a multi-line document -- rather than paying for a full
+    :func:`scan`. Shares ``_BLOCKQUOTE_RE`` with :func:`scan` so the two can
+    never drift on what counts as a blockquote marker.
+    """
+    return _BLOCKQUOTE_RE.match(line) is not None
 
 
 def _find_fence_close(lines: list[str], start: int, char: str, length: int) -> int | None:

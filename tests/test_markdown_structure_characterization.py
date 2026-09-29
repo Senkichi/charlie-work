@@ -1,18 +1,27 @@
 """Characterization tests for candidate 3 ("markdown structure"), architecture-
 deepening plan `docs/superpowers/plans/2026-09-29-architecture-deepening.md`.
 
-Every hand-rolled fence/blockquote/heading scanner in the repo deviates from
+Every hand-rolled fence/blockquote/heading scanner in the repo deviated from
 CommonMark somewhere (full inventory: `md-recon.md`, wave A scratchpad). This
-module pins each deviation's CURRENT (buggy) output, one test per (consumer,
-deviation), so the unification pass that follows (scan side of
-`markdown_fence.py`) has a regression net: every one of these tests is
-expected to start FAILING the moment a consumer is migrated onto
-CommonMark-correct scanning, at which point the flip is a deliberate,
-named behavior change -- not a silent one.
+module originally pinned each deviation's buggy output; now that every listed
+consumer (`github_body_scan.py`, `cross_repo_gate.py`, `verdict_parsing.py`,
+`rescue_review.py`, `attachment_contracts/hook_entry.py`,
+`scripts/heartbeat_check.py`, `github_prose_dependencies.py`) is wired onto
+`markdown_fence.scan`, these tests instead pin the CommonMark-correct output,
+so a future regression back to ad hoc scanning fails loudly here.
 
-Each test's docstring states the flip as "FLIP: current <x>; CommonMark gives
-<y>." `outbound_body_guard.py` is the one surveyed consumer with **zero**
-deviations (it already matches every CommonMark rule in the recon's matrix),
+Each flipped test's docstring states "FLIP: was <x>, now <y>." Two tests are
+deliberately NOT flipped, and say why inline:
+
+- `test_flip_cross_repo_gate_backtick_info_string_swallows_heading`: wiring
+  changed *how* the swallowed region is computed but not *whether* it is
+  swallowed for this input shape -- see its docstring.
+- `test_flip_rescue_review_verdict_heading_allows_no_space`: a deliberate
+  cross-family-model tolerance, out of this wiring pass's scope.
+
+`outbound_body_guard.py` is the one surveyed consumer with **zero**
+deviations (it already matched every CommonMark rule in the recon's matrix
+before this pass -- it was the module `markdown_fence.py` was ported from),
 so it has no test here by design -- not an oversight.
 
 Scope note: these are BLOCK-level fence/heading/blockquote deviations only,
@@ -37,6 +46,7 @@ from charlie_work.cross_repo_gate import _nearest_preceding_heading
 from charlie_work.github_body_scan import _fenced_block_ranges
 from charlie_work.github_prose_dependencies import _is_blockquote_line
 from charlie_work.rescue_review import _VERDICT_RE, _find_json_verdict
+from charlie_work.rescue_review import CrossFamilyVerdict
 from charlie_work.verdict_parsing import _extract_verdict_from_text
 
 
@@ -49,54 +59,59 @@ def hb():
 
 
 def test_flip_github_body_scan_unbounded_fence_indent() -> None:
-    """FLIP: current `_FENCE_OPEN_RE` tolerates any amount of leading
-    whitespace and treats a 4-space-indented ``` line as a fence opener,
-    capturing an over-indented block; CommonMark bounds fence-open indent to
-    0-3 spaces, so a 4+-space-indented ``` never opens a fence at all (it's
-    either an indented code block or, lacking a preceding blank line, a lazy
-    paragraph continuation) -- `_fenced_block_ranges` should return no range
-    here.
+    """FLIP: was a captured range covering the 4-space-indented ``` lines
+    (the old `_FENCE_OPEN_RE` tolerated any amount of leading whitespace and
+    treated a 4-space-indented ``` line as a fence opener); now, wired onto
+    `markdown_fence.scan`, `_fenced_block_ranges` returns no range at all.
+    CommonMark bounds fence-open indent to 0-3 spaces, so a 4+-space-indented
+    ``` never opens a fence (it's an indented code block, or, lacking a
+    preceding blank line, a lazy paragraph continuation).
     """
     text = "prose before\n    ```\n    #999 inside over-indented fence\n    ```\nprose after\n"
-    opener_start = text.index("    ```\n")
-    closer_line = "    ```\n"
-    content_end = text.index(closer_line, opener_start + len("    ```\n"))
 
-    ranges = _fenced_block_ranges(text)
-
-    assert ranges == [(opener_start, content_end)]
-    assert text[opener_start:content_end] == ("    ```\n    #999 inside over-indented fence\n")
+    assert _fenced_block_ranges(text) == []
 
 
 def test_flip_github_body_scan_backtick_in_info_string_opens_fence() -> None:
-    """FLIP: current `_FENCE_OPEN_RE` never inspects what follows the
-    backtick run, so a backtick-fence opener whose info string itself
-    contains a backtick (`` ```code`sample ``) is (incorrectly) treated as
-    opening a fence; CommonMark requires a backtick fence's info string to
-    contain no backtick, so this line should not open a fence at all and the
-    two lines that follow should be ordinary prose, not fenced content.
+    """FLIP: was a captured range covering the ``` lines (the old
+    `_FENCE_OPEN_RE` never inspected what follows the backtick run, so
+    `` ```code`sample `` was treated as opening a fence); now, wired onto
+    `markdown_fence.scan`, `_fenced_block_ranges` returns no range at all.
+    CommonMark requires a backtick fence's info string to contain no
+    backtick, so this line never opens a fence and the lines that follow are
+    ordinary prose, not fenced content.
     """
     text = "```code`sample\nshould be prose here, not code\n```\nafter\n"
-    opener_start = 0
-    content_end = text.index("```\nafter\n")
 
-    ranges = _fenced_block_ranges(text)
-
-    assert ranges == [(opener_start, content_end)]
-    assert text[opener_start:content_end] == ("```code`sample\nshould be prose here, not code\n")
+    assert _fenced_block_ranges(text) == []
 
 
 # --- cross_repo_gate.py -------------------------------------------------------
 
 
 def test_flip_cross_repo_gate_backtick_info_string_swallows_heading() -> None:
-    """FLIP: current `_nearest_preceding_heading` uses `_FENCE_DELIM_RE`,
-    which (like `github_body_scan`'s opener regex) never checks the info
-    string for an embedded backtick, so a `` ```code`sample `` line wrongly
-    opens a fence and swallows every line after it -- including a real ATX
-    heading -- as fence content up to end of text; CommonMark would not open
-    a fence there at all, so the swallowed `# References` heading should be
-    the nearest preceding heading instead of the one before the fake fence.
+    """NOT FLIPPED (verified, not assumed): `_nearest_preceding_heading`
+    still returns `"Real Heading"` after wiring onto `markdown_fence.scan`,
+    identical to before. This looks like it should flip -- the backtick in
+    `` ```code`sample ``'s info string means CommonMark never opens a fence
+    there -- but `markdown_fence.scan` deliberately still *skips* the lines
+    between a rejected opener and its nearest same-char, length-matching
+    closer (or end of text, if none exists); it just doesn't record a
+    `FenceSpan` for the skipped region (see `markdown_fence._find_fence_close`
+    docstring). `_nearest_preceding_heading` only reads `structure.headings`,
+    which is never populated for a skipped region regardless of whether the
+    opener that triggered the skip was valid -- so whether the region counts
+    as a "real" fence is invisible to this function. The old hand-rolled
+    `_FENCE_DELIM_RE` swallowed the same region for the same reason (any
+    backtick run of length >= 3 opened a fence, no info-string check, then
+    closed on the next same-length run or ran to EOF). Confirmed by
+    construction: giving the fake fence a real closer before `# References`
+    (`"## Real Heading\n```code`sample\n```\n# References\nmore text\n"`)
+    makes *both* the old and the wired implementation return `"References"`
+    -- the info-string check changes nothing observable through this
+    function either way. Left un-migrated is `verdict_parsing.py:44` /
+    `rescue_review.py:110`'s deliberate-tolerance case; this one is
+    different -- it genuinely has no observable flip, not "out of scope."
     """
     text = "## Real Heading\n```code`sample\n# References\nmore text\n"
 
@@ -107,87 +122,114 @@ def test_flip_cross_repo_gate_backtick_info_string_swallows_heading() -> None:
 
 
 def test_flip_verdict_parsing_desync_embedded_backticks_drops_verdict() -> None:
-    """FLIP: current `_VERDICT_FENCE_RE` is a non-line-anchored, non-greedy
-    regex that pairs the nearest ``` runs regardless of what line they sit
-    on, so a verdict whose `summary` field contains a triple-backtick
-    citation desyncs the pairing and `_extract_verdict_from_text` returns
-    `None` (the whole verdict is silently lost); CommonMark fences are
-    line-anchored (a ``` run has to be the first thing on its line to be a
-    delimiter at all), so a CommonMark-correct scanner would see one clean
-    fence spanning the whole JSON line and extract the verdict successfully.
+    """FLIP: was `None` (the old `_VERDICT_FENCE_RE` is a non-line-anchored,
+    non-greedy regex that pairs the nearest ``` runs regardless of what line
+    they sit on, so a verdict whose `summary` field contains a
+    triple-backtick citation desynced the pairing and the whole verdict was
+    silently lost); now, wired onto `markdown_fence.scan`,
+    `_extract_verdict_from_text` returns the recovered verdict dict.
+    CommonMark fences are line-anchored (a ``` run has to be the first thing
+    on its line to be a delimiter at all), so the embedded ```py citation --
+    which sits mid-line inside the JSON string, not at line-start -- is never
+    treated as a delimiter, and the real fence is read as one clean span.
     """
     payload = {"decision": "approved", "summary": "see ```py\nx=1\n``` above"}
     text = "```json\n" + json.dumps(payload) + "\n```\n"
 
-    assert _extract_verdict_from_text(text) is None
+    assert _extract_verdict_from_text(text) == {
+        "decision": "approved",
+        "summary": "see ```py\nx=1\n``` above",
+        "required_changes": [],
+    }
 
 
 def test_flip_verdict_parsing_tilde_fence_unsupported() -> None:
-    """FLIP: current `_VERDICT_FENCE_RE` only matches backtick runs, so a
-    verdict wrapped in a ``~~~`` fence is invisible to
-    `_extract_verdict_from_text` and it returns `None`; CommonMark treats
-    tilde fences as fully equivalent to backtick fences, so a
-    CommonMark-correct scanner would extract the same verdict either way.
+    """FLIP: was `None` (the old `_VERDICT_FENCE_RE` only matched backtick
+    runs, so a verdict wrapped in a ``~~~`` fence was invisible to
+    `_extract_verdict_from_text`); now, wired onto `markdown_fence.scan`,
+    it extracts the verdict. CommonMark treats tilde fences as fully
+    equivalent to backtick fences.
     """
     payload = {"decision": "approved", "summary": "ok"}
     text = "~~~json\n" + json.dumps(payload) + "\n~~~\n"
 
-    assert _extract_verdict_from_text(text) is None
+    assert _extract_verdict_from_text(text) == {
+        "decision": "approved",
+        "summary": "ok",
+        "required_changes": [],
+    }
 
 
 def test_flip_verdict_parsing_unclosed_fence_drops_verdict() -> None:
-    """FLIP: current `_VERDICT_FENCE_RE` requires a literal closing ``` to
-    match at all, so a verdict fence that is never closed (session killed
-    mid-output) has no match whatsoever and `_extract_verdict_from_text`
-    returns `None`; CommonMark treats an unclosed fence as running to end of
-    document, so a CommonMark-correct scanner would still recover the JSON
-    verdict from the open fence's content.
+    """FLIP: was `None` (the old `_VERDICT_FENCE_RE` required a literal
+    closing ``` to match at all, so a verdict fence never closed -- session
+    killed mid-output -- had no match whatsoever); now, wired onto
+    `markdown_fence.scan`, `_extract_verdict_from_text` recovers the verdict
+    from the open fence's content. CommonMark treats an unclosed fence as
+    running to end of document.
     """
     payload = {"decision": "approved", "summary": "ok"}
     text = "```json\n" + json.dumps(payload) + "\n"
 
-    assert _extract_verdict_from_text(text) is None
+    assert _extract_verdict_from_text(text) == {
+        "decision": "approved",
+        "summary": "ok",
+        "required_changes": [],
+    }
 
 
 # --- rescue_review.py ---------------------------------------------------------
 
 
 def test_flip_rescue_review_desync_embedded_backticks_drops_verdict() -> None:
-    """FLIP: current `_VERDICT_FENCE_RE` (byte-identical to
-    `verdict_parsing`'s, deliberately duplicated rather than imported) has
-    the same non-line-anchored nearest-pair defect, so `_find_json_verdict`
-    returns `None` when the `summary` field contains an embedded
-    triple-backtick citation; CommonMark's line-anchored fence rule would
-    let a correct scanner see one clean fence and extract the verdict.
+    """FLIP: was `None` (the old `_VERDICT_FENCE_RE`, byte-identical to
+    `verdict_parsing`'s pre-wiring regex, had the same non-line-anchored
+    nearest-pair defect, so `_find_json_verdict` lost a verdict whose
+    `summary` field contained an embedded triple-backtick citation); now,
+    wired onto `markdown_fence.scan`, it returns the recovered
+    `CrossFamilyVerdict`. CommonMark's line-anchored fence rule reads the
+    real fence as one clean span, same as `verdict_parsing.py`'s flip above.
     """
     payload = {"decision": "approved", "summary": "see ```py\nx=1\n``` above"}
     body = "```json\n" + json.dumps(payload) + "\n```\n"
 
-    assert _find_json_verdict(body) is None
+    assert _find_json_verdict(body) == CrossFamilyVerdict(
+        decision="approved",
+        summary="see ```py\nx=1\n``` above",
+        required_changes=(),
+    )
 
 
 def test_flip_rescue_review_tilde_fence_unsupported() -> None:
-    """FLIP: current `_VERDICT_FENCE_RE` only matches backtick runs, so a
-    verdict wrapped in a ``~~~`` fence is invisible to `_find_json_verdict`
-    and it returns `None`; CommonMark treats tilde fences as fully
-    equivalent to backtick fences.
+    """FLIP: was `None` (the old `_VERDICT_FENCE_RE` only matched backtick
+    runs, so a verdict wrapped in a ``~~~`` fence was invisible to
+    `_find_json_verdict`); now, wired onto `markdown_fence.scan`, it returns
+    the recovered `CrossFamilyVerdict`. CommonMark treats tilde fences as
+    fully equivalent to backtick fences.
     """
     payload = {"decision": "approved", "summary": "ok"}
     body = "~~~json\n" + json.dumps(payload) + "\n~~~\n"
 
-    assert _find_json_verdict(body) is None
+    assert _find_json_verdict(body) == CrossFamilyVerdict(
+        decision="approved", summary="ok", required_changes=()
+    )
 
 
 def test_flip_rescue_review_verdict_heading_allows_no_space() -> None:
-    """FLIP: current `_VERDICT_RE` accepts `#+\\s*verdict\\b` -- zero
-    whitespace required between the `#` run and the text -- so `###verdict`
-    (no space) matches as a verdict announcement; CommonMark requires at
-    least one space/tab after an ATX heading's `#` run for the line to be a
-    heading at all, so `###verdict` is not a heading under CommonMark (it's
-    an ordinary paragraph starting with literal `#` characters). This
-    looseness is a deliberate cross-family-model tolerance per the module's
-    own comment, not an accidental bug, but it is still a CommonMark
-    deviation worth pinning.
+    """NOT FLIPPED, deliberately, and out of this wiring pass's scope:
+    `_VERDICT_RE` still accepts `#+\\s*verdict\\b` -- zero whitespace
+    required between the `#` run and the text -- so `###verdict` (no space)
+    still matches as a verdict announcement. CommonMark requires at least
+    one space/tab after an ATX heading's `#` run for the line to be a
+    heading at all, so `###verdict` is not a CommonMark heading -- but
+    `_VERDICT_RE`/`_SEVERITY_RE` are deliberate cross-family-model-tolerance
+    detectors (per the module's own comment; some reviewer models, e.g.
+    kimi-k3-style output, emit `###verdict` with no space), not accidental
+    CommonMark bugs. The architecture-deepening plan's consumer citation for
+    this file (`rescue_review.py:110`) points at the fence regex, which *is*
+    wired above -- not at these heading regexes, which stay untouched.
+    Wiring them to strict CommonMark heading rules would regress real
+    verdict detection for those models, not fix a bug.
     """
     text = "###verdict\nApprove.\n"
 
@@ -198,16 +240,30 @@ def test_flip_rescue_review_verdict_heading_allows_no_space() -> None:
 
 
 def test_flip_hook_entry_closer_length_mismatch_drops_second_record() -> None:
-    """FLIP: current `parse_advisories_comment` treats ANY line starting
-    with 3+ backticks as a closer, with no check that its length matches the
-    opener's -- the most naive scanner in the recon. A payload opened with 4
-    backticks (````json) that happens to contain a bare ``` line closes
+    """FLIP: was `(first_record,)` (the old `parse_advisories_comment`
+    treated ANY line starting with 3+ backticks as a closer, with no check
+    that its length matched the opener's, so a payload opened with 4
+    backticks (````json) that happened to contain a bare ``` line closed
     early there, silently truncating the captured fence body to whatever
-    parses as valid JSON up to that point and dropping everything after;
-    CommonMark requires a closer to be at least as long as its opener (a
-    3-backtick line can never close a 4-backtick-opened fence), so a
-    CommonMark-correct scanner would keep reading past the decoy line to the
-    real (4-backtick) closer.
+    parsed as valid JSON up to that point and dropping the second record
+    with no signal); now, wired onto `markdown_fence.scan`,
+    `parse_advisories_comment` returns `()`. CommonMark requires a closer to
+    be at least as long as its opener (a 3-backtick line can never close a
+    4-backtick-opened fence), so the decoy ``` line no longer ends the
+    fence early -- the scanner correctly reads through to the real
+    (4-backtick) closer. But the resulting fence body is then the first
+    record's JSON, a literal ``` line, and the second record's JSON all
+    concatenated -- not one valid JSON document -- so `json.loads` fails and
+    `parse_advisories_comment` reports the "marker present, fence
+    missing/malformed" sentinel rather than fabricating a partial result.
+    That's the correct behavior change: silently returning one of two
+    records with no error (the old behavior) is worse than a loud,
+    unambiguous "malformed" signal, because a caller trusting `len(result)`
+    as a count of advisories would silently under-count in the old
+    behavior. The real bug this exposes -- a payload that legitimately needs
+    a decoy-proof opener/closer length pair should not use content that
+    itself contains a same-or-shorter backtick run -- belongs to whatever
+    constructs the advisories comment, not to the scanner.
     """
     first_record = [
         {
@@ -240,25 +296,15 @@ def test_flip_hook_entry_closer_length_mismatch_drops_second_record() -> None:
 
     result = parse_advisories_comment(body)
 
-    assert result == (
-        AdvisoryRecord(
-            severity="info",
-            file="x.py",
-            identity="id1",
-            message="first record",
-            redirect=None,
-            timestamp="2026-01-01T00:00:00Z",
-        ),
-    )
+    assert result == ()
 
 
 def test_flip_hook_entry_tilde_fence_unsupported() -> None:
-    """FLIP: current `parse_advisories_comment` only recognizes a backtick
-    (```` ``` ````) opener, so a payload wrapped in a ``~~~`` fence is never
-    found and it returns `()` (the "marker present, fence missing/malformed"
-    sentinel), discarding a well-formed record; CommonMark treats tilde
-    fences as fully equivalent to backtick fences, so a CommonMark-correct
-    scanner would find and parse the same payload.
+    """FLIP: was `()` (the old `parse_advisories_comment` only recognized a
+    backtick (```` ``` ````) opener, so a payload wrapped in a ``~~~`` fence
+    was never found, discarding a well-formed record); now, wired onto
+    `markdown_fence.scan`, it finds and parses the record. CommonMark treats
+    tilde fences as fully equivalent to backtick fences.
     """
     records = [
         {
@@ -272,51 +318,66 @@ def test_flip_hook_entry_tilde_fence_unsupported() -> None:
     ]
     body = ADVISORY_COMMENT_MARKER + "\n~~~json\n" + json.dumps(records) + "\n~~~\n"
 
-    assert parse_advisories_comment(body) == ()
+    assert parse_advisories_comment(body) == (
+        AdvisoryRecord(
+            severity="info",
+            file="x.py",
+            identity="id1",
+            message="m",
+            redirect=None,
+            timestamp="2026-01-01T00:00:00Z",
+        ),
+    )
 
 
 # --- scripts/heartbeat_check.py -----------------------------------------------
 
 
 def test_flip_heartbeat_check_desync_embedded_backticks_leaks_mention(hb) -> None:
-    """FLIP: current `_FENCED_CODE_BLOCK_RE` (```` ```.*?``` ```` DOTALL,
-    non-line-anchored) pairs the nearest two ``` runs, so a real fenced
-    block whose own content contains a literal ``` substring desyncs the
-    pairing -- the stripped text no longer removes the middle of the block,
-    leaking `#111` (which is genuinely inside the fence) into
-    `_mentioned_issue_numbers`'s result alongside the legitimately-outside
-    `#222`; CommonMark's line-anchored fence rule would strip the whole
-    block as one clean unit, leaving only `#222`.
+    """FLIP: was `{111, 222}` (the old `_FENCED_CODE_BLOCK_RE`
+    (```` ```.*?``` ```` DOTALL, non-line-anchored) paired the nearest two
+    ``` runs, so a real fenced block whose own content contained a literal
+    ``` substring desynced the pairing -- the stripped text no longer
+    removed the middle of the block, leaking `#111` (genuinely inside the
+    fence) into `_mentioned_issue_numbers`'s result alongside the
+    legitimately-outside `#222`); now, wired onto the module's line-indexed
+    scan (`_scan_markdown_structure`/`_strip_fenced_code_blocks`), the whole
+    block strips as one clean unit and only `#222` remains. CommonMark's
+    line-anchored fence rule is what makes the mid-line ``` inside the JSON
+    string invisible as a delimiter, same as the `verdict_parsing.py`/
+    `rescue_review.py` desync flips above.
     """
     text = '```json\n{"note": "```see #111 inside```", "id": 2}\n```\nAlso mentions #222 here.\n'
 
-    assert hb._mentioned_issue_numbers(text) == {111, 222}
+    assert hb._mentioned_issue_numbers(text) == {222}
 
 
 def test_flip_heartbeat_check_tilde_fence_unsupported_leaks_mention(hb) -> None:
-    """FLIP: current `_FENCED_CODE_BLOCK_RE` only matches backtick runs, so
-    a ``~~~``-fenced block is never stripped and `#123` (genuinely inside
-    the tilde-fenced block) leaks into `_mentioned_issue_numbers`'s result
-    alongside the legitimately-outside `#456`; CommonMark treats tilde
-    fences as fully equivalent to backtick fences, so a CommonMark-correct
-    scanner would strip the block and return only `#456`.
+    """FLIP: was `{123, 456}` (the old `_FENCED_CODE_BLOCK_RE` only matched
+    backtick runs, so a ``~~~``-fenced block was never stripped and `#123`
+    (genuinely inside the tilde-fenced block) leaked into
+    `_mentioned_issue_numbers`'s result alongside the legitimately-outside
+    `#456`); now, wired onto the module's scan, the tilde-fenced block
+    strips and only `#456` remains. CommonMark treats tilde fences as fully
+    equivalent to backtick fences.
     """
     text = "~~~\n#123 mentioned inside a tilde-fenced block\n~~~\nalso #456\n"
 
-    assert hb._mentioned_issue_numbers(text) == {123, 456}
+    assert hb._mentioned_issue_numbers(text) == {456}
 
 
 # --- github_prose_dependencies.py --------------------------------------------
 
 
 def test_flip_github_prose_dependencies_blockquote_unbounded_indent() -> None:
-    """FLIP: current `_is_blockquote_line` strips all leading spaces/tabs
-    before checking for `>`, so a `>` preceded by any amount of indentation
-    -- including 4+ spaces -- still counts as a blockquote line; CommonMark
-    bounds a blockquote marker's indent to 0-3 spaces (4+ makes it an
-    indented code block instead, where `>` is just a literal character), so
-    a 5-space-indented `>` line is not a blockquote marker under CommonMark.
+    """FLIP: was `True` (the old `_is_blockquote_line` stripped all leading
+    spaces/tabs before checking for `>`, so a `>` preceded by any amount of
+    indentation -- including 4+ spaces -- counted as a blockquote line); now,
+    wired onto `markdown_fence.is_blockquote_marker`, a 5-space-indented `>`
+    line returns `False`. CommonMark bounds a blockquote marker's indent to
+    0-3 spaces (4+ makes it an indented code block instead, where `>` is
+    just a literal character).
     """
     line = "     > deeply indented quote (5 spaces)"
 
-    assert _is_blockquote_line(line) is True
+    assert _is_blockquote_line(line) is False

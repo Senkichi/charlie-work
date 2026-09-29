@@ -20,6 +20,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Sequence
 
+from . import markdown_fence
 from .claude_code import extract_event_text, iter_stream_json_events, parse_claude_events
 from .config import OrchestratorConfig
 from .throttle_signatures import match_throttle_tail
@@ -30,17 +31,18 @@ from .throttle_signatures import match_throttle_tail
 # carries whatever diagnostic detail WAS recoverable.
 CAUSE_UNKNOWN: dict[str, Any] = {"cause": "unknown"}
 
-# Language-tag group accepts any tag (not just ``json``), mirroring the fix in
-# ``rescue_review._VERDICT_FENCE_RE``: a fence opened with an unrecognized tag
-# (e.g. ```python) previously failed to match as an opening delimiter at all,
-# causing its own closing ``` to be misread as a spurious new opening and
-# desynchronizing every fence pair after it. In practice this path is
-# protected here because each stream-json event's text is checked in
-# isolation (see ``_extract_verdict_from_stream_json``) and the reviewer's
-# final verdict fence normally lands in its own turn, separate from any
-# earlier code-citation turns -- but the defect is real and latent, so it is
-# fixed here too rather than left to fire the day a reviewer's final message
-# happens to combine both.
+# Retained ONLY for backward-compatible re-export (``workflow.py``'s
+# LOAD-BEARING re-export block re-exports every name here, including this
+# one, so an external import/monkeypatch target must keep resolving). No
+# longer used internally: architecture-deepening candidate 3 ("markdown
+# structure") rewired ``_extract_verdict_from_text`` onto
+# ``markdown_fence.scan``, which fixes exactly the class of defect this
+# comment used to describe (a fence opened with an unrecognized tag
+# desyncing the nearest-pair regex) plus more (tilde fences, unclosed
+# fences running to EOF instead of vanishing) -- see
+# ``tests/test_markdown_structure_characterization.py``'s
+# ``test_flip_verdict_parsing_*`` tests for the pinned-then-flipped
+# behavior.
 _VERDICT_FENCE_RE = re.compile(r"```(?:[a-zA-Z0-9_+-]*)\s*\n(.*?)```", re.DOTALL)
 
 # Absolute path ending in .md, as reviewers reference their summary files in
@@ -121,11 +123,20 @@ def _validate_review_verdict(data: Any) -> dict[str, Any] | None:
 def _extract_verdict_from_text(text: str) -> dict[str, Any] | None:
     """Extract the last valid fenced JSON verdict block from plain text.
 
-    Accepts fences with or without a ``json`` language tag, scanning from the
-    last fence (the final output) backwards.
+    Accepts fences with or without a language tag, backtick or tilde,
+    scanning from the last fence (the final output) backwards. Fence
+    detection is ``markdown_fence.scan`` (architecture-deepening candidate
+    3, "markdown structure"): CommonMark-line-anchored, so a ``` run
+    embedded mid-line inside the JSON payload can no longer desync the
+    pairing the way the old ``_VERDICT_FENCE_RE`` regex could, and an
+    unclosed fence still yields its content (runs to end-of-text) instead
+    of matching nothing at all.
     """
-    for match in reversed(list(_VERDICT_FENCE_RE.finditer(text))):
-        candidate = match.group(1).strip()
+    structure = markdown_fence.scan(text)
+    lines = text.splitlines()
+    for fence in reversed(structure.fences):
+        content_end = fence.end - 1 if fence.closed else fence.end
+        candidate = "\n".join(lines[fence.start + 1 : content_end]).strip()
         if not candidate:
             continue
         try:
@@ -136,6 +147,33 @@ def _extract_verdict_from_text(text: str) -> dict[str, Any] | None:
         if verdict is not None:
             return verdict
     return None
+
+
+def _strip_fenced_blocks(text: str) -> str:
+    """Remove every fenced code block from ``text`` (opener/closer lines included).
+
+    Used by ``_extract_review_session_summary``'s plaintext-log fallback to
+    drop verdict-fence attempts before keeping the remaining prose lines.
+    Fence detection is ``markdown_fence.scan`` (architecture-deepening
+    candidate 3) -- this replaces a second, narrower regex
+    (``` ```(?:json)?\\s*\\n.*?``` ```) that had drifted stale from this
+    module's own top-of-file fix to ``_VERDICT_FENCE_RE``'s language-tag
+    handling (it kept the old ``(?:json)?``-only restriction) and shared
+    the same non-line-anchored desync defect. Not delegated to
+    ``github_body_scan._strip_fenced_blocks``: that module is the
+    issue/PR-body-scanning domain, unrelated to reviewer-log parsing, and
+    each stays downstream-free of the other per both modules' docstrings.
+    """
+    structure = markdown_fence.scan(text)
+    if not structure.fences:
+        return text
+    lines = text.splitlines(keepends=True)
+    drop = [False] * len(lines)
+    for fence in structure.fences:
+        end = fence.end if fence.closed else len(lines)
+        for index in range(fence.start, end):
+            drop[index] = True
+    return "".join(line for line, is_dropped in zip(lines, drop) if not is_dropped)
 
 
 def _extract_verdict_from_stream_json(raw_text: str) -> dict[str, Any] | None:
@@ -767,7 +805,7 @@ def _extract_review_session_summary(
             if text.strip():
                 assistant_texts.append(text.strip())
         if not assistant_texts:
-            stripped = re.sub(r"```(?:json)?\s*\n.*?```", "", log_text, flags=re.DOTALL)
+            stripped = _strip_fenced_blocks(log_text)
             for line in stripped.splitlines():
                 stripped_line = line.strip()
                 if stripped_line and not stripped_line.startswith((">", "#", "-")):

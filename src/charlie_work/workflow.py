@@ -282,6 +282,7 @@ from .verdict_parsing import (  # noqa: F401  (deliberate re-export)
     _RESULT_EVENT_CAUSE_FIELDS,
     _validate_review_verdict,
     _extract_verdict_from_text,
+    _strip_fenced_blocks,
     _extract_verdict_from_stream_json,
     _parse_review_verdict_from_log,
     _parse_review_verdict_from_events,

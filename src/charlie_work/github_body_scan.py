@@ -12,15 +12,22 @@ helpers were themselves split out to ``github_prose_dependencies`` (issue
 #1949 rework, same cap) — this module imports them back; the dependency is
 one-directional so ``parse_blockers`` stays downstream-free.
 
-Every scanner in this module shares ONE fenced-code-block model:
-``_fenced_block_ranges`` — a line-based CommonMark-ish scan where a closing
-fence must be its own line, of the same fence character and at least the same
-length as the opening fence. ``_strip_fenced_blocks`` removes those blocks
-(closing fence line included) before pattern matching; ``_inside_fenced_block``
-answers point queries against the same ranges. A regex that pairs the two
-nearest triple-backtick runs is the naive model issue #1819 removed — a
-fenced block whose own content contains a triple-backtick substring desyncs
-that pairing and leaks fenced text into the scan.
+Every scanner in this module shares ONE fenced-code-block model, sourced from
+``markdown_fence.scan`` (architecture-deepening candidate 3, "markdown
+structure" — full CommonMark-deviation inventory of the pre-unification
+per-module scanners this replaced: `md-recon.md`, wave A scratchpad):
+``_fenced_block_ranges`` converts ``markdown_fence.MarkdownStructure``'s
+line-indexed fence spans to this module's char-offset ``(start, end)``
+convention (offset ``end`` excludes the closing fence line, unlike
+``FenceSpan`` which includes it — see that function's docstring).
+``_strip_fenced_blocks`` removes those blocks (closing fence line included)
+before pattern matching; ``_inside_fenced_block`` answers point queries
+against the same ranges. A regex that pairs the two nearest triple-backtick
+runs is the naive model issue #1819 removed, and the per-module reimplementation
+of the CommonMark rules themselves (0-3 space/tab indent bound, backtick-fence
+info-string exclusion) was the defect class candidate 3 removed in turn — a
+fenced block whose own content contains a triple-backtick substring, or an
+over-indented ``` line, no longer desyncs or falsely opens a fence.
 """
 
 from __future__ import annotations
@@ -28,6 +35,8 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable
 from typing import Any
+
+from . import markdown_fence
 
 # The prose-dependency pattern tables and the shared quoted-prose judgement
 # helpers live in ``github_prose_dependencies`` (extracted during the issue
@@ -262,19 +271,14 @@ _ISSUE_REF = re.compile(r"#\d+")
 # boundary, so the span's closing backtick lands inside the next clause and
 # pairs with a later span's opener, enveloping a genuine prose mention.
 _INLINE_FENCE_SPAN_RE = re.compile(r"(`{3,})(.+?)(\1)", flags=re.DOTALL)
-# Opening fence of a fenced code block: a line beginning with a run of 3+
-# backticks or tildes (optionally followed by an info string). CommonMark
-# allows up to 3 leading spaces; we tolerate any leading whitespace.
-_FENCE_OPEN_RE = re.compile(r"^[ \t]*([`~]{3,})")
+# NOTE: unlike the block-level fence opener this module used to hand-roll,
+# there is no ``markdown_fence`` equivalent for this pattern to delegate to
+# — it is a deliberately narrower, inline-only model (3+ backticks used
+# mid-document, not on their own line) that CommonMark's block-level fence
+# grammar (what ``markdown_fence.scan`` implements) does not cover at all;
+# see the module's own scope note. Left hand-rolled on purpose.
 
 # Issue #1847 — heading-list blocker sections ("## Blocked by\n- #N").
-# ATX heading: up to three leading spaces, 1-6 '#' characters, then optional
-# whitespace-separated text. CommonMark requires whitespace or end-of-line
-# after the opening run, so "###foo" is not a heading.
-_HEADING_RE = re.compile(r"^ {0,3}#{1,6}(?:[ \t]+(.*?))?[ \t]*$")
-# Optional CommonMark closing sequence of '#'s at the end of heading text
-# ("## Blocked by ##" -> text "Blocked by").
-_HEADING_CLOSING_RUN_RE = re.compile(r"[ \t]+#+[ \t]*$")
 # Heading text that opens a blocker section: "Blocked by" or "Depends on"
 # (case-insensitive, space or hyphen between the words, optional trailing colon).
 _BLOCKER_HEADING_TEXT_RE = re.compile(
@@ -307,48 +311,48 @@ def _inside_inline_fence_span(text: str, start: int, end: int) -> bool:
     return False
 
 
+def _line_start_offsets(text: str) -> list[int]:
+    """Char offset of the start of each line, plus a trailing ``len(text)`` sentinel.
+
+    Index ``i`` is the offset of ``text.splitlines()[i]``; index
+    ``line_count`` (one past the last real line) is ``len(text)``, matching
+    ``markdown_fence.MarkdownStructure``'s half-open ``end`` convention so a
+    ``FenceSpan.end`` of ``line_count`` (an unclosed fence) converts without
+    a special case.
+    """
+    offsets = []
+    pos = 0
+    for line in text.splitlines(keepends=True):
+        offsets.append(pos)
+        pos += len(line)
+    offsets.append(pos)
+    return offsets
+
+
 def _fenced_block_ranges(text: str) -> list[tuple[int, int]]:
     """Return the ``(start, end)`` char-offset ranges of fenced code blocks.
 
-    A fenced block starts with a line beginning with a run of 3+ backticks or
-    tildes (optionally followed by an info string, e.g. ```` ```python ````)
-    and ends at the next line beginning with a closing fence of the same
-    character and at least the same length. An unclosed fence runs to the end
-    of the text. Each returned range spans from the start of the opening fence
-    line up to (excluding) the closing fence line, so any content line between
-    the fences is contained in the range.
+    Delegates the actual scanning to ``markdown_fence.scan`` (CommonMark
+    block-level fence rules: 0-3 space/tab indent bound, backtick/tilde
+    support, closer same-char and >= opener length, no backtick in a
+    backtick fence's info string, unclosed fence runs to end-of-text) and
+    converts its line-indexed ``FenceSpan``s to this module's char-offset
+    convention. Each returned range spans from the start of the opening
+    fence line up to (excluding) the closing fence line, so any content line
+    between the fences is contained in the range -- this differs from
+    ``FenceSpan.end``, which is one past the closing fence line (the closer
+    line IS part of a ``FenceSpan``), so a closed fence's end offset here is
+    the *start* of ``FenceSpan.end - 1`` rather than of ``FenceSpan.end``.
     """
+    structure = markdown_fence.scan(text)
+    if not structure.fences:
+        return []
+    offsets = _line_start_offsets(text)
     ranges: list[tuple[int, int]] = []
-    pos = 0
-    in_fence = False
-    fence_char = ""
-    fence_len = 0
-    block_start = 0
-    for line in text.splitlines(keepends=True):
-        stripped = line.lstrip(" \t")
-        if not in_fence:
-            m = _FENCE_OPEN_RE.match(stripped)
-            if m:
-                fence_char = m.group(1)[0]
-                fence_len = len(m.group(1))
-                block_start = pos
-                in_fence = True
-        else:
-            close_m = re.match(
-                rf"{re.escape(fence_char)}{{{fence_len},}}[ \t]*$",
-                stripped.rstrip("\r\n"),
-            )
-            if close_m:
-                # Range covers opening fence line through last content line;
-                # the closing fence line itself is excluded.
-                ranges.append((block_start, pos))
-                in_fence = False
-                fence_char = ""
-                fence_len = 0
-        pos += len(line)
-    if in_fence:
-        # Unclosed fence runs to end of text.
-        ranges.append((block_start, len(text)))
+    for fence in structure.fences:
+        start = offsets[fence.start]
+        end = offsets[fence.end] if not fence.closed else offsets[fence.end - 1]
+        ranges.append((start, end))
     return ranges
 
 
@@ -425,27 +429,26 @@ def _scan_blocker_sections(text: str) -> tuple[list[int], bool]:
     ``owner/repo`` reference, free prose) — the signal
     :func:`detect_prose_only_dependencies` uses to park the issue for a
     human instead of silently freeing it.
+
+    The fence/heading structure comes from ``markdown_fence.scan`` — this
+    function keeps only the blocker-section state machine (heading text
+    match, list-item/none-sentinel/foreign-pattern classification), not any
+    CommonMark scanning of its own.
     """
-    fenced = _fenced_block_ranges(text)
+    structure = markdown_fence.scan(text)
+    heading_text_by_line = {heading.line: heading.text for heading in structure.headings}
     refs: list[int] = []
     unreadable = False
     in_section = False
-    fence_idx = 0
-    pos = 0
-    for line in text.splitlines(keepends=True):
-        line_start = pos
-        pos += len(line)
-        while fence_idx < len(fenced) and fenced[fence_idx][1] <= line_start:
-            fence_idx += 1
-        if fence_idx < len(fenced) and fenced[fence_idx][0] <= line_start:
-            # Inside a fenced block. The range starts at the opening fence
-            # line, so reaching it closes any open blocker section; content
-            # lines are quoted prose and never parsed.
+    for index, line in enumerate(text.splitlines(keepends=True)):
+        if structure.is_fenced(index):
+            # Inside a fenced block (opening line through closer, inclusive).
+            # Reaching it closes any open blocker section; content lines are
+            # quoted prose and never parsed.
             in_section = False
             continue
-        heading = _HEADING_RE.match(line.rstrip("\r\n"))
-        if heading is not None:
-            heading_text = _HEADING_CLOSING_RUN_RE.sub("", heading.group(1) or "")
+        heading_text = heading_text_by_line.get(index)
+        if heading_text is not None:
             in_section = bool(_BLOCKER_HEADING_TEXT_RE.fullmatch(heading_text.strip()))
             continue
         if not in_section or _is_blockquote_line(line) or _is_thematic_break(line):

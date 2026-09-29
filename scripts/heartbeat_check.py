@@ -954,14 +954,13 @@ def check_orchestrator_config(report: Report, repo: RepoInfo) -> None:
 # `tests/markdown_conformance_cases.py` ground-truth table
 # (`tests/test_markdown_conformance.py` runs that table against both).
 #
-# This does NOT replace `_FENCED_CODE_BLOCK_RE` below, which
-# `_mentioned_issue_numbers` still uses -- wiring a consumer onto
-# CommonMark-correct scanning is a deliberate, separate, later step (the
-# plan's own rule: characterize current behaviour first, flip it in a named
-# commit after). `tests/test_markdown_structure_characterization.py`'s two
-# `test_flip_heartbeat_check_*` tests pin `_FENCED_CODE_BLOCK_RE`'s current
-# (CommonMark-deviating) behaviour for exactly that reason and must keep
-# passing until that later step flips them on purpose.
+# `_mentioned_issue_numbers` below is wired onto this scan (via
+# `_strip_fenced_code_blocks`), replacing the `_FENCED_CODE_BLOCK_RE` regex
+# it used to strip fenced blocks with before matching bare `#N` references.
+# `tests/test_markdown_structure_characterization.py`'s two
+# `test_flip_heartbeat_check_*` tests now assert the CommonMark-correct
+# (flipped) result instead of pinning the old regex's desync/tilde-blind
+# behaviour.
 # --------------------------------------------------------------------------
 
 
@@ -1051,6 +1050,29 @@ def _scan_markdown_structure(text: str) -> _MarkdownStructure:
     )
 
 
+def _strip_fenced_code_blocks(text: str) -> str:
+    """Remove every fenced code block from ``text`` (opener/closer lines
+    included), via ``_scan_markdown_structure``.
+
+    Used by ``_mentioned_issue_numbers`` so a `#N`-shaped literal inside a
+    code sample is not read as a reference. Replaces the prior
+    ``_FENCED_CODE_BLOCK_RE`` regex (```` ```.*?``` ```` DOTALL,
+    non-line-anchored, nearest-pair) -- see
+    `tests/test_markdown_structure_characterization.py`'s
+    `test_flip_heartbeat_check_*` tests for the pinned-then-flipped
+    behaviour this replaces.
+    """
+    structure = _scan_markdown_structure(text)
+    if not structure.fenced_line_spans:
+        return text
+    lines = text.splitlines(keepends=True)
+    drop = [False] * len(lines)
+    for start, end in structure.fenced_line_spans:
+        for index in range(start, min(end, len(lines))):
+            drop[index] = True
+    return "".join(line for line, is_dropped in zip(lines, drop) if not is_dropped)
+
+
 # --------------------------------------------------------------------------
 # Stale-open-issue-mention scanning primitives (issue #902)
 #
@@ -1088,7 +1110,6 @@ _ISSUE_REF_RE = re.compile(r"#(\d+)\b")
 # normal branch-prefix binding path (`linked_issue_number`), so a miss here
 # is not a gap, just redundant with machinery this check exists to backstop.
 _BRANCH_ISSUE_NUMBER_RE = re.compile(r"^[A-Za-z][\w.]*/(\d+)(?=[-_/]|$)")
-_FENCED_CODE_BLOCK_RE = re.compile(r"```.*?```", flags=re.DOTALL)
 _NEGATION_WORDS = ("not", "never", "without", "cannot")
 _NEGATION_CONTRACTION_SUFFIX = "n't"
 _NEGATION_RE = re.compile(
@@ -1135,10 +1156,14 @@ def _mentioned_issue_numbers(text: str) -> set[int]:
     """Return every bare `#N` reference in `text`, minus quoted/negated ones.
 
     Fenced code blocks are stripped first (a code sample containing the
-    literal text `#123` is not a reference), mirroring
-    `charlie_work.github`'s same defense for its own mention scanner.
+    literal text `#123` is not a reference), via
+    ``_strip_fenced_code_blocks`` -- the same CommonMark-correct fence model
+    `charlie_work.github_body_scan`'s own mention scanner now shares too
+    (both wired onto their respective `markdown_fence.scan`/
+    `_scan_markdown_structure` implementations, architecture-deepening
+    candidate 3).
     """
-    stripped = _FENCED_CODE_BLOCK_RE.sub("", text)
+    stripped = _strip_fenced_code_blocks(text)
     numbers: set[int] = set()
     for match in _ISSUE_REF_RE.finditer(stripped):
         if _has_preceding_negation(stripped, match.start()):
