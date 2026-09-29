@@ -1,0 +1,4 @@
+warning
+# Issue #1976: a deprecated config key reappeared in a config layer after
+# its removal issue was already marked Ready. The label is retained (a
+# worker may be running), but the regression needs an operator's eyes.

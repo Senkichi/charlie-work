@@ -1,4 +1,4 @@
-3800
+4000
 # Issue #1716: merging main's #1836 in-pass-deadline work into the
 # stop/drain branch puts the merged fleet_dispatch.py at 3616 lines --
 # past the 3600 mark (main: 3549; this branch's drain wiring: +67).
@@ -6,3 +6,9 @@
 # round-1 review; the remainder is supervisor-loop wiring that cannot
 # move without restructuring the loop. Raised to the next MARK_QUANTUM
 # multiple per the ratchet's hand-raise rule.
+#
+# Issue #1976: +7 lines — one re-export import name and the four-line
+# ``_run_fleet_config_retirement_sweep`` call at the top of fleet_loop
+# (implementation lives in config_retirement_sweep.py / fleet_lanes.py;
+# this file only wires the once-per-pass hook). 3800 -> 4000 per the
+# hand-raise rule.

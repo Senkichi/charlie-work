@@ -142,6 +142,17 @@ def _edges(labels: LabelConfig) -> dict[str, tuple[tuple[str, ...], tuple[str, .
         # adds queued — queued is an ACTIVE label and would exclude the issue
         # from dispatch, the exact trap this edge exists to avoid.
         "unescalated_requeued": ((), tuple(sorted(labels.workflow_labels))),
+        # Issue #1976: the config-retirement sweep marks a deprecated key's
+        # removal issue Ready once the key has been absent from every config
+        # layer for the quiet window. Removal issues are filed unlabeled, so
+        # the add is the whole state change; the remove half clears any stray
+        # workflow label so the issue arrives at dispatch as a clean candidate
+        # (same shape as "unescalated_requeued" plus the ready marker itself,
+        # which is not a workflow_labels member).
+        "config_retirement_ready": (
+            (labels.ready,),
+            _compute_remove((labels.ready,)),
+        ),
         # Issue #203: a merged PR only *mentions* the issue in free text, with
         # no hijack-safe branch/closing-keyword binding. That never authorizes
         # a close — flag it for a human decision instead, same label as any

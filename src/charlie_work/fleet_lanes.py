@@ -321,3 +321,52 @@ def _start_fleet_reap_scheduler(
     )
     thread.start()
     return thread, stop_event
+
+
+def _run_fleet_config_retirement_sweep(
+    fleet_dir_override: str | None,
+    global_config: Any,
+    dry_run: bool,
+    now: datetime.datetime | None,
+) -> list[dict[str, Any]]:
+    """Run the deprecated-config-key retirement sweep once per fleet pass
+    (issue #1976).
+
+    Checks every key in ``config_deprecations.DEPRECATED_CONFIG_KEYS``
+    against every config layer of every registered repo and marks the key's
+    ``removal_issue`` Ready once it has been absent everywhere for the
+    ``runtime.config_retirement_quiet_days`` quiet window. Removal issues
+    live on the orchestrator's own repo, so the client is built against
+    ``orchestrator_root()`` rather than a fleet member's root; a ``None`` or
+    non-config ``global_config`` falls back to dataclass defaults (direct
+    CLI call sites pass no GlobalConfig).
+
+    Returns digest attention entries; the sweep itself never raises.
+    """
+    from .config_retirement_sweep import run_config_retirement_sweep
+
+    config = (
+        global_config if isinstance(global_config, OrchestratorConfig) else OrchestratorConfig()
+    )
+    try:
+        # ``github=`` rather than a pre-built ``gh`` so the client
+        # construction (``github_client_for`` against ``orchestrator_root()``)
+        # happens inside the sweep's own never-raises boundary -- a client
+        # that cannot be built must degrade to an attention entry, not break
+        # the fleet pass at this call site.
+        return run_config_retirement_sweep(
+            fleet_dir_override=fleet_dir_override,
+            config=config,
+            github=GitHub,
+            dry_run=dry_run,
+            now=now,
+        )["attention"]
+    except Exception:  # noqa: BLE001 — the sweep is observability+scheduling; the pass must survive it
+        logger.exception("config-retirement sweep failed")
+        return [
+            {
+                "repo_key": "fleet",
+                "type": "config_retirement_error",
+                "reason": "config-retirement sweep failed; see fleet log",
+            }
+        ]
