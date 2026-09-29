@@ -22,6 +22,7 @@ from charlie_work.config import (
     DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS,
     PRE_LAUNCH_BLOCKED_ENVIRONMENT_FAILURE_KINDS,
 )
+from charlie_work import fleet_provider_throttle
 from charlie_work.github import GitHubError
 from charlie_work.labels import TransitionOutcome
 from charlie_work.state import StateLockBusy
@@ -200,6 +201,29 @@ def _dispatch_rework_impl(
                 f"rework dispatch deferred: provider throttled until {throttled_until}",
                 data,
             )
+
+    # Issue #1993: fleet-wide window + staggered resume for this worker adapter.
+    resume = fleet_provider_throttle.decide_for_app(self)
+    if resume.deferred:
+        data = {
+            "adapter": self.config.worker.harness,
+            "selected_count": 0,
+            "deferred_reason": "provider_throttled_fleet"
+            if resume.action == "defer_throttled"
+            else "provider_resume_staggered",
+            "throttled_until": resume.throttled_until.isoformat()
+            if resume.throttled_until
+            else None,
+        }
+        if gov.any_term_enabled:
+            data.update(gov.report_fields())
+        return _wf.CommandResult(
+            False,
+            f"rework dispatch deferred: fleet provider throttle ({resume.action})",
+            data,
+        )
+    if resume.action == "admit_one":
+        rework_limit = min(rework_limit, 1)
 
     # Dry-run: read-only planning — compute selection and would-be
     # SessionRequests, but skip all state writes, label transitions,
@@ -1248,6 +1272,11 @@ def _dispatch_rework_impl(
                 normal_requests,
             )
         )
+        if resume.action == "admit_one":
+            fleet_provider_throttle.note_probe_launch(
+                fleet_provider_throttle.worker_adapter_kind(self.config.worker.harness),
+                fleet_dir_override=self.fleet_dir_override,
+            )
     if rescue_requests:
         dispatch_results.extend(
             _wf.dispatch_sessions(

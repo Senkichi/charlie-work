@@ -76,6 +76,7 @@ from charlie_work.dispatch_selection import (
     _windowed_blocked_environment_at,
     _windowed_foreign_writer_reaps,
 )
+from charlie_work import fleet_provider_throttle
 from charlie_work.escalation import _escalate_issue, _escalation_edge
 from charlie_work.fleet_registry import managed_repo_names, managed_repo_roots
 from charlie_work.github import label_names
@@ -227,6 +228,33 @@ def _dispatch_impl(
                 f"dispatch deferred: provider throttled until {throttled_until}",
                 data,
             )
+
+    # Issue #1993: the provider limit is per account, so consult the fleet-wide
+    # window (and staggered-resume probe) for this repo's worker adapter.
+    resume = fleet_provider_throttle.decide_for_app(self)
+    if resume.deferred:
+        return _wf.CommandResult(
+            False,
+            f"dispatch deferred: fleet provider throttle ({resume.action})",
+            {
+                "selected_count": 0,
+                "attempted_count": 0,
+                "failed_count": 0,
+                "skipped_issue_numbers": [],
+                "label_errors": [],
+                "sessions": [],
+                "dispatch_results": [],
+                "merged_prs": merged_prs_for_tripwire,
+                "deferred_reason": "provider_throttled_fleet"
+                if resume.action == "defer_throttled"
+                else "provider_resume_staggered",
+                "throttled_until": resume.throttled_until.isoformat()
+                if resume.throttled_until
+                else None,
+            },
+        )
+    if resume.action == "admit_one":
+        dispatch_limit = min(dispatch_limit, 1)
 
     def _resolve_merged_prs(
         outcome: _wf._MergedPRListOutcome | None,
@@ -1095,6 +1123,11 @@ def _dispatch_impl(
         self._adapter_settings(),
         session_requests,
     )
+    if resume.action == "admit_one" and session_requests:
+        fleet_provider_throttle.note_probe_launch(
+            fleet_provider_throttle.worker_adapter_kind(self.config.worker.harness),
+            fleet_dir_override=self.fleet_dir_override,
+        )
     successful_issue_numbers = {result.issue_number for result in dispatch_results if result.ok}
     # Issue #523: a live_worker_redispatch_averted result claims the prior
     # worker is still alive, but the adapter's probe (_probe_recovery_liveness)
