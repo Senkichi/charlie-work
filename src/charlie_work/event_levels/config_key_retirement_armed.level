@@ -1,0 +1,4 @@
+warning
+# Issue #1976: the retirement sweep marked a deprecated key's removal issue
+# Ready after the quiet window elapsed. Operator-visible state change --
+# the issue becomes dispatchable.

@@ -1,0 +1,5 @@
+warning
+# Issue #1976: a deprecated config key was read from a live config layer.
+# Emitted per registered key per file read, so it is high-volume while a
+# deprecated key remains set -- summarized by heartbeat_check via
+# EXPECTED_OPERATIONAL_KINDS membership rather than detailed listing.

@@ -353,6 +353,7 @@ FLEET_SUPERVISOR_LOCK_FILENAME = "fleet-supervisor.lock"
 FLEET_STOP_REQUEST_FILENAME = "fleet-stop-request.json"
 NOTIFY_HEALTH_STATE_FILENAME = "notify_health_state.json"
 CAPACITY_STARVATION_STATE_FILENAME = "capacity_starvation_state.json"
+CONFIG_RETIREMENT_STATE_FILENAME = "config_retirement_state.json"
 
 # The fleet heartbeat state file (``heartbeat-state.json``) also lives in the
 # fleet dir, but is deliberately NOT centralised here. Its sole owner is
@@ -447,3 +448,14 @@ def capacity_starvation_state_path(override: str | None = None) -> Path:
     sidecars (``notify_health_state.json``, ``runner-allocation.json``).
     """
     return fleet_dir(override=override) / CAPACITY_STARVATION_STATE_FILENAME
+
+
+def config_retirement_state_path(override: str | None = None) -> Path:
+    """Return the fleet config-retirement sidecar path (issue #1976).
+
+    Persists per-deprecated-key quiet-window state (first absent-everywhere
+    observation, whether the removal issue was marked Ready) so the sweep's
+    ``runtime.config_retirement_quiet_days`` window survives supervisor
+    respawns and arming is once-per-key across passes.
+    """
+    return fleet_dir(override=override) / CONFIG_RETIREMENT_STATE_FILENAME

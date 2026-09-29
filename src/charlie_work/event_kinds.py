@@ -47,6 +47,10 @@ EXPECTED_OPERATIONAL_KINDS: frozenset[str] = frozenset(
         "dispatch_stale",
         "runner_capacity_starved",
         "draft_pr_ready_held",
+        # Issue #1976: fires once per registered-key read of a config layer,
+        # so it repeats on every pass for as long as a deprecated key remains
+        # set -- the exact high-volume shape this bucket exists to summarize.
+        "config_key_deprecated_read",
         # Issue #1768 removed "operator_queue_depth" from this bucket (do not
         # re-add it, and do not add its replacement "operator_queue_impact"
         # either). The old level-triggered gauge fired every pass once any
