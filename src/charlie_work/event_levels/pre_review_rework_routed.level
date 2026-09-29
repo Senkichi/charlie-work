@@ -1,1 +1,14 @@
-error
+warning
+# Issue #2003: a dead worker's stuck pre-review PR was routed back to
+# the rework pipeline. Warning, not error: every ``reason`` value this
+# emit site can carry -- ``merge_conflict``, ``rework_branch_conflict``,
+# ``stale_empty_checks`` -- is the pipeline handling a routine, designed
+# recovery, not a failure, and the genuinely-failed branch (redispatch
+# cap exhausted / deterministic escalation) returns before this emit
+# site and never logs this kind. Level is per-kind only, so the whole
+# kind is downgraded rather than just the ``merge_conflict`` reason.
+# Warning rather than info because a worker dying and leaving a stuck
+# PR is still a handled-but-notable condition an operator should see;
+# sibling routing kinds (``merge_conflict_rework_requested``,
+# ``dispatch_rework``) stay ``info`` because they record healthy-path
+# decisions, not recovery from a dead worker.

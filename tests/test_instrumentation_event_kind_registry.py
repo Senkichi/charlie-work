@@ -237,6 +237,21 @@ def test_issue_910_latent_kinds_are_classified(tmp_path: Path) -> None:
         assert _LEVEL_BY_KIND[kind] == level, f"{kind} should be {level!r}"
 
 
+def test_pre_review_rework_routed_is_warning_not_error() -> None:
+    """#2003: routing a dead worker's stuck pre-review PR back to rework is
+    routine recovery, not a failure.
+
+    Every ``reason`` the emit site can carry (``merge_conflict``,
+    ``rework_branch_conflict``, ``stale_empty_checks``) is the pipeline
+    handling a designed recovery path; the genuinely-failed branch
+    (redispatch cap exhausted / deterministic escalation) returns before
+    the emit site and never logs this kind. ``error`` paged the fleet
+    watch on routine merge-conflict reroutes and diluted the error
+    stream.
+    """
+    assert _LEVEL_BY_KIND["pre_review_rework_routed"] == "warning"
+
+
 def test_sweep_inherits_base_level(tmp_path: Path) -> None:
     """Sweep-aggregated kinds (``{base}_sweep``) inherit the base kind's level."""
     state_path = tmp_path / "state.json"
