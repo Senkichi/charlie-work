@@ -234,8 +234,6 @@ def maybe_reap_dead_dispatched_worker(
     return state, True
 
 
-
-
 def handle_dead_worker_with_pr(
     *,
     state: dict[str, Any],

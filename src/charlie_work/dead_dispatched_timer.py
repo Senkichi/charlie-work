@@ -84,14 +84,10 @@ def dead_dispatched_reap_due(
             if throttled_until_dt > now:
                 return False
             grace_anchor = max(drift_dt, throttled_until_dt)
-    return (
-        now - grace_anchor
-    ).total_seconds() / 60 >= dead_dispatched_reap_minutes
+    return (now - grace_anchor).total_seconds() / 60 >= dead_dispatched_reap_minutes
 
 
-def note_local_park_deferral(
-    entry: dict[str, Any], *, now: datetime, reason: str
-) -> int:
+def note_local_park_deferral(entry: dict[str, Any], *, now: datetime, reason: str) -> int:
     """Record one deferred pass on ``entry``; return the consecutive count.
 
     Idempotent within a sweep pass: the reclaim lane (pre-lock, via
