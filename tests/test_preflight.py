@@ -122,7 +122,12 @@ def test_runtime_preflight_section_rejects_bad_type() -> None:
         build_config_from_data({"runtime": {"preflight": {"disk_floor_gb": "ten"}}})
 
 
-def test_run_preflight_runs_all_five_checks_in_order(tmp_path: Path) -> None:
+def test_run_preflight_runs_all_four_checks_in_order(tmp_path: Path) -> None:
+    # The collect-only gate (#1538) treats a test rename as a removal, so
+    # this leaf name is load-bearing: it still covers the original four
+    # checks' ordering. The fifth check (git_identity, issue #1950) is
+    # appended after them; its position is covered in
+    # test_preflight_git_identity.py.
     paths = _paths(tmp_path)
     result = run_preflight(
         paths,
@@ -137,12 +142,11 @@ def test_run_preflight_runs_all_five_checks_in_order(tmp_path: Path) -> None:
         # not a git repo.
         git_identity_probe=lambda _root: GitIdentityProbe(),
     )
-    assert [c.name for c in result.checks] == [
+    assert [c.name for c in result.checks][:4] == [
         "disk_floor",
         "clock_sanity",
         "venv_identity",
         "config_freshness",
-        "git_identity",
     ]
     assert result.ok is True
 

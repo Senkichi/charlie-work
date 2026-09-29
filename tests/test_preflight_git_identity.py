@@ -68,6 +68,24 @@ def _git_identity_check(paths: PreflightPaths, probe: GitIdentityProbe, cfg: Pre
     return result, next(c for c in result.checks if c.name == "git_identity")
 
 
+def test_run_preflight_appends_git_identity_after_original_checks(
+    tmp_path: Path,
+) -> None:
+    """``git_identity`` runs fifth, appended after the original four checks
+    -- the prefix order itself is covered by ``test_preflight.py``'s
+    ordering test (its leaf name predates this check and is load-bearing
+    for the collect-only gate)."""
+    paths = _paths(tmp_path)
+    result, _ = _git_identity_check(paths, GitIdentityProbe(), PreflightConfig())
+    assert [c.name for c in result.checks] == [
+        "disk_floor",
+        "clock_sanity",
+        "venv_identity",
+        "config_freshness",
+        "git_identity",
+    ]
+
+
 def test_git_identity_ok_when_no_repo_local_override(tmp_path: Path) -> None:
     paths = _paths(tmp_path)
     result, check = _git_identity_check(
