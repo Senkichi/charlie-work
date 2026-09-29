@@ -427,7 +427,7 @@ def _find_json_verdict(body: str) -> CrossFamilyVerdict | None:
     any, is tried next) rather than silently discarding the bad data.
     """
     structure = markdown_fence.scan(body)
-    lines = body.splitlines()
+    lines = markdown_fence.split_lines(body)
     for fence in reversed(structure.fences):
         content_end = fence.end - 1 if fence.closed else fence.end
         candidate = "\n".join(lines[fence.start + 1 : content_end]).strip()

@@ -133,7 +133,7 @@ def _extract_verdict_from_text(text: str) -> dict[str, Any] | None:
     of matching nothing at all.
     """
     structure = markdown_fence.scan(text)
-    lines = text.splitlines()
+    lines = markdown_fence.split_lines(text)
     for fence in reversed(structure.fences):
         content_end = fence.end - 1 if fence.closed else fence.end
         candidate = "\n".join(lines[fence.start + 1 : content_end]).strip()
@@ -167,7 +167,7 @@ def _strip_fenced_blocks(text: str) -> str:
     structure = markdown_fence.scan(text)
     if not structure.fences:
         return text
-    lines = text.splitlines(keepends=True)
+    lines = markdown_fence.split_lines(text, keepends=True)
     drop = [False] * len(lines)
     for fence in structure.fences:
         end = fence.end if fence.closed else len(lines)

@@ -245,12 +245,15 @@ def parse_advisories_comment(body: str) -> tuple[AdvisoryRecord, ...] | None:
     # treated ANY 3+-backtick line as both a valid opener and a valid
     # closer regardless of length or character, so a decoy 3-backtick line
     # inside a 4-backtick-opened payload could truncate it early. Tolerant
-    # of ``\\r\\n`` line endings (``str.splitlines`` inside ``scan``).
+    # of ``\\r\\n`` line endings (``markdown_fence.split_lines`` inside
+    # ``scan``) -- ``lines`` below must use the same helper, not
+    # ``str.splitlines()``, or a non-CommonMark separator could desync it
+    # from ``fence.start``/``fence.end``.
     structure = markdown_fence.scan(body)
     if not structure.fences:
         return ()
     fence = structure.fences[0]
-    lines = body.splitlines()
+    lines = markdown_fence.split_lines(body)
     content_end = fence.end - 1 if fence.closed else fence.end
     payload_text = "\n".join(lines[fence.start + 1 : content_end]).strip()
     if not payload_text:

@@ -314,15 +314,19 @@ def _inside_inline_fence_span(text: str, start: int, end: int) -> bool:
 def _line_start_offsets(text: str) -> list[int]:
     """Char offset of the start of each line, plus a trailing ``len(text)`` sentinel.
 
-    Index ``i`` is the offset of ``text.splitlines()[i]``; index
-    ``line_count`` (one past the last real line) is ``len(text)``, matching
-    ``markdown_fence.MarkdownStructure``'s half-open ``end`` convention so a
-    ``FenceSpan.end`` of ``line_count`` (an unclosed fence) converts without
-    a special case.
+    Index ``i`` is the offset of ``markdown_fence.split_lines(text)[i]``;
+    index ``line_count`` (one past the last real line) is ``len(text)``,
+    matching ``markdown_fence.MarkdownStructure``'s half-open ``end``
+    convention so a ``FenceSpan.end`` of ``line_count`` (an unclosed fence)
+    converts without a special case. Must use ``markdown_fence.split_lines``,
+    not ``str.splitlines()``: the latter also breaks on separators
+    CommonMark doesn't treat as line endings, which would desync these
+    offsets from ``markdown_fence.scan``'s line indices on such input
+    (adversarial review finding B2, architecture-deepening candidate 3).
     """
     offsets = []
     pos = 0
-    for line in text.splitlines(keepends=True):
+    for line in markdown_fence.split_lines(text, keepends=True):
         offsets.append(pos)
         pos += len(line)
     offsets.append(pos)
@@ -433,14 +437,17 @@ def _scan_blocker_sections(text: str) -> tuple[list[int], bool]:
     The fence/heading structure comes from ``markdown_fence.scan`` — this
     function keeps only the blocker-section state machine (heading text
     match, list-item/none-sentinel/foreign-pattern classification), not any
-    CommonMark scanning of its own.
+    CommonMark scanning of its own. Iterates via ``markdown_fence.
+    split_lines`` (not ``str.splitlines()``) so this loop's line indices
+    stay in sync with ``structure``'s (adversarial review finding B2,
+    architecture-deepening candidate 3).
     """
     structure = markdown_fence.scan(text)
     heading_text_by_line = {heading.line: heading.text for heading in structure.headings}
     refs: list[int] = []
     unreadable = False
     in_section = False
-    for index, line in enumerate(text.splitlines(keepends=True)):
+    for index, line in enumerate(markdown_fence.split_lines(text, keepends=True)):
         if structure.is_fenced(index):
             # Inside a fenced block (opening line through closer, inclusive).
             # Reaching it closes any open blocker section; content lines are

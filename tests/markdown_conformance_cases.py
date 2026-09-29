@@ -5,18 +5,17 @@ structure"), architecture-deepening plan
 This is a **data table**, not a test module (no `test_*` name, no assertions,
 not collected by pytest). It records, per case, the input markdown and the
 CommonMark-CORRECT block-level line spans for fenced code blocks, blockquote
-lines, and ATX heading lines. A later step runs this table against the
-unified scan side of `markdown_fence.py` *and* `scripts/heartbeat_check.py`'s
-stdlib copy, once both exist, as their shared conformance suite.
-
-It is deliberately NOT wired to a test yet: most cases here encode exactly
-the deviations that `tests/test_markdown_structure_characterization.py`
-pins as CURRENT (wrong) behavior, so asserting this table against any
-existing consumer today would fail by design, not by accident.
+lines, and ATX heading lines. `tests/test_markdown_conformance.py` runs this
+table against both the unified scan side of `markdown_fence.py` and
+`scripts/heartbeat_check.py`'s stdlib copy, as their shared conformance
+suite.
 
 ## Conventions
 
-* Lines are 0-indexed via `markdown.splitlines()` (no keepends).
+* Lines are 0-indexed via `markdown_fence.split_lines()` (no keepends) --
+  CommonMark line endings only (`\n`, `\r\n`, `\r`), NOT `str.splitlines()`,
+  which also breaks on separators CommonMark doesn't (adversarial review
+  finding B2, architecture-deepening candidate 3).
 * `fenced_line_spans`: tuple of `(start, end)` half-open line-index ranges.
   `start` is the line with the opening fence delimiter; `end` is one past
   the line with the CLOSING fence delimiter (i.e. the closer line IS part
@@ -88,9 +87,29 @@ CASES: tuple[ConformanceCase, ...] = (
         name="fence_backtick_in_info_string_is_not_a_fence",
         markdown="```code`sample\nprose, not code\n```\n",
         # A backtick-fence info string containing a backtick disqualifies
-        # the opener under CommonMark -- no fence forms here at all
-        # (block-level; see module scope note re: inline code spans).
-        fenced_line_spans=(),
+        # the opener under CommonMark -- that line is ordinary prose, not
+        # the start of a "malformed fence" region to skip. The line-2 ```
+        # is therefore free to open its OWN fence: unclosed (nothing
+        # follows it), so it's an empty fence at (2, 3), not "no fence at
+        # all". Verified against markdown-it-py in commonmark mode
+        # (adversarial review finding B1, architecture-deepening
+        # candidate 3): a prior version of this row asserted `()`, which
+        # was the implementation's own (wrong) output, not CommonMark's.
+        fenced_line_spans=((2, 3),),
+    ),
+    ConformanceCase(
+        name="fence_after_unicode_line_separator_is_not_split",
+        markdown="prose ```example-secret\nAKIAZ7Q3XK2PLM4RT5WN\n```\n",
+        # U+2028 LINE SEPARATOR is not a CommonMark line ending (only \n,
+        # \r\n, \r are), so line 0 is "prose ```example-secret" as ONE
+        # line -- a `` ``` `` that doesn't open the line is not a fence
+        # delimiter at all, just paragraph text. Line 2's ``` (the ONLY
+        # real line break is the \n after "...RT5WN") then opens its own
+        # unclosed fence. A splitter that also breaks on U+2028 (like
+        # `str.splitlines()`) would instead see 3 "lines" before this one
+        # and wrongly pair `` ```example-secret `` with the final ```,
+        # masking prose as fenced content (adversarial review finding B2).
+        fenced_line_spans=((2, 3),),
     ),
     ConformanceCase(
         name="fence_closer_must_be_at_least_as_long_as_opener",
@@ -138,6 +157,37 @@ CASES: tuple[ConformanceCase, ...] = (
         markdown="prose\n\n    > looks like a quote but is 4-space indented\nprose after\n",
         # 4+ leading spaces after a blank line makes this an indented code
         # block; the `>` is literal code text, not a blockquote marker.
+        quoted_lines=(),
+    ),
+    ConformanceCase(
+        name="heading_single_leading_tab_is_indented_code_not_heading",
+        markdown="prose\n\n\t# heading\nprose after\n",
+        # A tab advances to the next multiple of 4 columns, so a single
+        # leading tab is already 4 columns -- 4+-column indent after a
+        # blank line is an indented code block, not an ATX heading.
+        # `[ \t]{0,3}` (a *character* count) would wrongly admit this one
+        # tab as "0-3 spaces" (adversarial review finding B3,
+        # architecture-deepening candidate 3). Verified against
+        # markdown-it-py.
+        heading_lines=(),
+    ),
+    ConformanceCase(
+        name="fence_single_leading_tab_is_indented_code_not_fence",
+        markdown="prose\n\n\t```\n\tcode\n\t```\nprose after\n",
+        # Same column-counting rule as the heading case above, applied to
+        # a fence delimiter: a single leading tab is 4 columns, so this
+        # whole run is one indented code block, not a fence (adversarial
+        # review finding B3).
+        fenced_line_spans=(),
+    ),
+    ConformanceCase(
+        name="blockquote_space_then_tab_is_indented_code_not_quote",
+        markdown="prose\n\n \t> quote?\nprose after\n",
+        # One space (1 column) then one tab: a tab advances to the NEXT
+        # multiple of 4, so it consumes 3 more columns from column 1,
+        # landing on column 4 -- 4+ columns total from just two
+        # characters. Indented code, not a blockquote marker (adversarial
+        # review finding B3).
         quoted_lines=(),
     ),
 )

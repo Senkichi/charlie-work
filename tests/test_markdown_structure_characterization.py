@@ -10,14 +10,18 @@ consumer (`github_body_scan.py`, `cross_repo_gate.py`, `verdict_parsing.py`,
 `markdown_fence.scan`, these tests instead pin the CommonMark-correct output,
 so a future regression back to ad hoc scanning fails loudly here.
 
-Each flipped test's docstring states "FLIP: was <x>, now <y>." Two tests are
-deliberately NOT flipped, and say why inline:
+Each flipped test's docstring states "FLIP: was <x>, now <y>." One test is
+deliberately NOT flipped, and says why inline:
 
-- `test_flip_cross_repo_gate_backtick_info_string_swallows_heading`: wiring
-  changed *how* the swallowed region is computed but not *whether* it is
-  swallowed for this input shape -- see its docstring.
 - `test_flip_rescue_review_verdict_heading_allows_no_space`: a deliberate
   cross-family-model tolerance, out of this wiring pass's scope.
+
+`test_flip_cross_repo_gate_backtick_info_string_no_longer_swallows_heading`
+WAS in that "not flipped" list (its info-string swallow was unaffected by
+wiring alone), but a later fix to `markdown_fence.scan` itself -- a rejected
+fence opener no longer swallows the region up to its nearest closer;
+adversarial review finding B1, architecture-deepening candidate 3 -- flips
+it too. See that test's own docstring.
 
 `outbound_body_guard.py` is the one surveyed consumer with **zero**
 deviations (it already matched every CommonMark rule in the recon's matrix
@@ -76,46 +80,59 @@ def test_flip_github_body_scan_backtick_in_info_string_opens_fence() -> None:
     """FLIP: was a captured range covering the ``` lines (the old
     `_FENCE_OPEN_RE` never inspected what follows the backtick run, so
     `` ```code`sample `` was treated as opening a fence); now, wired onto
-    `markdown_fence.scan`, `_fenced_block_ranges` returns no range at all.
+    `markdown_fence.scan`, `_fenced_block_ranges` returns a DIFFERENT
+    non-empty range: char offsets 46-56, covering the line-3 ``` and
+    "after" -- not the empty range `[]` an earlier version of this test
+    asserted.
+
     CommonMark requires a backtick fence's info string to contain no
-    backtick, so this line never opens a fence and the lines that follow are
-    ordinary prose, not fenced content.
+    backtick, so `` ```code`sample `` (line 0) never opens a fence -- but
+    that line is ordinary prose, NOT the start of a "malformed fence"
+    region to skip (adversarial review finding B1, architecture-deepening
+    candidate 3: `markdown_fence.scan` used to still swallow such a region
+    without recording a span for it). The line-2 ``` is therefore free to
+    open its own (unclosed) fence, running to end-of-text -- verified
+    against markdown-it-py in commonmark mode.
     """
     text = "```code`sample\nshould be prose here, not code\n```\nafter\n"
 
-    assert _fenced_block_ranges(text) == []
+    assert _fenced_block_ranges(text) == [(46, 56)]
 
 
 # --- cross_repo_gate.py -------------------------------------------------------
 
 
-def test_flip_cross_repo_gate_backtick_info_string_swallows_heading() -> None:
-    """NOT FLIPPED (verified, not assumed): `_nearest_preceding_heading`
-    still returns `"Real Heading"` after wiring onto `markdown_fence.scan`,
-    identical to before. This looks like it should flip -- the backtick in
-    `` ```code`sample ``'s info string means CommonMark never opens a fence
-    there -- but `markdown_fence.scan` deliberately still *skips* the lines
-    between a rejected opener and its nearest same-char, length-matching
-    closer (or end of text, if none exists); it just doesn't record a
-    `FenceSpan` for the skipped region (see `markdown_fence._find_fence_close`
-    docstring). `_nearest_preceding_heading` only reads `structure.headings`,
-    which is never populated for a skipped region regardless of whether the
-    opener that triggered the skip was valid -- so whether the region counts
-    as a "real" fence is invisible to this function. The old hand-rolled
-    `_FENCE_DELIM_RE` swallowed the same region for the same reason (any
-    backtick run of length >= 3 opened a fence, no info-string check, then
-    closed on the next same-length run or ran to EOF). Confirmed by
-    construction: giving the fake fence a real closer before `# References`
-    (`"## Real Heading\n```code`sample\n```\n# References\nmore text\n"`)
-    makes *both* the old and the wired implementation return `"References"`
-    -- the info-string check changes nothing observable through this
-    function either way. Left un-migrated is `verdict_parsing.py:44` /
-    `rescue_review.py:110`'s deliberate-tolerance case; this one is
-    different -- it genuinely has no observable flip, not "out of scope."
+def test_flip_cross_repo_gate_backtick_info_string_no_longer_swallows_heading() -> None:
+    """FLIP: was `"Real Heading"`, now `"References"`.
+
+    Immediately after wiring onto `markdown_fence.scan`, this did NOT flip
+    (verified, not assumed): `markdown_fence.scan` at that point still
+    *skipped* the lines between a rejected opener (the backtick in
+    `` ```code`sample ``'s info string disqualifies it under CommonMark)
+    and its nearest same-char, length-matching closer -- or end of text, if
+    none exists -- without recording a `FenceSpan` for the skipped region.
+    `_nearest_preceding_heading` only reads `structure.headings`, which was
+    never populated for a skipped region regardless of whether the opener
+    that triggered the skip was valid, so whether the region counted as a
+    "real" fence was invisible to this function either way -- it returned
+    `"Real Heading"`, matching the old hand-rolled `_FENCE_DELIM_RE`, which
+    swallowed the same region for the same reason (any backtick run of
+    length >= 3 opened a fence, no info-string check, then closed on the
+    next same-length run or ran to EOF).
+
+    That "still skips a rejected opener's region" design was itself a
+    CommonMark deviation (adversarial review finding B1, architecture-
+    deepening candidate 3): a rejected opener is not a fence at all, so the
+    line right after it (`# References`) is ordinary text, eligible to be
+    read as a heading like any other line -- confirmed against
+    markdown-it-py in commonmark mode. Fixing B1 in `markdown_fence.scan`
+    removes the skip entirely, so `# References` (line 2) IS now seen as a
+    real heading, and being the last one before the end of the text, it
+    becomes the "nearest preceding heading" for a candidate after it.
     """
     text = "## Real Heading\n```code`sample\n# References\nmore text\n"
 
-    assert _nearest_preceding_heading(text) == "Real Heading"
+    assert _nearest_preceding_heading(text) == "References"
 
 
 # --- verdict_parsing.py -------------------------------------------------------

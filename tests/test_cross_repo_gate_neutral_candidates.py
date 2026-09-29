@@ -582,3 +582,40 @@ def test_indented_code_block_citation_heading_does_not_neutralize(
     assert result.missing_paths == (dispatch_target,)
     assert result.neutral_paths == ()
     assert "abstaining" in result.reason
+
+
+def test_tab_indented_citation_heading_does_not_neutralize(
+    tmp_path: Path,
+) -> None:
+    """Adversarial review finding B3 (architecture-deepening candidate 3):
+    a *tab*-indented ``#``-prefixed line is a 4+-CommonMark-column indented
+    code block, not a heading -- same rule as the 4-space case above, but a
+    single leading tab is already 4 columns (a tab advances to the next
+    multiple of 4), NOT the "1 character" a naive ``[ \t]{0,3}`` regex
+    (counting characters, not columns) would attribute to it. That regex
+    wrongly admitted up to three tabs (12 columns) as if it were "0-3
+    spaces", so a tab-indented ``\t# References`` line was misread as a
+    real heading, shadowing ``## Changes`` and wrongly neutralizing the
+    genuine dispatch target after it -- verified against markdown-it-py in
+    commonmark mode. Without a fleet registry the gate abstains on the
+    surviving candidate rather than escalating (positive-evidence redesign,
+    #1756-#1758)."""
+    repo = tmp_path / "repo"
+    _init_git_repo_with_var_gitignore(repo)
+    (repo / "src").mkdir()  # real, non-ignored top-level dir.
+    dispatch_target = "src/charlie_work/nonexistent.py"
+    body = (
+        "## Changes\n\n"
+        "Reproducer:\n\n"
+        "\t# References\n"
+        "\timport foo\n\n"
+        f"The fix is in `{dispatch_target}`.\n"
+    )
+
+    result = cross_repo_gate(body, repo)
+
+    assert result.passed is True
+    assert result.referenced_paths == (dispatch_target,)
+    assert result.missing_paths == (dispatch_target,)
+    assert result.neutral_paths == ()
+    assert "abstaining" in result.reason

@@ -161,6 +161,55 @@ def test_example_secret_masking_not_desynced_by_bare_cr() -> None:
     assert "github-pat" in rule_ids, "real secret after the fence was not detected"
 
 
+def test_rejected_fence_opener_does_not_over_mask_a_later_real_fence() -> None:
+    """Regression for adversarial review finding B1 (architecture-deepening
+    candidate 3): a rejected fence opener (backtick in its info string) must
+    not swallow the lines up to its nearest same-char closer -- it is
+    ordinary prose under CommonMark, not the start of a region to skip.
+
+    Body (verified against markdown-it-py in commonmark mode): line 0
+    ` ```x`y ` is a paragraph, NOT a fence opener (its info string contains
+    a backtick). Line 1's bare ``` is therefore a FRESH, valid opener with
+    an EMPTY info string -- not "example-secret" -- closed by line 4's ```,
+    so its content (lines 2-3, including the literal ` ```example-secret `
+    line) is never masking-exempt. `markdown_fence.scan` used to instead
+    pair line 0 with line 1 as a "malformed, skip it" region (since a
+    rejected opener still searched for and consumed a closer), leaving
+    line 2's ` ```example-secret ` to open what the guard *did* treat as
+    the exempt fence -- masking the key and dropping the match entirely.
+    """
+    body = f"```x`y\n```\n```example-secret\n{_AWS}\n```\n"
+    matches = scan_outbound_text(body, part="body")
+    assert any(m.rule_id == "aws-access-token" for m in matches), (
+        "real credential was masked as if inside an exempt example-secret fence"
+    )
+
+
+def test_example_secret_masking_not_desynced_by_unicode_line_separator() -> None:
+    """Regression for adversarial review finding B2 (architecture-deepening
+    candidate 3): U+2028 LINE SEPARATOR is not a CommonMark line ending
+    (only ``\\n``, ``\\r\\n``, ``\\r`` are), so it must not split a line for
+    fence-boundary purposes the way ``str.splitlines()`` does.
+
+    Body (verified against markdown-it-py in commonmark mode): "prose" and
+    the first ` ```example-secret ` are ONE physical line (joined by
+    U+2028, not a real line break), so that ``` never opens a line -- it is
+    ordinary paragraph text, not a fence delimiter at all. Only the final
+    bare ``` (after the real ``\\n``-terminated key line) opens a fence, and
+    it is unclosed -- with an EMPTY info string, not "example-secret" -- so
+    the key is never masking-exempt and must still be caught.
+    `markdown_fence.scan`/``_mask_example_secret_fences`` used to line-split
+    with ``str.splitlines()``, which also breaks on U+2028: that phantom
+    line break let ` ```example-secret ` open its own line and pair with
+    the trailing ``` as an exempt fence, masking the key.
+    """
+    body = f"prose ```example-secret\n{_AWS}\n```\n"
+    matches = scan_outbound_text(body, part="body")
+    assert any(m.rule_id == "aws-access-token" for m in matches), (
+        "real credential was masked as if inside an exempt example-secret fence"
+    )
+
+
 def test_match_reports_part_and_line() -> None:
     matches = scan_outbound_text(f"line one\nline two {_GHO}\n", part="body")
     match = next(m for m in matches if m.rule_id == "github-oauth")

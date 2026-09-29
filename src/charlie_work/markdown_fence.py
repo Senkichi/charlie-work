@@ -60,6 +60,7 @@ __all__ = [
     "MarkdownStructure",
     "scan",
     "is_blockquote_marker",
+    "split_lines",
 ]
 
 # CommonMark's minimum fence. A shorter run is inline code, not a block.
@@ -103,16 +104,21 @@ def fenced_block(text: str, info: str = "") -> str:
 # "naive nearest-pair" defect `github_body_scan.py`'s own docstring above
 # describes fixing in exactly one of the eight places that needed it.
 #
-# This is the scan side those seven consumers should eventually converge on
-# (not wired here -- that is a later, separate step; see the plan). It ports
-# in the strongest existing model found in the recon: `outbound_body_guard.
-# _FENCE_OPEN_RE`'s 0-3-space indent bound and backtick-in-info-string
-# exclusion (the only implementation that gets that rule right at all), with
-# `cross_repo_gate`'s same-char/length-aware closer search folded in as one
-# shared subroutine used for BOTH a valid opener and a rejected one -- see
-# `_find_fence_close`'s docstring for why a rejected opener still searches
-# for (and consumes) its matching closer rather than leaving the fence-shaped
-# text open to be reinterpreted as fresh structure.
+# This is the scan side those seven consumers now delegate to (wiring
+# happened in a later, separate commit; see the plan). It ports in the
+# strongest existing model found in the recon: `outbound_body_guard.
+# _FENCE_OPEN_RE`'s 0-3-COLUMN indent bound (tab stops of 4, not 0-3
+# characters -- a single leading tab is already 4 columns, so `_strip_
+# marker_indent` rejects it; see its docstring -- adversarial review finding
+# B3, architecture-deepening candidate 3) and backtick-in-info-string
+# exclusion, with `cross_repo_gate`'s same-char/length-aware closer search
+# folded in as one shared subroutine (`_find_fence_close`), used only for a
+# *valid* opener: a rejected opener (backtick fence, backtick in its info
+# string) is not a fence at all under CommonMark, so it is treated as an
+# ordinary line and scanning resumes immediately on the next line -- it does
+# not search for or consume a "closer" (adversarial review finding B1;
+# `_find_fence_close`'s docstring explains the narrower design this
+# replaced).
 #
 # Deliberately out of scope (`tests/markdown_conformance_cases.py`'s own
 # scope note): full CommonMark inline parsing (code spans, emphasis, links),
@@ -124,24 +130,122 @@ def fenced_block(text: str, info: str = "") -> str:
 # needing to model paragraphs. Block-level fences, blockquotes, and ATX
 # headings are what every surveyed consumer actually scans for.
 
-# CommonMark fenced-code-block delimiter: 0-3 leading spaces/tabs, then 3+
-# of the same backtick or tilde character, then an optional info string.
-_FENCE_DELIM_RE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})[ \t]*(.*)$")
+# CommonMark line endings only: `\n`, `\r\n`, `\r`. Used by :func:`split_lines`
+# instead of `str.splitlines()`, which also breaks on several separators
+# (vertical tab, form feed, file/group/record separator, NEL, LINE/PARAGRAPH
+# SEPARATOR) that neither CommonMark nor GitHub's renderer treat as line
+# breaks (adversarial review finding B2, architecture-deepening candidate 3).
+_LINE_ENDING_RE = re.compile(r"\r\n|\r|\n")
 
-# CommonMark blockquote marker: 0-3 leading spaces/tabs, then `>`. (The
-# optional single space CommonMark allows after the `>` is not captured here
-# -- callers needing quoted *content*, not just the marker line, strip it
-# themselves; every surveyed consumer only needs the boolean.)
-_BLOCKQUOTE_RE = re.compile(r"^[ \t]{0,3}>")
+# The three markers below match against a line with its leading indent
+# already stripped by :func:`_strip_marker_indent` (which enforces
+# CommonMark's 0-3-*column* bound, tab stops of 4 -- see that function's
+# docstring). They must NOT re-add an `[ \t]{0,3}` prefix: that pattern
+# counts leading *characters*, not columns, so it would wrongly admit up to
+# three tabs (12 columns) as if it were "0-3 spaces" (adversarial review
+# finding B3).
 
-# CommonMark ATX heading: 0-3 leading spaces/tabs, 1-6 `#`, then either
-# end-of-line or at least one space/tab before the heading text.
-_ATX_HEADING_RE = re.compile(r"^[ \t]{0,3}(#{1,6})(?:[ \t]+(.*?))?[ \t]*$")
+# CommonMark fenced-code-block delimiter: 3+ of the same backtick or tilde
+# character, then an optional info string.
+_FENCE_DELIM_RE = re.compile(r"^(`{3,}|~{3,})[ \t]*(.*)$")
+
+# CommonMark blockquote marker: `>`. (The optional single space CommonMark
+# allows after the `>` is not captured here -- callers needing quoted
+# *content*, not just the marker line, strip it themselves; every surveyed
+# consumer only needs the boolean.)
+_BLOCKQUOTE_RE = re.compile(r"^>")
+
+# CommonMark ATX heading: 1-6 `#`, then either end-of-line or at least one
+# space/tab before the heading text.
+_ATX_HEADING_RE = re.compile(r"^(#{1,6})(?:[ \t]+(.*?))?[ \t]*$")
 
 # An ATX heading's optional closing sequence of `#`s (`## Text ##`): must be
 # preceded by a space/tab (or be the whole remaining text) and followed only
 # by trailing whitespace, which the caller has already stripped.
 _ATX_CLOSING_RUN_RE = re.compile(r"(?:^|[ \t])#+$")
+
+
+def split_lines(text: str, *, keepends: bool = False) -> list[str]:
+    """Split ``text`` on CommonMark line endings only (``\\n``, ``\\r\\n``,
+    ``\\r``) -- never ``str.splitlines()``, whose wider separator set
+    (vertical tab, form feed, file/group/record separator, NEL, LINE/
+    PARAGRAPH SEPARATOR) is not a CommonMark or GitHub line break.
+
+    :func:`scan` uses this internally, and every consumer that indexes its
+    own line list by a `FenceSpan`/`Heading` line number returned from
+    `scan` (`outbound_body_guard._mask_example_secret_fences`,
+    `verdict_parsing._extract_verdict_from_text` /
+    `_strip_fenced_blocks`, `rescue_review._find_json_verdict`,
+    `attachment_contracts.hook_entry.parse_advisories_comment`,
+    `github_body_scan._line_start_offsets` / `_scan_blocker_sections`) must
+    use it too, on the same ``text``, rather than re-deriving its own line
+    list with ``str.splitlines()``. Otherwise a single invisible non-
+    CommonMark separator (e.g. U+2028 LINE SEPARATOR) in the input desyncs
+    the consumer's line indices from `scan`'s, which can silently shift a
+    `FenceSpan` onto the wrong lines (adversarial review finding B2,
+    architecture-deepening candidate 3). Matches ``str.splitlines()``'s
+    output exactly for text containing only CommonMark line endings --
+    including the "no trailing empty element after a final terminator"
+    behaviour -- so this is a drop-in, narrower replacement.
+    """
+    if not text:
+        return []
+    lines: list[str] = []
+    pos = 0
+    for match in _LINE_ENDING_RE.finditer(text):
+        end = match.end() if keepends else match.start()
+        lines.append(text[pos:end])
+        pos = match.end()
+    if pos < len(text):
+        lines.append(text[pos:])
+    return lines
+
+
+def _leading_indent_columns(line: str) -> tuple[int, int]:
+    """Return ``(columns, chars)`` for ``line``'s leading run of spaces and
+    tabs: the CommonMark *column* width of that run, and how many
+    characters it takes up.
+
+    A tab advances to the next multiple of 4 columns (CommonMark's tab
+    handling), so a single leading tab is already 4 columns wide -- not the
+    1 character that a naive ``[ \\t]{0,3}`` regex (matching characters, not
+    columns) would attribute to it, wrongly admitting up to three tabs (12
+    columns) as if they were "0-3 spaces" (adversarial review finding B3,
+    architecture-deepening candidate 3). Stops at the first non-space/tab
+    character, or as soon as the running total exceeds 3 columns -- nothing
+    further can matter once CommonMark's 0-3-column bound is already blown.
+    """
+    columns = 0
+    chars = 0
+    for char in line:
+        if char == " ":
+            columns += 1
+        elif char == "\t":
+            columns += 4 - (columns % 4)
+        else:
+            break
+        chars += 1
+        if columns > 3:
+            break
+    return columns, chars
+
+
+def _strip_marker_indent(line: str) -> str | None:
+    """Strip ``line``'s leading indent and return the remainder, or
+    ``None`` when that indent is 4+ CommonMark columns wide.
+
+    A 4+-column indent makes the line an indented code block under
+    CommonMark, never a fence/blockquote/heading marker, regardless of how
+    many literal space/tab *characters* precede it -- see
+    :func:`_leading_indent_columns`. Every marker check in :func:`scan`
+    (fence delimiter, blockquote marker, ATX heading) and in
+    :func:`_find_fence_close` goes through this first, so all four share
+    one indent rule and cannot drift from each other.
+    """
+    columns, chars = _leading_indent_columns(line)
+    if columns > 3:
+        return None
+    return line[chars:]
 
 
 @dataclass(frozen=True)
@@ -182,7 +286,7 @@ class Heading:
 class MarkdownStructure:
     """The block-level structure of one markdown document.
 
-    Line-indexed against ``text.splitlines()`` (no keepends), 0-indexed --
+    Line-indexed against ``split_lines(text)`` (no keepends), 0-indexed --
     matching `tests/markdown_conformance_cases.py`. This is the one thing
     every surveyed consumer in `md-recon.md` actually needs: which lines/
     spans are fenced code, which are blockquote markers, which are ATX
@@ -211,15 +315,17 @@ class MarkdownStructure:
 
 def is_blockquote_marker(line: str) -> bool:
     """True if ``line`` opens with a CommonMark blockquote marker (0-3
-    leading spaces/tabs, then ``>``).
+    leading indent *columns*, tab stops of 4, then ``>``).
 
     A single-line primitive for consumers (e.g. ``github_prose_dependencies.
     _is_blockquote_line``) that only need the boolean for one line at a
     time -- not a multi-line document -- rather than paying for a full
-    :func:`scan`. Shares ``_BLOCKQUOTE_RE`` with :func:`scan` so the two can
-    never drift on what counts as a blockquote marker.
+    :func:`scan`. Shares ``_strip_marker_indent`` and ``_BLOCKQUOTE_RE``
+    with :func:`scan` so the two can never drift on what counts as a
+    blockquote marker.
     """
-    return _BLOCKQUOTE_RE.match(line) is not None
+    stripped = _strip_marker_indent(line)
+    return stripped is not None and _BLOCKQUOTE_RE.match(stripped) is not None
 
 
 def _find_fence_close(lines: list[str], start: int, char: str, length: int) -> int | None:
@@ -227,17 +333,18 @@ def _find_fence_close(lines: list[str], start: int, char: str, length: int) -> i
     opened with a delimiter run of ``length``, searching from ``start``, or
     ``None`` if none exists before end-of-text.
 
-    Called for a *rejected* opener too (one whose info string broke the
-    backtick rule), not only a valid one: the text between a fence-shaped
-    line and its nearest same-char, long-enough closer reads as an author's
-    (malformed) attempt at a code block either way, and re-interpreting a
-    line in the middle of it as a fresh heading, blockquote, or fence would
-    be surprising -- so both cases consume the same region; they differ only
-    in whether `scan` records a `FenceSpan` for it.
+    Only ever called for a *valid* opener (:func:`scan` treats a rejected
+    one -- a backtick fence whose info string itself contains a backtick --
+    as an ordinary line, not something with a "closer" to find; see
+    :func:`scan`'s own comment). Each candidate closer line's indent is
+    checked with the same :func:`_strip_marker_indent` fence/blockquote/
+    heading share, so a closer over-indented past 0-3 columns (e.g. tab-
+    indented) is correctly skipped rather than accepted.
     """
-    close_re = re.compile(rf"^[ \t]{{0,3}}{re.escape(char)}{{{length},}}[ \t]*$")
+    close_re = re.compile(rf"^{re.escape(char)}{{{length},}}[ \t]*$")
     for index in range(start, len(lines)):
-        if close_re.match(lines[index]):
+        stripped = _strip_marker_indent(lines[index])
+        if stripped is not None and close_re.match(stripped):
             return index
     return None
 
@@ -253,14 +360,17 @@ def _strip_atx_closing_run(text: str) -> str:
 def scan(text: str) -> MarkdownStructure:
     """Scan ``text`` and return its CommonMark block-level structure.
 
-    Implements: 0-3 space/tab indent bound on fence/blockquote/heading
-    markers; backtick- and tilde-fence support; a closer that must be the
-    same character and at least as long as its opener; a backtick fence's
-    info string may not itself contain a backtick; an unclosed fence runs to
-    end-of-text; an ATX heading requires whitespace (or end-of-line) after
-    its `#` run, with an optional closing `#`-run stripped from its text.
+    Implements: 0-3-column indent bound (tab stops of 4) on fence/
+    blockquote/heading markers; backtick- and tilde-fence support; a closer
+    that must be the same character and at least as long as its opener; a
+    backtick fence's info string may not itself contain a backtick -- a
+    line that fails this is not a fence opener at all, so it is ordinary
+    text and scanning resumes on the very next line; an unclosed (valid)
+    fence runs to end-of-text; an ATX heading requires whitespace (or
+    end-of-line) after its `#` run, with an optional closing `#`-run
+    stripped from its text.
     """
-    lines = text.splitlines()
+    lines = split_lines(text)
     fences: list[FenceSpan] = []
     quoted: set[int] = set()
     headings: list[Heading] = []
@@ -268,16 +378,24 @@ def scan(text: str) -> MarkdownStructure:
     line_count = len(lines)
     index = 0
     while index < line_count:
-        line = lines[index]
+        stripped = _strip_marker_indent(lines[index])
 
-        delimiter = _FENCE_DELIM_RE.match(line)
-        if delimiter is not None:
-            run, info = delimiter.group(1), delimiter.group(2).strip()
-            char, length = run[0], len(run)
-            valid_opener = not (char == "`" and "`" in info)
-            close_at = _find_fence_close(lines, index + 1, char, length)
-            end = close_at + 1 if close_at is not None else line_count
-            if valid_opener:
+        if stripped is not None:
+            delimiter = _FENCE_DELIM_RE.match(stripped)
+            if delimiter is not None:
+                run, info = delimiter.group(1), delimiter.group(2).strip()
+                char, length = run[0], len(run)
+                if char == "`" and "`" in info:
+                    # Not a fence opener under CommonMark (a backtick
+                    # fence's info string may not itself contain a
+                    # backtick) -- an ordinary line, not the start of a
+                    # region to skip. The very next line is scanned fresh,
+                    # so e.g. a real fence opener on it is still seen
+                    # (adversarial review finding B1).
+                    index += 1
+                    continue
+                close_at = _find_fence_close(lines, index + 1, char, length)
+                end = close_at + 1 if close_at is not None else line_count
                 fences.append(
                     FenceSpan(
                         start=index,
@@ -288,23 +406,23 @@ def scan(text: str) -> MarkdownStructure:
                         closed=close_at is not None,
                     )
                 )
-            index = end
-            continue
+                index = end
+                continue
 
-        if _BLOCKQUOTE_RE.match(line):
-            quoted.add(index)
-            index += 1
-            continue
+            if _BLOCKQUOTE_RE.match(stripped):
+                quoted.add(index)
+                index += 1
+                continue
 
-        heading_match = _ATX_HEADING_RE.match(line)
-        if heading_match is not None:
-            level = len(heading_match.group(1))
-            text_group = heading_match.group(2) or ""
-            headings.append(
-                Heading(line=index, level=level, text=_strip_atx_closing_run(text_group))
-            )
-            index += 1
-            continue
+            heading_match = _ATX_HEADING_RE.match(stripped)
+            if heading_match is not None:
+                level = len(heading_match.group(1))
+                text_group = heading_match.group(2) or ""
+                headings.append(
+                    Heading(line=index, level=level, text=_strip_atx_closing_run(text_group))
+                )
+                index += 1
+                continue
 
         index += 1
 

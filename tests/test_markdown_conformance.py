@@ -4,16 +4,16 @@ deepening plan `docs/superpowers/plans/2026-09-29-architecture-deepening.md`.
 Runs `tests/markdown_conformance_cases.py`'s CommonMark ground-truth table
 against **both** CommonMark-correct scan implementations the plan calls for:
 
-* `charlie_work.markdown_fence.scan` -- the shared scan side, not yet wired
-  into any of the seven hand-rolled consumers `md-recon.md` inventories
-  (that wiring is a later, separate step).
+* `charlie_work.markdown_fence.scan` -- the shared scan side, wired into
+  every one of the seven hand-rolled consumers `md-recon.md` inventories
+  (`md-3-wire-notes.md`).
 * `scripts/heartbeat_check.py`'s own stdlib-only copy, `_scan_markdown_
   structure` -- a deliberate duplicate, not an import, because that script
   is stdlib-only by design (`scripts/README.md:50-51`) and cannot depend on
   `charlie_work`. It exists purely so this same table can characterize it
-  too; `heartbeat_check.py`'s actual `_mentioned_issue_numbers` still uses
-  its old, CommonMark-deviating `_FENCED_CODE_BLOCK_RE` -- wiring that is
-  also a later step (pinned as still-current behaviour by
+  too; `heartbeat_check.py`'s actual `_mentioned_issue_numbers` is wired
+  onto it (via `_strip_fenced_code_blocks`), replacing the old,
+  CommonMark-deviating `_FENCED_CODE_BLOCK_RE` regex (the flip is pinned by
   `tests/test_markdown_structure_characterization.py`'s two
   `test_flip_heartbeat_check_*` tests, which this file does not touch).
 
