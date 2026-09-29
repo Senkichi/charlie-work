@@ -370,8 +370,8 @@ def _defer_probe_failure(
             sweep_events=events,
         )
         state["issues"][str(issue_number)] = entry
-        for kind, payload in events:
-            state = write_gate.append_event(state, kind, payload)
+        for _kind, payload in events:  # defer_or_expire_local_park emits only drift events
+            state = write_gate.append_event(state, "orphaned_worker_drift", payload)
         write_gate.save_state(state)
     return deferred
 
