@@ -153,6 +153,57 @@ _REVIEW_EXEC_ALLOWLIST: tuple[str, ...] = (
 )
 
 
+REVIEW_EXEC_NOTICE_MARKER = "<!-- devin-review-exec-allowlist -->"
+
+
+def render_review_exec_notice() -> str:
+    """Render the reviewer-facing statement of ``_REVIEW_EXEC_ALLOWLIST`` (issue #2024).
+
+    Without it the model's default habit ("run the tests to check") is refused
+    by headless auto mode, and a reviewer that keeps retrying after the
+    rejection can end its session with no verdict. The command list is derived
+    from the constant, never restated, so it cannot drift from what
+    ``_write_review_permissions`` actually pre-approves.
+    """
+    commands = "\n".join(
+        f"- `{rule.removeprefix('Exec(').removesuffix(')')}`" for rule in _REVIEW_EXEC_ALLOWLIST
+    )
+    return (
+        f"\n{REVIEW_EXEC_NOTICE_MARKER}\n"
+        "## Commands you can run\n\n"
+        "This session is read-only. These commands are pre-approved:\n\n"
+        f"{commands}\n\n"
+        "Plain read-only git commands (`git status`, `git diff`, `git log`, "
+        "`git rev-parse`) are usually approved too.\n\n"
+        "Running tests, interpreters (`python`, `node`, `bash`) or package "
+        "managers (`uv`, `pip`, `npm`) will be refused, and retrying after a "
+        "refusal can end the session without a verdict. CI results are already "
+        "in the packet above (see `## CI status`); do not re-run them. Judge "
+        "the change by reading the diff and the code.\n"
+    )
+
+
+def append_review_exec_notice(prompt_path: Path) -> None:
+    """Append the exec notice to a review prompt file, once.
+
+    Never raises (adapters return errors as values): an unwritable prompt
+    degrades to the pre-fix behavior. The marker makes a relaunch of the same
+    packet idempotent; the write is temp-file + ``replace()`` because the
+    devin CLI reads this file.
+    """
+    try:
+        existing = prompt_path.read_text(encoding="utf-8")
+        if REVIEW_EXEC_NOTICE_MARKER in existing:
+            return
+        tmp = prompt_path.with_suffix(prompt_path.suffix + ".tmp")
+        tmp.write_text(
+            existing.rstrip("\n") + "\n" + render_review_exec_notice(), encoding="utf-8"
+        )
+        tmp.replace(prompt_path)
+    except OSError as exc:
+        logger.warning("could not append review exec notice to %s: %s", prompt_path, exc)
+
+
 def _write_review_permissions(checkout_path: Path) -> None:
     """Write the review exec allow-list into the review checkout (issue #2011).
 

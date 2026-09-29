@@ -229,3 +229,59 @@ def test_plain_launch_failure_keeps_failed_heading(tmp_path: Path) -> None:
     outcome = _extract_review_session_summary(tmp_path / "missing.jsonl", log, max_turns=0)
     assert outcome is not None
     assert outcome.text.startswith(REVIEW_SESSION_FAILED_HEADING)
+
+
+def test_review_exec_notice_lists_every_allowlist_command() -> None:
+    """Issue #2024: the reviewer-facing list is derived from the constant."""
+    notice = devin_shell.render_review_exec_notice()
+    for rule in _REVIEW_EXEC_ALLOWLIST:
+        command = rule.removeprefix("Exec(").removesuffix(")")
+        assert f"- `{command}`" in notice
+    assert "CI results are already" in notice
+    assert "refused" in notice
+
+
+def test_append_review_exec_notice_is_idempotent(tmp_path: Path) -> None:
+    prompt = tmp_path / "review-prompt.md"
+    prompt.write_text("# Packet\n", encoding="utf-8")
+    devin_shell.append_review_exec_notice(prompt)
+    once = prompt.read_text(encoding="utf-8")
+    devin_shell.append_review_exec_notice(prompt)
+    assert prompt.read_text(encoding="utf-8") == once
+    assert once.startswith("# Packet\n")
+    assert once.count(devin_shell.REVIEW_EXEC_NOTICE_MARKER) == 1
+
+
+def test_only_devin_shell_review_launcher_appends_notice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from charlie_work import workflow
+
+    seen: list[str] = []
+    monkeypatch.setattr(
+        workflow,
+        "launch_devin_session",
+        lambda *a, **k: seen.append(a[2].read_text(encoding="utf-8")),
+    )
+    prompt = tmp_path / "review-prompt.md"
+    prompt.write_text("# Packet\n", encoding="utf-8")
+    workflow._launch_review_devin_shell(
+        pr_number=1,
+        branch="b",
+        prompt_path=prompt,
+        prompt_text="# Packet\n",
+        head_sha="a" * 40,
+        repo_root=tmp_path,
+        reviews_dir=tmp_path,
+        config=None,
+        worker_env={},
+        materialize_dirs=(),
+        resolved_review_effort=None,
+        max_turns_override=None,
+        model_override=None,
+        api_worker_config=None,
+    )
+    assert devin_shell.REVIEW_EXEC_NOTICE_MARKER in seen[0]
+    # The shared packet template (claude-code path) never carries it.
+    template = Path(workflow.__file__).parent / "prompts" / "review.md"
+    assert devin_shell.REVIEW_EXEC_NOTICE_MARKER not in template.read_text(encoding="utf-8")

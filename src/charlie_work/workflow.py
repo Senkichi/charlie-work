@@ -21,7 +21,7 @@ from .claude_code import (
     run_quota_probe,  # noqa: F401  (deliberate re-export; used by moved L01 b3 delegates via _wf.)
 )
 from .api_worker import launch_api_worker
-from .devin_shell import launch_devin_session
+from .devin_shell import append_review_exec_notice, launch_devin_session
 from .checks import (
     CheckSummary,
     summarize_checks,
@@ -3762,6 +3762,9 @@ def _launch_review_devin_shell(
     # devin_shell has no notion of review-effort/turn-cap resolution (those
     # are claude-code CLI concepts -- --effort and --max-turns flags); a
     # devin-routed reviewer runs with the CLI's own defaults for both.
+    # Issue #2024: tell the reviewer which commands are pre-approved. Only
+    # this launcher does so; claude-code reviewers have plan-mode permissions.
+    append_review_exec_notice(prompt_path)
     return launch_devin_session(
         pr_number,
         branch,
