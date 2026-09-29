@@ -820,7 +820,7 @@ def test_dead_dispatched_worker_non_throttle_kind_still_reaped(tmp_path: Path) -
         None,
         "not-a-timestamp",
     ],
-    ids=["expired_beyond_grace", "unset", "malformed"],
+    ids=["expired", "unset", "malformed"],
 )
 def test_dead_dispatched_worker_provider_throttled_reaped_once_window_inactive(
     tmp_path: Path, throttled_until: str | None
