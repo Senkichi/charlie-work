@@ -3,7 +3,9 @@
 Covers acceptance criteria 1 (module shape + config-driven thresholds), 2
 (the disk-floor refusal path, at the unit level -- including the
 event-write-failure -> stderr fallback), 4 (venv_identity), and 5
-(config_freshness fires exactly once per change).
+(config_freshness fires exactly once per change). The issue #1950
+``git_identity`` check lives in ``test_preflight_git_identity.py`` so this
+module stays under the 800-line file-size cap.
 """
 
 from __future__ import annotations
@@ -19,6 +21,7 @@ import pytest
 from charlie_work.config import PreflightConfig, build_config_from_data
 from charlie_work.instrumentation import _LEVEL_BY_KIND, close_db, query_events
 from charlie_work.preflight import (
+    GitIdentityProbe,
     PreflightCheck,
     PreflightPaths,
     PreflightResult,
@@ -75,6 +78,7 @@ def test_preflight_config_defaults_match_issue_spec() -> None:
     assert cfg.clock_sanity_fatal is False
     assert cfg.venv_identity_fatal is True
     assert cfg.config_freshness_fatal is False
+    assert cfg.git_identity_fatal is True
 
 
 def test_preflight_config_is_frozen() -> None:
@@ -91,6 +95,7 @@ def test_runtime_preflight_section_parses_from_yaml_data() -> None:
                     "disk_floor_gb": 25,
                     "disk_floor_fatal": False,
                     "clock_max_skew_hours": 12.5,
+                    "git_identity_fatal": False,
                 }
             }
         }
@@ -98,6 +103,7 @@ def test_runtime_preflight_section_parses_from_yaml_data() -> None:
     assert config.runtime.preflight.disk_floor_gb == 25
     assert config.runtime.preflight.disk_floor_fatal is False
     assert config.runtime.preflight.clock_max_skew_hours == 12.5
+    assert config.runtime.preflight.git_identity_fatal is False
     # Untouched fields keep their defaults.
     assert config.runtime.preflight.venv_identity_fatal is True
 
@@ -116,7 +122,7 @@ def test_runtime_preflight_section_rejects_bad_type() -> None:
         build_config_from_data({"runtime": {"preflight": {"disk_floor_gb": "ten"}}})
 
 
-def test_run_preflight_runs_all_four_checks_in_order(tmp_path: Path) -> None:
+def test_run_preflight_runs_all_five_checks_in_order(tmp_path: Path) -> None:
     paths = _paths(tmp_path)
     result = run_preflight(
         paths,
@@ -126,12 +132,17 @@ def test_run_preflight_runs_all_four_checks_in_order(tmp_path: Path) -> None:
         stat_fn=lambda p: SimpleNamespace(st_mtime=datetime.now(UTC).timestamp()),
         sys_executable=str(paths.venv_dir / "Scripts" / "python.exe"),
         package_file=str(paths.repo_root / "src" / "charlie_work" / "preflight.py"),
+        # Injected so this ordering test stays hermetic: the default probe
+        # runs real `git config` reads, and _paths' repo_root is deliberately
+        # not a git repo.
+        git_identity_probe=lambda _root: GitIdentityProbe(),
     )
     assert [c.name for c in result.checks] == [
         "disk_floor",
         "clock_sanity",
         "venv_identity",
         "config_freshness",
+        "git_identity",
     ]
     assert result.ok is True
 
@@ -545,4 +556,5 @@ def test_preflight_config_field_names_match_defaults_in_issue() -> None:
         "clock_sanity_fatal",
         "venv_identity_fatal",
         "config_freshness_fatal",
+        "git_identity_fatal",
     }

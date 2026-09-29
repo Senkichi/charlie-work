@@ -377,8 +377,10 @@ def _default_healthy_preflight(monkeypatch: pytest.MonkeyPatch) -> None:
     and ``charlie_work.fleet_dispatch.run_preflight`` respectively -- each module
     imported its own reference, so both must be patched independently) inspects
     the REAL host: free disk space, ``sys.executable``'s location relative to a
-    conventional ``.venv``, ``charlie_work.__file__``'s location, and
-    ``state.json``'s mtime versus wall clock. That is exactly the point of the
+    conventional ``.venv``, ``charlie_work.__file__``'s location,
+    ``state.json``'s mtime versus wall clock, and (issue #1950) the target
+    repo's repo-local git ``user.email``/``user.name`` versus the operator's
+    global identity. That is exactly the point of the
     check in production, but it means every pre-existing test that drives
     ``OrchestratorApp(...).loop()`` or ``run_fleet_supervise(...)`` -- none of
     which exist to test host preconditions -- would otherwise pass or fail
