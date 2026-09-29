@@ -88,7 +88,11 @@ from .janitor import (
 )
 from .diff_coverage_probe import StaticProbeVerdict, run_static_probe
 from .labels import TransitionOutcome, transition
-from .local_work_park import park_or_reclaim_local_orphan
+from .local_work_park import (
+    LocalParkResult,
+    park_backstop_due_local_orphans,
+    park_or_reclaim_local_orphan,
+)
 from .pass_deadline import pass_deadline_spent, pass_deadline_suspended
 from .paths import RuntimePaths, resolved_layout
 from .prompt_sections import section_variant_names
@@ -1799,6 +1803,11 @@ def _detect_and_handle_orphaned_workers(
     # loop (pushed-branch candidates) without re-reading.
     worker_outcomes: dict[int, dict[str, Any] | None] = {}
     issues_by_number: dict[int, dict[str, Any]] = {}  # also used by the live-handoff lane below
+    # Issue #1971: no-PR-backend park verdicts; ``local_park_deferred`` is
+    # the failed/inconclusive subset the in-lock backstop below defers
+    # rather than escalating over possibly-salvageable work.
+    park_verdicts: dict[int, LocalParkResult] = {}
+    local_park_deferred: dict[int, str] = {}
 
     if no_pr_orphans:
         for issue in gh.issue_list(state="open"):
@@ -1949,8 +1958,10 @@ def _detect_and_handle_orphaned_workers(
             # Issue #1923: on a no-PR backend park the dead worker's
             # committed branch for review instead of reclaiming it -- the
             # gate contract lives in park_or_reclaim_local_orphan's
-            # docstring (local_work_park.py).
-            if park_or_reclaim_local_orphan(
+            # docstring (local_work_park.py). A parked or inconclusively
+            # probed verdict means the issue was handled/deferred this
+            # pass; anything else already ran the reclaim inside.
+            park_verdict = park_or_reclaim_local_orphan(
                 gh=gh,
                 config=config,
                 repo_root=repo_root,
@@ -1964,8 +1975,42 @@ def _detect_and_handle_orphaned_workers(
                 worker_outcome=worker_outcome,
                 write_gate=write_gate,
                 reclaim_results=reclaim_results,
-            ):
+            )
+            if park_verdict is not None:
+                park_verdicts[issue_number] = park_verdict
+            if park_verdict is not None and park_verdict.status in ("parked", "probe_failed"):
                 continue
+
+        # Issue #1971: the #654 dead-dispatched backstop inside the lock
+        # below is a pure timer -- it escalates an expired-drift entry
+        # without checking the branch for commits. On a no-PR backend the
+        # branch IS the deliverable, so every backstop-due orphan gets a
+        # salvageable-work park attempt here, pre-lock (the park takes
+        # ``state_lock`` itself). Failed/inconclusive probes land in
+        # ``local_park_deferred`` and defer the escalation one pass.
+        local_park_deferred.update(
+            park_backstop_due_local_orphans(
+                gh=gh,
+                config=config,
+                repo_root=repo_root,
+                worktrees_dir=worktrees_dir,
+                state=state,
+                state_file=state_file,
+                no_pr_orphans=no_pr_orphans,
+                issues_by_number=issues_by_number,
+                worker_outcomes=worker_outcomes,
+                reclaim_results=reclaim_results,
+                escalated={
+                    *worker_declared_blocked_escalations,
+                    *zero_artifact_escalations,
+                    *cross_repo_scope_escalations,
+                },
+                park_verdicts=park_verdicts,
+                dead_dispatched_reap_minutes=config.watchdog.dead_dispatched_reap_minutes,
+                now=now,
+                write_gate=write_gate,
+            )
+        )
 
     # Issue #935: for the no-open-PR orphans, determine whether the worker
     # pushed a branch and reported push-succeeded-but-PR-failed. This is done
@@ -2281,6 +2326,7 @@ def _detect_and_handle_orphaned_workers(
                     dead_dispatched_reap_minutes=(config.watchdog.dead_dispatched_reap_minutes),
                     now=now,
                     sweep_events=sweep_events,
+                    local_park_deferred=local_park_deferred,
                 )
             )
             if dead_dispatched_reaped:

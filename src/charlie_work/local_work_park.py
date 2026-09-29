@@ -25,20 +25,46 @@ delegates in ``orchestration/state_pr_capability_lanes.py`` consult
 from __future__ import annotations
 
 import logging
+from collections.abc import Collection, Iterable, Mapping
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from .config import OrchestratorConfig
-from .github import GitHubError, GitHubLike
+from .dead_dispatched_timer import dead_dispatched_reap_due
+from .github import GitHubError, GitHubLike, label_names
 from .labels import TransitionOutcome
-from .local_lane import branch_diff, local_base_branch
-from .paths import runtime_paths
+from .local_lane import branch_diff, branch_ref_exists, local_base_branch
+from .paths import resolved_layout, runtime_paths
 from .rework_prompts import _write_text_atomic
-from .state import PASSIVE_OPEN_STATUS, load_state, state_lock
-from .worktree import inspect_worktree_state, worktree_path_for_branch
+from .state import PASSIVE_OPEN_STATUS, load_state, load_state_locked, state_lock
+from .worktree import inspect_worktree_state, read_worker_outcome, worktree_path_for_branch
 from .write_gate import WriteGate
 
+if TYPE_CHECKING:
+    from .worker import WorkerView
+
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class LocalParkResult:
+    """Verdict from :func:`park_salvageable_local_orphan`.
+
+    Issue #1971 split "the lane found nothing" into the two answers its
+    callers must not conflate: ``no_commits`` is a *proved* empty verdict
+    (the probe ran and the branch carries no delta, or the branch ref
+    provably does not exist -- callers proceed to reclaim/escalate), while
+    ``probe_failed`` is an *inconclusive* verdict (git probing erred on a
+    branch that may exist -- callers defer and retry next pass rather than
+    discarding possibly-salvageable work). ``parked`` means the issue was
+    parked ``review_ready`` this call; ``park_failed`` means salvageable
+    commits were found but the park write failed and must be retried.
+    """
+
+    status: Literal["parked", "park_failed", "no_commits", "probe_failed"]
+    error: str | None = None
 
 
 def publishes_pull_requests(gh: GitHubLike) -> bool:
@@ -186,7 +212,7 @@ def park_salvageable_local_orphan(
     state_file: Path,
     worker_outcome: dict[str, Any] | None,
     write_gate: WriteGate,
-) -> tuple[bool, str | None] | None:
+) -> LocalParkResult | None:
     """Issue #1923: park a no-PR-backend orphan's committed branch for review.
 
     On a ``local_issues`` backend the worker's branch IS the deliverable --
@@ -203,30 +229,29 @@ def park_salvageable_local_orphan(
     ``dispatched`` in one step regardless of which lane found it.
 
     Returns ``None`` when this lane does not apply and the caller must
-    proceed to its normal reclaim:
+    proceed to its normal handling:
 
     * a PR-capable backend -- committed-but-unpushed recovery there is
       ``salvage_push_stranded_commits`` + ``_open_pr_for_orphaned_branch``,
       unchanged;
     * no resolvable ``repo_root`` -- the worktree cannot be inspected and
-      the park itself needs it;
-    * no provably salvageable commits -- ``inspect_worktree_state`` reports
-      ahead_count 0, including UNKNOWN (missing worktree dir or a failed
-      git probe): uncertainty is never proof of work, and the redispatch
-      dying ``worktree_unsafe`` on real commits is the loud outcome.
+      the park itself needs it.
+
+    Otherwise returns a :class:`LocalParkResult` -- ``parked`` when the issue
+    was handled this call (parked, or the salvage skip fired because the
+    work already landed), ``park_failed`` when salvageable commits were
+    found but the park write failed, ``no_commits`` when the probe *proved*
+    nothing salvageable exists, and ``probe_failed`` (issue #1971) when the
+    probe was inconclusive. The two empty-verdict statuses differ in what
+    the caller may do next: ``no_commits`` permits reclaim/escalation,
+    ``probe_failed`` must defer it -- a transient git failure can never be
+    the reason committed work is discarded.
 
     The worktree-missing case still probes the branch ref directly: on a
     no-remote repo the branch is the deliverable, so a reclaimed worktree
     must not strand committed work that still exists in the main checkout.
     The fallback measures a content delta (``branch_diff`` against the
     local base), not a bare commit count.
-
-    Returns ``(True, None)`` when the issue was handled -- parked, or the
-    salvage skip fired because the work already landed -- and the caller
-    must ``continue`` without reclaiming. Returns ``(False, error)`` when
-    the park itself failed; the caller falls through to the normal reclaim
-    so the failure stays loud (redispatch cap / dead-dispatched backstop),
-    matching the sibling lane's salvage-failure contract.
     """
     # Deferred: workflow.py imports this module for the sweep call site, so
     # a top-level ``import charlie_work.workflow`` would cycle. Attribute
@@ -264,14 +289,28 @@ def park_salvageable_local_orphan(
         # Branch-ref fallback: the worktree is gone (reclaimed) or
         # uninspectable while the branch still carries the worker's
         # commits. A non-empty diff against the local base means real work
-        # is salvageable; a None diff (missing ref / probe failure) reads
-        # as no work and falls through to the caller's reclaim.
+        # is salvageable. ``branch_diff`` returns None for ANY git error,
+        # though -- including a missing branch ref (a determinate "no work"
+        # answer) and transient failures alike -- so on None disambiguate
+        # with the ref probe: a provably absent ref is ``no_commits``,
+        # anything else is ``probe_failed`` (issue #1971: an inconclusive
+        # probe must defer the reap, never read as no-work).
         base_branch = resolved_base_ref or local_base_branch(repo_root) or "HEAD"
-        if branch_diff(repo_root, base_branch, branch):
+        diff = branch_diff(repo_root, base_branch, branch)
+        if diff is None:
+            ref_state = branch_ref_exists(repo_root, branch)
+            if ref_state is False:
+                return LocalParkResult("no_commits")
+            return LocalParkResult(
+                "probe_failed",
+                f"git diff {base_branch}...{branch} failed "
+                f"(branch ref {'exists' if ref_state else 'unverifiable'})",
+            )
+        if diff:
             ahead_count = 1
             resolved_base_ref = base_branch
     if ahead_count <= 0:
-        return None
+        return LocalParkResult("no_commits")
 
     salvaged, salvage_error = _wf._attempt_salvage(
         gh=gh,
@@ -290,7 +329,9 @@ def park_salvageable_local_orphan(
         worker_outcome=worker_outcome,
         write_gate=write_gate,
     )
-    return salvaged, salvage_error
+    if salvaged:
+        return LocalParkResult("parked")
+    return LocalParkResult("park_failed", salvage_error)
 
 
 def park_or_reclaim_local_orphan(
@@ -308,19 +349,29 @@ def park_or_reclaim_local_orphan(
     worker_outcome: dict[str, Any] | None,
     write_gate: WriteGate,
     reclaim_results: dict[int, dict[str, Any]],
-) -> bool:
+) -> LocalParkResult | None:
     """Issue #1923: the no-open-PR sweep tail -- park salvageable work, else reclaim.
 
     Runs :func:`park_salvageable_local_orphan` (whose docstring carries the
-    full gate contract). Returns ``True`` when the issue was parked -- the
-    caller ``continue``s without reclaiming. On any other outcome -- a
-    PR-capable backend, no salvageable commits, or a failed park -- the
-    sweep's normal reclaim runs here instead: strip the active labels,
-    re-add ``ready``, record the outcome in ``reclaim_results``. A failed
-    park additionally stamps ``salvage_failed``/``salvage_error`` onto the
-    recorded reclaim so the ``session_failed_relabeled`` event carries *why*
-    an issue with committed work fell through -- the loud outcome, matching
-    the sibling lane's salvage-failure contract.
+    full gate contract) and returns its verdict so the caller can record it
+    -- the ``dead_dispatched_reap_minutes`` backstop consults the same
+    verdicts to decide whether a timed escalation may proceed (issue #1971).
+
+    A ``parked`` or ``probe_failed`` verdict means the caller ``continue``s
+    without reclaiming: ``parked`` because the work is safely held on the
+    branch, ``probe_failed`` because the probe could not disprove committed
+    work -- reclaiming (strip active, re-add ``ready``, redispatch) on a
+    transient git failure is exactly the discard path issue #1971 removes;
+    the active label stays in place and the probe retries next pass.
+
+    On any other outcome -- a PR-capable backend, a proven ``no_commits``
+    verdict, or a failed park -- the sweep's normal reclaim runs here
+    instead: strip the active labels, re-add ``ready``, record the outcome
+    in ``reclaim_results``. A failed park additionally stamps
+    ``salvage_failed``/``salvage_error`` onto the recorded reclaim so the
+    ``session_failed_relabeled`` event carries *why* an issue with
+    committed work fell through -- the loud outcome, matching the sibling
+    lane's salvage-failure contract.
 
     Lives here rather than inline in ``_detect_and_handle_orphaned_workers``
     because ``workflow.py`` sits over its file-size ratchet mark -- the same
@@ -340,8 +391,8 @@ def park_or_reclaim_local_orphan(
         worker_outcome=worker_outcome,
         write_gate=write_gate,
     )
-    if park_result is not None and park_result[0]:
-        return True
+    if park_result is not None and park_result.status in ("parked", "probe_failed"):
+        return park_result
 
     needs_ready = config.labels.ready not in issue_labels
     label_write_ok = True
@@ -356,10 +407,186 @@ def park_or_reclaim_local_orphan(
         "added_ready": needs_ready,
         "label_write_ok": label_write_ok,
     }
-    if park_result is not None:
+    if park_result is not None and park_result.status == "park_failed":
         # Issue #1923: carry the park failure onto the relabel event so the
         # event stream shows this issue had salvageable commits that could
         # not be parked.
         reclaim_results[issue_number]["salvage_failed"] = True
-        reclaim_results[issue_number]["salvage_error"] = park_result[1]
-    return False
+        reclaim_results[issue_number]["salvage_error"] = park_result.error
+    return park_result
+
+
+def park_backstop_due_local_orphans(
+    *,
+    gh: GitHubLike,
+    config: OrchestratorConfig,
+    repo_root: Any,
+    worktrees_dir: Path | None,
+    state: dict[str, Any],
+    state_file: Path,
+    no_pr_orphans: Iterable[int],
+    issues_by_number: Mapping[int, dict[str, Any]],
+    worker_outcomes: Mapping[int, dict[str, Any] | None],
+    reclaim_results: Mapping[int, dict[str, Any]],
+    escalated: Collection[int],
+    park_verdicts: Mapping[int, "LocalParkResult"],
+    dead_dispatched_reap_minutes: float,
+    now: datetime,
+    write_gate: WriteGate,
+) -> dict[int, str]:
+    """Issue #1971: park-probe the no-PR orphans the timed backstop is due to reap.
+
+    ``orphaned_worker_sweep.maybe_reap_dead_dispatched_worker`` is a pure
+    timer running inside the sweep's ``state_lock``: a dead issue whose
+    ``orphan_drift_at`` expired escalates without checking whether the
+    worker's branch carries commits. The reclaim loop
+    (:func:`park_or_reclaim_local_orphan`) already park-probes every orphan
+    that still carries an ACTIVE label, but it skips labelless and
+    terminal-only issues -- exactly the stale ``dispatched`` entries the
+    backstop escalates. On a no-PR backend the branch IS the deliverable,
+    so every backstop-due orphan the earlier lanes did not handle gets the
+    same :func:`park_salvageable_local_orphan` attempt here, BEFORE the
+    lock: the park takes ``state_lock`` and does git/label I/O, so it can
+    never run inside the locked classification.
+
+    Skipped (the backstop keeps its existing semantics for each):
+
+    * issues already handled this pass -- a recorded park verdict
+      (``park_verdicts``), a completed reclaim (``reclaim_results``), or a
+      same-pass escalation (``escalated``: worker-blocked, zero-artifact,
+      or cross-repo -- each already stripped the active labels and applied
+      ``human_needed``, which a park's ``local_work_ready`` edge would
+      otherwise silently strip);
+    * issues carrying a ``config.labels.terminal`` label -- ``done``,
+      ``human_needed``, ``operator_queue``, ``review_ready`` are answers
+      another lane already gave, and parking would strip them;
+    * entries the timer predicate does not mark due.
+
+    Returns ``{issue_number: reason}`` for every issue whose park attempt
+    failed (``park_failed``) or whose branch probe was inconclusive
+    (``probe_failed``) -- the in-lock backstop consults the map and defers
+    the escalation one pass rather than discarding possibly-salvageable
+    work. A ``parked`` verdict flips the state entry off ``dispatched`` so
+    the backstop's status re-verify skips it; a ``no_commits`` verdict (or
+    a defensive ``None``) falls through and the backstop escalates exactly
+    as it does today.
+
+    No-ops (returns empty) on a PR-capable backend or a missing
+    ``repo_root`` -- committed-but-unpushed recovery there is
+    ``salvage_push_stranded_commits`` + ``_open_pr_for_orphaned_branch``,
+    unchanged.
+    """
+    if not isinstance(repo_root, Path) or publishes_pull_requests(gh):
+        return {}
+    deferred: dict[int, str] = {}
+    for issue_number in no_pr_orphans:
+        prior_verdict = park_verdicts.get(issue_number)
+        if prior_verdict is not None:
+            if prior_verdict.status in ("park_failed", "probe_failed"):
+                deferred[issue_number] = prior_verdict.error or prior_verdict.status
+            continue
+        if issue_number in reclaim_results or issue_number in escalated:
+            continue
+        issue = issues_by_number.get(issue_number)
+        if issue is None:
+            continue
+        issue_labels = label_names(issue)
+        if issue_labels & config.labels.terminal:
+            continue
+        entry = (state.get("issues") or {}).get(str(issue_number))
+        if not isinstance(entry, dict) or not dead_dispatched_reap_due(
+            state=state,
+            entry=entry,
+            dead_dispatched_reap_minutes=dead_dispatched_reap_minutes,
+            now=now,
+        ):
+            continue
+        park_result = park_salvageable_local_orphan(
+            gh=gh,
+            config=config,
+            repo_root=repo_root,
+            worktrees_dir=worktrees_dir,
+            state=state,
+            issue_number=issue_number,
+            issue=issue,
+            active_labels=issue_labels & config.labels.active,
+            issue_labels=issue_labels,
+            state_file=state_file,
+            worker_outcome=worker_outcomes.get(issue_number),
+            write_gate=write_gate,
+        )
+        if park_result is not None and park_result.status in (
+            "park_failed",
+            "probe_failed",
+        ):
+            deferred[issue_number] = park_result.error or park_result.status
+    return deferred
+
+
+def park_labelless_dead_local_session(
+    *,
+    gh: GitHubLike,
+    config: OrchestratorConfig,
+    repo_root: Any,
+    issue_labels: set[str],
+    worker: WorkerView,
+    write_gate: WriteGate,
+) -> bool:
+    """Issue #1971: park a dead session whose active label is already gone.
+
+    The dead-session reap's ``if not active_labels: continue`` gate is right
+    on a PR-capable backend -- an issue carrying only terminal labels has
+    nothing to reclaim -- but on a no-PR backend it discards real work: a
+    session whose active label is already gone while its state entry still
+    reads ``dispatched`` and its branch still carries commits is picked up
+    later by the ``dead_dispatched_reap_minutes`` backstop and escalated,
+    the branch never offered for review. When the state entry is still
+    ``dispatched`` this runs the same :func:`park_salvageable_local_orphan`
+    probe the state-keyed sweep uses: park salvageable work, leave a proved
+    no-commits verdict alone, and let an inconclusive probe defer to a
+    later pass.
+
+    ``worker.branch`` -- the session sidecar's recorded branch -- backfills a
+    missing ``branch_name`` on the state entry (the state-keyed sweep can
+    only synthesize ``{prefix}-{n}-{slug}``, which misses pre-slug or
+    renamed branches). ``worker.worktree_path`` gates the
+    ``.worker-outcome.json`` read on being a real directory so a
+    missing/empty path never probes the caller's cwd (cw#1771/#660).
+    Returns True when the issue was parked this call.
+    """
+    if not isinstance(repo_root, Path) or publishes_pull_requests(gh):
+        return False
+    if issue_labels & config.labels.terminal:
+        # A terminal label (done / human-needed / operator-queue /
+        # review-ready) is already an answer some lane gave; the park's
+        # ``local_work_ready`` edge would strip it.
+        return False
+    issue_number = worker.issue_number
+    state_file = write_gate.state_path
+    entry = (load_state_locked(state_file).get("issues") or {}).get(str(issue_number))
+    if not isinstance(entry, dict) or entry.get("status") != "dispatched":
+        return False
+    if worker.branch and not entry.get("branch_name"):
+        entry = {**entry, "branch_name": worker.branch}
+    # Path("")/Path(".") name themselves "" -- an empty sidecar
+    # worktree_path must not resolve the outcome probe to cwd.
+    worktree_path = Path(worker.worktree_path or "")
+    result = park_salvageable_local_orphan(
+        gh=gh,
+        config=config,
+        repo_root=repo_root,
+        worktrees_dir=resolved_layout(config, repo_root).worktrees,
+        state={"issues": {str(issue_number): entry}},
+        issue_number=issue_number,
+        issue={},
+        active_labels=set(),
+        issue_labels=issue_labels,
+        state_file=state_file,
+        worker_outcome=(
+            read_worker_outcome(worktree_path)
+            if worktree_path.name and worktree_path.is_dir()
+            else None
+        ),
+        write_gate=write_gate,
+    )
+    return result is not None and result.status == "parked"

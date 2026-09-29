@@ -31,11 +31,12 @@ other free name is imported directly from its defining module.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from .dead_dispatched_timer import dead_dispatched_reap_due
 from .dispatch_selection import _credit_worker_death
 from .orphaned_worker_review_drain import OrphanedWorkerReviewRoute
 from .process_utils import find_worker_terminal_status
@@ -63,6 +64,7 @@ def maybe_reap_dead_dispatched_worker(
     dead_dispatched_reap_minutes: float,
     now: datetime,
     sweep_events: list[tuple[str, dict[str, Any]]],
+    local_park_deferred: Mapping[int, str] | None = None,
 ) -> tuple[dict[str, Any], bool]:
     """Timed dead-dispatched backstop (issue #654), run per dead-PID entry.
 
@@ -108,6 +110,17 @@ def maybe_reap_dead_dispatched_worker(
     would reintroduce exactly the wedge this backstop fixes. An expired
     or unparseable window fails closed to the normal reap timer.
 
+    Issue #1971: on a no-PR backend the escalation additionally consults
+    ``local_park_deferred`` -- the per-issue outcomes of the salvageable-work
+    park the sweep ran for every backstop-due orphan BEFORE this lock (the
+    park takes ``state_lock`` itself, so it can never run inside). A failed
+    or inconclusive park/probe lands in the map and is DEFERRED -- the
+    escalation runs only when the park lane proved there is nothing to
+    salvage. ``orphan_drift_at`` stays armed so the next pass re-probes, and
+    the deferral surfaces once per distinct reason through the same
+    fingerprinted ``orphaned_worker_drift`` audit shape the drift branches
+    use.
+
     Returns the (possibly replaced) ``state`` mapping -- the escalation
     helpers rebuild it -- and ``True`` when the entry was escalated, so the
     caller appends to ``reap_escalations`` and moves to the next issue.
@@ -119,14 +132,33 @@ def maybe_reap_dead_dispatched_worker(
     import charlie_work.workflow as _wf
 
     orphan_drift_at = entry.get("orphan_drift_at")
-    if orphan_drift_at is None or dead_dispatched_reap_minutes <= 0:
+    if not dead_dispatched_reap_due(
+        state=state,
+        entry=entry,
+        dead_dispatched_reap_minutes=dead_dispatched_reap_minutes,
+        now=now,
+    ):
         return state, False
-    if is_provider_throttle_failure(entry.get("dead_worker_failure_kind")):
-        throttled_until_dt = _wf._parse_iso_timestamp(state.get("throttled_until"))
-        if throttled_until_dt is not None and throttled_until_dt > now:
-            return state, False
-    drift_dt = _wf._parse_iso_timestamp(orphan_drift_at)
-    if drift_dt is None or (now - drift_dt).total_seconds() / 60 < dead_dispatched_reap_minutes:
+    park_deferral = (local_park_deferred or {}).get(issue_number)
+    if park_deferral is not None:
+        # See the docstring: a failed or inconclusive park/probe must not
+        # escalate -- the branch may still carry the worker's commits. The
+        # event fires once per distinct reason via the drift fingerprint.
+        fingerprint = f"local_park_reap_deferred:{park_deferral}"
+        if entry.get("orphan_drift_fingerprint") != fingerprint:
+            entry["orphan_drift_fingerprint"] = fingerprint
+            sweep_events.append(
+                (
+                    "orphaned_worker_drift",
+                    {
+                        "issue_number": issue_number,
+                        "previous_status": "dispatched",
+                        "reason": "dead_dispatched_local_park_deferred",
+                        "detail": park_deferral,
+                        "orphan_drift_at": orphan_drift_at,
+                    },
+                )
+            )
         return state, False
     pr_number = int(pr_data["number"]) if pr_data else None
     terminal = find_worker_terminal_status(sessions_dir, issue_number)

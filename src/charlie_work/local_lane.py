@@ -76,6 +76,27 @@ def branch_head_sha(repo_root: Path, branch: str) -> str | None:
     return sha or None
 
 
+def branch_ref_exists(repo_root: Path, branch: str) -> bool | None:
+    """Whether ``refs/heads/<branch>`` resolves -- a tri-state probe.
+
+    ``git show-ref --verify --quiet`` exits 0 when the ref resolves and 1 when
+    it does not (a determinate "no branch" answer -- there is nothing
+    committed under that name to salvage). ``None`` means the probe itself
+    failed -- spawn error, timeout, or a git-level error (exit >= 2/128) --
+    so existence is inconclusive. A caller distinguishing "no work" from
+    "could not tell" needs the third state; ``branch_head_sha``'s flat
+    ``None`` conflates absent-with-failed (issue #1971).
+    """
+    result = run_captured(
+        ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
+        cwd=repo_root,
+        timeout_seconds=GIT_OP_TIMEOUT_SECONDS,
+    )
+    if result.returncode is None or result.returncode not in (0, 1):
+        return None
+    return result.returncode == 0
+
+
 def local_base_branch(repo_root: Path) -> str | None:
     """The branch the main worktree currently has checked out, or None detached.
 
