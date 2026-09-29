@@ -4,3 +4,8 @@
 # validation entries). Dataclass fields cannot be extracted into a domain
 # module -- the reviewed-exception path applies. Raised to the next
 # MARK_QUANTUM multiple per the ratchet's hand-raise rule.
+# Issue #1944: +18 lines for the dispatch.archive_unreachable_local_commits
+# knob (frozen-dataclass field + inline bool validation in
+# build_config_from_data). A config field cannot be extracted into a domain
+# module, so this is a deliberate reviewed mark raise to the next
+# MARK_QUANTUM multiple above the live count (4218 -> 4400).
