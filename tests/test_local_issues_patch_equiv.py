@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -282,3 +283,37 @@ def test_orchestrator_drain_emits_nothing_for_unmerged_blocker(
     assert (
         query_events(paths.state_file, kind="local_blocker_satisfied_by_patch_equivalence") == []
     )
+
+
+def test_loop_body_pass_emits_patch_equiv_event_end_to_end(
+    local_repo: tuple[Path, Path],
+) -> None:
+    """Loop-level regression for the ``reap_loop._loop_body`` call site.
+
+    A full pass over a ``LocalFileGitHub`` whose closed blocker was landed
+    by cherry-pick must emit ``local_blocker_satisfied_by_patch_equivalence``.
+    The test never calls ``are_issues_open`` or the drain itself: the
+    collection is driven by the pass -- intake's open-issue blocker-cycle
+    scan resolves issue #2's ``Blocked by #1`` through
+    ``are_issues_open([1])`` -- so the event can only appear when
+    ``_loop_body``'s own ``self._drain_local_blocker_patch_equiv()`` line
+    runs after the dispatch/local lanes. Deleting that call fails this
+    test; every earlier test in this module still passes without it.
+    ``limit=0``/``merge=False`` keep the pass read-only on the dispatch
+    and merge fronts (drain shape); the PR-scan and cadence lanes all
+    no-op on a non-publishing backend with empty state.
+    """
+    repo_root, issues_dir = local_repo
+    _commit_on_branch(repo_root, "agent/issue-1-add-helper", "helper.py")
+    _advance_main(repo_root)
+    _git(repo_root, "cherry-pick", "agent/issue-1-add-helper")
+    gh = LocalFileGitHub(repo_root=repo_root, issues_dir=issues_dir)
+    config = OrchestratorConfig()
+    paths = runtime_paths(repo_root, config.runtime.state_dir)
+    app = OrchestratorApp(repo_root, paths, config, gh)
+
+    result = app._loop_body(limit=0, merge=False, now=datetime.now(UTC))
+
+    assert result.ok, result.message
+    events = query_events(paths.state_file, kind="local_blocker_satisfied_by_patch_equivalence")
+    assert [event["payload"]["issue_number"] for event in events] == [1]
