@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import charlie_work.workflow as _wf
 from typing import Any
+from charlie_work.no_op_rework_body import _request_changes_body_drifted
 from charlie_work.state import StateLockBusy
 
 
@@ -39,6 +40,11 @@ def review_queue(self) -> _wf.CommandResult:
     - The recorded decision is a stale ``request_changes``/``blocked``/
       ``approved`` verdict whose patch-id genuinely differs from the live
       head and the packet head is still current.
+    - The recorded decision is a ``request_changes`` verdict whose PR body
+      drifted from its ``reviewed_body_sha256`` baseline (issue #1983): a
+      body-only rework satisfies body-scoped findings without a code delta,
+      so the verdict is superseded by a fresh review instead of carrying
+      forward on a content-identical head or re-routing to rework.
 
     A PR is NOT queued, but has a side-effecting repair applied instead,
     when the recorded decision is an actionable (non-content-free),
@@ -97,6 +103,16 @@ def review_queue(self) -> _wf.CommandResult:
         decision = self._review_decision(pr_number)
         decision_value = decision.get("decision")
         reviewed_head_sha = decision.get("reviewed_head_sha")
+        # Issue #1983: a request_changes verdict whose required fixes live in
+        # the PR body is superseded once the live body differs from the
+        # verdict's reviewed_body_sha256 baseline -- a body-only rework
+        # produces no code delta, so neither the patch-id/line-content
+        # carry-forward nor the stranded-verdict reroute below can see it.
+        # Drift queues a fresh review (never auto-approves) in both the
+        # same-head and moved-head branches; approved verdicts are
+        # unaffected, and a missing baseline fails closed to pre-#1983
+        # behavior.
+        body_drifted = _request_changes_body_drifted(decision, pr)
 
         if decision_value in ("approved", "request_changes", "blocked"):
             if reviewed_head_sha == live_head_sha:
@@ -124,6 +140,35 @@ def review_queue(self) -> _wf.CommandResult:
                             reviewed_head_sha,
                             live_head_sha,
                             decision.get("required_changes"),
+                        )
+                        queue.append(
+                            {
+                                "pr": pr_number,
+                                "issue": issue_number,
+                                "packet_head_sha": packet_head_sha,
+                                "decision": "stale",
+                                "reviewed_head_sha": reviewed_head_sha,
+                                "mergeable": pr.get("mergeable"),
+                                "mergeStateStatus": pr.get("mergeStateStatus"),
+                            }
+                        )
+                    continue
+                if body_drifted:
+                    # Issue #1983 (same-head variant): a body-only rework
+                    # leaves the head unchanged, so the verdict still reads
+                    # "reviewed at live head" -- but the body it was recorded
+                    # against has drifted, meaning its body-scoped findings
+                    # may already be fixed. Firing the stranded-verdict
+                    # reroute below is exactly the rework loop the issue
+                    # reports (the job-cannon #2201 incident), so queue a
+                    # FRESH review instead -- same contract as the #1111
+                    # stale-CI branch above: superseded by a new recorded
+                    # verdict, never auto-approved.
+                    if packet_head_sha == live_head_sha and self._packet_template_current(
+                        pr_number
+                    ):
+                        self._emit_request_changes_body_changed_requeued(
+                            pr_number, issue_number, decision, pr
                         )
                         queue.append(
                             {
@@ -176,6 +221,19 @@ def review_queue(self) -> _wf.CommandResult:
                     reviewed_head_sha,
                     live_head_sha,
                     decision.get("required_changes"),
+                )
+            elif check.carry_forward and body_drifted:
+                # Issue #1983: the diff content is unchanged (carry-forward
+                # matched), but the PR body the verdict was recorded against
+                # drifted -- a body-only rework can satisfy the verdict's
+                # body-scoped findings without any code delta. Re-pinning
+                # the request_changes verdict here re-drives rework on an
+                # already-fixed body and loops until the redispatch cap
+                # escalates the issue, so skip the carry-forward and fall
+                # through to the stale-queue path below: a fresh review
+                # supersedes the verdict (never auto-approved).
+                self._emit_request_changes_body_changed_requeued(
+                    pr_number, issue_number, decision, pr
                 )
             elif check.carry_forward:
                 # In dry-run mode we still run the content check so the queue

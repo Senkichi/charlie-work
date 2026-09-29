@@ -631,3 +631,56 @@ def _emit_stale_ci_verdict_requeued(
             },
         )
         _wf.save_state(self.paths.state_file, state)
+
+
+def _emit_request_changes_body_changed_requeued(
+    self,
+    pr_number: int,
+    issue_number: int | None,
+    decision: dict[str, Any],
+    pr: dict[str, Any],
+) -> None:
+    """Emit ``request_changes_body_changed_requeued`` once per head+body drift.
+
+    Issue #1983: a ``request_changes`` verdict whose only findings live in
+    the PR body is superseded the moment the live body differs from the
+    verdict's ``reviewed_body_sha256`` baseline -- ``review_queue()`` queues
+    a fresh review (never auto-approves) instead of carrying the verdict
+    forward or re-routing it to rework. This event is the audit trail for
+    that supersession.
+
+    Dedup mirrors ``_emit_stale_ci_verdict_requeued`` (issue #1120:
+    ``review_queue()`` can run multiple times per loop pass), keyed on a
+    ``request_changes_body_changed_requeued_key`` stored in the PR state
+    entry -- ``"<live_head_sha>:<live_body_sha256>"`` rather than the head
+    alone, so a *further* body edit at the same head is still a new drift
+    worth recording.
+    """
+    if self.dry_run:
+        return
+    live_head_sha = pr.get("headRefOid")
+    live_body_sha256 = _wf._body_content_sha256(pr.get("body"))
+    requeue_key = f"{live_head_sha}:{live_body_sha256}"
+    with _wf.state_lock(self.paths.state_file):
+        state = _wf.load_state(self.paths.state_file)
+        existing_pr_state = state["prs"].get(str(pr_number), {})
+        if existing_pr_state.get("request_changes_body_changed_requeued_key") == requeue_key:
+            return
+        state["prs"][str(pr_number)] = {
+            **existing_pr_state,
+            "request_changes_body_changed_requeued_key": requeue_key,
+        }
+        state = self._record_event(
+            state,
+            "request_changes_body_changed_requeued",
+            {
+                "pr_number": pr_number,
+                "issue_number": issue_number,
+                "reviewed_head_sha": decision.get("reviewed_head_sha"),
+                "live_head_sha": live_head_sha,
+                "reviewed_body_sha256": decision.get("reviewed_body_sha256"),
+                "live_body_sha256": live_body_sha256,
+                "required_changes": list(decision.get("required_changes") or []),
+            },
+        )
+        _wf.save_state(self.paths.state_file, state)
