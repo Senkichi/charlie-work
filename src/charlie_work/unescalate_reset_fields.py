@@ -53,6 +53,13 @@ UNESCALATE_PR_RESET_FIELDS = (
     # derives the required companions from that map).
     "conflict_rework_attempts_stall_since",
     "conflict_rework_attempts_stall_head",
+    # Issue #1972: the local merge gate's per-kind rework counters and the
+    # last-failure-kind marker (``local_merge_rework._local_route_merge_rework``).
+    # A re-arm that left them behind would re-escalate on the next gate
+    # failure without a single fresh rework attempt.
+    "local_merge_conflict_rework_attempts",
+    "local_suite_failed_rework_attempts",
+    "local_merge_rework_reason",
     "no_op_rework_attempts",
     "no_op_rework_attempts_last_head",
     "no_op_rework_attempts_stall_since",
@@ -267,6 +274,16 @@ REWORK_BUDGET_RESET_BY_ESCALATION_REASON: dict[str, tuple[tuple[str, ...], tuple
             "conflict_rework_attempts_stall_since",
             "conflict_rework_attempts_stall_head",
         ),
+    ),
+    # Issue #1972: the local merge gate escalates both its failure kinds under
+    # one reason, so the clear re-arms BOTH counters (either kind re-tripping
+    # alone re-escalates otherwise) and drops the last-failure-kind marker.
+    "local_merge_rework_cap_exceeded": (
+        (
+            "local_merge_conflict_rework_attempts",
+            "local_suite_failed_rework_attempts",
+        ),
+        ("local_merge_rework_reason",),
     ),
     # Issue #1683: the review-dispatch lanes were missing from this map
     # entirely, so every automated clear of either reason was inert -- the

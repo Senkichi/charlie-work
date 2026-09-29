@@ -1,0 +1,7 @@
+error
+# Issue #1972: a local merge-gate rework loop reached its per-kind attempt
+# cap (``local_merge_conflict_rework_attempts`` vs
+# ``review.max_conflict_rework_attempts``, or
+# ``local_suite_failed_rework_attempts`` vs ``review.max_rework_cycles``) and
+# escalated to the operator queue with ``local_merge_rework_cap_exceeded``
+# instead of routing another unbounded rework.
