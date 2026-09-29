@@ -254,3 +254,67 @@ def test_check_armable_backlog_mutation_arming_issue_clears_anomaly(
     assert not report_after.anomaly
     assert "genuinely empty" in report_after.lines[0]
     assert "armable=0" in report_after.lines[0]
+
+
+# ---------------------------------------------------------------------------
+# Issue #2004: dependency-blocked and sweep-armed issues are not un-triaged
+# ---------------------------------------------------------------------------
+
+
+def _issue_with_body(number: int, body: str, labels: tuple[str, ...] = ()) -> dict[str, Any]:
+    return {**_issue(number, labels), "body": body}
+
+
+def test_check_armable_backlog_body_blocked_by_open_issue_is_not_armable(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    """An unlabelled issue whose body reads ``Blocked by #N`` (N open) is gated."""
+    repo = _make_repo(hb, tmp_path)
+    issues = [
+        _issue_with_body(10, "Some work.\n\nBlocked by #11"),
+        _issue_with_body(11, "The blocker itself.", ("needs-design",)),
+    ]
+    _gh_dispatch(monkeypatch, hb, lambda args, cwd: (True, issues, ""))
+    report = hb.Report()
+    hb.check_armable_backlog(report, repo, blocked_numbers=set(), blocked_err="")
+    assert not report.anomaly
+    assert "armable=0" in report.lines[0]
+    assert "gated=2" in report.lines[0]
+
+
+def test_check_armable_backlog_body_blocker_closed_stays_armable(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    """A blocker absent from the open list (closed) no longer gates the issue."""
+    repo = _make_repo(hb, tmp_path)
+    issues = [_issue_with_body(10, "Blocked by #999")]
+    _gh_dispatch(monkeypatch, hb, lambda args, cwd: (True, issues, ""))
+    report = hb.Report()
+    hb.check_armable_backlog(report, repo, blocked_numbers=set(), blocked_err="")
+    assert report.anomaly
+    assert "[10]" in report.lines[0]
+
+
+def test_check_armable_backlog_unarmed_sweep_armed_issue_is_not_armable(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    """A ``sweep-armed`` issue not yet ``automated-ready`` is not a missed arm."""
+    repo = _make_repo(hb, tmp_path)
+    issues = [_issue_with_body(20, "Do not label by hand.", (hb.SWEEP_ARMED_LABEL,))]
+    _gh_dispatch(monkeypatch, hb, lambda args, cwd: (True, issues, ""))
+    report = hb.Report()
+    hb.check_armable_backlog(report, repo, blocked_numbers=set(), blocked_err="")
+    assert not report.anomaly
+    assert "armable=0" in report.lines[0]
+
+
+def test_check_armable_backlog_armed_sweep_issue_counts_as_runway(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    """Once the sweep arms it, the marker must not hide it from the runway."""
+    repo = _make_repo(hb, tmp_path)
+    issues = [_issue_with_body(20, "", (hb.SWEEP_ARMED_LABEL, "automated-ready"))]
+    _gh_dispatch(monkeypatch, hb, lambda args, cwd: (True, issues, ""))
+    report = hb.Report()
+    hb.check_armable_backlog(report, repo, blocked_numbers=set(), blocked_err="")
+    assert "runway=1" in report.lines[0]

@@ -122,6 +122,12 @@ ARMED_LABEL = "automated-ready"
 ARMABLE_GATING_LABELS: frozenset[str] = frozenset(
     {"blocked", "needs-design", "human-action", "question", "wontfix", "duplicate", "invalid"}
 )
+# Issue #2004: marker for issues a fleet sweep (e.g. the deprecated-config-key
+# retirement sweep) will arm itself. It gates only while the issue is NOT yet
+# `automated-ready`; once the sweep arms it, the issue is runway like any other,
+# so this is deliberately kept out of ARMABLE_GATING_LABELS (which gate
+# unconditionally, even over `automated-ready`).
+SWEEP_ARMED_LABEL = "sweep-armed"
 ARMABLE_PREVIEW_LIMIT = 8
 REVIEW_CLAIM_STALE_MINUTES = 45
 LOG_FRESHNESS_STALE_MINUTES = 30
@@ -245,6 +251,14 @@ try:
 except ImportError:
     _ndc = None
     _ndh = None
+
+# Issue #2004: the armable pool's dependency gate reuses the orchestrator's own
+# body parser (single point of enforcement) behind the same guarded import; when
+# it is unavailable the body gate degrades to a no-op and the caveat says so.
+try:
+    from charlie_work.github_body_scan import parse_blockers as _parse_blockers
+except ImportError:
+    _parse_blockers = None
 NOTIFY_DIGEST_STALE_HOURS = _ndc.NOTIFY_DIGEST_STALE_HOURS if _ndc else 72
 NOTIFY_RESOLUTION_EVENT_KIND = "notify_resolution"
 NOTIFY_DIGEST_STALE_EVENT_KIND = "notify_digest_stale"
@@ -1288,6 +1302,17 @@ def check_dispatch_coverage(
     )
 
 
+def _has_open_body_blocker(issue: dict[str, Any], open_numbers: set[int]) -> bool:
+    """True when the issue body declares a blocker that is still open.
+
+    Uses the orchestrator's own ``parse_blockers``; "open" is membership in the
+    open-issue list already fetched (a closed blocker is absent from it).
+    """
+    if _parse_blockers is None:
+        return False
+    return any(n in open_numbers for n in _parse_blockers(issue.get("body") or ""))
+
+
 def check_armable_backlog(
     report: Report,
     repo: RepoInfo,
@@ -1310,8 +1335,9 @@ def check_armable_backlog(
       what dispatch can take next. Healthy when ``>= floor``.
     * ``active``  -- carries an ``agent:*`` label (in flight / terminal).
     * ``armable`` -- no ``agent:*`` label, not ``automated-ready``, and no
-      *gating* label (``ARMABLE_GATING_LABELS``) or blocked-by-dependency
-      entry. This is the un-triaged pool: every issue here is either a
+      *gating* label (``ARMABLE_GATING_LABELS``), blocked-by-dependency
+      entry, open body-declared blocker, or pending ``sweep-armed`` marker
+      (issue #2004). This is the un-triaged pool: every issue here is either a
       missed arm or a missed gate, and a triage pass drives it to zero.
 
     Verdict:
@@ -1341,7 +1367,7 @@ def check_armable_backlog(
         "--state",
         "open",
         "--json",
-        "number,labels",
+        "number,labels,body",
         "--limit",
         str(ISSUE_LIST_LIMIT),
     ]
@@ -1350,6 +1376,7 @@ def check_armable_backlog(
         report.anom(check, err)
         return
 
+    open_numbers = {issue["number"] for issue in data}
     runway: list[int] = []
     active = 0
     gated = 0
@@ -1366,8 +1393,14 @@ def check_armable_backlog(
             continue
         if ARMED_LABEL in names:
             runway.append(number)
-        else:
-            armable.append(number)
+            continue
+        # Un-armed candidate: `fleet status` only evaluates blockers for
+        # `automated-ready` issues, so an unlabelled issue never reaches
+        # blocked_numbers -- evaluate its body here (issue #2004).
+        if SWEEP_ARMED_LABEL in names or _has_open_body_blocker(issue, open_numbers):
+            gated += 1
+            continue
+        armable.append(number)
 
     cap = get_dispatch_cap(repo.config_path) if repo.config_path else None
     floor = cap if cap is not None else ARMABLE_RUNWAY_FLOOR_DEFAULT
