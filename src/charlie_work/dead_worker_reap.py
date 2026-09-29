@@ -773,6 +773,7 @@ def _detect_and_handle_stalled_sessions(
                             w.issue_number,
                             fallback_kind="stalled",
                             config=config,
+                            now=now,
                         )
                     )
                 elif w.adapter_kind == "claude-code":
@@ -782,6 +783,7 @@ def _detect_and_handle_stalled_sessions(
                             w.issue_number,
                             fallback_kind="stalled",
                             config=config,
+                            now=now,
                         )
                     )
                 elif w.adapter_kind == "api":
@@ -796,6 +798,7 @@ def _detect_and_handle_stalled_sessions(
                             fallback_kind="stalled",
                             config=config,
                             adapter_kind="api",
+                            now=now,
                         )
                     )
 

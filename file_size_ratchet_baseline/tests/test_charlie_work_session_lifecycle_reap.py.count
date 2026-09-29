@@ -1,7 +1,10 @@
-1200
+1400
 # Issue #1917 / PR #1919 rework: the bounded provider-throttle
 # exemption, launch-failure stamping, and orphan-redispatch seeding
 # regression tests put the file at 1180 lines -- past the 800 cap.
 # Raised to the next MARK_QUANTUM multiple per the ratchet's hand-raise
 # rule; the alternative (a new test module) would duplicate the reap
 # lane fixture harness since test modules must not import each other.
+# Issue #1997: the born-expired emission-anchored window sibling test
+# (test_dead_dispatched_worker_expired_throttle_window_still_reclaimed)
+# pushed the file to 1305 -- same hand-raise rationale applies.

@@ -212,6 +212,10 @@ def test_loop_classifies_dead_sessions_and_sets_throttle_state(tmp_path: Path) -
     # CI stall; it does not affect the exact-equality assertion since both sides
     # derive from this same captured value.
     frozen_now = datetime.now(UTC) + timedelta(hours=1)
+    # Issue #1997: the throttle window is anchored at the log's emission time
+    # (its mtime), not the classification clock -- pin the mtime to the frozen
+    # clock so the anchored window is exactly frozen_now + 10min + margin.
+    os.utime(log_path, (frozen_now.timestamp(), frozen_now.timestamp()))
     app.loop(limit=0, now=frozen_now)
 
     # Verify throttled_until was set in state by the loop's classification pass
@@ -406,6 +410,10 @@ def test_loop_launch_failure_with_throttle_signature_persists_throttled_until(
     # of a wall-clock-tolerance window (a stall between loop() and the
     # assertion previously had ~5s to blow the tolerance and flake CI).
     frozen_now = datetime.now(UTC)
+    # Issue #1997: the throttle window is anchored at the log's emission time
+    # (its mtime), not the classification clock -- pin the mtime to the frozen
+    # clock so the anchored window is exactly frozen_now + 10min + margin.
+    os.utime(log_path, (frozen_now.timestamp(), frozen_now.timestamp()))
     result = app.loop(limit=0, now=frozen_now)
 
     # The launch-failure sidecar is reaped and reported

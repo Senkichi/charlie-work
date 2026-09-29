@@ -32,7 +32,7 @@ other free name is imported directly from its defining module.
 from __future__ import annotations
 
 from collections.abc import Callable
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -100,13 +100,18 @@ def maybe_reap_dead_dispatched_worker(
     reaped.
 
     The exemption is bounded by the throttle window it exists to ride
-    out. Once ``throttled_until`` has passed -- or no window was ever
-    stamped -- the #654 backstop resumes: in the PR-linked case the
-    sub-branches only emit drift once and then short-circuit on the
-    fingerprint (a no-op clean exit, a non-request_changes decision, a
-    head change without a review callback), so a stamp that held forever
-    would reintroduce exactly the wedge this backstop fixes. An expired
-    or unparseable window fails closed to the normal reap timer.
+    out plus one backstop grace (``dead_dispatched_reap_minutes``) past
+    its end — issue #1997's emission-anchored windows can be armed
+    already expired, and the entry still deserves the caller's normal
+    handling (reclaim to the dispatchable pool) rather than an instant
+    escalation. Once the window has been over longer than that grace --
+    or no window was ever stamped -- the #654 backstop resumes: in the
+    PR-linked case the sub-branches only emit drift once and then
+    short-circuit on the fingerprint (a no-op clean exit, a
+    non-request_changes decision, a head change without a review
+    callback), so a stamp that held forever would reintroduce exactly the
+    wedge this backstop fixes. A long-expired or unparseable window fails
+    closed to the normal reap timer.
 
     Returns the (possibly replaced) ``state`` mapping -- the escalation
     helpers rebuild it -- and ``True`` when the entry was escalated, so the
@@ -123,7 +128,19 @@ def maybe_reap_dead_dispatched_worker(
         return state, False
     if is_provider_throttle_failure(entry.get("dead_worker_failure_kind")):
         throttled_until_dt = _wf._parse_iso_timestamp(state.get("throttled_until"))
-        if throttled_until_dt is not None and throttled_until_dt > now:
+        # Issue #1997: the throttle window is now anchored at the provider
+        # message's emission time, so it can be armed already expired — the
+        # reset predated classification. The exemption still applies: the
+        # stamp means the death was a global provider condition, never a
+        # worker-quality signal, so the entry gets one backstop grace
+        # (``dead_dispatched_reap_minutes`` past the window's end) for the
+        # caller's normal handling to reclaim it to the dispatchable pool
+        # before this timed reap resumes. A stale stamp whose window ended
+        # longer ago than that fails closed to the timer, same as before —
+        # a wedge the normal lanes cannot resolve still escalates.
+        if throttled_until_dt is not None and throttled_until_dt > now - timedelta(
+            minutes=dead_dispatched_reap_minutes
+        ):
             return state, False
     drift_dt = _wf._parse_iso_timestamp(orphan_drift_at)
     if drift_dt is None or (now - drift_dt).total_seconds() / 60 < dead_dispatched_reap_minutes:
