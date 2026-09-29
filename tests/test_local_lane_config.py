@@ -10,8 +10,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from charlie_work.config import (
     LOCAL_REWORK_TEMPLATE,
+    ConfigError,
     LocalIssuesConfig,
     OrchestratorConfig,
     load_config,
@@ -131,3 +134,45 @@ def test_load_config_explicit_auto_merge_disabled_wins(tmp_path: Path) -> None:
     config = load_config(config_file)
 
     assert config.auto_merge.enabled is False
+
+
+def test_load_config_local_lane_stall_hours_defaults_to_12(tmp_path: Path) -> None:
+    """Issue #1968: an absent ``local_lane`` section keeps the default."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    config_file.write_text("local_issues:\n  enabled: true\n", encoding="utf-8")
+
+    config = load_config(config_file)
+
+    assert config.local_lane.kill_switch_stall_hours == 12.0
+
+
+def test_load_config_local_lane_explicit_stall_hours(tmp_path: Path) -> None:
+    config_file = tmp_path / "orchestrator.config.yaml"
+    config_file.write_text(
+        "local_issues:\n  enabled: true\nlocal_lane:\n  kill_switch_stall_hours: 4\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_file)
+
+    assert config.local_lane.kill_switch_stall_hours == 4
+
+
+@pytest.mark.parametrize("raw", ["soon", "true", "-1"], ids=["string", "bool", "negative"])
+def test_load_config_local_lane_rejects_bad_stall_hours(tmp_path: Path, raw: str) -> None:
+    config_file = tmp_path / "orchestrator.config.yaml"
+    config_file.write_text(
+        f"local_lane:\n  kill_switch_stall_hours: {raw}\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="kill_switch_stall_hours"):
+        load_config(config_file)
+
+
+def test_load_config_local_lane_rejects_unknown_key(tmp_path: Path) -> None:
+    config_file = tmp_path / "orchestrator.config.yaml"
+    config_file.write_text("local_lane:\n  bogus_knob: 1\n", encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="unknown key"):
+        load_config(config_file)

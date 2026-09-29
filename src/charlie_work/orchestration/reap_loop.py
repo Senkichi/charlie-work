@@ -216,6 +216,13 @@ def _loop_body(
         "local_lane", lambda: self._local_lane(now=now, limit=limit)
     )
 
+    # Issue #1967: drain the local backend's patch-equivalence
+    # satisfactions -- collected on the client by this pass's
+    # ``are_issues_open`` calls (intake's cycle scan, dispatch's prefetch
+    # and per-issue blocker gates) -- into once-per-issue events. A no-op
+    # on the remote backend.
+    self._drain_local_blocker_patch_equiv()
+
     reviews: list[dict[str, Any]] = []
     merges: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
