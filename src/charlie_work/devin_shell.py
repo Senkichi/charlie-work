@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any
 
 from charlie_work.process_utils import is_pid_alive, parse_proc_stat_starttime, popen_worker
+from .claude_code import _events_path, _rotate_old_log
 from .config import OrchestratorConfig
 from .devin_failure_classification import (  # noqa: F401 (deliberate re-export; #1442 extraction keeps devin_shell under its mark)
     _classify_session_failure,
@@ -463,6 +464,12 @@ def launch_devin_session(
         command_template = _sanitize_review_command_template(command_template)
     sessions_dir.mkdir(parents=True, exist_ok=True)
     log_path = _log_path(sessions_dir, issue_number, rework=rework)
+    # Issue #2036: the claude-code adapter's per-issue events.jsonl shares this
+    # sessions_dir and is read harness-agnostically by the verdict/miss/metrics
+    # readers. Only the claude launcher rotated it, so a devin session inherited
+    # the previous claude round's transcript as if it were its own. Retire it at
+    # launch so every reader sees this session's file or none.
+    _rotate_old_log(_events_path(sessions_dir, issue_number, rework=rework, review=review))
     session_id = str(uuid.uuid4())
 
     # Issue #426: recovery probes carry a Signal-1-style deferral counter. Seed
