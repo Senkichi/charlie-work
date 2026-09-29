@@ -181,6 +181,10 @@ def _write_review_permissions(checkout_path: Path) -> None:
 # in a row, and each refusal ended the session with no verdict. So the review
 # prompt states the same list, rendered from ``_REVIEW_EXEC_ALLOWLIST`` (never a
 # second hand-kept list), plus what will be refused and why that is fine.
+# Issue #2032: the section must present that list as the ONLY runnable set.
+# Devin's own read-only auto-approval outside the list is unpredictable
+# (`git log` passed nine times, and `git log -n 5 --stat` was refused), and
+# advertising git reads as "normally allowed" cost 3 of the first 5 reviews.
 REVIEW_EXEC_SECTION_HEADING = "## Shell commands in this review session"
 
 
@@ -191,14 +195,17 @@ def _review_exec_prompt_section() -> str:
         "This session is headless and read-only. Commands that need approval are "
         "REFUSED, and a refusal can end the session before you emit a verdict -- "
         "the review is then lost.\n\n"
-        f"- Pre-approved: {commands}. Read-only `git` inspection (`git status`, "
-        "`git diff`, `git log`, `git show`) is normally allowed too.\n"
+        f"- The ONLY shell commands you may run: {commands}. Run nothing else -- not "
+        "other `git` subcommands (not even read-only ones such as `git worktree` or "
+        "`git log --stat`), not `sed`, `awk`, `jq`, and not a pipe into any "
+        "unlisted program. Unlisted commands are refused unpredictably.\n"
+        "- Read files (including this packet's `pr.json`, `diff.patch` and "
+        "`interdiff.patch`) with your file-reading and search tools, not the shell. "
+        "The packet already contains the PR's diff and metadata.\n"
         "- Do NOT run tests, linters, interpreters, or package managers (`pytest`, "
         "`uv`, `python`, `ruff`, `npm`, ...). CI has already run them: results are "
         "in the CI status section and `checks.json` of this packet. Judge test "
         "adequacy by reading the tests.\n"
-        "- Prefer reading files over running commands; the packet already contains "
-        "the diff and PR metadata.\n"
     )
 
 
