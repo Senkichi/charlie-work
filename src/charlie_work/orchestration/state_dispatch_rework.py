@@ -25,6 +25,7 @@ from charlie_work.config import (
 from charlie_work.github import GitHubError
 from charlie_work.labels import TransitionOutcome
 from charlie_work.state import StateLockBusy
+from charlie_work.throttle_signatures import is_provider_throttle_failure
 from charlie_work.worktree import worktree_ahead_of_sha
 import charlie_work.superseded_worker_reap as superseded_worker_reap
 import charlie_work.workflow as _wf
@@ -254,7 +255,9 @@ def _dispatch_rework_impl(
                 continue
             if live_head_sha == reviewed_head_sha:
                 issue_entry = dry_head_check_state.get("issues", {}).get(str(issue_number), {})
-                if isinstance(issue_entry, dict):
+                if isinstance(issue_entry, dict) and not is_provider_throttle_failure(
+                    issue_entry.get("dead_worker_failure_kind")
+                ):
                     prior_redispatch = _wf._windowed_redispatch_at(
                         issue_entry,
                         window_minutes=self.config.watchdog.redispatch_window_minutes,
@@ -537,7 +540,14 @@ def _dispatch_rework_impl(
             # stranded work") instead of ``no_op_rework_cap_exceeded``
             # (triage: "worker is spinning").
             issue_entry = head_check_state.get("issues", {}).get(str(issue_number), {})
-            if isinstance(issue_entry, dict):
+            # Issue #1993: never escalate either cap on the heels of a
+            # provider-throttle death (2026-09-29: #1971 hit
+            # ``worker_death_loop`` at count 3 in a rate-limit wave). The
+            # stamp clears at the next dispatch epoch, so this defers the
+            # check by at most one dispatch.
+            if isinstance(issue_entry, dict) and not is_provider_throttle_failure(
+                issue_entry.get("dead_worker_failure_kind")
+            ):
                 prior_redispatch = _wf._windowed_redispatch_at(
                     issue_entry,
                     window_minutes=self.config.watchdog.redispatch_window_minutes,

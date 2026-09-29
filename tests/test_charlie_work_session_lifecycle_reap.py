@@ -814,7 +814,9 @@ def test_dead_dispatched_worker_non_throttle_kind_still_reaped(tmp_path: Path) -
 @pytest.mark.parametrize(
     "throttled_until",
     [
-        (datetime.now(UTC) - timedelta(hours=2)).isoformat().replace("+00:00", "Z"),
+        # Issue #1993: the grace now runs from the window close, so
+        # "expired" must be further back than dead_dispatched_reap_minutes.
+        (datetime.now(UTC) - timedelta(minutes=90)).isoformat().replace("+00:00", "Z"),
         None,
         "not-a-timestamp",
     ],
