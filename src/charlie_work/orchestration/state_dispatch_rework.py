@@ -28,6 +28,7 @@ from charlie_work.state import StateLockBusy
 from charlie_work.worktree import worktree_ahead_of_sha
 import charlie_work.superseded_worker_reap as superseded_worker_reap
 import charlie_work.workflow as _wf
+from charlie_work.worker_pid_stamp import stamp_worker_process
 
 
 def _dispatch_rework_impl(
@@ -1341,9 +1342,7 @@ def _dispatch_rework_impl(
                     (r for r in dispatch_results if r.issue_number == request.issue_number),
                     None,
                 )
-                if result and result.pid is not None:
-                    entry["worker_pid"] = result.pid
-                    entry["worker_process_start_time"] = result.process_start_time
+                stamp_worker_process(entry, result)
             if ok:
                 # Track redispatch count for escalation cap (issue #165)
                 now = datetime.now(UTC)
