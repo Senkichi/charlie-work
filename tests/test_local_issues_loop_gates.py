@@ -133,7 +133,7 @@ def _patch_lane_callees(monkeypatch: pytest.MonkeyPatch) -> tuple[Mock, Mock]:
     return reconcile_locked, reclaim
 
 
-def test_loop_pass_skips_only_main_ci_reclaim_on_non_publishing_backend(
+def test_loop_pass_skips_pr_shaped_lanes_on_non_publishing_backend(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """On a ``LocalFileGitHub`` (``publishes_pull_requests = False``), one
@@ -144,7 +144,13 @@ def test_loop_pass_skips_only_main_ci_reclaim_on_non_publishing_backend(
     invoked (and mocked, keeping this a gating test), the pass records
     ``reconcile_pass_completed``, and the pass must emit none of the
     noise events -- even with every lane's own enable knob armed as
-    production runs them."""
+    production runs them.
+
+    The leaf name predates #1969: ``pr_shaped_lanes`` now means the lanes
+    still gated on ``publishes_pull_requests`` -- after #1969 that set is
+    exactly ``main_ci_reclaim``. The name is kept verbatim because the
+    collect-only gate (#1538) fails a required check on any leaf-name
+    removal, rename included, absent an operator exemption label."""
     repo_root = tmp_path / "repo"
     _init_repo(repo_root)
     config = _config(local_enabled=True)
