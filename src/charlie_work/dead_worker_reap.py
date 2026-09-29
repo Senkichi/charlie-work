@@ -1356,7 +1356,7 @@ def _reap_restore_rework_requested(
         # stranded work") instead of redispatch_cap_exceeded (triage:
         # "worker is spinning").
         if not immediate_escalation and not provider_throttled:
-            worker_death_at = _credit_worker_death(entry)
+            worker_death_at = _credit_worker_death(entry, kind=failure_kind)
         else:
             worker_death_at = _windowed_worker_death_at(
                 entry, window_minutes=config.watchdog.redispatch_window_minutes

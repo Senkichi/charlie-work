@@ -108,6 +108,74 @@ _REVIEW_COMMAND_TEMPLATE: tuple[str, ...] = (
 )
 
 
+# Issue #2011: headless ``devin --print`` in ``auto`` mode auto-REJECTS any exec
+# its classifier does not approve and ENDS the session with no verdict. Models
+# shell out despite the pre-rendered packet, so review launches pre-approve a
+# READ-ONLY exec allow-list via ``<cwd>/.devin/config.local.json`` (project
+# local override; never clobbers a tracked ``.devin/config.json``). Rules are
+# whole-word prefix matches; compound commands are checked per segment, so
+# chaining (``git log && rm x``) cannot escape the list. Allow rules only: a
+# deny rule also ends the session silently.
+#
+# Anything NOT listed still goes to Devin's own classifier, which judges the
+# FULL command line: it already auto-approved ``git status``/``git diff``/
+# ``git log``/``git rev-parse`` in the #2011 sessions, and it can refuse a
+# flag-level escape (``git diff --output=<path>``) that a whole-word prefix
+# rule cannot express. So the list holds only (a) what the classifier
+# actually prompted on -- the read-only ``gh ... view`` family, which ended 4
+# of the 5 missed #2011 sessions -- and (b) commands with no exec/write flag.
+#
+# Deliberately EXCLUDED (keep it that way; the reviewer reads attacker-
+# influenced diffs, so every entry must be safe against prompt injection):
+# - bare ``Exec(git)``/``Exec(gh)`` and any git/gh subcommand with a write or
+#   exec flag: ``git diff|log|show`` (``--output=<path>`` writes anywhere),
+#   ``git grep`` (``-O<cmd>`` runs a pager command), ``gh api`` (arbitrary
+#   REST incl. writes).
+# - ``rg`` (``--pre <cmd>`` runs a program), ``sort`` (``-o``,
+#   ``--compress-program``), ``uniq`` (writes its 2nd arg), ``find``
+#   (``-delete``/``-exec``), ``sed``/``awk`` (in-place writes, system()).
+# - any interpreter or runner (python, uv, node, bash, sh, pwsh): arbitrary
+#   code -- the #2011 mdls session was ended by ``uv run ... python -c``, and
+#   that refusal is correct.
+# ``--permission-mode dangerous`` stays impossible (see the sanitizer below).
+_REVIEW_EXEC_ALLOWLIST: tuple[str, ...] = (
+    "Exec(gh issue view)",
+    "Exec(gh pr view)",
+    "Exec(gh pr diff)",
+    "Exec(gh pr checks)",
+    "Exec(grep)",
+    "Exec(cat)",
+    "Exec(head)",
+    "Exec(tail)",
+    "Exec(wc)",
+    "Exec(ls)",
+    "Exec(pwd)",
+)
+
+
+def _write_review_permissions(checkout_path: Path) -> None:
+    """Write the review exec allow-list into the review checkout (issue #2011).
+
+    Never raises: a missing allow-list degrades to the pre-fix behavior, and
+    adapters return errors as values. The file is untracked inside a review
+    checkout that ``remove_review_checkout`` force-removes wholesale, and
+    nothing computes dirtiness for review checkouts, so no separate cleanup
+    is needed.
+    """
+    try:
+        _write_json(
+            checkout_path / ".devin" / "config.local.json",
+            {"permissions": {"allow": list(_REVIEW_EXEC_ALLOWLIST)}},
+        )
+    except OSError as exc:
+        logger.warning(
+            "could not write review exec allow-list in %s: %s (reviewer may hit "
+            "an exec rejection)",
+            checkout_path,
+            exc,
+        )
+
+
 def _sanitize_review_command_template(command_template: tuple[str, ...]) -> tuple[str, ...]:
     """Hard-pin the read-only reviewer posture onto ``command_template``.
 
@@ -525,6 +593,9 @@ def launch_devin_session(
     # worker_env_dict itself, which already carries the real values).
     xdist_cap, xdist_cap_source = resolve_pytest_cap(sanitized_env, worker_env)
     uv_no_sync, uv_no_sync_source = resolve_uv_no_sync(worktree.path, sanitized_env, worker_env)
+
+    if review:
+        _write_review_permissions(worktree.path)
 
     pid: int | None = None
     error: str | None = None
