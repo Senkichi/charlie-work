@@ -230,7 +230,7 @@ def _parse_review_verdict_from_events(
     of the next round ends without a verdict, this path used to parse the
     *previous* claude-code round's events file and record that old verdict
     against the new head. The prompt quotes those findings, so they looked
-    plausible (PRs #2012 and #2017, and job-cannon #2208, on 2026-09-29).
+    plausible (issue #2029: eight verdicts fleet-wide on 2026-09-29).
     A missing or unparseable ``started_at`` means there is no safe gate, so the
     fallback is skipped.
 
