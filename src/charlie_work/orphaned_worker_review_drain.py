@@ -32,6 +32,7 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
 
+from .orphaned_worker_no_op_drain import NoOpReworkRoute
 from .rework_outcome import APPLIED_HEADS_KEY
 
 if TYPE_CHECKING:
@@ -70,6 +71,7 @@ def drain_orphaned_worker_review_routes(
     config: OrchestratorConfig,
     state_file: Path,
     write_gate: WriteGate,
+    no_op_routes: list[NoOpReworkRoute] | None = None,
 ) -> None:
     """Drain collected orphan-sweep review routes through ``review()``.
 
@@ -231,6 +233,19 @@ def drain_orphaned_worker_review_routes(
             ):
                 # Review failed: mark the drift fingerprint so the next pass
                 # does not retry/re-emit for this unchanged head.
+                # Issue #2034: a refused head-change review (the janitor's
+                # "diff unchanged" no-op gate) must also reach the no-op drain,
+                # or the issue rests in ``dispatched`` with no live worker.
+                if reason == "dead_worker_with_head_change" and no_op_routes is not None:
+                    no_op_routes.append(
+                        NoOpReworkRoute(
+                            issue_number=issue_number,
+                            pr_number=pr_number,
+                            live_head_sha=live_head_sha,
+                            reason=reason,
+                            branch=entry.get("branch_name"),
+                        )
+                    )
                 state["issues"][str(issue_number)] = {
                     **entry,
                     "orphan_drift_fingerprint": fingerprint,

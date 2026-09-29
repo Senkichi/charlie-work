@@ -346,9 +346,10 @@ def test_orphaned_worker_head_advanced_review_failure_emits_drift_once(tmp_path:
     state = load_state(paths.state_file)
     entry = state["issues"]["457"]
 
-    # Status should remain dispatched; the finding is tracked as drift.
-    assert entry.get("status") == "dispatched"
-    assert "orphan_drift_fingerprint" in entry
+    # Issue #2034: a refused review is tracked as drift AND escalated -- the
+    # issue must not rest in dispatched with no live worker.
+    assert entry.get("status") == "escalated"
+    assert entry.get("escalation_reason") == "rework_no_op"
 
     events = state.get("events", [])
     drift_events = [e for e in events if e.get("kind") == "orphaned_worker_drift"]
@@ -633,8 +634,9 @@ def test_orphaned_worker_approved_rework_clean_exit_no_op_drift(tmp_path: Path) 
     entry = state["issues"]["1109"]
 
     # Must NOT be reset -- clean exit with no push is a no-op, not a crash.
-    assert entry.get("status") == "dispatched"
-    assert entry.get("dispatched_at") == "2024-01-01T00:00:00Z"
+    # Issue #2034: it is escalated (visible), not left stranded in dispatched.
+    assert entry.get("status") == "escalated"
+    assert entry.get("escalation_reason") == "rework_no_op"
 
     events = state.get("events", [])
     assert [e for e in events if e.get("kind") == "orphaned_worker_recovered"] == []

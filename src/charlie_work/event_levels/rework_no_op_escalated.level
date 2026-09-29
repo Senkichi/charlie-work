@@ -1,0 +1,3 @@
+warning
+# Issue #2034: a dead rework worker no-oped and no automated disposition applied (or a
+# second no-op on the same head); escalated to agent:human-needed with reason rework_no_op.

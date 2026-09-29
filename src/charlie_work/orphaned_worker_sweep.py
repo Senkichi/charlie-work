@@ -37,6 +37,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from .dead_worker_classification import classify_and_credit_dead_worker
+from .orphaned_worker_no_op_drain import NoOpReworkRoute
 from .orphaned_worker_review_drain import OrphanedWorkerReviewRoute
 from .process_utils import find_worker_terminal_status
 from .review_decision import review_decision
@@ -51,6 +52,19 @@ from .worktree import worktree_path_for_branch
 if TYPE_CHECKING:
     from .config import OrchestratorConfig
     from .github import GitHubLike
+
+
+def _no_op_route(
+    pr_data: dict[str, Any], entry: dict[str, Any], issue_number: int, live_head_sha: str
+) -> NoOpReworkRoute:
+    """The no-op disposition route for a dead rework worker's finding (#2034)."""
+    return NoOpReworkRoute(
+        issue_number=issue_number,
+        pr_number=int(pr_data["number"]),
+        live_head_sha=live_head_sha,
+        reason="dead_worker_no_op",
+        branch=pr_data.get("headRefName") or entry.get("branch_name"),
+    )
 
 
 def maybe_reap_dead_dispatched_worker(
@@ -356,6 +370,7 @@ def handle_dead_worker_with_pr(
     worktrees_dir: Path | None,
     review_routes: list[OrphanedWorkerReviewRoute],
     outcome_apply_routes: list[tuple[int, int]],
+    no_op_routes: list[NoOpReworkRoute],
     pr_orphan_unreviewed_details: dict[int, dict[str, Any]],
     drift_fingerprint: Callable[..., str],
 ) -> None:
@@ -435,6 +450,11 @@ def handle_dead_worker_with_pr(
                     reason="dead_worker_clean_exit_no_op",
                     reviewed_head_sha=reviewed_head_sha,
                 )
+                # Issue #2034: surfacing the drift once is not a disposition --
+                # the route below is collected every pass until the post-lock
+                # no-op drain gives the issue one (CI rework, rebuttal review,
+                # or escalation), so it can never rest in ``dispatched``.
+                no_op_routes.append(_no_op_route(pr_data, entry, issue_number, live_head_sha))
                 if entry.get("orphan_drift_fingerprint") == fingerprint:
                     state["issues"][str(issue_number)] = entry
                     return
@@ -543,6 +563,9 @@ def handle_dead_worker_with_pr(
                     )
                 )
             else:
+                # Issue #2034: no review callback means nothing can consume
+                # the head change -- give it the same no-op disposition.
+                no_op_routes.append(_no_op_route(pr_data, entry, issue_number, live_head_sha))
                 entry["orphan_drift_fingerprint"] = fingerprint
                 entry["orphan_drift_at"] = _wf.utc_now()
                 sweep_events.append(
@@ -618,6 +641,7 @@ def handle_dead_worker_with_pr(
                     reason="dead_worker_clean_exit_no_op",
                     reviewed_head_sha=reviewed_head_sha,
                 )
+                no_op_routes.append(_no_op_route(pr_data, entry, issue_number, live_head_sha))
                 if entry.get("orphan_drift_fingerprint") == fingerprint:
                     state["issues"][str(issue_number)] = entry
                     return

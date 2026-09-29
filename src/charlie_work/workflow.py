@@ -183,7 +183,12 @@ from .process_utils import (
     find_worker_terminal_status,
     is_pid_alive,  # noqa: F401  (deliberate re-export; used by moved L08 delegate via _wf.)
 )
-from . import orphaned_worker_review_drain, orphaned_worker_sweep, rework_outcome
+from . import (
+    orphaned_worker_no_op_drain,
+    orphaned_worker_review_drain,
+    orphaned_worker_sweep,
+    rework_outcome,
+)
 from .write_gate import WriteGate, require_write_gate
 
 # LOAD-BEARING RE-EXPORT — NOT AN UNUSED IMPORT. Do not delete; the `noqa`
@@ -1658,6 +1663,8 @@ def _detect_and_handle_orphaned_workers(
     *,
     write_gate: WriteGate,
     review_callback: Callable[[int], Any] | None = None,
+    record_review_callback: Callable[..., Any] | None = None,
+    enrich_checks_callback: Callable[..., list[dict[str, Any]]] | None = None,
     fleet_dir_override: str | None = None,
 ) -> None:
     """Detect and handle orphaned workers using state.json PID records.
@@ -2242,6 +2249,7 @@ def _detect_and_handle_orphaned_workers(
     # collected and routed to the review lane outside the state lock (review()
     # itself acquires the lock and may call transition()).
     review_routes: list[orphaned_worker_review_drain.OrphanedWorkerReviewRoute] = []
+    no_op_routes: list[orphaned_worker_no_op_drain.NoOpReworkRoute] = []
     # Issue #654: dead dispatched workers time-escalated inside the lock
     # collected here for the post-lock transition() call (network I/O).
     reap_escalations: list[int] = []
@@ -2321,6 +2329,7 @@ def _detect_and_handle_orphaned_workers(
                     repo_root=repo_root,
                     worktrees_dir=worktrees_dir,
                     review_routes=review_routes,
+                    no_op_routes=no_op_routes,
                     outcome_apply_routes=outcome_apply_routes,
                     pr_orphan_unreviewed_details=pr_orphan_unreviewed_details,
                     drift_fingerprint=_drift_fingerprint,
@@ -2843,6 +2852,25 @@ def _detect_and_handle_orphaned_workers(
         config=config,
         state_file=state_file,
         write_gate=write_gate,
+        no_op_routes=no_op_routes,
+    )
+
+    # Issue #2034: every no-op finding (a clean exit with the head unchanged, or
+    # a head change the janitor refused to review) gets a disposition here --
+    # CI-failure rework, a once-per-head rebuttal review, or a visible
+    # ``rework_no_op`` escalation -- so none rests in ``dispatched``.
+    orphaned_worker_no_op_drain.drain_no_op_rework_routes(
+        no_op_routes,
+        gh=gh,
+        config=config,
+        state_file=state_file,
+        write_gate=write_gate,
+        sessions_dir=sessions_dir,
+        repo_root=repo_root,
+        worktrees_dir=worktrees_dir,
+        review_callback=review_callback,
+        record_review_callback=record_review_callback,
+        enrich_checks_callback=enrich_checks_callback,
     )
 
     # Issue #654: apply the ``escalated`` label edge for dead dispatched
