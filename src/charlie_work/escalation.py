@@ -11,18 +11,24 @@ monkeypatch targets keep working unchanged.
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import MappingProxyType
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .config import LabelConfig
-from .labels import _edges
+from .labels import TransitionOutcome, TransitionResult, _edges
 from .state import (
     ESCALATION_REASON_CLASSES,
     PASSIVE_OPEN_STATUS,
     SINK_STATUSES,
     escalation_reason_class,
+    load_state,
+    state_lock,
     utc_now,
 )
+
+if TYPE_CHECKING:
+    from .write_gate import WriteGate
 
 # Issue #1266: the two labels.py edges every escalation call site otherwise
 # hardcodes ("escalated" and "redispatch_escalated") get a mechanical
@@ -146,6 +152,83 @@ def _escalation_flags(
     return pr_escalated, issue_escalated
 
 
+def _stale_template_warning_suppressed(
+    pr_state: dict[str, Any], issue_state: dict[str, Any] | None
+) -> bool:
+    """Should reap_loop suppress the ``review_packet_template_stale`` WARNING?
+
+    The predicate ``_loop_body`` consults when a PR's head is current but its
+    packet predates the active template. Issue #1338 added the suppression
+    for ``escalated``; issue #1894 extends it to two more shapes, each for a
+    different reason. state.py documents why ``_escalation_flags`` itself
+    stays narrow -- a real policy boundary, not an oversight to "fix" by
+    widening it -- so the extra arms live here instead:
+
+    * ``_escalation_flags`` -- #1338: an escalated PR's packet regeneration
+      is unreachable (``review()`` early-returns "escalated; review skipped"
+      before its regen path), so the WARNING would re-emit an identical
+      event every pass without ever converging. The recovery procedure
+      (unescalate + why-charlie-hate) already regenerates the packet with
+      the current template. (The cross-family regen-budget charge the #1338
+      suppression used to also cover -- ``attempts_before`` /
+      ``_charge_cross_family_regen_not_reached`` -- was deleted along with
+      the auto-gate cross-family subsystem in role-config phase 2, track A;
+      no second side effect is left to skip.) ``SINK_STATUSES`` already
+      subsumes "escalated"; the escalated disjuncts stay spelled out so the
+      #1338 lineage remains legible at the predicate.
+    * ``SINK_STATUSES``' other member, ``"blocked"`` (a recorded judgment
+      verdict parked on ``agent:human-needed``), on either the PR record or
+      the linked issue's record -- #1894. Per the owner's #1894 amendment /
+      #1897 proposal this arm is deliberate suppression, NOT a
+      regen-unreachable claim: ``review()``'s entry gate excludes only
+      "escalated", so a blocked record still flows through ``review()``'s
+      main path each pass, which converges it (janitor green -> packet
+      regenerated with the current template and status "reviewing"; janitor
+      red -> status rewritten to "janitor_blocked", where the next arm then
+      applies if the sole failure is missing checks). For a janitor-green
+      blocked PR the WARNING would have fired exactly once before
+      converging -- this arm trades away that one-shot, non-actionable
+      signal (the event carries no automated remediation) for silence while
+      a human-owned record stands. ``review()`` does not touch the ISSUE
+      record's status, so an issue-level "blocked" keeps suppressing across
+      passes.
+    * ``janitor_blocked`` + ``is_missing_checks_only_block`` -- #1894: the
+      flag marks the TRANSIENT "required checks not yet reported"
+      population (janitor.py: "Required check(s) missing" is the sole
+      janitor failure), durable only alongside ``ci_run_never_created_head``
+      (orchestration/adapters.py -- the swole PR #298 shape, where CI never
+      started for the head). While the flag reads true on a pass,
+      ``review()``'s deterministic janitor gate short-circuits before
+      packet regen, so ``packet_template_sha`` cannot catch up to
+      ``current_template_sha`` and the WARNING cannot converge while the
+      flag holds. ``review()`` refreshes the flag every pass, so the
+      suppression self-lifts the moment the checks report -- it cannot
+      wedge.
+
+    The caller must still invoke ``review()`` every pass for these records.
+    Unlike the escalated early-return branch, the janitor-diagnostics
+    refresh for janitor_blocked / blocked records lives inside
+    ``review()``'s MAIN janitor path (``janitor_ok`` / ``janitor_failures``
+    / ``is_missing_checks_only_block`` -- this predicate's own inputs --
+    plus the ``ci_run_never_created`` detection and the
+    stale-checks-retrigger self-heal lane). Skipping the call would freeze
+    the predicate's inputs so the suppression could never lift once the
+    checks report -- a permanent wedge, and the same frozen-diagnostics
+    failure mode PRs #1397/#1443 established for the escalated case.
+    """
+    pr_escalated, issue_escalated = _escalation_flags(pr_state, issue_state)
+    return (
+        pr_escalated
+        or issue_escalated
+        or pr_state.get("status") in SINK_STATUSES
+        or (isinstance(issue_state, dict) and issue_state.get("status") in SINK_STATUSES)
+        or (
+            pr_state.get("status") == "janitor_blocked"
+            and bool(pr_state.get("is_missing_checks_only_block"))
+        )
+    )
+
+
 def _deescalation_skip(reason: str, issue_number: int) -> dict[str, Any]:
     """Build the "this candidate was not acted on" outcome of the de-escalation sweep.
 
@@ -168,6 +251,42 @@ def _deescalation_skip(reason: str, issue_number: int) -> dict[str, Any]:
     the unattributed bucket this helper exists to eliminate.
     """
     return {"skipped": reason, "issue_number": issue_number}
+
+
+def _record_issue_label_error(
+    state_file: Path,
+    write_gate: WriteGate,
+    issue_number: int,
+    edge: str,
+    result: TransitionResult,
+) -> None:
+    """Persist a failed/partial label transition as ``label_error`` on the issue.
+
+    Shared by the de-escalation sweep's two best-effort label moves (the
+    ``unescalated_pr_open`` edge after a clear and the ``escalated`` edge
+    after an identical-reason recurrence promotion, issue #1477): a
+    transition whose outcome is not ``APPLIED`` is recorded on the issue
+    entry so the failed write stays diagnosable, and the
+    ``_repair_escalated_labels`` self-heal sweep backstops it on a later
+    pass. No-op when the transition applied cleanly or had nothing to do.
+    """
+    if result.outcome == TransitionOutcome.APPLIED:
+        return
+    issue_key = str(issue_number)
+    with state_lock(state_file):
+        state = load_state(state_file)
+        entry = state["issues"].get(issue_key, {})
+        state["issues"][issue_key] = {
+            **(entry if isinstance(entry, dict) else {}),
+            "number": issue_number,
+            "label_error": {
+                "edge": edge,
+                "outcome": result.outcome.value,
+                "add_failures": result.add_failures,
+                "remove_failures": result.remove_failures,
+            },
+        }
+        write_gate.save_state(state)
 
 
 def _escalate_issue(

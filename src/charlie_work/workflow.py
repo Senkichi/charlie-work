@@ -89,6 +89,7 @@ from .janitor import (
 from .diff_coverage_probe import StaticProbeVerdict, run_static_probe
 from .labels import TransitionOutcome, transition
 from .local_work_park import park_or_reclaim_local_orphan
+from .pass_deadline import pass_deadline_spent, pass_deadline_suspended
 from .paths import RuntimePaths, resolved_layout
 from .prompt_sections import section_variant_names
 from .prompts import (
@@ -234,7 +235,9 @@ from .workflow_delegation import _install_delegates, discover_delegate_modules
 # above.
 from .escalation import (  # noqa: F401  (deliberate re-export)
     _escalation_flags,
+    _stale_template_warning_suppressed,
     _deescalation_skip,
+    _record_issue_label_error,
     _escalate_issue,
     _escalated_label_needs_repair,
     _collect_escalated_label_subjects,
@@ -1850,7 +1853,7 @@ def _detect_and_handle_orphaned_workers(
             # present, matching reconcile.py's issue_active_label_no_open_pr
             # pattern (~536-580) so all three sites agree. An issue with no
             # active label -- e.g. one carrying only a terminal label like
-            # agent:human-needed/agent:done/agent:blocked -- has nothing here
+            # agent:human-needed/agent:done -- has nothing here
             # to reclaim. A prior `if not active_labels and not needs_ready`
             # gate proceeded whenever EITHER half was false, which wrongly
             # added `ready` back onto a terminal-only issue that also had a
@@ -7914,35 +7917,51 @@ class OrchestratorApp:
                 # Label + branch cleanup are best-effort; the merged fact is already
                 # durable. A branch-deletion failure (head branch checked out in a
                 # worktree) or label failure must never un-record the merge.
-                if issue_number is not None:
-                    result = transition(self.gh, self.config.labels, issue_number, "merged")
-                    if result.outcome != TransitionOutcome.APPLIED:
-                        label_error = {
-                            "edge": "merged",
-                            "outcome": result.outcome.value,
-                            "add_failures": result.add_failures,
-                            "remove_failures": result.remove_failures,
-                        }
-                    # Close the linked issue explicitly — idempotent if already closed
-                    # via GitHub's keyword automation. This ensures the dependency gate
-                    # sees the closure immediately, avoiding the agent:done+OPEN state.
-                    self.gh.close_issue(issue_number)
-                if self.config.auto_merge.delete_branch:
-                    head_ref = str(pr.get("headRefName") or "")
-                    branch_deleted = self.gh.delete_branch(head_ref) if head_ref else False
-                # Update remaining open agent PRs after successful merge (if configured)
-                if self.config.auto_merge.update_branch_strategy in {
-                    "broadcast",
-                    "front_of_train",
-                }:
-                    update_results = self._update_open_agent_prs(pr_number)
-                # Cancel superseded queued runs on default branch after successful merge (if configured)
-                if self.config.runners.enabled and self.config.runners.cancel_superseded_main_runs:
-                    cancel_results = cancel_superseded_runs(
-                        self.gh,
-                        self.config.runners.default_branch,
-                        self.config.runners.workflow_name,
-                    )
+                # Issue #1948: the WHOLE post-merge_pr sequence is past the
+                # irreversible step, so deadline refusals are suspended for the
+                # finalize trio AND the deferral tail below it. A refusal in the
+                # tail cannot undo the merge -- it would propagate out of
+                # merge_ready before the merge_ready/merge_succeeded events and
+                # the merges[] result are produced, and the idempotency
+                # short-circuit above makes that loss permanent (the next pass
+                # returns "already merged" without re-emitting them). The tail
+                # is itself reconcile-visible bookkeeping -- the head-of-train's
+                # own merge_ready resyncs a stale base, and the maintenance lane
+                # reclaims superseded runs every pass -- so finishing it here is
+                # strictly better than stranding it.
+                with pass_deadline_suspended(self.gh):
+                    if issue_number is not None:
+                        result = transition(self.gh, self.config.labels, issue_number, "merged")
+                        if result.outcome != TransitionOutcome.APPLIED:
+                            label_error = {
+                                "edge": "merged",
+                                "outcome": result.outcome.value,
+                                "add_failures": result.add_failures,
+                                "remove_failures": result.remove_failures,
+                            }
+                        # Close the linked issue explicitly — idempotent if already closed
+                        # via GitHub's keyword automation. This ensures the dependency gate
+                        # sees the closure immediately, avoiding the agent:done+OPEN state.
+                        self.gh.close_issue(issue_number)
+                    if self.config.auto_merge.delete_branch:
+                        head_ref = str(pr.get("headRefName") or "")
+                        branch_deleted = self.gh.delete_branch(head_ref) if head_ref else False
+                    # Update remaining open agent PRs after successful merge (if configured)
+                    if self.config.auto_merge.update_branch_strategy in {
+                        "broadcast",
+                        "front_of_train",
+                    }:
+                        update_results = self._update_open_agent_prs(pr_number)
+                    # Cancel superseded queued runs on default branch after successful merge (if configured)
+                    if (
+                        self.config.runners.enabled
+                        and self.config.runners.cancel_superseded_main_runs
+                    ):
+                        cancel_results = cancel_superseded_runs(
+                            self.gh,
+                            self.config.runners.default_branch,
+                            self.config.runners.workflow_name,
+                        )
         # Issue #1598: human-merge hand-off. When the bound issue carries a
         # configured human_merge_labels label and the PR is merge-ready
         # (approved, checks green, no conflicts), the fleet does NOT merge or
@@ -8172,9 +8191,19 @@ class OrchestratorApp:
             new_stale_base_deferrals = 0
             merge_attempt_alarm = False
             merge_attempt_warning: str | None = None
-            if (
-                approved and not can_merge and not _is_pending_only(summary)
-            ) or mergequeue_handoff_failed:
+            # Issue #1948 belt: an in-pass deadline refusal propagates out of
+            # merge_ready as PassDeadlineExceeded and never reaches this
+            # block, but the counter invariant is stated here too -- a
+            # deadline-spent pass's verdict is partial information, so it
+            # must neither increment the failure streak nor zero it (same
+            # indeterminate-pass rule as pending-only above). Guards against
+            # any future path that lets a spent budget reach this block as
+            # a result rather than an exception.
+            deadline_spent = pass_deadline_spent(self.gh)
+            if not deadline_spent and (
+                (approved and not can_merge and not _is_pending_only(summary))
+                or mergequeue_handoff_failed
+            ):
                 new_attempts = int(existing.get("consecutive_failed_merge_attempts", 0)) + 1
                 threshold = self.config.auto_merge.failed_attempt_alarm
                 # Issue #777(b): this counter previously had no ceiling and
@@ -8299,7 +8328,7 @@ class OrchestratorApp:
                             "message": merge_attempt_warning,
                         },
                     )
-            elif can_merge:
+            elif can_merge and not deadline_spent:
                 # Genuine success: checks are ready (or an explicit merge/
                 # mergequeue-handoff already reset the persisted value above,
                 # which this re-read of `existing` picked up) and this is not
@@ -8309,6 +8338,7 @@ class OrchestratorApp:
                 # A confirmed-mergeable pass is real positive information, so
                 # it is safe -- and correct -- to zero the streak here, unlike
                 # the pending-only case above which conveys no information.
+                # A deadline-spent pass conveys none either (issue #1948).
                 new_attempts = 0
             if (
                 approved
@@ -8493,6 +8523,7 @@ class OrchestratorApp:
         *,
         merge: bool | None = None,
         now: datetime | None = None,
+        deadline_exceeded: Callable[[], bool] | None = None,
     ) -> CommandResult:
         # ``now`` (issue #822, extended #828) is this pass's injectable clock.
         # ``_loop_body`` forwards it, unresolved, to every cadence-gated lane
@@ -8506,7 +8537,11 @@ class OrchestratorApp:
         # is byte-identical when this argument is omitted (as all current
         # production callers do); tests can freeze one ``now`` and assert
         # exact equality instead of a wall-clock-tolerance proximity check.
-        return self._loop_impl(limit, merge=merge, now=now)
+        # ``deadline_exceeded`` (issue #1948) is an optional cooperative
+        # in-pass deadline predicate threaded from ``fleet_loop``'s pass
+        # budget into ``_loop_body``'s sub-phase-boundary yield checks;
+        # ``None`` (every non-fleet caller) disables them entirely.
+        return self._loop_impl(limit, merge=merge, now=now, deadline_exceeded=deadline_exceeded)
 
 
 # Track 2 Phase B delegation install (#1631, umbrella #1582). Every submodule of

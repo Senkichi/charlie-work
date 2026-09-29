@@ -161,13 +161,16 @@ class WorkerHealth(Enum):
     6.5. in-flight api per-session budget (api only) → RUNAWAY (issue #484)
     7. (none of the above) → HEALTHY
 
-    SLOW, RUNAWAY, and ORPHANED are reserved for future issues (#162, #163, B6a).
+    HEALTHY, STALLED, DEAD, SLOW, and RUNAWAY are all assigned by
+    ``classify_worker_health`` (see the table above). ORPHANED is the only
+    member never returned by it: it is reserved for B6a (sidecar dead/non-live
+    but a process still references the worktree).
     """
 
     HEALTHY = "healthy"
-    SLOW = "slow"  # Reserved for #162 (wall-clock/loop tripwires) and #163 (warn mode)
+    SLOW = "slow"  # Warn-mode wall-clock/loop/cost tripwires (signals 4-6)
     STALLED = "stalled"
-    RUNAWAY = "runaway"  # Reserved for #162/#163 (cost/token tripwires)
+    RUNAWAY = "runaway"  # Kill-mode wall-clock/loop/cost tripwires and api budget (signals 4-6.5)
     DEAD = "dead"
     ORPHANED = "orphaned"  # Reserved for B6a (sidecar dead/non-live but process still references worktree)
 

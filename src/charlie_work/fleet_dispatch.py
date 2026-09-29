@@ -1846,9 +1846,14 @@ def fleet_loop(
             pass stops starting new prologue steps/repo lanes and returns
             cleanly with the remainder recorded under ``data["deferred"]``,
             instead of running unboundedly until an external watchdog kills
-            the whole supervisor. ``None`` or <= 0 disables enforcement (the
-            pass always runs every prologue/repo, matching pre-#1832
-            behavior) -- the supervisor always passes its configured
+            the whole supervisor. Since issue #1948 the predicate is also
+            threaded into each lane (``app.loop``/``gh.run``), so a lane in
+            flight cuts short at its yield points and reports
+            ``data["deadline_deferred"]`` -> ``deadline_partial_repo_keys``
+            instead of overrunning by its remaining GitHub calls. ``None``
+            or <= 0 disables enforcement (the pass always runs every
+            prologue/repo, matching pre-#1832 behavior) -- the supervisor
+            always passes its configured
             ``SupervisorConfig.max_pass_runtime_seconds`` (nonzero by
             default), so this only goes unenforced for direct/CLI callers
             that do not pass it.
@@ -1924,6 +1929,11 @@ def fleet_loop(
     # instead of a slow repo starving the same later repos every time.
     deferred_repo_keys: list[str] = []
     deferred_autoscale_prologue = False
+    # Issue #1948: lanes that STARTED but were cut short mid-pass by the
+    # in-pass deadline (result carries data["deadline_deferred"]). Distinct
+    # from deferred_repo_keys -- these ran partially -- collected so the
+    # pass-level deferred event/result can attribute them per repo.
+    deadline_partial_repo_keys: list[str] = []
     # repo_keys whose lane actually reached the point of being attempted this
     # pass (i.e. neither stale-skipped nor deadline-deferred). Bumped to "now"
     # in the fleet registry after the pass so oldest-last_seen-first ordering
@@ -2042,7 +2052,13 @@ def fleet_loop(
         else:
             per_repo_results[repo_key] = result
             attention_events.extend(_extract_attention_events(repo_key, result))
-            observed_repo_keys.add(repo_key)
+            if result.data.get("deadline_deferred"):
+                # Issue #1948: a lane cut short mid-pass did NOT observe
+                # every tracked issue -- same "absence of a check is not
+                # evidence of health" rule as skipped/errored lanes.
+                deadline_partial_repo_keys.append(repo_key)
+            else:
+                observed_repo_keys.add(repo_key)
 
             # Count orphan sweep calls (B6a interaction)
             # Each loop() call internally triggers orphan sweep via
@@ -2199,6 +2215,8 @@ def fleet_loop(
                         limit=limit,
                         merge=merge,
                         ensure_labels=ensure_labels,
+                        # Issue #1948: thread the pass deadline into the lane.
+                        deadline_exceeded=_deadline_exceeded,
                     )
                 except Exception:
                     lock.release()
@@ -2284,7 +2302,7 @@ def fleet_loop(
     # kills the whole supervisor. One summary event per pass (not one per
     # deferred item) keeps volume low; the deferred repo keys themselves are
     # also in the returned CommandResult's ``deferred`` field.
-    if deferred_repo_keys or deferred_autoscale_prologue:
+    if deferred_repo_keys or deferred_autoscale_prologue or deadline_partial_repo_keys:
         try:
             # write-gate-exempt(issue=1832): no write_gate param; sibling raw calls remain
             log_event(
@@ -2295,6 +2313,9 @@ def fleet_loop(
                     "elapsed_seconds": pass_clock() - pass_started_at,
                     "deferred_repo_keys": deferred_repo_keys,
                     "deferred_autoscale_prologue": deferred_autoscale_prologue,
+                    # Issue #1948: lanes the deadline cut short mid-pass --
+                    # these ran (partially), unlike deferred_repo_keys.
+                    "deadline_partial_repo_keys": deadline_partial_repo_keys,
                 },
             )
         except Exception:
@@ -2408,6 +2429,7 @@ def fleet_loop(
             "pruned": pruned_keys,
             "deferred": deferred_repo_keys,
             "deferred_autoscale_prologue": deferred_autoscale_prologue,
+            "deadline_partial_repo_keys": deadline_partial_repo_keys,
             "api_worker_report": api_worker_report.to_dict()
             if api_worker_report is not None
             else None,

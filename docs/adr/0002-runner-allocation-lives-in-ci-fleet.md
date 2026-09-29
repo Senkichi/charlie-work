@@ -1,0 +1,11 @@
+# Runner allocation lives in ci_fleet
+
+Runner provisioning, slot allocation, and the allocation pass were extracted from this repo into the separate `ci_fleet` package. PR #869 (merged 2026-08-01) repointed every consumer at `ci_fleet.charlie_work_adapter`; issue #921 (PR #928, merged 2026-08-04) deleted the four dormant local copies (`runners.py`, `runner_slots.py`, `runner_allocation.py`, `runner_allocation_pass.py`) once the coverage-porting precondition (#898) was discharged. The commits and PR bodies record how the extraction was staged, but not why the package was split out. Since 2026-08-28 `ci_fleet` is consumed as a PyPI wheel rather than an editable sibling checkout (`8c61d076`, `docs/ci-fleet-version-bump.md`).
+
+## Consequences
+
+- A surviving reference to `charlie_work.runners` or `charlie_work.runner_allocation` is a stale name that raises `ImportError`, not a second implementation.
+- The `runner_allocation` config section stays here and is live. `config.py` re-exports `RunnerAllocationConfig` and `RunnerScalingConfig` from `ci_fleet.config` under a deliberate `noqa: F401` and does the section parsing and the cross-section floor check against `runner_scaling` (#600). Deleting the section because the module of the same name is gone would silently disable allocation. #921 deliberately left it alone.
+- The re-export is load-bearing. The dataclasses are compared and `isinstance`-checked across the seam, and two structurally identical frozen dataclasses are never equal, so a local re-declaration breaks equality at runtime without breaking any import. `tests/test_ci_fleet_seams.py` guards this (`test_config_dataclasses_are_one_class_not_two`, `test_config_instances_compare_equal_across_the_seam`), along with the moved `GitHubError` and the injected event sink and reader.
+- `tests/test_dormant_fleet_marking.py` derives the dormant-module set from the import graph (now empty) and fails if a new module has a test file and no importer in `src/`.
+- The safety properties of allocation (never stop a busy listener, never traverse outside `managed_root`) are `ci_fleet`'s code now, but a change here can still violate them through the adapter (`CLAUDE.md`, "Runner slots").
