@@ -1944,6 +1944,18 @@ def test_build_config_from_data_require_worker_github_token_rejects_non_bool() -
         build_config_from_data({"dispatch": {"require_worker_github_token": "true"}})
 
 
+def test_build_config_from_data_archive_unreachable_local_commits_rejects_non_bool() -> None:
+    """Issue #1944: dispatch.archive_unreachable_local_commits must be a bool."""
+    with pytest.raises(ConfigError, match="archive_unreachable_local_commits.*must be a bool"):
+        build_config_from_data({"dispatch": {"archive_unreachable_local_commits": "false"}})
+
+
+def test_build_config_from_data_archive_unreachable_local_commits_accepts_bool() -> None:
+    """Issue #1944: a real bool value round-trips onto config.dispatch."""
+    config = build_config_from_data({"dispatch": {"archive_unreachable_local_commits": False}})
+    assert config.dispatch.archive_unreachable_local_commits is False
+
+
 def test_build_config_from_data_ci_capacity_headroom_ratio_rejects_non_number() -> None:
     """Issue #1770: dispatch.ci_capacity_headroom_ratio must be a number."""
     with pytest.raises(ConfigError, match="ci_capacity_headroom_ratio.*must be a number"):
