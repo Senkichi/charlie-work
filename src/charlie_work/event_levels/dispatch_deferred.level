@@ -1,0 +1,6 @@
+warning
+# Issue #1986: a dispatch/dispatch_rework pass returned ok=True without
+# launching anything because of a deferral (fleet lock held, state lock
+# busy, GraphQL budget, GitHub error). Warning: handled and retried next
+# pass, but before this event such a pass was indistinguishable from
+# "nothing to do" -- the operator must be able to see it.
