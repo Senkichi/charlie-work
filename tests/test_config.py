@@ -320,13 +320,13 @@ def test_load_config_quota_probe_enabled_rejects_non_bool(tmp_path: Path) -> Non
         load_config(config_file)
 
 
-def test_load_config_fleet_supervisor_self_deploy_pull_ci_fleet_default() -> None:
+def test_load_config_supervisor_self_deploy_pull_ci_fleet_default() -> None:
     """FleetSupervisorConfig.self_deploy_pull_ci_fleet defaults to False (issue #552)."""
     config = load_config(Path("nonexistent.yaml"))
     assert config.fleet_supervisor.self_deploy_pull_ci_fleet is False
 
 
-def test_load_config_fleet_supervisor_self_deploy_pull_ci_fleet_accepts_true(
+def test_load_config_supervisor_self_deploy_pull_ci_fleet_accepts_true(
     tmp_path: Path,
 ) -> None:
     config_file = tmp_path / "orchestrator.config.yaml"
