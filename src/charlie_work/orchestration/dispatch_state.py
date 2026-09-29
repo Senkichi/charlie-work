@@ -47,6 +47,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 import charlie_work.workflow as _wf
+from charlie_work.worker_pid_stamp import stamp_worker_process
 from charlie_work.adapters import SessionRequest, cleanup_stale_session_tmp_files
 from charlie_work.backlog_reachability import (
     classify_backlog_reachability,
@@ -1403,9 +1404,7 @@ def _dispatch_impl(
                     (r for r in dispatch_results if r.issue_number == request.issue_number),
                     None,
                 )
-                if result and result.pid is not None:
-                    entry["worker_pid"] = result.pid
-                    entry["worker_process_start_time"] = result.process_start_time
+                stamp_worker_process(entry, result)
             # Issue #1000: stamp the citation-drift fingerprint computed in
             # the outside-lock loop. The comment was already posted there
             # (best-effort); this persists the dedup marker so a still-stale

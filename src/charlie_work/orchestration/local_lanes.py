@@ -37,6 +37,7 @@ from typing import Any, Sequence
 
 import charlie_work.superseded_worker_reap as superseded_worker_reap
 import charlie_work.workflow as _wf
+from charlie_work.worker_pid_stamp import stamp_worker_process
 from charlie_work.adapters import SessionRequest
 from charlie_work.claude_code import resolve_review_effort
 from charlie_work.github import GitHubError
@@ -1977,6 +1978,11 @@ def _local_dispatch_rework(self) -> dict[str, Any]:
                 "dispatched_at": _wf.utc_now() if ok else None,
             }
             entry.pop("dispatch_pending_at", None)
+            if ok:
+                stamp_worker_process(
+                    entry,
+                    next((r for r in dispatch_results if r.issue_number == issue_number), None),
+                )
             state["issues"][str(issue_number)] = entry
             if not ok:
                 result["failed"].append(

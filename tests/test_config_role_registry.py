@@ -171,7 +171,7 @@ def test_worker_role_config_defaults_and_frozen() -> None:
 def test_reviewer_role_config_defaults_and_frozen() -> None:
     cfg = ReviewerRoleConfig()
     assert cfg.harness == "claude-code"
-    assert cfg.model == "claude-sonnet-5"
+    assert cfg.model == "claude-sonnet-5-5"
     assert cfg.effort == ""
     assert cfg.effort_experiment_fraction == 0.0
     assert cfg.effort_experiment_salt == ""
@@ -181,11 +181,11 @@ def test_reviewer_role_config_defaults_and_frozen() -> None:
 
 def test_rescue_config_worker_and_reviewer_role_defaults() -> None:
     cfg = RescueConfig()
-    assert cfg.worker == WorkerRoleConfig(harness="claude-code", model="claude-opus-4-1")
+    assert cfg.worker == WorkerRoleConfig(harness="claude-code", model="claude-opus-5-5")
     assert cfg.reviewer == WorkerRoleConfig(harness="devin", model="codex")
     # Legacy fields are untouched by this task -- still their own defaults.
     assert cfg.worker_adapter == "claude-code"
-    assert cfg.worker_model == "claude-opus-4-1"
+    assert cfg.worker_model == "claude-opus-5-5"
     assert cfg.reviewer_adapter == "devin"
     assert cfg.reviewer_model == "codex"
 
