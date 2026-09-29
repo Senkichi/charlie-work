@@ -800,7 +800,7 @@ def classify_worker_health(
                     has_terminal_error = True
                     break
         if view.adapter_kind == "api":
-            from .claude_code import _provider_suspension_in_tail
+            from .worker_fate import _provider_suspension_in_tail
 
             tail = log_text[-2048:] if len(log_text) > 2048 else log_text
             if _provider_suspension_in_tail(tail):

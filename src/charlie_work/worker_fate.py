@@ -23,35 +23,64 @@ subject). ``classify_worker_health`` and ``is_worker_confirmed_dead`` stay in
 ``worker.py`` — they own the inconclusive-probe deferral counter (#755) and
 this module only consumes their output through ``FateEvidence.health``.
 
-Deliberately NOT in this commit (see the design doc sections 5-7 and the
-plan's Group A table, steps A2-A4): the ``AdapterFateProfile`` registry,
-``classify_failure``, ``profile_for``, ``persisted_failure``/``persist_fate``/
-``stale_evidence_events``, and ``default_readers`` production wiring. Those
-depend on merging two still-drifted adapter classifiers
-(``claude_code._classify_session_failure`` vs
-``devin_failure_classification._classify_session_failure``, issue #1997) and
-on new ``state.py``/``process_utils.py`` fields, and are wiring-adjacent in a
-way this slice's "no consumers yet" boundary is meant to keep out. Until
-then, ``FateEvidence.failure`` is supplied by the caller (or a test) as
+``wf-4-wire-a`` (this commit) adds the internal Adapter seam (design doc
+§7): ``classify_failure`` merges ``claude_code._classify_session_failure``
+and ``devin_failure_classification._classify_session_failure`` (issue
+#1997 — the devin-only emission-time throttle anchor becomes a profile
+flag, ``legacy_classification_anchor``, rather than two copies of the
+function); ``AdapterFateProfile``/``profile_for`` replace the 14
+``w.adapter_kind ==`` branches in ``dead_worker_reap.py`` and the two
+``_classify_session_failure`` duplicates in ``claude_code.py`` /
+``devin_shell.py`` (now thin wrappers around ``classify_failure``).
+
+Still deliberately NOT in this commit (see the design doc §6 and the
+plan's Group A/B tables): ``persisted_failure``/``persist_fate``/
+``stale_evidence_events`` (they depend on a fate-resolution loop actually
+running over ``dead_worker_reap.py``'s workers, which is Group B, not this
+wiring step — the 3 direct ``record_dead_worker_failure_kind`` calls stay
+in place), and ``default_readers`` production wiring. Until then,
+``FateEvidence.failure`` is still supplied by the caller (or a test) as
 already-classified data — ``resolve_fate`` only ever reads
 ``FailureEvidence.kind``/``throttled_until``, never produces them.
 
-No consumer in ``src/`` calls into this module yet. Wiring happens in later
-commits named after the plan's Group A/B steps.
+``is_worker_alive`` (claude_code.py) / ``is_session_alive`` (devin_shell.py)
+are deliberately NOT touched by this commit either, despite being the
+other half of design doc §7's "what it deletes" list (A2, not A3/A4).
+``tests/test_charlie_work_dispatch_phantom.py`` monkeypatches
+``charlie_work.claude_code.is_pid_alive`` directly (with an explicit
+comment explaining why: it is the only way to pin PID 4242's liveness
+without depending on host process-table state) — a patch that only stays
+effective while ``is_worker_alive``'s body keeps calling its own module's
+``is_pid_alive`` name literally. Redirecting the body to
+``worker_fate.is_alive`` would silently make that patch inert. A2's
+26-call-site rewiring (including ``WorkerView.is_alive`` in ``worker.py``,
+outside this commit's file list) is left for its own step, where the
+monkeypatch can be updated deliberately alongside the body change instead
+of as a side effect of this one.
+
+No consumer resolves a full ``WorkerFate`` yet (Group B). Wiring happens
+in later commits named after the plan's Group A/B steps.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+import re
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
+from .config import OrchestratorConfig
 from .process_utils import is_pid_alive as _process_is_pid_alive
-from .throttle_signatures import is_provider_throttle_failure
-from .worker import WorkerHealth
+from .throttle_signatures import (
+    is_provider_throttle_failure,
+    match_quota_tail,
+    match_throttle_tail,
+)
+from .worker import WorkerHealth, WorkerView
 
 _EMPTY_RAW: Mapping[str, Any] = MappingProxyType({})
 
@@ -589,3 +618,381 @@ def worker_fate(subject: WorkerSubject, readers: FateReaders, *, now: datetime) 
     """Convenience: gather, then resolve."""
     evidence = gather_evidence(subject, readers, now=now)
     return resolve_fate(evidence, now=now)
+
+
+# --------------------------------------------------------------------------
+# Failure classification (§6) and the internal Adapter seam (§7).
+#
+# ``classify_failure`` merges ``claude_code._classify_session_failure`` and
+# ``devin_failure_classification._classify_session_failure``. The two were
+# identical except for two things, both now data instead of two copies of
+# the function:
+#   - account-error detection (``provider_suspended``/``provider_auth``,
+#     api only) was ``adapter_kind == "api"``; now ``account_error_detection``.
+#   - the ``rate_limited`` cooldown anchor: devin already anchors at the
+#     message's *emission* time (issue #1997 -- classification can run tens
+#     of minutes after the log line was written, so anchoring "now" plus a
+#     15-minute cooldown overshoots the real provider reset by that much);
+#     claude-code/api still anchor at *classification* time. Porting #1997
+#     to claude-code/api fleet-wide is a real behaviour change, so it stays
+#     opt-in per profile (``legacy_classification_anchor``) behind FLIP 6
+#     (wf-design.md §9) until its own dedicated flip commit.
+# --------------------------------------------------------------------------
+
+_CLASSIFY_DEFAULT_THROTTLE_ERROR_MARKERS = OrchestratorConfig().runtime.throttle_error_markers
+_CLASSIFY_DEFAULT_QUOTA_ERROR_MARKERS = OrchestratorConfig().runtime.quota_error_markers
+_DEFAULT_RATE_LIMIT_COOLDOWN_MINUTES = 15
+_DEFAULT_QUOTA_COOLDOWN_HOURS = 24
+
+# Provider authentication failures (issue #484). Matched against the log tail
+# of account-error-detecting (api) sessions only. Moved verbatim from
+# claude_code.py -- see git history there for the full false-positive
+# rationale (word-boundary 401/403 so a coincidental numeric substring like
+# "issue #4019" cannot trip a false cooldown).
+_PROVIDER_AUTH_PATTERN = re.compile(
+    r"\b401\b|\b403\b|authentication(?:\s+failed)?|unauthorized|"
+    r"invalid[-\s]?api[-\s]?key|invalid[-\s]?authentication|"
+    r"permission_denied|auth(?:entication)?\s+error",
+    re.IGNORECASE,
+)
+
+# Provider account suspension / insufficient-balance responses (issue #1342).
+# Moved verbatim from claude_code.py. The billing phrase alone is not
+# enough -- ``_provider_suspension_in_tail`` requires it to co-occur on the
+# same log line as a structural API-error signal (HTTP 402 or a CLI
+# ``Error:``/``API Error:`` prefix), or a worker merely quoting/reviewing the
+# trigger phrase would misclassify.
+_PROVIDER_SUSPENDED_PHRASE = re.compile(
+    r"insufficient\s+(?:balance|funds|credit)"
+    r"|account\s+(?:is\s+)?suspended"
+    r"|suspended\s+due\s+to\s+(?:insufficient\s+balance|billing|payment|unpaid)"
+    r"|recharge\s+your\s+account"
+    r"|please\s+recharge",
+    re.IGNORECASE,
+)
+_PROVIDER_SUSPENDED_ANCHOR = re.compile(
+    r"^\s*(?:api\s+)?error\s*:|\b402\b",
+    re.IGNORECASE,
+)
+
+
+def _provider_suspension_in_tail(tail: str) -> bool:
+    """True if ``tail`` has a structurally-anchored account-suspension
+    signature: the billing phrase and the API-error anchor on the SAME line.
+    """
+    for line in tail.splitlines():
+        if _PROVIDER_SUSPENDED_PHRASE.search(line) and _PROVIDER_SUSPENDED_ANCHOR.search(line):
+            return True
+    return False
+
+
+# Headless permission-denial signature (issue #2010): a ``claude -p`` session
+# that cannot answer a permission prompt ends by asking the operator to
+# approve command execution. That is a config defect, not a blocked task, so
+# it gets its own failure kind (``permission_denied``) instead of escalating.
+# Moved verbatim from claude_code.py (origin/main 7293cb71).
+PERMISSION_DENIED_FAILURE_KIND = "permission_denied"
+_HEADLESS_PERMISSION_DENIAL_PATTERN = re.compile(
+    r"approve\s+(?:the\s+)?(?:command|bash|tool)\s+execution|"
+    r"requires?\s+(?:your\s+)?approval|"
+    r"(?:command|tool)\s+(?:was|were)\s+(?:denied|not\s+allowed)|"
+    r"permission\s+to\s+run\s+(?:this|these|the)\s+(?:command|bash)",
+    re.IGNORECASE,
+)
+
+
+def is_headless_permission_denial(text: str) -> bool:
+    """True when ``text`` (a log tail or outcome detail) shows the headless
+    permission-denial signature."""
+    return bool(_HEADLESS_PERMISSION_DENIAL_PATTERN.search(text))
+
+
+# Issue #1997: a tz-aware ISO-8601 timestamp on a tail line marks when the
+# provider emitted the throttle message -- a better anchor than the
+# classification-time clock. Moved verbatim from devin_failure_classification.py.
+_TAIL_LINE_TS_PATTERN = re.compile(
+    r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})"
+)
+
+
+def _tail_emission_timestamp(tail: str) -> datetime | None:
+    """The tz-aware timestamp on the tail's last timestamped line, scanning
+    backwards so the most recent one wins. None when no line has one --
+    naive (offset-less) timestamps are skipped since their zone is unknown.
+    """
+    for line in reversed(tail.splitlines()):
+        match = _TAIL_LINE_TS_PATTERN.search(line)
+        if match is None:
+            continue
+        try:
+            return datetime.fromisoformat(match.group(0))
+        except ValueError:
+            continue
+    return None
+
+
+def _throttle_emission_anchor(log_path: Path, tail: str, *, now: datetime) -> datetime:
+    """Anchor for a provider-throttle window: when the message was emitted,
+    not when it was classified. The tail's own timestamp when a line carries
+    one, else the log's mtime (the last write to a dead worker's log is the
+    death message), else ``now``. Clamped to ``now``: a future mtime/tail
+    timestamp is clock/mtime skew, not evidence the reset also moved.
+    """
+    anchor = _tail_emission_timestamp(tail)
+    if anchor is None:
+        try:
+            anchor = datetime.fromtimestamp(log_path.stat().st_mtime, tz=UTC)
+        except OSError:
+            anchor = now
+    return min(anchor, now)
+
+
+def classify_failure(
+    log_path: Path,
+    throttle_error_markers: Sequence[str] | None = None,
+    *,
+    quota_error_markers: Sequence[str] | None = None,
+    resume_margin_seconds: int = 0,
+    account_error_detection: bool = False,
+    headless_permission_detection: bool = False,
+    legacy_classification_anchor: bool = False,
+    now: datetime | None = None,
+) -> tuple[str | None, str | None]:
+    """Classify a session failure by matching the log tail against provider
+    throttle/auth/suspension signatures. Called after a session exits.
+
+    Returns (failure_kind, throttled_until_iso):
+    - failure_kind: "provider_suspended" | "provider_auth" | "rate_limited" |
+      "quota_exhausted" | "permission_denied" | None
+    - throttled_until_iso: ISO timestamp the cooldown ends, or None (always
+      None for "provider_suspended" -- terminal, no cooldown)
+
+    ``account_error_detection`` (api only) enables the ``provider_suspended``
+    (#1342) and ``provider_auth`` (#484) checks, both checked before
+    quota/throttle so neither masquerades as a transient issue.
+
+    ``headless_permission_detection`` (claude-code, issue #2010) enables the
+    ``permission_denied`` check. It is checked LAST so throttle/auth
+    signatures still win.
+
+    ``legacy_classification_anchor`` picks the ``rate_limited`` anchor: True
+    (claude-code/api, FLIP 6) anchors at classification time
+    (``resolved_now + cooldown``); False (devin) anchors at the message's
+    emission time (issue #1997 -- see ``_throttle_emission_anchor``).
+    ``quota_exhausted`` always anchors at classification time on both paths
+    -- its fixed 24h cooldown has no provider-stated reset to anchor
+    against, so this flag does not affect it.
+
+    ``now`` is the injectable clock: defaults to ``datetime.now(UTC)`` when
+    not supplied, so production behaviour is byte-identical (issue #822).
+    """
+    if not log_path.exists():
+        return None, None
+
+    try:
+        log_text = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None, None
+
+    resolved_now = now if now is not None else datetime.now(UTC)
+    # Check the last 2KB of the log (where error messages appear).
+    tail = log_text[-2048:] if len(log_text) > 2048 else log_text
+
+    if account_error_detection and _provider_suspension_in_tail(tail):
+        return "provider_suspended", None
+
+    if account_error_detection and _PROVIDER_AUTH_PATTERN.search(tail):
+        cooldown = timedelta(hours=_DEFAULT_QUOTA_COOLDOWN_HOURS, seconds=resume_margin_seconds)
+        throttled_until = resolved_now + cooldown
+        return "provider_auth", throttled_until.replace(microsecond=0).isoformat().replace(
+            "+00:00", "Z"
+        )
+
+    quota_markers = (
+        quota_error_markers
+        if quota_error_markers is not None
+        else _CLASSIFY_DEFAULT_QUOTA_ERROR_MARKERS
+    )
+    if match_quota_tail(tail, quota_markers):
+        cooldown = timedelta(hours=_DEFAULT_QUOTA_COOLDOWN_HOURS, seconds=resume_margin_seconds)
+        throttled_until = resolved_now + cooldown
+        return "quota_exhausted", throttled_until.replace(microsecond=0).isoformat().replace(
+            "+00:00", "Z"
+        )
+
+    markers = (
+        throttle_error_markers
+        if throttle_error_markers is not None
+        else _CLASSIFY_DEFAULT_THROTTLE_ERROR_MARKERS
+    )
+    matched, reset_minutes = match_throttle_tail(tail, markers)
+    if matched:
+        cooldown = timedelta(
+            minutes=reset_minutes
+            if reset_minutes is not None
+            else _DEFAULT_RATE_LIMIT_COOLDOWN_MINUTES,
+            seconds=resume_margin_seconds,
+        )
+        if legacy_classification_anchor:
+            # FLIP 6: claude-code/api still anchor at classification time.
+            throttled_until = resolved_now + cooldown
+        else:
+            emitted_at = _throttle_emission_anchor(log_path, tail, now=resolved_now)
+            throttled_until = max(resolved_now, emitted_at + cooldown)
+        return "rate_limited", throttled_until.replace(microsecond=0).isoformat().replace(
+            "+00:00", "Z"
+        )
+
+    # Issue #2010: last, so throttle/auth signatures still win.
+    if headless_permission_detection and is_headless_permission_denial(tail):
+        return PERMISSION_DENIED_FAILURE_KIND, None
+
+    return None, None
+
+
+@dataclass(frozen=True)
+class AdapterFateProfile:
+    """The internal Adapter seam (design doc §7): one place that knows how
+    each harness reports liveness and failure, replacing the 14
+    ``w.adapter_kind ==`` branches in ``dead_worker_reap.py``.
+    """
+
+    harness: str  # key in harnesses.HARNESS_REGISTRY / WORKER_HARNESSES
+    view_kinds: frozenset[str]  # WorkerView.adapter_kind spellings ("devin" for devin-shell)
+    writes_terminal_record: bool  # claude-code, api: True; devin-shell: False (follow-up)
+    probes_process: bool  # manual: False (no PID); others: True
+    account_error_detection: bool  # api only: provider_suspended / provider_auth
+    legacy_classification_anchor: bool  # FLIP 6 (see classify_failure's docstring)
+    record_failure: Callable[..., tuple[str | None, str | None]] | None
+    # (sessions_dir, issue_number, *, fallback_kind, config, now) -> the
+    # existing update_worker_record_with_failure_classification /
+    # update_session_record_with_failure_classification sidecar writer.
+    over_budget: Callable[[WorkerView, OrchestratorConfig], bool] | None  # api only
+
+
+_PROFILES: dict[str, AdapterFateProfile] | None = None
+
+
+def _build_profiles() -> dict[str, AdapterFateProfile]:
+    """Build the by-harness profile table, then index it by ``view_kinds``.
+
+    Imports the adapter modules lazily (function body, not module top
+    level): ``claude_code``/``devin_shell`` reach back into this module's
+    ``classify_failure`` from inside their own functions, so a top-level
+    import here would cycle. This function only ever runs at call time
+    (from ``profile_for``), by which point every module involved has
+    already finished loading, so the cycle risk does not apply to a lazy
+    import -- only to a module-level one.
+
+    ``update_worker_record_with_failure_classification`` (claude-code, api)
+    takes an ``adapter_kind`` kwarg that selects both the sidecar filename
+    suffix and account-error detection -- unlike ``update_session_record_
+    with_failure_classification`` (devin), which has no such parameter.
+    ``functools.partial`` binds each profile's value in at registry-build
+    time so every call site can call ``record_failure`` with the exact same
+    positional/keyword shape regardless of which adapter it resolved to,
+    without changing either function's own signature.
+    """
+    from functools import partial
+
+    from .claude_code import update_worker_record_with_failure_classification
+    from .devin_shell import update_session_record_with_failure_classification
+    from .harnesses import WORKER_HARNESSES
+    from .worker import _api_session_over_budget
+
+    by_harness = {
+        "devin-shell": AdapterFateProfile(
+            harness="devin-shell",
+            view_kinds=frozenset({"devin"}),
+            writes_terminal_record=False,
+            probes_process=True,
+            account_error_detection=False,
+            legacy_classification_anchor=False,
+            record_failure=update_session_record_with_failure_classification,
+            over_budget=None,
+        ),
+        "claude-code": AdapterFateProfile(
+            harness="claude-code",
+            view_kinds=frozenset({"claude-code"}),
+            writes_terminal_record=True,
+            probes_process=True,
+            account_error_detection=False,
+            legacy_classification_anchor=True,  # FLIP 6
+            record_failure=partial(
+                update_worker_record_with_failure_classification, adapter_kind="claude-code"
+            ),
+            over_budget=None,
+        ),
+        "api": AdapterFateProfile(
+            harness="api",
+            view_kinds=frozenset({"api"}),
+            writes_terminal_record=True,
+            probes_process=True,
+            account_error_detection=True,
+            legacy_classification_anchor=True,  # FLIP 6
+            record_failure=partial(
+                update_worker_record_with_failure_classification, adapter_kind="api"
+            ),
+            over_budget=_api_session_over_budget,
+        ),
+        # "command" and "manual" have no failure-classification or budget
+        # consumer today: dead_worker_reap.py's 14 sites never branch on
+        # either adapter_kind, and neither harness has an issue driving
+        # account-error detection or an over-budget check. Declared here
+        # (all capabilities off) purely so the WORKER_HARNESSES completeness
+        # assert below covers all 5 harnesses, matching the adapters.py
+        # #1513 pattern this seam follows -- not because either capability
+        # is known to be correct for them. A future consumer that needs
+        # real values for these two should fill them in then, not infer
+        # them from this placeholder.
+        "command": AdapterFateProfile(
+            harness="command",
+            view_kinds=frozenset({"command"}),
+            writes_terminal_record=False,
+            probes_process=True,
+            account_error_detection=False,
+            legacy_classification_anchor=False,
+            record_failure=None,
+            over_budget=None,
+        ),
+        "manual": AdapterFateProfile(
+            harness="manual",
+            view_kinds=frozenset({"manual"}),
+            writes_terminal_record=False,
+            probes_process=False,
+            account_error_detection=False,
+            legacy_classification_anchor=False,
+            record_failure=None,
+            over_budget=None,
+        ),
+    }
+    assert {p.harness for p in by_harness.values()} == WORKER_HARNESSES, (
+        "worker_fate._build_profiles must declare exactly the harnesses "
+        "harnesses.WORKER_HARNESSES declares valid -- keep both in sync "
+        "(adapters.py #1513 completeness-assert pattern)"
+    )
+    return by_harness
+
+
+def profile_for(adapter_kind: str) -> AdapterFateProfile | None:
+    """Look up the seam profile by ``WorkerView.adapter_kind`` spelling
+    (e.g. ``"devin"``, not the harness name ``"devin-shell"``).
+
+    Returns ``None`` for an unrecognized value rather than raising. The
+    design doc's §7 says an unknown value "raises KeyError at the seam" --
+    deviated from deliberately here: the 4 triplet call sites in
+    ``dead_worker_reap.py`` disagree today on what an unrecognized
+    ``adapter_kind`` should do (one keeps a pre-set ``fallback_kind``,
+    three default to ``(None, None)``), so a raising ``profile_for`` would
+    turn each site's existing graceful degradation into a crash. Returning
+    ``None`` lets every call site keep its own pre-existing fallback.
+    """
+    global _PROFILES
+    if _PROFILES is None:
+        by_harness = _build_profiles()
+        _PROFILES = {
+            view_kind: profile
+            for profile in by_harness.values()
+            for view_kind in profile.view_kinds
+        }
+    return _PROFILES.get(adapter_kind)

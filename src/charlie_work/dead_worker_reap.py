@@ -525,20 +525,16 @@ def _detect_and_handle_stalled_sessions(
     dead-session lane.
     """
     write_gate = require_write_gate(write_gate)
-    from .claude_code import update_worker_record_with_failure_classification
-    from .devin_shell import (
-        get_rate_limit_defer_until,
-        update_session_record_with_failure_classification,
-    )
+    from .devin_shell import get_rate_limit_defer_until
     from .post_mortem import classify_and_record
     from .worker import (
         _next_inconclusive_probe_deferred_count,
-        _api_session_over_budget,
         classify_worker_health,
         iter_workers,
         real_activity_probe_for,
         update_worker_log_stat,
     )
+    from .worker_fate import profile_for
 
     if not config.watchdog.enabled:
         return []
@@ -568,6 +564,13 @@ def _detect_and_handle_stalled_sessions(
     for w in iter_workers(sessions_dir):
         if w.pid is None or w.error is not None:
             continue
+
+        # The Adapter seam (design doc §7): one profile lookup per worker,
+        # reused below for both the budget check and the failure
+        # classification triplet -- replaces this function's two former
+        # ``w.adapter_kind ==`` branch groups (the budget check and the
+        # 3-way classification triplet).
+        profile = profile_for(w.adapter_kind)
 
         # Update log stat fields for progress tracking. This also clears any
         # stale rate-limit defer deadline when the log has resumed growing.
@@ -621,7 +624,11 @@ def _detect_and_handle_stalled_sessions(
         # reaped) — not reimplemented here. Issue #1325: both the tree kill
         # and the orphan kill now route through ``write_gate`` so
         # ``dry_run=True`` suppresses them.
-        if w.adapter_kind == "api" and _api_session_over_budget(w, config):
+        if (
+            profile is not None
+            and profile.over_budget is not None
+            and profile.over_budget(w, config)
+        ):
             killed_pids = write_gate.kill_process_tree(w.pid, w.process_start_time)
             orphan_pids_budget: list[int] = []
             orphan_processes = sweep_orphan_processes(w.worktree_path)
@@ -753,9 +760,19 @@ def _detect_and_handle_stalled_sessions(
             if not write_gate.dry_run:
                 classify_and_record(sessions_dir, config, w, now=now)
 
-            # Classify the sidecar (adapter-specific dispatch): log-tail
-            # classification runs first, falling back to failure_kind "stalled"
-            # only when the log shows no provider throttle signature.
+            # Classify the sidecar via the Adapter seam (design doc §7):
+            # ``profile.record_failure`` is
+            # ``update_session_record_with_failure_classification`` (devin)
+            # or ``update_worker_record_with_failure_classification``
+            # (claude-code, api -- the api sidecar suffix and account-error
+            # detection are bound in at registry-build time, see
+            # ``worker_fate._build_profiles``). Log-tail classification runs
+            # first, falling back to failure_kind "stalled" only when the
+            # log shows no provider throttle signature. An unrecognized
+            # ``adapter_kind`` (``profile is None``) or a profile with no
+            # writer (``record_failure is None``) leaves both values ``None``,
+            # matching this site's pre-seam behaviour of silently skipping
+            # classification for an adapter it didn't recognize.
             # Issue #1325: gated on ``write_gate.dry_run`` so the sidecar is
             # not mutated under ``--dry-run``. Under dry-run the return values
             # stay ``None``, which means no ``throttled_until`` is persisted
@@ -765,42 +782,18 @@ def _detect_and_handle_stalled_sessions(
             # happened," which is exactly what ``--dry-run`` promises.
             resolved_failure_kind: str | None = None
             throttled_until: str | None = None
-            if not write_gate.dry_run:
-                if w.adapter_kind == "devin":
-                    resolved_failure_kind, throttled_until = (
-                        update_session_record_with_failure_classification(
-                            sessions_dir,
-                            w.issue_number,
-                            fallback_kind="stalled",
-                            config=config,
-                            now=now,
-                        )
-                    )
-                elif w.adapter_kind == "claude-code":
-                    resolved_failure_kind, throttled_until = (
-                        update_worker_record_with_failure_classification(
-                            sessions_dir,
-                            w.issue_number,
-                            fallback_kind="stalled",
-                            config=config,
-                            now=now,
-                        )
-                    )
-                elif w.adapter_kind == "api":
-                    # api sidecars share the claude-code classification helper but
-                    # land as issue-<n>.api.json and get provider-auth classification
-                    # (issue #484). adapter_kind="api" selects both the sidecar
-                    # suffix and the auth-pattern check inside _classify_session_failure.
-                    resolved_failure_kind, throttled_until = (
-                        update_worker_record_with_failure_classification(
-                            sessions_dir,
-                            w.issue_number,
-                            fallback_kind="stalled",
-                            config=config,
-                            adapter_kind="api",
-                            now=now,
-                        )
-                    )
+            if (
+                not write_gate.dry_run
+                and profile is not None
+                and profile.record_failure is not None
+            ):
+                resolved_failure_kind, throttled_until = profile.record_failure(
+                    sessions_dir,
+                    w.issue_number,
+                    fallback_kind="stalled",
+                    config=config,
+                    now=now,
+                )
 
             if resolved_failure_kind and throttled_until:
                 # A throttle signature was found in the log tail even though
@@ -1795,14 +1788,13 @@ def _classify_dead_sessions_and_update_throttle_state(
     wall-clock-tolerance proximity check.
     """
     write_gate = require_write_gate(write_gate)
-    from .claude_code import update_worker_record_with_failure_classification
-    from .devin_shell import update_session_record_with_failure_classification
     from .post_mortem import classify_and_record
     from .state import load_state, set_throttled_until, state_lock
     from .worker import (
         is_worker_confirmed_dead,
         iter_workers,
     )
+    from .worker_fate import profile_for
     from .worker_literal_tmp import emit_literal_tmp_path_warning
     from .worktree import WorktreeState
 
@@ -1848,34 +1840,23 @@ def _classify_dead_sessions_and_update_throttle_state(
     reaped: list[dict[str, Any]] = []
 
     for w in iter_workers(sessions_dir):
+        # The Adapter seam (design doc §7): one profile lookup per worker,
+        # reused by every classification branch below (launch-failed,
+        # completed-but-unpublished, stalled/dead) -- replaces this
+        # function's 3 former ``w.adapter_kind ==`` branch-group triplets
+        # plus the suspension-event branch further down.
+        profile = profile_for(w.adapter_kind)
         if w.pid is None and w.error is not None:
             # Launch-failure sidecar: terminal by construction (issue #266).
             # The process never launched, so it can never transition to live.
             failure_kind = "launch_failed"
             throttled_until = None
-            if w.adapter_kind == "devin":
-                failure_kind, throttled_until = update_session_record_with_failure_classification(
+            if profile is not None and profile.record_failure is not None:
+                failure_kind, throttled_until = profile.record_failure(
                     sessions_dir,
                     w.issue_number,
                     fallback_kind=failure_kind,
                     config=config,
-                    now=now_for_health,
-                )
-            elif w.adapter_kind == "claude-code":
-                failure_kind, throttled_until = update_worker_record_with_failure_classification(
-                    sessions_dir,
-                    w.issue_number,
-                    fallback_kind=failure_kind,
-                    config=config,
-                    now=now_for_health,
-                )
-            elif w.adapter_kind == "api":
-                failure_kind, throttled_until = update_worker_record_with_failure_classification(
-                    sessions_dir,
-                    w.issue_number,
-                    fallback_kind=failure_kind,
-                    config=config,
-                    adapter_kind="api",
                     now=now_for_health,
                 )
             if failure_kind:
@@ -2084,39 +2065,14 @@ def _classify_dead_sessions_and_update_throttle_state(
                 # quota/rate-limit/auth failure, so log-tail marker matching
                 # (which would otherwise treat the session's own completion
                 # summary prose as fair game) is skipped entirely.
-                if w.adapter_kind == "devin":
-                    failure_kind, throttled_until = (
-                        update_session_record_with_failure_classification(
-                            sessions_dir,
-                            w.issue_number,
-                            fallback_kind="unpublished_work",
-                            config=config,
-                            session_completed=True,
-                            now=now_for_health,
-                        )
-                    )
-                elif w.adapter_kind == "claude-code":
-                    failure_kind, throttled_until = (
-                        update_worker_record_with_failure_classification(
-                            sessions_dir,
-                            w.issue_number,
-                            fallback_kind="unpublished_work",
-                            config=config,
-                            session_completed=True,
-                            now=now_for_health,
-                        )
-                    )
-                elif w.adapter_kind == "api":
-                    failure_kind, throttled_until = (
-                        update_worker_record_with_failure_classification(
-                            sessions_dir,
-                            w.issue_number,
-                            fallback_kind="unpublished_work",
-                            config=config,
-                            adapter_kind="api",
-                            session_completed=True,
-                            now=now_for_health,
-                        )
+                if profile is not None and profile.record_failure is not None:
+                    failure_kind, throttled_until = profile.record_failure(
+                        sessions_dir,
+                        w.issue_number,
+                        fallback_kind="unpublished_work",
+                        config=config,
+                        session_completed=True,
+                        now=now_for_health,
                     )
                 else:
                     failure_kind, throttled_until = None, None
@@ -2126,36 +2082,13 @@ def _classify_dead_sessions_and_update_throttle_state(
             else:
                 classify_and_record(sessions_dir, config, w, now=datetime.now(UTC))
                 fallback_kind = "stalled" if inspection.state != WorktreeState.UNKNOWN else None
-                if w.adapter_kind == "devin":
-                    failure_kind, throttled_until = (
-                        update_session_record_with_failure_classification(
-                            sessions_dir,
-                            w.issue_number,
-                            fallback_kind=fallback_kind,
-                            config=config,
-                            now=now_for_health,
-                        )
-                    )
-                elif w.adapter_kind == "claude-code":
-                    failure_kind, throttled_until = (
-                        update_worker_record_with_failure_classification(
-                            sessions_dir,
-                            w.issue_number,
-                            fallback_kind=fallback_kind,
-                            config=config,
-                            now=now_for_health,
-                        )
-                    )
-                elif w.adapter_kind == "api":
-                    failure_kind, throttled_until = (
-                        update_worker_record_with_failure_classification(
-                            sessions_dir,
-                            w.issue_number,
-                            fallback_kind=fallback_kind,
-                            config=config,
-                            adapter_kind="api",
-                            now=now_for_health,
-                        )
+                if profile is not None and profile.record_failure is not None:
+                    failure_kind, throttled_until = profile.record_failure(
+                        sessions_dir,
+                        w.issue_number,
+                        fallback_kind=fallback_kind,
+                        config=config,
+                        now=now_for_health,
                     )
                 else:
                     failure_kind, throttled_until = None, None
@@ -2212,7 +2145,7 @@ def _classify_dead_sessions_and_update_throttle_state(
             # there is no redispatch, hence exactly one episode and no spam.
             # The sidecar was just reaped, so the next pass won't re-see this
             # worker — the event fires once per episode by construction.
-            if w.adapter_kind == "api" and failure_kind == "provider_suspended":
+            if failure_kind == "provider_suspended":
                 with state_lock(state_file):
                     state = load_state(state_file)
                     state = write_gate.append_event(
