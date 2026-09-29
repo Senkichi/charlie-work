@@ -37,7 +37,10 @@ never green.
 
 **One gate per repo.** Base merges serialize anyway, so at most one suite is
 in flight: other approved records get a ``local_merge_deferred`` event and
-wait for the next pass.
+wait for the next pass. The in-flight flag is seeded from the persisted
+claims and live runner pid files before the ordered walk
+(``_local_gate_any_in_flight``), so the bound does not depend on where the
+record holding the gate sorts.
 
 Every top-level ``def`` is installed on ``OrchestratorApp`` by
 ``workflow_delegation._install_delegates``; workflow helpers are reached
@@ -120,9 +123,16 @@ def _local_merge_approved(self) -> list[dict[str, Any]]:
     """
     results: list[dict[str, Any]] = []
     state = _wf.load_state_locked(self.paths.state_file)
-    gate_in_flight = False
+    records = sorted(local_pr_records(state).items(), key=lambda kv: int(kv[0]))
+    # The one-gate bound cannot be derived from iteration order: a flag that
+    # fills in only as the walk proceeds never sees a claimed higher-numbered
+    # record before an unclaimed lower-numbered one, and the lower record
+    # would launch a second concurrent suite beside the first. Seed from the
+    # persisted claims and live runner pid files so the in-flight gate holds
+    # for the whole pass, wherever its record sorts.
+    gate_in_flight = self._local_gate_any_in_flight(records)
 
-    for pr_key, record in sorted(local_pr_records(state).items(), key=lambda kv: int(kv[0])):
+    for pr_key, record in records:
         pr_number = int(pr_key)
         issue_number = int(record.get("issue_number") or pr_number)
         entry: dict[str, Any] = {"issue": issue_number, "pr": pr_number}
@@ -242,6 +252,32 @@ def _local_merge_approved(self) -> list[dict[str, Any]]:
     return results
 
 
+def _local_gate_any_in_flight(
+    self,
+    records: list[tuple[str, dict[str, Any]]],
+) -> bool:
+    """Whether any lane record already has a merge-gate suite in flight.
+
+    Seeds ``gate_in_flight`` before ``_local_merge_approved``'s ordered walk.
+    A record holds the gate when it carries a persisted claim
+    (``local_suite_pid`` -- a dead claimed pid still holds it, because the
+    orphan path relaunches rather than freeing the gate mid-pass) or when it
+    is still ``approved`` with a live ``suite-runner.json`` the adopt step
+    will re-attach. Claims count regardless of record status: a claimed
+    record leaving ``approved`` is aborted later in the same pass, and
+    deferring a launch one pass beats two suites running side by side.
+    """
+    for pr_key, record in records:
+        if record.get("local_suite_pid"):
+            return True
+        if record.get("status") != "approved":
+            continue
+        paths = local_suite_runner.suite_gate_paths(self.paths.dispatches, int(pr_key))
+        if self._local_gate_live_runner_meta(paths) is not None:
+            return True
+    return False
+
+
 def _local_gate_event(
     self,
     kind: str,
@@ -310,6 +346,29 @@ def _local_gate_abort(
     )
 
 
+def _local_gate_live_runner_meta(
+    self,
+    paths: local_suite_runner.SuiteGatePaths,
+) -> dict[str, Any] | None:
+    """The wrapper's pid-file metadata when it names a live runner process.
+
+    One liveness predicate shared by ``_local_gate_adopt`` and
+    ``_local_gate_any_in_flight``: a pid file only holds the gate while the
+    fingerprint-checked process it names is still alive. A dead or malformed
+    file means nothing is in flight -- the launch path scrubs the stale
+    artifacts anyway.
+    """
+    meta = local_suite_runner.read_gate_pid(paths)
+    if meta is None:
+        return None
+    pid = meta.get("pid")
+    if not isinstance(pid, int) or pid <= 0:
+        return None
+    if not is_pid_alive(pid, meta.get("process_start_time")):
+        return None
+    return meta
+
+
 def _local_gate_adopt(
     self,
     *,
@@ -326,14 +385,10 @@ def _local_gate_adopt(
     """
     pr_number = int(pr_key)
     paths = local_suite_runner.suite_gate_paths(self.paths.dispatches, pr_number)
-    meta = local_suite_runner.read_gate_pid(paths)
+    meta = self._local_gate_live_runner_meta(paths)
     if meta is None:
         return False
-    pid = meta.get("pid")
-    if not isinstance(pid, int) or pid <= 0:
-        return False
-    if not is_pid_alive(pid, meta.get("process_start_time")):
-        return False
+    pid = meta["pid"]
     self._local_gate_update(
         pr_key,
         {

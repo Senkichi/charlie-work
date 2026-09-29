@@ -216,6 +216,21 @@ def _kill_claimed_gate(app: OrchestratorApp, pr_number: int) -> int:
     return pid
 
 
+def _kill_any_claimed_gates(app: OrchestratorApp, *pr_numbers: int) -> None:
+    """Kill every suite tree the records claim; tolerant of missing claims.
+
+    Cleanup for the multi-record ordering tests must also cover the buggy
+    shape they assert against -- a run that wrongly launched a second suite
+    leaves a claim on the lower-numbered record too.
+    """
+    state = load_state_locked(app.paths.state_file)
+    for pr_number in pr_numbers:
+        record = state["prs"].get(str(pr_number), {})
+        pid = record.get("local_suite_pid")
+        if isinstance(pid, int) and pid > 0:
+            kill_process_tree(pid, record.get("local_suite_process_start_time"))
+
+
 def _strip_claim_fields(app: OrchestratorApp, pr_number: int) -> None:
     """Erase the in-flight claim -- simulates a crash between the wrapper's
     Popen and the claim write, or any state loss that orphaned the runner."""
@@ -391,6 +406,83 @@ def test_second_approved_record_deferred_while_gate_in_flight(lane_repo: Path) -
         assert state["prs"]["8"].get("local_suite_pid") is None
     finally:
         _kill_claimed_gate(app, 7)
+
+
+def test_unclaimed_lower_record_defers_while_higher_gate_claimed(lane_repo: Path) -> None:
+    """Regression: the one-gate-per-repo bound must not depend on iteration
+    order. A higher-numbered record already holds a live claimed suite; the
+    walk reaches the lower-numbered unclaimed record first, so a flag that
+    only fills in as the walk proceeds would launch a second concurrent
+    suite. PR 7 must defer, not launch."""
+    _init_repo(lane_repo)
+    issues_dir = lane_repo / "docs" / "issues"
+    head7 = _make_branch(lane_repo, "agent/issue-7-x", "a.py", "a = 1\n")
+    head9 = _make_branch(lane_repo, "agent/issue-9-z", "c.py", "c = 1\n")
+    config = _lane_config(lane_repo, issues_dir, dispatch={"test_command": SLEEP_SUITE})
+    app = _lane_app(lane_repo, issues_dir, config=config)
+    # Only the higher-numbered record is approved for the first pass, so it
+    # owns the in-flight gate; the lower-numbered record is approved after.
+    _adopt_and_approve(app, issues_dir, 9, "agent/issue-9-z", head9)
+    first = app._local_merge_approved()
+    assert first[0]["outcome"] == "suite_launched"
+    pid9 = int(load_state_locked(app.paths.state_file)["prs"]["9"]["local_suite_pid"])
+    _adopt_and_approve(app, issues_dir, 7, "agent/issue-7-x", head7)
+
+    results = app._local_merge_approved()
+
+    try:
+        by_issue = {r["issue"]: r for r in results}
+        assert by_issue[7]["outcome"] == "deferred"
+        assert by_issue[9]["outcome"] == "suite_running"
+        deferred = _events_of_kind(app, "local_merge_deferred")
+        assert deferred
+        assert deferred[-1]["payload"]["issue_number"] == 7
+        assert "in flight" in deferred[-1]["payload"]["detail"]
+        state = load_state_locked(app.paths.state_file)
+        # No second runner pid or claim for the deferred record, and PR 9's
+        # suite is still the only one running.
+        assert state["prs"]["7"]["status"] == "approved"
+        assert state["prs"]["7"].get("local_suite_pid") is None
+        assert int(state["prs"]["9"]["local_suite_pid"]) == pid9
+        assert is_pid_alive(pid9)
+        assert len(_events_of_kind(app, "local_suite_launched")) == 1
+    finally:
+        _kill_any_claimed_gates(app, 7, 9)
+
+
+def test_unclaimed_lower_record_defers_while_higher_runner_adopted(lane_repo: Path) -> None:
+    """Same ordering bound through the crash-recovery path: a live
+    ``suite-runner.json`` on a higher-numbered record whose claim write never
+    landed still holds the gate -- the adopt step re-attaches it and the
+    lower-numbered unclaimed record defers rather than launching beside it."""
+    _init_repo(lane_repo)
+    issues_dir = lane_repo / "docs" / "issues"
+    head7 = _make_branch(lane_repo, "agent/issue-7-x", "a.py", "a = 1\n")
+    head9 = _make_branch(lane_repo, "agent/issue-9-z", "c.py", "c = 1\n")
+    config = _lane_config(lane_repo, issues_dir, dispatch={"test_command": SLEEP_SUITE})
+    app = _lane_app(lane_repo, issues_dir, config=config)
+    _adopt_and_approve(app, issues_dir, 9, "agent/issue-9-z", head9)
+    app._local_merge_approved()
+    meta = _wait_for_pid_file(app, 9)
+    pid9 = int(meta["pid"])
+    _strip_claim_fields(app, 9)
+    _adopt_and_approve(app, issues_dir, 7, "agent/issue-7-x", head7)
+
+    results = app._local_merge_approved()
+
+    try:
+        by_issue = {r["issue"]: r for r in results}
+        assert by_issue[7]["outcome"] == "deferred"
+        assert by_issue[9]["outcome"] == "suite_running"
+        assert by_issue[9]["adopted"] is True
+        state = load_state_locked(app.paths.state_file)
+        assert int(state["prs"]["9"]["local_suite_pid"]) == pid9
+        assert state["prs"]["7"].get("local_suite_pid") is None
+        assert len(_events_of_kind(app, "local_suite_launched")) == 1
+        assert is_pid_alive(pid9)
+    finally:
+        kill_process_tree(pid9)
+        _kill_any_claimed_gates(app, 7, 9)
 
 
 def test_restart_mid_suite_resumes_no_double_launch(lane_repo: Path) -> None:
