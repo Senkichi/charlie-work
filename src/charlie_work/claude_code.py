@@ -37,6 +37,7 @@ from charlie_work.process_utils import (
     parse_proc_stat_starttime,
     popen_worker,
     start_terminal_status_watcher,
+    terminal_record_proves_completion,
     worker_terminal_status_path,
 )
 from .config import (
@@ -1809,9 +1810,15 @@ def update_worker_record_with_failure_classification(
     if payload.get("failure_kind") is not None:
         return payload.get("failure_kind"), None
 
+    # Derive completion here too, not only from callers (#656 left it opt-in and
+    # the stall-reap lane never opted in): a terminal record proving this pid
+    # exited 0 with a worker outcome makes the log tail completion prose.
+    completed = session_completed or terminal_record_proves_completion(
+        sessions_dir, issue_number, _sidecar_suffix(adapter_kind), payload.get("pid")
+    )
     classified_kind: str | None = None
     throttled_until: str | None = None
-    log_path_str = payload.get("log_path") if not session_completed else None
+    log_path_str = payload.get("log_path") if not completed else None
     if log_path_str:
         if config is not None:
             throttle_markers = config.runtime.throttle_error_markers
