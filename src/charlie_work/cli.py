@@ -292,6 +292,17 @@ def build_parser() -> argparse.ArgumentParser:
     unescalate = subparsers.add_parser("unescalate")
     unescalate.add_argument("--pr", type=int, default=None)
     unescalate.add_argument("--issue", type=int, default=None)
+    unescalate.add_argument(
+        "--requeue",
+        action="store_true",
+        help=(
+            "Drop the issue back to the never-dispatched baseline even on a "
+            "no-remote repo whose finished worker branch would otherwise be "
+            "parked for the local path (agent:review-ready). Use when a "
+            "fresh worker should start over instead of reviewing the parked "
+            "work (issue #1970)."
+        ),
+    )
     _add_dry_run(unescalate)
 
     merge_check = subparsers.add_parser(
@@ -2421,7 +2432,7 @@ def run_command(app: OrchestratorApp, args: argparse.Namespace) -> CommandResult
             return CommandResult(False, f"OS error: {exc}", {})
     if args.command == "unescalate":
         try:
-            return app.unescalate(args.pr, args.issue, dry_run=args.dry_run)
+            return app.unescalate(args.pr, args.issue, dry_run=args.dry_run, requeue=args.requeue)
         except OSError as exc:
             return CommandResult(False, f"OS error: {exc}", {})
     if args.command == "merge-check":

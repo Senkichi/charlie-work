@@ -16,6 +16,8 @@ import json
 
 from charlie_work.github import GitHubError
 from charlie_work.labels import TransitionOutcome
+from charlie_work.local_lane import branch_diff, local_base_branch
+from charlie_work.local_work_park import publishes_pull_requests
 from charlie_work.review_decision import record_decision
 from charlie_work.state import (
     PASSIVE_OPEN_STATUS,
@@ -264,6 +266,7 @@ def unescalate(
     issue_number: int | None = None,
     *,
     dry_run: bool = False,
+    requeue: bool = False,
 ) -> _wf.CommandResult:
     """Operator re-arm for a PR/issue parked in the human/operator sink.
 
@@ -291,7 +294,15 @@ def unescalate(
       but nothing re-queues it, an invisible park replacing a visible one.
     - Issue with no live PR: drop the issue back to the never-dispatched
       baseline and strip workflow labels (``unescalated_requeued``) so
-      dispatch treats it as fresh.
+      dispatch treats it as fresh -- with one exception (issue #1970): on
+      a backend that cannot publish pull requests the worker's branch IS
+      the deliverable, so when the issue's branch still carries a diff
+      against the local base the issue is parked for the local path
+      instead -- ``open_passive`` status + the ``local_work_ready`` edge
+      (``agent:review-ready``), the same park ``park_unpublishable_work``
+      performs at a dead worker, so ``_local_review_packets`` adopts the
+      branch on the next pass. ``--requeue`` forces the drop for an
+      operator who wants a fresh worker even when finished work exists.
     - Issue carrying a merged-PR mention flag: the flag path
       (``dispatch_merged_pr_mention_flagged``) deliberately leaves
       ``status`` untouched, so a mention-flagged issue parks in the
@@ -457,6 +468,7 @@ def unescalate(
     # writer (e.g. a reconcile pass) touched in the meantime.
     transitions: dict[str, list[Any]] = {}
     label_edge: str | None = None
+    parked_branch: str | None = None
 
     pr_status_target: str | None = None
     if pr_number is not None and pr_stuck:
@@ -559,6 +571,24 @@ def unescalate(
             # and the mention_rearmed_at stamp below.
             issue_status_action = "drop"
             label_edge = "unescalated_requeued"
+            # Issue #1970: on a backend that cannot publish pull requests
+            # the worker's branch IS the deliverable, so "no live PR" is
+            # the normal end state of a *finished* worker rather than
+            # proof there is nothing to keep. Dropping here discards that
+            # work (or loops it through #1944's diverged-branch
+            # re-escalation). When the issue's branch still diffs against
+            # the local base, park it for the local path instead:
+            # ``local_work_ready`` is the same ``agent:review-ready``
+            # transition ``park_unpublishable_work`` applies at a dead
+            # worker, and ``open_passive`` is the converged placeholder
+            # ``_local_review_packets`` adopts from on the next pass.
+            # ``--requeue`` forces the drop for an operator who wants a
+            # fresh worker even when finished work exists.
+            if not requeue:
+                parked_branch = self._local_finished_branch(issue_number, issue_state)
+                if parked_branch is not None:
+                    issue_status_action = "passive"
+                    label_edge = "local_work_ready"
 
     def _apply_issue_reset(entry: dict[str, Any]) -> dict[str, Any]:
         updated = dict(entry)
@@ -621,6 +651,7 @@ def unescalate(
                 "issue": issue_number,
                 "transitions": transitions,
                 "label_edge": label_edge,
+                "parked_branch": parked_branch,
                 "mention_rearmed": mention_flagged,
                 "blocked_environment_at_reset": prior_blocked_environment_count > 0,
                 "blocked_environment_at_prior_count": prior_blocked_environment_count,
@@ -732,6 +763,7 @@ def unescalate(
                 "issue_number": issue_number,
                 "transitions": transitions,
                 "label_edge": label_edge,
+                "parked_branch": parked_branch,
                 "mention_rearmed": mention_rearmed,
                 "blocked_environment_at_reset": prior_blocked_environment_count > 0,
                 "blocked_environment_at_prior_count": prior_blocked_environment_count,
@@ -771,6 +803,8 @@ def unescalate(
         message += f" ({summary})"
     if mention_rearmed:
         message += " (mention flag re-armed)"
+    if parked_branch is not None:
+        message += f" (parked branch {parked_branch} for the local path)"
     if label_error:
         message += f" (label update failed: {label_error['outcome']})"
     return _wf.CommandResult(
@@ -781,6 +815,7 @@ def unescalate(
             "issue": issue_number,
             "transitions": transitions,
             "label_edge": label_edge,
+            "parked_branch": parked_branch,
             "label_error": label_error,
             "mention_rearmed": mention_rearmed,
             "verdict_voided": verdict_voided,
@@ -788,6 +823,35 @@ def unescalate(
             "changed": True,
         },
     )
+
+
+def _local_finished_branch(self, issue_number: int, issue_entry: dict[str, Any]) -> str | None:
+    """The issue's worker branch when it still holds parkable work, else None.
+
+    Issue #1970: ``unescalate``'s no-live-PR branch uses this to decide
+    whether an escalated issue on a no-remote backend has a deliverable
+    worth handing to the local path (``agent:review-ready``) rather than
+    dropping back to the never-dispatched baseline.
+
+    Returns None -- keep the drop -- when the backend publishes pull
+    requests (there is nothing to park), when no worker branch resolves,
+    or when the branch carries no diff against the local base. A
+    ``branch_diff`` failure (missing ref, no merge base) returns None just
+    like an empty diff: uncertainty is never proof of work, matching
+    ``park_salvageable_local_orphan``'s fallback rule. The branch is
+    resolved by ``_local_branch_for_issue`` -- the same resolver the
+    adoption pass uses -- so a name this returns is one the local path can
+    actually adopt on the next pass.
+    """
+    if publishes_pull_requests(self.gh):
+        return None
+    branch = self._local_branch_for_issue(issue_number, issue_entry)
+    if not branch:
+        return None
+    base_branch = local_base_branch(self.repo_root) or "HEAD"
+    if not branch_diff(self.repo_root, base_branch, branch):
+        return None
+    return branch
 
 
 def ack_unauthorized_merge(
