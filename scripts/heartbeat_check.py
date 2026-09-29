@@ -938,6 +938,120 @@ def check_orchestrator_config(report: Report, repo: RepoInfo) -> None:
 
 
 # --------------------------------------------------------------------------
+# Markdown block-structure scan -- stdlib-only duplicate (architecture-
+# deepening plan, candidate 3 "markdown structure";
+# `docs/superpowers/plans/2026-09-29-architecture-deepening.md`)
+#
+# `charlie_work.markdown_fence.scan` is the shared CommonMark-correct scan
+# side seven hand-rolled fence/blockquote/heading scanners across the repo
+# should eventually converge on (full inventory: `md-recon.md`, wave A
+# scratchpad). This script cannot import it -- it is deliberately
+# stdlib-only (see the module docstring and `scripts/README.md:50-51`), with
+# exactly one narrow, already-documented exception
+# (`charlie_work.event_kinds`, loaded via `heartbeat_event_alarms.py`) that
+# this is not. So this is a genuine duplicate, not a reuse: the same
+# algorithm, reimplemented from scratch against the same
+# `tests/markdown_conformance_cases.py` ground-truth table
+# (`tests/test_markdown_conformance.py` runs that table against both).
+#
+# This does NOT replace `_FENCED_CODE_BLOCK_RE` below, which
+# `_mentioned_issue_numbers` still uses -- wiring a consumer onto
+# CommonMark-correct scanning is a deliberate, separate, later step (the
+# plan's own rule: characterize current behaviour first, flip it in a named
+# commit after). `tests/test_markdown_structure_characterization.py`'s two
+# `test_flip_heartbeat_check_*` tests pin `_FENCED_CODE_BLOCK_RE`'s current
+# (CommonMark-deviating) behaviour for exactly that reason and must keep
+# passing until that later step flips them on purpose.
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _MarkdownStructure:
+    """The three views every surveyed consumer needs, line-indexed against
+    ``text.splitlines()`` (0-indexed, no keepends) -- see `FenceSpan` in
+    `charlie_work.markdown_fence` for the ``fenced_line_spans`` half-open
+    convention this mirrors exactly.
+    """
+
+    fenced_line_spans: tuple[tuple[int, int], ...]
+    quoted_lines: frozenset[int]
+    heading_lines: tuple[int, ...]
+
+
+# CommonMark fenced-code-block delimiter: 0-3 leading spaces/tabs, then 3+
+# of the same backtick or tilde character, then an optional info string.
+_MD_FENCE_DELIM_RE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})[ \t]*(.*)$")
+# CommonMark blockquote marker: 0-3 leading spaces/tabs, then `>`.
+_MD_BLOCKQUOTE_RE = re.compile(r"^[ \t]{0,3}>")
+# CommonMark ATX heading: 0-3 leading spaces/tabs, 1-6 `#`, then either
+# end-of-line or at least one space/tab before whatever heading text follows.
+_MD_ATX_HEADING_RE = re.compile(r"^[ \t]{0,3}#{1,6}([ \t].*)?$")
+
+
+def _md_find_fence_close(lines: list[str], start: int, char: str, length: int) -> int | None:
+    """First line index >= start closing a ``char``-fence opened at ``length``.
+
+    Also called for a rejected opener (backtick-in-info-string): the text up
+    to its nearest same-char, long-enough closer reads as a malformed code
+    block either way, so both consume the same region -- they differ only in
+    whether the caller records a span for it. See `charlie_work.
+    markdown_fence._find_fence_close`, which this mirrors exactly.
+    """
+    close_re = re.compile(rf"^[ \t]{{0,3}}{re.escape(char)}{{{length},}}[ \t]*$")
+    for index in range(start, len(lines)):
+        if close_re.match(lines[index]):
+            return index
+    return None
+
+
+def _scan_markdown_structure(text: str) -> _MarkdownStructure:
+    """Scan ``text`` for CommonMark block-level structure.
+
+    Stdlib-only reimplementation of `charlie_work.markdown_fence.scan`; see
+    that function's docstring for the CommonMark rules implemented.
+    """
+    lines = text.splitlines()
+    fenced_spans: list[tuple[int, int]] = []
+    quoted: set[int] = set()
+    heading_lines: list[int] = []
+
+    line_count = len(lines)
+    index = 0
+    while index < line_count:
+        line = lines[index]
+
+        delimiter = _MD_FENCE_DELIM_RE.match(line)
+        if delimiter is not None:
+            run, info = delimiter.group(1), delimiter.group(2).strip()
+            char, length = run[0], len(run)
+            valid_opener = not (char == "`" and "`" in info)
+            close_at = _md_find_fence_close(lines, index + 1, char, length)
+            end = close_at + 1 if close_at is not None else line_count
+            if valid_opener:
+                fenced_spans.append((index, end))
+            index = end
+            continue
+
+        if _MD_BLOCKQUOTE_RE.match(line):
+            quoted.add(index)
+            index += 1
+            continue
+
+        if _MD_ATX_HEADING_RE.match(line):
+            heading_lines.append(index)
+            index += 1
+            continue
+
+        index += 1
+
+    return _MarkdownStructure(
+        fenced_line_spans=tuple(fenced_spans),
+        quoted_lines=frozenset(quoted),
+        heading_lines=tuple(heading_lines),
+    )
+
+
+# --------------------------------------------------------------------------
 # Stale-open-issue-mention scanning primitives (issue #902)
 #
 # charlie_work.github already has `issue_numbers_mentioned_by_pr` (a same-repo
