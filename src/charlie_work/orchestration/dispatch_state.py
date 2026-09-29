@@ -245,16 +245,10 @@ def _dispatch_impl(
                 "sessions": [],
                 "dispatch_results": [],
                 "merged_prs": merged_prs_for_tripwire,
-                "deferred_reason": "provider_throttled_fleet"
-                if resume.action == "defer_throttled"
-                else "provider_resume_staggered",
-                "throttled_until": resume.throttled_until.isoformat()
-                if resume.throttled_until
-                else None,
+                **resume.deferral_data(),
             },
         )
-    if resume.action == "admit_one":
-        dispatch_limit = min(dispatch_limit, 1)
+    dispatch_limit = resume.cap_limit(dispatch_limit)
 
     def _resolve_merged_prs(
         outcome: _wf._MergedPRListOutcome | None,
@@ -1123,11 +1117,7 @@ def _dispatch_impl(
         self._adapter_settings(),
         session_requests,
     )
-    if resume.action == "admit_one" and session_requests:
-        fleet_provider_throttle.note_probe_launch(
-            fleet_provider_throttle.worker_adapter_kind(self.config.worker.harness),
-            fleet_dir_override=self.fleet_dir_override,
-        )
+    fleet_provider_throttle.note_probe_from_results(self, resume, dispatch_results)
     successful_issue_numbers = {result.issue_number for result in dispatch_results if result.ok}
     # Issue #523: a live_worker_redispatch_averted result claims the prior
     # worker is still alive, but the adapter's probe (_probe_recovery_liveness)

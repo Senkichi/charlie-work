@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -126,7 +127,7 @@ def test_expired_window_admits_one_then_staggers_until_probe_survives(tmp_path: 
     first = fpt.decide_launch([paths_a.state_file], "devin", now=now, **kw)
     assert first.action == "admit_one"
 
-    fpt.note_probe_launch("devin", now=now, **kw)
+    fpt.note_probe_launch("devin", [(os.getpid(), None)], now=now, **kw)
     soon = fpt.decide_launch([paths_a.state_file], "devin", now=now + timedelta(minutes=2), **kw)
     assert soon.action == "defer_probe"
 
@@ -152,7 +153,7 @@ def test_probe_in_flight_defers_rework_in_other_repo(tmp_path: Path) -> None:
     app_b, paths_b = _rework_app(tmp_path, "b", "devin-shell", fleet)
     _register(fleet, paths_a, paths_b)
     _throttle(paths_a, until=datetime.now(UTC) - timedelta(minutes=1))
-    fpt.note_probe_launch("devin", fleet_dir_override=str(fleet))
+    fpt.note_probe_launch("devin", [(os.getpid(), None)], fleet_dir_override=str(fleet))
 
     result = app_b.dispatch_rework()
 

@@ -208,12 +208,7 @@ def _dispatch_rework_impl(
         data = {
             "adapter": self.config.worker.harness,
             "selected_count": 0,
-            "deferred_reason": "provider_throttled_fleet"
-            if resume.action == "defer_throttled"
-            else "provider_resume_staggered",
-            "throttled_until": resume.throttled_until.isoformat()
-            if resume.throttled_until
-            else None,
+            **resume.deferral_data(),
         }
         if gov.any_term_enabled:
             data.update(gov.report_fields())
@@ -222,8 +217,7 @@ def _dispatch_rework_impl(
             f"rework dispatch deferred: fleet provider throttle ({resume.action})",
             data,
         )
-    if resume.action == "admit_one":
-        rework_limit = min(rework_limit, 1)
+    rework_limit = resume.cap_limit(rework_limit)
 
     # Dry-run: read-only planning — compute selection and would-be
     # SessionRequests, but skip all state writes, label transitions,
@@ -1263,20 +1257,15 @@ def _dispatch_rework_impl(
     rescue_requests = [r for r in launchable_requests if r.issue_number in rescue_issue_numbers]
     dispatch_results: list[SessionDispatchResult] = list(superseded_blocked_results)
     if normal_requests:
-        dispatch_results.extend(
-            _wf.dispatch_sessions(
-                self.repo_root,
-                manifest_path,
-                results_path,
-                self._adapter_settings(),
-                normal_requests,
-            )
+        normal_results = _wf.dispatch_sessions(
+            self.repo_root,
+            manifest_path,
+            results_path,
+            self._adapter_settings(),
+            normal_requests,
         )
-        if resume.action == "admit_one":
-            fleet_provider_throttle.note_probe_launch(
-                fleet_provider_throttle.worker_adapter_kind(self.config.worker.harness),
-                fleet_dir_override=self.fleet_dir_override,
-            )
+        dispatch_results.extend(normal_results)
+        fleet_provider_throttle.note_probe_from_results(self, resume, normal_results)
     if rescue_requests:
         dispatch_results.extend(
             _wf.dispatch_sessions(

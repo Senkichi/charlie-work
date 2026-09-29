@@ -22,20 +22,29 @@ its launch time, further launches for that adapter are deferred until the
 probe has lived ``RESUME_SURVIVAL_SECONDS``, and each pass admits at most one
 launch while no probe has survived. A probe that dies of the limit re-arms a
 newer window (its ``throttled_until`` is later than the probe's stamp), which
-puts the adapter straight back into probe mode -- no liveness tracking needed.
+puts the adapter straight back into probe mode.
+
+That window can lag the death by many minutes (the reaper only records it once
+it classifies the dead worker's log), so "no newer window" is *not* survival.
+The stamp therefore records the probe's pid(s); the fleet reopens only while a
+probe process is provably still alive after the survival period, and a probe
+that is dead with no window recorded is re-probed (``admit_one``), never
+treated as having survived. Survival is persisted (``survived_at``) so a probe
+that later finishes normally does not put the fleet back into probe mode.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from .layout import fleet_dir
+from .process_utils import is_pid_alive
 from .state import advisory_file_lock, save_state
 
 logger = logging.getLogger(__name__)
@@ -53,16 +62,42 @@ RESUME_PROBE_FILENAME = "provider_resume_probe.json"
 _DEFAULT_ADAPTER_KIND = "claude-code"
 
 
+ResumeAction = Literal["open", "defer_throttled", "defer_probe", "admit_one"]
+
+
 @dataclass(frozen=True)
 class ResumeDecision:
     """Outcome of the fleet gate for one adapter on one launch pass."""
 
-    action: str  # "open" | "defer_throttled" | "defer_probe" | "admit_one"
+    action: ResumeAction
     throttled_until: datetime | None = None
+    #: True when ``open`` was granted because a probe proved alive past the
+    #: survival period and that fact is not yet persisted.
+    probe_survived: bool = False
 
     @property
     def deferred(self) -> bool:
         return self.action in ("defer_throttled", "defer_probe")
+
+    @property
+    def deferred_reason(self) -> str | None:
+        """Stable ``deferred_reason`` for a deferred decision, else ``None``."""
+        if self.action == "defer_throttled":
+            return "provider_throttled_fleet"
+        if self.action == "defer_probe":
+            return "provider_resume_staggered"
+        return None
+
+    def deferral_data(self) -> dict[str, Any]:
+        """``deferred_reason`` / ``throttled_until`` fields for a deferred result."""
+        return {
+            "deferred_reason": self.deferred_reason,
+            "throttled_until": self.throttled_until.isoformat() if self.throttled_until else None,
+        }
+
+    def cap_limit(self, limit: int) -> int:
+        """A probe pass admits at most one launch; otherwise ``limit`` unchanged."""
+        return min(limit, 1) if self.action == "admit_one" else limit
 
 
 def _parse_iso(value: Any) -> datetime | None:
@@ -127,33 +162,101 @@ def decide_launch(
     if latest > resolved_now:
         return ResumeDecision("defer_throttled", throttled_until=latest)
     probe = _read_json(resume_probe_path(fleet_dir_override)).get(adapter_kind)
-    probe_at = _parse_iso(probe.get("launched_at")) if isinstance(probe, dict) else None
+    if not isinstance(probe, dict):
+        return ResumeDecision("admit_one", throttled_until=latest)
+    probe_at = _parse_iso(probe.get("launched_at"))
     if probe_at is None or probe_at < latest:
+        return ResumeDecision("admit_one", throttled_until=latest)
+    survived_at = _parse_iso(probe.get("survived_at"))
+    if survived_at is not None and survived_at >= latest:
+        return ResumeDecision("open", throttled_until=latest)
+    if not _any_probe_alive(probe.get("probes")):
+        # Probe died (or was never provably running) and no window says why:
+        # the fleet must not reopen on the strength of silence.
         return ResumeDecision("admit_one", throttled_until=latest)
     if resolved_now - probe_at < timedelta(seconds=RESUME_SURVIVAL_SECONDS):
         return ResumeDecision("defer_probe", throttled_until=latest)
-    return ResumeDecision("open", throttled_until=latest)
+    return ResumeDecision("open", throttled_until=latest, probe_survived=True)
 
 
-def note_probe_launch(
-    adapter_kind: str,
-    *,
-    fleet_dir_override: str | None = None,
-    now: datetime | None = None,
+def _any_probe_alive(probes: Any) -> bool:
+    if not isinstance(probes, list):
+        return False
+    for entry in probes:
+        if not isinstance(entry, dict) or not isinstance(entry.get("pid"), int):
+            continue
+        start = entry.get("process_start_time")
+        if is_pid_alive(entry["pid"], start if isinstance(start, (int, float)) else None):
+            return True
+    return False
+
+
+def _write_probe_entry(
+    adapter_kind: str, fleet_dir_override: str | None, entry: dict[str, Any]
 ) -> None:
-    """Stamp a resume probe launch for ``adapter_kind`` (atomic, fleet-locked)."""
-    resolved_now = now if now is not None else datetime.now(UTC)
     path = resume_probe_path(fleet_dir_override)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         with advisory_file_lock(path):
             data = _read_json(path)
-            data[adapter_kind] = {"launched_at": _iso(resolved_now)}
+            data[adapter_kind] = entry
             save_state(path, data)
     except (OSError, RuntimeError) as exc:
         # Best effort: a lost stamp only means the next pass admits another
         # probe, which is the pre-#1993 behaviour, not a new failure mode.
         logger.warning("could not record resume probe for %s: %s", adapter_kind, exc)
+
+
+def note_probe_launch(
+    adapter_kind: str,
+    probes: Sequence[tuple[int, float | None]],
+    *,
+    fleet_dir_override: str | None = None,
+    now: datetime | None = None,
+) -> None:
+    """Stamp a resume probe for ``adapter_kind`` with its ``(pid, start_time)`` list."""
+    resolved_now = now if now is not None else datetime.now(UTC)
+    _write_probe_entry(
+        adapter_kind,
+        fleet_dir_override,
+        {
+            "launched_at": _iso(resolved_now),
+            "probes": [{"pid": pid, "process_start_time": start} for pid, start in probes],
+        },
+    )
+
+
+def note_probe_survived(
+    adapter_kind: str,
+    *,
+    fleet_dir_override: str | None = None,
+    now: datetime | None = None,
+) -> None:
+    """Persist that the current probe outlived the survival period."""
+    resolved_now = now if now is not None else datetime.now(UTC)
+    entry = _read_json(resume_probe_path(fleet_dir_override)).get(adapter_kind)
+    if isinstance(entry, dict):
+        _write_probe_entry(
+            adapter_kind, fleet_dir_override, {**entry, "survived_at": _iso(resolved_now)}
+        )
+
+
+def note_probe_from_results(app: Any, resume: ResumeDecision, results: Iterable[Any]) -> None:
+    """Stamp the probe after a launch pass admitted under ``admit_one``.
+
+    Only launches that succeeded and report a pid count: a failed launch is not
+    a probe, and a probe without a pid cannot prove survival (the next pass
+    simply admits another probe -- one launch, never a fleet reopening).
+    """
+    if resume.action != "admit_one":
+        return
+    probes = [(r.pid, r.process_start_time) for r in results if r.ok and r.pid is not None]
+    if probes:
+        note_probe_launch(
+            worker_adapter_kind(app.config.worker.harness),
+            probes,
+            fleet_dir_override=app.fleet_dir_override,
+        )
 
 
 def worker_adapter_kind(harness: str) -> str:
@@ -179,9 +282,8 @@ def decide_for_app(app: Any, *, now: datetime | None = None) -> ResumeDecision:
         app.paths.state_file,
         *(state_file_path(d) for d in registered_state_dirs(override)),
     ]
-    return decide_launch(
-        state_files,
-        worker_adapter_kind(app.config.worker.harness),
-        fleet_dir_override=override,
-        now=now,
-    )
+    adapter_kind = worker_adapter_kind(app.config.worker.harness)
+    decision = decide_launch(state_files, adapter_kind, fleet_dir_override=override, now=now)
+    if decision.probe_survived:
+        note_probe_survived(adapter_kind, fleet_dir_override=override, now=now)
+    return decision
