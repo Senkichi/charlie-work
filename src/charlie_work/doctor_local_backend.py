@@ -12,13 +12,15 @@ grow past its recorded mark -- new code lands in a domain module instead.
 
 from __future__ import annotations
 
+import json
 import shutil
 from pathlib import Path
 from typing import Any
 
 from .config import OrchestratorConfig
-from .github import GitHubLike
+from .github import GitHubError, GitHubLike
 from .local_issue_files import scan_issues
+from .local_lane import disabled_lane_switches, kill_switch_stall_payloads
 from .paths import RuntimePaths
 from .subprocess_runner import run_captured
 
@@ -165,3 +167,96 @@ def _check_local_issue_backend(
             if not missing
             else f"verify command binaries not on PATH: {missing}",
         )
+
+    _check_local_lane_kill_switch(add, gh, paths, config)
+
+
+def _check_local_lane_kill_switch(
+    add: Any,
+    gh: GitHubLike,
+    paths: RuntimePaths,
+    config: OrchestratorConfig,
+) -> None:
+    """Warn when a local-lane kill switch strands review-ready issues (#1968).
+
+    An explicit ``review_dispatch.enabled: false`` or
+    ``auto_merge.enabled: false`` on a ``local_issues`` repo is a deliberate
+    gate and stays honored -- but it dead-ends every finished ticket at
+    ``agent:review-ready`` with no signal. This is the same condition the
+    loop pass's ``local_lane_kill_switch_stalled`` event reports, evaluated
+    live (via ``kill_switch_stall_payloads``) so doctor shows the current
+    truth rather than the last emitted row. Warning severity: the config is
+    honored as written; the finding names the key to flip.
+    """
+    if not config.local_issues.enabled:
+        return
+    stall_hours = config.local_lane.kill_switch_stall_hours
+    if stall_hours <= 0:
+        add(
+            "local lane kill switch",
+            True,
+            "stall alarm muted — local_lane.kill_switch_stall_hours is 0",
+            severity="warning",
+        )
+        return
+    try:
+        parked = gh.issue_list(labels=[config.labels.review_ready], state="open")
+    except GitHubError as exc:
+        add(
+            "local lane kill switch",
+            False,
+            f"could not evaluate — issue scan failed: {exc} "
+            "(see 'local issues dir'/'local issue files')",
+            severity="warning",
+        )
+        return
+    issues_state: Any = {}
+    if paths.state_file.exists():
+        try:
+            raw = json.loads(paths.state_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            raw = None
+        if isinstance(raw, dict) and isinstance(raw.get("issues"), dict):
+            issues_state = raw["issues"]
+    disabled = disabled_lane_switches(
+        review_dispatch_enabled=config.review_dispatch.enabled,
+        auto_merge_enabled=config.auto_merge.enabled,
+    )
+    if not disabled:
+        add(
+            "local lane kill switch",
+            True,
+            "review_dispatch.enabled and auto_merge.enabled are on — the "
+            "local review/merge lane is armed",
+        )
+        return
+    payloads = kill_switch_stall_payloads(
+        review_dispatch_enabled=config.review_dispatch.enabled,
+        auto_merge_enabled=config.auto_merge.enabled,
+        parked=parked,
+        issues_state=issues_state,
+        stall_hours=stall_hours,
+    )
+    if not payloads:
+        add(
+            "local lane kill switch",
+            True,
+            f"{', '.join(disabled)} is off but no review-ready issue has "
+            f"waited past {stall_hours}h — the gate is honored and nothing "
+            "is stranded yet",
+            severity="warning",
+        )
+        return
+    detail = "; ".join(
+        f"{p['switch']} stranding {p['issue_numbers']} (oldest {p['oldest_age_hours']}h)"
+        for p in payloads
+    )
+    add(
+        "local lane kill switch",
+        False,
+        f"{detail} — review-ready issue(s) are dead-ending at "
+        f"{config.labels.review_ready}; set the named config key(s) to true "
+        "(or remove the explicit false) in orchestrator.config.yaml, or "
+        "expect to review/merge the parked worker branches by hand",
+        severity="warning",
+    )

@@ -1,0 +1,13 @@
+warning
+# Issue #1968: on a ``local_issues`` repo an explicit
+# ``review_dispatch.enabled: false`` or ``auto_merge.enabled: false``
+# kill switch is honored -- the gated sub-phases stay skipped -- but it
+# dead-ends every finished ticket at ``agent:review-ready`` with no
+# signal. Warning, not error: the operator's configuration is honored as
+# written and no work is lost; the alarm exists to make the deliberate
+# gate visible, not to report a failure. Emitted once per pass per
+# disabled switch while a review-ready issue is parked past
+# ``local_lane.kill_switch_stall_hours``. Consumed by
+# ``scripts/heartbeat_event_alarms.py`` (``check_local_lane_kill_switch_stalled``,
+# ANOMALY) and mirrored by ``charlie doctor``'s kill-switch check, which
+# evaluates the same condition directly.
