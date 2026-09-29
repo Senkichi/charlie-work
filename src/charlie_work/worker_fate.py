@@ -391,11 +391,16 @@ def _resolve_freshness(evidence: FateEvidence) -> _FreshOutcome:
 
 
 def _is_pushed(outcome: OutcomeEvidence, branch: BranchEvidence) -> bool:
-    """``remote_head_sha == outcome.head_sha``, or head unknown and
-    ``remote_ahead > 0`` (rows 2-4). An unknown value never proves a push.
+    """``remote_head_sha == outcome.head_sha`` when both are known, else fall
+    back to ``remote_ahead > 0`` (rows 2-4). An unknown value never proves a
+    push -- but "unknown" means either side is missing, not just the branch
+    side: an outcome that never reported its own ``head_sha`` (a common,
+    legitimate shape -- the worker still confirmed the push) must not lose a
+    real, available ``remote_ahead`` signal just because the head-SHA compare
+    itself could not run.
     """
-    if branch.remote_head_sha is not None:
-        return outcome.head_sha is not None and branch.remote_head_sha == outcome.head_sha
+    if branch.remote_head_sha is not None and outcome.head_sha is not None:
+        return branch.remote_head_sha == outcome.head_sha
     return branch.remote_ahead is not None and branch.remote_ahead > 0
 
 

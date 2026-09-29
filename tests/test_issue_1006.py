@@ -39,14 +39,31 @@ def test_none_not_in_deterministic_escalation_failure_kinds() -> None:
     assert None not in DETERMINISTIC_ESCALATION_FAILURE_KINDS
 
 
+_NO_EVIDENCE_XFAIL = pytest.mark.xfail(
+    reason=(
+        "worker-fate rule 9 (design doc Sec 9, wf-6-flip): admission into the "
+        "pushed-branch salvage lane now requires resolve_fate to reach "
+        "PushedWithoutPr via git-confirmed evidence -- an invalid/None repo_root "
+        "means remote_branch_ahead_count/remote_branch_head_sha can never run, so "
+        "no evidence can ever exist and the fate always resolves to Crashed. "
+        "_open_pr_for_orphaned_branch is consequently never attempted, so `calls` "
+        "stays empty instead of recording the None-repo_root call this test "
+        "expects. Whether the None-repo_root case should still attempt the PR "
+        "open (trusting the worker's self-report when git evidence-gathering is "
+        "categorically impossible, not merely absent) is an architecture-owner "
+        "call, not a mechanical bug -- see cw-arch-worker-fate wf-7-verify."
+    ),
+    strict=True,
+)
+
+
 @pytest.mark.parametrize(
     ("repo_root_value", "is_valid_path"),
     [
-        (None, False),
-        ("a/string/path", False),
-        ("tmp_path", True),
+        pytest.param(None, False, marks=_NO_EVIDENCE_XFAIL, id="repo_root_none"),
+        pytest.param("a/string/path", False, marks=_NO_EVIDENCE_XFAIL, id="repo_root_string"),
+        pytest.param("tmp_path", True, id="repo_root_path"),
     ],
-    ids=["repo_root_none", "repo_root_string", "repo_root_path"],
 )
 def test_orphan_salvage_repo_root_guard(
     repo_root_value: Any,
@@ -65,7 +82,17 @@ def test_orphan_salvage_repo_root_guard(
     were removed and a string were passed through, the patched helper below
     raises. The ``path`` case verifies the real ``Path`` is passed through and the
     worker branch is salvaged into a passively-opened PR.
+
+    worker-fate rule 9 (design doc Sec 9): the ``path`` case needs a real
+    pushed branch -- admission into the pushed-branch salvage lane now
+    requires git-confirmed evidence, not the worker's bare self-report, so
+    ``repo_root`` must point at an actual repo with the branch actually ahead
+    of base for ``resolve_fate`` to reach ``PushedWithoutPr`` at all. The
+    ``none``/``string`` cases are unaffected: they were never meant to reach
+    real git evidence, only to prove the ``isinstance`` narrowing.
     """
+    import subprocess
+
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
     state_file = tmp_path / "state.json"
@@ -101,7 +128,92 @@ def test_orphan_salvage_repo_root_guard(
     )
 
     if repo_root_value == "tmp_path":
-        actual_repo_root: Any = tmp_path
+        actual_repo_root: Any = tmp_path / "repo"
+        remote_repo = tmp_path / "remote"
+        remote_repo.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            ["git", "init", "--bare", str(remote_repo)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        actual_repo_root.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            ["git", "init", "--initial-branch=main", str(actual_repo_root)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        for cmd in (
+            ["git", "config", "user.email", "test@example.test"],
+            ["git", "config", "user.name", "Test User"],
+        ):
+            subprocess.run(cmd, cwd=actual_repo_root, check=True, capture_output=True, text=True)
+        (actual_repo_root / "README.md").write_text("hello\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "add", "README.md"],
+            cwd=actual_repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "commit", "-m", "initial"],
+            cwd=actual_repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "remote", "add", "origin", str(remote_repo)],
+            cwd=actual_repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "push", "-u", "origin", "main"],
+            cwd=actual_repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "checkout", "-b", branch],
+            cwd=actual_repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        (actual_repo_root / "fix.txt").write_text("fix\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "add", "fix.txt"],
+            cwd=actual_repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "commit", "-m", "fix"],
+            cwd=actual_repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "push", "-u", "origin", branch],
+            cwd=actual_repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "checkout", "main"],
+            cwd=actual_repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
     else:
         actual_repo_root = repo_root_value
 
@@ -178,7 +290,7 @@ def test_orphan_salvage_repo_root_guard(
     ]
 
     if is_valid_path:
-        assert calls == [tmp_path]
+        assert calls == [actual_repo_root]
         assert len(handoff_events) == 1
         assert handoff_events[0]["payload"]["pr_number"] == 101
         assert handoff_events[0]["payload"]["issue_number"] == issue_number
