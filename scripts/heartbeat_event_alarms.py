@@ -529,3 +529,102 @@ def check_ci_headroom_unavailable(report: Report, repo: RepoInfo, baseline: date
         )
     else:
         report.ok(check, facts)
+
+
+# Issue #1968: emitted once per local-lane pass per disabled
+# ``review_dispatch.enabled``/``auto_merge.enabled`` switch while a
+# review-ready issue sits parked past ``local_lane.kill_switch_stall_hours``
+# on a ``local_issues`` repo. The literal is declared here (not imported):
+# the kind only exists in the newest charlie_work, and this script must run
+# against any installed package version.
+LOCAL_LANE_KILL_SWITCH_STALLED = "local_lane_kill_switch_stalled"
+
+
+def check_local_lane_kill_switch_stalled(
+    report: Report, repo: RepoInfo, baseline: datetime
+) -> None:
+    """Surface ``local_lane_kill_switch_stalled`` events as anomalies (#1968).
+
+    On a ``local_issues`` repo an explicit ``review_dispatch.enabled``/
+    ``auto_merge.enabled`` ``false`` is honored -- the gated sub-phases stay
+    skipped -- but it silently dead-ends every finished ticket at
+    ``agent:review-ready``. The lane emits this warning-level event every
+    pass the stall persists; the heartbeat's job is only to forward the
+    event rows (kind, ts, and the payload's ``switch``/``issue_numbers``
+    detail) to the operator -- it deliberately does NOT re-evaluate the
+    config, so the check stays correct across config edits and package
+    versions.
+
+    Deliberately ``report.anom``, not ``report.warn``: a stranded
+    review/merge lane means finished work is silently going nowhere, which
+    is exactly the dead-end the heartbeat exists to catch. The
+    db-availability guards match the other kind checks: an unreadable
+    events.db is a repo this check cannot vouch for.
+
+    Same ISO-vs-SQLite comparison convention as
+    ``check_draft_pr_blocked_events``: timestamps are compared in Python
+    against ``baseline``, never in SQL, so an unparseable ``ts`` fails
+    toward visibility, not silence.
+    """
+    check = f"local_lane_kill_switch_stalled {repo.slug}"
+    db_path = repo.state_dir / "events.db"
+    if not db_path.exists():
+        report.anom(check, f"cannot check: no events.db at {db_path}")
+        return
+
+    try:
+        conn = sqlite3.connect(str(db_path))
+    except sqlite3.Error as exc:
+        report.anom(check, f"cannot check: events.db unreadable: {exc}")
+        return
+
+    try:
+        try:
+            table_row = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'"
+            ).fetchone()
+            if table_row is None:
+                report.anom(check, "cannot check: events.db has no events table")
+                return
+            rows = conn.execute(
+                "SELECT ts, payload FROM events WHERE kind = ?",
+                (LOCAL_LANE_KILL_SWITCH_STALLED,),
+            ).fetchall()
+        except sqlite3.Error as exc:
+            report.anom(check, f"cannot check: events.db unreadable: {exc}")
+            return
+    finally:
+        conn.close()
+
+    new_rows = 0
+    switches: set[str] = set()
+    stranded_issues: set[int] = set()
+    for ts, payload_json in rows:
+        ts_dt = parse_iso(ts)
+        if ts_dt is not None and ts_dt <= baseline:
+            continue
+        # An unparseable ts fails toward visibility (counted as new).
+        new_rows += 1
+        try:
+            payload = json.loads(payload_json)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        switch = payload.get("switch")
+        if switch:
+            switches.add(str(switch))
+        for n in payload.get("issue_numbers") or ():
+            if isinstance(n, int) and not isinstance(n, bool):
+                stranded_issues.add(n)
+
+    facts = f"stalled_rows={len(rows)} new_since_last_beat={new_rows}"
+    if not new_rows:
+        report.ok(check, facts)
+        return
+    detail = f"{new_rows} event(s) since last beat"
+    if switches:
+        detail += f"; disabled switch(es): {sorted(switches)}"
+    if stranded_issues:
+        detail += f"; stranded issue(s): {sorted(stranded_issues)}"
+    report.anom(check, f"{detail} ({facts})")
