@@ -2232,7 +2232,7 @@ def _classify_dead_sessions_and_update_throttle_state(
                 # present, matching reconcile.py's issue_active_label_no_open_pr
                 # pattern (~536-580) so all three sites agree. An issue with
                 # no active label -- e.g. one carrying only a terminal label
-                # like agent:human-needed/agent:done/agent:blocked -- has
+                # like agent:human-needed/agent:done -- has
                 # nothing here to reclaim; it must never get `ready` added
                 # back just because it also has a stale
                 # dispatched/dead-worker/no-PR state.json entry. (A prior

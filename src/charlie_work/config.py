@@ -219,7 +219,6 @@ class LabelConfig:
     pr_open: str = "agent:pr-open"
     reviewing: str = "agent:reviewing"
     needs_rework: str = "agent:needs-rework"
-    blocked: str = "agent:blocked"
     done: str = "agent:done"
     human_needed: str = "agent:human-needed"
     prose_only_deps: str = "agent:prose-only-deps"
@@ -273,7 +272,6 @@ class LabelConfig:
     @property
     def terminal(self) -> set[str]:
         return {
-            self.blocked,
             self.done,
             self.human_needed,
             self.prose_only_deps,
@@ -294,7 +292,6 @@ class LabelConfig:
             self.pr_open,
             self.reviewing,
             self.needs_rework,
-            self.blocked,
             self.done,
             self.human_needed,
             self.prose_only_deps,
@@ -322,7 +319,6 @@ class LabelConfig:
             self.pr_open,
             self.reviewing,
             self.needs_rework,
-            self.blocked,
             self.done,
             self.human_needed,
             self.operator_queue,
@@ -2448,7 +2444,17 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
             f"unknown config section(s): {', '.join(unknown)} "
             f"(valid: {', '.join(sorted(known_sections))})"
         )
-    labels = _build_section(LabelConfig, "labels", _section(data, "labels"))
+    labels_data = _section(data, "labels")
+    # Issue #1963: ``blocked`` was removed from ``LabelConfig`` -- the
+    # "blocked" verdict edge maps to ``human_needed`` and no transition ever
+    # applied ``agent:blocked``. Tolerate a stale ``blocked:`` key in a live
+    # ``labels:`` section rather than letting ``_build_section``'s
+    # unknown-key rejection brick a repo that still carries it (same
+    # scoped-extraction reasoning as the ``deescalation`` section below).
+    # The override is dead weight -- nothing read the field even while it
+    # existed -- so it is silently dropped, not honored.
+    labels_data.pop("blocked", None)
+    labels = _build_section(LabelConfig, "labels", labels_data)
     dispatch_data = _section(data, "dispatch")
     materialize_dirs = dispatch_data.get("materialize_dirs")
     if materialize_dirs is not None:

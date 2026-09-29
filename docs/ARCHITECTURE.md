@@ -158,7 +158,7 @@ Notes tying the diagram to `_edges()` exactly:
   dispatch until a human reviews, merges, and closes it by hand. See
   [README.md#local-file-issue-source](../README.md#local-file-issue-source).
 
-`LabelConfig.terminal` = `{blocked, done, human_needed, prose_only_deps,
+`LabelConfig.terminal` = `{done, human_needed, prose_only_deps,
 operator_queue, review_ready}`;
 `LabelConfig.active` = `{queued, in_progress, pr_open, reviewing,
 needs_rework}`. `OrchestratorApp._is_dispatchable()` requires the `ready`

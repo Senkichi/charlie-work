@@ -74,17 +74,22 @@ definitions and the experiment's stopping rule.
 | `agent:pr-open` | A PR exists and `review()` has run against it at least once. | `why-charlie-hate` → event `review_started`. |
 | `agent:reviewing` | Set alongside `agent:pr-open` in the same transition; distinguished for readability, not a separate state. | `why-charlie-hate` → event `review_started`. |
 | `agent:needs-rework` | `verdict --decision request_changes`, under the rework cap. | `verdict` → event `rework_requested`. |
-| `agent:blocked` | `verdict --decision blocked` — a product/security decision is needed. | `verdict` → event `blocked`. |
 | `agent:done` | PR merged via `ship-it`. Every `active` label is removed in the same transition. | `ship-it` → event `merged`. |
 | `agent:human-needed` | `blocked` or the rework cap exhausted. Terminal — no further automation happens until a human clears it. | `verdict` → event `escalated`/`blocked`. |
 | `agent:review-ready` | Local-file issue source only (`local_issues.enabled`): a worker's session ended with commits and there was no remote to push to, so the branch is the deliverable. Terminal, but **not** an escalation — nothing went wrong. | `dead_worker_reap._park_local_work_for_review` → event `local_work_ready`. |
+
+`agent:blocked` is a removed/legacy label (issue #1963): no transition ever
+applied it — the `blocked` verdict edge adds `agent:human-needed`. The label
+may still exist on repos bootstrapped before its removal; treat any issue
+carrying it as `agent:human-needed`.
 
 Legal transitions are exactly `labels.py`'s `_edges()` table — see the
 mermaid diagram in
 [ARCHITECTURE.md](ARCHITECTURE.md#label-state-machine). Two invariants worth
 internalizing operationally:
 
-- `LabelConfig.terminal = {blocked, done, human_needed}` and
+- `LabelConfig.terminal = {done, human_needed, prose_only_deps,
+  operator_queue, review_ready}` and
   `LabelConfig.active = {queued, in_progress, pr_open, reviewing,
   needs_rework}`. `_is_dispatchable()` refuses to dispatch an issue that
   already carries any active *or* terminal label — so **removing a stale
