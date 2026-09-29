@@ -410,6 +410,39 @@ def write_worker_terminal_status(
     tmp_path.replace(path)
 
 
+def terminal_record_proves_completion(
+    sessions_dir: Path, issue_number: int, sidecar_suffix: str, pid: Any
+) -> bool:
+    """True when this exact worker process exited 0 AND handed off a worker outcome.
+
+    Ground truth that the session finished its task, so its log tail is the
+    model's own completion prose, not a provider error. Log-tail throttle
+    markers ("rate limit", "usage limit") false-positive on that prose whenever
+    the issue is *about* rate limits -- the #656 failure class, which recurred
+    2026-09-29 when issue #2002's clean-exit worker armed a 76-minute repo
+    throttle. Requires all three of: matching ``pid`` (a stale record from an
+    earlier attempt must not vouch for this one), ``exit_code == 0``, and a
+    ``worker_outcome`` dict (exit 0 alone is not enough -- the CLI's own exit
+    status on a provider limit is not a contract we control). Never raises.
+    """
+    path = worker_terminal_status_path(sessions_dir, issue_number, sidecar_suffix)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(data, dict) or pid is None:
+        return False
+    try:
+        same_process = int(data.get("pid")) == int(pid)
+    except (TypeError, ValueError):
+        return False
+    return (
+        same_process
+        and data.get("exit_code") == 0
+        and isinstance(data.get("worker_outcome"), dict)
+    )
+
+
 def find_worker_terminal_status(sessions_dir: Path, issue_number: int) -> dict[str, Any] | None:
     """Return the most recently written terminal-status record for ``issue_number``.
 
