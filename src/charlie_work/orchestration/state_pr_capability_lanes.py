@@ -1,4 +1,4 @@
-"""Per-pass ``loop()`` lanes that only make sense on a PR-publishing backend.
+"""Per-pass ``loop()`` lanes whose remote surface is PR/backend-capability dependent.
 
 Track 2 Phase B delegate leaf: the two method bodies below were moved
 verbatim out of ``orchestration/state_maintenance.py`` (which was over its
@@ -9,16 +9,29 @@ reach-through keeps the Tier-D monkeypatch seam (the suite patches
 ``reclaim_superseded_main_ci_runs`` and the ``state_lock``/``load_state``
 primitives on the ``charlie_work.workflow`` module object).
 
-Issue #1810: both lanes assume a GitHub/PR-capable backend. On a repo whose
+Issue #1810: both lanes assumed a GitHub/PR-capable backend. On a repo whose
 backend cannot publish pull requests (``local_issues.LocalFileGitHub`` --
 no remote at all) each was a guaranteed failure event every pass:
 ``_maybe_reclaim_superseded_main_ci`` starts with ``git fetch origin``, and
 ``_maybe_reconcile_drift`` -> ``detect_drift`` -> ``_fetch_prs`` calls
-``gh.run(...)`` which raises ``GitHubError``. Both are therefore gated on
+``gh.run(...)`` which raises ``GitHubError``. #1810 therefore gated both on
 ``local_work_park.publishes_pull_requests`` -- the same capability
 predicate ``dead_worker_reap`` consults -- so a non-publishing backend
-skips the lane outright rather than recording ``main_ci_reclaim_failed`` /
-``reconcile_pass_failed`` every pass with zero repair value.
+skipped the lane outright rather than recording ``main_ci_reclaim_failed``
+/ ``reconcile_pass_failed`` every pass with zero repair value.
+
+Issue #1969 un-skipped the reconcile lane only. Its #1810 failure mode was
+``_fetch_prs`` raising; reconcile.py now answers the empty PR snapshot on
+the capability (the truthful answer -- a backend that cannot host pull
+requests has no PRs), and ``detect_drift`` had already grown a no-remote
+issue branch under #1844, so ``_reconcile_locked`` is local-safe end to
+end. The pass must run on local backends: it is the only automatic path
+that finalizes a closed-while-``active`` state entry
+(``state_active_status_issue_closed`` -> ``status: "closed"``), and the old
+skip left a closed local issue parked at e.g. ``escalated`` forever,
+counting as a ``sink_census`` root for ``operator_queue_impact`` forever.
+The main-CI reclaim lane keeps the gate -- ``git fetch origin`` still has
+nothing to fetch on a no-remote repo.
 """
 
 from __future__ import annotations
@@ -274,13 +287,14 @@ def _maybe_reconcile_drift(self, *, now: datetime | None = None) -> None:
     """
     if not self.config.reconcile_pass.enabled:
         return
-    # Issue #1810: ``_reconcile_locked`` -> ``detect_drift`` -> ``_fetch_prs``
-    # calls ``gh.run(...)``, which raises ``GitHubError`` on a backend that
-    # cannot publish pull requests -- a guaranteed reconcile_pass_failed
-    # every due pass with zero repair value. Skip the whole call on the
-    # same capability predicate dead_worker_reap already gates on.
-    if not publishes_pull_requests(self.gh):
-        return
+    # Deliberately NO publishes_pull_requests gate here (issue #1969):
+    # #1810 added one because ``detect_drift`` -> ``_fetch_prs`` raised
+    # ``GitHubError`` on a no-remote backend. ``_fetch_prs`` now answers
+    # ``[]`` on the capability and ``detect_drift`` has a no-remote issue
+    # branch (#1844), so the pass is local-safe. It must keep running --
+    # it is the only automatic path that converges a closed-while-active
+    # state entry to ``closed``, and the skip left closed local issues
+    # parked at sink statuses like ``escalated`` forever.
 
     resolved_now = now if now is not None else datetime.now(UTC)
     state_file = self.paths.state_file

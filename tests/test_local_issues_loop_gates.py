@@ -1,18 +1,10 @@
-"""Issue #1810: per-pass ``loop()`` lanes gated on ``publishes_pull_requests``.
+"""Per-pass ``loop()`` lanes gated on ``publishes_pull_requests``.
 
 On a ``local_issues`` repo (``LocalFileGitHub`` --
-``publishes_pull_requests = False``), two per-pass steps assumed a
-GitHub/PR-capable backend and fired a failure/warning event every single
-pass:
-
-* ``_maybe_reconcile_drift`` -> ``_reconcile_locked`` -> ``detect_drift`` ->
-  ``_fetch_prs`` -> ``gh.run(...)`` raises ``GitHubError`` (the repo has no
-  remote to query) -- recorded as ``reconcile_pass_failed`` (ERROR).
-* ``_maybe_reclaim_superseded_main_ci`` ->
-  ``reclaim_superseded_main_ci_runs`` -> ``git fetch origin`` fails (no
-  origin remote exists) -- recorded as ``main_ci_reclaim_failed`` (WARNING).
-
-Each step is now skipped on the existing
+``publishes_pull_requests = False``), ``_maybe_reclaim_superseded_main_ci``
+-> ``reclaim_superseded_main_ci_runs`` -> ``git fetch origin`` fails (no
+origin remote exists) -- recorded as ``main_ci_reclaim_failed`` (WARNING).
+Issue #1810 skipped it on the existing
 ``local_work_park.publishes_pull_requests`` capability predicate -- the same
 one ``dead_worker_reap`` consults -- rather than surviving its own failure
 per call site. The two ``_maybe_*`` lanes live in
@@ -22,6 +14,16 @@ one ``loop()`` pass per backend and assert on the patched callees: never
 invoked on the non-publishing backend, and invoked on the publishing
 control (proving the skip is conditional on the capability, not the lane
 being deleted outright).
+
+The reconcile lane used to share #1810's skip (``detect_drift`` ->
+``_fetch_prs`` -> ``gh.run(...)`` raising ``GitHubError``), but issue #1969
+removed it: ``detect_drift`` grew a no-remote issue branch under #1844, and
+``_fetch_prs`` now answers the empty PR snapshot on a backend that cannot
+host pull requests, so ``_reconcile_locked`` is local-safe end to end.
+Running the pass matters -- it is the only automatic path that finalizes a
+closed-while-``active`` state entry (``state_active_status_issue_closed``),
+so the old skip left a closed local issue parked at ``escalated`` forever,
+counting as a ``sink_census`` root for ``operator_queue_impact`` forever.
 
 (A third lane used to live here: the #1001 worker-GitHub-token dispatch
 probe. Issue #1853 retired it outright -- workers are credential-free by
@@ -60,6 +62,7 @@ from charlie_work.state import empty_state, load_state, save_state
 from charlie_work.workflow import CommandResult, OrchestratorApp
 
 from _dispatch_fixtures import _stub_real_activity_probe_for_stalled_tests  # noqa: F401
+from _reconcile_fixtures import _write_local_issue
 
 
 def _init_repo(repo_root: Path) -> None:
@@ -137,10 +140,20 @@ def test_loop_pass_skips_pr_shaped_lanes_on_non_publishing_backend(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """On a ``LocalFileGitHub`` (``publishes_pull_requests = False``), one
-    ``loop()`` pass must not reach ``_reconcile_locked`` or
-    ``reclaim_superseded_main_ci_runs`` at all -- and must emit none of the
+    ``loop()`` pass must not reach ``reclaim_superseded_main_ci_runs`` at
+    all -- but issue #1969 un-skipped the reconcile lane, which is
+    local-safe end to end and is the only automatic finalizer for a
+    closed-while-active state entry. ``_reconcile_locked`` is therefore
+    invoked (and mocked, keeping this a gating test), the pass records
+    ``reconcile_pass_completed``, and the pass must emit none of the
     noise events -- even with every lane's own enable knob armed as
-    production runs them."""
+    production runs them.
+
+    The leaf name predates #1969: ``pr_shaped_lanes`` now means the lanes
+    still gated on ``publishes_pull_requests`` -- after #1969 that set is
+    exactly ``main_ci_reclaim``. The name is kept verbatim because the
+    collect-only gate (#1538) fails a required check on any leaf-name
+    removal, rename included, absent an operator exemption label."""
     repo_root = tmp_path / "repo"
     _init_repo(repo_root)
     config = _config(local_enabled=True)
@@ -157,14 +170,15 @@ def test_loop_pass_skips_pr_shaped_lanes_on_non_publishing_backend(
 
     result = app.loop()
 
-    reconcile_locked.assert_not_called()
+    reconcile_locked.assert_called_once_with(fix=True, skip_dead_session_sweep=True, dry_run=False)
     reclaim.assert_not_called()
 
     assert result.ok is True
     state = load_state(paths.state_file)
     kinds = {e.get("kind") for e in state.get("events", [])}
     assert "worker_token_missing" not in kinds
-    assert not [k for k in kinds if str(k).startswith("reconcile_pass")]
+    assert "reconcile_pass_completed" in kinds
+    assert "reconcile_pass_failed" not in kinds
     assert not [k for k in kinds if str(k).startswith("main_ci_reclaim")]
 
 
@@ -200,6 +214,80 @@ def test_loop_pass_runs_pr_shaped_lanes_on_publishing_backend(
     kinds = {e.get("kind") for e in state.get("events", [])}
     assert "reconcile_pass_completed" in kinds
     assert "worker_token_missing" not in kinds
+
+
+def test_loop_pass_reconcile_finalizes_closed_escalated_issue_on_local_backend(
+    tmp_path: Path,
+) -> None:
+    """Issue #1969 regression, end to end through ``app.loop()``: a local
+    issue closed out from under an ``escalated`` state entry (the repo's own
+    #131/#132 were stuck that way since 2026-09-23) is finalized to
+    ``closed`` by the periodic reconcile pass inside the loop -- no operator
+    action, no mocked lane -- and stops counting as a ``sink_census`` root
+    for ``operator_queue_impact``. The still-open ``escalated`` control
+    issue is untouched (``escalated_labels_converged`` D-2)."""
+    repo_root = tmp_path / "repo"
+    _init_repo(repo_root)
+    config = _config(local_enabled=True)
+    issues_dir = repo_root / config.local_issues.issues_dir
+    _write_local_issue(
+        issues_dir,
+        131,
+        "closed-escalated",
+        "closed escalated",
+        "closed",
+        f"[{config.labels.done}]",
+        "merged already.",
+    )
+    _write_local_issue(
+        issues_dir,
+        132,
+        "open-escalated",
+        "open escalated",
+        "open",
+        f"[{config.labels.human_needed}]",
+        "waiting on human.",
+    )
+    gh = LocalFileGitHub(
+        repo_root=repo_root,
+        issues_dir=issues_dir,
+        state_dir=config.runtime.state_dir,
+    )
+    paths = runtime_paths(repo_root, config.runtime.state_dir)
+
+    state = empty_state()
+    state["issues"]["131"] = {"number": 131, "status": "escalated"}
+    state["issues"]["132"] = {
+        "number": 132,
+        "status": "escalated",
+        # Stamped now so terminal_state_stale's >=2-day alert does not add an
+        # unrelated drift item for the control issue.
+        "terminal_since": datetime.now(UTC).isoformat(),
+    }
+    save_state(paths.state_file, state)
+
+    app = OrchestratorApp(repo_root, paths, config, gh)
+
+    result = app.loop()
+    assert result.ok is True
+
+    state = load_state(paths.state_file)
+    assert state["issues"]["131"]["status"] == "closed"
+    assert state["issues"]["132"]["status"] == "escalated"
+
+    events = state.get("events", [])
+    kinds = {e.get("kind") for e in events}
+    assert "reconcile_pass_completed" in kinds
+    assert "reconcile_pass_failed" not in kinds
+    assert any(
+        e.get("kind") == "reconcile"
+        and e.get("payload", {}).get("kind") == "state_active_status_issue_closed"
+        and e.get("payload", {}).get("issue_number") == 131
+        for e in events
+    )
+    # The closed issue no longer feeds operator_queue_impact's root census;
+    # the still-open escalated one still does.
+    assert workflow_module.sink_census(state) == {132}
 
 
 # ---------------------------------------------------------------------------
