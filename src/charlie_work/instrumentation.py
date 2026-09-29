@@ -1,7 +1,9 @@
 """SQLite-backed structured event log and correlation-ID infrastructure.
 
 This module provides the architecturally robust instrumentation layer for
-charlie-work. It complements ``state.json``'s 200-entry ``events`` array
+charlie-work. It complements ``state.json``'s capped ``events`` ring
+(``state.DEFAULT_EVENT_RING_SIZE`` entries, overridable via
+``runtime.event_ring_size``)
 (which serves as a convenience cache for recent activity) with an unlimited,
 append-only SQLite database (``events.db``) that preserves the complete audit
 history for root-cause analysis.

@@ -75,7 +75,12 @@ definitions and the experiment's stopping rule.
 | `agent:reviewing` | Set alongside `agent:pr-open` in the same transition; distinguished for readability, not a separate state. | `why-charlie-hate` → event `review_started`. |
 | `agent:needs-rework` | `verdict --decision request_changes`, under the rework cap. | `verdict` → event `rework_requested`. |
 | `agent:done` | PR merged via `ship-it`. Every `active` label is removed in the same transition. | `ship-it` → event `merged`. |
-| `agent:human-needed` | `blocked` or the rework cap exhausted. Terminal — no further automation happens until a human clears it. | `verdict` → event `escalated`/`blocked`. |
+| `agent:human-needed` | `verdict --decision blocked` (a product/security decision is needed) or the rework cap exhausted. Terminal — no further automation happens until a human clears it. | `verdict` → event `escalated`/`blocked`. |
+| `agent:operator-queue` | Mechanical escalations (`reason_class == "mechanical"`) land here instead of `agent:human-needed`, so human attention is reserved for judgment calls. Terminal. | `operator_queued` / `redispatch_operator_queued` edges and the de-escalation cap-exhaustion path. |
+| `agent:prose-only-deps` | Issue has prose-only dependencies that need structured blocker declarations (`Blocked by #N`). Terminal — held out of dispatch. | Intake pass (`workflow.py`, event `intake_prose_only_deps`). |
+| `agent:merge-hold` | Transient operator signal, not a workflow state: while present on the PR or its issue, `ship-it`/merge-ready refuses to merge. Survives non-terminal transitions; stripped by `merged` and `closed_unmerged`. | Human, on GitHub. |
+| `collect-gate-exempt` | PR-only, operator-applied escape hatch for the collect-only gate's fail-closed verdict (legitimate test deletions/renames); the gate reads the PR's live labels. Not a workflow or terminal label. | Human, on the PR (see the collect-only gate section below). |
+| `agent:cross-repo-override` | Operator's one-step recovery valve for a cross-repo-gate false positive: when present, both `cross_repo_gate` and `cross_repo_scope_gate` are skipped for that issue. Not a workflow or terminal label. | Human, on the issue. |
 | `agent:review-ready` | Local-file issue source only (`local_issues.enabled`): a worker's session ended with commits and there was no remote to push to, so the branch is the deliverable. Terminal, but **not** an escalation — nothing went wrong. | `dead_worker_reap._park_local_work_for_review` → event `local_work_ready`. |
 
 `agent:blocked` is a removed/legacy label (issue #1963): no transition ever
@@ -651,9 +656,13 @@ cap is exceeded.
 **Health states** (`WorkerHealth` enum in `worker.py`): a worker is classified
 from multiple signals — process liveness, log-file staleness (mtime vs.
 `watchdog.stall_minutes`), terminal error markers, absolute age, loop/no-
-progress detection, and cumulative cost/token usage. `charlie roll-call`
-surfaces these under a `workers` section (health per live sidecar) so a
-STALLED / RUNAWAY / DEAD worker is visible on the next pass.
+progress detection, and cumulative cost/token usage. The closed enum is
+`HEALTHY`, `SLOW`, `STALLED`, `RUNAWAY`, `DEAD`, `ORPHANED`: `SLOW` is the
+warn-level result of the wall-clock/loop/cost tripwires, `RUNAWAY` their
+kill-level result (also the api per-session budget), and `ORPHANED` is
+defined but not yet returned by `classify_worker_health` (reserved for B6a).
+`charlie roll-call` surfaces these under a `workers` section (health per live
+sidecar) so a STALLED / RUNAWAY / DEAD worker is visible on the next pass.
 
 **Tripwires** (all under `watchdog.*` in `orchestrator.config.yaml`, WARN-first
 by default so nothing kills a worker until you opt in):

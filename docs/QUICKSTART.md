@@ -113,7 +113,9 @@ uv run charlie bootstrap-labels
 
 Creates all labels from `LabelConfig.all` (`automated-ready`,
 `agent:queued`, `agent:in-progress`, `agent:pr-open`, `agent:reviewing`,
-`agent:needs-rework`, `agent:done`, `agent:human-needed`)
+`agent:needs-rework`, `agent:done`, `agent:human-needed`,
+plus `agent:prose-only-deps`, `agent:merge-hold`, `agent:operator-queue`,
+`collect-gate-exempt`, `agent:review-ready`, `agent:cross-repo-override`)
 with descriptions.
 
 ## 5. First cycle: intake → dispatch → review → merge
