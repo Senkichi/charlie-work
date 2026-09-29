@@ -17,7 +17,7 @@ disk, clock, or interpreter. Wiring these into
 separate, later step -- this module does not import ``workflow`` or
 ``supervise_loop``.
 
-Four checks, run in order, each independently classified fatal/non-fatal via
+Five checks, run in order, each independently classified fatal/non-fatal via
 ``config.PreflightConfig`` (never hardcoded at a call site):
 
 1. ``disk_floor`` (fatal by default) -- refuse before a pass half-writes
@@ -28,6 +28,14 @@ Four checks, run in order, each independently classified fatal/non-fatal via
    code.
 4. ``config_freshness`` (non-fatal by default) -- makes the silent-inert-
    edit trap loud; does not hot-reload.
+5. ``git_identity`` (fatal by default, issue #1950) -- a repo-local
+   ``user.email``/``user.name`` in the managed repo's live checkout
+   overrides the operator's global identity in every worktree of that
+   checkout, so every worker/salvage commit silently carries the override
+   (a stray ``git config user.email t@t`` did exactly that for two days).
+   Refusing the pass keeps a durable config drift from minting misattributed
+   commits; the override is still honored when it merely restates the global
+   value.
 """
 
 from __future__ import annotations
@@ -45,6 +53,7 @@ import charlie_work
 from . import layout
 from .config import PreflightConfig
 from .instrumentation import log_event
+from .subprocess_runner import command_failure_message, run_captured
 
 UTC = timezone.utc
 
@@ -55,6 +64,11 @@ DiskUsageFn = Callable[[str], object]
 #: Injectable signature for an mtime probe: takes a path, returns the path's
 #: ``os.stat_result`` (only ``.st_mtime`` is read).
 StatFn = Callable[[Path], object]
+
+#: Bound on each ``git config`` read ``git_identity`` issues. Config reads
+#: are local-file operations that return in milliseconds; 10s is generous
+#: headroom for a wedged filesystem without hanging a pass.
+_GIT_CONFIG_TIMEOUT_SECONDS = 10
 
 
 @dataclass(frozen=True)
@@ -69,7 +83,7 @@ class PreflightCheck:
 
 @dataclass(frozen=True)
 class PreflightResult:
-    """Outcome of a full ``run_preflight`` call: all four checks."""
+    """Outcome of a full ``run_preflight`` call: all five checks."""
 
     checks: tuple[PreflightCheck, ...]
 
@@ -306,6 +320,126 @@ def _check_config_freshness(
     )
 
 
+@dataclass(frozen=True)
+class GitIdentityProbe:
+    """Observed commit identity for a checkout (issue #1950).
+
+    ``local_*`` are the repo-local ``user.email``/``user.name`` values
+    (``git config --local --get``); ``global_*`` are the operator-global
+    values the local entries would shadow (``git config --global --get``).
+    ``None`` means the key is unset in that scope. ``error`` is set when the
+    probe could not read git config at all (not a git repository, missing
+    ``git`` binary, git-level failure) -- the individual fields are
+    meaningless in that case.
+    """
+
+    local_email: str | None = None
+    local_name: str | None = None
+    global_email: str | None = None
+    global_name: str | None = None
+    error: str | None = None
+
+
+#: Injectable signature for the git-identity probe: takes the repo root,
+#: returns a :class:`GitIdentityProbe`. The default runs real ``git config``
+#: reads; tests inject a fixed probe result.
+GitIdentityProbeFn = Callable[[Path], "GitIdentityProbe"]
+
+
+def _git_config_scope_get(repo_root: Path, scope: str, key: str) -> tuple[str | None, str | None]:
+    """Read ``git config <scope> --get <key>`` with ``cwd=repo_root``.
+
+    Returns ``(value, None)`` for a set key, ``(None, None)`` for an unset
+    key (``git config --get`` exits 1 on an absent key -- that is a
+    legitimate reading, not a failure), and ``(None, error)`` on any other
+    outcome (no repository at ``cwd``, missing binary, timeout).
+    """
+    command = ["git", "config", scope, "--get", key]
+    result = run_captured(command, cwd=repo_root, timeout_seconds=_GIT_CONFIG_TIMEOUT_SECONDS)
+    if result.returncode == 0:
+        value = result.stdout.strip()
+        return (value or None), None
+    if result.returncode == 1:
+        # Well-formed key, exit 1: unset in this scope. (``run_captured``
+        # always sets ``error`` on a nonzero exit, so ``.error`` cannot
+        # distinguish unset from a failure -- the return code can.)
+        return None, None
+    return None, command_failure_message(command, result, "git config read failed")
+
+
+def _default_git_identity_probe(repo_root: Path) -> GitIdentityProbe:
+    """Read the checkout's local and global commit identity via ``git config``.
+
+    ``--local`` is the shared ``<common-dir>/config`` of the checkout and its
+    worktrees (``extensions.worktreeConfig`` off is the norm, and a
+    worktree-scope override does not exist in the incident shape this guards
+    against); ``--global`` is the operator's ``~/.gitconfig`` identity.
+    """
+    values: dict[str, str | None] = {}
+    for field_name, scope, key in (
+        ("local_email", "--local", "user.email"),
+        ("local_name", "--local", "user.name"),
+        ("global_email", "--global", "user.email"),
+        ("global_name", "--global", "user.name"),
+    ):
+        value, error = _git_config_scope_get(repo_root, scope, key)
+        if error is not None:
+            return GitIdentityProbe(error=error)
+        values[field_name] = value
+    return GitIdentityProbe(**values)  # type: ignore[arg-type]
+
+
+def _check_git_identity(
+    paths: PreflightPaths,
+    cfg: PreflightConfig,
+    git_identity_probe: GitIdentityProbeFn,
+) -> PreflightCheck:
+    name = "git_identity"
+    probe = git_identity_probe(paths.repo_root)
+    if probe.error is not None:
+        # Fail inert, matching clock_sanity's missing-state-file posture: the
+        # drift this check exists to catch is durable, so a transient probe
+        # failure (or a non-git repo_root, which cannot dispatch worktrees
+        # anyway) must not turn the guard itself into a refusal source.
+        return PreflightCheck(
+            name,
+            ok=True,
+            detail=f"git identity probe failed; check skipped: {probe.error}",
+            fatal=cfg.git_identity_fatal,
+        )
+
+    mismatches: list[str] = []
+    for key, local, global_value in (
+        ("user.email", probe.local_email, probe.global_email),
+        ("user.name", probe.local_name, probe.global_name),
+    ):
+        if local is None:
+            continue
+        if local != global_value:
+            shown_global = global_value if global_value is not None else "<unset>"
+            mismatches.append(f"{key}: local {local!r} vs global {shown_global!r}")
+    if mismatches:
+        return PreflightCheck(
+            name,
+            ok=False,
+            detail=(
+                f"{paths.repo_root} has a repo-local git identity override "
+                f"({'; '.join(mismatches)}) — worker and salvage commits in "
+                "every worktree of this checkout carry the local value, not "
+                "the operator's identity. Unset the override (git config "
+                "--local --unset <key>) or pin it deliberately via "
+                "runtime.preflight.git_identity_fatal: false"
+            ),
+            fatal=cfg.git_identity_fatal,
+        )
+
+    if probe.local_email is not None or probe.local_name is not None:
+        detail = "repo-local user.email/user.name match the global identity"
+    else:
+        detail = "no repo-local user.email/user.name override"
+    return PreflightCheck(name, ok=True, detail=detail, fatal=cfg.git_identity_fatal)
+
+
 def run_preflight(
     paths: PreflightPaths,
     config: PreflightConfig,
@@ -317,8 +451,9 @@ def run_preflight(
     package_file: str | None = None,
     config_sources: Sequence[str] = (),
     known_config_mtimes: dict[str, float] | None = None,
+    git_identity_probe: GitIdentityProbeFn = _default_git_identity_probe,
 ) -> PreflightResult:
-    """Run all four preflight checks, in order, and return their results.
+    """Run all five preflight checks, in order, and return their results.
 
     Every probe is injectable so this can be tested without touching a real
     disk, clock, or interpreter:
@@ -335,6 +470,10 @@ def run_preflight(
       dict (the default) means every pass looks like a first-ever
       observation -- harmless for a single-call test, but the real wiring
       must persist the same dict across passes.
+    - ``git_identity_probe`` defaults to real ``git config`` reads against
+      ``paths.repo_root`` (the managed repo's live checkout per pass; the
+      orchestrator's own checkout at supervisor startup). Tests inject a
+      fixed :class:`GitIdentityProbe` to exercise the check without git.
     """
     if now is None:
         now = datetime.now(UTC)
@@ -352,6 +491,7 @@ def run_preflight(
             paths, config, sys_executable=sys_executable, package_file=package_file
         ),
         _check_config_freshness(config_sources, known_config_mtimes, config, stat_fn),
+        _check_git_identity(paths, config, git_identity_probe),
     )
     return PreflightResult(checks=checks)
 
