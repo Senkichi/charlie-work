@@ -20,10 +20,13 @@ from __future__ import annotations
 
 import charlie_work.workflow as _wf
 from charlie_work.dispatch_deferral import records_deferral
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from charlie_work import worker_fate
 from charlie_work.adapters import SessionRequest
+from charlie_work.config import WORKER_OUTCOME_FILENAME
 from charlie_work.dead_worker_reap import _emit_session_failed_relabeled
 from charlie_work.fleet_registry import try_acquire_fleet_lock
 from charlie_work.worker_launch_gate import WorkerLaunchDeferral, acquire_fleet_launch_lock
@@ -106,6 +109,62 @@ def _route_phantom_live_worker(
             and worker_outcome.get("push_succeeded") is True
             and worker_outcome.get("pr_created") is False
         )
+
+        # Obtain this worker's fate from the module (design doc §8, step
+        # B5, A11): a dispatched request's issue can never have an open
+        # tracked PR (see the docstring above), so `pr_known=True,
+        # open_pr_number=None` is a real invariant here, not a guess.
+        # `unpushed` reuses the same local, unverified `ahead_count` the
+        # legacy check below already trusts -- no remote read happens at
+        # dispatch time, so there is no remote-ahead source to split it
+        # from (rule 9 does not apply here).
+        try:
+            outcome_mtime = datetime.fromtimestamp(
+                (worktree_path / WORKER_OUTCOME_FILENAME).stat().st_mtime, tz=UTC
+            )
+        except OSError:
+            outcome_mtime = None
+        fate = worker_fate.resolve_fate(
+            worker_fate.FateEvidence(
+                issue_number=issue_number,
+                adapter=w.adapter_kind,
+                dispatched_at=worker_fate.parse_iso_timestamp(w.started_at),
+                pid_alive=False,
+                health=None,
+                terminal=None,
+                worktree_outcome=(
+                    worker_fate.OutcomeEvidence(
+                        source=worker_fate.EvidenceSource.WORKTREE,
+                        written_at=outcome_mtime,
+                        outcome=worker_outcome.get("outcome"),
+                        push_succeeded=worker_outcome.get("push_succeeded"),
+                        pr_created=worker_outcome.get("pr_created"),
+                        head_sha=worker_outcome.get("head_sha"),
+                        raw=worker_outcome,
+                    )
+                    if isinstance(worker_outcome, dict)
+                    else None
+                ),
+                branch=worker_fate.BranchEvidence(
+                    has_remote=True,
+                    remote_head_sha=None,
+                    remote_ahead=None,
+                    unpushed=inspection.ahead_count,
+                    open_pr_number=None,
+                    pr_known=True,
+                ),
+                failure=None,
+            ),
+            now=datetime.now(UTC),
+        )
+        # FLIP 1: legacy preserves on the raw local `ahead_count` or the bare
+        # self-reported push claim regardless of what `fate` resolves to --
+        # e.g. a fresh `blocked` declaration with local commits still
+        # present resolves to `fate=Blocked` here (row 1 beats everything),
+        # not `Stranded`, yet legacy's unconditioned `ahead_count > 0` still
+        # preserves the sidecar for salvage either way. Rule 1/2 would gate
+        # this on freshness and let a blocked declaration route separately
+        # instead of folding it into the same preserve-for-salvage check.
         if inspection.ahead_count > 0 or reported_push:
             # Preserve the sidecar so the reaper lane can salvage. Do NOT
             # strip labels -- the issue should stay in its active state
@@ -121,6 +180,7 @@ def _route_phantom_live_worker(
                 label_write_ok=True,
                 worktree_state=inspection.state.value,
                 reported_push=reported_push,
+                worker_fate=type(fate).__name__,
                 state_path=self.paths.state_file,
                 write_gate=self.write_gate,
             )
@@ -190,6 +250,22 @@ def _worktree_still_unsafe(self, issue_number: int, state: dict[str, Any]) -> st
     Fails closed: a probe failure (``WorktreeProbeFailedError``) is
     treated as "still unsafe" so a transient index lock cannot clear a
     real blocker.
+
+    FLIP 3 (rule-3 sibling of ``_route_phantom_live_worker`` above, design
+    doc §8 step B5): ``_worktree_refuse_to_reset_reason`` below classifies
+    local-only commits (``WORKTREE_UNSAFE_KIND_LOCAL_COMMITS``,
+    ``config.DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS``) as a
+    judgment-class escalation that is deliberately never auto-cleared --
+    the same underlying fact ``_route_phantom_live_worker`` resolves to
+    ``worker_fate.Stranded`` (salvageable) a few dozen lines up. Rule 3
+    folds both into one "stranded" fate; this function is not wired to
+    ``worker_fate`` directly because doing so would require a second,
+    duplicate ``inspect_worktree_state`` probe purely for an unused
+    classification (this function already fails closed on probe errors,
+    so a second probe adds risk -- a transient index lock between the two
+    calls could disagree with itself -- without changing what it returns).
+    The legacy reason string below stays authoritative until rule 3's own
+    flip commit reconciles the two call sites.
     """
     issue_entry = state.get("issues", {}).get(str(issue_number), {})
     if not isinstance(issue_entry, dict):

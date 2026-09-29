@@ -996,3 +996,58 @@ def profile_for(adapter_kind: str) -> AdapterFateProfile | None:
             for view_kind in profile.view_kinds
         }
     return _PROFILES.get(adapter_kind)
+
+
+# --------------------------------------------------------------------------
+# Group B shared helpers: consumers build ``FateEvidence`` from data they
+# already hold (design doc §8) rather than going through ``gather_evidence``,
+# so no double ``ls-remote`` runs during migration. These two are the pieces
+# every consumer site needs and none of them should reimplement.
+# --------------------------------------------------------------------------
+
+
+def parse_iso_timestamp(value: Any) -> datetime | None:
+    """Parse a ``state.json`` ISO 8601 timestamp into an aware ``datetime``.
+
+    Mirrors ``workflow._parse_iso_timestamp`` byte-for-byte (kept as a
+    separate copy, not an import, to avoid a cycle: ``workflow.py`` imports
+    this module). Naive results are assumed UTC, matching every writer in
+    this codebase (``state.utc_now`` et al.).
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=UTC) if value.tzinfo is None else value
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed
+
+
+@dataclass(frozen=True)
+class PersistedFailure:
+    """Read-side view of the persisted ``dead_worker_failure_kind`` (§6).
+
+    The single accessor consumer sites use instead of reading
+    ``entry.get("dead_worker_failure_kind")`` directly -- a guard test
+    (``test_worker_fate_seam.py``) fails if that string appears in ``src/``
+    outside ``state.py`` and this module.
+    """
+
+    kind: str | None
+    is_throttle: bool
+
+
+def persisted_failure(entry: Mapping[str, Any]) -> PersistedFailure:
+    """Read ``dead_worker_failure_kind`` off a state entry (rule 6, read side).
+
+    Never raises: a missing or malformed entry yields ``PersistedFailure(None,
+    False)``, the same as no persisted classification existing at all.
+    """
+    kind = entry.get("dead_worker_failure_kind") if isinstance(entry, Mapping) else None
+    return PersistedFailure(kind=kind, is_throttle=is_provider_throttle_failure(kind))

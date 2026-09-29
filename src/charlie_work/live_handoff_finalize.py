@@ -42,6 +42,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable
 
+from . import worker_fate
 from .config import WORKER_OUTCOME_FILENAME, OrchestratorConfig
 from .github import GitHubLike, label_names
 from .state import PASSIVE_OPEN_STATUS, utc_now
@@ -116,14 +117,65 @@ def collect_stale_live_handoff_pids(
             continue
         worktree_path = worktree_path_for_branch(repo_root, branch, worktrees_dir)
         try:
-            outcome_age = now - datetime.fromtimestamp(
+            outcome_mtime = datetime.fromtimestamp(
                 (worktree_path / WORKER_OUTCOME_FILENAME).stat().st_mtime, tz=UTC
             )
         except OSError:
             continue
+        outcome_age = now - outcome_mtime
+        worker_outcome = read_worker_outcome(worktree_path)
+
+        # Obtain this worker's fate from the module (design doc §8, step B4):
+        # a live PID with no remote/PR data available at this pure-filesystem
+        # stage can only resolve to `Live` (row 5) -- `resolve_fate` cannot
+        # independently confirm a push without the `ls-remote`/`gh pr_list`
+        # this function deliberately avoids paying for on every pass (see the
+        # module docstring). The routing decision below stays on the
+        # self-reported claim the legacy code already trusted.
+        outcome_evidence = worker_fate.OutcomeEvidence(
+            source=worker_fate.EvidenceSource.WORKTREE,
+            written_at=outcome_mtime,
+            outcome=worker_outcome.get("outcome") if isinstance(worker_outcome, dict) else None,
+            push_succeeded=(
+                worker_outcome.get("push_succeeded") if isinstance(worker_outcome, dict) else None
+            ),
+            pr_created=(
+                worker_outcome.get("pr_created") if isinstance(worker_outcome, dict) else None
+            ),
+            head_sha=worker_outcome.get("head_sha") if isinstance(worker_outcome, dict) else None,
+            raw=worker_outcome if isinstance(worker_outcome, dict) else {},
+        )
+        fate = worker_fate.resolve_fate(
+            worker_fate.FateEvidence(
+                issue_number=issue_number,
+                adapter=live_entry.get("adapter") or "unknown",
+                dispatched_at=worker_fate.parse_iso_timestamp(live_entry.get("dispatched_at")),
+                pid_alive=True,
+                health=None,
+                terminal=None,
+                worktree_outcome=outcome_evidence,
+                branch=worker_fate.BranchEvidence(
+                    has_remote=True,
+                    remote_head_sha=None,
+                    remote_ahead=None,
+                    unpushed=None,
+                    open_pr_number=None,
+                    pr_known=False,
+                ),
+                failure=None,
+            ),
+            now=now,
+        )
+
+        # FLIP 1: legacy gates freshness on outcome-age-vs-`now`, never on
+        # `dispatched_at` -- rule 1 would ignore a leftover outcome file from
+        # a prior dispatch of this branch instead of accepting it here.
+        # FLIP 5: legacy also withholds routing until `outcome_age` exceeds
+        # the same threshold the kill decision uses -- rule 5 says a
+        # `PushedWithoutPr`/`Completed` fate with `pid_alive=True` should
+        # route immediately, independent of that threshold.
         if outcome_age <= timedelta(minutes=worker_outcome_finalize_minutes):
             continue
-        worker_outcome = read_worker_outcome(worktree_path)
         if not (
             isinstance(worker_outcome, dict)
             and worker_outcome.get("push_succeeded") is True
@@ -136,6 +188,7 @@ def collect_stale_live_handoff_pids(
             "worker_outcome": worker_outcome,
             "worker_pid": live_entry.get("worker_pid"),
             "outcome_age_minutes": outcome_age.total_seconds() / 60,
+            "fate": fate,
         }
     return candidates
 

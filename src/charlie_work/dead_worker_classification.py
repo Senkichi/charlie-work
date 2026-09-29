@@ -48,9 +48,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from . import worker_fate
 from .dispatch_selection import _credit_worker_death
 from .state import set_throttled_until
-from .throttle_signatures import is_provider_throttle_failure
 from .worker import iter_workers
 
 if TYPE_CHECKING:
@@ -129,7 +129,7 @@ def resolve_dead_worker_failure_kind(
     caller then applies the pre-#2002 behavior (a credit is still a real
     worker death, just not a provider exemption).
     """
-    stamped = entry.get("dead_worker_failure_kind")
+    stamped = worker_fate.persisted_failure(entry).kind
     if stamped is not None:
         return stamped
     if not classify_log:
@@ -201,7 +201,7 @@ def classify_and_credit_dead_worker(
     false-positive class) must not arm a fleet-wide throttle from a worker
     that produced a PR. That death is still credited, as unclassified.
 
-    A provider-throttle kind (``is_provider_throttle_failure`` -- the
+    A provider-throttle kind (``worker_fate.persisted_failure(...).is_throttle`` -- the
     #1684/#1917 exemption) suppresses the credit: the death is a global
     provider condition, not a worker-quality signal, and must not count
     toward ``worker_death_at`` caps. Every other outcome credits the death
@@ -214,6 +214,9 @@ def classify_and_credit_dead_worker(
     failure_kind = resolve_dead_worker_failure_kind(
         entry, sessions_dir, issue_number, state, config, now=now, classify_log=classify_log
     )
-    if not is_provider_throttle_failure(failure_kind):
+    # Rule 6 read side (worker_fate.persisted_failure): resolution above has
+    # stamped ``dead_worker_failure_kind`` on ``entry`` whenever it resolved a
+    # kind, so the stamp read agrees with ``failure_kind``.
+    if not worker_fate.persisted_failure(entry).is_throttle:
         entry["worker_death_at"] = _credit_worker_death(entry, at=at, kind=failure_kind)
     return failure_kind

@@ -36,6 +36,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from . import worker_fate
 from .dead_worker_classification import classify_and_credit_dead_worker
 from .orphaned_worker_review_drain import OrphanedWorkerReviewRoute
 from .process_utils import find_worker_terminal_status
@@ -45,7 +46,6 @@ from .rework_outcome import (
     fresh_completed_worker_outcome,
 )
 from .state import PASSIVE_OPEN_STATUS
-from .throttle_signatures import is_provider_throttle_failure
 from .worktree import worktree_path_for_branch
 
 if TYPE_CHECKING:
@@ -138,7 +138,12 @@ def maybe_reap_dead_dispatched_worker(
     if drift_dt is None or dead_dispatched_reap_minutes <= 0:
         return state, False
     grace_anchor = drift_dt
-    provider_throttled = is_provider_throttle_failure(entry.get("dead_worker_failure_kind"))
+    # A6: single read-side accessor for the persisted failure kind (worker_fate
+    # §6) in place of the direct ``entry.get("dead_worker_failure_kind")`` read
+    # -- same value, single point of enforcement for the AST guard that keeps
+    # the raw key name out of every module but state.py/worker_fate.py.
+    failure = worker_fate.persisted_failure(entry)
+    provider_throttled = failure.is_throttle
     if provider_throttled:
         throttled_until_dt = _wf._parse_iso_timestamp(state.get("throttled_until"))
         if throttled_until_dt is not None:
@@ -165,7 +170,7 @@ def maybe_reap_dead_dispatched_worker(
                 "dead_dispatched_throttle_rearmed",
                 {
                     "issue_number": issue_number,
-                    "failure_kind": entry.get("dead_worker_failure_kind"),
+                    "failure_kind": failure.kind,
                     "previous_orphan_drift_at": orphan_drift_at,
                     "throttled_until": state.get("throttled_until"),
                     "rearm_count": rearm_count + 1,
@@ -259,6 +264,14 @@ def handle_dead_worker_completed_outcome(
     caller's own branch, non-zero being a confirmed crash -- a missing
     branch/worktree/timestamp, a stale or off-target outcome) returns
     ``False`` and leaves the caller's worker-death path untouched.
+
+    B2 wiring note: this function does not call ``worker_fate`` directly.
+    ``fresh_completed_worker_outcome`` (B1) already resolves the fate
+    internally and returns ``fate.basis.outcome`` only for the
+    ``Completed``/``PushedWithoutPr`` rows -- the exact "provably completed"
+    answer this function's boolean return depends on. No separate
+    ``FateEvidence`` is built here; doing so would require re-reading the
+    worktree outcome file a second time with no behavioural payoff.
     """
 
     # Deferred: workflow.py imports this module top-level, so a top-level
@@ -415,6 +428,12 @@ def handle_dead_worker_with_pr(
 
     if last_decision == "request_changes" and reviewed_head_sha and live_head_sha:
         if reviewed_head_sha == live_head_sha:
+            # FLIP 4: legacy; fate (rule 4) says a fresh, on-target,
+            # confirmed-push outcome file should outrank a recorded exit_code
+            # of 0. This short-circuit runs first regardless, so a genuinely
+            # completed handoff that also exited cleanly is misread as a
+            # no-op and never reaches `handle_dead_worker_completed_outcome`
+            # below. Kept literal for this wiring step; test_flip4_* pins it.
             if terminal_exit_code == 0:
                 # The worker exited cleanly (exit code 0) rather
                 # than crashing -- e.g. it was handed an empty
@@ -480,6 +499,16 @@ def handle_dead_worker_with_pr(
                 # pre-#773 behavior -- safe to reset
                 # to rework_requested (PR head unchanged since
                 # request_changes).
+                #
+                # FLIP 2: legacy; fate (rule 2) says a fresh, on-target
+                # "blocked" outcome file should be distinguished from "no
+                # evidence at all" and escalated rather than silently
+                # redispatched. `handle_dead_worker_completed_outcome` above
+                # returns False for both populations alike (it only answers
+                # "is this provably a completion"), so a worker that declared
+                # itself blocked lands here and is reset exactly like a
+                # worker that said nothing. Kept literal for this wiring
+                # step; test_flip2_with_pr_fresh_blocked_* pins it.
                 entry["status"] = "rework_requested"
                 entry["dispatched_at"] = None
                 # Issue #1134: record this as a worker death, not
@@ -609,6 +638,11 @@ def handle_dead_worker_with_pr(
             and live_head_sha
             and reviewed_head_sha == live_head_sha
         ):
+            # FLIP 4: legacy; fate (rule 4) says a fresh, on-target,
+            # confirmed-push outcome file should outrank a recorded
+            # exit_code of 0 here too -- the same disagreement as the
+            # request_changes branch above, duplicated at this second call
+            # site. Kept literal for this wiring step; test_flip4_* pins it.
             if terminal_exit_code == 0:
                 # Clean exit with no push -- same #773 rationale
                 # as the request_changes branch: do not spend a
@@ -672,6 +706,12 @@ def handle_dead_worker_with_pr(
                 # distinct reason so the death counter (issue
                 # #1134) and the redispatch cap (issue #165) apply
                 # exactly as they do for request_changes.
+                #
+                # FLIP 2: legacy; fate (rule 2) says a fresh, on-target
+                # "blocked" outcome should escalate rather than fall through
+                # to this same reset -- the same gap as the request_changes
+                # branch above. Kept literal for this wiring step;
+                # test_flip2_with_pr_fresh_blocked_* pins the sibling case.
                 entry["status"] = "rework_requested"
                 entry["dispatched_at"] = None
                 death_ts = _wf.utc_now()

@@ -175,7 +175,6 @@ from .preflight import (
     run_preflight,  # noqa: F401  (deliberate re-export; Tier D patch target + used by moved L05 _loop_impl delegate via _wf.)
 )
 from .throttle_signatures import (
-    is_provider_throttle_failure,
     match_quota_tail,
     match_throttle_tail,
     parse_reset_clock_time,
@@ -484,6 +483,7 @@ from .live_handoff_finalize import (
     partition_dispatched_by_pid_liveness,
     resolve_live_handoff_candidates,
 )
+from . import worker_fate
 
 
 def _diff_file_summary(diff: str) -> tuple[int, list[tuple[str, int, int]]]:
@@ -1652,6 +1652,29 @@ def operator_queue_depth(state: dict[str, Any]) -> set[int]:
     return queued
 
 
+def _no_pr_outcome_evidence(
+    raw: dict[str, Any] | None,
+) -> worker_fate.OutcomeEvidence | None:
+    """Build one ``OutcomeEvidence`` from a raw ``.worker-outcome.json`` dict
+    for the no-PR orphan lane (B3). ``if not raw`` mirrors the Python-truthy
+    ``terminal_outcome or worktree_outcome`` precedence the caller already
+    resolved (an empty dict is treated as absent, same as ``None``) -- this
+    helper wraps the CALLER'S already-chosen value, it does not re-arbitrate
+    terminal vs. worktree itself.
+    """
+    if not raw:
+        return None
+    return worker_fate.OutcomeEvidence(
+        source=worker_fate.EvidenceSource.WORKTREE,
+        written_at=None,
+        outcome=raw.get("outcome"),
+        push_succeeded=raw.get("push_succeeded"),
+        pr_created=raw.get("pr_created"),
+        head_sha=raw.get("head_sha"),
+        raw=raw,
+    )
+
+
 def _detect_and_handle_orphaned_workers(
     sessions_dir: Path,
     state_file: Path,
@@ -1803,6 +1826,15 @@ def _detect_and_handle_orphaned_workers(
     # fire before reclaim adds ``automated-ready``.  Reused by the second
     # loop (pushed-branch candidates) without re-reading.
     worker_outcomes: dict[int, dict[str, Any] | None] = {}
+    # B3: the fate the module resolves for each no-PR orphan from the SAME
+    # evidence this loop already reads. ``dispatched_at=None`` reproduces
+    # this loop's own unconditional read (FLIP 1: no freshness gate on
+    # ``worker_outcomes`` itself, which stays exactly as computed below).
+    # Branch evidence is unknown here (the remote read happens later, in the
+    # pushed-branch-candidate loop) -- an unknown branch cannot decide rows
+    # 2-4/6/8/9, so this fate is only reliable for the blocked check (row 1),
+    # which needs none of it.
+    fates: dict[int, worker_fate.WorkerFate] = {}
     issues_by_number: dict[int, dict[str, Any]] = {}  # also used by the live-handoff lane below
 
     if no_pr_orphans:
@@ -1843,7 +1875,35 @@ def _detect_and_handle_orphaned_workers(
             terminal = find_worker_terminal_status(sessions_dir, issue_number)
             terminal_outcome = terminal.get("worker_outcome") if terminal else None
             worktree_outcome = read_worker_outcome(worktree_path) if worktree_path else None
+            # FLIP 1, FLIP 7: legacy; kept literal. Rule 1 would gate this
+            # read on ``dispatched_at`` freshness, and rule 7 would let
+            # ``resolve_fate`` arbitrate terminal vs. worktree itself rather
+            # than this unconditional ``or``. test_flip1_a9_*/test_flip7_*
+            # pin the current (ungated, terminal-or-worktree) behaviour.
             worker_outcomes[issue_number] = terminal_outcome or worktree_outcome
+            fates[issue_number] = worker_fate.resolve_fate(
+                worker_fate.FateEvidence(
+                    issue_number=issue_number,
+                    adapter=str(entry.get("adapter") or "unknown")
+                    if isinstance(entry, dict)
+                    else "unknown",
+                    dispatched_at=None,
+                    pid_alive=False,
+                    health=None,
+                    terminal=None,
+                    worktree_outcome=_no_pr_outcome_evidence(worker_outcomes[issue_number]),
+                    branch=worker_fate.BranchEvidence(
+                        has_remote=True,
+                        remote_head_sha=None,
+                        remote_ahead=None,
+                        unpushed=None,
+                        open_pr_number=None,
+                        pr_known=True,
+                    ),
+                    failure=None,
+                ),
+                now=now,
+            )
 
         for issue_number in no_pr_orphans:
             issue = issues_by_number.get(issue_number)
@@ -1883,16 +1943,23 @@ def _detect_and_handle_orphaned_workers(
             # ``reap_escalations`` transition applies the operator-queue
             # label edge.
             worker_outcome = worker_outcomes.get(issue_number)
+            # B3: obtains the worker's fate from the module. Rule 1 (Blocked)
+            # already agrees with this lane's own pre-#1453 check byte for
+            # byte -- both read the same fresh ``worker_outcomes[issue_number]``
+            # via legacy-mode (``dispatched_at=None``) freshness, which is
+            # unconditional here -- so this replaces the literal dict check
+            # directly, no FLIP marker needed.
+            #
             # Issue #2010: a ``blocked`` outcome (or log tail) that is just the
             # headless permission-denial signature is a worker-config defect,
             # not a structurally impossible task -- it must not reach the
             # operator queue as if the task were blocked; it falls through to
             # the ordinary redispatch path.
-            if (
-                isinstance(worker_outcome, dict)
-                and worker_outcome.get("outcome") == "blocked"
-                and not worker_permission_denied(
-                    sessions_dir, issue_number, str(worker_outcome.get("detail") or "")
+            if isinstance(fates.get(issue_number), worker_fate.Blocked) and not (
+                worker_permission_denied(
+                    sessions_dir,
+                    issue_number,
+                    str((worker_outcome or {}).get("detail") or ""),
                 )
             ):
                 label_write_ok = True
@@ -1924,9 +1991,7 @@ def _detect_and_handle_orphaned_workers(
             # work loops -- it must not trip this guard (2026-09-29: #1983
             # escalated twice in 11 minutes on ``rate_limited`` deaths).
             orphan_entry = state["issues"].get(str(issue_number))
-            throttle_death = isinstance(orphan_entry, dict) and is_provider_throttle_failure(
-                orphan_entry.get("dead_worker_failure_kind")
-            )
+            throttle_death = worker_fate.persisted_failure(orphan_entry or {}).is_throttle
             if not throttle_death and _is_zero_artifact_dispatch_loop(sessions_dir, issue_number):
                 label_write_ok = True
                 for label in sorted(active_labels):
@@ -1974,6 +2039,19 @@ def _detect_and_handle_orphaned_workers(
             # committed branch for review instead of reclaiming it -- the
             # gate contract lives in park_or_reclaim_local_orphan's
             # docstring (local_work_park.py).
+            #
+            # FLIP 3/9: legacy; this call site's park-vs-reclaim decision is
+            # made inside local_work_park.py on the local worktree's raw
+            # ahead-of-base count, the same "local commits, not yet
+            # reconciled against the remote" fact rule 3 folds into
+            # ``Stranded`` -- park (this lane, no remote) vs. auto-salvage
+            # (dead_worker_reap.py's ``_attempt_salvage``, FLIP 3's sibling
+            # site) vs. judgment-escalation (misc_worker_dispatch.py's
+            # ``_worktree_still_unsafe``, FLIP 3's other sibling). Kept
+            # literal here: ``local_work_park.py`` is not one of this
+            # commit's named consumer files, and its own ahead-count read is
+            # unrelated to ``worker_outcomes``/``fates`` above. test_flip3_*
+            # pins the sibling call sites' current behaviour.
             if park_or_reclaim_local_orphan(
                 gh=gh,
                 config=config,
@@ -2097,6 +2175,10 @@ def _detect_and_handle_orphaned_workers(
         # loop; here we only need the outcome for the push/PR-failure signal.
         worker_outcome = worker_outcomes.get(issue_number)
 
+        # FLIP 1: legacy; ``worker_outcome`` is the same ungated
+        # ``worker_outcomes[issue_number]`` value from the precompute loop
+        # above (no ``dispatched_at`` freshness check) -- test_flip1_a9_*
+        # pins it.
         reported_push = (
             isinstance(worker_outcome, dict)
             and worker_outcome.get("push_succeeded") is True
@@ -2106,6 +2188,12 @@ def _detect_and_handle_orphaned_workers(
         ahead_count = None
         ahead_error = None
         if repo_root is not None:
+            # FLIP 3/9: legacy; fate (rule 3/9) would also need ``unpushed``
+            # (local-vs-remote) to tell "fully pushed, PR missing" apart from
+            # "partially pushed with additional local-only commits" --
+            # ``remote_branch_ahead_count`` only answers remote-vs-base, so a
+            # candidate here can never be resolved to ``Stranded`` the way
+            # rule 3/9 would. Kept literal; test_flip3_*/test_flip9_* pin it.
             ahead_count, ahead_error = remote_branch_ahead_count(
                 repo_root, branch, config.dispatch.base_ref
             )
@@ -2132,6 +2220,8 @@ def _detect_and_handle_orphaned_workers(
         # Treat a branch as a PR-open candidate when:
         # - the worker itself reported a successful push with a failed PR, OR
         # - the branch exists on origin and is ahead of the base (has commits).
+        # FLIP 1/8/9: legacy; ``reported_push``/``ahead_count`` above are the
+        # pre-fate signals this OR combines. See their own FLIP comments.
         if reported_push or (ahead_count is not None and ahead_count > 0):
             pushed_branch_candidates[issue_number] = {
                 "branch": branch,
@@ -2650,9 +2740,7 @@ def _detect_and_handle_orphaned_workers(
                 # ``dead_worker_failure_kind``, stamped on the entry by the
                 # stall/dead reap lanes; earlier non-throttle deaths in the
                 # list still count.
-                provider_throttled_death = is_provider_throttle_failure(
-                    entry.get("dead_worker_failure_kind")
-                )
+                provider_throttled_death = worker_fate.persisted_failure(entry).is_throttle
                 if head_changed or first_observation:
                     orphan_redispatch_at = [] if provider_throttled_death else [now_ts]
                 elif dispatch_identity != prior_dispatch and not provider_throttled_death:
