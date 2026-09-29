@@ -28,7 +28,6 @@ from .instrumentation import log_event
 from .local_issues import github_client_for
 from .pass_deadline import PassDeadlineExceeded, set_pass_deadline_exceeded
 from .paths import runtime_paths
-from .supervise import orchestrator_root
 from .workflow import CommandResult, OrchestratorApp
 
 logger = logging.getLogger(__name__)
@@ -349,11 +348,25 @@ def _run_fleet_config_retirement_sweep(
     config = (
         global_config if isinstance(global_config, OrchestratorConfig) else OrchestratorConfig()
     )
-    gh = github_client_for(orchestrator_root(), config, github=GitHub, dry_run=dry_run)
-    return run_config_retirement_sweep(
-        fleet_dir_override=fleet_dir_override,
-        config=config,
-        gh=gh,
-        dry_run=dry_run,
-        now=now,
-    )["attention"]
+    try:
+        # ``github=`` rather than a pre-built ``gh`` so the client
+        # construction (``github_client_for`` against ``orchestrator_root()``)
+        # happens inside the sweep's own never-raises boundary -- a client
+        # that cannot be built must degrade to an attention entry, not break
+        # the fleet pass at this call site.
+        return run_config_retirement_sweep(
+            fleet_dir_override=fleet_dir_override,
+            config=config,
+            github=GitHub,
+            dry_run=dry_run,
+            now=now,
+        )["attention"]
+    except Exception:  # noqa: BLE001 — the sweep is observability+scheduling; the pass must survive it
+        logger.exception("config-retirement sweep failed")
+        return [
+            {
+                "repo_key": "fleet",
+                "type": "config_retirement_error",
+                "reason": "config-retirement sweep failed; see fleet log",
+            }
+        ]

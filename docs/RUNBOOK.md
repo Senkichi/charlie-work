@@ -621,6 +621,12 @@ normal label edge, posts one comment listing the repos and layers checked plus
 the quiet-window start, and emits `config_key_retirement_armed`. Arming is
 idempotent — a closed or already-Ready issue is left alone.
 
+The sweep fails closed on unverifiable layers: a layer file that exists but
+cannot be read or parsed, and a registered repo whose `repo_root` is missing
+or unreachable (or absent from the registry entry), count as *unproven* rather
+than absent — the quiet window holds and the key cannot arm until every
+registered repo's layers read cleanly or the stale entry is pruned.
+
 If the key reappears after arming, the sweep emits
 `config_key_retirement_regressed` and comments again naming where it came back,
 but keeps the Ready label — a worker may already be running the removal.

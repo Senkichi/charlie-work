@@ -6,7 +6,10 @@ every registered repo -- the user-global fleet layer plus each repo's
 ``orchestrator.config.yaml`` (whether it is a tracked file or an untracked
 local profile). Presence is derived from the raw layer files, never from
 events: a repo that still sets the key but has not run a pass recently is
-still a user.
+still a user. The sweep fails closed: a layer that exists but cannot be
+parsed, and a registered repo whose ``repo_root`` is missing or unreachable,
+both count as *unproven* rather than absent, and hold the quiet window
+(forbid arming) until they read cleanly again.
 
 Per key, a fleet-dir sidecar (``config_retirement_state.json``) records the
 first pass the key was observed absent everywhere; reappearance resets that
@@ -40,7 +43,7 @@ from .config_deprecations import (
 )
 from .fleet_paths import fleet_dir, warn_fleet_dir_virtualization_on_write
 from .fleet_registry import _load_registry, _select_repos
-from .global_config import config_layer_paths
+from .global_config import config_layer_paths, describe_config_file
 from .instrumentation import log_event
 from .labels import transition
 from .local_issue_files import write_text_atomic
@@ -141,22 +144,57 @@ def _enumerate_layer_slots(
     *,
     fleet_dir_override: str | None,
     run_git: Callable[..., Any],
-) -> list[_LayerSlot]:
+) -> tuple[list[_LayerSlot], list[dict[str, str]]]:
     """Every (repo, layer, path) slot the sweep inspects this pass.
 
-    The user-global fleet layer is host-wide -- one slot for the whole pass.
-    Repo layers come from ``config_layer_paths``, the same pairing
-    ``load_layered_config`` reads, so the sweep can never drift away from the
-    loader's real source set (issue #1976's "not a single file" requirement).
+    Returns ``(slots, blocked)``. The user-global fleet layer is host-wide --
+    one slot for the whole pass. Repo layers come from ``config_layer_paths``,
+    the pairing ``load_layered_config`` itself resolves through, so the sweep
+    cannot drift away from the loader's real source set (issue #1976's "not a
+    single file" requirement).
+
+    *blocked* is one unreadable-layer record per registered repo whose layers
+    cannot even be enumerated: no ``repo_root`` on the entry, or a
+    ``repo_root`` that is missing/unreachable on disk. Absence of the key is
+    unprovable for such a repo -- its config file could still set it -- so
+    each record feeds the same fail-closed ``unreadable`` channel as an
+    unparseable file and blocks arming until the registry entry is repaired
+    or pruned (the #1372 stale-entry path owns that lifecycle).
     """
     slots: list[_LayerSlot] = [
         _LayerSlot(None, "user-global", layout.global_config_path(override=fleet_dir_override))
     ]
+    blocked: list[dict[str, str]] = []
     for repo_key, entry in selected:
         repo_root_str = entry.get("repo_root")
         if not repo_root_str:
+            blocked.append(
+                {
+                    "repo": repo_key,
+                    "layer": "repo",
+                    "path": str(entry.get("config_path") or "<unset>"),
+                    "error": "registry entry has no repo_root",
+                }
+            )
             continue
         repo_root = Path(repo_root_str)
+        try:
+            root_is_dir = repo_root.is_dir()
+        except (OSError, ValueError):
+            root_is_dir = False
+        if not root_is_dir:
+            blocked.append(
+                {
+                    "repo": repo_key,
+                    "layer": "repo",
+                    "path": str(repo_root),
+                    "error": (
+                        "repo_root is not a readable directory "
+                        f"({describe_config_file(repo_root)})"
+                    ),
+                }
+            )
+            continue
         explicit = entry.get("config_path")
         for layer, path in config_layer_paths(
             repo_root,
@@ -166,7 +204,7 @@ def _enumerate_layer_slots(
             if layer == "user-global":
                 continue  # the host-wide slot was already enumerated once
             slots.append(_LayerSlot(repo_key, _repo_layer_kind(repo_root, path, run_git), path))
-    return slots
+    return slots, blocked
 
 
 def _scan_layer(slot: _LayerSlot) -> tuple[list[DeprecatedConfigKey], str | None]:
@@ -175,13 +213,15 @@ def _scan_layer(slot: _LayerSlot) -> tuple[list[DeprecatedConfigKey], str | None
     An absent file is a clean miss, not an error -- the slot was still
     "checked". A file that exists but cannot be read or parsed is an error:
     the sweep cannot prove the key absent from it, which must block arming
-    (fail closed).
+    (fail closed). ``exists()`` itself is inside the try because it raises
+    (rather than returning False) on EACCES and unrepresentable paths --
+    those are unproven-absence too, not a clean miss.
     """
-    if not slot.path.exists():
-        return [], None
     try:
+        if not slot.path.exists():
+            return [], None
         raw = yaml.safe_load(slot.path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
+    except (OSError, UnicodeDecodeError, ValueError, yaml.YAMLError) as exc:
         return [], f"{type(exc).__name__}: {exc}"
     data = raw if isinstance(raw, dict) else {}
     return deprecated_keys_in(data), None
@@ -312,8 +352,11 @@ def _process_key(
             return summary
         absent_since = _parse_iso(rec.get("absent_since"))
         if absent_since is None:
+            # First clean pass: record the window start and fall through so
+            # quiet_days=0 -- the documented "retire on the first clean pass"
+            # opt-out -- arms immediately (elapsed 0 >= 0).
             rec["absent_since"] = _iso(now)
-            return summary
+            absent_since = now
         elapsed_days = (now - absent_since).total_seconds() / 86400.0
         summary["quiet_elapsed_days"] = elapsed_days
         if elapsed_days < quiet_days or dry_run:
@@ -429,13 +472,19 @@ def run_config_retirement_sweep(
         # All registered repos, not the pass's --repos subset: a filtered pass
         # must still see a repo where the key remains set.
         selected = _select_repos(registry_json, None)
-        slots = _enumerate_layer_slots(
+        slots, blocked = _enumerate_layer_slots(
             selected, fleet_dir_override=fleet_dir_override, run_git=run_git
         )
 
         presence: dict[str, list[dict[str, str]]] = {}
         unreadable: dict[str, list[dict[str, str]]] = {}
         checked: list[dict[str, str]] = []
+        # Repos whose layers could not even be enumerated (missing
+        # ``repo_root`` / unreachable root) block every registered key from
+        # arming -- absence is unproven there (fail closed).
+        for record in blocked:
+            for entry in registry:
+                unreadable.setdefault(entry.dotted, []).append(dict(record))
         for slot in slots:
             found, error = _scan_layer(slot)
             checked.append(

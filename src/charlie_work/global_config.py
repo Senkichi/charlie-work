@@ -8,11 +8,10 @@ from typing import Any
 import yaml
 
 from .config import (
-    DEFAULT_CONFIG_FILENAME,
     ConfigError,
     OrchestratorConfig,
     build_config_from_data,
-    find_config_path,
+    default_config_path,
     known_config_sections,
     load_config,
 )
@@ -35,13 +34,14 @@ def config_layer_paths(
     fleet dir's ``config.yaml``) or ``"repo"`` (the resolved per-repo file).
     Paths come back whether or not the file exists -- the fleet retirement
     sweep (issue #1976) needs the *slots*, not just the files that happen to
-    be present, so an absent layer is still "checked". This is the same
-    pairing ``load_layered_config`` performs; keeping it here stops the
-    sweep from drifting away from the real loader's source set.
+    be present, so an absent layer is still "checked". ``load_layered_config``
+    itself resolves its layer paths through this function, so the sweep and
+    the loader share one source set by construction rather than by parallel
+    resolution that could drift.
     """
     return (
         ("user-global", layout.global_config_path(override=fleet_dir_override)),
-        ("repo", repo_root / DEFAULT_CONFIG_FILENAME) if explicit is None else ("repo", explicit),
+        ("repo", default_config_path(repo_root)) if explicit is None else ("repo", explicit),
     )
 
 
@@ -128,11 +128,17 @@ def load_layered_config(
     Returns:
         The merged OrchestratorConfig.
     """
-    # Load per-repo config path
-    repo_config_path = find_config_path(repo_root, explicit)
-
-    # Load global config if present
-    global_config_path = layout.global_config_path(override=fleet_dir_override)
+    # Both layer paths come from config_layer_paths (issue #1976): the fleet
+    # retirement sweep enumerates exactly these slots, so the loader and the
+    # sweep share one source set by construction. The repo slot is the
+    # *candidate* -- explicit wins unconditionally, otherwise the default
+    # filename whether or not it exists; existence is gated at ``repo_source``
+    # below and ``load_config`` treats a nonexistent path as no config.
+    layer_map = dict(
+        config_layer_paths(repo_root, explicit, fleet_dir_override=fleet_dir_override)
+    )
+    global_config_path = layer_map["user-global"]
+    repo_config_path = layer_map["repo"]
     global_exists = global_config_path.exists()
     if require_global and not global_exists:
         # The silent-{} branch below is the whole of issue #623: every

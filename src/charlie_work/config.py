@@ -2419,13 +2419,23 @@ class OrchestratorConfig:
     sources: tuple[str, ...] = field(default=(), compare=False, metadata={"provenance": True})
 
 
+def default_config_path(repo_root: Path) -> Path:
+    """The default per-repo config candidate: ``repo_root / orchestrator.config.yaml``.
+
+    Single source for the candidate path so ``find_config_path`` (existence-gated
+    resolution for the loader) and ``config_layer_paths`` (slot enumeration for
+    the fleet retirement sweep, issue #1976) cannot drift apart on the filename.
+    """
+    return repo_root / DEFAULT_CONFIG_FILENAME
+
+
 def find_config_path(repo_root: Path, explicit: Path | None = None) -> Path | None:
     """Resolve the config file: an explicit path wins; otherwise the consumer
     repo's root-level ``orchestrator.config.yaml`` if present; otherwise None
     (pure dataclass defaults)."""
     if explicit is not None:
         return explicit
-    candidate = repo_root / DEFAULT_CONFIG_FILENAME
+    candidate = default_config_path(repo_root)
     return candidate if candidate.exists() else None
 
 
