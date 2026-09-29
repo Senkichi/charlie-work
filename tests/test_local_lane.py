@@ -1067,3 +1067,72 @@ class TestDrainSuppressesLocalRework:
         entry = state["issues"]["7"]
         assert entry["status"] == "dispatched"
         assert "dead_worker_failure_kind" not in entry
+
+    # A pid no live process can hold: the previous dispatch epoch's worker.
+    _STALE_PID = 2**31 - 7
+
+    def _seed_stale_worker_pid(self, app: OrchestratorApp) -> None:
+        with state_lock(app.paths.state_file):
+            state = load_state(app.paths.state_file)
+            state["issues"]["7"]["worker_pid"] = self._STALE_PID
+            state["issues"]["7"]["worker_process_start_time"] = 1.0
+            save_state(app.paths.state_file, state)
+
+    @staticmethod
+    def _spy_dispatch_with_pid(monkeypatch: pytest.MonkeyPatch, pid: int | None) -> None:
+        def _fake(_repo_root, _manifest, _results, _settings, requests):
+            return [
+                SessionDispatchResult(
+                    issue_number=request.issue_number,
+                    issue_title=request.issue_title,
+                    prompt_path=str(request.prompt_path),
+                    branch_name=request.branch_name,
+                    adapter="claude-code",
+                    ok=True,
+                    pid=pid,
+                    process_start_time=None if pid is None else 1234.5,
+                )
+                for request in requests
+            ]
+
+        monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", _fake)
+
+    def test_local_rework_dispatch_stamps_new_worker_pid(
+        self, repo: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The rework launch replaces the previous epoch's worker pid.
+
+        With the stale pid left in place, the dead-worker reap read the NEW
+        rework worker as dead on the next pass and parked its branch
+        mid-session: a reviewer got the pre-rework head, and the
+        superseded-worker reap could no longer see the live writer
+        (mdls #25/#7, 2026-09-29).
+        """
+        app = self._rework_pending(repo)
+        self._seed_stale_worker_pid(app)
+        self._spy_dispatch_with_pid(monkeypatch, 4242)
+
+        result = app.loop(limit=1)
+
+        assert result.ok, result.message
+        entry = load_state_locked(app.paths.state_file)["issues"]["7"]
+        assert entry["status"] == "dispatched"
+        assert entry["worker_pid"] == 4242
+        assert entry["worker_process_start_time"] == 1234.5
+
+    def test_local_rework_dispatch_without_pid_drops_stale_pid(
+        self, repo: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A launch that reports no pid must not leave the previous epoch's
+        pid standing as this worker's liveness signal."""
+        app = self._rework_pending(repo)
+        self._seed_stale_worker_pid(app)
+        self._spy_dispatch_with_pid(monkeypatch, None)
+
+        result = app.loop(limit=1)
+
+        assert result.ok, result.message
+        entry = load_state_locked(app.paths.state_file)["issues"]["7"]
+        assert entry["status"] == "dispatched"
+        assert "worker_pid" not in entry
+        assert "worker_process_start_time" not in entry
