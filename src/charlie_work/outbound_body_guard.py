@@ -122,16 +122,27 @@ def _mask_example_secret_fences(text: str) -> str:
     concern -- blank every line of a fence whose info string is exactly
     ``example-secret``, opener and closer lines included -- stays here; it
     is not itself CommonMark structure.
+
+    Line splitting here must track ``scan``'s own ``text.splitlines()``
+    convention exactly (content and terminator kept separate, terminators
+    preserved verbatim) rather than a plain ``text.split("\\n")``: the two
+    disagree on a bare ``\\r`` not part of a ``\\r\\n`` pair (``splitlines``
+    treats it as its own line break; ``split("\\n")`` does not), which would
+    desync ``fence.start``/``fence.end`` line indices from a locally
+    ``\\n``-split line list on such input.
     """
-    lines = text.split("\n")
+    contents = text.splitlines()
+    terminators = [
+        raw[len(content) :] for raw, content in zip(text.splitlines(keepends=True), contents)
+    ]
     structure = markdown_fence.scan(text)
     for fence in structure.fences:
         if fence.info != _EXAMPLE_FENCE_INFO:
             continue
-        end = fence.end if fence.closed else len(lines)
+        end = fence.end if fence.closed else len(contents)
         for i in range(fence.start, end):
-            lines[i] = ""
-    return "\n".join(lines)
+            contents[i] = ""
+    return "".join(content + terminator for content, terminator in zip(contents, terminators))
 
 
 @lru_cache(maxsize=1)

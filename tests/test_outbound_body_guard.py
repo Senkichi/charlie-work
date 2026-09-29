@@ -145,6 +145,22 @@ def test_other_fences_are_still_scanned() -> None:
         assert any(m.rule_id == "github-oauth" for m in matches), info
 
 
+def test_example_secret_masking_not_desynced_by_bare_cr() -> None:
+    """A bare ``\\r`` not part of a ``\\r\\n`` pair is its own line break
+    under ``str.splitlines()`` (what the ``markdown_fence.scan`` fence
+    indices are computed against) but not under a naive ``split("\\n")``.
+    Regression: masking used to line-split with ``split("\\n")`` while
+    consuming ``scan``'s line-indexed fence span, desyncing the two on such
+    input -- silently dropping a real secret that follows the exempt fence
+    (false negative) while leaving the exempt fence's own content
+    unmasked."""
+    body = f"note\r\rmore\r\n```example-secret\r\n{_GHO}\r\n```\r\n{_GHP}\r\n"
+    matches = scan_outbound_text(body, part="body")
+    rule_ids = {m.rule_id for m in matches}
+    assert "github-oauth" not in rule_ids, "exempt fence content leaked as a match"
+    assert "github-pat" in rule_ids, "real secret after the fence was not detected"
+
+
 def test_match_reports_part_and_line() -> None:
     matches = scan_outbound_text(f"line one\nline two {_GHO}\n", part="body")
     match = next(m for m in matches if m.rule_id == "github-oauth")

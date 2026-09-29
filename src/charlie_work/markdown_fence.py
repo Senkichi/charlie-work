@@ -50,13 +50,11 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from enum import Enum
 
 __all__ = [
     "MIN_FENCE_LENGTH",
     "fence_for",
     "fenced_block",
-    "LineKind",
     "FenceSpan",
     "Heading",
     "MarkdownStructure",
@@ -146,17 +144,6 @@ _ATX_HEADING_RE = re.compile(r"^[ \t]{0,3}(#{1,6})(?:[ \t]+(.*?))?[ \t]*$")
 _ATX_CLOSING_RUN_RE = re.compile(r"(?:^|[ \t])#+$")
 
 
-class LineKind(Enum):
-    """Which of the four (mutually exclusive) block-level buckets a line is
-    in: fenced code, a blockquote marker, an ATX heading, or plain prose.
-    """
-
-    FENCE = "fence"
-    QUOTE = "quote"
-    HEADING = "heading"
-    PROSE = "prose"
-
-
 @dataclass(frozen=True)
 class FenceSpan:
     """One fenced code block, as a half-open line-index range.
@@ -220,30 +207,6 @@ class MarkdownStructure:
     def is_fenced(self, line: int) -> bool:
         """True when ``line`` falls inside any fenced code block (open or closed)."""
         return any(line in fence for fence in self.fences)
-
-    def nearest_heading_before(self, line: int) -> Heading | None:
-        """The last heading whose line is strictly before ``line``, or ``None``.
-
-        Headings are stored in document order, so this is the same "most
-        recent heading regardless of level" rule `cross_repo_gate.
-        _nearest_preceding_heading` implements by hand today.
-        """
-        nearest: Heading | None = None
-        for heading in self.headings:
-            if heading.line >= line:
-                break
-            nearest = heading
-        return nearest
-
-    def kind_of(self, line: int) -> LineKind:
-        """Classify one line into its block-level bucket."""
-        if self.is_fenced(line):
-            return LineKind.FENCE
-        if line in self.quoted_lines:
-            return LineKind.QUOTE
-        if line in self.heading_lines:
-            return LineKind.HEADING
-        return LineKind.PROSE
 
 
 def is_blockquote_marker(line: str) -> bool:
