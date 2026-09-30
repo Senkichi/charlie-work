@@ -18,6 +18,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
+from .dead_dispatched_timer import LOCAL_PARK_DEFER_FIELDS
+
 # PR-record bookkeeping that must not survive an operator re-arm: attempt
 # counters and caches that would otherwise instantly re-escalate the PR
 # (counters at cap) or feed the pipeline frozen pre-escalation data
@@ -128,6 +130,9 @@ UNESCALATE_ISSUE_RESET_FIELDS = (
     "dead_worker_failure_classified_at",
     # Issue #1993: companion of the stamp above (bounded re-arm counter).
     "throttle_reap_rearm_count",
+    # Issue #1971: the bounded local-park deferral bookkeeping is per death
+    # episode; a re-arm starts the deferral budget fresh.
+    *LOCAL_PARK_DEFER_FIELDS,
     # wf-r2-s6 (N4): the live-handoff lane's "already routed this outcome"
     # marker; a re-arm must let the lane consider the outcome afresh.
     "live_handoff_routed_outcome_at",
