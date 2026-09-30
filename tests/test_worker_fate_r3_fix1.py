@@ -75,7 +75,11 @@ def test_fresh_exit_zero_record_still_routes_to_clean_exit_no_op(tmp_path: Path)
     _run_orphan_sweep(tmp_path, paths, config, fake_gh)
 
     state = load_state(paths.state_file)
-    assert state["issues"]["207"]["status"] == "dispatched"
+    # #773: no death-redispatch credit. #2034: the no-op finding is dispositioned
+    # (here CI is unknown/green with no rebuttal -> visible escalation), never
+    # left resting in ``dispatched``.
+    assert state["issues"]["207"]["status"] != "dispatched"
+    assert state["issues"]["207"].get("worker_death_at") is None
     assert _drift_reasons(state) == ["dead_worker_clean_exit_no_op"]
 
 

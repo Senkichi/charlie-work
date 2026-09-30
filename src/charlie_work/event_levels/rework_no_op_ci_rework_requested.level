@@ -1,0 +1,3 @@
+info
+# Issue #2034: a dead rework worker no-oped while live CI was red; the issue was routed
+# to the CI-failure rework lane (record_review, ci_gate_auto_reject) instead of stranded.
