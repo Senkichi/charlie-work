@@ -361,6 +361,7 @@ def worker_tmp_dir(target_path: Path) -> Path:
 GLOBAL_CONFIG_FILENAME = "config.yaml"
 FLEET_REGISTRY_FILENAME = "fleet.json"
 FLEET_LOCK_FILENAME = "fleet.lock"
+FLEET_LOCK_HOLDER_FILENAME = "fleet.lock.holder"
 FLEET_SUPERVISOR_LOCK_FILENAME = "fleet-supervisor.lock"
 FLEET_STOP_REQUEST_FILENAME = "fleet-stop-request.json"
 NOTIFY_HEALTH_STATE_FILENAME = "notify_health_state.json"
@@ -423,6 +424,17 @@ def fleet_registry_path(override: str | None = None) -> Path:
 def fleet_lock_path(override: str | None = None) -> Path:
     """Return the fleet-wide dispatch lock path in the fleet dir."""
     return fleet_dir(override=override) / FLEET_LOCK_FILENAME
+
+
+def fleet_lock_holder_path(override: str | None = None) -> Path:
+    """Return the fleet-launch-lock holder-metadata sidecar path (issue #2055).
+
+    The byte-range lock carries no owner identity, so the holder writes this
+    small JSON sidecar (``repo``/``pid``/``acquired_at``) on acquisition and
+    removes it on release; a waiter reads it -- best-effort -- to report who
+    starved it in the ``fleet_lock_held`` deferral payload.
+    """
+    return fleet_dir(override=override) / FLEET_LOCK_HOLDER_FILENAME
 
 
 def fleet_supervisor_lock_path(override: str | None = None) -> Path:

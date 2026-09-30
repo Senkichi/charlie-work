@@ -31,7 +31,7 @@ from charlie_work.blocked_worker_escalation import resolve_fate_exempting_blocke
 from charlie_work.config import WORKER_OUTCOME_FILENAME
 from charlie_work.dead_worker_reap import _emit_session_failed_relabeled
 from charlie_work.fleet_registry import try_acquire_fleet_lock
-from charlie_work.worker_launch_gate import WorkerLaunchDeferral, acquire_fleet_launch_lock
+from charlie_work.worker_launch_gate import acquire_fleet_launch_lock
 from charlie_work.github import label_names
 from charlie_work.salvage_events import repeats_last_salvage_failure
 from charlie_work.state import StateLockBusy
@@ -492,20 +492,12 @@ def dispatch_rework(
     counter, so it must run at most once per pass). Standalone callers
     leave this as None and the sweep runs inside this call as before.
     """
-    # Issue #2041: gate 1 of the shared worker-launch gate, held across
-    # governor -> claim -> launch; _dispatch_rework_impl hands it to
-    # issue_worker_launch_permit.
+    # Issue #2055: mint the fleet-launch-lock handle here so the ``finally``
+    # below covers every impl exit path, but do NOT take the OS lock yet --
+    # the pending handle is realized by issue_worker_launch_permit (bounded
+    # wait) immediately before the governor, after _dispatch_rework_impl's
+    # pr_list / issue_view / stall-sweep scan.
     launch_lock = acquire_fleet_launch_lock(self, acquire=try_acquire_fleet_lock)
-    if isinstance(launch_lock, WorkerLaunchDeferral):
-        return _wf.CommandResult(
-            True,
-            "rework dispatch deferred: fleet lock held",
-            {
-                "adapter": self.config.worker.harness,
-                "selected_count": 0,
-                "deferred_reason": launch_lock.reason,
-            },
-        )
     try:
         return self._dispatch_rework_impl(
             limit,

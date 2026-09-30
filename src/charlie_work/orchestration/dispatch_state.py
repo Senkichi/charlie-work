@@ -187,20 +187,15 @@ def _dispatch_impl(
             write_gate=self.write_gate,
         )
 
-    # Count live workers after stall handling (stalled workers are killed).
-    # Corroborated against state.json (issue #343) so a ghost -- a live
-    # worker_pid whose sidecar was removed -- cannot silently free a slot.
-    live_count = _wf._count_live_sessions(sessions_dir, self.paths.state_file)
-
-    # Issue #2041: the shared worker-launch gate -- concurrency governor (with
-    # the pre-computed live_count), then provider throttle, under the fleet
-    # lock dispatch() already holds. Issue #1129: fresh-issue dispatch also
-    # applies open-PR backpressure (max_open_agent_prs), pacing new PR
-    # creation to the review/merge lane.
+    # Issue #2041/#2055: the shared worker-launch gate -- provider-throttle
+    # pre-check (lock-free), the fleet lock realized HERE with a bounded wait
+    # (never across the scans above), live_count computed under it, then the
+    # concurrency governor and the authoritative throttle read. Issue #1129:
+    # fresh-issue dispatch also applies open-PR backpressure
+    # (max_open_agent_prs), pacing new PR creation to the review/merge lane.
     permit = issue_worker_launch_permit(
         self,
         dispatch_limit,
-        live_count=live_count,
         apply_open_pr_backpressure=True,
         launch_lock=launch_lock,
     )
@@ -231,7 +226,7 @@ def _dispatch_impl(
             message = f"dispatch deferred: provider throttled until {permit.throttled_until}"
         else:
             message = f"dispatch deferred: {permit.reason}"
-        return _wf.CommandResult(False, message, data)
+        return _wf.CommandResult(permit.ok, message, data)
     gov = permit.governor
     dispatch_limit = permit.max_launches
 
@@ -257,6 +252,11 @@ def _dispatch_impl(
     # Dry-run: read-only planning — compute selection and would-be SessionRequests,
     # but skip all state writes, label transitions, and file mutations.
     if self.dry_run:
+        # Issue #2055: nothing below launches, so the fleet lock the permit
+        # realized has served its purpose (governor decision) -- release it
+        # before the read-only planning scan rather than holding it to the
+        # lane's ``finally`` (release is idempotent; that finally still runs).
+        launch_lock.release()
         selected_issue_numbers: list[int] = []
         skipped_issue_numbers: list[int] = []
         # Detect stalled sessions (read-only for dry-run)
@@ -1096,6 +1096,12 @@ def _dispatch_impl(
     manifest_path = self._layout.session_manifest
     results_path = self._layout.session_results
     dispatch_results = _launch_workers(self, permit, self._adapter_settings(), session_requests)
+    # Issue #2055: the sessions the fleet cap counts are on disk now -- the
+    # governor -> claim -> launch window the lock exists to serialize is
+    # closed. Release before the result bookkeeping below instead of holding
+    # it to the lane's ``finally`` (release is idempotent; that finally
+    # still runs and covers every other exit path).
+    launch_lock.release()
     successful_issue_numbers = {result.issue_number for result in dispatch_results if result.ok}
     # Issue #523: a live_worker_redispatch_averted result claims the prior
     # worker is still alive, but the adapter's probe (_probe_recovery_liveness)
