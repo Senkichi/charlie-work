@@ -24,6 +24,7 @@ from .config import OrchestratorConfig
 from .rescue_review import LEGACY_VACUOUS_SUMMARY
 from .github import defang_closing_keywords
 from .markdown_fence import fenced_block
+from .paths import prompt_override_dirs
 from .prompt_skills import active_prompt_variants
 from .prompt_test_command import prompt_test_command_values
 from .prompts import assert_rework_prompt_contracts, render_prompt
@@ -56,14 +57,13 @@ def _provenance_caveat_from_decision(decision: dict[str, Any] | None) -> str:
 def _rework_prompt_search_dirs(
     config: OrchestratorConfig, repo_root: Path | None = None
 ) -> tuple[Path, ...]:
-    """Resolve the optional repo-local prompt override directory."""
-    prompts_dir = config.runtime.prompts_dir
-    if not prompts_dir:
-        return ()
-    path = Path(prompts_dir)
-    if not path.is_absolute() and repo_root is not None:
-        path = repo_root / path
-    return (path,)
+    """Resolve the optional repo-local prompt override directory.
+
+    Thin wrapper delegating to :func:`paths.prompt_override_dirs` -- the
+    resolution rule lives there once (issue #2054); this name stays only so
+    the ``workflow.py`` facade re-export keeps resolving unchanged.
+    """
+    return prompt_override_dirs(config, repo_root)
 
 
 _EXTERNAL_FINDINGS_POINTER = (

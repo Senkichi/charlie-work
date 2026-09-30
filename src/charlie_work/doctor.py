@@ -42,7 +42,7 @@ from .github import (
     RECONCILE_PR_FIELDS,
 )
 from .local_work_park import publishes_pull_requests
-from .paths import RuntimePaths, resolved_layout
+from .paths import RuntimePaths, prompt_override_dirs, resolved_layout
 from .prompts import resolve_template
 from ci_fleet.provenance import REFUSAL_STATE_FILENAME, load_refusal_streak
 from .supervise import _self_deploy_state_path, orchestrator_root, try_acquire_supervisor_lock
@@ -1420,14 +1420,15 @@ def run_doctor(
         )
 
     # -- prompts -------------------------------------------------------------
-    prompts_dir = config.runtime.prompts_dir
+    # Resolution is shared with dispatch and rework rendering via
+    # paths.prompt_override_dirs (issue #2054); only the existence check is
+    # doctor's own, since it is a diagnostic rather than part of resolution.
+    resolved_dirs = prompt_override_dirs(config, repo_root)
     search_dirs: tuple[Path, ...] = ()
-    if prompts_dir:
-        override = Path(prompts_dir)
-        if not override.is_absolute():
-            override = repo_root / override
+    if resolved_dirs:
+        override = resolved_dirs[0]
         if override.is_dir():
-            search_dirs = (override,)
+            search_dirs = resolved_dirs
             add("prompts dir", True, str(override))
         else:
             add("prompts dir", False, f"runtime.prompts_dir does not exist: {override}")
