@@ -7,6 +7,7 @@ Lock-phase handlers read the state copy the shell loaded under the lock
 
 from __future__ import annotations
 
+import copy
 import logging
 from collections.abc import Callable
 from pathlib import Path
@@ -45,6 +46,7 @@ from .model import (
     CreditDeadWorker,
     CreditResult,
     DrainNoOp,
+    GuardedUpdate,
     OpenPrForBranch,
     PrOpenResult,
     ReadAppliedHeads,
@@ -214,6 +216,34 @@ def review(ctx: SweepContext, req: Review) -> ReviewResult:
     )
 
 
+def guarded_update(ctx: SweepContext, req: GuardedUpdate) -> bool:
+    """Re-check the guards on a fresh load under one short lock, then merge.
+
+    Returns whether the merge was written: ``False`` means a concurrent writer
+    changed the issue's status or the PR's reviewed head first, and the flow
+    must not record anything that presumes the write (ADR-0001: merge, never
+    replace the entry)."""
+    with ctx.ports.state_lock(ctx.state_file):
+        state = ctx.ports.load_state(ctx.state_file)
+        entry = (state.get("issues") or {}).get(str(req.issue))
+        if not isinstance(entry, dict):
+            return False
+        if req.require_status is not None and entry.get("status") != req.require_status:
+            return False
+        if req.require_pr_reviewed_head is not None:
+            pr_number = ctx.review_prs.get(req.issue, entry.get("pr_number"))
+            pr_state = (state.get("prs") or {}).get(str(pr_number), {})
+            if pr_state.get("reviewed_head_sha") != req.require_pr_reviewed_head:
+                return False
+        entry.update(copy.deepcopy(dict(req.set_items)))
+        if req.stamp_fields:
+            stamp = ctx.ports.utc_now()
+            for key in req.stamp_fields:
+                entry[key] = stamp
+        ctx.write_gate.save_state(state)
+    return True
+
+
 def drain_no_op(ctx: SweepContext, req: DrainNoOp) -> bool:
     routes = [
         orphaned_worker_no_op_drain.NoOpReworkRoute(
@@ -266,6 +296,7 @@ HANDLERS: dict[type, Callable[[SweepContext, Any], Any]] = {
     ApplyOutcomes: apply_outcomes,
     ReadAppliedHeads: read_applied_heads,
     Review: review,
+    GuardedUpdate: guarded_update,
     DrainNoOp: drain_no_op,
 }
 

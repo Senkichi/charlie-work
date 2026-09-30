@@ -147,7 +147,7 @@ def _unreviewed_flow(
             waiting.append(number)
     unreviewed: dict[int, tuple[str, ...]] = {}
     if waiting:
-        issues = (yield FetchOpenIssues()).issues_by_number
+        issues = (yield FetchOpenIssues("unreviewed")).issues_by_number
         for number in waiting:
             issue = issues.get(number)
             if issue is not None:
@@ -180,7 +180,7 @@ def pre_flow(facts: SweepFacts) -> Flow:
     declared = {n: c for n, c in stale.items() if n not in pr_by_issue}
     live_candidates: dict[int, Mapping[str, Any]] = {}
     if declared:
-        issues = (yield FetchOpenIssues()).issues_by_number
+        issues = (yield FetchOpenIssues("live_handoff")).issues_by_number
         live_candidates = {n: c for n, c in declared.items() if n in issues}
 
     return PreOutcome(

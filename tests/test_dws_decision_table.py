@@ -39,6 +39,7 @@ from charlie_work.dead_worker_sweep.model import (
     Escalate,
     FateResult,
     FetchOpenIssues,
+    GuardedUpdate,
     FetchOpenPrs,
     FetchPrView,
     IssuesResult,
@@ -280,6 +281,7 @@ def _pr_answers(*, decision="request_changes", reviewed="old", exit_code=1, extr
             FetchPrView: None,
             DrainNoOp: True,
             ApplyOutcomes: True,
+            GuardedUpdate: True,
             CreditDeadWorker: CreditResult(failure_kind=None, throttled_until=None),
         }
         | (extra or {})
@@ -301,6 +303,10 @@ def _review_ok(**kw) -> ReviewResult:
     return ReviewResult(**(base | kw))
 
 
+def _guarded(post) -> list[GuardedUpdate]:
+    return [r for r in post.requests if isinstance(r, GuardedUpdate)]
+
+
 def _head_changed_run(review: ReviewResult, *, review_available: bool = True):
     facts = make_facts(state_with({7: dispatched()}), review_available=review_available)
     return drive_all_phases(facts, _pr_answers(extra={Review: review}))
@@ -309,8 +315,8 @@ def _head_changed_run(review: ReviewResult, *, review_available: bool = True):
 def test_head_changed_routes_to_review_and_flips_status_under_guards() -> None:
     _pre, lock, post = _head_changed_run(_review_ok())
     assert Review(7, 70, "dead_worker_with_head_change") in post.requests
-    (update,) = post.commits_of(UpdateIssue)
-    assert update.set_fields == {"status": "reviewing"}
+    (update,) = _guarded(post)
+    assert dict(update.set_items) == {"status": "reviewing"}
     assert update.require_status == "dispatched"
     assert update.require_pr_reviewed_head == "old"
     assert "orphaned_worker_routed_to_review" in post.emitted()
@@ -321,21 +327,23 @@ def test_head_changed_routes_to_review_and_flips_status_under_guards() -> None:
 
 def test_review_callback_error_emits_a_warning_and_changes_nothing() -> None:
     _pre, _lock, post = _head_changed_run(_review_ok(ok=False, raised_error="RuntimeError: boom"))
-    assert not post.commits_of(UpdateIssue)
+    assert not _guarded(post)
     (warn,) = [c for c in post.commits_of(Emit) if c.kind == "orphaned_worker_review_route_failed"]
     assert warn.level == "warning"
+    assert warn.audit_only  # events.db only, as the original ``log_event``
     assert warn.payload["error"] == "RuntimeError: boom"
 
 
 def test_review_that_routed_to_rework_is_not_marked_reviewing() -> None:
     _pre, _lock, post = _head_changed_run(_review_ok(routed_to_rework=True))
-    assert all(u.set_fields.get("status") != "reviewing" for u in post.commits_of(UpdateIssue))
+    assert all(dict(u.set_items).get("status") != "reviewing" for u in _guarded(post))
 
 
 def test_failed_review_records_drift_under_a_status_guard() -> None:
     _pre, _lock, post = _head_changed_run(_review_ok(ok=False))
-    (update,) = post.commits_of(UpdateIssue)
-    assert set(update.set_fields) == {"orphan_drift_fingerprint", "orphan_drift_at"}
+    (update,) = _guarded(post)
+    assert {k for k, _ in update.set_items} == {"orphan_drift_fingerprint"}
+    assert update.stamp_fields == ("orphan_drift_at",)  # stamped at write time
     assert update.require_status == "dispatched"
     assert update.require_pr_reviewed_head is None
     assert "orphaned_worker_drift" in post.emitted()
@@ -343,12 +351,29 @@ def test_failed_review_records_drift_under_a_status_guard() -> None:
 
 def test_issue_that_left_dispatched_during_review_is_left_alone() -> None:
     _pre, _lock, post = _head_changed_run(_review_ok(entry_status="reviewing"))
-    assert not post.commits_of(UpdateIssue)
+    assert not _guarded(post)
 
 
 def test_reviewed_head_that_moved_during_review_is_not_marked_reviewing() -> None:
     _pre, _lock, post = _head_changed_run(_review_ok(pr_reviewed_head_sha="newer"))
-    assert all(u.set_fields.get("status") != "reviewing" for u in post.commits_of(UpdateIssue))
+    assert all(dict(u.set_items).get("status") != "reviewing" for u in _guarded(post))
+
+
+def test_refused_guarded_write_suppresses_the_dependent_event() -> None:
+    """A write the shell refused (concurrent writer won) records no routed event."""
+    facts = make_facts(state_with({7: dispatched()}))
+    answers = _pr_answers(extra={Review: _review_ok(), GuardedUpdate: False})
+    _pre, _lock, post = drive_all_phases(facts, answers)
+    (event,) = [c for c in post.commits_of(Emit) if c.kind == "orphaned_worker_routed_to_review"]
+    assert event.payload["routed"] is False
+
+
+def test_refused_reviewing_flip_falls_through_like_the_elif_chain() -> None:
+    """Refused ok-route flip: the not-ok arms need ``not ok``, so nothing else writes."""
+    facts = make_facts(state_with({7: dispatched()}))
+    answers = _pr_answers(extra={Review: _review_ok(), GuardedUpdate: False})
+    _pre, _lock, post = drive_all_phases(facts, answers)
+    assert len(_guarded(post)) == 1
 
 
 def test_without_a_review_callback_head_change_is_recorded_as_drift() -> None:

@@ -1,9 +1,13 @@
 """The post-lock phase: outcome apply, the review drain, no-op drain, label edges.
 
 Ports ``orphaned_worker_review_drain.drain_orphaned_worker_review_routes``. Each
-disposition is a guarded ``UpdateIssue``: the shell re-checks ``require_status``
+disposition is a ``GuardedUpdate`` *request*: the shell re-checks ``require_status``
 and ``require_pr_reviewed_head`` against a fresh load under a short lock, so a
-concurrent transition that landed while ``review()`` ran still wins.
+concurrent transition that landed while ``review()`` ran still wins -- and the
+answer comes back to the flow. The event, the recovery (and so the label edge)
+and the no-op route are recorded only for a write that committed, which is what
+the original's single in-lock check/flip/event guaranteed. When the first
+disposition is refused the chain falls through to the next, as its ``elif`` did.
 """
 
 from __future__ import annotations
@@ -12,6 +16,7 @@ from .decide_common import Flow, emit
 from .model import (
     ApplyOutcomes,
     DrainNoOp,
+    GuardedUpdate,
     LockOutcome,
     NoOpRoute,
     PreOutcome,
@@ -21,7 +26,6 @@ from .model import (
     ReviewRoute,
     SweepFacts,
     TransitionLabel,
-    UpdateIssue,
 )
 
 
@@ -30,11 +34,13 @@ def _route_flow(
 ) -> Flow:
     number = route.issue_number
     if route.reason == "dead_worker_completed_outcome":
-        applied = yield ReadAppliedHeads()
+        applied = yield ReadAppliedHeads(number)
         if not (isinstance(applied, dict) and applied.get(str(number)) == route.live_head_sha):
             return
     result = yield Review(number, route.pr_number, route.reason)
     if result.raised_error is not None:
+        # events.db only, as the original ``write_gate.log_event`` wrote it: a
+        # persistently raising review() must not churn the capped state ring.
         yield emit(
             "orphaned_worker_review_route_failed",
             {
@@ -44,6 +50,7 @@ def _route_flow(
                 "error": result.raised_error,
             },
             level="warning",
+            audit_only=True,
         )
         return
 
@@ -52,6 +59,7 @@ def _route_flow(
     blocked_route = result.routed_to_rework or result.closed_unmerged_converged
     routed = False
     rework_requested = False
+    taken = False
     if (
         result.ok
         and not blocked_route
@@ -59,30 +67,36 @@ def _route_flow(
         and unchanged
         and dispatched
     ):
-        yield UpdateIssue(
+        routed = taken = yield GuardedUpdate(
             number,
-            {"status": "reviewing"},
+            (("status", "reviewing"),),
             require_status="dispatched",
             require_pr_reviewed_head=route.reviewed_head_sha,
         )
-        routed = True
-    elif (
-        not result.ok
+    if (
+        not taken
+        and not result.ok
         and not blocked_route
         and unchanged
         and route.reason == "dead_worker_completed_outcome"
         and dispatched
     ):
-        yield UpdateIssue(
+        rework_requested = taken = yield GuardedUpdate(
             number,
-            {"status": "rework_requested", "dispatched_at": None, "orphan_drift_at": None},
+            (("status", "rework_requested"), ("dispatched_at", None), ("orphan_drift_at", None)),
             require_status="dispatched",
             require_pr_reviewed_head=route.reviewed_head_sha,
         )
-        rework_requested = True
-        recovered.append(number)
-    elif not result.ok and not result.routed_to_rework and dispatched:
-        if route.reason == "dead_worker_with_head_change" and result.is_no_op_rework:
+        if rework_requested:
+            recovered.append(number)
+    if not taken and not result.ok and not result.routed_to_rework and dispatched:
+        drifted = yield GuardedUpdate(
+            number,
+            (("orphan_drift_fingerprint", route.fingerprint),),
+            stamp_fields=("orphan_drift_at",),  # anchored when written, after review() returned
+            require_status="dispatched",
+        )
+        if drifted and route.reason == "dead_worker_with_head_change" and result.is_no_op_rework:
             no_op.append(
                 NoOpRoute(
                     issue_number=number,
@@ -92,11 +106,6 @@ def _route_flow(
                     branch=result.entry_branch,
                 )
             )
-        yield UpdateIssue(
-            number,
-            {"orphan_drift_fingerprint": route.fingerprint, "orphan_drift_at": facts.stamp},
-            require_status="dispatched",
-        )
 
     if rework_requested:
         yield emit(

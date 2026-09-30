@@ -27,7 +27,7 @@ from .. import stalled_review_reap
 from ..config import OrchestratorConfig
 from ..paths import resolved_layout
 from ..write_gate import WriteGate, require_write_gate
-from .apply_commits import LOCK_ILLEGAL_COMMITS, apply_commit
+from .apply_commits import LOCK_ILLEGAL_COMMITS, POST_ILLEGAL_COMMITS, apply_commit
 from .apply_context import SweepContext
 from .apply_requests_lock import serve
 from .decide import decide
@@ -96,6 +96,10 @@ def _run_phase(run: _Run, facts: SweepFacts, sweep_events: list[Any]) -> None:
             if phase == "lock" and isinstance(commit, LOCK_ILLEGAL_COMMITS):
                 raise _abort(
                     ctx, PLAN_VIOLATION_KIND, phase, f"{type(commit).__name__} illegal in lock"
+                )
+            if phase == "post" and isinstance(commit, POST_ILLEGAL_COMMITS):
+                raise _abort(
+                    ctx, PLAN_VIOLATION_KIND, phase, f"{type(commit).__name__} illegal in post"
                 )
             apply_commit(ctx, phase, commit, sweep_events)
             applied.append(commit)

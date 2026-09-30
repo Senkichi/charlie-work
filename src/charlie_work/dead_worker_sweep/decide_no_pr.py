@@ -55,7 +55,7 @@ class NoPrTriage:
 def triage_no_pr(facts: SweepFacts, no_pr: tuple[int, ...]) -> Flow:
     """Resolve fates, escalate the structurally hopeless, park or reclaim the rest."""
     active_set = facts.config.labels.active
-    issues = (yield FetchOpenIssues()).issues_by_number
+    issues = (yield FetchOpenIssues("no_pr")).issues_by_number
     fates: dict[int, FateResult] = {}
     for number in no_pr:
         if number in issues:
@@ -262,6 +262,8 @@ def lock_no_pr_flow(facts: SweepFacts, pre: PreOutcome, draft: Draft) -> Flow:
         window_minutes=config.watchdog.redispatch_window_minutes,
         max_auto_redispatch=config.watchdog.max_auto_redispatch,
         stamp=stamp,
+        # Sweep-start clock: decide reads no clock of its own. The original sampled wall
+        # time at this call; the skew (seconds) is negligible against the 240-minute window.
         now=pre.now,
     )
     history = list(verdict.orphan_redispatch_at)

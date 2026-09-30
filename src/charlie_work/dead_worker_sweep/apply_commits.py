@@ -8,8 +8,9 @@ of them. Where it writes depends on the phase:
 * ``lock`` -- inside the sweep's state lock on ``ctx.state``. Events queue on
   ``sweep_events`` (saved once at the end of the lock); issue updates mutate
   ``ctx.state`` in place with merge semantics (ADR-0001).
-* ``post`` -- no lock held. Every write re-loads state under a short lock, and a
-  guarded ``UpdateIssue`` re-checks its ``require_*`` fields on that fresh load.
+* ``post`` -- no lock held. Every write re-loads state under a short lock. State
+  merges are not commits here: they are ``GuardedUpdate`` requests, so the flow
+  learns whether the write committed (see ``apply_requests_lock.guarded_update``).
 """
 
 from __future__ import annotations
@@ -36,9 +37,21 @@ logger = logging.getLogger(__name__)
 
 # Commits that do network I/O; the lock phase must never carry them.
 LOCK_ILLEGAL_COMMITS = (RoutePreReviewRework, TransitionLabel)
+# Commits whose effect is an unguarded write to ``ctx.state``, which the post phase
+# never saves; its merges go through the guarded ``GuardedUpdate`` request instead.
+POST_ILLEGAL_COMMITS = (UpdateIssue, Escalate, RoutePreReviewRework)
 
 
 def _emit_under_lock(ctx: SweepContext, commit: Emit) -> None:
+    if commit.audit_only:
+        ctx.write_gate.log_event(
+            # event-consumer: audit-only -- pass-through of the kind ``decide*`` chose; every
+            # literal is checked at its origin by tests/test_dws_event_kinds.py
+            kind=commit.kind,
+            payload=dict(commit.payload),
+            level=commit.level,
+        )
+        return
     with ctx.ports.state_lock(ctx.state_file):
         state = ctx.ports.load_state(ctx.state_file)
         state = ctx.write_gate.append_event(
@@ -63,24 +76,6 @@ def _update_in_memory(ctx: SweepContext, commit: UpdateIssue) -> None:
     entry = (ctx.state.get("issues") or {}).get(str(commit.issue))
     if isinstance(entry, dict):
         _apply_update(entry, commit)
-
-
-def _guarded_update(ctx: SweepContext, commit: UpdateIssue) -> None:
-    """Post-phase ``UpdateIssue``: re-check the guards on a fresh load, then merge."""
-    with ctx.ports.state_lock(ctx.state_file):
-        state = ctx.ports.load_state(ctx.state_file)
-        entry = (state.get("issues") or {}).get(str(commit.issue))
-        if not isinstance(entry, dict):
-            return
-        if commit.require_status is not None and entry.get("status") != commit.require_status:
-            return
-        if commit.require_pr_reviewed_head is not None:
-            pr_number = ctx.review_prs.get(commit.issue, entry.get("pr_number"))
-            pr_state = (state.get("prs") or {}).get(str(pr_number), {})
-            if pr_state.get("reviewed_head_sha") != commit.require_pr_reviewed_head:
-                return
-        _apply_update(entry, commit)
-        ctx.write_gate.save_state(state)
 
 
 def _escalate(ctx: SweepContext, commit: Escalate) -> None:
@@ -169,10 +164,7 @@ def apply_commit(ctx: SweepContext, phase: str, commit: Any, sweep_events: list[
         else:
             _emit_under_lock(ctx, commit)
     elif isinstance(commit, UpdateIssue):
-        if phase == "post":
-            _guarded_update(ctx, commit)
-        else:
-            _update_in_memory(ctx, commit)
+        _update_in_memory(ctx, commit)
     elif isinstance(commit, Escalate):
         _escalate(ctx, commit)
     elif isinstance(commit, ReportStaleEvidence):

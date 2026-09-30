@@ -107,8 +107,9 @@ def fetch_open_prs(ctx: SweepContext, _req: FetchOpenPrs) -> dict[int, dict[str,
     return copy.deepcopy(ctx.pr_by_issue)
 
 
-def fetch_open_issues(ctx: SweepContext, _req: FetchOpenIssues) -> IssuesResult:
-    if ctx.issues is None:
+def fetch_open_issues(ctx: SweepContext, req: FetchOpenIssues) -> IssuesResult:
+    # Later lanes re-fetch an empty listing (a swallowed gh error reads as ``{}``).
+    if ctx.issues is None or (req.lane != "no_pr" and not ctx.issues):
         found: dict[int, dict[str, Any]] = {}
         for issue in ctx.gh.issue_list(state="open"):
             number = issue.get("number")

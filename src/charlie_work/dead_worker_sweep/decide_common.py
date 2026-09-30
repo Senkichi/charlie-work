@@ -92,8 +92,10 @@ def flush(draft: Draft) -> Generator[Any, Any, None]:
         yield update
 
 
-def emit(kind: str, payload: Mapping[str, Any], level: str | None = None) -> Emit:
-    return Emit(kind=kind, payload=dict(payload), level=level)
+def emit(
+    kind: str, payload: Mapping[str, Any], level: str | None = None, *, audit_only: bool = False
+) -> Emit:
+    return Emit(kind=kind, payload=dict(payload), level=level, audit_only=audit_only)
 
 
 def events_to_emits(events: list[tuple[str, dict[str, Any]]]) -> tuple[Emit, ...]:

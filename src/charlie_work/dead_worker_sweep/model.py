@@ -70,7 +70,15 @@ class FetchOpenPrs:
 
 @dataclass(frozen=True)
 class FetchOpenIssues:
-    """Open issues by number, plus the cross-repo scope context."""
+    """Open issues by number, plus the cross-repo scope context.
+
+    ``lane`` names the consumer. The no-PR triage fetches once; the later
+    lanes (``unreviewed``, ``live_handoff``) re-fetch when the cached set is
+    empty, as the original lanes did (``if not issues_by_number``), so one
+    transient empty listing cannot blank every later consumer.
+    """
+
+    lane: Literal["no_pr", "unreviewed", "live_handoff"] = "no_pr"
 
 
 @dataclass(frozen=True)
@@ -181,7 +189,14 @@ class ApplyOutcomes:
 
 @dataclass(frozen=True)
 class ReadAppliedHeads:
-    """``APPLIED_HEADS_KEY`` as persisted after the outcome apply."""
+    """``APPLIED_HEADS_KEY`` as persisted after the outcome apply.
+
+    ``issue`` keys the read per route: the original re-read the map before every
+    completed-outcome route, so an earlier route's ``review()`` can never leave
+    a later route gating on a stale snapshot.
+    """
+
+    issue: int
 
 
 @dataclass(frozen=True)
@@ -189,6 +204,27 @@ class Review:
     issue: int
     pr_number: int
     reason: str
+
+
+@dataclass(frozen=True)
+class GuardedUpdate:
+    """Post-phase merge-update of one issue entry, guarded on a fresh load.
+
+    A request, not a commit: the shell answers ``True`` when both guards held
+    and the merge was written, ``False`` when a concurrent writer won. The flow
+    reads the answer before it records the matching event, recovery or label
+    edge, so none of those can outlive a refused write (the original did check,
+    flip and event in one ``state_lock``).
+
+    ``set_items`` is a tuple of pairs (requests are dict keys); ``stamp_fields``
+    names fields set to the clock at *write* time, after ``review()`` returned.
+    """
+
+    issue: int
+    set_items: tuple[tuple[str, Any], ...]
+    stamp_fields: tuple[str, ...] = ()
+    require_status: str | None = None
+    require_pr_reviewed_head: str | None = None
 
 
 @dataclass(frozen=True)
@@ -221,6 +257,7 @@ Request = (
     | ApplyOutcomes
     | ReadAppliedHeads
     | Review
+    | GuardedUpdate
     | DrainNoOp
 )
 REQUEST_TYPES = tuple(Request.__args__)
@@ -237,7 +274,7 @@ LOCK_LEGAL = (
     ReadBlockedOutcome,
     ReadReviewDecision,
 )
-POST_LEGAL = (ApplyOutcomes, ReadAppliedHeads, Review, DrainNoOp)
+POST_LEGAL = (ApplyOutcomes, ReadAppliedHeads, Review, GuardedUpdate, DrainNoOp)
 
 
 # ----------------------------------------------------------------- results
@@ -348,6 +385,9 @@ class Emit:
     kind: str
     payload: Mapping[str, Any]
     level: str | None = None
+    # Post-phase only: write to events.db alone (``WriteGate.log_event``), not the
+    # capped state.json ring -- for diagnostics the original never ring-buffered.
+    audit_only: bool = False
 
 
 @dataclass(frozen=True)
@@ -357,8 +397,6 @@ class UpdateIssue:
     issue: int
     set_fields: Mapping[str, Any] = field(default_factory=dict)
     clear_fields: tuple[str, ...] = ()
-    require_status: str | None = None  # post-phase guard, checked on a fresh load
-    require_pr_reviewed_head: str | None = None
 
 
 @dataclass(frozen=True)
