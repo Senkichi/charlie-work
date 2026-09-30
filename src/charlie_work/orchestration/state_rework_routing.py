@@ -7,6 +7,7 @@ the ``workflow_delegation`` installer re-attaches each ``def`` onto the class.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import Any, Callable
 import logging
 
@@ -408,6 +409,42 @@ def _route_janitor_gate_failure_to_rework(
             },
         )
     attempts = int(existing_pr_state.get(attempts_key, 0)) + 1
+
+    # Issue #2051: before ANY cap-exceeded action -- rescue dispatch or
+    # escalation -- check whether a live worker still holds the issue.
+    # ``rework_requested`` is not evidence nobody holds it: the conflict
+    # and check-failure routers re-set that status while an earlier worker
+    # remains alive (the #2006 incident). A live verdict defers the whole
+    # cap decision: the attempt counter is not persisted, the one-shot
+    # rescue slot is not burned, and no label transitions; the next pass
+    # re-evaluates once the worker exits or wedges. The helper no-ops
+    # unless the cap is exceeded and records the deferral once per worker
+    # via ``escalation_deferred_live_worker``.
+    deferred_verdict = _wf._defer_janitor_cap_escalation_for_live_worker(
+        issue_number,
+        issue_state if isinstance(issue_state, dict) else {},
+        attempts_key=attempts_key,
+        attempts=attempts,
+        max_attempts=max_attempts,
+        sessions_dir=self._layout.sessions_dir,
+        config=self.config,
+        write_gate=self.write_gate,
+        now=datetime.now(UTC),
+    )
+    if deferred_verdict is not None:
+        return _wf.CommandResult(
+            True,
+            f"PR #{pr_number} janitor {reason} rework cap exceeded "
+            f"({attempts}/{max_attempts}); escalation deferred -- {deferred_verdict.reason}",
+            {
+                "pr": pr_number,
+                "issue": issue_number,
+                "janitor_ok": False,
+                "escalation_deferred_live_worker": True,
+                "rework_reason": reason,
+                "attempts": attempts,
+            },
+        )
 
     if (
         max_attempts > 0
