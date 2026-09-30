@@ -151,6 +151,28 @@ def is_provider_auth_failure(tail: str) -> bool:
     return _PROVIDER_AUTH_PATTERN.search(tail) is not None
 
 
+# Headless permission-denial signature (issue #2010): a ``claude -p`` session
+# that cannot answer a permission prompt ends by asking the operator to
+# approve command execution. That is a config defect, not a blocked task, so
+# it gets its own failure kind (``permission_denied``) instead of escalating.
+# Lives here (a leaf module) so both ``claude_code`` and ``worker_fate`` can
+# import it without an import cycle; originally added in claude_code.py.
+PERMISSION_DENIED_FAILURE_KIND = "permission_denied"
+_HEADLESS_PERMISSION_DENIAL_PATTERN = re.compile(
+    r"approve\s+(?:the\s+)?(?:command|bash|tool)\s+execution|"
+    r"requires?\s+(?:your\s+)?approval|"
+    r"(?:command|tool)\s+(?:was|were)\s+(?:denied|not\s+allowed)|"
+    r"permission\s+to\s+run\s+(?:this|these|the)\s+(?:command|bash)",
+    re.IGNORECASE,
+)
+
+
+def is_headless_permission_denial(text: str) -> bool:
+    """True when ``text`` (a log tail or outcome detail) shows the headless
+    permission-denial signature."""
+    return bool(_HEADLESS_PERMISSION_DENIAL_PATTERN.search(text))
+
+
 def match_throttle_tail(tail: str, markers: Sequence[str]) -> tuple[bool, int | None]:
     """Match ``tail`` against ``markers`` (case-insensitive substrings).
 

@@ -50,7 +50,13 @@ from .env_sanitize import resolve_pytest_cap, resolve_uv_no_sync, sanitize_env
 from .post_mortem import merge_attempt_snapshot
 from .state import _canonical_started_at, utc_now
 from .subprocess_runner import RunResult, resolve_cli_binary, run_captured
-from .throttle_signatures import is_provider_auth_failure, match_quota_tail, match_throttle_tail
+from .throttle_signatures import (
+    PERMISSION_DENIED_FAILURE_KIND,
+    is_headless_permission_denial,
+    is_provider_auth_failure,
+    match_quota_tail,
+    match_throttle_tail,
+)
 from .worktree import (
     LiveWorkerRedispatchError,
     ReworkBranchConflictError,
@@ -79,13 +85,10 @@ logger = logging.getLogger(__name__)
 # the key is fixed (a dead key will not self-heal in minutes).
 #
 # Headless permission-denial classification (issue #2010) lives in
-# ``worker_fate`` beside the other log-tail signatures (``classify_failure``
-# merge, design doc §7); re-exported here because this module is the public
-# home consumers (workflow, doctor, tests) import it from.
-from .worker_fate import (  # noqa: E402  (grouped with the definition it re-exports)
-    PERMISSION_DENIED_FAILURE_KIND,
-    is_headless_permission_denial,
-)
+# ``throttle_signatures`` beside the other log-tail signatures (consumed by
+# ``worker_fate.classify_failure``); re-exported here because this module is
+# the public home consumers (workflow, doctor, tests) import it from.
+# (Listed in ``__all__`` below.)
 
 
 def worker_permission_denied(sessions_dir: Path, issue_number: int, detail: str = "") -> bool:

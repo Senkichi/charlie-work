@@ -77,6 +77,8 @@ from .config import OrchestratorConfig
 from .process_utils import is_pid_alive as _process_is_pid_alive
 from .state import parse_iso_timestamp as _state_parse_iso_timestamp
 from .throttle_signatures import (
+    PERMISSION_DENIED_FAILURE_KIND,
+    is_headless_permission_denial,
     is_provider_auth_failure,
     is_provider_throttle_failure,
     match_quota_tail,
@@ -744,27 +746,6 @@ def _provider_suspension_in_tail(tail: str) -> bool:
         if _PROVIDER_SUSPENDED_PHRASE.search(line) and _PROVIDER_SUSPENDED_ANCHOR.search(line):
             return True
     return False
-
-
-# Headless permission-denial signature (issue #2010): a ``claude -p`` session
-# that cannot answer a permission prompt ends by asking the operator to
-# approve command execution. That is a config defect, not a blocked task, so
-# it gets its own failure kind (``permission_denied``) instead of escalating.
-# Moved verbatim from claude_code.py (origin/main 7293cb71).
-PERMISSION_DENIED_FAILURE_KIND = "permission_denied"
-_HEADLESS_PERMISSION_DENIAL_PATTERN = re.compile(
-    r"approve\s+(?:the\s+)?(?:command|bash|tool)\s+execution|"
-    r"requires?\s+(?:your\s+)?approval|"
-    r"(?:command|tool)\s+(?:was|were)\s+(?:denied|not\s+allowed)|"
-    r"permission\s+to\s+run\s+(?:this|these|the)\s+(?:command|bash)",
-    re.IGNORECASE,
-)
-
-
-def is_headless_permission_denial(text: str) -> bool:
-    """True when ``text`` (a log tail or outcome detail) shows the headless
-    permission-denial signature."""
-    return bool(_HEADLESS_PERMISSION_DENIAL_PATTERN.search(text))
 
 
 # Issue #1997: a tz-aware ISO-8601 timestamp on a tail line marks when the
