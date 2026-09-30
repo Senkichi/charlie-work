@@ -13,7 +13,7 @@ from typing import Any
 
 import pytest
 from _fakes_github import FakeGitHub
-from charlie_work.config import FleetConfig, OrchestratorConfig
+from charlie_work.config import FleetConfig, OrchestratorConfig, WorkerRoleConfig
 from charlie_work.dispatch_deferral import DEFAULT_STARVATION_THRESHOLD
 from charlie_work.github import GitHubError, GraphQLBudgetError
 from charlie_work.instrumentation import query_events
@@ -26,7 +26,15 @@ _REWORK_MOD = "charlie_work.orchestration.misc_worker_dispatch"
 
 
 def _app(tmp_path: Path) -> OrchestratorApp:
-    config = OrchestratorConfig(fleet=FleetConfig(global_max_concurrent_sessions=2))
+    # launch_lock_wait_seconds=0: these tests pin the deferral's visibility,
+    # not the issue-#2055 retry -- a blocked acquirer should not stall the
+    # suite for the production wait budget on every call. A non-manual worker
+    # harness is required so dispatch_rework reaches the launch gate (the
+    # manual adapter early-returns before it).
+    config = OrchestratorConfig(
+        worker=WorkerRoleConfig(harness="claude-code"),
+        fleet=FleetConfig(global_max_concurrent_sessions=2, launch_lock_wait_seconds=0),
+    )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     return OrchestratorApp(tmp_path, paths, config, FakeGitHub())
 

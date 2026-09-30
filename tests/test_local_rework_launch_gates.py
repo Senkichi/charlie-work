@@ -69,7 +69,11 @@ class TestLocalReworkLaunchGates:
         calls = self._spy(monkeypatch)
         app.config = dataclasses.replace(
             app.config,
-            fleet=dataclasses.replace(app.config.fleet, global_max_concurrent_sessions=6),
+            fleet=dataclasses.replace(
+                app.config.fleet,
+                global_max_concurrent_sessions=6,
+                launch_lock_wait_seconds=0,
+            ),
         )
         monkeypatch.setattr(
             "charlie_work.orchestration.local_lanes.try_acquire_fleet_lock", lambda _o: None

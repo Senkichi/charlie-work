@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import math
 import os
 import re
 from collections.abc import Mapping
@@ -2075,9 +2076,19 @@ class FleetConfig:
     all registered repos. Default 0 (unlimited) preserves current per-repo-only
     behavior. This addresses worker-count oversubscription only; CPU/RAM
     oversubscription via xdist requires operator discipline (see RUNBOOK.md).
+
+    ``launch_lock_wait_seconds`` (issue #2055) bounds how long a dispatch lane
+    retries the fleet launch lock -- jittered retries up to this many seconds
+    -- before deferring the pass with ``fleet_lock_held``. It replaced a single
+    non-blocking try that cost the loser an entire pass; the lock is now held
+    only across governor -> claim -> launch, so a short wait suffices. ``0``
+    restores the old single-try behavior. Non-finite values are rejected: an
+    infinite budget would hang a lane on a wedged lock, and NaN reaches
+    ``time.sleep`` (which raises) inside the retry loop.
     """
 
     global_max_concurrent_sessions: int = 0
+    launch_lock_wait_seconds: float = 10.0
 
 
 @dataclass(frozen=True)
@@ -4005,6 +4016,17 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
         raise ConfigError(
             "config section 'fleet' key 'global_max_concurrent_sessions' must be an "
             f"int, got {type(global_max).__name__}"
+        )
+    launch_lock_wait = fleet_data.get("launch_lock_wait_seconds")
+    if launch_lock_wait is not None and (
+        isinstance(launch_lock_wait, bool)
+        or not isinstance(launch_lock_wait, (int, float))
+        or not math.isfinite(launch_lock_wait)
+        or launch_lock_wait < 0
+    ):
+        raise ConfigError(
+            "config section 'fleet' key 'launch_lock_wait_seconds' must be a "
+            f"non-negative finite number, got {launch_lock_wait!r}"
         )
     fleet = _build_section(FleetConfig, "fleet", fleet_data)
     notify_data = _section(data, "notify")
