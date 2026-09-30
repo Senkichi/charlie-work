@@ -161,27 +161,10 @@ supervisor:
   active_cooldown_seconds: 30
   max_runtime_minutes: 0
 
-fleet_supervisor:
-  # Knobs only `charlie fleet supervise` reads (issue #1978); the per-repo
-  # `charlie bash-rats` loop ignores every field here.
-  # max_pass_runtime_seconds bounds one fleet pass's wall-clock; the wedge
-  # watchdog treats a heartbeat older than 3x this as a wedged supervisor.
-  max_pass_runtime_seconds: 1800
-  # Max per-repo lanes one fleet pass runs concurrently (issue #1934).
-  # <= 0 falls back to the built-in default; 1 restores serial lanes.
-  fleet_lane_concurrency: 8
-  # Cadence of the out-of-band dead-reviewer-claim reap sweep (issue #1934).
-  # <= 0 disables the scheduler.
-  reap_sweep_interval_seconds: 300
-  # Consecutive-failure/streak thresholds before an events.db alarm entry
-  # fires; 0 disables each alarm.
-  self_deploy_failure_alarm: 3
-  zero_pass_alarm: 3
-  wedge_kill_loop_alarm: 3
-  # When true, self-deploy also FF-pulls the declared ci-fleet sibling
-  # (dedicated deploy clones only — see issue #552).
-  self_deploy_pull_ci_fleet: false
-  # Upper bound on how long a deferred self-deploy `uv sync` may stay pending
-  # under live workers before the supervisor drains dispatch (issue #1855).
-  # <= 0 disables the bound.
-  dependency_sync_starvation_seconds: 14400
+# Fleet-supervisor-only knobs (pass deadline, lane concurrency, reap cadence,
+# alarm thresholds, self-deploy sibling-pull/starvation) moved to the
+# host-wide `fleet_supervisor:` section in issue #1978. Declare it in the
+# GLOBAL fleet layer (<fleet_dir>/config.yaml), not here -- a per-repo
+# `fleet_supervisor:` section is a ConfigError. See docs/RUNBOOK.md.
+# The legacy `supervisor.<key>` spellings still parse during the migration
+# window (they emit config_key_deprecated_read; removal tracked by #1979).

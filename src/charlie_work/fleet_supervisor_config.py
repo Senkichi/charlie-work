@@ -14,7 +14,18 @@ key is registered in ``config_deprecations.DEPRECATED_CONFIG_KEYS`` so a
 legacy read emits ``config_key_deprecated_read`` and the fleet retirement
 sweep arms removal issue #1979 once the old keys are absent from every
 layer), then the dataclass default. Both locations set to *different*
-values is a ``ConfigError`` naming both.
+values in the *same file* is a ``ConfigError`` naming both.
+
+``fleet_supervisor:`` is a host-wide-only section (same treatment as
+``runner_allocation``/``runner_capacity_escalation``): every knob on it
+belongs to the one fleet supervisor daemon, so
+``global_config.load_layered_config`` rejects the section in a per-repo
+config and resolves each layer's new>legacy precedence *before* merging
+(``resolve_fleet_supervisor_layer``). A repo layer's leftover
+``supervisor.<key>`` therefore simply wins its key in the ordinary
+repo-over-global merge -- deterministic, and still visible through the
+deprecation event -- instead of surfacing as a merged-view conflict that
+would discard the entire global layer.
 
 The dataclass and its parser live here rather than in ``config.py`` so the
 relocation does not grow that over-cap monolith (file-size ratchet, issue
@@ -29,7 +40,7 @@ documents).
 from __future__ import annotations
 
 from dataclasses import dataclass, fields
-from typing import Any
+from typing import Any, Mapping
 
 #: The top-level YAML section name. Referenced by ``config_deprecations``'s
 #: ``replacement`` strings and the parser below so the name is declared once.
@@ -194,6 +205,26 @@ def parse_fleet_supervisor(data: dict[str, Any]) -> FleetSupervisorConfig:
             f"{', '.join(unknown)} (valid: {', '.join(sorted(valid))})"
         )
 
+    merged = _adopt_legacy_keys(new_section, legacy_section)
+    return FleetSupervisorConfig(**merged)
+
+
+def _adopt_legacy_keys(
+    new_section: Mapping[str, Any], legacy_section: dict[str, Any]
+) -> dict[str, Any]:
+    """Resolve one source's ``fleet_supervisor``/``supervisor`` pair.
+
+    Moved keys found in ``legacy_section`` are popped out of it *in place*
+    (so a later ``SupervisorConfig`` build never sees them as unknown) and
+    adopted into the returned mapping when ``new_section`` does not set the
+    key. A key in both locations with different values is a ``ConfigError``
+    naming both; ``null`` counts as unset on either side. The conflict
+    wording is shared verbatim by ``parse_fleet_supervisor`` (single file)
+    and ``resolve_fleet_supervisor_layer`` (one merge layer) so the two
+    paths cannot drift on what "both locations disagree" means.
+    """
+    from .config import ConfigError
+
     merged = dict(new_section)
     for f in fields(FleetSupervisorConfig):
         key = f.name
@@ -214,4 +245,38 @@ def parse_fleet_supervisor(data: dict[str, Any]) -> FleetSupervisorConfig:
             )
         if new_value is None:
             merged[key] = legacy_value
-    return FleetSupervisorConfig(**merged)
+    return merged
+
+
+def resolve_fleet_supervisor_layer(data: Mapping[str, Any]) -> dict[str, Any]:
+    """Return one raw config-*layer* dict with legacy keys folded in.
+
+    ``global_config.load_layered_config`` runs this on each layer BEFORE the
+    repo-over-global merge so the moved-key adoption sees one file at a
+    time: a ``fleet_supervisor.<key>``/``supervisor.<key>`` disagreement
+    within one file still raises the ``ConfigError`` above, while a
+    repo-layer ``supervisor.<key>`` that disagrees with the global layer's
+    ``fleet_supervisor.<key>`` is just an ordinary per-key override -- the
+    repo layer wins it, like every other repo-layer key. Without this, the
+    cross-layer disagreement only surfaced post-merge as a conflict that
+    triggered ``load_layered_config``'s #665 rescue and discarded the
+    *entire* global layer over one disputed key.
+
+    The input mapping is never mutated: the layer dict and both section
+    dicts are copied, so callers keep the raw layer for deprecation-event
+    attribution (``emit_deprecated_key_reads`` must still see the legacy
+    spelling in the file it was read from). No type validation happens here
+    -- ``parse_fleet_supervisor`` re-checks the merged ``fleet_supervisor``
+    values, and a bad legacy value in a repo layer resurfaces with its own
+    section name when the #665 rescue re-parses that file standalone.
+    """
+    out = dict(data)
+    new_section = data.get(FLEET_SUPERVISOR_SECTION)
+    new = dict(new_section) if isinstance(new_section, dict) else {}
+    legacy_section = data.get(LEGACY_SUPERVISOR_SECTION)
+    legacy = dict(legacy_section) if isinstance(legacy_section, dict) else {}
+
+    effective = _adopt_legacy_keys(new, legacy)
+    out[FLEET_SUPERVISOR_SECTION] = effective
+    out[LEGACY_SUPERVISOR_SECTION] = legacy
+    return out

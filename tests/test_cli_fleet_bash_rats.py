@@ -134,6 +134,43 @@ def test_run_fleet_bash_rats_drains_pass_when_sync_starved(
     assert "starvation bound reached" in out
 
 
+def test_run_fleet_bash_rats_passes_pull_ci_fleet_to_self_deploy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #1978: ``fleet_supervisor.self_deploy_pull_ci_fleet`` must reach
+    ``self_deploy``'s ``pull_ci_fleet`` kwarg -- a revert to reading the knob
+    off ``config.supervisor`` (now only dataclass defaults) would silently
+    pass False and this test must fail on it."""
+    from charlie_work.config import FleetSupervisorConfig, OrchestratorConfig
+
+    deploy_mock = MagicMock(
+        return_value=SelfDeployResult(
+            ok=True,
+            pulled=False,
+            changed=False,
+            synced=False,
+            message="up to date",
+        )
+    )
+    monkeypatch.setattr(cli, "self_deploy", deploy_mock)
+
+    fleet_loop_mock = MagicMock(return_value=CommandResult(True, "pass ok", {"repos": {}}))
+    monkeypatch.setattr(cli, "fleet_loop", fleet_loop_mock)
+    monkeypatch.setattr(
+        cli,
+        "load_layered_config",
+        lambda *_a, **_k: OrchestratorConfig(
+            fleet_supervisor=FleetSupervisorConfig(self_deploy_pull_ci_fleet=True)
+        ),
+    )
+
+    args = cli.build_parser().parse_args(["fleet", "bash-rats"])
+    result = cli.run_fleet_bash_rats(args)
+
+    assert result.ok is True
+    assert deploy_mock.call_args.kwargs["pull_ci_fleet"] is True
+
+
 def test_run_fleet_bash_rats_emits_attention_digest_on_repair_failure(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

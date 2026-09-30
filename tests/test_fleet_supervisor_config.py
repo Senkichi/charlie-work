@@ -319,14 +319,12 @@ def test_layered_config_honors_legacy_key_from_global_layer(tmp_path: Path) -> N
     assert fleet_rows[0]["payload"]["source"] == str(fleet_dir / layout.GLOBAL_CONFIG_FILENAME)
 
 
-def test_layered_config_conflict_across_layers_discards_global_layer(
-    tmp_path: Path,
-) -> None:
-    """A new-location value in one layer disagreeing with the legacy location
-    in another still fails merged validation -- and
-    ``load_layered_config``'s #623/#665 rescue treats that like any broken
-    global layer: the repo layer survives alone rather than the whole load
-    going down."""
+def test_layered_config_rejects_per_repo_fleet_supervisor(tmp_path: Path) -> None:
+    """``fleet_supervisor`` is host-wide only, same rule as
+    ``runner_allocation``/``runner_capacity_escalation``: every knob on it
+    belongs to the one fleet supervisor daemon, so a per-repo config
+    declaring the section is rejected outright rather than allowed to
+    shadow the operator's global values."""
     fleet_dir = tmp_path / "fleet"
     fleet_dir.mkdir()
     (fleet_dir / layout.GLOBAL_CONFIG_FILENAME).write_text(
@@ -334,9 +332,96 @@ def test_layered_config_conflict_across_layers_discards_global_layer(
     )
     repo = tmp_path / "repo"
     repo.mkdir()
-    _write_repo_config(repo, "supervisor:\n  zero_pass_alarm: 5\n")
+    _write_repo_config(repo, "fleet_supervisor:\n  zero_pass_alarm: 5\n")
+
+    with pytest.raises(ConfigError, match="host-wide only"):
+        load_layered_config(repo, fleet_dir_override=str(fleet_dir))
+
+
+def test_layered_config_cross_layer_disagreement_resolves_per_layer(
+    tmp_path: Path,
+) -> None:
+    """A ``fleet_supervisor.<key>`` in the global layer disagreeing with a
+    legacy ``supervisor.<key>`` in the repo layer is NOT a merged-view
+    conflict: each layer resolves new>legacy on its own before the merge,
+    so the repo layer wins the disputed key by the ordinary repo-over-global
+    rule -- and the rest of the global layer is NOT discarded over it (the
+    pre-fix outcome this replaces: the merged-view conflict tripped the #665
+    rescue and dropped every global section)."""
+    fleet_dir = tmp_path / "fleet"
+    fleet_dir.mkdir()
+    global_path = fleet_dir / layout.GLOBAL_CONFIG_FILENAME
+    global_path.write_text(
+        "fleet_supervisor:\n  zero_pass_alarm: 9\n"
+        "notify:\n  enabled: true\n"
+        "runner_scaling:\n  min_runners: 4\n",
+        encoding="utf-8",
+    )
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    repo_config = _write_repo_config(repo, "supervisor:\n  zero_pass_alarm: 5\n")
 
     config = load_layered_config(repo, fleet_dir_override=str(fleet_dir))
 
+    # The disputed key resolves deterministically: the repo layer wins, like
+    # every other repo-layer key.
     assert config.fleet_supervisor.zero_pass_alarm == 5
-    assert config.sources == (str(repo / "orchestrator.config.yaml"),)
+    # The global layer's other sections survive the disagreement.
+    assert config.notify.enabled is True
+    assert config.runner_scaling.min_runners == 4
+    # Both layers were read -- no rescue discard.
+    assert config.sources == (str(global_path), str(repo_config))
+
+
+def test_layered_config_same_file_conflict_in_global_layer_raises(
+    tmp_path: Path,
+) -> None:
+    """Both spellings disagreeing inside the *global* file is still the
+    same-file ConfigError -- per-layer resolution happens before the merge,
+    so a conflicting global file cannot be laundered into a cross-layer
+    repo override."""
+    fleet_dir = tmp_path / "fleet"
+    fleet_dir.mkdir()
+    (fleet_dir / layout.GLOBAL_CONFIG_FILENAME).write_text(
+        "supervisor:\n  zero_pass_alarm: 5\nfleet_supervisor:\n  zero_pass_alarm: 9\n",
+        encoding="utf-8",
+    )
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_repo_config(repo, "supervisor:\n  poll_interval_seconds: 10\n")
+
+    with pytest.raises(ConfigError, match="zero_pass_alarm.*fleet_supervisor.*supervisor"):
+        load_layered_config(repo, fleet_dir_override=str(fleet_dir))
+
+
+def test_layered_config_repo_legacy_key_folds_and_still_emits(
+    tmp_path: Path,
+) -> None:
+    """A repo layer's legacy ``supervisor.<key>`` folds into its effective
+    ``fleet_supervisor`` mapping AND still emits the deprecation read -- the
+    fold works on a copy so ``emit_deprecated_key_reads`` sees the raw file's
+    legacy spelling. The ``notify`` assertion pins that the value came from
+    the merged load: without the per-layer fold, the same-file-looking
+    conflict trips the #665 rescue, which still lands this key at 5 (the
+    repo-only reload adopts it) but silently drops the global layer's other
+    sections."""
+    fleet_dir = tmp_path / "fleet"
+    fleet_dir.mkdir()
+    (fleet_dir / layout.GLOBAL_CONFIG_FILENAME).write_text(
+        "fleet_supervisor:\n  wedge_kill_loop_alarm: 9\nnotify:\n  enabled: true\n",
+        encoding="utf-8",
+    )
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    repo_config = _write_repo_config(repo, "supervisor:\n  wedge_kill_loop_alarm: 5\n")
+
+    config = load_layered_config(repo, fleet_dir_override=str(fleet_dir))
+
+    assert config.fleet_supervisor.wedge_kill_loop_alarm == 5
+    assert config.notify.enabled is True
+    rows = query_events(_repo_state_path(repo), kind="config_key_deprecated_read")
+    assert len(rows) == 1
+    payload = rows[0]["payload"]
+    assert payload["section"] == "supervisor"
+    assert payload["key"] == "wedge_kill_loop_alarm"
+    assert payload["source"] == str(repo_config)

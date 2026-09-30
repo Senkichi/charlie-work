@@ -8,6 +8,7 @@ fixtures live in ``tests/_fleet_dispatch_fixtures.py``.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock, patch
 from _fleet_dispatch_fixtures import (
     SUPERVISOR_BEAT_AT,
@@ -18,6 +19,7 @@ from _fleet_dispatch_fixtures import (
     _patch_self_deploy_for_fleet_tests as _patch_self_deploy_for_fleet_tests,
 )
 from charlie_work.config import (
+    FleetSupervisorConfig,
     OrchestratorConfig,
     SupervisorConfig,
 )
@@ -409,3 +411,72 @@ def test_supervisor_lifecycle_self_deploy_head_move_reason(
     exit_kwargs = mocks["record_supervisor_exit"].call_args.kwargs
     assert exit_kwargs["exit_code"] == 0
     assert exit_kwargs["reason"] == "self_deploy_head_moved"
+
+
+@patch("charlie_work.fleet_dispatch.detect_wedge_kill_loop")
+@patch("charlie_work.fleet_dispatch.fleet_loop")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
+def test_run_fleet_supervise_wires_fleet_supervisor_knobs(
+    mock_lock: MagicMock,
+    mock_load_config: MagicMock,
+    mock_fleet_loop: MagicMock,
+    mock_wedge: MagicMock,
+    monkeypatch: Any,
+    tmp_path: Path,
+    _patch_self_deploy_for_fleet_tests: dict[str, MagicMock],
+) -> None:
+    """Issue #1978 regression: every fleet-only knob the supervisor reads off
+    ``config.fleet_supervisor`` must reach its consumer -- a revert to the
+    ``supervisor.`` spellings (which now carry only dataclass defaults) must
+    fail this test rather than silently dispatch with the defaults.
+
+    One ``run_fleet_supervise`` pass with four knobs at non-default values,
+    asserting each landing site: ``self_deploy``'s
+    ``failure_alarm_threshold``/``pull_ci_fleet`` kwargs,
+    ``detect_wedge_kill_loop``'s ``threshold``, the heartbeat stamp's
+    ``max_pass_runtime_seconds``/``wedge_kill_loop_alarm``, and
+    ``fleet_loop``'s in-pass ``deadline_seconds``.
+    """
+    mocks = _patch_self_deploy_for_fleet_tests
+    mock_wedge.return_value = None
+    mock_load_config.return_value = OrchestratorConfig(
+        supervisor=SupervisorConfig(poll_interval_seconds=5, full_pass_interval_seconds=1),
+        fleet_supervisor=FleetSupervisorConfig(
+            max_pass_runtime_seconds=42,
+            self_deploy_failure_alarm=7,
+            self_deploy_pull_ci_fleet=True,
+            wedge_kill_loop_alarm=9,
+            # Keep the out-of-band dead-claim reap scheduler off -- it is a
+            # real daemon thread unrelated to this assertion set (its cadence
+            # wiring is covered by the concurrency tests).
+            reap_sweep_interval_seconds=0,
+        ),
+    )
+    mock_fleet_loop.return_value = _drained_fleet_result()
+    # The autouse fixture's self_deploy replacement is a plain lambda; swap in
+    # a mock so the alarm/pull kwargs are assertable.
+    deploy_mock = MagicMock(
+        return_value=SelfDeployResult(
+            ok=True, pulled=False, changed=False, synced=False, message="test no-op"
+        )
+    )
+    monkeypatch.setattr("charlie_work.fleet_dispatch.self_deploy", deploy_mock)
+
+    fc = _FakeClock(auto_advance=1.0)
+    result = run_fleet_supervise(
+        max_passes=1,
+        fleet_dir_override=str(tmp_path / "fleet"),
+        clock=fc.now,
+        sleep=fc.sleep,
+    )
+
+    assert result.ok is True
+    deploy_kwargs = deploy_mock.call_args.kwargs
+    assert deploy_kwargs["failure_alarm_threshold"] == 7
+    assert deploy_kwargs["pull_ci_fleet"] is True
+    assert mock_wedge.call_args.kwargs["threshold"] == 9
+    start_kwargs = mocks["record_supervisor_started"].call_args.kwargs
+    assert start_kwargs["max_pass_runtime_seconds"] == 42
+    assert start_kwargs["wedge_kill_loop_alarm"] == 9
+    assert mock_fleet_loop.call_args.kwargs["deadline_seconds"] == 42
