@@ -129,8 +129,13 @@ _MOVED_NAMES = (
 # parameter to the module's ``set_throttled_until``/``persist_failure``
 # call sites, growing the module to 2984 lines — the band is re-centered
 # on the new measured total with the same +/-150 headroom.
-_CAP_BAND_MIN = 2834
-_CAP_BAND_MAX = 3134
+# Re-derived under issue #1971: the labelless-dead-local-session park call in
+# the classify lane grew the module to 2990 lines; the band is re-centered on
+# that total with the same +/-150 headroom.
+# Re-derived after merging #2006 and #1971: the merged module measures 2955
+# lines; the band is re-centered on that total with the same +/-150 headroom.
+_CAP_BAND_MIN = 2805
+_CAP_BAND_MAX = 3105
 
 
 # ---------------------------------------------------------------------------

@@ -89,7 +89,11 @@ from .janitor import (
 )
 from .diff_coverage_probe import StaticProbeVerdict, run_static_probe
 from .labels import TransitionOutcome, transition
-from .local_work_park import park_or_reclaim_local_orphan
+from .local_work_park import (
+    LocalParkResult,
+    park_backstop_due_local_orphans,
+    park_or_reclaim_local_orphan,
+)
 from .pass_deadline import pass_deadline_spent, pass_deadline_suspended
 from .paths import RuntimePaths, prompt_override_dirs, resolved_layout
 from .prompt_sections import section_variant_names
@@ -239,6 +243,7 @@ from .escalation import (  # noqa: F401  (deliberate re-export)
     _deescalation_skip,
     _record_issue_label_error,
     _escalate_issue,
+    _strip_active_and_flag_human_needed,
     _escalated_label_needs_repair,
     _collect_escalated_label_subjects,
     _escalation_edge,
@@ -1798,6 +1803,8 @@ def _detect_and_handle_orphaned_workers(
     # B6: every fate this lane resolves, reported once after the pushed loop.
     no_pr_stale_fates: dict[int, list[worker_fate.WorkerFate]] = {}
     issues_by_number: dict[int, dict[str, Any]] = {}  # also used by the live-handoff lane below
+    park_verdicts: dict[int, LocalParkResult] = {}  # Issue #1971 no-PR park lane
+    local_park_deferred: dict[int, str] = {}
 
     if no_pr_orphans:
         for issue in gh.issue_list(state="open"):
@@ -1900,13 +1907,9 @@ def _detect_and_handle_orphaned_workers(
                 )
                 is not None
             ):
-                label_write_ok = True
-                for label in sorted(active_labels):
-                    if not gh.remove_issue_label(issue_number, label):
-                        label_write_ok = False
-                if config.labels.human_needed not in issue_labels:
-                    if not gh.add_issue_label(issue_number, config.labels.human_needed):
-                        label_write_ok = False
+                label_write_ok = _strip_active_and_flag_human_needed(
+                    gh, config, issue_number, active_labels, issue_labels
+                )
                 worker_declared_blocked_escalations[issue_number] = {
                     "removed_labels": sorted(active_labels),
                     "label_write_ok": label_write_ok,
@@ -1930,13 +1933,9 @@ def _detect_and_handle_orphaned_workers(
             # escalated twice in 11 minutes on ``rate_limited`` deaths).
             throttle_death = worker_fate.throttle_failure(fates.get(issue_number)) is not None
             if not throttle_death and _is_zero_artifact_dispatch_loop(sessions_dir, issue_number):
-                label_write_ok = True
-                for label in sorted(active_labels):
-                    if not gh.remove_issue_label(issue_number, label):
-                        label_write_ok = False
-                if config.labels.human_needed not in issue_labels:
-                    if not gh.add_issue_label(issue_number, config.labels.human_needed):
-                        label_write_ok = False
+                label_write_ok = _strip_active_and_flag_human_needed(
+                    gh, config, issue_number, active_labels, issue_labels
+                )
                 zero_artifact_escalations[issue_number] = {
                     "removed_labels": sorted(active_labels),
                     "label_write_ok": label_write_ok,
@@ -1958,13 +1957,9 @@ def _detect_and_handle_orphaned_workers(
                 sweep_fleet_repos,
             )
             if not scope_result.passed:
-                label_write_ok = True
-                for label in sorted(active_labels):
-                    if not gh.remove_issue_label(issue_number, label):
-                        label_write_ok = False
-                if config.labels.human_needed not in issue_labels:
-                    if not gh.add_issue_label(issue_number, config.labels.human_needed):
-                        label_write_ok = False
+                label_write_ok = _strip_active_and_flag_human_needed(
+                    gh, config, issue_number, active_labels, issue_labels
+                )
                 cross_repo_scope_escalations[issue_number] = {
                     "removed_labels": sorted(active_labels),
                     "label_write_ok": label_write_ok,
@@ -1992,8 +1987,33 @@ def _detect_and_handle_orphaned_workers(
                 worker_outcome=worker_outcome,
                 write_gate=write_gate,
                 reclaim_results=reclaim_results,
+                park_verdicts=park_verdicts,
+                now=now,
             ):
                 continue
+
+        # Issue #1971: pre-lock park drain for the #654 backstop below.
+        local_park_deferred = park_backstop_due_local_orphans(
+            gh=gh,
+            config=config,
+            repo_root=repo_root,
+            worktrees_dir=worktrees_dir,
+            state=state,
+            state_file=state_file,
+            no_pr_orphans=no_pr_orphans,
+            issues_by_number=issues_by_number,
+            worker_outcomes=worker_outcomes,
+            reclaim_results=reclaim_results,
+            escalations=(
+                worker_declared_blocked_escalations,
+                zero_artifact_escalations,
+                cross_repo_scope_escalations,
+            ),
+            park_verdicts=park_verdicts,
+            dead_dispatched_reap_minutes=config.watchdog.dead_dispatched_reap_minutes,
+            now=now,
+            write_gate=write_gate,
+        )
 
     # Issue #935: for the no-open-PR orphans, determine whether the worker
     # pushed a branch and reported push-succeeded-but-PR-failed. This is done
@@ -2324,6 +2344,7 @@ def _detect_and_handle_orphaned_workers(
                     now=now,
                     sweep_events=sweep_events,
                     max_throttle_rearms=config.watchdog.max_auto_redispatch,
+                    local_park_deferred=local_park_deferred,
                     on_fate=lambda fate: worker_fate.collect_fate(swept_fates, fate),
                 )
             )
