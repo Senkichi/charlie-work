@@ -258,6 +258,23 @@ from .escalation import (  # noqa: F401  (deliberate re-export)
 # LOAD-BEARING RE-EXPORT — NOT AN UNUSED IMPORT. Do not delete; the `noqa`
 # below marks a deliberate re-export, not a lint concession.
 #
+# Issue #2051: the live-worker cap-escalation deferral helpers
+# (probe candidates through `issue_worker_liveness`, persist the
+# once-per-worker `escalation_deferred_live_worker` marker+event) live in
+# `charlie_work.live_worker_deferral` -- a new module rather than
+# `.escalation`, which has no file-size headroom left for them. Re-exported
+# here so `_wf.<name>` call sites and monkeypatch targets keep working.
+from .live_worker_deferral import (  # noqa: F401  (deliberate re-export)
+    _live_worker_cap_escalation_deferrals,
+    _filter_cap_escalation_lanes_for_live_workers,
+    _defer_cap_escalation_for_live_worker,
+    _record_cap_escalation_deferrals,
+    _defer_janitor_cap_escalation_for_live_worker,
+)
+
+# LOAD-BEARING RE-EXPORT — NOT AN UNUSED IMPORT. Do not delete; the `noqa`
+# below marks a deliberate re-export, not a lint concession.
+#
 # issue #1283 Phase A: the reviewer-verdict-parsing free-function family
 # (fenced-JSON extraction, stream-json event decoding, mtime-gated file
 # fallback recovery, and reviewer-session-summary reconstruction), plus the
@@ -1671,8 +1688,8 @@ def _detect_and_handle_orphaned_workers(
       dispatched this worker) and head is unchanged since review, reset to
       "rework_requested" -- same as the request_changes branch (issue #1109)
     - Issue #1911: before either reset, when no terminal-status record exists
-      (``terminal_exit_code is None`` -- the normal shape for devin-shell
-      sessions, which never get a watcher), a fresh on-target
+      (``terminal_exit_code is None`` -- e.g. a session whose watcher never
+      ran, or one launched before every Popen-backed harness grew one), a fresh on-target
       ``.worker-outcome.json`` in the worktree proves the dispatch completed;
       its PR edits are applied through the #1877 outcome-apply path instead
       of crediting a worker death. Issue #1915: once that apply lands, the
@@ -4255,14 +4272,18 @@ class OrchestratorApp:
         Returns:
             CommandResult with ok=True if a packet was generated, or ok=False if
             the review was blocked (janitor gate, test-adequacy gate) or the PR
-            was not found. Two ok=True returns carry NO packet and callers that
-            gate a status->"reviewing" flip on ``ok`` must additionally exclude
-            them via the data flags: ``routed_to_rework`` (the janitor-gate
-            conflict/no-op-rework route re-requests rework with no packet) and
-            ``closed_unmerged_converged`` (issue #558: a CLOSED-unmerged PR is
-            converged to state status "closed" at the janitor gate -- the PR is
-            dead, not a fresh-packet candidate). A refused janitor-gate return
-            also carries ``is_no_op_rework`` -- True only when the unchanged-diff
+            was not found. Three ok=True returns carry NO packet and callers
+            that gate a status->"reviewing" flip on ``ok`` must additionally
+            exclude them via the data flags: ``routed_to_rework`` (the
+            janitor-gate conflict/no-op-rework route re-requests rework with
+            no packet), ``closed_unmerged_converged`` (issue #558: a
+            CLOSED-unmerged PR is converged to state status "closed" at the
+            janitor gate -- the PR is dead, not a fresh-packet candidate),
+            and ``escalation_deferred_live_worker`` (issue #2051: the janitor
+            cap router deferred the escalation because a live worker still
+            holds the issue -- no packet and no routing; the worker may still
+            be committing). A refused janitor-gate return also carries
+            ``is_no_op_rework`` -- True only when the unchanged-diff
             no-op gate caused the refusal (issue #2034). See
             ``_route_rework_candidate_to_review`` and the dead-worker orphan
             sweep for the canonical gating pattern.

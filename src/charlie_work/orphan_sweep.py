@@ -16,7 +16,9 @@ orphan-sweep pipeline:
   ``process_utils.kill_orphan_pid``) refuse to terminate, because a sweep-hit
   PID naming any ancestor (uv, the pytest controller, the step's pwsh) fells
   the subtree containing the caller — the mid-run controller death issue
-  #1842 tracks.
+  #1842 tracks. The snapshot row type and the walk itself live in
+  ``process_chain`` (shared with ``quiesce`` and ``host_load``, issue #2058);
+  the private names here are alias bindings into it.
 """
 
 from __future__ import annotations
@@ -29,110 +31,22 @@ import signal
 import time
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any
 
-import psutil
-
+from .process_chain import ancestor_chain_pids
+from .process_chain import ProcRow as _ProcRow  # noqa: F401 (deliberate re-export)
+from .process_chain import posix_process_ppid_snapshot as _posix_process_ppid_snapshot
+from .process_chain import win32_process_ppid_snapshot as _win32_process_ppid_snapshot
 from .subprocess_runner import run_captured
 
 logger = logging.getLogger(__name__)
 
 
-# Hard backstop on the parent-PID walk in ``_self_ancestor_pids`` — the same
-# bound ``quiesce.self_process_chain`` carries as ``_MAX_CHAIN_DEPTH``. A
-# malformed or adversarial ppid snapshot (a cycle) must never spin the guard;
-# real chains are a handful of hops.
+# Hard backstop on the parent-PID walk ``_self_ancestor_pids`` delegates to
+# (``process_chain.ancestor_chain_pids``). A malformed or adversarial ppid
+# snapshot (a cycle) must never spin the guard; real chains are a handful of
+# hops.
 _MAX_ANCESTOR_CHAIN_HOPS = 64
-
-
-class _ProcRow(NamedTuple):
-    """One snapshot row: the parent pid and (where known) the creation stamp.
-
-    ``created`` is a creation time comparable only between rows of the same
-    snapshot (Windows: ``psutil`` ``create_time()``, epoch seconds derived from
-    the kernel's UTC FILETIME). ``None`` means unknown, and an unknown stamp
-    never disqualifies a parent link. Every row of one snapshot uses one unit.
-    """
-
-    ppid: int
-    created: float | None = None
-
-
-def _win32_process_ppid_snapshot() -> dict[int, _ProcRow]:
-    """Snapshot ``pid -> (ppid, creation time)`` for every process via ``psutil``.
-
-    The creation time exists because Windows never reparents: a child's
-    parent PID keeps naming its parent after the parent exits, and that PID
-    can then be recycled by an unrelated, *younger* process. A walk that
-    trusts the bare ppid follows the recycled PID into a stranger (see
-    ``_self_ancestor_pids``).
-
-    ``create_time()`` is taken from the kernel's process-creation FILETIME,
-    which is UTC by construction. The earlier CIM ``CreationDate`` source is a
-    ``DateTime`` built from local-time fields and can be off by an hour around
-    a DST transition -- enough to make a real parent look *newer* than its
-    child, stop the ancestor walk early, and unprotect a real ancestor (the
-    dangerous direction). ``psutil`` is a declared dependency; one
-    ``process_iter`` pass yields pid, ppid and create_time from the same
-    source, so the rows are mutually consistent, with no PowerShell spawn, no
-    JSON round-trip, and no 10s timeout to stall the kill path
-    (``kill_process_tree`` / ``kill_orphan_pid``). A process whose creation
-    time is unreadable (``AccessDenied`` -> ``None``) simply keeps its link.
-
-    Returns ``{}`` on any failure (``psutil`` error, OS error). The caller
-    degrades to the bare self-pid guard rather than disabling process reaping
-    on a host whose process-listing substrate is broken -- see
-    ``_self_ancestor_pids``.
-    """
-    ppid_by_pid: dict[int, _ProcRow] = {}
-    try:
-        for proc in psutil.process_iter(["pid", "ppid", "create_time"]):
-            info = proc.info
-            try:
-                pid = int(info["pid"])
-                ppid = int(info.get("ppid") or 0)
-            except (KeyError, TypeError, ValueError):
-                continue
-            created = info.get("create_time")
-            ppid_by_pid[pid] = _ProcRow(
-                ppid, float(created) if isinstance(created, (int, float)) else None
-            )
-    except (psutil.Error, OSError):
-        logger.warning("psutil process snapshot failed", exc_info=True)
-        return {}
-    return ppid_by_pid
-
-
-def _posix_process_ppid_snapshot(proc_root: Path = Path("/proc")) -> dict[int, _ProcRow]:
-    """Snapshot ``pid -> ppid`` from procfs (``/proc/<pid>/stat``).
-
-    ``proc_root`` is a parameter — not a constant read at call time — so
-    tests can point it at a fabricated procfs tree without touching the
-    host's (same convention as ``host_load._list_processes_posix``).
-    Processes that exit or become unreadable mid-scan are skipped: a
-    snapshot can never be perfectly atomic, and a vanished entry is not
-    worth failing the walk over. Returns ``{}`` where procfs is absent.
-
-    The creation stamp is left unknown: POSIX reparents orphans to init, so a
-    recorded ppid always names a live process and cannot go stale.
-    """
-    ppid_by_pid: dict[int, _ProcRow] = {}
-    try:
-        entries = list(proc_root.iterdir())
-    except OSError:
-        return ppid_by_pid
-    for entry in entries:
-        if not entry.name.isdigit():
-            continue
-        try:
-            stat_text = (entry / "stat").read_text(encoding="utf-8", errors="replace")
-            # ppid is the first field after ``state`` once comm (which can
-            # contain spaces/parens) is split off on the LAST ')'.
-            fields = stat_text.rpartition(")")[2].split()
-            ppid_by_pid[int(entry.name)] = _ProcRow(int(fields[1]))
-        except (OSError, ValueError, IndexError):
-            continue
-    return ppid_by_pid
 
 
 def _self_ancestor_pids() -> frozenset[int]:
@@ -146,22 +60,15 @@ def _self_ancestor_pids() -> frozenset[int]:
     CommandLine substring, and a too-broad worktree needle legitimately
     matches that ancestry's command lines.
 
-    The walk mirrors ``quiesce.self_process_chain``'s termination rules: a
-    parent absent from the snapshot, a cycle, or the hop cap ends it. It adds
-    one more: a parent *created after its child* is not a parent. Windows never
-    reparents, so once an ancestor exits its PID is free to be recycled, and a
-    child's stale ``ParentProcessId`` then names whatever unrelated process
-    took the number. Trusting it put a freshly launched merge-gate runner on
-    the "ancestor" list, and ``kill_process_tree`` refused to kill it (the
-    ``test_local_merge_gate_async`` timeout/restart flake): a user-mode
-    parent always predates its child, so a younger "parent" ends the walk.
-    Accepted limits: (1) the predates-its-child premise holds for user-mode
-    processes only -- children of the kernel ``System`` process (pid 4) can
-    appear older than it, which only ever ends the walk early at a kernel
-    boundary no caller descends from; (2) a system clock stepped backwards
-    between the parent's and the child's creation can invert their
-    timestamps, which ``psutil.Process.parent()`` -- which applies the same
-    check -- accepts as well. When the snapshot cannot be taken at all the
+    The walk is ``process_chain.ancestor_chain_pids`` (issue #2058), whose
+    termination rules are a parent absent from the snapshot, a cycle, the
+    hop cap, and -- crucially -- a parent *created after its child*. Windows
+    never reparents, so once an ancestor exits its PID is free to be
+    recycled, and a child's stale ``ParentProcessId`` then names whatever
+    unrelated process took the number. Trusting it put a freshly launched
+    merge-gate runner on the "ancestor" list, and ``kill_process_tree``
+    refused to kill it (the ``test_local_merge_gate_async``
+    timeout/restart flake). When the snapshot cannot be taken at all the
     result degrades to ``{os.getpid()}`` — on Windows the only producer of
     orphan PIDs (``sweep_orphan_processes``) needs a working
     process-listing substrate too, so a broken snapshot mostly means there
@@ -198,28 +105,7 @@ def _self_ancestor_pids() -> frozenset[int]:
             self_pid,
             os.name,
         )
-    chain: set[int] = {self_pid}
-    current = self_pid
-    for _ in range(_MAX_ANCESTOR_CHAIN_HOPS):
-        row = ppid_by_pid.get(current)
-        if row is None:
-            break
-        parent = row.ppid
-        if parent <= 0 or parent in chain:
-            break
-        parent_row = ppid_by_pid.get(parent)
-        if (
-            parent_row is not None
-            and row.created is not None
-            and parent_row.created is not None
-            and parent_row.created > row.created
-        ):
-            # Recycled PID: the recorded parent exited and an unrelated,
-            # younger process now holds its number. Not an ancestor.
-            break
-        chain.add(parent)
-        current = parent
-    return frozenset(chain)
+    return frozenset(ancestor_chain_pids(self_pid, ppid_by_pid, max_hops=_MAX_ANCESTOR_CHAIN_HOPS))
 
 
 # Minimum length a ``worktree_path`` needle must reach before
