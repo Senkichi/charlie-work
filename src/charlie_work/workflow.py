@@ -91,7 +91,7 @@ from .diff_coverage_probe import StaticProbeVerdict, run_static_probe
 from .labels import TransitionOutcome, transition
 from .local_work_park import park_or_reclaim_local_orphan
 from .pass_deadline import pass_deadline_spent, pass_deadline_suspended
-from .paths import RuntimePaths, resolved_layout
+from .paths import RuntimePaths, prompt_override_dirs, resolved_layout
 from .prompt_sections import section_variant_names
 from .prompts import (
     PromptTemplateError,
@@ -3902,8 +3902,6 @@ class OrchestratorApp:
             dry_run=self.dry_run, state_path=self.paths.state_file, repo=self.repo_root.name
         )
         self.fleet_dir_override = fleet_dir_override
-        # Ambient sink for markdown_guard_disagreement events on this thread (pure guards have
-        # no state path; fleet lanes rebind per pool thread in fleet_lanes).
         markdown_guard.bind_state_path(self.paths.state_file, self.repo_root.name)
         # Issue #1363: config_freshness's "exactly once per change" semantics
         # need a mtime cache that outlives a single pass but not the process
@@ -3914,14 +3912,7 @@ class OrchestratorApp:
         self._preflight_config_mtimes: dict[str, float] = {}
         # Make the event ring cap config-driven (issue #525).
         _state.EVENT_RING_SIZE = config.runtime.event_ring_size
-        prompts_dir = config.runtime.prompts_dir
-        if prompts_dir:
-            override = Path(prompts_dir)
-            if not override.is_absolute():
-                override = repo_root / override
-            self.prompt_dirs: tuple[Path, ...] = (override,)
-        else:
-            self.prompt_dirs = ()
+        self.prompt_dirs: tuple[Path, ...] = prompt_override_dirs(config, repo_root)
         self.paths.ensure()
 
         # Issue #713: fail fast at startup if any configured prompt template

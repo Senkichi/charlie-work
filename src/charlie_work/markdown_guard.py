@@ -108,8 +108,10 @@ def bind_state_path(state_path: Path | None, repo: str | None = None) -> None:
     """Bind (or with ``None`` unbind) the current thread's ambient sink, untokened.
 
     Used by ``OrchestratorApp.__init__`` for single-repo entry points that run
-    on the constructing thread. Fleet lanes run on pool threads and bind their
-    own sink with :func:`bind_sink`.
+    on the constructing thread: pure guards have no state path of their own, so
+    this is the ambient sink for ``markdown_guard_disagreement`` events. Fleet
+    lanes run on pool threads and rebind their own sink with :func:`bind_sink`
+    (see ``fleet_lanes``).
     """
     _sink.set(None if state_path is None else Sink(state_path, repo))
 
