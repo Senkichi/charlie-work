@@ -444,3 +444,42 @@ def test_orphaned_worker_completed_outcome_defers_review_until_applied(
     assert review_calls == [100]
     assert len(fake_gh.pr_edits) == 1
     assert entry.get("status") == "reviewing"
+
+
+def test_with_pr_stale_outcome_emits_worker_evidence_stale_once(tmp_path: Path) -> None:
+    """B6 (wf-r2-s6): the dead-worker-with-PR path resolves a fate through
+    ``fresh_completed_worker_outcome``; an outcome older than this dispatch is
+    ignored by rule 1 and must surface as a ``worker_evidence_stale`` warning
+    rather than vanishing -- once, however many passes re-sweep the worker.
+    """
+    from datetime import UTC
+    from unittest.mock import patch
+
+    from charlie_work.instrumentation import query_events
+
+    config, paths, fake_gh, dispatched_at = _dead_worker_rework_bed(tmp_path)
+    parsed_dispatch = datetime.fromisoformat(dispatched_at.replace("Z", "+00:00"))
+    _write_outcome(
+        paths,
+        tmp_path,
+        {"push_succeeded": True, "pr_created": False, "head_sha": "abc123"},
+        mtime=(parsed_dispatch - timedelta(hours=1)).astimezone(UTC),
+    )
+
+    with patch.object(rework_outcome, "remote_branch_head_sha", lambda *_a: "abc123"):
+        _run_orphan_sweep(tmp_path, paths, config, fake_gh)
+        _run_orphan_sweep(tmp_path, paths, config, fake_gh)
+
+    stale = query_events(paths.state_file, kind="worker_evidence_stale")
+    assert len(stale) == 1
+    assert stale[0]["level"] == "warning"
+    raw = stale[0]["payload"]
+    payload = json.loads(raw) if isinstance(raw, str) else raw
+    assert payload["issue_number"] == 207
+    assert payload["reason"] == "older_than_dispatch"
+    # The sweep may already have reset the entry by the time it reports, so the
+    # payload's dispatch time can come from the fate basis (``+00:00`` form).
+    assert (
+        datetime.fromisoformat(payload["dispatched_at"].replace("Z", "+00:00")) == parsed_dispatch
+    )
+    assert load_state(paths.state_file)["issues"]["207"]["stale_evidence_reported"]

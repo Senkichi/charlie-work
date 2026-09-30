@@ -914,7 +914,7 @@ def test_flip8_fresh_completed_outcome_ignores_pr_created_true(tmp_path: Path) -
     os.utime(outcome_path, (fresh_ts, fresh_ts))
 
     result = fresh_completed_worker_outcome(
-        worktree_path, live_head_sha="abc999", dispatched_at=dispatched_at
+        worktree_path, issue_number=1, live_head_sha="abc999", dispatched_at=dispatched_at
     )
 
     assert result is not None

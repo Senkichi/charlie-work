@@ -32,25 +32,24 @@ in strict order:
    nearly every pass of an active fleet).
 
    N4 (wf-review-opus.md): FLIP 5's "route immediately, ignore
-   ``worker_outcome_finalize_minutes``" change reopened a version of that
-   same round-2 cost concern from the other direction -- a single live PID
-   with a fresh, on-target, declared-push outcome now keeps this
-   function's result non-empty on every pass for as long as that PID stays
-   alive (there is no threshold left to age it out of the candidate set),
-   which defeats the early return and makes ``gh.pr_list()`` and
-   ``state_lock`` run every pass until the PID exits, not just once near
-   the threshold. Not fixed here -- reintroducing a wait window would
-   partially undo the reviewed FLIP 5 latency fix this same lane exists
-   for, so the right tradeoff (accept the per-pass cost, or find a
-   cheaper filesystem-only staleness marker) is a design decision, not a
-   review-fixes nit; see ``wf-review-dispositions.md``.
+   ``worker_outcome_finalize_minutes``" change left no threshold to age a
+   candidate out of the set, so a live PID with a fresh, on-target,
+   declared-push outcome kept this function's result non-empty on every
+   pass until the PID exited -- defeating the early return. The fix is a
+   filesystem-only marker: once the lane has routed an outcome (PR opened,
+   PR already open, or PR create failed) ``finalize_live_handoff_candidates``
+   stamps ``entry["live_handoff_routed_outcome_at"]`` with that outcome
+   file's mtime, and this function skips an entry whose marker equals the
+   current mtime. A newer outcome write is a new fact and re-arms the lane.
+   A failed PR create is therefore not retried by this lane; the dead-PID
+   lane (#935) retries it once the PID exits.
 2. ``resolve_live_handoff_candidates`` -- run after ``gh.pr_list()`` (needed
    elsewhere in the sweep regardless, for the dead-PID lanes), to drop
    candidates a PR already exists for and attach the issue/label data the
    finalize step needs. Pre-lock, since it may call ``gh.issue_list()``.
 3. ``finalize_live_handoff_candidates`` -- the in-lock step: opens the PR
-   (or records a fingerprinted stranded-branch drift on failure) and
-   updates ``state``/``sweep_events`` in place.
+   (or records a fingerprinted stranded-branch drift on failure), stamps
+   the routed-outcome marker and updates ``state``/``sweep_events`` in place.
 """
 
 from __future__ import annotations
@@ -64,6 +63,13 @@ from .config import WORKER_OUTCOME_FILENAME, OrchestratorConfig
 from .github import GitHubLike, label_names
 from .state import PASSIVE_OPEN_STATUS, utc_now
 from .worktree import read_worker_outcome, worktree_path_for_branch
+
+
+# N4: the entry field recording which outcome-file mtime (ISO) this lane has
+# already routed. Cleared with the dispatch epoch (``state.
+# clear_dead_worker_failure_kind``) and on operator re-arm
+# (``UNESCALATE_ISSUE_RESET_FIELDS``).
+ROUTED_OUTCOME_KEY = "live_handoff_routed_outcome_at"
 
 
 def partition_dispatched_by_pid_liveness(
@@ -107,6 +113,7 @@ def collect_stale_live_handoff_pids(
     repo_root: Path | None,
     worktrees_dir: Path | None,
     now: datetime,
+    on_fate: Callable[[worker_fate.WorkerFate], None] | None = None,
 ) -> dict[int, dict[str, Any]]:
     """Filesystem-only pre-check: which live-PID entries look finalizable.
 
@@ -115,6 +122,12 @@ def collect_stale_live_handoff_pids(
     Does not consult ``pr_by_issue`` -- that requires ``gh.pr_list()``, which
     callers gate on this function's result being non-empty in the first
     place, so it cannot be a precondition here.
+
+    An entry whose ``live_handoff_routed_outcome_at`` marker equals the
+    current outcome file's mtime was already routed and is skipped (N4).
+    ``on_fate`` receives each resolved fate so the caller can report rule 1's
+    stale evidence (``worker_fate.report_stale_evidence``, B6) -- this
+    function is lock-free and emits nothing itself.
     """
     candidates: dict[int, dict[str, Any]] = {}
     if (
@@ -138,6 +151,9 @@ def collect_stale_live_handoff_pids(
                 (worktree_path / WORKER_OUTCOME_FILENAME).stat().st_mtime, tz=UTC
             )
         except OSError:
+            continue
+        outcome_at = outcome_mtime.isoformat()
+        if live_entry.get(ROUTED_OUTCOME_KEY) == outcome_at:
             continue
         outcome_age = now - outcome_mtime
         worker_outcome = read_worker_outcome(worktree_path)
@@ -183,6 +199,8 @@ def collect_stale_live_handoff_pids(
             ),
             now=now,
         )
+        if on_fate is not None:
+            on_fate(fate)
 
         # Rule 1: freshness is gated on `dispatched_at`/`head_sha`, not on
         # outcome-age-vs-`now` -- a leftover outcome file from a prior
@@ -222,6 +240,7 @@ def collect_stale_live_handoff_pids(
             "worker_outcome": worker_outcome,
             "worker_pid": live_entry.get("worker_pid"),
             "outcome_age_minutes": outcome_age.total_seconds() / 60,
+            "outcome_at": outcome_at,
         }
     return candidates
 
@@ -233,8 +252,13 @@ def resolve_live_handoff_candidates(
     issues_by_number: dict[int, dict[str, Any]],
     gh: GitHubLike,
     config: OrchestratorConfig,
-) -> dict[int, dict[str, Any]]:
+) -> tuple[dict[int, dict[str, Any]], dict[int, dict[str, Any]]]:
     """Drop candidates a PR already exists for and attach issue/label data.
+
+    Returns ``(live_handoff_candidates, pr_already_open)``. The second map is
+    the candidates dropped because a PR already exists; the caller hands it to
+    ``finalize_live_handoff_candidates``, which stamps them as routed (N4) so
+    they are not re-collected on every pass.
 
     ``issues_by_number`` is shared with the caller's dead-PID lane and is
     mutated in place (populated via a single bulk ``gh.issue_list()`` call)
@@ -242,13 +266,18 @@ def resolve_live_handoff_candidates(
     it again.
     """
     live_handoff_candidates: dict[int, dict[str, Any]] = {}
+    pr_already_open = {
+        issue_number: candidate
+        for issue_number, candidate in stale_candidates.items()
+        if issue_number in pr_by_issue
+    }
     declared = {
         issue_number: candidate
         for issue_number, candidate in stale_candidates.items()
         if issue_number not in pr_by_issue
     }
     if not declared:
-        return live_handoff_candidates
+        return live_handoff_candidates, pr_already_open
 
     if not issues_by_number:
         for issue in gh.issue_list(state="open"):
@@ -266,7 +295,7 @@ def resolve_live_handoff_candidates(
         candidate["issue_labels"] = issue_labels
         candidate["active_labels"] = issue_labels & config.labels.active
         live_handoff_candidates[issue_number] = candidate
-    return live_handoff_candidates
+    return live_handoff_candidates, pr_already_open
 
 
 def finalize_live_handoff_candidates(
@@ -280,8 +309,15 @@ def finalize_live_handoff_candidates(
     pr_by_issue: dict[int, dict[str, Any]],
     sweep_events: list[tuple[str, dict[str, Any]]],
     drift_fingerprint: Callable[..., str],
+    pr_already_open: dict[int, dict[str, Any]] | None = None,
 ) -> None:
     """In-lock finalize: open the PR, or record a stranded-branch drift.
+
+    Every candidate handled here -- PR opened, PR create failed, or a PR
+    already open (``pr_already_open``, including one that appeared between
+    the pre-lock snapshot and this lock) -- is stamped with
+    ``live_handoff_routed_outcome_at`` so ``collect_stale_live_handoff_pids``
+    stops re-collecting it until a newer outcome is written (N4).
 
     Mutates ``state["issues"]`` and appends to ``sweep_events`` in place.
     Only the PR-open action runs here -- none of the dead-PID lanes (label
@@ -296,6 +332,14 @@ def finalize_live_handoff_candidates(
     # here, not at module level: workflow.py imports this module at import time.
     import charlie_work.workflow as _wf
 
+    def _stamp_routed(entry: dict[str, Any], candidate: dict[str, Any]) -> None:
+        entry[ROUTED_OUTCOME_KEY] = candidate["outcome_at"]
+
+    for issue_number, candidate in (pr_already_open or {}).items():
+        already = state["issues"].get(str(issue_number))
+        if isinstance(already, dict) and already.get("status") == "dispatched":
+            _stamp_routed(already, candidate)
+
     for issue_number in live_handoff_candidates:
         entry = state["issues"].get(str(issue_number), {})
         if not isinstance(entry, dict):
@@ -305,9 +349,11 @@ def finalize_live_handoff_candidates(
             continue
         # A PR may have appeared between the pre-lock snapshot and this
         # lock -- never open a duplicate.
-        if issue_number in pr_by_issue:
-            continue
         candidate = live_handoff_candidates[issue_number]
+        if issue_number in pr_by_issue:
+            _stamp_routed(entry, candidate)
+            state["issues"][str(issue_number)] = entry
+            continue
         # ``repo_root`` comes from ``getattr(gh, "repo_root", None)`` and is
         # not statically typed; narrow to ``Path | None`` before the salvage
         # helper (``None`` is an error value it already handles).
@@ -325,6 +371,7 @@ def finalize_live_handoff_candidates(
             state_file=state_file,
             worker_outcome=candidate["worker_outcome"],
         )
+        _stamp_routed(entry, candidate)
         if pr_number is not None:
             entry["status"] = PASSIVE_OPEN_STATUS
             entry["pr_number"] = pr_number
@@ -356,8 +403,9 @@ def finalize_live_handoff_candidates(
 
         # PR creation failed after the bounded retry -- the branch is pushed
         # and stranded. Same fingerprinted-drift pattern as the dead-PID
-        # lane: emit the drift event once per unchanged finding while the
-        # next pass re-attempts the create itself.
+        # lane. The outcome is stamped routed above, so this lane does not
+        # retry; the dead-PID lane (#935) re-attempts the create once the
+        # PID exits. The fingerprint still dedups the drift event.
         fingerprint = drift_fingerprint(
             reason="live_worker_handoff_pr_create_failed",
             branch_name=candidate["branch"],

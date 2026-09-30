@@ -232,6 +232,7 @@ def handle_dead_worker_completed_outcome(
     review_callback: Callable[[int], Any] | None,
     drift_fingerprint: Callable[..., str],
     extra_payload: dict[str, Any] | None = None,
+    on_fate: Callable[[worker_fate.WorkerFate], None] | None = None,
 ) -> bool:
     """Recover a dead worker that provably completed its handoff (#1911).
 
@@ -298,8 +299,10 @@ def handle_dead_worker_completed_outcome(
         return False
     outcome = fresh_completed_worker_outcome(
         worktree_path_for_branch(repo_root, branch, worktrees_dir),
+        issue_number=issue_number,
         live_head_sha=live_head_sha,
         dispatched_at=_wf._parse_iso_timestamp(entry.get("dispatched_at")),
+        on_fate=on_fate,
     )
     if outcome is None:
         return False
@@ -383,6 +386,7 @@ def handle_dead_worker_with_pr(
     outcome_apply_routes: list[tuple[int, int]],
     pr_orphan_unreviewed_details: dict[int, dict[str, Any]],
     drift_fingerprint: Callable[..., str],
+    on_fate: Callable[[worker_fate.WorkerFate], None] | None = None,
 ) -> None:
     """Classify one dead dispatched worker that still has an open PR.
 
@@ -464,6 +468,7 @@ def handle_dead_worker_with_pr(
                 review_routes=review_routes,
                 review_callback=review_callback,
                 drift_fingerprint=drift_fingerprint,
+                on_fate=on_fate,
             ):
                 # B2 (wf-review-opus.md), rule 2: a fresh, on-target
                 # "blocked" outcome file beats everything else here,
@@ -486,7 +491,9 @@ def handle_dead_worker_with_pr(
                 if branch and isinstance(repo_root, Path) and worktrees_dir is not None:
                     blocked_outcome = blocked_worker_outcome(
                         worktree_path_for_branch(repo_root, branch, worktrees_dir),
+                        issue_number=issue_number,
                         dispatched_at=_wf._parse_iso_timestamp(entry.get("dispatched_at")),
+                        on_fate=on_fate,
                     )
                 if blocked_outcome is not None:
                     state = _wf._escalate_issue(
@@ -735,6 +742,7 @@ def handle_dead_worker_with_pr(
                     "decision": "approved",
                     "pr_state_status": pr_state_status,
                 },
+                on_fate=on_fate,
             ):
                 # B2 (wf-review-opus.md), rule 2: a fresh, on-target
                 # "blocked" outcome escalates unconditionally -- checked
@@ -748,7 +756,9 @@ def handle_dead_worker_with_pr(
                 if branch and isinstance(repo_root, Path) and worktrees_dir is not None:
                     blocked_outcome = blocked_worker_outcome(
                         worktree_path_for_branch(repo_root, branch, worktrees_dir),
+                        issue_number=issue_number,
                         dispatched_at=_wf._parse_iso_timestamp(entry.get("dispatched_at")),
+                        on_fate=on_fate,
                     )
                 if blocked_outcome is not None:
                     state = _wf._escalate_issue(

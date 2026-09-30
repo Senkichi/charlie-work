@@ -192,8 +192,10 @@ def _read_rework_outcome(
 def fresh_completed_worker_outcome(
     worktree_path: Path | None,
     *,
+    issue_number: int,
     live_head_sha: str | None,
     dispatched_at: datetime | None,
+    on_fate: Callable[[worker_fate.WorkerFate], None] | None = None,
 ) -> dict[str, Any] | None:
     """Return a worktree ``.worker-outcome.json`` that proves a dead worker
     completed its handoff despite leaving no terminal-status record
@@ -213,6 +215,10 @@ def fresh_completed_worker_outcome(
 
     Every check fails safe: ``None`` sends the caller back to the existing
     worker-death path. Never raises.
+
+    ``on_fate`` receives the resolved fate so the caller can report rule 1's
+    stale evidence (``worker_fate.report_stale_evidence``, B6) once it is out
+    of its lock; this function reads only and never emits.
 
     Obtains this pick from the module (design doc §8, step B1, A12): rule
     1's freshness gate (``written_at > dispatched_at``) and rule 7's
@@ -246,7 +252,7 @@ def fresh_completed_worker_outcome(
 
     fate = worker_fate.resolve_fate(
         worker_fate.FateEvidence(
-            issue_number=0,  # not carried by this function's signature; unused by resolve_fate
+            issue_number=issue_number,
             adapter="unknown",
             dispatched_at=dispatched_at,
             pid_alive=False,
@@ -265,6 +271,8 @@ def fresh_completed_worker_outcome(
         ),
         now=datetime.now(UTC),
     )
+    if on_fate is not None:
+        on_fate(fate)
 
     resolved = fate.basis.outcome
     if (
@@ -280,7 +288,9 @@ def fresh_completed_worker_outcome(
 def blocked_worker_outcome(
     worktree_path: Path | None,
     *,
+    issue_number: int,
     dispatched_at: datetime | None,
+    on_fate: Callable[[worker_fate.WorkerFate], None] | None = None,
 ) -> dict[str, Any] | None:
     """Return a worktree ``.worker-outcome.json`` that proves a dead worker
     declared itself blocked (rule 2, wf-design.md §9: FLIP 2).
@@ -319,7 +329,7 @@ def blocked_worker_outcome(
 
     fate = worker_fate.resolve_fate(
         worker_fate.FateEvidence(
-            issue_number=0,  # not carried by this function's signature; unused by resolve_fate
+            issue_number=issue_number,
             adapter="unknown",
             dispatched_at=dispatched_at,
             pid_alive=False,
@@ -338,6 +348,8 @@ def blocked_worker_outcome(
         ),
         now=datetime.now(UTC),
     )
+    if on_fate is not None:
+        on_fate(fate)
     if isinstance(fate, worker_fate.Blocked) and fate.basis.outcome is not None:
         return dict(fate.basis.outcome.raw)
     return None

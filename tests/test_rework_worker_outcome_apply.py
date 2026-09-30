@@ -491,7 +491,7 @@ def test_fresh_completed_outcome_is_returned(tmp_path: Path) -> None:
     worktree_path = _write_worktree_outcome(tmp_path, worktrees_dir, BRANCH, _outcome())
 
     result = fresh_completed_worker_outcome(
-        worktree_path, live_head_sha=HEAD_SHA, dispatched_at=dispatched_at
+        worktree_path, issue_number=1, live_head_sha=HEAD_SHA, dispatched_at=dispatched_at
     )
 
     assert result is not None
@@ -507,7 +507,7 @@ def test_stale_outcome_is_not_completed(tmp_path: Path) -> None:
 
     assert (
         fresh_completed_worker_outcome(
-            worktree_path, live_head_sha=HEAD_SHA, dispatched_at=dispatched_at
+            worktree_path, issue_number=1, live_head_sha=HEAD_SHA, dispatched_at=dispatched_at
         )
         is None
     )
@@ -523,7 +523,7 @@ def test_outcome_at_other_head_is_not_completed(tmp_path: Path) -> None:
 
     assert (
         fresh_completed_worker_outcome(
-            worktree_path, live_head_sha=HEAD_SHA, dispatched_at=dispatched_at
+            worktree_path, issue_number=1, live_head_sha=HEAD_SHA, dispatched_at=dispatched_at
         )
         is None
     )
@@ -538,7 +538,7 @@ def test_unpushed_outcome_is_not_completed(tmp_path: Path) -> None:
 
     assert (
         fresh_completed_worker_outcome(
-            worktree_path, live_head_sha=HEAD_SHA, dispatched_at=dispatched_at
+            worktree_path, issue_number=1, live_head_sha=HEAD_SHA, dispatched_at=dispatched_at
         )
         is None
     )
@@ -563,7 +563,7 @@ def test_blocked_outcome_is_not_completed(tmp_path: Path) -> None:
 
     assert (
         fresh_completed_worker_outcome(
-            worktree_path, live_head_sha=HEAD_SHA, dispatched_at=dispatched_at
+            worktree_path, issue_number=1, live_head_sha=HEAD_SHA, dispatched_at=dispatched_at
         )
         is None
     )
@@ -577,24 +577,28 @@ def test_missing_outcome_or_missing_anchor_is_not_completed(tmp_path: Path) -> N
 
     assert (
         fresh_completed_worker_outcome(
-            worktree_path, live_head_sha=HEAD_SHA, dispatched_at=dispatched_at
+            worktree_path, issue_number=1, live_head_sha=HEAD_SHA, dispatched_at=dispatched_at
         )
         is None
     )
     assert (
-        fresh_completed_worker_outcome(None, live_head_sha=HEAD_SHA, dispatched_at=dispatched_at)
+        fresh_completed_worker_outcome(
+            None, issue_number=1, live_head_sha=HEAD_SHA, dispatched_at=dispatched_at
+        )
         is None
     )
 
     _write_worktree_outcome(tmp_path, worktrees_dir, BRANCH, _outcome())
     assert (
         fresh_completed_worker_outcome(
-            worktree_path, live_head_sha=None, dispatched_at=dispatched_at
+            worktree_path, issue_number=1, live_head_sha=None, dispatched_at=dispatched_at
         )
         is None
     )
     assert (
-        fresh_completed_worker_outcome(worktree_path, live_head_sha=HEAD_SHA, dispatched_at=None)
+        fresh_completed_worker_outcome(
+            worktree_path, issue_number=1, live_head_sha=HEAD_SHA, dispatched_at=None
+        )
         is None
     )
 

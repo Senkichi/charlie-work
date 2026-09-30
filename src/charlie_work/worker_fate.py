@@ -38,8 +38,9 @@ call ``classify_for``.
 
 ``FateEvidence.failure`` is supplied by the caller as already-classified
 data — ``resolve_fate`` only ever reads ``FailureEvidence.kind``/
-``throttled_until``, never produces them. ``stale_evidence_events`` reports
-rule 1's ignored evidence. Rule 6's write side is :func:`persist_failure`, the
+``throttled_until``, never produces them. :func:`report_stale_evidence` is the
+one path every ``resolve_fate`` consumer uses to report rule 1's ignored
+evidence (built from ``stale_evidence_events``). Rule 6's write side is :func:`persist_failure`, the
 single primitive every ``dead_worker_failure_kind`` writer goes through
 (``dead_worker_reap``, ``dead_worker_classification``, ``reconcile``); its
 read side feeds the persisted kind back in as ``FateEvidence.failure``
@@ -67,9 +68,14 @@ from typing import Any, Literal
 
 from .config import OrchestratorConfig
 from .process_utils import is_pid_alive as _process_is_pid_alive
+from .instrumentation import log_event
 from .state import (
+    load_state,
+    load_state_locked,
     record_dead_worker_failure_kind,
+    save_state,
     set_throttled_until,
+    state_lock,
 )
 from .state import parse_iso_timestamp as _state_parse_iso_timestamp
 from .throttle_signatures import (
@@ -228,6 +234,9 @@ class FateBasis:
     exit_code: int | None
     stale: tuple[StaleEvidence, ...]
     rule: str  # "R2", "R4-nodispatch", ...: which rule decided
+    # The dispatch epoch the freshness gate ran against; lets a stale-evidence
+    # event carry it for a consumer whose state entry does not (wf-r2-s6).
+    dispatched_at: datetime | None = None
 
 
 # --------------------------------------------------------------------------
@@ -507,6 +516,7 @@ def resolve_fate(evidence: FateEvidence, *, now: datetime) -> WorkerFate:  # noq
             exit_code=fresh.exit_code,
             stale=fresh.stale,
             rule=rule,
+            dispatched_at=evidence.dispatched_at,
         )
 
     # Row 1 (R2): fresh outcome "blocked" beats everything, alive or dead.
@@ -1147,6 +1157,8 @@ def stale_evidence_events(
     basis = fate.basis
     already_reported = set(entry.get("stale_evidence_reported") or ())
     dispatched_at = entry.get("dispatched_at")
+    if dispatched_at is None and basis.dispatched_at is not None:
+        dispatched_at = basis.dispatched_at.isoformat()
     adapter = entry.get("adapter")
     events: list[tuple[str, dict[str, Any]]] = []
     for stale in basis.stale:
@@ -1168,6 +1180,54 @@ def stale_evidence_events(
             )
         )
     return events
+
+
+def report_stale_evidence(state_file: Path, fates: Mapping[int, WorkerFate]) -> None:
+    """Emit ``worker_evidence_stale`` for every fate's not-yet-reported stale
+    evidence, then persist the dedup marker.
+
+    The one reporting path for every ``resolve_fate`` consumer (B6,
+    wf-r2-s6): the orphan sweep's precompute, the live-handoff lane, the
+    dispatch-time phantom-worker lane and the rework-outcome readers all hand
+    their fates here instead of each dropping ``basis.stale`` on the floor.
+
+    Never call this while holding ``state_lock`` -- it takes the lock itself
+    (not reentrant) and emits outside it (CLAUDE.md instrumentation
+    invariant). Callers already inside a lock collect their fates and report
+    after releasing it. Dedup is per ``(source, written_at)`` against the
+    entry's ``stale_evidence_reported`` marker (design doc §5), so re-sweeping
+    the same dead worker every pass emits once; an issue with no state entry
+    still emits (there is nothing to dedup against) but persists no marker.
+    """
+    if not fates:
+        return
+    snapshot = load_state_locked(state_file)
+    pending: dict[int, list[tuple[str, dict[str, Any]]]] = {}
+    for issue_number, fate in fates.items():
+        entry = snapshot.get("issues", {}).get(str(issue_number))
+        events = stale_evidence_events(entry if isinstance(entry, dict) else {}, fate)
+        if events:
+            pending[issue_number] = events
+    if not pending:
+        return
+    for events in pending.values():
+        for kind, payload in events:
+            log_event(
+                state_file,
+                kind,  # event-consumer: audit-only -- always ``worker_evidence_stale`` (the one kind ``stale_evidence_events`` builds); an operator-visibility warning that rule 1 ignored a leftover outcome, with no state mutation keyed off it
+                payload,
+                level="warning",
+            )
+    with state_lock(state_file):
+        locked_state = load_state(state_file)
+        for issue_number in pending:
+            locked_entry = locked_state.get("issues", {}).get(str(issue_number))
+            if not isinstance(locked_entry, dict):
+                continue
+            already = set(locked_entry.get("stale_evidence_reported") or ())
+            already.update(stale_evidence_key(s) for s in fates[issue_number].basis.stale)
+            locked_entry["stale_evidence_reported"] = sorted(already)
+        save_state(state_file, locked_state)
 
 
 def _format_utc_z(moment: datetime) -> str:

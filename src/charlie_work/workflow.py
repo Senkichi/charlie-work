@@ -1762,13 +1762,23 @@ def _detect_and_handle_orphaned_workers(
     if repo_root is not None:
         worktrees_dir = resolved_layout(config, repo_root).worktrees
 
+    live_handoff_fates: dict[int, worker_fate.WorkerFate] = {}
+
+    def _collect_live_handoff_fate(fate: worker_fate.WorkerFate) -> None:
+        live_handoff_fates[fate.basis.issue_number] = fate
+
     stale_live_handoff_pids = collect_stale_live_handoff_pids(  # Issue #1867 round-2
         live_pid_entries,
         worker_outcome_finalize_minutes=config.watchdog.worker_outcome_finalize_minutes,
         repo_root=repo_root,
         worktrees_dir=worktrees_dir,
         now=now,
+        on_fate=_collect_live_handoff_fate,
     )
+    # B6: the live-handoff lane's rule-1 stale evidence, reported before the
+    # early return below (a stale outcome is by definition not a candidate).
+    if not write_gate.dry_run:
+        worker_fate.report_stale_evidence(state_file, live_handoff_fates)
 
     if not orphaned_issues and not stale_live_handoff_pids:
         return
@@ -1839,14 +1849,6 @@ def _detect_and_handle_orphaned_workers(
     # 2-4/6/8/9, so this fate is only reliable for the blocked check (row 1),
     # which needs none of it.
     fates: dict[int, worker_fate.WorkerFate] = {}
-    # B6 (wf-review-opus.md) / design doc §5: rule 1's stale-evidence
-    # events, computed alongside each fate above from the exact same
-    # evidence -- not yet emitted or persisted here; drained right after
-    # this precompute loop, outside the state lock (CLAUDE.md: "events
-    # outside state-lock contexts... call log_event() directly"), with the
-    # dedup marker persisted in its own small locked section immediately
-    # after so the two never drift apart.
-    stale_evidence_by_issue: dict[int, list[tuple[str, dict[str, Any]]]] = {}
     issues_by_number: dict[int, dict[str, Any]] = {}  # also used by the live-handoff lane below
 
     if no_pr_orphans:
@@ -1975,42 +1977,15 @@ def _detect_and_handle_orphaned_workers(
             worker_outcomes[issue_number] = (
                 dict(resolved_outcome.raw) if resolved_outcome is not None else None
             )
-            # B6 (wf-review-opus.md) / design doc §5: not-yet-reported rule-1
-            # stale evidence from this SAME resolve_fate call, deduped
-            # against this entry's own ``stale_evidence_reported`` marker.
-            stale_events = worker_fate.stale_evidence_events(
-                entry if isinstance(entry, dict) else {}, fates[issue_number]
-            )
-            if stale_events:
-                stale_evidence_by_issue[issue_number] = stale_events
 
-        if stale_evidence_by_issue:
-            # Emit outside the lock (CLAUDE.md instrumentation invariant),
-            # matching how this whole precompute loop already reads
-            # terminal/worktree state outside it. Persisting the dedup
-            # marker is a separate, minimal, atomic state-lock section
-            # rather than reaching into either no-PR loop's own ``entry``
-            # -- neither loop's ``entry`` is guaranteed to still be the one
-            # eventually written back to ``state["issues"]`` (see B4,
-            # misc_worker_dispatch.py, for the same caller-side
-            # entry-identity hazard in this file's sibling lane), so this
-            # keeps the dedup write independent of that risk entirely.
-            for issue_number, events in stale_evidence_by_issue.items():
-                for kind, payload in events:
-                    log_event(state_file, kind, payload, level="warning")
-            with state_lock(state_file):
-                locked_state = load_state(state_file)
-                for issue_number, events in stale_evidence_by_issue.items():
-                    locked_entry = locked_state.get("issues", {}).get(str(issue_number))
-                    if not isinstance(locked_entry, dict):
-                        continue
-                    already = set(locked_entry.get("stale_evidence_reported") or ())
-                    new_fate = fates.get(issue_number)
-                    if new_fate is None:
-                        continue
-                    already.update(worker_fate.stale_evidence_key(s) for s in new_fate.basis.stale)
-                    locked_entry["stale_evidence_reported"] = sorted(already)
-                save_state(state_file, locked_state)
+        # B6 (wf-review-opus.md) / design doc §5: rule-1 stale evidence from
+        # every fate above, emitted outside the lock and deduped against each
+        # entry's own ``stale_evidence_reported`` marker by the module's one
+        # reporting path (which persists the marker in its own minimal,
+        # atomic lock section -- neither no-PR loop's ``entry`` is
+        # guaranteed to still be the one eventually written back to
+        # ``state["issues"]``, see B4 in ``misc_worker_dispatch.py``).
+        worker_fate.report_stale_evidence(state_file, fates)
 
         for issue_number in no_pr_orphans:
             issue = issues_by_number.get(issue_number)
@@ -2478,12 +2453,14 @@ def _detect_and_handle_orphaned_workers(
                 "active_labels": active_labels,
             }
 
-    live_handoff_candidates = resolve_live_handoff_candidates(  # Issue #1867
-        stale_live_handoff_pids,
-        pr_by_issue=pr_by_issue,
-        issues_by_number=issues_by_number,
-        gh=gh,
-        config=config,
+    live_handoff_candidates, live_handoff_pr_already_open = (
+        resolve_live_handoff_candidates(  # Issue #1867
+            stale_live_handoff_pids,
+            pr_by_issue=pr_by_issue,
+            issues_by_number=issues_by_number,
+            gh=gh,
+            config=config,
+        )
     )
 
     # Handle orphaned workers. Head-advanced request_changes findings are
@@ -2503,6 +2480,13 @@ def _detect_and_handle_orphaned_workers(
     # ``handle_dead_worker_completed_outcome`` -- extracted per the file-size
     # rule during the #1911 rework.
     outcome_apply_routes: list[tuple[int, int]] = []
+    # B6 (wf-review-opus.md): fates the in-lock rework-outcome readers
+    # resolve, keyed by issue. Their rule-1 stale evidence is reported after
+    # the lock is released (``report_stale_evidence`` takes the lock itself).
+    swept_fates: dict[int, worker_fate.WorkerFate] = {}
+
+    def _collect_swept_fate(fate: worker_fate.WorkerFate) -> None:
+        swept_fates[fate.basis.issue_number] = fate
 
     with state_lock(state_file):
         state = load_state(state_file)
@@ -2572,6 +2556,7 @@ def _detect_and_handle_orphaned_workers(
                     outcome_apply_routes=outcome_apply_routes,
                     pr_orphan_unreviewed_details=pr_orphan_unreviewed_details,
                     drift_fingerprint=_drift_fingerprint,
+                    on_fate=_collect_swept_fate,
                 )
             else:
                 # Issue #935: before reclaim/drift, try to open a PR for a branch
@@ -3046,6 +3031,7 @@ def _detect_and_handle_orphaned_workers(
             pr_by_issue=pr_by_issue,
             sweep_events=sweep_events,
             drift_fingerprint=_drift_fingerprint,
+            pr_already_open=live_handoff_pr_already_open,
         )
 
         state = _append_sweep_events(
@@ -3056,6 +3042,9 @@ def _detect_and_handle_orphaned_workers(
             write_gate=write_gate,
         )
         write_gate.save_state(state)
+
+    if not write_gate.dry_run:
+        worker_fate.report_stale_evidence(state_file, swept_fates)
 
     # Issue #1911: apply each recovered completed outcome through the #1877
     # seam, outside the lock (the helper does network I/O and takes

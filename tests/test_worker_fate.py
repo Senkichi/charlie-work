@@ -932,3 +932,34 @@ def test_throttle_failure_reads_throttle_kinds_off_carrying_variants_only() -> N
     assert isinstance(live, Live)
     assert throttle_failure(live) is None
     assert throttle_failure(None) is None
+
+
+def test_report_stale_evidence_without_a_state_entry_emits_and_persists_nothing(
+    tmp_path,
+) -> None:
+    """B6 (wf-r2-s6): an issue with no state entry still emits (nothing to
+    dedup against) and does not invent an entry; an empty mapping is a no-op."""
+    import json
+
+    from charlie_work.instrumentation import query_events
+    from charlie_work.state import load_state
+    from charlie_work.worker_fate import report_stale_evidence
+
+    state_file = tmp_path / "state.json"
+    fate = resolve_fate(
+        _evidence(worktree_outcome=_outcome(written_at=BEFORE, outcome="blocked")), now=NOW
+    )
+    assert fate.basis.stale
+
+    report_stale_evidence(state_file, {})
+    assert query_events(state_file, kind="worker_evidence_stale") == []
+
+    report_stale_evidence(state_file, {fate.basis.issue_number: fate})
+
+    events = query_events(state_file, kind="worker_evidence_stale")
+    assert len(events) == 1
+    raw = events[0]["payload"]
+    payload = json.loads(raw) if isinstance(raw, str) else raw
+    # No entry to read ``dispatched_at`` from: falls back to the fate basis.
+    assert payload["dispatched_at"] == DISPATCHED.isoformat()
+    assert str(fate.basis.issue_number) not in load_state(state_file)["issues"]

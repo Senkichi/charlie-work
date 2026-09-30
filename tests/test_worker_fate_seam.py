@@ -249,3 +249,114 @@ def test_the_write_guard_allows_clears_and_field_name_tuples() -> None:
         'x = entry.get("dead_worker_failure_kind")',
     ):
         assert _raw_write_lines(ast.parse(source)) == [], source
+
+
+# --------------------------------------------------------------------------
+# Liveness (B6 / wf-r2-s6): a public ``worker_fate`` function nobody outside
+# the module calls is a signal without a consumer -- ``stale_evidence_events``
+# sat in exactly that state (tested, exported, never emitted from three of
+# four ``resolve_fate`` consumers) until ``report_stale_evidence`` wired it.
+# --------------------------------------------------------------------------
+
+
+def _public_function_names(tree: ast.AST) -> set[str]:
+    """Module-level, non-underscore function names defined in ``tree``."""
+    return {
+        node.name
+        for node in getattr(tree, "body", [])
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+        and not node.name.startswith("_")
+    }
+
+
+def _referenced_names(tree: ast.AST) -> set[str]:
+    """Every name ``tree`` references: bare names, attribute names, imports."""
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name):
+            names.add(node.id)
+        elif isinstance(node, ast.Attribute):
+            names.add(node.attr)
+        elif isinstance(node, ast.ImportFrom):
+            names.update(alias.name for alias in node.names)
+    return names
+
+
+def _functions_without_production_caller(fate_source: str, other_sources: list[str]) -> set[str]:
+    """Public functions unreachable from any production reference.
+
+    A function is reachable when another ``src`` module references it, or when
+    a reachable top-level def/class in ``worker_fate.py`` references it (so a
+    helper such as ``stale_evidence_events`` counts once its caller
+    ``report_stale_evidence`` is itself consumed).
+    """
+    fate_tree = ast.parse(fate_source)
+    defs = {
+        node.name: _referenced_names(node)
+        for node in fate_tree.body
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef)
+    }
+    reachable: set[str] = set()
+    for source in other_sources:
+        reachable |= _referenced_names(ast.parse(source))
+    frontier = [name for name in defs if name in reachable]
+    reachable = set(frontier)
+    while frontier:
+        for ref in defs[frontier.pop()]:
+            if ref in defs and ref not in reachable:
+                reachable.add(ref)
+                frontier.append(ref)
+    return _public_function_names(fate_tree) - reachable
+
+
+def _production_sources(root: Path) -> list[str]:
+    return [
+        path.read_text(encoding="utf-8")
+        for path in sorted(root.rglob("*.py"))
+        if path.name != "worker_fate.py"
+    ]
+
+
+def test_every_public_worker_fate_function_has_a_production_caller() -> None:
+    """Every public ``worker_fate`` function is referenced by another ``src``
+    module. The set is derived from the module's own AST, so a new function
+    is covered the moment it is added -- there is no list to keep current.
+    """
+    root = _src_root()
+    fate_source = (root / "worker_fate.py").read_text(encoding="utf-8")
+
+    orphans = _functions_without_production_caller(fate_source, _production_sources(root))
+
+    assert orphans == set(), (
+        "public worker_fate functions with no production caller -- wire them into "
+        f"a consumer or delete them: {sorted(orphans)}"
+    )
+
+
+def test_the_caller_guard_flags_a_function_nobody_calls() -> None:
+    """Positive control: the pre-s6 shape (``stale_evidence_events`` defined and
+    tested but not called by any production consumer) is flagged, while a
+    function reached via attribute access or ``from`` import is not.
+    """
+    fate_source = (
+        "def emit_thing(x): ...\n"
+        "def used_attr(x): ...\n"
+        "def used_import(x): ...\n"
+        "def helper(x): ...\n"
+        "def _private(): ...\n"
+        "def entry(x):\n    return helper(x)\n"
+    )
+    consumers = [
+        "worker_fate.used_attr(1)\nworker_fate.entry(0)",
+        "from .worker_fate import used_import\nused_import(2)",
+    ]
+
+    # ``helper`` is reached transitively through the consumed ``entry``.
+    assert _functions_without_production_caller(fate_source, consumers) == {"emit_thing"}
+    assert _functions_without_production_caller(fate_source, []) == {
+        "emit_thing",
+        "used_attr",
+        "used_import",
+        "helper",
+        "entry",
+    }

@@ -22,6 +22,7 @@ import charlie_work.workflow as _wf
 from charlie_work.dispatch_deferral import records_deferral
 from datetime import UTC, datetime
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any
 
 from charlie_work import worker_fate
@@ -55,6 +56,7 @@ def _route_phantom_live_worker(
     request: SessionRequest,
     full_issue: dict[str, Any],
     sessions_dir: Path,
+    on_fate: Callable[[worker_fate.WorkerFate], None] | None = None,
 ) -> tuple[str, str | None, dict[str, Any]]:
     """Route a phantom ``live_worker_redispatch_averted`` result as dead.
 
@@ -88,6 +90,11 @@ def _route_phantom_live_worker(
     Returns ``(status, dispatched_at, state)``. The status is
     ``"dispatch_failed"`` so the caller's entry-building frees the slot;
     ``dispatched_at`` is ``None`` because no worker was actually launched.
+
+    The caller holds ``state_lock`` (and ``report_stale_evidence`` takes it
+    itself), so each resolved fate is handed to ``on_fate`` instead of
+    reported here; the caller reports rule 1's stale evidence (B6) once it
+    has released the lock.
     """
     issue_number = request.issue_number
 
@@ -167,6 +174,8 @@ def _route_phantom_live_worker(
             ),
             now=datetime.now(UTC),
         )
+        if on_fate is not None:
+            on_fate(fate)
         # Rule 1/2 (design doc §8, step B5): preserve for salvage when the
         # resolved fate is `Stranded` (local-only commits) -- a fresh
         # `blocked` declaration now resolves to `fate=Blocked` (rule 2:

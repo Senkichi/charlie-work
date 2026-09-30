@@ -408,8 +408,10 @@ def test_live_pid_stale_outcome_pr_create_failed_emits_stranded_drift_once(
 ) -> None:
     """A failed ``gh pr create`` on the live-PID finalize lane surfaces as
     the fingerprinted ``pr_create_failed_branch_stranded`` drift -- emitted
-    once per unchanged finding, retried on the next sweep, status stays
-    ``dispatched`` so the next pass re-attempts."""
+    once per unchanged finding; status stays ``dispatched``. Since N4
+    (wf-r2-s6) the outcome is stamped routed, so this lane does not re-attempt
+    the create on the next pass -- the dead-PID lane (#935) does, once the PID
+    exits."""
     from charlie_work.paths import resolved_layout, runtime_paths
     from charlie_work.state import load_state
     from charlie_work.workflow import _detect_and_handle_orphaned_workers
@@ -594,4 +596,169 @@ def test_live_pid_finalize_honors_workflow_patch_of_open_pr_helper(tmp_path: Pat
 
     assert open_pr.call_count == 1
     assert open_pr.call_args.kwargs["branch"] == branch
+    assert fake_gh.prs_created == []
+
+
+# ---------------------------------------------------------------------------
+# wf-r2-s6 / N4: once the live-PID lane has routed an outcome it must not
+# re-collect it, so the pre-lock early return fires again instead of paying
+# ``gh.pr_list()`` and a state lock on every pass until the PID exits.
+# ---------------------------------------------------------------------------
+
+_ROUTED_KEY = "live_handoff_routed_outcome_at"
+_ISSUE = 1867
+_BRANCH = "agent/issue-1867-stale-outcome-live-pid"
+
+
+def _live_handoff_bed(tmp_path: Path, *, pr_create_return, existing_pr: bool):
+    """Repo + seeded dispatched issue + a stale declared-push outcome + fake gh."""
+    from charlie_work.paths import resolved_layout, runtime_paths
+    from charlie_work.worktree import worktree_path_for_branch
+
+    config = _config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    repo_root = _make_repo_with_pushed_branch(tmp_path, _BRANCH)
+    _seed_dispatched_issue(paths, issue_number=_ISSUE, branch=_BRANCH)
+
+    worktrees_dir = resolved_layout(config, repo_root).worktrees
+    worktree_path = worktree_path_for_branch(repo_root, _BRANCH, worktrees_dir)
+    outcome_path = _write_outcome(
+        worktree_path, {"push_succeeded": True, "pr_created": False}, age_seconds=3600
+    )
+
+    fake_gh = _fake_gh(
+        repo_root,
+        issue_number=_ISSUE,
+        in_progress=config.labels.in_progress,
+        pr_create_return=pr_create_return,
+    )
+    if existing_pr:
+        fake_gh.prs = [
+            {
+                "number": 7777,
+                "title": "Existing PR",
+                "headRefName": _BRANCH,
+                "state": "OPEN",
+                "body": f"Closes #{_ISSUE}",
+                "isCrossRepository": False,
+            }
+        ]
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    return config, paths, fake_gh, sessions_dir, outcome_path
+
+
+def _live_sweep(config, paths, fake_gh, sessions_dir) -> int:
+    """One orphan-sweep pass with the PID alive; returns how many times
+    ``gh.pr_list()`` was called during it."""
+    from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+    with (
+        patch.object(fake_gh, "pr_list", wraps=fake_gh.pr_list) as pr_list_spy,
+        patch("charlie_work.workflow._worker_pid_alive", return_value=True),
+    ):
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
+    return pr_list_spy.call_count
+
+
+def test_routed_live_handoff_is_not_recollected_and_early_return_fires(tmp_path: Path) -> None:
+    """N4 (wf-review-opus.md): a live PID whose fresh declared-push outcome has
+    already been routed -- PR already open, or PR create failed -- must not be
+    a candidate on the next pass, so the second pass never calls ``pr_list``.
+    Before the routed-outcome marker both scenarios re-collected on every pass
+    until the PID exited.
+    """
+    for scenario, pr_create_return, existing_pr in (
+        ("pr_already_open", 9001, True),
+        ("pr_create_failed", None, False),
+    ):
+        root = tmp_path / scenario
+        root.mkdir()
+        config, paths, fake_gh, sessions_dir, _outcome = _live_handoff_bed(
+            root, pr_create_return=pr_create_return, existing_pr=existing_pr
+        )
+
+        first = _live_sweep(config, paths, fake_gh, sessions_dir)
+        second = _live_sweep(config, paths, fake_gh, sessions_dir)
+
+        assert first >= 1, scenario
+        assert second == 0, f"{scenario}: routed outcome was re-collected"
+
+
+def test_new_outcome_write_rearms_live_handoff(tmp_path: Path) -> None:
+    """A newer ``.worker-outcome.json`` write is a new fact: the marker (the
+    routed outcome's mtime) no longer matches, so the lane runs again."""
+    from charlie_work.state import load_state
+
+    config, paths, fake_gh, sessions_dir, outcome_path = _live_handoff_bed(
+        tmp_path, pr_create_return=None, existing_pr=False
+    )
+
+    # A failed create re-lists PRs while retrying, so "ran" is ``>= 1`` calls.
+    assert _live_sweep(config, paths, fake_gh, sessions_dir) >= 1
+    assert _live_sweep(config, paths, fake_gh, sessions_dir) == 0
+    marker_before = load_state(paths.state_file)["issues"][str(_ISSUE)][_ROUTED_KEY]
+
+    rewritten = time.time() - 1800
+    os.utime(outcome_path, (rewritten, rewritten))
+
+    assert _live_sweep(config, paths, fake_gh, sessions_dir) >= 1
+    marker_after = load_state(paths.state_file)["issues"][str(_ISSUE)][_ROUTED_KEY]
+    assert marker_after != marker_before
+    assert _live_sweep(config, paths, fake_gh, sessions_dir) == 0
+
+
+def test_pr_already_open_candidate_is_stamped_routed(tmp_path: Path) -> None:
+    """A candidate dropped because a PR already exists is stamped with the
+    outcome file's mtime -- the marker is what stops the re-collection."""
+    from datetime import UTC, datetime
+
+    from charlie_work.state import load_state
+
+    config, paths, fake_gh, sessions_dir, outcome_path = _live_handoff_bed(
+        tmp_path, pr_create_return=9001, existing_pr=True
+    )
+
+    _live_sweep(config, paths, fake_gh, sessions_dir)
+
+    entry = load_state(paths.state_file)["issues"][str(_ISSUE)]
+    assert entry["status"] == "dispatched"
+    assert (
+        entry[_ROUTED_KEY]
+        == datetime.fromtimestamp(outcome_path.stat().st_mtime, tz=UTC).isoformat()
+    )
+    assert fake_gh.prs_created == []
+
+
+def test_live_handoff_stale_outcome_emits_worker_evidence_stale(tmp_path: Path) -> None:
+    """B6 (wf-r2-s6): the live-handoff lane resolves a fate per live PID too, and
+    a leftover outcome older than this dispatch must surface as a
+    ``worker_evidence_stale`` warning -- once, deduped by the entry's marker."""
+    import json
+    from datetime import UTC, datetime, timedelta
+
+    from charlie_work.instrumentation import query_events
+    from charlie_work.state import load_state
+
+    config, paths, fake_gh, sessions_dir, _outcome = _live_handoff_bed(
+        tmp_path, pr_create_return=9001, existing_pr=False
+    )
+    # Re-dispatched 5 minutes ago; the seeded outcome is an hour old.
+    dispatched_at = (datetime.now(UTC) - timedelta(minutes=5)).isoformat().replace("+00:00", "Z")
+    _seed_dispatched_issue(paths, issue_number=_ISSUE, branch=_BRANCH, dispatched_at=dispatched_at)
+
+    assert _live_sweep(config, paths, fake_gh, sessions_dir) == 0
+    assert _live_sweep(config, paths, fake_gh, sessions_dir) == 0
+
+    stale = query_events(paths.state_file, kind="worker_evidence_stale")
+    assert len(stale) == 1
+    assert stale[0]["level"] == "warning"
+    raw = stale[0]["payload"]
+    payload = json.loads(raw) if isinstance(raw, str) else raw
+    assert payload["issue_number"] == _ISSUE
+    assert payload["reason"] == "older_than_dispatch"
+    assert payload["dispatched_at"] == dispatched_at
+    assert load_state(paths.state_file)["issues"][str(_ISSUE)]["stale_evidence_reported"]
     assert fake_gh.prs_created == []

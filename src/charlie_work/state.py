@@ -1098,6 +1098,10 @@ def clear_dead_worker_failure_kind(entry: dict[str, Any]) -> None:
     entry.pop("dead_worker_failure_kind", None)
     entry.pop("dead_worker_failure_classified_at", None)
     entry.pop("throttle_reap_rearm_count", None)
+    # wf-r2-s6 (N4): the live-handoff routing marker is per dispatch epoch
+    # too -- it records the outcome-file mtime the live lane already routed,
+    # and a new dispatch's outcome is a new fact.
+    entry.pop("live_handoff_routed_outcome_at", None)
 
 
 def _reviewer_quota(data: dict[str, Any]) -> dict[str, Any]:

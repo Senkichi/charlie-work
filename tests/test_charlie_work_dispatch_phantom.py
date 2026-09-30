@@ -804,3 +804,110 @@ def test_dispatch_phantom_live_worker_preserves_sidecar_for_blocked_outcome(
     assert payload["removed_labels"] == []
     assert payload["added_ready"] is False
     assert payload["worker_fate"] == "Blocked"
+
+
+def test_dispatch_phantom_stale_outcome_emits_worker_evidence_stale(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """B6 (wf-r2-s6): the dispatch-time phantom-worker lane resolves a fate too.
+    A ``.worker-outcome.json`` older than the phantom worker's start is ignored
+    by rule 1 and must surface as a ``worker_evidence_stale`` warning. The lane
+    resolves inside ``state_lock``, so the report happens after the lock is
+    released -- this proves it is emitted at all, and once.
+    """
+    import os
+
+    from charlie_work.config import WORKER_OUTCOME_FILENAME
+    from charlie_work.instrumentation import query_events
+
+    worktree_path = tmp_path / "wt"
+    worktree_path.mkdir(parents=True, exist_ok=True)
+    outcome_path = worktree_path / WORKER_OUTCOME_FILENAME
+    outcome_path.write_text(
+        json.dumps({"push_succeeded": True, "pr_created": False}), encoding="utf-8"
+    )
+    # Written well before the sidecar's ``started_at`` (2026-08-10T11:15:39Z).
+    before_start = datetime(2026, 8, 1, tzinfo=UTC).timestamp()
+    os.utime(outcome_path, (before_start, before_start))
+
+    def _fake_launch(issue_number, branch, prompt_text, **kwargs):
+        return ClaudeWorkerRecord(
+            issue_number=issue_number,
+            branch=branch,
+            worktree_path=str(worktree_path),
+            prompt_path=str(worktree_path / ".orchestrator-prompt.md"),
+            command=("claude", "-p"),
+            pid=7373,
+            started_at="2026-08-10T11:15:39Z",
+            log_path=str(tmp_path / "log"),
+            error="probe_error",
+            failure_kind="live_worker_redispatch_averted",
+            process_start_time=4_567_890.0,
+        )
+
+    monkeypatch.setattr("charlie_work.claude_code.launch_claude_worker", _fake_launch)
+    monkeypatch.setattr("charlie_work.workflow.is_pid_alive", lambda pid, start: False)
+    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda pid, start: False)
+
+    config = OrchestratorConfig(worker=WorkerRoleConfig(harness="claude-code"))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.pr_list = lambda: []
+    _original_issue_view = fake_gh.issue_view
+
+    def _patched_issue_view(number: int):
+        issue = _original_issue_view(number)
+        return {
+            **issue,
+            "labels": [{"name": "automated-ready"}, {"name": "agent:in-progress"}],
+        }
+
+    fake_gh.issue_view = _patched_issue_view
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    (sessions_dir / "issue-123.claude.json").write_text(
+        json.dumps(
+            {
+                "issue_number": 123,
+                "branch": "agent/issue-123-fix-search",
+                "worktree_path": str(worktree_path),
+                "prompt_path": "",
+                "command": ["claude", "-p"],
+                "pid": 7373,
+                "started_at": "2026-08-10T11:15:39Z",
+                "log_path": str(tmp_path / "log"),
+                "error": "probe_error",
+                "failure_kind": "live_worker_redispatch_averted",
+                "process_start_time": 4_567_890.0,
+                "session_id": "test-session-7373",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    seed = load_state(paths.state_file)
+    seed["issues"]["123"] = {
+        "number": 123,
+        "status": "dispatched",
+        "branch_name": "agent/issue-123-fix-search",
+        "worker_pid": 7373,
+        "worker_process_start_time": 4_567_890.0,
+        "title": "Fix search",
+        "url": "https://example.test/issues/123",
+    }
+    save_state(paths.state_file, seed)
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    result = app.dispatch(limit=1)
+
+    assert result.data["phantom_live_worker_count"] == 1, repr(result.data)
+    stale = query_events(paths.state_file, kind="worker_evidence_stale")
+    assert len(stale) == 1
+    assert stale[0]["level"] == "warning"
+    raw = stale[0]["payload"]
+    payload = json.loads(raw) if isinstance(raw, str) else raw
+    assert payload["issue_number"] == 123
+    assert payload["reason"] == "older_than_dispatch"
+    assert payload["source"] == "worktree"
+    assert load_state(paths.state_file)["issues"]["123"]["stale_evidence_reported"]
