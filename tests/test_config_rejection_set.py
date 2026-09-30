@@ -32,6 +32,7 @@ import types
 import typing
 from collections.abc import Mapping
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -460,7 +461,19 @@ def _changed(cfg: typing.Any) -> list[tuple[str, str, str]]:
     return rows
 
 
+# Defaults such as dispatch.host_load_max_pytest_trees derive from os.cpu_count(), and a
+# cell's hash is its diff against the default config -- so an unpinned count makes the
+# hash host-dependent (a 4-CPU runner's default of 2 trees erased the "<- 2" probe's diff).
+# The fixture was recorded on a 16-CPU host; recording and replay both pin to it.
+RECORDED_CPU_COUNT = 16
+
+
 def code_of(raw: dict) -> str:
+    with mock.patch("os.cpu_count", return_value=RECORDED_CPU_COUNT):
+        return _code_of(raw)
+
+
+def _code_of(raw: dict) -> str:
     try:
         cfg = build_config_from_data(copy.deepcopy(raw))
     except (ValueError, TypeError):
