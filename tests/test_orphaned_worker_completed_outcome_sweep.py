@@ -2,8 +2,9 @@
 
 Split out of ``tests/test_charlie_work_orphaned_worker_sweep.py`` during the
 #1911 rework: that file crossed the 800-line file-size cap. A dead devin
-rework session never gets a terminal-status record (only claude_code's
-launch path runs ``start_terminal_status_watcher``), so
+rework session can have no terminal-status record -- the watcher writes it
+only once the spawned process exits, so an orchestrator restart mid-session
+leaves none (and pre-#2052 devin launches wrote none at all) -- so
 ``terminal_exit_code`` is None even when the session completed, pushed, and
 wrote a fresh, on-target ``.worker-outcome.json``. Before crediting a worker
 death, the sweep must route that outcome into the #1877 apply path
@@ -29,11 +30,13 @@ from charlie_work.state import (
 
 
 # ---------------------------------------------------------------------------
-# Issue #1911: a dead devin rework session never gets a terminal-status record
-# (only claude_code's launch path runs start_terminal_status_watcher), so
-# ``terminal_exit_code`` is None even when the session completed, pushed, and
-# wrote a fresh, on-target .worker-outcome.json. Before crediting a worker
-# death, the sweep must route that outcome into the #1877 apply path.
+# Issue #1911: a dead devin rework session can have no terminal-status record
+# (since #2052 devin launches do run start_terminal_status_watcher, but it
+# only writes once the process exits -- an orchestrator restart mid-session
+# leaves none), so ``terminal_exit_code`` is None even when the session
+# completed, pushed, and wrote a fresh, on-target .worker-outcome.json.
+# Before crediting a worker death, the sweep must route that outcome into
+# the #1877 apply path.
 # ---------------------------------------------------------------------------
 
 
@@ -64,8 +67,8 @@ def test_orphaned_worker_fresh_outcome_without_terminal_record_is_not_a_death(
             "pr_body": "Closes #207\n\nCorrected PR body per review.",
         },
     )
-    # No terminal-status file in sessions_dir -- the devin launch path never
-    # writes one.
+    # No terminal-status file in sessions_dir -- the watcher-never-ran shape
+    # (e.g. orchestrator restart mid-session).
 
     with patch.object(rework_outcome, "remote_branch_head_sha", lambda *_a: "abc123"):
         _run_orphan_sweep(tmp_path, paths, config, fake_gh)

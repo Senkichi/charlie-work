@@ -1666,6 +1666,8 @@ def _detect_and_handle_orphaned_workers(
     *,
     write_gate: WriteGate,
     review_callback: Callable[[int], Any] | None = None,
+    record_review_callback: Callable[..., Any] | None = None,
+    enrich_checks_callback: Callable[..., list[dict[str, Any]]] | None = None,
     fleet_dir_override: str | None = None,
 ) -> None:
     """Detect and handle orphaned workers using state.json PID records.
@@ -1686,8 +1688,8 @@ def _detect_and_handle_orphaned_workers(
       dispatched this worker) and head is unchanged since review, reset to
       "rework_requested" -- same as the request_changes branch (issue #1109)
     - Issue #1911: before either reset, when no terminal-status record exists
-      (``terminal_exit_code is None`` -- the normal shape for devin-shell
-      sessions, which never get a watcher), a fresh on-target
+      (``terminal_exit_code is None`` -- e.g. a session whose watcher never
+      ran, or one launched before every Popen-backed harness grew one), a fresh on-target
       ``.worker-outcome.json`` in the worktree proves the dispatch completed;
       its PR edits are applied through the #1877 outcome-apply path instead
       of crediting a worker death. Issue #1915: once that apply lands, the
@@ -2304,12 +2306,11 @@ def _detect_and_handle_orphaned_workers(
         )
     )
 
-    # Handle orphaned workers. Head-advanced request_changes findings are
-    # collected and routed to the review lane outside the state lock (review()
-    # itself acquires the lock and may call transition()).
+    # Orphan findings are routed to the review lane / no-op drain (#2034)
+    # outside the state lock (review() takes it and may call transition()).
     review_routes: list[orphaned_worker_review_drain.OrphanedWorkerReviewRoute] = []
-    # Issue #654: dead dispatched workers time-escalated inside the lock
-    # collected here for the post-lock transition() call (network I/O).
+    no_op_routes: list[orphaned_worker_review_drain.NoOpReworkRoute] = []
+    # Issue #654: time-escalated dead workers; transition() (network I/O) runs post-lock.
     reap_escalations: list[int] = []
     # Issue #1911: (issue_number, pr_number) pairs whose dead worker left a
     # fresh, on-target .worker-outcome.json despite no terminal record.
@@ -2391,6 +2392,7 @@ def _detect_and_handle_orphaned_workers(
                     repo_root=repo_root,
                     worktrees_dir=worktrees_dir,
                     review_routes=review_routes,
+                    no_op_routes=no_op_routes,
                     outcome_apply_routes=outcome_apply_routes,
                     pr_orphan_unreviewed_details=pr_orphan_unreviewed_details,
                     drift_fingerprint=_drift_fingerprint,
@@ -2902,21 +2904,19 @@ def _detect_and_handle_orphaned_workers(
         write_gate=write_gate,
     )
 
-    # Route head-advanced request_changes findings -- and, since issue
-    # #1915, completed-outcome findings whose apply pass landed -- to the
-    # review lane outside the state lock. The drain (per-route exception
-    # guard, the completed-outcome apply gate, the reviewing /
-    # rework_requested / drift-fingerprint dispositions, and the
-    # rework_requested label transitions) lives in
-    # ``orphaned_worker_review_drain`` -- extracted per the file-size rule
-    # during the #1915 rework.
-    orphaned_worker_review_drain.drain_orphaned_worker_review_routes(
+    orphaned_worker_review_drain.drain_orphaned_worker_routes(
         review_routes,
+        no_op_routes,
         review_callback=review_callback,
+        record_review_callback=record_review_callback,
+        enrich_checks_callback=enrich_checks_callback,
         gh=gh,
         config=config,
         state_file=state_file,
         write_gate=write_gate,
+        sessions_dir=sessions_dir,
+        repo_root=repo_root,
+        worktrees_dir=worktrees_dir,
     )
 
     # Issue #654: apply the ``escalated`` label edge for dead dispatched
@@ -4282,8 +4282,11 @@ class OrchestratorApp:
             and ``escalation_deferred_live_worker`` (issue #2051: the janitor
             cap router deferred the escalation because a live worker still
             holds the issue -- no packet and no routing; the worker may still
-            be committing). See ``_route_rework_candidate_to_review`` and the
-            dead-worker orphan sweep for the canonical gating pattern.
+            be committing). A refused janitor-gate return also carries
+            ``is_no_op_rework`` -- True only when the unchanged-diff
+            no-op gate caused the refusal (issue #2034). See
+            ``_route_rework_candidate_to_review`` and the dead-worker orphan
+            sweep for the canonical gating pattern.
         """
         pr = self.gh.pr_view(pr_number)
         if not pr:
@@ -5392,6 +5395,9 @@ class OrchestratorApp:
                     "janitor_failures": list(verdict.failures),
                     "janitor_warnings": list(verdict.warnings),
                     "checks_unavailable": checks is None,
+                    # Issue #2034: True only when the unchanged-diff no-op gate
+                    # caused this refusal -- the no-op drain's discriminator.
+                    "is_no_op_rework": verdict.is_no_op_rework,
                 },
             )
         pr_dir = self.paths.prs / f"pr-{pr_number}"
