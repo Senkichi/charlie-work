@@ -62,18 +62,21 @@ def hb():
 # --- github_body_scan.py -----------------------------------------------------
 
 
-def test_flip_github_body_scan_unbounded_fence_indent() -> None:
-    """FLIP: was a captured range covering the 4-space-indented ``` lines
-    (the old `_FENCE_OPEN_RE` tolerated any amount of leading whitespace and
-    treated a 4-space-indented ``` line as a fence opener); now, wired onto
-    `markdown_fence.scan`, `_fenced_block_ranges` returns no range at all.
-    CommonMark bounds fence-open indent to 0-3 spaces, so a 4+-space-indented
-    ``` never opens a fence (it's an indented code block, or, lacking a
-    preceding blank line, a lazy paragraph continuation).
+def test_github_body_scan_fence_indent_is_container_tolerant() -> None:
+    """NOT a flip (md-r2 review B1): `_fenced_block_ranges` is an
+    *exclusion* guard, so it keeps the old any-indent tolerance for fence
+    openers/closers by scanning with `markdown_fence.scan(max_indent=None)`.
+    `scan` has no list-item container, and inside a list item CommonMark
+    re-bases content to the item's content column, so a 4+-space-indented
+    ``` under `1. ` / `- ` IS a fence. The top-level 0-3 bound would
+    under-approximate the quoted region and let `Blocked by #N` inside it
+    become a live blocker. (For a top-level over-indented ``` this
+    over-approximates -- the fail-safe direction for an exclusion guard.)
     """
     text = "prose before\n    ```\n    #999 inside over-indented fence\n    ```\nprose after\n"
 
-    assert _fenced_block_ranges(text) == []
+    ((start, end),) = _fenced_block_ranges(text)
+    assert text[start:end] == "    ```\n    #999 inside over-indented fence\n"
 
 
 def test_flip_github_body_scan_backtick_in_info_string_opens_fence() -> None:
@@ -386,15 +389,15 @@ def test_flip_heartbeat_check_tilde_fence_unsupported_leaks_mention(hb) -> None:
 # --- github_prose_dependencies.py --------------------------------------------
 
 
-def test_flip_github_prose_dependencies_blockquote_unbounded_indent() -> None:
-    """FLIP: was `True` (the old `_is_blockquote_line` stripped all leading
-    spaces/tabs before checking for `>`, so a `>` preceded by any amount of
-    indentation -- including 4+ spaces -- counted as a blockquote line); now,
-    wired onto `markdown_fence.is_blockquote_marker`, a 5-space-indented `>`
-    line returns `False`. CommonMark bounds a blockquote marker's indent to
-    0-3 spaces (4+ makes it an indented code block instead, where `>` is
-    just a literal character).
+def test_github_prose_dependencies_blockquote_is_container_tolerant() -> None:
+    """NOT a flip (md-r2 review B1): `_is_blockquote_line` is an *exclusion*
+    guard, so it keeps the old any-indent tolerance
+    (`is_blockquote_marker(max_indent=None)`). A `>` indented 4+ columns
+    under a list item is a real blockquote (CommonMark re-bases list-item
+    content), and the shared scan has no list-item container to say so.
     """
     line = "     > deeply indented quote (5 spaces)"
 
-    assert _is_blockquote_line(line) is False
+    assert _is_blockquote_line(line) is True
+    assert _is_blockquote_line("\t> tab-indented quote") is True
+    assert _is_blockquote_line("not > a quote") is False

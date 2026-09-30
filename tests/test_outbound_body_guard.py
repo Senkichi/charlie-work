@@ -147,8 +147,9 @@ def test_other_fences_are_still_scanned() -> None:
 
 def test_example_secret_masking_not_desynced_by_bare_cr() -> None:
     """A bare ``\\r`` not part of a ``\\r\\n`` pair is its own line break
-    under ``str.splitlines()`` (what the ``markdown_fence.scan`` fence
-    indices are computed against) but not under a naive ``split("\\n")``.
+    under ``markdown_fence.split_lines`` (what the ``markdown_fence.scan``
+    fence indices are computed against) but not under a naive
+    ``split("\\n")``.
     Regression: masking used to line-split with ``split("\\n")`` while
     consuming ``scan``'s line-indexed fence span, desyncing the two on such
     input -- silently dropping a real secret that follows the exempt fence
@@ -203,11 +204,42 @@ def test_example_secret_masking_not_desynced_by_unicode_line_separator() -> None
     line break let ` ```example-secret ` open its own line and pair with
     the trailing ``` as an exempt fence, masking the key.
     """
-    body = f"prose ```example-secret\n{_AWS}\n```\n"
+    body = f"prose\u2028```example-secret\n{_AWS}\n```\n"
     matches = scan_outbound_text(body, part="body")
     assert any(m.rule_id == "aws-access-token" for m in matches), (
         "real credential was masked as if inside an exempt example-secret fence"
     )
+
+
+@pytest.mark.parametrize(
+    "closer",
+    ["\t```", " \t```", "    ```", "\t\t```"],
+    ids=["tab", "space-tab", "four-spaces", "two-tabs"],
+)
+def test_example_secret_exemption_ends_at_an_over_indented_closer(closer: str) -> None:
+    """Regression for md-r2 re-review B2: an ``example-secret`` fence is an
+    author's claim that its content is a fake example. ``markdown_fence.scan``
+    is strict CommonMark, so a closer indented 4+ columns (a tab, four
+    spaces) does not close the fence and the exempt region would run on to
+    the next ``` -- masking a REAL credential written after the author
+    visibly closed the block. The mask must end at the earliest lenient
+    closer (same char, >= opener length, any indent), as the pre-branch
+    character-counting closer regex did."""
+    body = f"```example-secret\nfake\n{closer}\n{_AWS}\n```\n"
+    matches = scan_outbound_text(body, part="body")
+    assert any(m.rule_id == "aws-access-token" for m in matches), (
+        "real credential after a visibly closed example-secret fence was masked"
+    )
+
+
+def test_example_secret_exemption_still_masks_content_before_lenient_closer() -> None:
+    """Control: the fake key INSIDE the fence is still exempt when the
+    closer is over-indented, and a correctly closed fence is unchanged."""
+    inside = f"```example-secret\n{_AWS}\n\t```\nprose\n"
+    assert scan_outbound_text(inside, part="body") == ()
+    normal = f"```example-secret\n{_AWS}\n```\n{_GHP}\n"
+    rule_ids = {m.rule_id for m in scan_outbound_text(normal, part="body")}
+    assert rule_ids == {"github-pat"}
 
 
 def test_match_reports_part_and_line() -> None:

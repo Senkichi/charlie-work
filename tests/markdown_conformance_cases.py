@@ -99,9 +99,9 @@ CASES: tuple[ConformanceCase, ...] = (
     ),
     ConformanceCase(
         name="fence_after_unicode_line_separator_is_not_split",
-        markdown="prose ```example-secret\nAKIAZ7Q3XK2PLM4RT5WN\n```\n",
+        markdown="prose\u2028```example-secret\nAKIAZ7Q3XK2PLM4RT5WN\n```\n",
         # U+2028 LINE SEPARATOR is not a CommonMark line ending (only \n,
-        # \r\n, \r are), so line 0 is "prose ```example-secret" as ONE
+        # \r\n, \r are), so line 0 is "prose\u2028```example-secret" as ONE
         # line -- a `` ``` `` that doesn't open the line is not a fence
         # delimiter at all, just paragraph text. Line 2's ``` (the ONLY
         # real line break is the \n after "...RT5WN") then opens its own

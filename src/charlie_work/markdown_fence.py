@@ -55,6 +55,7 @@ __all__ = [
     "MIN_FENCE_LENGTH",
     "fence_for",
     "fenced_block",
+    "find_fence_close",
     "FenceSpan",
     "Heading",
     "MarkdownStructure",
@@ -112,12 +113,12 @@ def fenced_block(text: str, info: str = "") -> str:
 # marker_indent` rejects it; see its docstring -- adversarial review finding
 # B3, architecture-deepening candidate 3) and backtick-in-info-string
 # exclusion, with `cross_repo_gate`'s same-char/length-aware closer search
-# folded in as one shared subroutine (`_find_fence_close`), used only for a
+# folded in as one shared subroutine (`find_fence_close`), used only for a
 # *valid* opener: a rejected opener (backtick fence, backtick in its info
 # string) is not a fence at all under CommonMark, so it is treated as an
 # ordinary line and scanning resumes immediately on the next line -- it does
 # not search for or consume a "closer" (adversarial review finding B1;
-# `_find_fence_close`'s docstring explains the narrower design this
+# `find_fence_close`'s docstring explains the narrower design this
 # replaced).
 #
 # Deliberately out of scope (`tests/markdown_conformance_cases.py`'s own
@@ -201,7 +202,7 @@ def split_lines(text: str, *, keepends: bool = False) -> list[str]:
     return lines
 
 
-def _leading_indent_columns(line: str) -> tuple[int, int]:
+def _leading_indent_columns(line: str, limit: int | None = 3) -> tuple[int, int]:
     """Return ``(columns, chars)`` for ``line``'s leading run of spaces and
     tabs: the CommonMark *column* width of that run, and how many
     characters it takes up.
@@ -212,8 +213,9 @@ def _leading_indent_columns(line: str) -> tuple[int, int]:
     columns) would attribute to it, wrongly admitting up to three tabs (12
     columns) as if they were "0-3 spaces" (adversarial review finding B3,
     architecture-deepening candidate 3). Stops at the first non-space/tab
-    character, or as soon as the running total exceeds 3 columns -- nothing
-    further can matter once CommonMark's 0-3-column bound is already blown.
+    character, or as soon as the running total exceeds ``limit`` columns --
+    nothing further can matter once the bound is already blown. ``limit=None``
+    consumes the whole run (container-tolerant mode; see :func:`scan`).
     """
     columns = 0
     chars = 0
@@ -225,25 +227,31 @@ def _leading_indent_columns(line: str) -> tuple[int, int]:
         else:
             break
         chars += 1
-        if columns > 3:
+        if limit is not None and columns > limit:
             break
     return columns, chars
 
 
-def _strip_marker_indent(line: str) -> str | None:
+def _strip_marker_indent(line: str, max_indent: int | None = 3) -> str | None:
     """Strip ``line``'s leading indent and return the remainder, or
-    ``None`` when that indent is 4+ CommonMark columns wide.
+    ``None`` when that indent is wider than ``max_indent`` CommonMark
+    columns.
 
-    A 4+-column indent makes the line an indented code block under
-    CommonMark, never a fence/blockquote/heading marker, regardless of how
-    many literal space/tab *characters* precede it -- see
-    :func:`_leading_indent_columns`. Every marker check in :func:`scan`
-    (fence delimiter, blockquote marker, ATX heading) and in
-    :func:`_find_fence_close` goes through this first, so all four share
+    With the default ``max_indent=3``: a 4+-column indent makes the line an
+    indented code block under CommonMark, never a fence/blockquote/heading
+    marker, regardless of how many literal space/tab *characters* precede
+    it -- see :func:`_leading_indent_columns`. Every marker check in
+    :func:`scan` (fence delimiter, blockquote marker, ATX heading) and in
+    :func:`find_fence_close` goes through this first, so all four share
     one indent rule and cannot drift from each other.
+
+    ``max_indent=None`` never rejects (container-tolerant mode): inside a
+    list item CommonMark re-bases content to the item's content column, so
+    a fence or ``>`` indented 4+ columns under ``1. `` / ``- `` IS still a
+    fence or blockquote, and this module does not model list items.
     """
-    columns, chars = _leading_indent_columns(line)
-    if columns > 3:
+    columns, chars = _leading_indent_columns(line, max_indent)
+    if max_indent is not None and columns > max_indent:
         return None
     return line[chars:]
 
@@ -313,9 +321,13 @@ class MarkdownStructure:
         return any(line in fence for fence in self.fences)
 
 
-def is_blockquote_marker(line: str) -> bool:
+def is_blockquote_marker(line: str, *, max_indent: int | None = 3) -> bool:
     """True if ``line`` opens with a CommonMark blockquote marker (0-3
     leading indent *columns*, tab stops of 4, then ``>``).
+
+    ``max_indent=None`` accepts any leading indent: the container-tolerant
+    mode for *exclusion* guards (see :func:`scan`), where a ``>`` nested
+    under a list item is still a quote.
 
     A single-line primitive for consumers (e.g. ``github_prose_dependencies.
     _is_blockquote_line``) that only need the boolean for one line at a
@@ -324,14 +336,24 @@ def is_blockquote_marker(line: str) -> bool:
     with :func:`scan` so the two can never drift on what counts as a
     blockquote marker.
     """
-    stripped = _strip_marker_indent(line)
+    stripped = _strip_marker_indent(line, max_indent)
     return stripped is not None and _BLOCKQUOTE_RE.match(stripped) is not None
 
 
-def _find_fence_close(lines: list[str], start: int, char: str, length: int) -> int | None:
+def find_fence_close(
+    lines: list[str],
+    start: int,
+    char: str,
+    length: int,
+    max_indent: int | None = 3,
+) -> int | None:
     """Return the line index of the first valid closer for a ``char``-fence
     opened with a delimiter run of ``length``, searching from ``start``, or
     ``None`` if none exists before end-of-text.
+
+    Public so a masking consumer (``outbound_body_guard``) can ask for the
+    *lenient* closer (``max_indent=None``) alongside :func:`scan`'s strict
+    one, keeping the closer rule in one place.
 
     Only ever called for a *valid* opener (:func:`scan` treats a rejected
     one -- a backtick fence whose info string itself contains a backtick --
@@ -339,11 +361,12 @@ def _find_fence_close(lines: list[str], start: int, char: str, length: int) -> i
     :func:`scan`'s own comment). Each candidate closer line's indent is
     checked with the same :func:`_strip_marker_indent` fence/blockquote/
     heading share, so a closer over-indented past 0-3 columns (e.g. tab-
-    indented) is correctly skipped rather than accepted.
+    indented) is correctly skipped rather than accepted. ``max_indent=None``
+    accepts a closer at any indent (the lenient closer; see :func:`scan`).
     """
     close_re = re.compile(rf"^{re.escape(char)}{{{length},}}[ \t]*$")
     for index in range(start, len(lines)):
-        stripped = _strip_marker_indent(lines[index])
+        stripped = _strip_marker_indent(lines[index], max_indent)
         if stripped is not None and close_re.match(stripped):
             return index
     return None
@@ -357,8 +380,21 @@ def _strip_atx_closing_run(text: str) -> str:
     return text
 
 
-def scan(text: str) -> MarkdownStructure:
+def scan(text: str, *, max_indent: int | None = 3) -> MarkdownStructure:
     """Scan ``text`` and return its CommonMark block-level structure.
+
+    ``max_indent`` bounds the leading indent (in columns) of fence openers,
+    fence closers and blockquote markers; ATX headings always keep the
+    0-3 bound. The default (3) is CommonMark's top-level rule and is the
+    right model for *masking* consumers (``outbound_body_guard``), where
+    over-approximating a quoted region hides a real credential.
+    ``max_indent=None`` is the container-tolerant mode for *exclusion*
+    guards (``github_body_scan``): this scan has no list-item container, and
+    inside a list item content is re-based to the item's content column, so
+    a fence or ``>`` indented 4+ columns under ``1. `` / ``- `` is still a
+    fence or blockquote. Exclusion guards fail safe by over-approximating
+    quoted regions, so they pass ``None``; every other rule (same-char,
+    length, info-string) is unchanged.
 
     Implements: 0-3-column indent bound (tab stops of 4) on fence/
     blockquote/heading markers; backtick- and tilde-fence support; a closer
@@ -379,9 +415,10 @@ def scan(text: str) -> MarkdownStructure:
     index = 0
     while index < line_count:
         stripped = _strip_marker_indent(lines[index])
+        container_stripped = _strip_marker_indent(lines[index], max_indent)
 
-        if stripped is not None:
-            delimiter = _FENCE_DELIM_RE.match(stripped)
+        if container_stripped is not None:
+            delimiter = _FENCE_DELIM_RE.match(container_stripped)
             if delimiter is not None:
                 run, info = delimiter.group(1), delimiter.group(2).strip()
                 char, length = run[0], len(run)
@@ -394,7 +431,7 @@ def scan(text: str) -> MarkdownStructure:
                     # (adversarial review finding B1).
                     index += 1
                     continue
-                close_at = _find_fence_close(lines, index + 1, char, length)
+                close_at = find_fence_close(lines, index + 1, char, length, max_indent)
                 end = close_at + 1 if close_at is not None else line_count
                 fences.append(
                     FenceSpan(
@@ -409,11 +446,12 @@ def scan(text: str) -> MarkdownStructure:
                 index = end
                 continue
 
-            if _BLOCKQUOTE_RE.match(stripped):
+            if _BLOCKQUOTE_RE.match(container_stripped):
                 quoted.add(index)
                 index += 1
                 continue
 
+        if stripped is not None:
             heading_match = _ATX_HEADING_RE.match(stripped)
             if heading_match is not None:
                 level = len(heading_match.group(1))

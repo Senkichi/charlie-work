@@ -336,11 +336,17 @@ def _line_start_offsets(text: str) -> list[int]:
 def _fenced_block_ranges(text: str) -> list[tuple[int, int]]:
     """Return the ``(start, end)`` char-offset ranges of fenced code blocks.
 
-    Delegates the actual scanning to ``markdown_fence.scan`` (CommonMark
-    block-level fence rules: 0-3 space/tab indent bound, backtick/tilde
-    support, closer same-char and >= opener length, no backtick in a
-    backtick fence's info string, unclosed fence runs to end-of-text) and
-    converts its line-indexed ``FenceSpan``s to this module's char-offset
+    Delegates the actual scanning to ``markdown_fence.scan`` in its
+    container-tolerant mode (``max_indent=None``: CommonMark block-level
+    fence rules -- backtick/tilde support, closer same-char and >= opener
+    length, no backtick in a backtick fence's info string, unclosed fence
+    runs to end-of-text -- but with any leading indent accepted). This is an
+    *exclusion* guard: a fence nested under a list item (``1. step`` then a
+    4-space-indented fence) is still a fence, and ``scan`` has no
+    list-item container to re-base its indent, so the top-level 0-3 bound
+    would under-approximate the quoted region and let ``Blocked by #N``
+    inside it become a live blocker (architecture-deepening candidate 3,
+    re-review md-r2 B1). Converts its line-indexed ``FenceSpan``s to this module's char-offset
     convention. Each returned range spans from the start of the opening
     fence line up to (excluding) the closing fence line, so any content line
     between the fences is contained in the range -- this differs from
@@ -348,7 +354,7 @@ def _fenced_block_ranges(text: str) -> list[tuple[int, int]]:
     line IS part of a ``FenceSpan``), so a closed fence's end offset here is
     the *start* of ``FenceSpan.end - 1`` rather than of ``FenceSpan.end``.
     """
-    structure = markdown_fence.scan(text)
+    structure = markdown_fence.scan(text, max_indent=None)
     if not structure.fences:
         return []
     offsets = _line_start_offsets(text)
@@ -442,7 +448,7 @@ def _scan_blocker_sections(text: str) -> tuple[list[int], bool]:
     stay in sync with ``structure``'s (adversarial review finding B2,
     architecture-deepening candidate 3).
     """
-    structure = markdown_fence.scan(text)
+    structure = markdown_fence.scan(text, max_indent=None)
     heading_text_by_line = {heading.line: heading.text for heading in structure.headings}
     refs: list[int] = []
     unreadable = False

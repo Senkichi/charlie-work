@@ -943,13 +943,13 @@ def check_orchestrator_config(report: Report, repo: RepoInfo) -> None:
 # `docs/superpowers/plans/2026-09-29-architecture-deepening.md`)
 #
 # `charlie_work.markdown_fence.scan` is the shared CommonMark-correct scan
-# side seven hand-rolled fence/blockquote/heading scanners across the repo
-# should eventually converge on (full inventory: `md-recon.md`, wave A
-# scratchpad). This script cannot import it -- it is deliberately
-# stdlib-only (see the module docstring and `scripts/README.md:50-51`), with
-# exactly one narrow, already-documented exception
-# (`charlie_work.event_kinds`, loaded via `heartbeat_event_alarms.py`) that
-# this is not. So this is a genuine duplicate, not a reuse: the same
+# side that the seven consumers in `src/charlie_work/` are wired onto (full
+# inventory: `md-recon.md`, wave A scratchpad). This script cannot import
+# it -- it is deliberately stdlib-only (see the module docstring and
+# `scripts/README.md:50-51`), with two narrow, documented, guarded
+# exceptions (`charlie_work.event_kinds` via `heartbeat_event_alarms.py`,
+# and the `notify_digest*` leaves, #1859) that this is not. So this is a
+# genuine duplicate, not a reuse: the same
 # algorithm, reimplemented from scratch against the same
 # `tests/markdown_conformance_cases.py` ground-truth table
 # (`tests/test_markdown_conformance.py` runs that table against both).
@@ -1047,7 +1047,7 @@ def _md_find_fence_close(lines: list[str], start: int, char: str, length: int) -
     """First line index >= start closing a ``char``-fence opened at ``length``.
 
     Only ever called for a *valid* opener -- see `_scan_markdown_structure`.
-    See `charlie_work.markdown_fence._find_fence_close`, which this mirrors
+    See `charlie_work.markdown_fence.find_fence_close`, which this mirrors
     exactly, including the per-candidate-line indent check.
     """
     close_re = re.compile(rf"^{re.escape(char)}{{{length},}}[ \t]*$")

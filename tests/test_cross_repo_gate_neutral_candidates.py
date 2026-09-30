@@ -408,6 +408,24 @@ def test_references_and_see_also_headings_also_neutral(tmp_path: Path) -> None:
         assert result.referenced_paths == ()
 
 
+def test_atx_heading_closing_run_still_counts_as_citation_heading(tmp_path: Path) -> None:
+    """Deliberate behavior delta from wiring onto `markdown_fence.scan`
+    (md-r2 review N7): the optional ATX closing `#` run is stripped, so
+    `## References ##` renders as the heading text "References" and is a
+    citation heading -- paths under it are neutral. The old hand-rolled
+    heading regex kept the trailing ` ##` in the text and so flagged them."""
+    repo = tmp_path / "repo"
+    _init_git_repo_with_var_gitignore(repo)
+    foreign_path = "other-repo/docs/analysis.json"
+    body = f"## References ##\n\n- {foreign_path}\n"
+
+    result = cross_repo_gate(body, repo)
+
+    assert result.passed is True
+    assert result.neutral_paths == (foreign_path,)
+    assert result.referenced_paths == ()
+
+
 def test_provenance_marker_word_alone_neutralizes(tmp_path: Path) -> None:
     """Issue #1583 fix part 2: ``provenance`` and ``origin`` were added to
     ``_EVIDENCE_MARKER_RE``. A candidate introduced by ``provenance:`` in

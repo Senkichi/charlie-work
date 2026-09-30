@@ -141,6 +141,21 @@ def _mask_example_secret_fences(text: str) -> str:
         if fence.info != _EXAMPLE_FENCE_INFO:
             continue
         end = fence.end if fence.closed else len(contents)
+        # Masking is the fail-OPEN side: an ``example-secret`` fence is an
+        # author's claim that its content is a fake example, so the exempt
+        # region must be the smallest plausible one. ``scan`` is strict
+        # CommonMark (a closer indented 4+ columns, e.g. tab-indented, does
+        # not close), but an author who visibly closed the block (a
+        # tab-indented ``` line) is not vouching for what follows it. End the
+        # mask at the earlier of scan's closer and the first lenient closer
+        # (same char, >= opener length, any leading indent) -- the closer
+        # rule stays in ``markdown_fence.find_fence_close`` (re-review md-r2
+        # B2).
+        lenient_close = markdown_fence.find_fence_close(
+            contents, fence.start + 1, fence.char, fence.length, max_indent=None
+        )
+        if lenient_close is not None:
+            end = min(end, lenient_close + 1)
         for i in range(fence.start, end):
             contents[i] = ""
     return "".join(content + terminator for content, terminator in zip(contents, terminators))

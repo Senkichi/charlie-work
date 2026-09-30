@@ -23,6 +23,8 @@ Both implementations expose the same shape (`.fenced_line_spans`,
 
 from __future__ import annotations
 
+import ast
+from pathlib import Path
 from typing import Protocol
 
 import pytest
@@ -75,3 +77,39 @@ def test_both_implementations_are_independent_objects(hb: object) -> None:
     callables would become the exact same function object.
     """
     assert hb._scan_markdown_structure is not markdown_fence.scan
+
+
+def test_heartbeat_check_never_imports_markdown_fence() -> None:
+    """Enforces the stdlib-only property (`scripts/README.md:50-51`) by
+    inspecting `heartbeat_check.py`'s imports, which the function-identity
+    test above cannot: a thin wrapper around `markdown_fence.scan` would
+    pass that test. No script may import `charlie_work.markdown_fence`."""
+    scripts_dir = Path(__file__).resolve().parent.parent / "scripts"
+    offenders: list[str] = []
+    for script in sorted(scripts_dir.glob("*.py")):
+        tree = ast.parse(script.read_text(encoding="utf-8"), filename=str(script))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                names = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                base = node.module or ""
+                names = [base] + [f"{base}.{alias.name}" for alias in node.names]
+            else:
+                continue
+            if any("markdown_fence" in name for name in names):
+                offenders.append(f"{script.name}:{node.lineno}")
+    assert offenders == []
+
+
+def test_fence_inside_blockquote_is_a_documented_gap(scan: _Scanner) -> None:
+    """Known, deliberate gap (md-r2 review N6): a fenced block *inside* a
+    blockquote is CommonMark structure (`> ```), but neither scan models
+    blockquote containers -- each `>` line is just a quoted line and no
+    FenceSpan is produced. No consumer is weakened: exclusion guards treat
+    every `>` line as quoted, and the masking guard fails closed (nothing is
+    exempted). This pins the gap so closing it is a visible, intentional
+    change rather than a silent one."""
+    structure = scan("> ```\n> x\n> ```\n")
+
+    assert structure.fenced_line_spans == ()
+    assert tuple(sorted(structure.quoted_lines)) == (0, 1, 2)
