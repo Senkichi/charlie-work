@@ -414,7 +414,7 @@ class _FakePsutilProc:
         self.info = info
 
 
-def test_win32_process_ppid_snapshot_maps_psutil_rows(
+def test_win32_process_ppid_snapshot_normalizes_single_result(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Rows come from one ``psutil.process_iter`` pass: pid, ppid, and the
