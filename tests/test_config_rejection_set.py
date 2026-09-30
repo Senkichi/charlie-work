@@ -505,3 +505,13 @@ def test_whole_config_cases_unchanged(recorded):
         if not same(recorded["cases"].get(name, "?"), code_of(raw))
     ]
     assert not bad, "\n".join(bad)
+
+
+def test_every_live_config_path_has_a_recorded_row(recorded):
+    """A knob added after the migration must be recorded against origin/main's source
+    (see the ``review_exec_rejection_max_resumes`` and ``global_max_concurrent_reviews``
+    rows), not silently left outside the matrix. Replay only iterates recorded targets,
+    so without this guard a new key is invisible to the rejection-set signal."""
+    live = {t["id"] for t in walk_targets()}
+    missing = sorted(live - set(recorded["targets"]))
+    assert not missing, f"config paths absent from the rejection matrix fixture: {missing}"

@@ -1428,6 +1428,10 @@
 "fleet.global_max_concurrent_reviews": [
 "fleet",
 "global_max_concurrent_reviews"
+],
+"review_dispatch.review_exec_rejection_max_resumes": [
+"review_dispatch",
+"review_exec_rejection_max_resumes"
 ]
 },
 "seeds": {
@@ -1814,7 +1818,8 @@
 "supervisor.dependency_sync_starvation_seconds": {},
 "supervisor.fleet_lane_concurrency": {},
 "supervisor.reap_sweep_interval_seconds": {},
-"fleet.global_max_concurrent_reviews": {}
+"fleet.global_max_concurrent_reviews": {},
+"review_dispatch.review_exec_rejection_max_resumes": {}
 },
 "cells": {
 "labels": [
@@ -16829,6 +16834,50 @@
 "A5b84",
 "R",
 "A2180",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R"
+],
+"review_dispatch.review_exec_rejection_max_resumes": [
+"A23f6",
+"R",
+"R",
+"A83b5",
+"A9966",
+"R",
+"Ad751",
 "R",
 "R",
 "R",

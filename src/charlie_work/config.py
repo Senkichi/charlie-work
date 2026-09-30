@@ -2469,8 +2469,10 @@ class OrchestratorConfig:
     ] = field(default_factory=RunnerScalingConfig)
     # Host-wide (#600, #763): one physical machine, so a per-repo layer must not hold its
     # own opinion. ``ci_fleet``'s own ``__post_init__`` owns the remaining rules
-    # (per-repo ceilings, affinity); ``NotNull`` keeps ``key: null`` rejected on the four
-    # fields it cannot compare against ``None`` (they raised ``TypeError`` before).
+    # (per-repo ceilings, affinity), including ``key: null`` on the four fields it cannot
+    # compare against ``None``: that ``TypeError`` becomes a ``ConstructionError``, which the
+    # #665 layered rescue re-raises (a use-site ``NotNull`` would make it a rescuable
+    # ``FieldError`` and silently discard the global layer -- cfg review R2-B1).
     runner_allocation: Annotated[
         RunnerAllocationConfig,
         HostWideOnly,
@@ -2481,10 +2483,6 @@ class OrchestratorConfig:
             min_running_per_repo=(Typed, NonNeg),
             demand_idle_samples=(Typed, NonNeg),
             max_runs_scanned=(Typed, NonNeg),
-            reserved_threads=NotNull,
-            threads_per_slot=NotNull,
-            max_running_heavy=NotNull,
-            max_running_per_repo=NotNull,
         ),
         Check(_runner_floors_agree),
     ] = field(default_factory=RunnerAllocationConfig)

@@ -358,7 +358,7 @@ def test_supervisor_config_self_deploy_failure_alarm_wrong_type_raises(tmp_path:
 
     Issue #817 item 5 added this field alongside the existing supervisor int
     fields; the supervisor section has its own manual int-type-validation
-    tuple in config.py (separate from the generic _build_section machinery),
+    tuple in config.py (separate from the generic validate_section machinery),
     which needed the new key added explicitly. Locks that in so a future
     refactor of the tuple can't silently drop validation for this field.
     """
@@ -383,7 +383,7 @@ def test_supervisor_config_zero_pass_alarm_wrong_type_raises(tmp_path: Path) -> 
 
     Issue #855 added this field alongside the existing supervisor int
     fields; the supervisor section has its own manual int-type-validation
-    tuple in config.py (separate from the generic _build_section machinery),
+    tuple in config.py (separate from the generic validate_section machinery),
     which needed the new key added explicitly -- mirrors
     test_supervisor_config_self_deploy_failure_alarm_wrong_type_raises.
     Locks that in so a future refactor of the tuple can't silently drop
@@ -411,7 +411,7 @@ def test_supervisor_config_dependency_sync_starvation_wrong_type_raises(
 
     Issue #1855 added this field alongside the existing supervisor int
     fields; the supervisor section has its own manual int-type-validation
-    tuple in config.py (separate from the generic _build_section machinery),
+    tuple in config.py (separate from the generic validate_section machinery),
     which needed the new key added explicitly -- mirrors
     test_supervisor_config_self_deploy_failure_alarm_wrong_type_raises.
     Locks that in so a future refactor of the tuple can't silently drop

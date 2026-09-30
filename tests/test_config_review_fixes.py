@@ -86,6 +86,13 @@ def test_layered_null_keeps_both_layers(tmp_path: Path) -> None:
     [
         # ci_fleet ``__post_init__`` ValueError (mapping instead of [[repo, n]] pairs).
         "runner_allocation:\n  enabled: true\n  max_running_per_repo: {a/b: 1}\n",
+        # R2-B1: a null on a field ci_fleet's ``__post_init__`` cannot compare used to be
+        # caught by a use-site ``NotNull`` as a plain (rescuable) FieldError. Main raised the
+        # construction TypeError, which the rescue re-raises -- keep it that way.
+        "runner_allocation:\n  enabled: true\n  max_running_per_repo:\n",
+        "runner_allocation:\n  enabled: true\n  threads_per_slot:\n",
+        "runner_allocation:\n  enabled: true\n  reserved_threads:\n",
+        "runner_allocation:\n  enabled: true\n  max_running_heavy:\n",
     ],
 )
 def test_broken_host_wide_section_in_global_layer_is_not_rescued(
@@ -103,3 +110,26 @@ def test_unknown_key_in_global_layer_is_still_rescued(tmp_path: Path) -> None:
     )
     config = load_layered_config(repo, repo_config, fleet_dir_override=fleet)
     assert [Path(s).name for s in config.sources] == ["orchestrator.config.yaml"]
+
+
+# R2-B2 (design F3): main crashed with a raw TypeError/AttributeError on these shapes, which
+# the #665 rescue never saw; every rejection is now a ``ConfigError`` so the rescue covers them
+# like any other bad global layer. One layered pin per class keeps that flip documented.
+@pytest.mark.parametrize(
+    "global_yaml",
+    [
+        pytest.param("claude_code:\n  command: 5\n", id="command-template-non-string"),
+        pytest.param("worker:\n  harness: [a]\n", id="harness-non-string"),
+        pytest.param("review:\n  human_decision_markers:\n", id="not-null-tuple-key-null"),
+        pytest.param("dispatch:\n  1: 2\n", id="non-string-section-key"),
+        pytest.param("fleet_supervisor:\n  1: 3\n", id="non-string-host-wide-section-key"),
+        pytest.param("rescue:\n  reviewer:\n    a: b\n", id="rescue-role-mapping-unknown-key"),
+    ],
+)
+def test_former_raw_crash_shapes_are_now_rescued_like_any_bad_global_layer(
+    tmp_path: Path, global_yaml: str
+) -> None:
+    repo, repo_config, fleet = _layers(tmp_path, global_yaml, "dispatch:\n  default_limit: 2\n")
+    config = load_layered_config(repo, repo_config, fleet_dir_override=fleet)
+    assert [Path(s).name for s in config.sources] == ["orchestrator.config.yaml"]
+    assert config.dispatch.default_limit == 2

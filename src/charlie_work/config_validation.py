@@ -13,8 +13,10 @@ Design notes that are easy to get wrong:
 
 * A field with NO rule-bearing marker is not checked at all (its current
   laxness is preserved); any rule-bearing marker turns on the base-type check.
-* ``key: null`` is treated as "key absent": the dataclass default applies and
-  no marker runs (also for required keys, which then report ``missing``).
+* ``key: null`` is preserved as ``None`` (design P2): no marker runs on it and the
+  default does NOT apply, because a falsy ``None`` differs from a default ``True``.
+  ``NullIsDefault`` opts a key into the default instead (where main normalized it),
+  ``NotNull`` rejects it, and a required key still reports ``missing``.
 * ``bool`` is an ``int`` in Python; ``int``/``number`` fields reject it unless
   the field carries ``BoolTolerant`` (a legacy tolerance, preserved per key).
 * ``ConfigError`` lives here so section modules can raise it without the

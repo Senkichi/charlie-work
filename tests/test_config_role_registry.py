@@ -251,7 +251,7 @@ def test_build_config_from_data_devin_adapter_is_rejected_as_unknown_key() -> No
     """``devin.adapter`` used to soft-deprecate into ``worker.harness`` via
     the now-deleted dual-accept bridge (role-config Phase 2 Track E); with
     that bridge gone and ``DevinConfig.adapter`` itself deleted, it falls
-    straight through to ``_build_section``'s generic unknown-key rejection."""
+    straight through to ``validate_section``'s generic unknown-key rejection."""
     with pytest.raises(
         ConfigError,
         match=r"^devin: expected known keys \(valid: .*\), got unknown key\(s\) adapter$",
@@ -263,7 +263,7 @@ def test_build_config_from_data_worker_model_tier_key_is_rejected() -> None:
     """``dispatch.worker_model_tier`` was a pure deletion (Phase 2 Task 2, no
     migration target), not a dual-accept rename -- so its presence is no
     longer a soft deprecation warning. It falls straight through to
-    ``_build_section``'s generic unknown-key rejection, same as any other
+    ``validate_section``'s generic unknown-key rejection, same as any other
     key a section's dataclass doesn't declare."""
     with pytest.raises(
         ConfigError,
@@ -303,7 +303,7 @@ def test_build_config_from_data_unknown_worker_key_still_raises_configerror() ->
 
 def test_build_config_from_data_invalid_worker_harness_is_rejected() -> None:
     """Harness membership validation moved from the deleted dual-accept
-    resolver to the top-level ``worker = _build_section(...)`` call site
+    resolver to the top-level ``worker = validate_section(...)`` call site
     (role-config Phase 2 Track E); this pins the relocated check so a future
     refactor cannot silently drop it."""
     with pytest.raises(

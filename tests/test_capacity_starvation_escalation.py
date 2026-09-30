@@ -4,7 +4,7 @@ Extracted from ``tests/test_fleet_dispatch.py`` and ``tests/test_config.py``
 so new test code does not land in an over-cap monolith (file-size ratchet,
 issue #1442). Covers:
 
-* Config validation (``parse_runner_capacity_escalation`` / ``load_config``)
+* Config validation (``validate_section`` / ``load_config``)
 * Detector unit tests (edge trigger, sustained window, recovery, dry-run,
   disabled, no-slack-budget)
 * Operator-digest surface (``_build_fleet_attention_digest``)
