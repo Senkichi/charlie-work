@@ -41,7 +41,7 @@ FIXTURE = Path(__file__).parent / "fixtures" / "config_rejection_matrix.json"
 
 PROBES: list[tuple[str, object]] = [
     ("none", None), ("true", True), ("false", False), ("0", 0), ("1", 1), ("-1", -1),
-    ("2", 2), ("1.5", 1.5), ("-0.5", -0.5), ("inf", math.inf), ("nan", math.nan),
+    ("2", 2), ("1.5", 1.5), ("0.5", 0.5), ("-0.5", -0.5), ("inf", math.inf), ("nan", math.nan),
     ("empty", ""), ("blank", "  "), ("x", "x"), ("ab", "a b"), ("../x", "../x"),
     ("/abs", "/abs"), ("oldest", "oldest"), ("warn", "warn"), ("http", "http"),
     ("off", "off"), ("front", "front_of_train"), ("codex", "codex"),

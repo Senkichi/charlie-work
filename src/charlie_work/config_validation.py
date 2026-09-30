@@ -252,6 +252,34 @@ class _Coerced(Marker):
     kinds: ClassVar[frozenset[str] | None] = frozenset({"str"})  # element kind of seq_str
 
 
+@dataclass(frozen=True, init=False)
+class CommandTemplate(Marker):
+    """Legacy command-template field: a list is ``str()``-coerced to a tuple; a truthy value
+    must then be a string or tuple whose parts only use ``allowed`` placeholders.  A falsy
+    value (``""``, ``0``, ``{}``) passes through untouched (preserved per key)."""
+
+    allowed: frozenset[str]
+    checks_type: ClassVar[bool] = False
+
+    def __init__(self, allowed: Iterable[str]) -> None:
+        object.__setattr__(self, "allowed", frozenset(allowed))
+
+    def apply(self, value: Any, path: str) -> Any:
+        if isinstance(value, list):
+            value = tuple(str(elem) for elem in value)
+        if not value:
+            return value
+        if not isinstance(value, (str, tuple)):
+            raise FieldError(path, "string or list of strings", value, "type")
+        rule = Placeholders(self.allowed)
+        parts = (value,) if isinstance(value, str) else value
+        for i, part in enumerate(parts):
+            found = rule.problem(part)
+            if found is not None:
+                raise FieldError(path if isinstance(value, str) else f"{path}[{i}]", *found)
+        return value
+
+
 @dataclass(frozen=True)
 class Note(Marker):
     """Parenthetical appended to the ``expected`` clause of any failure on the field."""
@@ -378,6 +406,11 @@ def field_specs(cls: type) -> tuple[FieldSpec, ...]:
     return tuple(specs)
 
 
+def field_rules(cls: type, name: str) -> dict[str, tuple[Marker, ...]]:
+    """Use-site ``FieldRules`` declared on ``cls.name`` (for the nested section's fields)."""
+    return _rules_of(field_markers(cls, name))
+
+
 def field_markers(cls: type, name: str) -> tuple[Marker, ...]:
     """Annotation markers on one field (e.g. ``HostWideOnly`` on an OrchestratorConfig field)."""
     hint = typing.get_type_hints(cls, include_extras=True)[name]
@@ -498,7 +531,14 @@ def _coerce(spec: FieldSpec, markers: tuple[Marker, ...], value: Any, path: str)
                 raise FieldError(sub_path, "mapping", sub, "type")
             built[str(name)] = validate_section(spec.item, sub, path=sub_path)  # type: ignore[arg-type]
         return MappingProxyType(built) if spec.mapping_factory == "proxy" else built
+    command = next((m for m in markers if isinstance(m, CommandTemplate)), None)
+    if command is not None:
+        return command.apply(value, path)
     coerced = next((m for m in markers if isinstance(m, _Coerced)), None)
+    if coerced is not None and kind == "map_str":
+        if isinstance(value, Mapping):
+            return {str(k): str(v) for k, v in value.items()}
+        raise FieldError(path, "mapping of env-var names to values", value, "type")
     if coerced is not None and kind == "seq_str":
         if _is_seq(value):
             return tuple(str(elem) for elem in value)
@@ -569,6 +609,8 @@ def validate_section(
     for spec in specs:
         value = raw.get(spec.name)
         markers = spec.markers + tuple(rules.get(spec.name, ()))
+        if value is None and LenientMapping in markers and spec.name in raw:
+            value = {}  # legacy: ``key: null`` on a lenient nested section builds a bare one
         if value is None:
             if NotNull in markers and spec.name in raw:
                 raise FieldError(f"{path}.{spec.name}", "a value", "null", "raw")
@@ -645,8 +687,8 @@ def run_section_hooks(config: Any) -> None:
 
 __all__ = [
     "AtLeastOne", "BoolTolerant", "Check", "ConfigError", "FieldError", "FieldRules",
-    "Coerced", "CoercedLenient", "Finite", "Ge", "Gt", "HostWideOnly", "InRange", "LenientMapping", "Marker",
+    "Coerced", "CoercedLenient", "CommandTemplate", "Finite", "Ge", "Gt", "HostWideOnly", "InRange", "LenientMapping", "Marker",
     "NonEmpty", "NonEmptyRaw", "NonNeg", "NotNull", "Note", "OneOf", "Placeholders", "Positive", "Regex", "RelativePath", "Typed",
-    "field_markers", "field_specs", "host_wide_error", "host_wide_sections", "render_got",
+    "field_markers", "field_rules", "field_specs", "host_wide_error", "host_wide_sections", "render_got",
     "run_section_hooks", "unknown_sections_error", "validate_section",
 ]  # fmt: skip

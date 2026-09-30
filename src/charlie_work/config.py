@@ -39,14 +39,23 @@ from .config_validation import (
     BoolTolerant,
     Coerced,
     CoercedLenient,
+    CommandTemplate,
+    FieldError,
+    FieldRules,
     Finite,
+    InRange,
+    LenientMapping,
     NonEmpty,
     NonEmptyRaw,
     NonNeg,
     NotNull,
     OneOf,
+    Positive,
+    Regex,
     RelativePath,
     Typed,
+    field_rules,
+    run_section_hooks,
     validate_section,
 )
 
@@ -1075,7 +1084,7 @@ class InfraBlockedConfig:
     #: Case-insensitive annotation substrings (matched against each
     #: annotation's ``message``) that indicate an infrastructure/billing
     #: block rather than a code failure. Kept in config per issue #1383.
-    annotation_patterns: tuple[str, ...] = (
+    annotation_patterns: Annotated[tuple[str, ...], Coerced] = (
         "the job was not started",
         "actions budget is preventing further use",
         "no runner matching",
@@ -1101,12 +1110,12 @@ class AutoMergeConfig:
     # for single-operator repos, ["--auto"] for merge-queue/auto-merge flows).
     # Placeholder-free passthrough, validated to start with "--". Default empty
     # preserves current behavior. Takes precedence over the legacy `admin` field.
-    merge_flags: tuple[str, ...] = ()
+    merge_flags: Annotated[tuple[str, ...], Coerced] = ()
     # Post-merge branch deletion is best-effort and can never abort the
     # merge/label sequence (the local-worktree failure mode seen on one operator host).
     delete_branch: bool = True
     require_approved_review: bool = True
-    required_checks: tuple[str, ...] = ()
+    required_checks: Annotated[tuple[str, ...], CoercedLenient] = ()
     # After this many consecutive approved-but-unmergeable passes, emit a
     # merge_failed_attempt_alarm event and warning. 0 disables the alarm.
     failed_attempt_alarm: Annotated[int, Typed, BoolTolerant] = 3
@@ -1143,7 +1152,7 @@ class AutoMergeConfig:
     #   current review decision is request_changes, escalated, or blocked are
     #   still skipped.
     # - "off": never update open PR branches.
-    update_branch_strategy: str = "front_of_train"
+    update_branch_strategy: Annotated[str, NotNull] = "front_of_train"
     # Legacy alias for update_branch_strategy. Kept for backward compatibility.
     # When set, it is normalized and mapped to update_branch_strategy.
     #   true / "all"  -> "broadcast"
@@ -1210,17 +1219,11 @@ class AutoMergeConfig:
             elif isinstance(raw_legacy, str):
                 legacy_value = raw_legacy.lower()
                 if legacy_value not in legacy_to_strategy:
-                    raise ConfigError(
-                        "config section 'auto_merge' key 'update_open_prs' must be "
-                        "'all', 'next', 'off', or a boolean, "
-                        f"got {raw_legacy!r}"
+                    raise FieldError(
+                        "update_open_prs", "'all', 'next', 'off', or a boolean", raw_legacy
                     )
             else:
-                raise ConfigError(
-                    "config section 'auto_merge' key 'update_open_prs' must be "
-                    "a string or boolean, "
-                    f"got {type(raw_legacy).__name__}"
-                )
+                raise FieldError("update_open_prs", "string or bool", raw_legacy, "type")
             object.__setattr__(self, "update_open_prs", legacy_value)
             object.__setattr__(self, "update_branch_strategy", legacy_to_strategy[legacy_value])
         else:
@@ -1230,25 +1233,46 @@ class AutoMergeConfig:
             elif isinstance(raw_strategy, str):
                 strategy = raw_strategy.lower()
             else:
-                raise ConfigError(
-                    "config section 'auto_merge' key 'update_branch_strategy' must be "
-                    f"a string or boolean, got {type(raw_strategy).__name__}"
-                )
+                raise FieldError("update_branch_strategy", "string or bool", raw_strategy, "type")
             if strategy not in strategy_to_legacy:
-                raise ConfigError(
-                    "config section 'auto_merge' key 'update_branch_strategy' must be "
-                    f"'front_of_train', 'broadcast', or 'off', got {self.update_branch_strategy!r}"
+                raise FieldError(
+                    "update_branch_strategy",
+                    "one of 'front_of_train', 'broadcast', 'off'",
+                    self.update_branch_strategy,
                 )
             object.__setattr__(self, "update_branch_strategy", strategy)
             object.__setattr__(self, "update_open_prs", strategy_to_legacy[strategy])
 
+        # Normalizations (not rules): the label/login thread verbatim into
+        # `gh pr edit --add-label <label>` / a commit-author comparison, so surrounding
+        # whitespace must not survive; the wedge window is stored as a float.
+        for name in ("mergequeue_label", "queue_bot_login"):
+            value = getattr(self, name)
+            if isinstance(value, str):
+                object.__setattr__(self, name, value.strip())
+        if isinstance(self.mergequeue_wedge_hours, (int, float)):
+            object.__setattr__(self, "mergequeue_wedge_hours", float(self.mergequeue_wedge_hours))
+
+    def validate(self, config: OrchestratorConfig) -> None:
+        """Cross-field rules, run once the whole config exists."""
         if self.require_current_base and self.update_branch_strategy == "off":
-            raise ConfigError(
-                "config section 'auto_merge': require_current_base=True with "
-                "update_branch_strategy='off' creates a permanent merge deadlock: the base "
-                "must be current but the branch is never synced. Set "
-                "require_current_base: false, or set update_branch_strategy to 'front_of_train' or 'broadcast'."
+            raise FieldError(
+                "require_current_base",
+                "false when update_branch_strategy is 'off' (a permanent merge deadlock: the "
+                "base must be current but the branch is never synced); set "
+                "require_current_base: false, or update_branch_strategy to 'front_of_train' "
+                "or 'broadcast'",
+                self.require_current_base,
             )
+        # Each flag must start with "--" and must not be one the orchestrator manages
+        # itself (strategy flags merge_pr appends; branch deletion is handled separately).
+        # Normalize by splitting on '=' to catch --flag=value forms.
+        for i, flag in enumerate(self.merge_flags or ()):
+            if not str(flag).startswith("--"):
+                raise FieldError(f"merge_flags[{i}]", "flag starting with '--'", flag)
+        for i, flag in enumerate(self.merge_flags or ()):
+            if str(flag).split("=", 1)[0] in ORCHESTRATOR_MANAGED_MERGE_FLAGS:
+                raise FieldError(f"merge_flags[{i}]", "flag not managed by the orchestrator", flag)
 
 
 @dataclass(frozen=True)
@@ -1374,11 +1398,11 @@ class RuntimeConfig:
     # fast at 30s, not tie up a retry attempt for two minutes. Calls with a
     # legitimately long response (large paginated lists) use
     # gh_long_call_timeout_seconds instead via GitHub.run(long_call=True).
-    gh_timeout_seconds: Annotated[float, Typed, AtLeastOne] = 30.0
+    gh_timeout_seconds: Annotated[float, Typed, Positive] = 30.0
     # Budget for calls known in advance to be legitimately long-running --
     # large paginated issue/PR list and search responses -- as opposed to
     # gh_timeout_seconds' fail-fast default above (issue #1833).
-    gh_long_call_timeout_seconds: Annotated[float, Typed, AtLeastOne] = 120.0
+    gh_long_call_timeout_seconds: Annotated[float, Typed, Positive] = 120.0
     # Per-pass circuit breaker for gh transport-class failures (issue #1833).
     # Ships enabled by default with sensible thresholds (owner directive: no
     # default-off knobs) -- this section exists to retune or disable it, not
@@ -1392,7 +1416,7 @@ class RuntimeConfig:
     # without a `RuntimeConfig` at all (tests, legacy direct callers) do NOT
     # get this default -- see `github_capabilities/http_transport.py`'s
     # `_DEFAULT_GH_TRANSPORT` for why that fallback stays "gh".
-    gh_transport: str = "http"
+    gh_transport: Annotated[str, Typed, OneOf("http", "gh")] = "http"
     # cw#1273: outer retry for `gh pr create` specifically, layered on top of
     # GitHub.run()'s inner pre-connection-only retry above. The inner retry's
     # ~7s default span is far shorter than the ~45s TLS blips observed on
@@ -1475,7 +1499,9 @@ class DevinConfig:
     # this sentinel.
     session_manifest: str = ""
     session_results: str = ""
-    dispatch_command: str | tuple[str, ...] = ""
+    dispatch_command: Annotated[
+        str | tuple[str, ...], CommandTemplate({"prompt_path", "issue_number", "branch"})
+    ] = ""
     command_timeout_seconds: int = 300
     # devin-shell adapter: sidecar JSON + per-session logs live here. Empty
     # string means "derive from runtime.state_dir" (layout.sessions_dir_default)
@@ -1483,7 +1509,10 @@ class DevinConfig:
     sessions_dir: str = ""
     # devin-shell launch command; empty means devin_shell.DEFAULT_COMMAND_TEMPLATE.
     # Placeholders: {prompt_path} {issue_number} {branch} {model_args}.
-    shell_command: tuple[str, ...] = ()
+    shell_command: Annotated[
+        tuple[str, ...],
+        CommandTemplate({"prompt_path", "issue_number", "branch", "model_args"}),
+    ] = ()
     # devin-shell worker model; empty string means CLI default. When set,
     # injects "--model <value>" into the rendered command via {model_args}.
     worker_model: str = ""
@@ -1508,7 +1537,7 @@ class DevinConfig:
     # values override sanitized keys (e.g., worker_env={"VIRTUAL_ENV": "/path"}
     # reintroduces VIRTUAL_ENV even though sanitize_env strips it). This is
     # intentional: explicit operator overrides win over sanitization.
-    worker_env: dict[str, str] = field(default_factory=dict)
+    worker_env: Annotated[dict[str, str], Coerced] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -1534,7 +1563,9 @@ class ClaudeCodeConfig:
     effort: Annotated[str, Typed] = ""
     # Empty means claude_code.DEFAULT_COMMAND_TEMPLATE; the rendered worker
     # prompt is fed via stdin unless the template names {prompt_path}.
-    command: tuple[str, ...] = ()
+    command: Annotated[
+        tuple[str, ...], CommandTemplate({"prompt_path", "issue_number", "branch"})
+    ] = ()
     # None -> worktree.py default (<repo_root>/.var/charlie-work/worktrees).
     worktrees_dir: str | None = None
     # Disabled by default: a claude-code worker has a full agentic shell and
@@ -1555,7 +1586,7 @@ class ClaudeCodeConfig:
     # values override sanitized keys (e.g., worker_env={"VIRTUAL_ENV": "/path"}
     # reintroduces VIRTUAL_ENV even though sanitize_env strips it). This is
     # intentional: explicit operator overrides win over sanitization.
-    worker_env: dict[str, str] = field(default_factory=dict)
+    worker_env: Annotated[dict[str, str], Coerced] = field(default_factory=dict)
     # Opt-in: tee Claude Code's --output-format stream-json to a separate events.jsonl file.
     # When enabled, the worker launch command is extended with --output-format stream-json
     # and the structured JSONL output is written to issue-<n>.events.jsonl alongside the
@@ -1573,12 +1604,12 @@ class ApiProviderConfig:
     to ``0.0`` for providers that do not advertise a cached-input discount.
     """
 
-    base_url: str
-    api_key_env: str
-    model: str
-    input_usd_per_mtok: float
-    output_usd_per_mtok: float
-    cached_input_usd_per_mtok: float = 0.0
+    base_url: Annotated[str, Typed, NonEmptyRaw]
+    api_key_env: Annotated[str, Typed, NonEmptyRaw]
+    model: Annotated[str, Typed, NonEmptyRaw]
+    input_usd_per_mtok: Annotated[float, Typed]
+    output_usd_per_mtok: Annotated[float, Typed]
+    cached_input_usd_per_mtok: Annotated[float, Typed, NotNull] = 0.0
 
 
 @dataclass(frozen=True)
@@ -1589,23 +1620,10 @@ class ApiBudgetConfig:
     remaining defaults are conservative starting values for paid-API usage.
     """
 
-    max_usd_per_session: float = 0.0
-    preflight_reserve_usd: float = 1.0
-    max_usd_per_day: float = 5.0
-    lifetime_usd: float = 15.0
-
-    def __post_init__(self) -> None:
-        for key in (
-            "max_usd_per_session",
-            "preflight_reserve_usd",
-            "max_usd_per_day",
-            "lifetime_usd",
-        ):
-            value = getattr(self, key)
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
-                raise ConfigError(f"api_worker.budget.{key} must be a number, got {value!r}")
-            if value < 0:
-                raise ConfigError(f"api_worker.budget.{key} must be >= 0, got {value}")
+    max_usd_per_session: Annotated[float, Typed, NonNeg, NotNull] = 0.0
+    preflight_reserve_usd: Annotated[float, Typed, NonNeg, NotNull] = 1.0
+    max_usd_per_day: Annotated[float, Typed, NonNeg, NotNull] = 5.0
+    lifetime_usd: Annotated[float, Typed, NonNeg, NotNull] = 15.0
 
 
 @dataclass(frozen=True)
@@ -1620,10 +1638,10 @@ class ApiWorkerConfig:
     mutated after config load.
     """
 
-    enabled: bool = False
+    enabled: Annotated[bool, Typed] = False
     provider: Annotated[str, Typed] = ""
     max_concurrent_sessions: Annotated[int, Typed, NonNeg] = 1
-    providers: Mapping[str, ApiProviderConfig] = field(
+    providers: Annotated[Mapping[str, ApiProviderConfig], NotNull] = field(
         default_factory=lambda: MappingProxyType({})
     )
     budget: ApiBudgetConfig = field(default_factory=ApiBudgetConfig)
@@ -1646,39 +1664,33 @@ class ApiWorkerConfig:
                     )
             object.__setattr__(self, "providers", MappingProxyType(providers_dict))
 
+    def validate(self, config: OrchestratorConfig) -> None:
+        """Cross-field rules: an enabled api worker needs a usable selected provider."""
         if not self.enabled:
             return
-
         if not self.provider:
-            raise ConfigError(
-                "api_worker.provider must be a non-empty string when api_worker.enabled is true"
-            )
+            raise FieldError("provider", "non-empty string when enabled is true", self.provider)
         if self.provider not in self.providers:
-            raise ConfigError(
-                f"api_worker.provider '{self.provider}' is not a key in api_worker.providers"
+            raise FieldError(
+                "provider",
+                f"a key in providers ({', '.join(sorted(self.providers)) or 'none configured'})",
+                self.provider,
             )
-
         active = self.providers[self.provider]
+        base = f"providers.{self.provider}"
         if not active.api_key_env:
-            raise ConfigError(
-                f"api_worker.providers.{self.provider}.api_key_env must be a non-empty string"
-            )
+            raise FieldError(f"{base}.api_key_env", "non-empty string", active.api_key_env)
         for price_key in ("input_usd_per_mtok", "output_usd_per_mtok"):
             value = getattr(active, price_key)
             if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
-                raise ConfigError(
-                    f"api_worker.providers.{self.provider}.{price_key} must be > 0, got {value!r}"
-                )
+                raise FieldError(f"{base}.{price_key}", "> 0", value)
         cached_value = active.cached_input_usd_per_mtok
         if (
             not isinstance(cached_value, (int, float))
             or isinstance(cached_value, bool)
             or cached_value < 0
         ):
-            raise ConfigError(
-                "api_worker.providers."
-                f"{self.provider}.cached_input_usd_per_mtok must be >= 0, got {cached_value!r}"
-            )
+            raise FieldError(f"{base}.cached_input_usd_per_mtok", ">= 0", cached_value)
 
 
 @dataclass(frozen=True)
@@ -1724,53 +1736,27 @@ class ReviewerRoleConfig:
     here has no conflicting reuse to worry about.
     """
 
-    harness: str = "claude-code"
+    harness: Annotated[str, Typed, NotNull, OneOf(*sorted(REVIEWER_HARNESSES))] = "claude-code"
     model: str = _DEFAULT_CLAUDE_MODEL
-    effort: str = ""
-    effort_experiment_fraction: float = 0.0
-    effort_experiment_salt: str = ""
+    effort: Annotated[str, Typed, NotNull] = ""
+    effort_experiment_fraction: Annotated[float, Typed, NotNull, InRange(0.0, 1.0)] = 0.0
+    effort_experiment_salt: Annotated[str, Typed, NotNull] = ""
 
-    def __post_init__(self) -> None:
-        if self.harness not in REVIEWER_HARNESSES:
-            raise ConfigError(
-                "config section 'reviewer' key 'harness' must be one of "
-                f"{sorted(REVIEWER_HARNESSES)}, got {self.harness!r}"
-            )
-        if not isinstance(self.effort, str):
-            raise ConfigError(
-                "config section 'reviewer' key 'effort' must be a string, "
-                f"got {type(self.effort).__name__}"
-            )
-        fraction = self.effort_experiment_fraction
-        if isinstance(fraction, bool) or not isinstance(fraction, (int, float)):
-            raise ConfigError(
-                "config section 'reviewer' key 'effort_experiment_fraction' must be a "
-                f"number, got {type(fraction).__name__}"
-            )
-        if not (0.0 <= fraction <= 1.0):
-            raise ConfigError(
-                "config section 'reviewer' key 'effort_experiment_fraction' must be in "
-                f"[0.0, 1.0], got {fraction}"
-            )
-        if not isinstance(self.effort_experiment_salt, str):
-            raise ConfigError(
-                "config section 'reviewer' key 'effort_experiment_salt' must be a string, "
-                f"got {type(self.effort_experiment_salt).__name__}"
-            )
-        # Cross-field check: a fraction > 0.0 enables the experiment, whose
-        # treatment arm IS effort verbatim (resolve_review_effort returns it
-        # unmodified). Enabling the experiment without a treatment effort
-        # would silently make "treatment" mean "no --effort pin at all" while
-        # "control" still gets claude_code.effort -- a corrupted, undocumented
-        # comparison that would run for the life of the experiment with no
-        # warning. Fail loud at load instead. (Relocated from the deleted
-        # review_dispatch.review_effort_experiment_fraction cross-field check
-        # -- role-config Phase 2 Track E.)
-        if fraction > 0.0 and not self.effort:
-            raise ConfigError(
-                "config section 'reviewer': 'effort_experiment_fraction' is "
-                f"{fraction} but 'effort' is unset -- set 'effort' to the treatment "
-                "effort string (e.g. 'high') before enabling the experiment"
+    def validate(self, config: OrchestratorConfig) -> None:
+        """Cross-field rule: a fraction > 0.0 enables the experiment, whose treatment arm IS
+        ``effort`` verbatim (``resolve_review_effort`` returns it unmodified). Enabling it
+        without a treatment effort would silently make "treatment" mean "no --effort pin at
+        all" while "control" still gets ``claude_code.effort`` -- a corrupted, undocumented
+        comparison that would run for the life of the experiment with no warning. Fail loud at
+        load instead. (Relocated from the deleted
+        ``review_dispatch.review_effort_experiment_fraction`` check -- role-config Phase 2.)
+        """
+        if self.effort_experiment_fraction > 0.0 and not self.effort:
+            raise FieldError(
+                "effort",
+                "a treatment effort string (e.g. 'high') when effort_experiment_fraction is "
+                f"{self.effort_experiment_fraction}",
+                self.effort,
             )
 
 
@@ -1830,7 +1816,9 @@ class RescueConfig:
     reviewer_model: Annotated[str, Typed] = "codex"
     # Standard Devin CLI invocation shape -- override only if the rescue
     # tier's reviewer harness differs from that default.
-    reviewer_command: str | tuple[str, ...] = (
+    reviewer_command: Annotated[
+        str | tuple[str, ...], CommandTemplate({"prompt_path", "model"})
+    ] = (
         "devin",
         "--model",
         "{model}",
@@ -1839,10 +1827,10 @@ class RescueConfig:
         "{prompt_path}",
     )
     reviewer_timeout_seconds: Annotated[int, Typed, NonNeg] = 300
-    worker: WorkerRoleConfig = field(
+    worker: Annotated[WorkerRoleConfig, LenientMapping] = field(
         default_factory=lambda: WorkerRoleConfig(harness="claude-code", model="claude-opus-5-5")
     )
-    reviewer: WorkerRoleConfig = field(
+    reviewer: Annotated[WorkerRoleConfig, LenientMapping] = field(
         default_factory=lambda: WorkerRoleConfig(harness="devin", model="codex")
     )
 
@@ -2283,8 +2271,8 @@ class SignatureRule:
     PostMortemConfig.signature_rules.
     """
 
-    pattern: str
-    kind: str
+    pattern: Annotated[str, Typed, NonEmptyRaw, Regex]
+    kind: Annotated[str, Typed, NonEmptyRaw]
 
 
 @dataclass(frozen=True)
@@ -2384,7 +2372,7 @@ class HeartbeatConfig:
     # mirrors as ``ARMABLE_GATING_LABELS``) plus the conventional tracker/
     # umbrella/epic names the issue enumerates. Active labels (``agent:*`` and
     # the configured ``labels:`` lifecycle values) are excluded separately.
-    stale_mention_parked_labels: tuple[str, ...] = (
+    stale_mention_parked_labels: Annotated[tuple[str, ...], NotNull] = (
         "blocked",
         "needs-design",
         "human-action",
@@ -2402,7 +2390,14 @@ class HeartbeatConfig:
         # string wraps rather than iterates, and a list becomes a tuple so the
         # frozen instance stays hashable on every construction path.
         value = self.stale_mention_parked_labels
-        normalized = (str(value),) if isinstance(value, str) else tuple(str(v) for v in value)
+        if isinstance(value, str):
+            normalized = (value,)
+        elif isinstance(value, (list, tuple)):
+            normalized = tuple(str(v) for v in value)
+        else:
+            raise FieldError(
+                "stale_mention_parked_labels", "list of label names or a string", value, "type"
+            )
         object.__setattr__(self, "stale_mention_parked_labels", normalized)
 
 
@@ -2421,7 +2416,14 @@ class OrchestratorConfig:
     claude_code: ClaudeCodeConfig = field(default_factory=ClaudeCodeConfig)
     api_worker: ApiWorkerConfig = field(default_factory=ApiWorkerConfig)
     rescue: RescueConfig = field(default_factory=RescueConfig)
-    worker: WorkerRoleConfig = field(default_factory=WorkerRoleConfig)
+    worker: Annotated[
+        WorkerRoleConfig,
+        # Harness membership is enforced at the top-level worker only, not on
+        # ``WorkerRoleConfig`` itself: the class is reused for rescue.worker/.reviewer,
+        # and rescue.reviewer's documented default harness ("devin") is not a member of
+        # ``harnesses.WORKER_HARNESSES``.
+        FieldRules(harness=(Typed, NotNull, OneOf(*sorted(WORKER_HARNESSES)))),
+    ] = field(default_factory=WorkerRoleConfig)
     reviewer: ReviewerRoleConfig = field(default_factory=ReviewerRoleConfig)
     watchdog: WatchdogConfig = field(default_factory=WatchdogConfig)
     worktree_reclamation: WorktreeReclamationConfig = field(
@@ -2596,749 +2598,21 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
     # unknown keys are still silently ignored. The validation lives in
     # ``deescalation_config.py``; error messages are byte-identical.
     deescalation = DeescalationConfig(**parse_deescalation_overrides(deescalation_data))
-    auto_merge_data = _section(data, "auto_merge")
-    required_checks = auto_merge_data.get("required_checks")
-    if isinstance(required_checks, list):
-        auto_merge_data["required_checks"] = tuple(str(item) for item in required_checks)
-    merge_flags = auto_merge_data.get("merge_flags")
-    if merge_flags is not None and not isinstance(merge_flags, list):
-        raise ConfigError(
-            "config section 'auto_merge' key 'merge_flags' must be a list of flags, "
-            f"got {type(merge_flags).__name__}"
-        )
-    if isinstance(merge_flags, list):
-        auto_merge_data["merge_flags"] = tuple(str(item) for item in merge_flags)
-    # Validate merge_flags: each flag must start with "--"
-    merge_flags = auto_merge_data.get("merge_flags")
-    if merge_flags:
-        for flag in merge_flags:
-            if not str(flag).startswith("--"):
-                raise ConfigError(
-                    f"config section 'auto_merge' key 'merge_flags': flag '{flag}' "
-                    f"must start with '--'"
-                )
-        # Reject flags that conflict with orchestrator-managed behavior
-        # These are either appended by merge_pr itself (strategy flags) or
-        # deliberately excluded (branch deletion is handled separately)
-        # Normalize by splitting on '=' to catch --flag=value forms
-        for flag in merge_flags:
-            flag_name = str(flag).split("=", 1)[0]
-            if flag_name in ORCHESTRATOR_MANAGED_MERGE_FLAGS:
-                raise ConfigError(
-                    f"config section 'auto_merge' key 'merge_flags': flag '{flag}' "
-                    f"is managed by the orchestrator and cannot be specified in merge_flags"
-                )
-    failed_attempt_alarm = auto_merge_data.get("failed_attempt_alarm")
-    if failed_attempt_alarm is not None and not isinstance(failed_attempt_alarm, int):
-        raise ConfigError(
-            "config section 'auto_merge' key 'failed_attempt_alarm' must be an int, "
-            f"got {type(failed_attempt_alarm).__name__}"
-        )
-    readiness_no_ci_minutes = auto_merge_data.get("readiness_no_ci_minutes")
-    if readiness_no_ci_minutes is not None:
-        if isinstance(readiness_no_ci_minutes, bool) or not isinstance(
-            readiness_no_ci_minutes, int
-        ):
-            raise ConfigError(
-                "config section 'auto_merge' key 'readiness_no_ci_minutes' must be an int, "
-                f"got {type(readiness_no_ci_minutes).__name__}"
-            )
-        if readiness_no_ci_minutes < 0:
-            raise ConfigError(
-                "config section 'auto_merge' key 'readiness_no_ci_minutes' must not be negative"
-            )
-    ci_run_never_created_grace_minutes = auto_merge_data.get("ci_run_never_created_grace_minutes")
-    if ci_run_never_created_grace_minutes is not None:
-        if isinstance(ci_run_never_created_grace_minutes, bool) or not isinstance(
-            ci_run_never_created_grace_minutes, int
-        ):
-            raise ConfigError(
-                "config section 'auto_merge' key 'ci_run_never_created_grace_minutes' "
-                f"must be an int, got {type(ci_run_never_created_grace_minutes).__name__}"
-            )
-        if ci_run_never_created_grace_minutes < 0:
-            raise ConfigError(
-                "config section 'auto_merge' key 'ci_run_never_created_grace_minutes' "
-                "must not be negative"
-            )
-    mergequeue_label = auto_merge_data.get("mergequeue_label")
-    if mergequeue_label is not None:
-        if not isinstance(mergequeue_label, str):
-            raise ConfigError(
-                "config section 'auto_merge' key 'mergequeue_label' must be a string, "
-                f"got {type(mergequeue_label).__name__}"
-            )
-        stripped_mergequeue_label = mergequeue_label.strip()
-        if not stripped_mergequeue_label:
-            raise ConfigError(
-                "config section 'auto_merge' key 'mergequeue_label' must not be empty"
-            )
-        # Store the stripped value: this threads verbatim into
-        # `gh pr edit --add-label <label>`, so surrounding whitespace must
-        # not survive into the actual GitHub label name.
-        auto_merge_data["mergequeue_label"] = stripped_mergequeue_label
-    queue_bot_login = auto_merge_data.get("queue_bot_login")
-    if queue_bot_login is not None:
-        if not isinstance(queue_bot_login, str):
-            raise ConfigError(
-                "config section 'auto_merge' key 'queue_bot_login' must be a string, "
-                f"got {type(queue_bot_login).__name__}"
-            )
-        stripped_queue_bot_login = queue_bot_login.strip()
-        if not stripped_queue_bot_login:
-            raise ConfigError(
-                "config section 'auto_merge' key 'queue_bot_login' must not be empty"
-            )
-        # Store the stripped value: it is compared against the GitHub commit
-        # author login, where surrounding whitespace can never match.
-        auto_merge_data["queue_bot_login"] = stripped_queue_bot_login
-    mergequeue_wedge_hours = auto_merge_data.get("mergequeue_wedge_hours")
-    if mergequeue_wedge_hours is not None:
-        if isinstance(mergequeue_wedge_hours, bool) or not isinstance(
-            mergequeue_wedge_hours, (int, float)
-        ):
-            raise ConfigError(
-                "config section 'auto_merge' key 'mergequeue_wedge_hours' must be a "
-                f"number, got {type(mergequeue_wedge_hours).__name__}"
-            )
-        if mergequeue_wedge_hours < 0:
-            raise ConfigError(
-                "config section 'auto_merge' key 'mergequeue_wedge_hours' "
-                f"must not be negative, got {mergequeue_wedge_hours}"
-            )
-        auto_merge_data["mergequeue_wedge_hours"] = float(mergequeue_wedge_hours)
-    # Issue #1383: nested infra_blocked section under auto_merge.
-    infra_blocked_data = auto_merge_data.get("infra_blocked")
-    if infra_blocked_data is not None:
-        if not isinstance(infra_blocked_data, dict):
-            raise ConfigError(
-                "config section 'auto_merge' key 'infra_blocked' must be a mapping, "
-                f"got {type(infra_blocked_data).__name__}"
-            )
-        infra_blocked_fields = {f.name for f in fields(InfraBlockedConfig)}
-        unknown_ib_keys = sorted(set(infra_blocked_data) - infra_blocked_fields)
-        if unknown_ib_keys:
-            raise ConfigError(
-                "config section 'auto_merge' key 'infra_blocked' has unknown key(s): "
-                f"{', '.join(unknown_ib_keys)} "
-                f"(valid: {', '.join(sorted(infra_blocked_fields))})"
-            )
-        annotation_patterns = infra_blocked_data.get("annotation_patterns")
-        if annotation_patterns is not None:
-            if not isinstance(annotation_patterns, list):
-                raise ConfigError(
-                    "config section 'auto_merge' key 'infra_blocked.annotation_patterns' "
-                    f"must be a list of strings, got {type(annotation_patterns).__name__}"
-                )
-            infra_blocked_data["annotation_patterns"] = tuple(
-                str(item) for item in annotation_patterns
-            )
-        for int_key in ("instant_fail_seconds", "persistence_passes"):
-            int_value = infra_blocked_data.get(int_key)
-            if int_value is not None:
-                if isinstance(int_value, bool) or not isinstance(int_value, int):
-                    raise ConfigError(
-                        f"config section 'auto_merge' key 'infra_blocked.{int_key}' must be an "
-                        f"int, got {type(int_value).__name__}"
-                    )
-                if int_value < 0:
-                    raise ConfigError(
-                        f"config section 'auto_merge' key 'infra_blocked.{int_key}' must be >= 0, "
-                        f"got {int_value}"
-                    )
-        esc_minutes = infra_blocked_data.get("escalation_window_minutes")
-        if esc_minutes is not None:
-            if isinstance(esc_minutes, bool) or not isinstance(esc_minutes, int):
-                raise ConfigError(
-                    "config section 'auto_merge' key 'infra_blocked.escalation_window_minutes' "
-                    f"must be an int, got {type(esc_minutes).__name__}"
-                )
-            if esc_minutes < 0:
-                raise ConfigError(
-                    "config section 'auto_merge' key 'infra_blocked.escalation_window_minutes' "
-                    f"must be >= 0, got {esc_minutes}"
-                )
-        enabled_value = infra_blocked_data.get("enabled")
-        if enabled_value is not None and not isinstance(enabled_value, bool):
-            raise ConfigError(
-                "config section 'auto_merge' key 'infra_blocked.enabled' must be a bool, "
-                f"got {type(enabled_value).__name__}"
-            )
-        auto_merge_data["infra_blocked"] = InfraBlockedConfig(**infra_blocked_data)
-    auto_merge = _build_section(AutoMergeConfig, "auto_merge", auto_merge_data)
-    runtime_data = _section(data, "runtime")
-    throttle_error_markers = runtime_data.get("throttle_error_markers")
-    if throttle_error_markers is not None:
-        if not isinstance(throttle_error_markers, list):
-            raise ConfigError(
-                "config section 'runtime' key 'throttle_error_markers' must be a list of "
-                f"strings, got {type(throttle_error_markers).__name__}"
-            )
-        for item in throttle_error_markers:
-            if not isinstance(item, str):
-                raise ConfigError(
-                    "config section 'runtime' key 'throttle_error_markers' must be a list of "
-                    f"strings, got element of type {type(item).__name__}"
-                )
-        runtime_data["throttle_error_markers"] = tuple(throttle_error_markers)
-    session_limit_markers = runtime_data.get("session_limit_markers")
-    if session_limit_markers is not None:
-        if not isinstance(session_limit_markers, list):
-            raise ConfigError(
-                "config section 'runtime' key 'session_limit_markers' must be a list of "
-                f"strings, got {type(session_limit_markers).__name__}"
-            )
-        for item in session_limit_markers:
-            if not isinstance(item, str):
-                raise ConfigError(
-                    "config section 'runtime' key 'session_limit_markers' must be a list of "
-                    f"strings, got element of type {type(item).__name__}"
-                )
-        runtime_data["session_limit_markers"] = tuple(session_limit_markers)
-    quota_error_markers = runtime_data.get("quota_error_markers")
-    if quota_error_markers is not None:
-        if not isinstance(quota_error_markers, list):
-            raise ConfigError(
-                "config section 'runtime' key 'quota_error_markers' must be a list of "
-                f"strings, got {type(quota_error_markers).__name__}"
-            )
-        for item in quota_error_markers:
-            if not isinstance(item, str):
-                raise ConfigError(
-                    "config section 'runtime' key 'quota_error_markers' must be a list of "
-                    f"strings, got element of type {type(item).__name__}"
-                )
-        runtime_data["quota_error_markers"] = tuple(quota_error_markers)
-    gh_max_retries = runtime_data.get("gh_max_retries")
-    if gh_max_retries is not None and not isinstance(gh_max_retries, int):
-        raise ConfigError(
-            "config section 'runtime' key 'gh_max_retries' must be an int, "
-            f"got {type(gh_max_retries).__name__}"
-        )
-    gh_retry_base_seconds = runtime_data.get("gh_retry_base_seconds")
-    if gh_retry_base_seconds is not None and not isinstance(gh_retry_base_seconds, (int, float)):
-        raise ConfigError(
-            "config section 'runtime' key 'gh_retry_base_seconds' must be a number, "
-            f"got {type(gh_retry_base_seconds).__name__}"
-        )
-    gh_timeout_seconds = runtime_data.get("gh_timeout_seconds")
-    if gh_timeout_seconds is not None:
-        if isinstance(gh_timeout_seconds, bool) or not isinstance(
-            gh_timeout_seconds, (int, float)
-        ):
-            raise ConfigError(
-                "config section 'runtime' key 'gh_timeout_seconds' must be a number, "
-                f"got {type(gh_timeout_seconds).__name__}"
-            )
-        # Rejected rather than silently coerced: 0/negative would mean "time out
-        # instantly", turning every gh call into a failure. There is no
-        # "disable" value on purpose — an unbounded gh call is the defect.
-        if gh_timeout_seconds <= 0:
-            raise ConfigError(
-                "config section 'runtime' key 'gh_timeout_seconds' must be > 0, "
-                f"got {gh_timeout_seconds}"
-            )
-    # Issue #1976: quiet window for the config-retirement sweep. 0 is legal —
-    # it retires a key on the first pass where it is absent everywhere, which
-    # is the opt-out an operator would pick deliberately; negative is never
-    # meaningful, so it fails closed.
-    quiet_days = runtime_data.get("config_retirement_quiet_days")
-    if quiet_days is not None:
-        if isinstance(quiet_days, bool) or not isinstance(quiet_days, (int, float)):
-            raise ConfigError(
-                "config section 'runtime' key 'config_retirement_quiet_days' must be a "
-                f"number, got {type(quiet_days).__name__}"
-            )
-        if quiet_days < 0:
-            raise ConfigError(
-                "config section 'runtime' key 'config_retirement_quiet_days' must be "
-                f">= 0, got {quiet_days}"
-            )
-    gh_long_call_timeout_seconds = runtime_data.get("gh_long_call_timeout_seconds")
-    if gh_long_call_timeout_seconds is not None:
-        if isinstance(gh_long_call_timeout_seconds, bool) or not isinstance(
-            gh_long_call_timeout_seconds, (int, float)
-        ):
-            raise ConfigError(
-                "config section 'runtime' key 'gh_long_call_timeout_seconds' must be a "
-                f"number, got {type(gh_long_call_timeout_seconds).__name__}"
-            )
-        if gh_long_call_timeout_seconds <= 0:
-            raise ConfigError(
-                "config section 'runtime' key 'gh_long_call_timeout_seconds' must be > 0, "
-                f"got {gh_long_call_timeout_seconds}"
-            )
-    gh_transport = runtime_data.get("gh_transport")
-    if gh_transport is not None:
-        if not isinstance(gh_transport, str) or gh_transport not in ("http", "gh"):
-            raise ConfigError(
-                "config section 'runtime' key 'gh_transport' must be one of "
-                f"'http', 'gh', got {gh_transport!r}"
-            )
-    pr_create_retry_max_attempts = runtime_data.get("pr_create_retry_max_attempts")
-    if pr_create_retry_max_attempts is not None and not isinstance(
-        pr_create_retry_max_attempts, int
-    ):
-        raise ConfigError(
-            "config section 'runtime' key 'pr_create_retry_max_attempts' must be an int, "
-            f"got {type(pr_create_retry_max_attempts).__name__}"
-        )
-    pr_create_retry_base_seconds = runtime_data.get("pr_create_retry_base_seconds")
-    if pr_create_retry_base_seconds is not None and not isinstance(
-        pr_create_retry_base_seconds, (int, float)
-    ):
-        raise ConfigError(
-            "config section 'runtime' key 'pr_create_retry_base_seconds' must be a number, "
-            f"got {type(pr_create_retry_base_seconds).__name__}"
-        )
-    graphql_rate_limit_threshold = runtime_data.get("graphql_rate_limit_threshold")
-    if graphql_rate_limit_threshold is not None:
-        if not isinstance(graphql_rate_limit_threshold, int):
-            raise ConfigError(
-                "config section 'runtime' key 'graphql_rate_limit_threshold' must be an int, "
-                f"got {type(graphql_rate_limit_threshold).__name__}"
-            )
-        if graphql_rate_limit_threshold < 0:
-            raise ConfigError(
-                "config section 'runtime' key 'graphql_rate_limit_threshold' must be >= 0, "
-                f"got {graphql_rate_limit_threshold}"
-            )
-    event_ring_size = runtime_data.get("event_ring_size")
-    if event_ring_size is not None:
-        # bool is an int subclass, so a bare isinstance(..., int) accepts
-        # `event_ring_size: true` and silently uses it as 1 -- a two-entry ring
-        # that looks configured. Reject it explicitly, matching
-        # escalated_label_repair_max_per_pass below.
-        if not isinstance(event_ring_size, int) or isinstance(event_ring_size, bool):
-            raise ConfigError(
-                "config section 'runtime' key 'event_ring_size' must be an int, "
-                f"got {type(event_ring_size).__name__}"
-            )
-        # >= 1, not >= 0: append_event truncates via events[-max_size:], and
-        # -0 == 0 in Python, so max_size=0 would yield events[0:] (the FULL
-        # list) — no truncation, i.e. unbounded growth, the exact failure this
-        # cap exists to prevent. There is no sensible "disable" semantic for a
-        # bounded ring (unlike graphql_rate_limit_threshold: 0), so reject 0.
-        if event_ring_size < 1:
-            raise ConfigError(
-                "config section 'runtime' key 'event_ring_size' must be >= 1, "
-                f"got {event_ring_size}"
-            )
-    throttle_resume_margin_s = runtime_data.get("throttle_resume_margin_s")
-    if throttle_resume_margin_s is not None:
-        if not isinstance(throttle_resume_margin_s, int):
-            raise ConfigError(
-                "config section 'runtime' key 'throttle_resume_margin_s' must be an int, "
-                f"got {type(throttle_resume_margin_s).__name__}"
-            )
-        if throttle_resume_margin_s < 0:
-            raise ConfigError(
-                "config section 'runtime' key 'throttle_resume_margin_s' must be >= 0, "
-                f"got {throttle_resume_margin_s}"
-            )
-    repair_cap = runtime_data.get("escalated_label_repair_max_per_pass")
-    if repair_cap is not None:
-        if not isinstance(repair_cap, int) or isinstance(repair_cap, bool):
-            raise ConfigError(
-                "config section 'runtime' key 'escalated_label_repair_max_per_pass' "
-                f"must be an int, got {type(repair_cap).__name__}"
-            )
-        # 0 means unlimited here (matching graphql_rate_limit_threshold's
-        # "0 disables the guard"), so only negatives are rejected.
-        if repair_cap < 0:
-            raise ConfigError(
-                "config section 'runtime' key 'escalated_label_repair_max_per_pass' "
-                f"must be >= 0, got {repair_cap}"
-            )
-    stale_grace_days = runtime_data.get("fleet_registry_stale_grace_days")
-    if stale_grace_days is not None:
-        if not isinstance(stale_grace_days, int) or isinstance(stale_grace_days, bool):
-            raise ConfigError(
-                "config section 'runtime' key 'fleet_registry_stale_grace_days' "
-                f"must be an int, got {type(stale_grace_days).__name__}"
-            )
-        if stale_grace_days < 0:
-            raise ConfigError(
-                "config section 'runtime' key 'fleet_registry_stale_grace_days' "
-                f"must be >= 0, got {stale_grace_days}"
-            )
-    status_snapshot_ttl = runtime_data.get("status_snapshot_ttl_seconds")
-    if status_snapshot_ttl is not None:
-        if not isinstance(status_snapshot_ttl, int) or isinstance(status_snapshot_ttl, bool):
-            raise ConfigError(
-                "config section 'runtime' key 'status_snapshot_ttl_seconds' "
-                f"must be an int, got {type(status_snapshot_ttl).__name__}"
-            )
-        if status_snapshot_ttl < 0:
-            raise ConfigError(
-                "config section 'runtime' key 'status_snapshot_ttl_seconds' "
-                f"must be >= 0, got {status_snapshot_ttl}"
-            )
-    # Parse preflight sub-section (issue #1363).
-    preflight_data = runtime_data.get("preflight")
-    if preflight_data is not None:
-        if not isinstance(preflight_data, dict):
-            raise ConfigError(
-                "config section 'runtime' key 'preflight' must be a mapping, "
-                f"got {type(preflight_data).__name__}"
-            )
-        preflight_fields = {f.name for f in fields(PreflightConfig)}
-        unknown_preflight_keys = sorted(set(preflight_data) - preflight_fields)
-        if unknown_preflight_keys:
-            raise ConfigError(
-                "config section 'runtime' key 'preflight' has unknown key(s): "
-                f"{', '.join(unknown_preflight_keys)} "
-                f"(valid: {', '.join(sorted(preflight_fields))})"
-            )
-        disk_floor_gb = preflight_data.get("disk_floor_gb")
-        if disk_floor_gb is not None:
-            if not isinstance(disk_floor_gb, int) or isinstance(disk_floor_gb, bool):
-                raise ConfigError(
-                    "config section 'runtime' key 'preflight.disk_floor_gb' must be an int, "
-                    f"got {type(disk_floor_gb).__name__}"
-                )
-            if disk_floor_gb < 0:
-                raise ConfigError(
-                    "config section 'runtime' key 'preflight.disk_floor_gb' must be >= 0, "
-                    f"got {disk_floor_gb}"
-                )
-        clock_max_skew_hours = preflight_data.get("clock_max_skew_hours")
-        if clock_max_skew_hours is not None:
-            if not isinstance(clock_max_skew_hours, (int, float)) or isinstance(
-                clock_max_skew_hours, bool
-            ):
-                raise ConfigError(
-                    "config section 'runtime' key 'preflight.clock_max_skew_hours' must be a "
-                    f"number, got {type(clock_max_skew_hours).__name__}"
-                )
-            if clock_max_skew_hours < 0:
-                raise ConfigError(
-                    "config section 'runtime' key 'preflight.clock_max_skew_hours' must be >= 0, "
-                    f"got {clock_max_skew_hours}"
-                )
-        for bool_key in (
-            "disk_floor_fatal",
-            "clock_sanity_fatal",
-            "venv_identity_fatal",
-            "config_freshness_fatal",
-            "git_identity_fatal",
-        ):
-            bool_value = preflight_data.get(bool_key)
-            if bool_value is not None and not isinstance(bool_value, bool):
-                raise ConfigError(
-                    f"config section 'runtime' key 'preflight.{bool_key}' must be a bool, "
-                    f"got {type(bool_value).__name__}"
-                )
-        runtime_data["preflight"] = PreflightConfig(**preflight_data)
-    # Parse gh_circuit_breaker sub-section (issue #1833).
-    gh_circuit_breaker_data = runtime_data.get("gh_circuit_breaker")
-    if gh_circuit_breaker_data is not None:
-        if not isinstance(gh_circuit_breaker_data, dict):
-            raise ConfigError(
-                "config section 'runtime' key 'gh_circuit_breaker' must be a mapping, "
-                f"got {type(gh_circuit_breaker_data).__name__}"
-            )
-        breaker_fields = {f.name for f in fields(GhCircuitBreakerConfig)}
-        unknown_breaker_keys = sorted(set(gh_circuit_breaker_data) - breaker_fields)
-        if unknown_breaker_keys:
-            raise ConfigError(
-                "config section 'runtime' key 'gh_circuit_breaker' has unknown key(s): "
-                f"{', '.join(unknown_breaker_keys)} "
-                f"(valid: {', '.join(sorted(breaker_fields))})"
-            )
-        failure_threshold = gh_circuit_breaker_data.get("failure_threshold")
-        if failure_threshold is not None:
-            if not isinstance(failure_threshold, int) or isinstance(failure_threshold, bool):
-                raise ConfigError(
-                    "config section 'runtime' key 'gh_circuit_breaker.failure_threshold' "
-                    f"must be an int, got {type(failure_threshold).__name__}"
-                )
-            if failure_threshold < 1:
-                raise ConfigError(
-                    "config section 'runtime' key 'gh_circuit_breaker.failure_threshold' "
-                    f"must be >= 1, got {failure_threshold}"
-                )
-        cooldown_seconds = gh_circuit_breaker_data.get("cooldown_seconds")
-        if cooldown_seconds is not None:
-            if not isinstance(cooldown_seconds, (int, float)) or isinstance(
-                cooldown_seconds, bool
-            ):
-                raise ConfigError(
-                    "config section 'runtime' key 'gh_circuit_breaker.cooldown_seconds' "
-                    f"must be a number, got {type(cooldown_seconds).__name__}"
-                )
-            if cooldown_seconds < 0:
-                raise ConfigError(
-                    "config section 'runtime' key 'gh_circuit_breaker.cooldown_seconds' "
-                    f"must be >= 0, got {cooldown_seconds}"
-                )
-        runtime_data["gh_circuit_breaker"] = GhCircuitBreakerConfig(**gh_circuit_breaker_data)
-    runtime = _build_section(RuntimeConfig, "runtime", runtime_data)
-    devin_data = _section(data, "devin")
-    for command_key in ("dispatch_command", "shell_command"):
-        command_value = devin_data.get(command_key)
-        if isinstance(command_value, list):
-            devin_data[command_key] = tuple(str(item) for item in command_value)
-    # Validate dispatch_command placeholders (after list->tuple conversion)
-    dispatch_command = devin_data.get("dispatch_command")
-    if dispatch_command:
-        _validate_command_placeholders(
-            dispatch_command,
-            {"prompt_path", "issue_number", "branch"},
-            "devin.dispatch_command",
-        )
-    # Validate shell_command placeholders (after list->tuple conversion)
-    shell_command = devin_data.get("shell_command")
-    if shell_command:
-        _validate_command_placeholders(
-            shell_command,
-            {"prompt_path", "issue_number", "branch", "model_args"},
-            "devin.shell_command",
-        )
-    worker_env = devin_data.get("worker_env")
-    if worker_env is not None:
-        if not isinstance(worker_env, dict):
-            raise ConfigError(
-                "config section 'devin' key 'worker_env' must be a mapping of "
-                f"env-var names to values, got {type(worker_env).__name__}"
-            )
-        devin_data["worker_env"] = {str(k): str(v) for k, v in worker_env.items()}
-    devin = _build_section(DevinConfig, "devin", devin_data)
-    claude_code_data = _section(data, "claude_code")
-    claude_command = claude_code_data.get("command")
-    if isinstance(claude_command, list):
-        claude_code_data["command"] = tuple(str(item) for item in claude_command)
-    # Validate claude_code.command placeholders
-    claude_command = claude_code_data.get("command")
-    if claude_command:
-        _validate_command_placeholders(
-            claude_command,
-            {"prompt_path", "issue_number", "branch"},
-            "claude_code.command",
-        )
-    worker_env = claude_code_data.get("worker_env")
-    if worker_env is not None:
-        if not isinstance(worker_env, dict):
-            raise ConfigError(
-                "config section 'claude_code' key 'worker_env' must be a mapping of "
-                f"env-var names to values, got {type(worker_env).__name__}"
-            )
-        claude_code_data["worker_env"] = {str(k): str(v) for k, v in worker_env.items()}
-    effort_value = claude_code_data.get("effort")
-    if effort_value is not None and not isinstance(effort_value, str):
-        raise ConfigError(
-            "config section 'claude_code' key 'effort' must be a string, "
-            f"got {type(effort_value).__name__}"
-        )
-    claude_code = _build_section(ClaudeCodeConfig, "claude_code", claude_code_data)
-    api_worker_data = _section(data, "api_worker")
-    enabled_value = api_worker_data.get("enabled")
-    if enabled_value is not None and not isinstance(enabled_value, bool):
-        raise ConfigError(
-            "config section 'api_worker' key 'enabled' must be a bool, "
-            f"got {type(enabled_value).__name__}"
-        )
-    provider_value = api_worker_data.get("provider")
-    if provider_value is not None and not isinstance(provider_value, str):
-        raise ConfigError(
-            "config section 'api_worker' key 'provider' must be a string, "
-            f"got {type(provider_value).__name__}"
-        )
-    max_concurrent_sessions = api_worker_data.get("max_concurrent_sessions")
-    if max_concurrent_sessions is not None:
-        if isinstance(max_concurrent_sessions, bool) or not isinstance(
-            max_concurrent_sessions, int
-        ):
-            raise ConfigError(
-                "config section 'api_worker' key 'max_concurrent_sessions' must be an int, "
-                f"got {type(max_concurrent_sessions).__name__}"
-            )
-        if max_concurrent_sessions < 0:
-            raise ConfigError(
-                "config section 'api_worker' key 'max_concurrent_sessions' must be >= 0, "
-                f"got {max_concurrent_sessions}"
-            )
-    for str_key in ("worker_template", "rework_template"):
-        str_value = api_worker_data.get(str_key)
-        if str_value is not None and not isinstance(str_value, str):
-            raise ConfigError(
-                f"config section 'api_worker' key '{str_key}' must be a string, "
-                f"got {type(str_value).__name__}"
-            )
-
-    # Parse budget sub-section.
-    budget_data = api_worker_data.get("budget")
-    if budget_data is not None:
-        if not isinstance(budget_data, dict):
-            raise ConfigError(
-                "config section 'api_worker' key 'budget' must be a mapping, "
-                f"got {type(budget_data).__name__}"
-            )
-        budget_fields = {f.name for f in fields(ApiBudgetConfig)}
-        unknown_budget_keys = sorted(set(budget_data) - budget_fields)
-        if unknown_budget_keys:
-            raise ConfigError(
-                "config section 'api_worker' key 'budget' has unknown key(s): "
-                f"{', '.join(unknown_budget_keys)} "
-                f"(valid: {', '.join(sorted(budget_fields))})"
-            )
-        for budget_key in budget_fields:
-            if budget_key in budget_data:
-                budget_value = budget_data[budget_key]
-                if not isinstance(budget_value, (int, float)) or isinstance(budget_value, bool):
-                    raise ConfigError(
-                        f"config section 'api_worker' key 'budget.{budget_key}' must be a number, "
-                        f"got {type(budget_value).__name__}"
-                    )
-                if budget_value < 0:
-                    raise ConfigError(
-                        f"config section 'api_worker' key 'budget.{budget_key}' must be >= 0, "
-                        f"got {budget_value}"
-                    )
-        api_worker_data["budget"] = ApiBudgetConfig(**budget_data)
-
-    # Parse providers registry.
-    providers_data = api_worker_data.get("providers")
-    if providers_data is not None:
-        if not isinstance(providers_data, dict):
-            raise ConfigError(
-                "config section 'api_worker' key 'providers' must be a mapping, "
-                f"got {type(providers_data).__name__}"
-            )
-        provider_fields = {f.name for f in fields(ApiProviderConfig)}
-        built_providers: dict[str, ApiProviderConfig] = {}
-        for name, provider_data in providers_data.items():
-            if not isinstance(provider_data, dict):
-                raise ConfigError(
-                    f"config section 'api_worker' key 'providers.{name}' must be a mapping, "
-                    f"got {type(provider_data).__name__}"
-                )
-            unknown_provider_keys = sorted(set(provider_data) - provider_fields)
-            if unknown_provider_keys:
-                raise ConfigError(
-                    f"config section 'api_worker' key 'providers.{name}' has unknown key(s): "
-                    f"{', '.join(unknown_provider_keys)} "
-                    f"(valid: {', '.join(sorted(provider_fields))})"
-                )
-            required_provider_keys = (
-                "base_url",
-                "api_key_env",
-                "model",
-                "input_usd_per_mtok",
-                "output_usd_per_mtok",
-            )
-            for req in required_provider_keys:
-                if req not in provider_data:
-                    raise ConfigError(
-                        f"config section 'api_worker' key 'providers.{name}' is missing "
-                        f"required key '{req}'"
-                    )
-            for str_provider_key in ("base_url", "api_key_env", "model"):
-                str_provider_value = provider_data.get(str_provider_key)
-                if not isinstance(str_provider_value, str) or not str_provider_value:
-                    raise ConfigError(
-                        f"config section 'api_worker' key 'providers.{name}.{str_provider_key}' "
-                        "must be a non-empty string"
-                    )
-            for price_key in (
-                "input_usd_per_mtok",
-                "output_usd_per_mtok",
-                "cached_input_usd_per_mtok",
-            ):
-                if price_key in provider_data:
-                    price_value = provider_data[price_key]
-                    if not isinstance(price_value, (int, float)) or isinstance(price_value, bool):
-                        raise ConfigError(
-                            f"config section 'api_worker' key 'providers.{name}.{price_key}' "
-                            f"must be a number, got {type(price_value).__name__}"
-                        )
-            built_providers[str(name)] = ApiProviderConfig(**provider_data)
-        api_worker_data["providers"] = MappingProxyType(built_providers)
-
-    api_worker = _build_section(ApiWorkerConfig, "api_worker", api_worker_data)
-    rescue_data = _section(data, "rescue")
-    rescue_enabled = rescue_data.get("enabled")
-    if rescue_enabled is not None and not isinstance(rescue_enabled, bool):
-        raise ConfigError(
-            f"config section 'rescue' key 'enabled' must be a bool, "
-            f"got {type(rescue_enabled).__name__}"
-        )
-    for rescue_str_key in (
-        "worker_adapter",
-        "worker_model",
-        "reviewer_adapter",
-        "reviewer_model",
-    ):
-        rescue_str_value = rescue_data.get(rescue_str_key)
-        if rescue_str_value is not None and not isinstance(rescue_str_value, str):
-            raise ConfigError(
-                f"config section 'rescue' key '{rescue_str_key}' must be a string, "
-                f"got {type(rescue_str_value).__name__}"
-            )
-    rescue_command = rescue_data.get("reviewer_command")
-    if isinstance(rescue_command, list):
-        rescue_data["reviewer_command"] = tuple(str(item) for item in rescue_command)
-    rescue_command = rescue_data.get("reviewer_command")
-    if rescue_command:
-        _validate_command_placeholders(
-            rescue_command,
-            {"prompt_path", "model"},
-            "rescue.reviewer_command",
-        )
-    rescue_timeout = rescue_data.get("reviewer_timeout_seconds")
-    if rescue_timeout is not None and (
-        isinstance(rescue_timeout, bool) or not isinstance(rescue_timeout, int)
-    ):
-        raise ConfigError(
-            "config section 'rescue' key 'reviewer_timeout_seconds' must be an int, "
-            f"got {type(rescue_timeout).__name__}"
-        )
-    if rescue_timeout is not None and rescue_timeout < 0:
-        raise ConfigError(
-            "config section 'rescue' key 'reviewer_timeout_seconds' must be >= 0, "
-            f"got {rescue_timeout}"
-        )
-    # Only construct (and thus override) rescue.worker/.reviewer when the
-    # section actually names that key. If it's absent, leave it out of
-    # rescue_data entirely so _build_section's cls(**data) below does NOT
-    # pass worker=/reviewer= at all -- letting RescueConfig's own
-    # field-level default_factory apply (harness="claude-code",
-    # model="claude-opus-5-5" for worker; harness="devin", model="codex"
-    # for reviewer). Unconditionally constructing a bare WorkerRoleConfig()
-    # here regardless of presence used to silently override those
-    # RescueConfig-specific defaults with WorkerRoleConfig's OWN bare
-    # defaults (harness="manual", model="") any time no rescue.worker/
-    # rescue.reviewer section was configured -- making a loaded (but
-    # rescue-section-absent) config disagree with a bare RescueConfig()
-    # Python construction, which several tests assert must be equivalent
-    # (test_config_provenance.py's "configured-off is indistinguishable
-    # from never-loaded" invariant). Caught during role-config Phase 2
-    # Track E test triage.
-    if "worker" in rescue_data:
-        rescue_worker_data = rescue_data.get("worker") or {}
-        if not isinstance(rescue_worker_data, dict):
-            rescue_worker_data = {}
-        rescue_data["worker"] = WorkerRoleConfig(**rescue_worker_data)
-    if "reviewer" in rescue_data:
-        rescue_reviewer_data = rescue_data.get("reviewer") or {}
-        if not isinstance(rescue_reviewer_data, dict):
-            rescue_reviewer_data = {}
-        rescue_data["reviewer"] = WorkerRoleConfig(**rescue_reviewer_data)
-    rescue = _build_section(RescueConfig, "rescue", rescue_data)
-    worker = _build_section(WorkerRoleConfig, "worker", _section(data, "worker"))
-    # Harness membership is enforced here, at the top-level worker build site,
-    # rather than in WorkerRoleConfig.__post_init__: the dataclass is reused
-    # for rescue.worker/rescue.reviewer above, and rescue.reviewer's own
-    # documented default harness ("devin") is not a member of
-    # harnesses.WORKER_HARNESSES -- a blanket per-instance check would reject
-    # that reuse's own defaults. This check only ever applies to the single
-    # top-level worker role.
-    if worker.harness not in WORKER_HARNESSES:
-        raise ConfigError(
-            "config section 'worker' key 'harness' must be one of "
-            f"{sorted(WORKER_HARNESSES)}, got {worker.harness!r}"
-        )
-    reviewer = _build_section(ReviewerRoleConfig, "reviewer", _section(data, "reviewer"))
+    auto_merge = validate_section(AutoMergeConfig, _section(data, "auto_merge"), path="auto_merge")
+    runtime = validate_section(RuntimeConfig, _section(data, "runtime"), path="runtime")
+    devin = validate_section(DevinConfig, _section(data, "devin"), path="devin")
+    claude_code = validate_section(
+        ClaudeCodeConfig, _section(data, "claude_code"), path="claude_code"
+    )
+    api_worker = validate_section(ApiWorkerConfig, _section(data, "api_worker"), path="api_worker")
+    rescue = validate_section(RescueConfig, _section(data, "rescue"), path="rescue")
+    worker = validate_section(
+        WorkerRoleConfig,
+        _section(data, "worker"),
+        path="worker",
+        rules=field_rules(OrchestratorConfig, "worker"),
+    )
+    reviewer = validate_section(ReviewerRoleConfig, _section(data, "reviewer"), path="reviewer")
     watchdog = validate_section(WatchdogConfig, _section(data, "watchdog"), path="watchdog")
     worktree_reclamation = validate_section(
         WorktreeReclamationConfig,
@@ -3496,81 +2770,11 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
                 f"got {type(value).__name__}"
             )
     supervisor = _build_section(SupervisorConfig, "supervisor", supervisor_data)
-    post_mortem_data = _section(data, "post_mortem")
-    pm_enabled = post_mortem_data.get("enabled")
-    if pm_enabled is not None and not isinstance(pm_enabled, bool):
-        raise ConfigError(
-            f"config section 'post_mortem' key 'enabled' must be a bool, "
-            f"got {type(pm_enabled).__name__}"
-        )
-    db_path = post_mortem_data.get("db_path")
-    if db_path is not None and not isinstance(db_path, str):
-        raise ConfigError(
-            f"config section 'post_mortem' key 'db_path' must be a string, "
-            f"got {type(db_path).__name__}"
-        )
-    for int_key in (
-        "message_node_limit",
-        "match_window_margin_seconds",
-        "unparseable_started_at_lookback_seconds",
-    ):
-        value = post_mortem_data.get(int_key)
-        if value is not None and not isinstance(value, int):
-            raise ConfigError(
-                f"config section 'post_mortem' key '{int_key}' must be an int, "
-                f"got {type(value).__name__}"
-            )
-    signature_rules = post_mortem_data.get("signature_rules")
-    if signature_rules is not None:
-        if not isinstance(signature_rules, list):
-            raise ConfigError(
-                "config section 'post_mortem' key 'signature_rules' must be a list of "
-                f"{{pattern, kind}} mappings, got {type(signature_rules).__name__}"
-            )
-        built_rules: list[SignatureRule] = []
-        for i, item in enumerate(signature_rules):
-            if not isinstance(item, dict):
-                raise ConfigError(
-                    f"config section 'post_mortem' key 'signature_rules[{i}]' must be a "
-                    f"mapping with 'pattern' and 'kind' keys, got {type(item).__name__}"
-                )
-            unknown_rule_keys = sorted(set(item) - {"pattern", "kind"})
-            if unknown_rule_keys:
-                raise ConfigError(
-                    f"config section 'post_mortem' key 'signature_rules[{i}]' has unknown "
-                    f"key(s): {', '.join(unknown_rule_keys)} (valid: pattern, kind)"
-                )
-            pattern = item.get("pattern")
-            kind = item.get("kind")
-            if not isinstance(pattern, str) or not pattern:
-                raise ConfigError(
-                    f"config section 'post_mortem' key 'signature_rules[{i}].pattern' must "
-                    "be a non-empty string"
-                )
-            if not isinstance(kind, str) or not kind:
-                raise ConfigError(
-                    f"config section 'post_mortem' key 'signature_rules[{i}].kind' must "
-                    "be a non-empty string"
-                )
-            try:
-                re.compile(pattern)
-            except re.error as exc:
-                raise ConfigError(
-                    f"config section 'post_mortem' key 'signature_rules[{i}].pattern' is not "
-                    f"a valid regex: {exc}"
-                ) from exc
-            built_rules.append(SignatureRule(pattern=pattern, kind=kind))
-        post_mortem_data["signature_rules"] = tuple(built_rules)
-    post_mortem = _build_section(PostMortemConfig, "post_mortem", post_mortem_data)
-    heartbeat_data = _section(data, "heartbeat")
-    _parked = heartbeat_data.get("stale_mention_parked_labels")
-    if _parked is not None and not isinstance(_parked, (list, tuple, str)):
-        raise ConfigError(
-            "config section 'heartbeat' key 'stale_mention_parked_labels' must be a "
-            f"list of label names, got {type(_parked).__name__}"
-        )
-    heartbeat = _build_section(HeartbeatConfig, "heartbeat", heartbeat_data)
-    return OrchestratorConfig(
+    post_mortem = validate_section(
+        PostMortemConfig, _section(data, "post_mortem"), path="post_mortem"
+    )
+    heartbeat = validate_section(HeartbeatConfig, _section(data, "heartbeat"), path="heartbeat")
+    config = OrchestratorConfig(
         labels=labels,
         dispatch=dispatch,
         review=review,
@@ -3608,6 +2812,8 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
         # ``load_layered_config``) are the ones that know what path(s) the
         # data came from, and they attach that provenance with ``replace``.
     )
+    run_section_hooks(config)
+    return config
 
 
 def load_config(path: Path | None = None) -> OrchestratorConfig:
