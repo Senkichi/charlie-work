@@ -45,6 +45,7 @@ from charlie_work.labels import LabelConfig
 from charlie_work.local_issues import LocalFileGitHub
 from charlie_work.local_lane import (
     branch_diff,
+    branch_diff_result,
     branch_head_sha,
     is_ancestor,
     is_local_pr_record,
@@ -95,6 +96,12 @@ class TestLocalLanePrimitives:
     def test_branch_diff_missing_branch_returns_none(self, repo: Path) -> None:
         _init_repo(repo)
         assert branch_diff(repo, "main", "ghost-branch") is None
+
+    def test_branch_diff_result_carries_git_stderr_on_failure(self, repo: Path) -> None:
+        _init_repo(repo)
+        diff, error = branch_diff_result(repo, "main", "ghost-branch")
+        assert diff is None
+        assert error is not None and "ghost-branch" in error  # git's own stderr
 
     def test_is_ancestor(self, repo: Path) -> None:
         _init_repo(repo)

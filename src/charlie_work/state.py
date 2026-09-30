@@ -12,6 +12,8 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping
 
+from .dead_dispatched_timer import LOCAL_PARK_DEFER_FIELDS
+
 # Issue #1769 review follow-up / file-size ratchet (#1442): dispatch-cadence
 # bookkeeping moved to its own module; re-exported so import paths hold.
 from .dispatch_cadence import (  # noqa: F401 (deliberate re-export)
@@ -1086,6 +1088,9 @@ def clear_dead_worker_failure_kind(entry: dict[str, Any]) -> None:
     entry.pop("dead_worker_failure_kind", None)
     entry.pop("dead_worker_failure_classified_at", None)
     entry.pop("throttle_reap_rearm_count", None)
+    # Issue #1971: the bounded local-park deferral is per death episode too.
+    for field_name in LOCAL_PARK_DEFER_FIELDS:
+        entry.pop(field_name, None)
     # wf-r2-s6 (N4): the live-handoff routing marker is per dispatch epoch
     # too -- it records the outcome-file mtime the live lane already routed,
     # and a new dispatch's outcome is a new fact.
