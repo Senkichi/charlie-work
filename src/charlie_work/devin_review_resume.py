@@ -140,25 +140,13 @@ def build_resume_command(
     return (*kept, "--resume", session_id, "--prompt-file", str(nudge_path))
 
 
-def _emit(
-    app: Any,
-    pr_number: int,
-    kind: str,
-    payload: dict[str, Any],
-    *,
-    state_update: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
-) -> None:
-    """Append one event (and optionally rewrite this PR's state entry) through the write gate."""
+def _commit(app: Any, apply: Callable[[dict[str, Any]], dict[str, Any]]) -> None:
+    """Load state under the lock, apply ``apply`` (which appends the event), and save."""
     from . import workflow as _wf  # state_lock is patched on the workflow namespace
 
     with _wf.state_lock(app.paths.state_file):
         state = _wf.load_state(app.paths.state_file)
-        if state_update is not None:
-            prs = dict(state.get("prs") or {})
-            prs[str(pr_number)] = state_update(dict(prs.get(str(pr_number)) or {}))
-            state = {**state, "prs": prs}
-        state = app.write_gate.append_event(state, kind, payload)
-        app.write_gate.save_state(state)
+        app.write_gate.save_state(apply(state))
 
 
 def resume_exec_rejected_review(app: Any, worker: Any, pr_number: int, reviews_dir: Path) -> bool:
@@ -192,11 +180,13 @@ def resume_exec_rejected_review(app: Any, worker: Any, pr_number: int, reviews_d
     cached_id = pr_state.get("review_exec_resume_session_id") if same_dispatch else None
 
     def _fail(reason: str) -> bool:
-        _emit(
+        _commit(
             app,
-            pr_number,
-            "review_exec_rejection_resume_failed",
-            {"pr_number": pr_number, "attempt": attempt, "reason": reason},
+            lambda state: app.write_gate.append_event(
+                state,
+                "review_exec_rejection_resume_failed",
+                {"pr_number": pr_number, "attempt": attempt, "reason": reason},
+            ),
         )
         return False
 
@@ -281,11 +271,14 @@ def resume_exec_rejected_review(app: Any, worker: Any, pr_number: int, reviews_d
             "review_exec_resume_session_id": session_id,
         }
 
-    _emit(
-        app,
-        pr_number,
-        "review_exec_rejection_resumed",
-        {"pr_number": pr_number, "attempt": attempt, "session_id": session_id},
-        state_update=_bump,
-    )
+    def _apply(state: dict[str, Any]) -> dict[str, Any]:
+        prs = dict(state.get("prs") or {})
+        prs[str(pr_number)] = _bump(dict(prs.get(str(pr_number)) or {}))
+        return app.write_gate.append_event(
+            {**state, "prs": prs},
+            "review_exec_rejection_resumed",
+            {"pr_number": pr_number, "attempt": attempt, "session_id": session_id},
+        )
+
+    _commit(app, _apply)
     return True
