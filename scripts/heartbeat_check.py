@@ -938,6 +938,224 @@ def check_orchestrator_config(report: Report, repo: RepoInfo) -> None:
 
 
 # --------------------------------------------------------------------------
+# Markdown block-structure scan -- stdlib-only duplicate (architecture-
+# deepening plan, candidate 3 "markdown structure";
+# `docs/superpowers/plans/2026-09-29-architecture-deepening.md`)
+#
+# `charlie_work.markdown_fence.scan` is the shared CommonMark-correct scan
+# side that the seven consumers in `src/charlie_work/` are wired onto (full
+# inventory: `md-recon.md`, wave A scratchpad). This script cannot import
+# it -- it is deliberately stdlib-only (see the module docstring and
+# `scripts/README.md:50-51`), with two narrow, documented, guarded
+# exceptions (`charlie_work.event_kinds` via `heartbeat_event_alarms.py`,
+# and the `notify_digest*` leaves, #1859) that this is not. So this is a
+# genuine duplicate, not a reuse: the same
+# algorithm, reimplemented from scratch against the same
+# `tests/markdown_conformance_cases.py` ground-truth table
+# (`tests/test_markdown_conformance.py` runs that table against both).
+#
+# `_mentioned_issue_numbers` below is wired onto this scan (via
+# `_strip_fenced_code_blocks`), replacing the `_FENCED_CODE_BLOCK_RE` regex
+# it used to strip fenced blocks with before matching bare `#N` references.
+# `tests/test_markdown_structure_characterization.py`'s two
+# `test_flip_heartbeat_check_*` tests now assert the CommonMark-correct
+# (flipped) result instead of pinning the old regex's desync/tilde-blind
+# behaviour.
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _MarkdownStructure:
+    """The three views every surveyed consumer needs, line-indexed against
+    ``_md_split_lines(text)`` (0-indexed, no keepends) -- see `FenceSpan` in
+    `charlie_work.markdown_fence` for the ``fenced_line_spans`` half-open
+    convention this mirrors exactly.
+    """
+
+    fenced_line_spans: tuple[tuple[int, int], ...]
+    quoted_lines: frozenset[int]
+    heading_lines: tuple[int, ...]
+
+
+# CommonMark line endings only: \n, \r\n, \r. See `_md_split_lines` --
+# mirrors `charlie_work.markdown_fence._LINE_ENDING_RE` /
+# ``split_lines`` exactly (adversarial review finding B2,
+# architecture-deepening candidate 3).
+_MD_LINE_ENDING_RE = re.compile(r"\r\n|\r|\n")
+
+# The three markers below match against a line with its leading indent
+# already stripped by `_md_strip_marker_indent` (0-3 CommonMark *columns*,
+# tab stops of 4 -- NOT an `[ \t]{0,3}` *character* count, which would
+# wrongly admit up to three tabs/12 columns; adversarial review finding B3).
+
+# CommonMark fenced-code-block delimiter: 3+ of the same backtick or tilde
+# character, then an optional info string.
+_MD_FENCE_DELIM_RE = re.compile(r"^(`{3,}|~{3,})[ \t]*(.*)$")
+# CommonMark blockquote marker: `>`.
+_MD_BLOCKQUOTE_RE = re.compile(r"^>")
+# CommonMark ATX heading: 1-6 `#`, then either end-of-line or at least one
+# space/tab before whatever heading text follows.
+_MD_ATX_HEADING_RE = re.compile(r"^#{1,6}([ \t].*)?$")
+
+
+def _md_split_lines(text: str, *, keepends: bool = False) -> list[str]:
+    """Split ``text`` on CommonMark line endings only (0-indexed). Mirrors
+    `charlie_work.markdown_fence.split_lines` exactly (stdlib-only, so it
+    cannot import that module -- see this section's header comment) --
+    never ``str.splitlines()``, whose wider separator set (vertical tab,
+    form feed, file/group/record separator, NEL, LINE/PARAGRAPH SEPARATOR)
+    is not a CommonMark or GitHub line break and would desync these line
+    indices from a real fence/heading position on such input (adversarial
+    review finding B2).
+    """
+    if not text:
+        return []
+    lines: list[str] = []
+    pos = 0
+    for match in _MD_LINE_ENDING_RE.finditer(text):
+        end = match.end() if keepends else match.start()
+        lines.append(text[pos:end])
+        pos = match.end()
+    if pos < len(text):
+        lines.append(text[pos:])
+    return lines
+
+
+def _md_strip_marker_indent(line: str, max_indent: int | None = 3) -> str | None:
+    """Strip ``line``'s leading indent, or ``None`` when it is wider than
+    ``max_indent`` CommonMark columns (a tab advances to the next multiple
+    of 4). ``max_indent=None`` never rejects (container-tolerant mode; see
+    `_scan_markdown_structure`). Mirrors
+    `charlie_work.markdown_fence._strip_marker_indent` exactly.
+    """
+    columns = 0
+    chars = 0
+    for char in line:
+        if char == " ":
+            columns += 1
+        elif char == "\t":
+            columns += 4 - (columns % 4)
+        else:
+            break
+        chars += 1
+        if max_indent is not None and columns > max_indent:
+            break
+    if max_indent is not None and columns > max_indent:
+        return None
+    return line[chars:]
+
+
+def _md_find_fence_close(
+    lines: list[str], start: int, char: str, length: int, max_indent: int | None = 3
+) -> int | None:
+    """First line index >= start closing a ``char``-fence opened at ``length``.
+
+    Only ever called for a *valid* opener -- see `_scan_markdown_structure`.
+    See `charlie_work.markdown_fence._find_fence_close`, which this mirrors
+    exactly, including the per-candidate-line indent check.
+    """
+    close_re = re.compile(rf"^{re.escape(char)}{{{length},}}[ \t]*$")
+    for index in range(start, len(lines)):
+        stripped = _md_strip_marker_indent(lines[index], max_indent)
+        if stripped is not None and close_re.match(stripped):
+            return index
+    return None
+
+
+def _scan_markdown_structure(text: str, *, max_indent: int | None = 3) -> _MarkdownStructure:
+    """Scan ``text`` for CommonMark block-level structure.
+
+    Stdlib-only reimplementation of `charlie_work.markdown_fence.scan`; see
+    that function's docstring for the CommonMark rules implemented.
+    ``max_indent`` bounds fence-opener, fence-closer and blockquote-marker
+    indent (columns); ATX headings always keep the 0-3 bound.
+    ``max_indent=None`` is the container-tolerant mode for *exclusion*
+    consumers (this file's `_strip_fenced_code_blocks`): a fence nested
+    under a list item is still a fence, and this scan models no list items.
+    """
+    lines = _md_split_lines(text)
+    fenced_spans: list[tuple[int, int]] = []
+    quoted: set[int] = set()
+    heading_lines: list[int] = []
+
+    line_count = len(lines)
+    index = 0
+    while index < line_count:
+        stripped = _md_strip_marker_indent(lines[index])
+        container_stripped = _md_strip_marker_indent(lines[index], max_indent)
+
+        if container_stripped is not None:
+            delimiter = _MD_FENCE_DELIM_RE.match(container_stripped)
+            if delimiter is not None:
+                run, info = delimiter.group(1), delimiter.group(2).strip()
+                char, length = run[0], len(run)
+                if char == "`" and "`" in info:
+                    # Not a fence opener under CommonMark -- an ordinary
+                    # line, not the start of a region to skip (adversarial
+                    # review finding B1). Resume scanning on the next line.
+                    index += 1
+                    continue
+                close_at = _md_find_fence_close(lines, index + 1, char, length, max_indent)
+                end = close_at + 1 if close_at is not None else line_count
+                fenced_spans.append((index, end))
+                index = end
+                continue
+
+            if _MD_BLOCKQUOTE_RE.match(container_stripped):
+                quoted.add(index)
+                index += 1
+                continue
+
+        if stripped is not None:
+            if _MD_ATX_HEADING_RE.match(stripped):
+                heading_lines.append(index)
+                index += 1
+                continue
+
+        index += 1
+
+    return _MarkdownStructure(
+        fenced_line_spans=tuple(fenced_spans),
+        quoted_lines=frozenset(quoted),
+        heading_lines=tuple(heading_lines),
+    )
+
+
+# Inline run of 3+ backticks paired with an equal-length closer, spanning lines.
+_INLINE_TRIPLE_SPAN_RE = re.compile(r"(`{3,}).+?\1", re.DOTALL)
+
+
+def _strip_fenced_code_blocks(text: str) -> str:
+    """Remove every fenced code block from ``text`` (opener/closer lines
+    included), via ``_scan_markdown_structure``.
+
+    Used by ``_mentioned_issue_numbers`` so a `#N`-shaped literal inside a
+    code sample is not read as a reference. Replaces the prior
+    ``_FENCED_CODE_BLOCK_RE`` regex (```` ```.*?``` ```` DOTALL,
+    non-line-anchored, nearest-pair) -- see
+    `tests/test_markdown_structure_characterization.py`'s
+    `test_flip_heartbeat_check_*` tests for the pinned-then-flipped
+    behaviour this replaces.
+    """
+    # Container-tolerant (`max_indent=None`): this is an exclusion consumer,
+    # and the old `_FENCED_CODE_BLOCK_RE` ignored indent, so a list-nested
+    # fence must still be stripped (else a `#N` inside it is a false
+    # stale-mention ANOMALY).
+    structure = _scan_markdown_structure(text, max_indent=None)
+    if structure.fenced_line_spans:
+        lines = _md_split_lines(text, keepends=True)
+        drop = [False] * len(lines)
+        for start, end in structure.fenced_line_spans:
+            for index in range(start, min(end, len(lines))):
+                drop[index] = True
+        text = "".join(line for line, is_dropped in zip(lines, drop) if not is_dropped)
+    # A multi-line INLINE run of 3+ backticks (opener and closer of equal
+    # length, mid-paragraph) is a code span, not a block: strip it too, as the
+    # prior regex did (md-r3 N1).
+    return _INLINE_TRIPLE_SPAN_RE.sub("", text)
+
+
+# --------------------------------------------------------------------------
 # Stale-open-issue-mention scanning primitives (issue #902)
 #
 # charlie_work.github already has `issue_numbers_mentioned_by_pr` (a same-repo
@@ -945,8 +1163,8 @@ def check_orchestrator_config(report: Report, repo: RepoInfo) -> None:
 # negation-aware `#N` scanner used by `closing_keyword_gate.py`). This script
 # deliberately does NOT import charlie_work.github, or any other
 # ci_fleet-reachable charlie_work module (see the module docstring, `fleet_dir`,
-# and the `charlie_work.event_kinds` import's own comment for the one narrow,
-# stdlib-only exception), so the small negation/quote-stripping heuristics
+# and the section header above for the two narrow, guarded, stdlib-only
+# exceptions: `charlie_work.event_kinds` and the `notify_digest*` leaves), so the small negation/quote-stripping heuristics
 # below are a minimal, self-contained reimplementation for this one check
 # rather than a reuse of those functions. Two differences from `issue_numbers_mentioned_by_pr`
 # are intentional, not drift:
@@ -974,7 +1192,6 @@ _ISSUE_REF_RE = re.compile(r"#(\d+)\b")
 # normal branch-prefix binding path (`linked_issue_number`), so a miss here
 # is not a gap, just redundant with machinery this check exists to backstop.
 _BRANCH_ISSUE_NUMBER_RE = re.compile(r"^[A-Za-z][\w.]*/(\d+)(?=[-_/]|$)")
-_FENCED_CODE_BLOCK_RE = re.compile(r"```.*?```", flags=re.DOTALL)
 _NEGATION_WORDS = ("not", "never", "without", "cannot")
 _NEGATION_CONTRACTION_SUFFIX = "n't"
 _NEGATION_RE = re.compile(
@@ -1021,10 +1238,14 @@ def _mentioned_issue_numbers(text: str) -> set[int]:
     """Return every bare `#N` reference in `text`, minus quoted/negated ones.
 
     Fenced code blocks are stripped first (a code sample containing the
-    literal text `#123` is not a reference), mirroring
-    `charlie_work.github`'s same defense for its own mention scanner.
+    literal text `#123` is not a reference), via
+    ``_strip_fenced_code_blocks`` -- the same CommonMark-correct fence model
+    `charlie_work.github_body_scan`'s own mention scanner now shares too
+    (both wired onto their respective `markdown_fence.scan`/
+    `_scan_markdown_structure` implementations, architecture-deepening
+    candidate 3).
     """
-    stripped = _FENCED_CODE_BLOCK_RE.sub("", text)
+    stripped = _strip_fenced_code_blocks(text)
     numbers: set[int] = set()
     for match in _ISSUE_REF_RE.finditer(stripped):
         if _has_preceding_negation(stripped, match.start()):

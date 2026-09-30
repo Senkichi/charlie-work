@@ -95,7 +95,7 @@ from .local_work_park import (
     park_or_reclaim_local_orphan,
 )
 from .pass_deadline import pass_deadline_spent, pass_deadline_suspended
-from .paths import RuntimePaths, resolved_layout
+from .paths import RuntimePaths, prompt_override_dirs, resolved_layout
 from .prompt_sections import section_variant_names
 from .prompts import (
     PromptTemplateError,
@@ -187,7 +187,7 @@ from .process_utils import (
     find_worker_terminal_status,
     is_pid_alive,  # noqa: F401  (deliberate re-export; used by moved L08 delegate via _wf.)
 )
-from . import orphaned_worker_review_drain, orphaned_worker_sweep, rework_outcome
+from . import markdown_guard, orphaned_worker_review_drain, orphaned_worker_sweep, rework_outcome
 from .write_gate import WriteGate, require_write_gate
 
 # LOAD-BEARING RE-EXPORT — NOT AN UNUSED IMPORT. Do not delete; the `noqa`
@@ -3923,6 +3923,7 @@ class OrchestratorApp:
             dry_run=self.dry_run, state_path=self.paths.state_file, repo=self.repo_root.name
         )
         self.fleet_dir_override = fleet_dir_override
+        markdown_guard.bind_state_path(self.paths.state_file, self.repo_root.name)
         # Issue #1363: config_freshness's "exactly once per change" semantics
         # need a mtime cache that outlives a single pass but not the process
         # -- an in-memory dict on the (per-process, per-repo) app instance is
@@ -3932,14 +3933,7 @@ class OrchestratorApp:
         self._preflight_config_mtimes: dict[str, float] = {}
         # Make the event ring cap config-driven (issue #525).
         _state.EVENT_RING_SIZE = config.runtime.event_ring_size
-        prompts_dir = config.runtime.prompts_dir
-        if prompts_dir:
-            override = Path(prompts_dir)
-            if not override.is_absolute():
-                override = repo_root / override
-            self.prompt_dirs: tuple[Path, ...] = (override,)
-        else:
-            self.prompt_dirs = ()
+        self.prompt_dirs: tuple[Path, ...] = prompt_override_dirs(config, repo_root)
         self.paths.ensure()
 
         # Issue #713: fail fast at startup if any configured prompt template

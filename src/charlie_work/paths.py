@@ -301,6 +301,19 @@ def resolved_layout(config: OrchestratorConfig, repo_root: Path) -> ResolvedLayo
     )
 
 
+def prompt_override_dirs(config: OrchestratorConfig, repo_root: Path) -> tuple[Path, ...]:
+    """Prompt-template search dirs from ``runtime.prompts_dir`` (relative -> *repo_root*).
+
+    Empty when the knob is unset; existence is not checked here (``doctor``
+    reports a missing directory).
+    """
+    prompts_dir = config.runtime.prompts_dir
+    if not prompts_dir:
+        return ()
+    override = Path(prompts_dir)
+    return (override if override.is_absolute() else repo_root / override,)
+
+
 def _warn_if_phantom_state_dir(root: Path) -> None:
     """Warn when *root* exists with phantom sibling artifacts but no ``state.json``.
 

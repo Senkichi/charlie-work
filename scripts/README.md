@@ -51,16 +51,29 @@ stdlib-only; see the notes below before "fixing" one.
   module docstring). Deliberately **stdlib-only** (plus `psutil`/`yaml`,
   already project dependencies) so a broken package install can never break
   the check that would detect it. Do not add a `charlie_work` import here —
-  with one narrow, deliberate exception (#1271): `charlie_work.event_kinds`,
-  which exists solely to be a genuine leaf (no imports beyond stdlib, and
-  never `ci_fleet`) that both this script and `charlie_work.instrumentation`
-  can import from without either pulling in the other. That module is the
-  only permitted import — since #1895 it physically lives in
-  `heartbeat_event_alarms.py` (which `heartbeat_check` loads and re-exports
-  `EXPECTED_OPERATIONAL_KINDS` from), and anything else needing sharing from
-  inside the package still needs the reimplement-locally treatment
-  `fleet_dir` and the stale-open-issue-mention primitives already get, not a
-  new exception in either file.
+  with two narrow, deliberate exceptions, both `try`/`except ImportError`
+  guarded (so a broken install degrades that one check, never crashes the
+  whole heartbeat) rather than a bare top-level `import`:
+  - (#1271) `charlie_work.event_kinds`, which exists solely to be a genuine
+    leaf (no imports beyond stdlib, and never `ci_fleet`) that both this
+    script and `charlie_work.instrumentation` can import from without either
+    pulling in the other. Since #1895 it physically lives in
+    `heartbeat_event_alarms.py` (which `heartbeat_check` loads and
+    re-exports `EXPECTED_OPERATIONAL_KINDS` from).
+  - (#1859) `charlie_work.notify_digest_check` and
+    `charlie_work.notify_digest_heartbeat`, added after the notify-digest
+    daemon's writer was found to have been silently dead since 2026-08-31
+    with nothing surfacing the gap — a signal-without-a-consumer failure
+    mode this heartbeat exists to catch generally, so it grew a check for
+    itself too. `notify_digest_check` is the stdlib-only file-probe leaf;
+    `notify_digest_heartbeat` holds the events.db-read-plus-verdict logic.
+    `check_notify_digest_freshness` reports "check unavailable" rather than
+    alarming when the import fails, same degrade-not-crash shape as the
+    `event_kinds` exception above.
+
+  Anything else needing sharing from inside the package still needs the
+  reimplement-locally treatment `fleet_dir` and the stale-open-issue-mention
+  primitives already get, not a new exception in either file.
 - **`heartbeat_event_alarms.py`** — the five per-repo `events.db` kind/level
   anomaly checks (`check_error_events`, `check_warning_events`,
   `check_infra_blocked_events`, `check_draft_pr_blocked_events`,
