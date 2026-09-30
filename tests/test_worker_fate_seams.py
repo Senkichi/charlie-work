@@ -226,7 +226,7 @@ def test_persist_failure_writes_cooldown_and_kind_together_without_mutating() ->
         "rate_limited", "2026-01-01T12:15:00Z", fresh=True
     )
 
-    new = persist_failure(before, 7, failure, adapter_kind="devin", now=NOW)
+    new = persist_failure(before, 7, failure, adapter_kind="devin", now=NOW, source="test")
 
     assert new["throttled_until"] == "2026-01-01T12:15:00Z"  # round-trips, never recomputed
     assert new["throttle_reason"] == "rate_limited"
@@ -242,7 +242,7 @@ def test_persist_failure_without_cooldown_leaves_throttled_until_alone() -> None
     state = {"throttled_until": "2030-01-01T00:00:00Z", "issues": {"7": {"status": "dispatched"}}}
     failure = FailureEvidence(kind="stalled", throttled_until=None, fresh=True)
 
-    new = persist_failure(state, 7, failure, adapter_kind="claude-code", now=NOW)
+    new = persist_failure(state, 7, failure, adapter_kind="claude-code", now=NOW, source="test")
 
     assert new["throttled_until"] == "2030-01-01T00:00:00Z"
     assert new["issues"]["7"]["dead_worker_failure_kind"] == "stalled"
@@ -250,18 +250,20 @@ def test_persist_failure_without_cooldown_leaves_throttled_until_alone() -> None
 
 def test_persist_failure_never_invents_an_issue_entry() -> None:
     failure = FailureEvidence(kind="rate_limited", throttled_until=None, fresh=True)
-    new = persist_failure(_STATE, 999, failure, adapter_kind=None, now=NOW)
+    new = persist_failure(_STATE, 999, failure, adapter_kind=None, now=NOW, source="test")
     assert "999" not in new["issues"]
 
 
 def test_persist_failure_with_no_kind_stamps_nothing() -> None:
     failure = FailureEvidence(kind=None, throttled_until=None, fresh=True)
-    assert persist_failure(_STATE, 7, failure, adapter_kind=None, now=NOW) == _STATE
+    assert persist_failure(_STATE, 7, failure, adapter_kind=None, now=NOW, source="test") == _STATE
 
 
 def test_persisted_failure_round_trips_the_stamp_and_feeds_evidence() -> None:
     failure = FailureEvidence(kind="rate_limited", throttled_until=None, fresh=True)
-    entry = persist_failure(_STATE, 7, failure, adapter_kind=None, now=NOW)["issues"]["7"]
+    entry = persist_failure(_STATE, 7, failure, adapter_kind=None, now=NOW, source="test")[
+        "issues"
+    ]["7"]
 
     persisted = persisted_failure(entry)
 

@@ -62,9 +62,13 @@ def test_set_throttled_until_never_shortens_active_window() -> None:
     now = datetime.now(UTC)
     long_until = _iso(now + timedelta(hours=4))
     short_until = _iso(now + timedelta(minutes=15))
-    state = set_throttled_until({}, long_until, reason="quota_exhausted", adapter_kind="devin")
+    state = set_throttled_until(
+        {}, long_until, source="test", reason="quota_exhausted", adapter_kind="devin"
+    )
 
-    state = set_throttled_until(state, short_until, reason="rate_limited", adapter_kind="claude")
+    state = set_throttled_until(
+        state, short_until, source="test", reason="rate_limited", adapter_kind="claude"
+    )
 
     assert state["throttled_until"] == long_until
     assert state["throttle_reason"] == "quota_exhausted"
@@ -75,9 +79,13 @@ def test_set_throttled_until_extends_with_later_window() -> None:
     now = datetime.now(UTC)
     short_until = _iso(now + timedelta(minutes=15))
     long_until = _iso(now + timedelta(hours=4))
-    state = set_throttled_until({}, short_until, reason="rate_limited", adapter_kind="claude")
+    state = set_throttled_until(
+        {}, short_until, source="test", reason="rate_limited", adapter_kind="claude"
+    )
 
-    state = set_throttled_until(state, long_until, reason="quota_exhausted", adapter_kind="devin")
+    state = set_throttled_until(
+        state, long_until, source="test", reason="quota_exhausted", adapter_kind="devin"
+    )
 
     assert state["throttled_until"] == long_until
     assert state["throttle_reason"] == "quota_exhausted"
@@ -88,9 +96,13 @@ def test_set_throttled_until_replaces_expired_window() -> None:
     now = datetime.now(UTC)
     expired = _iso(now - timedelta(hours=1))
     new = _iso(now + timedelta(minutes=5))
-    state = set_throttled_until({}, expired, reason="quota_exhausted", adapter_kind="devin")
+    state = set_throttled_until(
+        {}, expired, source="test", reason="quota_exhausted", adapter_kind="devin"
+    )
 
-    state = set_throttled_until(state, new, reason="rate_limited", adapter_kind="claude")
+    state = set_throttled_until(
+        state, new, source="test", reason="rate_limited", adapter_kind="claude"
+    )
 
     assert state["throttled_until"] == new
     assert state["throttle_reason"] == "rate_limited"
@@ -98,5 +110,7 @@ def test_set_throttled_until_replaces_expired_window() -> None:
 
 def test_set_throttled_until_sets_when_none_active() -> None:
     new = _iso(datetime.now(UTC) + timedelta(minutes=5))
-    state = set_throttled_until({"throttled_until": None}, new, reason="rate_limited")
+    state = set_throttled_until(
+        {"throttled_until": None}, new, source="test", reason="rate_limited"
+    )
     assert state["throttled_until"] == new
