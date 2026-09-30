@@ -126,9 +126,9 @@ _MOVED_NAMES = (
 # headroom, per the assertion's own re-derivation instruction.
 # Re-derived again under issue #2006: the ``throttle_window_set`` audit
 # event added the required ``source`` keyword and ``write_gate`` routing
-# parameter to all four ``set_throttled_until`` call sites, growing the
-# module to 2984 lines — the band is re-centered on the new measured
-# total with the same +/-150 headroom.
+# parameter to the module's ``set_throttled_until``/``persist_failure``
+# call sites, growing the module to 2984 lines — the band is re-centered
+# on the new measured total with the same +/-150 headroom.
 _CAP_BAND_MIN = 2834
 _CAP_BAND_MAX = 3134
 

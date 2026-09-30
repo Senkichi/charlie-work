@@ -1,20 +1,23 @@
 """``throttle_window_set`` audit-event tests (issue #2006).
 
 ``state.set_throttled_until`` is the single writer API for the provider
-throttle window, but event emission used to be left to each caller -- three
-of five call sites emitted nothing, so a moved window was invisible in
-events.db (the audit gap the issue was filed for). ``set_throttled_until``
-now appends a ``throttle_window_set`` event itself on every value change
-(extended or shortened), stays silent on a no-op, and requires ``source`` --
-a string literal naming the caller -- at every call site.
+throttle window, but event emission used to be left to each caller -- a
+moved window was invisible in events.db (the audit gap the issue was filed
+for). ``set_throttled_until`` now appends a ``throttle_window_set`` event
+itself on every value change (extended or shortened), stays silent on a
+no-op, and requires ``source`` -- a string literal naming the caller -- at
+every call site.
 
 Coverage here is layered:
 
 * unit-level: emission shape, both directions, no-op silence, the three
   write channels (in-memory ring only, ``state_path`` dual-write,
   ``WriteGate``), and dry-run suppression;
-* call-site level: one test per production call site proving a changed
-  window produces exactly one ``throttle_window_set`` carrying the right
+* call-site level: one test per production call site (six emit-capable
+  lanes: the four ``dead_worker_reap`` sites, ``reconcile.apply_fixes``,
+  and the orphan sweep's ``dead_worker_classification`` classify-at-credit
+  seam) proving a changed window produces exactly one
+  ``throttle_window_set`` carrying the right
   ``previous``/``throttled_until``/``source``;
 * structural: an AST scan that fails if a new ``set_throttled_until`` call
   site appears without a ``source=`` literal, and the signature checks that
@@ -33,6 +36,7 @@ from typing import Any
 import pytest
 
 from _fakes_github import FakeGitHub
+from _orphan_sweep_fixtures import _dead_worker_rework_bed, _run_orphan_sweep
 from _worker_fixtures import _make_stalled_devin_session, _stale_devin_probe, _wg
 from charlie_work.config import (
     DevinConfig,
@@ -290,10 +294,14 @@ def _write_devin_sidecar(
     log_text: str,
     *,
     error: str | None,
+    pid: int | None = None,
 ) -> Path:
-    """A devin sidecar with ``pid=None``: ``error`` set is a launch failure
-    (issue #266), ``error=None`` is a confirmed-dead session with no process
-    to probe (``is_worker_confirmed_dead`` short-circuits on ``pid=None``)."""
+    """A devin sidecar with ``pid=None`` by default: ``error`` set is a
+    launch failure (issue #266), ``error=None`` is a confirmed-dead session
+    with no process to probe (``is_worker_confirmed_dead`` short-circuits on
+    ``pid=None``). The orphan-sweep lane instead needs the sidecar pid to
+    match the entry's recorded ``worker_pid`` (``_worker_view_for_entry``
+    refuses a mismatched log), so ``pid`` is overridable."""
     from charlie_work import devin_shell
 
     sessions_dir.mkdir(parents=True, exist_ok=True)
@@ -305,7 +313,7 @@ def _write_devin_sidecar(
         worktree_path=str(sessions_dir.parent / "worktree"),
         prompt_path="prompt.md",
         command=("devin", "--prompt-file", "prompt.md"),
-        pid=None,
+        pid=pid,
         started_at=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
         log_path=str(log_path),
         error=error,
@@ -530,3 +538,72 @@ def test_reconcile_apply_fixes_emits_throttle_window_set(tmp_path: Path) -> None
     db_events = [e for e in read_event_log(state_path) if e["kind"] == "throttle_window_set"]
     assert len(db_events) == 1
     assert db_events[0]["level"] == "info"
+
+
+def test_orphan_sweep_classification_emits_throttle_window_set(tmp_path: Path) -> None:
+    """Call site 6: the state.json-keyed orphan sweep's classify-at-credit
+    seam (``dead_worker_classification``, reached through
+    ``orphaned_worker_sweep.handle_dead_worker_with_pr``) arms the cooldown
+    for a throttle-classified death inside the sweep's ``state_lock``.
+    Threaded through the sweep's ``WriteGate``, the audit row reaches
+    events.db -- not only the in-memory ring, which is where this lane's
+    event used to stop."""
+    config, paths, fake_gh, _ = _dead_worker_rework_bed(tmp_path)
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    _write_devin_sidecar(
+        sessions_dir,
+        207,
+        "applying rework\nReached free model rate limit\n",
+        error=None,
+        pid=99999,
+    )
+
+    _run_orphan_sweep(tmp_path, paths, config, fake_gh)
+
+    state = load_state(paths.state_file)
+    # The classification still lands: kind stamped, cooldown armed, the
+    # provider-throttle death never credited.
+    entry = state["issues"]["207"]
+    assert entry["dead_worker_failure_kind"] == "rate_limited"
+    assert state["throttled_until"]
+
+    events = _throttle_window_events(state)
+    assert len(events) == 1
+    payload = events[0]["payload"]
+    assert payload["source"] == "dead_worker_classification"
+    assert payload["previous"] is None
+    assert payload["throttled_until"] == state["throttled_until"]
+    assert payload["reason"] == "rate_limited"
+    assert payload["adapter_kind"] == "devin"
+
+    db_events = [e for e in read_event_log(paths.state_file) if e["kind"] == "throttle_window_set"]
+    assert len(db_events) == 1
+    assert db_events[0]["level"] == "info"
+    assert db_events[0]["payload"]["source"] == "dead_worker_classification"
+    close_db(paths.state_file)
+
+
+def test_orphan_sweep_classification_dry_run_suppresses_throttle_window_set(
+    tmp_path: Path,
+) -> None:
+    """The threaded gate's dry-run suppression applies to this lane too:
+    under ``dry_run=True`` no ``throttle_window_set`` is emitted and no
+    events.db exists at all -- the same footprint as a pass that never ran
+    (the WriteGate invariant), with state.json left untouched."""
+    config, paths, fake_gh, _ = _dead_worker_rework_bed(tmp_path)
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    _write_devin_sidecar(
+        sessions_dir,
+        207,
+        "applying rework\nReached free model rate limit\n",
+        error=None,
+        pid=99999,
+    )
+
+    _run_orphan_sweep(tmp_path, paths, config, fake_gh, dry_run=True)
+
+    state = load_state(paths.state_file)
+    assert not state.get("throttled_until")
+    assert state["issues"]["207"]["status"] == "dispatched"
+    assert "dead_worker_failure_kind" not in state["issues"]["207"]
+    assert not (paths.state_file.parent / "events.db").exists()

@@ -48,6 +48,7 @@ from .rework_outcome import (
 )
 from .state import PASSIVE_OPEN_STATUS
 from .worktree import worktree_path_for_branch
+from .write_gate import WriteGate, require_write_gate
 
 if TYPE_CHECKING:
     from .config import OrchestratorConfig
@@ -396,6 +397,7 @@ def handle_dead_worker_with_pr(
     pr_orphan_unreviewed_details: dict[int, dict[str, Any]],
     drift_fingerprint: Callable[..., str],
     reap_escalations: list[int],
+    write_gate: WriteGate,
     on_fate: Callable[[worker_fate.WorkerFate], None] | None = None,
 ) -> None:
     """Classify one dead dispatched worker that still has an open PR.
@@ -423,6 +425,12 @@ def handle_dead_worker_with_pr(
     # import here would cycle. Attribute access through the module object
     # also keeps suite patches on ``charlie_work.workflow.<name>`` live.
     import charlie_work.workflow as _wf
+
+    # Convention B (issue #2006): the classify-at-credit calls below arm the
+    # provider cooldown through ``worker_fate.persist_failure``; the gate is
+    # their ``throttle_window_set`` audit channel (events.db dual-write,
+    # dry-run suppression), so a missing gate must fail loudly here.
+    write_gate = require_write_gate(write_gate)
 
     pr_number = int(pr_data["number"])
     pr_state = state.get("prs", {}).get(str(pr_number), {})
@@ -597,7 +605,13 @@ def handle_dead_worker_with_pr(
                     death_ts = _wf.utc_now()
                     # Issue #2002: classify the sidecar log before crediting.
                     death_kind = classify_and_credit_dead_worker(
-                        entry, sessions_dir, issue_number, state, config, at=death_ts
+                        entry,
+                        sessions_dir,
+                        issue_number,
+                        state,
+                        config,
+                        write_gate=write_gate,
+                        at=death_ts,
                     )
                     sweep_events.append(
                         (
@@ -813,7 +827,13 @@ def handle_dead_worker_with_pr(
                     # request_changes branch above.
                     # Issue #2002: classify the sidecar log before crediting.
                     death_kind = classify_and_credit_dead_worker(
-                        entry, sessions_dir, issue_number, state, config, at=death_ts
+                        entry,
+                        sessions_dir,
+                        issue_number,
+                        state,
+                        config,
+                        write_gate=write_gate,
+                        at=death_ts,
                     )
                     sweep_events.append(
                         (
@@ -897,6 +917,7 @@ def handle_dead_worker_with_pr(
                             issue_number,
                             state,
                             config,
+                            write_gate=write_gate,
                             at=death_ts,
                             classify_log=False,
                         )
