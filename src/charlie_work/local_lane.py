@@ -110,15 +110,6 @@ def probe_branch_ref(repo_root: Path, branch: str) -> tuple[bool | None, str | N
     return result.returncode == 0, None
 
 
-def branch_ref_exists(repo_root: Path, branch: str) -> bool | None:
-    """Whether ``refs/heads/<branch>`` resolves -- a tri-state probe.
-
-    Thin wrapper over :func:`probe_branch_ref` for callers that need the
-    verdict but not the failure detail.
-    """
-    return probe_branch_ref(repo_root, branch)[0]
-
-
 def resolve_ref_sha(repo_root: Path, ref: str) -> str | None:
     """Resolve any revision expression (branch, tag, ``HEAD``) to a commit SHA.
 

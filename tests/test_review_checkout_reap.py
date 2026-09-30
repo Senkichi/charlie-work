@@ -101,7 +101,7 @@ def test_reap_completed_review_checkouts_skips_while_reviewer_still_alive(
     have its checkout removed out from under the exiting process.
 
     Uses this test process's own PID/start-time as the sidecar's recorded
-    identity, so the real (non-monkeypatched) claude_code.is_worker_alive
+    identity, so the real (non-monkeypatched) worker_fate.is_alive
     liveness+identity check reports it genuinely alive — matching how
     test_count_live_sessions_ghost_worker_pid_corroborated_by_state (same
     file) proves a "ghost" liveness case elsewhere in this suite.

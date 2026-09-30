@@ -126,11 +126,16 @@ UNESCALATE_ISSUE_RESET_FIELDS = (
     # exempt a later, genuinely different death from the orphan-sweep
     # timed reap and redispatch cap.
     "dead_worker_failure_kind",
+    # Companion of the stamp above (when it was classified; wf-r2-s4).
+    "dead_worker_failure_classified_at",
     # Issue #1993: companion of the stamp above (bounded re-arm counter).
     "throttle_reap_rearm_count",
     # Issue #1971: the bounded local-park deferral bookkeeping is per death
     # episode; a re-arm starts the deferral budget fresh.
     *LOCAL_PARK_DEFER_FIELDS,
+    # wf-r2-s6 (N4): the live-handoff lane's "already routed this outcome"
+    # marker; a re-arm must let the lane consider the outcome afresh.
+    "live_handoff_routed_outcome_at",
     # Issue #2002: ``worker_death_failure_kinds`` (the per-death timestamp ->
     # classified-kind map written by ``_credit_worker_death``) is deliberately
     # ABSENT from this tuple: it is the forensic record of WHICH classification

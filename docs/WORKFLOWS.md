@@ -105,7 +105,7 @@ charlie work --limit 3
 # 5. Poll for liveness/completion instead of pasting anything by hand.
 #    `charlie doctor --adapter-probe` reports failed/exited sessions, or
 #    read the sidecars directly:
-python -c "from pathlib import Path; from charlie_work.devin_shell import read_session_records, is_session_alive; recs = read_session_records(Path('.var/charlie-work/dispatches/sessions')); [print(r.issue_number, is_session_alive(r)) for r in recs]"
+python -c "from pathlib import Path; from charlie_work.devin_shell import read_session_records; from charlie_work.worker_fate import is_alive; recs = read_session_records(Path('.var/charlie-work/dispatches/sessions')); [print(r.issue_number, is_alive(r.pid, r.process_start_time)) for r in recs]"
 
 # 6-9. Same why-charlie-hate/verdict/ship-it sequence as the manual loop
 charlie why-charlie-hate --pr 123

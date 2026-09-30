@@ -32,11 +32,13 @@ import pytest
 
 from charlie_work.config import LabelConfig
 from charlie_work.dead_dispatched_timer import (
+    LOCAL_PARK_DEFER_FIELDS,
     LOCAL_PARK_DEFER_MAX_PASSES,
     dead_dispatched_reap_due,
     defer_or_expire_local_park,
 )
 from charlie_work.local_issues import LocalFileGitHub
+from charlie_work.local_lane import probe_branch_ref
 from charlie_work.local_work_park import (
     LocalParkResult,
     park_backstop_due_local_orphans,
@@ -45,6 +47,7 @@ from charlie_work.local_work_park import (
 from charlie_work.orphaned_worker_sweep import maybe_reap_dead_dispatched_worker
 from charlie_work.paths import runtime_paths
 from charlie_work.state import load_state, save_state
+from charlie_work.subprocess_runner import RunResult
 from test_orphan_sweep_backstop_local_park import (
     _add_worktree_commit,
     _events,
@@ -507,6 +510,131 @@ def test_reap_due_matches_documented_semantics(
         max_throttle_rearms=0,
     )
     assert reaped is expected
+
+
+# ---------------------------------------------------------------------------
+# local_lane.probe_branch_ref -- the tri-state ref probe the park lane uses.
+# ---------------------------------------------------------------------------
+
+
+def test_probe_branch_ref_true_false_and_none(tmp_path: Path) -> None:
+    """rc 0 -> (True, None), rc 1 -> (False, None), rc >= 2 / spawn error -> (None, detail)."""
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    _git(repo, "branch", "agent/issue-7-x")
+    assert probe_branch_ref(repo, "agent/issue-7-x") == (True, None)  # rc 0
+    assert probe_branch_ref(repo, "ghost-branch") == (False, None)  # rc 1
+
+    for result in (
+        RunResult(returncode=128, stdout="", stderr="fatal: not a git repository"),
+        RunResult(returncode=None, stdout="", stderr="", error="spawn failed"),
+        RunResult(returncode=None, stdout="", stderr="", timed_out=True, error="timeout"),
+    ):
+        with patch("charlie_work.local_lane.run_captured", return_value=result):
+            exists, detail = probe_branch_ref(repo, "agent/issue-7-x")
+            assert exists is None and detail  # the third state carries a reason
+
+
+# ---------------------------------------------------------------------------
+# park_backstop_due_local_orphans -- the stale-snapshot due-check edge.
+# ---------------------------------------------------------------------------
+
+
+def test_drain_rechecks_due_against_fresh_state(tmp_path: Path, shallow_wts: Path) -> None:
+    """Drift cleared between the sweep's pre-lock snapshot and the drain
+    must not be probed: the in-lock backstop re-reads the entry before
+    escalating, so the drain re-verifies due-ness on a fresh locked read --
+    the snapshot-only check would park an already-resolved entry."""
+    number = 2004
+    repo_root, config, gh, paths, state = _drain_setup(tmp_path, shallow_wts, number, ())
+    # An earlier pre-lock lane cleared the drift under its own state_lock:
+    # the snapshot still shows it armed (due), disk does not.
+    fresh = load_state(paths.state_file)
+    fresh["issues"][str(number)].pop("orphan_drift_at", None)
+    save_state(paths.state_file, fresh)
+
+    with patch(
+        "charlie_work.local_work_park.park_salvageable_local_orphan",
+        return_value=LocalParkResult("parked"),
+    ) as park:
+        deferred = park_backstop_due_local_orphans(
+            gh=gh,
+            config=config,
+            repo_root=repo_root,
+            worktrees_dir=None,
+            state=state,
+            state_file=paths.state_file,
+            no_pr_orphans=[number],
+            issues_by_number={number: gh.issue_view(number)},
+            worker_outcomes={},
+            reclaim_results={},
+            escalations=(),
+            park_verdicts={},
+            dead_dispatched_reap_minutes=config.watchdog.dead_dispatched_reap_minutes,
+            now=datetime.now(UTC),
+            write_gate=_wg(paths.state_file),
+        )
+
+    park.assert_not_called()
+    assert deferred == {}
+
+
+# ---------------------------------------------------------------------------
+# _reset_probe_deferral -- the probe_failed -> conclusive transition.
+# ---------------------------------------------------------------------------
+
+
+def test_probe_failed_then_conclusive_verdict_clears_deferral(
+    tmp_path: Path, shallow_wts: Path
+) -> None:
+    """A conclusive verdict after a deferred probe clears the stamped budget.
+
+    The recovery test covers probe_failed -> ``parked``, which clears the
+    counters via the park's own status flip. A conclusive verdict that does
+    NOT park -- a provably absent branch ref -> ``no_commits`` -- reaches
+    ``_reset_probe_deferral`` in ``park_or_reclaim_local_orphan``'s else
+    branch; this pins that path.
+    """
+    labels_cfg = LabelConfig()
+    number = 2005
+    _, config, gh, paths, branch = _worktree_gone_setup(
+        tmp_path, shallow_wts, number, (labels_cfg.in_progress,)
+    )
+    _seed_dead_dispatched(paths.state_file, number, branch, armed_drift_minutes_ago=5)
+    sessions_dir = _sessions_dir(tmp_path)
+
+    # Pass 1: inconclusive probe -> bounded deferral stamped on the entry.
+    with _probe_error():
+        _run_sweep(
+            sessions_dir,
+            paths.state_file,
+            config,
+            gh,
+            _wg(paths.state_file),
+            tmp_path / "fleet",
+        )
+    entry = load_state(paths.state_file)["issues"][str(number)]
+    assert entry["local_park_defer_count"] == 1
+
+    # Pass 2: provably empty ref -> ``no_commits`` -> the reclaim proceeds
+    # and the deferral bookkeeping is cleared.
+    with (
+        _probe_error(),
+        patch("charlie_work.local_work_park.probe_branch_ref", return_value=(False, None)),
+    ):
+        _run_sweep(
+            sessions_dir,
+            paths.state_file,
+            config,
+            gh,
+            _wg(paths.state_file),
+            tmp_path / "fleet",
+        )
+
+    entry = load_state(paths.state_file)["issues"][str(number)]
+    for field_name in LOCAL_PARK_DEFER_FIELDS:
+        assert field_name not in entry
+    assert labels_cfg.ready in _label_names(gh, number)
 
 
 def test_reap_due_throttle_exemption_is_not_vacuous() -> None:

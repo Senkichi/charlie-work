@@ -47,7 +47,7 @@ def test_classify_worker_health_wall_clock_slow_default(tmp_path: Path) -> None:
         reclaimed=None,
     )
 
-    with patch("charlie_work.worker.is_session_alive", return_value=True):
+    with patch("charlie_work.worker_fate.is_alive", return_value=True):
         config = OrchestratorConfig()  # Default: wall_clock_kill=False
         now = datetime.now(UTC)
         health = classify_worker_health(view, config, now)
@@ -76,7 +76,7 @@ def test_classify_worker_health_wall_clock_runaway_with_kill(tmp_path: Path) -> 
         reclaimed=None,
     )
 
-    with patch("charlie_work.worker.is_session_alive", return_value=True):
+    with patch("charlie_work.worker_fate.is_alive", return_value=True):
         config = OrchestratorConfig(watchdog=WatchdogConfig(wall_clock_kill=True))
         now = datetime.now(UTC)
         health = classify_worker_health(view, config, now)
@@ -105,7 +105,7 @@ def test_classify_worker_health_wall_clock_within_threshold(tmp_path: Path) -> N
         reclaimed=None,
     )
 
-    with patch("charlie_work.worker.is_session_alive", return_value=True):
+    with patch("charlie_work.worker_fate.is_alive", return_value=True):
         config = OrchestratorConfig()
         now = datetime.now(UTC)
         health = classify_worker_health(view, config, now)
@@ -147,7 +147,7 @@ def test_classify_worker_health_loop_slow_default(tmp_path: Path) -> None:
         reclaimed=None,
     )
 
-    with patch("charlie_work.worker.is_worker_alive", return_value=True):
+    with patch("charlie_work.worker_fate.is_alive", return_value=True):
         config = OrchestratorConfig()  # Default: loop_kill=False
         now = datetime.now(UTC)
         health = classify_worker_health(view, config, now)
@@ -188,7 +188,7 @@ def test_classify_worker_health_loop_runaway_with_kill(tmp_path: Path) -> None:
         reclaimed=None,
     )
 
-    with patch("charlie_work.worker.is_worker_alive", return_value=True):
+    with patch("charlie_work.worker_fate.is_alive", return_value=True):
         config = OrchestratorConfig(watchdog=WatchdogConfig(loop_kill=True))
         now = datetime.now(UTC)
         health = classify_worker_health(view, config, now)
@@ -229,7 +229,7 @@ def test_classify_worker_health_loop_skipped_when_log_stale(tmp_path: Path) -> N
         reclaimed=None,
     )
 
-    with patch("charlie_work.worker.is_worker_alive", return_value=True):
+    with patch("charlie_work.worker_fate.is_alive", return_value=True):
         config = OrchestratorConfig()
         now = datetime.now(UTC)
         health = classify_worker_health(view, config, now)
@@ -263,7 +263,7 @@ def test_classify_worker_health_loop_devin_never_runaway(tmp_path: Path) -> None
         reclaimed=None,
     )
 
-    with patch("charlie_work.worker.is_session_alive", return_value=True):
+    with patch("charlie_work.worker_fate.is_alive", return_value=True):
         # Even with loop_kill=True, Devin should never return RUNAWAY from this tripwire
         config = OrchestratorConfig(watchdog=WatchdogConfig(loop_kill=True))
         now = datetime.now(UTC)
@@ -293,7 +293,7 @@ def test_classify_worker_health_loop_no_events_file(tmp_path: Path) -> None:
         reclaimed=None,
     )
 
-    with patch("charlie_work.worker.is_worker_alive", return_value=True):
+    with patch("charlie_work.worker_fate.is_alive", return_value=True):
         config = OrchestratorConfig()
         now = datetime.now(UTC)
         health = classify_worker_health(view, config, now)
@@ -343,7 +343,7 @@ def test_classify_worker_health_loop_claude_log_layout_runaway(tmp_path: Path) -
         reclaimed=None,
     )
 
-    with patch("charlie_work.worker.is_worker_alive", return_value=True):
+    with patch("charlie_work.worker_fate.is_alive", return_value=True):
         config = OrchestratorConfig(watchdog=WatchdogConfig(loop_kill=True))
         now = datetime.now(UTC)
         health = classify_worker_health(view, config, now)

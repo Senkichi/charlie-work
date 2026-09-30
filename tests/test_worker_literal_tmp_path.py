@@ -254,8 +254,7 @@ def _run_dead_lane(
     from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
 
     monkeypatch.setattr(dead_worker_reap, "sweep_orphan_processes", lambda worktree_path: [])
-    monkeypatch.setattr("charlie_work.worker.is_worker_alive", lambda record: False)
-    monkeypatch.setattr("charlie_work.worker.is_session_alive", lambda record: False)
+    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: False)
     monkeypatch.setattr("charlie_work.worker.real_activity_probe_for", lambda *args: None)
 
     _classify_dead_sessions_and_update_throttle_state(

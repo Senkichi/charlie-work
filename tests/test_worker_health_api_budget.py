@@ -87,7 +87,7 @@ def test_classify_worker_health_api_budget_kill_over_cap(tmp_path: Path) -> None
     _write_api_events(tmp_path)  # 6.15 USD at default pricing
     view = _api_worker_view(tmp_path)
 
-    with patch("charlie_work.worker.is_worker_alive", return_value=True):
+    with patch("charlie_work.worker_fate.is_alive", return_value=True):
         config = OrchestratorConfig(
             api_worker=ApiWorkerConfig(
                 enabled=True,
@@ -107,7 +107,7 @@ def test_classify_worker_health_api_budget_dormant_cap_unset(tmp_path: Path) -> 
     _write_api_events(tmp_path)  # 6.15 USD — would exceed a 5.0 cap, but cap is 0
     view = _api_worker_view(tmp_path)
 
-    with patch("charlie_work.worker.is_worker_alive", return_value=True):
+    with patch("charlie_work.worker_fate.is_alive", return_value=True):
         config = OrchestratorConfig(
             api_worker=ApiWorkerConfig(
                 enabled=True,
@@ -126,7 +126,7 @@ def test_classify_worker_health_api_budget_below_cap_healthy(tmp_path: Path) -> 
     _write_api_events(tmp_path)  # 6.15 USD
     view = _api_worker_view(tmp_path)
 
-    with patch("charlie_work.worker.is_worker_alive", return_value=True):
+    with patch("charlie_work.worker_fate.is_alive", return_value=True):
         config = OrchestratorConfig(
             api_worker=ApiWorkerConfig(
                 enabled=True,
@@ -162,7 +162,7 @@ def test_classify_worker_health_api_budget_non_api_never_evaluated(
         reclaimed=None,
     )
 
-    with patch("charlie_work.worker.is_worker_alive", return_value=True):
+    with patch("charlie_work.worker_fate.is_alive", return_value=True):
         # api budget cap is low, but the worker is claude-code, not api.
         config = OrchestratorConfig(
             api_worker=ApiWorkerConfig(
@@ -185,7 +185,7 @@ def test_classify_worker_health_api_budget_no_provider_healthy(tmp_path: Path) -
     _write_api_events(tmp_path)
     view = _api_worker_view(tmp_path, provider="")
 
-    with patch("charlie_work.worker.is_worker_alive", return_value=True):
+    with patch("charlie_work.worker_fate.is_alive", return_value=True):
         config = OrchestratorConfig(
             api_worker=ApiWorkerConfig(
                 enabled=True,
@@ -205,7 +205,7 @@ def test_classify_worker_health_api_budget_no_events_healthy(tmp_path: Path) -> 
     view = _api_worker_view(tmp_path)
     # No events.jsonl written.
 
-    with patch("charlie_work.worker.is_worker_alive", return_value=True):
+    with patch("charlie_work.worker_fate.is_alive", return_value=True):
         config = OrchestratorConfig(
             api_worker=ApiWorkerConfig(
                 enabled=True,

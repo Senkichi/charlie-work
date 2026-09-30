@@ -25,8 +25,6 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from .throttle_signatures import is_provider_throttle_failure
-
 # Consecutive deferred passes an issue gets while the salvageable-work probe
 # keeps failing before the lane resolves anyway (escalate for the #654
 # backstop, reclaim for the active-labeled lane). Deferred passes are counted
@@ -67,10 +65,13 @@ def dead_dispatched_reap_due(
     count``) stays in the caller -- it mutates the entry, so it is not part
     of the read-only predicate.
     """
-    # Deferred: workflow.py imports this module's consumers top-level, so a
-    # top-level import here would cycle. Attribute access through the module
-    # object also keeps suite patches on ``charlie_work.workflow.<name>``
+    # Deferred: workflow.py imports this module's consumers top-level, and
+    # worker_fate -> state -> this module would close a second cycle; a
+    # top-level import of either would break at module init. Attribute
+    # access through the module objects also keeps suite patches on
+    # ``charlie_work.workflow.<name>`` / ``charlie_work.worker_fate.<name>``
     # live.
+    import charlie_work.worker_fate as _fate
     import charlie_work.workflow as _wf
 
     orphan_drift_at = entry.get("orphan_drift_at")
@@ -78,7 +79,10 @@ def dead_dispatched_reap_due(
     if drift_dt is None or dead_dispatched_reap_minutes <= 0:
         return False
     grace_anchor = drift_dt
-    if is_provider_throttle_failure(entry.get("dead_worker_failure_kind")):
+    # A6 (worker_fate §6): the persisted failure kind is read through the
+    # single accessor -- the raw ``dead_worker_failure_kind`` key is confined
+    # to state.py/worker_fate.py by the AST seam guard.
+    if _fate.persisted_failure(entry).is_throttle:
         throttled_until_dt = _wf._parse_iso_timestamp(state.get("throttled_until"))
         if throttled_until_dt is not None:
             if throttled_until_dt > now:

@@ -423,7 +423,7 @@ def test_standalone_dispatch_and_rework_advance_inconclusive_probe_counter_once(
             )
         )
 
-    monkeypatch.setattr("charlie_work.worker.is_session_alive", lambda _record: False)
+    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: False)
     monkeypatch.setattr("charlie_work.worker.real_activity_probe_for", _inconclusive_probe)
 
     result = app.dispatch(limit=0)

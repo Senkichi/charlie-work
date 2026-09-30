@@ -45,6 +45,7 @@ from .local_lane import branch_diff_result, local_base_branch, probe_branch_ref
 from .paths import resolved_layout, runtime_paths
 from .rework_prompts import _write_text_atomic
 from .state import PASSIVE_OPEN_STATUS, load_state, load_state_locked, state_lock
+from .worker_fate import persisted_failure
 from .worktree import inspect_worktree_state, read_worker_outcome, worktree_path_for_branch
 from .write_gate import WriteGate
 
@@ -329,7 +330,7 @@ def park_salvageable_local_orphan(
         active_labels=active_labels,
         issue_labels=issue_labels,
         state_file=state_file,
-        failure_kind=(entry.get("dead_worker_failure_kind") if isinstance(entry, dict) else None),
+        failure_kind=(persisted_failure(entry).kind if isinstance(entry, dict) else None),
         issue_title=issue.get("title"),
         issue=issue,
         worker_outcome=worker_outcome,
@@ -550,7 +551,10 @@ def park_backstop_due_local_orphans(
     * issues carrying a ``config.labels.terminal`` label -- ``done``,
       ``human_needed``, ``operator_queue``, ``review_ready`` are answers
       another lane already gave, and parking would strip them;
-    * entries the timer predicate does not mark due.
+    * entries the timer predicate does not mark due -- checked first on the
+      sweep's pre-lock snapshot (cheap filter) and re-verified on a fresh
+      locked read immediately before the probe, since the in-lock backstop
+      re-checks on fresh state too.
 
     Returns ``{issue_number: reason}`` for every issue whose park attempt
     failed (``park_failed``) or whose branch probe was inconclusive
@@ -592,12 +596,29 @@ def park_backstop_due_local_orphans(
             now=now,
         ):
             continue
+        # Stale-snapshot edge: ``state`` is the sweep's pre-lock snapshot,
+        # but the in-lock backstop re-checks due-ness on a fresh load, and
+        # the earlier pre-lock lanes (reclaim, park, live-handoff finalize)
+        # may have rewritten the entry under their own ``state_lock``s.
+        # Re-verify on the current entry before the probe/park I/O so the
+        # drain never fires on fields a cheaper lane already resolved this
+        # pass -- the same fresh read ``park_labelless_dead_local_session``
+        # takes for its status check.
+        fresh = load_state_locked(state_file)
+        fresh_entry = (fresh.get("issues") or {}).get(str(issue_number))
+        if not isinstance(fresh_entry, dict) or not dead_dispatched_reap_due(
+            state=fresh,
+            entry=fresh_entry,
+            dead_dispatched_reap_minutes=dead_dispatched_reap_minutes,
+            now=now,
+        ):
+            continue
         park_result = park_salvageable_local_orphan(
             gh=gh,
             config=config,
             repo_root=repo_root,
             worktrees_dir=worktrees_dir,
-            state=state,
+            state=fresh,
             issue_number=issue_number,
             issue=issue,
             active_labels=issue_labels & config.labels.active,

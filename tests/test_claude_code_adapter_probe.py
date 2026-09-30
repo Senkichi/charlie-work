@@ -142,7 +142,7 @@ def test_run_quota_probe_quota_exhausted_output_returns_false(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     # Issue: exit code 0 with an in-band throttle message must not be
-    # misread as a green probe (mirrors _classify_session_failure's log-tail
+    # misread as a green probe (mirrors worker_fate.classify_for's log-tail
     # handling for a real worker).
     monkeypatch.setattr(claude_code, "resolve_cli_binary", lambda name: name)
     monkeypatch.setattr(
