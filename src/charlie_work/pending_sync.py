@@ -44,7 +44,7 @@ SELF_DEPLOY_SYNC_STARVED_KIND = "self_deploy_sync_starved"
 #: Default starvation bound (seconds) for a deferred ``uv sync`` that stays
 #: pending under continuous live fleet workers before the supervisor stops
 #: admitting new dispatches (issue #1855). Mirrors
-#: ``config.SupervisorConfig.dependency_sync_starvation_seconds``'s default;
+#: ``config.FleetSupervisorConfig.dependency_sync_starvation_seconds``'s default;
 #: <= 0 disables the bound.
 DEFAULT_SYNC_STARVATION_SECONDS = 14400
 
