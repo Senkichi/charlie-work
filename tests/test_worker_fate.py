@@ -169,12 +169,11 @@ def test_row4_unconfirmed_push_with_unpushed_commits_is_stranded(alive: bool) ->
     evidence = _evidence(
         pid_alive=alive,
         worktree_outcome=outcome,
-        branch=_branch(remote_head_sha=None, remote_ahead=0, unpushed=2, has_remote=True),
+        branch=_branch(remote_head_sha=None, remote_ahead=0, unpushed=2),
     )
     fate = resolve_fate(evidence, now=NOW)
     assert isinstance(fate, Stranded)
     assert fate.unpushed == 2
-    assert fate.park is False
     assert fate.basis.rule.startswith("R3+R9")
 
 
@@ -193,7 +192,7 @@ def test_row4_known_head_mismatch_is_stale_not_unconfirmed_push() -> None:
         pid_alive=True,
         health=WorkerHealth.HEALTHY,
         worktree_outcome=outcome,
-        branch=_branch(remote_head_sha="different-sha", unpushed=2, has_remote=True),
+        branch=_branch(remote_head_sha="different-sha", unpushed=2),
     )
     fate = resolve_fate(evidence, now=NOW)
     assert isinstance(fate, Live)
@@ -209,7 +208,7 @@ def test_row4_known_head_mismatch_dead_still_stranded_via_row6() -> None:
     evidence = _evidence(
         pid_alive=False,
         worktree_outcome=outcome,
-        branch=_branch(remote_head_sha="different-sha", unpushed=2, has_remote=True),
+        branch=_branch(remote_head_sha="different-sha", unpushed=2),
     )
     fate = resolve_fate(evidence, now=NOW)
     assert isinstance(fate, Stranded)
@@ -217,15 +216,14 @@ def test_row4_known_head_mismatch_dead_still_stranded_via_row6() -> None:
     assert any(s.reason == StaleReason.HEAD_MISMATCH for s in fate.basis.stale)
 
 
-def test_row4_parks_on_no_remote_repo() -> None:
+def test_row4_no_remote_repo_is_still_stranded() -> None:
     outcome = _outcome(push_succeeded=True, head_sha="claimed-sha")
     evidence = _evidence(
         worktree_outcome=outcome,
-        branch=_branch(remote_head_sha=None, remote_ahead=0, unpushed=1, has_remote=False),
+        branch=_branch(remote_head_sha=None, remote_ahead=0, unpushed=1),
     )
     fate = resolve_fate(evidence, now=NOW)
     assert isinstance(fate, Stranded)
-    assert fate.park is True
 
 
 # --------------------------------------------------------------------------
@@ -268,11 +266,10 @@ def test_row6_dead_with_unpushed_commits_is_stranded() -> None:
 def test_row6_remote_unknown_local_ahead_is_stranded_with_remote_unknown_rule() -> None:
     """N5: no remote read (``remote_ahead``/``remote_head_sha``/``unpushed`` all
     unknown) but local commits exist -> Stranded under a distinct rule."""
-    evidence = _evidence(pid_alive=False, branch=_branch(local_ahead=2, has_remote=False))
+    evidence = _evidence(pid_alive=False, branch=_branch(local_ahead=2))
     fate = resolve_fate(evidence, now=NOW)
     assert isinstance(fate, Stranded)
     assert fate.unpushed == 2
-    assert fate.park is True
     assert fate.basis.rule == "R3+R9-remote-unknown"
 
 

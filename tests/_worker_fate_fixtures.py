@@ -23,7 +23,6 @@ NOW = DISPATCHED + timedelta(minutes=10)
 
 def _branch(
     *,
-    has_remote: bool = True,
     remote_head_sha: str | None = None,
     remote_ahead: int | None = None,
     unpushed: int | None = None,
@@ -32,7 +31,6 @@ def _branch(
     pr_known: bool = False,
 ) -> BranchEvidence:
     return BranchEvidence(
-        has_remote=has_remote,
         remote_head_sha=remote_head_sha,
         remote_ahead=remote_ahead,
         unpushed=unpushed,

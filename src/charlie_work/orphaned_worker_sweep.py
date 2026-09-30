@@ -181,7 +181,12 @@ def maybe_reap_dead_dispatched_worker(
         )
         return state, False
     pr_number = int(pr_data["number"]) if pr_data else None
-    terminal = find_worker_terminal_status(sessions_dir, issue_number)
+    # Rule 1 (freshness): a record left by an earlier dispatch must not
+    # attribute its exit code to this death.
+    terminal = worker_fate.fresh_terminal_record(
+        find_worker_terminal_status(sessions_dir, issue_number),
+        _wf._parse_iso_timestamp(entry.get("dispatched_at")),
+    )
     terminal_exit_code = terminal.get("exit_code") if terminal else None
     state = _wf._escalate_issue(
         state,
@@ -445,7 +450,13 @@ def handle_dead_worker_with_pr(
     # every event below records it as-is so the two populations
     # (confirmed clean exit vs. everything else) are queryable
     # retrospectively even before they're fully separable.
-    terminal = find_worker_terminal_status(sessions_dir, issue_number)
+    # Rule 1 (freshness, ``fresh_terminal_record``): a record whose
+    # ``ended_at`` predates this dispatch is an earlier attempt's, and
+    # reads as None here exactly like a missing record.
+    terminal = worker_fate.fresh_terminal_record(
+        find_worker_terminal_status(sessions_dir, issue_number),
+        _wf._parse_iso_timestamp(entry.get("dispatched_at")),
+    )
     terminal_pid = entry.get("worker_pid")
     terminal_exit_code = terminal.get("exit_code") if terminal else None
     terminal_duration_seconds = terminal.get("duration_seconds") if terminal else None

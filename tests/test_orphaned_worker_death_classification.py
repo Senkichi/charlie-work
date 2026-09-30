@@ -20,6 +20,7 @@ end-to-end rather than mocked.
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -333,7 +334,18 @@ def test_unreviewed_pr_clean_exit_worker_quoting_rate_limit_is_not_log_classifie
     )
     sidecar_path = _write_devin_sidecar(sessions_dir, 207, pid=99999, log_path=log_path)
     (sessions_dir / "issue-207.devin.terminal.json").write_text(
-        json.dumps({"exit_code": 0, "duration_seconds": 12.0}), encoding="utf-8"
+        json.dumps(
+            {
+                "exit_code": 0,
+                "duration_seconds": 12.0,
+                # This dispatch's own record (rule 1: ended_at > dispatched_at;
+                # the bed dispatched an hour ago).
+                "ended_at": (datetime.now(UTC) - timedelta(minutes=5))
+                .isoformat()
+                .replace("+00:00", "Z"),
+            }
+        ),
+        encoding="utf-8",
     )
 
     _run_orphan_sweep(tmp_path, paths, config, fake_gh)

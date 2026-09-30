@@ -113,7 +113,6 @@ def resolve_no_pr_orphan_fate(
             terminal=terminal_evidence,
             worktree_outcome=worktree_evidence,
             branch=worker_fate.BranchEvidence(
-                has_remote=True,
                 remote_head_sha=None,
                 remote_ahead=None,
                 unpushed=None,
@@ -155,7 +154,6 @@ def resolve_pushed_orphan_fate(
             terminal=None,
             worktree_outcome=precompute.basis.outcome,
             branch=worker_fate.BranchEvidence(
-                has_remote=True,
                 remote_head_sha=remote_head_sha,
                 remote_ahead=ahead_count,
                 unpushed=None,

@@ -167,10 +167,12 @@ def _stream_json_emission_anchor(
     Real CLI output carries a top-level ``"timestamp"`` only on ``assistant``
     and ``user`` events; the terminal ``result`` event (and ``system`` /
     ``rate_limit_event``) has none. Non-JSON lines (merged stderr) are skipped
-    throughout. So:
+    unless one itself carries the newest marker (step 1). So:
 
-    1. Find the newest event whose own text carries a throttle marker -- the
-       event that IS the emission. Its top-level ``"timestamp"`` is trusted
+    1. Find the newest line carrying a throttle marker. If it is not a stream-json
+       event (a stderr line), return None: the emission is that line, and an
+       older event quoting the marker is not it. Otherwise that event IS the
+       emission. Its top-level ``"timestamp"`` is trusted
        when present. An earlier assistant/user turn is never used: the CLI
        retries a 429 with backoff for minutes before dying, so that turn
        predates the emission by an unbounded gap.
@@ -178,20 +180,29 @@ def _stream_json_emission_anchor(
        last JSON event of the tail, the CLI wrote it last, so the log's mtime
        is the emission time (stderr lines after it are seconds of hook noise).
     3. Otherwise None (the caller anchors at ``now``). In particular a
-       timestamp quoted inside a later ``tool_result`` is never taken.
+       timestamp quoted inside a later ``tool_result`` is never taken, and
+       neither is an older event's when a NON-event line (merged stderr)
+       carries a newer marker.
     """
-    events = [
-        (line, event) for line in tail.splitlines() if (event := _parse_event(line)) is not None
-    ]
-    for index in range(len(events) - 1, -1, -1):
-        line, event = events[index]
+    lines = tail.splitlines()
+    last_event_index = max(
+        (i for i, line in enumerate(lines) if _parse_event(line) is not None), default=-1
+    )
+    for index in range(len(lines) - 1, -1, -1):
+        line = lines[index]
         matched, _ = match_throttle_tail(line, throttle_markers)
         if not matched:
             continue
+        event = _parse_event(line)
+        if event is None:
+            # The newest marker-bearing line is not an event (merged stderr,
+            # or a fragment cut by the tail slice): an older event quoting the
+            # marker is not the emission, so do not anchor on it.
+            return None
         stamped = _event_timestamp(event)
         if stamped is not None:
             return stamped
-        if event.get("type") == "result" and index == len(events) - 1:
+        if event.get("type") == "result" and index == last_event_index:
             try:
                 return datetime.fromtimestamp(log_path.stat().st_mtime, tz=UTC)
             except OSError:

@@ -54,7 +54,7 @@ def test_is_alive_nonpositive_pid_is_never_alive_and_never_probed(
     def _boom(pid: int, expected_start_time: float | None = None) -> bool:
         raise AssertionError("a non-positive pid must not reach the process probe")
 
-    monkeypatch.setattr("charlie_work.worker_fate._process_is_pid_alive", _boom)
+    monkeypatch.setattr("charlie_work.process_utils.is_pid_alive", _boom)
     assert is_alive(0, None) is False
     assert is_alive(-1, 123.0) is False
 
@@ -66,7 +66,7 @@ def test_is_alive_delegates_to_process_utils(monkeypatch: pytest.MonkeyPatch) ->
         calls.append((pid, expected_start_time))
         return True
 
-    monkeypatch.setattr("charlie_work.worker_fate._process_is_pid_alive", _fake)
+    monkeypatch.setattr("charlie_work.process_utils.is_pid_alive", _fake)
     assert is_alive(1234, 5678.0) is True
     assert calls == [(1234, 5678.0)]
 

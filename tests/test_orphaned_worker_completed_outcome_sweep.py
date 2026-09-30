@@ -13,7 +13,7 @@ death, the sweep must route that outcome into the #1877 apply path
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from _dispatch_fixtures import _stub_real_activity_probe_for_stalled_tests  # noqa: F401
@@ -35,6 +35,10 @@ from charlie_work.state import (
 # wrote a fresh, on-target .worker-outcome.json. Before crediting a worker
 # death, the sweep must route that outcome into the #1877 apply path.
 # ---------------------------------------------------------------------------
+
+
+def _iso(value: datetime) -> str:
+    return value.isoformat().replace("+00:00", "Z")
 
 
 def test_orphaned_worker_fresh_outcome_without_terminal_record_is_not_a_death(
@@ -234,8 +238,9 @@ def test_orphaned_worker_recorded_crash_with_fresh_outcome_is_a_death(
             {
                 "pid": 99999,
                 "exit_code": 1,
-                "started_at": "2024-01-01T00:00:00Z",
-                "ended_at": "2024-01-01T00:05:00Z",
+                "started_at": _iso(datetime.now(UTC) - timedelta(minutes=10)),
+                # This dispatch's own record (rule 1: ended_at > dispatched_at).
+                "ended_at": _iso(datetime.now(UTC) - timedelta(minutes=5)),
                 "duration_seconds": 300.0,
             }
         ),

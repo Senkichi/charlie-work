@@ -80,7 +80,7 @@ from typing import Any
 # ``worker_fate.<name>`` for every consumer and test.
 from .adapter_fate_profile import AdapterFateProfile, classify_for, profile_for  # noqa: F401
 from .failure_classifier import classify_failure  # noqa: F401
-from .process_utils import is_pid_alive as _process_is_pid_alive
+from . import process_utils as _process_utils
 from .state import parse_iso_timestamp as _state_parse_iso_timestamp
 from .state import (
     record_dead_worker_failure_kind,
@@ -162,7 +162,6 @@ class BranchEvidence:
     never the same field under two names.
     """
 
-    has_remote: bool  # False on no-remote repos (Park lane)
     remote_head_sha: str | None  # live head of origin/<branch>; None = unknown/absent
     remote_ahead: int | None  # remote branch ahead of base (pushed commits)
     unpushed: int | None  # local HEAD ahead of remote (or of base if never pushed)
@@ -279,7 +278,6 @@ class PushedWithoutPr:
 class Stranded:
     basis: FateBasis
     unpushed: int  # commits not proven on the remote
-    park: bool  # not branch.has_remote
     failure: FailureEvidence | None
 
 
@@ -318,13 +316,17 @@ def is_alive(pid: int | None, process_start_time: float | None) -> bool:
     are always dead -- e.g. a manual-adapter subject that never had a process
     to begin with, or a sentinel pid.
 
-    This is the single liveness seam: the per-adapter ``is_worker_alive`` /
-    ``is_session_alive`` wrappers were deleted (wf-r2-s2), so tests patch
-    ``charlie_work.worker_fate.is_alive`` and nothing else.
+    This is the single liveness seam for worker-fate resolution: the
+    per-adapter ``is_worker_alive`` / ``is_session_alive`` wrappers were
+    deleted (wf-r2-s2), so fate tests patch ``charlie_work.worker_fate.is_alive``.
+    The primitive is looked up at call time, so a patch of
+    ``process_utils.is_pid_alive`` reaches it too. Reviewer, merge-gate and
+    worktree-marker liveness checks (and ``worker.py``'s own probe, which this
+    module imports) deliberately keep calling the primitive directly.
     """
     if pid is None or pid <= 0:
         return False
-    return _process_is_pid_alive(pid, process_start_time)
+    return _process_utils.is_pid_alive(pid, process_start_time)
 
 
 # --------------------------------------------------------------------------
@@ -557,7 +559,6 @@ def resolve_fate(evidence: FateEvidence, *, now: datetime) -> WorkerFate:  # noq
             return Stranded(
                 basis=basis(f"R3+R9{fresh.outcome_suffix}"),
                 unpushed=branch.unpushed,
-                park=not branch.has_remote,
                 failure=evidence.failure,
             )
 
@@ -565,14 +566,13 @@ def resolve_fate(evidence: FateEvidence, *, now: datetime) -> WorkerFate:  # noq
     if evidence.pid_alive:
         return Live(basis=basis("R5"), health=evidence.health)
 
-    # Row 6 (R3+R9): dead, local-only commits -> stranded (salvage; park on
-    # no-remote repos). Carries the failure kind too, so a throttle rearm
+    # Row 6 (R3+R9): dead, local-only commits -> stranded (salvage; the no-origin
+    # archive park is the salvage path's own call, not the fate's). Carries the failure kind too, so a throttle rearm
     # can still apply after the commits are salvaged.
     if branch.unpushed is not None and branch.unpushed > 0:
         return Stranded(
             basis=basis("R3+R9"),
             unpushed=branch.unpushed,
-            park=not branch.has_remote,
             failure=evidence.failure,
         )
 
@@ -592,7 +592,6 @@ def resolve_fate(evidence: FateEvidence, *, now: datetime) -> WorkerFate:  # noq
         return Stranded(
             basis=basis("R3+R9-remote-unknown"),
             unpushed=branch.local_ahead,
-            park=not branch.has_remote,
             failure=evidence.failure,
         )
 
@@ -659,6 +658,25 @@ def resolve_fate(evidence: FateEvidence, *, now: datetime) -> WorkerFate:  # noq
 # now use; re-exported under this name so every existing
 # ``worker_fate.parse_iso_timestamp(...)`` call site keeps working unchanged.
 parse_iso_timestamp = _state_parse_iso_timestamp
+
+
+def fresh_terminal_record(
+    record: Mapping[str, Any] | None, dispatched_at: datetime | None
+) -> Mapping[str, Any] | None:
+    """The terminal record only when it belongs to the current dispatch.
+
+    ``find_worker_terminal_status`` returns the newest ``issue-<n>.*.terminal.json``
+    and records are never deleted, so an earlier dispatch's record (or one
+    from another adapter) is still returned after a redispatch whose own
+    watcher never ran (devin-shell, restart mid-run). Rule 1 / design §3: the
+    record's ``ended_at`` must be ``> dispatched_at`` before its ``exit_code``,
+    ``pid`` or ``duration_seconds`` count. Legacy entries with no
+    ``dispatched_at`` accept unconditionally, as in ``_dispatch_fresh``.
+    """
+    if not isinstance(record, Mapping):
+        return None
+    ended_at = parse_iso_timestamp(record.get("ended_at"))
+    return record if _dispatch_fresh(ended_at, dispatched_at) else None
 
 
 def _format_utc_z(moment: datetime) -> str:

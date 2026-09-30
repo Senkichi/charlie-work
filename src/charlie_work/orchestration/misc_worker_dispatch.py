@@ -162,7 +162,6 @@ def _route_phantom_live_worker(
                     else None
                 ),
                 branch=worker_fate.BranchEvidence(
-                    has_remote=True,
                     remote_head_sha=None,
                     remote_ahead=None,
                     unpushed=None,

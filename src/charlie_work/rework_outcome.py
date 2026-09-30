@@ -175,7 +175,6 @@ def _read_rework_outcome(
             terminal=terminal_evidence,
             worktree_outcome=worktree_outcome_evidence,
             branch=worker_fate.BranchEvidence(
-                has_remote=True,
                 remote_head_sha=None,
                 remote_ahead=None,
                 unpushed=None,
@@ -256,7 +255,6 @@ def fresh_completed_worker_outcome(
             terminal=None,
             worktree_outcome=outcome_evidence,
             branch=worker_fate.BranchEvidence(
-                has_remote=True,
                 remote_head_sha=live_head_sha,
                 remote_ahead=None,
                 unpushed=None,
@@ -369,7 +367,6 @@ def blocked_worker_outcome(
             terminal=terminal_evidence,
             worktree_outcome=worktree_evidence,
             branch=worker_fate.BranchEvidence(
-                has_remote=True,
                 remote_head_sha=None,
                 remote_ahead=None,
                 unpushed=None,

@@ -8,9 +8,9 @@ contract -- the file's own instruction is "then stop", so a still-running
 PID at that point is a process that hung on exit, not a worker still doing
 work. N4 (wf-review-opus.md): a live PID with a fresh, on-target, declared
 push (rule 1's freshness gate: ``written_at`` after ``dispatched_at``)
-routes immediately -- ``watchdog.worker_outcome_finalize_minutes`` no
-longer gates this decision (FLIP 5); it only gates the stall watchdog's
-separate kill decision elsewhere. This lane opens the PR from the worker's
+routes immediately -- ``watchdog.worker_outcome_finalize_minutes`` is no
+longer an age threshold (FLIP 5); it is only the ``<= 0`` kill switch for
+this lane, and nothing else reads it. This lane opens the PR from the worker's
 drafted title/body through the same ``_open_pr_for_orphaned_branch`` the
 dead-PID lane uses, without waiting for the PID to exit (the swole #163
 incident: a completed worker left its PR unopened ~2h because every
@@ -188,7 +188,6 @@ def collect_stale_live_handoff_pids(
                 terminal=None,
                 worktree_outcome=outcome_evidence,
                 branch=worker_fate.BranchEvidence(
-                    has_remote=True,
                     remote_head_sha=None,
                     remote_ahead=None,
                     unpushed=None,
@@ -217,8 +216,8 @@ def collect_stale_live_handoff_pids(
         # claim directly -- the legacy code trusted the same claim, just
         # without the freshness gate in front of it.
         # Rule 5: a live PID with a fresh declared-push claim routes
-        # immediately -- `worker_outcome_finalize_minutes` only gates the
-        # kill decision elsewhere, never this routing check.
+        # immediately -- `worker_outcome_finalize_minutes` is only the
+        # `<= 0` kill switch checked above, never an age threshold.
         #
         # B9 (wf-review-opus.md): the legacy check required an EXPLICIT
         # ``pr_created is False`` before routing. The worker-fate refactor
