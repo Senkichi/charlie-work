@@ -284,7 +284,7 @@ def test_flip_hook_entry_closer_length_mismatch_drops_second_record() -> None:
     """
     first_record = [
         {
-            "severity": "info",
+            "severity": "advise",
             "file": "x.py",
             "identity": "id1",
             "message": "first record",
@@ -294,7 +294,7 @@ def test_flip_hook_entry_closer_length_mismatch_drops_second_record() -> None:
     ]
     second_record = [
         {
-            "severity": "warning",
+            "severity": "block",
             "file": "y.py",
             "identity": "id2",
             "message": "second record",
@@ -325,7 +325,7 @@ def test_flip_hook_entry_tilde_fence_unsupported() -> None:
     """
     records = [
         {
-            "severity": "info",
+            "severity": "advise",
             "file": "x.py",
             "identity": "id1",
             "message": "m",
@@ -337,7 +337,7 @@ def test_flip_hook_entry_tilde_fence_unsupported() -> None:
 
     assert parse_advisories_comment(body) == (
         AdvisoryRecord(
-            severity="info",
+            severity="advise",
             file="x.py",
             identity="id1",
             message="m",
