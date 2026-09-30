@@ -3,7 +3,6 @@ from __future__ import annotations
 import copy
 import logging
 import os
-import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
@@ -223,41 +222,6 @@ PRIOR_WORKER_STILL_ALIVE_FAILURE_KIND = "prior_worker_still_alive"
 PRE_LAUNCH_BLOCKED_ENVIRONMENT_FAILURE_KINDS: frozenset[str] = frozenset(
     {"worktree_foreign_writer", PRIOR_WORKER_STILL_ALIVE_FAILURE_KIND}
 )
-
-
-def _validate_command_placeholders(
-    command: str | tuple[str, ...],
-    allowed_placeholders: set[str],
-    config_key: str,
-) -> None:
-    """Validate that a command template uses only allowed placeholders.
-
-    Raises ConfigError if an unknown or malformed placeholder is found.
-    """
-    # Pattern to match {placeholder} tokens
-    placeholder_pattern = re.compile(r"\{([^{}]*)\}")
-
-    parts = command if isinstance(command, tuple) else (command,)
-    for part in parts:
-        matches = placeholder_pattern.findall(part)
-        for match in matches:
-            if match == "":
-                raise ConfigError(
-                    f"config section '{config_key}': empty placeholder {{}} is not allowed"
-                )
-            if match not in allowed_placeholders:
-                raise ConfigError(
-                    f"config section '{config_key}': unknown placeholder {{{match}}} "
-                    f"(allowed: {', '.join(sorted(allowed_placeholders))})"
-                )
-        # Simulate render to catch malformed placeholders that the regex misses
-        # (bare {, unclosed {prompt_path, stray }, positional {0})
-        try:
-            part.format(**{p: "" for p in allowed_placeholders})
-        except (ValueError, KeyError, IndexError) as e:
-            raise ConfigError(
-                f"config section '{config_key}': malformed placeholder in '{part}': {e}"
-            ) from e
 
 
 @dataclass(frozen=True)
@@ -761,7 +725,7 @@ class ReviewConfig:
 
     def __post_init__(self) -> None:
         # Mirror DispatchConfig.__post_init__: ``load_config`` validates and
-        # converts the YAML list to a tuple before ``_build_section``, but a
+        # converts the YAML list to a tuple before ``validate_section``, but a
         # direct ``ReviewConfig(...)`` in a test or a caller bypasses that --
         # normalize here so a bare string is wrapped rather than iterated
         # character-by-character and a list cannot smuggle mutability into a

@@ -7,7 +7,10 @@ only classes carrying markers.
 
 from __future__ import annotations
 
+import ast
+import inspect
 import pickle
+import textwrap
 from collections.abc import Mapping
 from dataclasses import dataclass, field, fields
 from types import MappingProxyType
@@ -574,3 +577,37 @@ def test_every_section_class_annotation_resolves_with_supported_markers():
     for cls in classes:
         for spec in cv.field_specs(cls):
             cv._check_compat(spec, spec.markers, cls)
+
+
+# ------------------------------------------------------ single point of enforcement
+def _hand_written_checks(fn) -> list[str]:
+    """``isinstance`` calls and ``raise ConfigError(...)`` inside ``fn`` (what ADR-0007 bans)."""
+    tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
+    found = []
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "isinstance"
+        ):
+            found.append(f"isinstance@{node.lineno}")
+        if isinstance(node, ast.Raise) and isinstance(node.exc, ast.Call):
+            callee = node.exc.func
+            if isinstance(callee, ast.Name) and callee.id in {"ConfigError", "FieldError"}:
+                found.append(f"raise {callee.id}@{node.lineno}")
+    return found
+
+
+def test_guard_detects_hand_written_checks():
+    """Positive control: the AST guard below would fail on the pre-migration shape."""
+
+    def legacy(data):
+        if not isinstance(data, dict):
+            raise ConfigError("config section 'x' key 'y' must be an int")
+
+    assert len(_hand_written_checks(legacy)) == 2
+
+
+def test_build_config_from_data_has_no_hand_written_validation():
+    """Section rules live in field metadata; the router only routes (ADR-0007)."""
+    assert _hand_written_checks(config_mod.build_config_from_data) == []
