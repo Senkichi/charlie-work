@@ -17,9 +17,9 @@ from .config import (
 )
 from . import layout
 from .config_deprecations import emit_deprecated_key_reads, repo_state_path
+from .config_validation import host_wide_error, host_wide_sections
 from .fleet_paths import fleet_dir
 from .fleet_supervisor_config import (
-    FLEET_SUPERVISOR_SECTION,
     resolve_fleet_supervisor_layer,
 )
 
@@ -227,46 +227,22 @@ def load_layered_config(
         str(p) for p in (global_config_path if global_exists else None, repo_source) if p
     )
 
-    # ``runner_allocation`` is host-wide only (see RunnerAllocationConfig's
-    # docstring): three repos must not hold three opinions about how many jobs
-    # one machine can run. The merge below is section-by-section with the
-    # per-repo file winning per key, so without this rejection a per-repo
-    # ``orchestrator.config.yaml`` could silently override a host-wide knob --
-    # the exact confusion that made #590 expensive to diagnose. Reject the key
-    # outright so the invalid state is unrepresentable rather than merely
-    # unused (issue #600).
-    if "runner_allocation" in repo_data:
-        raise ConfigError(
-            "config section 'runner_allocation' is host-wide only and must not "
-            f"appear in a per-repo config ({repo_config_path}); declare it in "
-            "the global fleet layer (<fleet_dir>/config.yaml) instead"
-        )
-    # ``runner_capacity_escalation`` is the same shape of host-wide concern as
-    # ``runner_allocation``: it escalates a starvation condition measured across
-    # the whole host's budget, so a per-repo override would be three repos
-    # holding three opinions about one machine's capacity signal. Reject it for
-    # the same reason and with the same remedy (issue #763).
-    if "runner_capacity_escalation" in repo_data:
-        raise ConfigError(
-            "config section 'runner_capacity_escalation' is host-wide only and "
-            f"must not appear in a per-repo config ({repo_config_path}); declare "
-            "it in the global fleet layer (<fleet_dir>/config.yaml) instead"
-        )
-    # ``fleet_supervisor`` is the same shape of host-wide concern as
-    # ``runner_allocation`` (issue #1978): every knob on it belongs to the one
-    # cross-repo fleet supervisor daemon, so a per-repo
-    # ``orchestrator.config.yaml`` declaring the section would shadow the
-    # operator's global values -- reject it outright, same remedy. The legacy
-    # ``supervisor.<key>`` spellings stay legal here during the #1979
-    # migration window: the fold below lifts them into the repo layer's
-    # effective ``fleet_supervisor`` mapping, where they keep the ordinary
-    # repo-wins-per-key merge semantics.
-    if FLEET_SUPERVISOR_SECTION in repo_data:
-        raise ConfigError(
-            f"config section '{FLEET_SUPERVISOR_SECTION}' is host-wide only and "
-            f"must not appear in a per-repo config ({repo_config_path}); declare "
-            "it in the global fleet layer (<fleet_dir>/config.yaml) instead"
-        )
+    # Host-wide sections (declared with ``HostWideOnly`` on the ``OrchestratorConfig``
+    # field, never listed here): one physical machine / one fleet supervisor daemon, so
+    # three repos must not hold three opinions about it. The merge below is
+    # section-by-section with the per-repo file winning per key, so without this
+    # rejection a per-repo ``orchestrator.config.yaml`` could silently override a
+    # host-wide knob -- the exact confusion that made #590 expensive to diagnose. Reject
+    # the key outright so the invalid state is unrepresentable rather than merely unused
+    # (issues #600, #763, #1978). The legacy ``supervisor.<key>`` spellings of the moved
+    # fleet-supervisor knobs stay legal here during the #1979 migration window: the fold
+    # below lifts them into the repo layer's effective ``fleet_supervisor`` mapping,
+    # where they keep the ordinary repo-wins-per-key merge semantics.
+    for host_wide in sorted(host_wide_sections()):
+        if host_wide in repo_data:
+            raise host_wide_error(
+                host_wide, fleet_dir=global_config_path.parent, repo_path=repo_config_path
+            )
 
     # Issue #1978: resolve each layer's fleet_supervisor/supervisor pair
     # *before* merging. Adoption on the post-merge view cannot tell a

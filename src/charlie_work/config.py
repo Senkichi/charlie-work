@@ -41,21 +41,26 @@ from .config_validation import (
     CoercedLenient,
     CommandTemplate,
     FieldError,
+    Check,
     FieldRules,
     Finite,
+    HostWideOnly,
     InRange,
     LenientMapping,
     NonEmpty,
     NonEmptyRaw,
     NonNeg,
     NotNull,
+    Note,
     OneOf,
     Positive,
     Regex,
     RelativePath,
     Typed,
     field_rules,
+    field_specs,
     run_section_hooks,
+    unknown_sections_error,
     validate_section,
 )
 
@@ -68,7 +73,6 @@ from .config_validation import (
 # the capacity-starvation seam is guarded by ``test_capacity_starvation_escalation.py``.
 from .capacity_starvation_escalation import (  # noqa: F401  (deliberate re-export)
     RunnerCapacityEscalationConfig,
-    parse_runner_capacity_escalation,
 )
 
 # Re-exported from the domain module (issue #1833) for the same reason
@@ -87,7 +91,7 @@ from .github_capabilities.circuit_breaker import (  # noqa: F401  (deliberate re
 # own module so new parse rules do not land in this over-cap monolith
 # (file-size ratchet, issue #1442); ``build_config_from_data`` delegates to
 # it below.
-from .deescalation_config import parse_deescalation_overrides
+from .deescalation_config import project_scoped_keys
 
 # Issue #1976: the deprecated-key registry lives in its own leaf module so
 # ``load_config`` can emit ``config_key_deprecated_read`` at the point a
@@ -922,7 +926,12 @@ class DeescalationConfig:
     # root-set change, a threshold crossing, or an age-bucket crossing),
     # never unconditionally every pass the condition holds. 0 disables the
     # alert entirely (no event emitted regardless of impact).
-    operator_queue_depth_threshold: Annotated[int, Typed, NonNeg] = 5
+    operator_queue_depth_threshold: Annotated[
+        int,
+        Typed,
+        NonNeg,
+        Note("blocked-ready-issue count, not root-issue count -- see issue #1768"),
+    ] = 5
 
 
 @dataclass(frozen=True)
@@ -2401,6 +2410,35 @@ class HeartbeatConfig:
         object.__setattr__(self, "stale_mention_parked_labels", normalized)
 
 
+def _runner_floors_agree(allocation: RunnerAllocationConfig, config: OrchestratorConfig) -> None:
+    """Cross-section floor check (issue #600).
+
+    ``runner_scaling`` and ``runner_allocation`` both declare a "minimum runners per repo"
+    floor on different axes -- scaling keeps runners *registered* (provisioning/
+    deregistering), allocation keeps listeners *running* (starting/stopping
+    already-configured listeners). When both are enabled, an allocation floor higher than
+    the scaling floor is unsatisfiable: allocation caps each repo's target at its
+    registered runner count (``runner_allocation.plan_allocation``), so
+    ``min_running_per_repo > min_runners`` silently degrades to ``min_runners`` with
+    nothing reconciling the two. Reject it at load time rather than documenting the
+    caveat. The reverse (``min_runners > min_running_per_repo``) is a legitimate buffer --
+    registered but parked runners that allocation promotes on demand -- and is allowed.
+    """
+    scaling = config.runner_scaling
+    if (
+        scaling.enabled
+        and allocation.enabled
+        and allocation.min_running_per_repo > scaling.min_runners
+    ):
+        raise FieldError(
+            "min_running_per_repo",
+            "<= runner_scaling.min_runners when both sections are enabled (floors disagree; "
+            "allocation cannot keep more listeners running than scaling provisions)",
+            f"{allocation.min_running_per_repo} > {scaling.min_runners}",
+            "raw",
+        )
+
+
 @dataclass(frozen=True)
 class OrchestratorConfig:
     labels: LabelConfig = field(default_factory=LabelConfig)
@@ -2437,13 +2475,55 @@ class OrchestratorConfig:
     local_lane: LocalLaneConfig = field(default_factory=LocalLaneConfig)
     runners: RunnersConfig = field(default_factory=RunnersConfig)
     main_ci_reclaim: MainCiReclaimConfig = field(default_factory=MainCiReclaimConfig)
-    runner_scaling: RunnerScalingConfig = field(default_factory=RunnerScalingConfig)
-    runner_allocation: RunnerAllocationConfig = field(default_factory=RunnerAllocationConfig)
-    runner_capacity_escalation: RunnerCapacityEscalationConfig = field(
+    # ``RunnerScalingConfig``/``RunnerAllocationConfig`` are ci_fleet-owned and cannot carry
+    # markers themselves (ADR-0002, ``tests/test_ci_fleet_seams.py``), so this repo's
+    # declaration of the section -- the field -- carries the rules. ``BoolTolerant`` is the
+    # legacy ``isinstance(v, int)`` behaviour (a YAML ``true`` passed as an int knob).
+    runner_scaling: Annotated[
+        RunnerScalingConfig,
+        FieldRules(
+            enabled=Typed,
+            managed_root=Typed,
+            runner_dir_prefix=Typed,
+            runner_name_template=Typed,
+            package_zip=Typed,
+            min_runners=(Typed, BoolTolerant),
+            max_runners=(Typed, BoolTolerant),
+            idle_scale_down_minutes=(Typed, BoolTolerant),
+            cooldown_minutes=(Typed, BoolTolerant),
+            ram_per_job_gb=(Typed, BoolTolerant),
+            min_free_ram_gb=(Typed, BoolTolerant),
+            max_host_cpu_pct=(Typed, BoolTolerant),
+        ),
+    ] = field(default_factory=RunnerScalingConfig)
+    # Host-wide (#600, #763): one physical machine, so a per-repo layer must not hold its
+    # own opinion. ``ci_fleet``'s own ``__post_init__`` owns the remaining rules
+    # (per-repo ceilings, affinity); ``NotNull`` keeps ``key: null`` rejected on the four
+    # fields it cannot compare against ``None`` (they raised ``TypeError`` before).
+    runner_allocation: Annotated[
+        RunnerAllocationConfig,
+        HostWideOnly,
+        FieldRules(
+            enabled=Typed,
+            managed_root=Typed,
+            max_running_runners=(Typed, NonNeg),
+            min_running_per_repo=(Typed, NonNeg),
+            demand_idle_samples=(Typed, NonNeg),
+            max_runs_scanned=(Typed, NonNeg),
+            reserved_threads=NotNull,
+            threads_per_slot=NotNull,
+            max_running_heavy=NotNull,
+            max_running_per_repo=NotNull,
+        ),
+        Check(_runner_floors_agree),
+    ] = field(default_factory=RunnerAllocationConfig)
+    runner_capacity_escalation: Annotated[RunnerCapacityEscalationConfig, HostWideOnly] = field(
         default_factory=RunnerCapacityEscalationConfig
     )
     supervisor: SupervisorConfig = field(default_factory=SupervisorConfig)
-    fleet_supervisor: FleetSupervisorConfig = field(default_factory=FleetSupervisorConfig)
+    fleet_supervisor: Annotated[FleetSupervisorConfig, HostWideOnly] = field(
+        default_factory=FleetSupervisorConfig
+    )
     post_mortem: PostMortemConfig = field(default_factory=PostMortemConfig)
     heartbeat: HeartbeatConfig = field(default_factory=HeartbeatConfig)
 
@@ -2499,18 +2579,22 @@ def _section(data: dict[str, Any], key: str) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
-def _build_section(cls: type, name: str, data: dict[str, Any]) -> Any:
-    """Construct a config dataclass, turning unknown YAML keys into a readable
-    error (a bare ``TypeError`` from ``cls(**data)`` names neither the section
-    nor the valid keys — hostile to consumers mid-migration)."""
-    valid = {f.name for f in fields(cls)}
-    unknown = sorted(set(data) - valid)
-    if unknown:
-        raise ConfigError(
-            f"unknown key(s) in config section '{name}': {', '.join(unknown)} "
-            f"(valid: {', '.join(sorted(valid))})"
-        )
-    return cls(**data)
+# Keys retired from a section that live configs may still carry: dropped before
+# validation so they are silently ignored rather than rejected as unknown (a rejection
+# would brick a self-deploy onto a config written before the retirement).
+_RETIRED_KEYS: Mapping[str, frozenset[str]] = MappingProxyType(
+    {"labels": frozenset({"blocked"})}  # issue #1963
+)
+
+
+def _scoped_raw(name: str, raw: dict[str, Any]) -> dict[str, Any]:
+    """The part of a raw section that is validated: retired keys and, for the
+    deliberately scoped ``deescalation`` section (#1314), un-annotated keys removed."""
+    retired = _RETIRED_KEYS.get(name, frozenset())
+    kept = {k: v for k, v in raw.items() if k not in retired}
+    if name == "deescalation":
+        return project_scoped_keys(DeescalationConfig, kept)
+    return kept
 
 
 def known_config_sections() -> frozenset[str]:
@@ -2556,81 +2640,32 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
     # forbids. A deep copy keeps this function's contract "reads a dict, does
     # not touch it" regardless of what future callers do with their copy.
     data = copy.deepcopy(data)
-    # Validate top-level keys before processing sections.
     known_sections = known_config_sections()
     unknown = sorted(set(data) - known_sections)
     if unknown:
-        raise ConfigError(
-            f"unknown config section(s): {', '.join(unknown)} "
-            f"(valid: {', '.join(sorted(known_sections))})"
+        raise unknown_sections_error(unknown, known_sections)
+    # Issue #1978: parse the fleet-scoped section BEFORE the loop reaches
+    # ``supervisor`` -- the parser pops the relocated keys out of
+    # ``data['supervisor']`` (the private deepcopy above, so the caller's dict
+    # is untouched) and applies the new-location > legacy > default precedence
+    # itself, raising ConfigError when both locations disagree.
+    prebuilt: dict[str, Any] = {"fleet_supervisor": parse_fleet_supervisor(data)}
+    by_name = {spec.name: spec for spec in field_specs(OrchestratorConfig)}
+    built: dict[str, Any] = {}
+    for f in fields(OrchestratorConfig):
+        if f.metadata.get("provenance"):
+            continue
+        if f.name in prebuilt:
+            built[f.name] = prebuilt[f.name]
+            continue
+        raw = _section(data, f.name)
+        built[f.name] = validate_section(
+            by_name[f.name].item,
+            _scoped_raw(f.name, raw),
+            path=f.name,
+            rules=field_rules(OrchestratorConfig, f.name),
         )
-    labels_data = _section(data, "labels")
-    labels_data.pop("blocked", None)
-    labels = validate_section(LabelConfig, labels_data, path="labels")
-    dispatch = validate_section(DispatchConfig, _section(data, "dispatch"), path="dispatch")
-    review = validate_section(ReviewConfig, _section(data, "review"), path="review")
-    review_dispatch_data = _section(data, "review_dispatch")
-    review_dispatch = validate_section(
-        ReviewDispatchConfig, review_dispatch_data, path="review_dispatch"
-    )
-    quota_probe = validate_section(
-        QuotaProbeConfig, _section(data, "quota_probe"), path="quota_probe"
-    )
-    reconcile_pass = validate_section(
-        ReconcilePassConfig, _section(data, "reconcile_pass"), path="reconcile_pass"
-    )
-    # Issue #1314: extract ONLY the two new operator-queue follow-up knobs
-    # from the ``deescalation`` section. The section as a whole was
-    # previously 100% inert (never passed into OrchestratorConfig — always
-    # defaulted), and activating full-section parsing here would silently
-    # (a) hard-reject unknown keys via ``_build_section`` for any live config
-    # that already has a ``deescalation:`` block with extra/typo'd keys
-    # (self-deploy-brick risk) and (b) flip ``enabled`` / ``interval_minutes``
-    # defaults for configs that set those keys expecting them to be ignored.
-    # Full-section activation is a separate, explicitly-reviewed change with
-    # operator notification; this PR scopes to the two fields the issue
-    # actually asks for. Unknown keys and pre-existing
-    # ``enabled``/``interval_minutes`` overrides are silently ignored, same
-    # as before this PR.
-    deescalation_data = _section(data, "deescalation")
-    # Issue #1477 added the third knob (``identical_reason_recurrence_window_minutes``)
-    # to the same scoped-extraction pattern: each key is parsed explicitly and
-    # unknown keys are still silently ignored. The validation lives in
-    # ``deescalation_config.py``; error messages are byte-identical.
-    deescalation = DeescalationConfig(**parse_deescalation_overrides(deescalation_data))
-    auto_merge = validate_section(AutoMergeConfig, _section(data, "auto_merge"), path="auto_merge")
-    runtime = validate_section(RuntimeConfig, _section(data, "runtime"), path="runtime")
-    devin = validate_section(DevinConfig, _section(data, "devin"), path="devin")
-    claude_code = validate_section(
-        ClaudeCodeConfig, _section(data, "claude_code"), path="claude_code"
-    )
-    api_worker = validate_section(ApiWorkerConfig, _section(data, "api_worker"), path="api_worker")
-    rescue = validate_section(RescueConfig, _section(data, "rescue"), path="rescue")
-    worker = validate_section(
-        WorkerRoleConfig,
-        _section(data, "worker"),
-        path="worker",
-        rules=field_rules(OrchestratorConfig, "worker"),
-    )
-    reviewer = validate_section(ReviewerRoleConfig, _section(data, "reviewer"), path="reviewer")
-    watchdog = validate_section(WatchdogConfig, _section(data, "watchdog"), path="watchdog")
-    worktree_reclamation = validate_section(
-        WorktreeReclamationConfig,
-        _section(data, "worktree_reclamation"),
-        path="worktree_reclamation",
-    )
-    test_adequacy = validate_section(
-        TestAdequacyConfig, _section(data, "test_adequacy"), path="test_adequacy"
-    )
-    coverage_probe = validate_section(
-        CoverageProbeConfig, _section(data, "coverage_probe"), path="coverage_probe"
-    )
-    fleet = validate_section(FleetConfig, _section(data, "fleet"), path="fleet")
-    notify = validate_section(NotifyConfig, _section(data, "notify"), path="notify")
-
-    local_issues = validate_section(
-        LocalIssuesConfig, _section(data, "local_issues"), path="local_issues"
-    )
+    local_issues = built["local_issues"]
     # A repo with no remote cannot satisfy the default worker prompt, which
     # mandates push + PR and calls anything less a task failure. Re-default
     # the template HERE, once, so ``dispatch.worker_template`` stays the single
@@ -2639,179 +2674,20 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
     # them needs to know a local backend exists. An explicit operator value
     # wins: only the *default* moves.
     if local_issues.enabled and "worker_template" not in _section(data, "dispatch"):
-        dispatch = replace(dispatch, worker_template=LOCAL_WORKER_TEMPLATE)
+        built["dispatch"] = replace(built["dispatch"], worker_template=LOCAL_WORKER_TEMPLATE)
     if local_issues.enabled and "rework_template" not in _section(data, "dispatch"):
-        dispatch = replace(dispatch, rework_template=LOCAL_REWORK_TEMPLATE)
+        built["dispatch"] = replace(built["dispatch"], rework_template=LOCAL_REWORK_TEMPLATE)
     # Issue #1844: a no-remote repo has no GitHub review lane to defer to, so
     # the automated local review lane IS the review -- default it on, the same
     # way the worker/rework templates re-default above. An explicit
     # ``review_dispatch.enabled`` (either value) wins: only the default moves.
-    if local_issues.enabled and "enabled" not in review_dispatch_data:
-        review_dispatch = replace(review_dispatch, enabled=True)
-    local_lane = validate_section(LocalLaneConfig, _section(data, "local_lane"), path="local_lane")
-    runners = validate_section(RunnersConfig, _section(data, "runners"), path="runners")
-    main_ci_reclaim = validate_section(
-        MainCiReclaimConfig, _section(data, "main_ci_reclaim"), path="main_ci_reclaim"
-    )
-    runner_scaling_data = _section(data, "runner_scaling")
-    # Validate numeric fields
-    for numeric_key in (
-        "min_runners",
-        "max_runners",
-        "idle_scale_down_minutes",
-        "cooldown_minutes",
-    ):
-        value = runner_scaling_data.get(numeric_key)
-        if value is not None and not isinstance(value, int):
-            raise ConfigError(
-                f"config section 'runner_scaling' key '{numeric_key}' must be an int, "
-                f"got {type(value).__name__}"
-            )
-    for float_key in ("ram_per_job_gb", "min_free_ram_gb", "max_host_cpu_pct"):
-        value = runner_scaling_data.get(float_key)
-        if value is not None and not isinstance(value, (int, float)):
-            raise ConfigError(
-                f"config section 'runner_scaling' key '{float_key}' must be a number, "
-                f"got {type(value).__name__}"
-            )
-    # Validate string fields
-    for str_key in ("managed_root", "runner_dir_prefix", "runner_name_template", "package_zip"):
-        value = runner_scaling_data.get(str_key)
-        if value is not None and not isinstance(value, str):
-            raise ConfigError(
-                f"config section 'runner_scaling' key '{str_key}' must be a string, "
-                f"got {type(value).__name__}"
-            )
-    # Validate boolean field
-    enabled = runner_scaling_data.get("enabled")
-    if enabled is not None and not isinstance(enabled, bool):
-        raise ConfigError(
-            f"config section 'runner_scaling' key 'enabled' must be a bool, "
-            f"got {type(enabled).__name__}"
-        )
-    runner_scaling = _build_section(RunnerScalingConfig, "runner_scaling", runner_scaling_data)
-    runner_allocation_data = _section(data, "runner_allocation")
-    for numeric_key in (
-        "max_running_runners",
-        "min_running_per_repo",
-        "demand_idle_samples",
-        "max_runs_scanned",
-    ):
-        value = runner_allocation_data.get(numeric_key)
-        # bool is an int subclass; reject it so `max_running_runners: true`
-        # fails loudly instead of silently allocating one slot.
-        if value is not None and (isinstance(value, bool) or not isinstance(value, int)):
-            raise ConfigError(
-                f"config section 'runner_allocation' key '{numeric_key}' must be an int, "
-                f"got {type(value).__name__}"
-            )
-        if isinstance(value, int) and not isinstance(value, bool) and value < 0:
-            raise ConfigError(
-                f"config section 'runner_allocation' key '{numeric_key}' must be >= 0, got {value}"
-            )
-    managed_root_value = runner_allocation_data.get("managed_root")
-    if managed_root_value is not None and not isinstance(managed_root_value, str):
-        raise ConfigError(
-            "config section 'runner_allocation' key 'managed_root' must be a string, "
-            f"got {type(managed_root_value).__name__}"
-        )
-    allocation_enabled = runner_allocation_data.get("enabled")
-    if allocation_enabled is not None and not isinstance(allocation_enabled, bool):
-        raise ConfigError(
-            "config section 'runner_allocation' key 'enabled' must be a bool, "
-            f"got {type(allocation_enabled).__name__}"
-        )
-    runner_allocation = _build_section(
-        RunnerAllocationConfig, "runner_allocation", runner_allocation_data
-    )
-    # Cross-section floor check (issue #600): runner_scaling and runner_allocation
-    # both declare a "minimum runners per repo" floor on different axes -- scaling
-    # keeps runners *registered* (provisioning/deregistering), allocation keeps
-    # listeners *running* (starting/stopping already-configured listeners). When
-    # both are enabled, an allocation floor higher than the scaling floor is
-    # unsatisfiable: allocation caps each repo's target at its registered runner
-    # count (runner_allocation.plan_allocation), so min_running_per_repo >
-    # min_runners silently degrades to min_runners with nothing reconciling the
-    # two. Reject it at load time rather than documenting the caveat. The reverse
-    # (min_runners > min_running_per_repo) is a legitimate buffer -- registered
-    # but parked runners that allocation promotes on demand -- and is allowed.
-    if (
-        runner_scaling.enabled
-        and runner_allocation.enabled
-        and runner_allocation.min_running_per_repo > runner_scaling.min_runners
-    ):
-        raise ConfigError(
-            "config sections 'runner_scaling' and 'runner_allocation' are both "
-            "enabled but their floors disagree: runner_allocation."
-            f"min_running_per_repo={runner_allocation.min_running_per_repo} "
-            f"exceeds runner_scaling.min_runners={runner_scaling.min_runners}. "
-            "Allocation cannot keep more listeners running than scaling "
-            "provisions; raise runner_scaling.min_runners to at least the "
-            "allocation floor."
-        )
-    runner_capacity_escalation = parse_runner_capacity_escalation(data)
-    # Issue #1978: parse the fleet-scoped section BEFORE the supervisor one --
-    # the parser pops the relocated keys out of ``data['supervisor']`` (the
-    # private deepcopy above, so the caller's dict is untouched) and applies
-    # the new-location > legacy > default precedence itself, raising
-    # ConfigError when both locations disagree.
-    fleet_supervisor = parse_fleet_supervisor(data)
-    supervisor_data = _section(data, "supervisor")
-    for int_key in (
-        "poll_interval_seconds",
-        "full_pass_interval_seconds",
-        "active_cooldown_seconds",
-        "max_runtime_minutes",
-    ):
-        value = supervisor_data.get(int_key)
-        if value is not None and not isinstance(value, int):
-            raise ConfigError(
-                f"config section 'supervisor' key '{int_key}' must be an int, "
-                f"got {type(value).__name__}"
-            )
-    supervisor = _build_section(SupervisorConfig, "supervisor", supervisor_data)
-    post_mortem = validate_section(
-        PostMortemConfig, _section(data, "post_mortem"), path="post_mortem"
-    )
-    heartbeat = validate_section(HeartbeatConfig, _section(data, "heartbeat"), path="heartbeat")
-    config = OrchestratorConfig(
-        labels=labels,
-        dispatch=dispatch,
-        review=review,
-        review_dispatch=review_dispatch,
-        quota_probe=quota_probe,
-        reconcile_pass=reconcile_pass,
-        deescalation=deescalation,
-        auto_merge=auto_merge,
-        runtime=runtime,
-        devin=devin,
-        claude_code=claude_code,
-        api_worker=api_worker,
-        rescue=rescue,
-        worker=worker,
-        reviewer=reviewer,
-        watchdog=watchdog,
-        worktree_reclamation=worktree_reclamation,
-        test_adequacy=test_adequacy,
-        coverage_probe=coverage_probe,
-        fleet=fleet,
-        notify=notify,
-        local_issues=local_issues,
-        local_lane=local_lane,
-        runners=runners,
-        main_ci_reclaim=main_ci_reclaim,
-        runner_scaling=runner_scaling,
-        runner_allocation=runner_allocation,
-        runner_capacity_escalation=runner_capacity_escalation,
-        supervisor=supervisor,
-        fleet_supervisor=fleet_supervisor,
-        post_mortem=post_mortem,
-        heartbeat=heartbeat,
-        # ``sources`` is left at its dataclass default here -- this function
-        # only ever sees a dict, never a path. ``load_config`` below (and
-        # ``load_layered_config``) are the ones that know what path(s) the
-        # data came from, and they attach that provenance with ``replace``.
-    )
+    if local_issues.enabled and "enabled" not in _section(data, "review_dispatch"):
+        built["review_dispatch"] = replace(built["review_dispatch"], enabled=True)
+    # ``sources`` is left at its dataclass default here -- this function
+    # only ever sees a dict, never a path. ``load_config`` below (and
+    # ``load_layered_config``) are the ones that know what path(s) the
+    # data came from, and they attach that provenance with ``replace``.
+    config = OrchestratorConfig(**built)
     run_section_hooks(config)
     return config
 

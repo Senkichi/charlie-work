@@ -392,9 +392,15 @@ def _classify(tp: Any) -> tuple[str, type | None, tuple[type, ...], str]:
 
 
 @functools.cache
+def _hints(cls: type) -> dict[str, Any]:
+    """Resolved annotations incl. ``Annotated`` extras (resolution is slow; classes are static)."""
+    return typing.get_type_hints(cls, include_extras=True)
+
+
+@functools.cache
 def field_specs(cls: type) -> tuple[FieldSpec, ...]:
     """Per-class field specs, in dataclass order (``init=False`` fields excluded)."""
-    hints = typing.get_type_hints(cls, include_extras=True)
+    hints = _hints(cls)
     specs = []
     for f in fields(cls):
         if not f.init:
@@ -413,7 +419,7 @@ def field_rules(cls: type, name: str) -> dict[str, tuple[Marker, ...]]:
 
 def field_markers(cls: type, name: str) -> tuple[Marker, ...]:
     """Annotation markers on one field (e.g. ``HostWideOnly`` on an OrchestratorConfig field)."""
-    hint = typing.get_type_hints(cls, include_extras=True)[name]
+    hint = _hints(cls)[name]
     return _markers_of(hint)[1]
 
 
@@ -672,7 +678,7 @@ def run_section_hooks(config: Any) -> None:
     method, then any ``Check`` markers on the field, then the same for nested
     dataclass values. A ``FieldError`` leaves prefixed with the section path.
     """
-    hints = typing.get_type_hints(type(config), include_extras=True)
+    hints = _hints(type(config))
     for f in fields(config):
         if f.metadata.get("provenance"):
             continue
