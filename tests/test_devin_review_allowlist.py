@@ -258,6 +258,21 @@ def test_review_prompt_states_every_allowlisted_command(
     assert (tmp_path / "prompt.md").read_text(encoding="utf-8") == "go\n"
 
 
+def test_review_prompt_permits_exactly_the_allowlist() -> None:
+    """Issue #2032: the runnable set the prompt states is the allow-list, no more.
+
+    Advertising anything beyond it (the first cut called read-only git
+    "normally allowed") sends the reviewer into commands Devin refuses at
+    random, and a refusal can end the session with no verdict.
+    """
+    section = devin_shell._review_exec_prompt_section()
+    match = re.search(r"The ONLY shell commands you may run: (.*?)\. Run nothing else", section)
+    assert match is not None, section
+    stated = set(re.findall(r"`([^`]+)`", match.group(1)))
+    assert stated == {entry[len("Exec(") : -1] for entry in _REVIEW_EXEC_ALLOWLIST}
+    assert "normally allowed" not in section
+
+
 def test_worker_prompt_has_no_review_exec_section(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
