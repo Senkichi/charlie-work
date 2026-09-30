@@ -9,11 +9,14 @@ from pathlib import Path
 
 import pytest
 
-import test_local_lane as tll
+from _local_lane_fixtures import new_repo_root, rework_pending_app, spy_dispatch_sessions
 from charlie_work.state import load_state, load_state_locked, save_state, state_lock
 from charlie_work.workflow import OrchestratorApp
 
-repo = tll.repo
+
+@pytest.fixture
+def repo() -> Path:
+    return new_repo_root()
 
 
 class TestLocalReworkLaunchGates:
@@ -22,8 +25,8 @@ class TestLocalReworkLaunchGates:
     the fix a no-remote repo launched a Devin rework worker through an active
     operator hold, uncounted against the fleet-wide cap."""
 
-    _rework_pending = tll.TestDrainSuppressesLocalRework._rework_pending
-    _spy = staticmethod(tll.TestDrainSuppressesLocalRework._spy_dispatch_sessions)
+    _rework_pending = staticmethod(rework_pending_app)
+    _spy = staticmethod(spy_dispatch_sessions)
 
     @staticmethod
     def _assert_deferred(app: OrchestratorApp, result: dict, reason: str) -> None:
