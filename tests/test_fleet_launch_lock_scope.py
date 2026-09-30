@@ -21,7 +21,6 @@ import itertools
 import json
 import os
 import sys
-import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -229,19 +228,32 @@ def test_briefly_held_lock_is_acquired_within_the_wait(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lane: str
 ) -> None:
     """A lock released inside the wait budget does not cost a whole pass --
-    the bounded jittered retry lands it and the lane launches."""
+    the bounded jittered retry lands it and the lane launches.
+
+    The release is driven by the retry itself: the wrapped acquirer frees the
+    held lock on the second attempt and delegates to the real primitive, so a
+    stalled/slow scheduler can only delay the retry, never exhaust the budget
+    against a still-held lock -- no wall-clock race (a ``threading.Timer``
+    release made this test load-sensitive under xdist)."""
     app = _app(tmp_path, lane, fleet_cap=4, launch_lock_wait=2.0)
     calls = _spy_dispatch_sessions(monkeypatch)
     held = try_acquire_fleet_lock(app.fleet_dir_override)
     assert held is not None
-    timer = threading.Timer(0.25, held.release)
-    timer.start()
+    attempts: list[int] = []
+
+    def _release_on_retry(override: Any) -> Any:
+        attempts.append(1)
+        if len(attempts) >= 2:
+            held.release()
+        return try_acquire_fleet_lock(override)
+
+    monkeypatch.setattr(f"{_LANE_MOD[lane]}.try_acquire_fleet_lock", _release_on_retry)
     try:
         result = _run(app, lane)
     finally:
-        timer.cancel()
-        held.release()  # idempotent: safe if the timer already ran
+        held.release()  # idempotent: safe if the retry already released it
 
+    assert len(attempts) >= 2, "the permit never retried a held lock"
     assert [r.issue_number for r in calls] == [123], result.message
     assert "deferred_reason" not in result.data
 
@@ -497,7 +509,7 @@ def test_entry_handle_does_not_touch_the_os_lock(tmp_path: Path) -> None:
 # --- config knob -------------------------------------------------------------
 
 
-@pytest.mark.parametrize("bad", [-1, -0.5, True, "10"])
+@pytest.mark.parametrize("bad", [-1, -0.5, True, "10", float("inf"), float("-inf"), float("nan")])
 def test_launch_lock_wait_seconds_rejects_bad_values(bad: Any) -> None:
     with pytest.raises(ConfigError, match="launch_lock_wait_seconds"):
         build_config_from_data({"fleet": {"launch_lock_wait_seconds": bad}})

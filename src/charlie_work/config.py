@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import math
 import os
 import re
 from collections.abc import Mapping
@@ -2081,7 +2082,9 @@ class FleetConfig:
     -- before deferring the pass with ``fleet_lock_held``. It replaced a single
     non-blocking try that cost the loser an entire pass; the lock is now held
     only across governor -> claim -> launch, so a short wait suffices. ``0``
-    restores the old single-try behavior.
+    restores the old single-try behavior. Non-finite values are rejected: an
+    infinite budget would hang a lane on a wedged lock, and NaN reaches
+    ``time.sleep`` (which raises) inside the retry loop.
     """
 
     global_max_concurrent_sessions: int = 0
@@ -4018,11 +4021,12 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
     if launch_lock_wait is not None and (
         isinstance(launch_lock_wait, bool)
         or not isinstance(launch_lock_wait, (int, float))
+        or not math.isfinite(launch_lock_wait)
         or launch_lock_wait < 0
     ):
         raise ConfigError(
             "config section 'fleet' key 'launch_lock_wait_seconds' must be a "
-            f"non-negative number, got {launch_lock_wait!r}"
+            f"non-negative finite number, got {launch_lock_wait!r}"
         )
     fleet = _build_section(FleetConfig, "fleet", fleet_data)
     notify_data = _section(data, "notify")
