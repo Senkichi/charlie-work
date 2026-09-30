@@ -48,6 +48,11 @@ _HEARTBEAT_CHECK = Path(__file__).parent.parent / "scripts" / "heartbeat_check.p
 # static scan below must cover BOTH files: heartbeat_check.py alone no
 # longer contains the import surface a regression would land in.
 _EVENT_ALARMS = Path(__file__).parent.parent / "scripts" / "heartbeat_event_alarms.py"
+# Issue #2048: same reasoning for the second extracted sibling --
+# heartbeat_stale_mentions.py holds the stale-mention scanning/exclusion
+# seam and is loaded via the same importlib pattern, so a forbidden import
+# could equally land there.
+_STALE_MENTIONS = Path(__file__).parent.parent / "scripts" / "heartbeat_stale_mentions.py"
 _EVENT_KINDS = Path(__file__).parent.parent / "src" / "charlie_work" / "event_kinds.py"
 
 
@@ -83,13 +88,14 @@ def test_heartbeat_check_never_imports_instrumentation_or_ci_fleet() -> None:
     ``ci_fleet`` being installed here to block in the first place.
 
     Since issue #1895 the guarded ``charlie_work.event_kinds`` import lives
-    in ``heartbeat_event_alarms.py``, so the scan covers that sibling too --
-    scanning heartbeat_check.py alone would no longer see the file where a
-    forbidden import would land.
+    in ``heartbeat_event_alarms.py``, and since #2048 the stale-mention seam
+    lives in ``heartbeat_stale_mentions.py`` -- both loaded via importlib,
+    so the scan covers those siblings too: scanning heartbeat_check.py
+    alone would no longer see the files where a forbidden import would land.
     """
     offenders = sorted(
         f"{path.name}: {name}"
-        for path in (_HEARTBEAT_CHECK, _EVENT_ALARMS)
+        for path in (_HEARTBEAT_CHECK, _EVENT_ALARMS, _STALE_MENTIONS)
         for name in _module_scope_imports(path)
         if name == "ci_fleet"
         or name.startswith("ci_fleet.")

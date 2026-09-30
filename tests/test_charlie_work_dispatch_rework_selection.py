@@ -431,7 +431,7 @@ def test_dispatch_rework_defers_when_provider_throttled(tmp_path: Path) -> None:
 
         future_time = datetime.now(UTC) + timedelta(hours=1)
         throttled_until = future_time.replace(microsecond=0).isoformat().replace("+00:00", "Z")
-        state = set_throttled_until(state, throttled_until)
+        state = set_throttled_until(state, throttled_until, source="test")
         save_state(paths.state_file, state)
 
     result = app.dispatch_rework()

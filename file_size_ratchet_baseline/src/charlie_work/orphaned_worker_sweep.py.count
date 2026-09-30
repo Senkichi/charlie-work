@@ -3,6 +3,10 @@
 # the module's bounded-exemption docstring and born-expired-window comment
 # past the 800 cap (799 -> 813). First crossing -- reviewed mark set at the
 # next MARK_QUANTUM multiple per the ratchet's hand-raise rule.
+# Issue #2006 / PR #2027: merging #1971 (local-park drain) with the
+# write_gate threading for the classify-at-credit lane grew the module to
+# 1010 lines (+10 over the 1000 mark). Reviewed raise to the next
+# MARK_QUANTUM multiple per the ratchet's hand-raise rule.
 # Issue #2034 / PR #2035: the no-op disposition work added route-collection
 # glue inside handle_dead_worker_with_pr (four no_op_routes.append sites at
 # existing decision points, including the deferred-head re-collect branch,

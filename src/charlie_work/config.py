@@ -2314,6 +2314,50 @@ class PostMortemConfig:
 
 
 @dataclass(frozen=True)
+class HeartbeatConfig:
+    """Knobs for the fleet heartbeat script (``scripts/heartbeat_check.py``).
+
+    The heartbeat is a read-only, stdlib-only script that runs outside the
+    orchestrator on a fleet cadence; it reads this section from the raw YAML
+    mapping (``load_orchestrator_config`` in ``heartbeat_worktree.py``), so
+    every field here must also be reachable -- with the same default -- by a
+    reader that cannot import this module. The mirror of
+    ``stale_mention_parked_labels`` lives at
+    ``scripts/heartbeat_stale_mentions.STALE_MENTION_PARKED_LABELS_DEFAULT``
+    and a drift-guard test asserts the two stay equal.
+    """
+
+    # Issue #2048: the ``stale-open-issue-mentions`` check ignores a merged-work
+    # mention of an open issue when the issue carries a parked label -- a human
+    # has already dispositioned it, so the mention is not closure evidence
+    # anyone needs to act on. The default is the fleet's shared non-lifecycle
+    # triage taxonomy (the same set ``heartbeat_check``'s armable-pool gate
+    # mirrors as ``ARMABLE_GATING_LABELS``) plus the conventional tracker/
+    # umbrella/epic names the issue enumerates. Active labels (``agent:*`` and
+    # the configured ``labels:`` lifecycle values) are excluded separately.
+    stale_mention_parked_labels: tuple[str, ...] = (
+        "blocked",
+        "needs-design",
+        "human-action",
+        "question",
+        "wontfix",
+        "duplicate",
+        "invalid",
+        "tracker",
+        "umbrella",
+        "epic",
+    )
+
+    def __post_init__(self) -> None:
+        # Same coercion contract as DispatchConfig.human_merge_labels: a bare
+        # string wraps rather than iterates, and a list becomes a tuple so the
+        # frozen instance stays hashable on every construction path.
+        value = self.stale_mention_parked_labels
+        normalized = (str(value),) if isinstance(value, str) else tuple(str(v) for v in value)
+        object.__setattr__(self, "stale_mention_parked_labels", normalized)
+
+
+@dataclass(frozen=True)
 class OrchestratorConfig:
     labels: LabelConfig = field(default_factory=LabelConfig)
     dispatch: DispatchConfig = field(default_factory=DispatchConfig)
@@ -2350,6 +2394,7 @@ class OrchestratorConfig:
     supervisor: SupervisorConfig = field(default_factory=SupervisorConfig)
     fleet_supervisor: FleetSupervisorConfig = field(default_factory=FleetSupervisorConfig)
     post_mortem: PostMortemConfig = field(default_factory=PostMortemConfig)
+    heartbeat: HeartbeatConfig = field(default_factory=HeartbeatConfig)
 
     # Provenance, not values (issue #943). Paths of the config files that were
     # actually read to produce this value, in merge order (global layer first,
@@ -4238,6 +4283,14 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
             built_rules.append(SignatureRule(pattern=pattern, kind=kind))
         post_mortem_data["signature_rules"] = tuple(built_rules)
     post_mortem = _build_section(PostMortemConfig, "post_mortem", post_mortem_data)
+    heartbeat_data = _section(data, "heartbeat")
+    _parked = heartbeat_data.get("stale_mention_parked_labels")
+    if _parked is not None and not isinstance(_parked, (list, tuple, str)):
+        raise ConfigError(
+            "config section 'heartbeat' key 'stale_mention_parked_labels' must be a "
+            f"list of label names, got {type(_parked).__name__}"
+        )
+    heartbeat = _build_section(HeartbeatConfig, "heartbeat", heartbeat_data)
     return OrchestratorConfig(
         labels=labels,
         dispatch=dispatch,
@@ -4270,6 +4323,7 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
         supervisor=supervisor,
         fleet_supervisor=fleet_supervisor,
         post_mortem=post_mortem,
+        heartbeat=heartbeat,
         # ``sources`` is left at its dataclass default here -- this function
         # only ever sees a dict, never a path. ``load_config`` below (and
         # ``load_layered_config``) are the ones that know what path(s) the
