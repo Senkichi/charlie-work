@@ -40,7 +40,9 @@ documents).
 from __future__ import annotations
 
 from dataclasses import dataclass, fields
-from typing import Any, Mapping
+from typing import Annotated, Any, Mapping
+
+from .config_validation import BoolTolerant, Typed
 
 #: The top-level YAML section name. Referenced by ``config_deprecations``'s
 #: ``replacement`` strings and the parser below so the name is declared once.
@@ -122,14 +124,14 @@ class FleetSupervisorConfig:
     scheduler.
     """
 
-    max_pass_runtime_seconds: int = 1800
-    self_deploy_failure_alarm: int = 3
-    self_deploy_pull_ci_fleet: bool = False
-    zero_pass_alarm: int = 3
-    wedge_kill_loop_alarm: int = 3
-    dependency_sync_starvation_seconds: int = 14400
-    fleet_lane_concurrency: int = 8
-    reap_sweep_interval_seconds: int = 300
+    max_pass_runtime_seconds: Annotated[int, Typed, BoolTolerant] = 1800
+    self_deploy_failure_alarm: Annotated[int, Typed, BoolTolerant] = 3
+    self_deploy_pull_ci_fleet: Annotated[bool, Typed] = False
+    zero_pass_alarm: Annotated[int, Typed, BoolTolerant] = 3
+    wedge_kill_loop_alarm: Annotated[int, Typed, BoolTolerant] = 3
+    dependency_sync_starvation_seconds: Annotated[int, Typed, BoolTolerant] = 14400
+    fleet_lane_concurrency: Annotated[int, Typed, BoolTolerant] = 8
+    reap_sweep_interval_seconds: Annotated[int, Typed, BoolTolerant] = 300
 
 
 # Derived from the dataclass, not hand-maintained: every ``fleet_supervisor``

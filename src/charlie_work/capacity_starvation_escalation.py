@@ -33,8 +33,9 @@ import json
 import logging
 from dataclasses import dataclass, fields
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
+from .config_validation import AtLeastOne, Typed
 from .fleet_paths import warn_fleet_dir_virtualization_on_write
 from . import layout
 from .instrumentation import log_event
@@ -74,8 +75,8 @@ class RunnerCapacityEscalationConfig:
     Default 15 min = three default-cadence passes.
     """
 
-    enabled: bool = True
-    starvation_escalation_minutes: int = 15
+    enabled: Annotated[bool, Typed] = True
+    starvation_escalation_minutes: Annotated[int, Typed, AtLeastOne] = 15
 
 
 def parse_runner_capacity_escalation(data: dict[str, Any]) -> RunnerCapacityEscalationConfig:

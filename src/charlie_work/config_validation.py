@@ -102,7 +102,9 @@ class Ge(Marker):
     kinds: ClassVar[frozenset[str] | None] = _NUM
 
     def problem(self, value: Any) -> tuple[str, object, GotKind] | None:
-        return None if value >= self.bound else (f">= {self.bound}", value, "value")
+        # Violation is ``value < bound`` (not ``not value >= bound``): NaN passes, as it
+        # always has; pair with ``Finite`` where NaN must be rejected.
+        return (f">= {self.bound}", value, "value") if value < self.bound else None
 
 
 @dataclass(frozen=True)
@@ -111,7 +113,7 @@ class Gt(Marker):
     kinds: ClassVar[frozenset[str] | None] = _NUM
 
     def problem(self, value: Any) -> tuple[str, object, GotKind] | None:
-        return None if value > self.bound else (f"> {self.bound}", value, "value")
+        return (f"> {self.bound}", value, "value") if value <= self.bound else None
 
 
 @dataclass(frozen=True)
@@ -184,6 +186,16 @@ class Placeholders(Marker):
 
 
 @dataclass(frozen=True)
+class _NonEmptyRaw(Marker):
+    """Legacy: rejects only ``""``; a whitespace-only string is accepted (preserved per key)."""
+
+    kinds: ClassVar[frozenset[str] | None] = _STR
+
+    def problem(self, value: Any) -> tuple[str, object, GotKind] | None:
+        return None if value != "" else ("non-empty string", value, "value")
+
+
+@dataclass(frozen=True)
 class _Regex(Marker):
     kinds: ClassVar[frozenset[str] | None] = _STR
 
@@ -200,9 +212,10 @@ class _RelativePath(Marker):
     kinds: ClassVar[frozenset[str] | None] = _STR
 
     def problem(self, value: Any) -> tuple[str, object, GotKind] | None:
-        for flavour in (PurePosixPath(value), PureWindowsPath(value)):
-            if flavour.anchor or ".." in flavour.parts:
-                return ("relative path without '..'", value, "value")
+        # Legacy semantics kept exactly: a drive-relative ``C:foo`` is NOT absolute.
+        posix = PurePosixPath(value.replace("\\", "/"))
+        if posix.is_absolute() or PureWindowsPath(value).is_absolute() or ".." in posix.parts:
+            return ("relative path without '..'", value, "value")
         return None
 
 
@@ -219,6 +232,24 @@ class _LenientMapping(Marker):
 
     kinds: ClassVar[frozenset[str] | None] = frozenset({"nested"})
     checks_type: ClassVar[bool] = False
+
+
+@dataclass(frozen=True)
+class _NotNull(Marker):
+    """Legacy: ``key: null`` is rejected (the default is NOT substituted) for this field."""
+
+    checks_type: ClassVar[bool] = False
+
+
+@dataclass(frozen=True)
+class _Coerced(Marker):
+    """Legacy: a list has every element ``str()``-coerced with no element check.
+
+    ``strict`` additionally requires a list; lenient lets any other value through
+    unchanged (``notify.shell_command``)."""
+
+    strict: bool = True
+    kinds: ClassVar[frozenset[str] | None] = frozenset({"str"})  # element kind of seq_str
 
 
 @dataclass(frozen=True)
@@ -266,10 +297,14 @@ AtLeastOne = Ge(1)
 Positive = Gt(0)
 Finite = _Finite()
 NonEmpty = _NonEmpty()
+NonEmptyRaw = _NonEmptyRaw()
 Regex = _Regex()
 RelativePath = _RelativePath()
 BoolTolerant = _BoolTolerant()
 LenientMapping = _LenientMapping()
+NotNull = _NotNull()
+Coerced = _Coerced()
+CoercedLenient = _Coerced(strict=False)
 HostWideOnly = _HostWideOnly()
 
 
@@ -463,6 +498,13 @@ def _coerce(spec: FieldSpec, markers: tuple[Marker, ...], value: Any, path: str)
                 raise FieldError(sub_path, "mapping", sub, "type")
             built[str(name)] = validate_section(spec.item, sub, path=sub_path)  # type: ignore[arg-type]
         return MappingProxyType(built) if spec.mapping_factory == "proxy" else built
+    coerced = next((m for m in markers if isinstance(m, _Coerced)), None)
+    if coerced is not None and kind == "seq_str":
+        if _is_seq(value):
+            return tuple(str(elem) for elem in value)
+        if coerced.strict:
+            raise FieldError(path, "list", value, "type")
+        return value
     if kind == "opaque" or not any(m.checks_type for m in markers):
         # Unchecked field: only the structural list -> tuple coercion applies.
         return tuple(value) if kind == "seq_str" and _is_seq(value) else value
@@ -526,9 +568,11 @@ def validate_section(
     built: dict[str, Any] = {}
     for spec in specs:
         value = raw.get(spec.name)
-        if value is None:
-            continue
         markers = spec.markers + tuple(rules.get(spec.name, ()))
+        if value is None:
+            if NotNull in markers and spec.name in raw:
+                raise FieldError(f"{path}.{spec.name}", "a value", "null", "raw")
+            continue
         _check_compat(spec, markers, cls)
         key_path = f"{path}.{spec.name}"
         notes = [m.text for m in markers if isinstance(m, Note)]
@@ -601,8 +645,8 @@ def run_section_hooks(config: Any) -> None:
 
 __all__ = [
     "AtLeastOne", "BoolTolerant", "Check", "ConfigError", "FieldError", "FieldRules",
-    "Finite", "Ge", "Gt", "HostWideOnly", "InRange", "LenientMapping", "Marker", "NonEmpty",
-    "NonNeg", "Note", "OneOf", "Placeholders", "Positive", "Regex", "RelativePath", "Typed",
+    "Coerced", "CoercedLenient", "Finite", "Ge", "Gt", "HostWideOnly", "InRange", "LenientMapping", "Marker",
+    "NonEmpty", "NonEmptyRaw", "NonNeg", "NotNull", "Note", "OneOf", "Placeholders", "Positive", "Regex", "RelativePath", "Typed",
     "field_markers", "field_specs", "host_wide_error", "host_wide_sections", "render_got",
     "run_section_hooks", "unknown_sections_error", "validate_section",
 ]  # fmt: skip
