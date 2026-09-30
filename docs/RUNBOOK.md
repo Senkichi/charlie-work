@@ -555,6 +555,18 @@ fleet_max` when the fleet cap bound the launch. A held lock defers the pass with
 after 3 in a row, lane `dispatch_reviews`). The knob is read from the layered
 config every pass -- no supervisor restart needed.
 
+**Devin reviewer exec-rejection resume**: `review_dispatch.review_exec_rejection_max_resumes`
+(issue #2090, default `2`, `0` = disabled). A headless `devin-shell` reviewer whose exec
+is refused ends its session with no verdict (`review_verdict_missed`, cause
+`reviewer_exec_rejected`). The reaper instead relaunches the *same* Devin session
+(`devin --resume <id> --print`, id from `devin list --format json` in the review checkout)
+with a nudge naming the allowed commands, up to this many times per dispatch, emitting
+`review_exec_rejection_resumed` (`pr_number`, `attempt`, `session_id`). The resumed process
+takes over the same sidecar and review slot, so neither the per-repo nor the fleet reviewer
+cap counts it twice. `review_verdict_missed` is recorded only when resumes are exhausted; a
+resume that cannot launch (no session id, checkout gone, relaunch error) emits
+`review_exec_rejection_resume_failed` and falls back to the miss. Read every pass; no restart.
+
 **Scoped claim**: The fleet budget bounds worker *count*, not CPU. When running
 the fleet across multiple repos on one host, you must still respect the
 cross-repo xdist discipline from the Local host saturation ceiling section

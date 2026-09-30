@@ -2403,11 +2403,14 @@ def run_command(app: OrchestratorApp, args: argparse.Namespace) -> CommandResult
         # --force-rereview is the explicit opt-out. ``getattr`` because
         # run_command is also invoked with hand-built Namespaces that
         # never went through argparse (mirroring the no_cache read above).
-        if not getattr(args, "force_rereview", False):
+        force_rereview = bool(getattr(args, "force_rereview", False))
+        if not force_rereview:
             refusal = app.review_verdict_guard(args.pr)
             if refusal is not None:
                 return refusal
-        return app.review(args.pr)
+        # Issue #2081: the flag must also reach review(), which voids a
+        # live-head verdict only when forced.
+        return app.review(args.pr, force=force_rereview)
     if args.command == "verdict":
         try:
             return app.record_review(

@@ -1015,6 +1015,8 @@ class ReviewDispatchConfig:
     # lands, that source should rebind/replace this value rather than the
     # rubric or probe hardcoding a constant of their own.
     file_size_cap_lines: Annotated[int, Typed, NonNeg] = 0
+    # #2090: devin exec-rejection resumes per review session; 0 = off.
+    review_exec_rejection_max_resumes: Annotated[int, Typed, NonNeg] = 2
 
 
 @dataclass(frozen=True)

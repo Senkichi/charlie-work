@@ -4264,8 +4264,15 @@ class OrchestratorApp:
     def review(
         self,
         pr_number: int,
+        *,
+        force: bool = False,
     ) -> CommandResult:
         """Generate a review packet for a PR.
+
+        ``force`` (issue #2081, ``why-charlie-hate --force-rereview``) voids a
+        terminal verdict even when it is pinned to the live head: the verdict is
+        archived into the rounds archive, the pending stub overwrites it, and a
+        ``verdict_force_voided`` event names the voided decision and head.
 
         When config.test_adequacy.enabled, this method may itself issue a
         request_changes verdict and advance/terminate the rework loop (previously
@@ -5753,12 +5760,26 @@ class OrchestratorApp:
             # corrupt file is left for a human rather than silently
             # overwritten (mirroring the original code's ``else`` branch,
             # which only reset on a real terminal decision).
-            voided_stale_verdict = live_decision_value in (
+            # Issue #2081: ``force`` (``why-charlie-hate --force-rereview``)
+            # voids a terminal verdict even when it is pinned to -- or carried
+            # forward to -- the live head. Before, the flag only skipped the
+            # CLI's #1695 guard and this block voided stale-head verdicts
+            # alone, so a live-head verdict survived the "forced" re-review.
+            is_terminal_verdict = live_decision_value in (
                 "approved",
                 "request_changes",
                 "blocked",
-            ) and (
-                live_reviewed_head_sha is None or live_reviewed_head_sha != pr.get("headRefOid")
+            )
+            voided_stale_verdict = is_terminal_verdict and (
+                force
+                or live_reviewed_head_sha is None
+                or live_reviewed_head_sha != pr.get("headRefOid")
+            )
+            force_voided_verdict = (
+                force
+                and is_terminal_verdict
+                and live_reviewed_head_sha is not None
+                and live_reviewed_head_sha == pr.get("headRefOid")
             )
             if not decision_path.exists() or voided_stale_verdict:
                 if voided_stale_verdict:
@@ -5901,6 +5922,20 @@ class OrchestratorApp:
                 _issue_key = str(issue_number)
                 _issue_entry = state["issues"].get(_issue_key, {})
                 state["issues"][_issue_key] = {**_issue_entry, "merge_alert": "OK"}
+            if force_voided_verdict:
+                state = append_event(
+                    state,
+                    "verdict_force_voided",
+                    {
+                        "pr_number": pr_number,
+                        "issue_number": issue_number,
+                        "voided_decision": live_decision_value,
+                        "voided_reviewed_head_sha": live_reviewed_head_sha,
+                        "verdict_provenance": live_decision.get("verdict_provenance"),
+                        "head_sha": pr.get("headRefOid"),
+                    },
+                    state_path=self.paths.state_file,
+                )
             state = append_event(
                 state,
                 "review_packet",
