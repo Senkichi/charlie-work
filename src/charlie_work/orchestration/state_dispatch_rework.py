@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import asdict
 from datetime import UTC, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from charlie_work.adapters import (
     SessionDispatchResult,
@@ -37,6 +37,9 @@ from charlie_work.worker_launch_gate import (
     _launch_workers,
     issue_worker_launch_permit,
 )
+
+if TYPE_CHECKING:
+    from charlie_work.worker import IssueWorkerLiveness
 
 
 def _dispatch_rework_impl(
@@ -321,6 +324,29 @@ def _dispatch_rework_impl(
 
         dry_candidates = dry_filtered_candidates
 
+        # Issue #2051 (mirror of the live path below): a cap-escalation
+        # candidate whose issue is held by a live worker would defer, not
+        # escalate -- report it that way instead of misreporting an
+        # escalation that will not happen. Read-only: no marker/event write.
+        (
+            (
+                dry_no_op_rework_escalated,
+                dry_worker_death_escalated,
+                dry_blocked_environment_escalated,
+            ),
+            dry_live_worker_deferrals,
+        ) = _wf._filter_cap_escalation_lanes_for_live_workers(
+            (
+                (dry_no_op_rework_escalated, "no_op_rework_cap_exceeded"),
+                (dry_worker_death_escalated, "worker_death_loop"),
+                (dry_blocked_environment_escalated, "dispatch_blocked_environment"),
+            ),
+            issues=dry_head_check_state.get("issues", {}),
+            sessions_dir=sessions_dir,
+            config=self.config,
+            now=datetime.now(UTC),
+        )
+
         # Apply only_issues filter and concurrency cap (read-only).
         # Issue #1014 (mirroring #1005 in the fresh-dispatch path): compute
         # deferred_by_concurrency uniformly across both the only_issues and
@@ -393,6 +419,7 @@ def _dispatch_rework_impl(
             "no_op_rework_escalated": sorted(dry_no_op_rework_escalated),
             "worker_death_escalated": sorted(dry_worker_death_escalated),
             "blocked_environment_escalated": sorted(dry_blocked_environment_escalated),
+            "escalation_deferred_live_worker": sorted(dry_live_worker_deferrals),
             "rescue_issue_numbers": sorted(dry_rescue_issue_numbers),
         }
         if gov.any_term_enabled:
@@ -696,6 +723,42 @@ def _dispatch_rework_impl(
     routed_to_review.extend(salvaged_confirmed)
     review_blocked_retry.extend(salvaged_blocked)
 
+    # Issue #2051: a cap escalation must not fire while a live worker
+    # still holds the issue -- escalation hands the branch to the
+    # operator while the worker is still writing it (the #2006 incident:
+    # the issue was escalated to operator-queue while its live rework
+    # worker kept committing to it). ``rework_requested`` is not evidence
+    # nobody holds the issue -- the conflict/check-failure routers re-set
+    # that status while an earlier worker remains alive. Gate all three
+    # cap lanes on the same ``issue_worker_liveness`` predicate
+    # ``unescalate`` uses: a live verdict drops the issue from every
+    # escalation list this pass with counters, status, and labels
+    # untouched (the cap is still exhausted, so the next pass escalates
+    # once the worker exits or wedges -- the verdict already folds in the
+    # watchdog stall standard), and the deferral is recorded once per
+    # worker via ``escalation_deferred_live_worker``. The liveness probe
+    # touches the filesystem/process table, so it runs outside the state
+    # lock; the marker/event write re-loads under the lock. A worker that
+    # exits between probe and write defers once and escalates next pass
+    # -- self-correcting, at worst one pass late.
+    live_worker_deferrals: dict[int, tuple[str, IssueWorkerLiveness]]
+    (
+        (no_op_rework_escalated, worker_death_escalated, blocked_environment_escalated),
+        live_worker_deferrals,
+    ) = _wf._filter_cap_escalation_lanes_for_live_workers(
+        (
+            (no_op_rework_escalated, "no_op_rework_cap_exceeded"),
+            (worker_death_escalated, "worker_death_loop"),
+            (blocked_environment_escalated, "dispatch_blocked_environment"),
+        ),
+        issues=head_check_state.get("issues", {}),
+        sessions_dir=sessions_dir,
+        config=self.config,
+        now=datetime.now(UTC),
+    )
+    if live_worker_deferrals:
+        _wf._record_cap_escalation_deferrals(live_worker_deferrals, write_gate=self.write_gate)
+
     # Escalate no-op rework issues that have exhausted the redispatch cap
     # without the PR head ever advancing. Each of these would have burned
     # another worker session on an unchanged diff.
@@ -903,6 +966,7 @@ def _dispatch_rework_impl(
             "worker_death_escalated": sorted(worker_death_escalated),
             "salvaged_to_review": sorted(salvaged_to_review),
             "blocked_environment_escalated": sorted(blocked_environment_escalated),
+            "escalation_deferred_live_worker": sorted(live_worker_deferrals),
         }
         if gov.any_term_enabled:
             data.update(gov.report_fields())
@@ -970,6 +1034,7 @@ def _dispatch_rework_impl(
             "worker_death_escalated": sorted(worker_death_escalated),
             "salvaged_to_review": sorted(salvaged_to_review),
             "blocked_environment_escalated": sorted(blocked_environment_escalated),
+            "escalation_deferred_live_worker": sorted(live_worker_deferrals),
         }
         if gov.any_term_enabled:
             data.update(gov.report_fields())
@@ -1204,6 +1269,7 @@ def _dispatch_rework_impl(
             "worker_death_escalated": sorted(worker_death_escalated),
             "salvaged_to_review": sorted(salvaged_to_review),
             "blocked_environment_escalated": sorted(blocked_environment_escalated),
+            "escalation_deferred_live_worker": sorted(live_worker_deferrals),
         }
         if gov.any_term_enabled:
             data.update(gov.report_fields())
@@ -1687,6 +1753,7 @@ def _dispatch_rework_impl(
         "no_op_rework_escalated": sorted(no_op_rework_escalated),
         "salvaged_to_review": sorted(salvaged_to_review),
         "blocked_environment_escalated": sorted(blocked_environment_escalated),
+        "escalation_deferred_live_worker": sorted(live_worker_deferrals),
     }
     if gov.any_term_enabled:
         data.update(gov.report_fields())

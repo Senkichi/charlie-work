@@ -189,6 +189,12 @@ UNESCALATE_ISSUE_RESET_FIELDS = (
     # windowed list fields above (``dispatch_failed_at`` etc.), whose
     # readers treat a missing key as an empty window.
     "blocked_environment_at",
+    # Issue #2051: the once-per-worker cap-escalation deferral marker is
+    # per-episode bookkeeping. A re-arm must clear it so a live-worker
+    # deferral under the next episode's worker still emits
+    # ``escalation_deferred_live_worker`` instead of being deduped against
+    # a stale marker.
+    "escalation_deferred_live_worker",
 )
 
 # Issue #1477 (Option A -- identical-cause recurrence is sticky): the marker

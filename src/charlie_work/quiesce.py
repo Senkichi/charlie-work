@@ -32,16 +32,20 @@ config), never hardcoded here (project rule: no embedded manual lists).
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shutil
 import subprocess
 import sys
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Protocol, runtime_checkable
 
+from .process_chain import ancestor_chain_pids, proc_rows, win32_process_ppid_snapshot
 from .subprocess_runner import no_console_window_kwargs
+
+logger = logging.getLogger(__name__)
 
 # Hard backstop on the parent-PID walk in `self_process_chain`. A cycle in
 # the chain already terminates the loop on its own (see that function's
@@ -73,12 +77,21 @@ class ProcessInfo:
     ``name`` is carried for display/logging only. Quiescence matching in
     `assert_quiescent` uses ``command_line`` exclusively — see defect #2 in
     the module docstring for why name-based matching is unsafe.
+
+    ``created`` is the process creation time (epoch seconds from a UTC
+    source, or ``None`` when the snapshot did not carry one). It exists so
+    the ancestor walk in `self_process_chain` can distrust a stale
+    ``ParentProcessId``: on Windows a dead parent's pid can be recycled by
+    an unrelated, *younger* process, and a recorded parent created after
+    its child is not an ancestor (issue #2058; the rule lives in
+    ``process_chain.ancestor_chain_pids``).
     """
 
     pid: int
     ppid: int
     name: str
     command_line: str
+    created: float | None = None
 
 
 @runtime_checkable
@@ -142,25 +155,23 @@ def self_process_chain(pid: int, processes: Sequence[ProcessInfo]) -> frozenset[
     every shell/wrapper that launched it) from ever matching a pattern that
     merely appears inside its own invocation (defect #1).
 
-    Termination is guaranteed three ways:
+    The walk is ``process_chain.ancestor_chain_pids`` (issue #2058), whose
+    termination rules are:
       - A parent PID already seen in the chain (a cycle) stops the walk
         before it is re-added.
       - A parent PID absent from ``processes`` (root of the tree, or a
-        snapshot that doesn't include it) stops the walk.
+        snapshot that doesn't include it) stops the walk after being
+        appended as the final ancestor.
+      - A parent *created after its child* stops the walk: on Windows a
+        recorded ``ParentProcessId`` is never updated when the parent
+        exits, and the freed pid can name an unrelated, younger process.
+        Following it would pull a stranger (and its ancestry) into the
+        exclusion set, so a matching process could be skipped and the gate
+        could report "quiescent" while it is still running. Rows with no
+        ``created`` stamp keep their links -- unknown never disqualifies.
       - `_MAX_CHAIN_DEPTH` hops is a hard backstop regardless of the above.
     """
-    ppid_by_pid = {proc.pid: proc.ppid for proc in processes}
-    chain: set[int] = set()
-    current = pid
-    hops = 0
-    while current not in chain and hops < _MAX_CHAIN_DEPTH:
-        chain.add(current)
-        hops += 1
-        parent = ppid_by_pid.get(current)
-        if parent is None:
-            break
-        current = parent
-    return frozenset(chain)
+    return frozenset(ancestor_chain_pids(pid, proc_rows(processes), max_hops=_MAX_CHAIN_DEPTH))
 
 
 def _compile_patterns(patterns: Sequence[str]) -> tuple[list[re.Pattern[str]], tuple[str, ...]]:
@@ -285,13 +296,22 @@ def list_processes() -> tuple[Sequence[ProcessInfo], str | None]:
 
     Built on the same PowerShell invocation style as
     ``orphan_sweep.sweep_orphan_processes``/``process_utils._enumerate_child_pids``:
-    ``Get-CimInstance Win32_Process`` piped through ``ConvertTo-Json``, no
-    ``psutil`` dependency (that module deliberately avoids one; see its
-    docstrings). Returns ``(processes, error)`` instead of raising — a
+    ``Get-CimInstance Win32_Process`` piped through ``ConvertTo-Json``.
+    Returns ``(processes, error)`` instead of raising — a
     PowerShell hiccup must surface as a value so a caller can fail the
     quiescence check *closed* (i.e. "unknown" is never reported as
     "quiescent"), matching this repo's "errors from external processes come
     back as values" invariant.
+
+    Each row's ``created`` stamp is overlaid afterwards from
+    ``process_chain.win32_process_ppid_snapshot`` (psutil, UTC-derived) —
+    the source issue #2057 settled on after CIM ``CreationDate`` proved to
+    be a local-time ``DateTime`` that can sit an hour off across a DST
+    transition. The overlay can only lose information (a pid unseen by
+    psutil keeps ``created=None``, and an unknown stamp never disqualifies
+    a parent link in the chain walk); a wholly failed overlay leaves every
+    stamp ``None`` and is logged, since a permanently inert
+    recycled-parent guard would otherwise vanish silently.
     """
     if sys.platform != "win32":
         return (), "list_processes is only implemented for win32"
@@ -387,6 +407,22 @@ def list_processes() -> tuple[Sequence[ProcessInfo], str | None]:
                 command_line=str(entry.get("CommandLine") or ""),
             )
         )
+
+    if processes:
+        created_by_pid = win32_process_ppid_snapshot()
+        if created_by_pid:
+            processes = [
+                replace(proc, created=created_by_pid[proc.pid].created)
+                if proc.pid in created_by_pid
+                else proc
+                for proc in processes
+            ]
+        else:
+            logger.warning(
+                "process creation-time snapshot unavailable; the "
+                "recycled-parent guard in self_process_chain degrades to "
+                "trusting bare ppids"
+            )
     return tuple(processes), None
 
 

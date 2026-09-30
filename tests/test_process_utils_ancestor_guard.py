@@ -20,6 +20,7 @@ from typing import Any
 import pytest
 
 import charlie_work.orphan_sweep as _sweep
+import charlie_work.process_chain as _pc
 import charlie_work.process_utils as _pu
 from charlie_work.process_utils import kill_orphan_pid, kill_process_tree
 from charlie_work.subprocess_runner import RunResult
@@ -422,7 +423,7 @@ def test_win32_process_ppid_snapshot_normalizes_single_result(
     unreadable creation time (``AccessDenied`` -> ``None``) yields ``created
     is None`` so the link is kept, and a missing ppid maps to 0."""
     monkeypatch.setattr(
-        _sweep.psutil,
+        _pc.psutil,
         "process_iter",
         lambda attrs=None: iter(
             [
@@ -447,9 +448,9 @@ def test_win32_process_ppid_snapshot_failure_returns_empty(
     rather than raising."""
 
     def boom(attrs: Any = None) -> Any:
-        raise _sweep.psutil.Error("substrate broken")
+        raise _pc.psutil.Error("substrate broken")
 
-    monkeypatch.setattr(_sweep.psutil, "process_iter", boom)
+    monkeypatch.setattr(_pc.psutil, "process_iter", boom)
     assert _sweep._win32_process_ppid_snapshot() == {}
 
 
@@ -581,7 +582,7 @@ def test_snapshot_spawn_oserror_degrades_without_raising(
     def boom(*args: Any, **kwargs: Any) -> Any:
         raise exc_type("denied")
 
-    monkeypatch.setattr(_sweep.psutil, "process_iter", boom)
+    monkeypatch.setattr(_pc.psutil, "process_iter", boom)
 
     assert _sweep._win32_process_ppid_snapshot() == {}
 
