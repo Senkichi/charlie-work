@@ -3,8 +3,8 @@
 Architecture-deepening candidate 1 (``docs/superpowers/plans/
 2026-09-29-architecture-deepening.md``, design note in the Wave A scratchpad
 ``wf-design.md``). Today, "what happened to this worker" is decided by 13
-scattered sites (``workflow.py``, ``orphaned_worker_sweep.py``,
-``dead_worker_sweep/live_handoff.py``, ``rework_outcome.py``, ``dead_worker_reap.py``,
+scattered sites (``workflow.py``, the retired ``orphaned_worker_sweep.py``,
+``dead_worker_sweep/live_handoff.py``, ``rework_outcome.py``, the retired ``dead_worker_reap.py``,
 ``misc_worker_dispatch.py``) that disagree on nine points. This module is the
 single point of enforcement for all nine; ``resolve_fate`` is a pure function
 over gathered evidence, so every rule is testable as a decision table with no

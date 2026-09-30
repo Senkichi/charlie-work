@@ -454,18 +454,16 @@ from .queue_sync_coverage import (  # noqa: F401  (deliberate re-export)
 #
 # issue #1317 (spun off from #1283's A6 recon): the dead-worker/session-reap
 # free-function family (25 functions plus the two threshold constants below
-# -- see the module docstring for the full list, the deliberate
-# `_detect_and_handle_orphaned_workers` exclusion rationale, and the
-# disclosed call-graph judgment calls) now lives in
-# `charlie_work.dead_worker_reap`. Re-exported here, not re-declared, so
+# -- see the module docstring for the full list and the disclosed
+# call-graph judgment calls) now lives in the
+# `charlie_work.dead_worker_sweep` package. Re-exported here, not re-declared, so
 # every existing `charlie_work.workflow.<name>` import and monkeypatch
 # target keeps resolving unchanged — the same pattern `config.py` uses for
 # `RunnerAllocationConfig` and this file's own `.dispatch_selection` /
 # `.escalation` / `.verdict_parsing` / `.rework_prompts` / `.ci_findings` /
 # `.backlog_reachability` / `.stalled_review_reap` blocks above.
 #
-# `_detect_and_handle_orphaned_workers` itself deliberately stays defined
-# below in this file -- see its docstring and issue #1317 for why.
+# `_detect_and_handle_orphaned_workers` is likewise re-exported (see below).
 from .dead_worker_sweep.effects_sessions import (  # noqa: F401  (deliberate re-export)
     STARTUP_DEATH_THRESHOLD_SECONDS,
     _is_startup_death,

@@ -1,8 +1,9 @@
 """Rule 2 (Worker fate) for a dead worker that still has an open PR: read its
 fresh ``blocked`` declaration and escalate it, queueing the label edge.
 
-Split out of ``orphaned_worker_sweep`` (two call sites there, one per review
-decision branch) so the sweep stays under its file-size ratchet mark.
+Split out of the retired ``orphaned_worker_sweep`` (now
+``dead_worker_sweep.decide_with_pr``), which reads this through
+``dead_worker_blocked_outcome``.
 """
 
 from __future__ import annotations
