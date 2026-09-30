@@ -44,6 +44,15 @@ class ConfigError(ValueError):
     """A config file was structurally invalid (unknown keys, wrong shapes)."""
 
 
+class ConstructionError(ConfigError):
+    """A section dataclass's own constructor raised a plain ``ValueError``/``TypeError``.
+
+    Callers that catch ``ConfigError`` handle it (design F1), but the #665 layered-load
+    rescue must NOT: such errors come from host-wide sections (``ci_fleet``'s
+    ``__post_init__``) and ``rescue.worker``, which live in the very global layer that
+    rescue discards. Before the wrap they escaped the rescue as raw ``ValueError``."""
+
+
 def _trunc(text: str) -> str:
     return text if len(text) <= _MAX_REPR else text[: _MAX_REPR - 3] + "..."
 
@@ -242,6 +251,15 @@ class _NotNull(Marker):
 
 
 @dataclass(frozen=True)
+class _NullIsDefault(Marker):
+    """Legacy: ``key: null`` builds the field's default (base normalized it, e.g. ``or ""``).
+
+    Without this marker an explicit null is preserved as ``None`` (design P2)."""
+
+    checks_type: ClassVar[bool] = False
+
+
+@dataclass(frozen=True)
 class _Coerced(Marker):
     """Legacy: a list has every element ``str()``-coerced with no element check.
 
@@ -331,6 +349,7 @@ RelativePath = _RelativePath()
 BoolTolerant = _BoolTolerant()
 LenientMapping = _LenientMapping()
 NotNull = _NotNull()
+NullIsDefault = _NullIsDefault()
 Coerced = _Coerced()
 CoercedLenient = _Coerced(strict=False)
 HostWideOnly = _HostWideOnly()
@@ -618,8 +637,13 @@ def validate_section(
         if value is None and LenientMapping in markers and spec.name in raw:
             value = {}  # legacy: ``key: null`` on a lenient nested section builds a bare one
         if value is None:
-            if NotNull in markers and spec.name in raw:
-                raise FieldError(f"{path}.{spec.name}", "a value", "null", "raw")
+            if spec.name in raw:
+                if NotNull in markers:
+                    raise FieldError(f"{path}.{spec.name}", "a value", "null", "raw")
+                # ``key: null`` is preserved, never checked and never replaced by the
+                # default (design P2): a falsy None differs from a default True.
+                if NullIsDefault not in markers:
+                    built[spec.name] = None
             continue
         _check_compat(spec, markers, cls)
         key_path = f"{path}.{spec.name}"
@@ -640,8 +664,8 @@ def validate_section(
     except (ValueError, TypeError) as exc:
         text = str(exc)
         if text.startswith(f"{path}."):  # ci_fleet text already names the key path
-            raise ConfigError(text) from exc
-        raise ConfigError(f"{path}: expected valid construction, got {text}") from exc
+            raise ConstructionError(text) from exc
+        raise ConstructionError(f"{path}: expected valid construction, got {text}") from exc
 
 
 # ----------------------------------------------------------------------- hooks
@@ -693,8 +717,8 @@ def run_section_hooks(config: Any) -> None:
 
 __all__ = [
     "AtLeastOne", "BoolTolerant", "Check", "ConfigError", "FieldError", "FieldRules",
-    "Coerced", "CoercedLenient", "CommandTemplate", "Finite", "Ge", "Gt", "HostWideOnly", "InRange", "LenientMapping", "Marker",
-    "NonEmpty", "NonEmptyRaw", "NonNeg", "NotNull", "Note", "OneOf", "Placeholders", "Positive", "Regex", "RelativePath", "Typed",
+    "Coerced", "CoercedLenient", "CommandTemplate", "ConstructionError", "Finite", "Ge", "Gt", "HostWideOnly", "InRange", "LenientMapping", "Marker",
+    "NonEmpty", "NonEmptyRaw", "NonNeg", "NotNull", "Note", "NullIsDefault", "OneOf", "Placeholders", "Positive", "Regex", "RelativePath", "Typed",
     "field_markers", "field_rules", "field_specs", "host_wide_error", "host_wide_sections", "render_got",
     "run_section_hooks", "unknown_sections_error", "validate_section",
 ]  # fmt: skip

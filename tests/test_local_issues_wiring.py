@@ -58,40 +58,53 @@ def test_load_config_local_issues_section(tmp_path: Path) -> None:
     assert config.local_issues.issues_dir == "tickets"
 
 
+def _legacy_id(yaml_body: str, old_match: str) -> str:
+    """Pre-migration parametrize id: the collect-only gate keys leaves by it (ADR-0007)."""
+    return f"{yaml_body}-{old_match}"
+
+
 @pytest.mark.parametrize(
     ("yaml_body", "match"),
     [
-        (
+        pytest.param(
             'local_issues:\n  enabled: "yes"\n',
             r"^local_issues\.enabled: expected bool, got 'yes' \(str\)$",
+            id=_legacy_id('local_issues:\n  enabled: "yes"\n', "must be a bool"),
         ),
-        (
+        pytest.param(
             'local_issues:\n  issues_dir: ""\n',
             r"^local_issues\.issues_dir: expected non-empty string, got ''$",
+            id=_legacy_id('local_issues:\n  issues_dir: ""\n', "must be a non-empty string"),
         ),
-        (
+        pytest.param(
             "local_issues:\n  issues_dir: 5\n",
             r"^local_issues\.issues_dir: expected string, got 5 \(int\)$",
+            id=_legacy_id("local_issues:\n  issues_dir: 5\n", "must be a non-empty string"),
         ),
-        (
+        pytest.param(
             "local_issues:\n  issues_dir: ../x\n",
             r"^local_issues\.issues_dir: expected relative path without '\.\.', got '\.\./x'$",
+            id=_legacy_id("local_issues:\n  issues_dir: ../x\n", "must not contain '..'"),
         ),
-        (
+        pytest.param(
             "local_issues:\n  issues_dir: a/../../x\n",
             r"^local_issues\.issues_dir: expected relative path without '\.\.', got 'a/",
+            id=_legacy_id("local_issues:\n  issues_dir: a/../../x\n", "must not contain '..'"),
         ),
-        (
+        pytest.param(
             "local_issues:\n  issues_dir: /etc/x\n",
             r"^local_issues\.issues_dir: expected relative path without '\.\.', got '/etc/x'$",
+            id=_legacy_id("local_issues:\n  issues_dir: /etc/x\n", "must be relative to the"),
         ),
-        (
+        pytest.param(
             "local_issues:\n  issues_dir: 'C:\\x'\n",
             r"^local_issues\.issues_dir: expected relative path without '\.\.', got 'C:",
+            id=_legacy_id("local_issues:\n  issues_dir: 'C:\\x'\n", "must be relative to the"),
         ),
-        (
+        pytest.param(
             "local_issues:\n  nope: 1\n",
             r"^local_issues: expected known keys .*got unknown key\(s\) nope$",
+            id=_legacy_id("local_issues:\n  nope: 1\n", "unknown key"),
         ),
     ],
 )

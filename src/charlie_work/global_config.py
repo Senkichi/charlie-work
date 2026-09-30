@@ -17,7 +17,7 @@ from .config import (
 )
 from . import layout
 from .config_deprecations import emit_deprecated_key_reads, repo_state_path
-from .config_validation import host_wide_error, host_wide_sections
+from .config_validation import ConstructionError, host_wide_error, host_wide_sections
 from .fleet_paths import fleet_dir
 from .fleet_supervisor_config import (
     resolve_fleet_supervisor_layer,
@@ -334,7 +334,7 @@ def load_layered_config(
             except Exception:  # noqa: BLE001 — deprecation telemetry must never break config load
                 logger.debug("config_key_deprecated_read emit failed for %s", repo_source)
         return merged
-    except ConfigError:
+    except ConfigError as exc:
         # A present-but-invalid global layer (e.g. an unknown key) makes
         # the merged load raise, and callers (fleet_dispatch) catch
         # ConfigError and skip the repo -- silently discarding a *valid*
@@ -345,6 +345,12 @@ def load_layered_config(
         # per-repo config to rescue, propagate the original error --
         # silently defaulting would itself reproduce the #623 shape.
         if not global_exists or not repo_data:
+            raise
+        # A section constructor's own rejection (ci_fleet's host-wide
+        # ``__post_init__`` rules, ``rescue.worker``) is the global layer's
+        # *host-wide* breakage. Discarding that layer would silently default
+        # every host-wide knob -- the #623 shape -- so it stays loud.
+        if isinstance(exc, ConstructionError):
             raise
         # Provenance is the per-repo file alone, deliberately: the global
         # layer was *discarded*, so listing it would claim a contribution

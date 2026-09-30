@@ -50,6 +50,7 @@ from .config_validation import (
     NonEmptyRaw,
     NonNeg,
     NotNull,
+    NullIsDefault,
     Note,
     OneOf,
     Positive,
@@ -370,7 +371,7 @@ class DispatchConfig:
     # dependency group that declares pytest -- and, when nothing is derivable,
     # tells the worker to use the command the repository documents in CLAUDE.md.
     # See prompt_test_command.
-    test_command: Annotated[str, Typed] = ""
+    test_command: Annotated[str, Typed, NullIsDefault] = ""
     # Global concurrency governor: cap total live worker sessions across fresh,
     # rework, and recovery dispatch. Unset/0 preserves current unlimited behavior.
     max_concurrent_sessions: int = 0
@@ -868,7 +869,7 @@ class DeescalationConfig:
     # degraded-cadence fleet (the observed #1306 loop re-escalated ~36 min
     # after the 2026-08-27T00:23:54Z manual unescalate; the two 08-25
     # escalations were ~10.5h apart).
-    identical_reason_recurrence_window_minutes: Annotated[int, Typed, NonNeg] = 1440
+    identical_reason_recurrence_window_minutes: Annotated[int, Typed, NonNeg, NullIsDefault] = 1440
     # Issue #1314 item 2 (retained by #1768's rewrite): dedicated cadence
     # knob for the operator-queue-impact check. The check currently rides
     # the loop pass cadence (every pass); this knob lets operators slow it
@@ -877,7 +878,7 @@ class DeescalationConfig:
     # > 0 means "check every N minutes", gated by a
     # ``next_operator_queue_review_at`` timestamp in ``state.json``'s
     # ``deescalation_pass`` section.
-    operator_queue_review_interval_minutes: Annotated[int, Typed, NonNeg] = 0
+    operator_queue_review_interval_minutes: Annotated[int, Typed, NonNeg, NullIsDefault] = 0
     # Issue #1768 (retired the #1314 item 3 raw-count gauge this field used
     # to threshold): alert threshold for the operator-queue-impact signal,
     # reused as-is rather than introduced as a new key since no fleet repo
@@ -894,6 +895,7 @@ class DeescalationConfig:
         int,
         Typed,
         NonNeg,
+        NullIsDefault,
         Note("blocked-ready-issue count, not root-issue count -- see issue #1768"),
     ] = 5
 

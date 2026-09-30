@@ -472,8 +472,6 @@ def test_key_probe_matrix_unchanged(recorded):
         path, seed = recorded["targets"][tid], recorded["seeds"][tid]
         for rec, (name, value) in zip(row, PROBES, strict=True):
             now = code_of(place(path, value, seed))
-            if name == "none" and rec.startswith("A") and now.startswith("A"):
-                continue  # ``key: null`` -> default replaces the stored None (ADR-0007, P2)
             if not same(rec, now):
                 bad.append(f"{tid} <- {name}: recorded {rec}, now {now}")
     assert not bad, "rejection set changed:\n" + "\n".join(bad[:60]) + f"\n({len(bad)} total)"
