@@ -5288,12 +5288,27 @@ class OrchestratorApp:
             # "Required check(s) missing" janitor failure). Detection lives
             # entirely in that method; the retrigger policy below (issue
             # #1274, W17) is this method's follow-up.
-            ci_run_never_created_head_sha = self._detect_ci_run_never_created(
+            # Issue #1681: the same detector also classifies the terminal
+            # "runs exist, all completed, none produced jobs" head
+            # (``workflow_no_jobs``, e.g. GitHub rejected the workflow file).
+            # Retrigger cannot fix that, so it routes to rework below instead
+            # of being re-parked as ``janitor_blocked`` forever.
+            ci_absence = self._detect_ci_absence(
                 pr,
                 verdict,
                 known_head=(pr_state or {}).get("ci_run_never_created_head"),
             )
+            ci_run_never_created_head_sha = (
+                ci_absence.head_sha
+                if ci_absence is not None and ci_absence.kind == "never_created"
+                else None
+            )
             ci_run_never_created = ci_run_never_created_head_sha is not None
+            workflow_no_jobs_head_sha = (
+                ci_absence.head_sha
+                if ci_absence is not None and ci_absence.kind == "workflow_no_jobs"
+                else None
+            )
 
             with state_lock(self.paths.state_file):
                 state = load_state(self.paths.state_file)
@@ -5329,7 +5344,28 @@ class OrchestratorApp:
                 )
                 if ci_run_never_created:
                     pr_state_update["ci_run_never_created_head"] = ci_run_never_created_head_sha
+                # Issue #1681: event dedup only -- routing below is NOT gated
+                # on this marker, so a rework that pushes nothing new is
+                # re-routed (and capped by record_review), never re-parked.
+                workflow_no_jobs_new_head = (
+                    workflow_no_jobs_head_sha is not None
+                    and existing_pr_state.get("workflow_no_jobs_head") != workflow_no_jobs_head_sha
+                )
+                if workflow_no_jobs_head_sha is not None:
+                    pr_state_update["workflow_no_jobs_head"] = workflow_no_jobs_head_sha
                 state["prs"][str(pr_number)] = pr_state_update
+                if workflow_no_jobs_new_head:
+                    state = self._record_event(
+                        state,
+                        "workflow_no_jobs",
+                        {
+                            "pr_number": pr_number,
+                            "issue_number": issue_number,
+                            "head_sha": workflow_no_jobs_head_sha,
+                            "branch": pr.get("headRefName"),
+                            "missing_checks": list(verdict.missing_required_checks),
+                        },
+                    )
                 if ci_run_never_created_new_head:
                     state = self._record_event(
                         state,
@@ -5380,6 +5416,23 @@ class OrchestratorApp:
             # and gives the rework loop real signal -- the three PRs this
             # item exists to fix (#1186/#1192/#1214) all carry a co-occurring
             # failure.
+            if issue_number is not None and workflow_no_jobs_head_sha is not None:
+                transition(self.gh, self.config.labels, issue_number, "review_started")
+                missing = ", ".join(verdict.missing_required_checks)
+                diagnostic = (
+                    f"workflow file invalid: run completed with no jobs created for head "
+                    f"{workflow_no_jobs_head_sha}; required check(s) {missing} can never "
+                    f"report for this head. Fix the workflow file and push."
+                )
+                return self.record_review(
+                    pr_number,
+                    "request_changes",
+                    summary=diagnostic,
+                    reviewed_head=pr.get("headRefOid"),
+                    required_changes=[diagnostic],
+                    verdict_provenance="ci_gate_auto_reject",
+                )
+
             stale_checks_head_sha = str(pr.get("headRefOid") or "") or None
             stale_checks_retrigger_in_scope = (
                 issue_number is not None

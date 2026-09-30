@@ -26,6 +26,7 @@ from typing import Any
 import charlie_work.workflow as _wf
 from charlie_work.dispatch_deferral import records_deferral
 from charlie_work import layout
+from charlie_work.ci_absence import CiAbsence, runs_terminally_without_jobs
 from charlie_work.ci_headroom import ci_headroom_available
 from charlie_work.fleet_paths import fleet_dir
 from charlie_work.fleet_registry import registered_state_dirs, try_acquire_fleet_lock
@@ -39,14 +40,23 @@ from charlie_work.worker_launch_gate import acquire_fleet_launch_lock
 from charlie_work.dead_worker_reap import _is_pr_updated_at_older_than, _safe_repo_slug
 
 
-def _detect_ci_run_never_created(
+def _detect_ci_absence(
     self,
     pr: dict[str, Any],
     verdict: JanitorVerdict,
     *,
     known_head: str | None = None,
-) -> str | None:
-    """Return the head SHA when Actions never created a run for it, else None.
+) -> CiAbsence | None:
+    """Classify a terminally-absent required check for this head, else None.
+
+    Returns ``CiAbsence(kind="never_created")`` when Actions created no run
+    object for the head, or ``CiAbsence(kind="workflow_no_jobs")`` (issue
+    #1681) when it created runs but every one is ``completed`` and none can
+    ever report the missing required checks. ``_detect_ci_run_never_created``
+    is the original, never-created-only view of this.
+
+    Original contract (``never_created``): the head SHA when Actions never
+    created a run for it.
 
     A "Required check(s) missing" janitor failure is ambiguous between
     "still pending" and "GitHub never created a workflow run for this
@@ -97,8 +107,34 @@ def _detect_ci_run_never_created(
     # None means the query itself failed (rate limit, transient error) --
     # fail closed: only a successful, empty response is positive evidence
     # of "never created", never the absence of a successful response.
-    if head_runs is not None and len(head_runs) == 0:
-        return head_sha
+    if head_runs is None:
+        return None
+    if len(head_runs) == 0:
+        return CiAbsence(kind="never_created", head_sha=head_sha)
+    # Issue #1681: a run object exists, so "never created" is structurally
+    # blind to this head; every run being completed with no jobs is the
+    # terminal "workflow file rejected" signature.
+    if runs_terminally_without_jobs(head_runs):
+        return CiAbsence(kind="workflow_no_jobs", head_sha=head_sha)
+    return None
+
+
+def _detect_ci_run_never_created(
+    self,
+    pr: dict[str, Any],
+    verdict: JanitorVerdict,
+    *,
+    known_head: str | None = None,
+) -> str | None:
+    """Return the head SHA when Actions never created a run for it, else None.
+
+    The never-created-only view of ``_detect_ci_absence`` (see there for the
+    full rationale); the escalated-PR path and the stale-checks retrigger
+    consume this. Does not take ``state_lock``.
+    """
+    absence = self._detect_ci_absence(pr, verdict, known_head=known_head)
+    if absence is not None and absence.kind == "never_created":
+        return absence.head_sha
     return None
 
 
