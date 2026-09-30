@@ -32,7 +32,11 @@ from _fleet_dispatch_fixtures import (
     _per_repo_runtime_paths,
 )
 from charlie_work import fleet_dispatch, layout
-from charlie_work.config import OrchestratorConfig, SupervisorConfig
+from charlie_work.config import (
+    FleetSupervisorConfig,
+    OrchestratorConfig,
+    SupervisorConfig,
+)
 from charlie_work.fleet_dispatch import (
     _fleet_reap_sweep_loop,
     _resolve_fleet_lane_concurrency,
@@ -151,7 +155,7 @@ def test_fleet_loop_lane_concurrency_is_bounded(
     mock_load_registry: MagicMock,
     tmp_path: Path,
 ) -> None:
-    """``supervisor.fleet_lane_concurrency`` caps live lanes; a cap of 2
+    """``fleet_supervisor.fleet_lane_concurrency`` caps live lanes; a cap of 2
     across 4 repos peaks at exactly 2 live lanes."""
     names = ("repo1", "repo2", "repo3", "repo4")
     mock_load_registry.return_value = _registry(*names, root=tmp_path)
@@ -173,7 +177,9 @@ def test_fleet_loop_lane_concurrency_is_bounded(
 
     result = fleet_loop(
         fleet_dir_override=str(tmp_path / "fleet"),
-        global_config=OrchestratorConfig(supervisor=SupervisorConfig(fleet_lane_concurrency=2)),
+        global_config=OrchestratorConfig(
+            fleet_supervisor=FleetSupervisorConfig(fleet_lane_concurrency=2)
+        ),
         repos=None,
         limit=3,
         merge=True,
@@ -255,7 +261,9 @@ def test_fleet_loop_deadline_defers_lanes_waiting_on_a_full_pool(
 
     result = fleet_loop(
         fleet_dir_override=str(tmp_path / "fleet"),
-        global_config=OrchestratorConfig(supervisor=SupervisorConfig(fleet_lane_concurrency=2)),
+        global_config=OrchestratorConfig(
+            fleet_supervisor=FleetSupervisorConfig(fleet_lane_concurrency=2)
+        ),
         repos=("owner/repo1", "owner/repo2", "owner/repo3", "owner/repo4"),
         limit=3,
         work_only=True,
@@ -415,14 +423,14 @@ def test_fleet_loop_lane_exception_isolated_and_lock_released(
 
 
 def test_resolve_fleet_lane_concurrency_defaults_and_overrides() -> None:
-    """The lane cap reads ``supervisor.fleet_lane_concurrency`` when a global
-    config supplies one; otherwise (or when misconfigured) the built-in
-    default applies."""
+    """The lane cap reads ``fleet_supervisor.fleet_lane_concurrency`` when a
+    global config supplies one; otherwise (or when misconfigured) the
+    built-in default applies."""
     assert _resolve_fleet_lane_concurrency(None) == 8
     assert _resolve_fleet_lane_concurrency(OrchestratorConfig()) == 8
     assert (
         _resolve_fleet_lane_concurrency(
-            OrchestratorConfig(supervisor=SupervisorConfig(fleet_lane_concurrency=2))
+            OrchestratorConfig(fleet_supervisor=FleetSupervisorConfig(fleet_lane_concurrency=2))
         )
         == 2
     )
@@ -430,7 +438,7 @@ def test_resolve_fleet_lane_concurrency_defaults_and_overrides() -> None:
     # call site rather than failing the pass.
     assert (
         _resolve_fleet_lane_concurrency(
-            OrchestratorConfig(supervisor=SupervisorConfig(fleet_lane_concurrency=0))
+            OrchestratorConfig(fleet_supervisor=FleetSupervisorConfig(fleet_lane_concurrency=0))
         )
         == 8
     )
@@ -689,8 +697,8 @@ def test_run_fleet_supervise_starts_and_stops_reap_scheduler(
         supervisor=SupervisorConfig(
             poll_interval_seconds=5,
             full_pass_interval_seconds=1,
-            reap_sweep_interval_seconds=300,
-        )
+        ),
+        fleet_supervisor=FleetSupervisorConfig(reap_sweep_interval_seconds=300),
     )
     mock_fleet_loop.return_value = _drained_fleet_result()
 
@@ -737,8 +745,8 @@ def test_run_fleet_supervise_reap_scheduler_disabled(
         supervisor=SupervisorConfig(
             poll_interval_seconds=5,
             full_pass_interval_seconds=1,
-            reap_sweep_interval_seconds=0,
-        )
+        ),
+        fleet_supervisor=FleetSupervisorConfig(reap_sweep_interval_seconds=0),
     )
     mock_fleet_loop.return_value = _drained_fleet_result()
 
