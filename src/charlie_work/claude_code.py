@@ -25,7 +25,7 @@ import subprocess
 import sys
 import time
 import uuid
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -115,8 +115,8 @@ def worker_permission_denied(sessions_dir: Path, issue_number: int, detail: str 
 #
 # Provider account suspension / insufficient-balance classification (issue
 # #1342) moved to ``worker_fate._provider_suspension_in_tail`` as part of the
-# ``classify_failure`` merge (design doc §7) -- ``_classify_session_failure``
-# below is now a thin wrapper and no longer needs its own copy.
+# ``classify_failure`` merge (design doc §7); the classifier itself is now
+# ``worker_fate.classify_for``, which the sidecar writer below calls.
 
 _WIN_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 
@@ -540,45 +540,6 @@ def parse_claude_events(events_path: Path) -> ClaudeProgress | None:
     )
 
 
-def _classify_session_failure(
-    log_path: Path,
-    throttle_error_markers: Sequence[str] | None = None,
-    *,
-    quota_error_markers: Sequence[str] | None = None,
-    resume_margin_seconds: int = 0,
-    adapter_kind: str = "claude-code",
-    now: datetime | None = None,
-) -> tuple[str | None, str | None]:
-    """Classify a session failure by matching the log tail against provider
-    throttle/auth/suspension signatures. Thin wrapper around
-    ``worker_fate.classify_failure`` (design doc §7, issue #1997 unification
-    with the ``devin_failure_classification`` sibling) — kept here, with
-    this same name and signature, because it is the seam
-    ``update_worker_record_with_failure_classification`` below calls and
-    that other modules/tests may still reference by this qualified name.
-
-    ``adapter_kind`` selects provider-auth/suspension classification (issue
-    #484/#1342, api only) via ``account_error_detection``.
-
-    Rule 6 (wf-design.md §9): claude-code/api anchor a ``rate_limited``
-    cooldown at the message's emission time, same as devin (issue #1997,
-    via ``worker_fate.classify_failure``) -- classification can run tens of
-    minutes after the log line was written, so anchoring "now" plus a fixed
-    cooldown used to overshoot the real provider reset by that much.
-    """
-    from .worker_fate import classify_failure
-
-    return classify_failure(
-        log_path,
-        throttle_error_markers,
-        quota_error_markers=quota_error_markers,
-        resume_margin_seconds=resume_margin_seconds,
-        account_error_detection=adapter_kind == "api",
-        headless_permission_detection=True,  # issue #2010
-        now=now,
-    )
-
-
 def _write_json_atomic(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_suffix(path.suffix + ".tmp")
@@ -836,7 +797,7 @@ def run_quota_probe(*, repo_root: Path, config: OrchestratorConfig) -> bool:
 
     Returns True ("green") only when the process exits 0 AND its combined
     stdout+stderr shows no quota/auth/rate-limit throttle signature --
-    reusing the exact patterns ``_classify_session_failure`` applies to a
+    reusing the exact patterns ``worker_fate.classify_for`` applies to a
     real worker's log tail (single point of enforcement, PR #262 findings
     F1/F5) so a session that exits 0 with an embedded, in-band throttle
     message is never misread as recovery. Never raises: ``run_captured``
@@ -1602,7 +1563,7 @@ def update_worker_record_with_failure_classification(
     This reads the existing sidecar, classifies the failure from the log tail,
     and writes back an updated record with failure_kind set.
 
-    Log-tail classification (``_classify_session_failure``) always runs first.
+    Log-tail classification (``worker_fate.classify_for``) always runs first.
     If it detects a provider throttle signature (``rate_limited`` /
     ``quota_exhausted``) or a provider-auth failure (``provider_auth``, api
     only — issue #484), that classification wins — including its computed
@@ -1641,7 +1602,7 @@ def update_worker_record_with_failure_classification(
     for ``"api"``) and enables provider-auth classification (issue #484).
     Defaults to ``"claude-code"`` for backward compatibility.
 
-    ``now`` is forwarded to ``_classify_session_failure`` (issue #822's
+    ``now`` is forwarded to ``worker_fate.classify_for`` (issue #822's
     injectable clock); defaults to ``datetime.now(UTC)`` there when omitted.
 
     Returns a tuple of (failure_kind, throttled_until_iso) for the caller to
@@ -1683,12 +1644,15 @@ def update_worker_record_with_failure_classification(
             throttle_markers = None
             quota_markers = None
             resume_margin_seconds = 0
-        classified_kind, throttled_until = _classify_session_failure(
+        # Lazy: worker_fate reaches back into this module (profile table).
+        from . import worker_fate
+
+        classified_kind, throttled_until = worker_fate.classify_for(
+            adapter_kind,
             Path(log_path_str),
             throttle_markers,
             quota_error_markers=quota_markers,
             resume_margin_seconds=resume_margin_seconds,
-            adapter_kind=adapter_kind,
             now=now,
         )
 

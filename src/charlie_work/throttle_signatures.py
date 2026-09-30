@@ -1,6 +1,6 @@
 """Shared provider-throttle tail-matching helper.
 
-``_classify_session_failure`` (``devin_shell.py`` + ``claude_code.py``) and
+``worker_fate.classify_for`` and
 ``get_rate_limit_defer_until`` (``devin_shell.py``, issue #247) each answer
 the same question — "does this log tail contain a provider-throttle
 signature, and if so, when does the cooldown end?" — against the same
@@ -99,7 +99,7 @@ _PROVIDER_AUTH_PATTERN = re.compile(
 )
 
 # The ``failure_kind`` values that represent a provider-side throttle
-# condition — the kinds for which ``_classify_session_failure`` arms
+# condition — the kinds for which ``worker_fate.classify_for`` arms
 # ``throttled_until``. Cap accounting uses this set so a zero-turn death
 # caused by a global provider condition (quota wall, rate limit, dead
 # API key) is never charged against the issue's redispatch/rework caps

@@ -1,17 +1,11 @@
-"""Devin-shell log-tail failure classification and throttle-window derivation.
+"""Devin-shell rate-limit deferral window derivation.
 
-``_classify_session_failure`` is now a thin wrapper around
-``worker_fate.classify_failure`` (design doc §7, issue #1997 unification with
-the claude_code sibling adapter's copy) — devin has no account-error
-detection and already uses the emission-time throttle anchor (the anchor
-itself, ``_throttle_emission_anchor``, now lives in ``worker_fate`` too).
-``devin_shell`` re-exports the public names so existing callers and test
-imports keep resolving through ``charlie_work.devin_shell``.
-
-``get_rate_limit_defer_until`` stays here: it is not part of the
-``classify_failure`` merge (claude_code has no equivalent function to unify
-it with), but shares the emission-anchor helper, imported lazily from
-``worker_fate`` to avoid a cycle.
+The failure classifier itself is ``worker_fate.classify_for`` (design doc §7;
+the per-adapter ``_classify_session_failure`` copies are deleted). What stays
+here is ``get_rate_limit_defer_until``: it is not part of the
+``classify_failure`` merge, but shares its emission-anchor helper, imported
+lazily from ``worker_fate`` to avoid a cycle. ``devin_shell`` re-exports it so
+existing callers keep resolving through ``charlie_work.devin_shell``.
 
 Signature matching itself is NOT here — the substring/"resets in N minutes"
 extraction lives in ``throttle_signatures`` (the single point of enforcement
@@ -40,38 +34,6 @@ _DEFAULT_THROTTLE_ERROR_MARKERS = OrchestratorConfig().runtime.throttle_error_ma
 _DEFAULT_RATE_LIMIT_COOLDOWN_MINUTES = 15
 
 
-def _classify_session_failure(
-    log_path: Path,
-    throttle_error_markers: Sequence[str] | None = None,
-    *,
-    quota_error_markers: Sequence[str] | None = None,
-    resume_margin_seconds: int = 0,
-    now: datetime | None = None,
-) -> tuple[str | None, str | None]:
-    """Classify a session failure from its log tail. Thin wrapper around
-    ``worker_fate.classify_failure`` (design doc §7) — devin has no
-    account-error detection (``account_error_detection=False``). The
-    emission-time throttle anchor (issue #1997) devin has always used is
-    now the only anchor ``classify_failure`` has (rule 6, wf-design.md §9,
-    ported it to claude-code/api too), so this module's observable
-    behaviour is unchanged by that flip.
-
-    Returns (failure_kind, throttled_until_iso):
-    - failure_kind: "rate_limited" | "quota_exhausted" | None
-    - throttled_until_iso: ISO timestamp when the cooldown ends, or None
-    """
-    from .worker_fate import classify_failure
-
-    return classify_failure(
-        log_path,
-        throttle_error_markers,
-        quota_error_markers=quota_error_markers,
-        resume_margin_seconds=resume_margin_seconds,
-        account_error_detection=False,
-        now=now,
-    )
-
-
 def get_rate_limit_defer_until(
     log_path: Path,
     slack_minutes: int,
@@ -81,14 +43,14 @@ def get_rate_limit_defer_until(
 ) -> str | None:
     """Return a defer-until ISO timestamp for a log tail containing a rate-limit signature.
 
-    Reads the same 2KB tail as ``_classify_session_failure`` and matches
+    Reads the same 2KB tail as ``worker_fate.classify_for`` and matches
     against the same config-driven markers via ``throttle_signatures.
-    match_throttle_tail`` (issue #247; unified with ``_classify_session_
-    failure`` per PR #262 review findings F1/F5 — previously each function
+    match_throttle_tail`` (issue #247; unified with the classifier per PR
+    #262 review findings F1/F5 — previously each function
     carried its own copy of this matching logic). If the tail matches and a
     ``"resets in N minutes"`` value is found, the defer deadline is anchored
     at the message's emission time (issue #1997, shared with
-    ``_classify_session_failure`` via ``_throttle_emission_anchor``):
+    ``worker_fate.classify_failure`` via ``_throttle_emission_anchor``):
     ``emitted_at + N minutes + slack + resume_margin_seconds``. Otherwise the
     fallback ``_DEFAULT_RATE_LIMIT_COOLDOWN_MINUTES`` is used. A computed
     deadline already in the past is clamped to ``now`` — a zero-length
@@ -128,7 +90,7 @@ def get_rate_limit_defer_until(
 
     minutes = reset_minutes if reset_minutes is not None else _DEFAULT_RATE_LIMIT_COOLDOWN_MINUTES
 
-    # Issue #1997: same emission-time anchor as _classify_session_failure —
+    # Issue #1997: same emission-time anchor as worker_fate.classify_for —
     # the provider's countdown started when the log line was written, not
     # now. max(now, ...) keeps a born-expired window a zero-length deferral
     # rather than a negative one. Lazy import: the anchor helper now lives

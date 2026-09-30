@@ -982,7 +982,7 @@ def set_throttled_until(
 ) -> dict[str, Any]:
     """Set the provider throttle cooldown window.
 
-    ``reason`` (a ``_classify_session_failure`` failure_kind -- e.g.
+    ``reason`` (a ``worker_fate.classify_for`` failure_kind -- e.g.
     "quota_exhausted", "provider_auth", "rate_limited") and ``adapter_kind``
     (the adapter whose session hit the throttle) are recorded alongside the
     cooldown so a later quota-probe decision (``clear_quota_throttles``) can
@@ -1544,7 +1544,7 @@ def _root_throttle_is_claude_code_shaped(data: dict[str, Any]) -> bool:
     """True when the root throttle, if any, is one an ambient CLI probe speaks to.
 
     Excludes a ``provider_auth`` cooldown (a dead credential does not
-    self-heal in minutes -- see claude_code._classify_session_failure) and
+    self-heal in minutes -- see worker_fate.classify_for) and
     excludes any adapter other than claude-code (devin uses a different tool
     entirely; the api adapter routes through a separately configured
     provider base_url/key, not the account an operator manually switches).

@@ -25,14 +25,16 @@ subject). ``classify_worker_health`` and ``is_worker_confirmed_dead`` stay in
 this module only consumes their output through ``FateEvidence.health``.
 
 ``wf-4-wire-a`` adds the internal Adapter seam (design doc §7):
-``classify_failure`` merges ``claude_code._classify_session_failure`` and
-``devin_failure_classification._classify_session_failure`` (issue #1997 —
-the devin-only emission-time throttle anchor, later ported fleet-wide by
-rule 6, so it is no longer a per-profile flag); ``AdapterFateProfile``/
-``profile_for`` replace the 14
-``w.adapter_kind ==`` branches in ``dead_worker_reap.py`` and the two
-``_classify_session_failure`` duplicates in ``claude_code.py`` /
-``devin_shell.py`` (now thin wrappers around ``classify_failure``).
+``classify_failure`` merged the two ``_classify_session_failure`` copies
+that lived in ``claude_code.py`` and ``devin_failure_classification.py``
+(issue #1997 — the devin-only emission-time throttle anchor, later ported
+fleet-wide by rule 6, so it is no longer a per-profile flag);
+``AdapterFateProfile``/``profile_for`` replace the 14
+``w.adapter_kind ==`` branches in ``dead_worker_reap.py``. Both copies are
+now deleted: ``classify_for`` looks the profile up and passes its three
+flags (``account_error_detection``, ``headless_permission_detection``,
+``log_format``) to ``classify_failure``, and the adapters' sidecar writers
+call ``classify_for``.
 
 ``FateEvidence.failure`` is supplied by the caller as already-classified
 data — ``resolve_fate`` only ever reads ``FailureEvidence.kind``/
@@ -50,6 +52,7 @@ so tests patch ``charlie_work.worker_fate.is_alive`` and nothing else.
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -57,7 +60,7 @@ from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any
+from typing import Any, Literal
 
 from .config import OrchestratorConfig
 from .process_utils import is_pid_alive as _process_is_pid_alive
@@ -602,8 +605,8 @@ def resolve_fate(evidence: FateEvidence, *, now: datetime) -> WorkerFate:  # noq
 # --------------------------------------------------------------------------
 # Failure classification (§6) and the internal Adapter seam (§7).
 #
-# ``classify_failure`` merges ``claude_code._classify_session_failure`` and
-# ``devin_failure_classification._classify_session_failure``. The two were
+# ``classify_failure`` merged the two per-adapter ``_classify_session_failure``
+# copies (both now deleted; ``classify_for`` is the entry point). The two were
 # identical except for two things, both now data instead of two copies of
 # the function:
 #   - account-error detection (``provider_suspended``/``provider_auth``,
@@ -662,6 +665,8 @@ def _provider_suspension_in_tail(tail: str) -> bool:
     return False
 
 
+LogFormat = Literal["plain_text", "stream_json"]
+
 # Issue #1997: a tz-aware ISO-8601 timestamp on a tail line marks when the
 # provider emitted the throttle message -- a better anchor than the
 # classification-time clock. Moved verbatim from devin_failure_classification.py.
@@ -686,13 +691,65 @@ def _tail_emission_timestamp(tail: str) -> datetime | None:
     return None
 
 
-def _throttle_emission_anchor(log_path: Path, tail: str, *, now: datetime) -> datetime:
-    """Anchor for a provider-throttle window: when the message was emitted,
-    not when it was classified. The tail's own timestamp when a line carries
-    one, else the log's mtime (the last write to a dead worker's log is the
-    death message), else ``now``. Clamped to ``now``: a future mtime/tail
-    timestamp is clock/mtime skew, not evidence the reset also moved.
+def _stream_json_emission_timestamp(tail: str) -> datetime | None:
+    """The tz-aware ``"timestamp"`` of the newest stream-json event in ``tail``
+    that carries one as a TOP-LEVEL string field, else None.
+
+    N9: claude-code/api logs are stream-json, one event per line. Their tails
+    also quote arbitrary tool output, so a regex over the raw text would take
+    an ISO timestamp embedded in a ``tool_result`` for the provider's emission
+    time. Each line is parsed as JSON and only the event's own top-level
+    ``"timestamp"`` (the repo's stream-json convention -- ``worker.py`` /
+    ``post_mortem.py``) is trusted; a partial first line (the tail is a byte
+    slice), a non-object, a missing or non-string field and a naive
+    (offset-less) value are all skipped. Never a substring match.
     """
+    for line in reversed(tail.splitlines()):
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        raw = event.get("timestamp")
+        if not isinstance(raw, str):
+            continue
+        try:
+            parsed = datetime.fromisoformat(raw)
+        except ValueError:
+            continue
+        if parsed.tzinfo is None:
+            continue
+        return parsed
+    return None
+
+
+def _throttle_emission_anchor(
+    log_path: Path,
+    tail: str,
+    *,
+    now: datetime,
+    log_format: LogFormat = "plain_text",
+) -> datetime:
+    """Anchor for a provider-throttle window: when the message was emitted,
+    not when it was classified. Clamped to ``now``: a future mtime/tail
+    timestamp is clock/mtime skew, not evidence the reset also moved.
+
+    ``plain_text`` (devin): the tail's last timestamped line, else the log's
+    mtime (the last write to a dead worker's log is the death message), else
+    ``now``.
+
+    ``stream_json`` (claude-code/api): the newest event's top-level
+    ``"timestamp"`` (see ``_stream_json_emission_timestamp``), else ``now``
+    -- never the mtime, which for a stream-json log says nothing about which
+    event was the throttle and would re-open the embedded-timestamp hole.
+    """
+    if log_format == "stream_json":
+        anchor = _stream_json_emission_timestamp(tail)
+        return min(anchor if anchor is not None else now, now)
     anchor = _tail_emission_timestamp(tail)
     if anchor is None:
         try:
@@ -710,6 +767,7 @@ def classify_failure(
     resume_margin_seconds: int = 0,
     account_error_detection: bool = False,
     headless_permission_detection: bool = False,
+    log_format: LogFormat = "plain_text",
     now: datetime | None = None,
 ) -> tuple[str | None, str | None]:
     """Classify a session failure by matching the log tail against provider
@@ -728,6 +786,11 @@ def classify_failure(
     ``headless_permission_detection`` (claude-code, issue #2010) enables the
     ``permission_denied`` check. It is checked LAST so throttle/auth
     signatures still win.
+
+    ``log_format`` selects how the emission time is read out of the log
+    (N9 -- see ``_throttle_emission_anchor``): ``plain_text`` for devin,
+    ``stream_json`` for claude-code/api. Callers normally reach this through
+    ``classify_for``, which reads all three flags off the adapter profile.
 
     The ``rate_limited`` anchor is always the message's emission time
     (issue #1997 -- see ``_throttle_emission_anchor``), for every harness.
@@ -788,7 +851,9 @@ def classify_failure(
             else _DEFAULT_RATE_LIMIT_COOLDOWN_MINUTES,
             seconds=resume_margin_seconds,
         )
-        emitted_at = _throttle_emission_anchor(log_path, tail, now=resolved_now)
+        emitted_at = _throttle_emission_anchor(
+            log_path, tail, now=resolved_now, log_format=log_format
+        )
         throttled_until = max(resolved_now, emitted_at + cooldown)
         return "rate_limited", throttled_until.replace(microsecond=0).isoformat().replace(
             "+00:00", "Z"
@@ -811,6 +876,8 @@ class AdapterFateProfile:
     harness: str  # key in harnesses.HARNESS_REGISTRY / WORKER_HARNESSES
     view_kinds: frozenset[str]  # WorkerView.adapter_kind spellings ("devin" for devin-shell)
     account_error_detection: bool  # api only: provider_suspended / provider_auth
+    headless_permission_detection: bool  # issue #2010: permission_denied (claude-code, api)
+    log_format: LogFormat  # how the emission time is read from the log tail (N9)
     record_failure: Callable[..., tuple[str | None, str | None]] | None
     # (sessions_dir, issue_number, *, fallback_kind, config, now) -> the
     # existing update_worker_record_with_failure_classification /
@@ -852,6 +919,8 @@ def _build_profiles() -> dict[str, AdapterFateProfile]:
             harness="devin-shell",
             view_kinds=frozenset({"devin"}),
             account_error_detection=False,
+            headless_permission_detection=False,
+            log_format="plain_text",
             record_failure=update_session_record_with_failure_classification,
             over_budget=None,
         ),
@@ -859,6 +928,8 @@ def _build_profiles() -> dict[str, AdapterFateProfile]:
             harness="claude-code",
             view_kinds=frozenset({"claude-code"}),
             account_error_detection=False,
+            headless_permission_detection=True,
+            log_format="stream_json",
             record_failure=partial(
                 update_worker_record_with_failure_classification, adapter_kind="claude-code"
             ),
@@ -868,6 +939,8 @@ def _build_profiles() -> dict[str, AdapterFateProfile]:
             harness="api",
             view_kinds=frozenset({"api"}),
             account_error_detection=True,
+            headless_permission_detection=True,
+            log_format="stream_json",
             record_failure=partial(
                 update_worker_record_with_failure_classification, adapter_kind="api"
             ),
@@ -887,6 +960,8 @@ def _build_profiles() -> dict[str, AdapterFateProfile]:
             harness="command",
             view_kinds=frozenset({"command"}),
             account_error_detection=False,
+            headless_permission_detection=False,
+            log_format="plain_text",
             record_failure=None,
             over_budget=None,
         ),
@@ -894,6 +969,8 @@ def _build_profiles() -> dict[str, AdapterFateProfile]:
             harness="manual",
             view_kinds=frozenset({"manual"}),
             account_error_detection=False,
+            headless_permission_detection=False,
+            log_format="plain_text",
             record_failure=None,
             over_budget=None,
         ),
@@ -947,6 +1024,40 @@ def profile_for(adapter_kind: str) -> AdapterFateProfile | None:
             for view_kind in profile.view_kinds
         }
     return _PROFILES.get(adapter_kind)
+
+
+def classify_for(
+    adapter_kind: str,
+    log_path: Path,
+    throttle_error_markers: Sequence[str] | None = None,
+    *,
+    quota_error_markers: Sequence[str] | None = None,
+    resume_margin_seconds: int = 0,
+    now: datetime | None = None,
+) -> tuple[str | None, str | None]:
+    """Classify a session failure for ``adapter_kind`` (a ``WorkerView``
+    spelling: ``"devin"``, ``"claude-code"``, ``"api"``, ...).
+
+    The single classifier entry point: the profile supplies the three
+    per-harness flags (``account_error_detection``,
+    ``headless_permission_detection``, ``log_format``) so the adapters no
+    longer carry their own ``_classify_session_failure`` wrappers that
+    hard-code them. An unknown ``adapter_kind`` returns ``(None, None)`` --
+    the same graceful "nothing classified" ``profile_for`` gives its callers.
+    """
+    profile = profile_for(adapter_kind)
+    if profile is None:
+        return None, None
+    return classify_failure(
+        log_path,
+        throttle_error_markers,
+        quota_error_markers=quota_error_markers,
+        resume_margin_seconds=resume_margin_seconds,
+        account_error_detection=profile.account_error_detection,
+        headless_permission_detection=profile.headless_permission_detection,
+        log_format=profile.log_format,
+        now=now,
+    )
 
 
 # --------------------------------------------------------------------------
