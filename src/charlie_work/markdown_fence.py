@@ -55,7 +55,6 @@ __all__ = [
     "MIN_FENCE_LENGTH",
     "fence_for",
     "fenced_block",
-    "find_fence_close",
     "FenceSpan",
     "Heading",
     "MarkdownStructure",
@@ -115,12 +114,12 @@ def fenced_block(text: str, info: str = "") -> str:
 # marker_indent` rejects it; see its docstring -- adversarial review finding
 # B3, architecture-deepening candidate 3) and backtick-in-info-string
 # exclusion, with `cross_repo_gate`'s same-char/length-aware closer search
-# folded in as one shared subroutine (`find_fence_close`), used only for a
+# folded in as one shared subroutine (`_find_fence_close`), used only for a
 # *valid* opener: a rejected opener (backtick fence, backtick in its info
 # string) is not a fence at all under CommonMark, so it is treated as an
 # ordinary line and scanning resumes immediately on the next line -- it does
 # not search for or consume a "closer" (adversarial review finding B1;
-# `find_fence_close`'s docstring explains the narrower design this
+# `_find_fence_close`'s docstring explains the narrower design this
 # replaced).
 #
 # Deliberately out of scope (`tests/markdown_conformance_cases.py`'s own
@@ -244,7 +243,7 @@ def _strip_marker_indent(line: str, max_indent: int | None = 3) -> str | None:
     marker, regardless of how many literal space/tab *characters* precede
     it -- see :func:`_leading_indent_columns`. Every marker check in
     :func:`scan` (fence delimiter, blockquote marker, ATX heading) and in
-    :func:`find_fence_close` goes through this first, so all four share
+    :func:`_find_fence_close` goes through this first, so all four share
     one indent rule and cannot drift from each other.
 
     ``max_indent=None`` never rejects (container-tolerant mode): inside a
@@ -342,7 +341,7 @@ def is_blockquote_marker(line: str, *, max_indent: int | None = 3) -> bool:
     return stripped is not None and _BLOCKQUOTE_RE.match(stripped) is not None
 
 
-def find_fence_close(
+def _find_fence_close(
     lines: list[str],
     start: int,
     char: str,
@@ -353,9 +352,9 @@ def find_fence_close(
     opened with a delimiter run of ``length``, searching from ``start``, or
     ``None`` if none exists before end-of-text.
 
-    Public so a consumer can ask for the *lenient* closer
-    (``max_indent=None``) alongside :func:`scan`'s strict one, keeping the
-    closer rule in one place.
+    Private: shared by :func:`scan`'s strict (``max_indent=3``) and
+    container-tolerant (``max_indent=None``) modes so the closer rule lives in
+    one place. Consumers ask :func:`scan` for the mode they need.
 
     Only ever called for a *valid* opener (:func:`scan` treats a rejected
     one -- a backtick fence whose info string itself contains a backtick --
@@ -433,7 +432,7 @@ def scan(text: str, *, max_indent: int | None = 3) -> MarkdownStructure:
                     # (adversarial review finding B1).
                     index += 1
                     continue
-                close_at = find_fence_close(lines, index + 1, char, length, max_indent)
+                close_at = _find_fence_close(lines, index + 1, char, length, max_indent)
                 end = close_at + 1 if close_at is not None else line_count
                 fences.append(
                     FenceSpan(

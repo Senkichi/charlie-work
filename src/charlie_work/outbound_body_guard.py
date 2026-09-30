@@ -301,12 +301,19 @@ def _scan_masked(masked: str, *, part: str) -> tuple[SecretMatch, ...]:
     return tuple(matches)
 
 
-def scan_outbound_text(text: str, *, part: str) -> tuple[SecretMatch, ...]:
+def scan_outbound_text(
+    text: str,
+    *,
+    part: str,
+    on_disagreement: markdown_guard.DisagreementCallback | None = None,
+) -> tuple[SecretMatch, ...]:
     """Return every credential-pattern match in ``text`` (empty = clean).
 
     Monotone by construction: the rules run over BOTH origin/main's masked
     text and the composed (intersected) masked text, and the matches are the
-    union (deduped by rule, line and hash). Scanning main's text is what
+    union (composed matches deduped against each other and legacy-only matches
+    appended as main reported them, so a same-line duplicate that only main
+    sees keeps main's count). Scanning main's text is what
     guarantees every match main reported is still reported: masking a subset
     of main's characters does not imply matching a superset of its secrets,
     because a multi-line rule can match across a block main blanked. Both
@@ -317,15 +324,15 @@ def scan_outbound_text(text: str, *, part: str) -> tuple[SecretMatch, ...]:
     """
     if not text:
         return ()
-    composed = _scan_masked(_mask_example_secret_fences(text), part=part)
+    composed = _scan_masked(
+        _mask_example_secret_fences(text, on_disagreement=on_disagreement), part=part
+    )
     legacy = _scan_masked(_legacy_masked_text(text), part=part)
-    seen = {(m.rule_id, m.line, m.match_sha256) for m in composed}
-    extra = []
-    for m in legacy:
-        key = (m.rule_id, m.line, m.match_sha256)
-        if key not in seen:
-            seen.add(key)
-            extra.append(m)
+    # Dedup ONLY against the composed matches: a legacy-only match is never
+    # collapsed against another legacy match, so the union's count is never
+    # below main's own (`match_count` in the refusal event stays >= main's).
+    composed_keys = {(m.rule_id, m.line, m.match_sha256) for m in composed}
+    extra = [m for m in legacy if (m.rule_id, m.line, m.match_sha256) not in composed_keys]
     return composed + tuple(extra)
 
 
@@ -357,6 +364,29 @@ def _state_path_for(repo_root: Path | None, state_dir: str | None) -> Path | Non
     ).state_file
 
 
+def _disagreement_sink(
+    repo_root: Path | None, state_dir: str | None
+) -> markdown_guard.DisagreementCallback | None:
+    """``on_disagreement`` writing to THIS client's repo, not the ambient sink.
+
+    The state path is resolved lazily (only when the two masks actually
+    disagree) so a clean write never pays for -- or fails on -- path
+    resolution. ``None`` (no ``repo_root``) leaves the guard on its ambient
+    fallback.
+    """
+    if repo_root is None:
+        return None
+
+    def _emit(disagreement: markdown_guard.Disagreement) -> None:
+        try:
+            state_path = _state_path_for(repo_root, state_dir)
+        except Exception:  # noqa: BLE001 -- telemetry only; fall back to the ambient sink
+            state_path = None
+        markdown_guard.emit_disagreement(disagreement, state_path=state_path, repo=repo_root.name)
+
+    return _emit
+
+
 def check_outbound_write(
     *,
     surface: str,
@@ -384,9 +414,12 @@ def check_outbound_write(
     """
     try:
         matches: list[SecretMatch] = []
+        on_disagreement = _disagreement_sink(repo_root, state_dir)
         for part, text in parts:
             if text:
-                matches.extend(scan_outbound_text(text, part=part))
+                matches.extend(
+                    scan_outbound_text(text, part=part, on_disagreement=on_disagreement)
+                )
         if not matches:
             return ()
 

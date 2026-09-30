@@ -359,12 +359,26 @@ def test_all_verdict_parsing_names_are_reexported_by_identity() -> None:
         f"found {len(names)}: {sorted(names)}"
     )
 
-    missing_from_facade = [n for n in names if not hasattr(workflow, n)]
+    # md-r5 N3: the markdown-structure halves were introduced by this branch and
+    # have no legacy ``workflow.<name>`` reader (the tests import them from
+    # verdict_parsing), so re-exporting them would only leave a stale name
+    # behind after the soak deletes ``_legacy_extract_verdict_from_text``.
+    facade_exempt = {
+        "_legacy_extract_verdict_from_text",
+        "_scan_extract_verdict_from_text",
+        "_strip_fenced_blocks",
+    }
+    assert facade_exempt <= set(names), (
+        "facade_exempt names a unit verdict_parsing no longer defines"
+    )
+    facaded = [n for n in names if n not in facade_exempt]
+
+    missing_from_facade = [n for n in facaded if not hasattr(workflow, n)]
     assert missing_from_facade == [], (
         f"workflow.py's facade does not re-export: {sorted(missing_from_facade)}"
     )
 
-    not_identical = [n for n in names if getattr(workflow, n) is not getattr(verdict_parsing, n)]
+    not_identical = [n for n in facaded if getattr(workflow, n) is not getattr(verdict_parsing, n)]
     assert not_identical == [], (
         "workflow.py re-exports these names as objects DIFFERENT from "
         f"verdict_parsing.py's own -- the facade must import, never redeclare: "

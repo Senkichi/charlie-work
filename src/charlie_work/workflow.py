@@ -282,9 +282,6 @@ from .verdict_parsing import (  # noqa: F401  (deliberate re-export)
     _RESULT_EVENT_CAUSE_FIELDS,
     _validate_review_verdict,
     _extract_verdict_from_text,
-    _legacy_extract_verdict_from_text,
-    _scan_extract_verdict_from_text,
-    _strip_fenced_blocks,
     _extract_verdict_from_stream_json,
     _parse_review_verdict_from_log,
     _parse_review_verdict_from_events,
@@ -3905,8 +3902,9 @@ class OrchestratorApp:
             dry_run=self.dry_run, state_path=self.paths.state_file, repo=self.repo_root.name
         )
         self.fleet_dir_override = fleet_dir_override
-        # Default sink for markdown_guard_disagreement events (pure guards have no state path).
-        markdown_guard.bind_state_path(self.paths.state_file)
+        # Ambient sink for markdown_guard_disagreement events on this thread (pure guards have
+        # no state path; fleet lanes rebind per pool thread in fleet_lanes).
+        markdown_guard.bind_state_path(self.paths.state_file, self.repo_root.name)
         # Issue #1363: config_freshness's "exactly once per change" semantics
         # need a mtime cache that outlives a single pass but not the process
         # -- an in-memory dict on the (per-process, per-repo) app instance is

@@ -1051,7 +1051,7 @@ def _md_find_fence_close(
     """First line index >= start closing a ``char``-fence opened at ``length``.
 
     Only ever called for a *valid* opener -- see `_scan_markdown_structure`.
-    See `charlie_work.markdown_fence.find_fence_close`, which this mirrors
+    See `charlie_work.markdown_fence._find_fence_close`, which this mirrors
     exactly, including the per-candidate-line indent check.
     """
     close_re = re.compile(rf"^{re.escape(char)}{{{length},}}[ \t]*$")

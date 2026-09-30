@@ -22,13 +22,15 @@ the inputs:
 When the two sides disagree, one ``markdown_guard_disagreement`` event is
 emitted, which is what the soak that retires the legacy paths measures. The
 guards stay pure: emission goes through an optional ``on_disagreement``
-callback whose default logs to the state path bound by the orchestrator.
+callback: callers with a state path in scope pass ``sink_callback(...)``; the
+rest fall back to the sink the orchestrator bound on the current thread.
 """
 
 from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Sequence
+from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TypeVar
@@ -67,25 +69,72 @@ class Disagreement:
 
 DisagreementCallback = Callable[[Disagreement], None]
 
-_bound_state_path: Path | None = None
+
+@dataclass(frozen=True)
+class Sink:
+    """Where a guard's ``markdown_guard_disagreement`` event is written."""
+
+    state_path: Path
+    repo: str | None = None
 
 
-def bind_state_path(state_path: Path | None) -> None:
-    """Bind (or with ``None`` unbind) the ``state.json`` the default emitter writes to.
+# Ambient fallback for guards whose callers have no state path in scope (the
+# verdict parsers sit under dozens of call sites). A ``ContextVar`` rather than
+# a module global: the fleet runs one lane per repo on a thread pool, and each
+# lane binds its own sink on its own thread, so lanes never share (or clobber)
+# each other's binding. Callers that DO have their state path in scope should
+# pass ``on_disagreement=sink_callback(...)`` instead of relying on this.
+_sink: ContextVar[Sink | None] = ContextVar("markdown_guard_sink", default=None)
 
-    Called once by ``OrchestratorApp.__init__``; the guards themselves have no
-    state path in scope (they are pure functions used from many layers).
+
+def bind_sink(state_path: Path, repo: str | None = None) -> Token[Sink | None] | None:
+    """Bind the ambient sink for the CURRENT thread; return a token for :func:`unbind_sink`.
+
+    A non-``Path`` ``state_path`` (a test double standing in for an app) binds
+    nothing and returns ``None`` rather than aiming ``events.db`` writes at it.
     """
-    global _bound_state_path
-    _bound_state_path = state_path
+    if not isinstance(state_path, Path):
+        return None
+    return _sink.set(Sink(state_path, repo))
 
 
-def emit_disagreement(disagreement: Disagreement) -> None:
+def unbind_sink(token: Token[Sink | None] | None) -> None:
+    """Restore the binding that :func:`bind_sink` replaced (``None`` token: no-op)."""
+    if token is not None:
+        _sink.reset(token)
+
+
+def bind_state_path(state_path: Path | None, repo: str | None = None) -> None:
+    """Bind (or with ``None`` unbind) the current thread's ambient sink, untokened.
+
+    Used by ``OrchestratorApp.__init__`` for single-repo entry points that run
+    on the constructing thread. Fleet lanes run on pool threads and bind their
+    own sink with :func:`bind_sink`.
+    """
+    _sink.set(None if state_path is None else Sink(state_path, repo))
+
+
+def sink_callback(state_path: Path, repo: str | None = None) -> DisagreementCallback:
+    """An ``on_disagreement`` callback writing to an explicit ``state_path``."""
+
+    def _emit(disagreement: Disagreement) -> None:
+        emit_disagreement(disagreement, state_path=state_path, repo=repo)
+
+    return _emit
+
+
+def emit_disagreement(
+    disagreement: Disagreement,
+    *,
+    state_path: Path | None = None,
+    repo: str | None = None,
+) -> None:
     """Default ``on_disagreement``: one ``markdown_guard_disagreement`` event.
 
-    Best effort by contract -- a telemetry failure must never change a guard's
-    verdict. Without a bound state path (a script or test calling the guard
-    directly) the divergence is logged through ``logging`` only.
+    Writes to the explicit ``state_path`` when given, else to the calling
+    thread's ambient sink. Best effort by contract -- a telemetry failure must
+    never change a guard's verdict. With neither, the divergence is logged
+    through ``logging`` only.
     """
     logger.warning(
         "%s: guard=%s legacy=%s new=%s chosen=%s",
@@ -95,9 +144,11 @@ def emit_disagreement(disagreement: Disagreement) -> None:
         disagreement.new,
         disagreement.chosen,
     )
-    state_path = _bound_state_path
     if state_path is None:
-        return
+        ambient = _sink.get()
+        if ambient is None:
+            return
+        state_path, repo = ambient.state_path, repo or ambient.repo
     try:
         from .instrumentation import log_event
 
@@ -110,7 +161,9 @@ def emit_disagreement(disagreement: Disagreement) -> None:
                 "legacy": disagreement.legacy,
                 "new": disagreement.new,
                 "chosen": disagreement.chosen,
+                "repo": repo,
             },
+            repo=repo,
         )
     except Exception:  # noqa: BLE001 -- telemetry must not alter a guard's result
         logger.warning("%s emission failed", DISAGREEMENT_KIND, exc_info=True)

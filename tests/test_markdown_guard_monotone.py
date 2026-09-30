@@ -17,11 +17,10 @@ one, instead of pinning individual inputs. They also pin that
 
 from __future__ import annotations
 
-import itertools
-import json
 from collections.abc import Callable
 from pathlib import Path
 
+import markdown_guard_corpus as corpus
 import pytest
 
 from charlie_work import markdown_guard
@@ -47,24 +46,14 @@ from charlie_work.verdict_parsing import (
     _scan_extract_verdict_from_text,
 )
 
-_APPROVED = json.dumps({"decision": "approved", "summary": "looks fine"})
-_REQUEST = json.dumps({"decision": "request_changes", "summary": "fix it"})
-_BLOCKED = json.dumps({"decision": "blocked", "summary": "no"})
-_DRAFT = f"```json\n{_APPROVED}\n```\nRevised:\n"
-
-# Final-block shapes the old unanchored regex caught but scan() does not.
-_FINAL_SHAPES: dict[str, str] = {
-    "mid-line-opener": f"My verdict: ```json\n{_REQUEST}\n```",
-    "glued-closer": f"```json\n{_REQUEST}```",
-    "list-nested-4col": f"- verdict:\n\n    ```json\n    {_REQUEST}\n    ```",
-    "tab-indented": f"\t```json\n{_REQUEST}\n\t```",
-}
-
-# md-r3 review B1 inputs: a fence only `scan` recognises after a legacy request_changes.
-_SCAN_ONLY_AFTER_LEGACY: dict[str, str] = {
-    "tilde-after": f"```json\n{_REQUEST}\n```\n~~~json\n{_APPROVED}\n~~~\n",
-    "unclosed-after": f"```json\n{_REQUEST}\n```\n\n```json\n{_APPROVED}\n",
-}
+_APPROVED, _REQUEST, _BLOCKED, _DRAFT = (
+    corpus.APPROVED,
+    corpus.REQUEST,
+    corpus.BLOCKED,
+    corpus.DRAFT,
+)
+_FINAL_SHAPES = corpus.FINAL_SHAPES
+_SCAN_ONLY_AFTER_LEGACY = corpus.SCAN_ONLY_AFTER_LEGACY
 
 
 # --- verdict extractors under test ------------------------------------------------
@@ -91,32 +80,7 @@ _GUARDS: dict[str, tuple[_Extractor, _Extractor, _Extractor]] = {
 _GUARD_IDS = sorted(_GUARDS)
 
 
-def _verdict_chunks() -> list[str]:
-    bodies = {"approved": _APPROVED, "request_changes": _REQUEST, "blocked": _BLOCKED}
-    chunks = ["no verdict here\n", _DRAFT]
-    for body in bodies.values():
-        chunks += [
-            f"```json\n{body}\n```\n",
-            f"~~~json\n{body}\n~~~\n",
-            f"```json\n{body}\n",
-            f"My verdict: ```json\n{body}\n```\n",
-            f"```json\n{body}```\n",
-            f"\t```json\n{body}\n\t```\n",
-            f"- v:\n\n    ```json\n    {body}\n    ```\n",
-        ]
-    chunks += list(_FINAL_SHAPES.values()) + list(_SCAN_ONLY_AFTER_LEGACY.values())
-    return chunks
-
-
-def _verdict_corpus() -> list[str]:
-    chunks = _verdict_chunks()
-    corpus: list[str] = []
-    for size in (1, 2, 3):
-        corpus.extend("\n".join(combo) for combo in itertools.product(chunks, repeat=size))
-    return corpus
-
-
-_VERDICT_CORPUS = _verdict_corpus()
+_VERDICT_CORPUS = corpus.verdict_corpus()
 
 
 @pytest.mark.parametrize("guard", _GUARD_IDS)
@@ -241,34 +205,8 @@ def test_strip_fenced_blocks_pins_line_anchored_behaviour() -> None:
 
 # --- outbound example-secret mask ----------------------------------------------------
 
-_KEY = "KEYKEYKEY"
-_OUTBOUND_CHUNKS: list[str] = [
-    "text\n",
-    f"```example-secret\n{_KEY}\n```\n",
-    f"~~~example-secret\n{_KEY}\n~~~\n",
-    f"```example-secret\n{_KEY}\n\t```\n",
-    f"```example-secret\n{_KEY}\n    ```\n",
-    f"```example-secret\n{_KEY}\n",
-    f"```\n{_KEY}\n```\n",
-    f"\t```\n{_KEY}\n```\n",
-    f"\t```example-secret\n{_KEY}\n```\n",
-    f"```x`y\n```\n```example-secret\n{_KEY}\n```\n",
-    f"x\r```example-secret\r{_KEY}\r```\r",
-    f"prose\u2028```example-secret\n{_KEY}\n```\n",
-    f"~~~\n\t\t~~~example-secret\n{_KEY}\n~~~\n",
-    f"- ```example-secret\n  {_KEY}\n  ```\n",
-    f"````example-secret\n{_KEY}\n```\n````\n",
-]
-
-
-def _outbound_corpus() -> list[str]:
-    corpus: list[str] = []
-    for size in (1, 2, 3):
-        corpus.extend("".join(combo) for combo in itertools.product(_OUTBOUND_CHUNKS, repeat=size))
-    return corpus
-
-
-_OUTBOUND_CORPUS = _outbound_corpus()
+_KEY = corpus.KEY
+_OUTBOUND_CORPUS = corpus.outbound_corpus()
 
 
 def _remove(text: str, ranges: list[tuple[int, int]]) -> str:
@@ -309,8 +247,8 @@ def _scan_masked_body(masked: str) -> tuple[SecretMatch, ...]:
     return _scan_masked(masked, part="body")
 
 
-_SPLIT_TOKEN_HEAD = "ZXlKaGJHY2lPaU" + "Ab1" * 4
-_SPLIT_TOKEN_TAIL = "Qz9" * 14
+_SPLIT_TOKEN_HEAD = corpus.SPLIT_TOKEN_HEAD
+_SPLIT_TOKEN_TAIL = corpus.SPLIT_TOKEN_TAIL
 
 
 def test_outbound_refuses_a_token_main_matches_across_a_legacy_only_masked_block() -> None:
@@ -336,10 +274,30 @@ def test_outbound_agreeing_split_token_is_refused_control() -> None:
 
 
 def test_outbound_scan_reports_every_match_main_reports_over_the_corpus() -> None:
-    for text in _OUTBOUND_CORPUS:
-        main = _scan_masked_body(_legacy_masked_text(text))
-        got = {(m.rule_id, m.line, m.match_sha256) for m in scan_outbound_text(text, part="body")}
-        assert {(m.rule_id, m.line, m.match_sha256) for m in main} <= got, text
+    """Compared against origin/main's LITERAL match keys, not the branch's own legacy scan.
+
+    The expected side is the golden table (``markdown_legacy_golden.json``,
+    generated by running origin/main's code over the same corpus), so this
+    cannot pass by construction: it fails if the union is dropped, if a legacy
+    body is loosened, or if a legacy-only duplicate is collapsed.
+    """
+    golden = corpus.load_golden()
+    texts = corpus.secret_corpus()
+    assert golden["fingerprints"]["secret"] == corpus.corpus_fingerprint(texts)
+    table = golden["secret"]
+    with_main_matches = 0
+    for text, index in zip(texts, table["index"], strict=True):
+        main_keys = table["unique"][index]["keys"]
+        got = [
+            [m.rule_id, m.line, m.match_sha256[:12]] for m in scan_outbound_text(text, part="body")
+        ]
+        remaining = list(got)
+        for key in main_keys:  # multiset containment: main's count is preserved too
+            assert key in remaining, (text, key)
+            remaining.remove(key)
+        with_main_matches += bool(main_keys)
+    # Control: the corpus has plenty of documents main refuses.
+    assert with_main_matches > 1000
 
 
 def test_outbound_disagreement_event_fires_only_on_disagreement() -> None:
@@ -371,7 +329,7 @@ def test_outbound_bare_cr_document_reports_the_line_model_disagreement() -> None
     assert len(events) == 1 and events[0].chosen == "-"
 
 
-_AWS = "AKIA" + "BC2D3E4F5G6H7JKL"
+_AWS = corpus.AWS
 
 
 @pytest.mark.parametrize(
@@ -423,3 +381,103 @@ def test_a_failing_callback_never_changes_the_result() -> None:
         raise RuntimeError("telemetry down")
 
     assert _extract_verdict_from_text(f"```json\n{_APPROVED}\n", on_disagreement=boom) is None
+
+
+# --- disagreement sink: per repo, never last-writer-wins ---------------------------------
+
+_BARE_CR_BODY = f"x\r```example-secret\r{_KEY}\r```\r"  # legacy/scan masks disagree, no secret
+
+
+def _state_file(repo_root: Path) -> Path:
+    return repo_root / ".var" / "charlie-work" / "state.json"
+
+
+def test_default_emitter_payload_carries_the_repo(tmp_path: Path) -> None:
+    state = tmp_path / "state.json"
+    markdown_guard.bind_state_path(state, "repo-x")
+    try:
+        _extract_verdict_from_text(f"```json\n{_APPROVED}\n")
+        rows = query_events(state, kind=markdown_guard.DISAGREEMENT_KIND)
+    finally:
+        close_db(state)
+    assert len(rows) == 1
+    assert rows[0]["payload"]["repo"] == "repo-x"
+    assert rows[0]["repo"] == "repo-x"
+
+
+def test_outbound_disagreement_goes_to_the_writing_clients_repo_not_the_ambient_one(
+    tmp_path: Path,
+) -> None:
+    from charlie_work.outbound_body_guard import check_outbound_write
+
+    other, mine = tmp_path / "other-repo", tmp_path / "my-repo"
+    ambient = _state_file(other)
+    markdown_guard.bind_state_path(ambient, other.name)  # the last-constructed app
+    try:
+        assert (
+            check_outbound_write(
+                surface="pr_comment", parts=(("body", _BARE_CR_BODY),), repo_root=mine
+            )
+            == ()
+        )
+        mine_rows = query_events(_state_file(mine), kind=markdown_guard.DISAGREEMENT_KIND)
+        other_rows = query_events(ambient, kind=markdown_guard.DISAGREEMENT_KIND)
+    finally:
+        close_db(_state_file(mine))
+        close_db(ambient)
+    assert [r["payload"]["repo"] for r in mine_rows] == ["my-repo"]
+    assert mine_rows[0]["payload"]["guard"] == markdown_guard.GUARD_OUTBOUND_MASK
+    assert other_rows == []
+
+
+def test_ambient_sinks_are_isolated_per_thread(tmp_path: Path) -> None:
+    """Two fleet lanes on two pool threads each write to their own repo."""
+    import threading
+
+    states = {name: tmp_path / name / "state.json" for name in ("a", "b")}
+    barrier = threading.Barrier(2)
+
+    def lane(name: str) -> None:
+        token = markdown_guard.bind_sink(states[name], name)
+        try:
+            barrier.wait(timeout=10)  # both bound before either emits
+            _extract_verdict_from_text(f"```json\n{_APPROVED}\n")
+        finally:
+            markdown_guard.unbind_sink(token)
+
+    threads = [threading.Thread(target=lane, args=(name,)) for name in states]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+    try:
+        for name, state in states.items():
+            rows = query_events(state, kind=markdown_guard.DISAGREEMENT_KIND)
+            assert [r["payload"]["repo"] for r in rows] == [name]
+    finally:
+        for state in states.values():
+            close_db(state)
+
+
+def test_the_autouse_fixture_leaves_no_ambient_sink_bound() -> None:
+    """tests/conftest.py resets the binding around every test (no cross-test leakage)."""
+    assert markdown_guard._sink.get() is None
+    markdown_guard.bind_state_path(Path("leak") / "state.json", "leak")  # reset after this test
+
+
+# --- N4: legacy-only duplicates keep main's count ----------------------------------------
+
+
+def test_legacy_only_duplicate_matches_keep_mains_count(monkeypatch: pytest.MonkeyPatch) -> None:
+    dup = SecretMatch(rule_id="r", part="body", line=2, match_sha256="h")
+    other = SecretMatch(rule_id="r", part="body", line=3, match_sha256="h")
+    from charlie_work import outbound_body_guard as guard
+
+    by_text = {"composed": (other,), "legacy": (dup, dup, other)}
+    monkeypatch.setattr(guard, "_mask_example_secret_fences", lambda _t, **_k: "composed")
+    monkeypatch.setattr(guard, "_legacy_masked_text", lambda _t: "legacy")
+    monkeypatch.setattr(guard, "_scan_masked", lambda masked, *, part: by_text[masked])
+    result = scan_outbound_text("anything", part="body")
+    # main reported 3 matches; the composed side already covers `other`, so the two
+    # legacy-only `dup` matches must both survive (not be collapsed to one).
+    assert result == (other, dup, dup)
