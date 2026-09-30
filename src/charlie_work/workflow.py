@@ -43,7 +43,7 @@ from .review_fleet_gate import (
 from .fleet_registry import count_fleet_live_reviews, count_fleet_live_sessions, managed_repo_names  # noqa: F401  (deliberate re-export; count_fleet_live_sessions used by moved L06 delegates via _wf., count_fleet_live_reviews by review_fleet_gate via _wf.)
 from . import layout, status_snapshot  # noqa: F401  (deliberate re-export; layout reached via _wf.layout by orchestration/misc_reconcile.py)
 from .main_ci_reclaim import reclaim_superseded_main_ci_runs  # noqa: F401  (deliberate re-export; used by moved L01 b3 delegates via _wf.)
-from .notify import AttentionDigest, AttentionEntry, emit_digest
+from .notify import AttentionDigest, AttentionEntry, emit_digest, reviewer_quota_alert_digest
 from .rescue_review import (
     LEGACY_VACUOUS_SUMMARY,
     run_cross_family_review,  # noqa: F401  (deliberate re-export; patched on the workflow module in tests)
@@ -452,13 +452,9 @@ from .queue_sync_coverage import (  # noqa: F401  (deliberate re-export)
 )
 
 
-# LOAD-BEARING RE-EXPORT — NOT AN UNUSED IMPORT. Do not delete; the `noqa`
-# below marks a deliberate re-export, not a lint concession.
-#
-# issue #1317: the dead-worker/session-reap family now lives in the
-# `charlie_work.dead_worker_sweep` package, re-exported here (not re-declared)
-# so every `charlie_work.workflow.<name>` import and monkeypatch target keeps
-# resolving -- the same pattern as the blocks above.
+# LOAD-BEARING RE-EXPORT, NOT AN UNUSED IMPORT (issue #1317): the dead-worker
+# family lives in `charlie_work.dead_worker_sweep`; every `workflow.<name>` import
+# and monkeypatch target keeps resolving, as in the blocks above.
 from .dead_worker_sweep.effects_sessions import (  # noqa: F401  (deliberate re-export)
     STARTUP_DEATH_THRESHOLD_SECONDS,
     _is_startup_death,
@@ -4982,20 +4978,14 @@ class OrchestratorApp:
         # probe succeeds, at which point the global quota is cleared.
         quota_alert: dict[str, Any] | None = None
         deferred = False
-        # Issue #2086: resolve the reviewer role chain against the fleet quota
-        # ledger. Every entry restricted defers; a per-repo quota window the
-        # ledger explains is covered (selection already routed past it).
-        role_sel = role_selection.select_for_launch(self.config.reviewer.chain)
-        role_cfg = role_selection.reviewer_config_for(self.config, role_sel)
+        # Issue #2086: reviewer chain vs the fleet quota ledger (see role_selection).
+        role_sel, role_cfg = role_selection.resolve_reviewer(self.config)
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
             if role_sel.exhausted:
                 deferred, probe_mode = True, False
-            elif is_reviewer_quota_exhausted(state) and not role_selection.window_covered(
-                (state.get("reviewer_quota") or {}).get("throttled_until"),
-                role_sel,
-                reason=(state.get("reviewer_quota") or {}).get("reason"),
-                adapter_kind=(state.get("reviewer_quota") or {}).get("adapter_kind"),
+            elif is_reviewer_quota_exhausted(state) and not role_selection.reviewer_window_covered(
+                state, role_sel
             ):
                 if not is_reviewer_probe_ready(state):
                     deferred = True
@@ -5018,27 +5008,7 @@ class OrchestratorApp:
             if quota_alert is not None:
                 emit_digest(
                     self._layout.notify,
-                    AttentionDigest(
-                        generated_at=utc_now(),
-                        repo=self.repo_root.name,
-                        transitions=(
-                            AttentionEntry(
-                                issue_number=0,
-                                adapter_kind="reviewer",
-                                health="REVIEWER_QUOTA_EXHAUSTED",
-                                previous_health=None,
-                                last_log_line=(
-                                    f"throttled_until={quota_alert.get('throttled_until')} "
-                                    f"probe_after={quota_alert.get('probe_after')}"
-                                ),
-                                pid=None,
-                                terminal_tool=None,
-                                terminal_reason=(
-                                    "all reviewer launches deferred until the quota probe succeeds"
-                                ),
-                            ),
-                        ),
-                    ),
+                    reviewer_quota_alert_digest(utc_now(), self.repo_root.name, quota_alert),
                 )
             # Rescue tier (issue #555): the quota gate above governs Claude-
             # family reviewer launches only. Rescue reviews run on the
@@ -5792,7 +5762,7 @@ class OrchestratorApp:
                     adapter_kind=role_selection.selection_adapter_kind(role_sel),
                 )
                 role_selection.record_launch_quota_hit(
-                    role_sel, quota_record.get("throttled_until"), source="launch_quota_hit"
+                    role_sel, quota_record.get("throttled_until")
                 )
                 # Distinct, queryable event for a launch-time quota hit
                 # (issue #612): mirrors the stalled-sweep event so a quota

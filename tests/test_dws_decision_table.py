@@ -604,6 +604,21 @@ def test_shell_aborts_when_the_commit_prefix_changes(
     assert event["payload"]["phase"] == "pre"
 
 
+def test_shell_aborts_loudly_on_a_phase_order_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from charlie_work.dead_worker_sweep import PhaseOrderError
+
+    def unfinished(facts, observed):
+        raise PhaseOrderError("pre flow is unfinished: no observed result")
+
+    state_file = _shell(tmp_path, monkeypatch, unfinished)  # must not raise out of the sweep
+    (event,) = _events(state_file, "dead_worker_sweep_plan_violation")
+    assert event["level"] == "error"
+    assert event["payload"]["phase"] == "pre"
+    assert "PhaseOrderError" in event["payload"]["detail"]
+
+
 def test_shell_aborts_on_a_request_that_is_illegal_in_the_phase(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

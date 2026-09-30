@@ -155,7 +155,31 @@ def test_later_lane_refetches_an_empty_issue_listing() -> None:
 
 
 def test_applied_heads_are_read_per_route() -> None:
-    """N3: the original re-read the map before each completed-outcome route."""
-    from charlie_work.dead_worker_sweep.model import ReadAppliedHeads
+    """N3: the original re-read the map before each completed-outcome route.
 
-    assert ReadAppliedHeads(1) != ReadAppliedHeads(2)
+    Drive ``_route_flow`` for two completed-outcome routes against an applied-heads
+    map that matches only the first: the flow must ask for heads once per route
+    (keyed by that route's issue) and route ONLY the route whose live head matches.
+    """
+    from charlie_work.dead_worker_sweep.decide_post import _route_flow
+    from charlie_work.dead_worker_sweep.model import ReadAppliedHeads, ReviewRoute
+
+    def route(issue: int, pr: int, live: str) -> ReviewRoute:
+        return ReviewRoute(issue, pr, None, live, f"fp{issue}", "dead_worker_completed_outcome")
+
+    applied_map = {"1": "head-1", "2": "stale-head"}
+    requests: list[Any] = []
+    for r in (route(1, 11, "head-1"), route(2, 22, "head-2")):
+        flow = _route_flow(None, r, [], [])  # type: ignore[arg-type]  # facts is unused
+        request = next(flow)
+        requests.append(request)
+        if isinstance(request, ReadAppliedHeads):
+            try:
+                requests.append(flow.send(applied_map))
+            except StopIteration:
+                pass
+    assert requests == [
+        ReadAppliedHeads(1),
+        Review(1, 11, "dead_worker_completed_outcome"),
+        ReadAppliedHeads(2),
+    ]

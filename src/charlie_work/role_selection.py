@@ -197,6 +197,23 @@ def window_covered(
     return False
 
 
+def reviewer_window_covered(state: Mapping[str, Any], selection: RoleSelection) -> bool:
+    """:func:`window_covered` for the state's ``reviewer_quota`` record."""
+    quota = state.get("reviewer_quota") or {}
+    return window_covered(
+        quota.get("throttled_until"),
+        selection,
+        reason=quota.get("reason"),
+        adapter_kind=quota.get("adapter_kind"),
+    )
+
+
+def resolve_reviewer(config: Any) -> tuple[RoleSelection, Any]:
+    """Select the reviewer chain entry and the config derived for it (issue #2086)."""
+    selection = select_for_launch(config.reviewer.chain)
+    return selection, reviewer_config_for(config, selection)
+
+
 def selection_adapter_kind(selection: RoleSelection) -> str | None:
     """The ``WorkerView.adapter_kind`` of the selected entry's harness, if any."""
     if selection.entry is None:
@@ -310,7 +327,9 @@ def after_review_launch(
         )
 
 
-def record_launch_quota_hit(selection: RoleSelection, until: Any, *, source: str) -> bool:
+def record_launch_quota_hit(
+    selection: RoleSelection, until: Any, *, source: str = "launch_quota_hit"
+) -> bool:
     """A reviewer launch hit the provider quota: restrict the entry it launched on."""
     entry = selection.entry
     if entry is None:

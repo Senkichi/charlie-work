@@ -28,6 +28,7 @@ from charlie_work.dead_worker_sweep.stalled_model import (
     ReadLogTail,
     RecordFailure,
     RecordPostMortem,
+    RecordRoleQuota,
     StalledFacts,
     StampSidecar,
     StateTxn,
@@ -167,10 +168,22 @@ def test_a_rate_limit_signature_defers_the_kill() -> None:
     assert plan.entry is None
     assert KillTree not in [type(r) for r in asked]
     assert StampSidecar(ISSUE, (("rate_limit_defer_until", until),)) in plan.commits
+    # Issue #2086: the fleet quota ledger restricts the stamped chain entry, right
+    # after the sidecar stamp and before the state txn (the original order).
+    quota = RecordRoleQuota(ISSUE, until, "rate_limited", "stalled_sessions_rate_limit_defer")
+    assert (
+        plan.commits.index(quota)
+        == plan.commits.index(StampSidecar(ISSUE, (("rate_limit_defer_until", until),))) + 1
+    )
     txn = plan.commits[-1]
     assert txn.event_kind == "session_rate_limit_deferred"
     assert txn.throttle.source == "stalled_sessions_rate_limit_defer"
     assert txn.throttle.reason == "rate_limited"
+
+
+def test_dry_run_defer_withholds_the_ledger_write() -> None:
+    plan, _ = _drive(_facts(dry_run=True), _answers(defer="2026-09-30T12:10:00Z"))
+    assert not [c for c in plan.commits if isinstance(c, RecordRoleQuota)]
 
 
 def test_an_unexpired_stored_defer_window_leaves_the_worker_alone() -> None:

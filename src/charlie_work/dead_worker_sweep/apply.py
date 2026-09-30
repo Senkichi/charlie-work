@@ -30,7 +30,7 @@ from ..write_gate import WriteGate, require_write_gate
 from .apply_commits import LOCK_ILLEGAL_COMMITS, POST_ILLEGAL_COMMITS, apply_commit
 from .apply_context import SweepContext
 from .apply_requests_lock import serve
-from .decide import decide
+from .decide import PhaseOrderError, decide
 from .model import (
     LOCK_LEGAL,
     POST_LEGAL,
@@ -89,7 +89,10 @@ def _run_phase(run: _Run, facts: SweepFacts, sweep_events: list[Any]) -> None:
     legal = _LEGAL[phase]
     applied: list[Any] = []
     for _round in range(MAX_ROUNDS_PER_PHASE):
-        plan = decide(facts, run.observed)
+        try:
+            plan = decide(facts, run.observed)
+        except PhaseOrderError as exc:  # a decide bug: abort loudly like any other gate
+            raise _abort(ctx, PLAN_VIOLATION_KIND, phase, f"PhaseOrderError: {exc}") from exc
         if tuple(plan.commits[: len(applied)]) != tuple(applied):
             raise _abort(ctx, PLAN_VIOLATION_KIND, phase, "commit prefix changed between rounds")
         for commit in plan.commits[len(applied) :]:
