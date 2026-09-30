@@ -35,7 +35,6 @@ from charlie_work.github import label_names
 from charlie_work.state import StateLockBusy
 from charlie_work.worker import iter_workers
 from charlie_work.foreign_worktree import OPERATOR_MARKER_KIND, read_worktree_marker
-from charlie_work.process_utils import is_pid_alive
 from charlie_work.worktree import (
     WORKTREE_UNSAFE_KIND_LOCAL_COMMITS,
     WorktreeProbeFailedError,
@@ -435,7 +434,7 @@ def _salvage_stranded_before_clear(
         marker_pid = marker.get("pid") if marker is not None else None
         if marker is not None and marker.get("kind") == OPERATOR_MARKER_KIND:
             skip_reason = "operator_claimed"
-        elif isinstance(marker_pid, int) and marker_pid > 0 and is_pid_alive(marker_pid):
+        elif isinstance(marker_pid, int) and worker_fate.is_alive(marker_pid, None):
             skip_reason = "live_writer_marker"
         elif _archive_unreachable_tip_if_applicable(
             self.repo_root, branch, wt_path, self.paths.state_file, set(), issue_number
@@ -454,9 +453,32 @@ def _salvage_stranded_before_clear(
     )
     with _wf.state_lock(self.paths.state_file):
         fresh = _wf.load_state(self.paths.state_file)
-        fresh = self._record_event(fresh, kind, payload)
-        self.write_gate.save_state(fresh)
+        # N3: the de-escalation sweep re-runs this every interval for a
+        # persistently unsalvageable branch; record a failure only when it
+        # differs from the newest failure already logged for this issue.
+        if mode is not None or not _repeats_last_salvage_failure(fresh, payload):
+            fresh = self._record_event(fresh, kind, payload)
+            self.write_gate.save_state(fresh)
     return mode
+
+
+def _repeats_last_salvage_failure(state: dict[str, Any], payload: dict[str, Any]) -> bool:
+    """True when the newest ``worktree_unsafe_stranded_salvage_failed`` event
+    for this issue already carries the same branch and skip reason. Derived
+    from the event ring itself, so there is no marker to go stale."""
+    for event in reversed(state.get("events", [])):
+        if not isinstance(event, dict):
+            continue
+        prior = event.get("payload")
+        if not isinstance(prior, dict) or prior.get("issue_number") != payload["issue_number"]:
+            continue
+        if event.get("kind") == "worktree_unsafe_stranded_salvaged":
+            return False
+        if event.get("kind") == "worktree_unsafe_stranded_salvage_failed":
+            return prior.get("branch") == payload["branch"] and prior.get(
+                "skip_reason"
+            ) == payload.get("skip_reason")
+    return False
 
 
 @records_deferral("dispatch_rework")

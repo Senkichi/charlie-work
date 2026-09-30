@@ -99,7 +99,7 @@ def get_rate_limit_defer_until(
     # imports this module's sibling functions).
     from .worker_fate import _throttle_emission_anchor
 
-    emitted_at = _throttle_emission_anchor(log_path, tail, now=now)
+    emitted_at = _throttle_emission_anchor(log_path, tail, now=now, throttle_markers=markers)
     defer_until = max(
         now,
         emitted_at + timedelta(minutes=minutes + slack_minutes, seconds=resume_margin_seconds),

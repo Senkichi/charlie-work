@@ -1,10 +1,13 @@
 """N9: the throttle-window emission anchor, per log format.
 
-``worker_fate.classify_for`` reads the profile's ``log_format``. Claude-code/api
-logs are stream-json: the anchor is the newest event's TOP-LEVEL ``"timestamp"``
-field, and ``now`` when there is none -- never a regex hit on a timestamp
-quoted inside a ``tool_result`` and never the log's mtime. Devin logs are plain
-text: the last timestamped line, then the log mtime (unchanged).
+The reader is chosen from the LOG'S SHAPE, not the harness: claude-code's
+``.log`` is plain CLI prose unless ``tee_stream_json`` is on, so it gets the
+tail-timestamp -> mtime chain (#1997); a stream-json log (api, reviewers) is read
+event by event. In stream-json only the event carrying the throttle marker
+counts: its own top-level ``"timestamp"``, else the log mtime when it is the
+terminal ``result`` line (the CLI writes it last), else ``now`` -- never an
+earlier assistant/user turn (retry backoff precedes the death) and never a
+timestamp quoted inside a ``tool_result``.
 """
 
 from __future__ import annotations
@@ -32,11 +35,11 @@ def _copy_fixture(tmp_path: Path, name: str, *, mtime: datetime) -> Path:
     return log_path
 
 
-def test_stream_json_anchor_is_the_top_level_timestamp_field(tmp_path: Path) -> None:
+def test_stream_json_anchor_is_the_throttle_events_own_timestamp(tmp_path: Path) -> None:
     # mtime deliberately disagrees with the event's own timestamp.
     log_path = _copy_fixture(
         tmp_path,
-        "claude_stream_json_throttle_structured_ts.jsonl",
+        "claude_stream_json_throttle_assistant_ts.jsonl",
         mtime=NOW - timedelta(minutes=3),
     )
 
@@ -94,8 +97,43 @@ def test_devin_plain_text_without_timestamp_still_anchors_at_log_mtime(tmp_path:
 def test_classify_for_unknown_adapter_kind_classifies_nothing(tmp_path: Path) -> None:
     log_path = _copy_fixture(
         tmp_path,
-        "claude_stream_json_throttle_structured_ts.jsonl",
+        "claude_stream_json_throttle_assistant_ts.jsonl",
         mtime=EMITTED,
     )
 
     assert worker_fate.classify_for("no-such-adapter", log_path, now=NOW) == (None, None)
+
+
+def test_stream_json_result_without_timestamp_anchors_at_mtime_not_earlier_turn(
+    tmp_path: Path,
+) -> None:
+    # Real CLI shape: the throttle `result` event has no timestamp; the only
+    # stamped event is an assistant turn 20 minutes BEFORE the death. The
+    # anchor must be the log mtime (the result line is written last), not
+    # that turn's 09:40 -- which would undershoot the window by the backoff.
+    log_path = _copy_fixture(
+        tmp_path,
+        "claude_stream_json_throttle_real_shape.jsonl",
+        mtime=EMITTED,
+    )
+
+    for kind in ("claude-code", "api"):
+        failure_kind, throttled_until = worker_fate.classify_for(kind, log_path, now=NOW)
+
+        assert failure_kind == "rate_limited"
+        assert throttled_until == _iso(EMITTED + timedelta(minutes=30))
+
+
+def test_claude_code_plain_text_log_anchors_at_mtime(tmp_path: Path) -> None:
+    # tee_stream_json defaults to False: a default claude-code log is prose.
+    # It must keep the #1997 mtime anchor, not fall to classification time.
+    log_path = _copy_fixture(
+        tmp_path,
+        "claude_plain_text_throttle.log",
+        mtime=EMITTED,
+    )
+
+    failure_kind, throttled_until = worker_fate.classify_for("claude-code", log_path, now=NOW)
+
+    assert failure_kind == "rate_limited"
+    assert throttled_until == _iso(EMITTED + timedelta(minutes=30))

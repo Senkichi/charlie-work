@@ -37,13 +37,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from . import worker_fate
+from .blocked_worker_escalation import dead_worker_blocked_outcome, escalate_declared_blocked
 from .dead_worker_classification import classify_and_credit_dead_worker
 from .orphaned_worker_review_drain import OrphanedWorkerReviewRoute
 from .process_utils import find_worker_terminal_status
 from .review_decision import review_decision
 from .rework_outcome import (
     APPLIED_HEADS_KEY,
-    blocked_worker_outcome,
     fresh_completed_worker_outcome,
 )
 from .state import PASSIVE_OPEN_STATUS
@@ -386,9 +386,16 @@ def handle_dead_worker_with_pr(
     outcome_apply_routes: list[tuple[int, int]],
     pr_orphan_unreviewed_details: dict[int, dict[str, Any]],
     drift_fingerprint: Callable[..., str],
+    reap_escalations: list[int],
     on_fate: Callable[[worker_fate.WorkerFate], None] | None = None,
 ) -> None:
     """Classify one dead dispatched worker that still has an open PR.
+
+    ``reap_escalations`` is the caller's post-lock list: a
+    ``worker_declared_blocked`` escalation appends its issue number so the
+    pass applies the ``escalated`` label edge (network I/O, outside the state
+    lock) -- the same seam the no-PR blocked path uses. Without it state.json
+    says ``escalated`` while GitHub still shows the active labels.
 
     Verbatim move of the ``if pr_data:`` arm of
     ``_detect_and_handle_orphaned_workers``'s per-issue loop: resolves the
@@ -486,61 +493,28 @@ def handle_dead_worker_with_pr(
                 # "is this provably a completion" -- it returns False for
                 # both populations alike -- so the blocked check is a
                 # separate, explicit read here.
-                branch = pr_data.get("headRefName") or entry.get("branch_name")
-                blocked_outcome = None
-                if branch and isinstance(repo_root, Path) and worktrees_dir is not None:
-                    blocked_outcome = blocked_worker_outcome(
-                        worktree_path_for_branch(repo_root, branch, worktrees_dir),
-                        issue_number=issue_number,
-                        dispatched_at=_wf._parse_iso_timestamp(entry.get("dispatched_at")),
-                        on_fate=on_fate,
-                    )
+                blocked_outcome = dead_worker_blocked_outcome(
+                    pr_data=pr_data,
+                    entry=entry,
+                    issue_number=issue_number,
+                    sessions_dir=sessions_dir,
+                    repo_root=repo_root,
+                    worktrees_dir=worktrees_dir,
+                    on_fate=on_fate,
+                )
                 if blocked_outcome is not None:
-                    state = _wf._escalate_issue(
-                        state,
-                        issue_number,
-                        reason="worker_declared_blocked",
-                        reason_class="mechanical",
+                    escalate_declared_blocked(
+                        state=state,
+                        sweep_events=sweep_events,
+                        entry=entry,
+                        issue_number=issue_number,
                         pr_number=pr_number,
-                        issue_extra={"dispatched_at": None},
-                    )
-                    # `_escalate_issue` rebuilds `state["issues"][key]` as a
-                    # brand-new dict rather than mutating the one passed in
-                    # (see escalation.py / CLAUDE.md). This function has no
-                    # explicit write-back on this path -- it falls off the
-                    # end and relies on the caller's loop tail in
-                    # `workflow.py` doing `state["issues"][str(issue_number)]
-                    # = entry` with the *same* `entry` object identity it
-                    # fetched before calling us. Rebinding the local `entry`
-                    # name here (as the naive `entry =
-                    # state["issues"][str(issue_number)]` would) only
-                    # updates this function's own local variable -- the
-                    # caller's `entry` reference is untouched, so its
-                    # stale, pre-escalation loop-tail write-back would
-                    # silently clobber the escalation. Mutate the
-                    # caller-owned `entry` object in place instead, so its
-                    # identity (and thus the loop tail's write-back) stays
-                    # correct.
-                    entry.clear()
-                    entry.update(state["issues"][str(issue_number)])
-                    state["issues"][str(issue_number)] = entry
-                    sweep_events.append(
-                        (
-                            "worker_declared_blocked",
-                            {
-                                "issue_number": issue_number,
-                                "pr_number": pr_number,
-                                "previous_status": "dispatched",
-                                "reason": "worker_declared_blocked",
-                                "reason_kind": str(
-                                    blocked_outcome.get("reason_kind") or "unknown"
-                                ),
-                                "detail": str(blocked_outcome.get("detail") or ""),
-                                "pid": terminal_pid,
-                                "exit_code": terminal_exit_code,
-                                "duration_seconds": terminal_duration_seconds,
-                            },
-                        )
+                        blocked_outcome=blocked_outcome,
+                        reap_escalations=reap_escalations,
+                        event_extra={},
+                        terminal_pid=terminal_pid,
+                        terminal_exit_code=terminal_exit_code,
+                        terminal_duration_seconds=terminal_duration_seconds,
                     )
                 elif terminal_exit_code == 0:
                     # The worker exited cleanly (exit code 0) rather
@@ -751,63 +725,28 @@ def handle_dead_worker_with_pr(
                 # claude-code/api worker that declares itself blocked then
                 # exits 0 is the normal case, and it must not be read as
                 # the exit-0 no-op drift instead.
-                branch = pr_data.get("headRefName") or entry.get("branch_name")
-                blocked_outcome = None
-                if branch and isinstance(repo_root, Path) and worktrees_dir is not None:
-                    blocked_outcome = blocked_worker_outcome(
-                        worktree_path_for_branch(repo_root, branch, worktrees_dir),
-                        issue_number=issue_number,
-                        dispatched_at=_wf._parse_iso_timestamp(entry.get("dispatched_at")),
-                        on_fate=on_fate,
-                    )
+                blocked_outcome = dead_worker_blocked_outcome(
+                    pr_data=pr_data,
+                    entry=entry,
+                    issue_number=issue_number,
+                    sessions_dir=sessions_dir,
+                    repo_root=repo_root,
+                    worktrees_dir=worktrees_dir,
+                    on_fate=on_fate,
+                )
                 if blocked_outcome is not None:
-                    state = _wf._escalate_issue(
-                        state,
-                        issue_number,
-                        reason="worker_declared_blocked",
-                        reason_class="mechanical",
+                    escalate_declared_blocked(
+                        state=state,
+                        sweep_events=sweep_events,
+                        entry=entry,
+                        issue_number=issue_number,
                         pr_number=pr_number,
-                        issue_extra={"dispatched_at": None},
-                    )
-                    # `_escalate_issue` rebuilds `state["issues"][key]` as a
-                    # brand-new dict rather than mutating the one passed in
-                    # (see escalation.py / CLAUDE.md). This function has no
-                    # explicit write-back on this path -- it falls off the
-                    # end and relies on the caller's loop tail in
-                    # `workflow.py` doing `state["issues"][str(issue_number)]
-                    # = entry` with the *same* `entry` object identity it
-                    # fetched before calling us. Rebinding the local `entry`
-                    # name here (as the naive `entry =
-                    # state["issues"][str(issue_number)]` would) only
-                    # updates this function's own local variable -- the
-                    # caller's `entry` reference is untouched, so its
-                    # stale, pre-escalation loop-tail write-back would
-                    # silently clobber the escalation. Mutate the
-                    # caller-owned `entry` object in place instead, so its
-                    # identity (and thus the loop tail's write-back) stays
-                    # correct.
-                    entry.clear()
-                    entry.update(state["issues"][str(issue_number)])
-                    state["issues"][str(issue_number)] = entry
-                    sweep_events.append(
-                        (
-                            "worker_declared_blocked",
-                            {
-                                "issue_number": issue_number,
-                                "pr_number": pr_number,
-                                "previous_status": "dispatched",
-                                "reason": "worker_declared_blocked",
-                                "decision": "approved",
-                                "pr_state_status": pr_state_status,
-                                "reason_kind": str(
-                                    blocked_outcome.get("reason_kind") or "unknown"
-                                ),
-                                "detail": str(blocked_outcome.get("detail") or ""),
-                                "pid": terminal_pid,
-                                "exit_code": terminal_exit_code,
-                                "duration_seconds": terminal_duration_seconds,
-                            },
-                        )
+                        blocked_outcome=blocked_outcome,
+                        reap_escalations=reap_escalations,
+                        event_extra={"decision": "approved", "pr_state_status": pr_state_status},
+                        terminal_pid=terminal_pid,
+                        terminal_exit_code=terminal_exit_code,
+                        terminal_duration_seconds=terminal_duration_seconds,
                     )
                 elif terminal_exit_code == 0:
                     # Clean exit with no push -- same #773 rationale

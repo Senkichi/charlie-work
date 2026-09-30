@@ -291,9 +291,16 @@ def blocked_worker_outcome(
     issue_number: int,
     dispatched_at: datetime | None,
     on_fate: Callable[[worker_fate.WorkerFate], None] | None = None,
+    sessions_dir: Path | None = None,
 ) -> dict[str, Any] | None:
-    """Return a worktree ``.worker-outcome.json`` that proves a dead worker
-    declared itself blocked (rule 2, wf-design.md §9: FLIP 2).
+    """Return the outcome (worktree ``.worker-outcome.json`` or the copy the
+    terminal-status watcher embedded in the terminal record) that proves a
+    dead worker declared itself blocked (rule 2, wf-design.md §9: FLIP 2).
+
+    ``sessions_dir`` (optional) adds the terminal record's embedded
+    ``worker_outcome`` as a candidate, so a declaration survives the worktree
+    being reaped. Both candidates go through ``resolve_fate``'s freshness
+    arbitration, exactly as the no-PR lane does.
 
     Sibling to ``fresh_completed_worker_outcome`` above, same freshness
     contract (``written_at`` must postdate ``dispatched_at``) and the same
@@ -311,20 +318,48 @@ def blocked_worker_outcome(
     all" lets the caller escalate it instead of silently folding it into
     the same ``rework_requested`` reset a genuinely silent death gets.
     """
-    if worktree_path is None or dispatched_at is None:
+    if dispatched_at is None:
         return None
-    try:
-        outcome_mtime = datetime.fromtimestamp(
-            (worktree_path / WORKER_OUTCOME_FILENAME).stat().st_mtime, tz=UTC
-        )
-    except OSError:
-        return None
-    outcome_evidence = _outcome_evidence(
-        read_worker_outcome(worktree_path),
-        source=worker_fate.EvidenceSource.WORKTREE,
-        written_at=outcome_mtime,
-    )
-    if outcome_evidence is None:
+
+    terminal_evidence: worker_fate.TerminalEvidence | None = None
+    if sessions_dir is not None:
+        record = find_worker_terminal_status(sessions_dir, issue_number)
+        if isinstance(record, dict):
+            ended_at = worker_fate.parse_iso_timestamp(record.get("ended_at"))
+            # The embedded outcome's own mtime, not the exit time (B5): a
+            # reused worktree can hold a previous dispatch's leftover file.
+            written_at = (
+                worker_fate.parse_iso_timestamp(record.get("worker_outcome_written_at"))
+                or ended_at
+            )
+            terminal_evidence = worker_fate.TerminalEvidence(
+                ended_at=ended_at or datetime.now(UTC),
+                exit_code=record.get("exit_code"),
+                outcome=_outcome_evidence(
+                    record.get("worker_outcome"),
+                    source=worker_fate.EvidenceSource.TERMINAL,
+                    written_at=written_at,
+                ),
+            )
+
+    worktree_evidence: worker_fate.OutcomeEvidence | None = None
+    if worktree_path is not None:
+        try:
+            outcome_mtime = datetime.fromtimestamp(
+                (worktree_path / WORKER_OUTCOME_FILENAME).stat().st_mtime, tz=UTC
+            )
+        except OSError:
+            outcome_mtime = None
+        if outcome_mtime is not None:
+            worktree_evidence = _outcome_evidence(
+                read_worker_outcome(worktree_path),
+                source=worker_fate.EvidenceSource.WORKTREE,
+                written_at=outcome_mtime,
+            )
+
+    if worktree_evidence is None and (
+        terminal_evidence is None or terminal_evidence.outcome is None
+    ):
         return None
 
     fate = worker_fate.resolve_fate(
@@ -334,8 +369,8 @@ def blocked_worker_outcome(
             dispatched_at=dispatched_at,
             pid_alive=False,
             health=None,
-            terminal=None,
-            worktree_outcome=outcome_evidence,
+            terminal=terminal_evidence,
+            worktree_outcome=worktree_evidence,
             branch=worker_fate.BranchEvidence(
                 has_remote=True,
                 remote_head_sha=None,

@@ -230,6 +230,10 @@ def collect_stale_live_handoff_pids(
         fresh_outcome = fate.basis.outcome
         if (
             fresh_outcome is None
+            # Rule 2: a blocked declaration wins everywhere -- never finalize
+            # it as a handoff, whatever push flags ride along.
+            or isinstance(fate, worker_fate.Blocked)
+            or fresh_outcome.outcome == "blocked"
             or fresh_outcome.push_succeeded is not True
             or fresh_outcome.pr_created is not False
         ):

@@ -350,6 +350,13 @@ def test_flip2_with_pr_fresh_blocked_outcome_falls_through_to_redispatch(tmp_pat
     # silently redispatching it.
     assert entry["status"] == "escalated"
     assert entry["escalation_reason"] == "worker_declared_blocked"
+    # State and labels must move together in the SAME pass: the post-lock
+    # `escalated` edge adds the operator-queue label and drops the active one.
+    # (Only `_repair_escalated_labels` would otherwise converge it, capped per
+    # pass -- a state/label split, the CLAUDE.md "state lives in labels AND
+    # state.json" invariant.)
+    assert (207, config.labels.operator_queue) in fake_gh.labels_added
+    assert (207, config.labels.in_progress) in fake_gh.labels_removed
     events = state.get("events", [])
     assert any(
         e.get("kind") == "worker_declared_blocked"
@@ -408,6 +415,13 @@ def test_flip2_with_pr_fresh_blocked_outcome_and_clean_exit_still_escalates(
     entry = state["issues"]["207"]
     assert entry["status"] == "escalated"
     assert entry["escalation_reason"] == "worker_declared_blocked"
+    # State and labels must move together in the SAME pass: the post-lock
+    # `escalated` edge adds the operator-queue label and drops the active one.
+    # (Only `_repair_escalated_labels` would otherwise converge it, capped per
+    # pass -- a state/label split, the CLAUDE.md "state lives in labels AND
+    # state.json" invariant.)
+    assert (207, config.labels.operator_queue) in fake_gh.labels_added
+    assert (207, config.labels.in_progress) in fake_gh.labels_removed
     events = state.get("events", [])
     assert any(
         e.get("kind") == "worker_declared_blocked"
@@ -464,6 +478,13 @@ def test_flip2_approved_rework_fresh_blocked_outcome_and_clean_exit_still_escala
     entry = state["issues"]["207"]
     assert entry["status"] == "escalated"
     assert entry["escalation_reason"] == "worker_declared_blocked"
+    # State and labels must move together in the SAME pass: the post-lock
+    # `escalated` edge adds the operator-queue label and drops the active one.
+    # (Only `_repair_escalated_labels` would otherwise converge it, capped per
+    # pass -- a state/label split, the CLAUDE.md "state lives in labels AND
+    # state.json" invariant.)
+    assert (207, config.labels.operator_queue) in fake_gh.labels_added
+    assert (207, config.labels.in_progress) in fake_gh.labels_removed
     events = state.get("events", [])
     assert any(
         e.get("kind") == "worker_declared_blocked"

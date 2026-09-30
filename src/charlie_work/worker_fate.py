@@ -31,9 +31,9 @@ that lived in ``claude_code.py`` and ``devin_failure_classification.py``
 fleet-wide by rule 6, so it is no longer a per-profile flag);
 ``AdapterFateProfile``/``profile_for`` replace the 14
 ``w.adapter_kind ==`` branches in ``dead_worker_reap.py``. Both copies are
-now deleted: ``classify_for`` looks the profile up and passes its three
-flags (``account_error_detection``, ``headless_permission_detection``,
-``log_format``) to ``classify_failure``, and the adapters' sidecar writers
+now deleted: ``classify_for`` looks the profile up and passes its two
+flags (``account_error_detection``, ``headless_permission_detection``)
+to ``classify_failure``, and the adapters' sidecar writers
 call ``classify_for``.
 
 ``FateEvidence.failure`` is supplied by the caller as already-classified
@@ -77,7 +77,7 @@ from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Literal
+from typing import Any
 
 from .config import OrchestratorConfig
 from .process_utils import is_pid_alive as _process_is_pid_alive
@@ -712,8 +712,6 @@ def _provider_suspension_in_tail(tail: str) -> bool:
     return False
 
 
-LogFormat = Literal["plain_text", "stream_json"]
-
 # Issue #1997: a tz-aware ISO-8601 timestamp on a tail line marks when the
 # provider emitted the throttle message -- a better anchor than the
 # classification-time clock. Moved verbatim from devin_failure_classification.py.
@@ -738,39 +736,82 @@ def _tail_emission_timestamp(tail: str) -> datetime | None:
     return None
 
 
-def _stream_json_emission_timestamp(tail: str) -> datetime | None:
-    """The tz-aware ``"timestamp"`` of the newest stream-json event in ``tail``
-    that carries one as a TOP-LEVEL string field, else None.
+def _parse_event(line: str) -> dict | None:
+    """The JSON object on ``line``, else None (partial line, prose, non-object)."""
+    line = line.strip()
+    if not line.startswith("{"):
+        return None
+    try:
+        event = json.loads(line)
+    except ValueError:
+        return None
+    return event if isinstance(event, dict) else None
 
-    N9: claude-code/api logs are stream-json, one event per line. Their tails
-    also quote arbitrary tool output, so a regex over the raw text would take
-    an ISO timestamp embedded in a ``tool_result`` for the provider's emission
-    time. Each line is parsed as JSON and only the event's own top-level
-    ``"timestamp"`` (the repo's stream-json convention -- ``worker.py`` /
-    ``post_mortem.py``) is trusted; a partial first line (the tail is a byte
-    slice), a non-object, a missing or non-string field and a naive
-    (offset-less) value are all skipped. Never a substring match.
+
+def _is_stream_json(tail: str) -> bool:
+    """True when the log's shape is stream-json: the LAST non-empty tail line
+    parses as a JSON object. The shape is read off the log itself, not the
+    harness: ``ClaudeCodeConfig.tee_stream_json`` defaults to False, so a
+    claude-code ``.log`` is plain CLI prose unless the tee is on, while api
+    and the reviewers always write stream-json. The tail is a byte slice, so
+    only its first line can be partial -- the last line is always whole.
     """
     for line in reversed(tail.splitlines()):
-        line = line.strip()
-        if not line.startswith("{"):
+        if line.strip():
+            return _parse_event(line) is not None
+    return False
+
+
+def _event_timestamp(event: dict) -> datetime | None:
+    """The event's own tz-aware top-level ``"timestamp"``, else None. Naive
+    (offset-less) and non-string values are skipped."""
+    raw = event.get("timestamp")
+    if not isinstance(raw, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
+def _stream_json_emission_anchor(
+    log_path: Path, tail: str, throttle_markers: Sequence[str]
+) -> datetime | None:
+    """When the provider emitted the throttle, read off a stream-json ``tail``.
+
+    Real CLI output carries a top-level ``"timestamp"`` only on ``assistant``
+    and ``user`` events; the terminal ``result`` event (and ``system`` /
+    ``rate_limit_event``) has none. So:
+
+    1. Find the newest event whose own text carries a throttle marker -- the
+       event that IS the emission. Its top-level ``"timestamp"`` is trusted
+       when present. An earlier assistant/user turn is never used: the CLI
+       retries a 429 with backoff for minutes before dying, so that turn
+       predates the emission by an unbounded gap.
+    2. Without a timestamp: if that event is the terminal ``result`` and the
+       last line of the tail, the CLI wrote it last, so the log's mtime is
+       the emission time.
+    3. Otherwise None (the caller anchors at ``now``). In particular a
+       timestamp quoted inside a later ``tool_result`` is never taken.
+    """
+    lines = [line for line in tail.splitlines() if line.strip()]
+    for index in range(len(lines) - 1, -1, -1):
+        event = _parse_event(lines[index])
+        if event is None:
             continue
-        try:
-            event = json.loads(line)
-        except ValueError:
+        matched, _ = match_throttle_tail(lines[index], throttle_markers)
+        if not matched:
             continue
-        if not isinstance(event, dict):
-            continue
-        raw = event.get("timestamp")
-        if not isinstance(raw, str):
-            continue
-        try:
-            parsed = datetime.fromisoformat(raw)
-        except ValueError:
-            continue
-        if parsed.tzinfo is None:
-            continue
-        return parsed
+        stamped = _event_timestamp(event)
+        if stamped is not None:
+            return stamped
+        if event.get("type") == "result" and index == len(lines) - 1:
+            try:
+                return datetime.fromtimestamp(log_path.stat().st_mtime, tz=UTC)
+            except OSError:
+                return None
+        return None
     return None
 
 
@@ -779,23 +820,24 @@ def _throttle_emission_anchor(
     tail: str,
     *,
     now: datetime,
-    log_format: LogFormat = "plain_text",
+    throttle_markers: Sequence[str],
 ) -> datetime:
     """Anchor for a provider-throttle window: when the message was emitted,
     not when it was classified. Clamped to ``now``: a future mtime/tail
     timestamp is clock/mtime skew, not evidence the reset also moved.
 
-    ``plain_text`` (devin): the tail's last timestamped line, else the log's
-    mtime (the last write to a dead worker's log is the death message), else
-    ``now``.
+    The log's shape picks the reader (see ``_is_stream_json``):
 
-    ``stream_json`` (claude-code/api): the newest event's top-level
-    ``"timestamp"`` (see ``_stream_json_emission_timestamp``), else ``now``
-    -- never the mtime, which for a stream-json log says nothing about which
-    event was the throttle and would re-open the embedded-timestamp hole.
+    - plain text (devin; claude-code without the stream-json tee): the tail's
+      last timestamped line, else the log's mtime (the last write to a dead
+      worker's log is the death message), else ``now``.
+    - stream-json (api, reviewers, claude-code with the tee): see
+      ``_stream_json_emission_anchor``, else ``now``. Never a bare mtime --
+      for a stream-json log it says nothing about which event was the
+      throttle and would re-open the embedded-timestamp hole.
     """
-    if log_format == "stream_json":
-        anchor = _stream_json_emission_timestamp(tail)
+    if _is_stream_json(tail):
+        anchor = _stream_json_emission_anchor(log_path, tail, throttle_markers)
         return min(anchor if anchor is not None else now, now)
     anchor = _tail_emission_timestamp(tail)
     if anchor is None:
@@ -814,7 +856,6 @@ def classify_failure(
     resume_margin_seconds: int = 0,
     account_error_detection: bool = False,
     headless_permission_detection: bool = False,
-    log_format: LogFormat = "plain_text",
     now: datetime | None = None,
 ) -> tuple[str | None, str | None]:
     """Classify a session failure by matching the log tail against provider
@@ -834,10 +875,10 @@ def classify_failure(
     ``permission_denied`` check. It is checked LAST so throttle/auth
     signatures still win.
 
-    ``log_format`` selects how the emission time is read out of the log
-    (N9 -- see ``_throttle_emission_anchor``): ``plain_text`` for devin,
-    ``stream_json`` for claude-code/api. Callers normally reach this through
-    ``classify_for``, which reads all three flags off the adapter profile.
+    The emission time is read out of the log according to the log's own
+    shape (N9 -- see ``_throttle_emission_anchor``), not the harness.
+    Callers normally reach this through ``classify_for``, which reads the two
+    detection flags off the adapter profile.
 
     The ``rate_limited`` anchor is always the message's emission time
     (issue #1997 -- see ``_throttle_emission_anchor``), for every harness.
@@ -899,7 +940,7 @@ def classify_failure(
             seconds=resume_margin_seconds,
         )
         emitted_at = _throttle_emission_anchor(
-            log_path, tail, now=resolved_now, log_format=log_format
+            log_path, tail, now=resolved_now, throttle_markers=markers
         )
         throttled_until = max(resolved_now, emitted_at + cooldown)
         return "rate_limited", throttled_until.replace(microsecond=0).isoformat().replace(
@@ -924,7 +965,6 @@ class AdapterFateProfile:
     view_kinds: frozenset[str]  # WorkerView.adapter_kind spellings ("devin" for devin-shell)
     account_error_detection: bool  # api only: provider_suspended / provider_auth
     headless_permission_detection: bool  # issue #2010: permission_denied (claude-code, api)
-    log_format: LogFormat  # how the emission time is read from the log tail (N9)
     record_failure: Callable[..., tuple[str | None, str | None]] | None
     # (sessions_dir, issue_number, *, fallback_kind, config, now) -> the
     # existing update_worker_record_with_failure_classification /
@@ -991,7 +1031,6 @@ def _build_profiles() -> dict[str, AdapterFateProfile]:
             view_kinds=frozenset({"devin"}),
             account_error_detection=False,
             headless_permission_detection=False,
-            log_format="plain_text",
             record_failure=_devin_record_failure,
             over_budget=None,
         ),
@@ -1000,7 +1039,6 @@ def _build_profiles() -> dict[str, AdapterFateProfile]:
             view_kinds=frozenset({"claude-code"}),
             account_error_detection=False,
             headless_permission_detection=True,
-            log_format="stream_json",
             record_failure=_claude_code_record_failure,
             over_budget=None,
         ),
@@ -1009,7 +1047,6 @@ def _build_profiles() -> dict[str, AdapterFateProfile]:
             view_kinds=frozenset({"api"}),
             account_error_detection=True,
             headless_permission_detection=True,
-            log_format="stream_json",
             record_failure=_api_record_failure,
             over_budget=_api_over_budget,
         ),
@@ -1028,7 +1065,6 @@ def _build_profiles() -> dict[str, AdapterFateProfile]:
             view_kinds=frozenset({"command"}),
             account_error_detection=False,
             headless_permission_detection=False,
-            log_format="plain_text",
             record_failure=None,
             over_budget=None,
         ),
@@ -1037,7 +1073,6 @@ def _build_profiles() -> dict[str, AdapterFateProfile]:
             view_kinds=frozenset({"manual"}),
             account_error_detection=False,
             headless_permission_detection=False,
-            log_format="plain_text",
             record_failure=None,
             over_budget=None,
         ),
@@ -1107,7 +1142,7 @@ def classify_for(
 
     The single classifier entry point: the profile supplies the three
     per-harness flags (``account_error_detection``,
-    ``headless_permission_detection``, ``log_format``) so the adapters no
+    ``headless_permission_detection``) so the adapters no
     longer carry their own ``_classify_session_failure`` wrappers that
     hard-code them. An unknown ``adapter_kind`` returns ``(None, None)`` --
     the same graceful "nothing classified" ``profile_for`` gives its callers.
@@ -1122,7 +1157,6 @@ def classify_for(
         resume_margin_seconds=resume_margin_seconds,
         account_error_detection=profile.account_error_detection,
         headless_permission_detection=profile.headless_permission_detection,
-        log_format=profile.log_format,
         now=now,
     )
 

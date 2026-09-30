@@ -1,3 +1,0 @@
-{"type":"system","subtype":"init","session_id":"s-1"}
-{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Starting work."}]}}
-{"type":"result","subtype":"error","is_error":true,"result":"Reached overall message rate limit. Your limit will reset in 30 minutes.","timestamp":"2026-09-29T10:00:00Z"}
