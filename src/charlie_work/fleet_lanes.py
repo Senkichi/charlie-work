@@ -46,11 +46,11 @@ _DEFAULT_FLEET_LANE_CONCURRENCY = 8
 
 
 def _resolve_fleet_lane_concurrency(global_config: Any) -> int:
-    """Effective per-pass lane cap: ``supervisor.fleet_lane_concurrency`` or
-    the built-in default when absent/misconfigured (including a None
+    """Effective per-pass lane cap: ``fleet_supervisor.fleet_lane_concurrency``
+    or the built-in default when absent/misconfigured (including a None
     ``global_config`` on direct CLI call sites)."""
-    supervisor_cfg = getattr(global_config, "supervisor", None)
-    value = getattr(supervisor_cfg, "fleet_lane_concurrency", None)
+    fleet_supervisor_cfg = getattr(global_config, "fleet_supervisor", None)
+    value = getattr(fleet_supervisor_cfg, "fleet_lane_concurrency", None)
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         return _DEFAULT_FLEET_LANE_CONCURRENCY
     return value

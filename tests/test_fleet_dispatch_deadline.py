@@ -21,7 +21,7 @@ from _fleet_dispatch_fixtures import (
     _per_repo_runtime_paths,
 )
 from charlie_work import layout
-from charlie_work.config import OrchestratorConfig, SupervisorConfig
+from charlie_work.config import FleetSupervisorConfig, OrchestratorConfig
 from charlie_work.fleet_dispatch import fleet_loop
 from charlie_work.instrumentation import query_events
 from charlie_work.workflow import CommandResult
@@ -98,7 +98,9 @@ def test_fleet_loop_deadline_defers_later_repos(
 
     result = fleet_loop(
         fleet_dir_override=str(tmp_path / "fleet"),
-        global_config=OrchestratorConfig(supervisor=SupervisorConfig(fleet_lane_concurrency=1)),
+        global_config=OrchestratorConfig(
+            fleet_supervisor=FleetSupervisorConfig(fleet_lane_concurrency=1)
+        ),
         repos=("owner/repo1", "owner/repo2", "owner/repo3"),
         work_only=True,
         deadline_seconds=100,
@@ -190,7 +192,9 @@ def test_fleet_loop_deadline_rotates_last_seen(
 
     fleet_loop(
         fleet_dir_override=str(fleet_dir_path),
-        global_config=OrchestratorConfig(supervisor=SupervisorConfig(fleet_lane_concurrency=1)),
+        global_config=OrchestratorConfig(
+            fleet_supervisor=FleetSupervisorConfig(fleet_lane_concurrency=1)
+        ),
         repos=None,
         work_only=True,
         deadline_seconds=100,

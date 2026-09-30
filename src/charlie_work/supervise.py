@@ -1279,7 +1279,7 @@ def _pull_ci_fleet_sibling(
     Deploy-clone half of issue #552: ``self_deploy`` only ever pulls the
     orchestrator checkout, so a dedicated daemon layout's editable ``ci_fleet``
     sibling would otherwise freeze at clone time, silently. Gated by
-    ``supervisor.self_deploy_pull_ci_fleet`` (default false -- in a dev layout
+    ``fleet_supervisor.self_deploy_pull_ci_fleet`` (default false -- in a dev layout
     the sibling is a working repo whose HEAD must never be moved out from
     under a session).
 

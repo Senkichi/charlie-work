@@ -19,6 +19,7 @@ from _fleet_dispatch_fixtures import (
 )
 from charlie_work import layout
 from charlie_work.config import (
+    FleetSupervisorConfig,
     OrchestratorConfig,
     SupervisorConfig,
 )
@@ -202,8 +203,8 @@ def test_run_fleet_supervise_zero_pass_streak_never_fires_with_empty_registry(
             poll_interval_seconds=5,
             full_pass_interval_seconds=1,
             active_cooldown_seconds=7,
-            zero_pass_alarm=3,
-        )
+        ),
+        fleet_supervisor=FleetSupervisorConfig(zero_pass_alarm=3),
     )
     mock_load_config.return_value = cfg
 
@@ -277,8 +278,8 @@ def test_run_fleet_supervise_zero_pass_streak_replays_851_outage_shape(
             poll_interval_seconds=5,
             full_pass_interval_seconds=1,
             active_cooldown_seconds=7,
-            zero_pass_alarm=3,
-        )
+        ),
+        fleet_supervisor=FleetSupervisorConfig(zero_pass_alarm=3),
     )
     mock_load_config.return_value = cfg
 
@@ -369,8 +370,8 @@ def test_run_fleet_supervise_zero_pass_streak_resets_after_repo_work(
             poll_interval_seconds=5,
             full_pass_interval_seconds=1,
             active_cooldown_seconds=7,
-            zero_pass_alarm=3,
-        )
+        ),
+        fleet_supervisor=FleetSupervisorConfig(zero_pass_alarm=3),
     )
     mock_load_config.return_value = cfg
     state_path = layout.state_file_path(layout.default_state_root(isolated_root))

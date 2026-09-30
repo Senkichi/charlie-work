@@ -794,6 +794,50 @@ supervisor:
   max_runtime_minutes: 0           # 0 = unlimited
 ```
 
+The knobs only `charlie fleet supervise` reads — pass deadline, lane
+concurrency, reap cadence, alarm thresholds, self-deploy sibling-pull and
+starvation bounds — live under `fleet_supervisor:` (issue #1978). That
+section is **host-wide only**, like `runner_allocation:` /
+`runner_capacity_escalation:`: declare it in the global fleet layer
+(`<fleet_dir>/config.yaml` — see "Where this section lives in the layered
+config" below), never in a per-repo `orchestrator.config.yaml`, where it is
+rejected with `ConfigError`.
+
+```yaml
+# <fleet_dir>/config.yaml — knobs only `charlie fleet supervise` reads
+fleet_supervisor:
+  # Bounds one fleet pass's wall-clock; the wedge watchdog treats a heartbeat
+  # older than 3x this as a wedged supervisor.
+  max_pass_runtime_seconds: 1800
+  # Max per-repo lanes one fleet pass runs concurrently (issue #1934).
+  # <= 0 falls back to the built-in default; 1 restores serial lanes.
+  fleet_lane_concurrency: 8
+  # Cadence of the out-of-band dead-reviewer-claim reap sweep (issue #1934).
+  # <= 0 disables the scheduler.
+  reap_sweep_interval_seconds: 300
+  # Consecutive-failure/streak thresholds before an events.db alarm entry
+  # fires; 0 disables each alarm.
+  self_deploy_failure_alarm: 3
+  zero_pass_alarm: 3
+  wedge_kill_loop_alarm: 3
+  # When true, self-deploy also FF-pulls the declared ci-fleet sibling
+  # (dedicated deploy clones only — see issue #552).
+  self_deploy_pull_ci_fleet: false
+  # Upper bound on how long a deferred self-deploy `uv sync` may stay pending
+  # under live workers before the supervisor drains dispatch (issue #1855).
+  # <= 0 disables the bound.
+  dependency_sync_starvation_seconds: 14400
+```
+
+During the migration window the legacy `supervisor.<key>` spellings still
+parse in *either* layer — emitting `config_key_deprecated_read`, removal
+tracked by #1979. Each layer resolves `fleet_supervisor` > `supervisor`
+before the repo-over-global merge: both spellings disagreeing inside one
+file is a `ConfigError` naming both, while a repo layer's leftover
+`supervisor.<key>` that disagrees with the global `fleet_supervisor.<key>`
+simply wins that key (the ordinary repo-wins rule) — deterministic, and
+visible in the deprecation events until the legacy key is deleted.
+
 ### Detection latency
 
 - **Local events** (worker exits/starts, verdict files written): detected within
