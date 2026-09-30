@@ -42,6 +42,7 @@ from .dead_dispatched_timer import (
 from .github import GitHubError, GitHubLike, label_names
 from .labels import TransitionOutcome
 from .local_lane import branch_diff_result, local_base_branch, probe_branch_ref
+from .local_noop_rework_rearm import rearm_no_op_local_rework
 from .paths import resolved_layout, runtime_paths
 from .rework_prompts import _write_text_atomic
 from .state import PASSIVE_OPEN_STATUS, load_state, load_state_locked, state_lock
@@ -109,6 +110,13 @@ def park_unpublishable_work(
     """
     if publishes_pull_requests(gh):
         return None
+
+    # Issue #2094: a rework worker that died without moving the branch must
+    # re-arm (or escalate), never park -- nothing selects a parked issue whose
+    # head equals the verdict's reviewed head.
+    rearmed = rearm_no_op_local_rework(gh, config, repo_root, branch, issue_number, write_gate)
+    if rearmed is not None:
+        return rearmed
 
     result = write_gate.transition(gh, config.labels, issue_number, "local_work_ready")
     label_ok = write_gate.dry_run or result.outcome is TransitionOutcome.APPLIED
