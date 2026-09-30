@@ -125,7 +125,8 @@ def _reap_review_verdicts(self, reviews_dir: Path) -> dict[str, Any]:
                 # Issue #1354: read the reviewer's exit code from the
                 # durable terminal-status record (written by
                 # ``start_terminal_status_watcher`` in
-                # ``launch_claude_worker``) so the terminating-cause
+                # ``launch_claude_worker`` and -- since #2052 --
+                # ``launch_devin_session``) so the terminating-cause
                 # extractor can fold it into the ``cause`` field of the
                 # ``review_verdict_missed`` payload. The terminal-status
                 # watcher is now started for review launches too (see

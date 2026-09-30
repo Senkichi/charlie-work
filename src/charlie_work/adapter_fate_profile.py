@@ -35,6 +35,13 @@ class AdapterFateProfile:
     # existing update_worker_record_with_failure_classification /
     # update_session_record_with_failure_classification sidecar writer.
     over_budget: Callable[[WorkerView, OrchestratorConfig], bool] | None  # api only
+    # Issue #2052: whether this harness's launcher runs the terminal-status
+    # watcher (process_utils.start_terminal_status_watcher) that leaves a
+    # durable ``issue-<n>.<suffix>.terminal.json`` when the spawned process
+    # exits. True for every Popen-backed harness (claude-code, api,
+    # devin-shell); command and manual never spawn a worker process, so
+    # there is nothing to watch.
+    writes_terminal_record: bool
 
 
 _PROFILES: dict[str, AdapterFateProfile] | None = None
@@ -98,6 +105,7 @@ def _build_profiles() -> dict[str, AdapterFateProfile]:
             headless_permission_detection=False,
             record_failure=_devin_record_failure,
             over_budget=None,
+            writes_terminal_record=True,
         ),
         "claude-code": AdapterFateProfile(
             harness="claude-code",
@@ -106,6 +114,7 @@ def _build_profiles() -> dict[str, AdapterFateProfile]:
             headless_permission_detection=True,
             record_failure=_claude_code_record_failure,
             over_budget=None,
+            writes_terminal_record=True,
         ),
         "api": AdapterFateProfile(
             harness="api",
@@ -114,6 +123,7 @@ def _build_profiles() -> dict[str, AdapterFateProfile]:
             headless_permission_detection=True,
             record_failure=_api_record_failure,
             over_budget=_api_over_budget,
+            writes_terminal_record=True,
         ),
         # "command" and "manual" have no failure-classification or budget
         # consumer today: dead_worker_reap.py's 14 sites never branch on
@@ -132,6 +142,7 @@ def _build_profiles() -> dict[str, AdapterFateProfile]:
             headless_permission_detection=False,
             record_failure=None,
             over_budget=None,
+            writes_terminal_record=False,
         ),
         "manual": AdapterFateProfile(
             harness="manual",
@@ -140,6 +151,7 @@ def _build_profiles() -> dict[str, AdapterFateProfile]:
             headless_permission_detection=False,
             record_failure=None,
             over_budget=None,
+            writes_terminal_record=False,
         ),
     }
     # N6 (wf-review-opus.md): an explicit raise, not a bare `assert` --
