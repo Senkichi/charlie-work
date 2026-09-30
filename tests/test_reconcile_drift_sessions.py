@@ -805,6 +805,46 @@ def test_apply_fixes_dead_worker_failure_kind_stamps_issue_entry() -> None:
     assert "dead_worker_failure_kind" not in state["issues"]["42"]
 
 
+def test_apply_fixes_dead_worker_failure_kind_goes_through_persist_failure() -> None:
+    """The stamp is written by ``worker_fate.persist_failure`` (with its
+    ``classified_at``), leaves the throttle window to its own drift item, and
+    keeps ``new_state["issues"]`` aliased so the items applied AFTER it still
+    land in the returned state."""
+    config = OrchestratorConfig()
+    gh = FakeGitHub(prs=[], issues=[])
+    state = empty_state()
+    state["issues"]["42"] = {"status": "dispatched"}
+    state["issues"]["43"] = {"status": "dispatched"}
+
+    drift = [
+        DriftItem(
+            kind="dead_worker_failure_kind",
+            issue_number=42,
+            pr_number=None,
+            detail="issue #42 dead worker classified failure_kind=rate_limited",
+            fix_actions=("stamp dead_worker_failure_kind=rate_limited",),
+            failure_kind="rate_limited",
+        ),
+        DriftItem(
+            kind="dead_worker_failure_kind",
+            issue_number=43,
+            pr_number=None,
+            detail="issue #43 dead worker classified failure_kind=stalled",
+            fix_actions=("stamp dead_worker_failure_kind=stalled",),
+            failure_kind="stalled",
+        ),
+    ]
+
+    new_state = apply_fixes(gh, state, drift, config)
+
+    assert new_state["issues"]["42"]["dead_worker_failure_kind"] == "rate_limited"
+    assert new_state["issues"]["42"]["dead_worker_failure_classified_at"].endswith("Z")
+    # The item applied after the first one is not lost to a re-bound mapping.
+    assert new_state["issues"]["43"]["dead_worker_failure_kind"] == "stalled"
+    # The throttle window is not this item's business.
+    assert not new_state.get("throttled_until")
+
+
 def test_apply_fixes_dead_worker_failure_kind_noop_for_untracked_issue() -> None:
     """Issue #1917: a ``dead_worker_failure_kind`` item for an issue with
     no state entry must not invent one — an untracked session has no

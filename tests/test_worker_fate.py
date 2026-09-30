@@ -33,9 +33,12 @@ from charlie_work.worker_fate import (
     TerminalEvidence,
     Throttled,
     is_alive,
+    persist_failure,
+    persisted_failure,
     resolve_fate,
     stale_evidence_events,
     stale_evidence_key,
+    throttle_failure,
 )
 from charlie_work.worker import WorkerHealth
 
@@ -817,3 +820,115 @@ def test_stale_evidence_key_distinguishes_source_and_written_at() -> None:
     key_a = stale_evidence_key(fate_a.basis.stale[0])
     key_b = stale_evidence_key(fate_b.basis.stale[0])
     assert key_a != key_b
+
+
+# --------------------------------------------------------------------------
+# Rule 6, write side: ``persist_failure`` is the single primitive; read side:
+# the persisted stamp is fed back as evidence so ``Throttled`` is reachable.
+# --------------------------------------------------------------------------
+
+_STATE = {
+    "throttled_until": None,
+    "issues": {"7": {"status": "dispatched", "branch_name": "b"}, "8": {"status": "queued"}},
+}
+
+
+def test_failure_evidence_from_classification_parses_classifier_iso() -> None:
+    failure = FailureEvidence.from_classification(
+        "rate_limited", "2026-01-01T12:15:00Z", fresh=True
+    )
+    assert failure.kind == "rate_limited"
+    assert failure.throttled_until == datetime(2026, 1, 1, 12, 15, tzinfo=UTC)
+    assert failure.fresh is True
+    assert (
+        FailureEvidence.from_classification("stalled", None, fresh=False).throttled_until is None
+    )
+
+
+def test_persist_failure_writes_cooldown_and_kind_together_without_mutating() -> None:
+    before = {"throttled_until": None, "issues": {"7": {"status": "dispatched"}}}
+    failure = FailureEvidence.from_classification(
+        "rate_limited", "2026-01-01T12:15:00Z", fresh=True
+    )
+
+    new = persist_failure(before, 7, failure, adapter_kind="devin", now=NOW)
+
+    assert new["throttled_until"] == "2026-01-01T12:15:00Z"  # round-trips, never recomputed
+    assert new["throttle_reason"] == "rate_limited"
+    assert new["throttle_adapter_kind"] == "devin"
+    entry = new["issues"]["7"]
+    assert entry["status"] == "dispatched"
+    assert entry["dead_worker_failure_kind"] == "rate_limited"
+    assert entry["dead_worker_failure_classified_at"] == "2026-01-01T12:10:00Z"
+    assert before == {"throttled_until": None, "issues": {"7": {"status": "dispatched"}}}
+
+
+def test_persist_failure_without_cooldown_leaves_throttled_until_alone() -> None:
+    state = {"throttled_until": "2030-01-01T00:00:00Z", "issues": {"7": {"status": "dispatched"}}}
+    failure = FailureEvidence(kind="stalled", throttled_until=None, fresh=True)
+
+    new = persist_failure(state, 7, failure, adapter_kind="claude-code", now=NOW)
+
+    assert new["throttled_until"] == "2030-01-01T00:00:00Z"
+    assert new["issues"]["7"]["dead_worker_failure_kind"] == "stalled"
+
+
+def test_persist_failure_never_invents_an_issue_entry() -> None:
+    failure = FailureEvidence(kind="rate_limited", throttled_until=None, fresh=True)
+    new = persist_failure(_STATE, 999, failure, adapter_kind=None, now=NOW)
+    assert "999" not in new["issues"]
+
+
+def test_persist_failure_with_no_kind_stamps_nothing() -> None:
+    failure = FailureEvidence(kind=None, throttled_until=None, fresh=True)
+    assert persist_failure(_STATE, 7, failure, adapter_kind=None, now=NOW) == _STATE
+
+
+def test_persisted_failure_round_trips_the_stamp_and_feeds_evidence() -> None:
+    failure = FailureEvidence(kind="rate_limited", throttled_until=None, fresh=True)
+    entry = persist_failure(_STATE, 7, failure, adapter_kind=None, now=NOW)["issues"]["7"]
+
+    persisted = persisted_failure(entry)
+
+    assert persisted.kind == "rate_limited"
+    assert persisted.is_throttle is True
+    assert persisted.classified_at == NOW
+    assert persisted.as_evidence() == FailureEvidence(
+        kind="rate_limited", throttled_until=None, fresh=False
+    )
+    assert persisted_failure({}).as_evidence() is None
+    assert persisted_failure({}).classified_at is None
+
+
+def test_persisted_throttle_makes_throttled_reachable_for_a_dead_worker() -> None:
+    entry = {"dead_worker_failure_kind": "rate_limited"}
+    fate = resolve_fate(_evidence(failure=persisted_failure(entry).as_evidence()), now=NOW)
+    assert isinstance(fate, Throttled)
+    assert fate.basis.rule == "R6"
+    assert throttle_failure(fate) is fate.failure
+
+
+def test_throttle_failure_reads_throttle_kinds_off_carrying_variants_only() -> None:
+    throttle = FailureEvidence(kind="rate_limited", throttled_until=None, fresh=False)
+    other = FailureEvidence(kind="stalled", throttled_until=None, fresh=False)
+
+    crashed = resolve_fate(
+        _evidence(
+            failure=throttle,
+            worktree_outcome=_outcome(outcome="completed", push_succeeded=False),
+        ),
+        now=NOW,
+    )
+    assert isinstance(crashed, Crashed)
+    assert throttle_failure(crashed) is throttle
+
+    stranded = resolve_fate(_evidence(failure=throttle, branch=_branch(unpushed=2)), now=NOW)
+    assert isinstance(stranded, Stranded)
+    assert throttle_failure(stranded) is throttle
+
+    assert throttle_failure(resolve_fate(_evidence(failure=other), now=NOW)) is None
+    assert throttle_failure(resolve_fate(_evidence(), now=NOW)) is None
+    live = resolve_fate(_evidence(pid_alive=True, failure=throttle), now=NOW)
+    assert isinstance(live, Live)
+    assert throttle_failure(live) is None
+    assert throttle_failure(None) is None

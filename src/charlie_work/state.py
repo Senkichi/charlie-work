@@ -1025,7 +1025,11 @@ def set_throttled_until(
 
 
 def record_dead_worker_failure_kind(
-    data: dict[str, Any], issue_number: int, failure_kind: str
+    data: dict[str, Any],
+    issue_number: int,
+    failure_kind: str,
+    *,
+    classified_at: str | None = None,
 ) -> dict[str, Any]:
     """Stamp a dead worker's classified ``failure_kind`` onto its issue entry.
 
@@ -1046,6 +1050,14 @@ def record_dead_worker_failure_kind(
     rest of this module's value helpers, this is a pure update: it returns
     a new top-level mapping (with new ``issues``/entry mappings) and never
     mutates the caller's ``data``.
+
+    ``classified_at`` (ISO timestamp) is stamped alongside the kind as
+    ``dead_worker_failure_classified_at`` so a read-side consumer can tell
+    how old the classification is. It is cleared with the kind.
+
+    Callers outside this module and ``worker_fate.py`` must not call this
+    directly: ``worker_fate.persist_failure`` is the single write primitive
+    (pinned by ``tests/test_worker_fate_seam.py``).
     """
     issues = data.get("issues")
     if not isinstance(issues, dict):
@@ -1054,12 +1066,12 @@ def record_dead_worker_failure_kind(
     entry = issues.get(issue_key)
     if not isinstance(entry, dict):
         return data
+    stamped = {**entry, "dead_worker_failure_kind": failure_kind}
+    if classified_at is not None:
+        stamped["dead_worker_failure_classified_at"] = classified_at
     return {
         **data,
-        "issues": {
-            **issues,
-            issue_key: {**entry, "dead_worker_failure_kind": failure_kind},
-        },
+        "issues": {**issues, issue_key: stamped},
     }
 
 
@@ -1084,6 +1096,7 @@ def clear_dead_worker_failure_kind(entry: dict[str, Any]) -> None:
     classification and is dropped with it.
     """
     entry.pop("dead_worker_failure_kind", None)
+    entry.pop("dead_worker_failure_classified_at", None)
     entry.pop("throttle_reap_rearm_count", None)
 
 

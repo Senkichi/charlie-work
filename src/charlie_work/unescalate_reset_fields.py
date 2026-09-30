@@ -124,6 +124,8 @@ UNESCALATE_ISSUE_RESET_FIELDS = (
     # exempt a later, genuinely different death from the orphan-sweep
     # timed reap and redispatch cap.
     "dead_worker_failure_kind",
+    # Companion of the stamp above (when it was classified; wf-r2-s4).
+    "dead_worker_failure_classified_at",
     # Issue #1993: companion of the stamp above (bounded re-arm counter).
     "throttle_reap_rearm_count",
     # Issue #2002: ``worker_death_failure_kinds`` (the per-death timestamp ->

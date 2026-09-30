@@ -1960,7 +1960,14 @@ def _detect_and_handle_orphaned_workers(
                         open_pr_number=None,
                         pr_known=True,
                     ),
-                    failure=None,
+                    # Rule 6, read-through-fate: the persisted classification
+                    # (stamped by the reap/classifier lanes via
+                    # ``worker_fate.persist_failure``) is fed back in as
+                    # evidence so a throttle death resolves to ``Throttled``
+                    # and the zero-artifact guard below reads it off the fate.
+                    failure=worker_fate.persisted_failure(
+                        entry if isinstance(entry, dict) else {}
+                    ).as_evidence(),
                 ),
                 now=now,
             )
@@ -2091,8 +2098,7 @@ def _detect_and_handle_orphaned_workers(
             # artifacts because the provider refused it, not because the
             # work loops -- it must not trip this guard (2026-09-29: #1983
             # escalated twice in 11 minutes on ``rate_limited`` deaths).
-            orphan_entry = state["issues"].get(str(issue_number))
-            throttle_death = worker_fate.persisted_failure(orphan_entry or {}).is_throttle
+            throttle_death = worker_fate.throttle_failure(fates.get(issue_number)) is not None
             if not throttle_death and _is_zero_artifact_dispatch_loop(sessions_dir, issue_number):
                 label_write_ok = True
                 for label in sorted(active_labels):

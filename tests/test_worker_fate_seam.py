@@ -152,3 +152,100 @@ def test_the_allow_listed_files_still_use_the_literal() -> None:
         assert f'"{_TARGET_KEY}"' in path.read_text(encoding="utf-8"), (
             f"allow-listed file no longer references the literal key: {name}"
         )
+
+
+# --------------------------------------------------------------------------
+# Write side (B7 / rule 6, wf-r2-s4): ``worker_fate.persist_failure`` is the
+# single write primitive. The read guard above confines *reads* of the raw key;
+# this confines *writes* the same way.
+# --------------------------------------------------------------------------
+
+_WRITE_PRIMITIVE = "record_dead_worker_failure_kind"
+
+
+def _raw_write_lines(tree: ast.AST) -> list[int]:
+    """Line numbers of any raw write of the ``dead_worker_failure_kind`` stamp.
+
+    Flags three shapes: a call to ``record_dead_worker_failure_kind`` (by bare
+    or attribute name), a subscript *assignment* to the key
+    (``entry["dead_worker_failure_kind"] = ...``), and a dict-literal key
+    (``{**entry, "dead_worker_failure_kind": kind}``). Clears
+    (``entry.pop``/``del entry[...]``, ``clear_dead_worker_failure_kind``) and
+    the ``UNESCALATE_ISSUE_RESET_FIELDS`` tuple of field *names* are different
+    AST shapes and stay legal -- resetting is not writing a classification.
+    """
+    lines: list[int] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            func = node.func
+            name = (
+                func.id
+                if isinstance(func, ast.Name)
+                else func.attr
+                if isinstance(func, ast.Attribute)
+                else None
+            )
+            if name == _WRITE_PRIMITIVE:
+                lines.append(node.lineno)
+        elif (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.ctx, ast.Store)
+            and isinstance(node.slice, ast.Constant)
+            and node.slice.value == _TARGET_KEY
+        ):
+            lines.append(node.lineno)
+        elif isinstance(node, ast.Dict):
+            for key in node.keys:
+                if isinstance(key, ast.Constant) and key.value == _TARGET_KEY:
+                    lines.append(key.lineno)
+    return lines
+
+
+def test_dead_worker_failure_kind_writes_are_confined_to_persist_primitive() -> None:
+    """Only ``state.py`` (the field's owner) and ``worker_fate.py`` (which owns
+    ``persist_failure``) may write the stamp; every other writer -- the reap
+    sites, ``dead_worker_classification``, ``reconcile`` -- calls
+    ``worker_fate.persist_failure``.
+    """
+    root = _src_root()
+    offenders: dict[str, list[int]] = {}
+    for path in sorted(root.rglob("*.py")):
+        if path.name in _ALLOWED_FILES:
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        lines = _raw_write_lines(tree)
+        if lines:
+            offenders[str(path.relative_to(root))] = lines
+
+    assert offenders == {}, (
+        "raw 'dead_worker_failure_kind' writes outside the allow-list -- route "
+        f"through worker_fate.persist_failure() instead: {offenders}"
+    )
+
+
+def test_the_write_guard_catches_every_raw_write_shape() -> None:
+    """Positive control, one snippet per shape -- including the exact shapes the
+    pre-s4 ``dead_worker_reap.py`` / ``dead_worker_classification.py`` /
+    ``reconcile.py`` used -- so an empty offenders dict above cannot mean the
+    detector stopped detecting.
+    """
+    call = ast.parse("state = record_dead_worker_failure_kind(state, n, kind)")
+    attr_call = ast.parse("state = st.record_dead_worker_failure_kind(state, n, kind)")
+    subscript = ast.parse('entry["dead_worker_failure_kind"] = failure_kind')
+    dict_literal = ast.parse('new[k] = {**existing, "dead_worker_failure_kind": kind}')
+
+    for snippet in (call, attr_call, subscript, dict_literal):
+        assert _raw_write_lines(snippet) == [1]
+
+
+def test_the_write_guard_allows_clears_and_field_name_tuples() -> None:
+    """Negative control: resets are not writes, and neither is naming the field."""
+    for source in (
+        'entry.pop("dead_worker_failure_kind", None)',
+        'del entry["dead_worker_failure_kind"]',
+        "clear_dead_worker_failure_kind(entry)",
+        'FIELDS = ("dead_worker_failure_kind", "other")',
+        'DriftItem(kind="dead_worker_failure_kind", failure_kind=kind)',
+        'x = entry.get("dead_worker_failure_kind")',
+    ):
+        assert _raw_write_lines(ast.parse(source)) == [], source

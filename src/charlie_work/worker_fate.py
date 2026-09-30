@@ -39,9 +39,12 @@ call ``classify_for``.
 ``FateEvidence.failure`` is supplied by the caller as already-classified
 data — ``resolve_fate`` only ever reads ``FailureEvidence.kind``/
 ``throttled_until``, never produces them. ``stale_evidence_events`` reports
-rule 1's ignored evidence; the ``record_dead_worker_failure_kind`` writes in
-``dead_worker_reap.py`` are still direct (a later step of the round-2 plan
-moves them behind one persist primitive).
+rule 1's ignored evidence. Rule 6's write side is :func:`persist_failure`, the
+single primitive every ``dead_worker_failure_kind`` writer goes through
+(``dead_worker_reap``, ``dead_worker_classification``, ``reconcile``); its
+read side feeds the persisted kind back in as ``FateEvidence.failure``
+(``PersistedFailure.as_evidence``) so ``Throttled`` is reachable, and
+:func:`throttle_failure` reads the throttle decision off the fate.
 
 ``is_alive`` is the single liveness seam (design doc A2): the per-adapter
 ``claude_code.is_worker_alive`` / ``devin_shell.is_session_alive`` wrappers
@@ -64,6 +67,10 @@ from typing import Any, Literal
 
 from .config import OrchestratorConfig
 from .process_utils import is_pid_alive as _process_is_pid_alive
+from .state import (
+    record_dead_worker_failure_kind,
+    set_throttled_until,
+)
 from .state import parse_iso_timestamp as _state_parse_iso_timestamp
 from .throttle_signatures import (
     PERMISSION_DENIED_FAILURE_KIND,
@@ -162,6 +169,23 @@ class FailureEvidence:
     kind: str | None  # rate_limited|quota_exhausted|provider_suspended|provider_auth|...|None
     throttled_until: datetime | None
     fresh: bool  # True = classified from the log this pass; False = persisted fallback
+
+    @classmethod
+    def from_classification(
+        cls, kind: str | None, throttled_until_iso: str | None, *, fresh: bool
+    ) -> FailureEvidence:
+        """Build from an adapter classifier's ``(failure_kind, throttled_until_iso)``.
+
+        The classifier reports the cooldown end as an ISO string; parsing it
+        here keeps ``throttled_until`` a real ``datetime`` for consumers,
+        while :func:`persist_failure` formats it back in the classifier's own
+        canonical form so the persisted value round-trips unchanged.
+        """
+        return cls(
+            kind=kind,
+            throttled_until=_state_parse_iso_timestamp(throttled_until_iso),
+            fresh=fresh,
+        )
 
 
 @dataclass(frozen=True)
@@ -1146,6 +1170,55 @@ def stale_evidence_events(
     return events
 
 
+def _format_utc_z(moment: datetime) -> str:
+    """The canonical persisted timestamp form (matches ``state.utc_now`` and
+    the classifier's ``throttled_until``): UTC, whole seconds, ``Z`` suffix."""
+    aware = moment.replace(tzinfo=UTC) if moment.tzinfo is None else moment.astimezone(UTC)
+    return aware.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def persist_failure(
+    state: dict[str, Any],
+    issue_number: int,
+    failure: FailureEvidence,
+    *,
+    adapter_kind: str | None,
+    now: datetime,
+) -> dict[str, Any]:
+    """Rule 6, write side: the single primitive that persists a classified failure.
+
+    Every writer of ``dead_worker_failure_kind`` (the three ``dead_worker_reap``
+    sites, ``dead_worker_classification`` and ``reconcile``) goes through this
+    function -- pinned by ``tests/test_worker_fate_seam.py``. It replaces the
+    former paired ``set_throttled_until`` + ``record_dead_worker_failure_kind``
+    calls so the cooldown and the epoch-scoped kind stamp can never drift apart.
+
+    Pure: returns a new state, never mutates ``state``. ``failure.throttled_until``
+    is written verbatim (formatted, never recomputed -- #1993/#1997 keep the
+    rearm window and emission anchor in the classifier); a ``None`` value leaves
+    ``throttled_until`` alone, so a caller that must not touch the fleet-wide
+    cooldown (the stall site, ``reconcile``'s separate throttle item) passes a
+    failure without one. The kind stamp is a no-op when the issue has no entry
+    (never invents one) or when ``failure.kind`` is ``None``.
+    """
+    new_state = state
+    if failure.throttled_until is not None:
+        new_state = set_throttled_until(
+            new_state,
+            _format_utc_z(failure.throttled_until),
+            reason=failure.kind,
+            adapter_kind=adapter_kind,
+        )
+    if failure.kind is not None:
+        new_state = record_dead_worker_failure_kind(
+            new_state,
+            issue_number,
+            failure.kind,
+            classified_at=_format_utc_z(now),
+        )
+    return new_state
+
+
 @dataclass(frozen=True)
 class PersistedFailure:
     """Read-side view of the persisted ``dead_worker_failure_kind`` (§6).
@@ -1155,11 +1228,23 @@ class PersistedFailure:
     (``tests/test_worker_fate_seam.py``) AST-walks ``src/`` and fails if a
     ``.get("dead_worker_failure_kind")`` call or a
     ``[...]["dead_worker_failure_kind"]`` read appears outside ``state.py``
-    (the field's owner) and this module.
+    (the field's owner) and this module. Writes are confined the same way
+    (:func:`persist_failure`).
     """
 
     kind: str | None
     is_throttle: bool
+    classified_at: datetime | None = None
+
+    def as_evidence(self) -> FailureEvidence | None:
+        """The persisted classification as ``FateEvidence.failure`` (``fresh=False``).
+
+        ``throttled_until`` is deliberately ``None``: the cooldown window lives
+        in ``state["throttled_until"]`` and is never re-derived from the stamp.
+        """
+        if self.kind is None:
+            return None
+        return FailureEvidence(kind=self.kind, throttled_until=None, fresh=False)
 
 
 def persisted_failure(entry: Mapping[str, Any]) -> PersistedFailure:
@@ -1168,5 +1253,27 @@ def persisted_failure(entry: Mapping[str, Any]) -> PersistedFailure:
     Never raises: a missing or malformed entry yields ``PersistedFailure(None,
     False)``, the same as no persisted classification existing at all.
     """
-    kind = entry.get("dead_worker_failure_kind") if isinstance(entry, Mapping) else None
-    return PersistedFailure(kind=kind, is_throttle=is_provider_throttle_failure(kind))
+    if not isinstance(entry, Mapping):
+        return PersistedFailure(kind=None, is_throttle=False)
+    kind = entry.get("dead_worker_failure_kind")
+    return PersistedFailure(
+        kind=kind,
+        is_throttle=is_provider_throttle_failure(kind),
+        classified_at=parse_iso_timestamp(entry.get("dead_worker_failure_classified_at")),
+    )
+
+
+def throttle_failure(fate: WorkerFate | None) -> FailureEvidence | None:
+    """The provider-throttle failure a fate carries, else ``None``.
+
+    Rule 6, read-through-fate: a dead worker's throttle classification reaches
+    consumers as part of the fate (``Throttled``, or ``Stranded``/``Crashed``
+    when a higher-precedence row decided first but still carried the failure),
+    so the zero-artifact guard (#1993) reads it off the fate instead of
+    re-reading the raw stamp.
+    """
+    if isinstance(fate, Throttled | Stranded | Crashed):
+        failure = fate.failure
+        if failure is not None and is_provider_throttle_failure(failure.kind):
+            return failure
+    return None

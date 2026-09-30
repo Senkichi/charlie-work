@@ -131,7 +131,6 @@ from .rework_prompts import _write_rework_prompt
 from .state import (
     load_state,
     load_state_locked,
-    record_dead_worker_failure_kind,
     set_throttled_until,
     state_lock,
 )
@@ -534,7 +533,7 @@ def _detect_and_handle_stalled_sessions(
         real_activity_probe_for,
         update_worker_log_stat,
     )
-    from .worker_fate import profile_for
+    from .worker_fate import FailureEvidence, persist_failure, profile_for
 
     if not config.watchdog.enabled:
         return []
@@ -862,9 +861,20 @@ def _detect_and_handle_stalled_sessions(
                 # entry so the state.json-keyed orphan sweep — which runs
                 # after this sidecar is gone — can exempt provider-throttle
                 # deaths from its timed reap and redispatch cap.
+                #
+                # ``throttled_until=None``: the cooldown (if any) was already
+                # armed by the stall-site ``set_throttled_until`` above, which
+                # deliberately never stamped a kind (design §9 FLIP 6
+                # boundary); this write only adds the kind stamp.
                 if resolved_failure_kind is not None:
-                    state = record_dead_worker_failure_kind(
-                        state, w.issue_number, resolved_failure_kind
+                    state = persist_failure(
+                        state,
+                        w.issue_number,
+                        FailureEvidence(
+                            kind=resolved_failure_kind, throttled_until=None, fresh=True
+                        ),
+                        adapter_kind=w.adapter_kind,
+                        now=now,
                     )
                 state = write_gate.append_event(
                     state,
@@ -1799,12 +1809,12 @@ def _classify_dead_sessions_and_update_throttle_state(
     """
     write_gate = require_write_gate(write_gate)
     from .post_mortem import classify_and_record
-    from .state import load_state, set_throttled_until, state_lock
+    from .state import load_state, state_lock
     from .worker import (
         is_worker_confirmed_dead,
         iter_workers,
     )
-    from .worker_fate import profile_for
+    from .worker_fate import FailureEvidence, persist_failure, profile_for
     from .worker_literal_tmp import emit_literal_tmp_path_warning
     from .worktree import WorktreeState
 
@@ -1872,23 +1882,24 @@ def _classify_dead_sessions_and_update_throttle_state(
             if failure_kind:
                 with state_lock(state_file):
                     state = load_state(state_file)
-                    if throttled_until:
-                        # A throttle-caused launch failure must persist its
-                        # window just like the dead-session branch below —
-                        # otherwise the governor relaunches straight into
-                        # the same throttled provider.
-                        state = set_throttled_until(
-                            state,
-                            throttled_until,
-                            reason=failure_kind,
-                            adapter_kind=w.adapter_kind,
-                        )
+                    # A throttle-caused launch failure must persist its
+                    # window just like the dead-session branch below —
+                    # otherwise the governor relaunches straight into
+                    # the same throttled provider.
                     # Issue #1917: persist the classification on the issue
                     # entry — same stamp the dead-session branch writes —
                     # so the state.json-keyed orphan sweep can exempt
                     # provider-throttle outcomes from its timed reap and
                     # orphan-redispatch cap after the sidecar is reaped.
-                    state = record_dead_worker_failure_kind(state, w.issue_number, failure_kind)
+                    state = persist_failure(
+                        state,
+                        w.issue_number,
+                        FailureEvidence.from_classification(
+                            failure_kind, throttled_until, fresh=True
+                        ),
+                        adapter_kind=w.adapter_kind,
+                        now=now_for_health,
+                    )
                     write_gate.save_state(state)
 
             if (
@@ -2106,20 +2117,21 @@ def _classify_dead_sessions_and_update_throttle_state(
             if failure_kind:
                 with state_lock(state_file):
                     state = load_state(state_file)
-                    if throttled_until:
-                        # Update state with throttle window
-                        state = set_throttled_until(
-                            state,
-                            throttled_until,
-                            reason=failure_kind,
-                            adapter_kind=w.adapter_kind,
-                        )
+                    # Update state with the throttle window (if any) and
                     # Issue #1917: persist the classification on the issue
                     # entry so the state.json-keyed orphan sweep — which
                     # runs after the sidecar is reaped just below — can
                     # exempt provider-throttle deaths from its timed reap
                     # and orphan-redispatch cap.
-                    state = record_dead_worker_failure_kind(state, w.issue_number, failure_kind)
+                    state = persist_failure(
+                        state,
+                        w.issue_number,
+                        FailureEvidence.from_classification(
+                            failure_kind, throttled_until, fresh=True
+                        ),
+                        adapter_kind=w.adapter_kind,
+                        now=now_for_health,
+                    )
                     write_gate.save_state(state)
 
             # Reap the sidecar to prevent phantom sessions from PID recycling (issue #113)
