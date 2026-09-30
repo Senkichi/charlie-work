@@ -32,17 +32,10 @@ from .throttle_signatures import match_throttle_tail
 CAUSE_UNKNOWN: dict[str, Any] = {"cause": "unknown"}
 
 # Retained ONLY for backward-compatible re-export (``workflow.py``'s
-# LOAD-BEARING re-export block re-exports every name here, including this
-# one, so an external import/monkeypatch target must keep resolving). No
-# longer used internally: architecture-deepening candidate 3 ("markdown
-# structure") rewired ``_extract_verdict_from_text`` onto
-# ``markdown_fence.scan``, which fixes exactly the class of defect this
-# comment used to describe (a fence opened with an unrecognized tag
-# desyncing the nearest-pair regex) plus more (tilde fences, unclosed
-# fences running to EOF instead of vanishing) -- see
-# ``tests/test_markdown_structure_characterization.py``'s
-# ``test_flip_verdict_parsing_*`` tests for the pinned-then-flipped
-# behavior.
+# LOAD-BEARING re-export block re-exports every name here, so an external
+# import/monkeypatch target must keep resolving). No longer used internally:
+# ``_extract_verdict_from_text`` now uses ``markdown_fence.scan`` (see
+# ``tests/test_markdown_structure_characterization.py``).
 _VERDICT_FENCE_RE = re.compile(r"```(?:[a-zA-Z0-9_+-]*)\s*\n(.*?)```", re.DOTALL)
 
 # Absolute path ending in .md, as reviewers reference their summary files in
