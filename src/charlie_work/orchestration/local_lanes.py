@@ -43,6 +43,13 @@ from charlie_work.worker_pid_stamp import stamp_worker_process
 from charlie_work.adapters import SessionRequest
 from charlie_work.claude_code import resolve_review_effort
 from charlie_work.fleet_registry import try_acquire_fleet_lock
+from charlie_work.worker_launch_gate import (
+    REASON_CONCURRENCY_CAP,
+    WorkerLaunchDeferral,
+    WorkerLaunchPermit,
+    _launch_workers,
+    issue_worker_launch_permit,
+)
 from charlie_work.github import GitHubError
 from charlie_work.janitor import check_operator_containment, check_test_adequacy
 from charlie_work.labels import TransitionOutcome
@@ -1494,41 +1501,31 @@ def _local_dispatch_rework(self) -> dict[str, Any]:
     if not candidates:
         return result
 
-    # Issue #2039: the three launch gates the remote rework lane applies
-    # (misc_worker_dispatch.dispatch_rework -> _dispatch_rework_impl), in the
-    # same order. Without them a no-remote repo's rework launched through a
-    # provider-throttle / operator-hold cooldown and uncounted against the
-    # fleet-wide Devin cap. A deferred candidate stays ``rework_requested``.
-    if _wf.is_throttled(state):
+    # Issue #2039 / #2041: the shared worker-launch gate the remote lanes use
+    # (fleet lock -> concurrency governor -> provider throttle). Without it a
+    # no-remote repo's rework launched through a provider-throttle /
+    # operator-hold cooldown and uncounted against the fleet-wide Devin cap.
+    # The permit acquires (and on exit releases) the fleet lock itself, held
+    # across governor -> claim -> launch. A deferred candidate stays
+    # ``rework_requested``.
+    decision = issue_worker_launch_permit(self, len(candidates), acquire=try_acquire_fleet_lock)
+    if isinstance(decision, WorkerLaunchDeferral):
         return _defer_local_rework(
-            self,
-            result,
-            candidates,
-            "provider_throttled",
-            throttled_until=state.get("throttled_until"),
+            self, result, candidates, decision.reason, **decision.report_fields()
         )
-    fleet_lock = None
-    if self.config.fleet.global_max_concurrent_sessions > 0:
-        fleet_lock = try_acquire_fleet_lock(self.fleet_dir_override)
-        if fleet_lock is None:
-            return _defer_local_rework(self, result, candidates, "fleet_lock_held")
-    try:
-        gov = self._apply_concurrency_governor(len(candidates))
-        if gov.dispatch_limit < len(candidates):
+    with decision as permit:
+        if permit.max_launches < len(candidates):
             _defer_local_rework(
                 self,
                 result,
-                candidates[max(0, gov.dispatch_limit) :],
-                "concurrency_cap",
-                **gov.report_fields(),
+                candidates[permit.max_launches :],
+                REASON_CONCURRENCY_CAP,
+                **permit.governor.report_fields(),
             )
-            candidates = candidates[: max(0, gov.dispatch_limit)]
+            candidates = candidates[: permit.max_launches]
         if not candidates:
             return result
-        return _launch_local_rework(self, state, candidates, result)
-    finally:
-        if fleet_lock is not None:
-            fleet_lock.release()
+        return _launch_local_rework(self, state, candidates, result, permit)
 
 
 def _defer_local_rework(
@@ -1555,7 +1552,11 @@ def _defer_local_rework(
 
 
 def _launch_local_rework(
-    self, state: dict[str, Any], candidates: list[int], result: dict[str, Any]
+    self,
+    state: dict[str, Any],
+    candidates: list[int],
+    result: dict[str, Any],
+    permit: WorkerLaunchPermit,
 ) -> dict[str, Any]:
     """Claim and launch the gated local rework candidates."""
     requests: list[SessionRequest] = []
@@ -1617,13 +1618,7 @@ def _launch_local_rework(
     dispatch_results = list(superseded_failures)
     if launch_requests:
         dispatch_results.extend(
-            _wf.dispatch_sessions(
-                self.repo_root,
-                self._layout.session_manifest,
-                self._layout.session_results,
-                self._adapter_settings(),
-                launch_requests,
-            )
+            _launch_workers(self, permit, self._adapter_settings(), launch_requests)
         )
     successful = {r.issue_number for r in dispatch_results if r.ok}
     failed_map = {
