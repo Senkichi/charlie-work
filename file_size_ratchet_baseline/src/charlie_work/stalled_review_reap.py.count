@@ -1,1 +1,10 @@
-1400
+1600
+# Issue #2086: +6 lines for the `adapter_kind` kwarg on
+# _set_reviewer_quota_exhausted_with_backoff, the `reason`/`adapter_kind`
+# provenance keys it stamps on the reviewer_quota record, and the sweep call
+# site that passes the dead session's adapter. The provenance must be written
+# where the quota record is built (same function, same lock) so
+# role_selection.window_covered can attribute a per-repo window to a skipped
+# chain entry; it cannot be extracted without splitting the record write.
+# Reviewed mark raise to the next MARK_QUANTUM multiple above the live count
+# (1406 -> 1600).

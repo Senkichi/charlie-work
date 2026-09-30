@@ -80,6 +80,7 @@ from .fleet_supervisor_config import (  # noqa: F401  (deliberate re-export)
 
 from . import layout
 from .harnesses import REVIEWER_HARNESSES, WORKER_HARNESSES
+from .role_chain import RoleEntry, chain_of, normalize_role_section, warn_same_family
 from .issue_comments import DEFAULT_INCLUDED_ASSOCIATIONS as DEFAULT_COMMENT_ASSOCIATIONS
 
 logger = logging.getLogger(__name__)
@@ -1682,6 +1683,8 @@ class WorkerRoleConfig:
 
     harness: str = "manual"
     model: str = ""
+    fallbacks: tuple[RoleEntry, ...] = ()  # issue #2086: role chain, see role_chain.py
+    chain = property(chain_of)
 
 
 @dataclass(frozen=True)
@@ -1707,6 +1710,8 @@ class ReviewerRoleConfig:
     effort: str = ""
     effort_experiment_fraction: float = 0.0
     effort_experiment_salt: str = ""
+    fallbacks: tuple[RoleEntry, ...] = ()  # issue #2086: role chain, see role_chain.py
+    chain = property(chain_of)
 
     def __post_init__(self) -> None:
         if self.harness not in REVIEWER_HARNESSES:
@@ -3743,7 +3748,10 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
             rescue_reviewer_data = {}
         rescue_data["reviewer"] = WorkerRoleConfig(**rescue_reviewer_data)
     rescue = _build_section(RescueConfig, "rescue", rescue_data)
-    worker = _build_section(WorkerRoleConfig, "worker", _section(data, "worker"))
+    worker_data = normalize_role_section(
+        WorkerRoleConfig, "worker", _section(data, "worker"), WORKER_HARNESSES
+    )
+    worker = _build_section(WorkerRoleConfig, "worker", worker_data)
     # Harness membership is enforced here, at the top-level worker build site,
     # rather than in WorkerRoleConfig.__post_init__: the dataclass is reused
     # for rescue.worker/rescue.reviewer above, and rescue.reviewer's own
@@ -3756,7 +3764,11 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
             "config section 'worker' key 'harness' must be one of "
             f"{sorted(WORKER_HARNESSES)}, got {worker.harness!r}"
         )
-    reviewer = _build_section(ReviewerRoleConfig, "reviewer", _section(data, "reviewer"))
+    reviewer_data = normalize_role_section(
+        ReviewerRoleConfig, "reviewer", _section(data, "reviewer"), REVIEWER_HARNESSES
+    )
+    reviewer = _build_section(ReviewerRoleConfig, "reviewer", reviewer_data)
+    warn_same_family(worker, reviewer)
     watchdog_data = _section(data, "watchdog")
     terminal_error_markers = watchdog_data.get("terminal_error_markers")
     if terminal_error_markers is not None:
