@@ -11,10 +11,11 @@ over gathered evidence, so every rule is testable as a decision table with no
 fakes, no ``tmp_path`` and no git.
 
 Shape (design doc section 1, "Shape A: a pure resolver over gathered
-evidence"):
-
-    evidence = gather_evidence(subject, readers, now=now)   # thin I/O
-    fate     = resolve_fate(evidence, now=now)               # pure, 9 rules
+evidence"): every consumer already does its own reads (some under a lock)
+and builds a ``FateEvidence`` by hand; ``resolve_fate`` is the pure, 9-rule
+decision over it. The originally planned evidence-gathering reader bundle was
+deleted (wf-r2-s1): wiring it in would only add a second ``ls-remote``/outcome
+read per candidate.
 
 ``process_utils.is_pid_alive`` stays the liveness primitive, unchanged,
 including its asymmetric fail-open/fail-closed behaviour; ``is_alive`` here
@@ -33,15 +34,12 @@ rule 6, so it is no longer a per-profile flag); ``AdapterFateProfile``/
 ``_classify_session_failure`` duplicates in ``claude_code.py`` /
 ``devin_shell.py`` (now thin wrappers around ``classify_failure``).
 
-Still deliberately NOT in this commit (see the design doc §6 and the
-plan's Group A/B tables): ``persisted_failure``/``persist_fate``/
-``stale_evidence_events`` (they depend on a fate-resolution loop actually
-running over ``dead_worker_reap.py``'s workers, which is Group B, not this
-wiring step — the 3 direct ``record_dead_worker_failure_kind`` calls stay
-in place), and ``default_readers`` production wiring. Until then,
-``FateEvidence.failure`` is still supplied by the caller (or a test) as
-already-classified data — ``resolve_fate`` only ever reads
-``FailureEvidence.kind``/``throttled_until``, never produces them.
+``FateEvidence.failure`` is supplied by the caller as already-classified
+data — ``resolve_fate`` only ever reads ``FailureEvidence.kind``/
+``throttled_until``, never produces them. ``stale_evidence_events`` reports
+rule 1's ignored evidence; the ``record_dead_worker_failure_kind`` writes in
+``dead_worker_reap.py`` are still direct (a later step of the round-2 plan
+moves them behind one persist primitive).
 
 ``is_worker_alive`` (claude_code.py) / ``is_session_alive`` (devin_shell.py)
 are deliberately NOT touched by this commit either, despite being the
@@ -57,9 +55,6 @@ effective while ``is_worker_alive``'s body keeps calling its own module's
 outside this commit's file list) is left for its own step, where the
 monkeypatch can be updated deliberately alongside the body change instead
 of as a side effect of this one.
-
-No consumer resolves a full ``WorkerFate`` yet (Group B). Wiring happens
-in later commits named after the plan's Group A/B steps.
 """
 
 from __future__ import annotations
@@ -145,9 +140,10 @@ class TerminalEvidence:
 
 @dataclass(frozen=True)
 class BranchEvidence:
-    """Local/remote branch state. Two differently-named ``ahead`` fields:
-    ``remote_ahead`` (pushed commits, rules 3/9) and ``unpushed`` (rules
-    3/9's "stranded" count) are never the same field under two names.
+    """Local/remote branch state. Three differently-named ``ahead`` fields:
+    ``remote_ahead`` (pushed commits, rules 3/9), ``unpushed`` (rules 3/9's
+    proven-"stranded" count) and ``local_ahead`` (local vs base only, N5) are
+    never the same field under two names.
     """
 
     has_remote: bool  # False on no-remote repos (Park lane)
@@ -156,6 +152,11 @@ class BranchEvidence:
     unpushed: int | None  # local HEAD ahead of remote (or of base if never pushed)
     open_pr_number: int | None  # from gh pr_list; None = no open PR
     pr_known: bool  # False when the PR lookup was not done or failed
+    local_ahead: int | None = None
+    # Local HEAD ahead of base; says nothing about the remote (N5). Used only
+    # by row 6 when the remote is unknown, so a consumer that does no remote
+    # read (dispatch-time routing) can still surface stranded-or-unknown work
+    # without pretending the count is proven-unpushed.
 
 
 @dataclass(frozen=True)
@@ -171,11 +172,10 @@ class FailureEvidence:
 
 @dataclass(frozen=True)
 class FateEvidence:
-    """Everything ``resolve_fate`` needs. Gathered once per pass by
-    ``gather_evidence``; consumers that already hold some of it (the
-    with-PR lane already has ``live_head_sha``, the no-PR lane already has
-    ``pr_by_issue``) may build it directly instead, to avoid a double
-    ``ls-remote`` during migration.
+    """Everything ``resolve_fate`` needs. Each consumer builds it from the
+    reads it already does (the with-PR lane already has ``live_head_sha``,
+    the no-PR lane already has ``pr_by_issue``), so no second ``ls-remote``
+    runs on behalf of the resolver.
     """
 
     issue_number: int
@@ -242,7 +242,7 @@ class PushedWithoutPr:
 @dataclass(frozen=True)
 class Stranded:
     basis: FateBasis
-    unpushed: int
+    unpushed: int  # commits not proven on the remote
     park: bool  # not branch.has_remote
     failure: FailureEvidence | None
 
@@ -454,8 +454,8 @@ def _completed_or_pushed(
 
 def resolve_fate(evidence: FateEvidence, *, now: datetime) -> WorkerFate:  # noqa: ARG001
     """Resolve one worker's fate. Pure: no I/O, no clock read (``now`` is
-    accepted for interface symmetry with ``gather_evidence``/``worker_fate``
-    and future use by a rule that needs it; none of the current nine do).
+    accepted for interface symmetry and future use by a rule that needs it;
+    none of the current nine do).
 
     First match wins, evaluated only after step 0 (freshness, rules 1/7)
     picks the winning outcome candidate. See the design doc §3 for the
@@ -534,6 +534,26 @@ def resolve_fate(evidence: FateEvidence, *, now: datetime) -> WorkerFate:  # noq
             failure=evidence.failure,
         )
 
+    # Row 6, remote unknown (N5): the consumer did no remote read (or it
+    # failed), so local commits cannot be split into pushed vs unpushed. They
+    # are still commits not proven on the remote, so they are stranded --
+    # under a distinct rule so an event reader can tell the count is
+    # unverified. A known remote (any of remote_ahead/remote_head_sha) makes
+    # ``local_ahead`` irrelevant: rows 8/9 read the remote evidence instead.
+    if (
+        branch.unpushed is None
+        and branch.remote_ahead is None
+        and branch.remote_head_sha is None
+        and branch.local_ahead is not None
+        and branch.local_ahead > 0
+    ):
+        return Stranded(
+            basis=basis("R3+R9-remote-unknown"),
+            unpushed=branch.local_ahead,
+            park=not branch.has_remote,
+            failure=evidence.failure,
+        )
+
     # Row 7 (R6): dead, no fresh outcome, a provider throttle classified it.
     if (
         outcome is None
@@ -581,108 +601,6 @@ def resolve_fate(evidence: FateEvidence, *, now: datetime) -> WorkerFate:  # noq
 
     # Row 10: otherwise, a dead worker with nothing to credit or salvage.
     return Crashed(basis=basis("R10"), failure=evidence.failure)
-
-
-# --------------------------------------------------------------------------
-# Evidence gathering (§4). The only laziness: the remote branch read runs
-# only when the PID is dead or a candidate outcome claims a push.
-# --------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class WorkerSubject:
-    """What ``gather_evidence`` needs to know about one dispatched worker."""
-
-    issue_number: int
-    adapter: str
-    pid: int | None
-    process_start_time: float | None
-    dispatched_at: datetime | None
-    worktree_path: str | None
-    branch: str | None
-    log_path: str | None
-
-
-@dataclass(frozen=True)
-class FateReaders:
-    """A bundle of plain callables. Each returns a plain value (or ``None``
-    on failure -- readers never raise) and takes no arguments beyond what
-    is bound in by the caller (typically via ``functools.partial`` or a
-    closure over ``subject``). Kept this shallow on purpose: the decision
-    logic lives entirely in ``resolve_fate``, never behind this bundle.
-    """
-
-    pid_alive: Callable[[], bool]
-    health: Callable[[], WorkerHealth | None]
-    terminal_record: Callable[[], TerminalEvidence | None]
-    worktree_outcome: Callable[[], OutcomeEvidence | None]
-    branch: Callable[[bool], BranchEvidence]  # arg: whether to do the remote read
-    log_tail: Callable[[], str | None]
-    persisted_failure_kind: Callable[[], FailureEvidence | None]
-
-
-def _claims_push(outcome: OutcomeEvidence | None) -> bool:
-    return outcome is not None and outcome.push_succeeded is True
-
-
-def gather_evidence(
-    subject: WorkerSubject, readers: FateReaders, *, now: datetime
-) -> FateEvidence:  # noqa: ARG001
-    """Read exactly what ``resolve_fate`` needs, in cost order (§4):
-
-    1. ``pid_alive``
-    2. ``health`` (alive only)
-    3. ``terminal_record``
-    4. ``worktree_outcome``
-    5. ``branch``: local ``unpushed`` always; the remote read (``ls-remote``,
-       ``remote_ahead``) only when the PID is dead **or** a candidate
-       outcome claims ``push_succeeded`` -- the one place this function is
-       lazy, pinned by the gather-policy tests below.
-    6. ``log_tail`` (dead only) -- kept as raw evidence; classifying it into
-       a ``FailureEvidence`` is the adapter seam (design doc §7), not built
-       yet, so a dead worker's ``failure`` currently comes only from
-       ``persisted_failure_kind`` (step 7).
-    7. ``persisted_failure_kind`` (dead only, no fresh classification yet)
-
-    ``now`` is accepted for interface symmetry with ``resolve_fate`` /
-    ``worker_fate`` and so a future reader can be handed a frozen clock;
-    none of the current readers need it directly (each closes over its own
-    clock if it needs one).
-    """
-    pid_alive = readers.pid_alive()
-    health = readers.health() if pid_alive else None
-    terminal = readers.terminal_record()
-    worktree_outcome = readers.worktree_outcome()
-
-    wants_remote = (
-        (not pid_alive)
-        or _claims_push(terminal.outcome if terminal else None)
-        or _claims_push(worktree_outcome)
-    )
-    branch = readers.branch(wants_remote)
-
-    failure: FailureEvidence | None = None
-    if not pid_alive:
-        readers.log_tail()  # read for future classification; not yet interpreted here
-        failure = readers.persisted_failure_kind()
-
-    return FateEvidence(
-        issue_number=subject.issue_number,
-        adapter=subject.adapter,
-        dispatched_at=subject.dispatched_at,
-        pid_alive=pid_alive,
-        health=health,
-        terminal=terminal,
-        worktree_outcome=worktree_outcome,
-        branch=branch,
-        failure=failure,
-    )
-
-
-def worker_fate(subject: WorkerSubject, readers: FateReaders, *, now: datetime) -> WorkerFate:
-    """Convenience: gather, then resolve."""
-    evidence = gather_evidence(subject, readers, now=now)
-    return resolve_fate(evidence, now=now)
 
 
 # --------------------------------------------------------------------------
@@ -896,8 +814,6 @@ class AdapterFateProfile:
 
     harness: str  # key in harnesses.HARNESS_REGISTRY / WORKER_HARNESSES
     view_kinds: frozenset[str]  # WorkerView.adapter_kind spellings ("devin" for devin-shell)
-    writes_terminal_record: bool  # claude-code, api: True; devin-shell: False (follow-up)
-    probes_process: bool  # manual: False (no PID); others: True
     account_error_detection: bool  # api only: provider_suspended / provider_auth
     record_failure: Callable[..., tuple[str | None, str | None]] | None
     # (sessions_dir, issue_number, *, fallback_kind, config, now) -> the
@@ -940,8 +856,6 @@ def _build_profiles() -> dict[str, AdapterFateProfile]:
         "devin-shell": AdapterFateProfile(
             harness="devin-shell",
             view_kinds=frozenset({"devin"}),
-            writes_terminal_record=False,
-            probes_process=True,
             account_error_detection=False,
             record_failure=update_session_record_with_failure_classification,
             over_budget=None,
@@ -949,8 +863,6 @@ def _build_profiles() -> dict[str, AdapterFateProfile]:
         "claude-code": AdapterFateProfile(
             harness="claude-code",
             view_kinds=frozenset({"claude-code"}),
-            writes_terminal_record=True,
-            probes_process=True,
             account_error_detection=False,
             record_failure=partial(
                 update_worker_record_with_failure_classification, adapter_kind="claude-code"
@@ -960,8 +872,6 @@ def _build_profiles() -> dict[str, AdapterFateProfile]:
         "api": AdapterFateProfile(
             harness="api",
             view_kinds=frozenset({"api"}),
-            writes_terminal_record=True,
-            probes_process=True,
             account_error_detection=True,
             record_failure=partial(
                 update_worker_record_with_failure_classification, adapter_kind="api"
@@ -981,8 +891,6 @@ def _build_profiles() -> dict[str, AdapterFateProfile]:
         "command": AdapterFateProfile(
             harness="command",
             view_kinds=frozenset({"command"}),
-            writes_terminal_record=False,
-            probes_process=True,
             account_error_detection=False,
             record_failure=None,
             over_budget=None,
@@ -990,8 +898,6 @@ def _build_profiles() -> dict[str, AdapterFateProfile]:
         "manual": AdapterFateProfile(
             harness="manual",
             view_kinds=frozenset({"manual"}),
-            writes_terminal_record=False,
-            probes_process=False,
             account_error_detection=False,
             record_failure=None,
             over_budget=None,
@@ -1037,9 +943,8 @@ def profile_for(adapter_kind: str) -> AdapterFateProfile | None:
 
 # --------------------------------------------------------------------------
 # Group B shared helpers: consumers build ``FateEvidence`` from data they
-# already hold (design doc §8) rather than going through ``gather_evidence``,
-# so no double ``ls-remote`` runs during migration. These two are the pieces
-# every consumer site needs and none of them should reimplement.
+# already hold (design doc §8), so no double ``ls-remote`` runs. These are the
+# pieces every consumer site needs and none of them should reimplement.
 # --------------------------------------------------------------------------
 
 

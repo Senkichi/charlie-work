@@ -222,7 +222,6 @@ def collect_stale_live_handoff_pids(
             "worker_outcome": worker_outcome,
             "worker_pid": live_entry.get("worker_pid"),
             "outcome_age_minutes": outcome_age.total_seconds() / 60,
-            "fate": fate,
         }
     return candidates
 

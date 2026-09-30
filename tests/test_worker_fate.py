@@ -5,7 +5,7 @@ asserts the returned ``WorkerFate`` variant -- no fakes, no ``tmp_path``, no
 git, per the design doc's Shape A rationale (``wf-design.md`` §1). Tests are
 grouped by which of the nine named flip rules (plan §"Candidate decisions")
 they pin, plus the freshness step (rules 1/7) they all sit behind, plus the
-separate ``gather_evidence`` laziness policy (design doc §4) and ``is_alive``.
+``is_alive``.
 
 Nothing here is wired to a consumer yet (that is Group B in the plan); these
 tests exercise the module's own public interface only.
@@ -25,7 +25,6 @@ from charlie_work.worker_fate import (
     EvidenceSource,
     FailureEvidence,
     FateEvidence,
-    FateReaders,
     Live,
     OutcomeEvidence,
     PushedWithoutPr,
@@ -33,13 +32,10 @@ from charlie_work.worker_fate import (
     Stranded,
     TerminalEvidence,
     Throttled,
-    WorkerSubject,
-    gather_evidence,
     is_alive,
     resolve_fate,
     stale_evidence_events,
     stale_evidence_key,
-    worker_fate,
 )
 from charlie_work.worker import WorkerHealth
 
@@ -55,6 +51,7 @@ def _branch(
     remote_head_sha: str | None = None,
     remote_ahead: int | None = None,
     unpushed: int | None = None,
+    local_ahead: int | None = None,
     open_pr_number: int | None = None,
     pr_known: bool = False,
 ) -> BranchEvidence:
@@ -63,6 +60,7 @@ def _branch(
         remote_head_sha=remote_head_sha,
         remote_ahead=remote_ahead,
         unpushed=unpushed,
+        local_ahead=local_ahead,
         open_pr_number=open_pr_number,
         pr_known=pr_known,
     )
@@ -339,6 +337,34 @@ def test_row6_dead_with_unpushed_commits_is_stranded() -> None:
     fate = resolve_fate(evidence, now=NOW)
     assert isinstance(fate, Stranded)
     assert fate.unpushed == 3
+
+
+def test_row6_remote_unknown_local_ahead_is_stranded_with_remote_unknown_rule() -> None:
+    """N5: no remote read (``remote_ahead``/``remote_head_sha``/``unpushed`` all
+    unknown) but local commits exist -> Stranded under a distinct rule."""
+    evidence = _evidence(pid_alive=False, branch=_branch(local_ahead=2, has_remote=False))
+    fate = resolve_fate(evidence, now=NOW)
+    assert isinstance(fate, Stranded)
+    assert fate.unpushed == 2
+    assert fate.park is True
+    assert fate.basis.rule == "R3+R9-remote-unknown"
+
+
+def test_row6_local_ahead_ignored_when_remote_known() -> None:
+    """``local_ahead`` says nothing about the remote: once the remote is known
+    (here ``remote_ahead == 0``) it must not strand anything."""
+    evidence = _evidence(pid_alive=False, branch=_branch(local_ahead=2, remote_ahead=0))
+    fate = resolve_fate(evidence, now=NOW)
+    assert isinstance(fate, Crashed)
+    # A known remote head alone also rules the remote-unknown rule out.
+    evidence = _evidence(pid_alive=False, branch=_branch(local_ahead=2, remote_head_sha="abc"))
+    assert isinstance(resolve_fate(evidence, now=NOW), Crashed)
+    # And a proven ``unpushed`` count wins under the ordinary row-6 rule.
+    evidence = _evidence(pid_alive=False, branch=_branch(local_ahead=5, unpushed=1))
+    fate = resolve_fate(evidence, now=NOW)
+    assert isinstance(fate, Stranded)
+    assert fate.unpushed == 1
+    assert fate.basis.rule == "R3+R9"
 
 
 def test_row6_stranded_carries_throttle_failure_ahead_of_row7() -> None:
@@ -701,160 +727,6 @@ def test_n7_outcome_evidence_raw_is_immutable_against_caller_mutation() -> None:
     # `raw` itself must refuse direct mutation.
     with pytest.raises(TypeError):
         evidence.raw["head_sha"] = "mutated"  # type: ignore[index]
-
-
-# --------------------------------------------------------------------------
-# gather_evidence: the laziness policy (design doc §4) -- the remote branch
-# read runs only when the PID is dead or a candidate outcome claims a push.
-# --------------------------------------------------------------------------
-
-
-class _Recorder:
-    def __init__(self) -> None:
-        self.branch_calls: list[bool] = []
-        self.health_called = False
-        self.log_tail_called = False
-        self.persisted_failure_called = False
-
-    def readers(
-        self,
-        *,
-        pid_alive: bool,
-        terminal=None,
-        worktree_outcome: OutcomeEvidence | None = None,
-        branch: BranchEvidence | None = None,
-        persisted_failure: FailureEvidence | None = None,
-    ) -> FateReaders:
-        branch = branch if branch is not None else _branch()
-
-        def _pid_alive() -> bool:
-            return pid_alive
-
-        def _health() -> WorkerHealth | None:
-            self.health_called = True
-            return WorkerHealth.HEALTHY
-
-        def _terminal_record():
-            return terminal
-
-        def _worktree_outcome():
-            return worktree_outcome
-
-        def _branch_reader(wants_remote: bool) -> BranchEvidence:
-            self.branch_calls.append(wants_remote)
-            return branch
-
-        def _log_tail() -> str | None:
-            self.log_tail_called = True
-            return None
-
-        def _persisted_failure_kind() -> FailureEvidence | None:
-            self.persisted_failure_called = True
-            return persisted_failure
-
-        return FateReaders(
-            pid_alive=_pid_alive,
-            health=_health,
-            terminal_record=_terminal_record,
-            worktree_outcome=_worktree_outcome,
-            branch=_branch_reader,
-            log_tail=_log_tail,
-            persisted_failure_kind=_persisted_failure_kind,
-        )
-
-
-def _subject(**overrides) -> WorkerSubject:
-    defaults = dict(
-        issue_number=1,
-        adapter="claude-code",
-        pid=123,
-        process_start_time=1.0,
-        dispatched_at=DISPATCHED,
-        worktree_path="/tmp/wt",
-        branch="agent/1",
-        log_path="/tmp/wt/worker.log",
-    )
-    defaults.update(overrides)
-    return WorkerSubject(**defaults)
-
-
-def test_gather_alive_no_claims_skips_remote_read() -> None:
-    rec = _Recorder()
-    evidence = gather_evidence(_subject(), rec.readers(pid_alive=True), now=NOW)
-    assert rec.branch_calls == [False]
-    assert evidence.pid_alive is True
-    assert evidence.health is WorkerHealth.HEALTHY
-
-
-def test_gather_alive_but_terminal_claims_push_reads_remote() -> None:
-    rec = _Recorder()
-    terminal = _terminal(
-        ended_at=AFTER, outcome=_outcome(source=EvidenceSource.TERMINAL, push_succeeded=True)
-    )
-    gather_evidence(_subject(), rec.readers(pid_alive=True, terminal=terminal), now=NOW)
-    assert rec.branch_calls == [True]
-
-
-def test_gather_alive_but_worktree_claims_push_reads_remote() -> None:
-    rec = _Recorder()
-    outcome = _outcome(push_succeeded=True)
-    gather_evidence(_subject(), rec.readers(pid_alive=True, worktree_outcome=outcome), now=NOW)
-    assert rec.branch_calls == [True]
-
-
-def test_gather_dead_always_reads_remote_even_with_no_claims() -> None:
-    rec = _Recorder()
-    gather_evidence(_subject(), rec.readers(pid_alive=False), now=NOW)
-    assert rec.branch_calls == [True]
-
-
-def test_gather_alive_skips_health_when_dead() -> None:
-    rec = _Recorder()
-    gather_evidence(_subject(), rec.readers(pid_alive=False), now=NOW)
-    assert rec.health_called is False
-
-
-def test_gather_dead_reads_log_tail_and_persisted_failure() -> None:
-    rec = _Recorder()
-    gather_evidence(_subject(), rec.readers(pid_alive=False), now=NOW)
-    assert rec.log_tail_called is True
-    assert rec.persisted_failure_called is True
-
-
-def test_gather_alive_skips_log_tail_and_persisted_failure() -> None:
-    rec = _Recorder()
-    evidence = gather_evidence(_subject(), rec.readers(pid_alive=True), now=NOW)
-    assert rec.log_tail_called is False
-    assert rec.persisted_failure_called is False
-    assert evidence.failure is None
-
-
-def test_gather_carries_subject_fields_into_evidence() -> None:
-    rec = _Recorder()
-    subject = _subject(issue_number=42, adapter="devin-shell")
-    evidence = gather_evidence(subject, rec.readers(pid_alive=True), now=NOW)
-    assert evidence.issue_number == 42
-    assert evidence.adapter == "devin-shell"
-    assert evidence.dispatched_at == DISPATCHED
-
-
-def test_gather_dead_surfaces_persisted_failure_kind() -> None:
-    rec = _Recorder()
-    failure = FailureEvidence(kind="rate_limited", throttled_until=NOW, fresh=False)
-    evidence = gather_evidence(
-        _subject(), rec.readers(pid_alive=False, persisted_failure=failure), now=NOW
-    )
-    assert evidence.failure is failure
-
-
-def test_worker_fate_convenience_gathers_then_resolves() -> None:
-    rec = _Recorder()
-    failure = FailureEvidence(kind="quota_exhausted", throttled_until=NOW, fresh=False)
-    fate = worker_fate(
-        _subject(), rec.readers(pid_alive=False, persisted_failure=failure), now=NOW
-    )
-    assert isinstance(fate, Throttled)
-    assert fate.failure is failure
 
 
 # --------------------------------------------------------------------------

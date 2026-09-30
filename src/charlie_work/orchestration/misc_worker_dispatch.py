@@ -114,27 +114,12 @@ def _route_phantom_live_worker(
         # B5, A11): a dispatched request's issue can never have an open
         # tracked PR (see the docstring above), so `pr_known=True,
         # open_pr_number=None` is a real invariant here, not a guess.
-        # `unpushed` reuses the same local, unverified `ahead_count` the
-        # legacy check below already trusts -- no remote read happens at
-        # dispatch time, so there is no remote-ahead source to split it
-        # from (rule 9 does not apply here).
-        #
-        # N5 (wf-review-opus.md): this IS the exact local-ahead/unpushed
-        # conflation rule 9 exists to remove -- a phantom branch whose
-        # commits are already fully pushed still resolves to `Stranded`
-        # here, same as a genuinely local-only one, because `ahead_count`
-        # (local vs base) does not distinguish "pushed but unmerged" from
-        # "never pushed". Left as-is: behaviour is unchanged from legacy
-        # (not a regression), and `Stranded`'s handling in this function
-        # already routes through the salvage-preserving branch below, so a
-        # misclassified-as-stranded pushed branch is not lost, only
-        # handled less precisely than a remote read would allow. Adding
-        # that remote read here means a new network call on the
-        # dispatch-time routing hot path -- a latency/rate-limit tradeoff
-        # for a caller elsewhere in this same file already avoided on
-        # purpose (see the comment above); left as a follow-up alongside
-        # B8's deferred `_worktree_still_unsafe` flip rather than decided
-        # unilaterally in this pass.
+        # `local_ahead` carries the local, unverified `ahead_count` (local vs
+        # base): no remote read happens at dispatch time, so it cannot be
+        # split into pushed vs unpushed. `unpushed=None` marks that; row 6
+        # resolves a dead worker with local commits and an unknown remote to
+        # `Stranded` (rule "R3+R9-remote-unknown"), which the branch below
+        # preserves for the salvage lane.
         try:
             outcome_mtime = datetime.fromtimestamp(
                 (worktree_path / WORKER_OUTCOME_FILENAME).stat().st_mtime, tz=UTC
@@ -166,7 +151,8 @@ def _route_phantom_live_worker(
                     has_remote=True,
                     remote_head_sha=None,
                     remote_ahead=None,
-                    unpushed=inspection.ahead_count,
+                    unpushed=None,
+                    local_ahead=inspection.ahead_count,
                     open_pr_number=None,
                     pr_known=True,
                 ),

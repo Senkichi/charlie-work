@@ -39,29 +39,11 @@ def test_none_not_in_deterministic_escalation_failure_kinds() -> None:
     assert None not in DETERMINISTIC_ESCALATION_FAILURE_KINDS
 
 
-_NO_EVIDENCE_XFAIL = pytest.mark.xfail(
-    reason=(
-        "worker-fate rule 9 (design doc Sec 9, wf-6-flip): admission into the "
-        "pushed-branch salvage lane now requires resolve_fate to reach "
-        "PushedWithoutPr via git-confirmed evidence -- an invalid/None repo_root "
-        "means remote_branch_ahead_count/remote_branch_head_sha can never run, so "
-        "no evidence can ever exist and the fate always resolves to Crashed. "
-        "_open_pr_for_orphaned_branch is consequently never attempted, so `calls` "
-        "stays empty instead of recording the None-repo_root call this test "
-        "expects. Whether the None-repo_root case should still attempt the PR "
-        "open (trusting the worker's self-report when git evidence-gathering is "
-        "categorically impossible, not merely absent) is an architecture-owner "
-        "call, not a mechanical bug -- see cw-arch-worker-fate wf-7-verify."
-    ),
-    strict=True,
-)
-
-
 @pytest.mark.parametrize(
     ("repo_root_value", "is_valid_path"),
     [
-        pytest.param(None, False, marks=_NO_EVIDENCE_XFAIL, id="repo_root_none"),
-        pytest.param("a/string/path", False, marks=_NO_EVIDENCE_XFAIL, id="repo_root_string"),
+        pytest.param(None, False, id="repo_root_none"),
+        pytest.param("a/string/path", False, id="repo_root_string"),
         pytest.param("tmp_path", True, id="repo_root_path"),
     ],
 )
@@ -73,15 +55,17 @@ def test_orphan_salvage_repo_root_guard(
     """The no-open-PR orphan salvage path narrows ``repo_root`` to ``Path | None``.
 
     ``getattr(gh, "repo_root", None)`` is not statically typed, so a non-``Path``
-    value is treated the same as ``None``: ``_open_pr_for_orphaned_branch`` is
-    still called, but with ``repo_root=None``. The helper already handles ``None``
-    by returning an error, which preserves the pre-#1041 drift/hold semantics for
-    a missing repo root.
+    value is treated the same as ``None``. Since worker-fate rule 9, a missing
+    or invalid repo root means no git evidence can be gathered, and per
+    ``wf-design.md`` section 4 ("An unknown value never proves a push") the
+    worker's self-reported push is not credited: ``_open_pr_for_orphaned_branch``
+    is never called for these cases.
 
-    The invalid cases also serve as a guard test: if the ``isinstance`` narrowing
-    were removed and a string were passed through, the patched helper below
-    raises. The ``path`` case verifies the real ``Path`` is passed through and the
-    worker branch is salvaged into a passively-opened PR.
+    The invalid cases also serve as a guard test: if the fate ever credited the
+    self-report without git evidence, the patched helper below would be called
+    (and raise for a non-``Path``). The ``path`` case verifies the real ``Path``
+    is passed through and the worker branch is salvaged into a passively-opened
+    PR.
 
     worker-fate rule 9 (design doc Sec 9): the ``path`` case needs a real
     pushed branch -- admission into the pushed-branch salvage lane now
@@ -301,13 +285,17 @@ def test_orphan_salvage_repo_root_guard(
         assert issue_state["status"] == PASSIVE_OPEN_STATUS
         assert issue_state["pr_number"] == 101
     else:
-        assert calls == [None]
+        # wf-design.md section 4: "An unknown value never proves a push."
+        # Without a usable repo_root no git evidence can exist, so the
+        # worker's bare self-report (push_succeeded=True) is not credited:
+        # the fate resolves to Crashed, the PR-open helper is never
+        # attempted, and the issue is relabelled for redispatch instead of
+        # being held as pr-create drift.
+        assert calls == []
         assert len(handoff_events) == 0
         assert len(opened_events) == 0
-        assert len(relabel_events) == 0
-        assert len(drift_events) == 1
-        assert drift_events[0]["payload"]["issue_number"] == issue_number
-        assert drift_events[0]["payload"]["branch_name"] == branch
-        # The issue is held as drift, not silently relabeled/reopened.
-        assert issue_state["status"] == "dispatched"
-        assert issue_state.get("orphan_drift_fingerprint") is not None
+        assert len(drift_events) == 0
+        assert len(relabel_events) == 1
+        assert relabel_events[0]["payload"]["issue_number"] == issue_number
+        assert relabel_events[0]["payload"]["reason"] == "dead_worker_no_open_pr_orphan_sweep"
+        assert issue_state.get("orphan_drift_fingerprint") is None
