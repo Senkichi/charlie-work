@@ -74,6 +74,20 @@ stdlib-only; see the notes below before "fixing" one.
   Anything else needing sharing from inside the package still needs the
   reimplement-locally treatment `fleet_dir` and the stale-open-issue-mention
   primitives already get, not a new exception in either file.
+- **`heartbeat_armable_gate.py`** — `check_armable_backlog` and its
+  dependency/sweep gates (issue #2004), extracted out of
+  `heartbeat_check.py` for file-size-ratchet headroom (PR #2023 rework) —
+  relocation only, no behavior change. Loaded by `heartbeat_check.py` via
+  `importlib` from the sibling script path like the siblings below, and
+  re-exported so `hb.check_armable_backlog`/`hb.ARMABLE_*` still resolve.
+  Unlike the other siblings it needs `heartbeat_check` helpers at call time
+  (`run_gh_json`, `get_dispatch_cap`), so the loader block calls its
+  `bind(sys.modules[__name__])` and it reads those helpers off the bound
+  module — keeping `hb.*` monkeypatches effective in tests. It holds two
+  more guarded `charlie_work` leaf imports in the family's set above:
+  `github_body_scan.parse_blockers` and `config_deprecations.DEPRECATED_CONFIG_KEYS`,
+  each degrade-to-no-op with a named caveat on the emitted verdict line.
+  Stdlib-only, same constraint as `heartbeat_check.py`.
 - **`heartbeat_event_alarms.py`** — the five per-repo `events.db` kind/level
   anomaly checks (`check_error_events`, `check_warning_events`,
   `check_infra_blocked_events`, `check_draft_pr_blocked_events`,

@@ -366,7 +366,7 @@ def test_check_armable_backlog_sweep_gate_reads_registry_not_shape(
     entry = DeprecatedConfigKey(
         section="dispatch", key="synthetic", replacement=None, removal_issue=4242
     )
-    monkeypatch.setattr(hb, "_DEPRECATED_CONFIG_KEYS", (entry,))
+    monkeypatch.setattr(hb._armable_gate, "DEPRECATED_CONFIG_KEYS", (entry,))
     repo = _self_repo(hb, tmp_path)
     issues = [_issue_with_body(4242, "")]
     _gh_dispatch(monkeypatch, hb, lambda args, cwd: (True, issues, ""))
@@ -395,8 +395,8 @@ def test_check_armable_backlog_degraded_imports_caveat_on_verdict(
     hb: ModuleType, monkeypatch: Any, tmp_path: Path
 ) -> None:
     """When the #2004 guarded imports are unavailable the verdict line says so."""
-    monkeypatch.setattr(hb, "_parse_blockers", None)
-    monkeypatch.setattr(hb, "_DEPRECATED_CONFIG_KEYS", None)
+    monkeypatch.setattr(hb._armable_gate, "parse_blockers", None)
+    monkeypatch.setattr(hb._armable_gate, "DEPRECATED_CONFIG_KEYS", None)
     repo = _self_repo(hb, tmp_path)
     # #10's body blocker is unevaluated without parse_blockers, so both issues
     # land in armable and the anomaly line must carry both caveats.

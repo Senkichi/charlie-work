@@ -48,6 +48,11 @@ _HEARTBEAT_CHECK = Path(__file__).parent.parent / "scripts" / "heartbeat_check.p
 # static scan below must cover BOTH files: heartbeat_check.py alone no
 # longer contains the import surface a regression would land in.
 _EVENT_ALARMS = Path(__file__).parent.parent / "scripts" / "heartbeat_event_alarms.py"
+# Issue #2004 (PR #2023 rework): check_armable_backlog and its two guarded
+# ``charlie_work`` leaf imports (``github_body_scan.parse_blockers``,
+# ``config_deprecations.DEPRECATED_CONFIG_KEYS`` -- both module-scope leaves)
+# live in this sibling; cover it for the same reason.
+_ARMABLE_GATE = Path(__file__).parent.parent / "scripts" / "heartbeat_armable_gate.py"
 _EVENT_KINDS = Path(__file__).parent.parent / "src" / "charlie_work" / "event_kinds.py"
 
 
@@ -89,7 +94,7 @@ def test_heartbeat_check_never_imports_instrumentation_or_ci_fleet() -> None:
     """
     offenders = sorted(
         f"{path.name}: {name}"
-        for path in (_HEARTBEAT_CHECK, _EVENT_ALARMS)
+        for path in (_HEARTBEAT_CHECK, _EVENT_ALARMS, _ARMABLE_GATE)
         for name in _module_scope_imports(path)
         if name == "ci_fleet"
         or name.startswith("ci_fleet.")
