@@ -444,50 +444,30 @@ def test_module_total_line_count_is_within_the_recorded_cap_band() -> None:
 
 
 def test_orphaned_workers_stays_in_workflow_and_resolves_moved_names_via_facade() -> None:
-    """Proves the facade dependency ``_detect_and_handle_orphaned_workers``
-    relies on actually works, not just that it is claimed in the docstring
-    above.
-
-    AST-extracts ``_detect_and_handle_orphaned_workers``'s source from
-    ``workflow.py``, finds every bare-Name load inside it that matches one
-    of the 27 moved names, and asserts each one resolves as a real
-    ``workflow`` module attribute post-import -- i.e. the facade import
-    block actually populated ``workflow.py``'s own globals with these names.
+    """The sweep entry is now ``dead_worker_sweep.run_orphan_sweep`` (dead-worker
+    sweep rewrite, wave B), re-exported under its historical name so the 32 suite
+    call sites and ``pass_deadline`` keep resolving it at call time. Every moved
+    name must still be a real ``workflow`` module attribute: the sweep's ports and
+    the orchestration modules reach them through ``_wf.<name>``.
     """
     import charlie_work.workflow as workflow
+    from charlie_work.dead_worker_sweep import run_orphan_sweep
 
-    source = _WORKFLOW_PATH.read_text(encoding="utf-8")
-    tree = ast.parse(source, filename=str(_WORKFLOW_PATH))
-    target = next(
-        (
-            node
-            for node in tree.body
-            if isinstance(node, ast.FunctionDef)
-            and node.name == "_detect_and_handle_orphaned_workers"
-        ),
-        None,
-    )
-    assert target is not None, (
-        "_detect_and_handle_orphaned_workers not found as a top-level function in "
-        "workflow.py -- it is supposed to stay there (see module docstring); if it "
-        "moved, this test (and the extraction's central claim) needs updating"
+    assert workflow._detect_and_handle_orphaned_workers is run_orphan_sweep, (
+        "_detect_and_handle_orphaned_workers must be the dead_worker_sweep re-export, "
+        "not a second definition"
     )
 
-    moved_set = set(_MOVED_NAMES)
-    referenced = {
-        node.id
-        for node in ast.walk(target)
-        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id in moved_set
-    }
-    assert referenced, (
-        "_detect_and_handle_orphaned_workers references zero moved names by bare name -- "
-        "either the facade dependency this test exists to verify no longer applies, or "
-        "the derivation above is broken"
-    )
+    tree = ast.parse(_WORKFLOW_PATH.read_text(encoding="utf-8"), filename=str(_WORKFLOW_PATH))
+    redefined = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_detect_and_handle_orphaned_workers"
+    ]
+    assert redefined == [], "workflow.py must re-export the sweep, never define it"
 
-    missing = [n for n in sorted(referenced) if not hasattr(workflow, n)]
+    missing = [n for n in sorted(_MOVED_NAMES) if not hasattr(workflow, n)]
     assert missing == [], (
-        f"_detect_and_handle_orphaned_workers calls these moved names by bare name, but "
-        f"they do not resolve as workflow.py module attributes post-import: {missing} -- "
-        "the facade import block is not populating workflow.py's own globals correctly"
+        f"these moved names do not resolve as workflow.py module attributes post-import: "
+        f"{missing} -- the facade import block is not populating workflow.py's own globals"
     )

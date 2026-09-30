@@ -57,6 +57,7 @@ def make_facts(
     review_available: bool = True,
     repo: RepoFacts | None = None,
     stamp: str = STAMP,
+    now: datetime = NOW,
 ) -> SweepFacts:
     """Facts for ``phase``; ``locked`` is a deepcopy of ``state`` for lock/post."""
     pid_alive = (
@@ -70,7 +71,7 @@ def make_facts(
     )
     return SweepFacts(
         phase=phase,  # type: ignore[arg-type]
-        now=NOW,
+        now=now,
         stamp=stamp,
         config=config or sweep_config(),
         snapshot=copy.deepcopy(dict(state)),
@@ -159,3 +160,75 @@ def drive_all_phases(
     lock = drive(for_phase(pre_facts, "lock"), answers, observed=observed)
     post = drive(for_phase(pre_facts, "post"), answers, observed=observed)
     return pre, lock, post
+
+
+@dataclass(frozen=True)
+class ReapRun:
+    """Result of one timed-backstop (#654) decision for a single dead entry."""
+
+    reaped: bool
+    events: tuple[tuple[str, Mapping[str, Any]], ...]
+    commits: tuple[Any, ...]
+    entry: Mapping[str, Any]  # the draft after the flow: re-arm mutations land here
+
+
+def run_reap(
+    entry: Mapping[str, Any],
+    *,
+    issue: int = 42,
+    pr_data: Mapping[str, Any] | None = None,
+    reap_minutes: float = 60,
+    max_rearms: int = 0,
+    throttled_until: str | None = None,
+    local_park_deferred: Mapping[int, str] | None = None,
+    now: datetime = NOW,
+    exit_code: int | None = None,
+) -> ReapRun:
+    """Drive ``reap_flow`` (the dead-dispatched backstop) for one dispatched entry.
+
+    Replaces direct calls to the old ``maybe_reap_dead_dispatched_worker``: the
+    decision is pure, so the row is "given this entry, PR, throttle window and
+    clock, the backstop escalates / re-arms / defers / stays quiet".
+    """
+    from charlie_work.dead_worker_sweep.decide_common import Draft, LockAcc, run_flow
+    from charlie_work.dead_worker_sweep.decide_reap import reap_flow
+    from charlie_work.dead_worker_sweep.model import (
+        Emit,
+        PreOutcome,
+        ReadTerminal,
+        TerminalFacts,
+    )
+
+    state = state_with({issue: entry})
+    facts = make_facts(
+        state,
+        phase="lock",
+        config=sweep_config(
+            dead_dispatched_reap_minutes=reap_minutes, max_auto_redispatch=max_rearms
+        ),
+        now=now,
+    )
+    pre = PreOutcome(
+        orphans=(issue,),
+        no_pr_orphans=(),
+        pr_by_issue={} if pr_data is None else {issue: pr_data},
+        details={},
+        candidates={},
+        escalations={},
+        deferred=dict(local_park_deferred or {}),
+        reclaim_results={},
+        unreviewed={},
+        live_candidates={},
+        pr_already_open={},
+        salvage_events=(),
+        heads={},
+        early_exit=False,
+        now=now,
+    )
+    draft = Draft(issue, entry)
+    acc = LockAcc(throttled_until=throttled_until)
+    observed = {ReadTerminal(issue): TerminalFacts(exit_code=exit_code, duration_seconds=None)}
+    reaped, commits, pending = run_flow(reap_flow(facts, pre, draft, pr_data, acc), observed)
+    assert pending is None, f"reap flow asked for an unanswered request: {pending!r}"
+    events = tuple((c.kind, c.payload) for c in commits if isinstance(c, Emit))
+    return ReapRun(bool(reaped), events, commits, dict(draft.work))

@@ -459,7 +459,7 @@ def test_preserve_rule6_throttle_exemption_reads_failure_kind_directly(tmp_path:
     event. The new fate module must keep this exemption reachable the same
     way even once the field is read only through a fate accessor.
     """
-    from charlie_work.orphaned_worker_sweep import maybe_reap_dead_dispatched_worker
+    from _dws_facts import run_reap
 
     now = datetime.now(UTC)
     orphan_drift_at = (now - timedelta(hours=2)).isoformat().replace("+00:00", "Z")
@@ -467,31 +467,24 @@ def test_preserve_rule6_throttle_exemption_reads_failure_kind_directly(tmp_path:
         "dead_worker_failure_kind": "rate_limited",
         "orphan_drift_at": orphan_drift_at,
     }
-    state: dict = {
-        "issues": {},
-        "throttled_until": (now + timedelta(minutes=30)).isoformat().replace("+00:00", "Z"),
-    }
-    sweep_events: list = []
 
-    new_state, escalated = maybe_reap_dead_dispatched_worker(
-        state=state,
-        entry=entry,
-        issue_number=9106,
-        sessions_dir=tmp_path / "sessions",
-        pr_data=None,
-        dead_dispatched_reap_minutes=60,
+    run = run_reap(
+        entry,
+        issue=9106,
+        reap_minutes=60,
+        max_rearms=3,
+        throttled_until=(now + timedelta(minutes=30)).isoformat().replace("+00:00", "Z"),
         now=now,
-        sweep_events=sweep_events,
-        max_throttle_rearms=3,
     )
 
-    assert escalated is False
-    assert new_state is state
+    assert run.reaped is False
     # No side effects: the throttled_until-in-future branch returns before
     # ever touching the rearm counter or re-arming orphan_drift_at.
+    assert run.commits == ()
+    assert "throttle_reap_rearm_count" not in run.entry
+    assert run.entry["orphan_drift_at"] == orphan_drift_at
     assert "throttle_reap_rearm_count" not in entry
     assert entry["orphan_drift_at"] == orphan_drift_at
-    assert sweep_events == []
 
 
 # ---------------------------------------------------------------------------

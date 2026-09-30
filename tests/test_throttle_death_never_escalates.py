@@ -22,6 +22,7 @@ from typing import Any
 from unittest.mock import patch
 
 import pytest
+from _dws_facts import run_reap
 
 from charlie_work.config import (
     DevinConfig,
@@ -29,7 +30,6 @@ from charlie_work.config import (
     WatchdogConfig,
     WorkerRoleConfig,
 )
-from charlie_work.orphaned_worker_sweep import maybe_reap_dead_dispatched_worker
 from charlie_work.paths import runtime_paths
 from charlie_work.state import clear_dead_worker_failure_kind, load_state, save_state
 from charlie_work.unescalate_reset_fields import UNESCALATE_ISSUE_RESET_FIELDS
@@ -51,22 +51,27 @@ def _reap(
     pr_data: dict[str, Any] | None = None,
     tmp_path: Path,
 ) -> tuple[dict[str, Any], bool, list[tuple[str, dict[str, Any]]]]:
-    state: dict[str, Any] = {"issues": {"42": entry}, "prs": {}}
-    if throttled_until is not None:
-        state["throttled_until"] = _iso(throttled_until)
-    events: list[tuple[str, dict[str, Any]]] = []
-    state, reaped = maybe_reap_dead_dispatched_worker(
-        state=state,
-        entry=entry,
-        issue_number=42,
-        sessions_dir=tmp_path,
+    """Decide the #654 backstop for ``entry``; return (state view, reaped, events).
+
+    The state view is the entry after the decision: re-arm mutations from the
+    draft, plus the escalation the ``Escalate`` commit asks the shell to apply.
+    """
+    from charlie_work.dead_worker_sweep.model import Escalate
+
+    run = run_reap(
+        entry,
+        issue=42,
         pr_data=pr_data,
-        dead_dispatched_reap_minutes=REAP_MINUTES,
+        reap_minutes=REAP_MINUTES,
+        max_rearms=MAX_REARMS,
+        throttled_until=None if throttled_until is None else _iso(throttled_until),
         now=NOW,
-        sweep_events=events,
-        max_throttle_rearms=MAX_REARMS,
     )
-    return state, reaped, events
+    stored = dict(run.entry)
+    for commit in run.commits:
+        if isinstance(commit, Escalate):
+            stored.update(status="escalated", escalation_reason=commit.reason)
+    return {"issues": {"42": stored}, "prs": {}}, run.reaped, [(k, dict(p)) for k, p in run.events]
 
 
 def _entry(kind: str | None, *, drift_minutes_ago: int, rearms: int = 0) -> dict[str, Any]:

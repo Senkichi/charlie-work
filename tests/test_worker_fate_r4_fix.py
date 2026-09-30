@@ -28,7 +28,6 @@ from charlie_work.state import PASSIVE_OPEN_STATUS, save_state
 from charlie_work.worktree import worktree_path_for_branch
 from charlie_work.write_gate import WriteGate
 from charlie_work.instrumentation import query_events
-from charlie_work.orphaned_worker_sweep import maybe_reap_dead_dispatched_worker
 from charlie_work.process_utils import write_worker_terminal_status
 from charlie_work.state import load_state, parse_iso_timestamp
 
@@ -134,33 +133,22 @@ def test_sweep_emits_stale_evidence_event_for_dropped_stale_terminal_record(
 
 
 def test_dead_dispatched_reap_reports_dropped_stale_terminal_record(tmp_path: Path) -> None:
-    now = datetime.now(UTC)
-    sessions_dir = _write_stale_terminal(tmp_path)
-    entry = {
-        "status": "dispatched",
-        "worker_pid": 99999,
-        "dispatched_at": _iso(now - timedelta(hours=1)),
-        "orphan_drift_at": _iso(now - timedelta(hours=2)),
-    }
-    fates: list[worker_fate.WorkerFate] = []
-
-    _state, reaped = maybe_reap_dead_dispatched_worker(
-        state={"issues": {"207": dict(entry)}, "prs": {}, "events": []},
-        entry=entry,
-        issue_number=207,
-        sessions_dir=sessions_dir,
-        pr_data=None,
-        dead_dispatched_reap_minutes=60,
-        now=now,
-        sweep_events=[],
-        max_throttle_rearms=0,
-        on_fate=fates.append,
+    config, paths, fake_gh, _dispatched_at = _dead_worker_rework_bed(
+        tmp_path, decision="request_changes"
     )
+    now = datetime.now(UTC)
+    _write_stale_terminal(tmp_path)
+    # Drift was first surfaced two hours ago: past the 60-minute #654 grace.
+    state = load_state(paths.state_file)
+    state["issues"]["207"]["orphan_drift_at"] = _iso(now - timedelta(hours=2))
+    save_state(paths.state_file, state)
 
-    assert reaped is True
-    assert [s.source for f in fates for s in f.basis.stale] == [
-        worker_fate.EvidenceSource.TERMINAL
-    ]
+    _run_orphan_sweep(tmp_path, paths, config, fake_gh)
+
+    state = load_state(paths.state_file)
+    assert state["issues"]["207"]["escalation_reason"] == "dead_dispatched_worker_reap"
+    events = query_events(paths.state_file, kind="worker_evidence_stale")
+    assert [e["payload"]["source"] for e in events] == ["terminal"]
 
 
 def test_fresh_terminal_record_reports_only_what_it_drops() -> None:
