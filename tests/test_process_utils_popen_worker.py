@@ -25,14 +25,16 @@ def test_popen_worker_routes_creationflags_through_hidden_console_kwargs(
     sentinel_kwargs = {"creationflags": 0xDEADBEEF}
 
     with patch(
-        "charlie_work.process_utils.hidden_console_kwargs",
+        "charlie_work.worker_launch.hidden_console_kwargs",
         return_value=sentinel_kwargs,
     ) as mock_helper:
         popen_worker(
             [sys.executable, "-c", "pass"], priority=CpuPriority.NORMAL, stdout=subprocess.DEVNULL
         )
 
-    expected_flag = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    expected_flag = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(
+        subprocess, "NORMAL_PRIORITY_CLASS", 0
+    )
     mock_helper.assert_called_once_with(expected_flag)
     assert mock.call_args.kwargs.get("creationflags") == 0xDEADBEEF
 
@@ -43,7 +45,7 @@ def test_popen_worker_combines_existing_creationflags(
     """Existing creationflags from the caller are merged with the process-group flag."""
     monkeypatch.setattr(subprocess, "Popen", MagicMock())
 
-    with patch("charlie_work.process_utils.hidden_console_kwargs") as mock_helper:
+    with patch("charlie_work.worker_launch.hidden_console_kwargs") as mock_helper:
         popen_worker(
             [sys.executable, "-c", "pass"],
             priority=CpuPriority.NORMAL,
@@ -51,7 +53,11 @@ def test_popen_worker_combines_existing_creationflags(
             stdout=subprocess.DEVNULL,
         )
 
-    expected_flag = 0x00000400 | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    expected_flag = (
+        0x00000400
+        | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        | getattr(subprocess, "NORMAL_PRIORITY_CLASS", 0)
+    )
     mock_helper.assert_called_once_with(expected_flag)
 
 
@@ -132,14 +138,16 @@ def test_popen_worker_requires_an_explicit_priority() -> None:
 def test_popen_worker_below_normal_composes_priority_class(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """BELOW_NORMAL adds the Windows priority-class flag; NORMAL adds nothing."""
+    """Each class composes its own explicit priority flag (NORMAL too: no flag
+    would inherit the launcher's class instead)."""
     below = getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0)
+    normal = getattr(subprocess, "NORMAL_PRIORITY_CLASS", 0)
     group = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
     monkeypatch.setattr(subprocess, "Popen", MagicMock())
-    with patch("charlie_work.process_utils.hidden_console_kwargs") as mock_helper:
+    with patch("charlie_work.worker_launch.hidden_console_kwargs") as mock_helper:
         popen_worker([sys.executable, "-c", "pass"], priority=CpuPriority.BELOW_NORMAL)
         popen_worker([sys.executable, "-c", "pass"], priority=CpuPriority.NORMAL)
-    assert [c.args[0] for c in mock_helper.call_args_list] == [below | group, group]
+    assert [c.args[0] for c in mock_helper.call_args_list] == [below | group, normal | group]
 
 
 _REPORT_CHILD_PRIORITY = """

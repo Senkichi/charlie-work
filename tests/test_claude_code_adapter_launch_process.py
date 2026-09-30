@@ -110,7 +110,7 @@ def test_launch_claude_worker_routes_creationflags_through_hidden_console_kwargs
     with (
         patch("subprocess.Popen", side_effect=capture_popen),
         patch(
-            "charlie_work.process_utils.hidden_console_kwargs",
+            "charlie_work.worker_launch.hidden_console_kwargs",
             return_value=sentinel_kwargs,
         ) as mock_helper,
     ):
