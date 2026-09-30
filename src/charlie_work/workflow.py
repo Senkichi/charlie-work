@@ -157,6 +157,7 @@ from .state import (
     mark_reviewer_quota_alerted,
     operator_claimed_issues,
     operator_queue_impact_baseline,  # noqa: F401  (deliberate re-export; issue #1768, used by moved L01 b3 delegates via _wf.)
+    parse_iso_timestamp as _state_parse_iso_timestamp,
     record_operator_queue_impact_signature,  # noqa: F401  (deliberate re-export; issue #1768, used by moved L01 b3 delegates via _wf.)
     release_operator_claimed,  # noqa: F401  (deliberate re-export; used by moved L01 b4 delegates via _wf.)
     save_state,
@@ -816,22 +817,13 @@ def _label_error_reason(label_error: dict[str, Any]) -> str:
     return "; ".join(parts)
 
 
-def _parse_iso_timestamp(value: Any) -> datetime | None:
-    """Parse an ISO 8601 timestamp from state.json into a timezone-aware datetime."""
-    if value is None:
-        return None
-    if isinstance(value, datetime):
-        return value.replace(tzinfo=UTC) if value.tzinfo is None else value
-    if not isinstance(value, str):
-        return None
-    ts = value.replace("Z", "+00:00")
-    try:
-        parsed = datetime.fromisoformat(ts)
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=UTC)
-    return parsed
+# N8 (wf-review-opus.md, wf-8-review-fixes): ``_parse_iso_timestamp`` used
+# to be a byte-for-byte duplicate of ``worker_fate.parse_iso_timestamp``.
+# ``state.parse_iso_timestamp`` is the shared leaf-module copy both now use;
+# aliased under this name so every existing unqualified
+# ``_parse_iso_timestamp(...)`` call site in this module keeps working
+# unchanged.
+_parse_iso_timestamp = _state_parse_iso_timestamp
 
 
 def _recent_dispatch_failed_attempts(
@@ -1666,6 +1658,13 @@ def _no_pr_outcome_evidence(
     real ``written_at`` and lets ``resolve_fate``'s freshness step (rules
     1/7) arbitrate between them, rather than pre-collapsing via a Python
     ``or`` before either has a timestamp attached.
+
+    A present-but-empty raw dict (``{}``) still builds a real
+    (all-``None``-fields) ``OutcomeEvidence`` here rather than ``None`` --
+    ``worker_fate._evaluate_candidate``'s ``_carries_no_claim`` check (N1,
+    wf-review-opus.md) is what stops that content-empty candidate from
+    out-ranking a sibling that carries a real claim, so this function does
+    not need its own emptiness check.
     """
     if not isinstance(raw, dict):
         return None
@@ -1840,6 +1839,14 @@ def _detect_and_handle_orphaned_workers(
     # 2-4/6/8/9, so this fate is only reliable for the blocked check (row 1),
     # which needs none of it.
     fates: dict[int, worker_fate.WorkerFate] = {}
+    # B6 (wf-review-opus.md) / design doc §5: rule 1's stale-evidence
+    # events, computed alongside each fate above from the exact same
+    # evidence -- not yet emitted or persisted here; drained right after
+    # this precompute loop, outside the state lock (CLAUDE.md: "events
+    # outside state-lock contexts... call log_event() directly"), with the
+    # dedup marker persisted in its own small locked section immediately
+    # after so the two never drift apart.
+    stale_evidence_by_issue: dict[int, list[tuple[str, dict[str, Any]]]] = {}
     issues_by_number: dict[int, dict[str, Any]] = {}  # also used by the live-handoff lane below
 
     if no_pr_orphans:
@@ -1895,13 +1902,30 @@ def _detect_and_handle_orphaned_workers(
             terminal_evidence: worker_fate.TerminalEvidence | None = None
             if isinstance(terminal, dict):
                 ended_at = _parse_iso_timestamp(terminal.get("ended_at")) or now
+                # B5 (wf-review-opus.md) / design doc §3, Group A step A1:
+                # ``ended_at`` is when the watcher observed the process
+                # exit, not when the copied-in outcome file was actually
+                # written -- a worktree reused across dispatches can still
+                # hold a PREVIOUS dispatch's leftover outcome file if the
+                # new dispatch died before writing its own. Using
+                # ``ended_at`` as the outcome's freshness anchor let that
+                # leftover pass rule 1's `written_at > dispatched_at` gate
+                # on a fresh exit timestamp alone. ``worker_outcome_written_at``
+                # is the outcome file's own mtime (additive field written by
+                # ``process_utils.write_worker_terminal_status`` since B5);
+                # fall back to ``ended_at`` only for records written before
+                # that field existed (rollout-window compatibility, design
+                # doc §3), which stays exactly as stale-prone as today.
+                outcome_written_at = (
+                    _parse_iso_timestamp(terminal.get("worker_outcome_written_at")) or ended_at
+                )
                 terminal_evidence = worker_fate.TerminalEvidence(
                     ended_at=ended_at,
                     exit_code=terminal.get("exit_code"),
                     outcome=_no_pr_outcome_evidence(
                         terminal.get("worker_outcome"),
                         source=worker_fate.EvidenceSource.TERMINAL,
-                        written_at=ended_at,
+                        written_at=outcome_written_at,
                     ),
                 )
             worktree_outcome_evidence: worker_fate.OutcomeEvidence | None = None
@@ -1944,6 +1968,42 @@ def _detect_and_handle_orphaned_workers(
             worker_outcomes[issue_number] = (
                 dict(resolved_outcome.raw) if resolved_outcome is not None else None
             )
+            # B6 (wf-review-opus.md) / design doc §5: not-yet-reported rule-1
+            # stale evidence from this SAME resolve_fate call, deduped
+            # against this entry's own ``stale_evidence_reported`` marker.
+            stale_events = worker_fate.stale_evidence_events(
+                entry if isinstance(entry, dict) else {}, fates[issue_number]
+            )
+            if stale_events:
+                stale_evidence_by_issue[issue_number] = stale_events
+
+        if stale_evidence_by_issue:
+            # Emit outside the lock (CLAUDE.md instrumentation invariant),
+            # matching how this whole precompute loop already reads
+            # terminal/worktree state outside it. Persisting the dedup
+            # marker is a separate, minimal, atomic state-lock section
+            # rather than reaching into either no-PR loop's own ``entry``
+            # -- neither loop's ``entry`` is guaranteed to still be the one
+            # eventually written back to ``state["issues"]`` (see B4,
+            # misc_worker_dispatch.py, for the same caller-side
+            # entry-identity hazard in this file's sibling lane), so this
+            # keeps the dedup write independent of that risk entirely.
+            for issue_number, events in stale_evidence_by_issue.items():
+                for kind, payload in events:
+                    log_event(state_file, kind, payload, level="warning")
+            with state_lock(state_file):
+                locked_state = load_state(state_file)
+                for issue_number, events in stale_evidence_by_issue.items():
+                    locked_entry = locked_state.get("issues", {}).get(str(issue_number))
+                    if not isinstance(locked_entry, dict):
+                        continue
+                    already = set(locked_entry.get("stale_evidence_reported") or ())
+                    new_fate = fates.get(issue_number)
+                    if new_fate is None:
+                        continue
+                    already.update(worker_fate.stale_evidence_key(s) for s in new_fate.basis.stale)
+                    locked_entry["stale_evidence_reported"] = sorted(already)
+                save_state(state_file, locked_state)
 
         for issue_number in no_pr_orphans:
             issue = issues_by_number.get(issue_number)

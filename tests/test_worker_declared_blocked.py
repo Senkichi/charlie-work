@@ -14,6 +14,7 @@ test green.
 from __future__ import annotations
 
 import json
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
@@ -255,6 +256,280 @@ def test_no_outcome_file_keeps_redispatch_behavior(tmp_path: Path) -> None:
     # The redispatch counter is seeded (first observation), not escalated.
     redispatch_at = entry.get("orphan_redispatch_at", [])
     assert len(redispatch_at) == 1
+
+
+def test_leftover_terminal_outcome_older_than_dispatch_is_not_laundered_as_fresh(
+    tmp_path: Path,
+) -> None:
+    """B5 (wf-review-opus.md), rule 1: the terminal-status watcher copies
+    whatever ``.worker-outcome.json`` sits in the worktree at process exit,
+    stamped with a fresh ``ended_at`` -- the moment the watcher observed
+    exit, not when that outcome file was actually written. A worktree reused
+    across dispatches can still hold a PREVIOUS dispatch's leftover outcome
+    if the new dispatch died before writing its own, and nothing deletes the
+    file at dispatch time.
+
+    Scenario: dispatch #1 writes a ``blocked`` outcome and dies. Dispatch #2
+    starts later, reuses the worktree, and also dies -- without ever writing
+    its own outcome -- so the terminal-status watcher copies dispatch #1's
+    stale ``blocked`` outcome into dispatch #2's terminal record with a
+    fresh ``ended_at``. Both the worktree file itself (mtime before
+    dispatch #2 started) and the terminal record's own
+    ``worker_outcome_written_at`` (the same, honest mtime -- the additive
+    field ``process_utils.write_worker_terminal_status`` now populates)
+    correctly mark this evidence as older than ``dispatched_at``. Before the
+    fix, only ``ended_at`` was available as the outcome's freshness anchor,
+    so the leftover passed rule 1's ``written_at > dispatched_at`` gate and
+    the issue was escalated as blocked on a dispatch that made no such
+    declaration.
+    """
+    from charlie_work.process_utils import write_worker_terminal_status
+    from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20, max_auto_redispatch=3),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    issue_number = 1455
+    branch = "agent/issue-1455-test"
+
+    leftover_written_at = "2026-09-29T00:00:00Z"
+    leftover_mtime_epoch = datetime(2026, 9, 29, 0, 0, 0, tzinfo=UTC).timestamp()
+    dispatch_2_started_at = "2026-09-29T00:10:00Z"
+    watcher_ended_at = "2026-09-29T00:20:00Z"
+
+    state = load_state(paths.state_file)
+    state["issues"][str(issue_number)] = {
+        "status": "dispatched",
+        "dispatched_at": dispatch_2_started_at,
+        "worker_pid": 99999,
+        "worker_process_start_time": 1234567890.0,
+        "branch_name": branch,
+    }
+    save_state(paths.state_file, state)
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    # Dispatch #1's leftover outcome file, still sitting in the reused
+    # worktree, its mtime pinned BEFORE dispatch #2 started.
+    worktrees_dir = resolved_layout(config, tmp_path).worktrees
+    worktree_path = worktree_path_for_branch(tmp_path, branch, worktrees_dir)
+    _write_blocked_outcome(
+        worktree_path,
+        reason_kind="cross_repo_scope",
+        detail="dispatch #1's stale declaration",
+    )
+    outcome_path = worktree_path / ".worker-outcome.json"
+    os.utime(outcome_path, (leftover_mtime_epoch, leftover_mtime_epoch))
+
+    # Dispatch #2's terminal record: watcher-observed exit is fresh
+    # (after dispatched_at), but it copied dispatch #1's leftover outcome
+    # file, and worker_outcome_written_at honestly reports that file's own
+    # (stale) mtime.
+    terminal_path = sessions_dir / f"issue-{issue_number}.devin.terminal.json"
+    write_worker_terminal_status(
+        terminal_path,
+        pid=99999,
+        exit_code=1,
+        started_at=dispatch_2_started_at,
+        ended_at=watcher_ended_at,
+        duration_seconds=600.0,
+        worker_outcome={
+            "outcome": "blocked",
+            "reason_kind": "cross_repo_scope",
+            "detail": "dispatch #1's stale declaration",
+        },
+        worker_outcome_written_at=leftover_written_at,
+    )
+
+    class FakeGitHubNoPR(FakeGitHub):
+        def pr_list(self):
+            return []
+
+    fake_gh = FakeGitHubNoPR(repo_root=tmp_path)
+    fake_gh.issues = [
+        {
+            "number": issue_number,
+            "title": "test issue",
+            "url": f"https://example.test/issues/{issue_number}",
+            "body": "",
+            "labels": [{"name": config.labels.in_progress}],
+            "state": "OPEN",
+        }
+    ]
+    fake_gh.prs = []
+
+    with (
+        patch("charlie_work.workflow._worker_pid_alive", return_value=False),
+        patch("charlie_work.workflow.remote_branch_head_sha", return_value=None),
+        patch("charlie_work.workflow.remote_branch_ahead_count", return_value=(0, None)),
+    ):
+        _detect_and_handle_orphaned_workers(
+            sessions_dir,
+            paths.state_file,
+            config,
+            fake_gh,
+            write_gate=_wg(paths.state_file),
+        )
+
+    st = load_state(paths.state_file)
+    entry = st["issues"][str(issue_number)]
+
+    # NOT escalated -- dispatch #1's leftover outcome is correctly stale
+    # relative to dispatch #2's dispatched_at, so it must not decide
+    # dispatch #2's fate.
+    assert entry["status"] == "dispatched", (
+        f"leftover outcome laundered as fresh: status={entry['status']!r}"
+    )
+    assert entry.get("escalation_reason") is None
+
+    blocked_events = [
+        e for e in st.get("events", []) if e.get("kind") == "worker_declared_blocked"
+    ]
+    assert len(blocked_events) == 0
+
+
+def test_stale_leftover_outcome_emits_worker_evidence_stale_event(tmp_path: Path) -> None:
+    """B6 (wf-review-opus.md), design doc §5: rule 1 dropping a stale
+    candidate must emit a ``worker_evidence_stale`` warning event so the
+    operator has a signal in events.db -- before this fix, ``FateBasis.stale``
+    was populated but nothing read it and no event existed at all.
+
+    Same leftover-outcome-via-terminal-record scenario as
+    ``test_leftover_terminal_outcome_older_than_dispatch_is_not_laundered_as_fresh``
+    (B5): both the worktree file and the terminal record's copy of it are
+    correctly recognized as stale, which is exactly what must now surface a
+    signal instead of silently vanishing.
+    """
+    from charlie_work.instrumentation import query_events
+    from charlie_work.process_utils import write_worker_terminal_status
+    from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20, max_auto_redispatch=3),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    issue_number = 1456
+    branch = "agent/issue-1456-test"
+
+    leftover_written_at = "2026-09-29T00:00:00Z"
+    leftover_mtime_epoch = datetime(2026, 9, 29, 0, 0, 0, tzinfo=UTC).timestamp()
+    dispatch_2_started_at = "2026-09-29T00:10:00Z"
+    watcher_ended_at = "2026-09-29T00:20:00Z"
+
+    state = load_state(paths.state_file)
+    state["issues"][str(issue_number)] = {
+        "status": "dispatched",
+        "dispatched_at": dispatch_2_started_at,
+        "worker_pid": 99999,
+        "worker_process_start_time": 1234567890.0,
+        "branch_name": branch,
+        "adapter": "devin",
+    }
+    save_state(paths.state_file, state)
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    worktrees_dir = resolved_layout(config, tmp_path).worktrees
+    worktree_path = worktree_path_for_branch(tmp_path, branch, worktrees_dir)
+    _write_blocked_outcome(
+        worktree_path,
+        reason_kind="cross_repo_scope",
+        detail="dispatch #1's stale declaration",
+    )
+    outcome_path = worktree_path / ".worker-outcome.json"
+    os.utime(outcome_path, (leftover_mtime_epoch, leftover_mtime_epoch))
+
+    terminal_path = sessions_dir / f"issue-{issue_number}.devin.terminal.json"
+    write_worker_terminal_status(
+        terminal_path,
+        pid=99999,
+        exit_code=1,
+        started_at=dispatch_2_started_at,
+        ended_at=watcher_ended_at,
+        duration_seconds=600.0,
+        worker_outcome={
+            "outcome": "blocked",
+            "reason_kind": "cross_repo_scope",
+            "detail": "dispatch #1's stale declaration",
+        },
+        worker_outcome_written_at=leftover_written_at,
+    )
+
+    class FakeGitHubNoPR(FakeGitHub):
+        def pr_list(self):
+            return []
+
+    fake_gh = FakeGitHubNoPR(repo_root=tmp_path)
+    fake_gh.issues = [
+        {
+            "number": issue_number,
+            "title": "test issue",
+            "url": f"https://example.test/issues/{issue_number}",
+            "body": "",
+            "labels": [{"name": config.labels.in_progress}],
+            "state": "OPEN",
+        }
+    ]
+    fake_gh.prs = []
+
+    with (
+        patch("charlie_work.workflow._worker_pid_alive", return_value=False),
+        patch("charlie_work.workflow.remote_branch_head_sha", return_value=None),
+        patch("charlie_work.workflow.remote_branch_ahead_count", return_value=(0, None)),
+    ):
+        _detect_and_handle_orphaned_workers(
+            sessions_dir,
+            paths.state_file,
+            config,
+            fake_gh,
+            write_gate=_wg(paths.state_file),
+        )
+
+    stale_events = query_events(paths.state_file, kind="worker_evidence_stale")
+    assert len(stale_events) >= 1, "no worker_evidence_stale signal reached events.db"
+    for event in stale_events:
+        assert event["level"] == "warning"
+        raw_payload = event["payload"]
+        payload = json.loads(raw_payload) if isinstance(raw_payload, str) else raw_payload
+        assert payload["issue_number"] == issue_number
+        assert payload["reason"] == "older_than_dispatch"
+        assert payload["adapter"] == "devin"
+        assert payload["dispatched_at"] == dispatch_2_started_at
+
+    # Dedup marker persisted so a second pass over the same still-dead,
+    # still-stale worker does not re-emit the same candidates.
+    st = load_state(paths.state_file)
+    entry = st["issues"][str(issue_number)]
+    assert entry.get("stale_evidence_reported"), "dedup marker was never persisted"
+    reported_before = list(entry["stale_evidence_reported"])
+    count_before = len(query_events(paths.state_file, kind="worker_evidence_stale"))
+
+    with (
+        patch("charlie_work.workflow._worker_pid_alive", return_value=False),
+        patch("charlie_work.workflow.remote_branch_head_sha", return_value=None),
+        patch("charlie_work.workflow.remote_branch_ahead_count", return_value=(0, None)),
+    ):
+        _detect_and_handle_orphaned_workers(
+            sessions_dir,
+            paths.state_file,
+            config,
+            fake_gh,
+            write_gate=_wg(paths.state_file),
+        )
+
+    st_after = load_state(paths.state_file)
+    assert st_after["issues"][str(issue_number)]["stale_evidence_reported"] == reported_before
+    count_after = len(query_events(paths.state_file, kind="worker_evidence_stale"))
+    assert count_after == count_before, "same stale candidate re-emitted on the next pass"
 
 
 def test_permission_denial_blocked_outcome_is_not_operator_escalated(tmp_path: Path) -> None:

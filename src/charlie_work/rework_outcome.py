@@ -97,11 +97,13 @@ def _outcome_evidence(
     """Build an ``OutcomeEvidence`` from a raw ``.worker-outcome.json`` dict.
 
     ``None`` in, ``None`` out (no claim); a present-but-empty dict still
-    builds a real (all-``None``-fields) evidence object, matching what
-    "an empty terminal outcome dict" means in the design doc (§3 step 0:
-    "An empty terminal dict ``{}`` is 'no claim': it is neither stale nor
-    decisive" -- distinguished from *absent*, i.e. ``None``, which is
-    skipped entirely by the freshness step).
+    builds a real (all-``None``-fields) object rather than ``None`` itself
+    -- ``worker_fate._evaluate_candidate``'s ``_carries_no_claim`` check is
+    what actually makes ``{}`` behave as "no claim: neither stale nor
+    decisive" (design doc §3 step 0), by never letting a content-empty
+    candidate win freshness arbitration over a sibling that carries a real
+    claim. That check is the single point of enforcement (N1,
+    wf-review-opus.md); this function does not need its own.
     """
     if not isinstance(outcome, dict):
         return None
@@ -133,15 +135,17 @@ def _read_rework_outcome(
     ``worker_fate.resolve_fate``'s freshness step (rules 1/7) already
     implements "terminal, if fresh, else worktree, if fresh, else nothing".
     Neither a ``dispatched_at`` nor a live head is known at this call site
-    (this function takes neither), so every candidate is fresh by
-    definition (rule 1's legacy mode: an unset ``dispatched_at`` accepts
-    unconditionally, and an unknown head never proves a mismatch) -- which
-    degrades exactly to "terminal if present (even ``{}``), else worktree",
-    FLIP 7's ``isinstance(outcome, dict): return outcome`` pass-through
-    with no ``or``-style fallthrough on an empty-but-present terminal dict.
-    Contrast ``workflow.py``'s no-PR lane (FLIP 7's other, disagreeing
-    site), which still uses the raw ``terminal_outcome or worktree_outcome``
-    expression.
+    (this function takes neither), so timestamp/head freshness never
+    rejects a candidate here (rule 1's legacy mode: an unset
+    ``dispatched_at`` accepts unconditionally, and an unknown head never
+    proves a mismatch) -- but an empty terminal ``worker_outcome`` (``{}``)
+    is still not decisive: ``worker_fate._carries_no_claim`` (N1,
+    wf-review-opus.md; design doc §3 step 0) keeps a content-empty terminal
+    candidate from out-ranking the worktree's real content even though
+    "legacy mode" would otherwise call it fresh, so this degrades to
+    "terminal if it carries a real claim, else worktree, else nothing" --
+    the same polarity as ``workflow.py``'s no-PR lane (FLIP 7's other
+    site), not the opposite one FLIP 7 originally found.
     """
     terminal_evidence: worker_fate.TerminalEvidence | None = None
     record = find_worker_terminal_status(sessions_dir, issue_number)

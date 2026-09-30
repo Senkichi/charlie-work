@@ -84,6 +84,20 @@ _RESOURCE_EXHAUSTED_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# Provider authentication failures (issue #484). N3 (wf-review-opus.md,
+# wf-8-review-fixes): this pattern used to be hand-duplicated verbatim in
+# both ``claude_code.py`` and ``worker_fate.py`` (the latter's own comment
+# said "moved verbatim from claude_code.py"), a byte-for-byte copy that
+# could silently drift the way ``_RATE_LIMIT_PATTERN`` once did (see this
+# module's docstring). Word-boundary 401/403 so a coincidental numeric
+# substring like "issue #4019" cannot trip a false cooldown.
+_PROVIDER_AUTH_PATTERN = re.compile(
+    r"\b401\b|\b403\b|authentication(?:\s+failed)?|unauthorized|"
+    r"invalid[-\s]?api[-\s]?key|invalid[-\s]?authentication|"
+    r"permission_denied|auth(?:entication)?\s+error",
+    re.IGNORECASE,
+)
+
 # The ``failure_kind`` values that represent a provider-side throttle
 # condition — the kinds for which ``_classify_session_failure`` arms
 # ``throttled_until``. Cap accounting uses this set so a zero-turn death
@@ -124,6 +138,17 @@ def _parse_reset_in_minutes(tail: str) -> int | None:
             continue
         return int(hours or 0) * 60 + int(minutes or 0)
     return None
+
+
+def is_provider_auth_failure(tail: str) -> bool:
+    """True when ``tail`` carries a provider authentication-failure signature.
+
+    Single point of enforcement (N3, wf-review-opus.md): both
+    ``claude_code.py``'s quota-probe classifier and ``worker_fate.py``'s
+    rule-6 tail classifier call this instead of each matching their own
+    compiled copy of ``_PROVIDER_AUTH_PATTERN``.
+    """
+    return _PROVIDER_AUTH_PATTERN.search(tail) is not None
 
 
 def match_throttle_tail(tail: str, markers: Sequence[str]) -> tuple[bool, int | None]:
@@ -216,6 +241,7 @@ def parse_reset_clock_time(tail: str, now: datetime) -> datetime | None:
 
 __all__ = [
     "PROVIDER_THROTTLE_FAILURE_KINDS",
+    "is_provider_auth_failure",
     "is_provider_throttle_failure",
     "match_quota_tail",
     "match_throttle_tail",

@@ -6,10 +6,13 @@ pushed its branch and wrote a complete ``.worker-outcome.json``
 (``push_succeeded: true`` / ``pr_created: false``) has finished the handoff
 contract -- the file's own instruction is "then stop", so a still-running
 PID at that point is a process that hung on exit, not a worker still doing
-work. When the outcome file is older than
-``watchdog.worker_outcome_finalize_minutes``, this lane opens the PR from
-the worker's drafted title/body through the same ``_open_pr_for_orphaned_branch``
-the dead-PID lane uses, without waiting for the PID to exit (the swole #163
+work. N4 (wf-review-opus.md): a live PID with a fresh, on-target, declared
+push (rule 1's freshness gate: ``written_at`` after ``dispatched_at``)
+routes immediately -- ``watchdog.worker_outcome_finalize_minutes`` no
+longer gates this decision (FLIP 5); it only gates the stall watchdog's
+separate kill decision elsewhere. This lane opens the PR from the worker's
+drafted title/body through the same ``_open_pr_for_orphaned_branch`` the
+dead-PID lane uses, without waiting for the PID to exit (the swole #163
 incident: a completed worker left its PR unopened ~2h because every
 finalize path keyed off PID death). Only the PR-open action applies to a
 live PID -- none of the dead-PID lanes (label reclaim, escalation,
@@ -27,6 +30,20 @@ in strict order:
    (the round-2 review finding: relaxing the early return to cover any live
    PID, not just a stale one, made the network fetch and lock fire on
    nearly every pass of an active fleet).
+
+   N4 (wf-review-opus.md): FLIP 5's "route immediately, ignore
+   ``worker_outcome_finalize_minutes``" change reopened a version of that
+   same round-2 cost concern from the other direction -- a single live PID
+   with a fresh, on-target, declared-push outcome now keeps this
+   function's result non-empty on every pass for as long as that PID stays
+   alive (there is no threshold left to age it out of the candidate set),
+   which defeats the early return and makes ``gh.pr_list()`` and
+   ``state_lock`` run every pass until the PID exits, not just once near
+   the threshold. Not fixed here -- reintroducing a wait window would
+   partially undo the reviewed FLIP 5 latency fix this same lane exists
+   for, so the right tradeoff (accept the per-pass cost, or find a
+   cheaper filesystem-only staleness marker) is a design decision, not a
+   review-fixes nit; see ``wf-review-dispositions.md``.
 2. ``resolve_live_handoff_candidates`` -- run after ``gh.pr_list()`` (needed
    elsewhere in the sweep regardless, for the dead-PID lanes), to drop
    candidates a PR already exists for and attach the issue/label data the
@@ -184,11 +201,19 @@ def collect_stale_live_handoff_pids(
         # Rule 5: a live PID with a fresh declared-push claim routes
         # immediately -- `worker_outcome_finalize_minutes` only gates the
         # kill decision elsewhere, never this routing check.
+        #
+        # B9 (wf-review-opus.md): the legacy check required an EXPLICIT
+        # ``pr_created is False`` before routing. The worker-fate refactor
+        # loosened this to ``pr_created is not True``, which also admits
+        # ``None`` -- an outcome that omits ``pr_created`` entirely (an
+        # incomplete/ambiguous self-report) now gets finalized as if it had
+        # explicitly declared no PR was created. That widening was never
+        # one of the nine reviewed flips; restore the strict legacy gate.
         fresh_outcome = fate.basis.outcome
         if (
             fresh_outcome is None
             or fresh_outcome.push_succeeded is not True
-            or fresh_outcome.pr_created is True
+            or fresh_outcome.pr_created is not False
         ):
             continue
         candidates[issue_number] = {

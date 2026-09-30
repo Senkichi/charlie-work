@@ -203,10 +203,19 @@ def test_orphaned_worker_outcome_at_other_head_is_a_death(tmp_path: Path) -> Non
 def test_orphaned_worker_recorded_crash_with_fresh_outcome_is_a_death(
     tmp_path: Path,
 ) -> None:
-    """Boundary pin: a terminal record carrying a confirmed non-zero exit is
-    still a crash even when a fresh, on-target outcome file exists -- the
-    #1911 recovery only fills the *missing* terminal-record case
-    (``terminal_exit_code is None``), matching the issue's suggested fix."""
+    """B3 (wf-review-opus.md), rule 4 flip: was a "boundary pin" -- a
+    terminal record carrying a confirmed non-zero exit used to be treated
+    as a crash even when a fresh, on-target, confirmed-push outcome file
+    existed, because the #1911 recovery only filled the *missing*
+    terminal-record case (``terminal_exit_code is None``).
+
+    Rule 4 (design doc §9) makes this unconditional: "a fresh outcome file
+    beats the exit code; the exit code decides only without one" --
+    ``resolve_fate``'s rows 2/3 credit a confirmed push regardless of exit
+    code, because a worker can push and then crash during teardown. Name
+    kept (leaf-name convention) though it no longer pins a death; only the
+    assertions flip.
+    """
     config, paths, fake_gh, _dispatched_at = _dead_worker_rework_bed(tmp_path)
     _write_outcome(
         paths,
@@ -237,12 +246,25 @@ def test_orphaned_worker_recorded_crash_with_fresh_outcome_is_a_death(
 
     state = load_state(paths.state_file)
     entry = state["issues"]["207"]
-    assert entry.get("status") == "rework_requested"
-    assert isinstance(entry.get("worker_death_at"), list)
+    # Not credited as a death: the confirmed push outrances the recorded
+    # non-zero exit code (rule 4).
+    assert entry.get("status") == "dispatched"
+    assert entry.get("worker_death_at") is None
     events = state.get("events", [])
-    recovered = [e for e in events if e.get("kind") == "orphaned_worker_recovered"]
-    assert len(recovered) == 1
-    assert recovered[0]["payload"]["exit_code"] == 1
+    assert [e for e in events if e.get("kind") == "orphaned_worker_recovered"] == []
+    drift_events = [e for e in events if e.get("kind") == "orphaned_worker_drift"]
+    assert len(drift_events) == 1
+    payload = drift_events[0]["payload"]
+    assert payload["reason"] == "dead_worker_completed_outcome"
+    assert payload["exit_code"] == 1
+    assert payload["worker_outcome_head_sha"] == "abc123"
+    # No real git remote to confirm the push against in this test
+    # environment, so the outcome is surfaced but not (yet) applied.
+    assert any(
+        e.get("kind") == "rework_outcome_skipped"
+        and e["payload"].get("reason") == "remote_head_unavailable"
+        for e in events
+    )
     assert fake_gh.pr_edits == []
 
 

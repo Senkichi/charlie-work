@@ -259,6 +259,47 @@ def test_flip5_live_handoff_finalize_withholds_fresh_outcome_until_threshold(
     assert candidates[9105]["worker_outcome"]["head_sha"] == "cafefeed"
 
 
+def test_b9_live_handoff_finalize_omitted_pr_created_is_not_a_confirmed_no_pr(
+    tmp_path: Path,
+) -> None:
+    """B9 (wf-review-opus.md): an outcome that OMITS ``pr_created`` entirely
+    must not be finalized as if it had explicitly declared no PR.
+
+    The legacy check required ``pr_created is False`` before routing. The
+    worker-fate refactor loosened this to ``pr_created is not True``, which
+    also admits ``None`` -- an incomplete self-report now gets finalized the
+    same as an explicit ``false``. That widening was never one of the nine
+    reviewed flips; this pins the restored strict gate.
+    """
+    from charlie_work.live_handoff_finalize import collect_stale_live_handoff_pids
+
+    now = datetime.now(UTC)
+    branch = "agent/issue-9106"
+    worktrees_dir = tmp_path / "worktrees"
+    worktree_path = worktree_path_for_branch(tmp_path, branch, worktrees_dir)
+    worktree_path.mkdir(parents=True, exist_ok=True)
+    outcome_path = worktree_path / WORKER_OUTCOME_FILENAME
+    # pr_created is left out entirely -- not `false`, not `true`.
+    outcome_path.write_text(
+        json.dumps({"push_succeeded": True, "head_sha": "b01dface"}),
+        encoding="utf-8",
+    )
+    fresh_ts = (now - timedelta(minutes=2)).timestamp()
+    os.utime(outcome_path, (fresh_ts, fresh_ts))
+
+    live_pid_entries = {9106: {"branch_name": branch, "worker_pid": 4242}}
+
+    candidates = collect_stale_live_handoff_pids(
+        live_pid_entries,
+        worker_outcome_finalize_minutes=15,
+        repo_root=tmp_path,
+        worktrees_dir=worktrees_dir,
+        now=now,
+    )
+
+    assert candidates == {}, "an omitted pr_created must not be treated as a confirmed no-PR push"
+
+
 # ---------------------------------------------------------------------------
 # Rule 2: a fresh `outcome: blocked` should beat push flags everywhere.
 # The no-PR lane already honours this (test_worker_declared_blocked.py);
@@ -321,6 +362,120 @@ def test_flip2_with_pr_fresh_blocked_outcome_falls_through_to_redispatch(tmp_pat
         and e["payload"].get("reason") == "dead_worker_with_request_changes"
         for e in events
     )
+
+
+def test_flip2_with_pr_fresh_blocked_outcome_and_clean_exit_still_escalates(
+    tmp_path: Path,
+) -> None:
+    """B2 (wf-review-opus.md): FLIP 2 must fire on a clean (exit code 0)
+    exit too -- the normal way a claude-code/api worker ends a blocked
+    task is to write the outcome file and then exit 0, not crash. Before
+    this fix, the blocked check lived only in the `else` of `terminal_
+    exit_code == 0`, so this exact population (blocked declaration + exit
+    0) took the exit-0 no-op drift branch and the blocked declaration was
+    never read at all.
+    """
+    config, paths, fake_gh, dispatched_at = _dead_worker_rework_bed(
+        tmp_path, decision="request_changes"
+    )
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    write_worker_terminal_status(
+        sessions_dir / "issue-207.claude.terminal.json",
+        pid=99999,
+        exit_code=0,
+        started_at="2026-01-01T00:00:00Z",
+        ended_at="2026-01-01T00:05:00Z",
+        duration_seconds=300.0,
+    )
+    _write_outcome(
+        paths,
+        tmp_path,
+        {
+            "outcome": "blocked",
+            "reason_kind": "ambiguous_scope",
+            "detail": "needs a human to disambiguate",
+            "push_succeeded": True,
+            "pr_created": False,
+            "head_sha": "abc123",
+        },
+        mtime=datetime.now(UTC),
+    )
+
+    _run_orphan_sweep(tmp_path, paths, config, fake_gh)
+
+    state = load_state(paths.state_file)
+    entry = state["issues"]["207"]
+    assert entry["status"] == "escalated"
+    assert entry["escalation_reason"] == "worker_declared_blocked"
+    events = state.get("events", [])
+    assert any(
+        e.get("kind") == "worker_declared_blocked"
+        and e["payload"].get("reason_kind") == "ambiguous_scope"
+        for e in events
+    )
+    # Neither the exit-0 no-op drift nor the generic reset must fire instead.
+    assert not any(
+        e.get("kind") == "orphaned_worker_drift"
+        and e["payload"].get("reason") == "dead_worker_clean_exit_no_op"
+        for e in events
+    )
+    assert not any(e.get("kind") == "orphaned_worker_recovered" for e in events)
+
+
+def test_flip2_approved_rework_fresh_blocked_outcome_and_clean_exit_still_escalates(
+    tmp_path: Path,
+) -> None:
+    """B2 companion for the second call site (the `approved` +
+    `rework_requested`-PR-state branch of `handle_dead_worker_with_pr`,
+    which duplicates the same blocked-check-inside-the-exit-0-else bug at
+    its own, separately-written call site).
+    """
+    config, paths, fake_gh, dispatched_at = _dead_worker_rework_bed(
+        tmp_path, decision="approved", pr_state_status="rework_requested"
+    )
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    write_worker_terminal_status(
+        sessions_dir / "issue-207.claude.terminal.json",
+        pid=99999,
+        exit_code=0,
+        started_at="2026-01-01T00:00:00Z",
+        ended_at="2026-01-01T00:05:00Z",
+        duration_seconds=300.0,
+    )
+    _write_outcome(
+        paths,
+        tmp_path,
+        {
+            "outcome": "blocked",
+            "reason_kind": "ambiguous_scope",
+            "detail": "needs a human to disambiguate",
+            "push_succeeded": True,
+            "pr_created": False,
+            "head_sha": "abc123",
+        },
+        mtime=datetime.now(UTC),
+    )
+
+    _run_orphan_sweep(tmp_path, paths, config, fake_gh)
+
+    state = load_state(paths.state_file)
+    entry = state["issues"]["207"]
+    assert entry["status"] == "escalated"
+    assert entry["escalation_reason"] == "worker_declared_blocked"
+    events = state.get("events", [])
+    assert any(
+        e.get("kind") == "worker_declared_blocked"
+        and e["payload"].get("reason_kind") == "ambiguous_scope"
+        for e in events
+    )
+    assert not any(
+        e.get("kind") == "orphaned_worker_drift"
+        and e["payload"].get("reason") == "dead_worker_clean_exit_no_op"
+        for e in events
+    )
+    assert not any(e.get("kind") == "orphaned_worker_recovered" for e in events)
 
 
 # ---------------------------------------------------------------------------
@@ -532,6 +687,58 @@ def test_flip4_approved_rework_exit0_discards_fresh_outcome(tmp_path: Path) -> N
     assert not any(e.get("kind") == "orphaned_worker_recovered" for e in events)
 
 
+def test_flip4_nonzero_exit_still_consults_fresh_confirmed_push_outcome(
+    tmp_path: Path,
+) -> None:
+    """B3 (wf-review-opus.md): rule 4 ("a fresh outcome file beats the exit
+    code; the exit code decides only without one") is unconditional --
+    ``resolve_fate``'s rows 2/3 credit a confirmed push regardless of exit
+    code (a worker can push, then crash during teardown). Before this fix,
+    ``handle_dead_worker_completed_outcome`` early-returned ``False`` for
+    ANY confirmed non-zero exit code without even reading the outcome file,
+    so a worker that pushed and then crashed was silently reset to
+    ``rework_requested`` and credited a worker death instead of being
+    recovered.
+    """
+    config, paths, fake_gh, dispatched_at = _dead_worker_rework_bed(
+        tmp_path, decision="request_changes"
+    )
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    write_worker_terminal_status(
+        sessions_dir / "issue-207.claude.terminal.json",
+        pid=99999,
+        exit_code=1,  # a genuine crash, e.g. during teardown after pushing
+        started_at="2026-01-01T00:00:00Z",
+        ended_at="2026-01-01T00:05:00Z",
+        duration_seconds=300.0,
+    )
+    _write_outcome(
+        paths,
+        tmp_path,
+        {"push_succeeded": True, "pr_created": False, "head_sha": "abc123"},
+        mtime=datetime.now(UTC),
+    )
+
+    _run_orphan_sweep(tmp_path, paths, config, fake_gh)
+
+    state = load_state(paths.state_file)
+    entry = state["issues"]["207"]
+    assert entry["status"] == "dispatched"
+    events = state.get("events", [])
+    # The fresh, confirmed-push outcome is consulted (and surfaced) instead
+    # of the non-zero exit code short-circuiting before it is ever read.
+    assert any(
+        e.get("kind") == "orphaned_worker_drift"
+        and e["payload"].get("reason") == "dead_worker_completed_outcome"
+        and e["payload"].get("worker_outcome_head_sha") == "abc123"
+        for e in events
+    )
+    # The generic worker-death reset must NOT also fire -- crediting a
+    # death here for confirmed-pushed work is exactly what rule 4 forbids.
+    assert not any(e.get("kind") == "orphaned_worker_recovered" for e in events)
+
+
 # ---------------------------------------------------------------------------
 # Rule 7: terminal-record precedence and the `terminal or worktree`
 # empty-dict fall-through are replaced by rule 1. Two sites read the same
@@ -541,15 +748,22 @@ def test_flip4_approved_rework_exit0_discards_fresh_outcome(tmp_path: Path) -> N
 
 
 def test_flip7_workflow_empty_terminal_outcome_falls_through_to_worktree(tmp_path: Path) -> None:
-    """FLIP 7: current behaviour; rule 1 replaces this fall-through.
+    """FLIP 7 / N1 (wf-review-opus.md), design doc §3 step 0: current
+    (fixed) behaviour.
 
-    `workflow.py`'s no-PR orphan lane computes
-    `worker_outcomes[issue_number] = terminal_outcome or worktree_outcome`.
-    `{}` is falsy in Python, so a terminal record that IS present but
-    reports an empty `worker_outcome` dict silently falls through to
-    whatever the worktree file happens to still contain -- here, a stale
-    `blocked` declaration -- rather than being treated as authoritative
-    (if empty) or triggering a "no signal" path.
+    `workflow.py`'s no-PR orphan lane builds real
+    `worker_fate.TerminalEvidence`/`OutcomeEvidence` and arbitrates them
+    through `resolve_fate`. A terminal record that IS present but reports
+    an empty `worker_outcome` dict (`{}`) builds a content-empty
+    `OutcomeEvidence` (all claim fields `None`) -- `worker_fate.
+    _carries_no_claim` is what stops that candidate from out-ranking the
+    worktree file's real `blocked` declaration even though the terminal
+    record's own timestamp is FRESH (postdates `dispatched_at`): without
+    it, an empty-but-fresh terminal candidate would win rule 7's
+    terminal-over-worktree precedence purely by timestamp, discarding the
+    worktree's real content. Both candidates are deliberately fresh here
+    (unlike a plain rule-1 staleness rejection) so this exercises the
+    `{}`-is-no-claim path specifically, not staleness.
     """
     from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
@@ -562,14 +776,19 @@ def test_flip7_workflow_empty_terminal_outcome_falls_through_to_worktree(tmp_pat
     branch = "agent/issue-9107-test"
     state_file, sessions_dir = _seed_no_pr_dispatched_issue(tmp_path, config, issue_number, branch)
 
+    # Fresh (post-`dispatched_at`) on purpose -- see docstring. A stale
+    # terminal timestamp would make rule 1 reject it regardless of whether
+    # `{}`-handling works, proving nothing about this specific defect.
+    fresh_ts = (datetime.now(UTC) + timedelta(seconds=5)).isoformat().replace("+00:00", "Z")
     write_worker_terminal_status(
         sessions_dir / f"issue-{issue_number}.claude.terminal.json",
         pid=99999,
         exit_code=1,
-        started_at="2026-01-01T00:00:00Z",
-        ended_at="2026-01-01T00:05:00Z",
+        started_at=fresh_ts,
+        ended_at=fresh_ts,
         duration_seconds=300.0,
         worker_outcome={},
+        worker_outcome_written_at=fresh_ts,
     )
 
     worktrees_dir = resolved_layout(config, tmp_path).worktrees
@@ -599,9 +818,12 @@ def test_flip7_workflow_empty_terminal_outcome_falls_through_to_worktree(tmp_pat
 
     st = load_state(state_file)
     entry = st["issues"][str(issue_number)]
-    # Current (disagreeing) behaviour: the present-but-empty terminal dict
-    # is falsy, so `or` silently falls through to the worktree file's real
-    # (blocked) content, and the sweep escalates on it.
+    # Fixed (N1) behaviour: `_carries_no_claim` keeps the fresh-but-empty
+    # terminal candidate from out-ranking the worktree file's real (blocked)
+    # content, so `resolve_fate` picks the worktree candidate and the sweep
+    # escalates on it. Pre-fix, the empty-but-fresh terminal candidate would
+    # win rule 7's precedence instead, `resolved_outcome` would carry no
+    # `outcome` field, and neither assertion below would hold.
     assert entry["status"] == "escalated"
     assert entry.get("escalation_reason") == "worker_declared_blocked"
 
@@ -609,14 +831,24 @@ def test_flip7_workflow_empty_terminal_outcome_falls_through_to_worktree(tmp_pat
 def test_flip7_read_rework_outcome_returns_empty_terminal_dict_unlike_workflow(
     tmp_path: Path,
 ) -> None:
-    """FLIP 7: current behaviour; contrast with the workflow.py site above.
+    """FLIP 7 / N1 (wf-review-opus.md), design doc §3 step 0: current
+    (fixed) behaviour -- same polarity as the workflow.py site above, not
+    the opposite one this test's name still describes (kept to preserve
+    the leaf name for the collect-only CI gate; see CLAUDE.md).
 
     `rework_outcome._read_rework_outcome` reads the SAME two sources
-    (durable terminal record, worktree fallback) but with
-    `isinstance(outcome, dict): return outcome` -- it returns the
-    present-but-empty terminal dict AS IS and never falls through to the
-    worktree file's real content, the opposite polarity from
-    `workflow.py`'s `terminal_outcome or worktree_outcome`.
+    (durable terminal record, worktree fallback) through the same
+    `worker_fate.resolve_fate` freshness step `workflow.py`'s no-PR lane
+    uses. This call site passes no `dispatched_at` (legacy mode: every
+    candidate's timestamp freshness check passes unconditionally), so
+    before the N1 fix a present-but-EMPTY terminal dict (`{}`) still beat
+    "legacy mode"'s unconditional freshness and was returned as-is,
+    discarding the worktree file's real content -- genuinely the opposite
+    polarity from `workflow.py`'s (then-buggy) `or`-based fallthrough.
+    `worker_fate._carries_no_claim` now makes an empty terminal candidate
+    non-decisive here too, so this site now falls through to the
+    worktree's real content exactly like `workflow.py`'s site does --
+    the two sites agree instead of disagreeing.
     """
     from charlie_work.rework_outcome import _read_rework_outcome
 
@@ -642,7 +874,7 @@ def test_flip7_read_rework_outcome_returns_empty_terminal_dict_unlike_workflow(
 
     result = _read_rework_outcome(sessions_dir, tmp_path, worktrees_dir, 9108, branch)
 
-    assert result == {}
+    assert result == {"push_succeeded": True, "pr_created": False, "head_sha": "realcontent"}
 
 
 # ---------------------------------------------------------------------------

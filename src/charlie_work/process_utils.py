@@ -387,6 +387,7 @@ def write_worker_terminal_status(
     ended_at: str,
     duration_seconds: float,
     worker_outcome: dict[str, Any] | None = None,
+    worker_outcome_written_at: str | None = None,
 ) -> None:
     """Atomically persist a worker process's terminal status (issue #773).
 
@@ -394,6 +395,15 @@ def write_worker_terminal_status(
     loop observes the process has exited. Uses the tmp-file + ``replace()``
     pattern required by CLAUDE.md for every JSON state write so a reader (the
     orphan detector's polling pass) never observes a partially-written file.
+
+    ``worker_outcome_written_at`` (design doc §3, Group A step A1; B5,
+    wf-review-opus.md) is the outcome file's own mtime, additive alongside
+    ``worker_outcome`` -- ``ended_at`` is when the watcher observed the
+    process exit, not when the copied-in outcome file was actually written,
+    and a worktree reused across dispatches can still hold a previous
+    dispatch's leftover outcome file. Consumers must use this field as the
+    outcome's freshness anchor when present, and fall back to ``ended_at``
+    only for records written before this field existed.
     """
     payload: dict[str, Any] = {
         "pid": pid,
@@ -404,6 +414,8 @@ def write_worker_terminal_status(
     }
     if worker_outcome is not None:
         payload["worker_outcome"] = worker_outcome
+    if worker_outcome_written_at is not None:
+        payload["worker_outcome_written_at"] = worker_outcome_written_at
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_suffix(path.suffix + ".tmp")
     tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -536,12 +548,39 @@ def start_terminal_status_watcher(
         ended_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
         try:
             worker_outcome = None
+            worker_outcome_written_at = None
             if worktree_path is not None:
                 # Local import to avoid a circular import: worktree.py already
                 # imports is_pid_alive from this module (issue #935).
+                from .config import WORKER_OUTCOME_FILENAME
                 from .worktree import read_worker_outcome
 
                 worker_outcome = read_worker_outcome(worktree_path)
+                if worker_outcome is not None:
+                    # B5 (wf-review-opus.md) / design doc §3, Group A step
+                    # A1: ``ended_at`` is when the watcher observed exit, not
+                    # when this outcome file was written -- a worktree reused
+                    # across dispatches can still hold a PREVIOUS dispatch's
+                    # outcome file if the new dispatch died before writing
+                    # its own, and nothing deletes the file at dispatch time.
+                    # Stamping that leftover with a fresh ``ended_at`` made
+                    # rule 1's freshness gate (``written_at > dispatched_at``)
+                    # pass on stale evidence -- the file's own mtime is the
+                    # only honest answer to "when was this written", so
+                    # capture it here, additively, alongside ``ended_at``.
+                    # ``None`` (missing file between the read above and this
+                    # stat, or an OS error) falls back to ``ended_at`` at the
+                    # consumer per the design doc's stated rollout-window
+                    # behaviour -- best-effort telemetry, not a hard failure.
+                    try:
+                        outcome_mtime = (worktree_path / WORKER_OUTCOME_FILENAME).stat().st_mtime
+                        worker_outcome_written_at = (
+                            datetime.fromtimestamp(outcome_mtime, tz=UTC)
+                            .isoformat()
+                            .replace("+00:00", "Z")
+                        )
+                    except OSError:
+                        worker_outcome_written_at = None
             write_worker_terminal_status(
                 path,
                 pid=pid,
@@ -549,6 +588,7 @@ def start_terminal_status_watcher(
                 started_at=started_at,
                 ended_at=ended_at,
                 duration_seconds=duration_seconds,
+                worker_outcome_written_at=worker_outcome_written_at,
                 worker_outcome=worker_outcome,
             )
         except Exception:

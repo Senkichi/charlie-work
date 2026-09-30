@@ -37,6 +37,8 @@ from charlie_work.worker_fate import (
     gather_evidence,
     is_alive,
     resolve_fate,
+    stale_evidence_events,
+    stale_evidence_key,
     worker_fate,
 )
 from charlie_work.worker import WorkerHealth
@@ -444,6 +446,61 @@ def test_row9_nonzero_exit_with_remote_ahead_still_credited() -> None:
     assert fate.pr_number == 11
 
 
+def test_row9_non_confirming_outcome_still_defers_to_remote_evidence() -> None:
+    """B1 (wf-review-opus.md): a fresh outcome that exists but never
+    confirms a push (a rework-shaped outcome, ``push_succeeded`` False)
+    must not shadow row 9's remote-confirmed evidence. Legacy behaviour was
+    ``reported_push or ahead_count > 0`` -- gating row 9 on bare
+    ``outcome is None`` silently dropped real pushed work (including a
+    #1248 salvage push landing after this outcome was written) whenever any
+    non-push-claiming outcome happened to exist.
+    """
+    outcome = _outcome(outcome="rework_requested", push_succeeded=False)
+    evidence = _evidence(
+        pid_alive=False,
+        terminal=None,
+        worktree_outcome=outcome,
+        branch=_branch(remote_ahead=1),
+    )
+    fate = resolve_fate(evidence, now=NOW)
+    assert isinstance(fate, PushedWithoutPr)
+
+
+def test_row9_outcome_missing_push_field_still_defers_to_remote_evidence() -> None:
+    """Same as above, but ``push_succeeded`` is simply absent (``None``)
+    rather than explicitly ``False`` -- the common shape for an outcome
+    that never claimed anything about the push.
+    """
+    outcome = _outcome(outcome="completed")
+    evidence = _evidence(
+        pid_alive=False,
+        terminal=None,
+        worktree_outcome=outcome,
+        branch=_branch(remote_ahead=1, open_pr_number=7),
+    )
+    fate = resolve_fate(evidence, now=NOW)
+    assert isinstance(fate, Completed)
+    assert fate.pr_number == 7
+
+
+def test_row9_self_reported_push_with_no_evidence_still_defers_not_credited() -> None:
+    """The companion, negative case: an outcome that DOES confirm a push
+    (``push_succeeded is True``) but cannot be verified here (no branch
+    evidence at all) must NOT fall through to row 9 -- that self-report-
+    with-no-evidence case stays exactly as before the B1 fix (see
+    ``tests/test_issue_1006.py``, deferred as an architecture-owner call).
+    """
+    outcome = _outcome(outcome="completed", push_succeeded=True, head_sha=None)
+    evidence = _evidence(
+        pid_alive=False,
+        terminal=None,
+        worktree_outcome=outcome,
+        branch=_branch(remote_ahead=None, remote_head_sha=None),
+    )
+    fate = resolve_fate(evidence, now=NOW)
+    assert isinstance(fate, Crashed)
+
+
 # --------------------------------------------------------------------------
 # Row 10: otherwise -> Crashed.
 # --------------------------------------------------------------------------
@@ -533,6 +590,29 @@ def test_freshness_empty_terminal_claim_is_not_decisive_falls_through_to_worktre
     assert fate.basis.stale == ()
 
 
+def test_freshness_empty_outcome_evidence_object_is_not_decisive_falls_through() -> None:
+    """N1 (wf-review-opus.md): a *present* ``OutcomeEvidence`` object with
+    every claim field ``None`` -- the exact shape ``_no_pr_outcome_evidence({})``
+    and ``rework_outcome._outcome_evidence({})`` build for an empty
+    ``.worker-outcome.json`` dict -- must not out-rank a worktree candidate
+    that carries a real claim, even though it is timestamp-fresh.
+
+    This is a different shape from the sibling
+    ``test_freshness_empty_terminal_claim_is_not_decisive_falls_through_to_worktree``
+    test above, which passes ``TerminalEvidence.outcome=None`` (no
+    ``OutcomeEvidence`` object at all -- always-correctly skipped). No
+    production consumer ever produces that shape for ``{}``; they all
+    produce a real, content-empty object, which is what this test builds.
+    """
+    empty_terminal_outcome = _outcome(source=EvidenceSource.TERMINAL, written_at=AFTER)
+    terminal = _terminal(ended_at=AFTER, exit_code=0, outcome=empty_terminal_outcome)
+    worktree_outcome = _outcome(written_at=AFTER, outcome="blocked")
+    fate = resolve_fate(_evidence(terminal=terminal, worktree_outcome=worktree_outcome), now=NOW)
+    assert isinstance(fate, Blocked)
+    assert fate.basis.outcome is worktree_outcome
+    assert fate.basis.stale == ()
+
+
 def test_freshness_legacy_mode_accepts_and_tags_rule_suffix() -> None:
     outcome = _outcome(written_at=None, outcome="blocked")
     fate = resolve_fate(_evidence(dispatched_at=None, worktree_outcome=outcome), now=NOW)
@@ -573,6 +653,54 @@ def test_is_alive_delegates_to_process_utils(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr("charlie_work.worker_fate._process_is_pid_alive", _fake)
     assert is_alive(1234, 5678.0) is True
     assert calls == [(1234, 5678.0)]
+
+
+def test_n6_build_profiles_completeness_check_survives_dash_o(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """N6 (wf-review-opus.md): the WORKER_HARNESSES/profile-registry
+    completeness guard must be an explicit ``raise``, not a bare
+    ``assert`` -- ``python -O`` strips ``assert`` statements, which would
+    silently disable this check exactly when a harness/profile drift
+    needs to be caught. Force a mismatch (a bogus extra harness) and
+    confirm ``_build_profiles`` still raises regardless.
+    """
+    from charlie_work import worker_fate
+
+    monkeypatch.setattr(worker_fate, "_PROFILES", None)
+    monkeypatch.setattr(
+        "charlie_work.harnesses.WORKER_HARNESSES",
+        frozenset({"devin-shell", "claude-code", "api", "command", "manual", "bogus-harness"}),
+    )
+    with pytest.raises(AssertionError, match="WORKER_HARNESSES"):
+        worker_fate._build_profiles()
+
+
+def test_n7_outcome_evidence_raw_is_immutable_against_caller_mutation() -> None:
+    """N7 (wf-review-opus.md): `OutcomeEvidence.raw` must not be the
+    caller's own live dict -- freezing the dataclass does not freeze
+    `raw`'s contents, so a caller mutating its own dict after
+    construction would otherwise be visible through the "frozen"
+    evidence. `raw` must also reject direct mutation itself.
+    """
+    caller_dict = {"push_succeeded": True, "pr_created": False, "head_sha": "abc123"}
+    evidence = OutcomeEvidence(
+        source=EvidenceSource.WORKTREE,
+        written_at=None,
+        outcome=None,
+        push_succeeded=True,
+        pr_created=False,
+        head_sha="abc123",
+        raw=caller_dict,
+    )
+
+    # Mutating the caller's own dict afterward must not leak through.
+    caller_dict["head_sha"] = "mutated"
+    assert evidence.raw["head_sha"] == "abc123"
+
+    # `raw` itself must refuse direct mutation.
+    with pytest.raises(TypeError):
+        evidence.raw["head_sha"] = "mutated"  # type: ignore[index]
 
 
 # --------------------------------------------------------------------------
@@ -727,3 +855,81 @@ def test_worker_fate_convenience_gathers_then_resolves() -> None:
     )
     assert isinstance(fate, Throttled)
     assert fate.failure is failure
+
+
+# --------------------------------------------------------------------------
+# B6 (wf-review-opus.md) / design doc §5: the stale-evidence event.
+# --------------------------------------------------------------------------
+
+
+def test_stale_evidence_events_builds_one_event_per_stale_candidate() -> None:
+    stale_terminal_outcome = _outcome(
+        source=EvidenceSource.TERMINAL, written_at=BEFORE, outcome="blocked"
+    )
+    terminal = _terminal(ended_at=AFTER, exit_code=None, outcome=stale_terminal_outcome)
+    fresh_worktree_outcome = _outcome(
+        source=EvidenceSource.WORKTREE, written_at=AFTER, outcome="blocked"
+    )
+    fate = resolve_fate(
+        _evidence(terminal=terminal, worktree_outcome=fresh_worktree_outcome), now=NOW
+    )
+    assert fate.basis.stale, "fixture must actually produce stale evidence"
+
+    events = stale_evidence_events({}, fate)
+
+    assert len(events) == len(fate.basis.stale)
+    kind, payload = events[0]
+    assert kind == "worker_evidence_stale"
+    assert payload["issue_number"] == fate.basis.issue_number
+    assert payload["source"] == "terminal"
+    assert payload["reason"] == "older_than_dispatch"
+    assert payload["written_at"] == BEFORE.isoformat()
+    assert payload["evidence_head"] is None
+    assert payload["live_head"] is None
+
+
+def test_stale_evidence_events_reads_dispatched_at_and_adapter_from_entry() -> None:
+    stale_outcome = _outcome(written_at=BEFORE, outcome="blocked")
+    fate = resolve_fate(_evidence(worktree_outcome=stale_outcome), now=NOW)
+    assert fate.basis.stale
+
+    entry = {"dispatched_at": "2026-01-01T12:00:00Z", "adapter": "devin"}
+    events = stale_evidence_events(entry, fate)
+
+    assert len(events) == 1
+    _, payload = events[0]
+    assert payload["dispatched_at"] == "2026-01-01T12:00:00Z"
+    assert payload["adapter"] == "devin"
+
+
+def test_stale_evidence_events_empty_when_nothing_is_stale() -> None:
+    fate = resolve_fate(_evidence(pid_alive=True, health=WorkerHealth.HEALTHY), now=NOW)
+    assert fate.basis.stale == ()
+    assert stale_evidence_events({}, fate) == []
+
+
+def test_stale_evidence_events_dedups_against_already_reported_keys() -> None:
+    stale_outcome = _outcome(written_at=BEFORE, outcome="blocked")
+    fate = resolve_fate(_evidence(worktree_outcome=stale_outcome), now=NOW)
+    assert len(fate.basis.stale) == 1
+    key = stale_evidence_key(fate.basis.stale[0])
+
+    # Not yet reported: one event.
+    assert len(stale_evidence_events({}, fate)) == 1
+
+    # Already reported: deduped to nothing, same fate, same stale evidence.
+    entry = {"stale_evidence_reported": [key]}
+    assert stale_evidence_events(entry, fate) == []
+
+
+def test_stale_evidence_key_distinguishes_source_and_written_at() -> None:
+    a = _outcome(source=EvidenceSource.TERMINAL, written_at=BEFORE, outcome="blocked")
+    b = _outcome(source=EvidenceSource.WORKTREE, written_at=BEFORE, outcome="blocked")
+    fate_a = resolve_fate(
+        _evidence(terminal=_terminal(ended_at=AFTER, exit_code=None, outcome=a)), now=NOW
+    )
+    fate_b = resolve_fate(_evidence(worktree_outcome=b), now=NOW)
+    assert fate_a.basis.stale and fate_b.basis.stale
+    key_a = stale_evidence_key(fate_a.basis.stale[0])
+    key_b = stale_evidence_key(fate_b.basis.stale[0])
+    assert key_a != key_b

@@ -542,3 +542,265 @@ def test_dispatch_phantom_live_worker_preserves_sidecar_for_push_succeeded_outco
     assert len(preserve_events) == 1
     payload = preserve_events[0]["payload"]
     assert payload["reported_push"] is True
+
+
+def test_dispatch_phantom_live_worker_reaps_sidecar_when_pr_created_omitted(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """B9 (wf-review-opus.md): an outcome that OMITS ``pr_created`` entirely
+    must NOT get the same preservation treatment as one that explicitly
+    declares ``pr_created: false``.
+
+    Sibling of ``test_dispatch_phantom_live_worker_preserves_sidecar_for_push_succeeded_outcome``
+    above, with ``pr_created`` left out of the outcome payload instead of
+    set to ``False``. The legacy check (restored by this fix) required an
+    explicit ``pr_created is False`` before crediting a declared push; the
+    worker-fate refactor briefly loosened this to ``pr_created is not
+    True``, which also admits the omitted/``None`` case -- an incomplete
+    self-report is not proof of "no PR was created". With the fix,
+    ``declared_push`` is false here, so (worktree state UNKNOWN, same as
+    the sibling test) the sidecar is reaped and labels ARE stripped, the
+    opposite of the sibling test's outcome.
+    """
+    from charlie_work.config import WORKER_OUTCOME_FILENAME
+
+    worktree_path = tmp_path / "wt"
+    worktree_path.mkdir(parents=True, exist_ok=True)
+    (worktree_path / WORKER_OUTCOME_FILENAME).write_text(
+        json.dumps({"push_succeeded": True, "error": "gh unauthenticated"}),
+        encoding="utf-8",
+    )
+
+    def _fake_launch(issue_number, branch, prompt_text, **kwargs):
+        return ClaudeWorkerRecord(
+            issue_number=issue_number,
+            branch=branch,
+            worktree_path=str(worktree_path),
+            prompt_path=str(worktree_path / ".orchestrator-prompt.md"),
+            command=("claude", "-p"),
+            pid=7374,
+            started_at="2026-08-10T11:15:39Z",
+            log_path=str(tmp_path / "log"),
+            error="probe_error",
+            failure_kind="live_worker_redispatch_averted",
+            process_start_time=4_567_891.0,
+        )
+
+    monkeypatch.setattr("charlie_work.claude_code.launch_claude_worker", _fake_launch)
+    monkeypatch.setattr("charlie_work.workflow.is_pid_alive", lambda pid, start: False)
+    monkeypatch.setattr("charlie_work.claude_code.is_pid_alive", lambda pid, start: False)
+
+    config = OrchestratorConfig(worker=WorkerRoleConfig(harness="claude-code"))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.pr_list = lambda: []
+    _original_issue_view = fake_gh.issue_view
+
+    def _patched_issue_view(number: int):
+        issue = _original_issue_view(number)
+        return {
+            **issue,
+            "labels": [
+                {"name": "automated-ready"},
+                {"name": "agent:in-progress"},
+            ],
+        }
+
+    fake_gh.issue_view = _patched_issue_view
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    sidecar_path = sessions_dir / "issue-123.claude.json"
+    sidecar_path.write_text(
+        json.dumps(
+            {
+                "issue_number": 123,
+                "branch": "agent/issue-123-fix-search",
+                "worktree_path": str(worktree_path),
+                "prompt_path": "",
+                "command": ["claude", "-p"],
+                "pid": 7374,
+                "started_at": "2026-08-10T11:15:39Z",
+                "log_path": str(tmp_path / "log"),
+                "error": "probe_error",
+                "failure_kind": "live_worker_redispatch_averted",
+                "process_start_time": 4_567_891.0,
+                "session_id": "test-session-7374",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    seed = load_state(paths.state_file)
+    seed["issues"]["123"] = {
+        "number": 123,
+        "status": "dispatched",
+        "branch_name": "agent/issue-123-fix-search",
+        "worker_pid": 7374,
+        "worker_process_start_time": 4_567_891.0,
+        "title": "Fix search",
+        "url": "https://example.test/issues/123",
+    }
+    save_state(paths.state_file, seed)
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    result = app.dispatch(limit=1)
+
+    assert result.data["phantom_live_worker_count"] == 1, repr(result.data)
+    assert not sidecar_path.exists(), "an omitted pr_created must not preserve the sidecar"
+
+    # Labels ARE stripped this time -- the opposite of the explicit-False sibling.
+    assert (123, "agent:in-progress") in fake_gh.labels_removed
+
+    state = load_state(paths.state_file)
+    dead_events = [
+        e
+        for e in state.get("events", [])
+        if e["kind"] == "session_failed_relabeled"
+        and e["payload"]["issue_number"] == 123
+        and e["payload"]["reason"] == "phantom_live_worker_pid_dead"
+    ]
+    assert len(dead_events) == 1
+    preserved_events = [
+        e
+        for e in state.get("events", [])
+        if e["kind"] == "session_failed_relabeled"
+        and e["payload"]["issue_number"] == 123
+        and e["payload"]["reason"] == "phantom_live_worker_completed_work_preserved"
+    ]
+    assert preserved_events == []
+
+
+def test_dispatch_phantom_live_worker_preserves_sidecar_for_blocked_outcome(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """B4 (wf-review-opus.md), rule 2: a phantom live worker with local
+    commits AND a fresh ``blocked`` outcome must NOT have its sidecar reaped
+    or its labels stripped/relabeled ``automated-ready``. Before the fix, a
+    ``Blocked`` fate was neither ``Stranded`` nor ``PushedWithoutPr`` and
+    ``declared_push`` was false, so control fell through to the reap-and-
+    ``ready`` path: the sidecar the reaper lane keys salvage/escalation off
+    was destroyed, and the issue was re-queued into the identical wall it
+    had just declared itself blocked on. Preserving it here instead defers
+    to the dead-session reaper lane, which already escalates a fresh
+    ``Blocked`` fate (``workflow.py``'s ``fates.get(issue_number) ==
+    Blocked`` branch) rather than redispatching.
+    """
+    from charlie_work.config import WORKER_OUTCOME_FILENAME
+
+    remote, repo_root = _init_bare_remote_and_clone(tmp_path)
+    worktree_path, branch = _setup_completed_worktree(repo_root, 1453)
+    (worktree_path / WORKER_OUTCOME_FILENAME).write_text(
+        json.dumps(
+            {
+                "outcome": "blocked",
+                "reason": "the task requires credentials this worker does not have",
+                "push_succeeded": False,
+                "pr_created": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    recent_started_at = (datetime.now(UTC) - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def _fake_launch(issue_number, branch, prompt_text, **kwargs):
+        return ClaudeWorkerRecord(
+            issue_number=issue_number,
+            branch=branch,
+            worktree_path=str(worktree_path),
+            prompt_path=str(worktree_path / ".orchestrator-prompt.md"),
+            command=("claude", "-p"),
+            pid=8484,
+            started_at=recent_started_at,
+            log_path=str(tmp_path / "log"),
+            error="probe_error",
+            failure_kind="live_worker_redispatch_averted",
+            process_start_time=5_678_901.0,
+        )
+
+    monkeypatch.setattr("charlie_work.claude_code.launch_claude_worker", _fake_launch)
+    monkeypatch.setattr("charlie_work.workflow.is_pid_alive", lambda pid, start: False)
+    # See the sibling completed-worktree test above: the sidecar's PID must
+    # also read as dead through claude_code.is_worker_alive's own
+    # claude_code.is_pid_alive reference, not just workflow's.
+    monkeypatch.setattr("charlie_work.claude_code.is_pid_alive", lambda pid, start: False)
+
+    config = OrchestratorConfig(worker=WorkerRoleConfig(harness="claude-code"))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.pr_list = lambda: []
+    _original_issue_view = fake_gh.issue_view
+
+    def _patched_issue_view(number: int):
+        issue = _original_issue_view(number)
+        return {
+            **issue,
+            "labels": [
+                {"name": "automated-ready"},
+                {"name": "agent:in-progress"},
+            ],
+        }
+
+    fake_gh.issue_view = _patched_issue_view
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    sidecar_path = sessions_dir / "issue-123.claude.json"
+    sidecar_path.write_text(
+        json.dumps(
+            {
+                "issue_number": 123,
+                "branch": branch,
+                "worktree_path": str(worktree_path),
+                "prompt_path": "",
+                "command": ["claude", "-p"],
+                "pid": 8484,
+                "started_at": recent_started_at,
+                "log_path": str(tmp_path / "log"),
+                "error": "probe_error",
+                "failure_kind": "live_worker_redispatch_averted",
+                "process_start_time": 5_678_901.0,
+                "session_id": "test-session-1453",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    seed = load_state(paths.state_file)
+    seed["issues"]["123"] = {
+        "number": 123,
+        "status": "dispatched",
+        "branch_name": branch,
+        "worker_pid": 8484,
+        "worker_process_start_time": 5_678_901.0,
+        "title": "Fix search",
+        "url": "https://example.test/issues/123",
+    }
+    save_state(paths.state_file, seed)
+
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    result = app.dispatch(limit=1)
+
+    assert result.data["phantom_live_worker_count"] == 1, repr(result.data)
+    assert sidecar_path.exists(), "Sidecar must not be reaped -- the reaper lane escalates Blocked"
+
+    # Labels are NOT stripped and `ready` is NOT restored: redispatching would
+    # re-queue the issue into the identical wall it declared itself blocked on.
+    assert (123, "agent:in-progress") not in fake_gh.labels_removed
+    assert (123, "automated-ready") not in fake_gh.labels_removed
+    assert (123, "automated-ready") not in fake_gh.labels_added
+
+    state = load_state(paths.state_file)
+    preserve_events = [
+        e
+        for e in state.get("events", [])
+        if e["kind"] == "session_failed_relabeled"
+        and e["payload"]["issue_number"] == 123
+        and e["payload"]["reason"] == "phantom_live_worker_declared_blocked_preserved"
+    ]
+    assert len(preserve_events) == 1
+    payload = preserve_events[0]["payload"]
+    assert payload["removed_labels"] == []
+    assert payload["added_ready"] is False
+    assert payload["worker_fate"] == "Blocked"

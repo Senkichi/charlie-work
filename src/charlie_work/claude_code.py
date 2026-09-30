@@ -21,7 +21,6 @@ import hashlib
 import json
 import logging
 import os
-import re
 import subprocess
 import sys
 import time
@@ -51,7 +50,7 @@ from .env_sanitize import resolve_pytest_cap, resolve_uv_no_sync, sanitize_env
 from .post_mortem import merge_attempt_snapshot
 from .state import _canonical_started_at, utc_now
 from .subprocess_runner import RunResult, resolve_cli_binary, run_captured
-from .throttle_signatures import match_quota_tail, match_throttle_tail
+from .throttle_signatures import is_provider_auth_failure, match_quota_tail, match_throttle_tail
 from .worktree import (
     LiveWorkerRedispatchError,
     ReworkBranchConflictError,
@@ -71,27 +70,14 @@ PROMPT_FILENAME = CLAUDE_CODE_PROMPT_FILENAME
 
 logger = logging.getLogger(__name__)
 
-# Pattern for provider authentication failures (issue #484). Matched against the
-# log tail of api-kind sessions only — a dead/invalid API key against a custom
+# Provider authentication failures (issue #484): matched against the log tail
+# of api-kind sessions only — a dead/invalid API key against a custom
 # Anthropic-compatible endpoint surfaces as 401/403 or an explicit
 # authentication/invalid-api-key error. Auth failures must NOT masquerade as
 # generic throttles: they are classified as ``provider_auth`` and enter the
 # existing ``throttled_until`` cooldown so routing preflight falls back until
 # the key is fixed (a dead key will not self-heal in minutes).
 #
-# The bare HTTP status codes 401/403 are anchored with word boundaries (\b) so
-# a coincidental numeric substring in an unrelated log tail (e.g. "error code
-# 14013", "4034 files processed", "issue #4019") cannot trip a false-positive
-# 24h cooldown. Every other pattern in this file (throttle markers, quota
-# phrases) matches natural-language substrings; the bare codes are the only
-# numeric tokens and would otherwise be the sole false-positive vector.
-_PROVIDER_AUTH_PATTERN = re.compile(
-    r"\b401\b|\b403\b|authentication(?:\s+failed)?|unauthorized|"
-    r"invalid[-\s]?api[-\s]?key|invalid[-\s]?authentication|"
-    r"permission_denied|auth(?:entication)?\s+error",
-    re.IGNORECASE,
-)
-
 # Headless permission-denial classification (issue #2010) lives in
 # ``worker_fate`` beside the other log-tail signatures (``classify_failure``
 # merge, design doc §7); re-exported here because this module is the public
@@ -119,6 +105,12 @@ def worker_permission_denied(sessions_dir: Path, issue_number: int, detail: str 
     return is_headless_permission_denial(log_text[-2048:])
 
 
+# N3 (wf-review-opus.md, wf-8-review-fixes): the matching pattern itself now
+# lives in ``throttle_signatures.is_provider_auth_failure`` (single point of
+# enforcement) instead of a byte-duplicate compiled here and again in
+# ``worker_fate.py`` — see that function's docstring for the word-boundary
+# 401/403 false-positive rationale.
+#
 # Provider account suspension / insufficient-balance classification (issue
 # #1342) moved to ``worker_fate._provider_suspension_in_tail`` as part of the
 # ``classify_failure`` merge (design doc §7) -- ``_classify_session_failure``
@@ -861,7 +853,7 @@ def run_quota_probe(*, repo_root: Path, config: OrchestratorConfig) -> bool:
     )
     combined = f"{result.stdout}\n{result.stderr}"
     tail = combined[-2048:] if len(combined) > 2048 else combined
-    if _PROVIDER_AUTH_PATTERN.search(tail):
+    if is_provider_auth_failure(tail):
         return False
     if match_quota_tail(tail, config.runtime.quota_error_markers):
         return False

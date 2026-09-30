@@ -118,6 +118,23 @@ def _route_phantom_live_worker(
         # legacy check below already trusts -- no remote read happens at
         # dispatch time, so there is no remote-ahead source to split it
         # from (rule 9 does not apply here).
+        #
+        # N5 (wf-review-opus.md): this IS the exact local-ahead/unpushed
+        # conflation rule 9 exists to remove -- a phantom branch whose
+        # commits are already fully pushed still resolves to `Stranded`
+        # here, same as a genuinely local-only one, because `ahead_count`
+        # (local vs base) does not distinguish "pushed but unmerged" from
+        # "never pushed". Left as-is: behaviour is unchanged from legacy
+        # (not a regression), and `Stranded`'s handling in this function
+        # already routes through the salvage-preserving branch below, so a
+        # misclassified-as-stranded pushed branch is not lost, only
+        # handled less precisely than a remote read would allow. Adding
+        # that remote read here means a new network call on the
+        # dispatch-time routing hot path -- a latency/rate-limit tradeoff
+        # for a caller elsewhere in this same file already avoided on
+        # purpose (see the comment above); left as a follow-up alongside
+        # B8's deferred `_worktree_still_unsafe` flip rather than decided
+        # unilaterally in this pass.
         try:
             outcome_mtime = datetime.fromtimestamp(
                 (worktree_path / WORKER_OUTCOME_FILENAME).stat().st_mtime, tz=UTC
@@ -177,21 +194,61 @@ def _route_phantom_live_worker(
         # row picked it, so `declared_push` reads the same self-reported
         # claim the legacy `reported_push` check trusted directly, gated
         # on rule 1 instead of trusted unconditionally.
+        # B9 (wf-review-opus.md): the legacy `reported_push` check above
+        # required an EXPLICIT `pr_created is False`. This refactored
+        # `declared_push` loosened it to `pr_created is not True`, which
+        # also admits `None` -- an outcome that omits `pr_created` now
+        # gets the same "confirmed pushed, no PR" preservation treatment
+        # as an explicit `false`. That widening was never one of the nine
+        # reviewed flips; restore the strict legacy gate.
         fresh_outcome = fate.basis.outcome
         declared_push = (
             fresh_outcome is not None
             and fresh_outcome.push_succeeded is True
-            and fresh_outcome.pr_created is not True
+            and fresh_outcome.pr_created is False
         )
-        if isinstance(fate, (worker_fate.Stranded, worker_fate.PushedWithoutPr)) or declared_push:
-            # Preserve the sidecar so the reaper lane can salvage. Do NOT
-            # strip labels -- the issue should stay in its active state
-            # until salvage moves it to pr_open, preventing re-dispatch
-            # into the occupied worktree.
+        # B4 (wf-review-opus.md), rule 2: a fresh `blocked` declaration
+        # beats push flags everywhere, but this dispatch-time helper has
+        # no remote read (see above) and is not the single point of
+        # enforcement for the blocked-escalation invariant -- the
+        # dead-session reaper lane already owns that (`workflow.py`'s
+        # `fates.get(issue_number) == Blocked` branch, and the
+        # `orphaned_worker_sweep.py` sites fixed for B2/B3), keyed off the
+        # very sidecar this function would otherwise reap. Before this
+        # fix, `Blocked` was neither `Stranded` nor `PushedWithoutPr` and
+        # `declared_push` was false for a pure blocked outcome, so control
+        # fell through to the reap-and-`ready` path below: the sidecar the
+        # reaper lane keys off was destroyed, and the issue was
+        # re-queued into the identical wall it had just declared itself
+        # blocked on. Folding `Blocked` into this same preserve branch
+        # (rather than escalating inline here, which would duplicate that
+        # enforcement point and reintroduce the entry-identity clobber the
+        # caller's `is_phantom_live_worker` arm does not guard against --
+        # it never re-reads `entry` from `state["issues"]` the way the
+        # dispatch-failed-cap and blocked-environment arms do after their
+        # own `_escalate_issue` calls) leaves the sidecar and labels
+        # untouched instead: the reaper lane's next pass resolves the same
+        # fresh `Blocked` fate with real branch evidence and escalates it
+        # exactly as it already does for a dead worker.
+        if (
+            isinstance(
+                fate, (worker_fate.Stranded, worker_fate.PushedWithoutPr, worker_fate.Blocked)
+            )
+            or declared_push
+        ):
+            # Preserve the sidecar so the reaper lane can act on it --
+            # either salvaging a pushed/stranded branch or escalating a
+            # declared-blocked worker. Do NOT strip labels -- the issue
+            # should stay in its active state until that lane resolves it,
+            # preventing re-dispatch into the occupied worktree or wall.
             state = _emit_session_failed_relabeled(
                 state,
                 issue_number=issue_number,
-                reason="phantom_live_worker_completed_work_preserved",
+                reason=(
+                    "phantom_live_worker_declared_blocked_preserved"
+                    if isinstance(fate, worker_fate.Blocked)
+                    else "phantom_live_worker_completed_work_preserved"
+                ),
                 failure_kind="live_worker_redispatch_averted",
                 removed_labels=[],
                 added_ready=False,
@@ -270,20 +327,39 @@ def _worktree_still_unsafe(self, issue_number: int, state: dict[str, Any]) -> st
     real blocker.
 
     FLIP 3 (rule-3 sibling of ``_route_phantom_live_worker`` above, design
-    doc §8 step B5): ``_worktree_refuse_to_reset_reason`` below classifies
+    doc §8 step B5) is deliberately NOT applied here, and this is a
+    permanent divergence, not a pending step (wf-review-opus.md B8: an
+    earlier commit message implied a follow-up "flip commit" was still
+    coming -- none is planned; see ``wf-review-dispositions.md`` B8 for the
+    full rationale). ``_worktree_refuse_to_reset_reason`` below classifies
     local-only commits (``WORKTREE_UNSAFE_KIND_LOCAL_COMMITS``,
     ``config.DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS``) as a
-    judgment-class escalation that is deliberately never auto-cleared --
-    the same underlying fact ``_route_phantom_live_worker`` resolves to
-    ``worker_fate.Stranded`` (salvageable) a few dozen lines up. Rule 3
-    folds both into one "stranded" fate; this function is not wired to
-    ``worker_fate`` directly because doing so would require a second,
-    duplicate ``inspect_worktree_state`` probe purely for an unused
-    classification (this function already fails closed on probe errors,
-    so a second probe adds risk -- a transient index lock between the two
-    calls could disagree with itself -- without changing what it returns).
-    The legacy reason string below stays authoritative until rule 3's own
-    flip commit reconciles the two call sites.
+    judgment-class escalation that is never auto-cleared here -- the same
+    underlying fact ``_route_phantom_live_worker`` resolves to
+    ``worker_fate.Stranded`` (salvageable) a few dozen lines up, for a
+    *different* caller.
+
+    Two independent reasons this function stays on the legacy reason
+    string instead of ``worker_fate.Stranded``:
+
+    1. Wiring it to ``worker_fate`` would require a second, duplicate
+       ``inspect_worktree_state`` probe purely for an unused
+       classification (this function already fails closed on probe
+       errors, so a second probe adds risk -- a transient index lock
+       between the two calls could disagree with itself -- without
+       changing what it returns).
+    2. More importantly, this function gates *de-escalation* (clearing an
+       existing ``worktree_unsafe`` label), which has no salvage step of
+       its own. ``_route_phantom_live_worker``'s ``Stranded`` is safe to
+       treat as salvageable because that lane runs ``_attempt_salvage``
+       (parks the branch for review) before anything touches the
+       worktree. Here, relabeling local-only commits as "safe to clear"
+       without also parking them first would let the next dispatch's
+       worktree reset silently discard those commits -- turning a
+       classification tweak into data loss. Applying rule 3 here for real
+       would mean adding a salvage-before-clear step, not just re-tagging
+       the fate; that is an architectural change, not this docstring's
+       scope.
     """
     issue_entry = state.get("issues", {}).get(str(issue_number), {})
     if not isinstance(issue_entry, dict):

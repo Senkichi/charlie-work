@@ -75,7 +75,9 @@ from typing import Any
 
 from .config import OrchestratorConfig
 from .process_utils import is_pid_alive as _process_is_pid_alive
+from .state import parse_iso_timestamp as _state_parse_iso_timestamp
 from .throttle_signatures import (
+    is_provider_auth_failure,
     is_provider_throttle_failure,
     match_quota_tail,
     match_throttle_tail,
@@ -116,6 +118,18 @@ class OutcomeEvidence:
     pr_created: bool | None  # a claim only; workers have no gh token (#1771)
     head_sha: str | None
     raw: Mapping[str, Any] = field(default_factory=lambda: _EMPTY_RAW)
+
+    def __post_init__(self) -> None:
+        # N7 (wf-review-opus.md): every construction site passes the
+        # live, mutable dict it just parsed as `raw`. Freezing the
+        # dataclass does not freeze `raw`'s own contents -- a caller
+        # mutation (e.g. of `worker_outcome` in a live-handoff candidate
+        # dict built alongside this evidence) would otherwise be visible
+        # through the "frozen" evidence after the fact. Wrap in
+        # `MappingProxyType` so `raw` is genuinely immutable regardless of
+        # what the caller does to its own copy afterward.
+        if not isinstance(self.raw, MappingProxyType):
+            object.__setattr__(self, "raw", MappingProxyType(dict(self.raw)))
 
 
 @dataclass(frozen=True)
@@ -298,6 +312,26 @@ def _head_fresh(evidence_head: str | None, live_head: str | None) -> bool:
     return evidence_head == live_head
 
 
+def _carries_no_claim(candidate: OutcomeEvidence) -> bool:
+    """N1 (wf-review-opus.md) / design doc §3 step 0: an empty terminal or
+    worktree outcome dict (``{}``) is "no claim: neither stale nor
+    decisive" -- distinct from *absent* (``None``), but the SAME as absent
+    for freshness-arbitration purposes. ``_no_pr_outcome_evidence`` /
+    ``rework_outcome._outcome_evidence`` both still build a real
+    ``OutcomeEvidence`` for ``{}`` (all four claim fields ``None``) rather
+    than returning ``None`` themselves, so the check belongs here -- the
+    single point every consumer's freshness step already funnels through --
+    instead of being duplicated at (and possibly missed by) each of their
+    construction sites.
+    """
+    return (
+        candidate.outcome is None
+        and candidate.push_succeeded is None
+        and candidate.pr_created is None
+        and candidate.head_sha is None
+    )
+
+
 def _evaluate_candidate(
     candidate: OutcomeEvidence | None,
     *,
@@ -307,9 +341,13 @@ def _evaluate_candidate(
     """Return (fresh, stale_entry_or_None) for one outcome candidate.
 
     A candidate that is absent (``None``, i.e. "no claim") is neither fresh
-    nor stale — the caller skips it entirely.
+    nor stale — the caller skips it entirely. The same holds for a present
+    candidate that carries no actual claim (every field ``None`` --
+    ``_carries_no_claim``): it must not out-rank a sibling candidate that
+    does carry real content just because it happens to be "fresher" by
+    timestamp alone.
     """
-    if candidate is None:
+    if candidate is None or _carries_no_claim(candidate):
         return False, None
     dispatch_ok = _dispatch_fresh(candidate.written_at, dispatched_at)
     head_ok = _head_fresh(candidate.head_sha, live_head)
@@ -502,10 +540,30 @@ def resolve_fate(evidence: FateEvidence, *, now: datetime) -> WorkerFate:  # noq
     ):
         return Throttled(basis=basis("R6"), failure=evidence.failure)
 
-    # Row 8 (R4): dead, no fresh outcome, a fresh clean exit with published
-    # commits -- the exit code decides only because no outcome file exists.
+    # Rows 8/9 read git-confirmed evidence (exit code / remote ahead-count),
+    # not the outcome file. They must fire not only when there is no fresh
+    # outcome at all, but also when a fresh outcome exists but never
+    # confirmed a push (``push_succeeded`` False or missing, e.g. a
+    # rework-shaped outcome): by this point rows 1-4 have already returned
+    # for every case where the outcome itself decides push/PR status
+    # (``blocked``, or a push confirmed at the remote), so a non-confirming
+    # outcome has nothing left to say and must not shadow real remote
+    # evidence. Gating on bare ``outcome is None`` silently dropped
+    # confirmed pushed work whenever any non-push-claiming outcome existed
+    # -- including the #1248 salvage-push case, where the push lands on the
+    # remote after the worker's own (non-confirming) outcome file was
+    # written (B1, wf-review-opus.md). An outcome that *does* claim
+    # ``push_succeeded is True`` but couldn't be confirmed here (unknown PR
+    # existence, or no branch evidence at all) still defers to the liveness/
+    # dead rows below rather than rows 8/9 -- that self-report-with-no-
+    # evidence case stays exactly as before (see ``tests/test_issue_1006.py``).
+    outcome_has_no_push_opinion = outcome is None or outcome.push_succeeded is not True
+
+    # Row 8 (R4): dead, no outcome deciding push/PR status, a fresh clean
+    # exit with published commits -- the exit code decides only because no
+    # outcome file settles it.
     if (
-        outcome is None
+        outcome_has_no_push_opinion
         and fresh.exit_code == 0
         and (
             (branch.remote_ahead is not None and branch.remote_ahead > 0)
@@ -514,9 +572,9 @@ def resolve_fate(evidence: FateEvidence, *, now: datetime) -> WorkerFate:  # noq
     ):
         return _completed_or_pushed(basis("R4"), branch, head_sha=branch.remote_head_sha)
 
-    # Row 9 (R3): dead, no outcome at all, remote shows pushed commits
-    # regardless of exit code.
-    if outcome is None and branch.remote_ahead is not None and branch.remote_ahead > 0:
+    # Row 9 (R3): dead, no outcome deciding push/PR status, remote shows
+    # pushed commits regardless of exit code.
+    if outcome_has_no_push_opinion and branch.remote_ahead is not None and branch.remote_ahead > 0:
         return _completed_or_pushed(basis("R3"), branch, head_sha=branch.remote_head_sha)
 
     # Row 10: otherwise, a dead worker with nothing to credit or salvage.
@@ -649,17 +707,15 @@ _DEFAULT_RATE_LIMIT_COOLDOWN_MINUTES = 15
 _DEFAULT_QUOTA_COOLDOWN_HOURS = 24
 
 # Provider authentication failures (issue #484). Matched against the log tail
-# of account-error-detecting (api) sessions only. Moved verbatim from
-# claude_code.py -- see git history there for the full false-positive
-# rationale (word-boundary 401/403 so a coincidental numeric substring like
-# "issue #4019" cannot trip a false cooldown).
-_PROVIDER_AUTH_PATTERN = re.compile(
-    r"\b401\b|\b403\b|authentication(?:\s+failed)?|unauthorized|"
-    r"invalid[-\s]?api[-\s]?key|invalid[-\s]?authentication|"
-    r"permission_denied|auth(?:entication)?\s+error",
-    re.IGNORECASE,
-)
-
+# of account-error-detecting (api) sessions only.
+#
+# N3 (wf-review-opus.md, wf-8-review-fixes): this used to be a byte-duplicate
+# of claude_code.py's own compiled copy ("moved verbatim from claude_code.py"
+# -- the two could drift silently). Both now call
+# ``throttle_signatures.is_provider_auth_failure`` (single point of
+# enforcement) -- see its docstring for the word-boundary 401/403
+# false-positive rationale.
+#
 # Provider account suspension / insufficient-balance responses (issue #1342).
 # Moved verbatim from claude_code.py. The billing phrase alone is not
 # enough -- ``_provider_suspension_in_tail`` requires it to co-occur on the
@@ -805,7 +861,7 @@ def classify_failure(
     if account_error_detection and _provider_suspension_in_tail(tail):
         return "provider_suspended", None
 
-    if account_error_detection and _PROVIDER_AUTH_PATTERN.search(tail):
+    if account_error_detection and is_provider_auth_failure(tail):
         cooldown = timedelta(hours=_DEFAULT_QUOTA_COOLDOWN_HOURS, seconds=resume_margin_seconds)
         throttled_until = resolved_now + cooldown
         return "provider_auth", throttled_until.replace(microsecond=0).isoformat().replace(
@@ -960,11 +1016,17 @@ def _build_profiles() -> dict[str, AdapterFateProfile]:
             over_budget=None,
         ),
     }
-    assert {p.harness for p in by_harness.values()} == WORKER_HARNESSES, (
-        "worker_fate._build_profiles must declare exactly the harnesses "
-        "harnesses.WORKER_HARNESSES declares valid -- keep both in sync "
-        "(adapters.py #1513 completeness-assert pattern)"
-    )
+    # N6 (wf-review-opus.md): an explicit raise, not a bare `assert` --
+    # this runs lazily on first `profile_for` call (mid-reap-pass, not at
+    # import), and a bare `assert` here is silently stripped under
+    # `python -O`, disabling the completeness guard exactly when a
+    # harness/profile drift would otherwise be caught.
+    if {p.harness for p in by_harness.values()} != WORKER_HARNESSES:
+        raise AssertionError(
+            "worker_fate._build_profiles must declare exactly the harnesses "
+            "harnesses.WORKER_HARNESSES declares valid -- keep both in sync "
+            "(adapters.py #1513 completeness-assert pattern)"
+        )
     return by_harness
 
 
@@ -1000,27 +1062,83 @@ def profile_for(adapter_kind: str) -> AdapterFateProfile | None:
 # --------------------------------------------------------------------------
 
 
-def parse_iso_timestamp(value: Any) -> datetime | None:
-    """Parse a ``state.json`` ISO 8601 timestamp into an aware ``datetime``.
+# N8 (wf-review-opus.md, wf-8-review-fixes): ``parse_iso_timestamp`` used to
+# be a byte-for-byte duplicate of ``workflow._parse_iso_timestamp``, kept
+# separate only to dodge an import cycle (``workflow.py`` imports this
+# module). ``state.parse_iso_timestamp`` is the shared leaf-module copy both
+# now use; re-exported under this name so every existing
+# ``worker_fate.parse_iso_timestamp(...)`` call site keeps working unchanged.
+parse_iso_timestamp = _state_parse_iso_timestamp
 
-    Mirrors ``workflow._parse_iso_timestamp`` byte-for-byte (kept as a
-    separate copy, not an import, to avoid a cycle: ``workflow.py`` imports
-    this module). Naive results are assumed UTC, matching every writer in
-    this codebase (``state.utc_now`` et al.).
+
+# --------------------------------------------------------------------------
+# B6 (wf-review-opus.md) / design doc §5: rule 1's stale-evidence event.
+# ``FateBasis.stale`` (rule 1/7's freshness step) was populated from the
+# start, but nothing built the event the plan promised ("Stale evidence is
+# ignored **and emits a stale-evidence event**") or read ``basis.stale`` at
+# all -- a prior-dispatch outcome (including a real pushed branch) could be
+# silently dropped with zero signal in events.db. These two functions are
+# the module's own answer (design doc §5); callers wire them in per site,
+# same as every other Group B consumer.
+# --------------------------------------------------------------------------
+
+
+def stale_evidence_key(stale: StaleEvidence) -> str:
+    """Dedup key for one ``StaleEvidence``: once per ``(source, written_at)``.
+
+    Design doc §5's dedup key, keyed by ``entry["stale_evidence_reported"]``
+    at the caller -- a dead worker re-swept every pass must not re-emit the
+    same stale candidate and flood the 2000-entry events ring.
     """
-    if value is None:
-        return None
-    if isinstance(value, datetime):
-        return value.replace(tzinfo=UTC) if value.tzinfo is None else value
-    if not isinstance(value, str):
-        return None
-    try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=UTC)
-    return parsed
+    written = stale.written_at.isoformat() if stale.written_at is not None else "unknown"
+    return f"{stale.source}:{written}"
+
+
+def stale_evidence_events(
+    entry: Mapping[str, Any], fate: WorkerFate
+) -> list[tuple[str, dict[str, Any]]]:
+    """Build ``(kind, payload)`` pairs for not-yet-reported rule-1 stale evidence.
+
+    Design doc §5: kind ``worker_evidence_stale`` (level warning), one event
+    per ``StaleEvidence`` in ``fate.basis.stale`` whose :func:`stale_evidence_key`
+    is not already in ``entry.get("stale_evidence_reported")``. Payload:
+    ``issue_number, source, reason, written_at, dispatched_at, evidence_head,
+    live_head, adapter`` -- ``dispatched_at`` and ``adapter`` come from
+    ``entry`` itself (``FateBasis`` does not carry either; every fate-computing
+    call site already stamps ``entry["dispatched_at"]``/``entry["adapter"]``
+    from the same evidence used to resolve the fate).
+
+    Pure: does not mutate ``entry``. The caller emits the returned events
+    through ``_record_event``/``append_event``/``log_event`` (ADR-0005; see
+    CLAUDE.md's instrumentation invariant for which one applies where) and
+    merges :func:`stale_evidence_key` for each of ``fate.basis.stale`` into
+    ``entry["stale_evidence_reported"]`` itself, in the same state-lock
+    section, so the dedup marker and the emitted events never drift apart.
+    """
+    basis = fate.basis
+    already_reported = set(entry.get("stale_evidence_reported") or ())
+    dispatched_at = entry.get("dispatched_at")
+    adapter = entry.get("adapter")
+    events: list[tuple[str, dict[str, Any]]] = []
+    for stale in basis.stale:
+        if stale_evidence_key(stale) in already_reported:
+            continue
+        events.append(
+            (
+                "worker_evidence_stale",
+                {
+                    "issue_number": basis.issue_number,
+                    "source": str(stale.source),
+                    "reason": str(stale.reason),
+                    "written_at": stale.written_at.isoformat() if stale.written_at else None,
+                    "dispatched_at": dispatched_at,
+                    "evidence_head": stale.evidence_head,
+                    "live_head": stale.live_head,
+                    "adapter": adapter,
+                },
+            )
+        )
+    return events
 
 
 @dataclass(frozen=True)
@@ -1029,8 +1147,10 @@ class PersistedFailure:
 
     The single accessor consumer sites use instead of reading
     ``entry.get("dead_worker_failure_kind")`` directly -- a guard test
-    (``test_worker_fate_seam.py``) fails if that string appears in ``src/``
-    outside ``state.py`` and this module.
+    (``tests/test_worker_fate_seam.py``) AST-walks ``src/`` and fails if a
+    ``.get("dead_worker_failure_kind")`` call or a
+    ``[...]["dead_worker_failure_kind"]`` read appears outside ``state.py``
+    (the field's owner) and this module.
     """
 
     kind: str | None

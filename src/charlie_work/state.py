@@ -431,6 +431,33 @@ def utc_now() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
+def parse_iso_timestamp(value: Any) -> datetime | None:
+    """Parse a ``state.json`` ISO 8601 timestamp into an aware ``datetime``.
+
+    N8 (wf-review-opus.md, wf-8-review-fixes): single point of enforcement
+    for a parser that used to be hand-duplicated byte-for-byte in both
+    ``workflow.py`` (``_parse_iso_timestamp``) and ``worker_fate.py``
+    (``parse_iso_timestamp``, whose own comment said "mirrors
+    workflow._parse_iso_timestamp byte-for-byte... to avoid a cycle").
+    ``state.py`` has no import of either module, so both can import this
+    one without creating that cycle. Naive results are assumed UTC,
+    matching every writer in this codebase (``utc_now`` above et al.).
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=UTC) if value.tzinfo is None else value
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed
+
+
 def age_days_since(timestamp: str | None, *, now: datetime | None = None) -> float | None:
     """Days elapsed since an ISO-8601 ``terminal_since``-shaped timestamp.
 
