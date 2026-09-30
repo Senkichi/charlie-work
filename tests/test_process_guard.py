@@ -8,11 +8,13 @@ the test body, so the autouse guard itself observes a clean teardown.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import subprocess
 import sys
 import time
 import types
+from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -64,12 +66,23 @@ def _wait_dead(pid: int, timeout: float = 10.0) -> bool:
     return False
 
 
-def _spawn_orphan_sleeper(tmp_path: Path, seconds: int = 120) -> int:
-    """Launch a sleeper through a helper that exits immediately.
+@contextlib.contextmanager
+def _orphan_sleeper(tmp_path: Path, seconds: int = 120) -> Iterator[int]:
+    """Yield the pid of a sleeper whose parent (a helper) has already exited.
 
-    The sleeper ends up parented to a dead pid — alive and killable, but not
-    a descendant of pytest — which is exactly the "foreign pid" shape a
+    The sleeper ends up parented to a dead pid -- alive and killable, but not
+    a descendant of pytest -- which is exactly the "foreign pid" shape a
     fabricated launch record could carry.
+
+    The helper's ``Popen`` handle is deliberately kept open for the whole
+    ``with`` body. ``psutil.Process.children(recursive=True)`` links a process
+    to its parent by *pid* (ppid map) and only rejects a reused pid when the
+    new holder is older than pytest. On Windows a pid stays allocated while any
+    handle to the process object is open, so holding the handle guarantees the
+    orphan's recorded ppid can never be recycled into a fresh child of ours and
+    chain the orphan into our descendant set. (An exited process that is merely
+    handle-held does not appear in the process snapshot -- verified -- so
+    holding it cannot itself be the thing that makes the orphan look ours.)
     """
     script = tmp_path / "orphan_helper.py"
     script.write_text(
@@ -89,14 +102,36 @@ def _spawn_orphan_sleeper(tmp_path: Path, seconds: int = 120) -> int:
         stderr=subprocess.PIPE,
         text=True,
     )
+    orphan_pid: int | None = None
     try:
         out, err = helper.communicate(timeout=30)
         assert helper.returncode == 0, f"orphan helper failed: {err!r}"
-        return int(out.strip())
+        orphan_pid = int(out.strip())
+        yield orphan_pid
     finally:
         if helper.poll() is None:
             helper.kill()
             helper.wait(timeout=10)
+        if orphan_pid is not None and psutil.pid_exists(orphan_pid):
+            with contextlib.suppress(psutil.NoSuchProcess):
+                psutil.Process(orphan_pid).kill()
+                psutil.Process(orphan_pid).wait(timeout=10)
+
+
+def _wait_not_our_descendant(pid: int, timeout: float = 10.0) -> set[int]:
+    """Poll until ``pid`` leaves pytest's descendant set; return the last set.
+
+    The set is a point-in-time process snapshot, and the helper that parented
+    ``pid`` exited a moment ago; a snapshot taken mid-teardown can still list
+    it. Bounded polling turns that transient into a deterministic outcome: a
+    pid that is genuinely ours stays in the set for the whole deadline.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        ours = {p.pid for p in psutil.Process().children(recursive=True)}
+        if pid not in ours or time.monotonic() >= deadline:
+            return ours
+        time.sleep(0.05)
 
 
 def test_leaked_sleeper_is_reported_and_killed() -> None:
@@ -169,11 +204,13 @@ def test_reap_pid_never_touches_foreign_or_missing_pids(tmp_path: Path) -> None:
     the test.
     """
     parent_pid = os.getppid()
-    orphan_pid = _spawn_orphan_sleeper(tmp_path)
-    try:
-        ours = {p.pid for p in psutil.Process().children(recursive=True)}
+    with _orphan_sleeper(tmp_path) as orphan_pid:
+        ours = _wait_not_our_descendant(orphan_pid)
         assert parent_pid not in ours, "test premise broken: pytest's parent is our descendant"
-        assert orphan_pid not in ours, "test premise broken: orphan is still our descendant"
+        assert orphan_pid not in ours, (
+            "test premise broken: orphan is still our descendant; "
+            f"orphan={orphan_pid} ppid={psutil.Process(orphan_pid).ppid()} ours={sorted(ours)}"
+        )
 
         reap_pid(None)
         reap_pid(0)
@@ -192,10 +229,6 @@ def test_reap_pid_never_touches_foreign_or_missing_pids(tmp_path: Path) -> None:
 
         reap_pid(parent_pid)
         assert psutil.pid_exists(parent_pid), "reap_pid killed pytest's parent"
-    finally:
-        if psutil.pid_exists(orphan_pid):
-            psutil.Process(orphan_pid).kill()
-            psutil.Process(orphan_pid).wait(timeout=10)
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Job Objects exist only on Windows")
