@@ -1671,8 +1671,8 @@ def _detect_and_handle_orphaned_workers(
       dispatched this worker) and head is unchanged since review, reset to
       "rework_requested" -- same as the request_changes branch (issue #1109)
     - Issue #1911: before either reset, when no terminal-status record exists
-      (``terminal_exit_code is None`` -- the normal shape for devin-shell
-      sessions, which never get a watcher), a fresh on-target
+      (``terminal_exit_code is None`` -- e.g. a session whose watcher never
+      ran, or one launched before every Popen-backed harness grew one), a fresh on-target
       ``.worker-outcome.json`` in the worktree proves the dispatch completed;
       its PR edits are applied through the #1877 outcome-apply path instead
       of crediting a worker death. Issue #1915: once that apply lands, the

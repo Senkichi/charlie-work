@@ -499,10 +499,11 @@ def handle_dead_worker_with_pr(
     # exited 0 having pushed nothing -- both present identically
     # to `_worker_pid_alive`. `find_worker_terminal_status` reads
     # the durable record `start_terminal_status_watcher`
-    # (process_utils.py) writes at the moment a claude-code worker
-    # actually exits; it returns None for legacy sessions, sessions
-    # from adapters that don't write one (e.g. devin-shell), or
-    # any session whose watcher never got to run (e.g. orchestrator
+    # (process_utils.py) writes at the moment a worker from any
+    # Popen-backed harness (claude-code, api, devin-shell since
+    # #2052) actually exits; it returns None for legacy sessions,
+    # sessions from adapters that don't write one (command/manual),
+    # or any session whose watcher never got to run (e.g. orchestrator
     # restart mid-session). `terminal_exit_code` is deliberately
     # left as None in all of those cases rather than guessed at --
     # every event below records it as-is so the two populations
