@@ -21,9 +21,12 @@ network I/O). In priority order:
 
 ``entry["no_op_handled_head"]`` records the head a tier-1/2 disposition was issued for;
 it is what makes "second no-op on the same head" checkable. Nothing here leaves the
-issue ``dispatched`` except one deliberate deferral: the checks fetch failed
-(``pr_checks`` returned ``None``), so CI state is unknown. That retries next pass and
-is bounded by the #654 ``dead_dispatched_reap_minutes`` backstop the sweep arms.
+issue ``dispatched`` except the deliberate deferrals for CI that has not settled:
+``pr_checks`` returned ``None`` (check state unknown), or the required-check summary
+is neither ``failed`` nor ``ready`` -- a required check still ``pending``,
+``missing``, ``infra_failed``, ``infra_blocked``, or ``unavailable``. Both defer to
+the next pass, stamp ``no_op_deferred_head`` once per head for the audit trail, and
+are bounded by the #654 ``dead_dispatched_reap_minutes`` backstop the sweep arms.
 """
 
 from __future__ import annotations
@@ -46,6 +49,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 NO_OP_HANDLED_HEAD_KEY = "no_op_handled_head"
+NO_OP_DEFERRED_HEAD_KEY = "no_op_deferred_head"
 NO_OP_ESCALATION_REASON = "rework_no_op"
 _LOG_EXCERPT_LINES = 40
 _LOG_EXCERPT_CHARS = 3000
@@ -179,11 +183,37 @@ def _drain_one(
     if entry.get(NO_OP_HANDLED_HEAD_KEY) != head:
         checks = gh.pr_checks(pr_number)
         if checks is None:
-            return  # CI state unknown: retry next pass (bounded by the #654 backstop)
+            # CI state unknown: retry next pass (bounded by the #654 backstop).
+            _defer_no_op(state_file, write_gate, route, ci_state="unavailable")
+            return
         required = config.auto_merge.required_checks
         if enrich_checks_callback is not None:
             checks = enrich_checks_callback(checks, required)
         summary = summarize_checks(checks, required)
+        if not summary.failed and not summary.ready:
+            # Required CI has not settled -- a check is pending, missing,
+            # infra-failed, infra-blocked, or unavailable -- so red vs green is
+            # undecided and any disposition would be a guess. Defer to the next
+            # pass, bounded by the same #654 backstop as the checks-is-None
+            # case, rather than falling through to rework_no_op escalation.
+            _defer_no_op(
+                state_file,
+                write_gate,
+                route,
+                ci_state="unsettled",
+                unsettled={
+                    bucket: sorted(getattr(summary, bucket))
+                    for bucket in (
+                        "pending",
+                        "missing",
+                        "infra_failed",
+                        "infra_blocked",
+                        "unavailable",
+                    )
+                    if getattr(summary, bucket)
+                },
+            )
+            return
         if summary.failed and record_review_callback is not None:
             failed = tuple(summary.failed)
             required_changes = _failing_step_entries(
@@ -235,6 +265,7 @@ def _drain_one(
                 "dispatched_at": None,
                 "orphan_drift_fingerprint": None,
                 "orphan_drift_at": None,
+                NO_OP_DEFERRED_HEAD_KEY: None,
                 "no_op_worker_comment": comment,
             },
         )
@@ -255,6 +286,55 @@ def _drain_one(
     escalations.append(issue_number)
 
 
+def _defer_no_op(
+    state_file: Path,
+    write_gate: WriteGate,
+    route: NoOpReworkRoute,
+    *,
+    ci_state: str,
+    unsettled: dict[str, list[str]] | None = None,
+) -> None:
+    """Leave the issue ``dispatched``; record once per head why a pass declined to act.
+
+    A no-op finding whose required CI has not settled gets no disposition this
+    pass -- it is retried on a later pass and bounded by the #654
+    ``dead_dispatched_reap_minutes`` backstop the sweep armed. The
+    ``no_op_deferred_head`` marker both makes the wait inspectable (the issue is
+    ``dispatched`` *because* CI was unsettled, not silently) and dedupes the
+    audit event: a clean-exit finding re-collects every pass while CI stays
+    unsettled, and re-emitting each time is the identical-event spam the
+    cost-spirals dedup convention exists to prevent.
+    """
+    import charlie_work.workflow as _wf
+
+    with _wf.state_lock(state_file):
+        state = _wf.load_state(state_file)
+        cur = state["issues"].get(str(route.issue_number), {})
+        if not isinstance(cur, dict) or cur.get("status") != "dispatched":
+            return
+        if cur.get(NO_OP_DEFERRED_HEAD_KEY) == route.live_head_sha:
+            return  # already recorded for this head
+        state["issues"][str(route.issue_number)] = {
+            **cur,
+            NO_OP_DEFERRED_HEAD_KEY: route.live_head_sha,
+        }
+        state = write_gate.append_event(
+            state,
+            # event-consumer: audit-only -- the actionable signal is the #654
+            # dead-dispatched backstop this deferral waits on; this records why
+            # the pass issued no disposition (vs. silently doing nothing).
+            "rework_no_op_deferred",
+            {
+                "issue_number": route.issue_number,
+                "pr_number": route.pr_number,
+                "head_sha": route.live_head_sha,
+                "ci_state": ci_state,
+                "unsettled": unsettled or {},
+            },
+        )
+        write_gate.save_state(state)
+
+
 def _mark_handled(
     state_file: Path,
     write_gate: WriteGate,
@@ -272,6 +352,7 @@ def _mark_handled(
             state["issues"][str(route.issue_number)] = {
                 **cur,
                 NO_OP_HANDLED_HEAD_KEY: route.live_head_sha,
+                NO_OP_DEFERRED_HEAD_KEY: None,
                 "orphan_drift_at": None,
             }
         payload = {

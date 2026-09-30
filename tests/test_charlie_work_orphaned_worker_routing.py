@@ -346,10 +346,19 @@ def test_orphaned_worker_head_advanced_review_failure_emits_drift_once(tmp_path:
     state = load_state(paths.state_file)
     entry = state["issues"]["457"]
 
-    # Issue #2034: a refused review is tracked as drift AND escalated -- the
-    # issue must not rest in dispatched with no live worker.
-    assert entry.get("status") == "escalated"
-    assert entry.get("escalation_reason") == "rework_no_op"
+    # Issue #2034: a review() refusal that is NOT the janitor's unchanged-diff
+    # no-op gate (no ``is_no_op_rework`` in the result data -- a transient
+    # refusal such as draft auto-readied, a flake rerun triggered/in flight,
+    # or infra-blocked checks) must NOT escalate: the worker pushed a real
+    # head change, so the finding is tracked as drift and the issue stays
+    # dispatched under the #654 backstop -- it is not a no-op.
+    assert entry.get("status") == "dispatched"
+    assert entry.get("orphan_drift_fingerprint")
+    assert entry.get("orphan_drift_at")
+    escalated_events = [
+        e for e in state.get("events", []) if e.get("kind") == "rework_no_op_escalated"
+    ]
+    assert escalated_events == []
 
     events = state.get("events", [])
     drift_events = [e for e in events if e.get("kind") == "orphaned_worker_drift"]
@@ -374,6 +383,93 @@ def test_orphaned_worker_head_advanced_review_failure_emits_drift_once(tmp_path:
     events = state.get("events", [])
     drift_events = [e for e in events if e.get("kind") == "orphaned_worker_drift"]
     assert len(drift_events) == 1, "drift must not be re-emitted for the same fingerprint"
+
+
+def test_orphaned_worker_head_advanced_no_op_refusal_reaches_drain(tmp_path: Path) -> None:
+    """Issue #2034: a head-change review refusal that IS the janitor's
+    unchanged-diff no-op gate -- flagged ``is_no_op_rework`` in the result
+    data -- reaches the no-op drain, which escalates ``rework_no_op`` once
+    required CI is settled green and the worker left no rebuttal."""
+    from unittest.mock import patch
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    state = load_state(paths.state_file)
+    state["issues"]["457"] = {
+        "status": "dispatched",
+        "worker_pid": 99999,
+        "worker_process_start_time": 1234567890.0,
+        "dispatched_at": "2024-01-01T00:00:00Z",
+    }
+    state["prs"]["100"] = {
+        "decision": "request_changes",
+        "reviewed_head_sha": "abc123",
+    }
+    save_state(paths.state_file, state)
+    _write_flat_review_decision(paths, 100, "request_changes", "abc123")
+
+    class FakeGitHubForOrphan(FakeGitHub):
+        def pr_list(self):
+            return [
+                {
+                    "number": 100,
+                    "headRefOid": "def456",
+                    "isCrossRepository": False,
+                    "headRepository": {"owner": {"login": "test"}, "name": "repo"},
+                    "headRefName": "agent/issue-457",
+                }
+            ]
+
+    fake_gh = FakeGitHubForOrphan()
+    fake_gh.issues.append(
+        {
+            "number": 457,
+            "title": "Test issue",
+            "url": "https://example.test/issues/457",
+            "body": "",
+            "labels": [],
+            "state": "OPEN",
+        }
+    )
+
+    def fake_review(pr_number: int):
+        return CommandResult(
+            False,
+            "janitor gate blocked PR #100: rework produced no content change",
+            {"pr_number": pr_number, "is_no_op_rework": True},
+        )
+
+    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+        sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+
+        _detect_and_handle_orphaned_workers(
+            sessions_dir,
+            paths.state_file,
+            config,
+            fake_gh,
+            review_callback=fake_review,
+            write_gate=_wg(paths.state_file),
+        )
+
+    state = load_state(paths.state_file)
+    entry = state["issues"]["457"]
+
+    assert entry.get("status") == "escalated"
+    assert entry.get("escalation_reason") == "rework_no_op"
+    assert (457, config.labels.human_needed) in fake_gh.labels_added
+    escalated_events = [
+        e for e in state.get("events", []) if e.get("kind") == "rework_no_op_escalated"
+    ]
+    assert len(escalated_events) == 1
+    assert escalated_events[0]["payload"]["reason"] == "dead_worker_with_head_change"
 
 
 def test_orphaned_worker_unsafe_to_auto_reset_drift_emits_once(tmp_path: Path) -> None:

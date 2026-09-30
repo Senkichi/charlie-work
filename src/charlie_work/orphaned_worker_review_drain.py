@@ -177,6 +177,12 @@ def drain_orphaned_worker_review_routes(
         # the "reviewing" flip nor the transient-block drift fingerprint
         # below applies to a permanently-dead PR.
         closed_unmerged_converged = bool(review_result.data.get("closed_unmerged_converged"))
+        # Issue #2034: stable discriminator set by review()'s janitor-gate
+        # blocked return -- True only when the unchanged-diff no-op gate
+        # contributed to the refusal. Read once, before the lock, like the
+        # flags above; consumers must branch on this flag, never on the
+        # failure-message text.
+        is_no_op_rework = bool(review_result.data.get("is_no_op_rework"))
         with _wf.state_lock(state_file):
             state = _wf.load_state(state_file)
             pr_state = state["prs"].get(str(pr_number), {})
@@ -233,10 +239,19 @@ def drain_orphaned_worker_review_routes(
             ):
                 # Review failed: mark the drift fingerprint so the next pass
                 # does not retry/re-emit for this unchanged head.
-                # Issue #2034: a refused head-change review (the janitor's
-                # "diff unchanged" no-op gate) must also reach the no-op drain,
-                # or the issue rests in ``dispatched`` with no live worker.
-                if reason == "dead_worker_with_head_change" and no_op_routes is not None:
+                # Issue #2034: only a refusal the janitor's unchanged-diff
+                # no-op gate caused -- review() flags it ``is_no_op_rework``
+                # in the result data -- reaches the no-op drain. A transient
+                # refusal (draft auto-readied, ``gh pr ready`` failed, a flake
+                # rerun was triggered or is in flight, checks infra-blocked)
+                # belongs to its own lane: the worker pushed real changes, so
+                # the drift fingerprint below is all the bookkeeping this pass
+                # needs and escalating it as ``rework_no_op`` would be wrong.
+                if (
+                    reason == "dead_worker_with_head_change"
+                    and no_op_routes is not None
+                    and is_no_op_rework
+                ):
                     no_op_routes.append(
                         NoOpReworkRoute(
                             issue_number=issue_number,

@@ -4239,7 +4239,9 @@ class OrchestratorApp:
             conflict/no-op-rework route re-requests rework with no packet) and
             ``closed_unmerged_converged`` (issue #558: a CLOSED-unmerged PR is
             converged to state status "closed" at the janitor gate -- the PR is
-            dead, not a fresh-packet candidate). See
+            dead, not a fresh-packet candidate). A refused janitor-gate return
+            also carries ``is_no_op_rework`` -- True only when the unchanged-diff
+            no-op gate caused the refusal (issue #2034). See
             ``_route_rework_candidate_to_review`` and the dead-worker orphan
             sweep for the canonical gating pattern.
         """
@@ -5350,6 +5352,9 @@ class OrchestratorApp:
                     "janitor_failures": list(verdict.failures),
                     "janitor_warnings": list(verdict.warnings),
                     "checks_unavailable": checks is None,
+                    # Issue #2034: True only when the unchanged-diff no-op gate
+                    # caused this refusal -- the no-op drain's discriminator.
+                    "is_no_op_rework": verdict.is_no_op_rework,
                 },
             )
         pr_dir = self.paths.prs / f"pr-{pr_number}"
