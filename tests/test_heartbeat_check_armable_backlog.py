@@ -20,6 +20,7 @@ from _heartbeat_check_fixtures import (
     _load_heartbeat_check,
     _make_repo,
 )
+from charlie_work.config_deprecations import DEPRECATED_CONFIG_KEYS, DeprecatedConfigKey
 
 
 @pytest.fixture(scope="module")
@@ -254,3 +255,164 @@ def test_check_armable_backlog_mutation_arming_issue_clears_anomaly(
     assert not report_after.anomaly
     assert "genuinely empty" in report_after.lines[0]
     assert "armable=0" in report_after.lines[0]
+
+
+# ---------------------------------------------------------------------------
+# Issue #2004: dependency-blocked and sweep-owned issues are not un-triaged
+# ---------------------------------------------------------------------------
+
+
+def _issue_with_body(number: int, body: str, labels: tuple[str, ...] = ()) -> dict[str, Any]:
+    return {**_issue(number, labels), "body": body}
+
+
+def _self_repo(hb: ModuleType, tmp_path: Path) -> Any:
+    """A RepoInfo for the repo ``heartbeat_check.py`` itself lives in.
+
+    The registry's ``removal_issue`` numbers are issues in the orchestrator's
+    own repo only, and the gate is anchored on the checkout the script runs
+    from -- so sweep-gate tests must report a repo_root equal to
+    ``Path(hb.__file__).resolve().parent.parent`` rather than tmp_path.
+    """
+    return hb.RepoInfo(
+        slug="owner/repo",
+        repo_root=Path(hb.__file__).resolve().parent.parent,
+        state_dir=tmp_path / "state",
+        config_path=tmp_path / "orchestrator.config.yaml",
+    )
+
+
+# The sweep gate keys on the live registry's removal_issue numbers, so the
+# parametrization derives from it rather than pinning a literal -- a hardcoded
+# number would silently rot the day its registry entry is retired. (An empty
+# registry parametrizes zero cases, which pytest reports as skipped.)
+_REGISTRY_REMOVAL_ISSUES = [entry.removal_issue for entry in DEPRECATED_CONFIG_KEYS]
+
+
+def test_check_armable_backlog_body_blocked_by_open_issue_is_not_armable(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    """An unlabelled issue whose body reads ``Blocked by #N`` (N open) is gated."""
+    repo = _make_repo(hb, tmp_path)
+    issues = [
+        _issue_with_body(10, "Some work.\n\nBlocked by #11"),
+        _issue_with_body(11, "The blocker itself.", ("needs-design",)),
+    ]
+    _gh_dispatch(monkeypatch, hb, lambda args, cwd: (True, issues, ""))
+    report = hb.Report()
+    hb.check_armable_backlog(report, repo, blocked_numbers=set(), blocked_err="")
+    assert not report.anomaly
+    assert "armable=0" in report.lines[0]
+    assert "gated=2" in report.lines[0]
+
+
+def test_check_armable_backlog_body_blocker_closed_stays_armable(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    """A blocker absent from the open list (closed) no longer gates the issue."""
+    repo = _make_repo(hb, tmp_path)
+    issues = [_issue_with_body(10, "Blocked by #999")]
+    _gh_dispatch(monkeypatch, hb, lambda args, cwd: (True, issues, ""))
+    report = hb.Report()
+    hb.check_armable_backlog(report, repo, blocked_numbers=set(), blocked_err="")
+    assert report.anomaly
+    assert "[10]" in report.lines[0]
+
+
+@pytest.mark.parametrize("removal_issue", _REGISTRY_REMOVAL_ISSUES)
+def test_check_armable_backlog_unarmed_removal_issue_is_not_armable(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path, removal_issue: int
+) -> None:
+    """An unlabelled, un-armed registry ``removal_issue`` is parked, not un-triaged.
+
+    The config-retirement sweep files its removal issues unarmed ("do not
+    label by hand") and arms them itself once the quiet window elapses; the
+    registry is deliberately the only marker (config_deprecations.py), so
+    membership in it -- not a label -- is what gates.
+    """
+    repo = _self_repo(hb, tmp_path)
+    issues = [_issue_with_body(removal_issue, "Do not label this issue by hand.")]
+    _gh_dispatch(monkeypatch, hb, lambda args, cwd: (True, issues, ""))
+    report = hb.Report()
+    hb.check_armable_backlog(report, repo, blocked_numbers=set(), blocked_err="")
+    assert not report.anomaly
+    assert "armable=0" in report.lines[0]
+    assert "gated=1" in report.lines[0]
+
+
+@pytest.mark.parametrize("removal_issue", _REGISTRY_REMOVAL_ISSUES)
+def test_check_armable_backlog_armed_removal_issue_counts_as_runway(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path, removal_issue: int
+) -> None:
+    """Once the sweep marks its removal issue ``automated-ready`` it is runway."""
+    repo = _self_repo(hb, tmp_path)
+    issues = [_issue_with_body(removal_issue, "", ("automated-ready",))]
+    _gh_dispatch(monkeypatch, hb, lambda args, cwd: (True, issues, ""))
+    report = hb.Report()
+    hb.check_armable_backlog(report, repo, blocked_numbers=set(), blocked_err="")
+    assert not report.anomaly
+    assert "runway=1" in report.lines[0]
+
+
+def test_check_armable_backlog_sweep_gate_reads_registry_not_shape(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    """The gate derives from ``DEPRECATED_CONFIG_KEYS`` contents, not a constant.
+
+    A synthetic registry entry keeps the mechanism pinned even on the day the
+    live registry empties (the parametrized live-registry tests would then
+    collect zero cases).
+    """
+    entry = DeprecatedConfigKey(
+        section="dispatch", key="synthetic", replacement=None, removal_issue=4242
+    )
+    monkeypatch.setattr(hb._armable_gate, "DEPRECATED_CONFIG_KEYS", (entry,))
+    repo = _self_repo(hb, tmp_path)
+    issues = [_issue_with_body(4242, "")]
+    _gh_dispatch(monkeypatch, hb, lambda args, cwd: (True, issues, ""))
+    report = hb.Report()
+    hb.check_armable_backlog(report, repo, blocked_numbers=set(), blocked_err="")
+    assert not report.anomaly
+    assert "armable=0" in report.lines[0]
+    assert "gated=1" in report.lines[0]
+
+
+def test_check_armable_backlog_sweep_gate_ignores_sibling_repos(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    """A same-numbered issue in another managed repo is a different issue."""
+    repo = _make_repo(hb, tmp_path)  # repo_root under tmp_path != the script's tree
+    numbers = _REGISTRY_REMOVAL_ISSUES or [4242]
+    issues = [_issue_with_body(n, "") for n in numbers]
+    _gh_dispatch(monkeypatch, hb, lambda args, cwd: (True, issues, ""))
+    report = hb.Report()
+    hb.check_armable_backlog(report, repo, blocked_numbers=set(), blocked_err="")
+    assert report.anomaly
+    assert f"armable={len(numbers)}" in report.lines[0]
+
+
+def test_check_armable_backlog_degraded_imports_caveat_on_verdict(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    """When the #2004 guarded imports are unavailable the verdict line says so."""
+    monkeypatch.setattr(hb._armable_gate, "parse_blockers", None)
+    monkeypatch.setattr(hb._armable_gate, "DEPRECATED_CONFIG_KEYS", None)
+    repo = _self_repo(hb, tmp_path)
+    # #10's body blocker is unevaluated without parse_blockers, so both issues
+    # land in armable and the anomaly line must carry both caveats.
+    issues = [_issue_with_body(10, "Blocked by #11"), _issue_with_body(11, "")]
+    _gh_dispatch(monkeypatch, hb, lambda args, cwd: (True, issues, ""))
+    report = hb.Report()
+    hb.check_armable_backlog(report, repo, blocked_numbers=set(), blocked_err="")
+    assert report.anomaly
+    assert "body-blocker gate degraded" in report.lines[0]
+    assert "sweep-registry gate degraded" in report.lines[0]
+
+    # The caveat marks the OK verdict too.
+    armed = [_issue(n, ("automated-ready",)) for n in (1, 2, 3)]
+    _gh_dispatch(monkeypatch, hb, lambda args, cwd: (True, armed, ""))
+    ok_report = hb.Report()
+    hb.check_armable_backlog(ok_report, repo, blocked_numbers=set(), blocked_err="")
+    assert not ok_report.anomaly
+    assert "body-blocker gate degraded" in ok_report.lines[0]
+    assert "sweep-registry gate degraded" in ok_report.lines[0]
