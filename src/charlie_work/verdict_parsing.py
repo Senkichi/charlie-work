@@ -31,11 +31,11 @@ from .throttle_signatures import match_throttle_tail
 # carries whatever diagnostic detail WAS recoverable.
 CAUSE_UNKNOWN: dict[str, Any] = {"cause": "unknown"}
 
-# Re-exported for backward compatibility (``workflow.py``'s LOAD-BEARING
-# re-export block re-exports every name here) AND still consumed:
-# ``_extract_verdict_from_text`` unions this legacy unanchored model with
-# ``markdown_fence.scan`` so the parser is never more permissive than the
-# regex-only code it replaced (see ``markdown_fence.fence_contents_latest_first``).
+# Re-export alias only (``workflow.py``'s LOAD-BEARING re-export block
+# re-exports every name here). Nothing reads THIS name: the live object is
+# ``markdown_fence.LEGACY_FENCE_RE``, consumed by
+# ``markdown_fence.pick_last_valid_fence``, so monkeypatching the alias has no
+# effect.
 _VERDICT_FENCE_RE = markdown_fence.LEGACY_FENCE_RE
 
 # Absolute path ending in .md, as reviewers reference their summary files in
@@ -121,24 +121,29 @@ def _extract_verdict_from_text(text: str) -> dict[str, Any] | None:
     come from BOTH ``markdown_fence.scan`` (CommonMark line-anchored: no
     desync from a mid-line ``` run inside the payload, an unclosed fence
     still yields its content) and the legacy unanchored
-    ``_VERDICT_FENCE_RE`` (mid-line opener, closer glued to the closing
-    brace, tab/list-indented fence), ordered by source position so the
-    final block wins whichever model recognised it. Dropping either model
-    would let an earlier ``approved`` block beat a final
-    ``request_changes`` one -- a verdict guard failing open.
+    ``markdown_fence.LEGACY_FENCE_RE`` (mid-line opener, closer glued to the
+    closing brace, tab/list-indented fence), ordered by source position so
+    the final block wins whichever model recognised it. Dropping either
+    model would let an earlier ``approved`` block beat a final
+    ``request_changes`` one; and a scan-only block after the legacy pick
+    never turns a legacy non-``approved`` into ``approved`` (see
+    ``markdown_fence.pick_last_valid_fence``) -- a verdict guard must not
+    fail open.
     """
-    for body in markdown_fence.fence_contents_latest_first(text):
+
+    def parse(body: str) -> dict[str, Any] | None:
         candidate = body.strip()
         if not candidate:
-            continue
+            return None
         try:
             data = json.loads(candidate)
         except json.JSONDecodeError:
-            continue
-        verdict = _validate_review_verdict(data)
-        if verdict is not None:
-            return verdict
-    return None
+            return None
+        return _validate_review_verdict(data)
+
+    return markdown_fence.pick_last_valid_fence(
+        text, parse, is_approval=lambda verdict: verdict["decision"] == "approved"
+    )
 
 
 def _strip_fenced_blocks(text: str) -> str:

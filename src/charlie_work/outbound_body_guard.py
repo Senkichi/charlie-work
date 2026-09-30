@@ -105,6 +105,36 @@ def _shannon_entropy(text: str) -> float:
     return -sum((c / n) * math.log2(c / n) for c in counts.values())
 
 
+def _example_secret_lines(
+    contents: list[str], structure: markdown_fence.MarkdownStructure
+) -> set[int]:
+    """Line indices inside an ``example-secret`` fence of ``structure``.
+
+    Unclosed blocks run to end-of-file (CommonMark semantics). ``scan`` is
+    strict CommonMark (a closer indented 4+ columns, e.g. tab-indented, does
+    not close), but masking is the fail-OPEN side: an ``example-secret`` fence
+    is an author's claim that its content is a fake example, so the exempt
+    region must be the smallest plausible one, and an author who visibly
+    closed the block (a tab-indented ``` line) is not vouching for what
+    follows it. The mask therefore ends at the earlier of scan's closer and
+    the first lenient closer (same char, >= opener length, any leading
+    indent) -- the closer rule stays in ``markdown_fence.find_fence_close``
+    (re-review md-r2 B2).
+    """
+    lines: set[int] = set()
+    for fence in structure.fences:
+        if fence.info != _EXAMPLE_FENCE_INFO:
+            continue
+        end = fence.end if fence.closed else len(contents)
+        lenient_close = markdown_fence.find_fence_close(
+            contents, fence.start + 1, fence.char, fence.length, max_indent=None
+        )
+        if lenient_close is not None:
+            end = min(end, lenient_close + 1)
+        lines.update(range(fence.start, end))
+    return lines
+
+
 def _mask_example_secret_fences(text: str) -> str:
     """Blank out every line of each ``example-secret`` fenced block.
 
@@ -118,8 +148,9 @@ def _mask_example_secret_fences(text: str) -> str:
     structure"; this module's own fence/closer model was in fact the one
     ported INTO that shared scan side (see its module docstring), since it
     was the only consumer already satisfying every CommonMark rule the
-    recon checked, so this wiring is behavior-preserving. Only the masking
-    concern -- blank every line of a fence whose info string is exactly
+    recon checked. Masking additionally requires agreement of the strict
+    and the any-indent scan (see below), which only ever masks less (the
+    fail-safe direction for this guard). Only the masking concern -- blank every line of a fence whose info string is exactly
     ``example-secret``, opener and closer lines included -- stays here; it
     is not itself CommonMark structure.
 
@@ -136,28 +167,18 @@ def _mask_example_secret_fences(text: str) -> str:
         raw[len(content) :]
         for raw, content in zip(markdown_fence.split_lines(text, keepends=True), contents)
     ]
-    structure = markdown_fence.scan(text)
-    for fence in structure.fences:
-        if fence.info != _EXAMPLE_FENCE_INFO:
-            continue
-        end = fence.end if fence.closed else len(contents)
-        # Masking is the fail-OPEN side: an ``example-secret`` fence is an
-        # author's claim that its content is a fake example, so the exempt
-        # region must be the smallest plausible one. ``scan`` is strict
-        # CommonMark (a closer indented 4+ columns, e.g. tab-indented, does
-        # not close), but an author who visibly closed the block (a
-        # tab-indented ``` line) is not vouching for what follows it. End the
-        # mask at the earlier of scan's closer and the first lenient closer
-        # (same char, >= opener length, any leading indent) -- the closer
-        # rule stays in ``markdown_fence.find_fence_close`` (re-review md-r2
-        # B2).
-        lenient_close = markdown_fence.find_fence_close(
-            contents, fence.start + 1, fence.char, fence.length, max_indent=None
-        )
-        if lenient_close is not None:
-            end = min(end, lenient_close + 1)
-        for i in range(fence.start, end):
-            contents[i] = ""
+    # Mask a line only when BOTH the strict CommonMark scan and the tolerant
+    # (any-indent) scan put it inside an ``example-secret`` fence (md-r3
+    # review B2). Strict alone lets a tab-indented ordinary opener (a tab before the backticks)
+    # read as indented code, so a following ```example-secret line opens an
+    # exempt block and hides a real credential that the pre-scan character-
+    # count opener treated as literal content of the ordinary fence. Every
+    # divergence of the intersection masks LESS, the fail-safe direction here.
+    masked = _example_secret_lines(contents, markdown_fence.scan(text)) & _example_secret_lines(
+        contents, markdown_fence.scan(text, max_indent=None)
+    )
+    for i in masked:
+        contents[i] = ""
     return "".join(content + terminator for content, terminator in zip(contents, terminators))
 
 

@@ -92,7 +92,7 @@ _SEVERITY_RE = re.compile(
 )
 
 # Fence detection for ``_find_json_verdict`` is
-# ``markdown_fence.fence_contents_latest_first`` (architecture-deepening
+# ``markdown_fence.pick_last_valid_fence`` (architecture-deepening
 # candidate 3, "markdown structure"): the union of ``markdown_fence.scan``
 # (CommonMark line-anchored: a ``` run only delimits a block as the first
 # thing on its own line, so a ```python citation block's embedded ``` can
@@ -414,10 +414,12 @@ def _find_json_verdict(body: str) -> CrossFamilyVerdict | None:
 
     Scans fenced code blocks from the last one backwards (candidates are the
     union of ``markdown_fence.scan`` and the legacy unanchored fence regex,
-    ordered by source position; see
-    ``markdown_fence.fence_contents_latest_first``), mirroring
-    ``verdict_parsing._extract_verdict_from_text``, so a reviewer's actual final answer wins over an earlier echo (e.g. of
-    the example block in its own prompt). A block is shape-valid when
+    ordered by source position; see ``markdown_fence.pick_last_valid_fence``,
+    which also stops a scan-only block from turning a legacy
+    ``request_changes`` into ``approved``), mirroring
+    ``verdict_parsing._extract_verdict_from_text``, so a reviewer's actual
+    final answer wins over an earlier echo (e.g. of the example block in its
+    own prompt). A block is shape-valid when
     ``decision`` is ``"approved"`` or ``"request_changes"`` (cross-family
     review never gates a merge on its own, so unlike the primary reviewer it
     has no ``"blocked"`` decision) and ``summary`` is a non-empty,
@@ -425,41 +427,48 @@ def _find_json_verdict(body: str) -> CrossFamilyVerdict | None:
     of strings; a malformed one rejects that block (an earlier fence, if
     any, is tried next) rather than silently discarding the bad data.
     """
-    for fence_body in markdown_fence.fence_contents_latest_first(body):
-        candidate = fence_body.strip()
-        if not candidate:
-            continue
-        try:
-            data = json.loads(candidate)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(data, dict):
-            continue
-        decision = data.get("decision")
-        if decision not in ("approved", "request_changes"):
-            continue
-        summary = data.get("summary")
-        if not isinstance(summary, str):
-            continue
-        stripped_summary = summary.strip()
-        if not stripped_summary:
-            continue
-        # An unfilled template placeholder ("<one or two sentence...>") is
-        # prompt boilerplate that leaked into the verdict, never a real
-        # summary — mirrors workflow._validate_review_verdict's guard.
-        if stripped_summary.startswith("<") and stripped_summary.endswith(">"):
-            continue
-        raw_changes = data.get("required_changes")
-        if raw_changes is None:
-            required_changes: tuple[str, ...] = ()
-        elif isinstance(raw_changes, list) and all(isinstance(item, str) for item in raw_changes):
-            required_changes = tuple(item.strip() for item in raw_changes if item.strip())
-        else:
-            continue
-        return CrossFamilyVerdict(
-            decision=decision, summary=stripped_summary, required_changes=required_changes
-        )
-    return None
+    return markdown_fence.pick_last_valid_fence(
+        body,
+        _parse_json_verdict_body,
+        is_approval=lambda verdict: verdict.decision == "approved",
+    )
+
+
+def _parse_json_verdict_body(fence_body: str) -> CrossFamilyVerdict | None:
+    """Parse one fence body into a shape-valid cross-family verdict, or None."""
+    candidate = fence_body.strip()
+    if not candidate:
+        return None
+    try:
+        data = json.loads(candidate)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    decision = data.get("decision")
+    if decision not in ("approved", "request_changes"):
+        return None
+    summary = data.get("summary")
+    if not isinstance(summary, str):
+        return None
+    stripped_summary = summary.strip()
+    if not stripped_summary:
+        return None
+    # An unfilled template placeholder ("<one or two sentence...>") is
+    # prompt boilerplate that leaked into the verdict, never a real
+    # summary — mirrors workflow._validate_review_verdict's guard.
+    if stripped_summary.startswith("<") and stripped_summary.endswith(">"):
+        return None
+    raw_changes = data.get("required_changes")
+    if raw_changes is None:
+        required_changes: tuple[str, ...] = ()
+    elif isinstance(raw_changes, list) and all(isinstance(item, str) for item in raw_changes):
+        required_changes = tuple(item.strip() for item in raw_changes if item.strip())
+    else:
+        return None
+    return CrossFamilyVerdict(
+        decision=decision, summary=stripped_summary, required_changes=required_changes
+    )
 
 
 __all__ = [

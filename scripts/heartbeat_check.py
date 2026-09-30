@@ -1121,6 +1121,10 @@ def _scan_markdown_structure(text: str, *, max_indent: int | None = 3) -> _Markd
     )
 
 
+# Inline run of 3+ backticks paired with an equal-length closer, spanning lines.
+_INLINE_TRIPLE_SPAN_RE = re.compile(r"(`{3,}).+?\1", re.DOTALL)
+
+
 def _strip_fenced_code_blocks(text: str) -> str:
     """Remove every fenced code block from ``text`` (opener/closer lines
     included), via ``_scan_markdown_structure``.
@@ -1138,14 +1142,17 @@ def _strip_fenced_code_blocks(text: str) -> str:
     # fence must still be stripped (else a `#N` inside it is a false
     # stale-mention ANOMALY).
     structure = _scan_markdown_structure(text, max_indent=None)
-    if not structure.fenced_line_spans:
-        return text
-    lines = _md_split_lines(text, keepends=True)
-    drop = [False] * len(lines)
-    for start, end in structure.fenced_line_spans:
-        for index in range(start, min(end, len(lines))):
-            drop[index] = True
-    return "".join(line for line, is_dropped in zip(lines, drop) if not is_dropped)
+    if structure.fenced_line_spans:
+        lines = _md_split_lines(text, keepends=True)
+        drop = [False] * len(lines)
+        for start, end in structure.fenced_line_spans:
+            for index in range(start, min(end, len(lines))):
+                drop[index] = True
+        text = "".join(line for line, is_dropped in zip(lines, drop) if not is_dropped)
+    # A multi-line INLINE run of 3+ backticks (opener and closer of equal
+    # length, mid-paragraph) is a code span, not a block: strip it too, as the
+    # prior regex did (md-r3 N1).
+    return _INLINE_TRIPLE_SPAN_RE.sub("", text)
 
 
 # --------------------------------------------------------------------------

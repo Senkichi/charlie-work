@@ -249,20 +249,29 @@ def parse_advisories_comment(body: str) -> tuple[AdvisoryRecord, ...] | None:
     # ``scan``) -- ``lines`` below must use the same helper, not
     # ``str.splitlines()``, or a non-CommonMark separator could desync it
     # from ``fence.start``/``fence.end``.
-    structure = markdown_fence.scan(body)
-    if not structure.fences:
-        return ()
-    fence = structure.fences[0]
-    lines = markdown_fence.split_lines(body)
-    content_end = fence.end - 1 if fence.closed else fence.end
-    payload_text = "\n".join(lines[fence.start + 1 : content_end]).strip()
-    if not payload_text:
-        return ()
-    try:
-        decoded = json.loads(payload_text)
-    except json.JSONDecodeError:
-        return ()
-    if not isinstance(decoded, list):
+    # Try every fence in order and take the first whose body decodes to a
+    # JSON list, so an unrelated earlier fence (``~~~`` note) or a
+    # tab/list-indented payload fence the strict scan rejects (origin/main's
+    # ``lstrip`` accepted it) cannot mask the payload (md-r3 N2): strict
+    # CommonMark structure first, then the any-indent scan as a fallback.
+    decoded = None
+    for structure in (markdown_fence.scan(body), markdown_fence.scan(body, max_indent=None)):
+        lines = markdown_fence.split_lines(body)
+        for fence in structure.fences:
+            content_end = fence.end - 1 if fence.closed else fence.end
+            payload_text = "\n".join(lines[fence.start + 1 : content_end]).strip()
+            if not payload_text:
+                continue
+            try:
+                candidate = json.loads(payload_text)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(candidate, list):
+                decoded = candidate
+                break
+        if decoded is not None:
+            break
+    if decoded is None:
         return ()
     records: list[AdvisoryRecord] = []
     for element in decoded:

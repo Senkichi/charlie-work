@@ -401,3 +401,35 @@ def test_github_prose_dependencies_blockquote_is_container_tolerant() -> None:
     assert _is_blockquote_line(line) is True
     assert _is_blockquote_line("\t> tab-indented quote") is True
     assert _is_blockquote_line("not > a quote") is False
+
+
+# --- md-r3 review N2: hook_entry tries every fence, not just the first ------
+
+
+def _advisory_record_json() -> str:
+    return json.dumps(
+        [
+            {
+                "severity": "advise",
+                "file": "x.py",
+                "identity": "id1",
+                "message": "the record",
+                "redirect": None,
+                "timestamp": "2026-01-01T00:00:00Z",
+            }
+        ]
+    )
+
+
+@pytest.mark.parametrize(
+    "fences",
+    [
+        "~~~\nnote\n~~~\n```json\n{payload}\n```",
+        "\t```json\n{payload}\n\t```",
+    ],
+    ids=["unrelated-earlier-fence", "tab-indented-payload-fence"],
+)
+def test_hook_entry_finds_payload_fence_beyond_first_or_indented(fences: str) -> None:
+    body = f"{ADVISORY_COMMENT_MARKER}\n" + fences.format(payload=_advisory_record_json())
+    result = parse_advisories_comment(body)
+    assert result is not None and len(result) == 1

@@ -49,7 +49,9 @@ re-derive it. There are three already:
 from __future__ import annotations
 
 import re
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from typing import TypeVar
 
 __all__ = [
     "MIN_FENCE_LENGTH",
@@ -61,6 +63,7 @@ __all__ = [
     "MarkdownStructure",
     "LEGACY_FENCE_RE",
     "fence_contents_latest_first",
+    "pick_last_valid_fence",
     "scan",
     "is_blockquote_marker",
     "split_lines",
@@ -514,3 +517,47 @@ def fence_contents_latest_first(text: str) -> list[str]:
         entries.append((match.end(), match.start(), match.group(1)))
     entries.sort(key=lambda entry: (entry[0], entry[1]), reverse=True)
     return [body for _end, _start, body in entries]
+
+
+_T = TypeVar("_T")
+
+
+def pick_last_valid_fence(
+    text: str,
+    parse: Callable[[str], _T | None],
+    *,
+    is_approval: Callable[[_T], bool],
+) -> _T | None:
+    """Return the last fenced block ``parse`` accepts, never fail-open.
+
+    Two candidate orders are evaluated: the *union* pick
+    (:func:`fence_contents_latest_first`) and the *legacy* pick (origin/main's
+    loop over :data:`LEGACY_FENCE_RE`, latest match first). Normally the union
+    pick wins -- it recognises shapes the legacy regex cannot (tilde fences,
+    unclosed fences). But the union also lets a scan-only block that comes
+    AFTER the legacy pick (a quoted ``~~~`` example, a trailing unterminated
+    block) override it, so a verdict parser could return ``approved`` where
+    the code it replaced returned ``request_changes`` (md-r3 review B1). When
+    the picks differ and the legacy one is not an approval while the union one
+    is, the legacy pick is returned: an approval never displaces a
+    non-approval that origin/main already honoured.
+    """
+    union_pick = _first_parsed(fence_contents_latest_first(text), parse)
+    legacy_bodies = [m.group(1) for m in LEGACY_FENCE_RE.finditer(text)]
+    legacy_pick = _first_parsed(reversed(legacy_bodies), parse)
+    if (
+        union_pick is not None
+        and legacy_pick is not None
+        and is_approval(union_pick)
+        and not is_approval(legacy_pick)
+    ):
+        return legacy_pick
+    return union_pick
+
+
+def _first_parsed(bodies: Iterable[str], parse: Callable[[str], _T | None]) -> _T | None:
+    for body in bodies:
+        parsed = parse(body)
+        if parsed is not None:
+            return parsed
+    return None

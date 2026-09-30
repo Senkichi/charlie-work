@@ -597,3 +597,22 @@ def test_check_stale_open_issue_mentions_degrades_gracefully_when_git_log_fails(
     assert report.anomaly
     assert "#817" in report.lines[-1]
     assert "commit-message scan degraded" in report.lines[-1]
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        ("Run ```charlie\nverdict #124``` to record it.\n", set()),
+        ("Run ```charlie\nverdict #124``` then see #127\n", {127}),
+        # Positive control: an unpaired inline run does not swallow the rest.
+        ("Run ``` alone\nsee #128\n", {128}),
+    ],
+    ids=["multiline-inline-span", "mention-after-span", "control-unpaired"],
+)
+def test_mentioned_issue_numbers_ignores_multiline_inline_triple_backtick_span(
+    hb: ModuleType, body: str, expected: set[int]
+) -> None:
+    """md-r3 review N1: origin/main's non-anchored regex also removed an
+    inline ``` span crossing a line break; the line-based block strip alone
+    would leak its ``#N`` as a false stale-mention ANOMALY."""
+    assert hb._mentioned_issue_numbers(body) == expected

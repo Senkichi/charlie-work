@@ -106,3 +106,30 @@ def test_strip_fenced_blocks_pins_line_anchored_behaviour() -> None:
     assert _strip_fenced_blocks("keep\n```json\ndrop\n```\nkeep2\n") == "keep\nkeep2\n"
     assert _strip_fenced_blocks("keep\n```json\ndrop to EOF\n") == "keep\n"
     assert _strip_fenced_blocks("say ```json\nkept\n").startswith("say ```json\nkept\n")
+
+
+# md-r3 review B1: the mirror image of md-r2-2 B1. A later fence that only
+# `scan` recognises (tilde block, unclosed trailing block) must not override a
+# `request_changes` that origin/main's legacy regex already returned.
+_SCAN_ONLY_AFTER_LEGACY: dict[str, str] = {
+    "tilde-after": f"```json\n{_REQUEST}\n```\n~~~json\n{_APPROVED}\n~~~\n",
+    "unclosed-after": f"```json\n{_REQUEST}\n```\n\n```json\n{_APPROVED}\n",
+}
+
+
+@pytest.mark.parametrize("extract", _EXTRACTORS, ids=["primary", "cross_family"])
+@pytest.mark.parametrize("shape", sorted(_SCAN_ONLY_AFTER_LEGACY))
+def test_scan_only_approval_after_legacy_request_changes_does_not_win(
+    extract: Callable[[str], str | None], shape: str
+) -> None:
+    assert extract(_SCAN_ONLY_AFTER_LEGACY[shape]) == "request_changes"
+
+
+@pytest.mark.parametrize("extract", _EXTRACTORS, ids=["primary", "cross_family"])
+def test_scan_only_request_changes_after_legacy_approved_still_wins(
+    extract: Callable[[str], str | None],
+) -> None:
+    """Positive control: the conservative clamp is one-directional -- a later
+    scan-only `request_changes` still beats an earlier legacy `approved`."""
+    text = f"```json\n{_APPROVED}\n```\n~~~json\n{_REQUEST}\n~~~\n"
+    assert extract(text) == "request_changes"

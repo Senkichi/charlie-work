@@ -724,3 +724,29 @@ def test_digest_emit_failure_leaves_cursor_for_retry(
     monkeypatch.setattr(_wf, "emit_digest", lambda cfg, digest: emitted.append(digest))
     app._maybe_report_outbound_secret_refusals()
     assert len(emitted) == 1
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        "\t```\n```example-secret\n{key}\n```\n",
+        "  \t```\n```example-secret\n{key}\n```\n",
+        "\t\t```\n~~~example-secret\n{key}\n~~~\n```\n",
+    ],
+    ids=["tab-opener", "space-tab-opener", "double-tab-tilde-inner"],
+)
+def test_example_secret_line_inside_tab_indented_ordinary_fence_does_not_mask(
+    template: str,
+) -> None:
+    """md-r3 review B2: a visibly opened ordinary fence (tab-indented opener,
+    which the pre-scan character-count model treated as a fence) contains the
+    ``example-secret`` line as literal content, so the key must still be caught.
+    Strict CommonMark alone reads the tab line as indented code and would open
+    an exempt block on the inner line."""
+    matches = scan_outbound_text(template.format(key=_AWS), part="body")
+    assert any(m.rule_id == "aws-access-token" for m in matches)
+
+
+def test_control_genuine_example_secret_fence_still_masks_after_intersection() -> None:
+    assert scan_outbound_text(f"```example-secret\n{_AWS}\n```\n", part="body") == ()
+    assert any(m.rule_id == "aws-access-token" for m in scan_outbound_text(_AWS, part="body"))
