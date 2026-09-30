@@ -1,5 +1,9 @@
-1000
+1200
 # Issue #1997 / PR #1998: the emission-anchored throttle-window change grew
 # the module's bounded-exemption docstring and born-expired-window comment
 # past the 800 cap (799 -> 813). First crossing -- reviewed mark set at the
 # next MARK_QUANTUM multiple per the ratchet's hand-raise rule.
+# Issue #2006 / PR #2027: merging #1971 (local-park drain) with the
+# write_gate threading for the classify-at-credit lane grew the module to
+# 1010 lines (+10 over the 1000 mark). Reviewed raise to the next
+# MARK_QUANTUM multiple per the ratchet's hand-raise rule.
