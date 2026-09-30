@@ -279,7 +279,10 @@ def test_seeded_registry_loads_and_matches_both_fleet_repos(hb: ModuleType) -> N
     assert entry.check == "stale-open-issue-mentions"
     assert entry.repo is None
     assert entry.issue == 1361
-    assert entry.expires == "2026-09-30"
+    # Shape, not value: renewing the entry is a reviewed diff to the registry
+    # alone and must not also require editing this test (see the clock-pinned
+    # test below for the same reasoning).
+    assert datetime.strptime(entry.expires, "%Y-%m-%d")
 
 
 def test_seeded_registry_actually_suppresses_the_real_per_repo_check_name(
