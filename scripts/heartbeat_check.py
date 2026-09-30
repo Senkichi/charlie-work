@@ -1021,10 +1021,12 @@ def _md_split_lines(text: str, *, keepends: bool = False) -> list[str]:
     return lines
 
 
-def _md_strip_marker_indent(line: str) -> str | None:
-    """Strip ``line``'s leading indent, or ``None`` when it is 4+
-    CommonMark columns wide (a tab advances to the next multiple of 4).
-    Mirrors `charlie_work.markdown_fence._strip_marker_indent` exactly.
+def _md_strip_marker_indent(line: str, max_indent: int | None = 3) -> str | None:
+    """Strip ``line``'s leading indent, or ``None`` when it is wider than
+    ``max_indent`` CommonMark columns (a tab advances to the next multiple
+    of 4). ``max_indent=None`` never rejects (container-tolerant mode; see
+    `_scan_markdown_structure`). Mirrors
+    `charlie_work.markdown_fence._strip_marker_indent` exactly.
     """
     columns = 0
     chars = 0
@@ -1036,14 +1038,16 @@ def _md_strip_marker_indent(line: str) -> str | None:
         else:
             break
         chars += 1
-        if columns > 3:
+        if max_indent is not None and columns > max_indent:
             break
-    if columns > 3:
+    if max_indent is not None and columns > max_indent:
         return None
     return line[chars:]
 
 
-def _md_find_fence_close(lines: list[str], start: int, char: str, length: int) -> int | None:
+def _md_find_fence_close(
+    lines: list[str], start: int, char: str, length: int, max_indent: int | None = 3
+) -> int | None:
     """First line index >= start closing a ``char``-fence opened at ``length``.
 
     Only ever called for a *valid* opener -- see `_scan_markdown_structure`.
@@ -1052,17 +1056,22 @@ def _md_find_fence_close(lines: list[str], start: int, char: str, length: int) -
     """
     close_re = re.compile(rf"^{re.escape(char)}{{{length},}}[ \t]*$")
     for index in range(start, len(lines)):
-        stripped = _md_strip_marker_indent(lines[index])
+        stripped = _md_strip_marker_indent(lines[index], max_indent)
         if stripped is not None and close_re.match(stripped):
             return index
     return None
 
 
-def _scan_markdown_structure(text: str) -> _MarkdownStructure:
+def _scan_markdown_structure(text: str, *, max_indent: int | None = 3) -> _MarkdownStructure:
     """Scan ``text`` for CommonMark block-level structure.
 
     Stdlib-only reimplementation of `charlie_work.markdown_fence.scan`; see
     that function's docstring for the CommonMark rules implemented.
+    ``max_indent`` bounds fence-opener, fence-closer and blockquote-marker
+    indent (columns); ATX headings always keep the 0-3 bound.
+    ``max_indent=None`` is the container-tolerant mode for *exclusion*
+    consumers (this file's `_strip_fenced_code_blocks`): a fence nested
+    under a list item is still a fence, and this scan models no list items.
     """
     lines = _md_split_lines(text)
     fenced_spans: list[tuple[int, int]] = []
@@ -1073,9 +1082,10 @@ def _scan_markdown_structure(text: str) -> _MarkdownStructure:
     index = 0
     while index < line_count:
         stripped = _md_strip_marker_indent(lines[index])
+        container_stripped = _md_strip_marker_indent(lines[index], max_indent)
 
-        if stripped is not None:
-            delimiter = _MD_FENCE_DELIM_RE.match(stripped)
+        if container_stripped is not None:
+            delimiter = _MD_FENCE_DELIM_RE.match(container_stripped)
             if delimiter is not None:
                 run, info = delimiter.group(1), delimiter.group(2).strip()
                 char, length = run[0], len(run)
@@ -1085,17 +1095,18 @@ def _scan_markdown_structure(text: str) -> _MarkdownStructure:
                     # review finding B1). Resume scanning on the next line.
                     index += 1
                     continue
-                close_at = _md_find_fence_close(lines, index + 1, char, length)
+                close_at = _md_find_fence_close(lines, index + 1, char, length, max_indent)
                 end = close_at + 1 if close_at is not None else line_count
                 fenced_spans.append((index, end))
                 index = end
                 continue
 
-            if _MD_BLOCKQUOTE_RE.match(stripped):
+            if _MD_BLOCKQUOTE_RE.match(container_stripped):
                 quoted.add(index)
                 index += 1
                 continue
 
+        if stripped is not None:
             if _MD_ATX_HEADING_RE.match(stripped):
                 heading_lines.append(index)
                 index += 1
@@ -1122,7 +1133,11 @@ def _strip_fenced_code_blocks(text: str) -> str:
     `test_flip_heartbeat_check_*` tests for the pinned-then-flipped
     behaviour this replaces.
     """
-    structure = _scan_markdown_structure(text)
+    # Container-tolerant (`max_indent=None`): this is an exclusion consumer,
+    # and the old `_FENCED_CODE_BLOCK_RE` ignored indent, so a list-nested
+    # fence must still be stripped (else a `#N` inside it is a false
+    # stale-mention ANOMALY).
+    structure = _scan_markdown_structure(text, max_indent=None)
     if not structure.fenced_line_spans:
         return text
     lines = _md_split_lines(text, keepends=True)
@@ -1141,8 +1156,8 @@ def _strip_fenced_code_blocks(text: str) -> str:
 # negation-aware `#N` scanner used by `closing_keyword_gate.py`). This script
 # deliberately does NOT import charlie_work.github, or any other
 # ci_fleet-reachable charlie_work module (see the module docstring, `fleet_dir`,
-# and the `charlie_work.event_kinds` import's own comment for the one narrow,
-# stdlib-only exception), so the small negation/quote-stripping heuristics
+# and the section header above for the two narrow, guarded, stdlib-only
+# exceptions: `charlie_work.event_kinds` and the `notify_digest*` leaves), so the small negation/quote-stripping heuristics
 # below are a minimal, self-contained reimplementation for this one check
 # rather than a reuse of those functions. Two differences from `issue_numbers_mentioned_by_pr`
 # are intentional, not drift:

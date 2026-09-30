@@ -162,6 +162,23 @@ def test_example_secret_masking_not_desynced_by_bare_cr() -> None:
     assert "github-pat" in rule_ids, "real secret after the fence was not detected"
 
 
+def test_bare_cr_line_endings_grant_example_secret_exemption() -> None:
+    """Pinned delta vs origin/main (md-r2 re-review 2, N1): a bare ``\\r`` is a
+    CommonMark line ending, so a bare-``\\r`` document with an
+    ``example-secret`` fence really is one and its content is exempt.
+    origin/main split on ``\\n`` only and therefore caught the key. The
+    exemption depending on an invisible line-ending detail is accepted as
+    CommonMark-correct; this makes that an intentional, visible choice. The
+    ordinary-fence control proves the harness still reports the key."""
+    cr_body = f"x\r```example-secret\r{_GHO}\r```\r"
+    lf_body = f"x\n```example-secret\n{_GHO}\n```\n"
+    ordinary = f"x\r```\r{_GHO}\r```\r"
+
+    assert not scan_outbound_text(cr_body, part="body")
+    assert not scan_outbound_text(lf_body, part="body")
+    assert "github-oauth" in {m.rule_id for m in scan_outbound_text(ordinary, part="body")}
+
+
 def test_rejected_fence_opener_does_not_over_mask_a_later_real_fence() -> None:
     """Regression for adversarial review finding B1 (architecture-deepening
     candidate 3): a rejected fence opener (backtick in its info string) must

@@ -31,12 +31,12 @@ from .throttle_signatures import match_throttle_tail
 # carries whatever diagnostic detail WAS recoverable.
 CAUSE_UNKNOWN: dict[str, Any] = {"cause": "unknown"}
 
-# Retained ONLY for backward-compatible re-export (``workflow.py``'s
-# LOAD-BEARING re-export block re-exports every name here, so an external
-# import/monkeypatch target must keep resolving). No longer used internally:
-# ``_extract_verdict_from_text`` now uses ``markdown_fence.scan`` (see
-# ``tests/test_markdown_structure_characterization.py``).
-_VERDICT_FENCE_RE = re.compile(r"```(?:[a-zA-Z0-9_+-]*)\s*\n(.*?)```", re.DOTALL)
+# Re-exported for backward compatibility (``workflow.py``'s LOAD-BEARING
+# re-export block re-exports every name here) AND still consumed:
+# ``_extract_verdict_from_text`` unions this legacy unanchored model with
+# ``markdown_fence.scan`` so the parser is never more permissive than the
+# regex-only code it replaced (see ``markdown_fence.fence_contents_latest_first``).
+_VERDICT_FENCE_RE = markdown_fence.LEGACY_FENCE_RE
 
 # Absolute path ending in .md, as reviewers reference their summary files in
 # final output (e.g. "Full review written to `C:\...\review.md`"). Colons,
@@ -117,19 +117,18 @@ def _extract_verdict_from_text(text: str) -> dict[str, Any] | None:
     """Extract the last valid fenced JSON verdict block from plain text.
 
     Accepts fences with or without a language tag, backtick or tilde,
-    scanning from the last fence (the final output) backwards. Fence
-    detection is ``markdown_fence.scan`` (architecture-deepening candidate
-    3, "markdown structure"): CommonMark-line-anchored, so a ``` run
-    embedded mid-line inside the JSON payload can no longer desync the
-    pairing the way the old ``_VERDICT_FENCE_RE`` regex could, and an
-    unclosed fence still yields its content (runs to end-of-text) instead
-    of matching nothing at all.
+    scanning from the last fence (the final output) backwards. Candidates
+    come from BOTH ``markdown_fence.scan`` (CommonMark line-anchored: no
+    desync from a mid-line ``` run inside the payload, an unclosed fence
+    still yields its content) and the legacy unanchored
+    ``_VERDICT_FENCE_RE`` (mid-line opener, closer glued to the closing
+    brace, tab/list-indented fence), ordered by source position so the
+    final block wins whichever model recognised it. Dropping either model
+    would let an earlier ``approved`` block beat a final
+    ``request_changes`` one -- a verdict guard failing open.
     """
-    structure = markdown_fence.scan(text)
-    lines = markdown_fence.split_lines(text)
-    for fence in reversed(structure.fences):
-        content_end = fence.end - 1 if fence.closed else fence.end
-        candidate = "\n".join(lines[fence.start + 1 : content_end]).strip()
+    for body in markdown_fence.fence_contents_latest_first(text):
+        candidate = body.strip()
         if not candidate:
             continue
         try:

@@ -30,6 +30,34 @@ def hb() -> ModuleType:
     return _load_heartbeat_check()
 
 
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        ("Repro:\n\n1. Paste:\n\n    ```\n    see #123\n    ```\n", set()),
+        ("- ex:\n\t```\n\tsee #124\n\t```\n", set()),
+        # Positive controls: the scanner still reports genuine mentions.
+        ("top #125\n", {125}),
+        ("1. step\n\n    ```\n    code\n    ```\n\nreal #126\n", {126}),
+    ],
+    ids=[
+        "numbered-step-fence",
+        "tab-fence-under-bullet",
+        "control-top-level",
+        "control-after-fence",
+    ],
+)
+def test_mentioned_issue_numbers_ignores_list_nested_fences(
+    hb: ModuleType, body: str, expected: set[int]
+) -> None:
+    """md-r2 re-review 2, B2: an exclusion consumer must be container-tolerant.
+
+    origin/main's ``_FENCED_CODE_BLOCK_RE`` ignored indent, so a fence nested
+    under a list item hid its ``#N``; a CommonMark-strict scan alone would
+    surface it as a false stale-mention ANOMALY.
+    """
+    assert hb._mentioned_issue_numbers(body) == expected
+
+
 # ---------------------------------------------------------------------------
 # check_stale_open_issue_mentions (issue #902)
 #

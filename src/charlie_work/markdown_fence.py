@@ -59,6 +59,8 @@ __all__ = [
     "FenceSpan",
     "Heading",
     "MarkdownStructure",
+    "LEGACY_FENCE_RE",
+    "fence_contents_latest_first",
     "scan",
     "is_blockquote_marker",
     "split_lines",
@@ -470,3 +472,45 @@ def scan(text: str, *, max_indent: int | None = 3) -> MarkdownStructure:
         quoted_lines=frozenset(quoted),
         headings=tuple(headings),
     )
+
+
+# The pre-architecture-deepening verdict-fence regex: NOT line-anchored, so it
+# catches an opener mid-line, a closer glued to the preceding text, and a
+# tab- or list-indented fence -- shapes ``scan``'s CommonMark top-level model
+# rejects. Defined here (single definition; ``verdict_parsing`` and
+# ``rescue_review`` both consume it) because a verdict *parser* must never be
+# more permissive than the code it replaced: see
+# :func:`fence_contents_latest_first`.
+LEGACY_FENCE_RE = re.compile(r"```(?:[a-zA-Z0-9_+-]*)\s*\n(.*?)```", re.DOTALL)
+
+
+def fence_contents_latest_first(text: str) -> list[str]:
+    """Return the body of every fenced block in ``text``, latest first.
+
+    Union of two models, ordered by source position (end offset, then start
+    offset, descending): ``scan``'s CommonMark line-anchored fences (tilde
+    fences, unclosed fences, no desync from mid-line backticks) and the
+    legacy unanchored :data:`LEGACY_FENCE_RE` (mid-line opener, glued
+    closer, tab/list-indented fence). Callers that pick "the last valid
+    block wins" -- reviewer-verdict parsers -- need both, otherwise a final
+    block that only one model recognises loses to an earlier block the
+    other model does catch (fail-open toward an earlier ``approved``).
+    Bodies are returned raw; callers strip/validate.
+    """
+    lines = split_lines(text)
+    offsets: list[int] = []
+    pos = 0
+    for raw in split_lines(text, keepends=True):
+        offsets.append(pos)
+        pos += len(raw)
+    offsets.append(pos)
+
+    entries: list[tuple[int, int, str]] = []
+    for fence in scan(text).fences:
+        content_end = fence.end - 1 if fence.closed else fence.end
+        body = "\n".join(lines[fence.start + 1 : content_end])
+        entries.append((offsets[fence.end], offsets[fence.start], body))
+    for match in LEGACY_FENCE_RE.finditer(text):
+        entries.append((match.end(), match.start(), match.group(1)))
+    entries.sort(key=lambda entry: (entry[0], entry[1]), reverse=True)
+    return [body for _end, _start, body in entries]

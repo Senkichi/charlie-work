@@ -35,7 +35,7 @@ from markdown_conformance_cases import CASES, ConformanceCase
 
 
 class _Scanner(Protocol):
-    def __call__(self, text: str) -> object: ...
+    def __call__(self, text: str, *, max_indent: int | None = 3) -> object: ...
 
 
 @pytest.fixture(scope="module")
@@ -113,3 +113,50 @@ def test_fence_inside_blockquote_is_a_documented_gap(scan: _Scanner) -> None:
 
     assert structure.fenced_line_spans == ()
     assert tuple(sorted(structure.quoted_lines)) == (0, 1, 2)
+
+
+# --- container-tolerant mode (max_indent=None) --------------------------------
+#
+# Both implementations must expose the mode and agree on it (md-r2 re-review 2,
+# B2: the stdlib copy lacked it, so an exclusion consumer diverged silently).
+# Rows: (name, markdown, fenced_line_spans, quoted_lines, heading_lines) for
+# `max_indent=None`. The strict-mode result for the same input is asserted
+# separately below so the two modes cannot drift into each other.
+
+_TolerantCase = tuple[str, str, tuple[tuple[int, int], ...], tuple[int, ...], tuple[int, ...]]
+
+_TOLERANT_CASES: tuple[_TolerantCase, ...] = (
+    ("numbered_step_fence", "1. step\n\n    ```\n    code\n    ```\n", ((2, 5),), (), ()),
+    ("tab_fence_under_bullet", "- ex:\n\t```\n\tcode\n\t```\n", ((1, 4),), (), ()),
+    ("nested_quote", "- note\n\n    > quoted\n", (), (2,), ()),
+    ("tab_quote", "- note\n\t> quoted\n", (), (1,), ()),
+    # Headings stay strict (0-3 columns) even in tolerant mode.
+    ("heading_stays_strict", "    # nope\n# yes\n", (), (), (1,)),
+    # Closer indent is relaxed too: a deeply indented closer closes the fence.
+    ("deep_closer", "```\ncode\n        ```\nafter\n", ((0, 3),), (), ()),
+    # Other fence rules are unchanged: a short closer does not close a longer opener.
+    ("short_closer_unclosed", "````\ncode\n```\n", ((0, 3),), (), ()),
+)
+
+
+@pytest.mark.parametrize("case", _TOLERANT_CASES, ids=[case[0] for case in _TOLERANT_CASES])
+def test_conformance_tolerant_mode(case: _TolerantCase, scan: _Scanner) -> None:
+    name, markdown, fenced, quoted, headings = case
+    structure = scan(markdown, max_indent=None)
+
+    assert structure.fenced_line_spans == fenced, f"{name}: fenced_line_spans mismatch"
+    assert tuple(sorted(structure.quoted_lines)) == quoted, f"{name}: quoted_lines mismatch"
+    assert structure.heading_lines == headings, f"{name}: heading_lines mismatch"
+
+
+def test_conformance_tolerant_mode_differs_from_strict_where_it_should(scan: _Scanner) -> None:
+    """Positive control: the tolerant rows above are not vacuous -- the same
+    inputs are NOT fences/quotes in the default strict mode."""
+    for name, markdown, fenced, quoted, _headings in _TOLERANT_CASES:
+        if name in {"heading_stays_strict", "short_closer_unclosed"}:
+            continue
+        strict = scan(markdown)
+        assert (strict.fenced_line_spans, tuple(sorted(strict.quoted_lines))) != (
+            fenced,
+            quoted,
+        ), name

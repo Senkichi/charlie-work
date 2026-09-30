@@ -89,8 +89,10 @@ def test_scan_tolerant_keeps_other_fence_rules() -> None:
 
 def test_scan_tolerant_keeps_headings_strict() -> None:
     """A 4+-column `#` line is never an ATX heading, even in tolerant mode:
-    a spurious heading would open a phantom `Blocked by` section, which is
-    the fail-open direction for the section parser."""
+    a spurious heading would open a phantom `Blocked by` section. (Known
+    trade-off, not a regression: strict headings also miss a genuinely
+    list-nested `## Blocked by`, which CommonMark would re-base into a real
+    heading -- origin/main's `^ {0,3}` heading regex had the same gap.)"""
     structure = markdown_fence.scan("    # Blocked by\n# Real\n", max_indent=None)
     assert structure.heading_lines == (1,)
 

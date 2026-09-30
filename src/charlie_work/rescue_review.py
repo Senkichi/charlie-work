@@ -91,19 +91,16 @@ _SEVERITY_RE = re.compile(
     re.MULTILINE,
 )
 
-# Fence detection for ``_find_json_verdict`` is ``markdown_fence.scan``
-# (architecture-deepening candidate 3, "markdown structure"), not a
-# hand-rolled regex any more -- this used to be a byte-identical duplicate
-# of ``verdict_parsing._VERDICT_FENCE_RE`` (deliberately, since ``workflow``
-# imports this module, not the reverse, so it could not be shared as code);
-# now both wire onto the same shared scan side instead, which is the actual
-# fix for the duplication this comment used to document. CommonMark's
-# line-anchored fence rule (a ``` run only delimits a block when it is the
-# first thing on its own line) is what makes the desync in the old comment's
-# PR #802 story structurally impossible rather than merely patched for one
-# more tag shape: a ```python citation block's own embedded ``` characters,
-# wherever they appear mid-line, can never be misread as that fence's own
-# closer or a fresh opener.
+# Fence detection for ``_find_json_verdict`` is
+# ``markdown_fence.fence_contents_latest_first`` (architecture-deepening
+# candidate 3, "markdown structure"): the union of ``markdown_fence.scan``
+# (CommonMark line-anchored: a ``` run only delimits a block as the first
+# thing on its own line, so a ```python citation block's embedded ``` can
+# never desync pairing -- the PR #802 story) and the legacy unanchored
+# regex (``markdown_fence.LEGACY_FENCE_RE``, formerly a byte-identical
+# duplicate kept here). The legacy model is kept so this verdict parser is
+# never more permissive than before: a mid-line opener, glued closer or
+# list/tab-indented final block must still beat an earlier echoed block.
 
 
 def _looks_transient(*texts: str) -> bool:
@@ -415,9 +412,11 @@ class CrossFamilyVerdict:
 def _find_json_verdict(body: str) -> CrossFamilyVerdict | None:
     """Return the last shape-valid JSON verdict block in ``body``, or None.
 
-    Scans fenced code blocks (``markdown_fence.scan``) from the last one
-    backwards — mirroring ``verdict_parsing._extract_verdict_from_text`` —
-    so a reviewer's actual final answer wins over an earlier echo (e.g. of
+    Scans fenced code blocks from the last one backwards (candidates are the
+    union of ``markdown_fence.scan`` and the legacy unanchored fence regex,
+    ordered by source position; see
+    ``markdown_fence.fence_contents_latest_first``), mirroring
+    ``verdict_parsing._extract_verdict_from_text``, so a reviewer's actual final answer wins over an earlier echo (e.g. of
     the example block in its own prompt). A block is shape-valid when
     ``decision`` is ``"approved"`` or ``"request_changes"`` (cross-family
     review never gates a merge on its own, so unlike the primary reviewer it
@@ -426,11 +425,8 @@ def _find_json_verdict(body: str) -> CrossFamilyVerdict | None:
     of strings; a malformed one rejects that block (an earlier fence, if
     any, is tried next) rather than silently discarding the bad data.
     """
-    structure = markdown_fence.scan(body)
-    lines = markdown_fence.split_lines(body)
-    for fence in reversed(structure.fences):
-        content_end = fence.end - 1 if fence.closed else fence.end
-        candidate = "\n".join(lines[fence.start + 1 : content_end]).strip()
+    for fence_body in markdown_fence.fence_contents_latest_first(body):
+        candidate = fence_body.strip()
         if not candidate:
             continue
         try:
