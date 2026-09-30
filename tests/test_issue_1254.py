@@ -27,11 +27,13 @@ parsing the workflow YAML statically:
 1. The Tests job has NO job-level ``concurrency`` block (any group key, any
    ``cancel-in-progress`` value -- the pending-cancel semantics apply to all
    of them).
-2. ``timeout-minutes`` stays at the hosted-derived bound: >= 22 and <= 30
-   (#1504 recalibrated the 75-min self-hosted backstop from hosted runtime
-   data -- 22 clears the observed max by ~38%; the ceiling keeps a
-   "just-in-case" bump back toward the contention-era numbers from
-   silently re-loosening the hang bound).
+2. ``timeout-minutes`` stays at the hosted-derived bound: >= 29 and <= 30
+   (#2045 re-derived from hosted runtime data -- the completed-job max had
+   grown to 21.4 min and the 22-min cap was already killing suites in
+   post-steps; the floor is the issue's no-completed-suite-over-75%-of-cap
+   bound, ceil(21.4 / 0.75) = 29; the ceiling keeps a "just-in-case" bump
+   back toward the contention-era numbers from silently re-loosening the
+   hang bound).
 """
 
 from __future__ import annotations
@@ -96,7 +98,7 @@ def test_workflow_level_concurrency_is_per_ref() -> None:
 
 
 def test_tests_timeout_minutes_at_hosted_derived_bound() -> None:
-    """The Tests job ``timeout-minutes`` must stay at the hosted bound (22).
+    """The Tests job ``timeout-minutes`` must stay at the hosted bound.
 
     History: 30 produced the #1254 false reds (under contention the suite
     stretched to 29:43 and the 30m cap killed it at the finish line); 45
@@ -109,21 +111,28 @@ def test_tests_timeout_minutes_at_hosted_derived_bound() -> None:
 
     #1504 recalibrated from hosted data: 205 successful Tests jobs created
     after the #1500 merge commit ran min 8.5 / median 11.9 / p95 14.0 /
-    max 15.9 min, and 22 clears the observed max by ~38% (the #1254
-    method's ~25-50% band). The floor blocks speculative tightening back
-    toward the observed max without a re-derivation (the #1434 failure
-    mode was PASSED suites cap-killed during cleanup); the ceiling blocks
-    drifting back toward the contention-era numbers (45/75), which only
-    ever made sense on the shared box -- on a dedicated VM a bigger cap
-    just lets a hang burn longer.
+    max 15.9 min, and 22 cleared the observed max by ~38% (the #1254
+    method's ~25-50% band). #2045 re-derived once the suite outgrew that
+    margin: 36 completed Tests jobs across the 40 most recent completed
+    ci.yml runs (sampled 2026-09-30) ran min 14.8 / median 19.6 / max
+    21.4 min, and the 22-min cap was already killing suites in
+    post-steps. The floor is now 29 = ceil(21.4 / 0.75), the smallest
+    cap under which no completed job in the sample exceeds 75% of it
+    (the issue's acceptance bound). The floor blocks speculative
+    tightening back toward the observed max without a re-derivation (the
+    #1434 failure mode was PASSED suites cap-killed during cleanup); the
+    ceiling blocks drifting back toward the contention-era numbers
+    (45/75), which only ever made sense on the shared box -- on a
+    dedicated VM a bigger cap just lets a hang burn longer.
     """
     tests_job = _tests_job()
     timeout = tests_job.get("timeout-minutes")
     assert timeout is not None, "ci.yml Tests job has no timeout-minutes"
-    assert timeout >= 22, (
-        f"ci.yml Tests job timeout-minutes is {timeout}, expected >= 22 -- "
-        "22 is the hosted-era bound derived in #1504 (205 successful hosted "
-        "runs, observed max 15.9 min, ~38% margin); tightening below it "
+    assert timeout >= 29, (
+        f"ci.yml Tests job timeout-minutes is {timeout}, expected >= 29 -- "
+        "29 is the hosted-era bound re-derived in #2045 (36 completed Tests "
+        "jobs, observed max 21.4 min; the issue's <=75%-of-cap acceptance "
+        "bound makes ceil(21.4 / 0.75) = 29 the floor); tightening below it "
         "without re-deriving risks the #1434/#1254 cap-killed-PASSED-suite "
         "failure mode"
     )
