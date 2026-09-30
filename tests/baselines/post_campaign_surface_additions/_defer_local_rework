@@ -1,1 +1,1 @@
-Issue #2039: local rework launch gates (orchestration/local_lanes.py). Split out of _local_dispatch_rework so the gated launch runs under the fleet lock; superseded by the shared worker launch permit (#2041).
+Issue #2039/#2041: records a gated local rework deferral (orchestration/local_lanes.py) -- the dispatch_deferred event for a WorkerLaunchDeferral or a governor clamp from worker_launch_gate.issue_worker_launch_permit.

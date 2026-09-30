@@ -30,6 +30,13 @@ from charlie_work.worktree import worktree_ahead_of_sha
 import charlie_work.superseded_worker_reap as superseded_worker_reap
 import charlie_work.workflow as _wf
 from charlie_work.worker_pid_stamp import stamp_worker_process
+from charlie_work.worker_launch_gate import (
+    REASON_PROVIDER_THROTTLED,
+    FleetLaunchLock,
+    WorkerLaunchDeferral,
+    _launch_workers,
+    issue_worker_launch_permit,
+)
 
 
 def _dispatch_rework_impl(
@@ -38,6 +45,7 @@ def _dispatch_rework_impl(
     *,
     only_issues: str | None = None,
     stalled_entries: list[dict[str, int]] | None = None,
+    launch_lock: FleetLaunchLock,
 ) -> _wf.CommandResult:
     """Dispatch rework workers for issues in needs-rework state with open PRs.
 
@@ -177,29 +185,27 @@ def _dispatch_rework_impl(
 
     rework_limit = limit if limit is not None else self.config.dispatch.default_limit
 
-    # Apply global concurrency governor cap
-    gov = self._apply_concurrency_governor(rework_limit)
-    rework_limit = gov.dispatch_limit
-
-    # Apply provider throttle cooldown check
-    with _wf.state_lock(self.paths.state_file):
-        state = _wf.load_state(self.paths.state_file)
-        if _wf.is_throttled(state):
-            throttled_until = state.get("throttled_until")
-            # Return immediately with deferral reason
-            data = {
-                "adapter": self.config.worker.harness,
-                "selected_count": 0,
-                "deferred_reason": "provider_throttled",
-                "throttled_until": throttled_until,
-            }
-            if gov.any_term_enabled:
-                data.update(gov.report_fields())
-            return _wf.CommandResult(
-                False,
-                f"rework dispatch deferred: provider throttled until {throttled_until}",
-                data,
+    # Issue #2041: the shared worker-launch gate -- concurrency governor, then
+    # provider throttle, under the fleet lock dispatch_rework() already holds.
+    # ONE permit covers both the normal and the rescue launch below.
+    permit = issue_worker_launch_permit(self, rework_limit, launch_lock=launch_lock)
+    if isinstance(permit, WorkerLaunchDeferral):
+        # Return immediately with deferral reason
+        data = {
+            "adapter": self.config.worker.harness,
+            "selected_count": 0,
+            "deferred_reason": permit.reason,
+            **permit.report_fields(),
+        }
+        if permit.reason == REASON_PROVIDER_THROTTLED:
+            message = (
+                f"rework dispatch deferred: provider throttled until {permit.throttled_until}"
             )
+        else:
+            message = f"rework dispatch deferred: {permit.reason}"
+        return _wf.CommandResult(False, message, data)
+    gov = permit.governor
+    rework_limit = permit.max_launches
 
     # Dry-run: read-only planning — compute selection and would-be
     # SessionRequests, but skip all state writes, label transitions,
@@ -1240,23 +1246,11 @@ def _dispatch_rework_impl(
     dispatch_results: list[SessionDispatchResult] = list(superseded_blocked_results)
     if normal_requests:
         dispatch_results.extend(
-            _wf.dispatch_sessions(
-                self.repo_root,
-                manifest_path,
-                results_path,
-                self._adapter_settings(),
-                normal_requests,
-            )
+            _launch_workers(self, permit, self._adapter_settings(), normal_requests)
         )
     if rescue_requests:
         dispatch_results.extend(
-            _wf.dispatch_sessions(
-                self.repo_root,
-                manifest_path,
-                results_path,
-                self._rescue_adapter_settings(),
-                rescue_requests,
-            )
+            _launch_workers(self, permit, self._rescue_adapter_settings(), rescue_requests)
         )
     # When both normal and rescue tiers dispatched, each sub-call's
     # write_session_manifest/write_session_results overwrote the files with
