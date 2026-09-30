@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import importlib
 import os
+import shutil
 import subprocess
 import tempfile
 from collections.abc import Iterator
@@ -32,6 +33,7 @@ import conftest
 from _git_leak_guard import (
     ceiling_directories,
     enclosing_repo_config_path,
+    install_session_git_isolation,
     protective_git_env,
 )
 from _worktree_fixtures import _git, _init_repo
@@ -178,43 +180,76 @@ def test_shared_helper_refuses_config_write_from_non_repo_nested_in_repo(
 
 
 def test_raw_git_config_from_non_repo_tmp_dir_cannot_discover_a_repo(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The *session-level* ceiling specifically, not the per-test fixture's.
+    """The session-level ceiling, exercised by the real installer on real repos.
 
-    The subprocess env is rebuilt with ONLY the ``GIT_CEILING_DIRECTORIES``
-    value captured at ``pytest_configure`` — every other ``GIT_*`` variable,
-    including whatever the function-scoped ``_isolate_git_env`` merged on
-    top, is stripped — so a discovery stop can only be credited to the
-    session install. ``git rev-parse`` is read-only by design: if the
-    session layer regresses, this probe discovers a repo but writes nothing.
+    Reproduces the incident geometry inside the test's own tmp dir so it
+    discriminates on any machine (the previous version probed ``tmp_path``
+    itself, which on a normal box is not inside a repo at all — discovery
+    fails there regardless, so the git step could never fail): ``outer`` is
+    a real repository standing in for the enclosing checkout, ``bt`` the
+    basetemp nested inside it, ``plain`` a non-repo dir below the basetemp.
+
+    ``install_session_git_isolation`` is invoked against a
+    monkeypatch-substituted ``os.environ`` — a plain dict with every
+    ``GIT_*`` key stripped — so the ceiling the probe subprocess carries
+    comes only from the function under test, never from the ambient
+    ``pytest_configure`` install or the ``_isolate_git_env`` merge, and the
+    ``GIT_CONFIG_*`` redirects it installs do not leak into the real
+    environment (monkeypatch restores the attribute at teardown). The probe
+    is read-only ``git rev-parse``: a regression discovers the repo but
+    performs no write.
     """
-    session_ceiling = conftest._SESSION_GIT_CEILING
-    assert session_ceiling is not None, (
-        "pytest_configure installed no GIT_CEILING_DIRECTORIES — the "
-        "session-level isolation layer is absent"
-    )
-    assert str(Path(os.path.realpath(tempfile.gettempdir()))) in session_ceiling.split(
-        os.pathsep
-    ), "the session ceiling does not cover the temp root"
+    outer = tmp_path / "outer"
+    _init_repo(outer)
+    session_basetemp = outer / "bt"
+    plain = session_basetemp / "plain"
+    plain.mkdir(parents=True)
 
-    plain = tmp_path / "not-a-repo"
-    plain.mkdir()
-    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
-    env["GIT_CEILING_DIRECTORIES"] = session_ceiling
+    clean_env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+
+    # Control: with no ceiling at all, discovery from ``plain`` ascends into
+    # ``outer`` — the repo the isolation layer must make unreachable. A green
+    # run cannot otherwise be credited to the ceiling.
+    control = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        cwd=plain,
+        env=clean_env,
+        capture_output=True,
+        text=True,
+    )
+    assert control.returncode == 0, control.stderr
+    assert Path(os.path.realpath(control.stdout.strip())) == Path(os.path.realpath(outer))
+
+    monkeypatch.setattr(os, "environ", dict(clean_env))
+    scratch = install_session_git_isolation(basetemp=session_basetemp)
+    try:
+        isolation_env = dict(os.environ)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
 
     result = subprocess.run(
-        ["git", "rev-parse", "--git-dir"],
+        ["git", "rev-parse", "--show-toplevel"],
         cwd=plain,
-        env=env,
+        env=isolation_env,
         capture_output=True,
         text=True,
     )
 
     assert result.returncode != 0, (
-        "git discovered a repository from a non-repo tmp dir under only the "
-        "session-installed ceiling — containment is not what stopped the ascent"
+        "git discovered the enclosing repo from a non-repo dir under the "
+        "session-installed basetemp ceiling — containment is not what "
+        "stopped the ascent"
     )
+
+    # Attribution detail for a failure above: the installed ceiling must name
+    # the basetemp and — because ``outer`` is a basetemp ancestor — the
+    # enclosing repo itself (a ceiling entry reached by ascent is not
+    # examined, so ``outer/.git`` is never seen from below the basetemp).
+    ceilings = isolation_env["GIT_CEILING_DIRECTORIES"].split(os.pathsep)
+    assert str(Path(os.path.realpath(session_basetemp))) in ceilings
+    assert str(Path(os.path.realpath(outer))) in ceilings
 
 
 def test_shared_helper_still_writes_config_at_repo_root(tmp_path: Path) -> None:
