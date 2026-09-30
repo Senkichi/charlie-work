@@ -51,6 +51,7 @@ from typing import TYPE_CHECKING, Any
 from . import worker_fate
 from .dispatch_selection import _credit_worker_death
 from .worker import iter_workers
+from .write_gate import WriteGate, require_write_gate
 
 if TYPE_CHECKING:
     from .config import OrchestratorConfig
@@ -89,6 +90,8 @@ def _persist_on_locked_entry(
     *,
     adapter_kind: str,
     now: datetime,
+    source: str,
+    write_gate: WriteGate,
 ) -> None:
     """Persist ``failure`` via ``worker_fate.persist_failure`` and keep ``entry`` live.
 
@@ -100,11 +103,18 @@ def _persist_on_locked_entry(
     could revert the caller's in-flight edits -- and the caller's own object
     is re-seated in ``state["issues"]`` when it was the stored entry before.
     """
+    write_gate = require_write_gate(write_gate)
     key = str(issue_number)
     issues_before = state.get("issues")
     before = issues_before.get(key) if isinstance(issues_before, dict) else None
     new_state = worker_fate.persist_failure(
-        state, issue_number, failure, adapter_kind=adapter_kind, now=now
+        state,
+        issue_number,
+        failure,
+        adapter_kind=adapter_kind,
+        now=now,
+        source=source,
+        write_gate=write_gate,
     )
     state.update(new_state)
     stamped = new_state.get("issues", {}).get(key) if isinstance(new_state, dict) else None
@@ -124,6 +134,7 @@ def resolve_dead_worker_failure_kind(
     state: dict[str, Any],
     config: OrchestratorConfig,
     *,
+    write_gate: WriteGate,
     now: datetime | None = None,
     classify_log: bool = True,
 ) -> str | None:
@@ -163,7 +174,15 @@ def resolve_dead_worker_failure_kind(
     the resolved kind, or None when the death stays unclassified -- the
     caller then applies the pre-#2002 behavior (a credit is still a real
     worker death, just not a provider exemption).
+
+    ``write_gate`` (issue #2006) is the emission channel for the
+    ``throttle_window_set`` audit event a resolved throttle kind emits when
+    it arms the cooldown: the gate's bound ``state_path``/``repo`` dual-write
+    puts the row in ``events.db`` (not only the in-memory ring) and its
+    ``dry_run`` suppresses the event entirely. Required -- a missing channel
+    here was the audit gap the issue was filed against.
     """
+    write_gate = require_write_gate(write_gate)
     stamped = worker_fate.persisted_failure(entry).kind
     if stamped is not None:
         return stamped
@@ -195,6 +214,8 @@ def resolve_dead_worker_failure_kind(
         worker_fate.FailureEvidence.from_classification(failure_kind, throttled_until, fresh=True),
         adapter_kind=view.adapter_kind,
         now=now if now is not None else datetime.now(UTC),
+        source="dead_worker_classification",
+        write_gate=write_gate,
     )
     return failure_kind
 
@@ -206,6 +227,7 @@ def classify_and_credit_dead_worker(
     state: dict[str, Any],
     config: OrchestratorConfig,
     *,
+    write_gate: WriteGate,
     at: str,
     now: datetime | None = None,
     classify_log: bool = True,
@@ -237,8 +259,16 @@ def classify_and_credit_dead_worker(
     Returns the resolved ``failure_kind`` (None when unclassifiable) so the
     call site can record it in its event payload.
     """
+    write_gate = require_write_gate(write_gate)
     failure_kind = resolve_dead_worker_failure_kind(
-        entry, sessions_dir, issue_number, state, config, now=now, classify_log=classify_log
+        entry,
+        sessions_dir,
+        issue_number,
+        state,
+        config,
+        write_gate=write_gate,
+        now=now,
+        classify_log=classify_log,
     )
     # Rule 6 read side (worker_fate.persisted_failure): resolution above has
     # stamped ``dead_worker_failure_kind`` on ``entry`` whenever it resolved a
