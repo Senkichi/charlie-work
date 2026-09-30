@@ -31,6 +31,11 @@ from ci_fleet.config import (  # noqa: F401  (deliberate re-export)
     RunnerScalingConfig,
 )
 
+# ``ConfigError`` moved to ``config_validation`` (ADR-0007) so section modules can
+# raise it without a lazy import of this module; ``charlie_work.config.ConfigError``
+# remains the public name and is the same class object.
+from .config_validation import ConfigError  # noqa: F401  (deliberate re-export)
+
 # Re-exported from the domain module (issue #763) for the same reason
 # ``RunnerAllocationConfig`` is re-exported from ``ci_fleet.config`` above:
 # the dataclass lives in its own module so new code does not land in this
@@ -191,10 +196,6 @@ PRIOR_WORKER_STILL_ALIVE_FAILURE_KIND = "prior_worker_still_alive"
 PRE_LAUNCH_BLOCKED_ENVIRONMENT_FAILURE_KINDS: frozenset[str] = frozenset(
     {"worktree_foreign_writer", PRIOR_WORKER_STILL_ALIVE_FAILURE_KIND}
 )
-
-
-class ConfigError(ValueError):
-    """A config file was structurally invalid (unknown keys, wrong shapes)."""
 
 
 def _validate_command_placeholders(
