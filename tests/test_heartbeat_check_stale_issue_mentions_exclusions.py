@@ -304,6 +304,33 @@ def test_check_stale_open_issue_mentions_configured_parked_labels(
     assert "excluded_labels=1" in report.lines[-1]
 
 
+def test_check_stale_open_issue_mentions_reports_config_load_error(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    """A malformed ``orchestrator.config.yaml`` is surfaced, not swallowed:
+    the check still runs (``parked_label_names`` falls back to the mirrored
+    default set, ``lifecycle_label_names`` contributes nothing) and the
+    facts line carries a degraded note, same posture as the commit-scan
+    degradation."""
+    repo = _make_repo(hb, tmp_path)
+    repo.config_path.write_text("- not a mapping\n", encoding="utf-8")
+    _stale_mention_gh_dispatch(
+        monkeypatch,
+        hb,
+        open_numbers=[700],
+        merged_prs=[_merged_pr(9, "Fixed for real in #700")],
+    )
+    monkeypatch.setattr(hb, "get_merged_commit_messages", lambda root, limit: (True, [], ""))
+
+    report = hb.Report()
+    hb.check_stale_open_issue_mentions(report, repo)
+
+    assert report.anomaly
+    assert "#700" in report.lines[-1]
+    assert "config load degraded" in report.lines[-1]
+    assert "expected a mapping" in report.lines[-1]
+
+
 @pytest.mark.parametrize(
     "author",
     [

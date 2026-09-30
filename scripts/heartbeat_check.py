@@ -2113,9 +2113,12 @@ def check_stale_open_issue_mentions(report: Report, repo: RepoInfo) -> None:
 
     Every suppression is counted and surfaced in the facts line
     (`excluded_refs`/`excluded_labels`/`excluded_bots`) so a silent zero is
-    auditable, never invisible. Output is capped at
-    `STALE_MENTION_REPORT_CAP` issues (with a "+K more" suffix) so a large
-    true positive count cannot flood the beat.
+    auditable, never invisible. A malformed `orchestrator.config.yaml`
+    (`load_orchestrator_config` error) is likewise surfaced in the facts
+    line as `config load degraded` rather than swallowed -- the exclusion
+    machinery then runs on the mirrored default parked set only. Output is
+    capped at `STALE_MENTION_REPORT_CAP` issues (with a "+K more" suffix)
+    so a large true positive count cannot flood the beat.
     """
     check = f"stale-open-issue-mentions {repo.slug}"
     if repo.local_issues_enabled:
@@ -2168,7 +2171,7 @@ def check_stale_open_issue_mentions(report: Report, repo: RepoInfo) -> None:
         repo.repo_root, STALE_MENTION_COMMIT_LOOKBACK
     )
 
-    config, _config_err = load_orchestrator_config(repo.config_path)
+    config, config_err = load_orchestrator_config(repo.config_path)
     managed_labels = parked_label_names(config.get("heartbeat")) | lifecycle_label_names(
         config.get("labels")
     )
@@ -2225,6 +2228,12 @@ def check_stale_open_issue_mentions(report: Report, repo: RepoInfo) -> None:
     )
     if not ok_commits:
         facts += f" (commit-message scan degraded: {err_commits})"
+    if config_err is not None:
+        # A malformed config must not be silently swallowed: the check still
+        # runs (parked_label_names falls back to the mirrored default and
+        # lifecycle_label_names contributes nothing on a non-mapping), but the
+        # facts line records that the configured knob was not consulted.
+        facts += f" (config load degraded: {config_err})"
 
     if not mentions:
         report.ok(check, f"stale_mentions=0 ({facts})")
