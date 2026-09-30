@@ -124,8 +124,11 @@ _MOVED_NAMES = (
 # pre-review-rework, and no-open-PR lanes) grew the module to 2830 lines —
 # the band is re-centered on the new measured total with the same +/-150
 # headroom, per the assertion's own re-derivation instruction.
-_CAP_BAND_MIN = 2680
-_CAP_BAND_MAX = 2980
+# Re-derived under issue #1971: the labelless-dead-local-session park call in
+# the classify lane grew the module to 2990 lines; the band is re-centered on
+# that total with the same +/-150 headroom.
+_CAP_BAND_MIN = 2840
+_CAP_BAND_MAX = 3140
 
 
 # ---------------------------------------------------------------------------

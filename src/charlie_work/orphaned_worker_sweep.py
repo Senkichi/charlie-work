@@ -11,6 +11,11 @@ no-open-PR salvage branch stay in ``workflow.py``. Issue #1917 later moved
 the #654 timed ``dead_dispatched_reap_minutes`` escalation backstop here
 too (``maybe_reap_dead_dispatched_worker``) for the same ratchet reason.
 
+Issue #1971 later moved the #1911 completed-outcome recovery one level
+deeper -- ``dead_worker_completed_outcome.handle_dead_worker_completed_
+outcome`` -- when the #1993 provider-throttle rearm merge pushed this module
+past the repo's 800-line cap; this module calls it at both original sites.
+
 Called once per dead-PID ``dispatched`` issue that still has a linked open
 PR, inside the sweep's ``state_lock`` (the same lock window the code ran
 under before the move). Every finding either mutates ``entry`` and appends
@@ -31,13 +36,14 @@ other free name is imported directly from its defining module.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from . import worker_fate
 from .blocked_worker_escalation import dead_worker_blocked_outcome, escalate_declared_blocked
+from .dead_dispatched_timer import dead_dispatched_reap_due, defer_or_expire_local_park
 from .dead_worker_classification import classify_and_credit_dead_worker
 from .orphaned_worker_no_op_drain import NO_OP_DEFERRED_HEAD_KEY, NoOpReworkRoute
 from .orphaned_worker_review_drain import OrphanedWorkerReviewRoute
@@ -79,6 +85,7 @@ def maybe_reap_dead_dispatched_worker(
     now: datetime,
     sweep_events: list[tuple[str, dict[str, Any]]],
     max_throttle_rearms: int,
+    local_park_deferred: Mapping[int, str] | None = None,
     on_fate: Callable[[worker_fate.WorkerFate], None] | None = None,
 ) -> tuple[dict[str, Any], bool]:
     """Timed dead-dispatched backstop (issue #654), run per dead-PID entry.
@@ -139,6 +146,24 @@ def maybe_reap_dead_dispatched_worker(
     PR-linked entries hold the branch mutex; they escalate on the anchored
     grace.
 
+    Issue #1971: on a no-PR backend the escalation additionally consults
+    ``local_park_deferred`` -- the per-issue outcomes of the salvageable-work
+    park the sweep ran for every backstop-due orphan BEFORE this lock (the
+    park takes ``state_lock`` itself, so it can never run inside). A failed
+    or inconclusive park/probe lands in the map and is DEFERRED -- the
+    escalation runs only when the park lane proved there is nothing to
+    salvage. ``orphan_drift_at`` stays armed so the next pass re-probes, and
+    the deferral surfaces once per distinct reason through the same
+    fingerprinted ``orphaned_worker_drift`` audit shape the drift branches
+    use. The deferral is BOUNDED
+    (``dead_dispatched_timer.LOCAL_PARK_DEFER_MAX_PASSES`` consecutive
+    deferred passes, counted on the entry by
+    ``dead_dispatched_timer.defer_or_expire_local_park``): once the budget
+    is spent the escalation runs anyway and carries the probe error (git's
+    own stderr via ``command_failure_message``), so a deterministic probe
+    failure -- a missing base ref, no merge base -- cannot wedge a
+    ``dispatched`` entry forever.
+
     Returns the (possibly replaced) ``state`` mapping -- the escalation
     helpers rebuild it -- and ``True`` when the entry was escalated, so the
     caller appends to ``reap_escalations`` and moves to the next issue.
@@ -150,32 +175,18 @@ def maybe_reap_dead_dispatched_worker(
     import charlie_work.workflow as _wf
 
     orphan_drift_at = entry.get("orphan_drift_at")
-    drift_dt = _wf._parse_iso_timestamp(orphan_drift_at) if orphan_drift_at else None
-    if drift_dt is None or dead_dispatched_reap_minutes <= 0:
-        return state, False
-    grace_anchor = drift_dt
     # A6: single read-side accessor for the persisted failure kind (worker_fate
     # §6) in place of the direct ``entry.get("dead_worker_failure_kind")`` read
     # -- same value, single point of enforcement for the AST guard that keeps
     # the raw key name out of every module but state.py/worker_fate.py.
     failure = worker_fate.persisted_failure(entry)
     provider_throttled = failure.is_throttle
-    if provider_throttled:
-        throttled_until_dt = _wf._parse_iso_timestamp(state.get("throttled_until"))
-        if throttled_until_dt is not None:
-            if throttled_until_dt > now:
-                return state, False
-            # Issue #1997: the throttle window is anchored at the provider
-            # message's emission time, so it can be armed already expired —
-            # the reset predated classification. The stamp still means the
-            # death was a fleet-wide provider condition, never a
-            # worker-quality signal, so the grace anchors at the window's
-            # own end (``max``): a born-expired window still leaves one
-            # backstop grace for the caller's normal handling to reclaim
-            # the issue before this timed reap resumes. A stamp whose
-            # window ended longer ago than that fails closed to the timer.
-            grace_anchor = max(drift_dt, throttled_until_dt)
-    if (now - grace_anchor).total_seconds() / 60 < dead_dispatched_reap_minutes:
+    if not dead_dispatched_reap_due(
+        state=state,
+        entry=entry,
+        dead_dispatched_reap_minutes=dead_dispatched_reap_minutes,
+        now=now,
+    ):
         return state, False
     rearm_count = int(entry.get("throttle_reap_rearm_count") or 0)
     if provider_throttled and pr_data is None and rearm_count < max_throttle_rearms:
@@ -194,6 +205,19 @@ def maybe_reap_dead_dispatched_worker(
                 },
             )
         )
+        return state, False
+    park_deferral = (local_park_deferred or {}).get(issue_number)
+    if park_deferral is not None and defer_or_expire_local_park(
+        entry,
+        issue_number=issue_number,
+        reason=park_deferral,
+        now=now,
+        orphan_drift_at=orphan_drift_at,
+        sweep_events=sweep_events,
+    ):
+        # See the docstring: a failed or inconclusive park/probe must not
+        # escalate while its deferral budget remains -- the branch may still
+        # carry the worker's commits.
         return state, False
     pr_number = int(pr_data["number"]) if pr_data else None
     # Rule 1 (freshness): a record left by an earlier dispatch must not
@@ -215,6 +239,13 @@ def maybe_reap_dead_dispatched_worker(
             "dispatched_at": None,
             "orphan_drift_fingerprint": None,
             "orphan_drift_at": None,
+            "local_park_defer_count": None,
+            "local_park_defer_since": None,
+            "local_park_defer_pass_key": None,
+            # The spent deferral's probe error (git stderr) is kept on the
+            # entry so the escalation record shows WHY unverified work was
+            # escalated rather than silently wedging.
+            "local_park_defer_reason": park_deferral,
         },
     )
     sweep_events.append(
@@ -228,6 +259,7 @@ def maybe_reap_dead_dispatched_worker(
                 "orphan_drift_at": orphan_drift_at,
                 "reap_minutes": dead_dispatched_reap_minutes,
                 "exit_code": terminal_exit_code,
+                "local_park_defer_error": park_deferral,
             },
         )
     )

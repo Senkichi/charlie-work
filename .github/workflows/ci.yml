@@ -92,7 +92,8 @@ jobs:
     # solo took 43.7 min under full sibling overlap on the shared box, and
     # 45 cap-killed 9 of 16 overnight runs). #1500 carried 75 onto hosted
     # runners as a first-runs backstop; the contention it encodes does not
-    # exist on dedicated single-use VMs.
+    # exist on dedicated single-use VMs. -> 22 (#1504) -> 30 (#2045);
+    # the two hosted derivations are below.
     #
     # 22 min: derived 2026-09-17 from hosted runs (#1504). Window = every
     # CI run created after the #1500 merge commit (f9b96b3); 205 successful
@@ -100,14 +101,28 @@ jobs:
     # (job started_at -> completed_at = whole job including checkout and
     # uv sync, not just pytest). Non-success runs stayed under ~19 min
     # except one superseded run still in-flight at 55 min when cancelled
-    # -- an outlier, not a completion time. 22 clears the observed max by
-    # ~38%, inside the #1254 method's ~25-50% band: headroom for suite
-    # growth, while a genuine hang now dies at 22 min instead of burning
-    # 75. If future data pushes typical runs toward the cap, re-derive
-    # from the Actions API rather than bumping by feel -- the #1434
-    # failure mode was PASSED suites cap-killed during cleanup, cycling
-    # merge_failed_attempt_alarm.
-    timeout-minutes: 22
+    # -- an outlier, not a completion time. 22 cleared the observed max by
+    # ~38%, inside the #1254 method's ~25-50% band.
+    #
+    # 30 min: derived 2026-09-30 from the Actions API (issue #2045).
+    # Window = the Tests jobs of the 40 most recent completed ci.yml runs;
+    # the 36 that ran to completion (29 success / 7 failure -- both count:
+    # a failed job still ran the whole suite) took min 14.8 / median 19.6 /
+    # max 21.4 min (same started_at -> completed_at whole-job measure).
+    # The 22-min cap was already firing: run 36653966287 (PR #2040)
+    # finished pytest '1 failed, 8962 passed ... in 1285.32s (0:21:25)'
+    # and was then cancelled at 22.3 min during post-steps (#2045), and
+    # run 36658582915's Tests job was cancelled at 22.4 min in this
+    # sample. The #1254 band (observed max x 1.25-1.5) gives 26.8-32.1
+    # min; the issue's suggested 28 would leave the observed max at ~76%
+    # of cap, over its own <=75%-of-cap acceptance bound, so 29 is the
+    # floor. 30 clears the observed max by ~40% -- the ~38% margin the
+    # 22-min derivation carried -- while a genuine hang still dies at 30
+    # instead of burning 75. If typical runs drift toward the cap again,
+    # re-derive from the Actions API rather than bumping by feel -- the
+    # #1434 failure mode was PASSED suites cap-killed during cleanup,
+    # cycling merge_failed_attempt_alarm.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
       # setup-uv restored (2026-08-28). It was replaced by a PATH-append step
