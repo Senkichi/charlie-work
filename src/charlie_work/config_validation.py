@@ -667,7 +667,11 @@ def validate_section(
         text = str(exc)
         if text.startswith(f"{path}."):  # ci_fleet text already names the key path
             raise ConstructionError(text) from exc
-        raise ConstructionError(f"{path}: expected valid construction, got {text}") from exc
+        nulls = sorted(k for k, v in built.items() if v is None)
+        # A ``key: null`` the constructor cannot compare surfaces as an opaque TypeError
+        # ("'<' not supported ... 'NoneType'"); name the candidate keys so it stays actionable.
+        hint = f" (null keys: {', '.join(f'{path}.{k}' for k in nulls)})" if nulls else ""
+        raise ConstructionError(f"{path}: expected valid construction, got {text}{hint}") from exc
 
 
 # ----------------------------------------------------------------------- hooks

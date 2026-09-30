@@ -1677,9 +1677,9 @@ class WorkerRoleConfig:
 
     ``harness`` must be one of ``harnesses.WORKER_HARNESSES`` (``devin-shell``
     | ``claude-code`` | ``api`` | ``command`` | ``manual``) -- enforced at the
-    top-level ``worker:`` build site in ``build_config_from_data``, not here
-    in ``__post_init__``, because this same dataclass is reused for
-    ``rescue.worker``/``rescue.reviewer``, and ``rescue.reviewer``'s own
+    top-level ``worker:`` section's ``FieldRules(harness=...)`` annotation on
+    ``OrchestratorConfig.worker``, not as field metadata here, because this same
+    dataclass is reused for ``rescue.worker``/``rescue.reviewer``, and ``rescue.reviewer``'s own
     documented default harness (``"devin"``) is not a member of that
     frozenset -- a blanket per-instance check would reject that reuse's own
     defaults. ``model`` is harness-specific: empty string means "let the
@@ -1701,8 +1701,8 @@ class ReviewerRoleConfig:
     which model it uses, and the review-effort A/B experiment knobs.
 
     ``harness`` must be one of ``harnesses.REVIEWER_HARNESSES``; any other
-    value is rejected with ``ConfigError`` at load (see ``__post_init__`` --
-    issue #1513). ``REVIEWER_HARNESSES`` is derived from the same
+    value is rejected with ``ConfigError`` at load (the ``OneOf`` field
+    metadata below -- issue #1513). ``REVIEWER_HARNESSES`` is derived from the same
     ``harnesses.HARNESS_REGISTRY`` that ``WorkerRoleConfig`` (via
     ``harnesses.WORKER_HARNESSES``) and ``adapters.dispatch_sessions`` (via
     its dispatch table) read -- a harness gains reviewer support by flipping

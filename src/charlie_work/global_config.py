@@ -3,7 +3,8 @@ from __future__ import annotations
 import logging
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from collections.abc import Callable
+from typing import Any, TypeVar
 
 import yaml
 
@@ -23,7 +24,11 @@ from .fleet_supervisor_config import (
     resolve_fleet_supervisor_layer,
 )
 
+from .paths import RepoNotFoundError
+
 logger = logging.getLogger(__name__)
+
+_T = TypeVar("_T")
 
 
 def config_layer_paths(
@@ -364,3 +369,45 @@ def load_layered_config(
             global_config_path,
         )
         return repo_only
+
+
+def load_fleet_global_config(
+    load: Callable[..., OrchestratorConfig],
+    cwd: Path,
+    *,
+    fleet_dir_override: str | None,
+    fallback: _T,
+    report: Callable[[Exception], None],
+) -> OrchestratorConfig | _T:
+    """Load the fleet entry points' global config: require the global layer, degrade softly.
+
+    The one place ``fleet supervise`` / ``fleet work`` / ``fleet bash-rats`` decide what a
+    failed global load means. A missing or invalid global layer is reported through
+    *report*, then the per-repo config is reloaded without the global requirement so it
+    survives (the #623 silent-disable shape); only if that also fails does the caller's
+    *fallback* apply.
+
+    A :class:`ConstructionError` is never degraded. It is a *host-wide* section's own
+    constructor rejecting the global layer (ci_fleet's ``__post_init__`` rules, design F1),
+    which main surfaced as a raw ``ValueError`` that these handlers did not catch, so the
+    process refused to start. Continuing on defaults would silently turn runner allocation
+    and the fleet caps off (#623 / #590). ``ConstructionError`` subclasses ``ConfigError``,
+    so it must be re-raised explicitly ahead of that catch.
+
+    *load* is the caller's own ``load_layered_config`` binding (injected, not imported here,
+    so the caller module remains the seam its tests patch). The per-repo call sites that
+    skip a repo on ``ConfigError`` (autoscale prologue, fleet status) stay as they are: they
+    are non-fatal per repo, and skipping one repo is not a host-wide fail-open.
+    """
+    try:
+        return load(cwd, None, fleet_dir_override=fleet_dir_override, require_global=True)
+    except ConstructionError:
+        raise
+    except (ConfigError, RepoNotFoundError) as exc:
+        report(exc)
+        try:
+            return load(cwd, None, fleet_dir_override=fleet_dir_override)
+        except ConstructionError:
+            raise
+        except (ConfigError, RepoNotFoundError):
+            return fallback

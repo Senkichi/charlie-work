@@ -145,8 +145,9 @@ def parse_fleet_supervisor(data: dict[str, Any]) -> FleetSupervisorConfig:
 
     A key set in both locations to different values is a ``ConfigError``
     naming both -- silently picking one would make an operator's real intent
-    unresolvable. A key present but ``null`` counts as unset, matching the
-    validation's own ``None``-is-absent convention.
+    unresolvable. A legacy ``null`` is ignored, and a ``fleet_supervisor`` ``null``
+    yields to a non-null legacy value; with no legacy value the ``null`` is kept
+    (``None``, not the default -- the same null semantics as every other section).
 
     Each location is validated on its own (the moved keys of the legacy
     section are projected through the same ``FleetSupervisorConfig`` rules) so
@@ -199,7 +200,8 @@ def _adopt_legacy_keys(
                 f"{FLEET_SUPERVISOR_SECTION}.{key}",
                 f"one value across '{FLEET_SUPERVISOR_SECTION}' and legacy "
                 f"'{LEGACY_SUPERVISOR_SECTION}'",
-                f"{new_value!r} vs {legacy_value!r} (removal tracked by #1979)",
+                f"{new_value!r} vs {legacy_value!r} (removal tracked by #1979); "
+                f"delete '{LEGACY_SUPERVISOR_SECTION}.{key}'",
                 "raw",
             )
         if new_value is None:

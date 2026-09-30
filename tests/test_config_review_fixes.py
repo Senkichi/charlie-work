@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 from charlie_work.config import ConfigError, build_config_from_data
 from charlie_work.config_validation import ConstructionError
-from charlie_work.global_config import load_layered_config
+from charlie_work.global_config import load_fleet_global_config, load_layered_config
 
 # Bool fields whose default is True: ``key:`` (YAML null) used to store a falsy ``None``.
 _TRUE_DEFAULT_NULL_KEYS = [
@@ -133,3 +133,106 @@ def test_former_raw_crash_shapes_are_now_rescued_like_any_bad_global_layer(
     config = load_layered_config(repo, repo_config, fleet_dir_override=fleet)
     assert [Path(s).name for s in config.sources] == ["orchestrator.config.yaml"]
     assert config.dispatch.default_limit == 2
+
+
+# R3-B1: ``ConstructionError`` subclasses ``ConfigError``, and the fleet entry points catch
+# ``ConfigError`` to degrade to per-repo/default config. On main a host-wide ``__post_init__``
+# rejection was a raw ``ValueError`` those handlers did not catch, so the process refused to
+# start; it must still refuse, not silently run with runner allocation and the fleet caps off.
+_BAD_HOST_WIDE_GLOBAL = (
+    "fleet:\n  global_max_concurrent_sessions: 7\n"
+    "runner_allocation:\n  enabled: true\n  max_running_per_repo: [[o/r, 2], [o/r, 3]]\n"
+)
+
+
+def test_fleet_global_load_helper_refuses_host_wide_construction_error(tmp_path: Path) -> None:
+    repo, _, fleet = _layers(tmp_path, _BAD_HOST_WIDE_GLOBAL, "dispatch:\n  default_limit: 2\n")
+    reported: list[Exception] = []
+    with pytest.raises(ConstructionError):
+        load_fleet_global_config(
+            load_layered_config,
+            repo,
+            fleet_dir_override=fleet,
+            fallback=None,
+            report=reported.append,
+        )
+    assert reported == [], "a refusal is not a degradation: nothing is reported-then-continued"
+
+
+def test_fleet_global_load_helper_still_degrades_other_config_errors(tmp_path: Path) -> None:
+    # Control: an ordinary FieldError in the global layer keeps the #623 fallback, so the
+    # refusal above is caused by the ConstructionError class alone.
+    repo, _, fleet = _layers(tmp_path, "dispatch:\n  nope: 1\n", "dispatch:\n  default_limit: 2\n")
+    reported: list[Exception] = []
+    config = load_fleet_global_config(
+        load_layered_config,
+        repo,
+        fleet_dir_override=fleet,
+        fallback=None,
+        report=reported.append,
+    )
+    assert config is not None
+    assert config.dispatch.default_limit == 2
+    assert reported == []  # the rescue inside load_layered_config handled it, no fallback needed
+
+
+def test_fleet_global_load_helper_falls_back_when_nothing_loads(tmp_path: Path) -> None:
+    fleet = tmp_path / "fleet"
+    fleet.mkdir()  # no global config.yaml: require_global raises a plain ConfigError
+    reported: list[Exception] = []
+    sentinel = object()
+    config = load_fleet_global_config(
+        load_layered_config,
+        tmp_path,
+        fleet_dir_override=str(fleet),
+        fallback=sentinel,
+        report=reported.append,
+    )
+    assert len(reported) == 1
+    assert not isinstance(reported[0], ConstructionError)
+    assert config is not sentinel  # per-repo reload (defaults here) beats the fallback
+
+
+@pytest.mark.parametrize("command", ["work", "bash-rats"])
+def test_fleet_cli_refuses_to_start_on_host_wide_construction_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, command: str
+) -> None:
+    from unittest.mock import MagicMock
+
+    from charlie_work import cli
+
+    repo, _, fleet = _layers(tmp_path, _BAD_HOST_WIDE_GLOBAL, "dispatch:\n  default_limit: 2\n")
+    fleet_loop_mock = MagicMock()
+    monkeypatch.setattr(cli, "fleet_loop", fleet_loop_mock)
+    monkeypatch.chdir(repo)
+    args = cli.build_parser().parse_args(["--fleet-dir", fleet, "fleet", command, "--limit", "1"])
+    runner = cli.run_fleet_work if command == "work" else cli.run_fleet_bash_rats
+    with pytest.raises(ConstructionError):
+        runner(args)
+    fleet_loop_mock.assert_not_called()
+
+
+def test_fleet_supervise_refuses_to_start_on_host_wide_construction_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from unittest.mock import MagicMock
+
+    from charlie_work import fleet_dispatch
+
+    repo, _, fleet = _layers(tmp_path, _BAD_HOST_WIDE_GLOBAL, "dispatch:\n  default_limit: 2\n")
+    fleet_loop_mock = MagicMock()
+    monkeypatch.setattr(fleet_dispatch, "fleet_loop", fleet_loop_mock)
+    monkeypatch.setattr(fleet_dispatch, "try_acquire_supervisor_lock", MagicMock())
+    monkeypatch.chdir(repo)
+    with pytest.raises(ConstructionError):
+        fleet_dispatch.run_fleet_supervise(max_passes=1, fleet_dir_override=fleet)
+    fleet_loop_mock.assert_not_called()
+
+
+def test_null_construction_error_names_the_null_key() -> None:
+    # R3-N2: stays a loud ConstructionError (not a FieldError), but the opaque
+    # "'<' not supported ... NoneType" text now names which keys were null.
+    with pytest.raises(
+        ConstructionError, match=r"null keys: .*runner_allocation\.threads_per_slot"
+    ):
+        build_config_from_data({"runner_allocation": {"enabled": True, "threads_per_slot": None}})
