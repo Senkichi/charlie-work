@@ -35,6 +35,7 @@ from .local_lane import branch_diff, local_base_branch
 from .paths import runtime_paths
 from .rework_prompts import _write_text_atomic
 from .state import PASSIVE_OPEN_STATUS, load_state, state_lock
+from .worker_fate import persisted_failure
 from .worktree import inspect_worktree_state, worktree_path_for_branch
 from .write_gate import WriteGate
 
@@ -284,7 +285,7 @@ def park_salvageable_local_orphan(
         active_labels=active_labels,
         issue_labels=issue_labels,
         state_file=state_file,
-        failure_kind=(entry.get("dead_worker_failure_kind") if isinstance(entry, dict) else None),
+        failure_kind=(persisted_failure(entry).kind if isinstance(entry, dict) else None),
         issue_title=issue.get("title"),
         issue=issue,
         worker_outcome=worker_outcome,

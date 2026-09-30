@@ -120,11 +120,11 @@ def test_dispatch_reviews_reaps_stalled_claim_when_disabled(monkeypatch, tmp_pat
         launched.append(kwargs.get("issue_number") or args[0])
         return _fake_claude_worker_record(100, "agent/issue-10-fix")
 
-    def fake_is_worker_alive(record: ClaudeWorkerRecord, **_kwargs: Any) -> bool:
+    def fake_is_alive(pid: int | None, start: float | None) -> bool:
         return False
 
     monkeypatch.setattr("charlie_work.workflow.launch_claude_worker", fake_launch)
-    monkeypatch.setattr("charlie_work.claude_code.is_worker_alive", fake_is_worker_alive)
+    monkeypatch.setattr("charlie_work.worker_fate.is_alive", fake_is_alive)
 
     result = app.dispatch_reviews()
 
@@ -194,11 +194,11 @@ def test_dispatch_reviews_redispatches_stalled_reviews(monkeypatch, tmp_path: Pa
         launched.append(kwargs.get("issue_number") or args[0])
         return _fake_claude_worker_record(100, "agent/issue-10-fix")
 
-    def fake_is_worker_alive(record: ClaudeWorkerRecord, **_kwargs: Any) -> bool:
+    def fake_is_alive(pid: int | None, start: float | None) -> bool:
         return False
 
     monkeypatch.setattr("charlie_work.workflow.launch_claude_worker", fake_launch)
-    monkeypatch.setattr("charlie_work.claude_code.is_worker_alive", fake_is_worker_alive)
+    monkeypatch.setattr("charlie_work.worker_fate.is_alive", fake_is_alive)
 
     result = app.dispatch_reviews()
 
@@ -294,7 +294,7 @@ def test_dispatch_reviews_recorded_verdict_suppresses_later_stalled_throttle(
         encoding="utf-8",
     )
 
-    monkeypatch.setattr("charlie_work.claude_code.is_worker_alive", lambda *_: False)
+    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: False)
     monkeypatch.setattr(
         "charlie_work.workflow.launch_claude_worker",
         lambda *args, **kwargs: _fake_claude_worker_record(

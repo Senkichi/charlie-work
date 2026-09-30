@@ -1,0 +1,5 @@
+warning
+# Rule 3 (Worker fate): _worktree_still_unsafe could not make a stranded
+# branch durable (diverged remote, live or operator writer marker,
+# push/probe error, archive declined), so the worktree_unsafe escalation
+# label stays. payload.skip_reason says why.

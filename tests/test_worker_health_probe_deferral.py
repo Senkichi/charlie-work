@@ -35,7 +35,7 @@ def test_classify_worker_health_indeterminate_liveness_does_not_bypass_deferral(
     """Issue #360 criterion #1: an indeterminate liveness probe is not a definitive dead signal.
 
     When ``get_process_start_time`` returns ``None`` for a live PID,
-    ``is_session_alive`` returns ``True`` (indeterminate).  A stale sidecar log
+    ``worker_fate.is_alive`` returns ``True`` (indeterminate).  A stale sidecar log
     should still classify as ``STALLED`` (not ``DEAD``), because the liveness
     signal was not definitive and the deferral cap must not be bypassed for an
     indeterminate probe.
@@ -130,7 +130,7 @@ def test_classify_worker_health_dead_by_liveness_deferred_by_fresh_probe(
         )
     )
 
-    with patch("charlie_work.worker.is_session_alive", return_value=False):
+    with patch("charlie_work.worker_fate.is_alive", return_value=False):
         config = OrchestratorConfig()
         health = classify_worker_health(view, config, now, probe)
         assert health == WorkerHealth.HEALTHY
@@ -179,7 +179,7 @@ def test_classify_worker_health_stalled_by_mtime_inconclusive_probe_deferred(
         )
     )
 
-    with patch("charlie_work.worker.is_session_alive", return_value=True):
+    with patch("charlie_work.worker_fate.is_alive", return_value=True):
         config = OrchestratorConfig()
         health = classify_worker_health(view, config, now, probe)
         assert health not in (WorkerHealth.DEAD, WorkerHealth.STALLED)
@@ -235,7 +235,7 @@ def test_classify_worker_health_stalled_by_mtime_no_match_yet_probe_deferred(
         )
     )
 
-    with patch("charlie_work.worker.is_session_alive", return_value=True):
+    with patch("charlie_work.worker_fate.is_alive", return_value=True):
         config = OrchestratorConfig()
         health = classify_worker_health(view, config, now, probe)
         assert health not in (WorkerHealth.DEAD, WorkerHealth.STALLED)
@@ -279,7 +279,7 @@ def test_classify_worker_health_terminal_marker_still_dead_with_fresh_probe(
         )
     )
 
-    with patch("charlie_work.worker.is_session_alive", return_value=True):
+    with patch("charlie_work.worker_fate.is_alive", return_value=True):
         config = OrchestratorConfig()
         health = classify_worker_health(view, config, now, probe)
         assert health == WorkerHealth.DEAD
@@ -356,7 +356,7 @@ def test_classify_worker_health_dead_by_liveness_inconclusive_all_errored_deferr
     probe = _all_errored_probe()
     now = datetime.now(UTC)
 
-    with patch("charlie_work.worker.is_session_alive", return_value=False):
+    with patch("charlie_work.worker_fate.is_alive", return_value=False):
         config = OrchestratorConfig(watchdog=WatchdogConfig(max_inconclusive_probe_deferrals=2))
         # Below the cap: defer rather than fail open to DEAD.
         health = classify_worker_health(view, config, now, probe)
@@ -376,7 +376,7 @@ def test_classify_worker_health_dead_by_liveness_inconclusive_no_match_yet_defer
     probe = _no_match_yet_probe()
     now = datetime.now(UTC)
 
-    with patch("charlie_work.worker.is_session_alive", return_value=False):
+    with patch("charlie_work.worker_fate.is_alive", return_value=False):
         config = OrchestratorConfig(watchdog=WatchdogConfig(max_inconclusive_probe_deferrals=2))
         # Below the cap: defer rather than fail open to DEAD.
         health = classify_worker_health(view, config, now, probe)
@@ -396,7 +396,7 @@ def test_classify_worker_health_dead_by_liveness_inconclusive_cap_zero_reaps_imm
     probe = _all_errored_probe()
     now = datetime.now(UTC)
 
-    with patch("charlie_work.worker.is_session_alive", return_value=False):
+    with patch("charlie_work.worker_fate.is_alive", return_value=False):
         config = OrchestratorConfig(watchdog=WatchdogConfig(max_inconclusive_probe_deferrals=0))
         health = classify_worker_health(view, config, now, probe)
         assert health == WorkerHealth.DEAD

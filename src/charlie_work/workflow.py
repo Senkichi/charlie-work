@@ -18,10 +18,10 @@ from .adapters import (
 from .claude_code import (
     launch_claude_worker,
     resolve_review_effort,
-    worker_permission_denied,
     run_quota_probe,  # noqa: F401  (deliberate re-export; used by moved L01 b3 delegates via _wf.)
 )
 from .api_worker import launch_api_worker
+from .blocked_worker_escalation import escalatable_blocked_outcome
 from .devin_shell import launch_devin_session
 from .checks import (
     CheckSummary,
@@ -175,7 +175,6 @@ from .preflight import (
     run_preflight,  # noqa: F401  (deliberate re-export; Tier D patch target + used by moved L05 _loop_impl delegate via _wf.)
 )
 from .throttle_signatures import (
-    is_provider_throttle_failure,
     match_quota_tail,
     match_throttle_tail,
     parse_reset_clock_time,
@@ -484,6 +483,9 @@ from .live_handoff_finalize import (
     partition_dispatched_by_pid_liveness,
     resolve_live_handoff_candidates,
 )
+from . import worker_fate
+from .iso_timestamp import parse_iso_timestamp as _parse_iso_timestamp
+from .no_pr_orphan_fate import resolve_no_pr_orphan_fate, resolve_pushed_orphan_fate
 
 
 def _diff_file_summary(diff: str) -> tuple[int, list[tuple[str, int, int]]]:
@@ -813,24 +815,6 @@ def _label_error_reason(label_error: dict[str, Any]) -> str:
     if remove_labels:
         parts.append(f"remove failures: {remove_labels}")
     return "; ".join(parts)
-
-
-def _parse_iso_timestamp(value: Any) -> datetime | None:
-    """Parse an ISO 8601 timestamp from state.json into a timezone-aware datetime."""
-    if value is None:
-        return None
-    if isinstance(value, datetime):
-        return value.replace(tzinfo=UTC) if value.tzinfo is None else value
-    if not isinstance(value, str):
-        return None
-    ts = value.replace("Z", "+00:00")
-    try:
-        parsed = datetime.fromisoformat(ts)
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=UTC)
-    return parsed
 
 
 def _recent_dispatch_failed_attempts(
@@ -1735,13 +1719,18 @@ def _detect_and_handle_orphaned_workers(
     if repo_root is not None:
         worktrees_dir = resolved_layout(config, repo_root).worktrees
 
+    live_handoff_fates: dict[int, list[worker_fate.WorkerFate]] = {}
     stale_live_handoff_pids = collect_stale_live_handoff_pids(  # Issue #1867 round-2
         live_pid_entries,
         worker_outcome_finalize_minutes=config.watchdog.worker_outcome_finalize_minutes,
         repo_root=repo_root,
         worktrees_dir=worktrees_dir,
         now=now,
+        sessions_dir=sessions_dir,
+        on_fate=lambda fate: worker_fate.collect_fate(live_handoff_fates, fate),
     )
+    # B6: reported before the early return below.
+    worker_fate.report_stale_evidence(state_file, live_handoff_fates, write_gate=write_gate)
 
     if not orphaned_issues and not stale_live_handoff_pids:
         return
@@ -1803,6 +1792,11 @@ def _detect_and_handle_orphaned_workers(
     # fire before reclaim adds ``automated-ready``.  Reused by the second
     # loop (pushed-branch candidates) without re-reading.
     worker_outcomes: dict[int, dict[str, Any] | None] = {}
+    # B3: per-orphan fate (``worker_outcomes`` derives from it); branch
+    # evidence is unknown here, so only rows 1 (blocked) and the throttle guard.
+    fates: dict[int, worker_fate.WorkerFate] = {}
+    # B6: every fate this lane resolves, reported once after the pushed loop.
+    no_pr_stale_fates: dict[int, list[worker_fate.WorkerFate]] = {}
     issues_by_number: dict[int, dict[str, Any]] = {}  # also used by the live-handoff lane below
 
     if no_pr_orphans:
@@ -1840,10 +1834,23 @@ def _detect_and_handle_orphaned_workers(
             worktree_path = None
             if repo_root is not None and worktrees_dir is not None:
                 worktree_path = worktree_path_for_branch(repo_root, branch, worktrees_dir)
-            terminal = find_worker_terminal_status(sessions_dir, issue_number)
-            terminal_outcome = terminal.get("worker_outcome") if terminal else None
-            worktree_outcome = read_worker_outcome(worktree_path) if worktree_path else None
-            worker_outcomes[issue_number] = terminal_outcome or worktree_outcome
+            # Rule 1/7: real evidence (not a pre-collapsed terminal-or-worktree
+            # outcome); the module's freshness step arbitrates the candidates.
+            fates[issue_number] = resolve_no_pr_orphan_fate(
+                issue_number=issue_number,
+                entry=entry,
+                terminal=find_worker_terminal_status(sessions_dir, issue_number),
+                worktree_path=worktree_path,
+                worktree_outcome_raw=(
+                    read_worker_outcome(worktree_path) if worktree_path is not None else None
+                ),
+                now=now,
+            )
+            resolved_outcome = fates[issue_number].basis.outcome
+            worker_outcomes[issue_number] = (
+                dict(resolved_outcome.raw) if resolved_outcome is not None else None
+            )
+            worker_fate.collect_fate(no_pr_stale_fates, fates[issue_number])
 
         for issue_number in no_pr_orphans:
             issue = issues_by_number.get(issue_number)
@@ -1883,17 +1890,15 @@ def _detect_and_handle_orphaned_workers(
             # ``reap_escalations`` transition applies the operator-queue
             # label edge.
             worker_outcome = worker_outcomes.get(issue_number)
-            # Issue #2010: a ``blocked`` outcome (or log tail) that is just the
-            # headless permission-denial signature is a worker-config defect,
-            # not a structurally impossible task -- it must not reach the
-            # operator queue as if the task were blocked; it falls through to
-            # the ordinary redispatch path.
+            # B3, rule 1: the blocked check reads the module's fate. The #2010
+            # permission-denial exemption is the shared gate
+            # ``escalatable_blocked_outcome`` (also used by the with-PR lane).
             if (
-                isinstance(worker_outcome, dict)
-                and worker_outcome.get("outcome") == "blocked"
-                and not worker_permission_denied(
-                    sessions_dir, issue_number, str(worker_outcome.get("detail") or "")
+                isinstance(fates.get(issue_number), worker_fate.Blocked)
+                and escalatable_blocked_outcome(
+                    worker_outcome, sessions_dir=sessions_dir, issue_number=issue_number
                 )
+                is not None
             ):
                 label_write_ok = True
                 for label in sorted(active_labels):
@@ -1923,10 +1928,7 @@ def _detect_and_handle_orphaned_workers(
             # artifacts because the provider refused it, not because the
             # work loops -- it must not trip this guard (2026-09-29: #1983
             # escalated twice in 11 minutes on ``rate_limited`` deaths).
-            orphan_entry = state["issues"].get(str(issue_number))
-            throttle_death = isinstance(orphan_entry, dict) and is_provider_throttle_failure(
-                orphan_entry.get("dead_worker_failure_kind")
-            )
+            throttle_death = worker_fate.throttle_failure(fates.get(issue_number)) is not None
             if not throttle_death and _is_zero_artifact_dispatch_loop(sessions_dir, issue_number):
                 label_write_ok = True
                 for label in sorted(active_labels):
@@ -1974,6 +1976,8 @@ def _detect_and_handle_orphaned_workers(
             # committed branch for review instead of reclaiming it -- the
             # gate contract lives in park_or_reclaim_local_orphan's
             # docstring (local_work_park.py).
+            # Rule 3/9 sibling: park-vs-reclaim stays in local_work_park.py
+            # (pinned by ``test_flip3_*``).
             if park_or_reclaim_local_orphan(
                 gh=gh,
                 config=config,
@@ -2096,7 +2100,6 @@ def _detect_and_handle_orphaned_workers(
         # worktree file.  The blocked-outcome check already ran in the first
         # loop; here we only need the outcome for the push/PR-failure signal.
         worker_outcome = worker_outcomes.get(issue_number)
-
         reported_push = (
             isinstance(worker_outcome, dict)
             and worker_outcome.get("push_succeeded") is True
@@ -2129,10 +2132,19 @@ def _detect_and_handle_orphaned_workers(
             }
         )
 
-        # Treat a branch as a PR-open candidate when:
-        # - the worker itself reported a successful push with a failed PR, OR
-        # - the branch exists on origin and is ahead of the base (has commits).
-        if reported_push or (ahead_count is not None and ahead_count > 0):
+        # Rules 8/9: a PR-open candidate exactly when the fate is
+        # `PushedWithoutPr` (only the remote ahead count decides).
+        pushed_fate = resolve_pushed_orphan_fate(
+            issue_number=issue_number,
+            entry=entry,
+            precompute=fates[issue_number],
+            remote_head_sha=remote_head_sha,
+            ahead_count=ahead_count,
+            now=now,
+            sessions_dir=sessions_dir,
+        )
+        worker_fate.collect_fate(no_pr_stale_fates, pushed_fate)
+        if isinstance(pushed_fate, worker_fate.PushedWithoutPr):
             pushed_branch_candidates[issue_number] = {
                 "branch": branch,
                 "worktree_path": worktree_path,
@@ -2141,6 +2153,8 @@ def _detect_and_handle_orphaned_workers(
                 "ahead_count": ahead_count,
                 "ahead_error": ahead_error,
             }
+
+    worker_fate.report_stale_evidence(state_file, no_pr_stale_fates, write_gate=write_gate)
 
     # Issue #439: route dead workers with stuck pre-review PRs to rework before
     # the state-update sweep. PR views are fetched outside the state lock; the
@@ -2243,12 +2257,14 @@ def _detect_and_handle_orphaned_workers(
                 "active_labels": active_labels,
             }
 
-    live_handoff_candidates = resolve_live_handoff_candidates(  # Issue #1867
-        stale_live_handoff_pids,
-        pr_by_issue=pr_by_issue,
-        issues_by_number=issues_by_number,
-        gh=gh,
-        config=config,
+    live_handoff_candidates, live_handoff_pr_already_open = (
+        resolve_live_handoff_candidates(  # Issue #1867
+            stale_live_handoff_pids,
+            pr_by_issue=pr_by_issue,
+            issues_by_number=issues_by_number,
+            gh=gh,
+            config=config,
+        )
     )
 
     # Handle orphaned workers. Head-advanced request_changes findings are
@@ -2268,6 +2284,8 @@ def _detect_and_handle_orphaned_workers(
     # ``handle_dead_worker_completed_outcome`` -- extracted per the file-size
     # rule during the #1911 rework.
     outcome_apply_routes: list[tuple[int, int]] = []
+    # B6: fates the in-lock readers resolve; reported after the lock.
+    swept_fates: dict[int, list[worker_fate.WorkerFate]] = {}
 
     with state_lock(state_file):
         state = load_state(state_file)
@@ -2306,6 +2324,7 @@ def _detect_and_handle_orphaned_workers(
                     now=now,
                     sweep_events=sweep_events,
                     max_throttle_rearms=config.watchdog.max_auto_redispatch,
+                    on_fate=lambda fate: worker_fate.collect_fate(swept_fates, fate),
                 )
             )
             if dead_dispatched_reaped:
@@ -2337,6 +2356,8 @@ def _detect_and_handle_orphaned_workers(
                     outcome_apply_routes=outcome_apply_routes,
                     pr_orphan_unreviewed_details=pr_orphan_unreviewed_details,
                     drift_fingerprint=_drift_fingerprint,
+                    reap_escalations=reap_escalations,
+                    on_fate=lambda fate: worker_fate.collect_fate(swept_fates, fate),
                 )
             else:
                 # Issue #935: before reclaim/drift, try to open a PR for a branch
@@ -2650,9 +2671,7 @@ def _detect_and_handle_orphaned_workers(
                 # ``dead_worker_failure_kind``, stamped on the entry by the
                 # stall/dead reap lanes; earlier non-throttle deaths in the
                 # list still count.
-                provider_throttled_death = is_provider_throttle_failure(
-                    entry.get("dead_worker_failure_kind")
-                )
+                provider_throttled_death = worker_fate.persisted_failure(entry).is_throttle
                 if head_changed or first_observation:
                     orphan_redispatch_at = [] if provider_throttled_death else [now_ts]
                 elif dispatch_identity != prior_dispatch and not provider_throttled_death:
@@ -2813,6 +2832,7 @@ def _detect_and_handle_orphaned_workers(
             pr_by_issue=pr_by_issue,
             sweep_events=sweep_events,
             drift_fingerprint=_drift_fingerprint,
+            pr_already_open=live_handoff_pr_already_open,
         )
 
         state = _append_sweep_events(
@@ -2823,6 +2843,8 @@ def _detect_and_handle_orphaned_workers(
             write_gate=write_gate,
         )
         write_gate.save_state(state)
+
+    worker_fate.report_stale_evidence(state_file, swept_fates, write_gate=write_gate)
 
     # Issue #1911: apply each recovered completed outcome through the #1877
     # seam, outside the lock (the helper does network I/O and takes

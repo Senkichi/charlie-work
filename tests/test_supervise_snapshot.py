@@ -239,6 +239,6 @@ def test_take_snapshot_counts_alive_workers_not_sidecar_files(
         encoding="utf-8",
     )
 
-    monkeypatch.setattr("charlie_work.worker.is_session_alive", lambda record: True)
+    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: True)
     snap = take_snapshot(sessions, prs)
     assert snap.live_count == 1

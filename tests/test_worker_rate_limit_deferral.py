@@ -58,7 +58,7 @@ def test_stalled_worker_with_rate_limit_signature_is_deferred(
         lambda pid, start_time=None: killed.append(pid) or [pid],
     )
     monkeypatch.setattr(dead_worker_reap, "sweep_orphan_processes", lambda worktree_path: [])
-    monkeypatch.setattr("charlie_work.worker.is_session_alive", lambda record: True)
+    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: True)
     monkeypatch.setattr("charlie_work.worker.real_activity_probe_for", _stale_devin_probe)
 
     config = OrchestratorConfig(
@@ -136,7 +136,7 @@ def test_deferred_worker_log_resumes_exits_deferred_state(
         lambda pid, start_time=None: killed.append(pid) or [pid],
     )
     monkeypatch.setattr(dead_worker_reap, "sweep_orphan_processes", lambda worktree_path: [])
-    monkeypatch.setattr("charlie_work.worker.is_session_alive", lambda record: True)
+    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: True)
 
     config = OrchestratorConfig(
         watchdog=WatchdogConfig(
@@ -193,7 +193,7 @@ def test_deferred_worker_past_deadline_is_killed(
         lambda pid, start_time=None: killed.append(pid) or [pid],
     )
     monkeypatch.setattr(dead_worker_reap, "sweep_orphan_processes", lambda worktree_path: [])
-    monkeypatch.setattr("charlie_work.worker.is_session_alive", lambda record: True)
+    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: True)
     monkeypatch.setattr("charlie_work.worker.real_activity_probe_for", _stale_devin_probe)
 
     config = OrchestratorConfig(
@@ -255,7 +255,7 @@ def test_stalled_worker_without_rate_limit_signature_is_killed(
         lambda pid, start_time=None: killed.append(pid) or [pid],
     )
     monkeypatch.setattr(dead_worker_reap, "sweep_orphan_processes", lambda worktree_path: [])
-    monkeypatch.setattr("charlie_work.worker.is_session_alive", lambda record: True)
+    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: True)
     monkeypatch.setattr("charlie_work.worker.real_activity_probe_for", _stale_devin_probe)
 
     config = OrchestratorConfig(

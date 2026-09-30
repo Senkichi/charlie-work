@@ -3,7 +3,7 @@
 Motivation (issue #261, extends #260): when the stall/dead-worker reaper in
 ``workflow.py`` kills a worker, the only diagnostic signal it has today is a
 regex grep over the last 2KB of the worker's own log tail
-(``devin_shell._classify_session_failure`` / the claude-code twin). That
+(``worker_fate.classify_for``). That
 misses the single most useful failure mode: a worker blocked by a
 ``.devin`` push-gate hook (``decision: block``) looks identical, from the
 log tail alone, to a generic stall — so it gets hot-redispatched straight
@@ -1379,7 +1379,7 @@ def _classify_worker_blocked_from_log_tail(
     Reuses ``PostMortemConfig.signature_rules`` (filtered to
     ``kind == "worker_blocked"``) rather than adding a parallel config
     surface — see that field's docstring. Matches against the last 2KB of
-    the log, mirroring ``devin_shell._classify_session_failure``'s tail
+    the log, mirroring ``worker_fate.classify_for``'s tail
     window.
 
     A ``worker_blocked`` verdict from this function must never carry

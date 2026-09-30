@@ -1,6 +1,6 @@
 """Shared provider-throttle tail-matching helper.
 
-``_classify_session_failure`` (``devin_shell.py`` + ``claude_code.py``) and
+``worker_fate.classify_for`` and
 ``get_rate_limit_defer_until`` (``devin_shell.py``, issue #247) each answer
 the same question — "does this log tail contain a provider-throttle
 signature, and if so, when does the cooldown end?" — against the same
@@ -84,8 +84,22 @@ _RESOURCE_EXHAUSTED_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# Provider authentication failures (issue #484). N3 (wf-review-opus.md,
+# wf-8-review-fixes): this pattern used to be hand-duplicated verbatim in
+# both ``claude_code.py`` and ``worker_fate.py`` (the latter's own comment
+# said "moved verbatim from claude_code.py"), a byte-for-byte copy that
+# could silently drift the way ``_RATE_LIMIT_PATTERN`` once did (see this
+# module's docstring). Word-boundary 401/403 so a coincidental numeric
+# substring like "issue #4019" cannot trip a false cooldown.
+_PROVIDER_AUTH_PATTERN = re.compile(
+    r"\b401\b|\b403\b|authentication(?:\s+failed)?|unauthorized|"
+    r"invalid[-\s]?api[-\s]?key|invalid[-\s]?authentication|"
+    r"permission_denied|auth(?:entication)?\s+error",
+    re.IGNORECASE,
+)
+
 # The ``failure_kind`` values that represent a provider-side throttle
-# condition — the kinds for which ``_classify_session_failure`` arms
+# condition — the kinds for which ``worker_fate.classify_for`` arms
 # ``throttled_until``. Cap accounting uses this set so a zero-turn death
 # caused by a global provider condition (quota wall, rate limit, dead
 # API key) is never charged against the issue's redispatch/rework caps
@@ -124,6 +138,39 @@ def _parse_reset_in_minutes(tail: str) -> int | None:
             continue
         return int(hours or 0) * 60 + int(minutes or 0)
     return None
+
+
+def is_provider_auth_failure(tail: str) -> bool:
+    """True when ``tail`` carries a provider authentication-failure signature.
+
+    Single point of enforcement (N3, wf-review-opus.md): both
+    ``claude_code.py``'s quota-probe classifier and ``worker_fate.py``'s
+    rule-6 tail classifier call this instead of each matching their own
+    compiled copy of ``_PROVIDER_AUTH_PATTERN``.
+    """
+    return _PROVIDER_AUTH_PATTERN.search(tail) is not None
+
+
+# Headless permission-denial signature (issue #2010): a ``claude -p`` session
+# that cannot answer a permission prompt ends by asking the operator to
+# approve command execution. That is a config defect, not a blocked task, so
+# it gets its own failure kind (``permission_denied``) instead of escalating.
+# Lives here (a leaf module) so both ``claude_code`` and ``worker_fate`` can
+# import it without an import cycle; originally added in claude_code.py.
+PERMISSION_DENIED_FAILURE_KIND = "permission_denied"
+_HEADLESS_PERMISSION_DENIAL_PATTERN = re.compile(
+    r"approve\s+(?:the\s+)?(?:command|bash|tool)\s+execution|"
+    r"requires?\s+(?:your\s+)?approval|"
+    r"(?:command|tool)\s+(?:was|were)\s+(?:denied|not\s+allowed)|"
+    r"permission\s+to\s+run\s+(?:this|these|the)\s+(?:command|bash)",
+    re.IGNORECASE,
+)
+
+
+def is_headless_permission_denial(text: str) -> bool:
+    """True when ``text`` (a log tail or outcome detail) shows the headless
+    permission-denial signature."""
+    return bool(_HEADLESS_PERMISSION_DENIAL_PATTERN.search(text))
 
 
 def match_throttle_tail(tail: str, markers: Sequence[str]) -> tuple[bool, int | None]:
@@ -216,6 +263,7 @@ def parse_reset_clock_time(tail: str, now: datetime) -> datetime | None:
 
 __all__ = [
     "PROVIDER_THROTTLE_FAILURE_KINDS",
+    "is_provider_auth_failure",
     "is_provider_throttle_failure",
     "match_quota_tail",
     "match_throttle_tail",
