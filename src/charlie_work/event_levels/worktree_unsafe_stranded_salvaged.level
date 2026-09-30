@@ -1,0 +1,6 @@
+info
+# Rule 3 (Worker fate): _worktree_still_unsafe found a stranded branch
+# (commits absent from the remote, no worker-authored dirt) and made the
+# work durable -- ff-only push to origin, or the #1944 archive park on a
+# no-remote repo -- before letting the worktree_unsafe escalation clear.
+# Routine recovery; nothing was lost.

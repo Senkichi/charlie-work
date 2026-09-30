@@ -457,7 +457,7 @@ def unescalate(
         and issue_stuck
         and issue_state.get("escalation_reason") in WORKTREE_UNSAFE_KINDS
     ):
-        unsafe_reason = self._worktree_still_unsafe(issue_number, state)
+        unsafe_reason = self._worktree_still_unsafe(issue_number, state, dry_run=dry_run)
         if unsafe_reason:
             return _wf.CommandResult(
                 True,

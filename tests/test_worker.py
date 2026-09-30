@@ -155,7 +155,7 @@ def test_iter_workers_skips_malformed_sidecar(tmp_path: Path) -> None:
 
 
 def test_worker_view_is_alive_devin(monkeypatch: pytest.MonkeyPatch) -> None:
-    """WorkerView.is_alive() for a devin-kind view delegates to is_session_alive-equivalent logic (mock the underlying PID probe)."""
+    """WorkerView.is_alive() for a devin-kind view delegates to worker_fate.is_alive logic (mock the underlying PID probe)."""
     worker = WorkerView(
         adapter_kind="devin",
         issue_number=1,
@@ -170,17 +170,17 @@ def test_worker_view_is_alive_devin(monkeypatch: pytest.MonkeyPatch) -> None:
         reclaimed=None,
     )
 
-    # Mock is_session_alive in the worker module where it's imported
-    monkeypatch.setattr("charlie_work.worker.is_session_alive", lambda record: True)
+    # Mock worker_fate.is_alive (the single liveness seam)
+    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: True)
     assert worker.is_alive() is True
 
-    # Mock is_session_alive to return False
-    monkeypatch.setattr("charlie_work.worker.is_session_alive", lambda record: False)
+    # Mock worker_fate.is_alive to return False
+    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: False)
     assert worker.is_alive() is False
 
 
 def test_worker_view_is_alive_claude(monkeypatch: pytest.MonkeyPatch) -> None:
-    """WorkerView.is_alive() for a claude-code kind view delegates to is_worker_alive-equivalent logic (mock the underlying PID probe)."""
+    """WorkerView.is_alive() for a claude-code kind view delegates to worker_fate.is_alive logic (mock the underlying PID probe)."""
     worker = WorkerView(
         adapter_kind="claude-code",
         issue_number=2,
@@ -195,12 +195,12 @@ def test_worker_view_is_alive_claude(monkeypatch: pytest.MonkeyPatch) -> None:
         reclaimed=None,
     )
 
-    # Mock is_worker_alive in the worker module where it's imported
-    monkeypatch.setattr("charlie_work.worker.is_worker_alive", lambda record: True)
+    # Mock worker_fate.is_alive (the single liveness seam)
+    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: True)
     assert worker.is_alive() is True
 
-    # Mock is_worker_alive to return False
-    monkeypatch.setattr("charlie_work.worker.is_worker_alive", lambda record: False)
+    # Mock worker_fate.is_alive to return False
+    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: False)
     assert worker.is_alive() is False
 
 
@@ -621,7 +621,7 @@ def test_worker_view_reap_sidecar_unknown_adapter(tmp_path: Path) -> None:
 
 
 def test_worker_view_is_alive_api(monkeypatch: pytest.MonkeyPatch) -> None:
-    """WorkerView.is_alive() for an api-kind view delegates to is_worker_alive
+    """WorkerView.is_alive() for an api-kind view delegates to worker_fate.is_alive
     (api workers are Claude Code CLI processes with provider env injected)."""
     worker = WorkerView(
         adapter_kind="api",
@@ -637,10 +637,10 @@ def test_worker_view_is_alive_api(monkeypatch: pytest.MonkeyPatch) -> None:
         reclaimed=None,
     )
 
-    monkeypatch.setattr("charlie_work.worker.is_worker_alive", lambda record: True)
+    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: True)
     assert worker.is_alive() is True
 
-    monkeypatch.setattr("charlie_work.worker.is_worker_alive", lambda record: False)
+    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: False)
     assert worker.is_alive() is False
 
 
@@ -1001,7 +1001,7 @@ def test_workflow_classify_dead_sessions_reaps_probe_error_sidecar(
         )
 
     monkeypatch.setattr("charlie_work.worker.real_activity_probe_for", _inconclusive_probe)
-    monkeypatch.setattr("charlie_work.worker.is_session_alive", lambda _record: False)
+    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: False)
 
     # First pass: defer and advance the counter.
     _classify_dead_sessions_and_update_throttle_state(

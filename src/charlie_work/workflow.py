@@ -21,6 +21,7 @@ from .claude_code import (
     run_quota_probe,  # noqa: F401  (deliberate re-export; used by moved L01 b3 delegates via _wf.)
 )
 from .api_worker import launch_api_worker
+from .blocked_worker_escalation import escalatable_blocked_outcome
 from .devin_shell import launch_devin_session
 from .checks import (
     CheckSummary,
@@ -33,7 +34,13 @@ from .config import (
     ReviewDispatchConfig,
 )
 from .harnesses import REVIEWER_HARNESSES
-from .fleet_registry import count_fleet_live_sessions, managed_repo_names  # noqa: F401  (deliberate re-export; count_fleet_live_sessions used by moved L06 delegates via _wf.)
+from .worker_launch_gate import FleetLaunchLock
+from .review_fleet_gate import (
+    fleet_review_lock,
+    fleet_review_lock_deferral,
+    read_fleet_review_cap,
+)
+from .fleet_registry import count_fleet_live_reviews, count_fleet_live_sessions, managed_repo_names  # noqa: F401  (deliberate re-export; count_fleet_live_sessions used by moved L06 delegates via _wf., count_fleet_live_reviews by review_fleet_gate via _wf.)
 from . import layout, status_snapshot  # noqa: F401  (deliberate re-export; layout reached via _wf.layout by orchestration/misc_reconcile.py)
 from .main_ci_reclaim import reclaim_superseded_main_ci_runs  # noqa: F401  (deliberate re-export; used by moved L01 b3 delegates via _wf.)
 from .notify import AttentionDigest, AttentionEntry, emit_digest
@@ -88,9 +95,13 @@ from .janitor import (
 )
 from .diff_coverage_probe import StaticProbeVerdict, run_static_probe
 from .labels import TransitionOutcome, transition
-from .local_work_park import park_or_reclaim_local_orphan
+from .local_work_park import (
+    LocalParkResult,
+    park_backstop_due_local_orphans,
+    park_or_reclaim_local_orphan,
+)
 from .pass_deadline import pass_deadline_spent, pass_deadline_suspended
-from .paths import RuntimePaths, resolved_layout
+from .paths import RuntimePaths, prompt_override_dirs, resolved_layout
 from .prompt_sections import section_variant_names
 from .prompts import (
     PromptTemplateError,
@@ -174,7 +185,6 @@ from .preflight import (
     run_preflight,  # noqa: F401  (deliberate re-export; Tier D patch target + used by moved L05 _loop_impl delegate via _wf.)
 )
 from .throttle_signatures import (
-    is_provider_throttle_failure,
     match_quota_tail,
     match_throttle_tail,
     parse_reset_clock_time,
@@ -183,7 +193,7 @@ from .process_utils import (
     find_worker_terminal_status,
     is_pid_alive,  # noqa: F401  (deliberate re-export; used by moved L08 delegate via _wf.)
 )
-from . import orphaned_worker_review_drain, orphaned_worker_sweep, rework_outcome
+from . import markdown_guard, orphaned_worker_review_drain, orphaned_worker_sweep, rework_outcome
 from .write_gate import WriteGate, require_write_gate
 
 # LOAD-BEARING RE-EXPORT — NOT AN UNUSED IMPORT. Do not delete; the `noqa`
@@ -239,6 +249,7 @@ from .escalation import (  # noqa: F401  (deliberate re-export)
     _deescalation_skip,
     _record_issue_label_error,
     _escalate_issue,
+    _strip_active_and_flag_human_needed,
     _escalated_label_needs_repair,
     _collect_escalated_label_subjects,
     _escalation_edge,
@@ -248,6 +259,23 @@ from .escalation import (  # noqa: F401  (deliberate re-export)
     _cap_escalation_pr_extra,
     _reset_linked_pr_status_to_passive_open,
     _MECHANICAL_ESCALATION_EDGES,
+)
+
+# LOAD-BEARING RE-EXPORT — NOT AN UNUSED IMPORT. Do not delete; the `noqa`
+# below marks a deliberate re-export, not a lint concession.
+#
+# Issue #2051: the live-worker cap-escalation deferral helpers
+# (probe candidates through `issue_worker_liveness`, persist the
+# once-per-worker `escalation_deferred_live_worker` marker+event) live in
+# `charlie_work.live_worker_deferral` -- a new module rather than
+# `.escalation`, which has no file-size headroom left for them. Re-exported
+# here so `_wf.<name>` call sites and monkeypatch targets keep working.
+from .live_worker_deferral import (  # noqa: F401  (deliberate re-export)
+    _live_worker_cap_escalation_deferrals,
+    _filter_cap_escalation_lanes_for_live_workers,
+    _defer_cap_escalation_for_live_worker,
+    _record_cap_escalation_deferrals,
+    _defer_janitor_cap_escalation_for_live_worker,
 )
 
 # LOAD-BEARING RE-EXPORT — NOT AN UNUSED IMPORT. Do not delete; the `noqa`
@@ -286,6 +314,7 @@ from .verdict_parsing import (  # noqa: F401  (deliberate re-export)
     _parse_review_verdict_from_log,
     _parse_review_verdict_from_events,
     _parse_review_verdict_from_files,
+    _session_mtime_cutoff,
     _reviewer_session_metrics,
     _log_tail_throttled,
     _extract_terminating_cause,
@@ -482,6 +511,9 @@ from .live_handoff_finalize import (
     partition_dispatched_by_pid_liveness,
     resolve_live_handoff_candidates,
 )
+from . import worker_fate
+from .iso_timestamp import parse_iso_timestamp as _parse_iso_timestamp
+from .no_pr_orphan_fate import resolve_no_pr_orphan_fate, resolve_pushed_orphan_fate
 
 
 def _diff_file_summary(diff: str) -> tuple[int, list[tuple[str, int, int]]]:
@@ -811,24 +843,6 @@ def _label_error_reason(label_error: dict[str, Any]) -> str:
     if remove_labels:
         parts.append(f"remove failures: {remove_labels}")
     return "; ".join(parts)
-
-
-def _parse_iso_timestamp(value: Any) -> datetime | None:
-    """Parse an ISO 8601 timestamp from state.json into a timezone-aware datetime."""
-    if value is None:
-        return None
-    if isinstance(value, datetime):
-        return value.replace(tzinfo=UTC) if value.tzinfo is None else value
-    if not isinstance(value, str):
-        return None
-    ts = value.replace("Z", "+00:00")
-    try:
-        parsed = datetime.fromisoformat(ts)
-    except ValueError:
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=UTC)
-    return parsed
 
 
 def _recent_dispatch_failed_attempts(
@@ -1658,6 +1672,8 @@ def _detect_and_handle_orphaned_workers(
     *,
     write_gate: WriteGate,
     review_callback: Callable[[int], Any] | None = None,
+    record_review_callback: Callable[..., Any] | None = None,
+    enrich_checks_callback: Callable[..., list[dict[str, Any]]] | None = None,
     fleet_dir_override: str | None = None,
 ) -> None:
     """Detect and handle orphaned workers using state.json PID records.
@@ -1678,8 +1694,8 @@ def _detect_and_handle_orphaned_workers(
       dispatched this worker) and head is unchanged since review, reset to
       "rework_requested" -- same as the request_changes branch (issue #1109)
     - Issue #1911: before either reset, when no terminal-status record exists
-      (``terminal_exit_code is None`` -- the normal shape for devin-shell
-      sessions, which never get a watcher), a fresh on-target
+      (``terminal_exit_code is None`` -- e.g. a session whose watcher never
+      ran, or one launched before every Popen-backed harness grew one), a fresh on-target
       ``.worker-outcome.json`` in the worktree proves the dispatch completed;
       its PR edits are applied through the #1877 outcome-apply path instead
       of crediting a worker death. Issue #1915: once that apply lands, the
@@ -1733,13 +1749,18 @@ def _detect_and_handle_orphaned_workers(
     if repo_root is not None:
         worktrees_dir = resolved_layout(config, repo_root).worktrees
 
+    live_handoff_fates: dict[int, list[worker_fate.WorkerFate]] = {}
     stale_live_handoff_pids = collect_stale_live_handoff_pids(  # Issue #1867 round-2
         live_pid_entries,
         worker_outcome_finalize_minutes=config.watchdog.worker_outcome_finalize_minutes,
         repo_root=repo_root,
         worktrees_dir=worktrees_dir,
         now=now,
+        sessions_dir=sessions_dir,
+        on_fate=lambda fate: worker_fate.collect_fate(live_handoff_fates, fate),
     )
+    # B6: reported before the early return below.
+    worker_fate.report_stale_evidence(state_file, live_handoff_fates, write_gate=write_gate)
 
     if not orphaned_issues and not stale_live_handoff_pids:
         return
@@ -1801,7 +1822,14 @@ def _detect_and_handle_orphaned_workers(
     # fire before reclaim adds ``automated-ready``.  Reused by the second
     # loop (pushed-branch candidates) without re-reading.
     worker_outcomes: dict[int, dict[str, Any] | None] = {}
+    # B3: per-orphan fate (``worker_outcomes`` derives from it); branch
+    # evidence is unknown here, so only rows 1 (blocked) and the throttle guard.
+    fates: dict[int, worker_fate.WorkerFate] = {}
+    # B6: every fate this lane resolves, reported once after the pushed loop.
+    no_pr_stale_fates: dict[int, list[worker_fate.WorkerFate]] = {}
     issues_by_number: dict[int, dict[str, Any]] = {}  # also used by the live-handoff lane below
+    park_verdicts: dict[int, LocalParkResult] = {}  # Issue #1971 no-PR park lane
+    local_park_deferred: dict[int, str] = {}
 
     if no_pr_orphans:
         for issue in gh.issue_list(state="open"):
@@ -1838,10 +1866,23 @@ def _detect_and_handle_orphaned_workers(
             worktree_path = None
             if repo_root is not None and worktrees_dir is not None:
                 worktree_path = worktree_path_for_branch(repo_root, branch, worktrees_dir)
-            terminal = find_worker_terminal_status(sessions_dir, issue_number)
-            terminal_outcome = terminal.get("worker_outcome") if terminal else None
-            worktree_outcome = read_worker_outcome(worktree_path) if worktree_path else None
-            worker_outcomes[issue_number] = terminal_outcome or worktree_outcome
+            # Rule 1/7: real evidence (not a pre-collapsed terminal-or-worktree
+            # outcome); the module's freshness step arbitrates the candidates.
+            fates[issue_number] = resolve_no_pr_orphan_fate(
+                issue_number=issue_number,
+                entry=entry,
+                terminal=find_worker_terminal_status(sessions_dir, issue_number),
+                worktree_path=worktree_path,
+                worktree_outcome_raw=(
+                    read_worker_outcome(worktree_path) if worktree_path is not None else None
+                ),
+                now=now,
+            )
+            resolved_outcome = fates[issue_number].basis.outcome
+            worker_outcomes[issue_number] = (
+                dict(resolved_outcome.raw) if resolved_outcome is not None else None
+            )
+            worker_fate.collect_fate(no_pr_stale_fates, fates[issue_number])
 
         for issue_number in no_pr_orphans:
             issue = issues_by_number.get(issue_number)
@@ -1881,14 +1922,19 @@ def _detect_and_handle_orphaned_workers(
             # ``reap_escalations`` transition applies the operator-queue
             # label edge.
             worker_outcome = worker_outcomes.get(issue_number)
-            if isinstance(worker_outcome, dict) and worker_outcome.get("outcome") == "blocked":
-                label_write_ok = True
-                for label in sorted(active_labels):
-                    if not gh.remove_issue_label(issue_number, label):
-                        label_write_ok = False
-                if config.labels.human_needed not in issue_labels:
-                    if not gh.add_issue_label(issue_number, config.labels.human_needed):
-                        label_write_ok = False
+            # B3, rule 1: the blocked check reads the module's fate. The #2010
+            # permission-denial exemption is the shared gate
+            # ``escalatable_blocked_outcome`` (also used by the with-PR lane).
+            if (
+                isinstance(fates.get(issue_number), worker_fate.Blocked)
+                and escalatable_blocked_outcome(
+                    worker_outcome, sessions_dir=sessions_dir, issue_number=issue_number
+                )
+                is not None
+            ):
+                label_write_ok = _strip_active_and_flag_human_needed(
+                    gh, config, issue_number, active_labels, issue_labels
+                )
                 worker_declared_blocked_escalations[issue_number] = {
                     "removed_labels": sorted(active_labels),
                     "label_write_ok": label_write_ok,
@@ -1910,18 +1956,11 @@ def _detect_and_handle_orphaned_workers(
             # artifacts because the provider refused it, not because the
             # work loops -- it must not trip this guard (2026-09-29: #1983
             # escalated twice in 11 minutes on ``rate_limited`` deaths).
-            orphan_entry = state["issues"].get(str(issue_number))
-            throttle_death = isinstance(orphan_entry, dict) and is_provider_throttle_failure(
-                orphan_entry.get("dead_worker_failure_kind")
-            )
+            throttle_death = worker_fate.throttle_failure(fates.get(issue_number)) is not None
             if not throttle_death and _is_zero_artifact_dispatch_loop(sessions_dir, issue_number):
-                label_write_ok = True
-                for label in sorted(active_labels):
-                    if not gh.remove_issue_label(issue_number, label):
-                        label_write_ok = False
-                if config.labels.human_needed not in issue_labels:
-                    if not gh.add_issue_label(issue_number, config.labels.human_needed):
-                        label_write_ok = False
+                label_write_ok = _strip_active_and_flag_human_needed(
+                    gh, config, issue_number, active_labels, issue_labels
+                )
                 zero_artifact_escalations[issue_number] = {
                     "removed_labels": sorted(active_labels),
                     "label_write_ok": label_write_ok,
@@ -1943,13 +1982,9 @@ def _detect_and_handle_orphaned_workers(
                 sweep_fleet_repos,
             )
             if not scope_result.passed:
-                label_write_ok = True
-                for label in sorted(active_labels):
-                    if not gh.remove_issue_label(issue_number, label):
-                        label_write_ok = False
-                if config.labels.human_needed not in issue_labels:
-                    if not gh.add_issue_label(issue_number, config.labels.human_needed):
-                        label_write_ok = False
+                label_write_ok = _strip_active_and_flag_human_needed(
+                    gh, config, issue_number, active_labels, issue_labels
+                )
                 cross_repo_scope_escalations[issue_number] = {
                     "removed_labels": sorted(active_labels),
                     "label_write_ok": label_write_ok,
@@ -1961,6 +1996,8 @@ def _detect_and_handle_orphaned_workers(
             # committed branch for review instead of reclaiming it -- the
             # gate contract lives in park_or_reclaim_local_orphan's
             # docstring (local_work_park.py).
+            # Rule 3/9 sibling: park-vs-reclaim stays in local_work_park.py
+            # (pinned by ``test_flip3_*``).
             if park_or_reclaim_local_orphan(
                 gh=gh,
                 config=config,
@@ -1975,8 +2012,33 @@ def _detect_and_handle_orphaned_workers(
                 worker_outcome=worker_outcome,
                 write_gate=write_gate,
                 reclaim_results=reclaim_results,
+                park_verdicts=park_verdicts,
+                now=now,
             ):
                 continue
+
+        # Issue #1971: pre-lock park drain for the #654 backstop below.
+        local_park_deferred = park_backstop_due_local_orphans(
+            gh=gh,
+            config=config,
+            repo_root=repo_root,
+            worktrees_dir=worktrees_dir,
+            state=state,
+            state_file=state_file,
+            no_pr_orphans=no_pr_orphans,
+            issues_by_number=issues_by_number,
+            worker_outcomes=worker_outcomes,
+            reclaim_results=reclaim_results,
+            escalations=(
+                worker_declared_blocked_escalations,
+                zero_artifact_escalations,
+                cross_repo_scope_escalations,
+            ),
+            park_verdicts=park_verdicts,
+            dead_dispatched_reap_minutes=config.watchdog.dead_dispatched_reap_minutes,
+            now=now,
+            write_gate=write_gate,
+        )
 
     # Issue #935: for the no-open-PR orphans, determine whether the worker
     # pushed a branch and reported push-succeeded-but-PR-failed. This is done
@@ -2083,7 +2145,6 @@ def _detect_and_handle_orphaned_workers(
         # worktree file.  The blocked-outcome check already ran in the first
         # loop; here we only need the outcome for the push/PR-failure signal.
         worker_outcome = worker_outcomes.get(issue_number)
-
         reported_push = (
             isinstance(worker_outcome, dict)
             and worker_outcome.get("push_succeeded") is True
@@ -2116,10 +2177,19 @@ def _detect_and_handle_orphaned_workers(
             }
         )
 
-        # Treat a branch as a PR-open candidate when:
-        # - the worker itself reported a successful push with a failed PR, OR
-        # - the branch exists on origin and is ahead of the base (has commits).
-        if reported_push or (ahead_count is not None and ahead_count > 0):
+        # Rules 8/9: a PR-open candidate exactly when the fate is
+        # `PushedWithoutPr` (only the remote ahead count decides).
+        pushed_fate = resolve_pushed_orphan_fate(
+            issue_number=issue_number,
+            entry=entry,
+            precompute=fates[issue_number],
+            remote_head_sha=remote_head_sha,
+            ahead_count=ahead_count,
+            now=now,
+            sessions_dir=sessions_dir,
+        )
+        worker_fate.collect_fate(no_pr_stale_fates, pushed_fate)
+        if isinstance(pushed_fate, worker_fate.PushedWithoutPr):
             pushed_branch_candidates[issue_number] = {
                 "branch": branch,
                 "worktree_path": worktree_path,
@@ -2128,6 +2198,8 @@ def _detect_and_handle_orphaned_workers(
                 "ahead_count": ahead_count,
                 "ahead_error": ahead_error,
             }
+
+    worker_fate.report_stale_evidence(state_file, no_pr_stale_fates, write_gate=write_gate)
 
     # Issue #439: route dead workers with stuck pre-review PRs to rework before
     # the state-update sweep. PR views are fetched outside the state lock; the
@@ -2230,20 +2302,21 @@ def _detect_and_handle_orphaned_workers(
                 "active_labels": active_labels,
             }
 
-    live_handoff_candidates = resolve_live_handoff_candidates(  # Issue #1867
-        stale_live_handoff_pids,
-        pr_by_issue=pr_by_issue,
-        issues_by_number=issues_by_number,
-        gh=gh,
-        config=config,
+    live_handoff_candidates, live_handoff_pr_already_open = (
+        resolve_live_handoff_candidates(  # Issue #1867
+            stale_live_handoff_pids,
+            pr_by_issue=pr_by_issue,
+            issues_by_number=issues_by_number,
+            gh=gh,
+            config=config,
+        )
     )
 
-    # Handle orphaned workers. Head-advanced request_changes findings are
-    # collected and routed to the review lane outside the state lock (review()
-    # itself acquires the lock and may call transition()).
+    # Orphan findings are routed to the review lane / no-op drain (#2034)
+    # outside the state lock (review() takes it and may call transition()).
     review_routes: list[orphaned_worker_review_drain.OrphanedWorkerReviewRoute] = []
-    # Issue #654: dead dispatched workers time-escalated inside the lock
-    # collected here for the post-lock transition() call (network I/O).
+    no_op_routes: list[orphaned_worker_review_drain.NoOpReworkRoute] = []
+    # Issue #654: time-escalated dead workers; transition() (network I/O) runs post-lock.
     reap_escalations: list[int] = []
     # Issue #1911: (issue_number, pr_number) pairs whose dead worker left a
     # fresh, on-target .worker-outcome.json despite no terminal record.
@@ -2255,6 +2328,8 @@ def _detect_and_handle_orphaned_workers(
     # ``handle_dead_worker_completed_outcome`` -- extracted per the file-size
     # rule during the #1911 rework.
     outcome_apply_routes: list[tuple[int, int]] = []
+    # B6: fates the in-lock readers resolve; reported after the lock.
+    swept_fates: dict[int, list[worker_fate.WorkerFate]] = {}
 
     with state_lock(state_file):
         state = load_state(state_file)
@@ -2293,6 +2368,8 @@ def _detect_and_handle_orphaned_workers(
                     now=now,
                     sweep_events=sweep_events,
                     max_throttle_rearms=config.watchdog.max_auto_redispatch,
+                    local_park_deferred=local_park_deferred,
+                    on_fate=lambda fate: worker_fate.collect_fate(swept_fates, fate),
                 )
             )
             if dead_dispatched_reaped:
@@ -2321,9 +2398,13 @@ def _detect_and_handle_orphaned_workers(
                     repo_root=repo_root,
                     worktrees_dir=worktrees_dir,
                     review_routes=review_routes,
+                    no_op_routes=no_op_routes,
                     outcome_apply_routes=outcome_apply_routes,
                     pr_orphan_unreviewed_details=pr_orphan_unreviewed_details,
                     drift_fingerprint=_drift_fingerprint,
+                    reap_escalations=reap_escalations,
+                    write_gate=write_gate,
+                    on_fate=lambda fate: worker_fate.collect_fate(swept_fates, fate),
                 )
             else:
                 # Issue #935: before reclaim/drift, try to open a PR for a branch
@@ -2637,9 +2718,7 @@ def _detect_and_handle_orphaned_workers(
                 # ``dead_worker_failure_kind``, stamped on the entry by the
                 # stall/dead reap lanes; earlier non-throttle deaths in the
                 # list still count.
-                provider_throttled_death = is_provider_throttle_failure(
-                    entry.get("dead_worker_failure_kind")
-                )
+                provider_throttled_death = worker_fate.persisted_failure(entry).is_throttle
                 if head_changed or first_observation:
                     orphan_redispatch_at = [] if provider_throttled_death else [now_ts]
                 elif dispatch_identity != prior_dispatch and not provider_throttled_death:
@@ -2800,6 +2879,7 @@ def _detect_and_handle_orphaned_workers(
             pr_by_issue=pr_by_issue,
             sweep_events=sweep_events,
             drift_fingerprint=_drift_fingerprint,
+            pr_already_open=live_handoff_pr_already_open,
         )
 
         state = _append_sweep_events(
@@ -2810,6 +2890,8 @@ def _detect_and_handle_orphaned_workers(
             write_gate=write_gate,
         )
         write_gate.save_state(state)
+
+    worker_fate.report_stale_evidence(state_file, swept_fates, write_gate=write_gate)
 
     # Issue #1911: apply each recovered completed outcome through the #1877
     # seam, outside the lock (the helper does network I/O and takes
@@ -2828,21 +2910,19 @@ def _detect_and_handle_orphaned_workers(
         write_gate=write_gate,
     )
 
-    # Route head-advanced request_changes findings -- and, since issue
-    # #1915, completed-outcome findings whose apply pass landed -- to the
-    # review lane outside the state lock. The drain (per-route exception
-    # guard, the completed-outcome apply gate, the reviewing /
-    # rework_requested / drift-fingerprint dispositions, and the
-    # rework_requested label transitions) lives in
-    # ``orphaned_worker_review_drain`` -- extracted per the file-size rule
-    # during the #1915 rework.
-    orphaned_worker_review_drain.drain_orphaned_worker_review_routes(
+    orphaned_worker_review_drain.drain_orphaned_worker_routes(
         review_routes,
+        no_op_routes,
         review_callback=review_callback,
+        record_review_callback=record_review_callback,
+        enrich_checks_callback=enrich_checks_callback,
         gh=gh,
         config=config,
         state_file=state_file,
         write_gate=write_gate,
+        sessions_dir=sessions_dir,
+        repo_root=repo_root,
+        worktrees_dir=worktrees_dir,
     )
 
     # Issue #654: apply the ``escalated`` label edge for dead dispatched
@@ -3867,6 +3947,7 @@ class OrchestratorApp:
             dry_run=self.dry_run, state_path=self.paths.state_file, repo=self.repo_root.name
         )
         self.fleet_dir_override = fleet_dir_override
+        markdown_guard.bind_state_path(self.paths.state_file, self.repo_root.name)
         # Issue #1363: config_freshness's "exactly once per change" semantics
         # need a mtime cache that outlives a single pass but not the process
         # -- an in-memory dict on the (per-process, per-repo) app instance is
@@ -3876,14 +3957,7 @@ class OrchestratorApp:
         self._preflight_config_mtimes: dict[str, float] = {}
         # Make the event ring cap config-driven (issue #525).
         _state.EVENT_RING_SIZE = config.runtime.event_ring_size
-        prompts_dir = config.runtime.prompts_dir
-        if prompts_dir:
-            override = Path(prompts_dir)
-            if not override.is_absolute():
-                override = repo_root / override
-            self.prompt_dirs: tuple[Path, ...] = (override,)
-        else:
-            self.prompt_dirs = ()
+        self.prompt_dirs: tuple[Path, ...] = prompt_override_dirs(config, repo_root)
         self.paths.ensure()
 
         # Issue #713: fail fast at startup if any configured prompt template
@@ -4190,8 +4264,15 @@ class OrchestratorApp:
     def review(
         self,
         pr_number: int,
+        *,
+        force: bool = False,
     ) -> CommandResult:
         """Generate a review packet for a PR.
+
+        ``force`` (issue #2081, ``why-charlie-hate --force-rereview``) voids a
+        terminal verdict even when it is pinned to the live head: the verdict is
+        archived into the rounds archive, the pending stub overwrites it, and a
+        ``verdict_force_voided`` event names the voided decision and head.
 
         When config.test_adequacy.enabled, this method may itself issue a
         request_changes verdict and advance/terminate the rework loop (previously
@@ -4204,13 +4285,19 @@ class OrchestratorApp:
         Returns:
             CommandResult with ok=True if a packet was generated, or ok=False if
             the review was blocked (janitor gate, test-adequacy gate) or the PR
-            was not found. Two ok=True returns carry NO packet and callers that
-            gate a status->"reviewing" flip on ``ok`` must additionally exclude
-            them via the data flags: ``routed_to_rework`` (the janitor-gate
-            conflict/no-op-rework route re-requests rework with no packet) and
-            ``closed_unmerged_converged`` (issue #558: a CLOSED-unmerged PR is
-            converged to state status "closed" at the janitor gate -- the PR is
-            dead, not a fresh-packet candidate). See
+            was not found. Three ok=True returns carry NO packet and callers
+            that gate a status->"reviewing" flip on ``ok`` must additionally
+            exclude them via the data flags: ``routed_to_rework`` (the
+            janitor-gate conflict/no-op-rework route re-requests rework with
+            no packet), ``closed_unmerged_converged`` (issue #558: a
+            CLOSED-unmerged PR is converged to state status "closed" at the
+            janitor gate -- the PR is dead, not a fresh-packet candidate),
+            and ``escalation_deferred_live_worker`` (issue #2051: the janitor
+            cap router deferred the escalation because a live worker still
+            holds the issue -- no packet and no routing; the worker may still
+            be committing). A refused janitor-gate return also carries
+            ``is_no_op_rework`` -- True only when the unchanged-diff
+            no-op gate caused the refusal (issue #2034). See
             ``_route_rework_candidate_to_review`` and the dead-worker orphan
             sweep for the canonical gating pattern.
         """
@@ -5321,6 +5408,9 @@ class OrchestratorApp:
                     "janitor_failures": list(verdict.failures),
                     "janitor_warnings": list(verdict.warnings),
                     "checks_unavailable": checks is None,
+                    # Issue #2034: True only when the unchanged-diff no-op gate
+                    # caused this refusal -- the no-op drain's discriminator.
+                    "is_no_op_rework": verdict.is_no_op_rework,
                 },
             )
         pr_dir = self.paths.prs / f"pr-{pr_number}"
@@ -5670,12 +5760,26 @@ class OrchestratorApp:
             # corrupt file is left for a human rather than silently
             # overwritten (mirroring the original code's ``else`` branch,
             # which only reset on a real terminal decision).
-            voided_stale_verdict = live_decision_value in (
+            # Issue #2081: ``force`` (``why-charlie-hate --force-rereview``)
+            # voids a terminal verdict even when it is pinned to -- or carried
+            # forward to -- the live head. Before, the flag only skipped the
+            # CLI's #1695 guard and this block voided stale-head verdicts
+            # alone, so a live-head verdict survived the "forced" re-review.
+            is_terminal_verdict = live_decision_value in (
                 "approved",
                 "request_changes",
                 "blocked",
-            ) and (
-                live_reviewed_head_sha is None or live_reviewed_head_sha != pr.get("headRefOid")
+            )
+            voided_stale_verdict = is_terminal_verdict and (
+                force
+                or live_reviewed_head_sha is None
+                or live_reviewed_head_sha != pr.get("headRefOid")
+            )
+            force_voided_verdict = (
+                force
+                and is_terminal_verdict
+                and live_reviewed_head_sha is not None
+                and live_reviewed_head_sha == pr.get("headRefOid")
             )
             if not decision_path.exists() or voided_stale_verdict:
                 if voided_stale_verdict:
@@ -5818,6 +5922,20 @@ class OrchestratorApp:
                 _issue_key = str(issue_number)
                 _issue_entry = state["issues"].get(_issue_key, {})
                 state["issues"][_issue_key] = {**_issue_entry, "merge_alert": "OK"}
+            if force_voided_verdict:
+                state = append_event(
+                    state,
+                    "verdict_force_voided",
+                    {
+                        "pr_number": pr_number,
+                        "issue_number": issue_number,
+                        "voided_decision": live_decision_value,
+                        "voided_reviewed_head_sha": live_reviewed_head_sha,
+                        "verdict_provenance": live_decision.get("verdict_provenance"),
+                        "head_sha": pr.get("headRefOid"),
+                    },
+                    state_path=self.paths.state_file,
+                )
             state = append_event(
                 state,
                 "review_packet",
@@ -5917,8 +6035,13 @@ class OrchestratorApp:
     # right granularity anyway.
 
     @_guard_state_lock
+    @fleet_review_lock()
     def dispatch_reviews(
-        self, limit: int | None = None, *, now: datetime | None = None
+        self,
+        limit: int | None = None,
+        *,
+        now: datetime | None = None,
+        launch_lock: FleetLaunchLock | None = None,
     ) -> CommandResult:
         """Launch reviewer sessions concurrently for queued PRs.
 
@@ -5930,6 +6053,13 @@ class OrchestratorApp:
         governor here — only an optional local-only process cap
         (``max_local_review_processes``) to protect the host from too many
         concurrent reviewer worktrees.
+
+        ``launch_lock`` (issue #2084) is supplied by ``@fleet_review_lock``: a
+        pending fleet-launch-lock handle (a no-op while
+        ``fleet.global_max_concurrent_reviews`` is 0) that this method realizes
+        just before candidate selection, holds through claim -> launch, and the
+        decorator releases on every exit path -- the same entry-point-mints /
+        ``finally``-releases shape as the worker lanes.
 
         The double-dispatch protection is a two-phase claim on
         ``state["prs"][pr]``: this method writes ``review_dispatch_pending``,
@@ -6079,6 +6209,7 @@ class OrchestratorApp:
                 resolved_now,
                 limit,
                 probe_mode_dry,
+                read_fleet_review_cap(self),
             )
             # Issue #1251: mirror the real path's empty-diff pre-flight gate
             # in the dry-run preview so the two cannot diverge. Read-only:
@@ -6122,6 +6253,7 @@ class OrchestratorApp:
                     "missed_verdicts": missed_verdicts,
                     "reconciled_verdicts": reconciled_verdicts,
                     **selection.local_cap.report_fields(),
+                    **selection.fleet_report_fields(),
                 },
             )
 
@@ -6313,6 +6445,27 @@ class OrchestratorApp:
         # return and both deployed fleets run that flag false -- the set was
         # always empty. The repair now derives its own subjects from state in
         # ``_repair_escalated_labels()``, called above that early return.
+        # Issue #2084: realize the fleet lock HERE -- after the lock-free
+        # sweeps/scans above, before the fleet reviewer count is read -- and
+        # hold it through claim -> launch (the caller releases it), so two
+        # repos cannot both read a stale fleet count and over-dispatch the cap.
+        lock_deferral = fleet_review_lock_deferral(self, launch_lock)
+        if lock_deferral is not None:
+            return CommandResult(
+                True,
+                "review dispatch deferred: fleet_lock_held",
+                {
+                    "selected_count": 0,
+                    "attempted_count": 0,
+                    "failed_count": 0,
+                    "launched_count": 0,
+                    "recorded_verdicts": recorded_verdicts,
+                    "missed_verdicts": missed_verdicts,
+                    "reconciled_verdicts": reconciled_verdicts,
+                    "rescue_review_results": rescue_review_results,
+                    **lock_deferral,
+                },
+            )
         selection_state = load_state_locked(self.paths.state_file)
         selection = _select_review_dispatch_candidates(
             candidates,
@@ -6323,6 +6476,7 @@ class OrchestratorApp:
             resolved_now,
             limit,
             probe_mode,
+            read_fleet_review_cap(self),
         )
         escalated_skipped = selection.escalated_skipped
         merge_conflict_routed = selection.merge_conflict_routed
@@ -6686,6 +6840,7 @@ class OrchestratorApp:
                         "pr_numbers": [c["pr"] for c in selected],
                         "count": len(selected),
                         "review_effort_assignments": review_effort_assignments,
+                        **selection.fleet_report_fields(),
                     },
                 )
             self.write_gate.save_state(state)
@@ -6971,6 +7126,7 @@ class OrchestratorApp:
                     "launched": [x["pr"] for x in launched],
                     "failed": [x["pr"] for x in failed],
                     "quota_hit": quota_hit,
+                    **selection.fleet_report_fields(),
                 },
             )
             self.write_gate.save_state(state)
@@ -7014,6 +7170,7 @@ class OrchestratorApp:
             "escalated_labels_repaired": repaired_labels,
         }
         data.update(local_cap.report_fields())
+        data.update(selection.fleet_report_fields())
         return CommandResult(ok, message, data)
 
     # Re-arm field sets live in unescalate_reset_fields.py (extracted under the

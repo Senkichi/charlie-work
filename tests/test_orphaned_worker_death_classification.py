@@ -20,6 +20,7 @@ end-to-end rather than mocked.
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -30,7 +31,9 @@ from charlie_work.config import DevinConfig, OrchestratorConfig, WorkerRoleConfi
 from charlie_work.dead_worker_classification import (
     _worker_view_for_entry,
     classify_and_credit_dead_worker,
+    resolve_dead_worker_failure_kind,
 )
+from charlie_work.instrumentation import close_db
 from charlie_work.state import PASSIVE_OPEN_STATUS, load_state, save_state
 from charlie_work.workflow import OrchestratorApp
 
@@ -119,6 +122,40 @@ def test_rate_limited_rework_death_classified_not_credited(tmp_path: Path) -> No
     ]
     assert len(recovered) == 1
     assert recovered[0]["payload"]["failure_kind"] == "rate_limited"
+
+
+def test_resolve_persists_via_primitive_and_keeps_the_locked_entry_live(tmp_path: Path) -> None:
+    """The classification is written by ``worker_fate.persist_failure`` (kind,
+    ``classified_at`` and the cooldown together), yet the sweep's own ``entry``
+    object stays the one stored in ``state["issues"]`` -- the caller keeps
+    mutating it after this call, so identity must survive the pure rewrite.
+    """
+    sessions_dir = _sessions_dir(tmp_path)
+    log_path = sessions_dir / "issue-207.log"
+    log_path.write_text("Reached free model rate limit\n", encoding="utf-8")
+    _write_devin_sidecar(sessions_dir, 207, pid=99999, log_path=log_path)
+    entry: dict[str, Any] = {"status": "dispatched", "worker_pid": 99999}
+    state: dict[str, Any] = {"issues": {"207": entry}}
+
+    kind = resolve_dead_worker_failure_kind(
+        entry,
+        sessions_dir,
+        207,
+        state,
+        OrchestratorConfig(devin=DevinConfig(), worker=WorkerRoleConfig(harness="devin-shell")),
+        write_gate=_wg(tmp_path / "state.json"),
+    )
+
+    assert kind == "rate_limited"
+    assert state["issues"]["207"] is entry
+    assert entry["dead_worker_failure_kind"] == "rate_limited"
+    assert entry["dead_worker_failure_classified_at"].endswith("Z")
+    assert state["throttled_until"]
+    assert state["throttle_reason"] == "rate_limited"
+    assert state["throttle_adapter_kind"] == "devin"
+    entry["later_mutation"] = True  # would be lost if the stored entry were a copy
+    assert state["issues"]["207"]["later_mutation"] is True
+    close_db(tmp_path / "state.json")
 
 
 def test_unclassified_death_credited_and_records_null_kind(tmp_path: Path) -> None:
@@ -300,7 +337,18 @@ def test_unreviewed_pr_clean_exit_worker_quoting_rate_limit_is_not_log_classifie
     )
     sidecar_path = _write_devin_sidecar(sessions_dir, 207, pid=99999, log_path=log_path)
     (sessions_dir / "issue-207.devin.terminal.json").write_text(
-        json.dumps({"exit_code": 0, "duration_seconds": 12.0}), encoding="utf-8"
+        json.dumps(
+            {
+                "exit_code": 0,
+                "duration_seconds": 12.0,
+                # This dispatch's own record (rule 1: ended_at > dispatched_at;
+                # the bed dispatched an hour ago).
+                "ended_at": (datetime.now(UTC) - timedelta(minutes=5))
+                .isoformat()
+                .replace("+00:00", "Z"),
+            }
+        ),
+        encoding="utf-8",
     )
 
     _run_orphan_sweep(tmp_path, paths, config, fake_gh)
@@ -463,6 +511,7 @@ def test_classify_log_false_never_reads_sidecar(tmp_path: Path) -> None:
         207,
         state,
         OrchestratorConfig(devin=DevinConfig(), worker=WorkerRoleConfig(harness="devin-shell")),
+        write_gate=_wg(tmp_path / "state.json"),
         at="2026-01-01T00:00:00Z",
         classify_log=False,
     )

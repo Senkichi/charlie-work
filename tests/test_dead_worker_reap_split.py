@@ -124,8 +124,18 @@ _MOVED_NAMES = (
 # pre-review-rework, and no-open-PR lanes) grew the module to 2830 lines —
 # the band is re-centered on the new measured total with the same +/-150
 # headroom, per the assertion's own re-derivation instruction.
-_CAP_BAND_MIN = 2680
-_CAP_BAND_MAX = 2980
+# Re-derived again under issue #2006: the ``throttle_window_set`` audit
+# event added the required ``source`` keyword and ``write_gate`` routing
+# parameter to the module's ``set_throttled_until``/``persist_failure``
+# call sites, growing the module to 2984 lines — the band is re-centered
+# on the new measured total with the same +/-150 headroom.
+# Re-derived under issue #1971: the labelless-dead-local-session park call in
+# the classify lane grew the module to 2990 lines; the band is re-centered on
+# that total with the same +/-150 headroom.
+# Re-derived after merging #2006 and #1971: the merged module measures 2955
+# lines; the band is re-centered on that total with the same +/-150 headroom.
+_CAP_BAND_MIN = 2805
+_CAP_BAND_MAX = 3105
 
 
 # ---------------------------------------------------------------------------
@@ -415,9 +425,10 @@ def test_module_defines_exactly_the_27_moved_symbols() -> None:
 
 def test_module_total_line_count_is_within_the_recorded_cap_band() -> None:
     """BAND gate: the new module's total (docstring + imports + body) must
-    fall within [2680, 2980] -- re-derived under issue #1684 from this PR's
-    measured total (2830 lines, grown by the provider-throttle cap-exemption
-    gates) with +/-150 lines of headroom on either side. This is
+    fall within [2834, 3134] -- re-derived under issue #2006 from this PR's
+    measured total (2984 lines, grown by the ``throttle_window_set`` audit
+    event's ``source``/``write_gate`` call-site parameters) with +/-150
+    lines of headroom on either side. This is
     NOT the repo's normal 800-line cap (explicitly waived for this
     extraction under the same #1283 operator exemption
     ``stalled_review_reap.py`` used).

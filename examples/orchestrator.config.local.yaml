@@ -160,3 +160,11 @@ supervisor:
   full_pass_interval_seconds: 300
   active_cooldown_seconds: 30
   max_runtime_minutes: 0
+
+# Fleet-supervisor-only knobs (pass deadline, lane concurrency, reap cadence,
+# alarm thresholds, self-deploy sibling-pull/starvation) moved to the
+# host-wide `fleet_supervisor:` section in issue #1978. Declare it in the
+# GLOBAL fleet layer (<fleet_dir>/config.yaml), not here -- a per-repo
+# `fleet_supervisor:` section is a ConfigError. See docs/RUNBOOK.md.
+# The legacy `supervisor.<key>` spellings still parse during the migration
+# window (they emit config_key_deprecated_read; removal tracked by #1979).

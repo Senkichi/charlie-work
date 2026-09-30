@@ -64,7 +64,7 @@ should not need to be read to reason about it.
 | `instrumentation.py` | SQLite-backed append-only event log (`events.db`) with correlation ID support. `log_event()` (best-effort, never raises), `record_loop_pass()` (loop pass summary table), `correlation_context()` (thread-local ID per orchestration pass), `read_event_log()` / `events_by_correlation_id()` / `query_events()` / `event_counts_by_kind()` (retrieval and aggregation). WAL mode, indexed on kind/ts/correlation_id/pr_number/issue_number. Auto-migrates legacy `events.jsonl`. |
 | `doctor.py` | `run_doctor()` — preflight diagnostics: `gh` on PATH + authenticated, config file presence, `required_checks` configured and matched against live `.github/workflows/*.yml` job names, GitHub labels exist, state file loads, dispatch adapter configured, worker template resolves. |
 | `worktree.py` | Junction-safe git worktree lifecycle: `create_worktree()` (creates a worktree + optional `.venv` Windows-junction/symlink to a shared virtualenv) and `remove_worktree()` (unlinks the `.venv` reparse point *before* `git worktree remove`, so teardown never follows the junction into the shared venv and deletes its contents). See [Invariants](#invariants) below. |
-| `devin_shell.py` | Non-blocking headless Devin CLI dispatch: `launch_devin_session()` spawns `devin --prompt-file <path> --print` via `Popen` (never blocks on completion) and writes a durable sidecar JSON (`sessions_dir/issue-<n>.json`) atomically before returning. `read_session_records()`, `is_session_alive()` (Windows liveness via ctypes `OpenProcess`+`GetExitCodeProcess`, since `os.kill(pid, 0)` is unreliable on Windows; `os.kill` on POSIX), and `probe_devin()` (for `doctor --adapter-probe`) round out the module. Selected by `worker.harness: devin-shell`. |
+| `devin_shell.py` | Non-blocking headless Devin CLI dispatch: `launch_devin_session()` spawns `devin --prompt-file <path> --print` via `Popen` (never blocks on completion) and writes a durable sidecar JSON (`sessions_dir/issue-<n>.json`) atomically before returning. `read_session_records()` and `probe_devin()` (for `doctor --adapter-probe`) round out the module (liveness is `worker_fate.is_alive`, the single seam over `process_utils.is_pid_alive`). Selected by `worker.harness: devin-shell`. |
 | `claude_code.py` | Worktree-isolated Claude Code workers: `launch_claude_worker()` composes `worktree.create_worktree()` with a headless `claude -p` `Popen` launch, writing a `.claude.json` sidecar per issue (field names mirror `devin_shell`'s sidecar so downstream code can treat both worker kinds uniformly). Best-effort worktree cleanup on a failed launch. `read_worker_records()` and `probe_claude()` mirror the `devin_shell` helpers. Selected by `worker.harness: claude-code`. |
 | `janitor.py` | Deterministic, non-LLM pre-review gate: `run_janitor(pr, checks, config)` returns a `JanitorVerdict` (pass/fail + warnings) by checking draft state, PR/mergeable state, required-checks status, linked-issue presence, non-empty body with a tests/rationale mention, conventional-commit-shaped title (warning only), and oversized-diff size (warning only). Pure function — no I/O, no `gh` calls; the caller feeds it data it already fetched. `review()` calls it **before** any packet spend and short-circuits a failing PR to `janitor_blocked`. |
 | `reconcile.py` | Drift detection between GitHub's actual state and the orchestrator's recorded state — e.g. a PR merged outside `merge_ready()` whose issue is still labeled `agent:in-progress`. `detect_drift()` is read-only (two `gh` list calls, zero mutations); `apply_fixes()` returns a *new* state and repairs labels via `labels.transition`. Surfaced as `charlie mop-up [--fix]` (read-only without `--fix`). |
@@ -413,7 +413,15 @@ global budget via `fleet.global_max_concurrent_sessions`. The registry
 global config layer (`global_config.py`) merges fleet-wide defaults with
 per-repo overrides. The governor `_apply_concurrency_governor()` in
 `workflow.py` applies both the per-repo `dispatch.max_concurrent_sessions` cap
-and the fleet-global cap at every dispatch path. Fleet-level commands
+and the fleet-global cap at every dispatch path. Reviewers have their own
+fleet-global budget, `fleet.global_max_concurrent_reviews` (issue #2084):
+`fleet_registry.count_fleet_live_reviews()` counts live reviewers across every
+registered repo's `reviews_dir` with the same liveness rule as the per-repo
+`review_dispatch.max_concurrent_reviews`, and `review_fleet_gate.py` clamps
+review dispatch (remote `dispatch_reviews` and the no-remote local review path)
+to `min(per-repo capacity, fleet_max - fleet_live)` under the same fleet launch
+lock, deferring with `fleet_lock_held` (`dispatch_deferred` / `dispatch_starved`
+events, lane `dispatch_reviews`) when the lock is held. Fleet-level commands
 (`charlie fleet status`) aggregate status across all registered repos by
 iterating over the registry and calling `OrchestratorApp.status()` per repo
 with `dry_run=True`.

@@ -77,7 +77,7 @@ WEDGE_KILL_STALE_MULTIPLIER = 3
 # Fallback pass-timeout (seconds) when the heartbeat lacks both
 # ``max_pass_runtime_seconds`` and ``full_pass_interval_seconds`` — e.g. a
 # heartbeat written by a supervisor older than the fields were added. Matches
-# the ``SupervisorConfig.max_pass_runtime_seconds`` default.
+# the ``FleetSupervisorConfig.max_pass_runtime_seconds`` default.
 WEDGE_KILL_DEFAULT_PASS_TIMEOUT_SECONDS = 1800
 
 # How often the watchdog polls the heartbeat. With a 90-minute threshold, a

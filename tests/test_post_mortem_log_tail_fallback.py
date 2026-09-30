@@ -154,7 +154,7 @@ def test_classify_and_record_log_tail_fallback_ignores_genuine_rate_limit_tail(
     """(b) A genuine provider rate-limit tail (no worker_blocked signature
     among default signature_rules) must NOT be classified worker_blocked by
     the log-tail fallback -- rate-limit retry/cooldown is a separate,
-    adapter-owned concern (devin_shell._classify_session_failure /
+    adapter-owned concern (worker_fate.classify_for /
     get_rate_limit_defer_until via throttle_signatures.match_throttle_tail),
     not this module's."""
     config = _config_with_db(tmp_path / "does-not-exist" / "sessions.db")

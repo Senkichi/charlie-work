@@ -64,6 +64,7 @@ SUPERVISOR_LOCK_FILENAME = "supervisor.lock"
 PENDING_SYNC_FILENAME = "pending-sync.json"
 SELF_DEPLOY_FAILURE_STATE_FILENAME = "self-deploy-failures.json"
 ZERO_PASS_STREAK_STATE_FILENAME = "zero-pass-streak.json"
+DISPATCH_DEFERRAL_STREAK_FILENAME = "dispatch-deferral-streaks.json"
 QUEUE_SYNC_COVERAGE_CACHE_FILENAME = "queue-sync-coverage-cache.json"
 # Issue #1834: bounded ETag/conditional-GET cache for the pooled HTTP
 # transport's REST-GET requests. Sibling of QUEUE_SYNC_COVERAGE_CACHE_FILENAME
@@ -182,6 +183,17 @@ def self_deploy_failure_state_path(state_root: Path) -> Path:
     :func:`pending_sync_path` -- same directory, same atomic-write contract.
     """
     return state_root / SELF_DEPLOY_FAILURE_STATE_FILENAME
+
+
+def dispatch_deferral_streak_path(state_root: Path) -> Path:
+    """Return the per-lane consecutive-dispatch-deferral counter path (issue #1986).
+
+    Sibling of :func:`zero_pass_streak_state_path` -- same directory, same
+    atomic-write contract. A sidecar rather than a ``state.json`` key
+    because one of the deferral reasons *is* the state lock being busy, and
+    a counter that needs that lock cannot count that deferral.
+    """
+    return state_root / DISPATCH_DEFERRAL_STREAK_FILENAME
 
 
 def zero_pass_streak_state_path(state_root: Path) -> Path:
@@ -349,6 +361,7 @@ def worker_tmp_dir(target_path: Path) -> Path:
 GLOBAL_CONFIG_FILENAME = "config.yaml"
 FLEET_REGISTRY_FILENAME = "fleet.json"
 FLEET_LOCK_FILENAME = "fleet.lock"
+FLEET_LOCK_HOLDER_FILENAME = "fleet.lock.holder"
 FLEET_SUPERVISOR_LOCK_FILENAME = "fleet-supervisor.lock"
 FLEET_STOP_REQUEST_FILENAME = "fleet-stop-request.json"
 NOTIFY_HEALTH_STATE_FILENAME = "notify_health_state.json"
@@ -411,6 +424,17 @@ def fleet_registry_path(override: str | None = None) -> Path:
 def fleet_lock_path(override: str | None = None) -> Path:
     """Return the fleet-wide dispatch lock path in the fleet dir."""
     return fleet_dir(override=override) / FLEET_LOCK_FILENAME
+
+
+def fleet_lock_holder_path(override: str | None = None) -> Path:
+    """Return the fleet-launch-lock holder-metadata sidecar path (issue #2055).
+
+    The byte-range lock carries no owner identity, so the holder writes this
+    small JSON sidecar (``repo``/``pid``/``acquired_at``) on acquisition and
+    removes it on release; a waiter reads it -- best-effort -- to report who
+    starved it in the ``fleet_lock_held`` deferral payload.
+    """
+    return fleet_dir(override=override) / FLEET_LOCK_HOLDER_FILENAME
 
 
 def fleet_supervisor_lock_path(override: str | None = None) -> Path:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import math
 import os
 import re
 from collections.abc import Mapping
@@ -65,6 +66,17 @@ from .deescalation_config import parse_deescalation_overrides
 # layer file was actually read (per-layer source attribution, not the merged
 # view) without this over-cap monolith growing a second registry.
 from .config_deprecations import emit_deprecated_key_reads, repo_state_path
+
+# Re-exported from the domain module (issue #1978) for the same reason
+# ``RunnerCapacityEscalationConfig`` is re-exported above: the dataclass and
+# its section parser live in their own module so new fleet-scoped knobs do
+# not land in this over-cap monolith (file-size ratchet, issue #1442);
+# ``config.py`` wires the dataclass into ``OrchestratorConfig`` and delegates
+# parsing (including the legacy ``supervisor.<key>`` fallback) to it.
+from .fleet_supervisor_config import (  # noqa: F401  (deliberate re-export)
+    FleetSupervisorConfig,
+    parse_fleet_supervisor,
+)
 
 from . import layout
 from .harnesses import REVIEWER_HARNESSES, WORKER_HARNESSES
@@ -988,16 +1000,15 @@ class ReviewDispatchConfig:
     # human instead of redispatching with a further-raised (but already-maxed)
     # cap. 0 disables the backstop.
     max_consecutive_turn_limit_misses: int = 3
-    # Issue #1445: repo file-size cap (lines). A diff that adds code to a file
-    # whose post-diff line count exceeds this cap is a REPORTABLE FINDING in the
-    # review packet (the review rubric references this cap generically rather
-    # than hardcoding a number). 0 disables the over-cap finding probe -- the
-    # rubric prose stays present but no dynamic finding section is rendered.
-    # This knob is the cap source the rubric line points at; once issue #1442's
-    # high-water-mark line-count ratchet (or its successor structural signal)
-    # lands, that source should rebind/replace this value rather than the
-    # rubric or probe hardcoding a constant of their own.
+    # Issue #1445: repo file-size cap (lines). A diff that adds code to a file whose post-diff line
+    # count exceeds this cap is a REPORTABLE FINDING in the review packet (the review rubric
+    # references this cap generically rather than hardcoding a number). 0 disables the over-cap
+    # finding probe -- the rubric prose stays present but no dynamic finding section is rendered.
+    # This knob is the cap source the rubric line points at; once issue #1442's high-water-mark line-
+    # count ratchet (or its successor structural signal) lands, that source should rebind/replace
+    # this value rather than the rubric or probe hardcoding a constant of their own.
     file_size_cap_lines: int = 0
+    review_exec_rejection_max_resumes: int = 2  # #2090 devin exec-reject resumes; 0 = off
 
 
 @dataclass(frozen=True)
@@ -1905,15 +1916,16 @@ class WatchdogConfig:
     # ``push_succeeded: true`` / ``pr_created: false`` has finished the
     # handoff contract -- the orchestrator is meant to open the PR from the
     # file the moment the session ends, and the file's own contract tells the
-    # worker to stop after writing it. When the outcome file has been sitting
-    # for this many minutes while the recorded ``worker_pid`` is still alive,
-    # ``_detect_and_handle_orphaned_workers`` treats the worker as hung on
-    # exit and opens the PR from the drafted ``pr_title``/``pr_body`` without
-    # waiting for the PID to die (the stall watchdog reaps the process itself
-    # on its own cadence). Without this, a worker whose process fails to exit
-    # leaves the pushed branch and its drafted PR stranded for as long as the
-    # PID lingers (the swole #163 incident: PR unopened ~2h). 0 disables the
-    # PID-independent finalize.
+    # worker to stop after writing it. While the recorded ``worker_pid`` is
+    # still alive, ``_detect_and_handle_orphaned_workers`` treats a fresh,
+    # on-target, declared-push outcome as a worker hung on exit and opens the
+    # PR from the drafted ``pr_title``/``pr_body`` without waiting for the PID
+    # to die. Since FLIP 5 this is a KILL SWITCH, not an age threshold: any
+    # value > 0 enables the lane and the magnitude is ignored (the outcome
+    # routes immediately, there is no grace window); 0 disables the
+    # PID-independent finalize. Without the lane a worker whose process fails
+    # to exit leaves the pushed branch and its drafted PR stranded for as long
+    # as the PID lingers (the swole #163 incident: PR unopened ~2h).
     worker_outcome_finalize_minutes: int = 15
 
 
@@ -2063,9 +2075,20 @@ class FleetConfig:
     all registered repos. Default 0 (unlimited) preserves current per-repo-only
     behavior. This addresses worker-count oversubscription only; CPU/RAM
     oversubscription via xdist requires operator discipline (see RUNBOOK.md).
+
+    ``launch_lock_wait_seconds`` (issue #2055) bounds how long a dispatch lane
+    retries the fleet launch lock -- jittered retries up to this many seconds
+    -- before deferring the pass with ``fleet_lock_held``. It replaced a single
+    non-blocking try that cost the loser an entire pass; the lock is now held
+    only across governor -> claim -> launch, so a short wait suffices. ``0``
+    restores the old single-try behavior. Non-finite values are rejected: an
+    infinite budget would hang a lane on a wedged lock, and NaN reaches
+    ``time.sleep`` (which raises) inside the retry loop.
     """
 
     global_max_concurrent_sessions: int = 0
+    global_max_concurrent_reviews: int = 0  # #2084 reviewer-lane cap; 0 = disabled
+    launch_lock_wait_seconds: float = 10.0
 
 
 @dataclass(frozen=True)
@@ -2191,79 +2214,25 @@ class SupervisorConfig:
     ``active_cooldown_seconds``: sleep after a pass that dispatched or merged
     something (default 30 s — stagger starts, respect rate limits).
     ``max_runtime_minutes``: hard wall-clock cap; 0 = unlimited (default).
-    ``max_pass_runtime_seconds``: upper bound on a single pass's wall-clock
-    duration. The supervisor heartbeat freshness check uses this bound so a
-    long-running pass is not mistaken for a dead supervisor (default 1800 s /
-    30 min).
-    ``self_deploy_failure_alarm``: consecutive ``self_deploy`` failures before
-    a ``self_deploy_alarm`` events.db entry fires (default 3, mirrors
-    ``AutoMergeConfig.failed_attempt_alarm``). 0 disables the alarm.
-    ``zero_pass_alarm``: consecutive fleet-supervisor cycles that complete
-    with zero repo passes, despite at least one repo being configured,
-    before a ``supervisor_zero_pass_alarm`` events.db entry fires (default 3,
-    mirrors ``self_deploy_failure_alarm``). 0 disables the alarm. A cycle
-    with zero repos configured never counts toward this streak in either
-    direction -- that is a configuration state, not an incident (issue #855).
-    ``self_deploy_pull_ci_fleet``: when true, ``self_deploy`` also FF-pulls
-    ``origin/main`` in the declared ``ci-fleet`` sibling checkout after a
-    successful orchestrator pull, but only when that sibling is clean and on
-    ``main``. Default false: in a development layout the sibling is a working
-    repo whose HEAD must never be moved out from under a session. Enable it
-    only for a dedicated deploy clone (issue #552), where the sibling exists
-    solely to be deployed to -- without it the daemon's editable ``ci_fleet``
-    is a silent version freeze, since ``self_deploy`` otherwise only ever
-    pulls the orchestrator checkout.
-    ``wedge_kill_loop_alarm``: consecutive ``supervisor_wedged_killed`` events
-    with no ``fleet_pass_completed`` event in between (i.e. the wedge-kill
-    backstop firing without the supervisor ever completing a pass again)
-    before a ``supervisor_wedge_loop`` events.db entry fires (default 3,
-    mirrors ``self_deploy_failure_alarm``/``zero_pass_alarm``). 0 disables
-    the alarm (issue #1832).
-    ``dependency_sync_starvation_seconds``: upper bound on how long a deferred
-    self-deploy ``uv sync`` may stay pending while fleet workers are live
-    before the supervisor stops admitting new dispatches (drain posture:
-    workers in flight are untouched) so the live-worker count can reach zero
-    and the sync can land (issue #1855). Measured wall-clock from the
-    pending-sync marker's ``written_at`` -- the first deferral of the
-    episode -- so it is robust to supervisor restarts. Default 14400 s (4 h):
-    comfortably above observed worker session durations, and far below the
-    multi-hour continuous deferral observed under sustained fleet load.
-    <= 0 disables the bound.
-    ``fleet_lane_concurrency``: maximum number of per-repo lanes one
-    ``fleet_loop`` pass runs concurrently (issue #1934). Per-repo lane work is
-    I/O-bound and repo-isolated (own config, GitHub client, supervisor lock,
-    state files), so lanes run on a bounded thread pool: a pass's wall-clock
-    approximates the slowest lane instead of the sum of every lane (~35-42
-    min observed across 6 repos for a configured 5-minute cadence). When the
-    cap meets or exceeds the registered repo count, a repo's lane-to-lane gap
-    is bounded by its own lane duration plus the supervisor's pass cadence --
-    decoupled from sibling lanes' workloads. <= 0 falls back to the built-in
-    default at the call site; 1 restores the pre-#1934 strict-serial order.
-    ``reap_sweep_interval_seconds``: cadence for the fleet supervisor's
-    out-of-band review-claim reap scheduler (issue #1934). The
-    dead-reviewer-claim sweep set (``OrchestratorApp._run_review_reap_sweeps``
-    -- the identical block ``dispatch_reviews`` and ``reap_reviews`` run)
-    executes once per registered repo on this interval from a dedicated
-    thread, independent of whether a fleet pass is due or in flight, so a
-    dead claim is freed on a ~5-minute cadence instead of once per fleet-wide
-    round. The sweeps launch nothing and are ``state_lock``-serialized /
-    merge-on-write safe against a concurrent lane (issue #1874's design), so
-    they run even while a repo's supervisor lock is held. <= 0 disables the
-    scheduler.
+
+    Issue #1978: the knobs only the cross-repo fleet supervisor daemon reads
+    (``max_pass_runtime_seconds``, ``self_deploy_failure_alarm``,
+    ``self_deploy_pull_ci_fleet``, ``zero_pass_alarm``,
+    ``wedge_kill_loop_alarm``, ``dependency_sync_starvation_seconds``,
+    ``fleet_lane_concurrency``, ``reap_sweep_interval_seconds``) moved to
+    ``FleetSupervisorConfig`` under the ``fleet_supervisor:`` section. The
+    four fields below are the ones both loops share -- ``run_supervised``
+    (per-repo) and ``run_fleet_supervise`` (fleet) each poll, cool down, and
+    bound their own runtime on the same cadence knobs. A moved key still
+    written under ``supervisor:`` keeps working during the migration window
+    (``parse_fleet_supervisor`` honors it and ``DEPRECATED_CONFIG_KEYS``
+    reports the read); issue #1979 removes the legacy locations.
     """
 
     poll_interval_seconds: int = 20
     full_pass_interval_seconds: int = 300
     active_cooldown_seconds: int = 30
     max_runtime_minutes: int = 0
-    max_pass_runtime_seconds: int = 1800
-    self_deploy_failure_alarm: int = 3
-    self_deploy_pull_ci_fleet: bool = False
-    zero_pass_alarm: int = 3
-    wedge_kill_loop_alarm: int = 3
-    dependency_sync_starvation_seconds: int = 14400
-    fleet_lane_concurrency: int = 8
-    reap_sweep_interval_seconds: int = 300
 
 
 @dataclass(frozen=True)
@@ -2356,6 +2325,50 @@ class PostMortemConfig:
 
 
 @dataclass(frozen=True)
+class HeartbeatConfig:
+    """Knobs for the fleet heartbeat script (``scripts/heartbeat_check.py``).
+
+    The heartbeat is a read-only, stdlib-only script that runs outside the
+    orchestrator on a fleet cadence; it reads this section from the raw YAML
+    mapping (``load_orchestrator_config`` in ``heartbeat_worktree.py``), so
+    every field here must also be reachable -- with the same default -- by a
+    reader that cannot import this module. The mirror of
+    ``stale_mention_parked_labels`` lives at
+    ``scripts/heartbeat_stale_mentions.STALE_MENTION_PARKED_LABELS_DEFAULT``
+    and a drift-guard test asserts the two stay equal.
+    """
+
+    # Issue #2048: the ``stale-open-issue-mentions`` check ignores a merged-work
+    # mention of an open issue when the issue carries a parked label -- a human
+    # has already dispositioned it, so the mention is not closure evidence
+    # anyone needs to act on. The default is the fleet's shared non-lifecycle
+    # triage taxonomy (the same set ``heartbeat_check``'s armable-pool gate
+    # mirrors as ``ARMABLE_GATING_LABELS``) plus the conventional tracker/
+    # umbrella/epic names the issue enumerates. Active labels (``agent:*`` and
+    # the configured ``labels:`` lifecycle values) are excluded separately.
+    stale_mention_parked_labels: tuple[str, ...] = (
+        "blocked",
+        "needs-design",
+        "human-action",
+        "question",
+        "wontfix",
+        "duplicate",
+        "invalid",
+        "tracker",
+        "umbrella",
+        "epic",
+    )
+
+    def __post_init__(self) -> None:
+        # Same coercion contract as DispatchConfig.human_merge_labels: a bare
+        # string wraps rather than iterates, and a list becomes a tuple so the
+        # frozen instance stays hashable on every construction path.
+        value = self.stale_mention_parked_labels
+        normalized = (str(value),) if isinstance(value, str) else tuple(str(v) for v in value)
+        object.__setattr__(self, "stale_mention_parked_labels", normalized)
+
+
+@dataclass(frozen=True)
 class OrchestratorConfig:
     labels: LabelConfig = field(default_factory=LabelConfig)
     dispatch: DispatchConfig = field(default_factory=DispatchConfig)
@@ -2390,7 +2403,9 @@ class OrchestratorConfig:
         default_factory=RunnerCapacityEscalationConfig
     )
     supervisor: SupervisorConfig = field(default_factory=SupervisorConfig)
+    fleet_supervisor: FleetSupervisorConfig = field(default_factory=FleetSupervisorConfig)
     post_mortem: PostMortemConfig = field(default_factory=PostMortemConfig)
+    heartbeat: HeartbeatConfig = field(default_factory=HeartbeatConfig)
 
     # Provenance, not values (issue #943). Paths of the config files that were
     # actually read to produce this value, in merge order (global layer first,
@@ -2887,6 +2902,7 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
         "turn_cap_max_multiplier",
         "max_consecutive_turn_limit_misses",
         "file_size_cap_lines",
+        "review_exec_rejection_max_resumes",
     )
     for _rd_key in _RD_INT_KEYS:
         _rd_val = review_dispatch_data.get(_rd_key)
@@ -4002,6 +4018,27 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
             "config section 'fleet' key 'global_max_concurrent_sessions' must be an "
             f"int, got {type(global_max).__name__}"
         )
+    global_max_reviews = fleet_data.get("global_max_concurrent_reviews")
+    if global_max_reviews is not None and (
+        not isinstance(global_max_reviews, int)
+        or isinstance(global_max_reviews, bool)
+        or global_max_reviews < 0
+    ):
+        raise ConfigError(
+            "config section 'fleet' key 'global_max_concurrent_reviews' must be a "
+            f"non-negative int, got {global_max_reviews!r}"
+        )
+    launch_lock_wait = fleet_data.get("launch_lock_wait_seconds")
+    if launch_lock_wait is not None and (
+        isinstance(launch_lock_wait, bool)
+        or not isinstance(launch_lock_wait, (int, float))
+        or not math.isfinite(launch_lock_wait)
+        or launch_lock_wait < 0
+    ):
+        raise ConfigError(
+            "config section 'fleet' key 'launch_lock_wait_seconds' must be a "
+            f"non-negative finite number, got {launch_lock_wait!r}"
+        )
     fleet = _build_section(FleetConfig, "fleet", fleet_data)
     notify_data = _section(data, "notify")
     shell_command = notify_data.get("shell_command")
@@ -4193,19 +4230,18 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
             "allocation floor."
         )
     runner_capacity_escalation = parse_runner_capacity_escalation(data)
+    # Issue #1978: parse the fleet-scoped section BEFORE the supervisor one --
+    # the parser pops the relocated keys out of ``data['supervisor']`` (the
+    # private deepcopy above, so the caller's dict is untouched) and applies
+    # the new-location > legacy > default precedence itself, raising
+    # ConfigError when both locations disagree.
+    fleet_supervisor = parse_fleet_supervisor(data)
     supervisor_data = _section(data, "supervisor")
     for int_key in (
         "poll_interval_seconds",
         "full_pass_interval_seconds",
         "active_cooldown_seconds",
         "max_runtime_minutes",
-        "max_pass_runtime_seconds",
-        "self_deploy_failure_alarm",
-        "zero_pass_alarm",
-        "wedge_kill_loop_alarm",
-        "dependency_sync_starvation_seconds",
-        "fleet_lane_concurrency",
-        "reap_sweep_interval_seconds",
     ):
         value = supervisor_data.get(int_key)
         if value is not None and not isinstance(value, int):
@@ -4213,12 +4249,6 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
                 f"config section 'supervisor' key '{int_key}' must be an int, "
                 f"got {type(value).__name__}"
             )
-    pull_ci_fleet = supervisor_data.get("self_deploy_pull_ci_fleet")
-    if pull_ci_fleet is not None and not isinstance(pull_ci_fleet, bool):
-        raise ConfigError(
-            "config section 'supervisor' key 'self_deploy_pull_ci_fleet' must be "
-            f"a bool, got {type(pull_ci_fleet).__name__}"
-        )
     supervisor = _build_section(SupervisorConfig, "supervisor", supervisor_data)
     post_mortem_data = _section(data, "post_mortem")
     pm_enabled = post_mortem_data.get("enabled")
@@ -4286,6 +4316,14 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
             built_rules.append(SignatureRule(pattern=pattern, kind=kind))
         post_mortem_data["signature_rules"] = tuple(built_rules)
     post_mortem = _build_section(PostMortemConfig, "post_mortem", post_mortem_data)
+    heartbeat_data = _section(data, "heartbeat")
+    _parked = heartbeat_data.get("stale_mention_parked_labels")
+    if _parked is not None and not isinstance(_parked, (list, tuple, str)):
+        raise ConfigError(
+            "config section 'heartbeat' key 'stale_mention_parked_labels' must be a "
+            f"list of label names, got {type(_parked).__name__}"
+        )
+    heartbeat = _build_section(HeartbeatConfig, "heartbeat", heartbeat_data)
     return OrchestratorConfig(
         labels=labels,
         dispatch=dispatch,
@@ -4316,7 +4354,9 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
         runner_allocation=runner_allocation,
         runner_capacity_escalation=runner_capacity_escalation,
         supervisor=supervisor,
+        fleet_supervisor=fleet_supervisor,
         post_mortem=post_mortem,
+        heartbeat=heartbeat,
         # ``sources`` is left at its dataclass default here -- this function
         # only ever sees a dict, never a path. ``load_config`` below (and
         # ``load_layered_config``) are the ones that know what path(s) the

@@ -405,7 +405,7 @@ def test_detect_drift_api_dead_session_provider_auth(
     log_path.write_text("Error: 401 Unauthorized. Invalid API key.\n", encoding="utf-8")
 
     # The dead-session lane fires only when the worker is not alive.
-    monkeypatch.setattr("charlie_work.worker.is_worker_alive", lambda record: False)
+    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: False)
 
     drift = detect_drift(gh, state, config, repo_root=tmp_path)
 

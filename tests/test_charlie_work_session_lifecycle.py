@@ -296,10 +296,10 @@ def test_stalled_session_emits_event_with_required_fields(tmp_path: Path) -> Non
         process_start_time=None,  # No start time verification in this test
     )
 
-    # Mock is_session_alive to return True and kill_process_tree to return killed PIDs
+    # Mock worker_fate.is_alive to return True and kill_process_tree to return killed PIDs
     with (
         patch("charlie_work.devin_shell.read_session_records", return_value=[fake_record]),
-        patch("charlie_work.worker.is_session_alive", return_value=True),
+        patch("charlie_work.worker_fate.is_alive", return_value=True),
         patch("charlie_work.write_gate.kill_process_tree", return_value=[99999]),
         patch(
             "charlie_work.dead_worker_reap.sweep_orphan_processes",
@@ -438,8 +438,12 @@ def test_sweep_orphan_processes_for_dead_sessions_unit(tmp_path: Path) -> None:
             return_value=[dead_session, live_session],
         ),
         patch("charlie_work.claude_code.read_worker_records", return_value=[dead_worker]),
-        patch("charlie_work.devin_shell.is_session_alive", side_effect=lambda r: r.pid != 1000),
-        patch("charlie_work.claude_code.is_worker_alive", side_effect=lambda r: r.pid != 1002),
+        # One liveness seam covers both sidecar kinds: the devin session (1000)
+        # and the claude-code worker (1002) are dead, every other pid is alive.
+        patch(
+            "charlie_work.worker_fate.is_alive",
+            side_effect=lambda pid, *_: pid not in (1000, 1002),
+        ),
         patch(
             "charlie_work.dead_worker_reap.sweep_orphan_processes", side_effect=mock_sweep_orphan
         ),
@@ -590,9 +594,9 @@ def test_watchdog_disabled_no_detection_no_kill_no_event(tmp_path: Path) -> None
         encoding="utf-8",
     )
 
-    # Mock is_session_alive and kill_process_tree to track calls
+    # Mock worker_fate.is_alive and kill_process_tree to track calls
     with (
-        patch("charlie_work.worker.is_session_alive", return_value=True) as mock_alive,
+        patch("charlie_work.worker_fate.is_alive", return_value=True) as mock_alive,
         patch("charlie_work.process_utils.kill_process_tree", return_value=[]) as mock_kill,
     ):
         # Run the stall detection and handling
@@ -602,7 +606,7 @@ def test_watchdog_disabled_no_detection_no_kill_no_event(tmp_path: Path) -> None
             sessions_dir, paths.state_file, config, write_gate=_wg(paths.state_file)
         )
 
-    # Check that is_session_alive was NOT called (detection skipped)
+    # Check that worker_fate.is_alive was NOT called (detection skipped)
     mock_alive.assert_not_called()
 
     # Check that kill_process_tree was NOT called (no kill)

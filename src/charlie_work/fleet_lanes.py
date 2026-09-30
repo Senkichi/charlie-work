@@ -18,7 +18,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
-from . import layout
+from . import layout, markdown_guard
 from .config import OrchestratorConfig
 from .fleet_paths import fleet_dir
 from .fleet_registry import _load_registry, _select_repos
@@ -46,11 +46,11 @@ _DEFAULT_FLEET_LANE_CONCURRENCY = 8
 
 
 def _resolve_fleet_lane_concurrency(global_config: Any) -> int:
-    """Effective per-pass lane cap: ``supervisor.fleet_lane_concurrency`` or
-    the built-in default when absent/misconfigured (including a None
+    """Effective per-pass lane cap: ``fleet_supervisor.fleet_lane_concurrency``
+    or the built-in default when absent/misconfigured (including a None
     ``global_config`` on direct CLI call sites)."""
-    supervisor_cfg = getattr(global_config, "supervisor", None)
-    value = getattr(supervisor_cfg, "fleet_lane_concurrency", None)
+    fleet_supervisor_cfg = getattr(global_config, "fleet_supervisor", None)
+    value = getattr(fleet_supervisor_cfg, "fleet_lane_concurrency", None)
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         return _DEFAULT_FLEET_LANE_CONCURRENCY
     return value
@@ -91,7 +91,12 @@ def _run_fleet_repo_lane(
     ``CommandResult`` carrying ``data["deadline_deferred"] = True`` instead
     of finishing every queued phase.
     """
+    # This lane's own ambient sink for markdown_guard_disagreement events: the
+    # pool thread has no binding until it sets one, and `app` was built on the
+    # submitting thread, so the last-constructed repo must not receive it.
+    sink_token = None
     try:
+        sink_token = markdown_guard.bind_sink(app.paths.state_file, app.repo_root.name)
         # Arm the deadline hook on this lane's own client (issue #1948).
         # isinstance, not getattr duck-typing: the suite patches
         # ``charlie_work.fleet_dispatch.GitHub`` with a MagicMock, so
@@ -174,6 +179,7 @@ def _run_fleet_repo_lane(
             {"deadline_deferred": True},
         )
     finally:
+        markdown_guard.unbind_sink(sink_token)
         lock.release()
 
 

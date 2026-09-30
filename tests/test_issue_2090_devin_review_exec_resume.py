@@ -1,0 +1,460 @@
+"""Issue #2090: resume a devin-shell review session that ended on a refused exec.
+
+App-level: every test drives ``OrchestratorApp._reap_review_verdicts`` against a
+real devin review sidecar + log on disk. Only the process boundary is faked:
+``popen_worker`` (records the resume argv, writes what the "resumed Devin"
+would print into the log handle it was given) and ``devin list`` (the session-id
+source). State, events, sidecars, caps and the reaper itself are real.
+"""
+
+from __future__ import annotations
+
+import json
+import subprocess
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+
+from _review_fixtures import (
+    _dispatch_reviews_app,
+    _set_review_dispatched_state,
+    _write_review_packet,
+)
+from charlie_work import devin_review_resume
+from charlie_work.config import ConfigError, build_config_from_data
+from charlie_work.devin_review_resume import (
+    build_resume_command,
+    find_devin_session_id,
+    review_exec_nudge_text,
+)
+from charlie_work.devin_shell import _REVIEW_EXEC_ALLOWLIST
+from charlie_work.dispatch_selection import _count_live_reviews
+from charlie_work.state import load_state
+
+PR = 2087
+ISSUE = 2081
+SESSION = "rough-tennis"
+REJECTION = (
+    "I'll review the PR.\nwarning: rejected a tool call that requires confirmation. "
+    "Running in non-interactive mode.\n"
+)
+VERDICT = (
+    "Final verdict:\n```json\n"
+    '{"decision": "approved", "summary": "looks right", "required_changes": []}\n```\n'
+)
+
+
+class _Rig:
+    """Fake process boundary + liveness for one app."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, app: Any) -> None:
+        self.app = app
+        self.reviews_dir: Path = app._layout.reviews_dir
+        self.popens: list[dict[str, Any]] = []
+        self.next_output: list[str] = []  # what each resumed session prints
+        self.live: set[int] = set()
+        self.launch_error: OSError | None = None
+        self.list_rows: list[dict[str, Any]] | None = [
+            {"id": SESSION, "last_activity_at": 4_000_000_000}
+        ]
+        self._pid = 50_000
+
+        def fake_popen(argv: Any, **kwargs: Any) -> Any:
+            if self.launch_error is not None:
+                raise self.launch_error
+            self._pid += 1
+            self.popens.append({"argv": list(argv), "cwd": kwargs.get("cwd"), "pid": self._pid})
+            out = self.next_output.pop(0) if self.next_output else REJECTION
+            kwargs["stdout"].write(out)
+            kwargs["stdout"].flush()
+            self.live.add(self._pid)
+            return SimpleNamespace(pid=self._pid)
+
+        def fake_list(argv: Any, **kwargs: Any) -> Any:
+            if self.list_rows is None:
+                return SimpleNamespace(ok=False, stdout="", returncode=1)
+            return SimpleNamespace(ok=True, stdout=json.dumps(self.list_rows), returncode=0)
+
+        alive = lambda pid, *_: pid in self.live  # noqa: E731
+        monkeypatch.setattr(devin_review_resume, "popen_worker", fake_popen)
+        monkeypatch.setattr(devin_review_resume, "run_captured", fake_list)
+        monkeypatch.setattr(devin_review_resume, "_get_process_start_time", lambda pid: 1.0)
+        monkeypatch.setattr(
+            devin_review_resume, "maybe_start_terminal_status_watcher", lambda *a, **k: None
+        )
+        monkeypatch.setattr(devin_review_resume, "write_worktree_marker", lambda *a, **k: None)
+        monkeypatch.setattr("charlie_work.worker_fate.is_alive", alive)
+        monkeypatch.setattr("charlie_work.dispatch_selection.is_pid_alive", alive)
+
+    def seed_dead_review(self, log_text: str = REJECTION, *, pid: int = 40_001) -> None:
+        checkout = self.reviews_dir / f"pr-{PR}"
+        checkout.mkdir(parents=True, exist_ok=True)
+        log = self.reviews_dir / f"issue-{PR}.log"
+        log.write_text(log_text, encoding="utf-8")
+        sidecar = {
+            "issue_number": PR,
+            "branch": "agent/issue-2081-x",
+            "worktree_path": str(checkout),
+            "prompt_path": str(self.reviews_dir / "p.md"),
+            "command": [
+                "devin",
+                "--model",
+                "swe-2-high",
+                "--prompt-file",
+                str(self.reviews_dir / "p.devin.md"),
+                "--print",
+                "--respect-workspace-trust",
+                "false",
+            ],
+            "pid": pid,
+            "started_at": "2026-09-30T18:18:26Z",
+            "log_path": str(log),
+            "process_start_time": 1_790_792_306.5,
+            "session_id": "b146a91e-66c0-4ead-a822-e952cecbc9ce",
+        }
+        (self.reviews_dir / f"issue-{PR}.json").write_text(json.dumps(sidecar), encoding="utf-8")
+        _set_review_dispatched_state(self.app, PR, ISSUE, "2026-09-30T18:18:27Z")
+
+    def reap(self) -> dict[str, Any]:
+        return self.app._reap_review_verdicts(self.reviews_dir)
+
+    def finish_resumed(self) -> None:
+        """The resumed process exits (its log keeps what it printed)."""
+        self.live.clear()
+
+    def events(self, kind: str) -> list[dict[str, Any]]:
+        state = load_state(self.app.paths.state_file)
+        return [e["payload"] for e in state["events"] if e["kind"] == kind]
+
+
+def _rig(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, **review_dispatch: Any) -> _Rig:
+    pr = {
+        "number": PR,
+        "title": "Fix",
+        "url": f"https://example.test/pull/{PR}",
+        "headRefName": "agent/issue-2081-x",
+        "baseRefName": "main",
+        "headRefOid": "sha-2087",
+        "mergeStateStatus": "CLEAN",
+        "body": f"Closes #{ISSUE}",
+        "labels": [],
+        "isCrossRepository": False,
+        "state": "OPEN",
+    }
+    app = _dispatch_reviews_app(tmp_path, prs=[pr])
+    _write_review_packet(tmp_path, PR, "sha-2087")
+    if review_dispatch:
+        from dataclasses import replace
+
+        rd = replace(app.config.review_dispatch, **review_dispatch)
+        object.__setattr__(app.config, "review_dispatch", rd)
+    return _Rig(monkeypatch, app)
+
+
+# --- acceptance 1: reject once, resumed session emits a verdict ---------------
+
+
+def test_rejected_review_is_resumed_and_the_verdict_is_recorded(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    rig = _rig(monkeypatch, tmp_path)
+    rig.seed_dead_review()
+    rig.next_output = [VERDICT]
+
+    first = rig.reap()
+
+    assert first == {"recorded": [], "missed": []}
+    assert len(rig.popens) == 1
+    argv = rig.popens[0]["argv"]
+    assert argv[argv.index("--resume") + 1] == SESSION
+    assert "--print" in argv and "--permission-mode" not in argv
+    assert rig.popens[0]["cwd"] == str(rig.reviews_dir / f"pr-{PR}")
+    resumed = rig.events("review_exec_rejection_resumed")
+    assert len(resumed) == 1
+    assert {k: resumed[0][k] for k in ("pr_number", "attempt", "session_id")} == {
+        "pr_number": PR,
+        "attempt": 1,
+        "session_id": SESSION,
+    }
+
+    rig.finish_resumed()
+    second = rig.reap()
+
+    assert [r["decision"] for r in second["recorded"]] == ["approved"]
+    assert second["missed"] == []
+    assert rig.events("review_verdict_missed") == []
+    assert len(rig.popens) == 1  # a verdict ends the resuming
+
+
+def test_the_nudge_file_states_the_allow_list_rendered_from_the_constant(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    rig = _rig(monkeypatch, tmp_path)
+    rig.seed_dead_review()
+    rig.reap()
+
+    argv = rig.popens[0]["argv"]
+    nudge = Path(argv[argv.index("--prompt-file") + 1])
+    assert nudge != rig.reviews_dir / "p.devin.md"  # the original prompt is replaced
+    text = nudge.read_text(encoding="utf-8")
+    assert text == review_exec_nudge_text()
+    for entry in _REVIEW_EXEC_ALLOWLIST:
+        assert f"`{entry[len('Exec(') : -1]}`" in text, entry
+    assert "REFUSED" in text and "Do not retry" in text and "verdict" in text
+
+
+# --- acceptance 2: reject every time -> exactly N resumes, then a miss --------
+
+
+@pytest.mark.parametrize("limit", [1, 2, 3])
+def test_rejecting_every_attempt_yields_exactly_n_resumes_then_a_miss(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, limit: int
+) -> None:
+    rig = _rig(monkeypatch, tmp_path, review_exec_rejection_max_resumes=limit)
+    rig.seed_dead_review()
+
+    results = []
+    for _ in range(limit + 1):
+        results.append(rig.reap())
+        rig.finish_resumed()
+
+    assert len(rig.popens) == limit
+    assert [e["attempt"] for e in rig.events("review_exec_rejection_resumed")] == list(
+        range(1, limit + 1)
+    )
+    assert all(r["missed"] == [] for r in results[:limit])
+    assert [m["cause"]["cause"] for m in results[limit]["missed"]] == ["reviewer_exec_rejected"]
+    missed = rig.events("review_verdict_missed")
+    assert len(missed) == 1 and missed[0]["cause"]["cause"] == "reviewer_exec_rejected"
+
+
+def test_zero_disables_resuming(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    rig = _rig(monkeypatch, tmp_path, review_exec_rejection_max_resumes=0)
+    rig.seed_dead_review()
+
+    result = rig.reap()
+
+    assert rig.popens == []
+    assert len(result["missed"]) == 1
+    assert rig.events("review_exec_rejection_resumed") == []
+
+
+def test_a_new_dispatch_gets_a_fresh_resume_budget(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    rig = _rig(monkeypatch, tmp_path, review_exec_rejection_max_resumes=1)
+    rig.seed_dead_review()
+    rig.reap()
+    rig.finish_resumed()
+    assert len(rig.reap()["missed"]) == 1  # budget spent for this dispatch
+
+    rig.seed_dead_review()  # re-dispatch: new review_dispatched_at
+    _set_review_dispatched_state(rig.app, PR, ISSUE, "2026-09-30T19:00:00Z")
+    rig.reap()
+
+    assert len(rig.popens) == 2
+
+
+# --- acceptance 3: a resume that cannot launch falls back to a miss -----------
+
+
+def test_resume_launch_failure_falls_back_to_a_miss_as_a_value(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    rig = _rig(monkeypatch, tmp_path)
+    rig.seed_dead_review()
+    rig.launch_error = FileNotFoundError("devin not found")
+
+    result = rig.reap()  # must not raise
+
+    assert len(result["missed"]) == 1
+    failed = rig.events("review_exec_rejection_resume_failed")
+    assert len(failed) == 1 and failed[0]["reason"].startswith("launch_failed")
+    assert rig.events("review_exec_rejection_resumed") == []
+
+
+def test_unknown_session_id_falls_back_to_a_miss(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    rig = _rig(monkeypatch, tmp_path)
+    rig.seed_dead_review()
+    rig.list_rows = None  # `devin list` fails
+
+    result = rig.reap()
+
+    assert rig.popens == []
+    assert len(result["missed"]) == 1
+    assert rig.events("review_exec_rejection_resume_failed")[0]["reason"] == (
+        "session_id_unavailable"
+    )
+
+
+def test_missing_checkout_falls_back_to_a_miss(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    rig = _rig(monkeypatch, tmp_path)
+    rig.seed_dead_review()
+    (rig.reviews_dir / f"pr-{PR}").rmdir()
+
+    result = rig.reap()
+
+    assert rig.popens == [] and len(result["missed"]) == 1
+    assert rig.events("review_exec_rejection_resume_failed")[0]["reason"] == (
+        "review_checkout_missing"
+    )
+
+
+def test_only_exec_rejections_are_resumed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    rig = _rig(monkeypatch, tmp_path)
+    rig.seed_dead_review("the model just stopped\n")
+
+    result = rig.reap()
+
+    assert rig.popens == [] and len(result["missed"]) == 1
+
+
+def test_claude_code_reviews_are_not_resumed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    rig = _rig(monkeypatch, tmp_path)
+    rig.seed_dead_review()
+    (rig.reviews_dir / f"issue-{PR}.json").rename(rig.reviews_dir / f"issue-{PR}.claude.json")
+
+    rig.reap()
+
+    assert rig.popens == []
+
+
+# --- acceptance 4: the resumed session occupies the SAME slot -----------------
+
+
+def test_resumed_session_is_not_double_counted_in_either_cap(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    rig = _rig(monkeypatch, tmp_path)
+    rig.seed_dead_review()
+    state_file = rig.app.paths.state_file
+    assert _count_live_reviews(rig.reviews_dir, state_file) == 0  # dead original: no slot
+
+    rig.reap()
+
+    # Per-repo cap: one sidecar, one live pid -> exactly one slot, not two.
+    assert len(list(rig.reviews_dir.glob("issue-*.json"))) == 1
+    assert _count_live_reviews(rig.reviews_dir, state_file) == 1
+    entry = load_state(state_file)["prs"][str(PR)]
+    assert entry["reviewer_pid"] == rig.popens[0]["pid"]
+    assert entry["review_dispatch_status"] == "review_dispatch_dispatched"
+
+    # Fleet cap: the fleet registry sums the same per-repo count over the
+    # registered repo; register this app's repo and count it.
+    from charlie_work.fleet_registry import count_fleet_live_reviews
+
+    fleet_dir = tmp_path / "fleet"
+    fleet_dir.mkdir()
+    (tmp_path / ".git").mkdir(exist_ok=True)
+    (fleet_dir / "fleet.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "repos": {
+                    "owner/r": {
+                        "repo_root": str(tmp_path),
+                        "name_with_owner": "owner/r",
+                        "config_path": str(tmp_path / "orchestrator.config.yaml"),
+                        "state_dir": str(rig.app.paths.root),
+                        "first_seen": "2024-01-01T00:00:00Z",
+                        "last_seen": "2024-01-01T00:00:00Z",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    count, skipped = count_fleet_live_reviews(str(fleet_dir))
+    assert (count, list(skipped)) == (1, [])
+
+
+# --- session-id source / command / config units -------------------------------
+
+
+def _list_returning(monkeypatch: pytest.MonkeyPatch, payload: Any, *, ok: bool = True) -> None:
+    text = payload if isinstance(payload, str) else json.dumps(payload)
+    monkeypatch.setattr(
+        devin_review_resume,
+        "run_captured",
+        lambda *a, **k: SimpleNamespace(ok=ok, stdout=text),
+    )
+
+
+def test_find_session_id_picks_newest_active_since_launch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _list_returning(
+        monkeypatch,
+        [
+            {"id": "old-round", "last_activity_at": 1000},
+            {"id": "newest", "last_activity_at": 2100},
+            {"id": "middle", "last_activity_at": 2050},
+        ],
+    )
+    assert find_devin_session_id("devin", tmp_path, started_epoch=2000.4) == "newest"
+    # Nothing active since the launch: an earlier round's session is never picked.
+    assert find_devin_session_id("devin", tmp_path, started_epoch=9000.0) is None
+
+
+@pytest.mark.parametrize("payload", ["not json", {"id": "x"}, [{"id": "x"}], []])
+def test_find_session_id_tolerates_garbage(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, payload: Any
+) -> None:
+    _list_returning(monkeypatch, payload)
+    assert find_devin_session_id("devin", tmp_path, started_epoch=None) is None
+
+
+def test_find_session_id_cli_failure_is_a_value(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _list_returning(monkeypatch, "", ok=False)
+    assert find_devin_session_id("devin", tmp_path, started_epoch=None) is None
+
+
+def test_resume_command_repins_the_read_only_posture(tmp_path: Path) -> None:
+    cmd = build_resume_command(
+        (
+            "devin",
+            "--permission-mode",
+            "dangerous",
+            "--prompt-file",
+            "orig.md",
+            "--print",
+            "--resume",
+            "stale",
+        ),
+        "rough-tennis",
+        tmp_path / "nudge.md",
+    )
+    assert "dangerous" not in cmd and "--permission-mode" not in cmd
+    assert "orig.md" not in cmd and "stale" not in cmd
+    assert cmd[-4:] == ("--resume", "rough-tennis", "--prompt-file", str(tmp_path / "nudge.md"))
+
+
+def test_the_allow_list_is_not_widened() -> None:
+    assert "Exec(uv)" not in _REVIEW_EXEC_ALLOWLIST
+    assert len(_REVIEW_EXEC_ALLOWLIST) == 11
+
+
+def test_knob_defaults_to_two_and_validates() -> None:
+    assert build_config_from_data({}).review_dispatch.review_exec_rejection_max_resumes == 2
+    zero = build_config_from_data({"review_dispatch": {"review_exec_rejection_max_resumes": 0}})
+    assert zero.review_dispatch.review_exec_rejection_max_resumes == 0
+    for bad in (-1, True, "2"):
+        with pytest.raises(ConfigError, match="review_exec_rejection_max_resumes"):
+            build_config_from_data({"review_dispatch": {"review_exec_rejection_max_resumes": bad}})
+
+
+def test_resume_never_blocks_on_the_worker() -> None:
+    # CLAUDE.md invariant: adapters use Popen and return; no wait/communicate.
+    src = Path(devin_review_resume.__file__).read_text(encoding="utf-8")
+    assert ".wait(" not in src and ".communicate(" not in src
+    assert subprocess  # (module imported for the Popen-stderr redirect constant)

@@ -1,0 +1,8 @@
+wf-r2-s5 (Worker fate rule 3): salvage-before-clear helper for
+``_worktree_still_unsafe`` -- ff-only ``salvage_push_stranded_commits`` when
+an origin exists, the #1944 archive park otherwise. Installed from
+``orchestration/misc_worker_dispatch.py``. Net-new OrchestratorApp member
+added after the Track 2 Phase B surface baseline was pinned; declared here so
+the member-surface conservation check in
+tests/test_workflow_delegation_l00.py subtracts it before comparing moved
+delegates against the pre-campaign total (133).

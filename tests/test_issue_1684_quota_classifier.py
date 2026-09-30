@@ -27,7 +27,7 @@ from typing import Any
 
 import pytest
 
-from charlie_work import claude_code, devin_shell
+from charlie_work import claude_code, devin_shell, worker_fate
 from charlie_work.config import (
     ConfigError,
     OrchestratorConfig,
@@ -170,16 +170,16 @@ def _write_log(tmp_path: Path, name: str, text: str) -> Path:
 
 
 def test_devin_classify_weekly_quota_log_is_quota_exhausted(tmp_path: Path) -> None:
-    kind, throttled_until = devin_shell._classify_session_failure(
-        _write_log(tmp_path, "issue-1.log", _WEEKLY_QUOTA_LOG)
+    kind, throttled_until = worker_fate.classify_for(
+        "devin", _write_log(tmp_path, "issue-1.log", _WEEKLY_QUOTA_LOG)
     )
     assert kind == "quota_exhausted"
     assert throttled_until is not None
 
 
 def test_claude_classify_weekly_quota_log_is_quota_exhausted(tmp_path: Path) -> None:
-    kind, throttled_until = claude_code._classify_session_failure(
-        _write_log(tmp_path, "issue-1.claude.log", _WEEKLY_QUOTA_LOG)
+    kind, throttled_until = worker_fate.classify_for(
+        "claude-code", _write_log(tmp_path, "issue-1.claude.log", _WEEKLY_QUOTA_LOG)
     )
     assert kind == "quota_exhausted"
     assert throttled_until is not None
@@ -188,12 +188,13 @@ def test_claude_classify_weekly_quota_log_is_quota_exhausted(tmp_path: Path) -> 
 def test_devin_classify_internal_error_kind_is_not_quota(tmp_path: Path) -> None:
     """Negative control at the classifier layer: a structured non-quota
     ``errorKind`` must not become ``quota_exhausted``."""
-    kind, throttled_until = devin_shell._classify_session_failure(
+    kind, throttled_until = worker_fate.classify_for(
+        "devin",
         _write_log(
             tmp_path,
             "issue-1.log",
             'Error: Agent error: boom. {"cognition.ai/errorKind": "internal"}',
-        )
+        ),
     )
     assert kind is None
     assert throttled_until is None

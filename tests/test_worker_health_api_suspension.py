@@ -54,7 +54,7 @@ def test_classify_worker_health_api_provider_suspended_is_dead(tmp_path: Path) -
         provider="example",
     )
 
-    with patch("charlie_work.worker.is_worker_alive", return_value=True):
+    with patch("charlie_work.worker_fate.is_alive", return_value=True):
         config = OrchestratorConfig()
         now = datetime.now(UTC)
         health = classify_worker_health(view, config, now)
@@ -87,7 +87,7 @@ def test_classify_worker_health_provider_suspended_not_for_claude_code(
         reclaimed=None,
     )
 
-    with patch("charlie_work.worker.is_worker_alive", return_value=True):
+    with patch("charlie_work.worker_fate.is_alive", return_value=True):
         config = OrchestratorConfig()
         now = datetime.now(UTC)
         health = classify_worker_health(view, config, now)
@@ -122,7 +122,7 @@ def test_classify_worker_health_api_genuine_429_not_dead(tmp_path: Path) -> None
         provider="example",
     )
 
-    with patch("charlie_work.worker.is_worker_alive", return_value=True):
+    with patch("charlie_work.worker_fate.is_alive", return_value=True):
         config = OrchestratorConfig()
         now = datetime.now(UTC)
         health = classify_worker_health(view, config, now)
@@ -171,7 +171,7 @@ def test_classify_worker_health_api_suspended_phrase_quoted_prose_not_killed(
         provider="example",
     )
 
-    with patch("charlie_work.worker.is_worker_alive", return_value=True):
+    with patch("charlie_work.worker_fate.is_alive", return_value=True):
         config = OrchestratorConfig()
         now = datetime.now(UTC)
         health = classify_worker_health(view, config, now)

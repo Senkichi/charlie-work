@@ -10,7 +10,9 @@ from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Mapping
+from typing import TYPE_CHECKING, Any, Mapping
+
+from .dead_dispatched_timer import LOCAL_PARK_DEFER_FIELDS
 
 # Issue #1769 review follow-up / file-size ratchet (#1442): dispatch-cadence
 # bookkeeping moved to its own module; re-exported so import paths hold.
@@ -24,6 +26,26 @@ from .dispatch_cadence import (  # noqa: F401 (deliberate re-export)
     mark_dispatch_baseline_backfill_attempted,
     record_non_empty_dispatch,
 )
+from .iso_timestamp import parse_iso_timestamp  # noqa: F401 (deliberate re-export)
+
+# File-size ratchet (#1442): periodic-pass scheduling helpers moved to their own
+# module; re-exported so import paths hold.
+from .periodic_pass_schedule import (  # noqa: F401 (deliberate re-export)
+    _deescalation_pass,
+    _reconcile_pass,
+    _worktree_reclamation,
+    arm_deescalation_pass,
+    arm_reconcile_pass,
+    is_deescalation_due,
+    is_reconcile_due,
+    is_worktree_reclamation_due,
+    schedule_worktree_reclamation,
+)
+
+if TYPE_CHECKING:
+    # write_gate.py imports this module, so the gate can only be named in
+    # annotations -- a runtime import here would be circular.
+    from .write_gate import WriteGate
 
 STATE_VERSION = 1
 
@@ -950,12 +972,27 @@ def set_throttled_until(
     data: dict[str, Any],
     throttled_until: str,
     *,
+    source: str,
     reason: str | None = None,
     adapter_kind: str | None = None,
+    write_gate: WriteGate | None = None,
+    state_path: Path | None = None,
+    repo: str | None = None,
 ) -> dict[str, Any]:
     """Set the provider throttle cooldown window.
 
-    ``reason`` (a ``_classify_session_failure`` failure_kind -- e.g.
+    ``source`` is a required keyword naming the caller (issue #2006).
+    Whenever the value changes -- extended or shortened -- this function
+    appends a ``throttle_window_set`` event carrying
+    ``{previous, throttled_until, reason, adapter_kind, source}`` so a moved
+    window is never invisible to the audit trail; a no-op write emits
+    nothing. Emission goes through ``write_gate`` when given (so gated lanes
+    get the gate's dry-run suppression and its bound ``state_path``/``repo``
+    dual-write), else through ``append_event`` with the optional
+    ``state_path``/``repo`` dual-write bindings; with neither, the event
+    lands only in the in-memory ``events`` ring.
+
+    ``reason`` (a ``worker_fate.classify_for`` failure_kind -- e.g.
     "quota_exhausted", "provider_auth", "rate_limited") and ``adapter_kind``
     (the adapter whose session hit the throttle) are recorded alongside the
     cooldown so a later quota-probe decision (``clear_quota_throttles``) can
@@ -966,18 +1003,56 @@ def set_throttled_until(
     throttle with an unset reason/adapter_kind is treated as
     claude-code-shaped (the common case) by ``clear_quota_throttles``.
 
+    Monotonic (issue #2042): a new window never shortens a still-active one.
+    When the stored ``throttled_until`` parses, is still in the future, and
+    ends at or after ``throttled_until``, the existing window (with its
+    reason/adapter_kind) is kept unchanged -- otherwise a later, shorter
+    classification (e.g. the 15-minute rate-limit fallback) would cut an
+    operator hold or a real multi-hour reset. Clearing goes through
+    ``clear_quota_throttles``, not this function.
+
     Returns a new state dict with throttled_until set; does not mutate ``data``.
     """
-    return {
+    previous = data.get("throttled_until")
+    if previous and is_throttled(data):
+        try:
+            existing_dt = datetime.fromisoformat(str(previous).replace("Z", "+00:00"))
+            new_dt = datetime.fromisoformat(throttled_until.replace("Z", "+00:00"))
+            if existing_dt.tzinfo is None:
+                existing_dt = existing_dt.replace(tzinfo=UTC)
+            if new_dt.tzinfo is None:
+                new_dt = new_dt.replace(tzinfo=UTC)
+            if existing_dt >= new_dt:
+                # Monotonic (#2042): window kept unchanged, so no event (#2006).
+                return dict(data)
+        except (ValueError, TypeError):
+            pass  # unparseable: fall through to the write
+    new_data = {
         **data,
         "throttled_until": throttled_until,
         "throttle_reason": reason,
         "throttle_adapter_kind": adapter_kind,
     }
+    if previous == throttled_until:
+        return new_data
+    payload = {
+        "previous": previous,
+        "throttled_until": throttled_until,
+        "reason": reason,
+        "adapter_kind": adapter_kind,
+        "source": source,
+    }
+    if write_gate is not None:
+        return write_gate.append_event(new_data, "throttle_window_set", payload)
+    return append_event(new_data, "throttle_window_set", payload, state_path=state_path, repo=repo)
 
 
 def record_dead_worker_failure_kind(
-    data: dict[str, Any], issue_number: int, failure_kind: str
+    data: dict[str, Any],
+    issue_number: int,
+    failure_kind: str,
+    *,
+    classified_at: str | None = None,
 ) -> dict[str, Any]:
     """Stamp a dead worker's classified ``failure_kind`` onto its issue entry.
 
@@ -998,6 +1073,14 @@ def record_dead_worker_failure_kind(
     rest of this module's value helpers, this is a pure update: it returns
     a new top-level mapping (with new ``issues``/entry mappings) and never
     mutates the caller's ``data``.
+
+    ``classified_at`` (ISO timestamp) is stamped alongside the kind as
+    ``dead_worker_failure_classified_at`` so a read-side consumer can tell
+    how old the classification is. It is cleared with the kind.
+
+    Callers outside this module and ``worker_fate.py`` must not call this
+    directly: ``worker_fate.persist_failure`` is the single write primitive
+    (pinned by ``tests/test_worker_fate_seam.py``).
     """
     issues = data.get("issues")
     if not isinstance(issues, dict):
@@ -1006,12 +1089,12 @@ def record_dead_worker_failure_kind(
     entry = issues.get(issue_key)
     if not isinstance(entry, dict):
         return data
+    stamped = {**entry, "dead_worker_failure_kind": failure_kind}
+    if classified_at is not None:
+        stamped["dead_worker_failure_classified_at"] = classified_at
     return {
         **data,
-        "issues": {
-            **issues,
-            issue_key: {**entry, "dead_worker_failure_kind": failure_kind},
-        },
+        "issues": {**issues, issue_key: stamped},
     }
 
 
@@ -1036,7 +1119,15 @@ def clear_dead_worker_failure_kind(entry: dict[str, Any]) -> None:
     classification and is dropped with it.
     """
     entry.pop("dead_worker_failure_kind", None)
+    entry.pop("dead_worker_failure_classified_at", None)
     entry.pop("throttle_reap_rearm_count", None)
+    # Issue #1971: the bounded local-park deferral is per death episode too.
+    for field_name in LOCAL_PARK_DEFER_FIELDS:
+        entry.pop(field_name, None)
+    # wf-r2-s6 (N4): the live-handoff routing marker is per dispatch epoch
+    # too -- it records the outcome-file mtime the live lane already routed,
+    # and a new dispatch's outcome is a new fact.
+    entry.pop("live_handoff_routed_outcome_at", None)
 
 
 def _reviewer_quota(data: dict[str, Any]) -> dict[str, Any]:
@@ -1260,140 +1351,6 @@ def disarm_quota_probe(data: dict[str, Any]) -> dict[str, Any]:
     return {**data, "quota_probe": probe}
 
 
-def _worktree_reclamation(data: dict[str, Any]) -> dict[str, Any]:
-    """Return the worktree-reclamation scheduling sub-dict from ``data``.
-
-    Tracks the ``next_run_at`` timestamp that gates the cadence-gated
-    ``clean_worktrees`` sweep fired from the fleet pass (issue #636). Returns a
-    mutable copy so callers can build new state without mutating ``data``.
-    """
-    sched = data.get("worktree_reclamation")
-    if not isinstance(sched, dict):
-        return {}
-    return dict(sched)
-
-
-def is_worktree_reclamation_due(data: dict[str, Any]) -> bool:
-    """True when the reclamation sweep's interval has elapsed.
-
-    An absent schedule means "never run yet", which is treated as due so the
-    first fleet pass after startup clears the existing backlog of merged-PR
-    worktrees (the exact accumulation issue #636 exists to fix). Malformed
-    timestamps are also treated as due so a corrupt value cannot wedge
-    reclamation off forever.
-    """
-    next_at = _worktree_reclamation(data).get("next_run_at")
-    if not next_at:
-        return True
-    try:
-        next_time = datetime.fromisoformat(next_at.replace("Z", "+00:00"))
-        return datetime.now(UTC) >= next_time
-    except (ValueError, TypeError):
-        return True
-
-
-def schedule_worktree_reclamation(data: dict[str, Any], next_run_at: str) -> dict[str, Any]:
-    """Set the next reclamation sweep timestamp.
-
-    Called after a sweep runs (or is skipped as not-due-armed) so the next
-    sweep fires roughly ``interval_minutes`` later rather than on the very next
-    pass. Returns a new state dict; does not mutate ``data``.
-    """
-    sched = _worktree_reclamation(data)
-    sched["next_run_at"] = next_run_at
-    return {**data, "worktree_reclamation": sched}
-
-
-def _reconcile_pass(data: dict[str, Any]) -> dict[str, Any]:
-    """Return the periodic in-loop reconcile scheduling sub-dict from ``data``.
-
-    Distinct from ``quota_probe``: tracks the merge-lane-recovery §6-B
-    cadence (``OrchestratorApp._maybe_reconcile_drift``), not the quota
-    probe. Ensures a mutable copy so callers can build new state without
-    mutating the original ``data``.
-    """
-    section = data.get("reconcile_pass")
-    if not isinstance(section, dict):
-        return {}
-    return dict(section)
-
-
-def is_reconcile_due(data: dict[str, Any]) -> bool:
-    """True when the periodic in-loop reconcile pass should run.
-
-    Unlike the quota probe (which only arms once a throttle indicator is
-    observed, deliberately delaying the first real probe), reconcile has no
-    "is something wrong" precondition to wait on -- it is a plain periodic
-    cadence, so an absent schedule (never run before, e.g. right after a
-    fresh deploy) is treated as due immediately rather than requiring one
-    full interval to elapse first. This matters for G1: the divergence class
-    this closes has already been sitting unrepaired indefinitely, so the
-    first pass after this lands should not wait `interval_minutes` before
-    doing anything. Malformed timestamps are treated as due, mirroring
-    ``is_quota_probe_due``, so a corrupt value cannot wedge reconcile off
-    forever.
-    """
-    next_at = _reconcile_pass(data).get("next_reconcile_at")
-    if not next_at:
-        return True
-    try:
-        next_time = datetime.fromisoformat(next_at.replace("Z", "+00:00"))
-        return datetime.now(UTC) >= next_time
-    except (ValueError, TypeError):
-        return True
-
-
-def arm_reconcile_pass(data: dict[str, Any], next_reconcile_at: str) -> dict[str, Any]:
-    """Schedule the next periodic in-loop reconcile attempt.
-
-    Returns a new state dict; does not mutate ``data``.
-    """
-    section = _reconcile_pass(data)
-    section["next_reconcile_at"] = next_reconcile_at
-    return {**data, "reconcile_pass": section}
-
-
-def _deescalation_pass(data: dict[str, Any]) -> dict[str, Any]:
-    """Return the periodic de-escalation sweep scheduling sub-dict from ``data``.
-
-    Mirrors ``_reconcile_pass``: tracks issue #783's
-    ``OrchestratorApp._maybe_deescalate_mechanical`` cadence. Ensures a
-    mutable copy so callers can build new state without mutating ``data``.
-    """
-    section = data.get("deescalation_pass")
-    if not isinstance(section, dict):
-        return {}
-    return dict(section)
-
-
-def is_deescalation_due(data: dict[str, Any]) -> bool:
-    """True when the periodic de-escalation sweep should run.
-
-    Same "absent schedule is due immediately" semantics as
-    ``is_reconcile_due`` -- a fresh deploy should not wait a full interval
-    before its first pass, and a malformed timestamp is treated as due
-    rather than wedging the sweep off forever.
-    """
-    next_at = _deescalation_pass(data).get("next_deescalation_at")
-    if not next_at:
-        return True
-    try:
-        next_time = datetime.fromisoformat(next_at.replace("Z", "+00:00"))
-        return datetime.now(UTC) >= next_time
-    except (ValueError, TypeError):
-        return True
-
-
-def arm_deescalation_pass(data: dict[str, Any], next_deescalation_at: str) -> dict[str, Any]:
-    """Schedule the next periodic de-escalation sweep attempt.
-
-    Returns a new state dict; does not mutate ``data``.
-    """
-    section = _deescalation_pass(data)
-    section["next_deescalation_at"] = next_deescalation_at
-    return {**data, "deescalation_pass": section}
-
-
 def is_operator_queue_review_due(data: dict[str, Any]) -> bool:
     """True when the operator-queue depth gauge should run (issue #1314 item 2).
 
@@ -1496,7 +1453,7 @@ def _root_throttle_is_claude_code_shaped(data: dict[str, Any]) -> bool:
     """True when the root throttle, if any, is one an ambient CLI probe speaks to.
 
     Excludes a ``provider_auth`` cooldown (a dead credential does not
-    self-heal in minutes -- see claude_code._classify_session_failure) and
+    self-heal in minutes -- see worker_fate.classify_for) and
     excludes any adapter other than claude-code (devin uses a different tool
     entirely; the api adapter routes through a separately configured
     provider base_url/key, not the account an operator manually switches).

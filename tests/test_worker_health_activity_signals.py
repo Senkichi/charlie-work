@@ -58,7 +58,7 @@ def test_classify_worker_health_stalled_by_mtime(tmp_path: Path) -> None:
     )
 
     # Mock the underlying adapter liveness function that is_alive() calls
-    with patch("charlie_work.worker.is_session_alive", return_value=True):
+    with patch("charlie_work.worker_fate.is_alive", return_value=True):
         config = OrchestratorConfig()
         now = datetime.now(UTC)
         health = classify_worker_health(view, config, now)
@@ -107,7 +107,7 @@ def test_classify_worker_health_stalled_by_mtime_overridden_by_real_activity(
         )
     )
 
-    with patch("charlie_work.worker.is_session_alive", return_value=True):
+    with patch("charlie_work.worker_fate.is_alive", return_value=True):
         config = OrchestratorConfig()
         health = classify_worker_health(view, config, now, probe)
         assert health == WorkerHealth.HEALTHY
@@ -145,7 +145,7 @@ def test_classify_worker_health_worktree_files_mtime_overrides_stale_log(
         reclaimed=None,
     )
 
-    with patch("charlie_work.worker.is_session_alive", return_value=True):
+    with patch("charlie_work.worker_fate.is_alive", return_value=True):
         config = OrchestratorConfig(
             watchdog=WatchdogConfig(stall_minutes=20, worktree_mtime_threshold_minutes=45),
             post_mortem=PostMortemConfig(db_path=str(tmp_path / "missing-sessions.db")),
@@ -187,7 +187,7 @@ def test_classify_worker_health_worktree_files_mtime_checkout_noise_stalls(
         reclaimed=None,
     )
 
-    with patch("charlie_work.worker.is_session_alive", return_value=True):
+    with patch("charlie_work.worker_fate.is_alive", return_value=True):
         config = OrchestratorConfig(
             watchdog=WatchdogConfig(stall_minutes=20, worktree_mtime_threshold_minutes=45),
             post_mortem=PostMortemConfig(db_path=str(tmp_path / "missing-sessions.db")),
@@ -232,7 +232,7 @@ def test_classify_worker_health_claude_events_override_stale_log(tmp_path: Path)
         reclaimed=None,
     )
 
-    with patch("charlie_work.worker.is_worker_alive", return_value=True):
+    with patch("charlie_work.worker_fate.is_alive", return_value=True):
         config = OrchestratorConfig(
             post_mortem=PostMortemConfig(db_path=str(tmp_path / "missing-sessions.db"))
         )
@@ -275,7 +275,7 @@ def test_classify_worker_health_claude_events_both_quiet_stalled(tmp_path: Path)
         reclaimed=None,
     )
 
-    with patch("charlie_work.worker.is_worker_alive", return_value=True):
+    with patch("charlie_work.worker_fate.is_alive", return_value=True):
         config = OrchestratorConfig(
             post_mortem=PostMortemConfig(db_path=str(tmp_path / "missing-sessions.db"))
         )

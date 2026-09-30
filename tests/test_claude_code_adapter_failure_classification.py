@@ -1,4 +1,4 @@
-"""Session-failure classification: ``_classify_session_failure``
+"""Session-failure classification: ``worker_fate.classify_for``
 throttle/provider-auth/provider-suspended signatures and
 ``update_worker_record_with_failure_classification`` record writes.
 
@@ -10,13 +10,21 @@ Track 1) -- bodies are verbatim relocations; shared helpers live in
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 from charlie_work.config import (
     OrchestratorConfig,
     RuntimeConfig,
 )
+from charlie_work import worker_fate
 from charlie_work.claude_code import update_worker_record_with_failure_classification
+
+
+def _classify_session_failure(log_path, *args, adapter_kind="claude-code", **kwargs):
+    """Test helper: ``worker_fate.classify_for`` bound to an adapter kind."""
+    return worker_fate.classify_for(adapter_kind, log_path, *args, **kwargs)
+
 
 # ---------------------------------------------------------------------------
 # Throttle death classification tests (symmetric to devin_shell tests)
@@ -25,7 +33,6 @@ from charlie_work.claude_code import update_worker_record_with_failure_classific
 
 def test_classify_session_failure_rate_limit_with_reset_time(tmp_path: Path) -> None:
     """Test that rate-limit errors with 'resets in N minutes' are classified correctly."""
-    from charlie_work.claude_code import _classify_session_failure
 
     log_path = tmp_path / "session.claude.log"
     log_path.write_text(
@@ -46,7 +53,6 @@ def test_classify_session_failure_rate_limit_with_reset_time(tmp_path: Path) -> 
 
 def test_classify_session_failure_quota_exhausted(tmp_path: Path) -> None:
     """Test that quota-exhaustion errors are classified correctly."""
-    from charlie_work.claude_code import _classify_session_failure
 
     log_path = tmp_path / "session.claude.log"
     log_path.write_text(
@@ -65,10 +71,13 @@ def test_classify_session_failure_quota_exhausted(tmp_path: Path) -> None:
 
 
 def test_classify_session_failure_includes_resume_margin(tmp_path: Path) -> None:
-    """Issue #499: killed-worker rate-limit classification must include the resume margin."""
-    from datetime import UTC, datetime, timedelta
+    """Issue #499: killed-worker rate-limit classification must include the resume margin.
 
-    from charlie_work.claude_code import _classify_session_failure
+    Rule 6 (wf-design.md §9): claude-code anchors at the log's emission
+    time now, not classification time, so the mtime is pinned to ``now``
+    (matching the devin sibling test's pattern) to keep this deterministic.
+    """
+    from datetime import UTC, datetime, timedelta
 
     log_path = tmp_path / "session.claude.log"
     log_path.write_text(
@@ -77,6 +86,7 @@ def test_classify_session_failure_includes_resume_margin(tmp_path: Path) -> None
     )
 
     now = datetime.now(UTC)
+    os.utime(log_path, (now.timestamp(), now.timestamp()))
     failure_kind, throttled_until = _classify_session_failure(
         log_path, resume_margin_seconds=90, now=now
     )
@@ -135,7 +145,12 @@ def test_update_worker_record_with_failure_classification(tmp_path: Path) -> Non
 def test_update_worker_record_with_failure_classification_includes_resume_margin(
     tmp_path: Path,
 ) -> None:
-    """Issue #499: update wrapper applies config.runtime.throttle_resume_margin_s."""
+    """Issue #499: update wrapper applies config.runtime.throttle_resume_margin_s.
+
+    Rule 6 (wf-design.md §9): the log's mtime is pinned to ``now`` so the
+    emission-time anchor (issue #1997, now fleet-wide) produces the exact
+    expected value deterministically.
+    """
     from datetime import UTC, datetime, timedelta
 
     sessions_dir = tmp_path / "sessions"
@@ -167,6 +182,7 @@ def test_update_worker_record_with_failure_classification_includes_resume_margin
 
     config = OrchestratorConfig(runtime=RuntimeConfig(throttle_resume_margin_s=90))
     now = datetime.now(UTC)
+    os.utime(log_path, (now.timestamp(), now.timestamp()))
     failure_kind, throttled_until = update_worker_record_with_failure_classification(
         sessions_dir, 42, config=config, now=now
     )
@@ -260,7 +276,6 @@ def test_classify_session_failure_tool_rejected_is_not_throttle(tmp_path: Path) 
     semantics, no throttled_until). See test_devin_shell.py's mirror test
     and test_post_mortem_log_tail_fallback.py for the worker_blocked log-tail fallback that
     now owns this signature instead."""
-    from charlie_work.claude_code import _classify_session_failure
 
     log_path = tmp_path / "session.claude.log"
     log_path.write_text(
@@ -351,7 +366,6 @@ def test_update_worker_record_custom_throttle_markers(tmp_path: Path) -> None:
 
 def test_classify_session_failure_provider_auth_401(tmp_path: Path) -> None:
     """Issue #484: a 401 error in an api session log classifies as provider_auth."""
-    from charlie_work.claude_code import _classify_session_failure
 
     log_path = tmp_path / "session.claude.log"
     log_path.write_text(
@@ -369,7 +383,6 @@ def test_classify_session_failure_provider_auth_401(tmp_path: Path) -> None:
 
 def test_classify_session_failure_provider_auth_403(tmp_path: Path) -> None:
     """Issue #484: a 403 error in an api session log classifies as provider_auth."""
-    from charlie_work.claude_code import _classify_session_failure
 
     log_path = tmp_path / "session.claude.log"
     log_path.write_text(
@@ -385,7 +398,6 @@ def test_classify_session_failure_provider_auth_403(tmp_path: Path) -> None:
 
 def test_classify_session_failure_provider_auth_invalid_key(tmp_path: Path) -> None:
     """Issue #484: an invalid-api-key error classifies as provider_auth."""
-    from charlie_work.claude_code import _classify_session_failure
 
     log_path = tmp_path / "session.claude.log"
     log_path.write_text(
@@ -403,7 +415,6 @@ def test_classify_session_failure_provider_auth_not_for_claude_code(
     tmp_path: Path,
 ) -> None:
     """Issue #484: auth patterns must NOT fire for claude-code sessions (only api)."""
-    from charlie_work.claude_code import _classify_session_failure
 
     log_path = tmp_path / "session.claude.log"
     log_path.write_text(
@@ -423,7 +434,6 @@ def test_classify_session_failure_throttle_not_misclassified_as_auth(
 ) -> None:
     """Issue #484: a generic throttle log still classifies as rate_limited, not
     provider_auth, even for api sessions."""
-    from charlie_work.claude_code import _classify_session_failure
 
     log_path = tmp_path / "session.claude.log"
     log_path.write_text(
@@ -442,8 +452,6 @@ def test_classify_session_failure_throttle_not_misclassified_as_auth(
 def test_classify_session_failure_provider_auth_cooldown_24h(tmp_path: Path) -> None:
     """Issue #484: provider_auth cooldown reuses the 24h quota-exhaustion constant."""
     from datetime import UTC, datetime, timedelta
-
-    from charlie_work.claude_code import _classify_session_failure
 
     log_path = tmp_path / "session.claude.log"
     log_path.write_text("Error: 401 Unauthorized\n", encoding="utf-8")
@@ -556,7 +564,6 @@ def test_classify_session_failure_provider_auth_numeric_substring_no_false_posit
     the file matches natural-language phrases; without \\b the bare codes were
     the sole false-positive vector.
     """
-    from charlie_work.claude_code import _classify_session_failure
 
     # Each tail contains "401" or "403" only as a substring of a larger number,
     # with no standalone HTTP status code and no auth-related phrasing.
@@ -585,7 +592,6 @@ def test_classify_session_failure_provider_auth_word_boundary_still_matches(
     matches — a standalone 401/403 (delimited by non-word characters: spaces,
     punctuation, start/end of string) still classifies as provider_auth.
     """
-    from charlie_work.claude_code import _classify_session_failure
 
     real_auth_tails = [
         "Error: 401 Unauthorized\n",
@@ -612,7 +618,6 @@ def test_classify_session_failure_provider_suspended_insufficient_balance(
     """Issue #1342: a provider account-suspension / insufficient-balance response
     classifies as ``provider_suspended`` (terminal) for api sessions, not as a
     transient rate-limit."""
-    from charlie_work.claude_code import _classify_session_failure
 
     log_path = tmp_path / "session.claude.log"
     # Verbatim Moonshot suspension message observed 2026-08-18 (issue #1342).
@@ -635,7 +640,6 @@ def test_classify_session_failure_provider_suspended_account_suspended(
 ) -> None:
     """Issue #1342: a generic ``account suspended`` billing message also
     classifies as ``provider_suspended`` (matched by semantics, not full-string)."""
-    from charlie_work.claude_code import _classify_session_failure
 
     log_path = tmp_path / "session.claude.log"
     log_path.write_text(
@@ -654,7 +658,6 @@ def test_classify_session_failure_provider_suspended_not_for_claude_code(
 ) -> None:
     """Issue #1342: suspension classification is api-only (mirrors provider_auth)
     — a claude-code session with the same message is not classified."""
-    from charlie_work.claude_code import _classify_session_failure
 
     log_path = tmp_path / "session.claude.log"
     log_path.write_text(
@@ -675,7 +678,6 @@ def test_classify_session_failure_provider_suspended_takes_precedence_over_throt
     """Issue #1342: a suspension signature must win over a coincidental
     rate-limit phrase in the same tail, so the session is not retried as a
     transient throttle."""
-    from charlie_work.claude_code import _classify_session_failure
 
     log_path = tmp_path / "session.claude.log"
     log_path.write_text(
@@ -693,7 +695,6 @@ def test_classify_session_failure_provider_suspended_takes_precedence_over_throt
 def test_classify_session_failure_genuine_429_keeps_rate_limited(tmp_path: Path) -> None:
     """Issue #1342 acceptance criterion 4: a genuine transient 429 rate-limit
     keeps the existing ``rate_limited`` backoff behavior (no suspension match)."""
-    from charlie_work.claude_code import _classify_session_failure
 
     log_path = tmp_path / "session.claude.log"
     log_path.write_text(
@@ -720,7 +721,6 @@ def test_classify_session_failure_provider_suspended_quoted_prose_not_matched(
     the trigger phrase does not start with ``Error:`` and so is not treated as
     a real API error. This is the self-inflicted-misclassification guard: a
     worker reviewing this very fix must not be classified as suspended."""
-    from charlie_work.claude_code import _classify_session_failure
 
     log_path = tmp_path / "session.claude.log"
     # The session's actual terminal error is a normal test failure; the
@@ -752,7 +752,6 @@ def test_classify_session_failure_provider_suspended_402_status_anchor(
     """PR #1426 round-2 review: an HTTP 402 (Payment Required) status on the
     same line as a billing phrase is a valid structural anchor — the canonical
     billing-suspension status code, distinct from any prose phrase."""
-    from charlie_work.claude_code import _classify_session_failure
 
     log_path = tmp_path / "session.claude.log"
     log_path.write_text(

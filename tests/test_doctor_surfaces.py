@@ -274,7 +274,7 @@ def test_doctor_surfaces_in_progress_corroboration_alive_but_polling(
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     gh = FakeDoctorGitHub(labels=config.labels.all)
 
-    with patch("charlie_work.worker.is_worker_alive", return_value=True):
+    with patch("charlie_work.worker_fate.is_alive", return_value=True):
         ok, checks = run_doctor(
             tmp_path, paths, config, tmp_path / "c.yaml", gh, adapter_probe=True
         )

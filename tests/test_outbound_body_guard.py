@@ -145,6 +145,134 @@ def test_other_fences_are_still_scanned() -> None:
         assert any(m.rule_id == "github-oauth" for m in matches), info
 
 
+def test_example_secret_masking_not_desynced_by_bare_cr() -> None:
+    """A bare ``\\r`` not part of a ``\\r\\n`` pair is its own line break
+    under ``markdown_fence.split_lines`` (what the ``markdown_fence.scan``
+    fence indices are computed against) but not under a naive
+    ``split("\\n")``.
+    Regression: masking used to line-split with ``split("\\n")`` while
+    consuming ``scan``'s line-indexed fence span, desyncing the two on such
+    input -- silently dropping a real secret that follows the exempt fence
+    (false negative) while leaving the exempt fence's own content
+    unmasked."""
+    body = f"note\r\rmore\r\n```example-secret\r\n{_GHO}\r\n```\r\n{_GHP}\r\n"
+    matches = scan_outbound_text(body, part="body")
+    rule_ids = {m.rule_id for m in matches}
+    assert "github-oauth" not in rule_ids, "exempt fence content leaked as a match"
+    assert "github-pat" in rule_ids, "real secret after the fence was not detected"
+
+
+def test_bare_cr_document_is_not_exempt_under_monotone_composition() -> None:
+    """md-r4: the example-secret mask is the INTERSECTION of origin/main's
+    line model (split on LF only) and the CommonMark scan. A bare-CR
+    document is one physical line to origin/main, so nothing is masked and the
+    key is caught -- exactly as on main. (md-r2 had pinned the opposite,
+    CommonMark-correct exemption; the two models disagreeing is now reported
+    as a ``markdown_guard_disagreement`` event instead of silently widening
+    the exemption.) The LF control still exempts, the ordinary-fence control
+    still reports the key."""
+    cr_body = f"x\r```example-secret\r{_GHO}\r```\r"
+    lf_body = f"x\n```example-secret\n{_GHO}\n```\n"
+    ordinary = f"x\r```\r{_GHO}\r```\r"
+
+    assert "github-oauth" in {m.rule_id for m in scan_outbound_text(cr_body, part="body")}
+    assert not scan_outbound_text(lf_body, part="body")
+    assert "github-oauth" in {m.rule_id for m in scan_outbound_text(ordinary, part="body")}
+
+
+def test_rejected_fence_opener_does_not_over_mask_a_later_real_fence() -> None:
+    """Regression for adversarial review finding B1 (architecture-deepening
+    candidate 3): a rejected fence opener (backtick in its info string) must
+    not swallow the lines up to its nearest same-char closer -- it is
+    ordinary prose under CommonMark, not the start of a region to skip.
+
+    Body (verified against markdown-it-py in commonmark mode): line 0
+    ` ```x`y ` is a paragraph, NOT a fence opener (its info string contains
+    a backtick). Line 1's bare ``` is therefore a FRESH, valid opener with
+    an EMPTY info string -- not "example-secret" -- closed by line 4's ```,
+    so its content (lines 2-3, including the literal ` ```example-secret `
+    line) is never masking-exempt. `markdown_fence.scan` used to instead
+    pair line 0 with line 1 as a "malformed, skip it" region (since a
+    rejected opener still searched for and consumed a closer), leaving
+    line 2's ` ```example-secret ` to open what the guard *did* treat as
+    the exempt fence -- masking the key and dropping the match entirely.
+    """
+    body = f"```x`y\n```\n```example-secret\n{_AWS}\n```\n"
+    matches = scan_outbound_text(body, part="body")
+    assert any(m.rule_id == "aws-access-token" for m in matches), (
+        "real credential was masked as if inside an exempt example-secret fence"
+    )
+
+
+def test_example_secret_masking_not_desynced_by_unicode_line_separator() -> None:
+    """Regression for adversarial review finding B2 (architecture-deepening
+    candidate 3): U+2028 LINE SEPARATOR is not a CommonMark line ending
+    (only ``\\n``, ``\\r\\n``, ``\\r`` are), so it must not split a line for
+    fence-boundary purposes the way ``str.splitlines()`` does.
+
+    Body (verified against markdown-it-py in commonmark mode): "prose" and
+    the first ` ```example-secret ` are ONE physical line (joined by
+    U+2028, not a real line break), so that ``` never opens a line -- it is
+    ordinary paragraph text, not a fence delimiter at all. Only the final
+    bare ``` (after the real ``\\n``-terminated key line) opens a fence, and
+    it is unclosed -- with an EMPTY info string, not "example-secret" -- so
+    the key is never masking-exempt and must still be caught.
+    `markdown_fence.scan`/``_mask_example_secret_fences`` used to line-split
+    with ``str.splitlines()``, which also breaks on U+2028: that phantom
+    line break let ` ```example-secret ` open its own line and pair with
+    the trailing ``` as an exempt fence, masking the key.
+    """
+    body = f"prose\u2028```example-secret\n{_AWS}\n```\n"
+    matches = scan_outbound_text(body, part="body")
+    assert any(m.rule_id == "aws-access-token" for m in matches), (
+        "real credential was masked as if inside an exempt example-secret fence"
+    )
+
+
+@pytest.mark.parametrize(
+    "closer",
+    ["\t```", " \t```", "\t\t```"],
+    ids=["tab", "space-tab", "two-tabs"],
+)
+def test_example_secret_exemption_ends_at_an_over_indented_closer(closer: str) -> None:
+    """Regression for md-r2 re-review B2: an ``example-secret`` fence is an
+    author's claim that its content is a fake example. ``markdown_fence.scan``
+    is strict CommonMark, so a closer indented 4+ columns (a tab, four
+    spaces) does not close the fence and the exempt region would run on to
+    the next ``` -- masking a REAL credential written after the author
+    visibly closed the block. The mask must end at the earliest lenient
+    closer (same char, >= opener length, any indent), as the pre-branch
+    character-counting closer regex did.
+
+    md-r4 note: a 4-SPACE closer is deliberately absent from these params --
+    origin/main and the strict scan both treat it as not closing, so the
+    composed mask runs on exactly as on main (see the parity test below)."""
+    body = f"```example-secret\nfake\n{closer}\n{_AWS}\n```\n"
+    matches = scan_outbound_text(body, part="body")
+    assert any(m.rule_id == "aws-access-token" for m in matches), (
+        "real credential after a visibly closed example-secret fence was masked"
+    )
+
+
+def test_four_space_closer_matches_origin_main_parity() -> None:
+    """md-r4: dropping the md-r2 B2 extra strictness is intentional -- a
+    4-space closer does not close the fence for origin/main nor for the strict
+    scan, so the composed mask (intersection) runs on to the next fence,
+    identical to origin/main. Pinned so a future tightening is a visible choice."""
+    body = f"```example-secret\nfake\n    ```\n{_AWS}\n```\n"
+    assert scan_outbound_text(body, part="body") == ()
+
+
+def test_example_secret_exemption_still_masks_content_before_lenient_closer() -> None:
+    """Control: the fake key INSIDE the fence is still exempt when the
+    closer is over-indented, and a correctly closed fence is unchanged."""
+    inside = f"```example-secret\n{_AWS}\n\t```\nprose\n"
+    assert scan_outbound_text(inside, part="body") == ()
+    normal = f"```example-secret\n{_AWS}\n```\n{_GHP}\n"
+    rule_ids = {m.rule_id for m in scan_outbound_text(normal, part="body")}
+    assert rule_ids == {"github-pat"}
+
+
 def test_match_reports_part_and_line() -> None:
     matches = scan_outbound_text(f"line one\nline two {_GHO}\n", part="body")
     match = next(m for m in matches if m.rule_id == "github-oauth")
@@ -610,3 +738,29 @@ def test_digest_emit_failure_leaves_cursor_for_retry(
     monkeypatch.setattr(_wf, "emit_digest", lambda cfg, digest: emitted.append(digest))
     app._maybe_report_outbound_secret_refusals()
     assert len(emitted) == 1
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        "\t```\n```example-secret\n{key}\n```\n",
+        "  \t```\n```example-secret\n{key}\n```\n",
+        "\t\t```\n~~~example-secret\n{key}\n~~~\n```\n",
+    ],
+    ids=["tab-opener", "space-tab-opener", "double-tab-tilde-inner"],
+)
+def test_example_secret_line_inside_tab_indented_ordinary_fence_does_not_mask(
+    template: str,
+) -> None:
+    """md-r3 review B2: a visibly opened ordinary fence (tab-indented opener,
+    which the pre-scan character-count model treated as a fence) contains the
+    ``example-secret`` line as literal content, so the key must still be caught.
+    Strict CommonMark alone reads the tab line as indented code and would open
+    an exempt block on the inner line."""
+    matches = scan_outbound_text(template.format(key=_AWS), part="body")
+    assert any(m.rule_id == "aws-access-token" for m in matches)
+
+
+def test_control_genuine_example_secret_fence_still_masks_after_intersection() -> None:
+    assert scan_outbound_text(f"```example-secret\n{_AWS}\n```\n", part="body") == ()
+    assert any(m.rule_id == "aws-access-token" for m in scan_outbound_text(_AWS, part="body"))

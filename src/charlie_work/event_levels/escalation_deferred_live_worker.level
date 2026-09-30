@@ -1,0 +1,13 @@
+warning
+# Issue #2051: a rework cap escalation (dispatch_rework's no-op /
+# worker-death / blocked-environment redispatch caps, or the janitor
+# attempts caps in _route_janitor_gate_failure_to_rework) was due this
+# pass but deferred because issue_worker_liveness reports a live worker
+# still holding the issue -- escalation would hand the branch to
+# operator-queue while the worker is still writing it. Warning, not
+# error: handled and re-evaluated next pass (the cap is never consumed,
+# so the escalation fires as soon as the worker exits or wedges), but the
+# operator must be able to see that the cap tripped and was suppressed.
+# Emitted once per worker session via the
+# escalation_deferred_live_worker marker on the issue record; consumed by
+# tests/test_cap_escalation_deferred_live_worker.py.
