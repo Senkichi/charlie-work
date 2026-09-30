@@ -184,8 +184,10 @@ def test_orphaned_worker_detection_with_head_change(tmp_path: Path) -> None:
     state = load_state(paths.state_file)
     entry = state["issues"]["207"]
 
-    # Status should NOT be reset (still dispatched)
-    assert entry.get("status") == "dispatched"
+    # Not auto-reset to rework_requested; issue #2034: with no review callback
+    # the head change is escalated rather than left stranded in dispatched.
+    assert entry.get("status") == "escalated"
+    assert entry.get("escalation_reason") == "rework_no_op"
 
     # Worker PID should be preserved for recovery-path verification (issue #282)
     assert entry["worker_pid"] == 99999
