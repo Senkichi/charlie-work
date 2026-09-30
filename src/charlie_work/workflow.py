@@ -485,7 +485,6 @@ from .dead_worker_reap import (  # noqa: F401  (deliberate re-export)
     _is_pr_updated_at_older_than,
     _is_pre_review_rework_candidate,
     _route_dead_worker_to_pre_review_rework,
-    _classify_dead_sessions_and_update_throttle_state,
     _safe_repo_slug,
     _dispatching_repo_name,
     _open_salvage_pr,
@@ -495,6 +494,7 @@ from .dead_worker_reap import (  # noqa: F401  (deliberate re-export)
     _issues_with_live_workers,
 )
 from .dead_worker_sweep import (  # noqa: F401  (deliberate re-export)
+    classify_dead_sessions as _classify_dead_sessions_and_update_throttle_state,
     run_orphan_sweep as _detect_and_handle_orphaned_workers,
     run_stalled_sweep as _detect_and_handle_stalled_sessions,
 )

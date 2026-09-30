@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from .apply import run_orphan_sweep
 from .apply_stalled import run_stalled_sweep
+from .dead_sessions import classify_dead_sessions
 from .decide import PhaseOrderError, decide
 from .model import RepoFacts, SweepFacts, SweepPlan
 from .ports import SweepPorts, ports_from_workflow
@@ -18,6 +19,7 @@ __all__ = [
     "SweepFacts",
     "SweepPlan",
     "SweepPorts",
+    "classify_dead_sessions",
     "decide",
     "ports_from_workflow",
     "run_orphan_sweep",

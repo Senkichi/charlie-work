@@ -376,7 +376,7 @@ def test_dead_session_reap_parks_labelless_local_work(tmp_path: Path, shallow_wt
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     _write_dead_session_sidecar(sessions_dir, issue_number, branch, worktree_path)
 
-    from charlie_work.dead_worker_reap import (
+    from charlie_work.workflow import (
         _classify_dead_sessions_and_update_throttle_state,
     )
 
@@ -435,7 +435,7 @@ def test_dead_session_reap_terminal_label_not_reparked(tmp_path: Path, shallow_w
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     _write_dead_session_sidecar(sessions_dir, issue_number, branch, worktree_path)
 
-    from charlie_work.dead_worker_reap import (
+    from charlie_work.workflow import (
         _classify_dead_sessions_and_update_throttle_state,
     )
 

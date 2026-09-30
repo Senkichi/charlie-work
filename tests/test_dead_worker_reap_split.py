@@ -102,7 +102,6 @@ _MOVED_NAMES = (
     "_is_pr_updated_at_older_than",
     "_is_pre_review_rework_candidate",
     "_route_dead_worker_to_pre_review_rework",
-    "_classify_dead_sessions_and_update_throttle_state",
     "_safe_repo_slug",
     "_dispatching_repo_name",
     "_open_salvage_pr",
@@ -136,8 +135,11 @@ _MOVED_NAMES = (
 # Re-derived under the dead-worker sweep rewrite (wave B, M8): the stalled-session
 # lane moved into ``dead_worker_sweep``, shrinking the module to 2504 lines; the
 # band is re-centered on that total with the same +/-150 headroom.
-_CAP_BAND_MIN = 2354
-_CAP_BAND_MAX = 2654
+# Re-derived under the dead-worker sweep rewrite (wave B, M9): the dead-session
+# classify lane moved into ``dead_worker_sweep``, shrinking the module to 1777
+# lines; the band is re-centered on that total with the same +/-150 headroom.
+_CAP_BAND_MIN = 1627
+_CAP_BAND_MAX = 1927
 
 
 # ---------------------------------------------------------------------------
@@ -339,7 +341,7 @@ def test_all_moved_names_are_reexported_by_identity() -> None:
 
     names = _module_level_defined_names(_MODULE_PATH)
     assert names, "AST derivation found zero module-level names -- derivation is broken"
-    assert len(names) == 26, f"expected 26 moved units, found {len(names)}: {sorted(names)}"
+    assert len(names) == 25, f"expected 25 moved units, found {len(names)}: {sorted(names)}"
     assert set(names) == set(_MOVED_NAMES), (
         f"AST-derived names {sorted(names)} do not match the expected moved set "
         f"{sorted(_MOVED_NAMES)}"
@@ -443,6 +445,15 @@ def test_module_total_line_count_is_within_the_recorded_cap_band() -> None:
         "itself (not this assertion) should be re-derived and re-recorded, not silently "
         "widened here"
     )
+
+
+def test_classify_dead_sessions_is_the_dead_worker_sweep_reexport() -> None:
+    """The dead-session lane moved into ``dead_worker_sweep`` (wave B, M9); the
+    historical workflow name is the same object, never a second definition."""
+    import charlie_work.workflow as workflow
+    from charlie_work.dead_worker_sweep import classify_dead_sessions
+
+    assert workflow._classify_dead_sessions_and_update_throttle_state is classify_dead_sessions
 
 
 def test_orphaned_workers_stays_in_workflow_and_resolves_moved_names_via_facade() -> None:

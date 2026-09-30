@@ -450,7 +450,7 @@ def test_launch_failure_reap_emits_throttle_window_set(tmp_path: Path) -> None:
     """Call site 3: a launch-failure sidecar whose log tail carries a
     throttle signature persists the window via the dead-session lane's
     launch-failure branch, emitting ``throttle_window_set``."""
-    from charlie_work.dead_worker_reap import _classify_dead_sessions_and_update_throttle_state
+    from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
 
     issue_number = 2008
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
@@ -478,7 +478,7 @@ def test_dead_session_reap_emits_throttle_window_set(tmp_path: Path) -> None:
     """Call site 4: a confirmed-dead session (no PID, no launch error)
     classified ``rate_limited`` from the log tail persists the window and
     emits ``throttle_window_set``."""
-    from charlie_work.dead_worker_reap import _classify_dead_sessions_and_update_throttle_state
+    from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
 
     issue_number = 2009
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"

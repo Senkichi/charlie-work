@@ -978,7 +978,7 @@ def test_launch_failure_lane_stamps_throttle_kind_and_arms_window(
     ``worker_fate.persist_failure``) and calls ``set_throttled_until``
     when the log-tail classification returns a throttle window."""
     import charlie_work.state as state_module
-    from charlie_work.dead_worker_reap import (
+    from charlie_work.workflow import (
         _classify_dead_sessions_and_update_throttle_state,
     )
 
@@ -1044,7 +1044,7 @@ def test_launch_failure_lane_stamps_kind_without_window_for_non_throttle(
     ``set_throttled_until`` — the window write is gated on the classifier
     actually returning a ``throttled_until``."""
     import charlie_work.state as state_module
-    from charlie_work.dead_worker_reap import (
+    from charlie_work.workflow import (
         _classify_dead_sessions_and_update_throttle_state,
     )
 
