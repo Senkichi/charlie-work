@@ -36,7 +36,9 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
-from typing import Literal
+from typing import Annotated, Literal
+
+from ..config_validation import AtLeastOne, NonNeg, Typed
 
 __all__ = [
     "GhFailureClass",
@@ -316,5 +318,5 @@ class GhCircuitBreakerConfig:
     types.
     """
 
-    failure_threshold: int = 5
-    cooldown_seconds: float = 60.0
+    failure_threshold: Annotated[int, Typed, AtLeastOne] = 5
+    cooldown_seconds: Annotated[float, Typed, NonNeg] = 60.0
