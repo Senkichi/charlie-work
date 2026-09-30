@@ -32,7 +32,7 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
 
-from .orphaned_worker_no_op_drain import NoOpReworkRoute
+from .orphaned_worker_no_op_drain import NoOpReworkRoute, drain_no_op_rework_routes
 from .rework_outcome import APPLIED_HEADS_KEY
 
 if TYPE_CHECKING:
@@ -327,3 +327,50 @@ def drain_orphaned_worker_review_routes(
                 )
                 state["issues"][str(issue_number)] = entry
                 write_gate.save_state(state)
+
+
+def drain_orphaned_worker_routes(
+    review_routes: Sequence[OrphanedWorkerReviewRoute],
+    no_op_routes: list[NoOpReworkRoute],
+    *,
+    review_callback: Callable[[int], Any] | None,
+    record_review_callback: Callable[..., Any] | None,
+    enrich_checks_callback: Callable[..., list[dict[str, Any]]] | None,
+    gh: GitHubLike,
+    config: OrchestratorConfig,
+    state_file: Path,
+    write_gate: WriteGate,
+    sessions_dir: Path,
+    repo_root: Any,
+    worktrees_dir: Path | None,
+) -> None:
+    """Drain the orphan sweep's post-lock routes: review lane, then no-op dispositions.
+
+    Issue #2034: every no-op finding (a clean exit with the head unchanged, or a
+    head change the janitor refused to review) gets a disposition -- CI-failure
+    rework, a once-per-head rebuttal review, or a visible ``rework_no_op``
+    escalation -- so none rests in ``dispatched``. The review drain runs first
+    because a refused head-change review appends to ``no_op_routes``.
+    """
+    drain_orphaned_worker_review_routes(
+        review_routes,
+        review_callback=review_callback,
+        gh=gh,
+        config=config,
+        state_file=state_file,
+        write_gate=write_gate,
+        no_op_routes=no_op_routes,
+    )
+    drain_no_op_rework_routes(
+        no_op_routes,
+        gh=gh,
+        config=config,
+        state_file=state_file,
+        write_gate=write_gate,
+        sessions_dir=sessions_dir,
+        repo_root=repo_root,
+        worktrees_dir=worktrees_dir,
+        review_callback=review_callback,
+        record_review_callback=record_review_callback,
+        enrich_checks_callback=enrich_checks_callback,
+    )

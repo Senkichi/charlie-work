@@ -62,7 +62,7 @@ def test_reap_review_verdicts_records_valid_verdict(monkeypatch, tmp_path: Path)
     _make_dead_review_sidecar(reviews_dir, 100, verdict_log)
     _set_review_dispatched_state(app, 100, 10, "2026-07-06T12:00:00Z")
 
-    monkeypatch.setattr("charlie_work.claude_code.is_worker_alive", lambda *_: False)
+    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: False)
 
     result = app._reap_review_verdicts(reviews_dir)
 
@@ -131,7 +131,7 @@ def test_reap_review_verdicts_records_session_metrics(monkeypatch, tmp_path: Pat
         "\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8"
     )
 
-    monkeypatch.setattr("charlie_work.claude_code.is_worker_alive", lambda *_: False)
+    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: False)
 
     result = app._reap_review_verdicts(reviews_dir)
 
@@ -197,7 +197,7 @@ def test_reap_review_verdicts_folds_review_effort_arm_into_session_metrics(
         }
         save_state(app.paths.state_file, state)
 
-    monkeypatch.setattr("charlie_work.claude_code.is_worker_alive", lambda *_: False)
+    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: False)
 
     result = app._reap_review_verdicts(reviews_dir)
 
@@ -251,7 +251,7 @@ def test_reap_review_verdicts_missing_events_file_records_verdict_with_no_metric
     _set_review_dispatched_state(app, 100, 10, "2026-07-06T12:00:00Z")
     # Deliberately do not create issue-100-review.events.jsonl.
 
-    monkeypatch.setattr("charlie_work.claude_code.is_worker_alive", lambda *_: False)
+    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: False)
 
     result = app._reap_review_verdicts(reviews_dir)
 
@@ -302,7 +302,7 @@ def test_reap_review_verdicts_leaves_invalid_verdict_for_stalled_reaper(
     )
     _set_review_dispatched_state(app, 100, 10, old_dispatched)
 
-    monkeypatch.setattr("charlie_work.claude_code.is_worker_alive", lambda *_: False)
+    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: False)
 
     reap = app._reap_review_verdicts(reviews_dir)
     assert reap["recorded"] == []

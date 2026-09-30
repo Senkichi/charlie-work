@@ -20,21 +20,33 @@ from __future__ import annotations
 
 import charlie_work.workflow as _wf
 from charlie_work.dispatch_deferral import records_deferral
+from datetime import UTC, datetime
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any
 
+from charlie_work import worker_fate
 from charlie_work.adapters import SessionRequest
+from charlie_work.blocked_worker_escalation import resolve_fate_exempting_blocked
+from charlie_work.config import WORKER_OUTCOME_FILENAME
 from charlie_work.dead_worker_reap import _emit_session_failed_relabeled
 from charlie_work.fleet_registry import try_acquire_fleet_lock
 from charlie_work.worker_launch_gate import WorkerLaunchDeferral, acquire_fleet_launch_lock
 from charlie_work.github import label_names
+from charlie_work.salvage_events import repeats_last_salvage_failure
 from charlie_work.state import StateLockBusy
 from charlie_work.worker import iter_workers
+from charlie_work.foreign_worktree import OPERATOR_MARKER_KIND, read_worktree_marker
 from charlie_work.worktree import (
+    WORKTREE_UNSAFE_KIND_LOCAL_COMMITS,
     WorktreeProbeFailedError,
+    _archive_unreachable_tip_if_applicable,
+    _has_origin_remote,
     _worktree_refuse_to_reset_reason,
+    _worktree_unsafe_kind_from_reason,
     inspect_worktree_state,
     read_worker_outcome,
+    salvage_push_stranded_commits,
     worktree_path_for_branch,
 )
 
@@ -45,6 +57,7 @@ def _route_phantom_live_worker(
     request: SessionRequest,
     full_issue: dict[str, Any],
     sessions_dir: Path,
+    on_fate: Callable[[worker_fate.WorkerFate], None] | None = None,
 ) -> tuple[str, str | None, dict[str, Any]]:
     """Route a phantom ``live_worker_redispatch_averted`` result as dead.
 
@@ -78,6 +91,11 @@ def _route_phantom_live_worker(
     Returns ``(status, dispatched_at, state)``. The status is
     ``"dispatch_failed"`` so the caller's entry-building frees the slot;
     ``dispatched_at`` is ``None`` because no worker was actually launched.
+
+    The caller holds ``state_lock`` (and ``report_stale_evidence`` takes it
+    itself), so each resolved fate is handed to ``on_fate`` instead of
+    reported here; the caller reports rule 1's stale evidence (B6) once it
+    has released the lock.
     """
     issue_number = request.issue_number
 
@@ -106,21 +124,149 @@ def _route_phantom_live_worker(
             and worker_outcome.get("push_succeeded") is True
             and worker_outcome.get("pr_created") is False
         )
-        if inspection.ahead_count > 0 or reported_push:
-            # Preserve the sidecar so the reaper lane can salvage. Do NOT
-            # strip labels -- the issue should stay in its active state
-            # until salvage moves it to pr_open, preventing re-dispatch
-            # into the occupied worktree.
+
+        # Obtain this worker's fate from the module (design doc §8, step
+        # B5, A11): a dispatched request's issue can never have an open
+        # tracked PR (see the docstring above), so `pr_known=True,
+        # open_pr_number=None` is a real invariant here, not a guess.
+        # `local_ahead` carries the local, unverified `ahead_count` (local vs
+        # base): no remote read happens at dispatch time, so it cannot be
+        # split into pushed vs unpushed. `unpushed=None` marks that; row 6
+        # resolves a dead worker with local commits and an unknown remote to
+        # `Stranded` (rule "R3+R9-remote-unknown"), which the branch below
+        # preserves for the salvage lane.
+        try:
+            outcome_mtime = datetime.fromtimestamp(
+                (worktree_path / WORKER_OUTCOME_FILENAME).stat().st_mtime, tz=UTC
+            )
+        except OSError:
+            outcome_mtime = None
+        fate = resolve_fate_exempting_blocked(
+            worker_fate.FateEvidence(
+                issue_number=issue_number,
+                adapter=w.adapter_kind,
+                dispatched_at=worker_fate.parse_iso_timestamp(w.started_at),
+                pid_alive=False,
+                health=None,
+                terminal=None,
+                worktree_outcome=(
+                    worker_fate.OutcomeEvidence(
+                        source=worker_fate.EvidenceSource.WORKTREE,
+                        written_at=outcome_mtime,
+                        outcome=worker_outcome.get("outcome"),
+                        push_succeeded=worker_outcome.get("push_succeeded"),
+                        pr_created=worker_outcome.get("pr_created"),
+                        head_sha=worker_outcome.get("head_sha"),
+                        raw=worker_outcome,
+                    )
+                    if isinstance(worker_outcome, dict)
+                    else None
+                ),
+                branch=worker_fate.BranchEvidence(
+                    remote_head_sha=None,
+                    remote_ahead=None,
+                    unpushed=None,
+                    local_ahead=inspection.ahead_count,
+                    open_pr_number=None,
+                    pr_known=True,
+                ),
+                failure=None,
+            ),
+            sessions_dir=sessions_dir,
+            issue_number=issue_number,
+            now=datetime.now(UTC),
+        )
+        if on_fate is not None:
+            on_fate(fate)
+        # Rule 1/2 (design doc §8, step B5): preserve for salvage when the
+        # resolved fate is `Stranded` (local-only commits) -- a fresh
+        # `blocked` declaration now resolves to `fate=Blocked` (rule 2:
+        # fresh blocked beats push flags) and no longer gets folded into
+        # the salvage-preserve branch just because local commits or a push
+        # claim are also present.
+        #
+        # `PushedWithoutPr` is named alongside `Stranded` for the case it
+        # can prove, but `_is_pushed` (row 2/3) needs `branch.remote_ahead`
+        # or a matching `remote_head_sha` to confirm a push, and neither is
+        # ever populated here -- this call site deliberately does no
+        # remote read at dispatch time (see the evidence-construction
+        # comment above), so `resolve_fate` alone can never *return*
+        # `PushedWithoutPr`/`Completed` from this evidence shape; an
+        # unconfirmable, fresh, self-reported push falls through to
+        # `Crashed` (row 10) instead. `fate.basis.outcome` still carries
+        # the rule-1-freshness-gated winning candidate regardless of which
+        # row picked it, so `declared_push` reads the same self-reported
+        # claim the legacy `reported_push` check trusted directly, gated
+        # on rule 1 instead of trusted unconditionally.
+        # B9 (wf-review-opus.md): the legacy `reported_push` check above
+        # required an EXPLICIT `pr_created is False`. This refactored
+        # `declared_push` loosened it to `pr_created is not True`, which
+        # also admits `None` -- an outcome that omits `pr_created` now
+        # gets the same "confirmed pushed, no PR" preservation treatment
+        # as an explicit `false`. That widening was never one of the nine
+        # reviewed flips; restore the strict legacy gate.
+        fresh_outcome = fate.basis.outcome
+        declared_push = (
+            fresh_outcome is not None
+            and fresh_outcome.push_succeeded is True
+            and fresh_outcome.pr_created is False
+        )
+        # B4 (wf-review-opus.md), rule 2: a fresh `blocked` declaration
+        # beats push flags everywhere, but this dispatch-time helper has
+        # no remote read (see above) and is not the single point of
+        # enforcement for the blocked-escalation invariant -- the
+        # dead-session reaper lane already owns that (`workflow.py`'s
+        # `fates.get(issue_number) == Blocked` branch, and the
+        # `orphaned_worker_sweep.py` sites fixed for B2/B3), keyed off the
+        # very sidecar this function would otherwise reap. Before this
+        # fix, `Blocked` was neither `Stranded` nor `PushedWithoutPr` and
+        # `declared_push` was false for a pure blocked outcome, so control
+        # fell through to the reap-and-`ready` path below: the sidecar the
+        # reaper lane keys off was destroyed, and the issue was
+        # re-queued into the identical wall it had just declared itself
+        # blocked on. Folding `Blocked` into this same preserve branch
+        # (rather than escalating inline here, which would duplicate that
+        # enforcement point and reintroduce the entry-identity clobber the
+        # caller's `is_phantom_live_worker` arm does not guard against --
+        # it never re-reads `entry` from `state["issues"]` the way the
+        # dispatch-failed-cap and blocked-environment arms do after their
+        # own `_escalate_issue` calls) leaves the sidecar and labels
+        # untouched instead: the reaper lane's next pass resolves the same
+        # fresh `Blocked` fate with real branch evidence and escalates it
+        # exactly as it already does for a dead worker.
+        # Issue #2010: a permission-denial ``blocked`` (a worker-config defect
+        # the reaper lane will NOT escalate) is exempt. ``fate`` above was
+        # resolved by ``resolve_fate_exempting_blocked``, which drops that claim
+        # and re-resolves from the branch evidence, so such a worker with local
+        # commits is ``Stranded`` (preserved for salvage, as on origin/main) and
+        # one with none takes the ordinary reap path. A ``Blocked`` fate here is
+        # therefore always escalatable.
+        escalatable_blocked = isinstance(fate, worker_fate.Blocked)
+        if (
+            isinstance(fate, (worker_fate.Stranded, worker_fate.PushedWithoutPr))
+            or escalatable_blocked
+            or declared_push
+        ):
+            # Preserve the sidecar so the reaper lane can act on it --
+            # either salvaging a pushed/stranded branch or escalating a
+            # declared-blocked worker. Do NOT strip labels -- the issue
+            # should stay in its active state until that lane resolves it,
+            # preventing re-dispatch into the occupied worktree or wall.
             state = _emit_session_failed_relabeled(
                 state,
                 issue_number=issue_number,
-                reason="phantom_live_worker_completed_work_preserved",
+                reason=(
+                    "phantom_live_worker_declared_blocked_preserved"
+                    if escalatable_blocked
+                    else "phantom_live_worker_completed_work_preserved"
+                ),
                 failure_kind="live_worker_redispatch_averted",
                 removed_labels=[],
                 added_ready=False,
                 label_write_ok=True,
                 worktree_state=inspection.state.value,
                 reported_push=reported_push,
+                worker_fate=type(fate).__name__,
                 state_path=self.paths.state_file,
                 write_gate=self.write_gate,
             )
@@ -175,7 +321,9 @@ def _route_phantom_live_worker(
     return "dispatch_failed", None, state
 
 
-def _worktree_still_unsafe(self, issue_number: int, state: dict[str, Any]) -> str | None:
+def _worktree_still_unsafe(
+    self, issue_number: int, state: dict[str, Any], *, dry_run: bool = False
+) -> str | None:
     """Re-run the worktree safety check for an issue (issue #849).
 
     Returns a reason string if the issue's worktree is still unsafe to
@@ -190,6 +338,30 @@ def _worktree_still_unsafe(self, issue_number: int, state: dict[str, Any]) -> st
     Fails closed: a probe failure (``WorktreeProbeFailedError``) is
     treated as "still unsafe" so a transient index lock cannot clear a
     real blocker.
+
+    Rule 3 of the Worker fate resolution (a stranded branch -- committed
+    but not on the remote -- is salvaged, never merely "stuck") is applied
+    here as salvage-before-clear, the same fact
+    ``_route_phantom_live_worker`` resolves to ``worker_fate.Stranded``.
+    When the reason is ``WORKTREE_UNSAFE_KIND_LOCAL_COMMITS`` (no
+    worker-authored dirt, only commits absent from the remote) the commits
+    are made durable first (``_salvage_stranded_before_clear``) and the
+    escalation clears only once they are:
+
+    - repo WITH an origin remote: the ff-only
+      ``salvage_push_stranded_commits`` push, then
+      ``_worktree_refuse_to_reset_reason`` is re-run and must be clean.
+      Both callers always have an open PR, so this deliberately does NOT
+      go through ``_attempt_salvage`` (its PR-open would duplicate it).
+    - repo with NO origin remote: the #1944 archive park. The re-check
+      cannot turn clean there (nothing is ever "on the remote"), so a
+      verified archive ref is the clearing evidence instead.
+
+    Any salvage skip or failure (diverged remote, live or operator writer
+    marker, push or probe error, archive declined) returns the ORIGINAL
+    reason so the label stays. ``dry_run`` (the command's own flag or the
+    write gate's) never salvages, so it never clears a local-commits
+    reason.
     """
     issue_entry = state.get("issues", {}).get(str(issue_number), {})
     if not isinstance(issue_entry, dict):
@@ -202,7 +374,8 @@ def _worktree_still_unsafe(self, issue_number: int, state: dict[str, Any]) -> st
         # No worktree on disk — the blocker is gone (or was never this
         # issue's worktree). Clearing is safe.
         return None
-    try:
+
+    def _refuse_reason() -> str | None:
         return _worktree_refuse_to_reset_reason(
             self.repo_root,
             branch,
@@ -211,10 +384,95 @@ def _worktree_still_unsafe(self, issue_number: int, state: dict[str, Any]) -> st
             self.config.dispatch.injected_paths,
             self.config.dispatch.materialize_dirs,
         )
+
+    try:
+        reason = _refuse_reason()
+        if (
+            not reason
+            or _worktree_unsafe_kind_from_reason(reason) != WORKTREE_UNSAFE_KIND_LOCAL_COMMITS
+            or dry_run
+            or self.write_gate.dry_run
+        ):
+            return reason
+        mode = self._salvage_stranded_before_clear(issue_number, branch, wt_path)
+        if mode is None:
+            return reason
+        if mode == "parked":
+            return None
+        return _refuse_reason()
     except (WorktreeProbeFailedError, RuntimeError):
         # Fail closed: a probe failure means we cannot confirm safety,
         # so treat the worktree as still unsafe.
         return "worktree safety probe failed; cannot confirm clean"
+
+
+def _salvage_stranded_before_clear(
+    self, issue_number: int, branch: str, wt_path: Path
+) -> str | None:
+    """Publish or park a stranded branch before its escalation may clear.
+
+    Returns ``"pushed"`` (ff-only push to origin landed; the caller
+    re-checks), ``"parked"`` (no origin remote; tip archived by the #1944
+    park path), or ``None`` when the work is not proven durable (the label
+    must stay). Emits ``worktree_unsafe_stranded_salvaged`` or
+    ``worktree_unsafe_stranded_salvage_failed`` (with ``skip_reason``).
+    """
+    mode: str | None = None
+    skip_reason: str | None = None
+    payload: dict[str, Any] = {"issue_number": issue_number, "branch": branch}
+    if _has_origin_remote(self.repo_root):
+        result = salvage_push_stranded_commits(
+            self.repo_root,
+            branch,
+            wt_path,
+            base_ref=self.config.dispatch.base_ref,
+            dry_run=False,
+        )
+        if result.pushed:
+            mode = "pushed"
+            payload.update(
+                commit_count=result.commit_count,
+                old_remote_sha=result.old_remote_sha,
+                new_remote_sha=result.new_remote_sha,
+            )
+        else:
+            skip_reason = result.skip_reason or result.error or "push_failed"
+    elif not self.config.dispatch.archive_unreachable_local_commits:
+        skip_reason = "archive_disabled"
+    else:
+        marker = read_worktree_marker(wt_path)
+        marker_pid = marker.get("pid") if marker is not None else None
+        # Same fingerprint the with-origin path passes (worktree.py), so a
+        # recycled marker PID does not read as a live writer.
+        marker_start_time = marker.get("process_start_time") if marker is not None else None
+        if marker is not None and marker.get("kind") == OPERATOR_MARKER_KIND:
+            skip_reason = "operator_claimed"
+        elif isinstance(marker_pid, int) and worker_fate.is_alive(marker_pid, marker_start_time):
+            skip_reason = "live_writer_marker"
+        elif _archive_unreachable_tip_if_applicable(
+            self.repo_root, branch, wt_path, self.paths.state_file, set(), issue_number
+        ):
+            mode = "parked"
+        else:
+            skip_reason = "archive_declined"
+
+    payload["mode"] = mode
+    if mode is None:
+        payload["skip_reason"] = skip_reason
+    kind = (
+        "worktree_unsafe_stranded_salvaged"
+        if mode is not None
+        else "worktree_unsafe_stranded_salvage_failed"
+    )
+    with _wf.state_lock(self.paths.state_file):
+        fresh = _wf.load_state(self.paths.state_file)
+        # N3: the de-escalation sweep re-runs this every interval for a
+        # persistently unsalvageable branch; record a failure only when it
+        # differs from the newest failure already logged for this issue.
+        if mode is not None or not repeats_last_salvage_failure(fresh, payload):
+            fresh = self._record_event(fresh, kind, payload)
+            self.write_gate.save_state(fresh)
+    return mode
 
 
 @records_deferral("dispatch_rework")

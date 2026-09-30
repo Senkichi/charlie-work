@@ -47,6 +47,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 import charlie_work.workflow as _wf
+from charlie_work import worker_fate
 from charlie_work.worker_pid_stamp import stamp_worker_process
 from charlie_work.worker_launch_gate import (
     REASON_PROVIDER_THROTTLED,
@@ -1135,6 +1136,10 @@ def _dispatch_impl(
     manual = self.config.worker.harness == "manual"
     label_errors: list[int] = []
     label_error_failures: dict[int, str] = {}
+    # B6: fates the phantom-worker lane resolves while ``state_lock`` is held,
+    # reported (rule-1 stale evidence) once the lock is released below.
+    phantom_fates: dict[int, list[worker_fate.WorkerFate]] = {}
+
     with _wf.state_lock(self.paths.state_file):
         state = _wf.load_state(self.paths.state_file)
         for request in session_requests:
@@ -1210,6 +1215,7 @@ def _dispatch_impl(
                     request,
                     full_issue,
                     sessions_dir,
+                    on_fate=lambda fate: worker_fate.collect_fate(phantom_fates, fate),
                 )
                 # A phantom live worker is being routed as dead; do not
                 # preserve a stale worker_pid that would keep the slot
@@ -1792,6 +1798,10 @@ def _dispatch_impl(
             state_path=self.paths.state_file,
         )
         _wf.save_state(self.paths.state_file, state)
+    worker_fate.report_stale_evidence(
+        self.paths.state_file, phantom_fates, write_gate=self.write_gate
+    )
+
     result_dicts = [result.to_dict() for result in dispatch_results]
     message = "dispatch complete"
     if failed_issue_numbers:

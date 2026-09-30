@@ -30,6 +30,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from . import worker_fate
 from .closing_reference import closing_issues_referenced_numbers, validate_closing_reference
 from .config import (
     DETERMINISTIC_ESCALATION_FAILURE_KINDS,
@@ -3260,14 +3261,24 @@ def apply_fixes(
             # provider-throttle deaths from its timed reap and
             # orphan-redispatch cap. Never invents an issue entry — an
             # untracked session has no orphan-sweep bookkeeping to exempt.
+            #
+            # Written through ``worker_fate.persist_failure`` (single write
+            # primitive, ``throttled_until=None``: the window has its own item
+            # above); only the stamped entry is folded back into ``new_issues``.
             if item.issue_number is not None and item.failure_kind is not None:
                 issue_key = str(item.issue_number)
-                existing_issue = new_issues.get(issue_key)
-                if isinstance(existing_issue, dict):
-                    new_issues[issue_key] = {
-                        **existing_issue,
-                        "dead_worker_failure_kind": item.failure_kind,
-                    }
+                persisted = worker_fate.persist_failure(
+                    new_state,
+                    item.issue_number,
+                    worker_fate.FailureEvidence(
+                        kind=item.failure_kind, throttled_until=None, fresh=True
+                    ),
+                    adapter_kind=None,
+                    now=datetime.now(UTC),
+                )
+                stamped_issue = persisted.get("issues", {}).get(issue_key)
+                if isinstance(stamped_issue, dict) and issue_key in new_issues:
+                    new_issues[issue_key] = stamped_issue
 
         elif item.kind == "session_failed_escalated":
             # Issue #261: worker was killed by a push-gate hook — escalate

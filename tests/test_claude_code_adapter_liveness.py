@@ -1,4 +1,4 @@
-"""Worker liveness: ``is_worker_alive`` pid-recycling guards,
+"""Worker liveness: ``worker_fate.is_alive`` pid-recycling guards,
 ``_posix_stat`` comm parsing, process-start-time capture, and the
 worker-census log line.
 
@@ -14,6 +14,8 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
+
 import pytest
 
 from _claude_adapter_fixtures import (
@@ -21,11 +23,16 @@ from _claude_adapter_fixtures import (
     _install_fake_create_worktree,
 )
 
+from charlie_work import worker_fate
 from charlie_work.claude_code import (
     ClaudeWorkerRecord,
-    is_worker_alive,
     launch_claude_worker,
 )
+
+
+def _record_alive(record: Any) -> bool:
+    """Liveness of a sidecar record, through the single ``worker_fate`` seam."""
+    return worker_fate.is_alive(record.pid, record.process_start_time)
 
 
 def test_log_worker_census_emits_alive_worker_with_cap(
@@ -108,14 +115,14 @@ def test_is_worker_alive_reflects_real_process(tmp_path: Path) -> None:
             started_at="2026-01-01T00:00:00Z",
             log_path="log.txt",
         )
-        assert is_worker_alive(alive_record) is True
+        assert _record_alive(alive_record) is True
     finally:
         process.kill()
         process.wait(timeout=5)
 
     # Regression guard for the Windows os.kill(pid, 0) trap: that call keeps
     # reporting a reaped PID as alive indefinitely (verified empirically —
-    # see is_worker_alive's docstring), so this must be an exact
+    # see worker_fate.is_alive's docstring), so this must be an exact
     # post-wait() assertion, not a "poll until it settles" retry loop.
     dead_record = ClaudeWorkerRecord(
         issue_number=1,
@@ -127,7 +134,7 @@ def test_is_worker_alive_reflects_real_process(tmp_path: Path) -> None:
         started_at="2026-01-01T00:00:00Z",
         log_path="log.txt",
     )
-    assert is_worker_alive(dead_record) is False
+    assert _record_alive(dead_record) is False
 
     # pid=None case (never launched)
     none_record = ClaudeWorkerRecord(
@@ -140,7 +147,7 @@ def test_is_worker_alive_reflects_real_process(tmp_path: Path) -> None:
         started_at="2026-01-01T00:00:00Z",
         log_path="log2.txt",
     )
-    assert is_worker_alive(none_record) is False
+    assert _record_alive(none_record) is False
 
 
 def test_is_worker_alive_rejects_pid_recycling_mismatched_start_time(tmp_path: Path) -> None:
@@ -183,7 +190,7 @@ def test_is_worker_alive_rejects_pid_recycling_mismatched_start_time(tmp_path: P
         )
 
         # Should return False because start time doesn't match
-        assert is_worker_alive(record) is False
+        assert _record_alive(record) is False
     finally:
         process.kill()
         process.wait(timeout=5)
@@ -221,7 +228,7 @@ def test_is_worker_alive_accepts_matching_start_time(tmp_path: Path) -> None:
         )
 
         # Should return True because start time matches
-        assert is_worker_alive(record) is True
+        assert _record_alive(record) is True
     finally:
         process.kill()
         process.wait(timeout=5)
@@ -246,7 +253,7 @@ def test_is_worker_alive_legacy_record_fallback() -> None:
     )
 
     # Should return True using pid-only fallback
-    assert is_worker_alive(record) is True
+    assert _record_alive(record) is True
 
 
 def test_posix_stat_parse_with_spaces_in_comm(
@@ -297,7 +304,7 @@ def test_is_worker_alive_probe_none_treats_indeterminate_as_alive(
 ) -> None:
     """Issue #360 criterion #1: a start-time probe failure is not a definitive dead signal.
 
-    When ``get_process_start_time`` returns ``None`` for a live PID, ``is_worker_alive``
+    When ``get_process_start_time`` returns ``None`` for a live PID, ``worker_fate.is_alive``
     treats the liveness signal as indeterminate and returns ``True`` rather than
     reaping a potentially-live worker.
     """
@@ -330,7 +337,7 @@ def test_is_worker_alive_probe_none_treats_indeterminate_as_alive(
         )
 
         # Should return True because the probe was indeterminate, not definitive dead.
-        assert is_worker_alive(record) is True
+        assert _record_alive(record) is True
     finally:
         process.kill()
         process.wait(timeout=5)

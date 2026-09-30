@@ -16,6 +16,7 @@ disposition; these tests drive the real sweep with the real
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +32,7 @@ from charlie_work.config import (
     WorkerRoleConfig,
 )
 from charlie_work.janitor import _calculate_patch_id
+from charlie_work.process_utils import write_worker_terminal_status
 from charlie_work.state import load_state, save_state
 from charlie_work.workflow import CommandResult, OrchestratorApp
 
@@ -91,8 +93,15 @@ def _bed(tmp_path: Path, *, lint_red: bool, live_head: str = "abc123"):
 def _terminal_exit_zero(tmp_path: Path) -> None:
     sessions = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions.mkdir(parents=True, exist_ok=True)
-    (sessions / "issue-207.claude.terminal.json").write_text(
-        json.dumps({"pid": 99999, "exit_code": 0, "duration_seconds": 300.0}), encoding="utf-8"
+    # The record must post-date this dispatch (a stale one is ignored).
+    now = datetime.now(UTC)
+    write_worker_terminal_status(
+        sessions / "issue-207.claude-code.terminal.json",
+        pid=99999,
+        exit_code=0,
+        started_at=(now - timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        ended_at=(now - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        duration_seconds=300.0,
     )
 
 
@@ -192,7 +201,7 @@ def test_ci_green_with_rebuttal_returns_to_review_once_per_head(tmp_path: Path) 
     _write_outcome(
         paths,
         tmp_path,
-        {"push_succeeded": True, "head_sha": "abc123", "pr_comment": "Head already fixes it."},
+        {"push_succeeded": False, "head_sha": "abc123", "pr_comment": "Head already fixes it."},
     )
     app = OrchestratorApp(tmp_path, paths, config, gh)
     calls: list[int] = []
@@ -221,7 +230,7 @@ def test_ci_green_rebuttal_review_refused_escalates_with_worker_comment(tmp_path
     _write_outcome(
         paths,
         tmp_path,
-        {"push_succeeded": True, "head_sha": "abc123", "pr_comment": "Nothing left to fix."},
+        {"push_succeeded": False, "head_sha": "abc123", "pr_comment": "Nothing left to fix."},
     )
     app = OrchestratorApp(tmp_path, paths, config, gh)
     _sweep(

@@ -31,10 +31,11 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Iterable
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from . import worker_fate
 from .config import WORKER_OUTCOME_FILENAME
 from .instrumentation import log_event
 from .process_utils import find_worker_terminal_status
@@ -87,6 +88,36 @@ def _load_issue_branch(state_file: Path, issue_number: int) -> str | None:
     return branch if isinstance(branch, str) and branch else None
 
 
+def _outcome_evidence(
+    outcome: dict[str, Any] | None,
+    *,
+    source: worker_fate.EvidenceSource,
+    written_at: datetime | None = None,
+) -> worker_fate.OutcomeEvidence | None:
+    """Build an ``OutcomeEvidence`` from a raw ``.worker-outcome.json`` dict.
+
+    ``None`` in, ``None`` out (no claim); a present-but-empty dict still
+    builds a real (all-``None``-fields) object rather than ``None`` itself
+    -- ``worker_fate._evaluate_candidate``'s ``_carries_no_claim`` check is
+    what actually makes ``{}`` behave as "no claim: neither stale nor
+    decisive" (design doc §3 step 0), by never letting a content-empty
+    candidate win freshness arbitration over a sibling that carries a real
+    claim. That check is the single point of enforcement (N1,
+    wf-review-opus.md); this function does not need its own.
+    """
+    if not isinstance(outcome, dict):
+        return None
+    return worker_fate.OutcomeEvidence(
+        source=source,
+        written_at=written_at,
+        outcome=outcome.get("outcome"),
+        push_succeeded=outcome.get("push_succeeded"),
+        pr_created=outcome.get("pr_created"),
+        head_sha=outcome.get("head_sha"),
+        raw=outcome,
+    )
+
+
 def _read_rework_outcome(
     sessions_dir: Path,
     repo_root: Path,
@@ -99,23 +130,72 @@ def _read_rework_outcome(
     The terminal-status watcher copies the outcome out of the worktree at
     process exit, so the durable copy survives worktree cleanup; the worktree
     file itself is the fallback for a worker whose watcher has not run yet.
+
+    Obtains this pick from the module (design doc §8, step B1, A13):
+    ``worker_fate.resolve_fate``'s freshness step (rules 1/7) already
+    implements "terminal, if fresh, else worktree, if fresh, else nothing".
+    Neither a ``dispatched_at`` nor a live head is known at this call site
+    (this function takes neither), so timestamp/head freshness never
+    rejects a candidate here (rule 1's legacy mode: an unset
+    ``dispatched_at`` accepts unconditionally, and an unknown head never
+    proves a mismatch) -- but an empty terminal ``worker_outcome`` (``{}``)
+    is still not decisive: ``worker_fate._carries_no_claim`` (N1,
+    wf-review-opus.md; design doc §3 step 0) keeps a content-empty terminal
+    candidate from out-ranking the worktree's real content even though
+    "legacy mode" would otherwise call it fresh, so this degrades to
+    "terminal if it carries a real claim, else worktree, else nothing" --
+    the same polarity as ``workflow.py``'s no-PR lane (FLIP 7's other
+    site), not the opposite one FLIP 7 originally found.
     """
+    terminal_evidence: worker_fate.TerminalEvidence | None = None
     record = find_worker_terminal_status(sessions_dir, issue_number)
     if isinstance(record, dict):
-        outcome = record.get("worker_outcome")
-        if isinstance(outcome, dict):
-            return outcome
+        terminal_evidence = worker_fate.TerminalEvidence(
+            ended_at=worker_fate.parse_iso_timestamp(record.get("ended_at")) or datetime.now(UTC),
+            exit_code=record.get("exit_code"),
+            outcome=_outcome_evidence(
+                record.get("worker_outcome"), source=worker_fate.EvidenceSource.TERMINAL
+            ),
+        )
+
+    worktree_outcome_evidence: worker_fate.OutcomeEvidence | None = None
     if branch:
         worktree_path = worktree_path_for_branch(repo_root, branch, worktrees_dir)
-        return read_worker_outcome(worktree_path)
-    return None
+        worktree_outcome_evidence = _outcome_evidence(
+            read_worker_outcome(worktree_path), source=worker_fate.EvidenceSource.WORKTREE
+        )
+
+    fate = worker_fate.resolve_fate(
+        worker_fate.FateEvidence(
+            issue_number=issue_number,
+            adapter="unknown",
+            dispatched_at=None,
+            pid_alive=False,
+            health=None,
+            terminal=terminal_evidence,
+            worktree_outcome=worktree_outcome_evidence,
+            branch=worker_fate.BranchEvidence(
+                remote_head_sha=None,
+                remote_ahead=None,
+                unpushed=None,
+                open_pr_number=None,
+                pr_known=False,
+            ),
+            failure=None,
+        ),
+        now=datetime.now(UTC),
+    )
+    return dict(fate.basis.outcome.raw) if fate.basis.outcome is not None else None
 
 
 def fresh_completed_worker_outcome(
     worktree_path: Path | None,
     *,
+    issue_number: int,
     live_head_sha: str | None,
     dispatched_at: datetime | None,
+    pr_number: int | None = None,
+    on_fate: Callable[[worker_fate.WorkerFate], None] | None = None,
 ) -> dict[str, Any] | None:
     """Return a worktree ``.worker-outcome.json`` that proves a dead worker
     completed its handoff despite leaving no terminal-status record
@@ -135,24 +215,173 @@ def fresh_completed_worker_outcome(
 
     Every check fails safe: ``None`` sends the caller back to the existing
     worker-death path. Never raises.
+
+    ``on_fate`` receives the resolved fate so the caller can report rule 1's
+    stale evidence (``worker_fate.report_stale_evidence``, B6) once it is out
+    of its lock; this function reads only and never emits.
+
+    Obtains this pick from the module (design doc §8, step B1, A12): rule
+    1's freshness gate (``written_at > dispatched_at``) and rule 7's
+    head-match replace the two literal checks this function used to run by
+    hand. The caller passes the open PR it is sweeping as ``pr_number``
+    (``None`` when it has none): a confirmed push then resolves to ``Completed`` (rule 8 never reads
+    ``pr_created`` -- ``pr_created: true`` is still accepted below,
+    unchanged). What gates the return is ``fate.basis.outcome`` surviving
+    the freshness step with a confirmed push and a head match -- the exact
+    two checks this function ran directly before.
     """
     if worktree_path is None or not live_head_sha or dispatched_at is None:
         return None
     try:
-        outcome_mtime = (worktree_path / WORKER_OUTCOME_FILENAME).stat().st_mtime
+        outcome_mtime = datetime.fromtimestamp(
+            (worktree_path / WORKER_OUTCOME_FILENAME).stat().st_mtime, tz=UTC
+        )
     except OSError:
         return None
-    if outcome_mtime <= dispatched_at.timestamp():
-        return None
     outcome = read_worker_outcome(worktree_path)
-    if not isinstance(outcome, dict) or outcome.get("outcome") == "blocked":
+    outcome_evidence = _outcome_evidence(
+        outcome, source=worker_fate.EvidenceSource.WORKTREE, written_at=outcome_mtime
+    )
+    if outcome_evidence is None:
         return None
-    if outcome.get("push_succeeded") is not True:
+
+    fate = worker_fate.resolve_fate(
+        worker_fate.FateEvidence(
+            issue_number=issue_number,
+            adapter="unknown",
+            dispatched_at=dispatched_at,
+            pid_alive=False,
+            health=None,
+            terminal=None,
+            worktree_outcome=outcome_evidence,
+            branch=worker_fate.BranchEvidence(
+                remote_head_sha=live_head_sha,
+                remote_ahead=None,
+                unpushed=None,
+                open_pr_number=pr_number,
+                pr_known=pr_number is not None,
+            ),
+            failure=None,
+        ),
+        now=datetime.now(UTC),
+    )
+    if on_fate is not None:
+        on_fate(fate)
+
+    resolved = fate.basis.outcome
+    if (
+        not isinstance(fate, worker_fate.Blocked)
+        and resolved is not None
+        and resolved.push_succeeded is True
+        and resolved.head_sha == live_head_sha
+    ):
+        return dict(resolved.raw)
+    return None
+
+
+def blocked_worker_outcome(
+    worktree_path: Path | None,
+    *,
+    issue_number: int,
+    dispatched_at: datetime | None,
+    pr_number: int | None = None,
+    on_fate: Callable[[worker_fate.WorkerFate], None] | None = None,
+    sessions_dir: Path | None = None,
+) -> dict[str, Any] | None:
+    """Return the outcome (worktree ``.worker-outcome.json`` or the copy the
+    terminal-status watcher embedded in the terminal record) that proves a
+    dead worker declared itself blocked (rule 2, wf-design.md §9: FLIP 2).
+
+    ``sessions_dir`` (optional) adds the terminal record's embedded
+    ``worker_outcome`` as a candidate, so a declaration survives the worktree
+    being reaped. Both candidates go through ``resolve_fate``'s freshness
+    arbitration, exactly as the no-PR lane does.
+
+    Sibling to ``fresh_completed_worker_outcome`` above, same freshness
+    contract (``written_at`` must postdate ``dispatched_at``) and the same
+    single-read shape -- deliberately not sharing its ``resolve_fate`` call:
+    the two functions answer different questions for different callers
+    (``handle_dead_worker_completed_outcome`` already returns ``bool``, not
+    a fate, and threading one back out is a larger seam change than this
+    flip needs), and both fail safe to ``None`` on any missing/stale/
+    unreadable outcome. No live-head/remote data is available at this call
+    site either, so -- as in the sibling -- rule 2's ``Blocked`` fate is
+    reachable without it (it only depends on the outcome's own freshness
+    and declared kind, never on branch/PR evidence).
+
+    Distinguishing a fresh ``blocked`` declaration from "no evidence at
+    all" lets the caller escalate it instead of silently folding it into
+    the same ``rework_requested`` reset a genuinely silent death gets.
+    """
+    if dispatched_at is None:
         return None
-    head_sha = outcome.get("head_sha")
-    if not isinstance(head_sha, str) or head_sha != live_head_sha:
+
+    terminal_evidence: worker_fate.TerminalEvidence | None = None
+    if sessions_dir is not None:
+        record = find_worker_terminal_status(sessions_dir, issue_number)
+        if isinstance(record, dict):
+            ended_at = worker_fate.parse_iso_timestamp(record.get("ended_at"))
+            # The embedded outcome's own mtime, not the exit time (B5): a
+            # reused worktree can hold a previous dispatch's leftover file.
+            written_at = (
+                worker_fate.parse_iso_timestamp(record.get("worker_outcome_written_at"))
+                or ended_at
+            )
+            terminal_evidence = worker_fate.TerminalEvidence(
+                ended_at=ended_at or datetime.now(UTC),
+                exit_code=record.get("exit_code"),
+                outcome=_outcome_evidence(
+                    record.get("worker_outcome"),
+                    source=worker_fate.EvidenceSource.TERMINAL,
+                    written_at=written_at,
+                ),
+            )
+
+    worktree_evidence: worker_fate.OutcomeEvidence | None = None
+    if worktree_path is not None:
+        try:
+            outcome_mtime = datetime.fromtimestamp(
+                (worktree_path / WORKER_OUTCOME_FILENAME).stat().st_mtime, tz=UTC
+            )
+        except OSError:
+            outcome_mtime = None
+        if outcome_mtime is not None:
+            worktree_evidence = _outcome_evidence(
+                read_worker_outcome(worktree_path),
+                source=worker_fate.EvidenceSource.WORKTREE,
+                written_at=outcome_mtime,
+            )
+
+    if worktree_evidence is None and (
+        terminal_evidence is None or terminal_evidence.outcome is None
+    ):
         return None
-    return outcome
+
+    fate = worker_fate.resolve_fate(
+        worker_fate.FateEvidence(
+            issue_number=issue_number,
+            adapter="unknown",
+            dispatched_at=dispatched_at,
+            pid_alive=False,
+            health=None,
+            terminal=terminal_evidence,
+            worktree_outcome=worktree_evidence,
+            branch=worker_fate.BranchEvidence(
+                remote_head_sha=None,
+                remote_ahead=None,
+                unpushed=None,
+                open_pr_number=pr_number,
+                pr_known=pr_number is not None,
+            ),
+            failure=None,
+        ),
+        now=datetime.now(UTC),
+    )
+    if on_fate is not None:
+        on_fate(fate)
+    if isinstance(fate, worker_fate.Blocked) and fate.basis.outcome is not None:
+        return dict(fate.basis.outcome.raw)
+    return None
 
 
 def apply_rework_worker_outcome(

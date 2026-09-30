@@ -6,10 +6,13 @@ pushed its branch and wrote a complete ``.worker-outcome.json``
 (``push_succeeded: true`` / ``pr_created: false``) has finished the handoff
 contract -- the file's own instruction is "then stop", so a still-running
 PID at that point is a process that hung on exit, not a worker still doing
-work. When the outcome file is older than
-``watchdog.worker_outcome_finalize_minutes``, this lane opens the PR from
-the worker's drafted title/body through the same ``_open_pr_for_orphaned_branch``
-the dead-PID lane uses, without waiting for the PID to exit (the swole #163
+work. N4 (wf-review-opus.md): a live PID with a fresh, on-target, declared
+push (rule 1's freshness gate: ``written_at`` after ``dispatched_at``)
+routes immediately -- ``watchdog.worker_outcome_finalize_minutes`` is no
+longer an age threshold (FLIP 5); it is only the ``<= 0`` kill switch for
+this lane, and nothing else reads it. This lane opens the PR from the worker's
+drafted title/body through the same ``_open_pr_for_orphaned_branch`` the
+dead-PID lane uses, without waiting for the PID to exit (the swole #163
 incident: a completed worker left its PR unopened ~2h because every
 finalize path keyed off PID death). Only the PR-open action applies to a
 live PID -- none of the dead-PID lanes (label reclaim, escalation,
@@ -27,25 +30,47 @@ in strict order:
    (the round-2 review finding: relaxing the early return to cover any live
    PID, not just a stale one, made the network fetch and lock fire on
    nearly every pass of an active fleet).
+
+   N4 (wf-review-opus.md): FLIP 5's "route immediately, ignore
+   ``worker_outcome_finalize_minutes``" change left no threshold to age a
+   candidate out of the set, so a live PID with a fresh, on-target,
+   declared-push outcome kept this function's result non-empty on every
+   pass until the PID exited -- defeating the early return. The fix is a
+   filesystem-only marker: once the lane has routed an outcome (PR opened,
+   PR already open, or PR create failed) ``finalize_live_handoff_candidates``
+   stamps ``entry["live_handoff_routed_outcome_at"]`` with that outcome
+   file's mtime, and this function skips an entry whose marker equals the
+   current mtime. A newer outcome write is a new fact and re-arms the lane.
+   A failed PR create is therefore not retried by this lane; the dead-PID
+   lane (#935) retries it once the PID exits.
 2. ``resolve_live_handoff_candidates`` -- run after ``gh.pr_list()`` (needed
    elsewhere in the sweep regardless, for the dead-PID lanes), to drop
    candidates a PR already exists for and attach the issue/label data the
    finalize step needs. Pre-lock, since it may call ``gh.issue_list()``.
 3. ``finalize_live_handoff_candidates`` -- the in-lock step: opens the PR
-   (or records a fingerprinted stranded-branch drift on failure) and
-   updates ``state``/``sweep_events`` in place.
+   (or records a fingerprinted stranded-branch drift on failure), stamps
+   the routed-outcome marker and updates ``state``/``sweep_events`` in place.
 """
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable
 
+from . import worker_fate
+from .blocked_worker_escalation import is_exempt_blocked
 from .config import WORKER_OUTCOME_FILENAME, OrchestratorConfig
 from .github import GitHubLike, label_names
 from .state import PASSIVE_OPEN_STATUS, utc_now
 from .worktree import read_worker_outcome, worktree_path_for_branch
+
+
+# N4: the entry field recording which outcome-file mtime (ISO) this lane has
+# already routed. Cleared with the dispatch epoch (``state.
+# clear_dead_worker_failure_kind``) and on operator re-arm
+# (``UNESCALATE_ISSUE_RESET_FIELDS``).
+ROUTED_OUTCOME_KEY = "live_handoff_routed_outcome_at"
 
 
 def partition_dispatched_by_pid_liveness(
@@ -89,6 +114,8 @@ def collect_stale_live_handoff_pids(
     repo_root: Path | None,
     worktrees_dir: Path | None,
     now: datetime,
+    sessions_dir: Path,
+    on_fate: Callable[[worker_fate.WorkerFate], None] | None = None,
 ) -> dict[int, dict[str, Any]]:
     """Filesystem-only pre-check: which live-PID entries look finalizable.
 
@@ -97,6 +124,12 @@ def collect_stale_live_handoff_pids(
     Does not consult ``pr_by_issue`` -- that requires ``gh.pr_list()``, which
     callers gate on this function's result being non-empty in the first
     place, so it cannot be a precondition here.
+
+    An entry whose ``live_handoff_routed_outcome_at`` marker equals the
+    current outcome file's mtime was already routed and is skipped (N4).
+    ``on_fate`` receives each resolved fate so the caller can report rule 1's
+    stale evidence (``worker_fate.report_stale_evidence``, B6) -- this
+    function is lock-free and emits nothing itself.
     """
     candidates: dict[int, dict[str, Any]] = {}
     if (
@@ -116,18 +149,100 @@ def collect_stale_live_handoff_pids(
             continue
         worktree_path = worktree_path_for_branch(repo_root, branch, worktrees_dir)
         try:
-            outcome_age = now - datetime.fromtimestamp(
+            outcome_mtime = datetime.fromtimestamp(
                 (worktree_path / WORKER_OUTCOME_FILENAME).stat().st_mtime, tz=UTC
             )
         except OSError:
             continue
-        if outcome_age <= timedelta(minutes=worker_outcome_finalize_minutes):
+        outcome_at = outcome_mtime.isoformat()
+        if live_entry.get(ROUTED_OUTCOME_KEY) == outcome_at:
             continue
+        outcome_age = now - outcome_mtime
         worker_outcome = read_worker_outcome(worktree_path)
-        if not (
-            isinstance(worker_outcome, dict)
-            and worker_outcome.get("push_succeeded") is True
-            and worker_outcome.get("pr_created") is False
+
+        # Obtain this worker's fate from the module (design doc §8, step B4):
+        # a live PID with no remote/PR data available at this pure-filesystem
+        # stage can only resolve to `Live` (row 5) -- `resolve_fate` cannot
+        # independently confirm a push without the `ls-remote`/`gh pr_list`
+        # this function deliberately avoids paying for on every pass (see the
+        # module docstring). The routing decision below stays on the
+        # self-reported claim the legacy code already trusted.
+        outcome_evidence = worker_fate.OutcomeEvidence(
+            source=worker_fate.EvidenceSource.WORKTREE,
+            written_at=outcome_mtime,
+            outcome=worker_outcome.get("outcome") if isinstance(worker_outcome, dict) else None,
+            push_succeeded=(
+                worker_outcome.get("push_succeeded") if isinstance(worker_outcome, dict) else None
+            ),
+            pr_created=(
+                worker_outcome.get("pr_created") if isinstance(worker_outcome, dict) else None
+            ),
+            head_sha=worker_outcome.get("head_sha") if isinstance(worker_outcome, dict) else None,
+            raw=worker_outcome if isinstance(worker_outcome, dict) else {},
+        )
+        fate = worker_fate.resolve_fate(
+            worker_fate.FateEvidence(
+                issue_number=issue_number,
+                adapter=live_entry.get("adapter") or "unknown",
+                dispatched_at=worker_fate.parse_iso_timestamp(live_entry.get("dispatched_at")),
+                pid_alive=True,
+                health=None,
+                terminal=None,
+                worktree_outcome=outcome_evidence,
+                branch=worker_fate.BranchEvidence(
+                    remote_head_sha=None,
+                    remote_ahead=None,
+                    unpushed=None,
+                    open_pr_number=None,
+                    pr_known=False,
+                ),
+                failure=None,
+            ),
+            now=now,
+        )
+        if on_fate is not None:
+            on_fate(fate)
+
+        # Rule 1: freshness is gated on `dispatched_at`/`head_sha`, not on
+        # outcome-age-vs-`now` -- a leftover outcome file from a prior
+        # dispatch of this branch is rejected once, by evidence, rather
+        # than by an elapsed-time proxy. `resolve_fate` itself can only
+        # ever return `Live` here (row 5): with no remote read at this
+        # pure-filesystem stage, `_is_pushed` can never confirm the push,
+        # so rows 2-4 (`PushedWithoutPr`/`Completed`) are unreachable from
+        # this call site's evidence shape. What we actually need is
+        # `resolve_fate`'s freshness *step* (rule 1), which survives onto
+        # `fate.basis.outcome`: the winning candidate if it passed the
+        # `dispatched_at`/`head_sha` check, else `None`. The routing
+        # decision below reads that rule-1-gated candidate's self-reported
+        # claim directly -- the legacy code trusted the same claim, just
+        # without the freshness gate in front of it.
+        # Rule 5: a live PID with a fresh declared-push claim routes
+        # immediately -- `worker_outcome_finalize_minutes` is only the
+        # `<= 0` kill switch checked above, never an age threshold.
+        #
+        # B9 (wf-review-opus.md): the legacy check required an EXPLICIT
+        # ``pr_created is False`` before routing. The worker-fate refactor
+        # loosened this to ``pr_created is not True``, which also admits
+        # ``None`` -- an outcome that omits ``pr_created`` entirely (an
+        # incomplete/ambiguous self-report) now gets finalized as if it had
+        # explicitly declared no PR was created. That widening was never
+        # one of the nine reviewed flips; restore the strict legacy gate.
+        fresh_outcome = fate.basis.outcome
+        if (
+            fresh_outcome is None
+            # Rule 2: a blocked declaration wins everywhere -- never finalize
+            # it as a handoff, whatever push flags ride along. Issue #2010: a
+            # headless permission-denial "blocked" is exempt (a worker-config
+            # defect, not a blocked task) and is routed as on origin/main.
+            or (
+                isinstance(fate, worker_fate.Blocked)
+                and not is_exempt_blocked(
+                    fate, sessions_dir=sessions_dir, issue_number=issue_number
+                )
+            )
+            or fresh_outcome.push_succeeded is not True
+            or fresh_outcome.pr_created is not False
         ):
             continue
         candidates[issue_number] = {
@@ -136,6 +251,7 @@ def collect_stale_live_handoff_pids(
             "worker_outcome": worker_outcome,
             "worker_pid": live_entry.get("worker_pid"),
             "outcome_age_minutes": outcome_age.total_seconds() / 60,
+            "outcome_at": outcome_at,
         }
     return candidates
 
@@ -147,8 +263,13 @@ def resolve_live_handoff_candidates(
     issues_by_number: dict[int, dict[str, Any]],
     gh: GitHubLike,
     config: OrchestratorConfig,
-) -> dict[int, dict[str, Any]]:
+) -> tuple[dict[int, dict[str, Any]], dict[int, dict[str, Any]]]:
     """Drop candidates a PR already exists for and attach issue/label data.
+
+    Returns ``(live_handoff_candidates, pr_already_open)``. The second map is
+    the candidates dropped because a PR already exists; the caller hands it to
+    ``finalize_live_handoff_candidates``, which stamps them as routed (N4) so
+    they are not re-collected on every pass.
 
     ``issues_by_number`` is shared with the caller's dead-PID lane and is
     mutated in place (populated via a single bulk ``gh.issue_list()`` call)
@@ -156,13 +277,18 @@ def resolve_live_handoff_candidates(
     it again.
     """
     live_handoff_candidates: dict[int, dict[str, Any]] = {}
+    pr_already_open = {
+        issue_number: candidate
+        for issue_number, candidate in stale_candidates.items()
+        if issue_number in pr_by_issue
+    }
     declared = {
         issue_number: candidate
         for issue_number, candidate in stale_candidates.items()
         if issue_number not in pr_by_issue
     }
     if not declared:
-        return live_handoff_candidates
+        return live_handoff_candidates, pr_already_open
 
     if not issues_by_number:
         for issue in gh.issue_list(state="open"):
@@ -180,7 +306,7 @@ def resolve_live_handoff_candidates(
         candidate["issue_labels"] = issue_labels
         candidate["active_labels"] = issue_labels & config.labels.active
         live_handoff_candidates[issue_number] = candidate
-    return live_handoff_candidates
+    return live_handoff_candidates, pr_already_open
 
 
 def finalize_live_handoff_candidates(
@@ -194,8 +320,15 @@ def finalize_live_handoff_candidates(
     pr_by_issue: dict[int, dict[str, Any]],
     sweep_events: list[tuple[str, dict[str, Any]]],
     drift_fingerprint: Callable[..., str],
+    pr_already_open: dict[int, dict[str, Any]] | None = None,
 ) -> None:
     """In-lock finalize: open the PR, or record a stranded-branch drift.
+
+    Every candidate handled here -- PR opened, PR create failed, or a PR
+    already open (``pr_already_open``, including one that appeared between
+    the pre-lock snapshot and this lock) -- is stamped with
+    ``live_handoff_routed_outcome_at`` so ``collect_stale_live_handoff_pids``
+    stops re-collecting it until a newer outcome is written (N4).
 
     Mutates ``state["issues"]`` and appends to ``sweep_events`` in place.
     Only the PR-open action runs here -- none of the dead-PID lanes (label
@@ -210,6 +343,14 @@ def finalize_live_handoff_candidates(
     # here, not at module level: workflow.py imports this module at import time.
     import charlie_work.workflow as _wf
 
+    def _stamp_routed(entry: dict[str, Any], candidate: dict[str, Any]) -> None:
+        entry[ROUTED_OUTCOME_KEY] = candidate["outcome_at"]
+
+    for issue_number, candidate in (pr_already_open or {}).items():
+        already = state["issues"].get(str(issue_number))
+        if isinstance(already, dict) and already.get("status") == "dispatched":
+            _stamp_routed(already, candidate)
+
     for issue_number in live_handoff_candidates:
         entry = state["issues"].get(str(issue_number), {})
         if not isinstance(entry, dict):
@@ -219,9 +360,11 @@ def finalize_live_handoff_candidates(
             continue
         # A PR may have appeared between the pre-lock snapshot and this
         # lock -- never open a duplicate.
-        if issue_number in pr_by_issue:
-            continue
         candidate = live_handoff_candidates[issue_number]
+        if issue_number in pr_by_issue:
+            _stamp_routed(entry, candidate)
+            state["issues"][str(issue_number)] = entry
+            continue
         # ``repo_root`` comes from ``getattr(gh, "repo_root", None)`` and is
         # not statically typed; narrow to ``Path | None`` before the salvage
         # helper (``None`` is an error value it already handles).
@@ -239,6 +382,7 @@ def finalize_live_handoff_candidates(
             state_file=state_file,
             worker_outcome=candidate["worker_outcome"],
         )
+        _stamp_routed(entry, candidate)
         if pr_number is not None:
             entry["status"] = PASSIVE_OPEN_STATUS
             entry["pr_number"] = pr_number
@@ -270,8 +414,9 @@ def finalize_live_handoff_candidates(
 
         # PR creation failed after the bounded retry -- the branch is pushed
         # and stranded. Same fingerprinted-drift pattern as the dead-PID
-        # lane: emit the drift event once per unchanged finding while the
-        # next pass re-attempts the create itself.
+        # lane. The outcome is stamped routed above, so this lane does not
+        # retry; the dead-PID lane (#935) re-attempts the create once the
+        # PID exits. The fingerprint still dedups the drift event.
         fingerprint = drift_fingerprint(
             reason="live_worker_handoff_pr_create_failed",
             branch_name=candidate["branch"],

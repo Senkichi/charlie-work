@@ -562,7 +562,7 @@ def test_classify_dead_sessions_api_provider_auth_classification(
     gh.prs = []
 
     before = datetime.now(UTC)
-    with patch("charlie_work.worker.is_worker_alive", return_value=False):
+    with patch("charlie_work.worker_fate.is_alive", return_value=False):
         reaped = _classify_dead_sessions_and_update_throttle_state(
             sessions_dir, state_file, gh, config, write_gate=_wg(state_file)
         )
@@ -621,7 +621,7 @@ def test_classify_dead_sessions_launch_failed_api_provider_auth(
     ]
     gh.prs = []
 
-    with patch("charlie_work.worker.is_worker_alive", return_value=False):
+    with patch("charlie_work.worker_fate.is_alive", return_value=False):
         reaped = _classify_dead_sessions_and_update_throttle_state(
             sessions_dir, state_file, gh, config, write_gate=_wg(state_file)
         )
