@@ -302,6 +302,7 @@ def handle_dead_worker_completed_outcome(
         issue_number=issue_number,
         live_head_sha=live_head_sha,
         dispatched_at=_wf._parse_iso_timestamp(entry.get("dispatched_at")),
+        pr_number=pr_number,
         on_fate=on_fate,
     )
     if outcome is None:

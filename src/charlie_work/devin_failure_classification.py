@@ -97,7 +97,7 @@ def get_rate_limit_defer_until(
     # in worker_fate (design doc §7), and a top-level import here would
     # cycle (worker_fate -> worker -> claude_code/devin_shell already
     # imports this module's sibling functions).
-    from .worker_fate import _throttle_emission_anchor
+    from .failure_classifier import _throttle_emission_anchor
 
     emitted_at = _throttle_emission_anchor(log_path, tail, now=now, throttle_markers=markers)
     defer_until = max(

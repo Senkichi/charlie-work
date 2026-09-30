@@ -137,3 +137,88 @@ def test_claude_code_plain_text_log_anchors_at_mtime(tmp_path: Path) -> None:
 
     assert failure_kind == "rate_limited"
     assert throttled_until == _iso(EMITTED + timedelta(minutes=30))
+
+
+# --- merged stderr (r3 B1) ------------------------------------------------
+# ``claude_code`` launches with ``stderr=STDOUT``, so the ``.log`` interleaves
+# the CLI's stream-json events with stderr prose; on this host most json-bearing
+# logs END with a non-JSON ``SessionEnd hook ... failed`` line. The log's shape
+# must be decided from the JSON lines anywhere in the tail, not the last line.
+
+HOOK_STDERR = (
+    "SessionEnd hook [pwsh session-end.ps1] failed: exit 1 at 2026-09-29T09:05:00+00:00\n"
+)
+
+
+def _with_trailing_stderr(tmp_path: Path, name: str, *, mtime: datetime) -> Path:
+    log_path = _copy_fixture(tmp_path, name, mtime=mtime)
+    with log_path.open("a", encoding="utf-8") as handle:
+        handle.write(HOOK_STDERR)
+    os.utime(log_path, (mtime.timestamp(), mtime.timestamp()))
+    return log_path
+
+
+def test_trailing_stderr_line_does_not_change_the_stream_json_anchor(tmp_path: Path) -> None:
+    # Same log as the real-shape test plus one trailing stderr line (which even
+    # carries a timestamp): must equal the clean-log answer, never the 09:40
+    # assistant turn nor the stderr line's 09:05.
+    clean = _copy_fixture(tmp_path, "claude_stream_json_throttle_real_shape.jsonl", mtime=EMITTED)
+    noisy_dir = tmp_path / "noisy"
+    noisy_dir.mkdir()
+    noisy = _with_trailing_stderr(
+        noisy_dir, "claude_stream_json_throttle_real_shape.jsonl", mtime=EMITTED
+    )
+
+    for kind in ("claude-code", "api"):
+        expected = worker_fate.classify_for(kind, clean, now=NOW)
+        assert expected == ("rate_limited", _iso(EMITTED + timedelta(minutes=30)))
+        assert worker_fate.classify_for(kind, noisy, now=NOW) == expected
+
+
+def test_trailing_stderr_keeps_a_quoted_timestamp_from_becoming_the_anchor(
+    tmp_path: Path,
+) -> None:
+    # The throttle event has no timestamp and a tool_result quotes 2026-01-01;
+    # a stderr line follows. Anchor is classification time, exactly as without
+    # the stderr line -- never the quoted instant (cooldown collapsed to 10:20).
+    log_path = _with_trailing_stderr(
+        tmp_path, "claude_stream_json_throttle_embedded_old_ts.jsonl", mtime=EMITTED
+    )
+
+    failure_kind, throttled_until = worker_fate.classify_for("claude-code", log_path, now=NOW)
+
+    assert failure_kind == "rate_limited"
+    assert throttled_until == _iso(NOW + timedelta(minutes=30))
+
+
+def test_stream_json_event_timestamp_wins_over_trailing_stderr(tmp_path: Path) -> None:
+    log_path = _with_trailing_stderr(
+        tmp_path,
+        "claude_stream_json_throttle_assistant_ts.jsonl",
+        mtime=NOW - timedelta(minutes=3),
+    )
+
+    _, throttled_until = worker_fate.classify_for("claude-code", log_path, now=NOW)
+
+    assert throttled_until == _iso(EMITTED + timedelta(minutes=30))
+
+
+def test_plain_text_reader_ignores_json_lines_and_truncated_fragments() -> None:
+    from charlie_work.failure_classifier import _is_stream_json, _tail_emission_timestamp
+
+    tail = (
+        '_cut","timestamp":"2026-01-01T00:00:00Z"}\n'  # first line cut by the byte slice
+        "Error: rate limit hit at 2026-09-29T10:00:00+00:00\n"
+        '{"type":"user","timestamp":"2026-09-29T09:59:00+00:00"}\n'
+        '{"type":"user","message":{"content":"2026-09-29T10:19:00+00:00 quoted"}\n'  # fragment
+    )
+
+    assert _is_stream_json(tail)  # a whole event line anywhere decides the shape
+    assert _tail_emission_timestamp(tail) == EMITTED
+
+
+def test_prose_with_a_json_looking_word_is_not_stream_json() -> None:
+    from charlie_work.failure_classifier import _is_stream_json
+
+    assert not _is_stream_json("plain prose\n{not json}\nmore prose\n")
+    assert not _is_stream_json('{"no_type": 1}\n')

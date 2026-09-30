@@ -396,14 +396,10 @@ def write_worker_terminal_status(
     pattern required by CLAUDE.md for every JSON state write so a reader (the
     orphan detector's polling pass) never observes a partially-written file.
 
-    ``worker_outcome_written_at`` (design doc §3, Group A step A1; B5,
-    wf-review-opus.md) is the outcome file's own mtime, additive alongside
-    ``worker_outcome`` -- ``ended_at`` is when the watcher observed the
-    process exit, not when the copied-in outcome file was actually written,
-    and a worktree reused across dispatches can still hold a previous
-    dispatch's leftover outcome file. Consumers must use this field as the
-    outcome's freshness anchor when present, and fall back to ``ended_at``
-    only for records written before this field existed.
+    ``worker_outcome_written_at`` is the outcome file's own mtime (B5):
+    ``ended_at`` is when the watcher saw the exit, not when a possibly
+    leftover outcome file was written. Consumers use it as the freshness
+    anchor when present and fall back to ``ended_at`` for older records.
     """
     payload: dict[str, Any] = {
         "pid": pid,
@@ -557,30 +553,14 @@ def start_terminal_status_watcher(
 
                 worker_outcome = read_worker_outcome(worktree_path)
                 if worker_outcome is not None:
-                    # B5 (wf-review-opus.md) / design doc §3, Group A step
-                    # A1: ``ended_at`` is when the watcher observed exit, not
-                    # when this outcome file was written -- a worktree reused
-                    # across dispatches can still hold a PREVIOUS dispatch's
-                    # outcome file if the new dispatch died before writing
-                    # its own, and nothing deletes the file at dispatch time.
-                    # Stamping that leftover with a fresh ``ended_at`` made
-                    # rule 1's freshness gate (``written_at > dispatched_at``)
-                    # pass on stale evidence -- the file's own mtime is the
-                    # only honest answer to "when was this written", so
-                    # capture it here, additively, alongside ``ended_at``.
-                    # ``None`` (missing file between the read above and this
-                    # stat, or an OS error) falls back to ``ended_at`` at the
-                    # consumer per the design doc's stated rollout-window
-                    # behaviour -- best-effort telemetry, not a hard failure.
+                    # B5: the file's mtime, not ``ended_at``, is when it was
+                    # written; ``None`` on OS error (consumer falls back).
                     try:
-                        outcome_mtime = (worktree_path / WORKER_OUTCOME_FILENAME).stat().st_mtime
-                        worker_outcome_written_at = (
-                            datetime.fromtimestamp(outcome_mtime, tz=UTC)
-                            .isoformat()
-                            .replace("+00:00", "Z")
-                        )
+                        mtime = (worktree_path / WORKER_OUTCOME_FILENAME).stat().st_mtime
+                        written = datetime.fromtimestamp(mtime, tz=UTC)
+                        worker_outcome_written_at = written.isoformat().replace("+00:00", "Z")
                     except OSError:
-                        worker_outcome_written_at = None
+                        pass
             write_worker_terminal_status(
                 path,
                 pid=pid,

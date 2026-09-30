@@ -3262,13 +3262,9 @@ def apply_fixes(
             # orphan-redispatch cap. Never invents an issue entry — an
             # untracked session has no orphan-sweep bookkeeping to exempt.
             #
-            # Written through ``worker_fate.persist_failure`` (the single
-            # write primitive) with ``throttled_until=None``: the throttle
-            # window keeps its own ``provider_throttle_detected`` item above.
-            # ``persist_failure`` returns a fresh ``issues`` mapping, so only
-            # the stamped entry is folded back into ``new_issues`` -- keeping
-            # ``new_state["issues"]`` and ``new_issues`` the same object for
-            # the items applied after this one.
+            # Written through ``worker_fate.persist_failure`` (single write
+            # primitive, ``throttled_until=None``: the window has its own item
+            # above); only the stamped entry is folded back into ``new_issues``.
             if item.issue_number is not None and item.failure_kind is not None:
                 issue_key = str(item.issue_number)
                 persisted = worker_fate.persist_failure(

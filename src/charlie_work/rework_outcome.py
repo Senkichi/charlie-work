@@ -195,6 +195,7 @@ def fresh_completed_worker_outcome(
     issue_number: int,
     live_head_sha: str | None,
     dispatched_at: datetime | None,
+    pr_number: int | None = None,
     on_fate: Callable[[worker_fate.WorkerFate], None] | None = None,
 ) -> dict[str, Any] | None:
     """Return a worktree ``.worker-outcome.json`` that proves a dead worker
@@ -223,17 +224,12 @@ def fresh_completed_worker_outcome(
     Obtains this pick from the module (design doc §8, step B1, A12): rule
     1's freshness gate (``written_at > dispatched_at``) and rule 7's
     head-match replace the two literal checks this function used to run by
-    hand. No ``pr_by_issue`` is threaded through here (the design note
-    limits this wiring to the caller's ``live_head_sha``/``dispatched_at``),
-    so ``resolve_fate`` can never prove ``Completed``/``PushedWithoutPr`` at
-    this call site (both require ``branch.pr_known``) and always falls
-    through to ``Crashed`` instead -- the module's own comment at that row
-    already says "pr_created claim ignored" (FLIP 8: rule 8 never reads
-    ``pr_created`` to decide, matching this function's own legacy contract,
-    which never checked it either -- ``pr_created: true`` is still accepted
-    below, unchanged). What still gates the return is ``fate.basis.outcome``
-    surviving the freshness step with a confirmed push and a head match --
-    the exact two checks this function ran directly before.
+    hand. The caller passes the open PR it is sweeping as ``pr_number``
+    (``None`` when it has none): a confirmed push then resolves to ``Completed`` (rule 8 never reads
+    ``pr_created`` -- ``pr_created: true`` is still accepted below,
+    unchanged). What gates the return is ``fate.basis.outcome`` surviving
+    the freshness step with a confirmed push and a head match -- the exact
+    two checks this function ran directly before.
     """
     if worktree_path is None or not live_head_sha or dispatched_at is None:
         return None
@@ -264,8 +260,8 @@ def fresh_completed_worker_outcome(
                 remote_head_sha=live_head_sha,
                 remote_ahead=None,
                 unpushed=None,
-                open_pr_number=None,
-                pr_known=False,
+                open_pr_number=pr_number,
+                pr_known=pr_number is not None,
             ),
             failure=None,
         ),
@@ -290,6 +286,7 @@ def blocked_worker_outcome(
     *,
     issue_number: int,
     dispatched_at: datetime | None,
+    pr_number: int | None = None,
     on_fate: Callable[[worker_fate.WorkerFate], None] | None = None,
     sessions_dir: Path | None = None,
 ) -> dict[str, Any] | None:
@@ -376,8 +373,8 @@ def blocked_worker_outcome(
                 remote_head_sha=None,
                 remote_ahead=None,
                 unpushed=None,
-                open_pr_number=None,
-                pr_known=False,
+                open_pr_number=pr_number,
+                pr_known=pr_number is not None,
             ),
             failure=None,
         ),

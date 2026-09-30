@@ -43,6 +43,7 @@ def dead_worker_blocked_outcome(
         worktree_path,
         issue_number=issue_number,
         dispatched_at=_wf._parse_iso_timestamp(entry.get("dispatched_at")),
+        pr_number=pr_data.get("number") if isinstance(pr_data.get("number"), int) else None,
         on_fate=on_fate,
         sessions_dir=sessions_dir,
     )

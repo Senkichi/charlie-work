@@ -499,6 +499,31 @@ def test_fresh_completed_outcome_is_returned(tmp_path: Path) -> None:
     assert result["push_succeeded"] is True
 
 
+def test_open_pr_number_makes_the_fate_completed(tmp_path: Path) -> None:
+    """r3 N-a: ``Completed`` is only reachable when the caller threads the open
+    PR it is sweeping; with no PR number the same outcome cannot prove it."""
+    from charlie_work import worker_fate
+
+    worktrees_dir, dispatched_at = _fresh_outcome_bed(tmp_path)
+    worktree_path = _write_worktree_outcome(tmp_path, worktrees_dir, BRANCH, _outcome())
+    fates: dict[str, worker_fate.WorkerFate] = {}
+
+    for label, pr_number in (("with_pr", 77), ("no_pr", None)):
+        result = fresh_completed_worker_outcome(
+            worktree_path,
+            issue_number=1,
+            live_head_sha=HEAD_SHA,
+            dispatched_at=dispatched_at,
+            pr_number=pr_number,
+            on_fate=lambda fate, label=label: fates.__setitem__(label, fate),
+        )
+        assert result is not None and result["head_sha"] == HEAD_SHA
+
+    assert isinstance(fates["with_pr"], worker_fate.Completed)
+    assert fates["with_pr"].pr_number == 77
+    assert not isinstance(fates["no_pr"], worker_fate.Completed)
+
+
 def test_stale_outcome_is_not_completed(tmp_path: Path) -> None:
     """An outcome older than the dispatch belongs to a previous session."""
     worktrees_dir, dispatched_at = _fresh_outcome_bed(tmp_path)

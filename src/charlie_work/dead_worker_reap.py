@@ -765,7 +765,7 @@ def _detect_and_handle_stalled_sessions(
             # or ``update_worker_record_with_failure_classification``
             # (claude-code, api -- the api sidecar suffix and account-error
             # detection are bound in at registry-build time, see
-            # ``worker_fate._build_profiles``). Log-tail classification runs
+            # ``adapter_fate_profile._build_profiles``). Log-tail classification runs
             # first, falling back to failure_kind "stalled" only when the
             # log shows no provider throttle signature. An unrecognized
             # ``adapter_kind`` (``profile is None``) or a profile with no

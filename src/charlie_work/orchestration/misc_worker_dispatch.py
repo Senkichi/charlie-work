@@ -32,6 +32,7 @@ from charlie_work.dead_worker_reap import _emit_session_failed_relabeled
 from charlie_work.fleet_registry import try_acquire_fleet_lock
 from charlie_work.worker_launch_gate import WorkerLaunchDeferral, acquire_fleet_launch_lock
 from charlie_work.github import label_names
+from charlie_work.salvage_events import repeats_last_salvage_failure
 from charlie_work.state import StateLockBusy
 from charlie_work.worker import iter_workers
 from charlie_work.foreign_worktree import OPERATOR_MARKER_KIND, read_worktree_marker
@@ -456,29 +457,10 @@ def _salvage_stranded_before_clear(
         # N3: the de-escalation sweep re-runs this every interval for a
         # persistently unsalvageable branch; record a failure only when it
         # differs from the newest failure already logged for this issue.
-        if mode is not None or not _repeats_last_salvage_failure(fresh, payload):
+        if mode is not None or not repeats_last_salvage_failure(fresh, payload):
             fresh = self._record_event(fresh, kind, payload)
             self.write_gate.save_state(fresh)
     return mode
-
-
-def _repeats_last_salvage_failure(state: dict[str, Any], payload: dict[str, Any]) -> bool:
-    """True when the newest ``worktree_unsafe_stranded_salvage_failed`` event
-    for this issue already carries the same branch and skip reason. Derived
-    from the event ring itself, so there is no marker to go stale."""
-    for event in reversed(state.get("events", [])):
-        if not isinstance(event, dict):
-            continue
-        prior = event.get("payload")
-        if not isinstance(prior, dict) or prior.get("issue_number") != payload["issue_number"]:
-            continue
-        if event.get("kind") == "worktree_unsafe_stranded_salvaged":
-            return False
-        if event.get("kind") == "worktree_unsafe_stranded_salvage_failed":
-            return prior.get("branch") == payload["branch"] and prior.get(
-                "skip_reason"
-            ) == payload.get("skip_reason")
-    return False
 
 
 @records_deferral("dispatch_rework")
