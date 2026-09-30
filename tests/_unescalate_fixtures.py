@@ -53,3 +53,54 @@ def _dry_run_app(tmp_path: Path) -> OrchestratorApp:
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
     return OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=True)
+
+
+def _stranded_worktree_bed(
+    tmp_path: Path, branch: str, *, origin: bool = True
+) -> tuple[OrchestratorApp, Path, Path, Path | None]:
+    """Repo + layout-path worktree holding ONE committed, never-pushed commit.
+
+    Rule 3 (Worker fate) fixture: no worker-authored dirt, so
+    ``_worktree_refuse_to_reset_reason`` returns the
+    ``WORKTREE_UNSAFE_KIND_LOCAL_COMMITS`` reason. ``origin=True`` clones a
+    bare remote (the branch does not exist on it yet); ``origin=False`` is a
+    plain no-remote repo. Returns ``(app, repo_root, worktree_path, remote)``.
+    """
+    import pytest
+    from _worktree_fixtures import _git, _init_bare_remote_and_clone, _init_repo
+
+    from charlie_work.worktree import worktree_path_for_branch
+
+    remote: Path | None = None
+    if origin:
+        remote, repo = _init_bare_remote_and_clone(tmp_path)
+    else:
+        repo = tmp_path / "repo"
+        _init_repo(repo)
+    app = _app(repo)
+    wt_path = worktree_path_for_branch(repo, branch, app._layout.worktrees)
+    # git builds the child worktree's .git path in a fixed-size buffer; a
+    # deeply nested basetemp overflows it with no test-side remedy.
+    if len(str(wt_path / ".git")) > 240:
+        pytest.skip(f"worktree target path too deep for git's internal buffers: {wt_path}")
+    wt_path.parent.mkdir(parents=True, exist_ok=True)
+    _git(repo, "worktree", "add", str(wt_path), "-b", branch)
+    _git(wt_path, "config", "user.email", "test@example.test")
+    _git(wt_path, "config", "user.name", "Test User")
+    (wt_path / "work.txt").write_text("stranded work\n", encoding="utf-8")
+    _git(wt_path, "add", "work.txt")
+    _git(wt_path, "commit", "-m", "stranded local-only commit")
+    return app, repo, wt_path, remote
+
+
+def _stranded_state(branch: str, *, reason: str = "worktree_unsafe_local_commits") -> dict:
+    return {
+        "issues": {
+            "123": {
+                "number": 123,
+                "status": "escalated",
+                "escalation_reason": reason,
+                "branch_name": branch,
+            }
+        }
+    }

@@ -1916,15 +1916,16 @@ class WatchdogConfig:
     # ``push_succeeded: true`` / ``pr_created: false`` has finished the
     # handoff contract -- the orchestrator is meant to open the PR from the
     # file the moment the session ends, and the file's own contract tells the
-    # worker to stop after writing it. When the outcome file has been sitting
-    # for this many minutes while the recorded ``worker_pid`` is still alive,
-    # ``_detect_and_handle_orphaned_workers`` treats the worker as hung on
-    # exit and opens the PR from the drafted ``pr_title``/``pr_body`` without
-    # waiting for the PID to die (the stall watchdog reaps the process itself
-    # on its own cadence). Without this, a worker whose process fails to exit
-    # leaves the pushed branch and its drafted PR stranded for as long as the
-    # PID lingers (the swole #163 incident: PR unopened ~2h). 0 disables the
-    # PID-independent finalize.
+    # worker to stop after writing it. While the recorded ``worker_pid`` is
+    # still alive, ``_detect_and_handle_orphaned_workers`` treats a fresh,
+    # on-target, declared-push outcome as a worker hung on exit and opens the
+    # PR from the drafted ``pr_title``/``pr_body`` without waiting for the PID
+    # to die. Since FLIP 5 this is a KILL SWITCH, not an age threshold: any
+    # value > 0 enables the lane and the magnitude is ignored (the outcome
+    # routes immediately, there is no grace window); 0 disables the
+    # PID-independent finalize. Without the lane a worker whose process fails
+    # to exit leaves the pushed branch and its drafted PR stranded for as long
+    # as the PID lingers (the swole #163 incident: PR unopened ~2h).
     worker_outcome_finalize_minutes: int = 15
 
 

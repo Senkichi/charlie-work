@@ -31,11 +31,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from charlie_work.process_utils import is_pid_alive, parse_proc_stat_starttime, popen_worker
+from charlie_work.process_utils import parse_proc_stat_starttime, popen_worker
 from .claude_code import _events_path, _rotate_old_log
 from .config import OrchestratorConfig
 from .devin_failure_classification import (  # noqa: F401 (deliberate re-export; #1442 extraction keeps devin_shell under its mark)
-    _classify_session_failure,
     get_rate_limit_defer_until,
 )
 from .env_sanitize import resolve_pytest_cap, resolve_uv_no_sync, sanitize_env
@@ -849,27 +848,6 @@ def _get_process_start_time(pid: int) -> float | None:
             return None
 
 
-def is_session_alive(record: SessionRecord) -> bool:
-    """Check whether the process behind ``record`` is still running.
-
-    Delegates to ``charlie_work.process_utils.is_pid_alive`` so liveness
-    semantics are enforced in a single place.  This avoids a hard `psutil`
-    dependency and the slow `tasklist` subprocess round trip.
-
-    Process identity is verified by checking that the current process start time
-    matches the recorded start time (captured at spawn).  A start-time probe
-    that returns ``None`` is treated as indeterminate and returns ``True`` rather
-    than reaping a potentially-live worker on a transient probe failure
-    (issue #360 criterion #1 / issue #343).
-
-    Legacy records without ``process_start_time`` fall back to pid-only liveness
-    (vulnerable to recycling but preserves backward compatibility).
-    """
-    if record.pid is None or record.pid <= 0:
-        return False
-    return is_pid_alive(record.pid, record.process_start_time)
-
-
 def update_session_record_with_failure_classification(
     sessions_dir: Path,
     issue_number: int,
@@ -884,7 +862,7 @@ def update_session_record_with_failure_classification(
     This reads the existing sidecar, classifies the failure from the log tail,
     and writes back an updated record with failure_kind set.
 
-    Log-tail classification (``_classify_session_failure``) always runs first.
+    Log-tail classification (``worker_fate.classify_for``) always runs first.
     If it detects a provider throttle signature (``rate_limited`` /
     ``quota_exhausted``), that classification wins — including its computed
     ``throttled_until`` cooldown — regardless of ``fallback_kind``. Only when
@@ -909,7 +887,7 @@ def update_session_record_with_failure_classification(
     ``runtime.throttle_error_markers``, ``runtime.quota_error_markers``, and
     ``runtime.throttle_resume_margin_s`` are used instead of the defaults.
 
-    ``now`` is forwarded to ``_classify_session_failure`` (issue #822's
+    ``now`` is forwarded to ``worker_fate.classify_for`` (issue #822's
     injectable clock); defaults to ``datetime.now(UTC)`` there when omitted.
 
     Returns a tuple of (failure_kind, throttled_until_iso) for the caller to
@@ -945,7 +923,11 @@ def update_session_record_with_failure_classification(
             throttle_markers = None
             quota_markers = None
             resume_margin_seconds = 0
-        classified_kind, throttled_until = _classify_session_failure(
+        # Lazy: worker_fate reaches back into this module (profile table).
+        from . import worker_fate
+
+        classified_kind, throttled_until = worker_fate.classify_for(
+            "devin",
             Path(log_path_str),
             throttle_markers,
             quota_error_markers=quota_markers,
@@ -968,7 +950,6 @@ __all__ = [
     "launch_devin_session",
     "read_session_records",
     "probe_devin",
-    "is_session_alive",
     "update_session_record_with_failure_classification",
     "get_rate_limit_defer_until",
     "_get_process_start_time",

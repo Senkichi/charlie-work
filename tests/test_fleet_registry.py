@@ -257,7 +257,7 @@ def test_count_fleet_live_sessions_respects_devin_sessions_dir_override(
     }
     fleet_json.write_text(json.dumps(registry_data), encoding="utf-8")
     monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", str(fleet_dir))
-    monkeypatch.setattr("charlie_work.worker.is_session_alive", lambda _record: True)
+    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: True)
 
     live_count, skipped_repos = count_fleet_live_sessions(None)
 
@@ -328,7 +328,7 @@ def test_count_fleet_live_sessions_respects_global_devin_sessions_dir_override(
     }
     fleet_json.write_text(json.dumps(registry_data), encoding="utf-8")
     monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", str(fleet_dir))
-    monkeypatch.setattr("charlie_work.worker.is_session_alive", lambda _record: True)
+    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: True)
 
     live_count, skipped_repos = count_fleet_live_sessions(None)
 

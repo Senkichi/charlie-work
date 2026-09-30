@@ -387,6 +387,7 @@ def write_worker_terminal_status(
     ended_at: str,
     duration_seconds: float,
     worker_outcome: dict[str, Any] | None = None,
+    worker_outcome_written_at: str | None = None,
 ) -> None:
     """Atomically persist a worker process's terminal status (issue #773).
 
@@ -394,6 +395,11 @@ def write_worker_terminal_status(
     loop observes the process has exited. Uses the tmp-file + ``replace()``
     pattern required by CLAUDE.md for every JSON state write so a reader (the
     orphan detector's polling pass) never observes a partially-written file.
+
+    ``worker_outcome_written_at`` is the outcome file's own mtime (B5):
+    ``ended_at`` is when the watcher saw the exit, not when a possibly
+    leftover outcome file was written. Consumers use it as the freshness
+    anchor when present and fall back to ``ended_at`` for older records.
     """
     payload: dict[str, Any] = {
         "pid": pid,
@@ -404,6 +410,8 @@ def write_worker_terminal_status(
     }
     if worker_outcome is not None:
         payload["worker_outcome"] = worker_outcome
+    if worker_outcome_written_at is not None:
+        payload["worker_outcome_written_at"] = worker_outcome_written_at
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_suffix(path.suffix + ".tmp")
     tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -536,12 +544,23 @@ def start_terminal_status_watcher(
         ended_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
         try:
             worker_outcome = None
+            worker_outcome_written_at = None
             if worktree_path is not None:
                 # Local import to avoid a circular import: worktree.py already
                 # imports is_pid_alive from this module (issue #935).
+                from .config import WORKER_OUTCOME_FILENAME
                 from .worktree import read_worker_outcome
 
                 worker_outcome = read_worker_outcome(worktree_path)
+                if worker_outcome is not None:
+                    # B5: the file's mtime, not ``ended_at``, is when it was
+                    # written; ``None`` on OS error (consumer falls back).
+                    try:
+                        mtime = (worktree_path / WORKER_OUTCOME_FILENAME).stat().st_mtime
+                        written = datetime.fromtimestamp(mtime, tz=UTC)
+                        worker_outcome_written_at = written.isoformat().replace("+00:00", "Z")
+                    except OSError:
+                        pass
             write_worker_terminal_status(
                 path,
                 pid=pid,
@@ -549,6 +568,7 @@ def start_terminal_status_watcher(
                 started_at=started_at,
                 ended_at=ended_at,
                 duration_seconds=duration_seconds,
+                worker_outcome_written_at=worker_outcome_written_at,
                 worker_outcome=worker_outcome,
             )
         except Exception:

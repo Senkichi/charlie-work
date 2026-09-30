@@ -26,12 +26,9 @@ from _devin_shell_fixtures import (
 )
 from _worker_marker_wait import read_worker_marker
 
-from charlie_work import devin_shell
+from charlie_work import devin_shell, worker_fate
 from charlie_work.config import DevinConfig, OrchestratorConfig
-from charlie_work.devin_shell import (
-    is_session_alive,
-    launch_devin_session,
-)
+from charlie_work.devin_shell import launch_devin_session
 from charlie_work.worktree import (
     create_worktree,
     is_junction,
@@ -495,7 +492,7 @@ def test_devin_shell_reuse_unlinks_shared_venv_junction_and_isolates_imports(
     log_path = Path(record.log_path)
     while time.time() < deadline:
         log_text = log_path.read_text(encoding="utf-8")
-        if log_text.strip() and not is_session_alive(record):
+        if log_text.strip() and not worker_fate.is_alive(record.pid, record.process_start_time):
             break
         time.sleep(0.05)
 

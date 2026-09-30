@@ -1,6 +1,6 @@
 """Shared provider-throttle tail-matching helper.
 
-``_classify_session_failure`` (``devin_shell.py`` + ``claude_code.py``) and
+``worker_fate.classify_for`` and
 ``get_rate_limit_defer_until`` (``devin_shell.py``, issue #247) each answer
 the same question — "does this log tail contain a provider-throttle
 signature, and if so, when does the cooldown end?" — against the same
@@ -47,9 +47,16 @@ from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-# "resets in N minutes" / "reset in N minutes" — extracts a specific
-# provider-reported cooldown duration when present in the log tail.
-_RESETS_IN_PATTERN = re.compile(r"resets? in (\d+) minutes?", re.IGNORECASE)
+# "resets in N minutes" / "reset in N hours M minutes" — extracts a specific
+# provider-reported cooldown duration when present in the log tail. Either
+# the hours part or the minutes part may be absent (issue #2042: the Devin
+# SWE 2 free-model notice reads "Your limit will reset in 4 hours 8
+# minutes."). Both groups are optional, so ``_parse_reset_in_minutes``
+# skips matches that captured neither (e.g. "reset in 5 seconds").
+_RESETS_IN_PATTERN = re.compile(
+    r"resets? in\s+(?:(\d+)\s*(?:hours?|hrs?)\b)?[\s,]*(?:and\s+)?(?:(\d+)\s*(?:minutes?|mins?)\b)?",
+    re.IGNORECASE,
+)
 
 # "resets H:MMam/pm (IANA zone)" — Claude Code's session-limit notice names
 # a specific clock time and the IANA timezone it resets in (observed
@@ -77,8 +84,22 @@ _RESOURCE_EXHAUSTED_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# Provider authentication failures (issue #484). N3 (wf-review-opus.md,
+# wf-8-review-fixes): this pattern used to be hand-duplicated verbatim in
+# both ``claude_code.py`` and ``worker_fate.py`` (the latter's own comment
+# said "moved verbatim from claude_code.py"), a byte-for-byte copy that
+# could silently drift the way ``_RATE_LIMIT_PATTERN`` once did (see this
+# module's docstring). Word-boundary 401/403 so a coincidental numeric
+# substring like "issue #4019" cannot trip a false cooldown.
+_PROVIDER_AUTH_PATTERN = re.compile(
+    r"\b401\b|\b403\b|authentication(?:\s+failed)?|unauthorized|"
+    r"invalid[-\s]?api[-\s]?key|invalid[-\s]?authentication|"
+    r"permission_denied|auth(?:entication)?\s+error",
+    re.IGNORECASE,
+)
+
 # The ``failure_kind`` values that represent a provider-side throttle
-# condition — the kinds for which ``_classify_session_failure`` arms
+# condition — the kinds for which ``worker_fate.classify_for`` arms
 # ``throttled_until``. Cap accounting uses this set so a zero-turn death
 # caused by a global provider condition (quota wall, rate limit, dead
 # API key) is never charged against the issue's redispatch/rework caps
@@ -109,22 +130,63 @@ def is_provider_throttle_failure(failure_kind: str | None) -> bool:
     return failure_kind in PROVIDER_THROTTLE_FAILURE_KINDS
 
 
+def _parse_reset_in_minutes(tail: str) -> int | None:
+    """Total minutes of the first "reset(s) in [N hours] [M minutes]" clause."""
+    for match in _RESETS_IN_PATTERN.finditer(tail):
+        hours, minutes = match.group(1), match.group(2)
+        if hours is None and minutes is None:
+            continue
+        return int(hours or 0) * 60 + int(minutes or 0)
+    return None
+
+
+def is_provider_auth_failure(tail: str) -> bool:
+    """True when ``tail`` carries a provider authentication-failure signature.
+
+    Single point of enforcement (N3, wf-review-opus.md): both
+    ``claude_code.py``'s quota-probe classifier and ``worker_fate.py``'s
+    rule-6 tail classifier call this instead of each matching their own
+    compiled copy of ``_PROVIDER_AUTH_PATTERN``.
+    """
+    return _PROVIDER_AUTH_PATTERN.search(tail) is not None
+
+
+# Headless permission-denial signature (issue #2010): a ``claude -p`` session
+# that cannot answer a permission prompt ends by asking the operator to
+# approve command execution. That is a config defect, not a blocked task, so
+# it gets its own failure kind (``permission_denied``) instead of escalating.
+# Lives here (a leaf module) so both ``claude_code`` and ``worker_fate`` can
+# import it without an import cycle; originally added in claude_code.py.
+PERMISSION_DENIED_FAILURE_KIND = "permission_denied"
+_HEADLESS_PERMISSION_DENIAL_PATTERN = re.compile(
+    r"approve\s+(?:the\s+)?(?:command|bash|tool)\s+execution|"
+    r"requires?\s+(?:your\s+)?approval|"
+    r"(?:command|tool)\s+(?:was|were)\s+(?:denied|not\s+allowed)|"
+    r"permission\s+to\s+run\s+(?:this|these|the)\s+(?:command|bash)",
+    re.IGNORECASE,
+)
+
+
+def is_headless_permission_denial(text: str) -> bool:
+    """True when ``text`` (a log tail or outcome detail) shows the headless
+    permission-denial signature."""
+    return bool(_HEADLESS_PERMISSION_DENIAL_PATTERN.search(text))
+
+
 def match_throttle_tail(tail: str, markers: Sequence[str]) -> tuple[bool, int | None]:
     """Match ``tail`` against ``markers`` (case-insensitive substrings).
 
     Returns ``(matched, reset_minutes)``:
     - ``matched`` is True when any marker is found in ``tail``.
-    - ``reset_minutes`` is the parsed "resets in N minutes" value when the
-      tail matched and included one, else None (callers apply their own
+    - ``reset_minutes`` is the parsed "resets in [N hours] [M minutes]" total
+      (in minutes) when the tail matched and included one, else None (callers apply their own
       default cooldown in that case). Always None when ``matched`` is False.
     """
     tail_lower = tail.lower()
     matched = any(marker.lower() in tail_lower for marker in markers)
     if not matched:
         return False, None
-    reset_match = _RESETS_IN_PATTERN.search(tail)
-    reset_minutes = int(reset_match.group(1)) if reset_match else None
-    return True, reset_minutes
+    return True, _parse_reset_in_minutes(tail)
 
 
 def match_quota_tail(tail: str, markers: Sequence[str]) -> bool:
@@ -201,6 +263,7 @@ def parse_reset_clock_time(tail: str, now: datetime) -> datetime | None:
 
 __all__ = [
     "PROVIDER_THROTTLE_FAILURE_KINDS",
+    "is_provider_auth_failure",
     "is_provider_throttle_failure",
     "match_quota_tail",
     "match_throttle_tail",

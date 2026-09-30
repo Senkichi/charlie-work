@@ -71,7 +71,7 @@ def test_log_extracted_verdict_persists_verdict_source_in_decision_file(
     _make_dead_review_sidecar(reviews_dir, 100, verdict_log)
     _set_review_dispatched_state(app, 100, 10, "2026-07-06T12:00:00Z")
 
-    monkeypatch.setattr("charlie_work.claude_code.is_worker_alive", lambda *_: False)
+    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: False)
 
     result = app._reap_review_verdicts(reviews_dir)
 
@@ -133,7 +133,7 @@ def test_review_pending_reset_keeps_file_and_state_in_agreement_after_log_verdic
     _make_dead_review_sidecar(reviews_dir, 100, verdict_log)
     _set_review_dispatched_state(app, 100, 10, "2026-07-06T12:00:00Z")
 
-    monkeypatch.setattr("charlie_work.claude_code.is_worker_alive", lambda *_: False)
+    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: False)
 
     # Step 1: reap the log-extracted verdict -- both stores agree on "approved".
     app._reap_review_verdicts(reviews_dir)
