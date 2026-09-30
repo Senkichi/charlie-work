@@ -413,7 +413,15 @@ global budget via `fleet.global_max_concurrent_sessions`. The registry
 global config layer (`global_config.py`) merges fleet-wide defaults with
 per-repo overrides. The governor `_apply_concurrency_governor()` in
 `workflow.py` applies both the per-repo `dispatch.max_concurrent_sessions` cap
-and the fleet-global cap at every dispatch path. Fleet-level commands
+and the fleet-global cap at every dispatch path. Reviewers have their own
+fleet-global budget, `fleet.global_max_concurrent_reviews` (issue #2084):
+`fleet_registry.count_fleet_live_reviews()` counts live reviewers across every
+registered repo's `reviews_dir` with the same liveness rule as the per-repo
+`review_dispatch.max_concurrent_reviews`, and `review_fleet_gate.py` clamps
+review dispatch (remote `dispatch_reviews` and the no-remote local review path)
+to `min(per-repo capacity, fleet_max - fleet_live)` under the same fleet launch
+lock, deferring with `fleet_lock_held` (`dispatch_deferred` / `dispatch_starved`
+events, lane `dispatch_reviews`) when the lock is held. Fleet-level commands
 (`charlie fleet status`) aggregate status across all registered repos by
 iterating over the registry and calling `OrchestratorApp.status()` per repo
 with `dry_run=True`.

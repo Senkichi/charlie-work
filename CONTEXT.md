@@ -116,6 +116,9 @@ A snapshot of the diff, checks, and metadata that a reviewer judges a PR against
 **Reviewer**:
 A worker launched in the review role, not the coding role.
 
+**Reviewer cap**:
+The fleet-wide limit on live reviewers (`fleet.global_max_concurrent_reviews`), counted across every registered repo and enforced under the fleet launch lock. It is separate from the worker budget (`fleet.global_max_concurrent_sessions`) and stacks on the per-repo `review_dispatch.max_concurrent_reviews`. `0` disables it.
+
 **Verdict**:
 The result of reviewing one PR head: approved, request changes, or blocked. The recorded verdict is what authorizes a merge.
 _Avoid_: Decision, outcome
