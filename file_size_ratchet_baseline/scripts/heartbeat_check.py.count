@@ -1,4 +1,4 @@
-3000
+2800
 # Architecture-deepening plan, candidate 3 ("markdown structure"): +~100
 # lines for `_scan_markdown_structure`, the stdlib-only CommonMark
 # block-structure scanner duplicated from `charlie_work.markdown_fence.scan`

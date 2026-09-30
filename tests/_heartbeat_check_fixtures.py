@@ -116,13 +116,35 @@ def _stale_mention_gh_dispatch(
     *,
     open_numbers: list[int],
     merged_prs: list[dict[str, Any]],
+    open_labels: dict[int, list[str]] | None = None,
     captured: list[list[str]] | None = None,
 ) -> None:
+    """Fake the two `gh ... list` calls ``check_stale_open_issue_mentions`` makes.
+
+    ``open_labels`` maps issue number -> label names for issues that should
+    carry labels (issue #2048's parked/active-label exclusion); issues not
+    in the map -- like the real #817/#866 -- return an empty ``labels`` list.
+    ``merged_prs`` entries are passed through verbatim, so a test that cares
+    about exclusion 3 sets ``author`` itself (``{"login": "dependabot[bot]"}``,
+    ``{"login": "..."}``, or omitted for the no-author shape).
+    """
+
     def handler(args: list[str], cwd: Path) -> tuple[bool, Any, str]:
         if captured is not None:
             captured.append(list(args))
         if args[:2] == ["issue", "list"]:
-            return True, [{"number": n} for n in open_numbers], ""
+            labels_map = open_labels or {}
+            return (
+                True,
+                [
+                    {
+                        "number": n,
+                        "labels": [{"name": name} for name in labels_map.get(n, [])],
+                    }
+                    for n in open_numbers
+                ],
+                "",
+            )
         if args[:2] == ["pr", "list"]:
             return True, merged_prs, ""
         raise AssertionError(f"unexpected gh call in check_stale_open_issue_mentions: {args}")
