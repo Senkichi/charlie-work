@@ -939,11 +939,7 @@ def _local_dispatch_reviewers(self, *, now: Any = None, launch_lock: Any = None)
         except (OSError, GitHubError, ValueError) as exc:
             failed.append({"pr": pr_number, "error": f"{type(exc).__name__}: {exc}"})
     role_selection.after_review_launch(
-        reviews_dir,
-        self.paths.state_file,
-        role_sel,
-        [x["pr"] for x in launched],
-        repo=self.repo_root.name,
+        reviews_dir, self.write_gate, role_sel, [x["pr"] for x in launched]
     )
 
     with _wf.state_lock(self.paths.state_file):

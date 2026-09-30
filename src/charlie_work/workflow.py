@@ -6998,11 +6998,7 @@ class OrchestratorApp:
             except (OSError, GitHubError, ValueError) as exc:
                 failed.append({"pr": pr_number, "error": f"{type(exc).__name__}: {exc}"})
         role_selection.after_review_launch(
-            reviews_dir,
-            self.paths.state_file,
-            role_sel,
-            [x["pr"] for x in launched],
-            repo=self.repo_root.name,
+            reviews_dir, self.write_gate, role_sel, [x["pr"] for x in launched]
         )
 
         # Upgrade claims outside the launch loop. Successful launches become

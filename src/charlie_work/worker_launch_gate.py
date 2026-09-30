@@ -568,10 +568,6 @@ def _launch_workers(
             role_selection.stamp_launch(settings.sessions_dir, number, "worker", selection)
         if launched:
             role_selection.emit_fallback_selected(
-                app.paths.state_file,
-                role="worker",
-                selection=selection,
-                numbers=launched,
-                repo=app.repo_root.name,
+                app.write_gate, role="worker", selection=selection, numbers=launched
             )
     return results

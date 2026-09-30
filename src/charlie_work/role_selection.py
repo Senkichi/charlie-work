@@ -34,6 +34,7 @@ from typing import Any
 from . import role_quota_ledger
 from .iso_timestamp import parse_iso_timestamp
 from .role_chain import RoleEntry
+from .write_gate import WriteGate, require_write_gate
 
 logger = logging.getLogger(__name__)
 
@@ -240,24 +241,24 @@ def stamp_launch(
 
 
 def emit_fallback_selected(
-    state_path: Path | None,
+    write_gate: WriteGate,
     *,
     role: str,
     selection: RoleSelection,
     numbers: Sequence[int],
-    repo: str | None = None,
 ) -> None:
-    """``role_fallback_selected`` for a launch past the primary. Never raises."""
-    if not selection.is_fallback or state_path is None:
-        return
-    from .instrumentation import log_event
+    """``role_fallback_selected`` for a launch past the primary. Never raises.
 
+    Routed through the caller's ``WriteGate`` (issue #1264): a dry-run pass
+    emits nothing, and the gate carries the state path and repo.
+    """
+    if not selection.is_fallback:
+        return
+    require_write_gate(write_gate)
     try:
-        log_event(
-            state_path,
-            "role_fallback_selected",  # event-consumer: audit-only -- the actionable state is the fleet quota ledger selection already acted on; this is the per-launch record of which chain entries were skipped and until when (issue #2086)
-            {"role": role, "numbers": list(numbers), **selection.report_fields()},
-            repo=repo,
+        write_gate.log_event(
+            kind="role_fallback_selected",  # event-consumer: audit-only -- the actionable state is the fleet quota ledger selection already acted on; this is the per-launch record of which chain entries were skipped and until when (issue #2086)
+            payload={"role": role, "numbers": list(numbers), **selection.report_fields()},
         )
     except Exception as exc:  # noqa: BLE001 - instrumentation must never block a launch
         logger.warning("role_fallback_selected event failed: %s", exc)
@@ -265,18 +266,16 @@ def emit_fallback_selected(
 
 def after_review_launch(
     reviews_dir: Path | None,
-    state_path: Path | None,
+    write_gate: WriteGate,
     selection: RoleSelection,
     launched_prs: Sequence[int],
-    *,
-    repo: str | None = None,
 ) -> None:
     """Stamp each launched reviewer session and emit the fallback event. Never raises."""
     for pr_number in launched_prs:
         stamp_launch(reviews_dir, pr_number, "reviewer", selection)
     if launched_prs:
         emit_fallback_selected(
-            state_path, role="reviewer", selection=selection, numbers=launched_prs, repo=repo
+            write_gate, role="reviewer", selection=selection, numbers=launched_prs
         )
 
 

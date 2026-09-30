@@ -17,6 +17,7 @@ from typing import Any
 
 import pytest
 from _fakes_github import FakeGitHub
+from _helpers import _init_git_repo
 from _review_fixtures import _fake_claude_worker_record, _write_review_packet
 from charlie_work import role_quota_ledger
 from charlie_work.config import OrchestratorConfig, ReviewDispatchConfig, ReviewerRoleConfig
@@ -26,7 +27,7 @@ from charlie_work.role_chain import RoleEntry
 from charlie_work.stalled_review_reap import _detect_and_handle_stalled_reviews
 from charlie_work.state import load_state, save_state, set_reviewer_quota_exhausted, state_lock
 from charlie_work.workflow import OrchestratorApp
-from test_fix_612_quota_reset_time import _seed_stalled, _wg, _write_session_limit_reviewer
+from charlie_work.write_gate import WriteGate
 
 import charlie_work.workflow as wf
 
@@ -34,6 +35,64 @@ PRIMARY = RoleEntry("devin-shell", "swe-2")
 FALLBACK = RoleEntry("claude-code", "claude-sonnet-5-5", "high")
 CHAINED = ReviewerRoleConfig(harness=PRIMARY.harness, model=PRIMARY.model, fallbacks=(FALLBACK,))
 SINGLE = ReviewerRoleConfig(harness=PRIMARY.harness, model=PRIMARY.model)
+
+
+# --- stalled-reviewer seeding (inlined: tests/ forbids cross-test imports) ---
+
+_SESSION_LIMIT_NOTICE = "You've hit your session limit · resets 4:40pm (America/Los_Angeles)"
+
+
+def _wg(state_file: Path) -> WriteGate:
+    return WriteGate(dry_run=False, state_path=state_file, repo="charlie-work")
+
+
+def _hour_ago() -> str:
+    return (datetime.now(UTC) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+
+
+def _seed_stalled(tmp_path: Path, pr_number: int):
+    """One dispatched reviewer whose recorded pid is dead."""
+    repo_root = tmp_path / "repo"
+    _init_git_repo(repo_root)
+    reviews_dir = tmp_path / "reviews"
+    reviews_dir.mkdir(parents=True, exist_ok=True)
+    config = OrchestratorConfig(review_dispatch=ReviewDispatchConfig(enabled=True))
+    state_file = tmp_path / "state.json"
+    state_file.write_text(
+        json.dumps({"version": 1, "issues": {}, "prs": {}, "events": []}), encoding="utf-8"
+    )
+    with state_lock(state_file):
+        state = load_state(state_file)
+        state["prs"][str(pr_number)] = {
+            "number": pr_number,
+            "review_dispatch_status": "review_dispatch_dispatched",
+            "review_dispatched_at": _hour_ago(),
+            "reviewer_pid": 999999999,
+            "reviewer_process_start_time": 1.0,
+        }
+        save_state(state_file, state)
+    return repo_root, reviews_dir, config, state_file
+
+
+def _write_session_limit_reviewer(reviews_dir: Path, pr_number: int, tmp_path: Path) -> Path:
+    """A dead claude-code reviewer whose log shows the session-limit notice."""
+    log_path = reviews_dir / f"issue-{pr_number}-review.claude.log"
+    log_path.write_text(_SESSION_LIMIT_NOTICE + "\n", encoding="utf-8")
+    sidecar = {
+        "issue_number": pr_number,
+        "branch": f"agent/issue-{pr_number}-fix",
+        "worktree_path": str(tmp_path / "worktrees" / f"issue-{pr_number}"),
+        "prompt_path": str(tmp_path / "prompt.md"),
+        "command": ["claude", "-p"],
+        "pid": 999999999,
+        "started_at": _hour_ago(),
+        "log_path": str(log_path),
+        "error": None,
+        "process_start_time": 1.0,
+    }
+    sidecar_path = reviews_dir / f"issue-{pr_number}.claude.json"
+    sidecar_path.write_text(json.dumps(sidecar), encoding="utf-8")
+    return sidecar_path
 
 
 def _pr(number: int) -> dict[str, Any]:
@@ -247,7 +306,7 @@ def test_launch_time_quota_hit_restricts_the_entry_it_launched_on(
 def test_dead_fallback_reviewer_restricts_its_own_recorded_entry(tmp_path: Path) -> None:
     """The stalled-review sweep classifies a dead reviewer by its sidecar and
     restricts the (harness, model) stamped on it -- the fallback, not config."""
-    repo_root, reviews_dir, config, state_file = _seed_stalled(tmp_path, [100])
+    repo_root, reviews_dir, config, state_file = _seed_stalled(tmp_path, 100)
     sidecar = _write_session_limit_reviewer(reviews_dir, 100, tmp_path)
     stamp = role_quota_ledger.session_stamp("reviewer", FALLBACK.harness, FALLBACK.model, 1)
     assert role_quota_ledger.stamp_session(sidecar, stamp)
