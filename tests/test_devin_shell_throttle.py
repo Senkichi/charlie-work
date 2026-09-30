@@ -1,7 +1,7 @@
 """Throttle/failure-classification tests for the devin-shell adapter.
 
 Split out of ``tests/test_devin_shell.py`` (issue #1542, Track-1 pilot):
-``_classify_session_failure`` log-tail classification, rate-limit
+``worker_fate.classify_for`` log-tail classification, rate-limit
 ``get_rate_limit_defer_until`` parsing, ``set_throttled_until``
 accumulation, and ``update_session_record_with_failure_classification``
 sidecar updates.
@@ -11,10 +11,12 @@ from __future__ import annotations
 
 import json
 import os
+from functools import partial
 from pathlib import Path
 
 from _devin_shell_fixtures import _make_session_sidecar
 
+from charlie_work import worker_fate
 from charlie_work.config import OrchestratorConfig, RuntimeConfig
 from charlie_work.devin_shell import (
     get_rate_limit_defer_until,
@@ -22,10 +24,11 @@ from charlie_work.devin_shell import (
 )
 from charlie_work.state import set_throttled_until
 
+_classify_session_failure = partial(worker_fate.classify_for, "devin")
+
 
 def test_classify_session_failure_rate_limit_with_reset_time(tmp_path: Path) -> None:
     """Test that rate-limit errors with 'resets in N minutes' are classified correctly."""
-    from charlie_work.devin_shell import _classify_session_failure
     from datetime import UTC, datetime, timedelta
 
     log_path = tmp_path / "session.log"
@@ -55,7 +58,6 @@ def test_classify_session_failure_rate_limit_with_reset_time(tmp_path: Path) -> 
 
 def test_classify_session_failure_rate_limit_without_reset_time(tmp_path: Path) -> None:
     """Test that rate-limit errors without reset time use default cooldown."""
-    from charlie_work.devin_shell import _classify_session_failure
 
     log_path = tmp_path / "session.log"
     log_path.write_text(
@@ -74,7 +76,6 @@ def test_classify_session_failure_rate_limit_without_reset_time(tmp_path: Path) 
 
 def test_classify_session_failure_quota_exhausted(tmp_path: Path) -> None:
     """Test that quota-exhaustion errors are classified correctly."""
-    from charlie_work.devin_shell import _classify_session_failure
 
     log_path = tmp_path / "session.log"
     log_path.write_text(
@@ -94,7 +95,6 @@ def test_classify_session_failure_quota_exhausted(tmp_path: Path) -> None:
 
 def test_classify_session_failure_no_throttle(tmp_path: Path) -> None:
     """Test that non-throttle errors return None."""
-    from charlie_work.devin_shell import _classify_session_failure
 
     log_path = tmp_path / "session.log"
     log_path.write_text(
@@ -110,7 +110,6 @@ def test_classify_session_failure_no_throttle(tmp_path: Path) -> None:
 
 def test_classify_session_failure_missing_log(tmp_path: Path) -> None:
     """Test that missing log files return None."""
-    from charlie_work.devin_shell import _classify_session_failure
 
     log_path = tmp_path / "nonexistent.log"
 
@@ -123,8 +122,6 @@ def test_classify_session_failure_missing_log(tmp_path: Path) -> None:
 def test_classify_session_failure_includes_resume_margin(tmp_path: Path) -> None:
     """Issue #499: killed-worker rate-limit classification must include the resume margin."""
     from datetime import UTC, datetime, timedelta
-
-    from charlie_work.devin_shell import _classify_session_failure
 
     log_path = tmp_path / "session.log"
     log_path.write_text(
@@ -229,8 +226,8 @@ def test_set_throttled_until_overwrites_no_accumulation() -> None:
     second = (datetime.now(UTC) + timedelta(minutes=10)).isoformat().replace("+00:00", "Z")
 
     original = {}
-    state = set_throttled_until(original, first)
-    state = set_throttled_until(state, second)
+    state = set_throttled_until(original, first, source="test")
+    state = set_throttled_until(state, second, source="test")
 
     assert state["throttled_until"] == second
     assert original.get("throttled_until") is None
@@ -427,7 +424,6 @@ def test_classify_session_failure_tool_rejected_is_not_throttle(tmp_path: Path) 
     established it is a hard failure that must instead route through
     post_mortem.classify_and_record's worker_blocked log-tail fallback (see
     test_post_mortem_log_tail_fallback.py), which composes with escalation, not cooldown."""
-    from charlie_work.devin_shell import _classify_session_failure
 
     log_path = tmp_path / "session.log"
     log_path.write_text(
@@ -525,8 +521,6 @@ def test_classify_session_failure_anchors_window_to_log_mtime(tmp_path: Path) ->
     """
     from datetime import UTC, datetime, timedelta
 
-    from charlie_work.devin_shell import _classify_session_failure
-
     now = datetime.now(UTC).replace(microsecond=0)
     emitted_at = now - timedelta(minutes=45)
     log_path = tmp_path / "session.log"
@@ -560,8 +554,6 @@ def test_classify_session_failure_anchored_window_still_future(tmp_path: Path) -
     end lands earlier than classification-time anchoring produced."""
     from datetime import UTC, datetime, timedelta
 
-    from charlie_work.devin_shell import _classify_session_failure
-
     now = datetime.now(UTC).replace(microsecond=0)
     emitted_at = now - timedelta(minutes=45)
     log_path = tmp_path / "session.log"
@@ -585,8 +577,6 @@ def test_classify_session_failure_expired_window_clamps_to_now(tmp_path: Path) -
     clamps to ``now`` — an already-expired ``throttled_until`` (no deferral),
     per the issue's ``max(now, emitted_at + reset + margin)`` formula."""
     from datetime import UTC, datetime, timedelta
-
-    from charlie_work.devin_shell import _classify_session_failure
 
     now = datetime.now(UTC).replace(microsecond=0)
     emitted_at = now - timedelta(minutes=45)
@@ -614,8 +604,6 @@ def test_classify_session_failure_prefers_tail_line_timestamp(tmp_path: Path) ->
     """Issue #1997: a tz-aware timestamp on a tail line is a better emission
     anchor than the file mtime — it is the line's actual write time."""
     from datetime import UTC, datetime, timedelta
-
-    from charlie_work.devin_shell import _classify_session_failure
 
     now = datetime.now(UTC).replace(microsecond=0)
     emitted_at = now - timedelta(minutes=10)
@@ -646,8 +634,6 @@ def test_classify_session_failure_naive_tail_timestamp_uses_mtime(tmp_path: Path
     skipped in favor of the file mtime rather than a guessed zone."""
     from datetime import UTC, datetime, timedelta
 
-    from charlie_work.devin_shell import _classify_session_failure
-
     now = datetime.now(UTC).replace(microsecond=0)
     emitted_at = now - timedelta(minutes=45)
     naive_ts = emitted_at.strftime("%Y-%m-%d %H:%M:%S")  # no offset
@@ -672,8 +658,6 @@ def test_classify_session_failure_falls_back_to_now_when_stat_fails(tmp_path: Pa
     the anchor falls back to ``now`` — the pre-#1997 behavior."""
     from datetime import UTC, datetime, timedelta
     from unittest.mock import patch
-
-    from charlie_work.devin_shell import _classify_session_failure
 
     log_path = tmp_path / "session.log"
     log_path.write_text(

@@ -540,6 +540,33 @@ does not bound CPU or RAM. The governor applies this cap at every dispatch
 path alongside the per-repo `dispatch.max_concurrent_sessions` cap
 (`_apply_concurrency_governor()` in `workflow.py`).
 
+**Reviewer budget**: `fleet.global_max_concurrent_reviews` (issue #2084, default
+`0` = disabled) is the same kind of cap for live *reviewer* sessions across all
+registered repos -- a separate budget from the worker one, stacking on the
+per-repo `review_dispatch.max_concurrent_reviews`. Use it when the reviewer
+harness has its own provider rate limit (e.g. `devin-shell` reviewers) that the
+per-repo caps, summed, would exceed. Review dispatch launches at most
+`min(per-repo capacity, fleet_max - fleet_live)` reviewers per pass, under the
+fleet launch lock; the `dispatch_reviews` result and the `review_dispatch_claim`
+/ `review_dispatch` events carry `fleet_review_concurrency_limit`,
+`fleet_live_review_count`, `fleet_available_review_slots`, and `clamped_by:
+fleet_max` when the fleet cap bound the launch. A held lock defers the pass with
+`deferred_reason: fleet_lock_held` (`dispatch_deferred`, then `dispatch_starved`
+after 3 in a row, lane `dispatch_reviews`). The knob is read from the layered
+config every pass -- no supervisor restart needed.
+
+**Devin reviewer exec-rejection resume**: `review_dispatch.review_exec_rejection_max_resumes`
+(issue #2090, default `2`, `0` = disabled). A headless `devin-shell` reviewer whose exec
+is refused ends its session with no verdict (`review_verdict_missed`, cause
+`reviewer_exec_rejected`). The reaper instead relaunches the *same* Devin session
+(`devin --resume <id> --print`, id from `devin list --format json` in the review checkout)
+with a nudge naming the allowed commands, up to this many times per dispatch, emitting
+`review_exec_rejection_resumed` (`pr_number`, `attempt`, `session_id`). The resumed process
+takes over the same sidecar and review slot, so neither the per-repo nor the fleet reviewer
+cap counts it twice. `review_verdict_missed` is recorded only when resumes are exhausted; a
+resume that cannot launch (no session id, checkout gone, relaunch error) emits
+`review_exec_rejection_resume_failed` and falls back to the miss. Read every pass; no restart.
+
 **Scoped claim**: The fleet budget bounds worker *count*, not CPU. When running
 the fleet across multiple repos on one host, you must still respect the
 cross-repo xdist discipline from the Local host saturation ceiling section
@@ -793,6 +820,50 @@ supervisor:
   active_cooldown_seconds: 30      # sleep after a pass that dispatched/merged
   max_runtime_minutes: 0           # 0 = unlimited
 ```
+
+The knobs only `charlie fleet supervise` reads — pass deadline, lane
+concurrency, reap cadence, alarm thresholds, self-deploy sibling-pull and
+starvation bounds — live under `fleet_supervisor:` (issue #1978). That
+section is **host-wide only**, like `runner_allocation:` /
+`runner_capacity_escalation:`: declare it in the global fleet layer
+(`<fleet_dir>/config.yaml` — see "Where this section lives in the layered
+config" below), never in a per-repo `orchestrator.config.yaml`, where it is
+rejected with `ConfigError`.
+
+```yaml
+# <fleet_dir>/config.yaml — knobs only `charlie fleet supervise` reads
+fleet_supervisor:
+  # Bounds one fleet pass's wall-clock; the wedge watchdog treats a heartbeat
+  # older than 3x this as a wedged supervisor.
+  max_pass_runtime_seconds: 1800
+  # Max per-repo lanes one fleet pass runs concurrently (issue #1934).
+  # <= 0 falls back to the built-in default; 1 restores serial lanes.
+  fleet_lane_concurrency: 8
+  # Cadence of the out-of-band dead-reviewer-claim reap sweep (issue #1934).
+  # <= 0 disables the scheduler.
+  reap_sweep_interval_seconds: 300
+  # Consecutive-failure/streak thresholds before an events.db alarm entry
+  # fires; 0 disables each alarm.
+  self_deploy_failure_alarm: 3
+  zero_pass_alarm: 3
+  wedge_kill_loop_alarm: 3
+  # When true, self-deploy also FF-pulls the declared ci-fleet sibling
+  # (dedicated deploy clones only — see issue #552).
+  self_deploy_pull_ci_fleet: false
+  # Upper bound on how long a deferred self-deploy `uv sync` may stay pending
+  # under live workers before the supervisor drains dispatch (issue #1855).
+  # <= 0 disables the bound.
+  dependency_sync_starvation_seconds: 14400
+```
+
+During the migration window the legacy `supervisor.<key>` spellings still
+parse in *either* layer — emitting `config_key_deprecated_read`, removal
+tracked by #1979. Each layer resolves `fleet_supervisor` > `supervisor`
+before the repo-over-global merge: both spellings disagreeing inside one
+file is a `ConfigError` naming both, while a repo layer's leftover
+`supervisor.<key>` that disagrees with the global `fleet_supervisor.<key>`
+simply wins that key (the ordinary repo-wins rule) — deterministic, and
+visible in the deprecation events until the legacy key is deleted.
 
 ### Detection latency
 

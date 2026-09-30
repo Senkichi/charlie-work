@@ -629,3 +629,26 @@ def _reset_linked_pr_status_to_passive_open(fresh_state: dict[str, Any], pr_numb
     if isinstance(pr_entry, dict):
         if pr_entry.get("status") not in ("merged", "closed"):
             pr_entry["status"] = PASSIVE_OPEN_STATUS
+
+
+def _strip_active_and_flag_human_needed(
+    gh: Any,
+    config: Any,
+    issue_number: int,
+    active_labels: set[str],
+    issue_labels: set[str],
+) -> bool:
+    """Strip every active label and apply ``human_needed`` (if absent).
+
+    The label writes shared by the orphan sweep's worker-blocked,
+    zero-artifact and cross-repo-scope escalations. Returns False when any
+    label write failed (the caller records it as ``label_write_ok``).
+    """
+    label_write_ok = True
+    for label in sorted(active_labels):
+        if not gh.remove_issue_label(issue_number, label):
+            label_write_ok = False
+    if config.labels.human_needed not in issue_labels:
+        if not gh.add_issue_label(issue_number, config.labels.human_needed):
+            label_write_ok = False
+    return label_write_ok

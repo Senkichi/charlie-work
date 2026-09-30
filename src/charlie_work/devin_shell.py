@@ -9,7 +9,11 @@ after ``Popen`` — callers must never block on the worker finishing. Each launc
 writes a JSON sidecar file (``sessions_dir/issue-<n>.json``) atomically (tmp +
 replace, matching ``adapters._write_json``) *before* returning, so a crash of
 the orchestrator process itself never loses track of a session that was actually
-spawned.
+spawned. A daemon-thread watcher (``process_utils.start_terminal_status_watcher``,
+issue #2052) then persists ``issue-<n>.devin.terminal.json`` once the spawned
+process exits — exit code, duration, and a copy of the worktree's
+``.worker-outcome.json`` — so ``worker_fate`` resolves a dead devin worker from
+the same durable terminal record it uses for claude-code.
 
 Each worker is launched in an isolated per-issue git worktree (created via
 ``worktree.create_worktree()``, mirroring the claude-code adapter) so
@@ -31,12 +35,23 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from charlie_work.process_utils import is_pid_alive, parse_proc_stat_starttime, popen_worker
+from charlie_work.process_utils import parse_proc_stat_starttime, popen_worker
+from .claude_code import _events_path, _rotate_old_log
 from .config import OrchestratorConfig
 from .devin_failure_classification import (  # noqa: F401 (deliberate re-export; #1442 extraction keeps devin_shell under its mark)
-    _classify_session_failure,
     get_rate_limit_defer_until,
+    update_session_record_with_failure_classification,
 )
+from .devin_review_mode import (  # noqa: F401 (deliberate re-export; #2069-rework extraction keeps devin_shell under its mark)
+    REVIEW_EXEC_SECTION_HEADING,
+    _REVIEW_COMMAND_TEMPLATE,
+    _REVIEW_EXEC_ALLOWLIST,
+    _review_exec_prompt_section,
+    _sanitize_review_command_template,
+    _write_devin_review_prompt,
+    _write_review_permissions,
+)
+from .devin_terminal_record import maybe_start_terminal_status_watcher
 from .env_sanitize import resolve_pytest_cap, resolve_uv_no_sync, sanitize_env
 from .post_mortem import merge_attempt_snapshot
 from .state import _canonical_started_at, utc_now
@@ -83,132 +98,6 @@ DEFAULT_COMMAND_TEMPLATE: tuple[str, ...] = (
     "--respect-workspace-trust",
     "false",
 )
-
-# Review-mode template: omits ``--permission-mode dangerous`` entirely. The
-# Devin CLI's documented default when that flag is absent is ``auto``
-# (read-only tools) -- exactly the posture a reviewer needs, since the review
-# packet built by ``workflow.py`` pre-renders the diff, CI status, and
-# test-adequacy sections directly into the prompt, so a reviewer never needs
-# to shell out to git/uv/gh (the only calls ``auto`` mode stalls on). This is
-# the devin-shell analogue of claude-code's hard-pinned ``--permission-mode
-# plan`` for review launches (see ``claude_code._REVIEW_COMMAND_TEMPLATE`` /
-# ``_sanitize_review_command_template``). Not used directly by
-# ``launch_devin_session`` (which sanitizes whatever template it receives,
-# including a caller-tuned one, via ``_sanitize_review_command_template``
-# below) -- kept as a documented, test-comparable constant for what that
-# sanitization produces from the worker default.
-_REVIEW_COMMAND_TEMPLATE: tuple[str, ...] = (
-    "devin",
-    "{model_args}",
-    "--prompt-file",
-    "{prompt_path}",
-    "--print",
-    "--respect-workspace-trust",
-    "false",
-)
-
-
-# Issue #2011: headless ``devin --print`` in ``auto`` mode auto-REJECTS any exec
-# its classifier does not approve and ENDS the session with no verdict. Models
-# shell out despite the pre-rendered packet, so review launches pre-approve a
-# READ-ONLY exec allow-list via ``<cwd>/.devin/config.local.json`` (project
-# local override; never clobbers a tracked ``.devin/config.json``). Rules are
-# whole-word prefix matches; compound commands are checked per segment, so
-# chaining (``git log && rm x``) cannot escape the list. Allow rules only: a
-# deny rule also ends the session silently.
-#
-# Anything NOT listed still goes to Devin's own classifier, which judges the
-# FULL command line: it already auto-approved ``git status``/``git diff``/
-# ``git log``/``git rev-parse`` in the #2011 sessions, and it can refuse a
-# flag-level escape (``git diff --output=<path>``) that a whole-word prefix
-# rule cannot express. So the list holds only (a) what the classifier
-# actually prompted on -- the read-only ``gh ... view`` family, which ended 4
-# of the 5 missed #2011 sessions -- and (b) commands with no exec/write flag.
-#
-# Deliberately EXCLUDED (keep it that way; the reviewer reads attacker-
-# influenced diffs, so every entry must be safe against prompt injection):
-# - bare ``Exec(git)``/``Exec(gh)`` and any git/gh subcommand with a write or
-#   exec flag: ``git diff|log|show`` (``--output=<path>`` writes anywhere),
-#   ``git grep`` (``-O<cmd>`` runs a pager command), ``gh api`` (arbitrary
-#   REST incl. writes).
-# - ``rg`` (``--pre <cmd>`` runs a program), ``sort`` (``-o``,
-#   ``--compress-program``), ``uniq`` (writes its 2nd arg), ``find``
-#   (``-delete``/``-exec``), ``sed``/``awk`` (in-place writes, system()).
-# - any interpreter or runner (python, uv, node, bash, sh, pwsh): arbitrary
-#   code -- the #2011 mdls session was ended by ``uv run ... python -c``, and
-#   that refusal is correct.
-# ``--permission-mode dangerous`` stays impossible (see the sanitizer below).
-_REVIEW_EXEC_ALLOWLIST: tuple[str, ...] = (
-    "Exec(gh issue view)",
-    "Exec(gh pr view)",
-    "Exec(gh pr diff)",
-    "Exec(gh pr checks)",
-    "Exec(grep)",
-    "Exec(cat)",
-    "Exec(head)",
-    "Exec(tail)",
-    "Exec(wc)",
-    "Exec(ls)",
-    "Exec(pwd)",
-)
-
-
-def _write_review_permissions(checkout_path: Path) -> None:
-    """Write the review exec allow-list into the review checkout (issue #2011).
-
-    Never raises: a missing allow-list degrades to the pre-fix behavior, and
-    adapters return errors as values. The file is untracked inside a review
-    checkout that ``remove_review_checkout`` force-removes wholesale, and
-    nothing computes dirtiness for review checkouts, so no separate cleanup
-    is needed.
-    """
-    try:
-        _write_json(
-            checkout_path / ".devin" / "config.local.json",
-            {"permissions": {"allow": list(_REVIEW_EXEC_ALLOWLIST)}},
-        )
-    except OSError as exc:
-        logger.warning(
-            "could not write review exec allow-list in %s: %s (reviewer may hit "
-            "an exec rejection)",
-            checkout_path,
-            exc,
-        )
-
-
-def _sanitize_review_command_template(command_template: tuple[str, ...]) -> tuple[str, ...]:
-    """Hard-pin the read-only reviewer posture onto ``command_template``.
-
-    A review launch must never carry ``--permission-mode dangerous`` -- this
-    is an invariant, not a default a caller-supplied (or config-forwarded)
-    ``command_template`` can defeat. ``DevinConfig.command`` is a single field
-    shared with worker dispatch (workers need ``dangerous`` for write
-    access); if an operator's worker-tuning override were honored verbatim
-    for reviewers too, it would silently grant write access, defeating
-    ``create_review_checkout``'s no-write guarantee. Mirrors
-    ``claude_code._sanitize_review_command_template``'s pinning of
-    ``--permission-mode plan`` for the identical reason.
-
-    Every occurrence of ``--permission-mode`` (the flag plus its following
-    value token, and any ``--permission-mode=<value>`` form) is stripped.
-    Unlike claude-code's ``plan`` mode, nothing is appended in its place: the
-    Devin CLI's own default when ``--permission-mode`` is entirely absent
-    from argv is ``auto`` (read-only tools), which is the posture wanted here
-    -- there is no "dangerous-but-read-only" flag value to pin to instead.
-    """
-    filtered: list[str] = []
-    skip_next = False
-    for token in command_template:
-        if skip_next:
-            skip_next = False
-            continue
-        if token == "--permission-mode":
-            skip_next = True
-            continue
-        if token.startswith("--permission-mode="):
-            continue
-        filtered.append(token)
-    return tuple(filtered)
 
 
 @dataclass(frozen=True)
@@ -405,6 +294,12 @@ def launch_devin_session(
         command_template = _sanitize_review_command_template(command_template)
     sessions_dir.mkdir(parents=True, exist_ok=True)
     log_path = _log_path(sessions_dir, issue_number, rework=rework)
+    # Issue #2036: the claude-code adapter's per-issue events.jsonl shares this
+    # sessions_dir and is read harness-agnostically by the verdict/miss/metrics
+    # readers. Only the claude launcher rotated it, so a devin session inherited
+    # the previous claude round's transcript as if it were its own. Retire it at
+    # launch so every reader sees this session's file or none.
+    _rotate_old_log(_events_path(sessions_dir, issue_number, rework=rework, review=review))
     session_id = str(uuid.uuid4())
 
     # Issue #426: recovery probes carry a Signal-1-style deferral counter. Seed
@@ -559,12 +454,13 @@ def launch_devin_session(
             return _fail(f"failed to append rework conflict notice to prompt file: {exc}")
 
     # --- command rendering (prompt_path is caller-supplied, lives outside wt) -
+    launch_prompt_path = _write_devin_review_prompt(prompt_path) if review else prompt_path
     try:
         command = _render_command(
             command_template,
             issue_number=issue_number,
             branch=branch,
-            prompt_path=prompt_path,
+            prompt_path=launch_prompt_path,
             worker_model=worker_model,
         )
     except (KeyError, IndexError, ValueError) as exc:
@@ -618,6 +514,21 @@ def launch_devin_session(
         error = f"failed to launch devin: {exc}"
 
     if pid is not None and error is None:
+        # Issue #2052: devin-shell joins the terminal-record contract. The
+        # profile gate and watcher start live in devin_terminal_record
+        # (extracted under the file-size ratchet on PR #2069 rework) -- it
+        # leaves ``issue-<n>.devin.terminal.json`` when this process exits,
+        # the durable exit evidence ``worker_fate.resolve_fate`` reads back
+        # adapter-agnostically. Review launches pass ``worktree_path=None``
+        # (claude_code's #1354 parity: a review checkout holds no worker
+        # outcome file).
+        maybe_start_terminal_status_watcher(
+            process,
+            sessions_dir,
+            issue_number,
+            worktree_path=None if review else worktree.path,
+        )
+
         # Write the worktree writer marker so this process is recorded as the
         # legitimate occupant of the worktree (issue #400).
         try:
@@ -783,126 +694,12 @@ def _get_process_start_time(pid: int) -> float | None:
             return None
 
 
-def is_session_alive(record: SessionRecord) -> bool:
-    """Check whether the process behind ``record`` is still running.
-
-    Delegates to ``charlie_work.process_utils.is_pid_alive`` so liveness
-    semantics are enforced in a single place.  This avoids a hard `psutil`
-    dependency and the slow `tasklist` subprocess round trip.
-
-    Process identity is verified by checking that the current process start time
-    matches the recorded start time (captured at spawn).  A start-time probe
-    that returns ``None`` is treated as indeterminate and returns ``True`` rather
-    than reaping a potentially-live worker on a transient probe failure
-    (issue #360 criterion #1 / issue #343).
-
-    Legacy records without ``process_start_time`` fall back to pid-only liveness
-    (vulnerable to recycling but preserves backward compatibility).
-    """
-    if record.pid is None or record.pid <= 0:
-        return False
-    return is_pid_alive(record.pid, record.process_start_time)
-
-
-def update_session_record_with_failure_classification(
-    sessions_dir: Path,
-    issue_number: int,
-    *,
-    fallback_kind: str | None = None,
-    config: OrchestratorConfig | None = None,
-    session_completed: bool = False,
-    now: datetime | None = None,
-) -> tuple[str | None, str | None]:
-    """Update a session record with failure classification after the session exits.
-
-    This reads the existing sidecar, classifies the failure from the log tail,
-    and writes back an updated record with failure_kind set.
-
-    Log-tail classification (``_classify_session_failure``) always runs first.
-    If it detects a provider throttle signature (``rate_limited`` /
-    ``quota_exhausted``), that classification wins — including its computed
-    ``throttled_until`` cooldown — regardless of ``fallback_kind``. Only when
-    the log shows no throttle signature does ``fallback_kind`` apply (e.g. the
-    stall watchdog's "stalled" default, or the launch-stall watchdog's
-    "launch_stalled" default). This ordering matters: a worker that dies
-    because it hit a provider rate limit must be classified as such even when
-    the caller only knows "this looked stalled" — otherwise ``throttled_until``
-    never gets set and dispatch keeps relaunching workers into the same limit.
-
-    ``session_completed`` (issue #656): when the caller has already confirmed
-    via worktree inspection that this session produced complete, committable
-    work, log-tail classification is skipped entirely and ``fallback_kind`` is
-    used directly. A session that finished real work cannot also have been
-    killed by a provider rate-limit failure — that's ground truth, not a
-    heuristic. See ``claude_code.update_worker_record_with_failure_
-    classification`` for the sibling fix and the live false-positive this
-    protects against (a worker's own completion-summary prose quoting
-    throttle-marker text).
-
-    ``config`` is optional for backward compatibility; when provided, its
-    ``runtime.throttle_error_markers``, ``runtime.quota_error_markers``, and
-    ``runtime.throttle_resume_margin_s`` are used instead of the defaults.
-
-    ``now`` is forwarded to ``_classify_session_failure`` (issue #822's
-    injectable clock); defaults to ``datetime.now(UTC)`` there when omitted.
-
-    Returns a tuple of (failure_kind, throttled_until_iso) for the caller to
-    update runtime state if needed. ``throttled_until_iso`` is only non-None
-    when log-tail classification actually matched a throttle signature.
-    """
-    sidecar_path = _sidecar_path(sessions_dir, issue_number)
-    if not sidecar_path.exists():
-        return None, None
-
-    try:
-        with sidecar_path.open("r", encoding="utf-8") as handle:
-            payload = json.load(handle)
-    except (OSError, json.JSONDecodeError):
-        return None, None
-
-    if not isinstance(payload, dict):
-        return None, None
-
-    # Skip if already classified
-    if payload.get("failure_kind") is not None:
-        return payload.get("failure_kind"), None
-
-    classified_kind: str | None = None
-    throttled_until: str | None = None
-    log_path_str = payload.get("log_path") if not session_completed else None
-    if log_path_str:
-        if config is not None:
-            throttle_markers = config.runtime.throttle_error_markers
-            quota_markers = config.runtime.quota_error_markers
-            resume_margin_seconds = config.runtime.throttle_resume_margin_s
-        else:
-            throttle_markers = None
-            quota_markers = None
-            resume_margin_seconds = 0
-        classified_kind, throttled_until = _classify_session_failure(
-            Path(log_path_str),
-            throttle_markers,
-            quota_error_markers=quota_markers,
-            resume_margin_seconds=resume_margin_seconds,
-            now=now,
-        )
-
-    resolved_kind = classified_kind or fallback_kind
-    if resolved_kind is None:
-        return None, None
-
-    payload["failure_kind"] = resolved_kind
-    _write_json(sidecar_path, payload)
-    return resolved_kind, throttled_until
-
-
 __all__ = [
     "DEFAULT_COMMAND_TEMPLATE",
     "SessionRecord",
     "launch_devin_session",
     "read_session_records",
     "probe_devin",
-    "is_session_alive",
     "update_session_record_with_failure_classification",
     "get_rate_limit_defer_until",
     "_get_process_start_time",

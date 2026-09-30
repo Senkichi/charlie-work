@@ -18,6 +18,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
+from .dead_dispatched_timer import LOCAL_PARK_DEFER_FIELDS
+
 # PR-record bookkeeping that must not survive an operator re-arm: attempt
 # counters and caches that would otherwise instantly re-escalate the PR
 # (counters at cap) or feed the pipeline frozen pre-escalation data
@@ -124,8 +126,16 @@ UNESCALATE_ISSUE_RESET_FIELDS = (
     # exempt a later, genuinely different death from the orphan-sweep
     # timed reap and redispatch cap.
     "dead_worker_failure_kind",
+    # Companion of the stamp above (when it was classified; wf-r2-s4).
+    "dead_worker_failure_classified_at",
     # Issue #1993: companion of the stamp above (bounded re-arm counter).
     "throttle_reap_rearm_count",
+    # Issue #1971: the bounded local-park deferral bookkeeping is per death
+    # episode; a re-arm starts the deferral budget fresh.
+    *LOCAL_PARK_DEFER_FIELDS,
+    # wf-r2-s6 (N4): the live-handoff lane's "already routed this outcome"
+    # marker; a re-arm must let the lane consider the outcome afresh.
+    "live_handoff_routed_outcome_at",
     # Issue #2002: ``worker_death_failure_kinds`` (the per-death timestamp ->
     # classified-kind map written by ``_credit_worker_death``) is deliberately
     # ABSENT from this tuple: it is the forensic record of WHICH classification
@@ -179,6 +189,12 @@ UNESCALATE_ISSUE_RESET_FIELDS = (
     # windowed list fields above (``dispatch_failed_at`` etc.), whose
     # readers treat a missing key as an empty window.
     "blocked_environment_at",
+    # Issue #2051: the once-per-worker cap-escalation deferral marker is
+    # per-episode bookkeeping. A re-arm must clear it so a live-worker
+    # deferral under the next episode's worker still emits
+    # ``escalation_deferred_live_worker`` instead of being deduped against
+    # a stale marker.
+    "escalation_deferred_live_worker",
 )
 
 # Issue #1477 (Option A -- identical-cause recurrence is sticky): the marker

@@ -1,0 +1,1 @@
+Issue #2039/#2041: claims and launches the gated local rework candidates (orchestration/local_lanes.py) against the WorkerLaunchPermit, through worker_launch_gate._launch_workers.

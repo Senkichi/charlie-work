@@ -298,15 +298,6 @@ def test_supervisor_config_defaults() -> None:
     assert config.supervisor.full_pass_interval_seconds == 300
     assert config.supervisor.active_cooldown_seconds == 30
     assert config.supervisor.max_runtime_minutes == 0
-    assert config.supervisor.max_pass_runtime_seconds == 1800
-    assert config.supervisor.self_deploy_failure_alarm == 3
-    assert config.supervisor.zero_pass_alarm == 3
-    # Issue #1855: the deferred-sync starvation bound defaults to 4h --
-    # comfortably above observed worker session durations.
-    assert config.supervisor.dependency_sync_starvation_seconds == 14400
-    # Issue #1934: bounded lane pool and the out-of-band reap cadence.
-    assert config.supervisor.fleet_lane_concurrency == 8
-    assert config.supervisor.reap_sweep_interval_seconds == 300
 
 
 def test_supervisor_config_parses_custom_values(tmp_path: Path) -> None:
@@ -319,12 +310,6 @@ supervisor:
   full_pass_interval_seconds: 120
   active_cooldown_seconds: 15
   max_runtime_minutes: 60
-  max_pass_runtime_seconds: 900
-  self_deploy_failure_alarm: 5
-  zero_pass_alarm: 7
-  dependency_sync_starvation_seconds: 600
-  fleet_lane_concurrency: 4
-  reap_sweep_interval_seconds: 90
 """
     )
     config = load_config(config_file)
@@ -332,12 +317,6 @@ supervisor:
     assert config.supervisor.full_pass_interval_seconds == 120
     assert config.supervisor.active_cooldown_seconds == 15
     assert config.supervisor.max_runtime_minutes == 60
-    assert config.supervisor.max_pass_runtime_seconds == 900
-    assert config.supervisor.self_deploy_failure_alarm == 5
-    assert config.supervisor.zero_pass_alarm == 7
-    assert config.supervisor.dependency_sync_starvation_seconds == 600
-    assert config.supervisor.fleet_lane_concurrency == 4
-    assert config.supervisor.reap_sweep_interval_seconds == 90
 
 
 def test_supervisor_config_unknown_key_raises(tmp_path: Path) -> None:

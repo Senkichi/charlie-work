@@ -63,7 +63,7 @@ def test_allocation_probe_flags_a_stale_pass(tmp_path: Path) -> None:
     # The staleness bound is the pass runtime cap plus three intervals
     # (issue #1852): 1800 + 300*3 = 2700 s under the default config.
     stale_by = (
-        config.supervisor.max_pass_runtime_seconds
+        config.fleet_supervisor.max_pass_runtime_seconds
         + config.supervisor.full_pass_interval_seconds * 3
         + 60
     )
@@ -192,7 +192,7 @@ def test_allocation_probe_falls_back_to_config_interval_when_none_recorded(
     _write_allocation_stamp(
         tmp_path,
         age_seconds=(
-            config.supervisor.max_pass_runtime_seconds
+            config.fleet_supervisor.max_pass_runtime_seconds
             + config.supervisor.full_pass_interval_seconds * 3
             + 60
         ),
@@ -298,7 +298,7 @@ def test_allocation_probe_falls_back_to_config_cap_when_heartbeat_absent(
     _, ok, detail = checks[0]
     assert ok is False
     assert "2700s staleness bound" in detail
-    assert "config supervisor.max_pass_runtime_seconds" in detail
+    assert "config fleet_supervisor.max_pass_runtime_seconds" in detail
 
 
 def test_allocation_probe_falls_back_to_config_cap_when_heartbeat_lacks_field(
@@ -322,9 +322,9 @@ def test_allocation_probe_falls_back_to_bare_interval_bound_when_no_cap(
 ) -> None:
     """Neither heartbeat nor config records a cap -> the bound is 3 x interval.
 
-    ``config.supervisor`` is replaced with a namespace that predates the
-    ``max_pass_runtime_seconds`` knob (the same "config object built by code
-    that predates the section" shape the probe already tolerates for the
+    ``config.fleet_supervisor`` is replaced with a namespace that predates
+    the ``max_pass_runtime_seconds`` knob (the same "config object built by
+    code that predates the section" shape the probe already tolerates for the
     runner_allocation section itself), and the heartbeat lacks the field, so
     the bound collapses to today's 3 x 300 = 900 s.
     """
@@ -333,7 +333,7 @@ def test_allocation_probe_falls_back_to_bare_interval_bound_when_no_cap(
 
     config = dataclasses.replace(
         _doctor_allocation_config(),
-        supervisor=SimpleNamespace(full_pass_interval_seconds=300),
+        fleet_supervisor=SimpleNamespace(),
     )
     _write_allocation_stamp(
         tmp_path,

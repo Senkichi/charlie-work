@@ -231,7 +231,7 @@ def test_reap_review_verdicts_emits_event_when_record_review_refuses_escalated(
     _set_review_dispatched_state(app, 100, 10, "2026-07-06T12:00:00Z")
     _seed_issue_state(app.paths, status="escalated")
 
-    monkeypatch.setattr("charlie_work.claude_code.is_worker_alive", lambda *_: False)
+    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: False)
 
     result = app._reap_review_verdicts(reviews_dir)
 
@@ -285,7 +285,7 @@ def test_reap_review_verdicts_launch_failure_is_not_reported_as_turn_limit(
     )
     _set_review_dispatched_state(app, 100, 10, old_dispatched)
 
-    monkeypatch.setattr("charlie_work.claude_code.is_worker_alive", lambda *_: False)
+    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: False)
 
     result = app._reap_review_verdicts(reviews_dir)
 
@@ -338,7 +338,7 @@ def test_reap_review_verdicts_turn_limit_miss_emits_event(monkeypatch, tmp_path:
     _write_review_events(reviews_dir, 100, turns=max_turns, tool_calls=3)
     _set_review_dispatched_state(app, 100, 10, old_dispatched)
 
-    monkeypatch.setattr("charlie_work.claude_code.is_worker_alive", lambda *_: False)
+    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: False)
 
     result = app._reap_review_verdicts(reviews_dir)
 
@@ -376,7 +376,7 @@ def test_reap_review_verdicts_death_after_partial_work_is_its_own_bucket(
     _write_review_events(reviews_dir, 100, turns=3, tool_calls=2)
     _set_review_dispatched_state(app, 100, 10, old_dispatched)
 
-    monkeypatch.setattr("charlie_work.claude_code.is_worker_alive", lambda *_: False)
+    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: False)
 
     result = app._reap_review_verdicts(reviews_dir)
 
@@ -461,7 +461,7 @@ def test_reap_review_verdicts_session_limit_notice_is_launch_failure(
     _write_session_limit_events(reviews_dir, 100)
     _set_review_dispatched_state(app, 100, 10, old_dispatched)
 
-    monkeypatch.setattr("charlie_work.claude_code.is_worker_alive", lambda *_: False)
+    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: False)
 
     result = app._reap_review_verdicts(reviews_dir)
 

@@ -520,13 +520,12 @@ def test_dispatch_excludes_stalled_session_dry_run(tmp_path: Path) -> None:
     session_file.write_text(json.dumps(session_record.to_dict()), encoding="utf-8")
 
     # Mock the liveness check to return True (simulating a live but stalled process).
-    # Patch target is charlie_work.worker (not devin_shell): the stalled-detection
-    # path goes through worker.WorkerView.is_alive(), which holds its own
-    # already-bound reference to is_session_alive from its module-level import —
-    # patching devin_shell's attribute would not reach that call site.
+    # Patch target is the single liveness seam, charlie_work.worker_fate.is_alive:
+    # the stalled-detection path goes through worker.WorkerView.is_alive(), which
+    # calls it through the module attribute (lazy import).
     from unittest.mock import patch
 
-    with patch("charlie_work.worker.is_session_alive", return_value=True):
+    with patch("charlie_work.worker_fate.is_alive", return_value=True):
         app.gh.prs[0]["state"] = "CLOSED"
         result = app.dispatch(limit=1)
 
@@ -588,7 +587,7 @@ def test_dispatch_excludes_stalled_session_real(tmp_path: Path) -> None:
     # Mock the liveness check to return True (simulating a live but stalled process)
     from unittest.mock import patch
 
-    with patch("charlie_work.devin_shell.is_session_alive", return_value=True):
+    with patch("charlie_work.worker_fate.is_alive", return_value=True):
         app.gh.prs[0]["state"] = "CLOSED"
         result = app.dispatch(limit=1)
 

@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from charlie_work.claude_code import _events_path
+from charlie_work.devin_review_resume import resume_exec_rejected_review
 from charlie_work.harnesses import REVIEWER_ADAPTER_KINDS
 from charlie_work.process_utils import find_worker_terminal_status
 from charlie_work.stalled_review_reap import (
@@ -87,10 +88,11 @@ def _reap_review_verdicts(self, reviews_dir: Path) -> dict[str, Any]:
             # Fallback: parse the structured events.jsonl. The plaintext log
             # may be truncated or the verdict block split across tee buffer
             # boundaries, but the stream-json events contain the assistant's
-            # message text in discrete JSONL lines.
+            # message text in discrete JSONL lines. mtime-gated to this
+            # session: the file is per-PR, so it may be an earlier round's.
             events_path = _events_path(reviews_dir, pr_number, review=True)
             verdict_source = "events"
-            verdict = _parse_review_verdict_from_events(events_path)
+            verdict = _parse_review_verdict_from_events(events_path, started_at=w.started_at)
         if verdict is None:
             # Last resort (issue #566): the reviewer may have written its
             # verdict to a Markdown file it referenced in final output
@@ -105,6 +107,10 @@ def _reap_review_verdicts(self, reviews_dir: Path) -> dict[str, Any]:
             if file_hit is not None:
                 verdict, file_source = file_hit
                 verdict_source = f"file:{file_source}"
+        if verdict is None and resume_exec_rejected_review(self, w, pr_number, reviews_dir):
+            # Issue #2090: the session ended on a refused exec and was resumed
+            # in place (same sidecar, same slot); nothing to record this pass.
+            continue
         if verdict is None:
             # No structured verdict found. Before discarding this reviewer's
             # work, check if it did substantial analysis (e.g. hit the
@@ -124,7 +130,8 @@ def _reap_review_verdicts(self, reviews_dir: Path) -> dict[str, Any]:
                 # Issue #1354: read the reviewer's exit code from the
                 # durable terminal-status record (written by
                 # ``start_terminal_status_watcher`` in
-                # ``launch_claude_worker``) so the terminating-cause
+                # ``launch_claude_worker`` and -- since #2052 --
+                # ``launch_devin_session``) so the terminating-cause
                 # extractor can fold it into the ``cause`` field of the
                 # ``review_verdict_missed`` payload. The terminal-status
                 # watcher is now started for review launches too (see

@@ -207,6 +207,22 @@ def _isolate_fleet_registry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
 
 
 @pytest.fixture(autouse=True)
+def _reset_markdown_guard_sink() -> Iterator[None]:
+    """Unbind the ambient ``markdown_guard`` disagreement sink around every test.
+
+    ``OrchestratorApp.__init__`` binds it to its ``state.json`` on the
+    constructing thread; without this reset a test that builds an app would
+    leave later tests' guard disagreements writing into its (long gone)
+    ``tmp_path``.
+    """
+    from charlie_work import markdown_guard
+
+    markdown_guard.bind_state_path(None)
+    yield
+    markdown_guard.bind_state_path(None)
+
+
+@pytest.fixture(autouse=True)
 def _isolate_git_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Isolate git invocations under ``tmp_path`` from any *enclosing* repo.
 

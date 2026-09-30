@@ -127,6 +127,7 @@ def test_set_throttled_until_records_reason_and_adapter_kind() -> None:
     state = set_throttled_until(
         empty_state(),
         "2026-08-01T00:00:00Z",
+        source="test",
         reason="quota_exhausted",
         adapter_kind="claude-code",
     )
@@ -139,7 +140,7 @@ def test_set_throttled_until_records_reason_and_adapter_kind() -> None:
 def test_set_throttled_until_defaults_reason_and_adapter_kind_to_none() -> None:
     from charlie_work.state import empty_state, set_throttled_until
 
-    state = set_throttled_until(empty_state(), "2026-08-01T00:00:00Z")
+    state = set_throttled_until(empty_state(), "2026-08-01T00:00:00Z", source="test")
 
     assert state["throttle_reason"] is None
     assert state["throttle_adapter_kind"] is None
@@ -194,7 +195,9 @@ def test_any_quota_exhausted_indicator_gate() -> None:
     assert any_quota_exhausted_indicator(empty_state()) is False
 
     future = (datetime.now(UTC) + timedelta(hours=1)).isoformat().replace("+00:00", "Z")
-    root_throttled = set_throttled_until(empty_state(), future, reason="rate_limited")
+    root_throttled = set_throttled_until(
+        empty_state(), future, source="test", reason="rate_limited"
+    )
     assert any_quota_exhausted_indicator(root_throttled) is True
 
     reviewer_throttled = set_reviewer_quota_exhausted(
@@ -210,6 +213,7 @@ def test_clear_quota_throttles_clears_root_throttle_for_claude_code_or_unset_ada
         state = set_throttled_until(
             empty_state(),
             "2026-08-01T00:00:00Z",
+            source="test",
             reason="rate_limited",
             adapter_kind=adapter_kind,
         )
@@ -223,12 +227,13 @@ def test_clear_quota_throttles_clears_root_throttle_for_claude_code_or_unset_ada
 
 def test_clear_quota_throttles_preserves_provider_auth_throttle() -> None:
     """A dead key does not self-heal within minutes -- see
-    claude_code._classify_session_failure; a green probe must not mask it."""
+    worker_fate.classify_for; a green probe must not mask it."""
     from charlie_work.state import clear_quota_throttles, empty_state, set_throttled_until
 
     state = set_throttled_until(
         empty_state(),
         "2026-08-01T00:00:00Z",
+        source="test",
         reason="provider_auth",
         adapter_kind="claude-code",
     )
@@ -248,6 +253,7 @@ def test_clear_quota_throttles_preserves_non_claude_code_adapter_throttle() -> N
         state = set_throttled_until(
             empty_state(),
             "2026-08-01T00:00:00Z",
+            source="test",
             reason="rate_limited",
             adapter_kind=adapter_kind,
         )
@@ -292,7 +298,9 @@ def test_clear_quota_throttles_always_clears_reviewer_quota_and_resets_probe_fai
     }
     # Also carry a devin-adapter root throttle, to confirm reviewer_quota
     # clears independently of what the root-throttle branch decides.
-    state = set_throttled_until(state, root_throttle, reason="rate_limited", adapter_kind="devin")
+    state = set_throttled_until(
+        state, root_throttle, source="test", reason="rate_limited", adapter_kind="devin"
+    )
 
     cleared = clear_quota_throttles(state)
 
@@ -328,7 +336,11 @@ def test_clear_quota_throttles_records_last_probe_cleared_at() -> None:
 
     # Root-only throttle (reviewer_quota never set): marker still recorded.
     root_only = set_throttled_until(
-        empty_state(), "2026-08-01T00:00:00Z", reason="rate_limited", adapter_kind="claude-code"
+        empty_state(),
+        "2026-08-01T00:00:00Z",
+        source="test",
+        reason="rate_limited",
+        adapter_kind="claude-code",
     )
     cleared_root = clear_quota_throttles(root_only)
     assert reviewer_quota_last_probe_cleared_at(cleared_root) is not None

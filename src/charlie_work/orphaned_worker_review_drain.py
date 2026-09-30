@@ -32,6 +32,7 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
 
+from .orphaned_worker_no_op_drain import NoOpReworkRoute, drain_no_op_rework_routes
 from .rework_outcome import APPLIED_HEADS_KEY
 
 if TYPE_CHECKING:
@@ -70,6 +71,7 @@ def drain_orphaned_worker_review_routes(
     config: OrchestratorConfig,
     state_file: Path,
     write_gate: WriteGate,
+    no_op_routes: list[NoOpReworkRoute] | None = None,
 ) -> None:
     """Drain collected orphan-sweep review routes through ``review()``.
 
@@ -175,6 +177,22 @@ def drain_orphaned_worker_review_routes(
         # the "reviewing" flip nor the transient-block drift fingerprint
         # below applies to a permanently-dead PR.
         closed_unmerged_converged = bool(review_result.data.get("closed_unmerged_converged"))
+        # Issue #2051: the janitor cap router returns ok=True with
+        # ``escalation_deferred_live_worker`` when it DEFERRED the cap
+        # escalation because a live worker still holds the issue -- no
+        # packet and no routing. Same treatment as routed_to_rework: it
+        # must not flip this issue to "reviewing", and the drain reports
+        # it as drift (not routed_to_review) below so the route can
+        # re-collect on a later pass.
+        escalation_deferred_live_worker = bool(
+            review_result.data.get("escalation_deferred_live_worker")
+        )
+        # Issue #2034: stable discriminator set by review()'s janitor-gate
+        # blocked return -- True only when the unchanged-diff no-op gate
+        # contributed to the refusal. Read once, before the lock, like the
+        # flags above; consumers must branch on this flag, never on the
+        # failure-message text.
+        is_no_op_rework = bool(review_result.data.get("is_no_op_rework"))
         with _wf.state_lock(state_file):
             state = _wf.load_state(state_file)
             pr_state = state["prs"].get(str(pr_number), {})
@@ -184,6 +202,7 @@ def drain_orphaned_worker_review_routes(
                 review_result.ok
                 and not routed_to_rework
                 and not closed_unmerged_converged
+                and not escalation_deferred_live_worker
                 and decision_unchanged
                 and isinstance(entry, dict)
                 and entry.get("status") == "dispatched"
@@ -231,6 +250,28 @@ def drain_orphaned_worker_review_routes(
             ):
                 # Review failed: mark the drift fingerprint so the next pass
                 # does not retry/re-emit for this unchanged head.
+                # Issue #2034: only a refusal the janitor's unchanged-diff
+                # no-op gate caused -- review() flags it ``is_no_op_rework``
+                # in the result data -- reaches the no-op drain. A transient
+                # refusal (draft auto-readied, ``gh pr ready`` failed, a flake
+                # rerun was triggered or is in flight, checks infra-blocked)
+                # belongs to its own lane: the worker pushed real changes, so
+                # the drift fingerprint below is all the bookkeeping this pass
+                # needs and escalating it as ``rework_no_op`` would be wrong.
+                if (
+                    reason == "dead_worker_with_head_change"
+                    and no_op_routes is not None
+                    and is_no_op_rework
+                ):
+                    no_op_routes.append(
+                        NoOpReworkRoute(
+                            issue_number=issue_number,
+                            pr_number=pr_number,
+                            live_head_sha=live_head_sha,
+                            reason=reason,
+                            branch=entry.get("branch_name"),
+                        )
+                    )
                 state["issues"][str(issue_number)] = {
                     **entry,
                     "orphan_drift_fingerprint": fingerprint,
@@ -252,7 +293,7 @@ def drain_orphaned_worker_review_routes(
                 state = write_gate.append_event(
                     state,
                     "orphaned_worker_routed_to_review"
-                    if review_result.ok
+                    if review_result.ok and not escalation_deferred_live_worker
                     else "orphaned_worker_drift",
                     {
                         "issue_number": issue_number,
@@ -312,3 +353,50 @@ def drain_orphaned_worker_review_routes(
                 )
                 state["issues"][str(issue_number)] = entry
                 write_gate.save_state(state)
+
+
+def drain_orphaned_worker_routes(
+    review_routes: Sequence[OrphanedWorkerReviewRoute],
+    no_op_routes: list[NoOpReworkRoute],
+    *,
+    review_callback: Callable[[int], Any] | None,
+    record_review_callback: Callable[..., Any] | None,
+    enrich_checks_callback: Callable[..., list[dict[str, Any]]] | None,
+    gh: GitHubLike,
+    config: OrchestratorConfig,
+    state_file: Path,
+    write_gate: WriteGate,
+    sessions_dir: Path,
+    repo_root: Any,
+    worktrees_dir: Path | None,
+) -> None:
+    """Drain the orphan sweep's post-lock routes: review lane, then no-op dispositions.
+
+    Issue #2034: every no-op finding (a clean exit with the head unchanged, or a
+    head change the janitor refused to review) gets a disposition -- CI-failure
+    rework, a once-per-head rebuttal review, or a visible ``rework_no_op``
+    escalation -- so none rests in ``dispatched``. The review drain runs first
+    because a refused head-change review appends to ``no_op_routes``.
+    """
+    drain_orphaned_worker_review_routes(
+        review_routes,
+        review_callback=review_callback,
+        gh=gh,
+        config=config,
+        state_file=state_file,
+        write_gate=write_gate,
+        no_op_routes=no_op_routes,
+    )
+    drain_no_op_rework_routes(
+        no_op_routes,
+        gh=gh,
+        config=config,
+        state_file=state_file,
+        write_gate=write_gate,
+        sessions_dir=sessions_dir,
+        repo_root=repo_root,
+        worktrees_dir=worktrees_dir,
+        review_callback=review_callback,
+        record_review_callback=record_review_callback,
+        enrich_checks_callback=enrich_checks_callback,
+    )

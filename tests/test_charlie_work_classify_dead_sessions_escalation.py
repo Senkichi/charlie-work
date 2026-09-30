@@ -338,7 +338,7 @@ def test_classify_dead_sessions_retains_sidecar_on_inconclusive_probe(
     )
     sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
 
-    with patch("charlie_work.worker.is_session_alive", return_value=False):
+    with patch("charlie_work.worker_fate.is_alive", return_value=False):
         _classify_dead_sessions_and_update_throttle_state(
             sessions_dir, paths.state_file, fake_gh, config, write_gate=_wg(paths.state_file)
         )
@@ -415,7 +415,7 @@ def test_classify_dead_sessions_reaps_sidecar_when_probe_conclusively_stale(
     )
 
     with (
-        patch("charlie_work.worker.is_session_alive", return_value=False),
+        patch("charlie_work.worker_fate.is_alive", return_value=False),
         patch("charlie_work.worker.real_activity_probe_for", return_value=stale_probe),
     ):
         _classify_dead_sessions_and_update_throttle_state(

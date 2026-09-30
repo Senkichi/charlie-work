@@ -1,7 +1,7 @@
 """Probe/liveness tests for the devin-shell adapter.
 
 Split out of ``tests/test_devin_shell.py`` (issue #1542, Track-1 pilot):
-``probe_devin`` binary checks, ``is_session_alive`` PID + start-time
+``probe_devin`` binary checks, ``worker_fate.is_alive`` PID + start-time
 matching (including PID-recycling rejection and the indeterminate-probe
 fallback), and the ``/proc/<pid>/stat`` comm-parsing unit tests.
 """
@@ -12,15 +12,21 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 from _devin_shell_fixtures import _FAKE_DEVIN_VERSION, _write_fake_devin
 
+from charlie_work import worker_fate
 from charlie_work.devin_shell import (
     SessionRecord,
-    is_session_alive,
     probe_devin,
 )
+
+
+def _record_alive(record: Any) -> bool:
+    """Liveness of a sidecar record, through the single ``worker_fate`` seam."""
+    return worker_fate.is_alive(record.pid, record.process_start_time)
 
 
 def test_probe_devin_ok_for_zero_exit_fake(tmp_path: Path) -> None:
@@ -64,14 +70,14 @@ def test_is_session_alive_reflects_real_process(tmp_path: Path) -> None:
             started_at="2026-01-01T00:00:00Z",
             log_path="log.txt",
         )
-        assert is_session_alive(alive_record) is True
+        assert _record_alive(alive_record) is True
     finally:
         process.kill()
         process.wait(timeout=5)
 
     # Regression guard for the Windows os.kill(pid, 0) trap: that call keeps
     # reporting a reaped PID as alive indefinitely (verified empirically —
-    # see is_session_alive's docstring), so this must be an exact
+    # see worker_fate.is_alive's docstring), so this must be an exact
     # post-wait() assertion, not a "poll until it settles" retry loop.
     dead_record = SessionRecord(
         issue_number=1,
@@ -83,7 +89,7 @@ def test_is_session_alive_reflects_real_process(tmp_path: Path) -> None:
         started_at="2026-01-01T00:00:00Z",
         log_path="log.txt",
     )
-    assert is_session_alive(dead_record) is False
+    assert _record_alive(dead_record) is False
 
 
 def test_is_session_alive_false_for_none_pid() -> None:
@@ -99,7 +105,7 @@ def test_is_session_alive_false_for_none_pid() -> None:
         error="devin not found",
     )
 
-    assert is_session_alive(record) is False
+    assert _record_alive(record) is False
 
 
 def test_is_session_alive_false_for_implausible_pid() -> None:
@@ -117,7 +123,7 @@ def test_is_session_alive_false_for_implausible_pid() -> None:
         log_path="log.txt",
     )
 
-    assert is_session_alive(record) is False
+    assert _record_alive(record) is False
 
 
 def test_is_session_alive_rejects_pid_recycling_mismatched_start_time(tmp_path: Path) -> None:
@@ -160,7 +166,7 @@ def test_is_session_alive_rejects_pid_recycling_mismatched_start_time(tmp_path: 
         )
 
         # Should return False because start time doesn't match
-        assert is_session_alive(record) is False
+        assert _record_alive(record) is False
     finally:
         process.kill()
         process.wait(timeout=5)
@@ -198,7 +204,7 @@ def test_is_session_alive_accepts_matching_start_time(tmp_path: Path) -> None:
         )
 
         # Should return True because start time matches
-        assert is_session_alive(record) is True
+        assert _record_alive(record) is True
     finally:
         process.kill()
         process.wait(timeout=5)
@@ -223,7 +229,7 @@ def test_is_session_alive_legacy_record_fallback() -> None:
     )
 
     # Should return True using pid-only fallback
-    assert is_session_alive(record) is True
+    assert _record_alive(record) is True
 
 
 def test_posix_stat_parse_with_spaces_in_comm(
@@ -274,7 +280,7 @@ def test_is_session_alive_probe_none_treats_indeterminate_as_alive(
 ) -> None:
     """Issue #360 criterion #1: a start-time probe failure is not a definitive dead signal.
 
-    When ``get_process_start_time`` returns ``None`` for a live PID, ``is_session_alive``
+    When ``get_process_start_time`` returns ``None`` for a live PID, ``worker_fate.is_alive``
     treats the liveness signal as indeterminate and returns ``True`` rather than
     reaping a potentially-live worker.
     """
@@ -307,7 +313,7 @@ def test_is_session_alive_probe_none_treats_indeterminate_as_alive(
         )
 
         # Should return True because the probe was indeterminate, not definitive dead.
-        assert is_session_alive(record) is True
+        assert _record_alive(record) is True
     finally:
         process.kill()
         process.wait(timeout=5)

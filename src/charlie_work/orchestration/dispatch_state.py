@@ -47,7 +47,15 @@ from datetime import UTC, datetime
 from typing import Any
 
 import charlie_work.workflow as _wf
+from charlie_work import worker_fate
 from charlie_work.worker_pid_stamp import stamp_worker_process
+from charlie_work.worker_launch_gate import (
+    REASON_PROVIDER_THROTTLED,
+    FleetLaunchLock,
+    WorkerLaunchDeferral,
+    _launch_workers,
+    issue_worker_launch_permit,
+)
 from charlie_work.adapters import SessionRequest, cleanup_stale_session_tmp_files
 from charlie_work.backlog_reachability import (
     classify_backlog_reachability,
@@ -87,7 +95,6 @@ from charlie_work.state import (
     clear_escalation,
     clear_escalation_on_issue_prs,
     escalation_reason_class,
-    is_throttled,
     operator_claimed_issues,
     record_non_empty_dispatch,
 )
@@ -101,6 +108,7 @@ def _dispatch_impl(
     stalled_entries: list[dict[str, int]] | None = None,
     ready_issues: list[dict[str, Any]] | None = None,
     merged_prs: _wf._MergedPRListOutcome | None = None,
+    launch_lock: FleetLaunchLock,
 ) -> _wf.CommandResult:
     # Issue #427: include closed ready-labeled issues so externally-merged PRs
     # (e.g. Aviator MergeQueue) can be finalized even after GitHub closes the issue.
@@ -179,20 +187,18 @@ def _dispatch_impl(
             write_gate=self.write_gate,
         )
 
-    # Count live workers after stall handling (stalled workers are killed).
-    # Corroborated against state.json (issue #343) so a ghost -- a live
-    # worker_pid whose sidecar was removed -- cannot silently free a slot.
-    live_count = _wf._count_live_sessions(sessions_dir, self.paths.state_file)
-
-    # Apply global concurrency governor cap with pre-computed live_count.
-    # Issue #1129: fresh-issue dispatch also applies open-PR backpressure
+    # Issue #2041/#2055: the shared worker-launch gate -- provider-throttle
+    # pre-check (lock-free), the fleet lock realized HERE with a bounded wait
+    # (never across the scans above), live_count computed under it, then the
+    # concurrency governor and the authoritative throttle read. Issue #1129:
+    # fresh-issue dispatch also applies open-PR backpressure
     # (max_open_agent_prs), pacing new PR creation to the review/merge lane.
-    gov = self._apply_concurrency_governor(
+    permit = issue_worker_launch_permit(
+        self,
         dispatch_limit,
-        live_count=live_count,
         apply_open_pr_backpressure=True,
+        launch_lock=launch_lock,
     )
-    dispatch_limit = gov.dispatch_limit
 
     # Compute the merged PR list (if already fetched) for the tripwire so
     # loop() can reuse it and avoid a second GraphQL call per pass.
@@ -202,31 +208,27 @@ def _dispatch_impl(
         else None
     )
 
-    # Apply provider throttle cooldown check
-    with _wf.state_lock(self.paths.state_file):
-        state = _wf.load_state(self.paths.state_file)
-        if is_throttled(state):
-            throttled_until = state.get("throttled_until")
-            # Return immediately with deferral reason
-            data = {
-                "selected_count": 0,
-                "attempted_count": 0,
-                "failed_count": 0,
-                "skipped_issue_numbers": [],
-                "label_errors": [],
-                "sessions": [],
-                "dispatch_results": [],
-                "merged_prs": merged_prs_for_tripwire,
-                "deferred_reason": "provider_throttled",
-                "throttled_until": throttled_until,
-            }
-            if gov.any_term_enabled:
-                data.update(gov.report_fields())
-            return _wf.CommandResult(
-                False,
-                f"dispatch deferred: provider throttled until {throttled_until}",
-                data,
-            )
+    if isinstance(permit, WorkerLaunchDeferral):
+        # Return immediately with deferral reason
+        data = {
+            "selected_count": 0,
+            "attempted_count": 0,
+            "failed_count": 0,
+            "skipped_issue_numbers": [],
+            "label_errors": [],
+            "sessions": [],
+            "dispatch_results": [],
+            "merged_prs": merged_prs_for_tripwire,
+            "deferred_reason": permit.reason,
+            **permit.report_fields(),
+        }
+        if permit.reason == REASON_PROVIDER_THROTTLED:
+            message = f"dispatch deferred: provider throttled until {permit.throttled_until}"
+        else:
+            message = f"dispatch deferred: {permit.reason}"
+        return _wf.CommandResult(permit.ok, message, data)
+    gov = permit.governor
+    dispatch_limit = permit.max_launches
 
     def _resolve_merged_prs(
         outcome: _wf._MergedPRListOutcome | None,
@@ -250,6 +252,11 @@ def _dispatch_impl(
     # Dry-run: read-only planning — compute selection and would-be SessionRequests,
     # but skip all state writes, label transitions, and file mutations.
     if self.dry_run:
+        # Issue #2055: nothing below launches, so the fleet lock the permit
+        # realized has served its purpose (governor decision) -- release it
+        # before the read-only planning scan rather than holding it to the
+        # lane's ``finally`` (release is idempotent; that finally still runs).
+        launch_lock.release()
         selected_issue_numbers: list[int] = []
         skipped_issue_numbers: list[int] = []
         # Detect stalled sessions (read-only for dry-run)
@@ -1088,13 +1095,13 @@ def _dispatch_impl(
         )
     manifest_path = self._layout.session_manifest
     results_path = self._layout.session_results
-    dispatch_results = _wf.dispatch_sessions(
-        self.repo_root,
-        manifest_path,
-        results_path,
-        self._adapter_settings(),
-        session_requests,
-    )
+    dispatch_results = _launch_workers(self, permit, self._adapter_settings(), session_requests)
+    # Issue #2055: the sessions the fleet cap counts are on disk now -- the
+    # governor -> claim -> launch window the lock exists to serialize is
+    # closed. Release before the result bookkeeping below instead of holding
+    # it to the lane's ``finally`` (release is idempotent; that finally
+    # still runs and covers every other exit path).
+    launch_lock.release()
     successful_issue_numbers = {result.issue_number for result in dispatch_results if result.ok}
     # Issue #523: a live_worker_redispatch_averted result claims the prior
     # worker is still alive, but the adapter's probe (_probe_recovery_liveness)
@@ -1135,6 +1142,10 @@ def _dispatch_impl(
     manual = self.config.worker.harness == "manual"
     label_errors: list[int] = []
     label_error_failures: dict[int, str] = {}
+    # B6: fates the phantom-worker lane resolves while ``state_lock`` is held,
+    # reported (rule-1 stale evidence) once the lock is released below.
+    phantom_fates: dict[int, list[worker_fate.WorkerFate]] = {}
+
     with _wf.state_lock(self.paths.state_file):
         state = _wf.load_state(self.paths.state_file)
         for request in session_requests:
@@ -1210,6 +1221,7 @@ def _dispatch_impl(
                     request,
                     full_issue,
                     sessions_dir,
+                    on_fate=lambda fate: worker_fate.collect_fate(phantom_fates, fate),
                 )
                 # A phantom live worker is being routed as dead; do not
                 # preserve a stale worker_pid that would keep the slot
@@ -1792,6 +1804,10 @@ def _dispatch_impl(
             state_path=self.paths.state_file,
         )
         _wf.save_state(self.paths.state_file, state)
+    worker_fate.report_stale_evidence(
+        self.paths.state_file, phantom_fates, write_gate=self.write_gate
+    )
+
     result_dicts = [result.to_dict() for result in dispatch_results]
     message = "dispatch complete"
     if failed_issue_numbers:

@@ -1,1 +1,8 @@
 2800
+# Architecture-deepening plan, candidate 3 ("markdown structure"): +~100
+# lines for `_scan_markdown_structure`, the stdlib-only CommonMark
+# block-structure scanner duplicated from `charlie_work.markdown_fence.scan`
+# (this script cannot import charlie_work -- scripts/README.md:50-51). Not
+# extractable: a second script file would violate the same stdlib-only
+# import boundary this duplicate exists to respect. Raised to the next
+# MARK_QUANTUM multiple per the ratchet's hand-raise rule (2800 -> 3000).

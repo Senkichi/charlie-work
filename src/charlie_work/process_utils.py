@@ -17,6 +17,8 @@ from pathlib import Path
 from typing import Any
 
 from .orphan_sweep import (  # noqa: F401  (deliberate re-export)
+    _enumerate_fingerprinted_children,
+    _reap_enumerated_children,
     _self_ancestor_pids,
     sweep_orphan_processes,
 )
@@ -387,6 +389,7 @@ def write_worker_terminal_status(
     ended_at: str,
     duration_seconds: float,
     worker_outcome: dict[str, Any] | None = None,
+    worker_outcome_written_at: str | None = None,
 ) -> None:
     """Atomically persist a worker process's terminal status (issue #773).
 
@@ -394,6 +397,11 @@ def write_worker_terminal_status(
     loop observes the process has exited. Uses the tmp-file + ``replace()``
     pattern required by CLAUDE.md for every JSON state write so a reader (the
     orphan detector's polling pass) never observes a partially-written file.
+
+    ``worker_outcome_written_at`` is the outcome file's own mtime (B5):
+    ``ended_at`` is when the watcher saw the exit, not when a possibly
+    leftover outcome file was written. Consumers use it as the freshness
+    anchor when present and fall back to ``ended_at`` for older records.
     """
     payload: dict[str, Any] = {
         "pid": pid,
@@ -404,10 +412,45 @@ def write_worker_terminal_status(
     }
     if worker_outcome is not None:
         payload["worker_outcome"] = worker_outcome
+    if worker_outcome_written_at is not None:
+        payload["worker_outcome_written_at"] = worker_outcome_written_at
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_suffix(path.suffix + ".tmp")
     tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     tmp_path.replace(path)
+
+
+def terminal_record_proves_completion(
+    sessions_dir: Path, issue_number: int, sidecar_suffix: str, pid: Any
+) -> bool:
+    """True when this exact worker process exited 0 AND handed off a worker outcome.
+
+    Ground truth that the session finished its task, so its log tail is the
+    model's own completion prose, not a provider error. Log-tail throttle
+    markers ("rate limit", "usage limit") false-positive on that prose whenever
+    the issue is *about* rate limits -- the #656 failure class, which recurred
+    2026-09-29 when issue #2002's clean-exit worker armed a 76-minute repo
+    throttle. Requires all three of: matching ``pid`` (a stale record from an
+    earlier attempt must not vouch for this one), ``exit_code == 0``, and a
+    ``worker_outcome`` dict (exit 0 alone is not enough -- the CLI's own exit
+    status on a provider limit is not a contract we control). Never raises.
+    """
+    path = worker_terminal_status_path(sessions_dir, issue_number, sidecar_suffix)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(data, dict) or pid is None:
+        return False
+    try:
+        same_process = int(data.get("pid")) == int(pid)
+    except (TypeError, ValueError):
+        return False
+    return (
+        same_process
+        and data.get("exit_code") == 0
+        and isinstance(data.get("worker_outcome"), dict)
+    )
 
 
 def find_worker_terminal_status(sessions_dir: Path, issue_number: int) -> dict[str, Any] | None:
@@ -503,12 +546,23 @@ def start_terminal_status_watcher(
         ended_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
         try:
             worker_outcome = None
+            worker_outcome_written_at = None
             if worktree_path is not None:
                 # Local import to avoid a circular import: worktree.py already
                 # imports is_pid_alive from this module (issue #935).
+                from .config import WORKER_OUTCOME_FILENAME
                 from .worktree import read_worker_outcome
 
                 worker_outcome = read_worker_outcome(worktree_path)
+                if worker_outcome is not None:
+                    # B5: the file's mtime, not ``ended_at``, is when it was
+                    # written; ``None`` on OS error (consumer falls back).
+                    try:
+                        mtime = (worktree_path / WORKER_OUTCOME_FILENAME).stat().st_mtime
+                        written = datetime.fromtimestamp(mtime, tz=UTC)
+                        worker_outcome_written_at = written.isoformat().replace("+00:00", "Z")
+                    except OSError:
+                        pass
             write_worker_terminal_status(
                 path,
                 pid=pid,
@@ -516,6 +570,7 @@ def start_terminal_status_watcher(
                 started_at=started_at,
                 ended_at=ended_at,
                 duration_seconds=duration_seconds,
+                worker_outcome_written_at=worker_outcome_written_at,
                 worker_outcome=worker_outcome,
             )
         except Exception:
@@ -557,9 +612,8 @@ def _ancestor_guard_exempt_pids() -> frozenset[int]:
 def kill_process_tree(pid: int, expected_start_time: float | None = None) -> list[int]:
     """Kill a process and all its children (process tree).
 
-    Returns a list of PIDs that were killed (including the root PID and children).
-    On Windows, uses taskkill /T /F to terminate the process tree.
-    On POSIX, uses os.killpg to kill the process group.
+    On Windows, uses taskkill /T /F to terminate the process tree; on POSIX,
+    uses os.killpg to kill the process group.
 
     This is used to clean up stalled sessions where the wrapper PID is alive
     but the agent loop has died, leaving child processes holding resources.
@@ -572,8 +626,8 @@ def kill_process_tree(pid: int, expected_start_time: float | None = None) -> lis
             the process is NOT killed and an empty list is returned.
 
     Returns:
-        A list of PIDs that were killed (including the root PID and children). Returns empty list
-        if the process could not be killed or if the start time verification failed.
+        PIDs verified dead (root + enumerated children, each confirmed dead or
+        individually reaped post-kill, issue #2059); empty list on failure.
     """
     killed_pids = []
 
@@ -599,7 +653,7 @@ def kill_process_tree(pid: int, expected_start_time: float | None = None) -> lis
     # existing ``pgid == os.getpgid(0)`` guard below still covers the
     # process-group shape; this PID-set check covers the direct case on both
     # platforms regardless of group boundaries.
-    if pid in _ancestor_guard_exempt_pids():
+    if pid in (exempt_pids := _ancestor_guard_exempt_pids()):
         # Refusals are logged, not silent: whether this guard ever fires is
         # the only telemetry that can confirm or refute the sweep-needle
         # hypothesis #1842 tracks.
@@ -622,8 +676,7 @@ def kill_process_tree(pid: int, expected_start_time: float | None = None) -> lis
             # Start time mismatch - PID has been recycled
             return killed_pids
 
-    # Enumerate children before killing
-    child_pids = _enumerate_child_pids(pid)
+    child_starts = _enumerate_fingerprinted_children(pid)  # fingerprinted before killing
 
     try:
         if os.name == "nt":
@@ -644,9 +697,6 @@ def kill_process_tree(pid: int, expected_start_time: float | None = None) -> lis
             # dead rather than trusting the return code alone.
             if result.returncode in (0, 1) or not is_pid_alive(pid):
                 killed_pids.append(pid)
-                # taskkill /T kills children but doesn't list them reliably
-                # Add enumerated children to the killed list
-                killed_pids.extend(child_pids)
         else:
             # POSIX: kill the process group
             try:
@@ -657,8 +707,6 @@ def kill_process_tree(pid: int, expected_start_time: float | None = None) -> lis
                     return killed_pids
                 os.killpg(pgid, 9)  # SIGKILL
                 killed_pids.append(pid)
-                # Add enumerated children to the killed list
-                killed_pids.extend(child_pids)
             except (ProcessLookupError, OSError):
                 # Process may have already exited
                 pass
@@ -666,6 +714,12 @@ def kill_process_tree(pid: int, expected_start_time: float | None = None) -> lis
         # Best-effort kill - don't raise
         pass
 
+    # Children are recorded only when verified dead; survivors get reaped,
+    # phantoms refused (_reap_enumerated_children, issue #2059).
+    if pid in killed_pids:
+        killed_pids.extend(
+            _reap_enumerated_children(pid, child_starts, exempt_pids, expected_start_time)
+        )
     return killed_pids
 
 

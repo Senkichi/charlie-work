@@ -88,7 +88,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from charlie_work import layout, quiesce
+from charlie_work import layout, process_chain, quiesce
 from charlie_work.instrumentation import log_event, query_events
 
 logger = logging.getLogger(__name__)
@@ -167,18 +167,18 @@ def pytest_tree_load(
     diagnostics and tests); ``measure_host_load`` always scopes.
     """
     resolved_self_pid = self_pid if self_pid is not None else os.getpid()
+    snapshot = tuple(processes)
+    rows = process_chain.proc_rows(snapshot)
     proc_by_pid: dict[int, quiesce.ProcessInfo] = {}
-    ppid_by_pid: dict[int, int] = {}
     children_by_ppid: dict[int, list[int]] = {}
     root_pids: set[int] = set()
-    for proc in processes:
+    for proc in snapshot:
         proc_by_pid[proc.pid] = proc
-        ppid_by_pid[proc.pid] = proc.ppid
         children_by_ppid.setdefault(proc.ppid, []).append(proc.pid)
         if _PYTEST_INVOCATION_RE.search(proc.command_line or ""):
             root_pids.add(proc.pid)
 
-    excluded = _self_tree(children_by_ppid, ppid_by_pid, root_pids, resolved_self_pid)
+    excluded = _self_tree(children_by_ppid, rows, root_pids, resolved_self_pid)
 
     # A nested root's subtree lies inside its outer root's, so overlapping
     # subtrees are one suite. Merging by overlap -- rather than skipping roots
@@ -274,7 +274,7 @@ def _tree_references_scope(
 
 def _self_tree(
     children_by_ppid: dict[int, list[int]],
-    ppid_by_pid: dict[int, int],
+    proc_rows: dict[int, process_chain.ProcRow],
     root_pids: set[int],
     self_pid: int,
 ) -> set[int]:
@@ -284,15 +284,16 @@ def _self_tree(
     folds nested invocations (a suite that itself shells out to pytest) into
     the one suite this measurement is part of, so only *other* trees count as
     external load. Empty when the caller is not running under pytest at all.
+
+    The upward walk is ``process_chain.ancestor_chain_pids`` (issue #2058):
+    it stops at a parent created after its child, so a pid recycled since the
+    recorded parent exited cannot pull an unrelated process -- or the pytest
+    tree above it -- into the exclusion set.
     """
-    node: int | None = self_pid
-    chain: set[int] = set()
     top: int | None = None
-    while node is not None and node not in chain:
-        chain.add(node)
-        if node in root_pids:
-            top = node
-        node = ppid_by_pid.get(node) or None  # ppid 0 / absent: end of chain
+    for pid in process_chain.ancestor_chain_pids(self_pid, proc_rows):
+        if pid in root_pids:
+            top = pid
     if top is None:
         return set()
     return _subtree_pids(children_by_ppid, top)

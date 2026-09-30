@@ -1,4 +1,4 @@
-1200
+1000
 # Issue #1716 / PR #1818 round-7 review: the drain-suppression regression
 # tests (TestDrainSuppressesLocalRework) put the file at 1068 lines -- past
 # the 1000 mark. Raised to the next MARK_QUANTUM multiple per the ratchet's

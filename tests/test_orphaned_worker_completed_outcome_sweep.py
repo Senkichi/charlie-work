@@ -2,8 +2,9 @@
 
 Split out of ``tests/test_charlie_work_orphaned_worker_sweep.py`` during the
 #1911 rework: that file crossed the 800-line file-size cap. A dead devin
-rework session never gets a terminal-status record (only claude_code's
-launch path runs ``start_terminal_status_watcher``), so
+rework session can have no terminal-status record -- the watcher writes it
+only once the spawned process exits, so an orchestrator restart mid-session
+leaves none (and pre-#2052 devin launches wrote none at all) -- so
 ``terminal_exit_code`` is None even when the session completed, pushed, and
 wrote a fresh, on-target ``.worker-outcome.json``. Before crediting a worker
 death, the sweep must route that outcome into the #1877 apply path
@@ -13,7 +14,7 @@ death, the sweep must route that outcome into the #1877 apply path
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from _dispatch_fixtures import _stub_real_activity_probe_for_stalled_tests  # noqa: F401
@@ -29,12 +30,18 @@ from charlie_work.state import (
 
 
 # ---------------------------------------------------------------------------
-# Issue #1911: a dead devin rework session never gets a terminal-status record
-# (only claude_code's launch path runs start_terminal_status_watcher), so
-# ``terminal_exit_code`` is None even when the session completed, pushed, and
-# wrote a fresh, on-target .worker-outcome.json. Before crediting a worker
-# death, the sweep must route that outcome into the #1877 apply path.
+# Issue #1911: a dead devin rework session can have no terminal-status record
+# (since #2052 devin launches do run start_terminal_status_watcher, but it
+# only writes once the process exits -- an orchestrator restart mid-session
+# leaves none), so ``terminal_exit_code`` is None even when the session
+# completed, pushed, and wrote a fresh, on-target .worker-outcome.json.
+# Before crediting a worker death, the sweep must route that outcome into
+# the #1877 apply path.
 # ---------------------------------------------------------------------------
+
+
+def _iso(value: datetime) -> str:
+    return value.isoformat().replace("+00:00", "Z")
 
 
 def test_orphaned_worker_fresh_outcome_without_terminal_record_is_not_a_death(
@@ -60,8 +67,8 @@ def test_orphaned_worker_fresh_outcome_without_terminal_record_is_not_a_death(
             "pr_body": "Closes #207\n\nCorrected PR body per review.",
         },
     )
-    # No terminal-status file in sessions_dir -- the devin launch path never
-    # writes one.
+    # No terminal-status file in sessions_dir -- the watcher-never-ran shape
+    # (e.g. orchestrator restart mid-session).
 
     with patch.object(rework_outcome, "remote_branch_head_sha", lambda *_a: "abc123"):
         _run_orphan_sweep(tmp_path, paths, config, fake_gh)
@@ -203,10 +210,19 @@ def test_orphaned_worker_outcome_at_other_head_is_a_death(tmp_path: Path) -> Non
 def test_orphaned_worker_recorded_crash_with_fresh_outcome_is_a_death(
     tmp_path: Path,
 ) -> None:
-    """Boundary pin: a terminal record carrying a confirmed non-zero exit is
-    still a crash even when a fresh, on-target outcome file exists -- the
-    #1911 recovery only fills the *missing* terminal-record case
-    (``terminal_exit_code is None``), matching the issue's suggested fix."""
+    """B3 (wf-review-opus.md), rule 4 flip: was a "boundary pin" -- a
+    terminal record carrying a confirmed non-zero exit used to be treated
+    as a crash even when a fresh, on-target, confirmed-push outcome file
+    existed, because the #1911 recovery only filled the *missing*
+    terminal-record case (``terminal_exit_code is None``).
+
+    Rule 4 (design doc §9) makes this unconditional: "a fresh outcome file
+    beats the exit code; the exit code decides only without one" --
+    ``resolve_fate``'s rows 2/3 credit a confirmed push regardless of exit
+    code, because a worker can push and then crash during teardown. Name
+    kept (leaf-name convention) though it no longer pins a death; only the
+    assertions flip.
+    """
     config, paths, fake_gh, _dispatched_at = _dead_worker_rework_bed(tmp_path)
     _write_outcome(
         paths,
@@ -225,8 +241,9 @@ def test_orphaned_worker_recorded_crash_with_fresh_outcome_is_a_death(
             {
                 "pid": 99999,
                 "exit_code": 1,
-                "started_at": "2024-01-01T00:00:00Z",
-                "ended_at": "2024-01-01T00:05:00Z",
+                "started_at": _iso(datetime.now(UTC) - timedelta(minutes=10)),
+                # This dispatch's own record (rule 1: ended_at > dispatched_at).
+                "ended_at": _iso(datetime.now(UTC) - timedelta(minutes=5)),
                 "duration_seconds": 300.0,
             }
         ),
@@ -237,12 +254,25 @@ def test_orphaned_worker_recorded_crash_with_fresh_outcome_is_a_death(
 
     state = load_state(paths.state_file)
     entry = state["issues"]["207"]
-    assert entry.get("status") == "rework_requested"
-    assert isinstance(entry.get("worker_death_at"), list)
+    # Not credited as a death: the confirmed push outrances the recorded
+    # non-zero exit code (rule 4).
+    assert entry.get("status") == "dispatched"
+    assert entry.get("worker_death_at") is None
     events = state.get("events", [])
-    recovered = [e for e in events if e.get("kind") == "orphaned_worker_recovered"]
-    assert len(recovered) == 1
-    assert recovered[0]["payload"]["exit_code"] == 1
+    assert [e for e in events if e.get("kind") == "orphaned_worker_recovered"] == []
+    drift_events = [e for e in events if e.get("kind") == "orphaned_worker_drift"]
+    assert len(drift_events) == 1
+    payload = drift_events[0]["payload"]
+    assert payload["reason"] == "dead_worker_completed_outcome"
+    assert payload["exit_code"] == 1
+    assert payload["worker_outcome_head_sha"] == "abc123"
+    # No real git remote to confirm the push against in this test
+    # environment, so the outcome is surfaced but not (yet) applied.
+    assert any(
+        e.get("kind") == "rework_outcome_skipped"
+        and e["payload"].get("reason") == "remote_head_unavailable"
+        for e in events
+    )
     assert fake_gh.pr_edits == []
 
 
@@ -422,3 +452,73 @@ def test_orphaned_worker_completed_outcome_defers_review_until_applied(
     assert review_calls == [100]
     assert len(fake_gh.pr_edits) == 1
     assert entry.get("status") == "reviewing"
+
+
+def test_with_pr_stale_outcome_emits_worker_evidence_stale_once(tmp_path: Path) -> None:
+    """B6 (wf-r2-s6): the dead-worker-with-PR path resolves a fate through
+    ``fresh_completed_worker_outcome``; an outcome older than this dispatch is
+    ignored by rule 1 and must surface as a ``worker_evidence_stale`` warning
+    rather than vanishing -- once, however many passes re-sweep the worker.
+    """
+    from datetime import UTC
+    from unittest.mock import patch
+
+    from charlie_work.instrumentation import query_events
+
+    config, paths, fake_gh, dispatched_at = _dead_worker_rework_bed(tmp_path)
+    parsed_dispatch = datetime.fromisoformat(dispatched_at.replace("Z", "+00:00"))
+    _write_outcome(
+        paths,
+        tmp_path,
+        {"push_succeeded": True, "pr_created": False, "head_sha": "abc123"},
+        mtime=(parsed_dispatch - timedelta(hours=1)).astimezone(UTC),
+    )
+
+    with patch.object(rework_outcome, "remote_branch_head_sha", lambda *_a: "abc123"):
+        _run_orphan_sweep(tmp_path, paths, config, fake_gh)
+        _run_orphan_sweep(tmp_path, paths, config, fake_gh)
+
+    stale = query_events(paths.state_file, kind="worker_evidence_stale")
+    assert len(stale) == 1
+    assert stale[0]["level"] == "warning"
+    raw = stale[0]["payload"]
+    payload = json.loads(raw) if isinstance(raw, str) else raw
+    assert payload["issue_number"] == 207
+    assert payload["reason"] == "older_than_dispatch"
+    # The sweep may already have reset the entry by the time it reports, so the
+    # payload's dispatch time can come from the fate basis (``+00:00`` form).
+    assert (
+        datetime.fromisoformat(payload["dispatched_at"].replace("Z", "+00:00")) == parsed_dispatch
+    )
+    assert load_state(paths.state_file)["issues"]["207"]["stale_evidence_reported"]
+
+
+def test_with_pr_fresh_outcome_with_mismatching_head_emits_head_mismatch_stale(
+    tmp_path: Path,
+) -> None:
+    """Review wf-r2-1 #1: a fresh outcome claiming a push whose head is not on
+    the remote is rule 1's ``head_mismatch`` stale evidence. The with-PR lane
+    resolves the same outcome twice (``fresh_completed_worker_outcome`` against
+    the live head, then ``blocked_worker_outcome`` without it); collecting only
+    the last fate dropped the mismatch and emitted no signal at all."""
+    from charlie_work.instrumentation import query_events
+
+    config, paths, fake_gh, _dispatched_at = _dead_worker_rework_bed(tmp_path)
+    _write_outcome(
+        paths,
+        tmp_path,
+        {"push_succeeded": True, "pr_created": False, "head_sha": "def456"},
+    )
+
+    # The bed's live PR head is ``abc123``; the outcome claims ``def456``.
+    _run_orphan_sweep(tmp_path, paths, config, fake_gh)
+    _run_orphan_sweep(tmp_path, paths, config, fake_gh)
+
+    stale = query_events(paths.state_file, kind="worker_evidence_stale")
+    assert len(stale) == 1
+    raw = stale[0]["payload"]
+    payload = json.loads(raw) if isinstance(raw, str) else raw
+    assert payload["issue_number"] == 207
+    assert payload["reason"] == "head_mismatch"
+    assert payload["evidence_head"] == "def456"
+    assert payload["live_head"] == "abc123"

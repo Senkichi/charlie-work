@@ -467,7 +467,7 @@ def test_stalled_review_throttled_rolls_back_attempt_count(monkeypatch, tmp_path
         state["prs"]["100"]["review_dispatch_attempt_count"] = 1
         save_state(app.paths.state_file, state)
 
-    monkeypatch.setattr("charlie_work.claude_code.is_worker_alive", lambda *_: False)
+    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: False)
 
     stalled = _detect_and_handle_stalled_reviews(
         reviews_dir,

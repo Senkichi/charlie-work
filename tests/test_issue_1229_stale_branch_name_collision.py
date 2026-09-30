@@ -795,7 +795,7 @@ def test_detect_drift_launch_stalled_stale_branch_does_not_mask_relabel(
         return [pid]
 
     with (
-        patch("charlie_work.worker.is_session_alive", return_value=True),
+        patch("charlie_work.worker_fate.is_alive", return_value=True),
         patch("charlie_work.reconcile.kill_process_tree", fake_kill),
     ):
         drift = detect_drift(gh, state, config, repo_root=tmp_path)

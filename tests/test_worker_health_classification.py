@@ -63,7 +63,7 @@ def test_classify_worker_health_healthy(tmp_path: Path) -> None:
     )
 
     # Mock the underlying adapter liveness function that is_alive() calls
-    with patch("charlie_work.worker.is_session_alive", return_value=True):
+    with patch("charlie_work.worker_fate.is_alive", return_value=True):
         config = OrchestratorConfig()
         now = datetime.now(UTC)
         health = classify_worker_health(view, config, now)
@@ -93,7 +93,7 @@ def test_classify_worker_health_dead_by_terminal_marker(tmp_path: Path) -> None:
     )
 
     # Mock the underlying adapter liveness function that is_alive() calls
-    with patch("charlie_work.worker.is_session_alive", return_value=True):
+    with patch("charlie_work.worker_fate.is_alive", return_value=True):
         config = OrchestratorConfig()
         now = datetime.now(UTC)
         health = classify_worker_health(view, config, now)
@@ -123,7 +123,7 @@ def test_classify_worker_health_dead_by_liveness(tmp_path: Path) -> None:
     )
 
     # Mock the underlying adapter liveness function that is_alive() calls to return False
-    with patch("charlie_work.worker.is_session_alive", return_value=False):
+    with patch("charlie_work.worker_fate.is_alive", return_value=False):
         config = OrchestratorConfig()
         now = datetime.now(UTC)
         health = classify_worker_health(view, config, now)
@@ -153,7 +153,7 @@ def test_classify_worker_health_legacy_none_start_time(tmp_path: Path) -> None:
     )
 
     # Mock the underlying adapter liveness function that is_alive() calls to return True (legacy fallback)
-    with patch("charlie_work.worker.is_session_alive", return_value=True):
+    with patch("charlie_work.worker_fate.is_alive", return_value=True):
         config = OrchestratorConfig()
         now = datetime.now(UTC)
         health = classify_worker_health(view, config, now)
@@ -184,7 +184,7 @@ def test_classify_worker_health_custom_terminal_marker(tmp_path: Path) -> None:
     )
 
     # Mock the underlying adapter liveness function that is_alive() calls
-    with patch("charlie_work.worker.is_session_alive", return_value=True):
+    with patch("charlie_work.worker_fate.is_alive", return_value=True):
         # Custom config with a custom terminal marker
         config = OrchestratorConfig(
             watchdog=WatchdogConfig(terminal_error_markers=("Custom fatal error",))
@@ -217,7 +217,7 @@ def test_classify_worker_health_no_io_performed(tmp_path: Path) -> None:
     )
 
     # Mock the underlying adapter liveness function that is_alive() calls
-    with patch("charlie_work.worker.is_session_alive", return_value=True):
+    with patch("charlie_work.worker_fate.is_alive", return_value=True):
         config = OrchestratorConfig()
         now = datetime.now(UTC)
         health = classify_worker_health(view, config, now)
@@ -258,7 +258,7 @@ def test_classify_worker_health_regression_test_suite_pattern(tmp_path: Path) ->
         reclaimed=None,
     )
 
-    with patch("charlie_work.worker.is_worker_alive", return_value=True):
+    with patch("charlie_work.worker_fate.is_alive", return_value=True):
         config = OrchestratorConfig()  # Default WARN-first settings
         now = datetime.now(UTC)
         health = classify_worker_health(view, config, now)
@@ -290,7 +290,7 @@ def test_classify_worker_health_malformed_started_at_claude_no_tool_calls(
         reclaimed=None,
     )
 
-    with patch("charlie_work.worker.is_worker_alive", return_value=True):
+    with patch("charlie_work.worker_fate.is_alive", return_value=True):
         config = OrchestratorConfig()
         now = datetime.now(UTC)
         health = classify_worker_health(view, config, now)
@@ -341,7 +341,7 @@ def test_classify_worker_health_incident_285_routine_exit_not_stalled(
         )
     )
 
-    with patch("charlie_work.worker.is_session_alive", return_value=False):
+    with patch("charlie_work.worker_fate.is_alive", return_value=False):
         config = OrchestratorConfig()
         health = classify_worker_health(view, config, now, probe)
         assert health not in (WorkerHealth.DEAD, WorkerHealth.STALLED)

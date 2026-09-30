@@ -431,6 +431,8 @@ def run_deadline_guarded_maintenance(
             app.gh,
             write_gate=app.write_gate,
             review_callback=app.review,
+            record_review_callback=app.record_review,
+            enrich_checks_callback=app._enrich_checks_infra_blocked,
             fleet_dir_override=app.fleet_dir_override,
         ),
         None,

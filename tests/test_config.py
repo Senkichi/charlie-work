@@ -13,6 +13,7 @@ from charlie_work.config import (
     ApiWorkerConfig,
     ConfigError,
     DispatchConfig,
+    HeartbeatConfig,
     OrchestratorConfig,
     RuntimeConfig,
     build_config_from_data,
@@ -321,26 +322,29 @@ def test_load_config_quota_probe_enabled_rejects_non_bool(tmp_path: Path) -> Non
 
 
 def test_load_config_supervisor_self_deploy_pull_ci_fleet_default() -> None:
-    """SupervisorConfig.self_deploy_pull_ci_fleet defaults to False (issue #552)."""
+    """FleetSupervisorConfig.self_deploy_pull_ci_fleet defaults to False (issue #552)."""
     config = load_config(Path("nonexistent.yaml"))
-    assert config.supervisor.self_deploy_pull_ci_fleet is False
+    assert config.fleet_supervisor.self_deploy_pull_ci_fleet is False
 
 
-def test_load_config_supervisor_self_deploy_pull_ci_fleet_accepts_true(tmp_path: Path) -> None:
+def test_load_config_supervisor_self_deploy_pull_ci_fleet_accepts_true(
+    tmp_path: Path,
+) -> None:
     config_file = tmp_path / "orchestrator.config.yaml"
     _write_config(
         config_file,
-        """supervisor:
+        """fleet_supervisor:
   self_deploy_pull_ci_fleet: true
 """,
     )
     config = load_config(config_file)
-    assert config.supervisor.self_deploy_pull_ci_fleet is True
+    assert config.fleet_supervisor.self_deploy_pull_ci_fleet is True
 
 
 def test_load_config_supervisor_self_deploy_pull_ci_fleet_rejects_non_bool(
     tmp_path: Path,
 ) -> None:
+    """A non-bool under the legacy ``supervisor:`` location still errors."""
     config_file = tmp_path / "orchestrator.config.yaml"
     _write_config(config_file, "supervisor:\n  self_deploy_pull_ci_fleet: not-a-bool\n")
     with pytest.raises(ConfigError, match="supervisor.*self_deploy_pull_ci_fleet.*must be a bool"):
@@ -2005,3 +2009,70 @@ def test_provider_suspended_is_deterministic_escalation_failure_kind() -> None:
     from charlie_work.config import DETERMINISTIC_ESCALATION_FAILURE_KINDS
 
     assert "provider_suspended" in DETERMINISTIC_ESCALATION_FAILURE_KINDS
+
+
+# ---------------------------------------------------------------------------
+# Issue #2048: heartbeat.stale_mention_parked_labels (HeartbeatConfig).
+# ---------------------------------------------------------------------------
+
+
+def test_heartbeat_config_defaults() -> None:
+    """Default HeartbeatConfig carries the fleet's shared non-lifecycle
+    triage taxonomy plus the tracker/umbrella/epic names issue #2048
+    enumerates. The drift-guard in
+    ``test_heartbeat_check_stale_issue_mentions_exclusions.py`` pins this
+    same default against the stdlib-only script's mirror."""
+    cfg = HeartbeatConfig()
+    assert cfg.stale_mention_parked_labels == (
+        "blocked",
+        "needs-design",
+        "human-action",
+        "question",
+        "wontfix",
+        "duplicate",
+        "invalid",
+        "tracker",
+        "umbrella",
+        "epic",
+    )
+
+
+def test_heartbeat_config_normalizes_bare_string_to_tuple() -> None:
+    """Same coercion contract as DispatchConfig.human_merge_labels: a bare
+    string wraps rather than iterates."""
+    cfg = HeartbeatConfig(stale_mention_parked_labels="custom-park")
+    assert cfg.stale_mention_parked_labels == ("custom-park",)
+
+
+def test_heartbeat_config_normalizes_list_to_tuple() -> None:
+    cfg = HeartbeatConfig(stale_mention_parked_labels=["custom-park", "wontfix"])
+    assert cfg.stale_mention_parked_labels == ("custom-park", "wontfix")
+
+
+def test_orchestrator_config_heartbeat_section_defaults() -> None:
+    """The heartbeat section loads onto OrchestratorConfig with its default
+    when no config data is provided."""
+    config = OrchestratorConfig()
+    assert config.heartbeat == HeartbeatConfig()
+
+
+def test_build_config_from_data_heartbeat_section_loads() -> None:
+    """A configured ``heartbeat:`` section round-trips onto
+    ``OrchestratorConfig.heartbeat`` (list coerced to tuple)."""
+    config = build_config_from_data(
+        {"heartbeat": {"stale_mention_parked_labels": ["custom-park"]}}
+    )
+    assert config.heartbeat.stale_mention_parked_labels == ("custom-park",)
+
+
+def test_build_config_from_data_heartbeat_section_bare_string() -> None:
+    """A bare string survives the build path as a one-element tuple."""
+    config = build_config_from_data({"heartbeat": {"stale_mention_parked_labels": "custom-park"}})
+    assert config.heartbeat.stale_mention_parked_labels == ("custom-park",)
+
+
+def test_build_config_from_data_heartbeat_rejects_non_list_parked_labels() -> None:
+    """Issue #2048: a non-list/non-string stale_mention_parked_labels raises
+    ConfigError rather than iterating a junk value in __post_init__."""
+    with pytest.raises(ConfigError, match="stale_mention_parked_labels.*must be a list"):
+        build_config_from_data({"heartbeat": {"stale_mention_parked_labels": 42}})

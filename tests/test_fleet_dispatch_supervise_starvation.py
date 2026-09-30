@@ -17,7 +17,11 @@ from _fleet_dispatch_fixtures import (
     _patch_ci_fleet_dirty_for_hermetic_tests as _patch_ci_fleet_dirty_for_hermetic_tests,
     _patch_self_deploy_for_fleet_tests as _patch_self_deploy_for_fleet_tests,
 )
-from charlie_work.config import OrchestratorConfig, SupervisorConfig
+from charlie_work.config import (
+    FleetSupervisorConfig,
+    OrchestratorConfig,
+    SupervisorConfig,
+)
 from charlie_work.fleet_dispatch import run_fleet_supervise
 from charlie_work.supervise import SelfDeployResult
 
@@ -47,8 +51,10 @@ def test_run_fleet_supervise_drains_new_dispatch_while_sync_starved(
             poll_interval_seconds=5,
             full_pass_interval_seconds=1,
             active_cooldown_seconds=7,
+        ),
+        fleet_supervisor=FleetSupervisorConfig(
             dependency_sync_starvation_seconds=7200,
-        )
+        ),
     )
     mock_load_config.return_value = cfg
     mock_fleet_loop.return_value = _drained_fleet_result()

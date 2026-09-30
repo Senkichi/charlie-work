@@ -1210,7 +1210,10 @@ def salvage_push_stranded_commits(
         if marker.get("kind") == OPERATOR_MARKER_KIND:
             return SalvagePushResult(pushed=False, skip_reason="operator_claimed")
         marker_pid = marker.get("pid")
-        if isinstance(marker_pid, int) and marker_pid > 0 and is_pid_alive(marker_pid):
+        from . import worker_fate  # lazy: worker_fate -> worker -> worktree
+
+        start = marker.get("process_start_time")
+        if isinstance(marker_pid, int) and worker_fate.is_alive(marker_pid, start):
             return SalvagePushResult(pushed=False, skip_reason="live_writer_marker")
 
     local_result = run_captured(
