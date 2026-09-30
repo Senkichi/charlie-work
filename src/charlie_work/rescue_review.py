@@ -27,6 +27,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import markdown_fence, markdown_guard
 from .env_sanitize import sanitize_env
 from .subprocess_runner import no_console_window_kwargs
 
@@ -416,7 +417,40 @@ class CrossFamilyVerdict:
             )
 
 
-def _find_json_verdict(body: str) -> CrossFamilyVerdict | None:
+def _scan_find_json_verdict(body: str) -> CrossFamilyVerdict | None:
+    """Last shape-valid JSON verdict among the fences ``markdown_fence.scan`` recognises."""
+    for fence_body in markdown_fence.fence_bodies_latest_first(body):
+        verdict = _parse_json_verdict_body(fence_body)
+        if verdict is not None:
+            return verdict
+    return None
+
+
+def _find_json_verdict(
+    body: str, *, on_disagreement: markdown_guard.DisagreementCallback | None = None
+) -> CrossFamilyVerdict | None:
+    """Return the last shape-valid JSON verdict block in ``body``, or None.
+
+    Monotone by construction (see ``markdown_guard``): the origin/main
+    extraction and the scan-based one both run and the MORE SEVERE result wins
+    (``request_changes`` > no verdict > ``approved``; ties return the legacy
+    result), so this never approves where origin/main did not. A disagreement
+    emits ``markdown_guard_disagreement``. Shape rules are those of
+    ``_legacy_find_json_verdict``: ``decision`` is ``"approved"`` or
+    ``"request_changes"`` (cross-family review never gates a merge on its own),
+    ``summary`` a non-empty non-placeholder string, ``required_changes`` a list
+    of strings if present.
+    """
+    return markdown_guard.choose_more_severe(
+        _legacy_find_json_verdict(body),
+        _scan_find_json_verdict(body),
+        guard=markdown_guard.GUARD_RESCUE_VERDICT,
+        decision_of=lambda verdict: verdict.decision,
+        on_disagreement=on_disagreement,
+    )
+
+
+def _legacy_find_json_verdict(body: str) -> CrossFamilyVerdict | None:
     """Return the last shape-valid JSON verdict block in ``body``, or None.
 
     Scans fenced code blocks from the last one backwards — mirroring
@@ -429,6 +463,8 @@ def _find_json_verdict(body: str) -> CrossFamilyVerdict | None:
     ``required_changes``, if present, must be a list of strings; a
     malformed one rejects that block (an earlier fence, if any, is tried
     next) rather than silently discarding the bad data.
+
+    legacy path: delete after soak when markdown_guard_disagreement stays at zero (follow-up issue).
     """
     for match in reversed(list(_VERDICT_FENCE_RE.finditer(body))):
         candidate = match.group(1).strip()
@@ -465,6 +501,43 @@ def _find_json_verdict(body: str) -> CrossFamilyVerdict | None:
             decision=decision, summary=stripped_summary, required_changes=required_changes
         )
     return None
+
+
+def _parse_json_verdict_body(fence_body: str) -> CrossFamilyVerdict | None:
+    """Parse one fence body into a shape-valid cross-family verdict, or None."""
+    candidate = fence_body.strip()
+    if not candidate:
+        return None
+    try:
+        data = json.loads(candidate)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    decision = data.get("decision")
+    if decision not in ("approved", "request_changes"):
+        return None
+    summary = data.get("summary")
+    if not isinstance(summary, str):
+        return None
+    stripped_summary = summary.strip()
+    if not stripped_summary:
+        return None
+    # An unfilled template placeholder ("<one or two sentence...>") is
+    # prompt boilerplate that leaked into the verdict, never a real
+    # summary — mirrors workflow._validate_review_verdict's guard.
+    if stripped_summary.startswith("<") and stripped_summary.endswith(">"):
+        return None
+    raw_changes = data.get("required_changes")
+    if raw_changes is None:
+        required_changes: tuple[str, ...] = ()
+    elif isinstance(raw_changes, list) and all(isinstance(item, str) for item in raw_changes):
+        required_changes = tuple(item.strip() for item in raw_changes if item.strip())
+    else:
+        return None
+    return CrossFamilyVerdict(
+        decision=decision, summary=stripped_summary, required_changes=required_changes
+    )
 
 
 __all__ = [

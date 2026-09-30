@@ -20,6 +20,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Sequence
 
+from . import markdown_fence, markdown_guard
 from .claude_code import extract_event_text, iter_stream_json_events, parse_claude_events
 from .config import OrchestratorConfig
 from .throttle_signatures import match_throttle_tail
@@ -30,17 +31,9 @@ from .throttle_signatures import match_throttle_tail
 # carries whatever diagnostic detail WAS recoverable.
 CAUSE_UNKNOWN: dict[str, Any] = {"cause": "unknown"}
 
-# Language-tag group accepts any tag (not just ``json``), mirroring the fix in
-# ``rescue_review._VERDICT_FENCE_RE``: a fence opened with an unrecognized tag
-# (e.g. ```python) previously failed to match as an opening delimiter at all,
-# causing its own closing ``` to be misread as a spurious new opening and
-# desynchronizing every fence pair after it. In practice this path is
-# protected here because each stream-json event's text is checked in
-# isolation (see ``_extract_verdict_from_stream_json``) and the reviewer's
-# final verdict fence normally lands in its own turn, separate from any
-# earlier code-citation turns -- but the defect is real and latent, so it is
-# fixed here too rather than left to fire the day a reviewer's final message
-# happens to combine both.
+# Legacy fence regex (origin/main's, verbatim; any language tag, NOT
+# line-anchored), used only via the monotone composition in
+# ``_extract_verdict_from_text``. ``workflow.py`` re-exports this name.
 _VERDICT_FENCE_RE = re.compile(r"```(?:[a-zA-Z0-9_+-]*)\s*\n(.*?)```", re.DOTALL)
 
 # Absolute path ending in .md, as reviewers reference their summary files in
@@ -118,11 +111,13 @@ def _validate_review_verdict(data: Any) -> dict[str, Any] | None:
     }
 
 
-def _extract_verdict_from_text(text: str) -> dict[str, Any] | None:
+def _legacy_extract_verdict_from_text(text: str) -> dict[str, Any] | None:
     """Extract the last valid fenced JSON verdict block from plain text.
 
     Accepts fences with or without a ``json`` language tag, scanning from the
     last fence (the final output) backwards.
+
+    legacy path: delete after soak when markdown_guard_disagreement stays at zero (follow-up issue).
     """
     for match in reversed(list(_VERDICT_FENCE_RE.finditer(text))):
         candidate = match.group(1).strip()
@@ -136,6 +131,45 @@ def _extract_verdict_from_text(text: str) -> dict[str, Any] | None:
         if verdict is not None:
             return verdict
     return None
+
+
+def _scan_extract_verdict_from_text(text: str) -> dict[str, Any] | None:
+    """Last valid verdict among the fences ``markdown_fence.scan`` recognises."""
+    for body in markdown_fence.fence_bodies_latest_first(text):
+        candidate = body.strip()
+        if not candidate:
+            continue
+        try:
+            data = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        verdict = _validate_review_verdict(data)
+        if verdict is not None:
+            return verdict
+    return None
+
+
+def _extract_verdict_from_text(
+    text: str, *, on_disagreement: markdown_guard.DisagreementCallback | None = None
+) -> dict[str, Any] | None:
+    """Extract the last valid fenced JSON verdict block from plain text.
+
+    Monotone: the legacy (origin/main) and scan-based extractions both run and
+    the MORE SEVERE wins (ties: legacy), so this never approves where
+    origin/main did not; a disagreement emits ``markdown_guard_disagreement``.
+    """
+    return markdown_guard.choose_more_severe(
+        _legacy_extract_verdict_from_text(text),
+        _scan_extract_verdict_from_text(text),
+        guard=markdown_guard.GUARD_VERDICT,
+        decision_of=lambda verdict: verdict["decision"],
+        on_disagreement=on_disagreement,
+    )
+
+
+def _strip_fenced_blocks(text: str) -> str:
+    """Drop fenced blocks for the plaintext-log summary fallback (cosmetic, scan-only)."""
+    return markdown_fence.strip_fenced_blocks(text)
 
 
 def _extract_verdict_from_stream_json(raw_text: str) -> dict[str, Any] | None:
@@ -767,7 +801,7 @@ def _extract_review_session_summary(
             if text.strip():
                 assistant_texts.append(text.strip())
         if not assistant_texts:
-            stripped = re.sub(r"```(?:json)?\s*\n.*?```", "", log_text, flags=re.DOTALL)
+            stripped = _strip_fenced_blocks(log_text)
             for line in stripped.splitlines():
                 stripped_line = line.strip()
                 if stripped_line and not stripped_line.startswith((">", "#", "-")):

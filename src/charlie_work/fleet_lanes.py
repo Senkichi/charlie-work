@@ -18,7 +18,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
-from . import layout
+from . import layout, markdown_guard
 from .config import OrchestratorConfig
 from .fleet_paths import fleet_dir
 from .fleet_registry import _load_registry, _select_repos
@@ -91,7 +91,12 @@ def _run_fleet_repo_lane(
     ``CommandResult`` carrying ``data["deadline_deferred"] = True`` instead
     of finishing every queued phase.
     """
+    # This lane's own ambient sink for markdown_guard_disagreement events: the
+    # pool thread has no binding until it sets one, and `app` was built on the
+    # submitting thread, so the last-constructed repo must not receive it.
+    sink_token = None
     try:
+        sink_token = markdown_guard.bind_sink(app.paths.state_file, app.repo_root.name)
         # Arm the deadline hook on this lane's own client (issue #1948).
         # isinstance, not getattr duck-typing: the suite patches
         # ``charlie_work.fleet_dispatch.GitHub`` with a MagicMock, so
@@ -174,6 +179,7 @@ def _run_fleet_repo_lane(
             {"deadline_deferred": True},
         )
     finally:
+        markdown_guard.unbind_sink(sink_token)
         lock.release()
 
 

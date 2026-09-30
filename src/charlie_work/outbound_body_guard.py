@@ -44,7 +44,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
-from . import layout
+from . import layout, markdown_fence, markdown_guard
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +60,8 @@ REFUSAL_EVENT_KIND = "outbound_body_secret_refused"
 # discussion of the gho_ incident) cannot otherwise be written to a PR body
 # or comment -- the guard would refuse the very prose that documents it.
 _EXAMPLE_FENCE_INFO = "example-secret"
+
+_NON_TERMINATOR_RUN_RE = re.compile(r"[^\r\n]+")
 
 _RULES_PATH = Path(__file__).parent / "_vendor" / "gitleaks" / "secrets.toml"
 
@@ -109,19 +111,23 @@ def _shannon_entropy(text: str) -> float:
     return -sum((c / n) * math.log2(c / n) for c in counts.values())
 
 
-def _mask_example_secret_fences(text: str) -> str:
-    """Blank out every line of each ``example-secret`` fenced block.
+def _legacy_example_secret_line_indices(text: str) -> set[int]:
+    """Indices (into the newline-split lines) of lines origin/main blanked as exempt.
 
-    Returns a string with the same line count as ``text`` so reported line
-    numbers still refer to the submitted document. Unclosed blocks mask to
-    end-of-file (CommonMark semantics).
+    Blank out every line of each ``example-secret`` fenced block.
 
     ``in_fence`` tracks *any* open fence, not just exempt ones: inside an
     ordinary block an `````example-secret`` line is literal content (a closing
     fence cannot carry an info string), so it must not start masking -- that
     would let a real credential hide inside a nested-looking fence.
+
+    legacy path: delete after soak when markdown_guard_disagreement stays at zero (follow-up issue).
+    This is origin/main's ``_mask_example_secret_fences`` state machine
+    verbatim, except that it records which lines it would have blanked
+    instead of blanking them.
     """
     lines = text.split("\n")
+    masked: set[int] = set()
     in_fence = False
     exempt = False
     close_re: re.Pattern[str] | None = None
@@ -139,15 +145,101 @@ def _mask_example_secret_fences(text: str) -> str:
             exempt = info == _EXAMPLE_FENCE_INFO
             close_re = re.compile(rf"^[ \t]{{0,3}}{re.escape(fence[0])}{{{len(fence)},}}[ \t]*$")
             if exempt:
-                lines[i] = ""
+                masked.add(i)
         else:
             if exempt:
-                lines[i] = ""
+                masked.add(i)
             if close_re is not None and close_re.match(stripped):
                 in_fence = False
                 exempt = False
                 close_re = None
-    return "\n".join(lines)
+    return masked
+
+
+def _legacy_mask_ranges(text: str) -> list[tuple[int, int]]:
+    """Character runs of the lines ``_legacy_example_secret_line_indices`` blanks."""
+    masked = _legacy_example_secret_line_indices(text)
+    ranges: list[tuple[int, int]] = []
+    offset = 0
+    for index, line in enumerate(text.split("\n")):
+        if index in masked:
+            ranges.extend(_content_runs(line, offset))
+        offset += len(line) + 1
+    return ranges
+
+
+def _scan_mask_ranges(text: str) -> list[tuple[int, int]]:
+    """Character runs inside ``example-secret`` fences per ``markdown_fence.scan``.
+
+    Line splitting tracks ``scan``'s own ``markdown_fence.split_lines``
+    (CommonMark line endings only), which the fence line indices refer to.
+    Unclosed blocks run to end-of-file.
+    """
+    contents = markdown_fence.split_lines(text)
+    masked: set[int] = set()
+    for fence in markdown_fence.scan(text).fences:
+        if fence.info == _EXAMPLE_FENCE_INFO:
+            masked.update(range(fence.start, fence.end if fence.closed else len(contents)))
+    ranges: list[tuple[int, int]] = []
+    offset = 0
+    for index, raw in enumerate(markdown_fence.split_lines(text, keepends=True)):
+        if index in masked:
+            ranges.extend(_content_runs(contents[index], offset))
+        offset += len(raw)
+    return ranges
+
+
+def _legacy_masked_text(text: str) -> str:
+    """Origin/main's masked text, byte for byte: masked lines become empty.
+
+    This deletes the masked lines' CR too (as main did), and keeps every LF so
+    line numbers are unchanged.
+    """
+    masked = _legacy_example_secret_line_indices(text)
+    lines = text.split("\n")
+    return "\n".join("" if i in masked else line for i, line in enumerate(lines))
+
+
+def _content_runs(line: str, offset: int) -> list[tuple[int, int]]:
+    """Non-empty ``[start, end)`` runs of ``line`` excluding CR/LF terminator chars.
+
+    Both mask sides go through this so that they compare equal whenever they
+    exempt the same content, however each one splits lines.
+    """
+    return [(offset + m.start(), offset + m.end()) for m in _NON_TERMINATOR_RUN_RE.finditer(line)]
+
+
+def _mask_example_secret_fences(
+    text: str, *, on_disagreement: markdown_guard.DisagreementCallback | None = None
+) -> str:
+    """Blank out every ``example-secret`` fenced block, opener and closer lines included.
+
+    A character is exempt from secret scanning only if BOTH origin/main's
+    fence state machine and the ``markdown_fence.scan``-based mask exempt it
+    (``markdown_guard.intersect_ranges``), so the composed mask removes a
+    subset of the characters origin/main removed. That alone does NOT make the
+    guard monotone: regexes are not monotone under insertion (a multi-line
+    rule can match across a block main blanked but not across the extra
+    characters kept here), which is why ``scan_outbound_text`` also scans
+    ``_legacy_masked_text`` and refuses on the union. A difference between the
+    two masks emits ``markdown_guard_disagreement``.
+
+    Only non-terminator characters are removed, so the result keeps every line
+    break and reported line numbers still refer to the submitted document.
+    """
+    ranges = markdown_guard.intersect_ranges(
+        _legacy_mask_ranges(text),
+        _scan_mask_ranges(text),
+        guard=markdown_guard.GUARD_OUTBOUND_MASK,
+        on_disagreement=on_disagreement,
+    )
+    pieces: list[str] = []
+    cursor = 0
+    for start, end in ranges:
+        pieces.append(text[cursor:start])
+        cursor = end
+    pieces.append(text[cursor:])
+    return "".join(pieces)
 
 
 @lru_cache(maxsize=1)
@@ -180,11 +272,8 @@ def _rules() -> tuple[_Rule, ...]:
     return tuple(compiled)
 
 
-def scan_outbound_text(text: str, *, part: str) -> tuple[SecretMatch, ...]:
-    """Return every credential-pattern match in ``text`` (empty = clean)."""
-    if not text:
-        return ()
-    masked = _mask_example_secret_fences(text)
+def _scan_masked(masked: str, *, part: str) -> tuple[SecretMatch, ...]:
+    """Run the vendored rules over already-masked ``masked`` text."""
     lowered = masked.lower()
     matches: list[SecretMatch] = []
     for rule in _rules():
@@ -210,6 +299,41 @@ def scan_outbound_text(text: str, *, part: str) -> tuple[SecretMatch, ...]:
                 )
             )
     return tuple(matches)
+
+
+def scan_outbound_text(
+    text: str,
+    *,
+    part: str,
+    on_disagreement: markdown_guard.DisagreementCallback | None = None,
+) -> tuple[SecretMatch, ...]:
+    """Return every credential-pattern match in ``text`` (empty = clean).
+
+    Monotone by construction: the rules run over BOTH origin/main's masked
+    text and the composed (intersected) masked text, and the matches are the
+    union (composed matches deduped against each other and legacy-only matches
+    appended as main reported them, so a same-line duplicate that only main
+    sees keeps main's count). Scanning main's text is what
+    guarantees every match main reported is still reported: masking a subset
+    of main's characters does not imply matching a superset of its secrets,
+    because a multi-line rule can match across a block main blanked. Both
+    texts keep every LF, so line numbers agree.
+
+    legacy path: delete the main-text scan after soak when
+    markdown_guard_disagreement stays at zero (follow-up issue).
+    """
+    if not text:
+        return ()
+    composed = _scan_masked(
+        _mask_example_secret_fences(text, on_disagreement=on_disagreement), part=part
+    )
+    legacy = _scan_masked(_legacy_masked_text(text), part=part)
+    # Dedup ONLY against the composed matches: a legacy-only match is never
+    # collapsed against another legacy match, so the union's count is never
+    # below main's own (`match_count` in the refusal event stays >= main's).
+    composed_keys = {(m.rule_id, m.line, m.match_sha256) for m in composed}
+    extra = [m for m in legacy if (m.rule_id, m.line, m.match_sha256) not in composed_keys]
+    return composed + tuple(extra)
 
 
 def refusal_summary(surface: str, matches: tuple[SecretMatch, ...]) -> str:
@@ -240,6 +364,29 @@ def _state_path_for(repo_root: Path | None, state_dir: str | None) -> Path | Non
     ).state_file
 
 
+def _disagreement_sink(
+    repo_root: Path | None, state_dir: str | None
+) -> markdown_guard.DisagreementCallback | None:
+    """``on_disagreement`` writing to THIS client's repo, not the ambient sink.
+
+    The state path is resolved lazily (only when the two masks actually
+    disagree) so a clean write never pays for -- or fails on -- path
+    resolution. ``None`` (no ``repo_root``) leaves the guard on its ambient
+    fallback.
+    """
+    if repo_root is None:
+        return None
+
+    def _emit(disagreement: markdown_guard.Disagreement) -> None:
+        try:
+            state_path = _state_path_for(repo_root, state_dir)
+        except Exception:  # noqa: BLE001 -- telemetry only; fall back to the ambient sink
+            state_path = None
+        markdown_guard.emit_disagreement(disagreement, state_path=state_path, repo=repo_root.name)
+
+    return _emit
+
+
 def check_outbound_write(
     *,
     surface: str,
@@ -267,9 +414,12 @@ def check_outbound_write(
     """
     try:
         matches: list[SecretMatch] = []
+        on_disagreement = _disagreement_sink(repo_root, state_dir)
         for part, text in parts:
             if text:
-                matches.extend(scan_outbound_text(text, part=part))
+                matches.extend(
+                    scan_outbound_text(text, part=part, on_disagreement=on_disagreement)
+                )
         if not matches:
             return ()
 

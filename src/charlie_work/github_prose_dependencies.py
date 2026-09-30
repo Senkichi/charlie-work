@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import re
 
+from . import markdown_fence
+
 _CLAUSE_BOUNDARY_CHARS = ".!?\n"
 
 # Markdown backtick code span: an opening run of backticks, content, and a
@@ -271,5 +273,15 @@ def _clause_bounds(text: str, match_start: int, match_end: int) -> tuple[int, in
 
 
 def _is_blockquote_line(line: str) -> bool:
-    """True if the line's first non-space character is ``>`` (a Markdown blockquote)."""
-    return line.lstrip(" \t").startswith(">")
+    """True if the line's first non-space character is ``>`` (a Markdown blockquote).
+
+    Delegates to ``markdown_fence.is_blockquote_marker`` in its
+    container-tolerant mode (``max_indent=None``, any leading spaces/tabs).
+    This is an *exclusion* guard: a ``>`` nested under a list item
+    (``- note`` then a 4-space-indented ``> Blocked by #5``) is still a
+    quote because CommonMark re-bases list-item content, and the shared
+    scan has no list-item container. Over-approximating quoted lines is
+    the fail-safe direction for a guard that excludes quoted prose
+    (architecture-deepening candidate 3, re-review md-r2 B1).
+    """
+    return markdown_fence.is_blockquote_marker(line, max_indent=None)
