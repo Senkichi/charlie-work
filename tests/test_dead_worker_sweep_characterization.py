@@ -63,7 +63,7 @@ def test_no_pr_worker_declared_blocked_escalates_to_operator_queue(tmp_path: Pat
     config, paths, gh = no_pr_bed(
         tmp_path, 1453, config=config, branch_name=branch, dispatched_at=iso()
     )
-    write_blocked_outcome(tmp_path, config, branch, "cross_repo_scope", "targets job-cannon")
+    write_blocked_outcome(tmp_path, config, branch, "cross_repo_scope", "targets other-repo")
 
     run_sweep(
         tmp_path,
@@ -150,14 +150,14 @@ def test_no_pr_cross_repo_scoped_issue_escalates_cross_repo_hop(tmp_path: Path) 
                 "version": 1,
                 "repos": {
                     "Senkichi/charlie-work": {"repo_root": "/tmp/cw"},
-                    "Senkichi/job-cannon": {"repo_root": "/tmp/jc"},
+                    "Senkichi/other-repo": {"repo_root": "/tmp/other"},
                 },
             }
         ),
         encoding="utf-8",
     )
     config, paths, gh = no_pr_bed(
-        tmp_path, 709, title="job-cannon: docs are stale", dispatched_at=iso()
+        tmp_path, 709, title="other-repo: docs are stale", dispatched_at=iso()
     )
     gh.name_with_owner = lambda: "Senkichi/charlie-work"  # type: ignore[method-assign]
 
