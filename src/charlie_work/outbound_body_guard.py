@@ -189,6 +189,17 @@ def _scan_mask_ranges(text: str) -> list[tuple[int, int]]:
     return ranges
 
 
+def _legacy_masked_text(text: str) -> str:
+    """Origin/main's masked text, byte for byte: masked lines become empty.
+
+    This deletes the masked lines' CR too (as main did), and keeps every LF so
+    line numbers are unchanged.
+    """
+    masked = _legacy_example_secret_line_indices(text)
+    lines = text.split("\n")
+    return "\n".join("" if i in masked else line for i, line in enumerate(lines))
+
+
 def _content_runs(line: str, offset: int) -> list[tuple[int, int]]:
     """Non-empty ``[start, end)`` runs of ``line`` excluding CR/LF terminator chars.
 
@@ -205,9 +216,13 @@ def _mask_example_secret_fences(
 
     A character is exempt from secret scanning only if BOTH origin/main's
     fence state machine and the ``markdown_fence.scan``-based mask exempt it
-    (``markdown_guard.intersect_ranges``), so the composed mask can only be
-    smaller than origin/main's -- the fail-safe direction for this guard. A
-    difference between the two emits ``markdown_guard_disagreement``.
+    (``markdown_guard.intersect_ranges``), so the composed mask removes a
+    subset of the characters origin/main removed. That alone does NOT make the
+    guard monotone: regexes are not monotone under insertion (a multi-line
+    rule can match across a block main blanked but not across the extra
+    characters kept here), which is why ``scan_outbound_text`` also scans
+    ``_legacy_masked_text`` and refuses on the union. A difference between the
+    two masks emits ``markdown_guard_disagreement``.
 
     Only non-terminator characters are removed, so the result keeps every line
     break and reported line numbers still refer to the submitted document.
@@ -257,11 +272,8 @@ def _rules() -> tuple[_Rule, ...]:
     return tuple(compiled)
 
 
-def scan_outbound_text(text: str, *, part: str) -> tuple[SecretMatch, ...]:
-    """Return every credential-pattern match in ``text`` (empty = clean)."""
-    if not text:
-        return ()
-    masked = _mask_example_secret_fences(text)
+def _scan_masked(masked: str, *, part: str) -> tuple[SecretMatch, ...]:
+    """Run the vendored rules over already-masked ``masked`` text."""
     lowered = masked.lower()
     matches: list[SecretMatch] = []
     for rule in _rules():
@@ -287,6 +299,34 @@ def scan_outbound_text(text: str, *, part: str) -> tuple[SecretMatch, ...]:
                 )
             )
     return tuple(matches)
+
+
+def scan_outbound_text(text: str, *, part: str) -> tuple[SecretMatch, ...]:
+    """Return every credential-pattern match in ``text`` (empty = clean).
+
+    Monotone by construction: the rules run over BOTH origin/main's masked
+    text and the composed (intersected) masked text, and the matches are the
+    union (deduped by rule, line and hash). Scanning main's text is what
+    guarantees every match main reported is still reported: masking a subset
+    of main's characters does not imply matching a superset of its secrets,
+    because a multi-line rule can match across a block main blanked. Both
+    texts keep every LF, so line numbers agree.
+
+    legacy path: delete the main-text scan after soak when
+    markdown_guard_disagreement stays at zero (follow-up issue).
+    """
+    if not text:
+        return ()
+    composed = _scan_masked(_mask_example_secret_fences(text), part=part)
+    legacy = _scan_masked(_legacy_masked_text(text), part=part)
+    seen = {(m.rule_id, m.line, m.match_sha256) for m in composed}
+    extra = []
+    for m in legacy:
+        key = (m.rule_id, m.line, m.match_sha256)
+        if key not in seen:
+            seen.add(key)
+            extra.append(m)
+    return composed + tuple(extra)
 
 
 def refusal_summary(surface: str, matches: tuple[SecretMatch, ...]) -> str:

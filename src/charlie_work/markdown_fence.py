@@ -353,9 +353,9 @@ def find_fence_close(
     opened with a delimiter run of ``length``, searching from ``start``, or
     ``None`` if none exists before end-of-text.
 
-    Public so a masking consumer (``outbound_body_guard``) can ask for the
-    *lenient* closer (``max_indent=None``) alongside :func:`scan`'s strict
-    one, keeping the closer rule in one place.
+    Public so a consumer can ask for the *lenient* closer
+    (``max_indent=None``) alongside :func:`scan`'s strict one, keeping the
+    closer rule in one place.
 
     Only ever called for a *valid* opener (:func:`scan` treats a rejected
     one -- a backtick fence whose info string itself contains a backtick --

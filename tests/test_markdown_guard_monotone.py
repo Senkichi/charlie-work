@@ -28,9 +28,12 @@ from charlie_work import markdown_guard
 from charlie_work.instrumentation import close_db, query_events
 from charlie_work.markdown_guard import Disagreement, decision_severity
 from charlie_work.outbound_body_guard import (
+    SecretMatch,
     _legacy_mask_ranges,
+    _legacy_masked_text,
     _mask_example_secret_fences,
     _scan_mask_ranges,
+    _scan_masked,
     scan_outbound_text,
 )
 from charlie_work.rescue_review import (
@@ -300,6 +303,43 @@ def test_composed_mask_never_masks_more_than_legacy_or_scan() -> None:
             narrower += 1
     # Controls: some inputs are masked identically, some strictly less.
     assert narrower and equal
+
+
+def _scan_masked_body(masked: str) -> tuple[SecretMatch, ...]:
+    return _scan_masked(masked, part="body")
+
+
+_SPLIT_TOKEN_HEAD = "ZXlKaGJHY2lPaU" + "Ab1" * 4
+_SPLIT_TOKEN_TAIL = "Qz9" * 14
+
+
+def test_outbound_refuses_a_token_main_matches_across_a_legacy_only_masked_block() -> None:
+    """md-r4 review B1: masking a subset of main's characters is not enough.
+
+    Main blanks the tab-indented example-secret block (deleting its lines joins
+    the base64 halves into one ``jwt-base64`` match); the strict scan reads it
+    as indented code and keeps it, which breaks that multi-line match. The
+    guard must still refuse, because main does.
+    """
+    body = f"{_SPLIT_TOKEN_HEAD}\n\t```example-secret\n\n```\n{_SPLIT_TOKEN_TAIL}\n"
+    events: list[Disagreement] = []
+    composed = _mask_example_secret_fences(body, on_disagreement=events.append)
+    assert _scan_masked_body(composed) == (), "premise: the composed mask alone misses it"
+    assert events, "premise: the two masks disagree on this body"
+    assert [m.rule_id for m in _scan_masked_body(_legacy_masked_text(body))] == ["jwt-base64"]
+    assert [m.rule_id for m in scan_outbound_text(body, part="body")] == ["jwt-base64"]
+
+
+def test_outbound_agreeing_split_token_is_refused_control() -> None:
+    body = f"{_SPLIT_TOKEN_HEAD}\r\n```example-secret\r\nnote\r\n```\r\n{_SPLIT_TOKEN_TAIL}\r\n"
+    assert {m.rule_id for m in scan_outbound_text(body, part="body")} == {"jwt-base64"}
+
+
+def test_outbound_scan_reports_every_match_main_reports_over_the_corpus() -> None:
+    for text in _OUTBOUND_CORPUS:
+        main = _scan_masked_body(_legacy_masked_text(text))
+        got = {(m.rule_id, m.line, m.match_sha256) for m in scan_outbound_text(text, part="body")}
+        assert {(m.rule_id, m.line, m.match_sha256) for m in main} <= got, text
 
 
 def test_outbound_disagreement_event_fires_only_on_disagreement() -> None:

@@ -10,8 +10,8 @@ the other on nested input:
 * *exclusion* guards (`github_body_scan`, `github_prose_dependencies`) must
   over-approximate quoted regions -> `max_indent=None`;
 * *masking* guards (`outbound_body_guard`) must under-approximate the exempt
-  region -> strict scan, plus a lenient closer bound (tested in
-  `test_outbound_body_guard.py`).
+  region -> strict scan, intersected with origin/main's own mask (tested in
+  `test_markdown_guard_monotone.py` and `test_outbound_body_guard.py`).
 
 Every "top-level control" below proves the harness can still report a blocker,
 so the nested-input `[]` results are not an artifact of a dead parser.

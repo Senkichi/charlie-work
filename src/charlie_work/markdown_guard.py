@@ -14,7 +14,10 @@ the inputs:
   only when BOTH parsers found one). Ties resolve to the legacy result, i.e.
   exactly what origin/main returned.
 * example-secret masking -> a character is exempt from secret scanning only if
-  BOTH masks exempt it (intersection): the composed mask can only shrink.
+  BOTH masks exempt it (intersection): the composed mask removes a subset of
+  origin/main's characters. Because regex matching is not monotone under
+  insertion, the outbound guard additionally scans origin/main's own masked
+  text and refuses on the union of matches.
 
 When the two sides disagree, one ``markdown_guard_disagreement`` event is
 emitted, which is what the soak that retires the legacy paths measures. The
