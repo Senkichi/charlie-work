@@ -32,5 +32,5 @@
 - check: stale-open-issue-mentions
   match: "referenced by merged work"
   issue: 1361
-  expires: "2026-09-30"
-  note: "Deliberately-open residuals, re-listed every beat; the flagged mechanism is repo-agnostic, so repo is omitted to cover every current and future fleet repo by construction -- the prior per-repo entries (Senkichi/charlie-work, Senkichi/job-cannon) missed Senkichi/jobcannon and Senkichi/swole, onboarded 2026-08-30 (issue #1860). See issue #1361."
+  expires: "2026-10-30"
+  note: "Deliberately-open residuals, re-listed every beat; the flagged mechanism is repo-agnostic, so repo is omitted to cover every current and future fleet repo by construction -- the prior per-repo entries (Senkichi/charlie-work, Senkichi/job-cannon) missed Senkichi/jobcannon and Senkichi/swole, onboarded 2026-08-30 (issue #1860). See issue #1361. Renewed 2026-09-30 -> 2026-10-30 while a one-time triage of the 52 flagged issues (cw 14, job-cannon 11, jobcannon 8, swole 19) closes the genuinely-resolved ones; many flags are mention-only false positives (active issues mentioned by a sibling PR, trackers)."
