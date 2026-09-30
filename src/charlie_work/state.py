@@ -986,9 +986,30 @@ def set_throttled_until(
     throttle with an unset reason/adapter_kind is treated as
     claude-code-shaped (the common case) by ``clear_quota_throttles``.
 
+    Monotonic (issue #2042): a new window never shortens a still-active one.
+    When the stored ``throttled_until`` parses, is still in the future, and
+    ends at or after ``throttled_until``, the existing window (with its
+    reason/adapter_kind) is kept unchanged -- otherwise a later, shorter
+    classification (e.g. the 15-minute rate-limit fallback) would cut an
+    operator hold or a real multi-hour reset. Clearing goes through
+    ``clear_quota_throttles``, not this function.
+
     Returns a new state dict with throttled_until set; does not mutate ``data``.
     """
     previous = data.get("throttled_until")
+    if previous and is_throttled(data):
+        try:
+            existing_dt = datetime.fromisoformat(str(previous).replace("Z", "+00:00"))
+            new_dt = datetime.fromisoformat(throttled_until.replace("Z", "+00:00"))
+            if existing_dt.tzinfo is None:
+                existing_dt = existing_dt.replace(tzinfo=UTC)
+            if new_dt.tzinfo is None:
+                new_dt = new_dt.replace(tzinfo=UTC)
+            if existing_dt >= new_dt:
+                # Monotonic (#2042): window kept unchanged, so no event (#2006).
+                return dict(data)
+        except (ValueError, TypeError):
+            pass  # unparseable: fall through to the write
     new_data = {
         **data,
         "throttled_until": throttled_until,

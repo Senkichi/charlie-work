@@ -35,6 +35,7 @@ from charlie_work.instrumentation import log_event
 from charlie_work.janitor import JanitorVerdict
 from charlie_work.safe_ref import require_valid_sha
 from charlie_work.state import StateLockBusy
+from charlie_work.worker_launch_gate import WorkerLaunchDeferral, acquire_fleet_launch_lock
 from charlie_work.dead_worker_reap import _is_pr_updated_at_older_than, _safe_repo_slug
 
 
@@ -459,21 +460,22 @@ def dispatch(
         else None
     )
 
-    fleet_lock = None
-    if self.config.fleet.global_max_concurrent_sessions > 0:
-        fleet_lock = try_acquire_fleet_lock(self.fleet_dir_override)
-        if fleet_lock is None:
-            return _wf.CommandResult(
-                True,
-                "dispatch deferred: fleet lock held",
-                {
-                    "selected_count": 0,
-                    "deferred_reason": "fleet_lock_held",
-                    "merged_prs": merged_prs_for_result,
-                    "merged_pr_closed_issue_numbers": sorted(finalized),
-                    "merged_pr_referenced_issue_numbers": sorted(finalized),
-                },
-            )
+    # Issue #2041: gate 1 of the shared worker-launch gate, taken here -- before
+    # the stall sweep and candidate scan -- and held across governor -> claim ->
+    # launch; _dispatch_impl hands it to issue_worker_launch_permit.
+    launch_lock = acquire_fleet_launch_lock(self, acquire=try_acquire_fleet_lock)
+    if isinstance(launch_lock, WorkerLaunchDeferral):
+        return _wf.CommandResult(
+            True,
+            "dispatch deferred: fleet lock held",
+            {
+                "selected_count": 0,
+                "deferred_reason": launch_lock.reason,
+                "merged_prs": merged_prs_for_result,
+                "merged_pr_closed_issue_numbers": sorted(finalized),
+                "merged_pr_referenced_issue_numbers": sorted(finalized),
+            },
+        )
     try:
         result = self._dispatch_impl(
             limit,
@@ -481,6 +483,7 @@ def dispatch(
             stalled_entries=stalled_entries,
             ready_issues=ready_issues,
             merged_prs=merged_pr_outcome,
+            launch_lock=launch_lock,
         )
         data = dict(result.data)
         if finalized:
@@ -548,5 +551,4 @@ def dispatch(
             },
         )
     finally:
-        if fleet_lock is not None:
-            fleet_lock.release()
+        launch_lock.release()

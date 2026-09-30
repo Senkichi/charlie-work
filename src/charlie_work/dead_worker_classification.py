@@ -166,6 +166,7 @@ def resolve_dead_worker_failure_kind(
             set_throttled_until(
                 state,
                 throttled_until,
+                source="dead_worker_classification",
                 reason=failure_kind,
                 adapter_kind=view.adapter_kind,
             )

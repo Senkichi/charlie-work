@@ -104,9 +104,10 @@ def test_set_throttled_until_emits_event_with_full_payload() -> None:
     }
 
 
-def test_set_throttled_until_emits_when_window_moves_both_directions() -> None:
-    """The event fires on extension AND shortening -- an audit record must
-    exist whenever the value changes, not only when it grows."""
+def test_set_throttled_until_emits_on_extension_and_not_on_kept_window() -> None:
+    """The event fires when the window moves. Shortening a still-active
+    window is refused by the #2042 monotonic guard, so the window is kept
+    unchanged and -- nothing having changed -- no event is emitted."""
     earlier = _iso(datetime.now(UTC) + timedelta(minutes=5))
     later = _iso(datetime.now(UTC) + timedelta(minutes=20))
 
@@ -120,15 +121,13 @@ def test_set_throttled_until_emits_when_window_moves_both_directions() -> None:
     assert events[0]["payload"]["previous"] == earlier
     assert events[0]["payload"]["throttled_until"] == later
 
-    shortened = set_throttled_until(
+    kept = set_throttled_until(
         {**empty_state(), "throttled_until": later},
         earlier,
         source="test_source",
     )
-    events = _throttle_window_events(shortened)
-    assert len(events) == 1
-    assert events[0]["payload"]["previous"] == later
-    assert events[0]["payload"]["throttled_until"] == earlier
+    assert kept["throttled_until"] == later
+    assert _throttle_window_events(kept) == []
 
 
 def test_set_throttled_until_noop_emits_nothing() -> None:

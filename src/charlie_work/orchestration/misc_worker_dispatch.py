@@ -26,6 +26,7 @@ from typing import Any
 from charlie_work.adapters import SessionRequest
 from charlie_work.dead_worker_reap import _emit_session_failed_relabeled
 from charlie_work.fleet_registry import try_acquire_fleet_lock
+from charlie_work.worker_launch_gate import WorkerLaunchDeferral, acquire_fleet_launch_lock
 from charlie_work.github import label_names
 from charlie_work.state import StateLockBusy
 from charlie_work.worker import iter_workers
@@ -233,22 +234,26 @@ def dispatch_rework(
     counter, so it must run at most once per pass). Standalone callers
     leave this as None and the sweep runs inside this call as before.
     """
-    fleet_lock = None
-    if self.config.fleet.global_max_concurrent_sessions > 0:
-        fleet_lock = try_acquire_fleet_lock(self.fleet_dir_override)
-        if fleet_lock is None:
-            return _wf.CommandResult(
-                True,
-                "rework dispatch deferred: fleet lock held",
-                {
-                    "adapter": self.config.worker.harness,
-                    "selected_count": 0,
-                    "deferred_reason": "fleet_lock_held",
-                },
-            )
+    # Issue #2041: gate 1 of the shared worker-launch gate, held across
+    # governor -> claim -> launch; _dispatch_rework_impl hands it to
+    # issue_worker_launch_permit.
+    launch_lock = acquire_fleet_launch_lock(self, acquire=try_acquire_fleet_lock)
+    if isinstance(launch_lock, WorkerLaunchDeferral):
+        return _wf.CommandResult(
+            True,
+            "rework dispatch deferred: fleet lock held",
+            {
+                "adapter": self.config.worker.harness,
+                "selected_count": 0,
+                "deferred_reason": launch_lock.reason,
+            },
+        )
     try:
         return self._dispatch_rework_impl(
-            limit, only_issues=only_issues, stalled_entries=stalled_entries
+            limit,
+            only_issues=only_issues,
+            stalled_entries=stalled_entries,
+            launch_lock=launch_lock,
         )
     except StateLockBusy:
         return _wf._state_lock_busy_result(
@@ -258,5 +263,4 @@ def dispatch_rework(
             deferred_reason="state_lock_busy",
         )
     finally:
-        if fleet_lock is not None:
-            fleet_lock.release()
+        launch_lock.release()
