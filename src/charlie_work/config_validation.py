@@ -324,6 +324,39 @@ class FieldRules(Marker):
         return dict(self.items)
 
 
+@dataclass(frozen=True, init=False)
+class Entries(Marker):
+    """Use-site rules for a ``tuple[SomeDataclass, ...]`` field: a length cap, per-element
+    ``FieldRules``-style markers, and element keys the class declares but this site forbids
+    (reported exactly like an unknown key)."""
+
+    max_len: int | None
+    forbid: tuple[str, ...]
+    items: tuple[tuple[str, tuple[Marker, ...]], ...]
+    kinds: ClassVar[frozenset[str] | None] = frozenset({"seq_dc"})
+    checks_type: ClassVar[bool] = False
+
+    def __init__(
+        self,
+        *,
+        max_len: int | None = None,
+        forbid: Iterable[str] = (),
+        **rules: Marker | tuple[Marker, ...],
+    ) -> None:
+        pairs = tuple((k, v if isinstance(v, tuple) else (v,)) for k, v in rules.items())
+        object.__setattr__(self, "max_len", max_len)
+        object.__setattr__(self, "forbid", tuple(forbid))
+        object.__setattr__(self, "items", pairs)
+
+
+@dataclass(frozen=True)
+class _Verbatim(Marker):
+    """Legacy: a sequence-of-sections field keeps the value exactly as written, unparsed."""
+
+    kinds: ClassVar[frozenset[str] | None] = frozenset({"seq_dc"})
+    checks_type: ClassVar[bool] = False
+
+
 @dataclass(frozen=True)
 class _HostWideOnly(Marker):
     """The section may not appear in a per-repo layer (declared on the root field)."""
@@ -355,6 +388,7 @@ NullIsDefault = _NullIsDefault()
 Coerced = _Coerced()
 CoercedLenient = _Coerced(strict=False)
 HostWideOnly = _HostWideOnly()
+Verbatim = _Verbatim()
 
 
 # ----------------------------------------------------------- annotation parsing
@@ -531,6 +565,25 @@ def _rules_of(markers: tuple[Marker, ...]) -> dict[str, tuple[Marker, ...]]:
     return merged
 
 
+def _entry(spec: FieldSpec, entries: Entries | None, elem: Mapping[str, Any], path: str) -> Any:
+    rules: Mapping[str, tuple[Marker, ...]] = _NO_RULES
+    if entries is not None:
+        if entries.forbid:
+            valid = sorted(s.name for s in field_specs(spec.item) if s.name not in entries.forbid)  # type: ignore[arg-type]
+            barred = sorted(str(k) for k in elem if k not in valid)
+        else:
+            valid, barred = [], []
+        if barred:
+            raise FieldError(
+                path,
+                f"known keys (valid: {', '.join(valid)})",
+                f"unknown key(s) {', '.join(barred)}",
+                "raw",
+            )
+        rules = dict(entries.items)
+    return validate_section(spec.item, elem, path=path, rules=rules)  # type: ignore[arg-type]
+
+
 def _coerce(spec: FieldSpec, markers: tuple[Marker, ...], value: Any, path: str) -> Any:
     kind = spec.kind
     if kind == "nested":
@@ -540,13 +593,20 @@ def _coerce(spec: FieldSpec, markers: tuple[Marker, ...], value: Any, path: str)
             value = {}
         return validate_section(spec.item, value, path=path, rules=_rules_of(markers))  # type: ignore[arg-type]
     if kind == "seq_dc":
+        entries = next((m for m in markers if isinstance(m, Entries)), None)
+        if Verbatim in markers and entries is None:  # a use-site ``Entries`` overrides it
+            return value
         if not _is_seq(value):
             raise FieldError(path, "list of mappings", value, "type")
+        if entries is not None and entries.max_len is not None and len(value) > entries.max_len:
+            raise FieldError(
+                path, f"at most {entries.max_len} entries", f"{len(value)} entries", "raw"
+            )
         out = []
         for i, elem in enumerate(value):
             if not isinstance(elem, Mapping):
                 raise FieldError(f"{path}[{i}]", "mapping", elem, "type")
-            out.append(validate_section(spec.item, elem, path=f"{path}[{i}]"))  # type: ignore[arg-type]
+            out.append(_entry(spec, entries, elem, f"{path}[{i}]"))
         return tuple(out)
     if kind == "map_dc":
         if not isinstance(value, Mapping):
@@ -723,8 +783,8 @@ def run_section_hooks(config: Any) -> None:
 
 __all__ = [
     "AtLeastOne", "BoolTolerant", "Check", "ConfigError", "FieldError", "FieldRules",
-    "Coerced", "CoercedLenient", "CommandTemplate", "ConstructionError", "Finite", "Ge", "Gt", "HostWideOnly", "InRange", "LenientMapping", "Marker",
-    "NonEmpty", "NonEmptyRaw", "NonNeg", "NotNull", "Note", "NullIsDefault", "OneOf", "Placeholders", "Positive", "Regex", "RelativePath", "Typed",
+    "Coerced", "CoercedLenient", "CommandTemplate", "ConstructionError", "Entries", "Finite", "Ge", "Gt", "HostWideOnly", "InRange", "LenientMapping", "Marker",
+    "NonEmpty", "NonEmptyRaw", "NonNeg", "NotNull", "Note", "NullIsDefault", "OneOf", "Placeholders", "Positive", "Regex", "RelativePath", "Typed", "Verbatim",
     "field_markers", "field_rules", "field_specs", "host_wide_error", "host_wide_sections", "render_got",
     "run_section_hooks", "unknown_sections_error", "validate_section",
 ]  # fmt: skip

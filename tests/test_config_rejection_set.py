@@ -63,6 +63,17 @@ _PROVIDER_BASE = {
     "output_usd_per_mtok": 2,
 }
 _RULE_BASE = {"pattern": "a", "kind": "k"}
+# Element seeds for ``tuple[Dataclass, ...]`` fields, by element class (default ``_RULE_BASE``).
+_ENTRY_SEEDS = {"RoleEntry": {"harness": "devin-shell"}}
+# A role chain is only valid beside a primary that records sessions (``manual`` -- the worker
+# default -- is rejected in any chain with fallbacks), so probes under ``worker.fallbacks`` /
+# ``reviewer.fallbacks`` are placed on top of one, else every cell would record ``R``.
+_CONTEXT = {
+    ("worker", "fallbacks"): {"worker": {"harness": "claude-code", "model": "m"}},
+    ("reviewer", "fallbacks"): {"reviewer": {"harness": "claude-code", "model": "m"}},
+}
+_FB = {"harness": "devin-shell", "model": "x"}
+_WORKER = {"harness": "claude-code", "model": "m"}
 
 # Whole-config scenarios the per-key matrix cannot express (cross-field rules,
 # legacy aliases, derived defaults, scoped sections). Name -> raw config.
@@ -112,6 +123,69 @@ CASES: dict[str, dict] = {
     "rescue_worker_absent": {"rescue": {"enabled": True}},
     "rescue_reviewer_list": {"rescue": {"reviewer": ["x"]}},
     "rescue_reviewer_ok": {"rescue": {"reviewer": {"harness": "devin", "model": "m"}}},
+    # Issue #2086/#2088 role chain -- recorded against origin/main's own source.
+    "worker_fallbacks_ok": {"worker": {**_WORKER, "fallbacks": [_FB]}},
+    "worker_fallbacks_three_ok": {
+        "worker": {**_WORKER, "fallbacks": [{**_FB, "model": str(i)} for i in range(3)]}
+    },
+    "worker_fallbacks_empty": {"worker": {**_WORKER, "fallbacks": []}},
+    "worker_fallbacks_null": {"worker": {**_WORKER, "fallbacks": None}},
+    "worker_fallbacks_null_manual": {"worker": {"fallbacks": None}},
+    "worker_fallbacks_bad_harness": {"worker": {**_WORKER, "fallbacks": [{"harness": "bogus"}]}},
+    "worker_fallbacks_harness_missing": {"worker": {**_WORKER, "fallbacks": [{"model": "x"}]}},
+    "worker_fallbacks_harness_null": {"worker": {**_WORKER, "fallbacks": [{"harness": None}]}},
+    "worker_fallbacks_harness_int": {"worker": {**_WORKER, "fallbacks": [{"harness": 5}]}},
+    "worker_fallbacks_dup_primary": {
+        "worker": {**_WORKER, "fallbacks": [{"harness": "claude-code", "model": "m"}]}
+    },
+    "worker_fallbacks_dup_fallbacks": {"worker": {**_WORKER, "fallbacks": [_FB, _FB]}},
+    "worker_fallbacks_same_harness_other_model": {
+        "worker": {**_WORKER, "fallbacks": [{"harness": "claude-code", "model": "n"}]}
+    },
+    "worker_fallbacks_four": {
+        "worker": {**_WORKER, "fallbacks": [{**_FB, "model": str(i)} for i in range(4)]}
+    },
+    "worker_fallbacks_sync_primary": {"worker": {"harness": "manual", "fallbacks": [_FB]}},
+    "worker_fallbacks_sync_default_primary": {"worker": {"fallbacks": [_FB]}},
+    "worker_fallbacks_sync_entry": {
+        "worker": {**_WORKER, "fallbacks": [{"harness": "command", "model": "x"}]}
+    },
+    "worker_fallbacks_effort": {"worker": {**_WORKER, "fallbacks": [{**_FB, "effort": "high"}]}},
+    "worker_fallbacks_effort_empty": {"worker": {**_WORKER, "fallbacks": [{**_FB, "effort": ""}]}},
+    "worker_fallbacks_unknown_key": {"worker": {**_WORKER, "fallbacks": [{**_FB, "bogus": 1}]}},
+    "worker_fallbacks_model_null": {
+        "worker": {**_WORKER, "fallbacks": [{"harness": "devin-shell", "model": None}]}
+    },
+    "worker_fallbacks_model_int": {"worker": {**_WORKER, "fallbacks": [{**_FB, "model": 5}]}},
+    "worker_fallbacks_not_list": {"worker": {**_WORKER, "fallbacks": "devin-shell"}},
+    "worker_fallbacks_mapping": {"worker": {**_WORKER, "fallbacks": {}}},
+    "worker_fallbacks_entry_str": {"worker": {**_WORKER, "fallbacks": ["devin-shell"]}},
+    "reviewer_fallbacks_ok": {"reviewer": {"fallbacks": [_FB]}},
+    "reviewer_fallbacks_effort_ok": {"reviewer": {"fallbacks": [{**_FB, "effort": "high"}]}},
+    "reviewer_fallbacks_effort_int": {"reviewer": {"fallbacks": [{**_FB, "effort": 5}]}},
+    "reviewer_fallbacks_null": {"reviewer": {"fallbacks": None}},
+    "reviewer_fallbacks_harness_set": {
+        "reviewer": {"fallbacks": [{"harness": "manual", "model": "x"}]}
+    },
+    "reviewer_fallbacks_bad_harness": {"reviewer": {"fallbacks": [{"harness": "bogus"}]}},
+    "reviewer_fallbacks_dup_effort_differs": {
+        "reviewer": {"fallbacks": [{"harness": "claude-code", "model": "m", "effort": "high"}]}
+    },
+    "reviewer_fallbacks_dup_primary": {
+        "reviewer": {"harness": "claude-code", "model": "m", "fallbacks": [_WORKER]}
+    },
+    "reviewer_fallbacks_four": {
+        "reviewer": {"fallbacks": [{**_FB, "model": str(i)} for i in range(4)]}
+    },
+    "reviewer_fallbacks_devin_primary": {
+        "reviewer": {"harness": "devin", "fallbacks": [_FB]}
+    },
+    # rescue.worker / rescue.reviewer reuse WorkerRoleConfig and store ``fallbacks`` unparsed
+    # (main's known gap): anything is accepted, verbatim, and a null stays ``None``.
+    "rescue_worker_fallbacks_raw": {"rescue": {"worker": {"fallbacks": [{"harness": "bogus"}]}}},
+    "rescue_worker_fallbacks_str": {"rescue": {"worker": {"fallbacks": "zz"}}},
+    "rescue_reviewer_fallbacks_null": {"rescue": {"reviewer": {"fallbacks": None}}},
+    "rescue_reviewer_fallbacks_ok": {"rescue": {"reviewer": {"fallbacks": [_FB]}}},
     "api_enabled_empty": {"api_worker": {"enabled": True}},
     "api_enabled_missing_provider": {"api_worker": {"enabled": True, "provider": "zz"}},
     "api_enabled_ok": {
@@ -313,7 +387,7 @@ def walk_targets() -> list[dict]:
             if _is_dc(tp):
                 sub = (here, tp, {})
             elif origin is tuple and args and _is_dc(args[0]):
-                sub = ([*here, 0], args[0], dict(_RULE_BASE))
+                sub = ([*here, 0], args[0], dict(_ENTRY_SEEDS.get(args[0].__name__, _RULE_BASE)))
             elif origin in (dict, Mapping) and len(args) == 2 and _is_dc(args[1]):
                 sub = ([*here, "p"], args[1], dict(_PROVIDER_BASE))
             out.append(
@@ -360,7 +434,13 @@ def place(path: list, value: object, seed: dict) -> dict:
         node[key] = child
         return node
 
-    return make(0)
+    raw = make(0)
+    for prefix, base in _CONTEXT.items():
+        if tuple(path[: len(prefix)]) == prefix:
+            ctx = copy.deepcopy(base)
+            ctx[prefix[0]].update(raw[prefix[0]])
+            raw = {**raw, **ctx}
+    return raw
 
 
 def _changed(cfg: typing.Any) -> list[tuple[str, str, str]]:

@@ -68,6 +68,7 @@ def _adapter_settings(self, *, adapter: str | None = None) -> AdapterSettings:
         launch_stagger_seconds=self.config.dispatch.launch_stagger_seconds,
         api_worker_config=api_worker if resolved_adapter == "api" else None,
         config=self.config,
+        role="worker" if adapter is None else "",
     )
 
 

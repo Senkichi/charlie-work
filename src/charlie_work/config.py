@@ -57,6 +57,7 @@ from .config_validation import (
     Regex,
     RelativePath,
     Typed,
+    Verbatim,
     field_rules,
     field_specs,
     run_section_hooks,
@@ -112,6 +113,13 @@ from .fleet_supervisor_config import (  # noqa: F401  (deliberate re-export)
 
 from . import layout
 from .harnesses import REVIEWER_HARNESSES, WORKER_HARNESSES
+from .role_chain import (
+    RoleEntry,
+    chain_of,
+    check_reviewer_role_chain,
+    check_role_chain,
+    role_entries,
+)
 from .issue_comments import DEFAULT_INCLUDED_ASSOCIATIONS as DEFAULT_COMMENT_ASSOCIATIONS
 
 logger = logging.getLogger(__name__)
@@ -1693,6 +1701,11 @@ class WorkerRoleConfig:
 
     harness: str = "manual"
     model: str = ""
+    # Issue #2086: role chain, see role_chain.py. ``Verbatim`` because rescue.worker /
+    # rescue.reviewer reuse this class and never parsed ``fallbacks`` (main stores the raw
+    # value); the top-level ``worker:`` section opts in with a use-site ``Entries``.
+    fallbacks: Annotated[tuple[RoleEntry, ...], Verbatim] = ()
+    chain = property(chain_of)
 
 
 @dataclass(frozen=True)
@@ -1718,6 +1731,12 @@ class ReviewerRoleConfig:
     effort: Annotated[str, Typed, NotNull] = ""
     effort_experiment_fraction: Annotated[float, Typed, NotNull, InRange(0.0, 1.0)] = 0.0
     effort_experiment_salt: Annotated[str, Typed, NotNull] = ""
+    fallbacks: Annotated[
+        tuple[RoleEntry, ...],
+        NullIsDefault,
+        role_entries(REVIEWER_HARNESSES, allow_effort=True),
+    ] = ()  # issue #2086: role chain, see role_chain.py
+    chain = property(chain_of)
 
     def validate(self, config: OrchestratorConfig) -> None:
         """Cross-field rule: a fraction > 0.0 enables the experiment, whose treatment arm IS
@@ -2431,9 +2450,15 @@ class OrchestratorConfig:
         # ``WorkerRoleConfig`` itself: the class is reused for rescue.worker/.reviewer,
         # and rescue.reviewer's documented default harness ("devin") is not a member of
         # ``harnesses.WORKER_HARNESSES``.
-        FieldRules(harness=(Typed, NotNull, OneOf(*sorted(WORKER_HARNESSES)))),
+        FieldRules(
+            harness=(Typed, NotNull, OneOf(*sorted(WORKER_HARNESSES))),
+            fallbacks=(NullIsDefault, role_entries(WORKER_HARNESSES, allow_effort=False)),
+        ),
+        Check(check_role_chain),
     ] = field(default_factory=WorkerRoleConfig)
-    reviewer: ReviewerRoleConfig = field(default_factory=ReviewerRoleConfig)
+    reviewer: Annotated[ReviewerRoleConfig, Check(check_reviewer_role_chain)] = field(
+        default_factory=ReviewerRoleConfig
+    )
     watchdog: WatchdogConfig = field(default_factory=WatchdogConfig)
     worktree_reclamation: WorktreeReclamationConfig = field(
         default_factory=WorktreeReclamationConfig

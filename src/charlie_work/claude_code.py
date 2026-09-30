@@ -1662,6 +1662,12 @@ def update_worker_record_with_failure_classification(
 
     payload["failure_kind"] = resolved_kind
     _write_json_atomic(sidecar_path, payload)
+    # Issue #2086: restrict the session's own (harness, model) fleet-wide.
+    from . import role_quota_ledger
+
+    role_quota_ledger.record_classified_death(
+        payload, resolved_kind, throttled_until, source="worker_failure_classification"
+    )
     return resolved_kind, throttled_until
 
 

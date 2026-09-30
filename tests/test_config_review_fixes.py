@@ -160,8 +160,10 @@ def test_fleet_global_load_helper_refuses_host_wide_construction_error(tmp_path:
 
 
 def test_fleet_global_load_helper_still_degrades_other_config_errors(tmp_path: Path) -> None:
-    # Control: an ordinary FieldError in the global layer keeps the #623 fallback, so the
-    # refusal above is caused by the ConstructionError class alone.
+    # Control (rescued half): an ordinary FieldError in the global layer is absorbed by the
+    # #665 rescue *inside* ``load_layered_config``, so the helper's own ``except ConfigError``
+    # never runs here; the next test drives that branch. The refusal above is caused by the
+    # ConstructionError class alone.
     repo, _, fleet = _layers(tmp_path, "dispatch:\n  nope: 1\n", "dispatch:\n  default_limit: 2\n")
     reported: list[Exception] = []
     config = load_fleet_global_config(
@@ -174,6 +176,33 @@ def test_fleet_global_load_helper_still_degrades_other_config_errors(tmp_path: P
     assert config is not None
     assert config.dispatch.default_limit == 2
     assert reported == []  # the rescue inside load_layered_config handled it, no fallback needed
+
+
+def test_fleet_global_load_helper_reports_a_bad_global_when_nothing_can_rescue_it(
+    tmp_path: Path,
+) -> None:
+    # Control (helper half): with no repo layer to rescue onto, the same ordinary FieldError
+    # escapes ``load_layered_config`` as a plain ConfigError, so the helper's own
+    # ``except ConfigError`` runs: one report, then the caller's fallback (not a refusal).
+    fleet = tmp_path / "fleet"
+    fleet.mkdir()
+    (fleet / "config.yaml").write_text("dispatch:\n  nope: 1\n", encoding="utf-8")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    reported: list[Exception] = []
+    sentinel = object()
+    config = load_fleet_global_config(
+        load_layered_config,
+        repo,
+        fleet_dir_override=str(fleet),
+        fallback=sentinel,
+        report=reported.append,
+    )
+    assert len(reported) == 1
+    assert isinstance(reported[0], ConfigError)
+    assert not isinstance(reported[0], ConstructionError)
+    assert "nope" in str(reported[0])
+    assert config is sentinel  # no repo layer either, so the reload fails too: fallback
 
 
 def test_fleet_global_load_helper_falls_back_when_nothing_loads(tmp_path: Path) -> None:

@@ -296,7 +296,7 @@ def test_build_config_from_data_empty_bodied_cross_family_section_is_rejected() 
 def test_build_config_from_data_unknown_worker_key_still_raises_configerror() -> None:
     with pytest.raises(
         ConfigError,
-        match=r"^worker: expected known keys \(valid: harness, model\), got unknown key\(s\) bogus$",
+        match=r"^worker: expected known keys \(valid: fallbacks, harness, model\), got unknown key\(s\) bogus$",
     ):
         build_config_from_data({"worker": {"bogus": "x"}})
 

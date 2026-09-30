@@ -2870,7 +2870,7 @@ def _worker_kind_from_recovery(recovery: dict[str, Any], config: OrchestratorCon
             kind = latest.get("kind")
             if isinstance(kind, str) and kind:
                 return kind
-    default = config.worker.harness
+    default = config.worker.harness if len(config.worker.chain) == 1 else None  # #2086
     if isinstance(default, str) and default:
         return default
     return None
