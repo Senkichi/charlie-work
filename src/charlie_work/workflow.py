@@ -258,6 +258,22 @@ from .escalation import (  # noqa: F401  (deliberate re-export)
 # LOAD-BEARING RE-EXPORT — NOT AN UNUSED IMPORT. Do not delete; the `noqa`
 # below marks a deliberate re-export, not a lint concession.
 #
+# Issue #2051: the live-worker cap-escalation deferral helpers
+# (probe candidates through `issue_worker_liveness`, persist the
+# once-per-worker `escalation_deferred_live_worker` marker+event) live in
+# `charlie_work.live_worker_deferral` -- a new module rather than
+# `.escalation`, which has no file-size headroom left for them. Re-exported
+# here so `_wf.<name>` call sites and monkeypatch targets keep working.
+from .live_worker_deferral import (  # noqa: F401  (deliberate re-export)
+    _live_worker_cap_escalation_deferrals,
+    _defer_cap_escalation_for_live_worker,
+    _record_cap_escalation_deferrals,
+    _defer_janitor_cap_escalation_for_live_worker,
+)
+
+# LOAD-BEARING RE-EXPORT — NOT AN UNUSED IMPORT. Do not delete; the `noqa`
+# below marks a deliberate re-export, not a lint concession.
+#
 # issue #1283 Phase A: the reviewer-verdict-parsing free-function family
 # (fenced-JSON extraction, stream-json event decoding, mtime-gated file
 # fallback recovery, and reviewer-session-summary reconstruction), plus the
