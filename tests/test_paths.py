@@ -40,7 +40,7 @@ from charlie_work.config import (
     RuntimeConfig,
 )
 from charlie_work.layout import resolve_state_child
-from charlie_work.paths import resolved_layout, runtime_paths
+from charlie_work.paths import prompt_override_dirs, resolved_layout, runtime_paths
 from charlie_work.worktree import WorktreeCleanResult
 from charlie_work.workflow import OrchestratorApp
 
@@ -229,3 +229,21 @@ def test_dispatch_and_clean_worktrees_root_agree_explicit_worktrees_dir(
 
     assert dispatch_root == clean_root
     assert dispatch_root == repo / "alt-worktrees-root"
+
+
+def test_prompt_override_dirs_repo_root_none(tmp_path: Path) -> None:
+    """Pin the ``repo_root=None`` arm of the single prompts_dir resolution
+    rule (issue #2054): the rework-brief render path can run without a repo
+    root, so a relative ``runtime.prompts_dir`` must come back unresolved
+    rather than raising on ``None / path``. Absolute values and the unset
+    knob behave the same as with a real root."""
+    relative = OrchestratorConfig(runtime=RuntimeConfig(prompts_dir="override-prompts"))
+    assert prompt_override_dirs(relative, None) == (Path("override-prompts"),)
+    assert prompt_override_dirs(relative, tmp_path) == (tmp_path / "override-prompts",)
+
+    absolute = OrchestratorConfig(runtime=RuntimeConfig(prompts_dir=str(tmp_path / "abs-prompts")))
+    assert prompt_override_dirs(absolute, None) == (tmp_path / "abs-prompts",)
+
+    unset = OrchestratorConfig()
+    assert prompt_override_dirs(unset, None) == ()
+    assert prompt_override_dirs(unset, tmp_path) == ()

@@ -311,8 +311,9 @@ def test_orphaned_worker_clean_exit_not_reset_to_rework(tmp_path: Path) -> None:
 
     # Must NOT be reset to rework_requested -- that would burn a redispatch
     # attempt on a worker that never had anything to change.
-    assert entry.get("status") == "dispatched"
-    assert entry.get("dispatched_at") == "2024-01-01T00:00:00Z"
+    # Issue #2034: escalated (visible), not left stranded in dispatched.
+    assert entry.get("status") == "escalated"
+    assert entry.get("escalation_reason") == "rework_no_op"
     assert entry["worker_pid"] == 99999
 
     events = state.get("events", [])

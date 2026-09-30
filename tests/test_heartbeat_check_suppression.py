@@ -262,41 +262,36 @@ def test_suppression_integration_with_check_stale_open_issue_mentions(
 
 def test_seeded_registry_loads_and_matches_both_fleet_repos(hb: ModuleType) -> None:
     """The registry checked into the repo (scripts/heartbeat-suppressions.yaml)
-    parses cleanly as a single fleet-wide entry with a live (non-expired, as
-    of this test's authorship) tracking issue: `repo` is omitted so the
-    suppression covers every current and future fleet repo by construction
-    (issue #1860 -- the prior per-repo enumeration missed Senkichi/jobcannon
-    and Senkichi/swole when they onboarded). The leaf name predates #1860
-    and is kept verbatim: the collect-only gate (issue #1538) fails test
-    renames fail-closed, and it stays accurate since the one fleet-wide
-    entry still matches both repos it names, along with every other."""
+    parses cleanly and -- since issue #2048 retired the fleet-wide
+    stale-open-issue-mentions entry (#1361) rather than renewing it -- holds
+    no suppression for that check.
+
+    The leaf name predates the retirement and is kept verbatim: the
+    collect-only gate (issue #1538) treats test renames fail-closed. The
+    assertion below is deliberately not "zero entries" -- the file is a
+    live registry and a *different* check may legitimately seed an entry
+    later without this test reneging; what must never silently come back
+    is a stale-open-issue-mentions suppression, which the companion test
+    below pins behaviorally.
+    """
     registry_path = Path(__file__).parent.parent / "scripts" / "heartbeat-suppressions.yaml"
     entries, err = hb.load_suppression_registry(registry_path)
 
     assert err is None
-    assert len(entries) == 1
-    (entry,) = entries
-    assert entry.check == "stale-open-issue-mentions"
-    assert entry.repo is None
-    assert entry.issue == 1361
-    assert entry.expires == "2026-09-30"
+    assert not any(e.check == "stale-open-issue-mentions" for e in entries)
 
 
 def test_seeded_registry_actually_suppresses_the_real_per_repo_check_name(
     hb: ModuleType,
 ) -> None:
-    """Closes the gap the two tests above leave open individually: parsing
-    the checked-in registry and matching *some* check name each prove half
-    the path. This proves the file on disk suppresses the exact string
-    `check_stale_open_issue_mentions` emits for each real fleet repo
-    (f"stale-open-issue-mentions {repo.slug}") -- not a stand-in owner/repo
-    slug, and not a hypothetical shape. With `repo` omitted (issue #1860)
-    it must also cover the repos the per-repo enumeration missed
-    (Senkichi/jobcannon, Senkichi/swole) and any slug a future onboarding
-    adds, so the entry can never again lag the fleet roster. If a future
-    edit bakes the repo suffix into the seeded `check:` field instead of
-    using the separate `repo:` field, this test fails loudly; the tests
-    above would not."""
+    """Post-#2048 inversion of this test's original contract: the seeded
+    registry must NOT suppress the exact string
+    `check_stale_open_issue_mentions` emits for a real fleet repo slug
+    (f"stale-open-issue-mentions {repo.slug}") -- the #1361 suppression was
+    retired, not renewed, so the same detail line that used to come back
+    SUPPRESSED now stays ANOMALY. A stray re-add of the entry fails this
+    test loudly; parsing alone (the test above) would only see its shape,
+    not its effect on the real check name."""
     registry_path = Path(__file__).parent.parent / "scripts" / "heartbeat-suppressions.yaml"
     entries, err = hb.load_suppression_registry(registry_path)
     assert err is None
@@ -316,5 +311,5 @@ def test_seeded_registry_actually_suppresses_the_real_per_repo_check_name(
         )
         report.anom(check, detail)
 
-        assert not report.anomaly, f"registry failed to suppress slug {slug}"
-        assert report.lines[-1].startswith(f"SUPPRESSED {check}: [#1361 until 2026-09-30]")
+        assert report.anomaly, f"registry unexpectedly suppressed slug {slug}"
+        assert report.lines[-1].startswith(f"ANOMALY {check}:")

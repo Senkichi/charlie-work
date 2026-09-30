@@ -589,7 +589,7 @@ def test_dispatch_defers_after_stall_reap_sets_throttled_until(tmp_path: Path) -
     )
 
     with (
-        patch("charlie_work.worker.is_session_alive", return_value=True),
+        patch("charlie_work.worker_fate.is_alive", return_value=True),
         patch("charlie_work.write_gate.kill_process_tree", return_value=[99999]),
         patch("charlie_work.dead_worker_reap.sweep_orphan_processes", return_value=[]),
     ):
@@ -667,7 +667,7 @@ def test_dispatch_defers_when_provider_throttled(tmp_path: Path) -> None:
 
         future_time = datetime.now(UTC) + timedelta(hours=1)
         throttled_until = future_time.replace(microsecond=0).isoformat().replace("+00:00", "Z")
-        state = set_throttled_until(state, throttled_until)
+        state = set_throttled_until(state, throttled_until, source="test")
         save_state(paths.state_file, state)
 
     app.gh.prs[0]["state"] = "CLOSED"
@@ -698,7 +698,7 @@ def test_dispatch_proceeds_when_throttle_window_expired(tmp_path: Path) -> None:
 
         past_time = datetime.now(UTC) - timedelta(hours=1)
         throttled_until = past_time.replace(microsecond=0).isoformat().replace("+00:00", "Z")
-        state = set_throttled_until(state, throttled_until)
+        state = set_throttled_until(state, throttled_until, source="test")
         save_state(paths.state_file, state)
 
     app.gh.prs[0]["state"] = "CLOSED"

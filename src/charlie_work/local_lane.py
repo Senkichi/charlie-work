@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Any
 
 from .prompt_test_command import PYTEST_FLAGS, derive_pytest_runner
-from .subprocess_runner import run_captured
+from .subprocess_runner import command_failure_message, run_captured
 from .worktree import list_worktrees, remove_worktree, worktree_path_for_branch
 
 # Generous bound for a full-suite run inside a branch worktree. The suite
@@ -85,6 +85,31 @@ def branch_head_sha(repo_root: Path, branch: str) -> str | None:
     return sha or None
 
 
+def probe_branch_ref(repo_root: Path, branch: str) -> tuple[bool | None, str | None]:
+    """``git show-ref --verify --quiet`` for ``refs/heads/<branch>``.
+
+    Tri-state probe WITH the failure detail attached: ``(exists, None)`` is
+    the determinate answer -- True when the ref resolves (rc 0), False when
+    it does not (rc 1 -- a determinate "no branch" answer: there is nothing
+    committed under that name to salvage). ``(None, detail)`` means the
+    probe itself failed -- spawn error, timeout, or a git-level error
+    (exit >= 2/128) -- so existence is inconclusive and ``detail`` carries
+    git's stderr (or the spawn/timeout error) for the caller's escalation
+    reason. A caller distinguishing "no work" from "could not tell" needs
+    the third state; ``branch_head_sha``'s flat ``None`` conflates
+    absent-with-failed (issue #1971).
+    """
+    command = ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"]
+    result = run_captured(
+        command,
+        cwd=repo_root,
+        timeout_seconds=GIT_OP_TIMEOUT_SECONDS,
+    )
+    if result.returncode is None or result.returncode not in (0, 1):
+        return None, command_failure_message(command, result, "ref probe failed")
+    return result.returncode == 0, None
+
+
 def resolve_ref_sha(repo_root: Path, ref: str) -> str | None:
     """Resolve any revision expression (branch, tag, ``HEAD``) to a commit SHA.
 
@@ -120,6 +145,29 @@ def local_base_branch(repo_root: Path) -> str | None:
     return name or None
 
 
+def branch_diff_result(
+    repo_root: Path, base_ref: str, branch: str
+) -> tuple[str | None, str | None]:
+    """``git diff <base_ref>...<branch>`` with the failure detail attached.
+
+    Returns ``(diff_text, None)`` on success -- an empty string is a
+    legitimate "no content delta" answer -- and ``(None, detail)`` on
+    failure, where ``detail`` prefers git's stderr over the generic
+    exit-code message so a lane escalating on a deterministic failure
+    (missing ref, no merge base) can carry the actual reason instead of
+    wedging silently (issue #1971).
+    """
+    command = ["git", "diff", f"{base_ref}...{branch}"]
+    result = run_captured(
+        command,
+        cwd=repo_root,
+        timeout_seconds=GIT_OP_TIMEOUT_SECONDS,
+    )
+    if not result.ok:
+        return None, command_failure_message(command, result, "diff failed")
+    return result.stdout, None
+
+
 def branch_diff(repo_root: Path, base_ref: str, branch: str) -> str | None:
     """``git diff <base_ref>...<branch>`` -- the three-dot branch diff.
 
@@ -128,14 +176,7 @@ def branch_diff(repo_root: Path, base_ref: str, branch: str) -> str | None:
     content delta vs. base) and is returned as-is -- callers decide whether an
     empty diff is dispatchable.
     """
-    result = run_captured(
-        ["git", "diff", f"{base_ref}...{branch}"],
-        cwd=repo_root,
-        timeout_seconds=GIT_OP_TIMEOUT_SECONDS,
-    )
-    if not result.ok:
-        return None
-    return result.stdout
+    return branch_diff_result(repo_root, base_ref, branch)[0]
 
 
 def is_ancestor(repo_root: Path, ancestor: str, descendant: str) -> bool:

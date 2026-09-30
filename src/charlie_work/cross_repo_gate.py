@@ -187,6 +187,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import markdown_fence
 from .cross_repo_gate_candidates import (
     _EMBEDDED_WHITESPACE_RE,
     _PATH_RE,
@@ -317,27 +318,17 @@ _PARAGRAPH_BREAK_RE = re.compile(r"\n[ \t]*\n")
 # from the clause search, defeating the exact pattern it exists to catch.
 _CLAUSE_BOUNDARY_RE = re.compile(r"[.;,()]")
 
-# A markdown ATX heading line: 1-6 ``#`` followed by whitespace and heading
-# text. Used to derive the enclosing section of a candidate from the body's
-# own structure (issue #1583) -- a citation under a ``## Provenance``
-# heading is neutral regardless of whether a clause-local marker word
-# introduces it, because the heading itself is the citation signal.
-#
-# The leading-whitespace class is ``[ \t]*`` (any amount) only because the
-# fence/indented-code filtering in :func:`_nearest_preceding_heading` strips
-# code-block lines before this regex ever sees them; a real ATX heading
-# cannot be indented 4+ spaces (that is an indented code block in CommonMark),
-# and the function skips such lines before matching.
-_HEADING_LINE_RE = re.compile(r"^[ \t]*#{1,6}[ \t]+(.+?)[ \t]*$")
-
-# A fenced-code-block delimiter (CommonMark): 0-3 leading spaces, then 3+
-# backticks or 3+ tildes. An opener may carry an info string after the marker
-# (e.g. `````python````); a closer is the marker alone (plus optional
-# trailing whitespace). Used by :func:`_nearest_preceding_heading` to skip
-# ``#``-prefixed lines inside a fenced block -- a code sample containing the
-# literal line ``# References`` is not a structural heading and must not
-# shadow a real preceding heading (review finding, PR #1584 round 3).
-_FENCE_DELIM_RE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})")
+# Heading and fence detection for :func:`_nearest_preceding_heading` comes
+# from ``markdown_fence.scan`` (architecture-deepening candidate 3,
+# "markdown structure"): CommonMark bounds an ATX heading's and a fence
+# delimiter's indent to 0-3 spaces/tabs, which -- by itself, with no
+# separate "indented code block" concept needed -- is why a ``#``-prefixed
+# line indented 4+ spaces was never a structural heading even before this
+# module stopped hand-rolling that bound (a real ATX heading can never be
+# indented that far). Fence-awareness (skipping ``#``-prefixed lines inside
+# a fenced block, so a code sample containing the literal line
+# ``# References`` cannot shadow a real preceding heading -- review finding,
+# PR #1584 round 3) comes from the same scan.
 
 # Citation-section heading vocabulary (issue #1583): a candidate whose
 # nearest preceding ``#``-heading is essentially one of these phrases is
@@ -387,54 +378,22 @@ def _nearest_preceding_heading(text_before_in_body: str) -> str | None:
     level (a ``### Sub`` under ``## Provenance`` is still in the Provenance
     section).
 
-    The walk is fence/indented-code aware (review finding, PR #1584 round
-    3): a ``#``-prefixed line inside a fenced code block (between
-    ``\\`\\`\\``` / ``~~~`` delimiters) or an indented code block (4+ leading
-    spaces or a tab) is code content, not a structural heading. Without
-    this, a code sample containing the literal line ``# References`` would
-    shadow a real preceding heading and wrongly neutralize a genuine
-    dispatch target elsewhere in the body -- the same cross-repo-
-    contamination risk class the gate exists to prevent. A real ATX
-    heading is never indented 4+ spaces (that is an indented code block in
-    CommonMark), so skipping such lines can only remove false positives,
-    never a genuine heading.
+    The walk is fence-aware (review finding, PR #1584 round 3): a
+    ``#``-prefixed line inside a fenced code block (between
+    ``\\`\\`\\``` / ``~~~`` delimiters) is code content, not a structural
+    heading -- ``markdown_fence.scan`` provides this. Without it, a code
+    sample containing the literal line ``# References`` would shadow a real
+    preceding heading and wrongly neutralize a genuine dispatch target
+    elsewhere in the body -- the same cross-repo-contamination risk class
+    the gate exists to prevent. A 4+-space-indented ``#`` line (an indented
+    code block under CommonMark) is likewise never read as a heading here,
+    because ``scan``'s own ATX-heading rule bounds indent to 0-3 -- no
+    separate indented-code-block check is needed to get that right.
     """
-    last: str | None = None
-    in_fence = False
-    fence_char = ""
-    fence_len = 0
-    for line in text_before_in_body.splitlines():
-        delim = _FENCE_DELIM_RE.match(line)
-        if delim:
-            marker = delim.group(1)
-            char = marker[0]
-            length = len(marker)
-            if not in_fence:
-                # Opener: enter the fence. An info string may follow the
-                # marker (e.g. ```python); it is code, not prose.
-                in_fence = True
-                fence_char = char
-                fence_len = length
-            elif char == fence_char and length >= fence_len:
-                # Closer: same fence character, at least as long as the
-                # opener, and nothing but whitespace after the marker.
-                if line[delim.end() :].strip() == "":
-                    in_fence = False
-                    fence_char = ""
-                    fence_len = 0
-            continue
-        if in_fence:
-            # Inside a fenced block: every line is code, regardless of '#'.
-            continue
-        # Indented code block (CommonMark): 4+ leading spaces or a leading
-        # tab is code, not prose -- a '# References' line so indented is a
-        # code sample, not a heading.
-        if line.startswith("    ") or line.startswith("\t"):
-            continue
-        match = _HEADING_LINE_RE.match(line)
-        if match:
-            last = match.group(1)
-    return last
+    structure = markdown_fence.scan(text_before_in_body)
+    if not structure.headings:
+        return None
+    return structure.headings[-1].text
 
 
 def _is_in_citation_section(text_before_in_body: str) -> bool:

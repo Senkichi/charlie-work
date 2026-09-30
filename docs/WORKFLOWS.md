@@ -105,7 +105,7 @@ charlie work --limit 3
 # 5. Poll for liveness/completion instead of pasting anything by hand.
 #    `charlie doctor --adapter-probe` reports failed/exited sessions, or
 #    read the sidecars directly:
-python -c "from pathlib import Path; from charlie_work.devin_shell import read_session_records, is_session_alive; recs = read_session_records(Path('.var/charlie-work/dispatches/sessions')); [print(r.issue_number, is_session_alive(r)) for r in recs]"
+python -c "from pathlib import Path; from charlie_work.devin_shell import read_session_records; from charlie_work.worker_fate import is_alive; recs = read_session_records(Path('.var/charlie-work/dispatches/sessions')); [print(r.issue_number, is_alive(r.pid, r.process_start_time)) for r in recs]"
 
 # 6-9. Same why-charlie-hate/verdict/ship-it sequence as the manual loop
 charlie why-charlie-hate --pr 123
@@ -183,7 +183,8 @@ tier's outcome surfaces.
 
 Fleet-level commands compose the single-repo loops across every repo in the
 user-level registry (`fleet_registry.py`) under one global concurrency budget
-(`fleet.global_max_concurrent_sessions`). A repo joins the registry
+(`fleet.global_max_concurrent_sessions` for workers;
+`fleet.global_max_concurrent_reviews` for reviewers). A repo joins the registry
 automatically the first time any command loads its config (`touch_repo()`), so
 there is no explicit "register" step — run charlie once against a repo and it is
 enrolled.

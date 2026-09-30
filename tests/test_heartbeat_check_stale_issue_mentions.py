@@ -30,6 +30,34 @@ def hb() -> ModuleType:
     return _load_heartbeat_check()
 
 
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        ("Repro:\n\n1. Paste:\n\n    ```\n    see #123\n    ```\n", set()),
+        ("- ex:\n\t```\n\tsee #124\n\t```\n", set()),
+        # Positive controls: the scanner still reports genuine mentions.
+        ("top #125\n", {125}),
+        ("1. step\n\n    ```\n    code\n    ```\n\nreal #126\n", {126}),
+    ],
+    ids=[
+        "numbered-step-fence",
+        "tab-fence-under-bullet",
+        "control-top-level",
+        "control-after-fence",
+    ],
+)
+def test_mentioned_issue_numbers_ignores_list_nested_fences(
+    hb: ModuleType, body: str, expected: set[int]
+) -> None:
+    """md-r2 re-review 2, B2: an exclusion consumer must be container-tolerant.
+
+    origin/main's ``_FENCED_CODE_BLOCK_RE`` ignored indent, so a fence nested
+    under a list item hid its ``#N``; a CommonMark-strict scan alone would
+    surface it as a false stale-mention ANOMALY.
+    """
+    assert hb._mentioned_issue_numbers(body) == expected
+
+
 # ---------------------------------------------------------------------------
 # check_stale_open_issue_mentions (issue #902)
 #
@@ -239,9 +267,17 @@ def test_check_stale_open_issue_mentions_catches_817_824_reproduction(
 def test_check_stale_open_issue_mentions_catches_866_864_reproduction_via_commit(
     hb: ModuleType, monkeypatch: Any, tmp_path: Path
 ) -> None:
-    """Issue #902 criterion 2: #866's fix rode inside PR #864, a PR for a
-    different issue, with no reference anywhere in #864's own title/body --
-    only in one of its commit messages."""
+    """Issue #902 criterion 2 / #2048: #866's fix rode inside PR #864, a PR
+    for a different issue, with no reference anywhere in #864's own
+    title/body -- only in one of its commit messages.
+
+    The seeded message uses an unqualified ``(#866)`` rather than the real
+    commit's verbatim ``(refs #866)``: under issue #2048's non-closing-context
+    exclusion the literal #866 text is deliberately suppressed (see
+    ``test_issue_mention_occurrences_marks_real_866_commit_non_closing``),
+    and what this test pins is the surviving shape -- an unlabeled issue
+    traceable only through a commit inside another issue's PR.
+    """
     repo = _make_repo(hb, tmp_path)
     _stale_mention_gh_dispatch(
         monkeypatch,
@@ -267,7 +303,7 @@ def test_check_stale_open_issue_mentions_catches_866_864_reproduction_via_commit
                 ("740484f", "feat(heartbeat): loop-pass stall (#864)"),
                 (
                     "e93fe13",
-                    "feat(heartbeat): surface error-level events with no consumer (refs #866)",
+                    "feat(heartbeat): surface error-level events with no consumer (#866)",
                 ),
             ],
             "",
@@ -280,6 +316,23 @@ def test_check_stale_open_issue_mentions_catches_866_864_reproduction_via_commit
     assert report.anomaly
     assert "#866" in report.lines[-1]
     assert "commit e93fe13" in report.lines[-1]
+
+
+def test_issue_mention_occurrences_marks_real_866_commit_non_closing(
+    hb: ModuleType,
+) -> None:
+    """Issue #2048's accepted tradeoff, pinned against the real payload.
+
+    The verbatim PR #864 squash-commit text mentions #866 as ``(refs #866)``
+    -- inside the same clause as the ``refs`` qualifier -- so exclusion 1
+    classifies it non-closing and the check no longer flags it. That is the
+    deliberate cost the issue accepts (a real ``Refs #N`` shape is the
+    corpus's dominant false positive); this test exists so a future change
+    to the clause scoping can't silently un-exclude it without a reviewer
+    seeing the tradeoff named here.
+    """
+    occurrences = hb.issue_mention_occurrences(_REAL_PR864_SQUASH_COMMIT_EXCERPT)
+    assert (866, True) in occurrences
 
 
 def test_check_stale_open_issue_mentions_no_label_filter_or_state_json(
@@ -569,3 +622,22 @@ def test_check_stale_open_issue_mentions_degrades_gracefully_when_git_log_fails(
     assert report.anomaly
     assert "#817" in report.lines[-1]
     assert "commit-message scan degraded" in report.lines[-1]
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        ("Run ```charlie\nverdict #124``` to record it.\n", set()),
+        ("Run ```charlie\nverdict #124``` then see #127\n", {127}),
+        # Positive control: an unpaired inline run does not swallow the rest.
+        ("Run ``` alone\nsee #128\n", {128}),
+    ],
+    ids=["multiline-inline-span", "mention-after-span", "control-unpaired"],
+)
+def test_mentioned_issue_numbers_ignores_multiline_inline_triple_backtick_span(
+    hb: ModuleType, body: str, expected: set[int]
+) -> None:
+    """md-r3 review N1: origin/main's non-anchored regex also removed an
+    inline ``` span crossing a line break; the line-based block strip alone
+    would leak its ``#N`` as a false stale-mention ANOMALY."""
+    assert hb._mentioned_issue_numbers(body) == expected

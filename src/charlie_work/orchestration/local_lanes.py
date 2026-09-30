@@ -42,7 +42,20 @@ import charlie_work.workflow as _wf
 from charlie_work.worker_pid_stamp import stamp_worker_process
 from charlie_work.adapters import SessionRequest
 from charlie_work.claude_code import resolve_review_effort
+from charlie_work.fleet_registry import try_acquire_fleet_lock
+from charlie_work.worker_launch_gate import (
+    REASON_CONCURRENCY_CAP,
+    WorkerLaunchDeferral,
+    WorkerLaunchPermit,
+    _launch_workers,
+    issue_worker_launch_permit,
+)
 from charlie_work.github import GitHubError
+from charlie_work.review_fleet_gate import (
+    fleet_review_lock,
+    fleet_review_lock_deferral,
+    read_fleet_review_cap,
+)
 from charlie_work.janitor import check_operator_containment, check_test_adequacy
 from charlie_work.labels import TransitionOutcome
 from charlie_work.local_lane import (
@@ -669,8 +682,12 @@ def _local_build_packet(
     return {"issue": issue_number, "ok": True, "head": head, "branch": branch}
 
 
-def _local_dispatch_reviewers(self, *, now: Any = None) -> dict[str, Any]:
+@fleet_review_lock(lambda data: _wf.CommandResult(True, "local review dispatch pass", data))
+def _local_dispatch_reviewers(self, *, now: Any = None, launch_lock: Any = None) -> dict[str, Any]:
     """Claim and launch reviewers for lane records whose head is packetized.
+
+    ``launch_lock`` (issue #2084) is supplied by ``@fleet_review_lock`` and is
+    realized/clamped below exactly as in ``dispatch_reviews``.
 
     Mirrors ``dispatch_reviews``'s claim/launch/post-claim shape at a smaller
     scale: pending claim stamped under one lock, launches outside it, then a
@@ -770,6 +787,21 @@ def _local_dispatch_reviewers(self, *, now: Any = None) -> dict[str, Any]:
 
     if not selected:
         return result
+
+    # Issue #2084: realize the fleet lock now -- after the lock-free scan,
+    # before the fleet reviewer count is read -- and hold it through
+    # claim -> launch (the wrapper releases it). Clamp to the fleet budget.
+    lock_deferral = fleet_review_lock_deferral(self, launch_lock)
+    if lock_deferral is not None:
+        return {**result, **lock_deferral, "skipped": [*result["skipped"], *selected]}
+    fleet_cap = read_fleet_review_cap(self)
+    if fleet_cap is not None:
+        clamped = fleet_cap.available < len(selected)
+        result.update(fleet_cap.report_fields(clamped=clamped))
+        result["skipped"] = [*result["skipped"], *selected[fleet_cap.available :]]
+        selected = selected[: fleet_cap.available]
+        if not selected:
+            return result
 
     claim_stamp = _wf.utc_now()
     with _wf.state_lock(self.paths.state_file):
@@ -1493,6 +1525,64 @@ def _local_dispatch_rework(self) -> dict[str, Any]:
     if not candidates:
         return result
 
+    # Issue #2039 / #2041: the shared worker-launch gate the remote lanes use
+    # (fleet lock -> concurrency governor -> provider throttle). Without it a
+    # no-remote repo's rework launched through a provider-throttle /
+    # operator-hold cooldown and uncounted against the fleet-wide Devin cap.
+    # The permit acquires (and on exit releases) the fleet lock itself, held
+    # across governor -> claim -> launch. A deferred candidate stays
+    # ``rework_requested``.
+    decision = issue_worker_launch_permit(self, len(candidates), acquire=try_acquire_fleet_lock)
+    if isinstance(decision, WorkerLaunchDeferral):
+        return _defer_local_rework(
+            self, result, candidates, decision.reason, **decision.report_fields()
+        )
+    with decision as permit:
+        if permit.max_launches < len(candidates):
+            _defer_local_rework(
+                self,
+                result,
+                candidates[permit.max_launches :],
+                REASON_CONCURRENCY_CAP,
+                **permit.governor.report_fields(),
+            )
+            candidates = candidates[: permit.max_launches]
+        if not candidates:
+            return result
+        return _launch_local_rework(self, state, candidates, result, permit)
+
+
+def _defer_local_rework(
+    self, result: dict[str, Any], candidates: list[int], reason: str, **fields: Any
+) -> dict[str, Any]:
+    """Record a gated local rework deferral (issue #2039) -- never silent (#2016)."""
+    for pr_number in candidates:
+        result["skipped"].append({"issue": pr_number, "reason": reason})
+    with _wf.state_lock(self.paths.state_file):
+        state = _wf.load_state(self.paths.state_file)
+        state = self._record_event(
+            state,
+            "dispatch_deferred",
+            {
+                "lane": "local_dispatch_rework",
+                "deferred_reason": reason,
+                "pr_numbers": list(candidates),
+                "local": True,
+                **fields,
+            },
+        )
+        self.write_gate.save_state(state)
+    return result
+
+
+def _launch_local_rework(
+    self,
+    state: dict[str, Any],
+    candidates: list[int],
+    result: dict[str, Any],
+    permit: WorkerLaunchPermit,
+) -> dict[str, Any]:
+    """Claim and launch the gated local rework candidates."""
     requests: list[SessionRequest] = []
     request_issues: dict[int, int] = {}
     for pr_number in candidates:
@@ -1552,13 +1642,7 @@ def _local_dispatch_rework(self) -> dict[str, Any]:
     dispatch_results = list(superseded_failures)
     if launch_requests:
         dispatch_results.extend(
-            _wf.dispatch_sessions(
-                self.repo_root,
-                self._layout.session_manifest,
-                self._layout.session_results,
-                self._adapter_settings(),
-                launch_requests,
-            )
+            _launch_workers(self, permit, self._adapter_settings(), launch_requests)
         )
     successful = {r.issue_number for r in dispatch_results if r.ok}
     failed_map = {

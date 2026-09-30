@@ -376,7 +376,18 @@ def test_orphaned_worker_reported_push_pr_create_failed_emits_distinct_drift(
     """Issue #935: a worker-reported push with a PR-create failure must not be
     treated as a no-open-PR orphan; it emits a distinct drift and stays
     dispatched so a human sees the real error.
+
+    worker-fate rule 9 (design doc Sec 9): admission into the pushed-branch
+    salvage lane requires git-confirmed evidence, never the worker's bare
+    self-report -- so this scenario needs a REAL pushed branch (matching
+    ``test_orphaned_worker_pushed_branch_uses_worker_drafted_pr_content``'s
+    setup) to reach the PR-create attempt at all. The fixture used to point
+    ``repo_root`` at a nonexistent directory, which was sufficient under the
+    pre-flip code (admission was the worker's self-report alone) but leaves
+    ``resolve_fate`` with zero evidence and no way to prove the push, so it
+    never reaches the PR-create attempt this test means to exercise.
     """
+    import subprocess
     from unittest.mock import patch
 
     from charlie_work.config import DevinConfig, OrchestratorConfig, WatchdogConfig
@@ -395,7 +406,77 @@ def test_orphaned_worker_reported_push_pr_create_failed_emits_distinct_drift(
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
+    remote_repo = tmp_path / "remote"
+    remote_repo.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "init", "--bare", str(remote_repo)], check=True, capture_output=True, text=True
+    )
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "init", "--initial-branch=main", str(repo_root)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    for cmd in (
+        ["git", "config", "user.email", "test@example.test"],
+        ["git", "config", "user.name", "Test User"],
+    ):
+        subprocess.run(cmd, cwd=repo_root, check=True, capture_output=True, text=True)
+    (repo_root / "README.md").write_text("hello\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "README.md"], cwd=repo_root, check=True, capture_output=True, text=True
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "initial"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "remote", "add", "origin", str(remote_repo)],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "push", "-u", "origin", "main"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
     branch = "agent/issue-935-workers-push-a-finished-branch-but-cannot-open-t"
+    subprocess.run(
+        ["git", "checkout", "-b", branch],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    (repo_root / "fix.txt").write_text("fix\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "fix.txt"], cwd=repo_root, check=True, capture_output=True, text=True
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "fix"], cwd=repo_root, check=True, capture_output=True, text=True
+    )
+    subprocess.run(
+        ["git", "push", "-u", "origin", branch],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "checkout", "main"], cwd=repo_root, check=True, capture_output=True, text=True
+    )
+
     state = load_state(paths.state_file)
     state["issues"]["935"] = {
         "status": "dispatched",
@@ -428,7 +509,7 @@ def test_orphaned_worker_reported_push_pr_create_failed_emits_distinct_drift(
 
     class FakeGitHubForFailedPr(FakeGitHub):
         def __init__(self) -> None:
-            super().__init__(repo_root=tmp_path / "not-a-repo")
+            super().__init__(repo_root=repo_root, dry_run=False)
             self.issues = [
                 {
                     "number": 935,
@@ -490,7 +571,13 @@ def test_orphaned_worker_pr_create_failed_stranded_drift_dedups_on_repeat_sweep(
     the pre-existing ``_drift_fingerprint``/``orphan_drift_fingerprint``
     dedup mechanism unchanged (see workflow.py's orphan-reap sweep) rather
     than inventing a second dedup layer for the new event kind.
+
+    worker-fate rule 9 (design doc Sec 9): see the sibling
+    ``test_orphaned_worker_reported_push_pr_create_failed_emits_distinct_drift``
+    -- admission into the pushed-branch salvage lane now requires a
+    git-confirmed push, so this fixture needs a real pushed branch too.
     """
+    import subprocess
     from unittest.mock import patch
 
     from charlie_work.config import DevinConfig, OrchestratorConfig, WatchdogConfig
@@ -509,7 +596,77 @@ def test_orphaned_worker_pr_create_failed_stranded_drift_dedups_on_repeat_sweep(
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
+    remote_repo = tmp_path / "remote"
+    remote_repo.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "init", "--bare", str(remote_repo)], check=True, capture_output=True, text=True
+    )
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "init", "--initial-branch=main", str(repo_root)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    for cmd in (
+        ["git", "config", "user.email", "test@example.test"],
+        ["git", "config", "user.name", "Test User"],
+    ):
+        subprocess.run(cmd, cwd=repo_root, check=True, capture_output=True, text=True)
+    (repo_root / "README.md").write_text("hello\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "README.md"], cwd=repo_root, check=True, capture_output=True, text=True
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "initial"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "remote", "add", "origin", str(remote_repo)],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "push", "-u", "origin", "main"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
     branch = "agent/issue-935-workers-push-a-finished-branch-but-cannot-open-t"
+    subprocess.run(
+        ["git", "checkout", "-b", branch],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    (repo_root / "fix.txt").write_text("fix\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "fix.txt"], cwd=repo_root, check=True, capture_output=True, text=True
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "fix"], cwd=repo_root, check=True, capture_output=True, text=True
+    )
+    subprocess.run(
+        ["git", "push", "-u", "origin", branch],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "checkout", "main"], cwd=repo_root, check=True, capture_output=True, text=True
+    )
+
     state = load_state(paths.state_file)
     state["issues"]["935"] = {
         "status": "dispatched",
@@ -541,7 +698,7 @@ def test_orphaned_worker_pr_create_failed_stranded_drift_dedups_on_repeat_sweep(
 
     class FakeGitHubForFailedPr(FakeGitHub):
         def __init__(self) -> None:
-            super().__init__(repo_root=tmp_path / "not-a-repo")
+            super().__init__(repo_root=repo_root, dry_run=False)
             self.issues = [
                 {
                     "number": 935,

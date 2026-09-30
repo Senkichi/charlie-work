@@ -175,7 +175,11 @@ def test_dead_dispatched_worker_not_reaped_within_grace_period(tmp_path: Path) -
 
     recent_drift_at = (datetime.now(UTC) - timedelta(minutes=5)).isoformat().replace("+00:00", "Z")
     fingerprint = json.dumps(
-        {"reason": "dead_worker_clean_exit_no_op", "reviewed_head_sha": "abc123"},
+        {
+            "reason": "dead_worker_unsafe_to_auto_reset",
+            "last_decision": "blocked",
+            "pr_number": 100,
+        },
         sort_keys=True,
         default=str,
     )
@@ -189,7 +193,7 @@ def test_dead_dispatched_worker_not_reaped_within_grace_period(tmp_path: Path) -
         "orphan_drift_fingerprint": fingerprint,
     }
     state["prs"]["100"] = {
-        "decision": "request_changes",
+        "decision": "blocked",
         "reviewed_head_sha": "abc123",
     }
     save_state(paths.state_file, state)
@@ -202,7 +206,7 @@ def test_dead_dispatched_worker_not_reaped_within_grace_period(tmp_path: Path) -
     pr_decision_dir = paths.prs / "pr-100"
     pr_decision_dir.mkdir(parents=True, exist_ok=True)
     (pr_decision_dir / "review-decision.json").write_text(
-        json.dumps({"decision": "request_changes", "reviewed_head_sha": "abc123"}),
+        json.dumps({"decision": "blocked", "reviewed_head_sha": "abc123"}),
         encoding="utf-8",
     )
 
@@ -384,7 +388,11 @@ def test_dead_dispatched_worker_provider_throttled_not_reaped(tmp_path: Path) ->
     # worker's death carried a provider-throttle classification.
     old_drift_at = (datetime.now(UTC) - timedelta(minutes=120)).isoformat().replace("+00:00", "Z")
     fingerprint = json.dumps(
-        {"reason": "dead_worker_clean_exit_no_op", "reviewed_head_sha": "abc123"},
+        {
+            "reason": "dead_worker_unsafe_to_auto_reset",
+            "last_decision": "blocked",
+            "pr_number": 100,
+        },
         sort_keys=True,
         default=str,
     )
@@ -399,7 +407,7 @@ def test_dead_dispatched_worker_provider_throttled_not_reaped(tmp_path: Path) ->
         "dead_worker_failure_kind": "rate_limited",
     }
     state["prs"]["100"] = {
-        "decision": "request_changes",
+        "decision": "blocked",
         "reviewed_head_sha": "abc123",
     }
     # The exemption is bounded by the provider throttle window: it holds
@@ -418,7 +426,7 @@ def test_dead_dispatched_worker_provider_throttled_not_reaped(tmp_path: Path) ->
     pr_decision_dir = paths.prs / "pr-100"
     pr_decision_dir.mkdir(parents=True, exist_ok=True)
     (pr_decision_dir / "review-decision.json").write_text(
-        json.dumps({"decision": "request_changes", "reviewed_head_sha": "abc123"}),
+        json.dumps({"decision": "blocked", "reviewed_head_sha": "abc123"}),
         encoding="utf-8",
     )
 
@@ -540,7 +548,7 @@ def test_dead_dispatched_worker_provider_throttled_reclaimed_and_retried(
         lambda pid, start_time=None: killed.append(pid) or [pid],
     )
     monkeypatch.setattr(dead_worker_reap, "sweep_orphan_processes", lambda worktree_path: [])
-    monkeypatch.setattr("charlie_work.worker.is_session_alive", lambda record: True)
+    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: True)
     monkeypatch.setattr("charlie_work.worker.real_activity_probe_for", _stale_devin_probe)
 
     from charlie_work import workflow
@@ -668,7 +676,7 @@ def test_dead_dispatched_worker_expired_throttle_window_still_reclaimed(
         lambda pid, start_time=None: killed.append(pid) or [pid],
     )
     monkeypatch.setattr(dead_worker_reap, "sweep_orphan_processes", lambda worktree_path: [])
-    monkeypatch.setattr("charlie_work.worker.is_session_alive", lambda record: True)
+    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: True)
     monkeypatch.setattr("charlie_work.worker.real_activity_probe_for", _stale_devin_probe)
 
     from charlie_work import workflow
@@ -682,6 +690,10 @@ def test_dead_dispatched_worker_expired_throttle_window_still_reclaimed(
     state = load_state(state_file)
     entry = state["issues"][str(issue_number)]
     assert entry["dead_worker_failure_kind"] == "rate_limited"
+    # ``persist_failure`` stamps when the classification was made.
+    assert entry["dead_worker_failure_classified_at"] == (
+        frozen_now.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    )
     # The armed window is already expired: anchored ~20 minutes in the
     # past, it clamps to the classification clock — a zero-length window.
     assert state.get("throttled_until") is not None
@@ -963,7 +975,7 @@ def test_launch_failure_lane_stamps_throttle_kind_and_arms_window(
     """Issue #1917: the launch-failure branch of
     ``_classify_dead_sessions_and_update_throttle_state`` stamps
     ``dead_worker_failure_kind`` on the issue entry (via
-    ``record_dead_worker_failure_kind``) and calls ``set_throttled_until``
+    ``worker_fate.persist_failure``) and calls ``set_throttled_until``
     when the log-tail classification returns a throttle window."""
     import charlie_work.state as state_module
     from charlie_work.dead_worker_reap import (
@@ -1004,7 +1016,9 @@ def test_launch_failure_lane_stamps_throttle_kind_and_arms_window(
         throttle_calls.append(until)
         return real_set_throttled_until(data, until, **kwargs)
 
-    monkeypatch.setattr(state_module, "set_throttled_until", _spy)
+    # ``worker_fate.persist_failure`` is the single writer of the cooldown and
+    # the kind stamp; it binds ``set_throttled_until`` at import time.
+    monkeypatch.setattr("charlie_work.worker_fate.set_throttled_until", _spy)
 
     reaped = _classify_dead_sessions_and_update_throttle_state(
         sessions_dir, state_file, FakeGitHub(), config, write_gate=_wg(state_file)
@@ -1065,7 +1079,9 @@ def test_launch_failure_lane_stamps_kind_without_window_for_non_throttle(
         throttle_calls.append(until)
         return real_set_throttled_until(data, until, **kwargs)
 
-    monkeypatch.setattr(state_module, "set_throttled_until", _spy)
+    # ``worker_fate.persist_failure`` is the single writer of the cooldown and
+    # the kind stamp; it binds ``set_throttled_until`` at import time.
+    monkeypatch.setattr("charlie_work.worker_fate.set_throttled_until", _spy)
 
     reaped = _classify_dead_sessions_and_update_throttle_state(
         sessions_dir, state_file, FakeGitHub(), config, write_gate=_wg(state_file)

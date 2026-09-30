@@ -35,6 +35,7 @@ from charlie_work.instrumentation import log_event
 from charlie_work.janitor import JanitorVerdict
 from charlie_work.safe_ref import require_valid_sha
 from charlie_work.state import StateLockBusy
+from charlie_work.worker_launch_gate import acquire_fleet_launch_lock
 from charlie_work.dead_worker_reap import _is_pr_updated_at_older_than, _safe_repo_slug
 
 
@@ -459,21 +460,12 @@ def dispatch(
         else None
     )
 
-    fleet_lock = None
-    if self.config.fleet.global_max_concurrent_sessions > 0:
-        fleet_lock = try_acquire_fleet_lock(self.fleet_dir_override)
-        if fleet_lock is None:
-            return _wf.CommandResult(
-                True,
-                "dispatch deferred: fleet lock held",
-                {
-                    "selected_count": 0,
-                    "deferred_reason": "fleet_lock_held",
-                    "merged_prs": merged_prs_for_result,
-                    "merged_pr_closed_issue_numbers": sorted(finalized),
-                    "merged_pr_referenced_issue_numbers": sorted(finalized),
-                },
-            )
+    # Issue #2055: mint the fleet-launch-lock handle here so the ``finally``
+    # below covers every impl exit path, but do NOT take the OS lock yet --
+    # the pending handle is realized by issue_worker_launch_permit (bounded
+    # wait) immediately before the governor, after _dispatch_impl's
+    # issue_list / blocker-prefetch / reachability / stall-sweep scan.
+    launch_lock = acquire_fleet_launch_lock(self, acquire=try_acquire_fleet_lock)
     try:
         result = self._dispatch_impl(
             limit,
@@ -481,6 +473,7 @@ def dispatch(
             stalled_entries=stalled_entries,
             ready_issues=ready_issues,
             merged_prs=merged_pr_outcome,
+            launch_lock=launch_lock,
         )
         data = dict(result.data)
         if finalized:
@@ -548,5 +541,4 @@ def dispatch(
             },
         )
     finally:
-        if fleet_lock is not None:
-            fleet_lock.release()
+        launch_lock.release()

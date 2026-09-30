@@ -16,7 +16,9 @@ orphan-sweep pipeline:
   ``process_utils.kill_orphan_pid``) refuse to terminate, because a sweep-hit
   PID naming any ancestor (uv, the pytest controller, the step's pwsh) fells
   the subtree containing the caller — the mid-run controller death issue
-  #1842 tracks.
+  #1842 tracks. The snapshot row type and the walk itself live in
+  ``process_chain`` (shared with ``quiesce`` and ``host_load``, issue #2058);
+  the private names here are alias bindings into it.
 """
 
 from __future__ import annotations
@@ -25,112 +27,26 @@ import json
 import logging
 import os
 import shutil
+import signal
+import time
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from .subprocess_runner import run_captured
+from .process_chain import ancestor_chain_pids
+from .process_chain import ProcRow as _ProcRow  # noqa: F401 (deliberate re-export)
+from .process_chain import posix_process_ppid_snapshot as _posix_process_ppid_snapshot
+from .process_chain import win32_process_ppid_snapshot as _win32_process_ppid_snapshot
+from .subprocess_runner import command_failure_message, run_captured
 
 logger = logging.getLogger(__name__)
 
 
-# Hard backstop on the parent-PID walk in ``_self_ancestor_pids`` — the same
-# bound ``quiesce.self_process_chain`` carries as ``_MAX_CHAIN_DEPTH``. A
-# malformed or adversarial ppid snapshot (a cycle) must never spin the guard;
-# real chains are a handful of hops.
+# Hard backstop on the parent-PID walk ``_self_ancestor_pids`` delegates to
+# (``process_chain.ancestor_chain_pids``). A malformed or adversarial ppid
+# snapshot (a cycle) must never spin the guard; real chains are a handful of
+# hops.
 _MAX_ANCESTOR_CHAIN_HOPS = 64
-
-
-def _win32_process_ppid_snapshot() -> dict[int, int]:
-    """Snapshot ``pid -> ppid`` for every process via one CIM query.
-
-    Leaner than ``quiesce.list_processes``: it selects only
-    ``ProcessId``/``ParentProcessId``, makes a single attempt, and uses a
-    10s timeout — this runs on the kill path inside ``kill_process_tree`` /
-    ``kill_orphan_pid``, where quiesce's 60s x 2 retry budget (sized for a
-    once-per-invocation operator gate) could stall an orphan sweep for
-    minutes under load.
-
-    Routed through ``subprocess_runner.run_captured`` (the codebase's
-    never-raises runner) rather than raw ``subprocess.run``: a spawn failure
-    such as ``PermissionError`` from a denied ``CreateProcess`` is an
-    ``OSError``, not a ``SubprocessError``, and would have slipped the old
-    narrow ``except`` to propagate through the ancestor guard — aborting
-    ``dead_worker_reap._sweep_orphan_processes_for_dead_sessions`` outright.
-
-    Returns ``{}`` on any failure (no PowerShell, timeout, non-zero exit,
-    spawn error, unparseable output). The caller degrades to the bare
-    self-pid guard rather than disabling process reaping on a host whose
-    process-listing substrate is broken — see ``_self_ancestor_pids``.
-    """
-    ppid_by_pid: dict[int, int] = {}
-    if not shutil.which("powershell"):
-        return ppid_by_pid
-    result = run_captured(
-        [
-            "powershell",
-            "-NoProfile",
-            "-Command",
-            "Get-CimInstance Win32_Process | "
-            "Select-Object ProcessId, ParentProcessId | ConvertTo-Json",
-        ],
-        cwd=Path.cwd(),
-        timeout_seconds=10,
-    )
-    if result.returncode != 0:
-        return ppid_by_pid
-    try:
-        data = json.loads(result.stdout)
-    except json.JSONDecodeError:
-        return ppid_by_pid
-
-    # No ``-AsArray``: that switch is PowerShell 6+ and Windows PowerShell
-    # 5.1 fails the whole command on it (see ``quiesce.list_processes``).
-    # ``ConvertTo-Json`` therefore emits a bare object when exactly one
-    # process matches — normalize both shapes.
-    if isinstance(data, dict):
-        data = [data]
-    if not isinstance(data, list):
-        return ppid_by_pid
-
-    for entry in data:
-        if not isinstance(entry, dict):
-            continue
-        try:
-            pid = int(entry["ProcessId"])
-            ppid = int(entry.get("ParentProcessId") or 0)
-        except (KeyError, TypeError, ValueError):
-            continue
-        ppid_by_pid[pid] = ppid
-    return ppid_by_pid
-
-
-def _posix_process_ppid_snapshot(proc_root: Path = Path("/proc")) -> dict[int, int]:
-    """Snapshot ``pid -> ppid`` from procfs (``/proc/<pid>/stat``).
-
-    ``proc_root`` is a parameter — not a constant read at call time — so
-    tests can point it at a fabricated procfs tree without touching the
-    host's (same convention as ``host_load._list_processes_posix``).
-    Processes that exit or become unreadable mid-scan are skipped: a
-    snapshot can never be perfectly atomic, and a vanished entry is not
-    worth failing the walk over. Returns ``{}`` where procfs is absent.
-    """
-    ppid_by_pid: dict[int, int] = {}
-    try:
-        entries = list(proc_root.iterdir())
-    except OSError:
-        return ppid_by_pid
-    for entry in entries:
-        if not entry.name.isdigit():
-            continue
-        try:
-            stat_text = (entry / "stat").read_text(encoding="utf-8", errors="replace")
-            # ppid is the first field after ``state`` once comm (which can
-            # contain spaces/parens) is split off on the LAST ')'.
-            fields = stat_text.rpartition(")")[2].split()
-            ppid_by_pid[int(entry.name)] = int(fields[1])
-        except (OSError, ValueError, IndexError):
-            continue
-    return ppid_by_pid
 
 
 def _self_ancestor_pids() -> frozenset[int]:
@@ -144,12 +60,19 @@ def _self_ancestor_pids() -> frozenset[int]:
     CommandLine substring, and a too-broad worktree needle legitimately
     matches that ancestry's command lines.
 
-    The walk mirrors ``quiesce.self_process_chain``'s termination rules: a
-    parent absent from the snapshot, a cycle, or the hop cap ends it. When
-    the snapshot cannot be taken at all the result degrades to
-    ``{os.getpid()}`` — on Windows the only producer of orphan PIDs
-    (``sweep_orphan_processes``) needs the same CIM substrate, so a broken
-    snapshot mostly means there was no sweep output to act on either;
+    The walk is ``process_chain.ancestor_chain_pids`` (issue #2058), whose
+    termination rules are a parent absent from the snapshot, a cycle, the
+    hop cap, and -- crucially -- a parent *created after its child*. Windows
+    never reparents, so once an ancestor exits its PID is free to be
+    recycled, and a child's stale ``ParentProcessId`` then names whatever
+    unrelated process took the number. Trusting it put a freshly launched
+    merge-gate runner on the "ancestor" list, and ``kill_process_tree``
+    refused to kill it (the ``test_local_merge_gate_async``
+    timeout/restart flake). When the snapshot cannot be taken at all the
+    result degrades to ``{os.getpid()}`` — on Windows the only producer of
+    orphan PIDs (``sweep_orphan_processes``) needs a working
+    process-listing substrate too, so a broken snapshot mostly means there
+    was no sweep output to act on either;
     collapsing to the pre-#1842 self-pid guard keeps direct
     ``kill_process_tree`` callers (which carry start-time fingerprints)
     working on such a host instead of silently disabling reaping.
@@ -182,15 +105,7 @@ def _self_ancestor_pids() -> frozenset[int]:
             self_pid,
             os.name,
         )
-    chain: set[int] = {self_pid}
-    current = self_pid
-    for _ in range(_MAX_ANCESTOR_CHAIN_HOPS):
-        parent = ppid_by_pid.get(current)
-        if parent is None or parent <= 0 or parent in chain:
-            break
-        chain.add(parent)
-        current = parent
-    return frozenset(chain)
+    return frozenset(ancestor_chain_pids(self_pid, ppid_by_pid, max_hops=_MAX_ANCESTOR_CHAIN_HOPS))
 
 
 # Minimum length a ``worktree_path`` needle must reach before
@@ -269,7 +184,7 @@ def sweep_orphan_processes(worktree_path: str) -> list[dict[str, Any]]:
     # Known gap: ``-AsArray`` is a PowerShell 6+ switch — on Windows
     # PowerShell 5.1 the whole command fails (non-zero exit) and this sweep
     # silently returns [] on every such host (a #1842 follow-up tracks the
-    # fix). ``_win32_process_ppid_snapshot`` deliberately omits ``-AsArray``
+    # fix). ``quiesce.list_processes`` deliberately omits ``-AsArray``
     # for exactly this reason.
     result = run_captured(
         [
@@ -310,3 +225,173 @@ def sweep_orphan_processes(worktree_path: str) -> list[dict[str, Any]]:
         )
 
     return orphans
+
+
+def _enumerate_fingerprinted_children(pid: int) -> dict[int, float | None]:
+    """Enumerate ``pid``'s children, pairing each with its process start time.
+
+    The fingerprint must be taken at enumeration time — *before* the platform
+    tree kill runs — because ``_reap_enumerated_children`` uses it later to
+    tell "the process enumeration returned" from a stranger that recycled the
+    pid during the kill window (issue #2059). ``None`` means the start time
+    was unreadable (a protected process, or the pid exited between
+    enumeration and the query); such a pid can never be pinned and must never
+    be individually killed.
+
+    The local import avoids a cycle: ``process_utils`` imports this module's
+    guard machinery at module scope. Resolving ``_enumerate_child_pids`` /
+    ``get_process_start_time`` through the module at call time preserves the
+    existing test seam (``monkeypatch.setattr(process_utils, ...)``).
+    """
+    from .process_utils import _enumerate_child_pids, get_process_start_time
+
+    return {child: get_process_start_time(child) for child in _enumerate_child_pids(pid)}
+
+
+# Bound on confirming a survivor of the tree kill actually dies after its
+# individual kill. TerminateProcess/SIGKILL teardown is prompt; the bound only
+# absorbs propagation latency under load, and a still-live result after it is
+# reported as a survivor, not retried forever.
+_CHILD_KILL_CONFIRM_SECONDS = 1.0
+_CHILD_KILL_CONFIRM_POLL_SECONDS = 0.05
+
+
+def _reap_enumerated_children(
+    root_pid: int,
+    child_starts: Mapping[int, float | None],
+    exempt_pids: frozenset[int],
+    expected_root_start_time: float | None,
+) -> list[int]:
+    """Verify each enumerated child died with its root; reap survivors directly.
+
+    Called by ``kill_process_tree`` after the platform tree kill, whose report
+    is optimistic: ``taskkill /T /PID <already-dead root>`` exits 128 ("not
+    found") and kills *nothing*, and ``/T`` silently skips a member it cannot
+    terminate — yet the children used to be recorded as killed unconditionally
+    (issue #2059: the "child still alive after kill_process_tree" flake is a
+    real orphan the return value had claimed dead). On POSIX, ``killpg``
+    similarly cannot reach an enumerated child that left the group.
+
+    Each enumerated pid is classified with its enumeration-time fingerprint:
+
+    * already dead — or recycled onto another process, which the pinned
+      ``is_pid_alive`` check reads as dead — is recorded.
+    * alive with a verified matching fingerprint is killed individually
+      (``taskkill /T /F`` on Windows so its own subtree goes with it;
+      ``SIGKILL`` on POSIX), then re-verified before it is recorded.
+    * alive but unverifiable (no fingerprint captured, or the start time can
+      no longer be read) is *never* killed by bare pid — an unpinned kill can
+      hit a stranger holding a recycled pid — and is logged instead.
+    * (Windows only) created before its alleged parent
+      (``start <= root_start_time``) is a stale-``ParentProcessId`` artifact
+      of pid recycling, not a child: Windows never reparents, so a real child
+      always postdates its parent — the #2057 ancestor-walk rule mirrored
+      onto descendants. Refused and logged. ``taskkill /T``'s own ppid
+      matching may still have hit it; that is outside this function's
+      control, but this path never adds an individual kill for it. The check
+      is Windows-only because its premise is: on POSIX the kernel reparents
+      orphans, so a ppid read at enumeration is never stale, and /proc start
+      times are ~10 ms-tick-quantized on an estimated boot base — jitter can
+      place a real child's read a few ms before its root's, and refusing it
+      would strand the very survivor this function exists to reap.
+    * listed in ``exempt_pids`` (the caller's self/ancestor guard, #1842) is
+      refused identically: a stale ppid can name an ancestor, and killing it
+      would fell this process's own subtree.
+
+    Returns the subset of enumerated pids verified dead. Never raises: this
+    runs on the kill path inside ``kill_process_tree``, whose contract is
+    best-effort.
+    """
+    # Routed through ``process_utils``'s own names at call time so a patched
+    # ``charlie_work.process_utils.run_captured`` covers the individual kill
+    # too — same seam the tree kill uses.
+    from .process_utils import get_process_start_time, is_pid_alive, run_captured
+
+    root_start = expected_root_start_time
+    if root_start is None:
+        # Post-mortem reads still work while a handle keeps the process object
+        # alive; a fully-reaped root yields None and the ordering check below
+        # is skipped (the fingerprint pin still applies).
+        root_start = get_process_start_time(root_pid)
+
+    confirmed_dead: list[int] = []
+    for child, start in child_starts.items():
+        if child in exempt_pids:
+            logger.warning(
+                "kill_process_tree: enumerated 'child' pid %d of %d is this process or "
+                "a caller ancestor; refusing to touch it (stale ParentProcessId or "
+                "bogus enumeration)",
+                child,
+                root_pid,
+            )
+            continue
+        if start is None:
+            if not is_pid_alive(child):
+                confirmed_dead.append(child)
+            else:
+                logger.warning(
+                    "kill_process_tree: child %d of %d survived the tree kill but has "
+                    "no start-time fingerprint; refusing an identity-unpinned kill",
+                    child,
+                    root_pid,
+                )
+            continue
+        if not is_pid_alive(child, start):
+            confirmed_dead.append(child)
+            continue
+        if os.name == "nt" and root_start is not None and start <= root_start:
+            logger.warning(
+                "kill_process_tree: enumerated 'child' %d of %d was created before its "
+                "parent (start %.3f <= %.3f); stale ParentProcessId on a recycled pid, "
+                "not a child -- refusing individual kill",
+                child,
+                root_pid,
+                start,
+                root_start,
+            )
+            continue
+        current = get_process_start_time(child)
+        if current is None or abs(current - start) > 1.0:
+            logger.warning(
+                "kill_process_tree: child %d of %d reads alive but its start time is no "
+                "longer verifiable; refusing an identity-unpinned kill",
+                child,
+                root_pid,
+            )
+            continue
+        # The direct kill's own failure detail rides into the survivor warning
+        # below -- a taskkill/os.kill that never landed is the difference
+        # between "kill was resisted" and "kill never happened", and only the
+        # latter is actionable from a bare "still alive" line.
+        kill_detail = ""
+        try:
+            if os.name == "nt":
+                kill_command = ["taskkill", "/T", "/F", "/PID", str(child)]
+                kill_result = run_captured(
+                    kill_command,
+                    cwd=Path.cwd(),
+                    timeout_seconds=10,
+                )
+                if not kill_result.ok:
+                    kill_detail = "; direct kill failed: " + command_failure_message(
+                        kill_command, kill_result, "no diagnostic output"
+                    )
+            else:
+                os.kill(child, signal.SIGKILL)
+        except Exception as exc:
+            kill_detail = f"; direct kill raised {exc!r}"
+        deadline = time.monotonic() + _CHILD_KILL_CONFIRM_SECONDS
+        while time.monotonic() < deadline:
+            if not is_pid_alive(child, start):
+                confirmed_dead.append(child)
+                break
+            time.sleep(_CHILD_KILL_CONFIRM_POLL_SECONDS)
+        else:
+            logger.warning(
+                "kill_process_tree: child %d of %d survived the tree kill and a direct "
+                "kill -- still alive%s",
+                child,
+                root_pid,
+                kill_detail,
+            )
+    return confirmed_dead

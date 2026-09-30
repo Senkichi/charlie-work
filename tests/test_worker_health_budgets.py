@@ -55,7 +55,7 @@ def test_classify_worker_health_cost_budget_warn_mode(tmp_path: Path) -> None:
         reclaimed=None,
     )
 
-    with patch("charlie_work.worker.is_worker_alive", return_value=True):
+    with patch("charlie_work.worker_fate.is_alive", return_value=True):
         config = OrchestratorConfig(
             watchdog=WatchdogConfig(cost_budget_usd=5.0, cost_budget_action="warn")
         )
@@ -93,7 +93,7 @@ def test_classify_worker_health_cost_budget_kill_mode(tmp_path: Path) -> None:
         reclaimed=None,
     )
 
-    with patch("charlie_work.worker.is_worker_alive", return_value=True):
+    with patch("charlie_work.worker_fate.is_alive", return_value=True):
         config = OrchestratorConfig(
             watchdog=WatchdogConfig(cost_budget_usd=5.0, cost_budget_action="kill")
         )
@@ -131,7 +131,7 @@ def test_classify_worker_health_token_budget_warn_mode(tmp_path: Path) -> None:
         reclaimed=None,
     )
 
-    with patch("charlie_work.worker.is_worker_alive", return_value=True):
+    with patch("charlie_work.worker_fate.is_alive", return_value=True):
         config = OrchestratorConfig(
             watchdog=WatchdogConfig(token_budget=50000, cost_budget_action="warn")
         )
@@ -169,7 +169,7 @@ def test_classify_worker_health_token_budget_kill_mode(tmp_path: Path) -> None:
         reclaimed=None,
     )
 
-    with patch("charlie_work.worker.is_worker_alive", return_value=True):
+    with patch("charlie_work.worker_fate.is_alive", return_value=True):
         config = OrchestratorConfig(
             watchdog=WatchdogConfig(token_budget=50000, cost_budget_action="kill")
         )
@@ -207,7 +207,7 @@ def test_classify_worker_health_usage_below_budgets(tmp_path: Path) -> None:
         reclaimed=None,
     )
 
-    with patch("charlie_work.worker.is_worker_alive", return_value=True):
+    with patch("charlie_work.worker_fate.is_alive", return_value=True):
         config = OrchestratorConfig(
             watchdog=WatchdogConfig(cost_budget_usd=100.0, token_budget=1000000)
         )
@@ -241,7 +241,7 @@ def test_classify_worker_health_no_events_file_devin(tmp_path: Path) -> None:
         reclaimed=None,
     )
 
-    with patch("charlie_work.worker.is_session_alive", return_value=True):
+    with patch("charlie_work.worker_fate.is_alive", return_value=True):
         config = OrchestratorConfig(watchdog=WatchdogConfig(cost_budget_usd=0.01, token_budget=10))
         now = datetime.now(UTC)
         health = classify_worker_health(view, config, now)
@@ -274,7 +274,7 @@ def test_classify_worker_health_no_events_file_claude(tmp_path: Path) -> None:
         reclaimed=None,
     )
 
-    with patch("charlie_work.worker.is_worker_alive", return_value=True):
+    with patch("charlie_work.worker_fate.is_alive", return_value=True):
         config = OrchestratorConfig(watchdog=WatchdogConfig(cost_budget_usd=0.01, token_budget=10))
         now = datetime.now(UTC)
         health = classify_worker_health(view, config, now)
@@ -311,7 +311,7 @@ def test_classify_worker_health_budgets_disabled_by_default(tmp_path: Path) -> N
         reclaimed=None,
     )
 
-    with patch("charlie_work.worker.is_worker_alive", return_value=True):
+    with patch("charlie_work.worker_fate.is_alive", return_value=True):
         config = OrchestratorConfig()  # Default config has None budgets
         now = datetime.now(UTC)
         health = classify_worker_health(view, config, now)
@@ -371,7 +371,7 @@ def test_classify_worker_health_budget_tripwire_rework_layout(tmp_path: Path) ->
         reclaimed=None,
     )
 
-    with patch("charlie_work.worker.is_worker_alive", return_value=True):
+    with patch("charlie_work.worker_fate.is_alive", return_value=True):
         config = OrchestratorConfig(
             watchdog=WatchdogConfig(cost_budget_usd=5.0, cost_budget_action="kill")
         )
