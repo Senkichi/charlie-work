@@ -33,6 +33,7 @@ from charlie_work.dead_worker_classification import (
     classify_and_credit_dead_worker,
     resolve_dead_worker_failure_kind,
 )
+from charlie_work.instrumentation import close_db
 from charlie_work.state import PASSIVE_OPEN_STATUS, load_state, save_state
 from charlie_work.workflow import OrchestratorApp
 
@@ -142,6 +143,7 @@ def test_resolve_persists_via_primitive_and_keeps_the_locked_entry_live(tmp_path
         207,
         state,
         OrchestratorConfig(devin=DevinConfig(), worker=WorkerRoleConfig(harness="devin-shell")),
+        write_gate=_wg(tmp_path / "state.json"),
     )
 
     assert kind == "rate_limited"
@@ -153,6 +155,7 @@ def test_resolve_persists_via_primitive_and_keeps_the_locked_entry_live(tmp_path
     assert state["throttle_adapter_kind"] == "devin"
     entry["later_mutation"] = True  # would be lost if the stored entry were a copy
     assert state["issues"]["207"]["later_mutation"] is True
+    close_db(tmp_path / "state.json")
 
 
 def test_unclassified_death_credited_and_records_null_kind(tmp_path: Path) -> None:
@@ -508,6 +511,7 @@ def test_classify_log_false_never_reads_sidecar(tmp_path: Path) -> None:
         207,
         state,
         OrchestratorConfig(devin=DevinConfig(), worker=WorkerRoleConfig(harness="devin-shell")),
+        write_gate=_wg(tmp_path / "state.json"),
         at="2026-01-01T00:00:00Z",
         classify_log=False,
     )

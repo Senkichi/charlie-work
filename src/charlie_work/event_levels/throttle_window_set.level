@@ -1,0 +1,5 @@
+info
+# Issue #2006: uniform audit record appended by state.set_throttled_until on
+# every throttle-window change (extended or shortened). Routine bookkeeping --
+# it exists so a moved window is never invisible to the audit trail, not to
+# signal a condition an operator must act on.
