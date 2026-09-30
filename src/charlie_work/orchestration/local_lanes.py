@@ -42,6 +42,7 @@ import charlie_work.workflow as _wf
 from charlie_work.worker_pid_stamp import stamp_worker_process
 from charlie_work.adapters import SessionRequest
 from charlie_work.claude_code import resolve_review_effort
+from charlie_work.fleet_registry import try_acquire_fleet_lock
 from charlie_work.github import GitHubError
 from charlie_work.janitor import check_operator_containment, check_test_adequacy
 from charlie_work.labels import TransitionOutcome
@@ -1493,6 +1494,70 @@ def _local_dispatch_rework(self) -> dict[str, Any]:
     if not candidates:
         return result
 
+    # Issue #2039: the three launch gates the remote rework lane applies
+    # (misc_worker_dispatch.dispatch_rework -> _dispatch_rework_impl), in the
+    # same order. Without them a no-remote repo's rework launched through a
+    # provider-throttle / operator-hold cooldown and uncounted against the
+    # fleet-wide Devin cap. A deferred candidate stays ``rework_requested``.
+    if _wf.is_throttled(state):
+        return _defer_local_rework(
+            self,
+            result,
+            candidates,
+            "provider_throttled",
+            throttled_until=state.get("throttled_until"),
+        )
+    fleet_lock = None
+    if self.config.fleet.global_max_concurrent_sessions > 0:
+        fleet_lock = try_acquire_fleet_lock(self.fleet_dir_override)
+        if fleet_lock is None:
+            return _defer_local_rework(self, result, candidates, "fleet_lock_held")
+    try:
+        gov = self._apply_concurrency_governor(len(candidates))
+        if gov.dispatch_limit < len(candidates):
+            _defer_local_rework(
+                self,
+                result,
+                candidates[max(0, gov.dispatch_limit) :],
+                "concurrency_cap",
+                **gov.report_fields(),
+            )
+            candidates = candidates[: max(0, gov.dispatch_limit)]
+        if not candidates:
+            return result
+        return _launch_local_rework(self, state, candidates, result)
+    finally:
+        if fleet_lock is not None:
+            fleet_lock.release()
+
+
+def _defer_local_rework(
+    self, result: dict[str, Any], candidates: list[int], reason: str, **fields: Any
+) -> dict[str, Any]:
+    """Record a gated local rework deferral (issue #2039) -- never silent (#2016)."""
+    for pr_number in candidates:
+        result["skipped"].append({"issue": pr_number, "reason": reason})
+    with _wf.state_lock(self.paths.state_file):
+        state = _wf.load_state(self.paths.state_file)
+        state = self._record_event(
+            state,
+            "dispatch_deferred",
+            {
+                "lane": "local_dispatch_rework",
+                "deferred_reason": reason,
+                "pr_numbers": list(candidates),
+                "local": True,
+                **fields,
+            },
+        )
+        self.write_gate.save_state(state)
+    return result
+
+
+def _launch_local_rework(
+    self, state: dict[str, Any], candidates: list[int], result: dict[str, Any]
+) -> dict[str, Any]:
+    """Claim and launch the gated local rework candidates."""
     requests: list[SessionRequest] = []
     request_issues: dict[int, int] = {}
     for pr_number in candidates:
