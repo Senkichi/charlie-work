@@ -27,6 +27,12 @@ is neither ``failed`` nor ``ready`` -- a required check still ``pending``,
 ``missing``, ``infra_failed``, ``infra_blocked``, or ``unavailable``. Both defer to
 the next pass, stamp ``no_op_deferred_head`` once per head for the audit trail, and
 are bounded by the #654 ``dead_dispatched_reap_minutes`` backstop the sweep arms.
+
+The retry half of that contract lives in the sweep, not here: the clean-exit branch
+re-collects its route unconditionally each pass, but the head-change branch
+short-circuits on the drift fingerprint the review drain stamped -- so it re-collects
+a ``NoOpReworkRoute`` whenever ``entry["no_op_deferred_head"]`` still equals the live
+head, without re-running ``review()``.
 """
 
 from __future__ import annotations

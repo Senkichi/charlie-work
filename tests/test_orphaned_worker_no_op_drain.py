@@ -13,7 +13,10 @@ disposition; these tests drive the real sweep with the real
 - CI not settled -> deliberate deferral (retry, #654-bounded): the checks fetch
   returning ``None``, or a required check still pending, missing, infra-failed,
   or infra-blocked -- on both the clean-exit route and the head-change route
-  (the janitor-flagged ``is_no_op_rework`` refusal).
+  (the janitor-flagged ``is_no_op_rework`` refusal), including the head-change
+  retry itself: a deferred route must be re-collected on later passes (the
+  review drain's fingerprint stamp would otherwise wedge it), and the retried
+  pass disposes once CI settles red or green.
 """
 
 from __future__ import annotations
@@ -412,6 +415,101 @@ def test_head_change_unsettled_ci_defers_instead_of_escalating(
     assert entry["orphan_drift_fingerprint"]  # the head-change drift fingerprint armed it
     assert "rework_no_op_escalated" not in [e["kind"] for e in state["events"]]
     assert (207, config.labels.human_needed) not in gh.labels_added
+
+
+def test_head_change_deferred_no_op_retries_to_ci_rework_when_ci_settles_red(
+    tmp_path: Path,
+) -> None:
+    """A deferred head-change no-op must be retried, not fingerprint-wedged.
+
+    The review drain stamps ``orphan_drift_fingerprint`` when it hands the
+    janitor-refused head change to the no-op drain, so without the sweep's
+    ``no_op_deferred_head`` re-collection the next pass short-circuits on the
+    fingerprint and the deferral is never retried -- a merge-only push
+    detected while CI is still pending (the #2005 shape) falls to the
+    generic #654 reap instead of the CI-rework lane. The flag is stubbed
+    (real ``review()`` propagation is pinned by the #2005-shape test); the
+    call count pins that review() is not re-run while the deferral stands.
+    """
+    config, paths, gh = _bed(
+        tmp_path,
+        checks=[{"name": _LINT, "state": "PENDING", "link": _LINT_LINK}],
+        live_head="def456",
+    )
+    app = OrchestratorApp(tmp_path, paths, config, gh)
+    review_calls: list[int] = []
+
+    def counted_review(pr_number: int) -> CommandResult:
+        review_calls.append(pr_number)
+        return CommandResult(False, "janitor gate blocked PR #100", {"is_no_op_rework": True})
+
+    _sweep(tmp_path, paths, config, gh, app, review=counted_review)
+    state = load_state(paths.state_file)
+    _assert_deferred(state["issues"]["207"], head="def456")
+    assert review_calls == [100]
+
+    # Still pending: the route is re-collected and re-deferred, review() is
+    # not re-run, and the deferred event stays once-per-head.
+    _sweep(tmp_path, paths, config, gh, app, review=counted_review)
+    state = load_state(paths.state_file)
+    _assert_deferred(state["issues"]["207"], head="def456")
+    assert review_calls == [100]
+    assert len([e for e in state["events"] if e["kind"] == "rework_no_op_deferred"]) == 1
+
+    # CI settles red: the re-collected route reaches the CI-rework lane.
+    gh.checks = [{"name": _LINT, "state": "FAILURE", "link": _LINT_LINK}]
+    _sweep(tmp_path, paths, config, gh, app, review=counted_review)
+    state = load_state(paths.state_file)
+    entry = state["issues"]["207"]
+    assert entry["status"] == "rework_requested"
+    assert entry["no_op_handled_head"] == "def456"
+    assert entry["no_op_deferred_head"] is None
+    assert review_calls == [100]
+    _assert_ci_rework_brief(paths, tmp_path, app, gh)
+    assert "rework_no_op_ci_rework_requested" in [e["kind"] for e in state["events"]]
+
+
+def test_head_change_deferred_no_op_retries_to_escalation_when_ci_settles_green(
+    tmp_path: Path,
+) -> None:
+    """Green variant: the retried head-change deferral escalates rework_no_op.
+
+    Same deferral as the red variant, but CI settles green and the worker
+    left no rebuttal -- the re-collected route must reach the ordinary
+    ``rework_no_op`` escalation rather than resting dispatched.
+    """
+    config, paths, gh = _bed(
+        tmp_path,
+        checks=[{"name": _LINT, "state": "PENDING", "link": _LINT_LINK}],
+        live_head="def456",
+    )
+    app = OrchestratorApp(tmp_path, paths, config, gh)
+    review_calls: list[int] = []
+
+    def counted_review(pr_number: int) -> CommandResult:
+        review_calls.append(pr_number)
+        return CommandResult(False, "janitor gate blocked PR #100", {"is_no_op_rework": True})
+
+    _sweep(tmp_path, paths, config, gh, app, review=counted_review)
+    _assert_deferred(load_state(paths.state_file)["issues"]["207"], head="def456")
+
+    # Still pending: re-collected and re-deferred without a second review().
+    _sweep(tmp_path, paths, config, gh, app, review=counted_review)
+    state = load_state(paths.state_file)
+    _assert_deferred(state["issues"]["207"], head="def456")
+    assert review_calls == [100]
+    assert len([e for e in state["events"] if e["kind"] == "rework_no_op_deferred"]) == 1
+
+    # CI settles green with no rebuttal: the deferred finding escalates.
+    gh.checks = [{"name": _LINT, "state": "SUCCESS", "link": _LINT_LINK}]
+    _sweep(tmp_path, paths, config, gh, app, review=counted_review)
+    state = load_state(paths.state_file)
+    entry = state["issues"]["207"]
+    assert entry["status"] == "escalated"
+    assert entry["escalation_reason"] == "rework_no_op"
+    assert (207, config.labels.human_needed) in gh.labels_added
+    assert review_calls == [100]
+    assert len([e for e in state["events"] if e["kind"] == "rework_no_op_deferred"]) == 1
 
 
 def test_clean_exit_ci_red_record_review_failure_escalates(tmp_path: Path) -> None:

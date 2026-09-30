@@ -39,7 +39,7 @@ from typing import TYPE_CHECKING, Any
 from . import worker_fate
 from .blocked_worker_escalation import dead_worker_blocked_outcome, escalate_declared_blocked
 from .dead_worker_classification import classify_and_credit_dead_worker
-from .orphaned_worker_no_op_drain import NoOpReworkRoute
+from .orphaned_worker_no_op_drain import NO_OP_DEFERRED_HEAD_KEY, NoOpReworkRoute
 from .orphaned_worker_review_drain import OrphanedWorkerReviewRoute
 from .process_utils import find_worker_terminal_status
 from .review_decision import review_decision
@@ -644,6 +644,25 @@ def handle_dead_worker_with_pr(
                 reviewed_head_sha=reviewed_head_sha,
                 live_head_sha=live_head_sha,
             )
+            if entry.get(NO_OP_DEFERRED_HEAD_KEY) == live_head_sha:
+                # Issue #2034: a prior pass routed this exact head through
+                # the review drain, which classified the refusal as the
+                # janitor's no-op gate (``is_no_op_rework``), stamped this
+                # finding's drift fingerprint, and handed the route to the
+                # no-op drain -- which then deferred on unsettled CI. The
+                # fingerprint stamp means the short-circuit below would
+                # never re-collect the route, so the deferral would never
+                # be retried: a merge-only push detected while CI was still
+                # pending (the #2005 shape) would fall to the generic #654
+                # reap instead of the CI-rework lane. Re-collect the route
+                # every pass while the deferral stands -- the no-op drain
+                # re-checks CI and disposes or re-defers (the deferred
+                # event dedupes on the same marker) -- without re-running
+                # review(), whose unchanged-diff verdict is deterministic
+                # for this head.
+                no_op_routes.append(_no_op_route(pr_data, entry, issue_number, live_head_sha))
+                state["issues"][str(issue_number)] = entry
+                return
             if entry.get("orphan_drift_fingerprint") == fingerprint:
                 # Already handled/failed for this exact head advance;
                 # don't re-emit or retry.
