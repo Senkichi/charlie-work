@@ -120,7 +120,7 @@ from .github import (
 from .issue_linking import linked_issue_number
 from .instrumentation import log_event
 from .labels import TransitionOutcome
-from .local_work_park import park_unpublishable_work
+from .local_work_park import park_labelless_dead_local_session, park_unpublishable_work
 from .no_op_checkpoint import _paired_death_count
 from .orphan_sweep import sweep_orphan_processes
 from .paths import resolved_layout
@@ -2210,6 +2210,17 @@ def _classify_dead_sessions_and_update_throttle_state(
                 # active label IS present, so the common
                 # remove-and-add-together case is unaffected.)
                 if not active_labels:
+                    # Issue #1971: a ``dispatched`` entry on a no-PR backend
+                    # with commits is finished work -- park, don't leave for
+                    # the timed backstop reap.
+                    park_labelless_dead_local_session(
+                        gh=gh,
+                        config=config,
+                        repo_root=repo_root,
+                        issue_labels=issue_labels,
+                        worker=w,
+                        write_gate=write_gate,
+                    )
                     continue
                 needs_ready = config.labels.ready not in issue_labels
 
