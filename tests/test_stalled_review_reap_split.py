@@ -128,8 +128,10 @@ _MOVED_NAMES = (
 # consults ``match_quota_tail`` (+3 lines over the W6 PR2 total, measured
 # 1394), so _CAP_BAND_MAX is re-set to the new measured total plus the same
 # 30-line headroom margin.
+# Re-derived under issue #1808: the PROVIDER_API_ERROR classification and its
+# delegating branch (measured total 1453) plus the same 30-line headroom.
 _CAP_BAND_MIN = 1308
-_CAP_BAND_MAX = 1424
+_CAP_BAND_MAX = 1483
 
 
 # ---------------------------------------------------------------------------
@@ -475,7 +477,7 @@ def test_member_content_defines_exactly_the_ten_moved_symbols() -> None:
 
 def test_module_total_line_count_is_within_the_recorded_cap_band() -> None:
     """BAND gate: the new module's total (docstring + imports + body) must
-    fall within [1308, 1424]. A6's Preflight step originally derived
+    fall within [1308, 1483]. A6's Preflight step originally derived
     [1308, 1338] live from ci_findings.py's own header/import-surface ratio
     (recorded in wf-a6-notes.md Step 10). W6 PR2 (issue #1264) widened the
     upper bound to 1391 -- the real post-conversion total this PR measured
@@ -483,7 +485,8 @@ def test_module_total_line_count_is_within_the_recorded_cap_band() -> None:
     write_gate: WriteGate signature additions + require_write_gate calls
     the conversion adds. Issue #1684 re-derived the upper bound to 1424 --
     the dead-reviewer log-tail check now consults ``match_quota_tail``
-    (measured total 1394) plus the same 30-line headroom margin. This is
+    (measured total 1394) plus the same 30-line headroom margin. Issue #1808
+    re-derived it to 1483 (measured 1453 + the same margin). This is
     NOT the repo's normal 800-line cap (explicitly waived for this
     extraction by operator decision).
     """

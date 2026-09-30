@@ -663,6 +663,7 @@ def record_review(
             # reviewer pipeline is healthy, so any prior
             # persistent-unreadable condition is resolved (issue #1069).
             "review_log_unreadable_streak": 0,
+            "review_api_error_streak": 0,  # issue #1808
             # Issue #1439: a recorded verdict ends the turn-limit miss
             # streak -- the reviewer reached a conclusion, so any prior
             # turn-limit deaths no longer count toward the cap-aware

@@ -1,0 +1,168 @@
+"""Regression tests for issue #1808: a dead reviewer whose terminal result
+event is a provider-side ``api_error`` (429/500/502/503/529) must not consume
+the per-PR dispatch attempt budget -- a provider outage otherwise walks every
+in-flight PR to ``max_review_dispatch_attempts_exceeded`` in parallel.
+"""
+
+from __future__ import annotations
+
+import json
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
+import pytest
+
+from charlie_work.config import OrchestratorConfig, ReviewDispatchConfig
+from charlie_work.state import load_state, save_state, state_lock
+from charlie_work.unescalate_reset_fields import UNESCALATE_PR_RESET_FIELDS
+from charlie_work.workflow import _detect_and_handle_stalled_reviews
+from charlie_work.write_gate import WriteGate
+
+from _helpers import _init_git_repo
+
+PR = 100
+
+
+def _wg(state_file: Path) -> WriteGate:
+    return WriteGate(dry_run=False, state_path=state_file, repo="charlie-work")
+
+
+def _result_event(status: int | None, terminal_reason: str = "api_error") -> str:
+    return json.dumps(
+        {
+            "type": "result",
+            "subtype": "error_during_execution",
+            "is_error": True,
+            "api_error_status": status,
+            "terminal_reason": terminal_reason,
+            "stop_reason": "stop_sequence",
+        }
+    )
+
+
+class _Env:
+    def __init__(self, tmp_path: Path, max_api_errors: int = 3) -> None:
+        self.tmp_path = tmp_path
+        self.repo_root = tmp_path / "repo"
+        _init_git_repo(self.repo_root)
+        self.reviews_dir = tmp_path / "reviews"
+        self.reviews_dir.mkdir()
+        self.config = OrchestratorConfig(
+            review_dispatch=ReviewDispatchConfig(
+                enabled=True, max_consecutive_review_api_errors=max_api_errors
+            )
+        )
+        self.state_file = tmp_path / "state.json"
+        self.state_file.write_text(
+            json.dumps({"version": 1, "issues": {}, "prs": {}, "events": []}), encoding="utf-8"
+        )
+        self.started = (datetime.now(UTC) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+
+    def dispatch_and_die(self, log_text: str) -> dict:
+        """Simulate one claim (attempt +1), a dead reviewer with ``log_text``,
+        then the stalled sweep; return the PR's state."""
+        with state_lock(self.state_file):
+            st = load_state(self.state_file)
+            prior = st["prs"].get(str(PR), {})
+            st["prs"][str(PR)] = {
+                **prior,
+                "number": PR,
+                "review_dispatch_status": "review_dispatch_dispatched",
+                "review_dispatched_at": self.started,
+                "reviewer_pid": 999999999,
+                "reviewer_process_start_time": 1.0,
+                "review_dispatch_attempt_count": int(prior.get("review_dispatch_attempt_count", 0))
+                + 1,
+            }
+            save_state(self.state_file, st)
+        log_path = self.reviews_dir / f"issue-{PR}-review.claude.log"
+        log_path.write_text(log_text, encoding="utf-8")
+        sidecar = {
+            "issue_number": PR,
+            "branch": f"agent/issue-{PR}-fix",
+            "worktree_path": str(self.tmp_path / "wt"),
+            "prompt_path": str(self.tmp_path / "prompt.md"),
+            "command": ["claude", "-p"],
+            "pid": 999999999,
+            "started_at": self.started,
+            "log_path": str(log_path),
+            "error": None,
+            "process_start_time": 1.0,
+        }
+        (self.reviews_dir / f"issue-{PR}.claude.json").write_text(
+            json.dumps(sidecar), encoding="utf-8"
+        )
+        _detect_and_handle_stalled_reviews(
+            self.reviews_dir,
+            self.state_file,
+            self.config,
+            self.repo_root,
+            write_gate=_wg(self.state_file),
+        )
+        return load_state(self.state_file)
+
+
+def test_three_consecutive_500s_leave_attempt_count_zero_and_arm_backoff(
+    tmp_path: Path,
+) -> None:
+    env = _Env(tmp_path)
+    for n in range(1, 4):
+        state = env.dispatch_and_die(_result_event(500))
+        pr = state["prs"][str(PR)]
+        assert pr["review_dispatch_attempt_count"] == 0
+        assert pr["review_dispatch_status"] is None  # rolled back, redispatchable
+        assert pr["review_api_error_streak"] == n
+    assert state["reviewer_quota"]["probe_after"]  # fleet-wide backoff armed
+    outage = [e for e in state["events"] if e["kind"] == "review_provider_outage"]
+    assert outage and outage[0]["payload"]["api_error_status"] == 500
+
+
+def test_api_error_beyond_bound_starts_counting(tmp_path: Path) -> None:
+    env = _Env(tmp_path)
+    for _ in range(3):
+        env.dispatch_and_die(_result_event(529))
+    state = env.dispatch_and_die(_result_event(529))  # the (N+1)th
+    pr = state["prs"][str(PR)]
+    assert pr["review_dispatch_attempt_count"] == 1
+    assert pr["review_dispatch_status"] == "review_dispatch_failed"
+    reasons = [
+        e["payload"]["reason"] for e in state["events"] if e["kind"] == "review_dispatch_stalled"
+    ]
+    assert reasons[-1] == "provider_api_error_counted"
+
+
+@pytest.mark.parametrize("status", [400, 401, 404, None])
+def test_non_provider_api_error_is_still_counted(tmp_path: Path, status: int | None) -> None:
+    env = _Env(tmp_path)
+    state = env.dispatch_and_die(_result_event(status))
+    pr = state["prs"][str(PR)]
+    assert pr["review_dispatch_attempt_count"] == 1
+    assert pr["review_dispatch_status"] == "review_dispatch_failed"
+    assert not [e for e in state["events"] if e["kind"] == "review_provider_outage"]
+
+
+@pytest.mark.parametrize("status", [429, 500, 502, 503, 529])
+def test_every_provider_status_rolls_back(tmp_path: Path, status: int) -> None:
+    state = _Env(tmp_path).dispatch_and_die(_result_event(status))
+    assert state["prs"][str(PR)]["review_dispatch_attempt_count"] == 0
+
+
+def test_streak_resets_on_a_definitive_non_api_death(tmp_path: Path) -> None:
+    env = _Env(tmp_path)
+    env.dispatch_and_die(_result_event(500))
+    env.dispatch_and_die(_result_event(500))
+    state = env.dispatch_and_die(_result_event(None, terminal_reason="completed"))
+    assert state["prs"][str(PR)]["review_api_error_streak"] == 0
+
+
+def test_streak_is_cleared_by_unescalate_and_recorded_verdict() -> None:
+    assert "review_api_error_streak" in UNESCALATE_PR_RESET_FIELDS
+    src = (
+        Path(__file__).parents[1] / "src/charlie_work/orchestration/state_record_review.py"
+    ).read_text(encoding="utf-8")
+    assert '"review_api_error_streak": 0' in src
+
+
+def test_zero_disables_rollback(tmp_path: Path) -> None:
+    state = _Env(tmp_path, max_api_errors=0).dispatch_and_die(_result_event(500))
+    assert state["prs"][str(PR)]["review_dispatch_attempt_count"] == 1

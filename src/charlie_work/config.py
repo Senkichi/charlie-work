@@ -956,6 +956,16 @@ class ReviewDispatchConfig:
     # packet, operator unescalate). 0 disables the bound (preserves the
     # pre-fix unbounded rollback — not recommended).
     max_consecutive_review_log_unreadable: int = 3
+    # Issue #1808: a dead reviewer whose terminal result event is an
+    # ``api_error`` with a provider-side status (429/500/502/503/529) is a
+    # provider outage, not a PR defect. The first N consecutive such deaths on
+    # one PR roll back the claim without consuming the dispatch attempt budget
+    # and arm the fleet-wide reviewer backoff; past N they become counted
+    # failures so a persistent per-PR poison still converges on the
+    # ``max_review_dispatch_attempts`` cap. The streak resets on any definitive
+    # outcome (recorded verdict, non-api death, new packet, operator
+    # unescalate). 0 disables the rollback (api errors count as before).
+    max_consecutive_review_api_errors: int = 3
     # Maximum agentic turns for a reviewer session. Caps token spend per
     # review by limiting how many tool-call round-trips the reviewer can make.
     # 0 means unlimited (preserves pre-existing behavior). 40 is generous for
@@ -2906,6 +2916,7 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
         "turn_cap_large_file_multiplier",
         "turn_cap_max_multiplier",
         "max_consecutive_turn_limit_misses",
+        "max_consecutive_review_api_errors",
         "file_size_cap_lines",
         "review_exec_rejection_max_resumes",
     )
