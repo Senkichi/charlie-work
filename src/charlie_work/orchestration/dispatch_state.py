@@ -73,9 +73,9 @@ from charlie_work.cross_repo_gate import (
     cross_repo_gate,
     cross_repo_scope_gate,
 )
-from charlie_work.dead_worker_reap import (
+from charlie_work.dead_worker_sweep.effects_pr import _dispatching_repo_name
+from charlie_work.dead_worker_sweep.effects_sessions import (
     _detect_stalled_sessions,
-    _dispatching_repo_name,
     _issues_with_live_workers,
 )
 from charlie_work.dispatch_selection import (

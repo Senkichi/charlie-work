@@ -358,14 +358,19 @@ def test_dependency_stall_minutes_defaults_and_loads(tmp_path: Path) -> None:
 def test_dependency_stall_minutes_rejects_non_int(tmp_path: Path) -> None:
     config_file = tmp_path / "orchestrator.config.yaml"
     config_file.write_text("dispatch:\n  dependency_stall_minutes: soon\n")
-    with pytest.raises(ConfigError, match="must be an int"):
+    with pytest.raises(
+        ConfigError,
+        match=r"^dispatch\.dependency_stall_minutes: expected int, got 'soon' \(str\)$",
+    ):
         load_config(config_file)
 
 
 def test_dependency_stall_minutes_rejects_negative(tmp_path: Path) -> None:
     config_file = tmp_path / "orchestrator.config.yaml"
     config_file.write_text("dispatch:\n  dependency_stall_minutes: -5\n")
-    with pytest.raises(ConfigError, match="must be >= 0"):
+    with pytest.raises(
+        ConfigError, match=r"^dispatch\.dependency_stall_minutes: expected >= 0, got -5$"
+    ):
         load_config(config_file)
 
 

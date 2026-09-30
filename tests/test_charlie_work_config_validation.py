@@ -75,9 +75,9 @@ def test_config_rejects_invalid_cost_budget_usd_type(tmp_path: Path) -> None:
     else:  # pragma: no cover
         raise AssertionError("expected ConfigError for invalid cost_budget_usd type")
 
-    assert "section 'watchdog'" in message
+    assert message.startswith("watchdog.") or message.startswith("watchdog:")
     assert "cost_budget_usd" in message
-    assert "must be a number" in message
+    assert "expected number" in message
 
 
 def test_config_rejects_invalid_token_budget_type(tmp_path: Path) -> None:
@@ -100,9 +100,9 @@ def test_config_rejects_invalid_token_budget_type(tmp_path: Path) -> None:
     else:  # pragma: no cover
         raise AssertionError("expected ConfigError for invalid token_budget type")
 
-    assert "section 'watchdog'" in message
+    assert message.startswith("watchdog.") or message.startswith("watchdog:")
     assert "token_budget" in message
-    assert "must be an int" in message
+    assert "expected int" in message
 
 
 def test_config_rejects_invalid_cost_budget_action_type(tmp_path: Path) -> None:
@@ -125,9 +125,9 @@ def test_config_rejects_invalid_cost_budget_action_type(tmp_path: Path) -> None:
     else:  # pragma: no cover
         raise AssertionError("expected ConfigError for invalid cost_budget_action type")
 
-    assert "section 'watchdog'" in message
+    assert message.startswith("watchdog.") or message.startswith("watchdog:")
     assert "cost_budget_action" in message
-    assert "must be a string" in message
+    assert "expected string" in message
 
 
 def test_config_rejects_invalid_cost_budget_action_value(tmp_path: Path) -> None:
@@ -150,9 +150,9 @@ def test_config_rejects_invalid_cost_budget_action_value(tmp_path: Path) -> None
     else:  # pragma: no cover
         raise AssertionError("expected ConfigError for invalid cost_budget_action value")
 
-    assert "section 'watchdog'" in message
+    assert message.startswith("watchdog.") or message.startswith("watchdog:")
     assert "cost_budget_action" in message
-    assert "must be 'warn' or 'kill'" in message
+    assert "expected one of 'warn', 'kill'" in message
 
 
 def test_config_worker_env_coerces_values_to_str(tmp_path: Path) -> None:
@@ -241,7 +241,7 @@ def test_config_rejects_merge_flags_not_starting_with_double_dash(tmp_path: Path
 
     assert "merge_flags" in message
     assert "auto_merge" in message
-    assert "must start with '--'" in message
+    assert "expected flag starting with '--'" in message
 
 
 def test_config_accepts_valid_merge_flags(tmp_path: Path) -> None:
@@ -309,7 +309,7 @@ def test_config_rejects_merge_flags_scalar(tmp_path: Path) -> None:
 
     assert "merge_flags" in message
     assert "auto_merge" in message
-    assert "must be a list" in message
+    assert "expected list" in message
 
 
 def test_config_rejects_non_string_review_effort(tmp_path: Path) -> None:
@@ -326,7 +326,7 @@ def test_config_rejects_non_string_review_effort(tmp_path: Path) -> None:
 
     assert "effort" in message
     assert "reviewer" in message
-    assert "must be a string" in message
+    assert "expected string" in message
 
 
 def test_config_accepts_string_review_effort(tmp_path: Path) -> None:

@@ -250,10 +250,10 @@ def _run_dead_lane(
     fake_gh: _FakeGitHub,
     monkeypatch: pytest.MonkeyPatch,
 ) -> dict:
-    from charlie_work import dead_worker_reap
+    from charlie_work.dead_worker_sweep import effects_sessions
     from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
 
-    monkeypatch.setattr(dead_worker_reap, "sweep_orphan_processes", lambda worktree_path: [])
+    monkeypatch.setattr(effects_sessions, "sweep_orphan_processes", lambda worktree_path: [])
     monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: False)
     monkeypatch.setattr("charlie_work.worker.real_activity_probe_for", lambda *args: None)
 

@@ -29,6 +29,21 @@ collaborator classes, because a new collaborator class is itself a new `class`
 attachment point that the saturation gate hard-blocks, while a free-function
 module is not an attachment point at all (Section 2.4, 2.5, verified 8.4).
 
+> **Superseded for deepened areas (2026-09-30, architecture-deepening program wave B).**
+> The verbatim-move rule of Section 3.1 (byte-identical body moves, one batch per
+> move-PR, enforced by the AST verbatim-move gate of Section 9) no longer governs the
+> areas the architecture-deepening program rewrites: Worker fate (wave A, #2049), the
+> dead-worker sweep (`_detect_and_handle_orphaned_workers`, `dead_worker_reap.py`,
+> `orphaned_worker_sweep.py`, `orphaned_worker_review_drain.py`,
+> `live_handoff_finalize.py`), config-section validation (ADR-0007), and the later
+> merge-path, GitHub-transport and injected-adapter candidates. PRs in those areas
+> declare themselves rewrites, not moves: they replace bodies with a deep module behind
+> a small interface, pin current behaviour with characterization tests first, and put
+> each intended behaviour change in its own named commit. For them the AST-equivalence
+> gate is advisory only. The file-size ratchet, the write-gate ratchet and the
+> collect-only gate still apply unchanged, and `workflow.py` must only shrink. Every
+> other area of this plan keeps the verbatim-move rule.
+
 
 ## 1. Summary
 

@@ -341,7 +341,9 @@ def test_dispatch_config_max_open_agent_prs_validation_int(tmp_path: Path) -> No
 
     config_file = tmp_path / "orchestrator.config.yaml"
     config_file.write_text("dispatch:\n  max_open_agent_prs: true\n")
-    with pytest.raises(ConfigError, match="must be an int"):
+    with pytest.raises(
+        ConfigError, match=r"^dispatch\.max_open_agent_prs: expected int, got True \(bool\)$"
+    ):
         load_config(config_file)
 
 
@@ -350,7 +352,9 @@ def test_dispatch_config_max_open_agent_prs_validation_negative(tmp_path: Path) 
 
     config_file = tmp_path / "orchestrator.config.yaml"
     config_file.write_text("dispatch:\n  max_open_agent_prs: -1\n")
-    with pytest.raises(ConfigError, match="must be >= 0"):
+    with pytest.raises(
+        ConfigError, match=r"^dispatch\.max_open_agent_prs: expected >= 0, got -1$"
+    ):
         load_config(config_file)
 
 
