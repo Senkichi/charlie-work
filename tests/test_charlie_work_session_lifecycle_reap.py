@@ -540,7 +540,7 @@ def test_dead_dispatched_worker_provider_throttled_reclaimed_and_retried(
         lambda pid, start_time=None: killed.append(pid) or [pid],
     )
     monkeypatch.setattr(dead_worker_reap, "sweep_orphan_processes", lambda worktree_path: [])
-    monkeypatch.setattr("charlie_work.worker.is_session_alive", lambda record: True)
+    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: True)
     monkeypatch.setattr("charlie_work.worker.real_activity_probe_for", _stale_devin_probe)
 
     from charlie_work import workflow
@@ -668,7 +668,7 @@ def test_dead_dispatched_worker_expired_throttle_window_still_reclaimed(
         lambda pid, start_time=None: killed.append(pid) or [pid],
     )
     monkeypatch.setattr(dead_worker_reap, "sweep_orphan_processes", lambda worktree_path: [])
-    monkeypatch.setattr("charlie_work.worker.is_session_alive", lambda record: True)
+    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: True)
     monkeypatch.setattr("charlie_work.worker.real_activity_probe_for", _stale_devin_probe)
 
     from charlie_work import workflow

@@ -991,8 +991,9 @@ def _sweep_orphan_processes_for_dead_sessions(
     ``process_utils.kill_orphan_pid``).
     """
     write_gate = require_write_gate(write_gate)
-    from .devin_shell import is_session_alive, read_session_records
-    from .claude_code import is_worker_alive, read_worker_records
+    from . import worker_fate
+    from .devin_shell import read_session_records
+    from .claude_code import read_worker_records
 
     # Only run on Windows where the issue occurs
     if os.name != "nt":
@@ -1005,14 +1006,14 @@ def _sweep_orphan_processes_for_dead_sessions(
     for record in read_session_records(sessions_dir):
         if record.pid is None or record.error is not None:
             continue
-        if not is_session_alive(record):
+        if not worker_fate.is_alive(record.pid, record.process_start_time):
             dead_worktree_paths.add(record.worktree_path)
 
     # Check claude-code sessions
     for record in read_worker_records(sessions_dir):
         if record.pid is None or record.error is not None:
             continue
-        if not is_worker_alive(record):
+        if not worker_fate.is_alive(record.pid, record.process_start_time):
             dead_worktree_paths.add(record.worktree_path)
 
     # Sweep for orphans in each dead worktree
@@ -1080,8 +1081,9 @@ def _log_worker_census(sessions_dir: Path) -> None:
 
     logger = logging.getLogger(__name__)
 
-    from .claude_code import is_worker_alive, read_worker_records
-    from .devin_shell import is_session_alive, read_session_records
+    from . import worker_fate
+    from .claude_code import read_worker_records
+    from .devin_shell import read_session_records
 
     now = datetime.now(UTC)
 
@@ -1095,9 +1097,13 @@ def _log_worker_census(sessions_dir: Path) -> None:
     entries: list[str] = []
     # adapter_kind=None also covers the "api" adapter, which delegates to
     # claude_code.launch_claude_worker under the hood and shares its sidecar
-    # schema (and therefore xdist_cap/is_worker_alive) unchanged.
+    # schema (and therefore xdist_cap/liveness) unchanged.
     for record in read_worker_records(sessions_dir, adapter_kind=None):
-        if record.pid is None or record.error is not None or not is_worker_alive(record):
+        if (
+            record.pid is None
+            or record.error is not None
+            or not worker_fate.is_alive(record.pid, record.process_start_time)
+        ):
             continue
         entries.append(
             f"(adapter={record.adapter_kind} issue={record.issue_number} "
@@ -1105,7 +1111,11 @@ def _log_worker_census(sessions_dir: Path) -> None:
             f"cap={record.xdist_cap} age_s={_age_seconds(record.started_at)})"
         )
     for record in read_session_records(sessions_dir):
-        if record.pid is None or record.error is not None or not is_session_alive(record):
+        if (
+            record.pid is None
+            or record.error is not None
+            or not worker_fate.is_alive(record.pid, record.process_start_time)
+        ):
             continue
         entries.append(
             f"(adapter=devin-shell issue={record.issue_number} "

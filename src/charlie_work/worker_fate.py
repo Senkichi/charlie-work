@@ -41,20 +41,11 @@ rule 1's ignored evidence; the ``record_dead_worker_failure_kind`` writes in
 ``dead_worker_reap.py`` are still direct (a later step of the round-2 plan
 moves them behind one persist primitive).
 
-``is_worker_alive`` (claude_code.py) / ``is_session_alive`` (devin_shell.py)
-are deliberately NOT touched by this commit either, despite being the
-other half of design doc §7's "what it deletes" list (A2, not A3/A4).
-``tests/test_charlie_work_dispatch_phantom.py`` monkeypatches
-``charlie_work.claude_code.is_pid_alive`` directly (with an explicit
-comment explaining why: it is the only way to pin PID 4242's liveness
-without depending on host process-table state) — a patch that only stays
-effective while ``is_worker_alive``'s body keeps calling its own module's
-``is_pid_alive`` name literally. Redirecting the body to
-``worker_fate.is_alive`` would silently make that patch inert. A2's
-26-call-site rewiring (including ``WorkerView.is_alive`` in ``worker.py``,
-outside this commit's file list) is left for its own step, where the
-monkeypatch can be updated deliberately alongside the body change instead
-of as a side effect of this one.
+``is_alive`` is the single liveness seam (design doc A2): the per-adapter
+``claude_code.is_worker_alive`` / ``devin_shell.is_session_alive`` wrappers
+were deleted, and ``WorkerView.is_alive``, ``dead_worker_reap`` and
+``doctor`` all call ``worker_fate.is_alive`` through the module attribute,
+so tests patch ``charlie_work.worker_fate.is_alive`` and nothing else.
 """
 
 from __future__ import annotations
@@ -278,10 +269,15 @@ def is_alive(pid: int | None, process_start_time: float | None) -> bool:
 
     Delegates to ``process_utils.is_pid_alive`` (the unchanged primitive,
     including its asymmetric fail-open/fail-closed behaviour) for every
-    real PID. The only addition is ``pid is None``, which is always dead —
-    e.g. a manual-adapter subject that never had a process to begin with.
+    real PID. The only additions are ``pid is None`` and ``pid <= 0``, which
+    are always dead -- e.g. a manual-adapter subject that never had a process
+    to begin with, or a sentinel pid.
+
+    This is the single liveness seam: the per-adapter ``is_worker_alive`` /
+    ``is_session_alive`` wrappers were deleted (wf-r2-s2), so tests patch
+    ``charlie_work.worker_fate.is_alive`` and nothing else.
     """
-    if pid is None:
+    if pid is None or pid <= 0:
         return False
     return _process_is_pid_alive(pid, process_start_time)
 
@@ -850,7 +846,6 @@ def _build_profiles() -> dict[str, AdapterFateProfile]:
     from .claude_code import update_worker_record_with_failure_classification
     from .devin_shell import update_session_record_with_failure_classification
     from .harnesses import WORKER_HARNESSES
-    from .worker import _api_session_over_budget
 
     by_harness = {
         "devin-shell": AdapterFateProfile(
@@ -876,7 +871,7 @@ def _build_profiles() -> dict[str, AdapterFateProfile]:
             record_failure=partial(
                 update_worker_record_with_failure_classification, adapter_kind="api"
             ),
-            over_budget=_api_session_over_budget,
+            over_budget=_api_over_budget,
         ),
         # "command" and "manual" have no failure-classification or budget
         # consumer today: dead_worker_reap.py's 14 sites never branch on
@@ -915,6 +910,19 @@ def _build_profiles() -> dict[str, AdapterFateProfile]:
             "(adapters.py #1513 completeness-assert pattern)"
         )
     return by_harness
+
+
+def _api_over_budget(view: WorkerView, config: OrchestratorConfig) -> bool:
+    """Resolve ``worker._api_session_over_budget`` at call time.
+
+    The profile registry is built once per process, so binding the function
+    object at build time would freeze whichever implementation happened to be
+    live at the first ``profile_for`` call -- making a later patch of
+    ``charlie_work.worker._api_session_over_budget`` depend on test order.
+    """
+    from . import worker
+
+    return worker._api_session_over_budget(view, config)
 
 
 def profile_for(adapter_kind: str) -> AdapterFateProfile | None:

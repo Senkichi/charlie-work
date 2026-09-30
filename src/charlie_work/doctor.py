@@ -361,7 +361,8 @@ def _surface_sessions(add: Any, repo_root: Path, config: OrchestratorConfig) -> 
     """Flag launched sessions that failed or whose process died without the
     orchestrator recording an outcome (orphans reconcile cannot see)."""
     from .claude_code import read_worker_records
-    from .devin_shell import is_session_alive, read_session_records
+    from . import worker_fate
+    from .devin_shell import read_session_records
 
     sessions_dir = resolved_layout(config, repo_root).sessions_dir
     if not sessions_dir.is_dir():
@@ -369,9 +370,11 @@ def _surface_sessions(add: Any, repo_root: Path, config: OrchestratorConfig) -> 
         return
     records = [*read_session_records(sessions_dir), *read_worker_records(sessions_dir)]
     failed = [record for record in records if record.error is not None]
-    # is_session_alive only reads .pid, so both record kinds duck-type through.
+    # worker_fate.is_alive takes (pid, process_start_time), so both record kinds fit.
     exited = [
-        record for record in records if record.error is None and not is_session_alive(record)
+        record
+        for record in records
+        if record.error is None and not worker_fate.is_alive(record.pid, record.process_start_time)
     ]
     detail = f"{len(records)} sidecar record(s): {len(failed)} failed, {len(exited)} exited"
     if failed or exited:

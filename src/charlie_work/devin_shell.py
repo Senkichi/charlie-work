@@ -31,7 +31,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from charlie_work.process_utils import is_pid_alive, parse_proc_stat_starttime, popen_worker
+from charlie_work.process_utils import parse_proc_stat_starttime, popen_worker
 from .claude_code import _events_path, _rotate_old_log
 from .config import OrchestratorConfig
 from .devin_failure_classification import (  # noqa: F401 (deliberate re-export; #1442 extraction keeps devin_shell under its mark)
@@ -849,27 +849,6 @@ def _get_process_start_time(pid: int) -> float | None:
             return None
 
 
-def is_session_alive(record: SessionRecord) -> bool:
-    """Check whether the process behind ``record`` is still running.
-
-    Delegates to ``charlie_work.process_utils.is_pid_alive`` so liveness
-    semantics are enforced in a single place.  This avoids a hard `psutil`
-    dependency and the slow `tasklist` subprocess round trip.
-
-    Process identity is verified by checking that the current process start time
-    matches the recorded start time (captured at spawn).  A start-time probe
-    that returns ``None`` is treated as indeterminate and returns ``True`` rather
-    than reaping a potentially-live worker on a transient probe failure
-    (issue #360 criterion #1 / issue #343).
-
-    Legacy records without ``process_start_time`` fall back to pid-only liveness
-    (vulnerable to recycling but preserves backward compatibility).
-    """
-    if record.pid is None or record.pid <= 0:
-        return False
-    return is_pid_alive(record.pid, record.process_start_time)
-
-
 def update_session_record_with_failure_classification(
     sessions_dir: Path,
     issue_number: int,
@@ -968,7 +947,6 @@ __all__ = [
     "launch_devin_session",
     "read_session_records",
     "probe_devin",
-    "is_session_alive",
     "update_session_record_with_failure_classification",
     "get_rate_limit_defer_until",
     "_get_process_start_time",

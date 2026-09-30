@@ -323,7 +323,7 @@ def test_compute_api_worker_fleet_report_respects_global_devin_sessions_dir_over
     }
     _make_fleet_json(tmp_path, fleet_dir, repos_map)
 
-    monkeypatch.setattr("charlie_work.worker.is_worker_alive", lambda _record: True)
+    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: True)
 
     report = compute_api_worker_fleet_report(fleet_dir_override=str(fleet_dir))
 

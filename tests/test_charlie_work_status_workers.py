@@ -76,8 +76,8 @@ def test_status_includes_workers_section(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    # Mock is_session_alive to return True for PID 12345
-    with patch("charlie_work.worker.is_session_alive", return_value=True):
+    # Mock worker_fate.is_alive to return True for PID 12345
+    with patch("charlie_work.worker_fate.is_alive", return_value=True):
         result = app.status()
 
     # Check that workers section is present
@@ -164,7 +164,7 @@ def test_status_workers_section_claude_code_rework_layout(tmp_path: Path) -> Non
     sidecar = sessions_dir / f"issue-{issue_number}-rework.claude.json"
     sidecar.write_text(json.dumps(record.to_dict()), encoding="utf-8")
 
-    with patch("charlie_work.worker.is_worker_alive", return_value=True):
+    with patch("charlie_work.worker_fate.is_alive", return_value=True):
         result = app.status()
 
     assert len(result.data["workers"]) == 1
@@ -244,7 +244,7 @@ def test_status_workers_not_killed_when_real_activity_probe_fresh(tmp_path: Path
         encoding="utf-8",
     )
 
-    with patch("charlie_work.worker.is_worker_alive", return_value=True):
+    with patch("charlie_work.worker_fate.is_alive", return_value=True):
         result = app.status()
 
     workers = [w for w in result.data["workers"] if w["issue"] == issue_number]
@@ -338,7 +338,7 @@ def test_status_workers_surfaces_corroboration_alive_but_polling(tmp_path: Path)
     # Worker 1347: genuinely stalled (stale log, stale corroboration).
     _plant_claude_worker(1347, fresh_corroboration=False)
 
-    with patch("charlie_work.worker.is_worker_alive", return_value=True):
+    with patch("charlie_work.worker_fate.is_alive", return_value=True):
         result = app.status()
 
     by_issue = {w["issue"]: w for w in result.data["workers"]}

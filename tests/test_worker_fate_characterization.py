@@ -1027,46 +1027,50 @@ def test_preserve_rule6_throttle_exemption_reads_failure_kind_directly(tmp_path:
 
 
 # ---------------------------------------------------------------------------
-# A2 (preserve): claude_code.is_worker_alive and devin_shell.is_session_alive
-# are duplicate wrappers around process_utils.is_pid_alive. The new
-# Adapter-liveness seam must keep them agreeing on the same input.
+# A2 (preserve): WorkerView.is_alive collapsed onto the single liveness seam,
+# worker_fate.is_alive; the per-adapter wrappers (claude_code.is_worker_alive,
+# devin_shell.is_session_alive) were deleted in wf-r2-s2.
 # ---------------------------------------------------------------------------
 
 
 def test_preserve_a2_is_worker_alive_and_is_session_alive_agree(tmp_path: Path) -> None:
-    """Preserve: the two adapter-specific liveness wrappers agree.
+    """Preserve: every adapter's ``WorkerView.is_alive`` equals ``worker_fate.is_alive``.
 
-    `claude_code.is_worker_alive` and `devin_shell.is_session_alive` are
-    separately-defined but byte-identical wrappers: `pid is None or pid <=
-    0` short-circuits to `False`, otherwise both delegate to the same
-    `process_utils.is_pid_alive`. The new module deletes the duplication
-    (per the plan); this pins that they agree today, on the same inputs.
+    The two adapter-specific wrappers were byte-identical (``pid is None or
+    pid <= 0`` short-circuits to ``False``, otherwise delegate to
+    ``process_utils.is_pid_alive``). They are deleted; ``WorkerView.is_alive``
+    now asks the one seam, for devin, claude-code and api alike. Pinned on the
+    same inputs the wrappers were pinned on, plus an unknown kind (dead).
     """
-    from charlie_work.claude_code import ClaudeWorkerRecord, is_worker_alive
-    from charlie_work.devin_shell import SessionRecord, is_session_alive
+    from charlie_work import worker_fate
+    from charlie_work.worker import WorkerView
 
-    common = dict(
-        issue_number=1,
-        branch="agent/issue-1",
-        worktree_path=str(tmp_path),
-        prompt_path=str(tmp_path / "prompt.md"),
-        command=("echo", "hi"),
-        started_at="2026-01-01T00:00:00Z",
-        log_path=str(tmp_path / "log.txt"),
-    )
+    def view(kind: str, pid: int | None) -> WorkerView:
+        return WorkerView(
+            adapter_kind=kind,
+            issue_number=1,
+            repo_key="",
+            pid=pid,
+            started_at="2026-01-01T00:00:00Z",
+            process_start_time=None,
+            log_path=str(tmp_path / "log.txt"),
+            worktree_path=str(tmp_path),
+            error=None,
+            failure_kind=None,
+            reclaimed=None,
+        )
 
-    # pid is None -> both short-circuit to False without probing.
-    assert is_worker_alive(ClaudeWorkerRecord(pid=None, **common)) is False
-    assert is_session_alive(SessionRecord(pid=None, **common)) is False
-
-    # pid <= 0 -> same short-circuit.
-    assert is_worker_alive(ClaudeWorkerRecord(pid=0, **common)) is False
-    assert is_session_alive(SessionRecord(pid=0, **common)) is False
-
-    # A pid confirmed dead (no such process) -> both delegate to the SAME
-    # process_utils.is_pid_alive and must agree with each other, whatever
-    # this host's answer is.
     dead_pid = 999_999_937
-    claude_dead = ClaudeWorkerRecord(pid=dead_pid, process_start_time=None, **common)
-    devin_dead = SessionRecord(pid=dead_pid, process_start_time=None, **common)
-    assert is_worker_alive(claude_dead) == is_session_alive(devin_dead)
+    for pid in (None, 0, -1, dead_pid):
+        expected = worker_fate.is_alive(pid, None)
+        for kind in ("devin", "claude-code", "api"):
+            assert view(kind, pid).is_alive() is expected, (kind, pid)
+    # None / non-positive pids are dead by definition, independent of the host.
+    assert worker_fate.is_alive(None, None) is False
+    assert worker_fate.is_alive(0, None) is False
+    assert worker_fate.is_alive(-1, None) is False
+    # An unrecognised adapter kind has no fate profile -> conservatively dead.
+    assert view("no-such-adapter", os.getpid()).is_alive() is False
+    # A live pid reads alive through every adapter's view.
+    for kind in ("devin", "claude-code", "api"):
+        assert view(kind, os.getpid()).is_alive() is True, kind

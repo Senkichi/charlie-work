@@ -287,7 +287,7 @@ def test_fleet_lock_serializes_cross_repo_dispatch(tmp_path: Path, monkeypatch) 
         )
 
     monkeypatch.setattr("charlie_work.adapters._run_devin_shell_adapter", fake_run_devin_shell)
-    monkeypatch.setattr("charlie_work.worker.is_session_alive", lambda _record: True)
+    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: True)
 
     # Build two independent repos, each sharing the same fleet directory.
     apps: list[OrchestratorApp] = []

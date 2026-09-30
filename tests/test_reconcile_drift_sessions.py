@@ -156,7 +156,7 @@ def test_detect_drift_defers_dead_session_on_inconclusive_probe(
             )
         )
 
-    monkeypatch.setattr("charlie_work.worker.is_session_alive", lambda _record: False)
+    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: False)
     monkeypatch.setattr("charlie_work.worker.real_activity_probe_for", _inconclusive_probe)
 
     drift = detect_drift(gh, state, config, repo_root=tmp_path)
@@ -550,7 +550,7 @@ def test_detect_drift_launch_stalled_calls_kill_process_tree(tmp_path: Path) -> 
     os.utime(log_path, (old_time.timestamp(), old_time.timestamp()))
 
     # Use a fake PID that passes is_alive() without actually checking the OS.
-    # We patch is_session_alive so the worker reads as alive.
+    # We patch worker_fate.is_alive so the worker reads as alive.
     fake_pid = 99999
     fake_start_time = 1700000000.0
 
@@ -581,7 +581,7 @@ def test_detect_drift_launch_stalled_calls_kill_process_tree(tmp_path: Path) -> 
         return [pid]
 
     with (
-        patch("charlie_work.worker.is_session_alive", return_value=True),
+        patch("charlie_work.worker_fate.is_alive", return_value=True),
         patch("charlie_work.reconcile.kill_process_tree", fake_kill),
     ):
         detect_drift(gh, state, config, repo_root=tmp_path)
@@ -655,7 +655,7 @@ def test_detect_drift_launch_stalled_api_session_settles_budget_ledger(
 
     Covers the launch_stalled reap call site (~reconcile.py:304). That lane
     fires only for an alive-but-shim-frozen worker corroborated by a
-    conclusive-stale real-activity probe. We patch ``is_worker_alive`` to True
+    conclusive-stale real-activity probe. We patch ``worker_fate.is_alive`` to True
     and ``real_activity_probe_for`` to a conclusive-stale probe so the lane
     runs for an api sidecar without spawning a real process. A wiring
     regression that drops the api kwargs from this call site leaves the ledger
@@ -693,7 +693,7 @@ def test_detect_drift_launch_stalled_api_session_settles_budget_ledger(
     _os.utime(log_path, (old_time.timestamp(), old_time.timestamp()))
 
     # Force the api worker to read as alive so the launch_stalled lane runs.
-    monkeypatch.setattr("charlie_work.worker.is_worker_alive", lambda record: True)
+    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: True)
     # Conclusive-stale probe: has a timestamp (not inconclusive) but stale past
     # the grace period (not fresh), so _log_is_stalled_at_shim returns True.
     stale_source = ActivitySource(

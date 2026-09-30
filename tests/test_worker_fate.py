@@ -661,12 +661,24 @@ def test_freshness_written_at_unknown_with_dispatch_known_is_stale() -> None:
 
 # --------------------------------------------------------------------------
 # is_alive: process_utils.is_pid_alive stays the primitive; the only
-# addition is the ``pid is None`` case.
+# additions are the ``pid is None`` and ``pid <= 0`` cases (wf-r2-s2 folded
+# the deleted per-adapter wrappers' ``<= 0`` guard in here).
 # --------------------------------------------------------------------------
 
 
 def test_is_alive_none_pid_is_never_alive() -> None:
     assert is_alive(None, None) is False
+
+
+def test_is_alive_nonpositive_pid_is_never_alive_and_never_probed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _boom(pid: int, expected_start_time: float | None = None) -> bool:
+        raise AssertionError("a non-positive pid must not reach the process probe")
+
+    monkeypatch.setattr("charlie_work.worker_fate._process_is_pid_alive", _boom)
+    assert is_alive(0, None) is False
+    assert is_alive(-1, 123.0) is False
 
 
 def test_is_alive_delegates_to_process_utils(monkeypatch: pytest.MonkeyPatch) -> None:

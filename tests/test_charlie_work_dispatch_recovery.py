@@ -589,7 +589,7 @@ def test_dispatch_defers_after_stall_reap_sets_throttled_until(tmp_path: Path) -
     )
 
     with (
-        patch("charlie_work.worker.is_session_alive", return_value=True),
+        patch("charlie_work.worker_fate.is_alive", return_value=True),
         patch("charlie_work.write_gate.kill_process_tree", return_value=[99999]),
         patch("charlie_work.dead_worker_reap.sweep_orphan_processes", return_value=[]),
     ):

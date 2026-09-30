@@ -18,14 +18,12 @@ from typing import Any
 from .claude_code import (
     ClaudeWorkerRecord,
     _sidecar_path as claude_sidecar_path,
-    is_worker_alive,
     read_worker_records,
 )
 from .config import WRITER_MARKER_FILENAME, OrchestratorConfig
 from .devin_shell import (
     SessionRecord,
     _sidecar_path as devin_sidecar_path,
-    is_session_alive,
     read_session_records,
 )
 from .post_mortem import (
@@ -278,82 +276,18 @@ class WorkerView:
     def is_alive(self) -> bool:
         """Check whether the process behind this worker is still running.
 
-        Dispatches to the adapter-specific liveness probe based on adapter_kind.
-        Preserves the existing PID + process_start_time recycling-safe check.
+        Delegates to ``worker_fate.is_alive`` -- the single liveness seam --
+        for every adapter that has a fate profile. An unknown adapter kind is
+        conservatively treated as dead. ``worker_fate`` imports this module at
+        module level, so the import here must stay lazy; the call goes through
+        the module attribute so a patch on ``charlie_work.worker_fate.is_alive``
+        reaches it.
         """
-        if self.adapter_kind == "devin":
-            # Reconstruct a minimal SessionRecord for the liveness probe
-            record = SessionRecord(
-                issue_number=self.issue_number,
-                branch="",  # Not used by is_session_alive
-                worktree_path=self.worktree_path,
-                prompt_path="",  # Not used by is_session_alive
-                command=(),  # Not used by is_session_alive
-                pid=self.pid,
-                started_at=self.started_at,
-                log_path=self.log_path,
-                error=self.error,
-                failure_kind=self.failure_kind,
-                process_start_time=self.process_start_time,
-                reclaimed=self.reclaimed,
-                last_activity_at=self.last_activity_at,
-                log_bytes=self.log_bytes,
-                rate_limit_defer_until=self.rate_limit_defer_until,
-                inconclusive_probe_deferred_count=self.inconclusive_probe_deferred_count,
-                session_id=self.session_id,
-            )
-            return is_session_alive(record)
-        elif self.adapter_kind == "claude-code":
-            # Reconstruct a minimal ClaudeWorkerRecord for the liveness probe
-            record = ClaudeWorkerRecord(
-                issue_number=self.issue_number,
-                branch="",  # Not used by is_worker_alive
-                worktree_path=self.worktree_path,
-                prompt_path="",  # Not used by is_worker_alive
-                command=(),  # Not used by is_worker_alive
-                pid=self.pid,
-                started_at=self.started_at,
-                log_path=self.log_path,
-                error=self.error,
-                failure_kind=self.failure_kind,
-                process_start_time=self.process_start_time,
-                reclaimed=self.reclaimed,
-                last_activity_at=self.last_activity_at,
-                log_bytes=self.log_bytes,
-                rate_limit_defer_until=self.rate_limit_defer_until,
-                inconclusive_probe_deferred_count=self.inconclusive_probe_deferred_count,
-                session_id=self.session_id,
-            )
-            return is_worker_alive(record)
-        elif self.adapter_kind == "api":
-            # api workers are Claude Code CLI processes with provider env
-            # injected; their sidecar/record shape is identical to claude-code
-            # (issue-<n>.api.json via launch_claude_worker adapter_kind="api"),
-            # so liveness delegates to the same is_worker_alive probe.
-            record = ClaudeWorkerRecord(
-                issue_number=self.issue_number,
-                branch="",
-                worktree_path=self.worktree_path,
-                prompt_path="",
-                command=(),
-                pid=self.pid,
-                started_at=self.started_at,
-                log_path=self.log_path,
-                error=self.error,
-                failure_kind=self.failure_kind,
-                process_start_time=self.process_start_time,
-                reclaimed=self.reclaimed,
-                last_activity_at=self.last_activity_at,
-                log_bytes=self.log_bytes,
-                rate_limit_defer_until=self.rate_limit_defer_until,
-                inconclusive_probe_deferred_count=self.inconclusive_probe_deferred_count,
-                session_id=self.session_id,
-                adapter_kind="api",
-            )
-            return is_worker_alive(record)
-        else:
-            # Unknown adapter kind - conservatively treat as dead
+        from . import worker_fate
+
+        if worker_fate.profile_for(self.adapter_kind) is None:
             return False
+        return worker_fate.is_alive(self.pid, self.process_start_time)
 
     def log_stat(self) -> stat_result | None:
         """Stat() the log_path, swallow OSError -> None.

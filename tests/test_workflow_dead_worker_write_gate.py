@@ -94,7 +94,7 @@ def _seed_orphan_sweep_scenario(root: Path) -> tuple[Path, Path, str]:
     # "is this session dead" check for this function's purposes is
     # `record.pid is None or record.error is not None: continue` -- a
     # session with no pid at all is skipped entirely, not treated as dead.
-    # Liveness is instead determined by mocking devin_shell.is_session_alive
+    # Liveness is instead determined by mocking worker_fate.is_alive
     # to return False for this pid (matching test_charlie_work.py's
     # test_sweep_orphan_processes_for_dead_sessions_unit fixture).
     record = SessionRecord(
@@ -165,7 +165,7 @@ def test_sweep_orphan_processes_for_dead_sessions_dry_run_true_kills_nothing(
         # into its own namespace (workflow.py no longer does, post routing
         # deletion).
         patch("os.name", "nt"),
-        patch("charlie_work.devin_shell.is_session_alive", return_value=False),
+        patch("charlie_work.worker_fate.is_alive", return_value=False),
         patch("subprocess.run", side_effect=control_runner),
     ):
         _sweep_orphan_processes_for_dead_sessions(
@@ -193,7 +193,7 @@ def test_sweep_orphan_processes_for_dead_sessions_dry_run_true_kills_nothing(
     with (
         patch("charlie_work.dead_worker_reap.sweep_orphan_processes", side_effect=_dry_sweep),
         patch("os.name", "nt"),
-        patch("charlie_work.devin_shell.is_session_alive", return_value=False),
+        patch("charlie_work.worker_fate.is_alive", return_value=False),
         patch("subprocess.run", side_effect=dry_runner),
     ):
         _sweep_orphan_processes_for_dead_sessions(
