@@ -133,6 +133,7 @@ def _set_reviewer_quota_exhausted_with_backoff(
     now_dt: datetime,
     *,
     reset_at: datetime | None = None,
+    adapter_kind: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Record a quota-exhaustion episode with exponential probe backoff.
 
@@ -168,6 +169,9 @@ def _set_reviewer_quota_exhausted_with_backoff(
     ``review_quota_exhausted`` event carrying ``throttled_until``,
     ``probe_after``, ``reset_at`` (ISO or None), and
     ``consecutive_probe_failures`` without re-reading state.
+
+    Issue #2086: the record carries ``reason`` and the hitting session's
+    ``adapter_kind`` so ``role_selection.window_covered`` can attribute it.
     """
     rd = config.review_dispatch
     quota = state.get("reviewer_quota") or {}
@@ -193,6 +197,8 @@ def _set_reviewer_quota_exhausted_with_backoff(
     )
     quota_record = {
         **state["reviewer_quota"],
+        "reason": "quota_exhausted",
+        "adapter_kind": adapter_kind,
         "consecutive_probe_failures": consecutive_failures,
         "reset_at": (
             reset_at.replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -542,7 +548,7 @@ def _detect_and_handle_stalled_reviews(
                 if not throttle_backoff_applied:
                     now_dt = resolved_now
                     state, quota_record = _set_reviewer_quota_exhausted_with_backoff(
-                        state, config, now_dt, reset_at=reset_at
+                        state, config, now_dt, reset_at=reset_at, adapter_kind=w.adapter_kind
                     )
                     throttle_backoff_applied = True
                     # Distinct, queryable event for a quota-dead reviewer session

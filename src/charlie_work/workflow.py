@@ -6273,7 +6273,10 @@ class OrchestratorApp:
             if role_sel.exhausted:
                 deferred, probe_mode = True, False
             elif is_reviewer_quota_exhausted(state) and not role_selection.window_covered(
-                (state.get("reviewer_quota") or {}).get("throttled_until"), role_sel
+                (state.get("reviewer_quota") or {}).get("throttled_until"),
+                role_sel,
+                reason=(state.get("reviewer_quota") or {}).get("reason"),
+                adapter_kind=(state.get("reviewer_quota") or {}).get("adapter_kind"),
             ):
                 if not is_reviewer_probe_ready(state):
                     deferred = True
@@ -7069,7 +7072,11 @@ class OrchestratorApp:
                     parse_reset_clock_time(quota_hit_error, now_dt) if quota_hit_error else None
                 )
                 state, quota_record = _set_reviewer_quota_exhausted_with_backoff(
-                    state, self.config, now_dt, reset_at=reset_at
+                    state,
+                    self.config,
+                    now_dt,
+                    reset_at=reset_at,
+                    adapter_kind=role_selection.selection_adapter_kind(role_sel),
                 )
                 role_selection.record_launch_quota_hit(
                     role_sel, quota_record.get("throttled_until"), source="launch_quota_hit"

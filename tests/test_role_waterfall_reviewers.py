@@ -34,6 +34,7 @@ import charlie_work.workflow as wf
 PRIMARY = RoleEntry("devin-shell", "swe-2")
 FALLBACK = RoleEntry("claude-code", "claude-sonnet-5-5", "high")
 CHAINED = ReviewerRoleConfig(harness=PRIMARY.harness, model=PRIMARY.model, fallbacks=(FALLBACK,))
+PRIMARY_ADAPTER = "devin"  # WorkerView.adapter_kind of the devin-shell harness
 SINGLE = ReviewerRoleConfig(harness=PRIMARY.harness, model=PRIMARY.model)
 
 
@@ -216,6 +217,11 @@ def test_covered_per_repo_quota_launches_fallback_not_a_probe(
         state = set_reviewer_quota_exhausted(
             state, throttled_until=_z(until), probe_after=far_probe
         )
+        state["reviewer_quota"] = {
+            **state["reviewer_quota"],
+            "reason": "quota_exhausted",
+            "adapter_kind": PRIMARY_ADAPTER,
+        }
         save_state(app.paths.state_file, state)
 
     result = app.dispatch_reviews()
@@ -319,3 +325,90 @@ def test_dead_fallback_reviewer_restricts_its_own_recorded_entry(tmp_path: Path)
     restrictions = role_quota_ledger.load_restrictions()
     assert set(restrictions) == {FALLBACK.key}
     assert _z(restrictions[FALLBACK.key]) == quota_until
+
+
+def _seed_quota_window(app: OrchestratorApp, until: datetime, **provenance: str | None) -> None:
+    far_probe = _z(datetime.now(UTC) + timedelta(hours=1))
+    with state_lock(app.paths.state_file):
+        state = set_reviewer_quota_exhausted(
+            load_state(app.paths.state_file), throttled_until=_z(until), probe_after=far_probe
+        )
+        state["reviewer_quota"] = {**state["reviewer_quota"], **provenance}
+        save_state(app.paths.state_file, state)
+
+
+@pytest.mark.parametrize(
+    "provenance",
+    [
+        pytest.param({}, id="unstamped-pre-ledger-window"),
+        pytest.param({"reason": None, "adapter_kind": PRIMARY_ADAPTER}, id="no-reason"),
+        pytest.param(
+            {"reason": "quota_exhausted", "adapter_kind": "claude-code"},
+            id="adapter-of-no-skipped-entry",
+        ),
+    ],
+)
+def test_reviewer_window_shorter_than_a_skipped_restriction_but_unexplained_still_defers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, provenance: dict[str, str | None]
+) -> None:
+    """The primary's ledger restriction outlasts the per-repo window, which the
+    old timestamp-only check waved through; without quota provenance attributable
+    to the skipped primary it must still defer exactly as before #2086."""
+    calls = _recorder(monkeypatch)
+    _restrict(PRIMARY, datetime.now(UTC) + timedelta(hours=3))
+    app = _app(tmp_path / "b", n_prs=2)
+    _seed_quota_window(app, datetime.now(UTC) + timedelta(hours=1), **provenance)
+
+    result = app.dispatch_reviews()
+
+    assert calls == []
+    assert result.data["launched_count"] == 0
+    assert result.data["deferred_reason"] == "reviewer_quota_probe_backoff"
+
+
+def test_reviewer_window_is_not_explained_by_a_later_unselected_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Primary free, only the fallback restricted: nothing was skipped, so even a
+    stamped quota window on the primary's adapter keeps deferring."""
+    calls = _recorder(monkeypatch)
+    _restrict(FALLBACK, datetime.now(UTC) + timedelta(hours=3))
+    app = _app(tmp_path / "b")
+    _seed_quota_window(
+        app,
+        datetime.now(UTC) + timedelta(hours=1),
+        reason="quota_exhausted",
+        adapter_kind=PRIMARY_ADAPTER,
+    )
+
+    result = app.dispatch_reviews()
+
+    assert calls == []
+    assert result.data["deferred_reason"] == "reviewer_quota_probe_backoff"
+
+
+def test_launch_time_quota_hit_stamps_the_window_with_the_launched_adapter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _restrict(PRIMARY, datetime.now(UTC) + timedelta(hours=2))  # fallback (claude-code) launches
+    _recorder(monkeypatch, error="Error: daily usage quota has been exhausted.")
+    app = _app(tmp_path / "b")
+
+    app.dispatch_reviews()
+
+    quota = load_state(app.paths.state_file)["reviewer_quota"]
+    assert (quota["reason"], quota["adapter_kind"]) == ("quota_exhausted", "claude-code")
+
+
+def test_dead_reviewer_sweep_stamps_the_window_with_the_dead_sessions_adapter(
+    tmp_path: Path,
+) -> None:
+    repo_root, reviews_dir, config, state_file = _seed_stalled(tmp_path, 100)
+    _write_session_limit_reviewer(reviews_dir, 100, tmp_path)
+
+    _detect_and_handle_stalled_reviews(
+        reviews_dir, state_file, config, repo_root, write_gate=_wg(state_file)
+    )
+
+    quota = load_state(state_file)["reviewer_quota"]
+    assert (quota["reason"], quota["adapter_kind"]) == ("quota_exhausted", "claude-code")

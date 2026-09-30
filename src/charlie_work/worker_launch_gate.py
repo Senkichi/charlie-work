@@ -446,7 +446,10 @@ def issue_worker_launch_permit(
         )
     pre_state = _wf.load_state(app.paths.state_file)
     if _wf.is_throttled(pre_state) and not role_selection.window_covered(
-        pre_state.get("throttled_until"), selection
+        pre_state.get("throttled_until"),
+        selection,
+        reason=pre_state.get("throttle_reason"),
+        adapter_kind=pre_state.get("throttle_adapter_kind"),
     ):
         return WorkerLaunchDeferral(
             REASON_PROVIDER_THROTTLED, throttled_until=pre_state.get("throttled_until")
@@ -480,7 +483,10 @@ def issue_worker_launch_permit(
             state = _wf.load_state(app.paths.state_file)
             throttled_until = state.get("throttled_until")
             throttled = _wf.is_throttled(state) and not role_selection.window_covered(
-                throttled_until, selection
+                throttled_until,
+                selection,
+                reason=state.get("throttle_reason"),
+                adapter_kind=state.get("throttle_adapter_kind"),
             )
     except BaseException:
         if owns_lock:

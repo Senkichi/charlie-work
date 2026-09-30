@@ -194,15 +194,75 @@ def test_length_one_chain_never_reads_the_ledger(monkeypatch: pytest.MonkeyPatch
     assert selection.chain_report_fields() == {}
 
 
-def test_window_covered_only_for_ledger_explained_windows() -> None:
+# CHAIN[0] is devin-shell/swe-2 (adapter "devin"); CHAIN[1] is claude-code (adapter "claude-code").
+QUOTA = {"reason": "quota_exhausted", "adapter_kind": "devin"}
+
+
+def test_window_covered_for_a_quota_window_attributable_to_a_skipped_entry() -> None:
     until = NOW + timedelta(hours=2)
     selection = role_selection.build_selection(CHAIN, {CHAIN[0].key: until}, NOW)
-    assert role_selection.window_covered(_z(until), selection)
-    # An operator hold / pre-ledger window that outlasts the ledger still blocks.
-    assert not role_selection.window_covered(_z(until + timedelta(hours=1)), selection)
-    assert not role_selection.window_covered(None, selection)
+    assert role_selection.window_covered(_z(until), selection, **QUOTA)
+    assert role_selection.window_covered(
+        _z(until - timedelta(hours=1)), selection, reason="rate_limited", adapter_kind="devin"
+    )
+
+
+@pytest.mark.parametrize(
+    ("per_repo", "kwargs"),
+    [
+        pytest.param(None, QUOTA, id="no-window"),
+        pytest.param(timedelta(hours=3), QUOTA, id="outlasts-the-skipped-restriction"),
+        pytest.param(timedelta(hours=1), {"reason": None, "adapter_kind": None}, id="unstamped"),
+        pytest.param(
+            timedelta(hours=1), {"reason": None, "adapter_kind": "devin"}, id="operator-hold"
+        ),
+        pytest.param(
+            timedelta(hours=1),
+            {"reason": "provider_auth", "adapter_kind": "devin"},
+            id="dead-credential",
+        ),
+        pytest.param(
+            timedelta(hours=1),
+            {"reason": "quota_exhausted", "adapter_kind": None},
+            id="no-adapter",
+        ),
+        pytest.param(
+            timedelta(hours=1),
+            {"reason": "quota_exhausted", "adapter_kind": "claude-code"},
+            id="adapter-of-no-skipped-entry",
+        ),
+    ],
+)
+def test_window_covered_refuses_windows_the_ledger_does_not_explain(
+    per_repo: timedelta | None, kwargs: dict[str, str | None]
+) -> None:
+    until = NOW + timedelta(hours=2)
+    selection = role_selection.build_selection(CHAIN, {CHAIN[0].key: until}, NOW)
+    window = None if per_repo is None else _z(NOW + per_repo)
+    assert not role_selection.window_covered(window, selection, **kwargs)
+
+
+def test_window_covered_ignores_restrictions_on_entries_selection_did_not_skip() -> None:
+    # The primary is free; only a LATER entry is restricted. No skipped entry
+    # exists, so no per-repo window is explained -- even a short, stamped one.
+    later_only = role_selection.build_selection(
+        CHAIN, {CHAIN[2].key: NOW + timedelta(hours=9)}, NOW
+    )
+    assert later_only.skipped == ()
+    window = _z(NOW + timedelta(hours=1))
+    assert not role_selection.window_covered(window, later_only, **QUOTA)
+    assert not role_selection.window_covered(
+        window, later_only, reason="quota_exhausted", adapter_kind="devin"
+    )
+
+
+def test_window_covered_never_for_a_length_one_chain_or_an_exhausted_chain() -> None:
+    until = NOW + timedelta(hours=2)
     single = role_selection.build_selection(CHAIN[:1], {}, NOW)
-    assert not role_selection.window_covered(_z(until), single)
+    assert not role_selection.window_covered(_z(until), single, **QUOTA)
+    ledger = {e.key: until for e in CHAIN}
+    exhausted = role_selection.build_selection(CHAIN, ledger, NOW)
+    assert not role_selection.window_covered(_z(until), exhausted, **QUOTA)
 
 
 # --- ledger ---------------------------------------------------------------------

@@ -791,10 +791,16 @@ def _local_dispatch_reviewers(self, *, now: Any = None, launch_lock: Any = None)
     # Issue #2086: the reviewer role chain, resolved against the fleet ledger.
     role_sel = role_selection.select_for_launch(self.config.reviewer.chain)
     if role_sel.exhausted:
+        # ``result["skipped"]`` is a list of PR numbers; the chain's
+        # SkippedEntry payloads go under ``chain_skipped`` so neither clobbers
+        # the other, and the unlaunched PRs are folded in like the lock deferral.
+        chain_fields = role_sel.report_fields()
+        chain_fields["chain_skipped"] = chain_fields.pop("skipped")
         return {
             **result,
             "deferred_reason": "reviewer_chain_exhausted",
-            **role_sel.report_fields(),
+            **chain_fields,
+            "skipped": [*result["skipped"], *selected],
         }
     role_cfg = role_selection.reviewer_config_for(self.config, role_sel)
 

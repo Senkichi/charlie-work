@@ -14,10 +14,14 @@ The per-repo throttle windows (``state["throttled_until"]`` for workers,
 may not launch the role". For a chained role, a per-repo window that the
 ledger fully explains (it ends no later than the latest ledger restriction on
 some chain entry) is **covered**: selection already routed around it, so the
-launch proceeds on the selected entry (:func:`window_covered`). A per-repo
-window the ledger does not explain -- an operator hold, a window from a
-session launched before the ledger existed -- still blocks, so nothing that
-blocked before this module can silently stop blocking. When every entry is
+launch proceeds on the selected entry (:func:`window_covered`). Explained means
+the stored window is quota-derived (it carries the ``reason`` /
+``adapter_kind`` provenance the writers stamp) **and** attributable to an
+entry selection skipped on that adapter -- never merely "shorter than some
+ledger restriction somewhere in the chain". A per-repo window the ledger does
+not explain -- an operator hold, a window from a session launched before the
+ledger existed -- still blocks, so nothing that blocked before this module can
+silently stop blocking. When every entry is
 restricted, selection returns ``None`` and the caller defers exactly as the
 per-repo window always did.
 """
@@ -32,6 +36,7 @@ from pathlib import Path
 from typing import Any
 
 from . import role_quota_ledger
+from .harnesses import HARNESS_REGISTRY
 from .iso_timestamp import parse_iso_timestamp
 from .role_chain import RoleEntry
 from .write_gate import WriteGate, require_write_gate
@@ -60,16 +65,15 @@ class SkippedEntry:
 class RoleSelection:
     """The outcome of one selection over a role chain.
 
-    ``entry`` is ``None`` when every entry is restricted. ``chain_restricted_until``
-    is the latest active ledger ``until`` over the chain (``None`` when no
-    entry is restricted); :func:`window_covered` compares against it.
+    ``entry`` is ``None`` when every entry is restricted. ``skipped`` holds the
+    restricted entries ahead of the selected one; :func:`window_covered`
+    attributes a per-repo window to one of them.
     """
 
     chain: tuple[RoleEntry, ...]
     entry: RoleEntry | None
     index: int | None
     skipped: tuple[SkippedEntry, ...]
-    chain_restricted_until: datetime | None = None
 
     @property
     def is_fallback(self) -> bool:
@@ -132,15 +136,11 @@ def build_selection(
 ) -> RoleSelection:
     chain_tuple = tuple(chain)
     entry, skipped = select_role_entry(chain_tuple, ledger, now)
-    active = [
-        until for key, until in ledger.items() if until > now and key in {e.key for e in chain}
-    ]
     return RoleSelection(
         chain=chain_tuple,
         entry=entry,
         index=None if entry is None else chain_tuple.index(entry),
         skipped=skipped,
-        chain_restricted_until=max(active, default=None),
     )
 
 
@@ -156,22 +156,53 @@ def select_for_launch(chain: Sequence[RoleEntry], now: datetime | None = None) -
     return build_selection(chain_tuple, role_quota_ledger.load_restrictions(), resolved_now)
 
 
-def window_covered(per_repo_until: Any, selection: RoleSelection) -> bool:
-    """True when the per-repo throttle window is already explained by the ledger.
+def window_covered(
+    per_repo_until: Any,
+    selection: RoleSelection,
+    *,
+    reason: str | None,
+    adapter_kind: str | None,
+) -> bool:
+    """True when the per-repo throttle window is explained by a skipped chain entry.
 
-    Only a chained role (length > 1) with an active ledger restriction on
-    some chain entry that lasts at least as long as ``per_repo_until`` is
-    covered; everything else (length-1 chains, operator holds, windows from
-    unstamped pre-ledger sessions) is not, so the per-repo gate still blocks.
+    Covered only when all of these hold; anything else (length-1 chains,
+    operator holds, windows from unstamped pre-ledger sessions, a
+    ``provider_auth`` cooldown, a window on an adapter no skipped entry uses,
+    a window outlasting every skipped entry's restriction) is not, so the
+    per-repo gate still blocks:
+
+    * the role is chained and selection found an entry to launch on;
+    * the window is quota-derived: ``reason`` is one of the failure kinds the
+      ledger restricts on (``role_quota_ledger.RESTRICTING_FAILURE_KINDS``);
+    * some **skipped** entry runs on ``adapter_kind`` and its ledger
+      restriction lasts at least as long as ``per_repo_until``.
+
+    Entries past the selected one are deliberately not consulted: a
+    restriction on an entry selection never had to skip explains nothing
+    about why this repo is held.
     """
     if len(selection.chain) <= 1 or selection.entry is None:
         return False
-    if selection.chain_restricted_until is None:
+    if reason not in role_quota_ledger.RESTRICTING_FAILURE_KINDS or adapter_kind is None:
         return False
     until = parse_iso_timestamp(per_repo_until)
     if until is None:
         return False
-    return until <= selection.chain_restricted_until
+    until = until.replace(microsecond=0)  # the ledger stores whole seconds
+    for item in selection.skipped:
+        capabilities = HARNESS_REGISTRY.get(item.entry.harness)
+        if capabilities is not None and capabilities.adapter_kind == adapter_kind:
+            if until <= item.until:
+                return True
+    return False
+
+
+def selection_adapter_kind(selection: RoleSelection) -> str | None:
+    """The ``WorkerView.adapter_kind`` of the selected entry's harness, if any."""
+    if selection.entry is None:
+        return None
+    capabilities = HARNESS_REGISTRY.get(selection.entry.harness)
+    return None if capabilities is None else capabilities.adapter_kind
 
 
 # --- derived per-launch config ------------------------------------------------

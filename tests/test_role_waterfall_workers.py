@@ -30,6 +30,12 @@ from charlie_work.paths import runtime_paths
 from charlie_work.role_chain import RoleEntry
 from charlie_work.state import load_state, save_state, set_throttled_until, state_lock
 from charlie_work.worker import iter_workers
+from charlie_work.worker_launch_gate import (
+    REASON_PROVIDER_THROTTLED,
+    WorkerLaunchDeferral,
+    WorkerLaunchPermit,
+    issue_worker_launch_permit,
+)
 from charlie_work.worker_fate import profile_for
 from charlie_work.workflow import OrchestratorApp
 
@@ -292,6 +298,106 @@ def test_same_repo_throttle_explained_by_the_ledger_is_covered(
     app = _app(tmp_path / "a", lane)
     with state_lock(app.paths.state_file):
         state = load_state(app.paths.state_file)
-        save_state(app.paths.state_file, set_throttled_until(state, until_z, source="t"))
+        stamped = set_throttled_until(
+            state, until_z, source="t", reason="quota_exhausted", adapter_kind="claude-code"
+        )
+        save_state(app.paths.state_file, stamped)
     result = _run(app, lane)
     assert [_launched_entry(s) for s, _ in calls] == [FALLBACK.key], result.message
+
+
+def _hold(app: OrchestratorApp, until: datetime, **provenance: str | None) -> None:
+    """Write a per-repo throttle window; ``provenance`` is reason/adapter_kind."""
+    until_z = until.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        save_state(
+            app.paths.state_file, set_throttled_until(state, until_z, source="t", **provenance)
+        )
+
+
+def _restrict(entry: RoleEntry, until: datetime) -> None:
+    role_quota_ledger.record_restriction(
+        entry.harness, entry.model, until, reason="quota_exhausted", source="test"
+    )
+
+
+@LANES
+def test_unstamped_hold_ending_before_a_skipped_entrys_restriction_still_blocks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lane: str
+) -> None:
+    """An operator hold (no provenance) that is SHORTER than the primary's ledger
+    restriction used to be waved through as "explained"; it must still block."""
+    calls = _spy(monkeypatch)
+    _restrict(PRIMARY, datetime.now(UTC) + timedelta(hours=3))
+    app = _app(tmp_path / "b", lane)
+    _hold(app, datetime.now(UTC) + timedelta(hours=1))
+    result = _run(app, lane)
+    assert calls == []
+    assert result.data.get("deferred_reason") == "provider_throttled", result.data
+
+
+@LANES
+def test_hold_is_not_explained_by_a_restriction_on_an_unselected_later_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lane: str
+) -> None:
+    """Primary free, only the FALLBACK restricted: selection skipped nothing, so
+    even a fully stamped quota window on the primary's adapter blocks."""
+    calls = _spy(monkeypatch)
+    _restrict(FALLBACK, datetime.now(UTC) + timedelta(hours=3))
+    app = _app(tmp_path / "b", lane)
+    _hold(
+        app,
+        datetime.now(UTC) + timedelta(hours=1),
+        reason="quota_exhausted",
+        adapter_kind="claude-code",
+    )
+    result = _run(app, lane)
+    assert calls == []
+    assert result.data.get("deferred_reason") == "provider_throttled", result.data
+
+
+@LANES
+def test_stamped_window_on_an_adapter_no_skipped_entry_uses_still_blocks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lane: str
+) -> None:
+    calls = _spy(monkeypatch)
+    _restrict(PRIMARY, datetime.now(UTC) + timedelta(hours=3))  # claude-code skipped
+    app = _app(tmp_path / "b", lane)
+    _hold(
+        app,
+        datetime.now(UTC) + timedelta(hours=1),
+        reason="quota_exhausted",
+        adapter_kind="devin",
+    )
+    _run(app, lane)
+    assert calls == []
+
+
+@pytest.mark.parametrize("stamped", [False, True], ids=["unstamped-blocks", "stamped-covered"])
+def test_under_lock_throttle_read_applies_the_same_attribution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stamped: bool
+) -> None:
+    """The window lands AFTER the lock-free pre-check (written from inside the
+    governor call), so only the authoritative under-lock read can see it."""
+    _restrict(PRIMARY, datetime.now(UTC) + timedelta(hours=3))
+    app = _app(tmp_path / "b", FRESH)
+    real_governor = app._apply_concurrency_governor
+
+    def _throttle_then_govern(*args: Any, **kwargs: Any) -> Any:
+        provenance = (
+            {"reason": "quota_exhausted", "adapter_kind": "claude-code"} if stamped else {}
+        )
+        _hold(app, datetime.now(UTC) + timedelta(hours=1), **provenance)
+        return real_governor(*args, **kwargs)
+
+    monkeypatch.setattr(app, "_apply_concurrency_governor", _throttle_then_govern)
+    outcome = issue_worker_launch_permit(app, 1)
+    if stamped:
+        assert isinstance(outcome, WorkerLaunchPermit), outcome
+        assert outcome.role_selection.entry == FALLBACK
+        outcome.release()
+    else:
+        assert isinstance(outcome, WorkerLaunchDeferral), outcome
+        assert outcome.reason == REASON_PROVIDER_THROTTLED
+        assert outcome.governor is not None  # came from the under-lock gate, not the pre-check
