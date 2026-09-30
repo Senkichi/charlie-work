@@ -227,7 +227,7 @@ def test_clear_quota_throttles_clears_root_throttle_for_claude_code_or_unset_ada
 
 def test_clear_quota_throttles_preserves_provider_auth_throttle() -> None:
     """A dead key does not self-heal within minutes -- see
-    claude_code._classify_session_failure; a green probe must not mask it."""
+    worker_fate.classify_for; a green probe must not mask it."""
     from charlie_work.state import clear_quota_throttles, empty_state, set_throttled_until
 
     state = set_throttled_until(

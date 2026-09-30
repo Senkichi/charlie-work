@@ -32,7 +32,7 @@ def test_doctor_adapter_probe_runs_devin_probe_and_surfaces_sessions(
     sessions_dir = tmp_path / "sessions"
     sessions_dir.mkdir()
     # A failed launch (error set) and a launched-but-dead one (implausible PID
-    # that OpenProcess/os.kill can never find -> is_session_alive False).
+    # that OpenProcess/os.kill can never find -> worker_fate.is_alive False).
     _write_sidecar(
         sessions_dir,
         "issue-1.json",

@@ -41,14 +41,14 @@ def test_match_throttle_tail_parses_hours_and_minutes(tail: str, expected: int |
 
 
 def test_classify_session_failure_verbatim_hours_notice(tmp_path: Path) -> None:
-    from charlie_work.devin_shell import _classify_session_failure
+    from charlie_work import worker_fate
 
     log_path = tmp_path / "session.log"
     log_path.write_text("work...\n" + _VERBATIM + "\n", encoding="utf-8")
     now = datetime.now(UTC).replace(microsecond=0)
     os.utime(log_path, (now.timestamp(), now.timestamp()))
 
-    kind, until = _classify_session_failure(log_path, now=now)
+    kind, until = worker_fate.classify_for("devin", log_path, now=now)
 
     assert kind == "rate_limited"
     assert until is not None

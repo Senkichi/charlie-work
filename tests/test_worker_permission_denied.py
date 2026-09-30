@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
+from functools import partial
 from pathlib import Path
 
-from charlie_work import claude_code
+from charlie_work import claude_code, worker_fate
 from charlie_work.claude_code import (
     _WORKER_COMMAND_TEMPLATE,
     PROMPTING_PERMISSION_MODES,
-    _classify_session_failure,
     _sidecar_path,
     worker_permission_denied,
 )
@@ -21,6 +21,8 @@ from charlie_work.doctor_worker_permissions import (
 )
 
 DENIAL = "I could not run the tests. If you approve command execution, I can finish these steps."
+
+_classify_session_failure = partial(worker_fate.classify_for, "claude-code")
 
 
 def _run_check(repo: Path, config: OrchestratorConfig) -> list[tuple[str, bool, str]]:

@@ -1,0 +1,8 @@
+warning
+# md-r4 (architecture-deepening candidate 3): a markdown guard's legacy
+# (origin/main) path and its markdown_fence.scan-based path disagreed -- on a
+# verdict decision (verdict / rescue_verdict) or on the example-secret mask
+# (outbound_mask). The guard already returned the MORE RESTRICTIVE answer, so
+# nothing failed open; the event is the soak signal for retiring the legacy
+# paths (delete them once this stays at zero). Warning so it is visible in
+# heartbeat's warning report while the soak runs. Deliberately unbucketed.

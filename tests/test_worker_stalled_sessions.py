@@ -95,7 +95,7 @@ def test_detect_stalled_sessions_passes_real_activity_probe(
         captured.append(real_activity_probe)
         return WorkerHealth.HEALTHY
 
-    monkeypatch.setattr("charlie_work.worker.is_worker_alive", lambda record: True)
+    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: True)
     monkeypatch.setattr("charlie_work.worker.classify_worker_health", spy_classify)
 
     config = OrchestratorConfig(
@@ -177,7 +177,7 @@ def test_detect_and_handle_stalled_sessions_not_killed_when_real_activity_probe_
         lambda pid, start_time=None: killed.append(pid) or [pid],
     )
     monkeypatch.setattr(dead_worker_reap, "sweep_orphan_processes", lambda worktree_path: [])
-    monkeypatch.setattr("charlie_work.worker.is_worker_alive", lambda record: True)
+    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: True)
 
     config = OrchestratorConfig(
         post_mortem=PostMortemConfig(db_path=str(tmp_path / "missing-sessions.db"))
@@ -244,7 +244,7 @@ def test_detect_and_handle_stalled_sessions_tolerates_none_probe(
         lambda pid, start_time=None: killed.append(pid) or [pid],
     )
     monkeypatch.setattr(dead_worker_reap, "sweep_orphan_processes", lambda worktree_path: [])
-    monkeypatch.setattr("charlie_work.worker.is_session_alive", lambda record: True)
+    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: True)
     monkeypatch.setattr("charlie_work.worker.real_activity_probe_for", lambda *args: None)
 
     state_file = tmp_path / "state.json"
@@ -316,7 +316,7 @@ def test_detect_and_handle_stalled_sessions_inconclusive_probe_deferred_then_esc
         lambda pid, start_time=None: killed.append(pid) or [pid],
     )
     monkeypatch.setattr(dead_worker_reap, "sweep_orphan_processes", lambda worktree_path: [])
-    monkeypatch.setattr("charlie_work.worker.is_session_alive", lambda record: False)
+    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: False)
     monkeypatch.setattr(
         "charlie_work.worker.real_activity_probe_for", _inconclusive_probe_for_signal_1
     )
@@ -401,7 +401,7 @@ def test_detect_and_handle_stalled_sessions_dry_run_suppresses_kills_and_writes(
     monkeypatch.setattr(
         "charlie_work.dead_worker_reap.sweep_orphan_processes", lambda worktree_path: []
     )
-    monkeypatch.setattr("charlie_work.worker.is_session_alive", lambda record: True)
+    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: True)
     monkeypatch.setattr("charlie_work.worker.real_activity_probe_for", _stale_devin_probe)
 
     config = OrchestratorConfig()
@@ -485,7 +485,7 @@ def test_detect_and_handle_stalled_sessions_dry_run_suppresses_api_budget_exceed
     monkeypatch.setattr(
         "charlie_work.dead_worker_reap.sweep_orphan_processes", lambda worktree_path: []
     )
-    monkeypatch.setattr("charlie_work.worker.is_session_alive", lambda record: True)
+    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: True)
     monkeypatch.setattr("charlie_work.worker.real_activity_probe_for", _stale_devin_probe)
     # Force the budget check to fire so the api-budget-exceeded branch is
     # exercised without needing a real events.jsonl + token-usage setup.
@@ -558,7 +558,7 @@ def test_detect_and_handle_stalled_sessions_dry_run_suppresses_rate_limit_defer(
     monkeypatch.setattr(
         "charlie_work.dead_worker_reap.sweep_orphan_processes", lambda worktree_path: []
     )
-    monkeypatch.setattr("charlie_work.worker.is_session_alive", lambda record: True)
+    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: True)
     monkeypatch.setattr("charlie_work.worker.real_activity_probe_for", _stale_devin_probe)
 
     config = OrchestratorConfig(
@@ -668,8 +668,7 @@ def test_detect_and_handle_stalled_sessions_emits_provider_suspended_event(
     # after it kills the PID, the dead lane sees a dead worker. Use a mutable
     # flag flipped by kill_process_tree to model the real liveness transition.
     alive = {"yes": True}
-    monkeypatch.setattr("charlie_work.worker.is_worker_alive", lambda record: alive["yes"])
-    monkeypatch.setattr("charlie_work.worker.is_session_alive", lambda record: alive["yes"])
+    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: alive["yes"])
     monkeypatch.setattr("charlie_work.worker.real_activity_probe_for", lambda *args: None)
 
     def _kill_and_flip(pid, start_time=None):

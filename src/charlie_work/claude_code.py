@@ -21,19 +21,17 @@ import hashlib
 import json
 import logging
 import os
-import re
 import subprocess
 import sys
 import time
 import uuid
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from charlie_work.process_utils import (
-    is_pid_alive,
     parse_proc_stat_starttime,
     popen_worker,
     start_terminal_status_watcher,
@@ -51,7 +49,13 @@ from .env_sanitize import resolve_pytest_cap, resolve_uv_no_sync, sanitize_env
 from .post_mortem import merge_attempt_snapshot
 from .state import _canonical_started_at, utc_now
 from .subprocess_runner import RunResult, resolve_cli_binary, run_captured
-from .throttle_signatures import match_quota_tail, match_throttle_tail
+from .throttle_signatures import (
+    PERMISSION_DENIED_FAILURE_KIND,
+    is_headless_permission_denial,
+    is_provider_auth_failure,
+    match_quota_tail,
+    match_throttle_tail,
+)
 from .worktree import (
     LiveWorkerRedispatchError,
     ReworkBranchConflictError,
@@ -71,59 +75,19 @@ PROMPT_FILENAME = CLAUDE_CODE_PROMPT_FILENAME
 
 logger = logging.getLogger(__name__)
 
-# Provider throttle signatures — matched against session log tails to classify
-# failure kinds. The defaults are sourced from RuntimeConfig so there is a single
-# default list; callers can override via config for new provider phrasings.
-# Matching itself (substring + "resets in N minutes" extraction) is unified in
-# throttle_signatures.match_throttle_tail, shared with the devin_shell sibling
-# adapter (PR #262 review findings F1/F5).
-_DEFAULT_THROTTLE_ERROR_MARKERS = OrchestratorConfig().runtime.throttle_error_markers
-# Quota-exhaustion prose fallback markers — defaults sourced from
-# RuntimeConfig so there is a single default list; the structured
-# "cognition.ai/errorKind": "resource_exhausted" trailer and the
-# period-agnostic prose match live in throttle_signatures.match_quota_tail
-# (issue #1684), shared with the devin_shell sibling adapter.
-_DEFAULT_QUOTA_ERROR_MARKERS = OrchestratorConfig().runtime.quota_error_markers
-
-# Pattern for provider authentication failures (issue #484). Matched against the
-# log tail of api-kind sessions only — a dead/invalid API key against a custom
+# Provider authentication failures (issue #484): matched against the log tail
+# of api-kind sessions only — a dead/invalid API key against a custom
 # Anthropic-compatible endpoint surfaces as 401/403 or an explicit
 # authentication/invalid-api-key error. Auth failures must NOT masquerade as
 # generic throttles: they are classified as ``provider_auth`` and enter the
 # existing ``throttled_until`` cooldown so routing preflight falls back until
 # the key is fixed (a dead key will not self-heal in minutes).
 #
-# The bare HTTP status codes 401/403 are anchored with word boundaries (\b) so
-# a coincidental numeric substring in an unrelated log tail (e.g. "error code
-# 14013", "4034 files processed", "issue #4019") cannot trip a false-positive
-# 24h cooldown. Every other pattern in this file (throttle markers, quota
-# phrases) matches natural-language substrings; the bare codes are the only
-# numeric tokens and would otherwise be the sole false-positive vector.
-_PROVIDER_AUTH_PATTERN = re.compile(
-    r"\b401\b|\b403\b|authentication(?:\s+failed)?|unauthorized|"
-    r"invalid[-\s]?api[-\s]?key|invalid[-\s]?authentication|"
-    r"permission_denied|auth(?:entication)?\s+error",
-    re.IGNORECASE,
-)
-
-# Headless permission-denial signature (issue #2010): a ``claude -p`` session
-# that cannot answer a permission prompt ends by asking the operator to
-# approve command execution. That is a config defect, not a blocked task, so
-# it gets its own failure kind (``permission_denied``) instead of escalating.
-PERMISSION_DENIED_FAILURE_KIND = "permission_denied"
-_HEADLESS_PERMISSION_DENIAL_PATTERN = re.compile(
-    r"approve\s+(?:the\s+)?(?:command|bash|tool)\s+execution|"
-    r"requires?\s+(?:your\s+)?approval|"
-    r"(?:command|tool)\s+(?:was|were)\s+(?:denied|not\s+allowed)|"
-    r"permission\s+to\s+run\s+(?:this|these|the)\s+(?:command|bash)",
-    re.IGNORECASE,
-)
-
-
-def is_headless_permission_denial(text: str) -> bool:
-    """True when ``text`` (a log tail or outcome detail) shows the headless
-    permission-denial signature."""
-    return bool(_HEADLESS_PERMISSION_DENIAL_PATTERN.search(text))
+# Headless permission-denial classification (issue #2010) lives in
+# ``throttle_signatures`` beside the other log-tail signatures (consumed by
+# ``worker_fate.classify_failure``); re-exported here because this module is
+# the public home consumers (workflow, doctor, tests) import it from.
+# (Listed in ``__all__`` below.)
 
 
 def worker_permission_denied(sessions_dir: Path, issue_number: int, detail: str = "") -> bool:
@@ -143,76 +107,16 @@ def worker_permission_denied(sessions_dir: Path, issue_number: int, detail: str 
     return is_headless_permission_denial(log_text[-2048:])
 
 
-# Provider account suspension / insufficient-balance responses (issue #1342).
-# Matched against the log tail of api-kind sessions only — a suspended provider
-# account (e.g. Moonshot "Error: suspended due to insufficient balance, please
-# recharge your account") is a TERMINAL billing failure that will not self-heal
-# in minutes, so it must NOT enter the rate-limit backoff loop. It is classified
-# as ``provider_suspended`` with NO cooldown (terminal), and
-# ``provider_suspended`` sits in ``config.DETERMINISTIC_ESCALATION_FAILURE_KINDS``
-# so the issue escalates to an operator on the first occurrence instead of
-# burning the redispatch cap.
+# N3 (wf-review-opus.md, wf-8-review-fixes): the matching pattern itself now
+# lives in ``throttle_signatures.is_provider_auth_failure`` (single point of
+# enforcement) instead of a byte-duplicate compiled here and again in
+# ``worker_fate.py`` — see that function's docstring for the word-boundary
+# 401/403 false-positive rationale.
 #
-# Structural anchor (PR #1426 round-2 review): the billing phrase alone is NOT
-# enough — it must co-occur on the SAME log line with a structural API-error
-# signal, enforced by ``_provider_suspension_in_tail``. The anchor is either an
-# HTTP 402 (Payment Required) status code (word-boundary, like the 401/403 auth
-# pattern) or a CLI error-rendering line prefix (``Error:`` / ``API Error:``).
-# Without this anchor the phrase regex matches the suspension trigger when it
-# appears only as quoted or reviewed prose — e.g. a worker reviewing this very
-# fix whose log contains the trigger phrase inside a code string or prose
-# sentence — and Signal 2.5 in ``classify_worker_health`` then kills that live
-# worker as DEAD (self-inflicted). The anchor cannot be a bare prose phrase:
-# 402 is a numeric token that does not appear in prose about the suspension, and
-# ``Error:``/``API Error:`` is the CLI's structured error-rendering marker, not a
-# mid-sentence quote. This is distinct from the provider-auth pattern
-# (401/403/invalid-key — a credential problem) and the quota-exhaustion pattern
-# ("usage limit" — a usage-ceiling problem).
-_PROVIDER_SUSPENDED_PHRASE = re.compile(
-    r"insufficient\s+(?:balance|funds|credit)"
-    r"|account\s+(?:is\s+)?suspended"
-    r"|suspended\s+due\s+to\s+(?:insufficient\s+balance|billing|payment|unpaid)"
-    r"|recharge\s+your\s+account"
-    r"|please\s+recharge",
-    re.IGNORECASE,
-)
-# The structural API-error signal that must co-occur on the same log line as a
-# billing phrase (see ``_provider_suspension_in_tail``). The ``Error:`` /
-# ``API Error:`` prefix is anchored to the START of the line (after optional
-# whitespace) because that is the CLI's error-rendering marker — a code string
-# or prose sentence that merely quotes ``Error: suspended ...`` (e.g. a worker
-# catting this PR's own test fixtures) does not start with ``Error:`` and so is
-# not treated as a real API error. HTTP 402 (Payment Required) is matched
-# word-boundary anywhere on the line, mirroring the 401/403 auth pattern.
-_PROVIDER_SUSPENDED_ANCHOR = re.compile(
-    r"^\s*(?:api\s+)?error\s*:|\b402\b",
-    re.IGNORECASE,
-)
-
-
-def _provider_suspension_in_tail(tail: str) -> bool:
-    """Return True if the log tail contains a structurally-anchored provider
-    account-suspension signature (issue #1342).
-
-    The billing phrase (``_PROVIDER_SUSPENDED_PHRASE``) must co-occur on the
-    SAME log line with a structural API-error signal
-    (``_PROVIDER_SUSPENDED_ANCHOR`` — HTTP 402 or a CLI ``Error:``/``API
-    Error:`` prefix). The phrase alone is not enough: a worker that merely
-    quotes or reviews the suspension trigger (e.g. a session reviewing this
-    very fix) would otherwise be misclassified — and, in
-    ``classify_worker_health``'s Signal 2.5, killed as DEAD mid-session.
-    Requiring the anchor on the same line makes the phrase's surrounding
-    prose/code context a non-match.
-    """
-    for line in tail.splitlines():
-        if _PROVIDER_SUSPENDED_PHRASE.search(line) and _PROVIDER_SUSPENDED_ANCHOR.search(line):
-            return True
-    return False
-
-
-# Default cooldown durations when we can't parse a specific reset time
-_DEFAULT_RATE_LIMIT_COOLDOWN_MINUTES = 15
-_DEFAULT_QUOTA_COOLDOWN_HOURS = 24
+# Provider account suspension / insufficient-balance classification (issue
+# #1342) moved to ``worker_fate._provider_suspension_in_tail`` as part of the
+# ``classify_failure`` merge (design doc §7); the classifier itself is now
+# ``worker_fate.classify_for``, which the sidecar writer below calls.
 
 _WIN_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 
@@ -636,126 +540,6 @@ def parse_claude_events(events_path: Path) -> ClaudeProgress | None:
     )
 
 
-def _classify_session_failure(
-    log_path: Path,
-    throttle_error_markers: Sequence[str] | None = None,
-    *,
-    quota_error_markers: Sequence[str] | None = None,
-    resume_margin_seconds: int = 0,
-    adapter_kind: str = "claude-code",
-    now: datetime | None = None,
-) -> tuple[str | None, str | None]:
-    """Classify a session failure by matching the log tail against provider throttle signatures.
-
-    Returns a tuple of (failure_kind, throttled_until_iso):
-    - failure_kind: "provider_suspended" | "rate_limited" | "quota_exhausted" |
-      "provider_auth" | None
-    - throttled_until_iso: ISO timestamp when the cooldown ends, or None if not
-      applicable (None for ``provider_suspended`` — terminal, no cooldown)
-
-    This is called after a session exits to detect provider throttling and set a cool-down window.
-
-    ``quota_error_markers`` is the prose-fallback list for quota exhaustion
-    (``RuntimeConfig.quota_error_markers``); the structured
-    ``cognition.ai/errorKind`` trailer is always checked first, regardless
-    of the marker list (issue #1684). Defaults to the config module's
-    default list when not provided.
-
-    ``resume_margin_seconds`` is an extra safety margin past the provider's
-    reported reset (or fixed quota cooldown) time. Provider reset estimates are
-    floors, not guarantees, and dispatching at T+0 races the actual reset
-    (issue #499).
-
-    ``adapter_kind`` selects provider-auth classification (issue #484): when
-    ``"api"``, the log tail is also matched against 401/403/authentication
-    patterns. Auth failures are checked BEFORE throttle markers so a dead API
-    key does not masquerade as a generic throttle. On a ``provider_auth`` match,
-    the cooldown reuses the existing quota-exhaustion constant (24h) — a dead
-    key needs human intervention, not a 15-minute retry window.
-
-    ``now`` is the injectable clock (mirrors ``devin_shell._classify_session_
-    failure`` / ``get_rate_limit_defer_until``): defaults to
-    ``datetime.now(UTC)`` when not supplied, so production behavior is
-    byte-identical (issue #822).
-    """
-    if not log_path.exists():
-        return None, None
-
-    try:
-        log_text = log_path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return None, None
-
-    resolved_now = now if now is not None else datetime.now(UTC)
-
-    # Check the last 2KB of the log (where error messages appear)
-    tail = log_text[-2048:] if len(log_text) > 2048 else log_text
-
-    # Provider account-suspension classification (api only, issue #1342).
-    # Checked BEFORE auth/quota/throttle so a suspended account is never
-    # retried as a transient rate-limit. A suspended account is a terminal
-    # billing failure: it returns ``provider_suspended`` with NO cooldown
-    # (the account will not self-heal) and escalates to an operator on the
-    # first occurrence via ``DETERMINISTIC_ESCALATION_FAILURE_KINDS``.
-    if adapter_kind == "api" and _provider_suspension_in_tail(tail):
-        return "provider_suspended", None
-
-    # Provider-auth classification (api only, issue #484). Checked before
-    # quota/throttle so an auth failure is never relabeled as a generic
-    # throttle. A dead API key reuses the quota-exhaustion cooldown (24h)
-    # rather than the short rate-limit cooldown — the key will not self-heal.
-    if adapter_kind == "api" and _PROVIDER_AUTH_PATTERN.search(tail):
-        cooldown = timedelta(hours=_DEFAULT_QUOTA_COOLDOWN_HOURS, seconds=resume_margin_seconds)
-        throttled_until = resolved_now + cooldown
-        return "provider_auth", throttled_until.replace(microsecond=0).isoformat().replace(
-            "+00:00", "Z"
-        )
-
-    # Check for quota exhaustion first (more severe). Single point of
-    # enforcement (throttle_signatures.match_quota_tail) shared with the
-    # devin_shell sibling adapter — the structured "cognition.ai/errorKind":
-    # "resource_exhausted" trailer is matched before the config-driven prose
-    # markers so provider wording drift ("daily" -> "weekly", issue #1684)
-    # cannot defeat the classification.
-    quota_markers = (
-        quota_error_markers if quota_error_markers is not None else _DEFAULT_QUOTA_ERROR_MARKERS
-    )
-    if match_quota_tail(tail, quota_markers):
-        # Quota exhaustion uses a fixed 24-hour cooldown regardless of reset time
-        cooldown = timedelta(hours=_DEFAULT_QUOTA_COOLDOWN_HOURS, seconds=resume_margin_seconds)
-        throttled_until = resolved_now + cooldown
-        return "quota_exhausted", throttled_until.replace(microsecond=0).isoformat().replace(
-            "+00:00", "Z"
-        )
-
-    # Check for rate limiting / provider throttling using configurable substrings.
-    # Single point of enforcement (throttle_signatures.match_throttle_tail) shared
-    # with devin_shell._classify_session_failure / get_rate_limit_defer_until.
-    markers = (
-        throttle_error_markers
-        if throttle_error_markers is not None
-        else _DEFAULT_THROTTLE_ERROR_MARKERS
-    )
-    matched, reset_minutes = match_throttle_tail(tail, markers)
-    if matched:
-        cooldown = timedelta(
-            minutes=reset_minutes
-            if reset_minutes is not None
-            else _DEFAULT_RATE_LIMIT_COOLDOWN_MINUTES,
-            seconds=resume_margin_seconds,
-        )
-        throttled_until = resolved_now + cooldown
-        return "rate_limited", throttled_until.replace(microsecond=0).isoformat().replace(
-            "+00:00", "Z"
-        )
-
-    # Issue #2010: last, so throttle/auth signatures still win.
-    if is_headless_permission_denial(tail):
-        return PERMISSION_DENIED_FAILURE_KIND, None
-
-    return None, None
-
-
 def _write_json_atomic(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_suffix(path.suffix + ".tmp")
@@ -1013,7 +797,7 @@ def run_quota_probe(*, repo_root: Path, config: OrchestratorConfig) -> bool:
 
     Returns True ("green") only when the process exits 0 AND its combined
     stdout+stderr shows no quota/auth/rate-limit throttle signature --
-    reusing the exact patterns ``_classify_session_failure`` applies to a
+    reusing the exact patterns ``worker_fate.classify_for`` applies to a
     real worker's log tail (single point of enforcement, PR #262 findings
     F1/F5) so a session that exits 0 with an embedded, in-band throttle
     message is never misread as recovery. Never raises: ``run_captured``
@@ -1032,7 +816,7 @@ def run_quota_probe(*, repo_root: Path, config: OrchestratorConfig) -> bool:
     )
     combined = f"{result.stdout}\n{result.stderr}"
     tail = combined[-2048:] if len(combined) > 2048 else combined
-    if _PROVIDER_AUTH_PATTERN.search(tail):
+    if is_provider_auth_failure(tail):
         return False
     if match_quota_tail(tail, config.runtime.quota_error_markers):
         return False
@@ -1764,27 +1548,6 @@ def _get_process_start_time(pid: int) -> float | None:
             return None
 
 
-def is_worker_alive(record: ClaudeWorkerRecord) -> bool:
-    """Check whether the process behind ``record`` is still running.
-
-    Delegates to ``charlie_work.process_utils.is_pid_alive`` so liveness
-    semantics are enforced in a single place.  This avoids a hard `psutil`
-    dependency and the slow `tasklist` subprocess round trip.
-
-    Process identity is verified by checking that the current process start time
-    matches the recorded start time (captured at spawn).  A start-time probe
-    that returns ``None`` is treated as indeterminate and returns ``True`` rather
-    than reaping a potentially-live worker on a transient probe failure
-    (issue #360 criterion #1 / issue #343).
-
-    Legacy records without ``process_start_time`` fall back to pid-only liveness
-    (vulnerable to recycling but preserves backward compatibility).
-    """
-    if record.pid is None or record.pid <= 0:
-        return False
-    return is_pid_alive(record.pid, record.process_start_time)
-
-
 def update_worker_record_with_failure_classification(
     sessions_dir: Path,
     issue_number: int,
@@ -1800,7 +1563,7 @@ def update_worker_record_with_failure_classification(
     This reads the existing sidecar, classifies the failure from the log tail,
     and writes back an updated record with failure_kind set.
 
-    Log-tail classification (``_classify_session_failure``) always runs first.
+    Log-tail classification (``worker_fate.classify_for``) always runs first.
     If it detects a provider throttle signature (``rate_limited`` /
     ``quota_exhausted``) or a provider-auth failure (``provider_auth``, api
     only — issue #484), that classification wins — including its computed
@@ -1839,7 +1602,7 @@ def update_worker_record_with_failure_classification(
     for ``"api"``) and enables provider-auth classification (issue #484).
     Defaults to ``"claude-code"`` for backward compatibility.
 
-    ``now`` is forwarded to ``_classify_session_failure`` (issue #822's
+    ``now`` is forwarded to ``worker_fate.classify_for`` (issue #822's
     injectable clock); defaults to ``datetime.now(UTC)`` there when omitted.
 
     Returns a tuple of (failure_kind, throttled_until_iso) for the caller to
@@ -1881,12 +1644,15 @@ def update_worker_record_with_failure_classification(
             throttle_markers = None
             quota_markers = None
             resume_margin_seconds = 0
-        classified_kind, throttled_until = _classify_session_failure(
+        # Lazy: worker_fate reaches back into this module (profile table).
+        from . import worker_fate
+
+        classified_kind, throttled_until = worker_fate.classify_for(
+            adapter_kind,
             Path(log_path_str),
             throttle_markers,
             quota_error_markers=quota_markers,
             resume_margin_seconds=resume_margin_seconds,
-            adapter_kind=adapter_kind,
             now=now,
         )
 
@@ -1905,7 +1671,6 @@ __all__ = [
     "launch_claude_worker",
     "read_worker_records",
     "probe_claude",
-    "is_worker_alive",
     "PERMISSION_DENIED_FAILURE_KIND",
     "PROMPTING_PERMISSION_MODES",
     "is_headless_permission_denial",

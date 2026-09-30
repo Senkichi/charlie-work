@@ -44,13 +44,12 @@ its other in-lock probes (``find_worker_terminal_status``).
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from . import worker_fate
 from .dispatch_selection import _credit_worker_death
-from .state import set_throttled_until
-from .throttle_signatures import is_provider_throttle_failure
 from .worker import iter_workers
 
 if TYPE_CHECKING:
@@ -82,6 +81,43 @@ def _worker_view_for_entry(
     return matches[0] if len(matches) == 1 else None
 
 
+def _persist_on_locked_entry(
+    entry: dict[str, Any],
+    state: dict[str, Any],
+    issue_number: int,
+    failure: worker_fate.FailureEvidence,
+    *,
+    adapter_kind: str,
+    now: datetime,
+    source: str,
+) -> None:
+    """Persist ``failure`` via ``worker_fate.persist_failure`` and keep ``entry`` live.
+
+    ``persist_failure`` is pure and returns a new state whose ``issues`` entry
+    is a fresh mapping. The sweep, however, holds ``entry`` by reference and
+    keeps mutating it after this call (and, in the common case, ``entry`` IS
+    ``state["issues"][n]``), so the stamp is copied back onto ``entry`` --
+    only the keys the primitive changed, never a wholesale overwrite that
+    could revert the caller's in-flight edits -- and the caller's own object
+    is re-seated in ``state["issues"]`` when it was the stored entry before.
+    """
+    key = str(issue_number)
+    issues_before = state.get("issues")
+    before = issues_before.get(key) if isinstance(issues_before, dict) else None
+    new_state = worker_fate.persist_failure(
+        state, issue_number, failure, adapter_kind=adapter_kind, now=now, source=source
+    )
+    state.update(new_state)
+    stamped = new_state.get("issues", {}).get(key) if isinstance(new_state, dict) else None
+    if not isinstance(stamped, dict):
+        return
+    missing = object()
+    prior = before if isinstance(before, dict) else {}
+    entry.update({k: v for k, v in stamped.items() if prior.get(k, missing) != v})
+    if before is entry:
+        state["issues"][key] = entry
+
+
 def resolve_dead_worker_failure_kind(
     entry: dict[str, Any],
     sessions_dir: Path,
@@ -106,12 +142,12 @@ def resolve_dead_worker_failure_kind(
     signature, or a kind a previous lane already wrote into the sidecar)
     resolves.
 
-    When the helper resolves a kind it is stamped onto
-    ``entry["dead_worker_failure_kind"]`` -- the same field the classifier
-    lane writes through ``record_dead_worker_failure_kind``, mutated in
-    place on the caller's locked state entry -- and a returned
-    ``throttled_until`` arms the fleet-wide provider cooldown via
-    ``set_throttled_until``. Arming here is required, not redundant: the
+    When the helper resolves a kind it is stamped onto the issue entry
+    through ``worker_fate.persist_failure`` -- the same single write primitive
+    the classifier lane uses -- and a returned ``throttled_until`` arms the
+    fleet-wide provider cooldown in the same call. The caller's locked
+    ``entry`` stays live (see ``_persist_on_locked_entry``); an issue with no
+    entry in ``state`` is never invented. Arming here is required, not redundant: the
     helper writes ``failure_kind`` to the sidecar, so the classifier lane's
     later call returns the stamp WITHOUT re-running the tail match --
     ``throttled_until`` comes back None there and the cooldown would never
@@ -123,13 +159,13 @@ def resolve_dead_worker_failure_kind(
     produced real work (see ``classify_and_credit_dead_worker``), where a log
     tail quoting throttle markers is the #656 false-positive class.
 
-    ``state`` is mutated in place (``set_throttled_until`` returns a new
+    ``state`` is mutated in place (``persist_failure`` returns a new
     mapping; ``update`` folds its keys back into the locked dict). Returns
     the resolved kind, or None when the death stays unclassified -- the
     caller then applies the pre-#2002 behavior (a credit is still a real
     worker death, just not a provider exemption).
     """
-    stamped = entry.get("dead_worker_failure_kind")
+    stamped = worker_fate.persisted_failure(entry).kind
     if stamped is not None:
         return stamped
     if not classify_log:
@@ -138,39 +174,30 @@ def resolve_dead_worker_failure_kind(
     if view is None:
         return None
 
-    from .claude_code import update_worker_record_with_failure_classification
-    from .devin_shell import update_session_record_with_failure_classification
-
-    if view.adapter_kind == "devin":
-        failure_kind, throttled_until = update_session_record_with_failure_classification(
-            sessions_dir,
-            issue_number,
-            config=config,
-            now=now,
-        )
-    elif view.adapter_kind in ("claude-code", "api"):
-        failure_kind, throttled_until = update_worker_record_with_failure_classification(
-            sessions_dir,
-            issue_number,
-            config=config,
-            adapter_kind=view.adapter_kind,
-            now=now,
-        )
-    else:
+    # The Adapter seam (design doc §7): the profile supplies the sidecar
+    # classifier for this view's adapter, so no ``adapter_kind`` branch lives
+    # here. A profile with no classifier (command/manual) or an unknown kind
+    # stays unclassified, exactly as before.
+    profile = worker_fate.profile_for(view.adapter_kind)
+    if profile is None or profile.record_failure is None:
         return None
+    failure_kind, throttled_until = profile.record_failure(
+        sessions_dir,
+        issue_number,
+        config=config,
+        now=now,
+    )
     if failure_kind is None:
         return None
-    entry["dead_worker_failure_kind"] = failure_kind
-    if throttled_until:
-        state.update(
-            set_throttled_until(
-                state,
-                throttled_until,
-                source="dead_worker_classification",
-                reason=failure_kind,
-                adapter_kind=view.adapter_kind,
-            )
-        )
+    _persist_on_locked_entry(
+        entry,
+        state,
+        issue_number,
+        worker_fate.FailureEvidence.from_classification(failure_kind, throttled_until, fresh=True),
+        adapter_kind=view.adapter_kind,
+        now=now if now is not None else datetime.now(UTC),
+        source="dead_worker_classification",
+    )
     return failure_kind
 
 
@@ -202,7 +229,7 @@ def classify_and_credit_dead_worker(
     false-positive class) must not arm a fleet-wide throttle from a worker
     that produced a PR. That death is still credited, as unclassified.
 
-    A provider-throttle kind (``is_provider_throttle_failure`` -- the
+    A provider-throttle kind (``worker_fate.persisted_failure(...).is_throttle`` -- the
     #1684/#1917 exemption) suppresses the credit: the death is a global
     provider condition, not a worker-quality signal, and must not count
     toward ``worker_death_at`` caps. Every other outcome credits the death
@@ -215,6 +242,9 @@ def classify_and_credit_dead_worker(
     failure_kind = resolve_dead_worker_failure_kind(
         entry, sessions_dir, issue_number, state, config, now=now, classify_log=classify_log
     )
-    if not is_provider_throttle_failure(failure_kind):
+    # Rule 6 read side (worker_fate.persisted_failure): resolution above has
+    # stamped ``dead_worker_failure_kind`` on ``entry`` whenever it resolved a
+    # kind, so the stamp read agrees with ``failure_kind``.
+    if not worker_fate.persisted_failure(entry).is_throttle:
         entry["worker_death_at"] = _credit_worker_death(entry, at=at, kind=failure_kind)
     return failure_kind

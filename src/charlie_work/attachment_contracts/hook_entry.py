@@ -34,6 +34,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import IO, Mapping
 
+from charlie_work import markdown_fence
 from charlie_work.attachment_contracts import baseline_dir
 from charlie_work.attachment_contracts.baseline import TamperError
 from charlie_work.attachment_contracts.check import check_file
@@ -236,31 +237,41 @@ def parse_advisories_comment(body: str) -> tuple[AdvisoryRecord, ...] | None:
     if not isinstance(body, str) or not body.lstrip().startswith(ADVISORY_COMMENT_MARKER):
         return None
 
-    # Extract the first fenced block after the marker. A fenced block opens
-    # with a line of three-or-more backticks (optionally tagged ``json``) and
-    # closes with the next line of three-or-more backticks. Anything between
-    # is the JSON payload. Tolerant of ``\\r\\n`` line endings.
-    lines = body.splitlines()
-    fence_open_index: int | None = None
-    for i, line in enumerate(lines):
-        if line.lstrip().startswith("```"):
-            fence_open_index = i
+    # Extract the first fenced block after the marker. Fence detection is
+    # ``markdown_fence.scan`` (architecture-deepening candidate 3, "markdown
+    # structure"): CommonMark backtick/tilde fences, a closer that must be
+    # the same character and at least as long as its opener, and an
+    # unclosed fence running to end-of-text -- replacing a prior model that
+    # treated ANY 3+-backtick line as both a valid opener and a valid
+    # closer regardless of length or character, so a decoy 3-backtick line
+    # inside a 4-backtick-opened payload could truncate it early. Tolerant
+    # of ``\\r\\n`` line endings (``markdown_fence.split_lines`` inside
+    # ``scan``) -- ``lines`` below must use the same helper, not
+    # ``str.splitlines()``, or a non-CommonMark separator could desync it
+    # from ``fence.start``/``fence.end``.
+    # Try every fence in order and take the first whose body decodes to a
+    # JSON list, so an unrelated earlier fence (``~~~`` note) or a
+    # tab/list-indented payload fence the strict scan rejects (origin/main's
+    # ``lstrip`` accepted it) cannot mask the payload (md-r3 N2): strict
+    # CommonMark structure first, then the any-indent scan as a fallback.
+    decoded = None
+    for structure in (markdown_fence.scan(body), markdown_fence.scan(body, max_indent=None)):
+        lines = markdown_fence.split_lines(body)
+        for fence in structure.fences:
+            content_end = fence.end - 1 if fence.closed else fence.end
+            payload_text = "\n".join(lines[fence.start + 1 : content_end]).strip()
+            if not payload_text:
+                continue
+            try:
+                candidate = json.loads(payload_text)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(candidate, list):
+                decoded = candidate
+                break
+        if decoded is not None:
             break
-    if fence_open_index is None:
-        return ()
-    fence_body: list[str] = []
-    for line in lines[fence_open_index + 1 :]:
-        if line.lstrip().startswith("```"):
-            break
-        fence_body.append(line)
-    payload_text = "\n".join(fence_body).strip()
-    if not payload_text:
-        return ()
-    try:
-        decoded = json.loads(payload_text)
-    except json.JSONDecodeError:
-        return ()
-    if not isinstance(decoded, list):
+    if decoded is None:
         return ()
     records: list[AdvisoryRecord] = []
     for element in decoded:

@@ -307,8 +307,8 @@ def test_status_includes_stalled_section(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    # Mock is_session_alive to return True for PID 99999 so detection runs
-    with patch("charlie_work.worker.is_session_alive", return_value=True):
+    # Mock worker_fate.is_alive to return True for PID 99999 so detection runs
+    with patch("charlie_work.worker_fate.is_alive", return_value=True):
         result = app.status()
 
     # Check that stalled section contains the issue number and pid
@@ -390,8 +390,8 @@ def test_status_stalled_section_unchanged(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    # Mock is_session_alive to return True for PID 99999 so detection runs
-    with patch("charlie_work.worker.is_session_alive", return_value=True):
+    # Mock worker_fate.is_alive to return True for PID 99999 so detection runs
+    with patch("charlie_work.worker_fate.is_alive", return_value=True):
         result = app.status()
 
     # Check that the stalled section keeps its base shape plus the issue #261

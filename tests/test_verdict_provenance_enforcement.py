@@ -332,7 +332,7 @@ def test_reap_review_verdicts_payload_carries_both_provenance_fields(
     events_path.write_text(
         "\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8"
     )
-    monkeypatch.setattr("charlie_work.claude_code.is_worker_alive", lambda *_: False)
+    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: False)
 
     result = app._reap_review_verdicts(reviews_dir)
 

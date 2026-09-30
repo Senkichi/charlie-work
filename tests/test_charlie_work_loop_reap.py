@@ -537,7 +537,7 @@ def test_loop_reaps_stalled_session_with_no_candidates(tmp_path: Path) -> None:
     fake_gh.prs = []
 
     # Mock the liveness check to return True (simulating a live but stalled process)
-    with patch("charlie_work.worker.is_session_alive", return_value=True):
+    with patch("charlie_work.worker_fate.is_alive", return_value=True):
         result = app.loop()
 
     # The loop should complete and the stalled session should be reaped
@@ -621,7 +621,7 @@ def test_loop_advances_inconclusive_probe_deferral_counter_once_per_pass(
         )
 
     # Worker process is gone; the probe cannot corroborate either way.
-    monkeypatch.setattr("charlie_work.worker.is_session_alive", lambda record: False)
+    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: False)
     monkeypatch.setattr("charlie_work.worker.real_activity_probe_for", _inconclusive_probe)
     # Neutralize the sibling lanes (see docstring) so only the stall-lane
     # sweeps driven by loop()/dispatch()/dispatch_rework() touch the sidecar.

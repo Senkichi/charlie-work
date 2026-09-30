@@ -247,12 +247,20 @@ def test_every_src_set_throttled_until_call_site_passes_source_literal() -> None
                 if isinstance(func, ast.Attribute)
                 else None
             )
-            if called != "set_throttled_until":
+            if called not in {"set_throttled_until", "persist_failure"}:
                 continue
             keyword = next((kw for kw in node.keywords if kw.arg == "source"), None)
             rel = f"{path.name}:{node.lineno}"
             if keyword is None:
                 violations.append(f"{rel}: missing source=")
+            elif (
+                path.name in {"worker_fate.py", "dead_worker_classification.py"}
+                and isinstance(keyword.value, ast.Name)
+                and keyword.value.id == "source"
+            ):
+                # Forwarders of their own required ``source`` parameter; the
+                # outermost callers are checked here as literal sites.
+                continue
             elif not (
                 isinstance(keyword.value, ast.Constant)
                 and isinstance(keyword.value.value, str)
@@ -345,7 +353,7 @@ def test_stall_lane_rate_limit_defer_emits_throttle_window_set(
         lambda pid, start_time=None: [pid],
     )
     monkeypatch.setattr(dead_worker_reap, "sweep_orphan_processes", lambda worktree_path: [])
-    monkeypatch.setattr("charlie_work.worker.is_session_alive", lambda record: True)
+    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: True)
     monkeypatch.setattr("charlie_work.worker.real_activity_probe_for", _stale_devin_probe)
 
     config = OrchestratorConfig(
@@ -400,7 +408,7 @@ def test_stall_lane_reap_emits_throttle_window_set(
         lambda pid, start_time=None: [pid],
     )
     monkeypatch.setattr(dead_worker_reap, "sweep_orphan_processes", lambda worktree_path: [])
-    monkeypatch.setattr("charlie_work.worker.is_session_alive", lambda record: True)
+    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: True)
     monkeypatch.setattr("charlie_work.worker.real_activity_probe_for", _stale_devin_probe)
 
     config = OrchestratorConfig(
