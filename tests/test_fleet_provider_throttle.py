@@ -39,7 +39,11 @@ def _throttle(paths, *, until: datetime, reason="rate_limited", adapter="devin")
     save_state(
         paths.state_file,
         set_throttled_until(
-            load_state(paths.state_file), _iso(until), reason=reason, adapter_kind=adapter
+            load_state(paths.state_file),
+            _iso(until),
+            reason=reason,
+            adapter_kind=adapter,
+            source="test",
         ),
     )
 

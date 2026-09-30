@@ -107,7 +107,11 @@ def _expire_window(paths, *, minutes_ago: int = 1) -> None:
     save_state(
         paths.state_file,
         set_throttled_until(
-            load_state(paths.state_file), until, reason="rate_limited", adapter_kind=ADAPTER
+            load_state(paths.state_file),
+            until,
+            reason="rate_limited",
+            adapter_kind=ADAPTER,
+            source="test",
         ),
     )
 
