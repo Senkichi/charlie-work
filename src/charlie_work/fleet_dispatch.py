@@ -17,6 +17,7 @@ from typing import Any, Callable
 from .config import (
     ApiWorkerConfig,
     ConfigError,
+    FleetSupervisorConfig,
     OrchestratorConfig,
     RunnerCapacityEscalationConfig,
     SupervisorConfig,
@@ -1855,7 +1856,7 @@ def fleet_loop(
             or <= 0 disables enforcement (the pass always runs every
             prologue/repo, matching pre-#1832 behavior) -- the supervisor
             always passes its configured
-            ``SupervisorConfig.max_pass_runtime_seconds`` (nonzero by
+            ``FleetSupervisorConfig.max_pass_runtime_seconds`` (nonzero by
             default), so this only goes unenforced for direct/CLI callers
             that do not pass it.
         pass_clock: Injectable monotonic clock for the deadline check, so
@@ -2903,6 +2904,13 @@ def run_fleet_supervise(
     if max_runtime_override is not None:
         overrides["max_runtime_minutes"] = max_runtime_override
     cfg = replace(global_config.supervisor, **overrides)
+    # Fleet-only knobs live on the fleet-scoped section (issue #1978). The
+    # getattr fallback tolerates a config object built by code that predates
+    # the section (the same stand-in shape ``_run_fleet_allocation_prologue``
+    # already tolerates), resolving to the dataclass defaults.
+    fleet_cfg = getattr(global_config, "fleet_supervisor", None)
+    if fleet_cfg is None:
+        fleet_cfg = FleetSupervisorConfig()
     # The supervisor's private self-bookkeeping root is resolved via the
     # dedicated helper, which binds the phantom-state-dir opt-out (#1754).
     state_root = supervisor_runtime_paths(global_config.runtime.state_dir).root
@@ -3025,7 +3033,9 @@ def run_fleet_supervise(
     # relaunch converging on a healthy supervisor. Checked once at startup,
     # same as the abnormal-exit detection above, since each wedge-kill is
     # exactly what produces a fresh supervisor start here.
-    wedge_loop = detect_wedge_kill_loop(fleet_dir_override, threshold=cfg.wedge_kill_loop_alarm)
+    wedge_loop = detect_wedge_kill_loop(
+        fleet_dir_override, threshold=fleet_cfg.wedge_kill_loop_alarm
+    )
     if wedge_loop is not None:
         record_wedge_kill_loop(fleet_dir_override, wedge_loop)
         print(
@@ -3060,8 +3070,8 @@ def run_fleet_supervise(
         pid=os.getpid(),
         started_at=started_at_iso,
         full_pass_interval_seconds=full_pass_interval,
-        max_pass_runtime_seconds=cfg.max_pass_runtime_seconds,
-        wedge_kill_loop_alarm=cfg.wedge_kill_loop_alarm,
+        max_pass_runtime_seconds=fleet_cfg.max_pass_runtime_seconds,
+        wedge_kill_loop_alarm=fleet_cfg.wedge_kill_loop_alarm,
     )
 
     # Record where ci_fleet was actually imported from plus the sibling
@@ -3105,9 +3115,9 @@ def run_fleet_supervise(
     reap_scheduler: tuple[threading.Thread, threading.Event] | None = None
 
     try:
-        if cfg.reap_sweep_interval_seconds > 0:
+        if fleet_cfg.reap_sweep_interval_seconds > 0:
             reap_scheduler = _start_fleet_reap_scheduler(
-                interval_seconds=cfg.reap_sweep_interval_seconds,
+                interval_seconds=fleet_cfg.reap_sweep_interval_seconds,
                 fleet_dir_override=fleet_dir_override,
                 repos=repos,
                 dry_run=dry_run,
@@ -3171,9 +3181,9 @@ def run_fleet_supervise(
                     state_root=state_root,
                     fleet_dir_override=fleet_dir_override,
                     dry_run=dry_run,
-                    failure_alarm_threshold=cfg.self_deploy_failure_alarm,
-                    pull_ci_fleet=cfg.self_deploy_pull_ci_fleet,
-                    starvation_seconds=cfg.dependency_sync_starvation_seconds,
+                    failure_alarm_threshold=fleet_cfg.self_deploy_failure_alarm,
+                    pull_ci_fleet=fleet_cfg.self_deploy_pull_ci_fleet,
+                    starvation_seconds=fleet_cfg.dependency_sync_starvation_seconds,
                 )
                 if not drain_state.draining
                 else None
@@ -3344,12 +3354,12 @@ def run_fleet_supervise(
                 # lifts automatically the pass the sync finally lands.
                 drain=drain_state.draining or (deploy is not None and deploy.starved),
                 # Issue #1832: cooperative in-pass deadline, enforced from the
-                # same SupervisorConfig field the external wedge-kill
+                # same FleetSupervisorConfig field the external wedge-kill
                 # watchdog's stale bound derives from (3x this), and the same
                 # injectable monotonic clock already used for this loop's own
                 # max_runtime check -- so a deadline test can control both
                 # without a real sleep.
-                deadline_seconds=cfg.max_pass_runtime_seconds,
+                deadline_seconds=fleet_cfg.max_pass_runtime_seconds,
                 pass_clock=clock,
             )
             labels_ensure_pending = False
@@ -3498,7 +3508,7 @@ def run_fleet_supervise(
                 orchestrator_root(),
                 repo_passes=total_repo_passes,
                 repos_configured=_fleet_has_configured_repos(fleet_dir_override, repos),
-                threshold=cfg.zero_pass_alarm,
+                threshold=fleet_cfg.zero_pass_alarm,
             )
         except Exception as streak_exc:  # noqa: BLE001 - bookkeeping must not alter exit semantics
             logger.warning(
