@@ -144,3 +144,49 @@ def test_repo_from_repository_url_rejects_malformed(url):
     from charlie_work.github_capabilities.cross_repo_blockers import repo_from_repository_url
 
     assert repo_from_repository_url(url) is None
+
+
+def _install_graphql(monkeypatch, tmp_path: Path, nodes: list[dict]):
+    """Fake gh whose batched GraphQL dependency query succeeds with ``nodes``."""
+    calls: list[str] = []
+
+    def fake_run(command, **kwargs):
+        if command[0] == "git":
+            return subprocess.CompletedProcess(
+                command, 0, stdout=f"https://github.com/{LOCAL}.git\n", stderr=""
+            )
+        calls.append(command[2])
+        if command[2] != "graphql":
+            return subprocess.CompletedProcess(command, 1, stdout="", stderr="HTTP 500")
+        data = {
+            "data": {
+                "repository": {
+                    "i_459": {"number": 459, "blockedBy": {"nodes": nodes, "pageInfo": {}}}
+                }
+            }
+        }
+        return subprocess.CompletedProcess(command, 0, stdout=json.dumps(data), stderr="")
+
+    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+    return github_module.GitHub(repo_root=tmp_path), calls
+
+
+def test_graphql_dependencies_keep_repo_identity_and_warm_cache(monkeypatch, tmp_path):
+    nodes = [
+        {"number": 60, "state": "OPEN", "repository": {"nameWithOwner": FOREIGN}},
+        {"number": 7, "state": "OPEN", "repository": {"nameWithOwner": LOCAL}},
+    ]
+    gh, calls = _install_graphql(monkeypatch, tmp_path, nodes)
+
+    deps = gh.issue_dependencies([459])[459]
+
+    assert deps == [CrossRepoBlocker(60, FOREIGN), 7]
+    assert isinstance(deps[0], CrossRepoBlocker)
+    assert not isinstance(deps[1], CrossRepoBlocker)
+
+    # The cache was warmed, so are_issues_open resolves both without refetching.
+    calls.clear()
+    assert gh.are_issues_open(deps) == set(deps)
+    assert calls == []
+    assert gh._list_cache[("issue_open", FOREIGN.lower(), 60)] is True
+    assert gh._list_cache[("issue_open", 7)] is True

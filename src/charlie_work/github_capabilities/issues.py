@@ -131,6 +131,10 @@ def get_github_issue_dependencies(gh: GitHubLike, issue_number: int) -> list[int
     for repos that don't have the feature enabled. Returns an empty list on any
     error (fail-open for compatibility).
 
+    Issue #2005: a dependency that lives in another repository is returned as
+    a ``CrossRepoBlocker`` (an ``int`` qualified by its ``owner/name``); a
+    same-repo dependency stays a plain ``int``.
+
     Successful resolutions (a real dependency list, including a legitimate
     empty one, and the 404/410 "feature not available" case) are cached in
     ``gh``'s pass-scoped ``_list_cache`` keyed ``("issue_dependencies",

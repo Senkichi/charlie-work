@@ -699,8 +699,10 @@ class Transport(CapabilityCollaborator):
     def _graphql_issue_dependencies(self, issue_numbers: list[int]) -> dict[int, list[int]]:
         """Fetch GitHub-native ``blockedBy`` dependencies for many issues at once.
 
-        Returns a mapping ``issue_number -> [blocker_number, ...]``. Also warms
-        the ``("issue_open", blocker_number)`` cache for the returned blockers
+        Returns a mapping ``issue_number -> [blocker, ...]`` where a blocker is
+        a plain ``int`` (same repo) or a ``CrossRepoBlocker`` (issue #2005).
+        Also warms the ``("issue_open", blocker_number)`` cache -- or
+        ``("issue_open", repo, blocker_number)`` for a cross-repo blocker --
         so the downstream ``are_issues_open`` call can avoid refetching them.
         """
         if not issue_numbers:

@@ -64,3 +64,20 @@ def make_blocker(number: int, repo: str | None, current_repo: str | None) -> int
     if current_repo is not None and repo.lower() == current_repo.lower():
         return number
     return CrossRepoBlocker(number, repo)
+
+
+def blocker_ref(blocker: int) -> int | str:
+    """JSON-stable, repo-qualified form of a blocker for state and event payloads.
+
+    A same-repo blocker stays a bare ``int``; a foreign one becomes
+    ``"owner/name#60"``. ``CrossRepoBlocker`` itself serialises to a bare
+    ``60`` (it is an ``int``), which would round-trip to the local issue.
+    """
+    if isinstance(blocker, CrossRepoBlocker):
+        return f"{blocker.repo}#{int(blocker)}"
+    return int(blocker)
+
+
+def blocker_refs(blockers: list[int]) -> list[int | str]:
+    """``blocker_ref`` over a list, preserving order."""
+    return [blocker_ref(b) for b in blockers]
