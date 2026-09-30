@@ -1,4 +1,4 @@
-4600
+2800
 # Issue #1934: +25 lines for SupervisorConfig.fleet_lane_concurrency and
 # SupervisorConfig.reap_sweep_interval_seconds (fields + _SUPERVISOR_INT_KEYS
 # validation entries). Dataclass fields cannot be extracted into a domain
@@ -9,10 +9,3 @@
 # build_config_from_data). A config field cannot be extracted into a domain
 # module, so this is a deliberate reviewed mark raise to the next
 # MARK_QUANTUM multiple above the live count (4218 -> 4400).
-# Issue #2086: +12 lines for WorkerRoleConfig/ReviewerRoleConfig.fallbacks
-# (frozen-dataclass fields + the `chain` property binding) and the two
-# role-section normalize calls + warn-only family check at the role build
-# sites. All parsing/validation/selection logic lives in role_chain.py /
-# role_selection.py / role_quota_ledger.py; only the fields and call sites
-# must live here. Reviewed mark raise to the next MARK_QUANTUM multiple
-# above the live count (4411 -> 4600).

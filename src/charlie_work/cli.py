@@ -57,7 +57,7 @@ from .fleet_status import (  # noqa: F401  (deliberate re-export)
     run_fleet_status,
 )
 from .fleet_stop import register_fleet_stop_subparser, run_fleet_stop
-from .global_config import load_layered_config
+from .global_config import load_fleet_global_config, load_layered_config
 from .github import (
     GitHub,
     GitHubError,
@@ -1240,27 +1240,19 @@ def run_fleet_work(args: argparse.Namespace) -> CommandResult:
     # Load global config for notifier integration (optional, may be None).
     # A failure here turns off every config-gated fleet behavior (notify and the
     # runner prologues), so it is reported rather than swallowed.
-    try:
-        global_config = load_layered_config(
-            Path.cwd(),
-            None,
-            fleet_dir_override=args.fleet_dir,
-            require_global=True,
-        )
-    except (ConfigError, RepoNotFoundError) as exc:
-        print(f"config load failed, fleet running without global config: {exc}", flush=True)
-        # The global layer is required, but the per-repo config is still valid
-        # and must not be discarded with it -- discarding both regresses the
-        # #623 silent-disable failure (every per-repo knob reverting to its
-        # dataclass default while passes keep reporting success). Reload
-        # without the global requirement so per-repo settings survive; only
-        # fall back to None if the per-repo load itself fails.
-        try:
-            global_config = load_layered_config(
-                Path.cwd(), None, fleet_dir_override=args.fleet_dir
-            )
-        except (ConfigError, RepoNotFoundError):
-            global_config = None
+    # The global layer is required, but the per-repo config is still valid and
+    # must not be discarded with it (#623); only a failing per-repo load too
+    # falls back to None. A host-wide ConstructionError is the one error that
+    # never degrades -- see load_fleet_global_config.
+    global_config = load_fleet_global_config(
+        load_layered_config,
+        Path.cwd(),
+        fleet_dir_override=args.fleet_dir,
+        fallback=None,
+        report=lambda exc: print(
+            f"config load failed, fleet running without global config: {exc}", flush=True
+        ),
+    )
 
     return fleet_loop(
         fleet_dir_override=args.fleet_dir,
@@ -1287,27 +1279,19 @@ def run_fleet_bash_rats(args: argparse.Namespace) -> CommandResult:
     # Load global config for notifier integration (optional, may be None).
     # A failure here turns off every config-gated fleet behavior (notify and the
     # runner prologues), so it is reported rather than swallowed.
-    try:
-        global_config = load_layered_config(
-            Path.cwd(),
-            None,
-            fleet_dir_override=args.fleet_dir,
-            require_global=True,
-        )
-    except (ConfigError, RepoNotFoundError) as exc:
-        print(f"config load failed, fleet running without global config: {exc}", flush=True)
-        # The global layer is required, but the per-repo config is still valid
-        # and must not be discarded with it -- discarding both regresses the
-        # #623 silent-disable failure (every per-repo knob reverting to its
-        # dataclass default while passes keep reporting success). Reload
-        # without the global requirement so per-repo settings survive; only
-        # fall back to None if the per-repo load itself fails.
-        try:
-            global_config = load_layered_config(
-                Path.cwd(), None, fleet_dir_override=args.fleet_dir
-            )
-        except (ConfigError, RepoNotFoundError):
-            global_config = None
+    # The global layer is required, but the per-repo config is still valid and
+    # must not be discarded with it (#623); only a failing per-repo load too
+    # falls back to None. A host-wide ConstructionError is the one error that
+    # never degrades -- see load_fleet_global_config.
+    global_config = load_fleet_global_config(
+        load_layered_config,
+        Path.cwd(),
+        fleet_dir_override=args.fleet_dir,
+        fallback=None,
+        report=lambda exc: print(
+            f"config load failed, fleet running without global config: {exc}", flush=True
+        ),
+    )
 
     # Self-deploy before running the pass: FF-pull origin/main and sync
     # dependencies when pyproject.toml/uv.lock changed. Non-fatal on a

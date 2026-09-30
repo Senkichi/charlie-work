@@ -3,8 +3,8 @@
 Architecture-deepening candidate 1 (``docs/superpowers/plans/
 2026-09-29-architecture-deepening.md``, design note in the Wave A scratchpad
 ``wf-design.md``). Today, "what happened to this worker" is decided by 13
-scattered sites (``workflow.py``, ``orphaned_worker_sweep.py``,
-``live_handoff_finalize.py``, ``rework_outcome.py``, ``dead_worker_reap.py``,
+scattered sites (``workflow.py``, the retired ``orphaned_worker_sweep.py``,
+``dead_worker_sweep/live_handoff.py``, ``rework_outcome.py``, the retired ``dead_worker_reap.py``,
 ``misc_worker_dispatch.py``) that disagree on nine points. This module is the
 single point of enforcement for all nine; ``resolve_fate`` is a pure function
 over gathered evidence, so every rule is testable as a decision table with no
@@ -52,7 +52,7 @@ read side feeds the persisted kind back in as ``FateEvidence.failure``
 tests patch ``charlie_work.worker_fate.is_alive`` and nothing else.
 
 Known exception to "this module owns post-exit fate": three consumers
-(``live_handoff_finalize``, ``misc_worker_dispatch``, ``rework_outcome``) use
+(``dead_worker_sweep.live_handoff``, ``misc_worker_dispatch``, ``rework_outcome``) use
 ``resolve_fate`` only as the rule-1/7 freshness filter and then route on the
 surviving ``basis.outcome``'s self-reported ``push_succeeded``/``head_sha``
 themselves. Their evidence shapes never resolve to ``PushedWithoutPr`` or

@@ -5,6 +5,7 @@ import os
 import subprocess
 import time
 import urllib.request
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -48,6 +49,31 @@ class AttentionDigest:
     generated_at: str
     repo: str
     transitions: tuple[AttentionEntry, ...]  # one per issue whose health changed this pass
+
+
+def reviewer_quota_alert_digest(
+    generated_at: str, repo: str, quota: Mapping[str, Any]
+) -> AttentionDigest:
+    """The once-per-episode REVIEWER_QUOTA_EXHAUSTED digest for ``quota``."""
+    return AttentionDigest(
+        generated_at=generated_at,
+        repo=repo,
+        transitions=(
+            AttentionEntry(
+                issue_number=0,
+                adapter_kind="reviewer",
+                health="REVIEWER_QUOTA_EXHAUSTED",
+                previous_health=None,
+                last_log_line=(
+                    f"throttled_until={quota.get('throttled_until')} "
+                    f"probe_after={quota.get('probe_after')}"
+                ),
+                pid=None,
+                terminal_tool=None,
+                terminal_reason="all reviewer launches deferred until the quota probe succeeds",
+            ),
+        ),
+    )
 
 
 @dataclass(frozen=True)

@@ -32,15 +32,15 @@ relocation does not grow that over-cap monolith (file-size ratchet, issue
 #1442) -- the same arrangement as ``capacity_starvation_escalation.py`` and
 ``deescalation_config.py``. ``config.py`` re-exports the dataclass and calls
 ``parse_fleet_supervisor`` from ``build_config_from_data``; this module must
-therefore not import ``config`` at module level (``ConfigError`` is imported
-lazily inside the parser -- the same pattern ``capacity_starvation_escalation``
-documents).
+therefore not import ``config`` at module level (it imports only ``config_validation``).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, fields
-from typing import Any, Mapping
+from typing import Annotated, Any, Mapping
+
+from .config_validation import BoolTolerant, FieldError, Typed, validate_section
 
 #: The top-level YAML section name. Referenced by ``config_deprecations``'s
 #: ``replacement`` strings and the parser below so the name is declared once.
@@ -122,51 +122,14 @@ class FleetSupervisorConfig:
     scheduler.
     """
 
-    max_pass_runtime_seconds: int = 1800
-    self_deploy_failure_alarm: int = 3
-    self_deploy_pull_ci_fleet: bool = False
-    zero_pass_alarm: int = 3
-    wedge_kill_loop_alarm: int = 3
-    dependency_sync_starvation_seconds: int = 14400
-    fleet_lane_concurrency: int = 8
-    reap_sweep_interval_seconds: int = 300
-
-
-# Derived from the dataclass, not hand-maintained: every ``fleet_supervisor``
-# key is either a bool or an int, and ``bool`` is an ``int`` subclass, so the
-# bool membership test runs first.
-_BOOL_KEYS: tuple[str, ...] = tuple(
-    f.name for f in fields(FleetSupervisorConfig) if isinstance(f.default, bool)
-)
-_INT_KEYS: tuple[str, ...] = tuple(
-    f.name for f in fields(FleetSupervisorConfig) if f.name not in _BOOL_KEYS
-)
-
-
-def _validate_typed_keys(section: dict[str, Any], section_name: str) -> None:
-    """Type-check the moved keys in one config section.
-
-    Mirrors the checks ``build_config_from_data`` ran inline for the
-    ``supervisor`` section before the move (same semantics: ``bool`` is not
-    rejected for int keys there either), applied per-location so the error
-    names the section the operator actually wrote.
-    """
-    from .config import ConfigError
-
-    for key in _INT_KEYS:
-        value = section.get(key)
-        if value is not None and not isinstance(value, int):
-            raise ConfigError(
-                f"config section '{section_name}' key '{key}' must be an int, "
-                f"got {type(value).__name__}"
-            )
-    for key in _BOOL_KEYS:
-        value = section.get(key)
-        if value is not None and not isinstance(value, bool):
-            raise ConfigError(
-                f"config section '{section_name}' key '{key}' must be a bool, "
-                f"got {type(value).__name__}"
-            )
+    max_pass_runtime_seconds: Annotated[int, Typed, BoolTolerant] = 1800
+    self_deploy_failure_alarm: Annotated[int, Typed, BoolTolerant] = 3
+    self_deploy_pull_ci_fleet: Annotated[bool, Typed] = False
+    zero_pass_alarm: Annotated[int, Typed, BoolTolerant] = 3
+    wedge_kill_loop_alarm: Annotated[int, Typed, BoolTolerant] = 3
+    dependency_sync_starvation_seconds: Annotated[int, Typed, BoolTolerant] = 14400
+    fleet_lane_concurrency: Annotated[int, Typed, BoolTolerant] = 8
+    reap_sweep_interval_seconds: Annotated[int, Typed, BoolTolerant] = 300
 
 
 def parse_fleet_supervisor(data: dict[str, Any]) -> FleetSupervisorConfig:
@@ -182,11 +145,15 @@ def parse_fleet_supervisor(data: dict[str, Any]) -> FleetSupervisorConfig:
 
     A key set in both locations to different values is a ``ConfigError``
     naming both -- silently picking one would make an operator's real intent
-    unresolvable. A key present but ``null`` counts as unset, matching the
-    validation's own ``is not None`` convention.
-    """
-    from .config import ConfigError
+    unresolvable. A legacy ``null`` is ignored, and a ``fleet_supervisor`` ``null``
+    yields to a non-null legacy value; with no legacy value the ``null`` is kept
+    (``None``, not the default -- the same null semantics as every other section).
 
+    Each location is validated on its own (the moved keys of the legacy
+    section are projected through the same ``FleetSupervisorConfig`` rules) so
+    the error names the section the operator actually wrote; the merged
+    result is then built once.
+    """
     new_section = data.get(FLEET_SUPERVISOR_SECTION)
     if not isinstance(new_section, dict):
         new_section = {}
@@ -194,19 +161,15 @@ def parse_fleet_supervisor(data: dict[str, Any]) -> FleetSupervisorConfig:
     if not isinstance(legacy_section, dict):
         legacy_section = {}
 
-    _validate_typed_keys(new_section, FLEET_SUPERVISOR_SECTION)
-    _validate_typed_keys(legacy_section, LEGACY_SUPERVISOR_SECTION)
-
-    valid = {f.name for f in fields(FleetSupervisorConfig)}
-    unknown = sorted(set(new_section) - valid)
-    if unknown:
-        raise ConfigError(
-            f"unknown key(s) in config section '{FLEET_SUPERVISOR_SECTION}': "
-            f"{', '.join(unknown)} (valid: {', '.join(sorted(valid))})"
-        )
-
+    moved = {f.name for f in fields(FleetSupervisorConfig)}
+    validate_section(FleetSupervisorConfig, new_section, path=FLEET_SUPERVISOR_SECTION)
+    validate_section(
+        FleetSupervisorConfig,
+        {k: v for k, v in legacy_section.items() if k in moved},
+        path=LEGACY_SUPERVISOR_SECTION,
+    )
     merged = _adopt_legacy_keys(new_section, legacy_section)
-    return FleetSupervisorConfig(**merged)
+    return validate_section(FleetSupervisorConfig, merged, path=FLEET_SUPERVISOR_SECTION)
 
 
 def _adopt_legacy_keys(
@@ -223,8 +186,6 @@ def _adopt_legacy_keys(
     and ``resolve_fleet_supervisor_layer`` (one merge layer) so the two
     paths cannot drift on what "both locations disagree" means.
     """
-    from .config import ConfigError
-
     merged = dict(new_section)
     for f in fields(FleetSupervisorConfig):
         key = f.name
@@ -235,13 +196,13 @@ def _adopt_legacy_keys(
             continue
         new_value = merged.get(key)
         if new_value is not None and new_value != legacy_value:
-            raise ConfigError(
-                f"config key '{key}' is set in both "
-                f"'{FLEET_SUPERVISOR_SECTION}' ({new_value!r}) and legacy "
-                f"'{LEGACY_SUPERVISOR_SECTION}' ({legacy_value!r}) with "
-                "different values; the legacy location is deprecated "
-                "(removal tracked by #1979) -- delete "
-                f"'{LEGACY_SUPERVISOR_SECTION}.{key}'"
+            raise FieldError(
+                f"{FLEET_SUPERVISOR_SECTION}.{key}",
+                f"one value across '{FLEET_SUPERVISOR_SECTION}' and legacy "
+                f"'{LEGACY_SUPERVISOR_SECTION}'",
+                f"{new_value!r} vs {legacy_value!r} (removal tracked by #1979); "
+                f"delete '{LEGACY_SUPERVISOR_SECTION}.{key}'",
+                "raw",
             )
         if new_value is None:
             merged[key] = legacy_value

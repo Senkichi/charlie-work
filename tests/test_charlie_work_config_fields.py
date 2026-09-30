@@ -70,7 +70,10 @@ runner_scaling:
   min_runners: "not-a-number"
 """
     )
-    with pytest.raises(ConfigError, match="must be an int"):
+    with pytest.raises(
+        ConfigError,
+        match=r"^runner_scaling\.min_runners: expected int, got 'not-a-number' \(str\)$",
+    ):
         load_config(config_file)
 
 
@@ -86,7 +89,9 @@ runner_scaling:
   managed_root: 123
 """
     )
-    with pytest.raises(ConfigError, match="must be a string"):
+    with pytest.raises(
+        ConfigError, match=r"^runner_scaling\.managed_root: expected string, got 123 \(int\)$"
+    ):
         load_config(config_file)
 
 
@@ -101,7 +106,9 @@ runner_scaling:
   enabled: "true"
 """
     )
-    with pytest.raises(ConfigError, match="must be a bool"):
+    with pytest.raises(
+        ConfigError, match=r"^runner_scaling\.enabled: expected bool, got 'true' \(str\)$"
+    ):
         load_config(config_file)
 
 
@@ -109,18 +116,19 @@ def test_auto_merge_config_rejects_stale_base_deadlock(tmp_path: Path) -> None:
     """Issue #368: require_current_base=True + update_open_prs='off' is a silent
     permanent merge deadlock, so it is rejected at config construction.
     """
-    from charlie_work.config import AutoMergeConfig, ConfigError, OrchestratorConfig, load_config
+    from charlie_work.config import (
+        AutoMergeConfig,
+        ConfigError,
+        build_config_from_data,
+        load_config,
+    )
 
-    with pytest.raises(ConfigError, match="permanent merge deadlock"):
-        AutoMergeConfig(require_current_base=True, update_open_prs="off")
-
-    with pytest.raises(ConfigError, match="permanent merge deadlock"):
-        AutoMergeConfig(require_current_base=True, update_open_prs=False)
-
-    with pytest.raises(ConfigError, match="permanent merge deadlock"):
-        OrchestratorConfig(
-            auto_merge=AutoMergeConfig(require_current_base=True, update_open_prs="off")
-        )
+    deadlock = r"^auto_merge\.require_current_base: expected false when .*permanent merge deadlock.*, got True$"
+    for strategy in ("off", False):
+        with pytest.raises(ConfigError, match=deadlock):
+            build_config_from_data(
+                {"auto_merge": {"require_current_base": True, "update_open_prs": strategy}}
+            )
 
     config_file = tmp_path / "orchestrator.config.yaml"
     config_file.write_text(
@@ -129,7 +137,7 @@ auto_merge:
   update_open_prs: off
 """
     )
-    with pytest.raises(ConfigError, match="permanent merge deadlock"):
+    with pytest.raises(ConfigError, match=deadlock):
         load_config(config_file)
 
     # Coherent combinations load without error.

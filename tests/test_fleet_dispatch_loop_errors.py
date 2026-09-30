@@ -434,8 +434,7 @@ def test_fleet_loop_real_unknown_config_key_reproduces_incident(
     assert mock_runtime_paths.call_count == 1
 
     message = result.data["repos"]["owner/repo1"]["message"]
-    assert "ConfigError" in message
-    assert "labels" in message
+    assert "labels: expected known keys" in message
     assert "totally_unknown_key" in message
 
     # (a) the failure is durably recorded to repo1's own events.db.

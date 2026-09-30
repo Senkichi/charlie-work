@@ -188,7 +188,10 @@ def test_config_with_retired_key_still_loads() -> None:
 
 def test_config_retired_key_must_still_be_bool() -> None:
     """Backward-compat parsing still validates the type."""
-    with pytest.raises(ConfigError, match="require_worker_github_token.*must be a bool"):
+    with pytest.raises(
+        ConfigError,
+        match=r"^dispatch\.require_worker_github_token: expected bool, got 'true' \(str\)$",
+    ):
         build_config_from_data({"dispatch": {"require_worker_github_token": "true"}})
 
 

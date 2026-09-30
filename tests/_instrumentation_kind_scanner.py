@@ -464,6 +464,27 @@ _ALLOWED_UNRESOLVED_KIND_SITES: tuple[_UnresolvedKindSite, ...] = (
         ),
     ),
     _UnresolvedKindSite(
+        path="dead_worker_sweep/apply_commits.py",
+        scope="_emit_under_lock",
+        source="commit.kind",
+        reason=(
+            "The sweep apply shell forwards the ``Emit`` commit's kind to "
+            "append_event. The literal is chosen where decide*.py builds the "
+            "commit, and tests/test_dws_event_kinds.py verifies every one of "
+            "those literals (and that the level-less ones are registered)."
+        ),
+    ),
+    _UnresolvedKindSite(
+        path="dead_worker_sweep/apply_stalled.py",
+        scope="_state_txn",
+        source="commit.event_kind",
+        reason=(
+            "The stalled-sweep apply shell forwards the ``StateTxn`` commit's "
+            "event_kind to append_event. The literal is chosen in "
+            "decide_stalled.py, verified by tests/test_dws_event_kinds.py."
+        ),
+    ),
+    _UnresolvedKindSite(
         path="orchestration/helpers_merge_outcomes.py",
         scope="_record_event",
         source="kind",
@@ -576,7 +597,7 @@ _ALLOWED_UNRESOLVED_KIND_SITES: tuple[_UnresolvedKindSite, ...] = (
         ),
     ),
     _UnresolvedKindSite(
-        path="dead_worker_reap.py",
+        path="dead_worker_sweep/effects_pr.py",
         scope="_attempt_salvage",
         source="salvage_skip_event_kind(skip_reason)",
         reason=(
@@ -594,7 +615,7 @@ _ALLOWED_UNRESOLVED_KIND_SITES: tuple[_UnresolvedKindSite, ...] = (
         source="salvage_skip_event_kind(skip_reason)",
         reason=(
             "Issue #1241: same salvage_skip_event_kind mapping as the "
-            "dead_worker_reap.py/_attempt_salvage entry above -- the reconcile "
+            "dead_worker_sweep/effects_pr.py/_attempt_salvage entry above -- the reconcile "
             "salvage lane and the workflow salvage lane share the single "
             "enforcement point in salvage_superseded.py. Both target literals "
             "are in _LEVEL_BY_KIND and verified by "

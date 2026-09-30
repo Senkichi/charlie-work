@@ -36,7 +36,9 @@ watchdog:
   worktree_mtime_enabled: "true"
 """,
     )
-    with pytest.raises(ConfigError, match="worktree_mtime_enabled.*must be a bool"):
+    with pytest.raises(
+        ConfigError, match=r"^watchdog\.worktree_mtime_enabled: expected bool, got "
+    ):
         load_config(config_file)
 
 
@@ -50,7 +52,10 @@ watchdog:
   worktree_mtime_threshold_minutes: "45"
 """,
     )
-    with pytest.raises(ConfigError, match="worktree_mtime_threshold_minutes.*must be an int"):
+    with pytest.raises(
+        ConfigError,
+        match=r"^watchdog\.worktree_mtime_threshold_minutes: expected int, got ",
+    ):
         load_config(config_file)
 
 
@@ -64,7 +69,9 @@ watchdog:
   worktree_mtime_max_depth: "4"
 """,
     )
-    with pytest.raises(ConfigError, match="worktree_mtime_max_depth.*must be an int"):
+    with pytest.raises(
+        ConfigError, match=r"^watchdog\.worktree_mtime_max_depth: expected int, got "
+    ):
         load_config(config_file)
 
 
@@ -83,7 +90,8 @@ watchdog:
 """,
     )
     with pytest.raises(
-        ConfigError, match="worktree_mtime_exclude_dirs.*must be a list of strings"
+        ConfigError,
+        match=r"^watchdog\.worktree_mtime_exclude_dirs\[1\]: expected string, got ",
     ):
         load_config(config_file)
 
@@ -254,7 +262,7 @@ def test_load_config_review_dispatch_override(tmp_path: Path) -> None:
 
 def test_load_config_review_dispatch_file_size_cap_lines_override(tmp_path: Path) -> None:
     """Issue #1445: ``review_dispatch.file_size_cap_lines`` is read from YAML
-    via the ``_RD_INT_KEYS`` wiring in ``build_config_from_data`` -- the
+    via the field metadata on ``ReviewDispatchConfig`` -- the
     ``review_dispatch:`` section (``ReviewDispatchConfig``), not the unrelated
     ``review:`` section (``ReviewConfig``)."""
     config_file = tmp_path / "orchestrator.config.yaml"
@@ -271,7 +279,7 @@ def test_load_config_review_dispatch_file_size_cap_lines_override(tmp_path: Path
 def test_load_config_review_dispatch_file_size_cap_lines_rejects_non_int(
     tmp_path: Path,
 ) -> None:
-    """Issue #1445: ``_RD_INT_KEYS`` validation rejects a non-int
+    """Issue #1445: ``ReviewDispatchConfig`` field validation rejects a non-int
     ``file_size_cap_lines`` in the ``review_dispatch:`` section."""
     config_file = tmp_path / "orchestrator.config.yaml"
     _write_config(
@@ -280,7 +288,10 @@ def test_load_config_review_dispatch_file_size_cap_lines_rejects_non_int(
   file_size_cap_lines: "not-an-int"
 """,
     )
-    with pytest.raises(ConfigError, match="review_dispatch.*file_size_cap_lines.*must be an int"):
+    with pytest.raises(
+        ConfigError,
+        match=r"^review_dispatch\.file_size_cap_lines: expected int, got ",
+    ):
         load_config(config_file)
 
 
@@ -317,7 +328,7 @@ def test_load_config_quota_probe_override(tmp_path: Path) -> None:
 def test_load_config_quota_probe_enabled_rejects_non_bool(tmp_path: Path) -> None:
     config_file = tmp_path / "orchestrator.config.yaml"
     _write_config(config_file, "quota_probe:\n  enabled: not-a-bool\n")
-    with pytest.raises(ConfigError, match="quota_probe.*enabled.*must be a bool"):
+    with pytest.raises(ConfigError, match=r"^quota_probe\.enabled: expected bool, got "):
         load_config(config_file)
 
 
@@ -347,7 +358,10 @@ def test_load_config_supervisor_self_deploy_pull_ci_fleet_rejects_non_bool(
     """A non-bool under the legacy ``supervisor:`` location still errors."""
     config_file = tmp_path / "orchestrator.config.yaml"
     _write_config(config_file, "supervisor:\n  self_deploy_pull_ci_fleet: not-a-bool\n")
-    with pytest.raises(ConfigError, match="supervisor.*self_deploy_pull_ci_fleet.*must be a bool"):
+    with pytest.raises(
+        ConfigError,
+        match=r"^supervisor\.self_deploy_pull_ci_fleet: expected bool, got ",
+    ):
         load_config(config_file)
 
 
@@ -357,14 +371,14 @@ def test_load_config_quota_probe_interval_minutes_rejects_non_positive(
 ) -> None:
     config_file = tmp_path / "orchestrator.config.yaml"
     _write_config(config_file, f"quota_probe:\n  interval_minutes: {value}\n")
-    with pytest.raises(ConfigError, match="quota_probe.*interval_minutes.*must be >= 1"):
+    with pytest.raises(ConfigError, match=r"^quota_probe\.interval_minutes: expected >= 1, got "):
         load_config(config_file)
 
 
 def test_load_config_quota_probe_interval_minutes_rejects_non_int(tmp_path: Path) -> None:
     config_file = tmp_path / "orchestrator.config.yaml"
     _write_config(config_file, "quota_probe:\n  interval_minutes: '15'\n")
-    with pytest.raises(ConfigError, match="quota_probe.*interval_minutes.*must be an int"):
+    with pytest.raises(ConfigError, match=r"^quota_probe\.interval_minutes: expected int, got "):
         load_config(config_file)
 
 
@@ -389,7 +403,7 @@ def test_load_config_reconcile_pass_terminal_state_alert_days_rejects_non_positi
     config_file = tmp_path / "orchestrator.config.yaml"
     _write_config(config_file, f"reconcile_pass:\n  terminal_state_alert_days: {value}\n")
     with pytest.raises(
-        ConfigError, match="reconcile_pass.*terminal_state_alert_days.*must be >= 1"
+        ConfigError, match=r"^reconcile_pass\.terminal_state_alert_days: expected >= 1, got "
     ):
         load_config(config_file)
 
@@ -400,7 +414,8 @@ def test_load_config_reconcile_pass_terminal_state_alert_days_rejects_non_int(
     config_file = tmp_path / "orchestrator.config.yaml"
     _write_config(config_file, "reconcile_pass:\n  terminal_state_alert_days: '2'\n")
     with pytest.raises(
-        ConfigError, match="reconcile_pass.*terminal_state_alert_days.*must be an int"
+        ConfigError,
+        match=r"^reconcile_pass\.terminal_state_alert_days: expected int, got ",
     ):
         load_config(config_file)
 
@@ -408,21 +423,23 @@ def test_load_config_reconcile_pass_terminal_state_alert_days_rejects_non_int(
 def test_load_config_quota_probe_model_rejects_empty(tmp_path: Path) -> None:
     config_file = tmp_path / "orchestrator.config.yaml"
     _write_config(config_file, "quota_probe:\n  model: '   '\n")
-    with pytest.raises(ConfigError, match="quota_probe.*model.*must not be empty"):
+    with pytest.raises(ConfigError, match=r"^quota_probe\.model: expected non-empty string, got "):
         load_config(config_file)
 
 
 def test_load_config_quota_probe_timeout_seconds_rejects_non_positive(tmp_path: Path) -> None:
     config_file = tmp_path / "orchestrator.config.yaml"
     _write_config(config_file, "quota_probe:\n  timeout_seconds: 0\n")
-    with pytest.raises(ConfigError, match="quota_probe.*timeout_seconds.*must be >= 1"):
+    with pytest.raises(ConfigError, match=r"^quota_probe\.timeout_seconds: expected >= 1, got "):
         load_config(config_file)
 
 
 def test_load_config_quota_probe_prompt_rejects_empty(tmp_path: Path) -> None:
     config_file = tmp_path / "orchestrator.config.yaml"
     _write_config(config_file, "quota_probe:\n  prompt: ''\n")
-    with pytest.raises(ConfigError, match="quota_probe.*prompt.*must not be empty"):
+    with pytest.raises(
+        ConfigError, match=r"^quota_probe\.prompt: expected non-empty string, got ''$"
+    ):
         load_config(config_file)
 
 
@@ -453,7 +470,7 @@ def test_load_config_event_ring_size_rejects_invalid(tmp_path: Path) -> None:
   event_ring_size: "lots"
 """,
     )
-    with pytest.raises(ConfigError, match="event_ring_size.*must be an int"):
+    with pytest.raises(ConfigError, match=r"^runtime\.event_ring_size: expected int, got "):
         load_config(config_file)
 
 
@@ -477,7 +494,7 @@ def test_load_config_event_ring_size_rejects_bool(tmp_path: Path) -> None:
   event_ring_size: true
 """,
     )
-    with pytest.raises(ConfigError, match="event_ring_size.*must be an int"):
+    with pytest.raises(ConfigError, match=r"^runtime\.event_ring_size: expected int, got "):
         load_config(config_file)
 
 
@@ -496,7 +513,7 @@ def test_load_config_event_ring_size_rejects_zero(tmp_path: Path) -> None:
   event_ring_size: 0
 """,
     )
-    with pytest.raises(ConfigError, match="event_ring_size.*must be >= 1"):
+    with pytest.raises(ConfigError, match=r"^runtime\.event_ring_size: expected >= 1, got "):
         load_config(config_file)
 
 
@@ -509,7 +526,7 @@ def test_load_config_event_ring_size_rejects_negative(tmp_path: Path) -> None:
   event_ring_size: -5
 """,
     )
-    with pytest.raises(ConfigError, match="event_ring_size.*must be >= 1"):
+    with pytest.raises(ConfigError, match=r"^runtime\.event_ring_size: expected >= 1, got "):
         load_config(config_file)
 
 
@@ -543,7 +560,10 @@ def test_load_config_escalated_label_repair_max_per_pass_rejects_non_int(
   escalated_label_repair_max_per_pass: "lots"
 """,
     )
-    with pytest.raises(ConfigError, match="escalated_label_repair_max_per_pass.*must be an int"):
+    with pytest.raises(
+        ConfigError,
+        match=r"^runtime\.escalated_label_repair_max_per_pass: expected int, got ",
+    ):
         load_config(config_file)
 
 
@@ -564,7 +584,10 @@ def test_load_config_escalated_label_repair_max_per_pass_rejects_bool(
   escalated_label_repair_max_per_pass: true
 """,
     )
-    with pytest.raises(ConfigError, match="escalated_label_repair_max_per_pass.*must be an int"):
+    with pytest.raises(
+        ConfigError,
+        match=r"^runtime\.escalated_label_repair_max_per_pass: expected int, got ",
+    ):
         load_config(config_file)
 
 
@@ -579,7 +602,9 @@ def test_load_config_escalated_label_repair_max_per_pass_rejects_negative(
   escalated_label_repair_max_per_pass: -1
 """,
     )
-    with pytest.raises(ConfigError, match="escalated_label_repair_max_per_pass.*must be >= 0"):
+    with pytest.raises(
+        ConfigError, match=r"^runtime\.escalated_label_repair_max_per_pass: expected >= 0, got "
+    ):
         load_config(config_file)
 
 
@@ -633,7 +658,7 @@ def test_load_config_gh_timeout_seconds_rejects_zero(tmp_path: Path) -> None:
   gh_timeout_seconds: 0
 """,
     )
-    with pytest.raises(ConfigError, match="gh_timeout_seconds.*must be > 0"):
+    with pytest.raises(ConfigError, match=r"^runtime\.gh_timeout_seconds: expected > 0, got "):
         load_config(config_file)
 
 
@@ -646,7 +671,7 @@ def test_load_config_gh_timeout_seconds_rejects_negative(tmp_path: Path) -> None
   gh_timeout_seconds: -1
 """,
     )
-    with pytest.raises(ConfigError, match="gh_timeout_seconds.*must be > 0"):
+    with pytest.raises(ConfigError, match=r"^runtime\.gh_timeout_seconds: expected > 0, got "):
         load_config(config_file)
 
 
@@ -660,7 +685,7 @@ def test_load_config_gh_timeout_seconds_rejects_bool(tmp_path: Path) -> None:
   gh_timeout_seconds: true
 """,
     )
-    with pytest.raises(ConfigError, match="gh_timeout_seconds.*must be a number"):
+    with pytest.raises(ConfigError, match=r"^runtime\.gh_timeout_seconds: expected number, got "):
         load_config(config_file)
 
 
@@ -673,7 +698,7 @@ def test_load_config_gh_timeout_seconds_rejects_non_number(tmp_path: Path) -> No
   gh_timeout_seconds: "120"
 """,
     )
-    with pytest.raises(ConfigError, match="gh_timeout_seconds.*must be a number"):
+    with pytest.raises(ConfigError, match=r"^runtime\.gh_timeout_seconds: expected number, got "):
         load_config(config_file)
 
 
@@ -709,7 +734,9 @@ def test_load_config_runtime_throttle_resume_margin_rejects_non_int(
   throttle_resume_margin_s: "90"
 """,
     )
-    with pytest.raises(ConfigError, match="throttle_resume_margin_s.*must be an int"):
+    with pytest.raises(
+        ConfigError, match=r"^runtime\.throttle_resume_margin_s: expected int, got "
+    ):
         load_config(config_file)
 
 
@@ -724,7 +751,9 @@ def test_load_config_runtime_throttle_resume_margin_rejects_negative(
   throttle_resume_margin_s: -1
 """,
     )
-    with pytest.raises(ConfigError, match="throttle_resume_margin_s.*must be >= 0"):
+    with pytest.raises(
+        ConfigError, match=r"^runtime\.throttle_resume_margin_s: expected >= 0, got "
+    ):
         load_config(config_file)
 
 
@@ -737,7 +766,10 @@ def test_load_config_readiness_no_ci_minutes_rejects_bool_true(tmp_path: Path) -
   readiness_no_ci_minutes: true
 """,
     )
-    with pytest.raises(ConfigError, match="readiness_no_ci_minutes.*must be an int"):
+    with pytest.raises(
+        ConfigError,
+        match=r"^auto_merge\.readiness_no_ci_minutes: expected int, got ",
+    ):
         load_config(config_file)
 
 
@@ -750,7 +782,10 @@ def test_load_config_readiness_no_ci_minutes_rejects_bool_false(tmp_path: Path) 
   readiness_no_ci_minutes: false
 """,
     )
-    with pytest.raises(ConfigError, match="readiness_no_ci_minutes.*must be an int"):
+    with pytest.raises(
+        ConfigError,
+        match=r"^auto_merge\.readiness_no_ci_minutes: expected int, got ",
+    ):
         load_config(config_file)
 
 
@@ -763,7 +798,9 @@ def test_load_config_readiness_no_ci_minutes_rejects_negative(tmp_path: Path) ->
   readiness_no_ci_minutes: -1
 """,
     )
-    with pytest.raises(ConfigError, match="readiness_no_ci_minutes.*must not be negative"):
+    with pytest.raises(
+        ConfigError, match=r"^auto_merge\.readiness_no_ci_minutes: expected >= 0, got "
+    ):
         load_config(config_file)
 
 
@@ -798,7 +835,9 @@ def test_load_config_stale_checks_grace_minutes_rejects_bool_true(tmp_path: Path
   stale_checks_grace_minutes: true
 """,
     )
-    with pytest.raises(ConfigError, match="stale_checks_grace_minutes.*must be an int"):
+    with pytest.raises(
+        ConfigError, match=r"^review\.stale_checks_grace_minutes: expected int, got "
+    ):
         load_config(config_file)
 
 
@@ -811,7 +850,10 @@ def test_load_config_stale_checks_grace_minutes_rejects_bool_false(tmp_path: Pat
   stale_checks_grace_minutes: false
 """,
     )
-    with pytest.raises(ConfigError, match="stale_checks_grace_minutes.*must be an int"):
+    with pytest.raises(
+        ConfigError,
+        match=r"^review\.stale_checks_grace_minutes: expected int, got ",
+    ):
         load_config(config_file)
 
 
@@ -824,7 +866,9 @@ def test_load_config_stale_checks_grace_minutes_rejects_negative(tmp_path: Path)
   stale_checks_grace_minutes: -1
 """,
     )
-    with pytest.raises(ConfigError, match="stale_checks_grace_minutes.*must not be negative"):
+    with pytest.raises(
+        ConfigError, match=r"^review\.stale_checks_grace_minutes: expected >= 0, got "
+    ):
         load_config(config_file)
 
 
@@ -859,7 +903,10 @@ def test_load_config_stale_checks_max_retriggers_rejects_bool_true(tmp_path: Pat
   stale_checks_max_retriggers: true
 """,
     )
-    with pytest.raises(ConfigError, match="stale_checks_max_retriggers.*must be an int"):
+    with pytest.raises(
+        ConfigError,
+        match=r"^review\.stale_checks_max_retriggers: expected int, got ",
+    ):
         load_config(config_file)
 
 
@@ -872,7 +919,10 @@ def test_load_config_stale_checks_max_retriggers_rejects_bool_false(tmp_path: Pa
   stale_checks_max_retriggers: false
 """,
     )
-    with pytest.raises(ConfigError, match="stale_checks_max_retriggers.*must be an int"):
+    with pytest.raises(
+        ConfigError,
+        match=r"^review\.stale_checks_max_retriggers: expected int, got ",
+    ):
         load_config(config_file)
 
 
@@ -885,7 +935,9 @@ def test_load_config_stale_checks_max_retriggers_rejects_negative(tmp_path: Path
   stale_checks_max_retriggers: -1
 """,
     )
-    with pytest.raises(ConfigError, match="stale_checks_max_retriggers.*must not be negative"):
+    with pytest.raises(
+        ConfigError, match=r"^review\.stale_checks_max_retriggers: expected >= 0, got "
+    ):
         load_config(config_file)
 
 
@@ -929,7 +981,10 @@ def test_load_config_foreign_issue_ref_confirm_passes_rejects_bool_true(
   foreign_issue_ref_confirm_passes: true
 """,
     )
-    with pytest.raises(ConfigError, match="foreign_issue_ref_confirm_passes.*must be an int"):
+    with pytest.raises(
+        ConfigError,
+        match=r"^review\.foreign_issue_ref_confirm_passes: expected int, got ",
+    ):
         load_config(config_file)
 
 
@@ -944,7 +999,10 @@ def test_load_config_foreign_issue_ref_confirm_passes_rejects_bool_false(
   foreign_issue_ref_confirm_passes: false
 """,
     )
-    with pytest.raises(ConfigError, match="foreign_issue_ref_confirm_passes.*must be an int"):
+    with pytest.raises(
+        ConfigError,
+        match=r"^review\.foreign_issue_ref_confirm_passes: expected int, got ",
+    ):
         load_config(config_file)
 
 
@@ -961,7 +1019,9 @@ def test_load_config_foreign_issue_ref_confirm_passes_rejects_below_one(
   foreign_issue_ref_confirm_passes: 0
 """,
     )
-    with pytest.raises(ConfigError, match="foreign_issue_ref_confirm_passes.*must be >= 1"):
+    with pytest.raises(
+        ConfigError, match=r"^review\.foreign_issue_ref_confirm_passes: expected >= 1, got "
+    ):
         load_config(config_file)
 
 
@@ -1001,7 +1061,10 @@ def test_load_config_foreign_issue_ref_reprobe_hours_rejects_bool_true(
   foreign_issue_ref_reprobe_hours: true
 """,
     )
-    with pytest.raises(ConfigError, match="foreign_issue_ref_reprobe_hours.*must be an int"):
+    with pytest.raises(
+        ConfigError,
+        match=r"^review\.foreign_issue_ref_reprobe_hours: expected int, got ",
+    ):
         load_config(config_file)
 
 
@@ -1016,7 +1079,10 @@ def test_load_config_foreign_issue_ref_reprobe_hours_rejects_bool_false(
   foreign_issue_ref_reprobe_hours: false
 """,
     )
-    with pytest.raises(ConfigError, match="foreign_issue_ref_reprobe_hours.*must be an int"):
+    with pytest.raises(
+        ConfigError,
+        match=r"^review\.foreign_issue_ref_reprobe_hours: expected int, got ",
+    ):
         load_config(config_file)
 
 
@@ -1031,7 +1097,9 @@ def test_load_config_foreign_issue_ref_reprobe_hours_rejects_negative(
   foreign_issue_ref_reprobe_hours: -1
 """,
     )
-    with pytest.raises(ConfigError, match="foreign_issue_ref_reprobe_hours.*must not be negative"):
+    with pytest.raises(
+        ConfigError, match=r"^review\.foreign_issue_ref_reprobe_hours: expected >= 0, got "
+    ):
         load_config(config_file)
 
 
@@ -1196,7 +1264,10 @@ def test_load_config_api_worker_enabled_rejects_unknown_provider(tmp_path: Path)
       cached_input_usd_per_mtok: 0.30
 """,
     )
-    with pytest.raises(ConfigError, match="not a key in api_worker.providers"):
+    with pytest.raises(
+        ConfigError,
+        match=r"^api_worker\.provider: expected a key in providers \(kimi-k3\), got ",
+    ):
         load_config(config_file)
 
 
@@ -1217,7 +1288,10 @@ def test_load_config_api_worker_enabled_rejects_empty_api_key_env(tmp_path: Path
       cached_input_usd_per_mtok: 0.30
 """,
     )
-    with pytest.raises(ConfigError, match="api_key_env.*must be a non-empty string"):
+    with pytest.raises(
+        ConfigError,
+        match=r"^api_worker\.providers\.kimi-k3\.api_key_env: expected non-empty string, got ",
+    ):
         load_config(config_file)
 
 
@@ -1256,7 +1330,9 @@ def test_load_config_api_worker_enabled_rejects_non_positive_pricing(
     kimi-k3:
 {provider_yaml}""",
     )
-    with pytest.raises(ConfigError, match=f"{field}.*must be > 0"):
+    with pytest.raises(
+        ConfigError, match=rf"^api_worker\.providers\.kimi-k3\.{field}: expected > 0, got "
+    ):
         load_config(config_file)
 
 
@@ -1305,7 +1381,10 @@ def test_load_config_api_worker_enabled_rejects_negative_cached_input_pricing(
       cached_input_usd_per_mtok: -0.1
 """,
     )
-    with pytest.raises(ConfigError, match="cached_input_usd_per_mtok.*must be >= 0"):
+    with pytest.raises(
+        ConfigError,
+        match=r"^api_worker\.providers\.kimi-k3\.cached_input_usd_per_mtok: expected >= 0, got ",
+    ):
         load_config(config_file)
 
 
@@ -1326,7 +1405,10 @@ def test_load_config_api_worker_rejects_missing_required_provider_key(
       output_usd_per_mtok: 15.0
 """,
     )
-    with pytest.raises(ConfigError, match="missing required key 'base_url'"):
+    with pytest.raises(
+        ConfigError,
+        match=r"^api_worker\.providers\.kimi-k3\.base_url: expected required key, got ",
+    ):
         load_config(config_file)
 
 
@@ -1338,7 +1420,10 @@ def test_load_config_api_worker_rejects_unknown_top_level_key(tmp_path: Path) ->
   unknown_key: value
 """,
     )
-    with pytest.raises(ConfigError, match=r"unknown key\(s\) in config section 'api_worker'"):
+    with pytest.raises(
+        ConfigError,
+        match=r"^api_worker: expected known keys \(valid: budget, enabled, max_concurrent_sessions, provider, providers, rework_template, worker_template\), got ",
+    ):
         load_config(config_file)
 
 
@@ -1359,7 +1444,10 @@ def test_load_config_api_worker_rejects_unknown_provider_key(tmp_path: Path) -> 
       extra: value
 """,
     )
-    with pytest.raises(ConfigError, match=r"providers\.kimi-k3.*has unknown key\(s\)"):
+    with pytest.raises(
+        ConfigError,
+        match=r"^api_worker\.providers\.kimi-k3: expected known keys \(valid: api_key_env, base_url, cached_input_usd_per_mtok, input_usd_per_mtok, model, output_usd_per_",
+    ):
         load_config(config_file)
 
 
@@ -1375,7 +1463,9 @@ def test_load_config_api_worker_rejects_bool_max_concurrent_sessions(
   max_concurrent_sessions: {str(value).lower()}
 """,
     )
-    with pytest.raises(ConfigError, match="max_concurrent_sessions.*must be an int"):
+    with pytest.raises(
+        ConfigError, match=r"^api_worker\.max_concurrent_sessions: expected int, got "
+    ):
         load_config(config_file)
 
 
@@ -1391,7 +1481,9 @@ def test_load_config_api_worker_rejects_invalid_types(tmp_path: Path) -> None:
     - not-a-mapping
 """,
     )
-    with pytest.raises(ConfigError, match="enabled.*must be a bool"):
+    with pytest.raises(
+        ConfigError, match=r"^api_worker\.enabled: expected bool, got 'true' \(str\)$"
+    ):
         load_config(config_file)
 
 
@@ -1404,7 +1496,9 @@ def test_load_config_api_worker_rejects_budget_negative(tmp_path: Path) -> None:
     max_usd_per_session: -1.0
 """,
     )
-    with pytest.raises(ConfigError, match="budget.max_usd_per_session.*must be >= 0"):
+    with pytest.raises(
+        ConfigError, match=r"^api_worker\.budget\.max_usd_per_session: expected >= 0, got "
+    ):
         load_config(config_file)
 
 
@@ -1897,7 +1991,7 @@ main_ci_reclaim:
   enabled: "true"
 """,
     )
-    with pytest.raises(ConfigError, match="main_ci_reclaim.*enabled.*must be a bool"):
+    with pytest.raises(ConfigError, match=r"^main_ci_reclaim\.enabled: expected bool, got "):
         load_config(config_file)
 
 
@@ -1910,7 +2004,9 @@ main_ci_reclaim:
   workflow_filename: 5
 """,
     )
-    with pytest.raises(ConfigError, match="main_ci_reclaim.*workflow_filename.*must be a string"):
+    with pytest.raises(
+        ConfigError, match=r"^main_ci_reclaim\.workflow_filename: expected string, got "
+    ):
         load_config(config_file)
 
 
@@ -1944,13 +2040,19 @@ main_ci_reclaim:
 
 def test_build_config_from_data_require_worker_github_token_rejects_non_bool() -> None:
     """Issue #1001: dispatch.require_worker_github_token must be a bool."""
-    with pytest.raises(ConfigError, match="require_worker_github_token.*must be a bool"):
+    with pytest.raises(
+        ConfigError,
+        match=r"^dispatch\.require_worker_github_token: expected bool, got ",
+    ):
         build_config_from_data({"dispatch": {"require_worker_github_token": "true"}})
 
 
 def test_build_config_from_data_archive_unreachable_local_commits_rejects_non_bool() -> None:
     """Issue #1944: dispatch.archive_unreachable_local_commits must be a bool."""
-    with pytest.raises(ConfigError, match="archive_unreachable_local_commits.*must be a bool"):
+    with pytest.raises(
+        ConfigError,
+        match=r"^dispatch\.archive_unreachable_local_commits: expected bool, got ",
+    ):
         build_config_from_data({"dispatch": {"archive_unreachable_local_commits": "false"}})
 
 
@@ -1962,19 +2064,27 @@ def test_build_config_from_data_archive_unreachable_local_commits_accepts_bool()
 
 def test_build_config_from_data_ci_capacity_headroom_ratio_rejects_non_number() -> None:
     """Issue #1770: dispatch.ci_capacity_headroom_ratio must be a number."""
-    with pytest.raises(ConfigError, match="ci_capacity_headroom_ratio.*must be a number"):
+    with pytest.raises(
+        ConfigError,
+        match=r"^dispatch\.ci_capacity_headroom_ratio: expected number, got ",
+    ):
         build_config_from_data({"dispatch": {"ci_capacity_headroom_ratio": "1.5"}})
 
 
 def test_build_config_from_data_ci_capacity_headroom_ratio_rejects_bool() -> None:
     """Issue #1770: bool is an int subclass -- must be rejected explicitly."""
-    with pytest.raises(ConfigError, match="ci_capacity_headroom_ratio.*must be a number"):
+    with pytest.raises(
+        ConfigError,
+        match=r"^dispatch\.ci_capacity_headroom_ratio: expected number, got ",
+    ):
         build_config_from_data({"dispatch": {"ci_capacity_headroom_ratio": True}})
 
 
 def test_build_config_from_data_ci_capacity_headroom_ratio_rejects_negative() -> None:
     """Issue #1770: dispatch.ci_capacity_headroom_ratio must be >= 0."""
-    with pytest.raises(ConfigError, match="ci_capacity_headroom_ratio.*must be >= 0"):
+    with pytest.raises(
+        ConfigError, match=r"^dispatch\.ci_capacity_headroom_ratio: expected >= 0, got "
+    ):
         build_config_from_data({"dispatch": {"ci_capacity_headroom_ratio": -0.5}})
 
 
@@ -2074,5 +2184,8 @@ def test_build_config_from_data_heartbeat_section_bare_string() -> None:
 def test_build_config_from_data_heartbeat_rejects_non_list_parked_labels() -> None:
     """Issue #2048: a non-list/non-string stale_mention_parked_labels raises
     ConfigError rather than iterating a junk value in __post_init__."""
-    with pytest.raises(ConfigError, match="stale_mention_parked_labels.*must be a list"):
+    with pytest.raises(
+        ConfigError,
+        match=r"^heartbeat\.stale_mention_parked_labels: expected list of label names or a string, got ",
+    ):
         build_config_from_data({"heartbeat": {"stale_mention_parked_labels": 42}})

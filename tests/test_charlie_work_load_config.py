@@ -30,7 +30,9 @@ auto_merge:
   failed_attempt_alarm: "three"
 """
     )
-    with pytest.raises(ConfigError, match="failed_attempt_alarm.*must be an int"):
+    with pytest.raises(
+        ConfigError, match=r"^auto_merge\.failed_attempt_alarm: expected int, got 'three' \(str\)$"
+    ):
         load_config(config_file)
 
 
@@ -110,7 +112,8 @@ auto_merge:
 """
     )
     with pytest.raises(
-        ConfigError, match="update_branch_strategy.*'front_of_train', 'broadcast', or 'off'"
+        ConfigError,
+        match=r"^auto_merge\.update_branch_strategy: expected one of 'front_of_train', 'broadcast', 'off', got 'sometimes'$",
     ):
         load_config(config_file)
 
@@ -168,7 +171,7 @@ def test_load_config_names_unknown_keys_and_section(tmp_path: Path) -> None:
     else:  # pragma: no cover
         raise AssertionError("expected ConfigError")
 
-    assert "section 'review'" in message
+    assert message.startswith("review: expected known keys")
     assert "max_rework_cylces" in message
     assert "max_rework_cycles" in message  # valid keys listed for the operator
 
@@ -295,7 +298,7 @@ def test_load_config_rejects_unknown_test_adequacy_key(tmp_path: Path) -> None:
     else:  # pragma: no cover
         raise AssertionError("expected ConfigError for unknown test_adequacy key")
 
-    assert "section 'test_adequacy'" in message
+    assert message.startswith("test_adequacy: expected known keys")
     assert "bad_key" in message
     # Should list valid keys
     assert "enabled" in message
@@ -318,6 +321,6 @@ def test_load_config_rejects_unknown_coverage_probe_key(tmp_path: Path) -> None:
     else:  # pragma: no cover
         raise AssertionError("expected ConfigError for unknown coverage_probe key")
 
-    assert "section 'coverage_probe'" in message
+    assert message.startswith("coverage_probe: expected known keys")
     assert "bad_key" in message
     assert "enabled" in message

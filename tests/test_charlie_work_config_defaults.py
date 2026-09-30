@@ -346,7 +346,10 @@ supervisor:
   poll_interval_seconds: "not-an-int"
 """
     )
-    with pytest.raises(ConfigError, match="must be an int"):
+    with pytest.raises(
+        ConfigError,
+        match=r"^supervisor\.poll_interval_seconds: expected int, got 'not-an-int' \(str\)$",
+    ):
         load_config(config_file)
 
 
@@ -355,7 +358,7 @@ def test_supervisor_config_self_deploy_failure_alarm_wrong_type_raises(tmp_path:
 
     Issue #817 item 5 added this field alongside the existing supervisor int
     fields; the supervisor section has its own manual int-type-validation
-    tuple in config.py (separate from the generic _build_section machinery),
+    tuple in config.py (separate from the generic validate_section machinery),
     which needed the new key added explicitly. Locks that in so a future
     refactor of the tuple can't silently drop validation for this field.
     """
@@ -368,7 +371,10 @@ supervisor:
   self_deploy_failure_alarm: "not-an-int"
 """
     )
-    with pytest.raises(ConfigError, match="must be an int"):
+    with pytest.raises(
+        ConfigError,
+        match=r"^supervisor\.self_deploy_failure_alarm: expected int, got 'not-an-int' \(str\)$",
+    ):
         load_config(config_file)
 
 
@@ -377,7 +383,7 @@ def test_supervisor_config_zero_pass_alarm_wrong_type_raises(tmp_path: Path) -> 
 
     Issue #855 added this field alongside the existing supervisor int
     fields; the supervisor section has its own manual int-type-validation
-    tuple in config.py (separate from the generic _build_section machinery),
+    tuple in config.py (separate from the generic validate_section machinery),
     which needed the new key added explicitly -- mirrors
     test_supervisor_config_self_deploy_failure_alarm_wrong_type_raises.
     Locks that in so a future refactor of the tuple can't silently drop
@@ -392,7 +398,9 @@ supervisor:
   zero_pass_alarm: "not-an-int"
 """
     )
-    with pytest.raises(ConfigError, match="must be an int"):
+    with pytest.raises(
+        ConfigError, match=r"^supervisor\.zero_pass_alarm: expected int, got 'not-an-int' \(str\)$"
+    ):
         load_config(config_file)
 
 
@@ -403,7 +411,7 @@ def test_supervisor_config_dependency_sync_starvation_wrong_type_raises(
 
     Issue #1855 added this field alongside the existing supervisor int
     fields; the supervisor section has its own manual int-type-validation
-    tuple in config.py (separate from the generic _build_section machinery),
+    tuple in config.py (separate from the generic validate_section machinery),
     which needed the new key added explicitly -- mirrors
     test_supervisor_config_self_deploy_failure_alarm_wrong_type_raises.
     Locks that in so a future refactor of the tuple can't silently drop
@@ -418,7 +426,10 @@ supervisor:
   dependency_sync_starvation_seconds: "not-an-int"
 """
     )
-    with pytest.raises(ConfigError, match="must be an int"):
+    with pytest.raises(
+        ConfigError,
+        match=r"^supervisor\.dependency_sync_starvation_seconds: expected int, got 'not-an-int' \(str\)$",
+    ):
         load_config(config_file)
 
 
@@ -435,7 +446,10 @@ supervisor:
   fleet_lane_concurrency: "not-an-int"
 """
     )
-    with pytest.raises(ConfigError, match="must be an int"):
+    with pytest.raises(
+        ConfigError,
+        match=r"^supervisor\.fleet_lane_concurrency: expected int, got 'not-an-int' \(str\)$",
+    ):
         load_config(config_file)
 
 
@@ -452,7 +466,10 @@ supervisor:
   reap_sweep_interval_seconds: "not-an-int"
 """
     )
-    with pytest.raises(ConfigError, match="must be an int"):
+    with pytest.raises(
+        ConfigError,
+        match=r"^supervisor\.reap_sweep_interval_seconds: expected int, got 'not-an-int' \(str\)$",
+    ):
         load_config(config_file)
 
 

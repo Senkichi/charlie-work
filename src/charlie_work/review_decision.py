@@ -302,6 +302,41 @@ def record_decision(
     return review_decision(pr_dir, pr_state=None, current_head_sha=head_sha)
 
 
+_TERMINAL_DECISIONS = ("approved", "request_changes", "blocked")
+
+
+def classify_verdict_void(
+    decision: Any, reviewed_head_sha: Any, live_head_sha: Any, *, force: bool = False
+) -> tuple[bool, bool]:
+    """Return ``(voided_stale_verdict, force_voided_verdict)`` for a re-packet.
+
+    Only a real terminal decision can be voided. It is voided when it is pinned
+    to a stale (or no) head, or when ``force`` (issue #2081,
+    ``why-charlie-hate --force-rereview``) asks for it. ``force_voided`` is the
+    subset that ``force`` alone voided (verdict pinned to the live head).
+    """
+    is_terminal = decision in _TERMINAL_DECISIONS
+    stale_head = reviewed_head_sha is None or reviewed_head_sha != live_head_sha
+    return is_terminal and (force or stale_head), (force and is_terminal and not stale_head)
+
+
+def force_voided_event_payload(
+    live_decision: Mapping[str, Any],
+    pr_number: Any,
+    issue_number: Any,
+    head_sha: Any,
+) -> dict[str, Any]:
+    """Payload of the ``verdict_force_voided`` event (issue #2081)."""
+    return {
+        "pr_number": pr_number,
+        "issue_number": issue_number,
+        "voided_decision": live_decision.get("decision"),
+        "voided_reviewed_head_sha": live_decision.get("reviewed_head_sha"),
+        "verdict_provenance": live_decision.get("verdict_provenance"),
+        "head_sha": head_sha,
+    }
+
+
 def resolve_decision_payload(pr_dir: Path) -> dict[str, Any]:
     """Return the full recorded decision payload for ``pr_dir``, or ``{"decision": "missing"}``.
 
