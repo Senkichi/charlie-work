@@ -27,7 +27,7 @@ from typing import Any
 
 from charlie_work import worker_fate
 from charlie_work.adapters import SessionRequest
-from charlie_work.blocked_worker_escalation import is_exempt_blocked
+from charlie_work.blocked_worker_escalation import resolve_fate_exempting_blocked
 from charlie_work.config import WORKER_OUTCOME_FILENAME
 from charlie_work.dead_worker_reap import _emit_session_failed_relabeled
 from charlie_work.fleet_registry import try_acquire_fleet_lock
@@ -141,7 +141,7 @@ def _route_phantom_live_worker(
             )
         except OSError:
             outcome_mtime = None
-        fate = worker_fate.resolve_fate(
+        fate = resolve_fate_exempting_blocked(
             worker_fate.FateEvidence(
                 issue_number=issue_number,
                 adapter=w.adapter_kind,
@@ -172,6 +172,8 @@ def _route_phantom_live_worker(
                 ),
                 failure=None,
             ),
+            sessions_dir=sessions_dir,
+            issue_number=issue_number,
             now=datetime.now(UTC),
         )
         if on_fate is not None:
@@ -233,11 +235,13 @@ def _route_phantom_live_worker(
         # fresh `Blocked` fate with real branch evidence and escalates it
         # exactly as it already does for a dead worker.
         # Issue #2010: a permission-denial ``blocked`` (a worker-config defect
-        # the reaper lane will NOT escalate) is not deferred to that lane: it
-        # takes the ordinary path, exactly as on origin/main.
-        escalatable_blocked = isinstance(fate, worker_fate.Blocked) and not is_exempt_blocked(
-            fate, sessions_dir=sessions_dir, issue_number=issue_number
-        )
+        # the reaper lane will NOT escalate) is exempt. ``fate`` above was
+        # resolved by ``resolve_fate_exempting_blocked``, which drops that claim
+        # and re-resolves from the branch evidence, so such a worker with local
+        # commits is ``Stranded`` (preserved for salvage, as on origin/main) and
+        # one with none takes the ordinary reap path. A ``Blocked`` fate here is
+        # therefore always escalatable.
+        escalatable_blocked = isinstance(fate, worker_fate.Blocked)
         if (
             isinstance(fate, (worker_fate.Stranded, worker_fate.PushedWithoutPr))
             or escalatable_blocked

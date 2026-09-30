@@ -31,19 +31,28 @@ from charlie_work.state import (
     save_state,
 )
 from charlie_work.workflow import OrchestratorApp
+from charlie_work.worktree import create_worktree
 from _dispatch_fixtures import _stub_real_activity_probe_for_stalled_tests  # noqa: F401
 
 
 def _run_phantom_blocked_dispatch(
-    tmp_path: Path, monkeypatch: Any, outcome_payload: dict[str, Any]
+    tmp_path: Path,
+    monkeypatch: Any,
+    outcome_payload: dict[str, Any],
+    *,
+    with_commits: bool = True,
 ) -> tuple[Any, Path, FakeGitHub, Any]:
-    """Dispatch over a phantom live worker (dead PID, local commits) whose
-    worktree carries ``outcome_payload``; returns ``(result, sidecar_path,
-    fake_gh, paths)``."""
+    """Dispatch over a phantom live worker (dead PID; local commits ahead of
+    origin/main unless ``with_commits=False``) whose worktree carries
+    ``outcome_payload``; returns ``(result, sidecar_path, fake_gh, paths)``."""
     from charlie_work.config import WORKER_OUTCOME_FILENAME
 
     remote, repo_root = _init_bare_remote_and_clone(tmp_path)
-    worktree_path, branch = _setup_completed_worktree(repo_root, 1453)
+    if with_commits:
+        worktree_path, branch = _setup_completed_worktree(repo_root, 1453)
+    else:
+        branch = "agent/issue-1453"
+        worktree_path = create_worktree(repo_root, branch, base_ref="origin/main").path
     (worktree_path / WORKER_OUTCOME_FILENAME).write_text(
         json.dumps(outcome_payload),
         encoding="utf-8",
@@ -181,32 +190,62 @@ def test_dispatch_phantom_live_worker_preserves_sidecar_for_blocked_outcome(
     assert payload["worker_fate"] == "Blocked"
 
 
-def test_dispatch_phantom_permission_denial_blocked_is_not_deferred_to_the_reaper_lane(
-    tmp_path: Path, monkeypatch
-) -> None:
-    """Issue #2010: the reaper lane never escalates a permission-denial
-    ``blocked`` outcome, so deferring it (preserve sidecar + labels) would only
-    delay the ordinary reap-and-ready by a pass under a misleading
-    ``declared_blocked_preserved`` reason. Positive control: the sibling test
-    above, same bed with a genuine blocked reason, still preserves."""
-    _result, sidecar_path, fake_gh, paths = _run_phantom_blocked_dispatch(
-        tmp_path,
-        monkeypatch,
-        {
-            "outcome": "blocked",
-            "detail": "Bash was denied. If you approve command execution, I can finish.",
-            "push_succeeded": False,
-            "pr_created": False,
-        },
-    )
+_PERMISSION_DENIAL_BLOCKED = {
+    "outcome": "blocked",
+    "detail": "Bash was denied. If you approve command execution, I can finish.",
+    "push_succeeded": False,
+    "pr_created": False,
+}
 
-    reasons = [
+
+def _phantom_reasons(paths: Any) -> list[str]:
+    return [
         e["payload"]["reason"]
         for e in load_state(paths.state_file).get("events", [])
         if e["kind"] == "session_failed_relabeled" and e["payload"]["issue_number"] == 123
     ]
+
+
+def test_dispatch_phantom_permission_denial_blocked_is_not_deferred_to_the_reaper_lane(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Issue #2010: the reaper lane never escalates a permission-denial
+    ``blocked`` outcome, so it is never preserved as ``declared_blocked``. But
+    the exemption must not shadow the branch evidence either: a worker with
+    local commits ahead is ``Stranded`` (the blocked claim is dropped and the
+    fate re-resolved), so its sidecar and labels are PRESERVED for the reaper
+    lane's salvage, exactly as on origin/main (wf-r5). Reaping it here would
+    strand the unpublished commits. Positive control: the sibling test above,
+    same bed with a genuine blocked reason, is preserved as declared_blocked;
+    the no-commits sibling below is reaped-and-readied."""
+    _result, sidecar_path, fake_gh, paths = _run_phantom_blocked_dispatch(
+        tmp_path, monkeypatch, _PERMISSION_DENIAL_BLOCKED
+    )
+
+    reasons = _phantom_reasons(paths)
     assert "phantom_live_worker_declared_blocked_preserved" not in reasons
+    assert reasons.count("phantom_live_worker_completed_work_preserved") == 1, reasons
+    assert sidecar_path.exists(), "commits ahead: sidecar must be kept for salvage"
+    assert (123, "agent:in-progress") not in fake_gh.labels_removed
+    assert (123, "automated-ready") not in fake_gh.labels_added
+
+
+def test_dispatch_phantom_permission_denial_blocked_without_commits_is_reaped(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Issue #2010, no-commits half: an exempt permission-denial ``blocked``
+    phantom worker with nothing ahead of origin/main has nothing to salvage, so
+    it takes the ordinary reap-and-ready path (sidecar reaped, active label
+    stripped, ``automated-ready`` restored)."""
+    _result, sidecar_path, fake_gh, paths = _run_phantom_blocked_dispatch(
+        tmp_path, monkeypatch, _PERMISSION_DENIAL_BLOCKED, with_commits=False
+    )
+
+    reasons = _phantom_reasons(paths)
+    assert "phantom_live_worker_declared_blocked_preserved" not in reasons
+    assert "phantom_live_worker_completed_work_preserved" not in reasons
     assert not sidecar_path.exists()
+    assert (123, "agent:in-progress") in fake_gh.labels_removed
 
 
 def test_dispatch_phantom_stale_outcome_emits_worker_evidence_stale(

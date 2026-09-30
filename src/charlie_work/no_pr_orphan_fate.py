@@ -17,13 +17,12 @@ namespace so suite patches on ``charlie_work.workflow.<name>`` stay live).
 
 from __future__ import annotations
 
-import dataclasses
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from . import worker_fate
-from .blocked_worker_escalation import is_exempt_blocked
+from .blocked_worker_escalation import resolve_fate_exempting_blocked
 from .config import WORKER_OUTCOME_FILENAME
 from .state import parse_iso_timestamp
 
@@ -147,17 +146,13 @@ def resolve_pushed_orphan_fate(
 
     Issue #2010: a ``Blocked`` precompute whose outcome is the headless
     permission-denial signature is exempt from escalation
-    (``blocked_worker_escalation.is_exempt_blocked``), so it must not shadow
-    the pushed-branch fate either: its ``blocked`` claim is dropped here and
-    the remote ahead count decides, exactly as on origin/main (which never
-    read blocked-ness for the PR-open candidate).
+    (``blocked_worker_escalation.resolve_fate_exempting_blocked``), so it must not shadow
+    the pushed-branch fate either: ``resolve_fate_exempting_blocked`` drops its
+    ``blocked`` claim and the remote ahead count decides, exactly as on
+    origin/main (which never read blocked-ness for the PR-open candidate).
     """
     outcome = precompute.basis.outcome
-    if outcome is not None and is_exempt_blocked(
-        precompute, sessions_dir=sessions_dir, issue_number=issue_number
-    ):
-        outcome = dataclasses.replace(outcome, outcome=None)
-    return worker_fate.resolve_fate(
+    return resolve_fate_exempting_blocked(
         worker_fate.FateEvidence(
             issue_number=issue_number,
             adapter=_adapter(entry),
@@ -177,5 +172,7 @@ def resolve_pushed_orphan_fate(
             ),
             failure=None,
         ),
+        sessions_dir=sessions_dir,
+        issue_number=issue_number,
         now=now,
     )

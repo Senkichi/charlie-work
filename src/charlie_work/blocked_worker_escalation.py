@@ -7,7 +7,9 @@ decision branch) so the sweep stays under its file-size ratchet mark.
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Callable
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -56,6 +58,60 @@ def is_exempt_blocked(
             dict(fate.basis.outcome.raw), sessions_dir=sessions_dir, issue_number=issue_number
         )
         is None
+    )
+
+
+def resolve_fate_exempting_blocked(
+    evidence: worker_fate.FateEvidence,
+    *,
+    sessions_dir: Path,
+    issue_number: int,
+    now: datetime,
+) -> worker_fate.WorkerFate:
+    """``resolve_fate(evidence)``, deciding the #2010 exemption at the fate.
+
+    Row 1 (a fresh ``blocked`` claim) shadows every branch-evidence row, so a
+    permission-denial ``blocked`` that the gate refuses to escalate would still
+    mask the fate the branch supports (``Stranded``/``PushedWithoutPr``) and a
+    consumer that merely skips the escalation would fall through to a
+    reap-and-ready path that destroys unsalvaged work. When the resolved fate is
+    such an exempt ``Blocked``, the ``blocked`` claim is dropped from the
+    evidence and the fate re-resolved, so the branch evidence decides exactly as
+    if the worker had not declared ``blocked``. Push flags and ``head_sha`` are
+    kept: only the ``outcome`` verdict is cleared.
+
+    The single implementation for every consumer that routes on fate (the
+    dispatch-time phantom-worker path and the pushed-orphan lane), so the
+    exemption is evaluated once per resolution and the returned fate is
+    ``Blocked`` only when it is genuinely escalatable.
+    """
+    fate = worker_fate.resolve_fate(evidence, now=now)
+    if not is_exempt_blocked(fate, sessions_dir=sessions_dir, issue_number=issue_number):
+        return fate
+    worktree_outcome = evidence.worktree_outcome
+    terminal = evidence.terminal
+    return worker_fate.resolve_fate(
+        dataclasses.replace(
+            evidence,
+            worktree_outcome=(
+                dataclasses.replace(worktree_outcome, outcome=None)
+                if worktree_outcome is not None
+                else None
+            ),
+            terminal=(
+                dataclasses.replace(
+                    terminal,
+                    outcome=(
+                        dataclasses.replace(terminal.outcome, outcome=None)
+                        if terminal.outcome is not None
+                        else None
+                    ),
+                )
+                if terminal is not None
+                else None
+            ),
+        ),
+        now=now,
     )
 
 
