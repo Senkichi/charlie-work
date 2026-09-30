@@ -1,0 +1,7 @@
+info
+# Issue #2034: a dead rework worker no-oped but the required-CI summary was not
+# settled (the checks fetch returned None, or a required check is still pending,
+# missing, infra-failed, or infra-blocked), so the no-op drain deferred its
+# disposition to a later pass instead of guessing. Emitted once per head
+# (deduped by the no_op_deferred_head marker); bounded by the #654
+# dead-dispatched backstop.
