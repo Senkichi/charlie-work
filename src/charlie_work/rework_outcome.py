@@ -38,6 +38,7 @@ from typing import TYPE_CHECKING, Any
 from . import worker_fate
 from .config import WORKER_OUTCOME_FILENAME
 from .instrumentation import log_event
+from .iso_timestamp import parse_iso_timestamp
 from .process_utils import find_worker_terminal_status
 from .rework_prompts import _write_text_atomic
 from .state import load_state, state_lock
@@ -56,6 +57,38 @@ logger = logging.getLogger(__name__)
 # State key holding {issue_number: applied_head_sha} — the dedup record that
 # makes outcome application exactly-once per reported head.
 APPLIED_HEADS_KEY = "rework_outcome_applied_heads"
+
+# State key holding {issue_number: applied_at ISO timestamp}, written in the
+# same lock as APPLIED_HEADS_KEY. Lets the stranded-request_changes restorer
+# tell a verdict already answered by the applied outcome (verdict older) from
+# a fresh verdict recorded after it (issue #2092).
+APPLIED_AT_KEY = "rework_outcome_applied_at"
+
+
+def verdict_answered_by_applied_outcome(
+    state: dict[str, Any],
+    issue_number: int,
+    pr: dict[str, Any],
+    decision: dict[str, Any],
+) -> bool:
+    """True when a rework outcome was applied at the live head AFTER the verdict.
+
+    Missing/unparseable timestamps fail toward "not answered" so a genuinely
+    stranded verdict is still restored.
+    """
+    key = str(issue_number)
+    applied_heads = state.get(APPLIED_HEADS_KEY)
+    applied_at = state.get(APPLIED_AT_KEY)
+    if not isinstance(applied_heads, dict) or not isinstance(applied_at, dict):
+        return False
+    live_head = pr.get("headRefOid")
+    if not live_head or applied_heads.get(key) != live_head:
+        return False
+    outcome_ts = parse_iso_timestamp(applied_at.get(key))
+    verdict_ts = parse_iso_timestamp(decision.get("reviewed_at"))
+    if outcome_ts is None or verdict_ts is None:
+        return False
+    return outcome_ts > verdict_ts
 
 
 def _emit_event(
@@ -512,6 +545,9 @@ def apply_rework_worker_outcome(
         applied_heads = state.setdefault(APPLIED_HEADS_KEY, {})
         if isinstance(applied_heads, dict):
             applied_heads[str(issue_number)] = head_sha
+        applied_at = state.setdefault(APPLIED_AT_KEY, {})
+        if isinstance(applied_at, dict):
+            applied_at[str(issue_number)] = datetime.now(UTC).isoformat()
         state = write_gate.append_event(
             state,
             "rework_outcome_applied",
@@ -590,8 +626,10 @@ def apply_collected_rework_outcomes(
 
 
 __all__ = [
+    "APPLIED_AT_KEY",
     "APPLIED_HEADS_KEY",
     "apply_collected_rework_outcomes",
     "apply_rework_worker_outcome",
     "fresh_completed_worker_outcome",
+    "verdict_answered_by_applied_outcome",
 ]

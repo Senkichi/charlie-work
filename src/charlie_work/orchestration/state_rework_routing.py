@@ -13,6 +13,7 @@ import logging
 
 from charlie_work.checks import CheckSummary
 from charlie_work.labels import TransitionOutcome
+from charlie_work.rework_outcome import verdict_answered_by_applied_outcome
 from charlie_work import rescue as rescue_helpers
 import charlie_work.workflow as _wf
 
@@ -740,6 +741,16 @@ def _reroute_stranded_request_changes(
     issue_entry = state.get("issues", {}).get(str(issue_number), {})
     issue_status = issue_entry.get("status")
     if issue_status in _wf._REWORK_ALREADY_ROUTED_STATUSES:
+        return None
+    # Issue #2092: a verdict already answered by an applied rework outcome
+    # at this same head is not stranded -- the outcome (evidence / rebuttal /
+    # body-only round, no new commit) IS the answer, and the drain routes it
+    # to review. Re-routing here would bounce it straight back to rework and
+    # burn the no-op cap. Enforced here (not via the shared routed-status
+    # tuple) because ``reviewing`` is a legitimate stranded state for a
+    # verdict nobody answered. A verdict recorded AFTER the outcome (fresh
+    # review of the answer) is newer and still restorable.
+    if verdict_answered_by_applied_outcome(state, issue_number, pr, decision):
         return None
     # Local idempotency guard for the closed-issue skip (see docstring):
     # once the restorer has confirmed a CLOSED issue and recorded the

@@ -7,6 +7,7 @@ the ``test_review_queue_*`` command seam -- queue listing and read-only guarante
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from _fakes_github import FakeGitHub
@@ -332,6 +333,118 @@ def test_review_queue_reroutes_stranded_request_changes_and_is_idempotent(
     assert state_final["prs"]["693"]["status"] == "rework_requested"
     assert len(state_final["events"]) == events_before_second_pass
     assert app.gh.labels_added == labels_added_before_second_pass
+
+
+def _answered_verdict_app(
+    tmp_path: Path,
+    *,
+    verdict_age: timedelta,
+    outcome_age: timedelta,
+    applied_head: str,
+) -> Any:
+    """Issue #2092: request_changes at ``sha-2092`` with an applied rework
+    outcome at ``applied_head``; issue sits at ``reviewing`` (the drain's
+    post-route status)."""
+    now = datetime.now(UTC)
+    prs = [
+        {
+            "number": 2092,
+            "title": "Fix #2060: some change",
+            "url": "https://example.test/pull/2092",
+            "headRefName": "agent/issue-2060-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-2092",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #2060",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        },
+    ]
+    app = _review_queue_app(tmp_path, prs=prs, dry_run=False)
+    app.gh.issues = [
+        {
+            "number": 2060,
+            "title": "Fix search",
+            "url": "https://example.test/issues/2060",
+            "body": "Search is broken",
+            "labels": [],
+            "state": "OPEN",
+        }
+    ]
+    _write_review_packet(
+        tmp_path,
+        2092,
+        "sha-2092",
+        {
+            "decision": "request_changes",
+            "reviewed_head_sha": "sha-2092",
+            "reviewed_at": (now - verdict_age).isoformat(),
+            "required_changes": [],
+            "summary": "Run the full suite at a deep basetemp and fix the PR body.",
+            "escalated": False,
+        },
+    )
+    state = load_state(app.paths.state_file)
+    state["issues"]["2060"] = {"number": 2060, "status": "reviewing"}
+    state["rework_outcome_applied_heads"] = {"2060": applied_head}
+    state["rework_outcome_applied_at"] = {"2060": (now - outcome_age).isoformat()}
+    save_state(app.paths.state_file, state)
+    return app
+
+
+def test_review_queue_does_not_restrand_verdict_answered_by_applied_outcome(
+    tmp_path: Path,
+) -> None:
+    """Issue #2092: a no-commit rework outcome applied at the verdict's head
+    AFTER the verdict answers it; the restorer must not bounce the issue back
+    to rework (burning the no-op cap)."""
+    app = _answered_verdict_app(
+        tmp_path,
+        verdict_age=timedelta(hours=3),
+        outcome_age=timedelta(hours=1),
+        applied_head="sha-2092",
+    )
+
+    result = app.review_queue()
+
+    assert result.ok is True
+    state_after = load_state(app.paths.state_file)
+    assert state_after["issues"]["2060"]["status"] == "reviewing"
+    assert not any(
+        e["kind"] == "stranded_request_changes_rework_requested" for e in state_after["events"]
+    )
+
+
+def test_review_queue_restores_verdict_newer_than_applied_outcome(tmp_path: Path) -> None:
+    """A verdict recorded AFTER the applied outcome is unanswered: still restored."""
+    app = _answered_verdict_app(
+        tmp_path,
+        verdict_age=timedelta(hours=1),
+        outcome_age=timedelta(hours=3),
+        applied_head="sha-2092",
+    )
+
+    app.review_queue()
+
+    state_after = load_state(app.paths.state_file)
+    assert state_after["issues"]["2060"]["status"] == "rework_requested"
+
+
+def test_review_queue_restores_verdict_when_outcome_applied_at_other_head(
+    tmp_path: Path,
+) -> None:
+    app = _answered_verdict_app(
+        tmp_path,
+        verdict_age=timedelta(hours=3),
+        outcome_age=timedelta(hours=1),
+        applied_head="sha-older",
+    )
+
+    app.review_queue()
+
+    state_after = load_state(app.paths.state_file)
+    assert state_after["issues"]["2060"]["status"] == "rework_requested"
 
 
 def test_review_queue_does_not_reroute_stranded_request_changes_for_closed_issue(
