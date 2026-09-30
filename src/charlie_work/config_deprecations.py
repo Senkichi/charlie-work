@@ -15,9 +15,13 @@ lazily inside ``emit_deprecated_key_reads`` for exactly that reason.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any, Mapping
+
+# ``fleet_supervisor_config`` is a leaf module (stdlib-only at import time),
+# so importing it here cannot cycle back through ``config.py``.
+from .fleet_supervisor_config import FLEET_SUPERVISOR_SECTION, FleetSupervisorConfig
 
 
 @dataclass(frozen=True)
@@ -50,6 +54,21 @@ DEPRECATED_CONFIG_KEYS: tuple[DeprecatedConfigKey, ...] = (
         key="require_worker_github_token",
         replacement=None,
         removal_issue=1977,
+    ),
+    # Issue #1978: every ``FleetSupervisorConfig`` field is a knob relocated
+    # out of ``supervisor:`` -- deriving the entries from the dataclass keeps
+    # the registry in sync with the new section by construction instead of
+    # restating the same key list a second time. Issue #1979 removes the
+    # legacy ``supervisor.<key>`` locations once the quiet window proves the
+    # sweep sees them set nowhere.
+    *(
+        DeprecatedConfigKey(
+            section="supervisor",
+            key=f.name,
+            replacement=f"{FLEET_SUPERVISOR_SECTION}.{f.name}",
+            removal_issue=1979,
+        )
+        for f in fields(FleetSupervisorConfig)
     ),
 )
 
