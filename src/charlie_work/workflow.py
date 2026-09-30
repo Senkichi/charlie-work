@@ -183,7 +183,7 @@ from .process_utils import (
     find_worker_terminal_status,
     is_pid_alive,  # noqa: F401  (deliberate re-export; used by moved L08 delegate via _wf.)
 )
-from . import orphaned_worker_review_drain, orphaned_worker_sweep, rework_outcome
+from . import markdown_guard, orphaned_worker_review_drain, orphaned_worker_sweep, rework_outcome
 from .write_gate import WriteGate, require_write_gate
 
 # LOAD-BEARING RE-EXPORT — NOT AN UNUSED IMPORT. Do not delete; the `noqa`
@@ -282,6 +282,8 @@ from .verdict_parsing import (  # noqa: F401  (deliberate re-export)
     _RESULT_EVENT_CAUSE_FIELDS,
     _validate_review_verdict,
     _extract_verdict_from_text,
+    _legacy_extract_verdict_from_text,
+    _scan_extract_verdict_from_text,
     _strip_fenced_blocks,
     _extract_verdict_from_stream_json,
     _parse_review_verdict_from_log,
@@ -3903,6 +3905,8 @@ class OrchestratorApp:
             dry_run=self.dry_run, state_path=self.paths.state_file, repo=self.repo_root.name
         )
         self.fleet_dir_override = fleet_dir_override
+        # Default sink for markdown_guard_disagreement events (pure guards have no state path).
+        markdown_guard.bind_state_path(self.paths.state_file)
         # Issue #1363: config_freshness's "exactly once per change" semantics
         # need a mtime cache that outlives a single pass but not the process
         # -- an in-memory dict on the (per-process, per-repo) app instance is

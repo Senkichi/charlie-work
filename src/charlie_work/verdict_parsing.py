@@ -20,7 +20,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Sequence
 
-from . import markdown_fence
+from . import markdown_fence, markdown_guard
 from .claude_code import extract_event_text, iter_stream_json_events, parse_claude_events
 from .config import OrchestratorConfig
 from .throttle_signatures import match_throttle_tail
@@ -31,12 +31,10 @@ from .throttle_signatures import match_throttle_tail
 # carries whatever diagnostic detail WAS recoverable.
 CAUSE_UNKNOWN: dict[str, Any] = {"cause": "unknown"}
 
-# Re-export alias only (``workflow.py``'s LOAD-BEARING re-export block
-# re-exports every name here). Nothing reads THIS name: the live object is
-# ``markdown_fence.LEGACY_FENCE_RE``, consumed by
-# ``markdown_fence.pick_last_valid_fence``, so monkeypatching the alias has no
-# effect.
-_VERDICT_FENCE_RE = markdown_fence.LEGACY_FENCE_RE
+# Legacy fence regex (origin/main's, verbatim; any language tag, NOT
+# line-anchored), used only via the monotone composition in
+# ``_extract_verdict_from_text``. ``workflow.py`` re-exports this name.
+_VERDICT_FENCE_RE = re.compile(r"```(?:[a-zA-Z0-9_+-]*)\s*\n(.*?)```", re.DOTALL)
 
 # Absolute path ending in .md, as reviewers reference their summary files in
 # final output (e.g. "Full review written to `C:\...\review.md`"). Colons,
@@ -113,64 +111,65 @@ def _validate_review_verdict(data: Any) -> dict[str, Any] | None:
     }
 
 
-def _extract_verdict_from_text(text: str) -> dict[str, Any] | None:
+def _legacy_extract_verdict_from_text(text: str) -> dict[str, Any] | None:
     """Extract the last valid fenced JSON verdict block from plain text.
 
-    Accepts fences with or without a language tag, backtick or tilde,
-    scanning from the last fence (the final output) backwards. Candidates
-    come from BOTH ``markdown_fence.scan`` (CommonMark line-anchored: no
-    desync from a mid-line ``` run inside the payload, an unclosed fence
-    still yields its content) and the legacy unanchored
-    ``markdown_fence.LEGACY_FENCE_RE`` (mid-line opener, closer glued to the
-    closing brace, tab/list-indented fence), ordered by source position so
-    the final block wins whichever model recognised it. Dropping either
-    model would let an earlier ``approved`` block beat a final
-    ``request_changes`` one; and a scan-only block after the legacy pick
-    never turns a legacy non-``approved`` into ``approved`` (see
-    ``markdown_fence.pick_last_valid_fence``) -- a verdict guard must not
-    fail open.
-    """
+    Accepts fences with or without a ``json`` language tag, scanning from the
+    last fence (the final output) backwards.
 
-    def parse(body: str) -> dict[str, Any] | None:
-        candidate = body.strip()
+    legacy path: delete after soak when markdown_guard_disagreement stays at zero (follow-up issue).
+    """
+    for match in reversed(list(_VERDICT_FENCE_RE.finditer(text))):
+        candidate = match.group(1).strip()
         if not candidate:
-            return None
+            continue
         try:
             data = json.loads(candidate)
         except json.JSONDecodeError:
-            return None
-        return _validate_review_verdict(data)
+            continue
+        verdict = _validate_review_verdict(data)
+        if verdict is not None:
+            return verdict
+    return None
 
-    return markdown_fence.pick_last_valid_fence(
-        text, parse, is_approval=lambda verdict: verdict["decision"] == "approved"
+
+def _scan_extract_verdict_from_text(text: str) -> dict[str, Any] | None:
+    """Last valid verdict among the fences ``markdown_fence.scan`` recognises."""
+    for body in markdown_fence.fence_bodies_latest_first(text):
+        candidate = body.strip()
+        if not candidate:
+            continue
+        try:
+            data = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        verdict = _validate_review_verdict(data)
+        if verdict is not None:
+            return verdict
+    return None
+
+
+def _extract_verdict_from_text(
+    text: str, *, on_disagreement: markdown_guard.DisagreementCallback | None = None
+) -> dict[str, Any] | None:
+    """Extract the last valid fenced JSON verdict block from plain text.
+
+    Monotone: the legacy (origin/main) and scan-based extractions both run and
+    the MORE SEVERE wins (ties: legacy), so this never approves where
+    origin/main did not; a disagreement emits ``markdown_guard_disagreement``.
+    """
+    return markdown_guard.choose_more_severe(
+        _legacy_extract_verdict_from_text(text),
+        _scan_extract_verdict_from_text(text),
+        guard=markdown_guard.GUARD_VERDICT,
+        decision_of=lambda verdict: verdict["decision"],
+        on_disagreement=on_disagreement,
     )
 
 
 def _strip_fenced_blocks(text: str) -> str:
-    """Remove every fenced code block from ``text`` (opener/closer lines included).
-
-    Used by ``_extract_review_session_summary``'s plaintext-log fallback to
-    drop verdict-fence attempts before keeping the remaining prose lines.
-    Fence detection is ``markdown_fence.scan`` (architecture-deepening
-    candidate 3) -- this replaces a second, narrower regex
-    (``` ```(?:json)?\\s*\\n.*?``` ```) that had drifted stale from this
-    module's own top-of-file fix to ``_VERDICT_FENCE_RE``'s language-tag
-    handling (it kept the old ``(?:json)?``-only restriction) and shared
-    the same non-line-anchored desync defect. Not delegated to
-    ``github_body_scan._strip_fenced_blocks``: that module is the
-    issue/PR-body-scanning domain, unrelated to reviewer-log parsing, and
-    each stays downstream-free of the other per both modules' docstrings.
-    """
-    structure = markdown_fence.scan(text)
-    if not structure.fences:
-        return text
-    lines = markdown_fence.split_lines(text, keepends=True)
-    drop = [False] * len(lines)
-    for fence in structure.fences:
-        end = fence.end if fence.closed else len(lines)
-        for index in range(fence.start, end):
-            drop[index] = True
-    return "".join(line for line, is_dropped in zip(lines, drop) if not is_dropped)
+    """Drop fenced blocks for the plaintext-log summary fallback (cosmetic, scan-only)."""
+    return markdown_fence.strip_fenced_blocks(text)
 
 
 def _extract_verdict_from_stream_json(raw_text: str) -> dict[str, Any] | None:

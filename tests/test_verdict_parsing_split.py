@@ -345,14 +345,17 @@ def test_all_verdict_parsing_names_are_reexported_by_identity() -> None:
     for 32 -> 33.
     Architecture-deepening candidate 3 ("markdown structure") adds
     ``_strip_fenced_blocks`` (1 function: 15 -> 16), for 33 -> 34 overall.
+    The md-r4 monotone composition adds ``_legacy_extract_verdict_from_text``
+    and ``_scan_extract_verdict_from_text`` (2 functions: 16 -> 18), for
+    34 -> 36 overall.
     """
     import charlie_work.verdict_parsing as verdict_parsing
     import charlie_work.workflow as workflow
 
     names = _module_level_defined_names(_VERDICT_PARSING_PATH)
     assert names, "AST derivation found zero module-level names -- derivation is broken"
-    assert len(names) == 34, (
-        f"expected 34 moved units (16 functions + ReviewSessionOutcome + 17 constants), "
+    assert len(names) == 36, (
+        f"expected 36 moved units (18 functions + ReviewSessionOutcome + 17 constants), "
         f"found {len(names)}: {sorted(names)}"
     )
 

@@ -27,7 +27,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import markdown_fence
+from . import markdown_fence, markdown_guard
 from .env_sanitize import sanitize_env
 from .subprocess_runner import no_console_window_kwargs
 
@@ -91,16 +91,24 @@ _SEVERITY_RE = re.compile(
     re.MULTILINE,
 )
 
-# Fence detection for ``_find_json_verdict`` is
-# ``markdown_fence.pick_last_valid_fence`` (architecture-deepening
-# candidate 3, "markdown structure"): the union of ``markdown_fence.scan``
-# (CommonMark line-anchored: a ``` run only delimits a block as the first
-# thing on its own line, so a ```python citation block's embedded ``` can
-# never desync pairing -- the PR #802 story) and the legacy unanchored
-# regex (``markdown_fence.LEGACY_FENCE_RE``, formerly a byte-identical
-# duplicate kept here). The legacy model is kept so this verdict parser is
-# never more permissive than before: a mid-line opener, glued closer or
-# list/tab-indented final block must still beat an earlier echoed block.
+# Fenced ```json ... ``` (or bare ``` ... ``` or ```<any-language-tag> ... ```)
+# block, mirroring ``workflow._VERDICT_FENCE_RE``. Not imported from
+# ``workflow`` because ``workflow`` imports this module, not the reverse.
+#
+# The language-tag group MUST accept any tag, not just ``json``: a prior
+# ``(?:json)?`` version only recognized an opening fence tagged bare or
+# ``json``, so a report with e.g. ``` ```python ``` citation blocks before its
+# final ```json verdict block desynchronized entirely -- the regex failed to
+# match the ```python fence's own OPENING backtick (its "python" tag isn't
+# "json" and isn't followed by whitespace-then-newline), so ``finditer``
+# skipped past it and instead matched the ```python block's *closing* bare
+# ``` as a spurious new opening, pairing it with the *next* fence's opening
+# as its "closing" -- silently merging two unrelated fenced blocks into one
+# corrupted match and permanently misaligning every fence pair after it in
+# the document (confirmed byte-for-byte against PR #802's real report, whose
+# genuinely well-formed trailing ```json verdict was never found because of
+# this).
+_VERDICT_FENCE_RE = re.compile(r"```(?:[a-zA-Z0-9_+-]*)\s*\n(.*?)```", re.DOTALL)
 
 
 def _looks_transient(*texts: str) -> bool:
@@ -409,29 +417,90 @@ class CrossFamilyVerdict:
             )
 
 
-def _find_json_verdict(body: str) -> CrossFamilyVerdict | None:
+def _scan_find_json_verdict(body: str) -> CrossFamilyVerdict | None:
+    """Last shape-valid JSON verdict among the fences ``markdown_fence.scan`` recognises."""
+    for fence_body in markdown_fence.fence_bodies_latest_first(body):
+        verdict = _parse_json_verdict_body(fence_body)
+        if verdict is not None:
+            return verdict
+    return None
+
+
+def _find_json_verdict(
+    body: str, *, on_disagreement: markdown_guard.DisagreementCallback | None = None
+) -> CrossFamilyVerdict | None:
     """Return the last shape-valid JSON verdict block in ``body``, or None.
 
-    Scans fenced code blocks from the last one backwards (candidates are the
-    union of ``markdown_fence.scan`` and the legacy unanchored fence regex,
-    ordered by source position; see ``markdown_fence.pick_last_valid_fence``,
-    which also stops a scan-only block from turning a legacy
-    ``request_changes`` into ``approved``), mirroring
-    ``verdict_parsing._extract_verdict_from_text``, so a reviewer's actual
-    final answer wins over an earlier echo (e.g. of the example block in its
-    own prompt). A block is shape-valid when
-    ``decision`` is ``"approved"`` or ``"request_changes"`` (cross-family
-    review never gates a merge on its own, so unlike the primary reviewer it
-    has no ``"blocked"`` decision) and ``summary`` is a non-empty,
-    non-placeholder string. ``required_changes``, if present, must be a list
-    of strings; a malformed one rejects that block (an earlier fence, if
-    any, is tried next) rather than silently discarding the bad data.
+    Monotone by construction (see ``markdown_guard``): the origin/main
+    extraction and the scan-based one both run and the MORE SEVERE result wins
+    (``request_changes`` > no verdict > ``approved``; ties return the legacy
+    result), so this never approves where origin/main did not. A disagreement
+    emits ``markdown_guard_disagreement``. Shape rules are those of
+    ``_legacy_find_json_verdict``: ``decision`` is ``"approved"`` or
+    ``"request_changes"`` (cross-family review never gates a merge on its own),
+    ``summary`` a non-empty non-placeholder string, ``required_changes`` a list
+    of strings if present.
     """
-    return markdown_fence.pick_last_valid_fence(
-        body,
-        _parse_json_verdict_body,
-        is_approval=lambda verdict: verdict.decision == "approved",
+    return markdown_guard.choose_more_severe(
+        _legacy_find_json_verdict(body),
+        _scan_find_json_verdict(body),
+        guard=markdown_guard.GUARD_RESCUE_VERDICT,
+        decision_of=lambda verdict: verdict.decision,
+        on_disagreement=on_disagreement,
     )
+
+
+def _legacy_find_json_verdict(body: str) -> CrossFamilyVerdict | None:
+    """Return the last shape-valid JSON verdict block in ``body``, or None.
+
+    Scans fenced code blocks from the last one backwards — mirroring
+    ``workflow._extract_verdict_from_text`` — so a reviewer's actual final
+    answer wins over an earlier echo (e.g. of the example block in its own
+    prompt). A block is shape-valid when ``decision`` is ``"approved"`` or
+    ``"request_changes"`` (cross-family review never gates a merge on its
+    own, so unlike the primary reviewer it has no ``"blocked"`` decision)
+    and ``summary`` is a non-empty, non-placeholder string.
+    ``required_changes``, if present, must be a list of strings; a
+    malformed one rejects that block (an earlier fence, if any, is tried
+    next) rather than silently discarding the bad data.
+
+    legacy path: delete after soak when markdown_guard_disagreement stays at zero (follow-up issue).
+    """
+    for match in reversed(list(_VERDICT_FENCE_RE.finditer(body))):
+        candidate = match.group(1).strip()
+        if not candidate:
+            continue
+        try:
+            data = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(data, dict):
+            continue
+        decision = data.get("decision")
+        if decision not in ("approved", "request_changes"):
+            continue
+        summary = data.get("summary")
+        if not isinstance(summary, str):
+            continue
+        stripped_summary = summary.strip()
+        if not stripped_summary:
+            continue
+        # An unfilled template placeholder ("<one or two sentence...>") is
+        # prompt boilerplate that leaked into the verdict, never a real
+        # summary — mirrors workflow._validate_review_verdict's guard.
+        if stripped_summary.startswith("<") and stripped_summary.endswith(">"):
+            continue
+        raw_changes = data.get("required_changes")
+        if raw_changes is None:
+            required_changes: tuple[str, ...] = ()
+        elif isinstance(raw_changes, list) and all(isinstance(item, str) for item in raw_changes):
+            required_changes = tuple(item.strip() for item in raw_changes if item.strip())
+        else:
+            continue
+        return CrossFamilyVerdict(
+            decision=decision, summary=stripped_summary, required_changes=required_changes
+        )
+    return None
 
 
 def _parse_json_verdict_body(fence_body: str) -> CrossFamilyVerdict | None:

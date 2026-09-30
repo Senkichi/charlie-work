@@ -49,9 +49,12 @@ from charlie_work.attachment_contracts.model import AdvisoryRecord
 from charlie_work.cross_repo_gate import _nearest_preceding_heading
 from charlie_work.github_body_scan import _fenced_block_ranges
 from charlie_work.github_prose_dependencies import _is_blockquote_line
-from charlie_work.rescue_review import _VERDICT_RE, _find_json_verdict
+from charlie_work.rescue_review import _VERDICT_RE, _find_json_verdict, _scan_find_json_verdict
 from charlie_work.rescue_review import CrossFamilyVerdict
-from charlie_work.verdict_parsing import _extract_verdict_from_text
+from charlie_work.verdict_parsing import (
+    _extract_verdict_from_text,
+    _scan_extract_verdict_from_text,
+)
 
 
 @pytest.fixture(scope="module")
@@ -156,7 +159,11 @@ def test_flip_verdict_parsing_desync_embedded_backticks_drops_verdict() -> None:
     payload = {"decision": "approved", "summary": "see ```py\nx=1\n``` above"}
     text = "```json\n" + json.dumps(payload) + "\n```\n"
 
-    assert _extract_verdict_from_text(text) == {
+    # md-r4: the scan side alone would recover the approval, but the guard is
+    # composed monotonically with origin/main's regex (which desyncs and finds
+    # nothing), and an approval only survives when BOTH sides find it.
+    assert _extract_verdict_from_text(text) is None
+    assert _scan_extract_verdict_from_text(text) == {
         "decision": "approved",
         "summary": "see ```py\nx=1\n``` above",
         "required_changes": [],
@@ -173,7 +180,9 @@ def test_flip_verdict_parsing_tilde_fence_unsupported() -> None:
     payload = {"decision": "approved", "summary": "ok"}
     text = "~~~json\n" + json.dumps(payload) + "\n~~~\n"
 
-    assert _extract_verdict_from_text(text) == {
+    # md-r4: scan-only approval is not honoured (monotone composition).
+    assert _extract_verdict_from_text(text) is None
+    assert _scan_extract_verdict_from_text(text) == {
         "decision": "approved",
         "summary": "ok",
         "required_changes": [],
@@ -191,7 +200,9 @@ def test_flip_verdict_parsing_unclosed_fence_drops_verdict() -> None:
     payload = {"decision": "approved", "summary": "ok"}
     text = "```json\n" + json.dumps(payload) + "\n"
 
-    assert _extract_verdict_from_text(text) == {
+    # md-r4: scan-only approval is not honoured (monotone composition).
+    assert _extract_verdict_from_text(text) is None
+    assert _scan_extract_verdict_from_text(text) == {
         "decision": "approved",
         "summary": "ok",
         "required_changes": [],
@@ -213,7 +224,9 @@ def test_flip_rescue_review_desync_embedded_backticks_drops_verdict() -> None:
     payload = {"decision": "approved", "summary": "see ```py\nx=1\n``` above"}
     body = "```json\n" + json.dumps(payload) + "\n```\n"
 
-    assert _find_json_verdict(body) == CrossFamilyVerdict(
+    # md-r4: scan-only approval is not honoured (monotone composition).
+    assert _find_json_verdict(body) is None
+    assert _scan_find_json_verdict(body) == CrossFamilyVerdict(
         decision="approved",
         summary="see ```py\nx=1\n``` above",
         required_changes=(),
@@ -230,7 +243,9 @@ def test_flip_rescue_review_tilde_fence_unsupported() -> None:
     payload = {"decision": "approved", "summary": "ok"}
     body = "~~~json\n" + json.dumps(payload) + "\n~~~\n"
 
-    assert _find_json_verdict(body) == CrossFamilyVerdict(
+    # md-r4: scan-only approval is not honoured (monotone composition).
+    assert _find_json_verdict(body) is None
+    assert _scan_find_json_verdict(body) == CrossFamilyVerdict(
         decision="approved", summary="ok", required_changes=()
     )
 

@@ -44,7 +44,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
-from . import layout, markdown_fence
+from . import layout, markdown_fence, markdown_guard
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +61,13 @@ REFUSAL_EVENT_KIND = "outbound_body_secret_refused"
 # or comment -- the guard would refuse the very prose that documents it.
 _EXAMPLE_FENCE_INFO = "example-secret"
 
+_NON_TERMINATOR_RUN_RE = re.compile(r"[^\r\n]+")
+
 _RULES_PATH = Path(__file__).parent / "_vendor" / "gitleaks" / "secrets.toml"
+
+# CommonMark fenced-code-block opening: up to 3 spaces of indent, then at
+# least three backticks or tildes, then an optional info string.
+_FENCE_OPEN_RE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})[ \t]*(.*)$")
 
 
 class OutboundBodyGuardError(RuntimeError):
@@ -105,81 +111,120 @@ def _shannon_entropy(text: str) -> float:
     return -sum((c / n) * math.log2(c / n) for c in counts.values())
 
 
-def _example_secret_lines(
-    contents: list[str], structure: markdown_fence.MarkdownStructure
-) -> set[int]:
-    """Line indices inside an ``example-secret`` fence of ``structure``.
+def _legacy_example_secret_line_indices(text: str) -> set[int]:
+    """Indices (into the newline-split lines) of lines origin/main blanked as exempt.
 
-    Unclosed blocks run to end-of-file (CommonMark semantics). ``scan`` is
-    strict CommonMark (a closer indented 4+ columns, e.g. tab-indented, does
-    not close), but masking is the fail-OPEN side: an ``example-secret`` fence
-    is an author's claim that its content is a fake example, so the exempt
-    region must be the smallest plausible one, and an author who visibly
-    closed the block (a tab-indented ``` line) is not vouching for what
-    follows it. The mask therefore ends at the earlier of scan's closer and
-    the first lenient closer (same char, >= opener length, any leading
-    indent) -- the closer rule stays in ``markdown_fence.find_fence_close``
-    (re-review md-r2 B2).
+    Blank out every line of each ``example-secret`` fenced block.
+
+    ``in_fence`` tracks *any* open fence, not just exempt ones: inside an
+    ordinary block an `````example-secret`` line is literal content (a closing
+    fence cannot carry an info string), so it must not start masking -- that
+    would let a real credential hide inside a nested-looking fence.
+
+    legacy path: delete after soak when markdown_guard_disagreement stays at zero (follow-up issue).
+    This is origin/main's ``_mask_example_secret_fences`` state machine
+    verbatim, except that it records which lines it would have blanked
+    instead of blanking them.
     """
-    lines: set[int] = set()
-    for fence in structure.fences:
-        if fence.info != _EXAMPLE_FENCE_INFO:
-            continue
-        end = fence.end if fence.closed else len(contents)
-        lenient_close = markdown_fence.find_fence_close(
-            contents, fence.start + 1, fence.char, fence.length, max_indent=None
-        )
-        if lenient_close is not None:
-            end = min(end, lenient_close + 1)
-        lines.update(range(fence.start, end))
-    return lines
+    lines = text.split("\n")
+    masked: set[int] = set()
+    in_fence = False
+    exempt = False
+    close_re: re.Pattern[str] | None = None
+    for i, line in enumerate(lines):
+        stripped = line.rstrip("\r")
+        if not in_fence:
+            m = _FENCE_OPEN_RE.match(stripped)
+            if m is None:
+                continue
+            fence, info = m.group(1), m.group(2).strip()
+            # CommonMark: a backtick fence's info string may not contain `.
+            if fence[0] == "`" and "`" in info:
+                continue
+            in_fence = True
+            exempt = info == _EXAMPLE_FENCE_INFO
+            close_re = re.compile(rf"^[ \t]{{0,3}}{re.escape(fence[0])}{{{len(fence)},}}[ \t]*$")
+            if exempt:
+                masked.add(i)
+        else:
+            if exempt:
+                masked.add(i)
+            if close_re is not None and close_re.match(stripped):
+                in_fence = False
+                exempt = False
+                close_re = None
+    return masked
 
 
-def _mask_example_secret_fences(text: str) -> str:
-    """Blank out every line of each ``example-secret`` fenced block.
+def _legacy_mask_ranges(text: str) -> list[tuple[int, int]]:
+    """Character runs of the lines ``_legacy_example_secret_line_indices`` blanks."""
+    masked = _legacy_example_secret_line_indices(text)
+    ranges: list[tuple[int, int]] = []
+    offset = 0
+    for index, line in enumerate(text.split("\n")):
+        if index in masked:
+            ranges.extend(_content_runs(line, offset))
+        offset += len(line) + 1
+    return ranges
 
-    Returns a string with the same line count as ``text`` so reported line
-    numbers still refer to the submitted document. Unclosed blocks mask to
-    end-of-file (CommonMark semantics).
 
-    Fence detection (including the backtick-in-info-string exclusion this
-    module's ``_FENCE_OPEN_RE`` used to enforce by hand) is
-    ``markdown_fence.scan`` -- architecture-deepening candidate 3, "markdown
-    structure"; this module's own fence/closer model was in fact the one
-    ported INTO that shared scan side (see its module docstring), since it
-    was the only consumer already satisfying every CommonMark rule the
-    recon checked. Masking additionally requires agreement of the strict
-    and the any-indent scan (see below), which only ever masks less (the
-    fail-safe direction for this guard). Only the masking concern -- blank every line of a fence whose info string is exactly
-    ``example-secret``, opener and closer lines included -- stays here; it
-    is not itself CommonMark structure.
+def _scan_mask_ranges(text: str) -> list[tuple[int, int]]:
+    """Character runs inside ``example-secret`` fences per ``markdown_fence.scan``.
 
-    Line splitting here must track ``scan``'s own ``markdown_fence.
-    split_lines`` convention exactly (content and terminator kept separate,
-    terminators preserved verbatim), not ``str.splitlines()``: the two
-    disagree on separators CommonMark doesn't recognize as line breaks
-    (e.g. U+2028 LINE SEPARATOR), which would desync ``fence.start``/
-    ``fence.end`` line indices from a locally-split line list on such input
-    (adversarial review finding B2, architecture-deepening candidate 3).
+    Line splitting tracks ``scan``'s own ``markdown_fence.split_lines``
+    (CommonMark line endings only), which the fence line indices refer to.
+    Unclosed blocks run to end-of-file.
     """
     contents = markdown_fence.split_lines(text)
-    terminators = [
-        raw[len(content) :]
-        for raw, content in zip(markdown_fence.split_lines(text, keepends=True), contents)
-    ]
-    # Mask a line only when BOTH the strict CommonMark scan and the tolerant
-    # (any-indent) scan put it inside an ``example-secret`` fence (md-r3
-    # review B2). Strict alone lets a tab-indented ordinary opener (a tab before the backticks)
-    # read as indented code, so a following ```example-secret line opens an
-    # exempt block and hides a real credential that the pre-scan character-
-    # count opener treated as literal content of the ordinary fence. Every
-    # divergence of the intersection masks LESS, the fail-safe direction here.
-    masked = _example_secret_lines(contents, markdown_fence.scan(text)) & _example_secret_lines(
-        contents, markdown_fence.scan(text, max_indent=None)
+    masked: set[int] = set()
+    for fence in markdown_fence.scan(text).fences:
+        if fence.info == _EXAMPLE_FENCE_INFO:
+            masked.update(range(fence.start, fence.end if fence.closed else len(contents)))
+    ranges: list[tuple[int, int]] = []
+    offset = 0
+    for index, raw in enumerate(markdown_fence.split_lines(text, keepends=True)):
+        if index in masked:
+            ranges.extend(_content_runs(contents[index], offset))
+        offset += len(raw)
+    return ranges
+
+
+def _content_runs(line: str, offset: int) -> list[tuple[int, int]]:
+    """Non-empty ``[start, end)`` runs of ``line`` excluding CR/LF terminator chars.
+
+    Both mask sides go through this so that they compare equal whenever they
+    exempt the same content, however each one splits lines.
+    """
+    return [(offset + m.start(), offset + m.end()) for m in _NON_TERMINATOR_RUN_RE.finditer(line)]
+
+
+def _mask_example_secret_fences(
+    text: str, *, on_disagreement: markdown_guard.DisagreementCallback | None = None
+) -> str:
+    """Blank out every ``example-secret`` fenced block, opener and closer lines included.
+
+    A character is exempt from secret scanning only if BOTH origin/main's
+    fence state machine and the ``markdown_fence.scan``-based mask exempt it
+    (``markdown_guard.intersect_ranges``), so the composed mask can only be
+    smaller than origin/main's -- the fail-safe direction for this guard. A
+    difference between the two emits ``markdown_guard_disagreement``.
+
+    Only non-terminator characters are removed, so the result keeps every line
+    break and reported line numbers still refer to the submitted document.
+    """
+    ranges = markdown_guard.intersect_ranges(
+        _legacy_mask_ranges(text),
+        _scan_mask_ranges(text),
+        guard=markdown_guard.GUARD_OUTBOUND_MASK,
+        on_disagreement=on_disagreement,
     )
-    for i in masked:
-        contents[i] = ""
-    return "".join(content + terminator for content, terminator in zip(contents, terminators))
+    pieces: list[str] = []
+    cursor = 0
+    for start, end in ranges:
+        pieces.append(text[cursor:start])
+        cursor = end
+    pieces.append(text[cursor:])
+    return "".join(pieces)
 
 
 @lru_cache(maxsize=1)

@@ -49,9 +49,7 @@ re-derive it. There are three already:
 from __future__ import annotations
 
 import re
-from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from typing import TypeVar
 
 __all__ = [
     "MIN_FENCE_LENGTH",
@@ -61,9 +59,8 @@ __all__ = [
     "FenceSpan",
     "Heading",
     "MarkdownStructure",
-    "LEGACY_FENCE_RE",
-    "fence_contents_latest_first",
-    "pick_last_valid_fence",
+    "fence_bodies_latest_first",
+    "strip_fenced_blocks",
     "scan",
     "is_blockquote_marker",
     "split_lines",
@@ -477,87 +474,35 @@ def scan(text: str, *, max_indent: int | None = 3) -> MarkdownStructure:
     )
 
 
-# The pre-architecture-deepening verdict-fence regex: NOT line-anchored, so it
-# catches an opener mid-line, a closer glued to the preceding text, and a
-# tab- or list-indented fence -- shapes ``scan``'s CommonMark top-level model
-# rejects. Defined here (single definition; ``verdict_parsing`` and
-# ``rescue_review`` both consume it) because a verdict *parser* must never be
-# more permissive than the code it replaced: see
-# :func:`fence_contents_latest_first`.
-LEGACY_FENCE_RE = re.compile(r"```(?:[a-zA-Z0-9_+-]*)\s*\n(.*?)```", re.DOTALL)
+def fence_bodies_latest_first(text: str) -> list[str]:
+    """Return the body of every ``scan``-recognised fenced block, latest first.
 
-
-def fence_contents_latest_first(text: str) -> list[str]:
-    """Return the body of every fenced block in ``text``, latest first.
-
-    Union of two models, ordered by source position (end offset, then start
-    offset, descending): ``scan``'s CommonMark line-anchored fences (tilde
-    fences, unclosed fences, no desync from mid-line backticks) and the
-    legacy unanchored :data:`LEGACY_FENCE_RE` (mid-line opener, glued
-    closer, tab/list-indented fence). Callers that pick "the last valid
-    block wins" -- reviewer-verdict parsers -- need both, otherwise a final
-    block that only one model recognises loses to an earlier block the
-    other model does catch (fail-open toward an earlier ``approved``).
-    Bodies are returned raw; callers strip/validate.
+    Bodies are raw (callers strip/validate); an unclosed fence yields its
+    content to end-of-file. This is the scan-based side of the verdict
+    parsers, which compose it monotonically with their legacy regex path
+    (``markdown_guard.choose_more_severe``) rather than merging fence lists.
     """
     lines = split_lines(text)
-    offsets: list[int] = []
-    pos = 0
-    for raw in split_lines(text, keepends=True):
-        offsets.append(pos)
-        pos += len(raw)
-    offsets.append(pos)
-
-    entries: list[tuple[int, int, str]] = []
+    bodies: list[str] = []
     for fence in scan(text).fences:
         content_end = fence.end - 1 if fence.closed else fence.end
-        body = "\n".join(lines[fence.start + 1 : content_end])
-        entries.append((offsets[fence.end], offsets[fence.start], body))
-    for match in LEGACY_FENCE_RE.finditer(text):
-        entries.append((match.end(), match.start(), match.group(1)))
-    entries.sort(key=lambda entry: (entry[0], entry[1]), reverse=True)
-    return [body for _end, _start, body in entries]
+        bodies.append("\n".join(lines[fence.start + 1 : content_end]))
+    bodies.reverse()
+    return bodies
 
 
-_T = TypeVar("_T")
+def strip_fenced_blocks(text: str) -> str:
+    """Remove every ``scan``-recognised fenced block (opener/closer lines included).
 
-
-def pick_last_valid_fence(
-    text: str,
-    parse: Callable[[str], _T | None],
-    *,
-    is_approval: Callable[[_T], bool],
-) -> _T | None:
-    """Return the last fenced block ``parse`` accepts, never fail-open.
-
-    Two candidate orders are evaluated: the *union* pick
-    (:func:`fence_contents_latest_first`) and the *legacy* pick (origin/main's
-    loop over :data:`LEGACY_FENCE_RE`, latest match first). Normally the union
-    pick wins -- it recognises shapes the legacy regex cannot (tilde fences,
-    unclosed fences). But the union also lets a scan-only block that comes
-    AFTER the legacy pick (a quoted ``~~~`` example, a trailing unterminated
-    block) override it, so a verdict parser could return ``approved`` where
-    the code it replaced returned ``request_changes`` (md-r3 review B1). When
-    the picks differ and the legacy one is not an approval while the union one
-    is, the legacy pick is returned: an approval never displaces a
-    non-approval that origin/main already honoured.
+    An unclosed fence drops the rest of the text (CommonMark semantics).
     """
-    union_pick = _first_parsed(fence_contents_latest_first(text), parse)
-    legacy_bodies = [m.group(1) for m in LEGACY_FENCE_RE.finditer(text)]
-    legacy_pick = _first_parsed(reversed(legacy_bodies), parse)
-    if (
-        union_pick is not None
-        and legacy_pick is not None
-        and is_approval(union_pick)
-        and not is_approval(legacy_pick)
-    ):
-        return legacy_pick
-    return union_pick
-
-
-def _first_parsed(bodies: Iterable[str], parse: Callable[[str], _T | None]) -> _T | None:
-    for body in bodies:
-        parsed = parse(body)
-        if parsed is not None:
-            return parsed
-    return None
+    structure = scan(text)
+    if not structure.fences:
+        return text
+    lines = split_lines(text, keepends=True)
+    drop = [False] * len(lines)
+    for fence in structure.fences:
+        end = fence.end if fence.closed else len(lines)
+        for index in range(fence.start, end):
+            drop[index] = True
+    return "".join(line for line, is_dropped in zip(lines, drop) if not is_dropped)
