@@ -338,14 +338,19 @@ def test_all_verdict_parsing_names_are_reexported_by_identity() -> None:
     Issue #1485 adds ``_EXTRACTED_VERDICT_SOURCES`` (1 constant: 14 -> 15)
     and ``is_extracted_verdict_source``, ``provenance_caveat_for`` (2
     functions: 11 -> 13), for 26 -> 29 overall.
+    Issue #2011 adds ``CAUSE_REVIEWER_EXEC_REJECTED``,
+    ``EXEC_REJECTED_LOG_SIGNATURE`` (2 constants: 15 -> 17) and
+    ``_log_reports_exec_rejection`` (1 function: 13 -> 14), for 29 -> 32.
+    Issue #2029's fix adds ``_session_mtime_cutoff`` (1 function: 14 -> 15),
+    for 32 -> 33.
     """
     import charlie_work.verdict_parsing as verdict_parsing
     import charlie_work.workflow as workflow
 
     names = _module_level_defined_names(_VERDICT_PARSING_PATH)
     assert names, "AST derivation found zero module-level names -- derivation is broken"
-    assert len(names) == 29, (
-        f"expected 29 moved units (13 functions + ReviewSessionOutcome + 15 constants), "
+    assert len(names) == 33, (
+        f"expected 33 moved units (15 functions + ReviewSessionOutcome + 17 constants), "
         f"found {len(names)}: {sorted(names)}"
     )
 

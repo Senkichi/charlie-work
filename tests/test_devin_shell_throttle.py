@@ -10,6 +10,7 @@ sidecar updates.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 from _devin_shell_fixtures import _make_session_sidecar
@@ -35,7 +36,10 @@ def test_classify_session_failure_rate_limit_with_reset_time(tmp_path: Path) -> 
         encoding="utf-8",
     )
 
-    now = datetime.now(UTC)
+    now = datetime.now(UTC).replace(microsecond=0)
+    # Issue #1997: the window is anchored at the log's emission time (mtime),
+    # so pin mtime to the frozen clock for an exact assertion.
+    os.utime(log_path, (now.timestamp(), now.timestamp()))
     failure_kind, throttled_until = _classify_session_failure(log_path, now=now)
 
     assert failure_kind == "rate_limited"
@@ -128,7 +132,8 @@ def test_classify_session_failure_includes_resume_margin(tmp_path: Path) -> None
         encoding="utf-8",
     )
 
-    now = datetime.now(UTC)
+    now = datetime.now(UTC).replace(microsecond=0)
+    os.utime(log_path, (now.timestamp(), now.timestamp()))
     failure_kind, throttled_until = _classify_session_failure(
         log_path, resume_margin_seconds=90, now=now
     )
@@ -151,7 +156,8 @@ def test_get_rate_limit_defer_until_with_reset_time(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    now = datetime.now(UTC)
+    now = datetime.now(UTC).replace(microsecond=0)
+    os.utime(log_path, (now.timestamp(), now.timestamp()))
     defer_until = get_rate_limit_defer_until(log_path, slack_minutes=2, now=now)
 
     assert defer_until is not None
@@ -172,7 +178,8 @@ def test_get_rate_limit_defer_until_without_reset_time(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    now = datetime.now(UTC)
+    now = datetime.now(UTC).replace(microsecond=0)
+    os.utime(log_path, (now.timestamp(), now.timestamp()))
     defer_until = get_rate_limit_defer_until(log_path, slack_minutes=2, now=now)
 
     assert defer_until is not None
@@ -199,7 +206,8 @@ def test_get_rate_limit_defer_until_includes_resume_margin(tmp_path: Path) -> No
         encoding="utf-8",
     )
 
-    now = datetime.now(UTC)
+    now = datetime.now(UTC).replace(microsecond=0)
+    os.utime(log_path, (now.timestamp(), now.timestamp()))
     defer_until = get_rate_limit_defer_until(
         log_path,
         slack_minutes=2,
@@ -306,7 +314,8 @@ def test_update_session_record_with_failure_classification_includes_resume_margi
     )
 
     config = OrchestratorConfig(runtime=RuntimeConfig(throttle_resume_margin_s=90))
-    now = datetime.now(UTC)
+    now = datetime.now(UTC).replace(microsecond=0)
+    os.utime(log_path, (now.timestamp(), now.timestamp()))
     failure_kind, throttled_until = update_session_record_with_failure_classification(
         sessions_dir, 42, config=config, now=now
     )
@@ -501,3 +510,246 @@ def test_update_session_record_custom_throttle_markers(tmp_path: Path) -> None:
     assert throttled_until is not None
     updated_sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
     assert updated_sidecar["failure_kind"] == "rate_limited"
+
+
+def test_classify_session_failure_anchors_window_to_log_mtime(tmp_path: Path) -> None:
+    """Issue #1997 criterion 1: the throttle window counts from when the
+    provider emitted "reset in N minutes" (the log's mtime), not from when
+    the orchestrator classifies the death.
+
+    A log whose mtime is T and whose tail says "reset in 37 minutes",
+    classified at T+45min, yields ``max(now, T+37min+margin) = T+45min``
+    (already expired — the real reset has passed) — not ``T+45min+37min``
+    (the old classification-time anchoring, which would idle the fleet ~45
+    minutes past the real reset).
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from charlie_work.devin_shell import _classify_session_failure
+
+    now = datetime.now(UTC).replace(microsecond=0)
+    emitted_at = now - timedelta(minutes=45)
+    log_path = tmp_path / "session.log"
+    log_path.write_text(
+        "Some work done...\n"
+        "Error: Reached free model rate limit. Please try again later. "
+        "Your limit will reset in 37 minutes.\n",
+        encoding="utf-8",
+    )
+    os.utime(log_path, (emitted_at.timestamp(), emitted_at.timestamp()))
+
+    failure_kind, throttled_until = _classify_session_failure(
+        log_path, resume_margin_seconds=90, now=now
+    )
+
+    assert failure_kind == "rate_limited"
+    parsed = datetime.fromisoformat(throttled_until.replace("Z", "+00:00"))
+    # T+37min+margin < T+45min: the anchored window ended before
+    # classification, so the issue's max(now, anchored) formula clamps to
+    # ``now`` — an already-expired deadline, never the old T+82min.
+    assert parsed == now
+    assert parsed != (now + timedelta(minutes=37, seconds=90)).replace(microsecond=0)
+    # And provably not the raw anchored value either (it is ~8 min in the
+    # past; the clamp floor is the later of the two).
+    assert parsed > emitted_at + timedelta(minutes=37, seconds=90)
+
+
+def test_classify_session_failure_anchored_window_still_future(tmp_path: Path) -> None:
+    """Issue #1997: when the anchored window has not expired yet, the
+    remaining time still gates dispatch — anchored at emission, the window
+    end lands earlier than classification-time anchoring produced."""
+    from datetime import UTC, datetime, timedelta
+
+    from charlie_work.devin_shell import _classify_session_failure
+
+    now = datetime.now(UTC).replace(microsecond=0)
+    emitted_at = now - timedelta(minutes=45)
+    log_path = tmp_path / "session.log"
+    log_path.write_text(
+        "Error: Reached free model rate limit. Your limit will reset in 60 minutes.\n",
+        encoding="utf-8",
+    )
+    os.utime(log_path, (emitted_at.timestamp(), emitted_at.timestamp()))
+
+    failure_kind, throttled_until = _classify_session_failure(log_path, now=now)
+
+    assert failure_kind == "rate_limited"
+    parsed = datetime.fromisoformat(throttled_until.replace("Z", "+00:00"))
+    expected = (emitted_at + timedelta(minutes=60)).replace(microsecond=0)
+    assert parsed == expected
+    assert parsed > now
+
+
+def test_classify_session_failure_expired_window_clamps_to_now(tmp_path: Path) -> None:
+    """Issue #1997 criterion 2: a window already in the past after anchoring
+    clamps to ``now`` — an already-expired ``throttled_until`` (no deferral),
+    per the issue's ``max(now, emitted_at + reset + margin)`` formula."""
+    from datetime import UTC, datetime, timedelta
+
+    from charlie_work.devin_shell import _classify_session_failure
+
+    now = datetime.now(UTC).replace(microsecond=0)
+    emitted_at = now - timedelta(minutes=45)
+    log_path = tmp_path / "session.log"
+    log_path.write_text(
+        "Error: Reached free model rate limit. Your limit will reset in 37 minutes.\n",
+        encoding="utf-8",
+    )
+    os.utime(log_path, (emitted_at.timestamp(), emitted_at.timestamp()))
+
+    failure_kind, throttled_until = _classify_session_failure(log_path, now=now)
+
+    assert failure_kind == "rate_limited"
+    parsed = datetime.fromisoformat(throttled_until.replace("Z", "+00:00"))
+    # T+37min < T+45min: the reset has already happened by classification
+    # time, so the stored window clamps to ``now`` — already expired
+    # (state.is_throttled compares ``now < throttled_until``, which is never
+    # true of the stored timestamp), and provably NOT the raw anchored value
+    # (~8 minutes in the past).
+    assert parsed == now
+    assert parsed > emitted_at + timedelta(minutes=37)
+
+
+def test_classify_session_failure_prefers_tail_line_timestamp(tmp_path: Path) -> None:
+    """Issue #1997: a tz-aware timestamp on a tail line is a better emission
+    anchor than the file mtime — it is the line's actual write time."""
+    from datetime import UTC, datetime, timedelta
+
+    from charlie_work.devin_shell import _classify_session_failure
+
+    now = datetime.now(UTC).replace(microsecond=0)
+    emitted_at = now - timedelta(minutes=10)
+    ts_line = emitted_at.isoformat().replace("+00:00", "Z")
+    log_path = tmp_path / "session.log"
+    log_path.write_text(
+        f"{ts_line} Error: Reached free model rate limit. Your limit will reset in 37 minutes.\n",
+        encoding="utf-8",
+    )
+    # mtime disagrees with the tail-line timestamp; the line wins. The
+    # anchored window stays live (emitted_at+37 > now) so the three
+    # candidates — tail timestamp, mtime, and classification time — each
+    # produce a distinct deadline.
+    later = now - timedelta(minutes=5)
+    os.utime(log_path, (later.timestamp(), later.timestamp()))
+
+    failure_kind, throttled_until = _classify_session_failure(log_path, now=now)
+
+    assert failure_kind == "rate_limited"
+    parsed = datetime.fromisoformat(throttled_until.replace("Z", "+00:00"))
+    expected = (emitted_at + timedelta(minutes=37)).replace(microsecond=0)
+    assert parsed == expected
+    assert parsed != (later + timedelta(minutes=37)).replace(microsecond=0)
+
+
+def test_classify_session_failure_naive_tail_timestamp_uses_mtime(tmp_path: Path) -> None:
+    """Issue #1997: a tail-line timestamp without a UTC offset is ambiguous —
+    skipped in favor of the file mtime rather than a guessed zone."""
+    from datetime import UTC, datetime, timedelta
+
+    from charlie_work.devin_shell import _classify_session_failure
+
+    now = datetime.now(UTC).replace(microsecond=0)
+    emitted_at = now - timedelta(minutes=45)
+    naive_ts = emitted_at.strftime("%Y-%m-%d %H:%M:%S")  # no offset
+    log_path = tmp_path / "session.log"
+    log_path.write_text(
+        f"{naive_ts} Error: Reached free model rate limit. Your limit will reset in 37 minutes.\n",
+        encoding="utf-8",
+    )
+    mtime = now - timedelta(minutes=10)
+    os.utime(log_path, (mtime.timestamp(), mtime.timestamp()))
+
+    failure_kind, throttled_until = _classify_session_failure(log_path, now=now)
+
+    assert failure_kind == "rate_limited"
+    parsed = datetime.fromisoformat(throttled_until.replace("Z", "+00:00"))
+    expected = (mtime + timedelta(minutes=37)).replace(microsecond=0)
+    assert parsed == expected
+
+
+def test_classify_session_failure_falls_back_to_now_when_stat_fails(tmp_path: Path) -> None:
+    """Issue #1997: with no usable mtime (stat fails) and no tail timestamp,
+    the anchor falls back to ``now`` — the pre-#1997 behavior."""
+    from datetime import UTC, datetime, timedelta
+    from unittest.mock import patch
+
+    from charlie_work.devin_shell import _classify_session_failure
+
+    log_path = tmp_path / "session.log"
+    log_path.write_text(
+        "Error: Reached free model rate limit. Your limit will reset in 10 minutes.\n",
+        encoding="utf-8",
+    )
+
+    now = datetime.now(UTC).replace(microsecond=0)
+    real_stat = Path.stat
+    stat_calls = 0
+
+    def flaky_stat(self: Path, *args: object, **kwargs: object) -> object:
+        # exists() stats once; make every later stat (the anchor's) fail.
+        nonlocal stat_calls
+        stat_calls += 1
+        if stat_calls > 1:
+            raise OSError("simulated stat failure")
+        return real_stat(self, *args, **kwargs)
+
+    with patch.object(Path, "stat", flaky_stat):
+        failure_kind, throttled_until = _classify_session_failure(log_path, now=now)
+
+    assert failure_kind == "rate_limited"
+    parsed = datetime.fromisoformat(throttled_until.replace("Z", "+00:00"))
+    expected = (now + timedelta(minutes=10)).replace(microsecond=0)
+    assert parsed == expected
+
+
+def test_get_rate_limit_defer_until_anchors_to_log_mtime(tmp_path: Path) -> None:
+    """Issue #1997 criterion 3: get_rate_limit_defer_until uses the same
+    emission-time anchor — ``emitted_at + reset + slack + margin``, not
+    ``now + reset + slack + margin``. The window is still live here, so the
+    stored value IS the anchored deadline (no clamp)."""
+    from datetime import UTC, datetime, timedelta
+
+    now = datetime.now(UTC).replace(microsecond=0)
+    emitted_at = now - timedelta(minutes=10)
+    log_path = tmp_path / "session.log"
+    log_path.write_text(
+        "Error: Reached free model rate limit. Your limit will reset in 37 minutes.\n",
+        encoding="utf-8",
+    )
+    os.utime(log_path, (emitted_at.timestamp(), emitted_at.timestamp()))
+
+    defer_until = get_rate_limit_defer_until(
+        log_path, slack_minutes=2, now=now, resume_margin_seconds=30
+    )
+
+    assert defer_until is not None
+    parsed = datetime.fromisoformat(defer_until.replace("Z", "+00:00"))
+    expected = (emitted_at + timedelta(minutes=37 + 2, seconds=30)).replace(microsecond=0)
+    assert parsed == expected
+    # Provably emission-anchored, not classification-anchored (which would
+    # store now + 39.5min — 10 minutes later).
+    assert parsed != (now + timedelta(minutes=37 + 2, seconds=30)).replace(microsecond=0)
+
+
+def test_get_rate_limit_defer_until_expired_window_clamps_to_now(tmp_path: Path) -> None:
+    """Issue #1997 criterion 2 (defer variant): an anchored defer window
+    already in the past clamps to ``now`` — the caller's ``now < defer_until``
+    check then reports not-deferred (a zero-length window, already expired)."""
+    from datetime import UTC, datetime, timedelta
+
+    now = datetime.now(UTC).replace(microsecond=0)
+    emitted_at = now - timedelta(minutes=45)
+    log_path = tmp_path / "session.log"
+    log_path.write_text(
+        "Error: Reached free model rate limit. Your limit will reset in 37 minutes.\n",
+        encoding="utf-8",
+    )
+    os.utime(log_path, (emitted_at.timestamp(), emitted_at.timestamp()))
+
+    defer_until = get_rate_limit_defer_until(log_path, slack_minutes=2, now=now)
+
+    assert defer_until is not None
+    parsed = datetime.fromisoformat(defer_until.replace("Z", "+00:00"))
+    assert parsed == now
+    # Provably the clamp, not the raw anchored value (~6 minutes in the past).
+    assert parsed > emitted_at + timedelta(minutes=37 + 2)

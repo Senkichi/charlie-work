@@ -64,6 +64,7 @@ SUPERVISOR_LOCK_FILENAME = "supervisor.lock"
 PENDING_SYNC_FILENAME = "pending-sync.json"
 SELF_DEPLOY_FAILURE_STATE_FILENAME = "self-deploy-failures.json"
 ZERO_PASS_STREAK_STATE_FILENAME = "zero-pass-streak.json"
+DISPATCH_DEFERRAL_STREAK_FILENAME = "dispatch-deferral-streaks.json"
 QUEUE_SYNC_COVERAGE_CACHE_FILENAME = "queue-sync-coverage-cache.json"
 # Issue #1834: bounded ETag/conditional-GET cache for the pooled HTTP
 # transport's REST-GET requests. Sibling of QUEUE_SYNC_COVERAGE_CACHE_FILENAME
@@ -182,6 +183,17 @@ def self_deploy_failure_state_path(state_root: Path) -> Path:
     :func:`pending_sync_path` -- same directory, same atomic-write contract.
     """
     return state_root / SELF_DEPLOY_FAILURE_STATE_FILENAME
+
+
+def dispatch_deferral_streak_path(state_root: Path) -> Path:
+    """Return the per-lane consecutive-dispatch-deferral counter path (issue #1986).
+
+    Sibling of :func:`zero_pass_streak_state_path` -- same directory, same
+    atomic-write contract. A sidecar rather than a ``state.json`` key
+    because one of the deferral reasons *is* the state lock being busy, and
+    a counter that needs that lock cannot count that deferral.
+    """
+    return state_root / DISPATCH_DEFERRAL_STREAK_FILENAME
 
 
 def zero_pass_streak_state_path(state_root: Path) -> Path:

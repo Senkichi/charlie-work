@@ -192,7 +192,29 @@ def _parse_review_verdict_from_log(log_path: Path) -> dict[str, Any] | None:
     return _extract_verdict_from_stream_json(log_text)
 
 
-def _parse_review_verdict_from_events(events_path: Path) -> dict[str, Any] | None:
+def _session_mtime_cutoff(started_at: str | None) -> datetime | None:
+    """Oldest mtime a file may have and still belong to the session.
+
+    ``started_at`` minus ``_REVIEW_FALLBACK_MTIME_SLACK_S``. ``None`` when
+    ``started_at`` is missing or unparseable: then there is no safe gate, and
+    callers must treat every file as stale.
+    """
+    if not started_at:
+        return None
+    try:
+        cutoff = datetime.fromisoformat(started_at.replace("Z", "+00:00")) - timedelta(
+            seconds=_REVIEW_FALLBACK_MTIME_SLACK_S
+        )
+    except ValueError:
+        return None
+    if cutoff.tzinfo is None:
+        cutoff = cutoff.replace(tzinfo=UTC)
+    return cutoff
+
+
+def _parse_review_verdict_from_events(
+    events_path: Path, *, started_at: str | None
+) -> dict[str, Any] | None:
     """Extract a fenced JSON verdict block from a reviewer's events.jsonl.
 
     Fallback for when ``_parse_review_verdict_from_log`` fails: the log may be
@@ -201,9 +223,26 @@ def _parse_review_verdict_from_events(events_path: Path) -> dict[str, Any] | Non
     lines. Decodes real stream-json events (``assistant``/``result``) as well
     as the legacy ``assistant_message`` shape.
 
-    Returns the parsed dict on success, or ``None`` if no valid block is found.
+    The file is mtime-gated to the reviewer session's ``started_at``, like
+    ``_parse_review_verdict_from_files``. ``issue-N-review.events.jsonl`` is
+    written only by the claude-code reviewer, and it is keyed by PR, not by
+    session. A devin-shell reviewer never writes one. So when a devin review
+    of the next round ends without a verdict, this path used to parse the
+    *previous* claude-code round's events file and record that old verdict
+    against the new head. The prompt quotes those findings, so they looked
+    plausible (issue #2029: eight verdicts fleet-wide on 2026-09-29).
+    A missing or unparseable ``started_at`` means there is no safe gate, so the
+    fallback is skipped.
+
+    Returns the parsed dict on success, or ``None`` if no valid block is found
+    in a file written during this session.
     """
+    cutoff = _session_mtime_cutoff(started_at)
+    if cutoff is None:
+        return None
     try:
+        if datetime.fromtimestamp(events_path.stat().st_mtime, tz=UTC) < cutoff:
+            return None
         raw_text = events_path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None
@@ -248,16 +287,9 @@ def _parse_review_verdict_from_files(
 
     Returns ``(verdict, source_path)`` or ``None``.
     """
-    if not started_at:
+    cutoff = _session_mtime_cutoff(started_at)
+    if cutoff is None:
         return None
-    try:
-        cutoff = datetime.fromisoformat(started_at.replace("Z", "+00:00")) - timedelta(
-            seconds=_REVIEW_FALLBACK_MTIME_SLACK_S
-        )
-    except ValueError:
-        return None
-    if cutoff.tzinfo is None:
-        cutoff = cutoff.replace(tzinfo=UTC)
 
     try:
         log_text = log_path.read_text(encoding="utf-8", errors="replace")
@@ -499,6 +531,26 @@ def body_has_crash_signature(text: str) -> bool:
     )
 
 
+# Devin CLI's headless (--print, ``auto`` permission mode) rejection notice: an
+# exec the classifier does not auto-approve is auto-rejected and the whole
+# session ENDS with no result event (issue #2011). The signature lands in the
+# process log, so it is matched there.
+EXEC_REJECTED_LOG_SIGNATURE = "rejected a tool call that requires confirmation"
+CAUSE_REVIEWER_EXEC_REJECTED = "reviewer_exec_rejected"
+
+
+def _log_reports_exec_rejection(log_path: Path) -> bool:
+    """True when the reviewer's log carries Devin's exec-rejection signature.
+
+    Never raises: an unreadable/missing log is "no signal".
+    """
+    try:
+        text = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    return EXEC_REJECTED_LOG_SIGNATURE in text.lower()
+
+
 # Fields extracted from the stream-json ``result`` event's terminal payload
 # (issue #1354). These are the fields that diagnose WHY the session ended:
 # ``is_error`` / ``subtype`` / ``api_error_status`` / ``terminal_reason`` /
@@ -606,7 +658,12 @@ def _extract_terminating_cause(
     # stream-cut signal; when only an exit code is available, the cause
     # is the exit code.
     if "cause" not in cause:
-        if result_event is not None:
+        if result_event is None and _log_reports_exec_rejection(log_path):
+            # Issue #2011: the session ran, then ended on a rejected exec.
+            # Distinct from a stream cut (and from exit_code:N, which a
+            # rejected-exec session also carries).
+            cause["cause"] = CAUSE_REVIEWER_EXEC_REJECTED
+        elif result_event is not None:
             terminal_reason = result_event.get("terminal_reason")
             subtype = result_event.get("subtype")
             is_error = result_event.get("is_error")
@@ -774,7 +831,24 @@ def _extract_review_session_summary(
     else:
         reason = REVIEW_MISS_DIED_MID_SESSION
 
-    if reason == REVIEW_MISS_LAUNCH_FAILED:
+    # Issue #2011: a session ended by Devin's exec rejection did run; the
+    # "failed to start" heading would be false. ``reason`` is deliberately left
+    # untouched (launch_failed / died_mid_session) because it feeds the #583
+    # rollback guard and many consumers; only the comment text and the
+    # terminating cause distinguish it.
+    exec_rejected = _log_reports_exec_rejection(log_path)
+
+    if exec_rejected:
+        parts = [f"{REVIEW_SESSION_SUMMARY_HEADING}\n"]
+        parts.append(
+            "The automated reviewer started and ran, then its session was ended "
+            "when it attempted a shell command that headless mode does not "
+            "auto-approve (the command was rejected and the session stopped). "
+            "No verdict was produced. This is a reviewer permission-policy "
+            "failure, not a judgement about this PR.\n"
+        )
+        parts.append("\n### Reviewer process output:\n")
+    elif reason == REVIEW_MISS_LAUNCH_FAILED:
         parts = [f"{REVIEW_SESSION_FAILED_HEADING}\n"]
         parts.append(
             "The automated reviewer exited before running a single turn, so no "

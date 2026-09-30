@@ -48,7 +48,9 @@ def test_stalled_worker_with_rate_limit_signature_is_deferred(
         "Error: Reached overall message rate limit. Please try again later. "
         "Your limit will reset in 10 minutes.\n"
     )
-    sessions_dir, state_file, _ = _make_stalled_devin_session(tmp_path, issue_number, log_text)
+    sessions_dir, state_file, log_path = _make_stalled_devin_session(
+        tmp_path, issue_number, log_text
+    )
 
     killed = []
     monkeypatch.setattr(
@@ -83,10 +85,14 @@ def test_stalled_worker_with_rate_limit_signature_is_deferred(
     assert sidecar["rate_limit_defer_until"] is not None
     defer_until = datetime.fromisoformat(sidecar["rate_limit_defer_until"].replace("Z", "+00:00"))
     margin_seconds = config.runtime.throttle_resume_margin_s
-    expected = (frozen_now + timedelta(minutes=10 + 2, seconds=margin_seconds)).replace(
-        microsecond=0
-    )
-    assert defer_until == expected
+    # Issue #1997: the defer window is anchored at the log's emission time —
+    # the fixture's 30-minute-old mtime — so it lands in the past (the
+    # 10-minute provider reset already elapsed while the worker sat
+    # stalled) and clamps to ``now``: a zero-length, already-expired
+    # deferral.
+    log_mtime = datetime.fromtimestamp(log_path.stat().st_mtime, UTC)
+    assert log_mtime + timedelta(minutes=10 + 2, seconds=margin_seconds) < frozen_now
+    assert defer_until == frozen_now.replace(microsecond=0)
 
     state = json.loads(state_file.read_text(encoding="utf-8"))
     events = [e for e in state.get("events", []) if e.get("kind") == "session_rate_limit_deferred"]
@@ -177,7 +183,7 @@ def test_deferred_worker_past_deadline_is_killed(
     # internal sample) staying within 5 minutes of each other under CI load.
     frozen_now = datetime.now(UTC)
     past_defer = (frozen_now - timedelta(minutes=5)).isoformat().replace("+00:00", "Z")
-    sessions_dir, state_file, _ = _make_stalled_devin_session(
+    sessions_dir, state_file, log_path = _make_stalled_devin_session(
         tmp_path, issue_number, log_text, rate_limit_defer_until=past_defer
     )
 
@@ -216,9 +222,13 @@ def test_deferred_worker_past_deadline_is_killed(
     assert state.get("throttled_until") is not None
     throttled_until = datetime.fromisoformat(state["throttled_until"].replace("Z", "+00:00"))
     margin = timedelta(seconds=config.runtime.throttle_resume_margin_s)
-    expected_min = datetime.now(UTC) + timedelta(minutes=10) + margin - timedelta(minutes=1)
-    expected_max = datetime.now(UTC) + timedelta(minutes=10) + margin + timedelta(minutes=1)
-    assert expected_min <= throttled_until <= expected_max
+    # Issue #1997: the cooldown is anchored at the log's emission time — the
+    # fixture's 30-minute-old mtime — so the raw window is already expired
+    # (the 10-minute reset elapsed while the worker sat stalled) and the
+    # deadline clamps to the classification clock ``frozen_now``.
+    log_mtime = datetime.fromtimestamp(log_path.stat().st_mtime, UTC)
+    assert log_mtime + timedelta(minutes=10) + margin < frozen_now
+    assert throttled_until == frozen_now.replace(microsecond=0)
 
 
 def test_stalled_worker_without_rate_limit_signature_is_killed(

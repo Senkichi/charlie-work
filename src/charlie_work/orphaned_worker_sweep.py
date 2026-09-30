@@ -36,7 +36,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from .dispatch_selection import _credit_worker_death
+from .dead_worker_classification import classify_and_credit_dead_worker
 from .orphaned_worker_review_drain import OrphanedWorkerReviewRoute
 from .process_utils import find_worker_terminal_status
 from .review_decision import review_decision
@@ -101,13 +101,18 @@ def maybe_reap_dead_dispatched_worker(
     reaped.
 
     The exemption is bounded by the throttle window it exists to ride
-    out. Once ``throttled_until`` has passed -- or no window was ever
-    stamped -- the #654 backstop resumes: in the PR-linked case the
-    sub-branches only emit drift once and then short-circuit on the
-    fingerprint (a no-op clean exit, a non-request_changes decision, a
-    head change without a review callback), so a stamp that held forever
-    would reintroduce exactly the wedge this backstop fixes. An expired
-    or unparseable window fails closed to the normal reap timer.
+    out plus one backstop grace (``dead_dispatched_reap_minutes``) past
+    its end — issue #1997's emission-anchored windows can be armed
+    already expired, and the entry still deserves the caller's normal
+    handling (reclaim to the dispatchable pool) rather than an instant
+    escalation. Once the window has been over longer than that grace --
+    or no window was ever stamped -- the #654 backstop resumes: in the
+    PR-linked case the sub-branches only emit drift once and then
+    short-circuit on the fingerprint (a no-op clean exit, a
+    non-request_changes decision, a head change without a review
+    callback), so a stamp that held forever would reintroduce exactly the
+    wedge this backstop fixes. A long-expired or unparseable window fails
+    closed to the normal reap timer.
 
     Issue #1993: after the window, the grace runs from ``max(orphan_drift_at,
     throttled_until)`` (#1976 was reaped 4 dispatchable minutes after its
@@ -139,6 +144,15 @@ def maybe_reap_dead_dispatched_worker(
         if throttled_until_dt is not None:
             if throttled_until_dt > now:
                 return state, False
+            # Issue #1997: the throttle window is anchored at the provider
+            # message's emission time, so it can be armed already expired —
+            # the reset predated classification. The stamp still means the
+            # death was a fleet-wide provider condition, never a
+            # worker-quality signal, so the grace anchors at the window's
+            # own end (``max``): a born-expired window still leaves one
+            # backstop grace for the caller's normal handling to reclaim
+            # the issue before this timed reap resumes. A stamp whose
+            # window ended longer ago than that fails closed to the timer.
             grace_anchor = max(drift_dt, throttled_until_dt)
     if (now - grace_anchor).total_seconds() / 60 < dead_dispatched_reap_minutes:
         return state, False
@@ -481,12 +495,12 @@ def handle_dead_worker_with_pr(
                 # #1684 exemption the rework lanes apply, so the
                 # death can never inflate ``worker_death_at`` for a
                 # later, genuinely different death's cap check.
+                # Issue #2002: classify the dead worker's sidecar
+                # log at credit time — see dead_worker_classification.
                 death_ts = _wf.utc_now()
-                if not is_provider_throttle_failure(entry.get("dead_worker_failure_kind")):
-                    entry["worker_death_at"] = _credit_worker_death(
-                        entry,
-                        at=death_ts,
-                    )
+                death_kind = classify_and_credit_dead_worker(
+                    entry, sessions_dir, issue_number, state, config, at=death_ts
+                )
                 sweep_events.append(
                     (
                         "orphaned_worker_recovered",
@@ -500,6 +514,7 @@ def handle_dead_worker_with_pr(
                             "exit_code": terminal_exit_code,
                             "duration_seconds": terminal_duration_seconds,
                             "worker_death_at": death_ts,
+                            "failure_kind": death_kind,
                         },
                     )
                 )
@@ -662,11 +677,10 @@ def handle_dead_worker_with_pr(
                 death_ts = _wf.utc_now()
                 # Issue #1917: provider-throttle deaths are not credited —
                 # same #1684 exemption as the request_changes branch above.
-                if not is_provider_throttle_failure(entry.get("dead_worker_failure_kind")):
-                    entry["worker_death_at"] = _credit_worker_death(
-                        entry,
-                        at=death_ts,
-                    )
+                # Issue #2002: classify the sidecar log before crediting.
+                death_kind = classify_and_credit_dead_worker(
+                    entry, sessions_dir, issue_number, state, config, at=death_ts
+                )
                 sweep_events.append(
                     (
                         "orphaned_worker_recovered",
@@ -682,6 +696,7 @@ def handle_dead_worker_with_pr(
                             "exit_code": terminal_exit_code,
                             "duration_seconds": terminal_duration_seconds,
                             "worker_death_at": death_ts,
+                            "failure_kind": death_kind,
                         },
                     )
                 )
@@ -737,12 +752,20 @@ def handle_dead_worker_with_pr(
                         # Issue #1917: provider-throttle deaths are
                         # not credited — same #1684 exemption as the
                         # branches above.
+                        # Issue #2002: an open PR proves the worker produced
+                        # real work and this site has no clean-exit guard, so
+                        # do NOT log-classify (#656 false-positive class) --
+                        # only an existing stamp is consulted.
                         death_ts = _wf.utc_now()
-                        if not is_provider_throttle_failure(entry.get("dead_worker_failure_kind")):
-                            entry["worker_death_at"] = _credit_worker_death(
-                                entry,
-                                at=death_ts,
-                            )
+                        death_kind = classify_and_credit_dead_worker(
+                            entry,
+                            sessions_dir,
+                            issue_number,
+                            state,
+                            config,
+                            at=death_ts,
+                            classify_log=False,
+                        )
                         sweep_events.append(
                             (
                                 "orphaned_worker_advanced_to_pr_open",
@@ -758,6 +781,7 @@ def handle_dead_worker_with_pr(
                                     "duration_seconds": terminal_duration_seconds,
                                     "label_write_ok": True,
                                     "worker_death_at": death_ts,
+                                    "failure_kind": death_kind,
                                 },
                             )
                         )

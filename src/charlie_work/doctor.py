@@ -22,6 +22,7 @@ from .doctor_allocation import _check_runner_allocation
 from .doctor_config_drift import _check_aviator_required_checks, _check_triage_label_map
 from .doctor_cross_repo import _check_cross_repo_escalations
 from .doctor_local_backend import _check_local_issue_backend
+from .doctor_worker_permissions import _check_claude_worker_permissions
 from .doctor_sync_starvation import _check_sync_starvation
 from .fleet_paths import fleet_dir, fleet_dir_virtualization
 from .fleet_registry import _load_registry
@@ -1361,6 +1362,7 @@ def run_doctor(
     # Always runs (not gated on --adapter-probe): these are config/environment
     # checks, not external CLI probes. Read-only — never mutates the ledger.
     _probe_api_worker(add, paths, config, now=resolved_now)
+    _check_claude_worker_permissions(add, repo_root, config)
 
     if adapter_probe:
         _probe_adapter(add, repo_root, config)

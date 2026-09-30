@@ -18,6 +18,7 @@ from .adapters import (
 from .claude_code import (
     launch_claude_worker,
     resolve_review_effort,
+    worker_permission_denied,
     run_quota_probe,  # noqa: F401  (deliberate re-export; used by moved L01 b3 delegates via _wf.)
 )
 from .api_worker import launch_api_worker
@@ -268,6 +269,9 @@ from .verdict_parsing import (  # noqa: F401  (deliberate re-export)
     REVIEW_MISS_LAUNCH_FAILED,
     REVIEW_MISS_DIED_MID_SESSION,
     CAUSE_UNKNOWN,
+    CAUSE_REVIEWER_EXEC_REJECTED,
+    EXEC_REJECTED_LOG_SIGNATURE,
+    _log_reports_exec_rejection,
     _VERDICT_FENCE_RE,
     _REVIEW_MD_PATH_RE,
     _REVIEW_FALLBACK_FILE_MAX_BYTES,
@@ -283,6 +287,7 @@ from .verdict_parsing import (  # noqa: F401  (deliberate re-export)
     _parse_review_verdict_from_log,
     _parse_review_verdict_from_events,
     _parse_review_verdict_from_files,
+    _session_mtime_cutoff,
     _reviewer_session_metrics,
     _log_tail_throttled,
     _extract_terminating_cause,
@@ -1878,7 +1883,18 @@ def _detect_and_handle_orphaned_workers(
             # ``reap_escalations`` transition applies the operator-queue
             # label edge.
             worker_outcome = worker_outcomes.get(issue_number)
-            if isinstance(worker_outcome, dict) and worker_outcome.get("outcome") == "blocked":
+            # Issue #2010: a ``blocked`` outcome (or log tail) that is just the
+            # headless permission-denial signature is a worker-config defect,
+            # not a structurally impossible task -- it must not reach the
+            # operator queue as if the task were blocked; it falls through to
+            # the ordinary redispatch path.
+            if (
+                isinstance(worker_outcome, dict)
+                and worker_outcome.get("outcome") == "blocked"
+                and not worker_permission_denied(
+                    sessions_dir, issue_number, str(worker_outcome.get("detail") or "")
+                )
+            ):
                 label_write_ok = True
                 for label in sorted(active_labels):
                     if not gh.remove_issue_label(issue_number, label):

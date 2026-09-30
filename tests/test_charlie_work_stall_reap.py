@@ -330,7 +330,7 @@ def test_stall_reap_classifies_rate_limit_before_stalled_fallback(tmp_path: Path
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
 
-    sidecar, _log_file = _make_stalled_sidecar(
+    sidecar, log_file = _make_stalled_sidecar(
         sessions_dir,
         1034,
         log_text=(
@@ -359,14 +359,25 @@ def test_stall_reap_classifies_rate_limit_before_stalled_fallback(tmp_path: Path
     updated_sidecar = json.loads(sidecar.read_text(encoding="utf-8"))
     assert updated_sidecar["failure_kind"] == "rate_limited"
 
-    # throttled_until must be persisted to state.json, roughly now + 7 minutes
-    # plus the resume margin.
+    # throttled_until must be persisted to state.json — issue #1997 anchors
+    # the window at the log's emission time (the fixture's ~25-minute-old
+    # mtime), so mtime + 7 minutes + margin is already in the past and the
+    # deadline clamps to "now": the provider's 7-minute reset elapsed while
+    # the worker sat stalled, so no idle time is left to impose.
     state = load_state(paths.state_file)
     throttled_until = state.get("throttled_until")
     assert throttled_until is not None
     throttle_time = datetime.fromisoformat(throttled_until.replace("Z", "+00:00"))
+    # The stored timestamp is second-precision; compare against the
+    # truncated ``before`` so a sub-second boundary cannot flake.
+    assert before.replace(microsecond=0) <= throttle_time <= after
+    # The clamp floor must be "now", not the raw anchored window (~18 minutes
+    # in the past) nor the pre-#1997 "now + 7 minutes" classification-time
+    # anchoring.
+    log_mtime = datetime.fromtimestamp(log_file.stat().st_mtime, UTC)
     margin = timedelta(seconds=config.runtime.throttle_resume_margin_s)
-    assert before + timedelta(minutes=6) <= throttle_time <= after + timedelta(minutes=8) + margin
+    assert log_mtime + timedelta(minutes=7) + margin < throttle_time
+    assert throttle_time < before + timedelta(minutes=7)
 
     # The reap event must carry the resolved failure_kind.
     #

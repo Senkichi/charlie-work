@@ -19,6 +19,7 @@ class through the installer.
 from __future__ import annotations
 
 import charlie_work.workflow as _wf
+from charlie_work.dispatch_deferral import records_deferral
 from pathlib import Path
 from typing import Any
 
@@ -215,6 +216,7 @@ def _worktree_still_unsafe(self, issue_number: int, state: dict[str, Any]) -> st
         return "worktree safety probe failed; cannot confirm clean"
 
 
+@records_deferral("dispatch_rework")
 def dispatch_rework(
     self,
     limit: int | None = None,
