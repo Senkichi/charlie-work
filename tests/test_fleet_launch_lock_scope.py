@@ -73,7 +73,7 @@ def _config(
     )
 
 
-def _app(tmp_path: Path, lane: str, **config_kw: Any) -> OrchestratorApp:
+def _app(tmp_path: Path, lane: str, *, dry_run: bool = False, **config_kw: Any) -> OrchestratorApp:
     config = _config(**config_kw)
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     paths.root.mkdir(parents=True, exist_ok=True)
@@ -89,7 +89,12 @@ def _app(tmp_path: Path, lane: str, **config_kw: Any) -> OrchestratorApp:
         # No open PR covers the ready issue, so fresh dispatch selects it.
         fake_gh.prs[0]["state"] = "CLOSED"
     app = OrchestratorApp(
-        tmp_path, paths, config, fake_gh, fleet_dir_override=str(tmp_path / "fleet")
+        tmp_path,
+        paths,
+        config,
+        fake_gh,
+        dry_run=dry_run,
+        fleet_dir_override=str(tmp_path / "fleet"),
     )
     if lane == REWORK:
         pr_dir = paths.prs / "pr-456"
@@ -317,6 +322,88 @@ def test_governor_receives_a_live_count_computed_under_the_lock(
     assert gov_calls, "governor never ran"
     assert all(isinstance(live_count, int) and held for live_count, held in gov_calls), gov_calls
     assert count_held and count_held[-1] is True
+
+
+# --- early release: the lock does not outlive the launch window -------------
+
+
+@LANES
+def test_fleet_lock_is_released_before_post_launch_bookkeeping(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lane: str
+) -> None:
+    """Every ``state_lock`` entry after ``_launch_workers`` returns -- the
+    dispatch_pending -> dispatched upgrade and the rest of the pass's
+    bookkeeping -- must observe a FREE fleet lock: the governor -> claim ->
+    launch window the lock exists to serialize closed when the session
+    sidecars landed. Probes are discriminated by whether dispatch_sessions
+    has already run, so the claim-phase entries (held, by design) do not
+    count."""
+    app = _app(tmp_path, lane, fleet_cap=4)
+    calls = _spy_dispatch_sessions(monkeypatch)
+    probes: list[tuple[bool, int]] = []
+    orig_state_lock = wf.state_lock
+
+    def _state_lock_probe(*a: Any, **kw: Any) -> Any:
+        probes.append((_lock_is_free(app), len(calls)))
+        return orig_state_lock(*a, **kw)
+
+    monkeypatch.setattr("charlie_work.workflow.state_lock", _state_lock_probe)
+
+    result = _run(app, lane)
+
+    assert [r.issue_number for r in calls] == [123], result.message
+    post_launch = [free for free, launched in probes if launched]
+    assert post_launch, "no state_lock entry observed after launch"
+    assert all(post_launch), probes
+
+
+# Probe target inside each lane's dry-run planning branch (post-release):
+# fresh dispatch plans from pr_list; remote rework calls issue_view for each
+# selected candidate. Both run strictly after the dry-run release, and any
+# same-named call in the pre-permit scan is filtered out by the boundary.
+_DRY_RUN_PROBE = {FRESH: "pr_list", REWORK: "issue_view"}
+
+
+@LANES
+def test_fleet_lock_is_released_before_dry_run_planning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lane: str
+) -> None:
+    """The dry-run branch releases the realized lock before its read-only
+    planning pass: every planning probe after issue_worker_launch_permit ran
+    must observe a free fleet lock -- without the branch's early release the
+    lock stayed held to the lane's finally, i.e. across the whole planning
+    pass."""
+    app = _app(tmp_path, lane, fleet_cap=4, dry_run=True)
+    calls = _spy_dispatch_sessions(monkeypatch)
+    order = itertools.count()
+    probes: list[tuple[int, bool]] = []
+    boundary: list[int] = []
+
+    probe_name = _DRY_RUN_PROBE[lane]
+    orig_probe = getattr(app.gh, probe_name)
+
+    def _probe(*a: Any, **kw: Any) -> Any:
+        probes.append((next(order), _lock_is_free(app)))
+        return orig_probe(*a, **kw)
+
+    monkeypatch.setattr(app.gh, probe_name, _probe)
+
+    orig_permit = getattr(sys.modules[_SCAN_MOD[lane]], "issue_worker_launch_permit")
+
+    def _permit_boundary(*a: Any, **kw: Any) -> Any:
+        boundary.append(next(order))
+        return orig_permit(*a, **kw)
+
+    monkeypatch.setattr(f"{_SCAN_MOD[lane]}.issue_worker_launch_permit", _permit_boundary)
+
+    result = _run(app, lane)
+
+    assert result.ok, result.message
+    assert calls == [], "a dry run launched workers"
+    assert boundary, "issue_worker_launch_permit never ran"
+    planning_probes = [free for seq, free in probes if seq > boundary[0]]
+    assert planning_probes, f"no {probe_name} probe observed during dry-run planning"
+    assert all(planning_probes), probes
 
 
 # --- holder metadata ---------------------------------------------------------

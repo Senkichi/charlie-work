@@ -15,7 +15,9 @@ Gate sequence -- the ONE implementation, inside
 
 0. provider-throttle / operator-hold PRE-CHECK -- a lock-free ``state.json``
    read. A throttled repo defers here without ever touching the fleet lock,
-   so a throttled fleet cannot saturate it;
+   so a throttled fleet cannot saturate it. The governor has not run at this
+   point, so a pre-check deferral carries ``throttled_until`` and NO governor
+   report fields -- only the step-4 deferral carries those;
 1. fleet lock (``try_acquire_fleet_lock``) realized when
    ``fleet.global_max_concurrent_sessions > 0``, retried with jitter for up
    to ``fleet.launch_lock_wait_seconds`` -- held only across
@@ -225,9 +227,11 @@ class FleetLaunchLock:
 class WorkerLaunchDeferral:
     """The gate refused to issue a permit this pass. Nothing may launch.
 
-    ``governor`` is populated when the governor ran before the deferring gate
-    (the authoritative provider-throttle case), so the deferral payload
-    reports the same governor fields the lanes always reported. ``ok`` is the
+    ``governor`` is populated only when the governor ran before the
+    deferring gate -- i.e. the authoritative provider-throttle read (gate
+    4), whose payload reports the same governor fields the lanes always
+    reported. A pre-check (gate 0) throttle deferral has ``governor=None``:
+    it carries ``throttled_until`` and no governor report fields. ``ok`` is the
     ``CommandResult.ok`` the lanes should surface: ``fleet_lock_held`` is an
     ok-deferral (``True``) so ``dispatch_deferral`` records it and counts it
     toward ``dispatch_starved`` -- that is the visibility the starvation
@@ -390,8 +394,9 @@ def issue_worker_launch_permit(
     # fleet previously still saturated it: the lock was taken before the
     # throttle check and held across the whole scan). The authoritative
     # throttle read still runs under the state lock after the governor
-    # below, so a throttle set after this check cannot slip through, and
-    # the deferred payload from that path keeps its governor fields.
+    # below, so a throttle set after this check cannot slip through. The
+    # deferred payload from THAT path keeps its governor fields; a pre-check
+    # deferral carries none -- the governor has not run.
     pre_state = _wf.load_state(app.paths.state_file)
     if _wf.is_throttled(pre_state):
         return WorkerLaunchDeferral(

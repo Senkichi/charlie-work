@@ -36,6 +36,8 @@ from charlie_work.worker_launch_gate import (
 )
 from charlie_work.workflow import OrchestratorApp
 
+import charlie_work.workflow as wf
+
 FRESH = "fresh"
 REWORK = "rework"
 
@@ -298,14 +300,66 @@ def test_permit_is_refused_once_its_fleet_lock_is_released(
     _assert_refused(results, calls, 1)
 
 
-def test_throttle_deferral_releases_the_permit_owned_lock(tmp_path: Path) -> None:
+def test_throttle_deferral_releases_the_permit_owned_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The AUTHORITATIVE (post-governor) throttle deferral -- not the lock-free
+    pre-check -- must release the permit-owned fleet lock. The throttle is on
+    disk before the call; the patched first ``load_state`` (the pre-check
+    read) sees it unthrottled so the gate proceeds to the fleet lock, the
+    governor, and the state-locked re-read that finds it. The lock object is
+    wrapped so the release itself is observed -- probing the OS lock after
+    the fact cannot see a leaked handle (it is dropped with the deferral and
+    GC releases it)."""
     app = _app(tmp_path, FRESH, fleet_cap=4)
     _throttle(app)
 
-    decision = issue_worker_launch_permit(app, 3)
+    orig_load_state = wf.load_state
+    pre_check_saw_unthrottled = {"done": False}
 
+    def _load_state_hiding_throttle_once(path: Path) -> dict[str, Any]:
+        state = orig_load_state(path)
+        if not pre_check_saw_unthrottled["done"]:
+            pre_check_saw_unthrottled["done"] = True
+            state = {**state, "throttled_until": None}
+        return state
+
+    monkeypatch.setattr("charlie_work.workflow.load_state", _load_state_hiding_throttle_once)
+
+    class _RecordingLock:
+        def __init__(self, inner: Any) -> None:
+            self._inner = inner
+            self.released = False
+
+        def release(self) -> None:
+            self.released = True
+            self._inner.release()
+
+    acquired: list[_RecordingLock] = []
+
+    def _recording_acquire(override: Any) -> Any:
+        real = try_acquire_fleet_lock(override)
+        if real is None:
+            return None
+        wrapped = _RecordingLock(real)
+        acquired.append(wrapped)
+        return wrapped
+
+    decision = issue_worker_launch_permit(app, 3, acquire=_recording_acquire)
+
+    assert pre_check_saw_unthrottled["done"], "the lock-free pre-check never ran"
     assert isinstance(decision, WorkerLaunchDeferral)
     assert decision.reason == "provider_throttled"
+    # Proof the POST-governor path deferred: a pre-check deferral carries no
+    # governor (it ran before the governor); this one does, and its report
+    # fields reach the lane payload.
+    assert decision.governor is not None
+    fields = decision.report_fields()
+    assert fields["throttled_until"] is not None
+    assert fields["fleet_concurrency_limit"] == 4
+    # The deferral released the lock it owned.
+    assert len(acquired) == 1
+    assert acquired[0].released, "a deferring permit leaked the fleet lock"
     lock = try_acquire_fleet_lock(app.fleet_dir_override)
     assert lock is not None, "a deferring permit leaked the fleet lock"
     lock.release()
