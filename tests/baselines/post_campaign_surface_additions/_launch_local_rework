@@ -1,0 +1,1 @@
+Issue #2039: local rework launch gates (orchestration/local_lanes.py). Split out of _local_dispatch_rework so the gated launch runs under the fleet lock; superseded by the shared worker launch permit (#2041).
