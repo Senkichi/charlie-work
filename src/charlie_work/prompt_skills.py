@@ -58,18 +58,31 @@ def provisioned_skills(repo_root: Path, skill_dirs: Iterable[str]) -> frozenset[
 
 
 def active_prompt_variants(
-    worker_harness: str, repo_root: Path | None, search_dirs: Sequence[Path] = ()
+    worker_harness: str | Sequence[str],
+    repo_root: Path | None,
+    search_dirs: Sequence[Path] = (),
 ) -> tuple[str, ...]:
     """Section variants to render a worker/rework prompt under.
 
     ``(SKILLS_VARIANT,)`` when ``worker_harness`` loads project skills and
     ``repo_root`` ships every skill the loop declares; otherwise ``()``, the plain
     git/gh loop that needs nothing beyond the shell.
+
+    ``worker_harness`` may be every harness of the worker role chain (issue
+    #2086): the prompt is rendered before launch-time selection picks an
+    entry, so the skills loop is used only when *every* chain harness can load
+    every declared skill. A single harness string behaves exactly as before.
     """
-    capabilities = HARNESS_REGISTRY.get(worker_harness)
-    if capabilities is None or not capabilities.skill_dirs or repo_root is None:
+    harnesses = (worker_harness,) if isinstance(worker_harness, str) else tuple(worker_harness)
+    if not harnesses or repo_root is None:
         return ()
     declared = declared_skills(search_dirs)
-    if declared and set(declared) <= provisioned_skills(repo_root, capabilities.skill_dirs):
-        return (SKILLS_VARIANT,)
-    return ()
+    if not declared:
+        return ()
+    for harness in harnesses:
+        capabilities = HARNESS_REGISTRY.get(harness)
+        if capabilities is None or not capabilities.skill_dirs:
+            return ()
+        if not set(declared) <= provisioned_skills(repo_root, capabilities.skill_dirs):
+            return ()
+    return (SKILLS_VARIANT,)

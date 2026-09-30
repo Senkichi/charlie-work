@@ -42,6 +42,7 @@ import charlie_work.workflow as _wf
 from charlie_work.worker_pid_stamp import stamp_worker_process
 from charlie_work.adapters import SessionRequest
 from charlie_work.claude_code import resolve_review_effort
+from charlie_work import role_selection
 from charlie_work.fleet_registry import try_acquire_fleet_lock
 from charlie_work.worker_launch_gate import (
     REASON_CONCURRENCY_CAP,
@@ -787,6 +788,21 @@ def _local_dispatch_reviewers(self, *, now: Any = None, launch_lock: Any = None)
 
     if not selected:
         return result
+    # Issue #2086: the reviewer role chain, resolved against the fleet ledger.
+    role_sel = role_selection.select_for_launch(self.config.reviewer.chain)
+    if role_sel.exhausted:
+        # ``result["skipped"]`` is a list of PR numbers; the chain's
+        # SkippedEntry payloads go under ``chain_skipped`` so neither clobbers
+        # the other, and the unlaunched PRs are folded in like the lock deferral.
+        chain_fields = role_sel.report_fields()
+        chain_fields["chain_skipped"] = chain_fields.pop("skipped")
+        return {
+            **result,
+            "deferred_reason": "reviewer_chain_exhausted",
+            **chain_fields,
+            "skipped": [*result["skipped"], *selected],
+        }
+    role_cfg = role_selection.reviewer_config_for(self.config, role_sel)
 
     # Issue #2084: realize the fleet lock now -- after the lock-free scan,
     # before the fleet reviewer count is read -- and hold it through
@@ -812,7 +828,7 @@ def _local_dispatch_reviewers(self, *, now: Any = None, launch_lock: Any = None)
             record = state["prs"].get(str(pr_number), {})
             attempt_count = int(record.get("review_dispatch_attempt_count", 0))
             review_effort_used, review_effort_arm = resolve_review_effort(
-                pr_number, self.config.reviewer, self.config.claude_code
+                pr_number, role_cfg.reviewer, self.config.claude_code
             )
             resolved_efforts[pr_number] = review_effort_used
             resolved_cap = _wf.resolve_review_turn_cap(
@@ -849,7 +865,7 @@ def _local_dispatch_reviewers(self, *, now: Any = None, launch_lock: Any = None)
         )
         self.write_gate.save_state(state)
 
-    reviewer_harness = self.config.reviewer.harness
+    reviewer_harness = role_cfg.reviewer.harness
     reviewer_adapter_settings = self._adapter_settings(adapter=reviewer_harness)
     reviewer_launcher = _wf._REVIEW_LAUNCHERS.get(reviewer_harness)
     launched: list[dict[str, Any]] = []
@@ -891,12 +907,12 @@ def _local_dispatch_reviewers(self, *, now: Any = None, launch_lock: Any = None)
                 head_sha=head_sha,
                 repo_root=self.repo_root,
                 reviews_dir=reviews_dir,
-                config=self.config,
+                config=role_cfg,
                 worker_env=reviewer_adapter_settings.worker_env,
                 materialize_dirs=self.config.dispatch.materialize_dirs,
                 resolved_review_effort=resolved_efforts.get(pr_number),
                 max_turns_override=resolved_turn_caps.get(pr_number),
-                model_override=self.config.reviewer.model or None,
+                model_override=role_cfg.reviewer.model or None,
                 api_worker_config=reviewer_adapter_settings.api_worker_config,
             )
             if launch_record.error or launch_record.pid is None:
@@ -912,6 +928,9 @@ def _local_dispatch_reviewers(self, *, now: Any = None, launch_lock: Any = None)
                     )
                 ):
                     quota_hit = True
+                    role_selection.record_error_quota_hit(
+                        role_sel, launch_record.error, self.config, source="local_launch_quota_hit"
+                    )
                     break
                 failed.append({"pr": pr_number, "error": error_text})
             else:
@@ -925,6 +944,9 @@ def _local_dispatch_reviewers(self, *, now: Any = None, launch_lock: Any = None)
                 )
         except (OSError, GitHubError, ValueError) as exc:
             failed.append({"pr": pr_number, "error": f"{type(exc).__name__}: {exc}"})
+    role_selection.after_review_launch(
+        reviews_dir, self.write_gate, role_sel, [x["pr"] for x in launched]
+    )
 
     with _wf.state_lock(self.paths.state_file):
         state = _wf.load_state(self.paths.state_file)

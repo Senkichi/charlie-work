@@ -9,6 +9,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
+from . import role_selection
 from .adapters import (
     SessionDispatchResult,
     cleanup_stale_session_tmp_files,  # noqa: F401  (deliberate re-export; used by orchestration delegates via _wf.)
@@ -4264,8 +4265,15 @@ class OrchestratorApp:
     def review(
         self,
         pr_number: int,
+        *,
+        force: bool = False,
     ) -> CommandResult:
         """Generate a review packet for a PR.
+
+        ``force`` (issue #2081, ``why-charlie-hate --force-rereview``) voids a
+        terminal verdict even when it is pinned to the live head: the verdict is
+        archived into the rounds archive, the pending stub overwrites it, and a
+        ``verdict_force_voided`` event names the voided decision and head.
 
         When config.test_adequacy.enabled, this method may itself issue a
         request_changes verdict and advance/terminate the rework loop (previously
@@ -5753,12 +5761,26 @@ class OrchestratorApp:
             # corrupt file is left for a human rather than silently
             # overwritten (mirroring the original code's ``else`` branch,
             # which only reset on a real terminal decision).
-            voided_stale_verdict = live_decision_value in (
+            # Issue #2081: ``force`` (``why-charlie-hate --force-rereview``)
+            # voids a terminal verdict even when it is pinned to -- or carried
+            # forward to -- the live head. Before, the flag only skipped the
+            # CLI's #1695 guard and this block voided stale-head verdicts
+            # alone, so a live-head verdict survived the "forced" re-review.
+            is_terminal_verdict = live_decision_value in (
                 "approved",
                 "request_changes",
                 "blocked",
-            ) and (
-                live_reviewed_head_sha is None or live_reviewed_head_sha != pr.get("headRefOid")
+            )
+            voided_stale_verdict = is_terminal_verdict and (
+                force
+                or live_reviewed_head_sha is None
+                or live_reviewed_head_sha != pr.get("headRefOid")
+            )
+            force_voided_verdict = (
+                force
+                and is_terminal_verdict
+                and live_reviewed_head_sha is not None
+                and live_reviewed_head_sha == pr.get("headRefOid")
             )
             if not decision_path.exists() or voided_stale_verdict:
                 if voided_stale_verdict:
@@ -5901,6 +5923,20 @@ class OrchestratorApp:
                 _issue_key = str(issue_number)
                 _issue_entry = state["issues"].get(_issue_key, {})
                 state["issues"][_issue_key] = {**_issue_entry, "merge_alert": "OK"}
+            if force_voided_verdict:
+                state = append_event(
+                    state,
+                    "verdict_force_voided",
+                    {
+                        "pr_number": pr_number,
+                        "issue_number": issue_number,
+                        "voided_decision": live_decision_value,
+                        "voided_reviewed_head_sha": live_reviewed_head_sha,
+                        "verdict_provenance": live_decision.get("verdict_provenance"),
+                        "head_sha": pr.get("headRefOid"),
+                    },
+                    state_path=self.paths.state_file,
+                )
             state = append_event(
                 state,
                 "review_packet",
@@ -6262,9 +6298,21 @@ class OrchestratorApp:
         # probe succeeds, at which point the global quota is cleared.
         quota_alert: dict[str, Any] | None = None
         deferred = False
+        # Issue #2086: resolve the reviewer role chain against the fleet quota
+        # ledger. Every entry restricted defers; a per-repo quota window the
+        # ledger explains is covered (selection already routed past it).
+        role_sel = role_selection.select_for_launch(self.config.reviewer.chain)
+        role_cfg = role_selection.reviewer_config_for(self.config, role_sel)
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
-            if is_reviewer_quota_exhausted(state):
+            if role_sel.exhausted:
+                deferred, probe_mode = True, False
+            elif is_reviewer_quota_exhausted(state) and not role_selection.window_covered(
+                (state.get("reviewer_quota") or {}).get("throttled_until"),
+                role_sel,
+                reason=(state.get("reviewer_quota") or {}).get("reason"),
+                adapter_kind=(state.get("reviewer_quota") or {}).get("adapter_kind"),
+            ):
                 if not is_reviewer_probe_ready(state):
                     deferred = True
                     # Quota deferral is by design, but it must never be silent:
@@ -6333,6 +6381,7 @@ class OrchestratorApp:
                     "missed_verdicts": missed_verdicts,
                     "reconciled_verdicts": reconciled_verdicts,
                     "rescue_review_results": deferred_rescue_results,
+                    **role_sel.chain_report_fields(),
                 },
             )
 
@@ -6752,7 +6801,7 @@ class OrchestratorApp:
                 pr_state = state["prs"].get(str(pr_number), {})
                 attempt_count = int(pr_state.get("review_dispatch_attempt_count", 0))
                 review_effort_used, review_effort_arm = resolve_review_effort(
-                    pr_number, self.config.reviewer, self.config.claude_code
+                    pr_number, role_cfg.reviewer, self.config.claude_code
                 )
                 resolved_review_efforts[pr_number] = review_effort_used
                 # Issue #1439: read the structure multiplier stamped into the
@@ -6830,7 +6879,7 @@ class OrchestratorApp:
         # a review checkout (create_review_checkout never materializes a
         # venv), so the reviewer's model is resolved from
         # ``self.config.reviewer.model`` below instead, exactly as before.
-        reviewer_harness = self.config.reviewer.harness
+        reviewer_harness = role_cfg.reviewer.harness  # issue #2086: the selected chain entry
         reviewer_adapter_settings = self._adapter_settings(adapter=reviewer_harness)
         reviewer_launcher = _REVIEW_LAUNCHERS.get(reviewer_harness)
         for candidate in selected:
@@ -6918,7 +6967,7 @@ class OrchestratorApp:
                     head_sha=head_sha,
                     repo_root=self.repo_root,
                     reviews_dir=reviews_dir,
-                    config=self.config,
+                    config=role_cfg,
                     worker_env=reviewer_adapter_settings.worker_env,
                     materialize_dirs=self.config.dispatch.materialize_dirs,
                     # The review_effort experiment arm was already resolved
@@ -6949,7 +6998,7 @@ class OrchestratorApp:
                     # verbatim by the devin-shell launcher too; ignored by
                     # the api launcher, which always pins the provider's own
                     # model).
-                    model_override=self.config.reviewer.model or None,
+                    model_override=role_cfg.reviewer.model or None,
                     api_worker_config=reviewer_adapter_settings.api_worker_config,
                 )
                 if record.error or record.pid is None:
@@ -6986,6 +7035,9 @@ class OrchestratorApp:
                     )
             except (OSError, GitHubError, ValueError) as exc:
                 failed.append({"pr": pr_number, "error": f"{type(exc).__name__}: {exc}"})
+        role_selection.after_review_launch(
+            reviews_dir, self.write_gate, role_sel, [x["pr"] for x in launched]
+        )
 
         # Upgrade claims outside the launch loop. Successful launches become
         # review_dispatch_dispatched. A quota failure rolls back the claim so
@@ -7055,7 +7107,14 @@ class OrchestratorApp:
                     parse_reset_clock_time(quota_hit_error, now_dt) if quota_hit_error else None
                 )
                 state, quota_record = _set_reviewer_quota_exhausted_with_backoff(
-                    state, self.config, now_dt, reset_at=reset_at
+                    state,
+                    self.config,
+                    now_dt,
+                    reset_at=reset_at,
+                    adapter_kind=role_selection.selection_adapter_kind(role_sel),
+                )
+                role_selection.record_launch_quota_hit(
+                    role_sel, quota_record.get("throttled_until"), source="launch_quota_hit"
                 )
                 # Distinct, queryable event for a launch-time quota hit
                 # (issue #612): mirrors the stalled-sweep event so a quota
@@ -7122,6 +7181,7 @@ class OrchestratorApp:
             "failed": failed,
             "quota_hit": quota_hit,
             "probe_mode": probe_mode,
+            **role_sel.chain_report_fields(),
             "skipped_count": len(dispatchable) - len(selected),
             "deferred_count": len(candidates) - len(dispatchable),
             "escalated_skipped": escalated_skipped,
