@@ -26,7 +26,7 @@ import logging
 import os
 import shutil
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from .subprocess_runner import run_captured
 
@@ -40,8 +40,26 @@ logger = logging.getLogger(__name__)
 _MAX_ANCESTOR_CHAIN_HOPS = 64
 
 
-def _win32_process_ppid_snapshot() -> dict[int, int]:
-    """Snapshot ``pid -> ppid`` for every process via one CIM query.
+class _ProcRow(NamedTuple):
+    """One snapshot row: the parent pid and (where known) the creation stamp.
+
+    ``created`` is an opaque monotone stamp comparable only between rows of the
+    same snapshot (Windows: FILETIME, 100ns ticks). ``None`` means unknown, and
+    an unknown stamp never disqualifies a parent link.
+    """
+
+    ppid: int
+    created: int | None = None
+
+
+def _win32_process_ppid_snapshot() -> dict[int, _ProcRow]:
+    """Snapshot ``pid -> (ppid, creation stamp)`` for every process via one CIM query.
+
+    The creation stamp exists because Windows never reparents: a child's
+    ``ParentProcessId`` keeps naming its parent after the parent exits, and
+    that PID can then be recycled by an unrelated, *younger* process. A walk
+    that trusts the bare ppid follows the recycled PID into a stranger (see
+    ``_self_ancestor_pids``).
 
     Leaner than ``quiesce.list_processes``: it selects only
     ``ProcessId``/``ParentProcessId``, makes a single attempt, and uses a
@@ -62,7 +80,7 @@ def _win32_process_ppid_snapshot() -> dict[int, int]:
     self-pid guard rather than disabling process reaping on a host whose
     process-listing substrate is broken — see ``_self_ancestor_pids``.
     """
-    ppid_by_pid: dict[int, int] = {}
+    ppid_by_pid: dict[int, _ProcRow] = {}
     if not shutil.which("powershell"):
         return ppid_by_pid
     result = run_captured(
@@ -71,7 +89,10 @@ def _win32_process_ppid_snapshot() -> dict[int, int]:
             "-NoProfile",
             "-Command",
             "Get-CimInstance Win32_Process | "
-            "Select-Object ProcessId, ParentProcessId | ConvertTo-Json",
+            "Select-Object ProcessId, ParentProcessId, "
+            "@{Name='CreatedFileTime';Expression="
+            "{if ($_.CreationDate) { $_.CreationDate.ToFileTimeUtc() } else { $null }}} | "
+            "ConvertTo-Json",
         ],
         cwd=Path.cwd(),
         timeout_seconds=10,
@@ -100,11 +121,15 @@ def _win32_process_ppid_snapshot() -> dict[int, int]:
             ppid = int(entry.get("ParentProcessId") or 0)
         except (KeyError, TypeError, ValueError):
             continue
-        ppid_by_pid[pid] = ppid
+        try:
+            created: int | None = int(entry["CreatedFileTime"])
+        except (KeyError, TypeError, ValueError):
+            created = None
+        ppid_by_pid[pid] = _ProcRow(ppid, created)
     return ppid_by_pid
 
 
-def _posix_process_ppid_snapshot(proc_root: Path = Path("/proc")) -> dict[int, int]:
+def _posix_process_ppid_snapshot(proc_root: Path = Path("/proc")) -> dict[int, _ProcRow]:
     """Snapshot ``pid -> ppid`` from procfs (``/proc/<pid>/stat``).
 
     ``proc_root`` is a parameter — not a constant read at call time — so
@@ -113,8 +138,11 @@ def _posix_process_ppid_snapshot(proc_root: Path = Path("/proc")) -> dict[int, i
     Processes that exit or become unreadable mid-scan are skipped: a
     snapshot can never be perfectly atomic, and a vanished entry is not
     worth failing the walk over. Returns ``{}`` where procfs is absent.
+
+    The creation stamp is left unknown: POSIX reparents orphans to init, so a
+    recorded ppid always names a live process and cannot go stale.
     """
-    ppid_by_pid: dict[int, int] = {}
+    ppid_by_pid: dict[int, _ProcRow] = {}
     try:
         entries = list(proc_root.iterdir())
     except OSError:
@@ -127,7 +155,7 @@ def _posix_process_ppid_snapshot(proc_root: Path = Path("/proc")) -> dict[int, i
             # ppid is the first field after ``state`` once comm (which can
             # contain spaces/parens) is split off on the LAST ')'.
             fields = stat_text.rpartition(")")[2].split()
-            ppid_by_pid[int(entry.name)] = int(fields[1])
+            ppid_by_pid[int(entry.name)] = _ProcRow(int(fields[1]))
         except (OSError, ValueError, IndexError):
             continue
     return ppid_by_pid
@@ -145,7 +173,14 @@ def _self_ancestor_pids() -> frozenset[int]:
     matches that ancestry's command lines.
 
     The walk mirrors ``quiesce.self_process_chain``'s termination rules: a
-    parent absent from the snapshot, a cycle, or the hop cap ends it. When
+    parent absent from the snapshot, a cycle, or the hop cap ends it. It adds
+    one more: a parent *created after its child* is not a parent. Windows never
+    reparents, so once an ancestor exits its PID is free to be recycled, and a
+    child's stale ``ParentProcessId`` then names whatever unrelated process
+    took the number. Trusting it put a freshly launched merge-gate runner on
+    the "ancestor" list, and ``kill_process_tree`` refused to kill it (the
+    ``test_local_merge_gate_async`` timeout/restart flake): a real parent
+    always predates its child, so a younger "parent" ends the walk. When
     the snapshot cannot be taken at all the result degrades to
     ``{os.getpid()}`` — on Windows the only producer of orphan PIDs
     (``sweep_orphan_processes``) needs the same CIM substrate, so a broken
@@ -185,8 +220,21 @@ def _self_ancestor_pids() -> frozenset[int]:
     chain: set[int] = {self_pid}
     current = self_pid
     for _ in range(_MAX_ANCESTOR_CHAIN_HOPS):
-        parent = ppid_by_pid.get(current)
-        if parent is None or parent <= 0 or parent in chain:
+        row = ppid_by_pid.get(current)
+        if row is None:
+            break
+        parent = row.ppid
+        if parent <= 0 or parent in chain:
+            break
+        parent_row = ppid_by_pid.get(parent)
+        if (
+            parent_row is not None
+            and row.created is not None
+            and parent_row.created is not None
+            and parent_row.created > row.created
+        ):
+            # Recycled PID: the recorded parent exited and an unrelated,
+            # younger process now holds its number. Not an ancestor.
             break
         chain.add(parent)
         current = parent

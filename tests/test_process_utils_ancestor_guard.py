@@ -236,18 +236,107 @@ def test_self_ancestor_pids_walks_win32_snapshot(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setattr(
         _sweep,
         "_win32_process_ppid_snapshot",
-        lambda: {300: 200, 200: 100, 100: 1, 50: 1},
+        lambda: {
+            300: _sweep._ProcRow(200),
+            200: _sweep._ProcRow(100),
+            100: _sweep._ProcRow(1),
+            50: _sweep._ProcRow(1),
+        },
     )
     monkeypatch.setattr(_sweep.os, "getpid", lambda: 300)
 
     assert _sweep._self_ancestor_pids() == frozenset({300, 200, 100, 1})
 
 
+def test_self_ancestor_pids_rejects_recycled_parent_pid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Windows never reparents: 300's recorded parent (200) exited and its PID
+    was recycled by a process created *after* 300. A real parent always
+    predates its child, so the walk must stop at 300 instead of naming the
+    stranger (and everything above it) as an ancestor -- otherwise a freshly
+    launched merge-gate runner that inherited the number is unkillable.
+    """
+    monkeypatch.setattr(_sweep.os, "name", "nt")
+    monkeypatch.setattr(
+        _sweep,
+        "_win32_process_ppid_snapshot",
+        lambda: {
+            300: _sweep._ProcRow(200, created=5_000),
+            200: _sweep._ProcRow(100, created=9_000),  # younger than its "child"
+            100: _sweep._ProcRow(1, created=1_000),
+        },
+    )
+    monkeypatch.setattr(_sweep.os, "getpid", lambda: 300)
+
+    assert _sweep._self_ancestor_pids() == frozenset({300})
+
+
+def test_self_ancestor_pids_keeps_older_parent_with_stamps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Control for the recycled-pid test: with creation stamps present and
+    every parent older than its child, the whole chain is still returned."""
+    monkeypatch.setattr(_sweep.os, "name", "nt")
+    monkeypatch.setattr(
+        _sweep,
+        "_win32_process_ppid_snapshot",
+        lambda: {
+            300: _sweep._ProcRow(200, created=5_000),
+            200: _sweep._ProcRow(100, created=3_000),
+            100: _sweep._ProcRow(1, created=1_000),
+        },
+    )
+    monkeypatch.setattr(_sweep.os, "getpid", lambda: 300)
+
+    assert _sweep._self_ancestor_pids() == frozenset({300, 200, 100, 1})
+
+
+def test_kill_process_tree_kills_pid_that_only_recycled_an_ancestor_slot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End to end through the real ``_self_ancestor_pids`` walk: a target whose
+    PID merely equals a stale parent link (younger than the caller) is a
+    stranger, not an ancestor, and must reach the platform kill primitive.
+    """
+    own_pid, recycled_pid = 424242, 777
+    monkeypatch.setattr(_sweep.os, "name", "nt")
+    monkeypatch.setattr(_sweep.os, "getpid", lambda: own_pid)
+    monkeypatch.setattr(
+        _sweep,
+        "_win32_process_ppid_snapshot",
+        lambda: {
+            own_pid: _sweep._ProcRow(recycled_pid, created=100),
+            recycled_pid: _sweep._ProcRow(1, created=200),
+        },
+    )
+    monkeypatch.setattr(_pu, "_enumerate_child_pids", lambda _pid: [])
+    monkeypatch.setattr(_pu, "is_pid_alive", lambda _pid, *_a, **_k: False)
+
+    commands: list[Any] = []
+
+    def fake_run_captured(command: Any, **kwargs: Any) -> RunResult:
+        commands.append(command)
+        return RunResult(returncode=0, stdout="", stderr="", error=None)
+
+    monkeypatch.setattr(_pu, "run_captured", fake_run_captured)
+    monkeypatch.setattr(_pu.os, "name", "nt")
+
+    killed = kill_process_tree(recycled_pid)
+
+    assert killed == [recycled_pid]
+    assert any("taskkill" in c for c in commands)
+
+
 def test_self_ancestor_pids_terminates_on_cycle(monkeypatch: pytest.MonkeyPatch) -> None:
     """A cyclic ppid map must not spin the walk — it terminates on the
     already-seen ancestor."""
     monkeypatch.setattr(_sweep.os, "name", "nt")
-    monkeypatch.setattr(_sweep, "_win32_process_ppid_snapshot", lambda: {5: 7, 7: 5})
+    monkeypatch.setattr(
+        _sweep,
+        "_win32_process_ppid_snapshot",
+        lambda: {5: _sweep._ProcRow(7), 7: _sweep._ProcRow(5)},
+    )
     monkeypatch.setattr(_sweep.os, "getpid", lambda: 5)
 
     assert _sweep._self_ancestor_pids() == frozenset({5, 7})
@@ -278,7 +367,9 @@ def test_posix_process_ppid_snapshot_parses_procfs(tmp_path: Path) -> None:
         (proc_dir / "stat").write_text(f"{pid} ({comm}) S {ppid} 1 2 3", encoding="utf-8")
     (tmp_path / "notapid").mkdir()  # non-numeric entry is skipped
 
-    assert _sweep._posix_process_ppid_snapshot(tmp_path) == rows
+    assert _sweep._posix_process_ppid_snapshot(tmp_path) == {
+        pid: _sweep._ProcRow(ppid) for pid, ppid in rows.items()
+    }
 
 
 def test_win32_process_ppid_snapshot_normalizes_single_result(
@@ -297,11 +388,14 @@ def test_win32_process_ppid_snapshot_normalizes_single_result(
         subprocess,
         "run",
         lambda *a, **k: subprocess.CompletedProcess(
-            a, 0, json.dumps({"ProcessId": 7, "ParentProcessId": 3}), ""
+            a,
+            0,
+            json.dumps({"ProcessId": 7, "ParentProcessId": 3, "CreatedFileTime": 99}),
+            "",
         ),
     )
 
-    assert _sweep._win32_process_ppid_snapshot() == {7: 3}
+    assert _sweep._win32_process_ppid_snapshot() == {7: _sweep._ProcRow(3, 99)}
 
 
 def test_win32_process_ppid_snapshot_failure_returns_empty(
