@@ -409,6 +409,9 @@ def test_list_processes_windows_parses_snapshot(monkeypatch: pytest.MonkeyPatch)
 
     monkeypatch.setattr("shutil.which", lambda _name: "C:\\Windows\\powershell.exe")
     monkeypatch.setattr("subprocess.run", lambda *a, **k: _FakeResult())
+    # Deterministic overlay: a real psutil map would stamp a fabricated pid
+    # that happened to collide with a live one.
+    monkeypatch.setattr("charlie_work.quiesce.win32_process_ppid_snapshot", lambda: {})
 
     processes, error = list_processes()
 
@@ -513,6 +516,9 @@ def _win32_listing_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """Get ``list_processes`` past its win32/PATH guards on any platform."""
     monkeypatch.setattr(sys, "platform", "win32")
     monkeypatch.setattr(shutil, "which", lambda name: name)
+    # Keep the creation-time overlay deterministic: the real psutil map
+    # would stamp a fabricated pid that happened to collide with a live one.
+    monkeypatch.setattr("charlie_work.quiesce.win32_process_ppid_snapshot", lambda: {})
 
 
 def test_list_processes_retries_once_on_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
