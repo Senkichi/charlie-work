@@ -58,12 +58,6 @@ def autospec() -> Callable[..., Any]:
 # test. ``None`` when the run was not launched from inside a repository.
 _ENCLOSING_REPO_CONFIG_PATH: Path | None = None
 
-# The GIT_CEILING_DIRECTORIES value as installed by pytest_configure,
-# captured before the function-scoped `_isolate_git_env` fixture merges on
-# top of it per test — lets a test attribute a discovery stop to the
-# session layer specifically.
-_SESSION_GIT_CEILING: str | None = None
-
 # Per-session scratch dir holding the GIT_CONFIG_GLOBAL/GIT_CONFIG_SYSTEM
 # copies installed at configure time; removed at sessionfinish.
 _GIT_ISOLATION_SCRATCH_DIR: Path | None = None
@@ -86,12 +80,11 @@ def pytest_configure(config: pytest.Config) -> None:
         install_session_git_isolation,
     )
 
-    global _GIT_ISOLATION_SCRATCH_DIR, _ENCLOSING_REPO_CONFIG_PATH, _SESSION_GIT_CEILING
+    global _GIT_ISOLATION_SCRATCH_DIR, _ENCLOSING_REPO_CONFIG_PATH
     basetemp = getattr(config.option, "basetemp", None)
     _GIT_ISOLATION_SCRATCH_DIR = install_session_git_isolation(
         basetemp=Path(basetemp) if basetemp else None
     )
-    _SESSION_GIT_CEILING = os.environ.get("GIT_CEILING_DIRECTORIES")
     _ENCLOSING_REPO_CONFIG_PATH = enclosing_repo_config_path()
 
 
