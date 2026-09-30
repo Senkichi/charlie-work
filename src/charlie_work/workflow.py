@@ -35,6 +35,7 @@ from .config import (
 from .harnesses import REVIEWER_HARNESSES
 from .worker_launch_gate import FleetLaunchLock
 from .review_fleet_gate import (
+    fleet_lock_held_result_data,
     fleet_review_lock,
     fleet_review_lock_deferral,
     read_fleet_review_cap,
@@ -102,6 +103,8 @@ from .prompts import (
     unsupplied_placeholders,
 )
 from .review_decision import (
+    classify_verdict_void,
+    force_voided_event_payload,
     record_decision,
     review_decision,
 )
@@ -452,18 +455,10 @@ from .queue_sync_coverage import (  # noqa: F401  (deliberate re-export)
 # LOAD-BEARING RE-EXPORT — NOT AN UNUSED IMPORT. Do not delete; the `noqa`
 # below marks a deliberate re-export, not a lint concession.
 #
-# issue #1317 (spun off from #1283's A6 recon): the dead-worker/session-reap
-# free-function family (25 functions plus the two threshold constants below
-# -- see the module docstring for the full list and the disclosed
-# call-graph judgment calls) now lives in the
-# `charlie_work.dead_worker_sweep` package. Re-exported here, not re-declared, so
-# every existing `charlie_work.workflow.<name>` import and monkeypatch
-# target keeps resolving unchanged — the same pattern `config.py` uses for
-# `RunnerAllocationConfig` and this file's own `.dispatch_selection` /
-# `.escalation` / `.verdict_parsing` / `.rework_prompts` / `.ci_findings` /
-# `.backlog_reachability` / `.stalled_review_reap` blocks above.
-#
-# `_detect_and_handle_orphaned_workers` is likewise re-exported (see below).
+# issue #1317: the dead-worker/session-reap family now lives in the
+# `charlie_work.dead_worker_sweep` package, re-exported here (not re-declared)
+# so every `charlie_work.workflow.<name>` import and monkeypatch target keeps
+# resolving -- the same pattern as the blocks above.
 from .dead_worker_sweep.effects_sessions import (  # noqa: F401  (deliberate re-export)
     STARTUP_DEATH_THRESHOLD_SECONDS,
     _is_startup_death,
@@ -4471,26 +4466,11 @@ class OrchestratorApp:
             # corrupt file is left for a human rather than silently
             # overwritten (mirroring the original code's ``else`` branch,
             # which only reset on a real terminal decision).
-            # Issue #2081: ``force`` (``why-charlie-hate --force-rereview``)
-            # voids a terminal verdict even when it is pinned to -- or carried
-            # forward to -- the live head. Before, the flag only skipped the
-            # CLI's #1695 guard and this block voided stale-head verdicts
-            # alone, so a live-head verdict survived the "forced" re-review.
-            is_terminal_verdict = live_decision_value in (
-                "approved",
-                "request_changes",
-                "blocked",
-            )
-            voided_stale_verdict = is_terminal_verdict and (
-                force
-                or live_reviewed_head_sha is None
-                or live_reviewed_head_sha != pr.get("headRefOid")
-            )
-            force_voided_verdict = (
-                force
-                and is_terminal_verdict
-                and live_reviewed_head_sha is not None
-                and live_reviewed_head_sha == pr.get("headRefOid")
+            voided_stale_verdict, force_voided_verdict = classify_verdict_void(
+                live_decision_value,
+                live_reviewed_head_sha,
+                pr.get("headRefOid"),
+                force=force,
             )
             if not decision_path.exists() or voided_stale_verdict:
                 if voided_stale_verdict:
@@ -4637,14 +4617,9 @@ class OrchestratorApp:
                 state = append_event(
                     state,
                     "verdict_force_voided",
-                    {
-                        "pr_number": pr_number,
-                        "issue_number": issue_number,
-                        "voided_decision": live_decision_value,
-                        "voided_reviewed_head_sha": live_reviewed_head_sha,
-                        "verdict_provenance": live_decision.get("verdict_provenance"),
-                        "head_sha": pr.get("headRefOid"),
-                    },
+                    force_voided_event_payload(
+                        live_decision, pr_number, issue_number, pr.get("headRefOid")
+                    ),
                     state_path=self.paths.state_file,
                 )
             state = append_event(
@@ -4766,11 +4741,10 @@ class OrchestratorApp:
         concurrent reviewer worktrees.
 
         ``launch_lock`` (issue #2084) is supplied by ``@fleet_review_lock``: a
-        pending fleet-launch-lock handle (a no-op while
-        ``fleet.global_max_concurrent_reviews`` is 0) that this method realizes
-        just before candidate selection, holds through claim -> launch, and the
-        decorator releases on every exit path -- the same entry-point-mints /
-        ``finally``-releases shape as the worker lanes.
+        pending fleet-launch-lock handle (no-op while
+        ``fleet.global_max_concurrent_reviews`` is 0) realized just before
+        candidate selection, held through claim -> launch, released by the
+        decorator on every exit path (same shape as the worker lanes).
 
         The double-dispatch protection is a two-phase claim on
         ``state["prs"][pr]``: this method writes ``review_dispatch_pending``,
@@ -5169,26 +5143,20 @@ class OrchestratorApp:
         # return and both deployed fleets run that flag false -- the set was
         # always empty. The repair now derives its own subjects from state in
         # ``_repair_escalated_labels()``, called above that early return.
-        # Issue #2084: realize the fleet lock HERE -- after the lock-free
-        # sweeps/scans above, before the fleet reviewer count is read -- and
-        # hold it through claim -> launch (the caller releases it), so two
-        # repos cannot both read a stale fleet count and over-dispatch the cap.
+        # Issue #2084: realize the fleet lock after the lock-free sweeps, before
+        # the fleet count is read; held through claim -> launch (caller releases).
         lock_deferral = fleet_review_lock_deferral(self, launch_lock)
         if lock_deferral is not None:
             return CommandResult(
                 True,
                 "review dispatch deferred: fleet_lock_held",
-                {
-                    "selected_count": 0,
-                    "attempted_count": 0,
-                    "failed_count": 0,
-                    "launched_count": 0,
-                    "recorded_verdicts": recorded_verdicts,
-                    "missed_verdicts": missed_verdicts,
-                    "reconciled_verdicts": reconciled_verdicts,
-                    "rescue_review_results": rescue_review_results,
-                    **lock_deferral,
-                },
+                fleet_lock_held_result_data(
+                    lock_deferral,
+                    recorded_verdicts=recorded_verdicts,
+                    missed_verdicts=missed_verdicts,
+                    reconciled_verdicts=reconciled_verdicts,
+                    rescue_review_results=rescue_review_results,
+                ),
             )
         selection_state = load_state_locked(self.paths.state_file)
         selection = _select_review_dispatch_candidates(
