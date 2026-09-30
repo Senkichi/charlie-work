@@ -1,0 +1,251 @@
+"""Issue #2086: role-chain config, pure selection, and the fleet quota ledger.
+
+App-level lane tests live in ``test_role_waterfall_workers.py`` and
+``test_role_waterfall_reviewers.py``.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
+import pytest
+from charlie_work import role_chain, role_quota_ledger, role_selection
+from charlie_work.config import ConfigError, build_config_from_data
+from charlie_work.role_chain import RoleEntry
+from charlie_work.role_selection import select_role_entry
+
+NOW = datetime(2026, 9, 30, 12, 0, tzinfo=UTC)
+
+
+def _z(moment: datetime) -> str:
+    return moment.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+# --- config parse / validation ------------------------------------------------
+
+
+def test_default_roles_have_length_one_chains() -> None:
+    config = build_config_from_data({})
+    assert config.worker.fallbacks == ()
+    assert config.reviewer.fallbacks == ()
+    assert config.worker.chain == (RoleEntry(config.worker.harness, config.worker.model),)
+    assert len(config.reviewer.chain) == 1
+
+
+def test_fallbacks_parse_into_frozen_entries_in_order() -> None:
+    config = build_config_from_data(
+        {
+            "worker": {
+                "harness": "devin-shell",
+                "model": "swe-2",
+                "fallbacks": [
+                    {"harness": "claude-code", "model": "claude-sonnet-5-5"},
+                    {"harness": "devin-shell", "model": "swe-1-6"},
+                ],
+            },
+            "reviewer": {
+                "harness": "claude-code",
+                "model": "claude-opus-5-5",
+                "fallbacks": [{"harness": "devin-shell", "model": "swe-2", "effort": "high"}],
+            },
+        }
+    )
+    assert [e.key for e in config.worker.chain] == [
+        ("devin-shell", "swe-2"),
+        ("claude-code", "claude-sonnet-5-5"),
+        ("devin-shell", "swe-1-6"),
+    ]
+    assert config.reviewer.chain[1] == RoleEntry("devin-shell", "swe-2", "high")
+    with pytest.raises(AttributeError):
+        config.worker.fallbacks[0].model = "x"  # type: ignore[misc]
+
+
+@pytest.mark.parametrize(
+    ("section", "fallbacks", "match"),
+    [
+        ("worker", [{"harness": "not-a-harness", "model": "m"}], "harness"),
+        ("reviewer", [{"harness": "manual", "model": "m"}], "harness"),
+        ("worker", [{"harness": "devin-shell", "model": "swe-2"}], "duplicate"),
+        (
+            "worker",
+            [
+                {"harness": "claude-code", "model": "a"},
+                {"harness": "claude-code", "model": "a"},
+            ],
+            "duplicate",
+        ),
+        (
+            "worker",
+            [{"harness": "claude-code", "model": str(i)} for i in range(4)],
+            "at most 3",
+        ),
+        ("worker", {"harness": "claude-code"}, "must be a list"),
+        ("worker", ["claude-code"], "must be a mapping"),
+        ("worker", [{"harness": "claude-code", "effort": "high"}], "unknown key"),
+        ("worker", [{"harness": "claude-code", "model": 5}], "must be a string"),
+        ("worker", [{"harness": "manual"}], "cannot be part of a role chain"),
+    ],
+)
+def test_bad_fallbacks_raise_config_error(section: str, fallbacks: object, match: str) -> None:
+    primary = (
+        {"harness": "devin-shell", "model": "swe-2"}
+        if section == "worker"
+        else {"harness": "claude-code", "model": "claude-opus-5-5"}
+    )
+    with pytest.raises(ConfigError, match=match):
+        build_config_from_data({section: {**primary, "fallbacks": fallbacks}})
+
+
+def test_same_family_fallback_warns_but_loads(caplog: pytest.LogCaptureFixture) -> None:
+    role_chain._WARNED.clear()
+    with caplog.at_level(logging.WARNING, logger="charlie_work.role_chain"):
+        config = build_config_from_data(
+            {
+                "worker": {
+                    "harness": "devin-shell",
+                    "model": "swe-2",
+                    "fallbacks": [{"harness": "claude-code", "model": "claude-sonnet-5-5"}],
+                },
+                "reviewer": {"harness": "claude-code", "model": "claude-opus-5-5"},
+            }
+        )
+    assert len(config.worker.chain) == 2
+    assert any("anthropic-family" in r.getMessage() for r in caplog.records)
+
+
+def test_cross_family_chains_do_not_warn(caplog: pytest.LogCaptureFixture) -> None:
+    role_chain._WARNED.clear()
+    with caplog.at_level(logging.WARNING, logger="charlie_work.role_chain"):
+        build_config_from_data(
+            {
+                "worker": {
+                    "harness": "devin-shell",
+                    "model": "swe-2",
+                    "fallbacks": [{"harness": "devin-shell", "model": "swe-1-6"}],
+                },
+                "reviewer": {"harness": "claude-code", "model": "claude-opus-5-5"},
+            }
+        )
+    assert not [r for r in caplog.records if "family" in r.getMessage()]
+
+
+# --- pure selection -------------------------------------------------------------
+
+CHAIN = (
+    RoleEntry("devin-shell", "swe-2"),
+    RoleEntry("claude-code", "claude-sonnet-5-5"),
+    RoleEntry("devin-shell", "swe-1-6"),
+)
+
+
+def test_select_empty_ledger_picks_primary() -> None:
+    entry, skipped = select_role_entry(CHAIN, {}, NOW)
+    assert entry == CHAIN[0]
+    assert skipped == ()
+
+
+def test_select_skips_restricted_entries_in_order() -> None:
+    until = NOW + timedelta(hours=2)
+    entry, skipped = select_role_entry(CHAIN, {CHAIN[0].key: until}, NOW)
+    assert entry == CHAIN[1]
+    assert [(s.index, s.entry, s.until) for s in skipped] == [(0, CHAIN[0], until)]
+
+    entry, skipped = select_role_entry(CHAIN, {CHAIN[0].key: until, CHAIN[1].key: until}, NOW)
+    assert entry == CHAIN[2]
+    assert [s.index for s in skipped] == [0, 1]
+
+
+def test_select_expired_restriction_returns_to_primary() -> None:
+    entry, skipped = select_role_entry(CHAIN, {CHAIN[0].key: NOW}, NOW)
+    assert entry == CHAIN[0]
+    assert skipped == ()
+
+
+def test_select_all_restricted_returns_none() -> None:
+    later = NOW + timedelta(minutes=5)
+    ledger = {e.key: later + timedelta(minutes=i) for i, e in enumerate(CHAIN)}
+    entry, skipped = select_role_entry(CHAIN, ledger, NOW)
+    assert entry is None
+    assert len(skipped) == 3
+    selection = role_selection.build_selection(CHAIN, ledger, NOW)
+    assert selection.exhausted
+    assert selection.earliest_until == later
+    assert selection.report_fields()["chain_retry_at"] == _z(later)
+
+
+def test_select_ignores_other_models_of_the_same_harness() -> None:
+    entry, _ = select_role_entry(
+        CHAIN, {("devin-shell", "some-other-model"): NOW + timedelta(hours=1)}, NOW
+    )
+    assert entry == CHAIN[0]
+
+
+def test_length_one_chain_never_reads_the_ledger(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _boom() -> dict:
+        raise AssertionError("length-1 chain must not read the ledger")
+
+    monkeypatch.setattr(role_quota_ledger, "load_restrictions", _boom)
+    selection = role_selection.select_for_launch((CHAIN[0],))
+    assert selection.entry == CHAIN[0]
+    assert selection.index == 0
+    assert selection.chain_report_fields() == {}
+
+
+def test_window_covered_only_for_ledger_explained_windows() -> None:
+    until = NOW + timedelta(hours=2)
+    selection = role_selection.build_selection(CHAIN, {CHAIN[0].key: until}, NOW)
+    assert role_selection.window_covered(_z(until), selection)
+    # An operator hold / pre-ledger window that outlasts the ledger still blocks.
+    assert not role_selection.window_covered(_z(until + timedelta(hours=1)), selection)
+    assert not role_selection.window_covered(None, selection)
+    single = role_selection.build_selection(CHAIN[:1], {}, NOW)
+    assert not role_selection.window_covered(_z(until), single)
+
+
+# --- ledger ---------------------------------------------------------------------
+
+
+def test_ledger_path_is_in_the_fleet_dir(tmp_path: Path) -> None:
+    # conftest points CHARLIE_WORK_FLEET_DIR at tmp_path / "fleet".
+    assert role_quota_ledger.ledger_path() == tmp_path / "fleet" / "role_quota_ledger.json"
+
+
+def test_ledger_records_monotonically_and_atomically(tmp_path: Path) -> None:
+    later = NOW + timedelta(hours=3)
+    earlier = NOW + timedelta(hours=1)
+    assert role_quota_ledger.record_restriction(
+        "devin-shell", "swe-2", later, reason="rate_limited", source="t"
+    )
+    assert not role_quota_ledger.record_restriction(
+        "devin-shell", "swe-2", earlier, reason="rate_limited", source="t"
+    )
+    assert role_quota_ledger.load_restrictions() == {("devin-shell", "swe-2"): later}
+    path = role_quota_ledger.ledger_path()
+    assert json.loads(path.read_text(encoding="utf-8"))["version"] == 1
+    assert not path.with_suffix(path.suffix + ".tmp").exists()
+
+
+def test_ledger_tolerates_a_corrupt_file() -> None:
+    path = role_quota_ledger.ledger_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{not json", encoding="utf-8")
+    assert role_quota_ledger.load_restrictions() == {}
+    assert role_quota_ledger.record_restriction(
+        "claude-code", "m", NOW + timedelta(hours=1), reason="quota_exhausted", source="t"
+    )
+
+
+def test_classified_death_records_only_stamped_throttle_kinds() -> None:
+    until = _z(NOW + timedelta(hours=1))
+    stamped = {role_quota_ledger.SESSION_ROLE_KEY: {"harness": "devin-shell", "model": "swe-2"}}
+    assert not role_quota_ledger.record_classified_death({}, "rate_limited", until, source="t")
+    assert not role_quota_ledger.record_classified_death(stamped, "stalled", until, source="t")
+    assert not role_quota_ledger.record_classified_death(
+        stamped, "provider_auth", until, source="t"
+    )
+    assert role_quota_ledger.load_restrictions() == {}
+    assert role_quota_ledger.record_classified_death(stamped, "quota_exhausted", until, source="t")
+    assert set(role_quota_ledger.load_restrictions()) == {("devin-shell", "swe-2")}

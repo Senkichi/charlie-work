@@ -77,6 +77,11 @@ class AdapterSettings:
     api_worker_config: ApiWorkerConfig | None = None
     # Full orchestrator config passed to worktree creation/recovery for liveness probes.
     config: OrchestratorConfig | None = None
+    # Issue #2086: "worker" marks the default worker-role settings (built by
+    # ``_adapter_settings()`` with no adapter override). Only those follow a
+    # role-chain fallback in ``_launch_workers``; rescue-tier and reviewer
+    # settings leave it empty and launch exactly as configured.
+    role: str = ""
 
 
 @dataclass(frozen=True)

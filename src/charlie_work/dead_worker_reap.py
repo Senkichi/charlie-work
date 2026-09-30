@@ -128,6 +128,7 @@ from .pr_create_retry import create_pr_with_retry
 from .process_utils import is_pid_alive
 from .review_decision import review_decision
 from .rework_prompts import _write_rework_prompt
+from . import role_quota_ledger
 from .state import (
     load_state,
     load_state_locked,
@@ -703,6 +704,14 @@ def _detect_and_handle_stalled_sessions(
                         if not write_gate.dry_run:
                             update_worker_log_stat(
                                 sessions_dir, w, rate_limit_defer_until=defer_until
+                            )
+                            role_quota_ledger.record_for_session(  # issue #2086
+                                sessions_dir,
+                                w.adapter_kind,
+                                w.issue_number,
+                                defer_until,
+                                reason="rate_limited",
+                                source="stalled_sessions_rate_limit_defer",
                             )
                         with state_lock(state_file):
                             state = load_state(state_file)

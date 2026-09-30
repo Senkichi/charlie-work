@@ -65,6 +65,7 @@ from .throttle_signatures import (
     match_throttle_tail,
     parse_reset_clock_time,
 )
+from .role_quota_ledger import record_view as _ledger_record  # issue #2086
 from .worker import _alive_review_worker_issue_numbers, iter_workers
 from .worktree import remove_review_checkout
 from .write_gate import WriteGate, require_write_gate
@@ -565,6 +566,7 @@ def _detect_and_handle_stalled_reviews(
                         },
                     )
                 throttled_until = state.get("reviewer_quota", {}).get("throttled_until")
+                _ledger_record(reviews_dir, w, throttled_until, "stalled_review_sweep", write_gate)
             # A session that exhausted its full turn budget did real
             # PR-specific work -- its death is a PR-level outcome (the
             # review didn't fit the budget) regardless of what killed the
