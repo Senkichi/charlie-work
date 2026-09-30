@@ -845,7 +845,9 @@ def _render_rework_prompt(
             **prompt_test_command_values(config.dispatch.test_command, repo_root),
         },
         search_dirs=search_dirs,
-        variants=active_prompt_variants(config.worker.harness, repo_root, search_dirs),
+        variants=active_prompt_variants(
+            [e.harness for e in config.worker.chain], repo_root, search_dirs
+        ),
     )
 
 
