@@ -203,7 +203,7 @@ def test_events_parser_handles_real_stream_json_schema(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    verdict = _parse_review_verdict_from_events(events)
+    verdict = _parse_review_verdict_from_events(events, started_at=_session_start())
 
     assert verdict is not None
     assert verdict["decision"] == "approved"
@@ -216,10 +216,33 @@ def test_events_parser_still_handles_legacy_assistant_message(tmp_path: Path) ->
         encoding="utf-8",
     )
 
-    verdict = _parse_review_verdict_from_events(events)
+    verdict = _parse_review_verdict_from_events(events, started_at=_session_start())
 
     assert verdict is not None
     assert verdict["decision"] == "approved"
+
+
+def _session_start() -> str:
+    return _utc_iso(datetime.now(UTC) - timedelta(minutes=10))
+
+
+def test_events_parser_ignores_events_file_from_an_earlier_round(tmp_path: Path) -> None:
+    """The events file is per-PR, not per-session: an earlier round's must not count."""
+    events = tmp_path / "review.events.jsonl"
+    events.write_text(_stream_json_log(_result_event(VERDICT_TEXT)), encoding="utf-8")
+    stale = (datetime.now(UTC) - timedelta(hours=1)).timestamp()
+    os.utime(events, (stale, stale))
+
+    assert _parse_review_verdict_from_events(events, started_at=_session_start()) is None
+
+
+def test_events_parser_requires_started_at(tmp_path: Path) -> None:
+    """Without a parseable started_at there is no safe mtime gate: no fallback."""
+    events = tmp_path / "review.events.jsonl"
+    events.write_text(_stream_json_log(_result_event(VERDICT_TEXT)), encoding="utf-8")
+
+    assert _parse_review_verdict_from_events(events, started_at=None) is None
+    assert _parse_review_verdict_from_events(events, started_at="not-a-time") is None
 
 
 # --- File fallback (issue #566) ---------------------------------------------
@@ -422,6 +445,95 @@ def test_reap_records_verdict_via_file_fallback(monkeypatch, tmp_path: Path) -> 
     ]
     state = load_state(app.paths.state_file)
     assert state["prs"]["100"]["review_dispatch_status"] == "review_dispatch_completed"
+
+
+def test_reap_does_not_record_previous_rounds_events_verdict(monkeypatch, tmp_path: Path) -> None:
+    """A reviewer that emits no verdict must not inherit the last round's.
+
+    Live on 2026-09-29: round 1 of PR #2017 was reviewed by claude-code, which
+    wrote ``issue-2017-review.events.jsonl``. Round 2 went to a devin-shell
+    reviewer, which ended on a refused exec with no verdict and writes no
+    events file. The fallback parsed round 1's file and recorded its
+    request_changes against the new head. The rework worker found nothing
+    left to do, and the issue wedged in ``dispatched``.
+    """
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    ]
+    app = _dispatch_reviews_app(tmp_path, prs=prs)
+    _write_review_packet(tmp_path, 100, "sha-100")
+    reviews_dir = app._layout.reviews_dir
+    reviews_dir.mkdir(parents=True, exist_ok=True)
+
+    previous_round = reviews_dir / "issue-100-review.events.jsonl"
+    previous_round.write_text(_stream_json_log(_result_event(VERDICT_TEXT)), encoding="utf-8")
+    stale = (datetime.now(UTC) - timedelta(hours=1)).timestamp()
+    os.utime(previous_round, (stale, stale))
+
+    started_at = _utc_iso(datetime.now(UTC) - timedelta(minutes=5))
+    _make_dead_review_sidecar(
+        reviews_dir, 100, "Tool execution was rejected by the user\n", started_at=started_at
+    )
+    _set_review_dispatched_state(app, 100, 10, started_at)
+    monkeypatch.setattr("charlie_work.claude_code.is_worker_alive", lambda *_: False)
+
+    result = app._reap_review_verdicts(reviews_dir)
+
+    assert result["recorded"] == []
+    state = load_state(app.paths.state_file)
+    assert state["prs"]["100"].get("decision") is None
+    assert state["prs"]["100"]["review_dispatch_status"] != "review_dispatch_completed"
+
+
+def test_reap_still_records_verdict_from_this_sessions_events_file(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Control for the gate above: a fresh events file still recovers the verdict."""
+    prs = [
+        {
+            "number": 100,
+            "title": "Fix #10",
+            "url": "https://example.test/pull/100",
+            "headRefName": "agent/issue-10-fix",
+            "baseRefName": "main",
+            "headRefOid": "sha-100",
+            "mergeStateStatus": "CLEAN",
+            "body": "Closes #10",
+            "labels": [],
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+    ]
+    app = _dispatch_reviews_app(tmp_path, prs=prs)
+    _write_review_packet(tmp_path, 100, "sha-100")
+    reviews_dir = app._layout.reviews_dir
+    reviews_dir.mkdir(parents=True, exist_ok=True)
+    (reviews_dir / "issue-100-review.events.jsonl").write_text(
+        _stream_json_log(_result_event(VERDICT_TEXT)), encoding="utf-8"
+    )
+
+    started_at = _utc_iso(datetime.now(UTC) - timedelta(minutes=5))
+    _make_dead_review_sidecar(reviews_dir, 100, "truncated log\n", started_at=started_at)
+    _set_review_dispatched_state(app, 100, 10, started_at)
+    monkeypatch.setattr("charlie_work.claude_code.is_worker_alive", lambda *_: False)
+
+    result = app._reap_review_verdicts(reviews_dir)
+
+    assert result["recorded"] == [
+        {"pr": 100, "issue": 10, "decision": "approved", "verdict_source": "events"}
+    ]
 
 
 # --- parse_claude_events on the real schema ---------------------------------
