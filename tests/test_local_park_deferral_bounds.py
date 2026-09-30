@@ -19,9 +19,6 @@ exit, a regression from the old reclaim/escalate. This file pins:
 
 from __future__ import annotations
 
-import shutil
-import tempfile
-from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -30,6 +27,20 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from _local_park_fixtures import (
+    _add_worktree_commit,
+    _events,
+    _git,
+    _init_repo,
+    _label_names,
+    _local_config,
+    _run_sweep,
+    _seed_dead_dispatched,
+    _sessions_dir,
+    _wg,
+    _write_issue,
+)
+from _local_park_fixtures import _shallow_wts as _register_shallow_wts  # noqa: F401
 from charlie_work.config import LabelConfig
 from charlie_work.dead_dispatched_timer import (
     LOCAL_PARK_DEFER_FIELDS,
@@ -48,30 +59,8 @@ from charlie_work.orphaned_worker_sweep import maybe_reap_dead_dispatched_worker
 from charlie_work.paths import runtime_paths
 from charlie_work.state import load_state, save_state
 from charlie_work.subprocess_runner import RunResult
-from test_orphan_sweep_backstop_local_park import (
-    _add_worktree_commit,
-    _events,
-    _git,
-    _init_repo,
-    _label_names,
-    _local_config,
-    _run_sweep,
-    _seed_dead_dispatched,
-    _sessions_dir,
-    _wg,
-    _write_issue,
-)
 
 _NOW = datetime(2026, 9, 29, 12, 0, tzinfo=UTC)
-
-
-@pytest.fixture
-def shallow_wts() -> Iterator[Path]:
-    """Worktrees root outside ``tmp_path``'s deep nesting (see
-    test_orphan_sweep_local_park.py)."""
-    root = Path(tempfile.mkdtemp(prefix="cwwt1971b-"))
-    yield root
-    shutil.rmtree(root, ignore_errors=True)
 
 
 _GIT_STDERR = "git diff main...agent/x: fatal: bad revision 'main...agent/x'"
