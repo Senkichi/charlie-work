@@ -151,6 +151,7 @@ def test_flip1_a5_live_handoff_finalize_ignores_dispatched_at(tmp_path: Path) ->
         repo_root=tmp_path,
         worktrees_dir=worktrees_dir,
         now=now,
+        sessions_dir=tmp_path / "sessions",
     )
 
     # New (rule 1) behaviour: the outcome predates the current dispatch by
@@ -202,6 +203,7 @@ def test_flip5_live_handoff_finalize_withholds_fresh_outcome_until_threshold(
         repo_root=tmp_path,
         worktrees_dir=worktrees_dir,
         now=now,
+        sessions_dir=tmp_path / "sessions",
     )
 
     # New (rule 5) behaviour: a fresh, on-target, declared-push outcome
@@ -248,6 +250,7 @@ def test_b9_live_handoff_finalize_omitted_pr_created_is_not_a_confirmed_no_pr(
         repo_root=tmp_path,
         worktrees_dir=worktrees_dir,
         now=now,
+        sessions_dir=tmp_path / "sessions",
     )
 
     assert candidates == {}, "an omitted pr_created must not be treated as a confirmed no-PR push"

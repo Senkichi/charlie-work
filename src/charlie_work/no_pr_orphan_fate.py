@@ -17,11 +17,13 @@ namespace so suite patches on ``charlie_work.workflow.<name>`` stay live).
 
 from __future__ import annotations
 
+import dataclasses
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from . import worker_fate
+from .blocked_worker_escalation import is_exempt_blocked
 from .config import WORKER_OUTCOME_FILENAME
 from .state import parse_iso_timestamp
 
@@ -135,13 +137,26 @@ def resolve_pushed_orphan_fate(
     remote_head_sha: str | None,
     ahead_count: int | None,
     now: datetime,
+    sessions_dir: Path,
 ) -> worker_fate.WorkerFate:
     """The branch-aware fate for one no-PR orphan: ``PushedWithoutPr`` exactly
     when the remote shows pushed commits (rules 8/9). ``open_pr_number`` is
     ``None`` -- a no-PR orphan by construction -- and ``unpushed`` is unset (the
     park/reclaim lane owns local-only commits), so this lane never resolves to
     ``Stranded``. Reuses the precompute fate's already-fresh outcome.
+
+    Issue #2010: a ``Blocked`` precompute whose outcome is the headless
+    permission-denial signature is exempt from escalation
+    (``blocked_worker_escalation.is_exempt_blocked``), so it must not shadow
+    the pushed-branch fate either: its ``blocked`` claim is dropped here and
+    the remote ahead count decides, exactly as on origin/main (which never
+    read blocked-ness for the PR-open candidate).
     """
+    outcome = precompute.basis.outcome
+    if outcome is not None and is_exempt_blocked(
+        precompute, sessions_dir=sessions_dir, issue_number=issue_number
+    ):
+        outcome = dataclasses.replace(outcome, outcome=None)
     return worker_fate.resolve_fate(
         worker_fate.FateEvidence(
             issue_number=issue_number,
@@ -152,7 +167,7 @@ def resolve_pushed_orphan_fate(
             pid_alive=False,
             health=None,
             terminal=None,
-            worktree_outcome=precompute.basis.outcome,
+            worktree_outcome=outcome,
             branch=worker_fate.BranchEvidence(
                 remote_head_sha=remote_head_sha,
                 remote_ahead=ahead_count,

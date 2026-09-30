@@ -59,6 +59,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import worker_fate
+from .blocked_worker_escalation import is_exempt_blocked
 from .config import WORKER_OUTCOME_FILENAME, OrchestratorConfig
 from .github import GitHubLike, label_names
 from .state import PASSIVE_OPEN_STATUS, utc_now
@@ -113,6 +114,7 @@ def collect_stale_live_handoff_pids(
     repo_root: Path | None,
     worktrees_dir: Path | None,
     now: datetime,
+    sessions_dir: Path,
     on_fate: Callable[[worker_fate.WorkerFate], None] | None = None,
 ) -> dict[int, dict[str, Any]]:
     """Filesystem-only pre-check: which live-PID entries look finalizable.
@@ -230,9 +232,15 @@ def collect_stale_live_handoff_pids(
         if (
             fresh_outcome is None
             # Rule 2: a blocked declaration wins everywhere -- never finalize
-            # it as a handoff, whatever push flags ride along.
-            or isinstance(fate, worker_fate.Blocked)
-            or fresh_outcome.outcome == "blocked"
+            # it as a handoff, whatever push flags ride along. Issue #2010: a
+            # headless permission-denial "blocked" is exempt (a worker-config
+            # defect, not a blocked task) and is routed as on origin/main.
+            or (
+                isinstance(fate, worker_fate.Blocked)
+                and not is_exempt_blocked(
+                    fate, sessions_dir=sessions_dir, issue_number=issue_number
+                )
+            )
             or fresh_outcome.push_succeeded is not True
             or fresh_outcome.pr_created is not False
         ):

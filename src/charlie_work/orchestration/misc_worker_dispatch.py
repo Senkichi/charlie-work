@@ -27,6 +27,7 @@ from typing import Any
 
 from charlie_work import worker_fate
 from charlie_work.adapters import SessionRequest
+from charlie_work.blocked_worker_escalation import is_exempt_blocked
 from charlie_work.config import WORKER_OUTCOME_FILENAME
 from charlie_work.dead_worker_reap import _emit_session_failed_relabeled
 from charlie_work.fleet_registry import try_acquire_fleet_lock
@@ -231,10 +232,15 @@ def _route_phantom_live_worker(
         # untouched instead: the reaper lane's next pass resolves the same
         # fresh `Blocked` fate with real branch evidence and escalates it
         # exactly as it already does for a dead worker.
+        # Issue #2010: a permission-denial ``blocked`` (a worker-config defect
+        # the reaper lane will NOT escalate) is not deferred to that lane: it
+        # takes the ordinary path, exactly as on origin/main.
+        escalatable_blocked = isinstance(fate, worker_fate.Blocked) and not is_exempt_blocked(
+            fate, sessions_dir=sessions_dir, issue_number=issue_number
+        )
         if (
-            isinstance(
-                fate, (worker_fate.Stranded, worker_fate.PushedWithoutPr, worker_fate.Blocked)
-            )
+            isinstance(fate, (worker_fate.Stranded, worker_fate.PushedWithoutPr))
+            or escalatable_blocked
             or declared_push
         ):
             # Preserve the sidecar so the reaper lane can act on it --
@@ -247,7 +253,7 @@ def _route_phantom_live_worker(
                 issue_number=issue_number,
                 reason=(
                     "phantom_live_worker_declared_blocked_preserved"
-                    if isinstance(fate, worker_fate.Blocked)
+                    if escalatable_blocked
                     else "phantom_live_worker_completed_work_preserved"
                 ),
                 failure_kind="live_worker_redispatch_averted",

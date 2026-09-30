@@ -55,6 +55,7 @@ def test_n1_live_handoff_does_not_finalize_a_blocked_declaration(tmp_path: Path)
         repo_root=tmp_path,
         worktrees_dir=worktrees_dir,
         now=now,
+        sessions_dir=tmp_path / "sessions",
     )
 
     assert candidates == {}

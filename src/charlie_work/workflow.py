@@ -1726,6 +1726,7 @@ def _detect_and_handle_orphaned_workers(
         repo_root=repo_root,
         worktrees_dir=worktrees_dir,
         now=now,
+        sessions_dir=sessions_dir,
         on_fate=lambda fate: worker_fate.collect_fate(live_handoff_fates, fate),
     )
     # B6: reported before the early return below.
@@ -2140,6 +2141,7 @@ def _detect_and_handle_orphaned_workers(
             remote_head_sha=remote_head_sha,
             ahead_count=ahead_count,
             now=now,
+            sessions_dir=sessions_dir,
         )
         worker_fate.collect_fate(no_pr_stale_fates, pushed_fate)
         if isinstance(pushed_fate, worker_fate.PushedWithoutPr):

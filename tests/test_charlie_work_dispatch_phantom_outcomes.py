@@ -13,6 +13,7 @@ from datetime import (
     timedelta,
 )
 from pathlib import Path
+from typing import Any
 
 from _fakes_github import FakeGitHub
 from _worktree_fixtures import (
@@ -33,34 +34,18 @@ from charlie_work.workflow import OrchestratorApp
 from _dispatch_fixtures import _stub_real_activity_probe_for_stalled_tests  # noqa: F401
 
 
-def test_dispatch_phantom_live_worker_preserves_sidecar_for_blocked_outcome(
-    tmp_path: Path, monkeypatch
-) -> None:
-    """B4 (wf-review-opus.md), rule 2: a phantom live worker with local
-    commits AND a fresh ``blocked`` outcome must NOT have its sidecar reaped
-    or its labels stripped/relabeled ``automated-ready``. Before the fix, a
-    ``Blocked`` fate was neither ``Stranded`` nor ``PushedWithoutPr`` and
-    ``declared_push`` was false, so control fell through to the reap-and-
-    ``ready`` path: the sidecar the reaper lane keys salvage/escalation off
-    was destroyed, and the issue was re-queued into the identical wall it
-    had just declared itself blocked on. Preserving it here instead defers
-    to the dead-session reaper lane, which already escalates a fresh
-    ``Blocked`` fate (``workflow.py``'s ``fates.get(issue_number) ==
-    Blocked`` branch) rather than redispatching.
-    """
+def _run_phantom_blocked_dispatch(
+    tmp_path: Path, monkeypatch: Any, outcome_payload: dict[str, Any]
+) -> tuple[Any, Path, FakeGitHub, Any]:
+    """Dispatch over a phantom live worker (dead PID, local commits) whose
+    worktree carries ``outcome_payload``; returns ``(result, sidecar_path,
+    fake_gh, paths)``."""
     from charlie_work.config import WORKER_OUTCOME_FILENAME
 
     remote, repo_root = _init_bare_remote_and_clone(tmp_path)
     worktree_path, branch = _setup_completed_worktree(repo_root, 1453)
     (worktree_path / WORKER_OUTCOME_FILENAME).write_text(
-        json.dumps(
-            {
-                "outcome": "blocked",
-                "reason": "the task requires credentials this worker does not have",
-                "push_succeeded": False,
-                "pr_created": False,
-            }
-        ),
+        json.dumps(outcome_payload),
         encoding="utf-8",
     )
 
@@ -143,6 +128,34 @@ def test_dispatch_phantom_live_worker_preserves_sidecar_for_blocked_outcome(
 
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
     result = app.dispatch(limit=1)
+    return result, sidecar_path, fake_gh, paths
+
+
+def test_dispatch_phantom_live_worker_preserves_sidecar_for_blocked_outcome(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """B4 (wf-review-opus.md), rule 2: a phantom live worker with local
+    commits AND a fresh ``blocked`` outcome must NOT have its sidecar reaped
+    or its labels stripped/relabeled ``automated-ready``. Before the fix, a
+    ``Blocked`` fate was neither ``Stranded`` nor ``PushedWithoutPr`` and
+    ``declared_push`` was false, so control fell through to the reap-and-
+    ``ready`` path: the sidecar the reaper lane keys salvage/escalation off
+    was destroyed, and the issue was re-queued into the identical wall it
+    had just declared itself blocked on. Preserving it here instead defers
+    to the dead-session reaper lane, which already escalates a fresh
+    ``Blocked`` fate (``workflow.py``'s ``fates.get(issue_number) ==
+    Blocked`` branch) rather than redispatching.
+    """
+    result, sidecar_path, fake_gh, paths = _run_phantom_blocked_dispatch(
+        tmp_path,
+        monkeypatch,
+        {
+            "outcome": "blocked",
+            "reason": "the task requires credentials this worker does not have",
+            "push_succeeded": False,
+            "pr_created": False,
+        },
+    )
 
     assert result.data["phantom_live_worker_count"] == 1, repr(result.data)
     assert sidecar_path.exists(), "Sidecar must not be reaped -- the reaper lane escalates Blocked"
@@ -166,6 +179,34 @@ def test_dispatch_phantom_live_worker_preserves_sidecar_for_blocked_outcome(
     assert payload["removed_labels"] == []
     assert payload["added_ready"] is False
     assert payload["worker_fate"] == "Blocked"
+
+
+def test_dispatch_phantom_permission_denial_blocked_is_not_deferred_to_the_reaper_lane(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Issue #2010: the reaper lane never escalates a permission-denial
+    ``blocked`` outcome, so deferring it (preserve sidecar + labels) would only
+    delay the ordinary reap-and-ready by a pass under a misleading
+    ``declared_blocked_preserved`` reason. Positive control: the sibling test
+    above, same bed with a genuine blocked reason, still preserves."""
+    _result, sidecar_path, fake_gh, paths = _run_phantom_blocked_dispatch(
+        tmp_path,
+        monkeypatch,
+        {
+            "outcome": "blocked",
+            "detail": "Bash was denied. If you approve command execution, I can finish.",
+            "push_succeeded": False,
+            "pr_created": False,
+        },
+    )
+
+    reasons = [
+        e["payload"]["reason"]
+        for e in load_state(paths.state_file).get("events", [])
+        if e["kind"] == "session_failed_relabeled" and e["payload"]["issue_number"] == 123
+    ]
+    assert "phantom_live_worker_declared_blocked_preserved" not in reasons
+    assert not sidecar_path.exists()
 
 
 def test_dispatch_phantom_stale_outcome_emits_worker_evidence_stale(

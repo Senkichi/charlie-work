@@ -38,6 +38,27 @@ def escalatable_blocked_outcome(
     return outcome
 
 
+def is_exempt_blocked(
+    fate: worker_fate.WorkerFate, *, sessions_dir: Path, issue_number: int
+) -> bool:
+    """Whether ``fate`` is a ``Blocked`` the #2010 gate refuses to escalate.
+
+    The fate-level form of :func:`escalatable_blocked_outcome`, for consumers
+    that must route such a worker as if it had not declared ``blocked`` at all
+    (the pushed-branch PR-open lane, the live-handoff finalize), so the
+    exemption decides the routing once instead of only suppressing the
+    escalation.
+    """
+    if not isinstance(fate, worker_fate.Blocked) or fate.basis.outcome is None:
+        return False
+    return (
+        escalatable_blocked_outcome(
+            dict(fate.basis.outcome.raw), sessions_dir=sessions_dir, issue_number=issue_number
+        )
+        is None
+    )
+
+
 def dead_worker_blocked_outcome(
     *,
     pr_data: dict[str, Any],
