@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import math
 import os
 import re
 from collections.abc import Mapping
@@ -999,16 +1000,15 @@ class ReviewDispatchConfig:
     # human instead of redispatching with a further-raised (but already-maxed)
     # cap. 0 disables the backstop.
     max_consecutive_turn_limit_misses: int = 3
-    # Issue #1445: repo file-size cap (lines). A diff that adds code to a file
-    # whose post-diff line count exceeds this cap is a REPORTABLE FINDING in the
-    # review packet (the review rubric references this cap generically rather
-    # than hardcoding a number). 0 disables the over-cap finding probe -- the
-    # rubric prose stays present but no dynamic finding section is rendered.
-    # This knob is the cap source the rubric line points at; once issue #1442's
-    # high-water-mark line-count ratchet (or its successor structural signal)
-    # lands, that source should rebind/replace this value rather than the
-    # rubric or probe hardcoding a constant of their own.
+    # Issue #1445: repo file-size cap (lines). A diff that adds code to a file whose post-diff line
+    # count exceeds this cap is a REPORTABLE FINDING in the review packet (the review rubric
+    # references this cap generically rather than hardcoding a number). 0 disables the over-cap
+    # finding probe -- the rubric prose stays present but no dynamic finding section is rendered.
+    # This knob is the cap source the rubric line points at; once issue #1442's high-water-mark line-
+    # count ratchet (or its successor structural signal) lands, that source should rebind/replace
+    # this value rather than the rubric or probe hardcoding a constant of their own.
     file_size_cap_lines: int = 0
+    review_exec_rejection_max_resumes: int = 2  # #2090 devin exec-reject resumes; 0 = off
 
 
 @dataclass(frozen=True)
@@ -2075,9 +2075,20 @@ class FleetConfig:
     all registered repos. Default 0 (unlimited) preserves current per-repo-only
     behavior. This addresses worker-count oversubscription only; CPU/RAM
     oversubscription via xdist requires operator discipline (see RUNBOOK.md).
+
+    ``launch_lock_wait_seconds`` (issue #2055) bounds how long a dispatch lane
+    retries the fleet launch lock -- jittered retries up to this many seconds
+    -- before deferring the pass with ``fleet_lock_held``. It replaced a single
+    non-blocking try that cost the loser an entire pass; the lock is now held
+    only across governor -> claim -> launch, so a short wait suffices. ``0``
+    restores the old single-try behavior. Non-finite values are rejected: an
+    infinite budget would hang a lane on a wedged lock, and NaN reaches
+    ``time.sleep`` (which raises) inside the retry loop.
     """
 
     global_max_concurrent_sessions: int = 0
+    global_max_concurrent_reviews: int = 0  # #2084 reviewer-lane cap; 0 = disabled
+    launch_lock_wait_seconds: float = 10.0
 
 
 @dataclass(frozen=True)
@@ -2891,6 +2902,7 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
         "turn_cap_max_multiplier",
         "max_consecutive_turn_limit_misses",
         "file_size_cap_lines",
+        "review_exec_rejection_max_resumes",
     )
     for _rd_key in _RD_INT_KEYS:
         _rd_val = review_dispatch_data.get(_rd_key)
@@ -4005,6 +4017,27 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
         raise ConfigError(
             "config section 'fleet' key 'global_max_concurrent_sessions' must be an "
             f"int, got {type(global_max).__name__}"
+        )
+    global_max_reviews = fleet_data.get("global_max_concurrent_reviews")
+    if global_max_reviews is not None and (
+        not isinstance(global_max_reviews, int)
+        or isinstance(global_max_reviews, bool)
+        or global_max_reviews < 0
+    ):
+        raise ConfigError(
+            "config section 'fleet' key 'global_max_concurrent_reviews' must be a "
+            f"non-negative int, got {global_max_reviews!r}"
+        )
+    launch_lock_wait = fleet_data.get("launch_lock_wait_seconds")
+    if launch_lock_wait is not None and (
+        isinstance(launch_lock_wait, bool)
+        or not isinstance(launch_lock_wait, (int, float))
+        or not math.isfinite(launch_lock_wait)
+        or launch_lock_wait < 0
+    ):
+        raise ConfigError(
+            "config section 'fleet' key 'launch_lock_wait_seconds' must be a "
+            f"non-negative finite number, got {launch_lock_wait!r}"
         )
     fleet = _build_section(FleetConfig, "fleet", fleet_data)
     notify_data = _section(data, "notify")

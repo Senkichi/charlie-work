@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import asdict
 from datetime import UTC, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from charlie_work.adapters import (
     SessionDispatchResult,
@@ -37,6 +37,9 @@ from charlie_work.worker_launch_gate import (
     _launch_workers,
     issue_worker_launch_permit,
 )
+
+if TYPE_CHECKING:
+    from charlie_work.worker import IssueWorkerLiveness
 
 
 def _dispatch_rework_impl(
@@ -185,9 +188,13 @@ def _dispatch_rework_impl(
 
     rework_limit = limit if limit is not None else self.config.dispatch.default_limit
 
-    # Issue #2041: the shared worker-launch gate -- concurrency governor, then
-    # provider throttle, under the fleet lock dispatch_rework() already holds.
-    # ONE permit covers both the normal and the rescue launch below.
+    # Issue #2041/#2055: the shared worker-launch gate -- provider-throttle
+    # pre-check (lock-free), the fleet lock realized HERE with a bounded wait
+    # (never across the scans above), live_count computed under it (the
+    # governor's internal fleet count already excludes launching/dead
+    # backends and corroborates worker_pid), then the governor and the
+    # authoritative throttle read. ONE permit covers both the normal and
+    # the rescue launch below.
     permit = issue_worker_launch_permit(self, rework_limit, launch_lock=launch_lock)
     if isinstance(permit, WorkerLaunchDeferral):
         # Return immediately with deferral reason
@@ -203,7 +210,7 @@ def _dispatch_rework_impl(
             )
         else:
             message = f"rework dispatch deferred: {permit.reason}"
-        return _wf.CommandResult(False, message, data)
+        return _wf.CommandResult(permit.ok, message, data)
     gov = permit.governor
     rework_limit = permit.max_launches
 
@@ -220,6 +227,11 @@ def _dispatch_rework_impl(
     # the review-routing path calls self.review() which writes state;
     # all are skipped here.
     if self.dry_run:
+        # Issue #2055: nothing below launches, so the fleet lock the permit
+        # realized has served its purpose (governor decision) -- release it
+        # before the read-only planning pass rather than holding it to the
+        # lane's ``finally`` (release is idempotent; that finally still runs).
+        launch_lock.release()
         dry_candidates = [issue for issue in rework_issues if int(issue["number"]) in pr_by_issue]
 
         # Head-check filtering (read-only): identify candidates that
@@ -312,6 +324,29 @@ def _dispatch_rework_impl(
 
         dry_candidates = dry_filtered_candidates
 
+        # Issue #2051 (mirror of the live path below): a cap-escalation
+        # candidate whose issue is held by a live worker would defer, not
+        # escalate -- report it that way instead of misreporting an
+        # escalation that will not happen. Read-only: no marker/event write.
+        (
+            (
+                dry_no_op_rework_escalated,
+                dry_worker_death_escalated,
+                dry_blocked_environment_escalated,
+            ),
+            dry_live_worker_deferrals,
+        ) = _wf._filter_cap_escalation_lanes_for_live_workers(
+            (
+                (dry_no_op_rework_escalated, "no_op_rework_cap_exceeded"),
+                (dry_worker_death_escalated, "worker_death_loop"),
+                (dry_blocked_environment_escalated, "dispatch_blocked_environment"),
+            ),
+            issues=dry_head_check_state.get("issues", {}),
+            sessions_dir=sessions_dir,
+            config=self.config,
+            now=datetime.now(UTC),
+        )
+
         # Apply only_issues filter and concurrency cap (read-only).
         # Issue #1014 (mirroring #1005 in the fresh-dispatch path): compute
         # deferred_by_concurrency uniformly across both the only_issues and
@@ -384,6 +419,7 @@ def _dispatch_rework_impl(
             "no_op_rework_escalated": sorted(dry_no_op_rework_escalated),
             "worker_death_escalated": sorted(dry_worker_death_escalated),
             "blocked_environment_escalated": sorted(dry_blocked_environment_escalated),
+            "escalation_deferred_live_worker": sorted(dry_live_worker_deferrals),
             "rescue_issue_numbers": sorted(dry_rescue_issue_numbers),
         }
         if gov.any_term_enabled:
@@ -687,6 +723,42 @@ def _dispatch_rework_impl(
     routed_to_review.extend(salvaged_confirmed)
     review_blocked_retry.extend(salvaged_blocked)
 
+    # Issue #2051: a cap escalation must not fire while a live worker
+    # still holds the issue -- escalation hands the branch to the
+    # operator while the worker is still writing it (the #2006 incident:
+    # the issue was escalated to operator-queue while its live rework
+    # worker kept committing to it). ``rework_requested`` is not evidence
+    # nobody holds the issue -- the conflict/check-failure routers re-set
+    # that status while an earlier worker remains alive. Gate all three
+    # cap lanes on the same ``issue_worker_liveness`` predicate
+    # ``unescalate`` uses: a live verdict drops the issue from every
+    # escalation list this pass with counters, status, and labels
+    # untouched (the cap is still exhausted, so the next pass escalates
+    # once the worker exits or wedges -- the verdict already folds in the
+    # watchdog stall standard), and the deferral is recorded once per
+    # worker via ``escalation_deferred_live_worker``. The liveness probe
+    # touches the filesystem/process table, so it runs outside the state
+    # lock; the marker/event write re-loads under the lock. A worker that
+    # exits between probe and write defers once and escalates next pass
+    # -- self-correcting, at worst one pass late.
+    live_worker_deferrals: dict[int, tuple[str, IssueWorkerLiveness]]
+    (
+        (no_op_rework_escalated, worker_death_escalated, blocked_environment_escalated),
+        live_worker_deferrals,
+    ) = _wf._filter_cap_escalation_lanes_for_live_workers(
+        (
+            (no_op_rework_escalated, "no_op_rework_cap_exceeded"),
+            (worker_death_escalated, "worker_death_loop"),
+            (blocked_environment_escalated, "dispatch_blocked_environment"),
+        ),
+        issues=head_check_state.get("issues", {}),
+        sessions_dir=sessions_dir,
+        config=self.config,
+        now=datetime.now(UTC),
+    )
+    if live_worker_deferrals:
+        _wf._record_cap_escalation_deferrals(live_worker_deferrals, write_gate=self.write_gate)
+
     # Escalate no-op rework issues that have exhausted the redispatch cap
     # without the PR head ever advancing. Each of these would have burned
     # another worker session on an unchanged diff.
@@ -894,6 +966,7 @@ def _dispatch_rework_impl(
             "worker_death_escalated": sorted(worker_death_escalated),
             "salvaged_to_review": sorted(salvaged_to_review),
             "blocked_environment_escalated": sorted(blocked_environment_escalated),
+            "escalation_deferred_live_worker": sorted(live_worker_deferrals),
         }
         if gov.any_term_enabled:
             data.update(gov.report_fields())
@@ -961,6 +1034,7 @@ def _dispatch_rework_impl(
             "worker_death_escalated": sorted(worker_death_escalated),
             "salvaged_to_review": sorted(salvaged_to_review),
             "blocked_environment_escalated": sorted(blocked_environment_escalated),
+            "escalation_deferred_live_worker": sorted(live_worker_deferrals),
         }
         if gov.any_term_enabled:
             data.update(gov.report_fields())
@@ -1195,6 +1269,7 @@ def _dispatch_rework_impl(
             "worker_death_escalated": sorted(worker_death_escalated),
             "salvaged_to_review": sorted(salvaged_to_review),
             "blocked_environment_escalated": sorted(blocked_environment_escalated),
+            "escalation_deferred_live_worker": sorted(live_worker_deferrals),
         }
         if gov.any_term_enabled:
             data.update(gov.report_fields())
@@ -1272,6 +1347,12 @@ def _dispatch_rework_impl(
             manifest_path, launchable_requests, adapter=manifest_adapter_label(combined_kinds)
         )
     write_session_results(results_path, dispatch_results)
+    # Issue #2055: the sessions the fleet cap counts are on disk now -- the
+    # governor -> claim -> launch window the lock exists to serialize is
+    # closed. Release before the second state lock below instead of holding
+    # it to the lane's ``finally`` (release is idempotent; that finally
+    # still runs and covers every other exit path).
+    launch_lock.release()
 
     successful_issue_numbers = {result.issue_number for result in dispatch_results if result.ok}
     failed_issue_numbers = {result.issue_number for result in dispatch_results if not result.ok}
@@ -1672,6 +1753,7 @@ def _dispatch_rework_impl(
         "no_op_rework_escalated": sorted(no_op_rework_escalated),
         "salvaged_to_review": sorted(salvaged_to_review),
         "blocked_environment_escalated": sorted(blocked_environment_escalated),
+        "escalation_deferred_live_worker": sorted(live_worker_deferrals),
     }
     if gov.any_term_enabled:
         data.update(gov.report_fields())

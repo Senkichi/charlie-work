@@ -34,7 +34,13 @@ from .config import (
     ReviewDispatchConfig,
 )
 from .harnesses import REVIEWER_HARNESSES
-from .fleet_registry import count_fleet_live_sessions, managed_repo_names  # noqa: F401  (deliberate re-export; count_fleet_live_sessions used by moved L06 delegates via _wf.)
+from .worker_launch_gate import FleetLaunchLock
+from .review_fleet_gate import (
+    fleet_review_lock,
+    fleet_review_lock_deferral,
+    read_fleet_review_cap,
+)
+from .fleet_registry import count_fleet_live_reviews, count_fleet_live_sessions, managed_repo_names  # noqa: F401  (deliberate re-export; count_fleet_live_sessions used by moved L06 delegates via _wf., count_fleet_live_reviews by review_fleet_gate via _wf.)
 from . import layout, status_snapshot  # noqa: F401  (deliberate re-export; layout reached via _wf.layout by orchestration/misc_reconcile.py)
 from .main_ci_reclaim import reclaim_superseded_main_ci_runs  # noqa: F401  (deliberate re-export; used by moved L01 b3 delegates via _wf.)
 from .notify import AttentionDigest, AttentionEntry, emit_digest
@@ -253,6 +259,23 @@ from .escalation import (  # noqa: F401  (deliberate re-export)
     _cap_escalation_pr_extra,
     _reset_linked_pr_status_to_passive_open,
     _MECHANICAL_ESCALATION_EDGES,
+)
+
+# LOAD-BEARING RE-EXPORT — NOT AN UNUSED IMPORT. Do not delete; the `noqa`
+# below marks a deliberate re-export, not a lint concession.
+#
+# Issue #2051: the live-worker cap-escalation deferral helpers
+# (probe candidates through `issue_worker_liveness`, persist the
+# once-per-worker `escalation_deferred_live_worker` marker+event) live in
+# `charlie_work.live_worker_deferral` -- a new module rather than
+# `.escalation`, which has no file-size headroom left for them. Re-exported
+# here so `_wf.<name>` call sites and monkeypatch targets keep working.
+from .live_worker_deferral import (  # noqa: F401  (deliberate re-export)
+    _live_worker_cap_escalation_deferrals,
+    _filter_cap_escalation_lanes_for_live_workers,
+    _defer_cap_escalation_for_live_worker,
+    _record_cap_escalation_deferrals,
+    _defer_janitor_cap_escalation_for_live_worker,
 )
 
 # LOAD-BEARING RE-EXPORT — NOT AN UNUSED IMPORT. Do not delete; the `noqa`
@@ -4241,8 +4264,15 @@ class OrchestratorApp:
     def review(
         self,
         pr_number: int,
+        *,
+        force: bool = False,
     ) -> CommandResult:
         """Generate a review packet for a PR.
+
+        ``force`` (issue #2081, ``why-charlie-hate --force-rereview``) voids a
+        terminal verdict even when it is pinned to the live head: the verdict is
+        archived into the rounds archive, the pending stub overwrites it, and a
+        ``verdict_force_voided`` event names the voided decision and head.
 
         When config.test_adequacy.enabled, this method may itself issue a
         request_changes verdict and advance/terminate the rework loop (previously
@@ -4255,14 +4285,18 @@ class OrchestratorApp:
         Returns:
             CommandResult with ok=True if a packet was generated, or ok=False if
             the review was blocked (janitor gate, test-adequacy gate) or the PR
-            was not found. Two ok=True returns carry NO packet and callers that
-            gate a status->"reviewing" flip on ``ok`` must additionally exclude
-            them via the data flags: ``routed_to_rework`` (the janitor-gate
-            conflict/no-op-rework route re-requests rework with no packet) and
-            ``closed_unmerged_converged`` (issue #558: a CLOSED-unmerged PR is
-            converged to state status "closed" at the janitor gate -- the PR is
-            dead, not a fresh-packet candidate). A refused janitor-gate return
-            also carries ``is_no_op_rework`` -- True only when the unchanged-diff
+            was not found. Three ok=True returns carry NO packet and callers
+            that gate a status->"reviewing" flip on ``ok`` must additionally
+            exclude them via the data flags: ``routed_to_rework`` (the
+            janitor-gate conflict/no-op-rework route re-requests rework with
+            no packet), ``closed_unmerged_converged`` (issue #558: a
+            CLOSED-unmerged PR is converged to state status "closed" at the
+            janitor gate -- the PR is dead, not a fresh-packet candidate),
+            and ``escalation_deferred_live_worker`` (issue #2051: the janitor
+            cap router deferred the escalation because a live worker still
+            holds the issue -- no packet and no routing; the worker may still
+            be committing). A refused janitor-gate return also carries
+            ``is_no_op_rework`` -- True only when the unchanged-diff
             no-op gate caused the refusal (issue #2034). See
             ``_route_rework_candidate_to_review`` and the dead-worker orphan
             sweep for the canonical gating pattern.
@@ -5726,12 +5760,26 @@ class OrchestratorApp:
             # corrupt file is left for a human rather than silently
             # overwritten (mirroring the original code's ``else`` branch,
             # which only reset on a real terminal decision).
-            voided_stale_verdict = live_decision_value in (
+            # Issue #2081: ``force`` (``why-charlie-hate --force-rereview``)
+            # voids a terminal verdict even when it is pinned to -- or carried
+            # forward to -- the live head. Before, the flag only skipped the
+            # CLI's #1695 guard and this block voided stale-head verdicts
+            # alone, so a live-head verdict survived the "forced" re-review.
+            is_terminal_verdict = live_decision_value in (
                 "approved",
                 "request_changes",
                 "blocked",
-            ) and (
-                live_reviewed_head_sha is None or live_reviewed_head_sha != pr.get("headRefOid")
+            )
+            voided_stale_verdict = is_terminal_verdict and (
+                force
+                or live_reviewed_head_sha is None
+                or live_reviewed_head_sha != pr.get("headRefOid")
+            )
+            force_voided_verdict = (
+                force
+                and is_terminal_verdict
+                and live_reviewed_head_sha is not None
+                and live_reviewed_head_sha == pr.get("headRefOid")
             )
             if not decision_path.exists() or voided_stale_verdict:
                 if voided_stale_verdict:
@@ -5874,6 +5922,20 @@ class OrchestratorApp:
                 _issue_key = str(issue_number)
                 _issue_entry = state["issues"].get(_issue_key, {})
                 state["issues"][_issue_key] = {**_issue_entry, "merge_alert": "OK"}
+            if force_voided_verdict:
+                state = append_event(
+                    state,
+                    "verdict_force_voided",
+                    {
+                        "pr_number": pr_number,
+                        "issue_number": issue_number,
+                        "voided_decision": live_decision_value,
+                        "voided_reviewed_head_sha": live_reviewed_head_sha,
+                        "verdict_provenance": live_decision.get("verdict_provenance"),
+                        "head_sha": pr.get("headRefOid"),
+                    },
+                    state_path=self.paths.state_file,
+                )
             state = append_event(
                 state,
                 "review_packet",
@@ -5973,8 +6035,13 @@ class OrchestratorApp:
     # right granularity anyway.
 
     @_guard_state_lock
+    @fleet_review_lock()
     def dispatch_reviews(
-        self, limit: int | None = None, *, now: datetime | None = None
+        self,
+        limit: int | None = None,
+        *,
+        now: datetime | None = None,
+        launch_lock: FleetLaunchLock | None = None,
     ) -> CommandResult:
         """Launch reviewer sessions concurrently for queued PRs.
 
@@ -5986,6 +6053,13 @@ class OrchestratorApp:
         governor here — only an optional local-only process cap
         (``max_local_review_processes``) to protect the host from too many
         concurrent reviewer worktrees.
+
+        ``launch_lock`` (issue #2084) is supplied by ``@fleet_review_lock``: a
+        pending fleet-launch-lock handle (a no-op while
+        ``fleet.global_max_concurrent_reviews`` is 0) that this method realizes
+        just before candidate selection, holds through claim -> launch, and the
+        decorator releases on every exit path -- the same entry-point-mints /
+        ``finally``-releases shape as the worker lanes.
 
         The double-dispatch protection is a two-phase claim on
         ``state["prs"][pr]``: this method writes ``review_dispatch_pending``,
@@ -6135,6 +6209,7 @@ class OrchestratorApp:
                 resolved_now,
                 limit,
                 probe_mode_dry,
+                read_fleet_review_cap(self),
             )
             # Issue #1251: mirror the real path's empty-diff pre-flight gate
             # in the dry-run preview so the two cannot diverge. Read-only:
@@ -6178,6 +6253,7 @@ class OrchestratorApp:
                     "missed_verdicts": missed_verdicts,
                     "reconciled_verdicts": reconciled_verdicts,
                     **selection.local_cap.report_fields(),
+                    **selection.fleet_report_fields(),
                 },
             )
 
@@ -6369,6 +6445,27 @@ class OrchestratorApp:
         # return and both deployed fleets run that flag false -- the set was
         # always empty. The repair now derives its own subjects from state in
         # ``_repair_escalated_labels()``, called above that early return.
+        # Issue #2084: realize the fleet lock HERE -- after the lock-free
+        # sweeps/scans above, before the fleet reviewer count is read -- and
+        # hold it through claim -> launch (the caller releases it), so two
+        # repos cannot both read a stale fleet count and over-dispatch the cap.
+        lock_deferral = fleet_review_lock_deferral(self, launch_lock)
+        if lock_deferral is not None:
+            return CommandResult(
+                True,
+                "review dispatch deferred: fleet_lock_held",
+                {
+                    "selected_count": 0,
+                    "attempted_count": 0,
+                    "failed_count": 0,
+                    "launched_count": 0,
+                    "recorded_verdicts": recorded_verdicts,
+                    "missed_verdicts": missed_verdicts,
+                    "reconciled_verdicts": reconciled_verdicts,
+                    "rescue_review_results": rescue_review_results,
+                    **lock_deferral,
+                },
+            )
         selection_state = load_state_locked(self.paths.state_file)
         selection = _select_review_dispatch_candidates(
             candidates,
@@ -6379,6 +6476,7 @@ class OrchestratorApp:
             resolved_now,
             limit,
             probe_mode,
+            read_fleet_review_cap(self),
         )
         escalated_skipped = selection.escalated_skipped
         merge_conflict_routed = selection.merge_conflict_routed
@@ -6742,6 +6840,7 @@ class OrchestratorApp:
                         "pr_numbers": [c["pr"] for c in selected],
                         "count": len(selected),
                         "review_effort_assignments": review_effort_assignments,
+                        **selection.fleet_report_fields(),
                     },
                 )
             self.write_gate.save_state(state)
@@ -7027,6 +7126,7 @@ class OrchestratorApp:
                     "launched": [x["pr"] for x in launched],
                     "failed": [x["pr"] for x in failed],
                     "quota_hit": quota_hit,
+                    **selection.fleet_report_fields(),
                 },
             )
             self.write_gate.save_state(state)
@@ -7070,6 +7170,7 @@ class OrchestratorApp:
             "escalated_labels_repaired": repaired_labels,
         }
         data.update(local_cap.report_fields())
+        data.update(selection.fleet_report_fields())
         return CommandResult(ok, message, data)
 
     # Re-arm field sets live in unescalate_reset_fields.py (extracted under the

@@ -35,7 +35,7 @@ from charlie_work.instrumentation import log_event
 from charlie_work.janitor import JanitorVerdict
 from charlie_work.safe_ref import require_valid_sha
 from charlie_work.state import StateLockBusy
-from charlie_work.worker_launch_gate import WorkerLaunchDeferral, acquire_fleet_launch_lock
+from charlie_work.worker_launch_gate import acquire_fleet_launch_lock
 from charlie_work.dead_worker_reap import _is_pr_updated_at_older_than, _safe_repo_slug
 
 
@@ -460,22 +460,12 @@ def dispatch(
         else None
     )
 
-    # Issue #2041: gate 1 of the shared worker-launch gate, taken here -- before
-    # the stall sweep and candidate scan -- and held across governor -> claim ->
-    # launch; _dispatch_impl hands it to issue_worker_launch_permit.
+    # Issue #2055: mint the fleet-launch-lock handle here so the ``finally``
+    # below covers every impl exit path, but do NOT take the OS lock yet --
+    # the pending handle is realized by issue_worker_launch_permit (bounded
+    # wait) immediately before the governor, after _dispatch_impl's
+    # issue_list / blocker-prefetch / reachability / stall-sweep scan.
     launch_lock = acquire_fleet_launch_lock(self, acquire=try_acquire_fleet_lock)
-    if isinstance(launch_lock, WorkerLaunchDeferral):
-        return _wf.CommandResult(
-            True,
-            "dispatch deferred: fleet lock held",
-            {
-                "selected_count": 0,
-                "deferred_reason": launch_lock.reason,
-                "merged_prs": merged_prs_for_result,
-                "merged_pr_closed_issue_numbers": sorted(finalized),
-                "merged_pr_referenced_issue_numbers": sorted(finalized),
-            },
-        )
     try:
         result = self._dispatch_impl(
             limit,

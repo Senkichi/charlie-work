@@ -17,6 +17,8 @@ from pathlib import Path
 from typing import Any
 
 from .orphan_sweep import (  # noqa: F401  (deliberate re-export)
+    _enumerate_fingerprinted_children,
+    _reap_enumerated_children,
     _self_ancestor_pids,
     sweep_orphan_processes,
 )
@@ -610,9 +612,8 @@ def _ancestor_guard_exempt_pids() -> frozenset[int]:
 def kill_process_tree(pid: int, expected_start_time: float | None = None) -> list[int]:
     """Kill a process and all its children (process tree).
 
-    Returns a list of PIDs that were killed (including the root PID and children).
-    On Windows, uses taskkill /T /F to terminate the process tree.
-    On POSIX, uses os.killpg to kill the process group.
+    On Windows, uses taskkill /T /F to terminate the process tree; on POSIX,
+    uses os.killpg to kill the process group.
 
     This is used to clean up stalled sessions where the wrapper PID is alive
     but the agent loop has died, leaving child processes holding resources.
@@ -625,8 +626,8 @@ def kill_process_tree(pid: int, expected_start_time: float | None = None) -> lis
             the process is NOT killed and an empty list is returned.
 
     Returns:
-        A list of PIDs that were killed (including the root PID and children). Returns empty list
-        if the process could not be killed or if the start time verification failed.
+        PIDs verified dead (root + enumerated children, each confirmed dead or
+        individually reaped post-kill, issue #2059); empty list on failure.
     """
     killed_pids = []
 
@@ -652,7 +653,7 @@ def kill_process_tree(pid: int, expected_start_time: float | None = None) -> lis
     # existing ``pgid == os.getpgid(0)`` guard below still covers the
     # process-group shape; this PID-set check covers the direct case on both
     # platforms regardless of group boundaries.
-    if pid in _ancestor_guard_exempt_pids():
+    if pid in (exempt_pids := _ancestor_guard_exempt_pids()):
         # Refusals are logged, not silent: whether this guard ever fires is
         # the only telemetry that can confirm or refute the sweep-needle
         # hypothesis #1842 tracks.
@@ -675,8 +676,7 @@ def kill_process_tree(pid: int, expected_start_time: float | None = None) -> lis
             # Start time mismatch - PID has been recycled
             return killed_pids
 
-    # Enumerate children before killing
-    child_pids = _enumerate_child_pids(pid)
+    child_starts = _enumerate_fingerprinted_children(pid)  # fingerprinted before killing
 
     try:
         if os.name == "nt":
@@ -697,9 +697,6 @@ def kill_process_tree(pid: int, expected_start_time: float | None = None) -> lis
             # dead rather than trusting the return code alone.
             if result.returncode in (0, 1) or not is_pid_alive(pid):
                 killed_pids.append(pid)
-                # taskkill /T kills children but doesn't list them reliably
-                # Add enumerated children to the killed list
-                killed_pids.extend(child_pids)
         else:
             # POSIX: kill the process group
             try:
@@ -710,8 +707,6 @@ def kill_process_tree(pid: int, expected_start_time: float | None = None) -> lis
                     return killed_pids
                 os.killpg(pgid, 9)  # SIGKILL
                 killed_pids.append(pid)
-                # Add enumerated children to the killed list
-                killed_pids.extend(child_pids)
             except (ProcessLookupError, OSError):
                 # Process may have already exited
                 pass
@@ -719,6 +714,12 @@ def kill_process_tree(pid: int, expected_start_time: float | None = None) -> lis
         # Best-effort kill - don't raise
         pass
 
+    # Children are recorded only when verified dead; survivors get reaped,
+    # phantoms refused (_reap_enumerated_children, issue #2059).
+    if pid in killed_pids:
+        killed_pids.extend(
+            _reap_enumerated_children(pid, child_starts, exempt_pids, expected_start_time)
+        )
     return killed_pids
 
 
