@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Any
 
 from . import worker_fate
-from .closing_reference import closing_issues_referenced_numbers, validate_closing_reference
+from .closing_reference import probe_closing_link, validate_closing_reference
 from .config import (
     DETERMINISTIC_ESCALATION_FAILURE_KINDS,
     DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS,
@@ -3466,20 +3466,19 @@ def apply_fixes(
                                 # real PR was opened -- only probe a real, truthy PR
                                 # number (mirrors workflow.py::_open_salvage_pr).
                                 if pr_number and state_path is not None:
-                                    query_ok = True
-                                    try:
-                                        pr_view = gh.pr_view(
-                                            pr_number, fields=PR_CLOSING_ISSUES_FIELDS
-                                        )
-                                    except Exception:
-                                        pr_view = {}
-                                        query_ok = False
-                                    linked_numbers = closing_issues_referenced_numbers(pr_view)
-                                    # Only log when the query itself succeeded --
-                                    # a transient `gh` failure must not be conflated
-                                    # with a genuine unlinked-PR miss (see
-                                    # workflow.py::_open_salvage_pr for rationale).
-                                    if query_ok and item.issue_number not in linked_numbers:
+                                    # cw#1868: settled across GitHub's indexing
+                                    # race; None = failed query, never a miss (see
+                                    # dead_worker_reap._open_salvage_pr).
+                                    linked_numbers = probe_closing_link(
+                                        gh,
+                                        pr_number,
+                                        item.issue_number,
+                                        fields=PR_CLOSING_ISSUES_FIELDS,
+                                    )
+                                    if (
+                                        linked_numbers is not None
+                                        and item.issue_number not in linked_numbers
+                                    ):
                                         log_event(
                                             state_path,
                                             "pr_closing_ref_unlinked",

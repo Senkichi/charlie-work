@@ -356,6 +356,20 @@ def _no_real_pr_create_retry_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture(autouse=True)
+def _no_real_closing_link_recheck_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Never let ``closing_reference.probe_closing_link`` really sleep (cw#1868).
+
+    Its re-probe pauses (~13s) only elapse on an unlinked reading, but every
+    pre-existing salvage test with a mismatched ``closingIssuesReferences``
+    would otherwise pay them. Patches the module-local ``_default_sleep``
+    (not the shared ``time.sleep``, see ``_no_real_pr_create_retry_sleep``).
+    """
+    import charlie_work.closing_reference as closing_reference_module
+
+    monkeypatch.setattr(closing_reference_module, "_default_sleep", lambda seconds: None)
+
+
+@pytest.fixture(autouse=True)
 def _no_real_host_load_probe(monkeypatch: pytest.MonkeyPatch) -> None:
     """Never let a governor's host-load probe spawn a real process listing.
 
