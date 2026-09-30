@@ -235,9 +235,8 @@ def _dispatch_impl(
     # window (and staggered-resume probe) for this repo's worker adapter.
     resume = fleet_provider_throttle.decide_for_app(self)
     if resume.deferred:
-        return _wf.CommandResult(
-            False,
-            f"dispatch deferred: fleet provider throttle ({resume.action})",
+        return resume.deferred_result(
+            "dispatch",
             {
                 "selected_count": 0,
                 "attempted_count": 0,
@@ -247,7 +246,6 @@ def _dispatch_impl(
                 "sessions": [],
                 "dispatch_results": [],
                 "merged_prs": merged_prs_for_tripwire,
-                **resume.deferral_data(),
             },
         )
     dispatch_limit = resume.cap_limit(dispatch_limit)

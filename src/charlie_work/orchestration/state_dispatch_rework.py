@@ -218,18 +218,10 @@ def _dispatch_rework_impl(
     # Issue #1993: fleet-wide window + staggered resume for this worker adapter.
     resume = fleet_provider_throttle.decide_for_app(self)
     if resume.deferred:
-        data = {
-            "adapter": self.config.worker.harness,
-            "selected_count": 0,
-            **resume.deferral_data(),
-        }
+        data = {"adapter": self.config.worker.harness, "selected_count": 0}
         if gov.any_term_enabled:
             data.update(gov.report_fields())
-        return _wf.CommandResult(
-            False,
-            f"rework dispatch deferred: fleet provider throttle ({resume.action})",
-            data,
-        )
+        return resume.deferred_result("rework dispatch", data)
     rework_limit = resume.cap_limit(rework_limit)
 
     # Dry-run: read-only planning — compute selection and would-be

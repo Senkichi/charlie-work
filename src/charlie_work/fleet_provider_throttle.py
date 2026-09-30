@@ -46,6 +46,7 @@ from typing import Any, Literal
 from .layout import fleet_dir
 from .process_utils import is_pid_alive
 from .state import advisory_file_lock, save_state
+from .workflow import CommandResult
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +95,14 @@ class ResumeDecision:
             "deferred_reason": self.deferred_reason,
             "throttled_until": self.throttled_until.isoformat() if self.throttled_until else None,
         }
+
+    def deferred_result(self, what: str, data: dict[str, Any]) -> CommandResult:
+        """The not-ok ``CommandResult`` a lane returns when this decision defers it."""
+        return CommandResult(
+            False,
+            f"{what} deferred: fleet provider throttle ({self.action})",
+            {**data, **self.deferral_data()},
+        )
 
     def cap_limit(self, limit: int) -> int:
         """A probe pass admits at most one launch; otherwise ``limit`` unchanged."""
