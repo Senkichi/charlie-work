@@ -47,9 +47,16 @@ from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-# "resets in N minutes" / "reset in N minutes" — extracts a specific
-# provider-reported cooldown duration when present in the log tail.
-_RESETS_IN_PATTERN = re.compile(r"resets? in (\d+) minutes?", re.IGNORECASE)
+# "resets in N minutes" / "reset in N hours M minutes" — extracts a specific
+# provider-reported cooldown duration when present in the log tail. Either
+# the hours part or the minutes part may be absent (issue #2042: the Devin
+# SWE 2 free-model notice reads "Your limit will reset in 4 hours 8
+# minutes."). Both groups are optional, so ``_parse_reset_in_minutes``
+# skips matches that captured neither (e.g. "reset in 5 seconds").
+_RESETS_IN_PATTERN = re.compile(
+    r"resets? in\s+(?:(\d+)\s*(?:hours?|hrs?)\b)?[\s,]*(?:and\s+)?(?:(\d+)\s*(?:minutes?|mins?)\b)?",
+    re.IGNORECASE,
+)
 
 # "resets H:MMam/pm (IANA zone)" — Claude Code's session-limit notice names
 # a specific clock time and the IANA timezone it resets in (observed
@@ -109,22 +116,30 @@ def is_provider_throttle_failure(failure_kind: str | None) -> bool:
     return failure_kind in PROVIDER_THROTTLE_FAILURE_KINDS
 
 
+def _parse_reset_in_minutes(tail: str) -> int | None:
+    """Total minutes of the first "reset(s) in [N hours] [M minutes]" clause."""
+    for match in _RESETS_IN_PATTERN.finditer(tail):
+        hours, minutes = match.group(1), match.group(2)
+        if hours is None and minutes is None:
+            continue
+        return int(hours or 0) * 60 + int(minutes or 0)
+    return None
+
+
 def match_throttle_tail(tail: str, markers: Sequence[str]) -> tuple[bool, int | None]:
     """Match ``tail`` against ``markers`` (case-insensitive substrings).
 
     Returns ``(matched, reset_minutes)``:
     - ``matched`` is True when any marker is found in ``tail``.
-    - ``reset_minutes`` is the parsed "resets in N minutes" value when the
-      tail matched and included one, else None (callers apply their own
+    - ``reset_minutes`` is the parsed "resets in [N hours] [M minutes]" total
+      (in minutes) when the tail matched and included one, else None (callers apply their own
       default cooldown in that case). Always None when ``matched`` is False.
     """
     tail_lower = tail.lower()
     matched = any(marker.lower() in tail_lower for marker in markers)
     if not matched:
         return False, None
-    reset_match = _RESETS_IN_PATTERN.search(tail)
-    reset_minutes = int(reset_match.group(1)) if reset_match else None
-    return True, reset_minutes
+    return True, _parse_reset_in_minutes(tail)
 
 
 def match_quota_tail(tail: str, markers: Sequence[str]) -> bool:
