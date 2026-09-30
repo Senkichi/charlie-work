@@ -393,7 +393,7 @@ def test_reap_records_verdict_from_stream_json_log(monkeypatch, tmp_path: Path) 
     )
     _make_dead_review_sidecar(reviews_dir, 100, log_text)
     _set_review_dispatched_state(app, 100, 10, "2026-07-06T12:00:00Z")
-    monkeypatch.setattr("charlie_work.claude_code.is_worker_alive", lambda *_: False)
+    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: False)
 
     result = app._reap_review_verdicts(reviews_dir)
 
@@ -436,7 +436,7 @@ def test_reap_records_verdict_via_file_fallback(monkeypatch, tmp_path: Path) -> 
     started_at = _utc_iso(datetime.now(UTC) - timedelta(minutes=5))
     _make_dead_review_sidecar(reviews_dir, 100, log_text, started_at=started_at)
     _set_review_dispatched_state(app, 100, 10, started_at)
-    monkeypatch.setattr("charlie_work.claude_code.is_worker_alive", lambda *_: False)
+    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: False)
 
     result = app._reap_review_verdicts(reviews_dir)
 
@@ -487,7 +487,7 @@ def test_reap_does_not_record_previous_rounds_events_verdict(monkeypatch, tmp_pa
         reviews_dir, 100, "Tool execution was rejected by the user\n", started_at=started_at
     )
     _set_review_dispatched_state(app, 100, 10, started_at)
-    monkeypatch.setattr("charlie_work.claude_code.is_worker_alive", lambda *_: False)
+    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: False)
 
     result = app._reap_review_verdicts(reviews_dir)
 
@@ -527,7 +527,7 @@ def test_reap_still_records_verdict_from_this_sessions_events_file(
     started_at = _utc_iso(datetime.now(UTC) - timedelta(minutes=5))
     _make_dead_review_sidecar(reviews_dir, 100, "truncated log\n", started_at=started_at)
     _set_review_dispatched_state(app, 100, 10, started_at)
-    monkeypatch.setattr("charlie_work.claude_code.is_worker_alive", lambda *_: False)
+    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: False)
 
     result = app._reap_review_verdicts(reviews_dir)
 

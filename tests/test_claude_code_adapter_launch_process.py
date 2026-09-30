@@ -147,7 +147,7 @@ def test_launch_claude_worker_tee_stream_json_writes_to_both_files(
     This test would fail against the buggy code (empty files) and pass after the fix.
     """
     from charlie_work.process_utils import is_session_stalled
-    from charlie_work.claude_code import _classify_session_failure
+    from charlie_work.worker_fate import classify_for
 
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
@@ -223,9 +223,9 @@ def test_launch_claude_worker_tee_stream_json_writes_to_both_files(
     assert is_stalled is False, "Freshly written log should not be stalled"
     assert last_line is not None, "Should be able to read last line from log"
 
-    # Verify _classify_session_failure works correctly on the tee'd log
+    # Verify worker_fate.classify_for works correctly on the tee'd log
     # Should return None (no failure) for a successful run
-    failure_kind, throttled_until = _classify_session_failure(log_path)
+    failure_kind, throttled_until = classify_for("claude-code", log_path)
     assert failure_kind is None, "Successful run should not be classified as a failure"
     assert throttled_until is None
 

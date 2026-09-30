@@ -9,7 +9,7 @@ stale-issue-mentions integration checks.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -279,7 +279,10 @@ def test_seeded_registry_loads_and_matches_both_fleet_repos(hb: ModuleType) -> N
     assert entry.check == "stale-open-issue-mentions"
     assert entry.repo is None
     assert entry.issue == 1361
-    assert entry.expires == "2026-09-30"
+    # Shape, not value: renewing the entry is a reviewed diff to the registry
+    # alone and must not also require editing this test (see the clock-pinned
+    # test below for the same reasoning).
+    assert datetime.strptime(entry.expires, "%Y-%m-%d")
 
 
 def test_seeded_registry_actually_suppresses_the_real_per_repo_check_name(
@@ -300,6 +303,17 @@ def test_seeded_registry_actually_suppresses_the_real_per_repo_check_name(
     registry_path = Path(__file__).parent.parent / "scripts" / "heartbeat-suppressions.yaml"
     entries, err = hb.load_suppression_registry(registry_path)
     assert err is None
+    seeded = [e for e in entries if e.check == "stale-open-issue-mentions"]
+    assert seeded, "registry no longer seeds a stale-open-issue-mentions entry"
+    entry = seeded[0]
+    # Pin the clock to the day before the entry's own expiry: this test proves
+    # the checked-in entry's *shape* matches the emitted check string. Whether
+    # the entry is still live is the heartbeat's runtime signal (it resurfaces
+    # as ANOMALY on expiry, by design) -- not a CI failure on every branch the
+    # day the date passes.
+    before_expiry = datetime.strptime(entry.expires, "%Y-%m-%d").replace(
+        tzinfo=timezone.utc
+    ) - timedelta(days=1)
 
     for slug in (
         "Senkichi/charlie-work",
@@ -308,7 +322,7 @@ def test_seeded_registry_actually_suppresses_the_real_per_repo_check_name(
         "Senkichi/swole",
         "Senkichi/a-repo-not-yet-onboarded",
     ):
-        report = hb.Report(suppressions=entries)
+        report = hb.Report(suppressions=entries, now=before_expiry)
         check = f"stale-open-issue-mentions {slug}"
         detail = (
             "18 open issue(s) referenced by merged work with no closure path: "
@@ -317,4 +331,6 @@ def test_seeded_registry_actually_suppresses_the_real_per_repo_check_name(
         report.anom(check, detail)
 
         assert not report.anomaly, f"registry failed to suppress slug {slug}"
-        assert report.lines[-1].startswith(f"SUPPRESSED {check}: [#1361 until 2026-09-30]")
+        assert report.lines[-1].startswith(
+            f"SUPPRESSED {check}: [#{entry.issue} until {entry.expires}]"
+        )

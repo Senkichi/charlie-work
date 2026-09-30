@@ -1,0 +1,1 @@
+Issue #2039/#2041: records a gated local rework deferral (orchestration/local_lanes.py) -- the dispatch_deferred event for a WorkerLaunchDeferral or a governor clamp from worker_launch_gate.issue_worker_launch_permit.

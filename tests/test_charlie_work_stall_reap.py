@@ -116,7 +116,7 @@ def test_stall_and_dead_lane_increment_deferral_counter_at_most_once_per_pass(
     )
 
     with (
-        patch("charlie_work.worker.is_session_alive", return_value=False),
+        patch("charlie_work.worker_fate.is_alive", return_value=False),
         patch("charlie_work.worker.real_activity_probe_for", return_value=inconclusive_probe),
     ):
         # loop() order and arguments: stall lane runs before the dead lane,
@@ -238,7 +238,7 @@ def test_stall_then_dead_lane_composition_survives_phantom_post_mortem_sidecar(
 
     def _run_stall_lane() -> None:
         with (
-            patch("charlie_work.worker.is_session_alive", return_value=False),
+            patch("charlie_work.worker_fate.is_alive", return_value=False),
             patch(
                 "charlie_work.worker.real_activity_probe_for",
                 return_value=inconclusive_probe,
@@ -250,7 +250,7 @@ def test_stall_then_dead_lane_composition_survives_phantom_post_mortem_sidecar(
 
     def _run_dead_lane() -> None:
         with (
-            patch("charlie_work.worker.is_session_alive", return_value=False),
+            patch("charlie_work.worker_fate.is_alive", return_value=False),
             patch(
                 "charlie_work.worker.real_activity_probe_for",
                 return_value=inconclusive_probe,
@@ -342,7 +342,7 @@ def test_stall_reap_classifies_rate_limit_before_stalled_fallback(tmp_path: Path
 
     before = datetime.now(UTC)
     with (
-        patch("charlie_work.worker.is_session_alive", return_value=True),
+        patch("charlie_work.worker_fate.is_alive", return_value=True),
         patch("charlie_work.write_gate.kill_process_tree", return_value=[99999]),
         patch("charlie_work.dead_worker_reap.sweep_orphan_processes", return_value=[]),
     ):
@@ -384,7 +384,7 @@ def test_stall_reap_classifies_rate_limit_before_stalled_fallback(tmp_path: Path
     # Issue #873: this fixture's log tail opens with a terminal error marker
     # ("Agent error: Permission denied"), so classify_worker_health returns
     # DEAD at its unconditional terminal-marker signal — not STALLED. (The
-    # patch on charlie_work.worker.is_session_alive above is inert here:
+    # patch on charlie_work.worker_fate.is_alive above is inert here:
     # classify_worker_health checks view.is_alive(), not that module-level
     # helper.) The reap event is therefore "session_exited", not
     # "session_stalled". This test always exercised the DEAD path; before
@@ -430,7 +430,7 @@ def test_stall_reap_classifies_quota_exhausted_before_stalled_fallback(tmp_path:
 
     before = datetime.now(UTC)
     with (
-        patch("charlie_work.worker.is_session_alive", return_value=True),
+        patch("charlie_work.worker_fate.is_alive", return_value=True),
         patch("charlie_work.write_gate.kill_process_tree", return_value=[99999]),
         patch("charlie_work.dead_worker_reap.sweep_orphan_processes", return_value=[]),
     ):
@@ -485,7 +485,7 @@ def test_stall_reap_falls_back_to_stalled_when_no_throttle_signature(tmp_path: P
     )
 
     with (
-        patch("charlie_work.worker.is_session_alive", return_value=True),
+        patch("charlie_work.worker_fate.is_alive", return_value=True),
         patch("charlie_work.write_gate.kill_process_tree", return_value=[99999]),
         patch("charlie_work.dead_worker_reap.sweep_orphan_processes", return_value=[]),
     ):
@@ -557,7 +557,7 @@ def test_stall_lane_api_budget_kill_over_cap(tmp_path: Path) -> None:
 
     killed_pids: list[int] = []
     with (
-        patch("charlie_work.worker.is_worker_alive", return_value=True),
+        patch("charlie_work.worker_fate.is_alive", return_value=True),
         patch(
             "charlie_work.write_gate.kill_process_tree",
             side_effect=lambda pid, *_a, **_kw: killed_pids.extend([pid]) or [pid],
@@ -630,7 +630,7 @@ def test_stall_lane_api_provider_auth_classification(tmp_path: Path) -> None:
 
     before = datetime.now(UTC)
     with (
-        patch("charlie_work.worker.is_worker_alive", return_value=True),
+        patch("charlie_work.worker_fate.is_alive", return_value=True),
         patch("charlie_work.write_gate.kill_process_tree", return_value=[99998]),
         patch("charlie_work.dead_worker_reap.sweep_orphan_processes", return_value=[]),
     ):

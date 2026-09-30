@@ -67,6 +67,59 @@ def test_write_worker_terminal_status_round_trips_worker_outcome(tmp_path: Path)
     assert record["worker_outcome"] == worker_outcome
 
 
+def test_write_worker_terminal_status_round_trips_worker_outcome_written_at(
+    tmp_path: Path,
+) -> None:
+    """B5 (wf-review-opus.md) / design doc §3, Group A step A1: the outcome
+    file's own mtime is additive alongside ``worker_outcome`` and ``ended_at``
+    -- consumers use it as the outcome's freshness anchor instead of
+    ``ended_at`` (the watcher's own exit-observation time, not when the
+    outcome file was actually written).
+    """
+    path = tmp_path / "issue-1.claude.terminal.json"
+    write_worker_terminal_status(
+        path,
+        pid=4242,
+        exit_code=0,
+        started_at="2026-07-30T00:00:00Z",
+        ended_at="2026-07-30T00:05:00Z",
+        duration_seconds=300.0,
+        worker_outcome={"push_succeeded": True, "pr_created": False},
+        worker_outcome_written_at="2026-07-29T23:50:00Z",
+    )
+
+    record = find_worker_terminal_status(tmp_path, 1)
+    assert record is not None
+    assert record["worker_outcome_written_at"] == "2026-07-29T23:50:00Z"
+    # Distinct from ended_at -- proving the field is not just a copy.
+    assert record["worker_outcome_written_at"] != record["ended_at"]
+
+
+def test_write_worker_terminal_status_omits_worker_outcome_written_at_when_absent(
+    tmp_path: Path,
+) -> None:
+    """Rollout-window compatibility (design doc §3): a caller that does not
+    pass ``worker_outcome_written_at`` gets a record without the key at all,
+    not a ``null`` -- matching ``worker_outcome``'s own omit-when-absent
+    convention so an old record and a "mtime unavailable" record are
+    indistinguishable from a "no signal" record, exactly as intended.
+    """
+    path = tmp_path / "issue-1.claude.terminal.json"
+    write_worker_terminal_status(
+        path,
+        pid=4242,
+        exit_code=0,
+        started_at="2026-07-30T00:00:00Z",
+        ended_at="2026-07-30T00:05:00Z",
+        duration_seconds=300.0,
+        worker_outcome={"push_succeeded": True, "pr_created": False},
+    )
+
+    record = find_worker_terminal_status(tmp_path, 1)
+    assert record is not None
+    assert "worker_outcome_written_at" not in record
+
+
 def test_write_worker_terminal_status_creates_missing_parent(tmp_path: Path) -> None:
     """The sessions directory does not need to pre-exist."""
     path = tmp_path / "nested" / "issue-1.claude.terminal.json"
@@ -192,3 +245,47 @@ def test_start_terminal_status_watcher_records_exit_code_without_blocking(
     assert payload["pid"] == proc.pid
     assert payload["exit_code"] == 7
     assert payload["duration_seconds"] >= 1.0
+
+
+def test_start_terminal_status_watcher_records_outcome_files_own_mtime(
+    tmp_path: Path,
+) -> None:
+    """B5 (wf-review-opus.md) / design doc §3, Group A step A1: the watcher
+    must capture the outcome file's own mtime as ``worker_outcome_written_at``,
+    not stamp it with the watcher's own exit-observation time (``ended_at``).
+    A leftover outcome file from an earlier dispatch sitting in a reused
+    worktree has a mtime from well before this process even started; if the
+    watcher stamped it with ``ended_at`` instead, that leftover would read as
+    freshly written on every subsequent dispatch that reuses the worktree.
+    """
+    worktree_path = tmp_path / "wt"
+    worktree_path.mkdir(parents=True, exist_ok=True)
+    outcome_path = worktree_path / ".worker-outcome.json"
+    outcome_path.write_text(
+        json.dumps({"outcome": "blocked", "reason": "leftover from an earlier dispatch"}),
+        encoding="utf-8",
+    )
+    # Pin the outcome file's mtime well before the process below even starts,
+    # simulating a leftover from an earlier dispatch of the same worktree.
+    old_mtime = datetime(2020, 1, 1, tzinfo=UTC).timestamp()
+    os.utime(outcome_path, (old_mtime, old_mtime))
+
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "raise SystemExit(1)"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=(os.name != "nt"),
+    )
+    path = tmp_path / "issue-1.claude.terminal.json"
+    thread = start_terminal_status_watcher(proc, path, worktree_path=worktree_path)
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["worker_outcome"]["outcome"] == "blocked"
+    # The recorded written_at reflects the FILE's mtime (2020), not the
+    # watcher's own exit-observation time (recorded as ended_at, which is
+    # necessarily >= this test's own start time, decades later).
+    recorded = datetime.fromisoformat(payload["worker_outcome_written_at"].replace("Z", "+00:00"))
+    assert recorded.year == 2020
+    assert payload["worker_outcome_written_at"] != payload["ended_at"]
