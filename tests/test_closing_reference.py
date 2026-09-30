@@ -9,6 +9,9 @@ from __future__ import annotations
 
 import ast
 import json
+import shutil
+import tempfile
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +27,22 @@ from charlie_work.config import OrchestratorConfig
 from charlie_work.instrumentation import query_events
 
 _SRC_ROOT = Path(__file__).resolve().parent.parent / "src" / "charlie_work"
+
+
+@pytest.fixture
+def tmp_path() -> Iterator[Path]:
+    """Short-path override of pytest's ``tmp_path``.
+
+    The ``apply_fixes`` salvage tests create real git worktrees; under a deep
+    checkout (worker worktrees) pytest's ``pytest-of-<user>/pytest-N/<test-name>``
+    nesting pushes the path past what git accepts on Windows (``fatal:
+    '$GIT_DIR' too big``). ``mkdtemp`` with a short prefix keeps them runnable.
+    """
+    path = Path(tempfile.mkdtemp(prefix="t"))
+    try:
+        yield path
+    finally:
+        shutil.rmtree(path, ignore_errors=True)
 
 
 class _FakeIssueViewer:
