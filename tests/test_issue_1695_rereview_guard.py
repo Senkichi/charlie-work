@@ -275,6 +275,10 @@ def test_cli_rereview_force_regenerates_packet_and_archives_prior_decision(
     )
     assert round_two["decision"] == "approved"
     assert round_two["reviewed_head_sha"] == "sha-carried"
+    # A stale-head void is not a *force* void: verdict_force_voided is
+    # reserved for live-head verdicts that only --force-rereview discards.
+    state = json.loads((repo / _STATE_REL).read_text(encoding="utf-8"))
+    assert not [e for e in state["events"] if e.get("kind") == "verdict_force_voided"]
 
 
 def test_cli_force_rereview_voids_live_head_request_changes_verdict(
