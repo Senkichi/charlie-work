@@ -130,8 +130,18 @@ def _write_review_permissions(checkout_path: Path) -> None:
 REVIEW_EXEC_SECTION_HEADING = "## Shell commands in this review session"
 
 
+def _review_exec_commands_text() -> str:
+    """The allow-list as a prose list, rendered from ``_REVIEW_EXEC_ALLOWLIST``.
+
+    The single renderer for every prompt that states the runnable set (the
+    launch prompt section below and the issue #2090 resume nudge), so neither
+    can grow a second hand-kept list.
+    """
+    return ", ".join(f"`{entry[len('Exec(') : -1]}`" for entry in _REVIEW_EXEC_ALLOWLIST)
+
+
 def _review_exec_prompt_section() -> str:
-    commands = ", ".join(f"`{entry[len('Exec(') : -1]}`" for entry in _REVIEW_EXEC_ALLOWLIST)
+    commands = _review_exec_commands_text()
     return (
         f"{REVIEW_EXEC_SECTION_HEADING}\n\n"
         "This session is headless and read-only. Commands that need approval are "
