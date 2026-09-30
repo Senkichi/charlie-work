@@ -18,7 +18,8 @@ import copy
 import logging
 from typing import Any
 
-from .. import dead_worker_reap, worker_fate
+from .. import worker_fate
+from . import effects_rework
 from ..escalation import _escalation_edge
 from ..labels import TransitionOutcome
 from .apply_context import SweepContext
@@ -42,6 +43,8 @@ def _emit_under_lock(ctx: SweepContext, commit: Emit) -> None:
         state = ctx.ports.load_state(ctx.state_file)
         state = ctx.write_gate.append_event(
             state,
+            # event-consumer: audit-only -- pass-through of the kind ``decide*`` chose; every
+            # literal is checked at its origin by tests/test_dws_event_kinds.py
             commit.kind,
             dict(commit.payload),
             ctx.config.runtime.event_ring_size,
@@ -93,7 +96,7 @@ def _escalate(ctx: SweepContext, commit: Escalate) -> None:
 
 def _route_pre_review_rework(ctx: SweepContext, commit: RoutePreReviewRework) -> None:
     enriched = ctx.pr_views.get(commit.pr_number) or ctx.pr_by_issue[commit.issue]
-    dead_worker_reap._route_dead_worker_to_pre_review_rework(
+    effects_rework._route_dead_worker_to_pre_review_rework(
         ctx.state_file,
         ctx.gh,
         ctx.config,
@@ -150,11 +153,19 @@ def _transition(ctx: SweepContext, commit: TransitionLabel) -> None:
     )
 
 
+def _lock_phase_event(commit: Emit) -> tuple[str, dict[str, Any]]:
+    """The ``(kind, payload)`` pair ``_append_sweep_events`` writes at the end of the lock.
+
+    The kind is whatever literal ``decide*`` chose; ``tests/test_dws_event_kinds.py``
+    verifies those literals at their origin."""
+    return (commit.kind, dict(commit.payload))
+
+
 def apply_commit(ctx: SweepContext, phase: str, commit: Any, sweep_events: list[Any]) -> None:
     """Apply one decided commit for ``phase``."""
     if isinstance(commit, Emit):
         if phase == "lock":
-            sweep_events.append((commit.kind, dict(commit.payload)))
+            sweep_events.append(_lock_phase_event(commit))
         else:
             _emit_under_lock(ctx, commit)
     elif isinstance(commit, UpdateIssue):

@@ -46,7 +46,7 @@ from unittest.mock import patch
 
 import pytest
 
-import charlie_work.dead_worker_reap as dead_worker_reap
+import charlie_work.dead_worker_sweep.effects_pr as effects_pr
 from _fakes_github import FakeGitHub
 from charlie_work.config import (
     ClaudeCodeConfig,
@@ -302,7 +302,7 @@ def test_orphan_sweep_parks_completed_local_work(tmp_path: Path, shallow_wts: Pa
     sessions_dir.mkdir(parents=True, exist_ok=True)
     fleet_dir = tmp_path / "fleet"
 
-    with patch.object(dead_worker_reap, "push_branch") as push_mock:
+    with patch.object(effects_pr, "push_branch") as push_mock:
         push_mock.side_effect = AssertionError(
             "push_branch must not be called for a no-PR backend"
         )

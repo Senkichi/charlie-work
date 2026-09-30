@@ -1,4 +1,14 @@
-"""Seam integrity for the workflow.py -> dead_worker_reap.py split (#1317,
+"""Seam integrity for the dead-worker helper family's home in ``dead_worker_sweep``.
+
+Wave B (dead-worker sweep rewrite, dws-3-wire) retired ``dead_worker_reap.py``: its 25
+helper units now live in three effect modules of the ``dead_worker_sweep`` package
+(``effects_sessions``, ``effects_rework``, ``effects_pr``), split by concern so each
+stays under the repo's normal 800-line cap. The facade promise is unchanged:
+``workflow.py`` re-exports every moved name, by identity, so every
+``charlie_work.workflow.<name>`` import path keeps resolving. The history below
+describes the original #1317 split and still explains why the facade exists.
+
+Seam integrity for the workflow.py -> dead_worker_reap.py split (#1317,
 spun off from #1283's Phase-A recon; seventh module in the same
 verbatim-move lineage as ``dispatch_selection.py``, ``escalation.py``,
 ``verdict_parsing.py``, ``rework_prompts.py``, ``ci_findings.py``,
@@ -80,7 +90,10 @@ import re
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).parents[1]
-_MODULE_PATH = _REPO_ROOT / "src" / "charlie_work" / "dead_worker_reap.py"
+_PACKAGE_DIR = _REPO_ROOT / "src" / "charlie_work" / "dead_worker_sweep"
+# The three effect modules the retired ``dead_worker_reap.py`` was split into.
+_EFFECT_MODULES = ("effects_sessions", "effects_rework", "effects_pr")
+_MODULE_PATHS = tuple(_PACKAGE_DIR / f"{name}.py" for name in _EFFECT_MODULES)
 _WORKFLOW_PATH = _REPO_ROOT / "src" / "charlie_work" / "workflow.py"
 
 _MOVED_NAMES = (
@@ -138,8 +151,13 @@ _MOVED_NAMES = (
 # Re-derived under the dead-worker sweep rewrite (wave B, M9): the dead-session
 # classify lane moved into ``dead_worker_sweep``, shrinking the module to 1777
 # lines; the band is re-centered on that total with the same +/-150 headroom.
-_CAP_BAND_MIN = 1627
-_CAP_BAND_MAX = 1927
+# Re-derived under the dead-worker sweep rewrite (wave B, M10): the helpers moved
+# out of ``dead_worker_reap.py`` (retired) into the three ``effects_*`` modules; their
+# combined length is 1748 lines, re-centered with the same +/-150 headroom.
+_CAP_BAND_MIN = 1598
+_CAP_BAND_MAX = 1898
+# Each effect module individually obeys the repo's normal per-module cap.
+_PER_MODULE_LINE_CAP = 800
 
 
 # ---------------------------------------------------------------------------
@@ -167,16 +185,24 @@ def _module_level_defined_names(path: Path) -> list[str]:
     return names
 
 
+def _all_effect_module_names() -> list[str]:
+    """Top-level names across the three effect modules, in module order."""
+    names: list[str] = []
+    for path in _MODULE_PATHS:
+        names.extend(_module_level_defined_names(path))
+    return names
+
+
 def _facade_reexported_names(workflow_path: Path) -> set[str]:
-    """Names workflow.py's facade block currently re-exports from
-    ``.dead_worker_reap``."""
+    """Names workflow.py's facade blocks currently re-export from the three
+    ``.dead_worker_sweep.effects_*`` modules."""
     tree = ast.parse(workflow_path.read_text(encoding="utf-8"), filename=str(workflow_path))
     names: set[str] = set()
     for node in ast.walk(tree):
         if (
             isinstance(node, ast.ImportFrom)
             and node.level == 1
-            and node.module == "dead_worker_reap"
+            and node.module in {f"dead_worker_sweep.{name}" for name in _EFFECT_MODULES}
         ):
             names.update(alias.asname or alias.name for alias in node.names)
     return names
@@ -251,17 +277,16 @@ def _workflow_imports_in(source: str, *, filename: str = "<string>") -> list[str
 
 
 def test_dead_worker_reap_has_no_workflow_import_grep_form() -> None:
-    """Grep-form check: raw-text scan of ``dead_worker_reap.py``'s own
-    source finds zero occurrences of a forbidden workflow.py import as an
-    actual statement.
+    """Grep-form check: raw-text scan of each effect module's own source finds
+    zero occurrences of a forbidden workflow.py import as an actual statement.
     """
-    source = _MODULE_PATH.read_text(encoding="utf-8")
-    hits = _grep_forbidden_workflow_imports(source)
-    assert hits == [], (
-        f"dead_worker_reap.py contains a forbidden import of workflow.py: {hits} -- "
-        "workflow.py's facade already imports FROM dead_worker_reap.py, so the "
-        "reverse import would create the exact cycle this pattern exists to avoid"
-    )
+    for path in _MODULE_PATHS:
+        hits = _grep_forbidden_workflow_imports(path.read_text(encoding="utf-8"))
+        assert hits == [], (
+            f"{path.name} contains a forbidden import of workflow.py: {hits} -- "
+            "workflow.py's facade already imports FROM the effect modules, so the "
+            "reverse import would create the exact cycle this pattern exists to avoid"
+        )
 
 
 def test_dead_worker_reap_has_no_workflow_import_ast_form() -> None:
@@ -269,10 +294,9 @@ def test_dead_worker_reap_has_no_workflow_import_ast_form() -> None:
     catching any multi-line/aliased spelling the raw-text scan might not
     anticipate.
     """
-    offenders = _workflow_imports_in(
-        _MODULE_PATH.read_text(encoding="utf-8"), filename=str(_MODULE_PATH)
-    )
-    assert offenders == [], f"dead_worker_reap.py imports from workflow.py: {offenders}"
+    for path in _MODULE_PATHS:
+        offenders = _workflow_imports_in(path.read_text(encoding="utf-8"), filename=str(path))
+        assert offenders == [], f"{path.name} imports from workflow.py: {offenders}"
 
 
 def test_workflow_import_detectors_flag_a_real_violation() -> None:
@@ -309,16 +333,20 @@ def test_dead_worker_reap_module_actually_imports_cleanly() -> None:
     """
     import importlib
 
-    module = importlib.import_module("charlie_work.dead_worker_reap")
-    assert module.__name__ == "charlie_work.dead_worker_reap"
+    sessions = importlib.import_module("charlie_work.dead_worker_sweep.effects_sessions")
+    rework = importlib.import_module("charlie_work.dead_worker_sweep.effects_rework")
+    pr = importlib.import_module("charlie_work.dead_worker_sweep.effects_pr")
+    assert sessions.__name__ == "charlie_work.dead_worker_sweep.effects_sessions"
 
-    # Confirms the module body actually executed to completion (not merely
+    # Confirms the module bodies actually executed to completion (not merely
     # "importlib didn't raise") by checking real symbols landed with the
     # expected shape.
-    assert callable(module._is_startup_death)
-    assert callable(module._detect_stalled_sessions)
-    assert isinstance(module.STARTUP_DEATH_THRESHOLD_SECONDS, int)
-    assert isinstance(module._ZERO_ARTIFACT_ESCALATION_THRESHOLD, int)
+    assert callable(sessions._is_startup_death)
+    assert callable(sessions._detect_stalled_sessions)
+    assert callable(rework._route_dead_worker_to_pre_review_rework)
+    assert callable(pr._attempt_salvage)
+    assert isinstance(sessions.STARTUP_DEATH_THRESHOLD_SECONDS, int)
+    assert isinstance(sessions._ZERO_ARTIFACT_ESCALATION_THRESHOLD, int)
 
 
 # ---------------------------------------------------------------------------
@@ -336,10 +364,17 @@ def test_all_moved_names_are_reexported_by_identity() -> None:
     a function or constant would compare equal-but-distinct in ways that are
     easy to miss.
     """
-    import charlie_work.dead_worker_reap as dead_worker_reap
+    import importlib
+
     import charlie_work.workflow as workflow
 
-    names = _module_level_defined_names(_MODULE_PATH)
+    owners = {
+        name: importlib.import_module(f"charlie_work.dead_worker_sweep.{module}")
+        for module in _EFFECT_MODULES
+        for name in _module_level_defined_names(_PACKAGE_DIR / f"{module}.py")
+    }
+    names = _all_effect_module_names()
+    assert len(names) == len(set(names)), "a name is defined in more than one effect module"
     assert names, "AST derivation found zero module-level names -- derivation is broken"
     assert len(names) == 25, f"expected 25 moved units, found {len(names)}: {sorted(names)}"
     assert set(names) == set(_MOVED_NAMES), (
@@ -352,16 +387,10 @@ def test_all_moved_names_are_reexported_by_identity() -> None:
         f"workflow.py's facade does not re-export: {sorted(missing_from_facade)}"
     )
 
-    missing_from_module = [n for n in names if not hasattr(dead_worker_reap, n)]
-    assert missing_from_module == [], (
-        f"dead_worker_reap.py itself is missing a name it should define: "
-        f"{sorted(missing_from_module)}"
-    )
-
-    not_identical = [n for n in names if getattr(workflow, n) is not getattr(dead_worker_reap, n)]
+    not_identical = [n for n in names if getattr(workflow, n) is not getattr(owners[n], n)]
     assert not_identical == [], (
         "workflow.py re-exports these names as objects DIFFERENT from "
-        f"dead_worker_reap.py's own -- the facade must import, never redeclare: "
+        f"the effect modules' own -- the facade must import, never redeclare: "
         f"{sorted(not_identical)}"
     )
 
@@ -401,7 +430,7 @@ def test_facade_reexported_names_match_the_moved_set() -> None:
     """
     facade_names = _facade_reexported_names(_WORKFLOW_PATH)
     assert facade_names == set(_MOVED_NAMES), (
-        f"workflow.py's `.dead_worker_reap` facade block re-exports "
+        f"workflow.py's `.dead_worker_sweep.effects_*` facade blocks re-export "
         f"{sorted(facade_names)}, expected exactly {sorted(_MOVED_NAMES)}"
     )
 
@@ -419,10 +448,10 @@ def test_module_defines_exactly_the_27_moved_symbols() -> None:
     lost, duplicated, or a top-level unit added/dropped/renamed during a
     mechanical edit.
     """
-    names = _module_level_defined_names(_MODULE_PATH)
+    names = _all_effect_module_names()
     assert names, "AST derivation found zero module-level names -- derivation is broken"
     assert set(names) == set(_MOVED_NAMES), (
-        f"dead_worker_reap.py's top-level definitions are {sorted(names)}, expected "
+        f"the effect modules' top-level definitions are {sorted(names)}, expected "
         f"exactly the moved names {sorted(_MOVED_NAMES)}"
     )
 
@@ -437,9 +466,14 @@ def test_module_total_line_count_is_within_the_recorded_cap_band() -> None:
     extraction under the same #1283 operator exemption
     ``stalled_review_reap.py`` used).
     """
-    total = len(_MODULE_PATH.read_text(encoding="utf-8").splitlines())
+    lengths = {
+        path.name: len(path.read_text(encoding="utf-8").splitlines()) for path in _MODULE_PATHS
+    }
+    too_long = {name: n for name, n in lengths.items() if n > _PER_MODULE_LINE_CAP}
+    assert too_long == {}, f"effect modules over the {_PER_MODULE_LINE_CAP}-line cap: {too_long}"
+    total = sum(lengths.values())
     assert _CAP_BAND_MIN <= total <= _CAP_BAND_MAX, (
-        f"dead_worker_reap.py is {total} lines total, expected within the recorded "
+        f"the effect modules total {total} lines, expected within the recorded "
         f"cap-exemption band [{_CAP_BAND_MIN}, {_CAP_BAND_MAX}] -- if this module's header "
         "or member content genuinely needs to grow or shrink beyond the band, the band "
         "itself (not this assertion) should be re-derived and re-recorded, not silently "

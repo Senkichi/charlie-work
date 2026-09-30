@@ -20,14 +20,6 @@ from typing import TYPE_CHECKING, Any
 
 from .. import state as state_mod
 from ..cross_repo_gate import cross_repo_scope_gate
-from ..dead_worker_reap import (
-    _attempt_salvage,
-    _emit_session_failed_relabeled,
-    _is_pre_review_rework_candidate,
-    _reap_restore_rework_requested,
-    _rework_pr_for_worker,
-    _route_dead_worker_to_pre_review_rework,
-)
 from ..dispatch_selection import _windowed_redispatch_at
 from ..escalation import _escalate_issue, _escalation_edge
 from ..github import label_names
@@ -35,6 +27,14 @@ from ..local_work_park import park_labelless_dead_local_session
 from ..worker import WorkerView
 from ..worktree import read_worker_outcome
 from .decide_dead_sessions import redispatch_verdict
+from .effects_pr import _attempt_salvage
+from .effects_rework import (
+    _is_pre_review_rework_candidate,
+    _reap_restore_rework_requested,
+    _rework_pr_for_worker,
+    _route_dead_worker_to_pre_review_rework,
+)
+from .effects_sessions import _emit_session_failed_relabeled
 
 if TYPE_CHECKING:
     from .dead_sessions import SessionPass

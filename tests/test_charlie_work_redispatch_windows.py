@@ -230,9 +230,6 @@ def test_redispatch_at_only_written_by_known_call_sites(tmp_path: Path) -> None:
     dispatch_selection_path = (
         Path(__file__).parents[1] / "src" / "charlie_work" / "dispatch_selection.py"
     )
-    dead_worker_reap_path = (
-        Path(__file__).parents[1] / "src" / "charlie_work" / "dead_worker_reap.py"
-    )
     state_dispatch_rework_path = (
         Path(__file__).parents[1]
         / "src"
@@ -270,13 +267,12 @@ def test_redispatch_at_only_written_by_known_call_sites(tmp_path: Path) -> None:
     redispatch_assignments = (
         _count_redispatch_at_assignments(workflow_path)
         + _count_redispatch_at_assignments(dispatch_selection_path)
-        + _count_redispatch_at_assignments(dead_worker_reap_path)
         + sum(_count_redispatch_at_assignments(p) for p in sweep_paths)
         + _count_redispatch_at_assignments(state_dispatch_rework_path)
     )
     assert redispatch_assignments == 4, (
         'Expected 4 real entry["redispatch_at"] assignment statements across '
-        "workflow.py, dispatch_selection.py, dead_worker_reap.py, dead_worker_sweep/, and "
+        "workflow.py, dispatch_selection.py, dead_worker_sweep/, and "
         "orchestration/state_dispatch_rework.py, found "
         f"{redispatch_assignments}"
     )

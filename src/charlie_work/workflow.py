@@ -466,7 +466,7 @@ from .queue_sync_coverage import (  # noqa: F401  (deliberate re-export)
 #
 # `_detect_and_handle_orphaned_workers` itself deliberately stays defined
 # below in this file -- see its docstring and issue #1317 for why.
-from .dead_worker_reap import (  # noqa: F401  (deliberate re-export)
+from .dead_worker_sweep.effects_sessions import (  # noqa: F401  (deliberate re-export)
     STARTUP_DEATH_THRESHOLD_SECONDS,
     _is_startup_death,
     _worker_death_bounded_runtime_seconds,
@@ -480,18 +480,22 @@ from .dead_worker_reap import (  # noqa: F401  (deliberate re-export)
     _is_zero_artifact_dispatch_loop,
     _sweep_orphan_processes_for_dead_sessions,
     _log_worker_census,
+    _issues_with_live_workers,
+)
+from .dead_worker_sweep.effects_rework import (  # noqa: F401  (deliberate re-export)
     _rework_pr_for_worker,
     _reap_restore_rework_requested,
     _is_pr_updated_at_older_than,
     _is_pre_review_rework_candidate,
     _route_dead_worker_to_pre_review_rework,
+)
+from .dead_worker_sweep.effects_pr import (  # noqa: F401  (deliberate re-export)
     _safe_repo_slug,
     _dispatching_repo_name,
     _open_salvage_pr,
     _salvage_already_landed,
     _attempt_salvage,
     _open_pr_for_orphaned_branch,
-    _issues_with_live_workers,
 )
 from .dead_worker_sweep import (  # noqa: F401  (deliberate re-export)
     classify_dead_sessions as _classify_dead_sessions_and_update_throttle_state,

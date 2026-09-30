@@ -350,7 +350,8 @@ def test_stall_lane_rate_limit_defer_emits_throttle_window_set(
 ) -> None:
     """Call site 1: ``_detect_and_handle_stalled_sessions``'s rate-limit
     defer branch writes the window and emits ``throttle_window_set``."""
-    from charlie_work import dead_worker_reap, workflow
+    from charlie_work import workflow
+    from charlie_work.dead_worker_sweep import effects_sessions
 
     issue_number = 2006
     sessions_dir, state_file, _ = _make_stalled_devin_session(
@@ -360,7 +361,7 @@ def test_stall_lane_rate_limit_defer_emits_throttle_window_set(
         "charlie_work.write_gate.kill_process_tree",
         lambda pid, start_time=None: [pid],
     )
-    monkeypatch.setattr(dead_worker_reap, "sweep_orphan_processes", lambda worktree_path: [])
+    monkeypatch.setattr(effects_sessions, "sweep_orphan_processes", lambda worktree_path: [])
     monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: True)
     monkeypatch.setattr("charlie_work.worker.real_activity_probe_for", _stale_devin_probe)
 
@@ -403,7 +404,8 @@ def test_stall_lane_reap_emits_throttle_window_set(
     """Call site 2: a deferred worker still silent past its deadline is
     killed, classified ``rate_limited`` from the log tail, and the write of
     the freshly computed window emits ``throttle_window_set``."""
-    from charlie_work import dead_worker_reap, workflow
+    from charlie_work import workflow
+    from charlie_work.dead_worker_sweep import effects_sessions
 
     issue_number = 2007
     frozen_now = datetime.now(UTC)
@@ -415,7 +417,7 @@ def test_stall_lane_reap_emits_throttle_window_set(
         "charlie_work.write_gate.kill_process_tree",
         lambda pid, start_time=None: [pid],
     )
-    monkeypatch.setattr(dead_worker_reap, "sweep_orphan_processes", lambda worktree_path: [])
+    monkeypatch.setattr(effects_sessions, "sweep_orphan_processes", lambda worktree_path: [])
     monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: True)
     monkeypatch.setattr("charlie_work.worker.real_activity_probe_for", _stale_devin_probe)
 

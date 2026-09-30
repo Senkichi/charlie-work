@@ -52,11 +52,6 @@ from typing import Any
 from .. import post_mortem, worker, worker_fate, worker_literal_tmp
 from .. import state as state_mod
 from ..config import OrchestratorConfig
-from ..dead_worker_reap import (
-    _attempt_salvage,
-    _dispatching_repo_name,
-    _reap_restore_rework_requested,
-)
 from ..dispatch_selection import _windowed_redispatch_at
 from ..escalation import _escalate_issue, _escalation_edge
 from ..fleet_registry import managed_repo_names
@@ -78,6 +73,8 @@ from .decide_dead_sessions import (
     launch_failure_redispatch_at,
     wants_unsafe_salvage,
 )
+from .effects_pr import _attempt_salvage, _dispatching_repo_name
+from .effects_rework import _reap_restore_rework_requested
 
 
 @dataclass(frozen=True)

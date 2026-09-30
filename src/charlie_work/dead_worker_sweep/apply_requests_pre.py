@@ -15,14 +15,13 @@ from typing import Any
 
 from .. import (
     blocked_worker_escalation,
-    dead_worker_reap,
     escalation,
     fleet_registry,
     local_work_park,
     no_pr_orphan_fate,
     worker_fate,
 )
-from . import live_handoff
+from . import effects_pr, effects_sessions, live_handoff
 from ..cross_repo_gate import cross_repo_scope_gate
 from ..github import build_branch_issue_validator
 from ..process_utils import find_worker_terminal_status
@@ -201,13 +200,13 @@ def strip_and_flag(ctx: SweepContext, req: StripAndFlag) -> LabelWrite:
 
 
 def probe_zero_artifact(ctx: SweepContext, req: ProbeZeroArtifact) -> bool:
-    return bool(dead_worker_reap._is_zero_artifact_dispatch_loop(ctx.sessions_dir, req.issue))
+    return bool(effects_sessions._is_zero_artifact_dispatch_loop(ctx.sessions_dir, req.issue))
 
 
 def probe_cross_repo_scope(ctx: SweepContext, req: ProbeCrossRepoScope) -> ScopeResult:
     if ctx.scope_context is None:
         repo_name = (
-            dead_worker_reap._dispatching_repo_name(ctx.gh, ctx.repo_root)
+            effects_pr._dispatching_repo_name(ctx.gh, ctx.repo_root)
             if ctx.repo_root is not None
             else ""
         )

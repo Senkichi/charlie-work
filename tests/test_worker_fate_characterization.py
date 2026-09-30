@@ -480,7 +480,9 @@ def test_flip3_dead_worker_reap_salvage_pushes_local_only_commits(
     config = OrchestratorConfig()
     active_labels, issue_labels = _salvage_labels(config)
     gh = _SalvageTestGitHub(repo_root=tmp_path)
-    monkeypatch.setattr("charlie_work.dead_worker_reap.push_branch", lambda *a, **k: (True, None))
+    monkeypatch.setattr(
+        "charlie_work.dead_worker_sweep.effects_pr.push_branch", lambda *a, **k: (True, None)
+    )
 
     from charlie_work.workflow import _attempt_salvage
 

@@ -26,7 +26,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from .. import dead_worker_reap, devin_shell, post_mortem, role_quota_ledger, worker, worker_fate
+from .. import devin_shell, post_mortem, role_quota_ledger, worker, worker_fate
+from . import effects_sessions
 from ..config import OrchestratorConfig
 from ..state import load_state, set_throttled_until, state_lock
 from ..write_gate import WriteGate, require_write_gate
@@ -105,7 +106,7 @@ def _serve(
         return tuple(write_gate.kill_process_tree(w.pid, w.process_start_time))
     if isinstance(request, KillOrphans):
         # Catches detached/daemonized processes that survived the tree kill.
-        orphans = dead_worker_reap.sweep_orphan_processes(w.worktree_path)
+        orphans = effects_sessions.sweep_orphan_processes(w.worktree_path)
         for orphan in orphans or []:
             write_gate.kill_process(orphan["pid"])
         return tuple(o["pid"] for o in orphans or [])
@@ -203,7 +204,13 @@ def _state_txn(
                 write_gate=write_gate,
             )
         if commit.event_kind is not None:
-            state = write_gate.append_event(state, commit.event_kind, dict(commit.event_payload))
+            state = write_gate.append_event(
+                state,
+                # event-consumer: audit-only -- pass-through of the kind ``decide_stalled``
+                # chose; every literal is checked at its origin by tests/test_dws_event_kinds.py
+                commit.event_kind,
+                dict(commit.event_payload),
+            )
         write_gate.save_state(state)
 
 
@@ -241,6 +248,8 @@ def _apply(
 def _violation(write_gate: WriteGate, w: worker.WorkerView, detail: str) -> None:
     logger.error("stalled sweep plan violation for issue %s: %s", w.issue_number, detail)
     write_gate.log_event(
+        # event-consumer: audit-only -- a plan violation is a bug in ``decide_stalled``; the
+        # error-level row is the audit record and the ``logger.error`` above is the alert
         kind=PLAN_VIOLATION_KIND,
         payload={"issue_number": w.issue_number, "detail": detail[:500]},
         level="error",

@@ -74,7 +74,11 @@ class _Run:
 def _abort(ctx: SweepContext, kind: str, phase: str, detail: str) -> SweepAborted:
     logger.error("dead-worker sweep %s in %s phase: %s", kind, phase, detail)
     ctx.write_gate.log_event(
-        kind=kind, payload={"phase": phase, "detail": detail[:500]}, level="error"
+        # event-consumer: audit-only -- a sweep abort is a decide-module bug; the error-level
+        # row is the audit record and the ``logger.error`` above is the alert
+        kind=kind,
+        payload={"phase": phase, "detail": detail[:500]},
+        level="error",
     )
     return SweepAborted(f"{kind}: {detail}")
 
