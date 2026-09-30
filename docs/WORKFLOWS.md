@@ -183,7 +183,8 @@ tier's outcome surfaces.
 
 Fleet-level commands compose the single-repo loops across every repo in the
 user-level registry (`fleet_registry.py`) under one global concurrency budget
-(`fleet.global_max_concurrent_sessions`). A repo joins the registry
+(`fleet.global_max_concurrent_sessions` for workers;
+`fleet.global_max_concurrent_reviews` for reviewers). A repo joins the registry
 automatically the first time any command loads its config (`touch_repo()`), so
 there is no explicit "register" step — run charlie once against a repo and it is
 enrolled.

@@ -2089,6 +2089,9 @@ class FleetConfig:
     """
 
     global_max_concurrent_sessions: Annotated[int, Typed, BoolTolerant] = 0
+    # #2084 reviewer-lane cap; 0 = disabled. Unlike the worker cap above this key has
+    # always rejected a bool and a negative (no BoolTolerant, NonNeg).
+    global_max_concurrent_reviews: Annotated[int, Typed, NonNeg] = 0
     launch_lock_wait_seconds: Annotated[float, Typed, NonNeg, Finite] = 10.0
 
 

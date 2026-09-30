@@ -540,6 +540,21 @@ does not bound CPU or RAM. The governor applies this cap at every dispatch
 path alongside the per-repo `dispatch.max_concurrent_sessions` cap
 (`_apply_concurrency_governor()` in `workflow.py`).
 
+**Reviewer budget**: `fleet.global_max_concurrent_reviews` (issue #2084, default
+`0` = disabled) is the same kind of cap for live *reviewer* sessions across all
+registered repos -- a separate budget from the worker one, stacking on the
+per-repo `review_dispatch.max_concurrent_reviews`. Use it when the reviewer
+harness has its own provider rate limit (e.g. `devin-shell` reviewers) that the
+per-repo caps, summed, would exceed. Review dispatch launches at most
+`min(per-repo capacity, fleet_max - fleet_live)` reviewers per pass, under the
+fleet launch lock; the `dispatch_reviews` result and the `review_dispatch_claim`
+/ `review_dispatch` events carry `fleet_review_concurrency_limit`,
+`fleet_live_review_count`, `fleet_available_review_slots`, and `clamped_by:
+fleet_max` when the fleet cap bound the launch. A held lock defers the pass with
+`deferred_reason: fleet_lock_held` (`dispatch_deferred`, then `dispatch_starved`
+after 3 in a row, lane `dispatch_reviews`). The knob is read from the layered
+config every pass -- no supervisor restart needed.
+
 **Scoped claim**: The fleet budget bounds worker *count*, not CPU. When running
 the fleet across multiple repos on one host, you must still respect the
 cross-repo xdist discipline from the Local host saturation ceiling section
