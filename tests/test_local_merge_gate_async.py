@@ -21,7 +21,6 @@ fixture style.
 
 from __future__ import annotations
 
-import os
 import subprocess
 import sys
 import tempfile
@@ -31,7 +30,7 @@ from pathlib import Path
 
 import pytest
 
-from _git_leak_guard import GIT_ISOLATION_ENV_VARS
+from _git_leak_guard import scrubbed_git_env
 from charlie_work import local_suite_runner, quiesce
 from charlie_work.config import OrchestratorConfig, build_config_from_data
 from charlie_work.host_load import pytest_tree_load
@@ -61,11 +60,7 @@ from charlie_work.orchestration.local_merge_gate import (  # noqa: E402
 def _git(repo_root: Path, *args: str) -> subprocess.CompletedProcess[str]:
     # The scrub stops ambient GIT_DIR/GIT_CONFIG_* redirecting commands at the
     # outer repo; the session's isolation vars (#2060) must survive it.
-    env = {
-        k: v
-        for k, v in os.environ.items()
-        if not k.startswith("GIT_") or k in GIT_ISOLATION_ENV_VARS
-    }
+    env = scrubbed_git_env()
     result = subprocess.run(["git", *args], cwd=repo_root, capture_output=True, text=True, env=env)
     assert result.returncode == 0, (args, result.stderr)
     return result

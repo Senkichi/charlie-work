@@ -28,8 +28,14 @@ layers:
 * :func:`enclosing_repo_config_path` — resolves, once at session start, the
   shared config file of whatever repository encloses the pytest invocation
   cwd; the conftest's per-test guard fixture byte-compares it before and
-  after every test so a mutation is attributed to the offending test and
-  restored instead of silently persisting.
+  after every test so a mutation is attributed to the offending test.
+  The guard is deliberately detect-only (:func:`fail_on_shared_config_mutation`
+  never writes the file): restoring the earlier bytes could silently discard
+  a legitimate concurrent write — worktree-add tracking config,
+  ``gh pr checkout``, ``git push -u``, a sibling xdist worker's repo setup —
+  and a raw ``write_bytes`` bypasses the ``config.lock`` protocol every real
+  git writer holds. The failure message carries the unified diff so the
+  human repairing the file sees exactly what changed.
 * :func:`assert_repo_scoped_config` — the call-site belt, wired into the
   shared ``_git`` runner in ``tests/_worktree_fixtures.py``: a repo-scoped
   ``git config`` mutation raises unless ``cwd`` resolves to the very
@@ -47,11 +53,14 @@ inside the sandbox).
 
 from __future__ import annotations
 
+import difflib
 import os
 import subprocess
 import tempfile
 from collections.abc import Iterable, Sequence
 from pathlib import Path
+
+import pytest
 
 #: Environment variables the session isolation layer owns. Tests that
 #: rebuild a subprocess env by dropping ``GIT_*`` keys must preserve these --
@@ -110,6 +119,22 @@ def merge_ceiling_directories(*roots: Path | str) -> str:
 def protective_git_env() -> dict[str, str]:
     """The installed isolation variables, for GIT_*-scrubbing test helpers."""
     return {name: os.environ[name] for name in GIT_ISOLATION_ENV_VARS if name in os.environ}
+
+
+def scrubbed_git_env() -> dict[str, str]:
+    """``os.environ`` minus every ``GIT_*`` variable except the isolation set.
+
+    The scrub exists to stop an ambient ``GIT_DIR``/``GIT_CONFIG_*`` redirect
+    from pointing a subprocess at the outer repo — but a blanket ``GIT_*``
+    drop would also strip the containment this module installs, re-opening
+    the #2060 leak inside scrubbed helpers. ``GIT_ISOLATION_ENV_VARS`` are
+    preserved by construction.
+    """
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("GIT_") or key in GIT_ISOLATION_ENV_VARS
+    }
 
 
 def _global_config_content() -> bytes:
@@ -192,6 +217,10 @@ def enclosing_repo_config_path(cwd: Path | None = None) -> Path | None:
     the shared file a stray ``git config --local`` writes through the
     worktree's ``.git`` file. ``None`` when the session was not launched from
     inside a repository (nothing to watch).
+
+    Called with the pytest invocation cwd — which, when that cwd is the
+    enclosing repo's own root, still resolves under the ancestor ceiling:
+    git examines the starting directory before any ceiling-gated ascent.
     """
     command = ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"]
     result = subprocess.run(command, cwd=cwd, capture_output=True, text=True)
@@ -330,12 +359,74 @@ def assert_repo_scoped_config(cwd: Path, argv: Iterable[str]) -> None:
     )
 
 
+# ---------------------------------------------------------------------------
+# Detect-only mutation check for the enclosing repo's shared config
+# ---------------------------------------------------------------------------
+
+
+def _render_config_diff(before: bytes | None, after: bytes | None) -> str:
+    """Unified ``before`` -> ``after`` diff of a config file's bytes.
+
+    ``None`` means the file was absent on that side of the test. Decoded
+    with ``backslashreplace`` so a non-UTF-8 byte renders rather than
+    raising inside the failure path.
+    """
+    before_lines = (
+        [] if before is None else before.decode("utf-8", errors="backslashreplace").splitlines()
+    )
+    after_lines = (
+        [] if after is None else after.decode("utf-8", errors="backslashreplace").splitlines()
+    )
+    from_label = "before" if before is not None else "absent (file created)"
+    to_label = "after" if after is not None else "absent (file deleted)"
+    return "\n".join(
+        difflib.unified_diff(
+            before_lines, after_lines, fromfile=from_label, tofile=to_label, lineterm=""
+        )
+    )
+
+
+def fail_on_shared_config_mutation(config_path: Path, before: bytes | None, nodeid: str) -> None:
+    """Fail the test named *nodeid* when the watched shared config changed.
+
+    Detect-only by design — this function NEVER writes *config_path*:
+
+    * Restoring the earlier snapshot cannot tell the test's write apart from
+      a legitimate concurrent write landing in the same window (worktree-add
+      tracking config, ``gh pr checkout``, ``git push -u``, a sibling xdist
+      worker's repo setup); a blind ``write_bytes(before)`` silently
+      discards whichever of those lost the race.
+    * A raw write also bypasses the ``config.lock`` protocol every real git
+      writer holds, so even a "careful" restore can interleave with an
+      in-flight ``git config`` and leave a torn file.
+
+    Leaving the bytes exactly as the writer left them keeps every writer's
+    change intact, and the rendered diff in the failure message is the
+    evidence a human needs to repair the file by hand — and to tell a real
+    ``user.email`` leak apart from an innocent concurrent write that merely
+    overlapped the test's wall-clock window.
+    """
+    after = config_path.read_bytes() if config_path.is_file() else None
+    if after == before:
+        return
+    pytest.fail(
+        f"{nodeid} coincided with a mutation of {config_path} — the enclosing "
+        "repo's shared git config (issue #2060). The guard is detect-only: "
+        "the file was left exactly as the writer left it, so the diff below "
+        "is the live state — check whether it is a test-side leak or an "
+        "unrelated concurrent write (worktree add, gh pr checkout, "
+        "git push -u) before repairing by hand.\n" + _render_config_diff(before, after)
+    )
+
+
 __all__ = [
     "GIT_ISOLATION_ENV_VARS",
     "assert_repo_scoped_config",
     "ceiling_directories",
     "enclosing_repo_config_path",
+    "fail_on_shared_config_mutation",
     "install_session_git_isolation",
     "merge_ceiling_directories",
     "protective_git_env",
+    "scrubbed_git_env",
 ]

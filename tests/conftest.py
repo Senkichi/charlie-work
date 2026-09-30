@@ -58,6 +58,12 @@ def autospec() -> Callable[..., Any]:
 # test. ``None`` when the run was not launched from inside a repository.
 _ENCLOSING_REPO_CONFIG_PATH: Path | None = None
 
+# The GIT_CEILING_DIRECTORIES value as installed by pytest_configure,
+# captured before the function-scoped `_isolate_git_env` fixture merges on
+# top of it per test — lets a test attribute a discovery stop to the
+# session layer specifically.
+_SESSION_GIT_CEILING: str | None = None
+
 # Per-session scratch dir holding the GIT_CONFIG_GLOBAL/GIT_CONFIG_SYSTEM
 # copies installed at configure time; removed at sessionfinish.
 _GIT_ISOLATION_SCRATCH_DIR: Path | None = None
@@ -80,11 +86,12 @@ def pytest_configure(config: pytest.Config) -> None:
         install_session_git_isolation,
     )
 
-    global _GIT_ISOLATION_SCRATCH_DIR, _ENCLOSING_REPO_CONFIG_PATH
+    global _GIT_ISOLATION_SCRATCH_DIR, _ENCLOSING_REPO_CONFIG_PATH, _SESSION_GIT_CEILING
     basetemp = getattr(config.option, "basetemp", None)
     _GIT_ISOLATION_SCRATCH_DIR = install_session_git_isolation(
         basetemp=Path(basetemp) if basetemp else None
     )
+    _SESSION_GIT_CEILING = os.environ.get("GIT_CEILING_DIRECTORIES")
     _ENCLOSING_REPO_CONFIG_PATH = enclosing_repo_config_path()
 
 
@@ -472,7 +479,7 @@ def _default_healthy_preflight(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture(autouse=True)
 def _shared_repo_config_guard(request: pytest.FixtureRequest) -> Iterator[None]:
-    """Issue #2060: fail (and undo) a test that mutates the enclosing repo's shared git config.
+    """Issue #2060: fail a test during which the enclosing repo's shared git config mutates.
 
     A ``git config`` (implicit ``--local``) run with ``cwd`` inside a
     directory that is not itself a repository ascends into the enclosing
@@ -480,30 +487,28 @@ def _shared_repo_config_guard(request: pytest.FixtureRequest) -> Iterator[None]:
     ``<git-common-dir>/config`` of the main repo — the 2026-09-30 leak that
     stalled the fleet's ``git_identity`` preflight. This fixture
     byte-compares that file before and after every test: a difference fails
-    the owning test with its nodeid and restores the prior bytes, so under
-    ``pytest -n auto`` the first offender is named and the live checkout is
-    never left mutated.
+    the owning test with its nodeid and a unified diff of the change.
+
+    The guard is deliberately detect-only — it never writes the file.
+    Restoring the earlier bytes (the first cut of this fixture) cannot tell
+    the test's write apart from a legitimate concurrent write landing in
+    the same window — worktree-add tracking config, ``gh pr checkout``,
+    ``git push -u``, a sibling worker's repo setup — so a blind restore can
+    silently discard one, and a raw ``write_bytes`` bypasses the
+    ``config.lock`` protocol real git writers hold. A false attribution
+    under ``pytest -n auto`` is surfaced, not hidden: the diff shows whether
+    the named test leaked a ``user.email`` or merely overlapped an
+    unrelated write. See ``fail_on_shared_config_mutation``.
 
     Defined last among the autouse fixtures so its teardown runs first: the
-    "after" snapshot brackets the test body as tightly as possible. A
-    mutation by a *sibling* xdist worker can still attribute to a test that
-    merely overlapped in time — the restore is what keeps the fleet safe
-    either way, and the named test is where the investigation starts.
+    "after" snapshot brackets the test body as tightly as possible.
     """
+    from _git_leak_guard import fail_on_shared_config_mutation
+
     config_path = _ENCLOSING_REPO_CONFIG_PATH
     if config_path is None:
         yield
         return
     before = config_path.read_bytes() if config_path.is_file() else None
     yield
-    after = config_path.read_bytes() if config_path.is_file() else None
-    if after == before:
-        return
-    if before is None:
-        config_path.unlink(missing_ok=True)
-    else:
-        config_path.write_bytes(before)
-    pytest.fail(
-        f"{request.node.nodeid} mutated {config_path} — the enclosing repo's "
-        "shared git config (prior bytes restored; issue #2060)"
-    )
+    fail_on_shared_config_mutation(config_path, before, request.node.nodeid)
