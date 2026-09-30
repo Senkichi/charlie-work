@@ -57,6 +57,7 @@ from pathlib import Path
 
 import pytest
 
+from _git_leak_guard import assert_repo_scoped_config
 from charlie_work.github import GitHubRunResult
 from charlie_work.worktree import WorktreeCleanGH, create_worktree
 
@@ -103,6 +104,11 @@ def _wt_scratch() -> Iterator[Path]:
 
 
 def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    # Issue #2060: a repo-scoped `git config` write from a cwd that is not the
+    # root of the repo discovery resolves to mutates an *enclosing* repo's
+    # config instead of failing -- the leak vector this issue closes. The
+    # assertion raises before git runs when that is about to happen.
+    assert_repo_scoped_config(cwd, args)
     return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)
 
 

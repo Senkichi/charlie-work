@@ -20,6 +20,7 @@ from pathlib import Path
 
 import pytest
 
+from _git_leak_guard import GIT_ISOLATION_ENV_VARS
 from _local_gate_helpers import drive_merge_gate
 from charlie_work.backlog_reachability import _get_open_blockers_for_issue
 from charlie_work.config import OrchestratorConfig, build_config_from_data
@@ -36,7 +37,13 @@ from charlie_work.workflow import OrchestratorApp
 
 
 def _git(repo_root: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    # The scrub stops ambient GIT_DIR/GIT_CONFIG_* redirecting commands at the
+    # outer repo; the session's isolation vars (#2060) must survive it.
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if not k.startswith("GIT_") or k in GIT_ISOLATION_ENV_VARS
+    }
     result = subprocess.run(["git", *args], cwd=repo_root, capture_output=True, text=True, env=env)
     assert result.returncode == 0, (args, result.stderr)
     return result
