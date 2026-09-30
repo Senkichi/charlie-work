@@ -19,13 +19,13 @@ satisfied issues on the client, ``OrchestratorApp`` drains them into one
 
 from __future__ import annotations
 
-import os
 import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
+from _git_leak_guard import scrubbed_git_env
 import charlie_work.local_lane as local_lane
 from charlie_work.config import OrchestratorConfig
 from charlie_work.instrumentation import query_events
@@ -36,7 +36,9 @@ from charlie_work.workflow import OrchestratorApp
 
 
 def _git(repo_root: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    # The scrub stops ambient GIT_DIR/GIT_CONFIG_* redirecting commands at the
+    # outer repo; the session's isolation vars (#2060) must survive it.
+    env = scrubbed_git_env()
     result = subprocess.run(["git", *args], cwd=repo_root, capture_output=True, text=True, env=env)
     assert result.returncode == 0, (args, result.stderr)
     return result

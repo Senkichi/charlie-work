@@ -49,6 +49,14 @@ repo's config (verified: a nested ``.gitignore`` of ``*`` suppresses the
 directory, including the ``.gitignore`` file itself, from
 ``git status --porcelain``).
 
+Because that directory is inside a git checkout, issue #2060 additionally
+sets ``GIT_CEILING_DIRECTORIES`` to the temp root's (realpath'd) parent:
+any ``git`` the worker runs with a temp-dir cwd that is not itself a repo --
+e.g. a pytest ``tmp_path`` whose ``git init``/``worktree add`` failed with
+``$GIT_DIR too big`` at the ~143-char depth -- can no longer ascend into the
+enclosing linked worktree and write the *shared* ``.git/config`` of the main
+checkout.
+
 It does NOT retarget a literal ``/tmp/...`` path written from a process
 spawned by Git Bash on this host: MSYS caches its ``/tmp`` ("usertemp") mount
 in a shared, install-wide table seeded once while any ``bash.exe`` from that
@@ -266,6 +274,27 @@ def sanitize_env(target_path: Path, *, tmp_dir: Path | None = None) -> dict[str,
     env["TMP"] = str(resolved_tmp_dir)
     env["TEMP"] = str(resolved_tmp_dir)
     env["TMPDIR"] = str(resolved_tmp_dir)
+
+    # Issue #2060: the session tmp dir lives inside the worktree, so any `git`
+    # the worker (or a test the worker runs) invokes with a cwd under it that
+    # is not itself a repository would ascend into the enclosing checkout --
+    # and, for a linked worktree, a `git config` write would land on the
+    # shared .git/config of the main repo. GIT_CEILING_DIRECTORIES stops the
+    # ascent one level above the worker's temp root: directories below it are
+    # still examined, so a repo a test legitimately init'd under tmp resolves
+    # normally, while nothing at or above the parent is ever reached. Both
+    # the realpath'd and literal spellings are listed because git compares
+    # ceilings against the canonicalized discovery path and which spelling a
+    # subprocess's cwd carries is the caller's choice; ambient entries are
+    # preserved, never replaced.
+    tmp_parent = Path(os.path.realpath(str(resolved_tmp_dir))).parent
+    ceiling_entries = [
+        entry for entry in env.get("GIT_CEILING_DIRECTORIES", "").split(os.pathsep) if entry
+    ]
+    for candidate in (str(tmp_parent), str(resolved_tmp_dir.parent)):
+        if candidate not in ceiling_entries:
+            ceiling_entries.append(candidate)
+    env["GIT_CEILING_DIRECTORIES"] = os.pathsep.join(ceiling_entries)
 
     # Issue #646: cap xdist worker fan-out and guard a real local .venv from a
     # concurrent uv sync. setdefault() so an already-exported ambient value

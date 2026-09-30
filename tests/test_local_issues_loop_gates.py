@@ -44,6 +44,7 @@ import pytest
 
 import charlie_work.workflow as workflow_module
 from _fakes_github import FakeGitHub
+from _git_leak_guard import scrubbed_git_env
 from charlie_work.config import (
     AutoMergeConfig,
     DispatchConfig,
@@ -79,7 +80,9 @@ def _init_repo(repo_root: Path) -> None:
     the fresh one.
     """
     repo_root.mkdir(parents=True, exist_ok=True)
-    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    # The scrub stops ambient GIT_DIR/GIT_CONFIG_* redirecting commands at the
+    # outer repo; the session's isolation vars (#2060) must survive it.
+    env = scrubbed_git_env()
     for command in (
         ["git", "init", "--initial-branch=main"],
         ["git", "config", "core.longpaths", "true"],
