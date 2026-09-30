@@ -22,7 +22,7 @@ from charlie_work.config import (
     WatchdogConfig,
     WorkerRoleConfig,
 )
-from charlie_work.live_handoff_finalize import collect_stale_live_handoff_pids
+from charlie_work.dead_worker_sweep.live_handoff import collect_stale_live_handoff_pids
 from charlie_work.paths import resolved_layout, runtime_paths
 from charlie_work.state import PASSIVE_OPEN_STATUS, save_state
 from charlie_work.worktree import worktree_path_for_branch

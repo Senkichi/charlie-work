@@ -8,7 +8,7 @@ those modules may not import ``state`` (see the AST guard in
 
 from __future__ import annotations
 
-from ..live_handoff_finalize import ROUTED_OUTCOME_KEY
+from .live_handoff import ROUTED_OUTCOME_KEY
 from ..orphaned_worker_no_op_drain import NO_OP_DEFERRED_HEAD_KEY
 from ..rework_outcome import APPLIED_HEADS_KEY
 from ..state import PASSIVE_OPEN_STATUS

@@ -18,11 +18,11 @@ from .. import (
     dead_worker_reap,
     escalation,
     fleet_registry,
-    live_handoff_finalize,
     local_work_park,
     no_pr_orphan_fate,
     worker_fate,
 )
+from . import live_handoff
 from ..cross_repo_gate import cross_repo_scope_gate
 from ..github import build_branch_issue_validator
 from ..process_utils import find_worker_terminal_status
@@ -81,7 +81,7 @@ def collect_live_handoff(ctx: SweepContext, _req: CollectLiveHandoff) -> LiveHan
         and entry.get("status") == "dispatched"
         and ctx.pid_alive.get(int(key)) is True
     }
-    candidates = live_handoff_finalize.collect_stale_live_handoff_pids(
+    candidates = live_handoff.collect_stale_live_handoff_pids(
         live_entries,
         worker_outcome_finalize_minutes=ctx.config.watchdog.worker_outcome_finalize_minutes,
         repo_root=ctx.repo_root,
