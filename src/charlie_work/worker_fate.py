@@ -69,7 +69,7 @@ it is reported once per issue entry (design doc §5).
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -95,6 +95,7 @@ from .worker_fate_stale import (  # noqa: F401
     report_stale_evidence,
     stale_evidence_events,
     stale_evidence_key,
+    stale_terminal_fate,
 )
 
 _EMPTY_RAW: Mapping[str, Any] = MappingProxyType({})
@@ -661,22 +662,33 @@ parse_iso_timestamp = _state_parse_iso_timestamp
 
 
 def fresh_terminal_record(
-    record: Mapping[str, Any] | None, dispatched_at: datetime | None
+    record: Mapping[str, Any] | None,
+    dispatched_at: datetime | None,
+    *,
+    issue_number: int | None = None,
+    on_fate: Callable[[WorkerFate], None] | None = None,
 ) -> Mapping[str, Any] | None:
     """The terminal record only when it belongs to the current dispatch.
 
     ``find_worker_terminal_status`` returns the newest ``issue-<n>.*.terminal.json``
-    and records are never deleted, so an earlier dispatch's record (or one
-    from another adapter) is still returned after a redispatch whose own
-    watcher never ran (devin-shell, restart mid-run). Rule 1 / design §3: the
+    and records are never deleted, so an earlier dispatch's record is still
+    returned after a redispatch whose own watcher never ran. Rule 1: the
     record's ``ended_at`` must be ``> dispatched_at`` before its ``exit_code``,
-    ``pid`` or ``duration_seconds`` count. Legacy entries with no
-    ``dispatched_at`` accept unconditionally, as in ``_dispatch_fresh``.
+    ``pid`` or ``duration_seconds`` count; legacy entries with no
+    ``dispatched_at`` accept unconditionally (``_dispatch_fresh``).
+
+    A dropped record is reported, not silent: with ``issue_number`` and
+    ``on_fate`` given, an evidence-only fate carrying the ``StaleEvidence`` goes
+    to ``on_fate`` (see ``stale_terminal_fate``).
     """
     if not isinstance(record, Mapping):
         return None
     ended_at = parse_iso_timestamp(record.get("ended_at"))
-    return record if _dispatch_fresh(ended_at, dispatched_at) else None
+    if _dispatch_fresh(ended_at, dispatched_at):
+        return record
+    if on_fate is not None and issue_number is not None:
+        on_fate(stale_terminal_fate(issue_number, ended_at, dispatched_at))
+    return None
 
 
 def _format_utc_z(moment: datetime) -> str:

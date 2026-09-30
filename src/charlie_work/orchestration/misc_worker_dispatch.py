@@ -432,9 +432,12 @@ def _salvage_stranded_before_clear(
     else:
         marker = read_worktree_marker(wt_path)
         marker_pid = marker.get("pid") if marker is not None else None
+        # Same fingerprint the with-origin path passes (worktree.py), so a
+        # recycled marker PID does not read as a live writer.
+        marker_start_time = marker.get("process_start_time") if marker is not None else None
         if marker is not None and marker.get("kind") == OPERATOR_MARKER_KIND:
             skip_reason = "operator_claimed"
-        elif isinstance(marker_pid, int) and worker_fate.is_alive(marker_pid, None):
+        elif isinstance(marker_pid, int) and worker_fate.is_alive(marker_pid, marker_start_time):
             skip_reason = "live_writer_marker"
         elif _archive_unreachable_tip_if_applicable(
             self.repo_root, branch, wt_path, self.paths.state_file, set(), issue_number

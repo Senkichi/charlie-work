@@ -12,8 +12,30 @@ from pathlib import Path
 from typing import Any
 
 from . import worker_fate
+from .claude_code import worker_permission_denied
 from .rework_outcome import blocked_worker_outcome
 from .worktree import worktree_path_for_branch
+
+
+def escalatable_blocked_outcome(
+    outcome: dict[str, Any] | None, *, sessions_dir: Path, issue_number: int
+) -> dict[str, Any] | None:
+    """The single gate every blocked-escalation path goes through: ``outcome``
+    when it may reach the operator queue, else None.
+
+    Issue #2010: a ``blocked`` declaration (or log tail) that is just the
+    headless permission-denial signature is a worker-config defect, not a
+    structurally impossible task, so it is never escalated -- it falls through
+    to the ordinary redispatch/reset path. Shared by the no-PR lane
+    (``workflow``) and the with-PR lane (:func:`dead_worker_blocked_outcome`)
+    so neither can skip the exemption.
+    """
+    if outcome is None:
+        return None
+    detail = str(outcome.get("detail") or "")
+    if worker_permission_denied(sessions_dir, issue_number, detail):
+        return None
+    return outcome
 
 
 def dead_worker_blocked_outcome(
@@ -26,7 +48,10 @@ def dead_worker_blocked_outcome(
     worktrees_dir: Path | None,
     on_fate: Callable[[worker_fate.WorkerFate], None] | None,
 ) -> dict[str, Any] | None:
-    """Rule 2: the dead worker's fresh ``blocked`` declaration, else None.
+    """Rule 2: the dead worker's fresh, escalatable ``blocked`` declaration, else None.
+
+    A #2010 permission-denial declaration is not escalatable (see
+    :func:`escalatable_blocked_outcome`).
 
     N4: the worktree may already be reaped; the terminal record still carries
     the watcher's copy of the outcome, so ``sessions_dir`` is always passed.
@@ -39,13 +64,17 @@ def dead_worker_blocked_outcome(
         if branch and isinstance(repo_root, Path) and worktrees_dir is not None
         else None
     )
-    return blocked_worker_outcome(
-        worktree_path,
-        issue_number=issue_number,
-        dispatched_at=_wf._parse_iso_timestamp(entry.get("dispatched_at")),
-        pr_number=pr_data.get("number") if isinstance(pr_data.get("number"), int) else None,
-        on_fate=on_fate,
+    return escalatable_blocked_outcome(
+        blocked_worker_outcome(
+            worktree_path,
+            issue_number=issue_number,
+            dispatched_at=_wf._parse_iso_timestamp(entry.get("dispatched_at")),
+            pr_number=pr_data.get("number") if isinstance(pr_data.get("number"), int) else None,
+            on_fate=on_fate,
+            sessions_dir=sessions_dir,
+        ),
         sessions_dir=sessions_dir,
+        issue_number=issue_number,
     )
 
 

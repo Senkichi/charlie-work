@@ -10,6 +10,7 @@ runtime would cycle.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -93,6 +94,44 @@ def stale_evidence_events(
             )
         )
     return events
+
+
+def stale_terminal_fate(
+    issue_number: int, ended_at: datetime | None, dispatched_at: datetime | None
+) -> WorkerFate:
+    """An evidence-only carrier fate for a stale terminal record that
+    ``fresh_terminal_record`` dropped, so it reaches :func:`report_stale_evidence`
+    through the ordinary ``on_fate`` collector. It decides nothing: its dedup
+    key ``(terminal, ended_at)`` equals the one ``resolve_fate`` builds for the
+    same record, so the two paths never double-report.
+    """
+    # Runtime import: ``worker_fate`` re-exports this module, so a top-level
+    # import would cycle; by call time it is fully loaded.
+    from .worker_fate import (
+        Crashed,
+        EvidenceSource,
+        FateBasis,
+        StaleEvidence,
+        StaleReason,
+    )
+
+    stale = StaleEvidence(
+        source=EvidenceSource.TERMINAL,
+        reason=StaleReason.OLDER_THAN_DISPATCH,
+        written_at=ended_at,
+        evidence_head=None,
+        live_head=None,
+    )
+    basis = FateBasis(
+        issue_number=issue_number,
+        pid_alive=False,
+        outcome=None,
+        exit_code=None,
+        stale=(stale,),
+        rule="R1-stale-terminal",
+        dispatched_at=dispatched_at,
+    )
+    return Crashed(basis=basis, failure=None)
 
 
 def collect_fate(into: dict[int, list[WorkerFate]], fate: WorkerFate) -> None:

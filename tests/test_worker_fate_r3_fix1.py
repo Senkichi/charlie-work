@@ -148,7 +148,9 @@ def test_n1_stderr_throttle_line_after_quoting_event_anchors_at_now(tmp_path: Pa
 
     assert failure_kind == "rate_limited"
     assert throttled_until is not None
-    assert parse_iso_timestamp(throttled_until) > now
+    # Exactly the fixed anchor (now) plus the 15 minute cooldown -- not merely
+    # "after now", which a wrong earlier anchor plus a longer reset also satisfies.
+    assert parse_iso_timestamp(throttled_until) == now + timedelta(minutes=15)
 
 
 def test_n3_is_alive_reaches_a_patched_process_utils_primitive(

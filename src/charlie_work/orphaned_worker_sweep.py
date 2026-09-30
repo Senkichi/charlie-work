@@ -65,6 +65,7 @@ def maybe_reap_dead_dispatched_worker(
     now: datetime,
     sweep_events: list[tuple[str, dict[str, Any]]],
     max_throttle_rearms: int,
+    on_fate: Callable[[worker_fate.WorkerFate], None] | None = None,
 ) -> tuple[dict[str, Any], bool]:
     """Timed dead-dispatched backstop (issue #654), run per dead-PID entry.
 
@@ -186,6 +187,8 @@ def maybe_reap_dead_dispatched_worker(
     terminal = worker_fate.fresh_terminal_record(
         find_worker_terminal_status(sessions_dir, issue_number),
         _wf._parse_iso_timestamp(entry.get("dispatched_at")),
+        issue_number=issue_number,
+        on_fate=on_fate,
     )
     terminal_exit_code = terminal.get("exit_code") if terminal else None
     state = _wf._escalate_issue(
@@ -456,6 +459,8 @@ def handle_dead_worker_with_pr(
     terminal = worker_fate.fresh_terminal_record(
         find_worker_terminal_status(sessions_dir, issue_number),
         _wf._parse_iso_timestamp(entry.get("dispatched_at")),
+        issue_number=issue_number,
+        on_fate=on_fate,
     )
     terminal_pid = entry.get("worker_pid")
     terminal_exit_code = terminal.get("exit_code") if terminal else None

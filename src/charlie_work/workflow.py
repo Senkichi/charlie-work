@@ -18,10 +18,10 @@ from .adapters import (
 from .claude_code import (
     launch_claude_worker,
     resolve_review_effort,
-    worker_permission_denied,
     run_quota_probe,  # noqa: F401  (deliberate re-export; used by moved L01 b3 delegates via _wf.)
 )
 from .api_worker import launch_api_worker
+from .blocked_worker_escalation import escalatable_blocked_outcome
 from .devin_shell import launch_devin_session
 from .checks import (
     CheckSummary,
@@ -1889,15 +1889,15 @@ def _detect_and_handle_orphaned_workers(
             # ``reap_escalations`` transition applies the operator-queue
             # label edge.
             worker_outcome = worker_outcomes.get(issue_number)
-            # B3, rule 1: the blocked check reads the module's fate.
-            # Issue #2010: a ``blocked`` outcome (or log tail) that is just the
-            # headless permission-denial signature is a worker-config defect,
-            # not a structurally impossible task -- it must not reach the
-            # operator queue as if the task were blocked; it falls through to
-            # the ordinary redispatch path.
-            blocked_detail = str((worker_outcome or {}).get("detail") or "")
-            if isinstance(fates.get(issue_number), worker_fate.Blocked) and (
-                not worker_permission_denied(sessions_dir, issue_number, blocked_detail)
+            # B3, rule 1: the blocked check reads the module's fate. The #2010
+            # permission-denial exemption is the shared gate
+            # ``escalatable_blocked_outcome`` (also used by the with-PR lane).
+            if (
+                isinstance(fates.get(issue_number), worker_fate.Blocked)
+                and escalatable_blocked_outcome(
+                    worker_outcome, sessions_dir=sessions_dir, issue_number=issue_number
+                )
+                is not None
             ):
                 label_write_ok = True
                 for label in sorted(active_labels):
@@ -2322,6 +2322,7 @@ def _detect_and_handle_orphaned_workers(
                     now=now,
                     sweep_events=sweep_events,
                     max_throttle_rearms=config.watchdog.max_auto_redispatch,
+                    on_fate=lambda fate: worker_fate.collect_fate(swept_fates, fate),
                 )
             )
             if dead_dispatched_reaped:
