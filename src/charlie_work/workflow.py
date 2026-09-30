@@ -3995,10 +3995,19 @@ class OrchestratorApp:
             # (``workflow_no_jobs``, e.g. GitHub rejected the workflow file).
             # Retrigger cannot fix that, so it routes to rework below instead
             # of being re-parked as ``janitor_blocked`` forever.
+            # A head already recorded as never-created is re-probed once per
+            # ``stale_checks_retrigger_attempts`` value (bounded by the
+            # retrigger cap), so a same-head transition to ``workflow_no_jobs``
+            # is still seen instead of being masked by the dedup marker.
+            stale_checks_attempts = int(
+                (pr_state or {}).get("stale_checks_retrigger_attempts") or 0
+            )
             ci_absence = self._detect_ci_absence(
                 pr,
                 verdict,
                 known_head=(pr_state or {}).get("ci_run_never_created_head"),
+                reprobe_known_head=(pr_state or {}).get("ci_absence_probed_attempts")
+                != stale_checks_attempts,
             )
             ci_run_never_created_head_sha = (
                 ci_absence.head_sha
@@ -4046,6 +4055,7 @@ class OrchestratorApp:
                 )
                 if ci_run_never_created:
                     pr_state_update["ci_run_never_created_head"] = ci_run_never_created_head_sha
+                pr_state_update["ci_absence_probed_attempts"] = stale_checks_attempts
                 # Issue #1681: event dedup only -- routing below is NOT gated
                 # on this marker, so a rework that pushes nothing new is
                 # re-routed (and capped by record_review), never re-parked.

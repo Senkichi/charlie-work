@@ -47,6 +47,7 @@ def _detect_ci_absence(
     verdict: JanitorVerdict,
     *,
     known_head: str | None = None,
+    reprobe_known_head: bool = False,
 ) -> CiAbsence | None:
     """Classify a terminally-absent required check for this head, else None.
 
@@ -87,6 +88,13 @@ def _detect_ci_absence(
     ``gh api`` call is skipped -- otherwise a PR that stays escalated for
     days would re-query Actions on every single pass forever (this is the
     same population the grace period targets).
+
+    The marker only records ``never_created``, so honoring it forever would
+    blind this detector to a same-head transition to ``workflow_no_jobs``
+    (e.g. the stale-checks retrigger itself creates a run for the head that
+    then completes with no jobs). ``reprobe_known_head=True`` lets the caller
+    lift the skip for one bounded re-query; the caller owns the bound (see
+    ``review()``: once per ``stale_checks_retrigger_attempts`` value).
     """
     if not verdict.missing_required_checks:
         return None
@@ -97,10 +105,10 @@ def _detect_ci_absence(
     if raw_head_sha is None:
         return None
     try:
-        head_sha = require_valid_sha(raw_head_sha, context="_detect_ci_run_never_created head_sha")
+        head_sha = require_valid_sha(raw_head_sha, context="_detect_ci_absence head_sha")
     except ValueError:
         return None
-    if known_head is not None and known_head == head_sha:
+    if known_head is not None and known_head == head_sha and not reprobe_known_head:
         return None
     if not _is_pr_updated_at_older_than(pr, datetime.now(UTC), grace_minutes):
         return None
