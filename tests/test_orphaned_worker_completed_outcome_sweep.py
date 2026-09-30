@@ -483,3 +483,34 @@ def test_with_pr_stale_outcome_emits_worker_evidence_stale_once(tmp_path: Path) 
         datetime.fromisoformat(payload["dispatched_at"].replace("Z", "+00:00")) == parsed_dispatch
     )
     assert load_state(paths.state_file)["issues"]["207"]["stale_evidence_reported"]
+
+
+def test_with_pr_fresh_outcome_with_mismatching_head_emits_head_mismatch_stale(
+    tmp_path: Path,
+) -> None:
+    """Review wf-r2-1 #1: a fresh outcome claiming a push whose head is not on
+    the remote is rule 1's ``head_mismatch`` stale evidence. The with-PR lane
+    resolves the same outcome twice (``fresh_completed_worker_outcome`` against
+    the live head, then ``blocked_worker_outcome`` without it); collecting only
+    the last fate dropped the mismatch and emitted no signal at all."""
+    from charlie_work.instrumentation import query_events
+
+    config, paths, fake_gh, _dispatched_at = _dead_worker_rework_bed(tmp_path)
+    _write_outcome(
+        paths,
+        tmp_path,
+        {"push_succeeded": True, "pr_created": False, "head_sha": "def456"},
+    )
+
+    # The bed's live PR head is ``abc123``; the outcome claims ``def456``.
+    _run_orphan_sweep(tmp_path, paths, config, fake_gh)
+    _run_orphan_sweep(tmp_path, paths, config, fake_gh)
+
+    stale = query_events(paths.state_file, kind="worker_evidence_stale")
+    assert len(stale) == 1
+    raw = stale[0]["payload"]
+    payload = json.loads(raw) if isinstance(raw, str) else raw
+    assert payload["issue_number"] == 207
+    assert payload["reason"] == "head_mismatch"
+    assert payload["evidence_head"] == "def456"
+    assert payload["live_head"] == "abc123"

@@ -1138,10 +1138,7 @@ def _dispatch_impl(
     label_error_failures: dict[int, str] = {}
     # B6: fates the phantom-worker lane resolves while ``state_lock`` is held,
     # reported (rule-1 stale evidence) once the lock is released below.
-    phantom_fates: dict[int, worker_fate.WorkerFate] = {}
-
-    def _collect_phantom_fate(fate: worker_fate.WorkerFate) -> None:
-        phantom_fates[fate.basis.issue_number] = fate
+    phantom_fates: dict[int, list[worker_fate.WorkerFate]] = {}
 
     with _wf.state_lock(self.paths.state_file):
         state = _wf.load_state(self.paths.state_file)
@@ -1218,7 +1215,7 @@ def _dispatch_impl(
                     request,
                     full_issue,
                     sessions_dir,
-                    on_fate=_collect_phantom_fate,
+                    on_fate=lambda fate: worker_fate.collect_fate(phantom_fates, fate),
                 )
                 # A phantom live worker is being routed as dead; do not
                 # preserve a stale worker_pid that would keep the slot
@@ -1801,8 +1798,9 @@ def _dispatch_impl(
             state_path=self.paths.state_file,
         )
         _wf.save_state(self.paths.state_file, state)
-    if not self.write_gate.dry_run:
-        worker_fate.report_stale_evidence(self.paths.state_file, phantom_fates)
+    worker_fate.report_stale_evidence(
+        self.paths.state_file, phantom_fates, dry_run=self.write_gate.dry_run
+    )
 
     result_dicts = [result.to_dict() for result in dispatch_results]
     message = "dispatch complete"

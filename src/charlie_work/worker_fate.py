@@ -52,6 +52,19 @@ read side feeds the persisted kind back in as ``FateEvidence.failure``
 were deleted, and ``WorkerView.is_alive``, ``dead_worker_reap`` and
 ``doctor`` all call ``worker_fate.is_alive`` through the module attribute,
 so tests patch ``charlie_work.worker_fate.is_alive`` and nothing else.
+
+Known exception to "this module owns post-exit fate": three consumers
+(``live_handoff_finalize``, ``misc_worker_dispatch``, ``rework_outcome``) use
+``resolve_fate`` only as the rule-1/7 freshness filter and then route on the
+surviving ``basis.outcome``'s self-reported ``push_succeeded``/``head_sha``
+themselves. Their evidence shapes never resolve to ``PushedWithoutPr`` or
+``Completed`` (no PR knowledge), so the fate variant carries no decision for
+them; those reads are legacy-compatible by design (wf-review-opus B9).
+
+The ``entry["stale_evidence_reported"]`` dedup marker is deliberately keyed
+``(source, written_at)`` with no dispatch epoch and is never cleared: a
+leftover file is one piece of evidence however many dispatches it outlives, so
+it is reported once per issue entry (design doc §5).
 """
 
 from __future__ import annotations
@@ -922,6 +935,31 @@ class AdapterFateProfile:
 _PROFILES: dict[str, AdapterFateProfile] | None = None
 
 
+def _devin_record_failure(*args: Any, **kwargs: Any) -> tuple[str | None, str | None]:
+    """Late-bound ``devin_shell.update_session_record_with_failure_classification``."""
+    from . import devin_shell
+
+    return devin_shell.update_session_record_with_failure_classification(*args, **kwargs)
+
+
+def _claude_code_record_failure(*args: Any, **kwargs: Any) -> tuple[str | None, str | None]:
+    """Late-bound ``claude_code.update_worker_record_with_failure_classification``."""
+    from . import claude_code
+
+    return claude_code.update_worker_record_with_failure_classification(
+        *args, adapter_kind="claude-code", **kwargs
+    )
+
+
+def _api_record_failure(*args: Any, **kwargs: Any) -> tuple[str | None, str | None]:
+    """Late-bound ``claude_code.update_worker_record_with_failure_classification`` (api)."""
+    from . import claude_code
+
+    return claude_code.update_worker_record_with_failure_classification(
+        *args, adapter_kind="api", **kwargs
+    )
+
+
 def _build_profiles() -> dict[str, AdapterFateProfile]:
     """Build the by-harness profile table, then index it by ``view_kinds``.
 
@@ -936,16 +974,15 @@ def _build_profiles() -> dict[str, AdapterFateProfile]:
     ``update_worker_record_with_failure_classification`` (claude-code, api)
     takes an ``adapter_kind`` kwarg that selects both the sidecar filename
     suffix and account-error detection -- unlike ``update_session_record_
-    with_failure_classification`` (devin), which has no such parameter.
-    ``functools.partial`` binds each profile's value in at registry-build
-    time so every call site can call ``record_failure`` with the exact same
-    positional/keyword shape regardless of which adapter it resolved to,
-    without changing either function's own signature.
+    with_failure_classification`` (devin), which has no such parameter. The
+    ``_*_record_failure`` shims bind each profile's value so every call site
+    can call ``record_failure`` with the exact same positional/keyword shape
+    regardless of which adapter it resolved to. They resolve the writer at
+    CALL time (see :func:`_api_over_budget`): the registry is cached for the
+    process, so binding the function objects here would freeze whichever
+    implementation -- including a test's ``patch`` mock -- was live at the
+    first ``profile_for`` call.
     """
-    from functools import partial
-
-    from .claude_code import update_worker_record_with_failure_classification
-    from .devin_shell import update_session_record_with_failure_classification
     from .harnesses import WORKER_HARNESSES
 
     by_harness = {
@@ -955,7 +992,7 @@ def _build_profiles() -> dict[str, AdapterFateProfile]:
             account_error_detection=False,
             headless_permission_detection=False,
             log_format="plain_text",
-            record_failure=update_session_record_with_failure_classification,
+            record_failure=_devin_record_failure,
             over_budget=None,
         ),
         "claude-code": AdapterFateProfile(
@@ -964,9 +1001,7 @@ def _build_profiles() -> dict[str, AdapterFateProfile]:
             account_error_detection=False,
             headless_permission_detection=True,
             log_format="stream_json",
-            record_failure=partial(
-                update_worker_record_with_failure_classification, adapter_kind="claude-code"
-            ),
+            record_failure=_claude_code_record_failure,
             over_budget=None,
         ),
         "api": AdapterFateProfile(
@@ -975,9 +1010,7 @@ def _build_profiles() -> dict[str, AdapterFateProfile]:
             account_error_detection=True,
             headless_permission_detection=True,
             log_format="stream_json",
-            record_failure=partial(
-                update_worker_record_with_failure_classification, adapter_kind="api"
-            ),
+            record_failure=_api_record_failure,
             over_budget=_api_over_budget,
         ),
         # "command" and "manual" have no failure-classification or budget
@@ -1162,8 +1195,12 @@ def stale_evidence_events(
     adapter = entry.get("adapter")
     events: list[tuple[str, dict[str, Any]]] = []
     for stale in basis.stale:
-        if stale_evidence_key(stale) in already_reported:
+        key = stale_evidence_key(stale)
+        if key in already_reported:
             continue
+        # N-d: one legacy terminal record yields two ``StaleEvidence`` (outcome
+        # and ``ended_at``/``exit_code``) sharing a key -- emit it once.
+        already_reported.add(key)
         events.append(
             (
                 "worker_evidence_stale",
@@ -1182,7 +1219,23 @@ def stale_evidence_events(
     return events
 
 
-def report_stale_evidence(state_file: Path, fates: Mapping[int, WorkerFate]) -> None:
+def collect_fate(into: dict[int, list[WorkerFate]], fate: WorkerFate) -> None:
+    """Accumulate ``fate`` under its issue -- the ``on_fate`` collector body.
+
+    Keeps EVERY fate a pass resolves for an issue, never just the last: the
+    with-PR sweep resolves the same outcome twice (once against the live PR
+    head, once without it), and the first carries ``HEAD_MISMATCH`` evidence
+    the second cannot (B6 residue). :func:`report_stale_evidence` merges them.
+    """
+    into.setdefault(fate.basis.issue_number, []).append(fate)
+
+
+def report_stale_evidence(
+    state_file: Path,
+    fates: Mapping[int, Sequence[WorkerFate]],
+    *,
+    dry_run: bool,
+) -> None:
     """Emit ``worker_evidence_stale`` for every fate's not-yet-reported stale
     evidence, then persist the dedup marker.
 
@@ -1190,6 +1243,14 @@ def report_stale_evidence(state_file: Path, fates: Mapping[int, WorkerFate]) -> 
     wf-r2-s6): the orphan sweep's precompute, the live-handoff lane, the
     dispatch-time phantom-worker lane and the rework-outcome readers all hand
     their fates here instead of each dropping ``basis.stale`` on the floor.
+
+    ``dry_run`` is required (keyword-only) and makes this a no-op: the events
+    ring and the dedup marker are local writes a dry run must not make -- and a
+    persisted marker would suppress the real event on the next live pass.
+    Taking it here means no caller can forget the gate.
+
+    Several fates for one issue are merged: their stale evidence is unioned and
+    deduped by :func:`stale_evidence_key`, first fate's wording winning.
 
     Never call this while holding ``state_lock`` -- it takes the lock itself
     (not reentrant) and emits outside it (CLAUDE.md instrumentation
@@ -1199,13 +1260,19 @@ def report_stale_evidence(state_file: Path, fates: Mapping[int, WorkerFate]) -> 
     the same dead worker every pass emits once; an issue with no state entry
     still emits (there is nothing to dedup against) but persists no marker.
     """
-    if not fates:
+    if dry_run or not fates:
         return
     snapshot = load_state_locked(state_file)
     pending: dict[int, list[tuple[str, dict[str, Any]]]] = {}
-    for issue_number, fate in fates.items():
+    for issue_number, issue_fates in fates.items():
         entry = snapshot.get("issues", {}).get(str(issue_number))
-        events = stale_evidence_events(entry if isinstance(entry, dict) else {}, fate)
+        entry_map: dict[str, Any] = dict(entry) if isinstance(entry, dict) else {}
+        reported = set(entry_map.get("stale_evidence_reported") or ())
+        events: list[tuple[str, dict[str, Any]]] = []
+        for fate in issue_fates:
+            entry_map["stale_evidence_reported"] = sorted(reported)
+            events.extend(stale_evidence_events(entry_map, fate))
+            reported.update(stale_evidence_key(s) for s in fate.basis.stale)
         if events:
             pending[issue_number] = events
     if not pending:
@@ -1225,7 +1292,8 @@ def report_stale_evidence(state_file: Path, fates: Mapping[int, WorkerFate]) -> 
             if not isinstance(locked_entry, dict):
                 continue
             already = set(locked_entry.get("stale_evidence_reported") or ())
-            already.update(stale_evidence_key(s) for s in fates[issue_number].basis.stale)
+            for fate in fates[issue_number]:
+                already.update(stale_evidence_key(s) for s in fate.basis.stale)
             locked_entry["stale_evidence_reported"] = sorted(already)
         save_state(state_file, locked_state)
 

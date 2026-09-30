@@ -1762,10 +1762,7 @@ def _detect_and_handle_orphaned_workers(
     if repo_root is not None:
         worktrees_dir = resolved_layout(config, repo_root).worktrees
 
-    live_handoff_fates: dict[int, worker_fate.WorkerFate] = {}
-
-    def _collect_live_handoff_fate(fate: worker_fate.WorkerFate) -> None:
-        live_handoff_fates[fate.basis.issue_number] = fate
+    live_handoff_fates: dict[int, list[worker_fate.WorkerFate]] = {}
 
     stale_live_handoff_pids = collect_stale_live_handoff_pids(  # Issue #1867 round-2
         live_pid_entries,
@@ -1773,12 +1770,11 @@ def _detect_and_handle_orphaned_workers(
         repo_root=repo_root,
         worktrees_dir=worktrees_dir,
         now=now,
-        on_fate=_collect_live_handoff_fate,
+        on_fate=lambda fate: worker_fate.collect_fate(live_handoff_fates, fate),
     )
     # B6: the live-handoff lane's rule-1 stale evidence, reported before the
     # early return below (a stale outcome is by definition not a candidate).
-    if not write_gate.dry_run:
-        worker_fate.report_stale_evidence(state_file, live_handoff_fates)
+    worker_fate.report_stale_evidence(state_file, live_handoff_fates, dry_run=write_gate.dry_run)
 
     if not orphaned_issues and not stale_live_handoff_pids:
         return
@@ -1841,14 +1837,17 @@ def _detect_and_handle_orphaned_workers(
     # loop (pushed-branch candidates) without re-reading.
     worker_outcomes: dict[int, dict[str, Any] | None] = {}
     # B3: the fate the module resolves for each no-PR orphan from the SAME
-    # evidence this loop already reads. ``dispatched_at=None`` reproduces
-    # this loop's own unconditional read (FLIP 1: no freshness gate on
-    # ``worker_outcomes`` itself, which stays exactly as computed below).
+    # evidence this loop already reads, against the real ``dispatched_at``
+    # (rule 1's freshness gate; ``worker_outcomes`` is derived from it).
     # Branch evidence is unknown here (the remote read happens later, in the
     # pushed-branch-candidate loop) -- an unknown branch cannot decide rows
-    # 2-4/6/8/9, so this fate is only reliable for the blocked check (row 1),
-    # which needs none of it.
+    # 2-4/6/8/9, so this fate is reliable for the blocked check (row 1) and
+    # the throttle guard (``throttle_failure``), which need none of it.
     fates: dict[int, worker_fate.WorkerFate] = {}
+    # B6: every fate this lane resolves (the precompute above AND the
+    # pushed-branch loop's branch-aware ``pushed_fate``, which is the only
+    # one that can carry ``HEAD_MISMATCH``), reported once after that loop.
+    no_pr_stale_fates: dict[int, list[worker_fate.WorkerFate]] = {}
     issues_by_number: dict[int, dict[str, Any]] = {}  # also used by the live-handoff lane below
 
     if no_pr_orphans:
@@ -1979,13 +1978,15 @@ def _detect_and_handle_orphaned_workers(
             )
 
         # B6 (wf-review-opus.md) / design doc §5: rule-1 stale evidence from
-        # every fate above, emitted outside the lock and deduped against each
+        # every fate above, collected here and emitted (dry-run gated) after
+        # the pushed-branch loop, outside the lock, deduped against each
         # entry's own ``stale_evidence_reported`` marker by the module's one
         # reporting path (which persists the marker in its own minimal,
         # atomic lock section -- neither no-PR loop's ``entry`` is
         # guaranteed to still be the one eventually written back to
         # ``state["issues"]``, see B4 in ``misc_worker_dispatch.py``).
-        worker_fate.report_stale_evidence(state_file, fates)
+        for precompute_fate in fates.values():
+            worker_fate.collect_fate(no_pr_stale_fates, precompute_fate)
 
         for issue_number in no_pr_orphans:
             issue = issues_by_number.get(issue_number)
@@ -2342,6 +2343,7 @@ def _detect_and_handle_orphaned_workers(
             ),
             now=now,
         )
+        worker_fate.collect_fate(no_pr_stale_fates, pushed_fate)
         if isinstance(pushed_fate, worker_fate.PushedWithoutPr):
             pushed_branch_candidates[issue_number] = {
                 "branch": branch,
@@ -2351,6 +2353,8 @@ def _detect_and_handle_orphaned_workers(
                 "ahead_count": ahead_count,
                 "ahead_error": ahead_error,
             }
+
+    worker_fate.report_stale_evidence(state_file, no_pr_stale_fates, dry_run=write_gate.dry_run)
 
     # Issue #439: route dead workers with stuck pre-review PRs to rework before
     # the state-update sweep. PR views are fetched outside the state lock; the
@@ -2483,10 +2487,7 @@ def _detect_and_handle_orphaned_workers(
     # B6 (wf-review-opus.md): fates the in-lock rework-outcome readers
     # resolve, keyed by issue. Their rule-1 stale evidence is reported after
     # the lock is released (``report_stale_evidence`` takes the lock itself).
-    swept_fates: dict[int, worker_fate.WorkerFate] = {}
-
-    def _collect_swept_fate(fate: worker_fate.WorkerFate) -> None:
-        swept_fates[fate.basis.issue_number] = fate
+    swept_fates: dict[int, list[worker_fate.WorkerFate]] = {}
 
     with state_lock(state_file):
         state = load_state(state_file)
@@ -2556,7 +2557,7 @@ def _detect_and_handle_orphaned_workers(
                     outcome_apply_routes=outcome_apply_routes,
                     pr_orphan_unreviewed_details=pr_orphan_unreviewed_details,
                     drift_fingerprint=_drift_fingerprint,
-                    on_fate=_collect_swept_fate,
+                    on_fate=lambda fate: worker_fate.collect_fate(swept_fates, fate),
                 )
             else:
                 # Issue #935: before reclaim/drift, try to open a PR for a branch
@@ -3043,8 +3044,7 @@ def _detect_and_handle_orphaned_workers(
         )
         write_gate.save_state(state)
 
-    if not write_gate.dry_run:
-        worker_fate.report_stale_evidence(state_file, swept_fates)
+    worker_fate.report_stale_evidence(state_file, swept_fates, dry_run=write_gate.dry_run)
 
     # Issue #1911: apply each recovered completed outcome through the #1877
     # seam, outside the lock (the helper does network I/O and takes

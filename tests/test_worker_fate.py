@@ -951,10 +951,10 @@ def test_report_stale_evidence_without_a_state_entry_emits_and_persists_nothing(
     )
     assert fate.basis.stale
 
-    report_stale_evidence(state_file, {})
+    report_stale_evidence(state_file, {}, dry_run=False)
     assert query_events(state_file, kind="worker_evidence_stale") == []
 
-    report_stale_evidence(state_file, {fate.basis.issue_number: fate})
+    report_stale_evidence(state_file, {fate.basis.issue_number: [fate]}, dry_run=False)
 
     events = query_events(state_file, kind="worker_evidence_stale")
     assert len(events) == 1
@@ -963,3 +963,143 @@ def test_report_stale_evidence_without_a_state_entry_emits_and_persists_nothing(
     # No entry to read ``dispatched_at`` from: falls back to the fate basis.
     assert payload["dispatched_at"] == DISPATCHED.isoformat()
     assert str(fate.basis.issue_number) not in load_state(state_file)["issues"]
+
+
+def test_report_stale_evidence_dry_run_writes_nothing(tmp_path) -> None:
+    """Review wf-r2-1 #2: ``dry_run`` is a required keyword and short-circuits
+    every local write (events.db and the dedup marker)."""
+    from charlie_work.instrumentation import query_events
+    from charlie_work.state import load_state, save_state
+    from charlie_work.worker_fate import report_stale_evidence
+
+    fate = resolve_fate(
+        _evidence(worktree_outcome=_outcome(written_at=BEFORE, outcome="blocked")), now=NOW
+    )
+    state_file = tmp_path / "state.json"
+    state = load_state(state_file)
+    state["issues"][str(fate.basis.issue_number)] = {"status": "dispatched"}
+    save_state(state_file, state)
+
+    report_stale_evidence(state_file, {fate.basis.issue_number: [fate]}, dry_run=True)
+
+    assert query_events(state_file, kind="worker_evidence_stale") == []
+    entry = load_state(state_file)["issues"][str(fate.basis.issue_number)]
+    assert "stale_evidence_reported" not in entry
+
+
+def test_report_stale_evidence_merges_every_fate_for_an_issue(tmp_path) -> None:
+    """Review wf-r2-1 #1: the with-PR sweep resolves the same outcome twice --
+    once against the live head (``HEAD_MISMATCH``), once without it (no
+    stale). Last-write-wins collection dropped the mismatch; collecting every
+    fate reports it exactly once."""
+    import json
+
+    from charlie_work.instrumentation import query_events
+    from charlie_work.worker_fate import collect_fate, report_stale_evidence
+
+    outcome = _outcome(written_at=AFTER, push_succeeded=True, head_sha="a" * 40)
+    with_live_head = resolve_fate(
+        _evidence(
+            worktree_outcome=outcome,
+            branch=_branch(remote_head_sha="b" * 40),
+        ),
+        now=NOW,
+    )
+    without_live_head = resolve_fate(_evidence(worktree_outcome=outcome), now=NOW)
+    assert [s.reason for s in with_live_head.basis.stale] == [StaleReason.HEAD_MISMATCH]
+    assert without_live_head.basis.stale == ()
+
+    collected: dict[int, list] = {}
+    collect_fate(collected, with_live_head)
+    collect_fate(collected, without_live_head)
+    assert len(collected[with_live_head.basis.issue_number]) == 2
+
+    state_file = tmp_path / "state.json"
+    report_stale_evidence(state_file, collected, dry_run=False)
+
+    events = query_events(state_file, kind="worker_evidence_stale")
+    assert len(events) == 1
+    raw = events[0]["payload"]
+    payload = json.loads(raw) if isinstance(raw, str) else raw
+    assert payload["reason"] == "head_mismatch"
+
+
+def test_stale_evidence_events_emit_a_shared_key_once() -> None:
+    """N-d: a legacy terminal record yields two ``StaleEvidence`` with one
+    key; the events list must not carry the same key twice."""
+    from charlie_work.worker_fate import StaleEvidence, stale_evidence_events, stale_evidence_key
+
+    base = resolve_fate(_evidence(), now=NOW)
+    first = StaleEvidence(
+        source=EvidenceSource.TERMINAL,
+        reason=StaleReason.OLDER_THAN_DISPATCH,
+        written_at=BEFORE,
+        evidence_head=None,
+        live_head=None,
+    )
+    twin = StaleEvidence(
+        source=EvidenceSource.TERMINAL,
+        reason=StaleReason.OLDER_THAN_DISPATCH,
+        written_at=BEFORE,
+        evidence_head=None,
+        live_head=None,
+    )
+    assert stale_evidence_key(first) == stale_evidence_key(twin)
+    from dataclasses import replace
+
+    fate = replace(base, basis=replace(base.basis, stale=(first, twin)))
+
+    assert len(stale_evidence_events({}, fate)) == 1
+
+
+@pytest.mark.parametrize(
+    ("view_kind", "module", "attr", "extra_kwargs"),
+    [
+        (
+            "devin",
+            "charlie_work.devin_shell",
+            "update_session_record_with_failure_classification",
+            {},
+        ),
+        (
+            "claude-code",
+            "charlie_work.claude_code",
+            "update_worker_record_with_failure_classification",
+            {"adapter_kind": "claude-code"},
+        ),
+        (
+            "api",
+            "charlie_work.claude_code",
+            "update_worker_record_with_failure_classification",
+            {"adapter_kind": "api"},
+        ),
+    ],
+)
+@pytest.mark.parametrize("registry_prebuilt", [False, True])
+def test_profile_record_failure_is_late_bound(
+    monkeypatch, view_kind, module, attr, extra_kwargs, registry_prebuilt
+) -> None:
+    """Review wf-r2-1 #3: the profile registry is cached per process, so a
+    ``record_failure`` bound at build time made a test's ``patch`` of the
+    adapter writer either vacuous (registry already built) or -- when the patch
+    was live during the first ``profile_for`` -- leaked a Mock into every later
+    test. The writer is resolved at call time: the patch reaches the call in
+    both orders, and nothing outlives it."""
+    from unittest.mock import MagicMock, patch
+
+    import charlie_work.worker_fate as worker_fate
+
+    monkeypatch.setattr(worker_fate, "_PROFILES", None)
+    if registry_prebuilt:
+        worker_fate.profile_for(view_kind)
+
+    with patch(f"{module}.{attr}", return_value=("patched", None)) as mock_writer:
+        profile = worker_fate.profile_for(view_kind)
+        assert profile is not None and profile.record_failure is not None
+        result = profile.record_failure("sessions", 7, fallback_kind="stalled")
+
+    assert result == ("patched", None)
+    mock_writer.assert_called_once_with("sessions", 7, fallback_kind="stalled", **extra_kwargs)
+    survivor = worker_fate.profile_for(view_kind)
+    assert survivor is not None
+    assert not isinstance(survivor.record_failure, MagicMock)

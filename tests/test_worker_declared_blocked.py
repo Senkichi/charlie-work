@@ -17,6 +17,7 @@ import json
 import os
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 from charlie_work.config import (
@@ -393,21 +394,15 @@ def test_leftover_terminal_outcome_older_than_dispatch_is_not_laundered_as_fresh
     assert len(blocked_events) == 0
 
 
-def test_stale_leftover_outcome_emits_worker_evidence_stale_event(tmp_path: Path) -> None:
-    """B6 (wf-review-opus.md), design doc §5: rule 1 dropping a stale
-    candidate must emit a ``worker_evidence_stale`` warning event so the
-    operator has a signal in events.db -- before this fix, ``FateBasis.stale``
-    was populated but nothing read it and no event existed at all.
+_STALE_ISSUE = 1456
+_STALE_DISPATCH_2_STARTED_AT = "2026-09-29T00:10:00Z"
 
-    Same leftover-outcome-via-terminal-record scenario as
-    ``test_leftover_terminal_outcome_older_than_dispatch_is_not_laundered_as_fresh``
-    (B5): both the worktree file and the terminal record's copy of it are
-    correctly recognized as stale, which is exactly what must now surface a
-    signal instead of silently vanishing.
-    """
-    from charlie_work.instrumentation import query_events
+
+def _stale_leftover_bed(tmp_path: Path) -> tuple[Any, Any, Path, Any]:
+    """A dead dispatched no-PR orphan whose worktree AND terminal record both
+    hold a prior dispatch's blocked outcome (older than ``dispatched_at``).
+    Returns ``(config, paths, sessions_dir, fake_gh)``."""
     from charlie_work.process_utils import write_worker_terminal_status
-    from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
     config = OrchestratorConfig(
         devin=DevinConfig(),
@@ -416,12 +411,12 @@ def test_stale_leftover_outcome_emits_worker_evidence_stale_event(tmp_path: Path
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
-    issue_number = 1456
+    issue_number = _STALE_ISSUE
     branch = "agent/issue-1456-test"
 
     leftover_written_at = "2026-09-29T00:00:00Z"
     leftover_mtime_epoch = datetime(2026, 9, 29, 0, 0, 0, tzinfo=UTC).timestamp()
-    dispatch_2_started_at = "2026-09-29T00:10:00Z"
+    dispatch_2_started_at = _STALE_DISPATCH_2_STARTED_AT
     watcher_ended_at = "2026-09-29T00:20:00Z"
 
     state = load_state(paths.state_file)
@@ -480,6 +475,28 @@ def test_stale_leftover_outcome_emits_worker_evidence_stale_event(tmp_path: Path
         }
     ]
     fake_gh.prs = []
+
+    return config, paths, sessions_dir, fake_gh
+
+
+def test_stale_leftover_outcome_emits_worker_evidence_stale_event(tmp_path: Path) -> None:
+    """B6 (wf-review-opus.md), design doc §5: rule 1 dropping a stale
+    candidate must emit a ``worker_evidence_stale`` warning event so the
+    operator has a signal in events.db -- before this fix, ``FateBasis.stale``
+    was populated but nothing read it and no event existed at all.
+
+    Same leftover-outcome-via-terminal-record scenario as
+    ``test_leftover_terminal_outcome_older_than_dispatch_is_not_laundered_as_fresh``
+    (B5): both the worktree file and the terminal record's copy of it are
+    correctly recognized as stale, which is exactly what must now surface a
+    signal instead of silently vanishing.
+    """
+    from charlie_work.instrumentation import query_events
+    from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+    config, paths, sessions_dir, fake_gh = _stale_leftover_bed(tmp_path)
+    issue_number = _STALE_ISSUE
+    dispatch_2_started_at = _STALE_DISPATCH_2_STARTED_AT
 
     with (
         patch("charlie_work.workflow._worker_pid_alive", return_value=False),
@@ -605,3 +622,37 @@ def test_permission_denial_blocked_outcome_is_not_operator_escalated(tmp_path: P
     assert entry.get("escalation_reason") != "worker_declared_blocked"
     assert entry["status"] != "escalated"
     assert not [e for e in st.get("events", []) if e.get("kind") == "worker_declared_blocked"]
+
+
+def test_dry_run_no_pr_precompute_writes_no_stale_event_or_marker(tmp_path: Path) -> None:
+    """Review wf-r2-1 #2: ``--dry-run`` promises no local writes (#1325). The
+    no-PR precompute reported stale evidence without the dry-run gate, writing
+    events.db and a ``stale_evidence_reported`` marker -- which then suppressed
+    the real event on the first live pass. Dry run: nothing written; the next
+    live pass still emits."""
+    from charlie_work.instrumentation import query_events
+    from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+    config, paths, sessions_dir, fake_gh = _stale_leftover_bed(tmp_path)
+
+    def sweep(*, dry_run: bool) -> None:
+        with (
+            patch("charlie_work.workflow._worker_pid_alive", return_value=False),
+            patch("charlie_work.workflow.remote_branch_head_sha", return_value=None),
+            patch("charlie_work.workflow.remote_branch_ahead_count", return_value=(0, None)),
+        ):
+            _detect_and_handle_orphaned_workers(
+                sessions_dir,
+                paths.state_file,
+                config,
+                fake_gh,
+                write_gate=_wg(paths.state_file, dry_run=dry_run),
+            )
+
+    sweep(dry_run=True)
+    assert query_events(paths.state_file, kind="worker_evidence_stale") == []
+    entry = load_state(paths.state_file)["issues"][str(_STALE_ISSUE)]
+    assert not entry.get("stale_evidence_reported")
+
+    sweep(dry_run=False)
+    assert len(query_events(paths.state_file, kind="worker_evidence_stale")) >= 1
