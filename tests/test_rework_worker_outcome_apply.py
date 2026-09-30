@@ -37,6 +37,8 @@ from charlie_work.paths import runtime_paths
 from charlie_work.process_utils import write_worker_terminal_status
 from charlie_work.instrumentation import query_events
 from charlie_work.rework_outcome import (
+    APPLIED_AT_KEY,
+    APPLIED_HEADS_KEY,
     apply_collected_rework_outcomes,
     apply_rework_worker_outcome,
     fresh_completed_worker_outcome,
@@ -311,13 +313,23 @@ def test_same_head_is_not_applied_twice(tmp_path: Path, remote_head) -> None:
     )
 
     _apply(gh, tmp_path, worktrees_dir=worktrees_dir, sessions_dir=sessions_dir)
+    first_state = _state(tmp_path)
+    first_applied_at = first_state.get(APPLIED_AT_KEY, {}).get(str(ISSUE_NUMBER))
+    # Producer write the stranded-request_changes restorer (#2092) consumes:
+    # a parseable ISO timestamp recorded alongside the applied head.
+    assert isinstance(first_applied_at, str)
+    assert datetime.fromisoformat(first_applied_at).tzinfo is not None
+
     _apply(gh, tmp_path, worktrees_dir=worktrees_dir, sessions_dir=sessions_dir)
 
     assert len(gh.pr_edits) == 1
     assert len(gh.pr_comments_posted) == 1
     state = _state(tmp_path)
     assert len(_events(state, "rework_outcome_applied")) == 1
-    assert state.get("rework_outcome_applied_heads", {}).get(str(ISSUE_NUMBER)) == HEAD_SHA
+    assert state.get(APPLIED_HEADS_KEY, {}).get(str(ISSUE_NUMBER)) == HEAD_SHA
+    # A duplicate same-head apply must not refresh applied_at, or a stale
+    # outcome could claim to have answered a newer verdict.
+    assert state.get(APPLIED_AT_KEY, {}).get(str(ISSUE_NUMBER)) == first_applied_at
 
 
 def test_new_head_reapplies(tmp_path: Path, remote_head) -> None:
