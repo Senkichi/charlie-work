@@ -84,6 +84,7 @@ from .github_capabilities import (  # noqa: F401  (deliberate re-export)
 )
 from .github_delegation import _COLLABORATORS, _install_delegates
 from .github_delegation import _ROUTES, _SIGNATURE_SOURCE, _make_delegate  # noqa: F401 (deliberate re-export)
+from .github_transport.failure_markers import is_pre_connection_text
 
 # ``_CLOSING_KEYWORDS_ALT`` is imported from ``issue_linking.py`` (Track 2,
 # issue #1613; design doc Section 5, L06b) as a real (not re-export-only)
@@ -825,16 +826,7 @@ def _is_pre_connection_error(error: str) -> bool:
     at-most-once semantics; post-send ambiguous timeouts (i/o timeout, 5xx after
     headers, etc.) are surfaced immediately.
     """
-    text = error.lower()
-    return any(
-        phrase in text
-        for phrase in (
-            "tls handshake timeout",
-            "connection refused",
-            "could not connect",
-            "error connecting to",
-        )
-    )
+    return is_pre_connection_text(error)
 
 
 def _should_retry(args: list[str], error: str, is_mutating: bool) -> bool:

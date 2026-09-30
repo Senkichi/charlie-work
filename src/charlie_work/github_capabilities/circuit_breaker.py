@@ -39,6 +39,7 @@ from enum import Enum
 from typing import Annotated, Literal
 
 from ..config_validation import AtLeastOne, NonNeg, Typed
+from ..github_transport.failure_markers import TRANSPORT_CLASS_MARKERS
 
 __all__ = [
     "GhFailureClass",
@@ -82,29 +83,7 @@ class GhFailureClass(Enum):
 # entries from it either: the two lists answer different questions (retry
 # safety vs. transport health) and conflating them by derivation would make
 # an unrelated retry-policy edit silently change breaker classification.
-_TRANSPORT_CLASS_MARKERS: tuple[str, ...] = (
-    # TLS handshake timeout (Go net/http, the #1832 signature).
-    "tls handshake timeout",
-    # Connection-level failures shared with transient_errors.py's allowlist
-    # (see that module's docstring for the gh-vs-git wording split).
-    "connection refused",
-    "connection reset",
-    "connection was reset",
-    "could not connect",
-    "couldn't connect",
-    "error connecting to",
-    "i/o timeout",
-    "remote end hung up",
-    "empty reply from server",
-    # DNS resolution failure. Not in transient_errors.py's gh-side list
-    # today (only its git-specific "could not resolve host" pattern is
-    # close); Go's net/http/net.DNSError renders as "no such host" on a
-    # failed lookup, and gh's Windows backend surfaces the underlying
-    # Winsock error via "connectex" (see transient_errors.py).
-    "no such host",
-    "could not resolve host",
-    "connectex",
-)
+_TRANSPORT_CLASS_MARKERS: tuple[str, ...] = TRANSPORT_CLASS_MARKERS
 
 _TRANSPORT_CLASS_RE = re.compile(
     "|".join(re.escape(marker) for marker in _TRANSPORT_CLASS_MARKERS)

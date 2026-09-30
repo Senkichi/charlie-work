@@ -70,14 +70,21 @@ from ..instrumentation import log_event
 from ..subprocess_runner import no_console_window_kwargs
 from . import http_cache
 from .circuit_breaker_transport import circuit_breaker_state_path
+from ..github_transport.outcome import (
+    GITHUB_API_HOST,
+    Response,
+    extract_message,
+    parse_graphql_errors,
+    render_graphql_errors,
+    render_legacy_error,
+)
+from ..github_transport.pagination import MAX_PAGES, next_link, path_from_url
 from .http_translate import HttpRequestPlan, build_request_plan, is_http_candidate
 
 if TYPE_CHECKING:
     from ..config import RuntimeConfig
 
 logger = logging.getLogger(__name__)
-
-GITHUB_API_HOST = "api.github.com"
 
 # Fallback used only when `GitHub` is constructed with `runtime=None` (tests
 # and legacy direct callers) -- mirrors `transport.py`'s
@@ -92,13 +99,7 @@ GITHUB_API_HOST = "api.github.com"
 # repo's own tests already rely on.
 _DEFAULT_GH_TRANSPORT = "gh"
 
-# Safety cap on `--paginate` follow-the-Link-header loops. `gh --paginate`
-# itself has no hardcoded cap and will follow a Link chain indefinitely; this
-# bound exists only to protect the orchestrator from a malformed or
-# adversarial Link chain, at a page count far beyond any real call site in
-# this codebase actually needs (`merged_pr_list`'s own `_LIST_LIMIT` cap is
-# 500 items / 100 per page = 5 pages).
-_MAX_PAGINATE_PAGES = 50
+_MAX_PAGINATE_PAGES = MAX_PAGES  # shared with github_transport.pagination
 
 # Response status that means "unchanged since the cached ETag".
 _NOT_MODIFIED = 304
@@ -253,73 +254,19 @@ def _send_once(
     return _RawResponse(status=status, headers=resp_headers, body=text)
 
 
-def _next_link(headers: dict[str, str]) -> str | None:
-    """Extract the `rel="next"` URL from a `Link` header, if present."""
-    link = headers.get("Link") or headers.get("link")
-    if not link:
-        return None
-    for part in link.split(","):
-        segments = part.split(";")
-        if len(segments) < 2:
-            continue
-        url = segments[0].strip().lstrip("<").rstrip(">")
-        rel_part = ";".join(segments[1:])
-        if 'rel="next"' in rel_part:
-            return url
-    return None
-
-
-def _path_from_url(url: str) -> str:
-    """Reduce an absolute `https://api.github.com/...` Link URL to a bare
-    request path -- pagination Link headers always stay on the same host.
-    """
-    marker = f"https://{GITHUB_API_HOST}"
-    if url.startswith(marker):
-        return url[len(marker) :] or "/"
-    return url
-
-
-def _extract_message(status: int, body: str) -> str:
-    """Best-effort extraction of GitHub's own REST error message field,
-    passed through verbatim (never hand-translated) so it carries whatever
-    substrings GitHub itself encodes -- "Bad credentials", "API rate limit
-    exceeded", etc. -- that this repo's classifiers already match on.
-    """
-    try:
-        parsed = json.loads(body) if body else None
-    except (json.JSONDecodeError, ValueError):
-        parsed = None
-    if isinstance(parsed, dict) and isinstance(parsed.get("message"), str) and parsed["message"]:
-        return parsed["message"]
-    return body.strip()[:200] or f"HTTP {status}"
+_next_link = next_link
+_path_from_url = path_from_url
+_extract_message = extract_message
 
 
 def _translate_error_response(status: int, body: str) -> str:
-    """Build the stderr text for a non-2xx REST response, matching gh's own
-    `gh: {message} (HTTP {status})` format -- verified against this
-    repository's real `gh api` error output (see
-    tests/test_http_transport.py). Every transient/terminal classifier in
-    this repo matches on the literal `HTTP {status}` substring (case
-    -insensitive, word-boundary), which this format always contains.
-    """
-    return f"gh: {_extract_message(status, body)} (HTTP {status})"
+    """`gh: {message} (HTTP {status})`; the format lives in `render_legacy_error`."""
+    return render_legacy_error(Response(status, (), body, "http"))
 
 
 def _translate_graphql_errors(errors: list[Any]) -> str:
-    """Build the stderr text for a 200-status graphql response whose body
-    carries a non-empty `errors` array -- gh's own CLI treats this as a
-    command failure (non-zero exit) even though the HTTP status is 200, and
-    formats it as `GraphQL: {message} ({dotted.path})` (verified against
-    this repo's own live `gh` output, e.g. `Could not resolve to a
-    PullRequest with the number of N. (repository.pullRequest)`).
-    """
-    first = errors[0] if errors else {}
-    message = str(first.get("message", first)) if isinstance(first, dict) else str(first)
-    path = first.get("path") if isinstance(first, dict) else None
-    if isinstance(path, list) and path:
-        dotted = ".".join(str(p) for p in path)
-        return f"GraphQL: {message} ({dotted})"
-    return f"GraphQL: {message}"
+    """`GraphQL: {message} ({dotted.path})` for the first error."""
+    return render_graphql_errors(parse_graphql_errors(errors))
 
 
 def _emit_fallback_event(state_path: Path, *, command: list[str], reason: str) -> None:
