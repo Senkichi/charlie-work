@@ -35,6 +35,7 @@ from charlie_work.config_validation import (
     NonEmpty,
     NonNeg,
     Note,
+    NullIsDefault,
     OneOf,
     Placeholders,
     Positive,
@@ -225,8 +226,20 @@ def test_field_error_pickles():
     assert str(e) == "a.b: expected >= 0, got -1"
 
 
+@dataclass(frozen=True)
+class NullSec:
+    plain: Annotated[bool, Typed] = True
+    normalized: Annotated[int, Typed, NullIsDefault] = 7
+
+
 def test_none_is_omitted_so_default_applies():
-    assert build(count=None).count == 0 and build(limit=None).limit == 1
+    """Despite the name (kept: the collect-only gate keys on it): ``key: null`` is preserved
+    as ``None`` (design P2, a falsy None differs from a default True) unless the field is
+    ``NullIsDefault``; an ABSENT key still takes the default."""
+    assert build(count=None).count is None and build(limit=None).limit is None
+    built = validate_section(NullSec, {"plain": None, "normalized": None}, path="sec")
+    assert built.plain is None and built.normalized == 7
+    assert validate_section(NullSec, {}, path="sec") == NullSec()
 
 
 def test_raw_is_not_mutated_and_lists_become_tuples():

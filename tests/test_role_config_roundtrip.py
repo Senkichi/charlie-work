@@ -85,7 +85,7 @@ def test_roundtrip_legacy_devin_adapter_key_raises() -> None:
     alongside it."""
     with pytest.raises(
         ConfigError,
-        match=r"^devin: expected known keys \(valid: command_timeout_seconds, dispatch_command, session_manifest, session_results, sessions_dir, shell_command, venv_sou",
+        match=r"^devin: expected known keys \(valid: .*\), got unknown key\(s\) adapter$",
     ):
         build_config_from_data(
             {"devin": {"adapter": "claude-shell"}, "worker": {"harness": "devin-shell"}}

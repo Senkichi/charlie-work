@@ -254,7 +254,7 @@ def test_build_config_from_data_devin_adapter_is_rejected_as_unknown_key() -> No
     straight through to ``_build_section``'s generic unknown-key rejection."""
     with pytest.raises(
         ConfigError,
-        match=r"^devin: expected known keys \(valid: command_timeout_seconds, dispatch_command, session_manifest, session_results, sessions_dir, shell_command, venv_sou",
+        match=r"^devin: expected known keys \(valid: .*\), got unknown key\(s\) adapter$",
     ):
         build_config_from_data({"devin": {"adapter": "devin-shell"}})
 
@@ -267,7 +267,7 @@ def test_build_config_from_data_worker_model_tier_key_is_rejected() -> None:
     key a section's dataclass doesn't declare."""
     with pytest.raises(
         ConfigError,
-        match=r"^dispatch: expected known keys \(valid: archive_unreachable_local_commits, base_ref, branch_prefix, ci_capacity_headroom_ratio, default_limit, dependenc",
+        match=r"^dispatch: expected known keys \(valid: .*\), got unknown key\(s\) worker_model_tier$",
     ):
         build_config_from_data({"dispatch": {"worker_model_tier": "capable"}})
 
