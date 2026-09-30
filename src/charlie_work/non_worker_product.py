@@ -37,6 +37,7 @@ from collections.abc import Callable
 from pathlib import PurePosixPath
 
 from .config import LAUNCHER_OWNED_DIRS
+from .harnesses import HARNESS_REGISTRY
 
 # PR body scratch files: workers ad-hoc draft PR bodies into root-level .md
 # files with varying naming conventions (``PR_BODY.md``, ``PR_BODY_<issue>.md``,
@@ -130,16 +131,49 @@ def _declared_scaffolding_matcher(
     return _is_declared
 
 
+# Issue #2019: root-level entries owned by an adapter/launcher, derived from
+# the launcher-owned dirs plus the skill roots of every registered harness so a
+# new harness extends the set without a second list to keep in sync. Anything
+# NOT named here (``.github/``, ``.gitignore``, ``.env``, ...) is treated as
+# worker-authored: the default is the loss-averse one.
+_ADAPTER_SHIM_ROOTS: frozenset[str] = frozenset(
+    (
+        *LAUNCHER_OWNED_DIRS,
+        *(
+            PurePosixPath(skill_dir).parts[0]
+            for cap in HARNESS_REGISTRY.values()
+            for skill_dir in cap.skill_dirs
+        ),
+    )
+)
+UNCOMMITTED_WORK_REASON_PREFIX = "worktree has uncommitted source work"
+_UNCOMMITTED_REASON_PATH_LIMIT = 5
+
+
 def _is_adapter_shim_path(raw_path: str) -> bool:
-    """True for a root-level dot-entry (``.devin/``, ``.claude/``, ``.env``…).
+    """True only for paths under a known adapter/launcher root (``.devin/``,
+    ``.claude/``, ``.git_worktree_dir/``), per ``_ADAPTER_SHIM_ROOTS``.
 
     Issue #2019: dirt that survives the scaffolding filter is classified on
-    content. Adapter/tool config lives in root-level dot-entries; anything
-    else (``src/``, ``tests/``, …) is worker-authored source whose loss is
-    unacceptable, so it must not share the mechanical ``shim_dirt`` kind.
+    content. Unknown dirt -- including repo config dot-entries such as
+    ``.github/workflows/``, ``.gitignore`` or ``.env`` -- is worker-authored
+    work whose loss is unacceptable, so it must not share the mechanical
+    ``shim_dirt`` kind.
     """
     parts = PurePosixPath(str(raw_path).replace("\\", "/")).parts
-    return bool(parts) and parts[0].startswith(".")
+    return bool(parts) and parts[0] in _ADAPTER_SHIM_ROOTS
+
+
+def _dirty_reason_for_paths(dirty_paths: list[str]) -> str:
+    """Issue #2019: name the dirt by content. Any path outside the adapter
+    shim namespace is source work and gets the distinct reason (and kind)."""
+    source_paths = [p for p in dirty_paths if not _is_adapter_shim_path(p)]
+    if not source_paths:
+        return "worktree has uncommitted modifications"
+    shown = ", ".join(source_paths[:_UNCOMMITTED_REASON_PATH_LIMIT])
+    extra = len(source_paths) - _UNCOMMITTED_REASON_PATH_LIMIT
+    suffix = f", +{extra} more" if extra > 0 else ""
+    return f"{UNCOMMITTED_WORK_REASON_PREFIX} ({len(source_paths)} path(s): {shown}{suffix})"
 
 
 def _non_worker_product_matcher(

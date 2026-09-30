@@ -56,8 +56,8 @@ def test_dirty_tracked_source_file_classifies_as_uncommitted_work(repo: Path) ->
 
 
 def test_shim_only_dirt_still_classifies_as_shim_dirt(repo: Path) -> None:
-    (repo / ".adapter").mkdir()
-    (repo / ".adapter" / "settings.json").write_text("{}\n", encoding="utf-8")
+    (repo / ".claude").mkdir()
+    (repo / ".claude" / "settings.json").write_text("{}\n", encoding="utf-8")
 
     reason = _worktree_dirty_reason(repo)
 
@@ -66,15 +66,46 @@ def test_shim_only_dirt_still_classifies_as_shim_dirt(repo: Path) -> None:
 
 
 def test_mixed_dirt_names_source_paths_only(repo: Path) -> None:
-    (repo / ".adapter").mkdir()
-    (repo / ".adapter" / "settings.json").write_text("{}\n", encoding="utf-8")
+    (repo / ".claude").mkdir()
+    (repo / ".claude" / "settings.json").write_text("{}\n", encoding="utf-8")
     (repo / "src" / "mod.py").write_text("x = 3\n", encoding="utf-8")
 
     reason = _worktree_dirty_reason(repo)
 
     assert reason is not None
     assert "src/mod.py" in reason
-    assert ".adapter" not in reason
+    assert ".claude" not in reason
+    assert _worktree_unsafe_kind_from_reason(reason) == WORKTREE_UNSAFE_KIND_UNCOMMITTED_WORK
+
+
+@pytest.mark.parametrize(
+    "rel_path",
+    [
+        ".github/workflows/ci.yml",
+        ".gitignore",
+        ".gitattributes",
+        ".env",
+        ".pre-commit-config.yaml",
+    ],
+)
+def test_repo_dot_config_dirt_is_uncommitted_work_not_shim_dirt(repo: Path, rel_path: str) -> None:
+    target = repo / rel_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("worker edit\n", encoding="utf-8")
+
+    reason = _worktree_dirty_reason(repo)
+
+    assert reason is not None
+    assert rel_path in reason
+    assert _worktree_unsafe_kind_from_reason(reason) == WORKTREE_UNSAFE_KIND_UNCOMMITTED_WORK
+
+
+def test_path_containing_local_commit_does_not_mislabel_kind(repo: Path) -> None:
+    (repo / "src" / "local commit.py").write_text("x = 1\n", encoding="utf-8")
+
+    reason = _worktree_dirty_reason(repo)
+
+    assert reason is not None
     assert _worktree_unsafe_kind_from_reason(reason) == WORKTREE_UNSAFE_KIND_UNCOMMITTED_WORK
 
 
