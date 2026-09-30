@@ -7,3 +7,13 @@
 # write_gate threading for the classify-at-credit lane grew the module to
 # 1010 lines (+10 over the 1000 mark). Reviewed raise to the next
 # MARK_QUANTUM multiple per the ratchet's hand-raise rule.
+# Issue #2034 / PR #2035: the no-op disposition work added route-collection
+# glue inside handle_dead_worker_with_pr (four no_op_routes.append sites at
+# existing decision points, including the deferred-head re-collect branch,
+# plus the _no_op_route factory), growing the module 989 -> 1036 at the
+# merged head.
+# The disposition behavior lives in orphaned_worker_no_op_drain.py; what grew
+# here is the per-decision-point call-site glue that must run inside the
+# sweep's decision tree, which the extraction remedy cannot shrink further.
+# Reviewed mark raised to the next MARK_QUANTUM multiple per the hand-raise
+# rule.
