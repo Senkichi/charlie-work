@@ -28,6 +28,8 @@ import shutil
 from pathlib import Path
 from typing import Any, NamedTuple
 
+import psutil
+
 from .subprocess_runner import run_captured
 
 logger = logging.getLogger(__name__)
@@ -43,89 +45,58 @@ _MAX_ANCESTOR_CHAIN_HOPS = 64
 class _ProcRow(NamedTuple):
     """One snapshot row: the parent pid and (where known) the creation stamp.
 
-    ``created`` is an opaque monotone stamp comparable only between rows of the
-    same snapshot (Windows: FILETIME, 100ns ticks). ``None`` means unknown, and
-    an unknown stamp never disqualifies a parent link.
+    ``created`` is a creation time comparable only between rows of the same
+    snapshot (Windows: ``psutil`` ``create_time()``, epoch seconds derived from
+    the kernel's UTC FILETIME). ``None`` means unknown, and an unknown stamp
+    never disqualifies a parent link. Every row of one snapshot uses one unit.
     """
 
     ppid: int
-    created: int | None = None
+    created: float | None = None
 
 
 def _win32_process_ppid_snapshot() -> dict[int, _ProcRow]:
-    """Snapshot ``pid -> (ppid, creation stamp)`` for every process via one CIM query.
+    """Snapshot ``pid -> (ppid, creation time)`` for every process via ``psutil``.
 
-    The creation stamp exists because Windows never reparents: a child's
-    ``ParentProcessId`` keeps naming its parent after the parent exits, and
-    that PID can then be recycled by an unrelated, *younger* process. A walk
-    that trusts the bare ppid follows the recycled PID into a stranger (see
+    The creation time exists because Windows never reparents: a child's
+    parent PID keeps naming its parent after the parent exits, and that PID
+    can then be recycled by an unrelated, *younger* process. A walk that
+    trusts the bare ppid follows the recycled PID into a stranger (see
     ``_self_ancestor_pids``).
 
-    Leaner than ``quiesce.list_processes``: it selects only
-    ``ProcessId``/``ParentProcessId``, makes a single attempt, and uses a
-    10s timeout — this runs on the kill path inside ``kill_process_tree`` /
-    ``kill_orphan_pid``, where quiesce's 60s x 2 retry budget (sized for a
-    once-per-invocation operator gate) could stall an orphan sweep for
-    minutes under load.
+    ``create_time()`` is taken from the kernel's process-creation FILETIME,
+    which is UTC by construction. The earlier CIM ``CreationDate`` source is a
+    ``DateTime`` built from local-time fields and can be off by an hour around
+    a DST transition -- enough to make a real parent look *newer* than its
+    child, stop the ancestor walk early, and unprotect a real ancestor (the
+    dangerous direction). ``psutil`` is a declared dependency; one
+    ``process_iter`` pass yields pid, ppid and create_time from the same
+    source, so the rows are mutually consistent, with no PowerShell spawn, no
+    JSON round-trip, and no 10s timeout to stall the kill path
+    (``kill_process_tree`` / ``kill_orphan_pid``). A process whose creation
+    time is unreadable (``AccessDenied`` -> ``None``) simply keeps its link.
 
-    Routed through ``subprocess_runner.run_captured`` (the codebase's
-    never-raises runner) rather than raw ``subprocess.run``: a spawn failure
-    such as ``PermissionError`` from a denied ``CreateProcess`` is an
-    ``OSError``, not a ``SubprocessError``, and would have slipped the old
-    narrow ``except`` to propagate through the ancestor guard — aborting
-    ``dead_worker_reap._sweep_orphan_processes_for_dead_sessions`` outright.
-
-    Returns ``{}`` on any failure (no PowerShell, timeout, non-zero exit,
-    spawn error, unparseable output). The caller degrades to the bare
-    self-pid guard rather than disabling process reaping on a host whose
-    process-listing substrate is broken — see ``_self_ancestor_pids``.
+    Returns ``{}`` on any failure (``psutil`` error, OS error). The caller
+    degrades to the bare self-pid guard rather than disabling process reaping
+    on a host whose process-listing substrate is broken -- see
+    ``_self_ancestor_pids``.
     """
     ppid_by_pid: dict[int, _ProcRow] = {}
-    if not shutil.which("powershell"):
-        return ppid_by_pid
-    result = run_captured(
-        [
-            "powershell",
-            "-NoProfile",
-            "-Command",
-            "Get-CimInstance Win32_Process | "
-            "Select-Object ProcessId, ParentProcessId, "
-            "@{Name='CreatedFileTime';Expression="
-            "{if ($_.CreationDate) { $_.CreationDate.ToFileTimeUtc() } else { $null }}} | "
-            "ConvertTo-Json",
-        ],
-        cwd=Path.cwd(),
-        timeout_seconds=10,
-    )
-    if result.returncode != 0:
-        return ppid_by_pid
     try:
-        data = json.loads(result.stdout)
-    except json.JSONDecodeError:
-        return ppid_by_pid
-
-    # No ``-AsArray``: that switch is PowerShell 6+ and Windows PowerShell
-    # 5.1 fails the whole command on it (see ``quiesce.list_processes``).
-    # ``ConvertTo-Json`` therefore emits a bare object when exactly one
-    # process matches — normalize both shapes.
-    if isinstance(data, dict):
-        data = [data]
-    if not isinstance(data, list):
-        return ppid_by_pid
-
-    for entry in data:
-        if not isinstance(entry, dict):
-            continue
-        try:
-            pid = int(entry["ProcessId"])
-            ppid = int(entry.get("ParentProcessId") or 0)
-        except (KeyError, TypeError, ValueError):
-            continue
-        try:
-            created: int | None = int(entry["CreatedFileTime"])
-        except (KeyError, TypeError, ValueError):
-            created = None
-        ppid_by_pid[pid] = _ProcRow(ppid, created)
+        for proc in psutil.process_iter(["pid", "ppid", "create_time"]):
+            info = proc.info
+            try:
+                pid = int(info["pid"])
+                ppid = int(info.get("ppid") or 0)
+            except (KeyError, TypeError, ValueError):
+                continue
+            created = info.get("create_time")
+            ppid_by_pid[pid] = _ProcRow(
+                ppid, float(created) if isinstance(created, (int, float)) else None
+            )
+    except (psutil.Error, OSError):
+        logger.warning("psutil process snapshot failed", exc_info=True)
+        return {}
     return ppid_by_pid
 
 
@@ -179,12 +150,19 @@ def _self_ancestor_pids() -> frozenset[int]:
     child's stale ``ParentProcessId`` then names whatever unrelated process
     took the number. Trusting it put a freshly launched merge-gate runner on
     the "ancestor" list, and ``kill_process_tree`` refused to kill it (the
-    ``test_local_merge_gate_async`` timeout/restart flake): a real parent
-    always predates its child, so a younger "parent" ends the walk. When
-    the snapshot cannot be taken at all the result degrades to
-    ``{os.getpid()}`` — on Windows the only producer of orphan PIDs
-    (``sweep_orphan_processes``) needs the same CIM substrate, so a broken
-    snapshot mostly means there was no sweep output to act on either;
+    ``test_local_merge_gate_async`` timeout/restart flake): a user-mode
+    parent always predates its child, so a younger "parent" ends the walk.
+    Accepted limits: (1) the predates-its-child premise holds for user-mode
+    processes only -- children of the kernel ``System`` process (pid 4) can
+    appear older than it, which only ever ends the walk early at a kernel
+    boundary no caller descends from; (2) a system clock stepped backwards
+    between the parent's and the child's creation can invert their
+    timestamps, which ``psutil.Process.parent()`` -- which applies the same
+    check -- accepts as well. When the snapshot cannot be taken at all the
+    result degrades to ``{os.getpid()}`` — on Windows the only producer of
+    orphan PIDs (``sweep_orphan_processes``) needs a working
+    process-listing substrate too, so a broken snapshot mostly means there
+    was no sweep output to act on either;
     collapsing to the pre-#1842 self-pid guard keeps direct
     ``kill_process_tree`` callers (which carry start-time fingerprints)
     working on such a host instead of silently disabling reaping.
@@ -317,7 +295,7 @@ def sweep_orphan_processes(worktree_path: str) -> list[dict[str, Any]]:
     # Known gap: ``-AsArray`` is a PowerShell 6+ switch — on Windows
     # PowerShell 5.1 the whole command fails (non-zero exit) and this sweep
     # silently returns [] on every such host (a #1842 follow-up tracks the
-    # fix). ``_win32_process_ppid_snapshot`` deliberately omits ``-AsArray``
+    # fix). ``quiesce.list_processes`` deliberately omits ``-AsArray``
     # for exactly this reason.
     result = run_captured(
         [

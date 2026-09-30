@@ -13,8 +13,6 @@ from __future__ import annotations
 
 import logging
 import os
-import shutil
-import subprocess
 import time
 from pathlib import Path
 from typing import Any
@@ -136,7 +134,7 @@ def _self_chain_or_skip(helper: Any, parent_pid: int) -> None:
 
     Distinguishes "snapshot substrate broken on this host" (skip — the guard
     cannot fire on a chain it cannot see) from "guard absent or misfired"
-    (fail). A bounded retry absorbs a transient CIM hiccup under xdist load,
+    (fail). A bounded retry absorbs a transient snapshot hiccup under xdist load,
     the same convention the kill_process_tree tests already carry.
     """
     deadline = time.monotonic() + 10.0
@@ -190,9 +188,9 @@ def test_kill_orphan_pid_refuses_real_parent(monkeypatch: pytest.MonkeyPatch) ->
     )
 
 
-@pytest.mark.skipif(os.name != "nt", reason="Windows-only: real ppid chain via CIM")
+@pytest.mark.skipif(os.name != "nt", reason="Windows-only: real ppid chain via psutil")
 def test_kill_process_tree_refuses_real_parent(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Windows end-to-end: ``os.getppid()`` resolved through the real CIM
+    """Windows end-to-end: ``os.getppid()`` resolved through the real psutil
     snapshot must be refused before ``taskkill`` runs.
 
     Windows-gated because on POSIX the pre-existing ``killpg`` group guard can
@@ -228,7 +226,7 @@ def test_kill_process_tree_refuses_real_parent(monkeypatch: pytest.MonkeyPatch) 
 
 
 def test_self_ancestor_pids_walks_win32_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Fabricated CIM rows: the walk must return self plus the whole chain,
+    """Fabricated snapshot rows: the walk must return self plus the whole chain,
     including the final ancestor whose own ppid is absent from the snapshot —
     the same boundary ``quiesce.self_process_chain`` tests pin.
     """
@@ -328,6 +326,43 @@ def test_kill_process_tree_kills_pid_that_only_recycled_an_ancestor_slot(
     assert any("taskkill" in c for c in commands)
 
 
+def test_kill_process_tree_refuses_older_ancestor_with_stamps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Control for the recycle end-to-end test: with creation stamps present
+    and a legitimate parent OLDER than the caller, the real
+    ``_self_ancestor_pids`` walk keeps it as an ancestor and
+    ``kill_process_tree`` refuses it -- no platform kill is reached."""
+    own_pid, parent_pid, grandparent_pid = 424242, 777, 555
+    monkeypatch.setattr(_sweep.os, "name", "nt")
+    monkeypatch.setattr(_sweep.os, "getpid", lambda: own_pid)
+    monkeypatch.setattr(
+        _sweep,
+        "_win32_process_ppid_snapshot",
+        lambda: {
+            own_pid: _sweep._ProcRow(parent_pid, created=200.0),
+            parent_pid: _sweep._ProcRow(grandparent_pid, created=100.0),
+            grandparent_pid: _sweep._ProcRow(1, created=50.0),
+        },
+    )
+    monkeypatch.setattr(_pu, "_enumerate_child_pids", lambda _pid: [])
+    monkeypatch.setattr(_pu, "is_pid_alive", lambda _pid, *_a, **_k: False)
+
+    commands: list[Any] = []
+    monkeypatch.setattr(
+        _pu,
+        "run_captured",
+        lambda command, **kwargs: (
+            commands.append(command) or RunResult(returncode=0, stdout="", stderr="", error=None)
+        ),
+    )
+    monkeypatch.setattr(_pu.os, "name", "nt")
+
+    assert kill_process_tree(parent_pid) == []
+    assert kill_process_tree(grandparent_pid) == []
+    assert commands == []
+
+
 def test_self_ancestor_pids_terminates_on_cycle(monkeypatch: pytest.MonkeyPatch) -> None:
     """A cyclic ppid map must not spin the walk — it terminates on the
     already-seen ancestor."""
@@ -372,39 +407,65 @@ def test_posix_process_ppid_snapshot_parses_procfs(tmp_path: Path) -> None:
     }
 
 
-def test_win32_process_ppid_snapshot_normalizes_single_result(
+class _FakePsutilProc:
+    """Minimal ``psutil.Process`` stand-in exposing only ``.info``."""
+
+    def __init__(self, **info: Any) -> None:
+        self.info = info
+
+
+def test_win32_process_ppid_snapshot_maps_psutil_rows(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Without ``-AsArray`` (dropped for PS 5.1 compat), ``ConvertTo-Json``
-    emits a bare object for a single result — the snapshot must treat a dict
-    payload as a one-element list, same as ``quiesce.list_processes``.
-    """
-    import json
-
-    monkeypatch.setattr(_sweep.shutil, "which", lambda _name: "powershell")
-    # The snapshot shells out through ``run_captured``, which reaches
-    # ``subprocess.run`` via the shared module — patch it there.
+    """Rows come from one ``psutil.process_iter`` pass: pid, ppid, and the
+    UTC-derived ``create_time`` (seconds, one unit for every row). An
+    unreadable creation time (``AccessDenied`` -> ``None``) yields ``created
+    is None`` so the link is kept, and a missing ppid maps to 0."""
     monkeypatch.setattr(
-        subprocess,
-        "run",
-        lambda *a, **k: subprocess.CompletedProcess(
-            a,
-            0,
-            json.dumps({"ProcessId": 7, "ParentProcessId": 3, "CreatedFileTime": 99}),
-            "",
+        _sweep.psutil,
+        "process_iter",
+        lambda attrs=None: iter(
+            [
+                _FakePsutilProc(pid=7, ppid=3, create_time=99.5),
+                _FakePsutilProc(pid=8, ppid=7, create_time=None),
+                _FakePsutilProc(pid=4, ppid=None, create_time=1.0),
+            ]
         ),
     )
 
-    assert _sweep._win32_process_ppid_snapshot() == {7: _sweep._ProcRow(3, 99)}
+    assert _sweep._win32_process_ppid_snapshot() == {
+        7: _sweep._ProcRow(3, 99.5),
+        8: _sweep._ProcRow(7, None),
+        4: _sweep._ProcRow(0, 1.0),
+    }
 
 
 def test_win32_process_ppid_snapshot_failure_returns_empty(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """No PowerShell (or a failed/unparseable query) must yield ``{}`` so the
-    ancestor guard degrades rather than raising."""
-    monkeypatch.setattr(_sweep.shutil, "which", lambda _name: None)
+    """A psutil failure must yield ``{}`` so the ancestor guard degrades
+    rather than raising."""
+
+    def boom(attrs: Any = None) -> Any:
+        raise _sweep.psutil.Error("substrate broken")
+
+    monkeypatch.setattr(_sweep.psutil, "process_iter", boom)
     assert _sweep._win32_process_ppid_snapshot() == {}
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows-only: real psutil snapshot")
+def test_win32_process_ppid_snapshot_real_rows_carry_creation_times() -> None:
+    """Integration guard against the recycled-PID fix silently disabling
+    itself: the REAL snapshot must give this process a creation time, and its
+    parent's (if listed) must not be newer -- a ``created`` that is always
+    ``None`` would make the walk fall back to trusting bare ppids again."""
+    snapshot = _sweep._win32_process_ppid_snapshot()
+    row = snapshot.get(os.getpid())
+    assert row is not None, "own pid missing from the real snapshot"
+    assert row.created is not None, "creation time unavailable: recycle guard is inert"
+    parent_row = snapshot.get(row.ppid)
+    if parent_row is not None and parent_row.created is not None:
+        assert parent_row.created <= row.created
 
 
 @pytest.mark.parametrize("bad_pid", [0, -1])
@@ -516,12 +577,11 @@ def test_snapshot_spawn_oserror_degrades_without_raising(
     with a warning, and both kill primitives must return without raising.
     """
     monkeypatch.setattr(_sweep.os, "name", "nt")
-    monkeypatch.setattr(shutil, "which", lambda _name: "powershell")
 
     def boom(*args: Any, **kwargs: Any) -> Any:
         raise exc_type("denied")
 
-    monkeypatch.setattr(subprocess, "run", boom)
+    monkeypatch.setattr(_sweep.psutil, "process_iter", boom)
 
     assert _sweep._win32_process_ppid_snapshot() == {}
 
