@@ -27,9 +27,9 @@ from pathlib import Path
 
 import pytest
 
-import charlie_work.dead_worker_reap as dead_worker_reap
+import charlie_work.dead_worker_sweep.effects_pr as effects_pr
 from charlie_work.config import LabelConfig, OrchestratorConfig, load_config
-from charlie_work.dead_worker_reap import _attempt_salvage
+from charlie_work.dead_worker_sweep.effects_pr import _attempt_salvage
 from charlie_work.github_capabilities.pull_requests import MergedPRSearchResult
 from charlie_work.labels import TransitionOutcome, transition
 from charlie_work.local_issues import LocalFileGitHub
@@ -389,7 +389,7 @@ def test_attempt_salvage_parks_local_backend_without_pushing(
     def _boom(*args: object, **kwargs: object) -> None:
         raise AssertionError("push_branch must not be called for a no-PR backend")
 
-    monkeypatch.setattr(dead_worker_reap, "push_branch", _boom)
+    monkeypatch.setattr(effects_pr, "push_branch", _boom)
 
     ok, error = _attempt_salvage(
         gh=gh,
@@ -454,7 +454,7 @@ def test_attempt_salvage_calls_push_branch_when_gh_publishes_prs(
         calls.append((repo_root_arg, branch_arg))
         return False, "x"
 
-    monkeypatch.setattr(dead_worker_reap, "push_branch", _fake_push_branch)
+    monkeypatch.setattr(effects_pr, "push_branch", _fake_push_branch)
 
     ok, error = _attempt_salvage(
         gh=_PublishingGitHubDouble(),

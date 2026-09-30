@@ -177,7 +177,7 @@ def test_config_loading_accepts_a_string_test_command() -> None:
 
 @pytest.mark.parametrize("bad", [5, True, ["uv", "run", "pytest"], {"cmd": "pytest"}, 1.5])
 def test_config_loading_rejects_a_non_string_test_command(bad: object) -> None:
-    with pytest.raises(ConfigError, match="dispatch.*test_command.*must be a string"):
+    with pytest.raises(ConfigError, match=r"^dispatch\.test_command: expected string, got "):
         build_config_from_data({"dispatch": {"test_command": bad}})
 
 

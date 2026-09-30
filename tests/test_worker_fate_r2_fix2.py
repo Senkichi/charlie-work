@@ -17,7 +17,7 @@ from _orphan_sweep_fixtures import _dead_worker_rework_bed, _run_orphan_sweep
 from _unescalate_fixtures import _events, _stranded_worktree_bed
 from charlie_work.config import WORKER_OUTCOME_FILENAME
 from charlie_work.foreign_worktree import write_worktree_marker
-from charlie_work.live_handoff_finalize import collect_stale_live_handoff_pids
+from charlie_work.dead_worker_sweep.live_handoff import collect_stale_live_handoff_pids
 from charlie_work.process_utils import write_worker_terminal_status
 from charlie_work.state import load_state, save_state, state_lock
 from charlie_work.worktree import worktree_path_for_branch

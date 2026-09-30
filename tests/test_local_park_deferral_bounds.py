@@ -26,6 +26,7 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
+from _dws_facts import run_reap
 
 from _local_park_fixtures import (
     _add_worktree_commit,
@@ -55,7 +56,6 @@ from charlie_work.local_work_park import (
     park_backstop_due_local_orphans,
     park_labelless_dead_local_session,
 )
-from charlie_work.orphaned_worker_sweep import maybe_reap_dead_dispatched_worker
 from charlie_work.paths import runtime_paths
 from charlie_work.state import load_state, save_state
 from charlie_work.subprocess_runner import RunResult
@@ -485,20 +485,17 @@ def test_reap_due_matches_documented_semantics(
         )
         is expected
     )
-    # The in-lock timer must agree (``max_throttle_rearms=0`` disables the
-    # bounded re-arm, which mutates the entry and is not part of the predicate).
-    _, reaped = maybe_reap_dead_dispatched_worker(
-        state=state,
-        entry=state["issues"]["42"],
-        issue_number=42,
-        sessions_dir=tmp_path,
-        pr_data=None,
-        dead_dispatched_reap_minutes=60,
+    # The sweep's decision must agree (``max_rearms=0`` disables the bounded
+    # re-arm, which mutates the entry and is not part of the predicate).
+    run = run_reap(
+        state["issues"]["42"],
+        issue=42,
+        reap_minutes=60,
+        max_rearms=0,
+        throttled_until=state.get("throttled_until"),
         now=_NOW,
-        sweep_events=[],
-        max_throttle_rearms=0,
     )
-    assert reaped is expected
+    assert run.reaped is expected
 
 
 # ---------------------------------------------------------------------------

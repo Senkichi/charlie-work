@@ -81,7 +81,7 @@ def _write_worker_prompt(self, issue: dict[str, Any], *, dry_run: bool = False) 
         # Slash-command skills are named only when the consumer ships them for
         # this harness; otherwise the plain git/gh loop renders. See prompt_skills.
         variants=active_prompt_variants(
-            self.config.worker.harness, self.repo_root, self.prompt_dirs
+            [e.harness for e in self.config.worker.chain], self.repo_root, self.prompt_dirs
         ),
     )
     # Issues #714/#715/#717/#1010/#1780: the rendered-output contract guards

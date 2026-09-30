@@ -302,7 +302,7 @@ def test_stalled_session_emits_event_with_required_fields(tmp_path: Path) -> Non
         patch("charlie_work.worker_fate.is_alive", return_value=True),
         patch("charlie_work.write_gate.kill_process_tree", return_value=[99999]),
         patch(
-            "charlie_work.dead_worker_reap.sweep_orphan_processes",
+            "charlie_work.dead_worker_sweep.effects_sessions.sweep_orphan_processes",
             return_value=[{"pid": 3492, "name": "python.exe", "command_line": "python worker.py"}],
         ),  # Fixed mock return
         patch(
@@ -445,9 +445,12 @@ def test_sweep_orphan_processes_for_dead_sessions_unit(tmp_path: Path) -> None:
             side_effect=lambda pid, *_: pid not in (1000, 1002),
         ),
         patch(
-            "charlie_work.dead_worker_reap.sweep_orphan_processes", side_effect=mock_sweep_orphan
+            "charlie_work.dead_worker_sweep.effects_sessions.sweep_orphan_processes",
+            side_effect=mock_sweep_orphan,
         ),
-        patch("os.name", "nt"),  # Force Windows path (os.name check lives in dead_worker_reap;
+        patch(
+            "os.name", "nt"
+        ),  # Force Windows path (os.name check lives in dead_worker_sweep.effects_sessions;
         # patching the os module directly avoids depending on which module happens to
         # `import os` into its own namespace)
         patch("subprocess.run", side_effect=mock_subprocess_run),

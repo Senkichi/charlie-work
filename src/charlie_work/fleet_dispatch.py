@@ -64,7 +64,7 @@ from .fleet_stop import (
 )
 from . import layout
 from .github import GitHub, GitHubError
-from .global_config import describe_config_file, load_layered_config
+from .global_config import describe_config_file, load_fleet_global_config, load_layered_config
 from .instrumentation import log_event
 from .local_issues import github_client_for
 from .notify import AttentionDigest, AttentionEntry, emit_digest
@@ -73,7 +73,7 @@ from .notify_freshness import (
     report_notify_resolution,
     resolve_fleet_notify,
 )
-from .paths import RepoNotFoundError, runtime_paths
+from .paths import runtime_paths
 from .venv_anchor import verify_interpreter_anchored_editables
 from .ci_fleet_anchor import ci_fleet_provenance_payload, ci_fleet_provenance_snapshot
 from .supervise import (
@@ -2834,14 +2834,7 @@ def run_fleet_supervise(
         return CommandResult(False, f"refusing to supervise: {anchor.detail}", {})
     logger.info("Venv editable anchor: %s", anchor.detail)
 
-    try:
-        global_config = load_layered_config(
-            Path.cwd(),
-            None,
-            fleet_dir_override=fleet_dir_override,
-            require_global=True,
-        )
-    except (ConfigError, RepoNotFoundError) as exc:
+    def _report_global_load_failure(exc: Exception) -> None:
         # Falling back to defaults silently is how a whole feature disappears
         # without a trace: every config-gated behavior (notify, labels, the
         # runner prologues) reverts to off while passes keep reporting success.
@@ -2853,18 +2846,18 @@ def run_fleet_supervise(
             exc,
         )
         print(f"config load failed, continuing on per-repo config: {exc}", flush=True)
-        # The global layer is required, but the per-repo config is still valid
-        # and must not be discarded with it -- discarding both regresses the
-        # #623 silent-disable failure (every per-repo knob reverting to its
-        # dataclass default while passes keep reporting success). Reload
-        # without the global requirement so per-repo settings survive; only
-        # fall back to pristine defaults if the per-repo load itself fails.
-        try:
-            global_config = load_layered_config(
-                Path.cwd(), None, fleet_dir_override=fleet_dir_override
-            )
-        except (ConfigError, RepoNotFoundError):
-            global_config = OrchestratorConfig()
+
+    # The global layer is required, but the per-repo config is still valid and
+    # must not be discarded with it (#623); only a failing per-repo load too
+    # falls back to pristine defaults. A host-wide ConstructionError is the one
+    # error that never degrades -- see load_fleet_global_config.
+    global_config = load_fleet_global_config(
+        load_layered_config,
+        Path.cwd(),
+        fleet_dir_override=fleet_dir_override,
+        fallback=OrchestratorConfig(),
+        report=_report_global_load_failure,
+    )
 
     # Provenance of the layer every fleet-wide knob comes from, logged once per
     # supervisor start (not per pass -- this is startup, so it costs one stat).

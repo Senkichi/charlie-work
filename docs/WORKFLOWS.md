@@ -179,6 +179,55 @@ but it is not an operator-invoked workflow — see
 [RUNBOOK.md](RUNBOOK.md#handling-agenthuman-needed-escalations) for how that
 tier's outcome surfaces.
 
+## Role chain (model waterfall)
+
+Both roles may name ordered fallbacks after their primary (issue #2086):
+
+```yaml
+worker:
+  harness: devin-shell
+  model: swe-2
+  fallbacks:
+    - {harness: claude-code, model: claude-sonnet-5-5}
+reviewer:
+  harness: claude-code
+  model: claude-opus-5-5
+  fallbacks:
+    - {harness: devin-shell, model: swe-2, effort: high}
+```
+
+- **Selection.** Every worker launch (fresh, remote rework, local rework --
+  all through the one launch permit) and every reviewer launch (remote and
+  local review lanes) calls `role_selection.select_role_entry`: the first
+  chain entry whose `(harness, model)` is not restricted in the **quota
+  ledger** (`<fleet_dir>/role_quota_ledger.json`) at launch time. The chosen
+  entry is stamped on the session sidecar (`role_entry`: role, harness,
+  model, `chain_index`); a launch past the primary emits
+  `role_fallback_selected` listing each skipped entry and its `until`.
+- **Learning.** When a worker or reviewer death is classified
+  `rate_limited` / `quota_exhausted` (worker failure classification, the
+  stalled rate-limit defer, the stalled-review sweep, a launch-time reviewer
+  quota hit), the ledger restricts the `(harness, model)` stamped on *that*
+  session until the classified reset. Writes are atomic and monotonic
+  (a shorter window never shortens an active one); entries only expire.
+  Sessions launched before this shipped carry no stamp and record nothing.
+- **Per-repo windows.** `throttled_until` (workers) and `reviewer_quota`
+  (reviewers) keep blocking for a chained role unless the ledger explains
+  them -- a window that ends no later than the latest ledger restriction on
+  a chain entry is *covered*, and the launch proceeds on the selected entry.
+  An operator hold or any other unexplained window still blocks. When every
+  entry is restricted the launch defers exactly as the per-repo window
+  always did (`provider_throttled` / `reviewer_quota_probe_backoff`, plus
+  `chain_retry_at`).
+- **Unchanged without fallbacks.** A chain of length 1 never reads the
+  ledger: per-repo throttles, the reviewer probe backoff and its single-probe
+  recovery behave exactly as before. The ledger is still written from its
+  sessions, so a chained repo elsewhere in the fleet learns from them.
+- **Downstream.** Reap and classification read the harness from the
+  sidecar's own type, so a fallback session is classified as what it ran on.
+  Worker prompts use the slash-command skills loop only when every chain
+  harness can load every declared skill.
+
 ## Fleet dispatch loop
 
 Fleet-level commands compose the single-repo loops across every repo in the

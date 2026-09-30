@@ -1,8 +1,8 @@
 """The ``dead_dispatched_reap_minutes`` due-check shared by both sides of the
 issue #1971 split.
 
-The #654 timed backstop (``orphaned_worker_sweep.maybe_reap_dead_dispatched_
-worker``) escalates a dead ``dispatched`` entry once ``orphan_drift_at`` has
+The #654 timed backstop (the ``dead_worker_sweep.decide_reap`` reap-due
+backstop) escalates a dead ``dispatched`` entry once ``orphan_drift_at`` has
 been armed longer than ``dead_dispatched_reap_minutes``. Issue #1971 added a
 pre-lock salvageable-park drain on no-PR backends
 (``local_work_park.park_backstop_due_local_orphans``) that must select exactly
@@ -56,7 +56,7 @@ def dead_dispatched_reap_due(
     """Whether the #654 timed backstop would escalate this entry this pass.
 
     The pure-predicate half of
-    ``orphaned_worker_sweep.maybe_reap_dead_dispatched_worker``, extracted
+    the ``dead_worker_sweep.decide_reap`` reap-due backstop, extracted
     (issue #1971) so the sweep's pre-lock salvageable-park probe can select
     exactly the backstop-due entries without duplicating the drift-expiry or
     provider-throttle exemption logic. Issue #1993 anchored the throttle-death

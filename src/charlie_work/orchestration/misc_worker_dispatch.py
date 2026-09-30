@@ -29,7 +29,7 @@ from charlie_work import worker_fate
 from charlie_work.adapters import SessionRequest
 from charlie_work.blocked_worker_escalation import resolve_fate_exempting_blocked
 from charlie_work.config import WORKER_OUTCOME_FILENAME
-from charlie_work.dead_worker_reap import _emit_session_failed_relabeled
+from charlie_work.dead_worker_sweep.effects_sessions import _emit_session_failed_relabeled
 from charlie_work.fleet_registry import try_acquire_fleet_lock
 from charlie_work.worker_launch_gate import acquire_fleet_launch_lock
 from charlie_work.github import label_names
