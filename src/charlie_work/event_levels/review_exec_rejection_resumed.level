@@ -1,0 +1,4 @@
+info
+# Issue #2090: a devin-shell reviewer ended on a refused exec and the reaper
+# resumed the same Devin session with a nudge instead of recording a miss.
+# Info: the recovery path working as designed. Payload: pr_number, attempt, session_id.
