@@ -13,7 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from .config import ReviewDispatchConfig
 from .no_op_checkpoint import _no_op_window_start, _normalized_timestamps
@@ -25,6 +25,9 @@ from .state import (
     load_state_locked,
 )
 from .worker import iter_workers
+
+if TYPE_CHECKING:
+    from .review_fleet_gate import FleetReviewCap
 
 
 @dataclass(frozen=True)
@@ -69,6 +72,17 @@ class ReviewDispatchSelection:
     local_cap: LocalReviewCapResult
     dispatch_limit: int
     selected: list[dict[str, Any]]
+    # Issue #2084: the fleet reviewer budget this selection was clamped under
+    # (``None`` = fleet cap disabled) and whether it, rather than the
+    # per-repo caps, bound ``dispatch_limit``.
+    fleet_cap: FleetReviewCap | None = None
+    fleet_clamped: bool = False
+
+    def fleet_report_fields(self) -> dict[str, Any]:
+        """Governor fields for the result/event payloads; empty when the cap is off."""
+        if self.fleet_cap is None:
+            return {}
+        return self.fleet_cap.report_fields(clamped=self.fleet_clamped)
 
 
 def parse_issue_numbers(only_issues: str) -> list[int]:
@@ -671,6 +685,7 @@ def _select_review_dispatch_candidates(
     resolved_now: datetime,
     limit: int | None,
     probe_mode: bool,
+    fleet_cap: FleetReviewCap | None = None,
 ) -> ReviewDispatchSelection:
     """Read-only selection of review-dispatch candidates (issue #617 rework).
 
@@ -747,6 +762,12 @@ def _select_review_dispatch_candidates(
         concurrent_cap = min(local_cap.dispatch_limit, concurrent_available)
     else:
         concurrent_cap = local_cap.dispatch_limit
+    # Issue #2084: the fleet-wide reviewer cap -- the review lane's
+    # ``fleet_max`` term, tightening (never loosening) the per-repo limit.
+    # Like the per-repo caps it is skipped for the single quota probe.
+    fleet_clamped = fleet_cap is not None and fleet_cap.available < concurrent_cap
+    if fleet_cap is not None and fleet_clamped:
+        concurrent_cap = fleet_cap.available
     dispatch_limit = 1 if probe_mode else concurrent_cap
     selected = dispatchable[:dispatch_limit]
     return ReviewDispatchSelection(
@@ -756,4 +777,6 @@ def _select_review_dispatch_candidates(
         local_cap=local_cap,
         dispatch_limit=dispatch_limit,
         selected=selected,
+        fleet_cap=fleet_cap,
+        fleet_clamped=fleet_clamped and not probe_mode,
     )
