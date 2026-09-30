@@ -47,11 +47,9 @@ read side feeds the persisted kind back in as ``FateEvidence.failure``
 (``PersistedFailure.as_evidence``) so ``Throttled`` is reachable, and
 :func:`throttle_failure` reads the throttle decision off the fate.
 
-``is_alive`` is the single liveness seam (design doc A2): the per-adapter
-``claude_code.is_worker_alive`` / ``devin_shell.is_session_alive`` wrappers
-were deleted, and ``WorkerView.is_alive``, ``dead_worker_reap`` and
-``doctor`` all call ``worker_fate.is_alive`` through the module attribute,
-so tests patch ``charlie_work.worker_fate.is_alive`` and nothing else.
+``is_alive`` is the single liveness seam (design doc A2): ``WorkerView.is_alive``,
+``dead_worker_reap`` and ``doctor`` call it through the module attribute, so
+tests patch ``charlie_work.worker_fate.is_alive`` and nothing else.
 
 Known exception to "this module owns post-exit fate": three consumers
 (``live_handoff_finalize``, ``misc_worker_dispatch``, ``rework_outcome``) use
@@ -74,7 +72,10 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 from types import MappingProxyType
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from .write_gate import WriteGate
 
 # Deliberate re-exports (file-size ratchet split): the public surface stays
 # ``worker_fate.<name>`` for every consumer and test.
@@ -317,9 +318,7 @@ def is_alive(pid: int | None, process_start_time: float | None) -> bool:
     are always dead -- e.g. a manual-adapter subject that never had a process
     to begin with, or a sentinel pid.
 
-    This is the single liveness seam for worker-fate resolution: the
-    per-adapter ``is_worker_alive`` / ``is_session_alive`` wrappers were
-    deleted (wf-r2-s2), so fate tests patch ``charlie_work.worker_fate.is_alive``.
+    The single liveness seam for worker-fate resolution (see module docstring).
     The primitive is looked up at call time, so a patch of
     ``process_utils.is_pid_alive`` reaches it too. Reviewer, merge-gate and
     worktree-marker liveness checks (and ``worker.py``'s own probe, which this
@@ -705,30 +704,31 @@ def persist_failure(
     *,
     adapter_kind: str | None,
     now: datetime,
+    source: str,
+    write_gate: WriteGate | None = None,
 ) -> dict[str, Any]:
     """Rule 6, write side: the single primitive that persists a classified failure.
 
-    Every writer of ``dead_worker_failure_kind`` (the three ``dead_worker_reap``
-    sites, ``dead_worker_classification`` and ``reconcile``) goes through this
-    function -- pinned by ``tests/test_worker_fate_seam.py``. It replaces the
-    former paired ``set_throttled_until`` + ``record_dead_worker_failure_kind``
-    calls so the cooldown and the epoch-scoped kind stamp can never drift apart.
+    Every writer of ``dead_worker_failure_kind`` goes through this function
+    (pinned by ``tests/test_worker_fate_seam.py``), so the cooldown and the
+    epoch-scoped kind stamp can never drift apart.
 
-    Pure: returns a new state, never mutates ``state``. ``failure.throttled_until``
-    is written verbatim (formatted, never recomputed -- #1993/#1997 keep the
-    rearm window and emission anchor in the classifier); a ``None`` value leaves
-    ``throttled_until`` alone, so a caller that must not touch the fleet-wide
-    cooldown (the stall site, ``reconcile``'s separate throttle item) passes a
-    failure without one. The kind stamp is a no-op when the issue has no entry
-    (never invents one) or when ``failure.kind`` is ``None``.
+    Pure: returns a new state. ``failure.throttled_until`` is written verbatim
+    (never recomputed -- #1993/#1997); ``None`` leaves ``throttled_until`` alone,
+    for callers that must not touch the fleet-wide cooldown. The kind stamp is a
+    no-op when the issue has no entry or ``failure.kind`` is ``None``.
+    ``source`` (issue #2006) names the caller (a literal, pinned by
+    ``tests/test_throttle_window_set.py``); ``write_gate`` routes the event.
     """
     new_state = state
     if failure.throttled_until is not None:
         new_state = set_throttled_until(
             new_state,
             _format_utc_z(failure.throttled_until),
+            source=source,
             reason=failure.kind,
             adapter_kind=adapter_kind,
+            write_gate=write_gate,
         )
     if failure.kind is not None:
         new_state = record_dead_worker_failure_kind(

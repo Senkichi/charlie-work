@@ -78,7 +78,9 @@ def test_maybe_probe_quota_recovery_arms_on_first_pass_without_probing(tmp_path:
         .isoformat()
         .replace("+00:00", "Z")
     )
-    state = set_throttled_until(load_state(app.paths.state_file), future, reason="rate_limited")
+    state = set_throttled_until(
+        load_state(app.paths.state_file), future, source="test", reason="rate_limited"
+    )
     save_state(app.paths.state_file, state)
 
     def _fail_if_called(**_kwargs: object) -> bool:
@@ -121,7 +123,9 @@ def test_maybe_probe_quota_recovery_waits_until_due(tmp_path: Path) -> None:
         .isoformat()
         .replace("+00:00", "Z")
     )
-    state = set_throttled_until(load_state(app.paths.state_file), future, reason="rate_limited")
+    state = set_throttled_until(
+        load_state(app.paths.state_file), future, source="test", reason="rate_limited"
+    )
     not_due = (
         (datetime.now(UTC) + timedelta(minutes=10))
         .replace(microsecond=0)
@@ -166,7 +170,11 @@ def test_maybe_probe_quota_recovery_green_clears_all_throttles(
         .replace("+00:00", "Z")
     )
     state = set_throttled_until(
-        load_state(app.paths.state_file), future, reason="rate_limited", adapter_kind="claude-code"
+        load_state(app.paths.state_file),
+        future,
+        source="test",
+        reason="rate_limited",
+        adapter_kind="claude-code",
     )
     state = set_reviewer_quota_exhausted(state, throttled_until=future, probe_after=future)
     state = {
@@ -217,7 +225,9 @@ def test_maybe_probe_quota_recovery_red_reschedules_flat_interval_and_keeps_thro
         .isoformat()
         .replace("+00:00", "Z")
     )
-    state = set_throttled_until(load_state(app.paths.state_file), future, reason="rate_limited")
+    state = set_throttled_until(
+        load_state(app.paths.state_file), future, source="test", reason="rate_limited"
+    )
     due = (
         (datetime.now(UTC) - timedelta(minutes=1))
         .replace(microsecond=0)
@@ -273,7 +283,9 @@ def test_maybe_probe_quota_recovery_red_also_defers_reviewer_probe(
         .isoformat()
         .replace("+00:00", "Z")
     )
-    state = set_throttled_until(load_state(app.paths.state_file), future, reason="rate_limited")
+    state = set_throttled_until(
+        load_state(app.paths.state_file), future, source="test", reason="rate_limited"
+    )
     # Reviewer quota exhausted with probe_after in the past (ready to probe).
     state = set_reviewer_quota_exhausted(
         state, throttled_until=future, probe_after="2020-01-01T00:00:00Z"
@@ -330,7 +342,9 @@ def test_maybe_probe_quota_recovery_red_does_not_shorten_existing_backoff(
         .isoformat()
         .replace("+00:00", "Z")
     )
-    state = set_throttled_until(load_state(app.paths.state_file), future, reason="rate_limited")
+    state = set_throttled_until(
+        load_state(app.paths.state_file), future, source="test", reason="rate_limited"
+    )
     state = set_reviewer_quota_exhausted(state, throttled_until=future, probe_after=far_future)
     due = (
         (datetime.now(UTC) - timedelta(minutes=1))
@@ -369,7 +383,11 @@ def test_maybe_probe_quota_recovery_red_skips_reviewer_probe_when_only_root_thro
         .replace("+00:00", "Z")
     )
     state = set_throttled_until(
-        load_state(app.paths.state_file), future, reason="rate_limited", adapter_kind="claude-code"
+        load_state(app.paths.state_file),
+        future,
+        source="test",
+        reason="rate_limited",
+        adapter_kind="claude-code",
     )
     due = (
         (datetime.now(UTC) - timedelta(minutes=1))
@@ -402,7 +420,9 @@ def test_maybe_probe_quota_recovery_disabled_config_never_probes(tmp_path: Path)
         .isoformat()
         .replace("+00:00", "Z")
     )
-    state = set_throttled_until(load_state(app.paths.state_file), future, reason="rate_limited")
+    state = set_throttled_until(
+        load_state(app.paths.state_file), future, source="test", reason="rate_limited"
+    )
     save_state(app.paths.state_file, state)
 
     def _fail_if_called(**_kwargs: object) -> bool:
@@ -443,6 +463,7 @@ def test_maybe_probe_quota_recovery_never_arms_for_provider_auth_throttle(
     state = set_throttled_until(
         load_state(app.paths.state_file),
         future,
+        source="test",
         reason="provider_auth",
         adapter_kind="claude-code",
     )
@@ -485,6 +506,7 @@ def test_maybe_probe_quota_recovery_never_arms_for_non_claude_code_adapter_throt
     state = set_throttled_until(
         load_state(app.paths.state_file),
         future,
+        source="test",
         reason="rate_limited",
         adapter_kind="devin",
     )

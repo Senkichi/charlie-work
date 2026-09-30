@@ -2378,6 +2378,7 @@ def _detect_and_handle_orphaned_workers(
                     pr_orphan_unreviewed_details=pr_orphan_unreviewed_details,
                     drift_fingerprint=_drift_fingerprint,
                     reap_escalations=reap_escalations,
+                    write_gate=write_gate,
                     on_fate=lambda fate: worker_fate.collect_fate(swept_fates, fate),
                 )
             else:

@@ -267,9 +267,17 @@ def test_check_stale_open_issue_mentions_catches_817_824_reproduction(
 def test_check_stale_open_issue_mentions_catches_866_864_reproduction_via_commit(
     hb: ModuleType, monkeypatch: Any, tmp_path: Path
 ) -> None:
-    """Issue #902 criterion 2: #866's fix rode inside PR #864, a PR for a
-    different issue, with no reference anywhere in #864's own title/body --
-    only in one of its commit messages."""
+    """Issue #902 criterion 2 / #2048: #866's fix rode inside PR #864, a PR
+    for a different issue, with no reference anywhere in #864's own
+    title/body -- only in one of its commit messages.
+
+    The seeded message uses an unqualified ``(#866)`` rather than the real
+    commit's verbatim ``(refs #866)``: under issue #2048's non-closing-context
+    exclusion the literal #866 text is deliberately suppressed (see
+    ``test_issue_mention_occurrences_marks_real_866_commit_non_closing``),
+    and what this test pins is the surviving shape -- an unlabeled issue
+    traceable only through a commit inside another issue's PR.
+    """
     repo = _make_repo(hb, tmp_path)
     _stale_mention_gh_dispatch(
         monkeypatch,
@@ -295,7 +303,7 @@ def test_check_stale_open_issue_mentions_catches_866_864_reproduction_via_commit
                 ("740484f", "feat(heartbeat): loop-pass stall (#864)"),
                 (
                     "e93fe13",
-                    "feat(heartbeat): surface error-level events with no consumer (refs #866)",
+                    "feat(heartbeat): surface error-level events with no consumer (#866)",
                 ),
             ],
             "",
@@ -308,6 +316,23 @@ def test_check_stale_open_issue_mentions_catches_866_864_reproduction_via_commit
     assert report.anomaly
     assert "#866" in report.lines[-1]
     assert "commit e93fe13" in report.lines[-1]
+
+
+def test_issue_mention_occurrences_marks_real_866_commit_non_closing(
+    hb: ModuleType,
+) -> None:
+    """Issue #2048's accepted tradeoff, pinned against the real payload.
+
+    The verbatim PR #864 squash-commit text mentions #866 as ``(refs #866)``
+    -- inside the same clause as the ``refs`` qualifier -- so exclusion 1
+    classifies it non-closing and the check no longer flags it. That is the
+    deliberate cost the issue accepts (a real ``Refs #N`` shape is the
+    corpus's dominant false positive); this test exists so a future change
+    to the clause scoping can't silently un-exclude it without a reviewer
+    seeing the tradeoff named here.
+    """
+    occurrences = hb.issue_mention_occurrences(_REAL_PR864_SQUASH_COMMIT_EXCERPT)
+    assert (866, True) in occurrences
 
 
 def test_check_stale_open_issue_mentions_no_label_filter_or_state_json(

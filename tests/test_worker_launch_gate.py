@@ -104,7 +104,7 @@ def _throttle(app: OrchestratorApp) -> None:
     until = (datetime.now(UTC) + timedelta(hours=1)).replace(microsecond=0)
     with state_lock(app.paths.state_file):
         state = load_state(app.paths.state_file)
-        state = set_throttled_until(state, until.isoformat().replace("+00:00", "Z"))
+        state = set_throttled_until(state, until.isoformat().replace("+00:00", "Z"), source="test")
         save_state(app.paths.state_file, state)
 
 

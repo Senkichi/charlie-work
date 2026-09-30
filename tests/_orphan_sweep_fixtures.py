@@ -172,6 +172,7 @@ def _run_orphan_sweep(
     fake_gh: Any,
     *,
     review_callback: Any = None,
+    dry_run: bool = False,
 ) -> None:
     from unittest.mock import patch
 
@@ -186,5 +187,5 @@ def _run_orphan_sweep(
             config,
             fake_gh,
             review_callback=review_callback,
-            write_gate=_wg(paths.state_file),
+            write_gate=_wg(paths.state_file, dry_run=dry_run),
         )
