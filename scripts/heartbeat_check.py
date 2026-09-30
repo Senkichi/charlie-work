@@ -122,12 +122,6 @@ ARMED_LABEL = "automated-ready"
 ARMABLE_GATING_LABELS: frozenset[str] = frozenset(
     {"blocked", "needs-design", "human-action", "question", "wontfix", "duplicate", "invalid"}
 )
-# Issue #2004: marker for issues a fleet sweep (e.g. the deprecated-config-key
-# retirement sweep) will arm itself. It gates only while the issue is NOT yet
-# `automated-ready`; once the sweep arms it, the issue is runway like any other,
-# so this is deliberately kept out of ARMABLE_GATING_LABELS (which gate
-# unconditionally, even over `automated-ready`).
-SWEEP_ARMED_LABEL = "sweep-armed"
 ARMABLE_PREVIEW_LIMIT = 8
 REVIEW_CLAIM_STALE_MINUTES = 45
 LOG_FRESHNESS_STALE_MINUTES = 30
@@ -253,12 +247,23 @@ except ImportError:
     _ndh = None
 
 # Issue #2004: the armable pool's dependency gate reuses the orchestrator's own
-# body parser (single point of enforcement) behind the same guarded import; when
-# it is unavailable the body gate degrades to a no-op and the caveat says so.
+# body parser (single point of enforcement), and its sweep gate reuses the
+# deprecated-key registry itself -- config_deprecations.py is deliberately the
+# single registry with no second marker, so a `removal_issue` number IS the
+# marker. Both sit behind guarded imports; when one is unavailable its gate
+# degrades to a no-op and check_armable_backlog's emitted verdict line carries
+# a caveat naming the degradation.
 try:
     from charlie_work.github_body_scan import parse_blockers as _parse_blockers
 except ImportError:
     _parse_blockers = None
+
+try:
+    from charlie_work.config_deprecations import (
+        DEPRECATED_CONFIG_KEYS as _DEPRECATED_CONFIG_KEYS,
+    )
+except ImportError:
+    _DEPRECATED_CONFIG_KEYS = None
 NOTIFY_DIGEST_STALE_HOURS = _ndc.NOTIFY_DIGEST_STALE_HOURS if _ndc else 72
 NOTIFY_RESOLUTION_EVENT_KIND = "notify_resolution"
 NOTIFY_DIGEST_STALE_EVENT_KIND = "notify_digest_stale"
@@ -1302,6 +1307,14 @@ def check_dispatch_coverage(
     )
 
 
+# The registry's ``removal_issue`` numbers are issues in the orchestrator's own
+# repo -- the checkout this script runs from (heartbeat_check.py lives at
+# <repo>/scripts/). A same-numbered issue in a sibling managed repo is a
+# different issue entirely, so the sweep gate is anchored on this root, not
+# applied fleet-wide.
+_SELF_REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
 def _has_open_body_blocker(issue: dict[str, Any], open_numbers: set[int]) -> bool:
     """True when the issue body declares a blocker that is still open.
 
@@ -1336,9 +1349,11 @@ def check_armable_backlog(
     * ``active``  -- carries an ``agent:*`` label (in flight / terminal).
     * ``armable`` -- no ``agent:*`` label, not ``automated-ready``, and no
       *gating* label (``ARMABLE_GATING_LABELS``), blocked-by-dependency
-      entry, open body-declared blocker, or pending ``sweep-armed`` marker
-      (issue #2004). This is the un-triaged pool: every issue here is either a
-      missed arm or a missed gate, and a triage pass drives it to zero.
+      entry, open body-declared blocker, or ``removal_issue`` membership in
+      ``DEPRECATED_CONFIG_KEYS`` (the config-retirement sweep files those
+      issues unarmed and arms them itself -- issue #2004). This is the
+      un-triaged pool: every issue here is either a missed arm or a missed
+      gate, and a triage pass drives it to zero.
 
     Verdict:
 
@@ -1354,11 +1369,27 @@ def check_armable_backlog(
     a false OK, an inflated armable can turn an OK into a false anomaly. The
     caveat is surfaced on whichever verdict is emitted rather than guessed
     around.
+
+    The two guarded imports degrade the same direction: a missing
+    ``parse_blockers`` or registry leaves body-declared blockers and
+    sweep-owned removal issues inside ``armable`` -- a possible false
+    anomaly, never a hidden one -- and each degradation is named in a
+    caveat on the emitted verdict line.
     """
     check = f"armable-backlog {repo.slug}"
     if repo.local_issues_enabled:
         report.ok(check, LOCAL_ONLY_SKIP_DETAIL)
         return
+    caveats: list[str] = []
+    if blocked_err:
+        caveats.append(f"blocked-issue lookup degraded: {blocked_err}")
+    if _parse_blockers is None:
+        caveats.append("body-blocker gate degraded: charlie_work.github_body_scan unavailable")
+    if _DEPRECATED_CONFIG_KEYS is None and repo.repo_root.resolve() == _SELF_REPO_ROOT:
+        caveats.append(
+            "sweep-registry gate degraded: charlie_work.config_deprecations unavailable"
+        )
+    caveat = f" ({'; '.join(caveats)})" if caveats else ""
     args = [
         "issue",
         "list",
@@ -1373,10 +1404,21 @@ def check_armable_backlog(
     ]
     ok, data, err = run_gh_json(args, repo.repo_root)
     if not ok:
-        report.anom(check, err)
+        report.anom(check, f"{err}{caveat}")
         return
 
     open_numbers = {issue["number"] for issue in data}
+    # The retirement sweep owns its removal issues end to end: it files them
+    # unarmed ("do not label by hand") and marks them `automated-ready` itself
+    # once each key's quiet window elapses (config_retirement_sweep). The
+    # registry is the marker -- there is deliberately no second label
+    # (config_deprecations.py) -- and the gate only applies to this script's
+    # own repo, where those issue numbers live.
+    sweep_owned = (
+        {entry.removal_issue for entry in _DEPRECATED_CONFIG_KEYS}
+        if _DEPRECATED_CONFIG_KEYS is not None and repo.repo_root.resolve() == _SELF_REPO_ROOT
+        else frozenset()
+    )
     runway: list[int] = []
     active = 0
     gated = 0
@@ -1396,8 +1438,9 @@ def check_armable_backlog(
             continue
         # Un-armed candidate: `fleet status` only evaluates blockers for
         # `automated-ready` issues, so an unlabelled issue never reaches
-        # blocked_numbers -- evaluate its body here (issue #2004).
-        if SWEEP_ARMED_LABEL in names or _has_open_body_blocker(issue, open_numbers):
+        # blocked_numbers -- evaluate its body here; a sweep-owned removal
+        # issue is likewise parked rather than un-triaged (issue #2004).
+        if number in sweep_owned or _has_open_body_blocker(issue, open_numbers):
             gated += 1
             continue
         armable.append(number)
@@ -1408,7 +1451,6 @@ def check_armable_backlog(
         f"runway={len(runway)} floor={floor} armable={len(armable)} "
         f"active={active} gated={gated} open={len(data)}"
     )
-    caveat = f" (blocked-issue lookup degraded: {blocked_err})" if blocked_err else ""
 
     if len(runway) >= floor:
         report.ok(check, f"plenty armed; {facts}{caveat}")
