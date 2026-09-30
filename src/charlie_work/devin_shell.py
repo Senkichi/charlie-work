@@ -35,7 +35,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from charlie_work.process_utils import parse_proc_stat_starttime, popen_worker
+from charlie_work.process_utils import CpuPriority, parse_proc_stat_starttime, popen_worker
 from .claude_code import _events_path, _rotate_old_log
 from .config import OrchestratorConfig
 from .devin_failure_classification import (  # noqa: F401 (deliberate re-export; #1442 extraction keeps devin_shell under its mark)
@@ -500,6 +500,7 @@ def launch_devin_session(
         with log_path.open("w", encoding="utf-8") as log_handle:
             process = popen_worker(
                 list(command),
+                priority=CpuPriority.BELOW_NORMAL,
                 cwd=str(worktree.path),
                 stdout=log_handle,
                 stderr=subprocess.STDOUT,
