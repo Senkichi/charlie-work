@@ -158,7 +158,10 @@ runner_capacity_escalation:
   enabled: "true"
 """,
     )
-    with pytest.raises(ConfigError, match="runner_capacity_escalation.*enabled.*must be a bool"):
+    with pytest.raises(
+        ConfigError,
+        match=r"^runner_capacity_escalation\.enabled: expected bool, got 'true' \(str\)$",
+    ):
         load_config(config_file)
 
 
@@ -178,7 +181,7 @@ runner_capacity_escalation:
     )
     with pytest.raises(
         ConfigError,
-        match="runner_capacity_escalation.*starvation_escalation_minutes.*must be an int",
+        match=r"^runner_capacity_escalation\.starvation_escalation_minutes: expected int, got True \(bool\)$",
     ):
         load_config(config_file)
 
@@ -200,7 +203,7 @@ runner_capacity_escalation:
     )
     with pytest.raises(
         ConfigError,
-        match="runner_capacity_escalation.*starvation_escalation_minutes.*must be > 0",
+        match=r"^runner_capacity_escalation\.starvation_escalation_minutes: expected >= 1, got 0$",
     ):
         load_config(config_file)
 

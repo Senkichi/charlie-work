@@ -72,7 +72,10 @@ def test_load_config_reviewer_effort_experiment_fraction_rejects_bool(tmp_path: 
   effort_experiment_fraction: true
 """,
     )
-    with pytest.raises(ConfigError, match="effort_experiment_fraction.*must be a number"):
+    with pytest.raises(
+        ConfigError,
+        match=r"^reviewer\.effort_experiment_fraction: expected number, got True \(bool\)$",
+    ):
         load_config(config_file)
 
 
@@ -86,7 +89,10 @@ def test_load_config_reviewer_effort_experiment_fraction_rejects_non_number(
   effort_experiment_fraction: "0.5"
 """,
     )
-    with pytest.raises(ConfigError, match="effort_experiment_fraction.*must be a number"):
+    with pytest.raises(
+        ConfigError,
+        match=r"^reviewer\.effort_experiment_fraction: expected number, got '0\.5' \(str\)$",
+    ):
         load_config(config_file)
 
 
@@ -101,7 +107,10 @@ def test_load_config_reviewer_effort_experiment_fraction_rejects_out_of_range(
   effort_experiment_fraction: {value}
 """,
     )
-    with pytest.raises(ConfigError, match=r"effort_experiment_fraction.*must be in \[0.0, 1.0\]"):
+    with pytest.raises(
+        ConfigError,
+        match=r"^reviewer\.effort_experiment_fraction: expected in \[0\.0, 1\.0\], got ",
+    ):
         load_config(config_file)
 
 
@@ -119,7 +128,7 @@ def test_load_config_reviewer_effort_experiment_fraction_without_effort_rejected
     )
     with pytest.raises(
         ConfigError,
-        match="effort_experiment_fraction.*is 0.25 but 'effort' is unset",
+        match=r"^reviewer\.effort: expected a treatment effort string \(e\.g\. 'high'\) when effort_experiment_fraction is 0\.25, got ''$",
     ):
         load_config(config_file)
 
@@ -156,7 +165,9 @@ def test_load_config_reviewer_effort_experiment_salt_rejects_non_str(tmp_path: P
   effort_experiment_salt: 123
 """,
     )
-    with pytest.raises(ConfigError, match="effort_experiment_salt.*must be a string"):
+    with pytest.raises(
+        ConfigError, match=r"^reviewer\.effort_experiment_salt: expected string, got 123 \(int\)$"
+    ):
         load_config(config_file)
 
 
@@ -241,7 +252,10 @@ def test_build_config_from_data_devin_adapter_is_rejected_as_unknown_key() -> No
     the now-deleted dual-accept bridge (role-config Phase 2 Track E); with
     that bridge gone and ``DevinConfig.adapter`` itself deleted, it falls
     straight through to ``_build_section``'s generic unknown-key rejection."""
-    with pytest.raises(ConfigError, match=r"unknown key\(s\) in config section 'devin'.*adapter"):
+    with pytest.raises(
+        ConfigError,
+        match=r"^devin: expected known keys \(valid: command_timeout_seconds, dispatch_command, session_manifest, session_results, sessions_dir, shell_command, venv_sou",
+    ):
         build_config_from_data({"devin": {"adapter": "devin-shell"}})
 
 
@@ -251,7 +265,10 @@ def test_build_config_from_data_worker_model_tier_key_is_rejected() -> None:
     longer a soft deprecation warning. It falls straight through to
     ``_build_section``'s generic unknown-key rejection, same as any other
     key a section's dataclass doesn't declare."""
-    with pytest.raises(ConfigError, match=r"unknown key\(s\) in config section 'dispatch'"):
+    with pytest.raises(
+        ConfigError,
+        match=r"^dispatch: expected known keys \(valid: archive_unreachable_local_commits, base_ref, branch_prefix, ci_capacity_headroom_ratio, default_limit, dependenc",
+    ):
         build_config_from_data({"dispatch": {"worker_model_tier": "capable"}})
 
 
@@ -277,7 +294,10 @@ def test_build_config_from_data_empty_bodied_cross_family_section_is_rejected() 
 
 
 def test_build_config_from_data_unknown_worker_key_still_raises_configerror() -> None:
-    with pytest.raises(ConfigError, match="unknown key.*worker.*bogus"):
+    with pytest.raises(
+        ConfigError,
+        match=r"^worker: expected known keys \(valid: harness, model\), got unknown key\(s\) bogus$",
+    ):
         build_config_from_data({"worker": {"bogus": "x"}})
 
 
@@ -286,7 +306,10 @@ def test_build_config_from_data_invalid_worker_harness_is_rejected() -> None:
     resolver to the top-level ``worker = _build_section(...)`` call site
     (role-config Phase 2 Track E); this pins the relocated check so a future
     refactor cannot silently drop it."""
-    with pytest.raises(ConfigError, match=r"section 'worker' key 'harness' must be one of"):
+    with pytest.raises(
+        ConfigError,
+        match=r"^worker\.harness: expected one of 'api', 'claude-code', 'command', 'devin-shell', 'manual', got 'bogus-harness'$",
+    ):
         build_config_from_data({"worker": {"harness": "bogus-harness"}})
 
 
@@ -304,7 +327,10 @@ def test_build_config_from_data_reviewer_harness_accepts_any_registered_harness(
     config = build_config_from_data({"reviewer": {"harness": "devin-shell"}})
     assert config.reviewer.harness == "devin-shell"
 
-    with pytest.raises(ConfigError, match=r"section 'reviewer' key 'harness' must be one of"):
+    with pytest.raises(
+        ConfigError,
+        match=r"^reviewer\.harness: expected one of 'api', 'claude-code', 'devin-shell', got 'devin'$",
+    ):
         build_config_from_data({"reviewer": {"harness": "devin"}})
 
 
@@ -318,7 +344,10 @@ def test_build_config_from_data_worker_harness_matches_registry() -> None:
         config = build_config_from_data({"worker": {"harness": harness}})
         assert config.worker.harness == harness
 
-    with pytest.raises(ConfigError, match=r"section 'worker' key 'harness' must be one of"):
+    with pytest.raises(
+        ConfigError,
+        match=r"^worker\.harness: expected one of 'api', 'claude-code', 'command', 'devin-shell', 'manual', got 'not-a-real-harness'$",
+    ):
         build_config_from_data({"worker": {"harness": "not-a-real-harness"}})
 
 
@@ -333,5 +362,8 @@ def test_build_config_from_data_reviewer_harness_matches_registry() -> None:
         config = build_config_from_data({"reviewer": {"harness": harness}})
         assert config.reviewer.harness == harness
 
-    with pytest.raises(ConfigError, match=r"section 'reviewer' key 'harness' must be one of"):
+    with pytest.raises(
+        ConfigError,
+        match=r"^reviewer\.harness: expected one of 'api', 'claude-code', 'devin-shell', got 'not-a-real-harness'$",
+    ):
         build_config_from_data({"reviewer": {"harness": "not-a-real-harness"}})

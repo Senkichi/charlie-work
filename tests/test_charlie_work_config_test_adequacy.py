@@ -76,7 +76,7 @@ def test_config_rejects_non_list_test_adequacy_tuple_field(tmp_path: Path) -> No
 
     assert "test_adequacy" in message
     assert "test_path_globs" in message
-    assert "must be a list" in message
+    assert "expected list of strings" in message
 
 
 def test_config_rejects_non_str_element_in_test_adequacy_tuple_field(tmp_path: Path) -> None:
@@ -99,7 +99,7 @@ def test_config_rejects_non_str_element_in_test_adequacy_tuple_field(tmp_path: P
 
     assert "test_adequacy" in message
     assert "test_path_globs" in message
-    assert "element of type" in message
+    assert "[1]: expected string, got 123" in message
 
 
 def test_config_rejects_bad_type_min_product_lines(tmp_path: Path) -> None:
@@ -122,7 +122,7 @@ def test_config_rejects_bad_type_min_product_lines(tmp_path: Path) -> None:
 
     assert "test_adequacy" in message
     assert "min_product_lines" in message
-    assert "must be an int" in message
+    assert "expected int" in message
 
 
 def test_config_rejects_bad_type_min_diff_coverage(tmp_path: Path) -> None:
@@ -146,7 +146,7 @@ def test_config_rejects_bad_type_min_diff_coverage(tmp_path: Path) -> None:
 
     assert "test_adequacy" in message
     assert "min_diff_coverage" in message
-    assert "must be a float" in message
+    assert "expected number" in message
 
     # Accept int
     config_path.write_text(
@@ -201,7 +201,7 @@ def test_config_rejects_non_bool_test_adequacy_flags(tmp_path: Path) -> None:
 
         assert "test_adequacy" in message
         assert bool_key in message
-        assert "must be a bool" in message
+        assert "expected bool" in message
 
 
 def test_config_accepts_full_test_adequacy_override(tmp_path: Path) -> None:
@@ -311,7 +311,7 @@ def test_config_rejects_non_list_coverage_probe_tuple_field(tmp_path: Path) -> N
 
     assert "coverage_probe" in message
     assert "branch_tokens" in message
-    assert "must be a list" in message
+    assert "expected list of strings" in message
 
 
 def test_config_rejects_bad_type_branch_to_assert_ratio_threshold(tmp_path: Path) -> None:
@@ -333,7 +333,7 @@ def test_config_rejects_bad_type_branch_to_assert_ratio_threshold(tmp_path: Path
 
     assert "coverage_probe" in message
     assert "branch_to_assert_ratio_threshold" in message
-    assert "must be a float" in message
+    assert "expected number" in message
 
 
 def test_config_rejects_non_bool_coverage_probe_flags(tmp_path: Path) -> None:
@@ -356,7 +356,7 @@ def test_config_rejects_non_bool_coverage_probe_flags(tmp_path: Path) -> None:
 
         assert "coverage_probe" in message
         assert bool_key in message
-        assert "must be a bool" in message
+        assert "expected bool" in message
 
 
 def test_config_accepts_full_coverage_probe_override(tmp_path: Path) -> None:

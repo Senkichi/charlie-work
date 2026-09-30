@@ -83,7 +83,10 @@ def test_roundtrip_legacy_devin_adapter_key_raises() -> None:
     worker.harness -- it is simply an unrecognized key under the `devin:`
     section, same as any other typo, regardless of what else is set
     alongside it."""
-    with pytest.raises(ConfigError, match=r"unknown key\(s\) in config section 'devin': adapter"):
+    with pytest.raises(
+        ConfigError,
+        match=r"^devin: expected known keys \(valid: command_timeout_seconds, dispatch_command, session_manifest, session_results, sessions_dir, shell_command, venv_sou",
+    ):
         build_config_from_data(
             {"devin": {"adapter": "claude-shell"}, "worker": {"harness": "devin-shell"}}
         )

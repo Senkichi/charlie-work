@@ -61,14 +61,38 @@ def test_load_config_local_issues_section(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("yaml_body", "match"),
     [
-        ('local_issues:\n  enabled: "yes"\n', "must be a bool"),
-        ('local_issues:\n  issues_dir: ""\n', "must be a non-empty string"),
-        ("local_issues:\n  issues_dir: 5\n", "must be a non-empty string"),
-        ("local_issues:\n  issues_dir: ../x\n", "must not contain '..'"),
-        ("local_issues:\n  issues_dir: a/../../x\n", "must not contain '..'"),
-        ("local_issues:\n  issues_dir: /etc/x\n", "must be relative to the"),
-        ("local_issues:\n  issues_dir: 'C:\\x'\n", "must be relative to the"),
-        ("local_issues:\n  nope: 1\n", "unknown key"),
+        (
+            'local_issues:\n  enabled: "yes"\n',
+            r"^local_issues\.enabled: expected bool, got 'yes' \(str\)$",
+        ),
+        (
+            'local_issues:\n  issues_dir: ""\n',
+            r"^local_issues\.issues_dir: expected non-empty string, got ''$",
+        ),
+        (
+            "local_issues:\n  issues_dir: 5\n",
+            r"^local_issues\.issues_dir: expected string, got 5 \(int\)$",
+        ),
+        (
+            "local_issues:\n  issues_dir: ../x\n",
+            r"^local_issues\.issues_dir: expected relative path without '\.\.', got '\.\./x'$",
+        ),
+        (
+            "local_issues:\n  issues_dir: a/../../x\n",
+            r"^local_issues\.issues_dir: expected relative path without '\.\.', got 'a/",
+        ),
+        (
+            "local_issues:\n  issues_dir: /etc/x\n",
+            r"^local_issues\.issues_dir: expected relative path without '\.\.', got '/etc/x'$",
+        ),
+        (
+            "local_issues:\n  issues_dir: 'C:\\x'\n",
+            r"^local_issues\.issues_dir: expected relative path without '\.\.', got 'C:",
+        ),
+        (
+            "local_issues:\n  nope: 1\n",
+            r"^local_issues: expected known keys .*got unknown key\(s\) nope$",
+        ),
     ],
 )
 def test_load_config_local_issues_validation_errors(

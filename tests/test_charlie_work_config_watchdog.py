@@ -77,9 +77,9 @@ def test_config_rejects_invalid_watchdog_terminal_error_markers_type(tmp_path: P
     else:  # pragma: no cover
         raise AssertionError("expected ConfigError for invalid terminal_error_markers type")
 
-    assert "section 'watchdog'" in message
+    assert message.startswith("watchdog.") or message.startswith("watchdog:")
     assert "terminal_error_markers" in message
-    assert "must be a list" in message
+    assert "expected list of strings" in message
 
 
 def test_config_rejects_invalid_watchdog_terminal_error_markers_element_type(
@@ -110,9 +110,9 @@ def test_config_rejects_invalid_watchdog_terminal_error_markers_element_type(
             "expected ConfigError for invalid terminal_error_markers element type"
         )
 
-    assert "section 'watchdog'" in message
+    assert message.startswith("watchdog.") or message.startswith("watchdog:")
     assert "terminal_error_markers" in message
-    assert "must be a list of strings" in message
+    assert "expected string" in message
 
 
 def test_config_rejects_unknown_watchdog_key(tmp_path: Path) -> None:
@@ -136,7 +136,7 @@ def test_config_rejects_unknown_watchdog_key(tmp_path: Path) -> None:
     else:  # pragma: no cover
         raise AssertionError("expected ConfigError for unknown watchdog key")
 
-    assert "section 'watchdog'" in message
+    assert message.startswith("watchdog.") or message.startswith("watchdog:")
     assert "bad_key" in message
     # Should list valid keys
     assert "enabled" in message

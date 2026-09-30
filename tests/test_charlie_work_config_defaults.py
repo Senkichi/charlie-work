@@ -346,7 +346,10 @@ supervisor:
   poll_interval_seconds: "not-an-int"
 """
     )
-    with pytest.raises(ConfigError, match="must be an int"):
+    with pytest.raises(
+        ConfigError,
+        match=r"^supervisor\.poll_interval_seconds: expected int, got 'not-an-int' \(str\)$",
+    ):
         load_config(config_file)
 
 
@@ -368,7 +371,10 @@ supervisor:
   self_deploy_failure_alarm: "not-an-int"
 """
     )
-    with pytest.raises(ConfigError, match="must be an int"):
+    with pytest.raises(
+        ConfigError,
+        match=r"^supervisor\.self_deploy_failure_alarm: expected int, got 'not-an-int' \(str\)$",
+    ):
         load_config(config_file)
 
 
@@ -392,7 +398,9 @@ supervisor:
   zero_pass_alarm: "not-an-int"
 """
     )
-    with pytest.raises(ConfigError, match="must be an int"):
+    with pytest.raises(
+        ConfigError, match=r"^supervisor\.zero_pass_alarm: expected int, got 'not-an-int' \(str\)$"
+    ):
         load_config(config_file)
 
 
@@ -418,7 +426,10 @@ supervisor:
   dependency_sync_starvation_seconds: "not-an-int"
 """
     )
-    with pytest.raises(ConfigError, match="must be an int"):
+    with pytest.raises(
+        ConfigError,
+        match=r"^supervisor\.dependency_sync_starvation_seconds: expected int, got 'not-an-int' \(str\)$",
+    ):
         load_config(config_file)
 
 
@@ -435,7 +446,10 @@ supervisor:
   fleet_lane_concurrency: "not-an-int"
 """
     )
-    with pytest.raises(ConfigError, match="must be an int"):
+    with pytest.raises(
+        ConfigError,
+        match=r"^supervisor\.fleet_lane_concurrency: expected int, got 'not-an-int' \(str\)$",
+    ):
         load_config(config_file)
 
 
@@ -452,7 +466,10 @@ supervisor:
   reap_sweep_interval_seconds: "not-an-int"
 """
     )
-    with pytest.raises(ConfigError, match="must be an int"):
+    with pytest.raises(
+        ConfigError,
+        match=r"^supervisor\.reap_sweep_interval_seconds: expected int, got 'not-an-int' \(str\)$",
+    ):
         load_config(config_file)
 
 

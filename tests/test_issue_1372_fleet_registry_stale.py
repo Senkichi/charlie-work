@@ -706,7 +706,9 @@ def test_fleet_registry_stale_grace_days_rejects_negative() -> None:
     """Issue #1372: negative grace_days is a ConfigError when parsed from YAML."""
     from charlie_work.config import ConfigError, build_config_from_data
 
-    with pytest.raises(ConfigError, match="must be >= 0"):
+    with pytest.raises(
+        ConfigError, match=r"^runtime\.fleet_registry_stale_grace_days: expected >= 0, got -1$"
+    ):
         build_config_from_data({"runtime": {"fleet_registry_stale_grace_days": -1}})
 
 
@@ -716,7 +718,10 @@ def test_fleet_registry_stale_grace_days_rejects_bool() -> None:
     """
     from charlie_work.config import ConfigError, build_config_from_data
 
-    with pytest.raises(ConfigError, match="must be an int"):
+    with pytest.raises(
+        ConfigError,
+        match=r"^runtime\.fleet_registry_stale_grace_days: expected int, got True \(bool\)$",
+    ):
         build_config_from_data({"runtime": {"fleet_registry_stale_grace_days": True}})
 
 
@@ -724,7 +729,10 @@ def test_fleet_registry_stale_grace_days_rejects_string() -> None:
     """Issue #1372: a string value is a ConfigError, not a silent coercion."""
     from charlie_work.config import ConfigError, build_config_from_data
 
-    with pytest.raises(ConfigError, match="must be an int"):
+    with pytest.raises(
+        ConfigError,
+        match=r"^runtime\.fleet_registry_stale_grace_days: expected int, got '7' \(str\)$",
+    ):
         build_config_from_data({"runtime": {"fleet_registry_stale_grace_days": "7"}})
 
 
