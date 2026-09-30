@@ -5,7 +5,7 @@ import logging
 import os
 import tempfile
 import threading
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from types import MappingProxyType
@@ -321,33 +321,22 @@ def touch_repo(
         return save_state(fleet_json_path, data)
 
 
-def count_fleet_live_sessions(
+def _iter_registered_repo_contexts(
     fleet_dir_override: str | None,
-) -> tuple[int, list[str]]:
-    """Count live worker sessions across all registered repos in the fleet.
+    skipped_repos: list[str],
+) -> Iterator[tuple[str, Path, Path, OrchestratorConfig]]:
+    """Yield ``(name_with_owner, repo_root, state_dir, repo_config)`` per registered repo.
 
-    Reads the fleet registry, iterates over each registered repo, resolves its
-    sessions_dir, and counts live workers using the adapter-agnostic iter_workers
-    from worker.py. Tolerates per-repo problems by skipping them and returning a
-    list of skipped repo keys for operator visibility.
-
-    Args:
-        fleet_dir_override: Optional override for the fleet directory path.
-
-    Returns:
-        A tuple of (total_live_count, skipped_repos) where skipped_repos is a
-        list of name_with_owner keys for any of:
-        - repo_root missing or not a git worktree,
-        - state_dir missing,
-        - config load failure (missing/unreadable/malformed/invalid), or
-        - resolved sessions_dir missing.
+    The shared per-repo resolution ``count_fleet_live_sessions`` and
+    ``count_fleet_live_reviews`` both walk. A repo that cannot be resolved is
+    appended to ``skipped_repos`` (the caller's operator-visibility list) and
+    not yielded: ``repo_root`` missing or not a git worktree, ``state_dir``
+    missing, or a config load failure (missing/unreadable/malformed/invalid).
+    Entries with no ``repo_root`` are ignored without being reported.
     """
     fleet_json_path = layout.fleet_registry_path(override=fleet_dir_override)
     data = _load_registry(fleet_json_path)
     repos = data.get("repos", {})
-
-    total_live_count = 0
-    skipped_repos: list[str] = []
 
     for name_with_owner, entry in repos.items():
         repo_root_str = entry.get("repo_root")
@@ -372,14 +361,13 @@ def count_fleet_live_sessions(
             skipped_repos.append(name_with_owner)
             continue
 
-        # Resolve sessions_dir from the registry entry's state_dir
-        # The state_dir is the .var/charlie-work root for that repo.
+        # The registry's state_dir is the .var/charlie-work root for that repo.
         # ``or ""`` (not ``.get(key, default)``): a present-but-null state_dir
         # returns None from .get — the default only applies when the key is
         # *absent* — and Path(None) raises TypeError. Same bug class fixed for
         # repo_root across fleet_dispatch.py; null here behaves like a missing
-        # key (cwd fallback), then the state_dir.exists() / sessions_dir checks
-        # skip + report the repo.
+        # key (cwd fallback), then the state_dir.exists() check skips + reports
+        # the repo.
         state_dir = Path(entry.get("state_dir") or "")
         if not state_dir.exists():
             logger.warning(
@@ -388,13 +376,14 @@ def count_fleet_live_sessions(
             skipped_repos.append(name_with_owner)
             continue
 
-        # Resolve sessions_dir from the repo's effective layered config.
+        # Resolve dirs from the repo's effective layered config.
         # The registry's state_dir is the resolved state root, but the repo's
-        # per-repo orchestrator.config.yaml may not declare devin.sessions_dir;
-        # the fleet-wide <fleet_dir>/config.yaml layer is also allowed to set it
-        # (known_config_sections() includes "devin"). Use load_layered_config so
-        # both layers are merged and an explicit devin.sessions_dir is resolved
-        # against repo_root via the single sentinel resolver in layout.py.
+        # per-repo orchestrator.config.yaml may not declare devin.sessions_dir
+        # (or review_dispatch.reviews_dir); the fleet-wide <fleet_dir>/config.yaml
+        # layer is also allowed to set them (known_config_sections() includes
+        # "devin"). Use load_layered_config so both layers are merged and an
+        # explicit override is resolved against repo_root via the single
+        # sentinel resolver in layout.py.
         explicit_cfg = entry.get("config_path")
         try:
             repo_config = load_layered_config(
@@ -410,6 +399,36 @@ def count_fleet_live_sessions(
             skipped_repos.append(name_with_owner)
             continue
 
+        yield name_with_owner, repo_root, state_dir, repo_config
+
+
+def count_fleet_live_sessions(
+    fleet_dir_override: str | None,
+) -> tuple[int, list[str]]:
+    """Count live worker sessions across all registered repos in the fleet.
+
+    Reads the fleet registry, iterates over each registered repo, resolves its
+    sessions_dir, and counts live workers using the adapter-agnostic iter_workers
+    from worker.py. Tolerates per-repo problems by skipping them and returning a
+    list of skipped repo keys for operator visibility.
+
+    Args:
+        fleet_dir_override: Optional override for the fleet directory path.
+
+    Returns:
+        A tuple of (total_live_count, skipped_repos) where skipped_repos is a
+        list of name_with_owner keys for any of:
+        - repo_root missing or not a git worktree,
+        - state_dir missing,
+        - config load failure (missing/unreadable/malformed/invalid), or
+        - resolved sessions_dir missing.
+    """
+    total_live_count = 0
+    skipped_repos: list[str] = []
+
+    for name_with_owner, repo_root, state_dir, repo_config in _iter_registered_repo_contexts(
+        fleet_dir_override, skipped_repos
+    ):
         sessions_dir = layout.resolve_state_child(
             repo_config.devin.sessions_dir,
             repo_root=repo_root,
@@ -427,6 +446,48 @@ def count_fleet_live_sessions(
         workers = iter_workers(sessions_dir, repo_key=name_with_owner)
         live_count = sum(1 for worker in workers if worker.is_alive())
         total_live_count += live_count
+
+    return total_live_count, skipped_repos
+
+
+def count_fleet_live_reviews(
+    fleet_dir_override: str | None,
+) -> tuple[int, list[str]]:
+    """Count live reviewer sessions across all registered repos in the fleet.
+
+    The review-lane twin of :func:`count_fleet_live_sessions` (issue #2084):
+    same registry walk and per-repo skip semantics, but each repo contributes
+    ``dispatch_selection._count_live_reviews(reviews_dir, state_file)`` -- the
+    SAME liveness rule the per-repo ``max_concurrent_reviews`` cap uses
+    (sidecar ``is_alive`` plus the ghost-reviewer corroboration against the
+    repo's ``state.json``), so the fleet and per-repo caps cannot disagree
+    about what "live" means.
+
+    Unlike the worker count, a missing ``reviews_dir`` is NOT a skip: it is
+    only created by a repo's first reviewer launch, so its absence means zero
+    live reviewers (a review-disabled repo), not an unreadable repo.
+
+    Returns ``(total_live_count, skipped_repos)``; ``skipped_repos`` holds the
+    repos ``_iter_registered_repo_contexts`` could not resolve.
+    """
+    # Imported at the one call site so fleet_registry's module-load graph is
+    # unchanged for every worker-lane consumer.
+    from .dispatch_selection import _count_live_reviews
+
+    total_live_count = 0
+    skipped_repos: list[str] = []
+
+    for _name, repo_root, state_dir, repo_config in _iter_registered_repo_contexts(
+        fleet_dir_override, skipped_repos
+    ):
+        reviews_dir = layout.resolve_state_child(
+            repo_config.review_dispatch.reviews_dir,
+            repo_root=repo_root,
+            default=layout.reviews_dir_default(state_dir),
+        )
+        if not reviews_dir.exists():
+            continue
+        total_live_count += _count_live_reviews(reviews_dir, layout.state_file_path(state_dir))
 
     return total_live_count, skipped_repos
 

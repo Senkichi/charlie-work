@@ -2088,6 +2088,7 @@ class FleetConfig:
     """
 
     global_max_concurrent_sessions: int = 0
+    global_max_concurrent_reviews: int = 0  # #2084 reviewer-lane cap; 0 = disabled
     launch_lock_wait_seconds: float = 10.0
 
 
@@ -4016,6 +4017,16 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
         raise ConfigError(
             "config section 'fleet' key 'global_max_concurrent_sessions' must be an "
             f"int, got {type(global_max).__name__}"
+        )
+    global_max_reviews = fleet_data.get("global_max_concurrent_reviews")
+    if global_max_reviews is not None and (
+        not isinstance(global_max_reviews, int)
+        or isinstance(global_max_reviews, bool)
+        or global_max_reviews < 0
+    ):
+        raise ConfigError(
+            "config section 'fleet' key 'global_max_concurrent_reviews' must be a "
+            f"non-negative int, got {global_max_reviews!r}"
         )
     launch_lock_wait = fleet_data.get("launch_lock_wait_seconds")
     if launch_lock_wait is not None and (

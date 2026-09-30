@@ -51,6 +51,11 @@ from charlie_work.worker_launch_gate import (
     issue_worker_launch_permit,
 )
 from charlie_work.github import GitHubError
+from charlie_work.review_fleet_gate import (
+    fleet_review_lock,
+    fleet_review_lock_deferral,
+    read_fleet_review_cap,
+)
 from charlie_work.janitor import check_operator_containment, check_test_adequacy
 from charlie_work.labels import TransitionOutcome
 from charlie_work.local_lane import (
@@ -677,8 +682,12 @@ def _local_build_packet(
     return {"issue": issue_number, "ok": True, "head": head, "branch": branch}
 
 
-def _local_dispatch_reviewers(self, *, now: Any = None) -> dict[str, Any]:
+@fleet_review_lock(lambda data: _wf.CommandResult(True, "local review dispatch pass", data))
+def _local_dispatch_reviewers(self, *, now: Any = None, launch_lock: Any = None) -> dict[str, Any]:
     """Claim and launch reviewers for lane records whose head is packetized.
+
+    ``launch_lock`` (issue #2084) is supplied by ``@fleet_review_lock`` and is
+    realized/clamped below exactly as in ``dispatch_reviews``.
 
     Mirrors ``dispatch_reviews``'s claim/launch/post-claim shape at a smaller
     scale: pending claim stamped under one lock, launches outside it, then a
@@ -778,6 +787,21 @@ def _local_dispatch_reviewers(self, *, now: Any = None) -> dict[str, Any]:
 
     if not selected:
         return result
+
+    # Issue #2084: realize the fleet lock now -- after the lock-free scan,
+    # before the fleet reviewer count is read -- and hold it through
+    # claim -> launch (the wrapper releases it). Clamp to the fleet budget.
+    lock_deferral = fleet_review_lock_deferral(self, launch_lock)
+    if lock_deferral is not None:
+        return {**result, **lock_deferral, "skipped": [*result["skipped"], *selected]}
+    fleet_cap = read_fleet_review_cap(self)
+    if fleet_cap is not None:
+        clamped = fleet_cap.available < len(selected)
+        result.update(fleet_cap.report_fields(clamped=clamped))
+        result["skipped"] = [*result["skipped"], *selected[fleet_cap.available :]]
+        selected = selected[: fleet_cap.available]
+        if not selected:
+            return result
 
     claim_stamp = _wf.utc_now()
     with _wf.state_lock(self.paths.state_file):

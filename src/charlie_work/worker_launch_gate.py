@@ -308,7 +308,10 @@ class WorkerLaunchPermit:
 
 
 def acquire_fleet_launch_lock(
-    app: OrchestratorApp, *, acquire: FleetLockAcquirer = try_acquire_fleet_lock
+    app: OrchestratorApp,
+    *,
+    acquire: FleetLockAcquirer = try_acquire_fleet_lock,
+    cap: int | None = None,
 ) -> FleetLaunchLock:
     """Mint this lane's fleet-launch-lock handle -- the OS lock is NOT taken here.
 
@@ -322,9 +325,14 @@ def acquire_fleet_launch_lock(
     ``acquire`` is the lock primitive the handle will realize through; lanes
     pass their own module-level ``try_acquire_fleet_lock`` name so existing
     tests that patch it there keep intercepting. Whether a lock is required
-    is decided here, never by the caller.
+    is decided here, never by the caller. ``cap`` is the fleet-wide cap the
+    lock serializes accounting for: the worker cap by default, or the
+    reviewer cap for the review lane (issue #2084) -- both share the one
+    fleet lock file, each lane opting in only when ITS cap is enabled.
     """
-    if app.config.fleet.global_max_concurrent_sessions <= 0:
+    if cap is None:
+        cap = app.config.fleet.global_max_concurrent_sessions
+    if cap <= 0:
         return FleetLaunchLock(None, _MINT)
     return FleetLaunchLock(
         None,
@@ -360,6 +368,23 @@ def _holder_held_seconds(acquired_at: Any) -> float | None:
     except ValueError:
         return None
     return max(0.0, (datetime.now(UTC) - acquired).total_seconds())
+
+
+def fleet_lock_held_extra(app: OrchestratorApp, wait_seconds: float) -> dict[str, Any]:
+    """Payload fields for a ``fleet_lock_held`` deferral (shared by every lane).
+
+    Carries the exhausted wait budget and, best-effort, who holds the lock.
+    """
+    holder = read_fleet_lock_holder(app.fleet_dir_override)
+    extra: dict[str, Any] = {"lock_wait_seconds": wait_seconds}
+    if isinstance(holder.get("repo"), str):
+        extra["lock_holder_repo"] = holder["repo"]
+    if isinstance(holder.get("pid"), int):
+        extra["lock_holder_pid"] = holder["pid"]
+    held_seconds = _holder_held_seconds(holder.get("acquired_at"))
+    if held_seconds is not None:
+        extra["lock_held_seconds"] = held_seconds
+    return extra
 
 
 def issue_worker_launch_permit(
@@ -415,16 +440,9 @@ def issue_worker_launch_permit(
     wait_seconds = app.config.fleet.launch_lock_wait_seconds
     waited = launch_lock.ensure_acquired(wait_seconds)
     if waited is None:
-        holder = read_fleet_lock_holder(app.fleet_dir_override)
-        extra: dict[str, Any] = {"lock_wait_seconds": wait_seconds}
-        if isinstance(holder.get("repo"), str):
-            extra["lock_holder_repo"] = holder["repo"]
-        if isinstance(holder.get("pid"), int):
-            extra["lock_holder_pid"] = holder["pid"]
-        held_seconds = _holder_held_seconds(holder.get("acquired_at"))
-        if held_seconds is not None:
-            extra["lock_held_seconds"] = held_seconds
-        return WorkerLaunchDeferral(REASON_FLEET_LOCK_HELD, ok=True, extra=extra)
+        return WorkerLaunchDeferral(
+            REASON_FLEET_LOCK_HELD, ok=True, extra=fleet_lock_held_extra(app, wait_seconds)
+        )
 
     try:
         if live_count is None:
