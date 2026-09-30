@@ -9,7 +9,11 @@ after ``Popen`` — callers must never block on the worker finishing. Each launc
 writes a JSON sidecar file (``sessions_dir/issue-<n>.json``) atomically (tmp +
 replace, matching ``adapters._write_json``) *before* returning, so a crash of
 the orchestrator process itself never loses track of a session that was actually
-spawned.
+spawned. A daemon-thread watcher (``process_utils.start_terminal_status_watcher``,
+issue #2052) then persists ``issue-<n>.devin.terminal.json`` once the spawned
+process exits — exit code, duration, and a copy of the worktree's
+``.worker-outcome.json`` — so ``worker_fate`` resolves a dead devin worker from
+the same durable terminal record it uses for claude-code.
 
 Each worker is launched in an isolated per-issue git worktree (created via
 ``worktree.create_worktree()``, mirroring the claude-code adapter) so
@@ -31,7 +35,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from charlie_work.process_utils import parse_proc_stat_starttime, popen_worker
+from charlie_work.process_utils import (
+    parse_proc_stat_starttime,
+    popen_worker,
+    start_terminal_status_watcher,
+    terminal_record_proves_completion,
+    worker_terminal_status_path,
+)
 from .claude_code import _events_path, _rotate_old_log
 from .config import OrchestratorConfig
 from .devin_failure_classification import (  # noqa: F401 (deliberate re-export; #1442 extraction keeps devin_shell under its mark)
@@ -683,6 +693,34 @@ def launch_devin_session(
         error = f"failed to launch devin: {exc}"
 
     if pid is not None and error is None:
+        # Issue #2052: devin-shell joins the terminal-record contract. Its
+        # fate profile now declares ``writes_terminal_record``, and the same
+        # non-blocking watcher the claude-code launcher runs leaves
+        # ``issue-<n>.devin.terminal.json`` when this process exits -- the
+        # durable exit evidence ``worker_fate.resolve_fate`` reads back
+        # adapter-agnostically via ``find_worker_terminal_status``. The
+        # watcher polls ``Popen.poll()`` on a daemon thread (never wait()/
+        # communicate()) and copies the worktree's ``.worker-outcome.json``
+        # into the record, so launch returns immediately. Review launches
+        # pass ``worktree_path=None``, matching claude_code's #1354
+        # handling: a review checkout holds no worker outcome file, only
+        # the exit code matters to the review-verdict reaper. A profile
+        # lookup failure still writes the record -- a registry hiccup must
+        # never suppress durable exit evidence on a live process.
+        try:
+            from . import worker_fate  # lazy: profile table reaches back into this module
+
+            profile = worker_fate.profile_for("devin")
+            writes_terminal_record = profile is None or profile.writes_terminal_record
+        except Exception:
+            writes_terminal_record = True
+        if writes_terminal_record:
+            start_terminal_status_watcher(
+                process,
+                worker_terminal_status_path(sessions_dir, issue_number, "devin"),
+                worktree_path=None if review else worktree.path,
+            )
+
         # Write the worktree writer marker so this process is recorded as the
         # legitimate occupant of the worktree (issue #400).
         try:
@@ -881,7 +919,10 @@ def update_session_record_with_failure_classification(
     heuristic. See ``claude_code.update_worker_record_with_failure_
     classification`` for the sibling fix and the live false-positive this
     protects against (a worker's own completion-summary prose quoting
-    throttle-marker text).
+    throttle-marker text). Since #2052 the launcher runs the terminal-status
+    watcher, so completion is derived here too via
+    ``terminal_record_proves_completion`` -- a record proving this pid exited
+    0 with a worker outcome makes the log tail completion prose.
 
     ``config`` is optional for backward compatibility; when provided, its
     ``runtime.throttle_error_markers``, ``runtime.quota_error_markers``, and
@@ -911,9 +952,16 @@ def update_session_record_with_failure_classification(
     if payload.get("failure_kind") is not None:
         return payload.get("failure_kind"), None
 
+    # Same derivation as claude_code's sibling writer (#656/#2022): the
+    # terminal record the #2052 watcher leaves behind is ground truth that
+    # this exact pid exited 0 with a worker outcome -- its log tail is the
+    # model's own completion prose, not a provider error.
+    completed = session_completed or terminal_record_proves_completion(
+        sessions_dir, issue_number, "devin", payload.get("pid")
+    )
     classified_kind: str | None = None
     throttled_until: str | None = None
-    log_path_str = payload.get("log_path") if not session_completed else None
+    log_path_str = payload.get("log_path") if not completed else None
     if log_path_str:
         if config is not None:
             throttle_markers = config.runtime.throttle_error_markers
