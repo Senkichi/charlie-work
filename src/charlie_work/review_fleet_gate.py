@@ -143,6 +143,23 @@ def fleet_review_lock_deferral(
     }
 
 
+def fleet_lock_held_result_data(lock_deferral: dict[str, Any], **carried: Any) -> dict[str, Any]:
+    """Result ``data`` for a review pass deferred on the fleet lock.
+
+    Nothing was selected or launched; ``carried`` are the pre-lock sweep
+    results (recorded/missed/reconciled verdicts, rescue reviews) the pass
+    already produced and must still report.
+    """
+    return {
+        "selected_count": 0,
+        "attempted_count": 0,
+        "failed_count": 0,
+        "launched_count": 0,
+        **carried,
+        **lock_deferral,
+    }
+
+
 def read_fleet_review_cap(app: OrchestratorApp) -> FleetReviewCap | None:
     """Read the fleet reviewer budget now; ``None`` when the cap is disabled.
 

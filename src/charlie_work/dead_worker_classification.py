@@ -1,7 +1,7 @@
 """Dead-worker failure classification for the state.json-keyed orphan sweep.
 
 Issue #2002: the dead-session classifier
-(``dead_worker_reap._classify_dead_sessions_and_update_throttle_state``)
+(``dead_worker_sweep.dead_sessions`` dead-session classifier)
 runs BEFORE ``workflow._detect_and_handle_orphaned_workers`` in each repo
 pass, but the two lanes answer "is this worker dead" with different
 verdicts. The classifier requires ``worker.is_worker_confirmed_dead`` --
@@ -38,7 +38,7 @@ sidecar on a later pass.
 The sweep runs inside the caller's ``state_lock``; every effect here is a
 cheap local read or an in-place mutation of the already-loaded ``entry`` /
 ``state`` mappings -- no network I/O, no subprocesses -- matching the
-discipline ``orphaned_worker_sweep.handle_dead_worker_with_pr`` applies to
+discipline ``dead_worker_sweep.decide_with_pr`` applies to
 its other in-lock probes (``find_worker_terminal_status``).
 """
 
@@ -235,7 +235,7 @@ def classify_and_credit_dead_worker(
     """Classify the dead worker, then credit its death unless throttle-caused.
 
     The orphan sweep's three ``worker_death_at`` credit sites
-    (``orphaned_worker_sweep.handle_dead_worker_with_pr``: request_changes
+    (``dead_worker_sweep.decide_with_pr``: request_changes
     restore, approved-rework restore, unreviewed-PR advance) call this once
     each instead of gating on a possibly-absent
     ``dead_worker_failure_kind`` stamp. Resolution runs lazily at the
