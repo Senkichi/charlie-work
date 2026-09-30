@@ -33,6 +33,7 @@ from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from . import role_quota_ledger
 from .config import OrchestratorConfig
 from .process_utils import terminal_record_proves_completion
 from .throttle_signatures import match_throttle_tail
@@ -231,4 +232,9 @@ def update_session_record_with_failure_classification(
 
     payload["failure_kind"] = resolved_kind
     devin_shell._write_json(sidecar_path, payload)
+    # Issue #2086: a quota/rate-limit death restricts the session's own
+    # stamped (harness, model) fleet-wide. Best-effort, never raises.
+    role_quota_ledger.record_classified_death(
+        payload, resolved_kind, throttled_until, source="devin_failure_classification"
+    )
     return resolved_kind, throttled_until
