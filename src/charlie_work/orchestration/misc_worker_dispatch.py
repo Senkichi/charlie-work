@@ -33,11 +33,18 @@ from charlie_work.worker_launch_gate import WorkerLaunchDeferral, acquire_fleet_
 from charlie_work.github import label_names
 from charlie_work.state import StateLockBusy
 from charlie_work.worker import iter_workers
+from charlie_work.foreign_worktree import OPERATOR_MARKER_KIND, read_worktree_marker
+from charlie_work.process_utils import is_pid_alive
 from charlie_work.worktree import (
+    WORKTREE_UNSAFE_KIND_LOCAL_COMMITS,
     WorktreeProbeFailedError,
+    _archive_unreachable_tip_if_applicable,
+    _has_origin_remote,
     _worktree_refuse_to_reset_reason,
+    _worktree_unsafe_kind_from_reason,
     inspect_worktree_state,
     read_worker_outcome,
+    salvage_push_stranded_commits,
     worktree_path_for_branch,
 )
 
@@ -296,7 +303,9 @@ def _route_phantom_live_worker(
     return "dispatch_failed", None, state
 
 
-def _worktree_still_unsafe(self, issue_number: int, state: dict[str, Any]) -> str | None:
+def _worktree_still_unsafe(
+    self, issue_number: int, state: dict[str, Any], *, dry_run: bool = False
+) -> str | None:
     """Re-run the worktree safety check for an issue (issue #849).
 
     Returns a reason string if the issue's worktree is still unsafe to
@@ -312,40 +321,29 @@ def _worktree_still_unsafe(self, issue_number: int, state: dict[str, Any]) -> st
     treated as "still unsafe" so a transient index lock cannot clear a
     real blocker.
 
-    FLIP 3 (rule-3 sibling of ``_route_phantom_live_worker`` above, design
-    doc §8 step B5) is deliberately NOT applied here, and this is a
-    permanent divergence, not a pending step (wf-review-opus.md B8: an
-    earlier commit message implied a follow-up "flip commit" was still
-    coming -- none is planned; see ``wf-review-dispositions.md`` B8 for the
-    full rationale). ``_worktree_refuse_to_reset_reason`` below classifies
-    local-only commits (``WORKTREE_UNSAFE_KIND_LOCAL_COMMITS``,
-    ``config.DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS``) as a
-    judgment-class escalation that is never auto-cleared here -- the same
-    underlying fact ``_route_phantom_live_worker`` resolves to
-    ``worker_fate.Stranded`` (salvageable) a few dozen lines up, for a
-    *different* caller.
+    Rule 3 of the Worker fate resolution (a stranded branch -- committed
+    but not on the remote -- is salvaged, never merely "stuck") is applied
+    here as salvage-before-clear, the same fact
+    ``_route_phantom_live_worker`` resolves to ``worker_fate.Stranded``.
+    When the reason is ``WORKTREE_UNSAFE_KIND_LOCAL_COMMITS`` (no
+    worker-authored dirt, only commits absent from the remote) the commits
+    are made durable first (``_salvage_stranded_before_clear``) and the
+    escalation clears only once they are:
 
-    Two independent reasons this function stays on the legacy reason
-    string instead of ``worker_fate.Stranded``:
+    - repo WITH an origin remote: the ff-only
+      ``salvage_push_stranded_commits`` push, then
+      ``_worktree_refuse_to_reset_reason`` is re-run and must be clean.
+      Both callers always have an open PR, so this deliberately does NOT
+      go through ``_attempt_salvage`` (its PR-open would duplicate it).
+    - repo with NO origin remote: the #1944 archive park. The re-check
+      cannot turn clean there (nothing is ever "on the remote"), so a
+      verified archive ref is the clearing evidence instead.
 
-    1. Wiring it to ``worker_fate`` would require a second, duplicate
-       ``inspect_worktree_state`` probe purely for an unused
-       classification (this function already fails closed on probe
-       errors, so a second probe adds risk -- a transient index lock
-       between the two calls could disagree with itself -- without
-       changing what it returns).
-    2. More importantly, this function gates *de-escalation* (clearing an
-       existing ``worktree_unsafe`` label), which has no salvage step of
-       its own. ``_route_phantom_live_worker``'s ``Stranded`` is safe to
-       treat as salvageable because that lane runs ``_attempt_salvage``
-       (parks the branch for review) before anything touches the
-       worktree. Here, relabeling local-only commits as "safe to clear"
-       without also parking them first would let the next dispatch's
-       worktree reset silently discard those commits -- turning a
-       classification tweak into data loss. Applying rule 3 here for real
-       would mean adding a salvage-before-clear step, not just re-tagging
-       the fate; that is an architectural change, not this docstring's
-       scope.
+    Any salvage skip or failure (diverged remote, live or operator writer
+    marker, push or probe error, archive declined) returns the ORIGINAL
+    reason so the label stays. ``dry_run`` (the command's own flag or the
+    write gate's) never salvages, so it never clears a local-commits
+    reason.
     """
     issue_entry = state.get("issues", {}).get(str(issue_number), {})
     if not isinstance(issue_entry, dict):
@@ -358,7 +356,8 @@ def _worktree_still_unsafe(self, issue_number: int, state: dict[str, Any]) -> st
         # No worktree on disk — the blocker is gone (or was never this
         # issue's worktree). Clearing is safe.
         return None
-    try:
+
+    def _refuse_reason() -> str | None:
         return _worktree_refuse_to_reset_reason(
             self.repo_root,
             branch,
@@ -367,10 +366,88 @@ def _worktree_still_unsafe(self, issue_number: int, state: dict[str, Any]) -> st
             self.config.dispatch.injected_paths,
             self.config.dispatch.materialize_dirs,
         )
+
+    try:
+        reason = _refuse_reason()
+        if (
+            not reason
+            or _worktree_unsafe_kind_from_reason(reason) != WORKTREE_UNSAFE_KIND_LOCAL_COMMITS
+            or dry_run
+            or self.write_gate.dry_run
+        ):
+            return reason
+        mode = self._salvage_stranded_before_clear(issue_number, branch, wt_path)
+        if mode is None:
+            return reason
+        if mode == "parked":
+            return None
+        return _refuse_reason()
     except (WorktreeProbeFailedError, RuntimeError):
         # Fail closed: a probe failure means we cannot confirm safety,
         # so treat the worktree as still unsafe.
         return "worktree safety probe failed; cannot confirm clean"
+
+
+def _salvage_stranded_before_clear(
+    self, issue_number: int, branch: str, wt_path: Path
+) -> str | None:
+    """Publish or park a stranded branch before its escalation may clear.
+
+    Returns ``"pushed"`` (ff-only push to origin landed; the caller
+    re-checks), ``"parked"`` (no origin remote; tip archived by the #1944
+    park path), or ``None`` when the work is not proven durable (the label
+    must stay). Emits ``worktree_unsafe_stranded_salvaged`` or
+    ``worktree_unsafe_stranded_salvage_failed`` (with ``skip_reason``).
+    """
+    mode: str | None = None
+    skip_reason: str | None = None
+    payload: dict[str, Any] = {"issue_number": issue_number, "branch": branch}
+    if _has_origin_remote(self.repo_root):
+        result = salvage_push_stranded_commits(
+            self.repo_root,
+            branch,
+            wt_path,
+            base_ref=self.config.dispatch.base_ref,
+            dry_run=False,
+        )
+        if result.pushed:
+            mode = "pushed"
+            payload.update(
+                commit_count=result.commit_count,
+                old_remote_sha=result.old_remote_sha,
+                new_remote_sha=result.new_remote_sha,
+            )
+        else:
+            skip_reason = result.skip_reason or result.error or "push_failed"
+    elif not self.config.dispatch.archive_unreachable_local_commits:
+        skip_reason = "archive_disabled"
+    else:
+        marker = read_worktree_marker(wt_path)
+        marker_pid = marker.get("pid") if marker is not None else None
+        if marker is not None and marker.get("kind") == OPERATOR_MARKER_KIND:
+            skip_reason = "operator_claimed"
+        elif isinstance(marker_pid, int) and marker_pid > 0 and is_pid_alive(marker_pid):
+            skip_reason = "live_writer_marker"
+        elif _archive_unreachable_tip_if_applicable(
+            self.repo_root, branch, wt_path, self.paths.state_file, set(), issue_number
+        ):
+            mode = "parked"
+        else:
+            skip_reason = "archive_declined"
+
+    payload["mode"] = mode
+    if mode is None:
+        payload["skip_reason"] = skip_reason
+    kind = (
+        "worktree_unsafe_stranded_salvaged"
+        if mode is not None
+        else "worktree_unsafe_stranded_salvage_failed"
+    )
+    with _wf.state_lock(self.paths.state_file):
+        fresh = _wf.load_state(self.paths.state_file)
+        fresh = self._record_event(fresh, kind, payload)
+        self.write_gate.save_state(fresh)
+    return mode
 
 
 @records_deferral("dispatch_rework")

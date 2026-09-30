@@ -26,7 +26,7 @@ from unittest.mock import patch
 from _fakes_github import FakeGitHub
 from _orphan_sweep_fixtures import _dead_worker_rework_bed, _run_orphan_sweep, _write_outcome
 from _salvage_fixtures import _SalvageTestGitHub, _salvage_labels
-from _worktree_fixtures import _git, _init_bare_remote_and_clone, _init_repo
+from _worktree_fixtures import _git, _init_bare_remote_and_clone
 
 from charlie_work.config import (
     WORKER_OUTCOME_FILENAME,
@@ -533,36 +533,40 @@ def test_flip3_dead_worker_reap_salvage_pushes_local_only_commits(
 
 
 def test_flip3_worktree_refuse_to_reset_treats_local_commits_as_unsafe(tmp_path: Path) -> None:
-    """FLIP 3: current behaviour; contrast with the sibling test above.
+    """FLIP 3: was a permanent "unsafe" verdict for local-only commits, the
+    opposite action from the salvage lane's auto-push above; now rule 3
+    applies to both lanes.
 
-    `_worktree_refuse_to_reset_reason` (backing
-    `misc_worker_dispatch._worktree_still_unsafe`) classifies the SAME fact
-    -- local commits on a branch that are not on the remote -- as a
-    judgment-class escalation (`WORKTREE_UNSAFE_KIND_LOCAL_COMMITS`, in
-    `config.DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS`) that is
-    deliberately NEVER auto-cleared, the opposite action from the salvage
-    lane's auto-push above.
+    `_worktree_refuse_to_reset_reason` still reports the local-only commits
+    (`WORKTREE_UNSAFE_KIND_LOCAL_COMMITS`) -- that read-only probe is
+    unchanged -- but `misc_worker_dispatch._worktree_still_unsafe`, its
+    de-escalation gate, now salvages them (ff-only push to the reachable
+    origin) and clears only because the re-check is then clean (`None`).
     """
+    from _unescalate_fixtures import _stranded_state, _stranded_worktree_bed
+
     from charlie_work.worktree import (
         WORKTREE_UNSAFE_KIND_LOCAL_COMMITS,
         _worktree_refuse_to_reset_reason,
         _worktree_unsafe_kind_from_reason,
     )
 
-    repo_root = tmp_path / "repo"
-    _init_repo(repo_root)
     branch = "agent/issue-9103"
-    _git(repo_root, "checkout", "-b", branch)
-    (repo_root / "work.txt").write_text("local work\n", encoding="utf-8")
-    _git(repo_root, "add", "work.txt")
-    _git(repo_root, "commit", "-m", "local-only commit")
-    _git(repo_root, "checkout", "main")
+    app, repo_root, wt_path, remote = _stranded_worktree_bed(tmp_path, branch)
 
-    reason = _worktree_refuse_to_reset_reason(repo_root, branch, "main", None)
-
+    reason = _worktree_refuse_to_reset_reason(repo_root, branch, "", wt_path)
     assert reason is not None
     assert "local commit" in reason
     assert _worktree_unsafe_kind_from_reason(reason) == WORKTREE_UNSAFE_KIND_LOCAL_COMMITS
+
+    assert app._worktree_still_unsafe(123, _stranded_state(branch)) is None
+
+    # Salvaged, not merely relabelled: the branch is now on the remote.
+    assert (
+        _git(remote, "rev-parse", f"refs/heads/{branch}").stdout.strip()
+        == _git(wt_path, "rev-parse", "HEAD").stdout.strip()
+    )
+    assert _worktree_refuse_to_reset_reason(repo_root, branch, "", wt_path) is None
 
 
 # ---------------------------------------------------------------------------
