@@ -185,9 +185,13 @@ def _dispatch_rework_impl(
 
     rework_limit = limit if limit is not None else self.config.dispatch.default_limit
 
-    # Issue #2041: the shared worker-launch gate -- concurrency governor, then
-    # provider throttle, under the fleet lock dispatch_rework() already holds.
-    # ONE permit covers both the normal and the rescue launch below.
+    # Issue #2041/#2055: the shared worker-launch gate -- provider-throttle
+    # pre-check (lock-free), the fleet lock realized HERE with a bounded wait
+    # (never across the scans above), live_count computed under it (the
+    # governor's internal fleet count already excludes launching/dead
+    # backends and corroborates worker_pid), then the governor and the
+    # authoritative throttle read. ONE permit covers both the normal and
+    # the rescue launch below.
     permit = issue_worker_launch_permit(self, rework_limit, launch_lock=launch_lock)
     if isinstance(permit, WorkerLaunchDeferral):
         # Return immediately with deferral reason
@@ -203,7 +207,7 @@ def _dispatch_rework_impl(
             )
         else:
             message = f"rework dispatch deferred: {permit.reason}"
-        return _wf.CommandResult(False, message, data)
+        return _wf.CommandResult(permit.ok, message, data)
     gov = permit.governor
     rework_limit = permit.max_launches
 
@@ -220,6 +224,11 @@ def _dispatch_rework_impl(
     # the review-routing path calls self.review() which writes state;
     # all are skipped here.
     if self.dry_run:
+        # Issue #2055: nothing below launches, so the fleet lock the permit
+        # realized has served its purpose (governor decision) -- release it
+        # before the read-only planning pass rather than holding it to the
+        # lane's ``finally`` (release is idempotent; that finally still runs).
+        launch_lock.release()
         dry_candidates = [issue for issue in rework_issues if int(issue["number"]) in pr_by_issue]
 
         # Head-check filtering (read-only): identify candidates that
@@ -1272,6 +1281,12 @@ def _dispatch_rework_impl(
             manifest_path, launchable_requests, adapter=manifest_adapter_label(combined_kinds)
         )
     write_session_results(results_path, dispatch_results)
+    # Issue #2055: the sessions the fleet cap counts are on disk now -- the
+    # governor -> claim -> launch window the lock exists to serialize is
+    # closed. Release before the second state lock below instead of holding
+    # it to the lane's ``finally`` (release is idempotent; that finally
+    # still runs and covers every other exit path).
+    launch_lock.release()
 
     successful_issue_numbers = {result.issue_number for result in dispatch_results if result.ok}
     failed_issue_numbers = {result.issue_number for result in dispatch_results if not result.ok}

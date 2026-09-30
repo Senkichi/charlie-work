@@ -40,15 +40,20 @@ FRESH = "fresh"
 REWORK = "rework"
 
 
-def _config(*, fleet_cap: int = 0, max_concurrent: int = 0) -> OrchestratorConfig:
+def _config(
+    *, fleet_cap: int = 0, max_concurrent: int = 0, launch_lock_wait: float = 10.0
+) -> OrchestratorConfig:
     return OrchestratorConfig(
         worker=WorkerRoleConfig(harness="claude-code"),
         dispatch=DispatchConfig(default_limit=5, max_concurrent_sessions=max_concurrent),
-        fleet=FleetConfig(global_max_concurrent_sessions=fleet_cap),
+        fleet=FleetConfig(
+            global_max_concurrent_sessions=fleet_cap,
+            launch_lock_wait_seconds=launch_lock_wait,
+        ),
     )
 
 
-def _app(tmp_path: Path, lane: str, **config_kw: int) -> OrchestratorApp:
+def _app(tmp_path: Path, lane: str, **config_kw: Any) -> OrchestratorApp:
     config = _config(**config_kw)
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     paths.root.mkdir(parents=True, exist_ok=True)
@@ -143,8 +148,9 @@ def test_provider_throttle_blocks_launch(
 def test_held_fleet_lock_blocks_launch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lane: str
 ) -> None:
-    """The real fleet lock, held by another dispatcher, not a patched stub."""
-    app = _app(tmp_path, lane, fleet_cap=4)
+    """The real fleet lock, held by another dispatcher, not a patched stub.
+    Issue #2055: a short bounded wait is retried before the deferral."""
+    app = _app(tmp_path, lane, fleet_cap=4, launch_lock_wait=0.2)
     calls = _spy_dispatch_sessions(monkeypatch)
     held = try_acquire_fleet_lock(app.fleet_dir_override)
     assert held is not None
