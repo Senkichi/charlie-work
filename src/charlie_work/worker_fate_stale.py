@@ -14,8 +14,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from .instrumentation import log_event
-from .state import load_state, load_state_locked, save_state, state_lock
+from .state import load_state, load_state_locked, state_lock
+from .write_gate import WriteGate, require_write_gate
 
 if TYPE_CHECKING:
     from .worker_fate import StaleEvidence, WorkerFate
@@ -149,7 +149,7 @@ def report_stale_evidence(
     state_file: Path,
     fates: Mapping[int, Sequence[WorkerFate]],
     *,
-    dry_run: bool,
+    write_gate: WriteGate,
 ) -> None:
     """Emit ``worker_evidence_stale`` for every fate's not-yet-reported stale
     evidence, then persist the dedup marker.
@@ -159,10 +159,13 @@ def report_stale_evidence(
     dispatch-time phantom-worker lane and the rework-outcome readers all hand
     their fates here instead of each dropping ``basis.stale`` on the floor.
 
-    ``dry_run`` is required (keyword-only) and makes this a no-op: the events
-    ring and the dedup marker are local writes a dry run must not make -- and a
-    persisted marker would suppress the real event on the next live pass.
-    Taking it here means no caller can forget the gate.
+    ``write_gate`` is required (keyword-only, validated by
+    :func:`~charlie_work.write_gate.require_write_gate`) and both the event
+    emission and the marker persist go through it. Under ``write_gate.dry_run``
+    this is a no-op: the events ring and the dedup marker are local writes a
+    dry run must not make -- and a persisted marker would suppress the real
+    event on the next live pass. Taking the gate here means no caller can
+    forget it.
 
     Several fates for one issue are merged: their stale evidence is unioned and
     deduped by :func:`stale_evidence_key`, first fate's wording winning.
@@ -175,7 +178,8 @@ def report_stale_evidence(
     the same dead worker every pass emits once; an issue with no state entry
     still emits (there is nothing to dedup against) but persists no marker.
     """
-    if dry_run or not fates:
+    write_gate = require_write_gate(write_gate)
+    if write_gate.dry_run or not fates:
         return
     snapshot = load_state_locked(state_file)
     pending: dict[int, list[tuple[str, dict[str, Any]]]] = {}
@@ -194,8 +198,7 @@ def report_stale_evidence(
         return
     for events in pending.values():
         for kind, payload in events:
-            log_event(
-                state_file,
+            write_gate.log_event(
                 kind,  # event-consumer: audit-only -- always ``worker_evidence_stale`` (the one kind ``stale_evidence_events`` builds); an operator-visibility warning that rule 1 ignored a leftover outcome, with no state mutation keyed off it
                 payload,
                 level="warning",
@@ -210,4 +213,4 @@ def report_stale_evidence(
             for fate in fates[issue_number]:
                 already.update(stale_evidence_key(s) for s in fate.basis.stale)
             locked_entry["stale_evidence_reported"] = sorted(already)
-        save_state(state_file, locked_state)
+        write_gate.save_state(locked_state)

@@ -1730,7 +1730,7 @@ def _detect_and_handle_orphaned_workers(
         on_fate=lambda fate: worker_fate.collect_fate(live_handoff_fates, fate),
     )
     # B6: reported before the early return below.
-    worker_fate.report_stale_evidence(state_file, live_handoff_fates, dry_run=write_gate.dry_run)
+    worker_fate.report_stale_evidence(state_file, live_handoff_fates, write_gate=write_gate)
 
     if not orphaned_issues and not stale_live_handoff_pids:
         return
@@ -2154,7 +2154,7 @@ def _detect_and_handle_orphaned_workers(
                 "ahead_error": ahead_error,
             }
 
-    worker_fate.report_stale_evidence(state_file, no_pr_stale_fates, dry_run=write_gate.dry_run)
+    worker_fate.report_stale_evidence(state_file, no_pr_stale_fates, write_gate=write_gate)
 
     # Issue #439: route dead workers with stuck pre-review PRs to rework before
     # the state-update sweep. PR views are fetched outside the state lock; the
@@ -2844,7 +2844,7 @@ def _detect_and_handle_orphaned_workers(
         )
         write_gate.save_state(state)
 
-    worker_fate.report_stale_evidence(state_file, swept_fates, dry_run=write_gate.dry_run)
+    worker_fate.report_stale_evidence(state_file, swept_fates, write_gate=write_gate)
 
     # Issue #1911: apply each recovered completed outcome through the #1877
     # seam, outside the lock (the helper does network I/O and takes

@@ -309,6 +309,12 @@ def test_throttle_failure_reads_throttle_kinds_off_carrying_variants_only() -> N
     assert throttle_failure(None) is None
 
 
+def _gate(state_file, *, dry_run: bool = False):
+    from charlie_work.write_gate import WriteGate
+
+    return WriteGate(dry_run=dry_run, state_path=state_file, repo="charlie-work")
+
+
 def test_report_stale_evidence_without_a_state_entry_emits_and_persists_nothing(
     tmp_path,
 ) -> None:
@@ -326,10 +332,12 @@ def test_report_stale_evidence_without_a_state_entry_emits_and_persists_nothing(
     )
     assert fate.basis.stale
 
-    report_stale_evidence(state_file, {}, dry_run=False)
+    report_stale_evidence(state_file, {}, write_gate=_gate(state_file))
     assert query_events(state_file, kind="worker_evidence_stale") == []
 
-    report_stale_evidence(state_file, {fate.basis.issue_number: [fate]}, dry_run=False)
+    report_stale_evidence(
+        state_file, {fate.basis.issue_number: [fate]}, write_gate=_gate(state_file)
+    )
 
     events = query_events(state_file, kind="worker_evidence_stale")
     assert len(events) == 1
@@ -341,7 +349,7 @@ def test_report_stale_evidence_without_a_state_entry_emits_and_persists_nothing(
 
 
 def test_report_stale_evidence_dry_run_writes_nothing(tmp_path) -> None:
-    """Review wf-r2-1 #2: ``dry_run`` is a required keyword and short-circuits
+    """Review wf-r2-1 #2: ``write_gate`` is a required keyword and, under dry-run, short-circuits
     every local write (events.db and the dedup marker)."""
     from charlie_work.instrumentation import query_events
     from charlie_work.state import load_state, save_state
@@ -355,7 +363,9 @@ def test_report_stale_evidence_dry_run_writes_nothing(tmp_path) -> None:
     state["issues"][str(fate.basis.issue_number)] = {"status": "dispatched"}
     save_state(state_file, state)
 
-    report_stale_evidence(state_file, {fate.basis.issue_number: [fate]}, dry_run=True)
+    report_stale_evidence(
+        state_file, {fate.basis.issue_number: [fate]}, write_gate=_gate(state_file, dry_run=True)
+    )
 
     assert query_events(state_file, kind="worker_evidence_stale") == []
     entry = load_state(state_file)["issues"][str(fate.basis.issue_number)]
@@ -390,7 +400,7 @@ def test_report_stale_evidence_merges_every_fate_for_an_issue(tmp_path) -> None:
     assert len(collected[with_live_head.basis.issue_number]) == 2
 
     state_file = tmp_path / "state.json"
-    report_stale_evidence(state_file, collected, dry_run=False)
+    report_stale_evidence(state_file, collected, write_gate=_gate(state_file))
 
     events = query_events(state_file, kind="worker_evidence_stale")
     assert len(events) == 1

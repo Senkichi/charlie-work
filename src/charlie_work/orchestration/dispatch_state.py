@@ -1799,7 +1799,7 @@ def _dispatch_impl(
         )
         _wf.save_state(self.paths.state_file, state)
     worker_fate.report_stale_evidence(
-        self.paths.state_file, phantom_fates, dry_run=self.write_gate.dry_run
+        self.paths.state_file, phantom_fates, write_gate=self.write_gate
     )
 
     result_dicts = [result.to_dict() for result in dispatch_results]
