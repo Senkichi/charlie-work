@@ -23,12 +23,10 @@ from .claude_code import (
 from .api_worker import launch_api_worker
 from .devin_shell import launch_devin_session
 from .checks import (
-    CheckSummary,
     summarize_checks,
 )
 from .config import (
     ApiWorkerConfig,
-    AutoMergeConfig,
     OrchestratorConfig,
     ReviewDispatchConfig,
 )
@@ -479,6 +477,16 @@ from .dead_worker_sweep.effects_rework import (  # noqa: F401  (deliberate re-ex
     _is_pr_updated_at_older_than,
     _is_pre_review_rework_candidate,
     _route_dead_worker_to_pre_review_rework,
+)
+from .merge_path.rules import (
+    REWORK_ALREADY_ROUTED_STATUSES as _REWORK_ALREADY_ROUTED_STATUSES,
+)
+from .merge_path.rules import (
+    format_merge_attempt_alarm_message as _format_merge_attempt_alarm_message,
+)
+from .merge_path.rules import is_pending_only as _is_pending_only
+from .merge_path.rules import (  # noqa: F401  (deliberate re-export)
+    is_readiness_no_ci_stall as _is_readiness_no_ci_stall,
 )
 from .dead_worker_sweep.effects_pr import (  # noqa: F401  (deliberate re-export)
     _safe_repo_slug,
@@ -1073,22 +1081,6 @@ def _summary_is_vacuous(summary: str) -> bool:
     """
     stripped = summary.strip()
     return not stripped or stripped == LEGACY_VACUOUS_SUMMARY
-
-
-# Statuses that mean an issue already has a rework routed (or an equivalent
-# gate) in flight, or is otherwise spoken for -- shared by every "should I
-# route this PR to rework_requested" check so they cannot drift apart.
-# Originally the cross-PR-revert gate in ``merge_ready`` (below); issue #784
-# AC-8 Case 2 reuses it verbatim for ``review_queue``'s stranded-verdict
-# check rather than inventing a second list.
-_REWORK_ALREADY_ROUTED_STATUSES = (
-    "escalated",
-    "blocked",
-    "dispatched",
-    "dispatch_pending",
-    "manifest_written",
-    "rework_requested",
-)
 
 
 def _janitor_section(warnings: tuple[str, ...]) -> str:
@@ -2175,35 +2167,6 @@ def _truncate_for_event(text: str, max_bytes: int = _EVENT_TEXT_MAX_BYTES) -> st
     return encoded[:keep].decode("utf-8", errors="ignore") + _EVENT_TRUNCATE_MARKER
 
 
-def _is_readiness_no_ci_stall(
-    pr: dict[str, Any],
-    checks: list[dict[str, Any]],
-    config: AutoMergeConfig,
-    now: datetime,
-) -> bool:
-    """Detect an approved PR whose required checks have never started.
-
-    Returns True when:
-      * ``pr_checks`` returned a parseable (non-None) list;
-      * none of the configured ``required_checks`` appear in that list;
-      * the PR's ``updatedAt`` is older than ``readiness_no_ci_minutes``.
-
-    The required check names come from ``config.required_checks``; no names are
-    hard-coded. ``updatedAt`` is the best available proxy for "head SHA pushed"
-    in the ``gh pr view`` JSON field list.
-    """
-    no_ci_minutes = config.readiness_no_ci_minutes
-    if no_ci_minutes <= 0:
-        return False
-    required = config.required_checks
-    if not required:
-        return False
-    seen = {str(check.get("name") or "") for check in checks}
-    if any(name in seen for name in required):
-        return False
-    return _is_pr_updated_at_older_than(pr, now, no_ci_minutes)
-
-
 def _build_attention_digest(
     state_file: Path,
     health_transitions: dict[int, dict[str, Any]],
@@ -2287,78 +2250,6 @@ def _build_attention_digest(
         repo=repo,
         transitions=tuple(entries),
     )
-
-
-def _is_pending_only(summary: CheckSummary) -> bool:
-    """Return True if the only reason the PR cannot merge is in-flight checks.
-
-    A summary whose only defect is pending checks is not a structural merge
-    failure; it should not arm the failed-attempt alarm.
-    """
-    return (
-        bool(summary.pending)
-        and not summary.failed
-        and not summary.missing
-        and not summary.infra_failed
-        and not summary.infra_blocked
-        and not summary.unavailable
-    )
-
-
-def _format_merge_attempt_alarm_message(
-    pr_number: int,
-    attempts: int,
-    summary: CheckSummary,
-    mergeable: str | None = None,
-    merge_state_status: str | None = None,
-) -> str:
-    """Human-readable alarm message for an approved PR that cannot merge.
-
-    The message is surfaced in pass warnings, the merge_failed_attempt_alarm
-    state event, and the notify digest terminal_reason.
-    """
-    buckets: list[str] = []
-    if summary.missing:
-        # Issue #253 signature: required checks missing while the PR is still open
-        buckets.append("required checks missing while GitHub shows the PR open")
-    if summary.pending:
-        buckets.append(f"pending: {', '.join(summary.pending)}")
-    if summary.failed:
-        buckets.append(f"failed: {', '.join(summary.failed)}")
-    if summary.infra_failed:
-        buckets.append(f"infra_failed: {', '.join(summary.infra_failed)}")
-    if summary.infra_blocked:
-        buckets.append(f"infra_blocked: {', '.join(summary.infra_blocked)}")
-    if summary.unavailable:
-        # gh reported no parseable check list at all (see summarize_checks'
-        # `checks is None` branch) — distinct from "all required checks
-        # passed", so it must not fall into the passed-but-unmergeable
-        # bucket below.
-        buckets.append(f"unavailable: {', '.join(summary.unavailable)}")
-    if not buckets:
-        # Issue #751: every check-summary bucket above is empty, which means
-        # the checks the bot tracks are not why this PR is stuck — GitHub's
-        # own mergeability signal is (a lagging/absent CONFLICTING reading, a
-        # BLOCKED merge state, branch protection, or a merge-base freshness
-        # result that isn't one of the explicitly modelled branches above).
-        # Surface what `pr_view` already fetched instead of discarding it;
-        # only fall back to the generic "unknown" text when GitHub hasn't
-        # reported anything usable either, so that case stays distinguishable.
-        norm_mergeable = str(mergeable or "").upper()
-        norm_merge_state = str(merge_state_status or "").upper()
-        known_mergeable = bool(norm_mergeable) and norm_mergeable != "UNKNOWN"
-        known_merge_state = bool(norm_merge_state) and norm_merge_state != "UNKNOWN"
-        if known_mergeable or known_merge_state:
-            buckets.append(
-                f"mergeable={norm_mergeable or 'UNKNOWN'}, "
-                f"mergeStateStatus={norm_merge_state or 'UNKNOWN'}, "
-                "all required checks passed"
-            )
-        else:
-            buckets.append("check summary unknown")
-    checks_str = "; ".join(buckets)
-    pass_str = "pass" if attempts == 1 else "passes"
-    return f"PR #{pr_number} approved but unmergeable for {attempts} {pass_str}: {checks_str}"
 
 
 def _format_stale_base_alarm_message(pr_number: int, attempts: int, reason: str) -> str:
