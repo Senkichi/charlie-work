@@ -46,6 +46,10 @@ def _route_rework_candidate_to_review(
     re-failing on the new head), which already reconciles the issue's
     status and ``reviewed_head_sha`` — that path returns ``ok=True`` but
     must not be re-flipped here either, so both checks are required.
+    ``review()``'s other ``ok=True`` no-packet returns —
+    ``routed_to_rework``, ``closed_unmerged_converged``, and the #2051
+    ``escalation_deferred_live_worker`` deferral — are each excluded
+    from the flip individually below.
 
     When ``routed`` is False, the issue's status is left untouched
     (``rework_requested``), so the next dispatch_rework pass naturally
@@ -94,6 +98,17 @@ def _route_rework_candidate_to_review(
     # rework_requested and the existing closed-unmerged issue-side
     # handling (closed_unmerged_pr_active_labels) finalizes it.
     closed_unmerged_converged = bool(review_result.data.get("closed_unmerged_converged"))
+    # Issue #2051: the janitor cap router returns ok=True with
+    # ``escalation_deferred_live_worker`` when it DEFERRED the cap
+    # escalation because a live worker still holds the issue. That
+    # outcome is neither a fresh packet nor a routing -- the live worker
+    # may still be committing to the PR -- so it must not flip the issue
+    # to "reviewing" either. The marker/event were already recorded
+    # inside review(); the issue stays rework_requested and the cap is
+    # re-evaluated next pass.
+    escalation_deferred_live_worker = bool(
+        review_result.data.get("escalation_deferred_live_worker")
+    )
     with _wf.state_lock(self.paths.state_file):
         state = _wf.load_state(self.paths.state_file)
         pr_state = state["prs"].get(str(pr_number), {})
@@ -103,6 +118,7 @@ def _route_rework_candidate_to_review(
             review_result.ok
             and not routed_to_rework
             and not closed_unmerged_converged
+            and not escalation_deferred_live_worker
             and decision_unchanged
             and isinstance(entry, dict)
             and entry.get("status") == "rework_requested"

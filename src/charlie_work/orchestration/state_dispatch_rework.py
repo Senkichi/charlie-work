@@ -319,7 +319,14 @@ def _dispatch_rework_impl(
         # candidate whose issue is held by a live worker would defer, not
         # escalate -- report it that way instead of misreporting an
         # escalation that will not happen. Read-only: no marker/event write.
-        dry_live_worker_deferrals = _wf._live_worker_cap_escalation_deferrals(
+        (
+            (
+                dry_no_op_rework_escalated,
+                dry_worker_death_escalated,
+                dry_blocked_environment_escalated,
+            ),
+            dry_live_worker_deferrals,
+        ) = _wf._filter_cap_escalation_lanes_for_live_workers(
             (
                 (dry_no_op_rework_escalated, "no_op_rework_cap_exceeded"),
                 (dry_worker_death_escalated, "worker_death_loop"),
@@ -330,16 +337,6 @@ def _dispatch_rework_impl(
             config=self.config,
             now=datetime.now(UTC),
         )
-        if dry_live_worker_deferrals:
-            dry_no_op_rework_escalated = [
-                n for n in dry_no_op_rework_escalated if n not in dry_live_worker_deferrals
-            ]
-            dry_worker_death_escalated = [
-                n for n in dry_worker_death_escalated if n not in dry_live_worker_deferrals
-            ]
-            dry_blocked_environment_escalated = [
-                n for n in dry_blocked_environment_escalated if n not in dry_live_worker_deferrals
-            ]
 
         # Apply only_issues filter and concurrency cap (read-only).
         # Issue #1014 (mirroring #1005 in the fresh-dispatch path): compute
@@ -735,29 +732,22 @@ def _dispatch_rework_impl(
     # lock; the marker/event write re-loads under the lock. A worker that
     # exits between probe and write defers once and escalates next pass
     # -- self-correcting, at worst one pass late.
-    live_worker_deferrals: dict[int, tuple[str, IssueWorkerLiveness]] = (
-        _wf._live_worker_cap_escalation_deferrals(
-            (
-                (no_op_rework_escalated, "no_op_rework_cap_exceeded"),
-                (worker_death_escalated, "worker_death_loop"),
-                (blocked_environment_escalated, "dispatch_blocked_environment"),
-            ),
-            issues=head_check_state.get("issues", {}),
-            sessions_dir=sessions_dir,
-            config=self.config,
-            now=datetime.now(UTC),
-        )
+    live_worker_deferrals: dict[int, tuple[str, IssueWorkerLiveness]]
+    (
+        (no_op_rework_escalated, worker_death_escalated, blocked_environment_escalated),
+        live_worker_deferrals,
+    ) = _wf._filter_cap_escalation_lanes_for_live_workers(
+        (
+            (no_op_rework_escalated, "no_op_rework_cap_exceeded"),
+            (worker_death_escalated, "worker_death_loop"),
+            (blocked_environment_escalated, "dispatch_blocked_environment"),
+        ),
+        issues=head_check_state.get("issues", {}),
+        sessions_dir=sessions_dir,
+        config=self.config,
+        now=datetime.now(UTC),
     )
     if live_worker_deferrals:
-        no_op_rework_escalated = [
-            n for n in no_op_rework_escalated if n not in live_worker_deferrals
-        ]
-        worker_death_escalated = [
-            n for n in worker_death_escalated if n not in live_worker_deferrals
-        ]
-        blocked_environment_escalated = [
-            n for n in blocked_environment_escalated if n not in live_worker_deferrals
-        ]
         _wf._record_cap_escalation_deferrals(live_worker_deferrals, write_gate=self.write_gate)
 
     # Escalate no-op rework issues that have exhausted the redispatch cap

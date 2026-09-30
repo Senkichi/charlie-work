@@ -175,6 +175,16 @@ def drain_orphaned_worker_review_routes(
         # the "reviewing" flip nor the transient-block drift fingerprint
         # below applies to a permanently-dead PR.
         closed_unmerged_converged = bool(review_result.data.get("closed_unmerged_converged"))
+        # Issue #2051: the janitor cap router returns ok=True with
+        # ``escalation_deferred_live_worker`` when it DEFERRED the cap
+        # escalation because a live worker still holds the issue -- no
+        # packet and no routing. Same treatment as routed_to_rework: it
+        # must not flip this issue to "reviewing", and the drain reports
+        # it as drift (not routed_to_review) below so the route can
+        # re-collect on a later pass.
+        escalation_deferred_live_worker = bool(
+            review_result.data.get("escalation_deferred_live_worker")
+        )
         with _wf.state_lock(state_file):
             state = _wf.load_state(state_file)
             pr_state = state["prs"].get(str(pr_number), {})
@@ -184,6 +194,7 @@ def drain_orphaned_worker_review_routes(
                 review_result.ok
                 and not routed_to_rework
                 and not closed_unmerged_converged
+                and not escalation_deferred_live_worker
                 and decision_unchanged
                 and isinstance(entry, dict)
                 and entry.get("status") == "dispatched"
@@ -252,7 +263,7 @@ def drain_orphaned_worker_review_routes(
                 state = write_gate.append_event(
                     state,
                     "orphaned_worker_routed_to_review"
-                    if review_result.ok
+                    if review_result.ok and not escalation_deferred_live_worker
                     else "orphaned_worker_drift",
                     {
                         "issue_number": issue_number,

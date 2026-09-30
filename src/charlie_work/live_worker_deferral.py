@@ -18,6 +18,10 @@ This module is the shared decision+recording layer both call sites use:
   at the escalation decision than at the operator re-arm door. The probe
   touches the filesystem (sidecars, sessions.db) and the process table, so
   callers run it OUTSIDE ``state_lock``.
+- ``_filter_cap_escalation_lanes_for_live_workers`` is the call-site
+  helper both ``_dispatch_rework_impl`` paths (dry-run partition and live
+  escalation) share: probe every lane once, return each lane's list minus
+  its deferred issues plus the deferral map.
 - ``_defer_cap_escalation_for_live_worker`` writes the per-issue deferral
   marker + ``escalation_deferred_live_worker`` event against already-loaded
   state (the caller holds the lock).
@@ -101,6 +105,44 @@ def _live_worker_cap_escalation_deferrals(
             if verdict.live:
                 deferrals[issue_number] = (reason, verdict)
     return deferrals
+
+
+def _filter_cap_escalation_lanes_for_live_workers(
+    lanes: Iterable[tuple[Iterable[int], str]],
+    *,
+    issues: Mapping[str, Any],
+    sessions_dir: Path,
+    config: OrchestratorConfig,
+    now: datetime,
+) -> tuple[list[list[int]], dict[int, tuple[str, IssueWorkerLiveness]]]:
+    """Probe every cap lane once and return each lane minus its deferrals.
+
+    Issue #2051 call-site helper for ``_dispatch_rework_impl``: the dry-run
+    partition and the live escalation path run the identical three-lane
+    probe+filter, so the shape lives here once instead of being spelled
+    out twice in the over-ratchet call-site file. Returns
+    ``(filtered_lanes, deferrals)``: ``filtered_lanes`` mirrors the input
+    lane order with every deferred issue dropped, and ``deferrals`` is the
+    ``_live_worker_cap_escalation_deferrals`` result for the caller to
+    report (the dry-run partition) or persist (``_record_cap_escalation_
+    deferrals``).
+
+    Read-only, like the probe it wraps -- recording the deferral is the
+    caller's decision, so the dry-run partition can use this helper
+    without any writes.
+    """
+    lane_lists = [(list(lane), reason) for lane, reason in lanes]
+    deferrals = _live_worker_cap_escalation_deferrals(
+        lane_lists,
+        issues=issues,
+        sessions_dir=sessions_dir,
+        config=config,
+        now=now,
+    )
+    filtered = [
+        [number for number in lane if number not in deferrals] for lane, _reason in lane_lists
+    ]
+    return filtered, deferrals
 
 
 def _defer_cap_escalation_for_live_worker(
