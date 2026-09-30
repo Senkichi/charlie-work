@@ -474,7 +474,6 @@ from .dead_worker_reap import (  # noqa: F401  (deliberate re-export)
     _emit_session_failed_relabeled,
     _count_live_sessions,
     _detect_stalled_sessions,
-    _detect_and_handle_stalled_sessions,
     _worker_pid_alive,
     _orphan_head_fingerprint,
     _ZERO_ARTIFACT_ESCALATION_THRESHOLD,
@@ -497,6 +496,7 @@ from .dead_worker_reap import (  # noqa: F401  (deliberate re-export)
 )
 from .dead_worker_sweep import (  # noqa: F401  (deliberate re-export)
     run_orphan_sweep as _detect_and_handle_orphaned_workers,
+    run_stalled_sweep as _detect_and_handle_stalled_sessions,
 )
 from .iso_timestamp import parse_iso_timestamp as _parse_iso_timestamp
 

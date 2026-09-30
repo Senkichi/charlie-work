@@ -7,6 +7,7 @@ its requests and commits. Nothing in the orchestrator imports this package yet.
 from __future__ import annotations
 
 from .apply import run_orphan_sweep
+from .apply_stalled import run_stalled_sweep
 from .decide import PhaseOrderError, decide
 from .model import RepoFacts, SweepFacts, SweepPlan
 from .ports import SweepPorts, ports_from_workflow
@@ -20,4 +21,5 @@ __all__ = [
     "decide",
     "ports_from_workflow",
     "run_orphan_sweep",
+    "run_stalled_sweep",
 ]

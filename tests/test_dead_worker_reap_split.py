@@ -91,7 +91,6 @@ _MOVED_NAMES = (
     "_emit_session_failed_relabeled",
     "_count_live_sessions",
     "_detect_stalled_sessions",
-    "_detect_and_handle_stalled_sessions",
     "_worker_pid_alive",
     "_orphan_head_fingerprint",
     "_ZERO_ARTIFACT_ESCALATION_THRESHOLD",
@@ -134,8 +133,11 @@ _MOVED_NAMES = (
 # that total with the same +/-150 headroom.
 # Re-derived after merging #2006 and #1971: the merged module measures 2955
 # lines; the band is re-centered on that total with the same +/-150 headroom.
-_CAP_BAND_MIN = 2805
-_CAP_BAND_MAX = 3105
+# Re-derived under the dead-worker sweep rewrite (wave B, M8): the stalled-session
+# lane moved into ``dead_worker_sweep``, shrinking the module to 2504 lines; the
+# band is re-centered on that total with the same +/-150 headroom.
+_CAP_BAND_MIN = 2354
+_CAP_BAND_MAX = 2654
 
 
 # ---------------------------------------------------------------------------
@@ -312,7 +314,7 @@ def test_dead_worker_reap_module_actually_imports_cleanly() -> None:
     # "importlib didn't raise") by checking real symbols landed with the
     # expected shape.
     assert callable(module._is_startup_death)
-    assert callable(module._detect_and_handle_stalled_sessions)
+    assert callable(module._detect_stalled_sessions)
     assert isinstance(module.STARTUP_DEATH_THRESHOLD_SECONDS, int)
     assert isinstance(module._ZERO_ARTIFACT_ESCALATION_THRESHOLD, int)
 
@@ -337,7 +339,7 @@ def test_all_moved_names_are_reexported_by_identity() -> None:
 
     names = _module_level_defined_names(_MODULE_PATH)
     assert names, "AST derivation found zero module-level names -- derivation is broken"
-    assert len(names) == 27, f"expected 27 moved units, found {len(names)}: {sorted(names)}"
+    assert len(names) == 26, f"expected 26 moved units, found {len(names)}: {sorted(names)}"
     assert set(names) == set(_MOVED_NAMES), (
         f"AST-derived names {sorted(names)} do not match the expected moved set "
         f"{sorted(_MOVED_NAMES)}"
@@ -419,7 +421,7 @@ def test_module_defines_exactly_the_27_moved_symbols() -> None:
     assert names, "AST derivation found zero module-level names -- derivation is broken"
     assert set(names) == set(_MOVED_NAMES), (
         f"dead_worker_reap.py's top-level definitions are {sorted(names)}, expected "
-        f"exactly the 27 moved names {sorted(_MOVED_NAMES)}"
+        f"exactly the moved names {sorted(_MOVED_NAMES)}"
     )
 
 
@@ -465,6 +467,12 @@ def test_orphaned_workers_stays_in_workflow_and_resolves_moved_names_via_facade(
         if isinstance(node, ast.FunctionDef) and node.name == "_detect_and_handle_orphaned_workers"
     ]
     assert redefined == [], "workflow.py must re-export the sweep, never define it"
+
+    from charlie_work.dead_worker_sweep import run_stalled_sweep
+
+    assert workflow._detect_and_handle_stalled_sessions is run_stalled_sweep, (
+        "_detect_and_handle_stalled_sessions must be the dead_worker_sweep re-export"
+    )
 
     missing = [n for n in sorted(_MOVED_NAMES) if not hasattr(workflow, n)]
     assert missing == [], (

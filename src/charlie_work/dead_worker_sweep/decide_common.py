@@ -24,19 +24,24 @@ Flow = Generator[Any, Any, Any]
 _MISSING = object()
 
 
-def run_flow(gen: Flow, observed: Mapping[Any, Any]) -> tuple[Any, tuple[Any, ...], Any]:
+def run_flow(
+    gen: Flow,
+    observed: Mapping[Any, Any],
+    commit_types: tuple[type, ...] = COMMIT_TYPES,
+) -> tuple[Any, tuple[Any, ...], Any]:
     """Drive one phase flow against ``observed``.
 
     Commits are recorded (``None`` is sent back); a request already in
     ``observed`` has its result sent back; the first unobserved request ends
-    the round. Returns ``(return_value, commits, pending_request)``;
+    the round. ``commit_types`` names which yielded values are commits (the
+    stalled lane has its own set). Returns ``(return_value, commits, pending_request)``;
     ``pending_request`` is ``None`` when the flow ran to completion.
     """
     commits: list[Any] = []
     try:
         item = next(gen)
         while True:
-            if isinstance(item, COMMIT_TYPES):
+            if isinstance(item, commit_types):
                 commits.append(item)
                 item = gen.send(None)
             elif item in observed:
