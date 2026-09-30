@@ -37,7 +37,7 @@ from .process_chain import ancestor_chain_pids
 from .process_chain import ProcRow as _ProcRow  # noqa: F401 (deliberate re-export)
 from .process_chain import posix_process_ppid_snapshot as _posix_process_ppid_snapshot
 from .process_chain import win32_process_ppid_snapshot as _win32_process_ppid_snapshot
-from .subprocess_runner import run_captured
+from .subprocess_runner import command_failure_message, run_captured
 
 logger = logging.getLogger(__name__)
 
@@ -282,13 +282,18 @@ def _reap_enumerated_children(
     * alive but unverifiable (no fingerprint captured, or the start time can
       no longer be read) is *never* killed by bare pid — an unpinned kill can
       hit a stranger holding a recycled pid — and is logged instead.
-    * created before its alleged parent (``start <= root_start_time``) is a
-      stale-``ParentProcessId`` artifact of pid recycling, not a child:
-      Windows never reparents, so a real child always postdates its parent —
-      the #2057 ancestor-walk rule mirrored onto descendants. Refused and
-      logged. ``taskkill /T``'s own ppid matching may still have hit it; that
-      is outside this function's control, but this path never adds an
-      individual kill for it.
+    * (Windows only) created before its alleged parent
+      (``start <= root_start_time``) is a stale-``ParentProcessId`` artifact
+      of pid recycling, not a child: Windows never reparents, so a real child
+      always postdates its parent — the #2057 ancestor-walk rule mirrored
+      onto descendants. Refused and logged. ``taskkill /T``'s own ppid
+      matching may still have hit it; that is outside this function's
+      control, but this path never adds an individual kill for it. The check
+      is Windows-only because its premise is: on POSIX the kernel reparents
+      orphans, so a ppid read at enumeration is never stale, and /proc start
+      times are ~10 ms-tick-quantized on an estimated boot base — jitter can
+      place a real child's read a few ms before its root's, and refusing it
+      would strand the very survivor this function exists to reap.
     * listed in ``exempt_pids`` (the caller's self/ancestor guard, #1842) is
       refused identically: a stale ppid can name an ancestor, and killing it
       would fell this process's own subtree.
@@ -334,7 +339,7 @@ def _reap_enumerated_children(
         if not is_pid_alive(child, start):
             confirmed_dead.append(child)
             continue
-        if root_start is not None and start <= root_start:
+        if os.name == "nt" and root_start is not None and start <= root_start:
             logger.warning(
                 "kill_process_tree: enumerated 'child' %d of %d was created before its "
                 "parent (start %.3f <= %.3f); stale ParentProcessId on a recycled pid, "
@@ -354,17 +359,27 @@ def _reap_enumerated_children(
                 root_pid,
             )
             continue
+        # The direct kill's own failure detail rides into the survivor warning
+        # below -- a taskkill/os.kill that never landed is the difference
+        # between "kill was resisted" and "kill never happened", and only the
+        # latter is actionable from a bare "still alive" line.
+        kill_detail = ""
         try:
             if os.name == "nt":
-                run_captured(
-                    ["taskkill", "/T", "/F", "/PID", str(child)],
+                kill_command = ["taskkill", "/T", "/F", "/PID", str(child)]
+                kill_result = run_captured(
+                    kill_command,
                     cwd=Path.cwd(),
                     timeout_seconds=10,
                 )
+                if not kill_result.ok:
+                    kill_detail = "; direct kill failed: " + command_failure_message(
+                        kill_command, kill_result, "no diagnostic output"
+                    )
             else:
                 os.kill(child, signal.SIGKILL)
-        except Exception:
-            pass
+        except Exception as exc:
+            kill_detail = f"; direct kill raised {exc!r}"
         deadline = time.monotonic() + _CHILD_KILL_CONFIRM_SECONDS
         while time.monotonic() < deadline:
             if not is_pid_alive(child, start):
@@ -374,8 +389,9 @@ def _reap_enumerated_children(
         else:
             logger.warning(
                 "kill_process_tree: child %d of %d survived the tree kill and a direct "
-                "kill -- still alive",
+                "kill -- still alive%s",
                 child,
                 root_pid,
+                kill_detail,
             )
     return confirmed_dead
