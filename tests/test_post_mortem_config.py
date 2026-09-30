@@ -89,7 +89,10 @@ post_mortem:
   message_node_limit: "not-an-int"
 """
     )
-    with pytest.raises(ConfigError, match="must be an int"):
+    with pytest.raises(
+        ConfigError,
+        match=r"^post_mortem\.message_node_limit: expected int, got 'not-an-int' \(str\)$",
+    ):
         load_config(config_file)
 
 
@@ -104,7 +107,10 @@ post_mortem:
   signature_rules: "not-a-list"
 """
     )
-    with pytest.raises(ConfigError, match="must be a list"):
+    with pytest.raises(
+        ConfigError,
+        match=r"^post_mortem\.signature_rules: expected list of mappings, got 'not-a-list' \(str\)$",
+    ):
         load_config(config_file)
 
 
@@ -121,7 +127,10 @@ post_mortem:
       kind: "worker_blocked"
 """
     )
-    with pytest.raises(ConfigError, match="not a valid regex"):
+    with pytest.raises(
+        ConfigError,
+        match=r"^post_mortem\.signature_rules\[0\]\.pattern: expected valid regex, got '\[' \(unterminated character set at position 0\)$",
+    ):
         load_config(config_file)
 
 

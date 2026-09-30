@@ -1,9 +1,9 @@
-"""Scoped ``deescalation`` config-section parsing (issues #1314, #1477).
+"""Scoped ``deescalation`` config-section projection (issues #1314, #1477).
 
-``build_config_from_data`` deliberately parses ONLY the three keys below out
-of the ``deescalation`` section rather than routing the whole section through
-``_build_section``: the section was previously 100% inert (never passed into
-``OrchestratorConfig`` -- always defaulted), so full-section parsing would
+``build_config_from_data`` deliberately validates ONLY the keys ``DeescalationConfig``
+annotates with rules out of the ``deescalation`` section rather than routing the whole
+section through ``validate_section``: the section was previously 100% inert (never
+passed into ``OrchestratorConfig`` -- always defaulted), so full-section parsing would
 silently (a) hard-reject unknown keys for any live config that already has a
 ``deescalation:`` block with extra/typo'd keys (self-deploy-brick risk) and
 (b) flip ``enabled`` / ``interval_minutes`` defaults for configs that set
@@ -12,12 +12,14 @@ separate, explicitly-reviewed change with operator notification; unknown keys
 and pre-existing ``enabled``/``interval_minutes`` overrides are silently
 ignored, same as before #1314.
 
-Extracted from ``config.py`` (file-size ratchet, #1442) so the over-cap
-monolith gains only a call site; ``config.py`` imports the helper back so the
-facade surface is unchanged. The error messages are byte-identical to the
-inline versions they replaced --
-``tests/test_issue_1314_operator_queue_followups.py`` pins them (including
-the ``operator_queue_depth_threshold`` unit parenthetical from #1768).
+The scope is derived, not listed: a ``DeescalationConfig`` field is in scope
+exactly when it carries field metadata (``Annotated[..., Typed, ...]``), so
+widening the activated surface is an explicit, reviewable annotation on the
+field and never a second list to keep in sync.
+
+Extracted from ``config.py`` (file-size ratchet, #1442).
+``tests/test_issue_1314_operator_queue_followups.py`` pins the behaviour
+(including the ``operator_queue_depth_threshold`` unit note from #1768).
 """
 
 from __future__ import annotations
@@ -25,55 +27,14 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
+from .config_validation import field_specs
 
-def _deescalation_nonneg_int(
-    data: Mapping[str, Any], key: str, *, qualifier: str = ""
-) -> int | None:
-    """Validate one optional non-negative-int knob in the ``deescalation`` section.
 
-    Returns the value (or ``None`` when absent, which callers translate into
-    "keep the dataclass default"). ``qualifier`` is the extra clause spliced
-    between the key name and the predicate in the error message -- used by
-    ``operator_queue_depth_threshold`` to name the unit it counts (#1768).
-    ``ConfigError`` is imported lazily to avoid a circular import
-    (``config.py`` imports this module; this module needs ``ConfigError``
-    from ``config.py``) -- the same pattern
-    ``capacity_starvation_escalation.parse_runner_capacity_escalation`` uses.
+def project_scoped_keys(cls: type, section_data: Mapping[str, Any]) -> dict[str, Any]:
+    """The subset of ``section_data`` naming a field of ``cls`` that carries metadata.
+
+    Everything else in the raw section (unknown keys, un-annotated knobs) is
+    dropped, which is what keeps the pre-#1314 "silently ignored" contract.
     """
-    from .config import ConfigError
-
-    value = data.get(key)
-    prefix = f"config section 'deescalation' key '{key}' {qualifier}"
-    if value is not None and (isinstance(value, bool) or not isinstance(value, int)):
-        raise ConfigError(f"{prefix}must be an int, got {type(value).__name__}")
-    if value is not None and value < 0:
-        raise ConfigError(f"{prefix}must be >= 0, got {value}")
-    return value
-
-
-def parse_deescalation_overrides(deescalation_data: Mapping[str, Any]) -> dict[str, Any]:
-    """Validate the scoped ``deescalation`` knobs and return dataclass overrides.
-
-    The returned dict is spliced into ``DeescalationConfig(**...)`` by
-    ``build_config_from_data``: only keys the operator actually set appear,
-    so every other field keeps its dataclass default.
-    """
-    oqr_interval = _deescalation_nonneg_int(
-        deescalation_data, "operator_queue_review_interval_minutes"
-    )
-    oq_threshold = _deescalation_nonneg_int(
-        deescalation_data,
-        "operator_queue_depth_threshold",
-        qualifier="(blocked-ready-issue count, not root-issue count -- see issue #1768) ",
-    )
-    irr_window = _deescalation_nonneg_int(
-        deescalation_data, "identical_reason_recurrence_window_minutes"
-    )
-    overrides: dict[str, Any] = {}
-    if oqr_interval is not None:
-        overrides["operator_queue_review_interval_minutes"] = oqr_interval
-    if oq_threshold is not None:
-        overrides["operator_queue_depth_threshold"] = oq_threshold
-    if irr_window is not None:
-        overrides["identical_reason_recurrence_window_minutes"] = irr_window
-    return overrides
+    scoped = {spec.name for spec in field_specs(cls) if spec.markers}
+    return {k: v for k, v in section_data.items() if k in scoped}

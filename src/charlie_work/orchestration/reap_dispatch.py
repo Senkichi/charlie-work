@@ -37,7 +37,8 @@ from charlie_work.janitor import JanitorVerdict
 from charlie_work.safe_ref import require_valid_sha
 from charlie_work.state import StateLockBusy
 from charlie_work.worker_launch_gate import acquire_fleet_launch_lock
-from charlie_work.dead_worker_reap import _is_pr_updated_at_older_than, _safe_repo_slug
+from charlie_work.dead_worker_sweep.effects_pr import _safe_repo_slug
+from charlie_work.dead_worker_sweep.effects_rework import _is_pr_updated_at_older_than
 
 
 def _detect_ci_absence(

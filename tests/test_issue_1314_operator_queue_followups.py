@@ -1471,7 +1471,7 @@ def test_deescalation_config_tolerates_unknown_keys(tmp_path: Path) -> None:
     """Unknown keys in the ``deescalation`` section must NOT brick startup.
     Before this PR the section was never parsed (always defaulted), so a live
     config may already carry a ``deescalation:`` block with typo'd or
-    extra keys. Full-section parsing via ``_build_section`` would
+    extra keys. Full-section parsing via ``validate_section`` would
     hard-reject those; this PR scopes to the two new fields only, so unknown
     keys are silently ignored."""
     from charlie_work.config import build_config_from_data

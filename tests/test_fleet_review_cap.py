@@ -69,13 +69,17 @@ def test_config_accepts_explicit_zero() -> None:
 
 
 def test_config_rejects_negative() -> None:
-    with pytest.raises(ConfigError, match="global_max_concurrent_reviews.*non-negative int"):
+    with pytest.raises(
+        ConfigError, match=r"^fleet\.global_max_concurrent_reviews: expected >= 0, got -1$"
+    ):
         build_config_from_data({"fleet": {"global_max_concurrent_reviews": -1}})
 
 
 @pytest.mark.parametrize("bad", ["3", 1.5, True, [2]])
 def test_config_rejects_non_int(bad: Any) -> None:
-    with pytest.raises(ConfigError, match="global_max_concurrent_reviews.*non-negative int"):
+    with pytest.raises(
+        ConfigError, match=r"^fleet\.global_max_concurrent_reviews: expected int, got "
+    ):
         build_config_from_data({"fleet": {"global_max_concurrent_reviews": bad}})
 
 

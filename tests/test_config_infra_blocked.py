@@ -52,7 +52,10 @@ def test_load_config_infra_blocked_rejects_non_mapping(tmp_path: Path) -> None:
         config_file,
         "auto_merge:\n  required_checks: [Tests passed]\n  infra_blocked: not-a-map\n",
     )
-    with pytest.raises(ConfigError, match="infra_blocked.*must be a mapping"):
+    with pytest.raises(
+        ConfigError,
+        match=r"^auto_merge\.infra_blocked: expected mapping, got 'not-a-map' \(str\)$",
+    ):
         load_config(config_file)
 
 
@@ -62,7 +65,10 @@ def test_load_config_infra_blocked_rejects_unknown_key(tmp_path: Path) -> None:
         config_file,
         _IB_HEADER + "    bogus_key: 1\n",
     )
-    with pytest.raises(ConfigError, match="infra_blocked.*has unknown key"):
+    with pytest.raises(
+        ConfigError,
+        match=r"^auto_merge\.infra_blocked: expected known keys \(valid: annotation_patterns, enabled, escalation_window_minutes, instant_fail_seconds, persistence_passe",
+    ):
         load_config(config_file)
 
 
@@ -74,7 +80,10 @@ def test_load_config_infra_blocked_annotation_patterns_rejects_non_list(
         config_file,
         _IB_HEADER + "    annotation_patterns: billing-exhausted\n",
     )
-    with pytest.raises(ConfigError, match="annotation_patterns.*must be a list of strings"):
+    with pytest.raises(
+        ConfigError,
+        match=r"^auto_merge\.infra_blocked\.annotation_patterns: expected list, got 'billing-exhausted' \(str\)$",
+    ):
         load_config(config_file)
 
 
@@ -86,7 +95,10 @@ def test_load_config_infra_blocked_instant_fail_seconds_rejects_non_int(
         config_file,
         _IB_HEADER + "    instant_fail_seconds: ten\n",
     )
-    with pytest.raises(ConfigError, match="instant_fail_seconds.*must be an int"):
+    with pytest.raises(
+        ConfigError,
+        match=r"^auto_merge\.infra_blocked\.instant_fail_seconds: expected int, got 'ten' \(str\)$",
+    ):
         load_config(config_file)
 
 
@@ -100,7 +112,10 @@ def test_load_config_infra_blocked_instant_fail_seconds_rejects_bool(
         config_file,
         _IB_HEADER + "    instant_fail_seconds: true\n",
     )
-    with pytest.raises(ConfigError, match="instant_fail_seconds.*must be an int"):
+    with pytest.raises(
+        ConfigError,
+        match=r"^auto_merge\.infra_blocked\.instant_fail_seconds: expected int, got True \(bool\)$",
+    ):
         load_config(config_file)
 
 
@@ -112,7 +127,10 @@ def test_load_config_infra_blocked_instant_fail_seconds_rejects_negative(
         config_file,
         _IB_HEADER + "    instant_fail_seconds: -1\n",
     )
-    with pytest.raises(ConfigError, match="instant_fail_seconds.*must be >= 0"):
+    with pytest.raises(
+        ConfigError,
+        match=r"^auto_merge\.infra_blocked\.instant_fail_seconds: expected >= 0, got -1$",
+    ):
         load_config(config_file)
 
 
@@ -124,7 +142,10 @@ def test_load_config_infra_blocked_persistence_passes_rejects_non_int(
         config_file,
         _IB_HEADER + "    persistence_passes: three\n",
     )
-    with pytest.raises(ConfigError, match="persistence_passes.*must be an int"):
+    with pytest.raises(
+        ConfigError,
+        match=r"^auto_merge\.infra_blocked\.persistence_passes: expected int, got 'three' \(str\)$",
+    ):
         load_config(config_file)
 
 
@@ -136,7 +157,10 @@ def test_load_config_infra_blocked_persistence_passes_rejects_bool(
         config_file,
         _IB_HEADER + "    persistence_passes: false\n",
     )
-    with pytest.raises(ConfigError, match="persistence_passes.*must be an int"):
+    with pytest.raises(
+        ConfigError,
+        match=r"^auto_merge\.infra_blocked\.persistence_passes: expected int, got False \(bool\)$",
+    ):
         load_config(config_file)
 
 
@@ -148,7 +172,10 @@ def test_load_config_infra_blocked_persistence_passes_rejects_negative(
         config_file,
         _IB_HEADER + "    persistence_passes: -2\n",
     )
-    with pytest.raises(ConfigError, match="persistence_passes.*must be >= 0"):
+    with pytest.raises(
+        ConfigError,
+        match=r"^auto_merge\.infra_blocked\.persistence_passes: expected >= 0, got -2$",
+    ):
         load_config(config_file)
 
 
@@ -160,7 +187,10 @@ def test_load_config_infra_blocked_escalation_window_minutes_rejects_non_int(
         config_file,
         _IB_HEADER + "    escalation_window_minutes: 1h\n",
     )
-    with pytest.raises(ConfigError, match="escalation_window_minutes.*must be an int"):
+    with pytest.raises(
+        ConfigError,
+        match=r"^auto_merge\.infra_blocked\.escalation_window_minutes: expected int, got '1h' \(str\)$",
+    ):
         load_config(config_file)
 
 
@@ -172,7 +202,10 @@ def test_load_config_infra_blocked_escalation_window_minutes_rejects_bool(
         config_file,
         _IB_HEADER + "    escalation_window_minutes: true\n",
     )
-    with pytest.raises(ConfigError, match="escalation_window_minutes.*must be an int"):
+    with pytest.raises(
+        ConfigError,
+        match=r"^auto_merge\.infra_blocked\.escalation_window_minutes: expected int, got True \(bool\)$",
+    ):
         load_config(config_file)
 
 
@@ -184,7 +217,10 @@ def test_load_config_infra_blocked_escalation_window_minutes_rejects_negative(
         config_file,
         _IB_HEADER + "    escalation_window_minutes: -5\n",
     )
-    with pytest.raises(ConfigError, match="escalation_window_minutes.*must be >= 0"):
+    with pytest.raises(
+        ConfigError,
+        match=r"^auto_merge\.infra_blocked\.escalation_window_minutes: expected >= 0, got -5$",
+    ):
         load_config(config_file)
 
 
@@ -194,5 +230,8 @@ def test_load_config_infra_blocked_enabled_rejects_non_bool(tmp_path: Path) -> N
         config_file,
         _IB_HEADER + "    enabled: yes-please\n",
     )
-    with pytest.raises(ConfigError, match="infra_blocked.enabled.*must be a bool"):
+    with pytest.raises(
+        ConfigError,
+        match=r"^auto_merge\.infra_blocked\.enabled: expected bool, got 'yes-please' \(str\)$",
+    ):
         load_config(config_file)

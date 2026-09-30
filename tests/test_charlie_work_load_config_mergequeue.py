@@ -27,7 +27,9 @@ auto_merge:
   mergequeue_label: 123
 """
     )
-    with pytest.raises(ConfigError, match="mergequeue_label.*must be a string"):
+    with pytest.raises(
+        ConfigError, match=r"^auto_merge\.mergequeue_label: expected string, got 123 \(int\)$"
+    ):
         load_config(config_file)
 
 
@@ -41,7 +43,9 @@ auto_merge:
   mergequeue_label: "   "
 """
     )
-    with pytest.raises(ConfigError, match="mergequeue_label.*must not be empty"):
+    with pytest.raises(
+        ConfigError, match=r"^auto_merge\.mergequeue_label: expected non-empty string, got '   '$"
+    ):
         load_config(config_file)
 
 
@@ -93,7 +97,9 @@ auto_merge:
   mergequeue_wedge_hours: -1
 """
     )
-    with pytest.raises(ConfigError, match="must not be negative"):
+    with pytest.raises(
+        ConfigError, match=r"^auto_merge\.mergequeue_wedge_hours: expected >= 0, got -1$"
+    ):
         load_config(config_file)
 
 
@@ -105,7 +111,10 @@ auto_merge:
   mergequeue_wedge_hours: "soon"
 """
     )
-    with pytest.raises(ConfigError, match="must be a number"):
+    with pytest.raises(
+        ConfigError,
+        match=r"^auto_merge\.mergequeue_wedge_hours: expected number, got 'soon' \(str\)$",
+    ):
         load_config(config_file)
 
 
@@ -117,7 +126,9 @@ auto_merge:
   queue_bot_login: 123
 """
     )
-    with pytest.raises(ConfigError, match="queue_bot_login.*must be a string"):
+    with pytest.raises(
+        ConfigError, match=r"^auto_merge\.queue_bot_login: expected string, got 123 \(int\)$"
+    ):
         load_config(config_file)
 
 
@@ -129,7 +140,9 @@ auto_merge:
   queue_bot_login: "   "
 """
     )
-    with pytest.raises(ConfigError, match="queue_bot_login.*must not be empty"):
+    with pytest.raises(
+        ConfigError, match=r"^auto_merge\.queue_bot_login: expected non-empty string, got '   '$"
+    ):
         load_config(config_file)
 
 

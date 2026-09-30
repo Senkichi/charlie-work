@@ -3,7 +3,8 @@ from __future__ import annotations
 import logging
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from collections.abc import Callable
+from typing import Any, TypeVar
 
 import yaml
 
@@ -17,13 +18,17 @@ from .config import (
 )
 from . import layout
 from .config_deprecations import emit_deprecated_key_reads, repo_state_path
+from .config_validation import ConstructionError, host_wide_error, host_wide_sections
 from .fleet_paths import fleet_dir
 from .fleet_supervisor_config import (
-    FLEET_SUPERVISOR_SECTION,
     resolve_fleet_supervisor_layer,
 )
 
+from .paths import RepoNotFoundError
+
 logger = logging.getLogger(__name__)
+
+_T = TypeVar("_T")
 
 
 def config_layer_paths(
@@ -227,46 +232,22 @@ def load_layered_config(
         str(p) for p in (global_config_path if global_exists else None, repo_source) if p
     )
 
-    # ``runner_allocation`` is host-wide only (see RunnerAllocationConfig's
-    # docstring): three repos must not hold three opinions about how many jobs
-    # one machine can run. The merge below is section-by-section with the
-    # per-repo file winning per key, so without this rejection a per-repo
-    # ``orchestrator.config.yaml`` could silently override a host-wide knob --
-    # the exact confusion that made #590 expensive to diagnose. Reject the key
-    # outright so the invalid state is unrepresentable rather than merely
-    # unused (issue #600).
-    if "runner_allocation" in repo_data:
-        raise ConfigError(
-            "config section 'runner_allocation' is host-wide only and must not "
-            f"appear in a per-repo config ({repo_config_path}); declare it in "
-            "the global fleet layer (<fleet_dir>/config.yaml) instead"
-        )
-    # ``runner_capacity_escalation`` is the same shape of host-wide concern as
-    # ``runner_allocation``: it escalates a starvation condition measured across
-    # the whole host's budget, so a per-repo override would be three repos
-    # holding three opinions about one machine's capacity signal. Reject it for
-    # the same reason and with the same remedy (issue #763).
-    if "runner_capacity_escalation" in repo_data:
-        raise ConfigError(
-            "config section 'runner_capacity_escalation' is host-wide only and "
-            f"must not appear in a per-repo config ({repo_config_path}); declare "
-            "it in the global fleet layer (<fleet_dir>/config.yaml) instead"
-        )
-    # ``fleet_supervisor`` is the same shape of host-wide concern as
-    # ``runner_allocation`` (issue #1978): every knob on it belongs to the one
-    # cross-repo fleet supervisor daemon, so a per-repo
-    # ``orchestrator.config.yaml`` declaring the section would shadow the
-    # operator's global values -- reject it outright, same remedy. The legacy
-    # ``supervisor.<key>`` spellings stay legal here during the #1979
-    # migration window: the fold below lifts them into the repo layer's
-    # effective ``fleet_supervisor`` mapping, where they keep the ordinary
-    # repo-wins-per-key merge semantics.
-    if FLEET_SUPERVISOR_SECTION in repo_data:
-        raise ConfigError(
-            f"config section '{FLEET_SUPERVISOR_SECTION}' is host-wide only and "
-            f"must not appear in a per-repo config ({repo_config_path}); declare "
-            "it in the global fleet layer (<fleet_dir>/config.yaml) instead"
-        )
+    # Host-wide sections (declared with ``HostWideOnly`` on the ``OrchestratorConfig``
+    # field, never listed here): one physical machine / one fleet supervisor daemon, so
+    # three repos must not hold three opinions about it. The merge below is
+    # section-by-section with the per-repo file winning per key, so without this
+    # rejection a per-repo ``orchestrator.config.yaml`` could silently override a
+    # host-wide knob -- the exact confusion that made #590 expensive to diagnose. Reject
+    # the key outright so the invalid state is unrepresentable rather than merely unused
+    # (issues #600, #763, #1978). The legacy ``supervisor.<key>`` spellings of the moved
+    # fleet-supervisor knobs stay legal here during the #1979 migration window: the fold
+    # below lifts them into the repo layer's effective ``fleet_supervisor`` mapping,
+    # where they keep the ordinary repo-wins-per-key merge semantics.
+    for host_wide in sorted(host_wide_sections()):
+        if host_wide in repo_data:
+            raise host_wide_error(
+                host_wide, fleet_dir=global_config_path.parent, repo_path=repo_config_path
+            )
 
     # Issue #1978: resolve each layer's fleet_supervisor/supervisor pair
     # *before* merging. Adoption on the post-merge view cannot tell a
@@ -358,7 +339,7 @@ def load_layered_config(
             except Exception:  # noqa: BLE001 — deprecation telemetry must never break config load
                 logger.debug("config_key_deprecated_read emit failed for %s", repo_source)
         return merged
-    except ConfigError:
+    except ConfigError as exc:
         # A present-but-invalid global layer (e.g. an unknown key) makes
         # the merged load raise, and callers (fleet_dispatch) catch
         # ConfigError and skip the repo -- silently discarding a *valid*
@@ -369,6 +350,12 @@ def load_layered_config(
         # per-repo config to rescue, propagate the original error --
         # silently defaulting would itself reproduce the #623 shape.
         if not global_exists or not repo_data:
+            raise
+        # A section constructor's own rejection (ci_fleet's host-wide
+        # ``__post_init__`` rules, ``rescue.worker``) is the global layer's
+        # *host-wide* breakage. Discarding that layer would silently default
+        # every host-wide knob -- the #623 shape -- so it stays loud.
+        if isinstance(exc, ConstructionError):
             raise
         # Provenance is the per-repo file alone, deliberately: the global
         # layer was *discarded*, so listing it would claim a contribution
@@ -382,3 +369,45 @@ def load_layered_config(
             global_config_path,
         )
         return repo_only
+
+
+def load_fleet_global_config(
+    load: Callable[..., OrchestratorConfig],
+    cwd: Path,
+    *,
+    fleet_dir_override: str | None,
+    fallback: _T,
+    report: Callable[[Exception], None],
+) -> OrchestratorConfig | _T:
+    """Load the fleet entry points' global config: require the global layer, degrade softly.
+
+    The one place ``fleet supervise`` / ``fleet work`` / ``fleet bash-rats`` decide what a
+    failed global load means. A missing or invalid global layer is reported through
+    *report*, then the per-repo config is reloaded without the global requirement so it
+    survives (the #623 silent-disable shape); only if that also fails does the caller's
+    *fallback* apply.
+
+    A :class:`ConstructionError` is never degraded. It is a *host-wide* section's own
+    constructor rejecting the global layer (ci_fleet's ``__post_init__`` rules, design F1),
+    which main surfaced as a raw ``ValueError`` that these handlers did not catch, so the
+    process refused to start. Continuing on defaults would silently turn runner allocation
+    and the fleet caps off (#623 / #590). ``ConstructionError`` subclasses ``ConfigError``,
+    so it must be re-raised explicitly ahead of that catch.
+
+    *load* is the caller's own ``load_layered_config`` binding (injected, not imported here,
+    so the caller module remains the seam its tests patch). The per-repo call sites that
+    skip a repo on ``ConfigError`` (autoscale prologue, fleet status) stay as they are: they
+    are non-fatal per repo, and skipping one repo is not a host-wide fail-open.
+    """
+    try:
+        return load(cwd, None, fleet_dir_override=fleet_dir_override, require_global=True)
+    except ConstructionError:
+        raise
+    except (ConfigError, RepoNotFoundError) as exc:
+        report(exc)
+        try:
+            return load(cwd, None, fleet_dir_override=fleet_dir_override)
+        except ConstructionError:
+            raise
+        except (ConfigError, RepoNotFoundError):
+            return fallback

@@ -157,7 +157,8 @@ def test_fleet_supervisor_wrong_type_raises(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     with pytest.raises(
-        ConfigError, match="fleet_supervisor.*fleet_lane_concurrency.*must be an int"
+        ConfigError,
+        match=r"^fleet_supervisor\.fleet_lane_concurrency: expected int, got 'not-an-int' \(str\)$",
     ):
         load_config(config_file)
 
@@ -170,7 +171,7 @@ def test_fleet_supervisor_bool_key_rejects_non_bool(tmp_path: Path) -> None:
     )
     with pytest.raises(
         ConfigError,
-        match="fleet_supervisor.*self_deploy_pull_ci_fleet.*must be a bool",
+        match=r"^fleet_supervisor\.self_deploy_pull_ci_fleet: expected bool, got 'not-a-bool' \(str\)$",
     ):
         load_config(config_file)
 
@@ -198,7 +199,7 @@ def test_legacy_wrong_type_still_raises(tmp_path: Path) -> None:
     )
     with pytest.raises(
         ConfigError,
-        match="supervisor.*dependency_sync_starvation_seconds.*must be an int",
+        match=r"^supervisor\.dependency_sync_starvation_seconds: expected int, got 'not-an-int' \(str\)$",
     ):
         load_config(config_file)
 

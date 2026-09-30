@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import functools
-import json
 import logging
 import re
 from dataclasses import asdict, dataclass, field
@@ -9,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
+from . import role_selection
 from .adapters import (
     SessionDispatchResult,
     cleanup_stale_session_tmp_files,  # noqa: F401  (deliberate re-export; used by orchestration delegates via _wf.)
@@ -21,7 +21,6 @@ from .claude_code import (
     run_quota_probe,  # noqa: F401  (deliberate re-export; used by moved L01 b3 delegates via _wf.)
 )
 from .api_worker import launch_api_worker
-from .blocked_worker_escalation import escalatable_blocked_outcome
 from .devin_shell import launch_devin_session
 from .checks import (
     CheckSummary,
@@ -36,6 +35,7 @@ from .config import (
 from .harnesses import REVIEWER_HARNESSES
 from .worker_launch_gate import FleetLaunchLock
 from .review_fleet_gate import (
+    fleet_lock_held_result_data,
     fleet_review_lock,
     fleet_review_lock_deferral,
     read_fleet_review_cap,
@@ -43,18 +43,16 @@ from .review_fleet_gate import (
 from .fleet_registry import count_fleet_live_reviews, count_fleet_live_sessions, managed_repo_names  # noqa: F401  (deliberate re-export; count_fleet_live_sessions used by moved L06 delegates via _wf., count_fleet_live_reviews by review_fleet_gate via _wf.)
 from . import layout, status_snapshot  # noqa: F401  (deliberate re-export; layout reached via _wf.layout by orchestration/misc_reconcile.py)
 from .main_ci_reclaim import reclaim_superseded_main_ci_runs  # noqa: F401  (deliberate re-export; used by moved L01 b3 delegates via _wf.)
-from .notify import AttentionDigest, AttentionEntry, emit_digest
+from .notify import AttentionDigest, AttentionEntry, emit_digest, reviewer_quota_alert_digest
 from .rescue_review import (
     LEGACY_VACUOUS_SUMMARY,
     run_cross_family_review,  # noqa: F401  (deliberate re-export; patched on the workflow module in tests)
 )
-from .cross_repo_gate import cross_repo_scope_gate
 from .github import (
     GitHub,
     GitHubError,
     GitHubLike,
     GitHubRunResult,
-    build_branch_issue_validator,
     cancel_superseded_runs,
     detect_prose_only_dependencies,
     issue_numbers_mentioned_by_pr,  # noqa: F401  (deliberate re-export; used by moved L01 b3 delegates via _wf.)
@@ -95,11 +93,6 @@ from .janitor import (
 )
 from .diff_coverage_probe import StaticProbeVerdict, run_static_probe
 from .labels import TransitionOutcome, transition
-from .local_work_park import (
-    LocalParkResult,
-    park_backstop_due_local_orphans,
-    park_or_reclaim_local_orphan,
-)
 from .pass_deadline import pass_deadline_spent, pass_deadline_suspended
 from .paths import RuntimePaths, prompt_override_dirs, resolved_layout
 from .prompt_sections import section_variant_names
@@ -110,21 +103,22 @@ from .prompts import (
     unsupplied_placeholders,
 )
 from .review_decision import (
+    classify_verdict_void,
+    force_voided_event_payload,
     record_decision,
     review_decision,
 )
 from .worktree import (
     _reap_idle_foreign_writer,
+    remote_branch_ahead_count,  # noqa: F401  (deliberate re-export; dead_worker_sweep.ports resolves it here at call time)
+    remote_branch_head_sha,  # noqa: F401  (deliberate re-export; dead_worker_sweep.ports resolves it here at call time)
+    salvage_push_stranded_commits,  # noqa: F401  (deliberate re-export; dead_worker_sweep.ports resolves it here at call time)
+    worktree_head_sha,  # noqa: F401  (deliberate re-export; dead_worker_sweep.ports resolves it here at call time)
+    worktree_path_for_branch,  # noqa: F401  (deliberate re-export; reached via _wf. by orchestration/state_*.py)
     clean_worktrees,  # noqa: F401  (deliberate re-export; used by moved L01 b3 delegates via _wf.)
     read_worktree_marker,
-    read_worker_outcome,
-    remote_branch_ahead_count,
-    remote_branch_head_sha,
     remove_review_checkout,  # noqa: F401  (deliberate re-export; patched on the workflow module and reached via _wf. by orchestration/misc_review_verdicts.py)
     remove_worktree_marker,  # noqa: F401  (deliberate re-export; used by moved L01 b4 delegates via _wf.)
-    salvage_push_stranded_commits,
-    worktree_head_sha,
-    worktree_path_for_branch,
     write_worktree_marker,  # noqa: F401  (deliberate re-export; used by moved L01 b4 delegates via _wf.)
 )
 from . import state as _state
@@ -190,11 +184,10 @@ from .throttle_signatures import (
     parse_reset_clock_time,
 )
 from .process_utils import (
-    find_worker_terminal_status,
     is_pid_alive,  # noqa: F401  (deliberate re-export; used by moved L08 delegate via _wf.)
 )
-from . import markdown_guard, orphaned_worker_review_drain, orphaned_worker_sweep, rework_outcome
-from .write_gate import WriteGate, require_write_gate
+from . import markdown_guard
+from .write_gate import WriteGate
 
 # LOAD-BEARING RE-EXPORT — NOT AN UNUSED IMPORT. Do not delete; the `noqa`
 # below marks a deliberate re-export, not a lint concession.
@@ -459,24 +452,10 @@ from .queue_sync_coverage import (  # noqa: F401  (deliberate re-export)
 )
 
 
-# LOAD-BEARING RE-EXPORT — NOT AN UNUSED IMPORT. Do not delete; the `noqa`
-# below marks a deliberate re-export, not a lint concession.
-#
-# issue #1317 (spun off from #1283's A6 recon): the dead-worker/session-reap
-# free-function family (25 functions plus the two threshold constants below
-# -- see the module docstring for the full list, the deliberate
-# `_detect_and_handle_orphaned_workers` exclusion rationale, and the
-# disclosed call-graph judgment calls) now lives in
-# `charlie_work.dead_worker_reap`. Re-exported here, not re-declared, so
-# every existing `charlie_work.workflow.<name>` import and monkeypatch
-# target keeps resolving unchanged — the same pattern `config.py` uses for
-# `RunnerAllocationConfig` and this file's own `.dispatch_selection` /
-# `.escalation` / `.verdict_parsing` / `.rework_prompts` / `.ci_findings` /
-# `.backlog_reachability` / `.stalled_review_reap` blocks above.
-#
-# `_detect_and_handle_orphaned_workers` itself deliberately stays defined
-# below in this file -- see its docstring and issue #1317 for why.
-from .dead_worker_reap import (  # noqa: F401  (deliberate re-export)
+# LOAD-BEARING RE-EXPORT, NOT AN UNUSED IMPORT (issue #1317): the dead-worker
+# family lives in `charlie_work.dead_worker_sweep`; every `workflow.<name>` import
+# and monkeypatch target keeps resolving, as in the blocks above.
+from .dead_worker_sweep.effects_sessions import (  # noqa: F401  (deliberate re-export)
     STARTUP_DEATH_THRESHOLD_SECONDS,
     _is_startup_death,
     _worker_death_bounded_runtime_seconds,
@@ -484,36 +463,35 @@ from .dead_worker_reap import (  # noqa: F401  (deliberate re-export)
     _emit_session_failed_relabeled,
     _count_live_sessions,
     _detect_stalled_sessions,
-    _detect_and_handle_stalled_sessions,
     _worker_pid_alive,
     _orphan_head_fingerprint,
     _ZERO_ARTIFACT_ESCALATION_THRESHOLD,
     _is_zero_artifact_dispatch_loop,
     _sweep_orphan_processes_for_dead_sessions,
     _log_worker_census,
+    _issues_with_live_workers,
+)
+from .dead_worker_sweep.effects_rework import (  # noqa: F401  (deliberate re-export)
     _rework_pr_for_worker,
     _reap_restore_rework_requested,
     _is_pr_updated_at_older_than,
     _is_pre_review_rework_candidate,
     _route_dead_worker_to_pre_review_rework,
-    _classify_dead_sessions_and_update_throttle_state,
+)
+from .dead_worker_sweep.effects_pr import (  # noqa: F401  (deliberate re-export)
     _safe_repo_slug,
     _dispatching_repo_name,
     _open_salvage_pr,
     _salvage_already_landed,
     _attempt_salvage,
     _open_pr_for_orphaned_branch,
-    _issues_with_live_workers,
 )
-from .live_handoff_finalize import (
-    collect_stale_live_handoff_pids,
-    finalize_live_handoff_candidates,
-    partition_dispatched_by_pid_liveness,
-    resolve_live_handoff_candidates,
+from .dead_worker_sweep import (  # noqa: F401  (deliberate re-export)
+    classify_dead_sessions as _classify_dead_sessions_and_update_throttle_state,
+    run_orphan_sweep as _detect_and_handle_orphaned_workers,
+    run_stalled_sweep as _detect_and_handle_stalled_sessions,
 )
-from . import worker_fate
 from .iso_timestamp import parse_iso_timestamp as _parse_iso_timestamp
-from .no_pr_orphan_fate import resolve_no_pr_orphan_fate, resolve_pushed_orphan_fate
 
 
 def _diff_file_summary(diff: str) -> tuple[int, list[tuple[str, int, int]]]:
@@ -1662,1282 +1640,6 @@ def operator_queue_depth(state: dict[str, Any]) -> set[int]:
         if is_operator_queue_issue(entry) and str(num).isdigit():
             queued.add(int(num))
     return queued
-
-
-def _detect_and_handle_orphaned_workers(
-    sessions_dir: Path,
-    state_file: Path,
-    config: OrchestratorConfig,
-    gh: GitHubLike,
-    *,
-    write_gate: WriteGate,
-    review_callback: Callable[[int], Any] | None = None,
-    record_review_callback: Callable[..., Any] | None = None,
-    enrich_checks_callback: Callable[..., list[dict[str, Any]]] | None = None,
-    fleet_dir_override: str | None = None,
-) -> None:
-    """Detect and handle orphaned workers using state.json PID records.
-
-    This is a fallback for issue #207: when session sidecar files are orphaned
-    (e.g., by session-limit reset), the session-file-based stall-reaper cannot
-    detect dead workers. This function reads worker PIDs from state.json and
-    checks liveness directly, allowing recovery even without session files.
-
-    For issues with status "dispatched" and a recorded worker_pid:
-    - If the PID is dead, check the linked PR's last review decision
-    - If last decision was "request_changes" and head unchanged, reset to "rework_requested"
-    - If last decision was "request_changes" and head advanced, route to the
-      review-pending path by calling ``review_callback`` and then flipping the
-      issue status to "reviewing"
-    - If last decision was "approved" and the PR state carries
-      ``status="rework_requested"`` (evidence the post-approval rework lane
-      dispatched this worker) and head is unchanged since review, reset to
-      "rework_requested" -- same as the request_changes branch (issue #1109)
-    - Issue #1911: before either reset, when no terminal-status record exists
-      (``terminal_exit_code is None`` -- e.g. a session whose watcher never
-      ran, or one launched before every Popen-backed harness grew one), a fresh on-target
-      ``.worker-outcome.json`` in the worktree proves the dispatch completed;
-      its PR edits are applied through the #1877 outcome-apply path instead
-      of crediting a worker death. Issue #1915: once that apply lands, the
-      post-lock review_routes drain calls ``review_callback`` -- a fresh
-      packet flips the issue to "reviewing"; a blocked review returns it to
-      "rework_requested" (still without a death credit). With no review
-      callback the finding surfaces once as drift, as before.
-    - Otherwise, surface as drift for human triage (once per unchanged finding)
-    - Do NOT clear worker_pid from state.json after handling (issue #282: the
-      recovery path needs the fingerprint to verify the worktree is safe to reset).
-
-    Issue #417: for the no-open-PR case, this is the ONE lane that revisits a
-    dead session's GitHub labels independent of its sidecar file -- it is
-    keyed entirely off state.json (``status == "dispatched"`` + a dead
-    ``worker_pid``), so it runs every pass whether or not a sidecar exists.
-    ``_classify_dead_sessions_and_update_throttle_state``'s own no-open-PR
-    reclaim (the "issue #118" lane) is a single best-effort attempt per dead
-    session: if it is interrupted (process crash/reboot) between writing
-    ``redispatch_at`` and swapping the GitHub labels, or if the label API
-    calls themselves fail, the sidecar is already reaped and that lane has no
-    way to revisit the issue. This sweep closes that gap by re-deriving
-    "does this issue still need its labels fixed" from GitHub's *live* label
-    state every pass (not from any one-shot flag), so a half-finished reclaim
-    -- or one stranded before this fix ever existed -- gets completed here
-    without a human needing to notice.
-
-    Issue #1122: this sweep is NOT gated on ``watchdog.enabled``. The watchdog
-    flag controls log-mtime stall detection (``_detect_stalled_sessions`` /
-    ``_detect_and_handle_stalled_sessions``), which is unrelated to this
-    function's dead-pid state-keyed recovery. A deployment that disables
-    watchdog (e.g. to work around a shim log-mtime blindness) must not lose
-    the #935 pushed-branch salvage backstop, the #417 ground-truth label
-    reclaim, or the orphan drift diagnostics -- all of which are keyed off
-    state.json PID records, not log mtimes. Issue #1867: ``live_handoff_finalize.py``.
-    """
-    write_gate = require_write_gate(write_gate)
-
-    def _drift_fingerprint(**parts: Any) -> str:
-        """Stable fingerprint for an orphaned-worker drift finding."""
-        return json.dumps(parts, sort_keys=True, default=str)
-
-    with state_lock(state_file):
-        state = load_state(state_file)
-
-    orphaned_issues, live_pid_entries = partition_dispatched_by_pid_liveness(
-        state, worker_pid_alive=_worker_pid_alive
-    )
-    now = datetime.now(UTC)  # Issue #935/#1453: computed once, before any pre-lock loop.
-    repo_root = getattr(gh, "repo_root", None)
-    worktrees_dir = None
-    if repo_root is not None:
-        worktrees_dir = resolved_layout(config, repo_root).worktrees
-
-    live_handoff_fates: dict[int, list[worker_fate.WorkerFate]] = {}
-    stale_live_handoff_pids = collect_stale_live_handoff_pids(  # Issue #1867 round-2
-        live_pid_entries,
-        worker_outcome_finalize_minutes=config.watchdog.worker_outcome_finalize_minutes,
-        repo_root=repo_root,
-        worktrees_dir=worktrees_dir,
-        now=now,
-        sessions_dir=sessions_dir,
-        on_fate=lambda fate: worker_fate.collect_fate(live_handoff_fates, fate),
-    )
-    # B6: reported before the early return below.
-    worker_fate.report_stale_evidence(state_file, live_handoff_fates, write_gate=write_gate)
-
-    if not orphaned_issues and not stale_live_handoff_pids:
-        return
-
-    # Fetch PRs once before acquiring the lock (avoid network I/O under lock)
-    prs = gh.pr_list()
-    pr_by_issue: dict[int, dict[str, Any]] = {}
-    # Issue #1229: validate branch-name-derived issue numbers against the
-    # open-issue set so a stale branch name (e.g. agent/issue-709-… left over
-    # from a merged PR #709, reused by an unrelated issue-less PR) cannot bind
-    # the PR to a non-existent or closed issue here. Without this, a stale
-    # binding would populate pr_by_issue[<wrong n>] and either mask a real
-    # orphan's no-open-PR reclaim (the orphan is wrongly seen as "has a PR")
-    # or route the #417 ground-truth label reclaim at the wrong issue subject.
-    branch_validator = build_branch_issue_validator(gh)
-    for pr in prs:
-        linked = linked_issue_number(
-            pr,
-            is_cross_repository=pr.get("isCrossRepository"),
-            branch_prefix=config.dispatch.branch_prefix,
-            branch_issue_validator=branch_validator,
-        )
-        if linked is not None:
-            pr_by_issue[linked] = pr
-
-    # Issue #417: ground-truth label reclaim for the no-open-PR orphans, done
-    # OUTSIDE the state lock (network I/O) and with a single bulk issue-list
-    # call rather than one gh.issue_view per orphan -- this sweep's GitHub
-    # cost must stay bounded regardless of how many stale "dispatched" entries
-    # have accumulated in state.json over time.
-    no_pr_orphans = [n for n in orphaned_issues if n not in pr_by_issue]
-    reclaim_results: dict[int, dict[str, Any]] = {}
-    # Issue #1153: issues escalated to ``agent:human-needed`` by the
-    # zero-artifact dispatch loop guard, instead of being relabeled to
-    # ``automated-ready`` for another fruitless redispatch. Keyed by issue
-    # number; each value carries the label-write outcome and the attempt
-    # count that triggered the escalation.
-    zero_artifact_escalations: dict[int, dict[str, Any]] = {}
-    # Issue #1244: issues escalated to ``agent:human-needed`` by the
-    # cross-repo scope tripwire, instead of being relabeled to
-    # ``automated-ready`` for another fruitless redispatch.  A dead worker
-    # whose issue title names another managed repo hopped to that repo's
-    # worktree; redispatching repeats the hop forever.  Keyed by issue
-    # number; each value carries the label-write outcome and the scope
-    # gate's reason.
-    cross_repo_scope_escalations: dict[int, dict[str, Any]] = {}
-    # Issue #1453: issues escalated to the operator queue because the worker
-    # itself declared the task structurally impossible (a ``blocked`` outcome
-    # in ``.worker-outcome.json``).  The worker deliberately concluded it
-    # cannot do the task (e.g. cross-repo scope, missing dependency); without
-    # this channel the orphan sweep would redispatch to another worker that
-    # hits the identical wall, burning the full redispatch cap.  Keyed by
-    # issue number; each value carries the label-write outcome and the
-    # worker's ``reason_kind`` / ``detail`` so the operator queue entry is
-    # actionable without reading the worktree.
-    worker_declared_blocked_escalations: dict[int, dict[str, Any]] = {}
-    # Issue #1453: pre-computed worker outcomes for all no-PR orphans, read
-    # once before the first pre-lock loop so the blocked-outcome check can
-    # fire before reclaim adds ``automated-ready``.  Reused by the second
-    # loop (pushed-branch candidates) without re-reading.
-    worker_outcomes: dict[int, dict[str, Any] | None] = {}
-    # B3: per-orphan fate (``worker_outcomes`` derives from it); branch
-    # evidence is unknown here, so only rows 1 (blocked) and the throttle guard.
-    fates: dict[int, worker_fate.WorkerFate] = {}
-    # B6: every fate this lane resolves, reported once after the pushed loop.
-    no_pr_stale_fates: dict[int, list[worker_fate.WorkerFate]] = {}
-    issues_by_number: dict[int, dict[str, Any]] = {}  # also used by the live-handoff lane below
-    park_verdicts: dict[int, LocalParkResult] = {}  # Issue #1971 no-PR park lane
-    local_park_deferred: dict[int, str] = {}
-
-    if no_pr_orphans:
-        for issue in gh.issue_list(state="open"):
-            number = issue.get("number")
-            if number is not None:
-                issues_by_number[int(number)] = issue
-        # Issue #1244: pre-compute the fleet's managed repo names and the
-        # dispatching repo name once for the whole loop — the fleet registry
-        # is read from disk and gh.name_with_owner() is a network call.
-        sweep_repo_root = repo_root
-        sweep_fleet_repos = managed_repo_names(fleet_dir_override)
-        sweep_dispatching_repo_name = (
-            _dispatching_repo_name(gh, sweep_repo_root) if sweep_repo_root is not None else ""
-        )
-
-        # Issue #1453: pre-read worker outcomes for all no-PR orphans so the
-        # first loop (reclaim/escalation) can detect a ``blocked`` outcome
-        # BEFORE reclaiming (which would add ``automated-ready`` and trigger a
-        # fruitless redispatch). The durable terminal status is authoritative
-        # because it is written after the worker exits and survives worktree
-        # removal; the worktree file is the live fallback. Stored for the
-        # second loop to reuse without re-reading.
-        for issue_number in no_pr_orphans:
-            issue = issues_by_number.get(issue_number)
-            if issue is None:
-                continue
-            entry = state.get("issues", {}).get(str(issue_number), {})
-            branch = entry.get("branch_name") if isinstance(entry, dict) else None
-            if not branch:
-                branch = (
-                    f"{config.dispatch.branch_prefix}-{issue_number}-"
-                    f"{slugify(str(issue.get('title') or 'work'))}"
-                )
-            worktree_path = None
-            if repo_root is not None and worktrees_dir is not None:
-                worktree_path = worktree_path_for_branch(repo_root, branch, worktrees_dir)
-            # Rule 1/7: real evidence (not a pre-collapsed terminal-or-worktree
-            # outcome); the module's freshness step arbitrates the candidates.
-            fates[issue_number] = resolve_no_pr_orphan_fate(
-                issue_number=issue_number,
-                entry=entry,
-                terminal=find_worker_terminal_status(sessions_dir, issue_number),
-                worktree_path=worktree_path,
-                worktree_outcome_raw=(
-                    read_worker_outcome(worktree_path) if worktree_path is not None else None
-                ),
-                now=now,
-            )
-            resolved_outcome = fates[issue_number].basis.outcome
-            worker_outcomes[issue_number] = (
-                dict(resolved_outcome.raw) if resolved_outcome is not None else None
-            )
-            worker_fate.collect_fate(no_pr_stale_fates, fates[issue_number])
-
-        for issue_number in no_pr_orphans:
-            issue = issues_by_number.get(issue_number)
-            if issue is None:
-                # Issue not found in the open snapshot (closed, deleted, or
-                # inaccessible) -- nothing safe to reclaim; leave it to the
-                # existing diagnostic drift path below.
-                continue
-            issue_labels = label_names(issue)
-            active_labels = issue_labels & config.labels.active
-            # Gate the WHOLE reclaim on an active label actually being
-            # present, matching reconcile.py's issue_active_label_no_open_pr
-            # pattern (~536-580) so all three sites agree. An issue with no
-            # active label -- e.g. one carrying only a terminal label like
-            # agent:human-needed/agent:done -- has nothing here
-            # to reclaim. A prior `if not active_labels and not needs_ready`
-            # gate proceeded whenever EITHER half was false, which wrongly
-            # added `ready` back onto a terminal-only issue that also had a
-            # stale dispatched/dead-worker/no-PR state.json entry (already
-            # fully reconciled issues, or terminal-only ones, both correctly
-            # fall through here without any GitHub call).
-            if not active_labels:
-                continue
-
-            # Issue #1453: a worker that deliberately concluded it CANNOT do
-            # the task writes a ``blocked`` outcome in
-            # ``.worker-outcome.json`` instead of exiting PR-less with no
-            # signal.  Without this channel the orphan sweep classifies the
-            # dead worker as ``dead_worker_no_open_pr`` and redispatches --
-            # to another worker that hits the identical wall, burning the
-            # full redispatch cap.  The worker's own declaration is the most
-            # authoritative signal: check it FIRST, before the zero-artifact
-            # and cross-repo heuristic escalations, and route directly to the
-            # operator queue with zero redispatches.  The pre-lock label
-            # relabeling (remove active, add human-needed as fallback) mirrors
-            # the zero-artifact / cross-repo scope pattern; the post-lock
-            # ``reap_escalations`` transition applies the operator-queue
-            # label edge.
-            worker_outcome = worker_outcomes.get(issue_number)
-            # B3, rule 1: the blocked check reads the module's fate. The #2010
-            # permission-denial exemption is the shared gate
-            # ``escalatable_blocked_outcome`` (also used by the with-PR lane).
-            if (
-                isinstance(fates.get(issue_number), worker_fate.Blocked)
-                and escalatable_blocked_outcome(
-                    worker_outcome, sessions_dir=sessions_dir, issue_number=issue_number
-                )
-                is not None
-            ):
-                label_write_ok = _strip_active_and_flag_human_needed(
-                    gh, config, issue_number, active_labels, issue_labels
-                )
-                worker_declared_blocked_escalations[issue_number] = {
-                    "removed_labels": sorted(active_labels),
-                    "label_write_ok": label_write_ok,
-                    "reason_kind": str(worker_outcome.get("reason_kind") or "unknown"),
-                    "detail": str(worker_outcome.get("detail") or ""),
-                }
-                continue
-
-            # Issue #1153: before relabeling to ``automated-ready`` for
-            # another redispatch, check whether prior attempts all produced
-            # zero artifacts (``ahead_of_main == 0``). A repeated
-            # zero-artifact dispatch loop means each worker session ran,
-            # determined the fix belongs in a sibling repo, hopped to its
-            # worktree, did the work there, and exited with ``ahead_of_main:
-            # 0`` in *this* repo's tree -- swept as a dead worker with no
-            # open PR, relabeled, redispatched, forever. Escalate to
-            # ``agent:human-needed`` instead of burning another dispatch.
-            # Issue #1993: a throttle-classified death produced zero
-            # artifacts because the provider refused it, not because the
-            # work loops -- it must not trip this guard (2026-09-29: #1983
-            # escalated twice in 11 minutes on ``rate_limited`` deaths).
-            throttle_death = worker_fate.throttle_failure(fates.get(issue_number)) is not None
-            if not throttle_death and _is_zero_artifact_dispatch_loop(sessions_dir, issue_number):
-                label_write_ok = _strip_active_and_flag_human_needed(
-                    gh, config, issue_number, active_labels, issue_labels
-                )
-                zero_artifact_escalations[issue_number] = {
-                    "removed_labels": sorted(active_labels),
-                    "label_write_ok": label_write_ok,
-                }
-                continue
-
-            # Issue #1244: cross-repo scope tripwire. Before relabeling to
-            # ``automated-ready`` for another redispatch, check whether the
-            # issue's title names another managed repo in the fleet. A dead
-            # worker whose issue scope targets a sibling repo hopped to that
-            # repo's worktree; redispatching repeats the hop forever. Escalate
-            # to ``agent:human-needed`` instead of burning another dispatch.
-            # This is the transition tripwire (Option 2): catches issues
-            # dispatched before the intake-time scope gate (Option 1) existed.
-            scope_result = cross_repo_scope_gate(
-                str(issue.get("title") or ""),
-                str(issue.get("body") or ""),
-                sweep_dispatching_repo_name,
-                sweep_fleet_repos,
-            )
-            if not scope_result.passed:
-                label_write_ok = _strip_active_and_flag_human_needed(
-                    gh, config, issue_number, active_labels, issue_labels
-                )
-                cross_repo_scope_escalations[issue_number] = {
-                    "removed_labels": sorted(active_labels),
-                    "label_write_ok": label_write_ok,
-                    "reason": scope_result.reason,
-                }
-                continue
-
-            # Issue #1923: on a no-PR backend park the dead worker's
-            # committed branch for review instead of reclaiming it -- the
-            # gate contract lives in park_or_reclaim_local_orphan's
-            # docstring (local_work_park.py).
-            # Rule 3/9 sibling: park-vs-reclaim stays in local_work_park.py
-            # (pinned by ``test_flip3_*``).
-            if park_or_reclaim_local_orphan(
-                gh=gh,
-                config=config,
-                repo_root=repo_root,
-                worktrees_dir=worktrees_dir,
-                state=state,
-                issue_number=issue_number,
-                issue=issue,
-                active_labels=active_labels,
-                issue_labels=issue_labels,
-                state_file=state_file,
-                worker_outcome=worker_outcome,
-                write_gate=write_gate,
-                reclaim_results=reclaim_results,
-                park_verdicts=park_verdicts,
-                now=now,
-            ):
-                continue
-
-        # Issue #1971: pre-lock park drain for the #654 backstop below.
-        local_park_deferred = park_backstop_due_local_orphans(
-            gh=gh,
-            config=config,
-            repo_root=repo_root,
-            worktrees_dir=worktrees_dir,
-            state=state,
-            state_file=state_file,
-            no_pr_orphans=no_pr_orphans,
-            issues_by_number=issues_by_number,
-            worker_outcomes=worker_outcomes,
-            reclaim_results=reclaim_results,
-            escalations=(
-                worker_declared_blocked_escalations,
-                zero_artifact_escalations,
-                cross_repo_scope_escalations,
-            ),
-            park_verdicts=park_verdicts,
-            dead_dispatched_reap_minutes=config.watchdog.dead_dispatched_reap_minutes,
-            now=now,
-            write_gate=write_gate,
-        )
-
-    # Issue #935: for the no-open-PR orphans, determine whether the worker
-    # pushed a branch and reported push-succeeded-but-PR-failed. This is done
-    # outside the state lock because it can touch origin. The second lock below
-    # will use these pre-computed candidates to decide whether to open the PR
-    # itself instead of re-dispatching.
-    # ``repo_root`` / ``worktrees_dir`` were computed above, before the first
-    # pre-lock loop, so the blocked-outcome check could read worker outcomes.
-
-    # Issue #1248: salvage-push committed-but-unpushed work from dead workers'
-    # worktrees BEFORE anything below classifies them. A worker that finished
-    # its work locally but died at the final push produces zero remote delta,
-    # so every downstream branch -- request_changes auto-reset, the no-op
-    # rework detector, the #935 pushed-branch lane -- reads it as "did
-    # nothing" and redispatches (or caps out) on work that is already done.
-    # ``salvage_push_stranded_commits`` publishes the work only when it is a
-    # pure fast-forward of the remote tip (never force; diverged worktrees
-    # fall through to the existing ``dead_worker_unsafe_to_auto_reset``
-    # handling untouched). After a successful push the PR snapshot's
-    # ``headRefOid`` is refreshed so the in-lock classification sees the head
-    # advance and routes to review instead of counting a death, and the #935
-    # candidate detection below sees the branch on origin and opens a PR for
-    # it. Runs pre-lock: it is network I/O.
-    salvage_pushes: dict[int, dict[str, Any]] = {}
-    if repo_root is not None and worktrees_dir is not None:
-        for issue_number in orphaned_issues:
-            pr_data = pr_by_issue.get(issue_number)
-            if pr_data is not None and pr_data.get("isCrossRepository"):
-                # The head branch lives in a fork; this checkout cannot (and
-                # must not) push there.
-                continue
-            entry = state.get("issues", {}).get(str(issue_number), {})
-            branch = pr_data.get("headRefName") if pr_data is not None else None
-            if not branch and isinstance(entry, dict):
-                branch = entry.get("branch_name")
-            if not branch:
-                # No recorded branch: never guess a ref name to push to.
-                continue
-            worktree_path = worktree_path_for_branch(repo_root, branch, worktrees_dir)
-            result = salvage_push_stranded_commits(
-                repo_root,
-                branch,
-                worktree_path,
-                base_ref=config.dispatch.base_ref,
-                dry_run=write_gate.dry_run,
-            )
-            if result.pushed:
-                salvage_pushes[issue_number] = {
-                    "issue_number": issue_number,
-                    "pr_number": int(pr_data["number"]) if pr_data is not None else None,
-                    "branch": branch,
-                    "old_remote_sha": result.old_remote_sha,
-                    "new_remote_sha": result.new_remote_sha,
-                    "commit_count": result.commit_count,
-                }
-                if pr_data is not None and result.new_remote_sha:
-                    # Refresh the snapshot so classification below compares
-                    # against the salvaged head, not the pre-push one.
-                    pr_data["headRefOid"] = result.new_remote_sha
-            elif result.error:
-                salvage_pushes[issue_number] = {
-                    "issue_number": issue_number,
-                    "pr_number": int(pr_data["number"]) if pr_data is not None else None,
-                    "branch": branch,
-                    "old_remote_sha": result.old_remote_sha,
-                    "commit_count": result.commit_count,
-                    "error": result.error,
-                }
-            # skip_reason outcomes are silent by design: "up_to_date" /
-            # "no_worktree" / "no_stranded_commits" describe the overwhelming
-            # majority of dead workers and would flood events.db every pass.
-
-    no_pr_issue_details: dict[int, dict[str, Any]] = {}
-    pushed_branch_candidates: dict[int, dict[str, Any]] = {}
-    state_snapshot = state
-    for issue_number in no_pr_orphans:
-        issue = issues_by_number.get(issue_number)
-        if issue is None:
-            # Issue not open/visible: we cannot safely mutate labels, and a
-            # closed issue should not get a new PR.
-            continue
-        issue_labels = label_names(issue)
-        active_labels = issue_labels & config.labels.active
-        no_pr_issue_details[issue_number] = {
-            "issue": issue,
-            "issue_labels": issue_labels,
-            "active_labels": active_labels,
-        }
-
-        entry = state_snapshot.get("issues", {}).get(str(issue_number), {})
-        branch = entry.get("branch_name")
-        if not branch:
-            branch = (
-                f"{config.dispatch.branch_prefix}-{issue_number}-"
-                f"{slugify(str(issue.get('title') or 'work'))}"
-            )
-
-        worktree_path = None
-        if repo_root is not None and worktrees_dir is not None:
-            worktree_path = worktree_path_for_branch(repo_root, branch, worktrees_dir)
-
-        # Issue #1453: reuse the outcome pre-computed above (before the first
-        # pre-lock loop) instead of re-reading the terminal status and
-        # worktree file.  The blocked-outcome check already ran in the first
-        # loop; here we only need the outcome for the push/PR-failure signal.
-        worker_outcome = worker_outcomes.get(issue_number)
-        reported_push = (
-            isinstance(worker_outcome, dict)
-            and worker_outcome.get("push_succeeded") is True
-            and worker_outcome.get("pr_created") is False
-        )
-
-        ahead_count = None
-        ahead_error = None
-        if repo_root is not None:
-            ahead_count, ahead_error = remote_branch_ahead_count(
-                repo_root, branch, config.dispatch.base_ref
-            )
-
-        # Issue #1243: compute the branch head SHA (remote + local worktree)
-        # for the no-open-PR redispatch cap. An unchanged head across attempts
-        # is the "no progress" signal that increments toward the cap; a moving
-        # head (remote push or local stranded commits) resets it. Done here,
-        # outside the state lock, because both probes touch git/network.
-        remote_head_sha = None
-        local_head_sha = None
-        if repo_root is not None:
-            remote_head_sha = remote_branch_head_sha(repo_root, branch)
-        if worktree_path is not None:
-            local_head_sha = worktree_head_sha(worktree_path)
-        no_pr_issue_details.setdefault(issue_number, {}).update(
-            {
-                "branch": branch,
-                "remote_head_sha": remote_head_sha,
-                "local_head_sha": local_head_sha,
-            }
-        )
-
-        # Rules 8/9: a PR-open candidate exactly when the fate is
-        # `PushedWithoutPr` (only the remote ahead count decides).
-        pushed_fate = resolve_pushed_orphan_fate(
-            issue_number=issue_number,
-            entry=entry,
-            precompute=fates[issue_number],
-            remote_head_sha=remote_head_sha,
-            ahead_count=ahead_count,
-            now=now,
-            sessions_dir=sessions_dir,
-        )
-        worker_fate.collect_fate(no_pr_stale_fates, pushed_fate)
-        if isinstance(pushed_fate, worker_fate.PushedWithoutPr):
-            pushed_branch_candidates[issue_number] = {
-                "branch": branch,
-                "worktree_path": worktree_path,
-                "worker_outcome": worker_outcome,
-                "reported_push": reported_push,
-                "ahead_count": ahead_count,
-                "ahead_error": ahead_error,
-            }
-
-    worker_fate.report_stale_evidence(state_file, no_pr_stale_fates, write_gate=write_gate)
-
-    # Issue #439: route dead workers with stuck pre-review PRs to rework before
-    # the state-update sweep. PR views are fetched outside the state lock; the
-    # route helper updates state/labels in its own critical section. The second
-    # lock below will then skip issues that have already moved to
-    # rework_requested/escalated.
-    pre_review_routed: set[int] = set()
-    state_snapshot = state
-    now = datetime.now(UTC)
-    for issue_number in orphaned_issues:
-        pr_data = pr_by_issue.get(issue_number)
-        if not pr_data:
-            continue
-        pr_number = int(pr_data["number"])
-        # Issue #1362 Stage 1: read through the single review-decision
-        # reader (flat file, falling back to the highest archived round)
-        # rather than state.json's ``decision``/``reviewed_head_sha``
-        # fields, which can lag a concurrent record_review/void.
-        resolved_decision = review_decision(
-            state_file.parent / "prs" / f"pr-{pr_number}", None, pr_data.get("headRefOid")
-        )
-        if resolved_decision.decision == "request_changes" and not resolved_decision.stale:
-            # Let the second-lock request_changes restoration path handle this;
-            # do not overwrite an existing review feedback prompt.
-            continue
-        try:
-            pr_view = gh.pr_view(pr_number)
-        except Exception:
-            pr_view = None
-        enriched = pr_view if pr_view else pr_data
-        is_candidate, reason = _is_pre_review_rework_candidate(enriched, config, now)
-        if is_candidate:
-            route_result = _route_dead_worker_to_pre_review_rework(
-                state_file,
-                gh,
-                config,
-                enriched,
-                issue_number,
-                reason,
-                failure_kind=None,
-                write_gate=write_gate,
-            )
-            if route_result is not None:
-                pre_review_routed.add(issue_number)
-
-    # Issue #1128: for dead workers that already have an OPEN PR with no
-    # review verdict yet (``last_decision`` is null/absent), pre-compute the
-    # issue's live GitHub labels outside the state lock. The second-lock
-    # sweep uses these to transition the issue from ``agent:in-progress`` to
-    # ``agent:pr-open`` -- the same LabelConfig-driven swap the
-    # ``orphaned_worker_opened_pr`` lane uses -- so review dispatch can claim
-    # the salvage PR. Without this, the ``dead_worker_unsafe_to_auto_reset``
-    # branch advanced no label and the issue sat on ``agent:in-progress``
-    # indefinitely, asserting a live worker the reconciler had just confirmed
-    # dead. ``pr_by_issue`` only contains OPEN PRs (``gh pr list --state
-    # open``), so presence there is the "PR is OPEN" precondition.
-    pr_orphan_unreviewed_details: dict[int, dict[str, Any]] = {}
-
-    def _has_no_review_verdict_yet(issue_number: int) -> bool:
-        """True when the PR carries no terminal review verdict yet.
-
-        Issue #1362 Stage 1 fix: the old state-based predicate
-        (``not pr_state.get("decision")``) was true for both "no decision
-        file at all" and "a pending placeholder decision" -- both count as
-        "no verdict yet" per this lane's #1128 intent (see the comment
-        above). Checking only ``.missing`` narrowed that: a dead-worker
-        orphan PR that reached a pending packet would be silently excluded
-        from the ``agent:in-progress`` -> ``agent:pr-open`` advance,
-        re-stranding the issue exactly like the original #1128 bug.
-        """
-        resolved = review_decision(
-            state_file.parent / "prs" / f"pr-{int(pr_by_issue[issue_number]['number'])}",
-            None,
-            pr_by_issue[issue_number].get("headRefOid"),
-        )
-        return resolved.missing or resolved.decision == "pending"
-
-    pr_orphans_unreviewed = [
-        n for n in orphaned_issues if n in pr_by_issue and _has_no_review_verdict_yet(n)
-    ]
-    if pr_orphans_unreviewed:
-        # ``issues_by_number`` is only populated above when there were
-        # no-open-PR orphans; build it here when this lane is the sole
-        # consumer so the label read stays a single bulk ``issue_list`` call.
-        if not issues_by_number:
-            for issue in gh.issue_list(state="open"):
-                number = issue.get("number")
-                if number is not None:
-                    issues_by_number[int(number)] = issue
-        for issue_number in pr_orphans_unreviewed:
-            issue = issues_by_number.get(issue_number)
-            if issue is None:
-                # Issue not open/visible -- cannot safely mutate labels;
-                # the conservative drift path below handles it.
-                continue
-            issue_labels = label_names(issue)
-            active_labels = issue_labels & config.labels.active
-            pr_orphan_unreviewed_details[issue_number] = {
-                "issue_labels": issue_labels,
-                "active_labels": active_labels,
-            }
-
-    live_handoff_candidates, live_handoff_pr_already_open = (
-        resolve_live_handoff_candidates(  # Issue #1867
-            stale_live_handoff_pids,
-            pr_by_issue=pr_by_issue,
-            issues_by_number=issues_by_number,
-            gh=gh,
-            config=config,
-        )
-    )
-
-    # Orphan findings are routed to the review lane / no-op drain (#2034)
-    # outside the state lock (review() takes it and may call transition()).
-    review_routes: list[orphaned_worker_review_drain.OrphanedWorkerReviewRoute] = []
-    no_op_routes: list[orphaned_worker_review_drain.NoOpReworkRoute] = []
-    # Issue #654: time-escalated dead workers; transition() (network I/O) runs post-lock.
-    reap_escalations: list[int] = []
-    # Issue #1911: (issue_number, pr_number) pairs whose dead worker left a
-    # fresh, on-target .worker-outcome.json despite no terminal record.
-    # Collected in-lock below and applied post-lock through the #1877 seam
-    # (apply_rework_worker_outcome does network I/O and takes state_lock
-    # itself, so it cannot run inside this function's lock). The collection
-    # and the in-lock classification live in
-    # ``orphaned_worker_sweep.handle_dead_worker_with_pr`` /
-    # ``handle_dead_worker_completed_outcome`` -- extracted per the file-size
-    # rule during the #1911 rework.
-    outcome_apply_routes: list[tuple[int, int]] = []
-    # B6: fates the in-lock readers resolve; reported after the lock.
-    swept_fates: dict[int, list[worker_fate.WorkerFate]] = {}
-
-    with state_lock(state_file):
-        state = load_state(state_file)
-        sweep_events: list[tuple[str, dict[str, Any]]] = []
-        # Issue #1248: record the pre-lock salvage pushes (and push failures)
-        # in the same event stream as the classification they feed, so a
-        # ``dead_worker_with_head_change`` routed below is attributable to its
-        # salvage rather than looking like a spontaneous worker push.
-        for salvage_payload in salvage_pushes.values():
-            if salvage_payload.get("error"):
-                sweep_events.append(("salvage_push_failed", salvage_payload))
-            else:
-                sweep_events.append(("salvage_pushed_stranded_commits", salvage_payload))
-        for issue_number in orphaned_issues:
-            entry = state["issues"].get(str(issue_number), {})
-            if not isinstance(entry, dict):
-                continue
-
-            # Re-verify status (state may have changed between lock windows)
-            if entry.get("status") != "dispatched":
-                continue
-
-            # Issue #654/#1917: timed dead-dispatched escalation backstop,
-            # extracted to ``orphaned_worker_sweep`` -- it escalates only
-            # entries with drift already surfaced on a prior pass that have
-            # exceeded ``dead_dispatched_reap_minutes``, and skips deaths
-            # classified as provider throttling entirely.
-            state, dead_dispatched_reaped = (
-                orphaned_worker_sweep.maybe_reap_dead_dispatched_worker(
-                    state=state,
-                    entry=entry,
-                    issue_number=issue_number,
-                    sessions_dir=sessions_dir,
-                    pr_data=pr_by_issue.get(issue_number),
-                    dead_dispatched_reap_minutes=(config.watchdog.dead_dispatched_reap_minutes),
-                    now=now,
-                    sweep_events=sweep_events,
-                    max_throttle_rearms=config.watchdog.max_auto_redispatch,
-                    local_park_deferred=local_park_deferred,
-                    on_fate=lambda fate: worker_fate.collect_fate(swept_fates, fate),
-                )
-            )
-            if dead_dispatched_reaped:
-                reap_escalations.append(issue_number)
-                continue
-
-            # Issue #282: do not clear the liveness fingerprint here. The worker
-            # is dead (``_worker_pid_alive`` returned False), but the PID record
-            # may still be needed by the recovery path to decide whether the
-            # worktree is safe to reset.
-
-            pr_data = pr_by_issue.get(issue_number)
-
-            if pr_data:
-                orphaned_worker_sweep.handle_dead_worker_with_pr(
-                    state=state,
-                    sweep_events=sweep_events,
-                    entry=entry,
-                    issue_number=issue_number,
-                    pr_data=pr_data,
-                    sessions_dir=sessions_dir,
-                    state_file=state_file,
-                    config=config,
-                    gh=gh,
-                    review_callback=review_callback,
-                    repo_root=repo_root,
-                    worktrees_dir=worktrees_dir,
-                    review_routes=review_routes,
-                    no_op_routes=no_op_routes,
-                    outcome_apply_routes=outcome_apply_routes,
-                    pr_orphan_unreviewed_details=pr_orphan_unreviewed_details,
-                    drift_fingerprint=_drift_fingerprint,
-                    reap_escalations=reap_escalations,
-                    write_gate=write_gate,
-                    on_fate=lambda fate: worker_fate.collect_fate(swept_fates, fate),
-                )
-            else:
-                # Issue #935: before reclaim/drift, try to open a PR for a branch
-                # that the worker pushed but could not create a PR for.
-                candidate = pushed_branch_candidates.get(issue_number)
-                if candidate is not None:
-                    details = no_pr_issue_details.get(issue_number, {})
-                    # ``getattr(gh, "repo_root", None)`` is not statically typed,
-                    # so it could in principle be any non-``Path`` value. Narrow
-                    # it to ``Path | None`` before passing it to the salvage
-                    # helper; ``None`` is a value the helper already handles by
-                    # returning an error, which preserves the existing drift/hold
-                    # behavior for no-repo-root orphans.
-                    salvage_repo_root = repo_root if isinstance(repo_root, Path) else None
-                    pr_number, pr_error, _closing_ref = _open_pr_for_orphaned_branch(
-                        gh=gh,
-                        config=config,
-                        repo_root=salvage_repo_root,
-                        branch=candidate["branch"],
-                        base_ref=config.dispatch.base_ref,
-                        issue_number=issue_number,
-                        active_labels=details.get("active_labels", set()),
-                        issue_labels=details.get("issue_labels", set()),
-                        issue_title=(details.get("issue") or {}).get("title"),
-                        state_file=state_file,
-                        # cw#1771: prefer the worker's own drafted PR title/body
-                        # (pre-computed above alongside this candidate) over the
-                        # orchestrator's "Salvaged work for #N" synthesis.
-                        worker_outcome=candidate.get("worker_outcome"),
-                    )
-                    if pr_number is not None:
-                        entry["status"] = PASSIVE_OPEN_STATUS
-                        entry["pr_number"] = pr_number
-                        # cw#1771 steps 4-6 (honest naming): a worker that
-                        # pushed AND wrote a valid `.worker-outcome.json`
-                        # confirming push_succeeded/pr_created=False completed
-                        # the handoff contract exactly as designed (workers
-                        # never carry a `gh` credential and cannot open the PR
-                        # themselves by design -- see `read_worker_outcome`).
-                        # That is not an anomaly, so it is named and counted
-                        # separately from the true-anomaly case: a pushed
-                        # branch inferred ONLY from `ahead_count` with no
-                        # confirming outcome file (worker died before writing
-                        # one, or wrote one that didn't confirm the push).
-                        # This is additive -- the anomaly case keeps emitting
-                        # the original `orphaned_worker_opened_pr` kind
-                        # unchanged, at its existing info level, so every
-                        # existing consumer/dashboard/memory-documented query
-                        # filtering on it keeps matching exactly what it
-                        # always matched.
-                        # Two separate literal append sites (rather than a
-                        # `kind`/`reason` variable chosen above and passed
-                        # through) so the AST-based sweep-append scanner
-                        # (`_scan_sweep_append_kinds`, which resolves only the
-                        # literal at the `sweep_events.append((...))` call
-                        # site itself -- it does not trace local variable
-                        # assignments the way the main event-kind scanner
-                        # does) can prove each kind is registered. Matches
-                        # the literal-at-call-site convention used by every
-                        # other `sweep_events.append(...)` site in this repo
-                        # (see stalled_review_reap.py).
-                        if candidate["reported_push"]:
-                            sweep_events.append(
-                                (
-                                    "worker_handoff_pr_opened",
-                                    {
-                                        "issue_number": issue_number,
-                                        "pr_number": pr_number,
-                                        "branch_name": candidate["branch"],
-                                        "worker_reported": candidate["reported_push"],
-                                        "ahead_count": candidate["ahead_count"],
-                                        "previous_status": "dispatched",
-                                        "reason": "worker_handoff_clean_exit",
-                                        "label_write_ok": pr_error is None,
-                                        "pr_error": pr_error,
-                                    },
-                                )
-                            )
-                        else:
-                            sweep_events.append(
-                                (
-                                    "orphaned_worker_opened_pr",
-                                    {
-                                        "issue_number": issue_number,
-                                        "pr_number": pr_number,
-                                        "branch_name": candidate["branch"],
-                                        "worker_reported": candidate["reported_push"],
-                                        "ahead_count": candidate["ahead_count"],
-                                        "previous_status": "dispatched",
-                                        "reason": "dead_worker_branch_pushed_no_pr",
-                                        "label_write_ok": pr_error is None,
-                                        "pr_error": pr_error,
-                                    },
-                                )
-                            )
-                        state["issues"][str(issue_number)] = entry
-                        continue
-
-                    # PR creation failed after the bounded outer retry
-                    # (pr_create_retry.py) and the duplicate-PR guard both
-                    # exhausted -- the branch is pushed and stranded (cw#1273).
-                    # Reuses this sweep's existing _drift_fingerprint dedup
-                    # path rather than inventing a parallel one; the "reason"
-                    # value is preserved unchanged from before cw#1273 so the
-                    # fingerprint (and any existing dedup state already on
-                    # disk from before this change) stays stable.
-                    fingerprint = _drift_fingerprint(
-                        reason="dead_worker_branch_pushed_pr_create_failed",
-                        branch_name=candidate["branch"],
-                        error=pr_error or "unknown",
-                    )
-                    if entry.get("orphan_drift_fingerprint") == fingerprint:
-                        state["issues"][str(issue_number)] = entry
-                        continue
-                    entry["orphan_drift_fingerprint"] = fingerprint
-                    entry["orphan_drift_at"] = utc_now()
-                    sweep_events.append(
-                        (
-                            "pr_create_failed_branch_stranded",
-                            {
-                                "issue_number": issue_number,
-                                "branch_name": candidate["branch"],
-                                "previous_status": "dispatched",
-                                "reason": "dead_worker_branch_pushed_pr_create_failed",
-                                "pr_create_error": pr_error,
-                                "worker_reported": candidate["reported_push"],
-                                "ahead_count": candidate["ahead_count"],
-                            },
-                        )
-                    )
-                    state["issues"][str(issue_number)] = entry
-                    continue
-
-                # Issue #1453: check whether the worker itself declared the
-                # task structurally impossible (a ``blocked`` outcome in
-                # ``.worker-outcome.json``, computed above, outside the state
-                # lock).  The worker's own declaration is the most
-                # authoritative signal -- check it FIRST, before the
-                # zero-artifact and cross-repo heuristic escalations, so a
-                # deliberate blocked analysis routes directly to the operator
-                # queue with zero redispatches instead of burning the full
-                # redispatch cap re-dispatching structurally impossible tasks.
-                # The event payload carries ``reason_kind`` and ``detail`` so
-                # the operator queue entry is actionable without reading the
-                # worktree.
-                blocked_escalation = worker_declared_blocked_escalations.get(issue_number)
-                if blocked_escalation is not None:
-                    state = _escalate_issue(
-                        state,
-                        issue_number,
-                        reason="worker_declared_blocked",
-                        reason_class="mechanical",
-                    )
-                    escalated_entry = state["issues"][str(issue_number)]
-                    escalated_entry["orphan_flagged_at"] = utc_now()
-                    state["issues"][str(issue_number)] = escalated_entry
-                    sweep_events.append(
-                        (
-                            "worker_declared_blocked",
-                            {
-                                "issue_number": issue_number,
-                                "previous_status": "dispatched",
-                                "reason": "worker_declared_blocked",
-                                "reason_kind": blocked_escalation["reason_kind"],
-                                "detail": blocked_escalation["detail"],
-                                "removed_labels": blocked_escalation["removed_labels"],
-                                "label_write_ok": blocked_escalation["label_write_ok"],
-                            },
-                        )
-                    )
-                    reap_escalations.append(issue_number)
-                    continue
-
-                # Issue #1153: check whether this issue was escalated to
-                # ``agent:human-needed`` by the zero-artifact dispatch loop
-                # guard (computed above, outside the state lock). If so,
-                # record the escalation in state and emit a visible event --
-                # do NOT fall through to the reclaim path (which would
-                # re-add ``automated-ready`` and trigger another fruitless
-                # redispatch).
-                escalation = zero_artifact_escalations.get(issue_number)
-                if escalation is not None:
-                    # Route through ``_escalate_issue`` so the paired
-                    # ``escalation_reason`` / ``reason_class`` /
-                    # ``terminal_since`` fields are written atomically and
-                    # the #750 structural guard (status="escalated" only
-                    # inside the helper) continues to hold.
-                    state = _escalate_issue(
-                        state,
-                        issue_number,
-                        reason="zero_artifact_dispatch_loop",
-                        reason_class="mechanical",
-                    )
-                    escalated_entry = state["issues"][str(issue_number)]
-                    escalated_entry["orphan_flagged_at"] = utc_now()
-                    state["issues"][str(issue_number)] = escalated_entry
-                    sweep_events.append(
-                        (
-                            "session_failed_escalated",
-                            _session_failed_relabeled_payload(
-                                issue_number=issue_number,
-                                reason="zero_artifact_dispatch_loop",
-                                removed_labels=escalation["removed_labels"],
-                                added_ready=False,
-                                label_write_ok=escalation["label_write_ok"],
-                            ),
-                        )
-                    )
-                    continue
-
-                # Issue #1244: check whether this issue was escalated to
-                # ``agent:human-needed`` by the cross-repo scope tripwire
-                # (computed above, outside the state lock). If so, record the
-                # escalation in state and emit a visible event — do NOT fall
-                # through to the reclaim path (which would re-add
-                # ``automated-ready`` and trigger another fruitless
-                # redispatch that hops to the sibling repo again).
-                scope_escalation = cross_repo_scope_escalations.get(issue_number)
-                if scope_escalation is not None:
-                    state = _escalate_issue(
-                        state,
-                        issue_number,
-                        reason="cross_repo_hop",
-                        reason_class="mechanical",
-                    )
-                    escalated_entry = state["issues"][str(issue_number)]
-                    escalated_entry["orphan_flagged_at"] = utc_now()
-                    state["issues"][str(issue_number)] = escalated_entry
-                    sweep_events.append(
-                        (
-                            "session_failed_escalated",
-                            _session_failed_relabeled_payload(
-                                issue_number=issue_number,
-                                reason="cross_repo_hop",
-                                removed_labels=scope_escalation["removed_labels"],
-                                added_ready=False,
-                                label_write_ok=scope_escalation["label_write_ok"],
-                            ),
-                        )
-                    )
-                    continue
-
-                # Issue #1243: per-issue redispatch cap with stall detection.
-                # The no-open-PR orphan-sweep redispatch path is the only
-                # redispatch loop without a bound -- without this cap, a
-                # persistent post-exit condition that leaves no open PR
-                # reproduces the #709 infinite loop (worker exits -> sweep
-                # strips agent:in-progress -> issue returns to the dispatchable
-                # pool -> next pass redispatches -> repeat). The cap counts
-                # dead *dispatches* via a timestamp list
-                # (``orphan_redispatch_at``) deduplicated on dispatch identity,
-                # mirroring the ``redispatch_at``/``worker_death_at`` pattern
-                # used by the parallel worker_death_loop cap elsewhere in this
-                # module.
-                # The previous implementation derived the count from
-                # ``len(adapter_history)``, but that list only grew when
-                # ``api_worker.enabled`` is ``True`` (the per-issue adapter
-                # selector that wrote it was deleted in Phase 2 Track B,
-                # PR #1517) -- so in the default (non-API-routed)
-                # configuration the counter never incremented and the cap
-                # never fired, leaving the #709 infinite loop unbounded in
-                # production. The timestamp list is appended on every sweep
-                # pass through this code, regardless of the configured
-                # adapter.
-                # "No progress" is measured, not assumed: the branch head SHA
-                # (remote ls-remote + local worktree) is compared across
-                # attempts. A moving head is the salvage path's job, not
-                # escalation. Parallel to the rework lane's worker_death_loop
-                # (fires at death_count > max_auto_redispatch).
-                head_details = no_pr_issue_details.get(issue_number, {})
-                current_head = _orphan_head_fingerprint(
-                    head_details.get("remote_head_sha"),
-                    head_details.get("local_head_sha"),
-                )
-                prior_head = entry.get("orphan_redispatch_head_sha")
-                now_ts = utc_now()
-
-                head_changed = prior_head is not None and current_head != prior_head
-                first_observation = prior_head is None
-                # Identity of the dispatch whose dead worker this pass is
-                # observing. The #417 reclaim deliberately leaves the entry's
-                # status/worker_pid untouched (issue #282 fingerprint
-                # preservation), so the same dead entry is re-discovered by
-                # every subsequent sweep pass until a real redispatch replaces
-                # dispatched_at/worker_pid. Counting passes would therefore
-                # escalate after a few sweeps with zero actual redispatch
-                # attempts (e.g. during fleet-capacity dispatch delays);
-                # instead, each dead dispatch is counted exactly once, keyed
-                # by this identity.
-                dispatch_identity = (
-                    f"{entry.get('dispatched_at') or 'none'}:{entry.get('worker_pid') or 'none'}"
-                )
-                prior_dispatch = entry.get("orphan_redispatch_counted_dispatch")
-                # Read the windowed timestamp list. On progress or first
-                # observation, reset it to [now] so only attempts after this
-                # point count toward the cap. Otherwise, append this pass's
-                # timestamp only when it observes a dispatch not yet counted
-                # -- re-observing the same dead dispatch on a later sweep
-                # pass is not a redispatch attempt. (The timestamp list, not
-                # adapter_history, is still what the count derives from:
-                # adapter_history only grew when api_worker.enabled was True,
-                # and the writer was deleted in Phase 2 Track B.)
-                orphan_redispatch_at = _windowed_orphan_redispatch_at(
-                    entry, window_minutes=config.watchdog.redispatch_window_minutes
-                )
-                # Issue #1917: a provider-throttle-classified death is a
-                # global provider condition, not a worker-quality signal —
-                # it must not count toward the orphan-sweep redispatch cap,
-                # matching the #1684 exemption the rework lanes apply to
-                # ``redispatch_at``. The classification is read from
-                # ``dead_worker_failure_kind``, stamped on the entry by the
-                # stall/dead reap lanes; earlier non-throttle deaths in the
-                # list still count.
-                provider_throttled_death = worker_fate.persisted_failure(entry).is_throttle
-                if head_changed or first_observation:
-                    orphan_redispatch_at = [] if provider_throttled_death else [now_ts]
-                elif dispatch_identity != prior_dispatch and not provider_throttled_death:
-                    orphan_redispatch_at = orphan_redispatch_at + [now_ts]
-
-                redispatch_count = len(orphan_redispatch_at)
-
-                if redispatch_count > config.watchdog.max_auto_redispatch and not head_changed:
-                    # Cap exceeded with no progress -- escalate instead of
-                    # recording the relabel event that would return the issue
-                    # to the dispatchable pool. The labels were already
-                    # stripped in the pre-lock reclaim, but the post-lock
-                    # transition() call (via reap_escalations) will change
-                    # them to agent:human-needed.
-                    state = _escalate_issue(
-                        state,
-                        issue_number,
-                        reason="orphan_sweep_redispatch_cap_exceeded",
-                        reason_class="mechanical",
-                        issue_extra={
-                            "dispatched_at": None,
-                            "orphan_redispatch_head_sha": current_head,
-                            "orphan_redispatch_at": orphan_redispatch_at,
-                            "orphan_redispatch_counted_dispatch": None,
-                            "orphan_flagged_at": None,
-                            "orphan_drift_fingerprint": None,
-                            "orphan_drift_at": None,
-                        },
-                    )
-                    sweep_events.append(
-                        (
-                            "orphan_sweep_redispatch_escalated",
-                            {
-                                "issue_number": issue_number,
-                                "previous_status": "dispatched",
-                                "reason": "orphan_sweep_redispatch_cap_exceeded",
-                                "redispatch_count": redispatch_count,
-                                "branch_head_sha": head_details.get("remote_head_sha"),
-                                "worktree_head_sha": head_details.get("local_head_sha"),
-                                "orphan_redispatch_at_len": len(orphan_redispatch_at),
-                            },
-                        )
-                    )
-                    reap_escalations.append(issue_number)
-                    continue
-
-                # Cap not exceeded (or progress detected): persist the head
-                # fingerprint, timestamp list, and counted dispatch identity
-                # so the next orphan-sweep pass can compare against them. On
-                # progress or first observation, the list was just (re)seeded
-                # above; this persists it.
-                entry["orphan_redispatch_head_sha"] = current_head
-                entry["orphan_redispatch_at"] = orphan_redispatch_at
-                entry["orphan_redispatch_counted_dispatch"] = dispatch_identity
-
-                # Issue #417: report (and, on success, resolve) the ground-truth
-                # label reclaim computed above before falling back to the
-                # unresolved-drift diagnostic. This is what makes the reap
-                # convergent -- an interrupted or partially-failed attempt by
-                # the sidecar-based lane is finished here, and a genuinely
-                # failed label write is retried again next pass (this reclaim
-                # never gates on orphan_flagged_at, only the diagnostic below
-                # does).
-                reclaim = reclaim_results.get(issue_number)
-                if reclaim is not None:
-                    sweep_events.append(
-                        (
-                            "session_failed_relabeled",
-                            _session_failed_relabeled_payload(
-                                issue_number=issue_number,
-                                reason="dead_worker_no_open_pr_orphan_sweep",
-                                **reclaim,
-                            ),
-                        )
-                    )
-                    if reclaim["label_write_ok"]:
-                        # Fully reclaimed: labels are correct, nothing left to
-                        # flag as unresolved drift. `status` deliberately stays
-                        # "dispatched" here (matching the sidecar-based lane's
-                        # own issue #282 fingerprint-preservation choice), so
-                        # this same entry would otherwise be re-discovered by
-                        # this sweep's very next pass and, having no more
-                        # labels left to touch, fall through to the
-                        # orphan_flagged_at diagnostic below and emit a
-                        # spurious orphaned_worker_drift for an issue that is
-                        # already fixed. Mark it flagged now so that never
-                        # happens -- this lane's reclaim retry above never
-                        # gates on this flag, only the diagnostic does.
-                        entry["orphan_flagged_at"] = utc_now()
-                        state["issues"][str(issue_number)] = entry
-                        continue
-
-                # No open PR - emit drift event, leave (further) recovery to
-                # this same sweep's next pass, which re-attempts the ground-
-                # truth label reclaim above unconditionally regardless of the
-                # flag set here (issue #118 mop-up remains a manual fallback).
-                # Issue #259: mark the entry so it is not re-flagged every pass.
-                # Suppress ONLY the duplicate no-open-PR event; with-PR recovery
-                # paths must run regardless of the flag.
-                # Issue #1230: ``orphan_drift_at`` arms the
-                # ``dead_dispatched_reap_minutes`` time-based backstop checked
-                # at the top of this loop.  It must be backfilled whenever it
-                # is missing, INDEPENDENTLY of the ``orphan_flagged_at``
-                # duplicate-event guard below.  An entry that was flagged
-                # before this stamp existed (pre-#1230 builds set only
-                # ``orphan_flagged_at``) or via the reclaim-success branch
-                # above (which deliberately omits ``orphan_drift_at``) has
-                # ``orphan_flagged_at`` set but ``orphan_drift_at`` absent, so
-                # the guard's early-return permanently blocks the backstop
-                # from ever arming.  That is the wedge: the issue is not
-                # re-dispatchable (a terminal label like ``agent:human-needed``
-                # excludes it from the dispatchable pool), not sweepable
-                # (status is not ``escalated``), and the backstop never fires
-                # because ``orphan_drift_at`` was never set.  Backfill from
-                # ``orphan_flagged_at`` so the grace period is measured from
-                # when the drift was first observed -- an already-wedged entry
-                # (e.g. a sibling repo's #1421, flagged 4+ days ago) converges on the very
-                # next sweep pass instead of waiting another full grace window.
-                # The reclaim-success branch above deliberately does NOT set
-                # ``orphan_drift_at`` -- that path leaves the issue ``ready``
-                # and re-dispatchable, so the backstop should not fire on the
-                # pass that reclaimed it.  This backfill only arms the backstop
-                # for entries that reach THIS drift branch (nothing to reclaim
-                # or reclaim failed), which means the issue is not on the
-                # normal re-dispatch path and the backstop is the correct
-                # convergence mechanism.
-                if (
-                    entry.get("orphan_drift_at") is None
-                    and entry.get("orphan_flagged_at") is not None
-                ):
-                    entry["orphan_drift_at"] = entry["orphan_flagged_at"]
-                if entry.get("orphan_flagged_at"):
-                    state["issues"][str(issue_number)] = entry
-                    continue
-                drift_ts = utc_now()
-                entry["orphan_flagged_at"] = drift_ts
-                entry["orphan_drift_at"] = drift_ts
-                sweep_events.append(
-                    (
-                        "orphaned_worker_drift",
-                        {
-                            "issue_number": issue_number,
-                            "previous_status": "dispatched",
-                            "reason": "dead_worker_no_open_pr",
-                        },
-                    )
-                )
-
-            state["issues"][str(issue_number)] = entry
-
-        finalize_live_handoff_candidates(  # Issue #1867
-            gh=gh,
-            config=config,
-            repo_root=repo_root,
-            state=state,
-            state_file=state_file,
-            live_handoff_candidates=live_handoff_candidates,
-            pr_by_issue=pr_by_issue,
-            sweep_events=sweep_events,
-            drift_fingerprint=_drift_fingerprint,
-            pr_already_open=live_handoff_pr_already_open,
-        )
-
-        state = _append_sweep_events(
-            state,
-            sweep_events,
-            max_size=config.runtime.event_ring_size,
-            state_file=state_file,
-            write_gate=write_gate,
-        )
-        write_gate.save_state(state)
-
-    worker_fate.report_stale_evidence(state_file, swept_fates, write_gate=write_gate)
-
-    # Issue #1911: apply each recovered completed outcome through the #1877
-    # seam, outside the lock (the helper does network I/O and takes
-    # state_lock itself). It re-reads the outcome file, re-verifies the live
-    # remote head against the reported head_sha, and dedups per applied head
-    # -- so an already-applied entry is skipped cheaply and a transient
-    # failure retries on the next pass. Per-route guard inside: an
-    # unexpected exception cannot skip the review_routes drain below.
-    rework_outcome.apply_collected_rework_outcomes(
-        gh,
-        outcome_apply_routes=outcome_apply_routes,
-        repo_root=repo_root,
-        worktrees_dir=worktrees_dir,
-        sessions_dir=sessions_dir,
-        state_file=state_file,
-        write_gate=write_gate,
-    )
-
-    orphaned_worker_review_drain.drain_orphaned_worker_routes(
-        review_routes,
-        no_op_routes,
-        review_callback=review_callback,
-        record_review_callback=record_review_callback,
-        enrich_checks_callback=enrich_checks_callback,
-        gh=gh,
-        config=config,
-        state_file=state_file,
-        write_gate=write_gate,
-        sessions_dir=sessions_dir,
-        repo_root=repo_root,
-        worktrees_dir=worktrees_dir,
-    )
-
-    # Issue #654: apply the ``escalated`` label edge for dead dispatched
-    # workers that exceeded the reap grace period. The state.json update
-    # (``_escalate_issue``) was done inside the lock above; ``transition``
-    # does network I/O (GitHub label API) so it runs here, outside the lock,
-    # matching the pattern ``_check_janitor_rework_stall`` uses. A failed
-    # transition leaves the issue escalated in state.json with a stale label
-    # -- the next pass's ``_detect_and_handle_orphaned_workers`` will not
-    # re-escalate (status is no longer ``dispatched``), but reconcile's
-    # ground-truth label sweep will eventually converge the label.
-    for issue_number in reap_escalations:
-        write_gate.transition(
-            gh, config.labels, issue_number, _escalation_edge("escalated", "mechanical")
-        )
 
 
 # Issue #713: canonical key sets each prompt writer supplies to
@@ -5813,26 +4515,11 @@ class OrchestratorApp:
             # corrupt file is left for a human rather than silently
             # overwritten (mirroring the original code's ``else`` branch,
             # which only reset on a real terminal decision).
-            # Issue #2081: ``force`` (``why-charlie-hate --force-rereview``)
-            # voids a terminal verdict even when it is pinned to -- or carried
-            # forward to -- the live head. Before, the flag only skipped the
-            # CLI's #1695 guard and this block voided stale-head verdicts
-            # alone, so a live-head verdict survived the "forced" re-review.
-            is_terminal_verdict = live_decision_value in (
-                "approved",
-                "request_changes",
-                "blocked",
-            )
-            voided_stale_verdict = is_terminal_verdict and (
-                force
-                or live_reviewed_head_sha is None
-                or live_reviewed_head_sha != pr.get("headRefOid")
-            )
-            force_voided_verdict = (
-                force
-                and is_terminal_verdict
-                and live_reviewed_head_sha is not None
-                and live_reviewed_head_sha == pr.get("headRefOid")
+            voided_stale_verdict, force_voided_verdict = classify_verdict_void(
+                live_decision_value,
+                live_reviewed_head_sha,
+                pr.get("headRefOid"),
+                force=force,
             )
             if not decision_path.exists() or voided_stale_verdict:
                 if voided_stale_verdict:
@@ -5979,14 +4666,9 @@ class OrchestratorApp:
                 state = append_event(
                     state,
                     "verdict_force_voided",
-                    {
-                        "pr_number": pr_number,
-                        "issue_number": issue_number,
-                        "voided_decision": live_decision_value,
-                        "voided_reviewed_head_sha": live_reviewed_head_sha,
-                        "verdict_provenance": live_decision.get("verdict_provenance"),
-                        "head_sha": pr.get("headRefOid"),
-                    },
+                    force_voided_event_payload(
+                        live_decision, pr_number, issue_number, pr.get("headRefOid")
+                    ),
                     state_path=self.paths.state_file,
                 )
             state = append_event(
@@ -6108,11 +4790,10 @@ class OrchestratorApp:
         concurrent reviewer worktrees.
 
         ``launch_lock`` (issue #2084) is supplied by ``@fleet_review_lock``: a
-        pending fleet-launch-lock handle (a no-op while
-        ``fleet.global_max_concurrent_reviews`` is 0) that this method realizes
-        just before candidate selection, holds through claim -> launch, and the
-        decorator releases on every exit path -- the same entry-point-mints /
-        ``finally``-releases shape as the worker lanes.
+        pending fleet-launch-lock handle (no-op while
+        ``fleet.global_max_concurrent_reviews`` is 0) realized just before
+        candidate selection, held through claim -> launch, released by the
+        decorator on every exit path (same shape as the worker lanes).
 
         The double-dispatch protection is a two-phase claim on
         ``state["prs"][pr]``: this method writes ``review_dispatch_pending``,
@@ -6350,9 +5031,15 @@ class OrchestratorApp:
         # probe succeeds, at which point the global quota is cleared.
         quota_alert: dict[str, Any] | None = None
         deferred = False
+        # Issue #2086: reviewer chain vs the fleet quota ledger (see role_selection).
+        role_sel, role_cfg = role_selection.resolve_reviewer(self.config)
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
-            if is_reviewer_quota_exhausted(state):
+            if role_sel.exhausted:
+                deferred, probe_mode = True, False
+            elif is_reviewer_quota_exhausted(state) and not role_selection.reviewer_window_covered(
+                state, role_sel
+            ):
                 if not is_reviewer_probe_ready(state):
                     deferred = True
                     # Quota deferral is by design, but it must never be silent:
@@ -6374,27 +5061,7 @@ class OrchestratorApp:
             if quota_alert is not None:
                 emit_digest(
                     self._layout.notify,
-                    AttentionDigest(
-                        generated_at=utc_now(),
-                        repo=self.repo_root.name,
-                        transitions=(
-                            AttentionEntry(
-                                issue_number=0,
-                                adapter_kind="reviewer",
-                                health="REVIEWER_QUOTA_EXHAUSTED",
-                                previous_health=None,
-                                last_log_line=(
-                                    f"throttled_until={quota_alert.get('throttled_until')} "
-                                    f"probe_after={quota_alert.get('probe_after')}"
-                                ),
-                                pid=None,
-                                terminal_tool=None,
-                                terminal_reason=(
-                                    "all reviewer launches deferred until the quota probe succeeds"
-                                ),
-                            ),
-                        ),
-                    ),
+                    reviewer_quota_alert_digest(utc_now(), self.repo_root.name, quota_alert),
                 )
             # Rescue tier (issue #555): the quota gate above governs Claude-
             # family reviewer launches only. Rescue reviews run on the
@@ -6421,6 +5088,7 @@ class OrchestratorApp:
                     "missed_verdicts": missed_verdicts,
                     "reconciled_verdicts": reconciled_verdicts,
                     "rescue_review_results": deferred_rescue_results,
+                    **role_sel.chain_report_fields(),
                 },
             )
 
@@ -6498,26 +5166,20 @@ class OrchestratorApp:
         # return and both deployed fleets run that flag false -- the set was
         # always empty. The repair now derives its own subjects from state in
         # ``_repair_escalated_labels()``, called above that early return.
-        # Issue #2084: realize the fleet lock HERE -- after the lock-free
-        # sweeps/scans above, before the fleet reviewer count is read -- and
-        # hold it through claim -> launch (the caller releases it), so two
-        # repos cannot both read a stale fleet count and over-dispatch the cap.
+        # Issue #2084: realize the fleet lock after the lock-free sweeps, before
+        # the fleet count is read; held through claim -> launch (caller releases).
         lock_deferral = fleet_review_lock_deferral(self, launch_lock)
         if lock_deferral is not None:
             return CommandResult(
                 True,
                 "review dispatch deferred: fleet_lock_held",
-                {
-                    "selected_count": 0,
-                    "attempted_count": 0,
-                    "failed_count": 0,
-                    "launched_count": 0,
-                    "recorded_verdicts": recorded_verdicts,
-                    "missed_verdicts": missed_verdicts,
-                    "reconciled_verdicts": reconciled_verdicts,
-                    "rescue_review_results": rescue_review_results,
-                    **lock_deferral,
-                },
+                fleet_lock_held_result_data(
+                    lock_deferral,
+                    recorded_verdicts=recorded_verdicts,
+                    missed_verdicts=missed_verdicts,
+                    reconciled_verdicts=reconciled_verdicts,
+                    rescue_review_results=rescue_review_results,
+                ),
             )
         selection_state = load_state_locked(self.paths.state_file)
         selection = _select_review_dispatch_candidates(
@@ -6840,7 +5502,7 @@ class OrchestratorApp:
                 pr_state = state["prs"].get(str(pr_number), {})
                 attempt_count = int(pr_state.get("review_dispatch_attempt_count", 0))
                 review_effort_used, review_effort_arm = resolve_review_effort(
-                    pr_number, self.config.reviewer, self.config.claude_code
+                    pr_number, role_cfg.reviewer, self.config.claude_code
                 )
                 resolved_review_efforts[pr_number] = review_effort_used
                 # Issue #1439: read the structure multiplier stamped into the
@@ -6918,7 +5580,7 @@ class OrchestratorApp:
         # a review checkout (create_review_checkout never materializes a
         # venv), so the reviewer's model is resolved from
         # ``self.config.reviewer.model`` below instead, exactly as before.
-        reviewer_harness = self.config.reviewer.harness
+        reviewer_harness = role_cfg.reviewer.harness  # issue #2086: the selected chain entry
         reviewer_adapter_settings = self._adapter_settings(adapter=reviewer_harness)
         reviewer_launcher = _REVIEW_LAUNCHERS.get(reviewer_harness)
         for candidate in selected:
@@ -7006,7 +5668,7 @@ class OrchestratorApp:
                     head_sha=head_sha,
                     repo_root=self.repo_root,
                     reviews_dir=reviews_dir,
-                    config=self.config,
+                    config=role_cfg,
                     worker_env=reviewer_adapter_settings.worker_env,
                     materialize_dirs=self.config.dispatch.materialize_dirs,
                     # The review_effort experiment arm was already resolved
@@ -7037,7 +5699,7 @@ class OrchestratorApp:
                     # verbatim by the devin-shell launcher too; ignored by
                     # the api launcher, which always pins the provider's own
                     # model).
-                    model_override=self.config.reviewer.model or None,
+                    model_override=role_cfg.reviewer.model or None,
                     api_worker_config=reviewer_adapter_settings.api_worker_config,
                 )
                 if record.error or record.pid is None:
@@ -7074,6 +5736,9 @@ class OrchestratorApp:
                     )
             except (OSError, GitHubError, ValueError) as exc:
                 failed.append({"pr": pr_number, "error": f"{type(exc).__name__}: {exc}"})
+        role_selection.after_review_launch(
+            reviews_dir, self.write_gate, role_sel, [x["pr"] for x in launched]
+        )
 
         # Upgrade claims outside the launch loop. Successful launches become
         # review_dispatch_dispatched. A quota failure rolls back the claim so
@@ -7143,7 +5808,14 @@ class OrchestratorApp:
                     parse_reset_clock_time(quota_hit_error, now_dt) if quota_hit_error else None
                 )
                 state, quota_record = _set_reviewer_quota_exhausted_with_backoff(
-                    state, self.config, now_dt, reset_at=reset_at
+                    state,
+                    self.config,
+                    now_dt,
+                    reset_at=reset_at,
+                    adapter_kind=role_selection.selection_adapter_kind(role_sel),
+                )
+                role_selection.record_launch_quota_hit(
+                    role_sel, quota_record.get("throttled_until")
                 )
                 # Distinct, queryable event for a launch-time quota hit
                 # (issue #612): mirrors the stalled-sweep event so a quota
@@ -7210,6 +5882,7 @@ class OrchestratorApp:
             "failed": failed,
             "quota_hit": quota_hit,
             "probe_mode": probe_mode,
+            **role_sel.chain_report_fields(),
             "skipped_count": len(dispatchable) - len(selected),
             "deferred_count": len(candidates) - len(dispatchable),
             "escalated_skipped": escalated_skipped,
