@@ -468,6 +468,10 @@ class LocalFileGitHub:
         return None
 
     def pr_view(self, number: int, *, fields: str = "") -> dict[str, Any]:
+        # ``{}`` is deliberate: there is no PR to view. The operator verdict
+        # path does not need one -- ``record_review`` delegates to
+        # ``record_local_review`` on a non-publishing backend (issue #2095),
+        # which reads the lane record, not ``pr_view``.
         return {}
 
     def pr_list(self) -> list[dict[str, Any]]:
