@@ -25,17 +25,21 @@ from .render import render_live_head_moved
 
 def carry_forward(
     app: Any, ports: MergePathPorts, write_gate: WriteGate, opening: Opening
-) -> Opening:
+) -> Opening | None:
     """Approved, head moved, patch-id/signature carried: re-stamp the approval, refetch.
 
     Returns the opening with the refetched PR and verdict and the admission the
     second ``decide_admission`` call (``observed_carry_forward``) answers.
+
+    Returns ``None`` when ``_update_approval_head`` refuses because the on-disk
+    verdict changed after the opening read it (issue #2205): the approval is NOT
+    re-stamped, and the caller ends the pass without merging.
     """
     write_gate = require_write_gate(write_gate)
     check = opening.carry_check
     pr_number = opening.facts.pr_number
     issue_number = opening.issue_number
-    app._update_approval_head(
+    carried = app._update_approval_head(
         pr_number,
         opening.decision,
         opening.pr.get("headRefOid"),
@@ -45,6 +49,8 @@ def carry_forward(
         new_patch_id=check.live_patch_id,
         new_signature=check.live_signature,
     )
+    if not carried:
+        return None
     pr = app.gh.pr_view(pr_number) or opening.pr
     decision = app._review_decision(pr_number)
     state_file = app.paths.state_file
@@ -120,8 +126,12 @@ def re_review(app: Any, ports: MergePathPorts, write_gate: WriteGate, opening: O
     )
 
 
-def sync_branch(app: Any, read: BranchRead, opening: Opening) -> tuple[BranchGate, Opening]:
-    """Apply the branch sync the gate requested; re-run the branch decision with its outcome."""
+def sync_branch(app: Any, read: BranchRead, opening: Opening) -> tuple[BranchGate, Opening] | None:
+    """Apply the branch sync the gate requested; re-run the branch decision with its outcome.
+
+    Returns ``None`` when the synced head's approval carry is refused because the
+    on-disk verdict changed underneath it (issue #2205); the caller ends the pass.
+    """
     gate = read.gate
     if not gate.request_sync:
         return gate, opening
@@ -136,13 +146,14 @@ def sync_branch(app: Any, read: BranchRead, opening: Opening) -> tuple[BranchGat
         if new_head is None:
             outcome = SyncOutcome.FAILED
         elif new_head != live_head:
-            app._update_approval_head(
+            if not app._update_approval_head(
                 pr_number,
                 decision,
                 new_head,
                 old_head=live_head,
                 issue_number=opening.issue_number,
-            )
+            ):
+                return None
             pr_after = app.gh.pr_view(pr_number) or pr
             decision = app._review_decision(pr_number)
             outcome = SyncOutcome.NEW_HEAD

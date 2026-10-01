@@ -56,6 +56,7 @@ from .render import (
     render_live_conflict_blocked,
     render_live_conflict_in_flight,
     render_live_final,
+    render_live_head_moved,
     render_live_skip,
     render_live_stall,
     render_not_found,
@@ -98,7 +99,10 @@ def run_merge_ready(
     if opening.admission.kind is PlanKind.NOT_FOUND:
         return render_not_found(ports, pr_number)
     if opening.admission.carry_forward_needed:
-        opening = carry_forward(app, ports, write_gate, opening)
+        carried = carry_forward(app, ports, write_gate, opening)
+        if carried is None:
+            return _approval_refused(ports, opening)
+        opening = carried
     if opening.admission.kind is PlanKind.REQUEST_REWORK:
         return re_review(app, ports, write_gate, opening)
 
@@ -106,12 +110,34 @@ def run_merge_ready(
     stopped = _branch_result(app, ports, cfg, opening, read, read.gate)
     if stopped is not None:
         return stopped
-    gate, opening = sync_branch(app, read, opening)
+    synced = sync_branch(app, read, opening)
+    if synced is None:
+        return _approval_refused(ports, opening)
+    gate, opening = synced
     stopped = _branch_result(app, ports, cfg, opening, read, gate)
     if stopped is not None:
         return stopped
 
     return _readiness_and_merge(app, ports, write_gate, cfg, opening, gate, merge=merge)
+
+
+def _approval_refused(ports: MergePathPorts, opening: Opening) -> Any:
+    """``_update_approval_head`` refused a stale approval (issue #2205): end the pass, no merge.
+
+    A newer verdict landed after the opening read ``approved``; nothing is
+    re-stamped and the next pass re-reads the verdict from disk.
+    """
+    facts = opening.facts
+    return render_live_head_moved(
+        ports,
+        facts.pr_number,
+        opening.issue_number,
+        facts.verdict.reviewed_head_sha,
+        facts.live_head_sha,
+        opening.decision,
+        label_error=None,
+        escalated=False,
+    )
 
 
 def _converge_merged_issue(
