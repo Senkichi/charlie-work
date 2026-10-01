@@ -13,7 +13,6 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 from _fleet_dispatch_fixtures import (
-    _FakeClock,
     _drained_fleet_result,
     _patch_ci_fleet_dirty_for_hermetic_tests as _patch_ci_fleet_dirty_for_hermetic_tests,
     _patch_self_deploy_for_fleet_tests as _patch_self_deploy_for_fleet_tests,
@@ -21,6 +20,7 @@ from _fleet_dispatch_fixtures import (
 from charlie_work.config import OrchestratorConfig, SupervisorConfig
 from charlie_work.fleet_dispatch import FleetLocalSnapshot, run_fleet_supervise
 from charlie_work.fleet_stop import read_fleet_stop_request, write_fleet_stop_request
+from charlie_work.host.fakes import FakeClock
 from charlie_work.supervise import LocalSnapshot
 
 
@@ -105,9 +105,9 @@ def test_run_fleet_supervise_drain_exits_pre_pass_when_already_at_zero(
         ),
     )
 
-    fc = _FakeClock(auto_advance=1.0)
+    fc = FakeClock(auto_advance=1.0)
     result = run_fleet_supervise(
-        fleet_dir_override=str(tmp_path), clock=fc.now, sleep=fc.sleep, max_passes=3
+        fleet_dir_override=str(tmp_path), clock=fc.monotonic, sleep=fc.sleep, max_passes=3
     )
 
     assert result.ok is True
@@ -181,9 +181,9 @@ def test_run_fleet_supervise_suppresses_head_drift_while_draining(
         ),
     )
 
-    fc = _FakeClock(auto_advance=1.0)
+    fc = FakeClock(auto_advance=1.0)
     result = run_fleet_supervise(
-        fleet_dir_override=str(tmp_path), clock=fc.now, sleep=fc.sleep, max_passes=3
+        fleet_dir_override=str(tmp_path), clock=fc.monotonic, sleep=fc.sleep, max_passes=3
     )
 
     assert result.ok is True
@@ -252,9 +252,9 @@ def test_run_fleet_supervise_plain_stop_overrides_a_latched_drain(
         ),
     )
 
-    fc = _FakeClock(auto_advance=1.0)
+    fc = FakeClock(auto_advance=1.0)
     result = run_fleet_supervise(
-        fleet_dir_override=str(tmp_path), clock=fc.now, sleep=fc.sleep, max_passes=3
+        fleet_dir_override=str(tmp_path), clock=fc.monotonic, sleep=fc.sleep, max_passes=3
     )
 
     assert result.ok is True

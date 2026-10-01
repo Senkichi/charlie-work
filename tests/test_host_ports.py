@@ -28,6 +28,29 @@ def test_fake_clock_advance_moves_now_and_monotonic() -> None:
     assert clock.monotonic() == 40.0
 
 
+def test_fake_clock_default_start_is_epoch_for_monotonic_only_users() -> None:
+    clock = FakeClock()
+    assert clock.now() == datetime(1970, 1, 1, tzinfo=UTC)
+    assert clock.monotonic() == 0.0
+
+
+def test_fake_clock_sleep_records_calls_and_advances_by_slept_seconds() -> None:
+    clock = FakeClock()
+    clock.sleep(2.5)
+    clock.sleep(1.0)
+    assert clock.sleep_calls == [2.5, 1.0]
+    assert clock.monotonic() == 3.5
+    assert clock.now() == datetime(1970, 1, 1, 0, 0, 3, 500000, tzinfo=UTC)
+
+
+def test_fake_clock_sleep_auto_advance_overrides_slept_seconds() -> None:
+    clock = FakeClock(auto_advance=1.0)
+    clock.sleep(30.0)
+    clock.sleep(9.0)
+    assert clock.sleep_calls == [30.0, 9.0]
+    assert clock.monotonic() == 2.0
+
+
 def test_fake_host_swaps_current_and_restores(fake_host) -> None:
     clock = FakeClock(datetime(2026, 1, 1, tzinfo=UTC))
     fake = fake_host(clock=clock)

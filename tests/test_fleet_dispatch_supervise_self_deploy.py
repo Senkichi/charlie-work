@@ -11,7 +11,6 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 from _fleet_dispatch_fixtures import (
-    _FakeClock,
     _drained_fleet_result,
     _patch_ci_fleet_dirty_for_hermetic_tests as _patch_ci_fleet_dirty_for_hermetic_tests,
     _patch_self_deploy_for_fleet_tests as _patch_self_deploy_for_fleet_tests,
@@ -21,6 +20,7 @@ from charlie_work.config import (
     SupervisorConfig,
 )
 from charlie_work.fleet_dispatch import run_fleet_supervise
+from charlie_work.host.fakes import FakeClock
 from charlie_work.instrumentation import query_events
 from charlie_work.supervise import SelfDeployResult
 
@@ -67,8 +67,8 @@ def test_run_fleet_supervise_self_deploys_before_each_pass(
     )
     monkeypatch.setattr("charlie_work.fleet_dispatch.self_deploy", deploy_mock)
 
-    fc = _FakeClock(auto_advance=1.0)
-    result = run_fleet_supervise(max_passes=3, clock=fc.now, sleep=fc.sleep)
+    fc = FakeClock(auto_advance=1.0)
+    result = run_fleet_supervise(max_passes=3, clock=fc.monotonic, sleep=fc.sleep)
 
     assert result.ok is True
     assert result.data["passes"] == 3
@@ -135,10 +135,10 @@ def test_run_fleet_supervise_restarts_when_self_deploy_moves_head(
     )
     monkeypatch.setattr("charlie_work.fleet_dispatch.self_deploy", deploy_mock)
 
-    fc = _FakeClock(auto_advance=1.0)
+    fc = FakeClock(auto_advance=1.0)
     # max_passes=5 proves the exit is driven by the head-change detection,
     # not by exhausting the pass budget.
-    result = run_fleet_supervise(max_passes=5, clock=fc.now, sleep=fc.sleep)
+    result = run_fleet_supervise(max_passes=5, clock=fc.monotonic, sleep=fc.sleep)
 
     assert result.ok is True
     assert result.data["passes"] == 1
@@ -186,8 +186,8 @@ def test_run_fleet_supervise_does_not_restart_when_already_up_to_date(
     )
     monkeypatch.setattr("charlie_work.fleet_dispatch.self_deploy", deploy_mock)
 
-    fc = _FakeClock(auto_advance=1.0)
-    result = run_fleet_supervise(max_passes=3, clock=fc.now, sleep=fc.sleep)
+    fc = FakeClock(auto_advance=1.0)
+    result = run_fleet_supervise(max_passes=3, clock=fc.monotonic, sleep=fc.sleep)
 
     assert result.ok is True
     assert result.data["passes"] == 3
@@ -240,8 +240,8 @@ def test_run_fleet_supervise_does_not_restart_on_deferred_sync_with_unmoved_head
     )
     monkeypatch.setattr("charlie_work.fleet_dispatch.self_deploy", deploy_mock)
 
-    fc = _FakeClock(auto_advance=1.0)
-    result = run_fleet_supervise(max_passes=3, clock=fc.now, sleep=fc.sleep)
+    fc = FakeClock(auto_advance=1.0)
+    result = run_fleet_supervise(max_passes=3, clock=fc.monotonic, sleep=fc.sleep)
 
     assert result.ok is True
     assert result.data["passes"] == 3
@@ -313,8 +313,8 @@ def test_run_fleet_supervise_restarts_on_external_head_drift(
         lambda _root: next(sha_sequence),
     )
 
-    fc = _FakeClock(auto_advance=1.0)
-    result = run_fleet_supervise(max_passes=5, clock=fc.now, sleep=fc.sleep)
+    fc = FakeClock(auto_advance=1.0)
+    result = run_fleet_supervise(max_passes=5, clock=fc.monotonic, sleep=fc.sleep)
 
     assert result.ok is True
     assert result.data["passes"] == 1
@@ -381,9 +381,9 @@ def test_run_fleet_supervise_alerts_when_watchdog_disabled_on_head_drift(
 
     fleet_dir = tmp_path / "fleet"
     with patch("charlie_work.fleet_dispatch._emit_fleet_transition") as mock_emit:
-        fc = _FakeClock(auto_advance=1.0)
+        fc = FakeClock(auto_advance=1.0)
         result = run_fleet_supervise(
-            max_passes=5, clock=fc.now, sleep=fc.sleep, fleet_dir_override=str(fleet_dir)
+            max_passes=5, clock=fc.monotonic, sleep=fc.sleep, fleet_dir_override=str(fleet_dir)
         )
 
     assert result.data["exit_reason"] == "head_drift"
@@ -453,10 +453,10 @@ def test_run_fleet_supervise_no_alert_when_watchdog_armed_or_unknown(
         )
         mock_probe.return_value = WatchdogProbe(armed=armed, detail=f"task state {label}")
         with patch("charlie_work.fleet_dispatch._emit_fleet_transition") as mock_emit:
-            fc = _FakeClock(auto_advance=1.0)
+            fc = FakeClock(auto_advance=1.0)
             run_fleet_supervise(
                 max_passes=5,
-                clock=fc.now,
+                clock=fc.monotonic,
                 sleep=fc.sleep,
                 fleet_dir_override=str(tmp_path / "fleet"),
             )
@@ -518,9 +518,9 @@ def test_run_fleet_supervise_alerts_when_watchdog_disabled_on_self_deploy(
 
     fleet_dir = tmp_path / "fleet"
     with patch("charlie_work.fleet_dispatch._emit_fleet_transition") as mock_emit:
-        fc = _FakeClock(auto_advance=1.0)
+        fc = FakeClock(auto_advance=1.0)
         result = run_fleet_supervise(
-            max_passes=5, clock=fc.now, sleep=fc.sleep, fleet_dir_override=str(fleet_dir)
+            max_passes=5, clock=fc.monotonic, sleep=fc.sleep, fleet_dir_override=str(fleet_dir)
         )
 
     assert result.data["exit_reason"] == "self_deploy"
@@ -585,10 +585,10 @@ def test_run_fleet_supervise_self_deploy_error_dedups_across_passes(
     )
     monkeypatch.setattr("charlie_work.fleet_dispatch.self_deploy", deploy_mock)
 
-    fc = _FakeClock(auto_advance=1.0)
+    fc = FakeClock(auto_advance=1.0)
     run_fleet_supervise(
         max_passes=2,
-        clock=fc.now,
+        clock=fc.monotonic,
         sleep=fc.sleep,
         fleet_dir_override=str(tmp_path / "fleet"),
     )
@@ -678,10 +678,10 @@ def test_run_fleet_supervise_self_deploy_failure_success_failure_emits_three_tra
     # (see test_run_fleet_supervise_restarts_when_self_deploy_moves_head),
     # which would end the loop after pass 2 and never reach the third
     # failure this test needs to observe.
-    fc = _FakeClock(auto_advance=1.0)
+    fc = FakeClock(auto_advance=1.0)
     run_fleet_supervise(
         max_passes=3,
-        clock=fc.now,
+        clock=fc.monotonic,
         sleep=fc.sleep,
         fleet_dir_override=str(tmp_path / "fleet"),
     )
@@ -757,10 +757,10 @@ def test_run_fleet_supervise_self_deploy_success_clears_error_baseline(
     )
     monkeypatch.setattr("charlie_work.fleet_dispatch.self_deploy", deploy_mock)
 
-    fc = _FakeClock(auto_advance=1.0)
+    fc = FakeClock(auto_advance=1.0)
     run_fleet_supervise(
         max_passes=2,
-        clock=fc.now,
+        clock=fc.monotonic,
         sleep=fc.sleep,
         fleet_dir_override=str(tmp_path / "fleet"),
     )

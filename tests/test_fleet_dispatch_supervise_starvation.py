@@ -12,7 +12,6 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 from _fleet_dispatch_fixtures import (
-    _FakeClock,
     _drained_fleet_result,
     _patch_ci_fleet_dirty_for_hermetic_tests as _patch_ci_fleet_dirty_for_hermetic_tests,
     _patch_self_deploy_for_fleet_tests as _patch_self_deploy_for_fleet_tests,
@@ -23,6 +22,7 @@ from charlie_work.config import (
     SupervisorConfig,
 )
 from charlie_work.fleet_dispatch import run_fleet_supervise
+from charlie_work.host.fakes import FakeClock
 from charlie_work.supervise import SelfDeployResult
 
 
@@ -75,8 +75,8 @@ def test_run_fleet_supervise_drains_new_dispatch_while_sync_starved(
     )
     monkeypatch.setattr("charlie_work.fleet_dispatch.self_deploy", deploy_mock)
 
-    fc = _FakeClock(auto_advance=1.0)
-    result = run_fleet_supervise(max_passes=3, clock=fc.now, sleep=fc.sleep)
+    fc = FakeClock(auto_advance=1.0)
+    result = run_fleet_supervise(max_passes=3, clock=fc.monotonic, sleep=fc.sleep)
 
     assert result.ok is True
     # The loop keeps running -- a starved deferral is not a restart reason.
@@ -152,8 +152,8 @@ def test_run_fleet_supervise_drain_lifts_once_starved_sync_lands(
     )
     monkeypatch.setattr("charlie_work.fleet_dispatch.self_deploy", deploy_mock)
 
-    fc = _FakeClock(auto_advance=1.0)
-    result = run_fleet_supervise(max_passes=3, clock=fc.now, sleep=fc.sleep)
+    fc = FakeClock(auto_advance=1.0)
+    result = run_fleet_supervise(max_passes=3, clock=fc.monotonic, sleep=fc.sleep)
 
     assert result.ok is True
     assert result.data["passes"] == 3
