@@ -25,6 +25,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from charlie_work.github_capabilities.cross_repo_blockers import CrossRepoBlocker
 from charlie_work.paths import ResolvedLayout
 from charlie_work.workflow_delegation import as_property, as_staticmethod
 
@@ -64,6 +65,10 @@ def _is_dead_blocker(
     and will unblock on the next janitor pass once CI reports. The
     ``escalated`` status stays dead unconditionally.
     """
+    if isinstance(blocker_number, CrossRepoBlocker):
+        # Issue #2005: local state cannot adjudicate a foreign blocker, and
+        # str() would alias it onto the same-numbered local issue.
+        return False
     issue_entry = state.get("issues", {}).get(str(blocker_number), {})
     if isinstance(issue_entry, dict) and issue_entry.get("status") == "escalated":
         return True

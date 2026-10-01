@@ -13,6 +13,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TypedDict
@@ -205,6 +206,68 @@ def _as_text(value: object) -> str:
     return str(value) if value else ""
 
 
+# Layered onto every child's env (issue #2139). ``GIT_ASK_YESNO=false`` makes
+# Git for Windows answer its "Unlink of file ... failed. Should I try again?
+# (y/n)" retry prompt with "no" instead of waiting on a console;
+# ``GIT_TERMINAL_PROMPT=0`` does the same for credential prompts. A caller's
+# ``extra_env`` still wins if it sets either key.
+_NON_INTERACTIVE_ENV: dict[str, str] = {"GIT_ASK_YESNO": "false", "GIT_TERMINAL_PROMPT": "0"}
+
+# Bound on draining the pipes after the process tree is killed. If a
+# descendant the tree kill could not reach still holds the inherited pipe
+# handles, the drain gives up after this long and the pipes are closed.
+_POST_KILL_DRAIN_SECONDS = 5
+
+
+def _kill_tree_and_drain(proc: subprocess.Popen[str]) -> tuple[str, str]:
+    """Kill ``proc``'s whole process tree, then drain its pipes with a bound.
+
+    ``subprocess.run(timeout=...)`` is not a bound on Windows: it kills only the
+    direct child and then calls ``communicate()`` with no timeout, which blocks
+    for as long as any surviving descendant (e.g. the real git under the
+    ``git.exe`` launcher) holds the inherited pipe handles (issue #2139). Never
+    raises and never blocks unbounded; returns whatever output was drained.
+    """
+    # Lazy import: ``process_utils`` imports this module at module scope.
+    from .process_utils import kill_process_tree
+
+    try:
+        kill_process_tree(proc.pid)
+    except Exception:  # noqa: BLE001 - best-effort; the direct kill below still runs
+        pass
+    try:
+        proc.kill()
+    except OSError:
+        pass
+    try:
+        stdout, stderr = proc.communicate(timeout=_POST_KILL_DRAIN_SECONDS)
+        return stdout or "", stderr or ""
+    except (subprocess.TimeoutExpired, OSError, ValueError) as exc:
+        partial = (
+            (_as_text(exc.stdout), _as_text(exc.stderr))
+            if isinstance(exc, subprocess.TimeoutExpired)
+            else ("", "")
+        )
+    # A survivor still holds the pipes. Closing them synchronously would block
+    # too: ``communicate``'s reader thread holds each buffered reader's lock
+    # while blocked in ``ReadFile``, and ``close()`` waits for that lock.
+    # Hand the close to a daemon thread so it completes whenever the survivor
+    # finally exits, without ever stalling the caller.
+    threading.Thread(
+        target=_close_pipes, args=(proc,), daemon=True, name=f"run-captured-close-{proc.pid}"
+    ).start()
+    return partial
+
+
+def _close_pipes(proc: subprocess.Popen[str]) -> None:
+    for pipe in (proc.stdin, proc.stdout, proc.stderr):
+        try:
+            if pipe is not None:
+                pipe.close()
+        except (OSError, ValueError):
+            pass
+
+
 def run_captured(
     command: list[str] | str,
     *,
@@ -219,41 +282,54 @@ def run_captured(
 
     ``extra_env``, when given, is layered on top of (never in place of) the
     current process environment -- a full replacement would drop ``PATH`` and
-    break the child's ability to even find ``git``. Omitted (the default),
-    the child inherits the parent environment unchanged, matching prior
-    behavior for every existing call site.
+    break the child's ability to even find ``git``. ``_NON_INTERACTIVE_ENV``
+    is always layered between the two, so ``extra_env`` can still override it.
+
+    ``timeout_seconds`` bounds the whole call, descendants included: on
+    timeout the process *tree* is killed and the pipe drain is itself bounded
+    (issue #2139). ``stdin=None`` gives the child ``DEVNULL`` -- never the
+    parent's stdin -- so an interactive prompt reads EOF instead of waiting.
     """
-    env = {**os.environ, **extra_env} if extra_env else None
+    env = {**os.environ, **_NON_INTERACTIVE_ENV, **(extra_env or {})}
+    # POSIX: a new session puts the child in its own process group so
+    # ``kill_process_tree``'s ``killpg`` can reach its descendants (it refuses
+    # the caller's own group), and drops the controlling terminal.
+    session_kwargs = {"start_new_session": True} if os.name != "nt" else {}
     try:
-        completed = subprocess.run(
+        proc = subprocess.Popen(
             command,
             cwd=str(cwd),
             text=True,
             encoding="utf-8",
             errors="replace",
-            capture_output=True,
-            timeout=timeout_seconds,
+            stdin=subprocess.DEVNULL if stdin is None else subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             shell=shell,
-            check=False,
-            input=stdin,
             env=env,
+            **session_kwargs,
             **hidden_console_kwargs(),
         )
-    except subprocess.TimeoutExpired as exc:
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        return RunResult(returncode=None, stdout="", stderr="", error=str(exc))
+    try:
+        stdout, stderr = proc.communicate(input=stdin, timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        stdout, stderr = _kill_tree_and_drain(proc)
         return RunResult(
             returncode=None,
-            stdout=_as_text(exc.stdout),
-            stderr=_as_text(exc.stderr),
+            stdout=stdout,
+            stderr=stderr,
             timed_out=True,
             error=f"command timed out after {timeout_seconds}s",
         )
-    except OSError as exc:
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        _kill_tree_and_drain(proc)
         return RunResult(returncode=None, stdout="", stderr="", error=str(exc))
-    except subprocess.SubprocessError as exc:
-        return RunResult(returncode=None, stdout="", stderr="", error=str(exc))
+    returncode = proc.returncode
     return RunResult(
-        returncode=completed.returncode,
-        stdout=completed.stdout or "",
-        stderr=completed.stderr or "",
-        error=None if completed.returncode == 0 else f"command exited {completed.returncode}",
+        returncode=returncode,
+        stdout=stdout or "",
+        stderr=stderr or "",
+        error=None if returncode == 0 else f"command exited {returncode}",
     )

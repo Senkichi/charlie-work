@@ -32,6 +32,21 @@ $logDir = Join-Path $root '.var\charlie-work\logs'
 if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Force -Path $logDir | Out-Null }
 $log = Join-Path $logDir 'fleet-pass.log'
 
+# Issue #1776: refuse to start a supervisor while the operator pause flag exists,
+# so this scheduled task can stay enabled and a pause survives reboot/logon.
+# Mirrors layout.fleet_pause_path / fleet_paths.fleet_dir (CHARLIE_WORK_FLEET_DIR,
+# else %LOCALAPPDATA%\charlie-work) -- no Python has run yet, so the filename is
+# a literal pinned to layout.FLEET_PAUSE_FILENAME by tests/test_fleet_pause.py.
+# Exit 0: a honored pause is not a launcher failure. `charlie fleet resume`
+# removes the flag and the next tick launches normally.
+$fleetDir = $env:CHARLIE_WORK_FLEET_DIR
+if (-not $fleetDir) { $fleetDir = Join-Path $env:LOCALAPPDATA 'charlie-work' }
+$pauseFlag = Join-Path $fleetDir 'fleet-pause.json'
+if (Test-Path -LiteralPath $pauseFlag) {
+    "--- fleet supervise-loop NOT started: fleet paused ($pauseFlag present); run 'charlie fleet resume' $(Get-Date -Format o) ---" | Out-File -FilePath $log -Append -Encoding utf8
+    exit 0
+}
+
 # Must name the same command as the exit marker below. These two lines bracket one
 # run in the log, and #862 changed the command under the exit marker only, leaving a
 # pass that started as "supervise" and ended as "supervise-loop" -- which reads like
