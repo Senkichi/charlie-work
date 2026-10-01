@@ -68,5 +68,9 @@ def _local_gate_infra_relaunch(
         base_ref=base_ref,
         decision=decision,
         reason="infra_relaunch",
+        # Carry the sibling bounds: resetting them here would let an
+        # infra/orphan/resync alternation evade every one of the three.
+        resync_count=int(record.get("local_suite_resync_count") or 0),
+        orphan_count=int(record.get("local_suite_orphan_count") or 0),
         infra_relaunch_count=relaunches,
     )

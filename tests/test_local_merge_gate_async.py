@@ -482,6 +482,10 @@ def test_dead_pid_missing_result_relaunches_bounded_then_escalates(
 
     for orphan in range(1, LOCAL_SUITE_GATE_MAX_ORPHANS + 1):
         _kill_claimed_gate(app, 7)
+        # The kill is not atomic: the runner wrapper can write a rc!=0 result in
+        # the window between its child and itself dying. That is an infra
+        # outcome (#2127), not the orphan this test exercises -- drop it.
+        _gate_paths(app, 7).result.unlink(missing_ok=True)
         results = app._local_merge_approved()
         assert results[0]["outcome"] == "suite_launched", f"orphan {orphan}"
         state = load_state_locked(app.paths.state_file)
@@ -493,6 +497,7 @@ def test_dead_pid_missing_result_relaunches_bounded_then_escalates(
         assert state["prs"]["7"]["status"] == "approved"
 
     _kill_claimed_gate(app, 7)
+    _gate_paths(app, 7).result.unlink(missing_ok=True)  # kill-window result, see above
     results = app._local_merge_approved()
 
     assert results[0]["outcome"] == "error"
