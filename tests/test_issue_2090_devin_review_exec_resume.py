@@ -87,6 +87,7 @@ class _Rig:
         monkeypatch.setattr(devin_review_resume, "write_worktree_marker", lambda *a, **k: None)
         monkeypatch.setattr("charlie_work.worker_fate.is_alive", alive)
         monkeypatch.setattr("charlie_work.dispatch_selection.is_pid_alive", alive)
+        monkeypatch.setattr("charlie_work.stalled_review_reap.is_pid_alive", alive)
 
     def seed_dead_review(self, log_text: str = REJECTION, *, pid: int = 40_001) -> None:
         checkout = self.reviews_dir / f"pr-{PR}"
@@ -458,6 +459,105 @@ def test_resume_never_blocks_on_the_worker() -> None:
     src = Path(devin_review_resume.__file__).read_text(encoding="utf-8")
     assert ".wait(" not in src and ".communicate(" not in src
     assert subprocess  # (module imported for the Popen-stderr redirect constant)
+
+
+# --- issue #2162: the stall sweep must not reap a resumed review ---------------
+
+
+def test_resumed_review_survives_the_stall_sweep_and_its_verdict_is_recorded(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from datetime import UTC, datetime
+
+    from charlie_work.stalled_review_reap import _detect_and_handle_stalled_reviews
+
+    rig = _rig(monkeypatch, tmp_path)
+    rig.seed_dead_review()  # original dispatch is far older than the stale timeout
+    rig.next_output = [VERDICT]
+    rig.reap()  # resume launches inside the harvest
+    rig.finish_resumed()  # ...and exits before the sweep runs
+
+    app = rig.app
+    stalled = _detect_and_handle_stalled_reviews(
+        rig.reviews_dir,
+        app.paths.state_file,
+        app.config,
+        app.repo_root,
+        write_gate=app.write_gate,
+        now=datetime.now(UTC),
+    )
+
+    assert stalled == []
+    assert rig.events("review_dispatch_stalled") == []
+    claim = load_state(app.paths.state_file)["prs"][str(PR)]
+    assert claim["review_dispatch_status"] == "review_dispatch_dispatched"
+    assert [r["decision"] for r in rig.reap()["recorded"]] == ["approved"]
+
+
+def test_truly_dead_stale_claim_without_sidecar_is_still_reaped(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from datetime import UTC, datetime
+
+    rig = _rig(monkeypatch, tmp_path)
+    rig.seed_dead_review()
+    (rig.reviews_dir / f"issue-{PR}.json").unlink()
+
+    rig.app._run_review_reap_sweeps(datetime.now(UTC))
+
+    assert len(rig.events("review_dispatch_stalled")) == 1
+    claim = load_state(rig.app.paths.state_file)["prs"][str(PR)]
+    assert claim["review_dispatch_status"] == "review_dispatch_failed"
+
+
+def test_resume_restamps_claim_age_and_keeps_the_budget_key_in_step(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    rig = _rig(monkeypatch, tmp_path, review_exec_rejection_max_resumes=1)
+    rig.seed_dead_review()
+    rig.reap()
+    claim = load_state(rig.app.paths.state_file)["prs"][str(PR)]
+    assert claim["review_dispatched_at"] != "2026-09-30T18:18:27Z"
+    assert claim["review_exec_resume_dispatched_at"] == claim["review_dispatched_at"]
+    assert claim["review_exec_resume_count"] == 1
+    rig.finish_resumed()
+    assert len(rig.reap()["missed"]) == 1  # cap still enforced
+    assert len(rig.popens) == 1
+
+
+def test_fresh_sidecar_alone_protects_a_stale_claim_from_the_stall_sweep(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Isolates ``fresh_sidecar_pr_keys``: the claim is stale with a dead pid, and only the
+    sidecar (written without a claim restamp) is fresh."""
+    from datetime import UTC, datetime
+
+    from charlie_work.stalled_review_reap import _detect_and_handle_stalled_reviews
+
+    rig = _rig(monkeypatch, tmp_path)
+    rig.seed_dead_review()
+    sidecar_path = rig.reviews_dir / f"issue-{PR}.json"
+    sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    now = datetime.now(UTC)
+    sidecar["started_at"] = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    sidecar_path.write_text(json.dumps(sidecar), encoding="utf-8")
+    before = load_state(rig.app.paths.state_file)["prs"][str(PR)]
+    assert before["review_dispatched_at"] == "2026-09-30T18:18:27Z"  # stale claim
+
+    app = rig.app
+    stalled = _detect_and_handle_stalled_reviews(
+        rig.reviews_dir,
+        app.paths.state_file,
+        app.config,
+        app.repo_root,
+        write_gate=app.write_gate,
+        now=now,
+    )
+
+    assert stalled == []
+    assert rig.events("review_dispatch_stalled") == []
+    claim = load_state(app.paths.state_file)["prs"][str(PR)]
+    assert claim["review_dispatch_status"] == "review_dispatch_dispatched"
 
 
 # --- issue #2110: two concurrent reaps of one dead reviewer are single-owner --
