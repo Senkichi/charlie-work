@@ -463,7 +463,7 @@ def _local_gate_poll(
         if is_pid_alive(pid, start_time):
             started = _iso_dt(record.get("local_suite_started_at"))
             age = (datetime.now(UTC) - started).total_seconds() if started else 0
-            timeout = effective_suite_timeout(self.paths.dispatches)
+            timeout = effective_suite_timeout(self.paths.dispatches, self.paths.state_file)
             if age > timeout:
                 killed = self.write_gate.kill_process_tree(pid, start_time)
                 self._local_gate_clear_claim(pr_key)

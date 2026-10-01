@@ -55,6 +55,7 @@ from .fleet_lanes import (  # noqa: F401  (deliberate re-export)
     _run_fleet_repo_lane,
     _start_fleet_reap_scheduler,
 )
+from .fleet_pause import fleet_pause_pending
 from .fleet_stop import (
     FleetStopState,
     apply_fleet_drain_config,
@@ -104,6 +105,7 @@ from .subprocess_runner import RunResult, no_console_window_kwargs, run_captured
 from .preflight import PreflightPaths, run_preflight
 from .supervise_loop import (
     DEFAULT_MAX_RELAUNCHES,
+    EXIT_FLEET_PAUSED,
     EXIT_RESTART_REQUESTED,
     PREFLIGHT_REFUSAL_EXIT_CODE,
     SuperviseLoopResult,
@@ -2594,6 +2596,10 @@ def _fleet_has_configured_repos(
 # zero-pass alarm also cannot currently tell these cases apart.
 RESTART_EXIT_REASONS = frozenset({"self_deploy", "head_drift"})
 
+# Exit reason for an honored ``fleet-pause.json`` flag (issue #1776). Not a
+# restart reason: a paused supervisor must stay down.
+FLEET_PAUSED_EXIT_REASON = "fleet_paused"
+
 # Bound on the per-repo failure reasons appended to the pass-summary line
 # (#893). ``message`` is operator-facing free text (e.g. "loop completed with
 # N PR error(s)", a tracebacks-derived string from an unclassified exception
@@ -3144,6 +3150,19 @@ def run_fleet_supervise(
                 exit_reason = _exit_reason = stop_reason
                 break
 
+            # Issue #1776: persistent pause flag, read fresh each iteration and
+            # only here -- between passes, never mid-pass. Nothing is killed;
+            # the flag stays until `fleet resume`.
+            if fleet_pause_pending(fleet_dir_override):
+                print(
+                    f"[{datetime.datetime.now().strftime('%H:%M:%S')}] fleet paused "
+                    f"({layout.FLEET_PAUSE_FILENAME} present); exiting (live workers untouched)",
+                    flush=True,
+                )
+                exit_reason = _exit_reason = FLEET_PAUSED_EXIT_REASON
+                _exit_code = EXIT_FLEET_PAUSED
+                break
+
             new_snapshot = _take_fleet_snapshot(fleet_dir_override=fleet_dir_override)
             fallback_due = (now - last_full_pass_at) >= full_pass_interval
             run_pass = _has_fleet_delta(snapshot, new_snapshot) or fallback_due
@@ -3603,6 +3622,7 @@ def run_fleet_supervise(
             "elapsed_seconds": elapsed_s,
             "exit_reason": exit_reason or "unknown",
             "restart_requested": exit_reason in RESTART_EXIT_REASONS,
+            "fleet_paused": exit_reason == FLEET_PAUSED_EXIT_REASON,
         },
     )
 
@@ -3771,7 +3791,9 @@ def run_fleet_supervise_loop(
             on_cap_reached=(
                 on_cap_reached if on_cap_reached is not None else _record_supervise_loop_cap_event
             ),
-            stop_requested=lambda: fleet_stop_pending(fleet_dir_override),
+            stop_requested=lambda: (
+                fleet_stop_pending(fleet_dir_override) or fleet_pause_pending(fleet_dir_override)
+            ),
         )
     except KeyboardInterrupt:
         return supervise_loop_interrupted_result()  # issue #1716
@@ -3788,7 +3810,7 @@ def run_fleet_supervise_loop(
     # instead of being removed. The cap's signal is the distinct log line and the
     # `supervise_relaunch_cap_reached` event, both of which say exactly which
     # condition occurred; the exit code does not need to carry it too.
-    ok = result.last_exit_code in (0, EXIT_RESTART_REQUESTED)
+    ok = result.last_exit_code in (0, EXIT_RESTART_REQUESTED, EXIT_FLEET_PAUSED)
     return CommandResult(
         ok,
         f"supervise-loop: {result.launches} launch(es), {result.relaunches} relaunch(es), "
