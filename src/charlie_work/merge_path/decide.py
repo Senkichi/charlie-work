@@ -22,6 +22,7 @@ from types import MappingProxyType
 from typing import Any, Mapping
 
 from .model import (
+    PersistedPr,
     Accounting,
     AccountingFacts,
     Admission,
@@ -43,6 +44,7 @@ from .model import (
     StageKind,
     SyncOutcome,
     Unavailable,
+    VerdictFact,
 )
 from .rules import (
     CHECK_ROUTE_EXCLUDED_STATUSES,
@@ -56,6 +58,63 @@ from .rules import (
 
 _SYNC_STRATEGIES = frozenset({"front_of_train", "broadcast"})
 _CARRY_FORWARD_FROM_REVOKE = "stale_head_pending_carry_forward"
+SYNC_STRATEGIES = _SYNC_STRATEGIES
+
+
+# --------------------------------------------------------------------------- #
+# Gather guards: the one definition of "does this stage need that fact"
+# --------------------------------------------------------------------------- #
+# A gather step reads a fact only when the stage below would consume it; the
+# predicates live here, next to the stage, so a guard cannot drift from the
+# decision it feeds (the stage raises FactNotGathered if it ever does).
+
+
+def is_head_moved(verdict: VerdictFact, live_head_sha: str | None) -> bool:
+    """The approved head is unknown or differs from the live head."""
+    reviewed = verdict.reviewed_head_sha
+    return reviewed is None or live_head_sha != reviewed
+
+
+def needs_carry_forward(verdict: VerdictFact, live_head_sha: str | None) -> bool:
+    """``AdmissionFacts.carry_forward`` is consumed: approved, head moved, live head known."""
+    return verdict.approved and is_head_moved(verdict, live_head_sha) and bool(live_head_sha)
+
+
+def is_already_in_mergequeue(persisted: PersistedPr | None, admission: Admission) -> bool:
+    """Parked in the merge queue and the label is still on (a revert voids the park)."""
+    status = persisted.status if persisted is not None else None
+    return status == "mergequeue" and not admission.mergequeue_label_reverted
+
+
+def merge_entry(readiness: Readiness, holds: HoldFacts) -> tuple[bool, bool]:
+    """``(escalated_merge_hold, enter)``: may a merge or hand-off be attempted at all.
+
+    The escalated hold leaves ``gate.can_merge`` untouched (#840 / #777b); it
+    only blocks the actions. Shared by ``decide_merge``, the merge-hold read
+    guard and the preview so the three cannot drift.
+    """
+    can_merge = readiness.gate.can_merge
+    escalated = can_merge and (holds.pr_escalated or holds.issue_escalated)
+    enter = (
+        can_merge
+        and holds.should_merge
+        and not escalated
+        and not readiness.human_merge_hold
+        and not readiness.human_merge_check_unavailable
+    )
+    return escalated, enter
+
+
+def merge_hold_read_needed(
+    readiness: Readiness, holds: HoldFacts, *, require_label: bool = True
+) -> bool:
+    """``HoldFacts.merge_hold`` is consumed: a hand-off (or, in preview, a merge) is possible.
+
+    ``require_label=False`` is the dry-run preview's (legacy) behaviour of
+    reading the hold whenever a merge could be attempted, label or not.
+    """
+    _, enter = merge_entry(readiness, holds)
+    return bool(enter and (holds.config.mergequeue_label or not require_label))
 
 
 # --------------------------------------------------------------------------- #
@@ -103,8 +162,7 @@ def decide_admission(
     if not f.verdict.approved:
         return base
 
-    reviewed = f.verdict.reviewed_head_sha
-    head_moved = reviewed is None or f.live_head_sha != reviewed
+    head_moved = is_head_moved(f.verdict, f.live_head_sha)
     base = replace(base, head_moved=head_moved)
     if not head_moved or observed_carry_forward:
         return base
@@ -138,6 +196,59 @@ def decide_admission(
 # --------------------------------------------------------------------------- #
 
 
+def branch_precheck(f: BranchFacts) -> tuple[BranchGate | None, bool, bool]:
+    """Conflict and train-head stages: ``(stop_gate, merge_conflict, sync_failed)``.
+
+    The first stage of ``decide_branch``, exposed so a gather step can stop
+    before the reads the later stages need (a conflict or a non-head PR returns
+    before any base-currency read, as the legacy body did). ``train_head=None``
+    with no ``train_head_param`` means "no other head", so a caller that has
+    not yet listed PRs gets the conflict and param stops only.
+    """
+    adm = f.admission
+    strategy = f.config.update_branch_strategy
+    sync_failed = False
+    merge_conflict = False
+
+    if f.merge_conflict:
+        if f.issue_status in CONFLICT_REWORK_IN_FLIGHT_STATUSES:
+            return (
+                BranchGate(
+                    kind=PlanKind.WAIT,
+                    admission=adm,
+                    stop=BranchStop.CONFLICT_IN_FLIGHT,
+                    merge_conflict=True,
+                ),
+                True,
+                False,
+            )
+        if f.issue_status == "blocked":
+            return (
+                BranchGate(
+                    kind=PlanKind.HOLD,
+                    admission=adm,
+                    stop=BranchStop.CONFLICT_BLOCKED,
+                    merge_conflict=True,
+                ),
+                True,
+                False,
+            )
+        # Any other status -- including "escalated" (issue #776) -- routes.
+        merge_conflict = True
+        sync_failed = True
+
+    if strategy == "front_of_train":
+        head_param = f.train_head_param
+        if head_param is not None:
+            if head_param != f.pr_number:
+                return _not_train_head(adm, merge_conflict), merge_conflict, sync_failed
+        elif isinstance(f.train_head, Unavailable):
+            sync_failed = True
+        elif f.train_head is not None and f.train_head != f.pr_number:
+            return _not_train_head(adm, merge_conflict), merge_conflict, sync_failed
+    return None, merge_conflict, sync_failed
+
+
 def decide_branch(f: BranchFacts, sync: SyncOutcome | None = None) -> BranchGate:
     """Conflict / train-head / branch-sync / stale-base gate.
 
@@ -152,40 +263,11 @@ def decide_branch(f: BranchFacts, sync: SyncOutcome | None = None) -> BranchGate
 
     cfg = f.config
     strategy = cfg.update_branch_strategy
-    sync_failed = False
-    merge_conflict = False
+    stop, merge_conflict, sync_failed = branch_precheck(f)
+    if stop is not None:
+        return stop
 
-    if f.merge_conflict:
-        if f.issue_status in CONFLICT_REWORK_IN_FLIGHT_STATUSES:
-            return BranchGate(
-                kind=PlanKind.WAIT,
-                admission=adm,
-                stop=BranchStop.CONFLICT_IN_FLIGHT,
-                merge_conflict=True,
-            )
-        if f.issue_status == "blocked":
-            return BranchGate(
-                kind=PlanKind.HOLD,
-                admission=adm,
-                stop=BranchStop.CONFLICT_BLOCKED,
-                merge_conflict=True,
-            )
-        # Any other status -- including "escalated" (issue #776) -- routes.
-        merge_conflict = True
-        sync_failed = True
-
-    if strategy == "front_of_train":
-        head_param = f.train_head_param
-        if head_param is not None:
-            if head_param != f.pr_number:
-                return _not_train_head(adm, merge_conflict)
-        elif isinstance(f.train_head, Unavailable):
-            sync_failed = True
-        elif f.train_head is not None and f.train_head != f.pr_number:
-            return _not_train_head(adm, merge_conflict)
-
-    persisted_status = f.persisted.status if f.persisted is not None else None
-    already_in_mergequeue = persisted_status == "mergequeue" and not adm.mergequeue_label_reverted
+    already_in_mergequeue = is_already_in_mergequeue(f.persisted, adm)
 
     gated = False
     if not sync_failed and strategy != "off":
@@ -374,17 +456,10 @@ def decide_merge(readiness: Readiness, holds: HoldFacts) -> MergePlan:
     human_hold = readiness.human_merge_hold
     human_unavailable = readiness.human_merge_check_unavailable
 
-    escalated_merge_hold = can_merge and (holds.pr_escalated or holds.issue_escalated)
+    escalated_merge_hold, enter = merge_entry(readiness, holds)
     should_merge = holds.should_merge
-    enter = (
-        can_merge
-        and should_merge
-        and not escalated_merge_hold
-        and not human_hold
-        and not human_unavailable
-    )
     label = cfg.mergequeue_label
-    read_merge_hold = bool(enter and label)
+    read_merge_hold = merge_hold_read_needed(readiness, holds)
     if read_merge_hold and holds.merge_hold is None and not holds.merge_hold_unavailable:
         raise FactNotGathered("merge_hold is needed: a mergequeue hand-off is possible")
     merge_hold = read_merge_hold and holds.merge_hold is True
