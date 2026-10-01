@@ -7,6 +7,11 @@
 # ONCE below; tests/test_dashboard_launcher.py pins it to the Python constant.
 # Any other exit code ends the loop and is returned to Task Scheduler, whose
 # restart-on-failure policy (3 retries, 1 minute apart) takes over.
+# The relaunch budget is a RATE, not a lifetime count: a normal fleet self-deploys
+# dozens of times a day, so only a burst (more than $maxRelaunches within
+# $windowMinutes minutes, i.e. a crash-looping build) stops the launcher. It then logs
+# the reason and exits 1 so Task Scheduler's failure policy and the repeating trigger
+# in charlie-dashboard-task.xml take over. A short delay separates relaunches.
 # The fleet pause flag is deliberately ignored: the dashboard is read-only.
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
@@ -18,8 +23,9 @@ if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Force -Path $logDi
 $log = Join-Path $logDir 'dashboard.log'
 
 $ExitRestartRequested = 3
-# Bound the relaunch loop so a stale launcher cannot spin forever.
-$maxRelaunches = 20
+$maxRelaunches = 5
+$windowMinutes = 10
+$relaunchDelaySeconds = 5
 
 # Native stderr is redirected inside cmd, never by PowerShell (PS 5.1 wraps it in
 # ErrorRecords and writes UTF-16LE); see the long note in fleet-pass.ps1.
@@ -30,11 +36,22 @@ $env:PYTHONIOENCODING = 'utf-8:surrogateescape'
 
 $cmdLine = "uv run --no-sync --project `"$root`" --directory `"$root`" python -m charlie_work dashboard serve >> `"$log`" 2>&1"
 $exitCode = 0
-for ($attempt = 0; $attempt -le $maxRelaunches; $attempt++) {
+$relaunches = New-Object System.Collections.Generic.List[datetime]
+while ($true) {
     "--- dashboard serve start $(Get-Date -Format o) ---" | Out-File -FilePath $log -Append -Encoding utf8
     & cmd /c $cmdLine
     $exitCode = $LASTEXITCODE
     "--- dashboard serve exit=$exitCode $(Get-Date -Format o) ---" | Out-File -FilePath $log -Append -Encoding utf8
     if ($exitCode -ne $ExitRestartRequested) { break }
+    $now = Get-Date
+    $cutoff = $now.AddMinutes(-$windowMinutes)
+    [void]$relaunches.RemoveAll([Predicate[datetime]]{ param($t) $t -lt $cutoff })
+    if ($relaunches.Count -ge $maxRelaunches) {
+        "--- dashboard launcher giving up: $($relaunches.Count) relaunches within $windowMinutes minutes (crash loop?) $(Get-Date -Format o) ---" | Out-File -FilePath $log -Append -Encoding utf8
+        $exitCode = 1
+        break
+    }
+    $relaunches.Add($now)
+    Start-Sleep -Seconds $relaunchDelaySeconds
 }
 exit $exitCode

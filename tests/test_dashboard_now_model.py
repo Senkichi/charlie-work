@@ -20,6 +20,7 @@ from typing import Any
 
 from charlie_work import cli, fleet_status
 from charlie_work.dashboard import now_model, sources
+from charlie_work.dashboard.now_shell import ps_quote
 
 import pytest
 
@@ -77,7 +78,7 @@ def test_needs_me_exact_rows_and_order(fleet) -> None:
         Finding("loop", "owner/alpha", "ok", "fine"),
     ]
     items = now_model.build_now_model(_read(fleet), NOW, findings).needs_me
-    a = shlex.quote(_root(fleet, "owner/alpha"))
+    a = ps_quote(_root(fleet, "owner/alpha"))
 
     got = [
         (i.kind, i.severity, i.repo, i.age_seconds, i.reason, i.command, i.as_of_snapshot)

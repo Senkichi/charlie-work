@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import re
+
+import pytest
 from dataclasses import replace
 from datetime import UTC, datetime
 from html.parser import HTMLParser
@@ -22,6 +24,7 @@ from charlie_work.dashboard.now_types import (
     RunnerRepo,
     UnreachableReason,
 )
+from charlie_work.dashboard.pages import now_fmt
 from charlie_work.dashboard.pages.now import render_fragment, render_now
 from charlie_work.dashboard.read_model import ModelState
 from charlie_work.dashboard.theme import generate_css, static_asset
@@ -310,3 +313,30 @@ def test_done_24h_is_off_the_stock_scale() -> None:
 def test_theme_query_override_is_not_persisted() -> None:
     js = static_asset("theme-init.js").read_text(encoding="utf-8")
     assert 'get("theme")' in js and "setItem" not in js
+
+
+@pytest.mark.parametrize(
+    "key", ["..", "../..", "a/..", "../x", "a/b/c", "fleet", "x/y z", 'a/"><b', "", "a//b", "./x"]
+)
+def test_hrefs_are_built_only_from_valid_slugs(key: str) -> None:
+    assert now_fmt.repo_url(key) is None
+    assert now_fmt.issue_url(key, 7) is None
+    assert now_fmt.link(now_fmt.repo_url(key), "t") == '<span class="n">t</span>'
+
+
+@pytest.mark.parametrize("key", ["owner/name", "local/mdls", "a.b/c_d-e"])
+def test_valid_slugs_keep_their_links(key: str) -> None:
+    assert now_fmt.repo_url(key) == f"/repo/{key}"
+    assert now_fmt.issue_url(key, 7) == f"/issue/{key}/7"
+
+
+def test_page_has_no_href_for_a_dot_dot_repo_key() -> None:
+    base = _model()
+    model = replace(
+        base,
+        freshness=(RepoFreshness("../..", NOW, 24.0, False, None), *base.freshness),
+        needs_me=(_item("Needs a look", repo="..", number=7), *base.needs_me),
+    )
+    page = _page(model)
+    assert "/repo/.." not in page and "/issue/../" not in page
+    assert 'href="/repo/../' not in page

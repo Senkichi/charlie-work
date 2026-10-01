@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <Task version="1.3" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
-    <Description>charlie-work fleet dashboard: read-only loopback web UI (`charlie dashboard serve`). Starts at logon; the launcher relaunches in-process when the server exits with the restart-requested code, and any other non-zero exit is retried by Task Scheduler (3 retries, 1 minute apart).</Description>
+    <Description>charlie-work fleet dashboard: read-only loopback web UI (`charlie dashboard serve`). Starts at logon; the launcher relaunches in-process when the server exits with the restart-requested code, and a relaunch crash loop (more than 5 within 10 minutes) or any other non-zero exit is retried by Task Scheduler (3 retries, 1 minute apart), and a 30-minute repeating trigger revives a stopped dashboard.</Description>
     <URI>\charlie-dashboard</URI>
   </RegistrationInfo>
   <!-- Template: UserId (below) and the script path in Actions/Exec/Arguments must be
@@ -35,6 +35,21 @@
       <Enabled>true</Enabled>
       <UserId>S-1-5-21-REPLACE-WITH-YOUR-USER-SID</UserId>
     </LogonTrigger>
+    <!-- Revival: RestartOnFailure gives up after 3 tries and a bind failure or the
+         launcher's crash-loop stop leaves the dashboard down until next logon. A
+         repeating trigger starts it again; MultipleInstancesPolicy=IgnoreNew makes it a
+         no-op while the dashboard is already running. -->
+    <CalendarTrigger>
+      <StartBoundary>2026-01-01T00:00:00</StartBoundary>
+      <Enabled>true</Enabled>
+      <Repetition>
+        <Interval>PT30M</Interval>
+        <Duration>P1D</Duration>
+      </Repetition>
+      <ScheduleByDay>
+        <DaysInterval>1</DaysInterval>
+      </ScheduleByDay>
+    </CalendarTrigger>
   </Triggers>
   <Actions Context="Author">
     <Exec>

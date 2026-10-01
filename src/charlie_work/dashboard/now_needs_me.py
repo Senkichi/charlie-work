@@ -7,13 +7,13 @@ Commands use only subcommands that exist in ``cli.py`` (``verdict``, ``unescalat
 
 from __future__ import annotations
 
-import shlex
 from collections.abc import Sequence
 from dataclasses import replace
 from datetime import datetime
 from typing import Any
 
 from . import now_cadence
+from .now_shell import join_command
 from .now_access import dict_list, label_set, pos_int, snapshot_data
 from .now_types import (
     NEEDS_ME_GROUPS,
@@ -35,7 +35,7 @@ _DECISION_PLACEHOLDER = "<approved|request_changes|blocked>"
 
 def _cli(repo: RepoRead, *args: str) -> str:
     """A copy-paste ``charlie`` command targeting ``repo`` (``--repo`` is a global flag)."""
-    return shlex.join(["charlie", "--repo", repo.repo_root, *args])
+    return join_command(["charlie", "--repo", repo.repo_root, *args])
 
 
 def needs_me_items(

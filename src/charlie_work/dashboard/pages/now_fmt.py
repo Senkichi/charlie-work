@@ -28,12 +28,27 @@ def short_repo(key: str) -> str:
     return key.rsplit("/", 1)[-1] or key
 
 
-def repo_url(key: str, **query: str) -> str:
+# ``owner/name`` (GitHub) or ``local/<name>`` (no-remote lane): exactly two segments of
+# slug characters, neither of them a dot segment. Anything else (``..``, extra ``/``,
+# ``fleet``, hostile text) is not a repo and gets no link.
+_SLUG = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+
+
+def valid_slug(key: str) -> bool:
+    return _SLUG.fullmatch(key) is not None and all(p.strip(".") for p in key.split("/"))
+
+
+def repo_url(key: str, **query: str) -> str | None:
+    """Drill-down href for a validated repo slug, else ``None`` (render without a link)."""
+    if not valid_slug(key):
+        return None
     base = "/repo/" + quote(key, safe="/")
     return f"{base}?{urlencode(query)}" if query else base
 
 
-def issue_url(repo: str, number: int) -> str:
+def issue_url(repo: str, number: int) -> str | None:
+    if not valid_slug(repo):
+        return None
     return f"/issue/{quote(repo, safe='/')}/{int(number)}"
 
 
@@ -41,8 +56,10 @@ def flow_url(stage: str) -> str:
     return f"/flow/{slug(stage)}"
 
 
-def link(href: str, text: object, cls: str = "n", title: str | None = None) -> str:
+def link(href: str | None, text: object, cls: str = "n", title: str | None = None) -> str:
     tip = f' title="{esc(title)}"' if title else ""
+    if href is None:
+        return f'<span class="{esc(cls)}"{tip}>{esc(text)}</span>'
     return f'<a class="{esc(cls)}" href="{esc(href)}"{tip}>{esc(text)}</a>'
 
 

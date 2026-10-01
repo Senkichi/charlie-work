@@ -25,22 +25,24 @@ from .now_needs import render_needs
 def _fresh_chip(f: RepoFreshness) -> str:
     name = esc(short_repo(f.repo))
     when = esc(age(f.age_seconds))
-    href = esc(repo_url(f.repo))
+    url = repo_url(f.repo)
+    href = f' href="{esc(url)}"' if url else ""
+    tag = "a" if url else "span"
     if f.error:
         return (
-            f'<a class="chip is-danger text-danger" href="{href}" '
+            f'<{tag} class="chip is-danger text-danger"{href} '
             f'title="{esc(f.repo)}: snapshot unreadable: {esc(f.error)}">'
-            f'{name} <span class="n">{when}</span> read error</a>'
+            f'{name} <span class="n">{when}</span> read error</{tag}>'
         )
     if f.stale:
         return (
-            f'<a class="chip is-warn text-warn" href="{href}" '
+            f'<{tag} class="chip is-warn text-warn"{href} '
             f'title="{esc(f.repo)}: no loop pass within the stale threshold">'
-            f'{name} <span class="n">{when}</span> stale</a>'
+            f'{name} <span class="n">{when}</span> stale</{tag}>'
         )
     return (
-        f'<a class="chip" href="{href}" title="{esc(f.repo)}">'
-        f'{name} <span class="n">{when}</span></a>'
+        f'<{tag} class="chip"{href} title="{esc(f.repo)}">'
+        f'{name} <span class="n">{when}</span></{tag}>'
     )
 
 

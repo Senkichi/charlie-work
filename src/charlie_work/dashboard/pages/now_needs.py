@@ -83,7 +83,7 @@ def _reason_html(reason: str) -> str:
     return f'<b class="ref">{esc(m.group(1))}</b>{esc(text[m.end(1) :])}'
 
 
-def _target(item: NeedsMeItem) -> str:
+def _target(item: NeedsMeItem) -> str | None:
     if item.number is not None and item.repo != "fleet":
         return issue_url(item.repo, item.number)
     return repo_url(item.repo)
@@ -114,6 +114,12 @@ def _commands(item: NeedsMeItem, row_id: str) -> str:
     return out + "</span>"
 
 
+def _go(row_id: str, target: str | None, reason: str) -> str:
+    if target is None:
+        return f'<span id="{esc(row_id)}-go">{_reason_html(reason)}</span>'
+    return f'<a id="{esc(row_id)}-go" href="{esc(target)}">{_reason_html(reason)}</a>'
+
+
 def _row(item: NeedsMeItem, over: bool = False) -> str:
     tone, glyph, word = _TONE.get(item.severity, _TONE["warn"])
     kind = _KIND.get(item.kind, item.kind)
@@ -121,7 +127,13 @@ def _row(item: NeedsMeItem, over: bool = False) -> str:
         kind = "Verdict"
     row_id = stable_id("nm", item.group, item.kind, item.repo, item.number, item.reason)
     target = _target(item)
-    age_title = "age not recorded" if item.age_seconds is None else f"{word}, open drill-down"
+    age_title = (
+        "age not recorded"
+        if item.age_seconds is None
+        else f"{word}, open drill-down"
+        if target
+        else word
+    )
     age_cls = "age n unk" if item.age_seconds is None else "age n"
     short = item.repo.rsplit("/", 1)[-1]
     snap = " · as of snapshot" if item.as_of_snapshot else ""
@@ -133,7 +145,7 @@ def _row(item: NeedsMeItem, over: bool = False) -> str:
         f'<span class="repo" title="{esc(item.repo)}">{esc(short)}</span>'
         f'<span class="kind">{esc(kind)}<span class="sr"> ({esc(word)})</span></span>'
         f'<span class="why" title="{esc(item.reason + snap)}">'
-        f'<a id="{esc(row_id)}-go" href="{esc(target)}">{_reason_html(item.reason)}</a></span>'
+        f"{_go(row_id, target, item.reason)}</span>"
         f'<span class="cmds">{_commands(item, row_id)}</span></li>'
     )
 

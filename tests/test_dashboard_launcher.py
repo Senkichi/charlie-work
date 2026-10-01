@@ -25,6 +25,15 @@ def test_task_triggers_at_logon_and_retries_on_failure() -> None:
     assert root.find("t:RegistrationInfo/t:URI", NS).text == "\\charlie-dashboard"
 
 
+def test_task_has_a_repeating_revival_trigger() -> None:
+    cal = _task().find("t:Triggers/t:CalendarTrigger", NS)
+    assert cal is not None
+    assert cal.find("t:Repetition/t:Interval", NS).text == "PT30M"
+    assert cal.find("t:Repetition/t:Duration", NS).text == "P1D"
+    # A running dashboard must make the repeat a no-op, never a second server.
+    assert _task().find("t:Settings/t:MultipleInstancesPolicy", NS).text == "IgnoreNew"
+
+
 def test_task_runs_hidden_vbs_wrapper() -> None:
     args = _task().find("t:Actions/t:Exec/t:Arguments", NS).text
     assert "dashboard-hidden.vbs" in args
@@ -55,3 +64,18 @@ def test_launcher_shape() -> None:
     assert "*>>" not in code and "2>&1" in code  # redirect inside cmd
     assert "PYTHONIOENCODING = 'utf-8:surrogateescape'" in code
     assert "exit $exitCode" in code
+
+
+def _launcher_code() -> str:
+    raw = (SCRIPTS / "dashboard.ps1").read_text(encoding="utf-8-sig")
+    return "\n".join(ln for ln in raw.splitlines() if not ln.lstrip().startswith("#"))
+
+
+def test_relaunch_budget_is_a_rate_with_a_delay_not_a_lifetime_count() -> None:
+    code = _launcher_code()
+    assert re.search(r"^\$maxRelaunches = 5\s*$", code, re.MULTILINE)
+    assert re.search(r"^\$windowMinutes = 10\s*$", code, re.MULTILINE)
+    assert "$relaunches.RemoveAll" in code  # entries age out of the window
+    assert "Start-Sleep -Seconds $relaunchDelaySeconds" in code
+    assert "giving up" in code  # the stop reason is logged
+    assert "for ($attempt" not in code  # the old lifetime counter
