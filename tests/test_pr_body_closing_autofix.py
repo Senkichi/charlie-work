@@ -174,6 +174,26 @@ def test_rerun_refused_while_running_holds_without_escalation(tmp_path: Path) ->
     assert load_state(paths.state_file)["issues"].get("123", {}).get("status") != "escalated"
 
 
+def test_stale_branch_target_mismatch_escalates_without_defanging_bound_reference(
+    tmp_path: Path,
+) -> None:
+    """The gate resolves its target without the open-issue validator (branch -> 999,
+    not an open issue); review() binds the PR to 123 via the body's ``Closes #123``.
+    Defanging that keyword would unlink the PR from its real lane, so escalate."""
+    fake = _GateFake(failed_steps=[_GATE_STEP], body="Closes #123\n\nTests: added.")
+    fake.prs[0]["headRefName"] = "agent/issue-999-stale-branch"
+
+    result, paths, config = _review(tmp_path, fake)
+
+    assert result.data.get("closing_keyword_autofix_failed") is True
+    assert fake.pr_edits == []
+    assert fake.rerun_calls == []
+    state = load_state(paths.state_file)
+    assert state["issues"]["123"]["status"] == "escalated"
+    assert state["prs"]["456"]["closing_keyword_autofix_failure"] == "declared_target_mismatch"
+    assert (123, config.labels.needs_rework) not in fake.labels_added
+
+
 def test_rewrite_keeps_declared_target_and_negated_references() -> None:
     body = "Closes #123. Also fixes #60 and resolved #61, but does not close #62."
 

@@ -27,7 +27,8 @@ Routing contract (every exit of ``autofix_body_closing_kw``):
   says nothing about the body, and an escalation is terminal while Lint is red).
   A scan-unavailable hold spends the per-head attempt budget, so a persistent
   fetch failure escalates via ``attempt_cap_exceeded`` instead of holding forever;
-- body edit or rerun failure, or a body finding with no declared target -> escalate.
+- body edit or rerun failure, a body finding with no declared target, or a gate-resolved
+  target that disagrees with the bound issue (``declared_target_mismatch``) -> escalate.
 """
 
 from __future__ import annotations
@@ -81,6 +82,7 @@ def autofix_body_closing_kw(
     result = autofix_closing_keyword_pr_body(
         app.gh,
         pr_number=pr_number,
+        issue_number=issue_number,
         run_ids=run_ids,
         branch_prefix=app.config.dispatch.branch_prefix,
         body_path=app.paths.prs / f"pr-{pr_number}" / "closing-keyword-autofix-body.md",

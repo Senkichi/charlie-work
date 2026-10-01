@@ -186,6 +186,7 @@ def autofix_closing_keyword_pr_body(
     gh: Any,
     *,
     pr_number: int,
+    issue_number: int,
     run_ids: Sequence[int],
     branch_prefix: str,
     body_path: Path,
@@ -212,6 +213,12 @@ def autofix_closing_keyword_pr_body(
         return AutofixResult(AutofixOutcome.NOT_APPLICABLE, "commit_message_finding")
     if scan.intended is None and scan.body_findings:
         return AutofixResult(AutofixOutcome.FAILED, "no_declared_target")
+    if scan.body_findings and scan.intended != issue_number:
+        # The gate resolves its target without the orchestrator's branch-issue
+        # validator, so on a stale ``agent/issue-N`` branch it can name a different
+        # issue than the one ``review()`` bound the PR to. Defanging the body's
+        # ``Closes #M`` there would unlink the PR from its real lane; escalate.
+        return AutofixResult(AutofixOutcome.FAILED, "declared_target_mismatch")
 
     rewritten = tuple(f.matched_text for f in scan.body_findings)
     if scan.body_findings:
