@@ -141,7 +141,7 @@ def _persist_attempts(
     with _wf.state_lock(app.paths.state_file):
         state = _wf.load_state(app.paths.state_file)
         state = _with_attempt(state, pr_number, issue_number, head_sha, attempts_by_head)
-        _wf.save_state(app.paths.state_file, state)
+        app.write_gate.save_state(state)
 
 
 def _record_autofix(
@@ -171,7 +171,7 @@ def _record_autofix(
                 "run_ids": list(result.run_ids),
             },
         )
-        _wf.save_state(app.paths.state_file, state)
+        app.write_gate.save_state(state)
     return _wf.CommandResult(
         False,
         f"PR #{pr_number} closing-keyword gate failure repaired by the orchestrator; "
@@ -212,10 +212,10 @@ def _escalate_autofix_failure(
                 "reason": reason,
             },
         )
-        _wf.save_state(app.paths.state_file, state)
+        app.write_gate.save_state(state)
 
     edge = _wf._escalation_edge("escalated", "mechanical")
-    transition_result = _wf.transition(app.gh, app.config.labels, issue_number, edge)
+    transition_result = app.write_gate.transition(app.gh, app.config.labels, issue_number, edge)
     label_error = None
     if transition_result.outcome != TransitionOutcome.APPLIED:
         label_error = {"edge": edge, "outcome": transition_result.outcome.value}
