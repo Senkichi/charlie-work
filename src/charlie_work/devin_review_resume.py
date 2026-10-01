@@ -49,7 +49,7 @@ from .devin_shell import (
 )
 from .devin_terminal_record import maybe_start_terminal_status_watcher
 from .env_sanitize import sanitize_env
-from .process_utils import popen_worker, worker_terminal_status_path
+from .process_utils import CpuPriority, popen_worker, worker_terminal_status_path
 from .state import utc_now
 from .subprocess_runner import run_captured
 from .verdict_parsing import CAUSE_REVIEWER_EXEC_REJECTED, _extract_terminating_cause
@@ -222,6 +222,7 @@ def resume_exec_rejected_review(app: Any, worker: Any, pr_number: int, reviews_d
         with log_path.open("w", encoding="utf-8") as handle:
             process = popen_worker(
                 list(command),
+                priority=CpuPriority.BELOW_NORMAL,
                 cwd=str(checkout),
                 stdout=handle,
                 stderr=subprocess.STDOUT,
