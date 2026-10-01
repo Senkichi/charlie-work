@@ -124,6 +124,10 @@ def _read_rework_outcome(
     worktrees_dir: Path,
     issue_number: int,
     branch: str | None,
+    *,
+    dispatched_at: datetime | None = None,
+    live_head_sha: str | None = None,
+    on_fate: Callable[[worker_fate.WorkerFate], None] | None = None,
 ) -> dict[str, Any] | None:
     """Read the worker's outcome: durable terminal status first, worktree fallback.
 
@@ -134,11 +138,13 @@ def _read_rework_outcome(
     Obtains this pick from the module (design doc §8, step B1, A13):
     ``worker_fate.resolve_fate``'s freshness step (rules 1/7) already
     implements "terminal, if fresh, else worktree, if fresh, else nothing".
-    Neither a ``dispatched_at`` nor a live head is known at this call site
-    (this function takes neither), so timestamp/head freshness never
-    rejects a candidate here (rule 1's legacy mode: an unset
-    ``dispatched_at`` accepts unconditionally, and an unknown head never
-    proves a mismatch) -- but an empty terminal ``worker_outcome`` (``{}``)
+    A caller that knows the current dispatch passes ``dispatched_at`` (and
+    the live head, when it has one) so evidence from an earlier round is
+    dropped (issue #2102); ``on_fate`` receives the resolved fate so that
+    caller can report the dropped evidence out of its lock. A caller that
+    passes neither (``apply_rework_outcome``) gets rule 1's legacy mode: an
+    unset ``dispatched_at`` accepts unconditionally, and an unknown head never
+    proves a mismatch -- but an empty terminal ``worker_outcome`` (``{}``)
     is still not decisive: ``worker_fate._carries_no_claim`` (N1,
     wf-review-opus.md; design doc §3 step 0) keeps a content-empty terminal
     candidate from out-ranking the worktree's real content even though
@@ -150,32 +156,49 @@ def _read_rework_outcome(
     terminal_evidence: worker_fate.TerminalEvidence | None = None
     record = find_worker_terminal_status(sessions_dir, issue_number)
     if isinstance(record, dict):
+        ended_at = worker_fate.parse_iso_timestamp(record.get("ended_at"))
+        # The embedded outcome may be a prior round's leftover copied out of a
+        # reused worktree, so its own write time -- not the record's ended_at --
+        # is what freshness must judge (same anchor as blocked_worker_outcome).
+        terminal_written_at = (
+            worker_fate.parse_iso_timestamp(record.get("worker_outcome_written_at")) or ended_at
+        )
         terminal_evidence = worker_fate.TerminalEvidence(
-            ended_at=worker_fate.parse_iso_timestamp(record.get("ended_at")) or datetime.now(UTC),
+            ended_at=ended_at or datetime.now(UTC),
             exit_code=record.get("exit_code"),
             outcome=_outcome_evidence(
-                record.get("worker_outcome"), source=worker_fate.EvidenceSource.TERMINAL
+                record.get("worker_outcome"),
+                source=worker_fate.EvidenceSource.TERMINAL,
+                written_at=terminal_written_at,
             ),
         )
 
     worktree_outcome_evidence: worker_fate.OutcomeEvidence | None = None
     if branch:
         worktree_path = worktree_path_for_branch(repo_root, branch, worktrees_dir)
+        try:
+            outcome_mtime: datetime | None = datetime.fromtimestamp(
+                (worktree_path / WORKER_OUTCOME_FILENAME).stat().st_mtime, tz=UTC
+            )
+        except OSError:
+            outcome_mtime = None
         worktree_outcome_evidence = _outcome_evidence(
-            read_worker_outcome(worktree_path), source=worker_fate.EvidenceSource.WORKTREE
+            read_worker_outcome(worktree_path),
+            source=worker_fate.EvidenceSource.WORKTREE,
+            written_at=outcome_mtime,
         )
 
     fate = worker_fate.resolve_fate(
         worker_fate.FateEvidence(
             issue_number=issue_number,
             adapter="unknown",
-            dispatched_at=None,
+            dispatched_at=dispatched_at,
             pid_alive=False,
             health=None,
             terminal=terminal_evidence,
             worktree_outcome=worktree_outcome_evidence,
             branch=worker_fate.BranchEvidence(
-                remote_head_sha=None,
+                remote_head_sha=live_head_sha,
                 remote_ahead=None,
                 unpushed=None,
                 open_pr_number=None,
@@ -185,6 +208,8 @@ def _read_rework_outcome(
         ),
         now=datetime.now(UTC),
     )
+    if on_fate is not None:
+        on_fate(fate)
     return dict(fate.basis.outcome.raw) if fate.basis.outcome is not None else None
 
 
