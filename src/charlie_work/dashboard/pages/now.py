@@ -9,6 +9,11 @@ style-src 'self'``): layout lives in ``/static/now.css``, behaviour in
 The whole ``#now`` region is the htmx swap target. It replaces itself (``outerHTML``) on
 every poll; the body is never swapped, so page scroll stays put, and every focusable
 control carries a stable ``id`` so htmx restores focus to it after the swap.
+
+Announcements live OUTSIDE the swap target: server banners carry no ``role="alert"``
+(a re-inserted alert is re-announced on every poll); they carry ``data-alert`` and
+dashboard.js speaks a banner once, when the set of banners changes. ``#client-status``
+is the stable polite region where dashboard.js shows "Not updating" when polls fail.
 """
 
 from __future__ import annotations
@@ -18,14 +23,15 @@ from ..read_model import ModelState
 from .now_capacity import render_capacity, render_repo_ledger
 from .now_flow import render_flow, render_not_dispatchable
 from .now_fmt import age, esc, local_time, repo_url, short_repo
-from .now_keyhelp import KEY_HELP
+from .now_keyhelp import key_help
 from .now_needs import render_needs
+from .routes import VIEWS, View, live_views, routed
 
 
 def _fresh_chip(f: RepoFreshness) -> str:
     name = esc(short_repo(f.repo))
     when = esc(age(f.age_seconds))
-    url = repo_url(f.repo)
+    url = routed(repo_url(f.repo))
     href = f' href="{esc(url)}"' if url else ""
     tag = "a" if url else "span"
     if f.error:
@@ -59,7 +65,7 @@ def _stall_banner(stalled: str | None) -> str:
     if not stalled:
         return ""
     return (
-        '<p class="banner text-danger" role="alert">Numbers frozen: collector is stalled: '
+        '<p class="banner text-danger" data-alert="stall">Numbers frozen: collector is stalled: '
         f"{esc(stalled)}. Showing the last good model.</p>"
     )
 
@@ -73,9 +79,18 @@ def _banner(state: ModelState) -> str:
         else " now"
     )
     return (
-        '<p class="banner text-danger" role="alert">Numbers frozen: collector failing'
+        '<p class="banner text-danger" data-alert="collector">Numbers frozen: collector failing'
         f"{since}: {esc(state.collector_error)}. Showing the last good model.</p>"
     )
+
+
+def _view(v: View) -> str:
+    if v.href == "/now":
+        return f'<a href="/now" aria-current="page" data-go="{v.key}">{esc(v.name)}</a>'
+    if v in live_views():
+        return f'<a href="{esc(v.href)}" data-go="{v.key}">{esc(v.name)}</a>'
+    # Not built yet: plain text, not a focusable link to a 404.
+    return f'<span class="soon">{esc(v.name)} <small>(soon)</small></span>'
 
 
 def _header(state: ModelState, poll_seconds: int) -> str:
@@ -86,33 +101,30 @@ def _header(state: ModelState, poll_seconds: int) -> str:
         if model is not None
         else '<span class="asof">collecting…</span>'
     )
-    nav = (
-        '<nav class="views" aria-label="Views"><a href="/now" aria-current="page">Now</a>'
-        '<a href="/history" class="soon" aria-disabled="true" title="coming soon">History</a>'
-        "</nav>"
-    )
+    nav = '<nav class="views" aria-label="Views">' + "".join(_view(v) for v in VIEWS) + "</nav>"
     fresh = _freshness(model) if model is not None else ""
     theme_btn = (
         '<button type="button" id="theme-toggle" class="themebtn" '
         'aria-label="Theme: system. Activate to change.">theme: system</button>'
     )
     return (
-        '<header class="top"><div class="top-line"><span class="brand">Fleet '
-        f"<em>· Now</em></span>{nav}{asof}{theme_btn}</div>{fresh}</header>"
+        '<header class="top"><div class="top-line"><h1 class="brand">Fleet '
+        f"<em>· Now</em></h1>{nav}{asof}{theme_btn}</div>{fresh}</header>"
     )
 
 
 def render_fragment(state: ModelState, poll_seconds: int, stalled: str | None = None) -> str:
     """The ``#now`` region: the htmx poll target and the body of the full page."""
     open_tag = (
-        f'<div id="now" class="shell" hx-get="/now/fragment" '
+        f'<div id="now" class="shell" hx-get="/now/fragment" data-poll="{int(poll_seconds)}" '
         f'hx-trigger="every {int(poll_seconds)}s" hx-swap="outerHTML">'
     )
     head = _header(state, poll_seconds) + _stall_banner(stalled) + _banner(state)
     model = state.model
     if model is None:
         return (
-            f'{open_tag}{head}<section class="needs"><p class="calm">Collecting the first '
+            f'{open_tag}{head}<section class="needs" id="needs" aria-label="Needs me">'
+            '<p class="calm">Collecting the first '
             "read of the fleet…</p></section></div>"
         )
     rail = (
@@ -140,6 +152,10 @@ def render_now(
         '<link rel="stylesheet" href="/static/now.css">'
         '<script src="/static/theme-init.js"></script>'
         '<script src="/static/htmx.min.js" defer></script>'
+        '<script src="/static/staleness.js" defer></script>'
         '<script src="/static/dashboard.js" defer></script></head><body>'
-        f"{render_fragment(state, poll_seconds, stalled)}{KEY_HELP}</body></html>"
+        '<a class="skip" href="#needs">Skip to Needs me</a>'
+        '<div id="client-status" class="client-status" role="status" aria-live="polite"></div>'
+        f'<main id="main">{render_fragment(state, poll_seconds, stalled)}</main>'
+        f"{key_help()}</body></html>"
     )

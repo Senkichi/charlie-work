@@ -11,6 +11,7 @@ import re
 
 from ..now_types import NEEDS_ME_GROUPS, NeedsMeItem, NowModel
 from .now_fmt import age, esc, issue_url, link, repo_url, slug, stable_id
+from .routes import routed
 
 # severity -> (tone class, glyph, word). Colour is never the only signal: glyph + word too.
 _TONE = {
@@ -84,16 +85,18 @@ def _reason_html(reason: str) -> str:
 
 
 def _target(item: NeedsMeItem) -> str | None:
+    """The row's one drill-down link (on the reason), or ``None`` while unrouted."""
     if item.number is not None and item.repo != "fleet":
-        return issue_url(item.repo, item.number)
-    return repo_url(item.repo)
+        return routed(issue_url(item.repo, item.number))
+    return routed(repo_url(item.repo))
 
 
 def _copy(command: str, row_id: str, which: str) -> str:
     return (
         f'<code title="{esc(command)}">{esc(_short_command(command))}</code>'
         f'<button type="button" class="copy" id="{esc(row_id)}-{which}" '
-        f'data-copy="{esc(command)}" aria-label="copy command">copy</button>'
+        f'data-copy="{esc(command)}" aria-label="copy: {esc(_short_command(command))}">'
+        "copy</button>"
     )
 
 
@@ -127,13 +130,8 @@ def _row(item: NeedsMeItem, over: bool = False) -> str:
         kind = "Verdict"
     row_id = stable_id("nm", item.group, item.kind, item.repo, item.number, item.reason)
     target = _target(item)
-    age_title = (
-        "age not recorded"
-        if item.age_seconds is None
-        else f"{word}, open drill-down"
-        if target
-        else word
-    )
+    # The age is text, not a second link to the reason's URL (one link per row).
+    age_title = "age not recorded" if item.age_seconds is None else f"{word}, waiting this long"
     age_cls = "age n unk" if item.age_seconds is None else "age n"
     short = item.repo.rsplit("/", 1)[-1]
     snap = " · as of snapshot" if item.as_of_snapshot else ""
@@ -141,7 +139,7 @@ def _row(item: NeedsMeItem, over: bool = False) -> str:
         f'<li class="row tone-{tone}{" over" if over else ""}" id="{esc(row_id)}" '
         f'data-grp="{slug(item.group)}">'
         f'<span class="g" aria-hidden="true">{glyph}</span>'
-        f"{link(target, age(item.age_seconds), age_cls, age_title)}"
+        f"{link(None, age(item.age_seconds), age_cls, age_title)}"
         f'<span class="repo" title="{esc(item.repo)}">{esc(short)}</span>'
         f'<span class="kind">{esc(kind)}<span class="sr"> ({esc(word)})</span></span>'
         f'<span class="why" title="{esc(item.reason + snap)}">'
@@ -176,7 +174,7 @@ def _headline(model: NowModel) -> str:
 def render_needs(model: NowModel) -> str:
     """The left column: headline + grouped ledger, or the calm line when empty."""
     if not model.needs_me:
-        return f'<section class="needs" aria-label="Needs me">{_calm(model)}</section>'
+        return f'<section class="needs" id="needs" aria-label="Needs me">{_calm(model)}</section>'
     body: list[str] = []
     grouped = {g: [i for i in model.needs_me if i.group == g] for g in NEEDS_ME_GROUPS}
     shown = visible_counts({g: len(r) for g, r in grouped.items() if r})
@@ -198,7 +196,7 @@ def render_needs(model: NowModel) -> str:
                 f'aria-expanded="false">+{len(rows) - cap} more</button></li>'
             )
     return (
-        '<section class="needs" aria-labelledby="needs-h">'
+        '<section class="needs" id="needs" aria-labelledby="needs-h">'
         f"{_headline(model)}{_FILTER}"
         '<div class="cols" aria-hidden="true"><span></span><span class="label">Age</span>'
         '<span class="label">Repo</span><span class="label">Kind</span>'

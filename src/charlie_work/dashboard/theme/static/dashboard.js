@@ -3,7 +3,11 @@
    - copy buttons (clipboard API, textarea fallback, polite live announcement)
    - theme toggle: system -> light -> dark, stored under 'cw-dash-theme'
    - <time class="js-local">: re-rendered as local HH:MM:SS
-   - keys: g n / g h, '/' filter, j/k select, Enter open, c copy, '?' help
+   - keys: g <view> (via the nav's data-go links), '/' filter, j/k select, Enter open,
+     c copy, '?' help
+   - staleness: no successful swap for 2x the poll interval => "Not updating" banner in
+     #client-status + html.is-stale (muted numbers); cleared by the next success
+   - server banners ([data-alert]) are announced once, when their set changes
    Key and click handling is delegated on document, so an htmx swap of #now needs no
    re-binding; the afterSwap hook only restores selection (by row id), filter and labels. */
 (function () {
@@ -17,6 +21,9 @@
   var expanded = {}; /* group slug -> true once "+N more" was opened (survives swaps) */
   var pendingG = false;
   var live = null;
+  var lastOk = Date.now();
+  var lastFail = null;
+  var alertKeys = "";
 
   function pad(n) { return (n < 10 ? "0" : "") + n; }
 
@@ -194,6 +201,56 @@
     p.hidden = typeof force === "boolean" ? !force : !p.hidden;
   }
 
+  /* ---- client-side staleness (rule in staleness.js) ---- */
+  function pollSeconds() {
+    var n = document.getElementById("now");
+    var v = n ? parseInt(n.getAttribute("data-poll"), 10) : NaN;
+    return v > 0 ? v : 20;
+  }
+
+  function clock(ms) {
+    var d = new Date(ms);
+    return pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds());
+  }
+
+  function checkStale() {
+    var rule = window.CwStale;
+    if (!rule) { return; }
+    var st = rule.staleState(Date.now(), lastOk, pollSeconds(), lastFail);
+    document.documentElement.classList.toggle("is-stale", !!st);
+    var region = document.getElementById("client-status");
+    if (!region) { return; }
+    var p = region.querySelector("p");
+    if (!st) {
+      if (p) { region.removeChild(p); }
+      return;
+    }
+    var msg = rule.message(st, clock(st.since));
+    if (!p) {
+      p = document.createElement("p");
+      p.className = "banner offline text-warn";
+      region.appendChild(p);
+    }
+    if (p.textContent !== msg) { p.textContent = msg; } /* unchanged text: not re-announced */
+  }
+
+  function pollOk() { lastOk = Date.now(); checkStale(); }
+  function pollFailed() { lastFail = Date.now(); checkStale(); }
+
+  /* Server banners sit inside the swapped #now, so a role=alert there would be re-read on
+     every poll; instead each banner is spoken once, when the set of banners changes. */
+  function announceAlerts() {
+    var nodes = document.querySelectorAll("#now [data-alert]");
+    var keys = [], fresh = [];
+    for (var i = 0; i < nodes.length; i++) {
+      var k = nodes[i].getAttribute("data-alert");
+      keys.push(k);
+      if (alertKeys.split(" ").indexOf(k) === -1) { fresh.push(nodes[i].textContent); }
+    }
+    alertKeys = keys.join(" ");
+    if (fresh.length) { announce(fresh.join(" ")); }
+  }
+
   /* ---- events ---- */
   document.addEventListener("click", function (e) {
     var t = e.target && e.target.closest ? e.target : null;
@@ -233,8 +290,8 @@
     if (e.ctrlKey || e.metaKey || e.altKey) { return; }
     if (pendingG) {
       pendingG = false;
-      if (e.key === "n") { location.href = "/now"; e.preventDefault(); }
-      else if (e.key === "h") { location.href = "/history"; e.preventDefault(); }
+      var view = /^[a-z]$/.test(e.key) && document.querySelector('nav.views a[data-go="' + e.key + '"]');
+      if (view) { location.href = view.href; e.preventDefault(); }
       return;
     }
     switch (e.key) {
@@ -272,8 +329,13 @@
     localise(document);
   }
 
-  document.addEventListener("htmx:afterSwap", restore);
+  function start() { restore(); announceAlerts(); setInterval(checkStale, 1000); }
+
+  document.addEventListener("htmx:afterSwap", function () { pollOk(); restore(); announceAlerts(); });
   document.addEventListener("htmx:afterSettle", restore);
-  if (document.readyState === "loading") { document.addEventListener("DOMContentLoaded", restore); }
-  else { restore(); }
+  document.addEventListener("htmx:responseError", pollFailed);
+  document.addEventListener("htmx:sendError", pollFailed);
+  document.addEventListener("htmx:timeout", pollFailed);
+  if (document.readyState === "loading") { document.addEventListener("DOMContentLoaded", start); }
+  else { start(); }
 })();

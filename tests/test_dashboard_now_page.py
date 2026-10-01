@@ -3,162 +3,33 @@
 from __future__ import annotations
 
 import re
+from dataclasses import replace
 
 import pytest
-from dataclasses import replace
-from datetime import UTC, datetime
-from html.parser import HTMLParser
-
-from charlie_work.dashboard.now_types import (
-    NEEDS_ME_GROUPS,
-    CapacityModel,
-    FlowModel,
-    FlowStage,
-    GroupSummary,
-    NeedsMeItem,
-    NowModel,
-    NowTotals,
-    RepoFlow,
-    RepoFreshness,
-    RepoWorkers,
-    RunnerRepo,
-    UnreachableReason,
+from _dashboard_page_fixtures import (
+    NOW,
+    QUEUE_CMD,
+    REQUEUE_CMD,
+    VERDICT_CMD,
+    _item,
+    _model,
+    _page,
+    _parse,
 )
-from charlie_work.dashboard.pages import now_fmt
+
+from charlie_work.dashboard.now_types import RepoFreshness
+from charlie_work.dashboard.pages import now_fmt, routes
 from charlie_work.dashboard.pages.now import render_fragment, render_now
 from charlie_work.dashboard.read_model import ModelState
 from charlie_work.dashboard.theme import generate_css, static_asset
 
-NOW = datetime(2026, 10, 1, 20, 29, 39, tzinfo=UTC)
-CW = "Senkichi/charlie-work"
-SW = "Senkichi/swole"
-VERDICT_CMD = (
-    "charlie --repo 'C:\\r\\cw' verdict --pr 7 --decision <approved|request_changes|blocked>"
-)
-REQUEUE_CMD = "charlie --repo 'C:\\r\\cw' unescalate --pr 7"
-QUEUE_CMD = "charlie --repo 'C:\\r\\sw' unescalate --issue 12"
-STAGES = ("Dispatchable", "Queued", "In progress", "PR open", "Reviewing", "Needs rework")
+DRILL_DOWNS = frozenset({"/now", "/repo", "/issue", "/flow", "/prs", "/backlog", "/capacity"})
 
 
-def _stages(*counts: int) -> tuple[FlowStage, ...]:
-    return tuple(FlowStage(n, None, c) for n, c in zip(STAGES, counts, strict=True))
-
-
-def _item(group: str, **kw) -> NeedsMeItem:
-    base = dict(
-        kind="operator_queue",
-        severity="action",
-        repo=SW,
-        age_seconds=None,
-        reason="Operator queue: #12 a title",
-        command=QUEUE_CMD,
-        as_of_snapshot=True,
-        number=12,
-        group=group,
-    )
-    base.update(kw)
-    return NeedsMeItem(**base)
-
-
-ITEMS = (
-    _item(
-        "Exceptions",
-        kind="alarm",
-        severity="anomaly",
-        repo=CW,
-        reason="loop_errors: <script>alert(1)</script> & more",
-        command=None,
-        number=None,
-        as_of_snapshot=False,
-    ),
-    _item(
-        "Exceptions",
-        kind="stale_source",
-        severity="warn",
-        reason="snapshot is 700s old",
-        command=None,
-        number=None,
-        age_seconds=700.0,
-    ),
-    _item(
-        "Awaiting your verdict",
-        kind="human_needed",
-        repo=CW,
-        reason="Human needed: PR #7 (issue #6) awaits an operator verdict",
-        command=VERDICT_CMD,
-        secondary_command=REQUEUE_CMD,
-        number=6,
-    ),
-    _item("Human needed", kind="human_needed", reason="Human needed: #9 x", number=9),
-    _item("Operator queue"),
-)
-
-
-def _model(items: tuple[NeedsMeItem, ...] = ITEMS, **kw) -> NowModel:
-    groups = tuple(
-        GroupSummary(g, sum(1 for i in items if i.group == g), None) for g in NEEDS_ME_GROUPS
-    )
-    base = dict(
-        generated_at=NOW,
-        stale_threshold_seconds=630.0,
-        freshness=(
-            RepoFreshness(CW, NOW, 24.0, False, None),
-            RepoFreshness(SW, NOW, 700.0, True, None),
-        ),
-        needs_me=items,
-        flow=FlowModel(
-            _stages(5, 0, 4, 2, 0, 1),
-            None,
-            (UnreachableReason("blocked_by_open_dependency", 84, (f"{SW}#139",)),),
-        ),
-        capacity=CapacityModel(
-            workers_live=4,
-            workers_cap=None,
-            workers_by_repo=(RepoWorkers(CW, 3, None), RepoWorkers(SW, 1, 2)),
-            reviewers_live=0,
-            reviewers_cap=6,
-            reviewers_by_repo=(),
-            runners=(RunnerRepo(SW, 3, 2, None, 1, 3),),
-            runners_age_seconds=72.0,
-            runners_stale=False,
-            capped_demand_now=False,
-            capped_repos=(),
-        ),
-        totals=NowTotals(119, 7, 11, 15, 4),
-        repos=(
-            RepoFlow(CW, _stages(2, 0, 3, 0, 0, 0), 3),
-            RepoFlow(SW, _stages(1, 0, 0, 1, 0, 0), 2),
-        ),
-        needs_me_groups=groups,
-    )
-    base.update(kw)
-    return NowModel(**base)
-
-
-class _Collect(HTMLParser):
-    def __init__(self) -> None:
-        super().__init__(convert_charrefs=True)
-        self.tags: list[tuple[str, dict[str, str | None]]] = []
-        self.text: list[str] = []
-
-    def handle_starttag(self, tag, attrs):
-        self.tags.append((tag, dict(attrs)))
-
-    def handle_startendtag(self, tag, attrs):
-        self.tags.append((tag, dict(attrs)))
-
-    def handle_data(self, data):
-        self.text.append(data)
-
-
-def _parse(html_text: str) -> _Collect:
-    p = _Collect()
-    p.feed(html_text)
-    return p
-
-
-def _page(model: NowModel | None = None, **state) -> str:
-    return render_now(ModelState(model=model or _model(), **state), poll_seconds=15)
+@pytest.fixture
+def drilldowns(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Register the drill-down routes, as the drill-down PR will."""
+    monkeypatch.setattr(routes, "ROUTES", DRILL_DOWNS)
 
 
 def test_groups_render_in_decision_order() -> None:
@@ -219,8 +90,11 @@ def test_no_inline_style_or_script_anywhere() -> None:
 
 def test_collector_failure_banner() -> None:
     html_text = _page(collector_error="OSError: <nope>", collector_failing_since=NOW)
-    assert 'role="alert"' in html_text and "OSError: &lt;nope&gt;" in html_text
+    assert 'data-alert="collector"' in html_text and "OSError: &lt;nope&gt;" in html_text
     assert "<nope>" not in html_text
+    # Inside the swapped #now a role=alert would be re-announced on every poll; the
+    # page's one polite region is the stable #client-status (plus dashboard.js's own).
+    assert 'role="alert"' not in html_text
 
 
 def test_header_as_of_local_time_nav_and_freshness() -> None:
@@ -228,11 +102,20 @@ def test_header_as_of_local_time_nav_and_freshness() -> None:
     local = NOW.astimezone().strftime("%H:%M:%S")
     assert f'<time class="js-local" datetime="{NOW.isoformat()}">{local}</time>' in html_text
     assert "(local)" in html_text
-    assert 'href="/history" class="soon" aria-disabled="true" title="coming soon"' in html_text
-    assert 'class="chip is-warn text-warn"' in html_text and "stale</a>" in html_text
+    assert '<span class="soon">History <small>(soon)</small></span>' in html_text
+    assert 'href="/history"' not in html_text  # unbuilt view: text, not a link to a 404
+    assert 'class="chip is-warn text-warn"' in html_text and "stale</span>" in html_text
 
 
-def test_numbers_link_to_drill_downs_and_done_is_unrecorded() -> None:
+def test_unrouted_numbers_render_as_text_not_dead_links() -> None:
+    html_text = _page()
+    hrefs = [a["href"] for t, a in _parse(html_text).tags if t == "a" and a.get("href")]
+    assert hrefs and all(routes.is_routed(h) for h in hrefs), hrefs
+    assert not any(h.startswith(("/repo", "/issue", "/flow", "/backlog")) for h in hrefs)
+    assert '<span class="n">84</span>' in html_text  # the held count is still shown
+
+
+def test_numbers_link_to_drill_downs_and_done_is_unrecorded(drilldowns: None) -> None:
     html_text = _page()
     assert 'href="/issue/Senkichi/charlie-work/6"' in html_text
     assert 'href="/flow/in-progress"' in html_text and 'href="/flow/needs-rework"' in html_text
@@ -294,7 +177,7 @@ def test_row_budget_hides_overflow_behind_a_toggle_but_never_exceptions() -> Non
     assert "more-btn" not in _page()  # within budget: no toggle
 
 
-def test_reason_drops_the_group_prefix_and_bolds_the_lead_ref() -> None:
+def test_reason_drops_the_group_prefix_and_bolds_the_lead_ref(drilldowns: None) -> None:
     html_text = _page()
     assert '<b class="ref">PR #7</b> (issue #6) awaits an operator verdict</a>' in html_text
     assert '<b class="ref">#9</b> x</a>' in html_text
@@ -307,7 +190,7 @@ def test_done_24h_is_off_the_stock_scale() -> None:
     assert done and float(done.group(1)) < 10  # a token bar, not 500 against stocks of 5
     tall = re.findall(r'<rect class="bar bar"[^>]*height="([\d.]+)"', html_text)
     assert max(float(h) for h in tall) == 75.0  # the biggest stock still fills the chart
-    assert 'class="unit-sep"' in html_text
+    assert 'class="stage done unit-sep"' in html_text
 
 
 def test_theme_query_override_is_not_persisted() -> None:

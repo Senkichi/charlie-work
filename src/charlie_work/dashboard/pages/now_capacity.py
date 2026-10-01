@@ -47,6 +47,11 @@ def _bullet(live: int, cap: int | None) -> str:
     )
 
 
+def _over(live: int, cap: int | None) -> str:
+    """Over-cap is stated in words + glyph (text-warn prepends the triangle), not colour only."""
+    return '<span class="over text-warn">over cap</span>' if cap and live > cap else ""
+
+
 def _cap_row(name: str, href: str, live: int | None, cap: int | None, small: str) -> str:
     if live is None:
         bar = '<span class="unknown">not measured</span>'
@@ -56,7 +61,7 @@ def _cap_row(name: str, href: str, live: int | None, cap: int | None, small: str
         if not cap:
             bar += '<span class="unknown">cap not reported</span>'
         cap_txt = link(href + "#cap", cap) if cap else "cap ?"
-        val = f"{link(href, live)} live / {cap_txt}"
+        val = f"{link(href, live)} live / {cap_txt}{_over(live, cap)}"
     return (
         f'<div class="cap-row"><span class="who">{esc(name)}<small>{small}</small></span>'
         f'<span class="bar">{bar}</span><span class="val">{val}</span></div>'
@@ -90,7 +95,7 @@ def _runner_row(cap: CapacityModel) -> str:
         f'<div class="cap-row"><span class="who">CI runners<small>{small} · {busy}'
         f'</small></span><span class="bar">{_bullet(online, slots)}</span><span class="val">'
         f"{link('/capacity/runners', online)} online / {link('/capacity/runners#slots', slots)}"
-        "</span></div>"
+        f"{_over(online, slots)}</span></div>"
     )
 
 
@@ -233,11 +238,14 @@ def render_repo_ledger(model: NowModel) -> str:
     return (
         '<section class="repos-now" aria-labelledby="repos-h">'
         '<h2 id="repos-h">By repo <span class="meta">shared scales · sorted by need-you'
-        "</span></h2>"
+        " · CI: p parked, d demand</span></h2>"
+        # Its own horizontal scroller: at mid widths the table may be wider than the rail,
+        # and the page itself never clips (no overflow-x: hidden on html/body).
+        '<div class="table-scroll" role="region" aria-label="By-repo table, scrolls sideways" tabindex="0">'
         '<table class="repos"><thead><tr><th class="l">Repo</th><th>Last pass</th>'
         f"{head}"
         '<th class="num" title="live workers / cap">Work</th>'
         '<th title="CI runners online / slots; p parked, d demand">CI</th>'
         '<th class="num" title="Needs-me rows for this repo">You</th></tr></thead>'
-        f"<tbody>{''.join(body)}</tbody></table></section>"
+        f"<tbody>{''.join(body)}</tbody></table></div></section>"
     )

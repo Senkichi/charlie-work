@@ -25,7 +25,9 @@
 
 *, *::before, *::after { box-sizing: border-box; }
 html { -webkit-text-size-adjust: 100%; }
-html, body { max-width: 100%; overflow-x: hidden; }
+/* No overflow-x: hidden here: it silently clipped wide content (By-repo at mid widths).
+   Wide parts scroll inside their own container instead. */
+html, body { max-width: 100%; }
 body {
   margin: 0;
   font-size: var(--lj-text-3);

@@ -1,19 +1,33 @@
-"""The keyboard-shortcut help panel (static markup; toggled by ``?`` in dashboard.js)."""
+"""The keyboard-shortcut help panel (toggled by ``?`` in dashboard.js).
+
+Only shortcuts that lead somewhere are listed: the ``g <key>`` views come from the route
+registry (dashboard.js navigates through the header nav's ``data-go`` links, so an
+unbuilt view has neither a link nor a key), and ``Enter`` is listed only once the issue
+drill-down route exists.
+"""
 
 from __future__ import annotations
 
-_KEYS = (
-    ("g n / g h", "go to Now / History"),
-    ("/", "filter Needs-me rows (Esc clears)"),
-    ("j / k", "select next / previous row"),
-    ("Enter", "open the selected row's drill-down"),
-    ("c", "copy the selected row's command"),
-    ("?", "show or hide this panel"),
-)
+from .routes import is_routed, live_views
 
-KEY_HELP = (
-    '<aside id="keyhelp" class="keyhelp" role="dialog" aria-label="Keyboard shortcuts" hidden>'
-    "<h2>Keys</h2><dl>"
-    + "".join(f"<dt><kbd>{k}</kbd></dt><dd>{d}</dd>" for k, d in _KEYS)
-    + "</dl></aside>"
-)
+
+def _keys() -> tuple[tuple[str, str], ...]:
+    views = live_views()
+    keys = [
+        (" / ".join(f"g {v.key}" for v in views), "go to " + " / ".join(v.name for v in views)),
+        ("/", "filter Needs-me rows (Esc clears)"),
+        ("j / k", "select next / previous row"),
+    ]
+    if is_routed("/issue/o/r/1"):
+        keys.append(("Enter", "open the selected row's drill-down"))
+    keys += [("c", "copy the selected row's command"), ("?", "show or hide this panel")]
+    return tuple(keys)
+
+
+def key_help() -> str:
+    return (
+        '<aside id="keyhelp" class="keyhelp" role="dialog" aria-label="Keyboard shortcuts" '
+        "hidden><h2>Keys</h2><dl>"
+        + "".join(f"<dt><kbd>{k}</kbd></dt><dd>{d}</dd>" for k, d in _keys())
+        + "</dl></aside>"
+    )

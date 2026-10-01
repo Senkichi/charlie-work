@@ -2,7 +2,8 @@
 
 Every helper that returns markup escapes its dynamic inputs; callers pass raw values.
 Drill-down URLs are built here (single point) so the routes can land later without the
-renderers changing: ``/repo/<key>``, ``/issue/<repo>/<n>``, ``/flow/<stage>``.
+renderers changing: ``/repo/<key>``, ``/issue/<repo>/<n>``, ``/flow/<stage>``. Whether a
+built URL becomes an ``<a>`` is decided by ``routes.routed`` (the route registry), never here.
 """
 
 from __future__ import annotations
@@ -12,6 +13,8 @@ import re
 from datetime import datetime
 from html import escape
 from urllib.parse import quote, urlencode
+
+from .routes import routed
 
 
 def esc(value: object) -> str:
@@ -57,7 +60,9 @@ def flow_url(stage: str) -> str:
 
 
 def link(href: str | None, text: object, cls: str = "n", title: str | None = None) -> str:
+    """An anchor when ``href`` names a registered route, else the same text in a span."""
     tip = f' title="{esc(title)}"' if title else ""
+    href = routed(href)
     if href is None:
         return f'<span class="{esc(cls)}"{tip}>{esc(text)}</span>'
     return f'<a class="{esc(cls)}" href="{esc(href)}"{tip}>{esc(text)}</a>'

@@ -216,3 +216,16 @@ def test_theme_init_is_synchronous_in_head_and_dashboard_js_deferred(served) -> 
     assert text.index("theme-init.js") < text.index("</head>")
     assert '<script src="/static/dashboard.js" defer></script>' in text
     assert 'id="theme-toggle"' in text and 'id="keyhelp"' in text
+
+
+def test_route_registry_matches_what_the_server_serves(served) -> None:
+    """Registered routes answer; a known view that is not registered really is a 404."""
+    from charlie_work.dashboard.pages import routes
+
+    for prefix in sorted(routes.ROUTES):
+        resp, _ = _get(served, prefix)
+        assert resp.status == 200, prefix
+    unbuilt = [v.href for v in routes.VIEWS if not routes.is_routed(v.href)]
+    for href in unbuilt:
+        resp, _ = _get(served, href)
+        assert resp.status == 404, href
