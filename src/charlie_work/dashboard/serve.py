@@ -58,13 +58,15 @@ def watch_head_drift(
     stop: threading.Event,
     drifted: threading.Event,
     interval_seconds: float,
+    baseline: str | None = None,
 ) -> None:
     """Set ``drifted`` and ``stop`` once ``read_head`` reports a SHA unlike the baseline.
 
-    ``None`` reads (git hiccup) carry no information and are skipped; the baseline is the
-    first non-``None`` read, so a transient startup failure cannot fake a drift.
+    ``baseline`` is the HEAD read when the process started, before any lazy import, so a
+    pull landing during startup is still a drift. ``None`` reads (git hiccup) carry no
+    information and are skipped; with no ``baseline`` the first non-``None`` read becomes
+    it, so a transient startup failure cannot fake a drift.
     """
-    baseline: str | None = None
     while not stop.is_set():
         sha = read_head()
         if sha is not None:
@@ -88,6 +90,10 @@ def serve_dashboard(
     """Serve until interrupted or HEAD drift; bind/config problems return as values."""
     if not config.enabled:
         return CommandResult(True, DISABLED_MESSAGE, {})
+    reader = read_head or _default_head_reader
+    # Earliest reliable point: before default_sources lazily imports the collector modules
+    # and before binding, i.e. as close to "the HEAD this code was loaded at" as we can get.
+    baseline = reader()
     server = make_server(
         config, default_sources(fleet_dir_override, config.collector_interval_seconds)
     )
@@ -100,12 +106,13 @@ def serve_dashboard(
     threading.Thread(
         target=watch_head_drift,
         args=(
-            read_head or _default_head_reader,
+            reader,
             stop,
             drifted,
             DEFAULT_DRIFT_INTERVAL_SECONDS
             if drift_interval_seconds is None
             else drift_interval_seconds,
+            baseline,
         ),
         name="dashboard-head-watch",
         daemon=True,

@@ -34,6 +34,31 @@ class ModelState:
     collector_failing_since: datetime | None = None
     rollup_errors: tuple[str, ...] = ()
     rolled_up_at: datetime | None = None
+    # Watchdog inputs: when the collector last STARTED a tick, and why its thread died
+    # (a BaseException that escaped the per-tick ``Exception`` boundary), if it did.
+    last_attempt_at: datetime | None = None
+    collector_dead: str | None = None
+
+
+STALL_MULTIPLIER = 3.0
+
+
+def collector_stall(state: ModelState, now: datetime, interval: float) -> str | None:
+    """Why the collector is not making progress (dead or silent for 3x its interval).
+
+    A tick that raises ``Exception`` is *progress* (it is shown by the failing banner);
+    this catches the cases that banner cannot: a dead thread and a tick that never ends.
+    """
+    if state.collector_dead:
+        return f"collector thread died: {state.collector_dead}"
+    if state.last_attempt_at is None:
+        return None
+    silent = (now - state.last_attempt_at).total_seconds()
+    if silent > STALL_MULTIPLIER * interval:
+        return (
+            f"collector stalled: last tick started {int(silent)}s ago (interval {int(interval)}s)"
+        )
+    return None
 
 
 class ReadModel:
@@ -56,6 +81,7 @@ class ReadModel:
 def refresh_model(holder: ReadModel, collect: Collect, clock: Clock) -> None:
     """One collector pass; on failure keep the previous model and record the error."""
     now = clock()
+    holder.update(last_attempt_at=now)
     try:
         sources_read, findings = collect(now)
         model = build_now_model(sources_read, now, findings)
@@ -82,11 +108,21 @@ def refresh_rollup(holder: ReadModel, rollup: RollupRun, clock: Clock) -> None:
     holder.update(rollup_errors=errors, rolled_up_at=now)
 
 
-def _loop(stop: threading.Event, interval: float, step: Callable[[], None]) -> None:
-    while True:
-        step()
-        if stop.wait(interval):
-            return
+def _loop(
+    stop: threading.Event,
+    interval: float,
+    step: Callable[[], None],
+    on_death: Callable[[BaseException], None] | None = None,
+) -> None:
+    try:
+        while True:
+            step()
+            if stop.wait(interval):
+                return
+    except BaseException as exc:  # noqa: BLE001 - thread boundary: surface, never vanish
+        log.error("dashboard worker died: %s: %s", type(exc).__name__, exc)
+        if on_death is not None:
+            on_death(exc)
 
 
 def start_workers(
@@ -100,16 +136,30 @@ def start_workers(
     clock: Clock,
 ) -> tuple[threading.Thread, ...]:
     """Start the ONE collector thread and (if given) the rollup thread (daemon)."""
-    plan: list[tuple[str, float, Callable[[], None]]] = [
-        ("dashboard-collector", collector_interval, lambda: refresh_model(holder, collect, clock))
+
+    def collector_died(exc: BaseException) -> None:
+        holder.update(collector_dead=f"{type(exc).__name__}: {exc}")
+
+    plan: list[tuple[str, float, Callable[[], None], Callable[[BaseException], None] | None]] = [
+        (
+            "dashboard-collector",
+            collector_interval,
+            lambda: refresh_model(holder, collect, clock),
+            collector_died,
+        )
     ]
     if rollup is not None:
         plan.append(
-            ("dashboard-rollup", rollup_interval, lambda: refresh_rollup(holder, rollup, clock))
+            (
+                "dashboard-rollup",
+                rollup_interval,
+                lambda: refresh_rollup(holder, rollup, clock),
+                None,
+            )
         )
     threads = tuple(
-        threading.Thread(target=_loop, args=(stop, iv, step), name=name, daemon=True)
-        for name, iv, step in plan
+        threading.Thread(target=_loop, args=(stop, iv, step, died), name=name, daemon=True)
+        for name, iv, step, died in plan
     )
     for t in threads:
         t.start()

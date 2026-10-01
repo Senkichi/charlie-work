@@ -53,6 +53,15 @@ def _freshness(model: NowModel) -> str:
     )
 
 
+def _stall_banner(stalled: str | None) -> str:
+    if not stalled:
+        return ""
+    return (
+        '<p class="banner text-danger" role="alert">Numbers frozen: collector is stalled: '
+        f"{esc(stalled)}. Showing the last good model.</p>"
+    )
+
+
 def _banner(state: ModelState) -> str:
     if not state.collector_error:
         return ""
@@ -91,13 +100,13 @@ def _header(state: ModelState, poll_seconds: int) -> str:
     )
 
 
-def render_fragment(state: ModelState, poll_seconds: int) -> str:
+def render_fragment(state: ModelState, poll_seconds: int, stalled: str | None = None) -> str:
     """The ``#now`` region: the htmx poll target and the body of the full page."""
     open_tag = (
         f'<div id="now" class="shell" hx-get="/now/fragment" '
         f'hx-trigger="every {int(poll_seconds)}s" hx-swap="outerHTML">'
     )
-    head = _header(state, poll_seconds) + _banner(state)
+    head = _header(state, poll_seconds) + _stall_banner(stalled) + _banner(state)
     model = state.model
     if model is None:
         return (
@@ -112,7 +121,13 @@ def render_fragment(state: ModelState, poll_seconds: int) -> str:
     return f"{open_tag}{head}{render_needs(model)}{rail}</div>"
 
 
-def render_now(state: ModelState, theme: str = "auto", *, poll_seconds: int = 20) -> str:
+def render_now(
+    state: ModelState,
+    theme: str = "auto",
+    *,
+    poll_seconds: int = 20,
+    stalled: str | None = None,
+) -> str:
     return (
         f'<!doctype html><html lang="en" data-theme="{esc(theme)}"><head>'
         '<meta charset="utf-8">'
@@ -124,5 +139,5 @@ def render_now(state: ModelState, theme: str = "auto", *, poll_seconds: int = 20
         '<script src="/static/theme-init.js"></script>'
         '<script src="/static/htmx.min.js" defer></script>'
         '<script src="/static/dashboard.js" defer></script></head><body>'
-        f"{render_fragment(state, poll_seconds)}{KEY_HELP}</body></html>"
+        f"{render_fragment(state, poll_seconds, stalled)}{KEY_HELP}</body></html>"
     )

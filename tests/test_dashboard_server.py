@@ -109,7 +109,7 @@ def test_api_and_healthz_payloads(served) -> None:
     _, body = _get(served, "/api/now.json")
     assert json.loads(body)["model"]["generated_at"] == NOW.isoformat()
     _, body = _get(served, "/healthz")
-    assert json.loads(body) == {"ok": True, "model_age_seconds": 0.0}
+    assert json.loads(body) == {"ok": True, "model_age_seconds": 0.0, "reason": None}
 
 
 @pytest.mark.parametrize(
@@ -150,7 +150,7 @@ def test_other_methods_405(served, method: str) -> None:
     conn.request(method, "/", body=b"x")
     resp = conn.getresponse()
     resp.read()
-    assert resp.status == 405 and resp.getheader("Allow") == "GET"
+    assert resp.status == 405 and resp.getheader("Allow") == "GET, HEAD"
     conn.close()
 
 

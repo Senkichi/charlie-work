@@ -9,6 +9,7 @@ writes fleet state and never calls GitHub: all data comes from ``ReadModel``.
 from __future__ import annotations
 
 import dataclasses
+import html
 import ipaddress
 import json
 import logging
@@ -16,7 +17,7 @@ import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import ThreadingHTTPServer
 from typing import Any
 
 from .config import DashboardConfig
@@ -24,19 +25,25 @@ from .pages.now import render_fragment, render_now
 from .read_model import (
     Clock,
     Collect,
+    ModelState,
     ReadModel,
     RollupRun,
+    collector_stall,
     start_workers,
     to_plain,
 )
+from .server_http import (
+    CSP,
+    MAX_DRAIN_BYTES,
+    DashboardHTTPServer,
+    SecureHandler,
+)
 from .theme import assets
+
+__all__ = ["CSP"]
 
 log = logging.getLogger("charlie_work.dashboard")
 
-CSP = (
-    "default-src 'self'; script-src 'self'; style-src 'self'; font-src 'self'; "
-    "img-src 'self' data:; frame-ancestors 'none'"
-)
 _STATIC_TYPES = {
     ".css": "text/css; charset=utf-8",
     ".js": "text/javascript; charset=utf-8",
@@ -118,76 +125,89 @@ class _App:
         self.allowed_hosts = frozenset({f"127.0.0.1:{port}", f"localhost:{port}"})
 
 
-class _Handler(BaseHTTPRequestHandler):
-    server_version = "charlie-dashboard"
-    sys_version = ""
-
+class _Handler(SecureHandler):
     @property
     def app(self) -> _App:
         return self.server.app  # type: ignore[attr-defined]
 
     # -- plumbing ---------------------------------------------------------
-    def log_message(self, format: str, *args: Any) -> None:  # noqa: A002 - stdlib signature
-        log.debug("%s - %s", self.address_string(), format % args)
-
-    def log_error(self, format: str, *args: Any) -> None:  # noqa: A002
-        log.warning("%s - %s", self.address_string(), format % args)
-
     def _send(self, status: int, body: bytes, ctype: str, extra: dict[str, str] | None = None):
         self.send_response(status)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Content-Security-Policy", CSP)
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("Referrer-Policy", "no-referrer")
-        self.send_header("Cache-Control", "no-store")
         for key, value in (extra or {}).items():
             self.send_header(key, value)
         self.end_headers()
-        self.wfile.write(body)
+        if self.command != "HEAD":  # HEAD carries the headers (incl. length), never a body
+            self.wfile.write(body)
 
     def _text(self, status: int, text: str, extra: dict[str, str] | None = None) -> None:
         self._send(status, (text + "\n").encode(), "text/plain; charset=utf-8", extra)
 
-    def _html(self, html_text: str) -> None:
-        self._send(200, html_text.encode("utf-8"), "text/html; charset=utf-8")
+    def _html(self, html_text: str, status: int = 200) -> None:
+        self._send(status, html_text.encode("utf-8"), "text/html; charset=utf-8")
 
-    def _json(self, payload: Any) -> None:
-        self._send(200, json.dumps(payload).encode("utf-8"), "application/json")
+    def _json(self, payload: Any, status: int = 200) -> None:
+        self._send(status, json.dumps(payload).encode("utf-8"), "application/json")
 
     # -- dispatch ---------------------------------------------------------
     def _guard(self) -> bool:
         """DNS-rebinding defence: only our own loopback Host values pass."""
         if self.headers.get("Host", "") not in self.app.allowed_hosts:
+            self.close_connection = True  # never read a body from an unvetted peer
             self._text(421, "misdirected request")
             return False
         return True
 
-    def do_GET(self) -> None:  # noqa: N802
+    def _stalled(self, state: ModelState) -> str | None:
+        return collector_stall(
+            state, self.app.clock(), float(self.app.config.collector_interval_seconds)
+        )
+
+    def _route(self) -> None:
         if not self._guard():
             return
         path = self.path.split("?", 1)[0].split("#", 1)[0]
         state = self.app.holder.get()
         poll = self.app.config.poll_interval_seconds
         if path in ("/", "/now"):
-            self._html(render_now(state, poll_seconds=poll))
+            self._html(render_now(state, poll_seconds=poll, stalled=self._stalled(state)))
         elif path == "/now/fragment":
-            self._html(render_fragment(state, poll))
+            self._html(render_fragment(state, poll, self._stalled(state)))
         elif path == "/api/now.json":
             self._json(to_plain(state))
         elif path == "/healthz":
+            stall = self._stalled(state)
             age = (
                 (self.app.clock() - state.collected_at).total_seconds()
                 if state.collected_at
                 else None
             )
-            self._json({"ok": True, "model_age_seconds": age})
+            self._json(
+                {"ok": stall is None, "model_age_seconds": age, "reason": stall},
+                200 if stall is None else 503,
+            )
         elif path == "/static/dashboard.css":
             self._send(200, assets.stylesheet().encode("utf-8"), "text/css; charset=utf-8")
         elif path.startswith("/static/"):
             self._static(path[len("/static/") :])
         else:
             self._text(404, "not found")
+
+    def do_GET(self) -> None:  # noqa: N802
+        try:
+            self._route()
+        except (ConnectionError, TimeoutError):
+            raise  # an aborted peer: logged as one line by the server's handle_error
+        except Exception as exc:  # noqa: BLE001 - a render bug is a 500, never a dropped socket
+            log.exception("dashboard request failed: %s %s", self.command, self.path)
+            self._html(
+                "<!doctype html><title>Fleet error</title><h1>Internal error</h1>"
+                f"<p>{html.escape(type(exc).__name__)}: {html.escape(str(exc))}</p>",
+                500,
+            )
+
+    do_HEAD = do_GET  # noqa: N815 - same routes, no body (see ``_send``)
 
     def _static(self, relpath: str) -> None:
         try:
@@ -199,20 +219,22 @@ class _Handler(BaseHTTPRequestHandler):
         self._send(200, data, _STATIC_TYPES.get(suffix, "application/octet-stream"))
 
     def _method_not_allowed(self) -> None:
-        # Drain a small request body so closing does not RST the socket before the client
-        # reads the 405 (observed on Windows); an oversized body just gets the connection cut.
+        if not self._guard():  # Host check BEFORE touching the body
+            return
+        # Drain a small body so closing does not RST the socket before the client reads the
+        # 405 (observed on Windows); a larger one just gets the connection cut. The socket
+        # timeout bounds a body that never arrives.
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError:
             length = 0
-        if 0 < length <= 65536:
+        if 0 < length <= MAX_DRAIN_BYTES:
             self.rfile.read(length)
         else:
             self.close_connection = True
-        if self._guard():
-            self._text(405, "method not allowed", {"Allow": "GET"})
+        self._text(405, "method not allowed", {"Allow": "GET, HEAD"})
 
-    do_POST = do_PUT = do_DELETE = do_PATCH = do_OPTIONS = do_HEAD = _method_not_allowed  # noqa: N815
+    do_POST = do_PUT = do_DELETE = do_PATCH = do_OPTIONS = _method_not_allowed  # noqa: N815
 
 
 def make_server(
@@ -228,10 +250,9 @@ def make_server(
             "and only binds 127.0.0.1"
         )
     try:
-        httpd = ThreadingHTTPServer((config.host, config.port), _Handler)
+        httpd = DashboardHTTPServer((config.host, config.port), _Handler)
     except OSError as exc:
         return ServerError(f"cannot bind {config.host}:{config.port}: {exc}")
-    httpd.daemon_threads = True
     holder = ReadModel()
     httpd.app = _App(holder, config, clock, int(httpd.server_address[1]))  # type: ignore[attr-defined]
     return DashboardServer(httpd, holder, config, sources, clock)

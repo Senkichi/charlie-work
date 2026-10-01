@@ -14,7 +14,7 @@ from datetime import datetime
 from typing import Any
 
 from . import now_cadence
-from .now_access import as_int, dict_list, label_set, snapshot_data
+from .now_access import dict_list, label_set, pos_int, snapshot_data
 from .now_types import (
     NEEDS_ME_GROUPS,
     FindingLike,
@@ -52,8 +52,9 @@ def needs_me_items(
         data = snapshot_data(repo)
         since = dict(repo.escalated_since)
         pr_by_issue = {
-            as_int(pr.get("issue_number")): as_int(pr.get("number"))
+            n: pr_no
             for pr in dict_list(data, "prs")
+            if (n := pos_int(pr.get("issue_number"))) and (pr_no := pos_int(pr.get("number")))
         }
 
         def age(number: int, _since: dict[int, datetime] = since) -> float | None:
@@ -61,9 +62,24 @@ def needs_me_items(
             return (now - when).total_seconds() if when is not None else None
 
         for issue in dict_list(data, "issues"):
-            number = as_int(issue.get("number"))
+            number = pos_int(issue.get("number"))
             have = label_set(issue)
             title = str(issue.get("title") or "")
+            if number is None:
+                if labels.operator_queue in have or labels.human_needed in have:
+                    # Never coerce to #0: a command aimed at issue 0 looks valid and is wrong.
+                    items.append(
+                        NeedsMeItem(
+                            "alarm",
+                            "warn",
+                            repo.key,
+                            None,
+                            "snapshot has a flagged issue with an unreadable number",
+                            None,
+                            True,
+                        )
+                    )
+                continue
             if labels.operator_queue in have:
                 items.append(
                     NeedsMeItem(
