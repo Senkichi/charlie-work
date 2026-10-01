@@ -1,7 +1,8 @@
 """Generate dashboard CSS custom properties from the vendored Living Journal tokens.
 
 ``tokens.json`` is a verbatim copy of swole's ``docs/design/living-journal/tokens.json``
-plus a separate ``status`` extension group (operational surfaces only, pending upstream).
+including its ``status`` group (swole PR #467), plus a charlie-work-only ``dashboardLocal``
+group (spacing/type scales) that is never compared against swole.
 The CSS is pure and deterministic: same tokens in, same bytes out.
 """
 
@@ -13,7 +14,9 @@ from importlib import resources
 from pathlib import Path
 from typing import Any, Mapping
 
-EXTENSION_GROUP = "status"
+STATUS_GROUP = "status"
+LOCAL_GROUP = "dashboardLocal"
+VENDORED_GROUPS_EXCLUDED = (STATUS_GROUP, LOCAL_GROUP)
 SWOLE_TOKENS_RELPATH = Path("docs/design/living-journal/tokens.json")
 
 # swole token name -> CSS custom property. Dark-only tokens (raised, equipment,
@@ -31,9 +34,11 @@ _COLOR_VARS: tuple[tuple[str, str], ...] = (
 _STATUS_VARS: tuple[tuple[str, str], ...] = (
     ("danger", "--lj-danger"),
     ("warn", "--lj-warn"),
-    ("seriesInk", "--lj-series-ink"),
-    ("seriesGray", "--lj-series-gray"),
-    ("seriesTan", "--lj-series-tan"),
+)
+_CHART_VARS: tuple[tuple[str, str], ...] = (
+    ("series1", "--lj-series-1"),
+    ("series2", "--lj-series-2"),
+    ("series3", "--lj-series-3"),
 )
 
 
@@ -44,8 +49,8 @@ def load_tokens() -> dict[str, Any]:
 
 
 def base_groups(tokens: Mapping[str, Any]) -> dict[str, Any]:
-    """Everything except the extension group: the part that must match swole verbatim."""
-    return {k: v for k, v in tokens.items() if k != EXTENSION_GROUP}
+    """Groups swole's ``color``-parity base: everything but ``status`` and ``dashboardLocal``."""
+    return {k: v for k, v in tokens.items() if k not in VENDORED_GROUPS_EXCLUDED}
 
 
 def _value(group: Mapping[str, Any], name: str) -> str:
@@ -54,7 +59,8 @@ def _value(group: Mapping[str, Any], name: str) -> str:
 
 def _theme_vars(tokens: Mapping[str, Any], mode: str) -> list[tuple[str, str]]:
     color = tokens["color"][mode]
-    status = tokens[EXTENSION_GROUP][mode]
+    status = tokens[STATUS_GROUP][mode]
+    chart = tokens[STATUS_GROUP]["chart"][mode]
     out = [(var, _value(color, name)) for name, var in _COLOR_VARS]
     # Dark-only tokens fall back so a property never goes missing across a theme switch:
     # raised -> card, equipment -> gray, rule -> dialTrack (dark) / rule (light).
@@ -64,6 +70,7 @@ def _theme_vars(tokens: Mapping[str, Any], mode: str) -> list[tuple[str, str]]:
     )
     out.append(("--lj-rule", _value(color, "rule" if "rule" in color else "dialTrack")))
     out.extend((var, _value(status, name)) for name, var in _STATUS_VARS)
+    out.extend((var, _value(chart, name)) for name, var in _CHART_VARS)
     return out
 
 
@@ -74,7 +81,7 @@ def _font_stack(fonts: Mapping[str, Any]) -> str:
 
 
 def _static_vars(tokens: Mapping[str, Any]) -> list[tuple[str, str]]:
-    typo, status = tokens["typography"], tokens[EXTENSION_GROUP]
+    typo, local = tokens["typography"], tokens[LOCAL_GROUP]
     out = [
         ("--lj-serif", _font_stack(typo["display"])),
         ("--lj-sans", _font_stack(typo["body"])),
@@ -87,9 +94,9 @@ def _static_vars(tokens: Mapping[str, Any]) -> list[tuple[str, str]]:
         (f"--lj-radius-{k}", _value(tokens["radius"], k)) for k in sorted_keys(tokens["radius"])
     ]
     out += [
-        (f"--lj-space-{i}", f"{v}px") for i, v in enumerate(status["spacing"]["$value"], start=1)
+        (f"--lj-space-{i}", f"{v}px") for i, v in enumerate(local["spacing"]["$value"], start=1)
     ]
-    out += [(f"--lj-text-{i}", f"{v}px") for i, v in enumerate(status["typeSize"]["$value"], 1)]
+    out += [(f"--lj-text-{i}", f"{v}px") for i, v in enumerate(local["typeSize"]["$value"], 1)]
     return out
 
 
@@ -145,7 +152,7 @@ def contrast_ratio(fg: str, bg: str) -> float:
 
 @dataclass(frozen=True)
 class DriftResult:
-    """Outcome of comparing the vendored base groups to a swole checkout.
+    """Outcome of comparing the vendored base and status groups to a swole checkout.
 
     ``status`` is ``in_sync``, ``drifted`` (``differing`` names the base groups), or
     ``unavailable`` (no checkout, or its tokens.json is unreadable; ``detail`` says why).
@@ -157,7 +164,7 @@ class DriftResult:
 
 
 def swole_drift(swole_root: Path | str | None) -> DriftResult:
-    """Compare base groups with ``<swole_root>/docs/design/living-journal/tokens.json``.
+    """Compare base and status groups with ``<swole_root>/docs/design/living-journal/tokens.json``.
 
     Never raises: a missing/unreadable/malformed checkout yields ``unavailable``.
     """
@@ -172,5 +179,31 @@ def swole_drift(swole_root: Path | str | None) -> DriftResult:
     except (OSError, ValueError) as exc:
         return DriftResult("unavailable", detail=f"{path}: {exc}")
     v, u = base_groups(vendored), base_groups(upstream)
-    differing = tuple(sorted(g for g in v.keys() | u.keys() if v.get(g) != u.get(g)))
+    differing = {g for g in v.keys() | u.keys() if v.get(g) != u.get(g)}
+    # The status group is vendored verbatim from swole PR #467; compare it too. Only an
+    # upstream that has it can be compared (a pre-#467 checkout simply lacks the group).
+    if STATUS_GROUP in upstream and vendored.get(STATUS_GROUP) != upstream[STATUS_GROUP]:
+        differing.add(STATUS_GROUP)
+    differing = tuple(sorted(differing))
     return DriftResult("drifted" if differing else "in_sync", differing)
+
+
+def find_swole_root(registry: Mapping[str, Any]) -> Path | None:
+    """The swole checkout registered in the fleet registry, or None.
+
+    ``registry`` is the loaded ``fleet.json`` dict (``{"repos": {nameWithOwner: entry}}``).
+    Picks the repo whose name (the part after ``owner/``) ends with ``swole`` and whose
+    ``repo_root`` is an existing directory. Entries are examined in sorted key order so the
+    choice is deterministic. Never raises on a malformed registry.
+    """
+    repos = registry.get("repos") if isinstance(registry, Mapping) else None
+    if not isinstance(repos, Mapping):
+        return None
+    for key in sorted(k for k in repos if isinstance(k, str)):
+        entry = repos[key]
+        if not key.rsplit("/", 1)[-1].lower().endswith("swole") or not isinstance(entry, Mapping):
+            continue
+        root = entry.get("repo_root")
+        if isinstance(root, str) and root and Path(root).is_dir():
+            return Path(root)
+    return None

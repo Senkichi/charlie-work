@@ -163,9 +163,14 @@ table.ledger { width: 100%; border-collapse: collapse; font-size: var(--lj-text-
 .pill.danger { color: var(--lj-danger); font-weight: 700; }
 .pill.danger::before { content: "\2715"; }
 .pill.muted { color: var(--lj-gray-text); }
+/* Colour never carries state alone: each text-* utility prepends the same glyph as its pill
+   (aria-hidden by construction: generated content). Still put the state in words. */
 .text-danger { color: var(--lj-danger); }
+.text-danger::before { content: "\2715\00a0"; }
 .text-warn { color: var(--lj-warn); }
+.text-warn::before { content: "\25B2\00a0"; }
 .text-ok { color: var(--lj-green-text); }
+.text-ok::before { content: "\2713\00a0"; }
 
 /* ---- stale / approximate treatments ---------------------------------- */
 .stale { border-style: dashed; color: var(--lj-gray-text); }
@@ -194,7 +199,11 @@ table.ledger { width: 100%; border-collapse: collapse; font-size: var(--lj-text-
 .bullet { display: grid; grid-template-columns: 8em 1fr auto; align-items: center; gap: var(--lj-space-3); }
 .bullet .track { position: relative; height: 12px; background: var(--lj-rule); border-radius: 2px; }
 .bullet .fill { position: absolute; inset: 0 auto 0 0; background: var(--lj-ink); border-radius: 2px; }
-.bullet .fill.hot { background: var(--lj-warn); }
+/* .hot is not colour-only: a diagonal hatch overlay differs in texture, and markup must also
+   state the over-threshold condition in the .value text. */
+.bullet .fill.hot {
+  background: repeating-linear-gradient(135deg, var(--lj-warn) 0 4px, var(--lj-card) 4px 6px);
+}
 .bullet .cap { position: absolute; top: -3px; bottom: -3px; width: 2px; background: var(--lj-ink); }
 .bullet .value { font-family: var(--lj-serif); font-weight: 600; text-align: right; }
 
@@ -204,11 +213,11 @@ svg.chart { display: block; width: 100%; height: auto; overflow: visible; }
 .chart .axis { stroke: var(--lj-gray); stroke-width: 1; shape-rendering: crispEdges; }
 .chart .tick { stroke: var(--lj-hair); stroke-width: 1; }
 .chart .axis-label { fill: var(--lj-gray-text); font: var(--lj-text-1) var(--lj-sans); }
-.chart .series-1, .spark .series-1 { stroke: var(--lj-series-ink); }
-.chart .series-2, .spark .series-2 { stroke: var(--lj-series-gray); stroke-dasharray: 6 3; }
-.chart .series-3, .spark .series-3 { stroke: var(--lj-series-tan); stroke-dasharray: 2 3; }
+.chart .series-1, .spark .series-1 { stroke: var(--lj-series-1); }
+.chart .series-2, .spark .series-2 { stroke: var(--lj-series-2); stroke-dasharray: 6 3; }
+.chart .series-3, .spark .series-3 { stroke: var(--lj-series-3); stroke-dasharray: 2 3; }
 .chart .line, .spark .line { fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
-.chart .mark { fill: var(--lj-series-ink); stroke: var(--lj-card); stroke-width: 1.5; }
+.chart .mark { fill: var(--lj-series-1); stroke: var(--lj-card); stroke-width: 1.5; }
 .chart .band { fill: var(--lj-rule); }
 .chart .annotation { fill: var(--lj-ink); font: 600 var(--lj-text-2) var(--lj-sans); }
 .chart .gap { stroke: var(--lj-gray); stroke-dasharray: 3 3; fill: none; } /* uncovered window */

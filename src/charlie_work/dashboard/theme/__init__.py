@@ -12,6 +12,7 @@ from charlie_work.dashboard.theme.theme import (
     contrast_ratio,
     generate_css,
     load_tokens,
+    find_swole_root,
     swole_drift,
 )
 
@@ -25,5 +26,6 @@ __all__ = [
     "contrast_ratio",
     "generate_css",
     "load_tokens",
+    "find_swole_root",
     "swole_drift",
 ]

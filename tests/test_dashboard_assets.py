@@ -46,10 +46,32 @@ def test_htmx_matches_published_sri_hash() -> None:
     assert HTMX_SHA384 in static_asset("VENDORED.md").read_text(encoding="utf-8")
 
 
-@pytest.mark.parametrize("bad", ["../theme.py", "/etc/passwd", "fonts/../base.css", "", "a//b"])
+TRAVERSAL_INPUTS = [
+    "../theme.py", "/etc/passwd", "fonts/../base.css", "", "a//b",
+    "C:../tokens.json", "D:x", "G:Downloads/x", "C:/abs", "C:",
+    "..\\x", "fonts\\..\\..", "\\\\server\\share\\x", "//server/share/x",
+    "%2e%2e/x", "%2E%2E%2Fx", "base.css\x00", "\x00", "base.css/", "./base.css",
+]  # fmt: skip
+
+
+@pytest.mark.parametrize("bad", TRAVERSAL_INPUTS)
 def test_static_asset_rejects_traversal(bad: str) -> None:
     with pytest.raises(ValueError):
         static_asset(bad)
+
+
+@pytest.mark.parametrize("rel", ASSETS)
+def test_every_listed_asset_is_in_the_allowlist(rel: str) -> None:
+    from charlie_work.dashboard.theme.assets import _asset_index
+
+    assert rel in _asset_index()
+    assert static_asset(rel).is_file()
+
+
+def test_allowlist_excludes_non_static_siblings() -> None:
+    from charlie_work.dashboard.theme.assets import _asset_index
+
+    assert not any(k.endswith((".py", "tokens.json")) for k in _asset_index())
 
 
 def test_static_asset_missing_is_file_not_found() -> None:
