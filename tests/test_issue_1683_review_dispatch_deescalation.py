@@ -56,7 +56,10 @@ from charlie_work.state import (
     save_state,
     state_lock,
 )
-from charlie_work.unescalate_reset_fields import REWORK_BUDGET_RESET_BY_ESCALATION_REASON
+from charlie_work.unescalate_reset_fields import (
+    ISSUE_BUDGET_RESET_BY_ESCALATION_REASON,
+    REWORK_BUDGET_RESET_BY_ESCALATION_REASON,
+)
 
 from _review_fixtures import (
     _dispatch_reviews_app,
@@ -366,28 +369,6 @@ _NO_COUNTER_ALLOWLIST: dict[str, str] = {
         "not reset (absent from UNESCALATE_PR_RESET_FIELDS) -- and the "
         "triggering condition (required checks missing) is a janitor "
         "blocker, so the sweep cannot clear while it persists."
-    ),
-    # --- issue-level windowed caps: the sweep's map resets PR-record ---
-    # --- fields only; these live on the issue record and are the      ---
-    # --- operator door's UNESCALATE_ISSUE_RESET_FIELDS domain. They   ---
-    # --- re-gate only on a fresh dispatch attempt (the next genuine   ---
-    # --- rework cycle), not on the very next pass.                    ---
-    "redispatch_cap_exceeded": (
-        "Gated by the issue-level ``redispatch_at`` windowed-timestamp "
-        "list, not a PR counter; the windowed list is operator-door "
-        "domain (UNESCALATE_ISSUE_RESET_FIELDS)."
-    ),
-    "worker_death_loop": (
-        "Gated by the issue-level ``worker_death_at`` windowed-timestamp "
-        "list; operator-door domain."
-    ),
-    "dispatch_blocked_environment": (
-        "Gated by the issue-level ``blocked_environment_at`` "
-        "windowed-timestamp list; operator-door domain."
-    ),
-    "dispatch_failed_cap_exceeded": (
-        "Gated by the issue-level ``dispatch_failed_at`` "
-        "windowed-timestamp list; operator-door domain."
     ),
     # --- DETERMINISTIC_ESCALATION_FAILURE_KINDS members: deterministic ---
     # --- failure classifications, escalated on first occurrence --    ---
@@ -760,7 +741,9 @@ def test_every_mechanical_escalation_reason_is_mapped_or_allowlisted() -> None:
     """
     literal_reasons, dynamic_sites = _mechanical_escalation_reasons()
 
-    mapped = set(REWORK_BUDGET_RESET_BY_ESCALATION_REASON)
+    mapped = set(REWORK_BUDGET_RESET_BY_ESCALATION_REASON) | set(
+        ISSUE_BUDGET_RESET_BY_ESCALATION_REASON
+    )
     allowlisted = set(_NO_COUNTER_ALLOWLIST)
     unaccounted = literal_reasons - mapped - allowlisted
     assert not unaccounted, (

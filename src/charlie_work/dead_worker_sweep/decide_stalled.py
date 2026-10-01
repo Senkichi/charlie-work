@@ -25,6 +25,7 @@ from .stalled_model import (
     KillOrphans,
     KillTree,
     MarkBudgetExceeded,
+    ProbeCompletedHandoff,
     ProbeHealth,
     ProbeRateLimitDefer,
     ReadAdapterProfile,
@@ -103,7 +104,11 @@ def _reap_flow(facts: StalledFacts, health: WorkerHealth, probe: Any, adapter: A
         yield RecordPostMortem(issue)
     failure_kind: str | None = None
     throttled_until: str | None = None
-    if not facts.dry_run and adapter.can_record_failure:
+    # A DEAD worker that already handed off a fresh completed outcome did not
+    # stall: the "stalled" fallback would be a false label (#2104), so it is not
+    # classified at all. Only a live, non-progressing (STALLED) worker earns it.
+    handed_off = health is WorkerHealth.DEAD and (yield ProbeCompletedHandoff(issue))
+    if not handed_off and not facts.dry_run and adapter.can_record_failure:
         failure_kind, throttled_until = yield RecordFailure(issue)
     if failure_kind and throttled_until:
         yield StateTxn(
@@ -149,6 +154,8 @@ def stalled_flow(facts: StalledFacts) -> Flow:
     issue = w.issue_number
     entry = {"issue": issue, "pid": w.pid}
 
+    # Intentionally read before the sidecar stamp below (#2114 D): ``over_budget`` only reads
+    # the session's events.jsonl (``worker._api_session_over_budget``), never the stamps.
     adapter = yield ReadAdapterProfile(issue)
     # #1325: sidecar writes are suppressed under dry-run; detection reads only
     # the pre-fetched ``WorkerView`` so skipping them leaves this pass intact.

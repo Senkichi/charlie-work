@@ -8,9 +8,10 @@ only has to keep the observed-results map and the count of commits it has
 already applied.
 
 Two gates protect the loop. A *plan violation* (the commit prefix changed
-between rounds, or a request illegal in the phase) aborts the phase before any
-save; a request that comes back unchanged (``no_progress``) does the same. Both
-log an error-level event and end the sweep with nothing half-written.
+between rounds, or a request illegal in the phase) aborts the phase; a request
+that comes back unchanged (``no_progress``) does the same. Both log an
+error-level event and end the sweep. A lock-phase abort still saves the commits
+already applied (their network effects are done); pre and post phases save nothing.
 """
 
 from __future__ import annotations
@@ -216,14 +217,18 @@ def _run_sweep(run: _Run) -> None:
         ctx.state = ctx.ports.load_state(ctx.state_file)
         locked = copy.deepcopy(ctx.state)
         sweep_events: list[Any] = []
-        _run_phase(run, _facts(run, "lock", locked), sweep_events)
-        ctx.state = stalled_review_reap._append_sweep_events(
-            ctx.state,
-            sweep_events,
-            max_size=ctx.config.runtime.event_ring_size,
-            state_file=ctx.state_file,
-            write_gate=ctx.write_gate,
-        )
-        ctx.write_gate.save_state(ctx.state)
+        try:
+            _run_phase(run, _facts(run, "lock", locked), sweep_events)
+        finally:
+            # Also on SweepAborted: ``OpenPrForBranch`` / ``AdvanceToPrOpen`` already hit
+            # GitHub, so the committed prefix must reach state.json or the two diverge.
+            ctx.state = stalled_review_reap._append_sweep_events(
+                ctx.state,
+                sweep_events,
+                max_size=ctx.config.runtime.event_ring_size,
+                state_file=ctx.state_file,
+                write_gate=ctx.write_gate,
+            )
+            ctx.write_gate.save_state(ctx.state)
 
     _run_phase(run, _facts(run, "post", locked), [])
