@@ -13,7 +13,7 @@ import pytest
 from charlie_work.ci_absence import runs_terminally_without_jobs
 from charlie_work.state import load_state, save_state
 
-from test_stale_checks_retrigger import _app_with_conflict_and_missing_checks, _events
+from _stale_checks_fixtures import _app_with_conflict_and_missing_checks, _events
 
 _REJECTED_RUN: dict[str, Any] = {"status": "completed", "conclusion": "failure", "jobs": []}
 
