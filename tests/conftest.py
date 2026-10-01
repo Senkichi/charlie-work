@@ -420,3 +420,15 @@ def _default_healthy_preflight(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     monkeypatch.setattr("charlie_work.workflow.run_preflight", _healthy_preflight)
     monkeypatch.setattr("charlie_work.fleet_dispatch.run_preflight", _healthy_preflight)
+
+
+@pytest.fixture(autouse=True)
+def _no_live_self_deploy_history(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Issue #2103: the reviewer reap reads the orchestrator's own ``events.db``
+    for ``self_deploy_succeeded``. On a host with deploy history that would
+    reclassify every fixture reviewer (started in the past) as deploy-interrupted,
+    so tests see no deploy store unless they opt in by patching this seam."""
+    monkeypatch.setattr(
+        "charlie_work.orchestration.misc_review_verdicts.self_deploy_state_path",
+        lambda: None,
+    )

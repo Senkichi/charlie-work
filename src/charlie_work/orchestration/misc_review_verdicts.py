@@ -25,6 +25,11 @@ from charlie_work.claude_code import _events_path
 from charlie_work.devin_review_resume import resume_exec_rejected_review
 from charlie_work.harnesses import REVIEWER_ADAPTER_KINDS
 from charlie_work.process_utils import find_worker_terminal_status
+from charlie_work.review_deploy_interruption import (
+    REVIEW_INTERRUPTED_BY_DEPLOY,
+    deploy_interrupted_review,
+    self_deploy_state_path,
+)
 from charlie_work.stalled_review_reap import (
     _detect_and_handle_stalled_reviews,
     _reap_completed_review_checkouts,
@@ -38,6 +43,7 @@ from charlie_work.verdict_parsing import (
     _parse_review_verdict_from_log,
     _reviewer_session_metrics,
 )
+from charlie_work.state import without_review_dispatch_claim
 from charlie_work.worker import iter_workers
 
 
@@ -110,6 +116,41 @@ def _reap_review_verdicts(self, reviews_dir: Path) -> dict[str, Any]:
         if verdict is None and resume_exec_rejected_review(self, w, pr_number, reviews_dir):
             # Issue #2090: the session ended on a refused exec and was resumed
             # in place (same sidecar, same slot); nothing to record this pass.
+            continue
+        deployed_at = (
+            deploy_interrupted_review(w.started_at, self_deploy_state_path())
+            if verdict is None
+            else None
+        )
+        if deployed_at is not None:
+            # Issue #2103: a code-only self_deploy landed after this reviewer
+            # started, so the daemon restarted under it. Not a miss: roll the
+            # claim back and give the attempt back (the throttled path's
+            # shape, stalled_review_reap) so the PR re-dispatches next pass.
+            # The miss streak is deliberately untouched.
+            with _wf.state_lock(self.paths.state_file):
+                state = _wf.load_state(self.paths.state_file)
+                ps = state["prs"].get(str(pr_number), {})
+                rolled_back = without_review_dispatch_claim(ps)
+                attempts = int(ps.get("review_dispatch_attempt_count", 0))
+                if attempts > 0:
+                    rolled_back["review_dispatch_attempt_count"] = attempts - 1
+                state["prs"][str(pr_number)] = rolled_back
+                state = _wf.append_event(
+                    state,
+                    REVIEW_INTERRUPTED_BY_DEPLOY,
+                    {
+                        "pr_number": pr_number,
+                        "issue_number": issue_number,
+                        "pid": w.pid,
+                        "started_at": w.started_at,
+                        "deployed_at": deployed_at,
+                    },
+                    state_path=self.paths.state_file,
+                )
+                _wf.save_state(self.paths.state_file, state)
+            _wf.remove_review_checkout(self.repo_root, pr_number, reviews_dir=reviews_dir)
+            w.reap_sidecar(reviews_dir)
             continue
         if verdict is None:
             # No structured verdict found. Before discarding this reviewer's
