@@ -294,3 +294,33 @@ def test_unescalate_reset_map_clears_the_infra_counter() -> None:
 
     counters, _ = REWORK_BUDGET_RESET_BY_ESCALATION_REASON["local_merge_gate_infra_exhausted"]
     assert "local_suite_infra_relaunch_count" in counters
+
+
+# ---------------------------------------------------------------------------
+# Durable-sample timeout (events.db, not pruned per-PR result dirs)
+# ---------------------------------------------------------------------------
+
+
+def test_timeout_derives_from_durable_events_without_result_files(tmp_path: Path) -> None:
+    from charlie_work.instrumentation import log_event
+
+    state_path = tmp_path / "state.json"
+    for pr in (1, 2, 3):
+        log_event(
+            state_path,
+            "local_suite_ok",
+            {"pr_number": pr, "duration_seconds": 1500},
+        )
+    dispatches = tmp_path / "dispatches"  # no pr-* result dirs at all
+    dispatches.mkdir()
+    assert effective_suite_timeout(dispatches, state_path) == 6000
+
+
+def test_timeout_degrades_to_default_on_missing_or_corrupt_db(tmp_path: Path) -> None:
+    dispatches = tmp_path / "dispatches"
+    dispatches.mkdir()
+    assert effective_suite_timeout(dispatches, tmp_path / "nodir" / "state.json") == 3600
+    corrupt = tmp_path / "bad"
+    corrupt.mkdir()
+    (corrupt / "events.db").write_bytes(b"not a sqlite database" * 50)
+    assert effective_suite_timeout(dispatches, corrupt / "state.json") == 3600
