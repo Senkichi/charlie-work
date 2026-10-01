@@ -29,6 +29,7 @@ from typing import Any
 
 from .. import layout
 from . import sources as src
+from .rollup_common import _int
 from .rollup_derive import GLOBAL_ONLY_KINDS, HANDLERS, derive_event
 from .rollup_schema import (
     FLEET_SOURCE,
@@ -184,8 +185,26 @@ def _copy_loop_passes(
     for row in rows:
         dst.execute(
             f"INSERT OR REPLACE INTO loop_passes (source, {cols}) VALUES ({marks})",
-            (source, *tuple(row)),
+            (source, *_typed_pass(tuple(row))),
         )
+
+
+_PASS_INT_COLUMNS = frozenset(LOOP_PASS_COLUMNS) - {
+    "correlation_id", "started_at", "completed_at", "elapsed_seconds"
+}  # fmt: skip
+
+
+def _typed_pass(row: tuple[Any, ...]) -> tuple[Any, ...]:
+    """Coerce a copied pass row to the column types: SQLite INT affinity keeps a
+    non-numeric TEXT count as TEXT, and dashboard.db must never hold one."""
+    out = []
+    for name, value in zip(LOOP_PASS_COLUMNS, row, strict=True):
+        if name in _PASS_INT_COLUMNS:
+            value = _int(value)
+        elif name == "elapsed_seconds" and not isinstance(value, (int, float)):
+            value = None
+        out.append(value)
+    return tuple(out)
 
 
 def _write_coverage(srcdb: sqlite3.Connection, dst: sqlite3.Connection, source: str) -> None:

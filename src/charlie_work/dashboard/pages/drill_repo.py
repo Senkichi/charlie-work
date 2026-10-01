@@ -92,8 +92,8 @@ def _passes(repo: str, rows: tuple[LoopPassRow, ...], tz: tzinfo | None) -> str:
         f"<tr><td>{link(pass_url(repo, p.correlation_id), p.correlation_id, 'cid')}</td>"
         f"<td>{ts_tag(p.started_at, tz)}</td>"
         f'<td class="num">{esc(age(p.elapsed_seconds))}</td><td>{_ok(p)}</td>'
-        f'<td class="num">{p.error_count}</td><td class="num">{p.merge_count}</td>'
-        f'<td class="num">{p.review_count}</td></tr>'
+        f'<td class="num">{esc(p.error_count)}</td><td class="num">{esc(p.merge_count)}</td>'
+        f'<td class="num">{esc(p.review_count)}</td></tr>'
         for p in rows
     ]
     return table(

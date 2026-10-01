@@ -20,7 +20,10 @@ log = logging.getLogger("charlie_work.dashboard")
 
 CSP = (
     "default-src 'self'; script-src 'self'; style-src 'self'; font-src 'self'; "
-    "img-src 'self' data:; frame-ancestors 'none'"
+    "img-src 'self' data:; frame-ancestors 'none'; "
+    # neither falls back to default-src: without them injected markup could retarget
+    # every relative link (<base>) or post a form off-host
+    "base-uri 'none'; form-action 'none'"
 )
 SECURITY_HEADERS = (
     ("Content-Security-Policy", CSP),

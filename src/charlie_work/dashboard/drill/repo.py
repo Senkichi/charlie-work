@@ -9,6 +9,7 @@ from pathlib import Path
 
 from ..metrics_flow import drop_reconcile_backfill
 from ..now_types import NowModel
+from ..rollup_common import _int
 from .types import (
     DrillError,
     EscalationRow,
@@ -40,10 +41,10 @@ def _passes(db: sqlite3.Connection, slug: str, limit: int, tz: tzinfo | None):
             done,
             local_text(done, tz),
             None if ok is None else bool(ok),
-            elapsed,
-            errors or 0,
-            merges or 0,
-            reviews or 0,
+            elapsed if isinstance(elapsed, (int, float)) else None,
+            _int(errors) or 0,  # a TEXT count in a corrupt db is 0, never markup
+            _int(merges) or 0,
+            _int(reviews) or 0,
         )  # fmt: skip
         for cid, started, done, ok, elapsed, errors, merges, reviews in rows
     )
