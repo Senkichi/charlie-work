@@ -4574,6 +4574,7 @@ class OrchestratorApp:
                 # must not carry forward and immediately count against the
                 # fresh attempt budget (issue #1069).
                 "review_log_unreadable_streak": 0,
+                "review_api_error_streak": 0,  # issue #1808
                 # Issue #1439: reset the turn-limit miss streak on a fresh
                 # dispatch cycle (new head). A same-head rebuild must NOT zero
                 # it -- mirroring review_dispatch_attempt_count's same-head
