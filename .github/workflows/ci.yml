@@ -511,6 +511,9 @@ jobs:
       pull-requests: read
     steps:
       - uses: actions/checkout@v5
+        with:
+          # Issue #2123: depth 2 so HEAD^1 (the merge ref's base parent) exists.
+          fetch-depth: 2
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
       - name: Install dependencies
         run: uv sync --frozen --all-extras
@@ -564,8 +567,12 @@ jobs:
         shell: bash
         run: |
           set -e
-          git fetch --depth 1 origin ${{ github.event.pull_request.base.sha }}
-          git worktree add ./base-tree ${{ github.event.pull_request.base.sha }}
+          # Issue #2123: HEAD is refs/pull/N/merge; collect the base side at its
+          # first parent (the exact base the head was merged onto), NOT
+          # pull_request.base.sha, which can predate PRs merged since. The script
+          # exits non-zero unless HEAD is a two-parent merge commit.
+          BASE_SHA=$(python scripts/collect_gate_base_sha.py)
+          git worktree add ./base-tree "$BASE_SHA"
           trap 'git worktree remove --force ./base-tree' EXIT
           (
             cd ./base-tree
