@@ -1,0 +1,276 @@
+# ruff: noqa: F811  (the imported ``fleet`` fixture is re-bound as a test parameter)
+"""Tests for the dashboard rollup (``dashboard/rollup.py``); fixtures in ``_dashboard_rollup_fixtures``."""
+
+from __future__ import annotations
+
+import sqlite3
+from datetime import timedelta
+
+import pytest
+from _dashboard_rollup_fixtures import (  # noqa: F401  (fleet is a pytest fixture)
+    ALPHA,
+    BETA,
+    NOW,
+    _all,
+    _facts,
+    fleet,
+)
+
+from charlie_work.dashboard import rollup
+from charlie_work.dashboard.rollup_derive import reason_group
+from charlie_work.dashboard.rollup_schema import SCHEMA_VERSION
+
+
+def test_facts_exact_values(fleet) -> None:
+    result = rollup.run_rollup(fleet.sources(), NOW)
+    assert result.errors == ()
+    by = {s.source: s for s in result.sources}
+    # handled-kind events only: unhandled supervisor_started and the 2 noise rows never count
+    assert (by[ALPHA].ingested, by[BETA].ingested, by["fleet"].ingested) == (18, 2, 4)
+    db = fleet.db()
+
+    assert _all(
+        db,
+        "SELECT source, ts, repo, live_sessions, fleet_live_sessions, concurrency_limit, fleet_concurrency_limit, available_slots, dispatch_limit, clamped, deferred_by_concurrency, launched, open_total, dispatchable, active_label, missing_ready, terminal_label, blocked_by_open_dependency, operator_claimed FROM pass_samples ORDER BY ts",
+    ) == [
+        (ALPHA, "2026-10-01T08:00:00Z", ALPHA, 1, 3, 5, 4, 4, 1, 0, 4, 2, 47, 5, 3, 18, 15, 0, 0),
+        (BETA, "2026-10-01T09:00:00Z", BETA, 1, 3, 5, 4, 4, 1, 0, None, 0, 47, 5, 3, 18, 15, 0, 0),
+    ]
+    assert _all(
+        db,
+        "SELECT source, available_slots, live_reviews, review_limit, launched, failed, quota_hit FROM review_samples",
+    ) == [(ALPHA, 6, 0, 6, 2, 1, 0)]
+    assert _all(
+        db,
+        "SELECT source, ts, issue, pr, milestone, event_kind, approx FROM issue_milestones WHERE source = ? ORDER BY ts, seq",
+        ALPHA,
+    ) == [
+        (ALPHA, "2026-10-01T08:00:00Z", 2226, None, "dispatched", "dispatch", 0),
+        (ALPHA, "2026-10-01T08:00:00Z", 2227, None, "dispatched", "dispatch", 0),
+        (ALPHA, "2026-10-01T08:01:00Z", 2195, 2197, "rework_dispatched", "dispatch_rework", 0),
+        (
+            ALPHA,
+            "2026-10-01T08:02:00Z",
+            2185,
+            2188,
+            "pr_opened_by_worker",
+            "worker_handoff_pr_opened",
+            0,
+        ),
+        (
+            ALPHA,
+            "2026-10-01T08:03:00Z",
+            1939,
+            1940,
+            "pr_opened_by_salvage",
+            "orphaned_worker_opened_pr",
+            1,
+        ),
+        (ALPHA, "2026-10-01T08:04:00Z", None, 2214, "review_claimed", "review_dispatch_claim", 0),
+        (ALPHA, "2026-10-01T08:04:00Z", None, 2215, "review_claimed", "review_dispatch_claim", 0),
+        (ALPHA, "2026-10-01T08:06:00Z", 2199, 2208, "verdict_approved", "record_review", 0),
+        (ALPHA, "2026-10-01T08:07:00Z", 2200, 2209, "verdict_request_changes", "record_review", 0),
+        (ALPHA, "2026-10-01T08:07:00Z", 2200, 2209, "escalated", "record_review", 0),
+        (ALPHA, "2026-10-01T08:08:00Z", 2199, 2208, "merged", "reconcile", 1),
+        (ALPHA, "2026-10-01T08:11:00Z", 2060, None, "escalated", "session_failed_escalated", 0),
+        (ALPHA, "2026-10-01T08:12:00Z", 1808, None, "unescalated", "unescalate", 0),
+    ]
+    assert _all(
+        db, "SELECT source, issue, failure_kind, worker_health FROM worker_exits ORDER BY ts"
+    ) == [
+        (ALPHA, 2195, "stalled", "DEAD"),
+        (BETA, 77, None, "DEAD"),
+    ]
+    assert _all(db, "SELECT issue, pr, event_kind, reason FROM escalations ORDER BY ts") == [
+        (2200, 2209, "record_review", "review_verdict_escalated"),
+        (2060, None, "session_failed_escalated", "no_op_rework_cap_exceeded"),
+        (1808, None, "unescalate", "dead_dispatched_worker_reap"),
+    ]
+    assert _all(
+        db,
+        "SELECT pr, reason, reason_group, exit_code, turn_count, tool_call_count FROM verdict_missed ORDER BY ts",
+    ) == [
+        (2087, "launch_failed", "launch_failed", 0, 0, 0),
+        (2088, "PR #2088 is MERGED on GitHub", "pr #", None, None, None),
+        (2089, "PR #2089 is MERGED on GitHub", "pr #", None, None, None),
+    ]
+    assert _all(
+        db,
+        "SELECT source, ts, target_repo, capacity, demand, running, target, budget, oldest_queued_seconds FROM runner_samples ORDER BY target_repo",
+    ) == [
+        ("fleet", "2026-10-01T10:00:00Z", "Senkichi/fresh-eyes", 1, 0, 1, 1, 8, 0),
+        ("fleet", "2026-10-01T10:00:00Z", "Senkichi/swole", 5, 2, 2, 3, 8, 30),
+    ]
+    assert _all(
+        db,
+        "SELECT job_id, source, src_id, queue_wait_seconds, execution_seconds, wall_seconds FROM job_observations ORDER BY job_id",
+    ) == [
+        ("j1", "fleet", 3, 2.0, 2.0, 40.0),
+        ("j2", "fleet", 2, 2.0, 2.0, 40.0),
+    ]
+    assert _all(db, "SELECT source, ok, changed, from_sha, to_sha, error FROM deploys") == [
+        (ALPHA, 1, 1, "32e8", "d6c3", None)
+    ]
+    assert _all(db, "SELECT event_kind, until, detail FROM throttles") == [
+        ("review_quota_exhausted", "2026-10-01T13:00:00Z", "stalled_review_sweep")
+    ]
+    assert _all(
+        db, "SELECT source, event_kind, requested, granted, reason FROM capped_demand ORDER BY ts"
+    ) == [
+        (ALPHA, "dispatch_backpressure", 3, 0, "host_load"),
+        ("fleet", "runner_capacity_starved", 7, 5, None),
+    ]
+    assert _all(
+        db,
+        "SELECT source, correlation_id, started_at, completed_at, ok, elapsed_seconds, merge_count, review_count, sink_population FROM loop_passes",
+    ) == [
+        (ALPHA, "ed62ee91e2e5", "2026-10-01T08:00:00Z", "2026-10-01T08:01:42Z", 1, 102.17, 2, 3, 9)
+    ]
+    # coverage is honest about everything in the source, including noise and unhandled kinds
+    assert _all(
+        db,
+        "SELECT kind, first_ts, last_ts, n FROM coverage WHERE source = ? AND kind IN ('*', 'unauthorized_merge_queue_sync_covered', 'dispatch')",
+        ALPHA,
+    ) == [
+        ("*", "2026-10-01T08:00:00Z", "2026-10-01T08:19:01Z", 23),
+        ("dispatch", "2026-10-01T08:00:00Z", "2026-10-01T08:00:00Z", 1),
+        (
+            "unauthorized_merge_queue_sync_covered",
+            "2026-10-01T08:09:01Z",
+            "2026-10-01T08:09:02Z",
+            2,
+        ),
+    ]
+    assert _all(
+        db, "SELECT kind, n FROM coverage WHERE source='fleet' AND kind = 'supervisor_started'"
+    ) == [("supervisor_started", 1)]
+
+
+def test_noise_and_per_repo_global_copies_excluded(fleet) -> None:
+    rollup.run_rollup(fleet.sources(), NOW)
+    db = fleet.db()
+    assert _all(db, "SELECT COUNT(*) FROM runner_samples WHERE source != 'fleet'") == [(0,)]
+    assert _all(db, "SELECT COUNT(*) FROM runner_samples") == [(2,)]  # global only, not 4
+    assert _all(db, "SELECT COUNT(*) FROM job_observations") == [(2,)]  # j1 seen 3x, counted once
+    for table in ("issue_milestones", "escalations"):
+        assert _all(
+            db,
+            f"SELECT COUNT(*) FROM {table} WHERE event_kind IN ('unauthorized_merge_queue_sync_covered') OR ts = '2026-10-01T08:09:00Z'",
+        ) == [(0,)]
+    # source attribution ignores the (wrong) repo column logged with every event
+    assert {r[0] for r in _all(db, "SELECT DISTINCT repo FROM pass_samples")} == {ALPHA, BETA}
+
+
+def test_second_run_is_idempotent(fleet) -> None:
+    rollup.run_rollup(fleet.sources(), NOW)
+    before = _facts(fleet.db())
+    result = rollup.run_rollup(fleet.sources(), NOW)
+    assert result.errors == ()
+    assert result.ingested == 0
+    assert {s.source: s.rederived for s in result.sources} == {ALPHA: 18, BETA: 2, "fleet": 4}
+    assert _facts(fleet.db()) == before  # re-derived window leaves no duplicates
+
+
+def test_new_events_ingest_incrementally(fleet) -> None:
+    rollup.run_rollup(fleet.sources(), NOW)
+    fleet.emit(
+        fleet.beta,
+        "2026-10-01T11:00:00Z",
+        "session_exited",
+        {"failure_kind": "rate_limited", "issue_number": 78, "worker_health": "DEAD"},
+    )
+    result = rollup.run_rollup(fleet.sources(), NOW + timedelta(minutes=5))
+    assert {s.source: s.ingested for s in result.sources} == {ALPHA: 0, BETA: 1, "fleet": 0}
+    assert _all(
+        fleet.db(),
+        "SELECT issue, failure_kind FROM worker_exits WHERE source = ? ORDER BY ts",
+        BETA,
+    ) == [(77, None), (78, "rate_limited")]
+
+
+def test_rebuild_from_scratch_reproduces_identical_facts(fleet) -> None:
+    rollup.run_rollup(fleet.sources(), NOW)
+    before = _facts(fleet.db())
+    fleet.release()
+    fleet.sources().db_path.unlink()
+    result = rollup.run_rollup(fleet.sources(), NOW)
+    assert result.ingested == 24
+    assert _facts(fleet.db()) == before
+
+
+def test_rederive_window_drops_deduped_rows_but_keeps_old_ones(fleet) -> None:
+    rollup.run_rollup(fleet.sources(), NOW)
+    fleet.close()
+    conn = sqlite3.connect(fleet.alpha / "events.db")
+    # an old (outside the 6h window) and a recent (inside) event vanish from the source
+    conn.execute("DELETE FROM events WHERE kind = 'dispatch'")  # 08:00, 4h before NOW: inside
+    conn.execute("DELETE FROM events WHERE kind = 'unescalate'")
+    conn.commit()
+    conn.close()
+    later = NOW + timedelta(hours=3)  # window now starts 09:00Z; both deleted rows are older
+    rollup.run_rollup(fleet.sources(), later)
+    assert _all(fleet.db(), "SELECT COUNT(*) FROM pass_samples WHERE source = ?", ALPHA) == [
+        (1,)
+    ]  # stale, kept
+    rollup.run_rollup(fleet.sources(), NOW)  # window from 06:00Z reaches 08:00Z rows
+    db = fleet.db()
+    assert _all(db, "SELECT COUNT(*) FROM pass_samples WHERE source = ?", ALPHA) == [(0,)]
+    assert _all(db, "SELECT COUNT(*) FROM escalations WHERE event_kind = 'unescalate'") == [(0,)]
+
+
+def test_schema_version_mismatch_drops_and_rebuilds(fleet) -> None:
+    rollup.run_rollup(fleet.sources(), NOW)
+    before = _facts(fleet.db())
+    fleet.release()
+    db = fleet.db()
+    db.execute(
+        "UPDATE meta SET value = ? WHERE key = 'schema_version'", (str(SCHEMA_VERSION + 1),)
+    )
+    db.execute(
+        "INSERT INTO worker_exits (source, src_id, seq, ts, repo) VALUES ('ghost', 1, 0, 't', 'ghost')"
+    )
+    db.commit()
+    db.close()
+    result = rollup.run_rollup(fleet.sources(), NOW)
+    assert result.db_rebuilt is True
+    assert result.ingested == 24
+    assert _facts(fleet.db()) == before  # ghost row gone, facts reproduced
+
+
+def test_missing_source_is_an_error_value_not_a_failure(fleet) -> None:
+    fleet.close()
+    (fleet.beta / "events.db").unlink(missing_ok=True)
+    for suffix in ("-wal", "-shm"):
+        (fleet.beta / f"events.db{suffix}").unlink(missing_ok=True)
+    result = rollup.run_rollup(fleet.sources(), NOW)
+    by = {s.source: s for s in result.sources}
+    assert by[BETA].error is not None and by[BETA].error.startswith("missing:")
+    assert (by[ALPHA].ingested, by["fleet"].ingested) == (18, 4)
+    assert len(result.errors) == 1
+
+
+def test_replaced_source_db_is_rebuilt(fleet) -> None:
+    rollup.run_rollup(fleet.sources(), NOW)
+    db = fleet.db()
+    db.execute("UPDATE watermarks SET max_id = 9999 WHERE source = ?", (BETA,))
+    db.commit()
+    db.close()
+    result = rollup.run_rollup(fleet.sources(), NOW)
+    by = {s.source: s for s in result.sources}
+    assert by[BETA].rebuilt is True and by[BETA].ingested == 2
+    assert _all(fleet.db(), "SELECT COUNT(*) FROM worker_exits WHERE source = ?", BETA) == [(1,)]
+
+
+@pytest.mark.parametrize(
+    ("reason", "group"),
+    [
+        ("died_mid_session", "died_mid_session"),
+        ("launch_failed", "launch_failed"),
+        ("PR #2087 is MERGED on GitHub", "pr #"),
+        ("escalated: max attempts 3", "escalated"),
+        ("", None),
+        (None, None),
+    ],
+)
+def test_reason_group(reason, group) -> None:
+    assert reason_group(reason) == group
