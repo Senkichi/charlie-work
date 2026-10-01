@@ -313,6 +313,39 @@ def test_pr_approved_carried_forward_status_clean_exit_is_no_op(tmp_path: Path) 
     assert drift["payload"]["reason"] == "dead_worker_clean_exit_no_op"
 
 
+def test_pr_approved_head_advanced_routes_to_review(tmp_path: Path) -> None:
+    """#2135: approved + live head != reviewed head takes the head-change route.
+
+    Before #2135 this arm fell into ``dead_worker_unsafe_to_auto_reset`` drift;
+    with status no longer consulted it must route through ``_head_changed``.
+    """
+    config, paths, gh, _ = _dead_worker_rework_bed(tmp_path, decision="approved")
+    _advance_head(gh)
+
+    run_sweep(tmp_path, paths, config, gh, review_callback=_review_ok)
+
+    assert issue_entry(paths, 207)["status"] == "reviewing"
+    (routed,) = events_of(paths, "orphaned_worker_routed_to_review")
+    assert routed["payload"]["pr_number"] == 100
+    assert routed["payload"]["routed"] is True
+    assert events_of(paths, "orphaned_worker_drift") == []
+    assert events_of(paths, "orphaned_worker_recovered") == []
+
+
+def test_pr_approved_head_advanced_review_refused_drifts_head_change(
+    tmp_path: Path,
+) -> None:
+    config, paths, gh, _ = _dead_worker_rework_bed(tmp_path, decision="approved")
+    _advance_head(gh)
+
+    run_sweep(tmp_path, paths, config, gh, review_callback=_review_refused)
+
+    assert issue_entry(paths, 207)["status"] == "dispatched"
+    (drift,) = events_of(paths, "orphaned_worker_drift")
+    assert drift["payload"]["reason"] == "dead_worker_with_head_change"
+    assert events_of(paths, "orphaned_worker_routed_to_review") == []
+
+
 def test_pr_approved_rework_clean_exit_is_no_op_escalation(tmp_path: Path) -> None:
     config, paths, gh, _ = _dead_worker_rework_bed(
         tmp_path, decision="approved", pr_state_status="rework_requested"
