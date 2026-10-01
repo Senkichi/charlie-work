@@ -243,7 +243,7 @@ _RUN_FIELDS = {
 
 
 def _is_file_name(workflow: str) -> bool:
-    return workflow.isdigit() or workflow.endswith((".yml", ".yaml"))
+    return workflow.isdigit() or workflow.lower().endswith((".yml", ".yaml"))
 
 
 @dataclass(frozen=True)
@@ -251,9 +251,10 @@ class RunListRead:
     """``gh run list --json F`` as a REST read (B1: a read).
 
     Without ``workflow`` it reads ``GET actions/runs``. With one it resolves
-    the workflow exactly as gh does (a numeric id or ``*.yml|*.yaml`` file name
-    is used as given; anything else is matched against the repo's workflow
-    names, and must match exactly one) and reads
+    the workflow exactly as gh does (a numeric id or ``*.yml|*.yaml`` file name,
+    suffix case-insensitive, is used as given; anything else is matched
+    case-insensitively against the names of the repo's workflows other than
+    those in state ``disabled_manually``, and must match exactly one) and reads
     ``GET actions/workflows/{id_or_file}/runs``. Either way ``branch``,
     ``status`` and ``event`` are server-side filters and ``per_page`` is
     ``min(limit, 100)``, so ``limit <= 100`` is one request. The repo-wide list
@@ -339,7 +340,11 @@ class RunListRead:
         ids = [
             w.get("id")
             for w in workflows
-            if isinstance(w, dict) and w.get("name") == self.workflow and w.get("id") is not None
+            if isinstance(w, dict)
+            and isinstance(w.get("name"), str)
+            and w["name"].casefold() == self.workflow.casefold()
+            and w.get("state") != "disabled_manually"
+            and w.get("id") is not None
         ]
         if len(ids) != 1:
             return _defect(f"{len(ids)} workflows named {self.workflow!r} (gh needs exactly one)")
