@@ -87,8 +87,12 @@ def test_operator_worker_env_overrides_background_default(
 
 def test_exited_with_background_work_predicate() -> None:
     ok = {"exit_code": 0, "duration_seconds": 38.0}
-    kw = {"adapter_kind": "claude-code", "dirty": True, "ahead_count": 0}
+    kw = {"adapter_kind": "claude-code", "dirty": True, "ahead_count": 0, "pid": 7}
+    ok = {**ok, "pid": 7}
     assert exited_with_background_work(ok, **kw)
+    assert not exited_with_background_work({**ok, "pid": 8}, **kw)  # stale prior attempt
+    assert not exited_with_background_work({k: v for k, v in ok.items() if k != "pid"}, **kw)
+    assert not exited_with_background_work(ok, **{**kw, "pid": None})
     assert not exited_with_background_work(None, **kw)
     assert not exited_with_background_work({**ok, "exit_code": 1}, **kw)
     assert not exited_with_background_work({**ok, "duration_seconds": 5000.0}, **kw)
@@ -123,7 +127,7 @@ def test_fake_worker_exit_zero_dirty_no_commit_emits_classification_event(
         worktree_path=str(worktree_path),
         prompt_path=str(tmp_path / "prompt.md"),
         command=("claude", "-p"),
-        pid=None,
+        pid=424242,
         started_at=now,
         log_path=str(sessions_dir / "issue-40.claude.log"),
         error=None,
@@ -132,7 +136,7 @@ def test_fake_worker_exit_zero_dirty_no_commit_emits_classification_event(
         json.dumps(record.to_dict()), encoding="utf-8"
     )
     (sessions_dir / "issue-40.claude.terminal.json").write_text(
-        json.dumps({"pid": 1, "exit_code": 0, "duration_seconds": 38.0}), encoding="utf-8"
+        json.dumps({"pid": 424242, "exit_code": 0, "duration_seconds": 38.0}), encoding="utf-8"
     )
     assert _git(worktree_path, "status", "--porcelain").stdout.strip()
 

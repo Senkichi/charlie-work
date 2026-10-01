@@ -89,9 +89,21 @@ def exited_with_background_work(
     adapter_kind: str,
     dirty: bool,
     ahead_count: int,
+    pid: int | None,
 ) -> bool:
-    """A claude-code worker that exited 0 quickly, leaving a dirty tree and no commit."""
-    if adapter_kind != "claude-code" or terminal is None:
+    """A claude-code worker that exited 0 quickly, leaving a dirty tree and no commit.
+
+    The terminal record must belong to the dead worker (``pid`` match): records
+    persist across attempts, so a prior attempt's quick exit-0 record must not
+    classify a later one. Mirrors ``terminal_record_proves_completion``.
+    """
+    if adapter_kind != "claude-code" or terminal is None or pid is None:
+        return False
+    try:
+        same_process = int(terminal.get("pid")) == int(pid)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return False
+    if not same_process:
         return False
     duration = terminal.get("duration_seconds")
     return bool(

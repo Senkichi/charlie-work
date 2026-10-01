@@ -346,6 +346,7 @@ def _reap_dead(
                 adapter_kind=w.adapter_kind,
                 dirty=inspection.dirty,
                 ahead_count=inspection.ahead_count,
+                pid=w.pid,
             ),
         )
         if profile is not None and profile.record_failure is not None:
@@ -396,10 +397,6 @@ def _reap_dead(
     # sidecar was just reaped above.
     worker_literal_tmp.emit_literal_tmp_path_warning(state_file, w, write_gate)
 
-    # Issue #1342: a distinct error-level event on the FIRST detection of a provider
-    # account suspension, so the operator learns about a billing problem in minutes.
-    # ``provider_suspended`` is terminal (no cooldown) and escalates below on this same
-    # pass; the sidecar was just reaped, so the event fires once per episode.
     if failure_kind == BACKGROUND_EXIT_FAILURE_KIND:
         # Issue #2096: visible and countable, not a generic orphan.
         with state_mod.state_lock(state_file):
@@ -418,6 +415,10 @@ def _reap_dead(
             )
             write_gate.save_state(state)
 
+    # Issue #1342: a distinct error-level event on the FIRST detection of a provider
+    # account suspension, so the operator learns about a billing problem in minutes.
+    # ``provider_suspended`` is terminal (no cooldown) and escalates below on this same
+    # pass; the sidecar was just reaped, so the event fires once per episode.
     if failure_kind == "provider_suspended":
         with state_mod.state_lock(state_file):
             state = state_mod.load_state(state_file)

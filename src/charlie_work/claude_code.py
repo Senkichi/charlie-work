@@ -46,7 +46,7 @@ from .config import (
     ReviewerRoleConfig,
     _DEFAULT_CLAUDE_MODEL,
 )
-from .env_sanitize import resolve_pytest_cap, resolve_uv_no_sync, sanitize_env
+from .env_sanitize import build_worker_env, resolve_pytest_cap, resolve_uv_no_sync, sanitize_env
 from .post_mortem import merge_attempt_snapshot
 from .state import _canonical_started_at, utc_now
 from .subprocess_runner import RunResult, resolve_cli_binary, run_captured
@@ -138,10 +138,6 @@ _WORKER_COMMAND_TEMPLATE: tuple[str, ...] = (
 )
 # Permission modes under which a headless worker cannot run un-allow-listed
 # Bash (issue #2010). Single source for the doctor check.
-# Env every claude-code worker launches with unless `worker_env` overrides it
-# (issue #2096). Verified against Claude Code CLI 2.1.286: with this set, the
-# Bash tool has no `run_in_background` parameter.
-WORKER_ENV_DEFAULTS: dict[str, str] = {"CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1"}
 PROMPTING_PERMISSION_MODES: frozenset[str] = frozenset({"acceptEdits", "default", "plan"})
 _REVIEW_COMMAND_TEMPLATE: tuple[str, ...] = ("claude", "-p", "--permission-mode", "plan")
 
@@ -1236,15 +1232,9 @@ def launch_claude_worker(
             provider=provider,
         )
         return _write_record(sessions_dir, record)
-    # Issue #2096: in print mode, ending the turn ends the session, so a
-    # background Bash task (e.g. a "background" test suite) is killed with the
-    # work uncommitted. Turn the tool off at the harness; an operator
-    # `worker_env` value is merged last and can still override this default.
-    worker_env = {
-        **sanitized_env,
-        **WORKER_ENV_DEFAULTS,
-        **{str(k): str(v) for k, v in (env or {}).items()},
-    }
+    # Issue #2096: harness defaults (background tasks off) sit between the
+    # sanitized base and the operator `worker_env`.
+    worker_env = build_worker_env(sanitized_env, env)
     # Issue #646: resolve what sanitize_env()+worker_env actually settled on,
     # purely for the launch-time diagnostic log below (does not affect
     # worker_env itself, which already carries the real values).
