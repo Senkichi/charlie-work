@@ -18,6 +18,7 @@ from typing import Any
 import pytest
 from _fakes_github import FakeGitHub
 from _rework_dispatch_fixtures import _wg
+from _run_captured_fakes import patch_run_captured
 from charlie_work.config import (
     DevinConfig,
     OrchestratorConfig,
@@ -454,6 +455,7 @@ def test_sweep_orphan_processes_for_dead_sessions_unit(tmp_path: Path) -> None:
         # patching the os module directly avoids depending on which module happens to
         # `import os` into its own namespace)
         patch("subprocess.run", side_effect=mock_subprocess_run),
+        patch_run_captured(mock_subprocess_run),
     ):
         from charlie_work.workflow import _sweep_orphan_processes_for_dead_sessions
 
