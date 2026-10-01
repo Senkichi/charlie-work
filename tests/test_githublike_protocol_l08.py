@@ -25,12 +25,12 @@ from pathlib import Path
 
 import pytest
 
-import charlie_work.github as _github_module
 from charlie_work.github import GitHub, GitHubLike, _ROUTES
 from charlie_work.github_capabilities import MergeBranchLike
 from charlie_work.github_capabilities._base import GitHubRunResult
 
 from _githublike_protocol_helpers import _compatible_signature, _lexical_github_defs
+from _fake_transport import FakeAdapter, make_github, ok, sent
 
 MERGE_BRANCH_MOVED_MEMBERS = (
     "merge_pr",
@@ -128,26 +128,18 @@ def test_branch_protection_delegate_uses_owner_shared_list_cache(tmp_path: Path)
 # ``GitHub`` instance with ``GitHub.run`` monkeypatched) --------------------
 
 
-def test_merge_pr_delegate_forwards_through_run(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """``gh.merge_pr(...)`` through the delegate must reach the patched
-    class-level ``GitHub.run`` with the argv the moved body produces, and fall
-    back to a synthetic success string when ``run`` returns empty stdout.
+def test_merge_pr_delegate_forwards_through_run(tmp_path: Path) -> None:
+    """``gh.merge_pr(...)`` PUTs the REST merge endpoint with the strategy as
+    ``merge_method`` and returns the API's own message (B8).
     """
-    calls: list[list[str]] = []
-
-    def fake_run(self: GitHub, args: list[str]) -> str:
-        calls.append(args)
-        return ""
-
-    monkeypatch.setattr(GitHub, "run", fake_run)
-
-    gh = GitHub(tmp_path)
+    reply = ok({"merged": True, "message": "Pull Request successfully merged"})
+    gh, http, _ = make_github(tmp_path, http=FakeAdapter("http", [reply]))
     result = gh.merge_pr(42, "squash")
 
-    assert result == "merged #42"
-    assert calls == [["pr", "merge", "42", "--squash"]]
+    assert result == "Pull Request successfully merged"
+    assert sent(http) == [
+        ("PUT", "repos/{owner}/{repo}/pulls/42/merge", {"merge_method": "squash"})
+    ]
 
 
 def test_merge_pr_delegate_admin_flag_and_merge_flags_precedence(
@@ -172,260 +164,146 @@ def test_merge_pr_delegate_admin_flag_and_merge_flags_precedence(
     assert "--admin" not in calls[0]
 
 
-def test_delete_branch_delegate_forwards_through_run(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """``gh.delete_branch(branch)`` through the delegate must reach the
-    patched class-level ``GitHub.run`` with the git-refs DELETE argv and
-    return ``True`` on success.
+def test_delete_branch_delegate_forwards_through_run(tmp_path: Path) -> None:
+    """``gh.delete_branch(branch)`` DELETEs the git-refs endpoint and returns
+    ``True`` on success.
     """
-    calls: list[list[str]] = []
-
-    def fake_run(self: GitHub, args: list[str]) -> str:
-        calls.append(args)
-        return ""
-
-    monkeypatch.setattr(GitHub, "run", fake_run)
-
-    gh = GitHub(tmp_path)
+    gh, http, _ = make_github(tmp_path, http=FakeAdapter("http", [ok("", status=204)]))
     result = gh.delete_branch("agent/issue-1-slug")
 
     assert result is True
-    assert calls == [
-        ["api", "-X", "DELETE", "repos/{owner}/{repo}/git/refs/heads/agent/issue-1-slug"],
+    assert sent(http) == [
+        ("DELETE", "repos/{owner}/{repo}/git/refs/heads/agent/issue-1-slug", None)
     ]
 
 
-def test_delete_branch_delegate_returns_false_on_githuberror(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_delete_branch_delegate_returns_false_on_githuberror(tmp_path: Path) -> None:
     """``delete_branch`` swallows ``GitHubError`` and returns ``False`` -- the
     identity-sensitive ``ci_fleet.github.GitHubError`` imported into
-    ``merge_branch.py`` must be the *same* type ``run`` raises, or this
+    ``merge_branch.py`` must be the *same* type the typed send raises, or this
     ``except`` would not catch it.
     """
-
-    def fake_run(self: GitHub, args: list[str]) -> str:
-        raise _github_module.GitHubError("boom")
-
-    monkeypatch.setattr(GitHub, "run", fake_run)
-
-    gh = GitHub(tmp_path)
+    reply = ok({"message": "Reference does not exist"}, status=422)
+    gh, _, _ = make_github(tmp_path, http=FakeAdapter("http", [reply]))
     assert gh.delete_branch("agent/issue-1-slug") is False
 
 
-def test_pr_update_branch_delegate_forwards_through_run(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """``gh.pr_update_branch(n)`` through the delegate must reach the patched
-    class-level ``GitHub.run`` with the argv the moved body produces and
-    return ``True``.
-    """
-    calls: list[list[str]] = []
-
-    def fake_run(self: GitHub, args: list[str]) -> str:
-        calls.append(args)
-        return ""
-
-    monkeypatch.setattr(GitHub, "run", fake_run)
-
-    gh = GitHub(tmp_path)
+def test_pr_update_branch_delegate_forwards_through_run(tmp_path: Path) -> None:
+    """``gh.pr_update_branch(n)`` PUTs ``pulls/{n}/update-branch`` and returns ``True``."""
+    reply = ok({"message": "Updating"}, status=202)
+    gh, http, _ = make_github(tmp_path, http=FakeAdapter("http", [reply]))
     result = gh.pr_update_branch(456)
 
     assert result is True
-    assert calls == [["pr", "update-branch", "456"]]
+    assert sent(http) == [("PUT", "repos/{owner}/{repo}/pulls/456/update-branch", None)]
 
 
-def test_pr_update_branch_delegate_returns_false_on_githuberror(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_pr_update_branch_delegate_returns_false_on_githuberror(tmp_path: Path) -> None:
     """``pr_update_branch`` swallows ``GitHubError`` and returns ``False``."""
-
-    def fake_run(self: GitHub, args: list[str]) -> str:
-        raise _github_module.GitHubError("conflict")
-
-    monkeypatch.setattr(GitHub, "run", fake_run)
-
-    gh = GitHub(tmp_path)
+    reply = ok({"message": "conflict"}, status=422)
+    gh, _, _ = make_github(tmp_path, http=FakeAdapter("http", [reply]))
     assert gh.pr_update_branch(456) is False
 
 
 def test_pr_close_delegate_dry_run_returns_synthetic_ok(tmp_path: Path) -> None:
-    """Under ``dry_run``, ``pr_close`` must return a synthetic ``ok=True``
-    result without calling ``run`` at all.
+    """Under ``dry_run``, ``pr_close`` returns an ``ok=True`` result and the
+    transport sends nothing (the dry-run guard lives in the transport now, B2).
     """
-    gh = GitHub(tmp_path, dry_run=True)
+    gh, http, _ = make_github(tmp_path, dry_run=True)
     result = gh.pr_close(7)
 
     assert isinstance(result, GitHubRunResult)
     assert result.ok is True
-    assert result.value is None
+    assert http.calls == []
 
 
-def test_pr_close_delegate_forwards_through_run(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """``gh.pr_close(n)`` through the delegate must reach the patched
-    class-level ``GitHub.run`` with ``allow_failure=True`` and return the
-    ``GitHubRunResult`` verbatim.
-    """
-    calls: list[tuple[list[str], bool]] = []
-    canned = GitHubRunResult(ok=True, returncode=0, stdout="", stderr="", value=None, error=None)
-
-    def fake_run(self: GitHub, args: list[str], *, allow_failure: bool = False) -> GitHubRunResult:
-        calls.append((args, allow_failure))
-        return canned
-
-    monkeypatch.setattr(GitHub, "run", fake_run)
-
-    gh = GitHub(tmp_path)
+def test_pr_close_delegate_forwards_through_run(tmp_path: Path) -> None:
+    """``gh.pr_close(n)`` PATCHes the pull with ``state=closed``."""
+    gh, http, _ = make_github(tmp_path, http=FakeAdapter("http", [ok({"state": "closed"})]))
     result = gh.pr_close(7)
 
-    assert result is canned
-    assert calls == [(["pr", "close", "7"], True)]
+    assert isinstance(result, GitHubRunResult)
+    assert result.ok is True
+    assert sent(http) == [("PATCH", "repos/{owner}/{repo}/pulls/7", {"state": "closed"})]
 
 
 def test_pr_reopen_delegate_dry_run_returns_synthetic_ok(tmp_path: Path) -> None:
-    """Under ``dry_run``, ``pr_reopen`` must return a synthetic ``ok=True``
-    result without calling ``run`` at all -- modeled exactly on ``pr_close``.
+    """Under ``dry_run``, ``pr_reopen`` returns an ``ok=True`` result and the
+    transport sends nothing (the dry-run guard lives in the transport now, B2).
     """
-    gh = GitHub(tmp_path, dry_run=True)
+    gh, http, _ = make_github(tmp_path, dry_run=True)
     result = gh.pr_reopen(7)
 
     assert isinstance(result, GitHubRunResult)
     assert result.ok is True
-    assert result.value is None
+    assert http.calls == []
 
 
-def test_pr_reopen_delegate_forwards_through_run(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """``gh.pr_reopen(n)`` through the delegate must reach the patched
-    class-level ``GitHub.run`` with ``allow_failure=True`` and return the
-    ``GitHubRunResult`` verbatim.
-    """
-    calls: list[tuple[list[str], bool]] = []
-    canned = GitHubRunResult(ok=True, returncode=0, stdout="", stderr="", value=None, error=None)
-
-    def fake_run(self: GitHub, args: list[str], *, allow_failure: bool = False) -> GitHubRunResult:
-        calls.append((args, allow_failure))
-        return canned
-
-    monkeypatch.setattr(GitHub, "run", fake_run)
-
-    gh = GitHub(tmp_path)
+def test_pr_reopen_delegate_forwards_through_run(tmp_path: Path) -> None:
+    """``gh.pr_reopen(n)`` PATCHes the pull with ``state=open``."""
+    gh, http, _ = make_github(tmp_path, http=FakeAdapter("http", [ok({"state": "open"})]))
     result = gh.pr_reopen(7)
 
-    assert result is canned
-    assert calls == [(["pr", "reopen", "7"], True)]
+    assert isinstance(result, GitHubRunResult)
+    assert result.ok is True
+    assert sent(http) == [("PATCH", "repos/{owner}/{repo}/pulls/7", {"state": "open"})]
 
 
 def test_push_empty_commit_delegate_dry_run_returns_synthetic_ok_without_calling_run(
     tmp_path: Path,
 ) -> None:
     """Under ``dry_run``, ``push_empty_commit`` must short-circuit before any
-    ``gh api`` call at all -- it is unconditionally mutating end to end.
+    request is sent -- it is unconditionally mutating end to end.
     """
-    calls: list[list[str]] = []
-
-    def fake_run(self: GitHub, args: list[str], **kwargs: object) -> None:
-        calls.append(args)
-        raise AssertionError("run must not be called under dry_run")
-
-    gh = GitHub(tmp_path, dry_run=True)
-    # Patch after construction is unnecessary here -- dry_run short-circuits
-    # before self.run is ever referenced -- but assert defensively via a
-    # class-level monkeypatch-free instance check instead.
+    gh, http, _ = make_github(tmp_path, dry_run=True)
     result = gh.push_empty_commit("agent/issue-1-slug")
 
     assert isinstance(result, GitHubRunResult)
     assert result.ok is True
-    assert calls == []
+    assert http.calls == []
 
 
-def test_push_empty_commit_delegate_forwards_the_full_four_step_sequence(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """``gh.push_empty_commit(branch)`` happy path must issue the four
-    ``gh api`` calls in order (ref GET, commit GET, commit POST, ref PATCH)
-    through the patched class-level ``GitHub.run`` and return the final
+def test_push_empty_commit_delegate_forwards_the_full_four_step_sequence(tmp_path: Path) -> None:
+    """``gh.push_empty_commit(branch)`` happy path issues the four requests in
+    order (ref GET, commit GET, commit POST, ref PATCH) and returns the final
     ref-update ``GitHubRunResult``.
     """
-    calls: list[list[str]] = []
-    responses = [
-        GitHubRunResult(
-            ok=True,
-            returncode=0,
-            stdout="",
-            stderr="",
-            value={"object": {"sha": "tip-sha"}},
-            error=None,
-        ),
-        GitHubRunResult(
-            ok=True,
-            returncode=0,
-            stdout="",
-            stderr="",
-            value={"tree": {"sha": "tree-sha"}},
-            error=None,
-        ),
-        GitHubRunResult(
-            ok=True, returncode=0, stdout="", stderr="", value={"sha": "new-sha"}, error=None
-        ),
-        GitHubRunResult(
-            ok=True, returncode=0, stdout="", stderr="", value={"sha": "new-sha"}, error=None
-        ),
+    replies = [
+        ok({"object": {"sha": "tip-sha"}}),
+        ok({"tree": {"sha": "tree-sha"}}),
+        ok({"sha": "new-sha"}),
+        ok({"sha": "new-sha"}),
     ]
-
-    def fake_run(self: GitHub, args: list[str], **kwargs: object) -> GitHubRunResult:
-        calls.append(args)
-        return responses[len(calls) - 1]
-
-    monkeypatch.setattr(GitHub, "run", fake_run)
-
-    gh = GitHub(tmp_path)
+    gh, http, _ = make_github(tmp_path, http=FakeAdapter("http", replies))
     result = gh.push_empty_commit("agent/issue-1-slug")
 
-    assert result is responses[3]
+    assert result.ok is True
+    assert result.value == {"sha": "new-sha"}
+    calls = sent(http)
     assert len(calls) == 4
-    assert calls[0] == ["api", "repos/{owner}/{repo}/git/refs/heads/agent/issue-1-slug"]
-    assert calls[1] == ["api", "repos/{owner}/{repo}/git/commits/tip-sha"]
-    assert calls[2][:3] == ["api", "-X", "POST"]
-    assert "tree=tree-sha" in calls[2]
-    assert "parents[]=tip-sha" in calls[2]
-    assert calls[3][:3] == ["api", "-X", "PATCH"]
-    assert "sha=new-sha" in calls[3]
-
-
-def test_branch_protection_delegate_forwards_through_run_and_caches(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """``gh.branch_protection(base)`` cache-miss path delegates to the patched
-    class-level ``GitHub.run`` and caches the parsed value in the owner's
-    shared ``_list_cache``; a second call must not call ``run`` again.
-    """
-    calls: list[list[str]] = []
-    canned = GitHubRunResult(
-        ok=True,
-        returncode=0,
-        stdout="",
-        stderr="",
-        value={"required_status_checks": {"strict": True}},
-        error=None,
+    assert calls[0] == ("GET", "repos/{owner}/{repo}/git/refs/heads/agent/issue-1-slug", None)
+    assert calls[1] == ("GET", "repos/{owner}/{repo}/git/commits/tip-sha", None)
+    assert calls[2][:2] == ("POST", "repos/{owner}/{repo}/git/commits")
+    assert calls[2][2]["tree"] == "tree-sha"  # type: ignore[index]
+    assert calls[2][2]["parents"] == ["tip-sha"]  # type: ignore[index]
+    assert calls[3] == (
+        "PATCH",
+        "repos/{owner}/{repo}/git/refs/heads/agent/issue-1-slug",
+        {"sha": "new-sha"},
     )
 
-    def fake_run(self: GitHub, args: list[str], **kwargs: object) -> GitHubRunResult:
-        calls.append(args)
-        return canned
 
-    monkeypatch.setattr(GitHub, "run", fake_run)
-
-    gh = GitHub(tmp_path)
+def test_branch_protection_delegate_forwards_through_run_and_caches(tmp_path: Path) -> None:
+    """``gh.branch_protection(base)`` cache-miss path sends one GET and caches
+    the parsed value in the owner's shared ``_list_cache``; a second call must
+    not send again.
+    """
+    reply = ok({"required_status_checks": {"strict": True}})
+    gh, http, _ = make_github(tmp_path, http=FakeAdapter("http", [reply]))
     first = gh.branch_protection("main")
     second = gh.branch_protection("main")
 
     assert first == {"required_status_checks": {"strict": True}}
     assert second == first
-    assert len(calls) == 1
-    assert calls[0] == ["api", "repos/{owner}/{repo}/branches/main/protection"]
+    assert sent(http) == [("GET", "repos/{owner}/{repo}/branches/main/protection", None)]
     assert gh._list_cache[("branch_protection", "main")] == first

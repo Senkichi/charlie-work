@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 import charlie_work.github as _github_module
+from _fake_transport import FakeAdapter, make_github, ok, sent
 import charlie_work.github_capabilities as _github_capabilities
 from charlie_work.github import GitHub, GitHubLike, _make_delegate, _ROUTES
 from charlie_work.github_capabilities import (
@@ -303,42 +304,24 @@ def test_comments_routes_point_at_the_comments_collaborator() -> None:
     assert _ROUTES["pr_comment"] == "_comments"
 
 
-def test_issue_comment_delegate_forwards_through_run(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """Calling ``gh.issue_comment(...)`` through the delegate must reach the
-    patched class-level ``GitHub.run`` with the same argv the moved body
-    produces.
+def test_issue_comment_delegate_forwards_through_run(tmp_path: Path) -> None:
+    """Calling ``gh.issue_comment(...)``/``pr_comment`` through the delegate
+    must POST the shared issue-comments endpoint with the body file's contents.
 
-    The expected argv is transcribed by reading the moved
-    ``Comments.issue_comment``/``pr_comment`` bodies directly (both are two
-    -line wrappers around ``self.run([...])``), not derived by calling the
-    same code under test -- calling it twice would make this a circular
-    assertion that could not catch a body that silently changed.
+    The expected requests are transcribed by reading the moved ``Comments``
+    bodies directly, not derived by calling the code under test.
     """
-    calls: list[tuple[list[str], bool, bool]] = []
-
-    def fake_run(
-        self: GitHub, args: list[str], *, json_output: bool = False, allow_failure: bool = False
-    ) -> None:
-        calls.append((args, json_output, allow_failure))
-        return None
-
-    monkeypatch.setattr(GitHub, "run", fake_run)
-
-    gh = GitHub(tmp_path)
+    gh, http, _ = make_github(tmp_path, http=FakeAdapter("http", [ok({"id": 1})]))
     # Issue #1505: issue_comment/pr_comment scan the body file's *contents*
-    # before forwarding (the outbound secret guard), so it must be a real
-    # file on disk now -- a bare name would be refused as unreadable before
-    # run() is ever reached.
+    # before sending (the outbound secret guard), so it must be a real file.
     body_file = tmp_path / "comment-body.md"
     body_file.write_text("delegation test body\n", encoding="utf-8")
     gh.issue_comment(7, body_file)
     gh.pr_comment(9, body_file)
 
-    assert calls == [
-        (["issue", "comment", "7", "--body-file", str(body_file)], False, False),
-        (["pr", "comment", "9", "--body-file", str(body_file)], False, False),
+    assert sent(http) == [
+        ("POST", "repos/{owner}/{repo}/issues/7/comments", {"body": "delegation test body\n"}),
+        ("POST", "repos/{owner}/{repo}/issues/9/comments", {"body": "delegation test body\n"}),
     ]
 
 
@@ -402,41 +385,19 @@ def test_labels_routes_point_at_the_labels_collaborator() -> None:
         assert _ROUTES[name] == "_labels"
 
 
-def test_add_issue_label_delegate_forwards_through_run_bool(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """Calling ``gh.add_issue_label(...)`` through the delegate must reach the
-    patched class-level ``GitHub.run`` with the same argv the moved body
-    produces, via the ``self._run_bool`` -> ``self.run`` chain.
+def test_add_issue_label_delegate_forwards_through_run_bool(tmp_path: Path) -> None:
+    """Calling ``gh.add_issue_label(...)`` through the delegate must POST the
+    issue-labels endpoint and report success as ``True``.
 
-    This exercises a strictly deeper resolution chain than the comments/
-    label_list tests: delegate -> ``Labels`` collaborator -> collaborator
-    ``__getattr__`` (for ``_run_bool``, still a lexical ``GitHub`` method
-    until L09) -> owner ``_run_bool`` -> owner ``run``. The expected argv is
-    transcribed by reading the moved ``Labels.add_issue_label`` body directly
-    (a one-line wrapper around ``self._run_bool([...])``, which itself is a
-    one-line wrapper around ``self.run(args, allow_failure=True)``), not
-    derived by calling the same code under test -- calling it twice would
-    make this a circular assertion that could not catch a body that silently
-    changed.
+    Delegate -> ``Labels`` collaborator -> typed send through the owner's
+    guarded transport. The expected request is transcribed by reading the
+    moved ``Labels`` body directly, not derived by calling the code under test.
     """
-    calls: list[tuple[list[str], bool, bool]] = []
-
-    def fake_run(
-        self: GitHub, args: list[str], *, json_output: bool = False, allow_failure: bool = False
-    ) -> _github_module.GitHubRunResult:
-        calls.append((args, json_output, allow_failure))
-        return _github_module.GitHubRunResult(ok=True, returncode=0, stdout="", stderr="")
-
-    monkeypatch.setattr(GitHub, "run", fake_run)
-
-    gh = GitHub(tmp_path)
+    gh, http, _ = make_github(tmp_path, http=FakeAdapter("http", [ok([{"name": "bug"}])]))
     result = gh.add_issue_label(7, "bug")
 
     assert result is True
-    assert calls == [
-        (["issue", "edit", "7", "--add-label", "bug"], False, True),
-    ]
+    assert sent(http) == [("POST", "repos/{owner}/{repo}/issues/7/labels", {"labels": ["bug"]})]
 
 
 def test_label_list_delegate_forwards_through_run(

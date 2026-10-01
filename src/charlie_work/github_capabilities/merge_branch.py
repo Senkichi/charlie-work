@@ -15,6 +15,7 @@ redeclared directly on the ``GitHubLike`` union body (design doc Section
 
 from __future__ import annotations
 
+import json
 from typing import Any, Protocol, runtime_checkable
 
 # ``ci_fleet.github.GitHubError`` is imported directly here, not re-derived
@@ -47,7 +48,10 @@ from ci_fleet.github import GitHubError
 # permanently, and ``Transport._run_bool``, moved in L09).
 # ``pr_close``/``pr_reopen`` (moved below) reference it as a bare global for
 # their dry-run synthetic-result guard.
-from ._base import CapabilityCollaborator, GitHubRunResult, _is_mutating
+from ..config_validation import ConfigError
+from ..github_transport.request import RestRequest
+from ._base import CapabilityCollaborator, GitHubRunResult
+from ._send import send_result, send_text
 
 # Flag constants for merge_pr -- single source of truth for both argv
 # construction and config validation, moved from ``github.py`` alongside
@@ -61,6 +65,8 @@ from ._base import CapabilityCollaborator, GitHubRunResult, _is_mutating
 # ``LABEL_LIST_FIELDS``/``_pr_number_from_url``.
 _STRATEGY_FLAGS = {"merge": "--merge", "squash": "--squash", "rebase": "--rebase"}
 _ADMIN_FLAG = "--admin"
+_AUTO_FLAG = "--auto"
+_MATCH_HEAD_FLAG = "--match-head-commit"
 
 
 @runtime_checkable
@@ -116,25 +122,44 @@ class MergeBranch(CapabilityCollaborator):
     def merge_pr(
         self, number: int, strategy: str, admin: bool = False, merge_flags: tuple[str, ...] = ()
     ) -> str:
-        args = ["pr", "merge", str(number)]
-        # merge_flags takes precedence over the legacy admin field
-        if merge_flags:
-            args.extend(merge_flags)
-        elif admin:
-            args.append(_ADMIN_FLAG)
-        # Strategy flags are managed here — see ORCHESTRATOR_MANAGED_MERGE_FLAGS
-        args.append(_STRATEGY_FLAGS[strategy])
-        # Branch deletion is deliberately NOT part of this call: `gh pr merge
-        # --delete-branch` also deletes/switches the LOCAL branch and fails when
-        # the head branch is checked out in a worktree, which used to abort the
-        # post-merge label update. Use `delete_branch` separately, best-effort.
-        # `self.run` raises GitHubError on a non-zero exit, so reaching this line
-        # means the merge succeeded. `gh pr merge` prints its success line to
-        # stderr, leaving stdout empty — fall back to an explicit success string
-        # so callers see a truthy result (otherwise `merged` reads as False on a
-        # successful merge).
-        output = str(self.run(args))
-        return output or f"merged #{number}"
+        # merge_flags takes precedence over the legacy admin field.
+        flags = tuple(merge_flags) if merge_flags else ((_ADMIN_FLAG,) if admin else ())
+        sha: str | None = None
+        auto = False
+        for flag in flags:
+            name, _, value = flag.partition("=")
+            if name == _ADMIN_FLAG:
+                continue  # REST merge is the direct merge `--admin` selects
+            if name == _AUTO_FLAG:
+                auto = True
+            elif name == _MATCH_HEAD_FLAG and value:
+                sha = value
+            else:
+                # B8: the closed flag set replaces an open pass-through to gh.
+                raise ConfigError(
+                    f"auto_merge.merge_flags: unsupported flag {flag!r}; supported: "
+                    f"{_ADMIN_FLAG}, {_AUTO_FLAG}, {_MATCH_HEAD_FLAG}=<sha>"
+                )
+        if auto:
+            args = ["pr", "merge", str(number), *flags, _STRATEGY_FLAGS[strategy]]
+            return str(self.run(args)) or f"merged #{number}"
+        # Branch deletion is deliberately NOT part of this call (the old
+        # `gh pr merge --delete-branch` also switched the LOCAL branch and failed
+        # when it was checked out in a worktree). Use `delete_branch` separately.
+        body: dict[str, str] = {"merge_method": strategy}
+        if sha is not None:
+            body["sha"] = sha
+        text = send_text(
+            self,
+            RestRequest.of("PUT", f"repos/{{owner}}/{{repo}}/pulls/{number}/merge", body=body),
+        )
+        # B8: the API's own message ("Pull Request successfully merged"); a
+        # truthy value either way, so `merged` never reads False on success.
+        try:
+            message = json.loads(text).get("message") if text else None
+        except (ValueError, AttributeError):
+            message = None
+        return message if isinstance(message, str) and message else f"merged #{number}"
 
     def delete_branch(self, branch: str) -> bool:
         """Best-effort deletion of the REMOTE head branch after a merge.
@@ -147,7 +172,10 @@ class MergeBranch(CapabilityCollaborator):
         it's deliberately excluded from merge_pr to avoid worktree failures.
         """
         try:
-            self.run(["api", "-X", "DELETE", f"repos/{{owner}}/{{repo}}/git/refs/heads/{branch}"])
+            send_text(
+                self,
+                RestRequest.of("DELETE", f"repos/{{owner}}/{{repo}}/git/refs/heads/{branch}"),
+            )
         except GitHubError:
             return False
         return True
@@ -155,12 +183,15 @@ class MergeBranch(CapabilityCollaborator):
     def pr_update_branch(self, pr_number: int) -> bool:
         """Update a PR's branch with the latest changes from its base.
 
-        Uses `gh pr update-branch`. Returns True on success, False on failure
+        PUTs ``pulls/{n}/update-branch``. Returns True on success, False on failure
         (conflicts, network errors, etc.). Never raises — per-PR failures are
         reported as values and must not abort a batch operation.
         """
         try:
-            self.run(["pr", "update-branch", str(pr_number)])
+            send_text(
+                self,
+                RestRequest.of("PUT", f"repos/{{owner}}/{{repo}}/pulls/{pr_number}/update-branch"),
+            )
             return True
         except GitHubError:
             return False
@@ -175,14 +206,14 @@ class MergeBranch(CapabilityCollaborator):
         ``pr_ready`` -- structured result, dry-run synthetic ok=True guard,
         never raises.
         """
-        args = ["pr", "close", str(number)]
-        if self.dry_run and _is_mutating(args):
-            return GitHubRunResult(
-                ok=True, returncode=0, stdout="", stderr="", value=None, error=None
-            )
-        result = self.run(args, allow_failure=True)
-        assert isinstance(result, GitHubRunResult)
-        return result
+        return send_result(
+            self,
+            RestRequest.of(
+                "PATCH",
+                f"repos/{{owner}}/{{repo}}/pulls/{number}",
+                body={"state": "closed"},
+            ),
+        )
 
     def pr_reopen(self, number: int) -> GitHubRunResult:
         """Reopen a PR via ``gh pr reopen`` (issue #1274, W17).
@@ -201,14 +232,14 @@ class MergeBranch(CapabilityCollaborator):
         a disposable fixture PR before relying on it as the primary
         mechanism in production.
         """
-        args = ["pr", "reopen", str(number)]
-        if self.dry_run and _is_mutating(args):
-            return GitHubRunResult(
-                ok=True, returncode=0, stdout="", stderr="", value=None, error=None
-            )
-        result = self.run(args, allow_failure=True)
-        assert isinstance(result, GitHubRunResult)
-        return result
+        return send_result(
+            self,
+            RestRequest.of(
+                "PATCH",
+                f"repos/{{owner}}/{{repo}}/pulls/{number}",
+                body={"state": "open"},
+            ),
+        )
 
     def push_empty_commit(self, branch: str) -> GitHubRunResult:
         """Push a content-free commit onto ``branch`` via the Git Data API
@@ -243,10 +274,10 @@ class MergeBranch(CapabilityCollaborator):
                 ok=True, returncode=0, stdout="", stderr="", value=None, error=None
             )
 
-        ref_result = self.run(
-            ["api", f"repos/{{owner}}/{{repo}}/git/refs/heads/{branch}"],
+        ref_result = send_result(
+            self,
+            RestRequest.of("GET", f"repos/{{owner}}/{{repo}}/git/refs/heads/{branch}"),
             json_output=True,
-            allow_failure=True,
         )
         if not isinstance(ref_result, GitHubRunResult) or not ref_result.ok:
             error = (
@@ -274,10 +305,10 @@ class MergeBranch(CapabilityCollaborator):
                 error=f"could not determine tip SHA for branch {branch!r}",
             )
 
-        commit_lookup = self.run(
-            ["api", f"repos/{{owner}}/{{repo}}/git/commits/{tip_sha}"],
+        commit_lookup = send_result(
+            self,
+            RestRequest.of("GET", f"repos/{{owner}}/{{repo}}/git/commits/{tip_sha}"),
             json_output=True,
-            allow_failure=True,
         )
         if not isinstance(commit_lookup, GitHubRunResult) or not commit_lookup.ok:
             error = (
@@ -309,21 +340,18 @@ class MergeBranch(CapabilityCollaborator):
                 error=f"could not determine tree SHA for commit {tip_sha!r}",
             )
 
-        new_commit = self.run(
-            [
-                "api",
-                "-X",
+        new_commit = send_result(
+            self,
+            RestRequest.of(
                 "POST",
                 "repos/{owner}/{repo}/git/commits",
-                "-f",
-                "message=chore: retrigger CI (empty commit)",
-                "-f",
-                f"tree={tree_sha}",
-                "-f",
-                f"parents[]={tip_sha}",
-            ],
+                body={
+                    "message": "chore: retrigger CI (empty commit)",
+                    "tree": tree_sha,
+                    "parents": [tip_sha],
+                },
+            ),
             json_output=True,
-            allow_failure=True,
         )
         if not isinstance(new_commit, GitHubRunResult) or not new_commit.ok:
             error = (
@@ -351,17 +379,14 @@ class MergeBranch(CapabilityCollaborator):
                 error="empty-commit creation response had no sha",
             )
 
-        ref_update = self.run(
-            [
-                "api",
-                "-X",
+        ref_update = send_result(
+            self,
+            RestRequest.of(
                 "PATCH",
                 f"repos/{{owner}}/{{repo}}/git/refs/heads/{branch}",
-                "-f",
-                f"sha={new_sha}",
-            ],
+                body={"sha": new_sha},
+            ),
             json_output=True,
-            allow_failure=True,
         )
         if not isinstance(ref_update, GitHubRunResult):
             return GitHubRunResult(
@@ -396,10 +421,10 @@ class MergeBranch(CapabilityCollaborator):
         cache_key = ("branch_protection", base)
         if cache_key in self._list_cache:
             return self._list_cache[cache_key]
-        result = self.run(
-            ["api", f"repos/{{owner}}/{{repo}}/branches/{base}/protection"],
+        result = send_result(
+            self,
+            RestRequest.of("GET", f"repos/{{owner}}/{{repo}}/branches/{base}/protection"),
             json_output=True,
-            allow_failure=True,
         )
         value: dict[str, Any] | None = None
         if isinstance(result, GitHubRunResult):

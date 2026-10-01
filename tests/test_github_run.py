@@ -14,8 +14,10 @@ from pathlib import Path
 
 import pytest
 
+from _fake_transport import FakeAdapter, failure, make_github, ok
 from charlie_work import github as github_module
 from charlie_work.config import RuntimeConfig
+from charlie_work.github_transport import FailureKind
 
 
 def _issue_list_args() -> list[str]:
@@ -225,26 +227,22 @@ def test_run_add_issue_label_retries_pre_connection_then_succeeds(
 ) -> None:
     """Label edits (mutating) are retried on pre-connection failures and return
     boolean success once the connection succeeds."""
-    call_count = 0
-
-    def fake_run(cmd, *args, **kwargs):
-        nonlocal call_count
-        call_count += 1
-        if call_count == 1:
-            return subprocess.CompletedProcess(
-                args=cmd,
-                returncode=1,
-                stdout="",
-                stderr="error connecting to api.github.com: connection refused",
-            )
-        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
-
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+    http = FakeAdapter(
+        "http", [failure(FailureKind.CONNECT, "connection refused"), ok([{"name": "x"}])]
+    )
     monkeypatch.setattr(github_module.time, "sleep", lambda seconds: None)
 
-    gh = github_module.GitHub(tmp_path, runtime=RuntimeConfig(gh_max_retries=3))
+    # A CONNECT failure falls back to gh for the same attempt; gh fails the same
+    # way, so the guard's pre-connection retry (safe for mutations) kicks in.
+    gh_adapter = FakeAdapter(
+        "gh", [failure(FailureKind.CONNECT, "connection refused")], token="tok-1"
+    )
+    gh, http, _ = make_github(
+        tmp_path, http=http, gh=gh_adapter, runtime=RuntimeConfig(gh_max_retries=3)
+    )
     assert gh.add_issue_label(123, "agent:in-progress") is True
-    assert call_count == 2
+    assert len(http.calls) == 2
+    assert len(gh_adapter.api_requests) == 1
 
 
 def test_run_read_command_timeout_retries_then_succeeds(monkeypatch, tmp_path: Path) -> None:

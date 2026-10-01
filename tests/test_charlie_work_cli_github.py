@@ -13,8 +13,10 @@ from pathlib import Path
 import pytest
 import yaml
 
+from _fake_transport import FakeAdapter, make_github, ok, sent
 from _fakes_github import FakeGitHub
 from charlie_work import cli, github as github_module
+from charlie_work.config_validation import ConfigError
 from charlie_work.state import load_state
 from charlie_work.workflow import OrchestratorApp
 from _dispatch_fixtures import _stub_real_activity_probe_for_stalled_tests  # noqa: F401
@@ -255,7 +257,8 @@ def test_github_run_allow_failure_text_value_on_success(monkeypatch, tmp_path: P
 
 
 def test_github_merge_pr_argv_with_merge_flags(monkeypatch, tmp_path: Path) -> None:
-    """Test that merge_flags are correctly passed to gh pr merge."""
+    """``--auto`` still renders as ``gh pr merge`` argv (merge flags before the
+    strategy flag); a flag outside the closed set is a config error (B8)."""
     captured_args = []
 
     def fake_run(cmd, *args, **kwargs):
@@ -270,49 +273,31 @@ def test_github_merge_pr_argv_with_merge_flags(monkeypatch, tmp_path: Path) -> N
     monkeypatch.setattr(github_module.subprocess, "run", fake_run)
 
     gh = github_module.GitHub(tmp_path)
-    gh.merge_pr(123, "squash", admin=False, merge_flags=("--auto", "--subject"))
+    gh.merge_pr(123, "squash", admin=False, merge_flags=("--auto",))
 
     assert len(captured_args) == 1
     args = captured_args[0]
-    # Expected: ["gh", "pr", "merge", "123", "--auto", "--subject", "--squash"]
+    # Expected: ["gh", "pr", "merge", "123", "--auto", "--squash"]
     assert args[0] == "gh"
     assert args[1:4] == ["pr", "merge", "123"]
     assert "--auto" in args
-    assert "--subject" in args
     assert "--squash" in args
     # Verify merge_flags come before strategy flag
-    auto_idx = args.index("--auto")
-    subject_idx = args.index("--subject")
-    squash_idx = args.index("--squash")
-    assert auto_idx < squash_idx
-    assert subject_idx < squash_idx
+    assert args.index("--auto") < args.index("--squash")
+
+    with pytest.raises(ConfigError, match="--subject"):
+        gh.merge_pr(123, "squash", admin=False, merge_flags=("--auto", "--subject"))
+    assert len(captured_args) == 1  # rejected before anything was sent
 
 
-def test_github_merge_pr_argv_with_admin_flag(monkeypatch, tmp_path: Path) -> None:
-    """Test that legacy admin flag is passed when merge_flags is empty."""
-    captured_args = []
-
-    def fake_run(cmd, *args, **kwargs):
-        captured_args.append(cmd)
-        return subprocess.CompletedProcess(
-            args=cmd,
-            returncode=0,
-            stdout="",
-            stderr="",
-        )
-
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
-
-    gh = github_module.GitHub(tmp_path)
+def test_github_merge_pr_argv_with_admin_flag(tmp_path: Path) -> None:
+    """The legacy admin flag selects the direct REST merge (no ``--admin`` argv)."""
+    gh, http, _ = make_github(tmp_path, http=FakeAdapter("http", [ok({"message": "merged"})]))
     gh.merge_pr(123, "squash", admin=True, merge_flags=())
 
-    assert len(captured_args) == 1
-    args = captured_args[0]
-    # Expected: ["gh", "pr", "merge", "123", "--admin", "--squash"]
-    assert args[0] == "gh"
-    assert args[1:4] == ["pr", "merge", "123"]
-    assert "--admin" in args
-    assert "--squash" in args
+    assert sent(http) == [
+        ("PUT", "repos/{owner}/{repo}/pulls/123/merge", {"merge_method": "squash"})
+    ]
 
 
 def test_github_merge_pr_argv_merge_flags_precedence(monkeypatch, tmp_path: Path) -> None:
@@ -352,43 +337,32 @@ def test_github_merge_pr_argv_merge_flags_precedence(monkeypatch, tmp_path: Path
 
 
 def test_github_merge_pr_flags_are_orchestrator_managed(monkeypatch, tmp_path: Path) -> None:
-    """Invariant: every flag merge_pr appends is in ORCHESTRATOR_MANAGED_MERGE_FLAGS.
+    """Invariant: every flag merge_pr maps is in ORCHESTRATOR_MANAGED_MERGE_FLAGS.
 
     This gate ensures that removing a flag from the constant derivation fails tests
-    on BOTH the validation side (config.py) and the argv side (merge_pr), preventing
+    on BOTH the validation side (config.py) and the request side (merge_pr), preventing
     the drift issue #107 where merge_pr could add flags without config validation
-    rejecting them.
+    rejecting them. The REST merge carries the strategy as ``merge_method``; the
+    strategy flag it stands for must stay in the managed set.
     """
-    captured_args = []
+    strategies = {"merge": "--merge", "squash": "--squash", "rebase": "--rebase"}
 
-    def fake_run(cmd, *args, **kwargs):
-        captured_args.append(cmd)
-        return subprocess.CompletedProcess(
-            args=cmd,
-            returncode=0,
-            stdout="",
-            stderr="",
-        )
-
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
-
-    gh = github_module.GitHub(tmp_path)
-    strategies = ["merge", "squash", "rebase"]
-
-    for strategy in strategies:
+    for strategy, strategy_flag in strategies.items():
         for admin in (False, True):
-            captured_args.clear()
+            gh, http, _ = make_github(
+                tmp_path, http=FakeAdapter("http", [ok({"message": "merged"})])
+            )
             gh.merge_pr(123, strategy, admin=admin, merge_flags=())
 
-            assert len(captured_args) == 1
-            args = captured_args[0]
-
-            # Extract flags (skip "gh", "pr", "merge", and the PR number)
-            flags = [arg for arg in args if arg.startswith("--")]
-
-            # Every flag merge_pr appends must be in ORCHESTRATOR_MANAGED_MERGE_FLAGS
-            for flag in flags:
+            (call,) = sent(http)
+            assert call == (
+                "PUT",
+                "repos/{owner}/{repo}/pulls/123/merge",
+                {"merge_method": strategy},
+            )
+            # Every flag merge_pr stands for must be in ORCHESTRATOR_MANAGED_MERGE_FLAGS
+            for flag in (strategy_flag, *(["--admin"] if admin else [])):
                 assert flag in github_module.ORCHESTRATOR_MANAGED_MERGE_FLAGS, (
-                    f"Flag {flag} appended by merge_pr(strategy={strategy}, admin={admin}) "
+                    f"Flag {flag} used by merge_pr(strategy={strategy}, admin={admin}) "
                     f"is not in ORCHESTRATOR_MANAGED_MERGE_FLAGS"
                 )

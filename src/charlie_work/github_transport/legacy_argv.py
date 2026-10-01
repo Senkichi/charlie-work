@@ -10,7 +10,8 @@ capability migrates to typed requests and the table only shrinks
 Two outcomes for every argv:
 
 * a ``RestRequest`` / ``GraphQLRequest`` for the ``gh api`` REST-GET and
-  GraphQL-query shapes the HTTP path has always served, or
+  GraphQL-query shapes the HTTP path has always served, plus the two
+  ``gh run cancel|rerun`` mutations, or
 * a ``LegacyCli``, the verbatim ``gh <args>`` passthrough for everything
   else (every ``--json`` subcommand and every mutation). ``LegacyCli`` is a
   transitional request: it always routes to the gh adapter and is deleted
@@ -257,6 +258,25 @@ def _graphql_row(args: list[str], long_call: bool) -> Translated | None:
         return None
 
 
+def _run_row(args: list[str], long_call: bool) -> Translated | None:
+    """`gh run cancel ID` / `gh run rerun ID [--failed]`: the two run mutations
+    that callers outside the capability layer still spell as argv (design a.2).
+    """
+    if len(args) < 3 or args[0] != "run" or not args[2].isdigit():
+        return None
+    run_id, rest = args[2], args[3:]
+    if args[1] == "cancel" and not rest:
+        suffix = "cancel"
+    elif args[1] == "rerun" and not rest:
+        suffix = "rerun"
+    elif args[1] == "rerun" and rest == ["--failed"]:
+        suffix = "rerun-failed-jobs"
+    else:
+        return None
+    route = f"repos/{{owner}}/{{repo}}/actions/runs/{run_id}/{suffix}"
+    return Translated(RestRequest("POST", route, long_call=long_call))
+
+
 def request_for_argv(
     args: list[str], *, long_call: bool = False, use_requests: bool = True
 ) -> Translated:
@@ -267,6 +287,8 @@ def request_for_argv(
     the switch is on.
     """
     passthrough = Translated(LegacyCli(tuple(args), long_call))
+    if use_requests and args and args[0] == "run":
+        return _run_row(args, long_call) or passthrough
     if not use_requests or not args or args[0] != "api" or api_is_mutating(args):
         return passthrough
     if is_graphql_query(args):

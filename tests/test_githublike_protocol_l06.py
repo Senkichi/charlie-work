@@ -31,6 +31,7 @@ from pathlib import Path
 import pytest
 
 import charlie_work.github as _github_module
+from _fake_transport import FakeAdapter, make_github, ok, sent
 from charlie_work.github import GitHub, _ROUTES
 from charlie_work.github_capabilities import PullRequestsLike
 from charlie_work.github_capabilities.pull_requests import PullRequests
@@ -100,53 +101,25 @@ def test_pullrequests_routes_point_at_the_pull_requests_collaborator() -> None:
         assert _ROUTES[name] == "_pull_requests"
 
 
-def test_pr_create_delegate_forwards_through_run(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """Calling ``gh.pr_create(...)`` through the delegate must reach the
-    patched class-level ``GitHub.run`` with the same argv the moved body
-    produces, and parse the PR number out of the returned URL.
+def test_pr_create_delegate_forwards_through_run(tmp_path: Path) -> None:
+    """Calling ``gh.pr_create(...)`` through the delegate must POST the pulls
+    endpoint and take the PR number from the JSON response (B9).
 
-    The expected argv is transcribed by reading the moved
-    ``PullRequests.pr_create`` body directly, not derived by calling the
-    same code under test.
+    The expected request is transcribed by reading the moved
+    ``PullRequests.pr_create`` body directly, not derived by calling the code
+    under test.
     """
-    calls: list[tuple[list[str], bool]] = []
-
-    def fake_run(
-        self: GitHub, args: list[str], *, allow_failure: bool = False
-    ) -> _github_module.GitHubRunResult:
-        calls.append((args, allow_failure))
-        return _github_module.GitHubRunResult(
-            ok=True,
-            returncode=0,
-            stdout="",
-            stderr="",
-            value="https://github.com/OWNER/REPO/pull/42",
-        )
-
-    monkeypatch.setattr(GitHub, "run", fake_run)
-
-    gh = GitHub(tmp_path)
+    reply = ok({"number": 42, "html_url": "https://github.com/OWNER/REPO/pull/42"}, status=201)
+    gh, http, _ = make_github(tmp_path, http=FakeAdapter("http", [reply]))
     result = gh.pr_create("feature-branch", "main", "My title", "My body")
 
     assert result == 42
-    assert calls == [
+    assert sent(http) == [
         (
-            [
-                "pr",
-                "create",
-                "--head",
-                "feature-branch",
-                "--base",
-                "main",
-                "--title",
-                "My title",
-                "--body",
-                "My body",
-            ],
-            True,
-        ),
+            "POST",
+            "repos/{owner}/{repo}/pulls",
+            {"head": "feature-branch", "base": "main", "title": "My title", "body": "My body"},
+        )
     ]
 
 
@@ -316,39 +289,17 @@ def test_pr_view_delegate_forwards_through_run(
     ]
 
 
-def test_pr_diff_delegate_forwards_through_run(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """Calling ``gh.pr_diff(number)`` through the delegate must reach the
-    patched class-level ``GitHub.run`` with the same argv the moved body
-    produces, unwrapping a ``GitHubRunResult`` to its ``.value`` string, and
-    must recognize a real ``GitHubRunResult`` returned across the
-    collaborator boundary via ``isinstance`` (the ``github_capabilities/
-    _base.py``-defined, ``github.py``-re-exported mechanism).
-
-    The expected argv is transcribed by reading the moved
-    ``PullRequests.pr_diff`` body directly.
+def test_pr_diff_delegate_forwards_through_run(tmp_path: Path) -> None:
+    """Calling ``gh.pr_diff(number)`` through the delegate must GET the pull
+    with the diff media type and return the response text.
     """
-    calls: list[tuple[list[str], bool]] = []
     diff_text = "diff --git a/x b/x\n+added line\n"
-
-    def fake_run(
-        self: GitHub, args: list[str], *, allow_failure: bool = False
-    ) -> _github_module.GitHubRunResult:
-        calls.append((args, allow_failure))
-        return _github_module.GitHubRunResult(
-            ok=True, returncode=0, stdout=diff_text, stderr="", value=diff_text
-        )
-
-    monkeypatch.setattr(GitHub, "run", fake_run)
-
-    gh = GitHub(tmp_path)
+    gh, http, _ = make_github(tmp_path, http=FakeAdapter("http", [ok(diff_text)]))
     result = gh.pr_diff(9)
 
-    assert result == diff_text
-    assert calls == [
-        (["pr", "diff", "9"], True),
-    ]
+    assert result == diff_text.strip()
+    assert sent(http) == [("GET", "repos/{owner}/{repo}/pulls/9", None)]
+    assert http.api_requests[0].accept == "application/vnd.github.v3.diff"  # type: ignore[union-attr]
 
 
 def test_pr_commits_delegate_forwards_through_run(

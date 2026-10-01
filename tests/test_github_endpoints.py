@@ -13,7 +13,7 @@ import json
 import subprocess
 from pathlib import Path
 
-from _fake_transport import gh_kill_switch_runtime
+from _fake_transport import FakeAdapter, gh_kill_switch_runtime, make_github, ok, sent
 from charlie_work import github as github_module
 from charlie_work.config import RuntimeConfig
 from _github_fixtures import _read_fixture
@@ -167,18 +167,9 @@ def test_commit_check_runs_returns_none_on_failure(monkeypatch, tmp_path: Path) 
     assert gh.commit_check_runs("missing-sha") is None
 
 
-def test_remove_pr_label_invokes_gh_pr_edit(monkeypatch, tmp_path: Path) -> None:
-    calls = []
+def test_remove_pr_label_invokes_gh_pr_edit(tmp_path: Path) -> None:
+    gh, http, _ = make_github(tmp_path, http=FakeAdapter("http", [ok([])]))
+    done = gh.remove_pr_label(1400, "blocked")
 
-    def fake_run(cmd, *args, **kwargs):
-        calls.append(cmd)
-        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
-
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
-
-    gh = github_module.GitHub(tmp_path)
-    ok = gh.remove_pr_label(1400, "blocked")
-
-    assert ok is True
-    assert calls[-1][:5] == ["gh", "pr", "edit", "1400", "--remove-label"]
-    assert calls[-1][5] == "blocked"
+    assert done is True
+    assert sent(http) == [("DELETE", "repos/{owner}/{repo}/issues/1400/labels/blocked", None)]

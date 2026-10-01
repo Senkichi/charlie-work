@@ -14,12 +14,14 @@ from typing import Protocol, runtime_checkable
 # refusal below lands in the exception type every caller already catches.
 from ci_fleet.github import GitHubError
 
+from ..github_transport.request import RestRequest
 from ..outbound_body_guard import (
     OutboundBodyGuardError,
     check_outbound_write,
     refusal_summary,
 )
 from ._base import CapabilityCollaborator
+from ._send import send_text
 
 
 @runtime_checkable
@@ -40,7 +42,7 @@ class Comments(CapabilityCollaborator):
     Section 3.3).
     """
 
-    def _guard_comment_body(self, surface: str, number: int, body_file: Path) -> None:
+    def _guard_comment_body(self, surface: str, number: int, body_file: Path) -> str:
         """Refuse the comment before ``gh`` runs if its body carries a secret.
 
         Issue #1505: a comment body is permanent -- deleting it does not
@@ -50,10 +52,13 @@ class Comments(CapabilityCollaborator):
         (the same failure vocabulary a ``gh`` refusal produces), and an
         unreadable body file refuses rather than letting gh discover it.
         Skipped under ``dry_run`` -- nothing is written, so there is nothing
-        to guard.
+        to guard (the body is returned as ``""``: the transport suppresses the
+        write, so nothing reads it).
+
+        Returns the body text the request will carry.
         """
         if self.dry_run:
-            return
+            return ""
         try:
             body = body_file.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError) as exc:
@@ -71,11 +76,21 @@ class Comments(CapabilityCollaborator):
             raise GitHubError(f"{surface} #{number}: {exc}") from exc
         if matches:
             raise GitHubError(refusal_summary(surface, matches))
+        return body
+
+    def _post_comment(self, number: int, body: str) -> None:
+        # Issue and PR comments share one endpoint: a PR is an issue.
+        send_text(
+            self,
+            RestRequest.of(
+                "POST",
+                f"repos/{{owner}}/{{repo}}/issues/{number}/comments",
+                body={"body": body},
+            ),
+        )
 
     def issue_comment(self, number: int, body_file: Path) -> None:
-        self._guard_comment_body("issue_comment", number, body_file)
-        self.run(["issue", "comment", str(number), "--body-file", str(body_file)])
+        self._post_comment(number, self._guard_comment_body("issue_comment", number, body_file))
 
     def pr_comment(self, number: int, body_file: Path) -> None:
-        self._guard_comment_body("pr_comment", number, body_file)
-        self.run(["pr", "comment", str(number), "--body-file", str(body_file)])
+        self._post_comment(number, self._guard_comment_body("pr_comment", number, body_file))

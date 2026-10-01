@@ -46,7 +46,9 @@ from ci_fleet.github import GitHubError
 # rationale (it is shared with ``PullRequests`` members and, until this leaf,
 # with ``GitHub.issue_list``). ``issue_list`` (moved below) references it as a
 # bare global.
+from ..github_transport.request import RestRequest
 from ._base import CapabilityCollaborator, GitHubRunResult, _LIST_LIMIT
+from ._send import send_text
 from .circuit_breaker_transport import circuit_breaker_state_path
 from .cross_repo_blockers import CrossRepoBlocker, make_blocker, repo_from_repository_url
 from ..instrumentation import log_event
@@ -370,12 +372,17 @@ class Issues(CapabilityCollaborator):
     def close_issue(self, number: int) -> bool:
         """Close an issue. Idempotent — returns True even if already closed.
 
-        Uses `gh issue close`. Returns True on success, False on failure.
+        PATCHes the issue state. Returns True on success, False on failure.
         Never raises — per-issue failures are reported as values and must not
         abort a batch operation.
         """
         try:
-            self.run(["issue", "close", str(number)])
+            send_text(
+                self,
+                RestRequest.of(
+                    "PATCH", f"repos/{{owner}}/{{repo}}/issues/{number}", body={"state": "closed"}
+                ),
+            )
             return True
         except GitHubError:
             return False

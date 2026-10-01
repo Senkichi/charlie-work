@@ -180,6 +180,9 @@ def make_github(
         adapters=Adapters(http=http, gh=gh),
     )
     github._list_cache[("_repo_owner_name",)] = ("octo", "hello")
+    # invalidate_list_cache() (once per pass) clears the cache seed above, so pin the
+    # resolver itself: the slug never falls through to a real `git remote get-url`.
+    object.__setattr__(github, "_repo_owner_name", lambda: ("octo", "hello"))
     return github, http, gh
 
 
@@ -189,3 +192,18 @@ def gh_kill_switch_runtime(**overrides: object):
     from charlie_work.config import RuntimeConfig
 
     return RuntimeConfig(gh_transport="gh", **overrides)  # type: ignore[arg-type]
+
+
+def sent(adapter: FakeAdapter) -> list[tuple[str, str, object]]:
+    """(method, route, decoded JSON body) of every REST request *adapter* saw.
+
+    The guard fills ``{owner}/{repo}`` before the adapter sees a request; this
+    maps ``make_github``'s seeded slug back so assertions read like the
+    capability's own route templates.
+    """
+    out: list[tuple[str, str, object]] = []
+    for request in adapter.api_requests:
+        route = getattr(request, "route", "").replace("repos/octo/hello/", "repos/{owner}/{repo}/")
+        body = getattr(request, "body", None)
+        out.append((getattr(request, "method", ""), route, json.loads(body) if body else None))
+    return out

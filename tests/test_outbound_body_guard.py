@@ -21,6 +21,7 @@ from typing import Any
 
 import pytest
 
+from _fake_transport import FakeAdapter, make_github, ok, sent
 from charlie_work.github import GitHub, GitHubError
 from charlie_work.instrumentation import query_events
 from charlie_work.local_issues import LocalFileGitHub
@@ -393,13 +394,12 @@ def test_pr_create_refuses_secret_in_title(
     assert calls == []
 
 
-def test_pr_create_clean_body_proceeds(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    calls = _capture_subprocess(monkeypatch, returncode=0, stdout=_PR_URL)
-    result = GitHub(repo_root=tmp_path).pr_create(
-        head="h", base="main", title="t", body="clean body"
-    )
+def test_pr_create_clean_body_proceeds(tmp_path: Path) -> None:
+    reply = ok({"number": 1234, "html_url": _PR_URL}, status=201)
+    gh, http, _ = make_github(tmp_path, http=FakeAdapter("http", [reply]))
+    result = gh.pr_create(head="h", base="main", title="t", body="clean body")
     assert result == 1234
-    assert len(calls) == 1
+    assert len(http.calls) == 1
 
 
 def test_pr_create_dry_run_still_no_ops(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -440,15 +440,14 @@ def test_pr_comment_refuses_before_gh(tmp_path: Path, monkeypatch: pytest.Monkey
     assert events[0]["pr_number"] == 5
 
 
-def test_issue_comment_clean_body_calls_gh(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    calls = _capture_subprocess(monkeypatch, returncode=0)
+def test_issue_comment_clean_body_calls_gh(tmp_path: Path) -> None:
+    gh, http, _ = make_github(tmp_path, http=FakeAdapter("http", [ok({"id": 1}, status=201)]))
     body_file = tmp_path / "comment.md"
     body_file.write_text("all clean\n", encoding="utf-8")
-    GitHub(repo_root=tmp_path).issue_comment(9, body_file)
-    assert len(calls) == 1
-    assert calls[0][:2] == ["gh", "issue"]
+    gh.issue_comment(9, body_file)
+    assert sent(http) == [
+        ("POST", "repos/{owner}/{repo}/issues/9/comments", {"body": "all clean\n"})
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -700,15 +699,13 @@ def test_issue_comment_non_utf8_body_file_raises_github_error(
     assert calls == []
 
 
-def test_issue_comment_dry_run_never_reads_or_calls(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_issue_comment_dry_run_never_reads_or_calls(tmp_path: Path) -> None:
     """dry_run skips the guard entirely -- a secret in a body that will not
     be written must not refuse, and the file need not even exist."""
-    calls = _capture_subprocess(monkeypatch, returncode=0)
-    GitHub(repo_root=tmp_path, dry_run=True).issue_comment(9, tmp_path / "nonexistent.md")
-    GitHub(repo_root=tmp_path, dry_run=True).pr_comment(9, tmp_path / "nonexistent.md")
-    assert calls == []
+    gh, http, _ = make_github(tmp_path, dry_run=True)
+    gh.issue_comment(9, tmp_path / "nonexistent.md")
+    gh.pr_comment(9, tmp_path / "nonexistent.md")
+    assert http.calls == []
 
 
 def test_local_issue_comment_dry_run_never_reads(tmp_path: Path) -> None:

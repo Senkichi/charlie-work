@@ -21,6 +21,7 @@ from pathlib import Path
 import pytest
 
 import charlie_work.github as _github_module
+from _fake_transport import FakeAdapter, make_github, ok, sent
 from charlie_work.github import GitHub, _ROUTES
 from charlie_work.github_capabilities import ISSUE_VIEW_FIELDS, IssuesLike
 
@@ -96,29 +97,18 @@ def test_issues_members_signature_compatible() -> None:
         _compatible_signature(proto_sig, concrete_sig)
 
 
-def test_close_issue_delegate_forwards_through_run(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """``gh.close_issue(n)`` through the delegate must reach the patched
-    class-level ``GitHub.run`` with the argv the moved body produces and
-    return ``True``.
+def test_close_issue_delegate_forwards_through_run(tmp_path: Path) -> None:
+    """``gh.close_issue(n)`` through the delegate must PATCH the issue with
+    ``state=closed`` and return ``True``.
 
-    The expected argv is transcribed by reading the moved ``Issues.close_issue``
+    The expected request is transcribed by reading the moved ``Issues.close_issue``
     body directly, not derived by calling the code under test.
     """
-    calls: list[list[str]] = []
-
-    def fake_run(self: GitHub, args: list[str]) -> str:
-        calls.append(args)
-        return ""
-
-    monkeypatch.setattr(GitHub, "run", fake_run)
-
-    gh = GitHub(tmp_path)
+    gh, http, _ = make_github(tmp_path, http=FakeAdapter("http", [ok({"state": "closed"})]))
     result = gh.close_issue(5)
 
     assert result is True
-    assert calls == [["issue", "close", "5"]]
+    assert sent(http) == [("PATCH", "repos/{owner}/{repo}/issues/5", {"state": "closed"})]
 
 
 def test_close_issue_delegate_returns_false_on_githuberror(

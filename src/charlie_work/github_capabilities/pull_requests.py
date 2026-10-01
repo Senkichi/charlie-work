@@ -73,7 +73,11 @@ from ..issue_linking import linked_issue_number
 # for the full cross-cutting rationale (both are shared with ``GitHub``
 # methods that have not moved yet, so they belong in the shared base, not
 # here).
+from ..github_transport.outcome import Response
+from ..github_transport.request import ACCEPT_DIFF, RestRequest
 from ._base import CapabilityCollaborator, GitHubRunResult, _is_mutating, _LIST_LIMIT
+from ._outcome import failure_text, is_success
+from ._send import send, send_result, send_text
 
 # Outbound secret guard (issue #1505): ``pr_create`` scans title+body before
 # any ``gh`` invocation -- a credential in a PR body survives deletion via
@@ -202,6 +206,20 @@ def _pr_number_from_url(output: str) -> int | None:
     return int(match.group(1)) if match is not None else None
 
 
+def _pr_number_from_response(outcome: Response) -> int | None:
+    """The created PR's number from the REST create response (B9).
+
+    Replaces URL parsing: the JSON body carries ``number`` directly. Never
+    raises; ``None`` when the body is not an object with an integer number.
+    """
+    try:
+        payload = outcome.json()
+    except ValueError:
+        return None
+    number = payload.get("number") if isinstance(payload, dict) else None
+    return number if isinstance(number, int) and not isinstance(number, bool) else None
+
+
 @runtime_checkable
 class PullRequestsLike(Protocol):
     """Structural interface for pull-request read/create operations."""
@@ -318,41 +336,33 @@ class PullRequests(CapabilityCollaborator):
                 len(matches),
             )
             return None
-        result = self.run(
-            [
-                "pr",
-                "create",
-                "--head",
-                head,
-                "--base",
-                base,
-                "--title",
-                title,
-                "--body",
-                body,
-            ],
-            allow_failure=True,
+        outcome = send(
+            self,
+            RestRequest.of(
+                "POST",
+                "repos/{owner}/{repo}/pulls",
+                body={"head": head, "base": base, "title": title, "body": body},
+            ),
         )
-        if not result.ok:
+        if not is_success(outcome):
             # Logged here rather than left to the caller: the caller sees only
-            # ``None`` and cannot say whether gh was missing, unauthenticated,
-            # rejected by the API, or handed a bad flag -- the ambiguity that
-            # hid this bug.
+            # ``None`` and cannot say whether the token was missing, the API
+            # rejected the request, or the transport failed -- the ambiguity
+            # that hid the original ``--json`` bug.
             logger.warning(
-                "gh pr create failed (head=%s base=%s rc=%s): %s",
+                "pr create failed (head=%s base=%s): %s",
                 head,
                 base,
-                result.returncode,
-                (result.stderr or "").strip()[:500] or "(no stderr)",
+                failure_text(outcome).strip()[:500] or "(no detail)",
             )
             return None
-        number = _pr_number_from_url(str(result.value or ""))
+        assert isinstance(outcome, Response)
+        number = _pr_number_from_response(outcome)
         if number is None:
             logger.warning(
-                "gh pr create reported success for head=%s but no PR URL was found "
-                "in its output: %r",
+                "pr create reported success for head=%s but its response carried no PR number: %r",
                 head,
-                str(result.value or "")[:500],
+                outcome.body[:500],
             )
         return number
 
@@ -370,6 +380,7 @@ class PullRequests(CapabilityCollaborator):
         written, so there is nothing to guard (``run`` itself short-circuits
         the mutating ``gh pr edit`` under dry-run via ``_is_mutating``).
         """
+        body = ""  # dry-run: the transport suppresses the write, nothing reads it
         if not self.dry_run:
             try:
                 body = body_file.read_text(encoding="utf-8")
@@ -387,7 +398,12 @@ class PullRequests(CapabilityCollaborator):
                 raise GitHubError(f"pr_edit #{number}: {exc}") from exc
             if matches:
                 raise GitHubError(refusal_summary("pr_edit", matches))
-        self.run(["pr", "edit", str(number), "--body-file", str(body_file)])
+        send_text(
+            self,
+            RestRequest.of(
+                "PATCH", f"repos/{{owner}}/{{repo}}/pulls/{number}", body={"body": body}
+            ),
+        )
 
     def pr_list(self) -> list[dict[str, Any]]:
         cache_key = ("pr_list",)
@@ -489,10 +505,11 @@ class PullRequests(CapabilityCollaborator):
         return result if isinstance(result, dict) else {}
 
     def pr_diff(self, number: int) -> str:
-        result = self.run(["pr", "diff", str(number)], allow_failure=True)
-        if isinstance(result, GitHubRunResult):
-            return result.value if result.ok else ""
-        return result if isinstance(result, str) else ""
+        result = send_result(
+            self,
+            RestRequest.of("GET", f"repos/{{owner}}/{{repo}}/pulls/{number}", accept=ACCEPT_DIFF),
+        )
+        return result.value if result.ok and isinstance(result.value, str) else ""
 
     def pr_commits(self, number: int) -> list[dict[str, Any]] | None:
         """Fetch a PR's commits via the REST ``pulls/{number}/commits`` endpoint.

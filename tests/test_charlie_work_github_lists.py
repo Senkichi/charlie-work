@@ -11,7 +11,7 @@ import logging
 import subprocess
 from pathlib import Path
 import pytest
-from _fake_transport import gh_kill_switch_runtime
+from _fake_transport import FakeAdapter, gh_kill_switch_runtime, make_github, ok, sent
 from charlie_work import github as github_module
 from charlie_work.config import RuntimeConfig
 
@@ -186,46 +186,39 @@ def test_pr_list_raises_limit_to_500_and_warns_on_truncation(
     assert any("truncated" in record.message for record in caplog.records)
 
 
-def test_branch_protection_caches_per_pass(monkeypatch, tmp_path: Path) -> None:
-    """Issue #812: branch_protection() must cost exactly one `gh api` call per
-    base ref per orchestrator pass, not one per PR -- N callers sharing a base
+def test_branch_protection_caches_per_pass(tmp_path: Path) -> None:
+    """Issue #812: branch_protection() must cost exactly one request per base
+    ref per orchestrator pass, not one per PR -- N callers sharing a base
     (e.g. N open PRs against main in one merge_ready/broadcast-sweep pass) must
     collapse to a single underlying read. The cache lives in GitHub._list_cache
     (the same dict pr_list/issue_list already use) and is cleared only by
     invalidate_list_cache(), which the orchestrator calls once per pass.
     """
-    calls: list[list[str]] = []
-
-    def fake_run(*args, **kwargs):
-        calls.append(args[0])
-        payload = json.dumps({"required_status_checks": {"strict": True}})
-        return subprocess.CompletedProcess(args=args, returncode=0, stdout=payload, stderr="")
-
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
-    gh = github_module.GitHub(repo_root=tmp_path, runtime=gh_kill_switch_runtime())
+    http = FakeAdapter("http", [ok({"required_status_checks": {"strict": True}})])
+    gh, http, _ = make_github(tmp_path, http=http)
 
     # Simulate N=5 PRs against the same base within one pass: 5 calls to the
-    # method, but the underlying `gh api` subprocess must run exactly once.
+    # method, but the underlying request must be sent exactly once.
     results = [gh.branch_protection("main") for _ in range(5)]
     assert all(r == {"required_status_checks": {"strict": True}} for r in results)
-    assert len(calls) == 1
-    # Pin the actual endpoint (and the {owner}/{repo} placeholder escaping),
-    # not just "something got cached" -- a wrong URL would still pass a
-    # call-count-only assertion.
-    assert calls[0] == ["gh", "api", "repos/{owner}/{repo}/branches/main/protection"]
+    assert len(http.calls) == 1
+    # Pin the actual endpoint (and the {owner}/{repo} placeholder), not just
+    # "something got cached" -- a wrong URL would still pass a count-only check.
+    assert sent(http) == [("GET", "repos/{owner}/{repo}/branches/main/protection", None)]
 
     # A different base ref is a distinct cache key, so it costs a fresh read.
     gh.branch_protection("develop")
-    assert len(calls) == 2
+    assert len(http.calls) == 2
     gh.branch_protection("develop")
-    assert len(calls) == 2  # still cached
+    assert len(http.calls) == 2  # still cached
 
     # invalidate_list_cache() (called once at the top of every orchestrator
     # pass) must force a fresh read on the next call -- the cache is valid
     # only within a single pass, never leaking across passes.
     gh.invalidate_list_cache()
+    gh._list_cache[("_repo_owner_name",)] = ("octo", "hello")  # make_github seeds the slug
     gh.branch_protection("main")
-    assert len(calls) == 3
+    assert len(http.calls) == 3
 
 
 def test_branch_protection_caches_failed_read_too(monkeypatch, tmp_path: Path) -> None:

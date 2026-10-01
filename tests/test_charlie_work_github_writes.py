@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
+from _fake_transport import FakeAdapter, make_github, ok, sent
 from charlie_work import github as github_module
 
 
@@ -68,17 +69,14 @@ def test_github_add_issue_label_returns_false_on_failure(monkeypatch, tmp_path: 
     assert result is False, "add_issue_label must return False on failure"
 
 
-def test_github_add_issue_label_returns_true_on_success(monkeypatch, tmp_path: Path) -> None:
-    """Boolean-truthfulness test: add_issue_label returns True on subprocess success (returncode=0)."""
-
-    def fake_run(cmd, *args, check=False, **kwargs):
-        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
-
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
-
-    gh = github_module.GitHub(tmp_path)
+def test_github_add_issue_label_returns_true_on_success(tmp_path: Path) -> None:
+    """Boolean-truthfulness test: add_issue_label returns True on a successful request."""
+    gh, http, _ = make_github(tmp_path, http=FakeAdapter("http", [ok([{"name": "x"}])]))
     result = gh.add_issue_label(123, "agent:in-progress")
     assert result is True, "add_issue_label must return True on success"
+    assert sent(http) == [
+        ("POST", "repos/{owner}/{repo}/issues/123/labels", {"labels": ["agent:in-progress"]})
+    ]
 
 
 def test_github_remove_issue_label_returns_false_on_failure(monkeypatch, tmp_path: Path) -> None:
@@ -94,17 +92,14 @@ def test_github_remove_issue_label_returns_false_on_failure(monkeypatch, tmp_pat
     assert result is False, "remove_issue_label must return False on failure"
 
 
-def test_github_remove_issue_label_returns_true_on_success(monkeypatch, tmp_path: Path) -> None:
-    """Boolean-truthfulness test: remove_issue_label returns True on subprocess success (returncode=0)."""
-
-    def fake_run(cmd, *args, check=False, **kwargs):
-        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
-
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
-
-    gh = github_module.GitHub(tmp_path)
+def test_github_remove_issue_label_returns_true_on_success(tmp_path: Path) -> None:
+    """Boolean-truthfulness test: remove_issue_label returns True on a successful request."""
+    gh, http, _ = make_github(tmp_path, http=FakeAdapter("http", [ok([])]))
     result = gh.remove_issue_label(123, "agent:in-progress")
     assert result is True, "remove_issue_label must return True on success"
+    assert sent(http) == [
+        ("DELETE", "repos/{owner}/{repo}/issues/123/labels/agent%3Ain-progress", None)
+    ]
 
 
 def test_github_dry_run_skips_mutating_command(monkeypatch, tmp_path: Path) -> None:
@@ -152,30 +147,23 @@ def test_is_mutating_classifies_readonly_and_mutating() -> None:
         assert _is_mutating(mutating) is True
 
 
-def test_is_mutating_blocks_the_argv_delete_branch_actually_builds(
-    monkeypatch, tmp_path: Path
-) -> None:
+def test_is_mutating_blocks_the_argv_delete_branch_actually_builds(tmp_path: Path) -> None:
     """#914/#917: `-X DELETE` classified as read-only, so `--dry-run` really deleted
     PR head branches.
 
-    The argv is captured from `delete_branch` itself rather than written out by hand,
-    so the gate cannot drift away from its most destructive caller: if someone changes
-    how that call is spelled, this test follows it.
+    The request is captured from `delete_branch` itself rather than written out by
+    hand, so the gate cannot drift away from its most destructive caller. Mutation-ness
+    is now derived from the request's method, and the transport -- not a per-caller
+    guard -- suppresses the write under dry-run.
     """
-    from charlie_work.github import _is_mutating
-
-    captured: list[list[str]] = []
-    # GitHub is a frozen dataclass -- patch the class, not the instance.
-    monkeypatch.setattr(
-        github_module.GitHub,
-        "run",
-        lambda self, args, **kwargs: captured.append(args) or "",
-    )
-    gh = github_module.GitHub(repo_root=tmp_path)
-
+    gh, http, _ = make_github(tmp_path, http=FakeAdapter("http", [ok("", status=204)]))
     assert gh.delete_branch("feature/x") is True
-    assert len(captured) == 1
-    assert _is_mutating(captured[0]) is True
+    assert len(http.api_requests) == 1
+    assert http.api_requests[0].is_mutation is True
+
+    dry, dry_http, _ = make_github(tmp_path, dry_run=True)
+    assert dry.delete_branch("feature/x") is True
+    assert dry_http.calls == []
 
 
 def test_is_mutating_api_method_spellings_and_preserved_reads() -> None:

@@ -64,6 +64,23 @@ def test_everything_else_is_a_verbatim_passthrough(argv: list[str]) -> None:
     assert translated.request == LegacyCli(tuple(argv))
 
 
+@pytest.mark.parametrize(
+    ("argv", "route"),
+    [
+        (["run", "cancel", "7"], "repos/{owner}/{repo}/actions/runs/7/cancel"),
+        (["run", "rerun", "7"], "repos/{owner}/{repo}/actions/runs/7/rerun"),
+        (
+            ["run", "rerun", "7", "--failed"],
+            "repos/{owner}/{repo}/actions/runs/7/rerun-failed-jobs",
+        ),
+    ],
+)
+def test_run_mutation_rows_translate_to_a_post(argv: list[str], route: str) -> None:
+    request = request_for_argv(argv).request
+    assert request == RestRequest("POST", route)
+    assert request_for_argv(argv, use_requests=False).request == LegacyCli(tuple(argv))
+
+
 def test_kill_switch_forces_passthrough_even_for_a_translatable_shape() -> None:
     translated = request_for_argv(["api", "repos/o/r/pulls"], use_requests=False)
     assert isinstance(translated.request, LegacyCli)
