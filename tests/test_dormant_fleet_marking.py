@@ -282,7 +282,8 @@ def _live_modules() -> set[str]:
 
 def _dormant_modules() -> set[str]:
     graph = _graph()
-    return {name for name in graph if name not in _live_modules() and name != "__init__"}
+    live = _live_modules()  # hoisted: calling it per module rebuilt the graph N times
+    return {name for name in graph if name not in live and name != "__init__"}
 
 
 def _test_file_candidates(module: str) -> list[str]:
