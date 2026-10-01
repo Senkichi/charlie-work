@@ -87,6 +87,7 @@ class _Rig:
         monkeypatch.setattr(devin_review_resume, "write_worktree_marker", lambda *a, **k: None)
         monkeypatch.setattr("charlie_work.worker_fate.is_alive", alive)
         monkeypatch.setattr("charlie_work.dispatch_selection.is_pid_alive", alive)
+        monkeypatch.setattr("charlie_work.stalled_review_reap.is_pid_alive", alive)
 
     def seed_dead_review(self, log_text: str = REJECTION, *, pid: int = 40_001) -> None:
         checkout = self.reviews_dir / f"pr-{PR}"
@@ -522,3 +523,38 @@ def test_resume_restamps_claim_age_and_keeps_the_budget_key_in_step(
     rig.finish_resumed()
     assert len(rig.reap()["missed"]) == 1  # cap still enforced
     assert len(rig.popens) == 1
+
+
+def test_fresh_sidecar_alone_protects_a_stale_claim_from_the_stall_sweep(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Isolates ``fresh_sidecar_pr_keys``: the claim is stale with a dead pid, and only the
+    sidecar (written without a claim restamp) is fresh."""
+    from datetime import UTC, datetime
+
+    from charlie_work.stalled_review_reap import _detect_and_handle_stalled_reviews
+
+    rig = _rig(monkeypatch, tmp_path)
+    rig.seed_dead_review()
+    sidecar_path = rig.reviews_dir / f"issue-{PR}.json"
+    sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    now = datetime.now(UTC)
+    sidecar["started_at"] = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    sidecar_path.write_text(json.dumps(sidecar), encoding="utf-8")
+    before = load_state(rig.app.paths.state_file)["prs"][str(PR)]
+    assert before["review_dispatched_at"] == "2026-09-30T18:18:27Z"  # stale claim
+
+    app = rig.app
+    stalled = _detect_and_handle_stalled_reviews(
+        rig.reviews_dir,
+        app.paths.state_file,
+        app.config,
+        app.repo_root,
+        write_gate=app.write_gate,
+        now=now,
+    )
+
+    assert stalled == []
+    assert rig.events("review_dispatch_stalled") == []
+    claim = load_state(app.paths.state_file)["prs"][str(PR)]
+    assert claim["review_dispatch_status"] == "review_dispatch_dispatched"
