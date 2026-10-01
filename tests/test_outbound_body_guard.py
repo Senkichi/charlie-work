@@ -15,13 +15,13 @@ credentials.
 from __future__ import annotations
 
 import json
-import subprocess
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from charlie_work.github import GitHub, GitHubError
+from _fake_transport import FakeAdapter, make_github, ok, sent
+from charlie_work.github import GitHubError
 from charlie_work.instrumentation import query_events
 from charlie_work.local_issues import LocalFileGitHub
 from charlie_work.outbound_body_guard import (
@@ -345,110 +345,77 @@ def test_pr_number_is_indexed_on_pr_comment_refusal(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-class _FakeCompleted:
-    def __init__(self, returncode: int = 0, stdout: str = "", stderr: str = "") -> None:
-        self.returncode = returncode
-        self.stdout = stdout
-        self.stderr = stderr
-
-
-def _capture_subprocess(monkeypatch: pytest.MonkeyPatch, **result: Any) -> list[list[str]]:
-    calls: list[list[str]] = []
-
-    def fake_run(command: list[str], **kwargs: Any) -> _FakeCompleted:
-        calls.append(list(command))
-        return _FakeCompleted(**result)
-
-    monkeypatch.setattr(subprocess, "run", fake_run)
-    return calls
-
-
 _PR_URL = "https://github.com/Senkichi/charlie-work/pull/1234"
 
 
-def test_pr_create_refuses_secret_body_before_gh(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    calls = _capture_subprocess(monkeypatch, returncode=0, stdout=_PR_URL)
-    result = GitHub(repo_root=tmp_path).pr_create(
-        head="h", base="main", title="t", body=f"notes {_GHO}"
-    )
+def test_pr_create_refuses_secret_body_before_gh(tmp_path: Path) -> None:
+    gh, http, _ = make_github(tmp_path)
+    result = gh.pr_create(head="h", base="main", title="t", body=f"notes {_GHO}")
     assert result is None
-    assert calls == []
+    assert http.calls == []
     events = query_events(_state_file(tmp_path), kind="outbound_body_secret_refused")
     assert len(events) == 1
     assert events[0]["payload"]["surface"] == "pr_create"
 
 
-def test_pr_create_refuses_secret_in_title(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_pr_create_refuses_secret_in_title(tmp_path: Path) -> None:
     """The title is written by the same gh call and lands in the same edit
     history -- it is inside the guarded surface, not just the body."""
-    calls = _capture_subprocess(monkeypatch, returncode=0, stdout=_PR_URL)
-    result = GitHub(repo_root=tmp_path).pr_create(
-        head="h", base="main", title=f"wip {_GHP}", body="clean"
-    )
+    gh, http, _ = make_github(tmp_path)
+    result = gh.pr_create(head="h", base="main", title=f"wip {_GHP}", body="clean")
     assert result is None
-    assert calls == []
+    assert http.calls == []
 
 
-def test_pr_create_clean_body_proceeds(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    calls = _capture_subprocess(monkeypatch, returncode=0, stdout=_PR_URL)
-    result = GitHub(repo_root=tmp_path).pr_create(
-        head="h", base="main", title="t", body="clean body"
-    )
+def test_pr_create_clean_body_proceeds(tmp_path: Path) -> None:
+    reply = ok({"number": 1234, "html_url": _PR_URL}, status=201)
+    gh, http, _ = make_github(tmp_path, http=FakeAdapter("http", [reply]))
+    result = gh.pr_create(head="h", base="main", title="t", body="clean body")
     assert result == 1234
-    assert len(calls) == 1
+    assert len(http.calls) == 1
 
 
-def test_pr_create_dry_run_still_no_ops(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_pr_create_dry_run_still_no_ops(tmp_path: Path) -> None:
     """dry_run never reaches gh -- scanning a body that will not be written
     would be a false refusal."""
-    calls = _capture_subprocess(monkeypatch, returncode=0, stdout=_PR_URL)
-    assert (
-        GitHub(repo_root=tmp_path, dry_run=True).pr_create(
-            head="h", base="main", title="t", body=f"notes {_GHO}"
-        )
-        == 0
-    )
-    assert calls == []
+    gh, http, _ = make_github(tmp_path, dry_run=True)
+    assert gh.pr_create(head="h", base="main", title="t", body=f"notes {_GHO}") == 0
+    assert http.calls == []
 
 
-def test_issue_comment_refuses_before_gh(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    calls = _capture_subprocess(monkeypatch, returncode=0)
+def test_issue_comment_refuses_before_gh(tmp_path: Path) -> None:
+    gh, http, _ = make_github(tmp_path)
     body_file = tmp_path / "comment.md"
     body_file.write_text(f"found it: {_GHO}\n", encoding="utf-8")
     with pytest.raises(GitHubError):
-        GitHub(repo_root=tmp_path).issue_comment(9, body_file)
-    assert calls == []
+        gh.issue_comment(9, body_file)
+    assert http.calls == []
     events = query_events(_state_file(tmp_path), kind="outbound_body_secret_refused")
     assert len(events) == 1
     assert events[0]["payload"]["surface"] == "issue_comment"
     assert events[0]["issue_number"] == 9
 
 
-def test_pr_comment_refuses_before_gh(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    calls = _capture_subprocess(monkeypatch, returncode=0)
+def test_pr_comment_refuses_before_gh(tmp_path: Path) -> None:
+    gh, http, _ = make_github(tmp_path)
     body_file = tmp_path / "comment.md"
     body_file.write_text(f"token {_GHP}", encoding="utf-8")
     with pytest.raises(GitHubError):
-        GitHub(repo_root=tmp_path).pr_comment(5, body_file)
-    assert calls == []
+        gh.pr_comment(5, body_file)
+    assert http.calls == []
     events = query_events(_state_file(tmp_path), kind="outbound_body_secret_refused")
     assert events[0]["payload"]["surface"] == "pr_comment"
     assert events[0]["pr_number"] == 5
 
 
-def test_issue_comment_clean_body_calls_gh(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    calls = _capture_subprocess(monkeypatch, returncode=0)
+def test_issue_comment_clean_body_calls_gh(tmp_path: Path) -> None:
+    gh, http, _ = make_github(tmp_path, http=FakeAdapter("http", [ok({"id": 1}, status=201)]))
     body_file = tmp_path / "comment.md"
     body_file.write_text("all clean\n", encoding="utf-8")
-    GitHub(repo_root=tmp_path).issue_comment(9, body_file)
-    assert len(calls) == 1
-    assert calls[0][:2] == ["gh", "issue"]
+    gh.issue_comment(9, body_file)
+    assert sent(http) == [
+        ("POST", "repos/{owner}/{repo}/issues/9/comments", {"body": "all clean\n"})
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -658,25 +625,23 @@ def test_check_raises_guard_error_on_broken_ruleset(tmp_path: Path, _broken_rule
 
 
 def test_pr_create_guard_failure_returns_none_before_gh(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _broken_ruleset: Path
+    tmp_path: Path, _broken_ruleset: Path
 ) -> None:
-    calls = _capture_subprocess(monkeypatch, returncode=0, stdout=_PR_URL)
-    result = GitHub(repo_root=tmp_path).pr_create(
-        head="h", base="main", title="t", body="clean body"
-    )
+    gh, http, _ = make_github(tmp_path)
+    result = gh.pr_create(head="h", base="main", title="t", body="clean body")
     assert result is None
-    assert calls == []
+    assert http.calls == []
 
 
 def test_issue_comment_guard_failure_raises_github_error(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _broken_ruleset: Path
+    tmp_path: Path, _broken_ruleset: Path
 ) -> None:
-    calls = _capture_subprocess(monkeypatch, returncode=0)
+    gh, http, _ = make_github(tmp_path)
     body_file = tmp_path / "comment.md"
     body_file.write_text("clean\n", encoding="utf-8")
     with pytest.raises(GitHubError):
-        GitHub(repo_root=tmp_path).issue_comment(9, body_file)
-    assert calls == []
+        gh.issue_comment(9, body_file)
+    assert http.calls == []
 
 
 def test_local_issue_comment_guard_failure_raises_github_error(
@@ -689,26 +654,22 @@ def test_local_issue_comment_guard_failure_raises_github_error(
         gh.issue_comment(1, body_file)
 
 
-def test_issue_comment_non_utf8_body_file_raises_github_error(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    calls = _capture_subprocess(monkeypatch, returncode=0)
+def test_issue_comment_non_utf8_body_file_raises_github_error(tmp_path: Path) -> None:
+    gh, http, _ = make_github(tmp_path)
     body_file = tmp_path / "comment.md"
     body_file.write_bytes(b"\xff\xfe\x00\x01 binary")
     with pytest.raises(GitHubError):
-        GitHub(repo_root=tmp_path).issue_comment(9, body_file)
-    assert calls == []
+        gh.issue_comment(9, body_file)
+    assert http.calls == []
 
 
-def test_issue_comment_dry_run_never_reads_or_calls(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_issue_comment_dry_run_never_reads_or_calls(tmp_path: Path) -> None:
     """dry_run skips the guard entirely -- a secret in a body that will not
     be written must not refuse, and the file need not even exist."""
-    calls = _capture_subprocess(monkeypatch, returncode=0)
-    GitHub(repo_root=tmp_path, dry_run=True).issue_comment(9, tmp_path / "nonexistent.md")
-    GitHub(repo_root=tmp_path, dry_run=True).pr_comment(9, tmp_path / "nonexistent.md")
-    assert calls == []
+    gh, http, _ = make_github(tmp_path, dry_run=True)
+    gh.issue_comment(9, tmp_path / "nonexistent.md")
+    gh.pr_comment(9, tmp_path / "nonexistent.md")
+    assert http.calls == []
 
 
 def test_local_issue_comment_dry_run_never_reads(tmp_path: Path) -> None:

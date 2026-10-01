@@ -9,6 +9,15 @@ from pathlib import Path
 import pytest
 
 import charlie_work.github as _github_module
+from _fake_transport import (
+    FakeAdapter,
+    check_run,
+    checks_reply,
+    graphql_variables,
+    make_github,
+    ok,
+    sent,
+)
 import charlie_work.github_capabilities as _github_capabilities
 from charlie_work.github import GitHub, GitHubLike, _make_delegate, _ROUTES
 from charlie_work.github_capabilities import (
@@ -303,42 +312,24 @@ def test_comments_routes_point_at_the_comments_collaborator() -> None:
     assert _ROUTES["pr_comment"] == "_comments"
 
 
-def test_issue_comment_delegate_forwards_through_run(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """Calling ``gh.issue_comment(...)`` through the delegate must reach the
-    patched class-level ``GitHub.run`` with the same argv the moved body
-    produces.
+def test_issue_comment_delegate_forwards_through_run(tmp_path: Path) -> None:
+    """Calling ``gh.issue_comment(...)``/``pr_comment`` through the delegate
+    must POST the shared issue-comments endpoint with the body file's contents.
 
-    The expected argv is transcribed by reading the moved
-    ``Comments.issue_comment``/``pr_comment`` bodies directly (both are two
-    -line wrappers around ``self.run([...])``), not derived by calling the
-    same code under test -- calling it twice would make this a circular
-    assertion that could not catch a body that silently changed.
+    The expected requests are transcribed by reading the moved ``Comments``
+    bodies directly, not derived by calling the code under test.
     """
-    calls: list[tuple[list[str], bool, bool]] = []
-
-    def fake_run(
-        self: GitHub, args: list[str], *, json_output: bool = False, allow_failure: bool = False
-    ) -> None:
-        calls.append((args, json_output, allow_failure))
-        return None
-
-    monkeypatch.setattr(GitHub, "run", fake_run)
-
-    gh = GitHub(tmp_path)
+    gh, http, _ = make_github(tmp_path, http=FakeAdapter("http", [ok({"id": 1})]))
     # Issue #1505: issue_comment/pr_comment scan the body file's *contents*
-    # before forwarding (the outbound secret guard), so it must be a real
-    # file on disk now -- a bare name would be refused as unreadable before
-    # run() is ever reached.
+    # before sending (the outbound secret guard), so it must be a real file.
     body_file = tmp_path / "comment-body.md"
     body_file.write_text("delegation test body\n", encoding="utf-8")
     gh.issue_comment(7, body_file)
     gh.pr_comment(9, body_file)
 
-    assert calls == [
-        (["issue", "comment", "7", "--body-file", str(body_file)], False, False),
-        (["pr", "comment", "9", "--body-file", str(body_file)], False, False),
+    assert sent(http) == [
+        ("POST", "repos/{owner}/{repo}/issues/7/comments", {"body": "delegation test body\n"}),
+        ("POST", "repos/{owner}/{repo}/issues/9/comments", {"body": "delegation test body\n"}),
     ]
 
 
@@ -402,76 +393,34 @@ def test_labels_routes_point_at_the_labels_collaborator() -> None:
         assert _ROUTES[name] == "_labels"
 
 
-def test_add_issue_label_delegate_forwards_through_run_bool(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """Calling ``gh.add_issue_label(...)`` through the delegate must reach the
-    patched class-level ``GitHub.run`` with the same argv the moved body
-    produces, via the ``self._run_bool`` -> ``self.run`` chain.
+def test_add_issue_label_delegate_forwards_through_run_bool(tmp_path: Path) -> None:
+    """Calling ``gh.add_issue_label(...)`` through the delegate must POST the
+    issue-labels endpoint and report success as ``True``.
 
-    This exercises a strictly deeper resolution chain than the comments/
-    label_list tests: delegate -> ``Labels`` collaborator -> collaborator
-    ``__getattr__`` (for ``_run_bool``, still a lexical ``GitHub`` method
-    until L09) -> owner ``_run_bool`` -> owner ``run``. The expected argv is
-    transcribed by reading the moved ``Labels.add_issue_label`` body directly
-    (a one-line wrapper around ``self._run_bool([...])``, which itself is a
-    one-line wrapper around ``self.run(args, allow_failure=True)``), not
-    derived by calling the same code under test -- calling it twice would
-    make this a circular assertion that could not catch a body that silently
-    changed.
+    Delegate -> ``Labels`` collaborator -> typed send through the owner's
+    guarded transport. The expected request is transcribed by reading the
+    moved ``Labels`` body directly, not derived by calling the code under test.
     """
-    calls: list[tuple[list[str], bool, bool]] = []
-
-    def fake_run(
-        self: GitHub, args: list[str], *, json_output: bool = False, allow_failure: bool = False
-    ) -> _github_module.GitHubRunResult:
-        calls.append((args, json_output, allow_failure))
-        return _github_module.GitHubRunResult(ok=True, returncode=0, stdout="", stderr="")
-
-    monkeypatch.setattr(GitHub, "run", fake_run)
-
-    gh = GitHub(tmp_path)
+    gh, http, _ = make_github(tmp_path, http=FakeAdapter("http", [ok([{"name": "bug"}])]))
     result = gh.add_issue_label(7, "bug")
 
     assert result is True
-    assert calls == [
-        (["issue", "edit", "7", "--add-label", "bug"], False, True),
-    ]
+    assert sent(http) == [("POST", "repos/{owner}/{repo}/issues/7/labels", {"labels": ["bug"]})]
 
 
-def test_label_list_delegate_forwards_through_run(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """Calling ``gh.label_list()`` through the delegate must reach the patched
-    class-level ``GitHub.run`` with the same argv the moved body produces,
-    including the ``LABEL_LIST_FIELDS`` constant resolved from the
-    collaborator's own module globals (not re-derived from the constant here
-    -- the literal ``"name"`` is asserted directly, since importing
-    ``LABEL_LIST_FIELDS`` to build the expectation would re-derive it from
-    the same code under test and could not catch the constant failing to
-    resolve at all, e.g. a ``NameError`` from a missing module-level binding).
+def test_label_list_delegate_forwards_through_run(tmp_path: Path) -> None:
+    """Calling ``gh.label_list()`` through the delegate must GET the labels
+    endpoint (REST, B12) and return the parsed items.
 
-    The expected argv is transcribed by reading the moved
-    ``Labels.label_list`` body directly, mirroring
-    ``test_issue_comment_delegate_forwards_through_run``'s approach for L02.
+    The expected request is transcribed by reading the moved
+    ``Labels.label_list`` body directly, not derived by calling the code under test.
     """
-    calls: list[tuple[list[str], bool, bool]] = []
-
-    def fake_run(
-        self: GitHub, args: list[str], *, json_output: bool = False, allow_failure: bool = False
-    ) -> list[dict[str, str]]:
-        calls.append((args, json_output, allow_failure))
-        return [{"name": "bug"}]
-
-    monkeypatch.setattr(GitHub, "run", fake_run)
-
-    gh = GitHub(tmp_path)
+    gh, http, _ = make_github(tmp_path, http=FakeAdapter("http", [ok([{"name": "bug"}])]))
     result = gh.label_list()
 
     assert result == [{"name": "bug"}]
-    assert calls == [
-        (["label", "list", "--limit", "200", "--json", "name"], True, False),
-    ]
+    assert sent(http) == [("GET", "repos/{owner}/{repo}/labels", None)]
+    assert dict(http.api_requests[0].query) == {"per_page": "100"}  # type: ignore[union-attr]
 
 
 def test_github_isinstance_checkslike(tmp_path: Path) -> None:
@@ -533,85 +482,40 @@ def test_checks_routes_point_at_the_checks_collaborator() -> None:
         assert _ROUTES[name] == "_checks"
 
 
-def test_check_graphql_rate_limit_delegate_forwards_through_run(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """Calling ``gh.check_graphql_rate_limit()`` through the delegate must reach
-    the patched class-level ``GitHub.run`` with the same argv the moved body
-    produces, and must recognize a real ``GitHubRunResult`` returned across
-    the collaborator boundary via ``isinstance`` -- the mechanism this leaf
-    introduces (``GitHubRunResult`` is now defined in
-    ``github_capabilities/_base.py`` and re-exported through ``github.py``,
-    not defined in ``github.py`` itself; see ``_base.py`` for why).
+def test_check_graphql_rate_limit_delegate_forwards_through_run(tmp_path: Path) -> None:
+    """Calling ``gh.check_graphql_rate_limit()`` through the delegate must GET
+    ``rate_limit`` and apply the default-threshold arithmetic to the
+    ``graphql`` resource.
 
-    The expected argv and default-threshold arithmetic are transcribed by
-    reading the moved ``Checks.check_graphql_rate_limit`` body directly, not
-    derived by calling the same code under test.
+    The expected request and arithmetic are transcribed by reading the moved
+    ``Checks.check_graphql_rate_limit`` body directly, not derived by calling
+    the same code under test.
     """
-    calls: list[tuple[list[str], bool, bool]] = []
-
-    def fake_run(
-        self: GitHub, args: list[str], *, json_output: bool = False, allow_failure: bool = False
-    ) -> _github_module.GitHubRunResult:
-        calls.append((args, json_output, allow_failure))
-        return _github_module.GitHubRunResult(
-            ok=True,
-            returncode=0,
-            stdout="",
-            stderr="",
-            value={"resources": {"graphql": {"remaining": 5000, "reset": 1699999999}}},
-        )
-
-    monkeypatch.setattr(GitHub, "run", fake_run)
-
-    gh = GitHub(tmp_path)
+    payload = {"resources": {"graphql": {"remaining": 5000, "reset": 1699999999}}}
+    gh, http, _ = make_github(tmp_path, http=FakeAdapter("http", [ok(payload)]))
     result = gh.check_graphql_rate_limit()
 
     assert result == (True, 5000, 1699999999)
-    assert calls == [
-        (["api", "rate_limit"], True, True),
-    ]
+    assert sent(http) == [("GET", "rate_limit", None)]
 
 
-def test_pr_checks_delegate_forwards_through_run(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_pr_checks_delegate_forwards_through_run(tmp_path: Path) -> None:
     """Calling ``gh.pr_checks(...)`` through the delegate must reach the
-    patched class-level ``GitHub.run`` with the same argv the moved body
-    produces, resolving ``PR_CHECKS_FIELDS`` from the collaborator's own
-    module globals (not re-derived from the constant here, mirroring
-    ``test_label_list_delegate_forwards_through_run``'s rationale for why the
-    literal is asserted directly), and must derive ``databaseId``/``runId``
-    via ``_job_id_from_link``/``_run_id_from_link`` -- the former relocated
-    alongside ``PR_CHECKS_FIELDS`` into ``github_capabilities/checks.py``,
-    the latter still imported from the top-level ``charlie_work.checks``
-    module, exactly as the moved body does.
+    ``Checks`` collaborator, which reads the rollup over GraphQL (B7: no
+    ``gh pr checks`` argv any more), maps it to gh's name/state/bucket/link
+    shape and derives ``databaseId``/``runId`` via ``_job_id_from_link`` /
+    ``_run_id_from_link`` -- the former relocated alongside
+    ``PR_CHECKS_FIELDS`` into ``github_capabilities/checks.py``, the latter
+    still imported from the top-level ``charlie_work.checks`` module.
 
-    This exercises the deepest new resolution chain this leaf introduces:
-    delegate -> ``Checks`` collaborator -> a real ``GitHubRunResult``
-    instance (built in ``_base.py``, re-exported through ``github.py``) ->
-    two bare-global helper functions resolved from ``checks.py``'s own
-    module namespace. The expected argv and output shape are transcribed by
-    reading the moved ``Checks.pr_checks`` body directly.
+    This exercises the deepest resolution chain the L04 leaf introduced:
+    delegate -> ``Checks`` collaborator -> transport -> two bare-global helper
+    functions resolved from ``checks.py``'s own module namespace.
     """
-    calls: list[tuple[list[str], bool, bool]] = []
     link = "https://github.com/o/r/actions/runs/1/job/42"
+    reply = checks_reply(check_run("build", "SUCCESS", link))
+    gh, http, _ = make_github(tmp_path, http=FakeAdapter("http", [reply]))
 
-    def fake_run(
-        self: GitHub, args: list[str], *, json_output: bool = False, allow_failure: bool = False
-    ) -> _github_module.GitHubRunResult:
-        calls.append((args, json_output, allow_failure))
-        return _github_module.GitHubRunResult(
-            ok=True,
-            returncode=0,
-            stdout="",
-            stderr="",
-            value=[{"name": "build", "state": "SUCCESS", "bucket": "pass", "link": link}],
-        )
-
-    monkeypatch.setattr(GitHub, "run", fake_run)
-
-    gh = GitHub(tmp_path)
     result = gh.pr_checks(5)
 
     assert result == [
@@ -624,9 +528,14 @@ def test_pr_checks_delegate_forwards_through_run(
             "runId": 1,
         }
     ]
-    assert calls == [
-        (["pr", "checks", "5", "--json", "name,state,bucket,link"], True, True),
-    ]
+    (request,) = http.api_requests
+    # The checks query is paginated (r1 B3): the first page carries ``after: None``.
+    assert graphql_variables(request) == {
+        "owner": "octo",
+        "name": "hello",
+        "number": 5,
+        "after": None,
+    }
 
 
 def test_github_isinstance_repometalike(tmp_path: Path) -> None:
@@ -714,173 +623,85 @@ def test_invalidate_list_cache_delegate_forwards_to_owner_shared_cache(
     assert gh._repo_meta.__dict__.get("_list_cache") is None
 
 
-def test_commit_delegate_forwards_through_run(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """Calling ``gh.commit(sha)`` through the delegate must reach the patched
-    class-level ``GitHub.run`` with the same argv the moved body produces,
-    and must recognize a real ``GitHubRunResult`` returned across the
-    collaborator boundary via ``isinstance`` -- the same
-    ``github_capabilities/_base.py``-defined, ``github.py``-re-exported
+def test_commit_delegate_forwards_through_run(tmp_path: Path) -> None:
+    """Calling ``gh.commit(sha)`` through the delegate must GET the commit and
+    return a real ``GitHubRunResult`` across the collaborator boundary -- the
+    same ``github_capabilities/_base.py``-defined, ``github.py``-re-exported
     mechanism L04 introduced for ``Checks``.
 
-    The expected argv is transcribed by reading the moved ``RepoMeta.commit``
+    The expected request is transcribed by reading the moved ``RepoMeta.commit``
     body directly, not derived by calling the same code under test.
     """
-    calls: list[tuple[list[str], bool, bool]] = []
-
-    def fake_run(
-        self: GitHub, args: list[str], *, json_output: bool = False, allow_failure: bool = False
-    ) -> _github_module.GitHubRunResult:
-        calls.append((args, json_output, allow_failure))
-        return _github_module.GitHubRunResult(
-            ok=True,
-            returncode=0,
-            stdout="",
-            stderr="",
-            value={"sha": "abc123", "parents": []},
-        )
-
-    monkeypatch.setattr(GitHub, "run", fake_run)
-
-    gh = GitHub(tmp_path)
+    gh, http, _ = make_github(
+        tmp_path, http=FakeAdapter("http", [ok({"sha": "abc123", "parents": []})])
+    )
     result = gh.commit("abc123")
 
     assert isinstance(result, _github_module.GitHubRunResult)
     assert result.ok is True
     assert result.value == {"sha": "abc123", "parents": []}
-    assert calls == [
-        (["api", "repos/{owner}/{repo}/commits/abc123"], True, True),
-    ]
+    assert sent(http) == [("GET", "repos/{owner}/{repo}/commits/abc123", None)]
 
 
-def test_compare_delegate_forwards_through_run(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """Calling ``gh.compare(base, head)`` through the delegate must reach the
-    patched class-level ``GitHub.run`` with the same argv the moved body
-    produces, unwrapping a ``GitHubRunResult`` to its ``.value`` dict.
+def test_compare_delegate_forwards_through_run(tmp_path: Path) -> None:
+    """Calling ``gh.compare(base, head)`` through the delegate must GET the
+    three-dot compare and return the parsed dict.
 
-    The expected argv is transcribed by reading the moved ``RepoMeta.compare``
+    The expected request is transcribed by reading the moved ``RepoMeta.compare``
     body directly.
     """
-    calls: list[tuple[list[str], bool, bool]] = []
-
-    def fake_run(
-        self: GitHub, args: list[str], *, json_output: bool = False, allow_failure: bool = False
-    ) -> _github_module.GitHubRunResult:
-        calls.append((args, json_output, allow_failure))
-        return _github_module.GitHubRunResult(
-            ok=True,
-            returncode=0,
-            stdout="",
-            stderr="",
-            value={"base_commit": {"sha": "base1"}, "merge_base_commit": {"sha": "mb1"}},
-        )
-
-    monkeypatch.setattr(GitHub, "run", fake_run)
-
-    gh = GitHub(tmp_path)
+    payload = {"base_commit": {"sha": "base1"}, "merge_base_commit": {"sha": "mb1"}}
+    gh, http, _ = make_github(tmp_path, http=FakeAdapter("http", [ok(payload)]))
     result = gh.compare("main", "feature")
 
-    assert result == {"base_commit": {"sha": "base1"}, "merge_base_commit": {"sha": "mb1"}}
-    assert calls == [
-        (["api", "repos/{owner}/{repo}/compare/main...feature"], True, True),
-    ]
+    assert result == payload
+    assert sent(http) == [("GET", "repos/{owner}/{repo}/compare/main...feature", None)]
 
 
-def test_compare_diff_delegate_forwards_through_run(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """Calling ``gh.compare_diff(base, head)`` through the delegate must reach
-    the patched class-level ``GitHub.run`` with the same argv (including the
-    ``Accept: application/vnd.github.v3.diff`` header) the moved body
-    produces, unwrapping a ``GitHubRunResult`` to its ``.value`` string.
+def test_compare_diff_delegate_forwards_through_run(tmp_path: Path) -> None:
+    """Calling ``gh.compare_diff(base, head)`` through the delegate must GET the
+    three-dot compare with the ``application/vnd.github.v3.diff`` media type and
+    return the response text.
 
-    The expected argv is transcribed by reading the moved
+    The expected request is transcribed by reading the moved
     ``RepoMeta.compare_diff`` body directly.
     """
-    calls: list[tuple[list[str], bool, bool]] = []
     diff_text = "diff --git a/x b/x\n+added line\n"
-
-    def fake_run(
-        self: GitHub, args: list[str], *, json_output: bool = False, allow_failure: bool = False
-    ) -> _github_module.GitHubRunResult:
-        calls.append((args, json_output, allow_failure))
-        return _github_module.GitHubRunResult(
-            ok=True, returncode=0, stdout=diff_text, stderr="", value=diff_text
-        )
-
-    monkeypatch.setattr(GitHub, "run", fake_run)
-
-    gh = GitHub(tmp_path)
+    gh, http, _ = make_github(tmp_path, http=FakeAdapter("http", [ok(diff_text)]))
     result = gh.compare_diff("main", "feature")
 
-    assert result == diff_text
-    assert calls == [
-        (
-            [
-                "api",
-                "repos/{owner}/{repo}/compare/main...feature",
-                "-H",
-                "Accept: application/vnd.github.v3.diff",
-            ],
-            False,
-            True,
-        ),
-    ]
+    assert result == diff_text.strip()
+    assert sent(http) == [("GET", "repos/{owner}/{repo}/compare/main...feature", None)]
+    assert http.api_requests[0].accept == "application/vnd.github.v3.diff"  # type: ignore[union-attr]
 
 
-def test_name_with_owner_delegate_forwards_through_run(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_name_with_owner_delegate_forwards_through_run(tmp_path: Path) -> None:
     """Calling ``gh.name_with_owner()`` through the delegate must reach the
-    patched class-level ``GitHub.run`` with the same argv the moved body
-    produces, and return the parsed ``nameWithOwner`` string.
-
-    The expected argv is transcribed by reading the moved
-    ``RepoMeta.name_with_owner`` body directly.
+    ``RepoMeta`` collaborator, which asks ``GET repos/{owner}/{repo}`` (B1: it
+    was ``gh repo view --json nameWithOwner``) and returns ``full_name``.
     """
-    calls: list[tuple[list[str], bool, bool]] = []
+    gh, http, _ = make_github(
+        tmp_path, http=FakeAdapter("http", [ok({"full_name": "Senkichi/charlie-work"})])
+    )
 
-    def fake_run(
-        self: GitHub, args: list[str], *, json_output: bool = False, allow_failure: bool = False
-    ) -> dict[str, str]:
-        calls.append((args, json_output, allow_failure))
-        return {"nameWithOwner": "Senkichi/charlie-work"}
-
-    monkeypatch.setattr(GitHub, "run", fake_run)
-
-    gh = GitHub(tmp_path)
     result = gh.name_with_owner()
 
     assert result == "Senkichi/charlie-work"
-    assert calls == [
-        (["repo", "view", "--json", "nameWithOwner"], True, False),
-    ]
+    assert sent(http) == [("GET", "repos/octo/hello", None)]
 
 
-def test_name_with_owner_delegate_raises_githuberror_on_bad_shape(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_name_with_owner_delegate_raises_githuberror_on_bad_shape(tmp_path: Path) -> None:
     """``name_with_owner`` must still raise ``GitHubError`` (not some
-    RepoMeta-local, unrelated exception type) when ``gh repo view`` returns an
+    RepoMeta-local, unrelated exception type) when the repo read returns an
     unparseable shape, exercising the identity-sensitive
     ``ci_fleet.github.GitHubError`` import this leaf adds to ``repo_meta.py``
     (see that module's import block: a local re-declaration would be a
     structurally identical but unrelated type that no ``except GitHubError``
     handler in the rest of the codebase would catch).
     """
+    gh, _http, _ = make_github(tmp_path, http=FakeAdapter("http", [ok({"unexpected": "shape"})]))
 
-    def fake_run(
-        self: GitHub, args: list[str], *, json_output: bool = False, allow_failure: bool = False
-    ) -> dict[str, str]:
-        return {"unexpected": "shape"}
-
-    monkeypatch.setattr(GitHub, "run", fake_run)
-
-    gh = GitHub(tmp_path)
-    with pytest.raises(_github_module.GitHubError):
+    with pytest.raises(_github_module.GitHubError, match="full_name"):
         gh.name_with_owner()
 
 

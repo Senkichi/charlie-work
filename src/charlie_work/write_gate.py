@@ -158,7 +158,7 @@ class WriteGate:
         event: str,
     ) -> TransitionResult:
         """Gate ``labels.transition``, in addition to (never instead of) the
-        sink-level ``_is_mutating`` gate already enforced in ``github.py``.
+        sink-level dry-run gate already enforced by the guarded transport.
 
         Dry-run: return the library's own no-op value,
         ``TransitionResult(TransitionOutcome.NOTHING_CHANGED, [], [])`` —

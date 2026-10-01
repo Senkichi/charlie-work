@@ -421,6 +421,23 @@ def _no_real_host_load_probe(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(host_load_module, "list_host_processes", lambda: ((), None))
 
 
+@pytest.fixture(autouse=True)
+def _no_real_github_network(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Never let the GitHub transport open a real connection (ADR-0006).
+
+    ``HttpAdapter`` builds its sockets through the module-level
+    ``_new_connection`` when no ``connection_factory`` is injected, so
+    patching that one hook makes "a test forgot to inject a fake" fail loudly
+    instead of calling api.github.com. Tests inject ``connection_factory=``.
+    """
+    from charlie_work.github_transport import http_adapter
+
+    def _refuse(host: str, timeout: float) -> object:
+        raise AssertionError(f"real network in tests: {host}")
+
+    monkeypatch.setattr(http_adapter, "_new_connection", _refuse)
+
+
 def _healthy_preflight(*args: object, **kwargs: object) -> PreflightResult:
     return PreflightResult(checks=())
 

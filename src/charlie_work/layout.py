@@ -227,7 +227,7 @@ def http_etag_cache_path(state_root: Path) -> Path:
     """Return the pooled HTTP transport's ETag cache path under ``state_root``.
 
     Issue #1834: stores ``ETag``/response pairs for REST GET requests made by
-    ``github_capabilities/http_transport.py`` so a repeated call can send
+    ``github_transport/http_adapter.py`` (via ``http_cache``) so a repeated call can send
     ``If-None-Match`` and treat a ``304 Not Modified`` as a cache hit instead
     of re-transferring an unchanged body. Sibling of
     :func:`queue_sync_coverage_cache_path` -- same directory, same

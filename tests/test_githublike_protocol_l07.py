@@ -21,8 +21,10 @@ from pathlib import Path
 import pytest
 
 import charlie_work.github as _github_module
+from _fake_transport import FakeAdapter, graphql_ok, graphql_variables, make_github, ok, sent
 from charlie_work.github import GitHub, _ROUTES
-from charlie_work.github_capabilities import ISSUE_VIEW_FIELDS, IssuesLike
+from charlie_work.github_transport.json_read import JsonRead
+from charlie_work.github_capabilities import IssuesLike
 
 from _githublike_protocol_helpers import _compatible_signature, _lexical_github_defs
 
@@ -96,29 +98,18 @@ def test_issues_members_signature_compatible() -> None:
         _compatible_signature(proto_sig, concrete_sig)
 
 
-def test_close_issue_delegate_forwards_through_run(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """``gh.close_issue(n)`` through the delegate must reach the patched
-    class-level ``GitHub.run`` with the argv the moved body produces and
-    return ``True``.
+def test_close_issue_delegate_forwards_through_run(tmp_path: Path) -> None:
+    """``gh.close_issue(n)`` through the delegate must PATCH the issue with
+    ``state=closed`` and return ``True``.
 
-    The expected argv is transcribed by reading the moved ``Issues.close_issue``
+    The expected request is transcribed by reading the moved ``Issues.close_issue``
     body directly, not derived by calling the code under test.
     """
-    calls: list[list[str]] = []
-
-    def fake_run(self: GitHub, args: list[str]) -> str:
-        calls.append(args)
-        return ""
-
-    monkeypatch.setattr(GitHub, "run", fake_run)
-
-    gh = GitHub(tmp_path)
+    gh, http, _ = make_github(tmp_path, http=FakeAdapter("http", [ok({"state": "closed"})]))
     result = gh.close_issue(5)
 
     assert result is True
-    assert calls == [["issue", "close", "5"]]
+    assert sent(http) == [("PATCH", "repos/{owner}/{repo}/issues/5", {"state": "closed"})]
 
 
 def test_close_issue_delegate_returns_false_on_githuberror(
@@ -139,43 +130,36 @@ def test_close_issue_delegate_returns_false_on_githuberror(
     assert gh.close_issue(5) is False
 
 
-def test_issue_view_delegate_forwards_through_run(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """``gh.issue_view(n)`` through the delegate must reach the patched
-    class-level ``GitHub.run`` with the argv the moved body produces, using the
-    ``ISSUE_VIEW_FIELDS`` bare global relocated to ``issues.py``.
+def test_issue_view_delegate_forwards_through_run(tmp_path: Path) -> None:
+    """``gh.issue_view(n)`` through the delegate must reach the ``Issues``
+    collaborator, which reads the issue over GraphQL (G4: it was
+    ``gh issue view --json``) using the ``ISSUE_VIEW_FIELDS`` bare global
+    relocated to ``issues.py``.
     """
-    calls: list[tuple[list[str], bool]] = []
+    reply = graphql_ok({"repository": {"issueOrPullRequest": {"number": 7, "state": "OPEN"}}})
+    gh, http, _ = make_github(tmp_path, http=FakeAdapter("http", [reply]))
 
-    def fake_run(self: GitHub, args: list[str], *, json_output: bool = False) -> dict:
-        calls.append((args, json_output))
-        return {"number": 7, "state": "OPEN"}
-
-    monkeypatch.setattr(GitHub, "run", fake_run)
-
-    gh = GitHub(tmp_path)
     result = gh.issue_view(7)
 
-    assert result == {"number": 7, "state": "OPEN"}
-    assert calls == [(["issue", "view", "7", "--json", ISSUE_VIEW_FIELDS], True)]
+    assert result["number"] == 7
+    assert result["state"] == "OPEN"
+    (request,) = http.api_requests
+    assert graphql_variables(request) == {"owner": "octo", "name": "hello", "number": 7}
 
 
 def test_issue_list_delegate_forwards_through_list_json(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """``gh.issue_list()`` through the delegate must reach the patched
-    class-level ``GitHub._list_json`` with the argv the moved body produces
+    class-level ``GitHub._list_json`` with the read the moved body builds
     (including ``_LIST_LIMIT``/``ISSUE_LIST_FIELDS``).
     """
     from charlie_work.github_capabilities import ISSUE_LIST_FIELDS, _LIST_LIMIT
 
-    calls: list[tuple[list[str], int, str]] = []
+    calls: list[tuple[JsonRead, str]] = []
 
-    def fake_list_json(
-        self: GitHub, args: list[str], *, limit: int, kind: str
-    ) -> list[dict[str, str]]:
-        calls.append((args, limit, kind))
+    def fake_list_json(self: GitHub, read: JsonRead, *, kind: str) -> list[dict[str, str]]:
+        calls.append((read, kind))
         return [{"number": "1"}]
 
     monkeypatch.setattr(GitHub, "_list_json", fake_list_json)
@@ -186,17 +170,15 @@ def test_issue_list_delegate_forwards_through_list_json(
     assert result == [{"number": "1"}]
     assert calls == [
         (
-            [
+            JsonRead(
                 "issue",
                 "list",
-                "--limit",
-                str(_LIST_LIMIT),
-                "--state",
-                "open",
-                "--json",
                 ISSUE_LIST_FIELDS,
-            ],
-            _LIST_LIMIT,
+                state="open",
+                labels=(),
+                limit=_LIST_LIMIT,
+                long_call=True,
+            ),
             "issues (labels=all, state=open)",
         ),
     ]
@@ -304,23 +286,24 @@ def test_are_issues_open_fallback_closure_runs_through_collaborator(
     thread-pool closure that calls ``self.issue_view`` for each number. Because
     ``issue_view`` moved into ``Issues`` in this same leaf, that call resolves
     on the collaborator instance (``self`` inside the closure), not back across
-    a thread boundary through the owner delegate. A fake class-level
-    ``GitHub.run`` returns issue JSON for two numbers; the result must be the
-    set of OPEN ones.
+    a thread boundary through the owner delegate. The per-issue GraphQL reads
+    return issue nodes for three numbers; the result must be the set of OPEN
+    ones.
     """
 
     def fake_states(self: GitHub, issue_numbers: list[int]) -> dict[int, bool]:
         raise _github_module.GitHubError("batched state query failed")
 
-    def fake_run(self: GitHub, args: list[str], *, json_output: bool = False) -> dict:
-        # args == ["issue", "view", "<n>", "--json", ISSUE_VIEW_FIELDS]
-        number = int(args[2])
-        return {"number": number, "state": "OPEN" if number in (1, 2) else "CLOSED"}
+    def view(request):
+        number = graphql_variables(request)["number"]
+        state = "OPEN" if number in (1, 2) else "CLOSED"
+        return graphql_ok(
+            {"repository": {"issueOrPullRequest": {"number": number, "state": state}}}
+        )
 
     monkeypatch.setattr(GitHub, "_graphql_issue_states", fake_states)
-    monkeypatch.setattr(GitHub, "run", fake_run)
+    gh, _http, _ = make_github(tmp_path, http=FakeAdapter("http", handler=view))
 
-    gh = GitHub(tmp_path)
     result = gh.are_issues_open([1, 2, 99])
 
     assert result == {1, 2}

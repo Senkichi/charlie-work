@@ -24,14 +24,17 @@ from __future__ import annotations
 
 import ast
 import inspect
-import subprocess
+import json
 import time
 from pathlib import Path
 
 import pytest
 
 import charlie_work.github as _github_module
-from charlie_work.config import ConfigError
+from _fake_transport import FakeAdapter, checks_reply, make_github, ok
+from charlie_work.github_transport import Adapters
+from charlie_work.github_transport.outcome import GraphQLError, Response
+from charlie_work.config import ConfigError, RuntimeConfig
 from charlie_work.github import GitHub, GitHubLike, _ROUTES
 from charlie_work.github_capabilities.transport import Transport
 from charlie_work.github_delegation import _build_routes
@@ -46,7 +49,6 @@ TRANSPORT_MOVED_MEMBERS = (
     "_graphql_issue_states",
     "_graphql_issue_dependencies",
     "_normalize_rest_pr",
-    "_pr_checks_fallback",
     "_max_retries",
     "_retry_base_seconds",
     "_timeout_seconds",
@@ -213,33 +215,23 @@ def test_retry_constants_read_through_run(monkeypatch: pytest.MonkeyPatch, tmp_p
     installed delegate on every retry loop iteration -- not just that the
     delegate methods work in isolation (the test above), but that ``run``'s
     retry loop really calls through them. Patches
-    ``charlie_work.github.subprocess.run`` (the dotted-tail form the L09
-    advisory review confirmed reaches the shared object rather than replacing
-    the whole ``github`` module attribute) and ``time.sleep`` to keep this
-    fast and deterministic.
+    Scripts the http adapter with a repeating transient 502 and patches
+    ``time.sleep`` to keep this fast and deterministic.
     """
-    from charlie_work.config import RuntimeConfig
-
-    call_count = 0
-
-    def fake_subprocess_run(*args, **kwargs):
-        nonlocal call_count
-        call_count += 1
-        return subprocess.CompletedProcess(
-            args, returncode=1, stdout="", stderr="http 502 bad gateway"
-        )
-
-    monkeypatch.setattr(_github_module.subprocess, "run", fake_subprocess_run)
     monkeypatch.setattr(time, "sleep", lambda *_a, **_k: None)
 
-    gh = GitHub(tmp_path, runtime=RuntimeConfig(gh_max_retries=2, gh_retry_base_seconds=0.01))
+    gh, http, _ = make_github(
+        tmp_path,
+        http=FakeAdapter("http", [ok("Bad Gateway", status=502)]),
+        runtime=RuntimeConfig(gh_max_retries=2, gh_retry_base_seconds=0.01),
+    )
     with pytest.raises(_github_module.GitHubError):
-        gh.run(["issue", "list"])
+        gh.run(["api", "repos/{owner}/{repo}/issues"])
 
     # max_retries=2 -> 3 attempts total (initial + 2 retries). If `run` were
     # not reading _max_retries() through the delegate (e.g. a stale closure
     # over the default), this would be 4 (the _DEFAULT_GH_MAX_RETRIES=3 value).
-    assert call_count == 3
+    assert len(http.api_requests) == 3
 
 
 def test_run_stays_lexical_not_a_delegate() -> None:
@@ -256,11 +248,12 @@ def test_run_monkeypatchable_at_class_level_with_moved_body_observing_it(
 ) -> None:
     """A class-level ``monkeypatch.setattr(GitHub, "run", ...)`` must still be
     observed by a MOVED body's internal ``self.run(...)`` call -- proving the
-    134 existing `run` patch sites keep intercepting after ``_run_bool``/
-    ``_list_json``/etc. move to ``Transport``. ``_list_json`` (moved) calls
-    ``self.run(...)``, which resolves via ``CapabilityCollaborator.__getattr__``
-    to the owner's ``run`` -- patched here at the class level, unaffected by
-    which collaborator ``self`` is.
+    134 existing `run` patch sites keep intercepting after ``_run_bool``/etc.
+    move to ``Transport``. ``_run_bool`` (moved) calls ``self.run(...)``, which
+    resolves via ``CapabilityCollaborator.__getattr__`` to the owner's ``run``
+    -- patched here at the class level, unaffected by which collaborator
+    ``self`` is. (``_list_json`` used to be the probe; it reads over GraphQL
+    now and no longer goes through ``run``.)
     """
     calls: list[list[str]] = []
 
@@ -273,15 +266,17 @@ def test_run_monkeypatchable_at_class_level_with_moved_body_observing_it(
         long_call: bool = False,
     ):
         calls.append(args)
-        return [{"number": 1}]
+        return _github_module.GitHubRunResult(
+            ok=True, returncode=0, stdout="", stderr="", value=None
+        )
 
     monkeypatch.setattr(GitHub, "run", fake_run)
 
     gh = GitHub(tmp_path)
-    result = gh._list_json(["issue", "list"], limit=10, kind="issues")
+    result = gh._run_bool(["label", "create", "x"])
 
-    assert result == [{"number": 1}]
-    assert calls == [["issue", "list"]]
+    assert result is True
+    assert calls == [["label", "create", "x"]]
 
 
 def test_run_monkeypatchable_at_instance_level_with_moved_body_observing_it(
@@ -349,27 +344,17 @@ def test_normalize_rest_pr_delegate_reachable(tmp_path: Path) -> None:
     }
 
 
-def test_pr_checks_fallback_delegate_reachable(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """``gh._pr_checks_fallback(...)`` reaches the moved ``Transport`` body
-    through the installed delegate, driven by a patched class-level ``run``.
+def test_pr_checks_fallback_delegate_reachable(tmp_path: Path) -> None:
+    """``_pr_checks_fallback`` was deleted with the ``gh pr checks`` dependency
+    (ADR-0006, B7): the rollup read *is* ``pr_checks`` now, so a PR with no
+    checks is answered ``[]`` by the delegate in one request, with no second
+    endpoint to disambiguate it.
     """
+    gh, http, _ = make_github(tmp_path, http=FakeAdapter("http", [checks_reply()]))
 
-    def fake_run(
-        self: GitHub, args: list[str], *, json_output: bool = False, allow_failure: bool = False
-    ):
-        return _github_module.GitHubRunResult(
-            ok=True,
-            returncode=0,
-            stdout="",
-            stderr="",
-            value={"statusCheckRollup": []},
-        )
-
-    monkeypatch.setattr(GitHub, "run", fake_run)
-    gh = GitHub(tmp_path)
-    assert gh._pr_checks_fallback(1) == []
+    assert not hasattr(GitHub, "_pr_checks_fallback")
+    assert gh.pr_checks(1) == []
+    assert len(http.api_requests) == 1
 
 
 def test_repo_owner_name_delegate_uses_owner_shared_list_cache(tmp_path: Path) -> None:
@@ -386,25 +371,28 @@ def test_repo_owner_name_delegate_uses_owner_shared_list_cache(tmp_path: Path) -
 
 
 def test_validate_field_lists_import_depth_fix_reaches_real_config_error(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    tmp_path: Path,
 ) -> None:
     """The one disclosed non-verbatim edit in this leaf: ``validate_field_lists``'s
     local ``from .config import ConfigError`` became ``from ..config import
     ConfigError`` because the function physically moved one package level
     deeper (``charlie_work`` -> ``charlie_work.github_capabilities``). Proves
     the fix reaches the identical, real ``charlie_work.config.ConfigError``
-    type (not a shadow/duplicate at the wrong path) by forcing the
-    ``FileNotFoundError`` branch and checking the raised exception's type
-    identity directly against an import of ``charlie_work.config``.
+    type (not a shadow/duplicate at the wrong path) by forcing a rejected
+    field and checking the raised exception's type identity directly against
+    an import of ``charlie_work.config``.
     """
-    from charlie_work.github_capabilities import transport as transport_mod
+    reply = Response(
+        200,
+        (),
+        '{"data": null}',
+        "http",
+        graphql_errors=(
+            GraphQLError("Field 'bogus' doesn't exist on type 'Issue'", "undefinedField"),
+        ),
+    )
+    gh, _http, _ = make_github(tmp_path, http=FakeAdapter("http", [reply]))
 
-    def boom(*_args, **_kwargs):
-        raise FileNotFoundError("gh not found")
-
-    monkeypatch.setattr(transport_mod.subprocess, "run", boom)
-
-    gh = GitHub(tmp_path)
     with pytest.raises(ConfigError) as excinfo:
         gh.validate_field_lists()
     assert type(excinfo.value) is ConfigError
@@ -444,7 +432,7 @@ class _SubclassOverridesRepoOwnerName(GitHub):
 
 
 def test_subclass_override_of_repo_owner_name_is_bypassed_by_graphql_query(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    tmp_path: Path,
 ) -> None:
     """Positive control: prove the bypass empirically, not just by argument.
 
@@ -455,7 +443,12 @@ def test_subclass_override_of_repo_owner_name_is_bypassed_by_graphql_query(
     ``_graphql_query`` used ``Transport._repo_owner_name`` -- which reads that
     cache -- rather than the subclass's hardcoded override.
     """
-    gh = _SubclassOverridesRepoOwnerName(tmp_path)
+    http = FakeAdapter("http", [ok({"data": {}})])
+    gh = _SubclassOverridesRepoOwnerName(
+        tmp_path,
+        runtime=RuntimeConfig(),
+        adapters=Adapters(http=http, gh=FakeAdapter("gh", token="tok-1")),
+    )
 
     # External call: the subclass override wins, as ordinary Python attribute
     # resolution on the `gh` instance predicts.
@@ -465,52 +458,25 @@ def test_subclass_override_of_repo_owner_name_is_bypassed_by_graphql_query(
     # in the shared cache that only Transport's real _repo_owner_name reads.
     gh._list_cache[("_repo_owner_name",)] = ("real-owner", "real-repo")
 
-    captured_args: list[list[str]] = []
-
-    def fake_run(
-        self: GitHub, args: list[str], *, json_output: bool = False, allow_failure: bool = False
-    ):
-        captured_args.append(args)
-        return {"data": {}}
-
-    monkeypatch.setattr(GitHub, "run", fake_run)
-
     gh._graphql_query("query { viewer { login } }")
 
-    [args] = captured_args
-    assert "owner=real-owner" in args
-    assert "name=real-repo" in args
-    assert "owner=subclass-owner" not in args
-    assert "name=subclass-repo" not in args
+    [request] = http.api_requests
+    variables = json.loads(request.variables)  # type: ignore[union-attr]
+    assert variables == {"owner": "real-owner", "name": "real-repo"}
 
 
 def test_graphql_issue_states_and_dependencies_call_through_transport_internals(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    tmp_path: Path,
 ) -> None:
     """``_graphql_issue_states``/``_graphql_issue_dependencies`` call
     ``self._repo_owner_name()`` and ``self._graphql_query()`` -- both moved to
     ``Transport`` in this same leaf, so these are same-collaborator internal
-    calls too. Patching ``GitHub.run`` at class level (the one seam that never
-    moves) must still be enough to drive both end to end, with no bypass:
-    unlike the positive control above, these two call ANOTHER moved member
-    (not a subclass override), and that call is a normal, unpatched
-    same-class method lookup that always resolves correctly.
+    calls too. Scripting the HTTP adapter (the one seam that never moves) must
+    still be enough to drive both end to end, with no bypass.
     """
-    gh = GitHub(tmp_path)
-    gh._list_cache[("_repo_owner_name",)] = ("o", "r")
-
-    def fake_run(
-        self: GitHub, args: list[str], *, json_output: bool = False, allow_failure: bool = False
-    ):
-        return {"data": {"repository": {"s_1": {"number": 1, "state": "OPEN"}}}}
-
-    monkeypatch.setattr(GitHub, "run", fake_run)
-    assert gh._graphql_issue_states([1]) == {1: True}
-
-    def fake_run_deps(
-        self: GitHub, args: list[str], *, json_output: bool = False, allow_failure: bool = False
-    ):
-        return {
+    states = ok({"data": {"repository": {"s_1": {"number": 1, "state": "OPEN"}}}})
+    deps = ok(
+        {
             "data": {
                 "repository": {
                     "i_1": {
@@ -520,7 +486,14 @@ def test_graphql_issue_states_and_dependencies_call_through_transport_internals(
                 }
             }
         }
+    )
+    gh, http, _ = make_github(tmp_path, http=FakeAdapter("http", [states, deps]))
+    gh._list_cache[("_repo_owner_name",)] = ("o", "r")
 
-    monkeypatch.setattr(GitHub, "run", fake_run_deps)
+    assert gh._graphql_issue_states([1]) == {1: True}
     assert gh._graphql_issue_dependencies([1]) == {1: [2]}
     assert gh._list_cache[("issue_open", 2)] is True
+    assert [json.loads(r.variables) for r in http.api_requests] == [  # type: ignore[union-attr]
+        {"owner": "o", "name": "r"},
+        {"owner": "o", "name": "r"},
+    ]

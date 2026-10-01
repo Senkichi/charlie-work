@@ -17,7 +17,7 @@ transports preserve that body: real ``gh`` copies the response body to
 stdout before emitting the error (verified in cli/cli
 ``pkg/cmd/api/api.go``'s ``processResponse`` -- the ``io.Copy(bodyWriter,
 responseBody)`` runs ahead of the ``serverError`` branch), and this repo's
-pooled HTTP transport does the same (``http_transport._execute_graphql``).
+pooled HTTP transport does the same (``github_transport.http_adapter``).
 Running the query through ``run(..., allow_failure=True)`` therefore
 surfaces the parsed body as ``GitHubRunResult.value`` even when ``ok`` is
 False, so a single bad alias no longer demotes an entire batch to the
@@ -32,7 +32,8 @@ from typing import Any
 
 from ci_fleet.github import GitHubError
 
-from ._base import GitHubRunResult
+from ..github_transport.request import GraphQLRequest
+from ._send import send_graphql
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +48,7 @@ def graphql_issue_states(
     """Fetch open/closed state for many issue numbers via batched GraphQL.
 
     ``transport`` is the ``Transport`` collaborator (duck-typed: needs
-    ``.run()`` and ``._repo_owner_name()``; ``Any`` because importing the
+    ``._transport_v2`` and ``._repo_owner_name()``; ``Any`` because importing the
     class would cycle -- the module map's ``TYPE_CHECKING`` pattern does not
     apply to a call target).
 
@@ -74,42 +75,23 @@ def graphql_issue_states(
             f"}}"
         )
 
-        result = transport.run(
-            [
-                "api",
-                "graphql",
-                "-f",
-                f"query={query}",
-                "-f",
-                f"owner={owner}",
-                "-f",
-                f"name={name}",
-            ],
-            json_output=True,
-            allow_failure=True,
+        value, error = send_graphql(
+            transport,
+            GraphQLRequest.of(query, {"owner": owner, "name": name}, partial_ok=True),
         )
-
-        value: Any
-        if isinstance(result, GitHubRunResult):
-            if not result.ok:
-                value = result.value
-                data = value.get("data") if isinstance(value, dict) else None
-                if not isinstance(data, dict) or not isinstance(data.get("repository"), dict):
-                    # No usable partial data -- a genuine whole-query
-                    # failure. Raise so the caller's full-set per-issue
-                    # fallback applies (the pre-#1933 path).
-                    raise GitHubError(f"GraphQL query failed: {result.error}")
-                logger.warning(
-                    "Batched issue-state query returned per-node errors; "
-                    "keeping the resolved aliases and leaving the unresolved "
-                    "numbers for scoped per-issue fallback: %s",
-                    result.error,
-                )
-            else:
-                value = result.value
-        else:
-            # Test doubles may return the parsed body directly.
-            value = result
+        if error is not None:
+            data = value.get("data") if isinstance(value, dict) else None
+            if not isinstance(data, dict) or not isinstance(data.get("repository"), dict):
+                # No usable partial data -- a genuine whole-query failure.
+                # Raise so the caller's full-set per-issue fallback applies
+                # (the pre-#1933 path).
+                raise GitHubError(f"GraphQL query failed: {error}")
+            logger.warning(
+                "Batched issue-state query returned per-node errors; "
+                "keeping the resolved aliases and leaving the unresolved "
+                "numbers for scoped per-issue fallback: %s",
+                error,
+            )
 
         if not isinstance(value, dict):
             raise GitHubError("GraphQL query returned non-dict JSON")
