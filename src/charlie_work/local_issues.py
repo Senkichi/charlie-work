@@ -56,6 +56,7 @@ from .local_issue_files import (
 )
 from .local_lane import (
     branch_head_sha,
+    local_pr_dict,
     is_ancestor,
     is_patch_equivalent,
     worker_branch_heads,
@@ -468,7 +469,32 @@ class LocalFileGitHub:
         return None
 
     def pr_view(self, number: int, *, fields: str = "") -> dict[str, Any]:
-        return {}
+        """The local review unit for issue ``number``, in ``gh pr view`` shape (minus ``state``).
+
+        There is no PR, but the lane keys its review unit by issue number
+        (``local_pr_dict``), and every shared consumer of ``pr_view``
+        (``record_review`` -> ``_write_rework_prompt``) indexes
+        ``pr["number"]``; an empty dict made ``charlie verdict`` raise
+        ``KeyError`` on this backend (issue #2095). ``{}`` is kept for "no such
+        issue", the same absent-PR signal the remote client gives.
+        """
+        issue = self.issue_view(number)
+        if not issue:
+            return {}
+        heads = worker_branch_heads(self.repo_root, self.branch_prefix, number)
+        branch = min(heads, default="")
+        pr = local_pr_dict(
+            {
+                "number": number,
+                "title": issue.get("title") or "",
+                "branch": branch,
+                "headRefOid": heads.get(branch),
+            }
+        )
+        # No GitHub PR exists, so no GitHub ``state``: ``unescalate`` and
+        # ``record_review`` read ``state`` as "a live remote PR in this
+        # state" and would mis-route a local review unit as OPEN.
+        return {key: value for key, value in pr.items() if key != "state"}
 
     def pr_list(self) -> list[dict[str, Any]]:
         return []
