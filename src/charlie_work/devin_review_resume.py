@@ -262,12 +262,18 @@ def resume_exec_rejected_review(app: Any, worker: Any, pr_number: int, reviews_d
         ).to_dict(),
     )
 
+    relaunched_at = utc_now()
+
     def _bump(entry: dict[str, Any]) -> dict[str, Any]:
         return {
             **entry,
+            # Re-stamp the claim age to the relaunch (issue #2162) so the stall
+            # sweep does not judge the resumed session by the original dispatch
+            # time. The resume-budget key moves with it, keeping the count.
+            "review_dispatched_at": relaunched_at,
             "reviewer_pid": pid,
             "reviewer_process_start_time": start_time,
-            "review_exec_resume_dispatched_at": dispatched_at,
+            "review_exec_resume_dispatched_at": relaunched_at,
             "review_exec_resume_count": attempt,
             "review_exec_resume_session_id": session_id,
         }
