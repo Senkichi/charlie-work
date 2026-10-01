@@ -58,6 +58,13 @@ class JsonRead:
     # -- execution -----------------------------------------------------------
 
     def execute(self, transport: GitHubTransport, owner: str, repo: str) -> Outcome:
+        if self.resource == "issue" and self.shape == "list" and len(self.labels) > 1:
+            # GraphQL ``issues(labels:)`` is OR; ``gh --label a --label b`` is AND.
+            # Refuse rather than return the silently-wrong superset; nothing is sent.
+            return _defect(
+                f"issue list with {len(self.labels)} labels is unsupported: "
+                "GraphQL matches any label (OR), gh matched all (AND)"
+            )
         try:
             if self.shape == "view":
                 return self._view(transport, owner, repo)
