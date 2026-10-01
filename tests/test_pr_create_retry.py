@@ -3,7 +3,7 @@
 Covers ``pr_create_retry.create_pr_with_retry`` in isolation (AC1-AC4, using a
 lightweight fake that satisfies the ``PrCreator`` protocol) and its
 composition with ``GitHub.run()``'s existing inner pre-connection-only retry
-(AC5, using the real ``GitHub`` class with a monkeypatched ``subprocess.run``,
+(AC5, using the real ``GitHub`` class over a scripted fake transport,
 mirroring ``tests/test_github.py``'s own harness -- a hand-rolled fake could
 assert "outer didn't retry" without ever proving the two layers actually
 compose against real code).
@@ -400,7 +400,7 @@ def test_precheck_failure_blocks_creation_only_once_one_is_already_in_flight() -
 
 # ---------------------------------------------------------------------------
 # AC5: composition with `GitHub.run()`'s existing inner pre-connection-only
-# retry. Uses the real `GitHub` class with a monkeypatched `subprocess.run`,
+# retry. Uses the real `GitHub` class over a scripted fake transport,
 # the same harness `tests/test_github.py` uses for the inner retry itself --
 # a fake that merely "remembers" which class an error belongs to would prove
 # nothing about whether the two layers actually compose.

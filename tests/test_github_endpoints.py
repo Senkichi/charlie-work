@@ -9,11 +9,9 @@ bodies are verbatim relocations; shared helpers live in
 
 from __future__ import annotations
 
-import subprocess
 from pathlib import Path
 
 from _fake_transport import FakeAdapter, make_github, ok, sent
-from charlie_work import github as github_module
 from charlie_work.config import RuntimeConfig
 from charlie_work.github_transport.request import GraphQLRequest
 from _github_fixtures import _read_fixture
@@ -108,26 +106,14 @@ def test_compare_diff_returns_none_on_failure(monkeypatch, tmp_path: Path) -> No
     """A failed compare (404, GC'd SHA, API error) must return None, never
     raise — errors are returned as values, per the GitHub wrapper's pattern."""
 
-    def fake_run(cmd, *args, **kwargs):
-        return subprocess.CompletedProcess(
-            args=cmd,
-            returncode=1,
-            stdout="",
-            stderr="HTTP 404: Not Found",
-        )
-
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
-
-    # gh_transport="gh": this test exercises the gh-subprocess failure path
-    # directly via `fake_run`. `compare_diff`'s REST-GET-with-header shape is
-    # an HTTP-transport candidate (issue #1834), and RuntimeConfig's
-    # gh_transport field defaults to "http" -- pinning "gh" here keeps this
-    # test exercising what it was written to test rather than the (already
-    # separately covered, see tests/test_http_transport.py) HTTP path.
-    gh = github_module.GitHub(tmp_path, runtime=RuntimeConfig(gh_max_retries=0, gh_transport="gh"))
+    reply = ok({"message": "Not Found"}, status=404)
+    gh, http, _ = make_github(
+        tmp_path, http=FakeAdapter("http", [reply]), runtime=RuntimeConfig(gh_max_retries=0)
+    )
     result = gh.compare_diff("sha-old", "sha-new")
 
     assert result is None
+    assert sent(http) == [("GET", "repos/{owner}/{repo}/compare/sha-old...sha-new", None)]
 
 
 def test_commit_check_runs_wraps_rest_endpoint(tmp_path: Path) -> None:
@@ -163,13 +149,11 @@ def test_commit_check_runs_wraps_rest_endpoint(tmp_path: Path) -> None:
 
 
 def test_commit_check_runs_returns_none_on_failure(monkeypatch, tmp_path: Path) -> None:
-    def fake_run(cmd, *args, **kwargs):
-        return subprocess.CompletedProcess(args=cmd, returncode=1, stdout="", stderr="not found")
+    reply = ok({"message": "Not Found"}, status=404)
+    gh, http, _ = make_github(tmp_path, http=FakeAdapter("http", [reply]))
 
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
-
-    gh = github_module.GitHub(tmp_path)
     assert gh.commit_check_runs("missing-sha") is None
+    assert sent(http) == [("GET", "repos/{owner}/{repo}/commits/missing-sha/check-runs", None)]
 
 
 def test_remove_pr_label_invokes_gh_pr_edit(tmp_path: Path) -> None:

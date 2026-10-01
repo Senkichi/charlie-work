@@ -10,7 +10,6 @@ bodies are verbatim relocations; shared helpers live in
 from __future__ import annotations
 
 import json
-import subprocess
 from pathlib import Path
 
 import pytest
@@ -114,22 +113,13 @@ def test_merged_pr_list_raises_on_empty_stdout_not_silent_empty(
     is the silent-empty path that would arm the #502 post-merge tripwire with
     an empty baseline and leave it permanently blind (issue #633).
     """
-    call_count = 0
-
-    def fake_run(cmd, *args, **kwargs):
-        nonlocal call_count
-        call_count += 1
-        # gh exits 0 with empty stdout — run() now raises GitHubError directly.
-        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
-
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
-
-    gh = github_module.GitHub(tmp_path)
+    # A 2xx reply with an empty body is unusable, not an empty page.
+    gh, http, _ = make_github(tmp_path, http=FakeAdapter("http", [ok("")]))
     with pytest.raises(github_module.GitHubError):
         gh.merged_pr_list()
 
     # The first page is where the unusable response is detected.
-    assert call_count == 1
+    assert len(http.api_requests) == 1
 
 
 def test_merged_pr_list_empty_page_terminates_cleanly(tmp_path: Path) -> None:

@@ -25,16 +25,14 @@ from __future__ import annotations
 import ast
 import inspect
 import json
-import subprocess
 import time
 from pathlib import Path
 
 import pytest
 
 import charlie_work.github as _github_module
-from _fake_transport import FakeAdapter, checks_reply, gh_kill_switch_runtime, make_github, ok
+from _fake_transport import FakeAdapter, checks_reply, make_github, ok
 from charlie_work.github_transport import Adapters
-from charlie_work.github_transport.gh_adapter import GhAdapter
 from charlie_work.github_transport.outcome import GraphQLError, Response
 from charlie_work.config import ConfigError, RuntimeConfig
 from charlie_work.github import GitHub, GitHubLike, _ROUTES
@@ -217,27 +215,15 @@ def test_retry_constants_read_through_run(monkeypatch: pytest.MonkeyPatch, tmp_p
     installed delegate on every retry loop iteration -- not just that the
     delegate methods work in isolation (the test above), but that ``run``'s
     retry loop really calls through them. Patches
-    ``charlie_work.github.subprocess.run`` (the dotted-tail form the L09
-    advisory review confirmed reaches the shared object rather than replacing
-    the whole ``github`` module attribute) and ``time.sleep`` to keep this
-    fast and deterministic.
+    Scripts the http adapter with a repeating transient 502 and patches
+    ``time.sleep`` to keep this fast and deterministic.
     """
-    call_count = 0
-
-    def fake_subprocess_run(*args, **kwargs):
-        nonlocal call_count
-        call_count += 1
-        return subprocess.CompletedProcess(
-            args, returncode=1, stdout="", stderr="net/http: TLS handshake timeout"
-        )
-
-    monkeypatch.setattr(_github_module.subprocess, "run", fake_subprocess_run)
     monkeypatch.setattr(time, "sleep", lambda *_a, **_k: None)
 
-    gh, _http, _ = make_github(
+    gh, http, _ = make_github(
         tmp_path,
-        gh=GhAdapter(tmp_path),
-        runtime=gh_kill_switch_runtime(gh_max_retries=2, gh_retry_base_seconds=0.01),
+        http=FakeAdapter("http", [ok("Bad Gateway", status=502)]),
+        runtime=RuntimeConfig(gh_max_retries=2, gh_retry_base_seconds=0.01),
     )
     with pytest.raises(_github_module.GitHubError):
         gh.run(["api", "repos/{owner}/{repo}/issues"])
@@ -245,7 +231,7 @@ def test_retry_constants_read_through_run(monkeypatch: pytest.MonkeyPatch, tmp_p
     # max_retries=2 -> 3 attempts total (initial + 2 retries). If `run` were
     # not reading _max_retries() through the delegate (e.g. a stale closure
     # over the default), this would be 4 (the _DEFAULT_GH_MAX_RETRIES=3 value).
-    assert call_count == 3
+    assert len(http.api_requests) == 3
 
 
 def test_run_stays_lexical_not_a_delegate() -> None:

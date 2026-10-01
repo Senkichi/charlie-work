@@ -7,7 +7,6 @@ Track-1 wave 8/8).
 from __future__ import annotations
 
 import logging
-import subprocess
 from pathlib import Path
 import pytest
 from _fake_transport import (
@@ -77,22 +76,17 @@ def test_github_merged_pr_list_does_not_retry_non_transient_error(
     """A non-gateway error (e.g. bad credentials) must fail immediately rather
     than be swallowed into the transient-gateway retry loop.
     """
-    call_count = 0
+    http = FakeAdapter("http", [ok({"message": "Bad credentials"}, status=401)])
+    gh, http, _ = make_github(tmp_path, http=http)
 
-    def fake_run(cmd, *args, **kwargs):
-        nonlocal call_count
-        call_count += 1
-        return subprocess.CompletedProcess(
-            args=cmd, returncode=1, stdout="", stderr="HTTP 401: Bad credentials"
-        )
-
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
-
-    gh = github_module.GitHub(tmp_path)
     with pytest.raises(github_module.GitHubError):
         gh.merged_pr_list()
 
-    assert call_count == 1
+    # 401 is terminal: the guard re-resolves the token once and resends once
+    # (never the transient-gateway retry loop), so exactly two sends, then raise.
+    assert [(r.method, r.route) for r in http.api_requests] == [  # type: ignore[union-attr]
+        ("GET", "repos/octo/hello/pulls")
+    ] * 2
 
 
 def test_issue_list_raises_limit_to_500_and_warns_on_truncation(tmp_path: Path, caplog) -> None:
@@ -163,21 +157,13 @@ def test_branch_protection_caches_failed_read_too(monkeypatch, tmp_path: Path) -
     rest of the pass -- otherwise every PR sharing a broken base ref retries
     the same doomed `gh api` call once each, turning one outage into N.
     """
-    calls: list[list[str]] = []
-
-    def fake_run(*args, **kwargs):
-        calls.append(args[0])
-        return subprocess.CompletedProcess(
-            args=args, returncode=1, stdout="", stderr="HTTP 404: Not Found"
-        )
-
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
-    gh = github_module.GitHub(repo_root=tmp_path)
+    http = FakeAdapter("http", [ok({"message": "Not Found"}, status=404)])
+    gh, http, _ = make_github(tmp_path, http=http)
 
     assert gh.branch_protection("main") is None
     assert gh.branch_protection("main") is None
     assert gh.branch_protection("main") is None
-    assert len(calls) == 1
+    assert sent(http) == [("GET", "repos/{owner}/{repo}/branches/main/protection", None)]
 
 
 def test_github_are_issues_open_normalizes_uppercase_state(tmp_path: Path) -> None:

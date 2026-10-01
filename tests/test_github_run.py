@@ -15,10 +15,17 @@ from pathlib import Path
 
 import pytest
 
-from _fake_transport import FakeAdapter, failure, gh_kill_switch_runtime, make_github, ok
+from _fake_transport import (
+    FakeAdapter,
+    failure,
+    gh_kill_switch_runtime,
+    graphql_ok,
+    make_github,
+    ok,
+)
 from charlie_work import github as github_module
 from charlie_work.config import RuntimeConfig
-from charlie_work.github_transport import FailureKind
+from charlie_work.github_transport import FailureKind, GraphQLRequest
 from charlie_work.github_transport.gh_adapter import GhAdapter
 
 
@@ -77,10 +84,6 @@ def _issue_list_args() -> list[str]:
         "--json",
         github_module.ISSUE_LIST_FIELDS,
     ]
-
-
-def _empty_stdout_success(cmd: list[str]) -> subprocess.CompletedProcess:
-    return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
 
 
 def test_run_retries_transient_read_failure_then_succeeds(monkeypatch, tmp_path: Path) -> None:
@@ -380,15 +383,8 @@ def test_wrapper_method_raises_on_unreadable_empty_stdout(
     raise actually propagates all the way out to the caller.
     """
 
-    def fake_run(cmd, *a, **kwargs):
-        return _empty_stdout_success(cmd)
-
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
-
-    gh = github_module.GitHub(tmp_path, runtime=gh_kill_switch_runtime())
-    # label_list is a REST read: pin the slug so no `git remote` lookup is needed.
-    object.__setattr__(gh, "_repo_owner_name", lambda: ("octo", "hello"))
-    gh._list_cache[("_repo_owner_name",)] = ("octo", "hello")  # the collaborator reads the cache
+    # Every request (REST or GraphQL) is answered 200 with an empty body.
+    gh, _http, _ = make_github(tmp_path, http=FakeAdapter("http", handler=lambda req: ok("")))
     method = getattr(gh, method_name)
     with pytest.raises(github_module.GitHubError):
         method(*args)
@@ -426,23 +422,12 @@ def test_wrapper_method_returns_empty_for_genuine_empty_json(
         "pr_view": {"repository": {"pullRequest": {}}},
     }
 
-    def fake_run(cmd, *a, **kwargs):
-        # A REST read goes out as ``gh api --include`` and reads back a status line.
-        prefix = "HTTP/2.0 200 OK\r\n\r\n" if "--include" in cmd else ""
-        if method_name in graphql:
-            stdout = json.dumps({"data": graphql[method_name]})
-        else:
-            stdout = empty_json_stdout
-        return subprocess.CompletedProcess(
-            args=cmd, returncode=0, stdout=prefix + stdout, stderr=""
-        )
+    def handler(request):
+        if isinstance(request, GraphQLRequest):
+            return graphql_ok(graphql[method_name])
+        return ok(json.loads(empty_json_stdout))
 
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
-
-    gh = github_module.GitHub(tmp_path, runtime=gh_kill_switch_runtime())
-    # label_list is a REST read: pin the slug so no `git remote` lookup is needed.
-    object.__setattr__(gh, "_repo_owner_name", lambda: ("octo", "hello"))
-    gh._list_cache[("_repo_owner_name",)] = ("octo", "hello")  # the collaborator reads the cache
+    gh, _http, _ = make_github(tmp_path, http=FakeAdapter("http", handler=handler))
     method = getattr(gh, method_name)
     result = method(*args)
 

@@ -14,12 +14,11 @@ from _merge_tripwire_fixtures import (
     _arm_unauthorized_merge_tripwire,
     _merged_worker_pr,
 )
-from _fake_transport import gh_kill_switch_runtime
+from _fake_transport import FakeAdapter, make_github, ok, sent
 from charlie_work import github as github_module
 from charlie_work.workflow import OrchestratorApp
 from _dispatch_fixtures import _stub_real_activity_probe_for_stalled_tests  # noqa: F401
 import json
-import subprocess
 from charlie_work.state import load_state
 
 
@@ -441,17 +440,11 @@ def test_detect_unauthorized_merges_against_real_rest_merged_pr_list(
         }
     ]
     # merged_pr_list() paginates until it sees an empty page.
-    responses = [json.dumps(rest_page), "[]"]
-
-    def fake_run(cmd, *args, **kwargs):
-        return subprocess.CompletedProcess(
-            args=cmd, returncode=0, stdout=responses.pop(0), stderr=""
-        )
-
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+    gh, http, _ = make_github(tmp_path, http=FakeAdapter("http", [ok(rest_page), ok([])]))
 
     # The real producer, driven off a real REST payload.
-    merged_prs = github_module.GitHub(tmp_path, runtime=gh_kill_switch_runtime()).merged_pr_list()
+    merged_prs = gh.merged_pr_list()
+    assert sent(http)[0] == ("GET", "repos/{owner}/{repo}/pulls", None)
     assert len(merged_prs) == 1
     assert merged_prs[0]["headRefOid"] == merged_head_sha, (
         "merged_pr_list() must map REST head.sha onto headRefOid (#631) — "

@@ -33,9 +33,8 @@ The fix has three seams, each covered below:
   ``warning`` (the last test below covers the fleet lifecycle end-to-end
   through the real ``log_event``/events.db path).
 
-No live network anywhere: the HTTP transport's ``HTTPSConnection`` is faked
-(the same stand-in shape as ``tests/test_http_transport.py``) and the ``gh``
-subprocess path is monkeypatched.
+No live network anywhere: both adapters are scripted fakes
+(``tests/_fake_transport.py``) and no ``gh`` subprocess is ever spawned.
 """
 
 from __future__ import annotations
