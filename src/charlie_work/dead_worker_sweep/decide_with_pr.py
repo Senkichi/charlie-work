@@ -280,8 +280,23 @@ def with_pr_flow(
     )
     last_decision = resolved.decision
 
-    if last_decision == "request_changes" and ctx.reviewed and ctx.live:
-        if ctx.reviewed == ctx.live:
+    # An issue can only be ``dispatched`` while its PR's verdict is ``approved`` if
+    # that dispatch is a post-approval rework (check failure or conflict), so the
+    # PR ``status`` is not consulted: carry-forward (#2135) can rewrite it back to
+    # ``approved`` mid-rework, and enumerating writers would rot.
+    if last_decision in ("request_changes", "approved") and ctx.reviewed and ctx.live:
+        if ctx.reviewed != ctx.live:
+            yield from _head_changed(facts, draft, acc, ctx, last_decision)
+        elif last_decision == "approved":
+            yield from _same_head(
+                facts,
+                draft,
+                acc,
+                ctx,
+                recovered_reason="dead_worker_with_approved_rework",
+                extra={"decision": "approved", "pr_state_status": pr_state.get("status")},
+            )
+        else:
             yield from _same_head(
                 facts,
                 draft,
@@ -290,26 +305,6 @@ def with_pr_flow(
                 recovered_reason="dead_worker_with_request_changes",
                 extra={},
             )
-        else:
-            yield from _head_changed(facts, draft, acc, ctx, last_decision)
-        return
-
-    status = pr_state.get("status")
-    if (
-        last_decision == "approved"
-        and status == "rework_requested"
-        and ctx.reviewed
-        and ctx.live
-        and ctx.reviewed == ctx.live
-    ):
-        yield from _same_head(
-            facts,
-            draft,
-            acc,
-            ctx,
-            recovered_reason="dead_worker_with_approved_rework",
-            extra={"decision": "approved", "pr_state_status": status},
-        )
         return
 
     if last_decision is None or last_decision == "pending":

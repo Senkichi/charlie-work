@@ -10,7 +10,6 @@ import json
 import sys
 from pathlib import Path
 import pytest
-from _dead_session_fixtures import _write_flat_review_decision
 from _dispatch_fixtures import _stub_real_activity_probe_for_stalled_tests  # noqa: F401
 from _fakes_github import FakeGitHub
 from _rework_dispatch_fixtures import _wg
@@ -27,89 +26,6 @@ from charlie_work.state import (
     save_state,
 )
 from charlie_work.workflow import OrchestratorApp
-
-
-def test_orphaned_worker_approved_without_rework_status_still_drifts(tmp_path: Path) -> None:
-    """Issue #1109 guard: an approved PR whose PR state does NOT carry
-    ``status="rework_requested"`` has no evidence a post-approval rework lane
-    dispatched this worker, so the sweep must still surface
-    ``dead_worker_unsafe_to_auto_reset`` drift rather than guess.
-
-    This is the existing test_orphaned_worker_unsafe_to_auto_reset_drift_emits_once
-    scenario (approved, head unchanged, no PR-state status) -- re-asserted
-    here to pin the guard's meaning: the ``pr_state_status == "rework_requested"``
-    check is what separates a safe auto-reset from an unclassifiable drift.
-    """
-    from unittest.mock import patch
-
-    config = OrchestratorConfig(
-        devin=DevinConfig(),
-        worker=WorkerRoleConfig(harness="devin-shell"),
-        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
-    )
-    paths = runtime_paths(tmp_path, config.runtime.state_dir)
-
-    state = load_state(paths.state_file)
-    state["issues"]["1109"] = {
-        "status": "dispatched",
-        "worker_pid": 99999,
-        "worker_process_start_time": 1234567890.0,
-        "dispatched_at": "2024-01-01T00:00:00Z",
-    }
-    # Approved but NO status="rework_requested" -- no evidence a rework lane
-    # dispatched this worker.
-    state["prs"]["100"] = {
-        "decision": "approved",
-        "reviewed_head_sha": "abc123",
-    }
-    save_state(paths.state_file, state)
-    _write_flat_review_decision(paths, 100, "approved", "abc123")
-
-    class FakeGitHubForOrphan(FakeGitHub):
-        def pr_list(self):
-            return [
-                {
-                    "number": 100,
-                    "headRefOid": "abc123",
-                    "isCrossRepository": False,
-                    "headRepository": {"owner": {"login": "test"}, "name": "repo"},
-                    "headRefName": "agent/issue-1109",
-                }
-            ]
-
-    fake_gh = FakeGitHubForOrphan()
-    fake_gh.issues.append(
-        {
-            "number": 1109,
-            "title": "Test issue",
-            "url": "https://example.test/issues/1109",
-            "body": "",
-            "labels": [],
-            "state": "OPEN",
-        }
-    )
-
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
-        from charlie_work.workflow import _detect_and_handle_orphaned_workers
-
-        sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
-        sessions_dir.mkdir(parents=True, exist_ok=True)
-
-        _detect_and_handle_orphaned_workers(
-            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
-        )
-
-    state = load_state(paths.state_file)
-    entry = state["issues"]["1109"]
-
-    # No evidence of a rework lane dispatch -- must stay dispatched and drift.
-    assert entry.get("status") == "dispatched"
-
-    events = state.get("events", [])
-    assert [e for e in events if e.get("kind") == "orphaned_worker_recovered"] == []
-    drift_events = [e for e in events if e.get("kind") == "orphaned_worker_drift"]
-    assert len(drift_events) == 1
-    assert drift_events[0]["payload"]["reason"] == "dead_worker_unsafe_to_auto_reset"
 
 
 def test_orphaned_worker_drift_fingerprint_cleared_on_redispatch(
@@ -197,7 +113,7 @@ def test_orphaned_worker_drift_fingerprint_cleared_on_redispatch(
     pr_dir = paths.prs / "pr-100"
     pr_dir.mkdir(parents=True, exist_ok=True)
     (pr_dir / "review-decision.json").write_text(
-        json.dumps({"decision": "approved", "reviewed_head_sha": "abc123"}),
+        json.dumps({"decision": "approved", "reviewed_head_sha": None}),
         encoding="utf-8",
     )
 
