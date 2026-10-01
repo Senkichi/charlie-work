@@ -206,8 +206,8 @@ def _state_txn(
         if commit.event_kind is not None:
             state = write_gate.append_event(
                 state,
-                # event-consumer: audit-only -- pass-through of the kind ``decide_stalled``
-                # chose; every literal is checked at its origin by tests/test_dws_event_kinds.py
+                # event-consumer: audit-only -- forwards ``commit.event_kind`` unchanged; the consumer
+                # or audit-only justification lives at the ``event_kind=`` literal in ``decide_stalled``
                 commit.event_kind,
                 dict(commit.event_payload),
             )
