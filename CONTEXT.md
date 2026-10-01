@@ -219,6 +219,19 @@ _Avoid_: gh call, HTTP plan
 Re-sending a failed request through the gh CLI for that one call, when the failure is a connect error, an unavailable token or an adapter defect. The `gh_transport: gh` kill switch sends every request that way.
 _Avoid_: gh call, HTTP plan
 
+### Flow measures
+
+**Lead time**:
+How long an issue takes from becoming Ready to reaching Done.
+_Avoid_: Cycle time (that is the sum of stage times), turnaround
+
+**Stage time**:
+How long an issue spends in one lifecycle state before it leaves that state. An issue that goes back to a state it already left (for example rework sending it back to In progress) builds up stage time across every visit.
+
+**Capped demand**:
+Time when dispatchable issues are waiting and the concurrency budget they need is already full. It separates a fleet held back by its budget from one with no work to do.
+_Avoid_: Backlog (that is the count of waiting issues, not the time spent at the cap), starvation
+
 ### Owned by ci_fleet (defined there, not here)
 
 **Runner allocation**:
