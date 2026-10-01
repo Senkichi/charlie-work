@@ -84,7 +84,7 @@ from charlie_work.dispatch_selection import (
     _windowed_blocked_environment_at,
     _windowed_foreign_writer_reaps,
 )
-from charlie_work import fleet_provider_throttle
+import charlie_work.fleet_provider_throttle as fleet_provider_throttle
 from charlie_work.escalation import _escalate_issue, _escalation_edge
 from charlie_work.fleet_registry import managed_repo_names, managed_repo_roots
 from charlie_work.github import label_names

@@ -42,7 +42,8 @@ import charlie_work.workflow as _wf
 from charlie_work.worker_pid_stamp import stamp_worker_process
 from charlie_work.adapters import SessionRequest
 from charlie_work.claude_code import resolve_review_effort
-from charlie_work import fleet_provider_throttle, role_selection
+import charlie_work.fleet_provider_throttle as fleet_provider_throttle
+from charlie_work import role_selection
 from charlie_work.fleet_registry import try_acquire_fleet_lock
 from charlie_work.worker_launch_gate import (
     REASON_CONCURRENCY_CAP,

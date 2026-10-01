@@ -22,7 +22,7 @@ from charlie_work.config import (
     DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS,
     PRE_LAUNCH_BLOCKED_ENVIRONMENT_FAILURE_KINDS,
 )
-from charlie_work import fleet_provider_throttle
+import charlie_work.fleet_provider_throttle as fleet_provider_throttle
 from charlie_work.github import GitHubError
 from charlie_work.labels import TransitionOutcome
 from charlie_work.state import StateLockBusy
