@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 import re
 from datetime import UTC, datetime, timedelta, timezone
 
@@ -186,9 +188,18 @@ def test_multiples_sorted_by_total_and_share_x_window() -> None:
     assert firsts[0] == firsts[1]  # same x for the same first bucket
 
 
-def test_multiples_heading_links_only_when_routed_and_outside_svg() -> None:
+def test_multiples_heading_links_only_when_routed_and_outside_svg(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from charlie_work.dashboard.pages import routes
+
     html = small_multiples(_panels(), LineSpec("m"), UTC)
-    # /repo is not a registered route yet, so the heading is plain text.
-    assert '<span class="panel-key">o/big</span>' in html
+    # /repo is a registered route, so the heading links to the repo drill-down ...
+    assert '<a class="panel-key" href="/repo/o/big">o/big</a>' in html
+    assert '<span class="panel-key">o/small</span>' in html  # no href: plain text
     for svg in re.findall(r"<svg.*?</svg>", html, re.S):
         assert "<a " not in svg
+    # ... and an unregistered route renders the same heading as plain text.
+    monkeypatch.setattr(routes, "ROUTES", frozenset({"/now"}))
+    html = small_multiples(_panels(), LineSpec("m"), UTC)
+    assert '<span class="panel-key">o/big</span>' in html

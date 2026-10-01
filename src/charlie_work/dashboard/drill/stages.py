@@ -14,7 +14,7 @@ from datetime import datetime
 
 from ..metrics_flow import APPROX_STAGES, STAGES
 from ..timeutil import parse_ts
-from .types import StageTime
+from .types import StageSpan, StageTime
 
 Milestone = tuple[str, str, bool]  # (ts, name, exact)
 
@@ -38,27 +38,42 @@ def _secs(a: str, b: str) -> float:
     return max(0.0, (parse_ts(b) - parse_ts(a)).total_seconds())
 
 
-def stage_times(
-    milestones: Sequence[Milestone], now: datetime
-) -> tuple[tuple[StageTime, ...], float | None, bool]:
-    """``(stage times, lead seconds, approx)`` for one item's time-ordered milestones."""
+def stage_spans(milestones: Sequence[Milestone], now: datetime) -> tuple[StageSpan, ...]:
+    """Every visit to every stage (``STAGES`` order, visits in time order); open ends at ``now``.
+
+    The lane chart draws these and ``stage_times`` sums them, so the bands and the totals
+    beside them cannot disagree.
+    """
     exact = any(e for _, _, e in milestones)
     evs = [(ts, name) for ts, name, e in milestones if e == exact]
     names = {name for _, name in evs} - {"ready_observed"}
-    out: list[StageTime] = []
+    out: list[StageSpan] = []
     for stage in STAGES:
         if exact:
             starts, ends = (stage,), tuple(names - {stage})
         else:
             starts, ends = APPROX_STAGES[stage]
         spans, opened = _scan(evs, starts, ends)
-        total = sum(_secs(a, b) for a, b in spans)
-        visits = len(spans)
+        out += [StageSpan(stage, a, b, _secs(a, b), False) for a, b in spans]
         if opened is not None:
-            total += _secs(opened, now.isoformat())
-            visits += 1
-        if visits:
-            out.append(StageTime(stage, total, visits, opened is not None))
+            end = now.isoformat()
+            out.append(StageSpan(stage, opened, end, _secs(opened, end), True))
+    return tuple(out)
+
+
+def stage_times(
+    milestones: Sequence[Milestone], now: datetime
+) -> tuple[tuple[StageTime, ...], float | None, bool]:
+    """``(stage times, lead seconds, approx)`` for one item's time-ordered milestones."""
+    exact = any(e for _, _, e in milestones)
+    evs = [(ts, name) for ts, name, e in milestones if e == exact]
+    spans = stage_spans(milestones, now)
+    out: list[StageTime] = []
+    for stage in STAGES:
+        mine = [s for s in spans if s.stage == stage]
+        if mine:
+            total = sum(s.seconds for s in mine)
+            out.append(StageTime(stage, total, len(mine), any(s.open_now for s in mine)))
     lead_starts, lead_ends = (
         (("ready", "ready_observed"), ("done",))
         if exact

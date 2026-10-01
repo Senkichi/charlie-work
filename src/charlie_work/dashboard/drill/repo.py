@@ -49,7 +49,7 @@ def _passes(db: sqlite3.Connection, slug: str, limit: int, tz: tzinfo | None):
     )
 
 
-def _merges(db: sqlite3.Connection, slug: str, limit: int, tz: tzinfo | None):
+def merges_for(db: sqlite3.Connection, slug: str, limit: int, tz: tzinfo | None):
     """Newest merges, each issue (or PR) once at its first signal, as History's Merges counts."""
     link = {
         pr: i
@@ -131,7 +131,7 @@ def repo_drill(
             empty,
             history_from=history_start(db, slug),
             passes=_passes(db, slug, limit, tz),
-            merges=_merges(db, slug, limit, tz),
+            merges=merges_for(db, slug, limit, tz),
             escalations=_escalations(db, slug, limit, tz),
         )
     except sqlite3.Error as exc:

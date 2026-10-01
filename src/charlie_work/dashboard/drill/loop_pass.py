@@ -18,14 +18,8 @@ from datetime import tzinfo
 from typing import Any
 
 from .. import sources as src
-from .types import (
-    DrillError,
-    PassDrill,
-    PassEvent,
-    check_slug,
-    local_text,
-    valid_correlation_id,
-)
+from ..pages.now_fmt import valid_correlation_id
+from .types import DrillError, PassDrill, PassEvent, check_slug, local_text
 
 MAX_PASS_EVENTS = 2000
 PREVIEW_CHARS = 160

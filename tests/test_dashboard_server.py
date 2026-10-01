@@ -223,8 +223,14 @@ def test_route_registry_matches_what_the_server_serves(served) -> None:
     from charlie_work.dashboard.pages import routes
 
     for prefix in sorted(routes.ROUTES):
-        resp, _ = _get(served, prefix)
-        assert resp.status == 200, prefix
+        resp, body = _get(served, prefix)
+        # A view answers 200; a bare drill-down prefix is handled by its page handler
+        # (a house-style 404 naming the expected shape), never the plain-text fallthrough.
+        assert resp.getheader("Content-Type", "").startswith("text/html"), prefix
+        if prefix in ("/now", "/history"):
+            assert resp.status == 200, prefix
+        else:
+            assert resp.status == 404 and b'class="dmissing"' in body, prefix
     unbuilt = [v.href for v in routes.VIEWS if not routes.is_routed(v.href)]
     for href in unbuilt:
         resp, _ = _get(served, href)

@@ -53,7 +53,8 @@ def _fresh_chip(f: RepoFreshness) -> str:
     )
 
 
-def _freshness(model: NowModel) -> str:
+def freshness_strip(model: NowModel) -> str:
+    """Last-pass chip per repo (shared by Now and every drill-down header)."""
     chips = "".join(_fresh_chip(f) for f in model.freshness)
     return (
         '<div class="fresh" aria-label="Last loop pass per repo"><span class="label">Last pass'
@@ -94,7 +95,7 @@ def _header(state: ModelState, poll_seconds: int) -> str:
         else '<span class="asof">collecting…</span>'
     )
     nav = views_nav("/now")
-    fresh = _freshness(model) if model is not None else ""
+    fresh = freshness_strip(model) if model is not None else ""
     return (
         '<header class="top"><div class="top-line"><h1 class="brand">Fleet '
         f"<em>· Now</em></h1>{nav}{asof}{THEME_BUTTON}</div>{fresh}</header>"

@@ -112,12 +112,23 @@ def test_header_as_of_local_time_nav_and_freshness() -> None:
     assert 'class="chip is-warn text-warn"' in html_text and "stale</span>" in html_text
 
 
-def test_unrouted_numbers_render_as_text_not_dead_links() -> None:
+def test_registered_drill_downs_are_links_and_unbuilt_ones_stay_text() -> None:
+    """With the real registry: every href is routed; /repo, /issue and /flow numbers are now
+    links; the unbuilt /backlog, /prs and /capacity numbers are still plain text."""
     html_text = _page()
     hrefs = [a["href"] for t, a in _parse(html_text).tags if t == "a" and a.get("href")]
     assert hrefs and all(routes.is_routed(h) for h in hrefs), hrefs
-    assert not any(h.startswith(("/repo", "/issue", "/flow", "/backlog")) for h in hrefs)
+    for prefix in ("/repo/", "/issue/", "/flow/"):
+        assert any(h.startswith(prefix) for h in hrefs), prefix
+    assert not any(h.startswith(("/backlog", "/prs", "/capacity")) for h in hrefs)
     assert '<span class="n">84</span>' in html_text  # the held count is still shown
+
+
+def test_unrouted_numbers_render_as_text_not_dead_links(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(routes, "ROUTES", frozenset({"/now", "/history"}))
+    html_text = _page()
+    hrefs = [a["href"] for t, a in _parse(html_text).tags if t == "a" and a.get("href")]
+    assert hrefs and not any(h.startswith(("/repo", "/issue", "/flow")) for h in hrefs)
 
 
 def test_numbers_link_to_drill_downs_and_done_is_unrecorded(drilldowns: None) -> None:

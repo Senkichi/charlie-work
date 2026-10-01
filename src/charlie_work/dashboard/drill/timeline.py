@@ -15,7 +15,7 @@ from ...config import LabelConfig
 from ..metrics_flow import EXACT_KINDS
 from ..now_access import dict_list, label_set, pos_int
 from ..sources import SnapshotRead
-from .stages import stage_times
+from .stages import stage_spans, stage_times
 from .types import (
     CurrentState,
     DrillError,
@@ -212,9 +212,8 @@ def _drill(
             issue, prs = _issue_for_pr(db, repo, number, snapshot), (number,)
         scope, args = _scope(issue, prs, strict_pr=kind == "pr")
         entries, ms = _entries(db, repo, scope, args, issue, tz)
-        stages, lead, approx = stage_times(
-            [(ts, name, k in EXACT_KINDS) for ts, _i, _p, name, k, _a in ms], now
-        )
+        milestones = [(ts, name, k in EXACT_KINDS) for ts, _i, _p, name, k, _a in ms]
+        stages, lead, approx = stage_times(milestones, now)
         current = _current(
             snapshot, labels or LabelConfig(), issue, number if kind == "pr" else None
         )
@@ -231,6 +230,7 @@ def _drill(
             approx=approx,
             history_from=history_start(db, repo),
             known=bool(entries) or current is not None,
+            spans=stage_spans(milestones, now),
         )
     except sqlite3.Error as exc:
         return DrillError("unavailable", f"history unreadable: {exc}")

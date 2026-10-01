@@ -8,6 +8,7 @@ filtered by correlation id.
 
 from __future__ import annotations
 
+from ..pages.now_fmt import valid_correlation_id
 from .loop_pass import pass_drill
 from .repo import repo_drill
 from .timeline import issue_drill, pr_drill
@@ -20,9 +21,9 @@ from .types import (
     PassDrill,
     PassEvent,
     RepoDrill,
+    StageSpan,
     StageTime,
     TimelineEntry,
-    valid_correlation_id,
 )
 
 __all__ = [
@@ -34,6 +35,7 @@ __all__ = [
     "PassDrill",
     "PassEvent",
     "RepoDrill",
+    "StageSpan",
     "StageTime",
     "TimelineEntry",
     "issue_drill",

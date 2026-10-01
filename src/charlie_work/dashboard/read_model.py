@@ -12,7 +12,7 @@ import dataclasses
 import logging
 import threading
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
@@ -38,6 +38,10 @@ class ModelState:
     # (a BaseException that escaped the per-tick ``Exception`` boundary), if it did.
     last_attempt_at: datetime | None = None
     collector_dead: str | None = None
+    # The read the model was built from, kept so a drill-down (stage list, an issue's current
+    # state) shows the same snapshot tick as the Now number that links to it. Not part of
+    # ``/api/now.json`` (``to_plain`` skips fields marked ``plain=False``).
+    sources: SourcesRead | None = field(default=None, metadata={"plain": False})
 
 
 STALL_MULTIPLIER = 3.0
@@ -94,7 +98,11 @@ def refresh_model(holder: ReadModel, collect: Collect, clock: Clock) -> None:
         )
         return
     holder.update(
-        model=model, collected_at=now, collector_error=None, collector_failing_since=None
+        model=model,
+        sources=sources_read,
+        collected_at=now,
+        collector_error=None,
+        collector_failing_since=None,
     )
 
 
@@ -169,7 +177,11 @@ def start_workers(
 def to_plain(value: Any) -> Any:
     """Dataclass tree -> JSON-ready structure (datetimes become ISO strings)."""
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
-        return {f.name: to_plain(getattr(value, f.name)) for f in dataclasses.fields(value)}
+        return {
+            f.name: to_plain(getattr(value, f.name))
+            for f in dataclasses.fields(value)
+            if f.metadata.get("plain", True)
+        }
     if isinstance(value, dict):
         return {str(k): to_plain(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):

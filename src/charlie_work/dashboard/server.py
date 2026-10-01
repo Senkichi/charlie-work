@@ -4,7 +4,9 @@
 a config problem (non-loopback host, bind failure). ``run_server`` starts the collector
 thread(s) plus the accept loop and blocks until a stop ``Event`` is set. The server never
 writes fleet state and never calls GitHub: Now reads ``ReadModel``; History reads
-``dashboard.db`` read-only through the per-(tab, range) ``HistoryCache``.
+``dashboard.db`` read-only through the per-(tab, range) ``HistoryCache``; the drill-downs
+(``server_drill``) read ``dashboard.db`` and, for one loop pass, one registered events.db,
+both read-only.
 """
 
 from __future__ import annotations
@@ -15,7 +17,7 @@ import ipaddress
 import json
 import logging
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from http.server import ThreadingHTTPServer
@@ -37,12 +39,14 @@ from .read_model import (
     start_workers,
     to_plain,
 )
+from .server_drill import DrillContext, drill_response
 from .server_http import (
     CSP,
     MAX_DRAIN_BYTES,
     DashboardHTTPServer,
     SecureHandler,
 )
+from .sources import RepoSource
 from .theme import assets
 
 __all__ = ["CSP"]
@@ -70,12 +74,14 @@ class ServerError:
 
 @dataclass(frozen=True)
 class DashboardSources:
-    """Injected data sources: the collector pass, the optional rollup pass, and the
-    ``dashboard.db`` History reads (None: History says the rollup is not available)."""
+    """Injected data sources: the collector pass, the optional rollup pass, the
+    ``dashboard.db`` History reads (None: History says the rollup is not available), and the
+    fleet registry's repos (the loop-pass drill-down opens one of their events.db files)."""
 
     collect: Collect
     rollup: RollupRun | None = None
     history_db: Path | None = None
+    repos: Callable[[], Sequence[RepoSource]] = tuple
 
 
 def default_sources(fleet_dir_override: str | None, collector_interval: float) -> DashboardSources:
@@ -84,6 +90,7 @@ def default_sources(fleet_dir_override: str | None, collector_interval: float) -
     from .alarm_feed import loop_pass_findings
     from .now_collect import collect_sources_read
     from .rollup import rollup_sources, run_rollup
+    from .sources import enumerate_repos
 
     def collect(now: datetime):
         read = collect_sources_read(now, fleet_dir_override)
@@ -93,7 +100,12 @@ def default_sources(fleet_dir_override: str | None, collector_interval: float) -
     def rollup(now: datetime) -> tuple[str, ...]:
         return run_rollup(rollup_sources(fleet_dir_override), now).errors
 
-    return DashboardSources(collect, rollup, layout.dashboard_db_path(override=fleet_dir_override))
+    return DashboardSources(
+        collect,
+        rollup,
+        layout.dashboard_db_path(override=fleet_dir_override),
+        lambda: enumerate_repos(fleet_dir_override),
+    )
 
 
 def _is_loopback_host(host: str) -> bool:
@@ -133,9 +145,11 @@ class _App:
         clock: Clock,
         port: int,
         history: HistoryCache,
+        sources: DashboardSources,
     ):
         self.holder = holder
         self.history = history
+        self.sources = sources
         self.config = config
         self.clock = clock
         self.allowed_hosts = frozenset({f"127.0.0.1:{port}", f"localhost:{port}"})
@@ -209,6 +223,8 @@ class _Handler(SecureHandler):
             self._send(200, assets.stylesheet().encode("utf-8"), "text/css; charset=utf-8")
         elif path.startswith("/static/"):
             self._static(path[len("/static/") :])
+        elif (drilled := self._drill(path, query, state)) is not None:
+            self._html(drilled[1], drilled[0])
         else:
             self._text(404, "not found")
 
@@ -231,6 +247,11 @@ class _Handler(SecureHandler):
         tab = pick_tab((params.get("tab") or [None])[0])
         range_key = pick_range((params.get("range") or [None])[0])
         self._html(render_history(self.app.history.get(tab, range_key), tab, range_key))
+
+    def _drill(self, path: str, query: str, state: ModelState) -> tuple[int, str] | None:
+        src = self.app.sources
+        ctx = DrillContext(state, src.history_db, src.repos, self.app.clock())
+        return drill_response(path, parse_qs(query), ctx)
 
     def _static(self, relpath: str) -> None:
         try:
@@ -279,7 +300,7 @@ def make_server(
     holder = ReadModel()
     history = history_cache(sources.history_db, float(config.rollup_interval_seconds), clock)
     port = int(httpd.server_address[1])
-    httpd.app = _App(holder, config, clock, port, history)  # type: ignore[attr-defined]
+    httpd.app = _App(holder, config, clock, port, history, sources)  # type: ignore[attr-defined]
     return DashboardServer(httpd, holder, config, sources, clock)
 
 

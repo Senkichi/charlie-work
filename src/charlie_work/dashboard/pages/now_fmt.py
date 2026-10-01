@@ -2,7 +2,8 @@
 
 Every helper that returns markup escapes its dynamic inputs; callers pass raw values.
 Drill-down URLs are built here (single point) so the routes can land later without the
-renderers changing: ``/repo/<key>``, ``/issue/<repo>/<n>``, ``/flow/<stage>``. Whether a
+renderers changing: ``/repo/<key>``, ``/issue/<repo>/<n>``, ``/pr/<repo>/<n>``,
+``/pass/<repo>/<correlation id>``, ``/flow/<stage>``. Whether a
 built URL becomes an ``<a>`` is decided by ``routes.routed`` (the route registry), never here.
 """
 
@@ -53,6 +54,27 @@ def issue_url(repo: str, number: int) -> str | None:
     if not valid_slug(repo):
         return None
     return f"/issue/{quote(repo, safe='/')}/{int(number)}"
+
+
+def pr_url(repo: str, number: int) -> str | None:
+    if not valid_slug(repo):
+        return None
+    return f"/pr/{quote(repo, safe='/')}/{int(number)}"
+
+
+# ``correlation_context`` mints ``uuid4().hex[:12]``; callers may pass their own id, so accept
+# any short token of id-safe characters (never a path, quote or whitespace).
+_CORRELATION_ID = re.compile(r"[A-Za-z0-9_.:-]{1,64}")
+
+
+def valid_correlation_id(value: str) -> bool:
+    return isinstance(value, str) and _CORRELATION_ID.fullmatch(value) is not None
+
+
+def pass_url(repo: str, correlation_id: str) -> str | None:
+    if not valid_slug(repo) or not valid_correlation_id(correlation_id):
+        return None
+    return f"/pass/{quote(repo, safe='/')}/{quote(correlation_id, safe='')}"
 
 
 def flow_url(stage: str) -> str:

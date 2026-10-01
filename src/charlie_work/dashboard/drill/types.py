@@ -7,7 +7,6 @@ strings; the page renderer escapes them.
 
 from __future__ import annotations
 
-import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, tzinfo
@@ -18,9 +17,6 @@ from ..now_types import FlowStage, NeedsMeItem, RepoFreshness, RepoWorkers, Runn
 from ..pages.now_fmt import valid_slug
 from ..timeutil import local_iso
 
-# ``correlation_context`` mints ``uuid4().hex[:12]``; callers may pass their own id, so accept
-# any short token of id-safe characters (never a path, quote or whitespace).
-_CORRELATION_ID = re.compile(r"[A-Za-z0-9_.:-]{1,64}")
 MAX_NUMBER = 10**9
 
 
@@ -30,10 +26,6 @@ class DrillError:
 
     code: str
     message: str
-
-
-def valid_correlation_id(value: str) -> bool:
-    return isinstance(value, str) and _CORRELATION_ID.fullmatch(value) is not None
 
 
 def check_slug(slug: str) -> DrillError | None:
@@ -155,6 +147,17 @@ class StageTime:
 
 
 @dataclass(frozen=True)
+class StageSpan:
+    """One visit to one stage: the band the lane chart draws (UTC ISO ends)."""
+
+    stage: str
+    start: str
+    end: str  # ``now`` when ``open_now``
+    seconds: float
+    open_now: bool
+
+
+@dataclass(frozen=True)
 class CurrentState:
     """What the status snapshot says about the item now (GitHub-derived, as of the snapshot)."""
 
@@ -183,6 +186,7 @@ class IssueDrill:
     approx: bool  # stage/lead times are reconstructed (no lifecycle_transition for this item)
     history_from: str | None
     known: bool  # False: neither history nor the snapshot has ever seen this number
+    spans: tuple[StageSpan, ...] = ()  # the visits ``stage_times`` sums (lane chart bands)
 
 
 # --- loop pass ----------------------------------------------------------------------------
