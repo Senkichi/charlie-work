@@ -558,3 +558,27 @@ def test_blocked_chain_dead_recovers_when_transient_pr_clears(
     chain_events = _events(state, "dispatch_blocked_chain_dead")
     assert len(chain_events) == 1
     assert chain_events[0]["payload"] == {"issue": 752, "chain_root": [743]}
+
+
+def test_dispatch_skip_blocked_dedupes_with_cross_repo_blocker(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Issue #2005: a foreign blocker is stored repo-qualified, so the snapshot
+    survives the state.json round trip and the next pass stays silent."""
+    from charlie_work import backlog_reachability
+    from charlie_work.github_capabilities.cross_repo_blockers import CrossRepoBlocker
+
+    foreign = CrossRepoBlocker(743, "Senkichi/fresh-eyes")
+    monkeypatch.setattr(
+        backlog_reachability, "get_github_issue_dependencies", lambda gh, number: [foreign]
+    )
+    app = _blocked_app(tmp_path, blocker_body="", open_blockers={foreign})
+
+    for _ in range(3):
+        app.dispatch(limit=10)
+
+    state = load_state(app.paths.state_file)
+    events = _events(state, "dispatch_skip_blocked")
+    assert len(events) == 1
+    assert events[0]["payload"]["blockers"] == ["senkichi/fresh-eyes#743"]
+    assert state["issues"]["752"]["last_skip_blocked_blockers"] == ["senkichi/fresh-eyes#743"]
