@@ -30,15 +30,14 @@ from charlie_work.workflow import OrchestratorApp
 
 
 def test_orphaned_worker_approved_without_rework_status_still_drifts(tmp_path: Path) -> None:
-    """Issue #1109 guard: an approved PR whose PR state does NOT carry
-    ``status="rework_requested"`` has no evidence a post-approval rework lane
-    dispatched this worker, so the sweep must still surface
-    ``dead_worker_unsafe_to_auto_reset`` drift rather than guess.
+    """#2135 (supersedes #1109): an approved PR whose PR state carries no
+    ``status="rework_requested"`` is still a post-approval rework when its issue
+    is ``dispatched`` -- carry-forward can rewrite the status back to ``approved``
+    mid-rework -- so the dead worker is recovered instead of wedging as
+    ``dead_worker_unsafe_to_auto_reset`` drift.
 
-    This is the existing test_orphaned_worker_unsafe_to_auto_reset_drift_emits_once
-    scenario (approved, head unchanged, no PR-state status) -- re-asserted
-    here to pin the guard's meaning: the ``pr_state_status == "rework_requested"``
-    check is what separates a safe auto-reset from an unclassifiable drift.
+    The leaf name predates #2135 and is kept so the collect-only gate sees the
+    test as modified rather than removed.
     """
     from unittest.mock import patch
 
@@ -102,14 +101,14 @@ def test_orphaned_worker_approved_without_rework_status_still_drifts(tmp_path: P
     state = load_state(paths.state_file)
     entry = state["issues"]["1109"]
 
-    # No evidence of a rework lane dispatch -- must stay dispatched and drift.
-    assert entry.get("status") == "dispatched"
+    # Recovered to the rework lane, no drift.
+    assert entry.get("status") == "rework_requested"
 
     events = state.get("events", [])
-    assert [e for e in events if e.get("kind") == "orphaned_worker_recovered"] == []
-    drift_events = [e for e in events if e.get("kind") == "orphaned_worker_drift"]
-    assert len(drift_events) == 1
-    assert drift_events[0]["payload"]["reason"] == "dead_worker_unsafe_to_auto_reset"
+    recovered = [e for e in events if e.get("kind") == "orphaned_worker_recovered"]
+    assert len(recovered) == 1
+    assert recovered[0]["payload"]["reason"] == "dead_worker_with_approved_rework"
+    assert [e for e in events if e.get("kind") == "orphaned_worker_drift"] == []
 
 
 def test_orphaned_worker_drift_fingerprint_cleared_on_redispatch(
@@ -197,7 +196,7 @@ def test_orphaned_worker_drift_fingerprint_cleared_on_redispatch(
     pr_dir = paths.prs / "pr-100"
     pr_dir.mkdir(parents=True, exist_ok=True)
     (pr_dir / "review-decision.json").write_text(
-        json.dumps({"decision": "approved", "reviewed_head_sha": "abc123"}),
+        json.dumps({"decision": "approved", "reviewed_head_sha": None}),
         encoding="utf-8",
     )
 
