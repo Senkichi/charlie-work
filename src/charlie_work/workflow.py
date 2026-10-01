@@ -5739,10 +5739,6 @@ class OrchestratorApp:
     _REWORK_BUDGET_RESET_BY_ESCALATION_REASON = REWORK_BUDGET_RESET_BY_ESCALATION_REASON
     _ISSUE_BUDGET_RESET_BY_ESCALATION_REASON = ISSUE_BUDGET_RESET_BY_ESCALATION_REASON
 
-    # Deliberately NOT @_guard_state_lock: merge_check takes no state lock, and
-    # the guard's contract is to return a *successful* skip (ok=True) when the
-    # lock is held. On an authorization preflight that would be fail-open —
-    # "cannot tell" rendered as "yes". Keep this method lock-free and pure.
     @_guard_state_lock
     def merge_ready(
         self,
