@@ -47,7 +47,7 @@ def _stage(name: str, count: int | None, scale: float, done: bool) -> str:
     if count is None:
         mark = (
             '<span class="stage-n unk">—</span>'
-            '<span class="bar unk"><span class="stage-s">not yet recorded</span></span>'
+            '<span class="bar unk"><span class="stage-s">unknown — rollup not current</span></span>'
         )
     elif count == 0:
         mark = f'<span class="stage-n">{link(href, 0)}</span>{_bar_svg("bar zero", 2.0)}'

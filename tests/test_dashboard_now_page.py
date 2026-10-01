@@ -120,7 +120,7 @@ def test_numbers_link_to_drill_downs_and_done_is_unrecorded(drilldowns: None) ->
     assert 'href="/issue/Senkichi/charlie-work/6"' in html_text
     assert 'href="/flow/in-progress"' in html_text and 'href="/flow/needs-rework"' in html_text
     assert 'href="/repo/Senkichi/swole?view=runners"' in html_text
-    assert "not yet" in html_text and 'class="bar unk"' in html_text
+    assert "rollup not current" in html_text and 'class="bar unk"' in html_text
     done = _page(_model(flow=replace(_model().flow, done_24h=9)))
     assert 'class="bar done"' in done and 'class="stage-n done"' in done
 
