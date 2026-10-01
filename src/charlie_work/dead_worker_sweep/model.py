@@ -96,6 +96,14 @@ class StripAndFlag:
 
 
 @dataclass(frozen=True)
+class CloseVerifiedNoChanges:
+    """Guard a ``verified_no_changes`` claim and, when it holds, close the issue (#2185)."""
+
+    issue: int
+    detail: str
+
+
+@dataclass(frozen=True)
 class ProbeZeroArtifact:
     issue: int
 
@@ -245,6 +253,7 @@ Request = (
     | FetchOpenIssues
     | ResolveFate
     | StripAndFlag
+    | CloseVerifiedNoChanges
     | ProbeZeroArtifact
     | ProbeCrossRepoScope
     | ParkOrReclaim
@@ -304,6 +313,7 @@ class FateResult:
     blocked_reason_kind: str = ""
     blocked_detail: str = ""
     throttled: bool = False  # fate is a provider-throttle death
+    verified_no_changes: bool = False  # fresh outcome declares verified_no_changes (#2185)
     pushed_without_pr: bool = False
     worker_outcome: Mapping[str, Any] | None = None
 
@@ -312,6 +322,13 @@ class FateResult:
 class LabelWrite:
     ok: bool
     removed_labels: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class VerifiedCloseResult:
+    ok: bool
+    removed_labels: tuple[str, ...] = ()
+    reason: str | None = None  # why the claim was refused when ``ok`` is False
 
 
 @dataclass(frozen=True)
