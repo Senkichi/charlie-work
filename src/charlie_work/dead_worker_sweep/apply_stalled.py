@@ -31,7 +31,7 @@ from . import effects_sessions
 from ..config import OrchestratorConfig
 from ..process_utils import find_worker_terminal_status
 from ..worktree import read_worker_outcome
-from ..state import load_state, set_throttled_until, state_lock
+from ..state import load_state, load_state_locked, set_throttled_until, state_lock
 from ..write_gate import WriteGate, require_write_gate
 from .decide_stalled import DEFER_SOURCE, REAP_SOURCE, decide_stalled
 from .stalled_model import (
@@ -73,7 +73,7 @@ def _completed_handoff(
     terminal record from an earlier dispatch, or a stale worktree outcome, does
     not count. Completed means a declared push or a clean (exit 0) terminal.
     """
-    entry = (load_state(state_file).get("issues") or {}).get(str(w.issue_number), {})
+    entry = (load_state_locked(state_file).get("issues") or {}).get(str(w.issue_number), {})
     worktree = Path(w.worktree_path) if w.worktree_path else None
     fate = no_pr_orphan_fate.resolve_no_pr_orphan_fate(
         issue_number=w.issue_number,
