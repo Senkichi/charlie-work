@@ -149,6 +149,8 @@ def stalled_flow(facts: StalledFacts) -> Flow:
     issue = w.issue_number
     entry = {"issue": issue, "pid": w.pid}
 
+    # Intentionally read before the sidecar stamp below (#2114 D): ``over_budget`` only reads
+    # the session's events.jsonl (``worker._api_session_over_budget``), never the stamps.
     adapter = yield ReadAdapterProfile(issue)
     # #1325: sidecar writes are suppressed under dry-run; detection reads only
     # the pre-fetched ``WorkerView`` so skipping them leaves this pass intact.
