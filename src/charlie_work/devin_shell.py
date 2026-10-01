@@ -34,6 +34,7 @@ from typing import Any
 
 from charlie_work import process_utils as _process_utils
 from charlie_work.process_utils import CpuPriority, popen_worker
+from . import launch_events
 from .claude_code import _events_path, _rotate_old_log
 from .config import OrchestratorConfig
 from .devin_failure_classification import (  # noqa: F401 (deliberate re-export; #1442 extraction keeps devin_shell under its mark)
@@ -309,6 +310,27 @@ def launch_devin_session(
             _read_sidecar_inconclusive_count(sessions_dir, issue_number),
         )
 
+    # Issue #2246: every error record produced below emits exactly one
+    # launch_failed event at the seam. State-dir resolution is a pure path
+    # computation -- no event is written on the success path. A reviewer's
+    # ``issue_number`` is really the PR number, so it lands on ``pr_number``.
+    launch_state_path = launch_events.state_path_for(repo_root, config)
+
+    def _emit_launch_failed(
+        error_class: str, error: str, *, failure_kind: str | None = None
+    ) -> None:
+        launch_events.emit_launch_failed(
+            launch_state_path,
+            role="reviewer" if review else "worker",
+            harness="devin-shell",
+            model=worker_model,
+            issue_number=None if review else issue_number,
+            pr_number=issue_number if review else None,
+            error_class=error_class,
+            error=error,
+            failure_kind=failure_kind,
+        )
+
     # --- worktree creation ---------------------------------------------------
     try:
         if review:
@@ -385,6 +407,11 @@ def launch_devin_session(
             else 0,
         )
         _write_json(_sidecar_path(sessions_dir, issue_number), record.to_dict())
+        _emit_launch_failed(
+            launch_events.LAUNCH_ERR_WORKTREE,
+            record.error or "",
+            failure_kind=failure_kind,
+        )
         return record
 
     def _teardown_worktree() -> None:
@@ -402,7 +429,7 @@ def launch_devin_session(
                 repo_root, worktree.path, force=True, branch=None if rework else branch
             )
 
-    def _fail(error: str) -> SessionRecord:
+    def _fail(error: str, *, error_class: str) -> SessionRecord:
         # Shared by the three post-worktree-creation failure paths below
         # (rework-conflict-notice, command-rendering, env-sanitization): each
         # already called _teardown_worktree() and just needs an identically
@@ -423,6 +450,7 @@ def launch_devin_session(
             error=error,
         )
         _write_json(_sidecar_path(sessions_dir, issue_number), record.to_dict())
+        _emit_launch_failed(error_class, error)
         return record
 
     # A redispatch may have just preserved the prior attempt's branch tip
@@ -448,7 +476,10 @@ def launch_devin_session(
             )
         except OSError as exc:
             _teardown_worktree()
-            return _fail(f"failed to append rework conflict notice to prompt file: {exc}")
+            return _fail(
+                f"failed to append rework conflict notice to prompt file: {exc}",
+                error_class=launch_events.LAUNCH_ERR_PROMPT,
+            )
 
     # --- command rendering (prompt_path is caller-supplied, lives outside wt) -
     launch_prompt_path = _write_devin_review_prompt(prompt_path) if review else prompt_path
@@ -462,7 +493,10 @@ def launch_devin_session(
         )
     except (KeyError, IndexError, ValueError) as exc:
         _teardown_worktree()
-        return _fail(f"command template rendering failed: {exc}")
+        return _fail(
+            f"command template rendering failed: {exc}",
+            error_class=launch_events.LAUNCH_ERR_RENDER,
+        )
 
     # Sanitize environment to prevent VIRTUAL_ENV leaks from the orchestrator,
     # then merge user-provided worker_env overrides on top (e.g. PYTEST_XDIST_AUTO_NUM_WORKERS).
@@ -476,7 +510,10 @@ def launch_devin_session(
         sanitized_env = sanitize_env(worktree.path)
     except OSError as exc:
         _teardown_worktree()
-        return _fail(f"failed to prepare worker environment: {exc}")
+        return _fail(
+            f"failed to prepare worker environment: {exc}",
+            error_class=launch_events.LAUNCH_ERR_ENV,
+        )
     worker_env_dict = {
         **sanitized_env,
         **{str(k): str(v) for k, v in (worker_env or {}).items()},
@@ -510,6 +547,7 @@ def launch_devin_session(
     except OSError as exc:
         _teardown_worktree()
         error = f"failed to launch devin: {exc}"
+        _emit_launch_failed(launch_events.LAUNCH_ERR_SPAWN, error)
 
     if pid is not None and error is None:
         # Issue #2052: devin-shell joins the terminal-record contract. The

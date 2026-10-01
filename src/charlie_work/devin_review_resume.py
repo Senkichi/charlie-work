@@ -35,6 +35,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
+from . import launch_events
 from .claude_code import _events_path, _rotate_old_log
 from .devin_review_mode import (
     _review_exec_commands_text,
@@ -140,6 +141,22 @@ def build_resume_command(
     return (*kept, "--resume", session_id, "--prompt-file", str(nudge_path))
 
 
+def _model_from_command(command: tuple[str, ...] | list[str]) -> str:
+    """The ``--model <x>`` / ``--model=<x>`` a recorded launch argv pinned.
+
+    The resumed session must run the same model the original dispatch rendered
+    (for a reviewer, the role-chain's reviewer entry) -- read it back from the
+    sidecar rather than re-deriving it from the live config, which may have
+    changed since dispatch.
+    """
+    for index, token in enumerate(command):
+        if token == "--model" and index + 1 < len(command):
+            return str(command[index + 1])
+        if token.startswith("--model="):
+            return token.split("=", 1)[1]
+    return ""
+
+
 def _commit(app: Any, apply: Callable[[dict[str, Any]], dict[str, Any]]) -> None:
     """Load state under the lock, apply ``apply`` (which appends the event), and save."""
     from . import workflow as _wf  # state_lock is patched on the workflow namespace
@@ -179,7 +196,7 @@ def resume_exec_rejected_review(app: Any, worker: Any, pr_number: int, reviews_d
     attempt = prior + 1
     cached_id = pr_state.get("review_exec_resume_session_id") if same_dispatch else None
 
-    def _fail(reason: str) -> bool:
+    def _fail(reason: str, *, error_class: str | None = None) -> bool:
         _commit(
             app,
             lambda state: app.write_gate.append_event(
@@ -188,6 +205,23 @@ def resume_exec_rejected_review(app: Any, worker: Any, pr_number: int, reviews_d
                 {"pr_number": pr_number, "attempt": attempt, "reason": reason},
             ),
         )
+        # Issue #2246: an error_class marks a resume path that reached the
+        # launch attempt (env prep or Popen) and came back errored -- emit one
+        # launch_failed at this seam. The precondition declines above
+        # (sidecar_unreadable / review_checkout_missing / session_id_unavailable)
+        # never attempted a launch and stay off this event. The model is read
+        # back out of the sidecar's recorded argv -- the role-chain entry the
+        # original dispatch actually rendered (reviewer.model, not worker.model).
+        if error_class is not None:
+            launch_events.emit_launch_failed(
+                app.paths.state_file,
+                role="reviewer",
+                harness="devin-shell",
+                model=_model_from_command(record.command),
+                pr_number=pr_number,
+                error_class=error_class,
+                error=reason,
+            )
         return False
 
     record = next(
@@ -220,7 +254,7 @@ def resume_exec_rejected_review(app: Any, worker: Any, pr_number: int, reviews_d
         worker_env = app._adapter_settings(adapter="devin-shell").worker_env
         env = {**sanitize_env(checkout), **{str(k): str(v) for k, v in worker_env.items()}}
     except OSError as exc:
-        return _fail(f"prepare_failed: {exc}")
+        return _fail(f"prepare_failed: {exc}", error_class=launch_events.LAUNCH_ERR_ENV)
 
     command = build_resume_command(record.command, session_id, nudge_path)
     _write_review_permissions(checkout)
@@ -247,7 +281,7 @@ def resume_exec_rejected_review(app: Any, worker: Any, pr_number: int, reviews_d
                 rotated.rename(log_path)
         except OSError:
             pass
-        return _fail(f"launch_failed: {exc}")
+        return _fail(f"launch_failed: {exc}", error_class=launch_events.LAUNCH_ERR_SPAWN)
 
     pid = process.pid
     start_time = _get_process_start_time(pid)
