@@ -24,7 +24,7 @@ def _priority_calls(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     """
     calls: list[str] = []
     monkeypatch.setattr(
-        cli, "raise_to_normal_priority", lambda *_a, **_k: calls.append("raise"), raising=False
+        cli, "raise_supervisor_to_normal", lambda *_a, **_k: calls.append("raise"), raising=False
     )
     return calls
 

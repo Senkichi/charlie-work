@@ -21,7 +21,9 @@ from pathlib import Path
 
 import psutil
 
+from . import layout
 from .instrumentation import log_event
+from .supervise import supervisor_runtime_paths
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +55,7 @@ def raise_to_normal_priority(state_path: Path | None = None) -> PriorityRaiseRes
         before = int(proc.nice())
         proc.nice(psutil.NORMAL_PRIORITY_CLASS)
         after = int(proc.nice())
-    except (psutil.Error, OSError, ValueError) as exc:
+    except Exception as exc:  # noqa: BLE001 -- contract: never raise; main() dispatch must still start
         logger.warning("could not raise control-plane priority to NORMAL: %s", exc)
         if state_path is not None:
             log_event(
@@ -66,3 +68,11 @@ def raise_to_normal_priority(state_path: Path | None = None) -> PriorityRaiseRes
 
     logger.info("control-plane priority class: %s -> %s", before, after)
     return PriorityRaiseResult(ok=True, before=before, after=after)
+
+
+def raise_supervisor_to_normal() -> PriorityRaiseResult:
+    """Startup hook for the ``fleet supervise`` / ``supervise-loop`` processes.
+
+    Resolves the supervisor's ``state.json`` path itself so callers need only this call.
+    """
+    return raise_to_normal_priority(supervisor_runtime_paths(layout.DEFAULT_STATE_DIR).state_file)

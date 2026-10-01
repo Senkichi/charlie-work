@@ -65,3 +65,28 @@ def test_failure_is_nonfatal_and_emits_warning_event(monkeypatch, tmp_path) -> N
 def test_posix_is_noop(monkeypatch) -> None:
     monkeypatch.setattr(cpp.os, "name", "posix")
     assert cpp.raise_to_normal_priority().ok is True
+
+
+def test_unexpected_exception_type_is_still_nonfatal(monkeypatch, tmp_path) -> None:
+    """The 'never raises' contract holds for non-psutil errors too."""
+    monkeypatch.setattr(cpp.os, "name", "nt")
+
+    def _boom():
+        raise RuntimeError("unexpected")
+
+    monkeypatch.setattr(
+        cpp, "psutil", SimpleNamespace(Process=_boom, NORMAL_PRIORITY_CLASS=NORMAL)
+    )
+    events = []
+    monkeypatch.setattr(cpp, "log_event", lambda *a, **k: events.append((a, k)))
+    result = cpp.raise_to_normal_priority(tmp_path / "state.json")
+    assert result.ok is False
+    assert events and events[0][0][1] == cpp.EVENT_FAILED
+
+
+def test_raise_supervisor_to_normal_resolves_supervisor_state_path(monkeypatch, tmp_path) -> None:
+    seen = []
+    monkeypatch.setattr(cpp, "raise_to_normal_priority", lambda p=None: seen.append(p))
+    monkeypatch.setattr(cpp.layout, "DEFAULT_STATE_DIR", tmp_path)
+    cpp.raise_supervisor_to_normal()
+    assert seen == [cpp.supervisor_runtime_paths(tmp_path).state_file]
