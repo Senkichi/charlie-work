@@ -16,19 +16,7 @@ from charlie_work.github_capabilities.circuit_breaker import (
     GhFailureClass,
     classify_gh_failure,
 )
-
-
-class _FakeClock:
-    """A deterministic, manually-advanced stand-in for time.monotonic."""
-
-    def __init__(self, start: float = 0.0) -> None:
-        self.now = start
-
-    def __call__(self) -> float:
-        return self.now
-
-    def advance(self, seconds: float) -> None:
-        self.now += seconds
+from charlie_work.host.fakes import FakeClock
 
 
 # --- classify_gh_failure -----------------------------------------------------
@@ -169,8 +157,10 @@ def test_non_transport_outcome_resets_the_consecutive_streak() -> None:
 
 
 def test_open_breaker_refuses_calls_until_cooldown_elapses() -> None:
-    clock = _FakeClock(start=100.0)
-    breaker = CircuitBreakerState(failure_threshold=1, cooldown_seconds=30.0, clock=clock)
+    clock = FakeClock(mono=100.0)
+    breaker = CircuitBreakerState(
+        failure_threshold=1, cooldown_seconds=30.0, clock=clock.monotonic
+    )
 
     breaker.record_transport_failure()
     assert breaker.phase == "open"
@@ -189,8 +179,10 @@ def test_open_breaker_refuses_calls_until_cooldown_elapses() -> None:
 
 
 def test_half_open_probe_success_closes_the_breaker() -> None:
-    clock = _FakeClock()
-    breaker = CircuitBreakerState(failure_threshold=1, cooldown_seconds=10.0, clock=clock)
+    clock = FakeClock()
+    breaker = CircuitBreakerState(
+        failure_threshold=1, cooldown_seconds=10.0, clock=clock.monotonic
+    )
 
     breaker.record_transport_failure()
     clock.advance(10.0)
@@ -203,8 +195,10 @@ def test_half_open_probe_success_closes_the_breaker() -> None:
 
 
 def test_half_open_probe_failure_reopens_and_restarts_cooldown() -> None:
-    clock = _FakeClock()
-    breaker = CircuitBreakerState(failure_threshold=1, cooldown_seconds=10.0, clock=clock)
+    clock = FakeClock()
+    breaker = CircuitBreakerState(
+        failure_threshold=1, cooldown_seconds=10.0, clock=clock.monotonic
+    )
 
     breaker.record_transport_failure()
     clock.advance(10.0)

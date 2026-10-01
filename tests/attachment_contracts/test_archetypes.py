@@ -190,7 +190,7 @@ class Vector:
 """
 
 FAKE_DOUBLE_SRC = """
-class FakeClock:
+class FakeTimer:
     def now(self):
         ...
     def advance(self, seconds):
@@ -247,7 +247,7 @@ def test_dataclass_with_real_method_not_flagged() -> None:
 
 def test_fake_double_flagged_structurally_trivial() -> None:
     point = scan_source(FAKE_DOUBLE_SRC, "tests/test_x.py")[0]
-    assert point.identity == "FakeClock"
+    assert point.identity == "FakeTimer"
     assert point.is_structurally_trivial is True
 
 

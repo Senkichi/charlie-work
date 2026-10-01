@@ -10,8 +10,9 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from _supervise_fixtures import FakeApp, FakeClock, _active_result, _drained_result
+from _supervise_fixtures import FakeApp, _active_result, _drained_result
 from charlie_work.config import SupervisorConfig
+from charlie_work.host.fakes import FakeClock
 from charlie_work.instrumentation import query_events
 from charlie_work.supervise import run_supervised, try_acquire_supervisor_lock
 from charlie_work.workflow import CommandResult
@@ -60,7 +61,7 @@ def test_run_supervised_exits_with_launch_failure_sidecar(tmp_path: Path) -> Non
     result = run_supervised(
         app,
         sleep=FakeClock().sleep,
-        clock=FakeClock().now,
+        clock=FakeClock().monotonic,
         max_passes=2,
     )
     assert result.ok is True
@@ -77,7 +78,7 @@ def test_pass_summary_reports_zero_merged_for_all_failed_attempts(
     """
     app = FakeApp(tmp_path, [_active_result(merge_failed=3, open_prs=3)])
     fc = FakeClock(auto_advance=1.0)
-    run_supervised(app, clock=fc.now, sleep=fc.sleep, max_passes=1)
+    run_supervised(app, clock=fc.monotonic, sleep=fc.sleep, max_passes=1)
 
     out = capsys.readouterr().out
     assert "merged 0/3" in out
@@ -93,7 +94,7 @@ def test_pass_summary_reports_plain_count_when_all_attempts_succeed(
     """
     app = FakeApp(tmp_path, [_active_result(merged=2)])
     fc = FakeClock(auto_advance=1.0)
-    run_supervised(app, clock=fc.now, sleep=fc.sleep, max_passes=1)
+    run_supervised(app, clock=fc.monotonic, sleep=fc.sleep, max_passes=1)
 
     out = capsys.readouterr().out
     assert "merged 2" in out
@@ -107,7 +108,7 @@ def test_pass_summary_reports_warnings_count(tmp_path: Path, capsys: Any) -> Non
         [_active_result(warnings=["PR #456 approved but unmergeable for 3 passes"])],
     )
     fc = FakeClock(auto_advance=1.0)
-    run_supervised(app, clock=fc.now, sleep=fc.sleep, max_passes=1)
+    run_supervised(app, clock=fc.monotonic, sleep=fc.sleep, max_passes=1)
 
     out = capsys.readouterr().out
     assert "warnings 1" in out
@@ -120,7 +121,7 @@ def test_run_supervised_ensures_labels_once_at_startup(tmp_path: Path) -> None:
     """
     app = FakeApp(tmp_path, [_drained_result(), _drained_result()])
     fc = FakeClock()
-    run_supervised(app, clock=fc.now, sleep=fc.sleep, max_passes=2)
+    run_supervised(app, clock=fc.monotonic, sleep=fc.sleep, max_passes=2)
 
     assert app.ensure_labels_calls == 1
 
@@ -138,7 +139,7 @@ def test_run_supervised_ensure_labels_failure_does_not_block(tmp_path: Path) -> 
     fc = FakeClock()
 
     # Must not raise; the supervisor proceeds to its loop.
-    result = run_supervised(app, clock=fc.now, sleep=fc.sleep, max_passes=1)
+    result = run_supervised(app, clock=fc.monotonic, sleep=fc.sleep, max_passes=1)
     assert result.ok is True
     # The ensure was actually invoked (not skipped), and its failure was caught.
     assert ensure_calls == [1], ensure_calls
@@ -150,7 +151,7 @@ def test_run_supervised_exits_when_drained_first_pass(tmp_path: Path) -> None:
     fc = FakeClock()
     result = run_supervised(
         app,
-        clock=fc.now,
+        clock=fc.monotonic,
         sleep=fc.sleep,
         max_passes=5,
     )
@@ -175,7 +176,7 @@ def test_run_supervised_records_ci_fleet_provenance(tmp_path: Path) -> None:
     """
     app = FakeApp(tmp_path, [_drained_result()])
     fc = FakeClock()
-    result = run_supervised(app, clock=fc.now, sleep=fc.sleep, max_passes=1)
+    result = run_supervised(app, clock=fc.monotonic, sleep=fc.sleep, max_passes=1)
     assert result.ok is True
 
     rows = query_events(app.paths.state_file, kind="ci_fleet_provenance")
@@ -246,7 +247,7 @@ def test_run_supervised_infill_freed_slot_triggers_prompt_pass(tmp_path: Path) -
 
     result = run_supervised(
         app,
-        clock=fc.now,
+        clock=fc.monotonic,
         sleep=sleeping,
         max_passes=2,
     )
@@ -303,7 +304,7 @@ def test_run_supervised_verdict_file_triggers_pass_while_live_zero(tmp_path: Pat
 
     result = run_supervised(
         app,
-        clock=fc.now,
+        clock=fc.monotonic,
         sleep=sleeping,
         max_passes=2,
     )
@@ -337,7 +338,7 @@ def test_run_supervised_fallback_timer_fires_with_no_delta(tmp_path: Path) -> No
     results = [_active_result(open_prs=1), _drained_result()]
     app = FakeApp(tmp_path, results, supervisor_cfg=cfg)
 
-    fc = FakeClock(start=0.0, auto_advance=0.0)
+    fc = FakeClock(mono=0.0, auto_advance=0.0)
 
     def sleeping(seconds: float) -> None:
         fc.sleep(seconds)
@@ -348,7 +349,7 @@ def test_run_supervised_fallback_timer_fires_with_no_delta(tmp_path: Path) -> No
 
     result = run_supervised(
         app,
-        clock=fc.now,
+        clock=fc.monotonic,
         sleep=sleeping,
         max_passes=5,
     )
@@ -372,7 +373,7 @@ def test_run_supervised_active_cooldown_sleep_after_dispatch(tmp_path: Path) -> 
     fc = FakeClock(auto_advance=1.0)
     result = run_supervised(
         app,
-        clock=fc.now,
+        clock=fc.monotonic,
         sleep=fc.sleep,
         max_passes=5,
     )
@@ -395,7 +396,7 @@ def test_run_supervised_poll_interval_sleep_when_idle(tmp_path: Path) -> None:
     fc = FakeClock(auto_advance=1.0)
     result = run_supervised(
         app,
-        clock=fc.now,
+        clock=fc.monotonic,
         sleep=fc.sleep,
         max_passes=5,
     )
@@ -412,7 +413,7 @@ def test_run_supervised_max_passes_exits(tmp_path: Path) -> None:
     fc = FakeClock(auto_advance=1.0)
     result = run_supervised(
         app,
-        clock=fc.now,
+        clock=fc.monotonic,
         sleep=fc.sleep,
         max_passes=3,
     )
@@ -426,10 +427,10 @@ def test_run_supervised_max_runtime_exits(tmp_path: Path) -> None:
     app = FakeApp(tmp_path, results)
 
     # Clock advances 70 seconds per sleep call (= >1 minute)
-    fc = FakeClock(start=0.0, auto_advance=70.0)
+    fc = FakeClock(mono=0.0, auto_advance=70.0)
     result = run_supervised(
         app,
-        clock=fc.now,
+        clock=fc.monotonic,
         sleep=fc.sleep,
         max_runtime_override=1,  # 1 minute
         max_passes=100,
@@ -454,7 +455,7 @@ def test_run_supervised_keyboard_interrupt_returns_ok(tmp_path: Path) -> None:
     fc = FakeClock(auto_advance=1.0)
     result = run_supervised(
         app,
-        clock=fc.now,
+        clock=fc.monotonic,
         sleep=fc.sleep,
         max_passes=10,
     )
@@ -481,7 +482,7 @@ def test_run_supervised_exception_returns_ok_false_and_releases_lock(tmp_path: P
     fc = FakeClock(auto_advance=1.0)
     result = run_supervised(
         app,
-        clock=fc.now,
+        clock=fc.monotonic,
         sleep=fc.sleep,
         max_passes=10,
     )
@@ -536,7 +537,7 @@ def test_run_supervised_lock_released_after_run(tmp_path: Path) -> None:
     """After run_supervised finishes, the lock is released (second call succeeds)."""
     app = FakeApp(tmp_path, [_drained_result()])
     fc = FakeClock(auto_advance=0.0)
-    result1 = run_supervised(app, clock=fc.now, sleep=fc.sleep, max_passes=5)
+    result1 = run_supervised(app, clock=fc.monotonic, sleep=fc.sleep, max_passes=5)
     assert result1.ok is True
 
     # Should be able to acquire again after first run
@@ -567,7 +568,7 @@ def test_run_supervised_summary_uses_fleet_live_count(tmp_path: Path, capfd: Any
     )
     app = FakeApp(tmp_path, [result])
     fc = FakeClock(auto_advance=0.0)
-    run_supervised(app, clock=fc.now, sleep=fc.sleep, max_passes=1)
+    run_supervised(app, clock=fc.monotonic, sleep=fc.sleep, max_passes=1)
 
     out = capfd.readouterr().out
     assert "live ~2" in out, "summary should report fleet-wide live count"

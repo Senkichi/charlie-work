@@ -13,13 +13,29 @@ from typing import Any
 
 
 class FakeClock:
-    """Deterministic clock; ``advance`` moves both ``now`` and ``monotonic``."""
+    """Deterministic clock; ``advance`` moves both ``now`` and ``monotonic``.
 
-    def __init__(self, start: datetime, mono: float = 0.0) -> None:
+    ``start`` defaults to the Unix epoch for tests that only exercise the
+    monotonic side. ``sleep`` doubles the injectable ``sleep`` callable of the
+    supervisor loops: it appends the requested duration to ``sleep_calls`` and
+    advances the clock by ``auto_advance`` per call when that is nonzero, else
+    by the slept seconds.
+    """
+
+    def __init__(
+        self,
+        start: datetime | None = None,
+        mono: float = 0.0,
+        auto_advance: float = 0.0,
+    ) -> None:
+        if start is None:
+            start = datetime(1970, 1, 1, tzinfo=UTC)
         if start.tzinfo is None:
             start = start.replace(tzinfo=UTC)
         self._now = start
         self._mono = mono
+        self._auto_advance = auto_advance
+        self.sleep_calls: list[float] = []
 
     def now(self) -> datetime:
         return self._now
@@ -30,6 +46,10 @@ class FakeClock:
     def advance(self, seconds: float) -> None:
         self._now = self._now + timedelta(seconds=seconds)
         self._mono += seconds
+
+    def sleep(self, seconds: float) -> None:
+        self.sleep_calls.append(seconds)
+        self.advance(self._auto_advance if self._auto_advance else seconds)
 
 
 class FakeProcessProbe:
