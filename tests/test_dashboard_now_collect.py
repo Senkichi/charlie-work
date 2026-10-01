@@ -8,11 +8,9 @@ build a fleet with the real writers (``touch_repo``, ``log_event``, ``record_loo
 
 from __future__ import annotations
 
-import importlib.util
 import json
 import os
 import subprocess
-import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -273,27 +271,15 @@ def test_p90_is_nearest_rank() -> None:
     assert now_cadence.p90([1.0] * 9) is None
 
 
-def test_supervisor_rule_matches_heartbeat_check_script() -> None:
-    """One rule, two implementations until PR #2239's alarm leaf lands: pin them together."""
-    spec = importlib.util.spec_from_file_location(
-        "heartbeat_check_pin", REPO_ROOT / "scripts" / "heartbeat_check.py"
+def test_supervisor_rule_comes_from_the_shared_alarm_leaf() -> None:
+    """The dashboard and heartbeat_check share one rule: no local copy of the numbers."""
+    from charlie_work import heartbeat_alarms_fleet as leaf
+
+    assert now_cadence.SUPERVISOR_HEARTBEAT_STALE_MULTIPLIER is (
+        leaf.SUPERVISOR_HEARTBEAT_STALE_MULTIPLIER
     )
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module  # the script binds itself via sys.modules[__name__]
-    try:
-        spec.loader.exec_module(module)
-    except ImportError:
-        pytest.skip("heartbeat_check dependencies unavailable")
-    finally:
-        sys.modules.pop(spec.name, None)
-    assert (
-        now_cadence.SUPERVISOR_HEARTBEAT_STALE_MULTIPLIER
-        == module.SUPERVISOR_HEARTBEAT_STALE_MULTIPLIER
-    )
-    assert (
-        now_cadence.SUPERVISOR_HEARTBEAT_DEFAULT_PASS_TIMEOUT_SECONDS
-        == module.SUPERVISOR_HEARTBEAT_DEFAULT_PASS_TIMEOUT_SECONDS
+    assert now_cadence.SUPERVISOR_HEARTBEAT_DEFAULT_PASS_TIMEOUT_SECONDS is (
+        leaf.SUPERVISOR_HEARTBEAT_DEFAULT_PASS_TIMEOUT_SECONDS
     )
     assert (
         now_cadence.supervisor_beat_threshold_seconds({"max_pass_runtime_seconds": 1800}) == 3600
