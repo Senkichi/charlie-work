@@ -60,6 +60,7 @@ from .github import (
     parse_blockers,
 )
 from .issue_linking import linked_issue_number
+from .pr_body_closing_autofix_flow import autofix_body_closing_kw
 from .pr_unlinked_visibility import summarize_unlinked_prs
 
 # LOAD-BEARING RE-EXPORT -- NOT AN UNUSED IMPORT. Do not delete; the `noqa`
@@ -3552,6 +3553,9 @@ class OrchestratorApp:
                     },
                 )
 
+            autofixed = autofix_body_closing_kw(self, pr, issue_number, verdict, checks)
+            if autofixed is not None:  # #2108: body-only Lint failure, workers can't edit it
+                return autofixed
             # Flake-aware debounce (issue #391): if the only blocker is a failed
             # required check and we have not yet retried the Actions run for this
             # head, trigger one automatic `gh run rerun --failed` and defer rework
