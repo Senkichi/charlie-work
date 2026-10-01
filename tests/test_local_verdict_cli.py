@@ -2,7 +2,8 @@
 
 ``record_review`` reads the PR through ``gh.pr_view``; ``LocalFileGitHub``
 returned ``{}``, so ``_write_rework_prompt`` raised ``KeyError: 'number'``.
-The fix is at the seam: ``pr_view`` returns the ``gh pr view`` shape.
+The fix routes ``record_review`` to ``record_local_review`` on a backend that
+publishes no pull requests (the #1844 pattern), so it never reads ``pr_view``.
 """
 
 from __future__ import annotations
@@ -20,11 +21,28 @@ from _local_lane_fixtures import (
     new_repo_root,
 )
 from charlie_work import cli
+from charlie_work.state import load_state
 
 
 @pytest.fixture
 def repo() -> Path:
     return new_repo_root()
+
+
+def _verdict_args(pr: int, head: str, summary_file: Path):
+    return cli.build_parser().parse_args(
+        [
+            "verdict",
+            "--pr",
+            str(pr),
+            "--decision",
+            "request_changes",
+            "--reviewed-head",
+            head,
+            "--summary-file",
+            str(summary_file),
+        ]
+    )
 
 
 def test_verdict_request_changes_writes_rework_prompt(repo: Path, tmp_path: Path) -> None:
@@ -60,16 +78,39 @@ def test_verdict_request_changes_writes_rework_prompt(repo: Path, tmp_path: Path
     assert decision["decision"] == "request_changes"
 
 
-def test_pr_view_shape_and_absent_issue(repo: Path) -> None:
+def test_verdict_on_merged_local_record_is_refused(repo: Path, tmp_path: Path) -> None:
     _init_repo(repo)
     issues_dir = repo / "docs" / "issues"
     head = _make_branch(repo, "agent/issue-7-x", "a.py", "a = 1\n")
     app = _app(repo, issues_dir)
     _parked_issue(app, issues_dir, 7, "agent/issue-7-x")
+    app._local_review_packets()
+    state = load_state(app.paths.state_file)
+    state["prs"]["7"]["status"] = "merged"
+    app.write_gate.save_state(state)
+    summary_file = tmp_path / "f.md"
+    summary_file.write_text("Add a test.\n", encoding="utf-8")
 
-    pr = app.gh.pr_view(7)
+    decision_path = app.paths.prs / "pr-7" / "review-decision.json"
+    before = decision_path.read_bytes()  # the pending decision the packet pass wrote
 
-    assert pr["number"] == 7
-    assert pr["headRefName"] == "agent/issue-7-x"
-    assert pr["headRefOid"] == head
-    assert app.gh.pr_view(999) == {}
+    result = cli.run_command(app, _verdict_args(7, head, summary_file))
+
+    assert not result.ok
+    assert result.data.get("terminal") is True
+    assert decision_path.read_bytes() == before
+
+
+def test_verdict_without_lane_record_does_not_mint_pr_record(repo: Path, tmp_path: Path) -> None:
+    _init_repo(repo)
+    issues_dir = repo / "docs" / "issues"
+    head = _make_branch(repo, "agent/issue-7-x", "a.py", "a = 1\n")
+    app = _app(repo, issues_dir)
+    _parked_issue(app, issues_dir, 7, "agent/issue-7-x")  # parked, no lane record yet
+    summary_file = tmp_path / "f.md"
+    summary_file.write_text("Add a test.\n", encoding="utf-8")
+
+    result = cli.run_command(app, _verdict_args(7, head, summary_file))
+
+    assert not result.ok
+    assert "7" not in (load_state(app.paths.state_file).get("prs") or {})
