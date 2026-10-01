@@ -1434,6 +1434,13 @@ class RuntimeConfig:
     # few hundred KB of JSON and preserves far more diagnostic history when a
     # single sweep emits repetitive events. Tuned via config (issue #525).
     event_ring_size: Annotated[int, Typed, AtLeastOne] = 2000
+    # Issue #2195: directories (relative paths resolve against the repo root)
+    # holding interactive operator session worktrees -- Claude Code puts them
+    # under ``.claude/worktrees``. Foreign-checkout adoption refuses any
+    # worktree that resolves under one: an interactive session writes no
+    # ``.charlie-writer.json`` marker, so the marker gate cannot see it. On by
+    # default; set to ``[]`` to restore marker-only adoption gating.
+    operator_worktree_roots: Annotated[tuple[str, ...], Typed, NotNull] = (".claude/worktrees",)
     # Extra safety margin added to provider-reported rate-limit reset times
     # when computing the ``throttled_until`` defer deadline. Provider reset
     # estimates are floors, not guarantees; dispatching at T+0 races the
