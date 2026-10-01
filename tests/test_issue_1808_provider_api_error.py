@@ -19,6 +19,14 @@ from charlie_work.workflow import _detect_and_handle_stalled_reviews
 from charlie_work.write_gate import WriteGate
 
 from _helpers import _init_git_repo
+from _local_lane_fixtures import (
+    _app,
+    _init_repo,
+    _make_branch,
+    _parked_issue,
+    new_repo_root,
+)
+from _review_fixtures import _PR_NUMBER, _round_archive_app
 
 PR = 100
 
@@ -161,12 +169,54 @@ def test_streak_resets_on_a_definitive_non_api_death(tmp_path: Path) -> None:
     assert state["prs"][str(PR)]["review_api_error_streak"] == 0
 
 
-def test_streak_is_cleared_by_unescalate_and_recorded_verdict() -> None:
+def test_streak_is_cleared_by_unescalate() -> None:
     assert "review_api_error_streak" in UNESCALATE_PR_RESET_FIELDS
-    src = (
-        Path(__file__).parents[1] / "src/charlie_work/orchestration/state_record_review.py"
-    ).read_text(encoding="utf-8")
-    assert '"review_api_error_streak": 0' in src
+
+
+def _seed_streak(state_file: Path, pr_number: int, streak: int) -> None:
+    with state_lock(state_file):
+        state = load_state(state_file)
+        prior = state["prs"].get(str(pr_number), {})
+        state["prs"][str(pr_number)] = {
+            **prior,
+            "number": pr_number,
+            "review_api_error_streak": streak,
+        }
+        save_state(state_file, state)
+
+
+def test_record_review_clears_api_error_streak(tmp_path: Path) -> None:
+    """A recorded remote-lane verdict proves the provider is healthy."""
+    app, paths = _round_archive_app(tmp_path)
+    _seed_streak(paths.state_file, _PR_NUMBER, 2)
+    assert load_state(paths.state_file)["prs"][str(_PR_NUMBER)]["review_api_error_streak"] == 2
+    result = app.record_review(
+        _PR_NUMBER, "approved", summary="lgtm", verdict_provenance="fresh_llm_review"
+    )
+    assert result.ok, result.message
+    assert load_state(paths.state_file)["prs"][str(_PR_NUMBER)]["review_api_error_streak"] == 0
+
+
+def test_record_local_review_clears_api_error_streak() -> None:
+    """Same invariant for the local lane (``record_local_review``)."""
+    repo = new_repo_root()
+    _init_repo(repo)
+    issues_dir = repo / "docs" / "issues"
+    head = _make_branch(repo, "agent/issue-7-x", "a.py", "a = 1\n")
+    app = _app(repo, issues_dir)
+    _parked_issue(app, issues_dir, 7, "agent/issue-7-x")
+    app._local_review_packets()
+    _seed_streak(app.paths.state_file, 7, 2)
+    assert load_state(app.paths.state_file)["prs"]["7"]["review_api_error_streak"] == 2
+    verdict = app.record_local_review(
+        7,
+        "approved",
+        summary="lgtm",
+        reviewed_head=head,
+        verdict_provenance="fresh_llm_review",
+    )
+    assert verdict.ok, verdict.message
+    assert load_state(app.paths.state_file)["prs"]["7"]["review_api_error_streak"] == 0
 
 
 def test_zero_disables_rollback(tmp_path: Path) -> None:
