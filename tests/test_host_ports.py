@@ -136,3 +136,9 @@ def test_real_session_counter_late_binds_to_existing_patch_targets(monkeypatch) 
     assert REAL.sessions.fleet_live_workers(None) == (12, [])
     assert REAL.sessions.fleet_live_reviews(None) == (13, [])
     assert REAL.sessions.live_reviews(Path("."), None) == 14
+
+
+def test_command_result_reexport_is_identity() -> None:
+    from charlie_work import command_result, workflow
+
+    assert workflow.CommandResult is command_result.CommandResult

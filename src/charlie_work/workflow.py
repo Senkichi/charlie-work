@@ -118,6 +118,7 @@ from .worktree import (
     write_worktree_marker,  # noqa: F401  (deliberate re-export; used by moved L01 b4 delegates via _wf.)
 )
 from . import state as _state
+from .command_result import CommandResult  # noqa: F401  deliberate re-export
 from .unescalate_reset_fields import (
     ISSUE_BUDGET_RESET_BY_ESCALATION_REASON,
     REWORK_BUDGET_RESET_BY_ESCALATION_REASON,
@@ -777,13 +778,6 @@ def _slim_pr_json(pr: dict[str, Any]) -> dict[str, Any]:
     reads the diff from ``diff.patch`` and checks from ``checks.json``.
     """
     return {k: v for k, v in pr.items() if k in _PR_SLIM_FIELDS}
-
-
-@dataclass(frozen=True)
-class CommandResult:
-    ok: bool
-    message: str
-    data: dict[str, Any]
 
 
 def _state_lock_busy_result(message: str, **extra: Any) -> CommandResult:

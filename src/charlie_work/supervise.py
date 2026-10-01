@@ -29,6 +29,7 @@ from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, Callable, Sequence
 
 from . import fleet_registry, git_pull_blockers, layout, worktree
+from .command_result import CommandResult
 from .config import WORKER_OUTCOME_FILENAME
 from .file_lock import ByteRangeFileLock, try_acquire_byte_range_lock
 from .git_retry import RetryOutcome, run_git_with_retry
@@ -57,7 +58,7 @@ from .pending_sync import (  # noqa: F401  (deliberate re-export)
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from .workflow import CommandResult, OrchestratorApp
+    from .workflow import OrchestratorApp
 
 
 # ---------------------------------------------------------------------------
@@ -1656,9 +1657,6 @@ def run_supervised(
     Returns ``CommandResult(ok=True)`` on clean drain or KeyboardInterrupt.
     Returns ``CommandResult(ok=False, ...)`` when the supervisor lock is held.
     """
-    # Import here to avoid circular imports (supervise ← workflow ← supervise)
-    from .workflow import CommandResult
-
     # Same interpreter-anchored refusal as run_fleet_supervise: a repointed
     # editable means everything below runs unreviewed code (issue #974).
     from .venv_anchor import verify_interpreter_anchored_editables
