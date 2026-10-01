@@ -38,9 +38,16 @@ from typing import Callable, Protocol
 from ..api_budget import GitHubRateBudget, observe_github_rate
 from ..instrumentation import log_event
 from ..pass_deadline import raise_if_pass_deadline_spent
+from ..transient_errors import is_transient_network_error
+from .failure_markers import is_pre_connection_text, is_transport_class_text
 from .gh_adapter import render_argv
-from .outcome import FailureKind, Outcome, Response, TransportFailure
+from .legacy_argv import LegacyCli
+from .outcome import FailureKind, Outcome, Response, TransportFailure, render_legacy_error
 from .request import CliCommand, CliRequest, Request, RestRequest
+
+# What the guard accepts: the typed requests plus the transitional verbatim
+# ``gh`` passthrough (``LegacyCli``), which is deleted with ``GitHub.run``.
+AnyRequest = Request | LegacyCli
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +78,7 @@ _BREAKER_KINDS = frozenset(
 class Adapter(Protocol):
     name: str
 
-    def send(self, request: Request, *, token: str | None, timeout: float) -> Outcome: ...
+    def send(self, request: AnyRequest, *, token: str | None, timeout: float) -> Outcome: ...
 
 
 class GitHubTransport(Protocol):
@@ -158,13 +165,26 @@ def is_retryable(outcome: Outcome, *, is_mutation: bool) -> bool:
         if outcome.kind in (FailureKind.SENT_NO_RESPONSE, FailureKind.TIMEOUT):
             return not is_mutation  # a mutation may already have landed
         return False
+    if outcome.status == 0:
+        # Text-classified (legacy gh prose): a mutation only retries on
+        # failures that provably happened before the request was sent.
+        text = render_legacy_error(outcome)
+        return response_is_transient(outcome) and (not is_mutation or is_pre_connection_text(text))
     if is_mutation:
         return False
     return response_is_transient(outcome)
 
 
 def response_is_transient(response: Response) -> bool:
+    if response.status == 0:
+        # A gh-local failure (LegacyCli / CliRequest): only prose to go on.
+        return is_transient_network_error(render_legacy_error(response))
     return response.status in _RETRYABLE_STATUSES or _is_rate_limited(response)
+
+
+def _response_is_transport_class(response: Response) -> bool:
+    """A gh-local failure whose prose says no response ever reached gh."""
+    return response.status == 0 and is_transport_class_text(render_legacy_error(response))
 
 
 class GuardedTransport:
@@ -205,6 +225,11 @@ class GuardedTransport:
     def _kill_switch(self) -> bool:
         return self._runtime is not None and self._runtime.gh_transport == "gh"
 
+    @property
+    def kill_switch(self) -> bool:
+        """True while ``runtime.gh_transport`` routes every request to gh."""
+        return self._kill_switch()
+
     def _max_retries(self) -> int:
         return self._runtime.gh_max_retries if self._runtime else _DEFAULT_MAX_RETRIES
 
@@ -212,7 +237,7 @@ class GuardedTransport:
         rt = self._runtime
         return rt.gh_retry_base_seconds if rt else _DEFAULT_RETRY_BASE_SECONDS
 
-    def _timeout(self, request: Request) -> float:
+    def _timeout(self, request: AnyRequest) -> float:
         long_call = getattr(request, "long_call", False)
         if long_call:
             rt = self._runtime
@@ -230,7 +255,7 @@ class GuardedTransport:
 
     # -- the stack -----------------------------------------------------------
 
-    def send(self, request: Request) -> Outcome:
+    def send(self, request: AnyRequest) -> Outcome:
         resolved = self._fill_placeholders(request)
         if isinstance(resolved, TransportFailure):
             return resolved
@@ -272,7 +297,7 @@ class GuardedTransport:
         self._note_breaker(outcome)
         return outcome
 
-    def _fill_placeholders(self, request: Request) -> Request | TransportFailure:
+    def _fill_placeholders(self, request: AnyRequest) -> AnyRequest | TransportFailure:
         if not isinstance(request, RestRequest) or not request.needs_repo:
             return request
         if self._resolve_owner_repo is None:
@@ -289,9 +314,9 @@ class GuardedTransport:
 
     # -- one attempt ---------------------------------------------------------
 
-    def _attempt(self, request: Request) -> Outcome:
+    def _attempt(self, request: AnyRequest) -> Outcome:
         timeout = self._timeout(request)
-        if isinstance(request, CliRequest) or self._kill_switch():
+        if isinstance(request, (CliRequest, LegacyCli)) or self._kill_switch():
             return self._adapters.gh.send(request, token=None, timeout=timeout)
         outcome = self._send_http(request, timeout)
         if isinstance(outcome, TransportFailure) and outcome.kind in FALLBACK_KINDS:
@@ -348,7 +373,11 @@ class GuardedTransport:
         breaker = self._breaker
         if breaker is None:
             return
-        counts = isinstance(outcome, TransportFailure) and outcome.kind in _BREAKER_KINDS
+        counts = (
+            outcome.kind in _BREAKER_KINDS
+            if isinstance(outcome, TransportFailure)
+            else _response_is_transport_class(outcome)
+        )
         with self._breaker_lock:
             transition = breaker.record_transport_failure() if counts else breaker.record_success()
             payload = {
@@ -373,6 +402,7 @@ class GuardedTransport:
 __all__ = [
     "Adapter",
     "Adapters",
+    "AnyRequest",
     "BreakerPort",
     "FALLBACK_KINDS",
     "GitHubTransport",

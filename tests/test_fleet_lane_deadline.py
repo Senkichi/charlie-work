@@ -86,7 +86,7 @@ def test_gh_run_refuses_call_when_pass_deadline_exceeded(
     set_pass_deadline_exceeded(gh, lambda: True)
 
     spawn = MagicMock()
-    monkeypatch.setattr(github_module, "run_gh_command", spawn)
+    monkeypatch.setattr(github_module.subprocess, "run", spawn)
 
     with pytest.raises(PassDeadlineExceeded, match="in-pass deadline"):
         gh.run(["api", "rate_limit"], allow_failure=True)
@@ -120,7 +120,7 @@ def test_gh_run_unarmed_deadline_is_inert(monkeypatch: pytest.MonkeyPatch, tmp_p
     """No armed hook (every non-fleet caller) means zero behavior change."""
     gh = GitHub(tmp_path)
     spawn = MagicMock(return_value=subprocess.CompletedProcess([], 0, "ok-out", ""))
-    monkeypatch.setattr(github_module, "run_gh_command", spawn)
+    monkeypatch.setattr(github_module.subprocess, "run", spawn)
 
     assert gh.run(["api", "rate_limit"]) == "ok-out"
     spawn.assert_called_once()
@@ -147,7 +147,7 @@ def test_gh_run_aborts_retry_chain_at_deadline(
 
     spawn = MagicMock(side_effect=subprocess.TimeoutExpired(cmd="gh api rate_limit", timeout=30))
     sleeps: list[float] = []
-    monkeypatch.setattr(github_module, "run_gh_command", spawn)
+    monkeypatch.setattr(github_module.subprocess, "run", spawn)
     monkeypatch.setattr(github_module.time, "sleep", lambda seconds: sleeps.append(seconds))
 
     with pytest.raises(PassDeadlineExceeded, match="in-pass deadline"):
@@ -185,7 +185,7 @@ def test_gh_run_checks_deadline_before_transient_retry_backoff(
         )
     )
     sleeps: list[float] = []
-    monkeypatch.setattr(github_module, "run_gh_command", spawn)
+    monkeypatch.setattr(github_module.subprocess, "run", spawn)
     monkeypatch.setattr(github_module.time, "sleep", lambda seconds: sleeps.append(seconds))
 
     with pytest.raises(PassDeadlineExceeded, match="in-pass deadline"):

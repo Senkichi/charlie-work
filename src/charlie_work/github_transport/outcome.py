@@ -32,7 +32,8 @@ class Response:
     body: str
     adapter: Literal["http", "gh", "dry_run"]
     graphql_errors: tuple[GraphQLError, ...] = ()
-    returncode: int | None = None  # only set for CliRequest results
+    returncode: int | None = None  # only set for gh-local (CliRequest / LegacyCli) results
+    stderr: str = ""  # only set for LegacyCli results (raw process stderr)
 
     def header(self, name: str) -> str | None:
         wanted = name.lower()
@@ -147,8 +148,10 @@ def render_legacy_error(outcome: Outcome) -> str:
     if isinstance(outcome, Response):
         if outcome.graphql_errors:
             return render_graphql_errors(outcome.graphql_errors)
-        if outcome.status == 0:  # gh-local command failure: body carries its stderr
-            return outcome.body.strip() or f"gh exited {outcome.returncode}"
+        if outcome.status == 0:  # gh-local command failure: stderr, else the body
+            return (
+                outcome.stderr.strip() or outcome.body.strip() or f"gh exited {outcome.returncode}"
+            )
         if 200 <= outcome.status < 300:
             return ""
         return f"gh: {extract_message(outcome.status, outcome.body)} (HTTP {outcome.status})"

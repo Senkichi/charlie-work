@@ -151,3 +151,16 @@ def record_response(cache_path: Path, path: str, *, etag: str, status: int, body
 
 
 __all__ = ["CachedResponse", "get_cached", "load_cache", "record_response"]
+
+
+class FileEtagCache:
+    """The transport's ``EtagCache`` port over the on-disk conditional-GET file."""
+
+    def __init__(self, cache_path: Path) -> None:
+        self._cache_path = cache_path
+
+    def get(self, path: str) -> CachedResponse | None:
+        return get_cached(self._cache_path, path)
+
+    def record(self, path: str, *, etag: str, status: int, body: str) -> None:
+        record_response(self._cache_path, path, etag=etag, status=status, body=body)

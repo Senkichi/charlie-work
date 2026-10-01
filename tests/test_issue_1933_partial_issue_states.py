@@ -49,6 +49,7 @@ import pytest
 from charlie_work.config import RuntimeConfig
 from charlie_work.github import GitHub, GitHubError, GitHubRunResult
 from charlie_work.github_capabilities import http_transport
+from charlie_work.github_transport import http_adapter
 
 
 class _FakeResponse:
@@ -67,6 +68,9 @@ class _FakeResponse:
 class _FakeConnection:
     def __init__(self, responses: list):
         self._responses = list(responses)
+
+    def connect(self):
+        pass
 
     def request(self, method, url, body=None, headers=None):
         pass
@@ -533,6 +537,7 @@ def test_are_issues_open_end_to_end_over_http_transport(
     monkeypatch.setattr(http_transport.subprocess, "run", fake_run)
     fake = _FakeConnection([_FakeResponse(200, {}, body)])
     monkeypatch.setattr(http_transport, "HTTPSConnection", lambda host, timeout=None: fake)
+    monkeypatch.setattr(http_adapter, "_new_connection", lambda host, timeout: fake)
 
     assert gh.are_issues_open([1, 361]) == {1, 361}
     assert issue_view_calls == [361]

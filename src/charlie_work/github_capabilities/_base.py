@@ -26,6 +26,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from ..github_transport.legacy_argv import (
+    api_is_mutating,
+    graphql_field_value,
+    is_graphql_query,
+    legacy_is_mutating,
+)
+
 if TYPE_CHECKING:
     from charlie_work.github import GitHub
 
@@ -111,94 +118,13 @@ _LIST_LIMIT = 500
 # re-exported through ``github_capabilities/__init__.py`` and re-imported
 # into ``github.py``. Bodies are unchanged from their former ``github.py``
 # copies.
-def _graphql_field_value(args: list[str], field: str) -> str | None:
-    """Return the raw value of a `gh api graphql -f/--field name=value` pair.
-
-    Handles detached (`-f query=...`), attached shorthand (`-fquery=...`),
-    and `--field=query=...` spellings (#919). Returns `None` if the field is
-    absent or its value is missing.
-    """
-    for i, arg in enumerate(args):
-        if arg in ("-f", "--raw-field", "-F", "--field"):
-            next_arg = args[i + 1] if i + 1 < len(args) else ""
-            if "=" in next_arg and next_arg.split("=", 1)[0] == field:
-                return next_arg.split("=", 1)[1]
-        elif arg.startswith("-f") and len(arg) > 2:
-            rest = arg[2:].lstrip("=")
-            if "=" in rest and rest.split("=", 1)[0] == field:
-                return rest.split("=", 1)[1]
-        elif arg.startswith(("--field=", "--raw-field=")):
-            rest = arg.split("=", 1)[1]
-            if "=" in rest and rest.split("=", 1)[0] == field:
-                return rest.split("=", 1)[1]
-    return None
-
-
-def _is_graphql_query(args: list[str]) -> bool:
-    """A `gh api graphql -f query='query { ... }'` is a read-only query.
-
-    `args` is the argv after the leading `gh` token, so a GraphQL call looks
-    like `["api", "graphql", "-f", "query=..."]`.
-
-    Fails closed: only an operation that *starts* with the GraphQL `query`
-    keyword is treated as read-only. `mutation` or anything unparseable is
-    classified as mutating so a stray write never runs under `--dry-run`.
-    """
-    if len(args) < 2 or args[0] != "api" or args[1] != "graphql":
-        return False
-    query = _graphql_field_value(args, "query")
-    if not query:
-        return False
-    return query.lstrip()[:5].lower() == "query"
-
-
-def _api_is_mutating(args: list[str]) -> bool:
-    """Classify a `gh api` invocation, for the --dry-run gate.
-
-    `gh api` defaults to GET, so a bare `gh api <path>` is read-only and MUST stay
-    runnable under --dry-run — roughly a dozen call sites (rate_limit, commits/{sha},
-    check-runs, compare, branches/*/protection, `fleet_registry.py`) depend on that.
-    Blanket-denying `api` would turn --dry-run from "observes without mutating" into
-    "cannot observe", so the classification keys off whether a method is *named*.
-
-    Structured on flag PRESENCE rather than on enumerating accepted spellings, and
-    fails CLOSED when a method flag is present but its value cannot be extracted.
-    The previous version enumerated `--method`/`--method=` only and fell through to
-    False for everything else, so `-X DELETE` — the form `delete_branch` builds —
-    classified as read-only and a --dry-run really deleted PR head branches
-    (#914, #917). Enumeration is the wrong shape here: it silently fails open on
-    each spelling nobody thought of (`-X`, `-X=`, `-XDELETE`, a trailing `--method`
-    with no value).
-
-    Read-only `gh api graphql -f query='query { ... }'` is an exception: it is a
-    GraphQL query and must be runnable under `--dry-run` so `fleet status` can
-    batch issue dependency/state lookups in a single subprocess (#923).
-    """
-    if _is_graphql_query(args):
-        return False
-
-    for i, arg in enumerate(args):
-        if arg in ("-X", "--method"):
-            method = args[i + 1] if i + 1 < len(args) else ""
-        elif arg.startswith("--method="):
-            method = arg.split("=", 1)[1]
-        elif arg.startswith("-X"):
-            # pflag shorthand accepts an attached value: `-XDELETE` and `-X=DELETE`.
-            method = arg[2:].lstrip("=")
-        else:
-            continue
-        # A named-but-unparseable method is not evidence of a read; fail closed.
-        return not method or method.upper() not in ("GET", "HEAD")
-    # No explicit method. gh switches GET -> POST when request parameters are added
-    # ("adding request parameters will automatically switch the request method to
-    # POST" -- gh api --help). Prefix-matched, not membership-tested, for the same
-    # reason as the method arm: pflag accepts both the detached (`-f title=x`,
-    # `--field=labels[]=bug`) and the attached (`-ftitle=x`) spelling, and a
-    # membership test sees only the detached one (#919). `--field`/`--raw-field`/
-    # `--input` are prefixes rather than exact matches so the bare and `=` forms
-    # collapse into one condition.
-    param_prefixes = ("--raw-field", "--field", "--input")
-    return any(arg.startswith(param_prefixes) or arg[:2] in ("-f", "-F") for arg in args)
+# The mutation classifier family now lives in github_transport/legacy_argv.py
+# (ADR-0006): the transport package sits below this one and cannot import
+# capabilities. Re-exported under the old private names for the capability
+# modules and tests that still import them from here.
+_graphql_field_value = graphql_field_value
+_is_graphql_query = is_graphql_query
+_api_is_mutating = api_is_mutating
 
 
 # MERGED_PR_LIST_FIELDS moved on from here to
@@ -222,25 +148,7 @@ def _api_is_mutating(args: list[str]) -> bool:
 RUN_LIST_FIELDS = "databaseId,status,createdAt,headBranch"
 
 
-def _is_mutating(args: list[str]) -> bool:
-    if not args:
-        return False
-    text = " ".join(args)
-    # `gh api` defaults to GET and is read-only unless a mutating method is given.
-    # run() passes args without the leading "gh" token.
-    if text.startswith("api"):
-        return _api_is_mutating(args)
-    readonly_prefixes = (
-        "issue list",
-        "issue view",
-        "pr list",
-        "pr view",
-        "pr diff",
-        "pr checks",
-        "label list",
-        "auth status",
-    )
-    return not any(text.startswith(prefix) for prefix in readonly_prefixes)
+_is_mutating = legacy_is_mutating
 
 
 class CapabilityCollaborator:

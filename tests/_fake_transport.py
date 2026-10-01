@@ -152,3 +152,32 @@ def build_guard(
         now=lambda: 1000.0,
     )
     return guard, http, gh, sleeps
+
+
+def make_github(
+    repo_root: Path,
+    *,
+    http: FakeAdapter | None = None,
+    gh: FakeAdapter | None = None,
+    runtime: object | None = None,
+    dry_run: bool = False,
+):
+    """A real ``GitHub`` whose adapters are scripted fakes (no network, no gh).
+
+    The owner/repo slug is pre-seeded, so ``{owner}/{repo}`` placeholders
+    resolve without a git remote. Sleep is not injected here: tests that
+    retry patch ``charlie_work.github.time.sleep`` as they always have.
+    """
+    from charlie_work.config import RuntimeConfig
+    from charlie_work.github import GitHub
+
+    http = http if http is not None else FakeAdapter("http", [ok({})])
+    gh = gh if gh is not None else FakeAdapter("gh", token="tok-1")
+    github = GitHub(
+        repo_root,
+        dry_run=dry_run,
+        runtime=runtime if runtime is not None else RuntimeConfig(),  # type: ignore[arg-type]
+        adapters=Adapters(http=http, gh=gh),
+    )
+    github._list_cache[("_repo_owner_name",)] = ("octo", "hello")
+    return github, http, gh

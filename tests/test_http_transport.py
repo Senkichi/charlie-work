@@ -47,6 +47,7 @@ from charlie_work.github_capabilities.http_translate import (
     build_request_plan,
     is_http_candidate,
 )
+from charlie_work.github_transport import http_adapter
 from charlie_work.instrumentation import query_events
 from charlie_work.transient_errors import is_transient_network_error
 
@@ -79,6 +80,9 @@ class _FakeConnection:
         self.requests: list[tuple[str, str, bytes | None, dict]] = []
         self.closed = False
 
+    def connect(self):
+        pass
+
     def request(self, method, url, body=None, headers=None):
         self.requests.append((method, url, body, dict(headers or {})))
 
@@ -97,6 +101,8 @@ class _FakeConnection:
 def _install_fake_connection(monkeypatch, responses: list) -> _FakeConnection:
     fake = _FakeConnection(responses)
     monkeypatch.setattr(http_transport, "HTTPSConnection", lambda host, timeout=None: fake)
+    # The guarded transport's HttpAdapter builds its sockets here (ADR-0006).
+    monkeypatch.setattr(http_adapter, "_new_connection", lambda host, timeout: fake)
     return fake
 
 
