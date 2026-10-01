@@ -286,6 +286,10 @@ def _json_row(args: list[str], long_call: bool) -> Translated | None:
         return None
     head, search = _single(values, "--head"), _single(values, "--search")
     labels = tuple(values.get("--label", ()))
+    if len(labels) > 1:
+        # GraphQL `issues(labels:)` is OR; `gh --label a --label b` is AND. Pass through
+        # to gh so both transports return the same (intersection) set.
+        return None
     if search is not None:
         if resource != "pr" or head is not None or labels:
             return None
