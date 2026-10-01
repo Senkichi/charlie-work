@@ -22,8 +22,6 @@ import json
 import logging
 import os
 import subprocess
-import sys
-import time
 import uuid
 from collections.abc import Iterator
 from dataclasses import asdict, dataclass
@@ -31,9 +29,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from charlie_work import process_utils as _process_utils
 from charlie_work.process_utils import (
     CpuPriority,
-    parse_proc_stat_starttime,
     popen_worker,
     start_terminal_status_watcher,
     terminal_record_proves_completion,
@@ -119,7 +117,6 @@ def worker_permission_denied(sessions_dir: Path, issue_number: int, detail: str 
 # ``classify_failure`` merge (design doc §7); the classifier itself is now
 # ``worker_fate.classify_for``, which the sidecar writer below calls.
 
-_WIN_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 
 # Default command templates. A headless (``-p``) worker cannot answer a
 # permission prompt, so any mode that prompts for Bash (acceptEdits/default/
@@ -1489,67 +1486,8 @@ def probe_claude(
 
 
 def _get_process_start_time(pid: int) -> float | None:
-    """Get the process creation time as a Unix timestamp in seconds.
-
-    Returns None if the process does not exist or the start time cannot be retrieved.
-    This is used to verify that a PID has not been recycled by the OS.
-
-    On Windows: Uses GetProcessTimes via ctypes to retrieve process creation time.
-    On POSIX: Reads /proc/<pid>/stat field 22 (starttime in clock ticks).
-    """
-    if sys.platform == "win32":
-        import ctypes
-        from ctypes import wintypes
-
-        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
-        handle = kernel32.OpenProcess(_WIN_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-        if not handle:
-            return None
-        try:
-            creation_time = wintypes.FILETIME()
-            exit_time = wintypes.FILETIME()
-            kernel_time = wintypes.FILETIME()
-            user_time = wintypes.FILETIME()
-            if not kernel32.GetProcessTimes(
-                handle,
-                ctypes.byref(creation_time),
-                ctypes.byref(exit_time),
-                ctypes.byref(kernel_time),
-                ctypes.byref(user_time),
-            ):
-                return None
-            # Convert FILETIME to Unix timestamp
-            # FILETIME is 100-nanosecond intervals since 1601-01-01
-            # Unix timestamp is seconds since 1970-01-01
-            # Difference between 1601-01-01 and 1970-01-01 is 11644473600 seconds
-            filetime = (creation_time.dwHighDateTime << 32) | creation_time.dwLowDateTime
-            unix_time = filetime / 10_000_000 - 11644473600
-            return unix_time
-        finally:
-            kernel32.CloseHandle(handle)
-    else:
-        # POSIX: read /proc/<pid>/stat
-        try:
-            with open(f"/proc/{pid}/stat", "r") as f:
-                stat = f.read()
-            starttime_ticks = parse_proc_stat_starttime(stat)
-            if starttime_ticks is None:
-                return None
-            # Convert to seconds: need system clock tick frequency
-            tick_hz = os.sysconf("SC_CLK_TCK")
-            if tick_hz <= 0:
-                tick_hz = 100  # Default fallback
-            # Get system uptime to convert to absolute time
-            try:
-                with open("/proc/uptime", "r") as f:
-                    uptime_seconds = float(f.read().split()[0])
-            except (OSError, ValueError, IndexError):
-                return None
-            # Process start time = current time - uptime + process starttime
-            boot_time = time.time() - uptime_seconds
-            return boot_time + (starttime_ticks / tick_hz)
-        except (OSError, ValueError, IndexError):
-            return None
+    """Process creation time as a Unix timestamp (delegates to ``process_utils``)."""
+    return _process_utils.get_process_start_time(pid)
 
 
 def update_worker_record_with_failure_classification(
