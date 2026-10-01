@@ -9,7 +9,8 @@ Two different clocks live here and must not be mixed up:
   ``2 * 300 + 30 = 630s`` rule flagged a healthy fleet stale ~25% of the time.
 * **Supervisor heartbeat** -- ``last_beat_at`` is rewritten at the top of every supervisor
   loop iteration, so its age reaches a full pass plus the sleep. ``heartbeat_check`` bounds
-  it by ``2 x max_pass_runtime_seconds`` (issue #627); this module mirrors that rule.
+  it by ``2 x max_pass_runtime_seconds`` (issue #627); the constants come from the shared
+  alarm leaf.
 """
 
 from __future__ import annotations
@@ -19,14 +20,12 @@ from collections.abc import Mapping, Sequence
 from datetime import datetime
 from typing import Any
 
-# Supervisor heartbeat freshness rule. TODO(PR #2239): these mirror
-# ``scripts/heartbeat_check.py`` (SUPERVISOR_HEARTBEAT_STALE_MULTIPLIER /
-# SUPERVISOR_HEARTBEAT_DEFAULT_PASS_TIMEOUT_SECONDS) until the shared alarm leaf
-# (``heartbeat_alarms``) lands on this branch; then import them from there and delete
-# these. Defined once here (not per call site), and pinned to the script by
-# ``tests/test_dashboard_now_collect.py`` so a drift fails a test.
-SUPERVISOR_HEARTBEAT_STALE_MULTIPLIER = 2
-SUPERVISOR_HEARTBEAT_DEFAULT_PASS_TIMEOUT_SECONDS = 1800
+# The shared alarm leaf owns the supervisor rule, so the dashboard and heartbeat_check
+# cannot disagree about when the supervisor is stale.
+from charlie_work.heartbeat_alarms_fleet import (
+    SUPERVISOR_HEARTBEAT_DEFAULT_PASS_TIMEOUT_SECONDS,
+    SUPERVISOR_HEARTBEAT_STALE_MULTIPLIER,
+)
 
 # With no heartbeat to say otherwise the fleet sleeps 300s between passes.
 DEFAULT_PASS_INTERVAL_SECONDS = 300.0
