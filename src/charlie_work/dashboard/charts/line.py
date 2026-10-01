@@ -28,6 +28,7 @@ from .svg import (
     num,
     svg_open,
     text,
+    step_decimals,
     value_text,
 )
 
@@ -115,13 +116,14 @@ def _dodge(wanted: list[tuple[float, int]], top: float, bottom: float) -> dict[i
 
 def _axes(f: Frame, unit: str, tz: tzinfo | None, max_x_ticks: int) -> str:
     out = ['<g class="axis y">']
+    digits = step_decimals(f.y_ticks)
     for v in f.y_ticks:
         y = f.y(v)
         out.append(
             f'<line class="grid" x1="{num(f.left)}" x2="{num(f.right)}" '
             f'y1="{num(y)}" y2="{num(y)}"/>'
         )
-        out.append(text(f.left - 6, y + 4, value_text(v, unit), "tick", "end"))
+        out.append(text(f.left - 6, y + 4, value_text(v, unit, digits), "tick", "end"))
     out.append('</g><g class="axis x">')
     out.append(
         f'<line class="baseline" x1="{num(f.left)}" x2="{num(f.right)}" '

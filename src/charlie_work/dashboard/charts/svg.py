@@ -8,6 +8,8 @@ act as the second channel next to colour.
 
 from __future__ import annotations
 
+import math
+
 from datetime import datetime, tzinfo
 
 from ..pages.now_fmt import esc, fmt_float
@@ -28,10 +30,28 @@ def num(value: float) -> str:
     return "0" if text in ("-0", "") else text
 
 
-def value_text(value: float, unit: str = "") -> str:
-    """Tick / label text for a data value: integers bare, else one decimal."""
-    text = str(int(value)) if float(value).is_integer() else fmt_float(value)
-    return f"{text}{unit}"
+def value_text(value: float, unit: str = "", decimals: int | None = None) -> str:
+    """Tick / label text for a data value: integers bare, else one decimal -- or, below
+    1, two significant digits, so a small ratio never collapses to "0" or "0.1".
+    ``decimals`` (an axis's step precision) overrides both, trailing zeros dropped."""
+    v = float(value)
+    if decimals is not None:
+        text = f"{v:.{decimals}f}".rstrip("0").rstrip(".") if decimals else str(round(v))
+    elif v.is_integer():
+        text = str(int(v))
+    elif abs(v) < 1:  # two significant digits, fixed-point (never "1e-05"), at most 4dp
+        d = min(4, 1 - math.floor(math.log10(abs(v))))
+        text = f"{v:.{d}f}".rstrip("0").rstrip(".")
+    else:
+        text = fmt_float(v)
+    return f"{'0' if text in ('-0', '') else text}{unit}"
+
+
+def step_decimals(ticks: tuple[float, ...]) -> int:
+    """Decimals that tell evenly spaced ticks apart (0.02 steps -> 2)."""
+    if len(ticks) < 2 or ticks[1] == ticks[0]:
+        return 0
+    return max(0, -math.floor(math.log10(abs(ticks[1] - ticks[0])) + 1e-9))
 
 
 def dash_attr(pattern: str | None) -> str:

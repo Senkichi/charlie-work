@@ -81,3 +81,17 @@ def test_charts_css_uses_only_tokens_and_px_text_at_least_11() -> None:
     assert not re.search(r"#[0-9a-fA-F]{3,8}\b|rgba?\(", css)
     sizes = re.findall(r"font-size:\s*([\d.]+)px", css)
     assert sizes and all(float(s) >= 11 for s in sizes)
+
+
+def test_small_ratio_ticks_and_values_stay_distinct() -> None:
+    from charlie_work.dashboard.charts.line import y_ticks_for
+    from charlie_work.dashboard.charts.svg import step_decimals, value_text
+
+    ticks = y_ticks_for([0.0, 0.09])
+    labels = [value_text(t, "", step_decimals(ticks)) for t in ticks]
+    assert labels == ["0", "0.02", "0.04", "0.06", "0.08", "0.1"]
+    assert len(set(labels)) == len(labels)
+    assert [value_text(v) for v in (0.09, 0.6047, 0.00001, 2.25, 3.0)] == [
+        "0.09", "0.6", "0", "2.2", "3"
+    ]  # fmt: skip
+    assert [value_text(t, "", step_decimals(y_ticks_for([0, 40]))) for t in (0, 10)] == ["0", "10"]
