@@ -60,6 +60,7 @@ from .github import (
     parse_blockers,
 )
 from .issue_linking import linked_issue_number
+from .pr_body_closing_autofix_flow import autofix_body_closing_kw
 from .pr_unlinked_visibility import summarize_unlinked_prs
 
 # LOAD-BEARING RE-EXPORT -- NOT AN UNUSED IMPORT. Do not delete; the `noqa`
@@ -3556,6 +3557,10 @@ class OrchestratorApp:
             # head, trigger one automatic `gh run rerun --failed` and defer rework
             # routing until the next poll. Any rerun-API error is surfaced as an
             # event and we fall through to the existing rework/janitor-block path.
+            # Issue #2108: body-only closing-keyword failure; workers can't edit it.
+            autofixed = autofix_body_closing_kw(self, pr, issue_number, verdict, checks)
+            if autofixed is not None:
+                return autofixed
             if verdict.rerun_run_ids:
                 rerun_errors: list[str] = []
                 triggered_run_ids: list[int] = []
