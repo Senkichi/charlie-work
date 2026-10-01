@@ -103,7 +103,9 @@ def test_pr_not_found_returns_empty_data_both_paths(tmp_path: Path) -> None:
         assert out.result.message == f"PR #{_PR} was not found"
         # Neither path carries a dry_run marker on this shape.
         assert out.data == {}
-        assert out.state_after == out.state_before
+        # ``generated_at`` is a wall-clock stamp that ticks across a second boundary.
+        stable = lambda state: {k: v for k, v in state.items() if k != "generated_at"}  # noqa: E731
+        assert stable(out.state_after) == stable(out.state_before)
         assert out.gh.merged == []
 
 
