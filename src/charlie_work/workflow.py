@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import functools
 import re
-from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
@@ -71,6 +70,10 @@ from .pr_unlinked_visibility import summarize_unlinked_prs
 from .attachment_budget_prompt import (  # noqa: F401  (deliberate re-export)
     ATTACHMENT_BUDGET_CLAUSE as _ATTACHMENT_BUDGET_CLAUSE,
     render_attachment_budget_section,
+    OverCapFileFinding,
+    _diff_file_summary,
+    _over_cap_file_findings,
+    render_over_cap_section,
 )
 from .cross_pr_revert import (  # noqa: F401  (deliberate re-export)
     CrossPrRevertResult,
@@ -84,7 +87,7 @@ from .janitor import (
     check_test_adequacy,
     is_stale_ci_verdict,
     run_janitor,
-    DiffContentSignature,
+    DiffContentSignature,  # noqa: F401  (deliberate re-export; reached via _wf. by orchestration/local_lanes.py)
     TestAdequacyFacts,
     TestAdequacyVerdict,
 )
@@ -93,6 +96,7 @@ from .labels import TransitionOutcome, transition
 from .paths import RuntimePaths, prompt_override_dirs, resolved_layout
 from .prompt_sections import section_variant_names
 from .prompts import (
+    PromptOverrideDriftError,  # noqa: F401  (deliberate re-export)
     PromptTemplateError,
     render_prompt,  # noqa: F401  (deliberate re-export; patched on the workflow module in tests, reached via _wf.render_prompt by orchestration/prompt_ops.py -- Tier D, #1627)
     resolve_template,
@@ -219,6 +223,11 @@ from .dispatch_selection import (  # noqa: F401  (deliberate re-export)
 )
 from .no_op_checkpoint import _paired_death_count  # noqa: F401  (deliberate re-export)
 from .no_op_rework_body import _body_content_sha256  # noqa: F401  (deliberate re-export; reached via _wf. by orchestration/state_record_review.py)
+from .orchestration.helpers_merge_gate import (  # noqa: F401  (deliberate re-export; reached via _wf. by orchestration/)
+    _BASE_CURRENT_UNSET,
+    _BaseCurrentUnset,
+)
+from .concurrency_governor_result import ConcurrencyGovernorResult  # noqa: F401  (deliberate re-export)
 from . import orchestration as _orchestration
 from .workflow_delegation import _install_delegates, discover_delegate_modules
 
@@ -389,6 +398,7 @@ from .ci_findings import (  # noqa: F401  (deliberate re-export)
 # `.dispatch_selection` / `.escalation` / `.verdict_parsing` /
 # `.rework_prompts` / `.ci_findings` blocks above.
 from .backlog_reachability import (  # noqa: F401  (deliberate re-export)
+    _MergedPRListOutcome,
     _get_open_blockers_for_issue,
     classify_backlog_reachability,
     compute_mention_coverage_map,
@@ -498,45 +508,6 @@ from .dead_worker_sweep import (  # noqa: F401  (deliberate re-export)
 from .iso_timestamp import parse_iso_timestamp as _parse_iso_timestamp
 
 
-def _diff_file_summary(diff: str) -> tuple[int, list[tuple[str, int, int]]]:
-    """Return (total_lines, per_file_stats) from a unified diff.
-
-    ``per_file_stats`` is a list of ``(filename, added, deleted)`` tuples.
-    ``total_lines`` counts content lines (not diff headers/meta lines).
-    """
-    files: list[tuple[str, int, int]] = []
-    current_file = ""
-    added = 0
-    deleted = 0
-    total = 0
-    for line in diff.splitlines():
-        if line.startswith("diff --git"):
-            if current_file:
-                files.append((current_file, added, deleted))
-            current_file = ""
-            added = 0
-            deleted = 0
-        elif line.startswith("+++ "):
-            current_file = line[4:].strip()
-            if current_file == "/dev/null":
-                current_file = ""
-        elif line.startswith("--- "):
-            # Use the source file if the dest is /dev/null (deletion)
-            if not current_file:
-                current_file = line[4:].strip()
-                if current_file == "/dev/null":
-                    current_file = ""
-        elif line.startswith("+") and not line.startswith("+++"):
-            added += 1
-            total += 1
-        elif line.startswith("-") and not line.startswith("---"):
-            deleted += 1
-            total += 1
-    if current_file:
-        files.append((current_file, added, deleted))
-    return total, files
-
-
 def _max_touched_file_line_count(diff: str, repo_root: Path) -> int:
     """Return the largest line count among files touched by ``diff`` (issue #1439).
 
@@ -574,100 +545,6 @@ def _max_touched_file_line_count(diff: str, repo_root: Path) -> int:
         if line_count > max_lines:
             max_lines = line_count
     return max_lines
-
-
-@dataclass(frozen=True)
-class OverCapFileFinding:
-    """One file whose post-diff line count exceeds the repo size cap and whose
-    diff adds code to it (issue #1445).
-
-    ``line_count`` is the post-diff line count (base file at ``repo_root`` plus
-    the diff's net added lines, or the added-line count for a new file).
-    ``added_lines`` is the diff's gross added content lines for this file --
-    the quantity the rubric flags as "new code added to an over-cap file".
-    """
-
-    filename: str
-    line_count: int
-    cap: int
-    added_lines: int
-
-
-def _over_cap_file_findings(
-    diff: str, repo_root: Path, cap: int
-) -> tuple[OverCapFileFinding, ...]:
-    """Detect files this diff adds code to that are over the repo size cap.
-
-    Returns findings only for files that (a) have at least one added content
-    line in the diff and (b) whose post-diff line count exceeds ``cap``. A
-    ``cap`` of 0 disables the check (returns ``()``) -- mirrors
-    ``turn_cap_large_file_threshold``'s 0-disables convention.
-
-    File sizes are read from ``repo_root`` (the orchestrator's checkout) plus
-    the diff's net added lines, mirroring ``_max_touched_file_line_count``; a
-    new file's size is its added lines. Best-effort: a file that cannot be read
-    is skipped, never raises -- the same posture as the static probe and
-    ``check_operator_containment``.
-    """
-    if cap <= 0:
-        return ()
-    _total, files = _diff_file_summary(diff)
-    findings: list[OverCapFileFinding] = []
-    for name, added, deleted in files:
-        if not name or added <= 0:
-            continue
-        # Unified diff ``+++`` paths are prefixed with ``b/``; strip it so the
-        # path resolves under ``repo_root`` and the reported filename is the
-        # repo-relative path (not the diff's ``b/``-prefixed form). A literal
-        # ``b/...`` file would be vanishingly rare and only makes the lookup
-        # miss (falling back to the added-line count), never reads the wrong
-        # file -- mirrors ``_max_touched_file_line_count``'s stance.
-        filename = name[2:] if name.startswith("b/") else name
-        path = repo_root / filename
-        if path.exists() and path.is_file():
-            try:
-                with path.open("r", encoding="utf-8", errors="replace") as handle:
-                    base = sum(1 for _ in handle)
-            except OSError:
-                continue
-            line_count = base + added - deleted
-        else:
-            # New file (not present at repo_root): its size is the added lines.
-            line_count = added
-        if line_count > cap:
-            findings.append(OverCapFileFinding(filename, line_count, cap, added))
-    return tuple(findings)
-
-
-def render_over_cap_section(findings: tuple[OverCapFileFinding, ...] | None) -> str:
-    """Render the ``$over_cap_section`` packet block (issue #1445).
-
-    Returns ``""`` when ``findings`` is ``None`` (cap disabled -- the caller in
-    ``review()`` passes ``None`` when ``file_size_cap_lines`` is 0), mirroring
-    ``render_static_probe_section``'s disabled contract. When enabled, this
-    ALWAYS renders visible text -- even with zero findings -- rather than ``"``
-    for a clean pass, mirroring ``render_static_probe_section``'s never-silent
-    contract: an advisory probe that goes silent on a clean run is
-    indistinguishable, from the rendered packet alone, from one that never ran.
-    """
-    if findings is None:
-        return ""
-    if not findings:
-        return "File-size cap: no over-cap additions in this diff.\n"
-    lines = ["**Over-cap file additions (issue #1445):**"]
-    for finding in findings:
-        lines.append(
-            f"- `{finding.filename}`: {finding.line_count} lines "
-            f"(cap {finding.cap}), +{finding.added_lines} added -- "
-            "REPORTABLE FINDING. Suggested remedy: extract the new code to a "
-            "domain module (facade re-export block in the monolith, "
-            "implementation in the module), matching the #1283-era extractions. "
-            "Then run `python scripts/refresh_file_size_ratchet.py` and commit "
-            "the resulting `file_size_ratchet_baseline/` entry tightening in this "
-            "PR -- the script's default mode is lower-only (never raises a "
-            "mark), so it is safe to run mid-PR (#1495)."
-        )
-    return "\n".join(lines) + "\n"
 
 
 def structure_turn_cap_multiplier(
@@ -879,171 +756,6 @@ def _guard_state_lock(func: Any) -> Any:
             return _state_lock_busy_result("state lock held, skipped")
 
     return wrapper
-
-
-@dataclass(frozen=True)
-class ConcurrencyGovernorResult:
-    """Result of applying concurrency governor to a dispatch limit.
-
-    This encapsulates the concurrency limiting logic and ensures all related
-    fields are bound together, eliminating Pyright's reportPossiblyUnbound
-    warnings for live_count.
-    """
-
-    clamped: bool
-    max_concurrent: int
-    live_count: int
-    available_slots: int
-    dispatch_limit: int
-    fleet_live_count: int = 0
-    fleet_max: int = 0
-    # Issue #1129: open-PR backpressure fields. Populated only when the
-    # governor was called with ``apply_open_pr_backpressure=True`` (fresh-issue
-    # dispatch) and ``dispatch.max_open_agent_prs`` is > 0. Left at 0 for
-    # rework/recovery/loop paths, which are exempt from this clamp.
-    open_pr_count: int = 0
-    open_pr_max: int = 0
-    # Issue #1770: CI-capacity headroom fields. ``ci_headroom_ratio`` mirrors
-    # ``open_pr_max``'s exemption -- populated only for the same
-    # ``apply_open_pr_backpressure=True`` (fresh-issue) call, 0.0 for
-    # rework/recovery/loop paths regardless of the configured ratio.
-    # ``ci_headroom`` is the ``ci_headroom_available()`` reading: ``None``
-    # when the ratio is 0 (clamp off) or the data could not be trusted this
-    # pass (fail-open -- see ``ci_headroom``'s docstring), an
-    # int otherwise.
-    ci_headroom: int | None = None
-    ci_headroom_ratio: float = 0.0
-    # Issue #1843: host-load backpressure fields. Unlike the two fields above
-    # this term applies to EVERY governor caller (loop wave budget, rework,
-    # fresh dispatch) -- a worker launch adds real host load regardless of
-    # lane. ``host_load_pytest_processes``/``host_load_pytest_trees`` are the
-    # ``host_load.measure_host_load`` reading for this call: ``None`` when
-    # both knobs are 0 (off), when the running limit was already 0 (no launch
-    # could happen, so no probe), or when the probe itself failed (fail-open
-    # -- see host_load.py), ints otherwise. Issue #1903 split the term into
-    # two knobs: ``host_load_max_pytest_trees`` (the governor -- clamps by
-    # suite headroom ``cap - live_trees``) and ``host_load_max_pytest_processes``
-    # (the fan-out brake -- strict ``>`` trip to 0 on abnormal ``-n`` width).
-    # Issue #1943: both reported counts are scoped to
-    # orchestrator-attributable trees (any member/ancestor command line
-    # referencing a managed state/worktree path) -- CI-runner and other
-    # foreign suites feed neither count.
-    host_load_max_pytest_processes: int = 0
-    host_load_max_pytest_trees: int = 0
-    host_load_pytest_processes: int | None = None
-    host_load_pytest_trees: int | None = None
-    # Which term actually bound ``dispatch_limit`` this call, e.g.
-    # "ci_headroom", "open_pr_max", "fleet_max", "max_concurrent",
-    # "host_load", or ``None`` when nothing clamped. The terms apply in
-    # sequence, each only tightening (never loosening) the running limit, so
-    # whichever term last reduced it is the true binding constraint -- this
-    # is what makes a "0 dispatched" pass explainable from the event alone
-    # instead of requiring a reader to redo the min() by hand
-    # (zero-dispatch-is-a-capacity-question-first).
-    clamped_by: str | None = None
-
-    @property
-    def enabled(self) -> bool:
-        """Return True if the governor is enabled (max_concurrent > 0)."""
-        return self.max_concurrent > 0
-
-    @property
-    def fleet_enabled(self) -> bool:
-        """Return True if the fleet governor is enabled (fleet_max > 0)."""
-        return self.fleet_max > 0
-
-    @property
-    def open_pr_enabled(self) -> bool:
-        """Return True if the open-PR backpressure clamp is enabled (open_pr_max > 0)."""
-        return self.open_pr_max > 0
-
-    @property
-    def ci_headroom_enabled(self) -> bool:
-        """Return True if the CI-headroom clamp is enabled (ci_headroom_ratio > 0)."""
-        return self.ci_headroom_ratio > 0
-
-    @property
-    def host_load_enabled(self) -> bool:
-        """Return True if the host-load clamp is enabled (either knob > 0)."""
-        return self.host_load_max_pytest_processes > 0 or self.host_load_max_pytest_trees > 0
-
-    @property
-    def any_term_enabled(self) -> bool:
-        """Return True if any governor term is enabled.
-
-        Single point of enforcement (issue #1770 review finding 1): every
-        call site that decides whether to splat ``report_fields()`` into a
-        ``CommandResult.data`` dict must gate on this property, never on a
-        hand-written ``or``-chain of the individual ``*_enabled`` flags. A
-        hand-written chain silently stops covering new terms the moment one
-        is added -- exactly what happened when ``ci_headroom_enabled`` shipped
-        without being added to the ten pre-existing
-        ``gov.enabled or gov.fleet_enabled or gov.open_pr_enabled`` sites, so
-        a repo that opted into *only* the CI-headroom clamp (the other three
-        left at 0, precisely the "opt into just the new clamp" rollout the
-        config comment advertises) got its ``dispatch_limit`` clamped to 0
-        with no ``ci_headroom``/``clamped_by`` field in the result to explain
-        why. Deriving this from the flags themselves means the next new term
-        cannot repeat that gap.
-        """
-        return (
-            self.enabled
-            or self.fleet_enabled
-            or self.open_pr_enabled
-            or self.ci_headroom_enabled
-            or self.host_load_enabled
-        )
-
-    def report_fields(self) -> dict[str, Any]:
-        """Return the fields to include in CommandResult.data when clamped."""
-        fields: dict[str, Any] = {
-            "concurrency_limit": self.max_concurrent,
-            "live_session_count": self.live_count,
-            "available_slots": self.available_slots,
-        }
-        if self.fleet_enabled:
-            fields["fleet_concurrency_limit"] = self.fleet_max
-            fields["fleet_live_session_count"] = self.fleet_live_count
-        if self.open_pr_enabled:
-            fields["open_pr_count"] = self.open_pr_count
-            fields["open_pr_max"] = self.open_pr_max
-        if self.ci_headroom_enabled:
-            fields["ci_headroom"] = self.ci_headroom
-            fields["ci_headroom_ratio"] = self.ci_headroom_ratio
-        if self.host_load_enabled:
-            fields["host_load_max_pytest_processes"] = self.host_load_max_pytest_processes
-            fields["host_load_max_pytest_trees"] = self.host_load_max_pytest_trees
-            fields["host_load_pytest_processes"] = self.host_load_pytest_processes
-            fields["host_load_pytest_trees"] = self.host_load_pytest_trees
-        if self.clamped_by is not None:
-            fields["clamped_by"] = self.clamped_by
-        return fields
-
-
-@dataclass(frozen=True)
-class CarryForwardCheck:
-    """Result of comparing a recorded review verdict's content against the
-    live PR diff (issues #411/#412 tier 1, #414 tier 2).
-
-    ``tier`` is ``"patch-id"`` when the live diff's stable patch-id matches
-    the recorded ``reviewed_patch_id`` outright (issue #412's fast path),
-    ``"line-content"`` when the patch-ids differed — which happens on every
-    ordinary main advance, since the merge-base moves — but the ordered
-    ``+``/``-`` line stream and changed-file set are identical to what was
-    recorded at review time (issue #414), or ``None`` when neither tier
-    establishes content identity: the caller must treat the verdict as
-    stale. ``live_patch_id``/``live_signature`` are always populated (when
-    the live diff was fetched) so a carrying-forward caller can persist the
-    freshly computed baseline against the new head without recomputing it.
-    """
-
-    tier: str | None
-    live_patch_id: str
-    live_signature: DiffContentSignature
-
-    @property
-    def carry_forward(self) -> bool:
-        return self.tier is not None
 
 
 def _summary_is_vacuous(summary: str) -> bool:
@@ -1769,27 +1481,6 @@ VERDICT_PROVENANCE_VALUES: frozenset[str] = frozenset(
 NO_OP_RESET_PROVENANCES: frozenset[str] = frozenset({"fresh_llm_review", "operator_manual"})
 
 
-class PromptOverrideDriftError(RuntimeError):
-    """One or more configured prompt templates reference placeholders their
-    writer does not supply (issue #713).
-
-    Raised at supervisor startup (and asserted in CI) by
-    :func:`check_prompt_template_drift` so a repo-local flat whole-file
-    override that drifted out of sync with the orchestrator's writer -- e.g.
-    a flat ``rework.md`` still referencing ``$review_summary`` after the
-    writer renamed it to ``$dispatch_note`` -- fails fast before any
-    dispatch, instead of staying live-armed until the next dispatch crashes
-    with an uncaught :class:`PromptTemplateError`.
-    """
-
-    def __init__(self, errors: Sequence["PromptTemplateError"]) -> None:
-        self.errors = tuple(errors)
-        details = "; ".join(str(error) for error in self.errors)
-        super().__init__(
-            f"prompt template drift detected (issue #713); refusing to start: {details}"
-        )
-
-
 def check_prompt_template_drift(
     config: OrchestratorConfig, *, search_dirs: Sequence[Path] = ()
 ) -> list[PromptTemplateError]:
@@ -2249,22 +1940,6 @@ def _format_stale_base_alarm_message(pr_number: int, attempts: int, reason: str)
     else:
         detail = f"base is not current (reason: {reason})"
     return f"PR #{pr_number} approved but {detail} for {attempts} consecutive {pass_str}"
-
-
-# Sentinel used to distinguish "no base-current signal was supplied" from
-# an explicit ``None`` (compare API unavailable) in _should_update_pr_branch.
-class _BaseCurrentUnset:
-    __slots__ = ()
-
-
-_BASE_CURRENT_UNSET = _BaseCurrentUnset()
-
-
-@dataclass(frozen=True)
-class _MergedPRListOutcome:
-    items: list[dict[str, Any]] = field(default_factory=list)
-    error: GitHubError | None = None
-    called: bool = False
 
 
 def _is_rerun_already_running_error(error: str) -> bool:

@@ -9,7 +9,7 @@ protocol exactly as a lexical method did).
 
 Names reached through ``_wf.`` (module-object seam, design Section 3.1 rule 2,
 #1627): ``charlie_work.workflow`` module-level definitions ``CommandResult``,
-``ConcurrencyGovernorResult``, ``_MergedPRListOutcome`` (classes),
+``_MergedPRListOutcome`` (class),
 ``_state_lock_busy_result`` (free function); and Tier-D names patched on
 ``charlie_work.workflow`` by the suite, so the moved body must keep intercepting
 those patches: ``_log_worker_census``. The live-session counters
@@ -31,6 +31,7 @@ from charlie_work.dispatch_deferral import records_deferral
 from charlie_work import layout
 from charlie_work.ci_absence import CiAbsence, runs_terminally_without_jobs
 from charlie_work.ci_headroom import ci_headroom_available
+from charlie_work.concurrency_governor_result import ConcurrencyGovernorResult
 from charlie_work.fleet_paths import fleet_dir
 from charlie_work.fleet_registry import registered_state_dirs, try_acquire_fleet_lock
 from charlie_work.github import GitHubError, GraphQLBudgetError
@@ -156,7 +157,7 @@ def _apply_concurrency_governor(
     *,
     live_count: int | None = None,
     apply_open_pr_backpressure: bool = False,
-) -> _wf.ConcurrencyGovernorResult:
+) -> ConcurrencyGovernorResult:
     """Apply global concurrency governor cap to a dispatch limit.
 
     Returns a ConcurrencyGovernorResult with the potentially-clamped limit
@@ -423,7 +424,7 @@ def _apply_concurrency_governor(
                 clamped = True
                 clamped_by = "host_load"
 
-    return _wf.ConcurrencyGovernorResult(
+    return ConcurrencyGovernorResult(
         clamped=clamped,
         max_concurrent=max_concurrent,
         live_count=live_count or 0,

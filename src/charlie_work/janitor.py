@@ -288,6 +288,31 @@ class DiffContentSignature:
     has_binary: bool = False
 
 
+@dataclass(frozen=True)
+class CarryForwardCheck:
+    """Result of comparing a recorded review verdict's content against the
+    live PR diff (issues #411/#412 tier 1, #414 tier 2).
+
+    ``tier`` is ``"patch-id"`` when the live diff's stable patch-id matches
+    the recorded ``reviewed_patch_id`` outright (issue #412's fast path),
+    ``"line-content"`` when the patch-ids differed — which happens on every
+    ordinary main advance, since the merge-base moves — but the ordered
+    ``+``/``-`` line stream and changed-file set are identical to what was
+    recorded at review time (issue #414), or ``None`` when neither tier
+    establishes content identity: the caller must treat the verdict as
+    stale. ``live_patch_id``/``live_signature`` are populated whenever the
+    live diff was fetched, so a caller can persist the new baseline.
+    """
+
+    tier: str | None
+    live_patch_id: str
+    live_signature: DiffContentSignature
+
+    @property
+    def carry_forward(self) -> bool:
+        return self.tier is not None
+
+
 def _diff_content_signature(diff: str) -> DiffContentSignature:
     """Derive a :class:`DiffContentSignature` from a unified diff string.
 
