@@ -279,3 +279,52 @@ def sent(adapter: FakeAdapter) -> list[tuple[str, str, object]]:
         body = getattr(request, "body", None)
         out.append((getattr(request, "method", ""), route, json.loads(body) if body else None))
     return out
+
+
+@dataclass
+class FakeRaw:
+    status: int
+    headers: dict[str, str] = field(default_factory=dict)
+    body: bytes = b""
+    will_close: bool = False
+
+    def getheaders(self) -> list[tuple[str, str]]:
+        return list(self.headers.items())
+
+    def read(self) -> bytes:
+        return self.body
+
+
+class FakeSock:
+    def settimeout(self, seconds: float) -> None:
+        self.timeout = seconds
+
+
+class FakeConn:
+    """Stand-in for HTTPSConnection: queue of responses or exceptions."""
+
+    def __init__(self, script: list, *, connect_error: BaseException | None = None) -> None:
+        self.script = list(script)
+        self.connect_error = connect_error
+        self.sock: FakeSock | None = None
+        self.timeout = 0.0
+        self.requests: list[tuple[str, str, bytes | None, dict]] = []
+        self.closed = False
+
+    def connect(self) -> None:
+        if self.connect_error is not None:
+            raise self.connect_error
+        self.sock = FakeSock()
+
+    def request(self, method: str, path: str, body=None, headers=None) -> None:
+        self.requests.append((method, path, body, dict(headers or {})))
+
+    def getresponse(self) -> FakeRaw:
+        item = self.script.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+    def close(self) -> None:
+        self.closed = True
+        self.sock = None

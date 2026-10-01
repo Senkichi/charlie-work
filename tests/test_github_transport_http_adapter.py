@@ -9,9 +9,10 @@ from __future__ import annotations
 import json
 import socket
 import ssl
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import pytest
+from _fake_transport import FakeConn, FakeRaw
 
 from charlie_work.github_transport import (
     CliCommand,
@@ -28,55 +29,6 @@ from charlie_work.github_transport import http_adapter as http_adapter_module
 GET = RestRequest.of("GET", "repos/o/r/pulls/1", query={"state": "all"})
 POST = RestRequest.of("POST", "repos/o/r/issues", body={"title": "t"})
 QUERY = GraphQLRequest.of("query Q($n: Int!) { a }", {"n": 1})
-
-
-@dataclass
-class FakeRaw:
-    status: int
-    headers: dict[str, str] = field(default_factory=dict)
-    body: bytes = b""
-    will_close: bool = False
-
-    def getheaders(self) -> list[tuple[str, str]]:
-        return list(self.headers.items())
-
-    def read(self) -> bytes:
-        return self.body
-
-
-class FakeSock:
-    def settimeout(self, seconds: float) -> None:
-        self.timeout = seconds
-
-
-class FakeConn:
-    """Stand-in for HTTPSConnection: queue of responses or exceptions."""
-
-    def __init__(self, script: list, *, connect_error: BaseException | None = None) -> None:
-        self.script = list(script)
-        self.connect_error = connect_error
-        self.sock: FakeSock | None = None
-        self.timeout = 0.0
-        self.requests: list[tuple[str, str, bytes | None, dict]] = []
-        self.closed = False
-
-    def connect(self) -> None:
-        if self.connect_error is not None:
-            raise self.connect_error
-        self.sock = FakeSock()
-
-    def request(self, method: str, path: str, body=None, headers=None) -> None:
-        self.requests.append((method, path, body, dict(headers or {})))
-
-    def getresponse(self) -> FakeRaw:
-        item = self.script.pop(0)
-        if isinstance(item, BaseException):
-            raise item
-        return item
-
-    def close(self) -> None:
-        self.closed = True
-        self.sock = None
 
 
 def _adapter(conn: FakeConn, **kwargs) -> HttpAdapter:

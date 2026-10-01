@@ -20,30 +20,37 @@ from __future__ import annotations
 from pathlib import Path
 
 from charlie_work.config import OrchestratorConfig
-from charlie_work.github import GitHub
+from charlie_work.github_transport import GraphQLRequest, Request, Response
 from charlie_work.paths import runtime_paths
 from charlie_work.state import load_state
 from charlie_work.workflow import OrchestratorApp
 
+from _fake_transport import FakeAdapter, connection_page, make_github, ok
 from _fakes_github import FakeGitHub
 
 
-def _counting_run(counter: dict[str, int]):
-    """A GitHub.run replacement that counts calls per gh subcommand."""
+def _counting_github(tmp_path: Path, counter: dict[str, int]):
+    """A real ``GitHub`` over a fake transport that counts requests per kind.
 
-    def run(self, args, *, json_output=False, allow_failure=False, long_call=False):
-        counter[args[0]] = counter.get(args[0], 0) + 1
-        return [] if json_output else ""
+    GraphQL list reads are keyed by their connection (``issue`` / ``pr``); REST
+    reads are keyed ``api``. Every reply is an empty page / empty list.
+    """
 
-    return run
+    def handler(request: Request) -> Response:
+        if isinstance(request, GraphQLRequest):
+            kind = "pr" if "pullRequests" in request.document else "issue"
+            counter[kind] = counter.get(kind, 0) + 1
+            return connection_page("issues" if kind == "issue" else "pullRequests", [])
+        counter["api"] = counter.get("api", 0) + 1
+        return ok([])
+
+    gh, _http, _gh_adapter = make_github(tmp_path, http=FakeAdapter("http", handler=handler))
+    return gh
 
 
-def test_issue_list_caches_within_pass_and_refetches_after_invalidate(
-    monkeypatch, tmp_path: Path
-) -> None:
+def test_issue_list_caches_within_pass_and_refetches_after_invalidate(tmp_path: Path) -> None:
     counter: dict[str, int] = {}
-    monkeypatch.setattr(GitHub, "run", _counting_run(counter))
-    gh = GitHub(repo_root=tmp_path)
+    gh = _counting_github(tmp_path, counter)
 
     gh.issue_list("automated-ready")
     gh.issue_list("automated-ready")
@@ -54,10 +61,9 @@ def test_issue_list_caches_within_pass_and_refetches_after_invalidate(
     assert counter["issue"] == 2, "post-invalidation call must refetch"
 
 
-def test_pr_and_merged_pr_lists_refetch_after_invalidate(monkeypatch, tmp_path: Path) -> None:
+def test_pr_and_merged_pr_lists_refetch_after_invalidate(tmp_path: Path) -> None:
     counter: dict[str, int] = {}
-    monkeypatch.setattr(GitHub, "run", _counting_run(counter))
-    gh = GitHub(repo_root=tmp_path)
+    gh = _counting_github(tmp_path, counter)
 
     gh.pr_list()
     gh.pr_list()

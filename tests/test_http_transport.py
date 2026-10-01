@@ -554,7 +554,7 @@ def test_etag_cache_serves_body_on_304(tmp_path: Path):
     """The real ``HttpAdapter`` + the on-disk ``FileEtagCache`` over a fake
     connection: the second GET carries the cached ETag and a 304 is answered
     from the cache as a 200."""
-    from test_github_transport_http_adapter import FakeConn, FakeRaw
+    from _fake_transport import FakeConn, FakeRaw
 
     conn = FakeConn([FakeRaw(200, {"ETag": '"v1"'}, b'{"n": 1}'), FakeRaw(304, {}, b"")])
     adapter = HttpAdapter(
