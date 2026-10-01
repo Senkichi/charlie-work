@@ -754,6 +754,44 @@ def _local_gate_launch(
     gate_head = branch_head_sha(self.repo_root, branch)
     gate_base = resolve_ref_sha(self.repo_root, base_ref)
     paths = local_suite_runner.suite_gate_paths(self.paths.dispatches, pr_number)
+
+    # Reuse must be decided before ``launch_suite_gate``, which scrubs the
+    # prior result. A passing suite for this exact (head, base) pair is
+    # settled through the normal result path: no new suite process, same
+    # drift check, same merge bookkeeping (#2125).
+    reused = local_suite_runner.reusable_gate_result(paths, head_sha=gate_head, base_sha=gate_base)
+    if reused is not None:
+        self._local_gate_event(
+            "local_merge_gate_result_reused",
+            {
+                "pr_number": pr_number,
+                "issue_number": issue_number,
+                "head_sha": gate_head,
+                "base_sha": gate_base,
+                "argv": list(argv),
+                "ended_at": reused.get("ended_at"),
+                "duration_seconds": reused.get("duration_seconds"),
+                "reason": reason,
+            },
+        )
+        entry["reused_result"] = True
+        return self._local_gate_resolve_result(
+            pr_key=pr_key,
+            record={
+                **record,
+                "local_suite_head": gate_head,
+                "local_suite_base_sha": gate_base,
+                "local_suite_argv": list(argv),
+            },
+            entry=entry,
+            branch=branch,
+            base_ref=base_ref,
+            live_head=gate_head or "",
+            decision=decision,
+            result=reused,
+            paths=paths,
+        )
+
     launch = local_suite_runner.launch_suite_gate(
         worktree_path,
         argv,
