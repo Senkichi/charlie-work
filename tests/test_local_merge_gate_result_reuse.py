@@ -28,6 +28,7 @@ from _local_gate_async_fixtures import (  # noqa: E402
     _gate_paths,
     _init_repo,
     _kill_claimed_gate,
+    _wait_pid_dead,
     _lane_app,
     _lane_config,
     _make_branch,
@@ -119,6 +120,11 @@ def lane_repo() -> Path:
 
 def _drop_claim(app: OrchestratorApp, pr_number: int) -> None:
     """Lose the claim (supervisor restart / re-arm) while the result file stays."""
+    # The result lands just before the runner exits; a still-live pid file would
+    # make the gate defer instead of launching.
+    _wait_pid_dead(
+        int(load_state_locked(app.paths.state_file)["prs"][str(pr_number)]["local_suite_pid"])
+    )
     with state_lock(app.paths.state_file):
         state = load_state(app.paths.state_file)
         record = state["prs"][str(pr_number)]
