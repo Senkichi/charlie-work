@@ -22,8 +22,10 @@ Routing contract (every exit of ``autofix_body_closing_kw``):
   (caller keeps the worker-rework routing);
 - per-head attempt cap reached -> escalate;
 - body repaired and/or rerun requested -> ``CommandResult(False, ...)``;
-- rerun refused because the run is still in progress -> held, retried next pass;
-- scan, body edit, or rerun failure -> escalate.
+- rerun refused because the run is still in progress, or the scan's pr_view /
+  pr_commits / compare fetch failed -> held, retried next pass (a fetch failure
+  says nothing about the body, and an escalation is terminal while Lint is red);
+- body edit or rerun failure, or a body finding with no declared target -> escalate.
 """
 
 from __future__ import annotations
@@ -35,6 +37,7 @@ from charlie_work.labels import TransitionOutcome
 from charlie_work.pr_body_closing_autofix import (
     MAX_AUTOFIX_ATTEMPTS_PER_HEAD,
     AutofixOutcome,
+    SCAN_UNAVAILABLE_REASON,
     AutofixResult,
     autofix_closing_keyword_pr_body,
     failing_runs_are_closing_keyword_gate_only,
@@ -63,7 +66,10 @@ def autofix_body_closing_kw(
 
     head_sha = str(pr.get("headRefOid") or "")
     state = _wf.load_state(app.paths.state_file)
-    attempts_by_head = dict((state["prs"].get(str(pr_number)) or {}).get(_ATTEMPTS_KEY) or {})
+    # The mechanical de-escalation sweep zeroes counters with ``0`` (see
+    # REWORK_BUDGET_RESET_BY_ESCALATION_REASON); a non-dict means "no attempts".
+    raw_attempts = (state["prs"].get(str(pr_number)) or {}).get(_ATTEMPTS_KEY)
+    attempts_by_head = dict(raw_attempts) if isinstance(raw_attempts, dict) else {}
     attempts = int(attempts_by_head.get(head_sha, 0))
     if attempts >= MAX_AUTOFIX_ATTEMPTS_PER_HEAD:
         return _escalate_autofix_failure(
@@ -83,6 +89,12 @@ def autofix_body_closing_kw(
     if result.outcome is AutofixOutcome.FAILED:
         return _escalate_autofix_failure(app, pr_number, issue_number, head_sha, result.reason)
     if result.outcome is AutofixOutcome.HELD:
+        if result.reason == SCAN_UNAVAILABLE_REASON:
+            return _wf.CommandResult(
+                False,
+                f"PR #{pr_number} closing-keyword autofix held: PR scan unavailable, retrying",
+                {"pr": pr_number, "issue": issue_number, "scan_unavailable": True},
+            )
         return _wf.CommandResult(
             False,
             f"PR #{pr_number} closing-keyword autofix held: Lint run still in progress",

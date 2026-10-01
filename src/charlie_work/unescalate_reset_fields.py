@@ -69,6 +69,11 @@ UNESCALATE_PR_RESET_FIELDS = (
     "no_op_rework_attempts_last_head",
     "no_op_rework_attempts_stall_since",
     "no_op_rework_attempts_stall_head",
+    # Issue #2108: per-head attempt counts of the PR-body closing-keyword autofix
+    # (``pr_body_closing_autofix_flow``). A re-arm that left them behind would
+    # re-escalate with ``attempt_cap_exceeded`` on the next Lint-red pass even
+    # when the body was fixed meanwhile.
+    "closing_keyword_autofix_attempts",
     "review_dispatch_status",
     "review_dispatch_failed_at",
     "review_dispatch_pending_at",
@@ -302,6 +307,9 @@ REWORK_BUDGET_RESET_BY_ESCALATION_REASON: dict[str, tuple[tuple[str, ...], tuple
             "conflict_rework_attempts_stall_head",
         ),
     ),
+    # Issue #2108: the PR-body closing-keyword autofix's per-head attempt map; no
+    # head-baseline or stall clock companion (the map is keyed by head itself).
+    "pr_body_closing_keyword_autofix_failed": (("closing_keyword_autofix_attempts",), ()),
     # Issue #1972: the local merge gate escalates both its failure kinds under
     # one reason, so the clear re-arms BOTH counters (either kind re-tripping
     # alone re-escalates otherwise) and drops the last-failure-kind marker.

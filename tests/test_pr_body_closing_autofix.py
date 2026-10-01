@@ -14,9 +14,14 @@ from typing import Any
 from _fakes_github_rerun import FakeGitHubWithRerunCapture
 from _review_fixtures import _required_checks_config
 from charlie_work.instrumentation import query_events
+from charlie_work.github import GitHubError
 from charlie_work.paths import runtime_paths
 from charlie_work.pr_body_closing_autofix import rewrite_unexpected_body_references
-from charlie_work.state import load_state
+from charlie_work.state import load_state, save_state
+from charlie_work.unescalate_reset_fields import (
+    REWORK_BUDGET_RESET_BY_ESCALATION_REASON,
+    UNESCALATE_PR_RESET_FIELDS,
+)
 from charlie_work.workflow import OrchestratorApp
 
 _LINT = "Lint & Format"
@@ -36,7 +41,6 @@ class _GateFake(FakeGitHubWithRerunCapture):
         failed_steps: list[str],
         commit_messages: list[str] | None = None,
         body: str = _BAD_BODY,
-        extra_failing_check: bool = False,
         **kwargs: Any,
     ) -> None:
         checks = [
@@ -44,12 +48,18 @@ class _GateFake(FakeGitHubWithRerunCapture):
             {"name": _LINT, "state": "FAILURE", "link": _LINK},
             {"name": "Pre-commit", "state": "SUCCESS"},
         ]
-        if extra_failing_check:
-            checks[0] = {"name": "Tests passed", "state": "FAILURE"}
         super().__init__(checks=checks, **kwargs)
         self.prs[0]["body"] = body
         self.failed_steps = failed_steps
         self.commit_messages = commit_messages or []
+        self.commits_unavailable = False
+        self.pr_view_error: Exception | None = None
+
+    def pr_view(self, number: int, **kwargs: Any) -> dict[str, Any]:
+        # only the autofix scan passes ``fields=``; review()'s own fetch must succeed
+        if self.pr_view_error is not None and "fields" in kwargs:
+            raise self.pr_view_error
+        return super().pr_view(number, **kwargs)
 
     def actions_job(self, job_id: int) -> dict[str, Any] | None:
         steps = [_step("Set up job", "success")]
@@ -57,6 +67,8 @@ class _GateFake(FakeGitHubWithRerunCapture):
         return {"conclusion": "failure", "steps": steps}
 
     def pr_commits(self, number: int) -> list[dict[str, Any]] | None:
+        if self.commits_unavailable:
+            return None
         return [
             {"sha": f"c{i}", "parents": [], "commit": {"message": m}}
             for i, m in enumerate(self.commit_messages)
@@ -165,3 +177,82 @@ def test_rewrite_keeps_declared_target_and_negated_references() -> None:
     out = rewrite_unexpected_body_references(body, intended=123)
 
     assert out == "Closes #123. Also fixes issue 60 and resolved issue 61, but does not close #62."
+
+
+def _assert_held_and_retries(tmp_path: Path, fake: _GateFake, recover: Any) -> None:
+    result, paths, _config = _review(tmp_path, fake)
+
+    assert result.ok is False
+    assert result.data.get("scan_unavailable") is True
+    assert fake.pr_edits == []
+    assert fake.rerun_calls == []
+    state = load_state(paths.state_file)
+    assert state["issues"].get("123", {}).get("status") != "escalated"
+    assert "pr_body_closing_keyword_autofix_failed" not in _kinds(paths)
+
+    recover()  # the transient fetch failure clears; the next pass repairs the body
+    config = _required_checks_config()
+    app = OrchestratorApp(tmp_path, paths, config, fake)
+    again = app.review(456)
+
+    assert again.data.get("closing_keyword_autofixed") is True
+    assert len(fake.pr_edits) == 1
+    assert fake.rerun_calls == [["run", "rerun", "900", "--failed"]]
+
+
+def test_scan_commits_fetch_failure_holds_then_retries(tmp_path: Path) -> None:
+    fake = _GateFake(failed_steps=[_GATE_STEP])
+    fake.commits_unavailable = True
+
+    _assert_held_and_retries(tmp_path, fake, lambda: setattr(fake, "commits_unavailable", False))
+
+
+def test_scan_pr_view_error_holds_then_retries(tmp_path: Path) -> None:
+    fake = _GateFake(failed_steps=[_GATE_STEP])
+    fake.pr_view_error = GitHubError("boom")
+
+    def _recover() -> None:
+        fake.pr_view_error = None
+
+    _assert_held_and_retries(tmp_path, fake, _recover)
+
+
+def test_attempt_cap_per_head_escalates(tmp_path: Path) -> None:
+    fake = _GateFake(failed_steps=[_GATE_STEP])
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    head = str(fake.prs[0]["headRefOid"])
+    state = load_state(paths.state_file)
+    state["prs"]["456"] = {"number": 456, "closing_keyword_autofix_attempts": {head: 2}}
+    save_state(paths.state_file, state)
+
+    result, paths, _config = _review(tmp_path, fake)
+
+    assert result.data.get("closing_keyword_autofix_failed") is True
+    assert fake.pr_edits == []
+    assert load_state(paths.state_file)["issues"]["123"]["status"] == "escalated"
+
+
+def test_rearm_resets_closing_keyword_autofix_attempts() -> None:
+    """A re-arm (operator or mechanical clear) must grant a fresh per-head budget (#2108)."""
+    assert "closing_keyword_autofix_attempts" in UNESCALATE_PR_RESET_FIELDS
+    counters, _companions = REWORK_BUDGET_RESET_BY_ESCALATION_REASON[
+        "pr_body_closing_keyword_autofix_failed"
+    ]
+    assert "closing_keyword_autofix_attempts" in counters
+
+
+def test_zeroed_attempts_counter_from_mechanical_clear_reads_as_no_attempts(
+    tmp_path: Path,
+) -> None:
+    """The sweep writes ``0`` into counter fields; the reader must not choke on a non-dict."""
+    fake = _GateFake(failed_steps=[_GATE_STEP])
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    state = load_state(paths.state_file)
+    state["prs"]["456"] = {"number": 456, "closing_keyword_autofix_attempts": 0}
+    save_state(paths.state_file, state)
+
+    result, _paths, _config = _review(tmp_path, fake)
+
+    assert result.data.get("closing_keyword_autofixed") is True

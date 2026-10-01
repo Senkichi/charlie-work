@@ -52,11 +52,14 @@ CLOSING_KEYWORD_STEP_PREFIX = "Closing-keyword gate"
 # repeat failure on the same head means the scan and CI disagree; bound the loop.
 MAX_AUTOFIX_ATTEMPTS_PER_HEAD = 2
 
+# ``AutofixResult.reason`` of a HELD outcome caused by a transient scan fetch failure.
+SCAN_UNAVAILABLE_REASON = "scan_unavailable"
+
 
 class AutofixOutcome(str, Enum):
     NOT_APPLICABLE = "not_applicable"  # route as before (worker rework)
     FIXED = "fixed"  # body edited and/or Lint re-run requested
-    HELD = "held"  # rerun refused because the run is still in progress; retry next pass
+    HELD = "held"  # transient (run still in progress, scan fetch failed); retry next pass
     FAILED = "failed"  # could not repair; caller escalates (never rework)
 
 
@@ -195,9 +198,16 @@ def autofix_closing_keyword_pr_body(
     fixed (by us on an earlier pass whose rerun was refused, or by anyone else)
     skips the edit and goes straight to the rerun.
     """
-    scan = scan_pr_closing_references(gh, pr_number, branch_prefix=branch_prefix)
+    try:
+        scan = scan_pr_closing_references(gh, pr_number, branch_prefix=branch_prefix)
+    except GitHubError as exc:  # pr_view raises; pr_commits/compare return None
+        logger.warning("closing-keyword autofix: scan fetch failed for #%s: %s", pr_number, exc)
+        scan = None
     if scan is None:
-        return AutofixResult(AutofixOutcome.FAILED, "scan_unavailable")
+        # A fetch failure says nothing about the body, and an escalation here is
+        # terminal (Lint stays red, so the mechanical de-escalation sweep cannot
+        # clear it). Hold and retry next pass instead.
+        return AutofixResult(AutofixOutcome.HELD, SCAN_UNAVAILABLE_REASON)
     if scan.commit_findings:
         return AutofixResult(AutofixOutcome.NOT_APPLICABLE, "commit_message_finding")
     if scan.intended is None and scan.body_findings:
