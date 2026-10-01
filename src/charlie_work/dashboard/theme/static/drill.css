@@ -28,16 +28,16 @@ a.crumb:focus-visible, .dtable a:focus-visible, .dlead a:focus-visible { outline
 .dsec > h2 .meta { font-family: var(--lj-sans); font-size: var(--lj-text-2); font-weight: 400; color: var(--lj-gray-text); }
 /* The section a Now number linked to (?view= / ?stage=): position + rule, not colour. */
 .dsec.focus > h2 { border-bottom: 2px solid var(--lj-ink); }
-.dsec.focus > h2::after { content: "\2190 from Now"; margin-left: auto; font-family: var(--lj-sans); font-size: var(--lj-text-1); font-weight: 400; color: var(--lj-gray-text); }
+.dsec.focus > h2::after { content: "\2190 from Now"; margin-left: auto; font-family: var(--lj-sans); font-size: var(--lj-text-2); font-weight: 400; color: var(--lj-gray-text); }
 
 .tscroll { overflow-x: auto; max-width: 100%; }
 .dtable { width: 100%; border-collapse: collapse; font-size: var(--lj-text-2); }
 .dtable th, .dtable td { padding: 3px var(--lj-space-2) 3px 0; text-align: left; vertical-align: baseline; border-bottom: 1px solid var(--lj-rule); }
-.dtable thead th { font-weight: 600; color: var(--lj-gray-text); font-size: var(--lj-text-1); letter-spacing: var(--lj-label-spacing); text-transform: uppercase; }
+.dtable thead th { font-weight: 600; color: var(--lj-gray-text); font-size: var(--lj-text-2); letter-spacing: var(--lj-label-spacing); text-transform: uppercase; }
 .dtable tbody th { font-weight: 600; color: var(--lj-ink); }
 .dtable .num { text-align: right; font-family: var(--lj-sans); font-variant-numeric: lining-nums tabular-nums; white-space: nowrap; }
 .dtable td time { font-family: var(--lj-sans); font-variant-numeric: lining-nums tabular-nums; white-space: nowrap; }
-.dtable code { font-size: var(--lj-text-1); overflow-wrap: anywhere; }
+.dtable code { font-size: var(--lj-text-2); overflow-wrap: anywhere; }
 .dtable .preview { max-width: 60ch; }
 .dtable .labels { color: var(--lj-gray-text); }
 .dtable .lvl { white-space: nowrap; }

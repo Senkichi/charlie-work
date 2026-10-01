@@ -31,7 +31,7 @@ svg .series.approx .line { stroke-width: 1.5; }
 svg text.direct { font-weight: 600; }
 svg text.direct.s1 { fill: var(--lj-series-1); }
 svg text.direct.s2 { fill: var(--lj-gray-text); }
-svg text.direct.s3 { fill: var(--lj-series-3); }
+svg text.direct.s3 { fill: var(--lj-gray-text); } /* series-3 is 4.07:1 on light card; the dash names the line */
 svg text.direct.approx { font-style: italic; }
 
 /* Uncovered span: rule tint (raised equals card in light, so it would vanish there). */
