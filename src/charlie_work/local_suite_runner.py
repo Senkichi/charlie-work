@@ -98,6 +98,30 @@ def read_gate_result(paths: SuiteGatePaths) -> dict[str, Any] | None:
     return _read_json(paths.result)
 
 
+def reusable_gate_result(
+    paths: SuiteGatePaths,
+    *,
+    head_sha: str | None,
+    base_sha: str | None,
+) -> dict[str, Any] | None:
+    """A prior passing result for exactly this ``(head_sha, base_sha)`` pair, else None.
+
+    Reuse is keyed on the full pair: a moved base means the merged tree differs,
+    so it must rerun. Fails closed -- a missing, truncated or malformed file
+    (``read_gate_result`` returns None), ``ok`` not literally ``True``, a missing
+    ``ended_at`` (an incomplete run), or an empty head/base on either side is a
+    miss, never a pass.
+    """
+    if not head_sha or not base_sha:
+        return None
+    result = read_gate_result(paths)
+    if result is None or result.get("ok") is not True or not result.get("ended_at"):
+        return None
+    if result.get("head_sha") != head_sha or result.get("base_sha") != base_sha:
+        return None
+    return result
+
+
 def read_gate_pid(paths: SuiteGatePaths) -> dict[str, Any] | None:
     """The wrapper's liveness claim, or None while absent/unparseable."""
     return _read_json(paths.pid_file)
