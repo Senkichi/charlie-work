@@ -18,7 +18,7 @@ from _claude_adapter_fixtures import _install_fake_create_worktree
 from _dead_session_fixtures import _git, _make_classify_state
 from _fakes_github import FakeGitHub
 from _rework_dispatch_fixtures import _wg
-from _worktree_fixtures import _init_bare_remote_and_clone, _setup_completed_worktree
+from _worktree_fixtures import _init_bare_remote_and_clone
 
 from charlie_work.claude_code import ClaudeWorkerRecord, launch_claude_worker
 from charlie_work.config import OrchestratorConfig
@@ -111,9 +111,10 @@ def test_fake_worker_exit_zero_dirty_no_commit_emits_classification_event(
     from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
 
     _remote, repo_root = _init_bare_remote_and_clone(tmp_path)
-    worktree_path, branch = _setup_completed_worktree(repo_root, 40)
-    # Un-commit the work: dirty tree, nothing ahead of the base.
-    _git(worktree_path, "reset", "--mixed", "origin/main")
+    # The clone itself is the "worktree": no `git worktree add`, which fails on
+    # Windows when the pytest tmp path is long.
+    worktree_path, branch = repo_root, "agent/issue-40"
+    (worktree_path / "test_config_precedence.py").write_text("x = 1", encoding="utf-8")
     sessions_dir, state_file = _make_classify_state(tmp_path)
     now = datetime.now(UTC).isoformat().replace("+00:00", "Z")
     record = ClaudeWorkerRecord(
