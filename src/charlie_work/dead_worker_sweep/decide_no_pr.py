@@ -264,6 +264,7 @@ def lock_no_pr_flow(facts: SweepFacts, pre: PreOutcome, draft: Draft) -> Flow:
         stamp=stamp,
         # Sweep-start clock: decide reads no clock of its own. The original sampled wall
         # time at this call; the skew (seconds) is negligible against the 240-minute window.
+        # Intentional (#2114 F): revisit only if ``redispatch_window_minutes`` shrinks to minutes.
         now=pre.now,
     )
     history = list(verdict.orphan_redispatch_at)
