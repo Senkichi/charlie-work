@@ -157,9 +157,15 @@ def _wait_pid_dead(pid: int, timeout_seconds: float = 15) -> None:
 
 
 def _kill_claimed_gate(app: OrchestratorApp, pr_number: int) -> int:
-    """Kill the in-flight suite tree named by the record's claim; returns pid."""
+    """Kill the in-flight suite tree named by the record's claim; returns pid.
+
+    Returns 0 when the claim is already cleared (e.g. the gate escalated), so it
+    is safe in a ``finally`` teardown.
+    """
     state = load_state_locked(app.paths.state_file)
     record = state["prs"][str(pr_number)]
+    if not record.get("local_suite_pid"):
+        return 0
     pid = int(record["local_suite_pid"])
     kill_process_tree(pid, record.get("local_suite_process_start_time"))
     _wait_pid_dead(pid)

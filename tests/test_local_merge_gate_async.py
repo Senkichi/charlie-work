@@ -26,6 +26,7 @@ import tempfile
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -461,6 +462,17 @@ def test_base_moved_during_suite_resyncs_and_relaunches(lane_repo: Path) -> None
     assert is_ancestor(lane_repo, head, branch_head_sha(lane_repo, "main"))
 
 
+def _gate_identity(app: OrchestratorApp, number: int) -> tuple[int, Any]:
+    """Launch identity of the claimed gate: (pid, process start-time fingerprint).
+
+    A bare pid is not unique across dead processes -- the OS may hand a dead
+    wrapper's pid to the next launch -- so "a new gate was launched" is asserted
+    on the pair, never on the pid alone (#2207).
+    """
+    record = load_state_locked(app.paths.state_file)["prs"][str(number)]
+    return int(record["local_suite_pid"]), record["local_suite_process_start_time"]
+
+
 def test_timeout_kills_tree_and_relaunches_without_rework(lane_repo: Path) -> None:
     """Runtime beyond the suite timeout kills the process tree and relaunches
     (#2127: wall clock measures the host, so it is never a rework)."""
@@ -472,7 +484,8 @@ def test_timeout_kills_tree_and_relaunches_without_rework(lane_repo: Path) -> No
     _adopt_and_approve(app, issues_dir, 7, "agent/issue-7-x", head)
 
     app._local_merge_approved()
-    pid = int(load_state_locked(app.paths.state_file)["prs"]["7"]["local_suite_pid"])
+    identity = _gate_identity(app, 7)
+    pid = identity[0]
     _backdate_gate_start(app, 7)
 
     try:
@@ -483,7 +496,7 @@ def test_timeout_kills_tree_and_relaunches_without_rework(lane_repo: Path) -> No
         state = load_state_locked(app.paths.state_file)
         assert state["prs"]["7"]["status"] == "approved"
         assert state["prs"]["7"]["local_suite_infra_relaunch_count"] == 1
-        assert int(state["prs"]["7"]["local_suite_pid"]) != pid
+        assert _gate_identity(app, 7) != identity
         assert "local_suite_failed" not in _event_kinds(app)
         assert "local_suite_infra_relaunched" in _event_kinds(app)
     finally:
@@ -503,33 +516,38 @@ def test_dead_pid_missing_result_relaunches_bounded_then_escalates(
     _adopt_and_approve(app, issues_dir, 7, "agent/issue-7-x", head)
 
     app._local_merge_approved()
-    launched_pids = {int(load_state_locked(app.paths.state_file)["prs"]["7"]["local_suite_pid"])}
+    launched = {_gate_identity(app, 7)}
 
-    for orphan in range(1, LOCAL_SUITE_GATE_MAX_ORPHANS + 1):
+    try:
+        for orphan in range(1, LOCAL_SUITE_GATE_MAX_ORPHANS + 1):
+            _kill_claimed_gate(app, 7)
+            # The kill is not atomic: the runner wrapper can write a rc!=0 result in
+            # the window between its child and itself dying. That is an infra
+            # outcome (#2127), not the orphan this test exercises -- drop it.
+            _gate_paths(app, 7).result.unlink(missing_ok=True)
+            results = app._local_merge_approved()
+            assert results[0]["outcome"] == "suite_launched", f"orphan {orphan}"
+            state = load_state_locked(app.paths.state_file)
+            # Launch identity, not bare pid: the OS may reuse a dead wrapper's pid.
+            identity = _gate_identity(app, 7)
+            assert identity not in launched
+            launched.add(identity)
+            assert state["prs"]["7"]["local_suite_orphan_count"] == orphan
+            # Never green on a missing result.
+            assert state["prs"]["7"]["status"] == "approved"
+
         _kill_claimed_gate(app, 7)
-        # The kill is not atomic: the runner wrapper can write a rc!=0 result in
-        # the window between its child and itself dying. That is an infra
-        # outcome (#2127), not the orphan this test exercises -- drop it.
-        _gate_paths(app, 7).result.unlink(missing_ok=True)
+        _gate_paths(app, 7).result.unlink(missing_ok=True)  # kill-window result, see above
         results = app._local_merge_approved()
-        assert results[0]["outcome"] == "suite_launched", f"orphan {orphan}"
+
+        assert results[0]["outcome"] == "error"
         state = load_state_locked(app.paths.state_file)
-        pid = int(state["prs"]["7"]["local_suite_pid"])
-        assert pid not in launched_pids
-        launched_pids.add(pid)
-        assert state["prs"]["7"]["local_suite_orphan_count"] == orphan
-        # Never green on a missing result.
-        assert state["prs"]["7"]["status"] == "approved"
-
-    _kill_claimed_gate(app, 7)
-    _gate_paths(app, 7).result.unlink(missing_ok=True)  # kill-window result, see above
-    results = app._local_merge_approved()
-
-    assert results[0]["outcome"] == "error"
-    state = load_state_locked(app.paths.state_file)
-    assert state["prs"]["7"]["status"] == "escalated"
-    assert state["prs"]["7"]["escalation_reason"] == "local_merge_error"
-    assert "local_merge_failed" in _event_kinds(app)
+        assert state["prs"]["7"]["status"] == "escalated"
+        assert state["prs"]["7"]["escalation_reason"] == "local_merge_error"
+        assert "local_merge_failed" in _event_kinds(app)
+    finally:
+        # A failing assert must not leak the live time.sleep(600) wrapper.
+        _kill_claimed_gate(app, 7)
 
 
 def test_malformed_result_file_is_never_green(lane_repo: Path) -> None:
