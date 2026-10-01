@@ -14,6 +14,7 @@
   var reduceMotion = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
   var selectedId = null;
   var filterText = "";
+  var expanded = {}; /* group slug -> true once "+N more" was opened (survives swaps) */
   var pendingG = false;
   var live = null;
 
@@ -78,6 +79,11 @@
 
   /* ---- theme ---- */
   function storedTheme() {
+    var root = document.documentElement;
+    if (root.getAttribute("data-theme-src") === "query") {
+      var q = root.getAttribute("data-theme");
+      if (q === "light" || q === "dark") { return q; }
+    }
     try {
       var v = localStorage.getItem(THEME_KEY);
       return v === "light" || v === "dark" ? v : "system";
@@ -98,6 +104,7 @@
   }
 
   function cycleTheme() {
+    document.documentElement.removeAttribute("data-theme-src");
     var next = THEMES[(THEMES.indexOf(storedTheme()) + 1) % THEMES.length];
     try {
       if (next === "system") { localStorage.removeItem(THEME_KEY); }
@@ -109,7 +116,22 @@
 
   /* ---- needs-me rows: selection and filter ---- */
   function allRows() { return Array.prototype.slice.call(document.querySelectorAll("#needs-list .row")); }
-  function visibleRows() { return allRows().filter(function (r) { return !r.hidden; }); }
+  function visibleRows() {
+    return allRows().filter(function (r) { return !r.hidden && r.getClientRects().length > 0; });
+  }
+
+  function applyExpanded() {
+    var items = document.querySelectorAll("#needs-list > [data-grp]");
+    for (var i = 0; i < items.length; i++) {
+      var li = items[i], open = !!expanded[li.getAttribute("data-grp")];
+      if (li.classList.contains("row")) { li.classList.toggle("is-open", open); }
+      var b = li.querySelector(".more-btn");
+      if (b) {
+        b.setAttribute("aria-expanded", open ? "true" : "false");
+        b.textContent = open ? "show fewer" : "+" + b.getAttribute("data-more") + " more";
+      }
+    }
+  }
 
   function paintSelection() {
     var rows = allRows();
@@ -131,6 +153,8 @@
 
   function applyFilter() {
     var q = filterText.trim().toLowerCase();
+    var list = document.getElementById("needs-list");
+    if (list) { list.classList.toggle("is-filtering", !!q); }
     var items = document.querySelectorAll("#needs-list > li");
     var groupHead = null, groupHasRow = false;
     var closeGroup = function () { if (groupHead) { groupHead.hidden = !!q && !groupHasRow; } };
@@ -139,7 +163,7 @@
       if (li.classList.contains("grp")) {
         closeGroup();
         groupHead = li; groupHasRow = false;
-      } else {
+      } else if (li.classList.contains("row")) {
         var repo = (li.querySelector(".repo") || {}).title || "";
         var hit = !q || li.textContent.toLowerCase().indexOf(q) !== -1 ||
           repo.toLowerCase().indexOf(q) !== -1;
@@ -149,7 +173,7 @@
     }
     closeGroup();
     var sel = selectedId && document.getElementById(selectedId);
-    if (sel && sel.hidden) { select(null); }
+    if (sel && (sel.hidden || !sel.getClientRects().length)) { select(null); }
   }
 
   function move(delta) {
@@ -177,6 +201,14 @@
     var b = t.closest("button[data-copy]");
     if (b) { copy(b); return; }
     if (t.closest("#theme-toggle")) { cycleTheme(); return; }
+    var more = t.closest(".more-btn");
+    if (more) {
+      var g = more.getAttribute("data-grp");
+      expanded[g] = !expanded[g];
+      applyExpanded();
+      applyFilter();
+      return;
+    }
     var row = t.closest("#needs-list .row");
     if (row && !t.closest("a, button")) { select(row); }
   });
@@ -233,6 +265,7 @@
   function restore() {
     var f = document.getElementById("needs-filter");
     if (f && f.value !== filterText) { f.value = filterText; }
+    applyExpanded();
     applyFilter();
     paintSelection();
     syncThemeButton(storedTheme());

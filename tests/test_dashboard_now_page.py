@@ -265,3 +265,48 @@ def test_dashboard_scripts_avoid_dynamic_code_and_html_injection() -> None:
         for banned in ("eval(", "new Function", "innerHTML", "outerHTML", "document.write"):
             assert banned not in src, f"{name} uses {banned}"
     assert "cw-dash-theme" in static_asset("theme-init.js").read_text(encoding="utf-8")
+
+
+def test_row_budget_hides_overflow_behind_a_toggle_but_never_exceptions() -> None:
+    from charlie_work.dashboard.pages.now_needs import ROW_BUDGET, ROW_FLOOR, visible_counts
+
+    alarms = tuple(
+        _item("Exceptions", kind="alarm", severity="anomaly", reason=f"alarm {n}", number=None)
+        for n in range(ROW_BUDGET + 2)
+    )
+    queue = tuple(
+        _item("Operator queue", reason=f"Operator queue: #{n} t", number=n) for n in range(9)
+    )
+    html_text = _page(_model(items=alarms + queue))
+    assert html_text.count('class="row tone-danger"') == ROW_BUDGET + 2  # alarms: never capped
+    assert html_text.count(' over"') == 9 - ROW_FLOOR
+    assert f'data-more="{9 - ROW_FLOOR}" aria-expanded="false">+{9 - ROW_FLOOR} more' in html_text
+    assert visible_counts(
+        {"Awaiting your verdict": 3, "Human needed": 4, "Operator queue": 11}
+    ) == {
+        "Awaiting your verdict": 3,
+        "Human needed": 4,
+        "Operator queue": ROW_BUDGET - 7,
+    }
+    assert "more-btn" not in _page()  # within budget: no toggle
+
+
+def test_reason_drops_the_group_prefix_and_bolds_the_lead_ref() -> None:
+    html_text = _page()
+    assert '<b class="ref">PR #7</b> (issue #6) awaits an operator verdict</a>' in html_text
+    assert '<b class="ref">#9</b> x</a>' in html_text
+    assert 'title="Human needed: #9 x · as of snapshot"' in html_text  # full reason kept
+
+
+def test_done_24h_is_off_the_stock_scale() -> None:
+    html_text = _page(_model(flow=replace(_model().flow, done_24h=500)))
+    done = re.search(r'<rect class="bar done"[^>]*height="([\d.]+)"', html_text)
+    assert done and float(done.group(1)) < 10  # a token bar, not 500 against stocks of 5
+    tall = re.findall(r'<rect class="bar bar"[^>]*height="([\d.]+)"', html_text)
+    assert max(float(h) for h in tall) == 75.0  # the biggest stock still fills the chart
+    assert 'class="unit-sep"' in html_text
+
+
+def test_theme_query_override_is_not_persisted() -> None:
+    js = static_asset("theme-init.js").read_text(encoding="utf-8")
+    assert 'get("theme")' in js and "setItem" not in js

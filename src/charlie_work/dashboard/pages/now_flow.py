@@ -11,6 +11,7 @@ from .now_fmt import esc, flow_url, fmt_float, link
 
 _PIPE = ("Dispatchable", "Queued", "In progress", "PR open", "Reviewing")
 _W, _BASE, _MAXH, _BAR = 520.0, 118.0, 75.0, 48.0
+_DONE_H = 6.0
 _REASON_LABEL = {
     "terminal_label": "Terminal label",
     "active_label": "Active label",
@@ -46,6 +47,10 @@ def _column(x: float, name: str, count: int | None, scale: float, done: bool) ->
     else:
         h = _MAXH * count / scale if scale else 0.0
         kind = "done" if done else "bar"
+        if done and count:
+            # Done is a 24h throughput, not a queue depth: it never shares the stock scale
+            # (77 merged would flatten every stage), so it is a fixed green token bar.
+            h = _DONE_H
         if count == 0:
             rect = (
                 f'<rect class="bar zero" x="{fmt_float(x)}" y="{fmt_float(_BASE - 2.5)}" '
@@ -71,11 +76,14 @@ def _column(x: float, name: str, count: int | None, scale: float, done: bool) ->
 
 def _pipeline_svg(flow: FlowModel) -> str:
     counts = [_count(flow, n) for n in _PIPE]
-    known = counts + ([flow.done_24h] if flow.done_24h is not None else [])
-    scale = float(max(known) if known and max(known) > 0 else 0)
+    scale = float(max(counts) if max(counts) > 0 else 0)
     step = _W / 6
     xs = [i * step + (step - _BAR) / 2 for i in range(6)]
-    parts = [f'<line class="base" x1="0" x2="{fmt_float(_W)}" y1="118.5" y2="118.5"/>']
+    sep = 5 * step - 1
+    parts = [
+        f'<line class="base" x1="0" x2="{fmt_float(_W)}" y1="118.5" y2="118.5"/>',
+        f'<line class="unit-sep" x1="{fmt_float(sep)}" x2="{fmt_float(sep)}" y1="30" y2="118"/>',
+    ]
     for i, name in enumerate(_PIPE):
         parts.append(_column(xs[i], name, counts[i], scale, done=False))
     parts.append(_column(xs[5], "Done 24h", flow.done_24h, scale, done=True))
