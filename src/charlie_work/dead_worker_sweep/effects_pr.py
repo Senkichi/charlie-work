@@ -13,7 +13,7 @@ from typing import Any
 
 from ..closing_reference import (
     ValidationResult,
-    closing_issues_referenced_numbers,
+    probe_closing_link,
     validate_closing_reference,
 )
 from ..config import (
@@ -232,18 +232,15 @@ def _open_salvage_pr(
     # a `gh pr view 0` call would be both wasted and nonsensical -- only probe
     # a real, truthy PR number.
     if pr_number and state_file is not None:
-        query_ok = True
-        try:
-            pr_view = gh.pr_view(pr_number, fields=PR_CLOSING_ISSUES_FIELDS)
-        except Exception:
-            pr_view = {}
-            query_ok = False
-        linked_numbers = closing_issues_referenced_numbers(pr_view)
-        # Only log when the query itself succeeded: a transient `gh` failure
-        # collapses to the same empty result as "GitHub really didn't link
-        # the issue", and this event exists to be acted on -- conflating a
-        # failed probe with a genuine miss would make it noisy and untrustworthy.
-        if query_ok and issue_number not in linked_numbers:
+        # cw#1868: probe_closing_link re-probes across GitHub's asynchronous
+        # closing-keyword indexing, so a just-created PR is not logged as
+        # unlinked on a read that precedes the index. It returns None when the
+        # query itself failed: a transient `gh` failure collapses to the same
+        # empty result as a real miss, and this event exists to be acted on.
+        linked_numbers = probe_closing_link(
+            gh, pr_number, issue_number, fields=PR_CLOSING_ISSUES_FIELDS
+        )
+        if linked_numbers is not None and issue_number not in linked_numbers:
             log_event(
                 state_file,
                 "pr_closing_ref_unlinked",

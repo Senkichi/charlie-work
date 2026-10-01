@@ -42,6 +42,7 @@ from typing import Any
 
 from .fleet_paths import fleet_dir, warn_fleet_dir_virtualization_on_write
 from .instrumentation import log_event, query_events
+from .supervise_loop import EXIT_FLEET_PAUSED
 from .wedge_watchdog import WEDGE_KILL_EVENT_KIND
 
 logger = logging.getLogger(__name__)
@@ -392,13 +393,14 @@ def is_exit_alertable(exit_code: int | None) -> bool:
     """Return True when a supervisor exit warrants an operator-facing alert.
 
     A ``0`` exit is routine (drain, HEAD-drift restart, self-deploy
-    restart, ``KeyboardInterrupt``). Anything else — a non-zero exit or
+    restart, ``KeyboardInterrupt``), and so is ``EXIT_FLEET_PAUSED``: the
+    operator asked for it (#1776). Anything else — a non-zero exit or
     an unknown ``None`` (gap-detected kill) — means something killed
     the supervisor and must reach the attention digest. This is the
     #621 ``alertable`` precedent applied to supervisor lifecycle: a
     routine restart must not page, a real kill must.
     """
-    return exit_code != 0
+    return exit_code not in (0, EXIT_FLEET_PAUSED)  # paused = operator's own act (#1776)
 
 
 def record_fleet_pass_completed(
