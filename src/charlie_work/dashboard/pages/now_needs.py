@@ -33,6 +33,11 @@ _GROUP_NOTE = {
     "Operator queue": "escalated issues waiting to be requeued",
 }
 _SEP = " · "
+_FILTER = (
+    '<div class="needs-filter"><label class="sr" for="needs-filter">Filter by repo or issue</label>'
+    '<input type="search" id="needs-filter" placeholder="filter repo / issue   ( / )" '
+    'autocomplete="off" spellcheck="false"></div>'
+)
 _REPO_PREFIX = re.compile(r"^charlie --repo (?:'[^']*'|\S+) ")
 
 
@@ -129,7 +134,7 @@ def render_needs(model: NowModel) -> str:
         body.extend(_row(i) for i in rows)
     return (
         '<section class="needs" aria-labelledby="needs-h">'
-        f"{_headline(model)}"
+        f"{_headline(model)}{_FILTER}"
         '<div class="cols" aria-hidden="true"><span></span><span class="label">Age</span>'
         '<span class="label">Repo</span><span class="label">Kind</span>'
         '<span class="label">Reason</span><span class="label r">Command</span></div>'

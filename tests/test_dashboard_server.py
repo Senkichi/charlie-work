@@ -197,3 +197,22 @@ def test_run_server_collects_serves_and_stops(fake: Fake) -> None:
     assert not runner.is_alive() and fake.calls >= 1
     with pytest.raises(urllib.error.URLError):
         urllib.request.urlopen(f"http://127.0.0.1:{server.port}/healthz", timeout=1)
+
+
+@pytest.mark.parametrize("name", ["dashboard.js", "theme-init.js"])
+def test_scripts_served_as_javascript_and_page_references_them(served, name: str) -> None:
+    resp, body = _get(served, f"/static/{name}")
+    assert resp.status == 200
+    assert resp.getheader("Content-Type", "").startswith("text/javascript")  # RFC 9239
+    assert body
+    _, page = _get(served, "/")
+    assert f'src="/static/{name}"' in page.decode()
+
+
+def test_theme_init_is_synchronous_in_head_and_dashboard_js_deferred(served) -> None:
+    _, page = _get(served, "/")
+    text = page.decode()
+    assert '<script src="/static/theme-init.js"></script>' in text
+    assert text.index("theme-init.js") < text.index("</head>")
+    assert '<script src="/static/dashboard.js" defer></script>' in text
+    assert 'id="theme-toggle"' in text and 'id="keyhelp"' in text

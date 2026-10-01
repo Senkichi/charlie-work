@@ -18,6 +18,7 @@ from ..read_model import ModelState
 from .now_capacity import render_capacity, render_repo_ledger
 from .now_flow import render_flow, render_not_dispatchable
 from .now_fmt import age, esc, local_time, repo_url, short_repo
+from .now_keyhelp import KEY_HELP
 from .now_needs import render_needs
 
 
@@ -80,9 +81,13 @@ def _header(state: ModelState, poll_seconds: int) -> str:
         "</nav>"
     )
     fresh = _freshness(model) if model is not None else ""
+    theme_btn = (
+        '<button type="button" id="theme-toggle" class="themebtn" '
+        'aria-label="Theme: system. Activate to change.">theme: system</button>'
+    )
     return (
         '<header class="top"><div class="top-line"><span class="brand">Fleet '
-        f"<em>· Now</em></span>{nav}{asof}</div>{fresh}</header>"
+        f"<em>· Now</em></span>{nav}{asof}{theme_btn}</div>{fresh}</header>"
     )
 
 
@@ -116,7 +121,8 @@ def render_now(state: ModelState, theme: str = "auto", *, poll_seconds: int = 20
         "<title>Fleet Now</title>"
         '<link rel="stylesheet" href="/static/dashboard.css">'
         '<link rel="stylesheet" href="/static/now.css">'
+        '<script src="/static/theme-init.js"></script>'
         '<script src="/static/htmx.min.js" defer></script>'
         '<script src="/static/dashboard.js" defer></script></head><body>'
-        f"{render_fragment(state, poll_seconds)}</body></html>"
+        f"{render_fragment(state, poll_seconds)}{KEY_HELP}</body></html>"
     )

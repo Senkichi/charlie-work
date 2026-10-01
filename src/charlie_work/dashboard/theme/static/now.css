@@ -189,3 +189,23 @@ svg.rsvg { width: 36px; height: 12px; flex: none; }
   .row .cmd { justify-content: space-between; }
   .row button.copy { padding: 2px var(--lj-space-3); }
 }
+
+/* ---------- interaction (dashboard.js) ---------- */
+.themebtn { font-size: var(--lj-text-1); text-transform: uppercase; letter-spacing: var(--lj-label-spacing); color: var(--lj-gray-text); }
+.needs-filter { padding: var(--lj-space-2) 0; }
+.needs-filter input {
+  width: 100%; font: inherit; font-size: var(--lj-text-2); color: var(--lj-ink);
+  background: var(--lj-card); border: var(--lj-stroke-cardHairline) solid var(--lj-hair);
+  border-radius: var(--lj-radius-button); padding: var(--lj-space-1) var(--lj-space-3);
+}
+ol.ledger-now > [hidden] { display: none; }
+.row.is-sel { background: var(--lj-raised); outline: 2px solid var(--lj-ink); outline-offset: -2px; }
+.keyhelp {
+  position: fixed; right: var(--lj-space-5); bottom: var(--lj-space-5); z-index: 10;
+  background: var(--lj-card); border: var(--lj-stroke-cardHairline) solid var(--lj-hair);
+  border-radius: var(--lj-radius-card); padding: var(--lj-space-3) var(--lj-space-4);
+}
+.keyhelp[hidden] { display: none; }
+.keyhelp dl { display: grid; grid-template-columns: auto 1fr; gap: var(--lj-space-1) var(--lj-space-3); margin: var(--lj-space-2) 0 0; }
+.keyhelp dt, .keyhelp dd { margin: 0; font-size: var(--lj-text-2); }
+@media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }

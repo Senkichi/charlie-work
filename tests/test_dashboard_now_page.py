@@ -257,3 +257,11 @@ def test_static_assets_served_and_token_only() -> None:
     tokens = generate_css()
     assert "@media (prefers-color-scheme: dark)" in tokens
     assert ':root[data-theme="dark"]' in tokens and "#1E1611" in tokens  # Lamplit Paper page
+
+
+def test_dashboard_scripts_avoid_dynamic_code_and_html_injection() -> None:
+    for name in ("dashboard.js", "theme-init.js"):
+        src = static_asset(name).read_text(encoding="utf-8")
+        for banned in ("eval(", "new Function", "innerHTML", "outerHTML", "document.write"):
+            assert banned not in src, f"{name} uses {banned}"
+    assert "cw-dash-theme" in static_asset("theme-init.js").read_text(encoding="utf-8")
