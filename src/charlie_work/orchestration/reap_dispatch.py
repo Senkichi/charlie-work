@@ -587,3 +587,114 @@ def dispatch(
         )
     finally:
         launch_lock.release()
+
+
+def _probe_ci_absence(
+    self,
+    pr: dict[str, Any],
+    verdict: JanitorVerdict,
+    pr_state: dict[str, Any] | None,
+) -> tuple[str | None, str | None, int]:
+    """Run ``_detect_ci_absence`` for ``review()``'s janitor gate (issue #1681).
+
+    Returns ``(never_created_head, workflow_no_jobs_head, attempts)``. A head
+    already recorded as never-created is re-probed once per
+    ``stale_checks_retrigger_attempts`` value (bounded by the retrigger cap), so
+    a same-head transition to ``workflow_no_jobs`` is not masked by the dedup
+    marker. Does NOT take ``state_lock``.
+    """
+    pr_state = pr_state or {}
+    raw_attempts = pr_state.get("stale_checks_retrigger_attempts")
+    attempts = raw_attempts if isinstance(raw_attempts, int) else 0
+    absence = self._detect_ci_absence(
+        pr,
+        verdict,
+        known_head=pr_state.get("ci_run_never_created_head"),
+        reprobe_known_head=pr_state.get("ci_absence_probed_attempts") != attempts,
+    )
+    kind = absence.kind if absence is not None else None
+    head_sha = absence.head_sha if absence is not None else None
+    return (
+        head_sha if kind == "never_created" else None,
+        head_sha if kind == "workflow_no_jobs" else None,
+        attempts,
+    )
+
+
+def _record_ci_absence_state(
+    self,
+    state: dict[str, Any],
+    pr_state_update: dict[str, Any],
+    existing_pr_state: dict[str, Any],
+    pr: dict[str, Any],
+    verdict: JanitorVerdict,
+    issue_number: int | None,
+    *,
+    never_created_head: str | None,
+    workflow_no_jobs_head: str | None,
+    attempts: int,
+) -> dict[str, Any]:
+    """Persist the absence markers + once-per-head events; return ``state``.
+
+    Must be called inside ``state_lock``. Marker writes go into
+    ``pr_state_update`` (the caller's fresh dict) which is then stored on
+    ``state``. The ``workflow_no_jobs`` event dedup is event-only: routing is
+    NOT gated on the marker, so a rework that pushes nothing new is re-routed
+    (and capped by ``record_review``), never re-parked.
+    """
+    pr_number = pr_state_update["number"]
+    pr_state_update["ci_absence_probed_attempts"] = attempts
+    emit: list[tuple[str, str]] = []
+    for kind, marker, head in (
+        ("workflow_no_jobs", "workflow_no_jobs_head", workflow_no_jobs_head),
+        ("ci_run_never_created", "ci_run_never_created_head", never_created_head),
+    ):
+        if head is None:
+            continue
+        if existing_pr_state.get(marker) != head:
+            emit.append((kind, head))
+        pr_state_update[marker] = head
+    state["prs"][str(pr_number)] = pr_state_update
+    for kind, head in emit:
+        state = self._record_event(
+            state,
+            kind,
+            {
+                "pr_number": pr_number,
+                "issue_number": issue_number,
+                "head_sha": head,
+                "branch": pr.get("headRefName"),
+                "missing_checks": list(verdict.missing_required_checks),
+            },
+        )
+    return state
+
+
+def _route_workflow_no_jobs(
+    self,
+    pr: dict[str, Any],
+    pr_number: int,
+    issue_number: int,
+    verdict: JanitorVerdict,
+    head_sha: str,
+) -> Any:
+    """Route a ``workflow_no_jobs`` head to rework (issue #1681).
+
+    Retrigger cannot fix a rejected workflow file, so ``review()`` returns this
+    instead of re-parking the PR as ``janitor_blocked``.
+    """
+    _wf.transition(self.gh, self.config.labels, issue_number, "review_started")
+    missing = ", ".join(verdict.missing_required_checks)
+    diagnostic = (
+        f"workflow file invalid: run completed with no jobs created for head "
+        f"{head_sha}; required check(s) {missing} can never "
+        f"report for this head. Fix the workflow file and push."
+    )
+    return self.record_review(
+        pr_number,
+        "request_changes",
+        summary=diagnostic,
+        reviewed_head=pr.get("headRefOid"),
+        required_changes=[diagnostic],
+        verdict_provenance="ci_gate_auto_reject",
+    )
