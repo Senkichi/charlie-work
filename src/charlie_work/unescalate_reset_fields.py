@@ -363,4 +363,10 @@ REWORK_BUDGET_RESET_BY_ESCALATION_REASON: dict[str, tuple[tuple[str, ...], tuple
 # ``UNESCALATE_ISSUE_RESET_FIELDS`` so the operator door stays in agreement.
 ISSUE_BUDGET_RESET_BY_ESCALATION_REASON: dict[str, tuple[str, ...]] = {
     "redispatch_cap_exceeded": ("redispatch_at",),
+    # The remaining dispatch-side windowed caps gate identically (a full
+    # issue-entry timestamp window re-trips on the next dispatch attempt), so
+    # an inert clear would burn ``auto_deescalation_count`` the same way.
+    "worker_death_loop": ("worker_death_at",),
+    "dispatch_blocked_environment": ("blocked_environment_at",),
+    "dispatch_failed_cap_exceeded": ("dispatch_failed_at",),
 }

@@ -370,23 +370,6 @@ _NO_COUNTER_ALLOWLIST: dict[str, str] = {
         "triggering condition (required checks missing) is a janitor "
         "blocker, so the sweep cannot clear while it persists."
     ),
-    # --- issue-level windowed caps: the sweep's map resets PR-record ---
-    # --- fields only; these live on the issue record and are the      ---
-    # --- operator door's UNESCALATE_ISSUE_RESET_FIELDS domain. They   ---
-    # --- re-gate only on a fresh dispatch attempt (the next genuine   ---
-    # --- rework cycle), not on the very next pass.                    ---
-    "worker_death_loop": (
-        "Gated by the issue-level ``worker_death_at`` windowed-timestamp "
-        "list; operator-door domain."
-    ),
-    "dispatch_blocked_environment": (
-        "Gated by the issue-level ``blocked_environment_at`` "
-        "windowed-timestamp list; operator-door domain."
-    ),
-    "dispatch_failed_cap_exceeded": (
-        "Gated by the issue-level ``dispatch_failed_at`` "
-        "windowed-timestamp list; operator-door domain."
-    ),
     # --- DETERMINISTIC_ESCALATION_FAILURE_KINDS members: deterministic ---
     # --- failure classifications, escalated on first occurrence --    ---
     # --- there is no retry counter to re-arm.                         ---
@@ -787,7 +770,18 @@ def test_every_mechanical_escalation_reason_is_mapped_or_allowlisted() -> None:
     )
 
 
-def test_sweep_resets_redispatch_at_for_redispatch_cap_exceeded(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("reason", "field"),
+    [
+        ("redispatch_cap_exceeded", "redispatch_at"),
+        ("worker_death_loop", "worker_death_at"),
+        ("dispatch_blocked_environment", "blocked_environment_at"),
+        ("dispatch_failed_cap_exceeded", "dispatch_failed_at"),
+    ],
+)
+def test_sweep_resets_redispatch_at_for_redispatch_cap_exceeded(
+    tmp_path: Path, reason: str, field: str
+) -> None:
     """Issue #2101: the no-op rework cap gates on the issue-entry
     ``redispatch_at`` window, so a clear that leaves it full re-escalates on
     the next detection. The clear must drop it and report a real reset."""
@@ -800,15 +794,15 @@ def test_sweep_resets_redispatch_at_for_redispatch_cap_exceeded(tmp_path: Path) 
             "number": 456,
             "issue_number": 123,
             "status": "escalated",
-            "escalation_reason": "redispatch_cap_exceeded",
+            "escalation_reason": reason,
         }
         state["issues"]["123"] = {
             "number": 123,
             "status": "escalated",
-            "escalation_reason": "redispatch_cap_exceeded",
+            "escalation_reason": reason,
             "reason_class": "mechanical",
             "terminal_since": now.isoformat(),
-            "redispatch_at": full_window,
+            field: full_window,
         }
         save_state(app.paths.state_file, state)
 
@@ -817,7 +811,7 @@ def test_sweep_resets_redispatch_at_for_redispatch_cap_exceeded(tmp_path: Path) 
     state = load_state(app.paths.state_file)
     issue_123 = state["issues"]["123"]
     assert issue_123["status"] == PASSIVE_OPEN_STATUS
-    assert "redispatch_at" not in issue_123
+    assert field not in issue_123
     cleared = _events(state, "deescalation_cleared")
     assert cleared[0]["payload"]["rework_budget_reset"] is True
 
