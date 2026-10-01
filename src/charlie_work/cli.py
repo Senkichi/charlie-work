@@ -52,6 +52,7 @@ from .supervise_loop import (
     PREFLIGHT_REFUSAL_EXIT_CODE,
 )
 from .fleet_pause import register_fleet_pause_subparsers, run_fleet_pause, run_fleet_resume
+from .control_plane_priority import raise_to_normal_priority
 from .fleet_paths import fleet_dir
 from .fleet_registry import _load_registry, touch_repo, count_fleet_runners
 from .fleet_status import (  # noqa: F401  (deliberate re-export)
@@ -1395,6 +1396,11 @@ def run_fleet_bash_rats(args: argparse.Namespace) -> CommandResult:
     )
 
 
+def _raise_control_plane_priority() -> None:
+    """Startup hook for the fleet supervisor processes (issue #2140)."""
+    raise_to_normal_priority(supervisor_runtime_paths(layout.DEFAULT_STATE_DIR).state_file)
+
+
 def run_fleet_supervise_command(args: argparse.Namespace) -> CommandResult:
     """Run the continuous fleet supervisor.
 
@@ -2569,8 +2575,10 @@ def main(argv: list[str] | None = None) -> int:
             elif args.fleet_command == "bash-rats":
                 result = run_fleet_bash_rats(args)
             elif args.fleet_command == "supervise":
+                _raise_control_plane_priority()
                 result = run_fleet_supervise_command(args)
             elif args.fleet_command == "supervise-loop":
+                _raise_control_plane_priority()
                 result = run_fleet_supervise_loop(
                     supervise_args=tuple(args.supervise_args),
                     max_relaunches=args.max_relaunches,
