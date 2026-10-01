@@ -134,14 +134,27 @@ class _Collect(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.tags: list[tuple[str, dict[str, str | None]]] = []
         self.text: list[str] = []
+        # Bodies of <script> elements as the parser sees them, so an end tag a regex
+        # would miss (``</script >``) cannot hide an inline script from the CSP checks.
+        self.script_bodies: list[str] = []
+        self._in_script = False
 
     def handle_starttag(self, tag, attrs):
         self.tags.append((tag, dict(attrs)))
+        if tag == "script":
+            self._in_script = True
+            self.script_bodies.append("")
+
+    def handle_endtag(self, tag):
+        if tag == "script":
+            self._in_script = False
 
     def handle_startendtag(self, tag, attrs):
         self.tags.append((tag, dict(attrs)))
 
     def handle_data(self, data):
+        if self._in_script:
+            self.script_bodies[-1] += data
         self.text.append(data)
 
 

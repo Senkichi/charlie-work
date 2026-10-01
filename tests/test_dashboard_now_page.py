@@ -84,8 +84,13 @@ def test_no_inline_style_or_script_anywhere() -> None:
         for tag, attrs in _parse(html_text).tags:
             if tag == "script":
                 assert attrs.get("src", "").startswith("/static/")
-        scripts = re.findall(r"<script\b[^>]*>(.*?)</script>", html_text, re.S | re.I)
-        assert all(body == "" for body in scripts)
+        assert all(body == "" for body in _parse(html_text).script_bodies)
+
+
+def test_inline_script_check_sees_through_spaced_end_tags() -> None:
+    # Positive control for the CSP check above: the parser must find these bodies.
+    assert _parse("<script>a()</script >").script_bodies == ["a()"]
+    assert _parse('<script src="/static/x.js"></script>').script_bodies == [""]
 
 
 def test_collector_failure_banner() -> None:
