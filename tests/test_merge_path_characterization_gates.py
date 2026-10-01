@@ -7,6 +7,7 @@ the 800-line module cap); the harness lives in
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -428,6 +429,13 @@ def test_front_of_train_discovers_head_from_pr_list_when_param_absent(tmp_path: 
             summary="ok",
             verdict_provenance="fresh_llm_review",
         )
+        # PR 100 must be the earlier reviewed one. record_review stamps
+        # wall-clock seconds, so PR 456 (reviewed first by the harness) wins
+        # whenever the two stamps straddle a second boundary; pin it.
+        decision_path = _paths.prs / "pr-100" / "review-decision.json"
+        decision = json.loads(decision_path.read_text(encoding="utf-8"))
+        decision["reviewed_at"] = "2020-01-01T00:00:00Z"
+        decision_path.write_text(json.dumps(decision), encoding="utf-8")
 
     pair = _pair(tmp_path, _cfg(strategy="front_of_train"), gh_factory, pre=pre)
 
