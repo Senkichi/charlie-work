@@ -99,3 +99,12 @@ def schema_sql() -> str:
         parts.append(f"CREATE TABLE IF NOT EXISTS {name} ({_KEY}, {cols}, {_PK});")
     parts.append(f"CREATE TABLE IF NOT EXISTS {JOB_TABLE} ({_JOB_DDL});")
     return "\n".join(parts)
+
+
+def schema_statements() -> list[str]:
+    """``schema_sql`` split into single statements (no DDL string contains ``;``).
+
+    Lets a caller run the DDL inside an open transaction: ``executescript`` would
+    COMMIT it first.
+    """
+    return [part.strip() for part in schema_sql().split(";") if part.strip()]

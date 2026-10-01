@@ -29,7 +29,9 @@ from pathlib import Path
 from typing import Any
 
 from .. import layout
-from ..fleet_registry import _load_registry
+
+# Private on purpose: no public events-DB path helper exists (`_db_path` is the one derivation
+# log_event itself uses, and cli/doctor/fleet_status import it too); promote it in a follow-up.
 from ..instrumentation import _db_path
 from ..supervisor_lifecycle import HEARTBEAT_FILENAME
 
@@ -99,15 +101,33 @@ def fleet_sources(fleet_dir_override: str | None = None) -> FleetSources:
     )
 
 
-def enumerate_repos(fleet_dir_override: str | None = None) -> tuple[RepoSource, ...]:
-    """Return one ``RepoSource`` per ``fleet.json`` entry, sorted by key.
+def read_registry(path: Path) -> tuple[dict[str, Any], str | None]:
+    """Parse ``fleet.json``; a missing file is an empty registry, a bad one is an error.
 
-    Entries without a ``repo_root`` or ``state_dir`` cannot be located and are
-    skipped; paths are not checked for existence (that is the reader's error
-    value, so a vanished lane stays visible as an error rather than disappearing).
-    A missing or corrupt registry yields ``()``.
+    ``fleet_registry._load_registry`` swallows corruption into an empty registry, which
+    would make an unreadable file look like "no repos registered". Here the two differ:
+    the second element is an error string only when the file exists but cannot be used.
     """
-    data = _load_registry(layout.fleet_registry_path(override=fleet_dir_override))
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {"repos": {}}, None
+    except OSError as exc:
+        return {"repos": {}}, f"fleet registry unreadable: {path}: {exc}"
+    try:
+        data = json.loads(text)
+    except ValueError as exc:
+        return {"repos": {}}, f"fleet registry corrupt: {path}: {exc}"
+    if not isinstance(data, dict) or not isinstance(data.get("repos", {}), dict):
+        return {"repos": {}}, f"fleet registry corrupt: {path}: unexpected structure"
+    return data, None
+
+
+def load_repos(
+    fleet_dir_override: str | None = None,
+) -> tuple[tuple[RepoSource, ...], str | None]:
+    """``enumerate_repos`` plus the registry error (None when readable or absent)."""
+    data, error = read_registry(layout.fleet_registry_path(override=fleet_dir_override))
     out: list[RepoSource] = []
     for key, entry in sorted(data.get("repos", {}).items()):
         if not isinstance(entry, dict) or not entry.get("repo_root") or not entry.get("state_dir"):
@@ -122,7 +142,19 @@ def enumerate_repos(fleet_dir_override: str | None = None) -> tuple[RepoSource, 
                 events_db=_db_path(layout.state_file_path(state_dir)),
             )
         )
-    return tuple(out)
+    return tuple(out), error
+
+
+def enumerate_repos(fleet_dir_override: str | None = None) -> tuple[RepoSource, ...]:
+    """Return one ``RepoSource`` per ``fleet.json`` entry, sorted by key.
+
+    Entries without a ``repo_root`` or ``state_dir`` cannot be located and are
+    skipped; paths are not checked for existence (that is the reader's error
+    value, so a vanished lane stays visible as an error rather than disappearing).
+    A missing or corrupt registry yields ``()``; callers that must tell those apart
+    use ``load_repos``.
+    """
+    return load_repos(fleet_dir_override)[0]
 
 
 def _parse_utc(value: Any) -> datetime | None:

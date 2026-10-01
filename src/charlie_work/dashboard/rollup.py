@@ -33,7 +33,7 @@ from .rollup_schema import (
     SCHEMA_VERSION,
     SOURCE_SCOPED_TABLES,
     WINDOWED_TABLES,
-    schema_sql,
+    schema_statements,
 )
 
 WINDOW = timedelta(hours=6)
@@ -49,6 +49,7 @@ class RollupSources:
     db_path: Path
     fleet_events_db: Path
     repos: tuple[tuple[str, Path], ...]  # (repo key, that repo's events.db)
+    registry_error: str | None = None  # fleet.json exists but is unusable
 
 
 @dataclass(frozen=True)
@@ -65,6 +66,7 @@ class RollupResult:
     sources: tuple[SourceResult, ...]
     db_rebuilt: bool  # dashboard.db was dropped (missing schema version / mismatch)
     error: str | None = None  # dashboard.db itself unusable
+    registry_error: str | None = None  # fleet.json corrupt: repos silently missing
 
     @property
     def ingested(self) -> int:
@@ -73,15 +75,18 @@ class RollupResult:
     @property
     def errors(self) -> tuple[str, ...]:
         found = [f"{s.source}: {s.error}" for s in self.sources if s.error]
-        return tuple(([self.error] if self.error else []) + found)
+        head = [e for e in (self.error, self.registry_error) if e]
+        return tuple(head + found)
 
 
 def rollup_sources(fleet_dir_override: str | None = None) -> RollupSources:
     """Resolve rollup inputs from ``fleet.json`` plus the global events DB."""
+    repos, registry_error = src.load_repos(fleet_dir_override)
     return RollupSources(
         db_path=layout.dashboard_db_path(override=fleet_dir_override),
         fleet_events_db=src.fleet_sources(fleet_dir_override).events_db,
-        repos=tuple((r.key, r.events_db) for r in src.enumerate_repos(fleet_dir_override)),
+        repos=tuple((r.key, r.events_db) for r in repos),
+        registry_error=registry_error,
     )
 
 
@@ -89,39 +94,59 @@ def _iso(moment: datetime) -> str:
     return moment.astimezone(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
-def _unlink_db(path: Path) -> None:
-    for suffix in ("", "-wal", "-shm"):
-        Path(f"{path}{suffix}").unlink(missing_ok=True)
+def _user_tables(conn: sqlite3.Connection) -> list[str]:
+    rows = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+    ).fetchall()
+    return [r[0] for r in rows]
 
 
 def _open_dashboard_db(path: Path) -> tuple[sqlite3.Connection | None, bool, str | None]:
-    """Open (creating or dropping-and-recreating on version mismatch) dashboard.db."""
-    rebuilt = False
+    """Open dashboard.db, creating it or rebuilding it in place on a version mismatch.
+
+    The file is never unlinked: another process (collector, CLI) may be creating or
+    rebuilding it at the same moment. Instead the check, drop and re-create run under one
+    ``BEGIN IMMEDIATE``, which serialises concurrent openers on SQLite's own write lock.
+    A directory that does not exist is an error (a mistyped fleet dir must not grow a
+    ghost dashboard.db). A file that is not a database at all is an error value too;
+    deleting it is the operator's call.
+    """
+    if not path.parent.is_dir():
+        return None, False, f"cannot open {path}: fleet directory does not exist"
+    conn: sqlite3.Connection | None = None
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        if path.exists():
-            conn = sqlite3.connect(path, isolation_level=None)
-            try:
-                row = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
-                current = row is not None and row[0] == str(SCHEMA_VERSION)
-            except sqlite3.Error:
-                current = False  # corrupt or pre-versioned: a cache, so just rebuild
-            if not current:
-                conn.close()
-                _unlink_db(path)
-                rebuilt = True
-            else:
-                return conn, False, None
-        conn = sqlite3.connect(path, isolation_level=None)
+        # Generous busy timeout: a concurrent cold rollup holds the write lock for its
+        # whole first ingest, and waiting beats failing the second runner.
+        conn = sqlite3.connect(path, isolation_level=None, timeout=60)
         conn.execute("PRAGMA journal_mode=WAL")
-        conn.executescript(schema_sql())
-        conn.execute(
-            "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?)",
-            (str(SCHEMA_VERSION),),
-        )
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            tables = _user_tables(conn)
+            row = (
+                conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+                if "meta" in tables
+                else None
+            )
+            rebuilt = False
+            if row is None or row[0] != str(SCHEMA_VERSION):
+                rebuilt = bool(tables)  # a cache: drop stale tables, rebuild from sources
+                for table in tables:
+                    conn.execute(f'DROP TABLE "{table}"')
+                for statement in schema_statements():
+                    conn.execute(statement)
+                conn.execute(
+                    "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?)",
+                    (str(SCHEMA_VERSION),),
+                )
+            conn.execute("COMMIT")
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
         return conn, rebuilt, None
     except (sqlite3.Error, OSError) as exc:
-        return None, rebuilt, f"cannot open {path}: {exc}"
+        if conn is not None:
+            conn.close()
+        return None, False, f"cannot open {path}: {exc}"
 
 
 def _decode(row: sqlite3.Row) -> dict[str, Any]:
@@ -190,22 +215,29 @@ def _ingest_source(dst: sqlite3.Connection, source: str, db: Path, cutoff: str) 
         return SourceResult(source, 0, 0, False, err)
     try:
         max_id = srcdb.execute("SELECT COALESCE(MAX(id), 0) FROM events").fetchone()[0]
-        row = dst.execute("SELECT max_id FROM watermarks WHERE source = ?", (source,)).fetchone()
-        wm = row[0] if row else 0
-        rebuilt = wm > max_id  # source DB was replaced under us
-        if rebuilt:
-            wm = 0
-        kinds = sorted(k for k in HANDLERS if source == FLEET_SOURCE or k not in GLOBAL_ONLY_KINDS)
-        marks = ", ".join("?" for _ in kinds)
-        events = srcdb.execute(
-            "SELECT id, ts, kind, payload, pr_number, issue_number FROM events"
-            f" WHERE (id > ? OR ts >= ?) AND id <= ? AND kind IN ({marks})"
-            " AND NOT (kind = 'reconcile' AND CASE WHEN json_valid(payload)"
-            f" THEN json_extract(payload, '$.kind') END IS '{_STALE_RECONCILE}') ORDER BY id",
-            (wm, cutoff, max_id, *kinds),
-        )
+        # Take the write lock BEFORE reading the watermark: a concurrent pass that wins
+        # the race commits its watermark first, so this one starts from it instead of
+        # re-ingesting (and re-reporting) the same rows.
         dst.execute("BEGIN IMMEDIATE")
         try:
+            row = dst.execute(
+                "SELECT max_id FROM watermarks WHERE source = ?", (source,)
+            ).fetchone()
+            wm = row[0] if row else 0
+            rebuilt = wm > max_id  # source DB was replaced under us
+            if rebuilt:
+                wm = 0
+            kinds = sorted(
+                k for k in HANDLERS if source == FLEET_SOURCE or k not in GLOBAL_ONLY_KINDS
+            )
+            marks = ", ".join("?" for _ in kinds)
+            events = srcdb.execute(
+                "SELECT id, ts, kind, payload, pr_number, issue_number FROM events"
+                f" WHERE (id > ? OR ts >= ?) AND id <= ? AND kind IN ({marks})"
+                " AND NOT (kind = 'reconcile' AND CASE WHEN json_valid(payload)"
+                f" THEN json_extract(payload, '$.kind') END IS '{_STALE_RECONCILE}') ORDER BY id",
+                (wm, cutoff, max_id, *kinds),
+            )
             if wm == 0:
                 _wipe_source(dst, source)
             else:
@@ -249,7 +281,7 @@ def run_rollup(sources: RollupSources, now: datetime) -> RollupResult:
     """
     dst, db_rebuilt, err = _open_dashboard_db(sources.db_path)
     if dst is None:
-        return RollupResult((), db_rebuilt, err)
+        return RollupResult((), db_rebuilt, err, sources.registry_error)
     cutoff = _iso(now - WINDOW)
     try:
         plan = [(FLEET_SOURCE, sources.fleet_events_db), *sources.repos]
@@ -257,8 +289,8 @@ def run_rollup(sources: RollupSources, now: datetime) -> RollupResult:
         dst.execute(
             "INSERT OR REPLACE INTO meta (key, value) VALUES ('rolled_up_at', ?)", (_iso(now),)
         )
-        return RollupResult(results, db_rebuilt)
+        return RollupResult(results, db_rebuilt, None, sources.registry_error)
     except sqlite3.Error as exc:
-        return RollupResult((), db_rebuilt, f"{type(exc).__name__}: {exc}")
+        return RollupResult((), db_rebuilt, f"{type(exc).__name__}: {exc}", sources.registry_error)
     finally:
         dst.close()

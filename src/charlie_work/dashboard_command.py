@@ -47,6 +47,10 @@ def _load_dashboard_config(fleet_dir_override: str | None) -> DashboardConfig:
     section = raw.get(DASHBOARD_SECTION) if isinstance(raw, dict) else None
     if section is None:
         return DashboardConfig()
+    if not isinstance(section, dict):
+        # `dashboard: false` must not silently mean "enabled" (build_config_from_data
+        # coerces a non-mapping section to defaults), so a malformed kill switch fails closed.
+        raise ConfigError(f"{DASHBOARD_SECTION}: expected a mapping, got {type(section).__name__}")
     return build_config_from_data({DASHBOARD_SECTION: section}).dashboard
 
 
@@ -125,7 +129,11 @@ def run_dashboard_command(args: argparse.Namespace) -> CommandResult:
     if args.dashboard_command == "now":
         from .dashboard.now_collect import collect_sources_read
         from .dashboard.now_model import build_now_model
+        from .dashboard.sources import load_repos
 
+        registry_error = load_repos(override)[1]
+        if registry_error:  # an unreadable registry is not "no repos"
+            return CommandResult(False, registry_error, {})
         model = build_now_model(collect_sources_read(now, override), now, findings=[])
         return CommandResult(True, "dashboard now", _plain(model))
     if args.dashboard_command == "history":
