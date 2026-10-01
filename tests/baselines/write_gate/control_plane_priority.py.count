@@ -1,0 +1,6 @@
+1
+# Issue #2140: +1 raw log_event call in raise_to_normal_priority's failure
+# path (the control_plane_priority_failed audit row). A standalone function in
+# a new top-level module with no OrchestratorApp receiver, called from cli.py
+# before any state lock exists -- the same out-of-wave pattern as host_load.py
+# and ci_headroom.py's _log_unavailable helpers.
