@@ -3,15 +3,17 @@
 ``state.json``'s ``prs[N].decision`` / ``reviewed_head_sha`` / ``decision_path``
 fields are a *cache* of the file-first ``review_decision``/
 ``resolve_decision_payload`` resolution -- never a second source of truth.
-Exactly six production sites are permitted to set new values for these keys
+Exactly these production sites are permitted to set new values for these keys
 on a PR's ``state["prs"][pr_number]`` entry:
 
 * ``review`` -- the new-dispatch placeholder write, immediately after (and
   sourced from) its own ``record_decision(..., archive_round=False)`` call.
 * ``record_review`` -- the reviewer-verdict writer, immediately after its own
   ``record_decision(...)`` call.
-* ``merge_ready`` -- the carry-forward branch, immediately after calling
-  ``_update_approval_head`` (which itself calls ``record_decision``).
+* ``merge_path.apply_stages.carry_forward`` -- the carry-forward branch
+  (extracted from ``merge_ready``), immediately after calling
+  ``_update_approval_head`` (which itself calls ``record_decision``); and
+  ``merge_path.apply_stages.re_review`` -- the head-moved stamp.
 * ``_route_to_rework`` -- deliberately *preserves* prior values via
   ``pr_entry.get(...)``; the verdict file is untouched by design.
 * ``_update_approval_head`` -- the carry-forward writer, immediately after
@@ -57,7 +59,6 @@ _SANCTIONED_FUNCTIONS = frozenset(
     {
         "review",
         "record_review",
-        "merge_ready",
         "_route_to_rework",
         "_update_approval_head",
         "_refresh_pr_decision_cache",
@@ -69,6 +70,15 @@ _SANCTIONED_FUNCTIONS = frozenset(
         # a stale re-read).
         "_local_build_packet",
         "record_local_review",
+        # merge-path extraction: ``merge_ready``'s carry-forward and
+        # head-moved branches moved verbatim into ``merge_path.apply_stages``.
+        # ``carry_forward`` stamps the decision returned by a fresh
+        # ``app._review_decision`` call made immediately after
+        # ``_update_approval_head``; ``re_review`` records the verdict's own
+        # reviewed head (the value the decision under review carries), never
+        # a stale re-read of state.json.
+        "carry_forward",
+        "re_review",
     }
 )
 

@@ -230,7 +230,14 @@ def _seed_issue_entry(paths: Any, **fields: Any) -> None:
 def _assert_dry_run_inert(out: _Outcome) -> None:
     """The dry-run invariant: state.json (counters and events included) is
     untouched and nothing mutating reached GitHub."""
-    assert out.state_after == out.state_before
+
+    # ``generated_at`` is a wall-clock stamp: with no state file on disk
+    # ``load_state`` mints a fresh default each call, so two loads straddling
+    # a second boundary differ without any write having happened.
+    def _stable(state: dict[str, Any]) -> dict[str, Any]:
+        return {k: v for k, v in state.items() if k != "generated_at"}
+
+    assert _stable(out.state_after) == _stable(out.state_before)
     gh = out.gh
     assert gh.merged == []
     assert gh.pr_labels_added == []
