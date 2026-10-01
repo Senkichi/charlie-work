@@ -43,7 +43,6 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from charlie_work import host as _host
 from charlie_work.dispatch_deferral import deferral_reason, record_lane_result
 from charlie_work.fleet_registry import try_acquire_fleet_lock
 from charlie_work.worker_launch_gate import (
@@ -161,9 +160,7 @@ def read_fleet_review_cap(app: OrchestratorApp) -> FleetReviewCap | None:
     fleet_max = app.config.fleet.global_max_concurrent_reviews
     if fleet_max <= 0:
         return None
-    live_count, _skipped_repos = _host.current().sessions.fleet_live_reviews(
-        app.fleet_dir_override
-    )
+    live_count, _skipped_repos = app.host.sessions.fleet_live_reviews(app.fleet_dir_override)
     return FleetReviewCap(fleet_max=fleet_max, fleet_live_count=live_count)
 
 

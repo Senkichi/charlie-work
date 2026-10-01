@@ -33,6 +33,7 @@ from .review_launch import (  # noqa: F401 deliberate re-export
     _launch_review_claude_code,
     _launch_review_devin_shell,
 )
+from .host import HostPorts, current as _host_current
 from .worker_launch_gate import FleetLaunchLock
 from .review_fleet_gate import (
     fleet_lock_held_result_data,
@@ -2056,7 +2057,10 @@ class OrchestratorApp:
         *,
         dry_run: bool = False,
         fleet_dir_override: str | None = None,
+        host: HostPorts | None = None,
     ):
+        # Production composition only; tests use the ``fake_host`` fixture.
+        self._host = host
         self.repo_root = repo_root
         self.paths = paths
         self.config = config
@@ -2101,6 +2105,11 @@ class OrchestratorApp:
         # installed CLI. Fail fast before any dispatch/review/merge work.
         if isinstance(self.gh, GitHub):
             self.gh.validate_field_lists()
+
+    @property
+    def host(self) -> HostPorts:
+        """Explicit ``host=`` if given, else the active ports, read at access time."""
+        return self._host if self._host is not None else _host_current()
 
     @_guard_state_lock
     def status(self, *, use_cache: bool = True) -> CommandResult:
@@ -4952,7 +4961,6 @@ class OrchestratorApp:
         # ``self.config.reviewer.model`` below instead, exactly as before.
         reviewer_harness = role_cfg.reviewer.harness  # issue #2086: the selected chain entry
         reviewer_adapter_settings = self._adapter_settings(adapter=reviewer_harness)
-        reviewer_launcher = _REVIEW_LAUNCHERS.get(reviewer_harness)
         for candidate in selected:
             pr_number = candidate["pr"]
             issue_number = candidate["issue"]
@@ -5014,23 +5022,8 @@ class OrchestratorApp:
                 # an actual dispatch pass. adapters.py's worker-dispatch path
                 # (_run_claude_code_adapter) already forwards config the same
                 # way.
-                if reviewer_launcher is None:
-                    # Unreachable in production: ReviewerRoleConfig.__post_init__
-                    # already restricts reviewer.harness to
-                    # harnesses.REVIEWER_HARNESSES, which _REVIEW_LAUNCHERS'
-                    # keys are asserted equal to at import time. Guarded
-                    # anyway so a config object built directly (bypassing
-                    # validation, e.g. in a test) fails as a per-PR error
-                    # value rather than a raise.
-                    failed.append(
-                        {
-                            "pr": pr_number,
-                            "error": f"unsupported reviewer harness: {reviewer_harness!r}",
-                        }
-                    )
-                    continue
-
-                record = reviewer_launcher(
+                record = self.host.launch.launch(
+                    reviewer_harness,
                     pr_number=pr_number,
                     branch=branch,
                     prompt_path=prompt_path,

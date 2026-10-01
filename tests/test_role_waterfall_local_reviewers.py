@@ -16,7 +16,6 @@ Fixture helpers are reinlined per file (the zero cross-test-import guard).
 from __future__ import annotations
 
 import json
-from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -32,7 +31,6 @@ from charlie_work.paths import runtime_paths
 from charlie_work.role_chain import RoleEntry
 from charlie_work.workflow import OrchestratorApp
 
-import charlie_work.workflow as wf
 
 PRIMARY = RoleEntry("devin-shell", "swe-2")
 FALLBACK = RoleEntry("claude-code", "claude-sonnet-5-5", "high")
@@ -173,22 +171,29 @@ def _recorder(monkeypatch: pytest.MonkeyPatch, *, error: str | None = None) -> l
     """Replace every review launcher; successful launches write the sidecar a real one would."""
     calls: list[dict] = []
 
-    def _make(harness: str):
-        def _launch(**kwargs: Any):
-            calls.append({"harness": harness, **kwargs})
-            pr = kwargs["pr_number"]
-            record = _fake_claude_worker_record(pr, kwargs["branch"])
-            if error is not None:
-                return replace(record, error=error, pid=None)
-            sidecar = role_quota_ledger.sidecar_path_for(kwargs["reviews_dir"], harness, pr)
-            sidecar.parent.mkdir(parents=True, exist_ok=True)
-            sidecar.write_text(json.dumps({"issue_number": pr, "pid": 12345}), encoding="utf-8")
-            return record
+    def _launch(harness: str, kwargs: dict[str, Any]):
+        calls.append({"harness": harness, **kwargs})
+        pr = kwargs["pr_number"]
+        record = _fake_claude_worker_record(pr, kwargs["branch"])
+        if error is not None:
+            from dataclasses import replace
 
-        return _launch
+            return replace(record, error=error, pid=None)
+        sidecar = role_quota_ledger.sidecar_path_for(kwargs["reviews_dir"], harness, pr)
+        sidecar.parent.mkdir(parents=True, exist_ok=True)
+        sidecar.write_text(json.dumps({"issue_number": pr, "pid": 12345}), encoding="utf-8")
+        return record
 
-    for harness in list(wf._REVIEW_LAUNCHERS):
-        monkeypatch.setitem(wf._REVIEW_LAUNCHERS, harness, _make(harness))
+    import dataclasses
+
+    from charlie_work import host as host_pkg
+    from charlie_work.host.fakes import FakeReviewLauncher
+
+    monkeypatch.setattr(
+        host_pkg,
+        "_ACTIVE",
+        dataclasses.replace(host_pkg.current(), launch=FakeReviewLauncher([_launch])),
+    )
     return calls
 
 

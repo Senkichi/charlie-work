@@ -142,3 +142,66 @@ def test_command_result_reexport_is_identity() -> None:
     from charlie_work import command_result, workflow
 
     assert workflow.CommandResult is command_result.CommandResult
+
+
+def _app(tmp_path, **kwargs):
+    from _review_fixtures import _dispatch_reviews_app
+
+    return _dispatch_reviews_app(tmp_path, **kwargs)
+
+
+def test_app_default_host_reads_current_at_access_time(fake_host, tmp_path) -> None:
+    from charlie_work.host.fakes import FakeProcessProbe
+
+    app = _app(tmp_path)
+    assert app.host is host.REAL
+    probe = FakeProcessProbe({4242: 1.0})
+    fake_host(probe=probe)  # installed AFTER the app was built
+    assert app.host.probe is probe
+
+
+def test_app_without_host_shares_the_fixture_fake_with_non_app_code(fake_host, tmp_path) -> None:
+    from charlie_work import worker_fate
+    from charlie_work.host.fakes import FakeProcessProbe
+
+    fake_host(probe=FakeProcessProbe({4242: 1.0}))
+    app = _app(tmp_path)
+    assert app.host.probe.is_alive(4242, 1.0) is True
+    assert worker_fate.is_alive(4242, 1.0) is True
+
+
+def test_explicit_host_wins_over_fixture_and_does_not_mutate_global(fake_host, tmp_path) -> None:
+    import dataclasses
+
+    from charlie_work.host.fakes import FakeReviewLauncher
+
+    explicit = dataclasses.replace(host.REAL, launch=FakeReviewLauncher())
+    app = _app(tmp_path)
+    app_explicit = type(app)(app.repo_root, app.paths, app.config, app.gh, host=explicit)
+    fixture_ports = fake_host(launch=FakeReviewLauncher())
+    assert app_explicit.host is explicit
+    assert app.host is fixture_ports
+    assert host.current() is fixture_ports
+
+
+def test_fake_review_launcher_scripts_outcomes_and_records_requests() -> None:
+    from charlie_work.host.fakes import FakeReviewLauncher
+
+    fake = FakeReviewLauncher(["boom"])
+    record = fake.launch("claude-code", pr_number=7, branch="b")
+    assert record.error == "boom" and record.pid is None
+    assert fake.requests == [("claude-code", {"pr_number": 7, "branch": "b"})]
+    assert FakeReviewLauncher().launch("devin-shell", pr_number=1).pid == 1
+
+
+def test_real_review_launcher_returns_errors_as_values(monkeypatch) -> None:
+    def _boom(**_kw):
+        raise OSError("no such binary")
+
+    monkeypatch.setitem(
+        __import__("charlie_work.workflow", fromlist=["x"])._REVIEW_LAUNCHERS, "api", _boom
+    )
+    record = host.REAL.launch.launch("api", pr_number=3, branch="b")
+    assert record.pid is None and record.error == "OSError: no such binary"
+    unknown = host.REAL.launch.launch("nope", pr_number=3, branch="b")
+    assert unknown.error == "unsupported reviewer harness: 'nope'"

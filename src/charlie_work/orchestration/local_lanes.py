@@ -868,7 +868,6 @@ def _local_dispatch_reviewers(self, *, now: Any = None, launch_lock: Any = None)
 
     reviewer_harness = role_cfg.reviewer.harness
     reviewer_adapter_settings = self._adapter_settings(adapter=reviewer_harness)
-    reviewer_launcher = _wf._REVIEW_LAUNCHERS.get(reviewer_harness)
     launched: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
     quota_hit = False
@@ -891,16 +890,9 @@ def _local_dispatch_reviewers(self, *, now: Any = None, launch_lock: Any = None)
             if not head_sha:
                 failed.append({"pr": pr_number, "error": "packet head missing"})
                 continue
-            if reviewer_launcher is None:
-                failed.append(
-                    {
-                        "pr": pr_number,
-                        "error": f"unsupported reviewer harness: {reviewer_harness!r}",
-                    }
-                )
-                continue
             prompt_text = prompt_path.read_text(encoding="utf-8")
-            launch_record = reviewer_launcher(
+            launch_record = self.host.launch.launch(
+                reviewer_harness,
                 pr_number=pr_number,
                 branch=branch,
                 prompt_path=prompt_path,

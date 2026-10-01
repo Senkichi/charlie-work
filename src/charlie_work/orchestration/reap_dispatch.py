@@ -26,7 +26,6 @@ from datetime import UTC, datetime
 from typing import Any
 
 import charlie_work.workflow as _wf
-from charlie_work import host as _host
 from charlie_work.dispatch_deferral import records_deferral
 from charlie_work import layout
 from charlie_work.ci_absence import CiAbsence, runs_terminally_without_jobs
@@ -227,7 +226,7 @@ def _apply_concurrency_governor(
     if max_concurrent > 0 or ci_headroom_ratio > 0:
         if live_count is None:
             sessions_dir = self._layout.sessions_dir
-            live_count = _host.current().sessions.live_workers(sessions_dir, self.paths.state_file)
+            live_count = self.host.sessions.live_workers(sessions_dir, self.paths.state_file)
 
     if max_concurrent > 0:
         available_slots = max(0, max_concurrent - (live_count or 0))
@@ -237,7 +236,7 @@ def _apply_concurrency_governor(
             clamped_by = "max_concurrent"
 
     if fleet_max > 0:
-        fleet_live_count, _skipped_repos = _host.current().sessions.fleet_live_workers(
+        fleet_live_count, _skipped_repos = self.host.sessions.fleet_live_workers(
             self.fleet_dir_override
         )
         fleet_available = max(0, fleet_max - fleet_live_count)

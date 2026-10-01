@@ -1,4 +1,4 @@
-"""Host ports: seams onto what the host provides (clock, process liveness; more per slice).
+"""Host ports: seams onto what the host provides (clock, process liveness, session counts, reviewer launch).
 
 Leaf package: stdlib imports only at module top, so it cannot create import
 cycles. ``current()`` is the single registry read by both ``OrchestratorApp``
@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .clock import Clock, RealClock
+from .launch import RealReviewLauncher, ReviewLauncher
 from .liveness import ProcessProbe, RealProcessProbe
 from .sessions import RealSessionCounter, SessionCounter
 
@@ -19,9 +20,15 @@ class HostPorts:
     clock: Clock
     probe: ProcessProbe
     sessions: SessionCounter
+    launch: ReviewLauncher
 
 
-REAL = HostPorts(clock=RealClock(), probe=RealProcessProbe(), sessions=RealSessionCounter())
+REAL = HostPorts(
+    clock=RealClock(),
+    probe=RealProcessProbe(),
+    sessions=RealSessionCounter(),
+    launch=RealReviewLauncher(),
+)
 
 _ACTIVE: HostPorts = REAL
 

@@ -7,8 +7,9 @@ invariant covers config and value objects; ``HostPorts`` itself is frozen).
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 
 class FakeClock:
@@ -87,3 +88,39 @@ class FakeSessionCounter:
     def fleet_live_reviews(self, fleet_dir_override):
         self.calls.append(("fleet_live_reviews", (fleet_dir_override,)))
         return self.fleet_reviews
+
+
+class FakeReviewLauncher:
+    """Scripted reviewer launches; never spawns a process or sleeps.
+
+    ``outcomes`` is consumed one per ``launch`` call (the last repeats). Each is
+    a record (returned as-is), a ``str`` (a failure record with that ``.error``),
+    or a callable ``(harness, kwargs) -> record``. With no outcomes every launch
+    succeeds with ``pid=1``. ``requests`` logs ``(harness, kwargs)``.
+    """
+
+    def __init__(self, outcomes: Sequence[Any] = ()) -> None:
+        self._outcomes = list(outcomes)
+        self.requests: list[tuple[str, dict[str, Any]]] = []
+
+    def launch(self, harness: str, **kwargs: Any) -> Any:
+        from .launch import error_record
+
+        index = len(self.requests)
+        self.requests.append((harness, dict(kwargs)))
+        if not self._outcomes:
+            record = error_record(harness, kwargs, "")
+            return _replace_record(record, error=None, pid=1)
+        outcome = self._outcomes[min(index, len(self._outcomes) - 1)]
+        if isinstance(outcome, str):
+            return error_record(harness, kwargs, outcome)
+        if callable(outcome):
+            call: Callable[[str, dict[str, Any]], Any] = outcome
+            return call(harness, dict(kwargs))
+        return outcome
+
+
+def _replace_record(record: Any, **changes: Any) -> Any:
+    import dataclasses
+
+    return dataclasses.replace(record, **changes)
