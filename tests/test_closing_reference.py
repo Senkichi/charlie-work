@@ -531,7 +531,7 @@ def test_open_salvage_pr_logs_unlinked_event_on_mismatch(tmp_path: Path) -> None
 
     assert pr_number == 101
     assert error is None
-    assert gh.pr_view_calls == [101]
+    assert gh.pr_view_calls == [101, 101, 101]  # re-probed across the indexing race (#1868)
     events = query_events(state_file, kind="pr_closing_ref_unlinked", issue_number=42)
     assert len(events) == 1
     assert events[0]["payload"]["pr_number"] == 101
