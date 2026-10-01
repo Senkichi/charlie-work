@@ -1,0 +1,1 @@
+issue #1681: classifies a terminally-absent required check (never_created vs workflow_no_jobs); installed from orchestration/reap_dispatch.py. Net-new OrchestratorApp member declared here so the member-surface conservation check in tests/test_workflow_delegation_l00.py subtracts it before comparing moved delegates against the pre-campaign total (133).
