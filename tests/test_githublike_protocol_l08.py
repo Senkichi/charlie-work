@@ -29,7 +29,16 @@ from charlie_work.github_capabilities import MergeBranchLike
 from charlie_work.github_capabilities._base import GitHubRunResult
 
 from _githublike_protocol_helpers import _compatible_signature, _lexical_github_defs
-from _fake_transport import FakeAdapter, graphql_ok, graphql_variables, make_github, ok, sent
+from _fake_transport import (
+    FakeAdapter,
+    graphql_ok,
+    graphql_variables,
+    make_github,
+    merge_adapter,
+    ok,
+    rest_sent,
+    sent,
+)
 
 MERGE_BRANCH_MOVED_MEMBERS = (
     "merge_pr",
@@ -132,11 +141,11 @@ def test_merge_pr_delegate_forwards_through_run(tmp_path: Path) -> None:
     ``merge_method`` and returns the API's own message (B8).
     """
     reply = ok({"merged": True, "message": "Pull Request successfully merged"})
-    gh, http, _ = make_github(tmp_path, http=FakeAdapter("http", [reply]))
+    gh, http, _ = make_github(tmp_path, http=merge_adapter(reply))
     result = gh.merge_pr(42, "squash")
 
     assert result == "Pull Request successfully merged"
-    assert sent(http) == [
+    assert rest_sent(http) == [
         ("PUT", "repos/{owner}/{repo}/pulls/42/merge", {"merge_method": "squash"})
     ]
 

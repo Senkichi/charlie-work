@@ -19,6 +19,7 @@ from charlie_work.github_transport import (
     CliRequest,
     FailureKind,
     GraphQLError,
+    GraphQLRequest,
     GuardedTransport,
     Outcome,
     Request,
@@ -63,9 +64,13 @@ def check_run(name: str, state: str = "SUCCESS", url: str = "", started: str = "
     }
 
 
-def checks_reply(*contexts: dict) -> Response:
-    """The reply to the ``pr checks`` document for a PR with *contexts*."""
-    rollup = {"contexts": {"nodes": list(contexts)}}
+def checks_reply(*contexts: dict, next_cursor: str | None = None) -> Response:
+    """The reply to the ``pr checks`` document for a PR with *contexts*.
+
+    *next_cursor* marks a page with more contexts after it.
+    """
+    page_info = {"hasNextPage": next_cursor is not None, "endCursor": next_cursor}
+    rollup = {"contexts": {"nodes": list(contexts), "pageInfo": page_info}}
     return graphql_ok({"repository": {"pullRequest": {"statusCheckRollup": rollup}}})
 
 
@@ -146,6 +151,22 @@ class FakeAdapter:
     @property
     def api_requests(self) -> list[Request]:
         return [r for r in self.requests if not isinstance(r, CliRequest)]
+
+
+def rest_sent(adapter: FakeAdapter) -> list[tuple[str, str, object]]:
+    """``sent`` restricted to REST requests (drops GraphQL reads)."""
+    return [call for call in sent(adapter) if call[0]]
+
+
+def merge_adapter(put_reply: Outcome, state: str = "CLEAN") -> FakeAdapter:
+    """Answers the ``mergeStateStatus`` read with *state*, every REST call with *put_reply*."""
+
+    def handler(request: Request) -> Outcome:
+        if isinstance(request, GraphQLRequest):
+            return graphql_ok({"repository": {"pullRequest": {"mergeStateStatus": state}}})
+        return put_reply
+
+    return FakeAdapter("http", handler=handler)
 
 
 @dataclass

@@ -338,12 +338,29 @@ def document_for(resource: str, fields: str | Iterable[str], shape: Shape) -> st
 
 
 def checks_document() -> str:
-    """The rollup query behind ``gh pr checks``: one PR's check contexts."""
+    """The rollup query behind ``gh pr checks``: one page of a PR's check contexts.
+
+    Unlike the list/view rollup (capped at one page, as gh caps it), ``gh pr
+    checks`` walks every page of contexts, so this document takes ``$after``
+    and selects ``pageInfo``; ``JsonRead._checks`` follows it.
+    """
     return (
-        "query($owner:String!,$name:String!,$number:Int!){"
+        "query($owner:String!,$name:String!,$number:Int!,$after:String){"
         "repository(owner:$owner,name:$name){pullRequest(number:$number){"
-        f"{_ROLLUP_SELECTION}}}}}}}"
+        f"statusCheckRollup{{contexts(first:{_PAGE},after:$after){{"
+        f"nodes{{{_CONTEXT_SELECTION}}}pageInfo{{hasNextPage endCursor}}}}}}}}}}}}"
     )
+
+
+def checks_next_cursor(pull_request: dict[str, Any]) -> str | None:
+    """``endCursor`` of the next contexts page, or ``None`` on the last page."""
+    rollup = pull_request.get("statusCheckRollup")
+    contexts = rollup.get("contexts") if isinstance(rollup, dict) else None
+    info = contexts.get("pageInfo") if isinstance(contexts, dict) else None
+    if not isinstance(info, dict) or not info.get("hasNextPage"):
+        return None
+    cursor = info.get("endCursor")
+    return cursor if isinstance(cursor, str) and cursor else None
 
 
 def states_for(resource: str, state: str) -> list[str] | None:
@@ -456,6 +473,7 @@ __all__ = [
     "UnknownFieldError",
     "bucket_for",
     "checks_contexts",
+    "checks_next_cursor",
     "checks_document",
     "document_for",
     "field_names",

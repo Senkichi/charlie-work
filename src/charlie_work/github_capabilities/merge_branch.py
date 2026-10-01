@@ -42,10 +42,10 @@ from ci_fleet.github import GitHubError
 # ``pull_requests.py``'s L06 promotion of the same import for the same
 # reason.
 from ..config_validation import ConfigError
-from ..github_transport.request import RestRequest
+from ..github_transport.request import GraphQLRequest, RestRequest
 from ._base import CapabilityCollaborator, GitHubRunResult
 from ._pr_mutations import enable_auto_merge
-from ._send import send_result, send_text
+from ._send import send_graphql, send_result, send_text
 
 # Flag constants for merge_pr -- single source of truth for both argv
 # construction and config validation, moved from ``github.py`` alongside
@@ -61,6 +61,32 @@ _STRATEGY_FLAGS = {"merge": "--merge", "squash": "--squash", "rebase": "--rebase
 _ADMIN_FLAG = "--admin"
 _AUTO_FLAG = "--auto"
 _MATCH_HEAD_FLAG = "--match-head-commit"
+
+# ``gh pr merge`` reads ``mergeStateStatus`` before it merges and refuses on
+# its own side; the REST merge route has no such pre-check and, with an
+# admin-capable token, would merge through branch protection. These are gh's
+# own refusal reasons (``blockedReason`` in gh's pr/merge), reproduced so the
+# gate survives the move off the gh binary ([gt-fix-r1] F2). ``--admin`` waives
+# BLOCKED and BEHIND, never DIRTY.
+_MERGE_STATE_QUERY = (
+    "query($owner: String!, $name: String!, $number: Int!) {"
+    " repository(owner: $owner, name: $name) {"
+    " pullRequest(number: $number) { mergeStateStatus } } }"
+)
+_REFUSAL_REASONS = {
+    "BLOCKED": "the base branch policy prohibits the merge",
+    "BEHIND": "the head branch is not up to date with the base branch",
+    "DIRTY": "the merge commit cannot be cleanly created",
+}
+_ADMIN_WAIVES = frozenset({"BLOCKED", "BEHIND"})
+
+
+def _dig(value: Any, *keys: str) -> Any:
+    for key in keys:
+        if not isinstance(value, dict):
+            return None
+        value = value.get(key)
+    return value
 
 
 @runtime_checkable
@@ -141,6 +167,9 @@ class MergeBranch(CapabilityCollaborator):
                     f"gh pr merge {number} --auto failed: {enabled.error or enabled.stderr}"
                 )
             return f"merged #{number}"  # the text gh's empty stdout always fell back to
+        self._refuse_if_blocked(
+            number, admin=any(f.partition("=")[0] == _ADMIN_FLAG for f in flags)
+        )
         # Branch deletion is deliberately NOT part of this call (the old
         # `gh pr merge --delete-branch` also switched the LOCAL branch and failed
         # when it was checked out in a worktree). Use `delete_branch` separately.
@@ -158,6 +187,37 @@ class MergeBranch(CapabilityCollaborator):
         except (ValueError, AttributeError):
             message = None
         return message if isinstance(message, str) and message else f"merged #{number}"
+
+    def _refuse_if_blocked(self, number: int, *, admin: bool) -> None:
+        """Raise ``GitHubError`` where ``gh pr merge`` would have refused.
+
+        One read of ``mergeStateStatus`` (the read gh made itself); a failed
+        or unrecognised read raises/proceeds exactly as gh did: an
+        unreadable PR is an error, ``UNKNOWN``/``CLEAN``/``UNSTABLE``/
+        ``HAS_HOOKS`` merge. The merge PUT is only ever sent after this
+        passes, so a refusal never sends a mutation.
+        """
+        owner, name = self._repo_owner_name()
+        request = GraphQLRequest.of(
+            _MERGE_STATE_QUERY, {"owner": owner, "name": name, "number": number}
+        )
+        body, error = send_graphql(self, request)
+        node = _dig(body, "data", "repository", "pullRequest")
+        if error is not None and node is None:
+            raise GitHubError(f"gh pr merge {number} failed: {error}")
+        status = str(node.get("mergeStateStatus") or "").upper() if isinstance(node, dict) else ""
+        reason = _REFUSAL_REASONS.get(status)
+        if reason is None or (admin and status in _ADMIN_WAIVES):
+            return
+        hint = (
+            ""
+            if admin or status not in _ADMIN_WAIVES
+            else " To use administrator privileges to immediately merge the pull request,"
+            " add the `--admin` flag."
+        )
+        raise GitHubError(
+            f"gh pr merge {number} failed: Pull request #{number} is not mergeable: {reason}.{hint}"
+        )
 
     def delete_branch(self, branch: str) -> bool:
         """Best-effort deletion of the REMOTE head branch after a merge.

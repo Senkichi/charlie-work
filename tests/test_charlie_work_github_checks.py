@@ -114,6 +114,22 @@ def test_pr_checks_returns_empty_list_on_empty_success(tmp_path: Path) -> None:
     assert gh.pr_checks(123) == []
 
 
+def test_pr_checks_walks_every_page_of_check_contexts(tmp_path: Path) -> None:
+    """``gh pr checks`` follows the rollup's pageInfo; a snapshot cut at the first
+    100 contexts could omit a failing required check ([gt-fix-r1] B3)."""
+    first = checks_reply(check_run("early"), next_cursor="CUR1")
+    second = checks_reply(check_run("late", "FAILURE"))
+    http = FakeAdapter("http", [first, second])
+    gh, _http, _ = make_github(tmp_path, http=http)
+
+    checks = gh.pr_checks(123)
+
+    assert checks is not None
+    assert {c["name"]: c["state"] for c in checks} == {"early": "SUCCESS", "late": "FAILURE"}
+    after = [graphql_variables(r)["after"] for r in http.api_requests]
+    assert after == [None, "CUR1"]
+
+
 def test_pr_checks_returns_none_on_gh_command_failure(tmp_path: Path) -> None:
     """A read the API rejected (a GraphQL error) returns None."""
     reply = graphql_failure("Field 'bogus' doesn't exist on type 'CheckRun'", "undefinedField")

@@ -6,6 +6,7 @@ guard makes a forgotten injection fail instead of dialling api.github.com.
 
 from __future__ import annotations
 
+import http.client
 import json
 import socket
 import ssl
@@ -25,6 +26,7 @@ from charlie_work.github_transport import (
     TransportFailure,
 )
 from charlie_work.github_transport import http_adapter as http_adapter_module
+from charlie_work.github_transport.guarded import FALLBACK_KINDS
 
 GET = RestRequest.of("GET", "repos/o/r/pulls/1", query={"state": "all"})
 POST = RestRequest.of("POST", "repos/o/r/issues", body={"title": "t"})
@@ -232,3 +234,111 @@ def test_conftest_guard_blocks_an_uninjected_real_connection() -> None:
         http_adapter_module._new_connection("api.github.com", 1.0)
     with pytest.raises(AssertionError, match="real network in tests"):
         HttpAdapter().send(GET, token="tok", timeout=1.0)
+
+
+MUTATION = GraphQLRequest.of(
+    "mutation M($id: ID!) { markPullRequestReadyForReview(id: $id) }", {"id": "x"}
+)
+
+
+@pytest.mark.parametrize("body", [b"<html>ok</html>", b"", b"[1, 2]"])
+def test_a_2xx_graphql_mutation_with_a_malformed_body_is_never_fallback_eligible(body) -> None:
+    # The server answered 2xx, so the mutation may have been applied. An
+    # ADAPTER_DEFECT would fall back to gh and replay it ([gt-fix-r1] F3/B1).
+    out = _send(_adapter(FakeConn([FakeRaw(200, body=body)])), MUTATION)
+    assert isinstance(out, TransportFailure)
+    assert out.kind is FailureKind.SENT_NO_RESPONSE
+    assert out.kind not in FALLBACK_KINDS
+
+
+def test_a_2xx_graphql_query_with_a_malformed_body_stays_an_adapter_defect() -> None:
+    out = _send(_adapter(FakeConn([FakeRaw(200, body=b"<html>")])), QUERY)
+    assert isinstance(out, TransportFailure) and out.kind is FailureKind.ADAPTER_DEFECT
+
+
+def _socketpair_conn(script: list) -> tuple[FakeConn, socket.socket]:
+    """A FakeConn whose ``sock`` is a real socket; returns the peer end too."""
+    ours, peer = socket.socketpair()
+    conn = FakeConn(script)
+    conn.sock = ours  # type: ignore[assignment]
+    return conn, peer
+
+
+def test_socket_dropped_detects_a_peer_closed_idle_socket() -> None:
+    ours, peer = socket.socketpair()
+    try:
+        assert http_adapter_module._socket_dropped(ours) is False  # idle and live
+        peer.close()
+        assert http_adapter_module._socket_dropped(ours) is True  # EOF is readable
+    finally:
+        ours.close()
+        peer.close()
+
+
+def test_socket_dropped_treats_a_closed_or_fd_less_socket_correctly() -> None:
+    ours, peer = socket.socketpair()
+    peer.close()
+    ours.close()
+    assert http_adapter_module._socket_dropped(ours) is True
+    assert http_adapter_module._socket_dropped(object()) is False  # test double
+
+
+def test_a_pooled_socket_the_server_closed_is_discarded_and_a_fresh_one_is_used() -> None:
+    stale, peer = _socketpair_conn([ConnectionAbortedError("must never be used")])
+    fresh = FakeConn([FakeRaw(201, body=b"{}")])
+    adapter = HttpAdapter(connection_factory=lambda host, timeout: fresh)
+    adapter._checkin(stale)
+    peer.close()  # the server idle-closed the keep-alive connection
+    out = _send(adapter, POST)
+    assert isinstance(out, Response) and out.status == 201
+    assert stale.requests == [] and stale.closed  # the dead socket never carried it
+    assert len(fresh.requests) == 1  # the mutation was sent exactly once
+    stale.sock = None
+
+
+def test_a_live_pooled_socket_is_reused() -> None:
+    live, peer = _socketpair_conn([FakeRaw(200, body=b"{}")])
+    adapter = HttpAdapter(connection_factory=lambda host, timeout: pytest.fail("no new conn"))
+    adapter._checkin(live)
+    try:
+        out = _send(adapter, GET)
+        assert isinstance(out, Response) and len(live.requests) == 1
+    finally:
+        peer.close()
+        if live.sock is not None:
+            live.sock.close()
+
+
+def test_a_read_that_dies_on_a_reused_socket_is_replayed_once_on_a_fresh_one() -> None:
+    reused = FakeConn([http.client.RemoteDisconnected("closed")])
+    reused.sock = _FakeLiveSock()  # type: ignore[assignment]
+    fresh = FakeConn([FakeRaw(200, body=b'{"n": 1}')])
+    adapter = HttpAdapter(connection_factory=lambda host, timeout: fresh)
+    adapter._checkin(reused)
+    out = _send(adapter, GET)
+    assert isinstance(out, Response) and out.json() == {"n": 1}
+    assert len(reused.requests) == 1 and len(fresh.requests) == 1
+
+
+def test_a_mutation_that_dies_on_a_reused_socket_is_never_replayed() -> None:
+    reused = FakeConn([http.client.RemoteDisconnected("closed")])
+    reused.sock = _FakeLiveSock()  # type: ignore[assignment]
+    fresh = FakeConn([FakeRaw(201, body=b"{}")])
+    adapter = HttpAdapter(connection_factory=lambda host, timeout: fresh)
+    adapter._checkin(reused)
+    out = _send(adapter, POST)
+    assert isinstance(out, TransportFailure) and out.kind is FailureKind.SENT_NO_RESPONSE
+    assert len(reused.requests) == 1 and fresh.requests == []
+
+
+class _FakeLiveSock:
+    def settimeout(self, seconds: float) -> None:
+        self.timeout = seconds
+
+
+def test_a_refused_redirect_detail_never_records_the_signed_query() -> None:
+    logs = RestRequest.of("GET", "repos/o/r/actions/jobs/1/logs", follow_redirect=True)
+    conn = FakeConn([FakeRaw(302, {"Location": "http://evil.example.net/x?sig=SECRET"})])
+    out = _send(_adapter(conn), logs)
+    assert isinstance(out, TransportFailure) and "SECRET" not in out.detail
+    assert "evil.example.net/x" in out.detail

@@ -11,37 +11,42 @@ from pathlib import Path
 import pytest
 from _fake_transport import (
     FakeAdapter,
+    graphql_failure,
     graphql_ok,
     graphql_variables,
     make_github,
+    merge_adapter,
     ok,
+    rest_sent,
     sent,
 )
+from charlie_work.github_transport import GraphQLRequest
+from ci_fleet.github import GitHubError
 from charlie_work.config_validation import ConfigError
 
 
 def test_merge_pr_returns_the_api_message(tmp_path: Path) -> None:
     reply = ok({"merged": True, "message": "Pull Request successfully merged"})
-    gh, http, _ = make_github(tmp_path, http=FakeAdapter("http", [reply]))
+    gh, http, _ = make_github(tmp_path, http=merge_adapter(reply))
 
     assert gh.merge_pr(7, "squash") == "Pull Request successfully merged"
-    assert sent(http) == [
+    assert rest_sent(http) == [
         ("PUT", "repos/{owner}/{repo}/pulls/7/merge", {"merge_method": "squash"})
     ]
 
 
 def test_merge_pr_without_an_api_message_falls_back_to_a_truthy_value(tmp_path: Path) -> None:
-    gh, _, _ = make_github(tmp_path, http=FakeAdapter("http", [ok({"merged": True})]))
+    gh, _, _ = make_github(tmp_path, http=merge_adapter(ok({"merged": True})))
 
     assert gh.merge_pr(7, "merge") == "merged #7"
 
 
 def test_merge_pr_match_head_commit_becomes_the_sha_guard(tmp_path: Path) -> None:
-    gh, http, _ = make_github(tmp_path, http=FakeAdapter("http", [ok({"message": "done"})]))
+    gh, http, _ = make_github(tmp_path, http=merge_adapter(ok({"message": "done"})))
 
     gh.merge_pr(7, "rebase", merge_flags=("--match-head-commit=abc123",))
 
-    assert sent(http) == [
+    assert rest_sent(http) == [
         (
             "PUT",
             "repos/{owner}/{repo}/pulls/7/merge",
@@ -51,11 +56,11 @@ def test_merge_pr_match_head_commit_becomes_the_sha_guard(tmp_path: Path) -> Non
 
 
 def test_merge_pr_admin_flag_is_the_plain_rest_merge(tmp_path: Path) -> None:
-    gh, http, _ = make_github(tmp_path, http=FakeAdapter("http", [ok({"message": "done"})]))
+    gh, http, _ = make_github(tmp_path, http=merge_adapter(ok({"message": "done"}), "BLOCKED"))
 
     gh.merge_pr(7, "squash", admin=True)
 
-    assert sent(http) == [
+    assert rest_sent(http) == [
         ("PUT", "repos/{owner}/{repo}/pulls/7/merge", {"merge_method": "squash"})
     ]
 
@@ -90,11 +95,14 @@ def test_merge_pr_auto_still_goes_through_the_gh_cli(tmp_path: Path) -> None:
 
 
 def test_merge_pr_dry_run_sends_nothing_and_still_reads_as_merged(tmp_path: Path) -> None:
-    gh, http, gh_adapter = make_github(tmp_path, dry_run=True)
+    gh, http, gh_adapter = make_github(tmp_path, http=merge_adapter(ok({}), "CLEAN"), dry_run=True)
 
     assert gh.merge_pr(7, "squash") == "merged #7"
 
-    assert http.calls == []
+    # The mergeStateStatus pre-check is a read and still goes out; the merge
+    # itself is never sent.
+    assert rest_sent(http) == []
+    assert all(isinstance(r, GraphQLRequest) for r in http.api_requests)
     assert gh_adapter.api_requests == []
 
 
@@ -170,3 +178,60 @@ def test_pr_create_returns_none_on_a_failed_create(tmp_path: Path) -> None:
     gh, _, _ = make_github(tmp_path, http=FakeAdapter("http", [reply]))
 
     assert gh.pr_create("agent/issue-1", "main", "title", "body") is None
+
+
+# --- merge_pr keeps gh's branch-protection gate ([gt-fix-r1] F2) ---------------
+# `gh pr merge` read mergeStateStatus and refused BLOCKED/BEHIND/DIRTY on its own
+# side; the REST PUT has no such pre-check and an admin token would merge through
+# branch protection. Each refusal must send NO mutation.
+
+
+@pytest.mark.parametrize(
+    ("state", "reason"),
+    [
+        ("BLOCKED", "the base branch policy prohibits the merge"),
+        ("BEHIND", "the head branch is not up to date with the base branch"),
+        ("DIRTY", "the merge commit cannot be cleanly created"),
+    ],
+)
+def test_merge_pr_refuses_a_blocked_pr_without_sending_the_merge(
+    tmp_path: Path, state: str, reason: str
+) -> None:
+    gh, http, _ = make_github(tmp_path, http=merge_adapter(ok({"message": "merged"}), state))
+
+    with pytest.raises(GitHubError, match=reason):
+        gh.merge_pr(7, "squash")
+
+    assert rest_sent(http) == []
+
+
+def test_merge_pr_admin_waives_blocked_and_behind_but_never_dirty(tmp_path: Path) -> None:
+    for state in ("BLOCKED", "BEHIND"):
+        gh, http, _ = make_github(tmp_path, http=merge_adapter(ok({"message": "m"}), state))
+        gh.merge_pr(7, "squash", merge_flags=("--admin",))
+        assert len(rest_sent(http)) == 1
+
+    gh, http, _ = make_github(tmp_path, http=merge_adapter(ok({"message": "m"}), "DIRTY"))
+    with pytest.raises(GitHubError, match="cannot be cleanly created"):
+        gh.merge_pr(7, "squash", admin=True)
+    assert rest_sent(http) == []
+
+
+@pytest.mark.parametrize("state", ["CLEAN", "UNSTABLE", "HAS_HOOKS", "UNKNOWN"])
+def test_merge_pr_proceeds_on_a_mergeable_or_unknown_state(tmp_path: Path, state: str) -> None:
+    gh, http, _ = make_github(tmp_path, http=merge_adapter(ok({"message": "m"}), state))
+
+    gh.merge_pr(7, "squash")
+
+    assert len(rest_sent(http)) == 1
+
+
+def test_merge_pr_an_unreadable_state_raises_and_sends_no_merge(tmp_path: Path) -> None:
+    gh, http, _ = make_github(
+        tmp_path, http=FakeAdapter("http", [graphql_failure("Could not resolve")])
+    )
+
+    with pytest.raises(GitHubError):
+        gh.merge_pr(7, "squash")
+
+    assert rest_sent(http) == []

@@ -25,6 +25,7 @@ because that decides whether a mutation may be replayed:
 from __future__ import annotations
 
 import json
+import select
 import socket
 import ssl
 import threading
@@ -55,6 +56,34 @@ _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 _DEFECT_ERRORS = (KeyError, TypeError, AttributeError, ValueError)
 
 
+def _socket_dropped(sock: Any) -> bool:
+    """Whether an idle pooled socket was closed by the peer.
+
+    An idle keep-alive socket should never be readable: readable means EOF
+    (the server idle-closed it), a TLS close_notify, or stray bytes -- in
+    every case it must not carry a new request. Without this check the
+    request "succeeds" into the kernel buffer and only ``getresponse()``
+    fails, which is indistinguishable from "sent, no response" and so
+    cannot be retried for a mutation. Test doubles without a real file
+    descriptor are treated as live.
+    """
+    try:
+        fileno = sock.fileno()
+    except AttributeError:
+        return False
+    except OSError:
+        return True
+    if not isinstance(fileno, int):
+        return False
+    if fileno < 0:
+        return True
+    try:
+        readable, _, _ = select.select([sock], [], [], 0)
+    except (OSError, ValueError):
+        return True
+    return bool(readable)
+
+
 def _new_connection(host: str, timeout: float) -> HTTPSConnection:
     return HTTPSConnection(host, timeout=timeout)
 
@@ -83,6 +112,7 @@ class _Prepared:
     path: str
     body: bytes | None
     headers: dict[str, str]
+    idempotent: bool = False
 
 
 class HttpAdapter:
@@ -109,16 +139,22 @@ class HttpAdapter:
         factory = self._factory if self._factory is not None else _new_connection
         return factory(host, timeout)
 
-    def _checkout(self, timeout: float) -> Any:
-        with self._lock:
-            conn = self._idle.pop() if self._idle else None
-        if conn is None:
-            return self._make(self._host, timeout)
-        conn.timeout = timeout
-        sock = getattr(conn, "sock", None)
-        if sock is not None:
-            sock.settimeout(timeout)
-        return conn
+    def _checkout(self, timeout: float, *, fresh: bool = False) -> tuple[Any, bool]:
+        """Return ``(connection, reused)``; dead idle sockets are discarded."""
+        while not fresh:
+            with self._lock:
+                conn = self._idle.pop() if self._idle else None
+            if conn is None:
+                break
+            sock = getattr(conn, "sock", None)
+            if sock is not None and _socket_dropped(sock):
+                self._close(conn)
+                continue
+            conn.timeout = timeout
+            if sock is not None:
+                sock.settimeout(timeout)
+            return conn, True
+        return self._make(self._host, timeout), False
 
     def _checkin(self, conn: Any) -> None:
         with self._lock:
@@ -151,7 +187,13 @@ class HttpAdapter:
             payload = {"query": request.document, "variables": json.loads(request.variables)}
             headers["Accept"] = "application/vnd.github+json"
             headers["Content-Type"] = "application/json"
-            return _Prepared("POST", "/graphql", json.dumps(payload).encode("utf-8"), headers)
+            return _Prepared(
+                "POST",
+                "/graphql",
+                json.dumps(payload).encode("utf-8"),
+                headers,
+                idempotent=not request.is_mutation,
+            )
         if isinstance(request, RestRequest):
             headers["Accept"] = request.accept
             body = request.body.encode("utf-8") if request.body is not None else None
@@ -159,7 +201,13 @@ class HttpAdapter:
                 headers["Content-Type"] = "application/json"
             if cached is not None:
                 headers["If-None-Match"] = cached.etag
-            return _Prepared(request.method, "/" + request.target(), body, headers)
+            return _Prepared(
+                request.method,
+                "/" + request.target(),
+                body,
+                headers,
+                idempotent=not request.is_mutation,
+            )
         raise TypeError(f"HttpAdapter cannot send {type(request).__name__}")
 
     # -- send ---------------------------------------------------------------
@@ -187,7 +235,7 @@ class HttpAdapter:
         if not isinstance(outcome, Response):
             return outcome
         if isinstance(request, GraphQLRequest):
-            return self._finish_graphql(outcome)
+            return self._finish_graphql(request, outcome)
         if outcome.status == _NOT_MODIFIED and cached is not None:
             return Response(cached.status, outcome.headers, cached.body, "http")
         if self._cache is not None and request.method == "GET":
@@ -201,12 +249,18 @@ class HttpAdapter:
         if self._cache is not None and response.status == 200 and etag:
             self._cache.record(path, etag=etag, status=200, body=response.body)
 
-    def _finish_graphql(self, response: Response) -> Outcome:
+    def _finish_graphql(self, request: GraphQLRequest, response: Response) -> Outcome:
         if not 200 <= response.status < 300:
             return response  # the status carries the failure; body need not be JSON
         errors = graphql_errors_from_body(response.body)
         if errors is None:
-            return self._defect("GraphQL response was not a JSON object")
+            detail = "GraphQL response was not a JSON object"
+            if request.is_mutation:
+                # The server answered 2xx, so the mutation may have been
+                # applied: ADAPTER_DEFECT would fall back and replay it via
+                # gh. SENT_NO_RESPONSE is neither retried nor fallen back.
+                return TransportFailure(FailureKind.SENT_NO_RESPONSE, detail, "http")
+            return self._defect(detail)
         if not errors:
             return response
         return Response(response.status, response.headers, response.body, "http", errors)
@@ -217,16 +271,34 @@ class HttpAdapter:
     # -- wire ----------------------------------------------------------------
 
     def _exchange(self, prepared: _Prepared, timeout: float) -> Outcome:
-        conn = self._checkout(timeout)
+        outcome, reused = self._exchange_once(prepared, timeout, fresh=False)
+        if (
+            reused
+            and prepared.idempotent
+            and isinstance(outcome, TransportFailure)
+            and outcome.kind is FailureKind.SENT_NO_RESPONSE
+        ):
+            # The peer closed a pooled socket in the instant after the
+            # liveness check. Replaying a read on a fresh connection is
+            # safe; a mutation is never replayed here (it may have landed).
+            outcome, _ = self._exchange_once(prepared, timeout, fresh=True)
+        return outcome
+
+    def _exchange_once(
+        self, prepared: _Prepared, timeout: float, *, fresh: bool
+    ) -> tuple[Outcome, bool]:
+        conn, reused = self._checkout(timeout, fresh=fresh)
         try:
             if getattr(conn, "sock", None) is None:
                 conn.connect()
         except TimeoutError as exc:
             self._close(conn)
-            return TransportFailure(FailureKind.CONNECT, f"connect timed out: {exc}", "http")
+            return TransportFailure(
+                FailureKind.CONNECT, f"connect timed out: {exc}", "http"
+            ), reused
         except (OSError, ssl.SSLError, HTTPException) as exc:
             self._close(conn)
-            return TransportFailure(FailureKind.CONNECT, str(exc), "http")
+            return TransportFailure(FailureKind.CONNECT, str(exc), "http"), reused
         try:
             conn.request(
                 prepared.method, prepared.path, body=prepared.body, headers=prepared.headers
@@ -238,16 +310,16 @@ class HttpAdapter:
             will_close = bool(getattr(raw, "will_close", False))
         except (TimeoutError, socket.timeout) as exc:
             self._close(conn)
-            return TransportFailure(FailureKind.TIMEOUT, f"read timed out: {exc}", "http")
+            return TransportFailure(FailureKind.TIMEOUT, f"read timed out: {exc}", "http"), reused
         except (OSError, ssl.SSLError, HTTPException) as exc:
             self._close(conn)
-            return TransportFailure(FailureKind.SENT_NO_RESPONSE, str(exc), "http")
+            return TransportFailure(FailureKind.SENT_NO_RESPONSE, str(exc), "http"), reused
         if will_close:
             self._close(conn)
         else:
             self._checkin(conn)
         text = body_bytes.decode("utf-8", errors="replace")
-        return Response(status, headers, text, "http")
+        return Response(status, headers, text, "http"), reused
 
     def _follow_redirect(self, redirect: Response, timeout: float) -> Outcome:
         """Fetch a signed-URL redirect target (job logs) without credentials."""
@@ -256,7 +328,9 @@ class HttpAdapter:
             return redirect
         target = urlsplit(location)
         if target.scheme != "https" or not target.hostname:
-            return self._defect(f"refusing redirect to non-https location: {location!r}")
+            # The query of a signed URL carries a credential: never record it.
+            shown = f"{target.scheme}://{target.netloc}{target.path}"
+            return self._defect(f"refusing redirect to non-https location: {shown!r}")
         path = target.path or "/"
         if target.query:
             path = f"{path}?{target.query}"

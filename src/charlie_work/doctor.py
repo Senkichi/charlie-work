@@ -805,6 +805,8 @@ def _validate_gh_field_lists(add: Any, gh: GitHubLike) -> None:
             ["pr", "checks", str(pr_number)] if pr_number else None,
             PR_CHECKS_FIELDS,
         ),
+        # `label list` is a REST read with no `gh ... --json` argv row, so this
+        # probe goes through `label_list()` instead of `gh.run` (see below).
         "LABEL_LIST_FIELDS": (["label", "list", "--limit", "1"], LABEL_LIST_FIELDS),
         "RECONCILE_PR_FIELDS": (
             ["pr", "list", "--state", "all", "--limit", "1"],
@@ -837,7 +839,10 @@ def _validate_gh_field_lists(add: Any, gh: GitHubLike) -> None:
 
         cmd = [*base_cmd, "--json", fields]
         try:
-            gh.run(cmd, json_output=True)
+            if list_name == "LABEL_LIST_FIELDS":
+                gh.label_list()  # raises GitHubError on any failed read (#756)
+            else:
+                gh.run(cmd, json_output=True)
             add(f"gh field list: {list_name}", True, f"valid ({len(fields.split(','))} fields)")
         except GitHubError as exc:
             error_msg = str(exc)

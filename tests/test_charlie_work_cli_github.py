@@ -17,6 +17,8 @@ from _fake_transport import (
     graphql_ok,
     graphql_variables,
     make_github,
+    merge_adapter,
+    rest_sent,
     ok,
     sent,
 )
@@ -290,10 +292,10 @@ def test_github_merge_pr_argv_with_merge_flags(tmp_path: Path) -> None:
 
 def test_github_merge_pr_argv_with_admin_flag(tmp_path: Path) -> None:
     """The legacy admin flag selects the direct REST merge (no ``--admin`` argv)."""
-    gh, http, _ = make_github(tmp_path, http=FakeAdapter("http", [ok({"message": "merged"})]))
+    gh, http, _ = make_github(tmp_path, http=merge_adapter(ok({"message": "merged"}), "BLOCKED"))
     gh.merge_pr(123, "squash", admin=True, merge_flags=())
 
-    assert sent(http) == [
+    assert rest_sent(http) == [
         ("PUT", "repos/{owner}/{repo}/pulls/123/merge", {"merge_method": "squash"})
     ]
 
@@ -329,12 +331,10 @@ def test_github_merge_pr_flags_are_orchestrator_managed(monkeypatch, tmp_path: P
 
     for strategy, strategy_flag in strategies.items():
         for admin in (False, True):
-            gh, http, _ = make_github(
-                tmp_path, http=FakeAdapter("http", [ok({"message": "merged"})])
-            )
+            gh, http, _ = make_github(tmp_path, http=merge_adapter(ok({"message": "merged"})))
             gh.merge_pr(123, strategy, admin=admin, merge_flags=())
 
-            (call,) = sent(http)
+            (call,) = rest_sent(http)
             assert call == (
                 "PUT",
                 "repos/{owner}/{repo}/pulls/123/merge",

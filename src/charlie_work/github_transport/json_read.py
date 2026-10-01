@@ -21,7 +21,7 @@ from typing import Any, Literal
 from . import gh_json_fields as fields_mod
 from .guarded import GitHubTransport
 from .outcome import FailureKind, Outcome, Response, TransportFailure
-from .pagination import paginate_graphql
+from .pagination import MAX_PAGES, paginate_graphql
 from .request import GraphQLRequest, RestRequest, canonical_json
 
 Shape = Literal["list", "view", "search", "checks"]
@@ -127,19 +127,28 @@ class JsonRead:
         return _with_body(outcome, fields_mod.normalize_nodes("pr", pulls, self.fields))
 
     def _checks(self, transport: GitHubTransport, owner: str, repo: str) -> Outcome:
-        outcome = self._send(
-            transport,
-            fields_mod.checks_document(),
-            {"owner": owner, "name": repo, "number": self.number},
-        )
-        node = _dig(outcome, ("repository", "pullRequest"))
-        if isinstance(node, (Response, TransportFailure)):
-            return node
-        if not isinstance(node, dict):
-            return _defect(f"no pull request #{self.number} in GraphQL response")
-        assert isinstance(outcome, Response)
-        contexts = fields_mod.checks_contexts(node)
-        return _with_body(outcome, fields_mod.normalize_checks(contexts, self.fields))
+        # `gh pr checks` walks every page of contexts; a snapshot cut at 100
+        # could omit a required check and read as green.
+        document = fields_mod.checks_document()
+        contexts: list[dict[str, Any]] = []
+        cursor: str | None = None
+        for _ in range(MAX_PAGES):
+            outcome = self._send(
+                transport,
+                document,
+                {"owner": owner, "name": repo, "number": self.number, "after": cursor},
+            )
+            node = _dig(outcome, ("repository", "pullRequest"))
+            if isinstance(node, (Response, TransportFailure)):
+                return node
+            if not isinstance(node, dict):
+                return _defect(f"no pull request #{self.number} in GraphQL response")
+            assert isinstance(outcome, Response)
+            contexts.extend(fields_mod.checks_contexts(node))
+            cursor = fields_mod.checks_next_cursor(node)
+            if cursor is None:
+                return _with_body(outcome, fields_mod.normalize_checks(contexts, self.fields))
+        return _defect(f"check contexts exceeded {MAX_PAGES} pages with a next page present")
 
 
 # gh ``run list --json`` field -> REST ``workflow_runs`` entry key.
