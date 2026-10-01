@@ -157,7 +157,7 @@ def test_heartbeat_check_has_no_local_check_defs_to_shadow_the_reexports() -> No
 # ---------------------------------------------------------------------------
 
 
-def test_parse_iso_is_byte_identical_to_the_leaf(hb: ModuleType) -> None:
+def test_parse_iso_is_byte_identical_to_heartbeat_checks(hb: ModuleType) -> None:
     assert inspect.getsource(leaf.parse_iso) == inspect.getsource(hb.parse_iso), (
         "heartbeat_check.parse_iso drifted from charlie_work.heartbeat_alarms.parse_iso "
         "-- the leaf is the single source; the remaining copy must stay byte-identical"
