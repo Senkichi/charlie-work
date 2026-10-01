@@ -497,7 +497,7 @@ def test_orphaned_worker_unsafe_to_auto_reset_drift_emits_once(tmp_path: Path) -
         "reviewed_head_sha": "abc123",
     }
     save_state(paths.state_file, state)
-    _write_flat_review_decision(paths, 100, "approved", "abc123")
+    _write_flat_review_decision(paths, 100, "approved", None)  # no reviewed head: unclassifiable
 
     class FakeGitHubForOrphan(FakeGitHub):
         def pr_list(self):

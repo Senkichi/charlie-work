@@ -397,6 +397,10 @@ def _detect_and_handle_stalled_reviews(
     snapshot_events = list(state.get("events") or [])
     changed = False
     seen_pr_keys: set[str] = set()
+    # PRs whose sidecar is live or recently (re)started. A resumed review
+    # (#2090) rewrites the sidecar's ``started_at`` while a stale claim
+    # timestamp may linger; such a claim is not yet reapable (issue #2162).
+    fresh_sidecar_pr_keys: set[str] = set()
     # One provider-throttle condition per sweep, no matter how many dead
     # reviewers show the same limit signature: the exponential probe backoff
     # counts consecutive failed PROBES, and a wave of N simultaneously
@@ -412,6 +416,7 @@ def _detect_and_handle_stalled_reviews(
         pr_key = str(w.issue_number)
         # A live reviewer needs no cleanup.
         if w.is_alive():
+            fresh_sidecar_pr_keys.add(pr_key)
             continue
         # Respect the stale-claim timeout so a very recently dead reviewer is
         # not immediately re-dispatched (which can thrash if the underlying
@@ -419,6 +424,7 @@ def _detect_and_handle_stalled_reviews(
         if not is_claim_stale(
             w.started_at, timeout_minutes=_REVIEW_STALE_CLAIM_TIMEOUT_MINUTES, now=now
         ):
+            fresh_sidecar_pr_keys.add(pr_key)
             continue
 
         seen_pr_keys.add(pr_key)
@@ -937,6 +943,11 @@ def _detect_and_handle_stalled_reviews(
             process_start_time = pr_state.get("reviewer_process_start_time")
             pid_alive = reviewer_pid is not None and is_pid_alive(reviewer_pid, process_start_time)
             if pid_alive:
+                continue
+            if pr_key in fresh_sidecar_pr_keys:
+                # The sidecar is newer than the claim (resumed review): leave
+                # the log and claim for the next pass's verdict harvest, which
+                # runs before this sweep and reaps the sidecar once stale.
                 continue
             dispatched_at = pr_state.get("review_dispatched_at")
             if dispatched_at and is_claim_stale(
