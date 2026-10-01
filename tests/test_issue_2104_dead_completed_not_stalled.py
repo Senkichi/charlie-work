@@ -7,6 +7,7 @@ non-progressing worker, which keeps ``failure_kind="stalled"``.
 from __future__ import annotations
 
 import json
+import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -20,15 +21,36 @@ from charlie_work.dead_worker_sweep import effects_sessions
 ISSUE = 2104
 
 
-def _setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, alive: bool, outcome: bool):
+def _iso(delta: timedelta) -> str:
+    return (datetime.now(UTC) + delta).isoformat().replace("+00:00", "Z")
+
+
+def _setup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    alive: bool,
+    outcome: bool | dict = False,
+    outcome_age: timedelta = timedelta(0),
+    terminal_exit_code: int | None = None,
+):
+    """``outcome``: True = declared push, dict = literal payload; ``outcome_age`` backdates it."""
     sessions_dir, state_file, _log = _make_stalled_devin_session(
         tmp_path, ISSUE, "Doing work.\n.worker-outcome.json is written\n"
     )
     worktree = tmp_path / "worktree"
     worktree.mkdir()
     if outcome:
-        (worktree / ".worker-outcome.json").write_text(
-            json.dumps({"push_succeeded": True, "pr_created": False}), encoding="utf-8"
+        payload = {"push_succeeded": True, "pr_created": False} if outcome is True else outcome
+        outcome_path = worktree / ".worker-outcome.json"
+        outcome_path.write_text(json.dumps(payload), encoding="utf-8")
+        if outcome_age:
+            stamp = (datetime.now(UTC) - outcome_age).timestamp()
+            os.utime(outcome_path, (stamp, stamp))
+    if terminal_exit_code is not None:
+        (sessions_dir / f"issue-{ISSUE}.devin.terminal.json").write_text(
+            json.dumps({"exit_code": terminal_exit_code, "ended_at": _iso(timedelta(minutes=-1))}),
+            encoding="utf-8",
         )
     dispatched = (datetime.now(UTC) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
     state_file.write_text(
@@ -59,7 +81,7 @@ def test_dead_completed_worker_is_not_stamped_stalled(
     assert payload["worker_health"] == "DEAD"
     assert payload["killed_pids"] == []
     assert payload["failure_kind"] != "stalled"
-    assert "failure_kind" not in state["issues"][str(ISSUE)]
+    assert "dead_worker_failure_kind" not in state["issues"][str(ISSUE)]
 
 
 def test_dead_worker_without_a_handoff_still_gets_the_stalled_fallback(
@@ -76,3 +98,35 @@ def test_live_stalled_worker_keeps_the_stalled_label(
     payload = _reap_event(state, "session_stalled")
     assert payload["worker_health"] == "STALLED"
     assert payload["failure_kind"] == "stalled"
+
+
+def test_dead_worker_with_clean_terminal_exit_is_not_stamped_stalled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = _setup(tmp_path, monkeypatch, alive=False, outcome=False, terminal_exit_code=0)
+    payload = _reap_event(state, "session_exited")
+    assert payload["failure_kind"] != "stalled"
+    assert "dead_worker_failure_kind" not in state["issues"][str(ISSUE)]
+
+
+def test_dead_worker_with_stale_outcome_still_gets_the_stalled_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A leftover .worker-outcome.json from a prior dispatch (older than dispatched_at).
+    state = _setup(
+        tmp_path, monkeypatch, alive=False, outcome=True, outcome_age=timedelta(hours=2)
+    )
+    assert _reap_event(state, "session_exited")["failure_kind"] == "stalled"
+
+
+def test_dead_worker_with_blocked_outcome_still_gets_the_stalled_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    blocked = {
+        "outcome": "blocked",
+        "reason_kind": "ambiguous_scope",
+        "detail": "needs a human",
+        "push_succeeded": True,
+    }
+    state = _setup(tmp_path, monkeypatch, alive=False, outcome=blocked)
+    assert _reap_event(state, "session_exited")["failure_kind"] == "stalled"
