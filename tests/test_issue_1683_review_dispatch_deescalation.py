@@ -419,13 +419,14 @@ _DYNAMIC_REASON_DOMAINS: dict[str, str] = {
         "marker; the lane's re-entry guard is the durable one-shot "
         "``rescue_attempted`` marker, not a per-mechanism counter."
     ),
-    "expr:verdict.reason": (
-        "``RedispatchVerdict.reason`` (dead_worker_sweep.decide_dead_sessions"
-        ".redispatch_verdict) is ``failure_kind`` for an immediate-class "
+    "expr:plan.reason": (
+        "``ReclaimCommit.reason`` (dead_worker_sweep.decide_dead_sessions_plan"
+        ".plan_reclaim_commit, from ``RedispatchVerdict.reason``) is ``failure_kind`` for an immediate-class "
         "death, else ``redispatch_cap_exceeded``. Both domains are the same "
         "values the other scanned escalation sites carry as literals / "
-        "``failure_kind``, so they are accounted for above; the verdict just "
-        "moved the former inline conditional into a pure function."
+        "``failure_kind``, so they are accounted for above; the plan "
+        "moved the former inline conditional into a pure function. "
+        "``LaunchEscalation.reason`` is the ``failure_kind`` itself."
     ),
     "expr:gate_result.reason": (
         "The pre-flight cross-repo gate emits free-form prose reasons "
