@@ -134,7 +134,10 @@ def run_dashboard_command(args: argparse.Namespace) -> CommandResult:
         registry_error = load_repos(override)[1]
         if registry_error:  # an unreadable registry is not "no repos"
             return CommandResult(False, registry_error, {})
-        model = build_now_model(collect_sources_read(now, override), now, findings=[])
+        sources_read = collect_sources_read(
+            now, override, collector_interval_seconds=float(config.collector_interval_seconds)
+        )
+        model = build_now_model(sources_read, now, findings=[])
         return CommandResult(True, "dashboard now", _plain(model))
     if args.dashboard_command == "history":
         return _run_history(args.days, args.bucket_hours, now, override)

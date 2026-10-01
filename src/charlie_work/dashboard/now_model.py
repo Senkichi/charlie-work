@@ -7,7 +7,7 @@ the loop pass wrote the snapshot, so every field derived from them is marked
 ``as_of_snapshot`` (snapshot recon section 1).
 
 Commands shown in Needs-me rows use only subcommands that exist in ``cli.py``
-(``unescalate``, ``fleet resume``); ``tests/test_dashboard_now_model.py`` parses
+(``unescalate``, ``verdict``, ``fleet resume``); ``tests/test_dashboard_now_model.py`` parses
 each one through ``cli.build_parser`` so a rename breaks the test, not the page.
 """
 
@@ -16,6 +16,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from datetime import datetime
 
+from . import now_cadence
 from .now_access import as_int, dict_list, label_set, snapshot_data
 from .now_needs_me import needs_me_items
 from .now_types import (
@@ -34,10 +35,6 @@ from .now_types import (
 )
 from .sources import _parse_utc
 
-# The loop writes every snapshot at the end of a pass; with no heartbeat to say
-# otherwise the fleet pass cadence is 300s (runner-allocation.json).
-DEFAULT_PASS_INTERVAL_SECONDS = 300.0
-
 # Reasons a Ready issue is held back, in classifier order (backlog_reachability.py
 # :243-299). ``missing_ready`` is deliberately absent: such an issue is not Ready at
 # all, so it is not "Ready but not dispatchable". ``dispatchable`` is the other side.
@@ -49,27 +46,6 @@ NOT_DISPATCHABLE_REASONS = (
     "blocked_by_open_dependency",
     "unidentified",
 )
-
-
-def stale_threshold_seconds(pass_interval: float, collector_interval: float) -> float:
-    """Age beyond which a source is stale: two loop passes plus one collector tick.
-
-    A snapshot is rewritten once per loop pass, so one missed pass is routine
-    (a long pass, a restart) and only a second consecutive miss is a signal: 2x the
-    pass interval. The dashboard itself only re-reads every collector interval, so
-    a perfectly healthy source can look one collector tick older than it is; that
-    tick is added so it never flags a fresh source.
-    """
-    return 2.0 * pass_interval + collector_interval
-
-
-def _pass_interval(sources: SourcesRead) -> float:
-    hb = sources.supervisor_heartbeat
-    if hb is not None and hb.data is not None:
-        value = hb.data.get("full_pass_interval_seconds")
-        if isinstance(value, (int, float)) and value > 0:
-            return float(value)
-    return DEFAULT_PASS_INTERVAL_SECONDS
 
 
 def _freshness(
@@ -168,7 +144,8 @@ def _capacity(
         workers_live=live,
         workers_cap=fleet_cap,
         workers_by_repo=workers,
-        reviewers_live=sum(r.live for r in reviewers),
+        # No readable count anywhere is unknown, not an idle fleet.
+        reviewers_live=sum(r.live for r in reviewers) if reviewers else None,
         reviewers_cap=sources.global_review_cap or None,
         reviewers_by_repo=reviewers,
         runners=runners,
@@ -223,8 +200,11 @@ def build_now_model(
     findings: Sequence[FindingLike] = (),
 ) -> NowModel:
     """Fold read sources + alarm findings into the Now model (pure; ``now`` injected)."""
-    threshold = stale_threshold_seconds(
-        _pass_interval(sources_read), sources_read.collector_interval_seconds
+    hb = sources_read.supervisor_heartbeat
+    threshold = now_cadence.stale_threshold_seconds(
+        hb.data if hb is not None else None,
+        sources_read.collector_interval_seconds,
+        sources_read.snapshot_gap_p90_seconds,
     )
     fresh, _ = _freshness(sources_read.repos, threshold)
     flow, dispatchable = _flow(sources_read)

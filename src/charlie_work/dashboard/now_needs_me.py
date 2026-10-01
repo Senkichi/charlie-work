@@ -1,6 +1,7 @@
 """Needs-me rows for the Now model: Operator queue, human-needed PRs, alarms, stale sources.
 
-Commands use only subcommands that exist in ``cli.py`` (``unescalate``, ``fleet resume``);
+Commands use only subcommands that exist in ``cli.py`` (``verdict``, ``unescalate``,
+``fleet resume``);
 ``tests/test_dashboard_now_model.py`` parses each through ``cli.build_parser``.
 """
 
@@ -11,11 +12,16 @@ from collections.abc import Sequence
 from datetime import datetime
 from typing import Any
 
+from . import now_cadence
 from .now_access import as_int, dict_list, label_set, snapshot_data
 from .now_types import FindingLike, NeedsMeItem, RepoFreshness, RepoRead, SourcesRead
 from .sources import _parse_utc
 
 _SEVERITY_RANK = {"anomaly": 0, "action": 1, "warn": 2}
+
+# ``verdict --decision`` choices (cli.py); left as a placeholder because the decision is
+# the operator's judgment call -- the row must not pre-answer it.
+_DECISION_PLACEHOLDER = "<approved|request_changes|blocked>"
 
 
 def _cli(repo: RepoRead, *args: str) -> str:
@@ -71,8 +77,12 @@ def needs_me_items(
                             repo.key,
                             age(number),
                             f"Human needed: PR #{pr} (issue #{number}) awaits an operator verdict",
-                            _cli(repo, "unescalate", "--pr", str(pr)),
+                            # Recording the verdict is the remedy; unescalate only voids a
+                            # valid verdict and re-reviews from scratch, so it is secondary.
+                            f"{_cli(repo, 'verdict', '--pr', str(pr), '--decision')} "
+                            f"{_DECISION_PLACEHOLDER}",
                             True,
+                            _cli(repo, "unescalate", "--pr", str(pr)),
                         )
                     )
                 else:
@@ -138,14 +148,15 @@ def needs_me_items(
     hb = sources.supervisor_heartbeat
     if hb is not None and hb.data is not None:
         beat = _since_age(hb.data.get("last_beat_at"), now)
-        if hb.data.get("exited_at") or (beat is not None and beat > threshold):
+        beat_limit = now_cadence.supervisor_beat_threshold_seconds(hb.data)
+        if hb.data.get("exited_at") or (beat is not None and beat > beat_limit):
             items.append(
                 NeedsMeItem(
                     "supervisor",
                     "anomaly",
                     "fleet",
                     beat,
-                    "Supervisor is not beating (exited or last beat too old)",
+                    f"Supervisor is not beating (exited or last beat older than {int(beat_limit)}s)",
                     None,
                     False,
                 )

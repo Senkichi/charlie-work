@@ -67,8 +67,11 @@ class SourcesRead:
     pause: Mapping[str, Any] | None = None
     # Merged-in-24h count derived by the collector from events; None = not derivable.
     done_24h: int | None = None
-    # Cadence of the dashboard collector; widens the stale threshold (see now_model).
+    # Cadence of the dashboard collector; widens the stale threshold (see now_cadence).
     collector_interval_seconds: float = 30.0
+    # p90 of seconds between completed loop passes over the last 24h (pooled across repos);
+    # None when too few passes were observed. Drives the stale threshold (see now_cadence).
+    snapshot_gap_p90_seconds: float | None = None
 
 
 @dataclass(frozen=True)
@@ -91,6 +94,8 @@ class NeedsMeItem:
     reason: str
     command: str | None
     as_of_snapshot: bool
+    # An alternative remedy shown beneath the primary command (e.g. requeue vs verdict).
+    secondary_command: str | None = None
 
 
 @dataclass(frozen=True)
@@ -139,7 +144,7 @@ class CapacityModel:
     workers_live: int
     workers_cap: int | None
     workers_by_repo: tuple[RepoWorkers, ...]
-    reviewers_live: int
+    reviewers_live: int | None  # None = no repo's live reviewers could be measured
     reviewers_cap: int | None
     reviewers_by_repo: tuple[RepoWorkers, ...]
     runners: tuple[RunnerRepo, ...]

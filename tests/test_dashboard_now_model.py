@@ -21,6 +21,8 @@ from typing import Any
 from charlie_work import cli, fleet_status
 from charlie_work.dashboard import now_model, sources
 
+import pytest
+
 from _dashboard_now_fixtures import (  # noqa: F401  (fleet is a pytest fixture)
     ALPHA,
     BETA,
@@ -38,8 +40,8 @@ from _dashboard_now_fixtures import (  # noqa: F401  (fleet is a pytest fixture)
 def test_freshness_and_threshold(fleet) -> None:
     model = now_model.build_now_model(_read(fleet), NOW)
 
-    # No heartbeat: 2 passes of 300s + one 30s collector tick.
-    assert model.stale_threshold_seconds == 630.0
+    # No heartbeat, no observed cadence: pass interval (300s) + max pass runtime (1800s).
+    assert model.stale_threshold_seconds == 2100.0
     alpha, beta = model.freshness
     assert (alpha.repo, alpha.age_seconds, alpha.stale) == ("owner/alpha", 150.0, False)
     assert (beta.repo, beta.age_seconds, beta.stale) == ("owner/beta", 3600.0, True)
@@ -55,7 +57,17 @@ def test_threshold_follows_heartbeat_pass_interval(fleet, tmp_path: Path) -> Non
         fleet, supervisor_heartbeat=sources.read_json_file(hb), collector_interval_seconds=10
     )
 
-    assert now_model.build_now_model(read, NOW).stale_threshold_seconds == 130.0
+    # Interval 60s, no max_pass_runtime in the heartbeat: 60 + default 1800.
+    assert now_model.build_now_model(read, NOW).stale_threshold_seconds == 1860.0
+
+
+def test_threshold_follows_observed_cadence_p90(fleet) -> None:
+    # Real fleet p90 of completed-pass gaps is 1078s: threshold is 2x that, not 630s.
+    read = _read(fleet, snapshot_gap_p90_seconds=1078.0)
+    assert now_model.build_now_model(read, NOW).stale_threshold_seconds == 2156.0
+    # A fast fleet still gets the 3x-interval floor (3*300 + 30).
+    read = _read(fleet, snapshot_gap_p90_seconds=100.0)
+    assert now_model.build_now_model(read, NOW).stale_threshold_seconds == 930.0
 
 
 def test_needs_me_exact_rows_and_order(fleet) -> None:
@@ -71,6 +83,8 @@ def test_needs_me_exact_rows_and_order(fleet) -> None:
         (i.kind, i.severity, i.repo, i.age_seconds, i.reason, i.command, i.as_of_snapshot)
         for i in items
     ]
+    human = next(i for i in items if i.kind == "human_needed")
+    assert human.secondary_command == f"charlie --repo {a} unescalate --pr 50"
     assert got == [
         ("alarm", "anomaly", "owner/alpha", None, "merge-flow: no merges 6h", None, False),
         (
@@ -79,7 +93,7 @@ def test_needs_me_exact_rows_and_order(fleet) -> None:
             "owner/alpha",
             7200.0,
             "Human needed: PR #50 (issue #5) awaits an operator verdict",
-            f"charlie --repo {a} unescalate --pr 50",
+            f"charlie --repo {a} verdict --pr 50 --decision <approved|request_changes|blocked>",
             True,
         ),
         (
@@ -96,7 +110,7 @@ def test_needs_me_exact_rows_and_order(fleet) -> None:
             "warn",
             "owner/beta",
             3600.0,
-            "snapshot is 3600s old (stale after 630s)",
+            "snapshot is 3600s old (stale after 2100s)",
             None,
             False,
         ),
@@ -107,13 +121,20 @@ def test_needs_me_exact_rows_and_order(fleet) -> None:
 def test_every_command_is_a_real_cli_invocation(fleet) -> None:
     pause = {"paused": True, "paused_at": "2026-10-01T11:00:00Z", "reason": "ops"}
     items = now_model.build_now_model(_read(fleet, pause=pause), NOW).needs_me
-    commands = [i.command for i in items if i.command]
-    assert len(commands) == 3
+    commands = [c for i in items for c in (i.command, i.secondary_command) if c]
+    assert len(commands) == 4  # operator_queue, human_needed (primary + secondary), resume
     parser = cli.build_parser()
+    parsed = []
     for command in commands:
-        parts = shlex.split(command)
+        parts = shlex.split(command.replace("<approved|request_changes|blocked>", "approved"))
         assert parts[0] == "charlie"
-        assert isinstance(parser.parse_args(parts[1:]), argparse.Namespace)
+        parsed.append(parser.parse_args(parts[1:]))
+    verdict = next(p for p in parsed if p.command == "verdict")
+    assert (verdict.pr, verdict.decision) == (50, "approved")
+    # The placeholder is not a valid decision: the operator must choose one.
+    with pytest.raises(SystemExit):
+        bad = next(i.command for i in items if i.kind == "human_needed")
+        parser.parse_args(shlex.split(bad)[1:])
     paused = next(i for i in items if i.kind == "paused")
     assert (paused.severity, paused.age_seconds, paused.command) == (
         "anomaly",
@@ -144,6 +165,32 @@ def test_supervisor_and_stale_runner_rows(fleet, tmp_path: Path) -> None:
     rows = [(i.kind, i.severity, i.age_seconds) for i in model.needs_me if i.repo == "fleet"]
     assert rows == [("supervisor", "anomaly", 3600.0), ("stale_source", "warn", 7200.0)]
     assert model.capacity.runners_stale is True
+
+
+def test_healthy_supervisor_is_not_flagged_at_the_heartbeat_check_bound(fleet, tmp_path) -> None:
+    """A beat 1h old is healthy under ``2 x max_pass_runtime`` (3600s), as heartbeat_check."""
+    hb = tmp_path / "hb.json"
+    beat = "2026-10-01T11:00:01Z"  # 3599s before NOW
+    hb.write_text(
+        json.dumps({"max_pass_runtime_seconds": 1800, "last_beat_at": beat}), encoding="utf-8"
+    )
+    read = _read(fleet, supervisor_heartbeat=sources.read_json_file(hb))
+    assert not [i for i in now_model.build_now_model(read, NOW).needs_me if i.kind == "supervisor"]
+
+    hb.write_text(
+        json.dumps({"max_pass_runtime_seconds": 1800, "last_beat_at": "2026-10-01T10:59:59Z"}),
+        encoding="utf-8",
+    )
+    read = _read(fleet, supervisor_heartbeat=sources.read_json_file(hb))
+    row = next(i for i in now_model.build_now_model(read, NOW).needs_me if i.kind == "supervisor")
+    assert row.age_seconds == 3601.0 and "3600s" in row.reason
+
+
+def test_reviewers_live_unknown_stays_none_not_zero(fleet) -> None:
+    read = _read(fleet)
+    repos = tuple(replace(r, reviewers_live=None) for r in read.repos)
+    cap = now_model.build_now_model(replace(read, repos=repos), NOW).capacity
+    assert cap.reviewers_live is None and cap.reviewers_by_repo == ()
 
 
 def test_unreadable_snapshot_is_stale_with_error(fleet) -> None:
