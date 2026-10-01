@@ -559,6 +559,7 @@ def test_fresh_sidecar_alone_protects_a_stale_claim_from_the_stall_sweep(
     claim = load_state(app.paths.state_file)["prs"][str(PR)]
     assert claim["review_dispatch_status"] == "review_dispatch_dispatched"
 
+
 # --- issue #2110: two concurrent reaps of one dead reviewer are single-owner --
 
 
