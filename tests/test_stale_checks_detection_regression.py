@@ -188,7 +188,7 @@ def _guard_member_modules() -> tuple[ModuleType, ...]:
     modules: list[ModuleType] = []
     for member in (
         OrchestratorApp._attempt_stale_checks_retrigger,
-        OrchestratorApp._detect_ci_run_never_created,
+        OrchestratorApp._detect_ci_absence,
     ):
         module = inspect.getmodule(member)
         assert module is not None, f"could not locate module for {member!r}"
@@ -243,7 +243,7 @@ def test_stale_checks_grace_minutes_never_referenced_inside_the_detector() -> No
         "retrigger's module (the retrigger-wait logic) -- scan found none, "
         "which means this test isn't actually exercising the field"
     )
-    assert "_detect_ci_run_never_created" not in referencing_functions
+    assert "_detect_ci_absence" not in referencing_functions
     assert referencing_functions == {"_attempt_stale_checks_retrigger"}
 
 
@@ -293,9 +293,9 @@ def test_exactly_one_workflow_runs_for_head_call_site_and_it_is_inside_the_detec
                 enclosing = _enclosing_function_name(node, parents)
                 call_sites.append((Path(module_file).name, enclosing))
 
-    assert call_sites == [("reap_dispatch.py", "_detect_ci_run_never_created")], (
+    assert call_sites == [("reap_dispatch.py", "_detect_ci_absence")], (
         f"expected exactly one workflow_runs_for_head call site across the "
-        f"stale-checks guard modules, inside _detect_ci_run_never_created; "
+        f"stale-checks guard modules, inside _detect_ci_absence; "
         f"found {call_sites!r}"
     )
 
@@ -343,5 +343,5 @@ def test_workflow_runs_for_head_call_sites_are_the_registered_ones() -> None:
 
     assert call_sites == [
         ("misc_checks.py", "_drive_infra_rerun_or_escalate"),
-        ("reap_dispatch.py", "_detect_ci_run_never_created"),
+        ("reap_dispatch.py", "_detect_ci_absence"),
     ], f"unexpected workflow_runs_for_head call site(s); found {call_sites!r}"

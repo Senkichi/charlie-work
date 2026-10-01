@@ -106,6 +106,7 @@ from .config_deprecations import emit_deprecated_key_reads, repo_state_path
 # not land in this over-cap monolith (file-size ratchet, issue #1442);
 # ``config.py`` wires the dataclass into ``OrchestratorConfig`` and delegates
 # parsing (including the legacy ``supervisor.<key>`` fallback) to it.
+from .test_slots import SlotPoolConfig  # noqa: F401  (deliberate re-export)
 from .fleet_supervisor_config import (  # noqa: F401  (deliberate re-export)
     FleetSupervisorConfig,
     parse_fleet_supervisor,
@@ -179,7 +180,7 @@ DETERMINISTIC_ESCALATION_FAILURE_KINDS: frozenset[str] = frozenset(
 # actively fights the safety system that raised the escalation and risks a
 # second writer on a branch that already has divergent local work.
 DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS: frozenset[str] = frozenset(
-    {"worktree_unsafe_local_commits"}
+    {"worktree_unsafe_local_commits", "worktree_unsafe_uncommitted_work"}
 )
 # Deliberately excluded: "worktree_probe_failed" (see worktree.WorktreeProbeFailedError).
 # A failed safety probe (e.g. git status --porcelain hitting an index lock) is
@@ -968,6 +969,16 @@ class ReviewDispatchConfig:
     # packet, operator unescalate). 0 disables the bound (preserves the
     # pre-fix unbounded rollback — not recommended).
     max_consecutive_review_log_unreadable: Annotated[int, Typed, NonNeg] = 3
+    # Issue #1808: a dead reviewer whose terminal result event is an
+    # ``api_error`` with a provider-side status (429/500/502/503/529) is a
+    # provider outage, not a PR defect. The first N consecutive such deaths on
+    # one PR roll back the claim without consuming the dispatch attempt budget
+    # and arm the fleet-wide reviewer backoff; past N they become counted
+    # failures so a persistent per-PR poison still converges on the
+    # ``max_review_dispatch_attempts`` cap. The streak resets on any definitive
+    # outcome (recorded verdict, non-api death, new packet, operator
+    # unescalate). 0 disables the rollback (api errors count as before).
+    max_consecutive_review_api_errors: Annotated[int, Typed, NonNeg] = 3
     # Maximum agentic turns for a reviewer session. Caps token spend per
     # review by limiting how many tool-call round-trips the reviewer can make.
     # 0 means unlimited (preserves pre-existing behavior). 40 is generous for
@@ -2518,6 +2529,8 @@ class OrchestratorConfig:
     fleet_supervisor: Annotated[FleetSupervisorConfig, HostWideOnly] = field(
         default_factory=FleetSupervisorConfig
     )
+    # One machine, one slot pool (issue #2124): host-wide like the runner sections.
+    test_slots: Annotated[SlotPoolConfig, HostWideOnly] = field(default_factory=SlotPoolConfig)
     post_mortem: PostMortemConfig = field(default_factory=PostMortemConfig)
     heartbeat: HeartbeatConfig = field(default_factory=HeartbeatConfig)
 

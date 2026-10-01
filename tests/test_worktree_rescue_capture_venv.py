@@ -219,7 +219,8 @@ def test_capture_or_raise_includes_capture_error_in_message(
         )
 
     message = str(exc_info.value)
-    assert "worktree has uncommitted modifications" in message
+    assert "worktree has uncommitted source work" in message
+    assert "dirty.txt" in message
     assert "simulated write-tree failure xyz123" in message
 
 

@@ -45,8 +45,8 @@ POST_ILLEGAL_COMMITS = (UpdateIssue, Escalate, RoutePreReviewRework)
 def _emit_under_lock(ctx: SweepContext, commit: Emit) -> None:
     if commit.audit_only:
         ctx.write_gate.log_event(
-            # event-consumer: audit-only -- pass-through of the kind ``decide*`` chose; every
-            # literal is checked at its origin by tests/test_dws_event_kinds.py
+            # event-consumer: audit-only -- forwards ``commit.kind`` unchanged; the consumer
+            # or audit-only justification lives at the ``emit(...)`` literal in ``decide*``
             kind=commit.kind,
             payload=dict(commit.payload),
             level=commit.level,
@@ -56,8 +56,8 @@ def _emit_under_lock(ctx: SweepContext, commit: Emit) -> None:
         state = ctx.ports.load_state(ctx.state_file)
         state = ctx.write_gate.append_event(
             state,
-            # event-consumer: audit-only -- pass-through of the kind ``decide*`` chose; every
-            # literal is checked at its origin by tests/test_dws_event_kinds.py
+            # event-consumer: audit-only -- forwards ``commit.kind`` unchanged; the consumer
+            # or audit-only justification lives at the ``emit(...)`` literal in ``decide*``
             commit.kind,
             dict(commit.payload),
             ctx.config.runtime.event_ring_size,

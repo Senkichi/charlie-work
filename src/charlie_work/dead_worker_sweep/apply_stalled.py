@@ -26,10 +26,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from .. import devin_shell, post_mortem, role_quota_ledger, worker, worker_fate
+from .. import devin_shell, no_pr_orphan_fate, post_mortem, role_quota_ledger, worker, worker_fate
 from . import effects_sessions
 from ..config import OrchestratorConfig
-from ..state import load_state, set_throttled_until, state_lock
+from ..process_utils import find_worker_terminal_status
+from ..worktree import read_worker_outcome
+from ..state import load_state, load_state_locked, set_throttled_until, state_lock
 from ..write_gate import WriteGate, require_write_gate
 from .decide_stalled import DEFER_SOURCE, REAP_SOURCE, decide_stalled
 from .stalled_model import (
@@ -40,6 +42,7 @@ from .stalled_model import (
     KillTree,
     LogTail,
     MarkBudgetExceeded,
+    ProbeCompletedHandoff,
     ProbeHealth,
     ProbeRateLimitDefer,
     ReadAdapterProfile,
@@ -61,11 +64,39 @@ MAX_ROUNDS_PER_WORKER = 64
 PLAN_VIOLATION_KIND = "stalled_sweep_plan_violation"
 
 
+def _completed_handoff(
+    w: worker.WorkerView, *, state_file: Path, sessions_dir: Path, now: datetime
+) -> bool:
+    """True when ``worker_fate`` finds a fresh, non-blocked completed outcome.
+
+    Same freshness rules as the orphan sweep (``resolve_no_pr_orphan_fate``): a
+    terminal record from an earlier dispatch, or a stale worktree outcome, does
+    not count. Completed means a declared push or a clean (exit 0) terminal.
+    """
+    entry = (load_state_locked(state_file).get("issues") or {}).get(str(w.issue_number), {})
+    worktree = Path(w.worktree_path) if w.worktree_path else None
+    fate = no_pr_orphan_fate.resolve_no_pr_orphan_fate(
+        issue_number=w.issue_number,
+        entry=entry,
+        terminal=find_worker_terminal_status(sessions_dir, w.issue_number),
+        worktree_path=worktree,
+        worktree_outcome_raw=read_worker_outcome(worktree) if worktree is not None else None,
+        now=now,
+    )
+    outcome = fate.basis.outcome
+    if outcome is not None:
+        return outcome.outcome != "blocked" and (
+            outcome.push_succeeded is True or outcome.outcome == "completed"
+        )
+    return fate.basis.exit_code == 0
+
+
 def _serve(
     request: Any,
     w: worker.WorkerView,
     *,
     sessions_dir: Path,
+    state_file: Path,
     config: OrchestratorConfig,
     now: datetime,
     write_gate: WriteGate,
@@ -116,6 +147,8 @@ def _serve(
         return profile.record_failure(
             sessions_dir, w.issue_number, fallback_kind="stalled", config=config, now=now
         )
+    if isinstance(request, ProbeCompletedHandoff):
+        return _completed_handoff(w, state_file=state_file, sessions_dir=sessions_dir, now=now)
     if isinstance(request, ReadLogTail):
         log_path = Path(w.log_path)
         last_line = None
@@ -206,8 +239,8 @@ def _state_txn(
         if commit.event_kind is not None:
             state = write_gate.append_event(
                 state,
-                # event-consumer: audit-only -- pass-through of the kind ``decide_stalled``
-                # chose; every literal is checked at its origin by tests/test_dws_event_kinds.py
+                # event-consumer: audit-only -- forwards ``commit.event_kind`` unchanged; the consumer
+                # or audit-only justification lives at the ``event_kind=`` literal in ``decide_stalled``
                 commit.event_kind,
                 dict(commit.event_payload),
             )
@@ -291,7 +324,13 @@ def _handle_worker(
             _violation(write_gate, w, f"unservable request {request!r}")
             return None
         observed[request] = _serve(
-            request, w, sessions_dir=sessions_dir, config=config, now=now, write_gate=write_gate
+            request,
+            w,
+            sessions_dir=sessions_dir,
+            state_file=state_file,
+            config=config,
+            now=now,
+            write_gate=write_gate,
         )
     _violation(write_gate, w, f"exceeded {MAX_ROUNDS_PER_WORKER} rounds")
     return None

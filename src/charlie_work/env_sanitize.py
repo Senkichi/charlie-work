@@ -82,6 +82,7 @@ from __future__ import annotations
 
 import os
 import shutil
+from collections.abc import Mapping
 from pathlib import Path
 
 from . import layout
@@ -134,6 +135,29 @@ STRIPPED_GH_TOKEN_VARS = (
     "GH_ENTERPRISE_TOKEN",
     "GITHUB_ENTERPRISE_TOKEN",
 )
+
+
+# Env every claude-code worker launches with unless `worker_env` overrides it
+# (issue #2096). Verified against Claude Code CLI 2.1.286: with this set, the
+# Bash tool has no `run_in_background` parameter. In print mode, ending the
+# turn ends the session, so a background Bash task would be killed with the
+# work uncommitted.
+WORKER_ENV_DEFAULTS: dict[str, str] = {"CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1"}
+
+
+def build_worker_env(
+    sanitized_env: Mapping[str, str], env: Mapping[str, object] | None
+) -> dict[str, str]:
+    """Merge sanitized base env, harness defaults, then operator ``worker_env``.
+
+    Later layers win, so an operator ``worker_env`` value can still override a
+    harness default.
+    """
+    return {
+        **sanitized_env,
+        **WORKER_ENV_DEFAULTS,
+        **{str(k): str(v) for k, v in (env or {}).items()},
+    }
 
 
 def _is_owned_venv(path: Path) -> bool:

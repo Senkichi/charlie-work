@@ -123,6 +123,7 @@ from .worktree import (
 )
 from . import state as _state
 from .unescalate_reset_fields import (
+    ISSUE_BUDGET_RESET_BY_ESCALATION_REASON,
     REWORK_BUDGET_RESET_BY_ESCALATION_REASON,
     UNESCALATE_ISSUE_RESET_FIELDS,
     UNESCALATE_PR_RESET_FIELDS,
@@ -3990,12 +3991,14 @@ class OrchestratorApp:
             # "Required check(s) missing" janitor failure). Detection lives
             # entirely in that method; the retrigger policy below (issue
             # #1274, W17) is this method's follow-up.
-            ci_run_never_created_head_sha = self._detect_ci_run_never_created(
-                pr,
-                verdict,
-                known_head=(pr_state or {}).get("ci_run_never_created_head"),
-            )
-            ci_run_never_created = ci_run_never_created_head_sha is not None
+            # Issue #1681: the same detector also classifies the terminal
+            # ``workflow_no_jobs`` head (runs exist, all completed, no jobs);
+            # retrigger cannot fix that, so it routes to rework below.
+            (
+                ci_run_never_created_head_sha,
+                workflow_no_jobs_head_sha,
+                stale_checks_attempts,
+            ) = self._probe_ci_absence(pr, verdict, pr_state)
 
             with state_lock(self.paths.state_file):
                 state = load_state(self.paths.state_file)
@@ -4022,28 +4025,17 @@ class OrchestratorApp:
                     # parsing failure-message text.
                     "is_missing_checks_only_block": verdict.is_missing_checks_only_block,
                 }
-                # At most once per (pr, head_sha): only emit when this head
-                # hasn't already been flagged as never-created.
-                ci_run_never_created_new_head = (
-                    ci_run_never_created
-                    and existing_pr_state.get("ci_run_never_created_head")
-                    != ci_run_never_created_head_sha
+                state = self._record_ci_absence_state(
+                    state,
+                    pr_state_update,
+                    existing_pr_state,
+                    pr,
+                    verdict,
+                    issue_number,
+                    never_created_head=ci_run_never_created_head_sha,
+                    workflow_no_jobs_head=workflow_no_jobs_head_sha,
+                    attempts=stale_checks_attempts,
                 )
-                if ci_run_never_created:
-                    pr_state_update["ci_run_never_created_head"] = ci_run_never_created_head_sha
-                state["prs"][str(pr_number)] = pr_state_update
-                if ci_run_never_created_new_head:
-                    state = self._record_event(
-                        state,
-                        "ci_run_never_created",
-                        {
-                            "pr_number": pr_number,
-                            "issue_number": issue_number,
-                            "head_sha": ci_run_never_created_head_sha,
-                            "branch": pr.get("headRefName"),
-                            "missing_checks": list(verdict.missing_required_checks),
-                        },
-                    )
                 if failures_changed:
                     # Issue #818: a draft co-occurring with another real
                     # failure (e.g. draft + empty body) is not auto-readied
@@ -4082,6 +4074,11 @@ class OrchestratorApp:
             # and gives the rework loop real signal -- the three PRs this
             # item exists to fix (#1186/#1192/#1214) all carry a co-occurring
             # failure.
+            if issue_number is not None and workflow_no_jobs_head_sha is not None:
+                return self._route_workflow_no_jobs(
+                    pr, pr_number, issue_number, verdict, workflow_no_jobs_head_sha
+                )
+
             stale_checks_head_sha = str(pr.get("headRefOid") or "") or None
             stale_checks_retrigger_in_scope = (
                 issue_number is not None
@@ -4569,6 +4566,7 @@ class OrchestratorApp:
                 # must not carry forward and immediately count against the
                 # fresh attempt budget (issue #1069).
                 "review_log_unreadable_streak": 0,
+                "review_api_error_streak": 0,  # issue #1808
                 # Issue #1439: reset the turn-limit miss streak on a fresh
                 # dispatch cycle (new head). A same-head rebuild must NOT zero
                 # it -- mirroring review_dispatch_attempt_count's same-head
@@ -5851,6 +5849,7 @@ class OrchestratorApp:
     _UNESCALATE_PR_RESET_FIELDS = UNESCALATE_PR_RESET_FIELDS
     _UNESCALATE_ISSUE_RESET_FIELDS = UNESCALATE_ISSUE_RESET_FIELDS
     _REWORK_BUDGET_RESET_BY_ESCALATION_REASON = REWORK_BUDGET_RESET_BY_ESCALATION_REASON
+    _ISSUE_BUDGET_RESET_BY_ESCALATION_REASON = ISSUE_BUDGET_RESET_BY_ESCALATION_REASON
 
     # Deliberately NOT @_guard_state_lock: merge_check takes no state lock, and
     # the guard's contract is to return a *successful* skip (ok=True) when the
