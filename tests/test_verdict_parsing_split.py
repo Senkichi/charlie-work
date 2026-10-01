@@ -348,14 +348,17 @@ def test_all_verdict_parsing_names_are_reexported_by_identity() -> None:
     The md-r4 monotone composition adds ``_legacy_extract_verdict_from_text``
     and ``_scan_extract_verdict_from_text`` (2 functions: 16 -> 18), for
     34 -> 36 overall.
+    Issue #2143's rework adds ``_LINE_START_JSON_OPENER_RE`` (1 constant: 17 ->
+    18) and ``_extract_trailing_fenced_verdict``,
+    ``_extract_verdict_from_plaintext_log`` (2 functions: 18 -> 20), for 36 -> 39.
     """
     import charlie_work.verdict_parsing as verdict_parsing
     import charlie_work.workflow as workflow
 
     names = _module_level_defined_names(_VERDICT_PARSING_PATH)
     assert names, "AST derivation found zero module-level names -- derivation is broken"
-    assert len(names) == 36, (
-        f"expected 36 moved units (18 functions + ReviewSessionOutcome + 17 constants), "
+    assert len(names) == 39, (
+        f"expected 39 moved units (20 functions + ReviewSessionOutcome + 18 constants), "
         f"found {len(names)}: {sorted(names)}"
     )
 
@@ -367,6 +370,9 @@ def test_all_verdict_parsing_names_are_reexported_by_identity() -> None:
         "_legacy_extract_verdict_from_text",
         "_scan_extract_verdict_from_text",
         "_strip_fenced_blocks",
+        "_LINE_START_JSON_OPENER_RE",
+        "_extract_trailing_fenced_verdict",
+        "_extract_verdict_from_plaintext_log",
     }
     assert facade_exempt <= set(names), (
         "facade_exempt names a unit verdict_parsing no longer defines"
