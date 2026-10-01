@@ -426,6 +426,31 @@ and `host_load_term` naming the binding term) to the repo's `events.db`, and a
 failed measurement fails *open* — dispatch proceeds — with a rate-limited
 `host_load_unavailable` warning instead of a silent missing clamp.
 
+### Host test-slot pool (`test_slots`, issue #2124)
+
+Dispatch admission only bounds how many sessions *start*; after that each worker
+picks when to run a wide suite. The slot pool bounds it at execution time:
+`S = cpu_count // width` fixed-width slots (default width 4 -> 4 slots on 16
+cores), each an OS file lock under `%LOCALAPPDATA%\charlie-work	est-slots\`
+held for the life of one wide suite. A killed holder frees its slot; there is no
+lease, heartbeat, or daemon. Slot 0 is the merge gate's alone; agent suites share
+slots `1..S-1`, so the gate never queues behind workers.
+
+- Enforced by `plugins/test_slot/test_slot_plugin.py`, a standalone pytest plugin
+  armed through `worker_env` (`PYTEST_PLUGINS` + `PYTHONPATH`) for every worker
+  and through the launch env for the gate. Only a run collecting at least
+  `min_items` (default 300) takes a slot, so targeted runs never wait.
+- Waiting prints `test-slot: waiting (N held, M queued)` every 30s. After
+  `wait_timeout_seconds` (default 480, under Claude's 10-minute Bash ceiling) the
+  run exits **75** with `test-slot: host busy; retry or run targeted tests` and a
+  `test_slot_wait_timeout` event is recorded on the next loop pass.
+- Config is host-wide (global config only): `test_slots.enabled` (default on; the
+  kill switch), `width`, `min_items`, `wait_timeout_seconds`.
+- Self-hosted CI runners run on this host but are provisioned by `ci_fleet`, not
+  this repo: to draw from the same pool, give the runner service the same
+  `PYTEST_PLUGINS`/`PYTHONPATH`/`CHARLIE_TEST_SLOT_*` environment (see
+  `charlie_work.test_slots.arm_env`). Until then CI suites are unmetered.
+
 ## Shared-venv isolation for devin-shell
 
 Per-worktree venvs are also the default for `devin-shell` (the `devin.venv_source`
