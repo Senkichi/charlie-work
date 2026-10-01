@@ -47,9 +47,11 @@ from .fleet_dispatch import (
 )
 from .supervise_loop import (
     DEFAULT_MAX_RELAUNCHES,
+    EXIT_FLEET_PAUSED,
     EXIT_RESTART_REQUESTED,
     PREFLIGHT_REFUSAL_EXIT_CODE,
 )
+from .fleet_pause import register_fleet_pause_subparsers, run_fleet_pause, run_fleet_resume
 from .fleet_paths import fleet_dir
 from .fleet_registry import _load_registry, touch_repo, count_fleet_runners
 from .fleet_status import (  # noqa: F401  (deliberate re-export)
@@ -484,6 +486,7 @@ def build_parser() -> argparse.ArgumentParser:
     # file-size ratchet mark) — same register_*_subparser convention as the
     # *_command modules below.
     register_fleet_stop_subparser(fleet_sub)
+    register_fleet_pause_subparsers(fleet_sub)  # issue #1776
 
     runners = subparsers.add_parser("runners")
     runners_sub = runners.add_subparsers(dest="runners_command", required=True)
@@ -2575,6 +2578,10 @@ def main(argv: list[str] | None = None) -> int:
                 )
             elif args.fleet_command == "stop":
                 result = run_fleet_stop(args)
+            elif args.fleet_command == "pause":
+                result = run_fleet_pause(args)
+            elif args.fleet_command == "resume":
+                result = run_fleet_resume(args)
             else:
                 result = CommandResult(False, f"unknown fleet command: {args.fleet_command}", {})
         elif args.command == "runners":
@@ -2843,6 +2850,11 @@ def main(argv: list[str] | None = None) -> int:
     # signal out of the command-name dispatch.
     if isinstance(result.data, dict) and result.data.get("preflight_refused"):
         return PREFLIGHT_REFUSAL_EXIT_CODE
+
+    # Issue #1776: an honored pause flag exits EXIT_FLEET_PAUSED (5) so the
+    # launcher log reads "paused", not "clean stop" or "crash".
+    if isinstance(result.data, dict) and result.data.get("fleet_paused"):
+        return EXIT_FLEET_PAUSED
 
     return 0 if result.ok else 1
 

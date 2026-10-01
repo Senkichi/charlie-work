@@ -49,6 +49,7 @@ from typing import Any
 from . import layout
 from .config import ConfigError
 from .fleet_dispatch import compute_api_worker_fleet_report
+from .fleet_pause import fleet_pause_status
 from .fleet_registry import _load_registry
 from .github import GitHub, GitHubError
 from .global_config import load_layered_config
@@ -184,10 +185,18 @@ def run_fleet_status(args: argparse.Namespace) -> CommandResult:
     # api-worker fleet report line (issue #483): read-only, never raises.
     api_worker_report = compute_api_worker_fleet_report(fleet_dir_override=args.fleet_dir)
 
+    # Issue #1776: a paused fleet must stay visible -- an unnoticed pause is an
+    # outage (it also freezes runner allocation).
+    pause = fleet_pause_status(args.fleet_dir)
+    paused_note = f" [PAUSED: {pause['consequence']}]" if pause else ""
     return CommandResult(
         ok=not errors,
-        message=f"fleet status: {len(per_repo)} repo(s), {len(errors)} error(s), {len(stale)} stale(s)",
+        message=(
+            f"fleet status: {len(per_repo)} repo(s), {len(errors)} error(s), "
+            f"{len(stale)} stale(s){paused_note}"
+        ),
         data={
+            "pause": pause,
             "repos": per_repo,
             "errors": errors,
             "stale": stale,

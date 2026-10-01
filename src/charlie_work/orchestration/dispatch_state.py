@@ -88,6 +88,7 @@ from charlie_work import fleet_provider_throttle
 from charlie_work.escalation import _escalate_issue, _escalation_edge
 from charlie_work.fleet_registry import managed_repo_names, managed_repo_roots
 from charlie_work.github import label_names
+from charlie_work.github_capabilities.cross_repo_blockers import blocker_refs
 from charlie_work.labels import TransitionOutcome
 from charlie_work.state import (
     arm_dispatch_stale_alert,
@@ -505,7 +506,7 @@ def _dispatch_impl(
             "sessions": [asdict(request) for request in session_requests],
             "dispatch_results": [],
             "blocked": [
-                {"issue": issue_number, "blockers": blockers}
+                {"issue": issue_number, "blockers": blocker_refs(blockers)}
                 for issue_number, blockers in sorted(blocked_issues.items())
             ],
             "stalled": stalled_entries,
@@ -915,7 +916,11 @@ def _dispatch_impl(
         # the (issue, blockers) content actually changed since the last
         # emission, tracked via a compact snapshot on the issue record.
         if blocked_issues:
-            for issue_number, blockers in blocked_issues.items():
+            for issue_number, raw_blockers in blocked_issues.items():
+                # Issue #2005: repo-qualified, JSON-stable refs -- a bare
+                # CrossRepoBlocker would round-trip through state.json to a
+                # local issue number and defeat this dedupe.
+                blockers = blocker_refs(raw_blockers)
                 issue_key = str(issue_number)
                 issue_entry = state["issues"].get(issue_key, {})
                 if not isinstance(issue_entry, dict):
@@ -946,6 +951,7 @@ def _dispatch_impl(
                     b for b in open_blockers if self._is_dead_blocker(b, state, pr_by_issue)
                 )
                 chain_dead = bool(open_blockers) and dead_blockers == sorted(open_blockers)
+                dead_blockers = blocker_refs(dead_blockers)
                 previously_alerted = issue_entry.get("chain_dead_alerted_blockers")
                 if chain_dead and previously_alerted != dead_blockers:
                     state["issues"][issue_key] = {
@@ -1883,7 +1889,7 @@ def _dispatch_impl(
         "live_worker_redispatch_averted": live_worker_redispatch_averted,
         "stalled": stalled_entries,
         "blocked": [
-            {"issue": issue_number, "blockers": blockers}
+            {"issue": issue_number, "blockers": blocker_refs(blockers)}
             for issue_number, blockers in sorted(blocked_issues.items())
         ],
         "operator_claimed_ready": sorted(operator_claimed_ready),
