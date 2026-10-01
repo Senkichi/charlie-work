@@ -40,8 +40,10 @@ from charlie_work.no_op_rework_body import _body_rework_escape_warning
 from charlie_work.safe_ref import require_valid_ref_name, require_valid_sha
 from charlie_work.subprocess_runner import run_captured
 from charlie_work.test_adequacy_exempt import (
+    exempt_reason_for_pr,
     exempt_reason_from_commit_trailers,  # noqa: F401  (deliberate re-export)
 )
+from charlie_work.unified_diff import iter_diff_files  # noqa: F401  (deliberate re-export)
 
 if TYPE_CHECKING:
     from charlie_work.config import OrchestratorConfig, TestAdequacyConfig
@@ -1287,44 +1289,6 @@ def _get_unpushed_commit_info(
     return None
 
 
-def iter_diff_files(diff: str) -> Iterator[tuple[str, bool, list[str]]]:
-    """Split a unified diff into per-file hunk bodies.
-
-    Yields ``(filename, is_new_file, hunk_lines)`` for each file section in
-    ``diff``, where ``hunk_lines`` is every ``@@``-header and hunk-body line
-    for that file (diff-metadata lines starting with ``\\`` are dropped).
-    Sections with no discoverable ``+++ b/`` path are skipped. This performs
-    structural splitting only — it does not tally added/removed lines or
-    inspect hunk content beyond locating file/hunk boundaries; line counting
-    is the caller's responsibility (see ``check_test_adequacy`` in a later
-    module addition).
-    """
-    sections = diff.split("\ndiff --git")
-    for section in sections:
-        if not section.strip():
-            continue
-        if not section.startswith("diff --git"):
-            section = "diff --git" + section
-
-        current_file: str | None = None
-        current_hunks: list[str] = []
-        is_new_file = False
-
-        for line in section.splitlines():
-            if line.startswith("+++ b/"):
-                current_file = line[6:]
-            elif line.startswith("new file mode"):
-                is_new_file = True
-            elif line.startswith("@@"):
-                current_hunks.append(line)
-            elif current_hunks:
-                if not line.startswith("\\"):
-                    current_hunks.append(line)
-
-        if current_file is not None:
-            yield current_file, is_new_file, current_hunks
-
-
 def check_test_adequacy(
     diff: str,
     pr: dict[str, Any],
@@ -1414,26 +1378,13 @@ def check_test_adequacy(
                     facts=default_facts,
                 )
 
-        # Step 5: Exemption check
-        exempt = False
-        exempt_reason = ""
-        body = pr.get("body") or ""
-        exempt_re = re.compile(rf"^{re.escape(config.exempt_marker)}\s*(?P<reason>.+)$", re.M)
-        match = exempt_re.search(body)
-        if match:
-            reason = match.group("reason").strip()
-            if reason:  # Non-empty reason required
-                exempt = True
-                exempt_reason = reason
-        if not exempt:
-            # Workers have no GitHub token and cannot edit the PR body; a
-            # commit trailer is the channel they do have (issue #2220).
-            trailer_reason = exempt_reason_from_commit_trailers(
-                commit_messages, config.exempt_marker
-            )
-            if trailer_reason:
-                exempt = True
-                exempt_reason = trailer_reason
+        # Step 5: Exemption check. Workers have no GitHub token and cannot
+        # edit the PR body; a commit trailer is the channel they do have
+        # (issue #2220).
+        exempt_reason = exempt_reason_for_pr(
+            pr.get("body") or "", commit_messages, config.exempt_marker
+        )
+        exempt = bool(exempt_reason)
 
         facts = TestAdequacyFacts(
             added_product_loc=added_product_loc,
