@@ -15,13 +15,17 @@ from datetime import datetime, timedelta, tzinfo
 from ..charts import Coverage, LineSpec, Marker, Panel, Size, line_chart, small_multiples
 from ..charts import Point as ChartPoint
 from ..charts import Series as ChartSeries
+from ..charts.svg import SERIES_DASH
 from ..history_data import HistoryView, MetricData
 from ..metrics_base import Series
 from ..timeutil import iso, parse_ts
 from .now_fmt import esc, repo_url, short_repo, slug
 
 LIFECYCLE_ISSUE = "#2226"
-MAX_CATEGORY_LINES = 3  # beyond this a combined chart stops supporting a comparison
+# One combined chart draws at most as many lines as the renderer has distinct (colour,
+# dash) styles: a 4th line would reuse the headline's style and be told apart only by its
+# end label (D2). The headline and any overlaid cap take their slots first.
+MAX_CHART_LINES = len(SERIES_DASH)
 COMBINED = Size(width=640.0, height=220.0)
 # Usage metric -> the cap/capacity metric of the same tab drawn on the same axis (the
 # comparison is "how close to the cap", Franconeri rule 4); the cap gets no card of its own.
@@ -68,8 +72,9 @@ def _chart_name(series: Series, headline: Series, has_children: bool) -> str:
 def drawn_series(metric: MetricData, cap: MetricData | None) -> tuple[Series, ...]:
     """The headline, its largest categories (bounded), then any overlaid cap series."""
     head = metric.headline
+    room = MAX_CHART_LINES - 1 - (cap is not None)
     children = sorted((s for s in metric.series[1:] if s.n > 0), key=lambda s: (-s.n, s.name))[
-        :MAX_CATEGORY_LINES
+        : max(room, 0)
     ]
     return (head, *children, *((cap.headline,) if cap is not None else ()))
 

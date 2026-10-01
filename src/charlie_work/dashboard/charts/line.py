@@ -199,7 +199,7 @@ def _series(f: Frame, series: tuple[Series, ...], spec: LineSpec, labels: bool) 
     out: list[str] = []
     ends: list[tuple[float, int]] = []
     for idx, s in enumerate(series):
-        cls = f"series s{idx % 3 + 1}" + (" approx" if s.approx else "")
+        cls = f"series s{idx % len(SERIES_DASH) + 1}" + (" approx" if s.approx else "")
         dash = (APPROX_DASHES if s.approx else SERIES_DASH)[idx % len(SERIES_DASH)]
         body: list[str] = []
         inside = tuple(p for p in s.points if f.t0 <= p.at <= f.t1)

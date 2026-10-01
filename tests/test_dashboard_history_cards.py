@@ -53,3 +53,26 @@ def test_history_buckets_sit_on_the_local_calendar_grid() -> None:
     three = bucket_end(now, timedelta(days=3), tz).astimezone(tz)
     assert three.time().isoformat() == "00:00:00"
     assert (three.date() - datetime(2026, 1, 1).date()).days % 3 == 0
+
+
+def test_a_combined_chart_never_repeats_a_line_style() -> None:
+    import re
+
+    from charlie_work.dashboard.history_data import MetricData, range_query
+    from charlie_work.dashboard.pages.history_cards import render_card
+
+    q = range_query("7d", END, UTC)
+    pts = tuple((f"2026-09-{d:02d}T{h:02d}:00:00Z", float(d)) for d in range(24, 30)
+                for h in (0, 6, 12, 18))  # fmt: skip
+    kw = dict(points=pts, kind="count", n=9, window_start=q.start_iso, window_end=q.end_iso,
+              bucket_seconds=int(q.bucket.total_seconds()))  # fmt: skip
+    head = _series(name="esc", **kw)
+    kids = tuple(_series(name=f"esc.k{i}", **{**kw, "n": 9 - i}) for i in range(5))
+    view_metric = MetricData("escalations", (head, *kids), {"esc": "t"})
+    from charlie_work.dashboard.history_data import HistoryView
+
+    html = render_card(HistoryView("quality", "7d", q, (view_metric,), END), view_metric, UTC)
+    combined = html[: html.index("</figure>")]
+    styles = re.findall(r'<g class="(series s\d)[^"]*"><path class="line" d="[^"]+" fill="none"'
+                        r'( stroke-dasharray="[^"]+")?', combined)  # fmt: skip
+    assert len(styles) >= 3 and len(set(styles)) == len(styles), styles
