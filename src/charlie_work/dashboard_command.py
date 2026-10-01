@@ -119,26 +119,6 @@ def _run_history(
     return CommandResult(True, f"dashboard history ({days}d)", {"tabs": tabs})
 
 
-def _run_serve(config: DashboardConfig, fleet_dir_override: str | None) -> CommandResult:
-    """Bind and serve until Ctrl-C; bind/config problems return as values."""
-    import threading
-
-    from .dashboard.server import ServerError, default_sources, make_server, run_server
-
-    server = make_server(
-        config, default_sources(fleet_dir_override, config.collector_interval_seconds)
-    )
-    if isinstance(server, ServerError):
-        return CommandResult(False, server.message, {})
-    print(f"dashboard serving on http://{config.host}:{server.port}/ (Ctrl-C to stop)")
-    stop = threading.Event()
-    try:
-        run_server(server, stop)
-    except KeyboardInterrupt:
-        stop.set()
-    return CommandResult(True, "dashboard stopped", {})
-
-
 def run_dashboard_command(args: argparse.Namespace) -> CommandResult:
     """Dispatch ``charlie dashboard <sub>``; config/IO failures come back as values."""
     override = args.fleet_dir
@@ -146,13 +126,16 @@ def run_dashboard_command(args: argparse.Namespace) -> CommandResult:
         config = _load_dashboard_config(override)
     except (ConfigError, ValueError, OSError, yaml.YAMLError) as exc:
         return CommandResult(False, f"dashboard config error: {exc}", {})
+    if args.dashboard_command == "serve":
+        # Owns its kill switch: disabled is a clean rc-0 no-op, not a failure.
+        from .dashboard.serve import serve_dashboard
+
+        return serve_dashboard(config, override)
     if not config.enabled:
         return CommandResult(
             False, "dashboard is disabled (dashboard.enabled: false in the fleet config)", {}
         )
     now = datetime.now(UTC)
-    if args.dashboard_command == "serve":
-        return _run_serve(config, override)
     if args.dashboard_command == "rollup":
         from .dashboard.rollup import run_rollup, rollup_sources
 
