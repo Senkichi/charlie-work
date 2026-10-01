@@ -15,6 +15,50 @@ from charlie_work import cli
 from charlie_work.workflow import CommandResult
 
 
+@pytest.fixture(autouse=True)
+def _priority_calls(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Stub the #2140 priority hook so ``main()`` never re-prioritises the pytest worker.
+
+    Returns the shared call log; wiring tests append dispatch markers to it so
+    ordering (hook before dispatch) is observable.
+    """
+    calls: list[str] = []
+    monkeypatch.setattr(
+        cli, "raise_to_normal_priority", lambda *_a, **_k: calls.append("raise"), raising=False
+    )
+    return calls
+
+
+def test_cli_fleet_supervise_raises_priority_before_dispatch(
+    monkeypatch: pytest.MonkeyPatch, _priority_calls: list[str]
+) -> None:
+    """#2140: ``fleet supervise`` raises to NORMAL priority before the loop runs."""
+
+    def _fake(**_kwargs: Any) -> CommandResult:
+        _priority_calls.append("dispatch")
+        return CommandResult(True, "fleet supervisor complete", {})
+
+    monkeypatch.setattr(cli, "run_fleet_supervise", _fake)
+
+    assert cli.main(["fleet", "supervise"]) == 0
+    assert _priority_calls == ["raise", "dispatch"]
+
+
+def test_cli_fleet_supervise_loop_raises_priority_before_dispatch(
+    monkeypatch: pytest.MonkeyPatch, _priority_calls: list[str]
+) -> None:
+    """#2140: the ``supervise-loop`` wrapper raises priority before launching children."""
+
+    def _fake(**_kwargs: Any) -> CommandResult:
+        _priority_calls.append("dispatch")
+        return CommandResult(True, "supervise-loop done", {})
+
+    monkeypatch.setattr(cli, "run_fleet_supervise_loop", _fake)
+
+    assert cli.main(["fleet", "supervise-loop"]) == 0
+    assert _priority_calls == ["raise", "dispatch"]
+
+
 def test_cli_fleet_supervise_parser() -> None:
     """``fleet supervise`` accepts the expected limit/repos/poll/max-runtime/merge flags."""
     parser = cli.build_parser()
