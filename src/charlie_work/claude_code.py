@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any
 
 from charlie_work.process_utils import (
+    CpuPriority,
     parse_proc_stat_starttime,
     popen_worker,
     start_terminal_status_watcher,
@@ -742,7 +743,7 @@ def resolve_review_effort(
     same deletion that removed the bridge itself. There is no fallback to a
     ``review_dispatch`` value here for the same reason ``devin.adapter`` was
     deleted rather than silently ignored: an old key that's still read halfway
-    is worse than one that errors loudly at load (config.py's ``_build_section``
+    is worse than one that errors loudly at load (config.py's ``validate_section``
     already rejects any surviving ``review_dispatch.review_effort*`` key as
     unknown before this function ever runs).
     """
@@ -1257,6 +1258,7 @@ def launch_claude_worker(
                     try:
                         process = popen_worker(
                             command,
+                            priority=CpuPriority.BELOW_NORMAL,
                             cwd=str(worktree.path),
                             stdin=prompt_handle,
                             stdout=subprocess.PIPE,
@@ -1270,6 +1272,7 @@ def launch_claude_worker(
                 else:
                     process = popen_worker(
                         command,
+                        priority=CpuPriority.BELOW_NORMAL,
                         cwd=str(worktree.path),
                         stdin=subprocess.DEVNULL,
                         stdout=subprocess.PIPE,
@@ -1320,6 +1323,7 @@ def launch_claude_worker(
                     with prompt_path.open("r", encoding="utf-8") as prompt_handle:
                         process = popen_worker(
                             command,
+                            priority=CpuPriority.BELOW_NORMAL,
                             cwd=str(worktree.path),
                             stdin=prompt_handle,
                             stdout=log_handle,
@@ -1330,6 +1334,7 @@ def launch_claude_worker(
                 else:
                     process = popen_worker(
                         command,
+                        priority=CpuPriority.BELOW_NORMAL,
                         cwd=str(worktree.path),
                         stdin=subprocess.DEVNULL,
                         stdout=log_handle,

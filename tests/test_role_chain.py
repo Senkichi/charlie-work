@@ -63,30 +63,76 @@ def test_fallbacks_parse_into_frozen_entries_in_order() -> None:
         config.worker.fallbacks[0].model = "x"  # type: ignore[misc]
 
 
+# Explicit ids keep every leaf's node id as it was when ``match`` was a loose substring
+# (the collect-only gate treats a renamed leaf as a deletion); ``match`` itself is now
+# anchored to the key path the section validator reports (ADR-0007).
 @pytest.mark.parametrize(
     ("section", "fallbacks", "match"),
     [
-        ("worker", [{"harness": "not-a-harness", "model": "m"}], "harness"),
-        ("reviewer", [{"harness": "manual", "model": "m"}], "harness"),
-        ("worker", [{"harness": "devin-shell", "model": "swe-2"}], "duplicate"),
-        (
+        pytest.param(
+            "worker",
+            [{"harness": "not-a-harness", "model": "m"}],
+            r"^worker\.fallbacks\[0\]\.harness: expected one of ",
+            id="worker-fallbacks0-harness",
+        ),
+        pytest.param(
+            "reviewer",
+            [{"harness": "manual", "model": "m"}],
+            r"^reviewer\.fallbacks\[0\]\.harness: expected one of ",
+            id="reviewer-fallbacks1-harness",
+        ),
+        pytest.param(
+            "worker",
+            [{"harness": "devin-shell", "model": "swe-2"}],
+            r"^worker\.fallbacks\[0\]: expected a \(harness, model\) pair not already in",
+            id="worker-fallbacks2-duplicate",
+        ),
+        pytest.param(
             "worker",
             [
                 {"harness": "claude-code", "model": "a"},
                 {"harness": "claude-code", "model": "a"},
             ],
-            "duplicate",
+            r"^worker\.fallbacks\[1\]: expected a \(harness, model\) pair not already in",
+            id="worker-fallbacks3-duplicate",
         ),
-        (
+        pytest.param(
             "worker",
             [{"harness": "claude-code", "model": str(i)} for i in range(4)],
-            "at most 3",
+            r"^worker\.fallbacks: expected at most 3 entries, got 4 entries$",
+            id="worker-fallbacks4-at most 3",
         ),
-        ("worker", {"harness": "claude-code"}, "must be a list"),
-        ("worker", ["claude-code"], "must be a mapping"),
-        ("worker", [{"harness": "claude-code", "effort": "high"}], "unknown key"),
-        ("worker", [{"harness": "claude-code", "model": 5}], "must be a string"),
-        ("worker", [{"harness": "manual"}], "cannot be part of a role chain"),
+        pytest.param(
+            "worker",
+            {"harness": "claude-code"},
+            r"^worker\.fallbacks: expected list of mappings, got ",
+            id="worker-fallbacks5-must be a list",
+        ),
+        pytest.param(
+            "worker",
+            ["claude-code"],
+            r"^worker\.fallbacks\[0\]: expected mapping, got 'claude-code'",
+            id="worker-fallbacks6-must be a mapping",
+        ),
+        pytest.param(
+            "worker",
+            [{"harness": "claude-code", "effort": "high"}],
+            r"^worker\.fallbacks\[0\]: expected known keys \(valid: harness, model\), "
+            r"got unknown key\(s\) effort$",
+            id="worker-fallbacks7-unknown key",
+        ),
+        pytest.param(
+            "worker",
+            [{"harness": "claude-code", "model": 5}],
+            r"^worker\.fallbacks\[0\]\.model: expected string, got 5 \(int\)$",
+            id="worker-fallbacks8-must be a string",
+        ),
+        pytest.param(
+            "worker",
+            [{"harness": "manual"}],
+            r"^worker\.fallbacks\[0\]\.harness: expected a harness that records sessions",
+            id="worker-fallbacks9-cannot be part of a role chain",
+        ),
     ],
 )
 def test_bad_fallbacks_raise_config_error(section: str, fallbacks: object, match: str) -> None:
@@ -97,6 +143,27 @@ def test_bad_fallbacks_raise_config_error(section: str, fallbacks: object, match
     )
     with pytest.raises(ConfigError, match=match):
         build_config_from_data({section: {**primary, "fallbacks": fallbacks}})
+
+
+@pytest.mark.parametrize("section", ["worker", "reviewer"])
+def test_null_fallbacks_normalize_to_an_empty_chain(section: str) -> None:
+    """``fallbacks: null`` builds ``()`` (what ``chain_of`` expects), never ``None``."""
+    role = getattr(build_config_from_data({section: {"fallbacks": None}}), section)
+    assert role.fallbacks == ()
+    assert len(role.chain) == 1
+
+
+def test_rescue_roles_keep_fallbacks_unparsed() -> None:
+    """Known gap carried over from #2088: rescue.* stores ``fallbacks`` as written."""
+    raw = [{"harness": "not-a-harness"}]
+    config = build_config_from_data({"rescue": {"worker": {"fallbacks": raw}}})
+    assert config.rescue.worker.fallbacks == raw
+
+
+def test_reviewer_fallback_harness_must_be_review_capable() -> None:
+    """``command`` is a worker harness but cannot review: reviewer chains reject it."""
+    with pytest.raises(ConfigError, match=r"^reviewer\.fallbacks\[0\]\.harness: expected one of "):
+        build_config_from_data({"reviewer": {"fallbacks": [{"harness": "command"}]}})
 
 
 def test_same_family_fallback_warns_but_loads(caplog: pytest.LogCaptureFixture) -> None:

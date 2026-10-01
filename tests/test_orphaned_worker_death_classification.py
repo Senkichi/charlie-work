@@ -529,7 +529,7 @@ def test_reap_restore_records_failure_kind_alongside_death(tmp_path: Path) -> No
     """``dead_worker_reap._reap_restore_rework_requested`` must pass the
     resolved ``failure_kind`` into ``_credit_worker_death`` so the credit and
     its attribution are recorded together."""
-    from charlie_work.dead_worker_reap import _reap_restore_rework_requested
+    from charlie_work.dead_worker_sweep.effects_rework import _reap_restore_rework_requested
     from charlie_work.worker import WorkerView
 
     config, paths, fake_gh, _ = _dead_worker_rework_bed(tmp_path)

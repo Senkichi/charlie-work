@@ -43,7 +43,7 @@ import json
 from pathlib import Path
 from unittest.mock import patch
 
-import charlie_work.dead_worker_reap as dead_worker_reap
+import charlie_work.dead_worker_sweep.effects_pr as effects_pr
 from _dead_session_fixtures import _write_dead_session_sidecar
 from _fakes_github import FakeGitHub
 from _local_park_fixtures import (
@@ -376,11 +376,11 @@ def test_dead_session_reap_parks_labelless_local_work(tmp_path: Path, shallow_wt
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     _write_dead_session_sidecar(sessions_dir, issue_number, branch, worktree_path)
 
-    from charlie_work.dead_worker_reap import (
+    from charlie_work.workflow import (
         _classify_dead_sessions_and_update_throttle_state,
     )
 
-    with patch.object(dead_worker_reap, "push_branch") as push_mock:
+    with patch.object(effects_pr, "push_branch") as push_mock:
         push_mock.side_effect = AssertionError(
             "push_branch must not be called for a no-PR backend"
         )
@@ -435,7 +435,7 @@ def test_dead_session_reap_terminal_label_not_reparked(tmp_path: Path, shallow_w
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     _write_dead_session_sidecar(sessions_dir, issue_number, branch, worktree_path)
 
-    from charlie_work.dead_worker_reap import (
+    from charlie_work.workflow import (
         _classify_dead_sessions_and_update_throttle_state,
     )
 
