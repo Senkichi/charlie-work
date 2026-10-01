@@ -14,7 +14,6 @@ collaborators' lookup discipline.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -23,6 +22,7 @@ from ..cross_repo_gate import cross_repo_scope_gate
 from ..dispatch_selection import _windowed_redispatch_at
 from ..escalation import _escalate_issue, _escalation_edge
 from ..github import label_names
+from ..host import current as _host_current
 from ..local_work_park import park_labelless_dead_local_session
 from ..worker import WorkerView
 from ..worktree import read_worker_outcome
@@ -163,7 +163,7 @@ def _reclaim_no_open_pr(
                 entry, window_minutes=config.watchdog.redispatch_window_minutes
             ),
             failure_kind,
-            now=datetime.now(UTC),
+            now=_host_current().clock.now(),
             max_auto_redispatch=config.watchdog.max_auto_redispatch,
             active_labels=active_labels,
             ready_label_present=not needs_ready,

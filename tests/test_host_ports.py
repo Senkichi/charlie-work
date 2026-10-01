@@ -1,0 +1,207 @@
+from __future__ import annotations
+
+import re
+from datetime import UTC, datetime
+
+import pytest
+
+from charlie_work import host
+from charlie_work.host.clock import RealClock, format_utc
+from charlie_work.host.fakes import FakeClock, FakeSessionCounter
+
+_UTC_NOW_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+
+
+def test_format_utc_matches_state_utc_now_shape() -> None:
+    assert _UTC_NOW_RE.match(format_utc(RealClock().now()))
+
+
+def test_format_utc_drops_microseconds_and_uses_z() -> None:
+    moment = datetime(2026, 1, 2, 3, 4, 5, 999999, tzinfo=UTC)
+    assert format_utc(moment) == "2026-01-02T03:04:05Z"
+
+
+def test_fake_clock_advance_moves_now_and_monotonic() -> None:
+    clock = FakeClock(datetime(2026, 1, 1, tzinfo=UTC), mono=10.0)
+    clock.advance(30)
+    assert clock.now() == datetime(2026, 1, 1, 0, 0, 30, tzinfo=UTC)
+    assert clock.monotonic() == 40.0
+
+
+def test_fake_host_swaps_current_and_restores(fake_host) -> None:
+    clock = FakeClock(datetime(2026, 1, 1, tzinfo=UTC))
+    fake = fake_host(clock=clock)
+    assert host.current() is fake
+    assert host.current().clock is clock
+
+
+def test_fake_host_restored_after_previous_test(fake_host, monkeypatch) -> None:
+    fake_host(clock=FakeClock(datetime(2026, 1, 1, tzinfo=UTC)))
+    assert host.current() is not host.REAL
+    monkeypatch.undo()
+    assert host.current() is host.REAL
+
+
+def test_fake_host_composes_with_previous_fake(fake_host) -> None:
+    clock = FakeClock(datetime(2026, 1, 1, tzinfo=UTC))
+    fake_host(clock=clock)
+    fake_host(sessions=FakeSessionCounter(workers=1))
+    assert host.current().clock is clock
+
+
+def test_host_ports_is_frozen() -> None:
+    with pytest.raises(AttributeError):
+        host.REAL.clock = FakeClock(datetime(2026, 1, 1, tzinfo=UTC))  # type: ignore[misc]
+
+
+def test_fake_host_clock_freezes_state_and_workflow_utc_now(fake_host) -> None:
+    from charlie_work import state, workflow
+
+    fake_host(clock=FakeClock(datetime(2026, 3, 4, 5, 6, 7, tzinfo=UTC)))
+    assert state.utc_now() == "2026-03-04T05:06:07Z"
+    assert workflow.utc_now() == "2026-03-04T05:06:07Z"
+
+
+def test_fake_process_probe_mirrors_primitive_semantics() -> None:
+    from charlie_work.host.fakes import FakeProcessProbe
+
+    probe = FakeProcessProbe({10: 5.0, 11: None})
+    assert probe.is_alive(10, 5.0) is True
+    assert probe.is_alive(10, 6.0) is False  # recycled pid
+    assert probe.is_alive(10, None) is True  # indeterminate -> fail-open
+    assert probe.is_alive(11, 7.0) is True
+    assert probe.is_alive(99) is False
+    assert probe.is_alive(None) is False
+    assert probe.is_alive(0) is False
+    assert probe.start_time(10) == 5.0
+
+
+def test_fake_host_probe_reaches_worker_fate_and_sweeps(fake_host) -> None:
+    from charlie_work import worker_fate
+    from charlie_work.dead_worker_sweep.effects_sessions import _worker_pid_alive
+    from charlie_work.dispatch_selection import _reviewer_pid_alive
+    from charlie_work.host.fakes import FakeProcessProbe
+
+    fake_host(probe=FakeProcessProbe({4242: 1.0}))
+    assert worker_fate.is_alive(4242, 1.0) is True
+    assert worker_fate.is_alive(4242, 2.0) is False
+    assert worker_fate.is_alive(None, None) is False
+    assert _worker_pid_alive({"worker_pid": 4242, "worker_process_start_time": 1.0}) is True
+    assert _reviewer_pid_alive({"reviewer_pid": 4242, "reviewer_process_start_time": 9.0}) is False
+
+
+def test_real_probe_late_binds_to_process_utils(monkeypatch) -> None:
+    from charlie_work.host import REAL
+
+    monkeypatch.setattr("charlie_work.process_utils.is_pid_alive", lambda pid, st=None: pid == 7)
+    assert REAL.probe.is_alive(7, None) is True
+    assert REAL.probe.is_alive(8, None) is False
+    assert REAL.probe.is_alive(-1, None) is False
+
+
+def test_fake_session_counter_reaches_review_fleet_gate(fake_host) -> None:
+    from pathlib import Path
+
+    from charlie_work.host.fakes import FakeSessionCounter
+
+    counter = FakeSessionCounter(
+        workers=2, reviews=3, fleet_workers=(5, ["x"]), fleet_reviews=(4, [])
+    )
+    ports = fake_host(sessions=counter)
+    s = ports.sessions
+    assert s.live_workers(Path("w"), None) == 2
+    assert s.live_reviews(Path("r"), None) == 3
+    assert s.fleet_live_workers(None) == (5, ["x"])
+    assert s.fleet_live_reviews("d") == (4, [])
+    assert [c[0] for c in counter.calls] == [
+        "live_workers",
+        "live_reviews",
+        "fleet_live_workers",
+        "fleet_live_reviews",
+    ]
+
+
+def test_real_session_counter_late_binds_to_existing_patch_targets(monkeypatch) -> None:
+    from pathlib import Path
+
+    from charlie_work.host import REAL
+
+    monkeypatch.setattr("charlie_work.workflow._count_live_sessions", lambda d, s=None: 11)
+    monkeypatch.setattr("charlie_work.workflow.count_fleet_live_sessions", lambda o: (12, []))
+    monkeypatch.setattr("charlie_work.workflow.count_fleet_live_reviews", lambda o: (13, []))
+    monkeypatch.setattr(
+        "charlie_work.dispatch_selection._count_live_reviews", lambda d, s=None: 14
+    )
+    assert REAL.sessions.live_workers(Path("."), None) == 11
+    assert REAL.sessions.fleet_live_workers(None) == (12, [])
+    assert REAL.sessions.fleet_live_reviews(None) == (13, [])
+    assert REAL.sessions.live_reviews(Path("."), None) == 14
+
+
+def test_command_result_reexport_is_identity() -> None:
+    from charlie_work import command_result, workflow
+
+    assert workflow.CommandResult is command_result.CommandResult
+
+
+def _app(tmp_path, **kwargs):
+    from _review_fixtures import _dispatch_reviews_app
+
+    return _dispatch_reviews_app(tmp_path, **kwargs)
+
+
+def test_app_default_host_reads_current_at_access_time(fake_host, tmp_path) -> None:
+    from charlie_work.host.fakes import FakeProcessProbe
+
+    app = _app(tmp_path)
+    assert app.host is host.REAL
+    probe = FakeProcessProbe({4242: 1.0})
+    fake_host(probe=probe)  # installed AFTER the app was built
+    assert app.host.probe is probe
+
+
+def test_app_without_host_shares_the_fixture_fake_with_non_app_code(fake_host, tmp_path) -> None:
+    from charlie_work import worker_fate
+    from charlie_work.host.fakes import FakeProcessProbe
+
+    fake_host(probe=FakeProcessProbe({4242: 1.0}))
+    app = _app(tmp_path)
+    assert app.host.probe.is_alive(4242, 1.0) is True
+    assert worker_fate.is_alive(4242, 1.0) is True
+
+
+def test_explicit_host_wins_over_fixture_and_does_not_mutate_global(fake_host, tmp_path) -> None:
+    import dataclasses
+
+    from charlie_work.host.fakes import FakeReviewLauncher
+
+    explicit = dataclasses.replace(host.REAL, launch=FakeReviewLauncher())
+    app = _app(tmp_path)
+    app_explicit = type(app)(app.repo_root, app.paths, app.config, app.gh, host=explicit)
+    fixture_ports = fake_host(launch=FakeReviewLauncher())
+    assert app_explicit.host is explicit
+    assert app.host is fixture_ports
+    assert host.current() is fixture_ports
+
+
+def test_fake_review_launcher_scripts_outcomes_and_records_requests() -> None:
+    from charlie_work.host.fakes import FakeReviewLauncher
+
+    fake = FakeReviewLauncher(["boom"])
+    record = fake.launch("claude-code", pr_number=7, branch="b")
+    assert record.error == "boom" and record.pid is None
+    assert fake.requests == [("claude-code", {"pr_number": 7, "branch": "b"})]
+    assert FakeReviewLauncher().launch("devin-shell", pr_number=1).pid == 1
+
+
+def test_real_review_launcher_returns_errors_as_values(monkeypatch) -> None:
+    def _boom(**_kw):
+        raise OSError("no such binary")
+
+    monkeypatch.setitem(
+        __import__("charlie_work.workflow", fromlist=["x"])._REVIEW_LAUNCHERS, "api", _boom
+    )
+    record = host.REAL.launch.launch("api", pr_number=3, branch="b")
+    assert record.pid is None and record.error == "OSError: no such binary"
+    unknown = host.REAL.launch.launch("nope", pr_number=3, branch="b")
+    assert unknown.error == "unsupported reviewer harness: 'nope'"

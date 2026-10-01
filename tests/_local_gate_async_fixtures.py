@@ -11,6 +11,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 from charlie_work import local_suite_runner
 from charlie_work.config import OrchestratorConfig, build_config_from_data
@@ -157,13 +158,30 @@ def _wait_pid_dead(pid: int, timeout_seconds: float = 15) -> None:
 
 
 def _kill_claimed_gate(app: OrchestratorApp, pr_number: int) -> int:
-    """Kill the in-flight suite tree named by the record's claim; returns pid."""
+    """Kill the in-flight suite tree named by the record's claim; returns pid.
+
+    Returns 0 when the claim is already cleared (e.g. the gate escalated), so it
+    is safe in a ``finally`` teardown.
+    """
     state = load_state_locked(app.paths.state_file)
     record = state["prs"][str(pr_number)]
+    if not record.get("local_suite_pid"):
+        return 0
     pid = int(record["local_suite_pid"])
     kill_process_tree(pid, record.get("local_suite_process_start_time"))
     _wait_pid_dead(pid)
     return pid
+
+
+def _gate_identity(app: OrchestratorApp, number: int) -> tuple[int, Any]:
+    """Launch identity of the claimed gate: (pid, process start-time fingerprint).
+
+    A bare pid is not unique across dead processes -- the OS may hand a dead
+    wrapper's pid to the next launch -- so "a new gate was launched" is asserted
+    on the pair, never on the pid alone (#2207).
+    """
+    record = load_state_locked(app.paths.state_file)["prs"][str(number)]
+    return int(record["local_suite_pid"]), record["local_suite_process_start_time"]
 
 
 def _dead_pid() -> int:

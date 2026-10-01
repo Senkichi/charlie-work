@@ -23,15 +23,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from . import layout
+from .command_result import CommandResult
 from .state import utc_now
 
 if TYPE_CHECKING:
-    # ``CommandResult`` and ``OrchestratorApp`` live in ``workflow.py``; the
-    # annotations are strings (``from __future__ import annotations``), so
-    # these are only needed for type-checkers, not at runtime. The runtime
-    # ``CommandResult`` construction in ``read_status_snapshot`` uses a
-    # deferred import to avoid the circular dependency.
-    from .workflow import CommandResult, OrchestratorApp
+    from .workflow import OrchestratorApp
 
 _LOG = logging.getLogger(__name__)
 
@@ -87,8 +83,6 @@ def read_status_snapshot(app: OrchestratorApp) -> CommandResult | None:
     data = dict(data)
     data["snapshot_written_at"] = written_at
     data["cache_age_seconds"] = round(age, 1)
-    from .workflow import CommandResult  # deferred: avoid circular import
-
     return CommandResult(True, "status complete (cached)", data)
 
 

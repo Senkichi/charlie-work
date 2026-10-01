@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Any, Callable
 
 from .config import ReviewDispatchConfig
 from .no_op_checkpoint import _no_op_window_start, _normalized_timestamps
-from .process_utils import is_pid_alive
+from . import host as _host
 from .state import (
     _REVIEW_DEAD_CLAIM_BACKSTOP_TIMEOUT_MINUTES,
     _REVIEW_STALE_CLAIM_TIMEOUT_MINUTES,
@@ -287,7 +287,7 @@ def _reviewer_pid_alive(entry: dict[str, Any]) -> bool:
     if reviewer_pid is None:
         return False
 
-    return is_pid_alive(reviewer_pid, entry.get("reviewer_process_start_time"))
+    return _host.current().probe.is_alive(reviewer_pid, entry.get("reviewer_process_start_time"))
 
 
 def _count_live_reviews(reviews_dir: Path, state_file: Path | None = None) -> int:
@@ -754,7 +754,7 @@ def _select_review_dispatch_candidates(
     ]
     max_local = review_dispatch_config.max_local_review_processes
     max_concurrent = review_dispatch_config.max_concurrent_reviews
-    live_count = _count_live_reviews(reviews_dir, state_file)
+    live_count = _host.current().sessions.live_reviews(reviews_dir, state_file)
     requested_limit = limit if limit is not None else len(dispatchable)
     local_cap = _apply_local_review_cap(requested_limit, max_local, live_count)
     if max_concurrent > 0:

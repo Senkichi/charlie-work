@@ -28,6 +28,7 @@ from charlie_work.checks import (
     workflow_run_terminal_by_id,
 )
 from charlie_work.janitor import (
+    CarryForwardCheck,
     DiffContentSignature,
     _diff_content_signature,
     _unwind_skipped_rerun_attempts,
@@ -36,7 +37,7 @@ from charlie_work.janitor import (
 )
 
 
-def _check_carry_forward(self, pr_number: int, decision: dict[str, Any]) -> _wf.CarryForwardCheck:
+def _check_carry_forward(self, pr_number: int, decision: dict[str, Any]) -> CarryForwardCheck:
     """Determine whether ``decision``'s verdict can carry forward to the
     PR's live head, and via which tier (issues #411/#412, #414).
 
@@ -99,7 +100,7 @@ def _check_carry_forward(self, pr_number: int, decision: dict[str, Any]) -> _wf.
     """
     live_diff = self.gh.pr_diff(pr_number) or ""
     if not live_diff:
-        return _wf.CarryForwardCheck(None, "", DiffContentSignature((), frozenset()))
+        return CarryForwardCheck(None, "", DiffContentSignature((), frozenset()))
 
     live_patch_id = _wf._calculate_patch_id(live_diff)
     live_signature = _diff_content_signature(live_diff)
@@ -108,7 +109,7 @@ def _check_carry_forward(self, pr_number: int, decision: dict[str, Any]) -> _wf.
     if not reviewed_patch_id:
         # No baseline recorded at all (e.g. a "blocked" verdict never
         # computes a patch-id) — nothing to compare against.
-        return _wf.CarryForwardCheck(None, live_patch_id, live_signature)
+        return CarryForwardCheck(None, live_patch_id, live_signature)
 
     if live_patch_id and live_patch_id == reviewed_patch_id:
         # Issue #1187: ``git patch-id --stable`` strips leading
@@ -127,36 +128,36 @@ def _check_carry_forward(self, pr_number: int, decision: dict[str, Any]) -> _wf.
             # Decision predates tier-2 (no signature recorded) —
             # patch-id is the only available signal; preserve #412's
             # original carry-forward behavior for legacy decisions.
-            return _wf.CarryForwardCheck("patch-id", live_patch_id, live_signature)
+            return CarryForwardCheck("patch-id", live_patch_id, live_signature)
         lines_match = tuple(reviewed_changed_lines) == live_signature.changed_lines
         files_match = frozenset(reviewed_changed_files) == live_signature.changed_files
         if lines_match and files_match:
-            return _wf.CarryForwardCheck("patch-id", live_patch_id, live_signature)
+            return CarryForwardCheck("patch-id", live_patch_id, live_signature)
         # Patch-id matched but tier-2 signatures differ — a
         # whitespace-only change that patch-id collapsed (issue #1187).
         # Fail closed to stale rather than carrying forward an approved
         # verdict across a semantically different, unreviewed head.
-        return _wf.CarryForwardCheck(None, live_patch_id, live_signature)
+        return CarryForwardCheck(None, live_patch_id, live_signature)
 
     reviewed_changed_lines = decision.get("reviewed_changed_lines")
     reviewed_changed_files = decision.get("reviewed_changed_files")
     if reviewed_changed_lines is None or reviewed_changed_files is None:
         # Decision predates tier-2 (no signature recorded) — cannot
         # establish content identity; fail closed to stale.
-        return _wf.CarryForwardCheck(None, live_patch_id, live_signature)
+        return CarryForwardCheck(None, live_patch_id, live_signature)
 
     if decision.get("reviewed_has_binary") or live_signature.has_binary:
         # A binary payload emits no +/- content lines, so the signature
         # cannot see it — never rely on its silence for content it
         # never observed (issue #414 review follow-up).
-        return _wf.CarryForwardCheck(None, live_patch_id, live_signature)
+        return CarryForwardCheck(None, live_patch_id, live_signature)
 
     lines_match = tuple(reviewed_changed_lines) == live_signature.changed_lines
     files_match = frozenset(reviewed_changed_files) == live_signature.changed_files
     if lines_match and files_match:
-        return _wf.CarryForwardCheck("line-content", live_patch_id, live_signature)
+        return CarryForwardCheck("line-content", live_patch_id, live_signature)
 
-    return _wf.CarryForwardCheck(None, live_patch_id, live_signature)
+    return CarryForwardCheck(None, live_patch_id, live_signature)
 
 
 def _still_valid_recorded_verdict(

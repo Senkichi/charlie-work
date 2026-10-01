@@ -98,16 +98,6 @@ class FleetReviewCap:
         return fields
 
 
-def _workflow() -> Any:
-    # Reached through ``charlie_work.workflow`` (resolved at call time -- it
-    # imports the orchestration delegates that import this module) so a test
-    # patching ``charlie_work.workflow.count_fleet_live_reviews`` intercepts,
-    # exactly as ``_wf.count_fleet_live_sessions`` does for the worker cap.
-    import charlie_work.workflow as wf
-
-    return wf
-
-
 def acquire_fleet_review_launch_lock(
     app: OrchestratorApp, *, acquire: FleetLockAcquirer | None = None
 ) -> FleetLaunchLock:
@@ -170,7 +160,7 @@ def read_fleet_review_cap(app: OrchestratorApp) -> FleetReviewCap | None:
     fleet_max = app.config.fleet.global_max_concurrent_reviews
     if fleet_max <= 0:
         return None
-    live_count, _skipped_repos = _workflow().count_fleet_live_reviews(app.fleet_dir_override)
+    live_count, _skipped_repos = app.host.sessions.fleet_live_reviews(app.fleet_dir_override)
     return FleetReviewCap(fleet_max=fleet_max, fleet_live_count=live_count)
 
 

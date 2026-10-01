@@ -473,7 +473,9 @@ def issue_worker_launch_permit(
 
     try:
         if live_count is None:
-            live_count = _wf._count_live_sessions(app._layout.sessions_dir, app.paths.state_file)
+            live_count = app.host.sessions.live_workers(
+                app._layout.sessions_dir, app.paths.state_file
+            )
         governor_kwargs: dict[str, Any] = {"live_count": live_count}
         if apply_open_pr_backpressure:
             governor_kwargs["apply_open_pr_backpressure"] = True

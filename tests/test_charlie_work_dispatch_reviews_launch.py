@@ -315,7 +315,9 @@ def test_dispatch_reviews_experiment_disabled_records_no_arm(monkeypatch, tmp_pa
     assert state["prs"]["100"]["review_effort_used"] == "high"
 
 
-def test_dispatch_reviews_launch_failure_releases_claim(monkeypatch, tmp_path: Path) -> None:
+def test_dispatch_reviews_launch_failure_releases_claim(
+    monkeypatch, tmp_path: Path, fake_host
+) -> None:
     """Issue #487: a failed reviewer launch (e.g. WinError 2 from an
     unresolved npm ``.CMD`` shim) must not strand the PR at
     ``review_dispatch_pending`` forever. ``dispatch_reviews`` claims the PR
@@ -345,20 +347,9 @@ def test_dispatch_reviews_launch_failure_releases_claim(monkeypatch, tmp_path: P
         "failed to launch claude: [WinError 2] The system cannot find the file specified"
     )
 
-    def fake_launch_failure(*args: Any, **kwargs: Any) -> ClaudeWorkerRecord:
-        return ClaudeWorkerRecord(
-            issue_number=kwargs.get("issue_number") or args[0],
-            branch=kwargs.get("branch") or args[1],
-            worktree_path="/fake/worktree",
-            prompt_path="/fake/prompt.md",
-            command=("claude", "-p", "--permission-mode", "plan"),
-            pid=None,
-            started_at="2026-07-20T12:00:00Z",
-            log_path="/fake/log.log",
-            error=launch_error,
-        )
+    from charlie_work.host.fakes import FakeReviewLauncher
 
-    monkeypatch.setattr("charlie_work.workflow.launch_claude_worker", fake_launch_failure)
+    fake_host(launch=FakeReviewLauncher([launch_error]))
 
     result = app.dispatch_reviews()
 

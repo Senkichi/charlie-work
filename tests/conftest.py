@@ -490,3 +490,23 @@ def _no_live_self_deploy_history(monkeypatch: pytest.MonkeyPatch) -> None:
         "charlie_work.orchestration.misc_review_verdicts.self_deploy_state_path",
         lambda: None,
     )
+
+
+@pytest.fixture
+def fake_host(monkeypatch: pytest.MonkeyPatch) -> Callable[..., Any]:
+    """Swap the active host ports for the test; restored by monkeypatch.
+
+    ``fake_host(clock=FakeClock(...))`` replaces the named ports on top of the
+    currently active ports (so repeated calls compose) and returns the resulting ``HostPorts``.  An app built without an
+    explicit ``host=`` and every non-app module see the same fake.
+    """
+    import dataclasses
+
+    from charlie_work import host as host_pkg
+
+    def _install(**overrides: Any) -> Any:
+        ports = dataclasses.replace(host_pkg.current(), **overrides)
+        monkeypatch.setattr(host_pkg, "_ACTIVE", ports)
+        return ports
+
+    return _install

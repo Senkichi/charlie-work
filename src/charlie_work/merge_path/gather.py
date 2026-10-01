@@ -17,7 +17,7 @@ could be attempted rather than only when a mergequeue label is set.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import datetime
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Callable, Literal
 
@@ -25,6 +25,7 @@ from ..checks import CheckSummary, summarize_checks
 from ..cross_pr_revert import CrossPrRevertStatus
 from ..escalation import _escalation_flags
 from ..github import GitHubError, label_names
+from ..host import current as _host_current
 from ..janitor import check_operator_containment
 from .decide import (
     SYNC_STRATEGIES,
@@ -413,7 +414,7 @@ def readiness_facts(
         checks=checks.summary,
         checks_unavailable=checks.unavailable,
         check_names_seen=frozenset(str(c.get("name") or "") for c in checks.enriched),
-        now=now or datetime.now(UTC),
+        now=now or _host_current().clock.now(),
         pr_updated_at=pr.get("updatedAt"),
         is_draft=bool(pr.get("isDraft")),
         human_merge_hold=human_merge[0],
