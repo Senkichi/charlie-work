@@ -793,7 +793,7 @@ def test_review_decision_write_sites_collects_bare_name_form() -> None:
 # are 2 (one ``record_review`` call + one ``record_local_review`` call).
 _EXPECTED_RECORD_REVIEW_PROVENANCE_BY_SITE: dict[tuple[str, str], Counter[str]] = {
     ("workflow.py", "review"): Counter({"ci_gate_auto_reject": 2, "test_adequacy_auto_reject": 1}),
-    ("misc_review_verdicts.py", "_reap_review_verdicts"): Counter({"fresh_llm_review": 2}),
+    ("misc_review_verdicts.py", "_reap_dead_reviewer"): Counter({"fresh_llm_review": 2}),
     ("instrumentation_ops.py", "_reconcile_stranded_verdicts"): Counter(
         {"stranded_reconciliation": 2}
     ),
