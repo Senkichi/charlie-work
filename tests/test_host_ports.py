@@ -42,3 +42,11 @@ def test_fake_host_restored_after_previous_test() -> None:
 def test_host_ports_is_frozen() -> None:
     with pytest.raises(AttributeError):
         host.REAL.clock = FakeClock(datetime(2026, 1, 1, tzinfo=UTC))  # type: ignore[misc]
+
+
+def test_fake_host_clock_freezes_state_and_workflow_utc_now(fake_host) -> None:
+    from charlie_work import state, workflow
+
+    fake_host(clock=FakeClock(datetime(2026, 3, 4, 5, 6, 7, tzinfo=UTC)))
+    assert state.utc_now() == "2026-03-04T05:06:07Z"
+    assert workflow.utc_now() == "2026-03-04T05:06:07Z"
