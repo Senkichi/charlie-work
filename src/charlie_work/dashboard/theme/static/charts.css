@@ -1,0 +1,54 @@
+/* Chart primitives (dashboard/charts). Colours are --lj-* tokens only; dash patterns are
+   SVG attributes set by the renderer (the second channel next to colour). Text is CSS px,
+   never below 11px; SVGs render at intrinsic size (1 unit = 1px) and scroll inside
+   .chart-scroll on narrow screens rather than shrinking their text. */
+figure.chart { margin: 0 0 var(--lj-space-5); }
+figure.chart > figcaption { display: flex; flex-direction: column; gap: 2px; margin-bottom: var(--lj-space-2); }
+.takeaway { margin: 0; font-family: var(--lj-serif); font-size: var(--lj-text-4); font-weight: 600; color: var(--lj-ink); }
+.chart-title { font-size: var(--lj-text-3); font-weight: 600; color: var(--lj-ink); }
+.chart-window { font-size: var(--lj-text-2); color: var(--lj-gray-text); }
+.chart-scroll { overflow-x: auto; max-width: 100%; }
+.chart-scroll > svg { display: block; }
+.multiples-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: var(--lj-space-3); }
+figure.panel { margin: 0; }
+figure.panel > figcaption { font-size: var(--lj-text-3); font-weight: 600; margin-bottom: 2px; }
+
+svg.line-chart text, svg.strip-chart text { font-family: var(--lj-sans); font-size: 12px; fill: var(--lj-ink); }
+svg .tick, svg .note { font-size: 11px; fill: var(--lj-gray-text); }
+svg .row-stats { font-size: 11.5px; fill: var(--lj-gray-text); }
+svg .grid { stroke: var(--lj-rule); stroke-width: 1; shape-rendering: crispEdges; }
+svg .baseline, svg .tickmark { stroke: var(--lj-gray); stroke-width: 1; shape-rendering: crispEdges; }
+
+svg .series .line { stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+svg .series.s1 .line { stroke: var(--lj-series-1); }
+svg .series.s2 .line { stroke: var(--lj-series-2); }
+svg .series.s3 .line { stroke: var(--lj-series-3); }
+svg .series.s1 .dot { fill: var(--lj-series-1); }
+svg .series.s2 .dot { fill: var(--lj-series-2); }
+svg .series.s3 .dot { fill: var(--lj-series-3); }
+svg .series.approx .line { stroke-width: 1.5; }
+svg text.direct { font-weight: 600; }
+svg text.direct.s1 { fill: var(--lj-series-1); }
+svg text.direct.s2 { fill: var(--lj-gray-text); }
+svg text.direct.s3 { fill: var(--lj-series-3); }
+svg text.direct.approx { font-style: italic; }
+
+svg .uncovered { fill: var(--lj-raised); }
+svg .cov-start { stroke: var(--lj-gray); stroke-width: 1; }
+svg .marker-rule { stroke: var(--lj-ink); stroke-width: 1; }
+
+svg .dist .row-label { font-weight: 600; }
+svg .iqr { fill: var(--lj-raised); stroke: var(--lj-rule); }
+svg .sample { fill: var(--lj-series-2); }
+svg .dist.approx .sample { fill: none; stroke: var(--lj-series-2); stroke-width: 1; }
+svg .median { stroke: var(--lj-ink); stroke-width: 3; }
+svg .p90 { stroke: var(--lj-ink); stroke-width: 1.5; }
+
+.bullets { display: flex; flex-direction: column; }
+.bullet-row { display: grid; grid-template-columns: 168px minmax(0, 1fr) 120px; column-gap: var(--lj-space-3); align-items: center; padding: 5px 0; border-bottom: 1px solid var(--lj-rule); font-size: var(--lj-text-3); }
+svg.bullet-svg { display: block; max-width: 100%; }
+svg.bullet-svg .trk { fill: var(--lj-rule); }
+svg.bullet-svg .fill { fill: var(--lj-ink); }
+svg.bullet-svg .fill.hot { fill: var(--lj-warn); }
+svg.bullet-svg .captick { stroke: var(--lj-ink); stroke-width: 2; }
+svg.bullet-svg .trk-open { stroke: var(--lj-gray); stroke-width: 1; }
