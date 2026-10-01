@@ -89,11 +89,17 @@ def _unavailable(result: HistoryUnavailable) -> str:
 
 
 def render_history(
-    result: HistoryResult, tab: str, range_key: str, tz: tzinfo | None = None
+    result: HistoryResult,
+    tab: str,
+    range_key: str,
+    tz: tzinfo | None = None,
+    known_repos: frozenset[str] = frozenset(),
 ) -> str:
-    """The full History page for one (tab, range) read."""
+    """The full History page for one (tab, range) read; ``known_repos`` (the registry's
+    slugs) are the only repos whose panels link to a repo drill-down."""
     if isinstance(result, HistoryView):
-        body = _meta(result, tz) + f'<div class="hcards">{render_cards(result, tz)}</div>'
+        cards = render_cards(result, tz, known_repos)
+        body = _meta(result, tz) + f'<div class="hcards">{cards}</div>'
     else:
         body = _unavailable(result)
     panel = (

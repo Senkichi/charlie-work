@@ -75,7 +75,11 @@ def test_history_unknown_params_fall_back_and_subpaths_404(served) -> None:
     status, body, _ = _get(served, "/history?tab=<script>&range=1y")
     assert status == 200 and 'id="tab-flow" href="/history?tab=flow&amp;range=7d" aria' in body
     assert "<script>&" not in body
-    assert _get(served, "/history/flow")[0] == 404
+    for path in ("/history/flow", "/nope/x"):  # house-style 404: nav, skip link, h1
+        status, body, resp = _get(served, path)
+        assert status == 404 and 'class="dmissing"' in body and "<h1" in body, path
+        assert resp.getheader("Content-Type", "").startswith("text/html"), path
+    assert _get(served, "/api/nope")[0] == 404  # machine paths stay plain text
 
 
 def test_history_without_a_rollup_db_says_so() -> None:

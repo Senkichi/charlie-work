@@ -158,8 +158,14 @@ def card_id(metric_id: str) -> str:
     return "m-" + slug(metric_id)
 
 
-def _panels(drawn: tuple[Series, ...], has_children: bool) -> tuple[Panel, ...]:
-    """One panel per repo for the headline (and an overlaid cap), never the categories."""
+def _panels(
+    drawn: tuple[Series, ...], has_children: bool, known: frozenset[str]
+) -> tuple[Panel, ...]:
+    """One panel per repo for the headline (and an overlaid cap), never the categories.
+
+    A panel heading links to ``/repo/<slug>`` only for a registry repo (``known``): a
+    source the registry does not hold (e.g. a runner-allocation target) has no drill page.
+    """
     keep = (drawn[0], *(s for s in drawn[1:] if not s.name.startswith(f"{drawn[0].name}.")))
     repos = sorted({r for s in keep for r, pts in s.per_repo.items() if pts})
     return tuple(
@@ -173,13 +179,18 @@ def _panels(drawn: tuple[Series, ...], has_children: bool) -> tuple[Panel, ...]:
                 )
                 for s in keep
             ),
-            href=repo_url(repo),
+            href=repo_url(repo) if repo in known else None,
         )
         for repo in repos
     )
 
 
-def render_card(view: HistoryView, metric: MetricData, tz: tzinfo | None = None) -> str:
+def render_card(
+    view: HistoryView,
+    metric: MetricData,
+    tz: tzinfo | None = None,
+    known: frozenset[str] = frozenset(),
+) -> str:
     """One metric card, or its honest 'not instrumented yet' card."""
     mid, head = metric.metric_id, metric.headline
     if head.not_instrumented:
@@ -198,13 +209,14 @@ def render_card(view: HistoryView, metric: MetricData, tz: tzinfo | None = None)
         size=COMBINED,
     )
     combined = line_chart(_chart_series(drawn, has_children), spec, tz)
-    panels = _panels(drawn, has_children)
+    panels = _panels(drawn, has_children, known)
     multiples = (
         small_multiples(
             panels,
             LineSpec(
                 title=f"{title_of(head)}, per repo (shared y)",
                 bucket_seconds=float(head.bucket_seconds),
+                coverage=spec.coverage,  # each panel keeps only its own source's start
                 markers=_markers(head, tz),
                 domain=window,
             ),
@@ -234,11 +246,17 @@ def overlay_for(view: HistoryView, metric_id: str) -> MetricData | None:
     return cap if cap is not None and not cap.headline.not_instrumented else None
 
 
-def render_cards(view: HistoryView, tz: tzinfo | None = None) -> str:
-    """Every card of the tab in registry order; an overlaid cap is not repeated alone."""
+def render_cards(
+    view: HistoryView, tz: tzinfo | None = None, known: frozenset[str] = frozenset()
+) -> str:
+    """Every card of the tab in registry order; an overlaid cap is not repeated alone.
+
+    ``known`` is the registry's repo slugs: only those panels link to a repo page."""
     overlaid = {
         cap.metric_id
         for m in view.metrics
         if not m.headline.not_instrumented and (cap := overlay_for(view, m.metric_id))
     }
-    return "".join(render_card(view, m, tz) for m in view.metrics if m.metric_id not in overlaid)
+    return "".join(
+        render_card(view, m, tz, known) for m in view.metrics if m.metric_id not in overlaid
+    )

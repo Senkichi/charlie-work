@@ -39,6 +39,7 @@ from .read_model import (
     start_workers,
     to_plain,
 )
+from .pages.drill_shell import not_found_page
 from .server_drill import DrillContext, drill_response
 from .server_http import (
     CSP,
@@ -203,7 +204,7 @@ class _Handler(SecureHandler):
         if path in ("/", "/now"):
             self._html(render_now(state, poll_seconds=poll, stalled=self._stalled(state)))
         elif path == "/history":
-            self._history(parse_qs(query))
+            self._history(parse_qs(query), state)
         elif path == "/now/fragment":
             self._html(render_fragment(state, poll, self._stalled(state)))
         elif path == "/api/now.json":
@@ -225,8 +226,10 @@ class _Handler(SecureHandler):
             self._static(path[len("/static/") :])
         elif (drilled := self._drill(path, query, state)) is not None:
             self._html(drilled[1], drilled[0])
-        else:
+        elif path.startswith("/api/"):
             self._text(404, "not found")
+        else:  # every other unknown page is the house-style 404, with nav and skip link
+            self._html(not_found_page(state), 404)
 
     def do_GET(self) -> None:  # noqa: N802
         try:
@@ -243,10 +246,13 @@ class _Handler(SecureHandler):
 
     do_HEAD = do_GET  # noqa: N815 - same routes, no body (see ``_send``)
 
-    def _history(self, params: dict[str, list[str]]) -> None:
+    def _history(self, params: dict[str, list[str]], state: ModelState) -> None:
         tab = pick_tab((params.get("tab") or [None])[0])
         range_key = pick_range((params.get("range") or [None])[0])
-        self._html(render_history(self.app.history.get(tab, range_key), tab, range_key))
+        # the same registry the /repo drill admits, so a panel link never 404s
+        known = frozenset(f.repo for f in state.model.freshness) if state.model else frozenset()
+        view = self.app.history.get(tab, range_key)
+        self._html(render_history(view, tab, range_key, known_repos=known))
 
     def _drill(self, path: str, query: str, state: ModelState) -> tuple[int, str] | None:
         src = self.app.sources

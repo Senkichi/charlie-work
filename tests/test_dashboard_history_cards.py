@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from charlie_work.dashboard.metrics_base import Series
-from charlie_work.dashboard.pages.history_cards import _chart_coverage
+from charlie_work.dashboard.pages.history_cards import _chart_coverage, _panels
 
 START = datetime(2026, 9, 1, tzinfo=UTC)
 END = datetime(2026, 10, 1, tzinfo=UTC)
@@ -27,3 +27,10 @@ def test_chart_coverage_keeps_sources_that_already_cover_the_window_start() -> N
     )
     # the chart needs "early" to know the window start IS covered; "after" cannot matter
     assert [c.source for c in _chart_coverage(s, (START, END))] == ["early", "late"]
+
+
+def test_panel_links_only_to_repos_the_registry_holds() -> None:
+    pts = (("2026-09-02T00:00:00Z", 1.0),)
+    s = _series(per_repo={"o/fleet-repo": pts, "o/runner-only": pts})
+    got = {p.key: p.href for p in _panels((s,), False, frozenset({"o/fleet-repo"}))}
+    assert got == {"fleet-repo": "/repo/o/fleet-repo", "runner-only": None}
