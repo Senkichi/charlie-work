@@ -183,3 +183,49 @@ def test_applied_heads_are_read_per_route() -> None:
         Review(1, 11, "dead_worker_completed_outcome"),
         ReadAppliedHeads(2),
     ]
+
+
+# ------------------------------------------------- #2113: status and event share a lock window
+
+
+def test_append_event_failure_leaves_neither_status_nor_event(tmp_path: Path) -> None:
+    """The audit event rides the guarded write: if ``append_event`` raises, the status
+    flip is not saved, there is no recovery row and no label edge, and the sweep
+    does not swallow it."""
+    import pytest
+
+    from charlie_work.write_gate import WriteGate
+
+    real_append = WriteGate.append_event
+
+    def failing_append(self: Any, data: Any, kind: str, *args: Any, **kwargs: Any) -> Any:
+        if kind == "orphaned_worker_recovered":
+            raise OSError("disk full")
+        return real_append(self, data, kind, *args, **kwargs)
+
+    config, paths, gh, _ = _dead_worker_rework_bed(tmp_path)
+    _write_outcome(paths, tmp_path, _COMPLETED_OUTCOME)
+    with pytest.raises(OSError, match="disk full"):
+        run_sweep(
+            tmp_path,
+            paths,
+            config,
+            gh,
+            review_callback=_refused,
+            patches=(
+                patch.object(rework_outcome, "remote_branch_head_sha", lambda *_a: "abc123"),
+                patch.object(WriteGate, "append_event", failing_append),
+            ),
+        )
+
+    assert issue_entry(paths, 207)["status"] == "dispatched"
+    assert events_of(paths, "orphaned_worker_recovered") == []
+    assert (207, config.labels.needs_rework) not in gh.labels_added
+
+
+def test_recovery_event_and_status_land_together(tmp_path: Path) -> None:
+    """Positive control for the test above: the same bed, unpatched, records both."""
+    config, paths, gh = _run_with_gap(tmp_path, lambda state: None)
+
+    assert issue_entry(paths, 207)["status"] == "rework_requested"
+    assert len(events_of(paths, "orphaned_worker_recovered")) == 1
