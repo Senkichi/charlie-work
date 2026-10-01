@@ -91,6 +91,7 @@ class Series:
     n: int = 0  # underlying observations inside the window
     # source -> (first, last) ts of that source's own coverage for this series' kinds
     repo_coverage: dict[str, tuple[str, str]] = field(default_factory=dict)
+    stat: str = ""  # per-bucket statistic a chart must name ("median"), "" when obvious
 
 
 @dataclass(frozen=True)
@@ -213,6 +214,7 @@ def _finish(
         kind=spec.kind,
         partial=flags.get("partial", False),
         exact_from=flags.get("exact_from"),
+        stat=flags.get("stat", ""),
         window_start=q.start_iso,
         window_end=q.end_iso,
         bucket_seconds=int(q.bucket.total_seconds()),
@@ -259,7 +261,9 @@ def make_series(
         r: _points(q, scope.active_for(r), scope.zero_for(r), b, how)
         for r, b in sorted(by_repo.items())
     }
-    flags = {"approx": approx, "partial": partial, "exact_from": exact_from}
+    # a median line must say so; a repo_sum line is a sum of repo values, not one statistic
+    stat = how if how == "median" and spec.combine != "repo_sum" else ""
+    flags = {"approx": approx, "partial": partial, "exact_from": exact_from, "stat": stat}
     return _finish(db, q, spec, scope.cov, points, repo_points, n, flags)
 
 

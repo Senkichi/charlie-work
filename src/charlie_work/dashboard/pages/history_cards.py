@@ -52,6 +52,8 @@ def title_of(series: Series) -> str:
     unit = _UNIT_WORDS.get(series.unit, series.unit)
     if series.kind == "count":
         return f"{base}, {unit} per {bucket_words(series.bucket_seconds)}"
+    if series.stat:  # a duration line is one statistic per bucket: name it (D8)
+        base = f"{base}, {series.stat} per {bucket_words(series.bucket_seconds)}"
     return f"{base} ({unit})" if unit else base
 
 

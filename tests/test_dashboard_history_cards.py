@@ -76,3 +76,13 @@ def test_a_combined_chart_never_repeats_a_line_style() -> None:
     styles = re.findall(r'<g class="(series s\d)[^"]*"><path class="line" d="[^"]+" fill="none"'
                         r'( stroke-dasharray="[^"]+")?', combined)  # fmt: skip
     assert len(styles) >= 3 and len(set(styles)) == len(styles), styles
+
+
+def test_a_median_line_names_its_statistic_in_the_title() -> None:
+    from charlie_work.dashboard.pages.history_cards import title_of
+
+    s = _series(label="Lead time", unit="hours", kind="duration", bucket_seconds=86400)
+    assert title_of(s) == "Lead time (hours)"
+    assert title_of(_series(**{**s.__dict__, "stat": "median"})) == (
+        "Lead time, median per 1d (hours)"
+    )
