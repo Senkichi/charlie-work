@@ -41,6 +41,20 @@ from charlie_work.verdict_parsing import (
 from charlie_work.worker import iter_workers
 
 
+def _release_reap_claim(self, pr_number: int, claim_key: str) -> None:
+    """Drop this sweep's claim when it took no terminal action (issue #2110).
+
+    Without a verdict, summary or terminal record the next pass must retry, as
+    it did before the claim existed. Only our own claim is cleared.
+    """
+    with _wf.state_lock(self.paths.state_file):
+        state = _wf.load_state(self.paths.state_file)
+        ps = state["prs"].get(str(pr_number))
+        if ps and ps.get("review_reaped_for") == claim_key:
+            state["prs"][str(pr_number)] = {**ps, "review_reaped_for": None}
+            _wf.save_state(self.paths.state_file, state)
+
+
 def _reap_review_verdicts(self, reviews_dir: Path) -> dict[str, Any]:
     """Record verdicts for dead reviewers whose sidecar log contains a valid
     fenced JSON verdict block.
@@ -81,6 +95,21 @@ def _reap_review_verdicts(self, reviews_dir: Path) -> dict[str, Any]:
             if pr_state.get("review_dispatch_status") != "review_dispatch_dispatched":
                 continue
             issue_number = pr_state.get("issue_number")
+            # Issue #2110: the loop pass and the fleet review lane both sweep
+            # here. Claim this dead session in the SAME locked section as the
+            # status check (compare-and-set), so exactly one caller parses,
+            # resumes or records it. The key includes the sidecar's
+            # ``started_at``, which a #2090 resume re-stamps, so the resumed
+            # session's own death is a fresh claim; the resume count keeps two
+            # resumes inside one clock second distinct.
+            claim_key = (
+                f"{pr_state.get('review_dispatched_at')}|{w.started_at}"
+                f"|{pr_state.get('review_exec_resume_count') or 0}"
+            )
+            if pr_state.get("review_reaped_for") == claim_key:
+                continue
+            state["prs"][str(pr_number)] = {**pr_state, "review_reaped_for": claim_key}
+            _wf.save_state(self.paths.state_file, state)
 
         verdict_source = "log"
         verdict = _parse_review_verdict_from_log(Path(w.log_path))
@@ -263,6 +292,8 @@ def _reap_review_verdicts(self, reviews_dir: Path) -> dict[str, Any]:
                     # itself after classification (or on its next pass
                     # once the stale timeout elapses).
                     _wf.remove_review_checkout(self.repo_root, pr_number, reviews_dir=reviews_dir)
+                else:
+                    _release_reap_claim(self, pr_number, claim_key)
             continue
 
         packet_head_sha = self._read_packet_head_oid(pr_number)
@@ -324,6 +355,7 @@ def _reap_review_verdicts(self, reviews_dir: Path) -> dict[str, Any]:
                 }
             )
         else:
+            _release_reap_claim(self, pr_number, claim_key)
             reason = result.message or "record_review failed"
             with _wf.state_lock(self.paths.state_file):
                 state = _wf.load_state(self.paths.state_file)

@@ -458,3 +458,66 @@ def test_resume_never_blocks_on_the_worker() -> None:
     src = Path(devin_review_resume.__file__).read_text(encoding="utf-8")
     assert ".wait(" not in src and ".communicate(" not in src
     assert subprocess  # (module imported for the Popen-stderr redirect constant)
+
+
+# --- issue #2110: two concurrent reaps of one dead reviewer are single-owner --
+
+
+def _reap_concurrently(rig: _Rig, monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    """Run two reaps so both pass the status check before either proceeds.
+
+    The barrier sits on the first log parse, i.e. right after the claim section,
+    which is exactly the window the unguarded code raced in.
+    """
+    import threading
+
+    from charlie_work.orchestration import misc_review_verdicts as mrv
+
+    barrier = threading.Barrier(2, timeout=2)
+    real = mrv._parse_review_verdict_from_log
+
+    def gated(path: Path) -> Any:
+        try:
+            barrier.wait()
+        except threading.BrokenBarrierError:
+            pass  # the claim loser never reaches the parse; the winner proceeds alone
+        return real(path)
+
+    monkeypatch.setattr(mrv, "_parse_review_verdict_from_log", gated)
+    results: list[dict[str, Any]] = []
+    threads = [threading.Thread(target=lambda: results.append(rig.reap())) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+    return results
+
+
+def test_concurrent_reaps_of_an_exec_rejected_reviewer_emit_one_outcome(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    rig = _rig(monkeypatch, tmp_path)
+    rig.seed_dead_review()
+    rig.next_output = [VERDICT]
+
+    results = _reap_concurrently(rig, monkeypatch)
+
+    assert len(results) == 2
+    assert len(rig.events("review_exec_rejection_resumed")) == 1
+    assert rig.events("review_exec_rejection_resume_failed") == []
+    assert rig.events("review_verdict_missed") == []
+    assert len(rig.popens) == 1
+    assert all(r["missed"] == [] for r in results)
+
+
+def test_concurrent_reaps_of_a_dead_reviewer_with_a_verdict_record_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    rig = _rig(monkeypatch, tmp_path)
+    rig.seed_dead_review(VERDICT)
+
+    results = _reap_concurrently(rig, monkeypatch)
+
+    assert sum(len(r["recorded"]) for r in results) == 1
+    assert sum(len(r["missed"]) for r in results) == 0
+    assert rig.popens == []
