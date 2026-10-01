@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any, NoReturn
 
 from .config import WRITER_MARKER_FILENAME
+from .safe_path import contains
 
 
 # Sentinel values for operator claim markers. The operator marker intentionally
@@ -189,6 +190,7 @@ def check_foreign_adoption(
     registered: list[dict],
     recovery: bool,
     marker_guard: Callable[[Path], None] | None = None,
+    operator_worktree_roots: tuple[str, ...] = (),
 ) -> bool:
     """Issue #1476 gate: may a rework session run in this foreign checkout?
 
@@ -213,6 +215,13 @@ def check_foreign_adoption(
     porcelain worktree list — its first entry is always the repo's main
     worktree, the anchor for the "never dispatch into the checkout hosting
     the orchestrator" refusal.
+
+    ``operator_worktree_roots`` (issue #2195, ``runtime.operator_worktree_roots``)
+    lists directories — relative entries resolve against ``repo_root`` — that
+    hold interactive operator session worktrees. A checkout resolving under
+    one is refused before any marker is consulted, because an interactive
+    session writes no marker for the gate to see. The default here is empty
+    (no roots); the production caller passes the config value.
 
     The dispatching-into-it checks live here; the shared rework flow adds the
     touching-its-contents checks (dirt, non-FF divergence), so nothing about a
@@ -243,6 +252,11 @@ def check_foreign_adoption(
         # Registered but gone (git would call it prunable): it cannot host a
         # session. Only the operator/prune can resolve this.
         _refuse("the registered worktree directory is missing (prunable)")
+    for root in operator_worktree_roots:
+        # ``contains`` resolves both sides, so a junction under the root that
+        # points elsewhere is judged by where it lands, not where it sits.
+        if contains(repo_root / root, foreign_path):
+            _refuse("operator session worktree")
     marker = read_worktree_marker(foreign_path)
     if recovery:
         # Recovery semantics presume the leftover worktree is ours — its dirt

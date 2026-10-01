@@ -31,6 +31,7 @@ from typing import Any
 from .attempt_refs import AttemptSnapshot, snapshot_attempt_ref
 from .config import (
     OrchestratorConfig,
+    RuntimeConfig,
     WORKER_OUTCOME_FILENAME,
 )
 from . import git_pull_blockers
@@ -3368,6 +3369,11 @@ def create_worktree(
             repo_root=repo_root,
             registered=registered,
             recovery=recovery is not None,
+            operator_worktree_roots=(
+                config.runtime.operator_worktree_roots
+                if config is not None
+                else RuntimeConfig().operator_worktree_roots
+            ),
             marker_guard=(
                 (
                     lambda path: _check_worktree_writer_marker(
