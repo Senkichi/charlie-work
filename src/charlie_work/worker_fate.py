@@ -81,7 +81,7 @@ if TYPE_CHECKING:
 # ``worker_fate.<name>`` for every consumer and test.
 from .adapter_fate_profile import AdapterFateProfile, classify_for, profile_for  # noqa: F401
 from .failure_classifier import classify_failure  # noqa: F401
-from . import process_utils as _process_utils
+from . import host as _host
 from .state import parse_iso_timestamp as _state_parse_iso_timestamp
 from .state import (
     record_dead_worker_failure_kind,
@@ -324,9 +324,7 @@ def is_alive(pid: int | None, process_start_time: float | None) -> bool:
     worktree-marker liveness checks (and ``worker.py``'s own probe, which this
     module imports) deliberately keep calling the primitive directly.
     """
-    if pid is None or pid <= 0:
-        return False
-    return _process_utils.is_pid_alive(pid, process_start_time)
+    return _host.current().probe.is_alive(pid, process_start_time)
 
 
 # --------------------------------------------------------------------------
