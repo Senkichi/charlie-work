@@ -211,6 +211,8 @@ def run_fleet_resume(args: argparse.Namespace) -> CommandResult:
     if removed:
         try:
             log_event(
+                # event-consumer: audit-only -- operator resume record; the flag's absence
+                # (and ``fleet status``) is the live signal, this row is the audit trail
                 supervisor_heartbeat_path(args.fleet_dir),
                 FLEET_RESUMED,
                 {"flag": str(flag_path)},
