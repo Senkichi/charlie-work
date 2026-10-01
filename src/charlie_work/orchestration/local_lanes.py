@@ -644,6 +644,7 @@ def _local_build_packet(
             ),
             "review_dispatch_attempt_last_head": head,
             "review_log_unreadable_streak": 0,
+            "review_api_error_streak": 0,  # issue #1808
             "review_turn_limit_miss_streak": (
                 0
                 if _fresh_dispatch_cycle
@@ -1287,6 +1288,7 @@ def record_local_review(
             "reviewer_process_start_time": None,
             "review_dispatch_attempt_count": 0,
             "review_log_unreadable_streak": 0,
+            "review_api_error_streak": 0,  # issue #1808
             "review_turn_limit_miss_streak": 0,
             "review_session_metrics": (
                 session_metrics

@@ -24,9 +24,10 @@ Decisions:
 
 from __future__ import annotations
 
-from collections.abc import Collection, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Any
 
 from ..config import (
     DETERMINISTIC_ESCALATION_FAILURE_KINDS,
@@ -76,14 +77,58 @@ def launch_failure_redispatch_at(windowed: Sequence[str], now: datetime) -> tupl
     return (*windowed, stamp(now))
 
 
-def dead_fallback_kind(*, is_completed: bool, worktree_unknown: bool) -> str | None:
+# Issue #2096: a headless `claude -p` worker that backgrounds its suite ends its
+# turn within minutes, which ends the session and kills the background job.
+BACKGROUND_EXIT_MAX_SECONDS: float = 600.0
+BACKGROUND_EXIT_FAILURE_KIND = "worker_exited_with_background_work"
+
+
+def exited_with_background_work(
+    terminal: Mapping[str, Any] | None,
+    *,
+    adapter_kind: str,
+    dirty: bool,
+    ahead_count: int,
+    pid: int | None,
+) -> bool:
+    """A claude-code worker that exited 0 quickly, leaving a dirty tree and no commit.
+
+    The terminal record must belong to the dead worker (``pid`` match): records
+    persist across attempts, so a prior attempt's quick exit-0 record must not
+    classify a later one. Mirrors ``terminal_record_proves_completion``.
+    """
+    if adapter_kind != "claude-code" or terminal is None or pid is None:
+        return False
+    try:
+        same_process = int(terminal.get("pid")) == int(pid)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return False
+    if not same_process:
+        return False
+    duration = terminal.get("duration_seconds")
+    return bool(
+        terminal.get("exit_code") == 0
+        and isinstance(duration, int | float)
+        and duration < BACKGROUND_EXIT_MAX_SECONDS
+        and dirty
+        and ahead_count == 0
+    )
+
+
+def dead_fallback_kind(
+    *, is_completed: bool, worktree_unknown: bool, background_exit: bool = False
+) -> str | None:
     """Fallback failure kind for a dead session whose log classifies as nothing.
 
-    A completed-but-unpublished worktree is ``unpublished_work``; otherwise a
-    readable worktree is ``stalled`` and an unreadable one has no fallback.
+    A completed-but-unpublished worktree is ``unpublished_work``; a fast clean
+    exit that left uncommitted work behind is ``worker_exited_with_background_work``
+    (issue #2096); otherwise a readable worktree is ``stalled`` and an
+    unreadable one has no fallback.
     """
     if is_completed:
         return "unpublished_work"
+    if background_exit and not worktree_unknown:
+        return BACKGROUND_EXIT_FAILURE_KIND
     return None if worktree_unknown else "stalled"
 
 
