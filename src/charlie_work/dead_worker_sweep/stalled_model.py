@@ -75,6 +75,13 @@ class RecordFailure:
 
 
 @dataclass(frozen=True)
+class ProbeCompletedHandoff:
+    """Did this dead worker already hand off a fresh completed outcome? (``bool``)"""
+
+    issue: int
+
+
+@dataclass(frozen=True)
 class ReadLogTail:
     """The log's last line and mtime, for the reap event payload."""
 
@@ -88,6 +95,7 @@ STALLED_REQUEST_TYPES = (
     KillTree,
     KillOrphans,
     RecordFailure,
+    ProbeCompletedHandoff,
     ReadLogTail,
 )
 

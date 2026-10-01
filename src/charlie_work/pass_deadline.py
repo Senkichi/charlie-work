@@ -360,6 +360,7 @@ def run_deadline_guarded_maintenance(
     workflow -> github.
     """
     import charlie_work.workflow as _wf
+    from charlie_work.test_slots import drain_wait_timeouts, slot_dir
 
     sessions_dir = app._layout.sessions_dir
     # Classify dead sessions and update throttle state (production loop path)
@@ -382,6 +383,17 @@ def run_deadline_guarded_maintenance(
         ),
         [],
     )
+
+    # Issue #2124: surface test-slot starvation. Local file reads only, no
+    # GitHub call, so it stays outside the deadline guard. Skipped in dry-run
+    # so the records are not consumed without their event being written.
+    if app.config.test_slots.enabled and not app.dry_run:
+        drain_wait_timeouts(
+            slot_dir(),
+            lambda payload: app.write_gate.log_event(
+                kind="test_slot_wait_timeout", payload=payload
+            ),
+        )
 
     # Flat-interval Haiku probe for early quota/rate-limit recovery (see
     # docstring): only does real work when a throttle indicator is active.

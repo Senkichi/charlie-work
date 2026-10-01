@@ -182,6 +182,31 @@ def test_approved_record_launches_suite_and_pass_returns_immediately(
         _kill_claimed_gate(app, 7)
 
 
+def test_gate_suite_runs_with_the_reserved_slot_env(lane_repo: Path) -> None:
+    """Issue #2124 wiring: the launched suite sees the plugin armed for the gate
+    role (slot 0), not the agent role."""
+    _init_repo(lane_repo)
+    issues_dir = lane_repo / "docs" / "issues"
+    head = _make_branch(lane_repo, "agent/issue-7-x", "a.py", "a = 1\n")
+    out = lane_repo / "gate-env.txt"
+    suite = (
+        "python -c \"import os,pathlib; pathlib.Path(r'" + str(out) + "').write_text("
+        "os.environ.get('CHARLIE_TEST_SLOT_ROLE','')+'|'+os.environ.get('PYTEST_PLUGINS',''))\""
+    )
+    config = _lane_config(lane_repo, issues_dir, dispatch={"test_command": suite})
+    app = _lane_app(lane_repo, issues_dir, config=config)
+    _adopt_and_approve(app, issues_dir, 7, "agent/issue-7-x", head)
+    app._local_merge_approved()
+    try:
+        _wait_for_pid_file(app, 7)
+        deadline = time.monotonic() + 30
+        while (not out.exists() or not out.stat().st_size) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert out.read_text(encoding="utf-8").startswith("gate|test_slot_plugin")
+    finally:
+        _kill_claimed_gate(app, 7)
+
+
 def test_green_result_advances_base_on_next_pass(lane_repo: Path) -> None:
     """AC: a green suite result on a later pass advances the base."""
     _init_repo(lane_repo)
