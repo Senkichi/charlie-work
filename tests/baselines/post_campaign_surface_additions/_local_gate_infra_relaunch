@@ -1,0 +1,5 @@
+issue #2127: bounded relaunch for the local merge gate's infra suite
+outcomes (timeout / summary-less death) so they never consume the
+merge-rework cap. Installed from ``orchestration/local_gate_infra_relaunch.py``.
+Net-new OrchestratorApp member added after the Track 2 Phase B surface
+baseline was pinned.

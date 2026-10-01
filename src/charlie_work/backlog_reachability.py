@@ -38,6 +38,7 @@ from typing import Any
 from .ci_findings import _parse_iso_ts
 from .config import OrchestratorConfig
 from .fleet_registry import managed_repo_names
+from .github_capabilities.cross_repo_blockers import CrossRepoBlocker, blocker_ref
 from .github import (
     GitHubError,
     GitHubLike,
@@ -314,8 +315,15 @@ def classify_backlog_reachability(
     open_by_number = {
         int(issue["number"]): issue for issue in issues if issue.get("number") is not None
     }
+    # Issue #2005: a foreign (CrossRepoBlocker) root is emitted repo-qualified
+    # (``"owner/name#60"``) with no ``updated_at``. Its bare number names a
+    # DIFFERENT local issue, so neither the open-issue lookup nor the
+    # local-state progress scan may key on it; the staleness check treats a
+    # string-numbered root as unadjudicable and keeps the exemption.
     reachability["dependency_root_blockers"] = [
-        {"number": n, "updated_at": open_by_number.get(n, {}).get("updatedAt")}
+        {"number": blocker_ref(n), "updated_at": None}
+        if isinstance(n, CrossRepoBlocker)
+        else {"number": n, "updated_at": open_by_number.get(n, {}).get("updatedAt")}
         for n in sorted(open_blockers_of_blocked - blocked_by_dep)
     ]
     if ready_open_count is not None:
