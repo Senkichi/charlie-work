@@ -227,3 +227,29 @@ def test_missing_worktree_is_ignored(tmp_path: Path) -> None:
 
     run_sweep(tmp_path, paths, config, gh)
     _assert_refused(paths, gh, "worktree_unavailable")
+
+
+def test_verified_close_wins_over_a_stale_pushed_branch(tmp_path: Path) -> None:
+    """A fresh claim plus a remote branch ahead of base yields ONE winner: the close.
+
+    The pushed-orphan candidate lane must not open a salvage PR on the issue the
+    claim just closed (the stale branch is left for the operator).
+    """
+    config, paths, gh, worktree = _bed(tmp_path)
+    (worktree / "stale.txt").write_text("stale\n", encoding="utf-8")
+    _git(["add", "stale.txt"], cwd=worktree)
+    _git(["commit", "-m", "wip: stale push"], cwd=worktree)
+    _git(["push", "origin", _BRANCH], cwd=worktree)
+    # The worktree is back at the base; only the remote branch is ahead.
+    _git(["reset", "--hard", "main"], cwd=worktree)
+
+    run_sweep(tmp_path, paths, config, gh)
+
+    assert gh.closed_issues == [_NUMBER]
+    assert len(events_of(paths, "worker_verified_no_changes")) == 1
+    assert events_of(paths, "orphaned_worker_opened_pr") == []
+    assert events_of(paths, "worker_handoff_pr_opened") == []
+    assert events_of(paths, "pr_create_failed_branch_stranded") == []
+    entry = issue_entry(paths, _NUMBER)
+    assert entry["status"] == "closed"
+    assert "pr_number" not in entry
