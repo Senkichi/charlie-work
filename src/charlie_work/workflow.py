@@ -4040,7 +4040,7 @@ class OrchestratorApp:
                 diff,
                 pr,
                 self.config.test_adequacy,
-                [str(c.get("commit", {}).get("message") or "") for c in pr_commits],
+                [str((c.get("commit") or {}).get("message") or "") for c in pr_commits],
             )
             if not test_adequacy_verdict.ok:
                 # Same terminal label set as an LLM request_changes:

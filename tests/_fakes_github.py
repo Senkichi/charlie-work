@@ -90,6 +90,7 @@ class FakeGitHub:
         self.push_empty_commit_error: str | None = None
         self.pr_head_shas: dict[int, str] = {}
         self.diffs: dict[int, str] = {}
+        self.pr_commits_by_number: dict[int, list[dict[str, Any]] | None] = {}
         self.pr_external_issue_comments: dict[int, list[dict[str, Any]]] = {}
         self.pr_external_reviews: dict[int, list[dict[str, Any]]] = {}
         self.pr_external_review_comments: dict[int, list[dict[str, Any]]] = {}
@@ -232,10 +233,12 @@ class FakeGitHub:
     def pr_commits(self, number: int) -> list[dict[str, Any]] | None:
         # No fixture data configured means an empty list, matching the real
         # GitHub.pr_commits's "no failure, nothing found" shape rather than
-        # raising. Not exercised by any GitHubLike-typed call site as of the
-        # PR that added this method (only the concrete GitHub-typed
-        # closing-keyword-check CLI path calls it), but kept here so
-        # FakeGitHub stays a complete stand-in for the GitHubLike protocol.
+        # raising. A ``pr_commits_by_number[number]`` entry overrides the
+        # default (including with ``None``, the real client's failure shape)
+        # for call sites like the test-adequacy gate in ``review()`` that
+        # feed REST-shaped commit payloads downstream.
+        if number in self.pr_commits_by_number:
+            return self.pr_commits_by_number[number]
         return []
 
     def pr_checks(self, number: int):

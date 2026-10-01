@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 from _review_fixtures import _test_adequacy_app
 from charlie_work.state import load_state, save_state
 from _dispatch_fixtures import _stub_real_activity_probe_for_stalled_tests  # noqa: F401
@@ -348,4 +349,103 @@ def test_review_test_adequacy_pass_proceeds_to_packet(tmp_path: Path, monkeypatc
     result = app.review(456)
 
     assert check_calls["n"] == 1
+    assert result.ok is True
+
+
+# --- Commit-trailer exemption wiring (issue #2220) -----------------------------
+
+_NO_TEST_PRODUCT_DIFF = """diff --git a/src/feature.py b/src/feature.py
+index 123..456 100644
+--- a/src/feature.py
++++ b/src/feature.py
+@@ -1,3 +1,5 @@
+ def feature():
+     pass
++def new_feature():
++    pass
+"""
+
+
+def test_review_test_adequacy_commit_trailer_exempts(tmp_path: Path, monkeypatch) -> None:
+    """review() feeds REST pr_commits messages to the real gate; a Test-exempt
+    trailer on a commit exempts a no-test diff the body cannot (workers have no
+    GitHub token to edit the body)."""
+    from charlie_work.janitor import check_test_adequacy as real_check
+
+    app = _test_adequacy_app(tmp_path, enabled=True, min_product_lines=1)
+    app.gh.diffs[456] = _NO_TEST_PRODUCT_DIFF
+    trailer_message = "fix: regenerate schema fixture\n\nTest-exempt: generated fixture"
+    # A malformed item (``"commit": None``) must degrade to "" rather than raise
+    # outside check_test_adequacy's never-raises guard.
+    app.gh.pr_commits_by_number[456] = [
+        {"sha": "bad0", "commit": None},
+        {"sha": "abc1", "commit": {"message": trailer_message}},
+    ]
+
+    captured: dict[str, list[str]] = {}
+
+    def _spy(diff, pr, config, commit_messages=()):
+        captured["commit_messages"] = list(commit_messages)
+        return real_check(diff, pr, config, commit_messages)
+
+    monkeypatch.setattr("charlie_work.workflow.check_test_adequacy", _spy)
+
+    result = app.review(456)
+
+    assert captured["commit_messages"] == ["", trailer_message]
+    assert result.ok is True
+    assert "prompt_path" in result.data
+    packet = Path(result.data["prompt_path"]).read_text(encoding="utf-8")
+    assert 'Test-exempt claim: "generated fixture"' in packet
+
+
+def test_review_test_adequacy_pr_commits_none_falls_back_to_body(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """When pr_commits fails (None), review() passes no commit messages and the
+    gate judges the body alone -- a no-test diff with no body marker hard-fails."""
+    from charlie_work.janitor import check_test_adequacy as real_check
+    from charlie_work.workflow import CommandResult
+
+    app = _test_adequacy_app(tmp_path, enabled=True, min_product_lines=1)
+    app.gh.diffs[456] = _NO_TEST_PRODUCT_DIFF
+
+    pr_commits_calls: list[int] = []
+
+    def _pr_commits_none(number):
+        pr_commits_calls.append(number)
+        return None
+
+    app.gh.pr_commits = _pr_commits_none
+
+    captured: dict[str, Any] = {}
+
+    def _spy(diff, pr, config, commit_messages=()):
+        captured["commit_messages"] = list(commit_messages)
+        return real_check(diff, pr, config, commit_messages)
+
+    def _fake_record_review(pr_number, decision, **kwargs):
+        captured["decision"] = decision
+        captured["verdict_provenance"] = kwargs.get("verdict_provenance")
+        return CommandResult(True, "record_review called", {})
+
+    def _fake_transition(gh, labels, issue_number, edge):
+        from charlie_work.labels import TransitionResult, TransitionOutcome
+
+        return TransitionResult(
+            outcome=TransitionOutcome.APPLIED,
+            add_failures=[],
+            remove_failures=[],
+        )
+
+    monkeypatch.setattr("charlie_work.workflow.check_test_adequacy", _spy)
+    monkeypatch.setattr("charlie_work.workflow.transition", _fake_transition)
+    monkeypatch.setattr(app, "record_review", _fake_record_review)
+
+    result = app.review(456)
+
+    assert pr_commits_calls == [456]
+    assert captured["commit_messages"] == []
+    assert captured["decision"] == "request_changes"
+    assert captured["verdict_provenance"] == "test_adequacy_auto_reject"
     assert result.ok is True
