@@ -34,13 +34,9 @@ _DEFAULT_LONG_CALL_TIMEOUT_SECONDS = 120.0
 
 @dataclass(frozen=True)
 class _DefaultRuntime:
-    """Stand-in for ``runtime=None``: the gh kill-switch with default knobs.
+    """Stand-in for ``runtime=None``: HTTP with the default retry knobs."""
 
-    ``GitHub(repo_root)`` without a ``RuntimeConfig`` keeps spawning gh until
-    the test-suite migration removes that default (design M4).
-    """
-
-    gh_transport: str = "gh"
+    gh_transport: str = "http"
     gh_max_retries: int = _DEFAULT_MAX_RETRIES
     gh_retry_base_seconds: float = _DEFAULT_RETRY_BASE_SECONDS
     gh_timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS

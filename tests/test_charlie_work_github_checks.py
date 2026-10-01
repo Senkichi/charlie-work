@@ -10,6 +10,7 @@ import json
 import subprocess
 from pathlib import Path
 import pytest
+from _fake_transport import gh_kill_switch_runtime
 from charlie_work import github as github_module
 from charlie_work.config import (
     ConfigError,
@@ -141,7 +142,9 @@ def test_check_run_annotations_returns_parsed_list_on_success(monkeypatch, tmp_p
 
     monkeypatch.setattr(github_module.subprocess, "run", fake_run)
 
-    result = github_module.GitHub(tmp_path).check_run_annotations(999)
+    result = github_module.GitHub(
+        tmp_path, runtime=gh_kill_switch_runtime()
+    ).check_run_annotations(999)
 
     assert result == [{"path": "src/foo.py", "start_line": 42, "message": "line too long"}]
 

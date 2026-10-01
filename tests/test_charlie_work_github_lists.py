@@ -11,6 +11,7 @@ import logging
 import subprocess
 from pathlib import Path
 import pytest
+from _fake_transport import gh_kill_switch_runtime
 from charlie_work import github as github_module
 from charlie_work.config import RuntimeConfig
 
@@ -28,7 +29,7 @@ def test_github_merged_pr_list_uses_rest_pagination(monkeypatch, tmp_path: Path)
 
     monkeypatch.setattr(github_module.subprocess, "run", fake_run)
 
-    gh = github_module.GitHub(tmp_path)
+    gh = github_module.GitHub(tmp_path, runtime=gh_kill_switch_runtime())
     gh.merged_pr_list()
 
     assert len(captured_args) == 1
@@ -64,7 +65,7 @@ def test_github_merged_pr_list_retries_on_transient_gateway_error(
     monkeypatch.setattr(github_module.subprocess, "run", fake_run)
     monkeypatch.setattr(github_module.time, "sleep", lambda seconds: sleeps.append(seconds))
 
-    gh = github_module.GitHub(tmp_path)
+    gh = github_module.GitHub(tmp_path, runtime=gh_kill_switch_runtime())
     result = gh.merged_pr_list()
 
     assert result == []
@@ -201,7 +202,7 @@ def test_branch_protection_caches_per_pass(monkeypatch, tmp_path: Path) -> None:
         return subprocess.CompletedProcess(args=args, returncode=0, stdout=payload, stderr="")
 
     monkeypatch.setattr(github_module.subprocess, "run", fake_run)
-    gh = github_module.GitHub(repo_root=tmp_path)
+    gh = github_module.GitHub(repo_root=tmp_path, runtime=gh_kill_switch_runtime())
 
     # Simulate N=5 PRs against the same base within one pass: 5 calls to the
     # method, but the underlying `gh api` subprocess must run exactly once.

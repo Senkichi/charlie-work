@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 
+from _fake_transport import gh_kill_switch_runtime
 from charlie_work import github as github_module
 
 
@@ -204,7 +205,7 @@ def test_push_empty_commit_success_walks_all_four_steps(monkeypatch, tmp_path: P
     fake_run, calls = _make_fake_push_empty_commit_run()
     monkeypatch.setattr(github_module.subprocess, "run", fake_run)
 
-    gh = github_module.GitHub(tmp_path)
+    gh = github_module.GitHub(tmp_path, runtime=gh_kill_switch_runtime())
     result = gh.push_empty_commit("agent/issue-123-fix")
 
     assert isinstance(result, github_module.GitHubRunResult)
@@ -228,7 +229,7 @@ def test_push_empty_commit_never_raises_stops_at_first_failure(
     fake_run, calls = _make_fake_push_empty_commit_run(fail_at_step=fail_at_step)
     monkeypatch.setattr(github_module.subprocess, "run", fake_run)
 
-    gh = github_module.GitHub(tmp_path)
+    gh = github_module.GitHub(tmp_path, runtime=gh_kill_switch_runtime())
     result = gh.push_empty_commit("agent/issue-123-fix")
 
     assert isinstance(result, github_module.GitHubRunResult)

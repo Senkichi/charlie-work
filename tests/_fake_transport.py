@@ -181,3 +181,11 @@ def make_github(
     )
     github._list_cache[("_repo_owner_name",)] = ("octo", "hello")
     return github, http, gh
+
+
+def gh_kill_switch_runtime(**overrides: object):
+    """A ``RuntimeConfig`` with ``gh_transport: gh``: every request is a gh
+    subprocess, so tests that patch ``subprocess.run`` keep seeing real argv."""
+    from charlie_work.config import RuntimeConfig
+
+    return RuntimeConfig(gh_transport="gh", **overrides)  # type: ignore[arg-type]

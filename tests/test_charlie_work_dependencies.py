@@ -10,6 +10,7 @@ import json
 import subprocess
 from pathlib import Path
 from _fakes_github import FakeGitHub
+from _fake_transport import gh_kill_switch_runtime
 from charlie_work import github as github_module
 
 
@@ -453,7 +454,7 @@ def test_get_github_issue_dependencies_caches_successful_result_per_pass(
         return subprocess.CompletedProcess(args=command, returncode=0, stdout=payload, stderr="")
 
     monkeypatch.setattr(github_module.subprocess, "run", fake_run)
-    gh = github_module.GitHub(repo_root=tmp_path)
+    gh = github_module.GitHub(repo_root=tmp_path, runtime=gh_kill_switch_runtime())
 
     first = get_github_issue_dependencies(gh, 100)
     second = get_github_issue_dependencies(gh, 100)

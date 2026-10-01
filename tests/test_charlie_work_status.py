@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from _fakes_github import FakeGitHub
+from _fake_transport import gh_kill_switch_runtime
 from charlie_work import github as github_module
 from charlie_work.config import DevinConfig, OrchestratorConfig, WatchdogConfig
 from charlie_work.paths import runtime_paths
@@ -211,7 +212,7 @@ def test_status_prefetch_uses_batched_graphql_for_blocker_data(
 
     config = OrchestratorConfig(devin=DevinConfig())
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
-    gh = github_module.GitHub(repo_root=tmp_path)
+    gh = github_module.GitHub(repo_root=tmp_path, runtime=gh_kill_switch_runtime())
     # Avoid a real `git remote` call; the owner/name are only used for the
     # GraphQL variables, and the mocked response is the same either way.
     gh._list_cache[("_repo_owner_name",)] = ("owner", "repo")

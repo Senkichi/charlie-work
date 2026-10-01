@@ -13,6 +13,7 @@ import json
 import subprocess
 from pathlib import Path
 
+from _fake_transport import gh_kill_switch_runtime
 from charlie_work import github as github_module
 from charlie_work.config import RuntimeConfig
 from _github_fixtures import _read_fixture
@@ -30,7 +31,7 @@ def test_check_graphql_rate_limit_parses_live_payload(monkeypatch, tmp_path: Pat
 
     monkeypatch.setattr(github_module.subprocess, "run", fake_run)
 
-    gh = github_module.GitHub(tmp_path)
+    gh = github_module.GitHub(tmp_path, runtime=gh_kill_switch_runtime())
     sufficient, remaining, reset_at = gh.check_graphql_rate_limit(threshold=1500)
 
     # Fixture has graphql.remaining == 4114, reset is a unix timestamp.
@@ -52,7 +53,7 @@ def test_check_graphql_rate_limit_below_threshold_returns_insufficient(
 
     monkeypatch.setattr(github_module.subprocess, "run", fake_run)
 
-    gh = github_module.GitHub(tmp_path)
+    gh = github_module.GitHub(tmp_path, runtime=gh_kill_switch_runtime())
     sufficient, remaining, reset_at = gh.check_graphql_rate_limit(threshold=5000)
 
     assert sufficient is False
@@ -79,7 +80,7 @@ def test_compare_diff_hits_three_dot_compare_with_diff_media_type(
 
     monkeypatch.setattr(github_module.subprocess, "run", fake_run)
 
-    gh = github_module.GitHub(tmp_path)
+    gh = github_module.GitHub(tmp_path, runtime=gh_kill_switch_runtime())
     result = gh.compare_diff("sha-old", "sha-new")
 
     assert seen_cmd[:2] == ["gh", "api"]
@@ -147,7 +148,7 @@ def test_commit_check_runs_wraps_rest_endpoint(monkeypatch, tmp_path: Path) -> N
 
     monkeypatch.setattr(github_module.subprocess, "run", fake_run)
 
-    gh = github_module.GitHub(tmp_path)
+    gh = github_module.GitHub(tmp_path, runtime=gh_kill_switch_runtime())
     check_runs = gh.commit_check_runs("abc123")
 
     assert check_runs is not None

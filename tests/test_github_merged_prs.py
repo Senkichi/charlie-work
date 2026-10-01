@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 
+from _fake_transport import gh_kill_switch_runtime
 from charlie_work import github as github_module
 from _github_fixtures import _read_fixture
 
@@ -65,7 +66,7 @@ def test_merged_pr_list_uses_rest_pagination_and_filters_merged(
 
     monkeypatch.setattr(github_module.subprocess, "run", fake_run)
 
-    gh = github_module.GitHub(tmp_path)
+    gh = github_module.GitHub(tmp_path, runtime=gh_kill_switch_runtime())
     result = gh.merged_pr_list()
 
     assert result == [
@@ -112,7 +113,7 @@ def test_merged_pr_list_raises_on_rest_pagination_error(monkeypatch, tmp_path: P
 
     monkeypatch.setattr(github_module.subprocess, "run", fake_run)
 
-    gh = github_module.GitHub(tmp_path)
+    gh = github_module.GitHub(tmp_path, runtime=gh_kill_switch_runtime())
     with pytest.raises(github_module.GitHubError):
         gh.merged_pr_list()
 
@@ -169,7 +170,7 @@ def test_merged_pr_list_empty_page_terminates_cleanly(monkeypatch, tmp_path: Pat
 
     monkeypatch.setattr(github_module.subprocess, "run", fake_run)
 
-    gh = github_module.GitHub(tmp_path)
+    gh = github_module.GitHub(tmp_path, runtime=gh_kill_switch_runtime())
     result = gh.merged_pr_list()
 
     assert result == []
@@ -400,7 +401,7 @@ def test_merged_pr_list_exposes_head_ref_oid_end_to_end(monkeypatch, tmp_path: P
 
     monkeypatch.setattr(github_module.subprocess, "run", fake_run)
 
-    gh = github_module.GitHub(tmp_path)
+    gh = github_module.GitHub(tmp_path, runtime=gh_kill_switch_runtime())
     merged = gh.merged_pr_list()
 
     assert len(merged) == 1

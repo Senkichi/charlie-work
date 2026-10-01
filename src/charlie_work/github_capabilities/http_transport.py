@@ -86,19 +86,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Fallback used only when `GitHub` is constructed with `runtime=None` (tests
-# and legacy direct callers) -- mirrors `transport.py`'s
-# `_DEFAULT_GH_MAX_RETRIES`/`_DEFAULT_GH_TIMEOUT_SECONDS` "tests and legacy
-# callers" carve-out. Deliberately NOT "http": a large share of this repo's
-# existing test suite constructs `GitHub(tmp_path)` (no runtime) and
-# monkeypatches `subprocess.run` directly to simulate `gh` CLI responses for
-# `gh api`-shaped calls -- exactly the shapes this module would otherwise
-# intercept before they ever reach that mock. Real orchestrator code always
-# passes `runtime=config.runtime` (never `None`), so this fallback is never
-# reached in production; it only governs the construction shape this
-# repo's own tests already rely on.
-_DEFAULT_GH_TRANSPORT = "gh"
-
 _MAX_PAGINATE_PAGES = MAX_PAGES  # shared with github_transport.pagination
 
 # Response status that means "unchanged since the cached ETag".
@@ -147,13 +134,10 @@ def build_http_transport_state() -> HttpTransportState:
 def gh_transport_mode(runtime: "RuntimeConfig | None") -> str:
     """Resolve the effective transport ("http" or "gh") for a `GitHub` instance.
 
-    See `_DEFAULT_GH_TRANSPORT`'s docstring for why `runtime=None` resolves
-    differently from an explicit `RuntimeConfig` (whose `gh_transport` field
-    defaults to `"http"`).
+    ``runtime=None`` resolves to ``"http"``, the same as ``RuntimeConfig``'s
+    own default (ADR-0006: HTTP is the default transport).
     """
-    if runtime is not None:
-        return runtime.gh_transport
-    return _DEFAULT_GH_TRANSPORT
+    return runtime.gh_transport if runtime is not None else "http"
 
 
 def _resolve_token(repo_root: Path) -> str | None:

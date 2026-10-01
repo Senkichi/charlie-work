@@ -315,12 +315,15 @@ def test_gh_transport_accepts_gh_kill_switch():
 
 
 def test_runtime_none_falls_back_to_gh_transport():
-    """GitHub instances built without a RuntimeConfig (this repo's own
-    dominant test-suite pattern) must keep using the gh subprocess -- see
-    http_transport._DEFAULT_GH_TRANSPORT's docstring.
+    """ADR-0006 inverted this: a GitHub built without a RuntimeConfig uses
+    HTTP like every other instance (the name is kept for the collect-only
+    gate; the kill switch is an explicit ``gh_transport: gh``).
     """
-    assert http_transport.gh_transport_mode(None) == "gh"
+    assert http_transport.gh_transport_mode(None) == "http"
     assert http_transport.gh_transport_mode(RuntimeConfig()) == "http"
+    assert github_module.GitHub(Path("."))._transport_v2.kill_switch is False
+    gh_runtime = RuntimeConfig(gh_transport="gh")
+    assert github_module.GitHub(Path("."), runtime=gh_runtime)._transport_v2.kill_switch is True
 
 
 # ---------------------------------------------------------------------------
@@ -887,10 +890,9 @@ def test_circuit_breaker_shared_across_http_and_gh_transports(monkeypatch, tmp_p
 def test_runtime_none_github_instance_uses_gh_subprocess_for_api_calls(
     monkeypatch, tmp_path: Path
 ):
-    """Existing-test-suite compatibility (issue #1834): `GitHub(tmp_path)`
-    with no RuntimeConfig must keep reaching a monkeypatched
-    `subprocess.run` for `gh api`-shaped calls, exactly as this repo's
-    pre-#1834 test suite already relies on.
+    """Kill switch (issue #1834): `gh_transport: gh` reaches a monkeypatched
+    `subprocess.run` for `gh api`-shaped calls. (Name kept for the collect-only
+    gate; a runtime-less GitHub now uses HTTP, ADR-0006.)
     """
 
     def fake_run(cmd, *args, **kwargs):
@@ -902,6 +904,6 @@ def test_runtime_none_github_instance_uses_gh_subprocess_for_api_calls(
         http_transport, "HTTPSConnection", lambda *a, **k: (_ for _ in ()).throw(AssertionError())
     )
 
-    gh = github_module.GitHub(tmp_path)
+    gh = github_module.GitHub(tmp_path, runtime=RuntimeConfig(gh_transport="gh"))
     result = gh.run(["api", "rate_limit"])
     assert result == "{}"

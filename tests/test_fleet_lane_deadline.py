@@ -41,6 +41,7 @@ from _fleet_dispatch_fixtures import (
     _patch_self_deploy_for_fleet_tests as _patch_self_deploy_for_fleet_tests,
     _per_repo_runtime_paths,
 )
+from _fake_transport import gh_kill_switch_runtime
 from charlie_work import github as github_module
 from charlie_work import layout
 from charlie_work.config import (
@@ -118,7 +119,7 @@ def test_pass_deadline_exceeded_is_cancellation_not_an_exception() -> None:
 
 def test_gh_run_unarmed_deadline_is_inert(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """No armed hook (every non-fleet caller) means zero behavior change."""
-    gh = GitHub(tmp_path)
+    gh = GitHub(tmp_path, runtime=gh_kill_switch_runtime())
     spawn = MagicMock(return_value=subprocess.CompletedProcess([], 0, "ok-out", ""))
     monkeypatch.setattr(github_module.subprocess, "run", spawn)
 
@@ -136,7 +137,7 @@ def test_gh_run_aborts_retry_chain_at_deadline(
     into a second spawn -- the whole point of #1948 is that the lane stops
     accumulating timeout+backoff cycles once the budget is spent.
     """
-    gh = GitHub(tmp_path)
+    gh = GitHub(tmp_path, runtime=gh_kill_switch_runtime())
     checks = {"n": 0}
 
     def _deadline() -> bool:
@@ -170,7 +171,7 @@ def test_gh_run_checks_deadline_before_transient_retry_backoff(
     ``_should_retry`` classifies retryable for a read call. The predicate
     is False for the pre-attempt check and True for the pre-sleep check.
     """
-    gh = GitHub(tmp_path)
+    gh = GitHub(tmp_path, runtime=gh_kill_switch_runtime())
     checks = {"n": 0}
 
     def _deadline() -> bool:
