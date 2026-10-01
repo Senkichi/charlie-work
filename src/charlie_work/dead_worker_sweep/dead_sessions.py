@@ -66,7 +66,10 @@ from ..worktree import (
 )
 from ..write_gate import WriteGate, require_write_gate
 from .dead_sessions_reclaim import reclaim_or_route_dead_session
+from ..process_utils import find_worker_terminal_status
 from .decide_dead_sessions import (
+    BACKGROUND_EXIT_FAILURE_KIND,
+    exited_with_background_work,
     dead_fallback_kind,
     escalation_class,
     launch_failure_escalates,
@@ -338,6 +341,12 @@ def _reap_dead(
         fallback_kind = dead_fallback_kind(
             is_completed=False,
             worktree_unknown=inspection.state == WorktreeState.UNKNOWN,
+            background_exit=exited_with_background_work(
+                find_worker_terminal_status(ctx.sessions_dir, w.issue_number),
+                adapter_kind=w.adapter_kind,
+                dirty=inspection.dirty,
+                ahead_count=inspection.ahead_count,
+            ),
         )
         if profile is not None and profile.record_failure is not None:
             failure_kind, throttled_until = profile.record_failure(
@@ -391,6 +400,24 @@ def _reap_dead(
     # account suspension, so the operator learns about a billing problem in minutes.
     # ``provider_suspended`` is terminal (no cooldown) and escalates below on this same
     # pass; the sidecar was just reaped, so the event fires once per episode.
+    if failure_kind == BACKGROUND_EXIT_FAILURE_KIND:
+        # Issue #2096: visible and countable, not a generic orphan.
+        with state_mod.state_lock(state_file):
+            state = state_mod.load_state(state_file)
+            state = write_gate.append_event(
+                state,
+                BACKGROUND_EXIT_FAILURE_KIND,
+                {
+                    "issue_number": w.issue_number,
+                    "pid": w.pid,
+                    "adapter_kind": w.adapter_kind,
+                    "failure_kind": failure_kind,
+                    "ahead_count": inspection.ahead_count,
+                },
+                level="warning",
+            )
+            write_gate.save_state(state)
+
     if failure_kind == "provider_suspended":
         with state_mod.state_lock(state_file):
             state = state_mod.load_state(state_file)
