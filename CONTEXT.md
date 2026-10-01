@@ -77,6 +77,10 @@ _Avoid_: Orchestrating agent, user, agent
 The mechanism the orchestrator uses to launch a worker on a given harness (manual, command, Devin, Claude Code, API). It returns immediately and never waits for the worker to finish.
 _Avoid_: Harness, backend, driver
 
+**Host port**:
+A seam onto something the host provides (wall/monotonic clock, process liveness, live-session count, reviewer launch), with a real and a fake implementation, reached via `host.current()` or `app.host`.
+_Avoid_: Adapter (reserved for the worker-launch mechanism)
+
 **Sidecar**:
 The durable record of one launched worker. The orchestrator reads it back to decide the worker's fate.
 _Avoid_: Manifest, session file
