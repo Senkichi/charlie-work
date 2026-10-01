@@ -33,7 +33,13 @@ from charlie_work.config import (
     WorkerRoleConfig,
 )
 from charlie_work.cross_pr_revert import CrossPrRevertResult, CrossPrRevertStatus
-from charlie_work.merge_path import EffectResults, MergePlan, PlanKind, decide_accounting
+from charlie_work.merge_path import (
+    EffectResults,
+    MergePlan,
+    PlanKind,
+    decide_accounting,
+    decide_merge,
+)
 from charlie_work.merge_path import apply_accounting
 from charlie_work.merge_path.model import EventSpec
 from charlie_work.paths import runtime_paths
@@ -204,3 +210,19 @@ def test_a_string_persisted_failed_attempt_counter_is_coerced_like_legacy() -> N
     acc = decide_accounting(plan, EffectResults(), facts)
 
     assert acc.failed_attempts == 3
+
+
+def test_a_malformed_persisted_counter_on_a_mergeable_pr_does_not_raise() -> None:
+    readiness = mf.readiness()
+    assert readiness.gate.can_merge
+    bad = mf.persisted(failed_attempts="not-a-number")
+
+    plan = decide_merge(readiness, mf.hold_facts(persisted=bad))
+    acc = decide_accounting(
+        MergePlan(kind=PlanKind.MERGE, readiness=readiness),
+        EffectResults(merge_output="merged"),
+        mf.accounting_facts(locked=bad),
+    )
+
+    assert plan.kind == PlanKind.MERGE
+    assert acc.failed_attempts == 0

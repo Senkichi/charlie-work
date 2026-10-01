@@ -519,6 +519,19 @@ def test_stale_base_is_repaired_by_update_branch_then_merges_live(tmp_path: Path
     assert live.data["review_decision"]["reviewed_head_sha"] == "sha-abc123-updated"
 
 
+def test_sync_branch_refused_approval_carry_does_not_merge_live(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #2205: a newer verdict made ``_update_approval_head`` refuse the synced head."""
+    monkeypatch.setattr(OrchestratorApp, "_update_approval_head", lambda self, *a, **k: False)
+    live = _run(tmp_path / "live", _stale_cfg(), _stale_base_gh, dry_run=False)
+
+    assert live.gh.pr_update_branch_calls == [_PR]
+    assert live.result.ok is False
+    assert live.data["merged"] is False
+    assert live.gh.merged == []
+
+
 def test_update_branch_failure_marks_sync_failed_and_blocks_merge(tmp_path: Path) -> None:
     def gh_factory() -> FakeGitHub:
         gh = _stale_base_gh()

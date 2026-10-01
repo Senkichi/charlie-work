@@ -58,6 +58,7 @@ from charlie_work.review_fleet_gate import (
     read_fleet_review_cap,
 )
 from charlie_work.janitor import check_operator_containment, check_test_adequacy
+from charlie_work.local_approval_carry import approval_survives_head_move
 from charlie_work.labels import TransitionOutcome
 from charlie_work.local_lane import (
     LOCAL_PENDING_STATUS,
@@ -383,17 +384,11 @@ def _local_review_packets(self) -> dict[str, Any]:
             # invariant the remote lane records on every verdict -- keeps the
             # approval valid across the sync merge while still re-reviewing
             # any genuinely new content (different patch-id -> rebuild).
-            decision = self._review_decision(pr_number)
-            reviewed_patch = decision.get("reviewed_patch_id")
-            live_diff = branch_diff(
+            if approval_survives_head_move(
                 self.repo_root,
                 str(record.get("baseRefName") or base_branch or "HEAD"),
                 branch,
-            )
-            if (
-                reviewed_patch
-                and live_diff is not None
-                and _wf._calculate_patch_id(live_diff) == reviewed_patch
+                self._review_decision(pr_number),
             ):
                 needs_build = False
         if not needs_build or issue_live:
@@ -1151,12 +1146,19 @@ def record_local_review(
     else:
         return _wf.CommandResult(False, "no packet or live branch head available", {})
 
-    diff = self._read_packet_diff(pr_number)
-    if diff is None and branch:
+    # The patch-id must describe the head the verdict is pinned to (issue
+    # #2151). The packet's diff.patch is that head's diff only when the
+    # verdict is pinned to the packet; an operator ``charlie verdict
+    # --reviewed-head <live>`` over a stale packet would otherwise record the
+    # PACKET head's patch-id against a different head, and the gate's own
+    # base-sync merge later fails the patch-id carry-forward and voids the
+    # approval. Everything else derives the diff from ``reviewed_head_sha``.
+    diff = self._read_packet_diff(pr_number) if reviewed_head_source == "packet" else None
+    if diff is None:
         diff = branch_diff(
             self.repo_root,
             str(pr_state.get("baseRefName") or local_base_branch(self.repo_root) or "HEAD"),
-            branch,
+            reviewed_head_sha,
         )
     reviewed_patch_id = _wf._calculate_patch_id(diff) if diff else ""
     reviewed_signature = (

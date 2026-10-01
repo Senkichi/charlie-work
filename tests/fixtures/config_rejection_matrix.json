@@ -1573,6 +1573,10 @@
 "test_slots.wait_timeout_seconds": [
 "test_slots",
 "wait_timeout_seconds"
+],
+"runtime.operator_worktree_roots": [
+"runtime",
+"operator_worktree_roots"
 ]
 },
 "seeds": {
@@ -2010,7 +2014,8 @@
 "test_slots.enabled": {},
 "test_slots.width": {},
 "test_slots.min_items": {},
-"test_slots.wait_timeout_seconds": {}
+"test_slots.wait_timeout_seconds": {},
+"runtime.operator_worktree_roots": {}
 },
 "cells": {
 "labels": [
@@ -18245,6 +18250,50 @@
 "R",
 "R",
 "R",
+"R",
+"R",
+"R"
+],
+"runtime.operator_worktree_roots": [
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"A571c",
+"Abf80",
+"Ac301",
+"A2af5",
+"R",
+"R",
+"A3066",
+"Af6d6",
 "R",
 "R",
 "R"
