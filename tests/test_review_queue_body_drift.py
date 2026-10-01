@@ -16,6 +16,8 @@ import hashlib
 import json
 from pathlib import Path
 
+import pytest
+
 from _review_fixtures import _stale_ci_pr, _write_review_packet, _review_queue_app
 from charlie_work.instrumentation import query_events
 from charlie_work.state import load_state, save_state
@@ -372,3 +374,82 @@ def test_same_head_legacy_verdict_still_reroutes_to_rework(tmp_path: Path) -> No
     assert result.data["queue"] == []
     state_after = load_state(app.paths.state_file)
     assert state_after["issues"][str(_ISSUE_NUMBER)]["status"] == "rework_requested"
+
+
+def test_applied_body_outcome_requeues_review_and_is_not_restranded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issues #2092 / #1983 end to end: a body-only rework worker writes
+    ``.worker-outcome.json`` with a new body, the orchestrator applies it
+    (``rework_outcome_applied body_updated=true``, head unchanged), the issue
+    is routed to review (``reviewing``), and the NEXT ``review_queue()``
+    passes must (a) NOT re-strand the still-pinned ``request_changes`` verdict
+    into rework and (b) queue a fresh review at the SAME head -- suppressing
+    the re-strand without a re-review would just park the PR."""
+    from charlie_work import rework_outcome
+    from charlie_work.config import WORKER_OUTCOME_FILENAME
+    from charlie_work.worktree import worktree_path_for_branch
+
+    from _rework_dispatch_fixtures import _wg
+
+    head = "sha-live-head"
+    branch = f"agent/issue-{_ISSUE_NUMBER}-fix"
+    pr = _stale_ci_pr(_PR_NUMBER, _ISSUE_NUMBER, head)
+    pr["body"] = _OLD_BODY
+    app = _review_queue_app(tmp_path, prs=[pr], dry_run=False)
+    _write_review_packet(tmp_path, _PR_NUMBER, head, _request_changes_decision(head))
+
+    # Rework worker's body-only outcome: no new commit, head unchanged.
+    monkeypatch.setattr(rework_outcome, "remote_branch_head_sha", lambda *_a: head)
+    worktrees_dir = tmp_path / "worktrees"
+    worktree = worktree_path_for_branch(tmp_path, branch, worktrees_dir)
+    worktree.mkdir(parents=True, exist_ok=True)
+    (worktree / WORKER_OUTCOME_FILENAME).write_text(
+        json.dumps(
+            {"push_succeeded": True, "pr_created": False, "head_sha": head, "pr_body": _NEW_BODY}
+        ),
+        encoding="utf-8",
+    )
+    state = load_state(app.paths.state_file)
+    state["issues"][str(_ISSUE_NUMBER)] = {
+        "number": _ISSUE_NUMBER,
+        "status": "rework_requested",
+        "branch_name": branch,
+    }
+    save_state(app.paths.state_file, state)
+
+    rework_outcome.apply_rework_worker_outcome(
+        app.gh,
+        repo_root=tmp_path,
+        worktrees_dir=worktrees_dir,
+        sessions_dir=tmp_path / "sessions",
+        state_file=app.paths.state_file,
+        write_gate=_wg(app.paths.state_file),
+        issue_number=_ISSUE_NUMBER,
+        pr_number=_PR_NUMBER,
+    )
+    applied = query_events(app.paths.state_file, kind="rework_outcome_applied")
+    assert len(applied) == 1
+    assert applied[0]["payload"]["body_updated"] is True
+    assert app.gh.prs[0]["body"] == _NEW_BODY
+    assert app.gh.prs[0]["headRefOid"] == head
+
+    # orphaned_worker_routed_to_review: the issue now sits in ``reviewing``.
+    state = load_state(app.paths.state_file)
+    state["issues"][str(_ISSUE_NUMBER)]["status"] = "reviewing"
+    save_state(app.paths.state_file, state)
+
+    # Two passes (the restorer used to fire ~60s later, i.e. on a later pass).
+    for _ in range(2):
+        result = app.review_queue()
+        assert result.ok is True
+        assert [(q["pr"], q["decision"], q["packet_head_sha"]) for q in result.data["queue"]] == [
+            (_PR_NUMBER, "stale", head)
+        ]
+        issue = load_state(app.paths.state_file)["issues"][str(_ISSUE_NUMBER)]
+        assert issue["status"] == "reviewing"
+
+    assert (
+        query_events(app.paths.state_file, kind="stranded_request_changes_rework_requested") == []
+    )
+    assert (_ISSUE_NUMBER, app.config.labels.needs_rework) not in app.gh.labels_added

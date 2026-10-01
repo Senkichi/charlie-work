@@ -517,11 +517,7 @@ def _loop_body(
                 template_current = packet_template_sha is None or (
                     packet_template_sha == current_template_sha
                 )
-                # Issue #1983: a request_changes verdict whose body baseline
-                # drifted is re-reviewed at the SAME head (body-only
-                # rework), so the packet must carry the live body too --
-                # otherwise the reviewer reads the old body and
-                # record_review re-stamps reviewed_body_sha256 from it.
+                # #1983: drifted request_changes re-reviews at same head; packet needs live body.
                 body_current = not _request_changes_body_drifted(
                     self._review_decision(pr_number), pr
                 ) or self._packet_body_current(pr_number, pr)
