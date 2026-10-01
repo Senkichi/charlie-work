@@ -704,6 +704,18 @@ Enable-ScheduledTask -TaskName charlie-fleet-pass
 `charlie fleet stop` reports whether the task is armed, so an armed task is
 called out in the command's own output.
 
+**Pausing (preferred, #1776)**: `charlie fleet pause [--reason TEXT]` writes a
+persistent `fleet-pause.json` next to `fleet.json`. The supervisor reads it at
+the top of each loop iteration (between passes, never mid-pass), stamps
+`exit_code`=5 / `exited_at` on the heartbeat, and exits without killing
+anything; `scripts/fleet-pass.ps1` refuses to launch while the flag exists, so
+the scheduled task stays enabled and the pause survives reboot/logon. No
+`Disable-ScheduledTask`, no PID kills. `charlie fleet resume` removes the flag
+and the next tick relaunches. `fleet status` reports the pause while it is set.
+**A pause also freezes runner allocation** (same supervisor pass) at the last
+converged parked floor. To verify a pause, check that no new supervisor starts
+for one full watchdog window, not just that the process is gone.
+
 **Restarting**: re-enable the task (the next tick relaunches
 `supervise-loop`), or run `uv run charlie fleet supervise-loop` in a visible
 console — Ctrl+C there is handled cleanly: the wrapper logs one line and

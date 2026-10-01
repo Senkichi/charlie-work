@@ -364,6 +364,7 @@ FLEET_LOCK_FILENAME = "fleet.lock"
 FLEET_LOCK_HOLDER_FILENAME = "fleet.lock.holder"
 FLEET_SUPERVISOR_LOCK_FILENAME = "fleet-supervisor.lock"
 FLEET_STOP_REQUEST_FILENAME = "fleet-stop-request.json"
+FLEET_PAUSE_FILENAME = "fleet-pause.json"
 NOTIFY_HEALTH_STATE_FILENAME = "notify_health_state.json"
 CAPACITY_STARVATION_STATE_FILENAME = "capacity_starvation_state.json"
 CONFIG_RETIREMENT_STATE_FILENAME = "config_retirement_state.json"
@@ -454,6 +455,19 @@ def fleet_stop_request_path(override: str | None = None) -> Path:
     writer and both readers agree on the name (issue #1716).
     """
     return fleet_dir(override=override) / FLEET_STOP_REQUEST_FILENAME
+
+
+def fleet_pause_path(override: str | None = None) -> Path:
+    """Return the persistent fleet pause flag path in the fleet dir.
+
+    ``charlie fleet pause`` writes this file and ``charlie fleet resume``
+    removes it. Unlike the one-shot stop marker it is never consumed by the
+    supervisor: the supervisor reads it between passes and
+    ``scripts/fleet-pass.ps1`` refuses to launch while it exists (issue #1776).
+    The launcher hardcodes the filename (no Python has run yet); the test
+    suite pins the two together.
+    """
+    return fleet_dir(override=override) / FLEET_PAUSE_FILENAME
 
 
 def notify_health_state_path(override: str | None = None) -> Path:
