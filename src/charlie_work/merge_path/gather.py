@@ -140,6 +140,29 @@ class Opening:
     carry_check: Any = None
 
 
+def gather_skip(pr_number: int, cfg: MergePathConfig, entry: dict[str, Any]) -> Opening | None:
+    """The SKIP opening for a PR already recorded as merged, else ``None``.
+
+    Reads nothing from GitHub, so the live driver can ask it inside its first
+    state lock before any network call.
+    """
+    persisted = persisted_from(entry)
+    if persisted.status != "merged":
+        return None
+    facts = AdmissionFacts(
+        pr_number=pr_number,
+        config=cfg,
+        persisted=persisted,
+        pr_found=False,
+        live_labels=frozenset(),
+        live_head_sha=None,
+        issue_number=entry.get("issue_number"),
+        verdict=VerdictFact(False, None),
+        carry_forward=None,
+    )
+    return Opening(facts, decide_admission(facts), {}, {}, entry.get("issue_number"))
+
+
 def gather_opening(
     app: Any,
     ports: MergePathPorts,
@@ -155,20 +178,10 @@ def gather_opening(
     ``escalation`` is read lazily, only when the first verdict is a re-review
     (the one place admission consumes the flags); the preview never passes it.
     """
+    skipped = gather_skip(pr_number, cfg, entry)
+    if skipped is not None:
+        return skipped
     persisted = persisted_from(entry)
-    if persisted.status == "merged":
-        facts = AdmissionFacts(
-            pr_number=pr_number,
-            config=cfg,
-            persisted=persisted,
-            pr_found=False,
-            live_labels=frozenset(),
-            live_head_sha=None,
-            issue_number=entry.get("issue_number"),
-            verdict=VerdictFact(False, None),
-            carry_forward=None,
-        )
-        return Opening(facts, decide_admission(facts), {}, {}, entry.get("issue_number"))
 
     pr = app.gh.pr_view(pr_number)
     if not pr:

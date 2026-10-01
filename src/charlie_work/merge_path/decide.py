@@ -36,6 +36,7 @@ from .model import (
     GateInputs,
     Hold,
     HoldFacts,
+    MergePathConfig,
     MergePlan,
     PlanKind,
     Readiness,
@@ -103,6 +104,36 @@ def merge_entry(readiness: Readiness, holds: HoldFacts) -> tuple[bool, bool]:
         and not readiness.human_merge_check_unavailable
     )
     return escalated, enter
+
+
+def deescalation_read_needed(
+    cfg: MergePathConfig,
+    issue_number: int | None,
+    human_merge_hold: bool,
+    human_merge_check_unavailable: bool,
+) -> bool:
+    """The issue's escalation entry is consumed: a policy escalation could be lifted.
+
+    Only a bound issue under configured human-merge labels whose label has
+    verifiably gone can be de-escalated (issue #1598); ``decide_readiness`` and
+    the live gather share this predicate.
+    """
+    return bool(
+        cfg.human_merge_labels
+        and issue_number is not None
+        and not human_merge_hold
+        and not human_merge_check_unavailable
+    )
+
+
+def mergequeue_stamp_needs_now(
+    locked: PersistedPr, merged: bool, live_head_sha: str | None
+) -> bool:
+    """``AccountingFacts.now_iso`` is consumed: a fresh mergequeue stamp will be written."""
+    status = "merged" if merged else locked.status
+    if status != "mergequeue" or not live_head_sha:
+        return False
+    return not (locked.mergequeue_head_sha == live_head_sha and bool(locked.mergequeue_since))
 
 
 def merge_hold_read_needed(
@@ -402,10 +433,9 @@ def decide_readiness(f: ReadinessFacts) -> Readiness:
         kind = PlanKind.RERUN_OR_ESCALATE
 
     deescalate = bool(
-        cfg.human_merge_labels
-        and f.issue_number is not None
-        and not f.human_merge_hold
-        and not f.human_merge_check_unavailable
+        deescalation_read_needed(
+            cfg, f.issue_number, f.human_merge_hold, f.human_merge_check_unavailable
+        )
         and f.issue_status == "escalated"
         and f.issue_reason_class == "policy"
     )
@@ -656,13 +686,10 @@ def decide_accounting(
     since: str | None = None
     head_sha: str | None = None
     if status == "mergequeue" and facts.live_head_sha:
-        if (
-            facts.locked.mergequeue_head_sha == facts.live_head_sha
-            and facts.locked.mergequeue_since
-        ):
-            since, head_sha = facts.locked.mergequeue_since, facts.locked.mergequeue_head_sha
-        else:
+        if mergequeue_stamp_needs_now(facts.locked, merged, facts.live_head_sha):
             since, head_sha = facts.now_iso, facts.live_head_sha
+        else:
+            since, head_sha = facts.locked.mergequeue_since, facts.locked.mergequeue_head_sha
 
     events.append(
         EventSpec(
