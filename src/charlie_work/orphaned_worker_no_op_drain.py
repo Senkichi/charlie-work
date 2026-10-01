@@ -45,6 +45,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 from .checks import _is_failing_run, summarize_checks
 from .ci_findings import _required_changes_from_checks
 from .markdown_fence import fenced_block
+from . import worker_fate
 from .rework_outcome import _read_rework_outcome
 
 if TYPE_CHECKING:
@@ -104,13 +105,31 @@ def _failing_step_entries(
 
 
 def _worker_comment(
-    route: NoOpReworkRoute, entry: dict[str, Any], sessions_dir: Path, repo_root: Any, wt: Any
+    route: NoOpReworkRoute,
+    entry: dict[str, Any],
+    sessions_dir: Path,
+    repo_root: Any,
+    wt: Any,
+    *,
+    on_fate: Callable[[worker_fate.WorkerFate], None] | None = None,
 ) -> str | None:
-    """The rework worker's ``pr_comment`` (its rebuttal), or ``None``."""
+    """The rework worker's ``pr_comment`` (its rebuttal), or ``None``.
+
+    Only evidence written after this dispatch (``entry["dispatched_at"]``) and
+    matching the live head counts: an earlier round's outcome must never be
+    quoted as this round's rebuttal (issue #2102).
+    """
     if not isinstance(repo_root, Path) or wt is None:
         return None
     outcome = _read_rework_outcome(
-        sessions_dir, repo_root, wt, route.issue_number, route.branch or entry.get("branch_name")
+        sessions_dir,
+        repo_root,
+        wt,
+        route.issue_number,
+        route.branch or entry.get("branch_name"),
+        dispatched_at=worker_fate.parse_iso_timestamp(entry.get("dispatched_at")),
+        live_head_sha=route.live_head_sha,
+        on_fate=on_fate,
     )
     comment = outcome.get("pr_comment") if isinstance(outcome, dict) else None
     return (
@@ -183,7 +202,16 @@ def _drain_one(
         entry = _wf.load_state(state_file)["issues"].get(str(issue_number), {})
     if not isinstance(entry, dict) or entry.get("status") != "dispatched":
         return  # a concurrent transition already resolved it
-    comment = _worker_comment(route, entry, sessions_dir, repo_root, worktrees_dir)
+    fates: dict[int, list[worker_fate.WorkerFate]] = {}
+    comment = _worker_comment(
+        route,
+        entry,
+        sessions_dir,
+        repo_root,
+        worktrees_dir,
+        on_fate=lambda fate: worker_fate.collect_fate(fates, fate),
+    )
+    worker_fate.report_stale_evidence(state_file, fates, write_gate=write_gate)
     detail = f"{route.reason}: {comment}" if comment else route.reason
 
     if entry.get(NO_OP_HANDLED_HEAD_KEY) != head:
