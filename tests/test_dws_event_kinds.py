@@ -2,9 +2,10 @@
 
 The sweep's decide modules build ``Emit`` commits through ``emit("<kind>", ...)`` and
 the stalled lane names its event in ``StateTxn(event_kind="<kind>")``; the apply shells
-forward ``commit.kind`` / ``commit.event_kind`` to ``append_event``. The repo-wide kind
-scanners cannot see through that forwarding (the shells are allow-listed pass-throughs),
-so the literal's true origin is checked here instead: each kind must resolve to string
+forward ``commit.kind`` / ``commit.event_kind`` to ``append_event``. The repo-wide
+consumer scanner (``test_event_kind_consumers.py``) treats those decide-module literals
+as the emit sites (sharing ``_dws_emit_scan``) and the shells as forwarding only; this
+file checks the literal-ness and level registration: each kind must resolve to string
 literals, and a kind emitted without an explicit ``level`` must be in the registry (the
 registry is where ``append_event`` looks a level up).
 (Named ``test_dws_*`` so the dormant module guard does not mistake this for a
@@ -16,33 +17,10 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+from _dws_emit_scan import literals, sweep_emit_kind
 from _instrumentation_kind_scanner import _known_level
 
 _PACKAGE = Path(__file__).parents[1] / "src" / "charlie_work" / "dead_worker_sweep"
-
-
-def _literals(expr: ast.expr, tree: ast.Module) -> set[str] | None:
-    """String literals ``expr`` can evaluate to, following one local assignment; else None."""
-    if isinstance(expr, ast.Constant) and isinstance(expr.value, str):
-        return {expr.value}
-    if isinstance(expr, ast.IfExp):
-        body, orelse = _literals(expr.body, tree), _literals(expr.orelse, tree)
-        return None if body is None or orelse is None else body | orelse
-    if isinstance(expr, ast.Name):
-        values = [
-            node.value
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Assign)
-            and any(isinstance(t, ast.Name) and t.id == expr.id for t in node.targets)
-        ]
-        resolved = [_literals(v, tree) for v in values]
-        if values and all(r is not None for r in resolved):
-            return set().union(*resolved)  # type: ignore[arg-type]
-    return None
-
-
-def _has_level(call: ast.Call) -> bool:
-    return len(call.args) > 2 or any(kw.arg == "level" for kw in call.keywords)
 
 
 def _sweep_kinds() -> tuple[set[str], set[str], list[str]]:
@@ -53,20 +31,11 @@ def _sweep_kinds() -> tuple[set[str], set[str], list[str]]:
     for path in sorted(_PACKAGE.glob("decide*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in ast.walk(tree):
-            if (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Name)
-                and node.func.id == "emit"
-                and node.args
-            ):
-                kind_node, leveled = node.args[0], _has_level(node)
-            elif isinstance(node, ast.keyword) and node.arg == "event_kind":
-                kind_node, leveled = node.value, False
-            else:
+            site = sweep_emit_kind(node, path.name)
+            if site is None:
                 continue
-            if path.name == "decide_common.py" and isinstance(kind_node, ast.Name):
-                continue  # ``events()`` forwards the kind its caller already chose
-            kinds = _literals(kind_node, tree)
+            kind_node, leveled = site
+            kinds = literals(kind_node, tree)
             if kinds is None:
                 unresolved.append(f"{path.name}:{node.lineno}: {ast.unparse(kind_node)}")
             else:
