@@ -71,7 +71,14 @@ def test_a_workflow_file_reads_its_own_runs_route_with_server_side_filters() -> 
 def test_a_workflow_name_is_resolved_then_its_runs_are_read() -> None:
     def respond(request):  # noqa: ANN001
         if request.route == WORKFLOWS:
-            return ok({"workflows": [{"id": 7, "name": "Other"}, {"id": 42, "name": "CI"}]})
+            return ok(
+                {
+                    "workflows": [
+                        {"id": 7, "name": "Other"},
+                        {"id": 42, "name": "CI", "state": "active"},
+                    ]
+                }
+            )
         assert request.route == f"{WORKFLOWS}/42/runs"
         return ok({"workflow_runs": [_run(9)]})
 
@@ -85,7 +92,13 @@ def test_a_workflow_name_is_resolved_then_its_runs_are_read() -> None:
     assert "page" not in _query(transport.requests[-1])
 
 
-@pytest.mark.parametrize("matches", [[], [{"id": 1, "name": "CI"}, {"id": 2, "name": "CI"}]])
+@pytest.mark.parametrize(
+    "matches",
+    [
+        [],
+        [{"id": 1, "name": "CI", "state": "active"}, {"id": 2, "name": "CI", "state": "active"}],
+    ],
+)
 def test_an_unknown_or_ambiguous_workflow_name_is_a_failed_read_not_an_empty_list(
     matches: list,
 ) -> None:
@@ -94,6 +107,42 @@ def test_an_unknown_or_ambiguous_workflow_name_is_a_failed_read_not_an_empty_lis
     assert isinstance(out, TransportFailure)
     assert out.kind is FailureKind.ADAPTER_DEFECT
     assert len(transport.requests) == 1  # no runs read
+
+
+def _resolved_route(workflow: str, workflows: list[dict]) -> str | TransportFailure:
+    def respond(request):  # noqa: ANN001
+        if request.route == WORKFLOWS:
+            return ok({"workflows": workflows})
+        return ok({"workflow_runs": [_run(9)]})
+
+    transport = FakeTransport(respond)
+    out = RunListRead("databaseId", workflow=workflow).execute(transport, "o", "r")
+    if isinstance(out, TransportFailure):
+        return out
+    return transport.requests[-1].route
+
+
+def test_a_workflow_name_matches_case_insensitively_like_gh() -> None:
+    route = _resolved_route("ci", [{"id": 42, "name": "CI", "state": "active"}])
+    assert route == f"{WORKFLOWS}/42/runs"
+
+
+def test_a_disabled_same_named_workflow_is_ignored_like_gh() -> None:
+    route = _resolved_route(
+        "CI",
+        [
+            {"id": 1, "name": "CI", "state": "disabled_manually"},
+            {"id": 2, "name": "CI", "state": "active"},
+        ],
+    )
+    assert route == f"{WORKFLOWS}/2/runs"
+
+
+def test_an_uppercase_file_suffix_is_a_file_not_a_name() -> None:
+    transport = FakeTransport(lambda r: ok({"workflow_runs": [_run(1)]}))
+    RunListRead("databaseId", workflow="CI.YML").execute(transport, "o", "r")
+    (request,) = transport.requests  # no workflow lookup
+    assert request.route == f"{WORKFLOWS}/CI.YML/runs"
 
 
 def test_a_limit_over_one_page_pages_the_workflow_route_and_dedupes_by_run_id() -> None:
