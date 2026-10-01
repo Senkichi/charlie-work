@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import functools
 import re
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
@@ -2146,7 +2146,7 @@ class OrchestratorApp:
         from .worker import classify_worker_health, iter_workers, real_activity_probe_for
 
         worker_views = list(iter_workers(sessions_dir))
-        now = datetime.now(UTC)
+        now = self.host.clock.now()
         workers = []
         for view in worker_views:
             if not view.is_alive():
@@ -3170,7 +3170,7 @@ class OrchestratorApp:
                     window["consecutive_passes"] = window.get("consecutive_passes", 0) + 1
                     window["last_pass_cid"] = cid
                 last_esc = window.get("last_escalation")
-                now_dt = datetime.now(UTC)
+                now_dt = self.host.clock.now()
                 should_escalate = window["consecutive_passes"] >= cfg.persistence_passes
                 if should_escalate and (
                     last_esc is None
@@ -4191,7 +4191,7 @@ class OrchestratorApp:
         byte-identical; tests can freeze it and assert exact equality instead
         of a wall-clock-tolerance proximity check.
         """
-        resolved_now = now if now is not None else datetime.now(UTC)
+        resolved_now = now if now is not None else self.host.clock.now()
         reviews_dir = self._layout.reviews_dir
 
         # Run the verdict-reaper and orphan/stalled sweeps BEFORE the quota
@@ -4397,7 +4397,7 @@ class OrchestratorApp:
                         "reviewer_quota": {
                             **(state.get("reviewer_quota") or {}),
                             "consecutive_probe_failures": 0,
-                            "last_probe_cleared_at": datetime.now(UTC)
+                            "last_probe_cleared_at": self.host.clock.now()
                             .isoformat()
                             .replace("+00:00", "Z"),
                         },
@@ -5162,7 +5162,7 @@ class OrchestratorApp:
                     state["prs"][str(pr_number)] = rolled_back
 
             if quota_hit:
-                now_dt = datetime.now(UTC)
+                now_dt = self.host.clock.now()
                 # Issue #612: parse the provider's named reset clock time
                 # from the launch error (e.g. "resets 1:20am
                 # (America/Los_Angeles)") so the backoff targets the stated
