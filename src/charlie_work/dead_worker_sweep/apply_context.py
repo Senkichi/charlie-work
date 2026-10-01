@@ -54,6 +54,7 @@ class SweepContext:
             "worker_declared_blocked": {},
             "zero_artifact": {},
             "cross_repo_scope": {},
+            "verified_no_changes": {},
         }
     )
     review_prs: dict[int, int] = field(default_factory=dict)
