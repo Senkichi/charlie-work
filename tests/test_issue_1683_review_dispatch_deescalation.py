@@ -56,7 +56,10 @@ from charlie_work.state import (
     save_state,
     state_lock,
 )
-from charlie_work.unescalate_reset_fields import REWORK_BUDGET_RESET_BY_ESCALATION_REASON
+from charlie_work.unescalate_reset_fields import (
+    ISSUE_BUDGET_RESET_BY_ESCALATION_REASON,
+    REWORK_BUDGET_RESET_BY_ESCALATION_REASON,
+)
 
 from _review_fixtures import (
     _dispatch_reviews_app,
@@ -372,11 +375,6 @@ _NO_COUNTER_ALLOWLIST: dict[str, str] = {
     # --- operator door's UNESCALATE_ISSUE_RESET_FIELDS domain. They   ---
     # --- re-gate only on a fresh dispatch attempt (the next genuine   ---
     # --- rework cycle), not on the very next pass.                    ---
-    "redispatch_cap_exceeded": (
-        "Gated by the issue-level ``redispatch_at`` windowed-timestamp "
-        "list, not a PR counter; the windowed list is operator-door "
-        "domain (UNESCALATE_ISSUE_RESET_FIELDS)."
-    ),
     "worker_death_loop": (
         "Gated by the issue-level ``worker_death_at`` windowed-timestamp "
         "list; operator-door domain."
@@ -759,7 +757,9 @@ def test_every_mechanical_escalation_reason_is_mapped_or_allowlisted() -> None:
     """
     literal_reasons, dynamic_sites = _mechanical_escalation_reasons()
 
-    mapped = set(REWORK_BUDGET_RESET_BY_ESCALATION_REASON)
+    mapped = set(REWORK_BUDGET_RESET_BY_ESCALATION_REASON) | set(
+        ISSUE_BUDGET_RESET_BY_ESCALATION_REASON
+    )
     allowlisted = set(_NO_COUNTER_ALLOWLIST)
     unaccounted = literal_reasons - mapped - allowlisted
     assert not unaccounted, (
@@ -785,3 +785,45 @@ def test_every_mechanical_escalation_reason_is_mapped_or_allowlisted() -> None:
         f"{sorted(dynamic_sites - set(_DYNAMIC_REASON_DOMAINS))}; "
         f"stale: {sorted(set(_DYNAMIC_REASON_DOMAINS) - dynamic_sites)}"
     )
+
+
+def test_sweep_resets_redispatch_at_for_redispatch_cap_exceeded(tmp_path: Path) -> None:
+    """Issue #2101: the no-op rework cap gates on the issue-entry
+    ``redispatch_at`` window, so a clear that leaves it full re-escalates on
+    the next detection. The clear must drop it and report a real reset."""
+    app = _app(tmp_path)
+    now = datetime.now(UTC)
+    full_window = [(now - timedelta(minutes=i)).isoformat() for i in range(5)]
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["prs"]["456"] = {
+            "number": 456,
+            "issue_number": 123,
+            "status": "escalated",
+            "escalation_reason": "redispatch_cap_exceeded",
+        }
+        state["issues"]["123"] = {
+            "number": 123,
+            "status": "escalated",
+            "escalation_reason": "redispatch_cap_exceeded",
+            "reason_class": "mechanical",
+            "terminal_since": now.isoformat(),
+            "redispatch_at": full_window,
+        }
+        save_state(app.paths.state_file, state)
+
+    app._maybe_deescalate_mechanical()
+
+    state = load_state(app.paths.state_file)
+    issue_123 = state["issues"]["123"]
+    assert issue_123["status"] == PASSIVE_OPEN_STATUS
+    assert "redispatch_at" not in issue_123
+    cleared = _events(state, "deescalation_cleared")
+    assert cleared[0]["payload"]["rework_budget_reset"] is True
+
+
+def test_issue_budget_reset_fields_are_operator_door_fields() -> None:
+    from charlie_work.unescalate_reset_fields import UNESCALATE_ISSUE_RESET_FIELDS
+
+    for fields in ISSUE_BUDGET_RESET_BY_ESCALATION_REASON.values():
+        assert set(fields) <= set(UNESCALATE_ISSUE_RESET_FIELDS)

@@ -123,6 +123,7 @@ from .worktree import (
 )
 from . import state as _state
 from .unescalate_reset_fields import (
+    ISSUE_BUDGET_RESET_BY_ESCALATION_REASON,
     REWORK_BUDGET_RESET_BY_ESCALATION_REASON,
     UNESCALATE_ISSUE_RESET_FIELDS,
     UNESCALATE_PR_RESET_FIELDS,
@@ -5851,6 +5852,7 @@ class OrchestratorApp:
     _UNESCALATE_PR_RESET_FIELDS = UNESCALATE_PR_RESET_FIELDS
     _UNESCALATE_ISSUE_RESET_FIELDS = UNESCALATE_ISSUE_RESET_FIELDS
     _REWORK_BUDGET_RESET_BY_ESCALATION_REASON = REWORK_BUDGET_RESET_BY_ESCALATION_REASON
+    _ISSUE_BUDGET_RESET_BY_ESCALATION_REASON = ISSUE_BUDGET_RESET_BY_ESCALATION_REASON
 
     # Deliberately NOT @_guard_state_lock: merge_check takes no state lock, and
     # the guard's contract is to return a *successful* skip (ok=True) when the

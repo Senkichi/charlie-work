@@ -401,6 +401,13 @@ def _deescalate_mechanical_issue(self, issue_number: int) -> dict[str, Any]:
                     for _field in companion_fields:
                         fresh_pr.pop(_field, None)
                     counter_reset = True
+            # Issue #2101: issue-entry windowed caps (``redispatch_at``).
+            for _issue_field in self._ISSUE_BUDGET_RESET_BY_ESCALATION_REASON.get(
+                cleared_condition, ()
+            ):
+                if _issue_field in updated_issue_entry:
+                    updated_issue_entry.pop(_issue_field)
+                    counter_reset = True
         fresh_state = self.write_gate.record_event(
             fresh_state,
             "deescalation_cleared",
