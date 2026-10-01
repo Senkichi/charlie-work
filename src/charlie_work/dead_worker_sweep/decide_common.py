@@ -76,6 +76,11 @@ class Draft:
     def take(self) -> UpdateIssue | None:
         if self._dead:
             return None
+        deleted = sorted(key for key in self._base if key not in self.work)
+        if deleted:
+            raise ValueError(
+                f"Draft for issue {self.issue} deleted keys {deleted}; the diff cannot express deletions"
+            )
         diff = {
             key: copy.deepcopy(value)
             for key, value in self.work.items()
