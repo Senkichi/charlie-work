@@ -252,3 +252,11 @@ def test_merge_pr_a_partial_read_with_errors_fails_closed(tmp_path: Path) -> Non
         gh.merge_pr(7, "squash")
 
     assert rest_sent(http) == []
+
+
+def test_removing_a_label_from_a_missing_issue_is_a_failure(tmp_path: Path) -> None:
+    gh, _, _ = make_github(
+        tmp_path, http=FakeAdapter("http", [ok({"message": "Not Found"}, status=404)])
+    )
+
+    assert gh.remove_issue_label(5, "agent:queued") is False

@@ -72,14 +72,19 @@ class Labels(CapabilityCollaborator):
         """Remove ``label``; an absent label counts as removed (idempotent).
 
         ``gh ... --remove-label`` of a label the object does not carry exits 0;
-        the REST DELETE answers 404, which is therefore success here.
+        the REST DELETE answers 404 "Label does not exist", which is therefore
+        success here. Any other 404 (missing issue, invisible repo) is a failure.
         """
         request = RestRequest.of(
             "DELETE",
             f"repos/{{owner}}/{{repo}}/issues/{number}/labels/{quote(label, safe='')}",
         )
         outcome = send(self, request)
-        return is_success(outcome) or (isinstance(outcome, Response) and outcome.status == 404)
+        return is_success(outcome) or (
+            isinstance(outcome, Response)
+            and outcome.status == 404
+            and "label does not exist" in outcome.body.lower()
+        )
 
     def add_issue_label(self, number: int, label: str) -> bool:
         return self._add_label(number, label)

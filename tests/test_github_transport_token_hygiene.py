@@ -184,3 +184,18 @@ def test_a_prepared_request_does_not_repr_its_authorization_header() -> None:
     assert isinstance(prepared, _Prepared)
     assert prepared.headers["Authorization"] == f"Bearer {SECRET}"  # still sent
     assert SECRET not in repr(prepared)
+
+
+def test_redact_scrubs_a_credential_that_is_not_the_cached_token() -> None:
+    """r4: the generic patterns must match mid-text (a literal backspace never did)."""
+    mine = "ghp_MINE" + "m" * 20
+    foreign = "ghp_" + "F" * 30
+    for text in (
+        "Authorization: Bearer abcdef123456",
+        f"proxy said: token {foreign}",
+        f"leaked {foreign} here",
+        "x github_pat_" + "Z" * 30 + " y",
+    ):
+        out = redact(text, mine)
+        assert "abcdef123456" not in out and "F" * 30 not in out and "Z" * 30 not in out, out
+    assert redact("Not Found", mine) == "Not Found"

@@ -337,6 +337,9 @@ class HttpAdapter:
         except (OSError, ssl.SSLError, HTTPException) as exc:
             self._close(conn)
             return TransportFailure(FailureKind.SENT_NO_RESPONSE, str(exc), "http"), reused
+        except _DEFECT_ERRORS:
+            self._close(conn)  # an adapter defect still must not leak the socket
+            raise
         if will_close:
             self._close(conn)
         else:
@@ -357,8 +360,9 @@ class HttpAdapter:
         path = target.path or "/"
         if target.query:
             path = f"{path}?{target.query}"
-        conn = self._make(target.netloc, timeout)
+        conn = None
         try:
+            conn = self._make(target.netloc, timeout)
             conn.request("GET", path, headers={"User-Agent": _USER_AGENT})
             raw = conn.getresponse()
             body_bytes = raw.read()
@@ -369,5 +373,6 @@ class HttpAdapter:
         except (OSError, ssl.SSLError, HTTPException) as exc:
             return TransportFailure(FailureKind.SENT_NO_RESPONSE, f"redirect fetch: {exc}", "http")
         finally:
-            self._close(conn)
+            if conn is not None:
+                self._close(conn)
         return Response(status, headers, body_bytes.decode("utf-8", errors="replace"), "http")

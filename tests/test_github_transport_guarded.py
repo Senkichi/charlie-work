@@ -481,3 +481,10 @@ def test_reset_circuit_breaker_clears_an_open_breaker() -> None:
     assert isinstance(guard.send(GET_PR), TransportFailure)
     guard.reset_circuit_breaker()
     assert guard.send(GET_PR).ok  # type: ignore[union-attr]
+
+
+def test_dry_run_suppresses_a_templated_mutation_even_when_origin_is_unreadable() -> None:
+    guard, http, gh, _ = build_guard(dry_run=True, owner_repo=None)
+    out = guard.send(RestRequest.of("PUT", "repos/{owner}/{repo}/pulls/1/merge"))
+    assert isinstance(out, Response) and out.adapter == "dry_run" and out.ok
+    assert http.calls == [] and gh.calls == []

@@ -239,8 +239,10 @@ class RunListRead:
     """``gh run list --json F`` as ``GET actions/runs`` (REST; B1: a read).
 
     ``workflow`` matches the run's workflow name or its file name, which is
-    what ``gh run list --workflow`` accepts. The filter runs client-side over
-    the newest page (<= 100 runs); ``limit`` then truncates.
+    what ``gh run list --workflow`` accepts. gh filters before it limits, so
+    pages (100 runs each) are read until ``limit`` runs match; ``limit`` then
+    truncates. ``MAX_PAGES`` pages without enough matches is an ADAPTER_DEFECT
+    (gh fallback), never a silently short list.
     """
 
     fields: str
@@ -261,26 +263,40 @@ class RunListRead:
         unknown = [c for c in columns if c not in _RUN_FIELDS]
         if unknown:
             return _defect(f"unknown run field(s): {', '.join(unknown)}")
-        query: dict[str, Any] = {"per_page": _PAGE}
+        filters: dict[str, Any] = {"per_page": _PAGE}
         if self.branch:
-            query["branch"] = self.branch
+            filters["branch"] = self.branch
         if self.status:
-            query["status"] = self.status
-        request = RestRequest.of(
-            "GET", "repos/{owner}/{repo}/actions/runs", query=query, long_call=self.long_call
-        )
-        outcome = transport.send(request)
-        if not isinstance(outcome, Response) or not outcome.ok:
-            return outcome
-        try:
-            runs = json.loads(outcome.body).get("workflow_runs")
-        except (ValueError, AttributeError):
-            return _defect("actions/runs body was not a JSON object")
-        if not isinstance(runs, list):
-            return _defect("actions/runs body had no workflow_runs list")
-        wanted = [r for r in runs if isinstance(r, dict) and self._matches(r)]
+            filters["status"] = self.status
+        wanted: list[dict[str, Any]] = []
+        last: Response | None = None
+        for page in range(1, MAX_PAGES + 1):
+            query = filters if page == 1 else {**filters, "page": page}
+            outcome = transport.send(
+                RestRequest.of(
+                    "GET",
+                    "repos/{owner}/{repo}/actions/runs",
+                    query=query,
+                    long_call=self.long_call,
+                )
+            )
+            if not isinstance(outcome, Response) or not outcome.ok:
+                return outcome
+            last = outcome
+            try:
+                runs = json.loads(outcome.body).get("workflow_runs")
+            except (ValueError, AttributeError):
+                return _defect("actions/runs body was not a JSON object")
+            if not isinstance(runs, list):
+                return _defect("actions/runs body had no workflow_runs list")
+            wanted.extend(r for r in runs if isinstance(r, dict) and self._matches(r))
+            if len(wanted) >= self.limit or len(runs) < _PAGE:
+                break
+        else:
+            return _defect(f"actions/runs exceeded {MAX_PAGES} pages without {self.limit} matches")
+        assert last is not None
         rows = [{c: run.get(_RUN_FIELDS[c]) for c in columns} for run in wanted[: self.limit]]
-        return _with_body(outcome, rows)
+        return _with_body(last, rows)
 
     def _matches(self, run: dict[str, Any]) -> bool:
         if not self.workflow:

@@ -261,12 +261,14 @@ class GuardedTransport:
     # -- the stack -----------------------------------------------------------
 
     def send(self, request: Request) -> Outcome:
+        if self.dry_run and request.is_mutation:
+            # Before placeholder resolution: a suppressed mutation must not need
+            # a readable origin (``git remote get-url``) to be suppressed.
+            return Response(200, (), "", "dry_run")
         resolved = self._fill_placeholders(request)
         if isinstance(resolved, TransportFailure):
             return resolved
         request = resolved
-        if self.dry_run and request.is_mutation:
-            return Response(200, (), "", "dry_run")
         command = [request.describe()]
         if self._breaker is not None:
             with self._breaker_lock:

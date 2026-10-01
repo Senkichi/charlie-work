@@ -23,8 +23,8 @@ REDACTED = "<redacted>"
 _WELL_FORMED = re.compile(r"[\x21-\x7e]+")
 # An ``Authorization`` credential (``Bearer <x>``, or ``token <long x>``) and the
 # shapes GitHub issues (classic, OAuth, app, fine-grained).
-_AUTH_VALUE = re.compile(r"(?i)(?:bearer\s+\S+|token\s+[A-Za-z0-9_.\-=]{20,})")
-_TOKEN_SHAPES = re.compile(r"(?:gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{16,})")
+_AUTH_VALUE = re.compile(r"(?i)\b(?:bearer\s+\S+|token\s+[A-Za-z0-9_.\-=]{20,})")
+_TOKEN_SHAPES = re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{16,})")
 
 
 def is_well_formed(token: str) -> bool:
