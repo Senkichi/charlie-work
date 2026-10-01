@@ -60,6 +60,8 @@ def raise_to_normal_priority(state_path: Path | None = None) -> PriorityRaiseRes
         if state_path is not None:
             log_event(
                 state_path,
+                # event-consumer: audit-only -- the warning row is the audit record for a
+                # best-effort startup step; the ``logger.warning`` above is the alert
                 EVENT_FAILED,
                 {"before": before, "error": str(exc)},
                 level="warning",
