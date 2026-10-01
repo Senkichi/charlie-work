@@ -195,6 +195,14 @@ def resume_exec_rejected_review(app: Any, worker: Any, pr_number: int, reviews_d
     )
     if record is None or not record.command:
         return _fail("sidecar_unreadable")
+    from . import worker_fate
+
+    if worker_fate.is_alive(record.pid, record.process_start_time):
+        # The caller's ``worker`` is a snapshot; the freshly-read sidecar names a
+        # live process, i.e. a concurrent reaper already resumed this session
+        # (issue #2110). Never relaunch over it, and tell the caller to skip the
+        # miss path (which would tear down the live session's checkout).
+        return True
     checkout = Path(record.worktree_path)
     if not checkout.is_dir():
         return _fail("review_checkout_missing")
