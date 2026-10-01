@@ -214,7 +214,7 @@ class FakeGitHub:
                 matched.append(pr)
         return github_module._MergedPRSearchResult(matched, ok=True)
 
-    def pr_view(self, number: int):
+    def pr_view(self, number: int, *, fields: str | None = None):
         # Return the PR matching the requested number
         for pr in self.prs:
             if pr["number"] == number:
