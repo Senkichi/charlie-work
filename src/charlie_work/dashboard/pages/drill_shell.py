@@ -8,6 +8,8 @@ dynamic value is escaped here or by the helpers it calls.
 
 from __future__ import annotations
 
+import re
+
 from collections.abc import Sequence
 from datetime import tzinfo
 
@@ -87,11 +89,27 @@ def section(sid: str, heading: str, inner: str, *, note: str = "", focus: bool =
     )
 
 
+_NUM_ATTR = ' class="num"'
+_CELL = re.compile(r"<t[dh]\b([^>]*)>")
+
+
+def _numeric_columns(row: str) -> frozenset[int]:
+    """Column indexes whose first-row cell is ``class="num"``: their header right-aligns
+    with the figures under it, derived from the cells so no caller lists them twice."""
+    return frozenset(
+        i for i, m in enumerate(_CELL.finditer(row)) if re.search(r'class="[^"]*\bnum\b', m[1])
+    )
+
+
 def table(caption: str, head: Sequence[str], rows: Sequence[str], empty: str) -> str:
     """A dense table; ``rows`` are pre-rendered ``<tr>`` strings (cells already escaped)."""
     if not rows:
         return f'<p class="calm-sm">{esc(empty)}</p>' if empty else ""
-    th = "".join(f'<th scope="col">{esc(h)}</th>' for h in head)
+    nums = _numeric_columns(rows[0])
+    th = "".join(
+        f'<th scope="col"{_NUM_ATTR if i in nums else ""}>{esc(h)}</th>'
+        for i, h in enumerate(head)
+    )
     return (
         f'<div class="tscroll"><table class="dtable"><caption class="sr">{esc(caption)}'
         f"</caption><thead><tr>{th}</tr></thead><tbody>{''.join(rows)}</tbody></table></div>"

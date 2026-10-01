@@ -319,3 +319,13 @@ def test_payload_preview_shapes() -> None:
     assert payload_preview('["a"]') == "[1 items]"
     many = payload_preview("{" + ",".join(f'"k{i}": "{"v" * 30}"' for i in range(30)) + "}")
     assert len(many) <= 200 and many.endswith("\u2026")
+
+
+def test_table_headers_right_align_over_numeric_columns() -> None:
+    from charlie_work.dashboard.pages.drill_shell import table
+
+    html = table("t", ("Pass", "Took", "Errors"), ['<tr><td>a</td><td class="num">1s</td>'
+                 '<td class="num">0</td></tr>'], "")  # fmt: skip
+    assert '<th scope="col">Pass</th>' in html
+    assert '<th scope="col" class="num">Took</th>' in html
+    assert '<th scope="col" class="num">Errors</th>' in html

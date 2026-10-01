@@ -12,7 +12,16 @@ from __future__ import annotations
 from datetime import tzinfo
 
 from ..pages.now_fmt import link
-from .line import Frame, domain, plot, sources_note, summary, values, y_ticks_for
+from .line import (
+    Frame,
+    domain,
+    label_width,
+    plot,
+    sources_note,
+    summary,
+    values,
+    y_ticks_for,
+)
 from .model import LineSpec, Panel, Size
 from .svg import caption, empty_figure, num, svg_open
 
@@ -44,10 +53,12 @@ def small_multiples(
         domain=window,
         size=panel_size,
     )
+    # One right margin for every panel, so the shared x window lines up across the grid.
+    multi = any(len(p.series) > 1 for p in panels)
+    room = min(label_width(all_series), panel_size.width * 0.4) if multi else 10
+    right = panel_size.width - room
     out: list[str] = []
     for panel in sorted(panels, key=lambda p: (-_total(p), p.key)):
-        multi = len(panel.series) > 1
-        right = panel_size.width - (90 if multi else 10)
         f = Frame(
             width=panel_size.width,
             height=panel_size.height,
@@ -68,7 +79,7 @@ def small_multiples(
                 "line-chart panel-chart",
                 {"data-y-max": num(y_ticks[-1])},
             )
-            + plot(panel.series, shared, f, tz, labels=multi, max_x_ticks=3)
+            + plot(panel.series, shared, f, tz, labels=len(panel.series) > 1, max_x_ticks=3)
             + "</svg>"
         )
         heading = link(panel.href, panel.key, cls="panel-key")

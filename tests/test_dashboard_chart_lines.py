@@ -20,6 +20,7 @@ from charlie_work.dashboard.charts import (
     time_ticks,
 )
 from charlie_work.dashboard.charts.line import segments
+from charlie_work.dashboard.charts.svg import APPROX_DASHES, fit
 
 T0 = datetime(2026, 9, 28, tzinfo=UTC)
 DAY = 86400.0
@@ -104,7 +105,9 @@ def test_approx_series_is_dashed_and_labelled_approx() -> None:
         UTC,
     )
     assert '<g class="series s2 approx"><path class="line"' in html
-    assert re.search(r'class="series s2 approx"><path [^>]*stroke-dasharray="4 4"', html)
+    assert re.search(
+        rf'class="series s2 approx"><path [^>]*stroke-dasharray="{APPROX_DASHES[1]}"', html
+    )
     assert re.search(r'class="series s1"><path [^>]*/>', html)
     assert "stroke-dasharray" not in re.search(r'class="series s1">(.*?)</g>', html).group(1)
     assert ">lead approx.</text>" in html
@@ -203,3 +206,32 @@ def test_multiples_heading_links_only_when_routed_and_outside_svg(
     monkeypatch.setattr(routes, "ROUTES", frozenset({"/now"}))
     html = small_multiples(_panels(), LineSpec("m"), UTC)
     assert '<span class="panel-key">o/big</span>' in html
+
+
+def test_all_approx_series_keep_distinct_dash_patterns() -> None:
+    html = line_chart(
+        tuple(Series(f"s{i}", pts(i, i + 1), approx=True) for i in range(3)),
+        LineSpec("approx trio"),
+        UTC,
+    )
+    dashes = re.findall(r'class="series s\d approx"><path [^>]*stroke-dasharray="([^"]+)"', html)
+    assert len(dashes) == 3 and len(set(dashes)) == 3
+
+
+def test_coverage_labels_follow_all_shading_and_collapse_past_three() -> None:
+    covs = tuple(Coverage(f"repo{i}", day(1) + timedelta(hours=i)) for i in range(5))
+    html = line_chart((Series("x", pts(1, 2, 3, 4)),), LineSpec("cov", coverage=covs), UTC)
+    group = re.search(r'<g class="coverage">(.*?)</g>', html).group(1)
+    assert group.rfind("<rect") < group.find("<text")  # no shading paints over a label
+    notes = re.findall(r'<text class="note"[^>]*>([^<]*)</text>', group)
+    assert len(notes) == 1 and notes[0].startswith("5 sources start")
+
+
+def test_week_window_with_three_ticks_gets_more_than_one_tick() -> None:
+    assert len(time_ticks(day(0), day(7), UTC, max_ticks=3)) >= 2
+
+
+def test_fit_truncates_with_ellipsis_and_keeps_short_text() -> None:
+    assert fit("short", 200) == "short"
+    cut = fit("a very long series name indeed", 70)
+    assert cut.endswith("…") and len(cut) < 15

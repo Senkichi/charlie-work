@@ -62,7 +62,7 @@ class TimeTick:
 
 _HOUR = 3600
 _STEPS = (_HOUR, 2 * _HOUR, 3 * _HOUR, 6 * _HOUR, 12 * _HOUR) + tuple(
-    d * 86400 for d in (1, 2, 7, 14, 30)
+    d * 86400 for d in (1, 2, 3, 4, 7, 14, 30)
 )
 
 

@@ -17,11 +17,13 @@ from datetime import datetime, timedelta, tzinfo
 from .model import LineSpec, Point, Series
 from .scale import Linear, nice_ticks, time_ticks
 from .svg import (
-    APPROX_DASH,
+    APPROX_DASHES,
+    CHAR_PX,
     SERIES_DASH,
     caption,
     dash_attr,
     empty_figure,
+    fit,
     local_label,
     num,
     svg_open,
@@ -136,20 +138,42 @@ def _axes(f: Frame, unit: str, tz: tzinfo | None, max_x_ticks: int) -> str:
     return "".join(out)
 
 
+_MAX_START_LABELS = 3  # more source starts than this share one label (details in caption)
+
+
 def _context(f: Frame, spec: LineSpec, tz: tzinfo | None) -> str:
-    """Coverage shading + source-start labels, then annotation markers."""
-    out: list[str] = []
-    for i, cov in enumerate(sorted(spec.coverage, key=lambda c: c.start)):
-        if not f.t0 < cov.start <= f.t1:
-            continue
+    """Coverage shading + source-start labels, then annotation markers.
+
+    Shading and rules are drawn before any label, so a later source's shading can never
+    paint over an earlier source's label; a label that would run past the plot flips to
+    the left of its rule.
+    """
+    starts = [c for c in sorted(spec.coverage, key=lambda c: c.start) if f.t0 < c.start <= f.t1]
+    shades: list[str] = []
+    labels: list[str] = []
+    for cov in starts:
         x = f.x(cov.start)
-        label = f"{cov.source} from {local_label(cov.start, tz)[:10]}"
-        out.append(
-            f'<g class="coverage"><rect class="uncovered" x="{num(f.left)}" '
-            f'y="{num(f.top)}" width="{num(x - f.left)}" height="{num(f.bottom - f.top)}"/>'
+        shades.append(
+            f'<rect class="uncovered" x="{num(f.left)}" y="{num(f.top)}" '
+            f'width="{num(x - f.left)}" height="{num(f.bottom - f.top)}"/>'
             f'<line class="cov-start" x1="{num(x)}" x2="{num(x)}" y1="{num(f.top)}" '
-            f'y2="{num(f.bottom)}"/>{text(x + 3, f.top + 11 + 13 * i, label, "note")}</g>'
+            f'y2="{num(f.bottom)}"/>'
         )
+    named = [
+        (c.start, f"{c.source} from {local_label(c.start, tz)[:10]}")
+        for c in starts[:_MAX_START_LABELS]
+    ]
+    if len(starts) > _MAX_START_LABELS:
+        first, last = local_label(starts[0].start, tz)[:10], local_label(starts[-1].start, tz)[:10]
+        span = first if first == last else f"{first}–{last}"
+        named = [(starts[-1].start, f"{len(starts)} sources start {span}")]
+    for i, (at, label) in enumerate(named):
+        x = f.x(at)
+        room_right = f.right - x - 3
+        anchor, tx = ("start", x + 3) if len(label) * CHAR_PX <= room_right else ("end", x - 3)
+        room = room_right if anchor == "start" else x - 3 - f.left
+        labels.append(text(tx, f.top + 11 + 13 * i, fit(label, room), "note", anchor, label))
+    out = [f'<g class="coverage">{"".join(shades)}{"".join(labels)}</g>'] if starts else []
     for m in spec.markers:
         if not f.t0 <= m.at <= f.t1:
             continue
@@ -167,7 +191,7 @@ def _series(f: Frame, series: tuple[Series, ...], spec: LineSpec, labels: bool) 
     ends: list[tuple[float, int]] = []
     for idx, s in enumerate(series):
         cls = f"series s{idx % 3 + 1}" + (" approx" if s.approx else "")
-        dash = APPROX_DASH if s.approx else SERIES_DASH[idx % len(SERIES_DASH)]
+        dash = (APPROX_DASHES if s.approx else SERIES_DASH)[idx % len(SERIES_DASH)]
         body: list[str] = []
         inside = tuple(p for p in s.points if f.t0 <= p.at <= f.t1)
         runs = segments(inside, spec.bucket_seconds)
@@ -193,8 +217,14 @@ def _series(f: Frame, series: tuple[Series, ...], spec: LineSpec, labels: bool) 
             s = series[idx]
             name = f"{s.name} approx." if s.approx else s.name
             cls = f"direct s{idx % 3 + 1}" + (" approx" if s.approx else "")
-            out.append(text(f.right + 6, y, name, cls))
+            out.append(text(f.right + 6, y, fit(name, f.width - f.right - 8), cls, full=name))
     return "".join(out)
+
+
+def label_width(series: tuple[Series, ...]) -> float:
+    """Room the direct labels need at the plot's right (callers cap it)."""
+    longest = max((len(s.name) + (8 if s.approx else 0) for s in series), default=0)
+    return 10 + CHAR_PX * longest
 
 
 def plot(
@@ -248,7 +278,7 @@ def line_chart(series: tuple[Series, ...], spec: LineSpec, tz: tzinfo | None = N
     if window is None:
         return empty_figure(spec.title, "no data in this window")
     width, height = spec.size.width, spec.size.height
-    label_room = 8 + 7 * max((len(s.name) + (8 if s.approx else 0) for s in series), default=0)
+    label_room = label_width(series)
     f = Frame(
         width=width,
         height=height,

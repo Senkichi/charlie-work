@@ -16,6 +16,9 @@ from ..timeutil import iso
 # Categorical second channel: series k gets colour class s{k+1} and this dash pattern.
 SERIES_DASH: tuple[str | None, ...] = (None, "9 3", "2 3")
 APPROX_DASH = "4 4"
+# Approximate series keep a per-series pattern too, so an all-approx chart (Flow before
+# lifecycle instrumentation) still separates its series without colour.
+APPROX_DASHES: tuple[str, ...] = (APPROX_DASH, "10 3 2 3", "1.5 3.5")
 UNKNOWN_DASH = "3 3"
 
 
@@ -35,12 +38,25 @@ def dash_attr(pattern: str | None) -> str:
     return f' stroke-dasharray="{pattern}"' if pattern else ""
 
 
-def text(x: float, y: float, body: str, cls: str, anchor: str = "start") -> str:
-    """An SVG ``<text>``; ``body`` is raw and escaped here."""
+def text(
+    x: float, y: float, body: str, cls: str, anchor: str = "start", full: str | None = None
+) -> str:
+    """An SVG ``<text>``; ``body`` is raw and escaped here. ``full`` (the untruncated
+    text) becomes a ``<title>`` hover so a fitted label never loses its meaning."""
+    hover = f"<title>{esc(full)}</title>" if full is not None and full != body else ""
     return (
         f'<text class="{esc(cls)}" x="{num(x)}" y="{num(y)}" text-anchor="{anchor}">'
-        f"{esc(body)}</text>"
+        f"{hover}{esc(body)}</text>"
     )
+
+
+CHAR_PX = 7.2  # 12px semibold sans advance (upper bound): fit labels without layout
+
+
+def fit(body: str, room: float) -> str:
+    """``body`` cut with an ellipsis to fit ``room`` px (labels must never be clipped)."""
+    limit = max(int(room / CHAR_PX), 1)
+    return body if len(body) <= limit else body[: max(limit - 1, 1)].rstrip() + "…"
 
 
 def local_label(moment: datetime, tz: tzinfo | None) -> str:

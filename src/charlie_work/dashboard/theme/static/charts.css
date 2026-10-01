@@ -4,8 +4,9 @@
    .chart-scroll on narrow screens rather than shrinking their text. */
 figure.chart { margin: 0 0 var(--lj-space-5); }
 figure.chart > figcaption { display: flex; flex-direction: column; gap: 2px; margin-bottom: var(--lj-space-2); }
-.takeaway { margin: 0; font-family: var(--lj-serif); font-size: var(--lj-text-4); font-weight: 600; color: var(--lj-ink); }
-.chart-title { font-size: var(--lj-text-3); font-weight: 600; color: var(--lj-ink); }
+/* The takeaway is the headline (read first); the title names the encoding beneath it. */
+.takeaway { margin: 0 0 2px; font-family: var(--lj-serif); font-size: var(--lj-text-5); font-weight: 600; line-height: 1.25; color: var(--lj-ink); }
+.chart-title { font-size: var(--lj-text-3); font-weight: 500; color: var(--lj-gray-text); }
 .chart-window { font-size: var(--lj-text-2); color: var(--lj-gray-text); }
 .chart-scroll { overflow-x: auto; max-width: 100%; }
 .chart-scroll > svg { display: block; }
@@ -33,7 +34,8 @@ svg text.direct.s2 { fill: var(--lj-gray-text); }
 svg text.direct.s3 { fill: var(--lj-series-3); }
 svg text.direct.approx { font-style: italic; }
 
-svg .uncovered { fill: var(--lj-raised); }
+/* Uncovered span: rule tint (raised equals card in light, so it would vanish there). */
+svg .uncovered { fill: var(--lj-rule); fill-opacity: 0.55; }
 svg .cov-start { stroke: var(--lj-gray); stroke-width: 1; }
 svg .marker-rule { stroke: var(--lj-ink); stroke-width: 1; }
 
