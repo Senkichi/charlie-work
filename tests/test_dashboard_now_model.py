@@ -88,6 +88,16 @@ def test_needs_me_exact_rows_and_order(fleet) -> None:
     assert got == [
         ("alarm", "anomaly", "owner/alpha", None, "merge-flow: no merges 6h", None, False),
         (
+            "stale_source",
+            "warn",
+            "owner/beta",
+            3600.0,
+            "snapshot is 3600s old (stale after 2100s)",
+            None,
+            False,
+        ),
+        ("alarm", "warn", "owner/beta", None, "github-rate: rate low", None, False),
+        (
             "human_needed",
             "action",
             "owner/alpha",
@@ -105,16 +115,6 @@ def test_needs_me_exact_rows_and_order(fleet) -> None:
             f"charlie --repo {a} unescalate --issue 4",
             True,
         ),
-        (
-            "stale_source",
-            "warn",
-            "owner/beta",
-            3600.0,
-            "snapshot is 3600s old (stale after 2100s)",
-            None,
-            False,
-        ),
-        ("alarm", "warn", "owner/beta", None, "github-rate: rate low", None, False),
     ]
 
 
@@ -320,3 +320,71 @@ def test_counts_match_fleet_status_aggregation(fleet, monkeypatch) -> None:
     stage = {s.name: s.count for s in model.flow.stages}
     active = ("Queued", "In progress", "PR open", "Reviewing", "Needs rework")
     assert sum(stage[name] for name in active) == sum(d["active_issue_count"] for d in per)
+
+
+def test_needs_me_groups_order_and_group_field(fleet) -> None:
+    findings = [Finding("merge-flow", "owner/alpha", "anomaly", "no merges 6h")]
+    model = now_model.build_now_model(_read(fleet), NOW, findings)
+
+    assert [(i.group, i.kind, i.number) for i in model.needs_me] == [
+        ("Exceptions", "alarm", None),
+        ("Exceptions", "stale_source", None),
+        ("Awaiting your verdict", "human_needed", 5),
+        ("Operator queue", "operator_queue", 4),
+    ]
+    assert [(g.group, g.count, g.oldest_age_seconds) for g in model.needs_me_groups] == [
+        ("Exceptions", 2, 3600.0),
+        ("Awaiting your verdict", 1, 7200.0),
+        ("Human needed", 0, None),
+        ("Operator queue", 1, 3600.0),
+    ]
+
+
+def test_human_needed_without_pr_is_its_own_group_and_ties_break_by_number(fleet) -> None:
+    read = _read(fleet)
+    alpha = read.repos[0]
+    data = {
+        **alpha.snapshot.data,
+        "prs": [],
+        "issues": [_issue(9, L.human_needed), _issue(8, L.human_needed)],
+    }
+    repos = (replace(alpha, snapshot=replace(alpha.snapshot, data=data), escalated_since=()),)
+    items = now_model.build_now_model(replace(read, repos=repos + read.repos[1:]), NOW).needs_me
+
+    assert [(i.group, i.number) for i in items if i.kind == "human_needed"] == [
+        ("Human needed", 8),
+        ("Human needed", 9),
+    ]
+
+
+def test_per_repo_stage_counts_and_need_you(fleet) -> None:
+    model = now_model.build_now_model(_read(fleet), NOW)
+
+    got = {r.repo: ([(s.name, s.count) for s in r.stages], r.need_you) for r in model.repos}
+    assert got == {
+        "owner/alpha": (
+            [
+                ("Dispatchable", 2),
+                ("Queued", 1),
+                ("In progress", 1),
+                ("PR open", 1),
+                ("Reviewing", 0),
+                ("Needs rework", 0),
+            ],
+            2,  # operator_queue #4 + human_needed PR #50
+        ),
+        "owner/beta": (
+            [
+                ("Dispatchable", 0),
+                ("Queued", 0),
+                ("In progress", 0),
+                ("PR open", 0),
+                ("Reviewing", 1),
+                ("Needs rework", 1),
+            ],
+            1,  # stale snapshot
+        ),
+    }
+    # Per-repo counts sum to the fleet stages.
+    for idx, stage in enumerate(model.flow.stages):
+        assert sum(r.stages[idx].count for r in model.repos) == stage.count
