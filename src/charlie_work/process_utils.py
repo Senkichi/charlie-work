@@ -269,7 +269,12 @@ def get_process_start_time(pid: int) -> float | None:
                 with open("/proc/uptime", "r") as f:
                     uptime_seconds = float(f.read().split()[0])
             except (OSError, ValueError, IndexError):
-                uptime_seconds = 0
+                # Indeterminate: substituting 0 would return
+                # ``time.time() + ticks/hz``, a value that drifts with the
+                # wall clock and makes later start-time fingerprints
+                # mismatch a live process (issue #2232).  ``None`` fails
+                # open the way the pre-dedup copies did.
+                return None
             boot_time = time.time() - uptime_seconds
             return boot_time + (starttime_ticks / tick_hz)
         except (OSError, ValueError, IndexError):
