@@ -186,6 +186,26 @@ def _finalize_merged(ev: dict) -> list[Row]:
     return [_milestone(ev, "merged", issue, pr, True)]
 
 
+def _lifecycle_transition(ev: dict) -> list[Row]:
+    """Exact lifecycle path (issue #2226): ``to_state`` becomes the milestone name.
+
+    The payload shape is the one #2226 specifies (``to_state``, issue/PR refs); a row with
+    no usable state yields nothing. ``approx=0`` marks it exact for the metrics layer.
+    """
+    p = ev["payload"]
+    state = p.get("to_state") or p.get("to")
+    if not isinstance(state, str) or not state.strip():
+        return []
+    issue, pr = _refs(ev)
+    name = "_".join(state.strip().lower().split())
+    return [_milestone(ev, name, issue, pr)]
+
+
+def _ready_observed(ev: dict) -> list[Row]:
+    issue, pr = _refs(ev)
+    return [_milestone(ev, "ready_observed", issue, pr)]
+
+
 def _session_exited(ev: dict) -> list[Row]:
     p = ev["payload"]
     row = {
@@ -317,6 +337,8 @@ HANDLERS: dict[str, Callable[[dict], list[Row]]] = {
     "janitor_rework_escalated": _escalated,
     "dispatch_cross_repo_escalated": _escalated,
     "unescalate": _unescalate,
+    "lifecycle_transition": _lifecycle_transition,
+    "ready_observed": _ready_observed,
     "session_exited": _session_exited,
     "review_verdict_missed": _verdict_missed,
     "runner_allocation": _runner_allocation,
