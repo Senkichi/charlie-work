@@ -1,0 +1,5 @@
+2
+# Issue #1264 shrink-only ratchet. Moved verbatim from dead_worker_reap.py (wave B, dws-3-wire):
+# the two raw log_event sites in _open_salvage_pr (pr_closing_ref_rewritten,
+# pr_closing_ref_unlinked). _open_salvage_pr has ~15 callers that pass no write_gate,
+# so converting them is a behaviour change left to the owning #1264 follow-up.

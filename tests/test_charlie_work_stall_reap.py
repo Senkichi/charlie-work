@@ -344,7 +344,10 @@ def test_stall_reap_classifies_rate_limit_before_stalled_fallback(tmp_path: Path
     with (
         patch("charlie_work.worker_fate.is_alive", return_value=True),
         patch("charlie_work.write_gate.kill_process_tree", return_value=[99999]),
-        patch("charlie_work.dead_worker_reap.sweep_orphan_processes", return_value=[]),
+        patch(
+            "charlie_work.dead_worker_sweep.effects_sessions.sweep_orphan_processes",
+            return_value=[],
+        ),
     ):
         from charlie_work.workflow import _detect_and_handle_stalled_sessions
 
@@ -432,7 +435,10 @@ def test_stall_reap_classifies_quota_exhausted_before_stalled_fallback(tmp_path:
     with (
         patch("charlie_work.worker_fate.is_alive", return_value=True),
         patch("charlie_work.write_gate.kill_process_tree", return_value=[99999]),
-        patch("charlie_work.dead_worker_reap.sweep_orphan_processes", return_value=[]),
+        patch(
+            "charlie_work.dead_worker_sweep.effects_sessions.sweep_orphan_processes",
+            return_value=[],
+        ),
     ):
         from charlie_work.workflow import _detect_and_handle_stalled_sessions
 
@@ -487,7 +493,10 @@ def test_stall_reap_falls_back_to_stalled_when_no_throttle_signature(tmp_path: P
     with (
         patch("charlie_work.worker_fate.is_alive", return_value=True),
         patch("charlie_work.write_gate.kill_process_tree", return_value=[99999]),
-        patch("charlie_work.dead_worker_reap.sweep_orphan_processes", return_value=[]),
+        patch(
+            "charlie_work.dead_worker_sweep.effects_sessions.sweep_orphan_processes",
+            return_value=[],
+        ),
     ):
         from charlie_work.workflow import _detect_and_handle_stalled_sessions
 
@@ -562,7 +571,10 @@ def test_stall_lane_api_budget_kill_over_cap(tmp_path: Path) -> None:
             "charlie_work.write_gate.kill_process_tree",
             side_effect=lambda pid, *_a, **_kw: killed_pids.extend([pid]) or [pid],
         ),
-        patch("charlie_work.dead_worker_reap.sweep_orphan_processes", return_value=[]),
+        patch(
+            "charlie_work.dead_worker_sweep.effects_sessions.sweep_orphan_processes",
+            return_value=[],
+        ),
     ):
         from charlie_work.workflow import _detect_and_handle_stalled_sessions
 
@@ -632,7 +644,10 @@ def test_stall_lane_api_provider_auth_classification(tmp_path: Path) -> None:
     with (
         patch("charlie_work.worker_fate.is_alive", return_value=True),
         patch("charlie_work.write_gate.kill_process_tree", return_value=[99998]),
-        patch("charlie_work.dead_worker_reap.sweep_orphan_processes", return_value=[]),
+        patch(
+            "charlie_work.dead_worker_sweep.effects_sessions.sweep_orphan_processes",
+            return_value=[],
+        ),
     ):
         from charlie_work.workflow import _detect_and_handle_stalled_sessions
 

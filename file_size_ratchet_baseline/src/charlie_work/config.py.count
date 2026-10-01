@@ -1,4 +1,4 @@
-4400
+2800
 # Issue #1934: +25 lines for SupervisorConfig.fleet_lane_concurrency and
 # SupervisorConfig.reap_sweep_interval_seconds (fields + _SUPERVISOR_INT_KEYS
 # validation entries). Dataclass fields cannot be extracted into a domain

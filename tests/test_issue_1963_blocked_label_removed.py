@@ -65,7 +65,7 @@ def test_blocked_edge_still_routes_to_human_needed() -> None:
 
 def test_labels_section_tolerates_stale_blocked_key(tmp_path: Path) -> None:
     """A live config that still carries ``labels: {blocked: ...}`` must not
-    trip ``_build_section``'s unknown-key ``ConfigError`` -- that would brick
+    trip ``validate_section``'s unknown-key ``ConfigError`` -- that would brick
     the repo on self-deploy. The dead override is silently ignored while
     sibling keys still parse."""
     config_file = tmp_path / "orchestrator.config.yaml"

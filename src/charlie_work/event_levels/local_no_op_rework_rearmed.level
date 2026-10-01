@@ -1,0 +1,2 @@
+warning
+# No-remote rework worker exited without committing: re-armed to rework_requested (or escalated at the no-op cap), issue #2094
