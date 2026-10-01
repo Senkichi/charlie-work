@@ -32,10 +32,10 @@ from typing import Any
 
 from . import layout
 from .fleet_paths import warn_fleet_dir_virtualization_on_write
-from .instrumentation import log_event
 from .process_utils import is_pid_alive
 from .supervisor_lifecycle import read_supervisor_heartbeat, supervisor_heartbeat_path
 from .workflow import CommandResult
+from .write_gate import WriteGate
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +50,18 @@ PAUSE_CONSEQUENCE = (
     "runner allocation is driven by the same supervisor pass, so CI capacity "
     "stays frozen at the last converged parked floor until `charlie fleet resume`"
 )
+
+
+def _fleet_write_gate(fleet_dir_override: str | None) -> WriteGate:
+    """Live (non-dry-run) gate for fleet-level audit events.
+
+    Dry-run callers return before reaching a write, so the gate is always live.
+    """
+    return WriteGate(
+        dry_run=False,
+        state_path=supervisor_heartbeat_path(fleet_dir_override),
+        repo="fleet",
+    )
 
 
 def write_fleet_pause(fleet_dir_override: str | None, *, reason: str | None = None) -> Path:
@@ -71,12 +83,8 @@ def write_fleet_pause(fleet_dir_override: str | None, *, reason: str | None = No
     tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     tmp.replace(path)
     try:
-        log_event(
-            supervisor_heartbeat_path(fleet_dir_override),
-            FLEET_PAUSED,
-            {"flag": str(path), "reason": reason},
-            repo="fleet",
-        )
+        write_gate = _fleet_write_gate(fleet_dir_override)
+        write_gate.log_event(kind=FLEET_PAUSED, payload={"flag": str(path), "reason": reason})
     except Exception:  # noqa: BLE001 - audit must not mask the recorded write
         logger.warning("could not record %s event", FLEET_PAUSED, exc_info=True)
     return path
@@ -210,13 +218,12 @@ def run_fleet_resume(args: argparse.Namespace) -> CommandResult:
     removed = clear_fleet_pause(args.fleet_dir)
     if removed:
         try:
-            log_event(
+            write_gate = _fleet_write_gate(args.fleet_dir)
+            write_gate.log_event(
                 # event-consumer: audit-only -- operator resume record; the flag's absence
                 # (and ``fleet status``) is the live signal, this row is the audit trail
-                supervisor_heartbeat_path(args.fleet_dir),
-                FLEET_RESUMED,
-                {"flag": str(flag_path)},
-                repo="fleet",
+                kind=FLEET_RESUMED,
+                payload={"flag": str(flag_path)},
             )
         except Exception:  # noqa: BLE001 - audit must not mask the removal
             logger.warning("could not record %s event", FLEET_RESUMED, exc_info=True)
