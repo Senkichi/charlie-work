@@ -222,7 +222,7 @@ def guarded_update(ctx: SweepContext, req: GuardedUpdate) -> bool:
     Returns whether the merge was written: ``False`` means a concurrent writer
     changed the issue's status or the PR's reviewed head first, and the flow
     must not record anything that presumes the write (ADR-0001: merge, never
-    replace the entry)."""
+    replace the entry). ``req.event`` is appended in this same lock window."""
     with ctx.ports.state_lock(ctx.state_file):
         state = ctx.ports.load_state(ctx.state_file)
         entry = (state.get("issues") or {}).get(str(req.issue))
@@ -240,6 +240,17 @@ def guarded_update(ctx: SweepContext, req: GuardedUpdate) -> bool:
             stamp = ctx.ports.utc_now()
             for key in req.stamp_fields:
                 entry[key] = stamp
+        if req.event is not None:
+            kind, payload = req.event
+            # An append_event failure propagates before save_state: status and
+            # event are both absent, never status without its audit row (#2113).
+            state = ctx.write_gate.append_event(
+                state,
+                # event-consumer: audit-only -- pass-through of the kind ``decide*`` chose
+                kind,
+                dict(payload),
+                ctx.config.runtime.event_ring_size,
+            )
         ctx.write_gate.save_state(state)
     return True
 

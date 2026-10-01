@@ -6,11 +6,16 @@ and ``require_pr_reviewed_head`` against a fresh load under a short lock, so a
 concurrent transition that landed while ``review()`` ran still wins -- and the
 answer comes back to the flow. The event, the recovery (and so the label edge)
 and the no-op route are recorded only for a write that committed, which is what
-the original's single in-lock check/flip/event guaranteed. When the first
+the original's single in-lock check/flip/event guaranteed. The disposition's audit
+event rides on the ``GuardedUpdate`` itself (``event=``), so the shell appends it in
+the write's own lock window; a standalone ``Emit`` is only the fallback for a
+disposition that committed no write. When the first
 disposition is refused the chain falls through to the next, as its ``elif`` did.
 """
 
 from __future__ import annotations
+
+from typing import Any
 
 from .decide_common import Flow, emit
 from .model import (
@@ -57,9 +62,21 @@ def _route_flow(
     dispatched = result.entry_status == "dispatched"
     unchanged = result.pr_reviewed_head_sha == route.reviewed_head_sha
     blocked_route = result.routed_to_rework or result.closed_unmerged_converged
-    routed = False
-    rework_requested = False
+    committed = False  # a GuardedUpdate wrote status AND its audit event together
     taken = False
+
+    def review_payload(routed: bool) -> tuple[tuple[str, Any], ...]:
+        payload = {
+            "issue_number": number,
+            "pr_number": route.pr_number,
+            "review_ok": result.ok,
+            "routed": routed,
+            "live_head_sha": route.live_head_sha,
+            "reviewed_head_sha": route.reviewed_head_sha,
+            "reason": route.reason,
+        }
+        return tuple(payload.items())
+
     if (
         result.ok
         and not blocked_route
@@ -67,11 +84,12 @@ def _route_flow(
         and unchanged
         and dispatched
     ):
-        routed = taken = yield GuardedUpdate(
+        committed = taken = yield GuardedUpdate(
             number,
             (("status", "reviewing"),),
             require_status="dispatched",
             require_pr_reviewed_head=route.reviewed_head_sha,
+            event=("orphaned_worker_routed_to_review", review_payload(True)),
         )
     if (
         not taken
@@ -81,21 +99,32 @@ def _route_flow(
         and route.reason == "dead_worker_completed_outcome"
         and dispatched
     ):
-        rework_requested = taken = yield GuardedUpdate(
+        recovered_payload = {
+            "issue_number": number,
+            "pr_number": route.pr_number,
+            "previous_status": "dispatched",
+            "new_status": "rework_requested",
+            "reason": route.reason,
+        }
+        committed = taken = yield GuardedUpdate(
             number,
             (("status", "rework_requested"), ("dispatched_at", None), ("orphan_drift_at", None)),
             require_status="dispatched",
             require_pr_reviewed_head=route.reviewed_head_sha,
+            event=("orphaned_worker_recovered", tuple(recovered_payload.items())),
         )
-        if rework_requested:
+        if taken:
             recovered.append(number)
+            return
     if not taken and not result.ok and not result.routed_to_rework and dispatched:
         drifted = yield GuardedUpdate(
             number,
             (("orphan_drift_fingerprint", route.fingerprint),),
             stamp_fields=("orphan_drift_at",),  # anchored when written, after review() returned
             require_status="dispatched",
+            event=("orphaned_worker_drift", review_payload(False)),  # reached only when not ok
         )
+        committed = drifted
         if drifted and route.reason == "dead_worker_with_head_change" and result.is_no_op_rework:
             no_op.append(
                 NoOpRoute(
@@ -106,32 +135,15 @@ def _route_flow(
                     branch=result.entry_branch,
                 )
             )
-
-    if rework_requested:
-        yield emit(
-            "orphaned_worker_recovered",
-            {
-                "issue_number": number,
-                "pr_number": route.pr_number,
-                "previous_status": "dispatched",
-                "new_status": "rework_requested",
-                "reason": route.reason,
-            },
-        )
+    if committed:
         return
+    # No write committed (guards refused, or the result gated every disposition):
+    # the original still recorded the review outcome, so emit it standalone.
     yield emit(
         "orphaned_worker_routed_to_review"
         if result.ok and not result.escalation_deferred_live_worker
         else "orphaned_worker_drift",
-        {
-            "issue_number": number,
-            "pr_number": route.pr_number,
-            "review_ok": result.ok,
-            "routed": routed,
-            "live_head_sha": route.live_head_sha,
-            "reviewed_head_sha": route.reviewed_head_sha,
-            "reason": route.reason,
-        },
+        dict(review_payload(False)),
     )
 
 

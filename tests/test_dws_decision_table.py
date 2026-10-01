@@ -319,7 +319,9 @@ def test_head_changed_routes_to_review_and_flips_status_under_guards() -> None:
     assert dict(update.set_items) == {"status": "reviewing"}
     assert update.require_status == "dispatched"
     assert update.require_pr_reviewed_head == "old"
-    assert "orphaned_worker_routed_to_review" in post.emitted()
+    assert update.event is not None and update.event[0] == "orphaned_worker_routed_to_review"
+    assert dict(update.event[1])["routed"] is True
+    assert "orphaned_worker_routed_to_review" not in post.emitted()  # rides the write
     assert not lock.commits_of(UpdateIssue) or all(
         u.set_fields.get("status") != "reviewing" for u in lock.commits_of(UpdateIssue)
     )
@@ -346,7 +348,8 @@ def test_failed_review_records_drift_under_a_status_guard() -> None:
     assert update.stamp_fields == ("orphan_drift_at",)  # stamped at write time
     assert update.require_status == "dispatched"
     assert update.require_pr_reviewed_head is None
-    assert "orphaned_worker_drift" in post.emitted()
+    assert update.event is not None and update.event[0] == "orphaned_worker_drift"
+    assert "orphaned_worker_drift" not in post.emitted()  # rides the write
 
 
 def test_issue_that_left_dispatched_during_review_is_left_alone() -> None:

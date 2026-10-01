@@ -62,6 +62,12 @@ def _sweep_kinds() -> tuple[set[str], set[str], list[str]]:
                 kind_node, leveled = node.args[0], _has_level(node)
             elif isinstance(node, ast.keyword) and node.arg == "event_kind":
                 kind_node, leveled = node.value, False
+            elif (  # ``GuardedUpdate(event=(kind, payload))``: the kind rides the write
+                isinstance(node, ast.keyword)
+                and node.arg == "event"
+                and isinstance(node.value, ast.Tuple)
+            ):
+                kind_node, leveled = node.value.elts[0], False
             else:
                 continue
             if path.name == "decide_common.py" and isinstance(kind_node, ast.Name):
