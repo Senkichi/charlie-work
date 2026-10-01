@@ -20,7 +20,7 @@ from _fake_transport import (
     rest_sent,
     sent,
 )
-from charlie_work.github_transport import GraphQLRequest
+from charlie_work.github_transport import GraphQLError, GraphQLRequest, Response
 from ci_fleet.github import GitHubError
 from charlie_work.config_validation import ConfigError
 
@@ -230,6 +230,23 @@ def test_merge_pr_an_unreadable_state_raises_and_sends_no_merge(tmp_path: Path) 
     gh, http, _ = make_github(
         tmp_path, http=FakeAdapter("http", [graphql_failure("Could not resolve")])
     )
+
+    with pytest.raises(GitHubError):
+        gh.merge_pr(7, "squash")
+
+    assert rest_sent(http) == []
+
+
+def test_merge_pr_a_partial_read_with_errors_fails_closed(tmp_path: Path) -> None:
+    """GraphQL partial data (a node plus ``errors``) is not a clean CLEAN read."""
+    partial = Response(
+        200,
+        (),
+        '{"data": {"repository": {"pullRequest": {"mergeStateStatus": null}}}}',
+        "http",
+        graphql_errors=(GraphQLError("resolver blew up", "INTERNAL"),),
+    )
+    gh, http, _ = make_github(tmp_path, http=FakeAdapter("http", [partial]))
 
     with pytest.raises(GitHubError):
         gh.merge_pr(7, "squash")

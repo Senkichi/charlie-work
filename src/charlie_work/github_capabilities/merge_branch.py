@@ -203,7 +203,7 @@ class MergeBranch(CapabilityCollaborator):
         )
         body, error = send_graphql(self, request)
         node = _dig(body, "data", "repository", "pullRequest")
-        if error is not None and node is None:
+        if error is not None:
             raise GitHubError(f"gh pr merge {number} failed: {error}")
         status = str(node.get("mergeStateStatus") or "").upper() if isinstance(node, dict) else ""
         reason = _REFUSAL_REASONS.get(status)

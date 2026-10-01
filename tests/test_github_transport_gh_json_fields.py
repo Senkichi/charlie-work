@@ -14,6 +14,7 @@ from typing import Any
 
 import pytest
 from _fake_transport import FakeAdapter, build_guard, ok
+from charlie_work.checks import summarize_checks
 from charlie_work.github_capabilities import checks, issues, pull_requests, transport
 from charlie_work.github_transport import GraphQLError, Response
 from charlie_work.github_transport import gh_json_fields as g
@@ -171,6 +172,56 @@ def test_checks_keep_the_newest_entry_per_name() -> None:
     ]  # fmt: skip
 
     assert g.normalize_checks(contexts, "name,bucket") == [{"name": "Tests", "bucket": "pass"}]
+
+
+def _run(name: str, workflow: str, event: str, conclusion: str, started: str) -> dict[str, Any]:
+    return {
+        "__typename": "CheckRun",
+        "name": name,
+        "status": "COMPLETED",
+        "conclusion": conclusion,
+        "startedAt": started,
+        "checkSuite": {"workflowRun": {"event": event, "workflow": {"name": workflow}}},
+    }
+
+
+def test_same_named_runs_of_different_workflows_both_survive() -> None:
+    """A newer passing run must not hide an older failing run of another workflow."""
+    contexts = [
+        _run("test", "CI", "pull_request", "FAILURE", "2026-09-30T10:00:00Z"),
+        _run("test", "CI", "push", "SUCCESS", "2026-09-30T10:00:05Z"),
+        _run("test", "Nightly", "pull_request", "SUCCESS", "2026-09-30T10:00:09Z"),
+    ]
+
+    rows = g.normalize_checks(contexts, "name,workflow,event,bucket")
+
+    assert sorted((r["workflow"], r["event"], r["bucket"]) for r in rows) == [
+        ("CI", "pull_request", "fail"),
+        ("CI", "push", "pass"),
+        ("Nightly", "pull_request", "pass"),
+    ]
+    assert summarize_checks(rows, ("test",)).failed == ("test",)
+
+
+def test_status_context_and_check_run_of_one_name_do_not_collide() -> None:
+    contexts = [
+        {"__typename": "StatusContext", "context": "build", "state": "FAILURE",
+         "createdAt": "2026-09-30T09:00:00Z"},
+        _run("build", "CI", "push", "SUCCESS", "2026-09-30T10:00:00Z"),
+    ]  # fmt: skip
+
+    rows = g.normalize_checks(contexts, "name,bucket")
+
+    assert sorted(r["bucket"] for r in rows) == ["fail", "pass"]
+
+
+def test_a_rerun_of_the_same_workflow_and_event_still_dedupes_to_the_newest() -> None:
+    contexts = [
+        _run("test", "CI", "push", "FAILURE", "2026-09-30T10:00:00Z"),
+        _run("test", "CI", "push", "SUCCESS", "2026-09-30T10:05:00Z"),
+    ]
+
+    assert g.normalize_checks(contexts, "name,bucket") == [{"name": "test", "bucket": "pass"}]
 
 
 def test_status_context_is_a_check_named_by_its_context() -> None:

@@ -412,9 +412,12 @@ _CHECK_FIELDS = (
 def normalize_checks(contexts: Iterable[Any], fields: str | Iterable[str]) -> list[dict[str, Any]]:
     """Rollup contexts -> ``gh pr checks --json fields``.
 
-    gh sorts newest-first by start time and keeps one entry per check name (or
-    status context), then derives ``state`` (a CheckRun's conclusion once it is
-    COMPLETED, else its status) and ``bucket`` from it.
+    gh sorts newest-first by start time and keeps one entry per check run
+    (keyed by name, workflow and triggering event) or per status context
+    (keyed by its context, in a separate namespace), then derives ``state`` (a
+    CheckRun's conclusion once it is COMPLETED, else its status) and ``bucket``
+    from it.  Keying on the bare name would hide a failing run of one workflow
+    behind a newer passing run of another.
     """
     names = field_names(fields)
     unknown = [name for name in names if name not in _CHECK_FIELDS]
@@ -422,12 +425,12 @@ def normalize_checks(contexts: Iterable[Any], fields: str | Iterable[str]) -> li
         raise UnknownFieldError(f"unknown --json field(s) for checks: {', '.join(unknown)}")
     entries = [_check_entry(c) for c in contexts if isinstance(c, dict)]
     entries.sort(key=lambda e: e["startedAt"], reverse=True)
-    seen: set[str] = set()
+    seen: set[tuple[str, ...]] = set()
     unique: list[dict[str, Any]] = []
     for entry in entries:
-        if entry["name"] in seen:
+        if entry["_key"] in seen:
             continue
-        seen.add(entry["name"])
+        seen.add(entry["_key"])
         unique.append(entry)
     return [{name: entry[name] for name in names} for entry in unique]
 
@@ -435,8 +438,10 @@ def normalize_checks(contexts: Iterable[Any], fields: str | Iterable[str]) -> li
 def _check_entry(context: dict[str, Any]) -> dict[str, Any]:
     if context.get("__typename") == "StatusContext":
         state = str(context.get("state") or "")
+        name = context.get("context") or ""
         return {
-            "name": context.get("context") or "",
+            "_key": ("status", name),
+            "name": name,
             "state": state,
             "bucket": bucket_for(state),
             "link": context.get("targetUrl") or "",
@@ -450,16 +455,20 @@ def _check_entry(context: dict[str, Any]) -> dict[str, Any]:
     conclusion = str(context.get("conclusion") or "")
     state = conclusion if status == "COMPLETED" else status
     run = ((context.get("checkSuite") or {}).get("workflowRun")) or {}
+    name = context.get("name") or ""
+    event = run.get("event") or ""
+    workflow = ((run.get("workflow") or {}).get("name")) or ""
     return {
-        "name": context.get("name") or "",
+        "_key": ("run", name, workflow, event),
+        "name": name,
         "state": state,
         "bucket": bucket_for(state),
         "link": context.get("detailsUrl") or "",
         "startedAt": context.get("startedAt") or _ZERO_TIME,
         "completedAt": context.get("completedAt") or _ZERO_TIME,
         "description": "",
-        "event": run.get("event") or "",
-        "workflow": ((run.get("workflow") or {}).get("name")) or "",
+        "event": event,
+        "workflow": workflow,
     }
 
 
