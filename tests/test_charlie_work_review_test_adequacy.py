@@ -21,7 +21,7 @@ def test_review_test_adequacy_disabled_is_noop(tmp_path: Path, monkeypatch) -> N
     app = _test_adequacy_app(tmp_path, enabled=False)
     calls = {"n": 0}
 
-    def _fake_check(diff, pr, config):
+    def _fake_check(diff, pr, config, commit_messages=()):
         calls["n"] += 1
         raise AssertionError("check_test_adequacy should not be called when disabled")
 
@@ -59,7 +59,7 @@ def test_review_test_adequacy_hard_fail_records_request_changes(
         ),
     )
 
-    def _fake_check(diff, pr, config):
+    def _fake_check(diff, pr, config, commit_messages=()):
         calls["check_test_adequacy"] += 1
         return hard_fail_verdict
 
@@ -121,7 +121,7 @@ def test_review_test_adequacy_hard_fail_label_set(tmp_path: Path, monkeypatch) -
         ),
     )
 
-    def _fake_check(diff, pr, config):
+    def _fake_check(diff, pr, config, commit_messages=()):
         return hard_fail_verdict
 
     def _fake_record_review(pr_number, decision, **kwargs):
@@ -177,7 +177,7 @@ def test_review_test_adequacy_unchanged_head_not_rerecorded(tmp_path: Path, monk
         ),
     )
 
-    def _fake_check(diff, pr, config):
+    def _fake_check(diff, pr, config, commit_messages=()):
         check_calls["n"] += 1
         return hard_fail_verdict
 
@@ -265,7 +265,7 @@ def test_review_test_adequacy_escalates_at_max_rework_cycles(tmp_path: Path, mon
         ),
     )
 
-    def _fake_check(diff, pr, config):
+    def _fake_check(diff, pr, config, commit_messages=()):
         check_calls["n"] += 1
         return hard_fail_verdict
 
@@ -339,7 +339,7 @@ def test_review_test_adequacy_pass_proceeds_to_packet(tmp_path: Path, monkeypatc
         ),
     )
 
-    def _fake_check(diff, pr, config):
+    def _fake_check(diff, pr, config, commit_messages=()):
         check_calls["n"] += 1
         return pass_verdict
 

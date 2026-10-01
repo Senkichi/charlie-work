@@ -1297,8 +1297,30 @@ def iter_diff_files(diff: str) -> Iterator[tuple[str, bool, list[str]]]:
             yield current_file, is_new_file, current_hunks
 
 
+def exempt_reason_from_commit_trailers(messages: Sequence[str], marker: str) -> str:
+    """Return the first non-empty ``<marker> <reason>`` trailer reason, or ``""``.
+
+    A trailer is a line in the *last* paragraph of a commit message, and that
+    paragraph must not be the subject (git's own trailer rule), so a message
+    that merely quotes the marker in body prose does not count.
+    """
+    trailer_re = re.compile(rf"^{re.escape(marker)}\s*(?P<reason>.+)$")
+    for message in messages:
+        paragraphs = re.split(r"\n\s*\n", message.replace("\r\n", "\n").strip())
+        if len(paragraphs) < 2:
+            continue
+        for line in paragraphs[-1].splitlines():
+            match = trailer_re.match(line.strip())
+            if match and match.group("reason").strip():
+                return match.group("reason").strip()
+    return ""
+
+
 def check_test_adequacy(
-    diff: str, pr: dict[str, Any], config: TestAdequacyConfig
+    diff: str,
+    pr: dict[str, Any],
+    config: TestAdequacyConfig,
+    commit_messages: Sequence[str] = (),
 ) -> TestAdequacyVerdict:
     """Check test adequacy of a PR diff.
 
@@ -1394,6 +1416,15 @@ def check_test_adequacy(
             if reason:  # Non-empty reason required
                 exempt = True
                 exempt_reason = reason
+        if not exempt:
+            # Workers have no GitHub token and cannot edit the PR body; a
+            # commit trailer is the channel they do have (issue #2220).
+            trailer_reason = exempt_reason_from_commit_trailers(
+                commit_messages, config.exempt_marker
+            )
+            if trailer_reason:
+                exempt = True
+                exempt_reason = trailer_reason
 
         facts = TestAdequacyFacts(
             added_product_loc=added_product_loc,
@@ -1417,7 +1448,8 @@ def check_test_adequacy(
             failures.append(
                 f"Product code changed ({added_product_loc} LOC added) but no test files changed. "
                 f"Untested product files: {', '.join(untested_product_files)}. "
-                f"Add tests or use '{config.exempt_marker} <reason>' in the PR body to exempt."
+                f"Add tests or add a '{config.exempt_marker} <reason>' trailer to a commit "
+                f"(an empty commit is fine) or to the PR body to exempt."
             )
             return TestAdequacyVerdict(
                 ok=False, failures=tuple(failures), warnings=(), facts=facts
