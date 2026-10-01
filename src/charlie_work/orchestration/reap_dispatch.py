@@ -606,6 +606,18 @@ def _probe_ci_absence(
     pr_state = pr_state or {}
     raw_attempts = pr_state.get("stale_checks_retrigger_attempts")
     attempts = raw_attempts if isinstance(raw_attempts, int) else 0
+    # ``workflow_no_jobs`` is terminal for a head: the persisted marker is the
+    # classification, so a later same-head pass must not fall back to the
+    # (stale) ``ci_run_never_created_head`` marker, which would re-blind the
+    # detector and drop the PR into the retrigger lane. Still gated on the
+    # live "required check missing" signal and the current head matching.
+    cached_no_jobs_head = pr_state.get("workflow_no_jobs_head")
+    if (
+        cached_no_jobs_head
+        and verdict.missing_required_checks
+        and str(pr.get("headRefOid") or "") == cached_no_jobs_head
+    ):
+        return None, cached_no_jobs_head, attempts
     absence = self._detect_ci_absence(
         pr,
         verdict,

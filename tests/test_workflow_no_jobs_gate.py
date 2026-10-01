@@ -92,6 +92,40 @@ def test_never_created_then_no_jobs_on_same_head_routes_to_rework(tmp_path: Path
     assert state["prs"]["456"]["workflow_no_jobs_head"] == head
 
 
+def test_no_jobs_head_keeps_routing_to_rework_on_later_same_head_passes(tmp_path: Path) -> None:
+    """never_created -> retrigger attempt -> workflow_no_jobs route -> further
+    same-head passes: the stale ``ci_run_never_created_head`` marker must not
+    re-blind the detector and drop the PR into the retrigger lane."""
+    app = _app_with_conflict_and_missing_checks(tmp_path, runs=[])
+    app.review(456)
+    state = load_state(app.paths.state_file)
+    head = app.gh.prs[0]["headRefOid"]
+    assert state["prs"]["456"]["ci_run_never_created_head"] == head
+
+    app.gh._runs = [_REJECTED_RUN]
+    state["prs"]["456"]["stale_checks_retrigger_attempts"] = 1
+    save_state(app.paths.state_file, state)
+    app.review(456)
+    assert load_state(app.paths.state_file)["issues"]["123"]["status"] == "rework_requested"
+
+    # Rework pushed nothing new: issue is re-dispatched on the same head, then
+    # reviewed again with the attempt counter unchanged (and then changed).
+    for attempts in (1, 2):
+        state = load_state(app.paths.state_file)
+        state["issues"]["123"]["status"] = "dispatched"
+        state["prs"]["456"]["stale_checks_retrigger_attempts"] = attempts
+        save_state(app.paths.state_file, state)
+        closes_before = len(app.gh.pr_close_calls)
+
+        app.review(456)
+
+        state = load_state(app.paths.state_file)
+        assert state["issues"]["123"]["status"] == "rework_requested"
+        assert state["prs"]["456"]["status"] != "janitor_blocked"
+        assert len(app.gh.pr_close_calls) == closes_before
+    assert len(_events(state, "workflow_no_jobs")) == 1
+
+
 def test_known_never_created_head_not_requeried_within_same_attempt(tmp_path: Path) -> None:
     """The re-probe is bounded: no extra Actions query while the retrigger
     attempt counter is unchanged since the last probe."""
