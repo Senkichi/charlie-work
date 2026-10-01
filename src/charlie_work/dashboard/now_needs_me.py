@@ -7,14 +7,23 @@ Commands use only subcommands that exist in ``cli.py`` (``verdict``, ``unescalat
 
 from __future__ import annotations
 
-import shlex
 from collections.abc import Sequence
+from dataclasses import replace
 from datetime import datetime
 from typing import Any
 
 from . import now_cadence
-from .now_access import as_int, dict_list, label_set, snapshot_data
-from .now_types import FindingLike, NeedsMeItem, RepoFreshness, RepoRead, SourcesRead
+from .now_shell import join_command
+from .now_access import dict_list, label_set, pos_int, snapshot_data
+from .now_types import (
+    NEEDS_ME_GROUPS,
+    FindingLike,
+    GroupSummary,
+    NeedsMeItem,
+    RepoFreshness,
+    RepoRead,
+    SourcesRead,
+)
 from .sources import _parse_utc
 
 _SEVERITY_RANK = {"anomaly": 0, "action": 1, "warn": 2}
@@ -26,7 +35,7 @@ _DECISION_PLACEHOLDER = "<approved|request_changes|blocked>"
 
 def _cli(repo: RepoRead, *args: str) -> str:
     """A copy-paste ``charlie`` command targeting ``repo`` (``--repo`` is a global flag)."""
-    return shlex.join(["charlie", "--repo", repo.repo_root, *args])
+    return join_command(["charlie", "--repo", repo.repo_root, *args])
 
 
 def needs_me_items(
@@ -43,8 +52,9 @@ def needs_me_items(
         data = snapshot_data(repo)
         since = dict(repo.escalated_since)
         pr_by_issue = {
-            as_int(pr.get("issue_number")): as_int(pr.get("number"))
+            n: pr_no
             for pr in dict_list(data, "prs")
+            if (n := pos_int(pr.get("issue_number"))) and (pr_no := pos_int(pr.get("number")))
         }
 
         def age(number: int, _since: dict[int, datetime] = since) -> float | None:
@@ -52,9 +62,24 @@ def needs_me_items(
             return (now - when).total_seconds() if when is not None else None
 
         for issue in dict_list(data, "issues"):
-            number = as_int(issue.get("number"))
+            number = pos_int(issue.get("number"))
             have = label_set(issue)
             title = str(issue.get("title") or "")
+            if number is None:
+                if labels.operator_queue in have or labels.human_needed in have:
+                    # Never coerce to #0: a command aimed at issue 0 looks valid and is wrong.
+                    items.append(
+                        NeedsMeItem(
+                            "alarm",
+                            "warn",
+                            repo.key,
+                            None,
+                            "snapshot has a flagged issue with an unreadable number",
+                            None,
+                            True,
+                        )
+                    )
+                continue
             if labels.operator_queue in have:
                 items.append(
                     NeedsMeItem(
@@ -65,6 +90,7 @@ def needs_me_items(
                         f"Operator queue: #{number} {title}".rstrip(),
                         _cli(repo, "unescalate", "--issue", str(number)),
                         True,
+                        number=number,
                     )
                 )
             elif labels.human_needed in have:
@@ -83,6 +109,7 @@ def needs_me_items(
                             f"{_DECISION_PLACEHOLDER}",
                             True,
                             _cli(repo, "unescalate", "--pr", str(pr)),
+                            number=number,
                         )
                     )
                 else:
@@ -95,6 +122,7 @@ def needs_me_items(
                             f"Human needed: #{number} {title}".rstrip(),
                             _cli(repo, "unescalate", "--issue", str(number)),
                             True,
+                            number=number,
                         )
                     )
     for finding in findings:
@@ -161,19 +189,41 @@ def needs_me_items(
                     False,
                 )
             )
-    # Anomalies first, then operator actions, then warnings; oldest first within a
-    # tier (unknown ages last), key as the deterministic tie-break.
+    # Group (the decision), then anomalies before actions before warnings; oldest first
+    # within a tier (unknown ages last), then repo, issue number, reason as tie-breaks.
     return tuple(
         sorted(
-            items,
+            (replace(i, group=_group(i)) for i in items),
             key=lambda i: (
+                NEEDS_ME_GROUPS.index(i.group),
                 _SEVERITY_RANK[i.severity],
                 -(i.age_seconds if i.age_seconds is not None else -1.0),
                 i.repo,
+                i.number if i.number is not None else 0,
                 i.reason,
             ),
         )
     )
+
+
+def _group(item: NeedsMeItem) -> str:
+    """The decision the operator makes for ``item`` (single point of grouping)."""
+    if item.kind == "operator_queue":
+        return "Operator queue"
+    if item.kind == "human_needed":
+        # A PR parked for a verdict is a different decision than a bare issue.
+        return "Awaiting your verdict" if item.secondary_command else "Human needed"
+    return "Exceptions"
+
+
+def group_summaries(items: Sequence[NeedsMeItem]) -> tuple[GroupSummary, ...]:
+    """One summary per group, in display order; oldest = max known row age."""
+    out: list[GroupSummary] = []
+    for name in NEEDS_ME_GROUPS:
+        rows = [i for i in items if i.group == name]
+        ages = [i.age_seconds for i in rows if i.age_seconds is not None]
+        out.append(GroupSummary(name, len(rows), max(ages) if ages else None))
+    return tuple(out)
 
 
 def _since_age(value: Any, now: datetime) -> float | None:
