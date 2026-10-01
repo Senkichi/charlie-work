@@ -711,8 +711,8 @@ def advisory_file_lock(path: Path):
             # We use a retry loop with timeout for bounded waiting
             import time
 
-            start = time.time()
-            while time.time() - start < _LOCK_TIMEOUT_SECONDS:
+            start = time.monotonic()
+            while time.monotonic() - start < _LOCK_TIMEOUT_SECONDS:
                 try:
                     # Try non-blocking lock first
                     msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
@@ -735,8 +735,8 @@ def advisory_file_lock(path: Path):
             import time
 
             lock_file = lock_path.open("r+b", encoding=None)
-            start = time.time()
-            while time.time() - start < _LOCK_TIMEOUT_SECONDS:
+            start = time.monotonic()
+            while time.monotonic() - start < _LOCK_TIMEOUT_SECONDS:
                 try:
                     fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
                     acquired = True
