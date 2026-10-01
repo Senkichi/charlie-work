@@ -49,6 +49,7 @@ through ``_wf.<name>`` (the module-object form the monkeypatch seams need).
 
 from __future__ import annotations
 
+import os
 from datetime import UTC, datetime
 from typing import Any
 
@@ -56,6 +57,7 @@ import charlie_work.workflow as _wf
 from charlie_work import local_suite_runner
 from charlie_work.local_approval_carry import approval_survives_head_move
 from charlie_work.labels import TransitionOutcome
+from charlie_work.test_slots import ROLE_GATE, arm_env
 from charlie_work.local_gate_infra import (
     LOCAL_SUITE_GATE_MAX_INFRA_RELAUNCHES,  # noqa: F401  (re-export; defined with the classifier)
     SuiteOutcome,
@@ -754,6 +756,8 @@ def _local_gate_launch(
         paths=paths,
         head_sha=gate_head or "",
         base_sha=gate_base,
+        # Issue #2124: the gate draws the reserved slot 0, never an agent slot.
+        env={**os.environ, **arm_env(self.config.test_slots, role=ROLE_GATE)},
     )
     if not launch.ok:
         detail = f"suite runner failed to spawn: {launch.error}"

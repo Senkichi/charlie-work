@@ -319,7 +319,9 @@ def test_head_changed_routes_to_review_and_flips_status_under_guards() -> None:
     assert dict(update.set_items) == {"status": "reviewing"}
     assert update.require_status == "dispatched"
     assert update.require_pr_reviewed_head == "old"
-    assert "orphaned_worker_routed_to_review" in post.emitted()
+    assert update.event is not None and update.event[0] == "orphaned_worker_routed_to_review"
+    assert dict(update.event[1])["routed"] is True
+    assert "orphaned_worker_routed_to_review" not in post.emitted()  # rides the write
     assert not lock.commits_of(UpdateIssue) or all(
         u.set_fields.get("status") != "reviewing" for u in lock.commits_of(UpdateIssue)
     )
@@ -346,7 +348,8 @@ def test_failed_review_records_drift_under_a_status_guard() -> None:
     assert update.stamp_fields == ("orphan_drift_at",)  # stamped at write time
     assert update.require_status == "dispatched"
     assert update.require_pr_reviewed_head is None
-    assert "orphaned_worker_drift" in post.emitted()
+    assert update.event is not None and update.event[0] == "orphaned_worker_drift"
+    assert "orphaned_worker_drift" not in post.emitted()  # rides the write
 
 
 def test_issue_that_left_dispatched_during_review_is_left_alone() -> None:
@@ -544,7 +547,7 @@ def test_the_purity_guard_detects_a_violation() -> None:
 # ------------------------------------------------------------------ shell gates
 
 
-def _shell(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, plans):
+def _shell(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, plans, **port_overrides):
     """Run ``run_orphan_sweep`` with ``decide`` replaced by ``plans(facts, observed)``."""
     from _rework_dispatch_fixtures import _wg
     from charlie_work import state as state_mod
@@ -558,6 +561,7 @@ def _shell(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, plans):
             **{f.name: getattr(real, f.name) for f in dataclasses.fields(SweepPorts)},
             "worker_pid_alive": lambda entry: False,
             "utc_now": lambda: STAMP,
+            **port_overrides,
         }
     )
     monkeypatch.setattr(apply, "decide", plans)
@@ -661,3 +665,48 @@ def test_ports_resolve_workflow_attributes_at_call_time(monkeypatch: pytest.Monk
     ports = ports_from_workflow()
     monkeypatch.setattr(wf, "utc_now", lambda: "patched-after-construction")
     assert ports.utc_now() == "patched-after-construction"
+
+
+def test_lock_abort_after_a_network_effect_still_saves_the_committed_prefix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from charlie_work import state as state_mod
+    from charlie_work.dead_worker_sweep.model import FetchOpenPrs, SweepPlan, UpdateIssue
+
+    opened = OpenPrForBranch(7, BRANCH, "pushed_orphan")
+    second = OpenPrForBranch(7, BRANCH, "live_handoff")
+    commit = UpdateIssue(7, {"status": "pr_open", "pr_number": 71})
+
+    def plans(facts, observed):
+        if facts.phase == "pre":
+            return (
+                SweepPlan((), ())
+                if FetchOpenPrs() in observed
+                else SweepPlan((FetchOpenPrs(),), ())
+            )
+        if opened not in observed:
+            return SweepPlan((opened,), ())
+        if second not in observed:
+            return SweepPlan((second,), (commit,))
+        return SweepPlan((), ())  # commit prefix vanished: plan violation after the effect
+
+    state_file = _shell(
+        tmp_path,
+        monkeypatch,
+        plans,
+        open_pr_for_orphaned_branch=lambda **kw: (71, None, None),
+    )
+
+    assert len(_events(state_file, "dead_worker_sweep_plan_violation")) == 1
+    entry = state_mod.load_state(state_file)["issues"]["7"]
+    assert entry["pr_number"] == 71
+    assert entry["status"] == "pr_open"
+
+
+def test_draft_take_rejects_a_deleted_base_key() -> None:
+    from charlie_work.dead_worker_sweep.decide_common import Draft
+
+    draft = Draft(7, {"status": "dispatched", "pid": 1})
+    draft.work.pop("pid")
+    with pytest.raises(ValueError, match="pid"):
+        draft.take()

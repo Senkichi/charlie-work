@@ -22,6 +22,7 @@ from charlie_work.dead_worker_sweep.stalled_model import (
     KillTree,
     LogTail,
     MarkBudgetExceeded,
+    ProbeCompletedHandoff,
     ProbeHealth,
     ProbeRateLimitDefer,
     ReadAdapterProfile,
@@ -71,6 +72,7 @@ def _answers(
     can_record: bool = True,
     defer: str | None = None,
     failure: tuple[str | None, str | None] = ("stalled", None),
+    handed_off: bool = False,
     next_count: int = 0,
 ) -> dict[type, Any]:
     return {
@@ -80,6 +82,7 @@ def _answers(
         KillTree: (11, 12),
         KillOrphans: (13,),
         RecordFailure: failure,
+        ProbeCompletedHandoff: handed_off,
         ReadLogTail: LogTail("last line", "2026-09-30 11:00:00+00:00"),
     }
 
@@ -145,6 +148,27 @@ def test_a_dead_worker_logs_session_exited_and_skips_the_rate_limit_probe() -> N
     plan, asked = _drive(_facts(), _answers(health=WorkerHealth.DEAD))
     assert _kinds(plan) == ["session_exited"]
     assert ProbeRateLimitDefer not in [type(r) for r in asked]
+
+
+def test_a_dead_worker_with_a_completed_handoff_is_not_labelled_stalled() -> None:
+    plan, asked = _drive(_facts(), _answers(health=WorkerHealth.DEAD, handed_off=True))
+    assert RecordFailure not in [type(r) for r in asked]
+    txn = plan.commits[-1]
+    assert txn.event_kind == "session_exited"
+    assert txn.stamp is None
+    assert dict(txn.event_payload)["failure_kind"] is None
+
+
+def test_a_dead_worker_without_a_handoff_keeps_the_stalled_fallback() -> None:
+    plan, _ = _drive(_facts(), _answers(health=WorkerHealth.DEAD))
+    assert plan.commits[-1].stamp.kind == "stalled"
+
+
+def test_a_stalled_worker_never_probes_for_a_handoff() -> None:
+    plan, asked = _drive(_facts(), _answers(handed_off=True))
+    assert ProbeCompletedHandoff not in [type(r) for r in asked]
+    assert plan.commits[-1].event_kind == "session_stalled"
+    assert plan.commits[-1].stamp.kind == "stalled"
 
 
 def test_a_throttle_failure_arms_the_cooldown_before_the_reap_event() -> None:
