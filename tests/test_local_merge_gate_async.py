@@ -720,3 +720,72 @@ def test_suite_log_captures_output_under_dispatch_dir(lane_repo: Path) -> None:
     assert paths.log.is_file()
     assert paths.gate_dir.is_relative_to(app.paths.dispatches)
     assert "marker-stdout" in paths.log.read_text(encoding="utf-8", errors="surrogateescape")
+
+
+def test_ff_deferral_keeps_green_pairing_and_retries_merge_only(lane_repo: Path) -> None:
+    """Issue #2189: a green suite whose fast-forward is deferred (the base
+    checkout is dirty on a path the branch touches) must not re-run the suite
+    once the dirt clears -- the tested head/base pairing is unchanged, so the
+    next pass retries the merge alone."""
+    _init_repo(lane_repo)
+    issues_dir = lane_repo / "docs" / "issues"
+    head = _make_branch(lane_repo, "agent/issue-7-x", "a.py", "a = 1\n")
+    app = _lane_app(lane_repo, issues_dir)
+    _adopt_and_approve(app, issues_dir, 7, "agent/issue-7-x", head)
+
+    app._local_merge_approved()
+    assert _wait_for_result(app, 7)["ok"] is True
+    # Operator WIP in the base checkout on a path the branch adds: the
+    # ``git merge --ff-only`` refuses to overwrite it.
+    dirt = lane_repo / "a.py"
+    dirt.write_text("operator wip\n", encoding="utf-8")
+
+    results = app._local_merge_approved()
+    assert results[0]["outcome"] == "deferred"
+    launches_before = len(_events_of_kind(app, "local_suite_launched"))
+
+    # A deferred pairing still holds the gate: re-deferring while dirty
+    # must not relaunch either.
+    results = app._local_merge_approved()
+    assert results[0]["outcome"] == "deferred"
+    assert len(_events_of_kind(app, "local_suite_launched")) == launches_before
+
+    dirt.unlink()
+    results = app._local_merge_approved()
+
+    assert results[0]["outcome"] in ("merged", "already_merged")
+    assert len(_events_of_kind(app, "local_suite_launched")) == launches_before
+    assert is_ancestor(lane_repo, head, branch_head_sha(lane_repo, "main"))
+    record = load_state_locked(app.paths.state_file)["prs"]["7"]
+    assert record["status"] == "merged"
+    assert record.get("local_suite_passed_head") is None
+    assert record.get("local_suite_passed_base") is None
+
+
+def test_ff_deferral_then_base_moves_relaunches_suite(lane_repo: Path) -> None:
+    """Issue #2189: the retained green pairing is only honoured while the base
+    is unchanged -- a base that advances after the deferral invalidates it and
+    the gate re-syncs and re-runs, exactly as before."""
+    _init_repo(lane_repo)
+    issues_dir = lane_repo / "docs" / "issues"
+    head = _make_branch(lane_repo, "agent/issue-7-x", "a.py", "a = 1\n")
+    app = _lane_app(lane_repo, issues_dir)
+    _adopt_and_approve(app, issues_dir, 7, "agent/issue-7-x", head)
+
+    app._local_merge_approved()
+    assert _wait_for_result(app, 7)["ok"] is True
+    dirt = lane_repo / "a.py"
+    dirt.write_text("operator wip\n", encoding="utf-8")
+    assert app._local_merge_approved()[0]["outcome"] == "deferred"
+    dirt.unlink()
+    _commit_file(lane_repo, "base_new.py", "n = 1\n", "base moved after deferral")
+
+    try:
+        results = app._local_merge_approved()
+
+        assert results[0]["outcome"] == "suite_launched"
+        record = load_state_locked(app.paths.state_file)["prs"]["7"]
+        assert record.get("local_suite_passed_head") is None
+        assert not is_ancestor(lane_repo, head, branch_head_sha(lane_repo, "main"))
+    finally:
+        _kill_claimed_gate(app, 7)
