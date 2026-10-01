@@ -3552,15 +3552,14 @@ class OrchestratorApp:
                     },
                 )
 
+            autofixed = autofix_body_closing_kw(self, pr, issue_number, verdict, checks)
+            if autofixed is not None:  # #2108: body-only Lint failure, workers can't edit it
+                return autofixed
             # Flake-aware debounce (issue #391): if the only blocker is a failed
             # required check and we have not yet retried the Actions run for this
             # head, trigger one automatic `gh run rerun --failed` and defer rework
             # routing until the next poll. Any rerun-API error is surfaced as an
             # event and we fall through to the existing rework/janitor-block path.
-            # Issue #2108: body-only closing-keyword failure; workers can't edit it.
-            autofixed = autofix_body_closing_kw(self, pr, issue_number, verdict, checks)
-            if autofixed is not None:
-                return autofixed
             if verdict.rerun_run_ids:
                 rerun_errors: list[str] = []
                 triggered_run_ids: list[int] = []
