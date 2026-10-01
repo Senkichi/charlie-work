@@ -57,6 +57,19 @@ def test_up_with_driver_and_window_label() -> None:
     assert takeaway(cur, pri) == "Merges/day ↑150% vs prior 3d, driven by a"
 
 
+def test_repo_uncovered_in_prior_window_never_drives() -> None:
+    # "b" only began reporting mid-way through the current window: no baseline to move from
+    late = {"b": ("2026-10-05T00:00:00Z", "2026-10-07T00:00:00Z")}
+    cur = {"a": [6, 6, 6], "b": [9, 9, 9], "c": [2, 2, 2]}
+    pri = {"a": [2, 2, 2], "b": [0, 0, 0], "c": [2, 2, 2]}
+    got = takeaway(*pair(cur, pri, repo_coverage=late))
+    assert got == "Merges/day ↑325% vs prior 3d, driven by a"
+    # a gauge is not zero-filled: a repo with no prior points has no baseline either
+    c, p = pair(cur, pri, kind="gauge", label="Lead time", n=99)
+    p = replace(p, per_repo={k: v for k, v in p.per_repo.items() if k != "b"})
+    assert takeaway(c, p).endswith("driven by a")
+
+
 def test_no_driver_when_movement_is_spread() -> None:
     cur = {"a": [2, 2, 2], "b": [2, 2, 2], "c": [2, 2, 2]}
     pri = {"a": [1, 1, 1], "b": [1, 1, 1], "c": [1, 1, 1]}

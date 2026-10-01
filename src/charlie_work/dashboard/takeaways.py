@@ -63,10 +63,26 @@ def _headline_label(series: Series) -> str:
     return f"{base}/day" if series.kind == "count" else base
 
 
+def _comparable(repo: str, current: Series, prior: Series) -> bool:
+    """A repo can drive a change only if it was covered when the prior window began (its
+    own coverage start), and -- for gauges, durations, ratios, which are not zero-filled --
+    has points in both windows. An uncovered prior is no baseline, not a real 0."""
+    cov = current.repo_coverage.get(repo) or prior.repo_coverage.get(repo)
+    tol = timedelta(seconds=current.bucket_seconds)
+    if cov is not None and parse_ts(cov[0]) > parse_ts(prior.window_start) + tol:
+        return False
+    if current.kind != "count":
+        return bool(current.per_repo.get(repo)) and bool(prior.per_repo.get(repo))
+    return True
+
+
 def _driver(current: Series, prior: Series, delta: float, span: timedelta) -> str | None:
-    """Repo with the largest same-direction share of the per-repo movement, if >= half."""
+    """Repo with the largest same-direction share of the per-repo movement, if >= half.
+
+    Only repos comparable across both windows (``_comparable``) take part."""
     moves: dict[str, float] = {}
-    for repo in sorted(set(current.per_repo) | set(prior.per_repo)):
+    repos = set(current.per_repo) | set(prior.per_repo)
+    for repo in sorted(r for r in repos if _comparable(r, current, prior)):
         cur = _value(current.per_repo.get(repo, ()), current.kind, span) or 0.0
         pri = _value(prior.per_repo.get(repo, ()), prior.kind, span) or 0.0
         moves[repo] = cur - pri
