@@ -21,3 +21,5 @@ Then stop. Writing this file, with the push already verified, is the task's done
 Only write this file when the push itself succeeded and was verified. If the push failed, do not write this file; report the push failure in your session log instead.
 
 $section_blocked_outcome
+
+$section_verified_no_changes_outcome
