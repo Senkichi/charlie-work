@@ -1,71 +1,122 @@
-"""MINIMAL placeholder Now page; the real design replaces this module wholesale.
+"""The Now page (spec section 4): exception-first ledger on the left, quiet rail on the right.
 
 Pure: ``render_now`` / ``render_fragment`` take a ``ModelState`` and return HTML. Every
-dynamic value goes through ``html.escape``.
+dynamic value goes through ``html.escape`` (``now_fmt.esc``). The page carries no inline
+script, no inline style attribute and no ``<style>`` block (CSP ``script-src 'self';
+style-src 'self'``): layout lives in ``/static/now.css``, behaviour in
+``/static/dashboard.js``.
+
+The whole ``#now`` region is the htmx swap target. It replaces itself (``outerHTML``) on
+every poll; the body is never swapped, so page scroll stays put, and every focusable
+control carries a stable ``id`` so htmx restores focus to it after the swap.
 """
 
 from __future__ import annotations
 
-from datetime import datetime
-from html import escape
-
+from ..now_types import NowModel, RepoFreshness
 from ..read_model import ModelState
+from .now_capacity import render_capacity, render_repo_ledger
+from .now_flow import render_flow, render_not_dispatchable
+from .now_fmt import age, esc, local_time, repo_url, short_repo
+from .now_needs import render_needs
 
 
-def _local(moment: datetime | None) -> str:
-    return moment.astimezone().strftime("%H:%M:%S") if moment else "n/a"
-
-
-def _table(head: tuple[str, ...], rows: list[tuple[object, ...]]) -> str:
-    th = "".join(f"<th>{escape(h)}</th>" for h in head)
-    body = "".join(
-        "<tr>" + "".join(f"<td>{escape(str(c))}</td>" for c in row) + "</tr>" for row in rows
+def _fresh_chip(f: RepoFreshness) -> str:
+    name = esc(short_repo(f.repo))
+    when = esc(age(f.age_seconds))
+    href = esc(repo_url(f.repo))
+    if f.error:
+        return (
+            f'<a class="chip is-danger text-danger" href="{href}" '
+            f'title="{esc(f.repo)}: snapshot unreadable: {esc(f.error)}">'
+            f'{name} <span class="n">{when}</span> read error</a>'
+        )
+    if f.stale:
+        return (
+            f'<a class="chip is-warn text-warn" href="{href}" '
+            f'title="{esc(f.repo)}: no loop pass within the stale threshold">'
+            f'{name} <span class="n">{when}</span> stale</a>'
+        )
+    return (
+        f'<a class="chip" href="{href}" title="{esc(f.repo)}">'
+        f'{name} <span class="n">{when}</span></a>'
     )
-    return f"<table><thead><tr>{th}</tr></thead><tbody>{body}</tbody></table>"
+
+
+def _freshness(model: NowModel) -> str:
+    chips = "".join(_fresh_chip(f) for f in model.freshness)
+    return (
+        '<div class="fresh" aria-label="Last loop pass per repo"><span class="label">Last pass'
+        f'</span>{chips}<span class="thr">stale after '
+        f"{esc(age(model.stale_threshold_seconds))}</span></div>"
+    )
+
+
+def _banner(state: ModelState) -> str:
+    if not state.collector_error:
+        return ""
+    since = (
+        f" since {local_time(state.collector_failing_since)} (local)"
+        if state.collector_failing_since
+        else " now"
+    )
+    return (
+        '<p class="banner text-danger" role="alert">Numbers frozen: collector failing'
+        f"{since}: {esc(state.collector_error)}. Showing the last good model.</p>"
+    )
+
+
+def _header(state: ModelState, poll_seconds: int) -> str:
+    model = state.model
+    asof = (
+        f'<span class="asof">as of <b>{local_time(model.generated_at)}</b> (local) '
+        f"· auto-refresh {int(poll_seconds)}s</span>"
+        if model is not None
+        else '<span class="asof">collecting…</span>'
+    )
+    nav = (
+        '<nav class="views" aria-label="Views"><a href="/now" aria-current="page">Now</a>'
+        '<a href="/history" class="soon" aria-disabled="true" title="coming soon">History</a>'
+        "</nav>"
+    )
+    fresh = _freshness(model) if model is not None else ""
+    return (
+        '<header class="top"><div class="top-line"><span class="brand">Fleet '
+        f"<em>· Now</em></span>{nav}{asof}</div>{fresh}</header>"
+    )
 
 
 def render_fragment(state: ModelState, poll_seconds: int) -> str:
-    banner = ""
-    if state.collector_error:
-        banner = (
-            f'<p class="banner" role="alert">collector failing since '
-            f"{escape(_local(state.collector_failing_since))} (local): "
-            f"{escape(state.collector_error)}</p>"
-        )
-    head = (
-        f'<section id="now" hx-get="/now/fragment" '
+    """The ``#now`` region: the htmx poll target and the body of the full page."""
+    open_tag = (
+        f'<div id="now" class="shell" hx-get="/now/fragment" '
         f'hx-trigger="every {int(poll_seconds)}s" hx-swap="outerHTML">'
     )
+    head = _header(state, poll_seconds) + _banner(state)
     model = state.model
     if model is None:
-        return f"{head}{banner}<p>collecting...</p></section>"
-    needs = _table(
-        ("severity", "kind", "repo", "reason", "command"),
-        [(i.severity, i.kind, i.repo or "", i.reason, i.command or "") for i in model.needs_me],
+        return (
+            f'{open_tag}{head}<section class="needs"><p class="calm">Collecting the first '
+            "read of the fleet…</p></section></div>"
+        )
+    rail = (
+        '<aside class="rail" aria-label="Flow and capacity">'
+        f"{render_flow(model)}{render_not_dispatchable(model)}"
+        f"{render_capacity(model)}{render_repo_ledger(model)}</aside>"
     )
-    flow = _table(("stage", "count"), [(s.name, s.count) for s in model.flow.stages])
-    cap = model.capacity
-    capacity = _table(
-        ("what", "live", "cap"),
-        [
-            ("workers", cap.workers_live, cap.workers_cap),
-            ("reviewers", cap.reviewers_live, cap.reviewers_cap),
-        ],
-    )
-    return (
-        f"{head}{banner}<p>as of {escape(_local(model.generated_at))} (local)</p>"
-        f"<h2>Needs me</h2>{needs}<h2>Flow</h2>{flow}<h2>Capacity</h2>{capacity}</section>"
-    )
+    return f"{open_tag}{head}{render_needs(model)}{rail}</div>"
 
 
 def render_now(state: ModelState, theme: str = "auto", *, poll_seconds: int = 20) -> str:
     return (
-        f'<!doctype html><html lang="en" data-theme="{escape(theme)}"><head>'
+        f'<!doctype html><html lang="en" data-theme="{esc(theme)}"><head>'
         '<meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width, initial-scale=1">'
         '<meta name="htmx-config" content=\'{"includeIndicatorStyles":false}\'>'
-        "<title>Fleet dashboard</title>"
+        "<title>Fleet Now</title>"
         '<link rel="stylesheet" href="/static/dashboard.css">'
-        '<script src="/static/htmx.min.js" defer></script></head><body><main>'
-        f"<h1>Fleet - Now</h1>{render_fragment(state, poll_seconds)}</main></body></html>"
+        '<link rel="stylesheet" href="/static/now.css">'
+        '<script src="/static/htmx.min.js" defer></script>'
+        '<script src="/static/dashboard.js" defer></script></head><body>'
+        f"{render_fragment(state, poll_seconds)}</body></html>"
     )
