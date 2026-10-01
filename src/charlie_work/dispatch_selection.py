@@ -754,7 +754,7 @@ def _select_review_dispatch_candidates(
     ]
     max_local = review_dispatch_config.max_local_review_processes
     max_concurrent = review_dispatch_config.max_concurrent_reviews
-    live_count = _count_live_reviews(reviews_dir, state_file)
+    live_count = _host.current().sessions.live_reviews(reviews_dir, state_file)
     requested_limit = limit if limit is not None else len(dispatchable)
     local_cap = _apply_local_review_cap(requested_limit, max_local, live_count)
     if max_concurrent > 0:

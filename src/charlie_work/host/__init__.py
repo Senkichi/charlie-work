@@ -11,15 +11,17 @@ from dataclasses import dataclass
 
 from .clock import Clock, RealClock
 from .liveness import ProcessProbe, RealProcessProbe
+from .sessions import RealSessionCounter, SessionCounter
 
 
 @dataclass(frozen=True)
 class HostPorts:
     clock: Clock
     probe: ProcessProbe
+    sessions: SessionCounter
 
 
-REAL = HostPorts(clock=RealClock(), probe=RealProcessProbe())
+REAL = HostPorts(clock=RealClock(), probe=RealProcessProbe(), sessions=RealSessionCounter())
 
 _ACTIVE: HostPorts = REAL
 

@@ -13,6 +13,7 @@ import sys
 from pathlib import Path
 
 from _fakes_github import FakeGitHub
+from charlie_work.host.fakes import FakeSessionCounter
 from charlie_work.config import (
     DevinConfig,
     DispatchConfig,
@@ -30,7 +31,9 @@ from charlie_work.workflow import OrchestratorApp
 from _dispatch_fixtures import _stub_real_activity_probe_for_stalled_tests  # noqa: F401
 
 
-def test_concurrency_governor_zero_rework_is_self_explaining(tmp_path: Path, monkeypatch) -> None:
+def test_concurrency_governor_zero_rework_is_self_explaining(
+    tmp_path: Path, monkeypatch, fake_host
+) -> None:
     """Issue #1014: a dispatch_rework pass clamped by the concurrency governor
     must be distinguishable, from CommandResult.data and events.db alone, from
     a pass with an empty rework backlog.
@@ -65,10 +68,7 @@ def test_concurrency_governor_zero_rework_is_self_explaining(tmp_path: Path, mon
        keys in ``failures``), not the truncated 5-item list.
     """
 
-    def mock_count_live_one(sessions_dir, state_file=None):
-        return 1
-
-    monkeypatch.setattr("charlie_work.workflow._count_live_sessions", mock_count_live_one)
+    fake_host(sessions=FakeSessionCounter(workers=1))
 
     config = OrchestratorConfig(
         dispatch=DispatchConfig(max_concurrent_sessions=1, default_limit=5),
@@ -231,9 +231,10 @@ def test_concurrency_governor_zero_rework_is_self_explaining(tmp_path: Path, mon
     _seed_rework_state(partial_paths.state_file, numbers_8)
     _create_rework_prompts(tmp_path / "partial", pr_numbers_8)
 
-    monkeypatch.setattr(
-        "charlie_work.workflow._count_live_sessions",
-        lambda sessions_dir, state_file=None: 0,
+    fake_host(
+        sessions=FakeSessionCounter(
+            workers=0,
+        )
     )
     partial_result = partial_app.dispatch_rework()
 
@@ -282,7 +283,7 @@ def test_concurrency_governor_zero_rework_is_self_explaining(tmp_path: Path, mon
     issues_app = OrchestratorApp(issues_tmp_path, issues_paths, config, issues_gh)
     _seed_rework_state(issues_paths.state_file, issues_numbers_7)
     _create_rework_prompts(issues_tmp_path, issues_pr_numbers_7)
-    monkeypatch.setattr("charlie_work.workflow._count_live_sessions", mock_count_live_one)
+    fake_host(sessions=FakeSessionCounter(workers=1))
 
     issues_result = issues_app.dispatch_rework(only_issues="401,402,403,404,405,406,407")
 
@@ -304,7 +305,7 @@ def test_concurrency_governor_zero_rework_is_self_explaining(tmp_path: Path, mon
 
 
 def test_concurrency_governor_zero_dispatch_is_self_explaining_in_dispatch_event(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, fake_host
 ) -> None:
     """Issue #1005: a dispatch pass clamped to zero by the concurrency governor
     must be distinguishable, from events.db alone, from a pass with an empty
@@ -345,10 +346,7 @@ def test_concurrency_governor_zero_dispatch_is_self_explaining_in_dispatch_event
        ``failures`` entries for the 6th+ deferred issue.
     """
 
-    def mock_count_live_one(sessions_dir, state_file=None):
-        return 1
-
-    monkeypatch.setattr("charlie_work.workflow._count_live_sessions", mock_count_live_one)
+    fake_host(sessions=FakeSessionCounter(workers=1))
 
     config = OrchestratorConfig(
         # Issue #1843: the pinned concurrency_governor event payload below is
@@ -454,16 +452,8 @@ def test_concurrency_governor_zero_dispatch_is_self_explaining_in_dispatch_event
     # Repo governor recomputes available_slots=1 (nonzero: 2 - 1 live), but
     # the fleet cap independently saturates and drives dispatch_limit to 0.
     # available_slots alone would misleadingly suggest a slot was open.
-    def mock_count_live_one_of_two(sessions_dir, state_file=None):
-        return 1
-
-    def mock_count_fleet_live_saturated(fleet_dir_override):
-        return 3, []
-
-    monkeypatch.setattr("charlie_work.workflow._count_live_sessions", mock_count_live_one_of_two)
-    monkeypatch.setattr(
-        "charlie_work.workflow.count_fleet_live_sessions", mock_count_fleet_live_saturated
-    )
+    fake_host(sessions=FakeSessionCounter(workers=1))
+    fake_host(sessions=FakeSessionCounter(workers=1, fleet_workers=(3, [])))
 
     fleet_config = OrchestratorConfig(
         fleet=FleetConfig(global_max_concurrent_sessions=3),
@@ -517,7 +507,7 @@ def test_concurrency_governor_zero_dispatch_is_self_explaining_in_dispatch_event
     issues_paths = runtime_paths(issues_tmp_path, config.runtime.state_dir)
     issues_gh = SaturatedGitHub(7)
     issues_app = OrchestratorApp(issues_tmp_path, issues_paths, config, issues_gh)
-    monkeypatch.setattr("charlie_work.workflow._count_live_sessions", mock_count_live_one)
+    fake_host(sessions=FakeSessionCounter(workers=1, fleet_workers=(3, [])))
 
     issues_result = issues_app.dispatch(only_issues="201,202,203,204,205,206,207")
 
@@ -544,7 +534,7 @@ def test_concurrency_governor_zero_dispatch_is_self_explaining_in_dispatch_event
 
 
 def test_concurrency_governor_zero_rework_dry_run_automatic_path(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, fake_host
 ) -> None:
     """Issue #1014: the dry-run (``dry_run=True``) branch of
     ``_dispatch_rework_impl`` must populate ``deferred_by_concurrency`` and
@@ -572,10 +562,7 @@ def test_concurrency_governor_zero_rework_dry_run_automatic_path(
        keys), not just the truncated 5-item display list.
     """
 
-    def mock_count_live_one(sessions_dir, state_file=None):
-        return 1
-
-    monkeypatch.setattr("charlie_work.workflow._count_live_sessions", mock_count_live_one)
+    fake_host(sessions=FakeSessionCounter(workers=1))
 
     config = OrchestratorConfig(
         dispatch=DispatchConfig(max_concurrent_sessions=1, default_limit=5),

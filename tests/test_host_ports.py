@@ -87,3 +87,42 @@ def test_real_probe_late_binds_to_process_utils(monkeypatch) -> None:
     assert REAL.probe.is_alive(7, None) is True
     assert REAL.probe.is_alive(8, None) is False
     assert REAL.probe.is_alive(-1, None) is False
+
+
+def test_fake_session_counter_reaches_review_fleet_gate(fake_host) -> None:
+    from pathlib import Path
+
+    from charlie_work.host.fakes import FakeSessionCounter
+
+    counter = FakeSessionCounter(
+        workers=2, reviews=3, fleet_workers=(5, ["x"]), fleet_reviews=(4, [])
+    )
+    ports = fake_host(sessions=counter)
+    s = ports.sessions
+    assert s.live_workers(Path("w"), None) == 2
+    assert s.live_reviews(Path("r"), None) == 3
+    assert s.fleet_live_workers(None) == (5, ["x"])
+    assert s.fleet_live_reviews("d") == (4, [])
+    assert [c[0] for c in counter.calls] == [
+        "live_workers",
+        "live_reviews",
+        "fleet_live_workers",
+        "fleet_live_reviews",
+    ]
+
+
+def test_real_session_counter_late_binds_to_existing_patch_targets(monkeypatch) -> None:
+    from pathlib import Path
+
+    from charlie_work.host import REAL
+
+    monkeypatch.setattr("charlie_work.workflow._count_live_sessions", lambda d, s=None: 11)
+    monkeypatch.setattr("charlie_work.workflow.count_fleet_live_sessions", lambda o: (12, []))
+    monkeypatch.setattr("charlie_work.workflow.count_fleet_live_reviews", lambda o: (13, []))
+    monkeypatch.setattr(
+        "charlie_work.dispatch_selection._count_live_reviews", lambda d, s=None: 14
+    )
+    assert REAL.sessions.live_workers(Path("."), None) == 11
+    assert REAL.sessions.fleet_live_workers(None) == (12, [])
+    assert REAL.sessions.fleet_live_reviews(None) == (13, [])
+    assert REAL.sessions.live_reviews(Path("."), None) == 14

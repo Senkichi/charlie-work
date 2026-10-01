@@ -66,6 +66,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
+from charlie_work import host as _host
 from charlie_work import layout, role_selection
 from charlie_work.adapters import AdapterSettings, SessionDispatchResult, SessionRequest
 from charlie_work.fleet_registry import try_acquire_fleet_lock
@@ -473,7 +474,9 @@ def issue_worker_launch_permit(
 
     try:
         if live_count is None:
-            live_count = _wf._count_live_sessions(app._layout.sessions_dir, app.paths.state_file)
+            live_count = _host.current().sessions.live_workers(
+                app._layout.sessions_dir, app.paths.state_file
+            )
         governor_kwargs: dict[str, Any] = {"live_count": live_count}
         if apply_open_pr_backpressure:
             governor_kwargs["apply_open_pr_backpressure"] = True

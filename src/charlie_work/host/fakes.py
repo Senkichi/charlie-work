@@ -54,3 +54,36 @@ class FakeProcessProbe:
 
     def start_time(self, pid: int) -> float | None:
         return self._alive.get(pid)
+
+
+class FakeSessionCounter:
+    """Scripted session counts with a call log of ``(method, args)``."""
+
+    def __init__(
+        self,
+        workers: int = 0,
+        reviews: int = 0,
+        fleet_workers: tuple[int, list[str]] = (0, []),
+        fleet_reviews: tuple[int, list[str]] = (0, []),
+    ) -> None:
+        self.workers = workers
+        self.reviews = reviews
+        self.fleet_workers = fleet_workers
+        self.fleet_reviews = fleet_reviews
+        self.calls: list[tuple[str, tuple]] = []
+
+    def live_workers(self, sessions_dir, state_file=None) -> int:
+        self.calls.append(("live_workers", (sessions_dir, state_file)))
+        return self.workers
+
+    def fleet_live_workers(self, fleet_dir_override):
+        self.calls.append(("fleet_live_workers", (fleet_dir_override,)))
+        return self.fleet_workers
+
+    def live_reviews(self, reviews_dir, state_file=None) -> int:
+        self.calls.append(("live_reviews", (reviews_dir, state_file)))
+        return self.reviews
+
+    def fleet_live_reviews(self, fleet_dir_override):
+        self.calls.append(("fleet_live_reviews", (fleet_dir_override,)))
+        return self.fleet_reviews

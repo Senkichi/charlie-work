@@ -15,6 +15,7 @@ import sys
 from pathlib import Path
 
 from _fakes_github import FakeGitHub
+from charlie_work.host.fakes import FakeSessionCounter
 from charlie_work.config import (
     DevinConfig,
     DispatchConfig,
@@ -62,15 +63,12 @@ def test_concurrency_governor_unlimited_when_unset(tmp_path: Path) -> None:
 
 
 def test_concurrency_governor_clamps_dispatch_when_sessions_alive(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, fake_host
 ) -> None:
     """When max_concurrent_sessions is set and there are live sessions, dispatch should be clamped."""
 
     # Mock _count_live_sessions to return 2 live sessions
-    def mock_count_live(sessions_dir, state_file=None):
-        return 2
-
-    monkeypatch.setattr("charlie_work.workflow._count_live_sessions", mock_count_live)
+    fake_host(sessions=FakeSessionCounter(workers=2))
 
     config = OrchestratorConfig(
         dispatch=DispatchConfig(max_concurrent_sessions=2, default_limit=5),
@@ -91,14 +89,13 @@ def test_concurrency_governor_clamps_dispatch_when_sessions_alive(
     assert result.data["available_slots"] == 0
 
 
-def test_concurrency_governor_clamps_rework_dispatch(tmp_path: Path, monkeypatch) -> None:
+def test_concurrency_governor_clamps_rework_dispatch(
+    tmp_path: Path, monkeypatch, fake_host
+) -> None:
     """Concurrency governor should also clamp rework dispatch."""
 
     # Mock _count_live_sessions to return 2 live sessions (at the cap)
-    def mock_count_live(sessions_dir, state_file=None):
-        return 2
-
-    monkeypatch.setattr("charlie_work.workflow._count_live_sessions", mock_count_live)
+    fake_host(sessions=FakeSessionCounter(workers=2))
 
     config = OrchestratorConfig(
         dispatch=DispatchConfig(max_concurrent_sessions=2, default_limit=5),
@@ -150,14 +147,13 @@ def test_concurrency_governor_clamps_rework_dispatch(tmp_path: Path, monkeypatch
     assert result.data["available_slots"] == 0
 
 
-def test_concurrency_governor_allows_partial_dispatch(tmp_path: Path, monkeypatch) -> None:
+def test_concurrency_governor_allows_partial_dispatch(
+    tmp_path: Path, monkeypatch, fake_host
+) -> None:
     """When some slots are available, dispatch should launch up to that limit."""
 
     # Mock _count_live_sessions to return 1 live session
-    def mock_count_live(sessions_dir, state_file=None):
-        return 1
-
-    monkeypatch.setattr("charlie_work.workflow._count_live_sessions", mock_count_live)
+    fake_host(sessions=FakeSessionCounter(workers=1))
 
     config = OrchestratorConfig(
         dispatch=DispatchConfig(max_concurrent_sessions=2, default_limit=5),
@@ -221,14 +217,13 @@ def test_concurrency_governor_result_dataclass() -> None:
         pass
 
 
-def test_concurrency_governor_clamps_only_issues_dispatch(tmp_path: Path, monkeypatch) -> None:
+def test_concurrency_governor_clamps_only_issues_dispatch(
+    tmp_path: Path, monkeypatch, fake_host
+) -> None:
     """Issue #105: when --issues names more issues than available slots, excess should be deferred by concurrency."""
 
     # Mock _count_live_sessions to return 0 live sessions
-    def mock_count_live(sessions_dir, state_file=None):
-        return 0
-
-    monkeypatch.setattr("charlie_work.workflow._count_live_sessions", mock_count_live)
+    fake_host(sessions=FakeSessionCounter(workers=0))
 
     config = OrchestratorConfig(
         dispatch=DispatchConfig(max_concurrent_sessions=2, default_limit=5),
@@ -292,15 +287,12 @@ def test_concurrency_governor_clamps_only_issues_dispatch(tmp_path: Path, monkey
 
 
 def test_concurrency_governor_clamps_only_issues_dispatch_with_live_sessions(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, fake_host
 ) -> None:
     """Issue #105: when --issues names more issues than available slots (with live sessions), excess should be deferred."""
 
     # Mock _count_live_sessions to return 1 live session
-    def mock_count_live(sessions_dir, state_file=None):
-        return 1
-
-    monkeypatch.setattr("charlie_work.workflow._count_live_sessions", mock_count_live)
+    fake_host(sessions=FakeSessionCounter(workers=1))
 
     config = OrchestratorConfig(
         dispatch=DispatchConfig(max_concurrent_sessions=2, default_limit=5),
@@ -364,14 +356,13 @@ def test_concurrency_governor_clamps_only_issues_dispatch_with_live_sessions(
     assert "103" not in state["issues"]
 
 
-def test_concurrency_governor_clamps_only_issues_dry_run(tmp_path: Path, monkeypatch) -> None:
+def test_concurrency_governor_clamps_only_issues_dry_run(
+    tmp_path: Path, monkeypatch, fake_host
+) -> None:
     """Issue #105: dry-run with --issues should also respect concurrency governor."""
 
     # Mock _count_live_sessions to return 0 live sessions
-    def mock_count_live(sessions_dir, state_file=None):
-        return 0
-
-    monkeypatch.setattr("charlie_work.workflow._count_live_sessions", mock_count_live)
+    fake_host(sessions=FakeSessionCounter(workers=0))
 
     config = OrchestratorConfig(
         dispatch=DispatchConfig(max_concurrent_sessions=2, default_limit=5),
@@ -434,15 +425,12 @@ def test_concurrency_governor_clamps_only_issues_dry_run(tmp_path: Path, monkeyp
 
 
 def test_concurrency_governor_clamps_only_issues_rework_dispatch(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, fake_host
 ) -> None:
     """Issue #105: dispatch_rework with --issues should also respect concurrency governor."""
 
     # Mock _count_live_sessions to return 0 live sessions
-    def mock_count_live(sessions_dir, state_file=None):
-        return 0
-
-    monkeypatch.setattr("charlie_work.workflow._count_live_sessions", mock_count_live)
+    fake_host(sessions=FakeSessionCounter(workers=0))
 
     config = OrchestratorConfig(
         dispatch=DispatchConfig(max_concurrent_sessions=2, default_limit=5),
