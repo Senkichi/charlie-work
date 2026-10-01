@@ -7,7 +7,7 @@ import pytest
 
 from charlie_work import host
 from charlie_work.host.clock import RealClock, format_utc
-from charlie_work.host.fakes import FakeClock
+from charlie_work.host.fakes import FakeClock, FakeSessionCounter
 
 _UTC_NOW_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 
@@ -35,8 +35,18 @@ def test_fake_host_swaps_current_and_restores(fake_host) -> None:
     assert host.current().clock is clock
 
 
-def test_fake_host_restored_after_previous_test() -> None:
+def test_fake_host_restored_after_previous_test(fake_host, monkeypatch) -> None:
+    fake_host(clock=FakeClock(datetime(2026, 1, 1, tzinfo=UTC)))
+    assert host.current() is not host.REAL
+    monkeypatch.undo()
     assert host.current() is host.REAL
+
+
+def test_fake_host_composes_with_previous_fake(fake_host) -> None:
+    clock = FakeClock(datetime(2026, 1, 1, tzinfo=UTC))
+    fake_host(clock=clock)
+    fake_host(sessions=FakeSessionCounter(workers=1))
+    assert host.current().clock is clock
 
 
 def test_host_ports_is_frozen() -> None:

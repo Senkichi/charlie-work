@@ -452,7 +452,6 @@ def test_concurrency_governor_zero_dispatch_is_self_explaining_in_dispatch_event
     # Repo governor recomputes available_slots=1 (nonzero: 2 - 1 live), but
     # the fleet cap independently saturates and drives dispatch_limit to 0.
     # available_slots alone would misleadingly suggest a slot was open.
-    fake_host(sessions=FakeSessionCounter(workers=1))
     fake_host(sessions=FakeSessionCounter(workers=1, fleet_workers=(3, [])))
 
     fleet_config = OrchestratorConfig(

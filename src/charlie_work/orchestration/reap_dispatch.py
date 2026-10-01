@@ -12,8 +12,10 @@ Names reached through ``_wf.`` (module-object seam, design Section 3.1 rule 2,
 ``ConcurrencyGovernorResult``, ``_MergedPRListOutcome`` (classes),
 ``_state_lock_busy_result`` (free function); and Tier-D names patched on
 ``charlie_work.workflow`` by the suite, so the moved body must keep intercepting
-those patches: ``_count_live_sessions``, ``count_fleet_live_sessions``,
-``_log_worker_census``. All other free names are imported directly from their
+those patches: ``_log_worker_census``. The live-session counters
+(``_count_live_sessions``, ``count_fleet_live_sessions``) are reached through
+``host.current().sessions``, whose Real late-binds ``charlie_work.workflow.*`` so
+those patches still intercept. All other free names are imported directly from their
 defining module (a three-form, six-alias patch census confirms no test patches
 any of them on ``charlie_work.workflow``).
 """

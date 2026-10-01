@@ -99,16 +99,6 @@ class FleetReviewCap:
         return fields
 
 
-def _workflow() -> Any:
-    # Reached through ``charlie_work.workflow`` (resolved at call time -- it
-    # imports the orchestration delegates that import this module) so a test
-    # patching ``charlie_work.workflow.count_fleet_live_reviews`` intercepts,
-    # exactly as ``_wf.count_fleet_live_sessions`` does for the worker cap.
-    import charlie_work.workflow as wf
-
-    return wf
-
-
 def acquire_fleet_review_launch_lock(
     app: OrchestratorApp, *, acquire: FleetLockAcquirer | None = None
 ) -> FleetLaunchLock:
