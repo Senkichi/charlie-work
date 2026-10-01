@@ -1,9 +1,11 @@
-"""Merge path: pure decision stages for ``merge_ready`` (dormant until consumers are wired).
+"""Merge path: the stages behind ``merge_ready`` and its dry-run preview.
 
-``decide_*`` are the pure decision tables over frozen facts; the gather, apply
-and render shells arrive in later steps. Import order matters for the dormancy
-gate: ``workflow`` imports ``merge_path.rules``, which makes this package
-reachable and, through it, the decision module.
+``decide_*`` are the pure decision tables over frozen facts; ``gather*`` read the
+facts, ``apply*`` run each stage's effects through the ``WriteGate``, and
+``render`` builds the result payloads. ``run_merge_ready`` (live) and
+``preview_merge_ready`` (dry-run) are the two drivers; they live in
+``merge_path.apply`` and ``merge_path.preview`` and are imported from there, not
+re-exported here, so importing the decision module stays free of effect code.
 """
 
 from __future__ import annotations
