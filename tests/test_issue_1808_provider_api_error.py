@@ -58,15 +58,14 @@ class _Env:
         )
         self.started = (datetime.now(UTC) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
 
-    def dispatch_and_die(self, log_text: str) -> dict:
-        """Simulate one claim (attempt +1), a dead reviewer with ``log_text``,
-        then the stalled sweep; return the PR's state."""
+    def plant_dead_reviewer(self, log_text: str, pr: int = PR) -> None:
+        """Simulate one claim (attempt +1) and a dead reviewer with ``log_text``."""
         with state_lock(self.state_file):
             st = load_state(self.state_file)
-            prior = st["prs"].get(str(PR), {})
-            st["prs"][str(PR)] = {
+            prior = st["prs"].get(str(pr), {})
+            st["prs"][str(pr)] = {
                 **prior,
-                "number": PR,
+                "number": pr,
                 "review_dispatch_status": "review_dispatch_dispatched",
                 "review_dispatched_at": self.started,
                 "reviewer_pid": 999999999,
@@ -75,11 +74,11 @@ class _Env:
                 + 1,
             }
             save_state(self.state_file, st)
-        log_path = self.reviews_dir / f"issue-{PR}-review.claude.log"
+        log_path = self.reviews_dir / f"issue-{pr}-review.claude.log"
         log_path.write_text(log_text, encoding="utf-8")
         sidecar = {
-            "issue_number": PR,
-            "branch": f"agent/issue-{PR}-fix",
+            "issue_number": pr,
+            "branch": f"agent/issue-{pr}-fix",
             "worktree_path": str(self.tmp_path / "wt"),
             "prompt_path": str(self.tmp_path / "prompt.md"),
             "command": ["claude", "-p"],
@@ -89,9 +88,11 @@ class _Env:
             "error": None,
             "process_start_time": 1.0,
         }
-        (self.reviews_dir / f"issue-{PR}.claude.json").write_text(
+        (self.reviews_dir / f"issue-{pr}.claude.json").write_text(
             json.dumps(sidecar), encoding="utf-8"
         )
+
+    def sweep(self) -> dict:
         _detect_and_handle_stalled_reviews(
             self.reviews_dir,
             self.state_file,
@@ -100,6 +101,11 @@ class _Env:
             write_gate=_wg(self.state_file),
         )
         return load_state(self.state_file)
+
+    def dispatch_and_die(self, log_text: str) -> dict:
+        """One claim, one dead reviewer, one sweep; return the state."""
+        self.plant_dead_reviewer(log_text)
+        return self.sweep()
 
 
 def test_three_consecutive_500s_leave_attempt_count_zero_and_arm_backoff(
@@ -166,3 +172,61 @@ def test_streak_is_cleared_by_unescalate_and_recorded_verdict() -> None:
 def test_zero_disables_rollback(tmp_path: Path) -> None:
     state = _Env(tmp_path, max_api_errors=0).dispatch_and_die(_result_event(500))
     assert state["prs"][str(PR)]["review_dispatch_attempt_count"] == 1
+
+
+_THROTTLE_LOG = "You've hit your session limit resets 4:40pm (America/Los_Angeles)\n"
+
+
+def test_throttle_death_between_api_errors_restarts_the_streak(tmp_path: Path) -> None:
+    env = _Env(tmp_path)
+    env.dispatch_and_die(_result_event(500))
+    state = env.dispatch_and_die(_result_event(500))
+    assert state["prs"][str(PR)]["review_api_error_streak"] == 2
+    state = env.dispatch_and_die(_THROTTLE_LOG)  # definitive throttled death
+    assert state["prs"][str(PR)]["review_api_error_streak"] == 0
+    state = env.dispatch_and_die(_result_event(500))
+    assert state["prs"][str(PR)]["review_api_error_streak"] == 1
+    assert state["prs"][str(PR)]["review_dispatch_attempt_count"] == 0
+
+
+def test_turn_limit_counted_throttle_death_restarts_the_streak(tmp_path: Path) -> None:
+    env = _Env(tmp_path)
+    state = env.dispatch_and_die(_result_event(500))
+    assert state["prs"][str(PR)]["review_api_error_streak"] == 1
+    with state_lock(env.state_file):
+        st = load_state(env.state_file)
+        st["prs"][str(PR)]["review_turn_limit_summary_posted"] = True
+        save_state(env.state_file, st)
+    state = env.dispatch_and_die(_THROTTLE_LOG)
+    assert state["prs"][str(PR)]["review_dispatch_status"] == "review_dispatch_failed"
+    assert state["prs"][str(PR)]["review_api_error_streak"] == 0
+
+
+def test_probe_cleared_after_death_suppresses_backoff_but_still_rolls_back(
+    tmp_path: Path,
+) -> None:
+    env = _Env(tmp_path)
+    cleared = (datetime.now(UTC) + timedelta(minutes=5)).isoformat().replace("+00:00", "Z")
+    with state_lock(env.state_file):
+        st = load_state(env.state_file)
+        st["reviewer_quota"] = {"last_probe_cleared_at": cleared}
+        save_state(env.state_file, st)
+    state = env.dispatch_and_die(_result_event(503))
+    pr = state["prs"][str(PR)]
+    assert pr["review_dispatch_status"] is None  # claim still rolled back
+    assert pr["review_dispatch_attempt_count"] == 0
+    assert not [e for e in state["events"] if e["kind"] == "review_provider_outage"]
+    assert not state["reviewer_quota"].get("consecutive_probe_failures")
+
+
+def test_two_dead_reviewers_in_one_sweep_arm_backoff_once(tmp_path: Path) -> None:
+    env = _Env(tmp_path)
+    env.plant_dead_reviewer(_result_event(529), pr=PR)
+    env.plant_dead_reviewer(_result_event(529), pr=PR + 1)
+    state = env.sweep()
+    for pr_no in (PR, PR + 1):
+        assert state["prs"][str(pr_no)]["review_dispatch_attempt_count"] == 0
+        assert state["prs"][str(pr_no)]["review_api_error_streak"] == 1
+    outage = [e for e in state["events"] if e["kind"] == "review_provider_outage"]
+    assert len(outage) == 1
+    assert state["reviewer_quota"]["consecutive_probe_failures"] == 1

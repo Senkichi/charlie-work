@@ -608,6 +608,7 @@ def _detect_and_handle_stalled_reviews(
                     "reviewer_pid": None,
                     "reviewer_process_start_time": None,
                     "review_log_unreadable_streak": 0,
+                    "review_api_error_streak": 0,
                 }
                 event_payload = {
                     "pr_number": w.issue_number,
@@ -647,6 +648,7 @@ def _detect_and_handle_stalled_reviews(
             if attempt_count > 0:
                 rolled_back["review_dispatch_attempt_count"] = attempt_count - 1
             rolled_back["review_log_unreadable_streak"] = 0
+            rolled_back["review_api_error_streak"] = 0
             state["prs"][pr_key] = rolled_back
             event_payload = {
                 "pr_number": w.issue_number,
