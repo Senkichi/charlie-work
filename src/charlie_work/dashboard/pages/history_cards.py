@@ -105,11 +105,12 @@ def coverage_note(series: Series, tz: tzinfo | None) -> str:
 
 
 def _chart_coverage(series: Series, window: tuple[datetime, datetime]) -> tuple[Coverage, ...]:
-    """Sources whose coverage starts inside the window (the chart shades before them)."""
+    """Every source that starts by the window's end, including those already covering its
+    start: the chart shades only before the earliest, and rules each later in-window start."""
     out = []
     for src, (lo, _) in sorted(series.repo_coverage.items()):
         start = parse_ts(lo)
-        if window[0] < start <= window[1]:
+        if start <= window[1]:
             out.append(Coverage(short_repo(src), start))
     return tuple(out)
 

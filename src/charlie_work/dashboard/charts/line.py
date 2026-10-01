@@ -144,18 +144,27 @@ _MAX_START_LABELS = 3  # more source starts than this share one label (details i
 def _context(f: Frame, spec: LineSpec, tz: tzinfo | None) -> str:
     """Coverage shading + source-start labels, then annotation markers.
 
+    ``spec.coverage`` lists every source, including ones that start before the window: only
+    the span before the earliest source is shaded "uncovered" (no source could hold data
+    there); each later in-window start gets a rule and a label.
+
     Shading and rules are drawn before any label, so a later source's shading can never
     paint over an earlier source's label; a label that would run past the plot flips to
     the left of its rule.
     """
-    starts = [c for c in sorted(spec.coverage, key=lambda c: c.start) if f.t0 < c.start <= f.t1]
+    ordered = sorted(spec.coverage, key=lambda c: c.start)
+    starts = [c for c in ordered if f.t0 < c.start <= f.t1]
     shades: list[str] = []
     labels: list[str] = []
-    for cov in starts:
-        x = f.x(cov.start)
+    if starts and ordered[0].start > f.t0:  # uncovered = before the EARLIEST source only
+        x = f.x(ordered[0].start)
         shades.append(
             f'<rect class="uncovered" x="{num(f.left)}" y="{num(f.top)}" '
             f'width="{num(x - f.left)}" height="{num(f.bottom - f.top)}"/>'
+        )
+    for cov in starts:  # a later source's start is a rule, not more shading
+        x = f.x(cov.start)
+        shades.append(
             f'<line class="cov-start" x1="{num(x)}" x2="{num(x)}" y1="{num(f.top)}" '
             f'y2="{num(f.bottom)}"/>'
         )

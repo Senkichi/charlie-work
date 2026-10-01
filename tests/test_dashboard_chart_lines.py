@@ -150,11 +150,36 @@ def test_coverage_shades_before_source_start_and_marker_is_drawn() -> None:
         markers=(Marker(day(3), "exact series starts Oct 1"),),
     )
     html = line_chart((Series("a", pts(1, 2, 3, 4)),), spec, UTC)
-    assert html.count('<rect class="uncovered"') == 1  # the source covering it all draws none
+    # "old" covers the whole window, so nothing is uncovered: a late start is only a rule
+    assert html.count('<rect class="uncovered"') == 0
+    assert html.count('<line class="cov-start"') == 1
     assert ">events.db from 2026-09-30</text>" in html
     assert "sources: old from 2026-09-23 00:00, events.db from 2026-09-30 00:00" in html
     assert re.search(r'class="marker-rule"[^>]*stroke-dasharray="2 2"', html)
     assert ">exact series starts Oct 1</text>" in html
+
+
+def test_uncovered_shade_stops_at_the_earliest_source_not_the_latest() -> None:
+    spec = LineSpec("t", coverage=(Coverage("early", day(1)), Coverage("late", day(3))))
+    html = line_chart((Series("a", pts(1, 2, 3, 4, 5)),), spec, UTC)
+    rects = re.findall(r'<rect class="uncovered" x="([\d.]+)" y="[\d.]+" width="([\d.]+)"', html)
+    rules = [float(x) for x in re.findall(r'<line class="cov-start" x1="([\d.]+)"', html)]
+    assert len(rects) == 1 and len(rules) == 2
+    x0, width = map(float, rects[0])
+    assert x0 + width == pytest.approx(min(rules))  # ends at "early", not at "late"
+
+
+def test_each_panel_is_shaded_by_its_own_source_only() -> None:
+    spec = LineSpec("t", coverage=(Coverage("a", day(-9)), Coverage("b", day(3))))
+    panels = (
+        Panel("a", (Series("a", pts(5, 5, 5, 5, 5)),)),
+        Panel("b", (Series("b", pts(0, 0, 0, 1, 1)),)),
+    )
+    html = small_multiples(panels, spec, UTC)
+    figs = re.findall(r'<figure class="panel">.*?</figure>', html, re.S)
+    by_key = {re.search(r"panel-key[^>]*>([ab])<", f).group(1): f for f in figs}
+    assert 'class="uncovered"' not in by_key["a"]  # a covers its whole window
+    assert by_key["b"].count('class="uncovered"') == 1
 
 
 def test_empty_series_renders_an_empty_state_not_an_error() -> None:

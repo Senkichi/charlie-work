@@ -9,6 +9,7 @@ while the SVG keeps ``role="img"``.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import tzinfo
 
 from ..pages.now_fmt import link
@@ -70,6 +71,8 @@ def small_multiples(
             t1=window[1],
             y_ticks=y_ticks,
         )
+        # a panel is shaded by its own source's coverage, never by another repo's start
+        own = replace(shared, coverage=tuple(c for c in shared.coverage if c.source == panel.key))
         label = summary(f"{spec.title}: {panel.key}", panel.series, shared, tz, window)
         svg = (
             svg_open(
@@ -79,7 +82,7 @@ def small_multiples(
                 "line-chart panel-chart",
                 {"data-y-max": num(y_ticks[-1])},
             )
-            + plot(panel.series, shared, f, tz, labels=len(panel.series) > 1, max_x_ticks=3)
+            + plot(panel.series, own, f, tz, labels=len(panel.series) > 1, max_x_ticks=3)
             + "</svg>"
         )
         heading = link(panel.href, panel.key, cls="panel-key")
