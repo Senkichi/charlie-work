@@ -24,7 +24,9 @@ Routing contract (every exit of ``autofix_body_closing_kw``):
 - body repaired and/or rerun requested -> ``CommandResult(False, ...)``;
 - rerun refused because the run is still in progress, or the scan's pr_view /
   pr_commits / compare fetch failed -> held, retried next pass (a fetch failure
-  says nothing about the body, and an escalation is terminal while Lint is red);
+  says nothing about the body, and an escalation is terminal while Lint is red).
+  A scan-unavailable hold spends the per-head attempt budget, so a persistent
+  fetch failure escalates via ``attempt_cap_exceeded`` instead of holding forever;
 - body edit or rerun failure, or a body finding with no declared target -> escalate.
 """
 
@@ -90,6 +92,9 @@ def autofix_body_closing_kw(
         return _escalate_autofix_failure(app, pr_number, issue_number, head_sha, result.reason)
     if result.outcome is AutofixOutcome.HELD:
         if result.reason == SCAN_UNAVAILABLE_REASON:
+            # A persistent fetch failure must not hold the Lint-red lane forever:
+            # each held pass spends the per-head budget, so the cap escalates it.
+            _persist_attempts(app, pr_number, issue_number, head_sha, attempts_by_head)
             return _wf.CommandResult(
                 False,
                 f"PR #{pr_number} closing-keyword autofix held: PR scan unavailable, retrying",
@@ -103,6 +108,40 @@ def autofix_body_closing_kw(
     return _record_autofix(app, pr_number, issue_number, head_sha, attempts_by_head, result)
 
 
+def _with_attempt(
+    state: dict[str, Any],
+    pr_number: int,
+    issue_number: int,
+    head_sha: str,
+    attempts_by_head: dict[str, int],
+) -> dict[str, Any]:
+    """Spend one per-head autofix attempt in ``state['prs']``."""
+    state["prs"][str(pr_number)] = {
+        **state["prs"].get(str(pr_number), {}),
+        "number": pr_number,
+        "issue_number": issue_number,
+        _ATTEMPTS_KEY: {
+            **attempts_by_head,
+            head_sha: int(attempts_by_head.get(head_sha, 0)) + 1,
+        },
+    }
+    return state
+
+
+def _persist_attempts(
+    app: Any,
+    pr_number: int,
+    issue_number: int,
+    head_sha: str,
+    attempts_by_head: dict[str, int],
+) -> None:
+    """Spend one per-head attempt for a held pass (no event)."""
+    with _wf.state_lock(app.paths.state_file):
+        state = _wf.load_state(app.paths.state_file)
+        state = _with_attempt(state, pr_number, issue_number, head_sha, attempts_by_head)
+        _wf.save_state(app.paths.state_file, state)
+
+
 def _record_autofix(
     app: Any,
     pr_number: int,
@@ -114,15 +153,7 @@ def _record_autofix(
     """Persist the attempt count and emit ``pr_body_closing_keyword_autofixed``."""
     with _wf.state_lock(app.paths.state_file):
         state = _wf.load_state(app.paths.state_file)
-        state["prs"][str(pr_number)] = {
-            **state["prs"].get(str(pr_number), {}),
-            "number": pr_number,
-            "issue_number": issue_number,
-            _ATTEMPTS_KEY: {
-                **attempts_by_head,
-                head_sha: int(attempts_by_head.get(head_sha, 0)) + 1,
-            },
-        }
+        state = _with_attempt(state, pr_number, issue_number, head_sha, attempts_by_head)
         state = app._record_event(
             state,
             # event-consumer: audit-only -- the repair already happened (body edited,

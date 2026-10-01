@@ -16,7 +16,10 @@ from _review_fixtures import _required_checks_config
 from charlie_work.instrumentation import query_events
 from charlie_work.github import GitHubError
 from charlie_work.paths import runtime_paths
-from charlie_work.pr_body_closing_autofix import rewrite_unexpected_body_references
+from charlie_work.pr_body_closing_autofix import (
+    MAX_AUTOFIX_ATTEMPTS_PER_HEAD,
+    rewrite_unexpected_body_references,
+)
 from charlie_work.state import load_state, save_state
 from charlie_work.unescalate_reset_fields import (
     REWORK_BUDGET_RESET_BY_ESCALATION_REASON,
@@ -215,6 +218,24 @@ def test_scan_pr_view_error_holds_then_retries(tmp_path: Path) -> None:
         fake.pr_view_error = None
 
     _assert_held_and_retries(tmp_path, fake, _recover)
+
+
+def test_persistent_scan_failure_escalates_at_attempt_cap(tmp_path: Path) -> None:
+    fake = _GateFake(failed_steps=[_GATE_STEP])
+    fake.commits_unavailable = True  # never clears
+
+    for _ in range(MAX_AUTOFIX_ATTEMPTS_PER_HEAD):
+        held, paths, _config = _review(tmp_path, fake)
+        assert held.data.get("scan_unavailable") is True
+        assert load_state(paths.state_file)["issues"].get("123", {}).get("status") != "escalated"
+
+    result = OrchestratorApp(tmp_path, paths, _required_checks_config(), fake).review(456)
+
+    assert result.data.get("closing_keyword_autofix_failed") is True
+    assert load_state(paths.state_file)["issues"]["123"]["status"] == "escalated"
+    assert fake.pr_edits == []
+    assert fake.rerun_calls == []
+    assert "pr_body_closing_keyword_autofix_failed" in _kinds(paths)
 
 
 def test_attempt_cap_per_head_escalates(tmp_path: Path) -> None:
