@@ -11,6 +11,7 @@ from datetime import timedelta
 from typing import Any
 
 import pytest
+from _dashboard_page_fixtures import _parse
 from _dashboard_rollup_fixtures import ALPHA, BETA, NOW, fleet  # noqa: F401
 
 from charlie_work import instrumentation
@@ -139,7 +140,9 @@ def test_each_drill_route_renders_in_house_style(served, path: str) -> None:
     assert "as of <b><time" in body and "(local)" in body  # same header as Now
     assert 'class="fresh"' in body and 'id="theme-toggle"' in body
     assert '<link rel="stylesheet" href="/static/drill.css">' in body
-    assert not re.search(r"<script(?![^>]*\bsrc=)", body)  # no inline script (CSP)
+    parsed = _parse(body)  # the parser, not a regex: a regex misses `</script >`
+    assert all(a.get("src", "").startswith("/static/") for t, a in parsed.tags if t == "script")
+    assert all(b == "" for b in parsed.script_bodies)  # no inline script (CSP)
     assert " style=" not in body and "<style" not in body
     assert HOSTILE not in body
 
