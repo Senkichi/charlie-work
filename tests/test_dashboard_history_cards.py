@@ -34,3 +34,22 @@ def test_panel_links_only_to_repos_the_registry_holds() -> None:
     s = _series(per_repo={"o/fleet-repo": pts, "o/runner-only": pts})
     got = {p.key: p.href for p in _panels((s,), False, frozenset({"o/fleet-repo"}))}
     assert got == {"fleet-repo": "/repo/o/fleet-repo", "runner-only": None}
+
+
+def test_history_buckets_sit_on_the_local_calendar_grid() -> None:
+    from datetime import timedelta, timezone
+
+    from charlie_work.dashboard.history_data import bucket_end, range_query
+
+    tz = timezone(timedelta(hours=-7))
+    now = datetime(2026, 10, 1, 23, 21, tzinfo=UTC)  # 16:21 local
+    q = range_query("30d", now, tz)
+    assert q.end.astimezone(tz) == datetime(2026, 10, 1, tzinfo=tz)  # last whole local day
+    assert q.start.astimezone(tz).time().isoformat() == "00:00:00"  # each bar = one day
+    six = bucket_end(now, timedelta(hours=6), tz).astimezone(tz)
+    assert (six.hour, six.minute) == (12, 0)
+    # boundaries do not drift between reloads inside one bucket
+    assert range_query("7d", now + timedelta(minutes=50), tz) == range_query("7d", now, tz)
+    three = bucket_end(now, timedelta(days=3), tz).astimezone(tz)
+    assert three.time().isoformat() == "00:00:00"
+    assert (three.date() - datetime(2026, 1, 1).date()).days % 3 == 0

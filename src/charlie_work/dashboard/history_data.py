@@ -15,7 +15,7 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, date, datetime, timedelta, tzinfo
 from pathlib import Path
 
 from .metrics import TABS, tab_series
@@ -48,10 +48,31 @@ def pick_range(raw: str | None) -> str:
     return key if key in RANGES else DEFAULT_RANGE
 
 
-def range_query(range_key: str, now: datetime) -> MetricQuery:
-    """The window ending at ``now`` (to the minute) with the range's bucket size."""
+_GRID_EPOCH = date(2026, 1, 1)  # multi-day buckets count whole days from here (stable grid)
+
+
+def bucket_end(now: datetime, bucket: timedelta, tz: tzinfo | None = None) -> datetime:
+    """The last local bucket boundary at or before ``now``: History draws whole buckets.
+
+    Sub-day buckets sit on a grid from local midnight (6h: 00/06/12/18), day buckets on
+    local midnights, multi-day buckets every N days from ``_GRID_EPOCH``. So a "day" bar is
+    one calendar day and boundaries do not move between reloads. The still-filling bucket
+    is left out (Now shows the live state): a partial newest bucket would read as a dip,
+    and a window reaching past ``now`` would bias a count's per-day rate against the
+    prior window. The grid uses ``now``'s UTC offset, so across a DST change older
+    boundaries sit an hour off local midnight (fixed-length buckets, by design).
+    """
+    local = now.astimezone(tz)
+    base = local.replace(hour=0, minute=0, second=0, microsecond=0)
+    if bucket >= timedelta(days=1):
+        base -= timedelta(days=(base.date() - _GRID_EPOCH).days % (bucket // timedelta(days=1)))
+    return (base + ((local - base) // bucket) * bucket).astimezone(UTC)
+
+
+def range_query(range_key: str, now: datetime, tz: tzinfo | None = None) -> MetricQuery:
+    """The range's window ending at the last whole local bucket boundary (``bucket_end``)."""
     span, bucket = RANGES[range_key]
-    end = now.replace(second=0, microsecond=0)
+    end = bucket_end(now, bucket, tz)
     return MetricQuery(end - span, end, bucket)
 
 
