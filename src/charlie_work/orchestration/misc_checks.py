@@ -313,42 +313,6 @@ def _is_stale_ci_request_changes(self, pr_number: int, decision: dict[str, Any])
     return is_stale_ci_verdict(decision, summarize_checks(checks, required))
 
 
-def _merge_not_ready_result(
-    self,
-    pr_number: int,
-    issue_number: int | None,
-    decision: dict[str, Any],
-    existing_pr_state: dict[str, Any],
-) -> _wf.CommandResult:
-    """Return a non-mergeable result for an approved PR that is not the train head."""
-    return _wf.CommandResult(
-        True,
-        f"PR #{pr_number} is not the head of the merge-train queue",
-        {
-            "pr": pr_number,
-            "issue": issue_number,
-            "can_merge": False,
-            "auto_merge_enabled": self.config.auto_merge.enabled,
-            "merged": False,
-            "merge_output": None,
-            "branch_deleted": None,
-            "review_decision": decision,
-            "checks": asdict(summarize_checks([], self.config.auto_merge.required_checks)),
-            "checks_unavailable": False,
-            "label_error": None,
-            "update_open_prs_results": None,
-            "cancel_superseded_runs_results": None,
-            "containment_warnings": [],
-            "consecutive_failed_merge_attempts": existing_pr_state.get(
-                "consecutive_failed_merge_attempts", 0
-            ),
-            "merge_attempt_alarm": False,
-            "merge_attempt_warning": None,
-            "merge_conflict": False,
-        },
-    )
-
-
 def _drive_infra_rerun_or_escalate(
     self,
     pr_number: int,
