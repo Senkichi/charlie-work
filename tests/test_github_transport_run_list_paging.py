@@ -138,6 +138,12 @@ def test_a_disabled_same_named_workflow_is_ignored_like_gh() -> None:
     assert route == f"{WORKFLOWS}/2/runs"
 
 
+@pytest.mark.parametrize("state", ["disabled_inactivity", "disabled_fork"])
+def test_a_non_manually_disabled_workflow_still_resolves_by_name_like_gh(state: str) -> None:
+    route = _resolved_route("CI", [{"id": 7, "name": "CI", "state": state}])
+    assert route == f"{WORKFLOWS}/7/runs"
+
+
 def test_an_uppercase_file_suffix_is_a_file_not_a_name() -> None:
     transport = FakeTransport(lambda r: ok({"workflow_runs": [_run(1)]}))
     RunListRead("databaseId", workflow="CI.YML").execute(transport, "o", "r")
