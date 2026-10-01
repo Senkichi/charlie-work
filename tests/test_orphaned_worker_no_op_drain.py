@@ -334,6 +334,49 @@ def test_stale_prior_round_outcome_is_not_quoted_in_rebuttal_or_escalation(
     assert any(k.startswith("worktree:") for k in entry["stale_evidence_reported"])
 
 
+def test_fresh_terminal_record_embedding_leftover_outcome_is_not_quoted(
+    tmp_path: Path,
+) -> None:
+    """#2102: a fresh ``ended_at`` must not launder a reused worktree's leftover.
+
+    The watcher copies the outcome file into the terminal record at exit; with a
+    reused worktree that file is a prior round's, and only the record's
+    ``worker_outcome_written_at`` says so.
+    """
+    config, paths, gh = _bed_lint(tmp_path, lint_red=False)
+    sessions = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions.mkdir(parents=True, exist_ok=True)
+    now = datetime.now(UTC)
+    write_worker_terminal_status(
+        sessions / "issue-207.claude-code.terminal.json",
+        pid=99999,
+        exit_code=0,
+        started_at=(now - timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        ended_at=(now - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        duration_seconds=300.0,
+        worker_outcome={
+            "push_succeeded": True,
+            "head_sha": "abc123",
+            "pr_comment": "Round-2 rework pushed.",
+        },
+        worker_outcome_written_at=(now - timedelta(hours=3)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    )
+    app = OrchestratorApp(tmp_path, paths, config, gh)
+    calls: list[int] = []
+
+    def review(pr_number: int) -> CommandResult:
+        calls.append(pr_number)
+        return CommandResult(True, "packet", {"pr": pr_number})
+
+    _sweep(tmp_path, paths, config, gh, app, review=review)
+    state = load_state(paths.state_file)
+    entry = state["issues"]["207"]
+    assert calls == []
+    assert entry["no_op_worker_comment"] is None
+    assert "Round-2" not in json.dumps(state["events"])
+    assert any(k.startswith("terminal:") for k in entry["stale_evidence_reported"])
+
+
 def test_fresh_outcome_after_dispatch_is_still_quoted(tmp_path: Path) -> None:
     config, paths, gh = _bed_lint(tmp_path, lint_red=False)
     _terminal_exit_zero(tmp_path)

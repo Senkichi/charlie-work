@@ -156,13 +156,20 @@ def _read_rework_outcome(
     terminal_evidence: worker_fate.TerminalEvidence | None = None
     record = find_worker_terminal_status(sessions_dir, issue_number)
     if isinstance(record, dict):
+        ended_at = worker_fate.parse_iso_timestamp(record.get("ended_at"))
+        # The embedded outcome may be a prior round's leftover copied out of a
+        # reused worktree, so its own write time -- not the record's ended_at --
+        # is what freshness must judge (same anchor as blocked_worker_outcome).
+        terminal_written_at = (
+            worker_fate.parse_iso_timestamp(record.get("worker_outcome_written_at")) or ended_at
+        )
         terminal_evidence = worker_fate.TerminalEvidence(
-            ended_at=worker_fate.parse_iso_timestamp(record.get("ended_at")) or datetime.now(UTC),
+            ended_at=ended_at or datetime.now(UTC),
             exit_code=record.get("exit_code"),
             outcome=_outcome_evidence(
                 record.get("worker_outcome"),
                 source=worker_fate.EvidenceSource.TERMINAL,
-                written_at=worker_fate.parse_iso_timestamp(record.get("ended_at")),
+                written_at=terminal_written_at,
             ),
         )
 
