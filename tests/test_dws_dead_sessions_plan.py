@@ -15,6 +15,7 @@ from charlie_work.dead_worker_sweep.decide_dead_sessions_plan import (
     DEAD_REAP_PERSIST_SOURCE,
     LAUNCH_FAILURE_PERSIST_SOURCE,
     DeadClassification,
+    EmitBackgroundExit,
     EmitProviderSuspended,
     EscalateLaunchFailure,
     NoPrGate,
@@ -123,6 +124,25 @@ def test_dead_classification_arms(is_completed, unknown, expected):
     )
 
 
+def test_dead_classification_background_exit_overrides_stalled_not_completed_or_unknown():
+    bg = "worker_exited_with_background_work"
+    assert plan_dead_classification(
+        is_completed=False, worktree_unknown=False, background_exit=True
+    ) == DeadClassification(True, False, bg)
+    assert (
+        plan_dead_classification(
+            is_completed=False, worktree_unknown=True, background_exit=True
+        ).fallback_kind
+        is None
+    )
+    assert (
+        plan_dead_classification(
+            is_completed=True, worktree_unknown=False, background_exit=True
+        ).fallback_kind
+        == "unpublished_work"
+    )
+
+
 # -- _reap_dead: reap steps -------------------------------------------------------
 
 
@@ -145,6 +165,16 @@ def test_dead_classification_arms(is_completed, unknown, expected):
                 ReapSidecar(),
                 WarnLiteralTmp(),
                 EmitProviderSuspended(),
+                ReclaimOrRoute(),
+            ),
+        ),
+        (
+            "worker_exited_with_background_work",
+            (
+                PersistFailure(DEAD_REAP_PERSIST_SOURCE),
+                ReapSidecar(),
+                WarnLiteralTmp(),
+                EmitBackgroundExit(),
                 ReclaimOrRoute(),
             ),
         ),
@@ -257,3 +287,10 @@ def test_open_pr_route_arms(completed, has_pr, expected):
 def test_open_pr_candidate_route_arms():
     assert open_pr_candidate_route(is_candidate=True) is OpenPrRoute.ROUTE_PRE_REVIEW
     assert open_pr_candidate_route(is_candidate=False) is OpenPrRoute.RESTORE
+
+
+def test_persist_source_constants_match_the_shell_audit_literals():
+    # dead_sessions.py passes these as string literals (the throttle-source audit
+    # guard rejects a variable); this keeps the plan's constants honest.
+    assert LAUNCH_FAILURE_PERSIST_SOURCE == "dead_sessions_launch_failure"
+    assert DEAD_REAP_PERSIST_SOURCE == "dead_sessions_reap"

@@ -20,6 +20,7 @@ from datetime import datetime
 from enum import Enum
 
 from .decide_dead_sessions import (
+    BACKGROUND_EXIT_FAILURE_KIND,
     dead_fallback_kind,
     escalation_class,
     launch_failure_escalates,
@@ -61,6 +62,11 @@ class WarnLiteralTmp:
 
 
 @dataclass(frozen=True)
+class EmitBackgroundExit:
+    """Issue #2096: warning event for a fast clean exit that left uncommitted work."""
+
+
+@dataclass(frozen=True)
 class EmitProviderSuspended:
     """Issue #1342: error-level event on the first detection of an account suspension."""
 
@@ -76,6 +82,7 @@ Step = (
     | ReapSidecar
     | RestoreRework
     | WarnLiteralTmp
+    | EmitBackgroundExit
     | EmitProviderSuspended
     | ReclaimOrRoute
 )
@@ -108,12 +115,16 @@ class DeadClassification:
     fallback_kind: str | None
 
 
-def plan_dead_classification(*, is_completed: bool, worktree_unknown: bool) -> DeadClassification:
+def plan_dead_classification(
+    *, is_completed: bool, worktree_unknown: bool, background_exit: bool = False
+) -> DeadClassification:
     return DeadClassification(
         post_mortem_first=not is_completed,
         session_completed=is_completed,
         fallback_kind=dead_fallback_kind(
-            is_completed=is_completed, worktree_unknown=worktree_unknown
+            is_completed=is_completed,
+            worktree_unknown=worktree_unknown,
+            background_exit=background_exit,
         ),
     )
 
@@ -124,6 +135,8 @@ def plan_dead_reap(failure_kind: str | None) -> tuple[Step, ...]:
     if failure_kind:
         steps.append(PersistFailure(DEAD_REAP_PERSIST_SOURCE))
     steps.extend((ReapSidecar(), WarnLiteralTmp()))
+    if failure_kind == BACKGROUND_EXIT_FAILURE_KIND:
+        steps.append(EmitBackgroundExit())
     if failure_kind == PROVIDER_SUSPENDED_KIND:
         steps.append(EmitProviderSuspended())
     steps.append(ReclaimOrRoute())

@@ -34,6 +34,8 @@ UNESCALATE_PR_RESET_FIELDS = (
     # this keeps the pair consistent with the other _last_head baselines).
     "review_dispatch_attempt_last_head",
     "review_log_unreadable_streak",
+    # Issue #1808: provider api-error streak is a re-arm-scoped counter.
+    "review_api_error_streak",
     # Issue #1439: turn-limit miss streak must not survive a re-arm, or
     # the cap-aware backstop would re-escalate instantly on the next
     # turn-limit death.
