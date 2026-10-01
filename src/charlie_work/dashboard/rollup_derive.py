@@ -57,8 +57,12 @@ def _dispatch(ev: dict) -> list[Row]:
 
 
 def _dispatch_rework(ev: dict) -> list[Row]:
+    """One row per reworked issue. A batch event carries ONE ``pr_number``: the first
+    *selected* issue's PR (state_dispatch_rework), which need not be the first listed one,
+    so no batch member can be told it is theirs -- only a lone issue gets the PR. Tagging
+    every member with it merged another issue's PR into their timelines (W3-02)."""
     issues = _ints(ev["payload"].get("issue_numbers")) or [ev["issue_number"]]
-    pr = ev["payload"].get("pr_number", ev["pr_number"])
+    pr = ev["payload"].get("pr_number", ev["pr_number"]) if len(issues) == 1 else None
     return [_milestone(ev, "rework_dispatched", i, pr) for i in issues]
 
 
