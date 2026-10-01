@@ -12,18 +12,12 @@ from datetime import datetime, tzinfo
 
 from ..charts.lanes import Band, Lane, lane_chart
 from ..drill import IssueDrill, TimelineEntry
-from ..metrics_flow import STAGES
+from ..metrics_flow import STAGE_NAMES, STAGES
 from ..read_model import ModelState
 from ..timeutil import parse_ts
 from .drill_shell import page, section, table, ts_tag
 from .now_fmt import age, esc, issue_url, link, local_time, pr_url, repo_url, short_repo
 
-STAGE_NAMES = {
-    "in_progress": "In progress",
-    "pr_open": "PR open",
-    "reviewing": "Reviewing",
-    "needs_rework": "Needs rework",
-}
 _CATEGORY = {"lifecycle": "Lifecycle", "review": "Review", "escalation": "Escalation",
              "worker": "Worker"}  # fmt: skip
 

@@ -32,6 +32,13 @@ APPROX_STAGES: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "needs_rework": (("verdict_request_changes",), ("rework_dispatched",)),
 }
 STAGES = tuple(APPROX_STAGES)
+# Display names, shared by History titles and the issue drill-down.
+STAGE_NAMES = {
+    "in_progress": "In progress",
+    "pr_open": "PR open",
+    "reviewing": "Reviewing",
+    "needs_rework": "Needs rework",
+}
 _LIFECYCLE_KINDS = ("lifecycle_transition", "ready_observed", "reconcile", "dispatch")
 _HOURS = 3600.0
 
@@ -145,7 +152,7 @@ def stage_time(db: sqlite3.Connection, q: MetricQuery, stage: str) -> Series:
         if spans:
             samples.append((spans[-1][1], source, sum(_hours(a, b) for a, b in spans)))
     spec = SeriesSpec(
-        f"stage_time.{stage}", f"Stage time: {stage}", "hours", "duration", _LIFECYCLE_KINDS,
+        f"stage_time.{stage}", f"Stage time: {STAGE_NAMES.get(stage, stage)}", "hours", "duration", _LIFECYCLE_KINDS,
         any_kind=True,
     )  # fmt: skip
     return _timing_series(db, q, spec, samples, cut)

@@ -107,3 +107,10 @@ def test_the_headline_comparison_is_drawn_on_the_chart() -> None:
     assert "prior 7d avg 0.25" in re.search(r'aria-label="([^"]+)"', drawn).group(1)
     bare = render_card(view, MetricData("m", (head,), {"m": "not comparable"}, {"m": None}), UTC)
     assert 'class="ref' not in bare
+
+
+def test_stage_time_titles_use_display_names() -> None:
+    from charlie_work.dashboard.metrics_flow import STAGE_NAMES, STAGES
+
+    assert set(STAGES) <= set(STAGE_NAMES)
+    assert all("_" not in name for name in STAGE_NAMES.values())
