@@ -1,13 +1,20 @@
 """Body-change escape for the janitor's no-op rework gate (issue #1939).
 
 Extracted from ``janitor.py`` to keep that module under its recorded
-file-size-ratchet mark: these two helpers are the whole of the #1939
-body-change signal, distinct from the diff/head comparisons that stay in
+file-size-ratchet mark: ``_body_content_sha256`` and
+``_body_rework_escape_warning`` are the whole of the #1939 body-change
+signal, distinct from the diff/head comparisons that stay in
 ``janitor.py``'s ``_check_no_op_rework`` as the pre-existing checks they
-already were. ``janitor.py`` imports ``_body_rework_escape_warning`` back and
-``workflow.py`` re-exports ``_body_content_sha256`` through its facade block
-(reached via ``_wf.`` by ``orchestration/state_record_review.py``); nothing
-here imports back, so there is no cycle.
+already were. ``_request_changes_body_drifted`` (issue #1983) applies the
+same baseline contract at the review-queue boundary: a ``request_changes``
+verdict whose recorded body hash no longer matches the live body must not
+carry forward or reroute to rework -- it queues a fresh review instead.
+``janitor.py`` imports ``_body_rework_escape_warning`` back,
+``orchestration/github_ops_review_queue.py`` imports
+``_request_changes_body_drifted``, and ``workflow.py`` re-exports
+``_body_content_sha256`` through its facade block (reached via ``_wf.`` by
+``orchestration/state_record_review.py``); nothing here imports back, so
+there is no cycle.
 
 Background (swole #198 / PR #348): a request_changes finding whose required
 fix lives in the PR body/description produces no code delta by construction
@@ -76,3 +83,36 @@ def _body_rework_escape_warning(
             "delta but is not a no-op (issue #1939)"
         )
     return None
+
+
+def _request_changes_body_drifted(
+    review_decision: Mapping[str, Any] | None,
+    pr: Mapping[str, Any],
+) -> bool:
+    """True when a ``request_changes`` verdict's body baseline drifted (issue #1983).
+
+    The carry-forward/reroute half of the #1939 body-change signal: a
+    ``request_changes`` verdict whose required fixes live in the PR body is
+    superseded once the live body differs from the verdict's
+    ``reviewed_body_sha256`` baseline -- the body-only rework already
+    happened, and neither ``_check_carry_forward`` (patch-id/line-content)
+    nor ``_reroute_stranded_request_changes`` can see it. ``review_queue()``
+    treats drifted verdicts as stale and queues a fresh review; the verdict
+    is superseded by the new recorded verdict, never auto-approved.
+
+    Fails closed -- a non-``request_changes`` verdict (an ``approved``
+    verdict still carries forward across a body edit), a missing/empty
+    baseline (a verdict recorded before ``reviewed_body_sha256`` existed),
+    or a PR payload without a ``body`` key all return False and preserve
+    the pre-#1983 behavior exactly.
+    """
+    decision = review_decision or {}
+    if decision.get("decision") != "request_changes":
+        return False
+    reviewed_body_sha256 = decision.get("reviewed_body_sha256")
+    return (
+        isinstance(reviewed_body_sha256, str)
+        and bool(reviewed_body_sha256)
+        and "body" in pr
+        and _body_content_sha256(pr.get("body")) != reviewed_body_sha256
+    )

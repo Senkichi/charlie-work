@@ -40,6 +40,7 @@ from charlie_work.github import (
 )
 from charlie_work.instrumentation import log_event
 from charlie_work.notify import AttentionDigest, AttentionEntry
+from charlie_work.no_op_rework_body import _request_changes_body_drifted
 from charlie_work.pass_deadline import (
     PassDeadline,
     PassDeadlineExceeded,
@@ -516,7 +517,11 @@ def _loop_body(
                 template_current = packet_template_sha is None or (
                     packet_template_sha == current_template_sha
                 )
-                if head_current and template_current:
+                # #1983: drifted request_changes re-reviews at same head; packet needs live body.
+                body_current = not _request_changes_body_drifted(
+                    self._review_decision(pr_number), pr
+                ) or self._packet_body_current(pr_number, pr)
+                if head_current and template_current and body_current:
                     # Packet is current — skip regenerating it. The
                     # already_approved branch above is evaluated earlier
                     # in this same pass and may not see a decision file an

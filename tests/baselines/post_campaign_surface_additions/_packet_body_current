@@ -1,0 +1,9 @@
+issue #2080: compares the review packet's stored PR body (via
+_read_packet_body) against the live body so loop()'s same-head packet skip
+regenerates the packet after a body-only rework -- otherwise the fresh
+review reads the old body and record_review re-stamps
+reviewed_body_sha256 from it, re-creating the drift the requeue was meant
+to resolve. Net-new OrchestratorApp member added after the Track 2 Phase B
+surface baseline was pinned; declared here so the member-surface
+conservation check in tests/test_workflow_delegation_l00.py subtracts it
+before comparing moved delegates against the pre-campaign total (133).
