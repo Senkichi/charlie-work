@@ -396,8 +396,10 @@ def test_log_event_rows_feed_the_evaluators(tmp_path: Path) -> None:
     assert f.severity == "anomaly" and f.facts == "total_events=1 recent=1 lookback_hours=24"
 
     errors = _rows(db, "SELECT ts, kind FROM events WHERE level = 'error'")
+    # Only supervisor_wedge_loop is error-level among the three events written above.
+    assert errors == [(errors[0][0], "supervisor_wedge_loop")]
     assert ha.eval_error_events("o/r", errors, past).facts == (
-        f"error_rows={len(errors)} new_since_last_beat={len(errors)}"
+        "error_rows=1 new_since_last_beat=1"
     )
 
 
@@ -436,6 +438,58 @@ def test_modules_are_stdlib_only_leaves_without_clock_or_io(name: str) -> None:
     assert not {m for m in imported if m and m.startswith(("ci_fleet",))}
     assert {m for m in imported if m and m.startswith("charlie_work")} <= allowed_pkg
     assert not {"sqlite3", "subprocess", "os", "shutil"} & imported
-    text = src.read_text(encoding="utf-8")
-    assert "datetime.now(" not in text and "time.time(" not in text
-    assert len(text.splitlines()) < 400
+    assert not _clock_or_io_calls(tree), "leaf must stay clock- and I/O-free"
+    assert len(src.read_text(encoding="utf-8").splitlines()) < 400
+
+
+_CLOCK_ATTR_CALLS = {
+    ("datetime", "now"),
+    ("datetime", "utcnow"),
+    ("datetime", "today"),
+    ("date", "today"),
+    ("time", "time"),
+    ("time", "monotonic"),
+    ("time", "perf_counter"),
+    ("sqlite3", "connect"),
+}
+_IO_METHODS = {"read_text", "read_bytes", "open", "write_text", "write_bytes"}
+
+
+def _clock_or_io_calls(tree: ast.AST) -> list[str]:
+    """Call nodes that read a clock or touch the filesystem/database."""
+    found: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        fn = node.func
+        if isinstance(fn, ast.Name) and fn.id == "open":
+            found.append("open()")
+        elif isinstance(fn, ast.Attribute):
+            base = fn.value
+            base_name = (
+                base.id
+                if isinstance(base, ast.Name)
+                else base.attr
+                if isinstance(base, ast.Attribute)
+                else None
+            )
+            if (base_name, fn.attr) in _CLOCK_ATTR_CALLS:
+                found.append(f"{base_name}.{fn.attr}()")
+            elif fn.attr in _IO_METHODS:
+                found.append(f".{fn.attr}()")
+    return found
+
+
+def test_clock_io_detector_flags_known_positives() -> None:
+    """Positive control: the AST walk must catch each forbidden shape."""
+    snippets = [
+        "datetime.datetime.now()",
+        "datetime.now()",
+        "date.today()",
+        "time.monotonic()",
+        "open('x')",
+        "Path('x').read_text()",
+        "sqlite3.connect('x')",
+    ]
+    bad = ast.parse(chr(10).join(snippets))
+    assert len(_clock_or_io_calls(bad)) == 7

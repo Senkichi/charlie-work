@@ -22,6 +22,11 @@ Timestamp convention: ``ts`` strings are ISO ``T``/``Z`` text and are compared
 here in Python on parsed datetimes, never in SQL (SQLite's space-separated
 ``datetime()`` strings sort differently and mis-compare silently). An
 unparseable ``ts`` fails toward visibility (reported), not silence.
+
+``parse_iso`` is the single copy for every verdict and the heartbeat scripts.
+Behavior change vs the pre-extraction script copy: it also swallows
+``AttributeError`` (a non-string ``ts``, e.g. an int from a malformed row,
+returns ``None`` instead of raising).
 """
 
 from __future__ import annotations

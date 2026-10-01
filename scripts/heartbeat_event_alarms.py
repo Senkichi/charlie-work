@@ -4,7 +4,7 @@ The five checks here share one signature
 (``report, repo, baseline -> None``), one db-availability posture (a missing
 or unreadable ``events.db`` is ``report.anom`` -- a registered repo this
 check cannot read is a repo it cannot vouch for), and one timestamp
-convention (ISO ``ts`` strings parsed with ``parse_iso`` and compared
+convention (ISO ``ts`` strings parsed with the leaf's ``heartbeat_alarms.parse_iso`` and compared
 against ``baseline`` in Python, never in SQL -- see
 ``check_loop_pass_freshness``'s docstring in ``heartbeat_check.py`` for the
 ISO-``T``/``Z``-vs-SQLite-space-format trap).
@@ -28,18 +28,19 @@ Stdlib-only, same constraint as ``heartbeat_check.py`` itself
 the guarded ``charlie_work.event_kinds`` leaf below, and never an import
 back into ``heartbeat_check`` -- that would cycle through its loader block,
 which is also why ``Report``/``RepoInfo`` are ``TYPE_CHECKING``-only names
-and ``parse_iso`` is mirrored below rather than shared.
+and the shared ``parse_iso`` comes from the ``charlie_work.heartbeat_alarms`` leaf.
 """
 
 from __future__ import annotations
 
 import sqlite3
 from collections.abc import Callable
-from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from datetime import datetime
+
     # ``heartbeat_check`` is not importable as a module at runtime
     # (``scripts/`` is not a package and stays off ``sys.path``); these names
     # exist so the moved functions keep their original annotations
@@ -87,26 +88,53 @@ except ImportError:
 # The verdict logic for every check below lives in the stdlib-only leaf
 # ``charlie_work.heartbeat_alarms`` (shared with the fleet dashboard); this
 # module only reads events.db and adapts the returned ``Finding`` onto the
-# heartbeat ``Report``. Guarded like ``event_kinds``: with the package absent a
-# check reports an ANOMALY it cannot evaluate -- visible, never silently green.
-try:
-    from charlie_work import heartbeat_alarms as _ha
-except ImportError:
-    _ha = None
+# heartbeat ``Report``. Resolution order: the installed package first; if
+# ``charlie_work`` is not importable (wrong venv -- see above) the leaf files
+# are loaded BY PATH from ``<repo>/src/charlie_work`` (they are stdlib-only,
+# so that works with no package at all). Only when both fail does a check
+# report a loud ANOMALY it cannot evaluate -- never silently green.
+_LEAF_DIR = Path(__file__).resolve().parent.parent / "src" / "charlie_work"
+# Shared sys.modules name: ``heartbeat_alarms_fleet``'s file-path fallback
+# reuses this entry so ``Finding`` has one identity across both leaves.
+_HA_LEAF_NAME = "_cw_heartbeat_alarms"
 
 
-# Mirrors ``heartbeat_check.parse_iso`` verbatim -- sibling scripts cannot
-# import each other (``scripts/`` is not a package), and a back-import would
-# cycle through ``heartbeat_check``'s loader block. Keep it byte-identical:
-# the timestamp comparison convention above depends on the two copies
-# agreeing.
-def parse_iso(value: str | None) -> datetime | None:
-    if not value:
-        return None
+def _load_leaf_by_path(module_name: str, filename: str) -> Any:
+    """Load ``<repo>/src/charlie_work/<filename>`` by path; ``None`` on any failure."""
+    import importlib.util
+    import sys
+
+    cached = sys.modules.get(module_name)
+    if cached is not None:
+        return cached
+    path = _LEAF_DIR / filename
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
+        spec = importlib.util.spec_from_file_location(module_name, path)
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+        return module
+    except Exception:  # noqa: BLE001 - absent/corrupt leaf => caller reports ANOMALY
+        sys.modules.pop(module_name, None)
         return None
+
+
+def load_alarm_leaves() -> tuple[Any, Any]:
+    """``(heartbeat_alarms, heartbeat_alarms_fleet)``, each ``None`` if unloadable."""
+    try:
+        from charlie_work import heartbeat_alarms as ha
+    except ImportError:
+        ha = _load_leaf_by_path(_HA_LEAF_NAME, "heartbeat_alarms.py")
+    try:
+        from charlie_work import heartbeat_alarms_fleet as haf
+    except ImportError:
+        haf = _load_leaf_by_path("_cw_heartbeat_alarms_fleet", "heartbeat_alarms_fleet.py")
+    return ha, haf
+
+
+_ha, _ = load_alarm_leaves()
 
 
 def _read_rows(

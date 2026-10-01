@@ -23,7 +23,8 @@ wiring itself -- the part no pre-existing test could see:
 * each ``hb.check_*`` attribute IS the sibling's function object -- a local
   ``def`` re-added in ``heartbeat_check.py`` would silently shadow the
   re-export and split the tested object from the deployed one,
-* the mirrored ``parse_iso`` stays byte-identical to ``heartbeat_check``'s
+* ``heartbeat_check``'s remaining ``parse_iso`` copy stays byte-identical to
+  the ``charlie_work.heartbeat_alarms`` leaf's (the single source)
   (the ISO-vs-SQLite timestamp convention depends on the copies agreeing),
 * the sibling never back-imports ``heartbeat_check`` (that would cycle
   through its loader block) and keeps its one sanctioned package import
@@ -48,6 +49,7 @@ from typing import Any
 
 import pytest
 
+from charlie_work import heartbeat_alarms as leaf
 from _heartbeat_check_fixtures import _iso, _load_heartbeat_check, _write_events_db
 from _script_loader import load_script_module
 
@@ -107,7 +109,7 @@ def test_sibling_module_loads_standalone_and_defines_all_five_checks(
             f"heartbeat_event_alarms.py no longer defines {name} -- "
             "heartbeat_check.py's re-export of it would AttributeError at import"
         )
-    assert callable(alarms.parse_iso)
+    assert not hasattr(alarms, "parse_iso"), "dead parse_iso copy reintroduced; use the leaf"
     assert isinstance(alarms.EXPECTED_OPERATIONAL_KINDS, frozenset)
 
 
@@ -149,19 +151,16 @@ def test_heartbeat_check_has_no_local_check_defs_to_shadow_the_reexports() -> No
 
 
 # ---------------------------------------------------------------------------
-# parse_iso parity -- the sibling docstring requires a byte-identical mirror
-# because the ISO-vs-SQLite comparison convention depends on the copies
-# agreeing.
+# parse_iso parity -- heartbeat_check keeps one copy (it must work with no
+# leaf at all); it must stay byte-identical to the leaf, the single source,
+# because the ISO-vs-SQLite comparison convention depends on them agreeing.
 # ---------------------------------------------------------------------------
 
 
-def test_parse_iso_is_byte_identical_to_heartbeat_checks(
-    hb: ModuleType, alarms: ModuleType
-) -> None:
-    assert inspect.getsource(alarms.parse_iso) == inspect.getsource(hb.parse_iso), (
-        "heartbeat_event_alarms.parse_iso drifted from heartbeat_check.parse_iso "
-        "-- the two copies must stay byte-identical (see the mirror comment "
-        "above the sibling's copy)"
+def test_parse_iso_is_byte_identical_to_the_leaf(hb: ModuleType) -> None:
+    assert inspect.getsource(leaf.parse_iso) == inspect.getsource(hb.parse_iso), (
+        "heartbeat_check.parse_iso drifted from charlie_work.heartbeat_alarms.parse_iso "
+        "-- the leaf is the single source; the remaining copy must stay byte-identical"
     )
 
 
@@ -184,8 +183,8 @@ def test_parse_iso_is_byte_identical_to_heartbeat_checks(
         pytest.param(datetime.now().isoformat(), id="now-naive"),  # no tzinfo
     ],
 )
-def test_parse_iso_copies_agree_on_inputs(hb: ModuleType, alarms: ModuleType, value: Any) -> None:
-    assert alarms.parse_iso(value) == hb.parse_iso(value)
+def test_parse_iso_copies_agree_on_inputs(hb: ModuleType, value: Any) -> None:
+    assert leaf.parse_iso(value) == hb.parse_iso(value)
 
 
 # ---------------------------------------------------------------------------
@@ -200,7 +199,7 @@ def test_parse_iso_copies_agree_on_inputs(hb: ModuleType, alarms: ModuleType, va
 
 def test_sibling_never_imports_heartbeat_check() -> None:
     """A back-import would cycle through heartbeat_check's loader block --
-    this is also why ``parse_iso`` is mirrored rather than shared. Checked
+    back-imports are never legal. Checked
     over the whole tree (``ast.walk``), not just module scope: even a
     function-local back-import fails at call time (``scripts/`` is never on
     ``sys.path``), so there is no legal place for one. The single permitted
@@ -227,7 +226,7 @@ def test_sibling_never_imports_heartbeat_check() -> None:
     assert not offenders, (
         f"heartbeat_event_alarms.py imports heartbeat_check {offenders} -- a "
         "back-import cycles through heartbeat_check's own loader block. "
-        "Mirror the primitive instead, the way parse_iso is mirrored."
+        "Mirror the primitive instead, or take it from the leaf."
     )
 
 

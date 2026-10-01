@@ -13,7 +13,30 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from charlie_work.heartbeat_alarms import Finding, anomaly_finding, ok_finding, parse_iso
+try:
+    from charlie_work.heartbeat_alarms import Finding, anomaly_finding, ok_finding, parse_iso
+except ImportError:  # pragma: no cover - exercised by the file-path-load subprocess test
+    # Loaded by file path (scripts/heartbeat_*.py with ``charlie_work`` not
+    # importable): resolve the sibling leaf the same way, sharing the module
+    # object the loader already registered so ``Finding`` has one identity.
+    import importlib.util as _ilu
+    import sys as _sys
+
+    _LEAF = "_cw_heartbeat_alarms"
+    _mod = _sys.modules.get(_LEAF)
+    if _mod is None:
+        _spec = _ilu.spec_from_file_location(
+            _LEAF, Path(__file__).with_name("heartbeat_alarms.py")
+        )
+        _mod = _ilu.module_from_spec(_spec)
+        _sys.modules[_LEAF] = _mod
+        _spec.loader.exec_module(_mod)
+    Finding, anomaly_finding, ok_finding, parse_iso = (
+        _mod.Finding,
+        _mod.anomaly_finding,
+        _mod.ok_finding,
+        _mod.parse_iso,
+    )
 
 # Healthy worst-case gap between loop passes measured 53.9m; see
 # heartbeat_check.py's history for the data behind the 90m coarse backstop.
@@ -150,7 +173,7 @@ def eval_wedge_kill_loop(
     """``ts_list`` = every fleet-level ``supervisor_wedge_loop`` ts."""
     check = "supervisor-wedge-kill-loop"
     cutoff = now - timedelta(hours=lookback_h)
-    recent = [ts for ts in ts_list if (parse_iso(ts) is None or parse_iso(ts) >= cutoff)]
+    recent = [ts for ts in ts_list if ((dt := parse_iso(ts)) is None or dt >= cutoff)]
     facts = f"total_events={len(ts_list)} recent={len(recent)} lookback_hours={lookback_h}"
     if not recent:
         return ok_finding(check, None, facts)
@@ -182,9 +205,7 @@ def eval_notify_digest(
     """
     check = "notify-digest"
     cutoff = now - timedelta(hours=stale_hours)
-    recent_stale = [
-        ts for ts in stale_ts_list if (parse_iso(ts) is None or parse_iso(ts) >= cutoff)
-    ]
+    recent_stale = [ts for ts in stale_ts_list if ((dt := parse_iso(ts)) is None or dt >= cutoff)]
     stale_fact = f"stale_events_{stale_hours}h={len(recent_stale)}"
 
     def warn(detail: str) -> Finding:

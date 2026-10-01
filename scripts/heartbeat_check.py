@@ -159,16 +159,14 @@ get_merged_commit_messages = _stale_mentions.get_merged_commit_messages
 
 # Pure alarm verdicts shared with the fleet dashboard live in the stdlib-only
 # leaves charlie_work.heartbeat_alarms / heartbeat_alarms_fleet; the thresholds
-# below are re-exported from them (single source). Guarded like the other
-# charlie_work leaves: with the package absent the checks that need a verdict
-# report an ANOMALY instead of crashing the beat.
-try:
-    from charlie_work import heartbeat_alarms as _ha
-    from charlie_work import heartbeat_alarms_fleet as _haf
-except ImportError:
-    _ha = None
-    _haf = None
-_ALARMS_UNAVAILABLE = "cannot evaluate: charlie_work.heartbeat_alarms not importable"
+# below are re-exported from them (single source). Loaded via the installed
+# package, else BY FILE PATH from <repo>/src (see
+# heartbeat_event_alarms.load_alarm_leaves) so a wrong-venv run keeps real
+# verdicts; only if both fail do the checks report a loud ANOMALY.
+_ha, _haf = _event_alarms.load_alarm_leaves()
+_ALARMS_UNAVAILABLE = (
+    "cannot evaluate: heartbeat_alarms leaves not importable and not loadable from src/"
+)
 
 # --------------------------------------------------------------------------
 # CONSTANTS
@@ -720,7 +718,7 @@ def parse_iso(value: str | None) -> datetime | None:
         return None
     try:
         return datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
+    except (ValueError, AttributeError):
         return None
 
 
