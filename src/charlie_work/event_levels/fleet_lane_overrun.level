@@ -1,0 +1,7 @@
+warning
+# Issue #2142: a repo lane was still running when the fleet pass's final
+# drain deadline expired. The pass returned without it (recorded in
+# deadline_partial_repo_keys, not observed_repo_keys) and the lane is left
+# running with its supervisor lock held. Warning, not error: nothing
+# crashed, and the lock-held skip keeps the next pass out of that repo
+# until the lane finishes.
