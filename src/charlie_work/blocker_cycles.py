@@ -28,6 +28,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from .github_capabilities.cross_repo_blockers import CrossRepoBlocker
 from .github import (
     GitHubError,
     GitHubLike,
@@ -127,7 +128,14 @@ def declared_blockers_by_issue(
         deps_by_number = {number: get_github_issue_dependencies(gh, number) for number in numbers}
     return {
         number: set(parse_blockers(body_by_number[number]))
-        | {int(dep) for dep in deps_by_number.get(number) or []}
+        # A cross-repo blocker (issue #2005) is not a vertex of this repo's
+        # graph: ``int(dep)`` would alias it onto the same-numbered local issue
+        # and invent an edge/cycle, so it is excluded from the scan.
+        | {
+            int(dep)
+            for dep in deps_by_number.get(number) or []
+            if not isinstance(dep, CrossRepoBlocker)
+        }
         for number in numbers
     }
 

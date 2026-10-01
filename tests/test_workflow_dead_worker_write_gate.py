@@ -51,6 +51,7 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 from _fakes_github import FakeGitHub
+from _run_captured_fakes import patch_run_captured
 from _sessions_db_fixtures import make_sessions_db
 from charlie_work.config import (
     AutoMergeConfig,
@@ -170,6 +171,7 @@ def test_sweep_orphan_processes_for_dead_sessions_dry_run_true_kills_nothing(
         patch("os.name", "nt"),
         patch("charlie_work.worker_fate.is_alive", return_value=False),
         patch("subprocess.run", side_effect=control_runner),
+        patch_run_captured(control_runner),
     ):
         _sweep_orphan_processes_for_dead_sessions(
             control_sessions_dir,
@@ -201,6 +203,7 @@ def test_sweep_orphan_processes_for_dead_sessions_dry_run_true_kills_nothing(
         patch("os.name", "nt"),
         patch("charlie_work.worker_fate.is_alive", return_value=False),
         patch("subprocess.run", side_effect=dry_runner),
+        patch_run_captured(dry_runner),
     ):
         _sweep_orphan_processes_for_dead_sessions(
             sessions_dir, state_file, config, write_gate=_wg(state_file, dry_run=True)
