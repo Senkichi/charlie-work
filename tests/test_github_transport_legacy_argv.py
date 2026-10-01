@@ -248,7 +248,9 @@ def test_shim_dry_run_does_not_suppress_a_dialect_read(tmp_path: Path) -> None:
 
 def test_shim_serves_run_list_over_rest(tmp_path: Path) -> None:
     """A workflow name is resolved, then its own runs route is read with the filters."""
-    workflows = {"workflows": [{"id": 5, "name": "CI"}, {"id": 6, "name": "Other"}]}
+    workflows = {
+        "workflows": [{"id": 5, "name": "CI", "state": "active"}, {"id": 6, "name": "Other"}]
+    }
     runs = {"workflow_runs": [
         {"id": 1, "name": "CI", "status": "queued", "created_at": "t1", "head_branch": "main"},
     ]}  # fmt: skip
