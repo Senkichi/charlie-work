@@ -2325,7 +2325,10 @@ def fleet_loop(
             _collect_finished_lanes(timeout)
         _record_lane_overruns()
     finally:
-        lane_pool.shutdown(wait=False, cancel_futures=True)
+        # No cancel_futures: a submitted-but-never-started future cancelled here
+        # would skip the lane body's `finally: lock.release()` and strand the
+        # phase-1 supervisor lock for the process lifetime.
+        lane_pool.shutdown(wait=False)
 
     # Results were recorded from two interleaved sources -- skips/prep errors
     # during submission and lane completions during collection -- so restore
