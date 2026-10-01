@@ -220,7 +220,7 @@ def _parse_review_verdict_from_log(log_path: Path) -> dict[str, Any] | None:
     except OSError:
         return None
 
-    verdict = _extract_verdict_from_text(log_text)
+    verdict = _extract_verdict_from_text(markdown_fence.restore_message_boundaries(log_text))
     if verdict is not None:
         return verdict
     return _extract_verdict_from_stream_json(log_text)
