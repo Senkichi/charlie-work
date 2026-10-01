@@ -132,7 +132,7 @@ def test_facts_exact_values(fleet) -> None:
         "SELECT kind, first_ts, last_ts, n FROM coverage WHERE source = ? AND kind IN ('*', 'unauthorized_merge_queue_sync_covered', 'dispatch')",
         ALPHA,
     ) == [
-        ("*", "2026-10-01T08:00:00Z", "2026-10-01T08:19:01Z", 23),
+        ("*", "2026-10-01T08:00:00Z", "2026-10-01T10:06:00Z", 23),
         ("dispatch", "2026-10-01T08:00:00Z", "2026-10-01T08:00:00Z", 1),
         (
             "unauthorized_merge_queue_sync_covered",

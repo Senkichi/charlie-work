@@ -258,11 +258,11 @@ def fleet(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         "dispatch_backpressure",
         {"clamped_by": "host_load", "clamped_limit": 0, "requested_limit": 3},
     )
-    # per-repo copies of global-authoritative kinds must be skipped
-    e(a, "2026-10-01T08:19:00Z", "runner_allocation", RUNNER_ALLOC)
+    # per-repo copies of global-authoritative kinds, AFTER the global DB first wrote them: skipped
+    e(a, "2026-10-01T10:05:00Z", "runner_allocation", RUNNER_ALLOC)
     e(
         a,
-        "2026-10-01T08:19:01Z",
+        "2026-10-01T10:06:00Z",
         "fleet_job_observations",
         {"jobs": [_job("j1", "completed", 2.0)]},
     )

@@ -7,13 +7,12 @@ registry doubles as the allow-list the rollup selects from.
 
 from __future__ import annotations
 
-import re
 from collections.abc import Callable
 from typing import Any
 
+from .rollup_common import Row, _dict, _flag, _int, _ints, _milestone, _refs, reason_group
+from .rollup_flow_handlers import FLOW_HANDLERS, escalation
 from .rollup_schema import JOB_TABLE
-
-Row = tuple[str, dict[str, Any]]
 
 # Excluded from every rollup (recon section 4): ~25% of cw rows / repeated every pass.
 # ``unauthorized_merge_queue_sync_covered`` has no handler; ``reconcile`` is handled but
@@ -27,65 +26,6 @@ _VERDICTS = {
     "request_changes": "verdict_request_changes",
     "blocked": "verdict_blocked",
 }
-
-
-def _int(value: Any) -> int | None:
-    if isinstance(value, bool):
-        return int(value)
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float) and value == int(value):
-        return int(value)
-    if isinstance(value, str) and value.strip().lstrip("-").isdigit():
-        return int(value)
-    return None
-
-
-def _flag(value: Any) -> int | None:
-    return None if value is None else int(bool(value))
-
-
-def _ints(values: Any) -> list[int]:
-    if not isinstance(values, list):
-        return []
-    return [n for n in (_int(v) for v in values) if n is not None]
-
-
-def _dict(value: Any) -> dict[str, Any]:
-    return value if isinstance(value, dict) else {}
-
-
-def reason_group(reason: Any) -> str | None:
-    """Group a ``review_verdict_missed`` reason: tokens stay, free text is prefix-grouped.
-
-    ``died_mid_session`` / ``launch_failed`` are enum-like and kept verbatim; anything
-    else is lowercased, cut at the first ``:`` and reduced to its first two words with
-    numbers masked, so ``"PR #2087 is MERGED"`` and ``"PR #2090 is MERGED"`` collapse.
-    """
-    if not isinstance(reason, str) or not reason.strip():
-        return None
-    if re.fullmatch(r"[a-z0-9_]+", reason):
-        return reason
-    head = re.sub(r"#?\d+", "#", reason.split(":", 1)[0].strip().lower())
-    return " ".join(head.split()[:2]) or None
-
-
-def _refs(ev: dict) -> tuple[Any, Any]:
-    p = ev["payload"]
-    return p.get("issue_number", ev["issue_number"]), p.get("pr_number", ev["pr_number"])
-
-
-def _milestone(ev: dict, milestone: str, issue: Any, pr: Any, approx: bool = False) -> Row:
-    return (
-        "issue_milestones",
-        {
-            "issue": _int(issue),
-            "pr": _int(pr),
-            "milestone": milestone,
-            "event_kind": ev["kind"],
-            "approx": int(approx),
-        },
-    )
 
 
 def _dispatch(ev: dict) -> list[Row]:
@@ -148,12 +88,6 @@ def _review_dispatch(ev: dict) -> list[Row]:
     return [("review_samples", row)]
 
 
-def _escalation(ev: dict, milestone: str, reason: Any) -> list[Row]:
-    issue, pr = _refs(ev)
-    row = {"issue": _int(issue), "pr": _int(pr), "event_kind": ev["kind"], "reason": reason}
-    return [("escalations", row), _milestone(ev, milestone, issue, pr)]
-
-
 def _record_review(ev: dict) -> list[Row]:
     p = ev["payload"]
     issue, pr = _refs(ev)
@@ -161,44 +95,8 @@ def _record_review(ev: dict) -> list[Row]:
     if p.get("decision") in _VERDICTS:
         rows.append(_milestone(ev, _VERDICTS[p["decision"]], issue, pr))
     if p.get("escalated"):
-        rows.extend(_escalation(ev, "escalated", "review_verdict_escalated"))
+        rows.extend(escalation(ev, "escalated", "review_verdict_escalated"))
     return rows
-
-
-def _escalated(ev: dict) -> list[Row]:
-    p = ev["payload"]
-    return _escalation(ev, "escalated", p.get("reason") or p.get("escalation_reason"))
-
-
-def _unescalate(ev: dict) -> list[Row]:
-    return _escalation(ev, "unescalated", ev["payload"].get("cleared_escalation_reason"))
-
-
-def _reconcile(ev: dict) -> list[Row]:
-    if ev["payload"].get("kind") != "merged_outside_orchestrator":
-        return []
-    issue, pr = _refs(ev)
-    return [_milestone(ev, "merged", issue, pr, True)]
-
-
-def _finalize_merged(ev: dict) -> list[Row]:
-    issue, pr = _refs(ev)
-    return [_milestone(ev, "merged", issue, pr, True)]
-
-
-def _lifecycle_transition(ev: dict) -> list[Row]:
-    """Exact lifecycle path (issue #2226): ``to_state`` becomes the milestone name.
-
-    The payload shape is the one #2226 specifies (``to_state``, issue/PR refs); a row with
-    no usable state yields nothing. ``approx=0`` marks it exact for the metrics layer.
-    """
-    p = ev["payload"]
-    state = p.get("to_state") or p.get("to")
-    if not isinstance(state, str) or not state.strip():
-        return []
-    issue, pr = _refs(ev)
-    name = "_".join(state.strip().lower().split())
-    return [_milestone(ev, name, issue, pr)]
 
 
 def _ready_observed(ev: dict) -> list[Row]:
@@ -305,12 +203,15 @@ def _throttle(until_key: str | None, detail_key: str | None) -> Callable[[dict],
 
 
 def _capped(
-    requested: str | None, granted: str | None, reason: str | None
+    requested: str | None, granted: str | None, reason: str | None, starved_repo: bool = False
 ) -> Callable[[dict], list[Row]]:
     def handler(ev: dict) -> list[Row]:
         p = ev["payload"]
         why = p.get(reason) if reason else None
+        # The global DB records a starved repo's event; the payload names who starved.
+        named = p.get("repo") if starved_repo and isinstance(p.get("repo"), str) else None
         row = {
+            **({"repo": named} if named else {}),
             "event_kind": ev["kind"],
             "requested": _int(p.get(requested)) if requested else None,
             "granted": _int(p.get(granted)) if granted else None,
@@ -330,14 +231,6 @@ HANDLERS: dict[str, Callable[[dict], list[Row]]] = {
     "review_dispatch_claim": _review_claim,
     "review_dispatch": _review_dispatch,
     "record_review": _record_review,
-    "reconcile": _reconcile,
-    "finalize_externally_merged": _finalize_merged,
-    "session_failed_escalated": _escalated,
-    "review_dispatch_escalated": _escalated,
-    "janitor_rework_escalated": _escalated,
-    "dispatch_cross_repo_escalated": _escalated,
-    "unescalate": _unescalate,
-    "lifecycle_transition": _lifecycle_transition,
     "ready_observed": _ready_observed,
     "session_exited": _session_exited,
     "review_verdict_missed": _verdict_missed,
@@ -354,8 +247,9 @@ HANDLERS: dict[str, Callable[[dict], list[Row]]] = {
     "dispatch_backpressure": _capped("requested_limit", "clamped_limit", "clamped_by"),
     "dispatch_deferred": _capped(None, None, "deferred_reason"),
     "dispatch_starved": _capped(None, None, "lane"),
-    "runner_capacity_starved": _capped("demand", "capacity", None),
+    "runner_capacity_starved": _capped("demand", "capacity", None, starved_repo=True),
 }
+HANDLERS.update(FLOW_HANDLERS)
 assert not NOISE_KINDS & HANDLERS.keys()  # a noise kind must never gain a handler
 
 

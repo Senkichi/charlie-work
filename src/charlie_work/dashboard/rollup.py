@@ -11,8 +11,11 @@ and rebuilt, so a deduped event disappears from the facts instead of lingering. 
 whose max id fell below its watermark was replaced, and is rebuilt from scratch.
 
 Repo attribution is the database an event came from, never the ``repo`` column (recon
-section 2); per-repo copies of ``GLOBAL_ONLY_KINDS`` are skipped so the global DB stays
-the single authority for them.
+section 2). ``GLOBAL_ONLY_KINDS`` are written to both the global DB and per-repo DBs; the
+global DB is authoritative, but the per-repo copies are the only record of the period
+before the global DB started writing them. A per-repo copy is therefore ingested only for
+timestamps strictly before the global DB's first row of that kind (``_kind_filter``), so
+the two never overlap and nothing is counted twice.
 """
 
 from __future__ import annotations
@@ -209,6 +212,36 @@ def _wipe_source(dst: sqlite3.Connection, source: str) -> None:
         dst.execute(f"DELETE FROM {table} WHERE source = ?", (source,))
 
 
+_NO_GLOBAL_ROWS = "9999-12-31T23:59:59Z"
+
+
+def _kind_filter(dst: sqlite3.Connection, source: str) -> tuple[str, tuple[str, ...]]:
+    """SQL predicate over ``kind`` (plus its args) for what ``source`` may contribute.
+
+    The global source takes every handled kind. A per-repo source takes the ordinary kinds
+    plus, for each ``GLOBAL_ONLY_KINDS`` kind, only rows older than the global DB's first row
+    of that kind (taken from the global source's ``coverage``, written earlier in the same
+    pass because the global source is ingested first). No global row yet means every copy
+    predates it, so all are admitted.
+    """
+    if source == FLEET_SOURCE:
+        kinds = sorted(HANDLERS)
+        return f"kind IN ({', '.join('?' for _ in kinds)})", tuple(kinds)
+    ordinary = sorted(k for k in HANDLERS if k not in GLOBAL_ONLY_KINDS)
+    first = dict(
+        dst.execute(
+            "SELECT kind, first_ts FROM coverage WHERE source = ? AND first_ts IS NOT NULL",
+            (FLEET_SOURCE,),
+        ).fetchall()
+    )
+    clauses = [f"kind IN ({', '.join('?' for _ in ordinary)})"]
+    args: list[str] = list(ordinary)
+    for kind in sorted(GLOBAL_ONLY_KINDS & HANDLERS.keys()):
+        clauses.append("(kind = ? AND ts < ?)")
+        args += [kind, first.get(kind, _NO_GLOBAL_ROWS)]
+    return " OR ".join(clauses), tuple(args)
+
+
 def _ingest_source(dst: sqlite3.Connection, source: str, db: Path, cutoff: str) -> SourceResult:
     srcdb, err = src.open_events_ro(db)
     if srcdb is None:
@@ -227,16 +260,13 @@ def _ingest_source(dst: sqlite3.Connection, source: str, db: Path, cutoff: str) 
             rebuilt = wm > max_id  # source DB was replaced under us
             if rebuilt:
                 wm = 0
-            kinds = sorted(
-                k for k in HANDLERS if source == FLEET_SOURCE or k not in GLOBAL_ONLY_KINDS
-            )
-            marks = ", ".join("?" for _ in kinds)
+            kind_sql, kind_args = _kind_filter(dst, source)
             events = srcdb.execute(
                 "SELECT id, ts, kind, payload, pr_number, issue_number FROM events"
-                f" WHERE (id > ? OR ts >= ?) AND id <= ? AND kind IN ({marks})"
+                f" WHERE (id > ? OR ts >= ?) AND id <= ? AND ({kind_sql})"
                 " AND NOT (kind = 'reconcile' AND CASE WHEN json_valid(payload)"
                 f" THEN json_extract(payload, '$.kind') END IS '{_STALE_RECONCILE}') ORDER BY id",
-                (wm, cutoff, max_id, *kinds),
+                (wm, cutoff, max_id, *kind_args),
             )
             if wm == 0:
                 _wipe_source(dst, source)

@@ -3,7 +3,7 @@
 Lead time and stage time have two paths (spec "Not yet recorded"):
 
 * approx: reconstructed from ``issue_milestones`` rows the rollup derives from ``dispatch``,
-  PR-opened, ``review_dispatch_claim``, ``record_review`` and merged-outside events;
+  PR-opened, ``review_dispatch_claim``, ``record_review`` and every merge-evidence kind;
 * exact: from ``lifecycle_transition`` / ``ready_observed`` rows (issue #2226).
 
 As soon as the rollup has seen a ``lifecycle_transition`` the exact path takes over from
@@ -148,8 +148,31 @@ def stage_time(db: sqlite3.Connection, q: MetricQuery, stage: str) -> Series:
     return _timing_series(db, q, spec, samples, cut)
 
 
+MERGE_KINDS = (
+    "merge_succeeded",
+    "dispatch_merged_pr_references_closed",
+    "finalize_externally_merged",
+    "reconcile",
+    "lifecycle_transition",
+)
+
+
 def merges_per_day(db: sqlite3.Connection, q: MetricQuery) -> Series:
-    """Issues reaching Done per bucket, each counted once at its first Done signal."""
+    """Issues reaching Done per bucket, each counted once at its first Done signal.
+
+    Every merge-evidence kind feeds the same ``merged``/``done`` milestones (see
+    ``rollup_flow_handlers``), the same set lead time reads. A PR-only row is attached to
+    its issue through any row naming both (as ``_load`` does), so one merge reported by
+    several kinds counts once per ``(repo, issue or PR)``.
+    """
+    link = {
+        (s, pr): i
+        for s, i, pr in db.execute(
+            "SELECT source, issue, pr FROM issue_milestones"
+            " WHERE issue IS NOT NULL AND pr IS NOT NULL AND ts < ?",
+            (q.end_iso,),
+        )
+    }
     rows = db.execute(
         "SELECT ts, source, issue, pr FROM issue_milestones"
         " WHERE milestone IN ('merged', 'done') AND ts < ? ORDER BY ts, src_id, seq",
@@ -158,17 +181,12 @@ def merges_per_day(db: sqlite3.Connection, q: MetricQuery) -> Series:
     seen: set = set()
     samples: list[Sample] = []
     for ts, source, issue, pr in rows:
+        issue = issue if issue is not None else link.get((source, pr))
         key = (source, issue) if issue is not None else (source, "pr", pr)
         if key not in seen:
             seen.add(key)
             samples.append((ts, source, 1.0))
-    spec = SeriesSpec(
-        "merges_per_day",
-        "Merges",
-        "merges",
-        "count",
-        ("reconcile", "finalize_externally_merged", "lifecycle_transition"),
-    )
+    spec = SeriesSpec("merges_per_day", "Merges", "merges", "count", MERGE_KINDS)
     return make_series(db, q, spec, samples, samples, how="sum")
 
 

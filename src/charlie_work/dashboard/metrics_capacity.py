@@ -102,7 +102,7 @@ def capped_demand(db: sqlite3.Connection, q: MetricQuery) -> Series:
         (q.start_iso, q.end_iso),
     ).fetchall()
     events = db.execute(
-        "SELECT ts, source FROM capped_demand WHERE ts >= ? AND ts < ?",
+        "SELECT ts, repo FROM capped_demand WHERE ts >= ? AND ts < ?",
         (q.start_iso, q.end_iso),
     ).fetchall()
     samples: list[Sample] = [(ts, repo, 1.0) for ts, repo in (*passes, *events)]
