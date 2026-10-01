@@ -266,6 +266,16 @@ class ReadinessFacts:
 
 
 @dataclass(frozen=True)
+class RevertVerdict:
+    """Outcome of the cross-PR revert gate (``decide_revert``)."""
+
+    sync_failed: bool
+    detected: bool
+    undetermined: bool
+    route: bool
+
+
+@dataclass(frozen=True)
 class Readiness:
     kind: PlanKind | StageKind
     gate: GateInputs

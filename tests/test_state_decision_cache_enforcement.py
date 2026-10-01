@@ -70,15 +70,22 @@ _SANCTIONED_FUNCTIONS = frozenset(
         # a stale re-read).
         "_local_build_packet",
         "record_local_review",
-        # merge-path extraction: ``merge_ready``'s carry-forward and
-        # head-moved branches moved verbatim into ``merge_path.apply_stages``.
-        # ``carry_forward`` stamps the decision returned by a fresh
-        # ``app._review_decision`` call made immediately after
-        # ``_update_approval_head``; ``re_review`` records the verdict's own
-        # reviewed head (the value the decision under review carries), never
-        # a stale re-read of state.json.
-        "carry_forward",
-        "re_review",
+    }
+)
+
+# Module-qualified sanctions: ``(path relative to src/charlie_work, function)``.
+# A bare name would sanction any same-named function in any module.
+#
+# merge-path extraction: ``merge_ready``'s carry-forward and head-moved
+# branches moved verbatim into ``merge_path.apply_stages``. ``carry_forward``
+# stamps the decision returned by a fresh ``app._review_decision`` call made
+# immediately after ``_update_approval_head``; ``re_review`` records the
+# verdict's own reviewed head (the value the decision under review carries),
+# never a stale re-read of state.json.
+_SANCTIONED_MODULE_FUNCTIONS = frozenset(
+    {
+        ("merge_path/apply_stages.py", "carry_forward"),
+        ("merge_path/apply_stages.py", "re_review"),
     }
 )
 
@@ -314,11 +321,17 @@ def test_pr_state_decision_writes_are_all_sanctioned() -> None:
 
     violations: list[str] = []
     functions_seen: set[str] = set()
+    qualified_seen: set[tuple[str, str]] = set()
     for source_file in sorted(src_root.rglob("*.py")):
         tree = ast.parse(source_file.read_text(encoding="utf-8"))
+        rel = source_file.relative_to(src_root).as_posix()
         for lineno, func_name, key in _scan(tree):
             functions_seen.add(func_name)
-            if func_name not in _SANCTIONED_FUNCTIONS:
+            qualified_seen.add((rel, func_name))
+            if (
+                func_name not in _SANCTIONED_FUNCTIONS
+                and (rel, func_name) not in _SANCTIONED_MODULE_FUNCTIONS
+            ):
                 violations.append(
                     f"{source_file.relative_to(src_root)}:{lineno} in {func_name}() "
                     f"sets {key!r} on a PR-state dict but is not a sanctioned site"
@@ -339,6 +352,12 @@ def test_pr_state_decision_writes_are_all_sanctioned() -> None:
     # test_legacy_forwarding_wrapper_scopes_are_not_stale in
     # test_write_gate_enforcement.py.
     stale = _SANCTIONED_FUNCTIONS - functions_seen
+    stale_qualified = _SANCTIONED_MODULE_FUNCTIONS - qualified_seen
+    assert not stale_qualified, (
+        f"_SANCTIONED_MODULE_FUNCTIONS lists {sorted(stale_qualified)} but no production "
+        "write to a PR-state decision field was found at that path/function anymore -- "
+        "remove the stale entry."
+    )
     assert not stale, (
         f"_SANCTIONED_FUNCTIONS lists {sorted(stale)} but no production write to a "
         "PR-state decision field was found in that function anymore -- remove the "

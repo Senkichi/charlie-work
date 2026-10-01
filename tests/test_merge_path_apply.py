@@ -16,8 +16,11 @@ from charlie_work.labels import TransitionOutcome
 from charlie_work.merge_path.apply import run_merge_ready
 from charlie_work.merge_path.apply_accounting import settle_accounting
 from charlie_work.merge_path.apply_merge import apply_merge_plan, label_error_of
-from charlie_work.merge_path.decide import deescalation_read_needed, mergequeue_stamp_needs_now
+from charlie_work.merge_path.decide import mergequeue_stamp_needs_now
+from charlie_work.merge_path.readiness_gates import deescalation_read_needed
 from charlie_work.merge_path.gather import gather_skip
+from charlie_work.merge_path.model import EffectResults, MergePlan, PlanKind
+from charlie_work.merge_path.ports import ports_from_workflow
 from charlie_work.write_gate import WriteGate
 
 
@@ -121,8 +124,24 @@ def test_apply_entry_points_refuse_a_non_write_gate(entry_point) -> None:
 
 
 def test_dry_run_write_gate_is_a_no_op_for_a_settled_accounting(tmp_path: Path) -> None:
-    """Under a dry-run gate the shell must not touch state.json."""
-    gate = WriteGate(dry_run=True, state_path=tmp_path / "state.json", repo="r")
-    state = {"prs": {}, "issues": {}}
-    assert gate.save_state(state) is state
-    assert not (tmp_path / "state.json").exists()
+    """Under a dry-run gate ``settle_accounting`` decides but must not touch state.json."""
+    state_file = tmp_path / "state.json"
+    app = SimpleNamespace(paths=SimpleNamespace(state_file=state_file), gh=SimpleNamespace())
+    gate = WriteGate(dry_run=True, state_path=state_file, repo="r")
+
+    accounting = settle_accounting(
+        app,
+        ports_from_workflow(),
+        gate,
+        pr_number=1,
+        issue_number=None,
+        cfg=mf.cfg(),
+        plan=MergePlan(
+            kind=PlanKind.NONE, readiness=mf.readiness(gate=mf.gate(summary_ready=False))
+        ),
+        results=EffectResults(),
+        pr={"headRefOid": "abc"},
+    )
+
+    assert accounting.failed_attempts == 1  # the settle really ran and counted
+    assert not state_file.exists()

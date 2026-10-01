@@ -95,10 +95,20 @@ def settle_accounting(
 
 
 def _record(write_gate: WriteGate, state: dict[str, Any], spec: EventSpec) -> dict[str, Any]:
-    return write_gate.record_event(
-        state,
-        # event-consumer: audit-only -- pass-through of the kind ``decide_accounting`` chose; every
-        # literal is checked at its origin by tests/test_merge_path_decide_accounting.py
-        spec.kind,
-        dict(spec.payload),
-    )
+    """Emit one ``decide_accounting`` event through the gate, one literal call per kind.
+
+    The kind is deliberately *not* forwarded as a variable: the event-kind
+    guards (``test_event_kind_consumers``, ``test_instrumentation_event_kind_registry``)
+    resolve literal kinds, and a forwarded ``spec.kind`` would hide these three
+    kinds from them. A kind ``decide_accounting`` emits without a branch here
+    raises instead of being dropped; ``tests/test_merge_path_apply.py`` pins the
+    two sets equal.
+    """
+    payload = dict(spec.payload)
+    if spec.kind == "merge_ready":
+        return write_gate.record_event(state, "merge_ready", payload)
+    if spec.kind == "merge_succeeded":
+        return write_gate.record_event(state, "merge_succeeded", payload)
+    if spec.kind == "merge_failed_attempt_alarm":
+        return write_gate.record_event(state, "merge_failed_attempt_alarm", payload)
+    raise ValueError(f"unrecognised merge-path accounting event kind: {spec.kind!r}")

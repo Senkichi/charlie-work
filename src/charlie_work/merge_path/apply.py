@@ -30,8 +30,6 @@ from .apply_stages import (
 )
 from .decide import (
     decide_merge,
-    decide_readiness,
-    deescalation_read_needed,
     merge_hold_read_needed,
 )
 from .gather import (
@@ -50,6 +48,7 @@ from .gather import (
     proceed,
     readiness_facts,
 )
+from .readiness_gates import decide_revert, deescalation_read_needed, with_human_merge
 from .model import BranchGate, BranchStop, EffectResults, MergePathConfig, PlanKind
 from .ports import MergePathPorts, ports_from_workflow
 from .render import (
@@ -183,11 +182,6 @@ def _readiness_and_merge(
     pr_number = opening.facts.pr_number
     issue_number = opening.issue_number
 
-    revert = gather_revert(app, ports, opening, gate)
-    checks = gather_checks(app, pr_number)
-    human_merge = app._human_merge_hold_check(issue_number)
-    facts = readiness_facts(opening, gate, revert, checks, human_merge=human_merge)
-
     def read_issue_status() -> tuple[str | None, str | None]:
         if issue_number is None:
             return None, None
@@ -196,17 +190,31 @@ def _readiness_and_merge(
             return None, None
         return issue.get("status"), issue.get("reason_class")
 
-    if deescalation_read_needed(cfg, issue_number, *human_merge):
+    # Legacy read/write order: the revert route is persisted BEFORE ``pr_checks``,
+    # and the human-merge label read comes only after the stall and infra exits,
+    # so a refused or failing read in between cannot lose or add a side effect.
+    revert = gather_revert(app, ports, opening, gate)
+    revert_args = {
+        "approved": opening.admission.approved,
+        "sync_failed": gate.sync_failed,
+        "revert": revert.status,
+        "issue_number": issue_number,
+    }
+    status, reason_class = None, None
+    verdict = decide_revert(**revert_args, issue_status=None)
+    if verdict.route:
         status, reason_class = read_issue_status()
-        readiness = decide_readiness(
-            replace(facts, issue_status=status, issue_reason_class=reason_class)
-        )
-    else:
-        readiness, _ = decide_readiness_lazily(facts, read_issue_status)
+        verdict = decide_revert(**revert_args, issue_status=status)
+    results = route_cross_pr_revert(app, opening, verdict, revert.reason, EffectResults())
+
+    checks = gather_checks(app, pr_number)
+    facts = readiness_facts(
+        opening, gate, revert, checks, issue_status=status, issue_reason_class=reason_class
+    )
+    readiness, _ = decide_readiness_lazily(facts, read_issue_status)
 
     pr = opening.pr
     decision = opening.decision
-    results = route_cross_pr_revert(app, opening, readiness, EffectResults())
     record_containment(app, ports, write_gate, pr_number, readiness.containment_warnings)
     if readiness.readiness_stall:
         label_error = app._request_readiness_no_ci_rework(
@@ -236,6 +244,12 @@ def _readiness_and_merge(
         if remediated is not None:
             return remediated
     readiness = proceed(readiness)
+    human_merge = app._human_merge_hold_check(issue_number)
+    if deescalation_read_needed(cfg, issue_number, *human_merge):
+        status, reason_class = read_issue_status()
+    else:
+        status, reason_class = None, None
+    readiness = with_human_merge(readiness, cfg, human_merge, status, reason_class)
     if readiness.deescalate:
         deescalate_human_merge(app, ports, write_gate, pr_number, issue_number)
 

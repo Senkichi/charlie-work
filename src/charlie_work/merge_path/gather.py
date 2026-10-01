@@ -427,12 +427,14 @@ def decide_readiness_lazily(
 ) -> tuple[Readiness, bool]:
     """``decide_readiness`` with the issue status read only when it can matter.
 
-    The first call assumes no status; only a revert route or a stall reads the
-    persisted status (legacy read it at exactly those two points). Returns the
-    readiness and whether the status was read.
+    The first call assumes no status; only a stall reads the persisted status
+    (legacy read it there). The cross-PR revert route reads its own status
+    earlier, ahead of ``pr_checks`` (``decide_revert``), and passes it in
+    ``facts``; a revert blocks the sync gate, so it never coincides with a
+    stall. Returns the readiness and whether the status was read.
     """
     optimistic = decide_readiness(facts)
-    if not (optimistic.route_cross_pr_revert or optimistic.readiness_stall):
+    if not optimistic.readiness_stall:
         return optimistic, False
     status, reason_class = read_status()
     return decide_readiness(

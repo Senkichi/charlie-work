@@ -18,7 +18,7 @@ from ..write_gate import WriteGate, require_write_gate
 from .apply_merge import label_error_of
 from .decide import decide_admission
 from .gather import BranchRead, Opening, regather_after_sync
-from .model import BranchGate, EffectResults, Readiness, SyncOutcome
+from .model import BranchGate, EffectResults, RevertVerdict, SyncOutcome
 from .ports import MergePathPorts
 from .render import render_live_head_moved
 
@@ -153,16 +153,16 @@ def sync_branch(app: Any, read: BranchRead, opening: Opening) -> tuple[BranchGat
 
 
 def route_cross_pr_revert(
-    app: Any, opening: Opening, readiness: Readiness, results: EffectResults
+    app: Any, opening: Opening, verdict: RevertVerdict, reason: str | None, results: EffectResults
 ) -> EffectResults:
     """Cross-PR revert detected on a bound, not-yet-routed issue: request rework."""
-    if not readiness.route_cross_pr_revert:
+    if not verdict.route:
         return results
     return replace(
         results,
         cross_pr_revert_routed=True,
         rework_label_error=app._request_cross_pr_revert_rework(
-            opening.pr, opening.issue_number, opening.decision, readiness.cross_pr_revert_reason
+            opening.pr, opening.issue_number, opening.decision, reason
         ),
     )
 

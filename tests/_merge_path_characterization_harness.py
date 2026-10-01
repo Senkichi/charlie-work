@@ -92,6 +92,11 @@ class _Outcome:
     paths: Any
     state_before: dict[str, Any]
     state_after: dict[str, Any]
+    # (mtime_ns, size) of state.json, or None when absent: ``save_state`` always
+    # restamps ``generated_at``, so a stray write of unchanged content is only
+    # visible here, not in the content comparison.
+    stat_before: tuple[int, int] | None = None
+    stat_after: tuple[int, int] | None = None
 
     @property
     def data(self) -> dict[str, Any]:
@@ -185,11 +190,28 @@ def _run(
     ):
         recorder.clear()
     before = load_state(paths.state_file)
+    stat_before = _state_stat(paths.state_file)
     kwargs: dict[str, Any] = {"merge": merge}
     if merge_train_head is not None:
         kwargs["merge_train_head"] = merge_train_head
     result = app.merge_ready(_PR, **kwargs)
-    return _Outcome(result, gh, paths, before, load_state(paths.state_file))
+    return _Outcome(
+        result,
+        gh,
+        paths,
+        before,
+        load_state(paths.state_file),
+        stat_before,
+        _state_stat(paths.state_file),
+    )
+
+
+def _state_stat(path: Path) -> tuple[int, int] | None:
+    try:
+        st = path.stat()
+    except FileNotFoundError:
+        return None
+    return st.st_mtime_ns, st.st_size
 
 
 def _pair(
@@ -238,6 +260,8 @@ def _assert_dry_run_inert(out: _Outcome) -> None:
         return {k: v for k, v in state.items() if k != "generated_at"}
 
     assert _stable(out.state_after) == _stable(out.state_before)
+    # A dry-run never writes the file at all (not even an unchanged re-save).
+    assert out.stat_after == out.stat_before
     gh = out.gh
     assert gh.merged == []
     assert gh.pr_labels_added == []

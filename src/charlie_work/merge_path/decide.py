@@ -36,22 +36,20 @@ from .model import (
     GateInputs,
     Hold,
     HoldFacts,
-    MergePathConfig,
     MergePlan,
     PlanKind,
     Readiness,
     ReadinessFacts,
-    RevertStatus,
     StageKind,
     SyncOutcome,
     Unavailable,
     VerdictFact,
 )
+from .readiness_gates import decide_revert, deescalates
 from .rules import (
     CHECK_ROUTE_EXCLUDED_STATUSES,
     CONFLICT_REWORK_IN_FLIGHT_STATUSES,
     CONFLICT_ROUTE_EXCLUDED_STATUSES,
-    REWORK_ALREADY_ROUTED_STATUSES,
     format_merge_attempt_alarm_message,
     is_pending_only,
     readiness_no_ci_stall,
@@ -104,26 +102,6 @@ def merge_entry(readiness: Readiness, holds: HoldFacts) -> tuple[bool, bool]:
         and not readiness.human_merge_check_unavailable
     )
     return escalated, enter
-
-
-def deescalation_read_needed(
-    cfg: MergePathConfig,
-    issue_number: int | None,
-    human_merge_hold: bool,
-    human_merge_check_unavailable: bool,
-) -> bool:
-    """The issue's escalation entry is consumed: a policy escalation could be lifted.
-
-    Only a bound issue under configured human-merge labels whose label has
-    verifiably gone can be de-escalated (issue #1598); ``decide_readiness`` and
-    the live gather share this predicate.
-    """
-    return bool(
-        cfg.human_merge_labels
-        and issue_number is not None
-        and not human_merge_hold
-        and not human_merge_check_unavailable
-    )
 
 
 def mergequeue_stamp_needs_now(
@@ -377,20 +355,17 @@ def decide_readiness(f: ReadinessFacts) -> Readiness:
     summary = f.checks
     sync_failed = branch.sync_failed
 
-    detected = False
-    undetermined = False
-    route_revert = False
-    if approved and not sync_failed:
-        if f.revert is RevertStatus.DETECTED:
-            sync_failed = True
-            detected = True
-            route_revert = (
-                f.issue_number is not None and f.issue_status not in REWORK_ALREADY_ROUTED_STATUSES
-            )
-        elif f.revert is RevertStatus.UNDETERMINED:
-            # Fail closed, never route.
-            sync_failed = True
-            undetermined = True
+    verdict = decide_revert(
+        approved=approved,
+        sync_failed=sync_failed,
+        revert=f.revert,
+        issue_number=f.issue_number,
+        issue_status=f.issue_status,
+    )
+    sync_failed = verdict.sync_failed
+    detected = verdict.detected
+    undetermined = verdict.undetermined
+    route_revert = verdict.route
 
     pending_only = is_pending_only(summary)
     stall_window = (
@@ -432,12 +407,13 @@ def decide_readiness(f: ReadinessFacts) -> Readiness:
     elif infra_eligible:
         kind = PlanKind.RERUN_OR_ESCALATE
 
-    deescalate = bool(
-        deescalation_read_needed(
-            cfg, f.issue_number, f.human_merge_hold, f.human_merge_check_unavailable
-        )
-        and f.issue_status == "escalated"
-        and f.issue_reason_class == "policy"
+    deescalate = deescalates(
+        cfg,
+        f.issue_number,
+        f.human_merge_hold,
+        f.human_merge_check_unavailable,
+        f.issue_status,
+        f.issue_reason_class,
     )
     gate = GateInputs(
         summary_ready=summary.ready,
@@ -499,7 +475,8 @@ def decide_merge(readiness: Readiness, holds: HoldFacts) -> MergePlan:
     action_merge = enter and not label
     action_human_merge = human_hold and can_merge and should_merge and not escalated_merge_hold
 
-    prior = holds.persisted.failed_attempts if holds.persisted is not None else 0
+    # ``int()``: legacy coerced the persisted counter (a hand-edited state file).
+    prior = int(holds.persisted.failed_attempts) if holds.persisted is not None else 0
     threshold = cfg.failed_attempt_alarm
     debounced = threshold > 0 and prior + 1 >= threshold
     issue_bound = readiness.issue_number is not None
@@ -639,14 +616,14 @@ def decide_accounting(
         adm.mergequeue_label_reverted and can_merge and not adm.self_revoked_stale_head
     )
 
-    attempts = facts.locked.failed_attempts
+    attempts = int(facts.locked.failed_attempts)
     alarm = False
     warning: str | None = None
     events: list[EventSpec] = []
     threshold = cfg.failed_attempt_alarm
     counts = (approved and not can_merge and not readiness.pending_only) or handoff_failed
     if not facts.deadline_spent and counts:
-        attempts = facts.locked.failed_attempts + 1
+        attempts = attempts + 1
         if threshold > 0:
             attempts = min(attempts, threshold + 1)
         alarm = threshold > 0 and attempts == threshold
