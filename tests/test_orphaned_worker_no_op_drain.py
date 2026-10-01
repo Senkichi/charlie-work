@@ -302,6 +302,61 @@ def test_ci_green_rebuttal_review_refused_escalates_with_worker_comment(tmp_path
     assert escalated[0]["payload"]["worker_comment"] == "Nothing left to fix."
 
 
+def test_stale_prior_round_outcome_is_not_quoted_in_rebuttal_or_escalation(
+    tmp_path: Path,
+) -> None:
+    """#2102: an outcome written before this dispatch is an earlier round's."""
+    config, paths, gh = _bed_lint(tmp_path, lint_red=False)
+    _terminal_exit_zero(tmp_path)
+    _write_outcome(
+        paths,
+        tmp_path,
+        {"push_succeeded": True, "head_sha": "abc123", "pr_comment": "Round-2 rework pushed."},
+        mtime=datetime.now(UTC) - timedelta(hours=3),  # dispatched_at is 1h ago
+    )
+    app = OrchestratorApp(tmp_path, paths, config, gh)
+    calls: list[int] = []
+
+    def review(pr_number: int) -> CommandResult:
+        calls.append(pr_number)
+        return CommandResult(True, "packet", {"pr": pr_number})
+
+    _sweep(tmp_path, paths, config, gh, app, review=review)
+    state = load_state(paths.state_file)
+    entry = state["issues"]["207"]
+    assert calls == []  # no comment -> no rebuttal review
+    assert entry["status"] == "escalated"
+    assert entry["no_op_worker_comment"] is None
+    escalated = [e for e in state["events"] if e["kind"] == "rework_no_op_escalated"]
+    assert escalated[0]["payload"]["worker_comment"] is None
+    assert "Round-2" not in json.dumps(state["events"])
+    # Reported (deduped per source/written_at) rather than silently dropped.
+    assert any(k.startswith("worktree:") for k in entry["stale_evidence_reported"])
+
+
+def test_fresh_outcome_after_dispatch_is_still_quoted(tmp_path: Path) -> None:
+    config, paths, gh = _bed_lint(tmp_path, lint_red=False)
+    _terminal_exit_zero(tmp_path)
+    _write_outcome(
+        paths,
+        tmp_path,
+        {"push_succeeded": False, "head_sha": "abc123", "pr_comment": "Fresh rebuttal."},
+        mtime=datetime.now(UTC) - timedelta(minutes=2),
+    )
+    app = OrchestratorApp(tmp_path, paths, config, gh)
+    _sweep(
+        tmp_path,
+        paths,
+        config,
+        gh,
+        app,
+        review=lambda n: CommandResult(False, "janitor refused", {"pr": n}),
+    )
+    state = load_state(paths.state_file)
+    escalated = [e for e in state["events"] if e["kind"] == "rework_no_op_escalated"]
+    assert escalated[0]["payload"]["worker_comment"] == "Fresh rebuttal."
+
+
 def test_ci_green_without_rebuttal_escalates_human_needed(tmp_path: Path) -> None:
     config, paths, gh = _bed_lint(tmp_path, lint_red=False)
     _terminal_exit_zero(tmp_path)
