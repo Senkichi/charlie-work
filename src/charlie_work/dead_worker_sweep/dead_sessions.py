@@ -44,6 +44,7 @@ module attributes at call time.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -65,16 +66,28 @@ from ..worktree import (
     worktree_path_for_branch,
 )
 from ..write_gate import WriteGate, require_write_gate
-from .dead_sessions_reclaim import reclaim_or_route_dead_session
 from ..process_utils import find_worker_terminal_status
+from .dead_sessions_reclaim import reclaim_or_route_dead_session
 from .decide_dead_sessions import (
     BACKGROUND_EXIT_FAILURE_KIND,
     exited_with_background_work,
-    dead_fallback_kind,
-    escalation_class,
-    launch_failure_escalates,
-    launch_failure_redispatch_at,
     wants_unsafe_salvage,
+)
+from .decide_dead_sessions_plan import (
+    EmitBackgroundExit,
+    EmitProviderSuspended,
+    EscalateLaunchFailure,
+    PersistFailure,
+    ReapSidecar,
+    ReclaimOrRoute,
+    RestoreRework,
+    Step,
+    WarnLiteralTmp,
+    plan_dead_classification,
+    plan_dead_reap,
+    plan_launch_escalation,
+    plan_launch_failed,
+    wants_salvage_from_unsafe,
 )
 from .effects_pr import _attempt_salvage, _dispatching_repo_name
 from .effects_rework import _reap_restore_rework_requested
@@ -152,7 +165,7 @@ def _escalate_launch_failure(ctx: SessionPass, w: worker.WorkerView, failure_kin
             config.dispatch.injected_paths,
             config.dispatch.materialize_dirs,
         )
-        if unsafe_inspection.ahead_count > 0:
+        if wants_salvage_from_unsafe(ahead_count=unsafe_inspection.ahead_count):
             salvaged_from_unsafe, _ = _attempt_salvage(
                 gh=gh,
                 config=config,
@@ -179,24 +192,23 @@ def _escalate_launch_failure(ctx: SessionPass, w: worker.WorkerView, failure_kin
     if salvaged_from_unsafe:
         return
 
-    cls = escalation_class(failure_kind)
     with state_mod.state_lock(state_file):
         state = state_mod.load_state(state_file)
         entry = state["issues"].get(str(w.issue_number), {})
-        now = datetime.now(UTC)
-        redispatch_at = list(
-            launch_failure_redispatch_at(
-                _windowed_redispatch_at(
-                    entry, window_minutes=config.watchdog.redispatch_window_minutes
-                ),
-                now,
-            )
+        plan = plan_launch_escalation(
+            _windowed_redispatch_at(
+                entry, window_minutes=config.watchdog.redispatch_window_minutes
+            ),
+            failure_kind,
+            now=datetime.now(UTC),
+            active_labels=active_labels,
         )
+        redispatch_at = list(plan.redispatch_at)
         state = _escalate_issue(
             state,
             w.issue_number,
-            reason=failure_kind,
-            reason_class=cls.reason_class,
+            reason=plan.reason,
+            reason_class=plan.reason_class,
             issue_extra={"redispatch_at": redispatch_at},
         )
         state["issues"][str(w.issue_number)].pop("worker_pid", None)
@@ -206,7 +218,7 @@ def _escalate_launch_failure(ctx: SessionPass, w: worker.WorkerView, failure_kin
             gh,
             config.labels,
             w.issue_number,
-            _escalation_edge("redispatch_escalated", cls.reason_class),
+            _escalation_edge("redispatch_escalated", plan.reason_class),
         )
         state = write_gate.append_event(
             state,
@@ -214,11 +226,73 @@ def _escalate_launch_failure(ctx: SessionPass, w: worker.WorkerView, failure_kin
             {
                 "issue_number": w.issue_number,
                 "failure_kind": failure_kind,
-                "removed_labels": sorted(active_labels),
+                "removed_labels": list(plan.removed_labels),
                 "redispatch_count": len(redispatch_at),
             },
         )
         write_gate.save_state(state)
+
+
+def _persist_failure(
+    ctx: SessionPass,
+    w: worker.WorkerView,
+    failure_kind: str,
+    throttled_until: Any,
+    *,
+    launch_failure: bool,
+) -> None:
+    """Persist the classification and throttle window on the issue entry.
+
+    Issue #1917: the classification lands on the issue entry so the state.json-keyed
+    orphan sweep -- which runs after the sidecar is reaped -- can exempt
+    provider-throttle outcomes from its timed reap and orphan-redispatch cap.
+
+    ``launch_failure`` selects the audit-trail source; each ``persist_failure`` call
+    carries its ``source=`` as a string literal (the repo-wide audit guard), kept equal
+    to the plan's ``*_PERSIST_SOURCE`` constants by a test.
+    """
+    evidence = worker_fate.FailureEvidence.from_classification(
+        failure_kind, throttled_until, fresh=True
+    )
+    with state_mod.state_lock(ctx.state_file):
+        state = state_mod.load_state(ctx.state_file)
+        if launch_failure:
+            state = worker_fate.persist_failure(
+                state,
+                w.issue_number,
+                evidence,
+                adapter_kind=w.adapter_kind,
+                now=ctx.now_for_health,
+                source="dead_sessions_launch_failure",
+                write_gate=ctx.write_gate,
+            )
+        else:
+            state = worker_fate.persist_failure(
+                state,
+                w.issue_number,
+                evidence,
+                adapter_kind=w.adapter_kind,
+                now=ctx.now_for_health,
+                source="dead_sessions_reap",
+                write_gate=ctx.write_gate,
+            )
+        ctx.write_gate.save_state(state)
+
+
+def _run_steps(steps: tuple[Step, ...], handlers: dict[type, Callable[[Any], None]]) -> None:
+    """Execute a decided plan in order; an unhandled step type is a wiring bug (KeyError)."""
+    for step in steps:
+        handlers[type(step)](step)
+
+
+def _reap_entry(w: worker.WorkerView, failure_kind: str | None) -> dict[str, Any]:
+    return {
+        "issue_number": w.issue_number,
+        "adapter_kind": w.adapter_kind,
+        "failure_kind": failure_kind,
+        "error": w.error,
+        "pid": w.pid,
+    }
 
 
 def _reap_launch_failed(ctx: SessionPass, w: worker.WorkerView, profile: Any) -> dict[str, Any]:
@@ -234,51 +308,95 @@ def _reap_launch_failed(ctx: SessionPass, w: worker.WorkerView, profile: Any) ->
             config=config,
             now=ctx.now_for_health,
         )
-    if failure_kind:
-        with state_mod.state_lock(state_file):
-            state = state_mod.load_state(state_file)
+    steps = plan_launch_failed(failure_kind, has_open_pr=w.issue_number in ctx.open_prs_by_issue)
+    _run_steps(
+        steps,
+        {
             # A throttle-caused launch failure must persist its window just like the
             # dead-session branch -- otherwise the governor relaunches straight into
-            # the same throttled provider. Issue #1917: persist the classification on
-            # the issue entry so the state.json-keyed orphan sweep can exempt
-            # provider-throttle outcomes after the sidecar is reaped.
-            state = worker_fate.persist_failure(
-                state,
-                w.issue_number,
-                worker_fate.FailureEvidence.from_classification(
-                    failure_kind, throttled_until, fresh=True
-                ),
-                adapter_kind=w.adapter_kind,
-                now=ctx.now_for_health,
-                source="dead_sessions_launch_failure",
+            # the same throttled provider.
+            PersistFailure: lambda _: _persist_failure(
+                ctx,
+                w,
+                failure_kind,  # type: ignore[arg-type]  # the plan only persists a kind
+                throttled_until,
+                launch_failure=True,
+            ),
+            EscalateLaunchFailure: lambda _: _escalate_launch_failure(
+                ctx,
+                w,
+                failure_kind,  # type: ignore[arg-type]  # the plan only escalates a kind
+            ),
+            ReapSidecar: lambda _: w.reap_sidecar(
+                ctx.sessions_dir, api_config=config.api_worker, state_dir=state_file.parent
+            ),
+            # Issue #295: a launch-failed rework session must still be returned to
+            # rework_requested so its owning lane can re-dispatch it.
+            RestoreRework: lambda _: _reap_restore_rework_requested(
+                state_file,
+                ctx.gh,
+                config,
+                ctx.open_prs_by_issue,
+                w,
+                failure_kind=failure_kind,
+                repo_root=ctx.repo_root,
                 write_gate=write_gate,
-            )
-            write_gate.save_state(state)
-
-    if launch_failure_escalates(failure_kind, has_open_pr=w.issue_number in ctx.open_prs_by_issue):
-        _escalate_launch_failure(ctx, w, failure_kind)  # type: ignore[arg-type]
-
-    w.reap_sidecar(ctx.sessions_dir, api_config=config.api_worker, state_dir=state_file.parent)
-    entry = {
-        "issue_number": w.issue_number,
-        "adapter_kind": w.adapter_kind,
-        "failure_kind": failure_kind,
-        "error": w.error,
-        "pid": w.pid,
-    }
-    # Issue #295: a launch-failed rework session must still be returned to
-    # rework_requested so its owning lane can re-dispatch it.
-    _reap_restore_rework_requested(
-        state_file,
-        ctx.gh,
-        config,
-        ctx.open_prs_by_issue,
-        w,
-        failure_kind=failure_kind,
-        repo_root=ctx.repo_root,
-        write_gate=write_gate,
+            ),
+        },
     )
-    return entry
+    return _reap_entry(w, failure_kind)
+
+
+def _emit_provider_suspended(
+    ctx: SessionPass, w: worker.WorkerView, failure_kind: str | None
+) -> None:
+    """Issue #1342: a distinct error-level event on the FIRST detection of a suspension.
+
+    ``provider_suspended`` is terminal (no cooldown) and escalates on this same pass;
+    the sidecar was just reaped, so the event fires once per episode.
+    """
+    with state_mod.state_lock(ctx.state_file):
+        state = state_mod.load_state(ctx.state_file)
+        state = ctx.write_gate.append_event(
+            state,
+            "api_worker_provider_suspended",
+            {
+                "issue_number": w.issue_number,
+                "pid": w.pid,
+                "process_start_time": w.process_start_time,
+                "provider": w.provider,
+                "failure_kind": failure_kind,
+            },
+            level="error",
+        )
+        ctx.write_gate.save_state(state)
+
+
+def _emit_background_exit(
+    ctx: SessionPass,
+    w: worker.WorkerView,
+    failure_kind: str | None,
+    ahead_count: int,
+) -> None:
+    """Issue #2096: visible and countable, not a generic orphan."""
+    with state_mod.state_lock(ctx.state_file):
+        state = state_mod.load_state(ctx.state_file)
+        state = ctx.write_gate.append_event(
+            state,
+            # event-consumer: audit-only -- operator-visible forensic record of a
+            # worker that exited 0 with uncommitted work (issue #2096); the
+            # reap and escalation decisions key off ``failure_kind``, not this event
+            BACKGROUND_EXIT_FAILURE_KIND,
+            {
+                "issue_number": w.issue_number,
+                "pid": w.pid,
+                "adapter_kind": w.adapter_kind,
+                "failure_kind": failure_kind,
+                "ahead_count": ahead_count,
+            },
+            level="warning",
+        )
+        ctx.write_gate.save_state(state)
 
 
 def _reap_dead(
@@ -289,7 +407,7 @@ def _reap_dead(
     persist_inconclusive_probe_counter: bool,
 ) -> dict[str, Any] | None:
     """A not-alive worker: confirm death, classify, stamp, reap, then reclaim or route."""
-    config, write_gate, state_file = ctx.config, ctx.write_gate, ctx.state_file
+    config, state_file = ctx.config, ctx.state_file
     # Issue #755: the confirmed-dead decision (including the
     # max_inconclusive_probe_deferrals grace period and counter) is owned by one
     # helper shared with reconcile.detect_drift.
@@ -312,140 +430,75 @@ def _reap_dead(
         config.dispatch.materialize_dirs,
     )
     is_completed = inspection.state == WorktreeState.COMPLETED
-
-    # Post-mortem extraction (issue #261) is intertwined with log-tail
-    # classification. For a completed-but-unpublished worktree the failure_kind must
-    # be "unpublished_work" even if the terminal log tail looks like a tool rejection,
-    # so classify first and record the post-mortem diagnostically afterwards. For
-    # other sessions keep the original order so worker_blocked still escalates.
-    if is_completed:
-        # session_completed=True (issue #656): the inspection is ground truth that
-        # the session produced real work, so it cannot also have died to a provider
-        # quota/rate-limit/auth failure; log-tail marker matching is skipped.
-        if profile is not None and profile.record_failure is not None:
-            failure_kind, throttled_until = profile.record_failure(
-                ctx.sessions_dir,
-                w.issue_number,
-                fallback_kind=dead_fallback_kind(is_completed=True, worktree_unknown=False),
-                config=config,
-                session_completed=True,
-                now=ctx.now_for_health,
-            )
-        else:
-            failure_kind, throttled_until = None, None
-        # Diagnostic post-mortem; its worker_blocked verdict is ignored because the
-        # worktree itself proves the work was completed.
-        post_mortem.classify_and_record(ctx.sessions_dir, config, w, now=datetime.now(UTC))
-    else:
-        post_mortem.classify_and_record(ctx.sessions_dir, config, w, now=datetime.now(UTC))
-        fallback_kind = dead_fallback_kind(
-            is_completed=False,
-            worktree_unknown=inspection.state == WorktreeState.UNKNOWN,
-            background_exit=exited_with_background_work(
-                find_worker_terminal_status(ctx.sessions_dir, w.issue_number),
-                adapter_kind=w.adapter_kind,
-                dirty=inspection.dirty,
-                ahead_count=inspection.ahead_count,
-                pid=w.pid,
-            ),
-        )
-        if profile is not None and profile.record_failure is not None:
-            failure_kind, throttled_until = profile.record_failure(
-                ctx.sessions_dir,
-                w.issue_number,
-                fallback_kind=fallback_kind,
-                config=config,
-                now=ctx.now_for_health,
-            )
-        else:
-            failure_kind, throttled_until = None, None
-
-    if failure_kind:
-        with state_mod.state_lock(state_file):
-            state = state_mod.load_state(state_file)
-            # Update state with the throttle window (if any). Issue #1917: persist
-            # the classification on the issue entry so the state.json-keyed orphan
-            # sweep -- which runs after the sidecar is reaped just below -- can
-            # exempt provider-throttle deaths from its timed reap and
-            # orphan-redispatch cap.
-            state = worker_fate.persist_failure(
-                state,
-                w.issue_number,
-                worker_fate.FailureEvidence.from_classification(
-                    failure_kind, throttled_until, fresh=True
-                ),
-                adapter_kind=w.adapter_kind,
-                now=ctx.now_for_health,
-                source="dead_sessions_reap",
-                write_gate=write_gate,
-            )
-            write_gate.save_state(state)
-
-    # Reap the sidecar to prevent phantom sessions from PID recycling (issue #113).
-    w.reap_sidecar(ctx.sessions_dir, api_config=config.api_worker, state_dir=state_file.parent)
-    entry = {
-        "issue_number": w.issue_number,
-        "adapter_kind": w.adapter_kind,
-        "failure_kind": failure_kind,
-        "error": w.error,
-        "pid": w.pid,
-    }
-
-    # Issue #1780: post-hoc signal for the residual class #1767 could not close -- a
-    # literal ``/tmp`` shell command resolves through MSYS's install-wide mount
-    # regardless of the per-session TMPDIR. Fires at most once per session: the
-    # sidecar was just reaped above.
-    worker_literal_tmp.emit_literal_tmp_path_warning(state_file, w, write_gate)
-
-    if failure_kind == BACKGROUND_EXIT_FAILURE_KIND:
-        # Issue #2096: visible and countable, not a generic orphan.
-        with state_mod.state_lock(state_file):
-            state = state_mod.load_state(state_file)
-            state = write_gate.append_event(
-                state,
-                # event-consumer: audit-only -- operator-visible forensic record of a
-                # worker that exited 0 with uncommitted work (issue #2096); the
-                # reap and escalation decisions key off ``failure_kind``, not this event
-                BACKGROUND_EXIT_FAILURE_KIND,
-                {
-                    "issue_number": w.issue_number,
-                    "pid": w.pid,
-                    "adapter_kind": w.adapter_kind,
-                    "failure_kind": failure_kind,
-                    "ahead_count": inspection.ahead_count,
-                },
-                level="warning",
-            )
-            write_gate.save_state(state)
-
-    # Issue #1342: a distinct error-level event on the FIRST detection of a provider
-    # account suspension, so the operator learns about a billing problem in minutes.
-    # ``provider_suspended`` is terminal (no cooldown) and escalates below on this same
-    # pass; the sidecar was just reaped, so the event fires once per episode.
-    if failure_kind == "provider_suspended":
-        with state_mod.state_lock(state_file):
-            state = state_mod.load_state(state_file)
-            state = write_gate.append_event(
-                state,
-                "api_worker_provider_suspended",
-                {
-                    "issue_number": w.issue_number,
-                    "pid": w.pid,
-                    "process_start_time": w.process_start_time,
-                    "provider": w.provider,
-                    "failure_kind": failure_kind,
-                },
-                level="error",
-            )
-            write_gate.save_state(state)
-
-    reclaim_or_route_dead_session(
-        ctx,
-        w,
-        failure_kind=failure_kind,
-        inspection=inspection,
+    classification = plan_dead_classification(
         is_completed=is_completed,
-        worktree_path=worktree_path,
+        worktree_unknown=inspection.state == WorktreeState.UNKNOWN,
+        background_exit=not is_completed
+        and exited_with_background_work(
+            find_worker_terminal_status(ctx.sessions_dir, w.issue_number),
+            adapter_kind=w.adapter_kind,
+            dirty=inspection.dirty,
+            ahead_count=inspection.ahead_count,
+            pid=w.pid,
+        ),
+    )
+
+    def record_post_mortem() -> None:
+        # Diagnostic; for a completed worktree its worker_blocked verdict is ignored
+        # because the worktree itself proves the work was completed.
+        post_mortem.classify_and_record(ctx.sessions_dir, config, w, now=datetime.now(UTC))
+
+    if classification.post_mortem_first:
+        record_post_mortem()
+    failure_kind: str | None = None
+    throttled_until = None
+    if profile is not None and profile.record_failure is not None:
+        # session_completed (issue #656): the inspection is ground truth that the
+        # session produced real work, so log-tail marker matching is skipped.
+        extra = {"session_completed": True} if classification.session_completed else {}
+        failure_kind, throttled_until = profile.record_failure(
+            ctx.sessions_dir,
+            w.issue_number,
+            fallback_kind=classification.fallback_kind,
+            config=config,
+            now=ctx.now_for_health,
+            **extra,
+        )
+    if not classification.post_mortem_first:
+        record_post_mortem()
+
+    entry = _reap_entry(w, failure_kind)
+    _run_steps(
+        plan_dead_reap(failure_kind),
+        {
+            PersistFailure: lambda _: _persist_failure(
+                ctx,
+                w,
+                failure_kind,  # type: ignore[arg-type]  # the plan only persists a kind
+                throttled_until,
+                launch_failure=False,
+            ),
+            # Reap the sidecar to prevent phantom sessions from PID recycling (#113).
+            ReapSidecar: lambda _: w.reap_sidecar(
+                ctx.sessions_dir, api_config=config.api_worker, state_dir=state_file.parent
+            ),
+            # Issue #1780: fires at most once per session: the sidecar was just reaped.
+            WarnLiteralTmp: lambda _: worker_literal_tmp.emit_literal_tmp_path_warning(
+                state_file, w, ctx.write_gate
+            ),
+            EmitBackgroundExit: lambda _: _emit_background_exit(
+                ctx, w, failure_kind, inspection.ahead_count
+            ),
+            EmitProviderSuspended: lambda _: _emit_provider_suspended(ctx, w, failure_kind),
+            ReclaimOrRoute: lambda _: reclaim_or_route_dead_session(
+                ctx,
+                w,
+                failure_kind=failure_kind,
+                inspection=inspection,
+                is_completed=is_completed,
+                worktree_path=worktree_path,
+            ),
+        },
     )
     return entry
 
