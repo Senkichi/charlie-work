@@ -349,8 +349,10 @@ class Transport(CapabilityCollaborator):
         executes anything, so a ``undefinedField`` error names exactly the
         configured field the schema lacks; a NOT_FOUND for ``number:0`` proves
         the selection was accepted. Raises ``ConfigError`` naming the constant
-        and the offending field(s). A transport-class failure is not a config
-        error: warn and skip the remaining probes (issue #1833).
+        and the offending field(s) ONLY on that positive rejection. Anything
+        else (a transport-class failure, 401/403/404, primary or secondary rate
+        limit, an inconclusive probe) is not a config error: warn and skip, so
+        startup never depends on GitHub availability or quota (issue #1833).
         """
         # Import lazily to avoid the config -> github import cycle.
         from ..config import ConfigError
@@ -386,7 +388,13 @@ class Transport(CapabilityCollaborator):
                     f"GitHub does not support field(s) for {constant}: {', '.join(missing)}"
                 )
             if verdict.detail:
-                raise ConfigError(f"Could not validate field list {constant}: {verdict.detail}")
+                # Inconclusive (neither accepted nor rejected): not evidence of a bad
+                # field list, so startup must not depend on it. Warn and move on.
+                logger.warning(
+                    "Could not validate field list %s (inconclusive probe); skipping it: %s",
+                    constant,
+                    verdict.detail,
+                )
 
     def _repo_owner_name(self) -> tuple[str, str]:
         """Resolve the repository owner and name from the local git remote.

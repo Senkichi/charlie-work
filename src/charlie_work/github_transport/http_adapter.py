@@ -29,7 +29,7 @@ import select
 import socket
 import ssl
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http.client import HTTPException, HTTPSConnection
 from typing import Any, Callable, Protocol
 from urllib.parse import urlsplit
@@ -44,6 +44,7 @@ from .outcome import (
     normalize_headers,
 )
 from .request import GraphQLRequest, Request, RestRequest
+from .token_hygiene import is_well_formed, redact
 
 # Matches the `issue_view` fan-out's max_workers ceiling: more idle sockets
 # than concurrent callers could ever use would only hold server resources.
@@ -111,7 +112,8 @@ class _Prepared:
     method: str
     path: str
     body: bytes | None
-    headers: dict[str, str]
+    # Holds ``Authorization: Bearer <token>``: never part of a repr.
+    headers: dict[str, str] = field(repr=False)
     idempotent: bool = False
 
 
@@ -217,10 +219,31 @@ class HttpAdapter:
             return self._defect(f"HttpAdapter cannot send {type(request).__name__}")
         if not token:
             return TransportFailure(FailureKind.TOKEN_UNAVAILABLE, "no bearer token", "http")
+        if not is_well_formed(token):
+            # Never reaches the wire (http.client would reject the header and echo
+            # it); the detail deliberately says nothing about the value.
+            detail = "bearer token is not a valid header value"
+            return TransportFailure(FailureKind.TOKEN_UNAVAILABLE, detail, "http")
         try:
-            return self._send(request, token, timeout)
+            outcome = self._send(request, token, timeout)
         except _DEFECT_ERRORS as exc:
-            return self._defect(f"{type(exc).__name__}: {exc}")
+            outcome = self._defect(f"{type(exc).__name__}: {exc}")
+        return self._scrubbed(outcome, token)
+
+    @staticmethod
+    def _scrubbed(outcome: Outcome, token: str) -> Outcome:
+        """The adapter boundary: no failure detail leaves carrying the credential.
+
+        Exception text (``http.client`` echoes rejected header values, an OS error
+        can name a request line) is the only free-form text the adapter builds, so
+        redacting here covers every failure kind at the one place the token is known.
+        """
+        if not isinstance(outcome, TransportFailure):
+            return outcome
+        detail = redact(outcome.detail, token)
+        if detail == outcome.detail:
+            return outcome
+        return TransportFailure(outcome.kind, detail, outcome.adapter)
 
     def _send(self, request: RestRequest | GraphQLRequest, token: str, timeout: float) -> Outcome:
         cached = None

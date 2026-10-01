@@ -37,10 +37,24 @@ class UnknownFieldError(ValueError):
 
 @dataclass(frozen=True)
 class FieldSpec:
-    """One gh field name: its GraphQL selection and the node -> gh value map."""
+    """One gh field name: its GraphQL selection and the node -> gh value map.
+
+    ``paged`` marks a nested connection that gh itself walks to the end
+    (``comments``, ``closingIssuesReferences``, ``statusCheckRollup``): its
+    selection carries ``pageInfo`` and ``gh_json_pages`` fetches the rest.
+    """
 
     selection: str
     extract: Callable[[dict[str, Any]], Any]
+    paged: bool = False
+
+
+_PAGE_INFO = "pageInfo{hasNextPage endCursor}"
+
+
+def _first(after: bool) -> str:
+    """The connection arguments of the first page, or of a follow-up page."""
+    return f"first:{_PAGE},after:$after" if after else f"first:{_PAGE}"
 
 
 def _nodes(node: dict[str, Any], key: str) -> list[Any]:
@@ -115,10 +129,19 @@ def _reaction_groups(comment: dict[str, Any]) -> list[dict[str, Any]]:
     return out
 
 
-_COMMENTS = FieldSpec(
-    f"comments(first:{_PAGE}){{nodes{{id author{{login}} authorAssociation body createdAt "
+_COMMENT_NODE = (
+    "id author{login} authorAssociation body createdAt "
     "includesCreatedEdit isMinimized minimizedReason url viewerDidAuthor "
-    "reactionGroups{content users{totalCount}}}}",
+    "reactionGroups{content users{totalCount}}"
+)
+
+
+def comments_selection(after: bool = False) -> str:
+    return f"comments({_first(after)}){{nodes{{{_COMMENT_NODE}}}{_PAGE_INFO}}}"
+
+
+_COMMENTS = FieldSpec(
+    comments_selection(),
     lambda node: [
         {
             "id": comment.get("id"),
@@ -135,11 +158,18 @@ _COMMENTS = FieldSpec(
         }
         for comment in _nodes(node, "comments")
     ],
+    paged=True,
 )
 
+_CLOSING_NODE = "id number url repository{id name owner{id login}}"
+
+
+def closing_issues_selection(after: bool = False) -> str:
+    return f"closingIssuesReferences({_first(after)}){{nodes{{{_CLOSING_NODE}}}{_PAGE_INFO}}}"
+
+
 _CLOSING_ISSUES = FieldSpec(
-    f"closingIssuesReferences(first:{_PAGE}){{nodes{{id number url "
-    "repository{id name owner{id login}}}}",
+    closing_issues_selection(),
     lambda node: [
         {
             "id": ref.get("id"),
@@ -156,6 +186,7 @@ _CLOSING_ISSUES = FieldSpec(
         }
         for ref in _nodes(node, "closingIssuesReferences")
     ],
+    paged=True,
 )
 
 # CheckRun / StatusContext, the two members of a rollup context (gh's names).
@@ -195,12 +226,17 @@ def _rollup_contexts(node: dict[str, Any]) -> list[dict[str, Any]]:
     return [c for c in _nodes({"contexts": contexts}, "contexts") if isinstance(c, dict)]
 
 
-_ROLLUP_SELECTION = (
-    f"statusCheckRollup{{contexts(first:{_PAGE}){{nodes{{{_CONTEXT_SELECTION}}}}}}}"
-)
+def rollup_selection(after: bool = False) -> str:
+    return (
+        f"statusCheckRollup{{contexts({_first(after)}){{"
+        f"nodes{{{_CONTEXT_SELECTION}}}{_PAGE_INFO}}}}}"
+    )
+
+
 _ROLLUP = FieldSpec(
-    _ROLLUP_SELECTION,
+    rollup_selection(),
     lambda node: [_rollup_entry(c) for c in _rollup_contexts(node)],
+    paged=True,
 )
 
 _COMMON: dict[str, FieldSpec] = {
@@ -246,6 +282,11 @@ _STATE_ENUMS = {
 }
 
 
+def paged_fields(resource: str) -> tuple[str, ...]:
+    """The field names of *resource* whose connection gh pages to the end."""
+    return tuple(name for name, spec in _REGISTRY.get(resource, {}).items() if spec.paged)
+
+
 def field_names(fields: str | Iterable[str]) -> tuple[str, ...]:
     """Split a gh ``--json`` field list (``"a,b,c"``) into its names."""
     if isinstance(fields, str):
@@ -271,7 +312,10 @@ def _specs(resource: str, fields: str | Iterable[str]) -> list[tuple[str, FieldS
 def selection_for(resource: str, fields: str | Iterable[str]) -> str:
     """The GraphQL selection set (without braces) for *fields*."""
     seen: list[str] = []
-    for _name, spec in _specs(resource, fields):
+    specs = _specs(resource, fields)
+    if any(spec.paged for _name, spec in specs):
+        seen.append("id")  # the node id a follow-up page is fetched by
+    for _name, spec in specs:
         if spec.selection not in seen:
             seen.append(spec.selection)
     return " ".join(seen)
@@ -307,10 +351,14 @@ def document_for(resource: str, fields: str | Iterable[str], shape: Shape) -> st
     """
     sel = selection_for(resource, fields)
     if shape == "view":
-        field = "issue" if resource == "issue" else "pullRequest"
+        if resource == "issue":
+            # ``gh issue view`` accepts a pull request number too (a PR is an issue).
+            body = f"issueOrPullRequest(number:$number){{... on Issue{{{sel}}} ... on PullRequest{{{sel}}}}}"
+        else:
+            body = f"pullRequest(number:$number){{{sel}}}"
         return (
             "query($owner:String!,$name:String!,$number:Int!){"
-            f"repository(owner:$owner,name:$name){{{field}(number:$number){{{sel}}}}}}}"
+            f"repository(owner:$owner,name:$name){{{body}}}}}"
         )
     if shape == "search":
         if resource != "pr":
@@ -340,15 +388,13 @@ def document_for(resource: str, fields: str | Iterable[str], shape: Shape) -> st
 def checks_document() -> str:
     """The rollup query behind ``gh pr checks``: one page of a PR's check contexts.
 
-    Unlike the list/view rollup (capped at one page, as gh caps it), ``gh pr
-    checks`` walks every page of contexts, so this document takes ``$after``
-    and selects ``pageInfo``; ``JsonRead._checks`` follows it.
+    ``gh pr checks`` walks every page of contexts, so this document takes
+    ``$after`` and selects ``pageInfo``; ``JsonRead._checks`` follows it.
     """
     return (
         "query($owner:String!,$name:String!,$number:Int!,$after:String){"
         "repository(owner:$owner,name:$name){pullRequest(number:$number){"
-        f"statusCheckRollup{{contexts(first:{_PAGE},after:$after){{"
-        f"nodes{{{_CONTEXT_SELECTION}}}pageInfo{{hasNextPage endCursor}}}}}}}}}}}}"
+        f"{rollup_selection(after=True)}}}}}}}"
     )
 
 
@@ -489,6 +535,7 @@ __all__ = [
     "normalize_checks",
     "normalize_node",
     "normalize_nodes",
+    "paged_fields",
     "selection_for",
     "states_for",
 ]

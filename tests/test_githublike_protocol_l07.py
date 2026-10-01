@@ -136,7 +136,7 @@ def test_issue_view_delegate_forwards_through_run(tmp_path: Path) -> None:
     ``gh issue view --json``) using the ``ISSUE_VIEW_FIELDS`` bare global
     relocated to ``issues.py``.
     """
-    reply = graphql_ok({"repository": {"issue": {"number": 7, "state": "OPEN"}}})
+    reply = graphql_ok({"repository": {"issueOrPullRequest": {"number": 7, "state": "OPEN"}}})
     gh, http, _ = make_github(tmp_path, http=FakeAdapter("http", [reply]))
 
     result = gh.issue_view(7)
@@ -297,7 +297,9 @@ def test_are_issues_open_fallback_closure_runs_through_collaborator(
     def view(request):
         number = graphql_variables(request)["number"]
         state = "OPEN" if number in (1, 2) else "CLOSED"
-        return graphql_ok({"repository": {"issue": {"number": number, "state": state}}})
+        return graphql_ok(
+            {"repository": {"issueOrPullRequest": {"number": number, "state": state}}}
+        )
 
     monkeypatch.setattr(GitHub, "_graphql_issue_states", fake_states)
     gh, _http, _ = make_github(tmp_path, http=FakeAdapter("http", handler=view))

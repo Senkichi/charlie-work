@@ -529,7 +529,13 @@ def test_pr_checks_delegate_forwards_through_run(tmp_path: Path) -> None:
         }
     ]
     (request,) = http.api_requests
-    assert graphql_variables(request) == {"owner": "octo", "name": "hello", "number": 5}
+    # The checks query is paginated (r1 B3): the first page carries ``after: None``.
+    assert graphql_variables(request) == {
+        "owner": "octo",
+        "name": "hello",
+        "number": 5,
+        "after": None,
+    }
 
 
 def test_github_isinstance_repometalike(tmp_path: Path) -> None:

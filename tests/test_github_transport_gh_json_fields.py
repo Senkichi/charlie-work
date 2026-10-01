@@ -251,7 +251,9 @@ def _body(outcome: Any) -> Any:
 
 def test_view_returns_gh_shaped_json() -> None:
     case = _load(FIXTURES / "issue_view_closed.json")
-    guard, http = _guard(_gql(case["graphql_data"]))
+    # ``issue view`` reads ``issueOrPullRequest`` (gh accepts a PR number too).
+    data = {"repository": {"issueOrPullRequest": case["graphql_data"]["repository"]["issue"]}}
+    guard, http = _guard(_gql(data))
 
     outcome = JsonRead("issue", "view", case["fields"], number=2090).execute(
         guard, "octo", "hello"

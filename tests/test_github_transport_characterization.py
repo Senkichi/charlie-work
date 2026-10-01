@@ -70,7 +70,9 @@ def test_dry_run_capability_mutation_is_a_typed_success_without_a_request(
 def test_dry_run_still_sends_reads(tmp_path: Path) -> None:
     gh, http, _ = make_github(
         tmp_path,
-        http=FakeAdapter("http", [ok({"data": {"repository": {"issue": {"number": 7}}}})]),
+        http=FakeAdapter(
+            "http", [ok({"data": {"repository": {"issueOrPullRequest": {"number": 7}}}})]
+        ),
         dry_run=True,
     )
 

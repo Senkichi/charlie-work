@@ -19,6 +19,7 @@ from dataclasses import dataclass, replace
 from typing import Any, Literal
 
 from . import gh_json_fields as fields_mod
+from . import gh_json_pages as pages_mod
 from .guarded import GitHubTransport
 from .outcome import FailureKind, Outcome, Response, TransportFailure
 from .pagination import MAX_PAGES, paginate_graphql
@@ -77,14 +78,66 @@ class JsonRead:
         outcome = self._send(
             transport, document, {"owner": owner, "name": repo, "number": self.number}
         )
-        field = "issue" if self.resource == "issue" else "pullRequest"
+        field = "issueOrPullRequest" if self.resource == "issue" else "pullRequest"
         node = _dig(outcome, ("repository", field))
         if isinstance(node, (Response, TransportFailure)):
             return node
         if not isinstance(node, dict):
             return _defect(f"no {self.resource} #{self.number} in GraphQL response")
         assert isinstance(outcome, Response)
-        return _with_body(outcome, fields_mod.normalize_node(self.resource, node, self.fields))
+        completed = self._complete(transport, node)
+        if not isinstance(completed, dict):
+            return completed
+        return _with_body(
+            outcome, fields_mod.normalize_node(self.resource, completed, self.fields)
+        )
+
+    def _complete(
+        self, transport: GitHubTransport, node: dict[str, Any]
+    ) -> dict[str, Any] | Outcome:
+        """*node* with every nested connection gh pages to the end fetched in full.
+
+        The first GraphQL page of ``comments``, ``closingIssuesReferences`` and
+        ``statusCheckRollup`` holds 100 items; a connection that reports a next
+        page is followed by node id. Silent truncation is never the result: a
+        failed or non-terminating follow-up returns the failure (or a defect
+        once ``MAX_PAGES`` pages have been read).
+        """
+        try:
+            pending = pages_mod.pending_pages(self.resource, self.fields, node)
+            for name, cursor in pending:
+                node_id = node.get("id")
+                if not isinstance(node_id, str) or not node_id:
+                    return _defect(f"{name} has more pages but the node has no id")
+                for _ in range(MAX_PAGES):
+                    document = pages_mod.page_document(self.resource, name)
+                    outcome = self._send(transport, document, {"id": node_id, "after": cursor})
+                    page = _dig(outcome, ("node",))
+                    if isinstance(page, (Response, TransportFailure)):
+                        return page
+                    if not isinstance(page, dict):
+                        return _defect(f"no node for the next {name} page")
+                    node, next_cursor = pages_mod.absorb_page(node, name, page)
+                    if next_cursor is None:
+                        break
+                    cursor = next_cursor
+                else:
+                    return _defect(f"{name} exceeded {MAX_PAGES} pages with a next page present")
+        except pages_mod.IncompletePageError as exc:
+            return _defect(str(exc))
+        return node
+
+    def _complete_all(self, transport: GitHubTransport, nodes: list[Any]) -> list[Any] | Outcome:
+        completed: list[Any] = []
+        for item in nodes:
+            if not isinstance(item, dict) or not item:
+                completed.append(item)
+                continue
+            full = self._complete(transport, item)
+            if not isinstance(full, dict):
+                return full
+            completed.append(full)
+        return completed
 
     def _list(self, transport: GitHubTransport, owner: str, repo: str) -> Outcome:
         document = fields_mod.document_for(self.resource, self.fields, "list")
@@ -110,11 +163,20 @@ class JsonRead:
         if not isinstance(nodes, list):
             return _defect(f"no {connection} connection in GraphQL response")
         assert isinstance(outcome, Response)
-        return _with_body(outcome, fields_mod.normalize_nodes(self.resource, nodes, self.fields))
+        completed = self._complete_all(transport, nodes)
+        if not isinstance(completed, list):
+            return completed
+        return _with_body(
+            outcome, fields_mod.normalize_nodes(self.resource, completed, self.fields)
+        )
 
     def _search(self, transport: GitHubTransport, owner: str, repo: str) -> Outcome:
         document = fields_mod.document_for("pr", self.fields, "search")
-        query = f"repo:{owner}/{repo} is:pr is:{self.state} {self.search or ''}".strip()
+        # ``--state all`` is no qualifier at all (``is:all`` is not a search term).
+        state = "" if self.state.strip().lower() == "all" else f"is:{self.state}"
+        query = " ".join(
+            part for part in (f"repo:{owner}/{repo}", "is:pr", state, self.search or "") if part
+        )
         outcome = self._send(transport, document, {"q": query, "first": self.limit})
         nodes = _dig(outcome, ("search", "nodes"))
         if isinstance(nodes, (Response, TransportFailure)):
@@ -124,7 +186,10 @@ class JsonRead:
         assert isinstance(outcome, Response)
         # A search hit that is not a PullRequest comes back as an empty object.
         pulls = [n for n in nodes if isinstance(n, dict) and n]
-        return _with_body(outcome, fields_mod.normalize_nodes("pr", pulls, self.fields))
+        completed = self._complete_all(transport, pulls)
+        if not isinstance(completed, list):
+            return completed
+        return _with_body(outcome, fields_mod.normalize_nodes("pr", completed, self.fields))
 
     def _checks(self, transport: GitHubTransport, owner: str, repo: str) -> Outcome:
         # `gh pr checks` walks every page of contexts; a snapshot cut at 100

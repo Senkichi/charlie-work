@@ -453,7 +453,7 @@ def test_are_issues_open_end_to_end_over_http_transport(tmp_path: Path) -> None:
     body = _partial_body(resolved={"s_1": {"number": 1, "state": "OPEN"}}, unresolved=[361])
     replies = [
         ok(body),
-        graphql_ok({"repository": {"issue": {"number": 361, "state": "OPEN"}}}),
+        graphql_ok({"repository": {"issueOrPullRequest": {"number": 361, "state": "OPEN"}}}),
     ]
     gh, http, _ = make_github(tmp_path, http=FakeAdapter("http", replies))
 

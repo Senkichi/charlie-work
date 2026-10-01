@@ -234,3 +234,49 @@ def test_validate_field_lists_timeout_raises_config_error(tmp_path: Path) -> Non
     # The transport-class failure is recorded on the breaker.
     assert gh._transport._circuit_breaker_state.consecutive_failures == 1
     assert gh._transport.__dict__.get("_list_cache") is None
+
+
+_PRIMARY_LIMIT = Response(
+    403,
+    (("x-ratelimit-remaining", "0"), ("x-ratelimit-limit", "5000")),
+    '{"message":"API rate limit exceeded for user ID 1."}',
+    "http",
+)
+_SECONDARY_LIMIT = Response(
+    403,
+    (("retry-after", "60"),),
+    '{"message":"You have exceeded a secondary rate limit."}',
+    "http",
+)
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        Response(401, (), '{"message":"Bad credentials"}', "http"),
+        _PRIMARY_LIMIT,
+        _SECONDARY_LIMIT,
+        Response(404, (), '{"message":"Not Found"}', "http"),
+        Response(422, (), '{"message":"Validation Failed"}', "http"),
+        Response(502, (), "bad gateway", "http"),
+    ],
+    ids=["401", "403-primary", "403-secondary", "404", "422-inconclusive", "502"],
+)
+def test_validate_field_lists_unavailable_github_is_not_a_config_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, reply
+) -> None:
+    """Startup must not depend on GitHub availability or quota (#1833): only a
+    positive "field rejected" verdict is a ConfigError. A 401/403/404, either
+    kind of rate limit, or an inconclusive reply warns and skips instead."""
+    monkeypatch.setattr("charlie_work.github.time.sleep", lambda _s: None)
+    monkeypatch.setattr("time.sleep", lambda _s: None)
+    gh, _http, _ = make_github(
+        tmp_path,
+        http=FakeAdapter("http", handler=lambda _request: reply),
+        runtime=RuntimeConfig(gh_max_retries=0),
+    )
+
+    with caplog.at_level("WARNING"):
+        gh.validate_field_lists()  # must not raise
+
+    assert "Could not validate field list" in caplog.text

@@ -43,6 +43,7 @@ from .failure_markers import is_pre_connection_text, is_transport_class_text
 from .gh_adapter import render_argv
 from .outcome import FailureKind, Outcome, Response, TransportFailure, render_legacy_error
 from .request import CliCommand, CliRequest, Request, RestRequest
+from .token_hygiene import is_well_formed, redact
 
 logger = logging.getLogger(__name__)
 
@@ -351,6 +352,11 @@ class GuardedTransport:
         # Recursive guarded call: a CliRequest always routes to gh, so no cycle.
         result = self.send(CliRequest(CliCommand.AUTH_TOKEN))
         token = result.body.strip() if isinstance(result, Response) and result.ok else ""
+        if token and not is_well_formed(token):
+            # An internal CR/LF/space cannot be a header value. Treat it as no token
+            # (gh then serves the request with its own credentials); never log it.
+            logger.warning("gh auth token returned a malformed token; ignoring it")
+            token = ""
         with self._token_lock:
             self._token = token or None
             return self._token
@@ -364,7 +370,7 @@ class GuardedTransport:
             "command": " ".join(render_argv(request)[0]),
             "request": request.describe(),
             "reason": failure.kind.value,
-            "detail": failure.detail[:_DETAIL_LIMIT],
+            "detail": redact(failure.detail, self._token)[:_DETAIL_LIMIT],
             "mutation": request.is_mutation,
         }
         # write-gate-exempt(issue=1834): GitHub client layer has no WriteGate; transport fallback bookkeeping is lock-free

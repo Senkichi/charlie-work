@@ -26,12 +26,21 @@ from .pull_requests import MERGED_PR_LIST_FIELDS, PR_LIST_FIELDS, PR_VIEW_FIELDS
 Probe = JsonRead | RunListRead | RestRequest
 
 _FIELD_IN_MESSAGE = re.compile(r"Field '([^']+)'")
+# Statuses that say GitHub (or our access to it) is unavailable, never that a field was
+# rejected: 0 = no HTTP exchange, 401 = bad/expired token, 403 = primary or secondary
+# rate limit or a permission gap, 404 = repository not visible, 429 = rate limited.
+_UNAVAILABLE_STATUSES = (0, 401, 403, 404, 429)
 _UNMAPPED = re.compile(r"^unknown (?:--json|run) field\(s\)(?: for [a-z]+)?: (.+)$")
 
 
 @dataclass(frozen=True)
 class ProbeVerdict:
-    """What one probe proved: ``rejected`` fields, a transport ``skip``, or a ``detail``."""
+    """What one probe proved: ``rejected`` fields, a transport ``skip``, or a ``detail``.
+
+    Only ``rejected`` is evidence that a configured field list is wrong. ``skip`` (GitHub
+    unavailable: transport failure, auth, quota) and a bare ``detail`` (inconclusive) are
+    both non-evidence, so the caller must not turn either into a startup error (#1833).
+    """
 
     rejected: tuple[str, ...] | None = None
     skip: bool = False
@@ -123,7 +132,7 @@ def probe_verdict(outcome: Outcome) -> ProbeVerdict:
     if errors and all(error.type == "NOT_FOUND" for error in errors):
         return ProbeVerdict()
     if (
-        outcome.status in (0, 429)
+        outcome.status in _UNAVAILABLE_STATUSES
         or outcome.status >= 500
         or any(error.type == "RATE_LIMITED" for error in errors)
     ):

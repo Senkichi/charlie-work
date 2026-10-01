@@ -189,7 +189,9 @@ def test_github_are_issues_open_normalizes_uppercase_state(tmp_path: Path) -> No
 
     def view(request):
         number = graphql_variables(request)["number"]
-        return graphql_ok({"repository": {"issue": {"number": number, "state": states[number]}}})
+        return graphql_ok(
+            {"repository": {"issueOrPullRequest": {"number": number, "state": states[number]}}}
+        )
 
     gh, _http, _ = make_github(tmp_path, http=FakeAdapter("http", handler=view))
     with pytest.MonkeyPatch.context() as patch:
@@ -219,7 +221,9 @@ def test_are_issues_open_caches_per_pass_and_dedupes_shared_numbers(tmp_path: Pa
         number = graphql_variables(request)["number"]
         calls.append(number)
         state = "OPEN" if number != 200 else "CLOSED"
-        return graphql_ok({"repository": {"issue": {"number": number, "state": state}}})
+        return graphql_ok(
+            {"repository": {"issueOrPullRequest": {"number": number, "state": state}}}
+        )
 
     gh, _http, _ = make_github(tmp_path, http=FakeAdapter("http", handler=handler))
 

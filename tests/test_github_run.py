@@ -418,7 +418,7 @@ def test_wrapper_method_returns_empty_for_genuine_empty_json(
     graphql = {
         "issue_list": {"repository": {"issues": page}},
         "pr_list": {"repository": {"pullRequests": page}},
-        "issue_view": {"repository": {"issue": {}}},
+        "issue_view": {"repository": {"issueOrPullRequest": {}}},
         "pr_view": {"repository": {"pullRequest": {}}},
     }
 
