@@ -38,7 +38,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Sequence
 
-from charlie_work.process_utils import get_process_start_time, popen_worker
+from charlie_work.process_utils import CpuPriority, get_process_start_time, popen_worker
 from charlie_work.subprocess_runner import hidden_console_kwargs
 
 LOG_FILENAME = "suite.log"
@@ -205,6 +205,7 @@ def launch_suite_gate(
         try:
             proc = popen_worker(
                 argv,
+                priority=CpuPriority.NORMAL,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=stderr_handle,
