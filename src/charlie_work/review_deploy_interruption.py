@@ -36,7 +36,7 @@ def _parse_ts(value: str | None) -> datetime | None:
         return None
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
+    except (ValueError, TypeError, AttributeError):
         return None
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
 
@@ -44,7 +44,9 @@ def _parse_ts(value: str | None) -> datetime | None:
 def deploy_interrupted_review(
     started_at: str | None, deploy_state_path: Path | None
 ) -> str | None:
-    """Return the ts of a ``self_deploy_succeeded`` after ``started_at``, else ``None``.
+    """Return the ts of a HEAD-moving ``self_deploy_succeeded`` after ``started_at``.
+
+    Only rows whose payload has a truthy ``changed`` count; else ``None``.
 
     ``None`` (never raises) when the reviewer's start time is unparseable, the
     deploy store is absent or unreadable, or no deploy landed after the start:
@@ -60,6 +62,11 @@ def deploy_interrupted_review(
     except Exception:  # best-effort evidence; never block the reap
         return None
     for event in reversed(events):
+        # ``self_deploy_succeeded`` also covers a venv-repair-only outcome
+        # (``changed`` False): HEAD did not move, no drift exit fired, and no
+        # reviewer was killed, so it is not a witness.
+        if not (event.get("payload") or {}).get("changed"):
+            continue
         ts = event.get("ts")
         deployed = _parse_ts(ts)
         if deployed is not None and deployed > started:

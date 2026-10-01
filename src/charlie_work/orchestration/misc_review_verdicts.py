@@ -180,6 +180,7 @@ def _reap_review_verdicts(self, reviews_dir: Path) -> dict[str, Any]:
                 if attempts > 0:
                     rolled_back["review_dispatch_attempt_count"] = attempts - 1
                 state["prs"][str(pr_number)] = rolled_back
+                # write-gate-exempt(issue=2103): same raw state write shape as the other review-reap sites in this module; no write_gate param.
                 state = _wf.append_event(
                     state,
                     "review_interrupted_by_deploy",
@@ -192,6 +193,7 @@ def _reap_review_verdicts(self, reviews_dir: Path) -> dict[str, Any]:
                     },
                     state_path=self.paths.state_file,
                 )
+                # write-gate-exempt(issue=2103): same raw state write shape as the other review-reap sites in this module; no write_gate param.
                 _wf.save_state(self.paths.state_file, state)
             _wf.remove_review_checkout(self.repo_root, pr_number, reviews_dir=reviews_dir)
             w.reap_sidecar(reviews_dir)

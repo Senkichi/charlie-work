@@ -39,7 +39,13 @@ def _iso(dt: datetime) -> str:
     return dt.replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
-def _setup(monkeypatch, tmp_path: Path, *, deployed: bool):
+def _setup(
+    monkeypatch,
+    tmp_path: Path,
+    *,
+    deployed: bool,
+    deploy_payload: dict | None = None,
+):
     app = _dispatch_reviews_app(tmp_path, prs=[_PR])
     _write_review_packet(tmp_path, 100, "sha-100")
     reviews_dir = app._layout.reviews_dir
@@ -55,7 +61,11 @@ def _setup(monkeypatch, tmp_path: Path, *, deployed: bool):
     deploy_state = tmp_path / "daemon" / "state.json"
     deploy_state.parent.mkdir()
     if deployed:
-        log_event(deploy_state, SELF_DEPLOY_SUCCEEDED, {"ok": True, "changed": True})
+        log_event(
+            deploy_state,
+            SELF_DEPLOY_SUCCEEDED,
+            deploy_payload or {"ok": True, "changed": True},
+        )
     monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: False)
     monkeypatch.setattr(
         "charlie_work.orchestration.misc_review_verdicts.self_deploy_state_path",
@@ -97,9 +107,36 @@ def test_dead_reviewer_without_deploy_is_still_a_miss(monkeypatch, tmp_path) -> 
 
 def test_deploy_before_reviewer_start_does_not_count(tmp_path) -> None:
     deploy_state = tmp_path / "state.json"
-    log_event(deploy_state, SELF_DEPLOY_SUCCEEDED, {"ok": True})
+    log_event(deploy_state, SELF_DEPLOY_SUCCEEDED, {"ok": True, "changed": True})
     later = _iso(datetime.now(UTC) + timedelta(minutes=5))
     assert deploy_interrupted_review(later, deploy_state) is None
     assert deploy_interrupted_review("garbage", deploy_state) is None
     assert deploy_interrupted_review(later, None) is None
     assert deploy_interrupted_review(later, tmp_path / "absent" / "state.json") is None
+
+
+def test_venv_repair_only_deploy_is_not_a_witness(tmp_path) -> None:
+    deploy_state = tmp_path / "state.json"
+    log_event(
+        deploy_state,
+        SELF_DEPLOY_SUCCEEDED,
+        {"ok": True, "changed": False, "venv_repaired": True},
+    )
+    earlier = _iso(datetime.now(UTC) - timedelta(minutes=5))
+    assert deploy_interrupted_review(earlier, deploy_state) is None
+
+
+def test_venv_repair_only_deploy_leaves_death_an_ordinary_miss(monkeypatch, tmp_path) -> None:
+    app, reviews_dir = _setup(
+        monkeypatch,
+        tmp_path,
+        deployed=True,
+        deploy_payload={"ok": True, "changed": False, "venv_repaired": True},
+    )
+
+    result = app._reap_review_verdicts(reviews_dir)
+
+    assert result["missed"][0]["reason"] == "died_mid_session"
+    state = load_state(app.paths.state_file)
+    assert "review_interrupted_by_deploy" not in _kinds(state)
+    assert state["prs"]["100"]["review_dispatch_attempt_count"] == 2
