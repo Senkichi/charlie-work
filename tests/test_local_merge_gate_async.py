@@ -21,9 +21,7 @@ fixture style.
 
 from __future__ import annotations
 
-import os
 import subprocess
-import sys
 import tempfile
 import time
 from datetime import UTC, datetime, timedelta
@@ -32,19 +30,33 @@ from pathlib import Path
 import pytest
 
 from charlie_work import local_suite_runner, quiesce
-from charlie_work.config import OrchestratorConfig, build_config_from_data
 from charlie_work.host_load import pytest_tree_load
-from charlie_work.labels import transition
-from charlie_work.local_issues import LocalFileGitHub
 from charlie_work.local_lane import (
     SUITE_TIMEOUT_SECONDS,
     branch_head_sha,
     is_ancestor,
 )
-from charlie_work.paths import runtime_paths
 from charlie_work.process_utils import is_pid_alive, kill_process_tree
 from charlie_work.state import load_state, load_state_locked, save_state, state_lock
 from charlie_work.workflow import OrchestratorApp
+
+from _local_gate_async_fixtures import (  # noqa: E402
+    FAIL_SUITE,
+    SLEEP_SUITE,
+    _adopt_and_approve,
+    _commit_file,
+    _dead_pid,
+    _event_kinds,
+    _events_of_kind,
+    _gate_paths,
+    _init_repo,
+    _kill_claimed_gate,
+    _lane_app,
+    _lane_config,
+    _make_branch,
+    _wait_for_result,
+    _wait_pid_dead,
+)
 
 # The gate delegate does ``import charlie_work.workflow as _wf`` at module
 # level, so it may only be imported *after* ``charlie_work.workflow`` has been
@@ -57,60 +69,9 @@ from charlie_work.orchestration.local_merge_gate import (  # noqa: E402
 )
 
 
-def _git(repo_root: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
-    result = subprocess.run(["git", *args], cwd=repo_root, capture_output=True, text=True, env=env)
-    assert result.returncode == 0, (args, result.stderr)
-    return result
-
-
-def _init_repo(repo_root: Path) -> None:
-    """Fresh repo with one commit on ``main`` (same as the sibling fixtures)."""
-    repo_root.mkdir(parents=True, exist_ok=True)
-    _git(repo_root, "init", "--initial-branch=main")
-    _git(repo_root, "config", "core.longpaths", "true")
-    _git(repo_root, "config", "user.email", "test@example.test")
-    _git(repo_root, "config", "user.name", "test")
-    _git(repo_root, "commit", "--allow-empty", "-m", "chore: seed")
-
-
-def _write_issue(
-    issues_dir: Path,
-    number: int,
-    *,
-    state: str = "open",
-    body: str = "Body.",
-    labels: tuple[str, ...] = (),
-) -> Path:
-    issues_dir.mkdir(parents=True, exist_ok=True)
-    labels_yaml = "[" + ", ".join(labels) + "]"
-    path = issues_dir / f"{number:03d}_issue.md"
-    path.write_text(f"---\nstate: {state}\nlabels: {labels_yaml}\n---\n{body}\n", encoding="utf-8")
-    return path
-
-
-def _commit_file(repo_root: Path, relpath: str, content: str, message: str) -> str:
-    path = repo_root / relpath
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding="utf-8")
-    _git(repo_root, "add", relpath)
-    _git(repo_root, "commit", "-m", message)
-    return _git(repo_root, "rev-parse", "HEAD").stdout.strip()
-
-
-def _make_branch(repo_root: Path, branch: str, relpath: str, content: str) -> str:
-    _git(repo_root, "checkout", "-b", branch)
-    head = _commit_file(repo_root, relpath, content, f"feat: {relpath}")
-    _git(repo_root, "checkout", "main")
-    return head
-
-
 # Suite commands: ``python -c`` bodies keep every test hermetic -- no pytest
 # collection, no imports, deterministic exits. ``suite_command_argv`` appends
 # ``-q --tb=short`` which lands harmlessly in ``sys.argv`` for ``-c``.
-PASS_SUITE = 'python -c "pass"'
-FAIL_SUITE = 'python -c "import sys; sys.exit(3)"'
-SLEEP_SUITE = 'python -c "import time; time.sleep(600)"'
 
 
 @pytest.fixture
@@ -118,72 +79,6 @@ def lane_repo() -> Path:
     """Real git repo under the system temp dir (``$GIT_DIR``-path headroom --
     see ``test_local_issues_merge_gate.lane_repo``)."""
     return Path(tempfile.mkdtemp(prefix="cw-gate-async-"))
-
-
-def _lane_config(repo_root: Path, issues_dir: Path, **overrides: object) -> OrchestratorConfig:
-    data: dict = {
-        "local_issues": {"enabled": True, "issues_dir": "docs/issues"},
-        "dispatch": {"test_command": PASS_SUITE},
-    }
-    for section, values in overrides.items():
-        data.setdefault(section, {}).update(values)
-    return build_config_from_data(data)
-
-
-def _lane_app(
-    repo_root: Path,
-    issues_dir: Path,
-    config: OrchestratorConfig | None = None,
-) -> OrchestratorApp:
-    cfg = config or _lane_config(repo_root, issues_dir)
-    gh = LocalFileGitHub(repo_root=repo_root, issues_dir=issues_dir)
-    paths = runtime_paths(repo_root, cfg.runtime.state_dir)
-    return OrchestratorApp(repo_root, paths, cfg, gh)
-
-
-def _adopt_and_approve(
-    app: OrchestratorApp,
-    issues_dir: Path,
-    issue_number: int,
-    branch: str,
-    head: str,
-) -> None:
-    labels = app.config.labels
-    _write_issue(issues_dir, issue_number, labels=(labels.ready, labels.in_progress))
-    transition(app.gh, labels, issue_number, "local_work_ready")
-    with state_lock(app.paths.state_file):
-        state = load_state(app.paths.state_file)
-        state.setdefault("issues", {})[str(issue_number)] = {
-            "number": issue_number,
-            "title": "Test issue",
-            "status": "dispatched",
-            "branch_name": branch,
-        }
-        save_state(app.paths.state_file, state)
-    app._local_review_packets()
-    result = app.record_local_review(
-        issue_number,
-        "approved",
-        reviewed_head=head,
-        verdict_provenance="fresh_llm_review",
-    )
-    assert result.ok, result.message
-
-
-def _gate_paths(app: OrchestratorApp, pr_number: int) -> local_suite_runner.SuiteGatePaths:
-    return local_suite_runner.suite_gate_paths(app.paths.dispatches, pr_number)
-
-
-def _wait_for_result(app: OrchestratorApp, pr_number: int, timeout_seconds: float = 90) -> dict:
-    """Poll the gate's result file -- the wrapper is a real child process."""
-    paths = _gate_paths(app, pr_number)
-    deadline = time.monotonic() + timeout_seconds
-    while time.monotonic() < deadline:
-        result = local_suite_runner.read_gate_result(paths)
-        if result is not None:
-            return result
-        time.sleep(0.1)
-    raise AssertionError(f"suite result for pr-{pr_number} never appeared at {paths.result}")
 
 
 def _wait_for_pid_file(app: OrchestratorApp, pr_number: int, timeout_seconds: float = 30) -> dict:
@@ -195,25 +90,6 @@ def _wait_for_pid_file(app: OrchestratorApp, pr_number: int, timeout_seconds: fl
             return meta
         time.sleep(0.05)
     raise AssertionError(f"suite pid file for pr-{pr_number} never appeared")
-
-
-def _wait_pid_dead(pid: int, timeout_seconds: float = 15) -> None:
-    deadline = time.monotonic() + timeout_seconds
-    while time.monotonic() < deadline:
-        if not is_pid_alive(pid):
-            return
-        time.sleep(0.1)
-    raise AssertionError(f"pid {pid} still alive after {timeout_seconds}s")
-
-
-def _kill_claimed_gate(app: OrchestratorApp, pr_number: int) -> int:
-    """Kill the in-flight suite tree named by the record's claim; returns pid."""
-    state = load_state_locked(app.paths.state_file)
-    record = state["prs"][str(pr_number)]
-    pid = int(record["local_suite_pid"])
-    kill_process_tree(pid, record.get("local_suite_process_start_time"))
-    _wait_pid_dead(pid)
-    return pid
 
 
 def _kill_any_claimed_gates(app: OrchestratorApp, *pr_numbers: int) -> None:
@@ -264,21 +140,6 @@ def _backdate_gate_start(app: OrchestratorApp, pr_number: int) -> None:
         state = load_state(app.paths.state_file)
         state["prs"][str(pr_number)]["local_suite_started_at"] = stale
         save_state(app.paths.state_file, state)
-
-
-def _dead_pid() -> int:
-    """A pid that was real a moment ago and is now definitely exited."""
-    child = subprocess.Popen([sys.executable, "-c", "pass"])
-    child.wait(timeout=30)
-    return child.pid
-
-
-def _event_kinds(app: OrchestratorApp) -> list[str]:
-    return [e["kind"] for e in load_state_locked(app.paths.state_file)["events"]]
-
-
-def _events_of_kind(app: OrchestratorApp, kind: str) -> list[dict]:
-    return [e for e in load_state_locked(app.paths.state_file)["events"] if e["kind"] == kind]
 
 
 # ---------------------------------------------------------------------------
@@ -575,9 +436,9 @@ def test_base_moved_during_suite_resyncs_and_relaunches(lane_repo: Path) -> None
     assert is_ancestor(lane_repo, head, branch_head_sha(lane_repo, "main"))
 
 
-def test_timeout_kills_tree_and_routes_to_rework(lane_repo: Path) -> None:
-    """AC: runtime beyond SUITE_TIMEOUT_SECONDS kills the process tree and
-    routes to rework."""
+def test_timeout_kills_tree_and_relaunches_without_rework(lane_repo: Path) -> None:
+    """Runtime beyond the suite timeout kills the process tree and relaunches
+    (#2127: wall clock measures the host, so it is never a rework)."""
     _init_repo(lane_repo)
     issues_dir = lane_repo / "docs" / "issues"
     head = _make_branch(lane_repo, "agent/issue-7-x", "a.py", "a = 1\n")
@@ -589,15 +450,19 @@ def test_timeout_kills_tree_and_routes_to_rework(lane_repo: Path) -> None:
     pid = int(load_state_locked(app.paths.state_file)["prs"]["7"]["local_suite_pid"])
     _backdate_gate_start(app, 7)
 
-    results = app._local_merge_approved()
+    try:
+        results = app._local_merge_approved()
 
-    assert results[0]["outcome"] == "suite_failed"
-    _wait_pid_dead(pid)
-    state = load_state_locked(app.paths.state_file)
-    assert state["prs"]["7"]["status"] == "rework_requested"
-    assert state["prs"]["7"].get("local_suite_pid") is None
-    kinds = _event_kinds(app)
-    assert "local_suite_failed" in kinds
+        assert results[0]["outcome"] == "suite_launched"
+        _wait_pid_dead(pid)
+        state = load_state_locked(app.paths.state_file)
+        assert state["prs"]["7"]["status"] == "approved"
+        assert state["prs"]["7"]["local_suite_infra_relaunch_count"] == 1
+        assert int(state["prs"]["7"]["local_suite_pid"]) != pid
+        assert "local_suite_failed" not in _event_kinds(app)
+        assert "local_suite_infra_relaunched" in _event_kinds(app)
+    finally:
+        _kill_claimed_gate(app, 7)
 
 
 def test_dead_pid_missing_result_relaunches_bounded_then_escalates(
