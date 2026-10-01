@@ -6,11 +6,18 @@ Track-1 wave 8/8).
 
 from __future__ import annotations
 
-import json
 import subprocess
 from pathlib import Path
 import pytest
-from _fake_transport import FakeAdapter, make_github, ok, sent
+from _fake_transport import (
+    FakeAdapter,
+    check_run,
+    checks_reply,
+    graphql_failure,
+    make_github,
+    ok,
+    sent,
+)
 from charlie_work import github as github_module
 from charlie_work.config import (
     ConfigError,
@@ -64,69 +71,40 @@ def test_job_id_from_link(link, expected) -> None:
     assert github_module._job_id_from_link(link) == expected
 
 
-def test_pr_checks_injects_database_id_from_link(monkeypatch, tmp_path: Path) -> None:
+def test_pr_checks_injects_database_id_from_link(tmp_path: Path) -> None:
     """pr_checks() derives databaseId from link for Actions checks, None otherwise."""
+    reply = checks_reply(
+        check_run("Tests passed", url="https://github.com/OWNER/REPO/actions/runs/1/job/42"),
+        {
+            "__typename": "StatusContext",
+            "context": "external-status-check",
+            "state": "SUCCESS",
+            "targetUrl": "https://example.com/status",
+        },
+    )
+    gh, _http, _ = make_github(tmp_path, http=FakeAdapter("http", [reply]))
 
-    def fake_run(*args, **kwargs):
-        return subprocess.CompletedProcess(
-            args=args,
-            returncode=0,
-            stdout=json.dumps(
-                [
-                    {
-                        "name": "Tests passed",
-                        "state": "SUCCESS",
-                        "bucket": "pass",
-                        "link": "https://github.com/OWNER/REPO/actions/runs/1/job/42",
-                    },
-                    {
-                        "name": "external-status-check",
-                        "state": "SUCCESS",
-                        "bucket": "pass",
-                        "link": "https://example.com/status",
-                    },
-                ]
-            ),
-            stderr="",
-        )
+    checks = gh.pr_checks(123)
 
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
-
-    checks = github_module.GitHub(tmp_path).pr_checks(123)
-
-    assert checks[0]["databaseId"] == 42
-    assert checks[1]["databaseId"] is None
+    assert {c["name"]: c["databaseId"] for c in checks} == {
+        "Tests passed": 42,
+        "external-status-check": None,
+    }
 
 
-def test_pr_checks_returns_empty_list_on_empty_success(monkeypatch, tmp_path: Path) -> None:
-    """Empty successful gh pr checks --json response returns [], not None."""
+def test_pr_checks_returns_empty_list_on_empty_success(tmp_path: Path) -> None:
+    """A PR with no check contexts returns [], not None."""
+    gh, _http, _ = make_github(tmp_path, http=FakeAdapter("http", [checks_reply()]))
 
-    def fake_run(*args, **kwargs):
-        return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
-
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
-
-    checks = github_module.GitHub(tmp_path).pr_checks(123)
-
-    assert checks == []
+    assert gh.pr_checks(123) == []
 
 
-def test_pr_checks_returns_none_on_gh_command_failure(monkeypatch, tmp_path: Path) -> None:
-    """gh pr checks command-level failure (Unknown JSON field) returns None."""
+def test_pr_checks_returns_none_on_gh_command_failure(tmp_path: Path) -> None:
+    """A read the API rejected (a GraphQL error) returns None."""
+    reply = graphql_failure("Field 'bogus' doesn't exist on type 'CheckRun'", "undefinedField")
+    gh, _http, _ = make_github(tmp_path, http=FakeAdapter("http", [reply]))
 
-    def fake_run(*args, **kwargs):
-        return subprocess.CompletedProcess(
-            args=args,
-            returncode=1,
-            stdout="",
-            stderr='Unknown JSON field: "databaseId"\nAvailable fields:\n  name\n  state\n  bucket\n  link',
-        )
-
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
-
-    checks = github_module.GitHub(tmp_path).pr_checks(123)
-
-    assert checks is None
+    assert gh.pr_checks(123) is None
 
 
 def test_check_run_annotations_returns_parsed_list_on_success(tmp_path: Path) -> None:
@@ -150,20 +128,12 @@ def test_check_run_annotations_returns_empty_list_on_api_failure(tmp_path: Path)
     assert gh.check_run_annotations(999) == []
 
 
-def test_pr_checks_returns_list_when_checks_fail(monkeypatch, tmp_path: Path) -> None:
-    """gh pr checks exits non-zero but with JSON list (failing checks) -> list."""
+def test_pr_checks_returns_list_when_checks_fail(tmp_path: Path) -> None:
+    """A failing check is a normal row (bucket "fail"), not a command failure."""
+    reply = checks_reply(check_run("Tests", "FAILURE"))
+    gh, _http, _ = make_github(tmp_path, http=FakeAdapter("http", [reply]))
 
-    def fake_run(*args, **kwargs):
-        return subprocess.CompletedProcess(
-            args=args,
-            returncode=2,
-            stdout='[{"name": "Tests", "state": "FAILURE", "bucket": "fail", "link": ""}]',
-            stderr="checks failed",
-        )
-
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
-
-    checks = github_module.GitHub(tmp_path).pr_checks(123)
+    checks = gh.pr_checks(123)
 
     assert checks == [
         {

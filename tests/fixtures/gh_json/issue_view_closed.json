@@ -1,0 +1,304 @@
+{
+  "fields": "number,title,url,body,labels,assignees,author,comments,createdAt,updatedAt,state",
+  "gh_json": {
+    "assignees": [],
+    "author": {
+      "id": "MDQ6VXNlcjI1NjcwNTk0",
+      "is_bot": false,
+      "login": "Senkichi",
+      "name": "Senkichi"
+    },
+    "body": "## Problem (third recurrence)\n\nA headless `devin --print` reviewer that tries an exec outside the read-only allow-list gets it **rejected, and the rejection ends the session with no verdict** (`review_verdict_missed`, cause `reviewer_exec_rejected`, `turn_count: 0` as recorded).\n\n- #2011 added the `.devin/config.local.json` allow-list.\n- #2024 and #2032 put the list into the prompt and told the reviewer to run nothing else.\n- On 2026-09-30 the reviewer switched to `devin-shell/swe-2-high`. The **first two SWE-2 reviews both missed this way**: charlie-work PR #2087 at 18:20:37Z and job-cannon PR #2213 at 18:20:17Z. Each did a thorough read and then shelled out to something off-list. Devin's log records `Permission decision for tool exec: prompting user` and then `Print mode: rejecting tool call ... that requires confirmation`. The command itself is not logged.\n\nPrompt wording has now failed with two model families (Gemini, SWE-2). Models *will* occasionally try a refused command, so a refusal has to be recoverable rather than fatal.\n\n## Proposed fix: bounded resume after a refusal\n\nThe Devin CLI supports `-r/--resume <SESSION_ID>` (and `--model` on resume).\n\n1. When a devin-shell **review** session ends with the exec-rejection signature (the classifier that already yields `reviewer_exec_rejected`), and no verdict was extracted, relaunch **the same session** with `--resume <session_id> --print`. Use a short nudge message: the last command was refused in this headless session; do not retry it; use only the allowed commands (render them from `_REVIEW_EXEC_ALLOWLIST`, the single source) or the pre-rendered packet; emit the verdict now.\n2. Allow at most N resumes per review (N=2, configurable via `review_dispatch`, where 0 disables it). Each resume is its own `Popen` (non-blocking, errors as values) and reuses the same review checkout, so the allow-list file is still there.\n3. Emit `review_exec_rejection_resumed` with `{pr_number, attempt, session_id}`. Only emit `review_verdict_missed` when the resumes run out or a resume fails to launch.\n4. Resumed sessions count against the per-repo review cap and against the fleet reviewer cap (#2084) exactly as the original session does. A resume replaces the dead session and must not be double-counted.\n5. The session id has to come from somewhere reliable: the `session/new` log line, `devin list` in the checkout cwd, or the sessions DB. Pick the one with a stable, parseable source, and fall back to the current miss behaviour if the id cannot be determined.\n\nOut of scope: widening the allow-list. It is deliberately minimal; see the rationale block in `devin_shell.py`. `--permission-mode smart` would put the safety decision in a fast model on attacker-influenced diffs, so this issue does not pursue it.\n\n## Acceptance\n- A fake devin review that exec-rejects once and then emits a verdict when resumed records that verdict, and no `review_verdict_missed` is emitted.\n- Rejecting on every attempt yields exactly N resumes, then `review_verdict_missed`.\n- A resume launch failure falls back to a miss, returned as an error value.\n- The cap accounting tests show a resumed session is not double-counted.\n",
+    "comments": [
+      {
+        "author": {
+          "login": "Senkichi"
+        },
+        "authorAssociation": "OWNER",
+        "body": "Stopgap while this is open: in the global layered config I raised `review_dispatch.max_review_dispatch_attempts` from 3 to 6 on 2026-09-30 ~18:30Z, so SWE-2 exec-rejection misses don't escalate every PR after 3 attempts. At that point SWE-2 reviews had missed 4 out of 4 (cw PR #2087 twice, jc PR #2213 twice). **Revert after this deploys:** delete the key; the backup is `config.yaml.bak-20260930-reviewattempts`.",
+        "createdAt": "2026-09-30T18:30:14Z",
+        "id": "IC_kwDOTL3PGc8AAAABYLKtqA",
+        "includesCreatedEdit": false,
+        "isMinimized": false,
+        "minimizedReason": "",
+        "reactionGroups": [],
+        "url": "https://github.com/Senkichi/charlie-work/issues/2090#issuecomment-5917289896",
+        "viewerDidAuthor": true
+      },
+      {
+        "author": {
+          "login": "Senkichi"
+        },
+        "authorAssociation": "OWNER",
+        "body": "Addendum: at 18:36Z, SWE-2 reviews were 0 for 5, and PRs are expected to hit the raised attempt cap (6) before this lands. **Post-deploy checklist:** (1) delete the temporary `max_review_dispatch_attempts` key; (2) `charlie unescalate --pr N` every PR escalated with a review-attempt-cap reason since 2026-09-30T18:20Z (so far cw #2087 and jc #2213 are at risk).",
+        "createdAt": "2026-09-30T18:36:24Z",
+        "id": "IC_kwDOTL3PGc8AAAABYLQjDQ",
+        "includesCreatedEdit": false,
+        "isMinimized": false,
+        "minimizedReason": "",
+        "reactionGroups": [],
+        "url": "https://github.com/Senkichi/charlie-work/issues/2090#issuecomment-5917385485",
+        "viewerDidAuthor": true
+      },
+      {
+        "author": {
+          "login": "Senkichi"
+        },
+        "authorAssociation": "OWNER",
+        "body": "Deployed (c4e79714, 19:34Z) and verified live: PR #2093's SWE-2 review was exec-rejected twice. Each time it resumed (`review_exec_rejection_resumed` attempts 1 and 2, same session), and it then recorded a real `request_changes` verdict at 19:50Z. Post-deploy checklist is done: the temporary `max_review_dispatch_attempts: 6` is removed (all 6 repos validate at 3), the error monitor no longer excludes exec-reject events, and no PRs were left escalated by the temporary cap (#2087 got a real verdict; jc #2213 is in reviewing).",
+        "createdAt": "2026-09-30T19:51:17Z",
+        "id": "IC_kwDOTL3PGc8AAAABYMWdkg",
+        "includesCreatedEdit": false,
+        "isMinimized": false,
+        "minimizedReason": "",
+        "reactionGroups": [],
+        "url": "https://github.com/Senkichi/charlie-work/issues/2090#issuecomment-5918530962",
+        "viewerDidAuthor": true
+      }
+    ],
+    "createdAt": "2026-09-30T18:22:12Z",
+    "labels": [
+      {
+        "color": "5319E7",
+        "description": "Automation completed and the issue was merged or resolved.",
+        "id": "LA_kwDOTL3PGc8AAAACqB473Q",
+        "name": "agent:done"
+      }
+    ],
+    "number": 2090,
+    "state": "CLOSED",
+    "title": "devin-shell reviewer: resume the session after an exec rejection instead of losing the review (3rd recurrence, SWE-2 2/2 missed)",
+    "updatedAt": "2026-09-30T19:57:27Z",
+    "url": "https://github.com/Senkichi/charlie-work/issues/2090"
+  },
+  "graphql_data": {
+    "repository": {
+      "issue": {
+        "assignees": {
+          "nodes": []
+        },
+        "author": {
+          "__typename": "User",
+          "id": "MDQ6VXNlcjI1NjcwNTk0",
+          "login": "Senkichi",
+          "name": "Senkichi"
+        },
+        "body": "## Problem (third recurrence)\n\nA headless `devin --print` reviewer that tries an exec outside the read-only allow-list gets it **rejected, and the rejection ends the session with no verdict** (`review_verdict_missed`, cause `reviewer_exec_rejected`, `turn_count: 0` as recorded).\n\n- #2011 added the `.devin/config.local.json` allow-list.\n- #2024 and #2032 put the list into the prompt and told the reviewer to run nothing else.\n- On 2026-09-30 the reviewer switched to `devin-shell/swe-2-high`. The **first two SWE-2 reviews both missed this way**: charlie-work PR #2087 at 18:20:37Z and job-cannon PR #2213 at 18:20:17Z. Each did a thorough read and then shelled out to something off-list. Devin's log records `Permission decision for tool exec: prompting user` and then `Print mode: rejecting tool call ... that requires confirmation`. The command itself is not logged.\n\nPrompt wording has now failed with two model families (Gemini, SWE-2). Models *will* occasionally try a refused command, so a refusal has to be recoverable rather than fatal.\n\n## Proposed fix: bounded resume after a refusal\n\nThe Devin CLI supports `-r/--resume <SESSION_ID>` (and `--model` on resume).\n\n1. When a devin-shell **review** session ends with the exec-rejection signature (the classifier that already yields `reviewer_exec_rejected`), and no verdict was extracted, relaunch **the same session** with `--resume <session_id> --print`. Use a short nudge message: the last command was refused in this headless session; do not retry it; use only the allowed commands (render them from `_REVIEW_EXEC_ALLOWLIST`, the single source) or the pre-rendered packet; emit the verdict now.\n2. Allow at most N resumes per review (N=2, configurable via `review_dispatch`, where 0 disables it). Each resume is its own `Popen` (non-blocking, errors as values) and reuses the same review checkout, so the allow-list file is still there.\n3. Emit `review_exec_rejection_resumed` with `{pr_number, attempt, session_id}`. Only emit `review_verdict_missed` when the resumes run out or a resume fails to launch.\n4. Resumed sessions count against the per-repo review cap and against the fleet reviewer cap (#2084) exactly as the original session does. A resume replaces the dead session and must not be double-counted.\n5. The session id has to come from somewhere reliable: the `session/new` log line, `devin list` in the checkout cwd, or the sessions DB. Pick the one with a stable, parseable source, and fall back to the current miss behaviour if the id cannot be determined.\n\nOut of scope: widening the allow-list. It is deliberately minimal; see the rationale block in `devin_shell.py`. `--permission-mode smart` would put the safety decision in a fast model on attacker-influenced diffs, so this issue does not pursue it.\n\n## Acceptance\n- A fake devin review that exec-rejects once and then emits a verdict when resumed records that verdict, and no `review_verdict_missed` is emitted.\n- Rejecting on every attempt yields exactly N resumes, then `review_verdict_missed`.\n- A resume launch failure falls back to a miss, returned as an error value.\n- The cap accounting tests show a resumed session is not double-counted.\n",
+        "comments": {
+          "nodes": [
+            {
+              "author": {
+                "login": "Senkichi"
+              },
+              "authorAssociation": "OWNER",
+              "body": "Stopgap while this is open: in the global layered config I raised `review_dispatch.max_review_dispatch_attempts` from 3 to 6 on 2026-09-30 ~18:30Z, so SWE-2 exec-rejection misses don't escalate every PR after 3 attempts. At that point SWE-2 reviews had missed 4 out of 4 (cw PR #2087 twice, jc PR #2213 twice). **Revert after this deploys:** delete the key; the backup is `config.yaml.bak-20260930-reviewattempts`.",
+              "createdAt": "2026-09-30T18:30:14Z",
+              "id": "IC_kwDOTL3PGc8AAAABYLKtqA",
+              "includesCreatedEdit": false,
+              "isMinimized": false,
+              "minimizedReason": null,
+              "reactionGroups": [
+                {
+                  "content": "THUMBS_UP",
+                  "users": {
+                    "totalCount": 0
+                  }
+                },
+                {
+                  "content": "THUMBS_DOWN",
+                  "users": {
+                    "totalCount": 0
+                  }
+                },
+                {
+                  "content": "LAUGH",
+                  "users": {
+                    "totalCount": 0
+                  }
+                },
+                {
+                  "content": "HOORAY",
+                  "users": {
+                    "totalCount": 0
+                  }
+                },
+                {
+                  "content": "CONFUSED",
+                  "users": {
+                    "totalCount": 0
+                  }
+                },
+                {
+                  "content": "HEART",
+                  "users": {
+                    "totalCount": 0
+                  }
+                },
+                {
+                  "content": "ROCKET",
+                  "users": {
+                    "totalCount": 0
+                  }
+                },
+                {
+                  "content": "EYES",
+                  "users": {
+                    "totalCount": 0
+                  }
+                }
+              ],
+              "url": "https://github.com/Senkichi/charlie-work/issues/2090#issuecomment-5917289896",
+              "viewerDidAuthor": true
+            },
+            {
+              "author": {
+                "login": "Senkichi"
+              },
+              "authorAssociation": "OWNER",
+              "body": "Addendum: at 18:36Z, SWE-2 reviews were 0 for 5, and PRs are expected to hit the raised attempt cap (6) before this lands. **Post-deploy checklist:** (1) delete the temporary `max_review_dispatch_attempts` key; (2) `charlie unescalate --pr N` every PR escalated with a review-attempt-cap reason since 2026-09-30T18:20Z (so far cw #2087 and jc #2213 are at risk).",
+              "createdAt": "2026-09-30T18:36:24Z",
+              "id": "IC_kwDOTL3PGc8AAAABYLQjDQ",
+              "includesCreatedEdit": false,
+              "isMinimized": false,
+              "minimizedReason": null,
+              "reactionGroups": [
+                {
+                  "content": "THUMBS_UP",
+                  "users": {
+                    "totalCount": 0
+                  }
+                },
+                {
+                  "content": "THUMBS_DOWN",
+                  "users": {
+                    "totalCount": 0
+                  }
+                },
+                {
+                  "content": "LAUGH",
+                  "users": {
+                    "totalCount": 0
+                  }
+                },
+                {
+                  "content": "HOORAY",
+                  "users": {
+                    "totalCount": 0
+                  }
+                },
+                {
+                  "content": "CONFUSED",
+                  "users": {
+                    "totalCount": 0
+                  }
+                },
+                {
+                  "content": "HEART",
+                  "users": {
+                    "totalCount": 0
+                  }
+                },
+                {
+                  "content": "ROCKET",
+                  "users": {
+                    "totalCount": 0
+                  }
+                },
+                {
+                  "content": "EYES",
+                  "users": {
+                    "totalCount": 0
+                  }
+                }
+              ],
+              "url": "https://github.com/Senkichi/charlie-work/issues/2090#issuecomment-5917385485",
+              "viewerDidAuthor": true
+            },
+            {
+              "author": {
+                "login": "Senkichi"
+              },
+              "authorAssociation": "OWNER",
+              "body": "Deployed (c4e79714, 19:34Z) and verified live: PR #2093's SWE-2 review was exec-rejected twice. Each time it resumed (`review_exec_rejection_resumed` attempts 1 and 2, same session), and it then recorded a real `request_changes` verdict at 19:50Z. Post-deploy checklist is done: the temporary `max_review_dispatch_attempts: 6` is removed (all 6 repos validate at 3), the error monitor no longer excludes exec-reject events, and no PRs were left escalated by the temporary cap (#2087 got a real verdict; jc #2213 is in reviewing).",
+              "createdAt": "2026-09-30T19:51:17Z",
+              "id": "IC_kwDOTL3PGc8AAAABYMWdkg",
+              "includesCreatedEdit": false,
+              "isMinimized": false,
+              "minimizedReason": null,
+              "reactionGroups": [
+                {
+                  "content": "THUMBS_UP",
+                  "users": {
+                    "totalCount": 0
+                  }
+                },
+                {
+                  "content": "THUMBS_DOWN",
+                  "users": {
+                    "totalCount": 0
+                  }
+                },
+                {
+                  "content": "LAUGH",
+                  "users": {
+                    "totalCount": 0
+                  }
+                },
+                {
+                  "content": "HOORAY",
+                  "users": {
+                    "totalCount": 0
+                  }
+                },
+                {
+                  "content": "CONFUSED",
+                  "users": {
+                    "totalCount": 0
+                  }
+                },
+                {
+                  "content": "HEART",
+                  "users": {
+                    "totalCount": 0
+                  }
+                },
+                {
+                  "content": "ROCKET",
+                  "users": {
+                    "totalCount": 0
+                  }
+                },
+                {
+                  "content": "EYES",
+                  "users": {
+                    "totalCount": 0
+                  }
+                }
+              ],
+              "url": "https://github.com/Senkichi/charlie-work/issues/2090#issuecomment-5918530962",
+              "viewerDidAuthor": true
+            }
+          ]
+        },
+        "createdAt": "2026-09-30T18:22:12Z",
+        "labels": {
+          "nodes": [
+            {
+              "color": "5319E7",
+              "description": "Automation completed and the issue was merged or resolved.",
+              "id": "LA_kwDOTL3PGc8AAAACqB473Q",
+              "name": "agent:done"
+            }
+          ]
+        },
+        "number": 2090,
+        "state": "CLOSED",
+        "title": "devin-shell reviewer: resume the session after an exec rejection instead of losing the review (3rd recurrence, SWE-2 2/2 missed)",
+        "updatedAt": "2026-09-30T19:57:27Z",
+        "url": "https://github.com/Senkichi/charlie-work/issues/2090"
+      }
+    }
+  },
+  "number": 2090,
+  "resource": "issue"
+}

@@ -9,6 +9,7 @@ bodies are verbatim relocations; shared helpers live in
 
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -65,7 +66,7 @@ def test_run_retries_transient_read_failure_then_succeeds(monkeypatch, tmp_path:
 
     gh = github_module.GitHub(
         tmp_path,
-        runtime=RuntimeConfig(gh_max_retries=3, gh_retry_base_seconds=1.0),
+        runtime=gh_kill_switch_runtime(gh_max_retries=3, gh_retry_base_seconds=1.0),
     )
     result = gh.run(_issue_list_args(), json_output=True)
 
@@ -180,7 +181,7 @@ def test_run_retry_backoff_is_bounded_and_grows(monkeypatch, tmp_path: Path) -> 
 
     gh = github_module.GitHub(
         tmp_path,
-        runtime=RuntimeConfig(gh_max_retries=2, gh_retry_base_seconds=1.0),
+        runtime=gh_kill_switch_runtime(gh_max_retries=2, gh_retry_base_seconds=1.0),
     )
     with pytest.raises(github_module.GitHubError):
         gh.run(_issue_list_args(), json_output=True)
@@ -210,7 +211,7 @@ def test_run_allow_failure_retries_then_returns_error_result(monkeypatch, tmp_pa
 
     gh = github_module.GitHub(
         tmp_path,
-        runtime=RuntimeConfig(gh_max_retries=1, gh_retry_base_seconds=1.0),
+        runtime=gh_kill_switch_runtime(gh_max_retries=1, gh_retry_base_seconds=1.0),
     )
     result = gh.run(_issue_list_args(), json_output=True, allow_failure=True)
 
@@ -265,7 +266,7 @@ def test_run_read_command_timeout_retries_then_succeeds(monkeypatch, tmp_path: P
 
     gh = github_module.GitHub(
         tmp_path,
-        runtime=RuntimeConfig(gh_max_retries=3, gh_retry_base_seconds=1.0),
+        runtime=gh_kill_switch_runtime(gh_max_retries=3, gh_retry_base_seconds=1.0),
     )
     result = gh.run(_issue_list_args(), json_output=True)
 
@@ -289,7 +290,7 @@ def test_run_read_command_timeout_exhausts_retries_raises(monkeypatch, tmp_path:
 
     gh = github_module.GitHub(
         tmp_path,
-        runtime=RuntimeConfig(gh_max_retries=2, gh_retry_base_seconds=1.0),
+        runtime=gh_kill_switch_runtime(gh_max_retries=2, gh_retry_base_seconds=1.0),
     )
     with pytest.raises(github_module.GitHubError, match="timed out"):
         gh.run(_issue_list_args(), json_output=True)
@@ -363,7 +364,7 @@ def test_run_read_command_timeout_allow_failure_terminal_returns_124(
 
     gh = github_module.GitHub(
         tmp_path,
-        runtime=RuntimeConfig(gh_max_retries=1, gh_retry_base_seconds=1.0),
+        runtime=gh_kill_switch_runtime(gh_max_retries=1, gh_retry_base_seconds=1.0),
     )
     result = gh.run(_issue_list_args(), json_output=True, allow_failure=True)
 
@@ -384,7 +385,7 @@ def test_run_file_not_found_raises_github_error(monkeypatch, tmp_path: Path) -> 
 
     monkeypatch.setattr(github_module.subprocess, "run", fake_run)
 
-    gh = github_module.GitHub(tmp_path)
+    gh = github_module.GitHub(tmp_path, runtime=gh_kill_switch_runtime())
     with pytest.raises(github_module.GitHubError, match="not installed"):
         gh.run(_issue_list_args(), json_output=True)
 
@@ -401,7 +402,7 @@ def test_run_file_not_found_allow_failure_returns_error_result(
 
     monkeypatch.setattr(github_module.subprocess, "run", fake_run)
 
-    gh = github_module.GitHub(tmp_path)
+    gh = github_module.GitHub(tmp_path, runtime=gh_kill_switch_runtime())
     result = gh.run(_issue_list_args(), json_output=True, allow_failure=True)
 
     assert isinstance(result, github_module.GitHubRunResult)
@@ -423,7 +424,7 @@ def test_run_passes_configured_gh_timeout_seconds_to_subprocess_run(
 
     monkeypatch.setattr(github_module.subprocess, "run", fake_run)
 
-    gh = github_module.GitHub(tmp_path, runtime=RuntimeConfig(gh_timeout_seconds=7.5))
+    gh = github_module.GitHub(tmp_path, runtime=gh_kill_switch_runtime(gh_timeout_seconds=7.5))
     gh.run(_issue_list_args(), json_output=True)
 
     assert captured_timeouts == [7.5]
@@ -445,7 +446,7 @@ def test_run_raises_on_empty_stdout_success_not_none(monkeypatch, tmp_path: Path
 
     monkeypatch.setattr(github_module.subprocess, "run", fake_run)
 
-    gh = github_module.GitHub(tmp_path)
+    gh = github_module.GitHub(tmp_path, runtime=gh_kill_switch_runtime())
     with pytest.raises(github_module.GitHubError):
         gh.run(["issue", "list", "--json", "number"], json_output=True)
 
@@ -460,7 +461,7 @@ def test_run_returns_empty_list_for_genuine_empty_json_array(monkeypatch, tmp_pa
 
     monkeypatch.setattr(github_module.subprocess, "run", fake_run)
 
-    gh = github_module.GitHub(tmp_path)
+    gh = github_module.GitHub(tmp_path, runtime=gh_kill_switch_runtime())
     result = gh.run(["issue", "list", "--json", "number"], json_output=True)
 
     assert result == []
@@ -495,6 +496,7 @@ def test_wrapper_method_raises_on_unreadable_empty_stdout(
     gh = github_module.GitHub(tmp_path, runtime=gh_kill_switch_runtime())
     # label_list is a REST read: pin the slug so no `git remote` lookup is needed.
     object.__setattr__(gh, "_repo_owner_name", lambda: ("octo", "hello"))
+    gh._list_cache[("_repo_owner_name",)] = ("octo", "hello")  # the collaborator reads the cache
     method = getattr(gh, method_name)
     with pytest.raises(github_module.GitHubError):
         method(*args)
@@ -522,11 +524,25 @@ def test_wrapper_method_returns_empty_for_genuine_empty_json(
     a genuinely empty JSON response ("[]" or "{}", not empty stdout) must still
     return the empty container cleanly, without raising."""
 
+    page = {"nodes": [], "pageInfo": {"hasNextPage": False, "endCursor": None}}
+    # The --json reads are GraphQL now: a genuinely empty result is an empty
+    # connection (lists) or a node with no populated fields (views).
+    graphql = {
+        "issue_list": {"repository": {"issues": page}},
+        "pr_list": {"repository": {"pullRequests": page}},
+        "issue_view": {"repository": {"issue": {}}},
+        "pr_view": {"repository": {"pullRequest": {}}},
+    }
+
     def fake_run(cmd, *a, **kwargs):
         # A REST read goes out as ``gh api --include`` and reads back a status line.
         prefix = "HTTP/2.0 200 OK\r\n\r\n" if "--include" in cmd else ""
+        if method_name in graphql:
+            stdout = json.dumps({"data": graphql[method_name]})
+        else:
+            stdout = empty_json_stdout
         return subprocess.CompletedProcess(
-            args=cmd, returncode=0, stdout=prefix + empty_json_stdout, stderr=""
+            args=cmd, returncode=0, stdout=prefix + stdout, stderr=""
         )
 
     monkeypatch.setattr(github_module.subprocess, "run", fake_run)
@@ -534,9 +550,12 @@ def test_wrapper_method_returns_empty_for_genuine_empty_json(
     gh = github_module.GitHub(tmp_path, runtime=gh_kill_switch_runtime())
     # label_list is a REST read: pin the slug so no `git remote` lookup is needed.
     object.__setattr__(gh, "_repo_owner_name", lambda: ("octo", "hello"))
+    gh._list_cache[("_repo_owner_name",)] = ("octo", "hello")  # the collaborator reads the cache
     method = getattr(gh, method_name)
     result = method(*args)
 
+    if isinstance(result, dict):  # a view of an empty node: every field unpopulated
+        result = {k: v for k, v in result.items() if v not in (None, [], "")}
     assert result == expected
 
 

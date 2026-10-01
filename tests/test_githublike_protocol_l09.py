@@ -32,7 +32,7 @@ from pathlib import Path
 import pytest
 
 import charlie_work.github as _github_module
-from _fake_transport import FakeAdapter, make_github, ok
+from _fake_transport import FakeAdapter, checks_reply, make_github, ok
 from charlie_work.github_transport import Adapters
 from charlie_work.config import ConfigError, RuntimeConfig
 from charlie_work.github import GitHub, GitHubLike, _ROUTES
@@ -49,7 +49,6 @@ TRANSPORT_MOVED_MEMBERS = (
     "_graphql_issue_states",
     "_graphql_issue_dependencies",
     "_normalize_rest_pr",
-    "_pr_checks_fallback",
     "_max_retries",
     "_retry_base_seconds",
     "_timeout_seconds",
@@ -259,11 +258,12 @@ def test_run_monkeypatchable_at_class_level_with_moved_body_observing_it(
 ) -> None:
     """A class-level ``monkeypatch.setattr(GitHub, "run", ...)`` must still be
     observed by a MOVED body's internal ``self.run(...)`` call -- proving the
-    134 existing `run` patch sites keep intercepting after ``_run_bool``/
-    ``_list_json``/etc. move to ``Transport``. ``_list_json`` (moved) calls
-    ``self.run(...)``, which resolves via ``CapabilityCollaborator.__getattr__``
-    to the owner's ``run`` -- patched here at the class level, unaffected by
-    which collaborator ``self`` is.
+    134 existing `run` patch sites keep intercepting after ``_run_bool``/etc.
+    move to ``Transport``. ``_run_bool`` (moved) calls ``self.run(...)``, which
+    resolves via ``CapabilityCollaborator.__getattr__`` to the owner's ``run``
+    -- patched here at the class level, unaffected by which collaborator
+    ``self`` is. (``_list_json`` used to be the probe; it reads over GraphQL
+    now and no longer goes through ``run``.)
     """
     calls: list[list[str]] = []
 
@@ -276,15 +276,17 @@ def test_run_monkeypatchable_at_class_level_with_moved_body_observing_it(
         long_call: bool = False,
     ):
         calls.append(args)
-        return [{"number": 1}]
+        return _github_module.GitHubRunResult(
+            ok=True, returncode=0, stdout="", stderr="", value=None
+        )
 
     monkeypatch.setattr(GitHub, "run", fake_run)
 
     gh = GitHub(tmp_path)
-    result = gh._list_json(["issue", "list"], limit=10, kind="issues")
+    result = gh._run_bool(["label", "create", "x"])
 
-    assert result == [{"number": 1}]
-    assert calls == [["issue", "list"]]
+    assert result is True
+    assert calls == [["label", "create", "x"]]
 
 
 def test_run_monkeypatchable_at_instance_level_with_moved_body_observing_it(
@@ -352,27 +354,17 @@ def test_normalize_rest_pr_delegate_reachable(tmp_path: Path) -> None:
     }
 
 
-def test_pr_checks_fallback_delegate_reachable(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """``gh._pr_checks_fallback(...)`` reaches the moved ``Transport`` body
-    through the installed delegate, driven by a patched class-level ``run``.
+def test_pr_checks_fallback_delegate_reachable(tmp_path: Path) -> None:
+    """``_pr_checks_fallback`` was deleted with the ``gh pr checks`` dependency
+    (ADR-0006, B7): the rollup read *is* ``pr_checks`` now, so a PR with no
+    checks is answered ``[]`` by the delegate in one request, with no second
+    endpoint to disambiguate it.
     """
+    gh, http, _ = make_github(tmp_path, http=FakeAdapter("http", [checks_reply()]))
 
-    def fake_run(
-        self: GitHub, args: list[str], *, json_output: bool = False, allow_failure: bool = False
-    ):
-        return _github_module.GitHubRunResult(
-            ok=True,
-            returncode=0,
-            stdout="",
-            stderr="",
-            value={"statusCheckRollup": []},
-        )
-
-    monkeypatch.setattr(GitHub, "run", fake_run)
-    gh = GitHub(tmp_path)
-    assert gh._pr_checks_fallback(1) == []
+    assert not hasattr(GitHub, "_pr_checks_fallback")
+    assert gh.pr_checks(1) == []
+    assert len(http.api_requests) == 1
 
 
 def test_repo_owner_name_delegate_uses_owner_shared_list_cache(tmp_path: Path) -> None:

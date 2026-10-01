@@ -11,11 +11,13 @@ Two outcomes for every argv:
 
 * a ``RestRequest`` / ``GraphQLRequest`` for the ``gh api`` REST-GET and
   GraphQL-query shapes the HTTP path has always served, plus the two
-  ``gh run cancel|rerun`` mutations, or
+  ``gh run cancel|rerun`` mutations, a ``JsonRead`` / ``RunListRead`` for
+  the ``gh issue|pr|run ... --json`` reads (executed over GraphQL / REST,
+  ``json_read.py``), or
 * a ``LegacyCli``, the verbatim ``gh <args>`` passthrough for everything
-  else (every ``--json`` subcommand and every mutation). ``LegacyCli`` is a
-  transitional request: it always routes to the gh adapter and is deleted
-  when the last capability has moved off ``run(argv)``.
+  else. ``LegacyCli`` is a transitional request: it always routes to the gh
+  adapter and is deleted when the last capability has moved off
+  ``run(argv)``.
 
 Mutation-ness of a passthrough argv is the old prefix allowlist, moved here
 verbatim (``legacy_is_mutating``): a typed request derives it from its
@@ -28,9 +30,13 @@ capability layer.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 from urllib.parse import parse_qsl
 
 from .request import ACCEPT_JSON, GraphQLRequest, Request, RestRequest
+
+if TYPE_CHECKING:  # json_read imports the guard, which imports this module
+    from .json_read import JsonRead, RunListRead
 
 # Endpoint path suffix whose request follows a redirect: the Actions job-log
 # endpoint answers 302 to a signed URL with a raw-text body (gt-design G3).
@@ -154,7 +160,7 @@ class LegacyCli:
 class Translated:
     """One table lookup: the request to send and whether to follow pages."""
 
-    request: Request | LegacyCli
+    request: "Request | LegacyCli | JsonRead | RunListRead"
     paginate: bool = False
 
 
@@ -283,6 +289,124 @@ def _run_row(args: list[str], long_call: bool) -> Translated | None:
     return Translated(RestRequest("POST", route, long_call=long_call))
 
 
+_STATES = frozenset({"open", "closed", "merged", "all"})
+
+
+def _flag_values(
+    args: list[str], start: int, allowed: frozenset[str]
+) -> dict[str, list[str]] | None:
+    """``--flag value`` pairs from *start* on; None for anything not in *allowed*
+    (a bare token, a ``--flag=value`` spelling, a missing value)."""
+    found: dict[str, list[str]] = {}
+    i = start
+    while i < len(args):
+        flag = args[i]
+        if flag not in allowed or i + 1 >= len(args):
+            return None
+        found.setdefault(flag, []).append(args[i + 1])
+        i += 2
+    return found
+
+
+def _single(values: dict[str, list[str]], flag: str) -> str | None:
+    seen = values.get(flag)
+    return seen[-1] if seen else None
+
+
+def _limit(values: dict[str, list[str]], default: int) -> int | None:
+    raw = _single(values, "--limit")
+    if raw is None:
+        return default
+    return int(raw) if raw.isdigit() and int(raw) > 0 else None
+
+
+def _json_row(args: list[str], long_call: bool) -> Translated | None:
+    """`gh issue|pr view|list|checks ... --json F`: the dialect reads.
+
+    ``--json F`` must be the last pair. Lists take ``--state/--limit/--label/
+    --head/--search``; anything else is not in the table (fails closed).
+    """
+    from .json_read import JsonRead
+
+    if len(args) < 4 or args[0] not in ("issue", "pr") or args[-2] != "--json":
+        return None
+    resource, verb, fields = args[0], args[1], args[-1]
+    body = args[:-2]
+    if verb in ("view", "checks") and len(body) == 3 and body[2].isdigit():
+        if verb == "checks" and resource != "pr":
+            return None
+        return Translated(
+            JsonRead(resource, verb, fields, number=int(body[2]), long_call=long_call)  # type: ignore[arg-type]
+        )
+    if verb != "list":
+        return None
+    values = _flag_values(
+        body, 2, frozenset({"--state", "--limit", "--label", "--head", "--search"})
+    )
+    if values is None:
+        return None
+    limit = _limit(values, 30)
+    state = _single(values, "--state") or "open"
+    if limit is None or state not in _STATES:
+        return None
+    head, search = _single(values, "--head"), _single(values, "--search")
+    labels = tuple(values.get("--label", ()))
+    if search is not None:
+        if resource != "pr" or head is not None or labels:
+            return None
+        return Translated(
+            JsonRead(
+                "pr",
+                "search",
+                fields,
+                state=state,
+                search=search,
+                limit=limit,
+                long_call=long_call,
+            )
+        )
+    if head is not None and resource != "pr" or labels and resource != "issue":
+        return None
+    return Translated(
+        JsonRead(
+            resource,  # type: ignore[arg-type]
+            "list",
+            fields,
+            state=state,
+            labels=labels,
+            head=head,
+            limit=limit,
+            long_call=long_call,
+        )
+    )
+
+
+def _run_list_row(args: list[str], long_call: bool) -> Translated | None:
+    """`gh run list [--workflow W] [--branch B] [--status S] [--limit N] --json F`."""
+    from .json_read import RunListRead
+
+    if len(args) < 4 or args[1] != "list" or args[-2] != "--json":
+        return None
+    values = _flag_values(
+        args[:-2], 2, frozenset({"--workflow", "--branch", "--status", "--limit"})
+    )
+    if values is None:
+        return None
+    limit = _limit(values, 20)
+    if limit is None:
+        return None
+    return Translated(
+        RunListRead(
+            fields=args[-1],
+            workflow=_single(values, "--workflow"),
+            branch=_single(values, "--branch"),
+            status=_single(values, "--status"),
+            limit=limit,
+            long_call=long_call,
+        )
+    )
+
+
 def request_for_argv(
     args: list[str], *, long_call: bool = False, use_requests: bool = True
 ) -> Translated:
@@ -293,8 +417,10 @@ def request_for_argv(
     the switch is on.
     """
     passthrough = Translated(LegacyCli(tuple(args), long_call))
+    if use_requests and args and args[0] in ("issue", "pr"):
+        return _json_row(args, long_call) or passthrough
     if use_requests and args and args[0] == "run":
-        return _run_row(args, long_call) or passthrough
+        return _run_row(args, long_call) or _run_list_row(args, long_call) or passthrough
     if not use_requests or not args or args[0] != "api" or api_is_mutating(args):
         return passthrough
     if is_graphql_query(args):

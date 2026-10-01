@@ -31,9 +31,19 @@ from pathlib import Path
 import pytest
 
 import charlie_work.github as _github_module
-from _fake_transport import FakeAdapter, make_github, ok, sent
+from _fake_transport import (
+    FakeAdapter,
+    FakeTransport,
+    graphql_failure,
+    graphql_ok,
+    graphql_variables,
+    make_github,
+    ok,
+    sent,
+)
 from charlie_work.github import GitHub, _ROUTES
 from charlie_work.github_capabilities import PullRequestsLike
+from charlie_work.github_transport.json_read import JsonRead
 from charlie_work.github_capabilities.pull_requests import PullRequests
 
 from _githublike_protocol_helpers import _lexical_github_defs
@@ -140,20 +150,18 @@ def test_pr_list_delegate_forwards_through_list_json(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """Calling ``gh.pr_list()`` through the delegate must reach the patched
-    class-level ``GitHub._list_json`` with the same argv the moved body
-    produces (including ``_LIST_LIMIT``/``PR_LIST_FIELDS``).
+    class-level ``GitHub._list_json`` with the same read the moved body
+    builds (including ``_LIST_LIMIT``/``PR_LIST_FIELDS``).
 
-    The expected argv is transcribed by reading the moved
+    The expected read is transcribed by reading the moved
     ``PullRequests.pr_list`` body directly.
     """
     from charlie_work.github_capabilities import PR_LIST_FIELDS, _LIST_LIMIT
 
-    calls: list[tuple[list[str], int, str]] = []
+    calls: list[tuple[JsonRead, str]] = []
 
-    def fake_list_json(
-        self: GitHub, args: list[str], *, limit: int, kind: str
-    ) -> list[dict[str, str]]:
-        calls.append((args, limit, kind))
+    def fake_list_json(self: GitHub, read: JsonRead, *, kind: str) -> list[dict[str, str]]:
+        calls.append((read, kind))
         return [{"number": "1"}]
 
     monkeypatch.setattr(GitHub, "_list_json", fake_list_json)
@@ -164,17 +172,9 @@ def test_pr_list_delegate_forwards_through_list_json(
     assert result == [{"number": "1"}]
     assert calls == [
         (
-            [
-                "pr",
-                "list",
-                "--state",
-                "open",
-                "--limit",
-                str(_LIST_LIMIT),
-                "--json",
-                PR_LIST_FIELDS,
-            ],
-            _LIST_LIMIT,
+            JsonRead(
+                "pr", "list", PR_LIST_FIELDS, state="open", limit=_LIST_LIMIT, long_call=True
+            ),
             "open PRs",
         ),
     ]
@@ -251,33 +251,22 @@ def test_merged_pr_list_delegate_raises_githuberror_on_bad_shape(
         gh.merged_pr_list()
 
 
-def test_pr_view_delegate_forwards_through_run(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_pr_view_delegate_forwards_through_run(tmp_path: Path) -> None:
     """Calling ``gh.pr_view(number)`` through the delegate must reach the
-    patched class-level ``GitHub.run`` with the same argv the moved body
-    produces, using the default ``PR_VIEW_FIELDS`` bound at *def* time.
-
-    The expected argv is transcribed by reading the moved
-    ``PullRequests.pr_view`` body directly.
+    ``PullRequests`` collaborator, which reads the PR over GraphQL (G4: it was
+    ``gh pr view --json``) with the default ``PR_VIEW_FIELDS`` bound at *def*
+    time, and returns the node in gh's dialect.
     """
-    from charlie_work.github_capabilities import PR_VIEW_FIELDS
+    node = {"number": 7, "title": "t"}
+    reply = graphql_ok({"repository": {"pullRequest": node}})
+    gh, http, _ = make_github(tmp_path, http=FakeAdapter("http", [reply]))
 
-    calls: list[tuple[list[str], bool]] = []
-
-    def fake_run(self: GitHub, args: list[str], *, json_output: bool = False) -> dict:
-        calls.append((args, json_output))
-        return {"number": 7, "title": "t"}
-
-    monkeypatch.setattr(GitHub, "run", fake_run)
-
-    gh = GitHub(tmp_path)
     result = gh.pr_view(7)
 
-    assert result == {"number": 7, "title": "t"}
-    assert calls == [
-        (["pr", "view", "7", "--json", PR_VIEW_FIELDS], True),
-    ]
+    assert result["number"] == 7
+    assert result["title"] == "t"
+    (request,) = http.api_requests
+    assert graphql_variables(request) == {"owner": "octo", "name": "hello", "number": 7}
 
 
 def test_pr_diff_delegate_forwards_through_run(tmp_path: Path) -> None:
@@ -408,45 +397,46 @@ def test_l06b_repointed_names_no_longer_exposed_by_github() -> None:
 def test_merged_prs_for_issue_behavior_through_fake_owner() -> None:
     """``merged_prs_for_issue``, called directly on a bare ``PullRequests``
     collaborator constructed with a minimal fake owner (not a real ``GitHub``
-    instance), proves the moved body's only sibling call (``self.run(...)``)
-    forwards correctly through ``CapabilityCollaborator.__getattr__`` -- no
-    subclass-override bypass hazard applies here (``run`` is never itself a
-    routed/collaborator-side member, unlike L07's ``are_issues_open`` calling
-    ``self.issue_view``) -- and that ``linked_issue_number`` (imported from
-    ``issue_linking.py``, not ``charlie_work.github``) correctly filters
-    search results down to PRs actually bound to the requested issue via
-    both the branch-name and closing-keyword paths.
+    instance), proves the moved body's sibling calls (the transport and the
+    slug) forward correctly through ``CapabilityCollaborator.__getattr__`` --
+    no subclass-override bypass hazard applies here -- and that
+    ``linked_issue_number`` (imported from ``issue_linking.py``, not
+    ``charlie_work.github``) correctly filters search results down to PRs
+    actually bound to the requested issue via both the branch-name and
+    closing-keyword paths.
     """
-    calls: list[list[str]] = []
+    nodes = [
+        {
+            # No agent/issue-N branch match -> falls through to the
+            # closing-keyword path, which binds via the title.
+            "number": 10,
+            "title": "Fixes #42",
+            "body": "",
+            "headRefName": "worker-branch-no-issue-pattern",
+            "isCrossRepository": False,
+            "state": "MERGED",
+            "headRefOid": "abc123",
+        },
+        {
+            # Branch name binds this one to issue 7, not 42 -- must
+            # be excluded even though nothing in title/body mentions
+            # 42 or 7.
+            "number": 11,
+            "title": "unrelated change",
+            "body": "",
+            "headRefName": "agent/issue-7-something",
+            "isCrossRepository": False,
+            "state": "MERGED",
+            "headRefOid": "def456",
+        },
+    ]
+    transport = FakeTransport(lambda request: graphql_ok({"search": {"nodes": nodes}}))
 
     class _FakeOwner:
-        def run(self, args: list[str], *, json_output: bool = False, allow_failure: bool = False):
-            calls.append(args)
-            return [
-                {
-                    # No agent/issue-N branch match -> falls through to the
-                    # closing-keyword path, which binds via the title.
-                    "number": 10,
-                    "title": "Fixes #42",
-                    "body": "",
-                    "headRefName": "worker-branch-no-issue-pattern",
-                    "isCrossRepository": False,
-                    "state": "MERGED",
-                    "headRefOid": "abc123",
-                },
-                {
-                    # Branch name binds this one to issue 7, not 42 -- must
-                    # be excluded even though nothing in title/body mentions
-                    # 42 or 7.
-                    "number": 11,
-                    "title": "unrelated change",
-                    "body": "",
-                    "headRefName": "agent/issue-7-something",
-                    "isCrossRepository": False,
-                    "state": "MERGED",
-                    "headRefOid": "def456",
-                },
-            ]
+        _transport_v2 = transport
+
+        def _repo_owner_name(self) -> tuple[str, str]:
+            return ("octo", "hello")
 
     pull_requests = PullRequests(_FakeOwner())
     result = pull_requests.merged_prs_for_issue(42, branch_prefix="agent/issue")
@@ -454,40 +444,27 @@ def test_merged_prs_for_issue_behavior_through_fake_owner() -> None:
     assert isinstance(result, _github_module.MergedPRSearchResult)
     assert result.ok is True
     assert [pr["number"] for pr in result] == [10]
-    assert calls == [
-        [
-            "pr",
-            "list",
-            "--state",
-            "merged",
-            "--search",
-            '"#42"',
-            "--limit",
-            "20",
-            "--json",
-            _github_module.MERGED_PR_LIST_FIELDS,
-        ]
-    ]
+    (request,) = transport.requests
+    assert graphql_variables(request) == {
+        "q": 'repo:octo/hello is:pr is:merged "#42"',
+        "first": 20,
+    }
 
 
 def test_merged_prs_for_issue_returns_not_ok_on_search_failure_through_fake_owner() -> None:
-    """A failed search (``GitHubRunResult`` with ``ok=False``) must produce an
-    empty, ``ok=False`` ``MergedPRSearchResult`` -- transcribed directly from
-    the moved body's ``if not result.ok: return MergedPRSearchResult([], ok=False)``
+    """A failed search (a read the API rejected) must produce an empty,
+    ``ok=False`` ``MergedPRSearchResult`` -- transcribed directly from the
+    moved body's ``if not result.ok: return MergedPRSearchResult([], ok=False)``
     guard -- exercised through the same bare-collaborator construction as
     above rather than a full ``GitHub`` instance.
     """
+    transport = FakeTransport(lambda request: graphql_failure("rate limited", "RATE_LIMITED"))
 
     class _FakeOwner:
-        def run(self, args: list[str], *, json_output: bool = False, allow_failure: bool = False):
-            return _github_module.GitHubRunResult(
-                ok=False,
-                returncode=1,
-                stdout="",
-                stderr="rate limited",
-                value=None,
-                error="rate limited",
-            )
+        _transport_v2 = transport
+
+        def _repo_owner_name(self) -> tuple[str, str]:
+            return ("octo", "hello")
 
     pull_requests = PullRequests(_FakeOwner())
     result = pull_requests.merged_prs_for_issue(42, branch_prefix="agent/issue")

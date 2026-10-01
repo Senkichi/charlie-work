@@ -6,12 +6,20 @@ Track-1 wave 8/8).
 
 from __future__ import annotations
 
-import json
 import logging
 import subprocess
 from pathlib import Path
 import pytest
-from _fake_transport import FakeAdapter, make_github, ok, sent
+from _fake_transport import (
+    FakeAdapter,
+    graphql_failure,
+    graphql_ok,
+    graphql_variables,
+    make_github,
+    ok,
+    paged_connection,
+    sent,
+)
 from charlie_work import github as github_module
 from charlie_work.config import RuntimeConfig
 
@@ -87,59 +95,31 @@ def test_github_merged_pr_list_does_not_retry_non_transient_error(
     assert call_count == 1
 
 
-def test_issue_list_raises_limit_to_500_and_warns_on_truncation(
-    monkeypatch, tmp_path: Path, caplog
-) -> None:
+def test_issue_list_raises_limit_to_500_and_warns_on_truncation(tmp_path: Path, caplog) -> None:
     caplog.set_level(logging.WARNING)
     limit = github_module._LIST_LIMIT
-
-    def fake_run(
-        self,
-        args: list[str],
-        *,
-        json_output: bool = False,
-        allow_failure: bool = False,
-        long_call: bool = False,
-    ):
-        assert json_output is True
-        assert args[:2] == ["issue", "list"]
-        assert str(limit) in args, f"expected --limit {limit} in {args}"
-        return [{"number": i} for i in range(limit)]
-
-    monkeypatch.setattr(github_module.GitHub, "run", fake_run)
-    gh = github_module.GitHub(tmp_path)
+    # More nodes than the cap exist: the read pages up to the cap, then warns.
+    adapter = FakeAdapter("http", handler=paged_connection("issues", limit + 100))
+    gh, http, _ = make_github(tmp_path, http=adapter)
 
     result = gh.issue_list("automated-ready")
 
     assert len(result) == limit
+    assert len(http.api_requests) == limit // 100
     assert any("truncated" in record.message for record in caplog.records)
 
 
-def test_pr_list_raises_limit_to_500_and_warns_on_truncation(
-    monkeypatch, tmp_path: Path, caplog
-) -> None:
+def test_pr_list_raises_limit_to_500_and_warns_on_truncation(tmp_path: Path, caplog) -> None:
     caplog.set_level(logging.WARNING)
     limit = github_module._LIST_LIMIT
-
-    def fake_run(
-        self,
-        args: list[str],
-        *,
-        json_output: bool = False,
-        allow_failure: bool = False,
-        long_call: bool = False,
-    ):
-        assert json_output is True
-        assert args[:2] == ["pr", "list"]
-        assert str(limit) in args, f"expected --limit {limit} in {args}"
-        return [{"number": i} for i in range(limit)]
-
-    monkeypatch.setattr(github_module.GitHub, "run", fake_run)
-    gh = github_module.GitHub(tmp_path)
+    # More nodes than the cap exist: the read pages up to the cap, then warns.
+    adapter = FakeAdapter("http", handler=paged_connection("pullRequests", limit + 100))
+    gh, http, _ = make_github(tmp_path, http=adapter)
 
     result = gh.pr_list()
 
     assert len(result) == limit
+    assert len(http.api_requests) == limit // 100
     assert any("truncated" in record.message for record in caplog.records)
 
 
@@ -200,21 +180,15 @@ def test_branch_protection_caches_failed_read_too(monkeypatch, tmp_path: Path) -
     assert len(calls) == 1
 
 
-def test_github_are_issues_open_normalizes_uppercase_state(monkeypatch, tmp_path: Path) -> None:
+def test_github_are_issues_open_normalizes_uppercase_state(tmp_path: Path) -> None:
     """Issue #173: Regression test for are_issues_open with realistic uppercase state.
 
     Exercises the production ``are_issues_open`` per-issue fallback path with
     realistic uppercase state field values (as returned by the real GitHub API),
-    ensuring the ``.upper()`` normalization cannot silently regress.
-
-    Post-L07 (issue #1591) ``are_issues_open`` lives on the ``Issues`` capability
-    collaborator, and its thread-pool fallback closure resolves ``self.issue_view``
-    on that collaborator -- so a GitHub *subclass* override of ``issue_view`` no
-    longer intercepts that internal call (the disclosed interception-path
-    relocation). The mock is therefore installed at the ``run`` layer, which
-    ``issue_view`` forwards to through the collaborator->owner seam, and the
-    batched GraphQL path is forced to fail so the per-issue fallback -- the code
-    performing the ``.upper()`` normalization -- is the path under test.
+    ensuring the ``.upper()`` normalization cannot silently regress. The batched
+    GraphQL path is forced to fail so the per-issue fallback -- the code
+    performing the ``.upper()`` normalization -- is the path under test; the
+    per-issue ``issue_view`` reads go out as GraphQL requests.
     """
     from charlie_work.github import GitHub as RealGitHub
     from charlie_work.github import GitHubError
@@ -227,36 +201,24 @@ def test_github_are_issues_open_normalizes_uppercase_state(monkeypatch, tmp_path
         # Force are_issues_open onto its per-issue ``issue_view`` fallback.
         raise GitHubError("forced batched-state failure -> per-issue fallback")
 
-    def _fake_run(self, args, **kwargs):
-        # issue_view builds ["issue", "view", str(number), "--json", ISSUE_VIEW_FIELDS];
-        # args[2] is the issue number. Raise ValueError (not KeyError) for an
-        # unexpected number so the failure mode matches the original mock: the
-        # fallback's ``except (GitHubError, ValueError, TypeError)`` swallows it to
-        # ``is_open=False`` rather than propagating out of ``pool.map``.
-        number = int(args[2])
-        if number not in states:
-            raise ValueError(f"Unexpected issue number: {number}")
-        return {"number": number, "state": states[number]}
+    def view(request):
+        number = graphql_variables(request)["number"]
+        return graphql_ok({"repository": {"issue": {"number": number, "state": states[number]}}})
 
-    monkeypatch.setattr(RealGitHub, "_graphql_issue_states", _fail_graphql)
-    monkeypatch.setattr(RealGitHub, "run", _fake_run)
-
-    real_gh = RealGitHub(repo_root=tmp_path)
-
-    # Call are_issues_open with a mix of open/closed issues
-    result = real_gh.are_issues_open([100, 200, 300, 400])
+    gh, _http, _ = make_github(tmp_path, http=FakeAdapter("http", handler=view))
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(RealGitHub, "_graphql_issue_states", _fail_graphql)
+        result = gh.are_issues_open([100, 200, 300, 400])
 
     # Only the OPEN-state issues are returned: 100 and 300 (uppercase OPEN) and
     # 400 (lowercase "open", normalized via .upper()). 200 is CLOSED.
     assert result == {100, 300, 400}, f"Expected {{100, 300, 400}}, got {result}"
 
 
-def test_are_issues_open_caches_per_pass_and_dedupes_shared_numbers(
-    monkeypatch, tmp_path: Path
-) -> None:
+def test_are_issues_open_caches_per_pass_and_dedupes_shared_numbers(tmp_path: Path) -> None:
     """Issue #870: are_issues_open() was a fully serial, uncached, one
-    `gh issue view` per number loop. Every distinct blocker issue number must
-    now cost exactly one `gh issue view` call per status()/orchestrator pass,
+    issue view per number loop. Every distinct blocker issue number must
+    now cost exactly one per-issue read per status()/orchestrator pass,
     no matter how many separate callers ask about it or how much the
     requested number lists overlap -- mirroring the existing per-pass cache
     contract already proven for branch_protection()
@@ -264,15 +226,16 @@ def test_are_issues_open_caches_per_pass_and_dedupes_shared_numbers(
     """
     calls: list[int] = []
 
-    def fake_run(command, **kwargs):
-        # command: ["gh", "issue", "view", "<number>", "--json", ...]
-        number = int(command[3])
+    def handler(request):
+        if "$number" not in request.document:
+            # The batched state query: fail it so each number is read per issue.
+            return graphql_failure("batched state query unavailable", "INTERNAL")
+        number = graphql_variables(request)["number"]
         calls.append(number)
-        payload = json.dumps({"number": number, "state": "OPEN" if number != 200 else "CLOSED"})
-        return subprocess.CompletedProcess(args=command, returncode=0, stdout=payload, stderr="")
+        state = "OPEN" if number != 200 else "CLOSED"
+        return graphql_ok({"repository": {"issue": {"number": number, "state": state}}})
 
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
-    gh = github_module.GitHub(repo_root=tmp_path)
+    gh, _http, _ = make_github(tmp_path, http=FakeAdapter("http", handler=handler))
 
     # Two overlapping requests, as _filter_blocked_issues and _summarize_issue
     # would each independently make for two issues sharing a blocker.
@@ -288,5 +251,6 @@ def test_are_issues_open_caches_per_pass_and_dedupes_shared_numbers(
     # invalidate_list_cache() (called once per orchestrator pass) must force
     # a fresh read on the next call -- never leaking across passes.
     gh.invalidate_list_cache()
+    gh._list_cache[("_repo_owner_name",)] = ("octo", "hello")  # make_github seeds the slug
     gh.are_issues_open([100])
     assert calls.count(100) == 2

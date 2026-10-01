@@ -73,11 +73,12 @@ from ..issue_linking import linked_issue_number
 # for the full cross-cutting rationale (both are shared with ``GitHub``
 # methods that have not moved yet, so they belong in the shared base, not
 # here).
+from ..github_transport.json_read import JsonRead
 from ..github_transport.outcome import Response
 from ..github_transport.request import ACCEPT_DIFF, RestRequest
 from ._base import CapabilityCollaborator, GitHubRunResult, _is_mutating, _LIST_LIMIT
 from ._outcome import failure_text, is_success
-from ._send import send, send_json, send_result, send_text
+from ._send import read_json, read_result, send, send_json, send_result, send_text
 
 # Outbound secret guard (issue #1505): ``pr_create`` scans title+body before
 # any ``gh`` invocation -- a credential in a PR body survives deletion via
@@ -410,20 +411,10 @@ class PullRequests(CapabilityCollaborator):
         cached = self._list_cache.get(cache_key)
         if cached is not None:
             return cached
-        result = self._list_json(
-            [
-                "pr",
-                "list",
-                "--state",
-                "open",
-                "--limit",
-                str(_LIST_LIMIT),
-                "--json",
-                PR_LIST_FIELDS,
-            ],
-            limit=_LIST_LIMIT,
-            kind="open PRs",
+        read = JsonRead(
+            "pr", "list", PR_LIST_FIELDS, state="open", limit=_LIST_LIMIT, long_call=True
         )
+        result = self._list_json(read, kind="open PRs")
         self._list_cache[cache_key] = result
         return result
 
@@ -499,16 +490,7 @@ class PullRequests(CapabilityCollaborator):
         list rather than filtering the wide result after the fact, so the gh
         invocation itself never requests a field it doesn't need.
         """
-        result = self.run(
-            [
-                "pr",
-                "view",
-                str(number),
-                "--json",
-                fields,
-            ],
-            json_output=True,
-        )
+        result = read_json(self, JsonRead("pr", "view", fields, number=number))
         return result if isinstance(result, dict) else {}
 
     def pr_diff(self, number: int) -> str:
@@ -587,34 +569,23 @@ class PullRequests(CapabilityCollaborator):
         The returned object's ``ok`` flag is False when the search call itself
         failed (e.g. rate limit), allowing callers to implement circuit breakers.
         """
-        query = f'"#{issue_number}"'
-        result = self.run(
-            [
-                "pr",
-                "list",
-                "--state",
-                "merged",
-                "--search",
-                query,
-                "--limit",
-                "20",
-                "--json",
-                MERGED_PR_LIST_FIELDS,
-            ],
-            json_output=True,
-            allow_failure=True,
+        read = JsonRead(
+            "pr",
+            "search",
+            MERGED_PR_LIST_FIELDS,
+            state="merged",
+            search=f'"#{issue_number}"',
+            limit=20,
         )
-        if isinstance(result, GitHubRunResult):
-            if not result.ok:
-                logger.warning(
-                    "Failed to search merged PRs for issue #%d: %s",
-                    issue_number,
-                    result.error,
-                )
-                return MergedPRSearchResult([], ok=False)
-            items = result.value if isinstance(result.value, list) else []
-        else:
-            items = result if isinstance(result, list) else []
+        result = read_result(self, read)
+        if not result.ok:
+            logger.warning(
+                "Failed to search merged PRs for issue #%d: %s",
+                issue_number,
+                result.error,
+            )
+            return MergedPRSearchResult([], ok=False)
+        items = result.value if isinstance(result.value, list) else []
 
         matched: list[dict[str, Any]] = []
         for pr in items:

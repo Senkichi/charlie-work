@@ -15,9 +15,14 @@ from pathlib import Path
 
 import pytest
 
-from _fake_transport import FakeAdapter, make_github, ok
+from _fake_transport import FakeAdapter, graphql_ok, graphql_variables, make_github, ok
 from charlie_work import github as github_module
 from _github_fixtures import _read_fixture
+
+
+def search_reply(nodes: list) -> object:
+    """The reply to the merged-PR ``search`` document: *nodes* are PR nodes."""
+    return graphql_ok({"search": {"nodes": nodes}})
 
 
 def test_merged_pr_list_uses_rest_pagination_and_filters_merged(tmp_path: Path) -> None:
@@ -140,54 +145,30 @@ def test_merged_pr_list_empty_page_terminates_cleanly(tmp_path: Path) -> None:
 
 
 def test_merged_prs_for_issue_returns_bound_pr_without_graphql_budget_check(
-    monkeypatch, tmp_path: Path
+    tmp_path: Path,
 ) -> None:
     """Issue #433: per-issue merged-PR lookup bypasses the 500-window cap and does
     not consume the GraphQL budget check used by merged_pr_list().
     """
-    search_json = _read_fixture("gh_pr_list_search_merged.json")
-    call_log: list[list[str]] = []
+    nodes = json.loads(_read_fixture("gh_pr_list_search_merged.json"))
+    http = FakeAdapter("http", [search_reply(nodes)])
+    gh, http, _ = make_github(tmp_path, http=http)
 
-    def fake_run(cmd, *args, **kwargs):
-        call_log.append(cmd)
-        if cmd[:3] == ["gh", "api", "rate_limit"]:
-            # Should not be called; this method is intentionally budget-agnostic.
-            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="{}", stderr="")
-        if cmd[:2] == ["gh", "pr"] and "--search" in cmd:
-            return subprocess.CompletedProcess(
-                args=cmd, returncode=0, stdout=search_json, stderr=""
-            )
-        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="[]", stderr="")
-
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
-
-    gh = github_module.GitHub(tmp_path)
     result = gh.merged_prs_for_issue(326, branch_prefix="agent/issue")
 
     assert len(result) == 1
     assert result[0]["number"] == 335
     assert result[0]["state"] == "MERGED"
-    search_calls = [c for c in call_log if c[:2] == ["gh", "pr"] and "--search" in c]
-    assert len(search_calls) == 1
-    assert search_calls[0] == [
-        "gh",
-        "pr",
-        "list",
-        "--state",
-        "merged",
-        "--search",
-        '"#326"',
-        "--limit",
-        "20",
-        "--json",
-        github_module.MERGED_PR_LIST_FIELDS,
-    ]
-    assert not any(c[:3] == ["gh", "api", "rate_limit"] for c in call_log)
+    # Exactly one search request, scoped to merged PRs mentioning the issue,
+    # and no rate-limit read: this method is intentionally budget-agnostic.
+    (request,) = http.api_requests
+    assert graphql_variables(request) == {
+        "q": 'repo:octo/hello is:pr is:merged "#326"',
+        "first": 20,
+    }
 
 
-def test_merged_prs_for_issue_returns_empty_when_pr_is_not_bound(
-    monkeypatch, tmp_path: Path
-) -> None:
+def test_merged_prs_for_issue_returns_empty_when_pr_is_not_bound(tmp_path: Path) -> None:
     """A merged PR that only mentions the issue (no branch prefix / closing keyword)
     must not be returned, even if the issue number appears in its title/body.
     """
@@ -201,50 +182,23 @@ def test_merged_prs_for_issue_returns_empty_when_pr_is_not_bound(
             "state": "MERGED",
         }
     ]
+    gh, _http, _ = make_github(tmp_path, http=FakeAdapter("http", [search_reply(prs)]))
 
-    def fake_run(cmd, *args, **kwargs):
-        if cmd[:2] == ["gh", "pr"] and "--search" in cmd:
-            return subprocess.CompletedProcess(
-                args=cmd, returncode=0, stdout=json.dumps(prs), stderr=""
-            )
-        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="[]", stderr="")
-
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
-
-    gh = github_module.GitHub(tmp_path)
     result = gh.merged_prs_for_issue(326, branch_prefix="agent/issue")
 
     assert result == []
 
 
-def test_merged_prs_for_issue_returns_empty_on_gh_failure(monkeypatch, tmp_path: Path) -> None:
-    """Per-issue lookup is best-effort; a non-zero gh exit returns an empty list."""
+def test_merged_prs_for_issue_returns_empty_on_gh_failure(tmp_path: Path) -> None:
+    """Per-issue lookup is best-effort; a failed read returns an empty list."""
+    gh, _http, _ = make_github(
+        tmp_path, http=FakeAdapter("http", [ok({"message": "Bad gateway"}, status=502)])
+    )
 
-    def fake_run(cmd, *args, **kwargs):
-        if cmd[:2] == ["gh", "pr"] and "--search" in cmd:
-            return subprocess.CompletedProcess(
-                args=cmd,
-                returncode=1,
-                stdout="",
-                stderr="HTTP 502: Bad gateway",
-            )
-        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="[]", stderr="")
-
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
-
-    gh = github_module.GitHub(tmp_path)
     result = gh.merged_prs_for_issue(326, branch_prefix="agent/issue")
 
     assert result == []
     assert result.ok is False
-
-
-# --- merged-PR field contract: the REST normalizer must reproduce exactly the
-# key set that merged_prs_for_issue() gets from `gh pr list --json`. These are
-# two independent producers of the same value shape; when they drift, consumers
-# reading a field the normalizer forgot silently see None on the REST path
-# (which is the only path merged_pr_list() uses) while every FakeGitHub-based
-# test keeps passing, because those fixtures hand-write the richer shape.
 
 
 def test_normalize_rest_pr_satisfies_merged_pr_list_field_contract() -> None:

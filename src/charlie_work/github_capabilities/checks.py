@@ -14,9 +14,10 @@ import re
 from typing import Any, Protocol, runtime_checkable
 
 from ..checks import _run_id_from_link
+from ..github_transport.json_read import JsonRead
 from ..github_transport.request import RestRequest
 from ._base import CapabilityCollaborator, GitHubRunResult
-from ._send import send_result
+from ._send import read_result, send_result
 
 # Moved from ``github.py`` alongside ``check_graphql_rate_limit`` (Track 2,
 # issue #1588; design doc Section 5, L04). No other ``github.py`` consumer
@@ -112,10 +113,8 @@ class Checks(CapabilityCollaborator):
     Moved from ``GitHub`` verbatim (Track 2, issue #1588; design doc Section
     5, L04). Bodies still say ``self.run(...)``, which resolves through
     ``CapabilityCollaborator.__getattr__`` to the owner's ``run`` (design doc
-    Section 3.3). ``pr_checks`` additionally calls
-    ``self._pr_checks_fallback(...)`` -- still a lexical ``GitHub`` method
-    until L09 (Transport) -- which resolves the same way; order L04-before-L09
-    is safe either way.
+    Section 3.3). ``pr_checks`` reads over GraphQL (``JsonRead``); the old
+    ``_pr_checks_fallback`` disambiguation is gone (B7).
 
     Two of the six also reference module-level bare globals relocated
     alongside them: ``pr_checks`` uses ``PR_CHECKS_FIELDS``,
@@ -170,57 +169,29 @@ class Checks(CapabilityCollaborator):
         return (remaining >= threshold, remaining, reset_at)
 
     def pr_checks(self, number: int) -> list[dict[str, Any]] | None:
-        result = self.run(
-            ["pr", "checks", str(number), "--json", PR_CHECKS_FIELDS],
-            json_output=True,
-            allow_failure=True,
-        )
-        if isinstance(result, GitHubRunResult):
-            # gh pr checks exits non-zero both when the command itself fails (e.g.
-            # an unsupported JSON field) and when checks are failing. The
-            # difference is in the value: a command failure yields no parseable
-            # list, while genuinely failing checks still produce a list of results.
-            if isinstance(result.value, list):
-                checks = result.value
-            elif result.ok and result.value is None:
-                # Empty successful response (no checks reported) is legitimate.
-                return []
-            else:
-                # gh pr checks ALSO exits non-zero -- with empty stdout, so
-                # result.value is None here too -- when the PR simply has no
-                # checks reported yet (issue #846, measured against this repo:
-                # `gh pr checks 700 ...` -> exit 1, stderr "no checks reported
-                # on the '...' branch", no JSON). That is indistinguishable
-                # from a genuine command failure (unsupported JSON field,
-                # GraphQL error, transient outage) using result.ok/result.value
-                # alone, so disambiguate with a second, different endpoint
-                # rather than guessing from the exit code or stderr text.
-                fallback = self._pr_checks_fallback(number)
-                if fallback is None:
-                    # Fallback also failed (or returned an unmappable shape):
-                    # genuine unavailability. Preserves pr_checks' existing
-                    # None contract -- callers/loop still count this as an
-                    # infrastructure error.
-                    return None
-                if not fallback:
-                    return []
-                checks = fallback
-        else:
-            # Legacy pre-result-object fallback
-            checks = result if isinstance(result, list) else []
-        # gh pr checks --json has no databaseId/runId fields; derive both the
-        # GitHub Actions job id and the workflow run id from "link" and inject
-        # them so downstream consumers keep reading check.get("databaseId") and
-        # check.get("runId") unchanged. This also normalizes the fallback path
-        # above: its mapped entries carry a "link" field in the same URL shape
-        # (Actions job URL), so the same regex-based derivation applies.
+        """The PR's checks as ``gh pr checks --json`` listed them, or ``None``.
+
+        Reads ``statusCheckRollup`` over GraphQL and maps it to gh's
+        name/state/bucket/link shape (``gh_json_fields.normalize_checks``).
+        A PR with no checks is an empty list, so there is no exit-8 / "no
+        checks reported" special case and no second endpoint (B7); ``None``
+        means the read itself failed and callers count it as an
+        infrastructure error.
+        """
+        result = read_result(self, JsonRead("pr", "checks", PR_CHECKS_FIELDS, number=number))
+        if not result.ok or not isinstance(result.value, list):
+            return None
+        # The rollup has no databaseId/runId; derive both the GitHub Actions
+        # job id and the workflow run id from "link" and inject them so
+        # downstream consumers keep reading check.get("databaseId") and
+        # check.get("runId") unchanged.
         return [
             {
                 **check,
                 "databaseId": _job_id_from_link(check.get("link")),
                 "runId": _run_id_from_link(check.get("link")),
             }
-            for check in checks
+            for check in result.value
         ]
 
     def actions_job(self, job_id: int) -> dict[str, Any] | None:

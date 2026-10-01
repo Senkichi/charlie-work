@@ -8,15 +8,19 @@ contract (raw value / ``str`` / ``GitHubRunResult`` / raised
 ``GitHubError``). Retry, breaker, deadline, dry-run and fallback all live in
 ``GuardedTransport``; nothing here loops.
 
-Under dry-run a mutating argv still returns ``[]`` / ``"DRY-RUN: gh ..."``,
+Under dry-run a *mutating request* still returns ``[]`` / ``"DRY-RUN: gh ..."``,
 because callers outside the package branch on ``isinstance(str)``.
+Mutation-ness comes from the translated request (B1), not an argv allowlist,
+so ``--json`` reads, ``repo view`` and ``auth token`` are no longer
+suppressed.
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from ..github_transport.legacy_argv import legacy_is_mutating, request_for_argv
+from ..github_transport.json_read import JsonRead, RunListRead
+from ..github_transport.legacy_argv import request_for_argv
 from ..github_transport.outcome import Outcome
 from ..github_transport.pagination import paginate_rest
 from ..github_transport.request import RestRequest
@@ -35,15 +39,18 @@ def run_legacy(
     long_call: bool,
 ) -> Any:
     command = " ".join(["gh", *args])
-    if gh.dry_run and legacy_is_mutating(args):
-        return [] if json_output else "DRY-RUN: " + command
     transport = gh._transport_v2
     translated = request_for_argv(
         args, long_call=long_call, use_requests=not transport.kill_switch
     )
     request = translated.request
+    if gh.dry_run and request.is_mutation:
+        return [] if json_output else "DRY-RUN: " + command
     outcome: Outcome
-    if translated.paginate and isinstance(request, RestRequest):
+    if isinstance(request, (JsonRead, RunListRead)):
+        owner, name = gh._repo_owner_name()
+        outcome = request.execute(transport, owner, name)
+    elif translated.paginate and isinstance(request, RestRequest):
         outcome = paginate_rest(transport, request)
     else:
         outcome = transport.send(request)

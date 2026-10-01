@@ -18,6 +18,7 @@ from charlie_work.github_transport import (
     CliCommand,
     CliRequest,
     FailureKind,
+    GraphQLError,
     GuardedTransport,
     Outcome,
     Request,
@@ -30,6 +31,66 @@ def ok(body: object = "", *, headers: dict[str, str] | None = None, status: int 
     text = body if isinstance(body, str) else json.dumps(body)
     pairs = tuple((k.lower(), v) for k, v in (headers or {}).items())
     return Response(status, pairs, text, "http")
+
+
+def graphql_ok(data: object) -> Response:
+    """A GraphQL ``{"data": ...}`` reply."""
+    return ok({"data": data})
+
+
+def graphql_failure(message: str, kind: str = "NOT_FOUND") -> Response:
+    """A GraphQL reply whose ``errors`` array is populated (``Response.ok`` is False)."""
+    return Response(
+        200, (), '{"data": null}', "http", graphql_errors=(GraphQLError(message, kind),)
+    )
+
+
+def check_run(name: str, state: str = "SUCCESS", url: str = "", started: str = "") -> dict:
+    """One ``CheckRun`` rollup context in the shape the checks document selects.
+
+    *state* is a conclusion for a finished run, or ``IN_PROGRESS`` / ``QUEUED``.
+    """
+    done = state not in ("IN_PROGRESS", "QUEUED", "PENDING")
+    return {
+        "__typename": "CheckRun",
+        "name": name,
+        "status": "COMPLETED" if done else state,
+        "conclusion": state if done else None,
+        "detailsUrl": url,
+        "startedAt": started or None,
+        "completedAt": None,
+        "checkSuite": {"workflowRun": None},
+    }
+
+
+def checks_reply(*contexts: dict) -> Response:
+    """The reply to the ``pr checks`` document for a PR with *contexts*."""
+    rollup = {"contexts": {"nodes": list(contexts)}}
+    return graphql_ok({"repository": {"pullRequest": {"statusCheckRollup": rollup}}})
+
+
+def graphql_variables(request: Request) -> dict:
+    """The variables of a ``GraphQLRequest`` as a dict."""
+    return json.loads(request.variables)  # type: ignore[attr-defined]
+
+
+def connection_page(connection: str, nodes: list, *, next_cursor: str | None = None) -> Response:
+    """One page of ``repository { <connection> { nodes pageInfo } }``."""
+    page_info = {"hasNextPage": next_cursor is not None, "endCursor": next_cursor}
+    return graphql_ok({"repository": {connection: {"nodes": nodes, "pageInfo": page_info}}})
+
+
+def paged_connection(connection: str, total: int, page_size: int = 100):
+    """A handler serving *total* ``{"number": i}`` nodes in pages of *page_size*."""
+
+    def handler(request: Request) -> Response:
+        after = graphql_variables(request).get("after")
+        start = int(after) if after else 0
+        end = min(start + page_size, total)
+        nodes = [{"number": i} for i in range(start, end)]
+        return connection_page(connection, nodes, next_cursor=str(end) if end < total else None)
+
+    return handler
 
 
 def failure(kind: FailureKind, detail: str = "boom", adapter: str = "http") -> TransportFailure:
@@ -55,6 +116,9 @@ class FakeAdapter:
     script: list[Outcome | BaseException] = field(default_factory=list)
     calls: list[Call] = field(default_factory=list)
     token: str | None = None
+    # When set, answers every non-token request instead of ``script`` (for
+    # reads whose reply depends on the request, e.g. a per-number issue view).
+    handler: Callable[[Request], Outcome] | None = None
     _served: int = 0
 
     def send(self, request: Request, *, token: str | None, timeout: float) -> Outcome:
@@ -65,6 +129,8 @@ class FakeAdapter:
             and request.command is CliCommand.AUTH_TOKEN
         ):
             return token_ok(self.token)
+        if self.handler is not None:
+            return self.handler(request)
         if not self.script:
             raise AssertionError(f"{self.name} adapter received an unscripted call: {request}")
         item = self.script[min(self._served, len(self.script) - 1)]

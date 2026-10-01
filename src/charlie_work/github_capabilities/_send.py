@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from ..github_transport.json_read import JsonRead
 from ..github_transport.outcome import Outcome, Response
 from ..github_transport.request import GraphQLRequest, RestRequest
 from ._base import GitHubRunResult
@@ -69,6 +70,26 @@ def send_graphql(collab: Any, request: GraphQLRequest) -> tuple[Any, str | None]
     return body, failure_text(outcome)
 
 
+def send_read(collab: Any, read: JsonRead) -> Outcome:
+    """Execute a ``--json`` read (GraphQL under the hood) for the repo's slug.
+
+    ``_repo_owner_name`` may raise ``GitHubError`` (no readable remote); that
+    propagates exactly as it does for a ``{owner}/{repo}`` REST route.
+    """
+    owner, name = collab._repo_owner_name()
+    return read.execute(collab._transport_v2, owner, name)
+
+
+def read_json(collab: Any, read: JsonRead) -> Any:
+    """Parsed gh-dialect JSON of a read; raises ``GitHubError`` on failure."""
+    return expect_json(send_read(collab, read), command=read.describe())
+
+
+def read_result(collab: Any, read: JsonRead) -> GitHubRunResult:
+    """The ``allow_failure=True`` shape of a read: errors come back as a value."""
+    return to_run_result(send_read(collab, read), json_output=True, command=read.describe())
+
+
 def status_of(outcome: Outcome) -> int | None:
     """HTTP status of an answered request, ``None`` for a transport failure."""
     return outcome.status if isinstance(outcome, Response) else None
@@ -77,8 +98,11 @@ def status_of(outcome: Outcome) -> int | None:
 __all__ = [
     "send",
     "send_graphql",
+    "read_json",
+    "read_result",
     "send_json",
     "send_ok",
+    "send_read",
     "send_result",
     "send_text",
     "status_of",

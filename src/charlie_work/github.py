@@ -345,7 +345,7 @@ class GitHub:
     # this owner), so no subclass-override bypass hazard applies here (unlike
     # L07's `are_issues_open`/`issue_view`).
 
-    # _pr_checks_fallback/validate_field_lists/_repo_owner_name/
+    # validate_field_lists/_repo_owner_name/
     # _graphql_query/_graphql_issue_states/_graphql_issue_dependencies moved
     # to github_capabilities/transport.py (Track 2, issue #1593; design doc
     # Section 5, L09) -- reached through the installed `_transport` delegate.
