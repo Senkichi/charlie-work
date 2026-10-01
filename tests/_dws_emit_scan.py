@@ -47,7 +47,8 @@ def _has_level(call: ast.Call) -> bool:
 def sweep_emit_kind(node: ast.AST, filename: str) -> tuple[ast.expr, bool] | None:
     """``(kind expression, carries an explicit level)`` if ``node`` is a sweep emit site.
 
-    Sites are ``emit(<kind>, ...)`` calls and ``event_kind=<kind>`` keywords. In
+    Sites are ``emit(<kind>, ...)`` calls, ``event_kind=<kind>`` keywords and
+    ``event=(<kind>, <payload>)`` tuples. In
     ``decide_common.py`` a bare-name kind is ``events()`` forwarding the kind its caller
     already chose, which is not a site.
     """
@@ -60,6 +61,10 @@ def sweep_emit_kind(node: ast.AST, filename: str) -> tuple[ast.expr, bool] | Non
         kind_node, leveled = node.args[0], _has_level(node)
     elif isinstance(node, ast.keyword) and node.arg == "event_kind":
         kind_node, leveled = node.value, False
+    elif (  # ``GuardedUpdate(event=(kind, payload))``: the kind rides the write
+        isinstance(node, ast.keyword) and node.arg == "event" and isinstance(node.value, ast.Tuple)
+    ):
+        kind_node, leveled = node.value.elts[0], False
     else:
         return None
     if filename == "decide_common.py" and isinstance(kind_node, ast.Name):

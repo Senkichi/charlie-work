@@ -475,6 +475,17 @@ _ALLOWED_UNRESOLVED_KIND_SITES: tuple[_UnresolvedKindSite, ...] = (
         ),
     ),
     _UnresolvedKindSite(
+        path="dead_worker_sweep/apply_requests_lock.py",
+        scope="guarded_update",
+        source="kind",
+        reason=(
+            "The sweep apply shell forwards the ``GuardedUpdate.event`` kind to "
+            "append_event inside the write's lock window (#2113). The literal is "
+            "chosen in decide_post.py, and tests/test_dws_event_kinds.py scans "
+            "every ``event=(kind, ...)`` literal there."
+        ),
+    ),
+    _UnresolvedKindSite(
         path="dead_worker_sweep/apply_stalled.py",
         scope="_state_txn",
         source="commit.event_kind",

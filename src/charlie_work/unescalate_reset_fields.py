@@ -357,3 +357,22 @@ REWORK_BUDGET_RESET_BY_ESCALATION_REASON: dict[str, tuple[tuple[str, ...], tuple
         ("review_dispatch_attempt_last_head",),
     ),
 }
+
+# Issue #2101: the issue-record twin of the map above.  Some mechanical
+# escalations are gated by a windowed list on the ISSUE entry rather than a
+# PR counter.  ``redispatch_cap_exceeded`` (the no-op rework cap) trips on
+# ``len(redispatch_at) > cap``; clearing it without dropping ``redispatch_at``
+# left the cap exhausted, so the next detection re-escalated and the inert
+# clears burned ``auto_deescalation_count`` (issue #2060: 2 clears, 0
+# ``dispatch_rework``).  Values are issue-entry fields popped once per
+# escalation episode alongside the PR-field reset; all of them must also be in
+# ``UNESCALATE_ISSUE_RESET_FIELDS`` so the operator door stays in agreement.
+ISSUE_BUDGET_RESET_BY_ESCALATION_REASON: dict[str, tuple[str, ...]] = {
+    "redispatch_cap_exceeded": ("redispatch_at",),
+    # The remaining dispatch-side windowed caps gate identically (a full
+    # issue-entry timestamp window re-trips on the next dispatch attempt), so
+    # an inert clear would burn ``auto_deescalation_count`` the same way.
+    "worker_death_loop": ("worker_death_at",),
+    "dispatch_blocked_environment": ("blocked_environment_at",),
+    "dispatch_failed_cap_exceeded": ("dispatch_failed_at",),
+}
