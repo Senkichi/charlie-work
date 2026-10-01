@@ -26,7 +26,6 @@ import tempfile
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
 
 import pytest
 
@@ -49,6 +48,7 @@ from _local_gate_async_fixtures import (  # noqa: E402
     _dead_pid,
     _event_kinds,
     _events_of_kind,
+    _gate_identity,
     _gate_paths,
     _init_repo,
     _kill_claimed_gate,
@@ -460,17 +460,6 @@ def test_base_moved_during_suite_resyncs_and_relaunches(lane_repo: Path) -> None
     results = app._local_merge_approved()
     assert results[0]["outcome"] in ("merged", "already_merged")
     assert is_ancestor(lane_repo, head, branch_head_sha(lane_repo, "main"))
-
-
-def _gate_identity(app: OrchestratorApp, number: int) -> tuple[int, Any]:
-    """Launch identity of the claimed gate: (pid, process start-time fingerprint).
-
-    A bare pid is not unique across dead processes -- the OS may hand a dead
-    wrapper's pid to the next launch -- so "a new gate was launched" is asserted
-    on the pair, never on the pid alone (#2207).
-    """
-    record = load_state_locked(app.paths.state_file)["prs"][str(number)]
-    return int(record["local_suite_pid"]), record["local_suite_process_start_time"]
 
 
 def test_timeout_kills_tree_and_relaunches_without_rework(lane_repo: Path) -> None:
