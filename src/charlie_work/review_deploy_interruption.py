@@ -20,7 +20,6 @@ from pathlib import Path
 from charlie_work.instrumentation import query_events
 
 SELF_DEPLOY_SUCCEEDED = "self_deploy_succeeded"
-REVIEW_INTERRUPTED_BY_DEPLOY = "review_interrupted_by_deploy"
 
 
 def self_deploy_state_path() -> Path:

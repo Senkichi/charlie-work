@@ -26,7 +26,6 @@ from charlie_work.devin_review_resume import resume_exec_rejected_review
 from charlie_work.harnesses import REVIEWER_ADAPTER_KINDS
 from charlie_work.process_utils import find_worker_terminal_status
 from charlie_work.review_deploy_interruption import (
-    REVIEW_INTERRUPTED_BY_DEPLOY,
     deploy_interrupted_review,
     self_deploy_state_path,
 )
@@ -138,7 +137,7 @@ def _reap_review_verdicts(self, reviews_dir: Path) -> dict[str, Any]:
                 state["prs"][str(pr_number)] = rolled_back
                 state = _wf.append_event(
                     state,
-                    REVIEW_INTERRUPTED_BY_DEPLOY,
+                    "review_interrupted_by_deploy",
                     {
                         "pr_number": pr_number,
                         "issue_number": issue_number,
