@@ -23,14 +23,13 @@ from __future__ import annotations
 import inspect
 from pathlib import Path
 
-import pytest
 
 from charlie_work.github import GitHub, GitHubLike, _ROUTES
 from charlie_work.github_capabilities import MergeBranchLike
 from charlie_work.github_capabilities._base import GitHubRunResult
 
 from _githublike_protocol_helpers import _compatible_signature, _lexical_github_defs
-from _fake_transport import FakeAdapter, make_github, ok, sent
+from _fake_transport import FakeAdapter, graphql_ok, graphql_variables, make_github, ok, sent
 
 MERGE_BRANCH_MOVED_MEMBERS = (
     "merge_pr",
@@ -142,26 +141,24 @@ def test_merge_pr_delegate_forwards_through_run(tmp_path: Path) -> None:
     ]
 
 
-def test_merge_pr_delegate_admin_flag_and_merge_flags_precedence(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """``merge_flags`` takes precedence over the legacy ``admin`` field, and
-    ``run``'s literal output (when non-empty) is returned as-is.
+def test_merge_pr_delegate_admin_flag_and_merge_flags_precedence(tmp_path: Path) -> None:
+    """``merge_flags`` takes precedence over the legacy ``admin`` field: with
+    ``--auto`` the PR is merged through the auto-merge mutation (B10: node-id
+    read, then GraphQL), not an admin merge, and the result text is
+    ``merged #N``.
     """
-    calls: list[list[str]] = []
+    replies = [
+        graphql_ok({"repository": {"pullRequest": {"id": "PR_node42"}}}),
+        graphql_ok({"enablePullRequestAutoMerge": {"pullRequest": {"number": 42}}}),
+    ]
+    gh, http, _ = make_github(tmp_path, http=FakeAdapter("http", replies))
 
-    def fake_run(self: GitHub, args: list[str]) -> str:
-        calls.append(args)
-        return "https://github.com/o/r/pull/42 merged"
-
-    monkeypatch.setattr(GitHub, "run", fake_run)
-
-    gh = GitHub(tmp_path)
     result = gh.merge_pr(42, "rebase", admin=True, merge_flags=("--auto",))
 
-    assert result == "https://github.com/o/r/pull/42 merged"
-    assert calls == [["pr", "merge", "42", "--auto", "--rebase"]]
-    assert "--admin" not in calls[0]
+    assert result == "merged #42"
+    _read, mutation = http.api_requests
+    assert graphql_variables(mutation) == {"id": "PR_node42", "method": "REBASE"}
+    assert "enablePullRequestAutoMerge" in mutation.document
 
 
 def test_delete_branch_delegate_forwards_through_run(tmp_path: Path) -> None:

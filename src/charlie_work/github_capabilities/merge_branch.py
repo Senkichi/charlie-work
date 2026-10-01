@@ -51,6 +51,7 @@ from ci_fleet.github import GitHubError
 from ..config_validation import ConfigError
 from ..github_transport.request import RestRequest
 from ._base import CapabilityCollaborator, GitHubRunResult
+from ._pr_mutations import enable_auto_merge
 from ._send import send_result, send_text
 
 # Flag constants for merge_pr -- single source of truth for both argv
@@ -141,8 +142,13 @@ class MergeBranch(CapabilityCollaborator):
                     f"{_ADMIN_FLAG}, {_AUTO_FLAG}, {_MATCH_HEAD_FLAG}=<sha>"
                 )
         if auto:
-            args = ["pr", "merge", str(number), *flags, _STRATEGY_FLAGS[strategy]]
-            return str(self.run(args)) or f"merged #{number}"
+            # B10: no REST route; the node id costs one extra read.
+            enabled = enable_auto_merge(self, number, strategy)
+            if not enabled.ok:
+                raise GitHubError(
+                    f"gh pr merge {number} --auto failed: {enabled.error or enabled.stderr}"
+                )
+            return f"merged #{number}"  # the text gh's empty stdout always fell back to
         # Branch deletion is deliberately NOT part of this call (the old
         # `gh pr merge --delete-branch` also switched the LOCAL branch and failed
         # when it was checked out in a worktree). Use `delete_branch` separately.

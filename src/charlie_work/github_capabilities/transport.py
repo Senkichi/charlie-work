@@ -45,24 +45,19 @@ from ci_fleet.github import GitHubError
 
 from ._base import (
     CapabilityCollaborator,
-    RUN_LIST_FIELDS,
     _is_mutating,
 )
-from .checks import PR_CHECKS_FIELDS
-from .circuit_breaker import GhFailureClass, classify_gh_failure
+from ._field_probes import field_list_probes, probe_verdict
 from .circuit_breaker_transport import (
     circuit_breaker_open_message,
     circuit_breaker_state_path,
     note_circuit_breaker_result,
 )
 from .cross_repo_blockers import CrossRepoBlocker, make_blocker
-from ._send import read_json, send_graphql
+from ._send import read_json, send, send_graphql
 from .graphql_issue_states import graphql_issue_states
-from .issues import ISSUE_LIST_FIELDS, ISSUE_VIEW_FIELDS
-from .labels import LABEL_LIST_FIELDS
-from .pull_requests import MERGED_PR_LIST_FIELDS, PR_LIST_FIELDS, PR_VIEW_FIELDS
 from ..github_transport.json_read import JsonRead
-from ..github_transport.request import GraphQLRequest
+from ..github_transport.request import GraphQLRequest, RestRequest
 from ..subprocess_runner import no_console_window_kwargs
 
 logger = logging.getLogger(__name__)
@@ -349,145 +344,52 @@ class Transport(CapabilityCollaborator):
         return items
 
     def validate_field_lists(self) -> None:
-        """Validate the compile-time ``--json`` field lists against ``gh``.
+        """Validate the compile-time field lists against the live GitHub schema.
 
-        Probes each list with an invalid field and parses the ``Available
-        fields:`` section of the stderr. Fails fast with a ``ConfigError`` naming
-        the constant and the offending field(s) when the installed ``gh`` CLI
-        does not support a configured field.
+        Sends one ``first:1`` / ``number:0`` probe per registered list through
+        the guarded transport (B13: GraphQL schema validation replaces gh's
+        ``Available fields`` stderr). GitHub rejects an unknown field before it
+        executes anything, so a ``undefinedField`` error names exactly the
+        configured field the schema lacks; a NOT_FOUND for ``number:0`` proves
+        the selection was accepted. Raises ``ConfigError`` naming the constant
+        and the offending field(s). A transport-class failure is not a config
+        error: warn and skip the remaining probes (issue #1833).
         """
         # Import lazily to avoid the config -> github import cycle.
         from ..config import ConfigError
 
-        probe = "nonexistent"  # Invalid field name, gh will list valid ones
-        field_lists: list[tuple[str, list[str], str]] = [
-            (
-                "ISSUE_LIST_FIELDS",
-                ["issue", "list", "--state", "open", "--limit", "1", "--json", probe],
-                ISSUE_LIST_FIELDS,
-            ),
-            ("ISSUE_VIEW_FIELDS", ["issue", "view", "0", "--json", probe], ISSUE_VIEW_FIELDS),
-            (
-                "PR_LIST_FIELDS",
-                ["pr", "list", "--state", "open", "--limit", "1", "--json", probe],
-                PR_LIST_FIELDS,
-            ),
-            (
-                "MERGED_PR_LIST_FIELDS",
-                ["pr", "list", "--state", "merged", "--limit", "1", "--json", probe],
-                MERGED_PR_LIST_FIELDS,
-            ),
-            ("PR_VIEW_FIELDS", ["pr", "view", "0", "--json", probe], PR_VIEW_FIELDS),
-            ("PR_CHECKS_FIELDS", ["pr", "checks", "0", "--json", probe], PR_CHECKS_FIELDS),
-            (
-                "LABEL_LIST_FIELDS",
-                ["label", "list", "--limit", "1", "--json", probe],
-                LABEL_LIST_FIELDS,
-            ),
-            (
-                "RECONCILE_PR_FIELDS",
-                ["pr", "list", "--state", "all", "--limit", "1", "--json", probe],
-                RECONCILE_PR_FIELDS,
-            ),
-            (
-                "RECONCILE_ISSUE_FIELDS",
-                ["issue", "list", "--state", "open", "--limit", "1", "--json", probe],
-                RECONCILE_ISSUE_FIELDS,
-            ),
-            ("RUN_LIST_FIELDS", ["run", "list", "--limit", "1", "--json", probe], RUN_LIST_FIELDS),
-        ]
+        try:
+            owner, name = self._repo_owner_name()
+        except GitHubError as exc:
+            logger.warning("Skipping gh field-list validation this pass: %s", exc)
+            return
 
-        for name, args, fields in field_lists:
-            # issue #1833: gate each probe on the breaker so a degraded
-            # network fails the rest of this loop fast (as values, per the
-            # errors-as-values invariant) instead of spawning gh ten times at
-            # up to _timeout_seconds() each. A hard ConfigError below still
-            # means "gh answered but the field list is wrong" -- that is a
-            # genuine misconfiguration this function exists to catch, not a
-            # transport problem, so it is deliberately left to raise.
-            if not self._circuit_breaker_allow_call():
+        for constant, fields, probe in field_list_probes(
+            RECONCILE_PR_FIELDS, RECONCILE_ISSUE_FIELDS
+        ):
+            outcome = (
+                send(self, probe)
+                if isinstance(probe, RestRequest)
+                else probe.execute(self._transport_v2, owner, name)
+            )
+            verdict = probe_verdict(outcome)
+            if verdict.skip:
                 logger.warning(
-                    "Skipping remaining gh --json field-list validation this pass: %s",
-                    self._circuit_breaker_open_message(["gh", *args]),
+                    "Could not validate field list %s due to a transport-class failure; "
+                    "skipping remaining field-list validation this pass: %s",
+                    constant,
+                    verdict.detail,
                 )
                 return
-
-            try:
-                result = subprocess.run(
-                    ["gh", *args],
-                    cwd=self.repo_root,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    capture_output=True,
-                    check=False,
-                    timeout=self._timeout_seconds(),
-                    **no_console_window_kwargs(),
+            if verdict.rejected is not None:
+                missing = [f for f in fields.split(",") if f in verdict.rejected] or list(
+                    verdict.rejected
                 )
-            except FileNotFoundError as exc:
-                raise ConfigError("GitHub CLI `gh` is not installed or not on PATH") from exc
-            except subprocess.TimeoutExpired:
-                # issue #1833: a hang here is transport-class, not a config
-                # error -- the #1832 outage's other signature alongside TLS
-                # handshake timeouts. Previously this always raised
-                # ConfigError and propagated out of OrchestratorApp.__init__
-                # uncaught (fleet_dispatch.py's "Error processing repo"
-                # path), which is exactly the errors-as-values invariant this
-                # fix restores: record the failure, skip the remaining
-                # probes this pass, and return normally instead of raising.
-                self._circuit_breaker_note_result(timed_out=True)
-                logger.warning(
-                    "gh timed out validating field list %s after %gs; skipping remaining "
-                    "field-list validation this pass (transport-class failure, not a "
-                    "config error)",
-                    name,
-                    self._timeout_seconds(),
-                )
-                return
-
-            if result.returncode == 0:
                 raise ConfigError(
-                    f"gh did not reject invalid field for {name}; cannot validate field list"
+                    f"GitHub does not support field(s) for {constant}: {', '.join(missing)}"
                 )
-
-            stderr = result.stderr
-            if "Unknown JSON field" not in stderr and "Available fields" not in stderr:
-                # issue #1833: this branch previously assumed any non-zero
-                # exit without the expected stderr shape meant a config
-                # problem worth a hard ConfigError. That is also reachable by
-                # a genuine transport-class failure (e.g. a connection reset
-                # mid-probe) whose stderr never mentions JSON fields at all --
-                # the same misclassification as the TimeoutExpired case
-                # above, via a different branch. Reclassify before deciding.
-                if classify_gh_failure(stderr) is GhFailureClass.TRANSPORT:
-                    self._circuit_breaker_note_result(error=stderr)
-                    logger.warning(
-                        "Could not validate field list %s due to a transport-class gh "
-                        "failure; skipping remaining field-list validation this pass: %s",
-                        name,
-                        stderr.strip() or result.stdout.strip(),
-                    )
-                    return
-                raise ConfigError(
-                    f"Could not validate field list {name}: {stderr.strip() or result.stdout.strip()}"
-                )
-
-            # A non-zero exit with the expected "Unknown JSON field"/
-            # "Available fields" stderr shape proves gh answered normally --
-            # record it so a prior transport-class streak this pass doesn't
-            # carry forward past evidence the transport is fine.
-            self._circuit_breaker_note_result()
-
-            available: set[str] = set()
-            match = re.search(r"Available fields:\n((?:  .+\n)+)", stderr)
-            if match:
-                available = {line.strip() for line in match.group(1).splitlines() if line.strip()}
-
-            unsupported = [field for field in fields.split(",") if field not in available]
-            if unsupported:
-                raise ConfigError(
-                    f"gh does not support field(s) for {name}: {', '.join(unsupported)}"
-                )
+            if verdict.detail:
+                raise ConfigError(f"Could not validate field list {constant}: {verdict.detail}")
 
     def _repo_owner_name(self) -> tuple[str, str]:
         """Resolve the repository owner and name from the local git remote.

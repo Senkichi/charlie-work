@@ -841,23 +841,23 @@ def _validate_gh_field_lists(add: Any, gh: GitHubLike) -> None:
             add(f"gh field list: {list_name}", True, f"valid ({len(fields.split(','))} fields)")
         except GitHubError as exc:
             error_msg = str(exc)
-            # Classify errors: only actual field errors get the "invalid field(s)" label
-            # Field errors have a specific shape: "Unknown JSON field: ..." or "invalid JSON field: ..."
+            # Classify errors: only actual field errors get the "invalid field(s)" label.
+            # The probes are GraphQL reads (B13), so a field the schema lacks reads
+            # "Field 'x' doesn't exist on type ..." and one the transport has no
+            # mapping for reads "unknown --json field(s) for ...".
             is_field_error = any(
                 phrase in error_msg
-                for phrase in ("Unknown JSON field:", "invalid JSON field:", "invalid field")
+                for phrase in (
+                    "doesn't exist on type",
+                    "unknown --json field",
+                    "unknown run field",
+                    "Unknown JSON field:",
+                    "invalid JSON field:",
+                    "invalid field",
+                )
             )
 
-            # Special case: gh pr checks fails with non-zero exit when no CI is configured
-            # This is not a field error - it's a missing feature
-            if list_name == "PR_CHECKS_FIELDS" and "no checks reported" in error_msg.lower():
-                add(
-                    f"gh field list: {list_name}",
-                    True,
-                    "skipped (no CI configured on probe PR)",
-                    severity="warning",
-                )
-            elif is_field_error:
+            if is_field_error:
                 add(
                     f"gh field list: {list_name}",
                     False,

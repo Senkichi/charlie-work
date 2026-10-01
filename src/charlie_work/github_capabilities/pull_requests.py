@@ -68,7 +68,7 @@ from ..issue_linking import linked_issue_number
 # while none of its own members had moved yet -- mirroring ``repo_meta.py``'s
 # L05 promotion of the same import for the same reason.
 #
-# ``_LIST_LIMIT``/``_is_mutating`` also live in ``_base.py`` (Track 2, issue
+# ``_LIST_LIMIT`` also lives in ``_base.py`` (Track 2, issue
 # #1590; design doc Section 5, L06) -- see ``_base.py``'s own comment on each
 # for the full cross-cutting rationale (both are shared with ``GitHub``
 # methods that have not moved yet, so they belong in the shared base, not
@@ -76,7 +76,8 @@ from ..issue_linking import linked_issue_number
 from ..github_transport.json_read import JsonRead
 from ..github_transport.outcome import Response
 from ..github_transport.request import ACCEPT_DIFF, RestRequest
-from ._base import CapabilityCollaborator, GitHubRunResult, _is_mutating, _LIST_LIMIT
+from ._base import CapabilityCollaborator, GitHubRunResult, _LIST_LIMIT
+from ._pr_mutations import mark_ready
 from ._outcome import failure_text, is_success
 from ._send import read_json, read_result, send, send_json, send_result, send_text
 
@@ -270,10 +271,9 @@ class PullRequests(CapabilityCollaborator):
     and this module's own ``logger``; ``pr_diff``/``pr_commits``/``pr_ready``
     use ``GitHubRunResult`` (relocated to ``_base.py`` in L04 and imported
     from there, not re-derived from ``github.py``, to avoid a circular
-    import); ``pr_list``/``merged_pr_list`` use ``_LIST_LIMIT`` and
-    ``pr_ready`` uses ``_is_mutating`` (both relocated to ``_base.py`` in L06
-    because they are also used by ``GitHub`` methods that have not moved
-    yet -- see ``_base.py``'s own comments on each); ``merged_pr_list``
+    import); ``pr_list``/``merged_pr_list`` use ``_LIST_LIMIT`` (relocated to
+    ``_base.py`` in L06 because ``GitHub`` methods use it too -- see
+    ``_base.py``'s own comment); ``merged_pr_list``
     raises ``GitHubError`` (imported directly from ``ci_fleet.github``, the
     same external, identity-sensitive source ``github.py`` itself re-exports
     from -- see this module's import block); and ``merged_prs_for_issue``
@@ -527,7 +527,7 @@ class PullRequests(CapabilityCollaborator):
         return result.value if result.ok and isinstance(result.value, list) else None
 
     def pr_ready(self, number: int) -> GitHubRunResult:
-        """Mark a draft PR as ready for review via ``gh pr ready`` (issue #818).
+        """Mark a draft PR as ready for review (issue #818).
 
         Returns a structured result so callers can distinguish success from
         failure without inferring from output shape -- errors from external
@@ -537,14 +537,9 @@ class PullRequests(CapabilityCollaborator):
         ``.run()`` itself returns a bare string under dry-run, not a
         ``GitHubRunResult``.
         """
-        args = ["pr", "ready", str(number)]
-        if self.dry_run and _is_mutating(args):
-            return GitHubRunResult(
-                ok=True, returncode=0, stdout="", stderr="", value=None, error=None
-            )
-        result = self.run(args, allow_failure=True)
-        assert isinstance(result, GitHubRunResult)
-        return result
+        # B10: a node-id read, then ``markPullRequestReadyForReview``. The guard
+        # answers the mutation with a synthetic success under dry-run.
+        return mark_ready(self, number)
 
     # Moved from ``GitHub`` verbatim (Track 2, issue #1613; design doc
     # Section 5, L06b). Its only sibling call is ``self.run(...)``; ``run`` is

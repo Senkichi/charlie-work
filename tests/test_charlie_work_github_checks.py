@@ -6,23 +6,38 @@ Track-1 wave 8/8).
 
 from __future__ import annotations
 
-import subprocess
 from pathlib import Path
 import pytest
 from _fake_transport import (
     FakeAdapter,
     check_run,
     checks_reply,
+    connection_page,
+    failure,
     graphql_failure,
+    graphql_variables,
     make_github,
     ok,
     sent,
 )
 from charlie_work import github as github_module
+from charlie_work.github_transport.outcome import FailureKind, GraphQLError, Response
+from charlie_work.github_transport.request import RestRequest
 from charlie_work.config import (
     ConfigError,
     RuntimeConfig,
 )
+
+
+def _schema_accepting_reply(request):
+    """What GitHub answers when every probed selection is valid: an empty
+    connection for a list, NOT_FOUND for the ``number: 0`` views, empty REST."""
+    if isinstance(request, RestRequest):
+        return ok({"workflow_runs": []} if "actions/runs" in request.route else [])
+    if "number" in graphql_variables(request):
+        return graphql_failure("Could not resolve to a node with the number of 0.")
+    connection = "issues" if "issues(" in request.document else "pullRequests"
+    return connection_page(connection, [])
 
 
 def test_pr_checks_fields_excludes_database_id() -> None:
@@ -147,114 +162,59 @@ def test_pr_checks_returns_list_when_checks_fail(tmp_path: Path) -> None:
     ]
 
 
-def test_validate_field_lists_passes_when_gh_lists_all_fields(monkeypatch, tmp_path: Path) -> None:
-    """Startup self-check accepts field lists gh supports."""
-    captured: list[list[str]] = []
+def test_validate_field_lists_passes_when_gh_lists_all_fields(tmp_path: Path) -> None:
+    """Startup self-check accepts field lists the GitHub schema supports (B13)."""
+    gh, http, _ = make_github(tmp_path, http=FakeAdapter("http", handler=_schema_accepting_reply))
 
-    def fake_run(cmd, *args, **kwargs):
-        captured.append(cmd)
-        # Return a generic "all these fields are available" stderr.
-        available_fields = [
-            "number",
-            "title",
-            "name",
-            "state",
-            "bucket",
-            "link",
-            "url",
-            "body",
-            "labels",
-            "headRefName",
-            "baseRefName",
-            "isCrossRepository",
-            "mergeable",
-            "headRefOid",
-            "closedAt",
-            "databaseId",
-            "status",
-            "createdAt",
-            "headBranch",
-            "assignees",
-            "author",
-            "updatedAt",
-            "createdAt",
-            "description",
-            "color",
-            "comments",
-            "isDraft",
-            "reviewDecision",
-            "statusCheckRollup",
-            "mergeStateStatus",
-            "additions",
-            "deletions",
-            "mergedAt",
-        ]
-        stderr = (
-            'Unknown JSON field: "nonexistent"\nAvailable fields:\n  '
-            + "\n  ".join(available_fields)
-            + "\n"
-        )
-        return subprocess.CompletedProcess(
-            args=cmd,
-            returncode=1,
-            stdout="",
-            stderr=stderr,
-        )
+    gh.validate_field_lists()
 
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
-
-    github_module.GitHub(tmp_path).validate_field_lists()
-
-    # Should have probed all 10 field-list constants.
-    assert len(captured) == 10
-    assert all(c[0] == "gh" for c in captured)
+    # Should have probed all 10 field-list constants, one request each.
+    assert len(http.api_requests) == 10
 
 
-def test_validate_field_lists_fails_on_unsupported_field(monkeypatch, tmp_path: Path) -> None:
-    """Startup self-check fails fast if a configured field is not supported by gh."""
+def test_validate_field_lists_fails_on_unsupported_field(tmp_path: Path) -> None:
+    """Startup self-check fails fast if a configured field is not in the schema."""
+    reply = Response(
+        200,
+        (),
+        '{"data": null}',
+        "http",
+        graphql_errors=(
+            GraphQLError("Field 'nonexistent' doesn't exist on type 'Issue'", "undefinedField"),
+        ),
+    )
+    gh, http, _ = make_github(tmp_path, http=FakeAdapter("http", [reply]))
 
-    def fake_run(cmd, *args, **kwargs):
-        return subprocess.CompletedProcess(
-            args=cmd,
-            returncode=1,
-            stdout="",
-            stderr='Unknown JSON field: "nonexistent"\nAvailable fields:\n  name\n  state\n  bucket',
-        )
-
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
-
-    with pytest.raises(ConfigError):
-        github_module.GitHub(tmp_path).validate_field_lists()
+    with pytest.raises(ConfigError, match="ISSUE_LIST_FIELDS.*nonexistent"):
+        gh.validate_field_lists()
+    assert len(http.api_requests) == 1
 
 
-def test_validate_field_lists_timeout_raises_config_error(monkeypatch, tmp_path: Path) -> None:
-    """A hung `gh` probe during startup field-list validation is
+def test_validate_field_lists_timeout_raises_config_error(tmp_path: Path) -> None:
+    """A hung probe during startup field-list validation is
     transport-class, not a configuration error (issue #1833, follow-up to the
     #1832 outage): it must no longer raise ConfigError -- doing so propagated
     uncaught out of OrchestratorApp.__init__ via fleet_dispatch.py's
     "Error processing repo" path, violating the errors-as-values invariant.
     validate_field_lists() now returns normally, skipping the remaining
-    probes for this pass, and records the failure on the circuit breaker.
-    This probe runs once and is not retried, and it is bound by the
-    configured gh_timeout_seconds."""
-    call_count = 0
-    captured_timeouts: list[float] = []
+    probes for this pass, and the guard records the failure on the circuit
+    breaker. The probe is bound by the configured gh_timeout_seconds."""
+    timed_out = failure(FailureKind.TIMEOUT, "hung")
+    http = FakeAdapter("http", [timed_out])
+    gh, http, _ = make_github(
+        tmp_path,
+        http=http,
+        gh=FakeAdapter("gh", [failure(FailureKind.TIMEOUT, "hung", "gh")], token="tok-1"),
+        runtime=RuntimeConfig(gh_timeout_seconds=45.0, gh_max_retries=0),
+    )
 
-    def fake_run(cmd, *args, **kwargs):
-        nonlocal call_count
-        call_count += 1
-        captured_timeouts.append(kwargs.get("timeout"))
-        raise subprocess.TimeoutExpired(cmd=cmd, timeout=kwargs.get("timeout"))
-
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
-
-    gh = github_module.GitHub(tmp_path, runtime=RuntimeConfig(gh_timeout_seconds=45.0))
     gh.validate_field_lists()  # must not raise
 
     # Fails fast on the first field list probed, not after trying all 10.
-    assert call_count == 1
-    # The timeout= kwarg passed to subprocess.run came from the configured
+    assert len(http.api_requests) == 1
+    # The timeout the adapter was given came from the configured
     # gh_timeout_seconds, not a hardcoded value.
-    assert captured_timeouts == [45.0]
+    assert [call.timeout for call in http.calls if call.request in http.api_requests] == [45.0]
     # The transport-class failure is recorded on the breaker.
     assert gh._transport._circuit_breaker_state.consecutive_failures == 1
+    assert gh._transport.__dict__.get("_list_cache") is None

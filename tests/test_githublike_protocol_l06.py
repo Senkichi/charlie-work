@@ -298,53 +298,41 @@ def test_pr_commits_delegate_forwards_through_run(tmp_path: Path) -> None:
     assert dict(http.api_requests[0].query) == {"per_page": "100"}  # type: ignore[union-attr]
 
 
-def test_pr_ready_delegate_forwards_through_run(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_pr_ready_delegate_forwards_through_run(tmp_path: Path) -> None:
     """Calling ``gh.pr_ready(number)`` through the delegate must reach the
-    patched class-level ``GitHub.run`` with the same argv the moved body
-    produces, and must recognize a real ``GitHubRunResult`` returned across
-    the collaborator boundary via ``isinstance``.
-
-    The expected argv is transcribed by reading the moved
-    ``PullRequests.pr_ready`` body directly.
+    ``PullRequests`` collaborator, which (B10) reads the PR's node id and then
+    sends ``markPullRequestReadyForReview`` over GraphQL, and must return a
+    real ``GitHubRunResult`` across the collaborator boundary.
     """
-    calls: list[tuple[list[str], bool]] = []
+    replies = [
+        graphql_ok({"repository": {"pullRequest": {"id": "PR_node13"}}}),
+        graphql_ok({"markPullRequestReadyForReview": {"pullRequest": {"number": 13}}}),
+    ]
+    gh, http, _ = make_github(tmp_path, http=FakeAdapter("http", replies))
 
-    def fake_run(
-        self: GitHub, args: list[str], *, allow_failure: bool = False
-    ) -> _github_module.GitHubRunResult:
-        calls.append((args, allow_failure))
-        return _github_module.GitHubRunResult(
-            ok=True, returncode=0, stdout="", stderr="", value=None
-        )
-
-    monkeypatch.setattr(GitHub, "run", fake_run)
-
-    gh = GitHub(tmp_path)
     result = gh.pr_ready(13)
 
     assert isinstance(result, _github_module.GitHubRunResult)
     assert result.ok is True
-    assert calls == [
-        (["pr", "ready", "13"], True),
-    ]
+    read, mutation = http.api_requests
+    assert graphql_variables(read) == {"owner": "octo", "name": "hello", "number": 13}
+    assert "markPullRequestReadyForReview" in mutation.document
+    assert graphql_variables(mutation) == {"id": "PR_node13"}
 
 
 def test_pr_ready_delegate_returns_synthetic_result_on_dry_run(tmp_path: Path) -> None:
-    """``pr_ready`` returns a synthetic ``ok=True`` result under dry-run
-    without calling ``run`` at all -- transcribed directly from the moved
-    body's ``if self.dry_run and _is_mutating(args): return GitHubRunResult(...)``
-    guard. ``pr ready`` is a mutating subcommand, so ``_is_mutating`` (moved to
-    ``_base.py`` in this same leaf) must correctly classify it as such for
-    this guard to fire.
+    """``pr_ready`` returns a synthetic ``ok=True`` result under dry-run: the
+    node-id read still goes out (a read), but the guard answers the
+    ``markPullRequestReadyForReview`` mutation without sending it.
     """
-    gh = GitHub(tmp_path, dry_run=True)
+    reply = graphql_ok({"repository": {"pullRequest": {"id": "PR_node13"}}})
+    gh, http, _ = make_github(tmp_path, http=FakeAdapter("http", [reply]), dry_run=True)
+
     result = gh.pr_ready(13)
 
     assert isinstance(result, _github_module.GitHubRunResult)
     assert result.ok is True
-    assert result.value is None
+    assert len(http.api_requests) == 1  # the read; the mutation was suppressed
 
 
 # ---------------------------------------------------------------------------

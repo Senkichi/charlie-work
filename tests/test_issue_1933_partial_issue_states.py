@@ -41,52 +41,22 @@ subprocess path is monkeypatched.
 from __future__ import annotations
 
 import json
-import subprocess
 from pathlib import Path
 
 import pytest
-from _fake_transport import FakeTransport
+from _fake_transport import (
+    FakeAdapter,
+    FakeTransport,
+    graphql_ok,
+    graphql_variables,
+    make_github,
+    ok,
+)
 
-from charlie_work.config import RuntimeConfig
 from charlie_work.github import GitHub, GitHubError
-from charlie_work.github_capabilities import http_transport
-from charlie_work.github_transport import http_adapter
+from charlie_work.github_capabilities._outcome import to_run_result
+from charlie_work.github_capabilities.issues import Issues
 from charlie_work.github_transport.outcome import Response, parse_graphql_errors
-
-
-class _FakeResponse:
-    def __init__(self, status: int, headers: dict | None = None, body: bytes = b""):
-        self.status = status
-        self._headers = headers or {}
-        self._body = body
-
-    def getheaders(self):
-        return list(self._headers.items())
-
-    def read(self) -> bytes:
-        return self._body
-
-
-class _FakeConnection:
-    def __init__(self, responses: list):
-        self._responses = list(responses)
-
-    def connect(self):
-        pass
-
-    def request(self, method, url, body=None, headers=None):
-        pass
-
-    def getresponse(self):
-        if not self._responses:
-            raise AssertionError("no more fake HTTP responses queued")
-        item = self._responses.pop(0)
-        if isinstance(item, BaseException):
-            raise item
-        return item
-
-    def close(self):
-        pass
 
 
 def _graphql_response(body: dict, *, status: int = 200) -> Response:
@@ -102,6 +72,16 @@ def _serve_graphql(gh: GitHub, outcome) -> FakeTransport:
     transport = FakeTransport(lambda request: outcome)
     object.__setattr__(gh, "_transport_v2", transport)
     return transport
+
+
+def _route_issue_view_through(monkeypatch: pytest.MonkeyPatch, fake_run) -> None:
+    """Serve the per-issue fallback (``Issues.issue_view``) from a ``fake_run``
+    written in the ``["issue", "view", N]`` argv dialect these tests use."""
+
+    def issue_view(self, number: int) -> dict:
+        return fake_run(self, ["issue", "view", str(number)])
+
+    monkeypatch.setattr(Issues, "issue_view", issue_view)
 
 
 def _partial_body(*, resolved: dict[str, dict], unresolved: list[int]) -> dict:
@@ -121,35 +101,19 @@ def _partial_body(*, resolved: dict[str, dict], unresolved: list[int]) -> dict:
 
 
 def test_graphql_error_response_body_reaches_stdout(monkeypatch, tmp_path: Path) -> None:
-    """``_execute_graphql`` must keep the response body on stdout for a 200
-    response with an ``errors`` array -- that body is what carries the
-    partial ``data`` ``GitHub.run`` parses into ``GitHubRunResult.value``.
-    Real ``gh api graphql`` does the same (body copied to stdout before the
-    error is emitted to stderr), so this is parity, not a new convention.
+    """A 200 response with an ``errors`` array keeps its body in the run
+    result -- that body is what carries the partial ``data`` the batched
+    query parses. Real ``gh api graphql`` does the same (body copied to stdout
+    before the error is emitted to stderr), so this is parity, not a new
+    convention. (The leaf name predates the transport: it asserted the same
+    through ``http_transport._execute_graphql``.)
     """
-    body = json.dumps(
-        _partial_body(resolved={"s_1": {"number": 1, "state": "OPEN"}}, unresolved=[361])
-    ).encode()
+    body = _partial_body(resolved={"s_1": {"number": 1, "state": "OPEN"}}, unresolved=[361])
+    outcome = _graphql_response(body)
 
-    def fake_run(cmd, *args, **kwargs):
-        assert cmd == ["gh", "auth", "token"]
-        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="t\n", stderr="")
+    result = to_run_result(outcome, json_output=False, command="gh api graphql")
 
-    monkeypatch.setattr(http_transport.subprocess, "run", fake_run)
-    fake = _FakeConnection([_FakeResponse(200, {}, body)])
-    monkeypatch.setattr(http_transport, "HTTPSConnection", lambda host, timeout=None: fake)
-
-    result = http_transport.run_gh_command(
-        args=["api", "graphql", "-f", "query=query { x }"],
-        command=["gh", "api", "graphql", "-f", "query=query { x }"],
-        cwd=tmp_path,
-        timeout_seconds=30.0,
-        runtime=RuntimeConfig(),
-        transport_state=http_transport.build_http_transport_state(),
-        resolve_owner_repo=lambda: ("acme", "widgets"),
-    )
-
-    assert result.returncode == 1
+    assert result.ok is False
     assert result.stderr.startswith("GraphQL: Could not resolve to an Issue")
     parsed = json.loads(result.stdout)
     assert parsed["data"]["repository"]["s_1"] == {"number": 1, "state": "OPEN"}
@@ -218,7 +182,7 @@ def test_are_issues_open_per_issue_fallback_covers_only_unresolved(
         # land in the open set rather than being silently marked closed.
         return {"number": number, "state": "OPEN"}
 
-    monkeypatch.setattr(GitHub, "run", fake_run)
+    _route_issue_view_through(monkeypatch, fake_run)
 
     assert gh.are_issues_open([1, 2, 361]) == {1, 361}
     assert issue_view_calls == [361]
@@ -243,7 +207,7 @@ def test_are_issues_open_full_fallback_when_batch_yields_no_data(
         issue_view_calls.append(number)
         return {"number": number, "state": "OPEN" if number != 2 else "CLOSED"}
 
-    monkeypatch.setattr(GitHub, "run", fake_run)
+    _route_issue_view_through(monkeypatch, fake_run)
 
     assert gh.are_issues_open([1, 2, 3]) == {1, 3}
     assert sorted(issue_view_calls) == [1, 2, 3]
@@ -311,7 +275,7 @@ def test_are_issues_open_emits_telemetry_for_partial_batch_fallback(
         gh._list_cache.clear()
         gh._list_cache[("_repo_owner_name",)] = ("o", "r")
 
-    monkeypatch.setattr(GitHub, "run", fake_run)
+    _route_issue_view_through(monkeypatch, fake_run)
     monkeypatch.setattr(issues_module, "log_event", fake_log_event)
 
     new_pass()
@@ -381,7 +345,7 @@ def _telemetry_harness(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
         gh._list_cache[("_repo_owner_name",)] = ("o", "r")
 
     monkeypatch.setattr(GitHub, "_graphql_issue_states", fake_states)
-    monkeypatch.setattr(GitHub, "run", fake_run)
+    _route_issue_view_through(monkeypatch, fake_run)
     monkeypatch.setattr(issues_module, "log_event", fake_log_event)
     new_pass()
     return gh, knobs, issue_view_calls, events, new_pass
@@ -483,40 +447,21 @@ def test_whole_batch_failure_neither_emits_nor_disturbs_tracked_set(
     assert _partial_events(events) == [{"unresolved": [361], "requested": 2}]
 
 
-def test_are_issues_open_end_to_end_over_http_transport(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """The production stack, no seams mocked out: ``gh_transport="http"``
-    (the ``RuntimeConfig`` default) -> ``_execute_graphql`` preserves the
-    body -> ``run()`` parses it into ``GitHubRunResult.value`` -> partial
-    states -> ``issue_view`` fallback for the unresolved number only."""
-    gh = GitHub(repo_root=tmp_path, runtime=RuntimeConfig())
-    gh._list_cache[("_repo_owner_name",)] = ("acme", "widgets")
-    body = json.dumps(
-        _partial_body(resolved={"s_1": {"number": 1, "state": "OPEN"}}, unresolved=[361])
-    ).encode()
-    issue_view_calls: list[int] = []
-
-    def fake_run(cmd, *args, **kwargs):
-        if cmd == ["gh", "auth", "token"]:
-            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="t\n", stderr="")
-        assert cmd[:3] == ["gh", "issue", "view"]
-        number = int(cmd[3])
-        issue_view_calls.append(number)
-        return subprocess.CompletedProcess(
-            args=cmd,
-            returncode=0,
-            stdout=json.dumps({"number": number, "state": "OPEN"}),
-            stderr="",
-        )
-
-    monkeypatch.setattr(http_transport.subprocess, "run", fake_run)
-    fake = _FakeConnection([_FakeResponse(200, {}, body)])
-    monkeypatch.setattr(http_transport, "HTTPSConnection", lambda host, timeout=None: fake)
-    monkeypatch.setattr(http_adapter, "_new_connection", lambda host, timeout: fake)
+def test_are_issues_open_end_to_end_over_http_transport(tmp_path: Path) -> None:
+    """The production stack with only the adapters faked: the guarded transport
+    keeps the erroring body -> the batch parses the partial states -> the
+    per-issue read runs for the unresolved number only."""
+    body = _partial_body(resolved={"s_1": {"number": 1, "state": "OPEN"}}, unresolved=[361])
+    replies = [
+        ok(body),
+        graphql_ok({"repository": {"issue": {"number": 361, "state": "OPEN"}}}),
+    ]
+    gh, http, _ = make_github(tmp_path, http=FakeAdapter("http", replies))
 
     assert gh.are_issues_open([1, 361]) == {1, 361}
-    assert issue_view_calls == [361]
+    batch, view = http.api_requests
+    assert "s_361" in batch.document
+    assert graphql_variables(view)["number"] == 361
 
 
 def test_fleet_lifecycle_persistent_blocker_never_emits_warning(
@@ -554,7 +499,7 @@ def test_fleet_lifecycle_persistent_blocker_never_emits_warning(
         return {"number": int(args[2]), "state": "CLOSED"}
 
     monkeypatch.setattr(GitHub, "_graphql_issue_states", fake_states)
-    monkeypatch.setattr(GitHub, "run", fake_run)
+    _route_issue_view_through(monkeypatch, fake_run)
 
     # Same state path the emit site resolves:
     # circuit_breaker_state_path(self.runtime, self.repo_root) with

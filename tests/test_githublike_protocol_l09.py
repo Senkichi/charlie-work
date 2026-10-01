@@ -34,6 +34,7 @@ import pytest
 import charlie_work.github as _github_module
 from _fake_transport import FakeAdapter, checks_reply, make_github, ok
 from charlie_work.github_transport import Adapters
+from charlie_work.github_transport.outcome import GraphQLError, Response
 from charlie_work.config import ConfigError, RuntimeConfig
 from charlie_work.github import GitHub, GitHubLike, _ROUTES
 from charlie_work.github_capabilities.transport import Transport
@@ -381,25 +382,28 @@ def test_repo_owner_name_delegate_uses_owner_shared_list_cache(tmp_path: Path) -
 
 
 def test_validate_field_lists_import_depth_fix_reaches_real_config_error(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    tmp_path: Path,
 ) -> None:
     """The one disclosed non-verbatim edit in this leaf: ``validate_field_lists``'s
     local ``from .config import ConfigError`` became ``from ..config import
     ConfigError`` because the function physically moved one package level
     deeper (``charlie_work`` -> ``charlie_work.github_capabilities``). Proves
     the fix reaches the identical, real ``charlie_work.config.ConfigError``
-    type (not a shadow/duplicate at the wrong path) by forcing the
-    ``FileNotFoundError`` branch and checking the raised exception's type
-    identity directly against an import of ``charlie_work.config``.
+    type (not a shadow/duplicate at the wrong path) by forcing a rejected
+    field and checking the raised exception's type identity directly against
+    an import of ``charlie_work.config``.
     """
-    from charlie_work.github_capabilities import transport as transport_mod
+    reply = Response(
+        200,
+        (),
+        '{"data": null}',
+        "http",
+        graphql_errors=(
+            GraphQLError("Field 'bogus' doesn't exist on type 'Issue'", "undefinedField"),
+        ),
+    )
+    gh, _http, _ = make_github(tmp_path, http=FakeAdapter("http", [reply]))
 
-    def boom(*_args, **_kwargs):
-        raise FileNotFoundError("gh not found")
-
-    monkeypatch.setattr(transport_mod.subprocess, "run", boom)
-
-    gh = GitHub(tmp_path)
     with pytest.raises(ConfigError) as excinfo:
         gh.validate_field_lists()
     assert type(excinfo.value) is ConfigError

@@ -33,7 +33,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 from urllib.parse import parse_qsl
 
-from .request import ACCEPT_JSON, GraphQLRequest, Request, RestRequest
+from .request import ACCEPT_JSON, CliCommand, CliRequest, GraphQLRequest, Request, RestRequest
 
 if TYPE_CHECKING:  # json_read imports the guard, which imports this module
     from .json_read import JsonRead, RunListRead
@@ -407,6 +407,11 @@ def _run_list_row(args: list[str], long_call: bool) -> Translated | None:
     )
 
 
+# gh-local commands that never touch the HTTP API (B14: ``auth token`` is
+# resolved by the guard itself; ``auth status`` stays a gh call).
+_CLI_ROWS = {command.value: command for command in CliCommand}
+
+
 def request_for_argv(
     args: list[str], *, long_call: bool = False, use_requests: bool = True
 ) -> Translated:
@@ -417,6 +422,8 @@ def request_for_argv(
     the switch is on.
     """
     passthrough = Translated(LegacyCli(tuple(args), long_call))
+    if use_requests and tuple(args) in _CLI_ROWS:
+        return Translated(CliRequest(_CLI_ROWS[tuple(args)]))
     if use_requests and args and args[0] in ("issue", "pr"):
         return _json_row(args, long_call) or passthrough
     if use_requests and args and args[0] == "run":

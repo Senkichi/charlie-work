@@ -9,9 +9,15 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from _fake_transport import FakeAdapter, make_github, ok, sent
+from _fake_transport import (
+    FakeAdapter,
+    graphql_ok,
+    graphql_variables,
+    make_github,
+    ok,
+    sent,
+)
 from charlie_work.config_validation import ConfigError
-from charlie_work.github_transport.legacy_argv import LegacyCli
 
 
 def test_merge_pr_returns_the_api_message(tmp_path: Path) -> None:
@@ -65,15 +71,22 @@ def test_merge_pr_unknown_flag_raises_config_error_before_any_request(tmp_path: 
 
 
 def test_merge_pr_auto_still_goes_through_the_gh_cli(tmp_path: Path) -> None:
-    gh_adapter = FakeAdapter("gh", [ok("")], token="tok-1")
-    gh, http, _ = make_github(tmp_path, gh=gh_adapter)
+    """B10: ``--auto`` has no REST route, so it is a node-id read plus the
+    ``enablePullRequestAutoMerge`` mutation, both over GraphQL (the leaf name
+    predates the migration, when it was a ``gh pr merge --auto`` passthrough)."""
+    replies = [
+        graphql_ok({"repository": {"pullRequest": {"id": "PR_node7"}}}),
+        graphql_ok({"enablePullRequestAutoMerge": {"pullRequest": {"number": 7}}}),
+    ]
+    gh, http, gh_adapter = make_github(tmp_path, http=FakeAdapter("http", replies))
 
     assert gh.merge_pr(7, "squash", merge_flags=("--auto",)) == "merged #7"
 
-    assert http.calls == []
-    (request,) = gh_adapter.api_requests
-    assert isinstance(request, LegacyCli)
-    assert request.args == ("pr", "merge", "7", "--auto", "--squash")
+    read, mutation = http.api_requests
+    assert graphql_variables(read) == {"owner": "octo", "name": "hello", "number": 7}
+    assert "enablePullRequestAutoMerge" in mutation.document
+    assert graphql_variables(mutation) == {"id": "PR_node7", "method": "SQUASH"}
+    assert gh_adapter.api_requests == []
 
 
 def test_merge_pr_dry_run_sends_nothing_and_still_reads_as_merged(tmp_path: Path) -> None:

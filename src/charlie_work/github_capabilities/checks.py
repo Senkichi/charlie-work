@@ -14,6 +14,7 @@ import re
 from typing import Any, Protocol, runtime_checkable
 
 from ..checks import _run_id_from_link
+from ..github_transport.guarded import GuardedTransport
 from ..github_transport.json_read import JsonRead
 from ..github_transport.request import RestRequest
 from ._base import CapabilityCollaborator, GitHubRunResult
@@ -25,6 +26,10 @@ from ._send import read_result, send_result
 # so it is relocated without a re-export -- unlike ``PR_CHECKS_FIELDS``
 # below.
 _DEFAULT_GRAPHQL_RATE_LIMIT_THRESHOLD = 1500
+# How old an observed GraphQL window may be and still answer the budget check
+# (B15). A window within this age is at most one pass behind, and the guard
+# never trusts one past its reset time.
+_RATE_WINDOW_MAX_AGE_SECONDS = 60.0
 
 # NOTE: "databaseId" is NOT a valid `gh pr checks --json` field (unlike `gh run
 # list --json`, which does support it) — installed gh CLIs reject it with
@@ -132,7 +137,7 @@ class Checks(CapabilityCollaborator):
     def check_graphql_rate_limit(
         self, threshold: int = _DEFAULT_GRAPHQL_RATE_LIMIT_THRESHOLD
     ) -> tuple[bool, int, int | None]:
-        """Return (sufficient, remaining, reset_at) from ``gh api rate_limit``.
+        """Return (sufficient, remaining, reset_at) from observed headers or ``rate_limit``.
 
         Uses the REST ``rate_limit`` endpoint to inspect
         ``resources.graphql.remaining`` before starting a quota-heavy phase.
@@ -141,6 +146,13 @@ class Checks(CapabilityCollaborator):
         not wedge the fleet; callers that need strict enforcement raise
         ``GraphQLBudgetError`` when this returns ``sufficient=False``.
         """
+        # B15: a GraphQL window observed from response headers a moment ago
+        # answers without spending the ``rate_limit`` call.
+        transport = self._transport_v2
+        if isinstance(transport, GuardedTransport):
+            window = transport.fresh_rate_window("graphql", _RATE_WINDOW_MAX_AGE_SECONDS)
+            if window is not None:
+                return (window.remaining >= threshold, window.remaining, window.reset_epoch)
         result = send_result(self, RestRequest.of("GET", "rate_limit"), json_output=True)
         data: dict[str, Any] | None = None
         if isinstance(result, GitHubRunResult):

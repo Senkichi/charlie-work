@@ -15,6 +15,7 @@ from pathlib import Path
 from _fake_transport import FakeAdapter, make_github, ok, sent
 from charlie_work import github as github_module
 from charlie_work.config import RuntimeConfig
+from charlie_work.github_transport.request import GraphQLRequest
 from _github_fixtures import _read_fixture
 
 
@@ -30,6 +31,51 @@ def test_check_graphql_rate_limit_parses_live_payload(tmp_path: Path) -> None:
     assert remaining == 4114
     assert isinstance(reset_at, int)
     assert sent(http) == [("GET", "rate_limit", None)]
+
+
+_FAR_FUTURE_RESET = "4102444800"  # 2100-01-01: never "already reset" on any host clock
+
+
+def _graphql_reply_with_window(remaining: int, resource: str = "graphql"):
+    reply = ok(
+        {"data": {"viewer": {"login": "octo"}}},
+        headers={
+            "x-ratelimit-limit": "5000",
+            "x-ratelimit-remaining": str(remaining),
+            "x-ratelimit-reset": _FAR_FUTURE_RESET,
+            "x-ratelimit-resource": resource,
+        },
+    )
+    return reply
+
+
+def test_check_graphql_rate_limit_answers_from_observed_headers(tmp_path: Path) -> None:
+    """B15: a GraphQL window seen in a recent response answers the budget check
+    without a ``rate_limit`` call."""
+    http = FakeAdapter("http", [_graphql_reply_with_window(4000)])
+    gh, http, _ = make_github(tmp_path, http=http)
+    gh._transport_v2.send(GraphQLRequest.of("query { viewer { login } }"))
+
+    result = gh.check_graphql_rate_limit(threshold=1500)
+
+    assert result == (True, 4000, int(_FAR_FUTURE_RESET))
+    assert len(http.api_requests) == 1  # the GraphQL read; no rate_limit request
+    assert gh.check_graphql_rate_limit(threshold=4001) == (False, 4000, int(_FAR_FUTURE_RESET))
+
+
+def test_check_graphql_rate_limit_ignores_a_window_for_another_resource(tmp_path: Path) -> None:
+    """B15: only the ``graphql`` window answers; a core window does not."""
+    replies = [
+        _graphql_reply_with_window(10, resource="core"),
+        ok(_read_fixture("gh_rate_limit.json")),
+    ]
+    gh, http, _ = make_github(tmp_path, http=FakeAdapter("http", replies))
+    gh._transport_v2.send(GraphQLRequest.of("query { viewer { login } }"))
+
+    sufficient, remaining, _reset = gh.check_graphql_rate_limit(threshold=1500)
+
+    assert (sufficient, remaining) == (True, 4114)
+    assert sent(http)[-1] == ("GET", "rate_limit", None)
 
 
 def test_check_graphql_rate_limit_below_threshold_returns_insufficient(tmp_path: Path) -> None:

@@ -35,7 +35,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Protocol
 
-from ..api_budget import GitHubRateBudget, observe_github_rate
+from ..api_budget import GitHubRateBudget, GitHubRateWindow, github_headroom, observe_github_rate
 from ..instrumentation import log_event
 from ..pass_deadline import raise_if_pass_deadline_spent
 from ..transient_errors import is_transient_network_error
@@ -243,6 +243,15 @@ class GuardedTransport:
             rt = self._runtime
             return rt.gh_long_call_timeout_seconds if rt else _DEFAULT_LONG_CALL_TIMEOUT_SECONDS
         return self._runtime.gh_timeout_seconds if self._runtime else _DEFAULT_TIMEOUT_SECONDS
+
+    def fresh_rate_window(self, resource: str, max_age_seconds: float) -> GitHubRateWindow | None:
+        """The observed window for *resource* if seen within *max_age_seconds*
+        and not yet reset (B15), else ``None``: the caller must ask GitHub."""
+        now = self._now()
+        window = github_headroom(self.budget.value, resource, now)
+        if window is None or now - window.observed_epoch > max_age_seconds:
+            return None
+        return window
 
     def set_pass_deadline_exceeded(self, check: Callable[[], bool] | None) -> None:
         self._exceeded = check
