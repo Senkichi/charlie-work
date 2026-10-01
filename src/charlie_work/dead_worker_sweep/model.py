@@ -218,6 +218,11 @@ class GuardedUpdate:
 
     ``set_items`` is a tuple of pairs (requests are dict keys); ``stamp_fields``
     names fields set to the clock at *write* time, after ``review()`` returned.
+
+    ``event`` is the audit row for this disposition as ``(kind, payload_pairs)``.
+    The shell appends it inside the same lock window as the write, only when the
+    guards pass, so status and event are durable together or not at all. The kind
+    stays a decide-chosen literal; the shell knows no event kinds.
     """
 
     issue: int
@@ -225,6 +230,7 @@ class GuardedUpdate:
     stamp_fields: tuple[str, ...] = ()
     require_status: str | None = None
     require_pr_reviewed_head: str | None = None
+    event: tuple[str, tuple[tuple[str, Any], ...]] | None = None
 
 
 @dataclass(frozen=True)
