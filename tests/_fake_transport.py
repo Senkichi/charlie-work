@@ -249,6 +249,12 @@ def make_github(
     # invalidate_list_cache() (once per pass) clears the cache seed above, so pin the
     # resolver itself: the slug never falls through to a real `git remote get-url`.
     object.__setattr__(github, "_repo_owner_name", lambda: ("octo", "hello"))
+    # The Transport collaborator owns the real resolver and calls its own copy, so
+    # pin that one too: otherwise a list read after invalidate_list_cache() shells
+    # out to git. It still reads the cache first, so a test can seed another slug.
+    github._transport._repo_owner_name = lambda: github._list_cache.setdefault(  # type: ignore[method-assign]
+        ("_repo_owner_name",), ("octo", "hello")
+    )
     return github, http, gh
 
 

@@ -16,10 +16,11 @@ from typing import Any
 
 import pytest
 
-from _fake_transport import FakeAdapter, failure, make_github, ok
+from _fake_transport import FakeAdapter, failure, graphql_ok, make_github, ok
 from charlie_work import github as github_module
 from charlie_work.config import RuntimeConfig
 from charlie_work.github_transport import FailureKind
+from charlie_work.github_transport.request import GraphQLRequest
 from charlie_work.instrumentation import _LEVEL_BY_KIND
 from charlie_work.pr_create_retry import (
     DEFAULT_BASE_SECONDS,
@@ -454,13 +455,20 @@ def test_composition_terminal_for_mutation_error_does_trigger_outer_retry(
     (HTTP 422 -- not pre-connection) gets zero attempts from the inner layer,
     so `gh.pr_create()` returns `None` on the very first outer attempt. The
     outer ladder must be the thing that retries here."""
-    http = FakeAdapter(
-        "http",
-        [
-            ok({"message": "Validation Failed"}, status=422),
-            ok({"number": 11, "html_url": "https://github.com/o/r/pull/11"}, status=201),
-        ],
-    )
+    creates = [
+        ok({"message": "Validation Failed"}, status=422),
+        ok({"number": 11, "html_url": "https://github.com/o/r/pull/11"}, status=201),
+    ]
+    empty_page = {"nodes": [], "pageInfo": {"hasNextPage": False, "endCursor": None}}
+
+    def reply(request):
+        # The duplicate-PR precheck between outer attempts is a GraphQL list read
+        # (no PR yet); only the REST creates consume the script.
+        if isinstance(request, GraphQLRequest):
+            return graphql_ok({"repository": {"pullRequests": empty_page}})
+        return creates.pop(0)
+
+    http = FakeAdapter("http", handler=reply)
     gh_list = FakeAdapter("gh", [ok("[]")], token="tok-1")
     monkeypatch.setattr(github_module.time, "sleep", lambda seconds: None)
 

@@ -379,7 +379,7 @@ class PullRequests(CapabilityCollaborator):
         file must be readable; an unreadable file refuses rather than letting
         gh discover it. Guard skipped under ``dry_run`` -- nothing is
         written, so there is nothing to guard (``run`` itself short-circuits
-        the mutating ``gh pr edit`` under dry-run via ``_is_mutating``).
+        the mutating request under dry-run).
         """
         body = ""  # dry-run: the transport suppresses the write, nothing reads it
         if not self.dry_run:
@@ -533,9 +533,7 @@ class PullRequests(CapabilityCollaborator):
         failure without inferring from output shape -- errors from external
         processes come back as values here, never exceptions. Dry-run mode
         returns a synthetic ok=True result (the operation would succeed if not
-        for dry-run); this mirrors ``_run_bool``'s explicit guard because
-        ``.run()`` itself returns a bare string under dry-run, not a
-        ``GitHubRunResult``.
+        for dry-run).
         """
         # B10: a node-id read, then ``markPullRequestReadyForReview``. The guard
         # answers the mutation with a synthetic success under dry-run.

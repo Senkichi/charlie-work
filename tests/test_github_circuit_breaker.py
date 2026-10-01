@@ -15,9 +15,11 @@ from pathlib import Path
 
 import pytest
 
+from _fake_transport import make_github
 from charlie_work import github as github_module
 from charlie_work.config import GhCircuitBreakerConfig, RuntimeConfig
 from charlie_work.github_capabilities.circuit_breaker import CircuitBreakerState
+from charlie_work.github_transport.gh_adapter import GhAdapter
 from charlie_work.instrumentation import query_events
 
 
@@ -25,10 +27,16 @@ def _state_path(tmp_path: Path) -> Path:
     return tmp_path / ".var" / "charlie-work" / "state.json"
 
 
+_READ = ["api", "repos/{owner}/{repo}/issues"]  # a modelled REST read, sent through gh
+
+
 def _gh(tmp_path: Path, *, failure_threshold: int = 3, cooldown_seconds: float = 60.0):
-    return github_module.GitHub(
+    github, _http, _gh_adapter = make_github(
         tmp_path,
+        gh=GhAdapter(tmp_path),  # real adapter: the tests patch ``subprocess.run``
         runtime=RuntimeConfig(
+            # The kill switch sends every request through the gh subprocess.
+            gh_transport="gh",
             # No internal retries: each gh.run() call maps to exactly one
             # subprocess.run() invocation, so consecutive-failure counting
             # is deterministic and independent of gh_max_retries.
@@ -38,6 +46,7 @@ def _gh(tmp_path: Path, *, failure_threshold: int = 3, cooldown_seconds: float =
             ),
         ),
     )
+    return github
 
 
 def _transport_failure_run(cmd, *args, **kwargs):
@@ -60,7 +69,7 @@ def test_breaker_trips_after_threshold_consecutive_transport_failures(
     gh = _gh(tmp_path, failure_threshold=3)
 
     for _ in range(3):
-        result = gh.run(["issue", "list"], json_output=True, allow_failure=True)
+        result = gh.run(_READ, json_output=True, allow_failure=True)
         assert result.ok is False
 
     assert call_count == 3
@@ -80,11 +89,11 @@ def test_open_breaker_fails_fast_without_spawning_gh_and_returns_a_value(
     monkeypatch.setattr(github_module.subprocess, "run", fake_run)
     gh = _gh(tmp_path, failure_threshold=2)
 
-    gh.run(["issue", "list"], json_output=True, allow_failure=True)
-    gh.run(["issue", "list"], json_output=True, allow_failure=True)
+    gh.run(_READ, json_output=True, allow_failure=True)
+    gh.run(_READ, json_output=True, allow_failure=True)
     assert call_count == 2
 
-    result = gh.run(["issue", "list"], json_output=True, allow_failure=True)
+    result = gh.run(_READ, json_output=True, allow_failure=True)
 
     # Errors-as-values: no new subprocess, and the caller gets a structured
     # failure rather than an exception.
@@ -108,11 +117,11 @@ def test_open_breaker_raises_githuberror_when_allow_failure_false(
     gh = _gh(tmp_path, failure_threshold=1)
 
     with pytest.raises(github_module.GitHubError):
-        gh.run(["issue", "list"], json_output=True)  # trips it
+        gh.run(_READ, json_output=True)  # trips it
     assert call_count == 1
 
     with pytest.raises(github_module.GitHubError, match="circuit breaker open"):
-        gh.run(["issue", "list"], json_output=True)  # fails fast, no new gh spawn
+        gh.run(_READ, json_output=True)  # fails fast, no new gh spawn
     assert call_count == 1
 
 
@@ -130,7 +139,7 @@ def test_semantic_failures_never_count_toward_the_breaker(monkeypatch, tmp_path:
     gh = _gh(tmp_path, failure_threshold=2)
 
     for _ in range(5):
-        result = gh.run(["issue", "view", "1"], json_output=True, allow_failure=True)
+        result = gh.run(_READ, json_output=True, allow_failure=True)
         assert result.ok is False
 
     assert call_count == 5
@@ -146,10 +155,10 @@ def test_timeout_and_file_not_found_count_as_transport_failures(
     monkeypatch.setattr(github_module.subprocess, "run", fake_run)
     gh = _gh(tmp_path, failure_threshold=2)
 
-    gh.run(["issue", "list"], json_output=True, allow_failure=True)
+    gh.run(_READ, json_output=True, allow_failure=True)
     assert gh._transport._circuit_breaker_state.consecutive_failures == 1
 
-    gh.run(["issue", "list"], json_output=True, allow_failure=True)
+    gh.run(_READ, json_output=True, allow_failure=True)
     assert gh._transport._circuit_breaker_state.phase == "open"
 
 
@@ -167,14 +176,14 @@ def test_reset_circuit_breaker_rearms_without_waiting_for_cooldown(
     # A long cooldown -- reset_circuit_breaker() must not need to wait it out.
     gh = _gh(tmp_path, failure_threshold=1, cooldown_seconds=3600.0)
 
-    gh.run(["issue", "list"], json_output=True, allow_failure=True)
+    gh.run(_READ, json_output=True, allow_failure=True)
     assert gh._transport._circuit_breaker_state.phase == "open"
     assert call_count == 1
 
     gh.reset_circuit_breaker()
 
     assert gh._transport._circuit_breaker_state.phase == "closed"
-    result = gh.run(["issue", "list"], json_output=True, allow_failure=True)
+    result = gh.run(_READ, json_output=True, allow_failure=True)
     assert call_count == 2  # gh was actually spawned again, not fast-failed
     assert result.ok is False  # still fails (same fake), but as a fresh attempt
 
@@ -183,8 +192,8 @@ def test_breaker_trip_emits_github_circuit_opened_event(monkeypatch, tmp_path: P
     monkeypatch.setattr(github_module.subprocess, "run", _transport_failure_run)
     gh = _gh(tmp_path, failure_threshold=2, cooldown_seconds=45.0)
 
-    gh.run(["issue", "list"], json_output=True, allow_failure=True)
-    gh.run(["issue", "list"], json_output=True, allow_failure=True)  # trips here
+    gh.run(_READ, json_output=True, allow_failure=True)
+    gh.run(_READ, json_output=True, allow_failure=True)  # trips here
 
     events = query_events(_state_path(tmp_path), kind="github_circuit_opened")
 
@@ -198,7 +207,10 @@ def test_breaker_trip_emits_github_circuit_opened_event(monkeypatch, tmp_path: P
 def test_breaker_recovery_emits_github_circuit_closed_event(monkeypatch, tmp_path: Path) -> None:
     def fake_success_run(cmd, *args, **kwargs):
         return subprocess.CompletedProcess(
-            args=cmd, returncode=0, stdout='[{"number": 1}]', stderr=""
+            args=cmd,
+            returncode=0,
+            stdout="HTTP/2.0 200 OK" + chr(13) + chr(10) + chr(13) + chr(10) + '[{"number": 1}]',
+            stderr="",
         )
 
     monkeypatch.setattr(github_module.subprocess, "run", fake_success_run)
@@ -218,7 +230,7 @@ def test_breaker_recovery_emits_github_circuit_closed_event(monkeypatch, tmp_pat
     assert probe_breaker.phase == "half_open"
     object.__setattr__(gh, "_circuit_breaker_state", probe_breaker)
 
-    result = gh.run(["issue", "list"], json_output=True)
+    result = gh.run(_READ, json_output=True)
 
     assert result == [{"number": 1}]
     assert gh._transport._circuit_breaker_state.phase == "closed"

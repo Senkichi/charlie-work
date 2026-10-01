@@ -43,10 +43,7 @@ from typing import Any
 
 from ci_fleet.github import GitHubError
 
-from ._base import (
-    CapabilityCollaborator,
-    _is_mutating,
-)
+from ._base import CapabilityCollaborator, GitHubRunResult
 from ._field_probes import field_list_probes, probe_verdict
 from .circuit_breaker_transport import (
     circuit_breaker_open_message,
@@ -320,9 +317,9 @@ class Transport(CapabilityCollaborator):
         — failures are returned as False (allow_failure semantics). Dry-run mode
         returns True (the operation would succeed if not for dry-run).
         """
-        if self.dry_run and _is_mutating(args):
-            return True
         result = self.run(args, allow_failure=True)
+        if not isinstance(result, GitHubRunResult):
+            return True  # dry-run: ``run`` answered a mutating argv with a bare string
         return result.ok
 
     def _list_json(self, read: JsonRead, *, kind: str) -> list[dict[str, Any]]:
@@ -439,9 +436,7 @@ class Transport(CapabilityCollaborator):
     def _graphql_query(self, query: str) -> dict[str, Any]:
         """Run a single read-only GraphQL query via ``gh api graphql``.
 
-        The command is classified as read-only by ``_api_is_mutating`` because
-        it starts with the GraphQL ``query`` keyword, so it is not suppressed by
-        ``--dry-run``. Raises GitHubError for non-zero exit or a response that
+        A query is a read, so ``--dry-run`` does not suppress it. Raises GitHubError for non-zero exit or a response that
         contains no usable ``data``.
         """
         owner, name = self._repo_owner_name()

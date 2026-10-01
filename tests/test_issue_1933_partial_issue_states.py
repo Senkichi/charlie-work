@@ -13,7 +13,7 @@ uncached number through ``issue_view`` -- slow enough to blow the
 
 The fix has three seams, each covered below:
 
-* ``http_transport._execute_graphql`` preserves the response body on stdout
+* ``http_adapter`` preserves the response body on stdout
   for erroring GraphQL responses (real ``gh api`` does the same -- in
   cli/cli's ``pkg/cmd/api/api.go`` ``processResponse`` copies the body to the
   output writer before emitting the error), so the partial ``data`` reaches
@@ -106,7 +106,7 @@ def test_graphql_error_response_body_reaches_stdout(monkeypatch, tmp_path: Path)
     query parses. Real ``gh api graphql`` does the same (body copied to stdout
     before the error is emitted to stderr), so this is parity, not a new
     convention. (The leaf name predates the transport: it asserted the same
-    through ``http_transport._execute_graphql``.)
+    through the pooled HTTP transport.)
     """
     body = _partial_body(resolved={"s_1": {"number": 1, "state": "OPEN"}}, unresolved=[361])
     outcome = _graphql_response(body)

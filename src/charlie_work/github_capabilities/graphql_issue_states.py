@@ -17,7 +17,7 @@ transports preserve that body: real ``gh`` copies the response body to
 stdout before emitting the error (verified in cli/cli
 ``pkg/cmd/api/api.go``'s ``processResponse`` -- the ``io.Copy(bodyWriter,
 responseBody)`` runs ahead of the ``serverError`` branch), and this repo's
-pooled HTTP transport does the same (``http_transport._execute_graphql``).
+pooled HTTP transport does the same (``github_transport.http_adapter``).
 Running the query through ``run(..., allow_failure=True)`` therefore
 surfaces the parsed body as ``GitHubRunResult.value`` even when ``ok`` is
 False, so a single bad alias no longer demotes an entire batch to the

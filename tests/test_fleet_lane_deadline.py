@@ -120,7 +120,9 @@ def test_pass_deadline_exceeded_is_cancellation_not_an_exception() -> None:
 def test_gh_run_unarmed_deadline_is_inert(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """No armed hook (every non-fleet caller) means zero behavior change."""
     gh = GitHub(tmp_path, runtime=gh_kill_switch_runtime())
-    spawn = MagicMock(return_value=subprocess.CompletedProcess([], 0, "ok-out", ""))
+    # ``gh api --include`` output: a status line, a blank line, then the body.
+    reply = "HTTP/2.0 200 OK" + chr(13) + chr(10) + chr(13) + chr(10) + "ok-out"
+    spawn = MagicMock(return_value=subprocess.CompletedProcess([], 0, reply, ""))
     monkeypatch.setattr(github_module.subprocess, "run", spawn)
 
     assert gh.run(["api", "rate_limit"]) == "ok-out"
@@ -168,7 +170,7 @@ def test_gh_run_checks_deadline_before_transient_retry_backoff(
     ``test_gh_run_aborts_retry_chain_at_deadline`` covers the
     ``TimeoutExpired`` branch; this covers the sibling branch -- a
     transient non-timeout gh failure ("connection reset") that
-    ``_should_retry`` classifies retryable for a read call. The predicate
+    ``is_retryable`` classifies retryable for a read call. The predicate
     is False for the pre-attempt check and True for the pre-sleep check.
     """
     gh = GitHub(tmp_path, runtime=gh_kill_switch_runtime())

@@ -64,7 +64,6 @@ from .github_capabilities import (
     RepoMetaLike,
     _ADMIN_FLAG,
     _STRATEGY_FLAGS,
-    _is_mutating,  # noqa: F401  (deliberate re-export; tests)
 )
 
 # ``_LIST_LIMIT`` is no longer referenced inside ``github.py`` itself -- its
@@ -89,7 +88,6 @@ from .github_capabilities._outcome import (  # noqa: F401  (deliberate re-export
 )
 from .github_capabilities.legacy_run import run_legacy
 from .github_capabilities.transport_wiring import build_guarded_transport
-from .github_transport.failure_markers import is_pre_connection_text
 from .github_transport.guarded import Adapters
 
 # ``_CLOSING_KEYWORDS_ALT`` is imported from ``issue_linking.py`` (Track 2,
@@ -574,30 +572,6 @@ def is_transient_repo_resolution_failure(error: str) -> bool:
 # inert for gh's own Go-idiom error text and so do not change this
 # function's behavior for any error gh can actually produce.
 _is_transient_gh_error = is_transient_network_error
-
-
-def _is_pre_connection_error(error: str) -> bool:
-    """Return True for failures that provably occurred before the request reached GitHub.
-
-    Mutating commands are only retried on these pre-send errors to preserve
-    at-most-once semantics; post-send ambiguous timeouts (i/o timeout, 5xx after
-    headers, etc.) are surfaced immediately.
-    """
-    return is_pre_connection_text(error)
-
-
-def _should_retry(args: list[str], error: str, is_mutating: bool) -> bool:
-    """Decide whether a failed gh invocation should be retried.
-
-    Reads/idempotent commands may retry any transient failure. Mutating commands
-    only retry provable pre-connection failures, avoiding double-application of
-    merges, label edits, comments, etc.
-    """
-    if not _is_transient_gh_error(error):
-        return False
-    if not is_mutating:
-        return True
-    return _is_pre_connection_error(error)
 
 
 def is_infrastructure_failure(job: dict[str, Any], annotations: list[dict[str, Any]]) -> bool:

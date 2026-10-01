@@ -14,18 +14,14 @@ from charlie_work.config import RuntimeConfig
 from charlie_work.github import GitHubError, GitHubNotFoundError
 from charlie_work.github_transport import FailureKind, GraphQLRequest, Response, RestRequest
 from charlie_work.github_transport.json_read import JsonRead, RunListRead
-from charlie_work.github_transport.legacy_argv import (
-    LegacyCli,
-    legacy_is_mutating,
-    request_for_argv,
-)
+from charlie_work.github_transport.legacy_argv import request_for_argv
 
-from _fake_transport import FakeAdapter, failure, make_github, ok
+from _fake_transport import FakeAdapter, failure, gh_kill_switch_runtime, make_github, ok
 
 # Translated shapes: the REST GET row, the GraphQL query row, the ``--json``
 # issue/pr dialect row and the ``run list --json`` row (the run mutations are
 # a REST POST, the same request type as the GET row).
-ROW_COUNT = 4
+ROW_COUNT = 5
 
 
 def test_rest_get_row_translates_to_a_typed_request() -> None:
@@ -72,8 +68,8 @@ def test_job_log_route_translates_with_redirect_following() -> None:
     ],
 )
 def test_everything_else_is_a_verbatim_passthrough(argv: list[str]) -> None:
-    translated = request_for_argv(argv)
-    assert translated.request == LegacyCli(tuple(argv))
+    """No row means no request: the table fails closed (ADR-0006)."""
+    assert request_for_argv(argv) is None
 
 
 @pytest.mark.parametrize(
@@ -90,12 +86,17 @@ def test_everything_else_is_a_verbatim_passthrough(argv: list[str]) -> None:
 def test_run_mutation_rows_translate_to_a_post(argv: list[str], route: str) -> None:
     request = request_for_argv(argv).request
     assert request == RestRequest("POST", route)
-    assert request_for_argv(argv, use_requests=False).request == LegacyCli(tuple(argv))
+    assert request.is_mutation is True
 
 
-def test_kill_switch_forces_passthrough_even_for_a_translatable_shape() -> None:
-    translated = request_for_argv(["api", "repos/o/r/pulls"], use_requests=False)
-    assert isinstance(translated.request, LegacyCli)
+def test_kill_switch_forces_passthrough_even_for_a_translatable_shape(tmp_path: Path) -> None:
+    """``gh_transport: gh`` keeps the translated request and sends it through the
+    gh adapter (rendered as ``gh api``), not the HTTP adapter."""
+    gh_adapter = FakeAdapter("gh", [ok([{"number": 1}])], token="tok-1")
+    gh, http, gh_adapter = make_github(tmp_path, gh=gh_adapter, runtime=gh_kill_switch_runtime())
+    assert gh.run(["api", "repos/o/r/pulls"], json_output=True) == [{"number": 1}]
+    assert http.calls == []
+    assert len(gh_adapter.requests) == 1
 
 
 def test_row_count_ratchet() -> None:
@@ -106,8 +107,8 @@ def test_row_count_ratchet() -> None:
             ["api", "graphql", "-f", "query=query { a }"],
             ["pr", "view", "1", "--json", "state"],
             ["run", "list", "--json", "databaseId"],
+            ["auth", "status"],
         )
-        if not isinstance(request_for_argv(argv).request, LegacyCli)
     }
     assert len(rows) <= ROW_COUNT
 
@@ -150,7 +151,6 @@ def test_row_count_ratchet() -> None:
 )  # fmt: skip
 def test_json_rows_translate_to_dialect_reads(argv: list[str], expected: object) -> None:
     assert request_for_argv(argv).request == expected
-    assert request_for_argv(argv, use_requests=False).request == LegacyCli(tuple(argv))
 
 
 @pytest.mark.parametrize(
@@ -165,7 +165,7 @@ def test_json_rows_translate_to_dialect_reads(argv: list[str], expected: object)
     ],
 )
 def test_json_rows_fail_closed_to_passthrough(argv: list[str]) -> None:
-    assert request_for_argv(argv).request == LegacyCli(tuple(argv))
+    assert request_for_argv(argv) is None
 
 
 def test_json_reads_are_never_mutations() -> None:
@@ -174,10 +174,13 @@ def test_json_reads_are_never_mutations() -> None:
 
 
 def test_legacy_mutation_classification_is_unchanged() -> None:
-    assert legacy_is_mutating(["pr", "merge", "1"]) is True
-    assert legacy_is_mutating(["pr", "view", "1"]) is False
-    assert legacy_is_mutating(["api", "repos/o/r/pulls"]) is False
-    assert legacy_is_mutating(["api", "repos/o/r/issues", "-f", "a=b"]) is True
+    """Mutation-ness is the translated request's own; a mutating shape with no
+    row is refused rather than classified."""
+    assert request_for_argv(["pr", "merge", "1"]) is None
+    assert request_for_argv(["pr", "view", "1", "--json", "state"]).request.is_mutation is False
+    assert request_for_argv(["api", "repos/o/r/pulls"]).request.is_mutation is False
+    assert request_for_argv(["api", "repos/o/r/issues", "-f", "a=b"]) is None
+    assert request_for_argv(["run", "cancel", "7"]).request.is_mutation is True
 
 
 def test_shim_serves_a_rest_get_over_http_and_parses_json(tmp_path: Path) -> None:
@@ -187,12 +190,14 @@ def test_shim_serves_a_rest_get_over_http_and_parses_json(tmp_path: Path) -> Non
 
 
 def test_shim_routes_passthrough_to_gh_even_in_http_mode(tmp_path: Path) -> None:
+    """A ``CliRequest`` row (gh-local, no REST equivalent) goes to the gh adapter."""
     gh_adapter = FakeAdapter(
         "gh", [Response(200, (), "hello\n", "gh", returncode=0)], token="tok-1"
     )
     gh, http, gh_adapter = make_github(tmp_path, gh=gh_adapter)
-    assert gh.run(["pr", "view", "1"]) == "hello"
+    assert gh.run(["auth", "status"]) == "hello"
     assert http.calls == []
+    assert len(gh_adapter.calls) == 1
 
 
 def test_shim_not_found_raises_the_specific_error(tmp_path: Path) -> None:
@@ -258,6 +263,15 @@ def test_shim_serves_run_list_over_rest(tmp_path: Path) -> None:
 
 def test_shim_dry_run_short_circuits_a_mutation(tmp_path: Path) -> None:
     gh, http, gh_adapter = make_github(tmp_path, dry_run=True)
-    assert gh.run(["pr", "merge", "1"]) == "DRY-RUN: gh pr merge 1"
-    assert gh.run(["pr", "merge", "1"], json_output=True) == []
+    assert gh.run(["run", "cancel", "7"]) == "DRY-RUN: gh run cancel 7"
+    assert gh.run(["run", "cancel", "7"], json_output=True) == []
+    assert http.calls == [] and gh_adapter.calls == []
+
+
+def test_shim_refuses_an_argv_with_no_row(tmp_path: Path) -> None:
+    """A mutating or unmodelled argv raises instead of running as a guess, and
+    nothing reaches either adapter."""
+    gh, http, gh_adapter = make_github(tmp_path)
+    with pytest.raises(GitHubError, match="unsupported argv"):
+        gh.run(["pr", "merge", "1"])
     assert http.calls == [] and gh_adapter.calls == []

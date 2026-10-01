@@ -41,13 +41,6 @@ from ci_fleet.github import GitHubError
 # normal top-level import, not a ``TYPE_CHECKING``-only one -- mirroring
 # ``pull_requests.py``'s L06 promotion of the same import for the same
 # reason.
-#
-# ``_is_mutating`` also lives in ``_base.py`` (Track 2, issue #1590; design
-# doc Section 5, L06) -- see ``_base.py``'s own comment for the cross-cutting
-# rationale (shared with ``GitHub.run``, which stays on the owner
-# permanently, and ``Transport._run_bool``, moved in L09).
-# ``pr_close``/``pr_reopen`` (moved below) reference it as a bare global for
-# their dry-run synthetic-result guard.
 from ..config_validation import ConfigError
 from ..github_transport.request import RestRequest
 from ._base import CapabilityCollaborator, GitHubRunResult
@@ -110,10 +103,9 @@ class MergeBranch(CapabilityCollaborator):
     ``pr_update_branch`` catch ``GitHubError`` (imported directly from
     ``ci_fleet.github``, the same identity-sensitive source ``github.py``
     itself re-exports from -- see this module's import block); ``pr_close``/
-    ``pr_reopen`` use ``GitHubRunResult`` and ``_is_mutating`` (both
-    relocated to ``_base.py`` in earlier leaves because they are shared with
-    ``GitHub`` methods/module constants that have not moved -- see
-    ``_base.py``'s own comments on each); ``push_empty_commit`` and
+    ``pr_reopen`` use ``GitHubRunResult`` (relocated to ``_base.py`` in an
+    earlier leaf because it is shared with ``GitHub`` methods that have not
+    moved -- see ``_base.py``'s own comment); ``push_empty_commit`` and
     ``branch_protection`` use ``GitHubRunResult`` only. Design doc Section
     3.3 covers only ``self.<attr>`` forwarding, not bare-global runtime
     symbols in moved bodies; this is the same disclosed design-gap

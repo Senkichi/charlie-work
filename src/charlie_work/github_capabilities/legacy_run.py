@@ -19,6 +19,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from ci_fleet.github import GitHubError
+
 from ..github_transport.json_read import JsonRead, RunListRead
 from ..github_transport.legacy_argv import request_for_argv
 from ..github_transport.outcome import Outcome
@@ -40,9 +42,9 @@ def run_legacy(
 ) -> Any:
     command = " ".join(["gh", *args])
     transport = gh._transport_v2
-    translated = request_for_argv(
-        args, long_call=long_call, use_requests=not transport.kill_switch
-    )
+    translated = request_for_argv(args, long_call=long_call)
+    if translated is None:
+        raise GitHubError(f"unsupported argv for GitHub.run: {command}")
     request = translated.request
     if gh.dry_run and request.is_mutation:
         return [] if json_output else "DRY-RUN: " + command

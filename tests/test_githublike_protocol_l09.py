@@ -32,8 +32,9 @@ from pathlib import Path
 import pytest
 
 import charlie_work.github as _github_module
-from _fake_transport import FakeAdapter, checks_reply, make_github, ok
+from _fake_transport import FakeAdapter, checks_reply, gh_kill_switch_runtime, make_github, ok
 from charlie_work.github_transport import Adapters
+from charlie_work.github_transport.gh_adapter import GhAdapter
 from charlie_work.github_transport.outcome import GraphQLError, Response
 from charlie_work.config import ConfigError, RuntimeConfig
 from charlie_work.github import GitHub, GitHubLike, _ROUTES
@@ -221,23 +222,25 @@ def test_retry_constants_read_through_run(monkeypatch: pytest.MonkeyPatch, tmp_p
     the whole ``github`` module attribute) and ``time.sleep`` to keep this
     fast and deterministic.
     """
-    from charlie_work.config import RuntimeConfig
-
     call_count = 0
 
     def fake_subprocess_run(*args, **kwargs):
         nonlocal call_count
         call_count += 1
         return subprocess.CompletedProcess(
-            args, returncode=1, stdout="", stderr="http 502 bad gateway"
+            args, returncode=1, stdout="", stderr="net/http: TLS handshake timeout"
         )
 
     monkeypatch.setattr(_github_module.subprocess, "run", fake_subprocess_run)
     monkeypatch.setattr(time, "sleep", lambda *_a, **_k: None)
 
-    gh = GitHub(tmp_path, runtime=RuntimeConfig(gh_max_retries=2, gh_retry_base_seconds=0.01))
+    gh, _http, _ = make_github(
+        tmp_path,
+        gh=GhAdapter(tmp_path),
+        runtime=gh_kill_switch_runtime(gh_max_retries=2, gh_retry_base_seconds=0.01),
+    )
     with pytest.raises(_github_module.GitHubError):
-        gh.run(["issue", "list"])
+        gh.run(["api", "repos/{owner}/{repo}/issues"])
 
     # max_retries=2 -> 3 attempts total (initial + 2 retries). If `run` were
     # not reading _max_retries() through the delegate (e.g. a stale closure

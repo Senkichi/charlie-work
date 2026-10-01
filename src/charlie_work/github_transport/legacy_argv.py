@@ -3,25 +3,24 @@
 ``GitHubLike.run(argv)`` stays because ``FakeGitHub`` is unchanged and a
 handful of callers outside the capability layer still pass gh argv. This
 module is the closed, test-pinned table that maps those argv shapes onto
-requests. It is an edge adapter for old callers, not the contract: each
-capability migrates to typed requests and the table only shrinks
-(``tests/test_github_transport_legacy_argv.py`` pins the row count).
+requests. It is an edge adapter for old callers, not the contract: the table
+only shrinks (``tests/test_github_transport_legacy_argv.py`` pins the row
+count).
 
-Two outcomes for every argv:
+Every argv maps to exactly one of:
 
 * a ``RestRequest`` / ``GraphQLRequest`` for the ``gh api`` REST-GET and
-  GraphQL-query shapes the HTTP path has always served, plus the two
-  ``gh run cancel|rerun`` mutations, a ``JsonRead`` / ``RunListRead`` for
-  the ``gh issue|pr|run ... --json`` reads (executed over GraphQL / REST,
-  ``json_read.py``), or
-* a ``LegacyCli``, the verbatim ``gh <args>`` passthrough for everything
-  else. ``LegacyCli`` is a transitional request: it always routes to the gh
-  adapter and is deleted when the last capability has moved off
-  ``run(argv)``.
+  GraphQL-query shapes, plus the two ``gh run cancel|rerun`` mutations,
+* a ``JsonRead`` / ``RunListRead`` for the ``gh issue|pr|run ... --json``
+  reads (executed over GraphQL / REST, ``json_read.py``),
+* a ``CliRequest`` for the gh-local commands, or
+* ``None``: not in the table. ``GitHub.run`` raises ``GitHubError`` for it;
+  there is no verbatim ``gh`` passthrough.
 
-Mutation-ness of a passthrough argv is the old prefix allowlist, moved here
-verbatim (``legacy_is_mutating``): a typed request derives it from its
-method or operation instead.
+Each row fails closed: any flag, second positional or header the row does not
+model is ``None``, so a mutating ``gh api`` spelling (``-X POST``, ``-f``,
+``--input``) can never reach the transport through ``run``. Mutation-ness of
+a translated request comes from its method or operation.
 
 This module imports only ``request``; the transport package sits below the
 capability layer.
@@ -42,20 +41,10 @@ if TYPE_CHECKING:  # json_read imports the guard, which imports this module
 # endpoint answers 302 to a signed URL with a raw-text body (gt-design G3).
 _REDIRECT_PATH_SUFFIXES = ("/logs",)
 _GRAPHQL_KNOWN_FIELDS = ("query", "owner", "name")
-_READONLY_PREFIXES = (
-    "issue list",
-    "issue view",
-    "pr list",
-    "pr view",
-    "pr diff",
-    "pr checks",
-    "label list",
-    "auth status",
-)
 
 
 # ---------------------------------------------------------------------------
-# mutation classification (moved verbatim from github_capabilities/_base.py)
+# gh api argv parsing
 # ---------------------------------------------------------------------------
 
 
@@ -86,8 +75,8 @@ def is_graphql_query(args: list[str]) -> bool:
     """A `gh api graphql -f query='query { ... }'` is a read-only query.
 
     Fails closed: only an operation that *starts* with the GraphQL `query`
-    keyword is treated as read-only. `mutation` or anything unparseable is
-    classified as mutating so a stray write never runs under `--dry-run`.
+    keyword is a query. `mutation` or anything unparseable is not, so it has
+    no row.
     """
     if len(args) < 2 or args[0] != "api" or args[1] != "graphql":
         return False
@@ -97,70 +86,16 @@ def is_graphql_query(args: list[str]) -> bool:
     return query.lstrip()[:5].lower() == "query"
 
 
-def api_is_mutating(args: list[str]) -> bool:
-    """Classify a `gh api` invocation, for the --dry-run gate.
-
-    `gh api` defaults to GET, so a bare `gh api <path>` is read-only. The
-    classification keys off whether a method is *named* and fails CLOSED when
-    a method flag is present but its value cannot be extracted (#914, #917).
-    Request parameters (`-f`, `-F`, `--field`, `--raw-field`, `--input`)
-    switch gh to POST, so they count as mutating too (#919). A read-only
-    `gh api graphql -f query='query { ... }'` is an exception (#923).
-    """
-    if is_graphql_query(args):
-        return False
-
-    for i, arg in enumerate(args):
-        if arg in ("-X", "--method"):
-            method = args[i + 1] if i + 1 < len(args) else ""
-        elif arg.startswith("--method="):
-            method = arg.split("=", 1)[1]
-        elif arg.startswith("-X"):
-            # pflag shorthand accepts an attached value: `-XDELETE` and `-X=DELETE`.
-            method = arg[2:].lstrip("=")
-        else:
-            continue
-        # A named-but-unparseable method is not evidence of a read; fail closed.
-        return not method or method.upper() not in ("GET", "HEAD")
-    param_prefixes = ("--raw-field", "--field", "--input")
-    return any(arg.startswith(param_prefixes) or arg[:2] in ("-f", "-F") for arg in args)
-
-
-def legacy_is_mutating(args: list[str]) -> bool:
-    """Whether the gh argv (without the leading ``gh``) may change state."""
-    if not args:
-        return False
-    text = " ".join(args)
-    if text.startswith("api"):
-        return api_is_mutating(args)
-    return not any(text.startswith(prefix) for prefix in _READONLY_PREFIXES)
-
-
 # ---------------------------------------------------------------------------
 # the request values
 # ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
-class LegacyCli:
-    """A verbatim ``gh <args>`` invocation (transitional passthrough)."""
-
-    args: tuple[str, ...]
-    long_call: bool = False
-
-    @property
-    def is_mutation(self) -> bool:
-        return legacy_is_mutating(list(self.args))
-
-    def describe(self) -> str:
-        return " ".join(("gh", *self.args))
-
-
-@dataclass(frozen=True)
 class Translated:
     """One table lookup: the request to send and whether to follow pages."""
 
-    request: "Request | LegacyCli | JsonRead | RunListRead"
+    request: "Request | JsonRead | RunListRead"
     paginate: bool = False
 
 
@@ -412,35 +347,25 @@ def _run_list_row(args: list[str], long_call: bool) -> Translated | None:
 _CLI_ROWS = {command.value: command for command in CliCommand}
 
 
-def request_for_argv(
-    args: list[str], *, long_call: bool = False, use_requests: bool = True
-) -> Translated:
-    """Map gh argv (without the leading ``gh``) onto a request.
-
-    ``use_requests=False`` (the ``gh_transport: gh`` kill switch) forces the
-    verbatim passthrough, so the old gh behaviour is exactly preserved while
-    the switch is on.
-    """
-    passthrough = Translated(LegacyCli(tuple(args), long_call))
-    if use_requests and tuple(args) in _CLI_ROWS:
+def request_for_argv(args: list[str], *, long_call: bool = False) -> Translated | None:
+    """Map gh argv (without the leading ``gh``) onto a request, or ``None``
+    when the argv is not in the table."""
+    if tuple(args) in _CLI_ROWS:
         return Translated(CliRequest(_CLI_ROWS[tuple(args)]))
-    if use_requests and args and args[0] in ("issue", "pr"):
-        return _json_row(args, long_call) or passthrough
-    if use_requests and args and args[0] == "run":
-        return _run_row(args, long_call) or _run_list_row(args, long_call) or passthrough
-    if not use_requests or not args or args[0] != "api" or api_is_mutating(args):
-        return passthrough
+    if args and args[0] in ("issue", "pr"):
+        return _json_row(args, long_call)
+    if args and args[0] == "run":
+        return _run_row(args, long_call) or _run_list_row(args, long_call)
+    if not args or args[0] != "api":
+        return None
     if is_graphql_query(args):
-        return _graphql_row(args, long_call) or passthrough
-    return _rest_row(args, long_call) or passthrough
+        return _graphql_row(args, long_call)
+    return _rest_row(args, long_call)
 
 
 __all__ = [
-    "LegacyCli",
     "Translated",
-    "api_is_mutating",
     "graphql_field_value",
     "is_graphql_query",
-    "legacy_is_mutating",
     "request_for_argv",
 ]

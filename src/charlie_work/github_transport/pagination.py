@@ -24,7 +24,7 @@ from .outcome import (
 )
 from .request import GraphQLRequest, RestRequest, canonical_json
 
-# Moved verbatim from http_transport._MAX_PAGINATE_PAGES.
+# The page cap the pooled-HTTP transport used before ADR-0006.
 MAX_PAGES = 50
 
 

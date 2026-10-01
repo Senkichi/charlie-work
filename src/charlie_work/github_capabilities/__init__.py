@@ -18,7 +18,6 @@ from __future__ import annotations
 from ._base import (
     GitHubRunResult,
     RUN_LIST_FIELDS,
-    _is_mutating,
     _LIST_LIMIT,
 )
 from .checks import PR_CHECKS_FIELDS, Checks, ChecksLike, _job_id_from_link
@@ -43,7 +42,6 @@ from .pull_requests import (
     PullRequestsLike,
     _pr_number_from_url,
 )
-from .http_transport import build_http_transport_state, run_gh_command
 from .repo_meta import RepoMeta, RepoMetaLike
 from .transport import (
     RECONCILE_ISSUE_FIELDS,
@@ -84,12 +82,9 @@ __all__ = [
     "_ADMIN_FLAG",
     "_LIST_LIMIT",
     "_STRATEGY_FLAGS",
-    "_is_mutating",
     "_job_id_from_link",
     "_pr_number_from_url",
     "build_circuit_breaker_state",
-    "build_http_transport_state",
     "classify_gh_failure",
     "get_github_issue_dependencies",
-    "run_gh_command",
 ]

@@ -6,65 +6,43 @@ Track-1 wave 8/8).
 
 from __future__ import annotations
 
-import subprocess
 from pathlib import Path
-from _fake_transport import FakeAdapter, make_github, ok, sent
-from charlie_work import github as github_module
+from _fake_transport import FakeAdapter, failure, make_github, ok, sent
+from charlie_work.github_transport import FailureKind, RestRequest
+from charlie_work.github_transport.guarded import is_retryable
+from charlie_work.github_transport.legacy_argv import request_for_argv
 
 
-def test_github_delete_branch_failure_returns_false(monkeypatch, tmp_path: Path) -> None:
-    def fake_run(*args, **kwargs):
-        return subprocess.CompletedProcess(
-            args=args,
-            returncode=1,
-            stdout="",
-            stderr="Reference does not exist",
-        )
-
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
-
-    assert github_module.GitHub(tmp_path).delete_branch("agent/issue-1-x") is False
+def _rejected():
+    """A non-transient API rejection (never retried)."""
+    return ok('{"message": "Validation Failed"}', status=422)
 
 
-def test_github_add_issue_label_failure_does_not_raise(monkeypatch, tmp_path: Path) -> None:
-    """C5 boundary test: add_issue_label with allow_failure=True returns error value, does not raise."""
+def test_github_delete_branch_failure_returns_false(tmp_path: Path) -> None:
+    """A rejected delete (422) is a False result, not a raise."""
+    gh, _http, _ = make_github(tmp_path, http=FakeAdapter("http", [_rejected()]))
 
-    def fake_run(cmd, *args, check=False, **kwargs):
-        if check:
-            raise subprocess.CalledProcessError(1, cmd, output="", stderr="simulated failure")
-        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="simulated failure")
+    assert gh.delete_branch("agent/issue-1-x") is False
 
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
 
-    gh = github_module.GitHub(tmp_path)
-    # Should not raise despite subprocess failure (allow_failure=True in add_issue_label)
+def test_github_add_issue_label_failure_does_not_raise(tmp_path: Path) -> None:
+    """C5 boundary test: a rejected add_issue_label returns a value, does not raise."""
+    gh, _http, _ = make_github(tmp_path, http=FakeAdapter("http", [_rejected()]))
+
     gh.add_issue_label(123, "agent:in-progress")
 
 
-def test_github_remove_issue_label_failure_does_not_raise(monkeypatch, tmp_path: Path) -> None:
-    """C5 boundary test: remove_issue_label with allow_failure=True returns error value, does not raise."""
+def test_github_remove_issue_label_failure_does_not_raise(tmp_path: Path) -> None:
+    """C5 boundary test: a rejected remove_issue_label returns a value, does not raise."""
+    gh, _http, _ = make_github(tmp_path, http=FakeAdapter("http", [_rejected()]))
 
-    def fake_run(cmd, *args, check=False, **kwargs):
-        if check:
-            raise subprocess.CalledProcessError(1, cmd, output="", stderr="simulated failure")
-        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="simulated failure")
-
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
-
-    gh = github_module.GitHub(tmp_path)
-    # Should not raise despite subprocess failure (allow_failure=True in remove_issue_label)
     gh.remove_issue_label(123, "agent:in-progress")
 
 
-def test_github_add_issue_label_returns_false_on_failure(monkeypatch, tmp_path: Path) -> None:
-    """Boolean-truthfulness test: add_issue_label returns False on subprocess failure (returncode=1)."""
+def test_github_add_issue_label_returns_false_on_failure(tmp_path: Path) -> None:
+    """Boolean-truthfulness test: add_issue_label returns False when the request is rejected."""
+    gh, _http, _ = make_github(tmp_path, http=FakeAdapter("http", [_rejected()]))
 
-    def fake_run(cmd, *args, check=False, **kwargs):
-        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="simulated failure")
-
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
-
-    gh = github_module.GitHub(tmp_path)
     result = gh.add_issue_label(123, "agent:in-progress")
     assert result is False, "add_issue_label must return False on failure"
 
@@ -79,15 +57,10 @@ def test_github_add_issue_label_returns_true_on_success(tmp_path: Path) -> None:
     ]
 
 
-def test_github_remove_issue_label_returns_false_on_failure(monkeypatch, tmp_path: Path) -> None:
-    """Boolean-truthfulness test: remove_issue_label returns False on subprocess failure (returncode=1)."""
+def test_github_remove_issue_label_returns_false_on_failure(tmp_path: Path) -> None:
+    """Boolean-truthfulness test: remove_issue_label returns False when the request is rejected."""
+    gh, _http, _ = make_github(tmp_path, http=FakeAdapter("http", [_rejected()]))
 
-    def fake_run(cmd, *args, check=False, **kwargs):
-        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="simulated failure")
-
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
-
-    gh = github_module.GitHub(tmp_path)
     result = gh.remove_issue_label(123, "agent:in-progress")
     assert result is False, "remove_issue_label must return False on failure"
 
@@ -102,49 +75,43 @@ def test_github_remove_issue_label_returns_true_on_success(tmp_path: Path) -> No
     ]
 
 
-def test_github_dry_run_skips_mutating_command(monkeypatch, tmp_path: Path) -> None:
-    calls: list[list[str]] = []
+def test_github_dry_run_skips_mutating_command(tmp_path: Path) -> None:
+    gh, http, gh_adapter = make_github(tmp_path, dry_run=True)
 
-    def fake_run(*args, **kwargs):
-        calls.append(args[0])
-        return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
-
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
-    gh = github_module.GitHub(repo_root=tmp_path, dry_run=True)
-
-    out = gh.run(["pr", "merge", "1", "--squash"])
+    out = gh.run(["run", "cancel", "7"])
 
     assert out.startswith("DRY-RUN:")
-    assert calls == []  # subprocess.run never invoked for a mutating command
+    assert http.calls == [] and gh_adapter.calls == []  # nothing sent for a mutation
 
 
-def test_github_dry_run_allows_readonly_command(monkeypatch, tmp_path: Path) -> None:
-    calls: list[list[str]] = []
+def test_github_dry_run_allows_readonly_command(tmp_path: Path) -> None:
+    reply = ok(
+        {"data": {"repository": {"issues": {"nodes": [], "pageInfo": {"hasNextPage": False}}}}}
+    )
+    gh, http, _ = make_github(tmp_path, dry_run=True, http=FakeAdapter("http", [reply]))
 
-    def fake_run(*args, **kwargs):
-        calls.append(args[0])
-        return subprocess.CompletedProcess(args=args, returncode=0, stdout="[]", stderr="")
+    gh.run(["issue", "list", "--label", "x", "--json", "number"], json_output=True)
 
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
-    gh = github_module.GitHub(repo_root=tmp_path, dry_run=True)
-
-    gh.run(["issue", "list", "--label", "x"], json_output=True)
-
-    assert len(calls) == 1  # read-only command still executes under dry-run
+    assert len(http.calls) == 1  # read-only command still executes under dry-run
 
 
 def test_is_mutating_classifies_readonly_and_mutating() -> None:
-    from charlie_work.github import _is_mutating
+    """Mutation-ness is a property of the typed request (ADR-0006).
 
+    A read-only gh shape translates to a request whose ``is_mutation`` is False;
+    a mutating shape has no row at all, so ``GitHub.run`` refuses it rather than
+    guessing at a classification.
+    """
     for readonly in (
-        ["issue", "list"],
-        ["pr", "view", "1"],
-        ["pr", "checks", "1"],
-        ["label", "list"],
+        ["issue", "list", "--json", "number"],
+        ["pr", "view", "1", "--json", "state"],
+        ["pr", "checks", "1", "--json", "name"],
+        ["run", "list", "--json", "databaseId"],
     ):
-        assert _is_mutating(readonly) is False
+        assert request_for_argv(readonly).request.is_mutation is False
     for mutating in (["pr", "merge", "1"], ["issue", "edit", "1"], ["label", "create", "x"]):
-        assert _is_mutating(mutating) is True
+        assert request_for_argv(mutating) is None
+    assert request_for_argv(["run", "cancel", "7"]).request.is_mutation is True
 
 
 def test_is_mutating_blocks_the_argv_delete_branch_actually_builds(tmp_path: Path) -> None:
@@ -167,15 +134,14 @@ def test_is_mutating_blocks_the_argv_delete_branch_actually_builds(tmp_path: Pat
 
 
 def test_is_mutating_api_method_spellings_and_preserved_reads() -> None:
-    """Every spelling `gh` accepts for a method must classify from that method, and
-    an unparseable one must fail CLOSED.
+    """Every spelling `gh` accepts for a mutating method has no row, and the
+    real read call sites keep theirs.
 
     The read-only half is the half that protects `--dry-run` from being tightened into
     uselessness: these are real live call sites, and without them a future "just deny
-    all `gh api`" change passes every other test in the suite.
+    all `gh api`" change passes every other test in the suite. The table fails
+    CLOSED: an argv it cannot model is refused, never run as a guess.
     """
-    from charlie_work.github import _is_mutating
-
     for mutating in (
         ["api", "-X", "DELETE", "repos/o/r/git/refs/heads/x"],
         ["api", "-X=DELETE", "repos/o/r/git/refs/heads/x"],
@@ -195,60 +161,50 @@ def test_is_mutating_api_method_spellings_and_preserved_reads() -> None:
         ["api", "repos/o/r/issues", "--input", "body.json"],
         ["api", "repos/o/r/issues", "--input=-"],
     ):
-        assert _is_mutating(mutating) is True, mutating
+        assert request_for_argv(mutating) is None, mutating
 
     for readonly in (
         ["api", "rate_limit"],
         ["api", "repos/o/r/commits/abc/check-runs"],
         ["api", "repos/o/r/compare/main...topic"],
         ["api", "repos/o/r/branches/main/protection"],
-        ["api", "-X", "GET", "repos/o/r/issues"],
-        ["api", "--method=HEAD", "repos/o/r"],
         # A header is not a method -- github.py:1033 fetches a diff this way.
         ["api", "repos/o/r/pulls/1", "-H", "Accept: application/vnd.github.v3.diff"],
-        # Other shorthands must not be swept up by the -f/-F prefix match (#919).
-        ["api", "repos/o/r/issues", "-q", ".[].number"],
-        ["api", "repos/o/r/issues", "-t", "{{.number}}"],
         ["api", "repos/o/r/issues", "--paginate"],
     ):
-        assert _is_mutating(readonly) is False, readonly
+        translated = request_for_argv(readonly)
+        assert translated is not None, readonly
+        assert translated.request.is_mutation is False, readonly
 
 
 def test_token_minting_posts_do_not_retry_post_send_failures() -> None:
     """Credential-minting POSTs must retry only on provable pre-send failures.
 
-    `_is_mutating` has a second consumer besides the --dry-run gate: `run()` feeds it
-    to `_should_retry`, which grants reads an unconditional retry on any transient
-    error and restricts mutations to pre-connection errors, so a request that may
-    already have been applied is never re-sent.
+    The guard's retry policy (``is_retryable``) grants reads a retry on any
+    transient failure and restricts mutations to failures that provably happened
+    before the request was sent, so a request that may already have been applied
+    is never re-sent.
 
-    Before #918 these two argvs classified as *reads* (the `-X` spelling fell through
-    the old enumeration), which put credential minting on the unconditional-retry
-    path: a post-send timeout on a request GitHub had actually served would mint a
-    second token. #918 fixed that as a side effect of the --dry-run work without
-    naming it, so pin it here -- a future reclassification of `-X POST` would
+    A post-send timeout on a request GitHub had actually served would mint a
+    second token, so pin it here -- a future reclassification of a POST would
     otherwise reopen the loop with every other test still green (#919).
     """
-    from charlie_work.github import _is_mutating, _should_retry
-
-    for argv in (
-        ["api", "-X", "POST", "repos/{owner}/{repo}/actions/runners/remove-token"],
-        [
-            "api",
-            "-X",
-            "POST",
-            "repos/{owner}/{repo}/actions/runners/registration-token",
-        ],
+    for route in (
+        "repos/{owner}/{repo}/actions/runners/remove-token",
+        "repos/{owner}/{repo}/actions/runners/registration-token",
     ):
-        assert _is_mutating(argv) is True, argv
+        request = RestRequest("POST", route)
+        assert request.is_mutation is True, route
         # Ambiguous: the request may have been served before the read timed out.
-        assert _should_retry(argv, "i/o timeout", _is_mutating(argv)) is False, argv
+        assert is_retryable(failure(FailureKind.TIMEOUT, "i/o timeout"), is_mutation=True) is False
         # Provably pre-send -- no token can have been minted, so retrying is safe.
-        assert _should_retry(argv, "dial tcp: connection refused", _is_mutating(argv)) is True, (
-            argv
+        assert (
+            is_retryable(failure(FailureKind.CONNECT, "connection refused"), is_mutation=True)
+            is True
         )
 
     # Control: a read is still granted the unconditional retry, so the assertions
-    # above are about the mutating classification and not about the error strings.
-    read = ["api", "repos/{owner}/{repo}/actions/runners"]
-    assert _should_retry(read, "i/o timeout", _is_mutating(read)) is True
+    # above are about the mutating classification and not about the error kind.
+    read = RestRequest("GET", "repos/{owner}/{repo}/actions/runners")
+    assert read.is_mutation is False
+    assert is_retryable(failure(FailureKind.TIMEOUT, "i/o timeout"), is_mutation=False) is True

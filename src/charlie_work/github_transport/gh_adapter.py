@@ -41,7 +41,6 @@ from .outcome import (
     graphql_errors_from_body,
     normalize_headers,
 )
-from .legacy_argv import LegacyCli
 from .request import CliRequest, GraphQLRequest, Request, RestRequest
 
 _STATUS_LINE_RE = re.compile(r"^HTTP/\S+\s+(\d{3})\b")
@@ -69,10 +68,8 @@ def _spawn(
     )
 
 
-def render_argv(request: Request | LegacyCli) -> tuple[list[str], str | None]:
+def render_argv(request: Request) -> tuple[list[str], str | None]:
     """The ``gh`` argv and stdin text for *request*."""
-    if isinstance(request, LegacyCli):
-        return ["gh", *request.args], None
     if isinstance(request, CliRequest):
         return ["gh", *request.command.value], None
     if isinstance(request, GraphQLRequest):
@@ -133,7 +130,7 @@ class GhAdapter:
         self._cwd = cwd
         self._spawn = spawn
 
-    def send(self, request: Request | LegacyCli, *, token: str | None, timeout: float) -> Outcome:
+    def send(self, request: Request, *, token: str | None, timeout: float) -> Outcome:
         del token  # gh resolves its own credentials
         try:
             argv, stdin = render_argv(request)
@@ -151,18 +148,9 @@ class GhAdapter:
             return TransportFailure(
                 FailureKind.ADAPTER_DEFECT, f"{type(exc).__name__}: {exc}", "gh"
             )
-        if isinstance(request, LegacyCli):
-            return self._legacy_response(proc)
         if isinstance(request, CliRequest):
             return self._cli_response(proc)
         return self._api_outcome(request, proc)
-
-    @staticmethod
-    def _legacy_response(proc: "subprocess.CompletedProcess[str]") -> Outcome:
-        """A verbatim gh run: both streams kept raw, exit status decides ok."""
-        stdout, stderr = proc.stdout or "", proc.stderr or ""
-        status = 200 if proc.returncode == 0 else 0
-        return Response(status, (), stdout, "gh", returncode=proc.returncode, stderr=stderr)
 
     @staticmethod
     def _cli_response(proc: "subprocess.CompletedProcess[str]") -> Outcome:

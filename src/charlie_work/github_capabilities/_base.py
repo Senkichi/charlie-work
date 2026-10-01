@@ -26,13 +26,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from ..github_transport.legacy_argv import (
-    api_is_mutating,
-    graphql_field_value,
-    is_graphql_query,
-    legacy_is_mutating,
-)
-
 if TYPE_CHECKING:
     from charlie_work.github import GitHub
 
@@ -101,30 +94,9 @@ class GitHubRunResult:
 _LIST_LIMIT = 500
 
 
-# Moved from ``github.py`` (Track 2, issue #1590; design doc Section 5, L06),
-# alongside ``_LIST_LIMIT`` above. ``_is_mutating`` (and its private helper
-# chain ``_api_is_mutating``/``_is_graphql_query``/``_graphql_field_value``)
-# is referenced as a bare global by ``PullRequests.pr_ready``,
-# ``MergeBranch.pr_close``/``pr_reopen`` (moved in L08), ``Transport._run_bool``
-# (moved in L09), and ``GitHub.run`` itself -- the one consumer that never
-# relocates, since ``run`` is the interception seam and stays on the owner by
-# design (design doc Section 3.2). This cross-cutting shape (one helper,
-# consumers scattered across every leaf plus the owner) is why it lives here
-# rather than in any single capability module -- re-relocating it leaf by leaf
-# or importing it sideways from a PR-domain module would just move the same
-# problem around. Only ``_is_mutating`` itself is referenced outside this
-# chain (by name, from ``github.py``); the three helper functions have no
-# consumer beyond ``_is_mutating``'s own body, so only ``_is_mutating`` is
-# re-exported through ``github_capabilities/__init__.py`` and re-imported
-# into ``github.py``. Bodies are unchanged from their former ``github.py``
-# copies.
-# The mutation classifier family now lives in github_transport/legacy_argv.py
-# (ADR-0006): the transport package sits below this one and cannot import
-# capabilities. Re-exported under the old private names for the capability
-# modules and tests that still import them from here.
-_graphql_field_value = graphql_field_value
-_is_graphql_query = is_graphql_query
-_api_is_mutating = api_is_mutating
+# The mutation classifier (``_is_mutating``) is gone (ADR-0006): a typed
+# request carries its own ``is_mutation``, and ``GitHub.run`` refuses any argv
+# the ``legacy_argv`` table does not model.
 
 
 # MERGED_PR_LIST_FIELDS moved on from here to
@@ -146,9 +118,6 @@ _api_is_mutating = api_is_mutating
 # Re-exported through ``github_capabilities/__init__.py`` and re-imported
 # into ``github.py`` (still used directly there in ``cancel_superseded_runs``).
 RUN_LIST_FIELDS = "databaseId,status,createdAt,headBranch"
-
-
-_is_mutating = legacy_is_mutating
 
 
 class CapabilityCollaborator:

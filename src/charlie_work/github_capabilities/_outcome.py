@@ -54,8 +54,8 @@ def is_not_found_gh_error(error: str) -> bool:
 def failure_text(outcome: Outcome) -> str:
     """The error text of a failed outcome, in today's ``final_error`` shape."""
     if isinstance(outcome, Response) and outcome.status == 0:
-        # A verbatim gh run: stderr, else stdout, else the bare exit status.
-        return outcome.stderr.strip() or outcome.body.strip() or str(outcome.returncode)
+        # A gh-local failure: the body is its stderr, else the bare exit status.
+        return outcome.body.strip() or str(outcome.returncode)
     return render_legacy_error(outcome)
 
 
@@ -106,7 +106,7 @@ def to_run_result(outcome: Outcome, *, json_output: bool, command: str) -> GitHu
                     ok=False,
                     returncode=_ok_returncode(outcome),
                     stdout=outcome.body,
-                    stderr=outcome.stderr,
+                    stderr="",
                     value=None,
                     error=f"Expected JSON from gh command: {command}",
                 )
@@ -114,7 +114,7 @@ def to_run_result(outcome: Outcome, *, json_output: bool, command: str) -> GitHu
             ok=True,
             returncode=_ok_returncode(outcome),
             stdout=outcome.body,
-            stderr=outcome.stderr,
+            stderr="",
             value=value,
             error=None,
         )
@@ -122,7 +122,7 @@ def to_run_result(outcome: Outcome, *, json_output: bool, command: str) -> GitHu
     stdout = outcome.body if isinstance(outcome, Response) else ""
     if isinstance(outcome, Response) and outcome.status != 0 and not outcome.graphql_errors:
         stdout = ""  # a plain HTTP error carried no stdout in the gh-shaped result
-    stderr = outcome.stderr if isinstance(outcome, Response) and outcome.status == 0 else error
+    stderr = error
     if isinstance(outcome, TransportFailure) and outcome.kind.value == "cli_missing":
         stderr = ""
     value = None

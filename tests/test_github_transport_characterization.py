@@ -50,8 +50,8 @@ def test_pr_checks_with_no_checks_is_an_empty_list(tmp_path: Path) -> None:
 def test_dry_run_mutation_through_run_keeps_the_legacy_return(tmp_path: Path) -> None:
     gh, http, gh_adapter = make_github(tmp_path, dry_run=True)
 
-    assert gh.run(["pr", "close", "7"]) == "DRY-RUN: gh pr close 7"
-    assert gh.run(["pr", "close", "7"], json_output=True) == []
+    assert gh.run(["run", "rerun", "7"]) == "DRY-RUN: gh run rerun 7"
+    assert gh.run(["run", "rerun", "7"], json_output=True) == []
     assert http.api_requests == []
     assert gh_adapter.api_requests == []
 
