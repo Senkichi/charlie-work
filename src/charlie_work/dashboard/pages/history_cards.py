@@ -13,6 +13,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, tzinfo
 
 from ..charts import Coverage, LineSpec, Marker, Panel, Size, line_chart, small_multiples
+from ..charts.model import Reference
 from ..charts import Point as ChartPoint
 from ..charts import Series as ChartSeries
 from ..charts.svg import SERIES_DASH
@@ -122,6 +123,17 @@ def _chart_coverage(series: Series, window: tuple[datetime, datetime]) -> tuple[
     return tuple(out)
 
 
+def _references(compared: tuple[float, float] | None, range_key: str) -> tuple[Reference, ...]:
+    """The two values the headline compares, as rules on the chart's own axis (D1)."""
+    if compared is None:
+        return ()
+    cur, pri = compared
+    return (
+        Reference(pri, f"prior {range_key} avg", prior=True),
+        Reference(cur, f"this {range_key} avg"),
+    )
+
+
 def _markers(series: Series, tz: tzinfo | None) -> tuple[Marker, ...]:
     if not series.exact_from:
         return ()
@@ -214,6 +226,7 @@ def render_card(
         takeaway=metric.takeaways[head.name],
         domain=window,
         size=COMBINED,
+        references=_references(metric.compared.get(head.name), view.range_key),
     )
     combined = line_chart(_chart_series(drawn, has_children), spec, tz)
     panels = _panels(drawn, has_children, known)

@@ -238,6 +238,28 @@ def label_width(series: tuple[Series, ...]) -> float:
     return 10 + CHAR_PX * longest
 
 
+REF_DASH = "5 4"  # the prior window's reference; this window's is solid
+
+
+def _references(f: Frame, spec: LineSpec) -> str:
+    """Reference rules (the headline's compared values), labelled just above each rule at
+    the left; close labels are pushed apart and kept inside the plot (``_dodge``)."""
+    refs = sorted(spec.references, key=lambda r: -r.value)
+    out: list[str] = []
+    for r in refs:
+        y = f.y(r.value)
+        cls = "ref prior" if r.prior else "ref"
+        out.append(
+            f'<line class="{cls}" x1="{num(f.left)}" x2="{num(f.right)}" y1="{num(y)}" '
+            f'y2="{num(y)}"{dash_attr(REF_DASH if r.prior else None)}/>'
+        )
+    placed = _dodge([(f.y(r.value) - 4, i) for i, r in enumerate(refs)], f.top + 10, f.bottom - 4)
+    for i, r in enumerate(refs):
+        body = f"{r.label} {value_text(r.value, spec.unit)}"
+        out.append(text(f.left + 4, placed[i], body, "note ref-label"))
+    return f'<g class="refs">{"".join(out)}</g>' if out else ""
+
+
 def plot(
     series: tuple[Series, ...],
     spec: LineSpec,
@@ -251,6 +273,7 @@ def plot(
     return (
         _axes(f, spec.unit, tz, max_x_ticks)
         + _context(f, spec, tz)
+        + _references(f, spec)
         + _series(f, series, spec, labels)
     )
 
@@ -270,6 +293,7 @@ def summary(title: str, series: tuple[Series, ...], spec: LineSpec, tz, window) 
             f"{name}: last {value_text(runs[-1][-1].value or 0.0, spec.unit)}, "
             f"peak {value_text(max(vals), spec.unit)}{gaps}"
         )
+    parts += [f"{r.label} {value_text(r.value, spec.unit)}" for r in spec.references]
     return ". ".join(parts) + "."
 
 
@@ -299,7 +323,7 @@ def line_chart(series: tuple[Series, ...], spec: LineSpec, tz: tzinfo | None = N
         bottom=height - 26,
         t0=window[0],
         t1=window[1],
-        y_ticks=y_ticks_for(values(series)),
+        y_ticks=y_ticks_for(values(series) + [r.value for r in spec.references]),
     )
     svg = (
         svg_open(width, height, summary(spec.title, series, spec, tz, window), "line-chart")

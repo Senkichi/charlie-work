@@ -111,40 +111,66 @@ def _gap(current: Series, prior: Series) -> str | None:
 
 def takeaway(current: Series, prior: Series, *, min_sample: int = MIN_SAMPLE) -> str:
     """One-sentence headline for ``current`` against the equal prior window ``prior``."""
+    return assess(current, prior, min_sample=min_sample)[0]
+
+
+Compared = tuple[float, float]  # (current, prior) window values, chart per-bucket units
+
+
+def assess(
+    current: Series, prior: Series, *, min_sample: int = MIN_SAMPLE
+) -> tuple[str, Compared | None]:
+    """``(headline, compared)``. ``compared`` holds the two window values the headline's
+    comparison rests on, scaled to the chart's per-bucket units (a count's per-day rate
+    times bucket/day), or None when the headline claims no comparison -- so the chart can
+    draw exactly what the words compare (D1)."""
+    text, values = _headline(current, prior, min_sample)
+    if values is None:
+        return text, None
+    scale = current.bucket_seconds / _DAY.total_seconds() if current.kind == "count" else 1.0
+    return text, (values[0] * scale, values[1] * scale)
+
+
+def _headline(current: Series, prior: Series, min_sample: int) -> tuple[str, Compared | None]:
     span = _span(current)
     if _span(prior) != span or prior.window_end != current.window_start:
         raise ValueError("prior must be the equal window ending where current starts")
     label = _headline_label(current)
     if current.not_instrumented:
-        return f"{label}: not instrumented yet"
+        return f"{label}: not instrumented yet", None
     gap = _gap(current, prior)
     if gap:
-        return gap if gap.startswith("not comparable") else f"{label}: no trend claimed, {gap}"
+        return (
+            gap if gap.startswith("not comparable") else f"{label}: no trend claimed, {gap}"
+        ), None
     window = _window_label(span)
     cur_v = _value(current.points, current.kind, span)
     pri_v = _value(prior.points, prior.kind, span)
     suffix = (" (approx.)" if current.approx else "") + (" (partial)" if current.partial else "")
     if current.kind == "count" and pri_v == 0 and cur_v is not None:
         # the prior window sits inside coverage, so its zeros are real: no sample floor
-        if cur_v == 0:
-            return f"{label} unchanged at 0 vs prior {window}{suffix}"
-        return f"{label} up from 0 to {_number(cur_v)} vs prior {window}{suffix}"
+        return _from_zero(label, cur_v, window, suffix), (cur_v, 0.0)
+    not_enough = f"{label}: not enough data vs prior {window}"
     if current.kind != "count" and min(len(current.points), len(prior.points)) < MIN_BUCKETS:
-        return f"{label}: not enough data vs prior {window}"
+        return not_enough, None
     if cur_v is None or pri_v is None or min(current.n, prior.n) < min_sample:
-        return f"{label}: not enough data vs prior {window}"
+        return not_enough, None
     if pri_v == 0:
-        if cur_v == 0:
-            return f"{label} unchanged at 0 vs prior {window}{suffix}"
-        return f"{label} up from 0 to {_number(cur_v)} vs prior {window}{suffix}"
+        return _from_zero(label, cur_v, window, suffix), (cur_v, pri_v)
     change = (cur_v - pri_v) / pri_v
     if abs(change) < FLAT_BELOW:
         sign = "+" if change >= 0 else "-"
-        return f"{label} flat vs prior {window} ({sign}{_pct(change)}%){suffix}"
+        return f"{label} flat vs prior {window} ({sign}{_pct(change)}%){suffix}", (cur_v, pri_v)
     arrow = "↑" if change > 0 else "↓"
     text = f"{label} {arrow}{_pct(change)}% vs prior {window}"
     driver = _driver(current, prior, cur_v - pri_v, span)
-    return text + (f", driven by {driver}" if driver else "") + suffix
+    return text + (f", driven by {driver}" if driver else "") + suffix, (cur_v, pri_v)
+
+
+def _from_zero(label: str, cur_v: float, window: str, suffix: str) -> str:
+    if cur_v == 0:
+        return f"{label} unchanged at 0 vs prior {window}{suffix}"
+    return f"{label} up from 0 to {_number(cur_v)} vs prior {window}{suffix}"
 
 
 NO_PRIOR = "not enough data"
@@ -153,5 +179,12 @@ NO_PRIOR = "not enough data"
 def paired_takeaways(current: tuple[Series, ...], prior: tuple[Series, ...]) -> dict[str, str]:
     """Takeaway per series name; category metrics may carry different categories per
     window, so the pairing is by name and a series with no prior twin gets ``NO_PRIOR``."""
+    return {name: text for name, (text, _) in paired_assessments(current, prior).items()}
+
+
+def paired_assessments(
+    current: tuple[Series, ...], prior: tuple[Series, ...]
+) -> dict[str, tuple[str, Compared | None]]:
+    """``assess`` per series name, paired as ``paired_takeaways`` pairs them."""
     old = {s.name: s for s in prior}
-    return {s.name: takeaway(s, old[s.name]) if s.name in old else NO_PRIOR for s in current}
+    return {s.name: assess(s, old[s.name]) if s.name in old else (NO_PRIOR, None) for s in current}

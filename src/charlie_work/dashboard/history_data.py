@@ -14,13 +14,13 @@ import sqlite3
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta, tzinfo
 from pathlib import Path
 
 from .metrics import TABS, tab_series
 from .metrics_base import MetricQuery, Series, open_dashboard_ro
-from .takeaways import paired_takeaways
+from .takeaways import Compared, paired_assessments
 
 # Range key -> (window length, bucket size): about 28-30 buckets in every range.
 RANGES: dict[str, tuple[timedelta, timedelta]] = {
@@ -83,6 +83,8 @@ class MetricData:
     metric_id: str
     series: tuple[Series, ...]
     takeaways: dict[str, str]
+    # series name -> the (current, prior) values its takeaway compares, None: no claim
+    compared: dict[str, Compared | None] = field(default_factory=dict)
 
     @property
     def headline(self) -> Series:
@@ -128,8 +130,14 @@ def load_tab(db_path: Path | None, tab: str, range_key: str, now: datetime) -> H
     finally:
         db.close()
     metrics = tuple(
-        MetricData(mid, series, paired_takeaways(series, prior[mid]))
+        MetricData(
+            mid,
+            series,
+            {name: text for name, (text, _) in got.items()},
+            {name: values for name, (_, values) in got.items()},
+        )
         for mid, series in current.items()
+        for got in (paired_assessments(series, prior[mid]),)
     )
     return HistoryView(tab, range_key, query, metrics, now)
 

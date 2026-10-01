@@ -38,6 +38,9 @@ svg text.direct.approx { font-style: italic; }
 svg .uncovered { fill: var(--lj-rule); fill-opacity: 0.55; }
 svg .cov-start { stroke: var(--lj-gray); stroke-width: 1; }
 svg .marker-rule { stroke: var(--lj-ink); stroke-width: 1; }
+/* Reference rules: the two window values the headline compares (prior dashed). */
+svg .ref { stroke: var(--lj-gray-text); stroke-width: 1; }
+svg text.ref-label { paint-order: stroke; stroke: var(--lj-card); stroke-width: 3px; stroke-linejoin: round; }
 
 svg .dist .row-label { font-weight: 600; }
 svg .iqr { fill: var(--lj-raised); stroke: var(--lj-rule); }

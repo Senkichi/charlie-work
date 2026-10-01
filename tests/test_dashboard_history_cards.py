@@ -86,3 +86,24 @@ def test_a_median_line_names_its_statistic_in_the_title() -> None:
     assert title_of(_series(**{**s.__dict__, "stat": "median"})) == (
         "Lead time, median per 1d (hours)"
     )
+
+
+def test_the_headline_comparison_is_drawn_on_the_chart() -> None:
+    import re
+
+    from charlie_work.dashboard.history_data import HistoryView, MetricData, range_query
+    from charlie_work.dashboard.pages.history_cards import render_card
+
+    q = range_query("7d", END, UTC)
+    pts = tuple((f"2026-09-{d:02d}T{h:02d}:00:00Z", 1.0) for d in range(24, 30)
+                for h in (0, 6, 12, 18))  # fmt: skip
+    head = _series(name="m", points=pts, n=24, window_start=q.start_iso, window_end=q.end_iso,
+                   bucket_seconds=int(q.bucket.total_seconds()))  # fmt: skip
+    view = HistoryView("flow", "7d", q, (), END)
+    drawn = render_card(view, MetricData("m", (head,), {"m": "M ↑300%"}, {"m": (1.0, 0.25)}), UTC)
+    rules = re.findall(r'<line class="(ref(?: prior)?)"[^>]*?(stroke-dasharray="[^"]+")?/>', drawn)
+    assert sorted(r[0] for r in rules) == ["ref", "ref prior"]
+    assert ">prior 7d avg 0.25</text>" in drawn and ">this 7d avg 1</text>" in drawn
+    assert "prior 7d avg 0.25" in re.search(r'aria-label="([^"]+)"', drawn).group(1)
+    bare = render_card(view, MetricData("m", (head,), {"m": "not comparable"}, {"m": None}), UTC)
+    assert 'class="ref' not in bare

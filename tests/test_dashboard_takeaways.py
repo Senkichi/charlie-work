@@ -161,3 +161,15 @@ def test_not_comparable_names_the_series_and_start_date() -> None:
     cur, pri = pair({"a": [5, 5, 5]}, {"a": [5, 5, 5]}, name="salvage_share")
     late = replace(cur, coverage_start="2026-10-02T05:00:00Z")  # last contributing kind began
     assert takeaway(late, pri) == "not comparable: salvage_share starts 2026-10-02"
+
+
+def test_assess_returns_the_compared_values_in_chart_units() -> None:
+    from charlie_work.dashboard.takeaways import assess
+
+    cur, pri = pair({"a": [4, 4, 4], "b": [1, 1, 1]}, {"a": [1, 1, 1], "b": [1, 1, 1]})
+    text, compared = assess(cur, pri)
+    assert text == takeaway(cur, pri) and compared == (5.0, 2.0)  # per 1d bucket
+    hourly = replace(cur, bucket_seconds=DAY // 4), replace(pri, bucket_seconds=DAY // 4)
+    assert assess(*hourly)[1] == (1.25, 0.5)  # a 6h bucket holds a quarter of a day
+    late = replace(cur, coverage_start="2026-10-03T00:00:00Z")
+    assert assess(late, pri)[1] is None  # "not comparable": nothing to draw

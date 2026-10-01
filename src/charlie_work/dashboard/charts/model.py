@@ -41,6 +41,16 @@ class Marker:
 
 
 @dataclass(frozen=True)
+class Reference:
+    """A horizontal reference rule at ``value`` (y units), e.g. the prior window's average:
+    the comparison a headline names, drawn on the same axis (Franconeri rule 4)."""
+
+    value: float
+    label: str
+    prior: bool = False  # the prior window's value (dashed) vs this window's (solid)
+
+
+@dataclass(frozen=True)
 class Size:
     width: float = 640.0
     height: float = 220.0
@@ -75,4 +85,5 @@ class LineSpec:
     unit: str = ""
     takeaway: str | None = None
     domain: tuple[datetime, datetime] | None = None
+    references: tuple[Reference, ...] = ()
     size: Size = field(default_factory=Size)
