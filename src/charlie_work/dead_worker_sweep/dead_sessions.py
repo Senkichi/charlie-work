@@ -403,6 +403,9 @@ def _reap_dead(
             state = state_mod.load_state(state_file)
             state = write_gate.append_event(
                 state,
+                # event-consumer: audit-only -- operator-visible forensic record of a
+                # worker that exited 0 with uncommitted work (issue #2096); the
+                # reap and escalation decisions key off ``failure_kind``, not this event
                 BACKGROUND_EXIT_FAILURE_KIND,
                 {
                     "issue_number": w.issue_number,
