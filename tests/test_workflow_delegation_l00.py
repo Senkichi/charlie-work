@@ -53,7 +53,10 @@ _WORKFLOW_PY = _REPO_ROOT / "src" / "charlie_work" / "workflow.py"
 # class attributes, so this total -- lexical defs remaining in workflow.py PLUS
 # installed delegates -- is conserved across the whole campaign. A single
 # documented constant, never a member-name list (CLAUDE.md rule 9).
-_PRE_CAMPAIGN_MEMBER_SURFACE = 133
+# 133 -> 132: ``_merge_not_ready_result`` (a moved delegate used only by the merge
+# path) was absorbed into merge_path.render.render_train_not_head and deleted --
+# a legitimate removal of a member, not a drift.
+_PRE_CAMPAIGN_MEMBER_SURFACE = 132
 
 # Members legitimately ADDED to the OrchestratorApp surface after the campaign
 # baseline was pinned. The conservation invariant covers bodies MOVED out of
