@@ -8,6 +8,7 @@ from typing import Any
 from unittest.mock import patch
 
 import pytest
+from _run_captured_fakes import monkeypatch_run_captured
 
 from charlie_work.process_utils import (
     is_pid_alive,
@@ -307,6 +308,7 @@ def test_kill_process_tree_self_pid_exempt(monkeypatch: Any) -> None:
         return subprocess.CompletedProcess(cmd, returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(subprocess, "run", fake_subprocess_run)
+    monkeypatch_run_captured(monkeypatch, fake_subprocess_run)
 
     def fake_killpg(pgid: int, sig: int) -> None:
         kill_attempts.append((pgid, sig))
