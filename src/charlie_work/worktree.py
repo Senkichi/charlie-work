@@ -2075,7 +2075,23 @@ def _capture_worktree_work_to_rescue_ref(
     ref_name = f"{RESCUE_REF_PREFIX}/{issue_part}-{timestamp}"
 
     commit_result = run_captured(
-        ["git", "commit-tree", tree_sha, "-p", head_sha, "-m", f"rescue: {issue_part}"],
+        [
+            "git",
+            # ``commit-tree`` refuses (exit 128) without a committer identity,
+            # and a host with no global ``user.name``/``user.email`` (CI, a
+            # fresh account) has none.  ``-c`` supplies one for this call only
+            # and never writes to any git config.
+            "-c",
+            "user.name=charlie-work rescue",
+            "-c",
+            "user.email=charlie-work-rescue@localhost",
+            "commit-tree",
+            tree_sha,
+            "-p",
+            head_sha,
+            "-m",
+            f"rescue: {issue_part}",
+        ],
         cwd=worktree_path,
         timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
     )
@@ -2083,7 +2099,10 @@ def _capture_worktree_work_to_rescue_ref(
         return RescueCapture(
             ref_name=None,
             commit_sha=None,
-            error=f"capture failed at commit-tree: {commit_result.error or commit_result.stderr}",
+            error="capture failed at commit-tree: "
+            + "; ".join(
+                part.strip() for part in (commit_result.error, commit_result.stderr) if part
+            ),
         )
     commit_sha = commit_result.stdout.strip()
 
