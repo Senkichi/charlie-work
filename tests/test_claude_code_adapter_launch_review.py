@@ -10,7 +10,7 @@ Track 1) -- bodies are verbatim relocations; shared helpers live in
 from __future__ import annotations
 
 import subprocess
-import time
+import threading
 from pathlib import Path
 import pytest
 
@@ -500,7 +500,7 @@ def test_launch_claude_worker_review_prompt_write_failure_tears_down_checkout(
 
 
 def test_launch_claude_worker_review_writes_terminal_status_record(
-    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """A review=True launch must start the terminal-status watcher so a
     ``terminal.json`` appears at
@@ -525,6 +525,22 @@ def test_launch_claude_worker_review_writes_terminal_status_record(
     sessions_dir = tmp_path / "reviews"
     head_sha = _repo_head_sha(repo_root)
 
+    # Capture the watcher thread the launch spawns so the test can wait on
+    # the signal that produces the record -- the watcher thread exits only
+    # after write_worker_terminal_status returns -- instead of polling the
+    # file on a fixed wall-clock deadline. The old 10s deadline flaked under
+    # `-n auto` load: the watcher's own 2s poll interval plus thread and
+    # process scheduling delays can exceed it (issue #2238).
+    watcher_threads: list[threading.Thread] = []
+    real_start_watcher = claude_code.start_terminal_status_watcher
+
+    def _capturing_start_watcher(*args, **kwargs):
+        thread = real_start_watcher(*args, **kwargs)
+        watcher_threads.append(thread)
+        return thread
+
+    monkeypatch.setattr(claude_code, "start_terminal_status_watcher", _capturing_start_watcher)
+
     record = launch_claude_worker(
         1354,
         "agent/issue-1354-fix",
@@ -538,15 +554,22 @@ def test_launch_claude_worker_review_writes_terminal_status_record(
 
     assert record.ok, record.error
     assert record.pid is not None
+    assert len(watcher_threads) == 1, (
+        "review=True launch did not start exactly one terminal-status watcher "
+        "-- the `if not review:` guard may have been reintroduced"
+    )
+
+    watcher = watcher_threads[0]
+    # join() wakes the instant the watcher exits; the 60s argument is only a
+    # hang backstop. On the happy path the fake script exits near-instantly
+    # and the watcher writes the record within one 2s poll interval.
+    watcher.join(timeout=60.0)
+    assert not watcher.is_alive(), "terminal-status watcher thread did not finish within 60s"
 
     expected_path = worker_terminal_status_path(sessions_dir, 1354, "claude")
-    # The watcher polls every _TERMINAL_STATUS_POLL_INTERVAL_SECONDS (2s); the
-    # fake script exits near-instantly, so the record should appear within a
-    # few poll intervals. Poll rather than sleep a fixed duration so the test
-    # is fast on a healthy path and only waits as long as needed.
-    deadline = time.monotonic() + 10.0
-    while time.monotonic() < deadline and not expected_path.exists():
-        time.sleep(0.1)
+    # The record write happens inside the watcher thread before it exits, so
+    # a completed join means the write already ran. A missing file here is a
+    # swallowed write failure (a real bug), not a timing flake.
     assert expected_path.exists(), (
         f"review=True launch did not write a terminal-status record at "
         f"{expected_path} -- the start_terminal_status_watcher guard "
