@@ -46,7 +46,7 @@ from .config import (
     ReviewerRoleConfig,
     _DEFAULT_CLAUDE_MODEL,
 )
-from .env_sanitize import resolve_pytest_cap, resolve_uv_no_sync, sanitize_env
+from .env_sanitize import build_worker_env, resolve_pytest_cap, resolve_uv_no_sync, sanitize_env
 from .post_mortem import merge_attempt_snapshot
 from .state import _canonical_started_at, utc_now
 from .subprocess_runner import RunResult, resolve_cli_binary, run_captured
@@ -1232,10 +1232,9 @@ def launch_claude_worker(
             provider=provider,
         )
         return _write_record(sessions_dir, record)
-    worker_env = {
-        **sanitized_env,
-        **{str(k): str(v) for k, v in (env or {}).items()},
-    }
+    # Issue #2096: harness defaults (background tasks off) sit between the
+    # sanitized base and the operator `worker_env`.
+    worker_env = build_worker_env(sanitized_env, env)
     # Issue #646: resolve what sanitize_env()+worker_env actually settled on,
     # purely for the launch-time diagnostic log below (does not affect
     # worker_env itself, which already carries the real values).

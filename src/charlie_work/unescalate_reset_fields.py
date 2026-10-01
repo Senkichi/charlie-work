@@ -34,6 +34,8 @@ UNESCALATE_PR_RESET_FIELDS = (
     # this keeps the pair consistent with the other _last_head baselines).
     "review_dispatch_attempt_last_head",
     "review_log_unreadable_streak",
+    # Issue #1808: provider api-error streak is a re-arm-scoped counter.
+    "review_api_error_streak",
     # Issue #1439: turn-limit miss streak must not survive a re-arm, or
     # the cap-aware backstop would re-escalate instantly on the next
     # turn-limit death.
@@ -61,6 +63,7 @@ UNESCALATE_PR_RESET_FIELDS = (
     # failure without a single fresh rework attempt.
     "local_merge_conflict_rework_attempts",
     "local_suite_failed_rework_attempts",
+    "local_suite_infra_relaunch_count",
     "local_merge_rework_reason",
     "no_op_rework_attempts",
     "no_op_rework_attempts_last_head",
@@ -309,6 +312,9 @@ REWORK_BUDGET_RESET_BY_ESCALATION_REASON: dict[str, tuple[tuple[str, ...], tuple
         ),
         ("local_merge_rework_reason",),
     ),
+    # Issue #2127: the gate's infra-relaunch bound (timeout / summary-less
+    # death); an unreset count would re-escalate on the very next infra blip.
+    "local_merge_gate_infra_exhausted": (("local_suite_infra_relaunch_count",), ()),
     # Issue #1683: the review-dispatch lanes were missing from this map
     # entirely, so every automated clear of either reason was inert -- the
     # gating counter stayed at cap, the next dispatch pass re-escalated

@@ -35,6 +35,14 @@ from charlie_work.state import load_state, load_state_locked, save_state, state_
 from charlie_work.workflow import OrchestratorApp
 
 
+# A failing suite that prints a pytest terminal summary. The gate (#2127) treats a
+# summary-less non-zero exit as an infra death, and a bare ``python -m pytest``
+# is not reliable here (the scratch worktree's ``python`` may lack pytest).
+_FAILING_SUITE = (
+    "python -c \"import sys; print('=== 1 failed, 2 passed in 0.12s ==='); sys.exit(1)\""
+)
+
+
 def _git(repo_root: Path, *args: str) -> subprocess.CompletedProcess[str]:
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     result = subprocess.run(["git", *args], cwd=repo_root, capture_output=True, text=True, env=env)
@@ -459,7 +467,7 @@ class TestLocalMergeReworkCaps:
         head = _make_branch(
             lane_repo, "agent/issue-7-x", "test_bad.py", "def test_x(): assert False\n"
         )
-        config = _lane_config(lane_repo, issues_dir, dispatch={"test_command": "python -m pytest"})
+        config = _lane_config(lane_repo, issues_dir, dispatch={"test_command": _FAILING_SUITE})
         app = _lane_app(lane_repo, issues_dir, config=config)
         _adopt_and_approve(app, issues_dir, "agent/issue-7-x", head)
 

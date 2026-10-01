@@ -1484,7 +1484,7 @@ def test_rework_reuse_refuses_non_ff_with_dirty_worktree(
     _git(remote_repo, "checkout", "main")
 
     _force_capture_failure(monkeypatch)
-    with pytest.raises(WorktreeUnsafeError, match="worktree has uncommitted modifications"):
+    with pytest.raises(WorktreeUnsafeError, match="worktree has uncommitted source work"):
         create_worktree(
             repo_root,
             branch_name,
@@ -1633,7 +1633,7 @@ def test_rework_reclaim_refuses_dirty_detached_worktree(
     (info1.path / "dirty.txt").write_text("uncommitted worker edit\n", encoding="utf-8")
 
     _force_capture_failure(monkeypatch)
-    with pytest.raises(WorktreeUnsafeError, match="worktree has uncommitted modifications"):
+    with pytest.raises(WorktreeUnsafeError, match="worktree has uncommitted source work"):
         create_worktree(repo_root, branch_name, rework=True)
 
     assert info1.path.exists()
@@ -2296,7 +2296,7 @@ def test_fresh_dispatch_dirty_worktree_refuses_to_reset(
 
     # Fresh dispatch must refuse to reset the dirty worktree.
     _force_capture_failure(monkeypatch)
-    with pytest.raises(WorktreeUnsafeError, match="worktree has uncommitted modifications"):
+    with pytest.raises(WorktreeUnsafeError, match="worktree has uncommitted source work"):
         create_worktree(repo_root, branch_name, base_ref="HEAD")
 
     # The original worktree and the dirty file must remain intact.
@@ -2355,7 +2355,7 @@ def test_fresh_dispatch_still_refuses_worker_authored_dirtiness(
     (info1.path / "worker-change.txt").write_text("worker work\n", encoding="utf-8")
 
     _force_capture_failure(monkeypatch)
-    with pytest.raises(WorktreeUnsafeError, match="worktree has uncommitted modifications"):
+    with pytest.raises(WorktreeUnsafeError, match="worktree has uncommitted source work"):
         create_worktree(repo_root, branch_name, base_ref="HEAD", config=config)
 
     assert info1.path.exists()
@@ -2565,7 +2565,7 @@ def test_fresh_dispatch_dirty_worktree_with_broken_remote_refuses_to_reset(
 
     # Fresh dispatch should refuse to reset the dirty worktree without trying to push.
     _force_capture_failure(monkeypatch)
-    with pytest.raises(WorktreeUnsafeError, match="worktree has uncommitted modifications"):
+    with pytest.raises(WorktreeUnsafeError, match="worktree has uncommitted source work"):
         create_worktree(repo_root, branch_name, base_ref="HEAD")
 
     # Verify the worktree still exists (not removed)
@@ -7799,7 +7799,7 @@ def test_worktree_unsafe_still_escalates_when_writer_marker_is_dead(
     )
     _force_capture_failure(monkeypatch)
 
-    with pytest.raises(WorktreeUnsafeError, match="worktree has uncommitted modifications"):
+    with pytest.raises(WorktreeUnsafeError, match="worktree has uncommitted source work"):
         create_worktree(
             repo,
             branch_name,
@@ -7979,7 +7979,7 @@ def test_rescue_capture_failure_still_raises_worktree_unsafe(
         ),
     )
 
-    with pytest.raises(WorktreeUnsafeError, match="worktree has uncommitted modifications"):
+    with pytest.raises(WorktreeUnsafeError, match="worktree has uncommitted source work"):
         create_worktree(repo, branch_name, base_ref="origin/main", issue_number=849)
 
     # No reset occurred — the dirty content survives untouched.
