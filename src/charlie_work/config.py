@@ -1408,10 +1408,8 @@ class RuntimeConfig:
     # REST-GET/graphql read shapes, behind the same `GitHub.run()` seam.
     # Ships enabled by default (owner directive: no default-off knobs) --
     # "gh" is a kill-switch value for reverting a single repo to the
-    # subprocess-only path, not an opt-in. `GitHub` instances constructed
-    # without a `RuntimeConfig` at all (tests, legacy direct callers) do NOT
-    # get this default -- see `github_capabilities/http_transport.py`'s
-    # `_DEFAULT_GH_TRANSPORT` for why that fallback stays "gh".
+    # subprocess-only path, not an opt-in. A `GitHub` constructed without a
+    # `RuntimeConfig` also uses HTTP (ADR-0006).
     gh_transport: Annotated[str, Typed, OneOf("http", "gh")] = "http"
     # cw#1273: outer retry for `gh pr create` specifically, layered on top of
     # GitHub.run()'s inner pre-connection-only retry above. The inner retry's

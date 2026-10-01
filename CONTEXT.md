@@ -207,6 +207,14 @@ _Avoid_: Log line
 **Correlation ID**:
 The identifier that ties together every event from one pass.
 
+**Request**:
+One GitHub operation as data (a REST call, a GraphQL document or a gh CLI command), independent of how it is delivered. A request goes into the guarded transport and an outcome (a response or a typed failure) comes out; the transport owns retry, the circuit breaker, dry-run and token handling.
+_Avoid_: gh call, HTTP plan
+
+**Transport fallback**:
+Re-sending a failed request through the gh CLI for that one call, when the failure is a connect error, an unavailable token or an adapter defect. The `gh_transport: gh` kill switch sends every request that way.
+_Avoid_: gh call, HTTP plan
+
 ### Owned by ci_fleet (defined there, not here)
 
 **Runner allocation**:

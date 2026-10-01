@@ -781,6 +781,13 @@ def _local_gate_launch(
     gate_head = branch_head_sha(self.repo_root, branch)
     gate_base = resolve_ref_sha(self.repo_root, base_ref)
     paths = local_suite_runner.suite_gate_paths(self.paths.dispatches, pr_number)
+
+    reused = self._local_gate_try_reuse(
+        pr_key, record, entry, branch, base_ref, decision, argv, reason, gate_head, gate_base
+    )
+    if reused is not None:
+        return reused
+
     launch = local_suite_runner.launch_suite_gate(
         worktree_path,
         argv,

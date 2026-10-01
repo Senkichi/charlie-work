@@ -7,13 +7,21 @@ Track-1 wave 7/8).
 from __future__ import annotations
 
 import json
-import subprocess
 from pathlib import Path
 from typing import Any
 
 from _fakes_github import FakeGitHub
-from charlie_work import github as github_module
+from _fake_transport import (
+    FakeAdapter,
+    connection_page,
+    graphql_failure,
+    graphql_ok,
+    graphql_variables,
+    make_github,
+    ok,
+)
 from charlie_work.config import DevinConfig, OrchestratorConfig, WatchdogConfig
+from charlie_work.github_transport import GraphQLRequest, Request, Response, RestRequest
 from charlie_work.paths import runtime_paths
 from charlie_work.workflow import OrchestratorApp
 from _dispatch_fixtures import _stub_real_activity_probe_for_stalled_tests  # noqa: F401
@@ -109,112 +117,72 @@ def test_status_prefetch_uses_batched_graphql_for_blocker_data(
     one `gh api .../dependencies/blocked_by` per ready issue plus one `gh issue
     view` per unique blocker. That is replaced by a single batched GraphQL
     query per repo that fetches both the native blockedBy relationships and the
-    blockers' open/closed states in one subprocess.
+    blockers' open/closed states in one request.
 
     This uses a real GitHub (not the hand-rolled FakeGitHub used elsewhere in
-    this file) with subprocess.run mocked, so every `gh` invocation status()
+    this file) over a scripted fake transport, so every request status()
     actually makes is visible and countable.
 
     Two ready issues (887, 888) both declare the same open blocker (886) via
     GitHub-native dependencies. Before this fix: 2 dependency-REST calls x2
     consumers = 4, plus 886's issue-view fetched twice per consumer = 4. After
     the batching fix: one GraphQL query fetches dependencies and blocker states
-    for the whole set; no further `gh` calls are needed.
+    for the whole set; no further requests are needed.
     """
-    calls: list[list[str]] = []
 
     def make_issue(number: int) -> dict[str, Any]:
+        # A GraphQL ``Issue`` node (the shape ``gh issue list --json`` is built from).
         return {
             "number": number,
             "title": f"Issue {number}",
             "url": f"https://example.test/issues/{number}",
             "body": "",
-            "labels": [{"name": "automated-ready"}],
-            "author": {"login": "tester"},
+            "labels": {"nodes": [{"name": "automated-ready"}]},
+            "author": {"__typename": "User", "login": "tester"},
             "createdAt": "2026-01-01T00:00:00Z",
             "updatedAt": "2026-01-01T00:00:00Z",
             "state": "OPEN",
         }
 
     ready_issues = [make_issue(887), make_issue(888)]
+    blocked_by = {
+        "nodes": [{"number": 886, "state": "OPEN"}],
+        "pageInfo": {"hasNextPage": False},
+    }
 
-    def fake_run(command, **kwargs):
-        args = command[1:]  # drop leading "gh"
-        if args and args[-2:] == ["--json", "nonexistent"]:
-            # OrchestratorApp.__init__'s validate_field_lists() startup probe
-            all_field_list_constants = [
-                "ISSUE_LIST_FIELDS",
-                "ISSUE_VIEW_FIELDS",
-                "PR_LIST_FIELDS",
-                "MERGED_PR_LIST_FIELDS",
-                "PR_VIEW_FIELDS",
-                "PR_CHECKS_FIELDS",
-                "LABEL_LIST_FIELDS",
-                "RECONCILE_PR_FIELDS",
-                "RECONCILE_ISSUE_FIELDS",
-                "RUN_LIST_FIELDS",
-            ]
-            available_fields = sorted(
-                {
-                    field
-                    for name in all_field_list_constants
-                    for field in getattr(github_module, name).split(",")
-                }
-            )
-            stderr = (
-                'Unknown JSON field: "nonexistent"\nAvailable fields:\n  '
-                + "\n  ".join(available_fields)
-                + "\n"
-            )
-            return subprocess.CompletedProcess(
-                args=command, returncode=1, stdout="", stderr=stderr
-            )
-
-        calls.append(command)
-        if args[:2] == ["issue", "list"]:
-            payload = json.dumps(ready_issues)
-        elif args[:2] == ["pr", "list"]:
-            payload = json.dumps([])
-        elif args[0] == "api" and len(args) >= 2 and "pulls?state=closed" in args[1]:
+    def handler(request: Request) -> Response:
+        if isinstance(request, RestRequest):
             # Issue #1337: status() now calls merged_pr_list() to compute the
             # merged-PR coverage exclusion set for the reachability classifier.
             # No merged PRs in this test -> empty page breaks pagination.
-            payload = json.dumps([])
-        elif args[0] == "api" and len(args) >= 2 and args[1] == "graphql":
-            payload = json.dumps(
+            # (The startup field-list probes also list labels and workflow runs.)
+            if request.route.endswith("/actions/runs"):
+                return ok({"workflow_runs": []})
+            assert request.route.endswith(("/pulls", "/labels")), request
+            return ok([])
+        document = request.document
+        if "blockedBy" in document:
+            return graphql_ok(
                 {
-                    "data": {
-                        "repository": {
-                            "i_887": {
-                                "number": 887,
-                                "blockedBy": {
-                                    "nodes": [{"number": 886, "state": "OPEN"}],
-                                    "pageInfo": {"hasNextPage": False},
-                                },
-                            },
-                            "i_888": {
-                                "number": 888,
-                                "blockedBy": {
-                                    "nodes": [{"number": 886, "state": "OPEN"}],
-                                    "pageInfo": {"hasNextPage": False},
-                                },
-                            },
-                        }
+                    "repository": {
+                        "i_887": {"number": 887, "blockedBy": blocked_by},
+                        "i_888": {"number": 888, "blockedBy": blocked_by},
                     }
                 }
             )
-        else:
-            raise AssertionError(f"Unexpected gh command in status(): {command}")
-        return subprocess.CompletedProcess(args=command, returncode=0, stdout=payload, stderr="")
+        if "issues(" in document:
+            return connection_page("issues", ready_issues)
+        if "pullRequests(" in document:
+            return connection_page("pullRequests", [])
+        # OrchestratorApp.__init__'s validate_field_lists() startup probe: the
+        # schema accepts the selection and the probed object does not exist.
+        return graphql_failure("Could not resolve to a node")
 
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+    transport = FakeAdapter("http", handler=handler)
 
     config = OrchestratorConfig(devin=DevinConfig())
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
-    gh = github_module.GitHub(repo_root=tmp_path)
-    # Avoid a real `git remote` call; the owner/name are only used for the
-    # GraphQL variables, and the mocked response is the same either way.
-    gh._list_cache[("_repo_owner_name",)] = ("owner", "repo")
+    gh, http, _ = make_github(tmp_path, http=transport)
     app = OrchestratorApp(tmp_path, paths, config, gh)
 
     result = app.status()
@@ -227,15 +195,25 @@ def test_status_prefetch_uses_batched_graphql_for_blocker_data(
     assert summaries[887] == {"declared": [886], "open": [886]}
     assert summaries[888] == {"declared": [886], "open": [886]}
 
-    graphql_calls = [c for c in calls if c[1:3] == ["api", "graphql"]]
-    rest_dependency_calls = [
-        c for c in calls if c[1] == "api" and "dependencies/blocked_by" in c[2]
+    requests = http.api_requests
+    dependency_queries = [
+        r for r in requests if isinstance(r, GraphQLRequest) and "blockedBy" in r.document
     ]
-    issue_view_calls = [c for c in calls if c[1:3] == ["issue", "view"]]
+    rest_dependency_calls = [
+        r for r in requests if isinstance(r, RestRequest) and "dependencies/blocked_by" in r.route
+    ]
+    # (The startup field-list probe views issue number 0; any other view is a fetch.)
+    issue_view_calls = [
+        r
+        for r in requests
+        if isinstance(r, GraphQLRequest)
+        and "issue(number:$number)" in r.document.replace(" ", "")
+        and graphql_variables(r)["number"] != 0
+    ]
 
     # The whole dependency + blocker-state lookup is now one batched GraphQL
     # query for the two ready issues, not N per-issue REST calls + M issue views.
-    assert len(graphql_calls) == 1
+    assert len(dependency_queries) == 1
     assert len(rest_dependency_calls) == 0
     assert len(issue_view_calls) == 0
 

@@ -6,11 +6,9 @@ Track-1 wave 8/8).
 
 from __future__ import annotations
 
-import json
-import subprocess
 from pathlib import Path
 from _fakes_github import FakeGitHub
-from charlie_work import github as github_module
+from _fake_transport import FakeAdapter, make_github, ok, sent
 
 
 def test_detect_prose_only_dependencies_do_not_dispatch_before() -> None:
@@ -440,37 +438,31 @@ def test_get_github_issue_dependencies_caches_successful_result_per_pass(
 
     Uses the real GitHub (not FakeGitHub, whose `run()` has its own
     dependencies_response stand-in and doesn't exercise the production
-    _list_cache path) with subprocess.run mocked.
+    _list_cache path) with a scripted fake transport.
     """
     from charlie_work.github import get_github_issue_dependencies
 
-    calls: list[str] = []
-
-    def fake_run(command, **kwargs):
-        # command: ["gh", "api", "repos/{owner}/{repo}/issues/<N>/dependencies/blocked_by"]
-        calls.append(command[2])
-        payload = json.dumps([{"number": 200}])
-        return subprocess.CompletedProcess(args=command, returncode=0, stdout=payload, stderr="")
-
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
-    gh = github_module.GitHub(repo_root=tmp_path)
+    # Every dependencies read is answered with the same blocker list.
+    adapter = FakeAdapter("http", [ok([{"number": 200}])])
+    gh, http, _ = make_github(tmp_path, http=adapter)
 
     first = get_github_issue_dependencies(gh, 100)
     second = get_github_issue_dependencies(gh, 100)
 
     assert first == [200]
     assert second == [200]
-    assert len(calls) == 1  # second call is a pure cache hit, no live fetch
+    assert len(http.api_requests) == 1  # second call is a pure cache hit, no live fetch
+    assert sent(http) == [("GET", "repos/{owner}/{repo}/issues/100/dependencies/blocked_by", None)]
 
     # A different issue number is a distinct cache key -- costs a fresh read.
     get_github_issue_dependencies(gh, 101)
-    assert len(calls) == 2
+    assert len(http.api_requests) == 2
 
     # invalidate_list_cache() (called once per orchestrator pass) must force
     # a fresh read on the next call for the same issue number.
     gh.invalidate_list_cache()
     get_github_issue_dependencies(gh, 100)
-    assert len(calls) == 3
+    assert len(http.api_requests) == 3
 
 
 def test_github_dependencies_unexpected_type_fail_open(tmp_path: Path) -> None:

@@ -1,6 +1,6 @@
 """``--dry-run`` must not mutate local state.
 
-``dry_run`` was introduced to suppress mutating ``gh`` calls (``github._is_mutating``)
+``dry_run`` was introduced to suppress mutating ``gh`` calls (the guarded transport's dry-run gate)
 and nothing else, so several paths kept writing local state underneath it. The worst
 was ``self_deploy``, which fast-forward-pulls the *live deployed checkout* and may
 ``uv sync`` its venv — and because a HEAD move terminates a running ``fleet supervise``

@@ -8,8 +8,14 @@ Cluster B of the design doc's capability segmentation (Section 3.1):
 from __future__ import annotations
 
 from typing import Any, Protocol, runtime_checkable
+from urllib.parse import quote
 
+from ..github_transport.outcome import Response
+from ..github_transport.pagination import paginate_rest
+from ..github_transport.request import RestRequest
 from ._base import CapabilityCollaborator
+from ._outcome import expect_json, is_success
+from ._send import send
 
 # Moved from ``github.py`` alongside ``label_list`` (Track 2, issue #1587;
 # design doc Section 5, L03). ``label_list``'s body is byte-identical to its
@@ -54,11 +60,37 @@ class Labels(CapabilityCollaborator):
     owner's ``_run_bool``/``run`` (design doc Section 3.3).
     """
 
+    def _add_label(self, number: int, label: str) -> bool:
+        # A PR is an issue: one endpoint labels both. Never raises; dry-run is
+        # a typed success from the transport.
+        request = RestRequest.of(
+            "POST", f"repos/{{owner}}/{{repo}}/issues/{number}/labels", body={"labels": [label]}
+        )
+        return is_success(send(self, request))
+
+    def _remove_label(self, number: int, label: str) -> bool:
+        """Remove ``label``; an absent label counts as removed (idempotent).
+
+        ``gh ... --remove-label`` of a label the object does not carry exits 0;
+        the REST DELETE answers 404 "Label does not exist", which is therefore
+        success here. Any other 404 (missing issue, invisible repo) is a failure.
+        """
+        request = RestRequest.of(
+            "DELETE",
+            f"repos/{{owner}}/{{repo}}/issues/{number}/labels/{quote(label, safe='')}",
+        )
+        outcome = send(self, request)
+        return is_success(outcome) or (
+            isinstance(outcome, Response)
+            and outcome.status == 404
+            and "label does not exist" in outcome.body.lower()
+        )
+
     def add_issue_label(self, number: int, label: str) -> bool:
-        return self._run_bool(["issue", "edit", str(number), "--add-label", label])
+        return self._add_label(number, label)
 
     def remove_issue_label(self, number: int, label: str) -> bool:
-        return self._run_bool(["issue", "edit", str(number), "--remove-label", label])
+        return self._remove_label(number, label)
 
     def add_pr_label(self, number: int, label: str) -> bool:
         """Add a label to a PR (PR-scoped, not the linked issue).
@@ -66,31 +98,46 @@ class Labels(CapabilityCollaborator):
         Used for the Aviator MergeQueue handoff (task #10): the trigger label
         must land on the PR itself, and issue_number may be None for
         cross-repository PRs. Idempotent (gh's addLabels is a no-op if the
-        label is already present) and never raises — see ``_run_bool``.
+        label is already present) and never raises.
         """
-        return self._run_bool(["pr", "edit", str(number), "--add-label", label])
+        return self._add_label(number, label)
 
     def remove_pr_label(self, number: int, label: str) -> bool:
         """Remove a label from a PR (PR-scoped, not the linked issue).
 
         Mirrors ``add_pr_label``. Used to clear Aviator's ``blocked`` label
         once it has gone stale (reconcile.py's ``aviator_stale_blocked`` drift
-        kind). Idempotent and never raises — see ``_run_bool``.
+        kind). Idempotent and never raises.
         """
-        return self._run_bool(["pr", "edit", str(number), "--remove-label", label])
+        return self._remove_label(number, label)
 
     def label_list(self) -> list[dict[str, Any]]:
-        result = self.run(
-            ["label", "list", "--limit", "200", "--json", LABEL_LIST_FIELDS], json_output=True
+        # REST ``GET labels`` over every page (B12: quota moves from GraphQL to
+        # REST core); each item already carries ``name``. A failed or unreadable
+        # read raises (issue #756): "could not read GitHub" is not "no labels".
+        outcome = paginate_rest(
+            self._transport_v2,
+            RestRequest.of("GET", "repos/{owner}/{repo}/labels", query={"per_page": 100}),
         )
-        return result if isinstance(result, list) else []
+        items = expect_json(outcome, command="GET repos/{owner}/{repo}/labels")
+        return (
+            [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
+        )
 
     def label_create(self, label: str, color: str, description: str) -> None:
-        # --force makes this update-or-create: bootstrap must be idempotent, and
-        # without it `gh label create` errors on a pre-existing label and the
-        # colour/description drift silently. `--force` is a mutation but stays
-        # read-only-safe under dry-run via `_is_mutating`.
-        self.run(
-            ["label", "create", label, "--force", "--color", color, "--description", description],
-            allow_failure=True,
+        # Update-or-create: bootstrap must be idempotent, and a plain create
+        # errors on a pre-existing label so colour/description drift silently.
+        # POST first; a 422 means the label exists, so PATCH it (B11: two calls
+        # for an existing label). Errors are values; the result is not used.
+        body = {"color": color.lstrip("#"), "description": description}
+        created = send(
+            self,
+            RestRequest.of("POST", "repos/{owner}/{repo}/labels", body={"name": label, **body}),
         )
+        if isinstance(created, Response) and created.status == 422:
+            send(
+                self,
+                RestRequest.of(
+                    "PATCH", f"repos/{{owner}}/{{repo}}/labels/{quote(label, safe='')}", body=body
+                ),
+            )

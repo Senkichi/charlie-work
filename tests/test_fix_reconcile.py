@@ -639,6 +639,10 @@ def test_valid_issue_statuses_covers_every_assigned_status_literal() -> None:
         "conflict",
         "deferred",
         "error",
+        # github_transport.json_read._RUN_FIELDS maps gh's ``status`` field name
+        # to the REST workflow-run key of the same name: a field-name mapping,
+        # not an assigned workflow status.
+        "status",
     }
 
     unclassified = found - VALID_ISSUE_STATUSES - pr_or_event_only

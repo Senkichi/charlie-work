@@ -6,37 +6,34 @@ Track-1 wave 8/8).
 
 from __future__ import annotations
 
-import json
 import logging
-import subprocess
 from pathlib import Path
 import pytest
+from _fake_transport import (
+    FakeAdapter,
+    graphql_failure,
+    graphql_ok,
+    graphql_variables,
+    make_github,
+    ok,
+    paged_connection,
+    sent,
+)
 from charlie_work import github as github_module
 from charlie_work.config import RuntimeConfig
 
 
-def test_github_merged_pr_list_uses_rest_pagination(monkeypatch, tmp_path: Path) -> None:
+def test_github_merged_pr_list_uses_rest_pagination(tmp_path: Path) -> None:
     """merged_pr_list() now uses the REST pulls endpoint instead of the
     GraphQL-backed `gh pr list --state merged`, avoiding expensive field sets
     such as `statusCheckRollup` (issue #361).
     """
-    captured_args: list[list[str]] = []
-
-    def fake_run(cmd, *args, **kwargs):
-        captured_args.append(cmd)
-        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="[]", stderr="")
-
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
-
-    gh = github_module.GitHub(tmp_path)
+    gh, http, gh_adapter = make_github(tmp_path, http=FakeAdapter("http", [ok([])]))
     gh.merged_pr_list()
 
-    assert len(captured_args) == 1
-    args = captured_args[0]
-    assert args[:2] == ["gh", "api"]
-    assert "pulls" in args[2]
-    assert "state=closed" in args[2]
-    assert not any(c[:2] == ["gh", "pr"] and "merged" in c for c in captured_args)
+    assert sent(http) == [("GET", "repos/{owner}/{repo}/pulls", None)]
+    assert dict(http.api_requests[0].query)["state"] == "closed"  # type: ignore[union-attr]
+    assert gh_adapter.api_requests == []
 
 
 def test_github_merged_pr_list_retries_on_transient_gateway_error(
@@ -46,29 +43,15 @@ def test_github_merged_pr_list_retries_on_transient_gateway_error(
     in-pass (bounded) instead of immediately failing the whole fleet pass for
     that repo (issue #361). Succeeds on the 2nd attempt here.
     """
-    call_count = 0
     sleeps: list[float] = []
-
-    def fake_run(cmd, *args, **kwargs):
-        nonlocal call_count
-        call_count += 1
-        if call_count == 1:
-            return subprocess.CompletedProcess(
-                args=cmd,
-                returncode=1,
-                stdout="",
-                stderr="HTTP 502: 502 Bad Gateway (https://api.github.com/graphql)",
-            )
-        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="[]", stderr="")
-
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
     monkeypatch.setattr(github_module.time, "sleep", lambda seconds: sleeps.append(seconds))
+    http = FakeAdapter("http", [ok("Bad Gateway", status=502), ok([])])
+    gh, http, _ = make_github(tmp_path, http=http)
 
-    gh = github_module.GitHub(tmp_path)
     result = gh.merged_pr_list()
 
     assert result == []
-    assert call_count == 2
+    assert len(http.api_requests) == 2
     assert len(sleeps) == 1
 
 
@@ -77,32 +60,14 @@ def test_github_merged_pr_list_gives_up_after_max_retries(monkeypatch, tmp_path:
     forever — so the per-repo fleet-pass boundary can still catch it and move
     on to the next repo.
     """
-    call_count = 0
-
-    def fake_run(cmd, *args, **kwargs):
-        nonlocal call_count
-        call_count += 1
-        return subprocess.CompletedProcess(
-            args=cmd,
-            returncode=1,
-            stdout="",
-            stderr="HTTP 502: 502 Bad Gateway (https://api.github.com/graphql)",
-        )
-
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
     monkeypatch.setattr(github_module.time, "sleep", lambda seconds: None)
+    http = FakeAdapter("http", [ok("Bad Gateway", status=502)])
+    gh, http, _ = make_github(tmp_path, http=http, runtime=RuntimeConfig(gh_max_retries=2))
 
-    # gh_transport="gh": `merged_pr_list`'s REST-GET pagination shape is an
-    # HTTP-transport candidate (issue #1834), and RuntimeConfig's
-    # gh_transport field defaults to "http" -- pinning "gh" here keeps this
-    # test exercising the gh-subprocess retry path it was written to test
-    # via `fake_run` (the HTTP path has its own coverage in
-    # tests/test_http_transport.py).
-    gh = github_module.GitHub(tmp_path, runtime=RuntimeConfig(gh_max_retries=2, gh_transport="gh"))
     with pytest.raises(github_module.GitHubError):
         gh.merged_pr_list()
 
-    assert call_count == 3
+    assert len(http.api_requests) == 3
 
 
 def test_github_merged_pr_list_does_not_retry_non_transient_error(
@@ -111,120 +76,80 @@ def test_github_merged_pr_list_does_not_retry_non_transient_error(
     """A non-gateway error (e.g. bad credentials) must fail immediately rather
     than be swallowed into the transient-gateway retry loop.
     """
-    call_count = 0
+    http = FakeAdapter("http", [ok({"message": "Bad credentials"}, status=401)])
+    gh, http, _ = make_github(tmp_path, http=http)
 
-    def fake_run(cmd, *args, **kwargs):
-        nonlocal call_count
-        call_count += 1
-        return subprocess.CompletedProcess(
-            args=cmd, returncode=1, stdout="", stderr="HTTP 401: Bad credentials"
-        )
-
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
-
-    gh = github_module.GitHub(tmp_path)
     with pytest.raises(github_module.GitHubError):
         gh.merged_pr_list()
 
-    assert call_count == 1
+    # 401 is terminal: the guard re-resolves the token once and resends once
+    # (never the transient-gateway retry loop), so exactly two sends, then raise.
+    assert [(r.method, r.route) for r in http.api_requests] == [  # type: ignore[union-attr]
+        ("GET", "repos/octo/hello/pulls")
+    ] * 2
 
 
-def test_issue_list_raises_limit_to_500_and_warns_on_truncation(
-    monkeypatch, tmp_path: Path, caplog
-) -> None:
+def test_issue_list_raises_limit_to_500_and_warns_on_truncation(tmp_path: Path, caplog) -> None:
     caplog.set_level(logging.WARNING)
     limit = github_module._LIST_LIMIT
-
-    def fake_run(
-        self,
-        args: list[str],
-        *,
-        json_output: bool = False,
-        allow_failure: bool = False,
-        long_call: bool = False,
-    ):
-        assert json_output is True
-        assert args[:2] == ["issue", "list"]
-        assert str(limit) in args, f"expected --limit {limit} in {args}"
-        return [{"number": i} for i in range(limit)]
-
-    monkeypatch.setattr(github_module.GitHub, "run", fake_run)
-    gh = github_module.GitHub(tmp_path)
+    # More nodes than the cap exist: the read pages up to the cap, then warns.
+    adapter = FakeAdapter("http", handler=paged_connection("issues", limit + 100))
+    gh, http, _ = make_github(tmp_path, http=adapter)
 
     result = gh.issue_list("automated-ready")
 
     assert len(result) == limit
+    assert len(http.api_requests) == limit // 100
     assert any("truncated" in record.message for record in caplog.records)
 
 
-def test_pr_list_raises_limit_to_500_and_warns_on_truncation(
-    monkeypatch, tmp_path: Path, caplog
-) -> None:
+def test_pr_list_raises_limit_to_500_and_warns_on_truncation(tmp_path: Path, caplog) -> None:
     caplog.set_level(logging.WARNING)
     limit = github_module._LIST_LIMIT
-
-    def fake_run(
-        self,
-        args: list[str],
-        *,
-        json_output: bool = False,
-        allow_failure: bool = False,
-        long_call: bool = False,
-    ):
-        assert json_output is True
-        assert args[:2] == ["pr", "list"]
-        assert str(limit) in args, f"expected --limit {limit} in {args}"
-        return [{"number": i} for i in range(limit)]
-
-    monkeypatch.setattr(github_module.GitHub, "run", fake_run)
-    gh = github_module.GitHub(tmp_path)
+    # More nodes than the cap exist: the read pages up to the cap, then warns.
+    adapter = FakeAdapter("http", handler=paged_connection("pullRequests", limit + 100))
+    gh, http, _ = make_github(tmp_path, http=adapter)
 
     result = gh.pr_list()
 
     assert len(result) == limit
+    assert len(http.api_requests) == limit // 100
     assert any("truncated" in record.message for record in caplog.records)
 
 
-def test_branch_protection_caches_per_pass(monkeypatch, tmp_path: Path) -> None:
-    """Issue #812: branch_protection() must cost exactly one `gh api` call per
-    base ref per orchestrator pass, not one per PR -- N callers sharing a base
+def test_branch_protection_caches_per_pass(tmp_path: Path) -> None:
+    """Issue #812: branch_protection() must cost exactly one request per base
+    ref per orchestrator pass, not one per PR -- N callers sharing a base
     (e.g. N open PRs against main in one merge_ready/broadcast-sweep pass) must
     collapse to a single underlying read. The cache lives in GitHub._list_cache
     (the same dict pr_list/issue_list already use) and is cleared only by
     invalidate_list_cache(), which the orchestrator calls once per pass.
     """
-    calls: list[list[str]] = []
-
-    def fake_run(*args, **kwargs):
-        calls.append(args[0])
-        payload = json.dumps({"required_status_checks": {"strict": True}})
-        return subprocess.CompletedProcess(args=args, returncode=0, stdout=payload, stderr="")
-
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
-    gh = github_module.GitHub(repo_root=tmp_path)
+    http = FakeAdapter("http", [ok({"required_status_checks": {"strict": True}})])
+    gh, http, _ = make_github(tmp_path, http=http)
 
     # Simulate N=5 PRs against the same base within one pass: 5 calls to the
-    # method, but the underlying `gh api` subprocess must run exactly once.
+    # method, but the underlying request must be sent exactly once.
     results = [gh.branch_protection("main") for _ in range(5)]
     assert all(r == {"required_status_checks": {"strict": True}} for r in results)
-    assert len(calls) == 1
-    # Pin the actual endpoint (and the {owner}/{repo} placeholder escaping),
-    # not just "something got cached" -- a wrong URL would still pass a
-    # call-count-only assertion.
-    assert calls[0] == ["gh", "api", "repos/{owner}/{repo}/branches/main/protection"]
+    assert len(http.calls) == 1
+    # Pin the actual endpoint (and the {owner}/{repo} placeholder), not just
+    # "something got cached" -- a wrong URL would still pass a count-only check.
+    assert sent(http) == [("GET", "repos/{owner}/{repo}/branches/main/protection", None)]
 
     # A different base ref is a distinct cache key, so it costs a fresh read.
     gh.branch_protection("develop")
-    assert len(calls) == 2
+    assert len(http.calls) == 2
     gh.branch_protection("develop")
-    assert len(calls) == 2  # still cached
+    assert len(http.calls) == 2  # still cached
 
     # invalidate_list_cache() (called once at the top of every orchestrator
     # pass) must force a fresh read on the next call -- the cache is valid
     # only within a single pass, never leaking across passes.
     gh.invalidate_list_cache()
+    gh._list_cache[("_repo_owner_name",)] = ("octo", "hello")  # make_github seeds the slug
     gh.branch_protection("main")
-    assert len(calls) == 3
+    assert len(http.calls) == 3
 
 
 def test_branch_protection_caches_failed_read_too(monkeypatch, tmp_path: Path) -> None:
@@ -232,38 +157,24 @@ def test_branch_protection_caches_failed_read_too(monkeypatch, tmp_path: Path) -
     rest of the pass -- otherwise every PR sharing a broken base ref retries
     the same doomed `gh api` call once each, turning one outage into N.
     """
-    calls: list[list[str]] = []
-
-    def fake_run(*args, **kwargs):
-        calls.append(args[0])
-        return subprocess.CompletedProcess(
-            args=args, returncode=1, stdout="", stderr="HTTP 404: Not Found"
-        )
-
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
-    gh = github_module.GitHub(repo_root=tmp_path)
+    http = FakeAdapter("http", [ok({"message": "Not Found"}, status=404)])
+    gh, http, _ = make_github(tmp_path, http=http)
 
     assert gh.branch_protection("main") is None
     assert gh.branch_protection("main") is None
     assert gh.branch_protection("main") is None
-    assert len(calls) == 1
+    assert sent(http) == [("GET", "repos/{owner}/{repo}/branches/main/protection", None)]
 
 
-def test_github_are_issues_open_normalizes_uppercase_state(monkeypatch, tmp_path: Path) -> None:
+def test_github_are_issues_open_normalizes_uppercase_state(tmp_path: Path) -> None:
     """Issue #173: Regression test for are_issues_open with realistic uppercase state.
 
     Exercises the production ``are_issues_open`` per-issue fallback path with
     realistic uppercase state field values (as returned by the real GitHub API),
-    ensuring the ``.upper()`` normalization cannot silently regress.
-
-    Post-L07 (issue #1591) ``are_issues_open`` lives on the ``Issues`` capability
-    collaborator, and its thread-pool fallback closure resolves ``self.issue_view``
-    on that collaborator -- so a GitHub *subclass* override of ``issue_view`` no
-    longer intercepts that internal call (the disclosed interception-path
-    relocation). The mock is therefore installed at the ``run`` layer, which
-    ``issue_view`` forwards to through the collaborator->owner seam, and the
-    batched GraphQL path is forced to fail so the per-issue fallback -- the code
-    performing the ``.upper()`` normalization -- is the path under test.
+    ensuring the ``.upper()`` normalization cannot silently regress. The batched
+    GraphQL path is forced to fail so the per-issue fallback -- the code
+    performing the ``.upper()`` normalization -- is the path under test; the
+    per-issue ``issue_view`` reads go out as GraphQL requests.
     """
     from charlie_work.github import GitHub as RealGitHub
     from charlie_work.github import GitHubError
@@ -276,36 +187,26 @@ def test_github_are_issues_open_normalizes_uppercase_state(monkeypatch, tmp_path
         # Force are_issues_open onto its per-issue ``issue_view`` fallback.
         raise GitHubError("forced batched-state failure -> per-issue fallback")
 
-    def _fake_run(self, args, **kwargs):
-        # issue_view builds ["issue", "view", str(number), "--json", ISSUE_VIEW_FIELDS];
-        # args[2] is the issue number. Raise ValueError (not KeyError) for an
-        # unexpected number so the failure mode matches the original mock: the
-        # fallback's ``except (GitHubError, ValueError, TypeError)`` swallows it to
-        # ``is_open=False`` rather than propagating out of ``pool.map``.
-        number = int(args[2])
-        if number not in states:
-            raise ValueError(f"Unexpected issue number: {number}")
-        return {"number": number, "state": states[number]}
+    def view(request):
+        number = graphql_variables(request)["number"]
+        return graphql_ok(
+            {"repository": {"issueOrPullRequest": {"number": number, "state": states[number]}}}
+        )
 
-    monkeypatch.setattr(RealGitHub, "_graphql_issue_states", _fail_graphql)
-    monkeypatch.setattr(RealGitHub, "run", _fake_run)
-
-    real_gh = RealGitHub(repo_root=tmp_path)
-
-    # Call are_issues_open with a mix of open/closed issues
-    result = real_gh.are_issues_open([100, 200, 300, 400])
+    gh, _http, _ = make_github(tmp_path, http=FakeAdapter("http", handler=view))
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(RealGitHub, "_graphql_issue_states", _fail_graphql)
+        result = gh.are_issues_open([100, 200, 300, 400])
 
     # Only the OPEN-state issues are returned: 100 and 300 (uppercase OPEN) and
     # 400 (lowercase "open", normalized via .upper()). 200 is CLOSED.
     assert result == {100, 300, 400}, f"Expected {{100, 300, 400}}, got {result}"
 
 
-def test_are_issues_open_caches_per_pass_and_dedupes_shared_numbers(
-    monkeypatch, tmp_path: Path
-) -> None:
+def test_are_issues_open_caches_per_pass_and_dedupes_shared_numbers(tmp_path: Path) -> None:
     """Issue #870: are_issues_open() was a fully serial, uncached, one
-    `gh issue view` per number loop. Every distinct blocker issue number must
-    now cost exactly one `gh issue view` call per status()/orchestrator pass,
+    issue view per number loop. Every distinct blocker issue number must
+    now cost exactly one per-issue read per status()/orchestrator pass,
     no matter how many separate callers ask about it or how much the
     requested number lists overlap -- mirroring the existing per-pass cache
     contract already proven for branch_protection()
@@ -313,15 +214,18 @@ def test_are_issues_open_caches_per_pass_and_dedupes_shared_numbers(
     """
     calls: list[int] = []
 
-    def fake_run(command, **kwargs):
-        # command: ["gh", "issue", "view", "<number>", "--json", ...]
-        number = int(command[3])
+    def handler(request):
+        if "$number" not in request.document:
+            # The batched state query: fail it so each number is read per issue.
+            return graphql_failure("batched state query unavailable", "INTERNAL")
+        number = graphql_variables(request)["number"]
         calls.append(number)
-        payload = json.dumps({"number": number, "state": "OPEN" if number != 200 else "CLOSED"})
-        return subprocess.CompletedProcess(args=command, returncode=0, stdout=payload, stderr="")
+        state = "OPEN" if number != 200 else "CLOSED"
+        return graphql_ok(
+            {"repository": {"issueOrPullRequest": {"number": number, "state": state}}}
+        )
 
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
-    gh = github_module.GitHub(repo_root=tmp_path)
+    gh, _http, _ = make_github(tmp_path, http=FakeAdapter("http", handler=handler))
 
     # Two overlapping requests, as _filter_blocked_issues and _summarize_issue
     # would each independently make for two issues sharing a blocker.
@@ -337,5 +241,6 @@ def test_are_issues_open_caches_per_pass_and_dedupes_shared_numbers(
     # invalidate_list_cache() (called once per orchestrator pass) must force
     # a fresh read on the next call -- never leaking across passes.
     gh.invalidate_list_cache()
+    gh._list_cache[("_repo_owner_name",)] = ("octo", "hello")  # make_github seeds the slug
     gh.are_issues_open([100])
     assert calls.count(100) == 2

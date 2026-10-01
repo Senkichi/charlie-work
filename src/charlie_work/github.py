@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-import json
 import logging
-import random
+import random  # noqa: F401  (tests patch github.random.uniform)
 import re
-import subprocess
-import time
+import subprocess  # noqa: F401  (tests patch github.subprocess.run)
+import time  # noqa: F401  (tests patch github.time.sleep)
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
@@ -47,7 +46,6 @@ from .github_capabilities import (
     CommentsLike,
     GitHubRunResult,
     build_circuit_breaker_state,
-    build_http_transport_state,
     ISSUE_LIST_FIELDS,  # noqa: F401  (deliberate re-export; doctor.py et al.)
     ISSUE_VIEW_FIELDS,  # noqa: F401  (deliberate re-export; doctor.py et al.)
     IssuesLike,
@@ -66,8 +64,6 @@ from .github_capabilities import (
     RepoMetaLike,
     _ADMIN_FLAG,
     _STRATEGY_FLAGS,
-    _is_mutating,
-    run_gh_command,
 )
 
 # ``_LIST_LIMIT`` is no longer referenced inside ``github.py`` itself -- its
@@ -84,6 +80,15 @@ from .github_capabilities import (  # noqa: F401  (deliberate re-export)
 )
 from .github_delegation import _COLLABORATORS, _install_delegates
 from .github_delegation import _ROUTES, _SIGNATURE_SOURCE, _make_delegate  # noqa: F401 (deliberate re-export)
+from .github_capabilities._outcome import (  # noqa: F401  (deliberate re-export)
+    CIRCUIT_OPEN_RETURNCODE as _CIRCUIT_OPEN_RETURNCODE,
+    TIMEOUT_RETURNCODE as _TIMEOUT_RETURNCODE,
+    GitHubNotFoundError,
+    is_not_found_gh_error as _is_not_found_gh_error,
+)
+from .github_capabilities.legacy_run import run_legacy
+from .github_capabilities.transport_wiring import build_guarded_transport
+from .github_transport.guarded import Adapters
 
 # ``_CLOSING_KEYWORDS_ALT`` is imported from ``issue_linking.py`` (Track 2,
 # issue #1613; design doc Section 5, L06b) as a real (not re-export-only)
@@ -99,7 +104,6 @@ from .github_delegation import _ROUTES, _SIGNATURE_SOURCE, _make_delegate  # noq
 # ``issue_linking`` (issue #1627), so the re-exports are gone -- the names are
 # no longer reachable through ``charlie_work.github``.
 from .issue_linking import _CLOSING_KEYWORDS_ALT
-from .pass_deadline import raise_if_pass_deadline_spent
 from .transient_errors import is_transient_network_error
 
 logger = logging.getLogger(__name__)
@@ -107,13 +111,11 @@ logger = logging.getLogger(__name__)
 # Conventional exit status for "killed by timeout" (GNU coreutils `timeout`).
 # A TimeoutExpired carries no returncode of its own, and callers that branch on
 # returncode must not see a 0 that reads as success.
-_TIMEOUT_RETURNCODE = 124
 
 # Sentinel returncode for "the circuit breaker refused this call" (issue
 # #1833) -- no gh subprocess ever ran, so there is no real exit status.
 # Distinct from _TIMEOUT_RETURNCODE: a caller branching on returncode needs
 # to tell "gh hung" from "gh was never spawned" apart.
-_CIRCUIT_OPEN_RETURNCODE = 125
 
 # Fractional jitter applied to each retry backoff (e.g. 0.25 => +/- 25%).
 _JITTER_FRACTION = 0.25
@@ -225,16 +227,6 @@ ORCHESTRATOR_MANAGED_MERGE_FLAGS: frozenset[str] = frozenset(
 )
 
 
-class GitHubNotFoundError(GitHubError):
-    """The referenced GitHub object does not exist in this repository.
-
-    Permanent (not retryable): raised when gh reports a GraphQL
-    could-not-resolve or REST 404 for the requested object. Callers that
-    derive object numbers from untrusted inputs (e.g. PR branch names) use
-    this to distinguish "will never succeed" from transient gh failures.
-    """
-
-
 class GraphQLBudgetError(GitHubError):
     """Raised when the GitHub GraphQL rate-limit budget is too low to start a
     quota-heavy phase safely.
@@ -268,6 +260,8 @@ class GitHub:
     repo_root: Path
     dry_run: bool = False
     runtime: RuntimeConfig | None = None
+    # Test seam: replaces the real HTTP/gh adapters under the guard.
+    adapters: Adapters | None = field(default=None, repr=False, compare=False)
 
     # _max_retries/_retry_base_seconds/_timeout_seconds moved to
     # github_capabilities/transport.py (Track 2, issue #1593; design doc
@@ -294,14 +288,14 @@ class GitHub:
         object.__setattr__(
             self, "_circuit_breaker_state", build_circuit_breaker_state(self.runtime)
         )
-        # Per-instance pooled HTTP transport state (issue #1834): mutable,
-        # constructed once here for the same reason as
-        # `_circuit_breaker_state` above -- `run_gh_command` needs it before
-        # the `_COLLABORATORS` loop below installs any delegate.
-        object.__setattr__(self, "_http_transport_state", build_http_transport_state())
         # Cooperative in-pass deadline hook (issue #1948), armed per-lane via
         # pass_deadline.set_pass_deadline_exceeded(); None disables it.
         object.__setattr__(self, "_pass_deadline_exceeded", None)
+        # The guarded transport (ADR-0006): retry, breaker, deadline, dry-run
+        # and per-call gh fallback. Built after the breaker state and the
+        # deadline hook it reads; the owner/repo resolver is bound lazily
+        # because the collaborators are installed below.
+        object.__setattr__(self, "_transport_v2", build_guarded_transport(self))
         # Capability collaborators (Track 2, issue #1585, design doc
         # Section 3.3): each is constructed with a back-reference to this
         # instance and reached through the delegates _install_delegates()
@@ -323,243 +317,18 @@ class GitHub:
         allow_failure: bool = False,
         long_call: bool = False,
     ) -> Any:
-        command = ["gh", *args]
-        if self.dry_run and _is_mutating(args):
-            return [] if json_output else "DRY-RUN: " + " ".join(command)
+        """Legacy gh-argv entry point: a shim over the guarded transport.
 
-        # Per-pass circuit breaker gate (issue #1833): after enough
-        # consecutive transport-class failures this pass, fail every further
-        # call immediately as a value -- never spawn gh -- until the cooldown
-        # elapses. Checked before the retry loop, not inside it: an open
-        # breaker must skip the subprocess entirely, not merely skip retries
-        # on one.
-        if not self._circuit_breaker_allow_call():
-            breaker_error = self._circuit_breaker_open_message(command)
-            if not allow_failure:
-                raise GitHubError(breaker_error)
-            return GitHubRunResult(
-                ok=False,
-                returncode=_CIRCUIT_OPEN_RETURNCODE,
-                stdout="",
-                stderr=breaker_error,
-                value=None,
-                error=breaker_error,
-            )
-
-        is_mutating = _is_mutating(args)
-        max_retries = self._max_retries()
-        base_delay = self._retry_base_seconds()
-        timeout_seconds = (
-            self._long_call_timeout_seconds() if long_call else self._timeout_seconds()
-        )
-        last_result: subprocess.CompletedProcess[str] | None = None
-
-        # Issue #1948: cooperative in-pass deadline -- checked before each
-        # attempt and each backoff sleep; a spent budget raises
-        # PassDeadlineExceeded (even under allow_failure=True, and never
-        # feeds the circuit breaker). See pass_deadline.py.
-        for attempt in range(max_retries + 1):
-            raise_if_pass_deadline_spent(self._pass_deadline_exceeded, command)
-            try:
-                # Issue #1834: `run_gh_command` chooses HTTP or the `gh`
-                # subprocess per call (config-default HTTP for
-                # `http_translate.is_http_candidate` shapes, `gh` for
-                # everything else or on per-call HTTP fallback) and always
-                # returns a `subprocess.CompletedProcess`-shaped result (or
-                # raises the same two exceptions a direct `subprocess.run`
-                # call would) -- every line below this point is unchanged
-                # regardless of which transport actually produced `result`.
-                result = run_gh_command(
-                    args=args,
-                    command=command,
-                    cwd=self.repo_root,
-                    timeout_seconds=timeout_seconds,
-                    runtime=self.runtime,
-                    transport_state=self._http_transport_state,
-                    resolve_owner_repo=self._repo_owner_name,
-                )
-            except FileNotFoundError as exc:
-                # Transport-class by construction (issue #1833): gh could not
-                # even be spawned, so there is no response to classify --
-                # reuse timed_out=True, which classify_gh_failure() always
-                # treats as transport regardless of message text.
-                self._circuit_breaker_note_result(timed_out=True)
-                if allow_failure:
-                    return GitHubRunResult(
-                        ok=False,
-                        returncode=0,
-                        stdout="",
-                        stderr="",
-                        value=None,
-                        error="GitHub CLI `gh` is not installed or not on PATH.",
-                    )
-                raise GitHubError("GitHub CLI `gh` is not installed or not on PATH.") from exc
-            except subprocess.TimeoutExpired as exc:
-                timeout_error = (
-                    f"gh command timed out after {timeout_seconds:g}s: {' '.join(command)}"
-                )
-                # A timeout is not evidence about whether GitHub received the
-                # request. Reads are idempotent, so they may retry. A mutation
-                # that timed out may already have been applied server-side, so
-                # retrying it risks double-merging, double-labelling, or a
-                # duplicate comment. That is the same rule _should_retry()
-                # applies to mutations, reached through a different signal —
-                # checked explicitly here rather than by calling _should_retry(),
-                # which classifies stderr from a process that actually returned
-                # and has no string to classify for a call that never did.
-                if is_mutating or attempt >= max_retries:
-                    # Terminal for this run() call -- record now, not on the
-                    # retryable branch below, since the breaker observes
-                    # each call's FINAL outcome, not every intra-call attempt
-                    # (issue #1833).
-                    self._circuit_breaker_note_result(timed_out=True)
-                    if not allow_failure:
-                        raise GitHubError(timeout_error) from exc
-                    return GitHubRunResult(
-                        ok=False,
-                        returncode=_TIMEOUT_RETURNCODE,
-                        # Partial output captured before the kill. Coerced
-                        # rather than trusted: TimeoutExpired.stdout is bytes
-                        # when the child was not opened in text mode, and this
-                        # error path must not raise on the way out.
-                        stdout=exc.stdout if isinstance(exc.stdout, str) else "",
-                        stderr=timeout_error,
-                        value=None,
-                        error=timeout_error,
-                    )
-                # Issue #1948: a spent budget refuses instead of sleeping.
-                raise_if_pass_deadline_spent(self._pass_deadline_exceeded, command)
-                delay = base_delay * (2**attempt)
-                jitter = random.uniform(-_JITTER_FRACTION * delay, _JITTER_FRACTION * delay)
-                sleep_seconds = max(0.0, delay + jitter)
-                logger.warning(
-                    "gh command timed out after %gs (attempt %d/%d): %s; retrying in %.2fs",
-                    timeout_seconds,
-                    attempt + 1,
-                    max_retries + 1,
-                    " ".join(command),
-                    sleep_seconds,
-                )
-                time.sleep(sleep_seconds)
-                continue
-
-            last_result = result
-            output = result.stdout.strip()
-
-            if result.returncode == 0:
-                # A response reached the caller -- the transport is provably
-                # fine right now regardless of what gh's exit code says
-                # elsewhere, so record it before branching (issue #1833).
-                self._circuit_breaker_note_result()
-                # Success path: parse and return exactly as before.
-                if not allow_failure:
-                    if not json_output:
-                        return output
-                    if not output:
-                        # gh exited 0 with empty stdout: cannot distinguish an
-                        # empty-but-legitimate result from an unreadable one.
-                        # Callers of this path (allow_failure=False) already
-                        # handle GitHubError from the retry-exhausted branch
-                        # below on every call site; treat this the same way
-                        # rather than silently coercing to None, which callers
-                        # doing `result if isinstance(result, list) else []`
-                        # (or dict equivalents) would read as "genuinely
-                        # empty" (issue #756). Not retried here — the next
-                        # orchestrator loop pass is the retry.
-                        raise GitHubError(
-                            f"gh exited 0 with empty stdout for command: {' '.join(command)}; "
-                            "cannot distinguish an empty result from an unreadable one"
-                        )
-                    try:
-                        return json.loads(output)
-                    except json.JSONDecodeError as exc:
-                        raise GitHubError(
-                            f"Expected JSON from gh command: {' '.join(command)}"
-                        ) from exc
-
-                # allow_failure=True: always return a structured result so callers can
-                # distinguish command failure from empty-but-legitimate output.
-                value: Any | None = None
-                if not json_output:
-                    value = output
-                elif output:
-                    try:
-                        value = json.loads(output)
-                    except json.JSONDecodeError:
-                        return GitHubRunResult(
-                            ok=False,
-                            returncode=result.returncode,
-                            stdout=result.stdout,
-                            stderr=result.stderr,
-                            value=None,
-                            error=f"Expected JSON from gh command: {' '.join(command)}",
-                        )
-                return GitHubRunResult(
-                    ok=True,
-                    returncode=result.returncode,
-                    stdout=result.stdout,
-                    stderr=result.stderr,
-                    value=value,
-                    error=None,
-                )
-
-            # Failure path: classify and either retry or surface the error.
-            error = (
-                result.stderr.strip() or result.stdout.strip() or f"gh exited {result.returncode}"
-            )
-            if attempt >= max_retries or not _should_retry(args, error, is_mutating):
-                break
-
-            # Issue #1948: a spent budget refuses instead of sleeping.
-            raise_if_pass_deadline_spent(self._pass_deadline_exceeded, command)
-            delay = base_delay * (2**attempt)
-            jitter = random.uniform(-_JITTER_FRACTION * delay, _JITTER_FRACTION * delay)
-            sleep_seconds = max(0.0, delay + jitter)
-            logger.warning(
-                "Transient GitHub error (attempt %d/%d, %s): %s; retrying in %.2fs",
-                attempt + 1,
-                max_retries + 1,
-                "read/idempotent" if not is_mutating else "mutation pre-connection",
-                error,
-                sleep_seconds,
-            )
-            time.sleep(sleep_seconds)
-
-        # Exhausted retries or terminal failure. Reconstruct the original
-        # failure contract so callers see identical behaviour for terminal errors.
-        assert last_result is not None
-        final_error = (
-            last_result.stderr.strip() or last_result.stdout.strip() or str(last_result.returncode)
-        )
-        # Terminal for this run() call: classify and record now (issue
-        # #1833). A response DID reach the caller here (unlike the
-        # TimeoutExpired/FileNotFoundError branches above), so this goes
-        # through classify_gh_failure() on the actual stderr text rather than
-        # a forced transport classification.
-        self._circuit_breaker_note_result(error=final_error)
-        if not allow_failure:
-            if _is_not_found_gh_error(final_error):
-                raise GitHubNotFoundError(final_error)
-            raise GitHubError(final_error)
-
-        value = None
-        error = final_error
-        output = last_result.stdout.strip()
-        if not json_output:
-            value = output if last_result.returncode == 0 else None
-        elif output:
-            try:
-                value = json.loads(output)
-            except json.JSONDecodeError:
-                error = f"Expected JSON from gh command: {' '.join(command)}"
-                value = None
-        return GitHubRunResult(
-            ok=False,
-            returncode=last_result.returncode,
-            stdout=last_result.stdout,
-            stderr=last_result.stderr,
-            value=value,
-            error=error,
+        Retry, breaker, deadline, dry-run and fallback all live in
+        ``GuardedTransport`` (ADR-0006); ``run_legacy`` maps the argv to a
+        request and renders the outcome into the historical return contract.
+        """
+        return run_legacy(
+            self,
+            args,
+            json_output=json_output,
+            allow_failure=allow_failure,
+            long_call=long_call,
         )
 
     # _run_bool/_list_json moved to github_capabilities/transport.py (Track 2,
@@ -574,7 +343,7 @@ class GitHub:
     # this owner), so no subclass-override bypass hazard applies here (unlike
     # L07's `are_issues_open`/`issue_view`).
 
-    # _pr_checks_fallback/validate_field_lists/_repo_owner_name/
+    # validate_field_lists/_repo_owner_name/
     # _graphql_query/_graphql_issue_states/_graphql_issue_dependencies moved
     # to github_capabilities/transport.py (Track 2, issue #1593; design doc
     # Section 5, L09) -- reached through the installed `_transport` delegate.
@@ -771,19 +540,6 @@ def build_branch_issue_validator_from_issues(
 # ``charlie_work.github``.
 
 
-def _is_not_found_gh_error(error: str) -> bool:
-    """Classify a gh stderr/stdout string as an object-does-not-exist failure.
-
-    Matches GitHub's GraphQL could-not-resolve shape and REST 404s — the same
-    signals `_is_transient_gh_error` already treats as terminal. Permanent:
-    retrying can never succeed while the referenced object is absent.
-    """
-    text = error.lower()
-    if "could not resolve to a" in text or "not_found" in text:
-        return True
-    return bool(re.search(r"\bhttp 404\b", text))
-
-
 def is_transient_repo_resolution_failure(error: str) -> bool:
     """Classify a ``GitHubNotFoundError`` message as a transient repository-level
     resolution failure rather than a permanent issue-level 404.
@@ -816,39 +572,6 @@ def is_transient_repo_resolution_failure(error: str) -> bool:
 # inert for gh's own Go-idiom error text and so do not change this
 # function's behavior for any error gh can actually produce.
 _is_transient_gh_error = is_transient_network_error
-
-
-def _is_pre_connection_error(error: str) -> bool:
-    """Return True for failures that provably occurred before the request reached GitHub.
-
-    Mutating commands are only retried on these pre-send errors to preserve
-    at-most-once semantics; post-send ambiguous timeouts (i/o timeout, 5xx after
-    headers, etc.) are surfaced immediately.
-    """
-    text = error.lower()
-    return any(
-        phrase in text
-        for phrase in (
-            "tls handshake timeout",
-            "connection refused",
-            "could not connect",
-            "error connecting to",
-        )
-    )
-
-
-def _should_retry(args: list[str], error: str, is_mutating: bool) -> bool:
-    """Decide whether a failed gh invocation should be retried.
-
-    Reads/idempotent commands may retry any transient failure. Mutating commands
-    only retry provable pre-connection failures, avoiding double-application of
-    merges, label edits, comments, etc.
-    """
-    if not _is_transient_gh_error(error):
-        return False
-    if not is_mutating:
-        return True
-    return _is_pre_connection_error(error)
 
 
 def is_infrastructure_failure(job: dict[str, Any], annotations: list[dict[str, Any]]) -> bool:

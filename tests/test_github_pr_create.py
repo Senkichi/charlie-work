@@ -17,39 +17,25 @@ checks the arguments against ``gh`` itself rather than against our model of it.
 
 from __future__ import annotations
 
+import json
 import pathlib
-import shutil
-import subprocess
-import types
 
 import pytest
 
+from _fake_transport import FakeAdapter, failure, make_github, ok
 from charlie_work.github import GitHub, _pr_number_from_url
+from charlie_work.github_transport import CliRequest, FailureKind, RestRequest
 
 _URL = "https://github.com/Senkichi/charlie-work/pull/1234"
 
 
-class _FakeCompleted:
-    def __init__(self, returncode: int = 0, stdout: str = "", stderr: str = "") -> None:
-        self.returncode = returncode
-        self.stdout = stdout
-        self.stderr = stderr
-
-
-def _capture(monkeypatch: pytest.MonkeyPatch, **result: object) -> list[list[str]]:
-    """Patch subprocess.run inside github.py and record every argv it sees."""
-    calls: list[list[str]] = []
-
-    def fake_run(command: list[str], **kwargs: object) -> _FakeCompleted:
-        calls.append(list(command))
-        return _FakeCompleted(**result)  # type: ignore[arg-type]
-
-    monkeypatch.setattr("charlie_work.github.subprocess.run", fake_run)
-    return calls
-
-
-def _client(tmp_path: pathlib.Path) -> GitHub:
-    return GitHub(repo_root=tmp_path)
+def _client(
+    tmp_path: pathlib.Path, reply: object | None = None, *, dry_run: bool = False
+) -> tuple[GitHub, FakeAdapter]:
+    """A real ``GitHub`` over a scripted http adapter (no network, no gh)."""
+    script = [reply if reply is not None else ok({"number": 1234, "html_url": _URL}, status=201)]
+    gh, http, _ = make_github(tmp_path, http=FakeAdapter("http", script), dry_run=dry_run)
+    return gh, http
 
 
 # --------------------------------------------------------------------------
@@ -57,62 +43,36 @@ def _client(tmp_path: pathlib.Path) -> GitHub:
 # --------------------------------------------------------------------------
 
 
-def test_pr_create_does_not_send_a_json_flag(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """`gh pr create` is a mutation and reports its result by printing a URL;
-    it has no --json. Sending one makes gh fail at argument parsing."""
-    calls = _capture(monkeypatch, returncode=0, stdout=_URL)
-    _client(tmp_path).pr_create(head="agent/issue-1", base="main", title="t", body="b")
+def test_pr_create_does_not_send_a_json_flag(tmp_path: pathlib.Path) -> None:
+    """`pr_create` is a typed REST POST now: no gh argv exists to carry a bad
+    flag, so the original `--json` bug class is unrepresentable (ADR-0006)."""
+    gh, http = _client(tmp_path)
+    gh.pr_create(head="agent/issue-1", base="main", title="t", body="b")
 
-    assert len(calls) == 1
-    argv = calls[0]
-    assert "--json" not in argv
-    # Control: the command really is the one under test, so the absence above is
-    # about pr_create's arguments and not about an empty/short argv.
-    assert argv[:3] == ["gh", "pr", "create"]
-    assert "--head" in argv and "--base" in argv
+    assert len(http.calls) == 1
+    request = http.api_requests[0]
+    # Control: the request really is the one under test, so the absence of any
+    # CLI argv is about pr_create's shape and not about an empty call list.
+    assert isinstance(request, RestRequest)
+    assert (request.method, request.route) == ("POST", "repos/octo/hello/pulls")
+    assert not [r for r in http.requests if isinstance(r, CliRequest)]
 
 
 def test_every_flag_pr_create_sends_is_accepted_by_the_installed_gh(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: pathlib.Path,
 ) -> None:
-    """The test that would have caught this.
-
-    Our fakes agree with us by construction; only `gh` can contradict us. This
-    asserts every long flag pr_create sends appears in `gh pr create --help`.
+    """The REST successor of the installed-gh flag check: every field
+    pr_create sends is one the documented create-pull-request endpoint accepts.
+    (There is no CLI left to disagree with; the API's field list is the contract.)
     """
-    if shutil.which("gh") is None:
-        pytest.skip("gh CLI not installed")
+    gh, http = _client(tmp_path)
+    gh.pr_create(head="agent/issue-1", base="main", title="t", body="b")
 
-    # Read the help text BEFORE patching. `_capture` replaces
-    # `charlie_work.github.subprocess.run`, and that attribute *is* the shared
-    # subprocess module's `run`, so a help call made afterwards would be served
-    # by the fake and this test would silently validate our own stub against
-    # itself. (Caught by the control below on the first run -- it asserted a
-    # real help text and got the fake's PR URL.)
-    help_text = subprocess.run(
-        ["gh", "pr", "create", "--help"],
-        capture_output=True,
-        text=True,
-        check=False,
-    ).stdout
-
-    # Control: if the help text is empty or unrecognisable, every membership
-    # test below would be vacuous. Assert we actually got help output for the
-    # right subcommand before drawing any conclusion from it.
-    assert "--head" in help_text, "unexpected `gh pr create --help` output; test is blind"
-
-    calls = _capture(monkeypatch, returncode=0, stdout=_URL)
-    _client(tmp_path).pr_create(head="agent/issue-1", base="main", title="t", body="b")
-    sent = {tok for tok in calls[0] if tok.startswith("--")}
-
-    unsupported = sorted(flag for flag in sent if flag not in help_text)
-    assert not unsupported, (
-        f"pr_create sends flags the installed gh does not accept: {unsupported}. "
-        "gh exits non-zero at argument parsing before contacting the API, so "
-        "pr_create would silently never create a PR."
-    )
+    sent_fields = set(json.loads(http.api_requests[0].body or "{}"))
+    assert sent_fields == {"head", "base", "title", "body"}
+    documented = {"title", "head", "base", "body", "draft", "maintainer_can_modify", "issue"}
+    unsupported = sorted(sent_fields - documented)
+    assert not unsupported, f"pr_create sends fields the pulls API does not accept: {unsupported}"
 
 
 # --------------------------------------------------------------------------
@@ -120,26 +80,23 @@ def test_every_flag_pr_create_sends_is_accepted_by_the_installed_gh(
 # --------------------------------------------------------------------------
 
 
-def test_pr_create_returns_the_number_from_the_url(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    _capture(monkeypatch, returncode=0, stdout=_URL + "\n")
-    assert _client(tmp_path).pr_create(head="h", base="main", title="t", body="b") == 1234
+def test_pr_create_returns_the_number_from_the_url(tmp_path: pathlib.Path) -> None:
+    """B9: the number comes from the JSON response, not from URL parsing."""
+    gh, _ = _client(tmp_path, ok({"number": 1234, "html_url": _URL}, status=201))
+    assert gh.pr_create(head="h", base="main", title="t", body="b") == 1234
 
 
-def test_pr_create_prefers_the_last_url_in_the_output(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """gh prints progress chatter before the URL, and a title or body echoed
-    into it can legitimately contain another PR link ("supersedes .../pull/900").
-    The URL gh appends last is the one it created."""
-    noisy = (
-        "Creating pull request for agent/issue-1 into main in Senkichi/charlie-work\n"
-        "note: supersedes https://github.com/Senkichi/charlie-work/pull/900\n"
-        f"{_URL}\n"
-    )
-    _capture(monkeypatch, returncode=0, stdout=noisy)
-    assert _client(tmp_path).pr_create(head="h", base="main", title="t", body="b") == 1234
+def test_pr_create_prefers_the_last_url_in_the_output(tmp_path: pathlib.Path) -> None:
+    """B9: a title or body echoed into the response can legitimately contain
+    another PR link ("supersedes .../pull/900"). The structured `number` field
+    is the created PR; no text in the body can displace it."""
+    noisy = {
+        "number": 1234,
+        "html_url": _URL,
+        "body": "note: supersedes https://github.com/Senkichi/charlie-work/pull/900",
+    }
+    gh, _ = _client(tmp_path, ok(noisy, status=201))
+    assert gh.pr_create(head="h", base="main", title="t", body="b") == 1234
 
 
 @pytest.mark.parametrize(
@@ -162,57 +119,42 @@ def test_pr_number_from_url(output: str, expected: int | None) -> None:
 # --------------------------------------------------------------------------
 
 
-def test_pr_create_returns_none_when_gh_fails(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    _capture(monkeypatch, returncode=1, stdout="", stderr="pull request already exists")
-    assert _client(tmp_path).pr_create(head="h", base="main", title="t", body="b") is None
+def test_pr_create_returns_none_when_gh_fails(tmp_path: pathlib.Path) -> None:
+    reply = ok({"message": "A pull request already exists"}, status=422)
+    gh, http = _client(tmp_path, reply)
+    assert gh.pr_create(head="h", base="main", title="t", body="b") is None
+    assert len(http.calls) == 1  # control: the failure came from the answered request
 
 
 def test_pr_create_logs_the_stderr_when_gh_fails(
     tmp_path: pathlib.Path,
-    monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """The caller only sees None. Without the reason in the log, "gh is not
-    authenticated", "GitHub rejected it", and "we sent a bad flag" are
-    indistinguishable -- which is what made the original bug expensive."""
-    _capture(monkeypatch, returncode=1, stdout="", stderr="unknown flag: --json")
+    """The caller only sees None. Without the reason in the log, "not
+    authenticated", "GitHub rejected it", and "we sent a bad request" are
+    indistinguishable -- which is what made the original bug expensive. The
+    reason is now the API's own message (B3)."""
+    gh, _ = _client(tmp_path, ok({"message": "Validation Failed"}, status=422))
     with caplog.at_level("WARNING"):
-        _client(tmp_path).pr_create(head="h", base="main", title="t", body="b")
-    assert "unknown flag: --json" in caplog.text
+        gh.pr_create(head="h", base="main", title="t", body="b")
+    assert "Validation Failed" in caplog.text
 
 
-def test_pr_create_returns_none_when_output_has_no_url(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Exit 0 with no URL must not be reported as a created PR. Returning a
-    bogus number would put an unusable pr_number into state.json."""
-    _capture(monkeypatch, returncode=0, stdout="something unexpected")
-    assert _client(tmp_path).pr_create(head="h", base="main", title="t", body="b") is None
+def test_pr_create_returns_none_when_output_has_no_url(tmp_path: pathlib.Path) -> None:
+    """A 2xx whose body carries no PR number must not be reported as a created
+    PR. Returning a bogus number would put an unusable pr_number into state.json."""
+    gh, _ = _client(tmp_path, ok({"unexpected": "shape"}, status=201))
+    assert gh.pr_create(head="h", base="main", title="t", body="b") is None
 
 
-def test_pr_create_is_a_no_op_under_dry_run(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    calls = _capture(monkeypatch, returncode=0, stdout=_URL)
-    assert (
-        GitHub(repo_root=tmp_path, dry_run=True).pr_create(
-            head="h", base="main", title="t", body="b"
-        )
-        == 0
-    )
-    assert calls == []
+def test_pr_create_is_a_no_op_under_dry_run(tmp_path: pathlib.Path) -> None:
+    gh, http = _client(tmp_path, dry_run=True)
+    assert gh.pr_create(head="h", base="main", title="t", body="b") == 0
+    assert http.calls == []
 
 
-def test_pr_create_returns_none_when_gh_is_missing(
-    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """`allow_failure=True` must absorb a missing binary as a value, per the
-    repo invariant that external-process errors come back as values."""
-
-    def boom(command: list[str], **kwargs: object) -> types.SimpleNamespace:
-        raise FileNotFoundError(command[0])
-
-    monkeypatch.setattr("charlie_work.github.subprocess.run", boom)
-    assert _client(tmp_path).pr_create(head="h", base="main", title="t", body="b") is None
+def test_pr_create_returns_none_when_gh_is_missing(tmp_path: pathlib.Path) -> None:
+    """A transport failure (no token, no connection, no gh) must be absorbed as
+    a value, per the repo invariant that external-process errors come back as values."""
+    gh, _ = _client(tmp_path, failure(FailureKind.CLI_MISSING, "gh not found"))
+    assert gh.pr_create(head="h", base="main", title="t", body="b") is None

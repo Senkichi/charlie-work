@@ -26,6 +26,7 @@ from . import apply_requests_pre as pre_handlers
 from .apply_context import SweepContext
 from .decide_common import label_names
 from .model import (
+    CloseVerifiedNoChanges,
     CollectLiveHandoff,
     FetchOpenIssues,
     FetchOpenPrs,
@@ -289,6 +290,7 @@ HANDLERS: dict[type, Callable[[SweepContext, Any], Any]] = {
     FetchOpenIssues: pre_handlers.fetch_open_issues,
     ResolveFate: pre_handlers.resolve_fate,
     StripAndFlag: pre_handlers.strip_and_flag,
+    CloseVerifiedNoChanges: pre_handlers.close_verified_no_changes,
     ProbeZeroArtifact: pre_handlers.probe_zero_artifact,
     ProbeCrossRepoScope: pre_handlers.probe_cross_repo_scope,
     ParkOrReclaim: pre_handlers.park_or_reclaim,
