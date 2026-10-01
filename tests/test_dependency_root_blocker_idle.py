@@ -32,6 +32,7 @@ from _dispatch_fixtures import _stub_real_activity_probe_for_stalled_tests  # no
 from _fakes_github import FakeGitHub
 from charlie_work.backlog_reachability import classify_backlog_reachability
 from charlie_work.ci_findings import check_dispatch_staleness
+from charlie_work.github_capabilities.cross_repo_blockers import CrossRepoBlocker
 from charlie_work.config import ConfigError, DispatchConfig, OrchestratorConfig, load_config
 from charlie_work.instrumentation import query_events
 from charlie_work.paths import runtime_paths
@@ -195,6 +196,57 @@ def test_idle_root_blocker_fires_dependency_root_blocker_idle() -> None:
     assert roots[0]["blocking_prs"] == [
         {"number": 1595, "status": "janitor_blocked", "last_change_at": old}
     ]
+
+
+def test_classifier_emits_foreign_root_repo_qualified(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Issue #2005: a foreign root is emitted as ``owner/name#N`` with no
+    ``updated_at`` -- never as the bare number of an unrelated local issue,
+    whose ``updatedAt`` must not be borrowed."""
+    config = OrchestratorConfig()
+    labels = config.labels
+    gh = FakeGitHub()
+    gh.issues = [
+        _issue(60, {labels.ready}, updated_at=_iso(datetime.now(UTC))),  # local #60 != foreign
+        _issue(70, {labels.ready}),
+    ]
+    foreign = CrossRepoBlocker(60, "Other/Repo")
+    monkeypatch.setattr(
+        "charlie_work.backlog_reachability._get_open_blockers_for_issue",
+        lambda _gh, issue: ([], [foreign] if issue["number"] == 70 else []),
+    )
+
+    result = classify_backlog_reachability(gh, config)
+
+    assert result["dependency_root_blockers"] == [{"number": "other/repo#60", "updated_at": None}]
+
+
+def test_all_foreign_roots_do_not_fire_dependency_root_blocker_idle() -> None:
+    """Issue #2005: local state can never hold evidence for a foreign root, so
+    it must fall back to the unconditional exemption, not read as idle."""
+    now = datetime.now(UTC).replace(microsecond=0)
+    config = DispatchConfig(dispatch_staleness_minutes=240, dependency_stall_minutes=60)
+    backlog = _blocked_backlog([{"number": "other/repo#60", "updated_at": None}])
+
+    result = check_dispatch_staleness({"issues": {}, "prs": {}}, config, backlog, now=now)
+
+    assert result["stale"] is False
+    assert result["reason"] == "all_ready_blocked_by_dependencies"
+
+
+def test_idle_local_root_plus_foreign_root_stays_quiet() -> None:
+    """Issue #2005: one unadjudicable foreign root makes "every root idle"
+    unprovable, so an idle local root alongside it must not fire."""
+    now = datetime.now(UTC).replace(microsecond=0)
+    config = DispatchConfig(dispatch_staleness_minutes=240, dependency_stall_minutes=60)
+    old = _iso(now - timedelta(minutes=180))
+    backlog = _blocked_backlog(
+        [{"number": 1538, "updated_at": old}, {"number": "other/repo#60", "updated_at": None}]
+    )
+
+    result = check_dispatch_staleness(_idle_state(old), config, backlog, now=now)
+
+    assert result["stale"] is False
+    assert result["reason"] == "all_ready_blocked_by_dependencies"
 
 
 def test_progressing_root_blocker_stays_quiet() -> None:

@@ -56,6 +56,7 @@ from .circuit_breaker_transport import (
     circuit_breaker_state_path,
     note_circuit_breaker_result,
 )
+from .cross_repo_blockers import CrossRepoBlocker, make_blocker
 from .graphql_issue_states import graphql_issue_states
 from .issues import ISSUE_LIST_FIELDS, ISSUE_VIEW_FIELDS
 from .labels import LABEL_LIST_FIELDS
@@ -698,8 +699,10 @@ class Transport(CapabilityCollaborator):
     def _graphql_issue_dependencies(self, issue_numbers: list[int]) -> dict[int, list[int]]:
         """Fetch GitHub-native ``blockedBy`` dependencies for many issues at once.
 
-        Returns a mapping ``issue_number -> [blocker_number, ...]``. Also warms
-        the ``("issue_open", blocker_number)`` cache for the returned blockers
+        Returns a mapping ``issue_number -> [blocker, ...]`` where a blocker is
+        a plain ``int`` (same repo) or a ``CrossRepoBlocker`` (issue #2005).
+        Also warms the ``("issue_open", blocker_number)`` cache -- or
+        ``("issue_open", repo, blocker_number)`` for a cross-repo blocker --
         so the downstream ``are_issues_open`` call can avoid refetching them.
         """
         if not issue_numbers:
@@ -714,7 +717,7 @@ class Transport(CapabilityCollaborator):
                 f"i_{n}: issue(number: {n}) {{ "
                 f"number "
                 f"blockedBy(first: {_GRAPHQL_BLOCKED_BY_FIRST}) {{ "
-                f"nodes {{ number state }} "
+                f"nodes {{ number state repository {{ nameWithOwner }} }} "
                 f"pageInfo {{ hasNextPage }} "
                 f"}} "
                 f"}}"
@@ -757,11 +760,31 @@ class Transport(CapabilityCollaborator):
                         if isinstance(node, dict):
                             blocker_number = node.get("number")
                             if blocker_number is not None:
-                                blocked_by.append(int(blocker_number))
+                                # Issue #2005: a blocker in another repo keeps
+                                # its repo identity and is cached under a
+                                # repo-qualified key, never the bare number.
+                                repo_info = node.get("repository")
+                                node_repo = (
+                                    repo_info.get("nameWithOwner")
+                                    if isinstance(repo_info, dict)
+                                    else None
+                                )
+                                blocker = make_blocker(
+                                    int(blocker_number), node_repo, f"{owner}/{name}"
+                                )
+                                blocked_by.append(blocker)
                                 # Cache the blocker state now so
                                 # are_issues_open does not need to re-derive it.
-                                is_open = str(node.get("state") or "").upper() == "OPEN"
-                                self._list_cache[("issue_open", int(blocker_number))] = is_open
+                                state = str(node.get("state") or "").upper()
+                                if isinstance(blocker, CrossRepoBlocker):
+                                    if state in ("OPEN", "CLOSED"):
+                                        self._list_cache[
+                                            ("issue_open", blocker.repo, int(blocker))
+                                        ] = state == "OPEN"
+                                else:
+                                    self._list_cache[("issue_open", int(blocker_number))] = (
+                                        state == "OPEN"
+                                    )
 
                 deps_by_number[number] = blocked_by
                 self._list_cache[("issue_dependencies", number)] = blocked_by

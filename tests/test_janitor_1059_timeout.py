@@ -28,6 +28,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from _run_captured_fakes import monkeypatch_run_captured
 
 from charlie_work.cross_pr_revert import (
     CrossPrRevertStatus,
@@ -114,6 +115,7 @@ def test_check_no_op_rework_timeout_returns_false_not_hang(
 
     # Patch AFTER _init_repo so the repo setup is not affected.
     monkeypatch.setattr("subprocess.run", _timeout_subprocess_run)
+    monkeypatch_run_captured(monkeypatch, _timeout_subprocess_run)
 
     failures: list[str] = []
     warnings: list[str] = []
@@ -148,6 +150,7 @@ def test_detect_cross_pr_revert_timeout_returns_undetermined_not_hang(
     pr = _green_pr(headRefName="agent/issue-1-fix", baseRefName="main")
 
     monkeypatch.setattr("subprocess.run", _timeout_subprocess_run)
+    monkeypatch_run_captured(monkeypatch, _timeout_subprocess_run)
 
     result = detect_cross_pr_revert(pr, repo)
     assert result.status is CrossPrRevertStatus.UNDETERMINED
@@ -162,6 +165,7 @@ def test_check_operator_containment_timeout_returns_empty_not_hang(
     _init_repo(repo)
 
     monkeypatch.setattr("subprocess.run", _timeout_subprocess_run)
+    monkeypatch_run_captured(monkeypatch, _timeout_subprocess_run)
 
     result = check_operator_containment(repo, "diff --git a/f b/f\n", 999)
     assert result == ()
@@ -175,6 +179,7 @@ def test_get_unpushed_commit_info_timeout_returns_none_not_hang(
     _init_repo(repo)
 
     monkeypatch.setattr("subprocess.run", _timeout_subprocess_run)
+    monkeypatch_run_captured(monkeypatch, _timeout_subprocess_run)
 
     result = _get_unpushed_commit_info("agent/issue-1-fix", repo)
     assert result is None

@@ -7,6 +7,7 @@ import sys
 from typing import Any
 
 import pytest
+from _run_captured_fakes import monkeypatch_run_captured, patch_run_captured
 
 import charlie_work.orphan_sweep as _sweep
 from charlie_work.orphan_sweep import sweep_orphan_processes
@@ -49,7 +50,7 @@ def test_sweep_orphan_processes_windows_parsing() -> None:
             "CommandLine": "node server.js /some/worktree/path",
         },
     ]
-    with patch("subprocess.run") as mock_run:
+    with patch("subprocess.run") as mock_run, patch_run_captured(mock_run):
         mock_run.return_value.returncode = 0
         mock_run.return_value.stdout = json.dumps(sample)
         orphans = sweep_orphan_processes("/some/worktree/path")
@@ -73,7 +74,7 @@ def test_sweep_orphan_processes_windows_empty_output() -> None:
     from unittest.mock import patch
 
     # Mock subprocess.run to return empty output
-    with patch("subprocess.run") as mock_run:
+    with patch("subprocess.run") as mock_run, patch_run_captured(mock_run):
         mock_run.return_value.returncode = 0
         mock_run.return_value.stdout = ""
         orphans = sweep_orphan_processes("/some/worktree/path")
@@ -86,7 +87,7 @@ def test_sweep_orphan_processes_windows_subprocess_error() -> None:
     from unittest.mock import patch
 
     # Mock subprocess.run to raise an exception
-    with patch("subprocess.run") as mock_run:
+    with patch("subprocess.run") as mock_run, patch_run_captured(mock_run):
         mock_run.side_effect = subprocess.TimeoutExpired("powershell", 10)
         orphans = sweep_orphan_processes("/some/worktree/path")
         assert orphans == []
@@ -101,7 +102,7 @@ def test_sweep_orphan_processes_windows_oserror(exc_type: type[OSError]) -> None
     aborting ``_sweep_orphan_processes_for_dead_sessions`` mid-loop."""
     from unittest.mock import patch
 
-    with patch("subprocess.run") as mock_run:
+    with patch("subprocess.run") as mock_run, patch_run_captured(mock_run):
         mock_run.side_effect = exc_type("denied")
         orphans = sweep_orphan_processes("/some/worktree/path")
         assert orphans == []
@@ -163,9 +164,11 @@ def test_sweep_orphan_processes_rejects_degenerate_needles(
         )
         return subprocess.CompletedProcess(args, 0, payload, "")
 
-    # The sweep shells out through ``run_captured``, which reaches
-    # ``subprocess.run`` via the shared module — patch it there.
+    # The sweep shells out through ``run_captured``, which spawns via
+    # ``Popen`` (issue #2139): route that spawn through the same spy, and keep
+    # the global ``subprocess.run`` patch for any direct caller.
     monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch_run_captured(monkeypatch, fake_run)
 
     orphans = sweep_orphan_processes(worktree_path)
 
