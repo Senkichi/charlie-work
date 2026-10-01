@@ -163,7 +163,7 @@ def test_json_rows_translate_to_dialect_reads(argv: list[str], expected: object)
         ["pr", "view", "x", "--json", "state"],
         ["issue", "checks", "1", "--json", "name"],
         ["issue", "list", "--search", "x", "--json", "number"],
-        # GraphQL `labels:` is OR, `gh --label a --label b` is AND: fail closed to gh.
+        # GraphQL `labels:` is OR, `gh --label a --label b` is AND: no row matches, so the shim refuses.
         ["issue", "list", "--label", "a", "--label", "b", "--json", "number"],
         ["pr", "list", "--state", "bogus", "--json", "number"],
         ["pr", "list", "--limit", "0", "--json", "number"],
@@ -296,5 +296,19 @@ def test_shim_multi_label_issue_list_is_refused_on_both_transports(
     argv = ["issue", "list", "--label", "a", "--label", "b", "--json", "number"]
     with pytest.raises(GitHubError, match="unsupported argv"):
         gh.run(argv, json_output=True)
+    assert http.calls == []
+    assert gh_adapter.calls == []
+
+
+@pytest.mark.parametrize("kill_switch", [False, True])
+def test_issue_list_capability_refuses_multiple_labels_on_both_transports(
+    tmp_path: Path, kill_switch: bool
+) -> None:
+    """``gh.issue_list(labels=[a, b])`` must not return GraphQL's OR superset."""
+    gh_adapter = FakeAdapter("gh", [ok([])], token="tok-1")
+    runtime = gh_kill_switch_runtime() if kill_switch else None
+    gh, http, gh_adapter = make_github(tmp_path, gh=gh_adapter, runtime=runtime)
+    with pytest.raises(GitHubError, match="unsupported"):
+        gh.issue_list(labels=["a", "b"])
     assert http.calls == []
     assert gh_adapter.calls == []
