@@ -52,6 +52,7 @@ def _release_reap_claim(self, pr_number: int, claim_key: str) -> None:
         ps = state["prs"].get(str(pr_number))
         if ps and ps.get("review_reaped_for") == claim_key:
             state["prs"][str(pr_number)] = {**ps, "review_reaped_for": None}
+            # write-gate-exempt(issue=2110): same raw state write shape as the other review-reap sites in this module; no write_gate param.
             _wf.save_state(self.paths.state_file, state)
 
 
@@ -429,6 +430,7 @@ def _reap_review_verdicts(self, reviews_dir: Path) -> dict[str, Any]:
             if not _is_current_dead_session(reviews_dir, w):
                 continue
             state["prs"][str(pr_number)] = {**pr_state, "review_reaped_for": claim_key}
+            # write-gate-exempt(issue=2110): same raw state write shape as the other review-reap sites in this module; no write_gate param.
             _wf.save_state(self.paths.state_file, state)
 
         settled = False
