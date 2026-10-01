@@ -29,7 +29,6 @@ from charlie_work.state import load_state, save_state, set_reviewer_quota_exhaus
 from charlie_work.workflow import OrchestratorApp
 from charlie_work.write_gate import WriteGate
 
-import charlie_work.workflow as wf
 
 PRIMARY = RoleEntry("devin-shell", "swe-2")
 FALLBACK = RoleEntry("claude-code", "claude-sonnet-5-5", "high")
@@ -134,24 +133,29 @@ def _app(root: Path, reviewer: ReviewerRoleConfig = CHAINED, n_prs: int = 1) -> 
 def _recorder(monkeypatch: pytest.MonkeyPatch, *, error: str | None = None) -> list[dict]:
     calls: list[dict] = []
 
-    def _make(harness: str):
-        def _launch(**kwargs: Any):
-            calls.append({"harness": harness, **kwargs})
-            pr = kwargs["pr_number"]
-            record = _fake_claude_worker_record(pr, kwargs["branch"])
-            if error is not None:
-                from dataclasses import replace
+    def _launch(harness: str, kwargs: dict[str, Any]):
+        calls.append({"harness": harness, **kwargs})
+        pr = kwargs["pr_number"]
+        record = _fake_claude_worker_record(pr, kwargs["branch"])
+        if error is not None:
+            from dataclasses import replace
 
-                return replace(record, error=error, pid=None)
-            sidecar = role_quota_ledger.sidecar_path_for(kwargs["reviews_dir"], harness, pr)
-            sidecar.parent.mkdir(parents=True, exist_ok=True)
-            sidecar.write_text(json.dumps({"issue_number": pr, "pid": 12345}), encoding="utf-8")
-            return record
+            return replace(record, error=error, pid=None)
+        sidecar = role_quota_ledger.sidecar_path_for(kwargs["reviews_dir"], harness, pr)
+        sidecar.parent.mkdir(parents=True, exist_ok=True)
+        sidecar.write_text(json.dumps({"issue_number": pr, "pid": 12345}), encoding="utf-8")
+        return record
 
-        return _launch
+    import dataclasses
 
-    for harness in list(wf._REVIEW_LAUNCHERS):
-        monkeypatch.setitem(wf._REVIEW_LAUNCHERS, harness, _make(harness))
+    from charlie_work import host as host_pkg
+    from charlie_work.host.fakes import FakeReviewLauncher
+
+    monkeypatch.setattr(
+        host_pkg,
+        "_ACTIVE",
+        dataclasses.replace(host_pkg.current(), launch=FakeReviewLauncher([_launch])),
+    )
     return calls
 
 

@@ -12,6 +12,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Mapping
 
+from . import host as _host
 from .dead_dispatched_timer import LOCAL_PARK_DEFER_FIELDS
 
 # Issue #1769 review follow-up / file-size ratchet (#1442): dispatch-cadence
@@ -26,6 +27,7 @@ from .dispatch_cadence import (  # noqa: F401 (deliberate re-export)
     mark_dispatch_baseline_backfill_attempted,
     record_non_empty_dispatch,
 )
+from .host.clock import format_utc
 from .iso_timestamp import parse_iso_timestamp  # noqa: F401 (deliberate re-export)
 
 # File-size ratchet (#1442): periodic-pass scheduling helpers moved to their own
@@ -450,7 +452,7 @@ def _thread_lock_for(path: Path) -> threading.Lock:
 
 
 def utc_now() -> str:
-    return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    return format_utc(_host.current().clock.now())
 
 
 def age_days_since(timestamp: str | None, *, now: datetime | None = None) -> float | None:

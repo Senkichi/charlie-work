@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterable
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -686,3 +687,10 @@ def resolve_dispatch_mention_coverage(
     except GitHubError:
         return {}, None
     return compute_mention_coverage_map(issues, fetched, app), fetched
+
+
+@dataclass(frozen=True)
+class _MergedPRListOutcome:
+    items: list[dict[str, Any]] = field(default_factory=list)
+    error: GitHubError | None = None
+    called: bool = False

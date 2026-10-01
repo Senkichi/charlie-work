@@ -18,6 +18,11 @@ import charlie_work
 
 PACKAGE_ROOT = Path(charlie_work.__file__).resolve().parent
 LAUNCH_TABLE = "_REVIEW_LAUNCHERS"
+# Since wave D6b, launch sites reach the table through the host port
+# (``self.host.launch.launch(...)``); the table itself is read only inside
+# ``host/launch.py`` (the port's Real), which is not a launch site.
+PORT_CALL = "host.launch.launch"
+PORT_MODULE = PACKAGE_ROOT / "host" / "launch.py"
 REQUIRED_GATES = {"fleet_review_lock", "fleet_review_lock_deferral", "read_fleet_review_cap"}
 
 
@@ -28,18 +33,34 @@ def _names_in(node: ast.AST) -> set[str]:
             names.add(child.id)
         elif isinstance(child, ast.Attribute):
             names.add(child.attr)
+            if _is_port_call(child):
+                names.add(PORT_CALL)
     return names
+
+
+def _is_port_call(node: ast.Attribute) -> bool:
+    """``<x>.host.launch.launch`` -- the reviewer launch call through the port."""
+    inner = node.value
+    return (
+        node.attr == "launch"
+        and isinstance(inner, ast.Attribute)
+        and inner.attr == "launch"
+        and isinstance(inner.value, ast.Attribute)
+        and inner.value.attr == "host"
+    )
 
 
 def _launch_sites() -> list[tuple[str, str, set[str]]]:
     """``(module path, function name, names referenced)`` per function using the table."""
     sites: list[tuple[str, str, set[str]]] = []
     for path in sorted(PACKAGE_ROOT.rglob("*.py")):
+        if path == PORT_MODULE:
+            continue
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 names = _names_in(node)
-                if LAUNCH_TABLE in names:
+                if LAUNCH_TABLE in names or PORT_CALL in names:
                     sites.append((path.name, node.name, names))
     return sites
 

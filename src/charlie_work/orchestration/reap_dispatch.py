@@ -9,11 +9,13 @@ protocol exactly as a lexical method did).
 
 Names reached through ``_wf.`` (module-object seam, design Section 3.1 rule 2,
 #1627): ``charlie_work.workflow`` module-level definitions ``CommandResult``,
-``ConcurrencyGovernorResult``, ``_MergedPRListOutcome`` (classes),
+``_MergedPRListOutcome`` (class),
 ``_state_lock_busy_result`` (free function); and Tier-D names patched on
 ``charlie_work.workflow`` by the suite, so the moved body must keep intercepting
-those patches: ``_count_live_sessions``, ``count_fleet_live_sessions``,
-``_log_worker_census``. All other free names are imported directly from their
+those patches: ``_log_worker_census``. The live-session counters
+(``_count_live_sessions``, ``count_fleet_live_sessions``) are reached through
+``host.current().sessions``, whose Real late-binds ``charlie_work.workflow.*`` so
+those patches still intercept. All other free names are imported directly from their
 defining module (a three-form, six-alias patch census confirms no test patches
 any of them on ``charlie_work.workflow``).
 """
@@ -28,6 +30,7 @@ from charlie_work.dispatch_deferral import records_deferral
 from charlie_work import layout
 from charlie_work.ci_absence import CiAbsence, runs_terminally_without_jobs
 from charlie_work.ci_headroom import ci_headroom_available
+from charlie_work.concurrency_governor_result import ConcurrencyGovernorResult
 from charlie_work.fleet_paths import fleet_dir
 from charlie_work.fleet_registry import registered_state_dirs, try_acquire_fleet_lock
 from charlie_work.github import GitHubError, GraphQLBudgetError
@@ -153,7 +156,7 @@ def _apply_concurrency_governor(
     *,
     live_count: int | None = None,
     apply_open_pr_backpressure: bool = False,
-) -> _wf.ConcurrencyGovernorResult:
+) -> ConcurrencyGovernorResult:
     """Apply global concurrency governor cap to a dispatch limit.
 
     Returns a ConcurrencyGovernorResult with the potentially-clamped limit
@@ -223,7 +226,7 @@ def _apply_concurrency_governor(
     if max_concurrent > 0 or ci_headroom_ratio > 0:
         if live_count is None:
             sessions_dir = self._layout.sessions_dir
-            live_count = _wf._count_live_sessions(sessions_dir, self.paths.state_file)
+            live_count = self.host.sessions.live_workers(sessions_dir, self.paths.state_file)
 
     if max_concurrent > 0:
         available_slots = max(0, max_concurrent - (live_count or 0))
@@ -233,7 +236,9 @@ def _apply_concurrency_governor(
             clamped_by = "max_concurrent"
 
     if fleet_max > 0:
-        fleet_live_count, _skipped_repos = _wf.count_fleet_live_sessions(self.fleet_dir_override)
+        fleet_live_count, _skipped_repos = self.host.sessions.fleet_live_workers(
+            self.fleet_dir_override
+        )
         fleet_available = max(0, fleet_max - fleet_live_count)
         if fleet_available < dispatch_limit:
             dispatch_limit = fleet_available
@@ -418,7 +423,7 @@ def _apply_concurrency_governor(
                 clamped = True
                 clamped_by = "host_load"
 
-    return _wf.ConcurrencyGovernorResult(
+    return ConcurrencyGovernorResult(
         clamped=clamped,
         max_concurrent=max_concurrent,
         live_count=live_count or 0,

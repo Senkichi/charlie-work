@@ -74,6 +74,26 @@ _POST_CAMPAIGN_SURFACE_ADDITIONS_DIR = (
     Path(__file__).parent / "baselines" / "post_campaign_surface_additions"
 )
 
+# Lexical (class-body) additions are declared separately: the installed-delegate
+# set above can only hold members attached by the installer, but a net-new
+# member defined directly in the class body (e.g. the ``host`` port-bundle
+# property, wave D) is lexical. Same per-member marker-file form; each name
+# must be a real lexical def, so a removed or renamed member fails closed.
+_POST_CAMPAIGN_LEXICAL_ADDITIONS_DIR = (
+    Path(__file__).parent / "baselines" / "post_campaign_lexical_additions"
+)
+
+
+def _post_campaign_lexical_additions() -> frozenset[str]:
+    """Load the declared post-campaign lexical additions; fail closed."""
+    try:
+        return load_set_baseline(_POST_CAMPAIGN_LEXICAL_ADDITIONS_DIR)
+    except BaselineFormatError as exc:
+        pytest.fail(
+            f"post-campaign lexical-additions baseline is missing or malformed "
+            f"at {_POST_CAMPAIGN_LEXICAL_ADDITIONS_DIR} (fail closed): {exc}"
+        )
+
 
 def _post_campaign_surface_additions() -> frozenset[str]:
     """Load the declared post-campaign member additions; fail closed."""
@@ -585,7 +605,13 @@ def test_orchestratorapp_member_surface_conserved_lexical_plus_installed() -> No
         f"{sorted(additions - installed)}"
     )
     moved_delegates = installed - additions
-    assert lexical_defs + len(moved_delegates) == _PRE_CAMPAIGN_MEMBER_SURFACE
+    lexical_additions = _post_campaign_lexical_additions()
+    assert lexical_additions <= lexical_names, (
+        f"declared lexical addition(s) not defined in the class body: "
+        f"{sorted(lexical_additions - lexical_names)}"
+    )
+    moved_lexical = lexical_names - lexical_additions
+    assert len(moved_lexical) + len(moved_delegates) == _PRE_CAMPAIGN_MEMBER_SURFACE
 
     shadowed = installed & lexical_names
     assert not shadowed, (

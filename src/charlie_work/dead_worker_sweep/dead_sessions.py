@@ -46,7 +46,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -56,6 +56,7 @@ from ..config import OrchestratorConfig
 from ..dispatch_selection import _windowed_redispatch_at
 from ..escalation import _escalate_issue, _escalation_edge
 from ..fleet_registry import managed_repo_names
+from ..host import current as _host_current
 from ..github import GitHubLike, build_branch_issue_validator, label_names
 from ..issue_linking import linked_issue_number
 from ..paths import resolved_layout
@@ -200,7 +201,7 @@ def _escalate_launch_failure(ctx: SessionPass, w: worker.WorkerView, failure_kin
                 entry, window_minutes=config.watchdog.redispatch_window_minutes
             ),
             failure_kind,
-            now=datetime.now(UTC),
+            now=_host_current().clock.now(),
             active_labels=active_labels,
         )
         redispatch_at = list(plan.redispatch_at)
@@ -446,7 +447,9 @@ def _reap_dead(
     def record_post_mortem() -> None:
         # Diagnostic; for a completed worktree its worker_blocked verdict is ignored
         # because the worktree itself proves the work was completed.
-        post_mortem.classify_and_record(ctx.sessions_dir, config, w, now=datetime.now(UTC))
+        post_mortem.classify_and_record(
+            ctx.sessions_dir, config, w, now=_host_current().clock.now()
+        )
 
     if classification.post_mortem_first:
         record_post_mortem()
@@ -520,7 +523,7 @@ def classify_dead_sessions(
     contract and the issues that shaped it.
     """
     write_gate = require_write_gate(write_gate)
-    now_for_health = now if now is not None else datetime.now(UTC)
+    now_for_health = now if now is not None else _host_current().clock.now()
 
     repo_root = getattr(gh, "repo_root", None)
     open_prs = _open_prs_by_issue(gh, config)

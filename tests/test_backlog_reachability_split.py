@@ -61,6 +61,9 @@ _MOVED_NAMES = (
     # original move -- the module's namespace is still the contract, so
     # new units land here (and in the facade) rather than bypassing it.
     "mention_scan_repo_context",
+    # Wave D5b: the merged-PR list outcome value type lives beside its
+    # fetcher (fetch_merged_prs_fail_open); workflow.py re-exports it.
+    "_MergedPRListOutcome",
 )
 
 
@@ -406,7 +409,11 @@ def test_consumer_reference_scan_finds_the_known_anchor() -> None:
     assert (
         set(referenced.keys())
         == set(referenced_all.keys())
-        == {"classify_backlog_reachability", "resolve_dispatch_mention_coverage"}
+        == {
+            "classify_backlog_reachability",
+            "resolve_dispatch_mention_coverage",
+            "_MergedPRListOutcome",
+        }
     )
 
 
