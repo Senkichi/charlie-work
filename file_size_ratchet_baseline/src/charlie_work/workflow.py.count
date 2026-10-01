@@ -1,4 +1,4 @@
-8800
+7400
 # Issue #1971 / PR #1999 rework: the merged #2049 worker-fate wiring plus
 # this PR's pre-lock park-drain call site grew the live count to 8621, past
 # the 8600 mark. The added behavior lives in the domain modules

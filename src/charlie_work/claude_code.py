@@ -742,7 +742,7 @@ def resolve_review_effort(
     same deletion that removed the bridge itself. There is no fallback to a
     ``review_dispatch`` value here for the same reason ``devin.adapter`` was
     deleted rather than silently ignored: an old key that's still read halfway
-    is worse than one that errors loudly at load (config.py's ``_build_section``
+    is worse than one that errors loudly at load (config.py's ``validate_section``
     already rejects any surviving ``review_dispatch.review_effort*`` key as
     unknown before this function ever runs).
     """

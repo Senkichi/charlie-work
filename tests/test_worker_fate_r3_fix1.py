@@ -20,9 +20,8 @@ import pytest
 
 from _orphan_sweep_fixtures import _dead_worker_rework_bed, _run_orphan_sweep
 from charlie_work import worker_fate
-from charlie_work.orphaned_worker_sweep import maybe_reap_dead_dispatched_worker
 from charlie_work.process_utils import write_worker_terminal_status
-from charlie_work.state import load_state, parse_iso_timestamp
+from charlie_work.state import load_state, parse_iso_timestamp, save_state
 
 
 def _iso(value: datetime) -> str:
@@ -84,31 +83,23 @@ def test_fresh_exit_zero_record_still_routes_to_clean_exit_no_op(tmp_path: Path)
 
 
 def test_dead_dispatched_reap_ignores_a_stale_terminal_exit_code(tmp_path: Path) -> None:
-    now = datetime.now(UTC)
-    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
-    _write_terminal(tmp_path, ended_ago=timedelta(hours=3))
-    entry = {
-        "status": "dispatched",
-        "worker_pid": 99999,
-        "dispatched_at": _iso(now - timedelta(hours=1)),
-        "orphan_drift_at": _iso(now - timedelta(hours=2)),
-    }
-    events: list[tuple[str, dict[str, Any]]] = []
-
-    _state, reaped = maybe_reap_dead_dispatched_worker(
-        state={"issues": {"207": dict(entry)}, "prs": {}, "events": []},
-        entry=entry,
-        issue_number=207,
-        sessions_dir=sessions_dir,
-        pr_data=None,
-        dead_dispatched_reap_minutes=60,
-        now=now,
-        sweep_events=events,
-        max_throttle_rearms=0,
+    config, paths, fake_gh, _dispatched_at = _dead_worker_rework_bed(
+        tmp_path, decision="request_changes"
     )
+    now = datetime.now(UTC)
+    _write_terminal(tmp_path, ended_ago=timedelta(hours=3))
+    # Drift was first surfaced two hours ago: past the 60-minute #654 grace.
+    state = load_state(paths.state_file)
+    state["issues"]["207"]["orphan_drift_at"] = _iso(now - timedelta(hours=2))
+    save_state(paths.state_file, state)
 
-    assert reaped is True
-    payloads = [p for kind, p in events if kind == "dead_dispatched_worker_reaped"]
+    _run_orphan_sweep(tmp_path, paths, config, fake_gh)
+
+    state = load_state(paths.state_file)
+    assert state["issues"]["207"]["escalation_reason"] == "dead_dispatched_worker_reap"
+    payloads = [
+        e["payload"] for e in state["events"] if e["kind"] == "dead_dispatched_worker_reaped"
+    ]
     assert [p["exit_code"] for p in payloads] == [None]
 
 

@@ -757,10 +757,14 @@ def test_host_load_knob_accepts_zero_as_kill_switch() -> None:
 
 @pytest.mark.parametrize("bad", ["8", 8.0, True])
 def test_host_load_knob_rejects_non_int(bad: object) -> None:
-    with pytest.raises(ConfigError, match="host_load_max_pytest_processes.*must be an int"):
+    with pytest.raises(
+        ConfigError, match=r"^dispatch\.host_load_max_pytest_processes: expected int, got "
+    ):
         build_config_from_data({"dispatch": {"host_load_max_pytest_processes": bad}})
 
 
 def test_host_load_knob_rejects_negative() -> None:
-    with pytest.raises(ConfigError, match="host_load_max_pytest_processes.*must be >= 0"):
+    with pytest.raises(
+        ConfigError, match=r"^dispatch\.host_load_max_pytest_processes: expected >= 0, got -1$"
+    ):
         build_config_from_data({"dispatch": {"host_load_max_pytest_processes": -1}})

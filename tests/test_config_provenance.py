@@ -330,7 +330,7 @@ def test_layered_control_known_section_unknown_key_already_consistent(
 ) -> None:
     """Pin for the matrix's third cell (not #962's bug): a *known* section
     with an *unknown key* inside it was already rejected consistently by both
-    loaders before this fix, because `_build_section`'s key check runs on the
+    loaders before this fix, because `validate_section`'s key check runs on the
     section's own dict regardless of whether the section name is known at the
     top level. Guards against a #962 fix that accidentally touches this path."""
     direct_path = _repo_with_config(tmp_path / "direct", "dispatch:\n  not_a_real_key: 1\n")

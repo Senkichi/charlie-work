@@ -2,14 +2,12 @@ from __future__ import annotations
 
 import copy
 import logging
-import math
 import os
-import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field, fields, replace
-from pathlib import Path, PurePosixPath, PureWindowsPath
+from pathlib import Path
 from types import MappingProxyType
-from typing import Any
+from typing import Annotated, Any
 
 import yaml
 
@@ -31,6 +29,42 @@ from ci_fleet.config import (  # noqa: F401  (deliberate re-export)
     RunnerScalingConfig,
 )
 
+# ``ConfigError`` moved to ``config_validation`` (ADR-0007) so section modules can
+# raise it without a lazy import of this module; ``charlie_work.config.ConfigError``
+# remains the public name and is the same class object.
+from .config_validation import ConfigError  # noqa: F401  (deliberate re-export)
+from .config_validation import (
+    AtLeastOne,
+    BoolTolerant,
+    Coerced,
+    CoercedLenient,
+    CommandTemplate,
+    FieldError,
+    Check,
+    FieldRules,
+    Finite,
+    HostWideOnly,
+    InRange,
+    LenientMapping,
+    NonEmpty,
+    NonEmptyRaw,
+    NonNeg,
+    NotNull,
+    NullIsDefault,
+    Note,
+    OneOf,
+    Positive,
+    Regex,
+    RelativePath,
+    Typed,
+    Verbatim,
+    field_rules,
+    field_specs,
+    run_section_hooks,
+    unknown_sections_error,
+    validate_section,
+)
+
 # Re-exported from the domain module (issue #763) for the same reason
 # ``RunnerAllocationConfig`` is re-exported from ``ci_fleet.config`` above:
 # the dataclass lives in its own module so new code does not land in this
@@ -40,7 +74,6 @@ from ci_fleet.config import (  # noqa: F401  (deliberate re-export)
 # the capacity-starvation seam is guarded by ``test_capacity_starvation_escalation.py``.
 from .capacity_starvation_escalation import (  # noqa: F401  (deliberate re-export)
     RunnerCapacityEscalationConfig,
-    parse_runner_capacity_escalation,
 )
 
 # Re-exported from the domain module (issue #1833) for the same reason
@@ -59,7 +92,7 @@ from .github_capabilities.circuit_breaker import (  # noqa: F401  (deliberate re
 # own module so new parse rules do not land in this over-cap monolith
 # (file-size ratchet, issue #1442); ``build_config_from_data`` delegates to
 # it below.
-from .deescalation_config import parse_deescalation_overrides
+from .deescalation_config import project_scoped_keys
 
 # Issue #1976: the deprecated-key registry lives in its own leaf module so
 # ``load_config`` can emit ``config_key_deprecated_read`` at the point a
@@ -80,7 +113,13 @@ from .fleet_supervisor_config import (  # noqa: F401  (deliberate re-export)
 
 from . import layout
 from .harnesses import REVIEWER_HARNESSES, WORKER_HARNESSES
-from .role_chain import RoleEntry, chain_of, normalize_role_section, warn_same_family
+from .role_chain import (
+    RoleEntry,
+    chain_of,
+    check_reviewer_role_chain,
+    check_role_chain,
+    role_entries,
+)
 from .issue_comments import DEFAULT_INCLUDED_ASSOCIATIONS as DEFAULT_COMMENT_ASSOCIATIONS
 
 logger = logging.getLogger(__name__)
@@ -192,45 +231,6 @@ PRIOR_WORKER_STILL_ALIVE_FAILURE_KIND = "prior_worker_still_alive"
 PRE_LAUNCH_BLOCKED_ENVIRONMENT_FAILURE_KINDS: frozenset[str] = frozenset(
     {"worktree_foreign_writer", PRIOR_WORKER_STILL_ALIVE_FAILURE_KIND}
 )
-
-
-class ConfigError(ValueError):
-    """A config file was structurally invalid (unknown keys, wrong shapes)."""
-
-
-def _validate_command_placeholders(
-    command: str | tuple[str, ...],
-    allowed_placeholders: set[str],
-    config_key: str,
-) -> None:
-    """Validate that a command template uses only allowed placeholders.
-
-    Raises ConfigError if an unknown or malformed placeholder is found.
-    """
-    # Pattern to match {placeholder} tokens
-    placeholder_pattern = re.compile(r"\{([^{}]*)\}")
-
-    parts = command if isinstance(command, tuple) else (command,)
-    for part in parts:
-        matches = placeholder_pattern.findall(part)
-        for match in matches:
-            if match == "":
-                raise ConfigError(
-                    f"config section '{config_key}': empty placeholder {{}} is not allowed"
-                )
-            if match not in allowed_placeholders:
-                raise ConfigError(
-                    f"config section '{config_key}': unknown placeholder {{{match}}} "
-                    f"(allowed: {', '.join(sorted(allowed_placeholders))})"
-                )
-        # Simulate render to catch malformed placeholders that the regex misses
-        # (bare {, unclosed {prompt_path, stray }, positional {0})
-        try:
-            part.format(**{p: "" for p in allowed_placeholders})
-        except (ValueError, KeyError, IndexError) as e:
-            raise ConfigError(
-                f"config section '{config_key}': malformed placeholder in '{part}': {e}"
-            ) from e
 
 
 @dataclass(frozen=True)
@@ -364,7 +364,7 @@ class DispatchConfig:
     # time (same source the merge-hold check uses), not a cached snapshot,
     # so an operator adding or removing the label mid-flight takes effect on
     # the next pass.
-    human_merge_labels: tuple[str, ...] = ()
+    human_merge_labels: Annotated[tuple[str, ...], Typed, NotNull] = ()
     # Package template rendered for worker prompts. "worker.md" targets Devin
     # sessions (skills-based loop); "worker_claude_code.md" targets Claude Code
     # workers (direct shell loop). A repo-local prompts dir overrides by filename.
@@ -379,7 +379,7 @@ class DispatchConfig:
     # dependency group that declares pytest -- and, when nothing is derivable,
     # tells the worker to use the command the repository documents in CLAUDE.md.
     # See prompt_test_command.
-    test_command: str = ""
+    test_command: Annotated[str, Typed, NullIsDefault] = ""
     # Global concurrency governor: cap total live worker sessions across fresh,
     # rework, and recovery dispatch. Unset/0 preserves current unlimited behavior.
     max_concurrent_sessions: int = 0
@@ -392,7 +392,7 @@ class DispatchConfig:
     # Rework, conflict-rework, recovery, and review dispatch are NOT gated --
     # they reduce verification debt rather than adding to it. 0 = off,
     # preserving current behavior.
-    max_open_agent_prs: int = 0
+    max_open_agent_prs: Annotated[int, Typed, NonNeg] = 0
     # Issue #1770: CI-capacity headroom for fresh-issue dispatch. When > 0,
     # fresh dispatch additionally clamps to ci_headroom_available()'s reading
     # for this repo -- floor(registered_runner_capacity * ratio) minus live
@@ -425,7 +425,7 @@ class DispatchConfig:
     # Rework, conflict-rework, recovery, and review dispatch are NOT gated,
     # same rationale as max_open_agent_prs -- they reduce WIP rather than
     # adding to it. 0 = off, preserving current behavior.
-    ci_capacity_headroom_ratio: float = 0.0
+    ci_capacity_headroom_ratio: Annotated[float, Typed, NonNeg] = 0.0
     # Issue #1843: host-load backpressure for every dispatch lane that can
     # launch a worker (fresh, rework, and the loop's shared wave budget).
     # Unlike max_open_agent_prs/ci_capacity_headroom_ratio this term is NOT
@@ -462,32 +462,36 @@ class DispatchConfig:
     # entirely (also the effective behavior where os.cpu_count() returns
     # None). A failed measurement fails OPEN (dispatch proceeds) and is
     # reported via a rate-limited host_load_unavailable event.
-    host_load_max_pytest_processes: int = field(default_factory=lambda: (os.cpu_count() or 0) * 3)
-    host_load_max_pytest_trees: int = field(default_factory=lambda: (os.cpu_count() or 0) // 2)
+    host_load_max_pytest_processes: Annotated[int, Typed, NonNeg] = field(
+        default_factory=lambda: (os.cpu_count() or 0) * 3
+    )
+    host_load_max_pytest_trees: Annotated[int, Typed, NonNeg] = field(
+        default_factory=lambda: (os.cpu_count() or 0) // 2
+    )
     # Repo-root-relative paths copied into each worktree after creation
     # (e.g. [".devin"]). Copy-not-link (workers may write marker files);
     # skip-if-tracked (tracked paths are already present). Errors surface as
     # values in SessionRecord.error.
-    materialize_dirs: tuple[str, ...] = ()
+    materialize_dirs: Annotated[tuple[str, ...], Coerced] = ()
     # Base ref for fresh worktree creation. Empty string (default) means auto-resolve
     # to origin/<default-branch>. If set, must be a valid git ref (e.g., "origin/main",
     # "HEAD", or a commit SHA). When the resolved base ref is a remote-tracking ref
     # (origin/<branch>), git fetch is run before worktree creation to ensure the
     # worktree bases off the latest remote tip instead of a stale local HEAD.
-    base_ref: str = ""
+    base_ref: Annotated[str, Typed] = ""
     # Dispatch order: "oldest" (default) selects issues by creation date ascending,
     # "newest" selects by creation date descending (previous behavior).
-    order: str = "oldest"
+    order: Annotated[str, Typed, OneOf("oldest", "newest")] = "oldest"
     # Seconds to sleep between consecutive worker-session launches within a
     # single dispatch pass (fresh or rework lane). Bursting several launches
     # back-to-back can trip a provider's message rate limit (observed:
     # Devin's "overall message rate limit" firing when 3 sessions launched
     # within 6 seconds, killing all three instantly). 0 disables the stagger.
-    launch_stagger_seconds: int = 45
+    launch_stagger_seconds: Annotated[int, Typed, BoolTolerant, NonNeg] = 45
     # Per-pass cap for merge-finalization of merged-PR-referenced ready issues
     # (label transition + close). A large backlog of closed issues carrying a
     # stale ready marker cannot monopolize a pass. 0 disables finalization.
-    finalize_limit: int = 25
+    finalize_limit: Annotated[int, Typed, BoolTolerant, NonNeg] = 25
     # Worktree-relative paths owned by the orchestrator and excluded from
     # "is the worktree dirty?" checks. By default the Claude Code adapter's
     # in-worktree prompt file and the per-worktree writer marker are excluded.
@@ -497,7 +501,7 @@ class DispatchConfig:
     # writes prompt files back into the worktree must set ``injected_paths``
     # explicitly. Paths are normalized to forward slashes so Windows-style
     # backslash separators in config still match git-reported paths.
-    injected_paths: tuple[str, ...] = ()
+    injected_paths: Annotated[tuple[str, ...], Typed] = ()
     # Issue comments rendered into the worker prompt (issue #872). A worker that
     # only sees ``issue.body`` cannot see the comment that corrected it.
     #
@@ -507,21 +511,23 @@ class DispatchConfig:
     # ``viewerDidAuthor`` looks like the natural self-filter and is the wrong
     # one -- the orchestrator authenticates as the operator's own account, so it
     # is true for exactly the human corrections this feature exists to deliver.
-    worker_prompt_comment_associations: tuple[str, ...] = DEFAULT_COMMENT_ASSOCIATIONS
+    worker_prompt_comment_associations: Annotated[tuple[str, ...], Typed, NotNull] = (
+        DEFAULT_COMMENT_ASSOCIATIONS
+    )
     # Logins whose comments are dropped regardless of association. Empty by
     # default; the escape hatch for a bot that comments as a COLLABORATOR, or
     # for the orchestrator's own future issue-side chatter.
-    worker_prompt_excluded_comment_authors: tuple[str, ...] = ()
+    worker_prompt_excluded_comment_authors: Annotated[tuple[str, ...], Typed, NotNull] = ()
     # Prompt budget. Newest comments win when either bound binds, and the
     # rendered block says how many were dropped rather than truncating silently.
     # 0 disables the respective bound.
-    worker_prompt_max_comments: int = 20
-    worker_prompt_max_comment_chars: int = 12000
+    worker_prompt_max_comments: Annotated[int, Typed, NonNeg] = 20
+    worker_prompt_max_comment_chars: Annotated[int, Typed, NonNeg] = 12000
     # Issue #946: maximum age (in minutes) of the most recent non-empty
     # ``dispatch`` event (payload ``issue_numbers != []``) before a warning
     # fires while the unfiltered backlog is observed to be non-empty. 0
     # disables the check.
-    dispatch_staleness_minutes: int = 240
+    dispatch_staleness_minutes: Annotated[int, Typed, NonNeg] = 240
     # Issue #1682: maximum idle time (in minutes) of a dependency root blocker
     # before an otherwise-silent ``all_ready_blocked_by_dependencies`` backlog
     # fires ``dependency_root_blocker_idle`` instead. "Idle" means no recorded
@@ -533,14 +539,14 @@ class DispatchConfig:
     # enough that a wedged root is surfaced within a day, long enough that a
     # root merely waiting out a slow CI cycle or an overnight review is not
     # paged as stuck.
-    dependency_stall_minutes: int = 1440
+    dependency_stall_minutes: Annotated[int, Typed, NonNeg] = 1440
     # Issue #1853: DEPRECATED no-op, kept only so existing config files that
     # set it still parse. The worker-GitHub-token dispatch gate (issue #1001)
     # was retired when the operator decided workers stay credential-free by
     # design — PR mutations flow through ``.worker-outcome.json`` and the
     # authenticated orchestrator applies them (see ``rework_outcome.py``).
     # The staged-rollout plan this flag served (issue #1224) is superseded.
-    require_worker_github_token: bool = False
+    require_worker_github_token: Annotated[bool, Typed] = False
     # Issue #1944: on a repo with no remote, an agent branch whose commits are
     # unreachable from the default branch can never become "pushed" — there is
     # nowhere to push — so refusing to reset it escalates the issue on every
@@ -552,7 +558,7 @@ class DispatchConfig:
     # refuse-and-escalate behavior. Repos WITH an origin remote are unaffected —
     # unpushed commits there keep refusing either way, because a salvage push
     # is real.
-    archive_unreachable_local_commits: bool = True
+    archive_unreachable_local_commits: Annotated[bool, Typed] = True
 
     def __post_init__(self) -> None:
         # Normalize to a tuple of forward-slash strings. The writer marker is
@@ -655,7 +661,7 @@ class ReviewConfig:
     # codebase's design explicitly avoids -- keep them separate by contract,
     # not just by accident. 15 minutes gives a retriggered run enough time to
     # actually appear before another attempt is considered.
-    stale_checks_grace_minutes: int = 15
+    stale_checks_grace_minutes: Annotated[int, Typed, NonNeg] = 15
     # Same issue: bounds how many retrigger attempts (close/reopen or
     # empty-commit, combined -- one shared counter, not two) a single PR gets
     # before this codebase escalates it to a human via `_escalate_issue`
@@ -664,7 +670,7 @@ class ReviewConfig:
     # small bound that absorbs transient GitHub-side propagation lag without
     # spinning indefinitely on a PR where retriggering mechanically cannot
     # help (e.g. a workflow file itself is broken).
-    stale_checks_max_retriggers: int = 3
+    stale_checks_max_retriggers: Annotated[int, Typed, NonNeg] = 3
     # Issue #1132: a transient GraphQL repo-resolution failure (e.g. during a
     # ~7-minute network/ISP dip) was classified as a permanent
     # ``foreign_issue_ref`` park because ``GitHubNotFoundError`` conflates
@@ -677,13 +683,13 @@ class ReviewConfig:
     # original one-pass park behavior (use only if the classification guard
     # alone is trusted). Legacy markers without a ``confirmations`` field are
     # treated as already-confirmed so existing parks are not re-processed.
-    foreign_issue_ref_confirm_passes: int = 2
+    foreign_issue_ref_confirm_passes: Annotated[int, Typed, AtLeastOne] = 2
     # ``foreign_issue_ref_reprobe_hours``: re-probe a parked marker via REST
     # ``issue_view`` on this cadence; if the issue now resolves, clear the
     # marker, emit an event, and resume per-PR processing. A wrong park
     # self-heals in hours instead of sitting forever. 0 disables self-heal
     # (operator-only remedy via ``charlie unescalate --pr``).
-    foreign_issue_ref_reprobe_hours: int = 24
+    foreign_issue_ref_reprobe_hours: Annotated[int, Typed, NonNeg] = 24
     # Issue #1642: case-insensitive substring markers that flag a
     # ``request_changes`` finding as asking for a human/operator decision.
     # ``record_review`` runs ``review_decision.human_decision_marker_match``
@@ -707,7 +713,7 @@ class ReviewConfig:
     # under agent:human-needed for days. The phrase set below keeps all 4
     # genuine human calls in that corpus (pinned verbatim in
     # tests/test_human_decision_marker_corpus.py).
-    human_decision_markers: tuple[str, ...] = (
+    human_decision_markers: Annotated[tuple[str, ...], Typed, NotNull] = (
         "human call",
         "operator call",
         "human/operator",
@@ -728,7 +734,7 @@ class ReviewConfig:
 
     def __post_init__(self) -> None:
         # Mirror DispatchConfig.__post_init__: ``load_config`` validates and
-        # converts the YAML list to a tuple before ``_build_section``, but a
+        # converts the YAML list to a tuple before ``validate_section``, but a
         # direct ``ReviewConfig(...)`` in a test or a caller bypasses that --
         # normalize here so a bare string is wrapped rather than iterated
         # character-by-character and a list cannot smuggle mutability into a
@@ -749,28 +755,28 @@ class QuotaProbeConfig:
     # clears the throttle early on a green result, instead of always riding
     # out the full cooldown window. False disables probing entirely -- the
     # cooldown then behaves exactly as before this feature existed.
-    enabled: bool = True
+    enabled: Annotated[bool, Typed] = True
     # Flat retry interval, NOT exponential backoff (deliberately distinct
     # from review_dispatch's quota_probe_interval_minutes below, which
     # doubles on each consecutive failure). The probe is cheap enough that a
     # fixed 15-minute cadence for the lifetime of the throttle is acceptable,
     # and a flat interval is simpler to reason about for "did my account
     # switch get picked up yet".
-    interval_minutes: int = 15
+    interval_minutes: Annotated[int, Typed, AtLeastOne] = 15
     # Short alias form (matches ClaudeCodeConfig.model's convention), pinned
     # explicitly via --model so the probe never inherits ambient /model
     # state -- see ClaudeCodeConfig.model's comment for the outage this
     # guards against. A dedicated Haiku pin (distinct from claude_code.model)
     # keeps the probe cheap regardless of what model workers/reviewers use.
-    model: str = "claude-haiku-4-5"
+    model: Annotated[str, Typed, NonEmpty] = "claude-haiku-4-5"
     # Bounded synchronous subprocess timeout. A single "reply OK" prompt
     # should return in well under a minute; this is a ceiling against a hung
     # CLI process, not an expected duration.
-    timeout_seconds: int = 60
+    timeout_seconds: Annotated[int, Typed, AtLeastOne] = 60
     # Deliberately trivial: the probe only needs to prove the CLI can
     # complete a session without hitting a throttle/auth signature, not
     # produce any real work.
-    prompt: str = "Reply with the single word OK and nothing else."
+    prompt: Annotated[str, Typed, NonEmpty] = "Reply with the single word OK and nothing else."
 
 
 @dataclass(frozen=True)
@@ -802,14 +808,14 @@ class ReconcilePassConfig:
     # defaulted off would leave that divergence class unrepaired until an
     # operator remembered to flip it -- exactly the failure mode this
     # workstream exists to close. The knob exists for rollback, not opt-in.
-    enabled: bool = True
+    enabled: Annotated[bool, Typed] = True
     # detect_drift() issues two full-repo GitHub list queries (all PRs, all
     # issues) plus a GraphQL rate-limit check every time it runs -- heavier
     # than quota_probe's single cheap Haiku subprocess call, so a longer flat
     # cadence than quota_probe's 15 minutes is appropriate here. 30 minutes
     # still comfortably beats "only ever runs when an operator remembers to
     # run mop-up".
-    interval_minutes: int = 30
+    interval_minutes: Annotated[int, Typed, AtLeastOne] = 30
     # Issue #947: ``agent:human-needed`` is a forced terminal state with no
     # other alerting -- an issue parked there (e.g. #894) is silently
     # invisible until an operator happens to look. detect_drift() reports any
@@ -819,7 +825,7 @@ class ReconcilePassConfig:
     # ``mergequeue_revoked`` alert-only kinds -- no dedup marker). 2 days
     # balances catching a genuinely stuck issue against not paging on every
     # escalation that clears same-day via ``charlie unescalate``.
-    terminal_state_alert_days: int = 2
+    terminal_state_alert_days: Annotated[int, Typed, AtLeastOne] = 2
 
 
 @dataclass(frozen=True)
@@ -871,7 +877,7 @@ class DeescalationConfig:
     # degraded-cadence fleet (the observed #1306 loop re-escalated ~36 min
     # after the 2026-08-27T00:23:54Z manual unescalate; the two 08-25
     # escalations were ~10.5h apart).
-    identical_reason_recurrence_window_minutes: int = 1440
+    identical_reason_recurrence_window_minutes: Annotated[int, Typed, NonNeg, NullIsDefault] = 1440
     # Issue #1314 item 2 (retained by #1768's rewrite): dedicated cadence
     # knob for the operator-queue-impact check. The check currently rides
     # the loop pass cadence (every pass); this knob lets operators slow it
@@ -880,7 +886,7 @@ class DeescalationConfig:
     # > 0 means "check every N minutes", gated by a
     # ``next_operator_queue_review_at`` timestamp in ``state.json``'s
     # ``deescalation_pass`` section.
-    operator_queue_review_interval_minutes: int = 0
+    operator_queue_review_interval_minutes: Annotated[int, Typed, NonNeg, NullIsDefault] = 0
     # Issue #1768 (retired the #1314 item 3 raw-count gauge this field used
     # to threshold): alert threshold for the operator-queue-impact signal,
     # reused as-is rather than introduced as a new key since no fleet repo
@@ -893,7 +899,13 @@ class DeescalationConfig:
     # root-set change, a threshold crossing, or an age-bucket crossing),
     # never unconditionally every pass the condition holds. 0 disables the
     # alert entirely (no event emitted regardless of impact).
-    operator_queue_depth_threshold: int = 5
+    operator_queue_depth_threshold: Annotated[
+        int,
+        Typed,
+        NonNeg,
+        NullIsDefault,
+        Note("blocked-ready-issue count, not root-issue count -- see issue #1768"),
+    ] = 5
 
 
 @dataclass(frozen=True)
@@ -901,18 +913,18 @@ class ReviewDispatchConfig:
     # Issue #370: concurrent reviewer launcher for queued PRs. This is a
     # deterministic loop stage, not a provider governor; reviewers use
     # launch_claude_worker with no concurrency clamp for rate-limit reasons.
-    enabled: bool = False
+    enabled: Annotated[bool, Typed] = False
     # Per-PR review sidecar + log directory. MUST be distinct from
     # devin.sessions_dir so worker concurrency accounting is not poisoned by
     # reviewer processes. Empty string means "derive from runtime.state_dir"
     # (layout.reviews_dir_default) rather than a fixed literal -- see
     # paths.resolved_layout, the single place that resolves this sentinel.
-    reviews_dir: str = ""
+    reviews_dir: Annotated[str, Typed] = ""
     # Local-only process bound. 0 means unlimited; raise this only if local
     # CPU/disk from concurrent reviewer worktrees becomes a visible bottleneck.
     # Default is 2 so a host that enables review_dispatch without overriding
     # this key does not run an unbounded number of local Claude Code reviewers.
-    max_local_review_processes: int = 2
+    max_local_review_processes: Annotated[int, Typed, BoolTolerant, NonNeg] = 2
     # Provider-token budget slots. Limits how many reviewers can be in flight
     # simultaneously against the Claude usage budget. When a slot frees (a
     # reviewer finishes), the next poll dispatches another. 0 means unlimited.
@@ -929,7 +941,7 @@ class ReviewDispatchConfig:
     # (4h) keeps the floor below quota_reset_hours's default 5h window so a
     # probe is still attempted at least once before/around the window's
     # natural expiry. 0 disables the cap (backoff grows unbounded).
-    quota_probe_max_interval_minutes: int = 240
+    quota_probe_max_interval_minutes: Annotated[int, Typed, NonNeg] = 240
     # Approximate provider usage-limit reset window in hours. When a reviewer
     # launch hits the wall, the global reviewer quota is held exhausted for at
     # least this long while probes run every ``quota_probe_interval_minutes``.
@@ -940,7 +952,7 @@ class ReviewDispatchConfig:
     # for an advanced head. Without this cap, a PR that never produces a
     # verdict (e.g. every reviewer hits the session limit) is re-dispatched
     # indefinitely, burning quota every stale-claim interval.
-    max_review_dispatch_attempts: int = 3
+    max_review_dispatch_attempts: Annotated[int, Typed, AtLeastOne] = 3
     # Maximum consecutive UNDETERMINED (unreadable/empty reviewer log)
     # classifications for the same PR before the rollback stops preserving
     # the attempt budget (issue #1069). The first N consecutive undetermined
@@ -955,7 +967,7 @@ class ReviewDispatchConfig:
     # definitive outcome (throttled, not-throttled, verdict recorded, new
     # packet, operator unescalate). 0 disables the bound (preserves the
     # pre-fix unbounded rollback — not recommended).
-    max_consecutive_review_log_unreadable: int = 3
+    max_consecutive_review_log_unreadable: Annotated[int, Typed, NonNeg] = 3
     # Issue #1808: a dead reviewer whose terminal result event is an
     # ``api_error`` with a provider-side status (429/500/502/503/529) is a
     # provider outage, not a PR defect. The first N consecutive such deaths on
@@ -965,19 +977,19 @@ class ReviewDispatchConfig:
     # ``max_review_dispatch_attempts`` cap. The streak resets on any definitive
     # outcome (recorded verdict, non-api death, new packet, operator
     # unescalate). 0 disables the rollback (api errors count as before).
-    max_consecutive_review_api_errors: int = 3
+    max_consecutive_review_api_errors: Annotated[int, Typed, NonNeg] = 3
     # Maximum agentic turns for a reviewer session. Caps token spend per
     # review by limiting how many tool-call round-trips the reviewer can make.
     # 0 means unlimited (preserves pre-existing behavior). 40 is generous for
     # a review (read diff, read tests, read a few source files, write verdict)
     # but prevents unbounded codebase exploration.
-    review_max_turns: int = 40
+    review_max_turns: Annotated[int, Typed, NonNeg] = 40
     # Diff line count above which the review prompt includes a diff-size
     # warning and a per-file summary instead of encouraging the reviewer to
     # read the entire diff in one shot. 0 disables the threshold (always
     # include the full diff guidance). 500 lines is ~12K tokens, a reasonable
     # single-read budget; beyond that the reviewer should read file-by-file.
-    diff_line_threshold: int = 500
+    diff_line_threshold: Annotated[int, Typed, NonNeg] = 500
     # Issue #1439: structure-aware reviewer turn cap. The flat
     # ``review_max_turns`` budget ignores the size of the files a diff touches,
     # so a PR threading a monolith (e.g. workflow.py at ~25k lines) burns the
@@ -999,27 +1011,30 @@ class ReviewDispatchConfig:
     # pre-fix unbounded retry -- not recommended).
     # Line count above which a touched file triggers the structure multiplier.
     # 0 disables the structure bonus (every diff uses the base cap).
-    turn_cap_large_file_threshold: int = 5000
+    turn_cap_large_file_threshold: Annotated[int, Typed, NonNeg] = 5000
     # Multiplier applied to ``review_max_turns`` when any touched file exceeds
     # ``turn_cap_large_file_threshold``. Clamped to ``turn_cap_max_multiplier``.
-    turn_cap_large_file_multiplier: int = 2
+    turn_cap_large_file_multiplier: Annotated[int, Typed, NonNeg] = 2
     # Absolute cap on the effective multiplier (structure bonus + miss
     # escalation combined). Prevents unbounded cap growth on a PR that keeps
     # hitting the turn limit.
-    turn_cap_max_multiplier: int = 3
+    turn_cap_max_multiplier: Annotated[int, Typed, NonNeg] = 3
     # After this many CONSECUTIVE turn-limit misses on one PR, escalate to a
     # human instead of redispatching with a further-raised (but already-maxed)
     # cap. 0 disables the backstop.
-    max_consecutive_turn_limit_misses: int = 3
-    # Issue #1445: repo file-size cap (lines). A diff that adds code to a file whose post-diff line
-    # count exceeds this cap is a REPORTABLE FINDING in the review packet (the review rubric
-    # references this cap generically rather than hardcoding a number). 0 disables the over-cap
-    # finding probe -- the rubric prose stays present but no dynamic finding section is rendered.
-    # This knob is the cap source the rubric line points at; once issue #1442's high-water-mark line-
-    # count ratchet (or its successor structural signal) lands, that source should rebind/replace
-    # this value rather than the rubric or probe hardcoding a constant of their own.
-    file_size_cap_lines: int = 0
-    review_exec_rejection_max_resumes: int = 2  # #2090 devin exec-reject resumes; 0 = off
+    max_consecutive_turn_limit_misses: Annotated[int, Typed, NonNeg] = 3
+    # Issue #1445: repo file-size cap (lines). A diff that adds code to a file
+    # whose post-diff line count exceeds this cap is a REPORTABLE FINDING in the
+    # review packet (the review rubric references this cap generically rather
+    # than hardcoding a number). 0 disables the over-cap finding probe -- the
+    # rubric prose stays present but no dynamic finding section is rendered.
+    # This knob is the cap source the rubric line points at; once issue #1442's
+    # high-water-mark line-count ratchet (or its successor structural signal)
+    # lands, that source should rebind/replace this value rather than the
+    # rubric or probe hardcoding a constant of their own.
+    file_size_cap_lines: Annotated[int, Typed, NonNeg] = 0
+    # #2090: devin exec-rejection resumes per review session; 0 = off.
+    review_exec_rejection_max_resumes: Annotated[int, Typed, NonNeg] = 2
 
 
 @dataclass(frozen=True)
@@ -1047,7 +1062,7 @@ class InfraBlockedConfig:
     #: Master switch. When False, no infra_blocked classification happens
     #: and budget-failed checks fall back to ordinary ``failed`` routing
     #: (the pre-#1383 behavior).
-    enabled: bool = True
+    enabled: Annotated[bool, Typed] = True
     #: Reserved timing threshold. Originally a separate "instant-fail"
     #: signal for jobs whose ``steps`` array the Actions API omitted (a
     #: FAILURE concluding within this many seconds of starting). The
@@ -1060,11 +1075,11 @@ class InfraBlockedConfig:
     #: still validated) as a reserved knob so a future timing signal for
     #: a distinct shape can reuse it without a config migration; it
     #: currently has no behavioral effect.
-    instant_fail_seconds: int = 10
+    instant_fail_seconds: Annotated[int, Typed, NonNeg] = 10
     #: Case-insensitive annotation substrings (matched against each
     #: annotation's ``message``) that indicate an infrastructure/billing
     #: block rather than a code failure. Kept in config per issue #1383.
-    annotation_patterns: tuple[str, ...] = (
+    annotation_patterns: Annotated[tuple[str, ...], Coerced] = (
         "the job was not started",
         "actions budget is preventing further use",
         "no runner matching",
@@ -1072,10 +1087,10 @@ class InfraBlockedConfig:
     )
     #: Number of loop passes the infra_blocked condition must persist
     #: across before a single operator-facing escalation is emitted (AC3).
-    persistence_passes: int = 3
+    persistence_passes: Annotated[int, Typed, NonNeg] = 3
     #: Window (minutes) during which only one ``infra_blocked_escalated``
     #: event is emitted, regardless of how many PRs are affected (AC3).
-    escalation_window_minutes: int = 60
+    escalation_window_minutes: Annotated[int, Typed, NonNeg] = 60
 
 
 @dataclass(frozen=True)
@@ -1090,15 +1105,15 @@ class AutoMergeConfig:
     # for single-operator repos, ["--auto"] for merge-queue/auto-merge flows).
     # Placeholder-free passthrough, validated to start with "--". Default empty
     # preserves current behavior. Takes precedence over the legacy `admin` field.
-    merge_flags: tuple[str, ...] = ()
+    merge_flags: Annotated[tuple[str, ...], Coerced] = ()
     # Post-merge branch deletion is best-effort and can never abort the
     # merge/label sequence (the local-worktree failure mode seen on one operator host).
     delete_branch: bool = True
     require_approved_review: bool = True
-    required_checks: tuple[str, ...] = ()
+    required_checks: Annotated[tuple[str, ...], CoercedLenient] = ()
     # After this many consecutive approved-but-unmergeable passes, emit a
     # merge_failed_attempt_alarm event and warning. 0 disables the alarm.
-    failed_attempt_alarm: int = 3
+    failed_attempt_alarm: Annotated[int, Typed, BoolTolerant] = 3
     # Maximum `gh run rerun` attempts per workflow run id for a required check
     # that is infra-failed (CANCELLED/INFRA_FAILURE/TIMED_OUT -- see
     # checks.classify_infra_failures, issue #841). Once every infra-failing
@@ -1113,14 +1128,14 @@ class AutoMergeConfig:
     # required check run to appear before routing an approved PR to readiness
     # rework. This catches invisible CI-never-started stalls (mergeStateStatus
     # DIRTY or a missing CI trigger). 0 disables the guard.
-    readiness_no_ci_minutes: int = 15
+    readiness_no_ci_minutes: Annotated[int, Typed, NonNeg] = 15
     # Maximum minutes after the PR's last update (updatedAt) to wait before
     # querying GitHub Actions directly to distinguish "CI never created a run
     # for this head" from "CI is pending" when the janitor gate reports
     # required checks missing. Unlike readiness_no_ci_minutes (which only
     # gates the post-approval merge_ready path), this applies to any PR
     # blocked pre-review by the janitor gate. 0 disables the guard.
-    ci_run_never_created_grace_minutes: int = 5
+    ci_run_never_created_grace_minutes: Annotated[int, Typed, NonNeg] = 5
     # Strategy controlling which open agent PRs are rebased after a
     # successful ship-it merge.
     #
@@ -1132,7 +1147,7 @@ class AutoMergeConfig:
     #   current review decision is request_changes, escalated, or blocked are
     #   still skipped.
     # - "off": never update open PR branches.
-    update_branch_strategy: str = "front_of_train"
+    update_branch_strategy: Annotated[str, NotNull] = "front_of_train"
     # Legacy alias for update_branch_strategy. Kept for backward compatibility.
     # When set, it is normalized and mapped to update_branch_strategy.
     #   true / "all"  -> "broadcast"
@@ -1154,7 +1169,7 @@ class AutoMergeConfig:
     # status to "merged" (+ label transition) once GitHub reports the PR
     # merged, so no new post-merge bookkeeping is added here. Default None
     # preserves today's self-merge behavior byte-for-byte.
-    mergequeue_label: str | None = None
+    mergequeue_label: Annotated[str | None, Typed, NonEmpty] = None
     # Issue #1194: GitHub account login of the merge-queue bot (e.g.
     # "aviator-app[bot]") whose branch sync-merges the #502 unauthorized-merge
     # tripwire may recognize as approval-covered. Deployment config, not
@@ -1162,7 +1177,7 @@ class AutoMergeConfig:
     # disables the recognition entirely: every approved-head mismatch keeps
     # firing exactly as before, so the control's failure mode is unchanged
     # until an operator names the bot.
-    queue_bot_login: str | None = None
+    queue_bot_login: Annotated[str | None, Typed, NonEmpty] = None
     # Issue #1401: time-in-mergequeue watchdog. When a PR has carried the
     # Aviator ``mergequeue`` label for more than this many hours with no head
     # movement (Aviator never rebased it) and no merge, reconcile escalates it
@@ -1176,7 +1191,7 @@ class AutoMergeConfig:
     # ``blocked`` + aviator/checks completed-failure) is unconditional when
     # ``mergequeue_label`` is set -- it is a definitive "Aviator will not merge
     # this" signal, not a heuristic, so it does not need a time floor.
-    mergequeue_wedge_hours: float = 24.0
+    mergequeue_wedge_hours: Annotated[float, Typed, NonNeg] = 24.0
 
     def __post_init__(self) -> None:
         legacy_to_strategy = {
@@ -1199,17 +1214,11 @@ class AutoMergeConfig:
             elif isinstance(raw_legacy, str):
                 legacy_value = raw_legacy.lower()
                 if legacy_value not in legacy_to_strategy:
-                    raise ConfigError(
-                        "config section 'auto_merge' key 'update_open_prs' must be "
-                        "'all', 'next', 'off', or a boolean, "
-                        f"got {raw_legacy!r}"
+                    raise FieldError(
+                        "update_open_prs", "'all', 'next', 'off', or a boolean", raw_legacy
                     )
             else:
-                raise ConfigError(
-                    "config section 'auto_merge' key 'update_open_prs' must be "
-                    "a string or boolean, "
-                    f"got {type(raw_legacy).__name__}"
-                )
+                raise FieldError("update_open_prs", "string or bool", raw_legacy, "type")
             object.__setattr__(self, "update_open_prs", legacy_value)
             object.__setattr__(self, "update_branch_strategy", legacy_to_strategy[legacy_value])
         else:
@@ -1219,25 +1228,46 @@ class AutoMergeConfig:
             elif isinstance(raw_strategy, str):
                 strategy = raw_strategy.lower()
             else:
-                raise ConfigError(
-                    "config section 'auto_merge' key 'update_branch_strategy' must be "
-                    f"a string or boolean, got {type(raw_strategy).__name__}"
-                )
+                raise FieldError("update_branch_strategy", "string or bool", raw_strategy, "type")
             if strategy not in strategy_to_legacy:
-                raise ConfigError(
-                    "config section 'auto_merge' key 'update_branch_strategy' must be "
-                    f"'front_of_train', 'broadcast', or 'off', got {self.update_branch_strategy!r}"
+                raise FieldError(
+                    "update_branch_strategy",
+                    "one of 'front_of_train', 'broadcast', 'off'",
+                    self.update_branch_strategy,
                 )
             object.__setattr__(self, "update_branch_strategy", strategy)
             object.__setattr__(self, "update_open_prs", strategy_to_legacy[strategy])
 
+        # Normalizations (not rules): the label/login thread verbatim into
+        # `gh pr edit --add-label <label>` / a commit-author comparison, so surrounding
+        # whitespace must not survive; the wedge window is stored as a float.
+        for name in ("mergequeue_label", "queue_bot_login"):
+            value = getattr(self, name)
+            if isinstance(value, str):
+                object.__setattr__(self, name, value.strip())
+        if isinstance(self.mergequeue_wedge_hours, (int, float)):
+            object.__setattr__(self, "mergequeue_wedge_hours", float(self.mergequeue_wedge_hours))
+
+    def validate(self, config: OrchestratorConfig) -> None:
+        """Cross-field rules, run once the whole config exists."""
         if self.require_current_base and self.update_branch_strategy == "off":
-            raise ConfigError(
-                "config section 'auto_merge': require_current_base=True with "
-                "update_branch_strategy='off' creates a permanent merge deadlock: the base "
-                "must be current but the branch is never synced. Set "
-                "require_current_base: false, or set update_branch_strategy to 'front_of_train' or 'broadcast'."
+            raise FieldError(
+                "require_current_base",
+                "false when update_branch_strategy is 'off' (a permanent merge deadlock: the "
+                "base must be current but the branch is never synced); set "
+                "require_current_base: false, or update_branch_strategy to 'front_of_train' "
+                "or 'broadcast'",
+                self.require_current_base,
             )
+        # Each flag must start with "--" and must not be one the orchestrator manages
+        # itself (strategy flags merge_pr appends; branch deletion is handled separately).
+        # Normalize by splitting on '=' to catch --flag=value forms.
+        for i, flag in enumerate(self.merge_flags or ()):
+            if not str(flag).startswith("--"):
+                raise FieldError(f"merge_flags[{i}]", "flag starting with '--'", flag)
+        for i, flag in enumerate(self.merge_flags or ()):
+            if str(flag).split("=", 1)[0] in ORCHESTRATOR_MANAGED_MERGE_FLAGS:
+                raise FieldError(f"merge_flags[{i}]", "flag not managed by the orchestrator", flag)
 
 
 @dataclass(frozen=True)
@@ -1254,22 +1284,22 @@ class PreflightConfig:
     #: Minimum free disk space, in GB, on each volume hosting state_dir/repo
     #: root. Below this, disk_floor fails. 2026-08-19 outage: C: hit 0 bytes
     #: free; a refusal here replaces 8 noisy aborted passes with one.
-    disk_floor_gb: int = 10
-    disk_floor_fatal: bool = True
+    disk_floor_gb: Annotated[int, Typed, NonNeg] = 10
+    disk_floor_fatal: Annotated[bool, Typed] = True
     #: Bound (hours) on state.json's age before clock_sanity flags it as
     #: stale/skewed. A negative age (state.json mtime in the future) always
     #: flags regardless of this bound.
-    clock_max_skew_hours: float = 48.0
-    clock_sanity_fatal: bool = False
-    venv_identity_fatal: bool = True
-    config_freshness_fatal: bool = False
+    clock_max_skew_hours: Annotated[float, Typed, NonNeg] = 48.0
+    clock_sanity_fatal: Annotated[bool, Typed] = False
+    venv_identity_fatal: Annotated[bool, Typed] = True
+    config_freshness_fatal: Annotated[bool, Typed] = False
     #: Fatal by default (issue #1950): a repo-local ``user.email``/
     #: ``user.name`` override that differs from the global identity makes
     #: every commit in every worktree of the managed checkout carry the
     #: bogus identity -- exactly the misattribution this check exists to
     #: stop, so the pass refuses rather than dispatching through it. Set
     #: false on a host that deliberately pins a per-repo commit identity.
-    git_identity_fatal: bool = True
+    git_identity_fatal: Annotated[bool, Typed] = True
 
 
 @dataclass(frozen=True)
@@ -1291,7 +1321,7 @@ class RuntimeConfig:
     # worker_blocked rule, which owns that signature instead. Do not re-add
     # it here: retry semantics (throttled_until, hot redispatch after
     # cooldown) are wrong for a hook block.
-    throttle_error_markers: tuple[str, ...] = (
+    throttle_error_markers: Annotated[tuple[str, ...], Typed] = (
         "Reached overall message rate limit",
         "rate limit",
         "too many requests",
@@ -1324,7 +1354,7 @@ class RuntimeConfig:
     # CLI's own death message, not a domain term, so it is safe to match
     # against reviewer text. Extend via config when a new session-limit
     # phrasing is observed.
-    session_limit_markers: tuple[str, ...] = ("hit your session limit",)
+    session_limit_markers: Annotated[tuple[str, ...], Typed] = ("hit your session limit",)
     # Prose fallback markers for provider quota exhaustion (issue #1684).
     # The PRIMARY quota signal is the structured JSON trailer —
     # "cognition.ai/errorKind": "resource_exhausted" — matched structurally
@@ -1337,7 +1367,7 @@ class RuntimeConfig:
     # changed the sentence (2026-09-17, PR #1595 — three reviewer launches
     # burned the review-attempt cap). Extend via config when a new quota
     # phrasing is observed, never by re-pinning the period word.
-    quota_error_markers: tuple[str, ...] = (
+    quota_error_markers: Annotated[tuple[str, ...], Typed] = (
         "usage quota has been exhausted",
         "quota exceeded",
         "usage limit",
@@ -1346,8 +1376,8 @@ class RuntimeConfig:
     # resets, gateway 5xx, secondary rate limits, etc.) in GitHub.run().
     # These knobs apply fleet-wide; keep them in RuntimeConfig so GitHub stays
     # a frozen value object with no mutable state.
-    gh_max_retries: int = 3
-    gh_retry_base_seconds: float = 1.0
+    gh_max_retries: Annotated[int, Typed, BoolTolerant] = 3
+    gh_retry_base_seconds: Annotated[float, Typed, BoolTolerant] = 1.0
     # Wall-clock ceiling on a single `gh` invocation. Without it a hung gh
     # process blocks the orchestrator loop pass forever: the pass never
     # completes, the supervisor's staleness watchdog eventually kills the
@@ -1363,11 +1393,11 @@ class RuntimeConfig:
     # fast at 30s, not tie up a retry attempt for two minutes. Calls with a
     # legitimately long response (large paginated lists) use
     # gh_long_call_timeout_seconds instead via GitHub.run(long_call=True).
-    gh_timeout_seconds: float = 30.0
+    gh_timeout_seconds: Annotated[float, Typed, Positive] = 30.0
     # Budget for calls known in advance to be legitimately long-running --
     # large paginated issue/PR list and search responses -- as opposed to
     # gh_timeout_seconds' fail-fast default above (issue #1833).
-    gh_long_call_timeout_seconds: float = 120.0
+    gh_long_call_timeout_seconds: Annotated[float, Typed, Positive] = 120.0
     # Per-pass circuit breaker for gh transport-class failures (issue #1833).
     # Ships enabled by default with sensible thresholds (owner directive: no
     # default-off knobs) -- this section exists to retune or disable it, not
@@ -1381,7 +1411,7 @@ class RuntimeConfig:
     # without a `RuntimeConfig` at all (tests, legacy direct callers) do NOT
     # get this default -- see `github_capabilities/http_transport.py`'s
     # `_DEFAULT_GH_TRANSPORT` for why that fallback stays "gh".
-    gh_transport: str = "http"
+    gh_transport: Annotated[str, Typed, OneOf("http", "gh")] = "http"
     # cw#1273: outer retry for `gh pr create` specifically, layered on top of
     # GitHub.run()'s inner pre-connection-only retry above. The inner retry's
     # ~7s default span is far shorter than the ~45s TLS blips observed on
@@ -1392,22 +1422,22 @@ class RuntimeConfig:
     # failure (mirrors `gh_max_retries`'s "N retries, N+1 total tries"
     # naming); backoff before retry n is `pr_create_retry_base_seconds *
     # (3 ** (n - 1))` -- 10s/30s/90s with the defaults.
-    pr_create_retry_max_attempts: int = 3
-    pr_create_retry_base_seconds: float = 10.0
+    pr_create_retry_max_attempts: Annotated[int, Typed, BoolTolerant] = 3
+    pr_create_retry_base_seconds: Annotated[float, Typed, BoolTolerant] = 10.0
     # Pre-emptive GraphQL rate-limit guard. Before starting quota-heavy phases
     # (mop-up sweeps, merged-PR listings), GitHub.check_graphql_rate_limit()
     # verifies ``resources.graphql.remaining`` from ``gh api rate_limit`` is at
     # least this value. Set to 0 to disable the guard.
-    graphql_rate_limit_threshold: int = 1500
+    graphql_rate_limit_threshold: Annotated[int, Typed, BoolTolerant, NonNeg] = 1500
     # Bounded in-memory event ring for state.json. A larger cap costs only a
     # few hundred KB of JSON and preserves far more diagnostic history when a
     # single sweep emits repetitive events. Tuned via config (issue #525).
-    event_ring_size: int = 2000
+    event_ring_size: Annotated[int, Typed, AtLeastOne] = 2000
     # Extra safety margin added to provider-reported rate-limit reset times
     # when computing the ``throttled_until`` defer deadline. Provider reset
     # estimates are floors, not guarantees; dispatching at T+0 races the
     # provider's actual reset. Default 90 seconds.
-    throttle_resume_margin_s: int = 90
+    throttle_resume_margin_s: Annotated[int, Typed, BoolTolerant, NonNeg] = 90
     # Issue #1088: max escalated issues the label self-heal sweep will verify
     # against GitHub in a single pass. The bound is mandatory, not defensive.
     # Every subject whose ``label_error`` key is absent costs one live
@@ -1419,7 +1449,7 @@ class RuntimeConfig:
     # instead of one long burst; verified subjects are then free forever (their
     # ``label_error`` is None, which costs a dict lookup and no API call). Set
     # to 0 for unlimited.
-    escalated_label_repair_max_per_pass: int = 10
+    escalated_label_repair_max_per_pass: Annotated[int, Typed, NonNeg] = 10
     # Issue #1372: grace period (in days) after which a stale fleet registry
     # entry (repo_root no longer exists) is pruned from fleet.json. A stale
     # entry is skipped every pass and reported separately so one corpse cannot
@@ -1427,7 +1457,7 @@ class RuntimeConfig:
     # touch_repo (last_seen older than the grace period), it is pruned under
     # state_lock. Set to 0 to disable pruning (stale entries are skipped but
     # never removed).
-    fleet_registry_stale_grace_days: int = 7
+    fleet_registry_stale_grace_days: Annotated[int, Typed, NonNeg] = 7
     # Issue #1463: freshness window (seconds) for the per-repo status-snapshot
     # cache. The loop pass writes ``status()``'s result to
     # ``status-snapshot.json`` at the end of every pass; ``fleet status --json``
@@ -1437,7 +1467,7 @@ class RuntimeConfig:
     # cadence (median ~10.4m) so a running supervisor always produces a fresh
     # snapshot before the previous one expires. Set to 0 to disable caching
     # (always compute live).
-    status_snapshot_ttl_seconds: int = 900
+    status_snapshot_ttl_seconds: Annotated[int, Typed, NonNeg] = 900
     # Issue #1976: quiet window (days) the fleet config-retirement sweep
     # requires before marking a deprecated key's removal issue Ready. The
     # sweep records the first pass on which the key was absent from every
@@ -1445,7 +1475,7 @@ class RuntimeConfig:
     # observation is this many days old -- a single clean sample is not
     # enough, because a repo that still sets the key but has not run a pass
     # lately is still a user. Reappearance resets the window.
-    config_retirement_quiet_days: float = 7
+    config_retirement_quiet_days: Annotated[float, Typed, NonNeg] = 7
 
 
 # Shared default for every Claude Code model field this refactor touches
@@ -1464,7 +1494,9 @@ class DevinConfig:
     # this sentinel.
     session_manifest: str = ""
     session_results: str = ""
-    dispatch_command: str | tuple[str, ...] = ""
+    dispatch_command: Annotated[
+        str | tuple[str, ...], CommandTemplate({"prompt_path", "issue_number", "branch"})
+    ] = ""
     command_timeout_seconds: int = 300
     # devin-shell adapter: sidecar JSON + per-session logs live here. Empty
     # string means "derive from runtime.state_dir" (layout.sessions_dir_default)
@@ -1472,7 +1504,10 @@ class DevinConfig:
     sessions_dir: str = ""
     # devin-shell launch command; empty means devin_shell.DEFAULT_COMMAND_TEMPLATE.
     # Placeholders: {prompt_path} {issue_number} {branch} {model_args}.
-    shell_command: tuple[str, ...] = ()
+    shell_command: Annotated[
+        tuple[str, ...],
+        CommandTemplate({"prompt_path", "issue_number", "branch", "model_args"}),
+    ] = ()
     # devin-shell worker model; empty string means CLI default. When set,
     # injects "--model <value>" into the rendered command via {model_args}.
     worker_model: str = ""
@@ -1497,7 +1532,7 @@ class DevinConfig:
     # values override sanitized keys (e.g., worker_env={"VIRTUAL_ENV": "/path"}
     # reintroduces VIRTUAL_ENV even though sanitize_env strips it). This is
     # intentional: explicit operator overrides win over sanitization.
-    worker_env: dict[str, str] = field(default_factory=dict)
+    worker_env: Annotated[dict[str, str], Coerced] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -1520,10 +1555,12 @@ class ClaudeCodeConfig:
     # see claude_code._apply_effort_pin. Empty string means no pin (the CLI
     # uses its default effort). Mirrors the model pin: prevents ambient CLI
     # state from leaking into headless fleet sessions.
-    effort: str = ""
+    effort: Annotated[str, Typed] = ""
     # Empty means claude_code.DEFAULT_COMMAND_TEMPLATE; the rendered worker
     # prompt is fed via stdin unless the template names {prompt_path}.
-    command: tuple[str, ...] = ()
+    command: Annotated[
+        tuple[str, ...], CommandTemplate({"prompt_path", "issue_number", "branch"})
+    ] = ()
     # None -> worktree.py default (<repo_root>/.var/charlie-work/worktrees).
     worktrees_dir: str | None = None
     # Disabled by default: a claude-code worker has a full agentic shell and
@@ -1544,7 +1581,7 @@ class ClaudeCodeConfig:
     # values override sanitized keys (e.g., worker_env={"VIRTUAL_ENV": "/path"}
     # reintroduces VIRTUAL_ENV even though sanitize_env strips it). This is
     # intentional: explicit operator overrides win over sanitization.
-    worker_env: dict[str, str] = field(default_factory=dict)
+    worker_env: Annotated[dict[str, str], Coerced] = field(default_factory=dict)
     # Opt-in: tee Claude Code's --output-format stream-json to a separate events.jsonl file.
     # When enabled, the worker launch command is extended with --output-format stream-json
     # and the structured JSONL output is written to issue-<n>.events.jsonl alongside the
@@ -1562,12 +1599,12 @@ class ApiProviderConfig:
     to ``0.0`` for providers that do not advertise a cached-input discount.
     """
 
-    base_url: str
-    api_key_env: str
-    model: str
-    input_usd_per_mtok: float
-    output_usd_per_mtok: float
-    cached_input_usd_per_mtok: float = 0.0
+    base_url: Annotated[str, Typed, NonEmptyRaw]
+    api_key_env: Annotated[str, Typed, NonEmptyRaw]
+    model: Annotated[str, Typed, NonEmptyRaw]
+    input_usd_per_mtok: Annotated[float, Typed]
+    output_usd_per_mtok: Annotated[float, Typed]
+    cached_input_usd_per_mtok: Annotated[float, Typed, NotNull] = 0.0
 
 
 @dataclass(frozen=True)
@@ -1578,23 +1615,10 @@ class ApiBudgetConfig:
     remaining defaults are conservative starting values for paid-API usage.
     """
 
-    max_usd_per_session: float = 0.0
-    preflight_reserve_usd: float = 1.0
-    max_usd_per_day: float = 5.0
-    lifetime_usd: float = 15.0
-
-    def __post_init__(self) -> None:
-        for key in (
-            "max_usd_per_session",
-            "preflight_reserve_usd",
-            "max_usd_per_day",
-            "lifetime_usd",
-        ):
-            value = getattr(self, key)
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
-                raise ConfigError(f"api_worker.budget.{key} must be a number, got {value!r}")
-            if value < 0:
-                raise ConfigError(f"api_worker.budget.{key} must be >= 0, got {value}")
+    max_usd_per_session: Annotated[float, Typed, NonNeg, NotNull] = 0.0
+    preflight_reserve_usd: Annotated[float, Typed, NonNeg, NotNull] = 1.0
+    max_usd_per_day: Annotated[float, Typed, NonNeg, NotNull] = 5.0
+    lifetime_usd: Annotated[float, Typed, NonNeg, NotNull] = 15.0
 
 
 @dataclass(frozen=True)
@@ -1609,15 +1633,15 @@ class ApiWorkerConfig:
     mutated after config load.
     """
 
-    enabled: bool = False
-    provider: str = ""
-    max_concurrent_sessions: int = 1
-    providers: Mapping[str, ApiProviderConfig] = field(
+    enabled: Annotated[bool, Typed] = False
+    provider: Annotated[str, Typed] = ""
+    max_concurrent_sessions: Annotated[int, Typed, NonNeg] = 1
+    providers: Annotated[Mapping[str, ApiProviderConfig], NotNull] = field(
         default_factory=lambda: MappingProxyType({})
     )
     budget: ApiBudgetConfig = field(default_factory=ApiBudgetConfig)
-    worker_template: str = "worker_claude_code.md"
-    rework_template: str = "rework.md"
+    worker_template: Annotated[str, Typed] = "worker_claude_code.md"
+    rework_template: Annotated[str, Typed] = "rework.md"
 
     def __post_init__(self) -> None:
         # Normalize to an immutable mapping view once at the boundary.
@@ -1635,39 +1659,33 @@ class ApiWorkerConfig:
                     )
             object.__setattr__(self, "providers", MappingProxyType(providers_dict))
 
+    def validate(self, config: OrchestratorConfig) -> None:
+        """Cross-field rules: an enabled api worker needs a usable selected provider."""
         if not self.enabled:
             return
-
         if not self.provider:
-            raise ConfigError(
-                "api_worker.provider must be a non-empty string when api_worker.enabled is true"
-            )
+            raise FieldError("provider", "non-empty string when enabled is true", self.provider)
         if self.provider not in self.providers:
-            raise ConfigError(
-                f"api_worker.provider '{self.provider}' is not a key in api_worker.providers"
+            raise FieldError(
+                "provider",
+                f"a key in providers ({', '.join(sorted(self.providers)) or 'none configured'})",
+                self.provider,
             )
-
         active = self.providers[self.provider]
+        base = f"providers.{self.provider}"
         if not active.api_key_env:
-            raise ConfigError(
-                f"api_worker.providers.{self.provider}.api_key_env must be a non-empty string"
-            )
+            raise FieldError(f"{base}.api_key_env", "non-empty string", active.api_key_env)
         for price_key in ("input_usd_per_mtok", "output_usd_per_mtok"):
             value = getattr(active, price_key)
             if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
-                raise ConfigError(
-                    f"api_worker.providers.{self.provider}.{price_key} must be > 0, got {value!r}"
-                )
+                raise FieldError(f"{base}.{price_key}", "> 0", value)
         cached_value = active.cached_input_usd_per_mtok
         if (
             not isinstance(cached_value, (int, float))
             or isinstance(cached_value, bool)
             or cached_value < 0
         ):
-            raise ConfigError(
-                "api_worker.providers."
-                f"{self.provider}.cached_input_usd_per_mtok must be >= 0, got {cached_value!r}"
-            )
+            raise FieldError(f"{base}.cached_input_usd_per_mtok", ">= 0", cached_value)
 
 
 @dataclass(frozen=True)
@@ -1677,9 +1695,9 @@ class WorkerRoleConfig:
 
     ``harness`` must be one of ``harnesses.WORKER_HARNESSES`` (``devin-shell``
     | ``claude-code`` | ``api`` | ``command`` | ``manual``) -- enforced at the
-    top-level ``worker:`` build site in ``build_config_from_data``, not here
-    in ``__post_init__``, because this same dataclass is reused for
-    ``rescue.worker``/``rescue.reviewer``, and ``rescue.reviewer``'s own
+    top-level ``worker:`` section's ``FieldRules(harness=...)`` annotation on
+    ``OrchestratorConfig.worker``, not as field metadata here, because this same
+    dataclass is reused for ``rescue.worker``/``rescue.reviewer``, and ``rescue.reviewer``'s own
     documented default harness (``"devin"``) is not a member of that
     frozenset -- a blanket per-instance check would reject that reuse's own
     defaults. ``model`` is harness-specific: empty string means "let the
@@ -1693,7 +1711,10 @@ class WorkerRoleConfig:
 
     harness: str = "manual"
     model: str = ""
-    fallbacks: tuple[RoleEntry, ...] = ()  # issue #2086: role chain, see role_chain.py
+    # Issue #2086: role chain, see role_chain.py. ``Verbatim`` because rescue.worker /
+    # rescue.reviewer reuse this class and never parsed ``fallbacks`` (main stores the raw
+    # value); the top-level ``worker:`` section opts in with a use-site ``Entries``.
+    fallbacks: Annotated[tuple[RoleEntry, ...], Verbatim] = ()
     chain = property(chain_of)
 
 
@@ -1703,8 +1724,8 @@ class ReviewerRoleConfig:
     which model it uses, and the review-effort A/B experiment knobs.
 
     ``harness`` must be one of ``harnesses.REVIEWER_HARNESSES``; any other
-    value is rejected with ``ConfigError`` at load (see ``__post_init__`` --
-    issue #1513). ``REVIEWER_HARNESSES`` is derived from the same
+    value is rejected with ``ConfigError`` at load (the ``OneOf`` field
+    metadata below -- issue #1513). ``REVIEWER_HARNESSES`` is derived from the same
     ``harnesses.HARNESS_REGISTRY`` that ``WorkerRoleConfig`` (via
     ``harnesses.WORKER_HARNESSES``) and ``adapters.dispatch_sessions`` (via
     its dispatch table) read -- a harness gains reviewer support by flipping
@@ -1715,55 +1736,33 @@ class ReviewerRoleConfig:
     here has no conflicting reuse to worry about.
     """
 
-    harness: str = "claude-code"
+    harness: Annotated[str, Typed, NotNull, OneOf(*sorted(REVIEWER_HARNESSES))] = "claude-code"
     model: str = _DEFAULT_CLAUDE_MODEL
-    effort: str = ""
-    effort_experiment_fraction: float = 0.0
-    effort_experiment_salt: str = ""
-    fallbacks: tuple[RoleEntry, ...] = ()  # issue #2086: role chain, see role_chain.py
+    effort: Annotated[str, Typed, NotNull] = ""
+    effort_experiment_fraction: Annotated[float, Typed, NotNull, InRange(0.0, 1.0)] = 0.0
+    effort_experiment_salt: Annotated[str, Typed, NotNull] = ""
+    fallbacks: Annotated[
+        tuple[RoleEntry, ...],
+        NullIsDefault,
+        role_entries(REVIEWER_HARNESSES, allow_effort=True),
+    ] = ()  # issue #2086: role chain, see role_chain.py
     chain = property(chain_of)
 
-    def __post_init__(self) -> None:
-        if self.harness not in REVIEWER_HARNESSES:
-            raise ConfigError(
-                "config section 'reviewer' key 'harness' must be one of "
-                f"{sorted(REVIEWER_HARNESSES)}, got {self.harness!r}"
-            )
-        if not isinstance(self.effort, str):
-            raise ConfigError(
-                "config section 'reviewer' key 'effort' must be a string, "
-                f"got {type(self.effort).__name__}"
-            )
-        fraction = self.effort_experiment_fraction
-        if isinstance(fraction, bool) or not isinstance(fraction, (int, float)):
-            raise ConfigError(
-                "config section 'reviewer' key 'effort_experiment_fraction' must be a "
-                f"number, got {type(fraction).__name__}"
-            )
-        if not (0.0 <= fraction <= 1.0):
-            raise ConfigError(
-                "config section 'reviewer' key 'effort_experiment_fraction' must be in "
-                f"[0.0, 1.0], got {fraction}"
-            )
-        if not isinstance(self.effort_experiment_salt, str):
-            raise ConfigError(
-                "config section 'reviewer' key 'effort_experiment_salt' must be a string, "
-                f"got {type(self.effort_experiment_salt).__name__}"
-            )
-        # Cross-field check: a fraction > 0.0 enables the experiment, whose
-        # treatment arm IS effort verbatim (resolve_review_effort returns it
-        # unmodified). Enabling the experiment without a treatment effort
-        # would silently make "treatment" mean "no --effort pin at all" while
-        # "control" still gets claude_code.effort -- a corrupted, undocumented
-        # comparison that would run for the life of the experiment with no
-        # warning. Fail loud at load instead. (Relocated from the deleted
-        # review_dispatch.review_effort_experiment_fraction cross-field check
-        # -- role-config Phase 2 Track E.)
-        if fraction > 0.0 and not self.effort:
-            raise ConfigError(
-                "config section 'reviewer': 'effort_experiment_fraction' is "
-                f"{fraction} but 'effort' is unset -- set 'effort' to the treatment "
-                "effort string (e.g. 'high') before enabling the experiment"
+    def validate(self, config: OrchestratorConfig) -> None:
+        """Cross-field rule: a fraction > 0.0 enables the experiment, whose treatment arm IS
+        ``effort`` verbatim (``resolve_review_effort`` returns it unmodified). Enabling it
+        without a treatment effort would silently make "treatment" mean "no --effort pin at
+        all" while "control" still gets ``claude_code.effort`` -- a corrupted, undocumented
+        comparison that would run for the life of the experiment with no warning. Fail loud at
+        load instead. (Relocated from the deleted
+        ``review_dispatch.review_effort_experiment_fraction`` check -- role-config Phase 2.)
+        """
+        if self.effort_experiment_fraction > 0.0 and not self.effort:
+            raise FieldError(
+                "effort",
+                "a treatment effort string (e.g. 'high') when effort_experiment_fraction is "
+                f"{self.effort_experiment_fraction}",
+                self.effort,
             )
 
 
@@ -1816,14 +1815,16 @@ class RescueConfig:
     would both be wrong here.
     """
 
-    enabled: bool = False
-    worker_adapter: str = "claude-code"
-    worker_model: str = "claude-opus-5-5"
-    reviewer_adapter: str = "devin"
-    reviewer_model: str = "codex"
+    enabled: Annotated[bool, Typed] = False
+    worker_adapter: Annotated[str, Typed] = "claude-code"
+    worker_model: Annotated[str, Typed] = "claude-opus-5-5"
+    reviewer_adapter: Annotated[str, Typed] = "devin"
+    reviewer_model: Annotated[str, Typed] = "codex"
     # Standard Devin CLI invocation shape -- override only if the rescue
     # tier's reviewer harness differs from that default.
-    reviewer_command: str | tuple[str, ...] = (
+    reviewer_command: Annotated[
+        str | tuple[str, ...], CommandTemplate({"prompt_path", "model"})
+    ] = (
         "devin",
         "--model",
         "{model}",
@@ -1831,11 +1832,11 @@ class RescueConfig:
         "--prompt-file",
         "{prompt_path}",
     )
-    reviewer_timeout_seconds: int = 300
-    worker: WorkerRoleConfig = field(
+    reviewer_timeout_seconds: Annotated[int, Typed, NonNeg] = 300
+    worker: Annotated[WorkerRoleConfig, LenientMapping] = field(
         default_factory=lambda: WorkerRoleConfig(harness="claude-code", model="claude-opus-5-5")
     )
-    reviewer: WorkerRoleConfig = field(
+    reviewer: Annotated[WorkerRoleConfig, LenientMapping] = field(
         default_factory=lambda: WorkerRoleConfig(harness="devin", model="codex")
     )
 
@@ -1854,7 +1855,7 @@ class WatchdogConfig:
     stall_minutes: int = 20
     redispatch_window_minutes: int = 240
     max_auto_redispatch: int = 3
-    terminal_error_markers: tuple[str, ...] = (
+    terminal_error_markers: Annotated[tuple[str, ...], Typed] = (
         "Error: A tool was rejected",
         "Error: Agent error:",
     )
@@ -1866,38 +1867,38 @@ class WatchdogConfig:
     loop_kill: bool = False
     # Cost/token budget tripwire (issue #163). None/0 = disabled.
     # When enabled, checks cumulative usage from Claude Code's tee'd events.jsonl.
-    cost_budget_usd: float | None = None
-    token_budget: int | None = None
+    cost_budget_usd: Annotated[float | None, Typed, BoolTolerant] = None
+    token_budget: Annotated[int | None, Typed, BoolTolerant] = None
     # Action when budget is exceeded: "warn" (default, no kill) or "kill"
-    cost_budget_action: str = "warn"
+    cost_budget_action: Annotated[str, Typed, OneOf("warn", "kill")] = "warn"
     # Launch stall detection (issue #221): grace period for shim materialization.
     # Sessions whose log has not grown past the shim marker within this window
     # are classified as launch_stalled and reaped. Default 5 minutes.
-    launch_stall_grace_minutes: int = 5
+    launch_stall_grace_minutes: Annotated[int, Typed, BoolTolerant] = 5
     # Rate-limit deferral (issue #247): when a stalled-looking worker's log tail
     # matches a provider rate-limit signature, defer the stall kill until the
     # parsed reset time plus this slack has elapsed. Default 2 minutes.
-    rate_limit_defer_enabled: bool = True
-    rate_limit_defer_slack_minutes: int = 2
+    rate_limit_defer_enabled: Annotated[bool, Typed] = True
+    rate_limit_defer_slack_minutes: Annotated[int, Typed, BoolTolerant] = 2
     # Inconclusive real-activity probe deferral cap (issue #338). A dead worker
     # whose probe is inconclusive (all sources errored or no match yet) is
     # deferred this many passes before Signal-1 reaps it. Prevents a permanently
     # broken probe from pinning a slot indefinitely while still allowing the
     # downstream liveness checks to avoid false reaps.
-    max_inconclusive_probe_deferrals: int = 3
+    max_inconclusive_probe_deferrals: Annotated[int, Typed, BoolTolerant] = 3
     # Issue #439: a PR whose updatedAt is older than this many minutes and has
     # an empty statusCheckRollup is treated as stuck before review (the worker
     # died before CI could start). It is routed to the rework pipeline with a
     # rebase-onto-main brief. 0 disables the stale-empty-check predicate.
-    pre_review_rework_stale_minutes: int = 30
+    pre_review_rework_stale_minutes: Annotated[int, Typed, BoolTolerant] = 30
     # Worktree file mtime corroboration (issue #353): a fourth real-activity
     # source that detects progress by scanning files written in the worker's
     # checkout. Workers read/plan for a while before writing, so this source uses
     # its own generous threshold rather than stall_minutes.
-    worktree_mtime_enabled: bool = True
-    worktree_mtime_threshold_minutes: int = 45
-    worktree_mtime_max_depth: int = 4
-    worktree_mtime_exclude_dirs: tuple[str, ...] = (".git", ".venv")
+    worktree_mtime_enabled: Annotated[bool, Typed] = True
+    worktree_mtime_threshold_minutes: Annotated[int, Typed, BoolTolerant] = 45
+    worktree_mtime_max_depth: Annotated[int, Typed, BoolTolerant] = 4
+    worktree_mtime_exclude_dirs: Annotated[tuple[str, ...], Typed] = (".git", ".venv")
     # Issue #654: time-based escape for a dead dispatched worker whose drift
     # was surfaced by ``_detect_and_handle_orphaned_workers`` but whose PR
     # state did not qualify for auto-reset (clean exit with no push, a non-
@@ -1941,7 +1942,7 @@ class WatchdogConfig:
     # PID-independent finalize. Without the lane a worker whose process fails
     # to exit leaves the pushed branch and its drafted PR stranded for as long
     # as the PID lingers (the swole #163 incident: PR unopened ~2h).
-    worker_outcome_finalize_minutes: int = 15
+    worker_outcome_finalize_minutes: Annotated[int, Typed, NonNeg] = 15
 
 
 @dataclass(frozen=True)
@@ -1967,8 +1968,8 @@ class WorktreeReclamationConfig:
     to run it unattended.
     """
 
-    enabled: bool = True
-    interval_minutes: int = 60
+    enabled: Annotated[bool, Typed] = True
+    interval_minutes: Annotated[int, Typed, AtLeastOne] = 60
 
 
 @dataclass(frozen=True)
@@ -1985,10 +1986,15 @@ class TestAdequacyConfig:
 
     __test__ = False  # Prevent pytest from collecting this as a test class
 
-    enabled: bool = False
-    min_product_lines: int = 10
-    test_path_globs: tuple[str, ...] = ("tests/**", "test_*.py", "*_test.py", "conftest.py")
-    exempt_path_globs: tuple[str, ...] = (
+    enabled: Annotated[bool, Typed] = False
+    min_product_lines: Annotated[int, Typed, BoolTolerant] = 10
+    test_path_globs: Annotated[tuple[str, ...], Typed] = (
+        "tests/**",
+        "test_*.py",
+        "*_test.py",
+        "conftest.py",
+    )
+    exempt_path_globs: Annotated[tuple[str, ...], Typed] = (
         "*.md",
         "docs/**",
         "examples/**",
@@ -1998,16 +2004,16 @@ class TestAdequacyConfig:
         "*.cfg",
         "*.ini",
     )
-    assertion_markers: tuple[str, ...] = (
+    assertion_markers: Annotated[tuple[str, ...], Typed] = (
         "assert ",
         "pytest.raises",
         "raises(",
         "assert_called",
         "self.assert",
     )
-    comment_prefixes: tuple[str, ...] = ("#",)
-    require_assertions: bool = False
-    stub_test_seam_keywords: tuple[str, ...] = (
+    comment_prefixes: Annotated[tuple[str, ...], Typed] = ("#",)
+    require_assertions: Annotated[bool, Typed] = False
+    stub_test_seam_keywords: Annotated[tuple[str, ...], Typed] = (
         "route",
         "e2e",
         "byte",
@@ -2016,12 +2022,12 @@ class TestAdequacyConfig:
         "lock",
         "concurrent",
     )
-    exempt_marker: str = "Test-exempt:"
+    exempt_marker: Annotated[str, Typed, NonEmptyRaw] = "Test-exempt:"
     # Tier 3 (reserved, deferred): diff-coverage extension, not read by any
     # code path yet.
-    coverage_enabled: bool = False
-    coverage_command: tuple[str, ...] = ()
-    min_diff_coverage: float = 0.0
+    coverage_enabled: Annotated[bool, Typed] = False
+    coverage_command: Annotated[tuple[str, ...], Typed] = ()
+    min_diff_coverage: Annotated[float, Typed, BoolTolerant] = 0.0
 
 
 @dataclass(frozen=True)
@@ -2044,14 +2050,19 @@ class CoverageProbeConfig:
     intentionally has no auto-reject knob.
     """
 
-    enabled: bool = False
+    enabled: Annotated[bool, Typed] = False
 
     # -- W3: branch-token-vs-test-add heuristic ------------------------------
     # Path-classification defaults mirror TestAdequacyConfig's own, kept as
     # an independent copy (not a shared reference) so the two gates can be
     # configured separately without coupling.
-    test_path_globs: tuple[str, ...] = ("tests/**", "test_*.py", "*_test.py", "conftest.py")
-    exempt_path_globs: tuple[str, ...] = (
+    test_path_globs: Annotated[tuple[str, ...], Typed] = (
+        "tests/**",
+        "test_*.py",
+        "*_test.py",
+        "conftest.py",
+    )
+    exempt_path_globs: Annotated[tuple[str, ...], Typed] = (
         "*.md",
         "docs/**",
         "examples/**",
@@ -2061,25 +2072,32 @@ class CoverageProbeConfig:
         "*.cfg",
         "*.ini",
     )
-    comment_prefixes: tuple[str, ...] = ("#",)
-    branch_tokens: tuple[str, ...] = ("if ", "elif ", "except ", " and ", " or ", " else ")
-    assertion_markers: tuple[str, ...] = (
+    comment_prefixes: Annotated[tuple[str, ...], Typed] = ("#",)
+    branch_tokens: Annotated[tuple[str, ...], Typed] = (
+        "if ",
+        "elif ",
+        "except ",
+        " and ",
+        " or ",
+        " else ",
+    )
+    assertion_markers: Annotated[tuple[str, ...], Typed] = (
         "assert ",
         "pytest.raises",
         "raises(",
         "assert_called",
         "self.assert",
     )
-    test_function_prefix: str = "def test_"
+    test_function_prefix: Annotated[str, Typed] = "def test_"
     # branch_adds:test_adds ratio above this threshold flags even when
     # test_adds > 0.
-    branch_to_assert_ratio_threshold: float = 4.0
+    branch_to_assert_ratio_threshold: Annotated[float, Typed, BoolTolerant] = 4.0
 
     # -- W20 item 1: unwired-symbol AST probe --------------------------------
-    check_unwired_symbols: bool = True
+    check_unwired_symbols: Annotated[bool, Typed] = True
     # Leading-underscore names are excluded -- the probe only flags *public*
     # new symbols.
-    private_name_prefix: str = "_"
+    private_name_prefix: Annotated[str, Typed] = "_"
 
 
 @dataclass(frozen=True)
@@ -2101,9 +2119,11 @@ class FleetConfig:
     ``time.sleep`` (which raises) inside the retry loop.
     """
 
-    global_max_concurrent_sessions: int = 0
-    global_max_concurrent_reviews: int = 0  # #2084 reviewer-lane cap; 0 = disabled
-    launch_lock_wait_seconds: float = 10.0
+    global_max_concurrent_sessions: Annotated[int, Typed, BoolTolerant] = 0
+    # #2084 reviewer-lane cap; 0 = disabled. Unlike the worker cap above this key has
+    # always rejected a bool and a negative (no BoolTolerant, NonNeg).
+    global_max_concurrent_reviews: Annotated[int, Typed, NonNeg] = 0
+    launch_lock_wait_seconds: Annotated[float, Typed, NonNeg, Finite] = 10.0
 
 
 @dataclass(frozen=True)
@@ -2119,7 +2139,7 @@ class NotifyConfig:
     enabled: bool = False
     sink: str = "file"  # "webhook" | "desktop" | "shell" | "file"
     webhook_url: str = ""
-    shell_command: tuple[str, ...] = ()
+    shell_command: Annotated[tuple[str, ...], CoercedLenient] = ()
     # Empty string means "derive from runtime.state_dir"
     # (layout.notify_digest_default) rather than a fixed literal -- see
     # paths.resolved_layout, the single place that resolves this sentinel.
@@ -2152,8 +2172,8 @@ class LocalIssuesConfig:
     ``LocalFileGitHub.__post_init__``.
     """
 
-    enabled: bool = False
-    issues_dir: str = "docs/issues"
+    enabled: Annotated[bool, Typed] = False
+    issues_dir: Annotated[str, Typed, NonEmpty, RelativePath] = "docs/issues"
 
 
 @dataclass(frozen=True)
@@ -2171,7 +2191,7 @@ class LocalLaneConfig:
     mutes the alarm only -- the kill switches themselves are unaffected.
     """
 
-    kill_switch_stall_hours: float = 12.0
+    kill_switch_stall_hours: Annotated[float, Typed, NonNeg] = 12.0
 
 
 @dataclass(frozen=True)
@@ -2187,10 +2207,10 @@ class RunnersConfig:
     a no-op. When enabled, runs the autoscale decision before fleet bash-rats.
     """
 
-    enabled: bool = False
-    cancel_superseded_main_runs: bool = False
-    default_branch: str = "main"
-    workflow_name: str = ""
+    enabled: Annotated[bool, Typed] = False
+    cancel_superseded_main_runs: Annotated[bool, Typed] = False
+    default_branch: Annotated[str, Typed] = "main"
+    workflow_name: Annotated[str, Typed] = ""
     fleet_autoscale_prologue: bool = False
 
 
@@ -2214,8 +2234,8 @@ class MainCiReclaimConfig:
     unattended on every pass. The knob exists for rollback, not opt-in.
     """
 
-    enabled: bool = True
-    workflow_filename: str = "ci.yml"
+    enabled: Annotated[bool, Typed] = True
+    workflow_filename: Annotated[str, Typed] = "ci.yml"
 
 
 @dataclass(frozen=True)
@@ -2244,10 +2264,10 @@ class SupervisorConfig:
     reports the read); issue #1979 removes the legacy locations.
     """
 
-    poll_interval_seconds: int = 20
-    full_pass_interval_seconds: int = 300
-    active_cooldown_seconds: int = 30
-    max_runtime_minutes: int = 0
+    poll_interval_seconds: Annotated[int, Typed, BoolTolerant] = 20
+    full_pass_interval_seconds: Annotated[int, Typed, BoolTolerant] = 300
+    active_cooldown_seconds: Annotated[int, Typed, BoolTolerant] = 30
+    max_runtime_minutes: Annotated[int, Typed, BoolTolerant] = 0
 
 
 @dataclass(frozen=True)
@@ -2260,8 +2280,8 @@ class SignatureRule:
     PostMortemConfig.signature_rules.
     """
 
-    pattern: str
-    kind: str
+    pattern: Annotated[str, Typed, NonEmptyRaw, Regex]
+    kind: Annotated[str, Typed, NonEmptyRaw]
 
 
 @dataclass(frozen=True)
@@ -2302,15 +2322,15 @@ class PostMortemConfig:
     content.
     """
 
-    enabled: bool = True
+    enabled: Annotated[bool, Typed] = True
     # "" resolves to %APPDATA%\devin\cli\sessions.db at read time (env-expanded,
     # never hardcoded — see post_mortem._default_db_path).
-    db_path: str = ""
+    db_path: Annotated[str, Typed] = ""
     # How many of the most recent message_nodes to pull per matched session.
-    message_node_limit: int = 10
+    message_node_limit: Annotated[int, Typed, BoolTolerant] = 10
     # Slack applied to both ends of the [started_at, reaped_at] window when
     # matching a session by working_directory (clock skew / write-lag tolerance).
-    match_window_margin_seconds: int = 120
+    match_window_margin_seconds: Annotated[int, Typed, BoolTolerant] = 120
     # When worker.started_at itself fails to parse, the match window can no
     # longer be anchored to it — falling back to a narrow now-minus-margin
     # window (the old behavior) missed real sessions that started well
@@ -2318,7 +2338,7 @@ class PostMortemConfig:
     # Widen to this lookback from "now" instead; recorded on the resulting
     # PostMortemRecord as window_start_fallback so a false non-match is
     # diagnosable. Default 6h comfortably covers any single dispatch.
-    unparseable_started_at_lookback_seconds: int = 21600
+    unparseable_started_at_lookback_seconds: Annotated[int, Typed, BoolTolerant] = 21600
     signature_rules: tuple[SignatureRule, ...] = (
         SignatureRule(pattern=r"Tool blocked:", kind="worker_blocked"),
         SignatureRule(pattern=r"decision\s*:\s*block", kind="worker_blocked"),
@@ -2361,7 +2381,7 @@ class HeartbeatConfig:
     # mirrors as ``ARMABLE_GATING_LABELS``) plus the conventional tracker/
     # umbrella/epic names the issue enumerates. Active labels (``agent:*`` and
     # the configured ``labels:`` lifecycle values) are excluded separately.
-    stale_mention_parked_labels: tuple[str, ...] = (
+    stale_mention_parked_labels: Annotated[tuple[str, ...], NotNull] = (
         "blocked",
         "needs-design",
         "human-action",
@@ -2379,8 +2399,44 @@ class HeartbeatConfig:
         # string wraps rather than iterates, and a list becomes a tuple so the
         # frozen instance stays hashable on every construction path.
         value = self.stale_mention_parked_labels
-        normalized = (str(value),) if isinstance(value, str) else tuple(str(v) for v in value)
+        if isinstance(value, str):
+            normalized = (value,)
+        elif isinstance(value, (list, tuple)):
+            normalized = tuple(str(v) for v in value)
+        else:
+            raise FieldError(
+                "stale_mention_parked_labels", "list of label names or a string", value, "type"
+            )
         object.__setattr__(self, "stale_mention_parked_labels", normalized)
+
+
+def _runner_floors_agree(allocation: RunnerAllocationConfig, config: OrchestratorConfig) -> None:
+    """Cross-section floor check (issue #600).
+
+    ``runner_scaling`` and ``runner_allocation`` both declare a "minimum runners per repo"
+    floor on different axes -- scaling keeps runners *registered* (provisioning/
+    deregistering), allocation keeps listeners *running* (starting/stopping
+    already-configured listeners). When both are enabled, an allocation floor higher than
+    the scaling floor is unsatisfiable: allocation caps each repo's target at its
+    registered runner count (``runner_allocation.plan_allocation``), so
+    ``min_running_per_repo > min_runners`` silently degrades to ``min_runners`` with
+    nothing reconciling the two. Reject it at load time rather than documenting the
+    caveat. The reverse (``min_runners > min_running_per_repo``) is a legitimate buffer --
+    registered but parked runners that allocation promotes on demand -- and is allowed.
+    """
+    scaling = config.runner_scaling
+    if (
+        scaling.enabled
+        and allocation.enabled
+        and allocation.min_running_per_repo > scaling.min_runners
+    ):
+        raise FieldError(
+            "min_running_per_repo",
+            "<= runner_scaling.min_runners when both sections are enabled (floors disagree; "
+            "allocation cannot keep more listeners running than scaling provisions)",
+            f"{allocation.min_running_per_repo} > {scaling.min_runners}",
+            "raw",
+        )
 
 
 @dataclass(frozen=True)
@@ -2398,8 +2454,21 @@ class OrchestratorConfig:
     claude_code: ClaudeCodeConfig = field(default_factory=ClaudeCodeConfig)
     api_worker: ApiWorkerConfig = field(default_factory=ApiWorkerConfig)
     rescue: RescueConfig = field(default_factory=RescueConfig)
-    worker: WorkerRoleConfig = field(default_factory=WorkerRoleConfig)
-    reviewer: ReviewerRoleConfig = field(default_factory=ReviewerRoleConfig)
+    worker: Annotated[
+        WorkerRoleConfig,
+        # Harness membership is enforced at the top-level worker only, not on
+        # ``WorkerRoleConfig`` itself: the class is reused for rescue.worker/.reviewer,
+        # and rescue.reviewer's documented default harness ("devin") is not a member of
+        # ``harnesses.WORKER_HARNESSES``.
+        FieldRules(
+            harness=(Typed, NotNull, OneOf(*sorted(WORKER_HARNESSES))),
+            fallbacks=(NullIsDefault, role_entries(WORKER_HARNESSES, allow_effort=False)),
+        ),
+        Check(check_role_chain),
+    ] = field(default_factory=WorkerRoleConfig)
+    reviewer: Annotated[ReviewerRoleConfig, Check(check_reviewer_role_chain)] = field(
+        default_factory=ReviewerRoleConfig
+    )
     watchdog: WatchdogConfig = field(default_factory=WatchdogConfig)
     worktree_reclamation: WorktreeReclamationConfig = field(
         default_factory=WorktreeReclamationConfig
@@ -2412,13 +2481,53 @@ class OrchestratorConfig:
     local_lane: LocalLaneConfig = field(default_factory=LocalLaneConfig)
     runners: RunnersConfig = field(default_factory=RunnersConfig)
     main_ci_reclaim: MainCiReclaimConfig = field(default_factory=MainCiReclaimConfig)
-    runner_scaling: RunnerScalingConfig = field(default_factory=RunnerScalingConfig)
-    runner_allocation: RunnerAllocationConfig = field(default_factory=RunnerAllocationConfig)
-    runner_capacity_escalation: RunnerCapacityEscalationConfig = field(
+    # ``RunnerScalingConfig``/``RunnerAllocationConfig`` are ci_fleet-owned and cannot carry
+    # markers themselves (ADR-0002, ``tests/test_ci_fleet_seams.py``), so this repo's
+    # declaration of the section -- the field -- carries the rules. ``BoolTolerant`` is the
+    # legacy ``isinstance(v, int)`` behaviour (a YAML ``true`` passed as an int knob).
+    runner_scaling: Annotated[
+        RunnerScalingConfig,
+        FieldRules(
+            enabled=Typed,
+            managed_root=Typed,
+            runner_dir_prefix=Typed,
+            runner_name_template=Typed,
+            package_zip=Typed,
+            min_runners=(Typed, BoolTolerant),
+            max_runners=(Typed, BoolTolerant),
+            idle_scale_down_minutes=(Typed, BoolTolerant),
+            cooldown_minutes=(Typed, BoolTolerant),
+            ram_per_job_gb=(Typed, BoolTolerant),
+            min_free_ram_gb=(Typed, BoolTolerant),
+            max_host_cpu_pct=(Typed, BoolTolerant),
+        ),
+    ] = field(default_factory=RunnerScalingConfig)
+    # Host-wide (#600, #763): one physical machine, so a per-repo layer must not hold its
+    # own opinion. ``ci_fleet``'s own ``__post_init__`` owns the remaining rules
+    # (per-repo ceilings, affinity), including ``key: null`` on the four fields it cannot
+    # compare against ``None``: that ``TypeError`` becomes a ``ConstructionError``, which the
+    # #665 layered rescue re-raises (a use-site ``NotNull`` would make it a rescuable
+    # ``FieldError`` and silently discard the global layer -- cfg review R2-B1).
+    runner_allocation: Annotated[
+        RunnerAllocationConfig,
+        HostWideOnly,
+        FieldRules(
+            enabled=Typed,
+            managed_root=Typed,
+            max_running_runners=(Typed, NonNeg),
+            min_running_per_repo=(Typed, NonNeg),
+            demand_idle_samples=(Typed, NonNeg),
+            max_runs_scanned=(Typed, NonNeg),
+        ),
+        Check(_runner_floors_agree),
+    ] = field(default_factory=RunnerAllocationConfig)
+    runner_capacity_escalation: Annotated[RunnerCapacityEscalationConfig, HostWideOnly] = field(
         default_factory=RunnerCapacityEscalationConfig
     )
     supervisor: SupervisorConfig = field(default_factory=SupervisorConfig)
-    fleet_supervisor: FleetSupervisorConfig = field(default_factory=FleetSupervisorConfig)
+    fleet_supervisor: Annotated[FleetSupervisorConfig, HostWideOnly] = field(
+        default_factory=FleetSupervisorConfig
+    )
     post_mortem: PostMortemConfig = field(default_factory=PostMortemConfig)
     heartbeat: HeartbeatConfig = field(default_factory=HeartbeatConfig)
 
@@ -2474,18 +2583,22 @@ def _section(data: dict[str, Any], key: str) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
-def _build_section(cls: type, name: str, data: dict[str, Any]) -> Any:
-    """Construct a config dataclass, turning unknown YAML keys into a readable
-    error (a bare ``TypeError`` from ``cls(**data)`` names neither the section
-    nor the valid keys — hostile to consumers mid-migration)."""
-    valid = {f.name for f in fields(cls)}
-    unknown = sorted(set(data) - valid)
-    if unknown:
-        raise ConfigError(
-            f"unknown key(s) in config section '{name}': {', '.join(unknown)} "
-            f"(valid: {', '.join(sorted(valid))})"
-        )
-    return cls(**data)
+# Keys retired from a section that live configs may still carry: dropped before
+# validation so they are silently ignored rather than rejected as unknown (a rejection
+# would brick a self-deploy onto a config written before the retirement).
+_RETIRED_KEYS: Mapping[str, frozenset[str]] = MappingProxyType(
+    {"labels": frozenset({"blocked"})}  # issue #1963
+)
+
+
+def _scoped_raw(name: str, raw: dict[str, Any]) -> dict[str, Any]:
+    """The part of a raw section that is validated: retired keys and, for the
+    deliberately scoped ``deescalation`` section (#1314), un-annotated keys removed."""
+    retired = _RETIRED_KEYS.get(name, frozenset())
+    kept = {k: v for k, v in raw.items() if k not in retired}
+    if name == "deescalation":
+        return project_scoped_keys(DeescalationConfig, kept)
+    return kept
 
 
 def known_config_sections() -> frozenset[str]:
@@ -2531,1569 +2644,32 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
     # forbids. A deep copy keeps this function's contract "reads a dict, does
     # not touch it" regardless of what future callers do with their copy.
     data = copy.deepcopy(data)
-    # Validate top-level keys before processing sections.
     known_sections = known_config_sections()
     unknown = sorted(set(data) - known_sections)
     if unknown:
-        raise ConfigError(
-            f"unknown config section(s): {', '.join(unknown)} "
-            f"(valid: {', '.join(sorted(known_sections))})"
-        )
-    labels_data = _section(data, "labels")
-    # Issue #1963: ``blocked`` was removed from ``LabelConfig`` -- the
-    # "blocked" verdict edge maps to ``human_needed`` and no transition ever
-    # applied ``agent:blocked``. Tolerate a stale ``blocked:`` key in a live
-    # ``labels:`` section rather than letting ``_build_section``'s
-    # unknown-key rejection brick a repo that still carries it (same
-    # scoped-extraction reasoning as the ``deescalation`` section below).
-    # The override is dead weight -- nothing read the field even while it
-    # existed -- so it is silently dropped, not honored.
-    labels_data.pop("blocked", None)
-    labels = _build_section(LabelConfig, "labels", labels_data)
-    dispatch_data = _section(data, "dispatch")
-    materialize_dirs = dispatch_data.get("materialize_dirs")
-    if materialize_dirs is not None:
-        if not isinstance(materialize_dirs, list):
-            raise ConfigError(
-                "config section 'dispatch' key 'materialize_dirs' must be a list of "
-                f"directory paths, got {type(materialize_dirs).__name__}"
-            )
-        dispatch_data["materialize_dirs"] = tuple(str(item) for item in materialize_dirs)
-    base_ref = dispatch_data.get("base_ref")
-    if base_ref is not None and not isinstance(base_ref, str):
-        raise ConfigError(
-            "config section 'dispatch' key 'base_ref' must be a string, "
-            f"got {type(base_ref).__name__}"
-        )
-    test_command = dispatch_data.get("test_command")
-    if test_command is not None and not isinstance(test_command, str):
-        raise ConfigError(
-            "config section 'dispatch' key 'test_command' must be a string, "
-            f"got {type(test_command).__name__}"
-        )
-    # A key left blank in YAML (``test_command:``) parses to None; the field is a str
-    # whose empty value means "derive it", so normalize here rather than at each reader.
-    dispatch_data["test_command"] = test_command or ""
-    order = dispatch_data.get("order")
-    if order is not None and not isinstance(order, str):
-        raise ConfigError(
-            f"config section 'dispatch' key 'order' must be a string, got {type(order).__name__}"
-        )
-    if order is not None and order not in ("oldest", "newest"):
-        raise ConfigError(
-            f"config section 'dispatch' key 'order' must be 'oldest' or 'newest', got '{order}'"
-        )
-    launch_stagger_seconds = dispatch_data.get("launch_stagger_seconds")
-    if launch_stagger_seconds is not None and not isinstance(launch_stagger_seconds, int):
-        raise ConfigError(
-            "config section 'dispatch' key 'launch_stagger_seconds' must be an int, "
-            f"got {type(launch_stagger_seconds).__name__}"
-        )
-    if launch_stagger_seconds is not None and launch_stagger_seconds < 0:
-        raise ConfigError(
-            "config section 'dispatch' key 'launch_stagger_seconds' must be >= 0, "
-            f"got {launch_stagger_seconds}"
-        )
-    finalize_limit = dispatch_data.get("finalize_limit")
-    if finalize_limit is not None and not isinstance(finalize_limit, int):
-        raise ConfigError(
-            "config section 'dispatch' key 'finalize_limit' must be an int, "
-            f"got {type(finalize_limit).__name__}"
-        )
-    if finalize_limit is not None and finalize_limit < 0:
-        raise ConfigError(
-            f"config section 'dispatch' key 'finalize_limit' must be >= 0, got {finalize_limit}"
-        )
-    dispatch_staleness_minutes = dispatch_data.get("dispatch_staleness_minutes")
-    if dispatch_staleness_minutes is not None and (
-        isinstance(dispatch_staleness_minutes, bool)
-        or not isinstance(dispatch_staleness_minutes, int)
-    ):
-        raise ConfigError(
-            "config section 'dispatch' key 'dispatch_staleness_minutes' must be an int, "
-            f"got {type(dispatch_staleness_minutes).__name__}"
-        )
-    if dispatch_staleness_minutes is not None and dispatch_staleness_minutes < 0:
-        raise ConfigError(
-            f"config section 'dispatch' key 'dispatch_staleness_minutes' must be >= 0, "
-            f"got {dispatch_staleness_minutes}"
-        )
-    # Issue #1682: same int/>=0 contract as dispatch_staleness_minutes -- 0 is
-    # the documented "disabled" value, not an error.
-    dependency_stall_minutes = dispatch_data.get("dependency_stall_minutes")
-    if dependency_stall_minutes is not None and (
-        isinstance(dependency_stall_minutes, bool) or not isinstance(dependency_stall_minutes, int)
-    ):
-        raise ConfigError(
-            "config section 'dispatch' key 'dependency_stall_minutes' must be an int, "
-            f"got {type(dependency_stall_minutes).__name__}"
-        )
-    if dependency_stall_minutes is not None and dependency_stall_minutes < 0:
-        raise ConfigError(
-            f"config section 'dispatch' key 'dependency_stall_minutes' must be >= 0, "
-            f"got {dependency_stall_minutes}"
-        )
-    injected_paths = dispatch_data.get("injected_paths")
-    if injected_paths is not None:
-        if not isinstance(injected_paths, list):
-            raise ConfigError(
-                "config section 'dispatch' key 'injected_paths' must be a list of "
-                f"strings, got {type(injected_paths).__name__}"
-            )
-        for item in injected_paths:
-            if not isinstance(item, str):
-                raise ConfigError(
-                    "config section 'dispatch' key 'injected_paths' must be a list of "
-                    f"strings, got element of type {type(item).__name__}"
-                )
-        dispatch_data["injected_paths"] = _normalize_injected_paths(
-            tuple(str(item) for item in injected_paths)
-        )
-    # Worker-prompt comment controls (issue #872). ``DispatchConfig.__post_init__``
-    # does the list->tuple coercion for every construction path; these checks exist
-    # so a *config file* mistake fails loudly at load with the offending key named,
-    # rather than silently degrading the prompt for every dispatched issue.
-    for _seq_key in (
-        "worker_prompt_comment_associations",
-        "worker_prompt_excluded_comment_authors",
-    ):
-        _seq_value = dispatch_data.get(_seq_key)
-        if _seq_value is not None:
-            if not isinstance(_seq_value, list):
-                raise ConfigError(
-                    f"config section 'dispatch' key '{_seq_key}' must be a list of "
-                    f"strings, got {type(_seq_value).__name__}"
-                )
-            for item in _seq_value:
-                if not isinstance(item, str):
-                    raise ConfigError(
-                        f"config section 'dispatch' key '{_seq_key}' must be a list of "
-                        f"strings, got element of type {type(item).__name__}"
-                    )
-            dispatch_data[_seq_key] = tuple(str(item) for item in _seq_value)
-    # Issue #1598: validate human_merge_labels as a list of strings.
-    _hml = dispatch_data.get("human_merge_labels")
-    if _hml is not None:
-        if not isinstance(_hml, list):
-            raise ConfigError(
-                "config section 'dispatch' key 'human_merge_labels' must be a list of "
-                f"strings, got {type(_hml).__name__}"
-            )
-        for item in _hml:
-            if not isinstance(item, str):
-                raise ConfigError(
-                    "config section 'dispatch' key 'human_merge_labels' must be a list of "
-                    f"strings, got element of type {type(item).__name__}"
-                )
-        dispatch_data["human_merge_labels"] = tuple(str(item) for item in _hml)
-    for _int_key in ("worker_prompt_max_comments", "worker_prompt_max_comment_chars"):
-        _int_value = dispatch_data.get(_int_key)
-        if _int_value is not None:
-            # bool is an int subclass; rejecting it explicitly (as the api_worker
-            # section does) keeps `true` in YAML from silently meaning "1 comment".
-            if isinstance(_int_value, bool) or not isinstance(_int_value, int):
-                raise ConfigError(
-                    f"config section 'dispatch' key '{_int_key}' must be an int, "
-                    f"got {type(_int_value).__name__}"
-                )
-            if _int_value < 0:
-                raise ConfigError(
-                    f"config section 'dispatch' key '{_int_key}' must be >= 0, got {_int_value}"
-                )
-    # Issue #1001: bool validation for require_worker_github_token.
-    _rwt = dispatch_data.get("require_worker_github_token")
-    if _rwt is not None and not isinstance(_rwt, bool):
-        raise ConfigError(
-            "config section 'dispatch' key 'require_worker_github_token' must be a bool, "
-            f"got {type(_rwt).__name__}"
-        )
-    _aulc = dispatch_data.get("archive_unreachable_local_commits")
-    if _aulc is not None and not isinstance(_aulc, bool):
-        raise ConfigError(
-            "config section 'dispatch' key 'archive_unreachable_local_commits' must be "
-            f"a bool, got {type(_aulc).__name__}"
-        )
-    # Issue #1129: int validation for max_open_agent_prs.
-    _mop = dispatch_data.get("max_open_agent_prs")
-    if _mop is not None:
-        if isinstance(_mop, bool) or not isinstance(_mop, int):
-            raise ConfigError(
-                "config section 'dispatch' key 'max_open_agent_prs' must be an int, "
-                f"got {type(_mop).__name__}"
-            )
-        if _mop < 0:
-            raise ConfigError(
-                f"config section 'dispatch' key 'max_open_agent_prs' must be >= 0, got {_mop}"
-            )
-    # Issue #1770: numeric validation for ci_capacity_headroom_ratio.
-    _cchr = dispatch_data.get("ci_capacity_headroom_ratio")
-    if _cchr is not None:
-        if isinstance(_cchr, bool) or not isinstance(_cchr, (int, float)):
-            raise ConfigError(
-                "config section 'dispatch' key 'ci_capacity_headroom_ratio' must be a number, "
-                f"got {type(_cchr).__name__}"
-            )
-        if _cchr < 0:
-            raise ConfigError(
-                "config section 'dispatch' key 'ci_capacity_headroom_ratio' must be >= 0, "
-                f"got {_cchr}"
-            )
-    # Issue #1843: int validation for host_load_max_pytest_processes;
-    # issue #1903 adds the sibling tree cap under identical rules.
-    for _hl_key in ("host_load_max_pytest_processes", "host_load_max_pytest_trees"):
-        _hl_val = dispatch_data.get(_hl_key)
-        if _hl_val is None:
+        raise unknown_sections_error(unknown, known_sections)
+    # Issue #1978: parse the fleet-scoped section BEFORE the loop reaches
+    # ``supervisor`` -- the parser pops the relocated keys out of
+    # ``data['supervisor']`` (the private deepcopy above, so the caller's dict
+    # is untouched) and applies the new-location > legacy > default precedence
+    # itself, raising ConfigError when both locations disagree.
+    prebuilt: dict[str, Any] = {"fleet_supervisor": parse_fleet_supervisor(data)}
+    by_name = {spec.name: spec for spec in field_specs(OrchestratorConfig)}
+    built: dict[str, Any] = {}
+    for f in fields(OrchestratorConfig):
+        if f.metadata.get("provenance"):
             continue
-        if isinstance(_hl_val, bool) or not isinstance(_hl_val, int):
-            raise ConfigError(
-                f"config section 'dispatch' key '{_hl_key}' must be "
-                f"an int, got {type(_hl_val).__name__}"
-            )
-        if _hl_val < 0:
-            raise ConfigError(
-                f"config section 'dispatch' key '{_hl_key}' must be >= 0, got {_hl_val}"
-            )
-    dispatch = _build_section(DispatchConfig, "dispatch", dispatch_data)
-    review_data = _section(data, "review")
-    stale_checks_grace_minutes = review_data.get("stale_checks_grace_minutes")
-    if stale_checks_grace_minutes is not None:
-        if isinstance(stale_checks_grace_minutes, bool) or not isinstance(
-            stale_checks_grace_minutes, int
-        ):
-            raise ConfigError(
-                "config section 'review' key 'stale_checks_grace_minutes' must be an "
-                f"int, got {type(stale_checks_grace_minutes).__name__}"
-            )
-        if stale_checks_grace_minutes < 0:
-            raise ConfigError(
-                "config section 'review' key 'stale_checks_grace_minutes' must not be negative"
-            )
-    stale_checks_max_retriggers = review_data.get("stale_checks_max_retriggers")
-    if stale_checks_max_retriggers is not None:
-        if isinstance(stale_checks_max_retriggers, bool) or not isinstance(
-            stale_checks_max_retriggers, int
-        ):
-            raise ConfigError(
-                "config section 'review' key 'stale_checks_max_retriggers' must be an "
-                f"int, got {type(stale_checks_max_retriggers).__name__}"
-            )
-        if stale_checks_max_retriggers < 0:
-            raise ConfigError(
-                "config section 'review' key 'stale_checks_max_retriggers' must not be negative"
-            )
-    fir_confirm = review_data.get("foreign_issue_ref_confirm_passes")
-    if fir_confirm is not None:
-        if isinstance(fir_confirm, bool) or not isinstance(fir_confirm, int):
-            raise ConfigError(
-                "config section 'review' key 'foreign_issue_ref_confirm_passes' must be an "
-                f"int, got {type(fir_confirm).__name__}"
-            )
-        if fir_confirm < 1:
-            raise ConfigError(
-                "config section 'review' key 'foreign_issue_ref_confirm_passes' must be >= 1"
-            )
-    fir_reprobe = review_data.get("foreign_issue_ref_reprobe_hours")
-    if fir_reprobe is not None:
-        if isinstance(fir_reprobe, bool) or not isinstance(fir_reprobe, int):
-            raise ConfigError(
-                "config section 'review' key 'foreign_issue_ref_reprobe_hours' must be an "
-                f"int, got {type(fir_reprobe).__name__}"
-            )
-        if fir_reprobe < 0:
-            raise ConfigError(
-                "config section 'review' key 'foreign_issue_ref_reprobe_hours' must not be negative"
-            )
-    # Issue #1642: validate human_decision_markers as a list of strings,
-    # same convention as dispatch.* list-of-strings keys above.
-    _hdm = review_data.get("human_decision_markers")
-    if _hdm is not None:
-        if not isinstance(_hdm, list):
-            raise ConfigError(
-                "config section 'review' key 'human_decision_markers' must be a list of "
-                f"strings, got {type(_hdm).__name__}"
-            )
-        for item in _hdm:
-            if not isinstance(item, str):
-                raise ConfigError(
-                    "config section 'review' key 'human_decision_markers' must be a list of "
-                    f"strings, got element of type {type(item).__name__}"
-                )
-        review_data["human_decision_markers"] = tuple(str(item) for item in _hdm)
-    review = _build_section(ReviewConfig, "review", review_data)
-    review_dispatch_data = _section(data, "review_dispatch")
-    for rd_bool_key in ("enabled",):
-        rd_bool_value = review_dispatch_data.get(rd_bool_key)
-        if rd_bool_value is not None and not isinstance(rd_bool_value, bool):
-            raise ConfigError(
-                f"config section 'review_dispatch' key '{rd_bool_key}' must be a bool, "
-                f"got {type(rd_bool_value).__name__}"
-            )
-    rd_reviews_dir = review_dispatch_data.get("reviews_dir")
-    if rd_reviews_dir is not None and not isinstance(rd_reviews_dir, str):
-        raise ConfigError(
-            "config section 'review_dispatch' key 'reviews_dir' must be a string, "
-            f"got {type(rd_reviews_dir).__name__}"
-        )
-    rd_max_local = review_dispatch_data.get("max_local_review_processes")
-    if rd_max_local is not None and not isinstance(rd_max_local, int):
-        raise ConfigError(
-            "config section 'review_dispatch' key 'max_local_review_processes' must be an int, "
-            f"got {type(rd_max_local).__name__}"
-        )
-    if rd_max_local is not None and rd_max_local < 0:
-        raise ConfigError(
-            "config section 'review_dispatch' key 'max_local_review_processes' must be >= 0, "
-            f"got {rd_max_local}"
-        )
-    rd_max_attempts = review_dispatch_data.get("max_review_dispatch_attempts")
-    if rd_max_attempts is not None and (
-        isinstance(rd_max_attempts, bool) or not isinstance(rd_max_attempts, int)
-    ):
-        raise ConfigError(
-            "config section 'review_dispatch' key 'max_review_dispatch_attempts' must be an int, "
-            f"got {type(rd_max_attempts).__name__}"
-        )
-    if rd_max_attempts is not None and rd_max_attempts < 1:
-        raise ConfigError(
-            "config section 'review_dispatch' key 'max_review_dispatch_attempts' must be >= 1, "
-            f"got {rd_max_attempts}"
-        )
-    rd_max_unreadable = review_dispatch_data.get("max_consecutive_review_log_unreadable")
-    if rd_max_unreadable is not None and (
-        isinstance(rd_max_unreadable, bool) or not isinstance(rd_max_unreadable, int)
-    ):
-        raise ConfigError(
-            "config section 'review_dispatch' key 'max_consecutive_review_log_unreadable' must be an int, "
-            f"got {type(rd_max_unreadable).__name__}"
-        )
-    if rd_max_unreadable is not None and rd_max_unreadable < 0:
-        raise ConfigError(
-            "config section 'review_dispatch' key 'max_consecutive_review_log_unreadable' must be >= 0, "
-            f"got {rd_max_unreadable}"
-        )
-    rd_probe_max_interval = review_dispatch_data.get("quota_probe_max_interval_minutes")
-    if rd_probe_max_interval is not None and (
-        isinstance(rd_probe_max_interval, bool) or not isinstance(rd_probe_max_interval, int)
-    ):
-        raise ConfigError(
-            "config section 'review_dispatch' key 'quota_probe_max_interval_minutes' must be "
-            f"an int, got {type(rd_probe_max_interval).__name__}"
-        )
-    if rd_probe_max_interval is not None and rd_probe_max_interval < 0:
-        raise ConfigError(
-            "config section 'review_dispatch' key 'quota_probe_max_interval_minutes' must be "
-            f">= 0, got {rd_probe_max_interval}"
-        )
-    rd_max_turns = review_dispatch_data.get("review_max_turns")
-    if rd_max_turns is not None and (
-        isinstance(rd_max_turns, bool) or not isinstance(rd_max_turns, int)
-    ):
-        raise ConfigError(
-            "config section 'review_dispatch' key 'review_max_turns' must be an int, "
-            f"got {type(rd_max_turns).__name__}"
-        )
-    if rd_max_turns is not None and rd_max_turns < 0:
-        raise ConfigError(
-            "config section 'review_dispatch' key 'review_max_turns' must be >= 0, "
-            f"got {rd_max_turns}"
-        )
-    rd_diff_threshold = review_dispatch_data.get("diff_line_threshold")
-    if rd_diff_threshold is not None and (
-        isinstance(rd_diff_threshold, bool) or not isinstance(rd_diff_threshold, int)
-    ):
-        raise ConfigError(
-            "config section 'review_dispatch' key 'diff_line_threshold' must be an int, "
-            f"got {type(rd_diff_threshold).__name__}"
-        )
-    if rd_diff_threshold is not None and rd_diff_threshold < 0:
-        raise ConfigError(
-            "config section 'review_dispatch' key 'diff_line_threshold' must be >= 0, "
-            f"got {rd_diff_threshold}"
-        )
-    # Issue #1439: structure-aware turn-cap knobs.
-    _RD_INT_KEYS = (
-        "turn_cap_large_file_threshold",
-        "turn_cap_large_file_multiplier",
-        "turn_cap_max_multiplier",
-        "max_consecutive_turn_limit_misses",
-        "max_consecutive_review_api_errors",
-        "file_size_cap_lines",
-        "review_exec_rejection_max_resumes",
-    )
-    for _rd_key in _RD_INT_KEYS:
-        _rd_val = review_dispatch_data.get(_rd_key)
-        if _rd_val is not None and (isinstance(_rd_val, bool) or not isinstance(_rd_val, int)):
-            raise ConfigError(
-                f"config section 'review_dispatch' key '{_rd_key}' must be an int, "
-                f"got {type(_rd_val).__name__}"
-            )
-        if _rd_val is not None and _rd_val < 0:
-            raise ConfigError(
-                f"config section 'review_dispatch' key '{_rd_key}' must be >= 0, got {_rd_val}"
-            )
-    review_dispatch = _build_section(ReviewDispatchConfig, "review_dispatch", review_dispatch_data)
-    quota_probe_data = _section(data, "quota_probe")
-    qp_enabled = quota_probe_data.get("enabled")
-    if qp_enabled is not None and not isinstance(qp_enabled, bool):
-        raise ConfigError(
-            f"config section 'quota_probe' key 'enabled' must be a bool, "
-            f"got {type(qp_enabled).__name__}"
-        )
-    qp_interval = quota_probe_data.get("interval_minutes")
-    if qp_interval is not None and (
-        isinstance(qp_interval, bool) or not isinstance(qp_interval, int)
-    ):
-        raise ConfigError(
-            "config section 'quota_probe' key 'interval_minutes' must be an int, "
-            f"got {type(qp_interval).__name__}"
-        )
-    if qp_interval is not None and qp_interval < 1:
-        raise ConfigError(
-            f"config section 'quota_probe' key 'interval_minutes' must be >= 1, got {qp_interval}"
-        )
-    qp_model = quota_probe_data.get("model")
-    if qp_model is not None and not isinstance(qp_model, str):
-        raise ConfigError(
-            f"config section 'quota_probe' key 'model' must be a string, got {type(qp_model).__name__}"
-        )
-    if qp_model is not None and not qp_model.strip():
-        raise ConfigError("config section 'quota_probe' key 'model' must not be empty")
-    qp_timeout = quota_probe_data.get("timeout_seconds")
-    if qp_timeout is not None and (
-        isinstance(qp_timeout, bool) or not isinstance(qp_timeout, int)
-    ):
-        raise ConfigError(
-            "config section 'quota_probe' key 'timeout_seconds' must be an int, "
-            f"got {type(qp_timeout).__name__}"
-        )
-    if qp_timeout is not None and qp_timeout < 1:
-        raise ConfigError(
-            f"config section 'quota_probe' key 'timeout_seconds' must be >= 1, got {qp_timeout}"
-        )
-    qp_prompt = quota_probe_data.get("prompt")
-    if qp_prompt is not None and not isinstance(qp_prompt, str):
-        raise ConfigError(
-            f"config section 'quota_probe' key 'prompt' must be a string, got {type(qp_prompt).__name__}"
-        )
-    if qp_prompt is not None and not qp_prompt.strip():
-        raise ConfigError("config section 'quota_probe' key 'prompt' must not be empty")
-    quota_probe = _build_section(QuotaProbeConfig, "quota_probe", quota_probe_data)
-    reconcile_pass_data = _section(data, "reconcile_pass")
-    rp_enabled = reconcile_pass_data.get("enabled")
-    if rp_enabled is not None and not isinstance(rp_enabled, bool):
-        raise ConfigError(
-            f"config section 'reconcile_pass' key 'enabled' must be a bool, "
-            f"got {type(rp_enabled).__name__}"
-        )
-    rp_interval = reconcile_pass_data.get("interval_minutes")
-    if rp_interval is not None and (
-        isinstance(rp_interval, bool) or not isinstance(rp_interval, int)
-    ):
-        raise ConfigError(
-            "config section 'reconcile_pass' key 'interval_minutes' must be an int, "
-            f"got {type(rp_interval).__name__}"
-        )
-    if rp_interval is not None and rp_interval < 1:
-        raise ConfigError(
-            f"config section 'reconcile_pass' key 'interval_minutes' must be >= 1, got {rp_interval}"
-        )
-    rp_alert_days = reconcile_pass_data.get("terminal_state_alert_days")
-    if rp_alert_days is not None and (
-        isinstance(rp_alert_days, bool) or not isinstance(rp_alert_days, int)
-    ):
-        raise ConfigError(
-            "config section 'reconcile_pass' key 'terminal_state_alert_days' must be an int, "
-            f"got {type(rp_alert_days).__name__}"
-        )
-    if rp_alert_days is not None and rp_alert_days < 1:
-        raise ConfigError(
-            "config section 'reconcile_pass' key 'terminal_state_alert_days' must be >= 1, "
-            f"got {rp_alert_days}"
-        )
-    reconcile_pass = _build_section(ReconcilePassConfig, "reconcile_pass", reconcile_pass_data)
-    # Issue #1314: extract ONLY the two new operator-queue follow-up knobs
-    # from the ``deescalation`` section. The section as a whole was
-    # previously 100% inert (never passed into OrchestratorConfig — always
-    # defaulted), and activating full-section parsing here would silently
-    # (a) hard-reject unknown keys via ``_build_section`` for any live config
-    # that already has a ``deescalation:`` block with extra/typo'd keys
-    # (self-deploy-brick risk) and (b) flip ``enabled`` / ``interval_minutes``
-    # defaults for configs that set those keys expecting them to be ignored.
-    # Full-section activation is a separate, explicitly-reviewed change with
-    # operator notification; this PR scopes to the two fields the issue
-    # actually asks for. Unknown keys and pre-existing
-    # ``enabled``/``interval_minutes`` overrides are silently ignored, same
-    # as before this PR.
-    deescalation_data = _section(data, "deescalation")
-    # Issue #1477 added the third knob (``identical_reason_recurrence_window_minutes``)
-    # to the same scoped-extraction pattern: each key is parsed explicitly and
-    # unknown keys are still silently ignored. The validation lives in
-    # ``deescalation_config.py``; error messages are byte-identical.
-    deescalation = DeescalationConfig(**parse_deescalation_overrides(deescalation_data))
-    auto_merge_data = _section(data, "auto_merge")
-    required_checks = auto_merge_data.get("required_checks")
-    if isinstance(required_checks, list):
-        auto_merge_data["required_checks"] = tuple(str(item) for item in required_checks)
-    merge_flags = auto_merge_data.get("merge_flags")
-    if merge_flags is not None and not isinstance(merge_flags, list):
-        raise ConfigError(
-            "config section 'auto_merge' key 'merge_flags' must be a list of flags, "
-            f"got {type(merge_flags).__name__}"
-        )
-    if isinstance(merge_flags, list):
-        auto_merge_data["merge_flags"] = tuple(str(item) for item in merge_flags)
-    # Validate merge_flags: each flag must start with "--"
-    merge_flags = auto_merge_data.get("merge_flags")
-    if merge_flags:
-        for flag in merge_flags:
-            if not str(flag).startswith("--"):
-                raise ConfigError(
-                    f"config section 'auto_merge' key 'merge_flags': flag '{flag}' "
-                    f"must start with '--'"
-                )
-        # Reject flags that conflict with orchestrator-managed behavior
-        # These are either appended by merge_pr itself (strategy flags) or
-        # deliberately excluded (branch deletion is handled separately)
-        # Normalize by splitting on '=' to catch --flag=value forms
-        for flag in merge_flags:
-            flag_name = str(flag).split("=", 1)[0]
-            if flag_name in ORCHESTRATOR_MANAGED_MERGE_FLAGS:
-                raise ConfigError(
-                    f"config section 'auto_merge' key 'merge_flags': flag '{flag}' "
-                    f"is managed by the orchestrator and cannot be specified in merge_flags"
-                )
-    failed_attempt_alarm = auto_merge_data.get("failed_attempt_alarm")
-    if failed_attempt_alarm is not None and not isinstance(failed_attempt_alarm, int):
-        raise ConfigError(
-            "config section 'auto_merge' key 'failed_attempt_alarm' must be an int, "
-            f"got {type(failed_attempt_alarm).__name__}"
-        )
-    readiness_no_ci_minutes = auto_merge_data.get("readiness_no_ci_minutes")
-    if readiness_no_ci_minutes is not None:
-        if isinstance(readiness_no_ci_minutes, bool) or not isinstance(
-            readiness_no_ci_minutes, int
-        ):
-            raise ConfigError(
-                "config section 'auto_merge' key 'readiness_no_ci_minutes' must be an int, "
-                f"got {type(readiness_no_ci_minutes).__name__}"
-            )
-        if readiness_no_ci_minutes < 0:
-            raise ConfigError(
-                "config section 'auto_merge' key 'readiness_no_ci_minutes' must not be negative"
-            )
-    ci_run_never_created_grace_minutes = auto_merge_data.get("ci_run_never_created_grace_minutes")
-    if ci_run_never_created_grace_minutes is not None:
-        if isinstance(ci_run_never_created_grace_minutes, bool) or not isinstance(
-            ci_run_never_created_grace_minutes, int
-        ):
-            raise ConfigError(
-                "config section 'auto_merge' key 'ci_run_never_created_grace_minutes' "
-                f"must be an int, got {type(ci_run_never_created_grace_minutes).__name__}"
-            )
-        if ci_run_never_created_grace_minutes < 0:
-            raise ConfigError(
-                "config section 'auto_merge' key 'ci_run_never_created_grace_minutes' "
-                "must not be negative"
-            )
-    mergequeue_label = auto_merge_data.get("mergequeue_label")
-    if mergequeue_label is not None:
-        if not isinstance(mergequeue_label, str):
-            raise ConfigError(
-                "config section 'auto_merge' key 'mergequeue_label' must be a string, "
-                f"got {type(mergequeue_label).__name__}"
-            )
-        stripped_mergequeue_label = mergequeue_label.strip()
-        if not stripped_mergequeue_label:
-            raise ConfigError(
-                "config section 'auto_merge' key 'mergequeue_label' must not be empty"
-            )
-        # Store the stripped value: this threads verbatim into
-        # `gh pr edit --add-label <label>`, so surrounding whitespace must
-        # not survive into the actual GitHub label name.
-        auto_merge_data["mergequeue_label"] = stripped_mergequeue_label
-    queue_bot_login = auto_merge_data.get("queue_bot_login")
-    if queue_bot_login is not None:
-        if not isinstance(queue_bot_login, str):
-            raise ConfigError(
-                "config section 'auto_merge' key 'queue_bot_login' must be a string, "
-                f"got {type(queue_bot_login).__name__}"
-            )
-        stripped_queue_bot_login = queue_bot_login.strip()
-        if not stripped_queue_bot_login:
-            raise ConfigError(
-                "config section 'auto_merge' key 'queue_bot_login' must not be empty"
-            )
-        # Store the stripped value: it is compared against the GitHub commit
-        # author login, where surrounding whitespace can never match.
-        auto_merge_data["queue_bot_login"] = stripped_queue_bot_login
-    mergequeue_wedge_hours = auto_merge_data.get("mergequeue_wedge_hours")
-    if mergequeue_wedge_hours is not None:
-        if isinstance(mergequeue_wedge_hours, bool) or not isinstance(
-            mergequeue_wedge_hours, (int, float)
-        ):
-            raise ConfigError(
-                "config section 'auto_merge' key 'mergequeue_wedge_hours' must be a "
-                f"number, got {type(mergequeue_wedge_hours).__name__}"
-            )
-        if mergequeue_wedge_hours < 0:
-            raise ConfigError(
-                "config section 'auto_merge' key 'mergequeue_wedge_hours' "
-                f"must not be negative, got {mergequeue_wedge_hours}"
-            )
-        auto_merge_data["mergequeue_wedge_hours"] = float(mergequeue_wedge_hours)
-    # Issue #1383: nested infra_blocked section under auto_merge.
-    infra_blocked_data = auto_merge_data.get("infra_blocked")
-    if infra_blocked_data is not None:
-        if not isinstance(infra_blocked_data, dict):
-            raise ConfigError(
-                "config section 'auto_merge' key 'infra_blocked' must be a mapping, "
-                f"got {type(infra_blocked_data).__name__}"
-            )
-        infra_blocked_fields = {f.name for f in fields(InfraBlockedConfig)}
-        unknown_ib_keys = sorted(set(infra_blocked_data) - infra_blocked_fields)
-        if unknown_ib_keys:
-            raise ConfigError(
-                "config section 'auto_merge' key 'infra_blocked' has unknown key(s): "
-                f"{', '.join(unknown_ib_keys)} "
-                f"(valid: {', '.join(sorted(infra_blocked_fields))})"
-            )
-        annotation_patterns = infra_blocked_data.get("annotation_patterns")
-        if annotation_patterns is not None:
-            if not isinstance(annotation_patterns, list):
-                raise ConfigError(
-                    "config section 'auto_merge' key 'infra_blocked.annotation_patterns' "
-                    f"must be a list of strings, got {type(annotation_patterns).__name__}"
-                )
-            infra_blocked_data["annotation_patterns"] = tuple(
-                str(item) for item in annotation_patterns
-            )
-        for int_key in ("instant_fail_seconds", "persistence_passes"):
-            int_value = infra_blocked_data.get(int_key)
-            if int_value is not None:
-                if isinstance(int_value, bool) or not isinstance(int_value, int):
-                    raise ConfigError(
-                        f"config section 'auto_merge' key 'infra_blocked.{int_key}' must be an "
-                        f"int, got {type(int_value).__name__}"
-                    )
-                if int_value < 0:
-                    raise ConfigError(
-                        f"config section 'auto_merge' key 'infra_blocked.{int_key}' must be >= 0, "
-                        f"got {int_value}"
-                    )
-        esc_minutes = infra_blocked_data.get("escalation_window_minutes")
-        if esc_minutes is not None:
-            if isinstance(esc_minutes, bool) or not isinstance(esc_minutes, int):
-                raise ConfigError(
-                    "config section 'auto_merge' key 'infra_blocked.escalation_window_minutes' "
-                    f"must be an int, got {type(esc_minutes).__name__}"
-                )
-            if esc_minutes < 0:
-                raise ConfigError(
-                    "config section 'auto_merge' key 'infra_blocked.escalation_window_minutes' "
-                    f"must be >= 0, got {esc_minutes}"
-                )
-        enabled_value = infra_blocked_data.get("enabled")
-        if enabled_value is not None and not isinstance(enabled_value, bool):
-            raise ConfigError(
-                "config section 'auto_merge' key 'infra_blocked.enabled' must be a bool, "
-                f"got {type(enabled_value).__name__}"
-            )
-        auto_merge_data["infra_blocked"] = InfraBlockedConfig(**infra_blocked_data)
-    auto_merge = _build_section(AutoMergeConfig, "auto_merge", auto_merge_data)
-    runtime_data = _section(data, "runtime")
-    throttle_error_markers = runtime_data.get("throttle_error_markers")
-    if throttle_error_markers is not None:
-        if not isinstance(throttle_error_markers, list):
-            raise ConfigError(
-                "config section 'runtime' key 'throttle_error_markers' must be a list of "
-                f"strings, got {type(throttle_error_markers).__name__}"
-            )
-        for item in throttle_error_markers:
-            if not isinstance(item, str):
-                raise ConfigError(
-                    "config section 'runtime' key 'throttle_error_markers' must be a list of "
-                    f"strings, got element of type {type(item).__name__}"
-                )
-        runtime_data["throttle_error_markers"] = tuple(throttle_error_markers)
-    session_limit_markers = runtime_data.get("session_limit_markers")
-    if session_limit_markers is not None:
-        if not isinstance(session_limit_markers, list):
-            raise ConfigError(
-                "config section 'runtime' key 'session_limit_markers' must be a list of "
-                f"strings, got {type(session_limit_markers).__name__}"
-            )
-        for item in session_limit_markers:
-            if not isinstance(item, str):
-                raise ConfigError(
-                    "config section 'runtime' key 'session_limit_markers' must be a list of "
-                    f"strings, got element of type {type(item).__name__}"
-                )
-        runtime_data["session_limit_markers"] = tuple(session_limit_markers)
-    quota_error_markers = runtime_data.get("quota_error_markers")
-    if quota_error_markers is not None:
-        if not isinstance(quota_error_markers, list):
-            raise ConfigError(
-                "config section 'runtime' key 'quota_error_markers' must be a list of "
-                f"strings, got {type(quota_error_markers).__name__}"
-            )
-        for item in quota_error_markers:
-            if not isinstance(item, str):
-                raise ConfigError(
-                    "config section 'runtime' key 'quota_error_markers' must be a list of "
-                    f"strings, got element of type {type(item).__name__}"
-                )
-        runtime_data["quota_error_markers"] = tuple(quota_error_markers)
-    gh_max_retries = runtime_data.get("gh_max_retries")
-    if gh_max_retries is not None and not isinstance(gh_max_retries, int):
-        raise ConfigError(
-            "config section 'runtime' key 'gh_max_retries' must be an int, "
-            f"got {type(gh_max_retries).__name__}"
-        )
-    gh_retry_base_seconds = runtime_data.get("gh_retry_base_seconds")
-    if gh_retry_base_seconds is not None and not isinstance(gh_retry_base_seconds, (int, float)):
-        raise ConfigError(
-            "config section 'runtime' key 'gh_retry_base_seconds' must be a number, "
-            f"got {type(gh_retry_base_seconds).__name__}"
-        )
-    gh_timeout_seconds = runtime_data.get("gh_timeout_seconds")
-    if gh_timeout_seconds is not None:
-        if isinstance(gh_timeout_seconds, bool) or not isinstance(
-            gh_timeout_seconds, (int, float)
-        ):
-            raise ConfigError(
-                "config section 'runtime' key 'gh_timeout_seconds' must be a number, "
-                f"got {type(gh_timeout_seconds).__name__}"
-            )
-        # Rejected rather than silently coerced: 0/negative would mean "time out
-        # instantly", turning every gh call into a failure. There is no
-        # "disable" value on purpose — an unbounded gh call is the defect.
-        if gh_timeout_seconds <= 0:
-            raise ConfigError(
-                "config section 'runtime' key 'gh_timeout_seconds' must be > 0, "
-                f"got {gh_timeout_seconds}"
-            )
-    # Issue #1976: quiet window for the config-retirement sweep. 0 is legal —
-    # it retires a key on the first pass where it is absent everywhere, which
-    # is the opt-out an operator would pick deliberately; negative is never
-    # meaningful, so it fails closed.
-    quiet_days = runtime_data.get("config_retirement_quiet_days")
-    if quiet_days is not None:
-        if isinstance(quiet_days, bool) or not isinstance(quiet_days, (int, float)):
-            raise ConfigError(
-                "config section 'runtime' key 'config_retirement_quiet_days' must be a "
-                f"number, got {type(quiet_days).__name__}"
-            )
-        if quiet_days < 0:
-            raise ConfigError(
-                "config section 'runtime' key 'config_retirement_quiet_days' must be "
-                f">= 0, got {quiet_days}"
-            )
-    gh_long_call_timeout_seconds = runtime_data.get("gh_long_call_timeout_seconds")
-    if gh_long_call_timeout_seconds is not None:
-        if isinstance(gh_long_call_timeout_seconds, bool) or not isinstance(
-            gh_long_call_timeout_seconds, (int, float)
-        ):
-            raise ConfigError(
-                "config section 'runtime' key 'gh_long_call_timeout_seconds' must be a "
-                f"number, got {type(gh_long_call_timeout_seconds).__name__}"
-            )
-        if gh_long_call_timeout_seconds <= 0:
-            raise ConfigError(
-                "config section 'runtime' key 'gh_long_call_timeout_seconds' must be > 0, "
-                f"got {gh_long_call_timeout_seconds}"
-            )
-    gh_transport = runtime_data.get("gh_transport")
-    if gh_transport is not None:
-        if not isinstance(gh_transport, str) or gh_transport not in ("http", "gh"):
-            raise ConfigError(
-                "config section 'runtime' key 'gh_transport' must be one of "
-                f"'http', 'gh', got {gh_transport!r}"
-            )
-    pr_create_retry_max_attempts = runtime_data.get("pr_create_retry_max_attempts")
-    if pr_create_retry_max_attempts is not None and not isinstance(
-        pr_create_retry_max_attempts, int
-    ):
-        raise ConfigError(
-            "config section 'runtime' key 'pr_create_retry_max_attempts' must be an int, "
-            f"got {type(pr_create_retry_max_attempts).__name__}"
-        )
-    pr_create_retry_base_seconds = runtime_data.get("pr_create_retry_base_seconds")
-    if pr_create_retry_base_seconds is not None and not isinstance(
-        pr_create_retry_base_seconds, (int, float)
-    ):
-        raise ConfigError(
-            "config section 'runtime' key 'pr_create_retry_base_seconds' must be a number, "
-            f"got {type(pr_create_retry_base_seconds).__name__}"
-        )
-    graphql_rate_limit_threshold = runtime_data.get("graphql_rate_limit_threshold")
-    if graphql_rate_limit_threshold is not None:
-        if not isinstance(graphql_rate_limit_threshold, int):
-            raise ConfigError(
-                "config section 'runtime' key 'graphql_rate_limit_threshold' must be an int, "
-                f"got {type(graphql_rate_limit_threshold).__name__}"
-            )
-        if graphql_rate_limit_threshold < 0:
-            raise ConfigError(
-                "config section 'runtime' key 'graphql_rate_limit_threshold' must be >= 0, "
-                f"got {graphql_rate_limit_threshold}"
-            )
-    event_ring_size = runtime_data.get("event_ring_size")
-    if event_ring_size is not None:
-        # bool is an int subclass, so a bare isinstance(..., int) accepts
-        # `event_ring_size: true` and silently uses it as 1 -- a two-entry ring
-        # that looks configured. Reject it explicitly, matching
-        # escalated_label_repair_max_per_pass below.
-        if not isinstance(event_ring_size, int) or isinstance(event_ring_size, bool):
-            raise ConfigError(
-                "config section 'runtime' key 'event_ring_size' must be an int, "
-                f"got {type(event_ring_size).__name__}"
-            )
-        # >= 1, not >= 0: append_event truncates via events[-max_size:], and
-        # -0 == 0 in Python, so max_size=0 would yield events[0:] (the FULL
-        # list) — no truncation, i.e. unbounded growth, the exact failure this
-        # cap exists to prevent. There is no sensible "disable" semantic for a
-        # bounded ring (unlike graphql_rate_limit_threshold: 0), so reject 0.
-        if event_ring_size < 1:
-            raise ConfigError(
-                "config section 'runtime' key 'event_ring_size' must be >= 1, "
-                f"got {event_ring_size}"
-            )
-    throttle_resume_margin_s = runtime_data.get("throttle_resume_margin_s")
-    if throttle_resume_margin_s is not None:
-        if not isinstance(throttle_resume_margin_s, int):
-            raise ConfigError(
-                "config section 'runtime' key 'throttle_resume_margin_s' must be an int, "
-                f"got {type(throttle_resume_margin_s).__name__}"
-            )
-        if throttle_resume_margin_s < 0:
-            raise ConfigError(
-                "config section 'runtime' key 'throttle_resume_margin_s' must be >= 0, "
-                f"got {throttle_resume_margin_s}"
-            )
-    repair_cap = runtime_data.get("escalated_label_repair_max_per_pass")
-    if repair_cap is not None:
-        if not isinstance(repair_cap, int) or isinstance(repair_cap, bool):
-            raise ConfigError(
-                "config section 'runtime' key 'escalated_label_repair_max_per_pass' "
-                f"must be an int, got {type(repair_cap).__name__}"
-            )
-        # 0 means unlimited here (matching graphql_rate_limit_threshold's
-        # "0 disables the guard"), so only negatives are rejected.
-        if repair_cap < 0:
-            raise ConfigError(
-                "config section 'runtime' key 'escalated_label_repair_max_per_pass' "
-                f"must be >= 0, got {repair_cap}"
-            )
-    stale_grace_days = runtime_data.get("fleet_registry_stale_grace_days")
-    if stale_grace_days is not None:
-        if not isinstance(stale_grace_days, int) or isinstance(stale_grace_days, bool):
-            raise ConfigError(
-                "config section 'runtime' key 'fleet_registry_stale_grace_days' "
-                f"must be an int, got {type(stale_grace_days).__name__}"
-            )
-        if stale_grace_days < 0:
-            raise ConfigError(
-                "config section 'runtime' key 'fleet_registry_stale_grace_days' "
-                f"must be >= 0, got {stale_grace_days}"
-            )
-    status_snapshot_ttl = runtime_data.get("status_snapshot_ttl_seconds")
-    if status_snapshot_ttl is not None:
-        if not isinstance(status_snapshot_ttl, int) or isinstance(status_snapshot_ttl, bool):
-            raise ConfigError(
-                "config section 'runtime' key 'status_snapshot_ttl_seconds' "
-                f"must be an int, got {type(status_snapshot_ttl).__name__}"
-            )
-        if status_snapshot_ttl < 0:
-            raise ConfigError(
-                "config section 'runtime' key 'status_snapshot_ttl_seconds' "
-                f"must be >= 0, got {status_snapshot_ttl}"
-            )
-    # Parse preflight sub-section (issue #1363).
-    preflight_data = runtime_data.get("preflight")
-    if preflight_data is not None:
-        if not isinstance(preflight_data, dict):
-            raise ConfigError(
-                "config section 'runtime' key 'preflight' must be a mapping, "
-                f"got {type(preflight_data).__name__}"
-            )
-        preflight_fields = {f.name for f in fields(PreflightConfig)}
-        unknown_preflight_keys = sorted(set(preflight_data) - preflight_fields)
-        if unknown_preflight_keys:
-            raise ConfigError(
-                "config section 'runtime' key 'preflight' has unknown key(s): "
-                f"{', '.join(unknown_preflight_keys)} "
-                f"(valid: {', '.join(sorted(preflight_fields))})"
-            )
-        disk_floor_gb = preflight_data.get("disk_floor_gb")
-        if disk_floor_gb is not None:
-            if not isinstance(disk_floor_gb, int) or isinstance(disk_floor_gb, bool):
-                raise ConfigError(
-                    "config section 'runtime' key 'preflight.disk_floor_gb' must be an int, "
-                    f"got {type(disk_floor_gb).__name__}"
-                )
-            if disk_floor_gb < 0:
-                raise ConfigError(
-                    "config section 'runtime' key 'preflight.disk_floor_gb' must be >= 0, "
-                    f"got {disk_floor_gb}"
-                )
-        clock_max_skew_hours = preflight_data.get("clock_max_skew_hours")
-        if clock_max_skew_hours is not None:
-            if not isinstance(clock_max_skew_hours, (int, float)) or isinstance(
-                clock_max_skew_hours, bool
-            ):
-                raise ConfigError(
-                    "config section 'runtime' key 'preflight.clock_max_skew_hours' must be a "
-                    f"number, got {type(clock_max_skew_hours).__name__}"
-                )
-            if clock_max_skew_hours < 0:
-                raise ConfigError(
-                    "config section 'runtime' key 'preflight.clock_max_skew_hours' must be >= 0, "
-                    f"got {clock_max_skew_hours}"
-                )
-        for bool_key in (
-            "disk_floor_fatal",
-            "clock_sanity_fatal",
-            "venv_identity_fatal",
-            "config_freshness_fatal",
-            "git_identity_fatal",
-        ):
-            bool_value = preflight_data.get(bool_key)
-            if bool_value is not None and not isinstance(bool_value, bool):
-                raise ConfigError(
-                    f"config section 'runtime' key 'preflight.{bool_key}' must be a bool, "
-                    f"got {type(bool_value).__name__}"
-                )
-        runtime_data["preflight"] = PreflightConfig(**preflight_data)
-    # Parse gh_circuit_breaker sub-section (issue #1833).
-    gh_circuit_breaker_data = runtime_data.get("gh_circuit_breaker")
-    if gh_circuit_breaker_data is not None:
-        if not isinstance(gh_circuit_breaker_data, dict):
-            raise ConfigError(
-                "config section 'runtime' key 'gh_circuit_breaker' must be a mapping, "
-                f"got {type(gh_circuit_breaker_data).__name__}"
-            )
-        breaker_fields = {f.name for f in fields(GhCircuitBreakerConfig)}
-        unknown_breaker_keys = sorted(set(gh_circuit_breaker_data) - breaker_fields)
-        if unknown_breaker_keys:
-            raise ConfigError(
-                "config section 'runtime' key 'gh_circuit_breaker' has unknown key(s): "
-                f"{', '.join(unknown_breaker_keys)} "
-                f"(valid: {', '.join(sorted(breaker_fields))})"
-            )
-        failure_threshold = gh_circuit_breaker_data.get("failure_threshold")
-        if failure_threshold is not None:
-            if not isinstance(failure_threshold, int) or isinstance(failure_threshold, bool):
-                raise ConfigError(
-                    "config section 'runtime' key 'gh_circuit_breaker.failure_threshold' "
-                    f"must be an int, got {type(failure_threshold).__name__}"
-                )
-            if failure_threshold < 1:
-                raise ConfigError(
-                    "config section 'runtime' key 'gh_circuit_breaker.failure_threshold' "
-                    f"must be >= 1, got {failure_threshold}"
-                )
-        cooldown_seconds = gh_circuit_breaker_data.get("cooldown_seconds")
-        if cooldown_seconds is not None:
-            if not isinstance(cooldown_seconds, (int, float)) or isinstance(
-                cooldown_seconds, bool
-            ):
-                raise ConfigError(
-                    "config section 'runtime' key 'gh_circuit_breaker.cooldown_seconds' "
-                    f"must be a number, got {type(cooldown_seconds).__name__}"
-                )
-            if cooldown_seconds < 0:
-                raise ConfigError(
-                    "config section 'runtime' key 'gh_circuit_breaker.cooldown_seconds' "
-                    f"must be >= 0, got {cooldown_seconds}"
-                )
-        runtime_data["gh_circuit_breaker"] = GhCircuitBreakerConfig(**gh_circuit_breaker_data)
-    runtime = _build_section(RuntimeConfig, "runtime", runtime_data)
-    devin_data = _section(data, "devin")
-    for command_key in ("dispatch_command", "shell_command"):
-        command_value = devin_data.get(command_key)
-        if isinstance(command_value, list):
-            devin_data[command_key] = tuple(str(item) for item in command_value)
-    # Validate dispatch_command placeholders (after list->tuple conversion)
-    dispatch_command = devin_data.get("dispatch_command")
-    if dispatch_command:
-        _validate_command_placeholders(
-            dispatch_command,
-            {"prompt_path", "issue_number", "branch"},
-            "devin.dispatch_command",
-        )
-    # Validate shell_command placeholders (after list->tuple conversion)
-    shell_command = devin_data.get("shell_command")
-    if shell_command:
-        _validate_command_placeholders(
-            shell_command,
-            {"prompt_path", "issue_number", "branch", "model_args"},
-            "devin.shell_command",
-        )
-    worker_env = devin_data.get("worker_env")
-    if worker_env is not None:
-        if not isinstance(worker_env, dict):
-            raise ConfigError(
-                "config section 'devin' key 'worker_env' must be a mapping of "
-                f"env-var names to values, got {type(worker_env).__name__}"
-            )
-        devin_data["worker_env"] = {str(k): str(v) for k, v in worker_env.items()}
-    devin = _build_section(DevinConfig, "devin", devin_data)
-    claude_code_data = _section(data, "claude_code")
-    claude_command = claude_code_data.get("command")
-    if isinstance(claude_command, list):
-        claude_code_data["command"] = tuple(str(item) for item in claude_command)
-    # Validate claude_code.command placeholders
-    claude_command = claude_code_data.get("command")
-    if claude_command:
-        _validate_command_placeholders(
-            claude_command,
-            {"prompt_path", "issue_number", "branch"},
-            "claude_code.command",
-        )
-    worker_env = claude_code_data.get("worker_env")
-    if worker_env is not None:
-        if not isinstance(worker_env, dict):
-            raise ConfigError(
-                "config section 'claude_code' key 'worker_env' must be a mapping of "
-                f"env-var names to values, got {type(worker_env).__name__}"
-            )
-        claude_code_data["worker_env"] = {str(k): str(v) for k, v in worker_env.items()}
-    effort_value = claude_code_data.get("effort")
-    if effort_value is not None and not isinstance(effort_value, str):
-        raise ConfigError(
-            "config section 'claude_code' key 'effort' must be a string, "
-            f"got {type(effort_value).__name__}"
-        )
-    claude_code = _build_section(ClaudeCodeConfig, "claude_code", claude_code_data)
-    api_worker_data = _section(data, "api_worker")
-    enabled_value = api_worker_data.get("enabled")
-    if enabled_value is not None and not isinstance(enabled_value, bool):
-        raise ConfigError(
-            "config section 'api_worker' key 'enabled' must be a bool, "
-            f"got {type(enabled_value).__name__}"
-        )
-    provider_value = api_worker_data.get("provider")
-    if provider_value is not None and not isinstance(provider_value, str):
-        raise ConfigError(
-            "config section 'api_worker' key 'provider' must be a string, "
-            f"got {type(provider_value).__name__}"
-        )
-    max_concurrent_sessions = api_worker_data.get("max_concurrent_sessions")
-    if max_concurrent_sessions is not None:
-        if isinstance(max_concurrent_sessions, bool) or not isinstance(
-            max_concurrent_sessions, int
-        ):
-            raise ConfigError(
-                "config section 'api_worker' key 'max_concurrent_sessions' must be an int, "
-                f"got {type(max_concurrent_sessions).__name__}"
-            )
-        if max_concurrent_sessions < 0:
-            raise ConfigError(
-                "config section 'api_worker' key 'max_concurrent_sessions' must be >= 0, "
-                f"got {max_concurrent_sessions}"
-            )
-    for str_key in ("worker_template", "rework_template"):
-        str_value = api_worker_data.get(str_key)
-        if str_value is not None and not isinstance(str_value, str):
-            raise ConfigError(
-                f"config section 'api_worker' key '{str_key}' must be a string, "
-                f"got {type(str_value).__name__}"
-            )
-
-    # Parse budget sub-section.
-    budget_data = api_worker_data.get("budget")
-    if budget_data is not None:
-        if not isinstance(budget_data, dict):
-            raise ConfigError(
-                "config section 'api_worker' key 'budget' must be a mapping, "
-                f"got {type(budget_data).__name__}"
-            )
-        budget_fields = {f.name for f in fields(ApiBudgetConfig)}
-        unknown_budget_keys = sorted(set(budget_data) - budget_fields)
-        if unknown_budget_keys:
-            raise ConfigError(
-                "config section 'api_worker' key 'budget' has unknown key(s): "
-                f"{', '.join(unknown_budget_keys)} "
-                f"(valid: {', '.join(sorted(budget_fields))})"
-            )
-        for budget_key in budget_fields:
-            if budget_key in budget_data:
-                budget_value = budget_data[budget_key]
-                if not isinstance(budget_value, (int, float)) or isinstance(budget_value, bool):
-                    raise ConfigError(
-                        f"config section 'api_worker' key 'budget.{budget_key}' must be a number, "
-                        f"got {type(budget_value).__name__}"
-                    )
-                if budget_value < 0:
-                    raise ConfigError(
-                        f"config section 'api_worker' key 'budget.{budget_key}' must be >= 0, "
-                        f"got {budget_value}"
-                    )
-        api_worker_data["budget"] = ApiBudgetConfig(**budget_data)
-
-    # Parse providers registry.
-    providers_data = api_worker_data.get("providers")
-    if providers_data is not None:
-        if not isinstance(providers_data, dict):
-            raise ConfigError(
-                "config section 'api_worker' key 'providers' must be a mapping, "
-                f"got {type(providers_data).__name__}"
-            )
-        provider_fields = {f.name for f in fields(ApiProviderConfig)}
-        built_providers: dict[str, ApiProviderConfig] = {}
-        for name, provider_data in providers_data.items():
-            if not isinstance(provider_data, dict):
-                raise ConfigError(
-                    f"config section 'api_worker' key 'providers.{name}' must be a mapping, "
-                    f"got {type(provider_data).__name__}"
-                )
-            unknown_provider_keys = sorted(set(provider_data) - provider_fields)
-            if unknown_provider_keys:
-                raise ConfigError(
-                    f"config section 'api_worker' key 'providers.{name}' has unknown key(s): "
-                    f"{', '.join(unknown_provider_keys)} "
-                    f"(valid: {', '.join(sorted(provider_fields))})"
-                )
-            required_provider_keys = (
-                "base_url",
-                "api_key_env",
-                "model",
-                "input_usd_per_mtok",
-                "output_usd_per_mtok",
-            )
-            for req in required_provider_keys:
-                if req not in provider_data:
-                    raise ConfigError(
-                        f"config section 'api_worker' key 'providers.{name}' is missing "
-                        f"required key '{req}'"
-                    )
-            for str_provider_key in ("base_url", "api_key_env", "model"):
-                str_provider_value = provider_data.get(str_provider_key)
-                if not isinstance(str_provider_value, str) or not str_provider_value:
-                    raise ConfigError(
-                        f"config section 'api_worker' key 'providers.{name}.{str_provider_key}' "
-                        "must be a non-empty string"
-                    )
-            for price_key in (
-                "input_usd_per_mtok",
-                "output_usd_per_mtok",
-                "cached_input_usd_per_mtok",
-            ):
-                if price_key in provider_data:
-                    price_value = provider_data[price_key]
-                    if not isinstance(price_value, (int, float)) or isinstance(price_value, bool):
-                        raise ConfigError(
-                            f"config section 'api_worker' key 'providers.{name}.{price_key}' "
-                            f"must be a number, got {type(price_value).__name__}"
-                        )
-            built_providers[str(name)] = ApiProviderConfig(**provider_data)
-        api_worker_data["providers"] = MappingProxyType(built_providers)
-
-    api_worker = _build_section(ApiWorkerConfig, "api_worker", api_worker_data)
-    rescue_data = _section(data, "rescue")
-    rescue_enabled = rescue_data.get("enabled")
-    if rescue_enabled is not None and not isinstance(rescue_enabled, bool):
-        raise ConfigError(
-            f"config section 'rescue' key 'enabled' must be a bool, "
-            f"got {type(rescue_enabled).__name__}"
-        )
-    for rescue_str_key in (
-        "worker_adapter",
-        "worker_model",
-        "reviewer_adapter",
-        "reviewer_model",
-    ):
-        rescue_str_value = rescue_data.get(rescue_str_key)
-        if rescue_str_value is not None and not isinstance(rescue_str_value, str):
-            raise ConfigError(
-                f"config section 'rescue' key '{rescue_str_key}' must be a string, "
-                f"got {type(rescue_str_value).__name__}"
-            )
-    rescue_command = rescue_data.get("reviewer_command")
-    if isinstance(rescue_command, list):
-        rescue_data["reviewer_command"] = tuple(str(item) for item in rescue_command)
-    rescue_command = rescue_data.get("reviewer_command")
-    if rescue_command:
-        _validate_command_placeholders(
-            rescue_command,
-            {"prompt_path", "model"},
-            "rescue.reviewer_command",
-        )
-    rescue_timeout = rescue_data.get("reviewer_timeout_seconds")
-    if rescue_timeout is not None and (
-        isinstance(rescue_timeout, bool) or not isinstance(rescue_timeout, int)
-    ):
-        raise ConfigError(
-            "config section 'rescue' key 'reviewer_timeout_seconds' must be an int, "
-            f"got {type(rescue_timeout).__name__}"
-        )
-    if rescue_timeout is not None and rescue_timeout < 0:
-        raise ConfigError(
-            "config section 'rescue' key 'reviewer_timeout_seconds' must be >= 0, "
-            f"got {rescue_timeout}"
-        )
-    # Only construct (and thus override) rescue.worker/.reviewer when the
-    # section actually names that key. If it's absent, leave it out of
-    # rescue_data entirely so _build_section's cls(**data) below does NOT
-    # pass worker=/reviewer= at all -- letting RescueConfig's own
-    # field-level default_factory apply (harness="claude-code",
-    # model="claude-opus-5-5" for worker; harness="devin", model="codex"
-    # for reviewer). Unconditionally constructing a bare WorkerRoleConfig()
-    # here regardless of presence used to silently override those
-    # RescueConfig-specific defaults with WorkerRoleConfig's OWN bare
-    # defaults (harness="manual", model="") any time no rescue.worker/
-    # rescue.reviewer section was configured -- making a loaded (but
-    # rescue-section-absent) config disagree with a bare RescueConfig()
-    # Python construction, which several tests assert must be equivalent
-    # (test_config_provenance.py's "configured-off is indistinguishable
-    # from never-loaded" invariant). Caught during role-config Phase 2
-    # Track E test triage.
-    if "worker" in rescue_data:
-        rescue_worker_data = rescue_data.get("worker") or {}
-        if not isinstance(rescue_worker_data, dict):
-            rescue_worker_data = {}
-        rescue_data["worker"] = WorkerRoleConfig(**rescue_worker_data)
-    if "reviewer" in rescue_data:
-        rescue_reviewer_data = rescue_data.get("reviewer") or {}
-        if not isinstance(rescue_reviewer_data, dict):
-            rescue_reviewer_data = {}
-        rescue_data["reviewer"] = WorkerRoleConfig(**rescue_reviewer_data)
-    rescue = _build_section(RescueConfig, "rescue", rescue_data)
-    worker_data = normalize_role_section(
-        WorkerRoleConfig, "worker", _section(data, "worker"), WORKER_HARNESSES
-    )
-    worker = _build_section(WorkerRoleConfig, "worker", worker_data)
-    # Harness membership is enforced here, at the top-level worker build site,
-    # rather than in WorkerRoleConfig.__post_init__: the dataclass is reused
-    # for rescue.worker/rescue.reviewer above, and rescue.reviewer's own
-    # documented default harness ("devin") is not a member of
-    # harnesses.WORKER_HARNESSES -- a blanket per-instance check would reject
-    # that reuse's own defaults. This check only ever applies to the single
-    # top-level worker role.
-    if worker.harness not in WORKER_HARNESSES:
-        raise ConfigError(
-            "config section 'worker' key 'harness' must be one of "
-            f"{sorted(WORKER_HARNESSES)}, got {worker.harness!r}"
-        )
-    reviewer_data = normalize_role_section(
-        ReviewerRoleConfig, "reviewer", _section(data, "reviewer"), REVIEWER_HARNESSES
-    )
-    reviewer = _build_section(ReviewerRoleConfig, "reviewer", reviewer_data)
-    warn_same_family(worker, reviewer)
-    watchdog_data = _section(data, "watchdog")
-    terminal_error_markers = watchdog_data.get("terminal_error_markers")
-    if terminal_error_markers is not None:
-        if not isinstance(terminal_error_markers, list):
-            raise ConfigError(
-                "config section 'watchdog' key 'terminal_error_markers' must be a list of "
-                f"strings, got {type(terminal_error_markers).__name__}"
-            )
-        for item in terminal_error_markers:
-            if not isinstance(item, str):
-                raise ConfigError(
-                    "config section 'watchdog' key 'terminal_error_markers' must be a list of "
-                    f"strings, got element of type {type(item).__name__}"
-                )
-        watchdog_data["terminal_error_markers"] = tuple(terminal_error_markers)
-    # Validate cost_budget_usd
-    cost_budget_usd = watchdog_data.get("cost_budget_usd")
-    if cost_budget_usd is not None and not isinstance(cost_budget_usd, (int, float)):
-        raise ConfigError(
-            "config section 'watchdog' key 'cost_budget_usd' must be a number, "
-            f"got {type(cost_budget_usd).__name__}"
-        )
-    # Validate token_budget
-    token_budget = watchdog_data.get("token_budget")
-    if token_budget is not None and not isinstance(token_budget, int):
-        raise ConfigError(
-            "config section 'watchdog' key 'token_budget' must be an int, "
-            f"got {type(token_budget).__name__}"
-        )
-    # Validate cost_budget_action
-    cost_budget_action = watchdog_data.get("cost_budget_action")
-    if cost_budget_action is not None:
-        if not isinstance(cost_budget_action, str):
-            raise ConfigError(
-                "config section 'watchdog' key 'cost_budget_action' must be a string, "
-                f"got {type(cost_budget_action).__name__}"
-            )
-        if cost_budget_action not in ("warn", "kill"):
-            raise ConfigError(
-                f"config section 'watchdog' key 'cost_budget_action' must be 'warn' or 'kill', "
-                f"got '{cost_budget_action}'"
-            )
-    # Validate launch_stall_grace_minutes
-    launch_stall_grace_minutes = watchdog_data.get("launch_stall_grace_minutes")
-    if launch_stall_grace_minutes is not None and not isinstance(launch_stall_grace_minutes, int):
-        raise ConfigError(
-            "config section 'watchdog' key 'launch_stall_grace_minutes' must be an int, "
-            f"got {type(launch_stall_grace_minutes).__name__}"
-        )
-    # Validate rate-limit deferral config (issue #247)
-    rate_limit_defer_enabled = watchdog_data.get("rate_limit_defer_enabled")
-    if rate_limit_defer_enabled is not None and not isinstance(rate_limit_defer_enabled, bool):
-        raise ConfigError(
-            "config section 'watchdog' key 'rate_limit_defer_enabled' must be a bool, "
-            f"got {type(rate_limit_defer_enabled).__name__}"
-        )
-    rate_limit_defer_slack_minutes = watchdog_data.get("rate_limit_defer_slack_minutes")
-    if rate_limit_defer_slack_minutes is not None and not isinstance(
-        rate_limit_defer_slack_minutes, int
-    ):
-        raise ConfigError(
-            "config section 'watchdog' key 'rate_limit_defer_slack_minutes' must be an int, "
-            f"got {type(rate_limit_defer_slack_minutes).__name__}"
-        )
-    max_inconclusive_probe_deferrals = watchdog_data.get("max_inconclusive_probe_deferrals")
-    if max_inconclusive_probe_deferrals is not None and not isinstance(
-        max_inconclusive_probe_deferrals, int
-    ):
-        raise ConfigError(
-            "config section 'watchdog' key 'max_inconclusive_probe_deferrals' must be an int, "
-            f"got {type(max_inconclusive_probe_deferrals).__name__}"
-        )
-    pre_review_rework_stale_minutes = watchdog_data.get("pre_review_rework_stale_minutes")
-    if pre_review_rework_stale_minutes is not None and not isinstance(
-        pre_review_rework_stale_minutes, int
-    ):
-        raise ConfigError(
-            "config section 'watchdog' key 'pre_review_rework_stale_minutes' must be an int, "
-            f"got {type(pre_review_rework_stale_minutes).__name__}"
-        )
-    # Issue #1867: int, >= 0 (0 disables the PID-independent finalize).
-    worker_outcome_finalize_minutes = watchdog_data.get("worker_outcome_finalize_minutes")
-    if worker_outcome_finalize_minutes is not None and (
-        isinstance(worker_outcome_finalize_minutes, bool)
-        or not isinstance(worker_outcome_finalize_minutes, int)
-    ):
-        raise ConfigError(
-            "config section 'watchdog' key 'worker_outcome_finalize_minutes' must be an int, "
-            f"got {type(worker_outcome_finalize_minutes).__name__}"
-        )
-    if worker_outcome_finalize_minutes is not None and worker_outcome_finalize_minutes < 0:
-        raise ConfigError(
-            "config section 'watchdog' key 'worker_outcome_finalize_minutes' must be >= 0, "
-            f"got {worker_outcome_finalize_minutes}"
-        )
-    # Validate worktree mtime corroboration config (issue #353)
-    worktree_mtime_enabled = watchdog_data.get("worktree_mtime_enabled")
-    if worktree_mtime_enabled is not None and not isinstance(worktree_mtime_enabled, bool):
-        raise ConfigError(
-            "config section 'watchdog' key 'worktree_mtime_enabled' must be a bool, "
-            f"got {type(worktree_mtime_enabled).__name__}"
-        )
-    for worktree_int_key in ("worktree_mtime_threshold_minutes", "worktree_mtime_max_depth"):
-        worktree_int_value = watchdog_data.get(worktree_int_key)
-        if worktree_int_value is not None and not isinstance(worktree_int_value, int):
-            raise ConfigError(
-                f"config section 'watchdog' key '{worktree_int_key}' must be an int, "
-                f"got {type(worktree_int_value).__name__}"
-            )
-    worktree_mtime_exclude_dirs = watchdog_data.get("worktree_mtime_exclude_dirs")
-    if worktree_mtime_exclude_dirs is not None:
-        if not isinstance(worktree_mtime_exclude_dirs, list):
-            raise ConfigError(
-                "config section 'watchdog' key 'worktree_mtime_exclude_dirs' must be a list of "
-                f"strings, got {type(worktree_mtime_exclude_dirs).__name__}"
-            )
-        for item in worktree_mtime_exclude_dirs:
-            if not isinstance(item, str):
-                raise ConfigError(
-                    "config section 'watchdog' key 'worktree_mtime_exclude_dirs' must be a list of "
-                    f"strings, got element of type {type(item).__name__}"
-                )
-        watchdog_data["worktree_mtime_exclude_dirs"] = tuple(
-            str(item) for item in worktree_mtime_exclude_dirs
-        )
-    watchdog = _build_section(WatchdogConfig, "watchdog", watchdog_data)
-    worktree_reclamation_data = _section(data, "worktree_reclamation")
-    wr_enabled = worktree_reclamation_data.get("enabled")
-    if wr_enabled is not None and not isinstance(wr_enabled, bool):
-        raise ConfigError(
-            "config section 'worktree_reclamation' key 'enabled' must be a bool, "
-            f"got {type(wr_enabled).__name__}"
-        )
-    wr_interval = worktree_reclamation_data.get("interval_minutes")
-    if wr_interval is not None and (
-        isinstance(wr_interval, bool) or not isinstance(wr_interval, int)
-    ):
-        raise ConfigError(
-            "config section 'worktree_reclamation' key 'interval_minutes' must be an int, "
-            f"got {type(wr_interval).__name__}"
-        )
-    if wr_interval is not None and wr_interval < 1:
-        raise ConfigError(
-            "config section 'worktree_reclamation' key 'interval_minutes' must be >= 1, "
-            f"got {wr_interval}"
-        )
-    worktree_reclamation = _build_section(
-        WorktreeReclamationConfig, "worktree_reclamation", worktree_reclamation_data
-    )
-    test_adequacy_data = _section(data, "test_adequacy")
-
-    # Six tuple-of-str fields: reject non-list, coerce elements to str.
-    _TEST_ADEQUACY_TUPLE_FIELDS = (
-        "test_path_globs",
-        "exempt_path_globs",
-        "assertion_markers",
-        "comment_prefixes",
-        "stub_test_seam_keywords",
-        "coverage_command",
-    )
-    for key in _TEST_ADEQUACY_TUPLE_FIELDS:
-        value = test_adequacy_data.get(key)
-        if value is None:
+        if f.name in prebuilt:
+            built[f.name] = prebuilt[f.name]
             continue
-        if not isinstance(value, list):
-            raise ConfigError(
-                f"config section 'test_adequacy' key '{key}' must be a list of "
-                f"strings, got {type(value).__name__}"
-            )
-        for item in value:
-            if not isinstance(item, str):
-                raise ConfigError(
-                    f"config section 'test_adequacy' key '{key}' must be a list of "
-                    f"strings, got element of type {type(item).__name__}"
-                )
-        test_adequacy_data[key] = tuple(value)
-
-    # Scalar fields: isinstance rejection, mirroring base_ref (config.py:326-331).
-    min_product_lines = test_adequacy_data.get("min_product_lines")
-    if min_product_lines is not None and not isinstance(min_product_lines, int):
-        raise ConfigError(
-            "config section 'test_adequacy' key 'min_product_lines' must be an "
-            f"int, got {type(min_product_lines).__name__}"
+        raw = _section(data, f.name)
+        built[f.name] = validate_section(
+            by_name[f.name].item,
+            _scoped_raw(f.name, raw),
+            path=f.name,
+            rules=field_rules(OrchestratorConfig, f.name),
         )
-    min_diff_coverage = test_adequacy_data.get("min_diff_coverage")
-    if min_diff_coverage is not None and not isinstance(min_diff_coverage, (int, float)):
-        raise ConfigError(
-            "config section 'test_adequacy' key 'min_diff_coverage' must be a "
-            f"float, got {type(min_diff_coverage).__name__}"
-        )
-    exempt_marker = test_adequacy_data.get("exempt_marker")
-    if exempt_marker is not None:
-        if not isinstance(exempt_marker, str) or not exempt_marker:
-            raise ConfigError(
-                "config section 'test_adequacy' key 'exempt_marker' must be a non-empty string"
-            )
-    for bool_key in ("enabled", "coverage_enabled", "require_assertions"):
-        bool_value = test_adequacy_data.get(bool_key)
-        if bool_value is not None and not isinstance(bool_value, bool):
-            raise ConfigError(
-                f"config section 'test_adequacy' key '{bool_key}' must be a bool, "
-                f"got {type(bool_value).__name__}"
-            )
-
-    test_adequacy = _build_section(TestAdequacyConfig, "test_adequacy", test_adequacy_data)
-    coverage_probe_data = _section(data, "coverage_probe")
-
-    # Five tuple-of-str fields: reject non-list, coerce elements to str.
-    _COVERAGE_PROBE_TUPLE_FIELDS = (
-        "test_path_globs",
-        "exempt_path_globs",
-        "comment_prefixes",
-        "branch_tokens",
-        "assertion_markers",
-    )
-    for key in _COVERAGE_PROBE_TUPLE_FIELDS:
-        value = coverage_probe_data.get(key)
-        if value is None:
-            continue
-        if not isinstance(value, list):
-            raise ConfigError(
-                f"config section 'coverage_probe' key '{key}' must be a list of "
-                f"strings, got {type(value).__name__}"
-            )
-        for item in value:
-            if not isinstance(item, str):
-                raise ConfigError(
-                    f"config section 'coverage_probe' key '{key}' must be a list of "
-                    f"strings, got element of type {type(item).__name__}"
-                )
-        coverage_probe_data[key] = tuple(value)
-
-    branch_ratio = coverage_probe_data.get("branch_to_assert_ratio_threshold")
-    if branch_ratio is not None and not isinstance(branch_ratio, (int, float)):
-        raise ConfigError(
-            "config section 'coverage_probe' key 'branch_to_assert_ratio_threshold' must be "
-            f"a float, got {type(branch_ratio).__name__}"
-        )
-    for str_key in ("test_function_prefix", "private_name_prefix"):
-        str_value = coverage_probe_data.get(str_key)
-        if str_value is not None and not isinstance(str_value, str):
-            raise ConfigError(
-                f"config section 'coverage_probe' key '{str_key}' must be a string, "
-                f"got {type(str_value).__name__}"
-            )
-    for bool_key in ("enabled", "check_unwired_symbols"):
-        bool_value = coverage_probe_data.get(bool_key)
-        if bool_value is not None and not isinstance(bool_value, bool):
-            raise ConfigError(
-                f"config section 'coverage_probe' key '{bool_key}' must be a bool, "
-                f"got {type(bool_value).__name__}"
-            )
-
-    coverage_probe = _build_section(CoverageProbeConfig, "coverage_probe", coverage_probe_data)
-    fleet_data = _section(data, "fleet")
-    global_max = fleet_data.get("global_max_concurrent_sessions")
-    if global_max is not None and not isinstance(global_max, int):
-        raise ConfigError(
-            "config section 'fleet' key 'global_max_concurrent_sessions' must be an "
-            f"int, got {type(global_max).__name__}"
-        )
-    global_max_reviews = fleet_data.get("global_max_concurrent_reviews")
-    if global_max_reviews is not None and (
-        not isinstance(global_max_reviews, int)
-        or isinstance(global_max_reviews, bool)
-        or global_max_reviews < 0
-    ):
-        raise ConfigError(
-            "config section 'fleet' key 'global_max_concurrent_reviews' must be a "
-            f"non-negative int, got {global_max_reviews!r}"
-        )
-    launch_lock_wait = fleet_data.get("launch_lock_wait_seconds")
-    if launch_lock_wait is not None and (
-        isinstance(launch_lock_wait, bool)
-        or not isinstance(launch_lock_wait, (int, float))
-        or not math.isfinite(launch_lock_wait)
-        or launch_lock_wait < 0
-    ):
-        raise ConfigError(
-            "config section 'fleet' key 'launch_lock_wait_seconds' must be a "
-            f"non-negative finite number, got {launch_lock_wait!r}"
-        )
-    fleet = _build_section(FleetConfig, "fleet", fleet_data)
-    notify_data = _section(data, "notify")
-    shell_command = notify_data.get("shell_command")
-    if isinstance(shell_command, list):
-        notify_data["shell_command"] = tuple(str(item) for item in shell_command)
-    notify = _build_section(NotifyConfig, "notify", notify_data)
-
-    local_issues_data = _section(data, "local_issues")
-    local_issues_enabled = local_issues_data.get("enabled")
-    if local_issues_enabled is not None and not isinstance(local_issues_enabled, bool):
-        raise ConfigError(
-            "config section 'local_issues' key 'enabled' must be a bool, "
-            f"got {type(local_issues_enabled).__name__}"
-        )
-    issues_dir = local_issues_data.get("issues_dir")
-    if issues_dir is not None:
-        if not isinstance(issues_dir, str) or not issues_dir.strip():
-            raise ConfigError(
-                "config section 'local_issues' key 'issues_dir' must be a non-empty string"
-            )
-        issues_dir_path = PurePosixPath(issues_dir.replace("\\", "/"))
-        if issues_dir_path.is_absolute() or PureWindowsPath(issues_dir).is_absolute():
-            raise ConfigError(
-                "config section 'local_issues' key 'issues_dir' must be relative to the "
-                f"repo root, got {issues_dir!r}"
-            )
-        if ".." in issues_dir_path.parts:
-            raise ConfigError(
-                "config section 'local_issues' key 'issues_dir' must not contain '..', "
-                f"got {issues_dir!r}"
-            )
-    local_issues = _build_section(LocalIssuesConfig, "local_issues", local_issues_data)
+    local_issues = built["local_issues"]
     # A repo with no remote cannot satisfy the default worker prompt, which
     # mandates push + PR and calls anything less a task failure. Re-default
     # the template HERE, once, so ``dispatch.worker_template`` stays the single
@@ -4101,290 +2677,23 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
     # #713 startup drift check, ``doctor``, the template digest) -- none of
     # them needs to know a local backend exists. An explicit operator value
     # wins: only the *default* moves.
-    if local_issues.enabled and "worker_template" not in dispatch_data:
-        dispatch = replace(dispatch, worker_template=LOCAL_WORKER_TEMPLATE)
-    if local_issues.enabled and "rework_template" not in dispatch_data:
-        dispatch = replace(dispatch, rework_template=LOCAL_REWORK_TEMPLATE)
+    if local_issues.enabled and "worker_template" not in _section(data, "dispatch"):
+        built["dispatch"] = replace(built["dispatch"], worker_template=LOCAL_WORKER_TEMPLATE)
+    if local_issues.enabled and "rework_template" not in _section(data, "dispatch"):
+        built["dispatch"] = replace(built["dispatch"], rework_template=LOCAL_REWORK_TEMPLATE)
     # Issue #1844: a no-remote repo has no GitHub review lane to defer to, so
     # the automated local review lane IS the review -- default it on, the same
     # way the worker/rework templates re-default above. An explicit
     # ``review_dispatch.enabled`` (either value) wins: only the default moves.
-    if local_issues.enabled and "enabled" not in review_dispatch_data:
-        review_dispatch = replace(review_dispatch, enabled=True)
-    local_lane_data = _section(data, "local_lane")
-    stall_hours = local_lane_data.get("kill_switch_stall_hours")
-    if stall_hours is not None:
-        if isinstance(stall_hours, bool) or not isinstance(stall_hours, (int, float)):
-            raise ConfigError(
-                "config section 'local_lane' key 'kill_switch_stall_hours' must be a "
-                f"number, got {type(stall_hours).__name__}"
-            )
-        if stall_hours < 0:
-            raise ConfigError(
-                "config section 'local_lane' key 'kill_switch_stall_hours' must be "
-                f">= 0, got {stall_hours}"
-            )
-    local_lane = _build_section(LocalLaneConfig, "local_lane", local_lane_data)
-    runners_data = _section(data, "runners")
-    # Validate runners config fields
-    for bool_key in ("enabled", "cancel_superseded_main_runs"):
-        bool_value = runners_data.get(bool_key)
-        if bool_value is not None and not isinstance(bool_value, bool):
-            raise ConfigError(
-                f"config section 'runners' key '{bool_key}' must be a bool, "
-                f"got {type(bool_value).__name__}"
-            )
-    for str_key in ("default_branch", "workflow_name"):
-        str_value = runners_data.get(str_key)
-        if str_value is not None and not isinstance(str_value, str):
-            raise ConfigError(
-                f"config section 'runners' key '{str_key}' must be a string, "
-                f"got {type(str_value).__name__}"
-            )
-    runners = _build_section(RunnersConfig, "runners", runners_data)
-    main_ci_reclaim_data = _section(data, "main_ci_reclaim")
-    mcr_enabled = main_ci_reclaim_data.get("enabled")
-    if mcr_enabled is not None and not isinstance(mcr_enabled, bool):
-        raise ConfigError(
-            "config section 'main_ci_reclaim' key 'enabled' must be a bool, "
-            f"got {type(mcr_enabled).__name__}"
-        )
-    mcr_workflow_filename = main_ci_reclaim_data.get("workflow_filename")
-    if mcr_workflow_filename is not None and not isinstance(mcr_workflow_filename, str):
-        raise ConfigError(
-            "config section 'main_ci_reclaim' key 'workflow_filename' must be a string, "
-            f"got {type(mcr_workflow_filename).__name__}"
-        )
-    main_ci_reclaim = _build_section(MainCiReclaimConfig, "main_ci_reclaim", main_ci_reclaim_data)
-    runner_scaling_data = _section(data, "runner_scaling")
-    # Validate numeric fields
-    for numeric_key in (
-        "min_runners",
-        "max_runners",
-        "idle_scale_down_minutes",
-        "cooldown_minutes",
-    ):
-        value = runner_scaling_data.get(numeric_key)
-        if value is not None and not isinstance(value, int):
-            raise ConfigError(
-                f"config section 'runner_scaling' key '{numeric_key}' must be an int, "
-                f"got {type(value).__name__}"
-            )
-    for float_key in ("ram_per_job_gb", "min_free_ram_gb", "max_host_cpu_pct"):
-        value = runner_scaling_data.get(float_key)
-        if value is not None and not isinstance(value, (int, float)):
-            raise ConfigError(
-                f"config section 'runner_scaling' key '{float_key}' must be a number, "
-                f"got {type(value).__name__}"
-            )
-    # Validate string fields
-    for str_key in ("managed_root", "runner_dir_prefix", "runner_name_template", "package_zip"):
-        value = runner_scaling_data.get(str_key)
-        if value is not None and not isinstance(value, str):
-            raise ConfigError(
-                f"config section 'runner_scaling' key '{str_key}' must be a string, "
-                f"got {type(value).__name__}"
-            )
-    # Validate boolean field
-    enabled = runner_scaling_data.get("enabled")
-    if enabled is not None and not isinstance(enabled, bool):
-        raise ConfigError(
-            f"config section 'runner_scaling' key 'enabled' must be a bool, "
-            f"got {type(enabled).__name__}"
-        )
-    runner_scaling = _build_section(RunnerScalingConfig, "runner_scaling", runner_scaling_data)
-    runner_allocation_data = _section(data, "runner_allocation")
-    for numeric_key in (
-        "max_running_runners",
-        "min_running_per_repo",
-        "demand_idle_samples",
-        "max_runs_scanned",
-    ):
-        value = runner_allocation_data.get(numeric_key)
-        # bool is an int subclass; reject it so `max_running_runners: true`
-        # fails loudly instead of silently allocating one slot.
-        if value is not None and (isinstance(value, bool) or not isinstance(value, int)):
-            raise ConfigError(
-                f"config section 'runner_allocation' key '{numeric_key}' must be an int, "
-                f"got {type(value).__name__}"
-            )
-        if isinstance(value, int) and not isinstance(value, bool) and value < 0:
-            raise ConfigError(
-                f"config section 'runner_allocation' key '{numeric_key}' must be >= 0, got {value}"
-            )
-    managed_root_value = runner_allocation_data.get("managed_root")
-    if managed_root_value is not None and not isinstance(managed_root_value, str):
-        raise ConfigError(
-            "config section 'runner_allocation' key 'managed_root' must be a string, "
-            f"got {type(managed_root_value).__name__}"
-        )
-    allocation_enabled = runner_allocation_data.get("enabled")
-    if allocation_enabled is not None and not isinstance(allocation_enabled, bool):
-        raise ConfigError(
-            "config section 'runner_allocation' key 'enabled' must be a bool, "
-            f"got {type(allocation_enabled).__name__}"
-        )
-    runner_allocation = _build_section(
-        RunnerAllocationConfig, "runner_allocation", runner_allocation_data
-    )
-    # Cross-section floor check (issue #600): runner_scaling and runner_allocation
-    # both declare a "minimum runners per repo" floor on different axes -- scaling
-    # keeps runners *registered* (provisioning/deregistering), allocation keeps
-    # listeners *running* (starting/stopping already-configured listeners). When
-    # both are enabled, an allocation floor higher than the scaling floor is
-    # unsatisfiable: allocation caps each repo's target at its registered runner
-    # count (runner_allocation.plan_allocation), so min_running_per_repo >
-    # min_runners silently degrades to min_runners with nothing reconciling the
-    # two. Reject it at load time rather than documenting the caveat. The reverse
-    # (min_runners > min_running_per_repo) is a legitimate buffer -- registered
-    # but parked runners that allocation promotes on demand -- and is allowed.
-    if (
-        runner_scaling.enabled
-        and runner_allocation.enabled
-        and runner_allocation.min_running_per_repo > runner_scaling.min_runners
-    ):
-        raise ConfigError(
-            "config sections 'runner_scaling' and 'runner_allocation' are both "
-            "enabled but their floors disagree: runner_allocation."
-            f"min_running_per_repo={runner_allocation.min_running_per_repo} "
-            f"exceeds runner_scaling.min_runners={runner_scaling.min_runners}. "
-            "Allocation cannot keep more listeners running than scaling "
-            "provisions; raise runner_scaling.min_runners to at least the "
-            "allocation floor."
-        )
-    runner_capacity_escalation = parse_runner_capacity_escalation(data)
-    # Issue #1978: parse the fleet-scoped section BEFORE the supervisor one --
-    # the parser pops the relocated keys out of ``data['supervisor']`` (the
-    # private deepcopy above, so the caller's dict is untouched) and applies
-    # the new-location > legacy > default precedence itself, raising
-    # ConfigError when both locations disagree.
-    fleet_supervisor = parse_fleet_supervisor(data)
-    supervisor_data = _section(data, "supervisor")
-    for int_key in (
-        "poll_interval_seconds",
-        "full_pass_interval_seconds",
-        "active_cooldown_seconds",
-        "max_runtime_minutes",
-    ):
-        value = supervisor_data.get(int_key)
-        if value is not None and not isinstance(value, int):
-            raise ConfigError(
-                f"config section 'supervisor' key '{int_key}' must be an int, "
-                f"got {type(value).__name__}"
-            )
-    supervisor = _build_section(SupervisorConfig, "supervisor", supervisor_data)
-    post_mortem_data = _section(data, "post_mortem")
-    pm_enabled = post_mortem_data.get("enabled")
-    if pm_enabled is not None and not isinstance(pm_enabled, bool):
-        raise ConfigError(
-            f"config section 'post_mortem' key 'enabled' must be a bool, "
-            f"got {type(pm_enabled).__name__}"
-        )
-    db_path = post_mortem_data.get("db_path")
-    if db_path is not None and not isinstance(db_path, str):
-        raise ConfigError(
-            f"config section 'post_mortem' key 'db_path' must be a string, "
-            f"got {type(db_path).__name__}"
-        )
-    for int_key in (
-        "message_node_limit",
-        "match_window_margin_seconds",
-        "unparseable_started_at_lookback_seconds",
-    ):
-        value = post_mortem_data.get(int_key)
-        if value is not None and not isinstance(value, int):
-            raise ConfigError(
-                f"config section 'post_mortem' key '{int_key}' must be an int, "
-                f"got {type(value).__name__}"
-            )
-    signature_rules = post_mortem_data.get("signature_rules")
-    if signature_rules is not None:
-        if not isinstance(signature_rules, list):
-            raise ConfigError(
-                "config section 'post_mortem' key 'signature_rules' must be a list of "
-                f"{{pattern, kind}} mappings, got {type(signature_rules).__name__}"
-            )
-        built_rules: list[SignatureRule] = []
-        for i, item in enumerate(signature_rules):
-            if not isinstance(item, dict):
-                raise ConfigError(
-                    f"config section 'post_mortem' key 'signature_rules[{i}]' must be a "
-                    f"mapping with 'pattern' and 'kind' keys, got {type(item).__name__}"
-                )
-            unknown_rule_keys = sorted(set(item) - {"pattern", "kind"})
-            if unknown_rule_keys:
-                raise ConfigError(
-                    f"config section 'post_mortem' key 'signature_rules[{i}]' has unknown "
-                    f"key(s): {', '.join(unknown_rule_keys)} (valid: pattern, kind)"
-                )
-            pattern = item.get("pattern")
-            kind = item.get("kind")
-            if not isinstance(pattern, str) or not pattern:
-                raise ConfigError(
-                    f"config section 'post_mortem' key 'signature_rules[{i}].pattern' must "
-                    "be a non-empty string"
-                )
-            if not isinstance(kind, str) or not kind:
-                raise ConfigError(
-                    f"config section 'post_mortem' key 'signature_rules[{i}].kind' must "
-                    "be a non-empty string"
-                )
-            try:
-                re.compile(pattern)
-            except re.error as exc:
-                raise ConfigError(
-                    f"config section 'post_mortem' key 'signature_rules[{i}].pattern' is not "
-                    f"a valid regex: {exc}"
-                ) from exc
-            built_rules.append(SignatureRule(pattern=pattern, kind=kind))
-        post_mortem_data["signature_rules"] = tuple(built_rules)
-    post_mortem = _build_section(PostMortemConfig, "post_mortem", post_mortem_data)
-    heartbeat_data = _section(data, "heartbeat")
-    _parked = heartbeat_data.get("stale_mention_parked_labels")
-    if _parked is not None and not isinstance(_parked, (list, tuple, str)):
-        raise ConfigError(
-            "config section 'heartbeat' key 'stale_mention_parked_labels' must be a "
-            f"list of label names, got {type(_parked).__name__}"
-        )
-    heartbeat = _build_section(HeartbeatConfig, "heartbeat", heartbeat_data)
-    return OrchestratorConfig(
-        labels=labels,
-        dispatch=dispatch,
-        review=review,
-        review_dispatch=review_dispatch,
-        quota_probe=quota_probe,
-        reconcile_pass=reconcile_pass,
-        deescalation=deescalation,
-        auto_merge=auto_merge,
-        runtime=runtime,
-        devin=devin,
-        claude_code=claude_code,
-        api_worker=api_worker,
-        rescue=rescue,
-        worker=worker,
-        reviewer=reviewer,
-        watchdog=watchdog,
-        worktree_reclamation=worktree_reclamation,
-        test_adequacy=test_adequacy,
-        coverage_probe=coverage_probe,
-        fleet=fleet,
-        notify=notify,
-        local_issues=local_issues,
-        local_lane=local_lane,
-        runners=runners,
-        main_ci_reclaim=main_ci_reclaim,
-        runner_scaling=runner_scaling,
-        runner_allocation=runner_allocation,
-        runner_capacity_escalation=runner_capacity_escalation,
-        supervisor=supervisor,
-        fleet_supervisor=fleet_supervisor,
-        post_mortem=post_mortem,
-        heartbeat=heartbeat,
-        # ``sources`` is left at its dataclass default here -- this function
-        # only ever sees a dict, never a path. ``load_config`` below (and
-        # ``load_layered_config``) are the ones that know what path(s) the
-        # data came from, and they attach that provenance with ``replace``.
-    )
+    if local_issues.enabled and "enabled" not in _section(data, "review_dispatch"):
+        built["review_dispatch"] = replace(built["review_dispatch"], enabled=True)
+    # ``sources`` is left at its dataclass default here -- this function
+    # only ever sees a dict, never a path. ``load_config`` below (and
+    # ``load_layered_config``) are the ones that know what path(s) the
+    # data came from, and they attach that provenance with ``replace``.
+    config = OrchestratorConfig(**built)
+    run_section_hooks(config)
+    return config
 
 
 def load_config(path: Path | None = None) -> OrchestratorConfig:

@@ -7,13 +7,18 @@ at launch time :func:`charlie_work.role_selection.select_role_entry` picks the
 first entry whose ``(harness, model)`` is not restricted in the fleet-scoped
 quota ledger (:mod:`charlie_work.role_quota_ledger`).
 
-This module owns the config half: parsing and validating the ``fallbacks:``
-list (every entry is checked exactly like the primary -- harness membership,
-string types -- plus no duplicate ``(harness, model)`` pairs across the whole
-chain), the ``chain`` accessor both role dataclasses expose, and the warn-only
-cross-family guard. It lives outside ``config.py`` because of the file-size
-ratchet; ``config.py`` calls :func:`normalize_role_section` at the two role
-build sites.
+This module owns the config half, expressed in the section-validation
+vocabulary (ADR-0007) rather than a parser of its own:
+
+* :func:`role_entries` is the use-site marker that validates the ``fallbacks:``
+  list as it is built -- list shape, at most :data:`MAX_FALLBACKS` entries,
+  every entry checked like the primary (harness membership for the role, string
+  types, unknown keys), and ``effort`` accepted only on a reviewer entry.
+* :func:`check_role_chain` / :func:`check_reviewer_role_chain` are the
+  ``Check`` hooks for the rules that need the primary: no synchronous harness in
+  a chain with fallbacks, and no duplicate ``(harness, model)`` pair across the
+  whole chain. The reviewer hook also runs the warn-only cross-family guard.
+* :func:`chain_of`, the ``chain`` accessor both role dataclasses expose.
 
 An empty ``fallbacks`` list (the default) is a chain of length 1, which
 behaves exactly as a role did before this module existed.
@@ -22,9 +27,11 @@ behaves exactly as a role did before this module existed.
 from __future__ import annotations
 
 import logging
-from collections.abc import Collection, Mapping
-from dataclasses import MISSING, dataclass, fields
-from typing import Any
+from collections.abc import Collection
+from dataclasses import dataclass
+from typing import Annotated, Any
+
+from .config_validation import Entries, FieldError, NotNull, NullIsDefault, OneOf, Typed
 
 logger = logging.getLogger(__name__)
 
@@ -43,12 +50,14 @@ class RoleEntry:
     """One ``(harness, model)`` entry of a role chain.
 
     ``effort`` is the reviewer's ``--effort`` pin for this entry (claude-code
-    only; empty means the harness default). Worker entries never carry one.
+    only; empty means the harness default). Worker entries never carry one --
+    the worker role's :func:`role_entries` marker forbids the key.
+    ``harness`` membership is per role, so it is added at the use site.
     """
 
-    harness: str
-    model: str = ""
-    effort: str = ""
+    harness: Annotated[str, Typed]
+    model: Annotated[str, Typed, NullIsDefault] = ""
+    effort: Annotated[str, Typed, NullIsDefault] = ""
 
     @property
     def key(self) -> tuple[str, str]:
@@ -69,139 +78,50 @@ def chain_of(role: Any) -> tuple[RoleEntry, ...]:
     return (primary, *tuple(getattr(role, "fallbacks", ()) or ()))
 
 
-def _config_error(message: str) -> Exception:
-    # Lazy: config.py imports this module at load time.
-    from .config import ConfigError
-
-    return ConfigError(message)
-
-
-def _field_default(cls: type, name: str) -> Any:
-    for item in fields(cls):
-        if item.name == name:
-            if item.default is not MISSING:
-                return item.default
-            return None
-    return None
+def role_entries(harnesses: Collection[str], *, allow_effort: bool) -> Entries:
+    """The ``fallbacks`` marker for one role: harness set, length cap, effort policy."""
+    return Entries(
+        max_len=MAX_FALLBACKS,
+        forbid=() if allow_effort else ("effort",),
+        harness=(Typed, NotNull, OneOf(*sorted(harnesses))),
+    )
 
 
-def _parse_entry(
-    section: str, index: int, raw: Any, *, harnesses: Collection[str], allow_effort: bool
-) -> RoleEntry:
-    where = f"config section '{section}' key 'fallbacks[{index}]'"
-    if not isinstance(raw, Mapping):
-        raise _config_error(f"{where} must be a mapping, got {type(raw).__name__}")
-    allowed = {"harness", "model", "effort"} if allow_effort else {"harness", "model"}
-    unknown = sorted(set(raw) - allowed)
-    if unknown:
-        raise _config_error(
-            f"unknown key(s) in {where}: {', '.join(map(str, unknown))} "
-            f"(valid: {', '.join(sorted(allowed))})"
-        )
-    harness = raw.get("harness")
-    if not isinstance(harness, str) or harness not in harnesses:
-        raise _config_error(
-            f"{where} key 'harness' must be one of {sorted(harnesses)}, got {harness!r}"
-        )
-    values: dict[str, str] = {}
-    for key in sorted(allowed - {"harness"}):
-        value = raw.get(key, "")
-        if value is None:
-            value = ""
-        if not isinstance(value, str):
-            raise _config_error(
-                f"{where} key '{key}' must be a string, got {type(value).__name__}"
-            )
-        values[key] = value
-    return RoleEntry(harness=harness, **values)
+def _text(value: Any) -> str:
+    return value if isinstance(value, str) else ""
 
 
-def parse_fallbacks(
-    section: str,
-    raw: Any,
-    primary: RoleEntry,
-    *,
-    harnesses: Collection[str],
-    allow_effort: bool,
-) -> tuple[RoleEntry, ...]:
-    """Validate a raw ``fallbacks:`` value and return it as a tuple of entries.
-
-    Raises ``ConfigError`` for a non-list, more than :data:`MAX_FALLBACKS`
-    entries, a bad entry (see :func:`_parse_entry`), a synchronous harness
-    anywhere in a chain that has fallbacks, or a ``(harness, model)`` pair
-    that appears twice in the chain (primary included).
-    """
-    if raw is None:
-        return ()
-    if isinstance(raw, tuple) and all(isinstance(item, RoleEntry) for item in raw):
-        entries = raw  # already parsed (e.g. a config round-trip)
-    else:
-        if not isinstance(raw, list | tuple):
-            raise _config_error(
-                f"config section '{section}' key 'fallbacks' must be a list, "
-                f"got {type(raw).__name__}"
-            )
-        entries = tuple(
-            item
-            if isinstance(item, RoleEntry)
-            else _parse_entry(section, index, item, harnesses=harnesses, allow_effort=allow_effort)
-            for index, item in enumerate(raw)
-        )
-    if len(entries) > MAX_FALLBACKS:
-        raise _config_error(
-            f"config section '{section}' key 'fallbacks' allows at most {MAX_FALLBACKS} "
-            f"entries, got {len(entries)}"
-        )
+def check_role_chain(role: Any, config: Any = None) -> None:  # noqa: ARG001 (Check signature)
+    """Section hook: the chain-wide rules that need the primary. A chain with no
+    fallbacks is never checked, so a role without them behaves as before #2086."""
+    entries = tuple(role.fallbacks or ())
     if not entries:
-        return ()
-    chain = (primary, *entries)
-    for entry in chain:
+        return
+    chain = (RoleEntry(_text(role.harness), _text(role.model)), *entries)
+    for index, entry in enumerate(chain):
         if entry.harness in _NON_SESSION_HARNESSES:
-            raise _config_error(
-                f"config section '{section}': harness {entry.harness!r} cannot be part of a "
-                "role chain with fallbacks (it produces no session a quota restriction "
-                "could be recorded against)"
+            raise FieldError(
+                "harness" if index == 0 else f"fallbacks[{index - 1}].harness",
+                "a harness that records sessions in a role chain with fallbacks "
+                f"(not {', '.join(sorted(_NON_SESSION_HARNESSES))}: a quota "
+                "restriction cannot be recorded against them)",
+                entry.harness,
             )
     seen: set[tuple[str, str]] = set()
-    for entry in chain:
+    for index, entry in enumerate(chain):
         if entry.key in seen:
-            raise _config_error(
-                f"config section '{section}' key 'fallbacks': duplicate (harness, model) "
-                f"pair {entry.key!r} in the role chain"
+            raise FieldError(
+                f"fallbacks[{index - 1}]",
+                "a (harness, model) pair not already in the role chain",
+                entry.key,
             )
         seen.add(entry.key)
-    return entries
 
 
-def normalize_role_section(
-    cls: type, section: str, data: Mapping[str, Any], harnesses: Collection[str]
-) -> dict[str, Any]:
-    """Return ``data`` with its ``fallbacks`` list parsed into ``RoleEntry`` tuples.
-
-    Called by ``config.build_config_from_data`` on the raw ``worker:`` /
-    ``reviewer:`` section before ``_build_section``. The primary is resolved
-    from ``data`` with ``cls``'s own field defaults, so the duplicate check
-    sees the same primary the dataclass will. A section without
-    ``fallbacks`` is returned unchanged (as a copy).
-    """
-    result = dict(data)
-    if "fallbacks" not in result:
-        return result
-    allow_effort = any(item.name == "effort" for item in fields(cls))
-
-    def _primary(name: str) -> str:
-        value = result.get(name, _field_default(cls, name))
-        return value if isinstance(value, str) else ""
-
-    primary = RoleEntry(_primary("harness"), _primary("model"), _primary("effort"))
-    result["fallbacks"] = parse_fallbacks(
-        section,
-        result["fallbacks"],
-        primary,
-        harnesses=harnesses,
-        allow_effort=allow_effort,
-    )
-    return result
+def check_reviewer_role_chain(reviewer: Any, config: Any) -> None:
+    """Reviewer hook: the chain rules, then the warn-only worker/reviewer family guard."""
+    check_role_chain(reviewer)
+    warn_same_family(config.worker, reviewer)
 
 
 # --- warn-only cross-family guard -------------------------------------------

@@ -120,7 +120,7 @@ def test_flip1_a5_live_handoff_finalize_ignores_dispatched_at(tmp_path: Path) ->
     the live entry's `dispatched_at`, regardless of how old it is by wall
     clock.
     """
-    from charlie_work.live_handoff_finalize import collect_stale_live_handoff_pids
+    from charlie_work.dead_worker_sweep.live_handoff import collect_stale_live_handoff_pids
 
     now = datetime.now(UTC)
     branch = "agent/issue-9102"
@@ -180,7 +180,7 @@ def test_flip5_live_handoff_finalize_withholds_fresh_outcome_until_threshold(
     regardless of `worker_outcome_finalize_minutes` -- that threshold now
     only gates the kill decision elsewhere (rule 5).
     """
-    from charlie_work.live_handoff_finalize import collect_stale_live_handoff_pids
+    from charlie_work.dead_worker_sweep.live_handoff import collect_stale_live_handoff_pids
 
     now = datetime.now(UTC)
     branch = "agent/issue-9105"
@@ -226,7 +226,7 @@ def test_b9_live_handoff_finalize_omitted_pr_created_is_not_a_confirmed_no_pr(
     same as an explicit ``false``. That widening was never one of the nine
     reviewed flips; this pins the restored strict gate.
     """
-    from charlie_work.live_handoff_finalize import collect_stale_live_handoff_pids
+    from charlie_work.dead_worker_sweep.live_handoff import collect_stale_live_handoff_pids
 
     now = datetime.now(UTC)
     branch = "agent/issue-9106"
@@ -480,7 +480,9 @@ def test_flip3_dead_worker_reap_salvage_pushes_local_only_commits(
     config = OrchestratorConfig()
     active_labels, issue_labels = _salvage_labels(config)
     gh = _SalvageTestGitHub(repo_root=tmp_path)
-    monkeypatch.setattr("charlie_work.dead_worker_reap.push_branch", lambda *a, **k: (True, None))
+    monkeypatch.setattr(
+        "charlie_work.dead_worker_sweep.effects_pr.push_branch", lambda *a, **k: (True, None)
+    )
 
     from charlie_work.workflow import _attempt_salvage
 
