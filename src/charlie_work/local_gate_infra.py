@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any
 
 from charlie_work import local_suite_runner
+from charlie_work.instrumentation import query_events
 
 DEFAULT_SUITE_TIMEOUT_SECONDS = 3600
 MAX_SUITE_TIMEOUT_SECONDS = 10800
@@ -131,6 +132,40 @@ def read_gate_results(dispatches_dir: Path) -> list[dict[str, Any]]:
     return results
 
 
-def effective_suite_timeout(dispatches_dir: Path) -> int:
-    """The in-flight suite time limit for the gate under ``dispatches_dir``."""
-    return derived_suite_timeout(read_gate_results(dispatches_dir))
+def read_event_results(state_path: Path) -> list[dict[str, Any]]:
+    """Recent ok-suite durations from the durable ``local_suite_ok`` events.
+
+    Per-PR result dirs are pruned after merge, so only ``events.db`` (next to
+    ``state.json``) retains enough history to derive a baseline. Never raises:
+    any read failure degrades to ``[]``.
+    """
+    try:
+        events = query_events(state_path, kind="local_suite_ok", limit=MAX_TIMEOUT_SAMPLES)
+    except Exception:  # noqa: BLE001 -- instrumentation reads must never break the gate
+        return []
+    results: list[dict[str, Any]] = []
+    for event in events:
+        payload = event.get("payload") if isinstance(event, dict) else None
+        if not isinstance(payload, dict):
+            continue
+        results.append(
+            {
+                "ok": True,
+                "duration_seconds": payload.get("duration_seconds"),
+                "ended_at": event.get("ts"),
+            }
+        )
+    return results
+
+
+def effective_suite_timeout(dispatches_dir: Path, state_path: Path | None = None) -> int:
+    """The in-flight suite time limit for the gate under ``dispatches_dir``.
+
+    Samples come from ``local_suite_ok`` events in the ``events.db`` beside
+    ``state_path``; per-PR result files are only a fallback when no such
+    event exists (or ``state_path`` is not given).
+    """
+    results = read_event_results(state_path) if state_path is not None else []
+    if not results:
+        results = read_gate_results(dispatches_dir)
+    return derived_suite_timeout(results)
