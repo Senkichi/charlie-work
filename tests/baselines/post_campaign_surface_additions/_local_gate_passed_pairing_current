@@ -1,0 +1,7 @@
+issue #2189: whether a green merge-gate pairing whose base advance was
+deferred (dirty base checkout refused the fast-forward) still matches the
+live branch head and base. While it does, ``_local_merge_approved`` retries
+the merge alone instead of re-running the full suite, and the pairing holds
+the one-gate-per-repo bound. Installed from
+``orchestration/local_merge_gate.py``. Net-new OrchestratorApp member
+added after the Track 2 Phase B surface baseline was pinned.
