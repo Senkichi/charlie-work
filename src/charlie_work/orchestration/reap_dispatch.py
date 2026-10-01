@@ -644,29 +644,33 @@ def _record_ci_absence_state(
     """
     pr_number = pr_state_update["number"]
     pr_state_update["ci_absence_probed_attempts"] = attempts
-    emit: list[tuple[str, str]] = []
-    for kind, marker, head in (
-        ("workflow_no_jobs", "workflow_no_jobs_head", workflow_no_jobs_head),
-        ("ci_run_never_created", "ci_run_never_created_head", never_created_head),
-    ):
-        if head is None:
-            continue
-        if existing_pr_state.get(marker) != head:
-            emit.append((kind, head))
-        pr_state_update[marker] = head
+    no_jobs_new = (
+        workflow_no_jobs_head is not None
+        and existing_pr_state.get("workflow_no_jobs_head") != workflow_no_jobs_head
+    )
+    never_created_new = (
+        never_created_head is not None
+        and existing_pr_state.get("ci_run_never_created_head") != never_created_head
+    )
+    if workflow_no_jobs_head is not None:
+        pr_state_update["workflow_no_jobs_head"] = workflow_no_jobs_head
+    if never_created_head is not None:
+        pr_state_update["ci_run_never_created_head"] = never_created_head
     state["prs"][str(pr_number)] = pr_state_update
-    for kind, head in emit:
-        state = self._record_event(
-            state,
-            kind,
-            {
-                "pr_number": pr_number,
-                "issue_number": issue_number,
-                "head_sha": head,
-                "branch": pr.get("headRefName"),
-                "missing_checks": list(verdict.missing_required_checks),
-            },
-        )
+
+    def payload(head: str | None) -> dict[str, Any]:
+        return {
+            "pr_number": pr_number,
+            "issue_number": issue_number,
+            "head_sha": head,
+            "branch": pr.get("headRefName"),
+            "missing_checks": list(verdict.missing_required_checks),
+        }
+
+    if no_jobs_new:
+        state = self._record_event(state, "workflow_no_jobs", payload(workflow_no_jobs_head))
+    if never_created_new:
+        state = self._record_event(state, "ci_run_never_created", payload(never_created_head))
     return state
 
 
