@@ -157,6 +157,19 @@ lifecycle_label_names = _stale_mentions.lifecycle_label_names
 mention_exempt_by_label = _stale_mentions.mention_exempt_by_label
 get_merged_commit_messages = _stale_mentions.get_merged_commit_messages
 
+# Pure alarm verdicts shared with the fleet dashboard live in the stdlib-only
+# leaves charlie_work.heartbeat_alarms / heartbeat_alarms_fleet; the thresholds
+# below are re-exported from them (single source). Guarded like the other
+# charlie_work leaves: with the package absent the checks that need a verdict
+# report an ANOMALY instead of crashing the beat.
+try:
+    from charlie_work import heartbeat_alarms as _ha
+    from charlie_work import heartbeat_alarms_fleet as _haf
+except ImportError:
+    _ha = None
+    _haf = None
+_ALARMS_UNAVAILABLE = "cannot evaluate: charlie_work.heartbeat_alarms not importable"
+
 # --------------------------------------------------------------------------
 # CONSTANTS
 # --------------------------------------------------------------------------
@@ -168,7 +181,7 @@ MERGED_PR_LOOKBACK_LIMIT = 5
 QUEUED_STALE_MINUTES = 20
 
 REVIEW_CLAIM_STALE_MINUTES = 45
-LOG_FRESHNESS_STALE_MINUTES = 30
+LOG_FRESHNESS_STALE_MINUTES = _haf.LOG_FRESHNESS_STALE_MINUTES if _haf else 30
 # Measured production cadence (charlie-work `loop_started` gaps, last 39
 # intervals, 2026-07-31): min=5.5m median=10.4m p90=20.2m max=53.9m.
 # `loop_started` is logged per repo (workflow.py's `_loop_impl`, into that
@@ -193,7 +206,7 @@ LOG_FRESHNESS_STALE_MINUTES = 30
 # merely slow loop. Do not lower this value to "catch" that outage faster --
 # it will just reintroduce the false-alarm noise measured above; extend
 # PR #865's check instead.
-LOOP_PASS_STALE_MINUTES = 90
+LOOP_PASS_STALE_MINUTES = _haf.LOOP_PASS_STALE_MINUTES if _haf else 90
 MERGEQUEUE_STALL_BEATS = 2
 GRAPHQL_RATE_LIMIT_MIN_REMAINING = 500
 DISPATCH_THROTTLE_MAX_MINUTES = 30
@@ -266,8 +279,10 @@ _WORKTREE_MTIME_SCAN_FILE_CAP = 5000
 # Older heartbeats that lack ``max_pass_runtime_seconds`` fall back to
 # ``full_pass_interval_seconds`` (the pre-fix behavior) for transition safety.
 SUPERVISOR_HEARTBEAT_FILENAME = "supervisor-heartbeat.json"
-SUPERVISOR_HEARTBEAT_STALE_MULTIPLIER = 2
-SUPERVISOR_HEARTBEAT_DEFAULT_PASS_TIMEOUT_SECONDS = 1800
+SUPERVISOR_HEARTBEAT_STALE_MULTIPLIER = _haf.SUPERVISOR_HEARTBEAT_STALE_MULTIPLIER if _haf else 2
+SUPERVISOR_HEARTBEAT_DEFAULT_PASS_TIMEOUT_SECONDS = (
+    _haf.SUPERVISOR_HEARTBEAT_DEFAULT_PASS_TIMEOUT_SECONDS if _haf else 1800
+)
 
 # Issue #1832: a ``supervisor_wedge_loop`` event means the wedge-kill
 # backstop (issue #728) fired N consecutive times with no fleet pass
@@ -277,7 +292,7 @@ SUPERVISOR_HEARTBEAT_DEFAULT_PASS_TIMEOUT_SECONDS = 1800
 # lookback window count, so a single old occurrence that has since resolved
 # does not alarm forever.
 SUPERVISOR_WEDGE_LOOP_EVENT_KIND = "supervisor_wedge_loop"
-SUPERVISOR_WEDGE_LOOP_LOOKBACK_HOURS = 24
+SUPERVISOR_WEDGE_LOOP_LOOKBACK_HOURS = _haf.SUPERVISOR_WEDGE_LOOP_LOOKBACK_HOURS if _haf else 24
 
 # Issue #1859: notify_digest_check is the stdlib-only file-probe leaf;
 # notify_digest_heartbeat holds the events.db-read-plus-verdict logic (see
@@ -1646,31 +1661,32 @@ def check_dispatch_failures(report: Report, repo: RepoInfo, baseline: datetime) 
 
 
 def check_log_freshness(report: Report, repo: RepoInfo, *, now: datetime | None = None) -> None:
-    """``now`` is the injectable clock (issue #828); see ``check_dispatch_throttle``."""
+    """``now`` is the injectable clock (issue #828); see ``check_dispatch_throttle``.
+
+    Reads the freshest log/state/checkpoint mtime under the state dir; the
+    verdict is ``heartbeat_alarms_fleet.eval_log_freshness``.
+    """
     check = f"log-freshness {repo.slug}"
+    if _haf is None:
+        report.anom(check, _ALARMS_UNAVAILABLE)
+        return
     candidates = list(repo.state_dir.glob("*.log"))
     state_json = repo.state_dir / "state.json"
     if state_json.exists():
         candidates.append(state_json)
     candidates.extend(repo.state_dir.glob("*checkpoint*"))
     candidates = [c for c in candidates if c.is_file()]
-
-    if not candidates:
-        report.anom(check, "no log/state/checkpoint files found under state dir")
-        return
-
-    freshest = max(candidates, key=lambda p: p.stat().st_mtime)
-    resolved_now = now if now is not None else datetime.now(timezone.utc)
-    mtime = datetime.fromtimestamp(freshest.stat().st_mtime, tz=timezone.utc)
-    age_min = (resolved_now - mtime).total_seconds() / 60
-
-    facts = f"freshest={freshest.name} age={round(age_min)}m"
-    if age_min > LOG_FRESHNESS_STALE_MINUTES:
-        report.anom(
-            check, f"freshest file older than threshold={LOG_FRESHNESS_STALE_MINUTES}m ({facts})"
-        )
-    else:
-        report.ok(check, facts)
+    freshest = max(candidates, key=lambda p: p.stat().st_mtime) if candidates else None
+    _ha.emit(
+        report,
+        _haf.eval_log_freshness(
+            repo.slug,
+            freshest.stat().st_mtime if freshest else None,
+            freshest.name if freshest else "",
+            now if now is not None else datetime.now(timezone.utc),
+            LOG_FRESHNESS_STALE_MINUTES,
+        ),
+    )
 
 
 def check_loop_pass_freshness(
@@ -1682,36 +1698,18 @@ def check_loop_pass_freshness(
 ) -> None:
     """Coarse backstop for prolonged, total fleet death -- NOT a detector
     for the #851/#854 outage class specifically (see ``LOOP_PASS_STALE_MINUTES``
-    for the measured cadence data and why: that outage was shorter than this
-    repo's own legitimate worst-case gap between loop passes, so no per-repo
-    threshold can separate the two; PR #865 / issue #855 catches that class
-    instead, by watching for consecutive zero-repo-pass cycles rather than
-    elapsed time).
+    for the measured cadence data; PR #865 / issue #855 catches that class).
 
-    What this still catches: the process exited 0, the scheduled task
-    reported success, and the state dir kept getting touched
-    (``self_deploy_succeeded`` fires every beat), so ``check_log_freshness``
-    reads healthy indefinitely even though the loop body itself
-    (``workflow.py``'s ``_loop_impl``, which is the only place that logs
-    ``loop_started``) has not run in any of this repo's passes for well
-    over an hour. The only ground truth for "is the loop actually running"
-    is the ABSENCE of ``loop_started`` rows in ``events.db``.
+    What this still catches: the loop body (``workflow.py``'s ``_loop_impl``,
+    the only place that logs ``loop_started``) has not run for well over an
+    hour while the state dir keeps getting touched, so ``check_log_freshness``
+    reads healthy. Ground truth is the ABSENCE of ``loop_started`` rows.
 
-    ``now`` is the injectable clock (issue #828); see ``check_dispatch_throttle``.
-
-    Missing DB, missing table, and zero ``loop_started`` rows are each
-    reported OK with a distinct message -- a fresh install/state dir with no
-    history yet is not the same failure as a fleet that stopped mid-flight.
-
-    CRITICAL: the freshness comparison is done in Python on parsed
-    ``datetime`` objects, never in SQL. ``ts`` values are ISO strings like
-    ``2026-07-31T22:25:04Z`` (``T``/``Z``); SQLite's
-    ``datetime('now','-90 minutes')`` returns a space-separated,
-    non-``Z`` string like ``2026-07-31 22:25:04``. A predicate such as
-    ``WHERE ts < datetime('now','-90 minutes')`` compares them as strings,
-    where ``'T'`` (0x54) sorts after ``' '`` (0x20) -- this silently
-    misclassifies rows in both directions instead of raising, so the bug
-    doesn't fail loudly, it just returns the wrong answer.
+    ``now`` is the injectable clock (issue #828). Missing DB, missing table, and
+    zero rows are each OK with a distinct message (fresh install is not a dead
+    fleet). ``ts`` is compared in Python, never SQL (ISO ``T``/``Z`` vs SQLite
+    space-format mis-compares silently). Verdict:
+    ``heartbeat_alarms_fleet.eval_loop_pass_freshness``.
     """
     check = f"loop-pass-freshness {repo.slug}"
     db_path = repo.state_dir / "events.db"
@@ -1742,32 +1740,19 @@ def check_loop_pass_freshness(
     finally:
         conn.close()
 
-    if newest_ts is None:
-        report.ok(check, "no loop_started rows recorded yet")
+    if _haf is None:
+        report.anom(check, _ALARMS_UNAVAILABLE)
         return
-
-    newest_dt = parse_iso(newest_ts)
-    if newest_dt is None:
-        report.anom(check, f"newest loop_started ts unparseable: {newest_ts!r}")
-        return
-
-    resolved_now = now if now is not None else datetime.now(timezone.utc)
-    age_min = (resolved_now - newest_dt).total_seconds() / 60
-    facts = f"newest_loop_started={newest_ts} age={round(age_min)}m"
-
-    if age_min > stale_minutes:
-        marker_path = repo.state_dir / "pending-sync.json"
-        report.anom(
-            check,
-            f"no loop pass in {repo.slug} for {round(age_min)}m "
-            f"(newest loop_started {newest_ts}), threshold={stale_minutes}m -- "
-            f"at or beyond the observed healthy worst case, so the supervisor "
-            f"may be dead or wedged. Cause is open-ended at this duration; "
-            f"{marker_path} is one thing worth checking, not the only one. "
-            f"({facts})",
-        )
-    else:
-        report.ok(check, facts)
+    _ha.emit(
+        report,
+        _haf.eval_loop_pass_freshness(
+            repo.slug,
+            newest_ts,
+            now if now is not None else datetime.now(timezone.utc),
+            stale_minutes,
+            marker_hint=str(repo.state_dir / "pending-sync.json"),
+        ),
+    )
 
 
 def check_supervisor_venv_refusal(
@@ -2327,18 +2312,12 @@ def check_supervisor_heartbeat(report: Report) -> None:
     """Flag a stale or absent fleet supervisor heartbeat (issue #627).
 
     The supervisor writes ``supervisor-heartbeat.json`` in the fleet dir every
-    loop iteration. A stale ``last_beat_at`` means the supervisor is not making
-    progress — either killed (``exited_at`` null, no clean exit recorded) or
-    cleanly stopped but not restarted by the watchdog (``exited_at`` set, the
-    2026-07-25 18:24 UTC outage shape where the watchdog task was disabled).
-
-    This is the independent detector that catches both shapes: a killed
-    supervisor leaves the heartbeat stale with no ``exited_at``, and a
-    supervisor whose launcher was also killed leaves no marker at all — the
-    heartbeat file's age is the only remaining signal. The stale threshold
-    derives from ``max_pass_runtime_seconds`` recorded in the heartbeat
-    itself (the config knob that bounds a single pass's wall-clock runtime),
-    falling back to ``full_pass_interval_seconds`` for older heartbeats.
+    loop iteration; a stale ``last_beat_at`` means it is killed (``exited_at``
+    null) or cleanly stopped but not restarted (``exited_at`` set -- the
+    2026-07-25 watchdog-disabled shape). The file's age is the only signal
+    left when the launcher died too. This reads the file; the verdict (stale
+    threshold derived from the heartbeat's own ``max_pass_runtime_seconds``) is
+    ``heartbeat_alarms_fleet.eval_supervisor_heartbeat``.
     """
     check = "supervisor-heartbeat"
     path = fleet_dir() / SUPERVISOR_HEARTBEAT_FILENAME
@@ -2354,93 +2333,24 @@ def check_supervisor_heartbeat(report: Report) -> None:
     except (OSError, json.JSONDecodeError) as exc:
         report.anom(check, f"{SUPERVISOR_HEARTBEAT_FILENAME} unreadable: {exc}")
         return
-    if not isinstance(data, dict):
-        report.anom(check, f"{SUPERVISOR_HEARTBEAT_FILENAME} malformed (not a JSON object)")
+    if _haf is None:
+        report.anom(check, _ALARMS_UNAVAILABLE)
         return
-
-    last_beat = parse_iso(data.get("last_beat_at"))
-    if last_beat is None:
-        report.anom(check, f"{SUPERVISOR_HEARTBEAT_FILENAME} has no parseable last_beat_at")
-        return
-
-    now = datetime.now(timezone.utc)
-    age_min = (now - last_beat).total_seconds() / 60.0
-    exited_at = data.get("exited_at")
-    try:
-        raw_timeout = data.get("max_pass_runtime_seconds")
-        pass_timeout = int(raw_timeout) if raw_timeout is not None else None
-    except (TypeError, ValueError):
-        pass_timeout = None
-    if pass_timeout is None or pass_timeout <= 0:
-        try:
-            raw_interval = data.get("full_pass_interval_seconds")
-            pass_timeout = (
-                int(raw_interval)
-                if raw_interval is not None
-                else SUPERVISOR_HEARTBEAT_DEFAULT_PASS_TIMEOUT_SECONDS
-            )
-        except (TypeError, ValueError):
-            pass_timeout = SUPERVISOR_HEARTBEAT_DEFAULT_PASS_TIMEOUT_SECONDS
-    stale_threshold_min = (SUPERVISOR_HEARTBEAT_STALE_MULTIPLIER * pass_timeout) / 60.0
-
-    pid = data.get("pid")
-    facts = (
-        f"last_beat={round(age_min)}m ago pid={pid} exited_at={exited_at} "
-        f"pass_timeout={pass_timeout}s"
-    )
-
-    if age_min <= stale_threshold_min:
-        report.ok(check, facts)
-        return
-
-    if exited_at is not None:
-        report.anom(
-            check,
-            f"supervisor exited cleanly at {exited_at} but has not restarted in "
-            f"{round(age_min)}m (threshold={round(stale_threshold_min)}m) — the "
-            f"watchdog may be disabled ({facts})",
-        )
-    else:
-        report.anom(
-            check,
-            f"supervisor heartbeat stale: last beat {round(age_min)}m ago with no "
-            f"clean exit (threshold={round(stale_threshold_min)}m) — likely killed "
-            f"or hung ({facts})",
-        )
+    _ha.emit(report, _haf.eval_supervisor_heartbeat(data, datetime.now(timezone.utc)))
 
 
 def check_wedge_kill_loop(report: Report) -> None:
     """Surface a ``supervisor_wedge_loop`` event -- the wedge-kill backstop looping (issue #1832).
 
-    ``WedgeWatchdog`` (the supervise-loop wrapper's in-process detector, see
-    ``wedge_watchdog.py``) kills a wedged supervisor child and records
-    ``supervisor_wedged_killed``; the wrapper then relaunches a fresh child.
-    ``charlie_work.supervisor_lifecycle.detect_wedge_kill_loop`` runs inside
-    that fresh child at startup and, once N consecutive kills have happened
-    with no ``fleet_pass_completed`` event recovering in between, records a
-    distinct ``supervisor_wedge_loop`` error-level event -- the relaunch loop
-    itself is stuck, not merely a single slow pass.
+    ``supervisor_lifecycle.detect_wedge_kill_loop`` records this error-level
+    event in the FLEET-level ``events.db`` (a sibling of
+    ``supervisor-heartbeat.json``), which ``check_error_events`` -- scanning
+    only registered repos' state dirs -- never sees. This is a thin read; the
+    streak logic stays in that one implementation, and the verdict (events
+    within the lookback window) is ``heartbeat_alarms_fleet.eval_wedge_kill_loop``.
 
-    That event lands in the FLEET-level ``events.db`` (a sibling of
-    ``supervisor-heartbeat.json`` directly under ``fleet_dir()``), never a
-    per-repo ``state_dir/events.db`` -- so ``check_error_events`` above,
-    which only scans registered repos' ``state_dir``, never sees it. This
-    check reads that file directly, the same reason
-    ``check_supervisor_heartbeat`` above reads the heartbeat sidecar
-    directly rather than importing ``charlie_work``.
-
-    Deliberately a thin read, not a reimplementation of the detection: this
-    only asks "did that event fire recently," leaving the streak-counting
-    logic (what counts as "consecutive," where the reset boundary is) to the
-    single implementation in ``supervisor_lifecycle.detect_wedge_kill_loop``.
-    Only events within ``SUPERVISOR_WEDGE_LOOP_LOOKBACK_HOURS`` of `now`
-    count, so one old, already-resolved occurrence does not alarm forever.
-
-    A missing fleet ``events.db`` is OK, not an anomaly (mirrors
-    ``check_loop_pass_freshness``'s missing-db posture, not
-    ``check_error_events``'s): the supervisor may simply never have started
-    yet, and ``check_supervisor_heartbeat`` above already owns "the
-    supervisor isn't running" as a distinct anomaly.
+    A missing fleet ``events.db`` is OK, not an anomaly: the supervisor may never
+    have started, and ``check_supervisor_heartbeat`` owns that failure.
     """
     check = "supervisor-wedge-kill-loop"
     db_path = fleet_dir() / "events.db"
@@ -2474,26 +2384,17 @@ def check_wedge_kill_loop(report: Report) -> None:
     finally:
         conn.close()
 
-    now = datetime.now(timezone.utc)
-    cutoff = now - timedelta(hours=SUPERVISOR_WEDGE_LOOP_LOOKBACK_HOURS)
-    # An unparseable ts fails toward visibility (reported), matching
-    # check_error_events's polarity for the same ambiguous case.
-    recent_ts = [ts for (ts,) in rows if (parse_iso(ts) is None or parse_iso(ts) >= cutoff)]
-
-    facts = (
-        f"total_events={len(rows)} recent={len(recent_ts)} "
-        f"lookback_hours={SUPERVISOR_WEDGE_LOOP_LOOKBACK_HOURS}"
+    if _haf is None:
+        report.anom(check, _ALARMS_UNAVAILABLE)
+        return
+    _ha.emit(
+        report,
+        _haf.eval_wedge_kill_loop(
+            [ts for (ts,) in rows],
+            datetime.now(timezone.utc),
+            SUPERVISOR_WEDGE_LOOP_LOOKBACK_HOURS,
+        ),
     )
-    if recent_ts:
-        newest_ts = max(recent_ts)
-        report.anom(
-            check,
-            f"supervisor_wedge_loop fired {len(recent_ts)} time(s) in the last "
-            f"{SUPERVISOR_WEDGE_LOOP_LOOKBACK_HOURS}h (most recent {newest_ts}) -- "
-            f"the wedge-kill backstop is looping instead of recovering ({facts})",
-        )
-    else:
-        report.ok(check, facts)
 
 
 def check_notify_digest_freshness(report: Report, *, now: datetime | None = None) -> None:

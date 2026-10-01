@@ -33,10 +33,11 @@ and ``parse_iso`` is mirrored below rather than shared.
 
 from __future__ import annotations
 
-import json
 import sqlite3
+from collections.abc import Callable
 from datetime import datetime
-from typing import TYPE_CHECKING
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     # ``heartbeat_check`` is not importable as a module at runtime
@@ -83,6 +84,16 @@ try:
 except ImportError:
     EXPECTED_OPERATIONAL_KINDS: frozenset[str] = frozenset()
 
+# The verdict logic for every check below lives in the stdlib-only leaf
+# ``charlie_work.heartbeat_alarms`` (shared with the fleet dashboard); this
+# module only reads events.db and adapts the returned ``Finding`` onto the
+# heartbeat ``Report``. Guarded like ``event_kinds``: with the package absent a
+# check reports an ANOMALY it cannot evaluate -- visible, never silently green.
+try:
+    from charlie_work import heartbeat_alarms as _ha
+except ImportError:
+    _ha = None
+
 
 # Mirrors ``heartbeat_check.parse_iso`` verbatim -- sibling scripts cannot
 # import each other (``scripts/`` is not a package), and a back-import would
@@ -98,437 +109,141 @@ def parse_iso(value: str | None) -> datetime | None:
         return None
 
 
-def check_error_events(report: Report, repo: RepoInfo, baseline: datetime) -> None:
-    """Surface error-level events that fire but have no consumer (issue #866).
+def _read_rows(
+    report: Report, check: str, db_path: Path, prefix: str, queries: list[tuple[str, tuple]]
+) -> list[list[tuple]] | None:
+    """Run each ``(sql, params)`` against ``db_path``; ``None`` after an ANOMALY.
 
-    `self_deploy_alarm` and every other member of `instrumentation._ERROR_KINDS`
-    (e.g. PR #865's `supervisor_zero_pass_alarm`) are emitted, classified
-    error-level, documented, and unit-tested -- but before this check,
-    nothing in the codebase ever read them. A human had to manually open
-    `events.db` and know which `kind` string to search for. This check
-    closes that detection-to-delivery gap; `check_loop_pass_freshness` above
-    is a separate, coarser backstop (defense in depth), not a substitute --
-    that one answers "did the loop run recently," this one answers "did
-    anything already flag itself as an error."
-
-    Coverage is DERIVED, never a hardcoded `kind` list: `level` is computed
-    once and persisted per-row at write time by
-    `instrumentation._classify_level` (checked against `_ERROR_KINDS`/
-    `_WARNING_KINDS` there), so filtering on the persisted `level = 'error'`
-    column here picks up every current and future error kind without this
-    script importing `charlie_work` or restating its kind list. This is more
-    correct than importing `_ERROR_KINDS` directly would be, too:
-    `_ERROR_KINDS` reflects the currently-installed code, while a row's
-    `level` reflects what the classifier actually assigned when that row was
-    written -- the two can disagree across a deploy boundary, and the
-    persisted column is ground truth for "what actually happened."
-
-    Unlike `check_loop_pass_freshness` (missing db/table = OK, "no history
-    yet" -- a fresh install is not a failure), a missing or unreadable
-    events.db HERE is an ANOMALY: this check's entire job is "did any alarm
-    fire," and a registered repo this check cannot read is a repo it cannot
-    vouch for, not one it can call clean.
-
-    Only rows with `ts` strictly after `baseline` (the previous heartbeat
-    beat -- same mechanism as `check_dispatch_failures`) are reported, so an
-    already-seen alarm is not re-flagged forever. On a cold start (no prior
-    `heartbeat-state.json`), `main()` falls `baseline` back to
-    `now - LOG_FRESHNESS_STALE_MINUTES`, so alarms older than that fallback
-    window are silently out of scope on the very first run -- a deliberate,
-    bounded blind spot, not an oversight.
-
-    CRITICAL: timestamps are compared in Python, never in SQL -- the same
-    ISO-`T`/`Z`-vs-SQLite-space-format trap documented on
-    `check_loop_pass_freshness`. All `level='error'` rows are pulled
-    unfiltered by time and each `ts` is parsed with `parse_iso` and compared
-    against the `baseline` `datetime` in Python.
+    A missing/unreadable events.db or absent ``events`` table is ``report.anom``
+    (``prefix`` is the per-check message lead): a repo this check cannot read is
+    a repo it cannot vouch for. Timestamps are never compared in SQL.
     """
-    check = f"error-events {repo.slug}"
-    db_path = repo.state_dir / "events.db"
     if not db_path.exists():
-        report.anom(check, f"cannot check for alarms: no events.db at {db_path}")
-        return
-
+        report.anom(check, f"{prefix}: no events.db at {db_path}")
+        return None
     try:
         conn = sqlite3.connect(str(db_path))
     except sqlite3.Error as exc:
-        report.anom(check, f"cannot check for alarms: events.db unreadable: {exc}")
-        return
-
+        report.anom(check, f"{prefix}: events.db unreadable: {exc}")
+        return None
     try:
         try:
             table_row = conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'"
             ).fetchone()
             if table_row is None:
-                report.anom(check, "cannot check for alarms: events.db has no events table")
-                return
-            rows = conn.execute("SELECT ts, kind FROM events WHERE level = 'error'").fetchall()
+                report.anom(check, f"{prefix}: events.db has no events table")
+                return None
+            return [conn.execute(sql, params).fetchall() for sql, params in queries]
         except sqlite3.Error as exc:
-            report.anom(check, f"cannot check for alarms: events.db unreadable: {exc}")
-            return
+            report.anom(check, f"{prefix}: events.db unreadable: {exc}")
+            return None
     finally:
         conn.close()
 
-    new_alarms: list[str] = []
-    for ts, kind in rows:
-        ts_dt = parse_iso(ts)
-        # An unparseable ts fails toward visibility (reported), not silence.
-        if ts_dt is None or ts_dt > baseline:
-            new_alarms.append(f"{kind}@{ts}")
 
-    facts = f"error_rows={len(rows)} new_since_last_beat={len(new_alarms)}"
-    if new_alarms:
-        report.anom(check, f"new error-level event(s) since last beat: {new_alarms} ({facts})")
-    else:
-        report.ok(check, facts)
+def _run(
+    report: Report,
+    repo: RepoInfo,
+    base: str,
+    prefix: str,
+    queries: list[tuple[str, tuple]],
+    evaluate: Callable[..., Any],
+) -> None:
+    check = f"{base} {repo.slug}"
+    if _ha is None:
+        report.anom(check, "cannot evaluate: charlie_work.heartbeat_alarms not importable")
+        return
+    results = _read_rows(report, check, repo.state_dir / "events.db", prefix, queries)
+    if results is None:
+        return
+    out = evaluate(*results)
+    for finding in out if isinstance(out, list) else [out]:
+        _ha.emit(report, finding)
+
+
+def check_error_events(report: Report, repo: RepoInfo, baseline: datetime) -> None:
+    """Surface error-level events that fire but have no consumer (issue #866).
+
+    Coverage is DERIVED from the persisted per-row ``level = 'error'`` (ground
+    truth for what the classifier assigned at write time), never a kind list.
+    A missing/unreadable events.db is an ANOMALY here -- this check's whole job
+    is "did any alarm fire." Only rows newer than ``baseline`` (previous beat)
+    are reported. Verdict: ``heartbeat_alarms.eval_error_events``.
+    """
+    _run(
+        report,
+        repo,
+        "error-events",
+        "cannot check for alarms",
+        [("SELECT ts, kind FROM events WHERE level = 'error'", ())],
+        lambda rows: _ha.eval_error_events(repo.slug, rows, baseline),
+    )
 
 
 def check_warning_events(report: Report, repo: RepoInfo, baseline: datetime) -> None:
     """Surface warning-level events that fire but have no consumer (issue #946).
 
-    Mirrors `check_error_events` above one level down the `level` column:
-    every member of `instrumentation._WARNING_KINDS` -- issue #946's
-    motivating kind plus roughly a dozen other pre-existing ones -- is
-    emitted, classified, documented, and unit tested, but before this check
-    nothing in the codebase ever read a warning-level row. This gives all of
-    them their first reader at once, the same detection-to-delivery gap
-    `check_error_events` closed for `level = 'error'`.
-
-    Coverage is DERIVED, never a hardcoded `kind` list, for the identical
-    reason as `check_error_events`: `level` is computed once and persisted
-    per-row at write time by `instrumentation._classify_level` (checked
-    against `_WARNING_KINDS` there), so filtering on the persisted
-    `level = 'warning'` column here picks up every current and future
-    warning kind without restating the kind list. This one check does import
-    `charlie_work.event_kinds` (see the module-level import's own comment,
-    and NOT `charlie_work.instrumentation` -- that module reaches `ci_fleet`
-    at import time, which this stdlib-only script must never depend on) --
-    but only for `EXPECTED_OPERATIONAL_KINDS`, the presentation bucketing
-    below, which is a distinct question from coverage.
-
-    Deliberately different from `check_error_events` in exactly one place:
-    a new warning-level event is reported via `report.warn`, not
-    `report.anom`. Several `_WARNING_KINDS` members are normal-operation
-    events, not faults -- and a deliberately paused fleet with a non-empty
-    backlog is not a crash either (see `EXPECTED_OPERATIONAL_KINDS` for
-    exactly which kinds). Flipping the heartbeat to failure on every one of
-    those would make this check permanently red and get ignored within a
-    day; visibility is the goal, not a new alarm. The db-availability guards
-    below stay `report.anom`, matching `check_error_events`: an unreadable
-    events.db means this check cannot vouch for the repo at all, which is a
-    genuine anomaly independent of whether any warning fired.
-
-    See `check_error_events`'s docstring for the missing-db-is-an-anomaly
-    rationale and the ISO-vs-SQLite string-comparison trap this avoids by
-    comparing `ts` in Python against `baseline`, never in SQL.
-
-    Issue #1271: the kinds in `EXPECTED_OPERATIONAL_KINDS` routinely
-    dominate warning volume (a live 7-day window measured them as the
-    majority of 676 total warnings) and drowned the rare genuine warning
-    kinds in a flat listing. New rows whose `kind` is a member are bucketed
-    into a one-line summarized count instead of the detailed listing; every
-    other kind keeps the original flat `kind@ts` format unchanged. Both are
-    still reported via `report.warn`, never `report.anom` -- bucketing
-    changes presentation, not severity. Kind counts within the summary are
-    ordered by sorted kind name (never dict/insertion order) so two runs
-    over the same fixture produce byte-identical report lines.
+    Mirrors ``check_error_events`` one level down, but new rows are WARN, never
+    ANOMALY (several warning kinds are normal operation). Kinds in
+    ``EXPECTED_OPERATIONAL_KINDS`` (issue #1271) are bucketed into a one-line
+    sorted count. Verdict: ``heartbeat_alarms.eval_warning_events``.
     """
-    check = f"warning-events {repo.slug}"
-    db_path = repo.state_dir / "events.db"
-    if not db_path.exists():
-        report.anom(check, f"cannot check for warnings: no events.db at {db_path}")
-        return
-
-    try:
-        conn = sqlite3.connect(str(db_path))
-    except sqlite3.Error as exc:
-        report.anom(check, f"cannot check for warnings: events.db unreadable: {exc}")
-        return
-
-    try:
-        try:
-            table_row = conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'"
-            ).fetchone()
-            if table_row is None:
-                report.anom(check, "cannot check for warnings: events.db has no events table")
-                return
-            rows = conn.execute("SELECT ts, kind FROM events WHERE level = 'warning'").fetchall()
-        except sqlite3.Error as exc:
-            report.anom(check, f"cannot check for warnings: events.db unreadable: {exc}")
-            return
-    finally:
-        conn.close()
-
-    new_warnings_detail: list[str] = []
-    expected_operational_counts: dict[str, int] = {}
-    for ts, kind in rows:
-        ts_dt = parse_iso(ts)
-        # An unparseable ts fails toward visibility (reported), not silence.
-        if ts_dt is None or ts_dt > baseline:
-            if kind in EXPECTED_OPERATIONAL_KINDS:
-                expected_operational_counts[kind] = expected_operational_counts.get(kind, 0) + 1
-            else:
-                new_warnings_detail.append(f"{kind}@{ts}")
-
-    total_new = len(new_warnings_detail) + sum(expected_operational_counts.values())
-    facts = f"warning_rows={len(rows)} new_since_last_beat={total_new}"
-
-    if new_warnings_detail:
-        report.warn(
-            check, f"new warning-level event(s) since last beat: {new_warnings_detail} ({facts})"
-        )
-    if expected_operational_counts:
-        # Sorted by kind name -- never dict/insertion order -- for
-        # deterministic, byte-identical output across repeated runs.
-        counts_str = ", ".join(
-            f"{kind}={expected_operational_counts[kind]}"
-            for kind in sorted(expected_operational_counts)
-        )
-        report.warn(
-            check,
-            f"{sum(expected_operational_counts.values())} routine operational warnings "
-            f"({counts_str}) ({facts})",
-        )
-    if not new_warnings_detail and not expected_operational_counts:
-        report.ok(check, facts)
+    _run(
+        report,
+        repo,
+        "warning-events",
+        "cannot check for warnings",
+        [("SELECT ts, kind FROM events WHERE level = 'warning'", ())],
+        lambda rows: _ha.eval_warning_events(
+            repo.slug, rows, baseline, EXPECTED_OPERATIONAL_KINDS
+        ),
+    )
 
 
 def check_infra_blocked_events(report: Report, repo: RepoInfo, baseline: datetime) -> None:
     """Surface ``check_infra_blocked`` events and their persisted escalation
-    (issue #1383, AC4).
-
-    ``check_infra_blocked`` is a warning-level event emitted per affected PR
-    when a required check fails due to a fleet-wide infrastructure condition
-    (Actions budget/runner outage) rather than the PR's code. The
-    operator-facing ``infra_blocked_escalated`` error event is emitted at
-    most once per configured window when the condition persists across N
-    passes. Both kinds already appear in the generic
-    ``check_warning_events`` / ``check_error_events`` listings, but those
-    are flat ``kind@ts`` lines with no correlation to the affected PRs or
-    the persistence state. This dedicated check gives the operator a
-    structured view: how many PRs are currently infra-blocked, which
-    checks, and whether the persistence escalation has fired.
-
-    Same db-availability posture as ``check_error_events``: a missing or
-    unreadable events.db is an anomaly (this check cannot vouch for a repo
-    it cannot read), not a silent OK. Timestamps are compared in Python
-    against ``baseline`` for the same ISO-vs-SQLite reason documented on
-    ``check_loop_pass_freshness``.
-    """
-    check = f"infra-blocked-events {repo.slug}"
-    db_path = repo.state_dir / "events.db"
-    if not db_path.exists():
-        report.anom(check, f"cannot check: no events.db at {db_path}")
-        return
-
-    try:
-        conn = sqlite3.connect(str(db_path))
-    except sqlite3.Error as exc:
-        report.anom(check, f"cannot check: events.db unreadable: {exc}")
-        return
-
-    try:
-        try:
-            table_row = conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'"
-            ).fetchone()
-            if table_row is None:
-                report.anom(check, "cannot check: events.db has no events table")
-                return
-            blocked_rows = conn.execute(
-                "SELECT ts, kind FROM events WHERE kind = ?",
-                ("check_infra_blocked",),
-            ).fetchall()
-            escalated_rows = conn.execute(
-                "SELECT ts FROM events WHERE kind = ?",
-                ("infra_blocked_escalated",),
-            ).fetchall()
-        except sqlite3.Error as exc:
-            report.anom(check, f"cannot check: events.db unreadable: {exc}")
-            return
-    finally:
-        conn.close()
-
-    new_blocked: list[str] = []
-    for ts, _kind in blocked_rows:
-        ts_dt = parse_iso(ts)
-        if ts_dt is None or ts_dt > baseline:
-            new_blocked.append(ts)
-
-    new_escalated: list[str] = []
-    for (ts,) in escalated_rows:
-        ts_dt = parse_iso(ts)
-        if ts_dt is None or ts_dt > baseline:
-            new_escalated.append(ts)
-
-    facts = f"blocked_rows={len(blocked_rows)} escalated_rows={len(escalated_rows)}"
-    if new_escalated:
-        report.anom(
-            check,
-            f"infra_blocked_escalated since last beat: {new_escalated} ({facts})",
-        )
-    elif new_blocked:
-        report.warn(
-            check,
-            f"check_infra_blocked since last beat: {len(new_blocked)} event(s) ({facts})",
-        )
-    else:
-        report.ok(check, facts)
+    (issue #1383, AC4): escalated is an ANOMALY, bare blocks a WARN.
+    Verdict: ``heartbeat_alarms.eval_infra_blocked``."""
+    _run(
+        report,
+        repo,
+        "infra-blocked-events",
+        "cannot check",
+        [
+            ("SELECT ts, kind FROM events WHERE kind = ?", ("check_infra_blocked",)),
+            ("SELECT ts FROM events WHERE kind = ?", ("infra_blocked_escalated",)),
+        ],
+        lambda blocked, escalated: _ha.eval_infra_blocked(repo.slug, blocked, escalated, baseline),
+    )
 
 
 def check_draft_pr_blocked_events(report: Report, repo: RepoInfo, baseline: datetime) -> None:
-    """Surface ``draft_pr_blocked`` events periodically (issue #1366).
-
-    A PR parked as draft-only-blocked (``workflow.py``'s ``failures_changed``
-    arm) emits one ``draft_pr_blocked`` warning event per park. The event is
-    the durable record that the park happened; this check is its first
-    automated reader, surfacing new parks since the last beat so an operator
-    sees draft-blocked PRs alongside the other stuck-state detectors in the
-    same heartbeat output rather than only via a manual
-    ``query_events(kind="draft_pr_blocked")`` grep.
-
-    Deliberately a ``report.warn`` (passive, periodic surfacing), not
-    ``report.anom``: a draft-blocked PR is a state to surface periodically,
-    not a fleet emergency -- the operator comment on issue #1366 placed this
-    kind on the periodic-surfacing path rather than the real-alert path
-    reserved for ``venv_editable_anchor_violation`` (see
-    ``check_supervisor_venv_refusal``). The db-availability guards stay
-    ``report.anom``, matching ``check_infra_blocked_events``: an unreadable
-    events.db means this check cannot vouch for the repo at all, which is a
-    genuine anomaly independent of whether any park fired.
-
-    Same db-availability posture and ISO-vs-SQLite comparison convention as
-    ``check_infra_blocked_events``: timestamps are compared in Python against
-    ``baseline`` (never in SQL) so an unparseable ``ts`` fails toward
-    visibility, not silence.
-    """
-    check = f"draft-pr-blocked-events {repo.slug}"
-    db_path = repo.state_dir / "events.db"
-    if not db_path.exists():
-        report.anom(check, f"cannot check: no events.db at {db_path}")
-        return
-
-    try:
-        conn = sqlite3.connect(str(db_path))
-    except sqlite3.Error as exc:
-        report.anom(check, f"cannot check: events.db unreadable: {exc}")
-        return
-
-    try:
-        try:
-            table_row = conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'"
-            ).fetchone()
-            if table_row is None:
-                report.anom(check, "cannot check: events.db has no events table")
-                return
-            rows = conn.execute(
-                "SELECT ts FROM events WHERE kind = ?",
-                ("draft_pr_blocked",),
-            ).fetchall()
-        except sqlite3.Error as exc:
-            report.anom(check, f"cannot check: events.db unreadable: {exc}")
-            return
-    finally:
-        conn.close()
-
-    new_blocked: list[str] = []
-    for (ts,) in rows:
-        ts_dt = parse_iso(ts)
-        if ts_dt is None or ts_dt > baseline:
-            new_blocked.append(ts)
-
-    facts = f"blocked_rows={len(rows)} new_since_last_beat={len(new_blocked)}"
-    if new_blocked:
-        report.warn(
-            check,
-            f"draft_pr_blocked since last beat: {len(new_blocked)} event(s) ({facts})",
-        )
-    else:
-        report.ok(check, facts)
+    """Surface ``draft_pr_blocked`` events periodically (issue #1366) as WARN --
+    a state to surface, not a fleet emergency. Verdict:
+    ``heartbeat_alarms.eval_draft_pr_blocked``."""
+    _run(
+        report,
+        repo,
+        "draft-pr-blocked-events",
+        "cannot check",
+        [("SELECT ts FROM events WHERE kind = ?", ("draft_pr_blocked",))],
+        lambda rows: _ha.eval_draft_pr_blocked(repo.slug, rows, baseline),
+    )
 
 
 def check_ci_headroom_unavailable(report: Report, repo: RepoInfo, baseline: datetime) -> None:
-    """Surface ``ci_headroom_unavailable`` events periodically (issue #1770).
-
-    ``ci_headroom_available()`` (``charlie_work/ci_headroom.py``) records
-    this warning-level event whenever it cannot trust the freshest
-    ``runner_allocation`` reading for a repo that has opted into the
-    CI-headroom clamp (``dispatch.ci_capacity_headroom_ratio > 0``) -- the
-    emission site's own comment on the event's level registration
-    (``instrumentation.py``) says "a repeating burst here means that channel
-    itself needs attention", but before this check nothing read the kind
-    back: it had only a test-only consumer (review finding 6), the
-    ``signal-without-consumer`` shape this codebase's review history flags
-    as its most recurrent defect class. Mirrors
-    ``check_draft_pr_blocked_events`` exactly -- same db-availability
-    posture, same periodic ``report.warn`` (not ``report.anom``: a fail-open
-    reading is a diagnosability gap, not by itself a fleet emergency) --
-    since the emitter (issue #1770 review finding 2) is itself now
-    edge-triggered/rate-limited, so a burst here is meaningful rather than
-    an artifact of unconditional per-pass writes.
-
-    Same ISO-vs-SQLite comparison convention as ``check_draft_pr_blocked_
-    events``: timestamps are compared in Python against ``baseline``, never
-    in SQL, so an unparseable ``ts`` fails toward visibility, not silence.
-    """
-    check = f"ci-headroom-unavailable-events {repo.slug}"
-    db_path = repo.state_dir / "events.db"
-    if not db_path.exists():
-        report.anom(check, f"cannot check: no events.db at {db_path}")
-        return
-
-    try:
-        conn = sqlite3.connect(str(db_path))
-    except sqlite3.Error as exc:
-        report.anom(check, f"cannot check: events.db unreadable: {exc}")
-        return
-
-    try:
-        try:
-            table_row = conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'"
-            ).fetchone()
-            if table_row is None:
-                report.anom(check, "cannot check: events.db has no events table")
-                return
-            rows = conn.execute(
-                "SELECT ts, payload FROM events WHERE kind = ?",
-                ("ci_headroom_unavailable",),
-            ).fetchall()
-        except sqlite3.Error as exc:
-            report.anom(check, f"cannot check: events.db unreadable: {exc}")
-            return
-    finally:
-        conn.close()
-
-    new_unavailable: list[str] = []
-    reasons: dict[str, int] = {}
-    for ts, payload_json in rows:
-        ts_dt = parse_iso(ts)
-        if ts_dt is not None and ts_dt <= baseline:
-            continue
-        new_unavailable.append(ts)
-        reason = "unknown"
-        try:
-            parsed_payload = json.loads(payload_json)
-            if isinstance(parsed_payload, dict):
-                reason = str(parsed_payload.get("reason", "unknown"))
-        except (TypeError, ValueError, json.JSONDecodeError):
-            pass
-        reasons[reason] = reasons.get(reason, 0) + 1
-
-    facts = f"unavailable_rows={len(rows)} new_since_last_beat={len(new_unavailable)}"
-    if new_unavailable:
-        report.warn(
-            check,
-            f"ci_headroom_unavailable since last beat: {len(new_unavailable)} event(s), "
-            f"reasons={reasons} ({facts})",
-        )
-    else:
-        report.ok(check, facts)
+    """Surface ``ci_headroom_unavailable`` events periodically (issue #1770) as
+    WARN, with payload ``reason`` bucketing. Verdict:
+    ``heartbeat_alarms.eval_ci_headroom_unavailable``."""
+    _run(
+        report,
+        repo,
+        "ci-headroom-unavailable-events",
+        "cannot check",
+        [("SELECT ts, payload FROM events WHERE kind = ?", ("ci_headroom_unavailable",))],
+        lambda rows: _ha.eval_ci_headroom_unavailable(repo.slug, rows, baseline),
+    )
 
 
 # Issue #1968: emitted once per local-lane pass per disabled
@@ -543,88 +258,15 @@ LOCAL_LANE_KILL_SWITCH_STALLED = "local_lane_kill_switch_stalled"
 def check_local_lane_kill_switch_stalled(
     report: Report, repo: RepoInfo, baseline: datetime
 ) -> None:
-    """Surface ``local_lane_kill_switch_stalled`` events as anomalies (#1968).
-
-    On a ``local_issues`` repo an explicit ``review_dispatch.enabled``/
-    ``auto_merge.enabled`` ``false`` is honored -- the gated sub-phases stay
-    skipped -- but it silently dead-ends every finished ticket at
-    ``agent:review-ready``. The lane emits this warning-level event every
-    pass the stall persists; the heartbeat's job is only to forward the
-    event rows (kind, ts, and the payload's ``switch``/``issue_numbers``
-    detail) to the operator -- it deliberately does NOT re-evaluate the
-    config, so the check stays correct across config edits and package
-    versions.
-
-    Deliberately ``report.anom``, not ``report.warn``: a stranded
-    review/merge lane means finished work is silently going nowhere, which
-    is exactly the dead-end the heartbeat exists to catch. The
-    db-availability guards match the other kind checks: an unreadable
-    events.db is a repo this check cannot vouch for.
-
-    Same ISO-vs-SQLite comparison convention as
-    ``check_draft_pr_blocked_events``: timestamps are compared in Python
-    against ``baseline``, never in SQL, so an unparseable ``ts`` fails
-    toward visibility, not silence.
-    """
-    check = f"local_lane_kill_switch_stalled {repo.slug}"
-    db_path = repo.state_dir / "events.db"
-    if not db_path.exists():
-        report.anom(check, f"cannot check: no events.db at {db_path}")
-        return
-
-    try:
-        conn = sqlite3.connect(str(db_path))
-    except sqlite3.Error as exc:
-        report.anom(check, f"cannot check: events.db unreadable: {exc}")
-        return
-
-    try:
-        try:
-            table_row = conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'"
-            ).fetchone()
-            if table_row is None:
-                report.anom(check, "cannot check: events.db has no events table")
-                return
-            rows = conn.execute(
-                "SELECT ts, payload FROM events WHERE kind = ?",
-                (LOCAL_LANE_KILL_SWITCH_STALLED,),
-            ).fetchall()
-        except sqlite3.Error as exc:
-            report.anom(check, f"cannot check: events.db unreadable: {exc}")
-            return
-    finally:
-        conn.close()
-
-    new_rows = 0
-    switches: set[str] = set()
-    stranded_issues: set[int] = set()
-    for ts, payload_json in rows:
-        ts_dt = parse_iso(ts)
-        if ts_dt is not None and ts_dt <= baseline:
-            continue
-        # An unparseable ts fails toward visibility (counted as new).
-        new_rows += 1
-        try:
-            payload = json.loads(payload_json)
-        except (TypeError, ValueError):
-            continue
-        if not isinstance(payload, dict):
-            continue
-        switch = payload.get("switch")
-        if switch:
-            switches.add(str(switch))
-        for n in payload.get("issue_numbers") or ():
-            if isinstance(n, int) and not isinstance(n, bool):
-                stranded_issues.add(n)
-
-    facts = f"stalled_rows={len(rows)} new_since_last_beat={new_rows}"
-    if not new_rows:
-        report.ok(check, facts)
-        return
-    detail = f"{new_rows} event(s) since last beat"
-    if switches:
-        detail += f"; disabled switch(es): {sorted(switches)}"
-    if stranded_issues:
-        detail += f"; stranded issue(s): {sorted(stranded_issues)}"
-    report.anom(check, f"{detail} ({facts})")
+    """Surface ``local_lane_kill_switch_stalled`` events as ANOMALY (#1968): a
+    stranded review/merge lane means finished work is going nowhere. Forwards
+    the event detail only; it does not re-evaluate config. Verdict:
+    ``heartbeat_alarms.eval_local_lane_stalled``."""
+    _run(
+        report,
+        repo,
+        "local_lane_kill_switch_stalled",
+        "cannot check",
+        [("SELECT ts, payload FROM events WHERE kind = ?", (LOCAL_LANE_KILL_SWITCH_STALLED,))],
+        lambda rows: _ha.eval_local_lane_stalled(repo.slug, rows, baseline),
+    )
