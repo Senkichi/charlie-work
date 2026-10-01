@@ -539,6 +539,10 @@ def test_ci_findings_header_ratio_still_matches_the_bands_own_justification() ->
     pair itself lives in ``dispatch_cadence.py`` because this module was at
     the file-size ratchet cap, so no unit was added or removed here either.
     Header is now 56 lines, total 732.
+
+    Issue #2005 added the foreign-root guard (``has_foreign_root``) inside
+    ``check_dispatch_staleness`` -- body growth within an existing unit, header
+    unchanged at 56 -- bringing the total to 739.
     """
     ci_findings_source = _CI_FINDINGS_PATH.read_text(encoding="utf-8")
     ci_findings_lines = ci_findings_source.splitlines()
@@ -559,8 +563,8 @@ def test_ci_findings_header_ratio_still_matches_the_bands_own_justification() ->
         "ci_findings.py has genuinely changed shape, the band needs re-deriving, not "
         "this guard silently loosened"
     )
-    assert len(ci_findings_lines) == 732, (
-        f"ci_findings.py is now {len(ci_findings_lines)} lines total, expected 732 -- "
+    assert len(ci_findings_lines) == 739, (
+        f"ci_findings.py is now {len(ci_findings_lines)} lines total, expected 739 -- "
         "same drift-guard rationale as the header-length assertion above"
     )
 
