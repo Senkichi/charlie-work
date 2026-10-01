@@ -75,3 +75,28 @@ def test_the_holder_replaces_one_value_under_a_lock() -> None:
     assert holder.value == GitHubRateBudget()
     holder.observe(Response(200, HEADERS, "", "http"), 100.0)
     assert holder.value.windows[0].remaining == 4000
+
+
+def _hdr(remaining: int, reset: int) -> tuple[tuple[str, str], ...]:
+    return (
+        ("x-ratelimit-limit", "5000"),
+        ("x-ratelimit-remaining", str(remaining)),
+        ("x-ratelimit-reset", str(reset)),
+    )
+
+
+@pytest.mark.parametrize(
+    ("kept", "late", "winner"),
+    [
+        ((3000, 2000), (3500, 2000), 3000),  # same window: remaining only falls
+        ((3000, 2000), (4900, 1000), 3000),  # an older window (earlier reset) is stale
+        ((3000, 2000), (2999, 2000), 2999),  # same window, lower remaining is newer
+        ((3000, 2000), (4999, 5600), 4999),  # a later reset is a new window
+        ((3000, 2000), (3000, 2000), 3000),  # identical: harmless
+    ],
+)
+def test_an_out_of_order_observation_does_not_replace_a_newer_one(kept, late, winner) -> None:
+    """r5 N5-2: concurrent responses can arrive out of order; the server's numbers decide."""
+    budget = observe_github_rate(GitHubRateBudget(), _hdr(*kept), 100.0)
+    budget = observe_github_rate(budget, _hdr(*late), 101.0)
+    assert [w.remaining for w in budget.windows] == [winner]

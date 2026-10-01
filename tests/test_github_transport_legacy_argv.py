@@ -147,6 +147,10 @@ def test_row_count_ratchet() -> None:
              "--limit", "100", "--json", "databaseId"],
             RunListRead("databaseId", workflow="CI", branch="main", status="queued", limit=100),
         ),
+        (
+            ["run", "list", "--event", "push", "--json", "databaseId"],
+            RunListRead("databaseId", event="push"),
+        ),
     ],
 )  # fmt: skip
 def test_json_rows_translate_to_dialect_reads(argv: list[str], expected: object) -> None:
@@ -241,11 +245,12 @@ def test_shim_dry_run_does_not_suppress_a_dialect_read(tmp_path: Path) -> None:
 
 
 def test_shim_serves_run_list_over_rest(tmp_path: Path) -> None:
+    """A workflow name is resolved, then its own runs route is read with the filters."""
+    workflows = {"workflows": [{"id": 5, "name": "CI"}, {"id": 6, "name": "Other"}]}
     runs = {"workflow_runs": [
         {"id": 1, "name": "CI", "status": "queued", "created_at": "t1", "head_branch": "main"},
-        {"id": 2, "name": "Other", "status": "queued", "created_at": "t2", "head_branch": "main"},
     ]}  # fmt: skip
-    gh, http, _ = make_github(tmp_path, http=FakeAdapter("http", [ok(runs)]))
+    gh, http, _ = make_github(tmp_path, http=FakeAdapter("http", [ok(workflows), ok(runs)]))
 
     result = gh.run(
         ["run", "list", "--workflow", "CI", "--branch", "main", "--status", "queued",
@@ -256,8 +261,9 @@ def test_shim_serves_run_list_over_rest(tmp_path: Path) -> None:
     assert result == [
         {"databaseId": 1, "status": "queued", "createdAt": "t1", "headBranch": "main"}
     ]
-    request = http.api_requests[0]
-    assert request.route == "repos/octo/hello/actions/runs"
+    lookup, request = http.api_requests
+    assert lookup.route == "repos/octo/hello/actions/workflows"
+    assert request.route == "repos/octo/hello/actions/workflows/5/runs"
     assert dict(request.query) == {"per_page": "100", "branch": "main", "status": "queued"}
 
 

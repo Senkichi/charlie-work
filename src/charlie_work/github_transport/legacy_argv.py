@@ -317,13 +317,13 @@ def _json_row(args: list[str], long_call: bool) -> Translated | None:
 
 
 def _run_list_row(args: list[str], long_call: bool) -> Translated | None:
-    """`gh run list [--workflow W] [--branch B] [--status S] [--limit N] --json F`."""
+    """`gh run list [--workflow W] [--branch B] [--status S] [--event E] [--limit N] --json F`."""
     from .json_read import RunListRead
 
     if len(args) < 4 or args[1] != "list" or args[-2] != "--json":
         return None
     values = _flag_values(
-        args[:-2], 2, frozenset({"--workflow", "--branch", "--status", "--limit"})
+        args[:-2], 2, frozenset({"--workflow", "--branch", "--status", "--event", "--limit"})
     )
     if values is None:
         return None
@@ -336,6 +336,7 @@ def _run_list_row(args: list[str], long_call: bool) -> Translated | None:
             workflow=_single(values, "--workflow"),
             branch=_single(values, "--branch"),
             status=_single(values, "--status"),
+            event=_single(values, "--event"),
             limit=limit,
             long_call=long_call,
         )

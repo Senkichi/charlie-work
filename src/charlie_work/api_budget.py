@@ -603,7 +603,13 @@ def observe_github_rate(
 ) -> GitHubRateBudget:
     """Return *budget* with the window named by the ``x-ratelimit-*`` headers
     replaced (or added). Headers that are absent or malformed leave the
-    budget unchanged -- an unparsable response must not erase what is known."""
+    budget unchanged -- an unparsable response must not erase what is known.
+
+    The newest observation wins, judged by the server's own numbers rather than
+    arrival order (concurrent responses can land out of order): a later
+    ``reset`` is a newer window; within one window ``remaining`` only falls, so
+    the lower value is the newer. An observation that is older by either rule
+    leaves the budget unchanged."""
     values = {name.lower(): value for name, value in headers}
     limit = _header_int(values, "x-ratelimit-limit")
     remaining = _header_int(values, "x-ratelimit-remaining")
@@ -612,6 +618,12 @@ def observe_github_rate(
         return budget
     resource = values.get("x-ratelimit-resource") or "core"
     window = GitHubRateWindow(resource, limit, remaining, reset, now)
+    current = next((w for w in budget.windows if w.resource == resource), None)
+    if current is not None and (
+        current.reset_epoch > reset
+        or (current.reset_epoch == reset and current.remaining < remaining)
+    ):
+        return budget
     kept = tuple(w for w in budget.windows if w.resource != resource)
     return GitHubRateBudget(windows=(*kept, window))
 

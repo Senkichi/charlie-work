@@ -24,7 +24,9 @@ _WELL_FORMED = re.compile(r"[\x21-\x7e]+")
 # An ``Authorization`` credential (``Bearer <x>``, or ``token <long x>``) and the
 # shapes GitHub issues (classic, OAuth, app, fine-grained).
 _AUTH_VALUE = re.compile(r"(?i)\b(?:bearer\s+\S+|token\s+[A-Za-z0-9_.\-=]{20,})")
-_TOKEN_SHAPES = re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{16,})")
+# No boundary before a shape: a foreign token glued to a letter or underscore
+# (``xghp_...``, ``GH_TOKEN_ghp_...``) is still a token.
+_TOKEN_SHAPES = re.compile(r"(?:gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{16,})")
 
 
 def is_well_formed(token: str) -> bool:

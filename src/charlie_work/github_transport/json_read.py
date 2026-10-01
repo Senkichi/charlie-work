@@ -17,12 +17,13 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, replace
 from typing import Any, Literal
+from urllib.parse import quote
 
 from . import gh_json_fields as fields_mod
 from . import gh_json_pages as pages_mod
 from .guarded import GitHubTransport
 from .outcome import FailureKind, Outcome, Response, TransportFailure
-from .pagination import MAX_PAGES, paginate_graphql
+from .pagination import MAX_PAGES, paginate_graphql, paginate_rest
 from .request import GraphQLRequest, RestRequest, canonical_json
 
 Shape = Literal["list", "view", "search", "checks"]
@@ -163,7 +164,7 @@ class JsonRead:
         if not isinstance(nodes, list):
             return _defect(f"no {connection} connection in GraphQL response")
         assert isinstance(outcome, Response)
-        completed = self._complete_all(transport, nodes)
+        completed = self._complete_all(transport, pages_mod.dedupe_by_id(nodes))
         if not isinstance(completed, list):
             return completed
         return _with_body(
@@ -209,7 +210,7 @@ class JsonRead:
             if not isinstance(node, dict):
                 return _defect(f"no pull request #{self.number} in GraphQL response")
             assert isinstance(outcome, Response)
-            contexts.extend(fields_mod.checks_contexts(node))
+            contexts = pages_mod.dedupe_by_id([*contexts, *fields_mod.checks_contexts(node)])
             cursor = fields_mod.checks_next_cursor(node)
             if cursor is None:
                 return _with_body(outcome, fields_mod.normalize_checks(contexts, self.fields))
@@ -234,21 +235,31 @@ _RUN_FIELDS = {
 }
 
 
+def _is_file_name(workflow: str) -> bool:
+    return workflow.isdigit() or workflow.endswith((".yml", ".yaml"))
+
+
 @dataclass(frozen=True)
 class RunListRead:
-    """``gh run list --json F`` as ``GET actions/runs`` (REST; B1: a read).
+    """``gh run list --json F`` as a REST read (B1: a read).
 
-    ``workflow`` matches the run's workflow name or its file name, which is
-    what ``gh run list --workflow`` accepts. gh filters before it limits, so
-    pages (100 runs each) are read until ``limit`` runs match; ``limit`` then
-    truncates. ``MAX_PAGES`` pages without enough matches is an ADAPTER_DEFECT
-    (gh fallback), never a silently short list.
+    Without ``workflow`` it reads ``GET actions/runs``. With one it resolves
+    the workflow exactly as gh does (a numeric id or ``*.yml|*.yaml`` file name
+    is used as given; anything else is matched against the repo's workflow
+    names, and must match exactly one) and reads
+    ``GET actions/workflows/{id_or_file}/runs``. Either way ``branch``,
+    ``status`` and ``event`` are server-side filters and ``per_page`` is
+    ``min(limit, 100)``, so ``limit <= 100`` is one request. The repo-wide list
+    is never filtered client-side: it pages by offset over a list that keeps
+    changing, and a shifted page repeats an entry. A ``limit`` over 100 pages
+    the filtered endpoint and drops a repeated run id.
     """
 
     fields: str
     workflow: str | None = None
     branch: str | None = None
     status: str | None = None
+    event: str | None = None
     limit: int = 20
     long_call: bool = False
 
@@ -263,22 +274,24 @@ class RunListRead:
         unknown = [c for c in columns if c not in _RUN_FIELDS]
         if unknown:
             return _defect(f"unknown run field(s): {', '.join(unknown)}")
-        filters: dict[str, Any] = {"per_page": _PAGE}
-        if self.branch:
-            filters["branch"] = self.branch
-        if self.status:
-            filters["status"] = self.status
+        route = self._route(transport)
+        if not isinstance(route, str):
+            return route
+        per_page = max(1, min(self.limit, _PAGE))
+        filters: dict[str, Any] = {"per_page": per_page}
+        for name, value in (
+            ("branch", self.branch),
+            ("status", self.status),
+            ("event", self.event),
+        ):
+            if value:
+                filters[name] = value
         wanted: list[dict[str, Any]] = []
         last: Response | None = None
         for page in range(1, MAX_PAGES + 1):
             query = filters if page == 1 else {**filters, "page": page}
             outcome = transport.send(
-                RestRequest.of(
-                    "GET",
-                    "repos/{owner}/{repo}/actions/runs",
-                    query=query,
-                    long_call=self.long_call,
-                )
+                RestRequest.of("GET", route, query=query, long_call=self.long_call)
             )
             if not isinstance(outcome, Response) or not outcome.ok:
                 return outcome
@@ -289,20 +302,41 @@ class RunListRead:
                 return _defect("actions/runs body was not a JSON object")
             if not isinstance(runs, list):
                 return _defect("actions/runs body had no workflow_runs list")
-            wanted.extend(r for r in runs if isinstance(r, dict) and self._matches(r))
-            if len(wanted) >= self.limit or len(runs) < _PAGE:
+            wanted = pages_mod.dedupe_by_id([*wanted, *(r for r in runs if isinstance(r, dict))])
+            if len(wanted) >= self.limit or len(runs) < per_page:
                 break
         else:
-            return _defect(f"actions/runs exceeded {MAX_PAGES} pages without {self.limit} matches")
+            return _defect(f"actions/runs exceeded {MAX_PAGES} pages without {self.limit} runs")
         assert last is not None
         rows = [{c: run.get(_RUN_FIELDS[c]) for c in columns} for run in wanted[: self.limit]]
         return _with_body(last, rows)
 
-    def _matches(self, run: dict[str, Any]) -> bool:
+    def _route(self, transport: GitHubTransport) -> str | TransportFailure | Response:
+        """The runs route: repo-wide, or the resolved workflow's own."""
         if not self.workflow:
-            return True
-        path = str(run.get("path") or "")
-        return self.workflow in (run.get("name"), path.rsplit("/", 1)[-1])
+            return "repos/{owner}/{repo}/actions/runs"
+        base = "repos/{owner}/{repo}/actions/workflows"
+        if _is_file_name(self.workflow):
+            return f"{base}/{quote(self.workflow, safe='')}/runs"
+        listed = paginate_rest(
+            transport,
+            RestRequest.of("GET", base, query={"per_page": _PAGE}, long_call=self.long_call),
+            items_key="workflows",
+        )
+        if not isinstance(listed, Response) or not listed.ok:
+            return listed
+        try:
+            workflows = json.loads(listed.body)
+        except ValueError:
+            return _defect("actions/workflows body was not JSON")
+        ids = [
+            w.get("id")
+            for w in workflows
+            if isinstance(w, dict) and w.get("name") == self.workflow and w.get("id") is not None
+        ]
+        if len(ids) != 1:
+            return _defect(f"{len(ids)} workflows named {self.workflow!r} (gh needs exactly one)")
+        return f"{base}/{ids[0]}/runs"
 
 
 def _with_body(outcome: Response, payload: Any) -> Response:

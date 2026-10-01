@@ -199,3 +199,11 @@ def test_redact_scrubs_a_credential_that_is_not_the_cached_token() -> None:
         out = redact(text, mine)
         assert "abcdef123456" not in out and "F" * 30 not in out and "Z" * 30 not in out, out
     assert redact("Not Found", mine) == "Not Found"
+
+
+@pytest.mark.parametrize("prefix", ["x", "_", "GH_TOKEN_", "9", "token="])
+def test_a_foreign_token_glued_to_a_word_character_is_still_redacted(prefix: str) -> None:
+    """r5 N5-1: no word boundary is required before a token shape."""
+    for body in ("ghp_" + "F" * 30, "github_pat_" + "Z" * 30, "gho_" + "Q" * 30):
+        out = redact(f"saw {prefix}{body} in text", "ghp_MINE" + "m" * 20)
+        assert body not in out and body[-20:] not in out, out

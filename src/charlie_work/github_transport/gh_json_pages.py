@@ -48,6 +48,34 @@ class IncompletePageError(ValueError):
     """A connection reports a next page the node cannot be followed to."""
 
 
+def _id_key(item: Any) -> Any:
+    """The identity of one list entry: its ``id`` (else ``databaseId``/``number``)."""
+    if isinstance(item, dict):
+        for key in ("id", "databaseId", "number"):
+            if item.get(key) is not None:
+                return (key, item[key])
+    return None
+
+
+def dedupe_by_id(items: list[Any]) -> list[Any]:
+    """*items* without a repeated id, first occurrence kept, order preserved.
+
+    A list that changes between page reads (offset paging) returns the entry
+    at the page boundary twice, and a repeated entry must not be counted or
+    acted on twice. An entry with no id is kept as is.
+    """
+    seen: set[Any] = set()
+    unique: list[Any] = []
+    for item in items:
+        key = _id_key(item)
+        if key is not None:
+            if key in seen:
+                continue
+            seen.add(key)
+        unique.append(item)
+    return unique
+
+
 def _connection(node: dict[str, Any], path: tuple[str, ...]) -> dict[str, Any] | None:
     current: Any = node
     for key in path:
@@ -112,5 +140,5 @@ def _extended(
     child = child if isinstance(child, dict) else {}
     if rest:
         return {**node, key: _extended(child, rest, fresh)}
-    nodes = [*(child.get("nodes") or []), *fresh["nodes"]]
+    nodes = dedupe_by_id([*(child.get("nodes") or []), *fresh["nodes"]])
     return {**node, key: {**child, "nodes": nodes, "pageInfo": fresh.get("pageInfo")}}
