@@ -3,7 +3,7 @@
 Every renderer that would emit an ``<a href>`` asks :func:`routed` first: a number whose
 drill-down route is not registered renders as plain text, never as a dotted-underlined
 link to a 404. The drill-down PR adds ``/repo``, ``/issue``, ``/flow``, ``/prs``,
-``/backlog``, ``/capacity`` and ``/history`` here as each lands, and the numbers become
+``/backlog`` and ``/capacity`` here as each lands (``/history`` is live), and the numbers become
 links with no renderer change. ``tests/test_dashboard_server.py`` holds the registry to
 the server in both directions (registered -> 200, known-but-unregistered view -> 404).
 
@@ -17,7 +17,7 @@ from dataclasses import dataclass
 
 # Path prefixes with a real handler. A prefix matches itself and anything below it
 # (``/now`` covers ``/now/fragment``); query strings and fragments are ignored.
-ROUTES: frozenset[str] = frozenset({"/now"})
+ROUTES: frozenset[str] = frozenset({"/now", "/history"})
 
 
 @dataclass(frozen=True)

@@ -15,7 +15,7 @@ from __future__ import annotations
 import sqlite3
 import statistics
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -89,6 +89,8 @@ class Series:
     window_end: str = ""
     bucket_seconds: int = 0
     n: int = 0  # underlying observations inside the window
+    # source -> (first, last) ts of that source's own coverage for this series' kinds
+    repo_coverage: dict[str, tuple[str, str]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -215,6 +217,7 @@ def _finish(
         window_end=q.end_iso,
         bucket_seconds=int(q.bucket.total_seconds()),
         n=n,
+        repo_coverage=dict(cov.spans),
     )
 
 

@@ -3,7 +3,8 @@
 ``make_server`` builds (never starts) the server and returns a ``ServerError`` value on
 a config problem (non-loopback host, bind failure). ``run_server`` starts the collector
 thread(s) plus the accept loop and blocks until a stop ``Event`` is set. The server never
-writes fleet state and never calls GitHub: all data comes from ``ReadModel``.
+writes fleet state and never calls GitHub: Now reads ``ReadModel``; History reads
+``dashboard.db`` read-only through the per-(tab, range) ``HistoryCache``.
 """
 
 from __future__ import annotations
@@ -18,9 +19,13 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from http.server import ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs
 
 from .config import DashboardConfig
+from .history_data import HistoryCache, history_cache, pick_range, pick_tab
+from .pages.history import render_history
 from .pages.now import render_fragment, render_now
 from .read_model import (
     Clock,
@@ -65,14 +70,17 @@ class ServerError:
 
 @dataclass(frozen=True)
 class DashboardSources:
-    """Injected data sources: the collector pass and the optional rollup pass."""
+    """Injected data sources: the collector pass, the optional rollup pass, and the
+    ``dashboard.db`` History reads (None: History says the rollup is not available)."""
 
     collect: Collect
     rollup: RollupRun | None = None
+    history_db: Path | None = None
 
 
 def default_sources(fleet_dir_override: str | None, collector_interval: float) -> DashboardSources:
     """Real fleet sources (read-only collector + alarm leaves, and the rollup)."""
+    from .. import layout
     from .alarm_feed import loop_pass_findings
     from .now_collect import collect_sources_read
     from .rollup import rollup_sources, run_rollup
@@ -85,7 +93,7 @@ def default_sources(fleet_dir_override: str | None, collector_interval: float) -
     def rollup(now: datetime) -> tuple[str, ...]:
         return run_rollup(rollup_sources(fleet_dir_override), now).errors
 
-    return DashboardSources(collect, rollup)
+    return DashboardSources(collect, rollup, layout.dashboard_db_path(override=fleet_dir_override))
 
 
 def _is_loopback_host(host: str) -> bool:
@@ -118,8 +126,16 @@ def _utcnow() -> datetime:
 class _App:
     """Per-server state the handler reads (set on the httpd instance)."""
 
-    def __init__(self, holder: ReadModel, config: DashboardConfig, clock: Clock, port: int):
+    def __init__(
+        self,
+        holder: ReadModel,
+        config: DashboardConfig,
+        clock: Clock,
+        port: int,
+        history: HistoryCache,
+    ):
         self.holder = holder
+        self.history = history
         self.config = config
         self.clock = clock
         self.allowed_hosts = frozenset({f"127.0.0.1:{port}", f"localhost:{port}"})
@@ -167,11 +183,13 @@ class _Handler(SecureHandler):
     def _route(self) -> None:
         if not self._guard():
             return
-        path = self.path.split("?", 1)[0].split("#", 1)[0]
+        path, _, query = self.path.split("#", 1)[0].partition("?")
         state = self.app.holder.get()
         poll = self.app.config.poll_interval_seconds
         if path in ("/", "/now"):
             self._html(render_now(state, poll_seconds=poll, stalled=self._stalled(state)))
+        elif path == "/history":
+            self._history(parse_qs(query))
         elif path == "/now/fragment":
             self._html(render_fragment(state, poll, self._stalled(state)))
         elif path == "/api/now.json":
@@ -208,6 +226,11 @@ class _Handler(SecureHandler):
             )
 
     do_HEAD = do_GET  # noqa: N815 - same routes, no body (see ``_send``)
+
+    def _history(self, params: dict[str, list[str]]) -> None:
+        tab = pick_tab((params.get("tab") or [None])[0])
+        range_key = pick_range((params.get("range") or [None])[0])
+        self._html(render_history(self.app.history.get(tab, range_key), tab, range_key))
 
     def _static(self, relpath: str) -> None:
         try:
@@ -254,7 +277,9 @@ def make_server(
     except OSError as exc:
         return ServerError(f"cannot bind {config.host}:{config.port}: {exc}")
     holder = ReadModel()
-    httpd.app = _App(holder, config, clock, int(httpd.server_address[1]))  # type: ignore[attr-defined]
+    history = history_cache(sources.history_db, float(config.rollup_interval_seconds), clock)
+    port = int(httpd.server_address[1])
+    httpd.app = _App(holder, config, clock, port, history)  # type: ignore[attr-defined]
     return DashboardServer(httpd, holder, config, sources, clock)
 
 

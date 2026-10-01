@@ -24,8 +24,9 @@ from .now_capacity import render_capacity, render_repo_ledger
 from .now_flow import render_flow, render_not_dispatchable
 from .now_fmt import age, esc, local_time, repo_url, short_repo
 from .now_keyhelp import key_help
+from .nav import THEME_BUTTON, views_nav
 from .now_needs import render_needs
-from .routes import VIEWS, View, live_views, routed
+from .routes import routed
 
 
 def _fresh_chip(f: RepoFreshness) -> str:
@@ -84,15 +85,6 @@ def _banner(state: ModelState) -> str:
     )
 
 
-def _view(v: View) -> str:
-    if v.href == "/now":
-        return f'<a href="/now" aria-current="page" data-go="{v.key}">{esc(v.name)}</a>'
-    if v in live_views():
-        return f'<a href="{esc(v.href)}" data-go="{v.key}">{esc(v.name)}</a>'
-    # Not built yet: plain text, not a focusable link to a 404.
-    return f'<span class="soon">{esc(v.name)} <small>(soon)</small></span>'
-
-
 def _header(state: ModelState, poll_seconds: int) -> str:
     model = state.model
     asof = (
@@ -101,15 +93,11 @@ def _header(state: ModelState, poll_seconds: int) -> str:
         if model is not None
         else '<span class="asof">collecting…</span>'
     )
-    nav = '<nav class="views" aria-label="Views">' + "".join(_view(v) for v in VIEWS) + "</nav>"
+    nav = views_nav("/now")
     fresh = _freshness(model) if model is not None else ""
-    theme_btn = (
-        '<button type="button" id="theme-toggle" class="themebtn" '
-        'aria-label="Theme: system. Activate to change.">theme: system</button>'
-    )
     return (
         '<header class="top"><div class="top-line"><h1 class="brand">Fleet '
-        f"<em>· Now</em></h1>{nav}{asof}{theme_btn}</div>{fresh}</header>"
+        f"<em>· Now</em></h1>{nav}{asof}{THEME_BUTTON}</div>{fresh}</header>"
     )
 
 

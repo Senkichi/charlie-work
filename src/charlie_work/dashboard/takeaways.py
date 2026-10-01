@@ -129,3 +129,13 @@ def takeaway(current: Series, prior: Series, *, min_sample: int = MIN_SAMPLE) ->
     text = f"{label} {arrow}{_pct(change)}% vs prior {window}"
     driver = _driver(current, prior, cur_v - pri_v, span)
     return text + (f", driven by {driver}" if driver else "") + suffix
+
+
+NO_PRIOR = "not enough data"
+
+
+def paired_takeaways(current: tuple[Series, ...], prior: tuple[Series, ...]) -> dict[str, str]:
+    """Takeaway per series name; category metrics may carry different categories per
+    window, so the pairing is by name and a series with no prior twin gets ``NO_PRIOR``."""
+    old = {s.name: s for s in prior}
+    return {s.name: takeaway(s, old[s.name]) if s.name in old else NO_PRIOR for s in current}

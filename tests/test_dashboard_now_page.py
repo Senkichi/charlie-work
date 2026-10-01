@@ -107,8 +107,8 @@ def test_header_as_of_local_time_nav_and_freshness() -> None:
     local = NOW.astimezone().strftime("%H:%M:%S")
     assert f'<time class="js-local" datetime="{NOW.isoformat()}">{local}</time>' in html_text
     assert "(local)" in html_text
-    assert '<span class="soon">History <small>(soon)</small></span>' in html_text
-    assert 'href="/history"' not in html_text  # unbuilt view: text, not a link to a 404
+    assert '<a href="/now" aria-current="page" data-go="n">Now</a>' in html_text
+    assert '<a href="/history" data-go="h">History</a>' in html_text  # registered: live
     assert 'class="chip is-warn text-warn"' in html_text and "stale</span>" in html_text
 
 
