@@ -17,9 +17,11 @@ from pathlib import Path
 import pytest
 from _fakes_github import FakeGitHub
 from charlie_work import fleet_provider_throttle as fpt
+from charlie_work import role_quota_ledger
 from charlie_work.adapters import SessionDispatchResult
 from charlie_work.config import DevinConfig, DispatchConfig, OrchestratorConfig, WorkerRoleConfig
 from charlie_work.paths import runtime_paths
+from charlie_work.role_chain import RoleEntry
 from charlie_work.state import load_state, save_state, set_throttled_until, state_lock
 from charlie_work.workflow import OrchestratorApp
 
@@ -31,11 +33,11 @@ def _iso(dt: datetime) -> str:
     return dt.replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
-def _config() -> OrchestratorConfig:
+def _config(worker: WorkerRoleConfig | None = None) -> OrchestratorConfig:
     return OrchestratorConfig(
         dispatch=DispatchConfig(default_limit=3),
         devin=DevinConfig(),
-        worker=WorkerRoleConfig(harness=ADAPTER),
+        worker=worker or WorkerRoleConfig(harness=ADAPTER),
     )
 
 
@@ -63,10 +65,18 @@ class _MultiIssueGitHub(FakeGitHub):
         ]
 
 
-def _app(tmp_path: Path, name: str, fleet: Path, *, rework: bool = False, dry_run: bool = False):
+def _app(
+    tmp_path: Path,
+    name: str,
+    fleet: Path,
+    *,
+    rework: bool = False,
+    dry_run: bool = False,
+    worker: WorkerRoleConfig | None = None,
+):
     root = tmp_path / name
     root.mkdir()
-    config = _config()
+    config = _config(worker)
     paths = runtime_paths(root, config.runtime.state_dir)
     gh = _MultiIssueGitHub(config.labels.needs_rework if rework else None)
     if rework:
@@ -102,15 +112,20 @@ def _register(fleet: Path, *paths_list) -> None:
     (fleet / "fleet.json").write_text(json.dumps({"repos": repos}), encoding="utf-8")
 
 
-def _expire_window(paths, *, minutes_ago: int = 1) -> None:
-    until = _iso(datetime.now(UTC) - timedelta(minutes=minutes_ago))
+def _expire_window(
+    paths, *, minutes_ago: int = 1, adapter_kind: str = ADAPTER, minutes_ahead: int = 0
+) -> None:
+    """Record a fleet-scoped window; expired by default, active when ``minutes_ahead``."""
+    until = _iso(
+        datetime.now(UTC) + timedelta(minutes=minutes_ahead - minutes_ago * (not minutes_ahead))
+    )
     save_state(
         paths.state_file,
         set_throttled_until(
             load_state(paths.state_file),
             until,
             reason="rate_limited",
-            adapter_kind=ADAPTER,
+            adapter_kind=adapter_kind,
             source="test",
         ),
     )
@@ -240,3 +255,104 @@ def test_live_probe_past_survival_period_opens_and_survival_is_persisted(
     stamp[ADAPTER]["probes"] = [{"pid": 0, "process_start_time": None}]
     fpt.resume_probe_path(str(fleet)).write_text(json.dumps(stamp), encoding="utf-8")
     assert fpt.decide_for_app(app).action == "open"
+
+
+# --- worker.fallbacks: the gate follows the SELECTED chain entry (issue #1993 review) ---
+
+DEVIN_PRIMARY = RoleEntry("devin-shell", "swe-2")
+CLAUDE_FALLBACK = RoleEntry("claude-code", "claude-sonnet-5-5")
+CHAINED = WorkerRoleConfig(
+    harness=DEVIN_PRIMARY.harness, model=DEVIN_PRIMARY.model, fallbacks=(CLAUDE_FALLBACK,)
+)
+
+
+@pytest.fixture
+def chained_launches(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Capture the adapter each launch actually ran on; every launch succeeds."""
+    adapters: list[str] = []
+
+    def fake_dispatch_sessions(_root, _manifest, _results, settings, requests):
+        adapters.extend(settings.adapter for _ in requests)
+        return [
+            SessionDispatchResult(
+                issue_number=r.issue_number,
+                issue_title=r.issue_title,
+                prompt_path=str(r.prompt_path),
+                branch_name=r.branch_name,
+                adapter=settings.adapter,
+                ok=True,
+                pid=os.getpid(),
+            )
+            for r in requests
+        ]
+
+    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", fake_dispatch_sessions)
+    return adapters
+
+
+def _restrict_primary() -> None:
+    """Fleet quota ledger restricts the primary, so selection lands on the fallback."""
+    assert role_quota_ledger.record_restriction(
+        DEVIN_PRIMARY.harness,
+        DEVIN_PRIMARY.model,
+        datetime.now(UTC) + timedelta(hours=1),
+        reason="quota_exhausted",
+        source="test",
+    )
+
+
+def _chained_pair(tmp_path: Path, fleet: Path, lane: str):
+    """Launching repo plus a peer repo that carries the fleet window."""
+    launching, launching_paths = _app(
+        tmp_path, "a", fleet, rework=lane == "rework", worker=CHAINED
+    )
+    _, peer_paths = _app(tmp_path, "b", fleet, rework=lane == "rework", worker=CHAINED)
+    _register(fleet, launching_paths, peer_paths)
+    _restrict_primary()
+    return launching, peer_paths
+
+
+@pytest.mark.parametrize("lane", ["dispatch", "rework"])
+def test_fleet_window_on_primary_adapter_does_not_defer_fallback_launch(
+    tmp_path: Path, chained_launches: list[str], lane: str
+) -> None:
+    fleet = tmp_path / "fleet"
+    app, peer_paths = _chained_pair(tmp_path, fleet, lane)
+    _expire_window(peer_paths, adapter_kind="devin", minutes_ahead=30)
+
+    _lane(app, lane, limit=3)
+
+    assert chained_launches
+    assert set(chained_launches) == {"claude-code"}
+
+
+@pytest.mark.parametrize("lane", ["dispatch", "rework"])
+def test_fleet_window_on_fallback_adapter_defers_fallback_launch(
+    tmp_path: Path, chained_launches: list[str], lane: str
+) -> None:
+    fleet = tmp_path / "fleet"
+    app, peer_paths = _chained_pair(tmp_path, fleet, lane)
+    _expire_window(peer_paths, adapter_kind="claude-code", minutes_ahead=30)
+
+    result = _lane(app, lane, limit=3)
+
+    assert chained_launches == []
+    assert result.ok is False
+    assert result.data["deferred_reason"] == "provider_throttled_fleet"
+
+
+@pytest.mark.parametrize("lane", ["dispatch", "rework"])
+def test_probe_stamp_records_the_launched_adapter_not_the_primary(
+    tmp_path: Path, chained_launches: list[str], lane: str
+) -> None:
+    fleet = tmp_path / "fleet"
+    app, peer_paths = _chained_pair(tmp_path, fleet, lane)
+    _expire_window(peer_paths, adapter_kind="claude-code")
+
+    _lane(app, lane, limit=3)
+
+    assert chained_launches == ["claude-code"]
+    stamp = _stamp(fleet)
+    assert "claude-code" in stamp
+    assert "devin" not in stamp
+    assert [p["pid"] for p in stamp["claude-code"]["probes"]] == [os.getpid()]

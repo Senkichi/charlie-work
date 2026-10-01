@@ -38,7 +38,7 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
@@ -75,6 +75,9 @@ class ResumeDecision:
     #: True when ``open`` was granted because a probe proved alive past the
     #: survival period and that fact is not yet persisted.
     probe_survived: bool = False
+    #: The adapter the gate was evaluated for (the launch's selected role-chain
+    #: entry); the probe stamp reuses it so gate and stamp can never disagree.
+    adapter_kind: str | None = None
 
     @property
     def deferred(self) -> bool:
@@ -262,7 +265,7 @@ def note_probe_from_results(app: Any, resume: ResumeDecision, results: Iterable[
     probes = [(r.pid, r.process_start_time) for r in results if r.ok and r.pid is not None]
     if probes:
         note_probe_launch(
-            worker_adapter_kind(app.config.worker.harness),
+            resume.adapter_kind or worker_adapter_kind(app.config.worker.harness),
             probes,
             fleet_dir_override=app.fleet_dir_override,
         )
@@ -276,8 +279,15 @@ def worker_adapter_kind(harness: str) -> str:
     return cap.adapter_kind if cap is not None else harness
 
 
-def decide_for_app(app: Any, *, now: datetime | None = None) -> ResumeDecision:
-    """Fleet gate for ``app``'s worker adapter (dispatch and rework lanes).
+def decide_for_app(
+    app: Any, *, selection: Any = None, now: datetime | None = None
+) -> ResumeDecision:
+    """Fleet gate for the worker adapter a launch will run on (dispatch and rework lanes).
+
+    ``selection`` is the permit's ``role_selection``: with ``worker.fallbacks``
+    configured the launch runs on the selected chain entry, which may not be the
+    primary, so the gate (and the decision's probe stamp) key on *that* entry's
+    adapter. Without a selection the configured primary is used.
 
     Scans this repo's own ``state.json`` plus every registered repo's.
     Reviewers are not gated here: they launch through their own harness and
@@ -291,8 +301,17 @@ def decide_for_app(app: Any, *, now: datetime | None = None) -> ResumeDecision:
         app.paths.state_file,
         *(state_file_path(d) for d in registered_state_dirs(override)),
     ]
-    adapter_kind = worker_adapter_kind(app.config.worker.harness)
-    decision = decide_launch(state_files, adapter_kind, fleet_dir_override=override, now=now)
+    adapter_kind = None
+    if selection is not None:
+        from .role_selection import selection_adapter_kind
+
+        adapter_kind = selection_adapter_kind(selection)
+    if adapter_kind is None:
+        adapter_kind = worker_adapter_kind(app.config.worker.harness)
+    decision = replace(
+        decide_launch(state_files, adapter_kind, fleet_dir_override=override, now=now),
+        adapter_kind=adapter_kind,
+    )
     if decision.probe_survived:
         note_probe_survived(adapter_kind, fleet_dir_override=override, now=now)
     return decision

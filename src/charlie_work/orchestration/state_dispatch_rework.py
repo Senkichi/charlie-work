@@ -216,7 +216,7 @@ def _dispatch_rework_impl(
     rework_limit = permit.max_launches
 
     # Issue #1993: fleet-wide window + staggered resume for this worker adapter.
-    resume = fleet_provider_throttle.decide_for_app(self)
+    resume = fleet_provider_throttle.decide_for_app(self, selection=permit.role_selection)
     if resume.deferred:
         data = {"adapter": self.config.worker.harness, "selected_count": 0}
         if gov.any_term_enabled:

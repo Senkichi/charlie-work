@@ -233,7 +233,7 @@ def _dispatch_impl(
 
     # Issue #1993: the provider limit is per account, so consult the fleet-wide
     # window (and staggered-resume probe) for this repo's worker adapter.
-    resume = fleet_provider_throttle.decide_for_app(self)
+    resume = fleet_provider_throttle.decide_for_app(self, selection=permit.role_selection)
     if resume.deferred:
         return resume.deferred_result(
             "dispatch",
