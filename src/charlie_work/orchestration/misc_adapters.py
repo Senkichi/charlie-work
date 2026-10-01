@@ -12,6 +12,7 @@ from __future__ import annotations
 from dataclasses import replace as dataclasses_replace
 
 from charlie_work.adapters import AdapterSettings
+from charlie_work.test_slots import ROLE_AGENT, arm_env
 
 
 def _adapter_settings(self, *, adapter: str | None = None) -> AdapterSettings:
@@ -39,6 +40,8 @@ def _adapter_settings(self, *, adapter: str | None = None) -> AdapterSettings:
     else:
         venv_source = None
         worker_env = {}
+    # Issue #2124: arm the host test-slot plugin; an operator worker_env key wins.
+    worker_env = {**arm_env(self.config.test_slots, role=ROLE_AGENT), **worker_env}
     return AdapterSettings(
         adapter=resolved_adapter,
         dispatch_command=devin.dispatch_command,
@@ -68,6 +71,7 @@ def _adapter_settings(self, *, adapter: str | None = None) -> AdapterSettings:
         launch_stagger_seconds=self.config.dispatch.launch_stagger_seconds,
         api_worker_config=api_worker if resolved_adapter == "api" else None,
         config=self.config,
+        role="worker" if adapter is None else "",
     )
 
 
@@ -103,7 +107,7 @@ def _rescue_adapter_settings(self) -> AdapterSettings:
         claude_command=claude.command,
         worktrees_dir=self._layout.worktrees,
         venv_source=self._resolve(claude.venv_source) if claude.venv_source else None,
-        worker_env=claude.worker_env,
+        worker_env={**arm_env(self.config.test_slots, role=ROLE_AGENT), **claude.worker_env},
         materialize_dirs=self.config.dispatch.materialize_dirs,
         dry_run=self.dry_run,
         base_ref=self.config.dispatch.base_ref,

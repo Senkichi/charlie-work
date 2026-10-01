@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any
 
 from charlie_work.process_utils import (
+    CpuPriority,
     parse_proc_stat_starttime,
     popen_worker,
     start_terminal_status_watcher,
@@ -45,7 +46,7 @@ from .config import (
     ReviewerRoleConfig,
     _DEFAULT_CLAUDE_MODEL,
 )
-from .env_sanitize import resolve_pytest_cap, resolve_uv_no_sync, sanitize_env
+from .env_sanitize import build_worker_env, resolve_pytest_cap, resolve_uv_no_sync, sanitize_env
 from .post_mortem import merge_attempt_snapshot
 from .state import _canonical_started_at, utc_now
 from .subprocess_runner import RunResult, resolve_cli_binary, run_captured
@@ -742,7 +743,7 @@ def resolve_review_effort(
     same deletion that removed the bridge itself. There is no fallback to a
     ``review_dispatch`` value here for the same reason ``devin.adapter`` was
     deleted rather than silently ignored: an old key that's still read halfway
-    is worse than one that errors loudly at load (config.py's ``_build_section``
+    is worse than one that errors loudly at load (config.py's ``validate_section``
     already rejects any surviving ``review_dispatch.review_effort*`` key as
     unknown before this function ever runs).
     """
@@ -1231,10 +1232,9 @@ def launch_claude_worker(
             provider=provider,
         )
         return _write_record(sessions_dir, record)
-    worker_env = {
-        **sanitized_env,
-        **{str(k): str(v) for k, v in (env or {}).items()},
-    }
+    # Issue #2096: harness defaults (background tasks off) sit between the
+    # sanitized base and the operator `worker_env`.
+    worker_env = build_worker_env(sanitized_env, env)
     # Issue #646: resolve what sanitize_env()+worker_env actually settled on,
     # purely for the launch-time diagnostic log below (does not affect
     # worker_env itself, which already carries the real values).
@@ -1257,6 +1257,7 @@ def launch_claude_worker(
                     try:
                         process = popen_worker(
                             command,
+                            priority=CpuPriority.BELOW_NORMAL,
                             cwd=str(worktree.path),
                             stdin=prompt_handle,
                             stdout=subprocess.PIPE,
@@ -1270,6 +1271,7 @@ def launch_claude_worker(
                 else:
                     process = popen_worker(
                         command,
+                        priority=CpuPriority.BELOW_NORMAL,
                         cwd=str(worktree.path),
                         stdin=subprocess.DEVNULL,
                         stdout=subprocess.PIPE,
@@ -1320,6 +1322,7 @@ def launch_claude_worker(
                     with prompt_path.open("r", encoding="utf-8") as prompt_handle:
                         process = popen_worker(
                             command,
+                            priority=CpuPriority.BELOW_NORMAL,
                             cwd=str(worktree.path),
                             stdin=prompt_handle,
                             stdout=log_handle,
@@ -1330,6 +1333,7 @@ def launch_claude_worker(
                 else:
                     process = popen_worker(
                         command,
+                        priority=CpuPriority.BELOW_NORMAL,
                         cwd=str(worktree.path),
                         stdin=subprocess.DEVNULL,
                         stdout=log_handle,
@@ -1662,6 +1666,12 @@ def update_worker_record_with_failure_classification(
 
     payload["failure_kind"] = resolved_kind
     _write_json_atomic(sidecar_path, payload)
+    # Issue #2086: restrict the session's own (harness, model) fleet-wide.
+    from . import role_quota_ledger
+
+    role_quota_ledger.record_classified_death(
+        payload, resolved_kind, throttled_until, source="worker_failure_classification"
+    )
     return resolved_kind, throttled_until
 
 

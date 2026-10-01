@@ -47,9 +47,11 @@ from .fleet_dispatch import (
 )
 from .supervise_loop import (
     DEFAULT_MAX_RELAUNCHES,
+    EXIT_FLEET_PAUSED,
     EXIT_RESTART_REQUESTED,
     PREFLIGHT_REFUSAL_EXIT_CODE,
 )
+from .fleet_pause import register_fleet_pause_subparsers, run_fleet_pause, run_fleet_resume
 from .fleet_paths import fleet_dir
 from .fleet_registry import _load_registry, touch_repo, count_fleet_runners
 from .fleet_status import (  # noqa: F401  (deliberate re-export)
@@ -57,7 +59,7 @@ from .fleet_status import (  # noqa: F401  (deliberate re-export)
     run_fleet_status,
 )
 from .fleet_stop import register_fleet_stop_subparser, run_fleet_stop
-from .global_config import load_layered_config
+from .global_config import load_fleet_global_config, load_layered_config
 from .github import (
     GitHub,
     GitHubError,
@@ -484,6 +486,7 @@ def build_parser() -> argparse.ArgumentParser:
     # file-size ratchet mark) — same register_*_subparser convention as the
     # *_command modules below.
     register_fleet_stop_subparser(fleet_sub)
+    register_fleet_pause_subparsers(fleet_sub)  # issue #1776
 
     runners = subparsers.add_parser("runners")
     runners_sub = runners.add_subparsers(dest="runners_command", required=True)
@@ -1240,27 +1243,19 @@ def run_fleet_work(args: argparse.Namespace) -> CommandResult:
     # Load global config for notifier integration (optional, may be None).
     # A failure here turns off every config-gated fleet behavior (notify and the
     # runner prologues), so it is reported rather than swallowed.
-    try:
-        global_config = load_layered_config(
-            Path.cwd(),
-            None,
-            fleet_dir_override=args.fleet_dir,
-            require_global=True,
-        )
-    except (ConfigError, RepoNotFoundError) as exc:
-        print(f"config load failed, fleet running without global config: {exc}", flush=True)
-        # The global layer is required, but the per-repo config is still valid
-        # and must not be discarded with it -- discarding both regresses the
-        # #623 silent-disable failure (every per-repo knob reverting to its
-        # dataclass default while passes keep reporting success). Reload
-        # without the global requirement so per-repo settings survive; only
-        # fall back to None if the per-repo load itself fails.
-        try:
-            global_config = load_layered_config(
-                Path.cwd(), None, fleet_dir_override=args.fleet_dir
-            )
-        except (ConfigError, RepoNotFoundError):
-            global_config = None
+    # The global layer is required, but the per-repo config is still valid and
+    # must not be discarded with it (#623); only a failing per-repo load too
+    # falls back to None. A host-wide ConstructionError is the one error that
+    # never degrades -- see load_fleet_global_config.
+    global_config = load_fleet_global_config(
+        load_layered_config,
+        Path.cwd(),
+        fleet_dir_override=args.fleet_dir,
+        fallback=None,
+        report=lambda exc: print(
+            f"config load failed, fleet running without global config: {exc}", flush=True
+        ),
+    )
 
     return fleet_loop(
         fleet_dir_override=args.fleet_dir,
@@ -1287,27 +1282,19 @@ def run_fleet_bash_rats(args: argparse.Namespace) -> CommandResult:
     # Load global config for notifier integration (optional, may be None).
     # A failure here turns off every config-gated fleet behavior (notify and the
     # runner prologues), so it is reported rather than swallowed.
-    try:
-        global_config = load_layered_config(
-            Path.cwd(),
-            None,
-            fleet_dir_override=args.fleet_dir,
-            require_global=True,
-        )
-    except (ConfigError, RepoNotFoundError) as exc:
-        print(f"config load failed, fleet running without global config: {exc}", flush=True)
-        # The global layer is required, but the per-repo config is still valid
-        # and must not be discarded with it -- discarding both regresses the
-        # #623 silent-disable failure (every per-repo knob reverting to its
-        # dataclass default while passes keep reporting success). Reload
-        # without the global requirement so per-repo settings survive; only
-        # fall back to None if the per-repo load itself fails.
-        try:
-            global_config = load_layered_config(
-                Path.cwd(), None, fleet_dir_override=args.fleet_dir
-            )
-        except (ConfigError, RepoNotFoundError):
-            global_config = None
+    # The global layer is required, but the per-repo config is still valid and
+    # must not be discarded with it (#623); only a failing per-repo load too
+    # falls back to None. A host-wide ConstructionError is the one error that
+    # never degrades -- see load_fleet_global_config.
+    global_config = load_fleet_global_config(
+        load_layered_config,
+        Path.cwd(),
+        fleet_dir_override=args.fleet_dir,
+        fallback=None,
+        report=lambda exc: print(
+            f"config load failed, fleet running without global config: {exc}", flush=True
+        ),
+    )
 
     # Self-deploy before running the pass: FF-pull origin/main and sync
     # dependencies when pyproject.toml/uv.lock changed. Non-fatal on a
@@ -2403,11 +2390,14 @@ def run_command(app: OrchestratorApp, args: argparse.Namespace) -> CommandResult
         # --force-rereview is the explicit opt-out. ``getattr`` because
         # run_command is also invoked with hand-built Namespaces that
         # never went through argparse (mirroring the no_cache read above).
-        if not getattr(args, "force_rereview", False):
+        force_rereview = bool(getattr(args, "force_rereview", False))
+        if not force_rereview:
             refusal = app.review_verdict_guard(args.pr)
             if refusal is not None:
                 return refusal
-        return app.review(args.pr)
+        # Issue #2081: the flag must also reach review(), which voids a
+        # live-head verdict only when forced.
+        return app.review(args.pr, force=force_rereview)
     if args.command == "verdict":
         try:
             return app.record_review(
@@ -2588,6 +2578,10 @@ def main(argv: list[str] | None = None) -> int:
                 )
             elif args.fleet_command == "stop":
                 result = run_fleet_stop(args)
+            elif args.fleet_command == "pause":
+                result = run_fleet_pause(args)
+            elif args.fleet_command == "resume":
+                result = run_fleet_resume(args)
             else:
                 result = CommandResult(False, f"unknown fleet command: {args.fleet_command}", {})
         elif args.command == "runners":
@@ -2856,6 +2850,11 @@ def main(argv: list[str] | None = None) -> int:
     # signal out of the command-name dispatch.
     if isinstance(result.data, dict) and result.data.get("preflight_refused"):
         return PREFLIGHT_REFUSAL_EXIT_CODE
+
+    # Issue #1776: an honored pause flag exits EXIT_FLEET_PAUSED (5) so the
+    # launcher log reads "paused", not "clean stop" or "crash".
+    if isinstance(result.data, dict) and result.data.get("fleet_paused"):
+        return EXIT_FLEET_PAUSED
 
     return 0 if result.ok else 1
 

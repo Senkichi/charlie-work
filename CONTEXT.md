@@ -81,6 +81,14 @@ _Avoid_: Harness, backend, driver
 The durable record of one launched worker. The orchestrator reads it back to decide the worker's fate.
 _Avoid_: Manifest, session file
 
+**Role chain**:
+The ordered list of (harness, model) entries a role may launch on: the configured primary, then its `fallbacks`. Each launch picks the first entry the quota ledger does not restrict, and records that entry on the worker's sidecar.
+_Avoid_: Waterfall (only in prose about the feature), fallback list, model rotation
+
+**Quota ledger**:
+The fleet-wide record of which (harness, model) pairs are restricted by a provider quota or rate limit, and until when. Entries are learned from a classified worker or reviewer death and keyed by what that session actually ran on, never by config. They only expire; nothing clears them early.
+_Avoid_: Throttle (the per-repo window), rate-limit cache
+
 **Rework**:
 A new worker run against an existing PR to address review findings or conflicts.
 _Avoid_: Retry, fix-up
@@ -115,6 +123,9 @@ A snapshot of the diff, checks, and metadata that a reviewer judges a PR against
 
 **Reviewer**:
 A worker launched in the review role, not the coding role.
+
+**Reviewer cap**:
+The fleet-wide limit on live reviewers (`fleet.global_max_concurrent_reviews`), counted across every registered repo and enforced under the fleet launch lock. It is separate from the worker budget (`fleet.global_max_concurrent_sessions`) and stacks on the per-repo `review_dispatch.max_concurrent_reviews`. `0` disables it.
 
 **Verdict**:
 The result of reviewing one PR head: approved, request changes, or blocked. The recorded verdict is what authorizes a merge.

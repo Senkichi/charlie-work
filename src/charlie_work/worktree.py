@@ -61,9 +61,18 @@ from .base_branch import resolve_base_branch_name  # noqa: F401  (deliberate re-
 from .non_worker_product import (  # noqa: F401  (deliberate re-export)
     _LAUNCHER_OWNED_PR_BODY_RE,
     _declared_scaffolding_matcher,
+    _dirty_reason_for_paths,
+    _is_adapter_shim_path,
     _launcher_owned_file_matcher,
     _launcher_owned_matcher,
     _non_worker_product_matcher,
+)
+from .worktree_unsafe_kinds import (  # noqa: F401  (deliberate re-export)
+    WORKTREE_UNSAFE_KIND_LOCAL_COMMITS,
+    WORKTREE_UNSAFE_KIND_SHIM_DIRT,
+    WORKTREE_UNSAFE_KIND_UNCOMMITTED_WORK,
+    WORKTREE_UNSAFE_KINDS,
+    _worktree_unsafe_kind_from_reason,
 )
 from .foreign_worktree import (  # noqa: F401  (deliberate re-export)
     OPERATOR_MARKER_KIND,
@@ -125,48 +134,6 @@ def _run_remote_captured(
     if result.timed_out:
         result = _invoke(command, cwd=cwd, timeout_seconds=_REMOTE_TIMEOUT_SECONDS)
     return result
-
-
-# Issue #807: ``worktree_unsafe`` is split at detection time into two
-# discriminable kinds, because the two triggers do not share a correct
-# response. Launch-shim dirt / adapter shim materialization (uncommitted
-# modifications) is genuinely mechanical — auto-clear and redispatch is the
-# right move. Genuine unpushed local commits on the worktree branch are a
-# judgment call — returning the issue to dispatch actively fights the safety
-# system that raised the escalation and risks a second writer on a branch
-# that already has divergent local work. The discriminator is the
-# ``dirty_reason`` string already computed at the raise site; classifying at
-# detection (rather than after the fact) makes the invalid state
-# unrepresentable.
-WORKTREE_UNSAFE_KIND_SHIM_DIRT = "worktree_unsafe_shim_dirt"
-WORKTREE_UNSAFE_KIND_LOCAL_COMMITS = "worktree_unsafe_local_commits"
-WORKTREE_UNSAFE_KINDS: frozenset[str] = frozenset(
-    {WORKTREE_UNSAFE_KIND_SHIM_DIRT, WORKTREE_UNSAFE_KIND_LOCAL_COMMITS}
-)
-
-
-def _worktree_unsafe_kind_from_reason(reason: str) -> str:
-    """Map a ``dirty_reason`` string to its ``worktree_unsafe`` sub-kind.
-
-    The reason strings are produced by ``_worktree_refuse_to_reset_reason``
-    and ``_worktree_dirty_reason``. "uncommitted modifications" denotes
-    shim/adapter dirt (mechanical); "local commit(s)" denotes genuine
-    divergence (judgment). A reason that matches neither known pattern
-    defaults to ``WORKTREE_UNSAFE_KIND_LOCAL_COMMITS`` — the fail-closed
-    classification toward judgment/human-needed — so a future reason
-    string that doesn't match either pattern escalates as a judgment
-    call rather than being silently treated as mechanical and
-    auto-cleared (which would reproduce the #807 bug the split exists to
-    prevent). This mirrors the fail-closed convention already enforced
-    for an unrecognized explicit ``kind`` in ``WorktreeUnsafeError.__init__``
-    and for an unrecognized ``reason_class`` in
-    ``state.escalation_reason_class``.
-    """
-    if "local commit" in reason:
-        return WORKTREE_UNSAFE_KIND_LOCAL_COMMITS
-    if "uncommitted modifications" in reason:
-        return WORKTREE_UNSAFE_KIND_SHIM_DIRT
-    return WORKTREE_UNSAFE_KIND_LOCAL_COMMITS
 
 
 class WorktreeUnsafeError(RuntimeError):
@@ -1963,7 +1930,16 @@ def _worker_authored_dirty(
     materialize_dirs: tuple[str, ...] = (),
 ) -> bool:
     """Return True if the worktree has uncommitted changes that are NOT
-    orchestrator scaffolding.
+    orchestrator scaffolding (see ``_worker_authored_dirty_paths``)."""
+    return bool(_worker_authored_dirty_paths(worktree_path, injected_paths, materialize_dirs))
+
+
+def _worker_authored_dirty_paths(
+    worktree_path: Path,
+    injected_paths: tuple[str, ...] = (),
+    materialize_dirs: tuple[str, ...] = (),
+) -> list[str]:
+    """Return the uncommitted paths that are NOT orchestrator scaffolding.
 
     ``injected_paths`` and ``materialize_dirs`` are worktree-relative paths
     (files or directories) that the orchestrator writes into the worktree
@@ -2010,11 +1986,11 @@ def _worker_authored_dirty(
     is_non_worker_product = _non_worker_product_matcher(
         injected_paths, materialize_dirs, include_launcher_dirs=True
     )
-    for raw_path in _parse_status_v2_paths(status_result.stdout):
-        if is_non_worker_product(raw_path):
-            continue
-        return True
-    return False
+    return [
+        raw_path
+        for raw_path in _parse_status_v2_paths(status_result.stdout)
+        if not is_non_worker_product(raw_path)
+    ]
 
 
 def _capture_worktree_work_to_rescue_ref(
@@ -2099,7 +2075,23 @@ def _capture_worktree_work_to_rescue_ref(
     ref_name = f"{RESCUE_REF_PREFIX}/{issue_part}-{timestamp}"
 
     commit_result = run_captured(
-        ["git", "commit-tree", tree_sha, "-p", head_sha, "-m", f"rescue: {issue_part}"],
+        [
+            "git",
+            # ``commit-tree`` refuses (exit 128) without a committer identity,
+            # and a host with no global ``user.name``/``user.email`` (CI, a
+            # fresh account) has none.  ``-c`` supplies one for this call only
+            # and never writes to any git config.
+            "-c",
+            "user.name=charlie-work rescue",
+            "-c",
+            "user.email=charlie-work-rescue@localhost",
+            "commit-tree",
+            tree_sha,
+            "-p",
+            head_sha,
+            "-m",
+            f"rescue: {issue_part}",
+        ],
         cwd=worktree_path,
         timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
     )
@@ -2107,7 +2099,10 @@ def _capture_worktree_work_to_rescue_ref(
         return RescueCapture(
             ref_name=None,
             commit_sha=None,
-            error=f"capture failed at commit-tree: {commit_result.error or commit_result.stderr}",
+            error="capture failed at commit-tree: "
+            + "; ".join(
+                part.strip() for part in (commit_result.error, commit_result.stderr) if part
+            ),
         )
     commit_sha = commit_result.stdout.strip()
 
@@ -2160,8 +2155,9 @@ def _worktree_refuse_to_reset_reason(
     """
     # Uncommitted modifications are only meaningful when the worktree directory exists.
     if worktree_path is not None and worktree_path.is_dir():
-        if _worker_authored_dirty(worktree_path, injected_paths, materialize_dirs):
-            return "worktree has uncommitted modifications"
+        dirty_paths = _worker_authored_dirty_paths(worktree_path, injected_paths, materialize_dirs)
+        if dirty_paths:
+            return _dirty_reason_for_paths(dirty_paths)
         local_tip_result = run_captured(
             ["git", "rev-parse", "--verify", "-q", "HEAD"],
             cwd=worktree_path,
@@ -2315,8 +2311,9 @@ def _worktree_dirty_reason(
     """
     if not worktree_path.is_dir():
         return None
-    if _worker_authored_dirty(worktree_path, injected_paths, materialize_dirs):
-        return "worktree has uncommitted modifications"
+    dirty_paths = _worker_authored_dirty_paths(worktree_path, injected_paths, materialize_dirs)
+    if dirty_paths:
+        return _dirty_reason_for_paths(dirty_paths)
     return None
 
 
@@ -2870,7 +2867,7 @@ def _worker_kind_from_recovery(recovery: dict[str, Any], config: OrchestratorCon
             kind = latest.get("kind")
             if isinstance(kind, str) and kind:
                 return kind
-    default = config.worker.harness
+    default = config.worker.harness if len(config.worker.chain) == 1 else None  # #2086
     if isinstance(default, str) and default:
         return default
     return None

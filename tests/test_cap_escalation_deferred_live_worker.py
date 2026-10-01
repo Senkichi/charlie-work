@@ -47,10 +47,6 @@ from _cap_deferral_fixtures import (
 )
 from _janitor_routing_fixtures import _set_decision
 from charlie_work.config import RescueConfig
-from charlie_work.orphaned_worker_review_drain import (
-    OrphanedWorkerReviewRoute,
-    drain_orphaned_worker_review_routes,
-)
 from charlie_work.state import load_state, save_state, state_lock
 from charlie_work.workflow import CommandResult
 
@@ -635,53 +631,39 @@ def test_janitor_cap_deferral_does_not_flip_route_candidate_to_reviewing(
 def test_orphan_drain_does_not_report_deferral_as_routed_to_review(
     tmp_path: Path,
 ) -> None:
-    """``drain_orphaned_worker_review_routes`` consumer contract: an
+    """The orphan sweep's post-lock review drain consumer contract: an
     ``ok=True`` result carrying ``escalation_deferred_live_worker`` is not
     a fresh packet either -- the issue must stay ``dispatched`` (its guard
-    status) and the drain must report drift, never
+    status) and the sweep must report drift, never
     ``orphaned_worker_routed_to_review``.
 
     Production ``review()`` cannot currently produce this shape for a
     ``dispatched`` issue -- the janitor wrapper early-returns before the
-    deferral probe for pending statuses -- so the route below drives the
+    deferral probe for pending statuses -- so the sweep below drives the
     contract with a stubbed review callback returning the deferral shape,
     the same way this file's other drain coverage stubs review(). The
     guard exists so a future ``review()`` path that surfaces the flag for
     a dispatched issue cannot silently re-introduce the reviewing flip.
     """
-    app, _fake_gh = _no_op_cap_app(
-        tmp_path, issue_extra={"status": "dispatched", **_live_worker_fields()}
-    )
-    route = OrphanedWorkerReviewRoute(
-        issue_number=123,
-        pr_number=456,
-        reviewed_head_sha="sha-abc123",
-        live_head_sha="sha-abc123",
-        fingerprint="fp-deferral",
-        reason="dead_worker_with_head_change",
-    )
+    from _orphan_sweep_fixtures import _dead_worker_rework_bed, _run_orphan_sweep
+
+    config, paths, fake_gh, _dispatched_at = _dead_worker_rework_bed(tmp_path)
+    fake_gh.prs[0]["headRefOid"] = "def456"  # head moved past the recorded verdict
 
     def deferred_review(_pr_number: int) -> CommandResult:
         return CommandResult(
             True,
             "rework cap escalation deferred: worker still live",
-            {"pr": 456, "issue": 123, "escalation_deferred_live_worker": True},
+            {"pr": 100, "issue": 207, "escalation_deferred_live_worker": True},
         )
 
-    drain_orphaned_worker_review_routes(
-        [route],
-        review_callback=deferred_review,
-        gh=app.gh,
-        config=app.config,
-        state_file=app.paths.state_file,
-        write_gate=app.write_gate,
-    )
+    _run_orphan_sweep(tmp_path, paths, config, fake_gh, review_callback=deferred_review)
 
-    state = load_state(app.paths.state_file)
-    issue = state["issues"]["123"]
+    state = load_state(paths.state_file)
+    issue = state["issues"]["207"]
     assert issue["status"] == "dispatched"
     assert _events_of_kind(state, "orphaned_worker_routed_to_review") == []
     drift_events = _events_of_kind(state, "orphaned_worker_drift")
     assert len(drift_events) == 1
     assert drift_events[0]["payload"]["routed"] is False
-    assert drift_events[0]["payload"]["issue_number"] == 123
+    assert drift_events[0]["payload"]["issue_number"] == 207

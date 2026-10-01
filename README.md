@@ -50,7 +50,8 @@ separately.
   layer turns health transitions into outbound signals.
 - **Fleet**: `charlie fleet …` composes N per-repo passes across a user-level
   repo registry under one global concurrency budget
-  (`fleet.global_max_concurrent_sessions`). Neither the supervisor nor the
+  (`fleet.global_max_concurrent_sessions` for workers,
+  `fleet.global_max_concurrent_reviews` for reviewers). Neither the supervisor nor the
   fleet is a daemon — both are invoke-per-pass, so detection latency equals
   invocation cadence.
 
@@ -211,10 +212,15 @@ when empty),
 escalates to `agent:human-needed`), `auto_merge.required_checks` (verify with
 `doctor`), `runtime.prompts_dir` (repo-local template overrides),
 `worker.harness` (`manual` | `command` | `devin-shell` | `claude-code`),
+`worker.fallbacks` / `reviewer.fallbacks` (the role chain: up to 3 ordered
+`{harness, model}` entries -- reviewer entries may add `effort` -- tried in
+order when the fleet quota ledger restricts the earlier ones; see
+[WORKFLOWS.md](docs/WORKFLOWS.md#role-chain-model-waterfall)),
 `claude_code.*` (worktree/venv settings for the claude-code adapter),
 `test_adequacy.*` (opt-in test-adequacy gate), `watchdog.*` (supervisor tripwires: stall/wall-clock/
 loop/cost-token budgets, WARN-first by default), `fleet.*`
-(`global_max_concurrent_sessions` — cross-repo worker-count budget),
+(`global_max_concurrent_sessions` — cross-repo worker-count budget;
+`global_max_concurrent_reviews` — cross-repo reviewer-count budget),
 `notify.*` (opt-in needs-attention sink: webhook | desktop | shell | file),
 `runner_allocation.*` (host-wide elastic CI-runner slots — see below),
 `runner_capacity_escalation.*` (sustained-window starvation escalation — see below),

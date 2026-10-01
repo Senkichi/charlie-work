@@ -32,6 +32,16 @@ Gate sequence -- the ONE implementation, inside
    ordered after the governor so the provider-throttled deferral payload
    carries the governor's report fields as it always has.
 
+Role chain (issue #2086): before gate 0 the worker role chain is resolved
+against the fleet quota ledger (:func:`charlie_work.role_selection.select_for_launch`).
+Every entry restricted defers ``provider_throttled`` with the chain fields; a
+per-repo throttle window the ledger fully explains is *covered* (selection
+already routed past the restricted entry) and does not block gates 0 or 4.
+The selection rides on the permit, and :func:`_launch_workers` launches the
+worker-role settings on the selected entry, stamps each launched session's
+sidecar with it, and emits ``role_fallback_selected`` past the primary. A
+length-1 chain never reads the ledger and behaves exactly as before.
+
 The fresh and remote-rework lanes mint a *pending* lock handle at their entry
 point via :func:`acquire_fleet_launch_lock` -- which does NOT touch the OS
 lock -- and hand it to :func:`issue_worker_launch_permit`; the local lane lets
@@ -56,7 +66,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
-from charlie_work import layout
+from charlie_work import layout, role_selection
 from charlie_work.adapters import AdapterSettings, SessionDispatchResult, SessionRequest
 from charlie_work.fleet_registry import try_acquire_fleet_lock
 
@@ -287,6 +297,8 @@ class WorkerLaunchPermit:
     _owns_lock: bool = field(default=False, repr=False, compare=False)
     _ledger: _LaunchLedger = field(default_factory=_LaunchLedger, repr=False, compare=False)
     _token: object = field(default=None, repr=False, compare=False)
+    # Issue #2086: the worker role-chain entry this permit launches on.
+    role_selection: Any = field(default=None, repr=False, compare=False)
 
     @property
     def clamped(self) -> bool:
@@ -308,7 +320,10 @@ class WorkerLaunchPermit:
 
 
 def acquire_fleet_launch_lock(
-    app: OrchestratorApp, *, acquire: FleetLockAcquirer = try_acquire_fleet_lock
+    app: OrchestratorApp,
+    *,
+    acquire: FleetLockAcquirer = try_acquire_fleet_lock,
+    cap: int | None = None,
 ) -> FleetLaunchLock:
     """Mint this lane's fleet-launch-lock handle -- the OS lock is NOT taken here.
 
@@ -322,9 +337,14 @@ def acquire_fleet_launch_lock(
     ``acquire`` is the lock primitive the handle will realize through; lanes
     pass their own module-level ``try_acquire_fleet_lock`` name so existing
     tests that patch it there keep intercepting. Whether a lock is required
-    is decided here, never by the caller.
+    is decided here, never by the caller. ``cap`` is the fleet-wide cap the
+    lock serializes accounting for: the worker cap by default, or the
+    reviewer cap for the review lane (issue #2084) -- both share the one
+    fleet lock file, each lane opting in only when ITS cap is enabled.
     """
-    if app.config.fleet.global_max_concurrent_sessions <= 0:
+    if cap is None:
+        cap = app.config.fleet.global_max_concurrent_sessions
+    if cap <= 0:
         return FleetLaunchLock(None, _MINT)
     return FleetLaunchLock(
         None,
@@ -362,6 +382,23 @@ def _holder_held_seconds(acquired_at: Any) -> float | None:
     return max(0.0, (datetime.now(UTC) - acquired).total_seconds())
 
 
+def fleet_lock_held_extra(app: OrchestratorApp, wait_seconds: float) -> dict[str, Any]:
+    """Payload fields for a ``fleet_lock_held`` deferral (shared by every lane).
+
+    Carries the exhausted wait budget and, best-effort, who holds the lock.
+    """
+    holder = read_fleet_lock_holder(app.fleet_dir_override)
+    extra: dict[str, Any] = {"lock_wait_seconds": wait_seconds}
+    if isinstance(holder.get("repo"), str):
+        extra["lock_holder_repo"] = holder["repo"]
+    if isinstance(holder.get("pid"), int):
+        extra["lock_holder_pid"] = holder["pid"]
+    held_seconds = _holder_held_seconds(holder.get("acquired_at"))
+    if held_seconds is not None:
+        extra["lock_held_seconds"] = held_seconds
+    return extra
+
+
 def issue_worker_launch_permit(
     app: OrchestratorApp,
     requested: int,
@@ -397,8 +434,23 @@ def issue_worker_launch_permit(
     # below, so a throttle set after this check cannot slip through. The
     # deferred payload from THAT path keeps its governor fields; a pre-check
     # deferral carries none -- the governor has not run.
+    # Issue #2086: resolve the worker role chain against the fleet quota
+    # ledger first. Every entry restricted is the chained form of "provider
+    # throttled"; a per-repo window the ledger explains is covered below.
+    selection = role_selection.select_for_launch(app.config.worker.chain)
+    if selection.exhausted:
+        return WorkerLaunchDeferral(
+            REASON_PROVIDER_THROTTLED,
+            throttled_until=selection.report_fields().get("chain_retry_at"),
+            extra=selection.report_fields(),
+        )
     pre_state = _wf.load_state(app.paths.state_file)
-    if _wf.is_throttled(pre_state):
+    if _wf.is_throttled(pre_state) and not role_selection.window_covered(
+        pre_state.get("throttled_until"),
+        selection,
+        reason=pre_state.get("throttle_reason"),
+        adapter_kind=pre_state.get("throttle_adapter_kind"),
+    ):
         return WorkerLaunchDeferral(
             REASON_PROVIDER_THROTTLED, throttled_until=pre_state.get("throttled_until")
         )
@@ -415,16 +467,9 @@ def issue_worker_launch_permit(
     wait_seconds = app.config.fleet.launch_lock_wait_seconds
     waited = launch_lock.ensure_acquired(wait_seconds)
     if waited is None:
-        holder = read_fleet_lock_holder(app.fleet_dir_override)
-        extra: dict[str, Any] = {"lock_wait_seconds": wait_seconds}
-        if isinstance(holder.get("repo"), str):
-            extra["lock_holder_repo"] = holder["repo"]
-        if isinstance(holder.get("pid"), int):
-            extra["lock_holder_pid"] = holder["pid"]
-        held_seconds = _holder_held_seconds(holder.get("acquired_at"))
-        if held_seconds is not None:
-            extra["lock_held_seconds"] = held_seconds
-        return WorkerLaunchDeferral(REASON_FLEET_LOCK_HELD, ok=True, extra=extra)
+        return WorkerLaunchDeferral(
+            REASON_FLEET_LOCK_HELD, ok=True, extra=fleet_lock_held_extra(app, wait_seconds)
+        )
 
     try:
         if live_count is None:
@@ -436,8 +481,13 @@ def issue_worker_launch_permit(
 
         with _wf.state_lock(app.paths.state_file):
             state = _wf.load_state(app.paths.state_file)
-            throttled = _wf.is_throttled(state)
             throttled_until = state.get("throttled_until")
+            throttled = _wf.is_throttled(state) and not role_selection.window_covered(
+                throttled_until,
+                selection,
+                reason=state.get("throttle_reason"),
+                adapter_kind=state.get("throttle_adapter_kind"),
+            )
     except BaseException:
         if owns_lock:
             launch_lock.release()
@@ -456,6 +506,7 @@ def issue_worker_launch_permit(
         _launch_lock=launch_lock,
         _owns_lock=owns_lock,
         _token=_MINT,
+        role_selection=selection,
     )
 
 
@@ -502,13 +553,27 @@ def _launch_workers(
             for request in requests
         ]
     permit._ledger.launched += len(requests)
+    selection = permit.role_selection
+    if selection is not None and settings.role == "worker" and selection.is_fallback:
+        # Issue #2086: worker-role settings follow the permit's chain entry;
+        # rescue-tier settings (role "") launch exactly as configured.
+        settings = role_selection.worker_settings_for(app, selection)
     _wf = _workflow()
     # Reached through the workflow re-export so test fakes that patch
     # ``charlie_work.workflow.dispatch_sessions`` keep intercepting.
-    return _wf.dispatch_sessions(
+    results = _wf.dispatch_sessions(
         app.repo_root,
         app._layout.session_manifest,
         app._layout.session_results,
         settings,
         requests,
     )
+    if selection is not None and settings.role == "worker":
+        launched = [result.issue_number for result in results if result.ok]
+        for number in launched:
+            role_selection.stamp_launch(settings.sessions_dir, number, "worker", selection)
+        if launched:
+            role_selection.emit_fallback_selected(
+                app.write_gate, role="worker", selection=selection, numbers=launched
+            )
+    return results

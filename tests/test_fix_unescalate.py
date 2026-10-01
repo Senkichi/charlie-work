@@ -94,6 +94,8 @@ def test_unescalate_escalated_open_pr_resets_and_relabels(tmp_path: Path) -> Non
             "review_dispatch_status": "review_dispatch_failed",
             "escalation_reason": "max_review_dispatch_attempts_exceeded",
             "ci_run_never_created_head": "abc123abc123",
+            "workflow_no_jobs_head": "abc123abc123",
+            "ci_absence_probed_attempts": 2,
         }
         state["issues"]["123"] = {
             "number": 123,
@@ -123,6 +125,8 @@ def test_unescalate_escalated_open_pr_resets_and_relabels(tmp_path: Path) -> Non
         "review_dispatch_status",
         "escalation_reason",
         "ci_run_never_created_head",
+        "workflow_no_jobs_head",
+        "ci_absence_probed_attempts",
     ):
         assert stale_field not in pr_entry, stale_field
 

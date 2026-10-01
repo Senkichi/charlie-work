@@ -31,10 +31,11 @@ from __future__ import annotations
 import datetime
 import json
 import logging
-from dataclasses import dataclass, fields
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
+from .config_validation import AtLeastOne, Typed
 from .fleet_paths import warn_fleet_dir_virtualization_on_write
 from . import layout
 from .instrumentation import log_event
@@ -74,51 +75,8 @@ class RunnerCapacityEscalationConfig:
     Default 15 min = three default-cadence passes.
     """
 
-    enabled: bool = True
-    starvation_escalation_minutes: int = 15
-
-
-def parse_runner_capacity_escalation(data: dict[str, Any]) -> RunnerCapacityEscalationConfig:
-    """Validate and build the ``runner_capacity_escalation`` config section.
-
-    Extracted from ``config.build_config_from_data`` so the validation lives
-    alongside the dataclass it guards. ``ConfigError`` is imported lazily to
-    avoid a circular import (``config.py`` imports this module for the
-    dataclass re-export; this module needs ``ConfigError`` from ``config.py``).
-    The same lazy-import pattern ``github.py`` already uses.
-    """
-    from .config import ConfigError
-
-    section_data = data.get("runner_capacity_escalation")
-    if not isinstance(section_data, dict):
-        section_data = {}
-    rce_enabled = section_data.get("enabled")
-    if rce_enabled is not None and not isinstance(rce_enabled, bool):
-        raise ConfigError(
-            "config section 'runner_capacity_escalation' key 'enabled' must be a bool, "
-            f"got {type(rce_enabled).__name__}"
-        )
-    rce_minutes = section_data.get("starvation_escalation_minutes")
-    if rce_minutes is not None and (
-        isinstance(rce_minutes, bool) or not isinstance(rce_minutes, int)
-    ):
-        raise ConfigError(
-            "config section 'runner_capacity_escalation' key 'starvation_escalation_minutes' "
-            f"must be an int, got {type(rce_minutes).__name__}"
-        )
-    if isinstance(rce_minutes, int) and not isinstance(rce_minutes, bool) and rce_minutes <= 0:
-        raise ConfigError(
-            "config section 'runner_capacity_escalation' key 'starvation_escalation_minutes' "
-            f"must be > 0, got {rce_minutes}"
-        )
-    valid = {f.name for f in fields(RunnerCapacityEscalationConfig)}
-    unknown = sorted(set(section_data) - valid)
-    if unknown:
-        raise ConfigError(
-            f"unknown key(s) in config section 'runner_capacity_escalation': "
-            f"{', '.join(unknown)} (valid: {', '.join(sorted(valid))})"
-        )
-    return RunnerCapacityEscalationConfig(**section_data)
+    enabled: Annotated[bool, Typed] = True
+    starvation_escalation_minutes: Annotated[int, Typed, AtLeastOne] = 15
 
 
 def _starved_repos_from_plan(plan: Any) -> list[dict[str, Any]]:

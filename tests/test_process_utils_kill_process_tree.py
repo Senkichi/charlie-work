@@ -8,6 +8,7 @@ from typing import Any
 from unittest.mock import patch
 
 import pytest
+from _run_captured_fakes import monkeypatch_run_captured
 
 from charlie_work.process_utils import (
     is_pid_alive,
@@ -307,6 +308,7 @@ def test_kill_process_tree_self_pid_exempt(monkeypatch: Any) -> None:
         return subprocess.CompletedProcess(cmd, returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(subprocess, "run", fake_subprocess_run)
+    monkeypatch_run_captured(monkeypatch, fake_subprocess_run)
 
     def fake_killpg(pgid: int, sig: int) -> None:
         kill_attempts.append((pgid, sig))
@@ -321,107 +323,122 @@ def test_kill_process_tree_self_pid_exempt(monkeypatch: Any) -> None:
     assert kill_attempts == []
 
 
-def test_kill_process_tree_enumerates_children(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_kill_process_tree_enumerates_children(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
     """Test that kill_process_tree enumerates children and kills the process tree.
 
     The assertion strategy decouples from ``kill_process_tree``'s internal
     enumeration *result*, which is best-effort by design (``_enumerate_child_pids``
     swallows transient CIM/proc failures and returns ``[]``). Under full-suite
     load the internal single-shot enumeration can fail even when the test's
-    retry-loop enumeration succeeded, so asserting ``child_pid in killed``
-    couples two independent enumerations and flakes (#608, #681, #1064).
+    setup enumeration succeeded, so asserting ``child_pid in killed`` couples
+    two independent enumerations and flakes (#608, #681, #1064).
 
     Instead we verify three things:
     1. The parent PID is in ``killed`` (the kill was reported).
     2. ``kill_process_tree`` called ``_enumerate_child_pids`` (enumeration was
        attempted — structural, via spy). Catches a regression that removes the
        enumeration call.
-    3. Each enumerated child is actually dead (behavioral). ``taskkill /T``
-       (Windows) or ``killpg`` (POSIX) kills the tree regardless of enumeration,
-       so this is the reliable signal that the tree kill worked.
+    3. The child the parent *reports* is dead (behavioral). The report is the
+       ground truth of which process is the child: a ``ParentProcessId`` match
+       can also name a stranger holding a pid recycled from a dead parent
+       (stale ppid; Windows never reparents — the same recycled-pid family as
+       #2057), and asserting on an enumerated-but-unrelated pid was a source of
+       the "child still alive" flake (#2059). Liveness is checked with a
+       start-time fingerprint so a pid recycled onto a new process after its
+       death cannot read alive either.
     """
-    # Spawn a real parent process that will spawn a child
-    # On POSIX, use start_new_session=True to avoid sharing pytest's process group
-    # The parent imports ``sys`` before referencing ``sys.executable``; without it
-    # the parent crashes with NameError before spawning the child, and the test
-    # silently no-ops via the empty-children skip path (a false positive).
+    import logging
+    import threading
+    import time
+
+    import charlie_work.process_utils as _pu
+
+    # Spawn a real parent process that will spawn a child and print the child's
+    # pid on stdout -- the test then asserts on that pid, not on whichever pids
+    # a ppid match happened to return. On POSIX use start_new_session=True to
+    # avoid sharing pytest's process group.
     #
-    # The sleeps must outlast the enumeration deadline below by a wide margin.
-    # They previously matched it exactly (both 10s), so under full-suite CPU
+    # ``sys._base_executable`` (fall back to ``sys.executable``) skips the
+    # uv-managed venv trampoline: under uv, ``sys.executable`` is a trampoline
+    # whose spawned interpreter is a *child* of the pid ``Popen`` returns, so
+    # the real parent was one level down and the sleeper a grandchild -- extra
+    # layers inside the enumerate->kill window this test exists to exercise.
+    # Spawning the base interpreter directly gives the intended two-level tree.
+    #
+    # The sleeps must outlast the setup deadline below by a wide margin. They
+    # previously matched it exactly (both 10s), so under full-suite CPU
     # contention a child that took several seconds to become visible left the
-    # parent with almost no lifetime remaining: it exited between the retry
-    # loop and ``kill_process_tree``, ``taskkill`` found nothing to kill, and
-    # the test failed on an empty ``killed`` list rather than skipping. Both
-    # processes are terminated explicitly below and in ``finally``, so a long
-    # sleep costs nothing -- nothing here waits for them to expire on their own.
+    # parent with almost no lifetime remaining: it exited between enumeration
+    # and ``kill_process_tree``, and the test failed on an empty ``killed``
+    # list rather than skipping. Both processes are terminated explicitly
+    # below and in ``finally``, so a long sleep costs nothing.
+    python = getattr(sys, "_base_executable", sys.executable)
     parent_proc = subprocess.Popen(
         [
-            sys.executable,
+            python,
             "-c",
             "import subprocess, sys, time; "
-            "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)']); "
+            "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)']); "
+            "print(f'CHILD {child.pid}', flush=True); "
             "time.sleep(120)",
         ],
-        stdout=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
+        text=True,
         start_new_session=(os.name != "nt"),
     )
 
     # Bound outside the ``try`` so the ``finally`` cleanup can always read it,
-    # including when a skip fires before the retry loop assigns it.
-    child_pids: list[int] = []
+    # including when a skip fires before the setup assigns it.
+    child_pid: int | None = None
 
     try:
-        import time
+        # Read the child's pid from the parent's stdout. A thread is required:
+        # ``readline`` blocks until the parent prints, and the parent may take
+        # seconds to spawn the child under full-suite CPU contention. A bounded
+        # join distinguishes "not yet printed" from "parent died / pipe broken".
+        reported: list[int] = []
 
-        from charlie_work.process_utils import _enumerate_child_pids
+        def _read_reported_child() -> None:
+            assert parent_proc.stdout is not None
+            parts = parent_proc.stdout.readline().split()
+            if len(parts) == 2 and parts[0] == "CHILD" and parts[1].isdigit():
+                reported.append(int(parts[1]))
 
-        # Poll for the child to appear instead of sampling once. Under full-suite
-        # CPU contention the child may not be visible to a single CIM/proc
-        # snapshot immediately, and on Windows the enumeration itself may
-        # transiently time out and return ``[]`` (swallowed by design). A bounded
-        # retry distinguishes "child not yet visible" (keep waiting) from "no
-        # child was spawned / enumeration failed" (skip), avoiding a spurious
-        # assertion failure on unrelated PRs. See issue #608.
-        deadline = time.monotonic() + 10.0
-        while time.monotonic() < deadline:
+        reader = threading.Thread(target=_read_reported_child, daemon=True)
+        reader.start()
+        reader.join(timeout=10.0)
+        if not reported:
             if parent_proc.poll() is not None:
-                pytest.skip(f"parent process {parent_proc.pid} exited before spawning a child")
-            child_pids = _enumerate_child_pids(parent_proc.pid)
-            if child_pids:
-                break
-            time.sleep(0.25)
-
-        if not child_pids:
+                pytest.skip(f"parent process {parent_proc.pid} exited before reporting a child")
             pytest.skip(
-                f"no child of parent {parent_proc.pid} became visible within "
-                f"the deadline; enumeration may have failed under load"
+                f"parent process {parent_proc.pid} did not report a child pid within the deadline"
             )
+        child_pid = reported[0]
 
-        # Re-check liveness immediately before the kill. The retry loop above
-        # only proves the parent was alive when enumeration started; a parent
-        # that died in between leaves nothing for the platform kill to find and
-        # returns an empty list, which would fail the assertion below for a
-        # reason that has nothing to do with child enumeration. Skipping here
-        # keeps that failure mode legible instead of surfacing as
-        # ``assert <pid> in []``.
-        if parent_proc.poll() is not None:
+        # Fingerprint the reported child so the post-kill liveness check is
+        # pinned to this exact process: a pid recycled onto a new process after
+        # the real child's death must not satisfy "still alive" OR "alive at
+        # assert time" (the recycled-pid failure shape, #2057/#2059).
+        from charlie_work.process_utils import get_process_start_time
+
+        child_start = get_process_start_time(child_pid)
+        if child_start is None:
+            pytest.skip(f"could not read reported child {child_pid}'s start time")
+        if parent_proc.poll() is not None or not is_pid_alive(child_pid, child_start):
             pytest.skip(
-                f"parent process {parent_proc.pid} exited between enumeration and kill; "
-                f"cannot assert on the killed set"
+                f"fixture died before the kill (parent={parent_proc.poll()}, child={child_pid})"
             )
 
         # Spy on ``_enumerate_child_pids`` to verify ``kill_process_tree`` calls
-        # it (structural assertion). The spy is installed AFTER the retry loop
-        # above, which imported ``_enumerate_child_pids`` into a local name --
-        # monkeypatching the module attribute only affects ``kill_process_tree``'s
-        # module-level reference, not the retry loop's already-bound local. This
-        # lets us distinguish ``kill_process_tree``'s internal call from the
-        # retry loop's calls. The internal enumeration's *result* is best-effort
-        # (can return ``[]`` under load), so we assert on the *call*, not the
-        # result -- a regression that removes the enumeration call fails here.
-        import charlie_work.process_utils as _pu
-
+        # it (structural assertion). The patched module attribute is resolved
+        # by ``kill_process_tree`` at call time -- inside this test it is only
+        # used for ``finally`` cleanup, which is unaffected by the monkeypatch.
+        # The internal enumeration's *result* is best-effort (can return ``[]``
+        # under load), so we assert on the *call*, not the result -- a
+        # regression that removes the enumeration call fails here.
         enumerate_calls: list[int] = []
         _real_enumerate = _pu._enumerate_child_pids
 
@@ -431,11 +448,20 @@ def test_kill_process_tree_enumerates_children(monkeypatch: pytest.MonkeyPatch) 
 
         monkeypatch.setattr(_pu, "_enumerate_child_pids", _spy_enumerate)
 
-        # Kill the parent process tree
-        killed = kill_process_tree(parent_proc.pid, expected_start_time=None)
+        # Kill the parent process tree. ``caplog`` captures kill_process_tree's
+        # warnings so a future failure is self-diagnosing: a "refused pid"
+        # warning exposes the #2057-style stale-parent-PID refusal, a taskkill
+        # failure surfaces the platform kill, and the *absence* of warnings
+        # points at the tree-kill-reach path itself.
+        with caplog.at_level(logging.WARNING, logger="charlie_work"):
+            killed = kill_process_tree(parent_proc.pid, expected_start_time=None)
+        warnings = "; ".join(r.getMessage() for r in caplog.records) or "<none>"
 
         # 1. The parent PID must be in the killed list (kill was reported).
-        assert parent_proc.pid in killed
+        assert parent_proc.pid in killed, (
+            f"parent {parent_proc.pid} not in killed={killed}; "
+            f"kill_process_tree warnings: {warnings}"
+        )
 
         # 2. ``kill_process_tree`` must call ``_enumerate_child_pids`` with the
         #    parent PID (enumeration was attempted). This catches a regression
@@ -445,29 +471,29 @@ def test_kill_process_tree_enumerates_children(monkeypatch: pytest.MonkeyPatch) 
         #    best-effort and transiently empty under load (#1064).
         assert parent_proc.pid in enumerate_calls, (
             f"kill_process_tree did not call _enumerate_child_pids for "
-            f"parent {parent_proc.pid}; enumeration was skipped"
+            f"parent {parent_proc.pid}; enumeration was skipped; "
+            f"kill_process_tree warnings: {warnings}"
         )
 
-        # 3. Behavioral assertion: each enumerated child must be actually dead.
+        # 3. Behavioral assertion: the reported child must be actually dead.
         #    ``taskkill /T`` (Windows) or ``killpg`` (POSIX) kills the tree
         #    regardless of enumeration, so child liveness is the reliable signal
-        #    that the tree kill worked. A bounded retry accommodates kill-signal
-        #    propagation latency under load. This catches a regression that
-        #    breaks the tree kill (e.g. dropping ``/T`` from ``taskkill``) while
-        #    being immune to the enumeration-result race that flaked the prior
-        #    assertion (``assert child_pid in killed``).
-        for child_pid in child_pids:
-            child_dead = False
-            child_deadline = time.monotonic() + 5.0
-            while time.monotonic() < child_deadline:
-                if not is_pid_alive(child_pid):
-                    child_dead = True
-                    break
-                time.sleep(0.1)
-            assert child_dead, (
-                f"child {child_pid} still alive after kill_process_tree; "
-                f"tree kill did not reach the child"
-            )
+        #    that the tree kill worked. The fingerprint pins identity so a
+        #    recycled pid cannot read alive; a bounded wait accommodates
+        #    kill-signal propagation latency under load.
+        child_dead = False
+        child_deadline = time.monotonic() + 5.0
+        while time.monotonic() < child_deadline:
+            if not is_pid_alive(child_pid, child_start):
+                child_dead = True
+                break
+            time.sleep(0.1)
+        assert child_dead, (
+            f"child {child_pid} still alive after kill_process_tree; "
+            f"tree kill did not reach the child; killed={killed}; "
+            f"parent_poll={parent_proc.poll()}; "
+            f"kill_process_tree warnings: {warnings}"
+        )
     finally:
         # Clean up if still alive
         if parent_proc.poll() is None:
@@ -476,12 +502,250 @@ def test_kill_process_tree_enumerates_children(monkeypatch: pytest.MonkeyPatch) 
 
         # ``parent_proc.terminate()`` does not reap the grandchild, and the
         # sleeps are long enough now that a skipped run would otherwise leave
-        # it resident on the runner for two minutes. Reap any child the
-        # enumeration found; on the assertion path they are already dead, so
-        # this is a no-op there. Best-effort by design -- a failure to clean up
-        # a stray sleep must not mask the test's own result.
-        for stray_pid in child_pids:
+        # it resident on the runner for two minutes. Reap the reported child;
+        # on the assertion path it is already dead, so this is a no-op there.
+        # Best-effort by design -- a failure to clean up a stray sleep must not
+        # mask the test's own result.
+        if child_pid is not None:
             try:
-                os.kill(stray_pid, signal.SIGTERM)
+                os.kill(child_pid, signal.SIGTERM)
             except OSError:
                 pass
+
+
+def _stub_kill_env(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    children: list[int],
+    alive: dict[int, bool],
+    starts: dict[int, float | None],
+    taskkill_calls: list[list[str]],
+) -> None:
+    """Install the process_utils seams ``kill_process_tree`` touches.
+
+    ``children`` is the enumeration result; ``starts`` is pid -> start-time
+    fingerprint (what ``get_process_start_time`` returns). ``alive`` is pid ->
+    liveness as ``is_pid_alive`` sees it. ``taskkill_calls`` records every
+    command handed to ``run_captured``; the default stub models the platform
+    faithfully -- a ``/T`` kill takes the target's enumerated children with it.
+    """
+
+    import charlie_work.process_utils as _pu
+
+    def fake_enumerate(pid: int) -> list[int]:
+        return list(children)
+
+    def fake_start(pid: int) -> float | None:
+        return starts.get(pid)
+
+    def fake_alive(pid: int, expected_start_time: float | None = None) -> bool:
+        if not alive.get(pid, False):
+            return False
+        if expected_start_time is not None:
+            current = starts.get(pid)
+            return current is not None and abs(current - expected_start_time) <= 1.0
+        return True
+
+    def fake_run_captured(command: list[str], **_kwargs: Any) -> RunResult:
+        taskkill_calls.append(list(command))
+        # taskkill /T kills the tree: the target plus its enumerated children.
+        try:
+            killed_pid = int(command[-1])
+        except (ValueError, IndexError):
+            killed_pid = -1
+        if killed_pid in alive:
+            alive[killed_pid] = False
+            if "/T" in command:
+                for child in children:
+                    alive[child] = False
+        return RunResult(returncode=0, stdout="", stderr="", error=None)
+
+    monkeypatch.setattr(_pu, "_enumerate_child_pids", fake_enumerate)
+    monkeypatch.setattr(_pu, "get_process_start_time", fake_start)
+    monkeypatch.setattr(_pu, "is_pid_alive", fake_alive)
+    monkeypatch.setattr(_pu, "run_captured", fake_run_captured)
+    monkeypatch.setattr(_pu.os, "name", "nt", raising=False)
+
+
+def test_kill_process_tree_reaps_survivor_when_root_died_before_taskkill(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Root dies between enumeration and taskkill: the tree kill kills nothing
+    (taskkill exits 128 on a dead root -- verified platform behavior), so a
+    verified-alive child is reaped individually and then recorded (#2059)."""
+    import charlie_work.process_utils as _pu
+
+    root, child = 60001, 60002
+    children = [child]
+    alive = {root: False, child: True}
+    starts = {root: 1000.0, child: 2000.0}
+    taskkill_calls: list[list[str]] = []
+    _stub_kill_env(
+        monkeypatch,
+        children=children,
+        alive=alive,
+        starts=starts,
+        taskkill_calls=taskkill_calls,
+    )
+
+    # Root already dead by the time taskkill runs: "not found", rc=128, and the
+    # /T traversal has no live root to walk -- the child is untouched.
+    def dead_root_run_captured(command: list[str], **_kwargs: Any) -> RunResult:
+        taskkill_calls.append(list(command))
+        if int(command[-1]) == root:
+            return RunResult(returncode=128, stdout="", stderr="not found", error="exit 128")
+        alive[int(command[-1])] = False
+        return RunResult(returncode=0, stdout="", stderr="", error=None)
+
+    monkeypatch.setattr(_pu, "run_captured", dead_root_run_captured)
+
+    killed = kill_process_tree(root, expected_start_time=None)
+
+    assert killed == [root, child]
+    assert ["taskkill", "/T", "/F", "/PID", str(child)] in taskkill_calls
+
+
+def test_kill_process_tree_records_child_dead_with_root_without_extra_kill(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A child that died with the tree kill is recorded without an individual kill."""
+    root, child = 60011, 60012
+    children = [child]
+    alive = {root: True, child: True}
+    starts = {root: 1000.0, child: 2000.0}
+    taskkill_calls: list[list[str]] = []
+    _stub_kill_env(
+        monkeypatch,
+        children=children,
+        alive=alive,
+        starts=starts,
+        taskkill_calls=taskkill_calls,
+    )
+
+    killed = kill_process_tree(root, expected_start_time=None)
+
+    assert killed == [root, child]
+    assert taskkill_calls == [["taskkill", "/T", "/F", "/PID", str(root)]]
+
+
+def test_kill_process_tree_refuses_unpinned_surviving_child(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A survivor with no start-time fingerprint can't be identity-pinned, so
+    it is never individually killed nor recorded -- a bare-pid kill could hit a
+    stranger holding a recycled pid (#2059)."""
+    import logging
+
+    import charlie_work.process_utils as _pu
+
+    root, child = 60021, 60022
+    children = [child]  # enumeration could not fingerprint it
+    alive = {root: True, child: True}
+    starts = {root: 1000.0, child: None}
+    taskkill_calls: list[list[str]] = []
+    _stub_kill_env(
+        monkeypatch,
+        children=children,
+        alive=alive,
+        starts=starts,
+        taskkill_calls=taskkill_calls,
+    )
+    # The tree kill spares the child (e.g. it could not be terminated).
+    alive[child] = True
+
+    def sparing_run_captured(command: list[str], **_kwargs: Any) -> RunResult:
+        taskkill_calls.append(list(command))
+        if int(command[-1]) == root:
+            alive[root] = False
+        return RunResult(returncode=0, stdout="", stderr="", error=None)
+
+    monkeypatch.setattr(_pu, "run_captured", sparing_run_captured)
+
+    with caplog.at_level(logging.WARNING, logger="charlie_work"):
+        killed = kill_process_tree(root, expected_start_time=None)
+
+    assert killed == [root]
+    assert ["taskkill", "/T", "/F", "/PID", str(child)] not in taskkill_calls
+    assert any("no start-time fingerprint" in r.getMessage() for r in caplog.records)
+
+
+def test_kill_process_tree_refuses_child_predating_its_parent(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A 'child' created before its alleged parent is a stale-ParentProcessId
+    artifact (a pid recycled onto an unrelated process -- Windows never
+    reparents). It is refused, warned about, and not recorded (#2059)."""
+    import logging
+
+    import charlie_work.process_utils as _pu
+
+    root, phantom = 60031, 60032
+    children = [phantom]  # "child" predates root's start of 1000.0
+    alive = {root: True, phantom: True}
+    starts = {root: 1000.0, phantom: 500.0}
+    taskkill_calls: list[list[str]] = []
+    _stub_kill_env(
+        monkeypatch,
+        children=children,
+        alive=alive,
+        starts=starts,
+        taskkill_calls=taskkill_calls,
+    )
+    # The platform kill does not reach the phantom (protected or its own tree).
+    alive[phantom] = True
+
+    def sparing_run_captured(command: list[str], **_kwargs: Any) -> RunResult:
+        taskkill_calls.append(list(command))
+        if int(command[-1]) == root:
+            alive[root] = False
+        return RunResult(returncode=0, stdout="", stderr="", error=None)
+
+    monkeypatch.setattr(_pu, "run_captured", sparing_run_captured)
+
+    with caplog.at_level(logging.WARNING, logger="charlie_work"):
+        killed = kill_process_tree(root, expected_start_time=None)
+
+    assert killed == [root]
+    assert ["taskkill", "/T", "/F", "/PID", str(phantom)] not in taskkill_calls
+    assert any("stale ParentProcessId" in r.getMessage() for r in caplog.records)
+
+
+def test_kill_process_tree_refuses_enumerated_caller_ancestor(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An enumerated 'child' naming a caller ancestor gets the same #1842
+    refusal as the root: a stale ppid can name an ancestor, and killing it
+    would fell this process's own subtree."""
+    import logging
+
+    import charlie_work.process_utils as _pu
+
+    root, ancestor = 60041, 60042
+    children = [ancestor]
+    alive = {root: True, ancestor: True}
+    starts = {root: 1000.0, ancestor: 2000.0}
+    taskkill_calls: list[list[str]] = []
+    _stub_kill_env(
+        monkeypatch,
+        children=children,
+        alive=alive,
+        starts=starts,
+        taskkill_calls=taskkill_calls,
+    )
+    monkeypatch.setattr(_pu, "_self_ancestor_pids", lambda: frozenset({ancestor}))
+    alive[ancestor] = True
+
+    def sparing_run_captured(command: list[str], **_kwargs: Any) -> RunResult:
+        taskkill_calls.append(list(command))
+        if int(command[-1]) == root:
+            alive[root] = False
+        return RunResult(returncode=0, stdout="", stderr="", error=None)
+
+    monkeypatch.setattr(_pu, "run_captured", sparing_run_captured)
+
+    with caplog.at_level(logging.WARNING, logger="charlie_work"):
+        killed = kill_process_tree(root, expected_start_time=None)
+
+    assert killed == [root]
+    assert ["taskkill", "/T", "/F", "/PID", str(ancestor)] not in taskkill_calls
+    assert any("caller ancestor" in r.getMessage() for r in caplog.records)

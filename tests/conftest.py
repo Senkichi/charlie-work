@@ -355,6 +355,47 @@ def _no_real_pr_create_retry_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(pr_create_retry_module, "_default_sleep", lambda seconds: None)
 
 
+_SHORT_BASETEMP: Path | None = None
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Keep pytest's temp root short on Windows so real ``git worktree add`` works.
+
+    Under a deep checkout (worker worktrees) pytest's default
+    ``pytest-of-<user>/pytest-N/<test-name>`` nesting pushes salvage-test paths
+    past what git accepts (``fatal: '$GIT_DIR' too big``). Only applies when no
+    ``--basetemp`` was given (xdist workers always get one).
+    """
+    global _SHORT_BASETEMP
+    if os.name != "nt" or config.option.basetemp is not None:
+        return
+    # Not ``tempfile.gettempdir()``: workers export TMPDIR inside the worktree.
+    root = Path(os.environ.get("LOCALAPPDATA", "")) / "Temp"
+    _SHORT_BASETEMP = Path(
+        _tempfile_module.mkdtemp(prefix="t", dir=root if root.is_dir() else None)
+    )
+    config.option.basetemp = str(_SHORT_BASETEMP)
+
+
+def pytest_unconfigure(config: pytest.Config) -> None:
+    if _SHORT_BASETEMP is not None:
+        shutil.rmtree(_SHORT_BASETEMP, ignore_errors=True)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_closing_link_recheck_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Never let ``closing_reference.probe_closing_link`` really sleep (cw#1868).
+
+    Its re-probe pauses (~13s) only elapse on an unlinked reading, but every
+    pre-existing salvage test with a mismatched ``closingIssuesReferences``
+    would otherwise pay them. Patches the module-local ``_default_sleep``
+    (not the shared ``time.sleep``, see ``_no_real_pr_create_retry_sleep``).
+    """
+    import charlie_work.closing_reference as closing_reference_module
+
+    monkeypatch.setattr(closing_reference_module, "_default_sleep", lambda seconds: None)
+
+
 @pytest.fixture(autouse=True)
 def _no_real_host_load_probe(monkeypatch: pytest.MonkeyPatch) -> None:
     """Never let a governor's host-load probe spawn a real process listing.
@@ -420,3 +461,15 @@ def _default_healthy_preflight(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     monkeypatch.setattr("charlie_work.workflow.run_preflight", _healthy_preflight)
     monkeypatch.setattr("charlie_work.fleet_dispatch.run_preflight", _healthy_preflight)
+
+
+@pytest.fixture(autouse=True)
+def _no_live_self_deploy_history(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Issue #2103: the reviewer reap reads the orchestrator's own ``events.db``
+    for ``self_deploy_succeeded``. On a host with deploy history that would
+    reclassify every fixture reviewer (started in the past) as deploy-interrupted,
+    so tests see no deploy store unless they opt in by patching this seam."""
+    monkeypatch.setattr(
+        "charlie_work.orchestration.misc_review_verdicts.self_deploy_state_path",
+        lambda: None,
+    )

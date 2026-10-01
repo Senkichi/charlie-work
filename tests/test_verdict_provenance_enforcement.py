@@ -793,13 +793,15 @@ def test_review_decision_write_sites_collects_bare_name_form() -> None:
 # are 2 (one ``record_review`` call + one ``record_local_review`` call).
 _EXPECTED_RECORD_REVIEW_PROVENANCE_BY_SITE: dict[tuple[str, str], Counter[str]] = {
     ("workflow.py", "review"): Counter({"ci_gate_auto_reject": 2, "test_adequacy_auto_reject": 1}),
-    ("misc_review_verdicts.py", "_reap_review_verdicts"): Counter({"fresh_llm_review": 2}),
+    ("misc_review_verdicts.py", "_reap_dead_reviewer"): Counter({"fresh_llm_review": 2}),
     ("instrumentation_ops.py", "_reconcile_stranded_verdicts"): Counter(
         {"stranded_reconciliation": 2}
     ),
     ("state_rescue.py", "_process_rescue_review"): Counter({"rescue_review": 1}),
     ("cli.py", "run_command"): Counter({"operator_manual": 1}),
     ("local_lanes.py", "_local_build_packet"): Counter({"test_adequacy_auto_reject": 1}),
+    # issue #1681: the workflow_no_jobs rework route, extracted from review().
+    ("reap_dispatch.py", "_route_workflow_no_jobs"): Counter({"ci_gate_auto_reject": 1}),
 }
 
 
@@ -840,14 +842,14 @@ def test_record_review_call_sites_map_to_expected_provenance_literal() -> None:
     # Positive control: the table itself must cover all known call sites --
     # an accidentally-empty expected table would make the equality assertion
     # above vacuously true if `actual` were also empty (e.g. a scanner
-    # regression that stopped matching anything). 7 ``record_review`` sites
+    # regression that stopped matching anything). 8 ``record_review`` sites
     # plus 3 ``record_local_review`` sites (issue #1844's local lane:
     # _reap_review_verdicts, _reconcile_stranded_verdicts, and
     # _local_build_packet's test-adequacy auto-reject).
     total_sites = sum(
         sum(counter.values()) for counter in _EXPECTED_RECORD_REVIEW_PROVENANCE_BY_SITE.values()
     )
-    assert total_sites == 10, _EXPECTED_RECORD_REVIEW_PROVENANCE_BY_SITE
+    assert total_sites == 11, _EXPECTED_RECORD_REVIEW_PROVENANCE_BY_SITE
 
 
 # ---------------------------------------------------------------------------

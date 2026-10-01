@@ -110,7 +110,7 @@ def test_launch_claude_worker_routes_creationflags_through_hidden_console_kwargs
     with (
         patch("subprocess.Popen", side_effect=capture_popen),
         patch(
-            "charlie_work.process_utils.hidden_console_kwargs",
+            "charlie_work.worker_launch.hidden_console_kwargs",
             return_value=sentinel_kwargs,
         ) as mock_helper,
     ):
@@ -123,8 +123,12 @@ def test_launch_claude_worker_routes_creationflags_through_hidden_console_kwargs
             command_template=(sys.executable, "-c", "pass"),
         )
 
-    expected_group_flag = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-    mock_helper.assert_called_once_with(expected_group_flag)
+    # Agent sessions launch BELOW_NORMAL so their test suites yield the CPU
+    # to the merge gate (CpuPriority); the class composes into the same flags.
+    expected_flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(
+        subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0
+    )
+    mock_helper.assert_called_once_with(expected_flags)
     assert popen_calls, "expected at least one Popen call from the worker launch"
     assert popen_calls[0].get("creationflags") == subprocess.CREATE_NEW_CONSOLE
     assert popen_calls[0].get("startupinfo") is startupinfo

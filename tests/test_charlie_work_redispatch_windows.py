@@ -230,9 +230,6 @@ def test_redispatch_at_only_written_by_known_call_sites(tmp_path: Path) -> None:
     dispatch_selection_path = (
         Path(__file__).parents[1] / "src" / "charlie_work" / "dispatch_selection.py"
     )
-    dead_worker_reap_path = (
-        Path(__file__).parents[1] / "src" / "charlie_work" / "dead_worker_reap.py"
-    )
     state_dispatch_rework_path = (
         Path(__file__).parents[1]
         / "src"
@@ -258,16 +255,24 @@ def test_redispatch_at_only_written_by_known_call_sites(tmp_path: Path) -> None:
                     count += 1
         return count
 
+    # dead-worker sweep rewrite (wave B, M9): the dead-session lane's no-open-PR
+    # relabel writer moved into the ``dead_worker_sweep`` package
+    # (dead_sessions_reclaim.py); the scan covers every module in it so a NEW
+    # writer there still fails here.
+    sweep_paths = sorted(
+        (Path(__file__).parents[1] / "src" / "charlie_work" / "dead_worker_sweep").glob("*.py")
+    )
+
     # Any unexpected increase means a new call site is writing redispatch_at.
     redispatch_assignments = (
         _count_redispatch_at_assignments(workflow_path)
         + _count_redispatch_at_assignments(dispatch_selection_path)
-        + _count_redispatch_at_assignments(dead_worker_reap_path)
+        + sum(_count_redispatch_at_assignments(p) for p in sweep_paths)
         + _count_redispatch_at_assignments(state_dispatch_rework_path)
     )
     assert redispatch_assignments == 4, (
         'Expected 4 real entry["redispatch_at"] assignment statements across '
-        "workflow.py, dispatch_selection.py, dead_worker_reap.py, and "
+        "workflow.py, dispatch_selection.py, dead_worker_sweep/, and "
         "orchestration/state_dispatch_rework.py, found "
         f"{redispatch_assignments}"
     )

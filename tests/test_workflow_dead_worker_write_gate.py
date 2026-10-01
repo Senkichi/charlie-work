@@ -51,6 +51,7 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 from _fakes_github import FakeGitHub
+from _run_captured_fakes import patch_run_captured
 from _sessions_db_fixtures import make_sessions_db
 from charlie_work.config import (
     AutoMergeConfig,
@@ -159,14 +160,18 @@ def test_sweep_orphan_processes_for_dead_sessions_dry_run_true_kills_nothing(
 
     control_runner, control_calls = _run_recorder(real_run)
     with (
-        patch("charlie_work.dead_worker_reap.sweep_orphan_processes", side_effect=_control_sweep),
-        # os.name check lives in dead_worker_reap; patching the os module
+        patch(
+            "charlie_work.dead_worker_sweep.effects_sessions.sweep_orphan_processes",
+            side_effect=_control_sweep,
+        ),
+        # os.name check lives in dead_worker_sweep.effects_sessions; patching the os module
         # directly avoids depending on which module happens to `import os`
         # into its own namespace (workflow.py no longer does, post routing
         # deletion).
         patch("os.name", "nt"),
         patch("charlie_work.worker_fate.is_alive", return_value=False),
         patch("subprocess.run", side_effect=control_runner),
+        patch_run_captured(control_runner),
     ):
         _sweep_orphan_processes_for_dead_sessions(
             control_sessions_dir,
@@ -191,10 +196,14 @@ def test_sweep_orphan_processes_for_dead_sessions_dry_run_true_kills_nothing(
 
     dry_runner, dry_calls = _run_recorder(real_run)
     with (
-        patch("charlie_work.dead_worker_reap.sweep_orphan_processes", side_effect=_dry_sweep),
+        patch(
+            "charlie_work.dead_worker_sweep.effects_sessions.sweep_orphan_processes",
+            side_effect=_dry_sweep,
+        ),
         patch("os.name", "nt"),
         patch("charlie_work.worker_fate.is_alive", return_value=False),
         patch("subprocess.run", side_effect=dry_runner),
+        patch_run_captured(dry_runner),
     ):
         _sweep_orphan_processes_for_dead_sessions(
             sessions_dir, state_file, config, write_gate=_wg(state_file, dry_run=True)

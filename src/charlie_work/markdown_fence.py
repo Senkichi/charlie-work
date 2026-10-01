@@ -63,6 +63,7 @@ __all__ = [
     "scan",
     "is_blockquote_marker",
     "split_lines",
+    "restore_message_boundaries",
 ]
 
 # CommonMark's minimum fence. A shorter run is inline code, not a block.
@@ -505,3 +506,22 @@ def strip_fenced_blocks(text: str) -> str:
         for index in range(fence.start, end):
             drop[index] = True
     return "".join(line for line, is_dropped in zip(lines, drop) if not is_dropped)
+
+
+# A tagged fence opener (```json) glued to preceding non-newline text. A bare
+# ``` is left alone: mid-line it is indistinguishable from a closing fence.
+_GLUED_FENCE_OPENER_RE = re.compile(r"(?<=[^\n])(?=```[A-Za-z0-9_+-]+[ \t]*\n)")
+
+
+def restore_message_boundaries(log_text: str) -> str:
+    """Break the line before a tagged fence opener glued to preceding text.
+
+    The devin CLI's plaintext stdout joins consecutive assistant messages with
+    no separator, so a message that *starts* with a fence lands its opener
+    mid-line, where CommonMark (and ``markdown_fence.scan``) rightly refuses it
+    (issue #2143). Restore the lost boundary at the log boundary instead of
+    changing the scanner. Plaintext logs only: stream-json event text keeps
+    its real message framing. The normalized text can only gain a fence the
+    body of which must still decode as a valid verdict JSON.
+    """
+    return _GLUED_FENCE_OPENER_RE.sub("\n", log_text)

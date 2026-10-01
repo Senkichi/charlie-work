@@ -30,7 +30,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 import charlie_work.workflow as _wf
-from charlie_work.dead_worker_reap import _detect_stalled_sessions
+from charlie_work.dead_worker_sweep.effects_sessions import _detect_stalled_sessions
 from charlie_work.escalation import _stale_template_warning_suppressed
 from charlie_work.github import (
     GitHub,

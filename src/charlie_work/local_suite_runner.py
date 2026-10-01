@@ -36,9 +36,9 @@ import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
-from charlie_work.process_utils import get_process_start_time, popen_worker
+from charlie_work.process_utils import CpuPriority, get_process_start_time, popen_worker
 from charlie_work.subprocess_runner import hidden_console_kwargs
 
 LOG_FILENAME = "suite.log"
@@ -182,6 +182,7 @@ def launch_suite_gate(
     paths: SuiteGatePaths,
     head_sha: str,
     base_sha: str | None,
+    env: Mapping[str, str] | None = None,
 ) -> SuiteGateLaunch:
     """Spawn the detached suite runner; return immediately with its pid.
 
@@ -205,6 +206,8 @@ def launch_suite_gate(
         try:
             proc = popen_worker(
                 argv,
+                priority=CpuPriority.NORMAL,
+                env=env,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=stderr_handle,

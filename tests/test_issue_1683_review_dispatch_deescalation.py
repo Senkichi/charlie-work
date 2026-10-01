@@ -56,7 +56,10 @@ from charlie_work.state import (
     save_state,
     state_lock,
 )
-from charlie_work.unescalate_reset_fields import REWORK_BUDGET_RESET_BY_ESCALATION_REASON
+from charlie_work.unescalate_reset_fields import (
+    ISSUE_BUDGET_RESET_BY_ESCALATION_REASON,
+    REWORK_BUDGET_RESET_BY_ESCALATION_REASON,
+)
 
 from _review_fixtures import (
     _dispatch_reviews_app,
@@ -367,28 +370,6 @@ _NO_COUNTER_ALLOWLIST: dict[str, str] = {
         "triggering condition (required checks missing) is a janitor "
         "blocker, so the sweep cannot clear while it persists."
     ),
-    # --- issue-level windowed caps: the sweep's map resets PR-record ---
-    # --- fields only; these live on the issue record and are the      ---
-    # --- operator door's UNESCALATE_ISSUE_RESET_FIELDS domain. They   ---
-    # --- re-gate only on a fresh dispatch attempt (the next genuine   ---
-    # --- rework cycle), not on the very next pass.                    ---
-    "redispatch_cap_exceeded": (
-        "Gated by the issue-level ``redispatch_at`` windowed-timestamp "
-        "list, not a PR counter; the windowed list is operator-door "
-        "domain (UNESCALATE_ISSUE_RESET_FIELDS)."
-    ),
-    "worker_death_loop": (
-        "Gated by the issue-level ``worker_death_at`` windowed-timestamp "
-        "list; operator-door domain."
-    ),
-    "dispatch_blocked_environment": (
-        "Gated by the issue-level ``blocked_environment_at`` "
-        "windowed-timestamp list; operator-door domain."
-    ),
-    "dispatch_failed_cap_exceeded": (
-        "Gated by the issue-level ``dispatch_failed_at`` "
-        "windowed-timestamp list; operator-door domain."
-    ),
     # --- DETERMINISTIC_ESCALATION_FAILURE_KINDS members: deterministic ---
     # --- failure classifications, escalated on first occurrence --    ---
     # --- there is no retry counter to re-arm.                         ---
@@ -418,6 +399,15 @@ _DYNAMIC_REASON_DOMAINS: dict[str, str] = {
         "rescue_review_<cause> is formatted from the stored ``rescue_cause`` "
         "marker; the lane's re-entry guard is the durable one-shot "
         "``rescue_attempted`` marker, not a per-mechanism counter."
+    ),
+    "expr:plan.reason": (
+        "``ReclaimCommit.reason`` (dead_worker_sweep.decide_dead_sessions_plan"
+        ".plan_reclaim_commit, from ``RedispatchVerdict.reason``) is ``failure_kind`` for an immediate-class "
+        "death, else ``redispatch_cap_exceeded``. Both domains are the same "
+        "values the other scanned escalation sites carry as literals / "
+        "``failure_kind``, so they are accounted for above; the plan "
+        "moved the former inline conditional into a pure function. "
+        "``LaunchEscalation.reason`` is the ``failure_kind`` itself."
     ),
     "expr:gate_result.reason": (
         "The pre-flight cross-repo gate emits free-form prose reasons "
@@ -563,6 +553,13 @@ class _SourceIndex:
                 merge(self.resolve(elt, scope, in_progress))
         elif isinstance(node, ast.JoinedStr):
             merge(self._resolve_joined(node, scope, in_progress))
+        elif isinstance(node, ast.Subscript) and isinstance(node.value, ast.Dict):
+            # ``{...literal dict...}[key]``: the result is one of the dict's
+            # values, so the union of every value over-approximates it (the
+            # dead-worker sweep maps an escalation kind to its reason this
+            # way).
+            for value in node.value.values:
+                merge(self.resolve(value, scope, in_progress))
         elif isinstance(node, ast.Attribute) and node.attr == "failure_kind":
             # ``foo.failure_kind`` reaching a mechanical escalation site is
             # membership-gated to DETERMINISTIC_ESCALATION_FAILURE_KINDS at
@@ -689,6 +686,14 @@ def _callee_name(call: ast.Call) -> str | None:
     return None
 
 
+# ``_escalate_issue`` is the imperative escalation site; the dead-worker
+# sweep's pure decide phase instead yields the ``Escalate`` commit value
+# (same ``reason`` / ``reason_class`` kwargs), which the apply phase feeds
+# to ``_escalate_issue`` through a port -- a call the scan cannot follow.
+# Treat the commit constructor as an escalation site so its literals count.
+_ESCALATION_SITE_CALLEES = frozenset({"_escalate_issue", "Escalate"})
+
+
 def _mechanical_escalation_reasons() -> tuple[set[str], set[str]]:
     """Derive every ``escalation_reason`` reachable with
     ``reason_class="mechanical"`` from ``_escalate_issue`` call sites.
@@ -702,7 +707,7 @@ def _mechanical_escalation_reasons() -> tuple[set[str], set[str]]:
     literal_reasons: set[str] = set()
     dynamic_sites: set[str] = set()
     for scope, call in index.calls:
-        if _callee_name(call) != "_escalate_issue":
+        if _callee_name(call) not in _ESCALATION_SITE_CALLEES:
             continue
         kwargs = {kw.arg: kw.value for kw in call.keywords if kw.arg is not None}
         class_lits, class_dyn = (
@@ -736,7 +741,9 @@ def test_every_mechanical_escalation_reason_is_mapped_or_allowlisted() -> None:
     """
     literal_reasons, dynamic_sites = _mechanical_escalation_reasons()
 
-    mapped = set(REWORK_BUDGET_RESET_BY_ESCALATION_REASON)
+    mapped = set(REWORK_BUDGET_RESET_BY_ESCALATION_REASON) | set(
+        ISSUE_BUDGET_RESET_BY_ESCALATION_REASON
+    )
     allowlisted = set(_NO_COUNTER_ALLOWLIST)
     unaccounted = literal_reasons - mapped - allowlisted
     assert not unaccounted, (

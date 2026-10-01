@@ -34,6 +34,8 @@ UNESCALATE_PR_RESET_FIELDS = (
     # this keeps the pair consistent with the other _last_head baselines).
     "review_dispatch_attempt_last_head",
     "review_log_unreadable_streak",
+    # Issue #1808: provider api-error streak is a re-arm-scoped counter.
+    "review_api_error_streak",
     # Issue #1439: turn-limit miss streak must not survive a re-arm, or
     # the cap-aware backstop would re-escalate instantly on the next
     # turn-limit death.
@@ -61,11 +63,17 @@ UNESCALATE_PR_RESET_FIELDS = (
     # failure without a single fresh rework attempt.
     "local_merge_conflict_rework_attempts",
     "local_suite_failed_rework_attempts",
+    "local_suite_infra_relaunch_count",
     "local_merge_rework_reason",
     "no_op_rework_attempts",
     "no_op_rework_attempts_last_head",
     "no_op_rework_attempts_stall_since",
     "no_op_rework_attempts_stall_head",
+    # Issue #2108: per-head attempt counts of the PR-body closing-keyword autofix
+    # (``pr_body_closing_autofix_flow``). A re-arm that left them behind would
+    # re-escalate with ``attempt_cap_exceeded`` on the next Lint-red pass even
+    # when the body was fixed meanwhile.
+    "closing_keyword_autofix_attempts",
     "review_dispatch_status",
     "review_dispatch_failed_at",
     "review_dispatch_pending_at",
@@ -82,6 +90,10 @@ UNESCALATE_PR_RESET_FIELDS = (
     # silently suppress a fresh event even after an operator re-arms the
     # PR and the same head is still stuck.
     "ci_run_never_created_head",
+    # Issue #1681: same dedup-marker hazard for the workflow_no_jobs event.
+    "workflow_no_jobs_head",
+    # Issue #1681: bounds the same-head re-probe; stale after a re-arm.
+    "ci_absence_probed_attempts",
     "escalation_reason",
     # Issue #1461: clear the append-only escalation history so a re-arm
     # gives every lane a genuinely fresh dedup slate.
@@ -299,6 +311,9 @@ REWORK_BUDGET_RESET_BY_ESCALATION_REASON: dict[str, tuple[tuple[str, ...], tuple
             "conflict_rework_attempts_stall_head",
         ),
     ),
+    # Issue #2108: the PR-body closing-keyword autofix's per-head attempt map; no
+    # head-baseline or stall clock companion (the map is keyed by head itself).
+    "pr_body_closing_keyword_autofix_failed": (("closing_keyword_autofix_attempts",), ()),
     # Issue #1972: the local merge gate escalates both its failure kinds under
     # one reason, so the clear re-arms BOTH counters (either kind re-tripping
     # alone re-escalates otherwise) and drops the last-failure-kind marker.
@@ -309,6 +324,9 @@ REWORK_BUDGET_RESET_BY_ESCALATION_REASON: dict[str, tuple[tuple[str, ...], tuple
         ),
         ("local_merge_rework_reason",),
     ),
+    # Issue #2127: the gate's infra-relaunch bound (timeout / summary-less
+    # death); an unreset count would re-escalate on the very next infra blip.
+    "local_merge_gate_infra_exhausted": (("local_suite_infra_relaunch_count",), ()),
     # Issue #1683: the review-dispatch lanes were missing from this map
     # entirely, so every automated clear of either reason was inert -- the
     # gating counter stayed at cap, the next dispatch pass re-escalated
@@ -346,4 +364,23 @@ REWORK_BUDGET_RESET_BY_ESCALATION_REASON: dict[str, tuple[tuple[str, ...], tuple
         ("review_turn_limit_miss_streak", "review_dispatch_attempt_count"),
         ("review_dispatch_attempt_last_head",),
     ),
+}
+
+# Issue #2101: the issue-record twin of the map above.  Some mechanical
+# escalations are gated by a windowed list on the ISSUE entry rather than a
+# PR counter.  ``redispatch_cap_exceeded`` (the no-op rework cap) trips on
+# ``len(redispatch_at) > cap``; clearing it without dropping ``redispatch_at``
+# left the cap exhausted, so the next detection re-escalated and the inert
+# clears burned ``auto_deescalation_count`` (issue #2060: 2 clears, 0
+# ``dispatch_rework``).  Values are issue-entry fields popped once per
+# escalation episode alongside the PR-field reset; all of them must also be in
+# ``UNESCALATE_ISSUE_RESET_FIELDS`` so the operator door stays in agreement.
+ISSUE_BUDGET_RESET_BY_ESCALATION_REASON: dict[str, tuple[str, ...]] = {
+    "redispatch_cap_exceeded": ("redispatch_at",),
+    # The remaining dispatch-side windowed caps gate identically (a full
+    # issue-entry timestamp window re-trips on the next dispatch attempt), so
+    # an inert clear would burn ``auto_deescalation_count`` the same way.
+    "worker_death_loop": ("worker_death_at",),
+    "dispatch_blocked_environment": ("blocked_environment_at",),
+    "dispatch_failed_cap_exceeded": ("dispatch_failed_at",),
 }

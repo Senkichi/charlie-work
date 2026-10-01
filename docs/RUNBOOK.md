@@ -426,6 +426,31 @@ and `host_load_term` naming the binding term) to the repo's `events.db`, and a
 failed measurement fails *open* — dispatch proceeds — with a rate-limited
 `host_load_unavailable` warning instead of a silent missing clamp.
 
+### Host test-slot pool (`test_slots`, issue #2124)
+
+Dispatch admission only bounds how many sessions *start*; after that each worker
+picks when to run a wide suite. The slot pool bounds it at execution time:
+`S = cpu_count // width` fixed-width slots (default width 4 -> 4 slots on 16
+cores), each an OS file lock under `%LOCALAPPDATA%\charlie-work	est-slots\`
+held for the life of one wide suite. A killed holder frees its slot; there is no
+lease, heartbeat, or daemon. Slot 0 is the merge gate's alone; agent suites share
+slots `1..S-1`, so the gate never queues behind workers.
+
+- Enforced by `plugins/test_slot/test_slot_plugin.py`, a standalone pytest plugin
+  armed through `worker_env` (`PYTEST_PLUGINS` + `PYTHONPATH`) for every worker
+  and through the launch env for the gate. Only a run collecting at least
+  `min_items` (default 300) takes a slot, so targeted runs never wait.
+- Waiting prints `test-slot: waiting (N held, M queued)` every 30s. After
+  `wait_timeout_seconds` (default 480, under Claude's 10-minute Bash ceiling) the
+  run exits **75** with `test-slot: host busy; retry or run targeted tests` and a
+  `test_slot_wait_timeout` event is recorded on the next loop pass.
+- Config is host-wide (global config only): `test_slots.enabled` (default on; the
+  kill switch), `width`, `min_items`, `wait_timeout_seconds`.
+- Self-hosted CI runners run on this host but are provisioned by `ci_fleet`, not
+  this repo: to draw from the same pool, give the runner service the same
+  `PYTEST_PLUGINS`/`PYTHONPATH`/`CHARLIE_TEST_SLOT_*` environment (see
+  `charlie_work.test_slots.arm_env`). Until then CI suites are unmetered.
+
 ## Shared-venv isolation for devin-shell
 
 Per-worktree venvs are also the default for `devin-shell` (the `devin.venv_source`
@@ -539,6 +564,33 @@ sessions across all registered repos. This is a worker-count budget only — it
 does not bound CPU or RAM. The governor applies this cap at every dispatch
 path alongside the per-repo `dispatch.max_concurrent_sessions` cap
 (`_apply_concurrency_governor()` in `workflow.py`).
+
+**Reviewer budget**: `fleet.global_max_concurrent_reviews` (issue #2084, default
+`0` = disabled) is the same kind of cap for live *reviewer* sessions across all
+registered repos -- a separate budget from the worker one, stacking on the
+per-repo `review_dispatch.max_concurrent_reviews`. Use it when the reviewer
+harness has its own provider rate limit (e.g. `devin-shell` reviewers) that the
+per-repo caps, summed, would exceed. Review dispatch launches at most
+`min(per-repo capacity, fleet_max - fleet_live)` reviewers per pass, under the
+fleet launch lock; the `dispatch_reviews` result and the `review_dispatch_claim`
+/ `review_dispatch` events carry `fleet_review_concurrency_limit`,
+`fleet_live_review_count`, `fleet_available_review_slots`, and `clamped_by:
+fleet_max` when the fleet cap bound the launch. A held lock defers the pass with
+`deferred_reason: fleet_lock_held` (`dispatch_deferred`, then `dispatch_starved`
+after 3 in a row, lane `dispatch_reviews`). The knob is read from the layered
+config every pass -- no supervisor restart needed.
+
+**Devin reviewer exec-rejection resume**: `review_dispatch.review_exec_rejection_max_resumes`
+(issue #2090, default `2`, `0` = disabled). A headless `devin-shell` reviewer whose exec
+is refused ends its session with no verdict (`review_verdict_missed`, cause
+`reviewer_exec_rejected`). The reaper instead relaunches the *same* Devin session
+(`devin --resume <id> --print`, id from `devin list --format json` in the review checkout)
+with a nudge naming the allowed commands, up to this many times per dispatch, emitting
+`review_exec_rejection_resumed` (`pr_number`, `attempt`, `session_id`). The resumed process
+takes over the same sidecar and review slot, so neither the per-repo nor the fleet reviewer
+cap counts it twice. `review_verdict_missed` is recorded only when resumes are exhausted; a
+resume that cannot launch (no session id, checkout gone, relaunch error) emits
+`review_exec_rejection_resume_failed` and falls back to the miss. Read every pass; no restart.
 
 **Scoped claim**: The fleet budget bounds worker *count*, not CPU. When running
 the fleet across multiple repos on one host, you must still respect the
@@ -676,6 +728,18 @@ Enable-ScheduledTask -TaskName charlie-fleet-pass
 
 `charlie fleet stop` reports whether the task is armed, so an armed task is
 called out in the command's own output.
+
+**Pausing (preferred, #1776)**: `charlie fleet pause [--reason TEXT]` writes a
+persistent `fleet-pause.json` next to `fleet.json`. The supervisor reads it at
+the top of each loop iteration (between passes, never mid-pass), stamps
+`exit_code`=5 / `exited_at` on the heartbeat, and exits without killing
+anything; `scripts/fleet-pass.ps1` refuses to launch while the flag exists, so
+the scheduled task stays enabled and the pause survives reboot/logon. No
+`Disable-ScheduledTask`, no PID kills. `charlie fleet resume` removes the flag
+and the next tick relaunches. `fleet status` reports the pause while it is set.
+**A pause also freezes runner allocation** (same supervisor pass) at the last
+converged parked floor. To verify a pause, check that no new supervisor starts
+for one full watchdog window, not just that the process is gone.
 
 **Restarting**: re-enable the task (the next tick relaunches
 `supervise-loop`), or run `uv run charlie fleet supervise-loop` in a visible

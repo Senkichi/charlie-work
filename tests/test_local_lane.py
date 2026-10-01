@@ -69,6 +69,14 @@ from charlie_work.workflow import OrchestratorApp
 # ---------------------------------------------------------------------------
 
 
+# A failing suite that prints a pytest terminal summary. The gate (#2127) treats a
+# summary-less non-zero exit as an infra death, and a bare ``python -m pytest``
+# is not reliable here (the scratch worktree's ``python`` may lack pytest).
+_FAILING_SUITE = (
+    "python -c \"import sys; print('=== 1 failed, 2 passed in 0.12s ==='); sys.exit(1)\""
+)
+
+
 @pytest.fixture
 def repo() -> Path:
     return new_repo_root()
@@ -548,7 +556,7 @@ class TestLocalMergeGate:
         # Branch adds a failing test -> suite gate must fail. The suite runs
         # inside the branch worktree, so pytest picks up test_bad.py there.
         head = _make_branch(repo, "agent/issue-7-x", "test_bad.py", "def test_x(): assert False\n")
-        config = _local_config(repo, issues_dir, dispatch={"test_command": "python -m pytest"})
+        config = _local_config(repo, issues_dir, dispatch={"test_command": _FAILING_SUITE})
         app = _app(repo, issues_dir, config=config)
         _parked_issue(app, issues_dir, 7, "agent/issue-7-x")
         app._local_review_packets()

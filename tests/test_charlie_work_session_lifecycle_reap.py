@@ -498,7 +498,7 @@ def test_dead_dispatched_worker_provider_throttled_reclaimed_and_retried(
     from unittest.mock import patch
 
     from _worker_fixtures import _make_stalled_devin_session, _stale_devin_probe
-    from charlie_work import dead_worker_reap
+    from charlie_work.dead_worker_sweep import effects_sessions
     from charlie_work.state import is_throttled
 
     issue_number = 249
@@ -547,7 +547,7 @@ def test_dead_dispatched_worker_provider_throttled_reclaimed_and_retried(
         "charlie_work.write_gate.kill_process_tree",
         lambda pid, start_time=None: killed.append(pid) or [pid],
     )
-    monkeypatch.setattr(dead_worker_reap, "sweep_orphan_processes", lambda worktree_path: [])
+    monkeypatch.setattr(effects_sessions, "sweep_orphan_processes", lambda worktree_path: [])
     monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: True)
     monkeypatch.setattr("charlie_work.worker.real_activity_probe_for", _stale_devin_probe)
 
@@ -631,7 +631,7 @@ def test_dead_dispatched_worker_expired_throttle_window_still_reclaimed(
     from unittest.mock import patch
 
     from _worker_fixtures import _make_stalled_devin_session, _stale_devin_probe
-    from charlie_work import dead_worker_reap
+    from charlie_work.dead_worker_sweep import effects_sessions
     from charlie_work.state import is_throttled
 
     issue_number = 249
@@ -675,7 +675,7 @@ def test_dead_dispatched_worker_expired_throttle_window_still_reclaimed(
         "charlie_work.write_gate.kill_process_tree",
         lambda pid, start_time=None: killed.append(pid) or [pid],
     )
-    monkeypatch.setattr(dead_worker_reap, "sweep_orphan_processes", lambda worktree_path: [])
+    monkeypatch.setattr(effects_sessions, "sweep_orphan_processes", lambda worktree_path: [])
     monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: True)
     monkeypatch.setattr("charlie_work.worker.real_activity_probe_for", _stale_devin_probe)
 
@@ -978,7 +978,7 @@ def test_launch_failure_lane_stamps_throttle_kind_and_arms_window(
     ``worker_fate.persist_failure``) and calls ``set_throttled_until``
     when the log-tail classification returns a throttle window."""
     import charlie_work.state as state_module
-    from charlie_work.dead_worker_reap import (
+    from charlie_work.workflow import (
         _classify_dead_sessions_and_update_throttle_state,
     )
 
@@ -1044,7 +1044,7 @@ def test_launch_failure_lane_stamps_kind_without_window_for_non_throttle(
     ``set_throttled_until`` — the window write is gated on the classifier
     actually returning a ``throttled_until``."""
     import charlie_work.state as state_module
-    from charlie_work.dead_worker_reap import (
+    from charlie_work.workflow import (
         _classify_dead_sessions_and_update_throttle_state,
     )
 

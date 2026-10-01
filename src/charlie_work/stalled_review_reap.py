@@ -65,6 +65,8 @@ from .throttle_signatures import (
     match_throttle_tail,
     parse_reset_clock_time,
 )
+from .review_provider_outage import apply_provider_api_error, session_api_error_status
+from .role_quota_ledger import record_view as _ledger_record  # issue #2086
 from .worker import _alive_review_worker_issue_numbers, iter_workers
 from .worktree import remove_review_checkout
 from .write_gate import WriteGate, require_write_gate
@@ -132,6 +134,7 @@ def _set_reviewer_quota_exhausted_with_backoff(
     now_dt: datetime,
     *,
     reset_at: datetime | None = None,
+    adapter_kind: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Record a quota-exhaustion episode with exponential probe backoff.
 
@@ -167,6 +170,9 @@ def _set_reviewer_quota_exhausted_with_backoff(
     ``review_quota_exhausted`` event carrying ``throttled_until``,
     ``probe_after``, ``reset_at`` (ISO or None), and
     ``consecutive_probe_failures`` without re-reading state.
+
+    Issue #2086: the record carries ``reason`` and the hitting session's
+    ``adapter_kind`` so ``role_selection.window_covered`` can attribute it.
     """
     rd = config.review_dispatch
     quota = state.get("reviewer_quota") or {}
@@ -192,6 +198,8 @@ def _set_reviewer_quota_exhausted_with_backoff(
     )
     quota_record = {
         **state["reviewer_quota"],
+        "reason": "quota_exhausted",
+        "adapter_kind": adapter_kind,
         "consecutive_probe_failures": consecutive_failures,
         "reset_at": (
             reset_at.replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -322,6 +330,7 @@ class _ThrottleClassification(Enum):
     THROTTLED = "throttled"
     NOT_THROTTLED = "not_throttled"
     UNDETERMINED = "undetermined"
+    PROVIDER_API_ERROR = "provider_api_error"  # issue #1808
 
 
 def _detect_and_handle_stalled_reviews(
@@ -388,6 +397,10 @@ def _detect_and_handle_stalled_reviews(
     snapshot_events = list(state.get("events") or [])
     changed = False
     seen_pr_keys: set[str] = set()
+    # PRs whose sidecar is live or recently (re)started. A resumed review
+    # (#2090) rewrites the sidecar's ``started_at`` while a stale claim
+    # timestamp may linger; such a claim is not yet reapable (issue #2162).
+    fresh_sidecar_pr_keys: set[str] = set()
     # One provider-throttle condition per sweep, no matter how many dead
     # reviewers show the same limit signature: the exponential probe backoff
     # counts consecutive failed PROBES, and a wave of N simultaneously
@@ -403,6 +416,7 @@ def _detect_and_handle_stalled_reviews(
         pr_key = str(w.issue_number)
         # A live reviewer needs no cleanup.
         if w.is_alive():
+            fresh_sidecar_pr_keys.add(pr_key)
             continue
         # Respect the stale-claim timeout so a very recently dead reviewer is
         # not immediately re-dispatched (which can thrash if the underlying
@@ -410,6 +424,7 @@ def _detect_and_handle_stalled_reviews(
         if not is_claim_stale(
             w.started_at, timeout_minutes=_REVIEW_STALE_CLAIM_TIMEOUT_MINUTES, now=now
         ):
+            fresh_sidecar_pr_keys.add(pr_key)
             continue
 
         seen_pr_keys.add(pr_key)
@@ -457,6 +472,7 @@ def _detect_and_handle_stalled_reviews(
         # not-throttled burns the budget and leaves the fleet unprotected).
         classification = _ThrottleClassification.NOT_THROTTLED
         log_mtime_dt: datetime | None = None
+        api_error_status: int | None = None
         reset_at: datetime | None = None
         log_read_ok = False
         try:
@@ -495,6 +511,10 @@ def _detect_and_handle_stalled_reviews(
                 if matched
                 else _ThrottleClassification.NOT_THROTTLED
             )
+            if classification is _ThrottleClassification.NOT_THROTTLED:  # issue #1808
+                api_error_status = session_api_error_status(log_file)
+                if api_error_status is not None:
+                    classification = _ThrottleClassification.PROVIDER_API_ERROR
             # Issue #612: the session-limit notice names a specific reset
             # clock time in an IANA zone (e.g. "resets 1:20am
             # (America/Los_Angeles)"). Parse it once per dead session so the
@@ -541,7 +561,7 @@ def _detect_and_handle_stalled_reviews(
                 if not throttle_backoff_applied:
                     now_dt = resolved_now
                     state, quota_record = _set_reviewer_quota_exhausted_with_backoff(
-                        state, config, now_dt, reset_at=reset_at
+                        state, config, now_dt, reset_at=reset_at, adapter_kind=w.adapter_kind
                     )
                     throttle_backoff_applied = True
                     # Distinct, queryable event for a quota-dead reviewer session
@@ -565,6 +585,7 @@ def _detect_and_handle_stalled_reviews(
                         },
                     )
                 throttled_until = state.get("reviewer_quota", {}).get("throttled_until")
+                _ledger_record(reviews_dir, w, throttled_until, "stalled_review_sweep", write_gate)
             # A session that exhausted its full turn budget did real
             # PR-specific work -- its death is a PR-level outcome (the
             # review didn't fit the budget) regardless of what killed the
@@ -593,6 +614,7 @@ def _detect_and_handle_stalled_reviews(
                     "reviewer_pid": None,
                     "reviewer_process_start_time": None,
                     "review_log_unreadable_streak": 0,
+                    "review_api_error_streak": 0,
                 }
                 event_payload = {
                     "pr_number": w.issue_number,
@@ -632,6 +654,7 @@ def _detect_and_handle_stalled_reviews(
             if attempt_count > 0:
                 rolled_back["review_dispatch_attempt_count"] = attempt_count - 1
             rolled_back["review_log_unreadable_streak"] = 0
+            rolled_back["review_api_error_streak"] = 0
             state["prs"][pr_key] = rolled_back
             event_payload = {
                 "pr_number": w.issue_number,
@@ -667,6 +690,45 @@ def _detect_and_handle_stalled_reviews(
             # exactly once (observed live 2026-07-24: two dead reviewers
             # re-counted across ~6 passes pushed probe_after 4 hours out
             # while the provider window was already open again).
+            w.reap_sidecar(reviews_dir)
+            continue
+
+        if (
+            classification is _ThrottleClassification.PROVIDER_API_ERROR
+            and config.review_dispatch.max_consecutive_review_api_errors > 0
+        ):
+            # Issue #1808: a provider 5xx/529/429 is an outage, not a PR defect;
+            # see ``review_provider_outage``. Once-per-sweep backoff latch is
+            # shared with the throttle path: one outage, one backoff increment.
+            state, event_payload, throttle_backoff_applied = apply_provider_api_error(
+                state,
+                pr_key,
+                worker=w,
+                config=config,
+                write_gate=write_gate,
+                api_error_status=api_error_status,
+                log_mtime_dt=log_mtime_dt,
+                arm_backoff=lambda st: _set_reviewer_quota_exhausted_with_backoff(
+                    st, config, resolved_now, adapter_kind=w.adapter_kind
+                ),
+                backoff_armed=throttle_backoff_applied,
+            )
+            state = write_gate.append_event(
+                state,
+                "review_dispatch_stalled",
+                event_payload,
+                level=_classify_review_dispatch_stalled_level(event_payload),
+            )
+            changed = True
+            stalled.append(
+                {
+                    "pr": w.issue_number,
+                    "pid": w.pid,
+                    "started_at": w.started_at,
+                    "reason": event_payload["reason"],
+                }
+            )
+            remove_review_checkout(repo_root, w.issue_number, reviews_dir=reviews_dir)
             w.reap_sidecar(reviews_dir)
             continue
 
@@ -803,6 +865,7 @@ def _detect_and_handle_stalled_reviews(
             "reviewer_pid": None,
             "reviewer_process_start_time": None,
             "review_log_unreadable_streak": 0,
+            "review_api_error_streak": 0,  # issue #1808: definitive non-api death
         }
         sweep_events.append(
             (
@@ -880,6 +943,11 @@ def _detect_and_handle_stalled_reviews(
             process_start_time = pr_state.get("reviewer_process_start_time")
             pid_alive = reviewer_pid is not None and is_pid_alive(reviewer_pid, process_start_time)
             if pid_alive:
+                continue
+            if pr_key in fresh_sidecar_pr_keys:
+                # The sidecar is newer than the claim (resumed review): leave
+                # the log and claim for the next pass's verdict harvest, which
+                # runs before this sweep and reaps the sidecar once stale.
                 continue
             dispatched_at = pr_state.get("review_dispatched_at")
             if dispatched_at and is_claim_stale(
@@ -1321,7 +1389,7 @@ def _classify_review_dispatch_stalled_level(payload: dict[str, Any]) -> str | No
     default. This centralizes the "classify by reason" decision in one place.
     """
     reason = payload.get("reason")
-    if isinstance(reason, str) and reason.startswith("provider_throttled"):
+    if isinstance(reason, str) and reason.startswith(("provider_throttled", "provider_api")):
         return "warning"
     return None
 

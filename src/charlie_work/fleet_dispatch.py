@@ -9,7 +9,7 @@ import sys
 import threading
 import time
 from collections.abc import Sequence
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
@@ -55,6 +55,7 @@ from .fleet_lanes import (  # noqa: F401  (deliberate re-export)
     _run_fleet_repo_lane,
     _start_fleet_reap_scheduler,
 )
+from .fleet_pause import fleet_pause_pending
 from .fleet_stop import (
     FleetStopState,
     apply_fleet_drain_config,
@@ -63,7 +64,7 @@ from .fleet_stop import (
 )
 from . import layout
 from .github import GitHub, GitHubError
-from .global_config import describe_config_file, load_layered_config
+from .global_config import describe_config_file, load_fleet_global_config, load_layered_config
 from .instrumentation import log_event
 from .local_issues import github_client_for
 from .notify import AttentionDigest, AttentionEntry, emit_digest
@@ -72,7 +73,7 @@ from .notify_freshness import (
     report_notify_resolution,
     resolve_fleet_notify,
 )
-from .paths import RepoNotFoundError, runtime_paths
+from .paths import runtime_paths
 from .venv_anchor import verify_interpreter_anchored_editables
 from .ci_fleet_anchor import ci_fleet_provenance_payload, ci_fleet_provenance_snapshot
 from .supervise import (
@@ -104,6 +105,7 @@ from .subprocess_runner import RunResult, no_console_window_kwargs, run_captured
 from .preflight import PreflightPaths, run_preflight
 from .supervise_loop import (
     DEFAULT_MAX_RELAUNCHES,
+    EXIT_FLEET_PAUSED,
     EXIT_RESTART_REQUESTED,
     PREFLIGHT_REFUSAL_EXIT_CODE,
     SuperviseLoopResult,
@@ -1797,6 +1799,12 @@ def _fleet_notify_config(global_config: Any) -> Any:
     return resolve_fleet_notify(notify_config, state_root)
 
 
+# Issue #2142: wind-down allowance added to the remaining pass budget when
+# waiting on lanes, so a lane that stops cooperatively at the deadline can
+# still be harvested rather than reported as an overrun.
+_LANE_DRAIN_GRACE_SECONDS = 30.0
+
+
 def fleet_loop(
     fleet_dir_override: str | None = None,
     global_config: Any = None,  # GlobalConfig from #159, but we don't have the type yet
@@ -2039,20 +2047,34 @@ def fleet_loop(
     # The supervisor lock a lane acquires in phase 1 stays held until its
     # lane body returns, exactly as before.
     lane_concurrency = max(1, min(len(selected), _resolve_fleet_lane_concurrency(global_config)))
-    pending_lanes: list[tuple[str, dict[str, Any], Path, float, Any]] = []
-    collected_lane_count = 0
+    # Issue #2142: outstanding lane futures, harvested in COMPLETION order via
+    # concurrent.futures.wait so one slow lane cannot hold back the rest. The
+    # _selected_order sort below restores selection order for the results.
+    outstanding: dict[Future[CommandResult], tuple[str, dict[str, Any], Path, float]] = {}
 
-    def _collect_next_pending_lane() -> None:
-        """Resolve the oldest uncollected lane future, in selection order.
+    def _wait_budget() -> float | None:
+        """Seconds a lane wait may block: the remaining pass budget plus a
+        wind-down grace for lanes that stop cooperatively at the deadline.
+        ``None`` (wait indefinitely) when the pass has no deadline."""
+        if not deadline_seconds or deadline_seconds <= 0:
+            return None
+        remaining = deadline_seconds - (pass_clock() - pass_started_at)
+        return max(0.0, remaining) + _LANE_DRAIN_GRACE_SECONDS
 
-        Runs on the calling thread both when the submission loop throttles
-        on a full pool and in the post-loop drain, so per-repo results,
-        attention events, and the lane-elapsed log line keep serial ordering
-        no matter when a lane actually finishes.
+    def _harvest_lane(
+        future: Future[CommandResult],
+        repo_key: str,
+        entry: dict[str, Any],
+        repo_root: Path,
+        repo_lane_start: float,
+    ) -> None:
+        """Fold one FINISHED lane future into the pass aggregates.
+
+        Runs only on the calling thread and only for a done future, so
+        per_repo_results is written at collection time and a lane left
+        running past the drain deadline can never write into it later.
         """
-        nonlocal collected_lane_count, orphan_sweep_calls
-        repo_key, entry, repo_root, repo_lane_start, future = pending_lanes[collected_lane_count]
-        collected_lane_count += 1
+        nonlocal orphan_sweep_calls
         try:
             result = future.result()
         except Exception as exc:
@@ -2080,9 +2102,42 @@ def fleet_loop(
             pass_clock() - repo_lane_start,
         )
 
-    with ThreadPoolExecutor(
-        max_workers=lane_concurrency, thread_name_prefix="fleet-lane"
-    ) as lane_pool:
+    def _collect_finished_lanes(timeout: float | None) -> bool:
+        """Wait up to ``timeout`` for at least one outstanding lane to finish,
+        then harvest every finished one. Returns False if none finished."""
+        done, _not_done = wait(list(outstanding), timeout=timeout, return_when=FIRST_COMPLETED)
+        for future in done:
+            repo_key, entry, repo_root, repo_lane_start = outstanding.pop(future)
+            _harvest_lane(future, repo_key, entry, repo_root, repo_lane_start)
+        return bool(done)
+
+    def _record_lane_overruns() -> None:
+        """Final-drain deadline expired: report every lane still running.
+
+        The lane is left running (its supervisor lock stays held, so the
+        lock-held skip keeps the next pass out of that repo) and is recorded
+        as deadline-partial, never as observed.
+        """
+        for future, (repo_key, _entry, _root, repo_lane_start) in outstanding.items():
+            elapsed = pass_clock() - repo_lane_start
+            deadline_partial_repo_keys.append(repo_key)
+            logger.warning(
+                "fleet pass lane overrun: lane=%s elapsed_seconds=%.1f", repo_key, elapsed
+            )
+            try:
+                # write-gate-exempt(issue=2142): no write_gate param; sibling raw calls remain
+                log_event(
+                    fleet_state_path,
+                    "fleet_lane_overrun",
+                    {"repo_key": repo_key, "elapsed_seconds": elapsed},
+                    repo=repo_key,
+                )
+            except Exception:
+                logger.debug("Failed to record fleet_lane_overrun for %s", repo_key)
+        outstanding.clear()
+
+    lane_pool = ThreadPoolExecutor(max_workers=lane_concurrency, thread_name_prefix="fleet-lane")
+    try:
         for repo_key, entry in selected:
             if _deadline_exceeded():
                 # Issue #1832: stop starting new repo lanes once the pass is
@@ -2105,9 +2160,16 @@ def fleet_loop(
             # (re-check below), while lanes already in flight finish
             # cooperatively.
             waited_for_slot = False
-            while len(pending_lanes) - collected_lane_count >= lane_concurrency:
-                _collect_next_pending_lane()
+            while len(outstanding) >= lane_concurrency:
                 waited_for_slot = True
+                if not _collect_finished_lanes(_wait_budget()):
+                    # Issue #2142: no lane finished inside the pass budget.
+                    # Stop waiting; the repo is deferred below and the
+                    # still-running lanes are reported by the final drain.
+                    break
+            if len(outstanding) >= lane_concurrency:
+                deferred_repo_keys.append(repo_key)
+                continue
             # The wait for a pool slot can consume the rest of the budget, so
             # re-check before prep -- but only when a wait actually happened:
             # the top-of-loop check is otherwise still fresh, and an
@@ -2229,7 +2291,7 @@ def fleet_loop(
                 except Exception:
                     lock.release()
                     raise
-                pending_lanes.append((repo_key, entry, repo_root, repo_lane_start, future))
+                outstanding[future] = (repo_key, entry, repo_root, repo_lane_start)
                 lane_submitted = True
 
             except Exception as exc:
@@ -2250,13 +2312,23 @@ def fleet_loop(
                         pass_clock() - repo_lane_start,
                     )
 
-        # Drain the lanes still outstanding, in selection order (not
-        # completion order) so result/attention-event ordering is identical
-        # to the serial loop. ``future.result()`` blocks until each lane
-        # finishes; the ``with`` exit then joins the pool with nothing left
-        # to wait on.
-        while collected_lane_count < len(pending_lanes):
-            _collect_next_pending_lane()
+        # Final drain (issue #2142): harvest lanes as they finish, bounded by
+        # the remaining pass budget. A lane still running at expiry is
+        # reported by _record_lane_overruns and left running -- the pool is
+        # shut down with wait=False below instead of joined.
+        budget = _wait_budget()
+        drain_deadline = None if budget is None else time.monotonic() + budget
+        while outstanding:
+            timeout = None if drain_deadline is None else drain_deadline - time.monotonic()
+            if timeout is not None and timeout <= 0:
+                break
+            _collect_finished_lanes(timeout)
+        _record_lane_overruns()
+    finally:
+        # No cancel_futures: a submitted-but-never-started future cancelled here
+        # would skip the lane body's `finally: lock.release()` and strand the
+        # phase-1 supervisor lock for the process lifetime.
+        lane_pool.shutdown(wait=False)
 
     # Results were recorded from two interleaved sources -- skips/prep errors
     # during submission and lane completions during collection -- so restore
@@ -2594,6 +2666,10 @@ def _fleet_has_configured_repos(
 # zero-pass alarm also cannot currently tell these cases apart.
 RESTART_EXIT_REASONS = frozenset({"self_deploy", "head_drift"})
 
+# Exit reason for an honored ``fleet-pause.json`` flag (issue #1776). Not a
+# restart reason: a paused supervisor must stay down.
+FLEET_PAUSED_EXIT_REASON = "fleet_paused"
+
 # Bound on the per-repo failure reasons appended to the pass-summary line
 # (#893). ``message`` is operator-facing free text (e.g. "loop completed with
 # N PR error(s)", a tracebacks-derived string from an unclassified exception
@@ -2828,14 +2904,7 @@ def run_fleet_supervise(
         return CommandResult(False, f"refusing to supervise: {anchor.detail}", {})
     logger.info("Venv editable anchor: %s", anchor.detail)
 
-    try:
-        global_config = load_layered_config(
-            Path.cwd(),
-            None,
-            fleet_dir_override=fleet_dir_override,
-            require_global=True,
-        )
-    except (ConfigError, RepoNotFoundError) as exc:
+    def _report_global_load_failure(exc: Exception) -> None:
         # Falling back to defaults silently is how a whole feature disappears
         # without a trace: every config-gated behavior (notify, labels, the
         # runner prologues) reverts to off while passes keep reporting success.
@@ -2847,18 +2916,18 @@ def run_fleet_supervise(
             exc,
         )
         print(f"config load failed, continuing on per-repo config: {exc}", flush=True)
-        # The global layer is required, but the per-repo config is still valid
-        # and must not be discarded with it -- discarding both regresses the
-        # #623 silent-disable failure (every per-repo knob reverting to its
-        # dataclass default while passes keep reporting success). Reload
-        # without the global requirement so per-repo settings survive; only
-        # fall back to pristine defaults if the per-repo load itself fails.
-        try:
-            global_config = load_layered_config(
-                Path.cwd(), None, fleet_dir_override=fleet_dir_override
-            )
-        except (ConfigError, RepoNotFoundError):
-            global_config = OrchestratorConfig()
+
+    # The global layer is required, but the per-repo config is still valid and
+    # must not be discarded with it (#623); only a failing per-repo load too
+    # falls back to pristine defaults. A host-wide ConstructionError is the one
+    # error that never degrades -- see load_fleet_global_config.
+    global_config = load_fleet_global_config(
+        load_layered_config,
+        Path.cwd(),
+        fleet_dir_override=fleet_dir_override,
+        fallback=OrchestratorConfig(),
+        report=_report_global_load_failure,
+    )
 
     # Provenance of the layer every fleet-wide knob comes from, logged once per
     # supervisor start (not per pass -- this is startup, so it costs one stat).
@@ -3149,6 +3218,19 @@ def run_fleet_supervise(
             stop_reason = drain_state.poll_stop_marker(fleet_dir_override)
             if stop_reason is not None:
                 exit_reason = _exit_reason = stop_reason
+                break
+
+            # Issue #1776: persistent pause flag, read fresh each iteration and
+            # only here -- between passes, never mid-pass. Nothing is killed;
+            # the flag stays until `fleet resume`.
+            if fleet_pause_pending(fleet_dir_override):
+                print(
+                    f"[{datetime.datetime.now().strftime('%H:%M:%S')}] fleet paused "
+                    f"({layout.FLEET_PAUSE_FILENAME} present); exiting (live workers untouched)",
+                    flush=True,
+                )
+                exit_reason = _exit_reason = FLEET_PAUSED_EXIT_REASON
+                _exit_code = EXIT_FLEET_PAUSED
                 break
 
             new_snapshot = _take_fleet_snapshot(fleet_dir_override=fleet_dir_override)
@@ -3610,6 +3692,7 @@ def run_fleet_supervise(
             "elapsed_seconds": elapsed_s,
             "exit_reason": exit_reason or "unknown",
             "restart_requested": exit_reason in RESTART_EXIT_REASONS,
+            "fleet_paused": exit_reason == FLEET_PAUSED_EXIT_REASON,
         },
     )
 
@@ -3778,7 +3861,9 @@ def run_fleet_supervise_loop(
             on_cap_reached=(
                 on_cap_reached if on_cap_reached is not None else _record_supervise_loop_cap_event
             ),
-            stop_requested=lambda: fleet_stop_pending(fleet_dir_override),
+            stop_requested=lambda: (
+                fleet_stop_pending(fleet_dir_override) or fleet_pause_pending(fleet_dir_override)
+            ),
         )
     except KeyboardInterrupt:
         return supervise_loop_interrupted_result()  # issue #1716
@@ -3795,7 +3880,7 @@ def run_fleet_supervise_loop(
     # instead of being removed. The cap's signal is the distinct log line and the
     # `supervise_relaunch_cap_reached` event, both of which say exactly which
     # condition occurred; the exit code does not need to carry it too.
-    ok = result.last_exit_code in (0, EXIT_RESTART_REQUESTED)
+    ok = result.last_exit_code in (0, EXIT_RESTART_REQUESTED, EXIT_FLEET_PAUSED)
     return CommandResult(
         ok,
         f"supervise-loop: {result.launches} launch(es), {result.relaunches} relaunch(es), "
