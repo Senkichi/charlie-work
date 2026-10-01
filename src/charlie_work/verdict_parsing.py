@@ -220,74 +220,9 @@ def _parse_review_verdict_from_log(log_path: Path) -> dict[str, Any] | None:
     except OSError:
         return None
 
-    verdict = _extract_trailing_fenced_verdict(log_text)
-    if verdict is not None:
-        return verdict
-    verdict = _extract_verdict_from_plaintext_log(log_text)
-    if verdict is not None:
-        return verdict
-    return _extract_verdict_from_stream_json(log_text)
+    from .verdict_log_extraction import extract_verdict_from_log_text
 
-
-_LINE_START_JSON_OPENER_RE = re.compile(r"^```json[ \t]*$")
-
-
-def _extract_trailing_fenced_verdict(text: str) -> dict[str, Any] | None:
-    """Verdict from the well-formed ```json block that ENDS the text, else ``None``.
-
-    Scans backwards from the end: the last non-blank line must be a bare
-    closing fence, and the nearest earlier fence-looking line must be a
-    line-start ```json opener. Nothing before that opener is consulted, so a
-    verdict-shaped object inside an earlier illustrative example (with or
-    without balanced fences) can never be selected. Anything else -- no
-    trailing fence, a glued or differently tagged opener, an invalid verdict
-    body -- returns ``None`` and the caller falls back to the whole-text scan.
-    """
-    lines = text.rstrip().splitlines()
-    if not lines or lines[-1].rstrip() != "```":
-        return None
-    for index in range(len(lines) - 2, -1, -1):
-        line = lines[index]
-        if not line.startswith("```"):
-            continue
-        if not _LINE_START_JSON_OPENER_RE.match(line):
-            return None
-        try:
-            data = json.loads("\n".join(lines[index + 1 : -1]).strip())
-        except json.JSONDecodeError:
-            return None
-        return _validate_review_verdict(data)
-    return None
-
-
-def _extract_verdict_from_plaintext_log(log_text: str) -> dict[str, Any] | None:
-    """Whole-text verdict extraction for a plaintext log.
-
-    The raw text is consulted first, so boundary normalization can never
-    destroy a verdict the unmodified text yields. ``restore_message_boundaries``
-    is only a fallback when the raw pass finds nothing, or a way to settle a
-    raw-pass legacy/scan disagreement when the normalized text confirms the
-    raw pass's own decision; it never changes the decision the raw pass chose.
-    """
-    raw_events: list[markdown_guard.Disagreement] = []
-    verdict = _extract_verdict_from_text(log_text, on_disagreement=raw_events.append)
-    normalized = markdown_fence.restore_message_boundaries(log_text)
-    if verdict is None:
-        return _extract_verdict_from_text(normalized)
-    if raw_events and normalized != log_text:
-        normalized_events: list[markdown_guard.Disagreement] = []
-        confirmed = _extract_verdict_from_text(
-            normalized, on_disagreement=normalized_events.append
-        )
-        if (
-            confirmed is not None
-            and confirmed["decision"] == verdict["decision"]
-            and not normalized_events
-        ):
-            return verdict
-    for event in raw_events:
-        markdown_guard.emit_disagreement(event)
-    return verdict
+    return extract_verdict_from_log_text(log_text)
 
 
 def _session_mtime_cutoff(started_at: str | None) -> datetime | None:
