@@ -265,6 +265,33 @@ def test_pr_approved_carried_forward_status_recovers_to_rework(tmp_path: Path) -
     assert events_of(paths, "orphaned_worker_drift") == []
 
 
+def test_pr_approved_without_rework_status_drifts_unsafe_to_auto_reset(
+    tmp_path: Path,
+) -> None:
+    """#2135 (supersedes #1109): no PR ``status`` at all no longer wedges.
+
+    ``dispatched`` + ``approved`` on the same head is a post-approval rework
+    whatever the PR ``status`` says, so the dead worker recovers instead of
+    drifting. The leaf name predates #2135 and is kept so the collect-only gate
+    sees the test as modified rather than removed.
+    """
+    config, paths, gh, _ = _dead_worker_rework_bed(tmp_path, decision="approved")
+    write_terminal_exit(
+        tmp_path,
+        207,
+        exit_code=1,
+        started_at=iso(minutes_ago=30),
+        ended_at=iso(minutes_ago=25),
+    )
+
+    run_sweep(tmp_path, paths, config, gh)
+
+    assert issue_entry(paths, 207)["status"] == "rework_requested"
+    (event,) = events_of(paths, "orphaned_worker_recovered")
+    assert event["payload"]["reason"] == "dead_worker_with_approved_rework"
+    assert events_of(paths, "orphaned_worker_drift") == []
+
+
 def test_pr_approved_carried_forward_status_clean_exit_is_no_op(tmp_path: Path) -> None:
     """#2135: exit 0 on a carried-forward approved PR counts against the no-op cap."""
     config, paths, gh, _ = _dead_worker_rework_bed(

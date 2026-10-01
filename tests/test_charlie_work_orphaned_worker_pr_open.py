@@ -10,6 +10,7 @@ import json
 import sys
 from pathlib import Path
 import pytest
+from _dead_session_fixtures import _write_flat_review_decision
 from _dispatch_fixtures import _stub_real_activity_probe_for_stalled_tests  # noqa: F401
 from _fakes_github import FakeGitHub
 from _rework_dispatch_fixtures import _wg
@@ -26,6 +27,88 @@ from charlie_work.state import (
     save_state,
 )
 from charlie_work.workflow import OrchestratorApp
+
+
+def test_orphaned_worker_approved_without_rework_status_still_drifts(tmp_path: Path) -> None:
+    """#2135 (supersedes #1109): an approved PR whose PR state carries no
+    ``status="rework_requested"`` is still a post-approval rework when its issue
+    is ``dispatched`` -- carry-forward can rewrite the status back to ``approved``
+    mid-rework -- so the dead worker is recovered instead of wedging as
+    ``dead_worker_unsafe_to_auto_reset`` drift.
+
+    The leaf name predates #2135 and is kept so the collect-only gate sees the
+    test as modified rather than removed.
+    """
+    from unittest.mock import patch
+
+    config = OrchestratorConfig(
+        devin=DevinConfig(),
+        worker=WorkerRoleConfig(harness="devin-shell"),
+        watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+
+    state = load_state(paths.state_file)
+    state["issues"]["1109"] = {
+        "status": "dispatched",
+        "worker_pid": 99999,
+        "worker_process_start_time": 1234567890.0,
+        "dispatched_at": "2024-01-01T00:00:00Z",
+    }
+    # Approved but NO status="rework_requested" -- no evidence a rework lane
+    # dispatched this worker.
+    state["prs"]["100"] = {
+        "decision": "approved",
+        "reviewed_head_sha": "abc123",
+    }
+    save_state(paths.state_file, state)
+    _write_flat_review_decision(paths, 100, "approved", "abc123")
+
+    class FakeGitHubForOrphan(FakeGitHub):
+        def pr_list(self):
+            return [
+                {
+                    "number": 100,
+                    "headRefOid": "abc123",
+                    "isCrossRepository": False,
+                    "headRepository": {"owner": {"login": "test"}, "name": "repo"},
+                    "headRefName": "agent/issue-1109",
+                }
+            ]
+
+    fake_gh = FakeGitHubForOrphan()
+    fake_gh.issues.append(
+        {
+            "number": 1109,
+            "title": "Test issue",
+            "url": "https://example.test/issues/1109",
+            "body": "",
+            "labels": [],
+            "state": "OPEN",
+        }
+    )
+
+    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        from charlie_work.workflow import _detect_and_handle_orphaned_workers
+
+        sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+
+        _detect_and_handle_orphaned_workers(
+            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+        )
+
+    state = load_state(paths.state_file)
+    entry = state["issues"]["1109"]
+
+    # Recovered to the rework lane, no drift.
+    assert entry.get("status") == "rework_requested"
+
+    events = state.get("events", [])
+    recovered = [e for e in events if e.get("kind") == "orphaned_worker_recovered"]
+    assert len(recovered) == 1
+    assert recovered[0]["payload"]["reason"] == "dead_worker_with_approved_rework"
+    assert [e for e in events if e.get("kind") == "orphaned_worker_drift"] == []
 
 
 def test_orphaned_worker_drift_fingerprint_cleared_on_redispatch(
