@@ -32,9 +32,9 @@ from urllib.parse import parse_qsl
 
 from .request import ACCEPT_JSON, GraphQLRequest, Request, RestRequest
 
-# Endpoint path suffixes the REST row does not translate: the Actions job-log
-# endpoint answers 302 to a signed URL with a raw-text body, which gh follows.
-_EXCLUDED_PATH_SUFFIXES = ("/logs",)
+# Endpoint path suffix whose request follows a redirect: the Actions job-log
+# endpoint answers 302 to a signed URL with a raw-text body (gt-design G3).
+_REDIRECT_PATH_SUFFIXES = ("/logs",)
 _GRAPHQL_KNOWN_FIELDS = ("query", "owner", "name")
 _READONLY_PREFIXES = (
     "issue list",
@@ -202,10 +202,16 @@ def _rest_row(args: list[str], long_call: bool) -> Translated | None:
     if path is None:
         return None
     route, query = _split_route(path)
-    if any(route.split("?", 1)[0].endswith(suffix) for suffix in _EXCLUDED_PATH_SUFFIXES):
-        return None
+    follow = route.endswith(_REDIRECT_PATH_SUFFIXES)
     try:
-        request = RestRequest("GET", route, query=tuple(query), accept=accept, long_call=long_call)
+        request = RestRequest(
+            "GET",
+            route,
+            query=tuple(query),
+            accept=accept,
+            long_call=long_call,
+            follow_redirect=follow,
+        )
     except ValueError:
         return None
     return Translated(request, paginate=paginate)

@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from _fake_transport import FakeAdapter, failure, make_github, ok
+from _fake_transport import FakeAdapter, failure, gh_kill_switch_runtime, make_github, ok
 from charlie_work import github as github_module
 from charlie_work.config import RuntimeConfig
 from charlie_work.github_transport import FailureKind
@@ -492,7 +492,9 @@ def test_wrapper_method_raises_on_unreadable_empty_stdout(
 
     monkeypatch.setattr(github_module.subprocess, "run", fake_run)
 
-    gh = github_module.GitHub(tmp_path)
+    gh = github_module.GitHub(tmp_path, runtime=gh_kill_switch_runtime())
+    # label_list is a REST read: pin the slug so no `git remote` lookup is needed.
+    object.__setattr__(gh, "_repo_owner_name", lambda: ("octo", "hello"))
     method = getattr(gh, method_name)
     with pytest.raises(github_module.GitHubError):
         method(*args)
@@ -521,13 +523,17 @@ def test_wrapper_method_returns_empty_for_genuine_empty_json(
     return the empty container cleanly, without raising."""
 
     def fake_run(cmd, *a, **kwargs):
+        # A REST read goes out as ``gh api --include`` and reads back a status line.
+        prefix = "HTTP/2.0 200 OK\r\n\r\n" if "--include" in cmd else ""
         return subprocess.CompletedProcess(
-            args=cmd, returncode=0, stdout=empty_json_stdout, stderr=""
+            args=cmd, returncode=0, stdout=prefix + empty_json_stdout, stderr=""
         )
 
     monkeypatch.setattr(github_module.subprocess, "run", fake_run)
 
-    gh = github_module.GitHub(tmp_path)
+    gh = github_module.GitHub(tmp_path, runtime=gh_kill_switch_runtime())
+    # label_list is a REST read: pin the slug so no `git remote` lookup is needed.
+    object.__setattr__(gh, "_repo_owner_name", lambda: ("octo", "hello"))
     method = getattr(gh, method_name)
     result = method(*args)
 

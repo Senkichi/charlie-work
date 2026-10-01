@@ -15,7 +15,7 @@ from typing import Any
 from ..github_transport.outcome import Outcome, Response
 from ..github_transport.request import GraphQLRequest, RestRequest
 from ._base import GitHubRunResult
-from ._outcome import expect_json, expect_ok, is_success, to_run_result
+from ._outcome import expect_json, expect_ok, failure_text, is_success, to_run_result
 
 AnyTypedRequest = RestRequest | GraphQLRequest
 
@@ -49,6 +49,26 @@ def send_result(
     )
 
 
+def send_graphql(collab: Any, request: GraphQLRequest) -> tuple[Any, str | None]:
+    """Send a GraphQL request; return ``(parsed body, error text)``.
+
+    The body is returned whenever the call was answered 2xx and parses, even
+    if it carries per-node ``errors`` (the partial ``data`` GitHub still
+    sends, #1933); ``error`` is then the rendered errors. A transport failure
+    or non-2xx answer returns ``(None, text)``. Never raises.
+    """
+    outcome = send(collab, request)
+    if not isinstance(outcome, Response) or not 200 <= outcome.status < 300:
+        return None, failure_text(outcome)
+    try:
+        body = outcome.json()
+    except ValueError:
+        return None, "GraphQL response was not JSON"
+    if outcome.ok:
+        return body, None
+    return body, failure_text(outcome)
+
+
 def status_of(outcome: Outcome) -> int | None:
     """HTTP status of an answered request, ``None`` for a transport failure."""
     return outcome.status if isinstance(outcome, Response) else None
@@ -56,6 +76,7 @@ def status_of(outcome: Outcome) -> int | None:
 
 __all__ = [
     "send",
+    "send_graphql",
     "send_json",
     "send_ok",
     "send_result",

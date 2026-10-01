@@ -48,13 +48,22 @@ def test_graphql_query_row_translates_to_a_typed_request() -> None:
     assert isinstance(translated.request, GraphQLRequest)
 
 
+def test_job_log_route_translates_with_redirect_following() -> None:
+    translated = request_for_argv(["api", "repos/{owner}/{repo}/actions/jobs/9/logs"])
+    assert isinstance(translated.request, RestRequest)
+    assert translated.request.follow_redirect is True
+    plain = request_for_argv(["api", "repos/{owner}/{repo}/pulls/9"])
+    assert isinstance(plain.request, RestRequest)
+    assert plain.request.follow_redirect is False
+
+
 @pytest.mark.parametrize(
     "argv",
     [
         ["pr", "view", "1", "--json", "state"],
         ["api", "-X", "POST", "repos/o/r/issues/1/comments", "-f", "body=x"],
         ["api", "graphql", "-f", "query=mutation { x }"],
-        ["api", "repos/o/r/actions/jobs/1/logs"],
+        ["issue", "list", "--json", "number"],
         ["api", "repos/o/r/pulls", "-H", "X-Other: 1"],
         [],
     ],

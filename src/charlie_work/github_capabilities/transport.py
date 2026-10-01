@@ -57,10 +57,12 @@ from .circuit_breaker_transport import (
     note_circuit_breaker_result,
 )
 from .cross_repo_blockers import CrossRepoBlocker, make_blocker
+from ._send import send_graphql
 from .graphql_issue_states import graphql_issue_states
 from .issues import ISSUE_LIST_FIELDS, ISSUE_VIEW_FIELDS
 from .labels import LABEL_LIST_FIELDS
 from .pull_requests import MERGED_PR_LIST_FIELDS, PR_LIST_FIELDS, PR_VIEW_FIELDS
+from ..github_transport.request import GraphQLRequest
 from ..subprocess_runner import no_console_window_kwargs
 
 logger = logging.getLogger(__name__)
@@ -632,12 +634,7 @@ class Transport(CapabilityCollaborator):
         self._list_cache[cache_key] = parsed
         return parsed
 
-    def _graphql_query(
-        self,
-        query: str,
-        *,
-        allow_failure: bool = False,
-    ) -> dict[str, Any]:
+    def _graphql_query(self, query: str) -> dict[str, Any]:
         """Run a single read-only GraphQL query via ``gh api graphql``.
 
         The command is classified as read-only by ``_api_is_mutating`` because
@@ -645,27 +642,10 @@ class Transport(CapabilityCollaborator):
         ``--dry-run``. Raises GitHubError for non-zero exit or a response that
         contains no usable ``data``.
         """
-        result = self.run(
-            [
-                "api",
-                "graphql",
-                "-f",
-                f"query={query}",
-                "-f",
-                f"owner={self._repo_owner_name()[0]}",
-                "-f",
-                f"name={self._repo_owner_name()[1]}",
-            ],
-            json_output=True,
-            allow_failure=allow_failure,
-        )
-
-        if isinstance(result, GitHubRunResult):
-            if not result.ok:
-                raise GitHubError(f"GraphQL query failed: {result.error}")
-            value = result.value
-        else:
-            value = result
+        owner, name = self._repo_owner_name()
+        value, error = send_graphql(self, GraphQLRequest.of(query, {"owner": owner, "name": name}))
+        if error is not None:
+            raise GitHubError(f"GraphQL query failed: {error}")
 
         if not isinstance(value, dict):
             raise GitHubError("GraphQL query returned non-dict JSON")

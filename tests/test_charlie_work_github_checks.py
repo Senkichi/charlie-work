@@ -10,7 +10,7 @@ import json
 import subprocess
 from pathlib import Path
 import pytest
-from _fake_transport import gh_kill_switch_runtime
+from _fake_transport import FakeAdapter, make_github, ok, sent
 from charlie_work import github as github_module
 from charlie_work.config import (
     ConfigError,
@@ -129,46 +129,25 @@ def test_pr_checks_returns_none_on_gh_command_failure(monkeypatch, tmp_path: Pat
     assert checks is None
 
 
-def test_check_run_annotations_returns_parsed_list_on_success(monkeypatch, tmp_path: Path) -> None:
-    def fake_run(*args, **kwargs):
-        return subprocess.CompletedProcess(
-            args=args,
-            returncode=0,
-            stdout=json.dumps(
-                [{"path": "src/foo.py", "start_line": 42, "message": "line too long"}]
-            ),
-            stderr="",
-        )
+def test_check_run_annotations_returns_parsed_list_on_success(tmp_path: Path) -> None:
+    annotations = [{"path": "src/foo.py", "start_line": 42, "message": "line too long"}]
+    gh, http, _ = make_github(tmp_path, http=FakeAdapter("http", [ok(annotations)]))
 
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
+    result = gh.check_run_annotations(999)
 
-    result = github_module.GitHub(
-        tmp_path, runtime=gh_kill_switch_runtime()
-    ).check_run_annotations(999)
-
-    assert result == [{"path": "src/foo.py", "start_line": 42, "message": "line too long"}]
+    assert result == annotations
+    assert sent(http) == [("GET", "repos/{owner}/{repo}/check-runs/999/annotations", None)]
 
 
-def test_check_run_annotations_returns_empty_list_on_api_failure(
-    monkeypatch, tmp_path: Path
-) -> None:
+def test_check_run_annotations_returns_empty_list_on_api_failure(tmp_path: Path) -> None:
     """Issue #771: the annotations accessor must return a value (empty list),
-    never raise, when the gh api call fails -- callers building required_changes
+    never raise, when the API call fails -- callers building required_changes
     from it must never crash the review() codepath on a transient GitHub error."""
+    gh, _, _ = make_github(
+        tmp_path, http=FakeAdapter("http", [ok({"message": "Not Found"}, status=404)])
+    )
 
-    def fake_run(*args, **kwargs):
-        return subprocess.CompletedProcess(
-            args=args,
-            returncode=1,
-            stdout="",
-            stderr="HTTP 404: Not Found",
-        )
-
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
-
-    result = github_module.GitHub(tmp_path).check_run_annotations(999)
-
-    assert result == []
+    assert gh.check_run_annotations(999) == []
 
 
 def test_pr_checks_returns_list_when_checks_fail(monkeypatch, tmp_path: Path) -> None:

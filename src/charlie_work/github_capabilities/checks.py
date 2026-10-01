@@ -14,7 +14,9 @@ import re
 from typing import Any, Protocol, runtime_checkable
 
 from ..checks import _run_id_from_link
+from ..github_transport.request import RestRequest
 from ._base import CapabilityCollaborator, GitHubRunResult
+from ._send import send_result
 
 # Moved from ``github.py`` alongside ``check_graphql_rate_limit`` (Track 2,
 # issue #1588; design doc Section 5, L04). No other ``github.py`` consumer
@@ -140,7 +142,7 @@ class Checks(CapabilityCollaborator):
         not wedge the fleet; callers that need strict enforcement raise
         ``GraphQLBudgetError`` when this returns ``sufficient=False``.
         """
-        result = self.run(["api", "rate_limit"], json_output=True, allow_failure=True)
+        result = send_result(self, RestRequest.of("GET", "rate_limit"), json_output=True)
         data: dict[str, Any] | None = None
         if isinstance(result, GitHubRunResult):
             if not result.ok or not isinstance(result.value, dict):
@@ -227,13 +229,10 @@ class Checks(CapabilityCollaborator):
         Returns job data including steps[]. Used to detect infrastructure failures
         via step counts. Returns None on failure (allow_failure=True).
         """
-        result = self.run(
-            [
-                "api",
-                f"repos/{{owner}}/{{repo}}/actions/jobs/{job_id}",
-            ],
+        result = send_result(
+            self,
+            RestRequest.of("GET", f"repos/{{owner}}/{{repo}}/actions/jobs/{job_id}"),
             json_output=True,
-            allow_failure=True,
         )
         if isinstance(result, GitHubRunResult):
             return result.value if result.ok and isinstance(result.value, dict) else None
@@ -245,13 +244,12 @@ class Checks(CapabilityCollaborator):
         Returns a flat list of annotation objects. Used to detect infrastructure
         failures via billing/runner messages. Returns empty list on failure.
         """
-        result = self.run(
-            [
-                "api",
-                f"repos/{{owner}}/{{repo}}/check-runs/{check_run_id}/annotations",
-            ],
+        result = send_result(
+            self,
+            RestRequest.of(
+                "GET", f"repos/{{owner}}/{{repo}}/check-runs/{check_run_id}/annotations"
+            ),
             json_output=True,
-            allow_failure=True,
         )
         if isinstance(result, GitHubRunResult):
             return result.value if result.ok and isinstance(result.value, list) else []
@@ -270,10 +268,10 @@ class Checks(CapabilityCollaborator):
         does not surface at all). This is the only way to read that message.
         Errors are returned as values, never raised.
         """
-        result = self.run(
-            ["api", f"repos/{{owner}}/{{repo}}/commits/{sha}/check-runs"],
+        result = send_result(
+            self,
+            RestRequest.of("GET", f"repos/{{owner}}/{{repo}}/commits/{sha}/check-runs"),
             json_output=True,
-            allow_failure=True,
         )
         value = result.value if isinstance(result, GitHubRunResult) and result.ok else None
         if not isinstance(value, dict):
@@ -293,10 +291,12 @@ class Checks(CapabilityCollaborator):
         means the query succeeded and GitHub genuinely has zero run objects
         for this SHA. Errors are returned as values, never raised.
         """
-        result = self.run(
-            ["api", f"repos/{{owner}}/{{repo}}/actions/runs?head_sha={head_sha}"],
+        result = send_result(
+            self,
+            RestRequest.of(
+                "GET", "repos/{owner}/{repo}/actions/runs", query={"head_sha": head_sha}
+            ),
             json_output=True,
-            allow_failure=True,
         )
         value = result.value if isinstance(result, GitHubRunResult) and result.ok else None
         if not isinstance(value, dict):

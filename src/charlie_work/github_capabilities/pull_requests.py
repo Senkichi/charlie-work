@@ -77,7 +77,7 @@ from ..github_transport.outcome import Response
 from ..github_transport.request import ACCEPT_DIFF, RestRequest
 from ._base import CapabilityCollaborator, GitHubRunResult, _is_mutating, _LIST_LIMIT
 from ._outcome import failure_text, is_success
-from ._send import send, send_result, send_text
+from ._send import send, send_json, send_result, send_text
 
 # Outbound secret guard (issue #1505): ``pr_create`` scans title+body before
 # any ``gh`` invocation -- a credential in a PR body survives deletion via
@@ -442,16 +442,23 @@ class PullRequests(CapabilityCollaborator):
         merged: list[dict[str, Any]] = []
         max_pages = (_LIST_LIMIT // 100) + 1
         for page in range(1, max_pages + 1):
-            result = self.run(
-                [
-                    "api",
-                    f"repos/{{owner}}/{{repo}}/pulls?state=closed&sort=updated&direction=desc&per_page=100&page={page}",
-                ],
-                json_output=True,
-                # issue #1833: up to _LIST_LIMIT (500) items across pages of
-                # 100, like _list_json's large-limit calls -- legitimately
-                # longer than the fail-fast default.
-                long_call=True,
+            result = send_json(
+                self,
+                RestRequest.of(
+                    "GET",
+                    "repos/{owner}/{repo}/pulls",
+                    query={
+                        "state": "closed",
+                        "sort": "updated",
+                        "direction": "desc",
+                        "per_page": 100,
+                        "page": page,
+                    },
+                    # issue #1833: up to _LIST_LIMIT (500) items across pages
+                    # of 100, like _list_json's large-limit calls --
+                    # legitimately longer than the fail-fast default.
+                    long_call=True,
+                ),
             )
             # run() returns None when gh exits 0 with empty stdout. A genuine
             # empty page comes back as the JSON array ``[]`` (a list), so a
@@ -528,14 +535,14 @@ class PullRequests(CapabilityCollaborator):
         commits than that is outside this project's workflow. Returns
         ``None`` on failure — errors are returned as values, never raised.
         """
-        result = self.run(
-            ["api", f"repos/{{owner}}/{{repo}}/pulls/{number}/commits?per_page=100"],
+        result = send_result(
+            self,
+            RestRequest.of(
+                "GET", f"repos/{{owner}}/{{repo}}/pulls/{number}/commits", query={"per_page": 100}
+            ),
             json_output=True,
-            allow_failure=True,
         )
-        if isinstance(result, GitHubRunResult):
-            return result.value if result.ok and isinstance(result.value, list) else None
-        return result if isinstance(result, list) else None
+        return result.value if result.ok and isinstance(result.value, list) else None
 
     def pr_ready(self, number: int) -> GitHubRunResult:
         """Mark a draft PR as ready for review via ``gh pr ready`` (issue #818).

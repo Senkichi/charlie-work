@@ -11,33 +11,22 @@ import logging
 import subprocess
 from pathlib import Path
 import pytest
-from _fake_transport import FakeAdapter, gh_kill_switch_runtime, make_github, ok, sent
+from _fake_transport import FakeAdapter, make_github, ok, sent
 from charlie_work import github as github_module
 from charlie_work.config import RuntimeConfig
 
 
-def test_github_merged_pr_list_uses_rest_pagination(monkeypatch, tmp_path: Path) -> None:
+def test_github_merged_pr_list_uses_rest_pagination(tmp_path: Path) -> None:
     """merged_pr_list() now uses the REST pulls endpoint instead of the
     GraphQL-backed `gh pr list --state merged`, avoiding expensive field sets
     such as `statusCheckRollup` (issue #361).
     """
-    captured_args: list[list[str]] = []
-
-    def fake_run(cmd, *args, **kwargs):
-        captured_args.append(cmd)
-        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="[]", stderr="")
-
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
-
-    gh = github_module.GitHub(tmp_path, runtime=gh_kill_switch_runtime())
+    gh, http, gh_adapter = make_github(tmp_path, http=FakeAdapter("http", [ok([])]))
     gh.merged_pr_list()
 
-    assert len(captured_args) == 1
-    args = captured_args[0]
-    assert args[:2] == ["gh", "api"]
-    assert "pulls" in args[2]
-    assert "state=closed" in args[2]
-    assert not any(c[:2] == ["gh", "pr"] and "merged" in c for c in captured_args)
+    assert sent(http) == [("GET", "repos/{owner}/{repo}/pulls", None)]
+    assert dict(http.api_requests[0].query)["state"] == "closed"  # type: ignore[union-attr]
+    assert gh_adapter.api_requests == []
 
 
 def test_github_merged_pr_list_retries_on_transient_gateway_error(
@@ -47,29 +36,15 @@ def test_github_merged_pr_list_retries_on_transient_gateway_error(
     in-pass (bounded) instead of immediately failing the whole fleet pass for
     that repo (issue #361). Succeeds on the 2nd attempt here.
     """
-    call_count = 0
     sleeps: list[float] = []
-
-    def fake_run(cmd, *args, **kwargs):
-        nonlocal call_count
-        call_count += 1
-        if call_count == 1:
-            return subprocess.CompletedProcess(
-                args=cmd,
-                returncode=1,
-                stdout="",
-                stderr="HTTP 502: 502 Bad Gateway (https://api.github.com/graphql)",
-            )
-        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="[]", stderr="")
-
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
     monkeypatch.setattr(github_module.time, "sleep", lambda seconds: sleeps.append(seconds))
+    http = FakeAdapter("http", [ok("Bad Gateway", status=502), ok([])])
+    gh, http, _ = make_github(tmp_path, http=http)
 
-    gh = github_module.GitHub(tmp_path, runtime=gh_kill_switch_runtime())
     result = gh.merged_pr_list()
 
     assert result == []
-    assert call_count == 2
+    assert len(http.api_requests) == 2
     assert len(sleeps) == 1
 
 
@@ -78,32 +53,14 @@ def test_github_merged_pr_list_gives_up_after_max_retries(monkeypatch, tmp_path:
     forever — so the per-repo fleet-pass boundary can still catch it and move
     on to the next repo.
     """
-    call_count = 0
-
-    def fake_run(cmd, *args, **kwargs):
-        nonlocal call_count
-        call_count += 1
-        return subprocess.CompletedProcess(
-            args=cmd,
-            returncode=1,
-            stdout="",
-            stderr="HTTP 502: 502 Bad Gateway (https://api.github.com/graphql)",
-        )
-
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
     monkeypatch.setattr(github_module.time, "sleep", lambda seconds: None)
+    http = FakeAdapter("http", [ok("Bad Gateway", status=502)])
+    gh, http, _ = make_github(tmp_path, http=http, runtime=RuntimeConfig(gh_max_retries=2))
 
-    # gh_transport="gh": `merged_pr_list`'s REST-GET pagination shape is an
-    # HTTP-transport candidate (issue #1834), and RuntimeConfig's
-    # gh_transport field defaults to "http" -- pinning "gh" here keeps this
-    # test exercising the gh-subprocess retry path it was written to test
-    # via `fake_run` (the HTTP path has its own coverage in
-    # tests/test_http_transport.py).
-    gh = github_module.GitHub(tmp_path, runtime=RuntimeConfig(gh_max_retries=2, gh_transport="gh"))
     with pytest.raises(github_module.GitHubError):
         gh.merged_pr_list()
 
-    assert call_count == 3
+    assert len(http.api_requests) == 3
 
 
 def test_github_merged_pr_list_does_not_retry_non_transient_error(

@@ -193,46 +193,37 @@ def test_pr_list_delegate_uses_owner_shared_list_cache(tmp_path: Path) -> None:
     assert gh._pull_requests.__dict__.get("_list_cache") is None
 
 
-def test_merged_pr_list_delegate_forwards_through_run(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """Calling ``gh.merged_pr_list()`` through the delegate must reach the
-    patched class-level ``GitHub.run`` with the same argv the moved body
-    produces for its first REST page, and filter to merged PRs only.
+def test_merged_pr_list_delegate_forwards_through_run(tmp_path: Path) -> None:
+    """Calling ``gh.merged_pr_list()`` through the delegate must GET the first
+    REST page of closed PRs and filter to merged PRs only.
 
-    The expected argv is transcribed by reading the moved
+    The expected request is transcribed by reading the moved
     ``PullRequests.merged_pr_list`` body directly.
     """
-    calls: list[tuple[list[str], bool]] = []
 
-    def fake_run(
-        self: GitHub, args: list[str], *, json_output: bool = False, long_call: bool = False
-    ) -> list[dict]:
-        calls.append((args, json_output))
-        if len(calls) == 1:
-            return [
-                {"number": 1, "merged_at": "2026-01-01T00:00:00Z"},
-                {"number": 2, "merged_at": None},
-            ]
-        return []
+    def pr(number: int, merged_at: str | None) -> dict:
+        return {
+            "number": number,
+            "title": "t",
+            "body": "",
+            "merged_at": merged_at,
+            "head": {"ref": f"b{number}", "sha": "s", "repo": {"full_name": "o/r"}},
+            "base": {"repo": {"full_name": "o/r"}},
+        }
 
-    def fake_normalize_rest_pr(self: GitHub, pr: dict) -> dict:
-        return pr
-
-    monkeypatch.setattr(GitHub, "run", fake_run)
-    monkeypatch.setattr(GitHub, "_normalize_rest_pr", fake_normalize_rest_pr)
-
-    gh = GitHub(tmp_path)
+    page = [pr(1, "2026-01-01T00:00:00Z"), pr(2, None)]
+    gh, http, _ = make_github(tmp_path, http=FakeAdapter("http", [ok(page), ok([])]))
     result = gh.merged_pr_list()
 
-    assert result == [{"number": 1, "merged_at": "2026-01-01T00:00:00Z"}]
-    assert calls[0] == (
-        [
-            "api",
-            "repos/{owner}/{repo}/pulls?state=closed&sort=updated&direction=desc&per_page=100&page=1",
-        ],
-        True,
-    )
+    assert [item["number"] for item in result] == [1]
+    assert sent(http)[0] == ("GET", "repos/{owner}/{repo}/pulls", None)
+    assert dict(http.api_requests[0].query) == {  # type: ignore[union-attr]
+        "state": "closed",
+        "sort": "updated",
+        "direction": "desc",
+        "per_page": "100",
+        "page": "1",
+    }
 
 
 def test_merged_pr_list_delegate_raises_githuberror_on_bad_shape(
@@ -302,36 +293,20 @@ def test_pr_diff_delegate_forwards_through_run(tmp_path: Path) -> None:
     assert http.api_requests[0].accept == "application/vnd.github.v3.diff"  # type: ignore[union-attr]
 
 
-def test_pr_commits_delegate_forwards_through_run(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """Calling ``gh.pr_commits(number)`` through the delegate must reach the
-    patched class-level ``GitHub.run`` with the same argv the moved body
-    produces, unwrapping a ``GitHubRunResult`` to its ``.value`` list.
+def test_pr_commits_delegate_forwards_through_run(tmp_path: Path) -> None:
+    """Calling ``gh.pr_commits(number)`` through the delegate must GET
+    ``pulls/{n}/commits`` and return the parsed list.
 
-    The expected argv is transcribed by reading the moved
+    The expected request is transcribed by reading the moved
     ``PullRequests.pr_commits`` body directly.
     """
-    calls: list[tuple[list[str], bool, bool]] = []
     commits = [{"commit": {"message": "subject\n\nbody"}}]
-
-    def fake_run(
-        self: GitHub, args: list[str], *, json_output: bool = False, allow_failure: bool = False
-    ) -> _github_module.GitHubRunResult:
-        calls.append((args, json_output, allow_failure))
-        return _github_module.GitHubRunResult(
-            ok=True, returncode=0, stdout="", stderr="", value=commits
-        )
-
-    monkeypatch.setattr(GitHub, "run", fake_run)
-
-    gh = GitHub(tmp_path)
+    gh, http, _ = make_github(tmp_path, http=FakeAdapter("http", [ok(commits)]))
     result = gh.pr_commits(11)
 
     assert result == commits
-    assert calls == [
-        (["api", "repos/{owner}/{repo}/pulls/11/commits?per_page=100"], True, True),
-    ]
+    assert sent(http) == [("GET", "repos/{owner}/{repo}/pulls/11/commits", None)]
+    assert dict(http.api_requests[0].query) == {"per_page": "100"}  # type: ignore[union-attr]
 
 
 def test_pr_ready_delegate_forwards_through_run(

@@ -45,11 +45,13 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from _fake_transport import FakeTransport
 
 from charlie_work.config import RuntimeConfig
-from charlie_work.github import GitHub, GitHubError, GitHubRunResult
+from charlie_work.github import GitHub, GitHubError
 from charlie_work.github_capabilities import http_transport
 from charlie_work.github_transport import http_adapter
+from charlie_work.github_transport.outcome import Response, parse_graphql_errors
 
 
 class _FakeResponse:
@@ -85,6 +87,21 @@ class _FakeConnection:
 
     def close(self):
         pass
+
+
+def _graphql_response(body: dict, *, status: int = 200) -> Response:
+    """What the transport hands back for a GraphQL answer: the body text plus
+    the typed per-node errors the adapters extract from it."""
+    errors = parse_graphql_errors(body.get("errors"))
+    return Response(status, (), json.dumps(body), "http", graphql_errors=errors)
+
+
+def _serve_graphql(gh: GitHub, outcome) -> FakeTransport:
+    """Answer every GraphQL request *gh* sends with *outcome* (the issue-view
+    fallback still goes through ``GitHub.run``, patched per test)."""
+    transport = FakeTransport(lambda request: outcome)
+    object.__setattr__(gh, "_transport_v2", transport)
+    return transport
 
 
 def _partial_body(*, resolved: dict[str, dict], unresolved: list[int]) -> dict:
@@ -155,19 +172,7 @@ def test_graphql_issue_states_omits_unresolved_numbers(
         unresolved=[361],
     )
 
-    def fake_run(self, args, *, json_output=False, allow_failure=False, long_call=False):
-        return GitHubRunResult(
-            ok=False,
-            returncode=1,
-            stdout=json.dumps(body),
-            stderr="GraphQL: Could not resolve to an Issue with the number of 361. "
-            "(repository.s_361)",
-            value=body,
-            error="GraphQL: Could not resolve to an Issue with the number of 361. "
-            "(repository.s_361)",
-        )
-
-    monkeypatch.setattr(GitHub, "run", fake_run)
+    _serve_graphql(gh, _graphql_response(body))
     assert gh._graphql_issue_states([1, 2, 361]) == {1: True, 2: False}
 
 
@@ -180,17 +185,7 @@ def test_graphql_issue_states_still_raises_without_usable_data(
     gh = GitHub(tmp_path)
     gh._list_cache[("_repo_owner_name",)] = ("o", "r")
 
-    def fake_run(self, args, *, json_output=False, allow_failure=False, long_call=False):
-        return GitHubRunResult(
-            ok=False,
-            returncode=1,
-            stdout="",
-            stderr="HTTP 502: 502 Bad Gateway (https://api.github.com/graphql)",
-            value=None,
-            error="HTTP 502: 502 Bad Gateway (https://api.github.com/graphql)",
-        )
-
-    monkeypatch.setattr(GitHub, "run", fake_run)
+    _serve_graphql(gh, Response(502, (), "Bad Gateway", "http"))
     with pytest.raises(GitHubError):
         gh._graphql_issue_states([1])
 
@@ -212,18 +207,9 @@ def test_are_issues_open_per_issue_fallback_covers_only_unresolved(
     )
     issue_view_calls: list[int] = []
 
+    _serve_graphql(gh, _graphql_response(body))
+
     def fake_run(self, args, *, json_output=False, allow_failure=False, long_call=False):
-        if args[:2] == ["api", "graphql"]:
-            return GitHubRunResult(
-                ok=False,
-                returncode=1,
-                stdout=json.dumps(body),
-                stderr="GraphQL: Could not resolve to an Issue with the number of 361. "
-                "(repository.s_361)",
-                value=body,
-                error="GraphQL: Could not resolve to an Issue with the number of 361. "
-                "(repository.s_361)",
-            )
         assert args[:2] == ["issue", "view"]
         number = int(args[2])
         issue_view_calls.append(number)
@@ -249,16 +235,9 @@ def test_are_issues_open_full_fallback_when_batch_yields_no_data(
     gh._list_cache[("_repo_owner_name",)] = ("o", "r")
     issue_view_calls: list[int] = []
 
+    _serve_graphql(gh, Response(502, (), "HTTP 502", "http"))
+
     def fake_run(self, args, *, json_output=False, allow_failure=False, long_call=False):
-        if args[:2] == ["api", "graphql"]:
-            return GitHubRunResult(
-                ok=False,
-                returncode=1,
-                stdout="",
-                stderr="HTTP 502",
-                value=None,
-                error="HTTP 502",
-            )
         assert args[:2] == ["issue", "view"]
         number = int(args[2])
         issue_view_calls.append(number)
@@ -310,20 +289,17 @@ def test_are_issues_open_emits_telemetry_for_partial_batch_fallback(
         events.append((kind, payload))
 
     def fake_run(self, args, *, json_output=False, allow_failure=False, long_call=False):
-        if args[:2] == ["api", "graphql"]:
-            body = _partial_body(
+        return {"number": int(args[2]), "state": "CLOSED"}
+
+    def answer(request):
+        return _graphql_response(
+            _partial_body(
                 resolved={"s_1": {"number": 1, "state": "OPEN"}},
                 unresolved=unresolved_numbers,
             )
-            return GitHubRunResult(
-                ok=False,
-                returncode=1,
-                stdout=json.dumps(body),
-                stderr="GraphQL: Could not resolve to an Issue.",
-                value=body,
-                error="GraphQL: Could not resolve to an Issue.",
-            )
-        return {"number": int(args[2]), "state": "CLOSED"}
+        )
+
+    object.__setattr__(gh, "_transport_v2", FakeTransport(answer))
 
     def new_pass() -> None:
         # Simulate a pass boundary in the single-repo supervisor

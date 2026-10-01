@@ -15,14 +15,12 @@ from pathlib import Path
 
 import pytest
 
-from _fake_transport import gh_kill_switch_runtime
+from _fake_transport import FakeAdapter, make_github, ok
 from charlie_work import github as github_module
 from _github_fixtures import _read_fixture
 
 
-def test_merged_pr_list_uses_rest_pagination_and_filters_merged(
-    monkeypatch, tmp_path: Path
-) -> None:
+def test_merged_pr_list_uses_rest_pagination_and_filters_merged(tmp_path: Path) -> None:
     """merged_pr_list() now paginates through the REST pulls endpoint and
     filters to merged PRs, avoiding the GraphQL query entirely.
     """
@@ -50,23 +48,8 @@ def test_merged_pr_list_uses_rest_pagination_and_filters_merged(
             "state": "closed",
         },
     ]
-    call_log: list[list[str]] = []
-    pull_call_count = 0
+    gh, http, gh_adapter = make_github(tmp_path, http=FakeAdapter("http", [ok(page1), ok([])]))
 
-    def fake_run(cmd, *args, **kwargs):
-        nonlocal pull_call_count
-        call_log.append(cmd)
-        if cmd[:2] == ["gh", "api"] and "pulls" in cmd[2]:
-            pull_call_count += 1
-            if pull_call_count == 1:
-                return subprocess.CompletedProcess(
-                    args=cmd, returncode=0, stdout=json.dumps(page1), stderr=""
-                )
-        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="[]", stderr="")
-
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
-
-    gh = github_module.GitHub(tmp_path, runtime=gh_kill_switch_runtime())
     result = gh.merged_pr_list()
 
     assert result == [
@@ -82,12 +65,15 @@ def test_merged_pr_list_uses_rest_pagination_and_filters_merged(
             "mergedAt": "2026-07-21T20:00:00Z",
         }
     ]
-    assert pull_call_count >= 1
-    assert any("pulls?state=closed" in c[2] for c in call_log)
-    assert not any(c[:2] == ["gh", "pr"] for c in call_log)
+    assert len(http.api_requests) >= 1
+    assert all(
+        r.route == "repos/octo/hello/pulls" and dict(r.query)["state"] == "closed"  # type: ignore[union-attr]
+        for r in http.api_requests
+    )
+    assert gh_adapter.api_requests == []
 
 
-def test_merged_pr_list_raises_on_rest_pagination_error(monkeypatch, tmp_path: Path) -> None:
+def test_merged_pr_list_raises_on_rest_pagination_error(tmp_path: Path) -> None:
     """A terminal REST failure during pagination raises GitHubError."""
     merged_pr = {
         "number": 1,
@@ -98,26 +84,13 @@ def test_merged_pr_list_raises_on_rest_pagination_error(monkeypatch, tmp_path: P
         "merged_at": "2026-07-21T20:00:00Z",
         "state": "closed",
     }
-    call_count = 0
+    replies = [ok([merged_pr]), ok({"message": "Not Found"}, status=404)]
+    gh, http, _ = make_github(tmp_path, http=FakeAdapter("http", replies))
 
-    def fake_run(cmd, *args, **kwargs):
-        nonlocal call_count
-        call_count += 1
-        if call_count == 1:
-            return subprocess.CompletedProcess(
-                args=cmd, returncode=0, stdout=json.dumps([merged_pr]), stderr=""
-            )
-        return subprocess.CompletedProcess(
-            args=cmd, returncode=1, stdout="", stderr="HTTP 401: Bad credentials"
-        )
-
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
-
-    gh = github_module.GitHub(tmp_path, runtime=gh_kill_switch_runtime())
     with pytest.raises(github_module.GitHubError):
         gh.merged_pr_list()
 
-    assert call_count == 2
+    assert len(http.api_requests) == 2
 
 
 def test_merged_pr_list_raises_on_empty_stdout_not_silent_empty(
@@ -154,26 +127,16 @@ def test_merged_pr_list_raises_on_empty_stdout_not_silent_empty(
     assert call_count == 1
 
 
-def test_merged_pr_list_empty_page_terminates_cleanly(monkeypatch, tmp_path: Path) -> None:
+def test_merged_pr_list_empty_page_terminates_cleanly(tmp_path: Path) -> None:
     """A genuine empty page (``[]``) terminates pagination without raising.
 
     This is the positive counterpart to test_merged_pr_list_raises_on_empty_stdout:
     a real empty page is a list (``[]``) and must keep being treated as "no more
     results", not as an unusable response.
     """
-    responses = ["[]"]
+    gh, _, _ = make_github(tmp_path, http=FakeAdapter("http", [ok([])]))
 
-    def fake_run(cmd, *args, **kwargs):
-        return subprocess.CompletedProcess(
-            args=cmd, returncode=0, stdout=responses.pop(0), stderr=""
-        )
-
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
-
-    gh = github_module.GitHub(tmp_path, runtime=gh_kill_switch_runtime())
-    result = gh.merged_pr_list()
-
-    assert result == []
+    assert gh.merged_pr_list() == []
 
 
 def test_merged_prs_for_issue_returns_bound_pr_without_graphql_budget_check(
@@ -379,7 +342,7 @@ def test_normalize_rest_pr_merge_commit_oid_is_none_when_absent() -> None:
     assert normalized["mergeCommitOid"] is None
 
 
-def test_merged_pr_list_exposes_head_ref_oid_end_to_end(monkeypatch, tmp_path: Path) -> None:
+def test_merged_pr_list_exposes_head_ref_oid_end_to_end(tmp_path: Path) -> None:
     """The full REST path — not just the normalizer — must surface headRefOid,
     since merged_pr_list() is REST-only by construction (issue #361)."""
     page = [
@@ -392,16 +355,8 @@ def test_merged_pr_list_exposes_head_ref_oid_end_to_end(monkeypatch, tmp_path: P
             "base": {"repo": {"full_name": "o/r"}},
         }
     ]
-    responses = [json.dumps(page), "[]"]
+    gh, _, _ = make_github(tmp_path, http=FakeAdapter("http", [ok(page), ok([])]))
 
-    def fake_run(cmd, *args, **kwargs):
-        return subprocess.CompletedProcess(
-            args=cmd, returncode=0, stdout=responses.pop(0), stderr=""
-        )
-
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
-
-    gh = github_module.GitHub(tmp_path, runtime=gh_kill_switch_runtime())
     merged = gh.merged_pr_list()
 
     assert len(merged) == 1

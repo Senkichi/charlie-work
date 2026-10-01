@@ -9,51 +9,34 @@ bodies are verbatim relocations; shared helpers live in
 
 from __future__ import annotations
 
-import json
 import subprocess
 from pathlib import Path
 
-from _fake_transport import FakeAdapter, gh_kill_switch_runtime, make_github, ok, sent
+from _fake_transport import FakeAdapter, make_github, ok, sent
 from charlie_work import github as github_module
 from charlie_work.config import RuntimeConfig
 from _github_fixtures import _read_fixture
 
 
-def test_check_graphql_rate_limit_parses_live_payload(monkeypatch, tmp_path: Path) -> None:
-    """Issue #398: the rate-limit guard must parse a live ``gh api rate_limit`` payload."""
+def test_check_graphql_rate_limit_parses_live_payload(tmp_path: Path) -> None:
+    """Issue #398: the rate-limit guard must parse a live ``rate_limit`` payload."""
     rate_limit_json = _read_fixture("gh_rate_limit.json")
+    gh, http, _ = make_github(tmp_path, http=FakeAdapter("http", [ok(rate_limit_json)]))
 
-    def fake_run(cmd, *args, **kwargs):
-        assert cmd[:3] == ["gh", "api", "rate_limit"]
-        return subprocess.CompletedProcess(
-            args=cmd, returncode=0, stdout=rate_limit_json, stderr=""
-        )
-
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
-
-    gh = github_module.GitHub(tmp_path, runtime=gh_kill_switch_runtime())
     sufficient, remaining, reset_at = gh.check_graphql_rate_limit(threshold=1500)
 
     # Fixture has graphql.remaining == 4114, reset is a unix timestamp.
     assert sufficient is True
     assert remaining == 4114
     assert isinstance(reset_at, int)
+    assert sent(http) == [("GET", "rate_limit", None)]
 
 
-def test_check_graphql_rate_limit_below_threshold_returns_insufficient(
-    monkeypatch, tmp_path: Path
-) -> None:
+def test_check_graphql_rate_limit_below_threshold_returns_insufficient(tmp_path: Path) -> None:
     """Issue #398: when remaining points are below the threshold the guard reports insufficient."""
     rate_limit_json = _read_fixture("gh_rate_limit.json")
+    gh, _, _ = make_github(tmp_path, http=FakeAdapter("http", [ok(rate_limit_json)]))
 
-    def fake_run(cmd, *args, **kwargs):
-        return subprocess.CompletedProcess(
-            args=cmd, returncode=0, stdout=rate_limit_json, stderr=""
-        )
-
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
-
-    gh = github_module.GitHub(tmp_path, runtime=gh_kill_switch_runtime())
     sufficient, remaining, reset_at = gh.check_graphql_rate_limit(threshold=5000)
 
     assert sufficient is False
@@ -61,34 +44,18 @@ def test_check_graphql_rate_limit_below_threshold_returns_insufficient(
     assert isinstance(reset_at, int)
 
 
-def test_compare_diff_hits_three_dot_compare_with_diff_media_type(
-    monkeypatch, tmp_path: Path
-) -> None:
+def test_compare_diff_hits_three_dot_compare_with_diff_media_type(tmp_path: Path) -> None:
     """compare_diff must call the three-dot compare endpoint with the diff
     media type Accept header (not the default JSON compare metadata), and
     return the raw response body unwrapped from GitHubRunResult."""
-    seen_cmd: list[str] = []
+    diff = "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1 +1 @@\n-old\n+new\n"
+    gh, http, _ = make_github(tmp_path, http=FakeAdapter("http", [ok(diff)]))
 
-    def fake_run(cmd, *args, **kwargs):
-        seen_cmd.extend(cmd)
-        return subprocess.CompletedProcess(
-            args=cmd,
-            returncode=0,
-            stdout="diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1 +1 @@\n-old\n+new\n",
-            stderr="",
-        )
-
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
-
-    gh = github_module.GitHub(tmp_path, runtime=gh_kill_switch_runtime())
     result = gh.compare_diff("sha-old", "sha-new")
 
-    assert seen_cmd[:2] == ["gh", "api"]
-    assert seen_cmd[2] == "repos/{owner}/{repo}/compare/sha-old...sha-new"
-    assert "-H" in seen_cmd
-    h_idx = seen_cmd.index("-H")
-    assert seen_cmd[h_idx + 1] == "Accept: application/vnd.github.v3.diff"
-    assert result == "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1 +1 @@\n-old\n+new"
+    assert sent(http) == [("GET", "repos/{owner}/{repo}/compare/sha-old...sha-new", None)]
+    assert http.api_requests[0].accept == "application/vnd.github.v3.diff"  # type: ignore[union-attr]
+    assert result == diff.strip()
 
 
 def test_compare_diff_returns_none_on_failure(monkeypatch, tmp_path: Path) -> None:
@@ -117,7 +84,7 @@ def test_compare_diff_returns_none_on_failure(monkeypatch, tmp_path: Path) -> No
     assert result is None
 
 
-def test_commit_check_runs_wraps_rest_endpoint(monkeypatch, tmp_path: Path) -> None:
+def test_commit_check_runs_wraps_rest_endpoint(tmp_path: Path) -> None:
     """reconcile.py's aviator_stale_blocked detection needs output.summary,
     which gh pr checks --json cannot surface (its description field is always
     empty for App-created Check Runs) -- this is the only path that can."""
@@ -138,19 +105,11 @@ def test_commit_check_runs_wraps_rest_endpoint(monkeypatch, tmp_path: Path) -> N
             }
         ]
     }
+    gh, http, _ = make_github(tmp_path, http=FakeAdapter("http", [ok(payload)]))
 
-    def fake_run(cmd, *args, **kwargs):
-        assert cmd[:2] == ["gh", "api"]
-        assert cmd[2] == "repos/{owner}/{repo}/commits/abc123/check-runs"
-        return subprocess.CompletedProcess(
-            args=cmd, returncode=0, stdout=json.dumps(payload), stderr=""
-        )
-
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
-
-    gh = github_module.GitHub(tmp_path, runtime=gh_kill_switch_runtime())
     check_runs = gh.commit_check_runs("abc123")
 
+    assert sent(http) == [("GET", "repos/{owner}/{repo}/commits/abc123/check-runs", None)]
     assert check_runs is not None
     assert check_runs[0]["name"] == "aviator/checks"
     assert check_runs[0]["conclusion"] == "failure"
