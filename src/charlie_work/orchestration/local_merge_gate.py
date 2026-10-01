@@ -54,6 +54,7 @@ from typing import Any
 
 import charlie_work.workflow as _wf
 from charlie_work import local_suite_runner
+from charlie_work.local_approval_carry import approval_survives_head_move
 from charlie_work.labels import TransitionOutcome
 from charlie_work.local_gate_infra import (
     LOCAL_SUITE_GATE_MAX_INFRA_RELAUNCHES,  # noqa: F401  (re-export; defined with the classifier)
@@ -63,7 +64,6 @@ from charlie_work.local_gate_infra import (
 )
 from charlie_work.local_lane import (
     _iso_dt,
-    branch_diff,
     branch_head_sha,
     ensure_branch_worktree,
     local_base_branch,
@@ -193,13 +193,7 @@ def _local_merge_approved(self) -> list[dict[str, Any]]:
             # (a rogue push, rework landing mid-gate) falls through to the
             # packet phase's rebuild + re-review -- and kills the suite,
             # which is testing a superseded head.
-            reviewed_patch = decision.get("reviewed_patch_id")
-            live_diff = branch_diff(self.repo_root, base_ref, branch)
-            if not (
-                reviewed_patch
-                and live_diff is not None
-                and _wf._calculate_patch_id(live_diff) == reviewed_patch
-            ):
+            if not approval_survives_head_move(self.repo_root, base_ref, branch, decision):
                 if claimed:
                     self._local_gate_abort(
                         pr_key,
