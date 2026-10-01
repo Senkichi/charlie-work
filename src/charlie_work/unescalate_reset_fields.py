@@ -90,6 +90,10 @@ UNESCALATE_PR_RESET_FIELDS = (
     # silently suppress a fresh event even after an operator re-arms the
     # PR and the same head is still stuck.
     "ci_run_never_created_head",
+    # Issue #1681: same dedup-marker hazard for the workflow_no_jobs event.
+    "workflow_no_jobs_head",
+    # Issue #1681: bounds the same-head re-probe; stale after a re-arm.
+    "ci_absence_probed_attempts",
     "escalation_reason",
     # Issue #1461: clear the append-only escalation history so a re-arm
     # gives every lane a genuinely fresh dedup slate.

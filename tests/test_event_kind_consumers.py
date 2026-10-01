@@ -61,6 +61,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from _dws_emit_scan import is_decide_module, sweep_emit_kind
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC = REPO_ROOT / "src" / "charlie_work"
 TESTS_DIR = REPO_ROOT / "tests"
@@ -475,6 +477,7 @@ def _scan_emit_sites_in_tree(
             module_constants[name] = set().union(*parts)
 
     sites: list[EmitSite] = []
+    in_decide = is_decide_module(rel_path)
 
     def scan(
         node: ast.AST,
@@ -482,7 +485,22 @@ def _scan_emit_sites_in_tree(
         local_params: frozenset[str],
         scope_name: str,
     ) -> None:
-        if isinstance(node, ast.Call):
+        sweep_site = sweep_emit_kind(node, rel_path.rpartition("/")[2]) if in_decide else None
+        if sweep_site is not None:
+            # The literal kind is chosen here; the apply shell only forwards it.
+            _record_site(
+                node,
+                sweep_site[0],
+                "emit" if isinstance(node, ast.Call) else "event_kind",
+                local_assigns,
+                local_params,
+                module_constants,
+                module_funcs,
+                scope_name,
+                rel_path,
+                sites,
+            )
+        elif isinstance(node, ast.Call):
             fname = _call_func_name(node)
             if fname in EMIT_FUNC_NAMES:
                 pos, kw = KIND_ARG_SPEC
@@ -552,7 +570,7 @@ def _scan_emit_sites_in_tree(
 
 
 def _record_site(
-    call: ast.Call,
+    call: ast.Call | ast.keyword,
     kind_node: ast.expr | None,
     func_name: str,
     local_assigns: dict[str, list[ast.expr]],
@@ -1115,6 +1133,57 @@ def test_new_unconsumed_kind_with_marker_is_accepted(tmp_path: Path) -> None:
     assert not report.unaccounted
     assert not report.unmarked_dynamic
     assert not report.orphan_markers
+
+
+def _sweep_fixture(tmp_path: Path, body: str) -> Path:
+    root = tmp_path / "src"
+    package = root / "dead_worker_sweep"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "decide_fixture.py").write_text(body, encoding="utf-8")
+    return root
+
+
+def test_sweep_decide_emit_without_consumer_or_marker_fails(tmp_path: Path) -> None:
+    """#2112: ``emit("<kind>", ...)`` in a ``dead_worker_sweep/decide*.py`` is an emit site."""
+    root = _sweep_fixture(
+        tmp_path,
+        "def decide():\n"
+        '    return emit("fixture_unconsumed_kind", {})\n'
+        "\n"
+        "def decide_stalled():\n"
+        '    return StateTxn(event_kind="fixture_unconsumed_txn_kind")\n',
+    )
+    report = _analyze(root, tests_root=None, heartbeat_paths=None)
+    offending = {u.kind: u for u in report.unaccounted}
+    assert set(offending) == {"fixture_unconsumed_kind", "fixture_unconsumed_txn_kind"}
+    assert offending["fixture_unconsumed_kind"].sites[0].lineno == 2
+
+
+def test_sweep_decide_emit_with_marker_is_accepted(tmp_path: Path) -> None:
+    root = _sweep_fixture(
+        tmp_path,
+        "def decide():\n"
+        '    return emit("fixture_unconsumed_kind", {})  # event-consumer: audit-only fixture\n',
+    )
+    report = _analyze(root, tests_root=None, heartbeat_paths=None)
+    assert not report.unaccounted
+    assert not report.orphan_markers
+
+
+def test_emit_outside_a_decide_module_is_not_a_sweep_site(tmp_path: Path) -> None:
+    root = _sweep_fixture(tmp_path, "")
+    (root / "dead_worker_sweep" / "apply_fixture.py").write_text(
+        'def go():\n    return emit("fixture_unconsumed_kind", {})\n', encoding="utf-8"
+    )
+    assert not _analyze(root, tests_root=None, heartbeat_paths=None).emit_sites
+
+
+def test_the_real_sweep_decide_modules_yield_emit_sites() -> None:
+    """Positive control: the real package is reached, so a clean report is not a blind one."""
+    sites = [s for s in _scan_emit_sites(SRC) if s.func_name in {"emit", "event_kind"}]
+    assert len(sites) > 10, f"only {len(sites)} sweep emit sites found -- the walk is broken"
+    assert all(is_decide_module(s.path) for s in sites)
 
 
 def test_non_literal_kind_argument_without_marker_fails(tmp_path: Path) -> None:
