@@ -67,13 +67,9 @@ def test_flat_and_unchanged_and_from_zero() -> None:
     cur, pri = pair({"a": [3, 3, 3]}, {"a": [3, 3, 3]})
     assert takeaway(cur, pri) == "Merges/day flat vs prior 3d (+0%)"
     cur, pri = pair({"a": [1, 1, 3]}, {"a": [0, 0, 0]})
-    cur = replace(cur, n=9)
-    pri = replace(pri, n=5)
-    assert takeaway(cur, pri) == "Merges/day up from 0 vs prior 3d"
-    cur, pri = pair({"a": [0, 0, 0]}, {"a": [0, 0, 0]})
-    assert (
-        takeaway(replace(cur, n=5), replace(pri, n=5)) == "Merges/day unchanged at 0 vs prior 3d"
-    )
+    assert takeaway(cur, pri) == "Merges/day up from 0 to 1.67 vs prior 3d"
+    cur, pri = pair({"a": [0, 0, 0]}, {"a": [0, 0, 0]})  # real zeros inside coverage
+    assert takeaway(cur, pri) == "Merges/day unchanged at 0 vs prior 3d"
 
 
 def test_not_enough_data_below_minimum_sample() -> None:
@@ -92,9 +88,7 @@ def test_gauge_uses_bucket_mean_and_approx_suffix() -> None:
 def test_never_claims_a_trend_inside_a_coverage_gap() -> None:
     cur, pri = pair({"a": [9, 9, 9]}, {"a": [2, 2, 2]})
     started_late = replace(cur, coverage_start="2026-10-03T00:00:00Z")
-    assert takeaway(started_late, pri) == (
-        "Merges/day: no trend claimed, history starts 2026-10-03T00:00:00Z"
-    )
+    assert takeaway(started_late, pri) == "not comparable: merges_per_day starts 2026-10-03"
     ended_early = replace(cur, coverage_end="2026-10-05T00:00:00Z")
     assert takeaway(ended_early, pri) == (
         "Merges/day: no trend claimed, data ends 2026-10-05T00:00:00Z"
@@ -116,10 +110,41 @@ def test_headlines_from_a_real_rollup(ro_db) -> None:
     early = MetricQuery(PRIOR.start, PRIOR.end, PRIOR.bucket)  # its prior starts 09-17
     s = flow.merges_per_day(ro_db, early)
     assert takeaway(s, flow.merges_per_day(ro_db, early.prior())) == (
-        f"Merges/day: no trend claimed, history starts {day(-6, 1)}"
+        "not comparable: merges_per_day starts 2026-09-25"  # first merge evidence, 09-25T12
     )
     share = quality.salvage_share(ro_db, CURRENT)
     assert takeaway(share, quality.salvage_share(ro_db, PRIOR)) == (
-        "Salvage share: not enough data vs prior 7d"
+        "not comparable: salvage_share starts 2026-10-03"  # worker_handoff_pr_opened first seen
     )
     assert ALPHA in flow.merges_per_day(ro_db, CURRENT).per_repo
+
+
+def test_partial_series_headlines_say_so() -> None:
+    cur, pri = pair(
+        {"a": [4, 4, 4], "b": [1, 1, 1]}, {"a": [1, 1, 1], "b": [1, 1, 1]}, partial=True
+    )
+    assert takeaway(cur, pri) == "Merges/day ↑150% vs prior 3d, driven by a (partial)"
+    cur, pri = pair({"a": [0, 0, 0]}, {"a": [0, 0, 0]}, partial=True, approx=True)
+    assert takeaway(cur, pri) == "Merges/day unchanged at 0 vs prior 3d (approx.) (partial)"
+
+
+def test_a_gauge_over_a_single_bucket_is_not_enough_data() -> None:
+    cur, pri = pair({"a": [6]}, {"a": [4]}, kind="gauge", label="Lead time")
+    assert takeaway(cur, pri, min_sample=1) == "Lead time: not enough data vs prior 3d"
+    cur, pri = pair({"a": [6, 6]}, {"a": [4]}, kind="gauge", label="Lead time")
+    assert takeaway(cur, pri, min_sample=1) == "Lead time: not enough data vs prior 3d"
+
+
+def test_zero_baseline_count_states_the_absolute_change_without_a_sample_floor() -> None:
+    cur, pri = pair({"a": [3, 0, 0]}, {"a": [0, 0, 0]})  # n = 3 < MIN_SAMPLE, prior n = 0
+    assert takeaway(cur, pri) == "Merges/day up from 0 to 1 vs prior 3d"
+    # a gauge's zero baseline still needs its samples (an idle reading is not a count of events)
+    cur, pri = pair({"a": [3, 3]}, {"a": [0, 0]}, kind="gauge", label="Wip")
+    assert takeaway(cur, pri, min_sample=5) == "Wip: not enough data vs prior 3d"
+    assert takeaway(replace(cur, n=9), replace(pri, n=9)) == "Wip up from 0 to 3 vs prior 3d"
+
+
+def test_not_comparable_names_the_series_and_start_date() -> None:
+    cur, pri = pair({"a": [5, 5, 5]}, {"a": [5, 5, 5]}, name="salvage_share")
+    late = replace(cur, coverage_start="2026-10-02T05:00:00Z")  # last contributing kind began
+    assert takeaway(late, pri) == "not comparable: salvage_share starts 2026-10-02"

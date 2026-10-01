@@ -15,22 +15,18 @@ from __future__ import annotations
 import sqlite3
 import statistics
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from dataclasses import dataclass, replace
+from datetime import datetime, timedelta
 from pathlib import Path
 
+from .metrics_coverage import Coverage, Scope, build_scope
 from .rollup_schema import FLEET_SOURCE
+from .timeutil import iso, parse_ts
+
+__all__ = ["iso", "parse_ts"]  # re-exported: metric modules and tests import them from here
 
 Point = tuple[str, float]  # (bucket start, ISO UTC "...Z"; value)
 Sample = tuple[str, str, float]  # (event ts, repo, value)
-
-
-def parse_ts(ts: str) -> datetime:
-    return datetime.fromisoformat(ts).astimezone(UTC)
-
-
-def iso(moment: datetime) -> str:
-    return moment.astimezone(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 @dataclass(frozen=True)
@@ -105,6 +101,8 @@ class SeriesSpec:
     sources: str = "repos"  # repos | fleet | all
     check_instrumented: bool = False  # continuously-emitted kinds only: none seen => not yet
     combine: str = "samples"  # samples | repo_sum (sum of per-repo bucket means)
+    any_kind: bool = False  # kinds are alternative evidence: coverage starts at the first one
+    pulse: str = "events"  # liveness stream: a quiet bucket is a zero only if this was written
 
 
 def open_dashboard_ro(path: Path) -> tuple[sqlite3.Connection | None, str | None]:
@@ -132,15 +130,6 @@ def coverage(db: sqlite3.Connection, kinds: Sequence[str], sources: str) -> tupl
     return (row[0], row[1]) if row and row[0] and row[1] else None
 
 
-def _bounds(db: sqlite3.Connection, spec: SeriesSpec) -> tuple[str, str] | None:
-    """The span the series' sources were being written (any kind): zeros inside it are real.
-
-    Per-kind coverage would drop the quiet stretches around a rare event, so the bounds are
-    the sources' whole span; ``spec.kinds`` only decides ``not_instrumented``.
-    """
-    return coverage(db, ("*",), spec.sources)
-
-
 def _reduce(values: list[float], how: str) -> float:
     if how == "sum":
         return float(sum(values))
@@ -149,11 +138,14 @@ def _reduce(values: list[float], how: str) -> float:
     return float(statistics.fmean(values))
 
 
-def _bucketed(q: MetricQuery, samples: Iterable[Sample]) -> dict[str, dict[int, list[float]]]:
+def _bucketed(
+    q: MetricQuery, samples: Iterable[Sample], scope: Scope
+) -> dict[str, dict[int, list[float]]]:
+    """Samples by repo and bucket, dropping any outside their repo's own coverage."""
     out: dict[str, dict[int, list[float]]] = {}
     for ts, repo, value in samples:
         i = q.bucket_index(ts)
-        if i is not None:
+        if i is not None and i in scope.active_for(repo):
             out.setdefault(repo, {}).setdefault(i, []).append(value)
     return out
 
@@ -166,33 +158,30 @@ def _merge_repos(by_repo: dict[str, dict[int, list[float]]]) -> dict[int, list[f
     return merged
 
 
-def _in_window(q: MetricQuery, samples: Sequence[Sample]) -> int:
-    return sum(q.bucket_index(ts) is not None for ts, _, _ in samples)
-
-
-def _active(q: MetricQuery, cov: tuple[str, str] | None) -> list[int]:
-    """Bucket indexes overlapping the covered span."""
-    if cov is None:
-        return []
-    lo, hi = parse_ts(cov[0]), parse_ts(cov[1])
-    return [
-        i
-        for i in range(q.n_buckets)
-        if q.bucket_start(i) + q.bucket > lo and q.bucket_start(i) <= hi
-    ]
+def _count(by_bucket: dict[int, list[float]]) -> int:
+    return sum(len(v) for v in by_bucket.values())
 
 
 def _points(
-    q: MetricQuery, active: list[int], by_bucket: dict[int, list[float]], how: str
+    q: MetricQuery,
+    active: frozenset[int],
+    zero_ok: frozenset[int],
+    by_bucket: dict[int, list[float]],
+    how: str,
 ) -> tuple[Point, ...]:
+    """Observed buckets, plus (counts only) real zeros where the source was alive."""
     out = []
-    for i in active:
+    for i in sorted(active):
         vals = by_bucket.get(i)
         if vals:
             out.append((iso(q.bucket_start(i)), _reduce(vals, how)))
-        elif how == "sum":
+        elif how == "sum" and i in zero_ok:
             out.append((iso(q.bucket_start(i)), 0.0))
     return tuple(out)
+
+
+def _scope(db: sqlite3.Connection, q: MetricQuery, spec: SeriesSpec) -> Scope:
+    return build_scope(db, q, spec.kinds, spec.sources, spec.pulse, spec.any_kind)
 
 
 def _seen(db: sqlite3.Connection, spec: SeriesSpec) -> bool:
@@ -203,7 +192,7 @@ def _finish(
     db: sqlite3.Connection,
     q: MetricQuery,
     spec: SeriesSpec,
-    cov: tuple[str, str] | None,
+    cov: Coverage,
     points: tuple[Point, ...],
     per_repo: dict[str, tuple[Point, ...]],
     n: int,
@@ -214,8 +203,8 @@ def _finish(
         unit=spec.unit,
         points=points,
         per_repo=per_repo,
-        coverage_start=cov[0] if cov else None,
-        coverage_end=cov[1] if cov else None,
+        coverage_start=cov.start,
+        coverage_end=cov.end,
         approx=flags.get("approx", False),
         not_instrumented=spec.check_instrumented and not _seen(db, spec),
         label=spec.label,
@@ -246,22 +235,29 @@ def make_series(
     ``how`` is sum (zero-filled), mean or median. With ``spec.combine == "repo_sum"`` the
     all-repos line is instead the sum of each repo's bucket value (``combined`` unused).
     """
-    cov = _bounds(db, spec)
-    active = _active(q, cov)
-    by_repo = _bucketed(q, per_repo)
+    scope = _scope(db, q, spec)
+    by_repo = _bucketed(q, per_repo, scope)
     if spec.combine == "repo_sum":
         buckets: dict[int, list[float]] = {}
         for per_bucket in by_repo.values():
             for i, vals in per_bucket.items():
                 buckets.setdefault(i, []).append(_reduce(vals, how))
-        points = tuple((iso(q.bucket_start(i)), sum(buckets[i])) for i in active if i in buckets)
-        n = _in_window(q, per_repo)
+        points = tuple(
+            (iso(q.bucket_start(i)), sum(buckets[i]))
+            for i in sorted(scope.all_active)
+            if i in buckets
+        )
+        n = sum(_count(b) for b in by_repo.values())
     else:
-        points = _points(q, active, _merge_repos(_bucketed(q, combined)), how)
-        n = _in_window(q, combined)
-    repo_points = {r: _points(q, active, b, how) for r, b in sorted(by_repo.items())}
+        merged = _merge_repos(_bucketed(q, combined, scope))
+        points = _points(q, scope.all_active, scope.all_active & scope.all_alive, merged, how)
+        n = _count(merged)
+    repo_points = {
+        r: _points(q, scope.active_for(r), scope.zero_for(r), b, how)
+        for r, b in sorted(by_repo.items())
+    }
     flags = {"approx": approx, "partial": partial, "exact_from": exact_from}
-    return _finish(db, q, spec, cov, points, repo_points, n, flags)
+    return _finish(db, q, spec, scope.cov, points, repo_points, n, flags)
 
 
 def make_ratio_series(
@@ -272,21 +268,35 @@ def make_ratio_series(
     den: Sequence[Sample],
 ) -> Series:
     """num/den per bucket (buckets with no denominator are absent); ``n`` counts den."""
-    cov = _bounds(db, spec)
-    active = _active(q, cov)
+    scope = _scope(db, q, spec)
 
-    def pts(n_by: dict[int, list[float]], d_by: dict[int, list[float]]) -> tuple[Point, ...]:
+    def pts(
+        active: frozenset[int], n_by: dict[int, list[float]], d_by: dict[int, list[float]]
+    ) -> tuple[Point, ...]:
         out = []
-        for i in active:
+        for i in sorted(active):
             d = sum(d_by.get(i, []))
             if d > 0:
                 out.append((iso(q.bucket_start(i)), sum(n_by.get(i, [])) / d))
         return tuple(out)
 
-    n_all, d_all = _bucketed(q, num), _bucketed(q, den)
-    repo_points = {r: pts(n_all.get(r, {}), d_all[r]) for r in sorted(d_all)}
-    points = pts(_merge_repos(n_all), _merge_repos(d_all))
-    return _finish(db, q, spec, cov, points, repo_points, _in_window(q, den), {})
+    n_all, d_all = _bucketed(q, num, scope), _bucketed(q, den, scope)
+    repo_points = {r: pts(scope.active_for(r), n_all.get(r, {}), d_all[r]) for r in sorted(d_all)}
+    d_merged = _merge_repos(d_all)
+    points = pts(scope.all_active, _merge_repos(n_all), d_merged)
+    return _finish(db, q, spec, scope.cov, points, repo_points, _count(d_merged), {})
+
+
+OTHER = "other"
+
+
+def top_categories(rows: Sequence[tuple[str, str, str]], top: int) -> list[tuple[str, str, str]]:
+    """Keep the ``top`` most frequent categories (ties by name); fold the rest into ``other``."""
+    counts: dict[str, int] = {}
+    for _, _, cat in rows:
+        counts[str(cat)] = counts.get(str(cat), 0) + 1
+    ranked = sorted(counts, key=lambda c: (-counts[c], c))[:top]
+    return [(ts, repo, c if c in ranked else OTHER) for ts, repo, c in rows]
 
 
 def category_series(
@@ -297,25 +307,21 @@ def category_series(
     fixed: Sequence[str] = (),
     *,
     partial: bool = False,
+    top: int | None = None,
 ) -> tuple[Series, ...]:
     """Counts split by category: the total (``spec.name``) then ``name.<category>`` each.
 
-    ``rows`` are ``(ts, repo, category)``; ``fixed`` categories always get a series.
+    ``rows`` are ``(ts, repo, category)``; ``fixed`` categories always get a series. With
+    ``top`` the categories are bounded to the ``top`` most frequent plus ``other``.
     """
+    if top is not None:
+        rows = top_categories(rows, top)
     cats = sorted({str(r[2]) for r in rows} | set(fixed))
     total: list[Sample] = [(ts, repo, 1.0) for ts, repo, _ in rows]
     out = [make_series(db, q, spec, total, total, how="sum", partial=partial)]
     for cat in cats:
         part: list[Sample] = [(ts, repo, 1.0) for ts, repo, c in rows if str(c) == cat]
-        child = SeriesSpec(
-            f"{spec.name}.{cat}",
-            f"{spec.label}: {cat}",
-            spec.unit,
-            spec.kind,
-            spec.kinds,
-            spec.sources,
-            spec.check_instrumented,
-        )
+        child = replace(spec, name=f"{spec.name}.{cat}", label=f"{spec.label}: {cat}")
         out.append(make_series(db, q, child, part, part, how="sum", partial=partial))
     return tuple(out)
 

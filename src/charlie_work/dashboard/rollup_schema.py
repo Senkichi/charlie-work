@@ -11,7 +11,7 @@ re-deriving an event an idempotent ``INSERT OR REPLACE``.
 
 from __future__ import annotations
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 FLEET_SOURCE = "fleet"
 
 _KEY = (
@@ -62,7 +62,7 @@ _JOB_DDL = (
 # Tables re-derived by deleting a source's rows at/after the window's first event id.
 WINDOWED_TABLES = tuple(_FACT_TABLES)
 # Tables wiped when one source is rebuilt from scratch.
-SOURCE_SCOPED_TABLES = (*WINDOWED_TABLES, JOB_TABLE, "loop_passes", "coverage")
+SOURCE_SCOPED_TABLES = (*WINDOWED_TABLES, JOB_TABLE, "loop_passes", "coverage", "pulse")
 
 _OTHER_DDL = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -75,6 +75,9 @@ CREATE TABLE IF NOT EXISTS loop_passes (
 CREATE TABLE IF NOT EXISTS coverage (
     source TEXT NOT NULL, kind TEXT NOT NULL, first_ts TEXT, last_ts TEXT, n INT NOT NULL,
     PRIMARY KEY (source, kind));
+CREATE TABLE IF NOT EXISTS pulse (
+    source TEXT NOT NULL, stream TEXT NOT NULL, hour TEXT NOT NULL,
+    PRIMARY KEY (source, stream, hour));
 """
 
 LOOP_PASS_COLUMNS = (

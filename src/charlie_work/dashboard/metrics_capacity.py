@@ -109,6 +109,6 @@ def capped_demand(db: sqlite3.Connection, q: MetricQuery) -> Series:
     spec = SeriesSpec(
         "capped_demand", "Capped demand", "moments", "count",
         ("dispatch", "dispatch_backpressure", "dispatch_deferred", "dispatch_starved"),
-        sources="all",
+        sources="all", pulse="dispatch",
     )  # fmt: skip
     return make_series(db, q, spec, samples, samples, how="sum")

@@ -5,11 +5,13 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 from _dashboard_rollup_fixtures import ALPHA, BETA, fleet  # noqa: F401  (pytest fixture)
 
 from charlie_work import cli
+from charlie_work.dashboard.timeutil import local_iso
 
 
 def _run(capsys: pytest.CaptureFixture[str], *argv: str) -> tuple[int, dict]:
@@ -84,3 +86,24 @@ def test_history_after_rollup_returns_every_tab_with_takeaways(fleet, capsys) ->
 def test_history_rejects_nonpositive_window(fleet, capsys) -> None:
     rc, out = _run(capsys, "--fleet-dir", str(fleet.dir), "dashboard", "history", "--days", "0")
     assert rc == 1 and out["message"] == "--days and --bucket-hours must be at least 1"
+
+
+def test_local_iso_renders_the_same_instant_in_the_given_zone() -> None:
+    pdt = timezone(timedelta(hours=-7))
+    assert local_iso("2026-10-01T03:30:00Z", pdt) == "2026-09-30T20:30:00-07:00"
+    assert local_iso("2026-10-01T03:30:00Z", UTC) == "2026-10-01T03:30:00+00:00"
+
+
+def test_history_carries_local_bucket_times_alongside_utc(fleet, capsys) -> None:
+    assert _run(capsys, "--fleet-dir", str(fleet.dir), "dashboard", "rollup")[0] == 0
+    _, out = _run(capsys, "--fleet-dir", str(fleet.dir), "dashboard", "history", "--days", "30")
+    checked = 0
+    for metrics in out["data"]["tabs"].values():
+        for series_list in metrics.values():
+            for s in series_list:
+                assert [p[1] for p in s["points_local"]] == [p[1] for p in s["points"]]
+                for (utc, _), (local, _) in zip(s["points"], s["points_local"], strict=True):
+                    expected = datetime.fromisoformat(utc.replace("Z", "+00:00")).astimezone()
+                    assert local == expected.isoformat()
+                    checked += 1
+    assert checked > 0  # the comparison above ran against real points, not an empty catalogue

@@ -28,6 +28,7 @@ from charlie_work.dashboard.metrics_base import MetricQuery, open_dashboard_ro
 from charlie_work.dashboard.takeaways import takeaway
 
 ZEROS = [0.0] * 7
+q_day = timedelta(days=1)
 
 
 def pts(*pairs: tuple[int, float]) -> tuple[tuple[str, float], ...]:
@@ -55,10 +56,25 @@ def test_open_missing_dashboard_db_is_a_value(tmp_path: Path) -> None:
 def test_merges_per_day_and_headline(ro_db) -> None:
     cur, prior = flow.merges_per_day(ro_db, CURRENT), flow.merges_per_day(ro_db, PRIOR)
     assert values(cur) == [0.0, 2.0, 1.0, 0.0, 2.0, 0.0, 0.0]  # duplicate report of 201 once
-    assert values(prior) == [0.0, 1.0, 1.0, 1.0, 2.0, 1.0, 2.0]
+    # the first merge evidence (a reconcile at 09-25T12) starts coverage: 09-24 is not claimed
+    assert values(prior) == [1.0, 1.0, 1.0, 2.0, 1.0, 2.0]
     assert cur.per_repo[ALPHA][1][1] == 1.0 and cur.per_repo[BETA][1][1] == 1.0
-    assert (cur.n, prior.n, cur.approx, cur.not_instrumented) == (5, 8, False, False)
-    assert takeaway(cur, prior) == f"Merges/day ↓38% vs prior 7d, driven by {ALPHA}"
+    assert (cur.n, prior.n, cur.approx, cur.not_instrumented) == (
+        5,
+        8,
+        True,
+        False,
+    )  # reconcile-detected: stamped at detection
+    # the first merge evidence is 09-25T12, after the prior window began: no comparison
+    assert takeaway(cur, prior) == "not comparable: merges_per_day starts 2026-09-25"
+    # a shorter pair that both sit inside coverage compares: 2 merges (10-05) vs 3 (10-02/03)
+    short = MetricQuery(
+        datetime(2026, 10, 4, tzinfo=UTC), datetime(2026, 10, 7, tzinfo=UTC), q_day
+    )
+    got = takeaway(
+        flow.merges_per_day(ro_db, short), flow.merges_per_day(ro_db, short.prior()), min_sample=1
+    )
+    assert got == f"Merges/day ↓33% vs prior 3d, driven by {ALPHA} (approx.)"
 
 
 def test_lead_time_approx_from_milestones(ro_db) -> None:
@@ -81,25 +97,30 @@ def test_wip_queue_depth_and_capped_demand(ro_db) -> None:
     depth = flow.queue_depth(ro_db, CURRENT)
     assert depth.points == pts((2, 11.0), (5, 5.0), (7, 0.0))  # sum of per-repo means
     capped = cap.capped_demand(ro_db, CURRENT)
-    assert values(capped) == [0.0, 3.0, 0.0, 0.0, 2.0, 0.0, 0.0]  # 2 passes + 1 backpressure
+    # coverage starts with the first backpressure (10-02); only days a dispatch pass ran are alive
+    assert capped.points == pts((2, 3.0), (5, 2.0), (7, 0.0))  # 2 passes + 1 backpressure
     assert not wip.not_instrumented and not wip.approx
 
 
 def test_quality_metrics(ro_db) -> None:
     mix = {s.name: values(s) for s in quality.verdict_mix(ro_db, CURRENT)}
-    assert mix["verdict_mix.approved"] == [0.0, 2.0, 1.0, 0.0, 0.0, 0.0, 0.0]
-    assert mix["verdict_mix.request_changes"] == [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0]
-    assert mix["verdict_mix.blocked"] == ZEROS
-    assert mix["verdict_mix"] == [0.0, 2.0, 2.0, 0.0, 0.0, 0.0, 0.0]
+    # record_review first appears 10-02: nothing is claimed for 10-01
+    assert mix["verdict_mix.approved"] == [2.0, 1.0, 0.0, 0.0, 0.0, 0.0]
+    assert mix["verdict_mix.request_changes"] == [0.0, 1.0, 0.0, 0.0, 0.0, 0.0]
+    assert mix["verdict_mix.blocked"] == [0.0] * 6
+    assert mix["verdict_mix"] == [2.0, 2.0, 0.0, 0.0, 0.0, 0.0]
 
     rework = quality.rework_rate(ro_db, CURRENT)
+    # alpha's coverage starts at its first dispatch_rework (10-05): its 10-02 dispatches drop out
+    # for alpha only; beta has no rework event, so its own coverage starts with its dispatches
     assert rework.points == pts((2, 0.0), (5, 1 / 3))
-    assert rework.n == 6
+    assert rework.n == 4
 
     esc = {s.name: values(s) for s in quality.escalations(ro_db, CURRENT)}
-    assert esc["escalations"] == [0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0]  # unescalate excluded
-    assert esc["escalations.capped"] == [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
-    assert esc["escalations.review_verdict_escalated"] == [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0]
+    # alternative routes: coverage starts with the first of them (record_review, 10-02)
+    assert esc["escalations"] == [0.0, 1.0, 1.0, 0.0, 0.0, 0.0]  # unescalate excluded
+    assert esc["escalations.capped"] == [0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
+    assert esc["escalations.review_verdict_escalated"] == [0.0, 1.0, 0.0, 0.0, 0.0, 0.0]
 
     assert by_name(quality.worker_fate(ro_db, CURRENT)) == {
         "worker_fate": 8.0,
@@ -137,17 +158,18 @@ def test_workers_cap_uses_fleet_limit_and_per_repo_limit(ro_db) -> None:
 
 def test_reliability_metrics(ro_db) -> None:
     assert rel.loop_pass_duration(ro_db, CURRENT).points == pts((2, 150.0))
-    assert values(rel.loop_pass_errors(ro_db, CURRENT)) == [0.0, 3.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    # a day with no loop pass is a blackout, not a quiet day: only 10-02 has a point
+    assert rel.loop_pass_errors(ro_db, CURRENT).points == pts((2, 3.0))
     fail = rel.launch_failures(ro_db, CURRENT)
-    assert values(fail) == [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0] and fail.partial
+    assert values(fail) == [1.0, 0.0, 0.0, 0.0, 0.0] and fail.partial  # starts 10-03
     deploys = {s.name: values(s) for s in rel.self_deploys(ro_db, CURRENT)}
-    assert deploys["self_deploys"] == [0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0]
-    assert deploys["self_deploys.succeeded"] == [0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0]
-    assert deploys["self_deploys.failed"] == [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
+    assert deploys["self_deploys"] == [1.0, 1.0, 1.0, 0.0, 0.0, 0.0]  # from the first, 10-02
+    assert deploys["self_deploys.succeeded"] == [1.0, 1.0, 0.0, 0.0, 0.0, 0.0]
+    assert deploys["self_deploys.failed"] == [0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
     throttles = {s.name: values(s) for s in rel.throttles(ro_db, CURRENT)}
-    assert throttles["throttles"] == [0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0]
-    assert throttles["throttles.review_quota_exhausted"][2] == 1.0
-    assert throttles["throttles.worker_rate_limited"][3] == 1.0
+    assert throttles["throttles"] == [0.0, 1.0, 1.0, 0.0, 0.0, 0.0]  # from 10-02 (session_exited)
+    assert throttles["throttles.review_quota_exhausted"][1] == 1.0
+    assert throttles["throttles.worker_rate_limited"][2] == 1.0
 
 
 def test_registry_covers_every_history_metric(ro_db) -> None:

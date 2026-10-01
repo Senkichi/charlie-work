@@ -14,6 +14,9 @@ from .metrics_base import (
 )
 
 _WINDOW = "ts >= ? AND ts < ?"
+# ``escalations.reason`` is already the rollup's normalised category; still bound the series
+# count so a new free-text head can never mint an unbounded catalogue.
+MAX_ESCALATION_CATEGORIES = 8
 
 
 def _rows(db: sqlite3.Connection, sql: str, q: MetricQuery, *extra) -> list[tuple]:
@@ -62,8 +65,9 @@ def escalations(db: sqlite3.Connection, q: MetricQuery) -> tuple[Series, ...]:
     spec = SeriesSpec(
         "escalations", "Escalations", "escalations", "count",
         ("session_failed_escalated", "review_dispatch_escalated", "record_review"),
+        any_kind=True,  # alternative routes into the same escalated state
     )  # fmt: skip
-    return category_series(db, q, spec, rows)
+    return category_series(db, q, spec, rows, top=MAX_ESCALATION_CATEGORIES)
 
 
 def worker_fate(db: sqlite3.Connection, q: MetricQuery) -> tuple[Series, ...]:
@@ -83,6 +87,7 @@ def worker_fate(db: sqlite3.Connection, q: MetricQuery) -> tuple[Series, ...]:
     spec = SeriesSpec(
         "worker_fate", "Worker fate", "workers", "count",
         ("session_exited", "worker_handoff_pr_opened", "orphaned_worker_opened_pr"),
+        any_kind=True,  # alternative fates of one worker
     )  # fmt: skip
     return category_series(db, q, spec, exits + prs)
 

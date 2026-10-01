@@ -59,6 +59,9 @@ def build_base(f: Fleet) -> None:
     for state in (a, b):  # uncapped edge passes (dispatchable 0)
         dispatch(f, state, day(-6, 1), dispatchable=0)
         dispatch(f, state, day(7, 23), dispatchable=0)
+    for n in range(-6, 8):  # a daily heartbeat: every bucket's source is alive, so zeros are real
+        for state in (a, b, g):
+            f.emit(state, day(n, 3), "supervisor_started", {})
     f.emit(g, day(-6, 1), "supervisor_started", {})
     f.emit(g, day(7, 23), "supervisor_started", {})
     for n in range(6):  # prior window: alpha 6, beta 2

@@ -17,6 +17,7 @@ import yaml
 
 from .config import build_config_from_data
 from .config_validation import ConfigError
+from .dashboard.timeutil import local_iso
 from .dashboard.config import DASHBOARD_SECTION, DashboardConfig
 from .fleet_paths import fleet_dir
 from .layout import GLOBAL_CONFIG_FILENAME
@@ -67,6 +68,16 @@ def _plain(value: Any) -> Any:
     return value
 
 
+def _local_buckets(series: Any) -> dict[str, Any]:
+    """Bucket starts in the host's local time, parallel to the UTC ``points`` (same order)."""
+    return {
+        "points_local": [[local_iso(ts), v] for ts, v in series.points],
+        "per_repo_local": {
+            repo: [[local_iso(ts), v] for ts, v in pts] for repo, pts in series.per_repo.items()
+        },
+    }
+
+
 def _run_history(
     days: int, bucket_hours: int, now: datetime, fleet_dir_override: str | None
 ) -> CommandResult:
@@ -95,9 +106,13 @@ def _run_history(
             # Category metrics may carry different categories per window: pair by name.
             old = {s.name: s for s in prior[tab][metric]}
             tabs[tab][metric] = [
-                {**_plain(cur), "takeaway": takeaway(cur, old[cur.name])}
-                if cur.name in old
-                else {**_plain(cur), "takeaway": "not enough data"}
+                {
+                    **_plain(cur),
+                    **_local_buckets(cur),
+                    "takeaway": takeaway(cur, old[cur.name])
+                    if cur.name in old
+                    else "not enough data",
+                }
                 for cur in series
             ]
     return CommandResult(True, f"dashboard history ({days}d)", {"tabs": tabs})

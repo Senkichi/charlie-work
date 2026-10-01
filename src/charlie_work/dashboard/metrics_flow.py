@@ -121,7 +121,9 @@ def lead_time(db: sqlite3.Connection, q: MetricQuery) -> Series:
     for (source, _), evs in _grouped(ms, True).items():
         for start, end in _scan(evs, ("ready", "ready_observed"), ("done",))[:1]:
             samples.append((end, source, _hours(start, end)))
-    spec = SeriesSpec("lead_time", "Lead time", "hours", "duration", _LIFECYCLE_KINDS)
+    spec = SeriesSpec(
+        "lead_time", "Lead time", "hours", "duration", _LIFECYCLE_KINDS, any_kind=True
+    )
     return _timing_series(db, q, spec, samples, cut)
 
 
@@ -143,8 +145,9 @@ def stage_time(db: sqlite3.Connection, q: MetricQuery, stage: str) -> Series:
         if spans:
             samples.append((spans[-1][1], source, sum(_hours(a, b) for a, b in spans)))
     spec = SeriesSpec(
-        f"stage_time.{stage}", f"Stage time: {stage}", "hours", "duration", _LIFECYCLE_KINDS
-    )
+        f"stage_time.{stage}", f"Stage time: {stage}", "hours", "duration", _LIFECYCLE_KINDS,
+        any_kind=True,
+    )  # fmt: skip
     return _timing_series(db, q, spec, samples, cut)
 
 
@@ -174,20 +177,47 @@ def merges_per_day(db: sqlite3.Connection, q: MetricQuery) -> Series:
         )
     }
     rows = db.execute(
-        "SELECT ts, source, issue, pr FROM issue_milestones"
+        "SELECT ts, source, issue, pr, event_kind FROM issue_milestones"
         " WHERE milestone IN ('merged', 'done') AND ts < ? ORDER BY ts, src_id, seq",
         (q.end_iso,),
     ).fetchall()
     seen: set = set()
-    samples: list[Sample] = []
-    for ts, source, issue, pr in rows:
+    firsts: list[tuple[str, str, str]] = []  # (ts, source, evidence kind) per merged issue
+    for ts, source, issue, pr, kind in rows:
         issue = issue if issue is not None else link.get((source, pr))
         key = (source, issue) if issue is not None else (source, "pr", pr)
         if key not in seen:
             seen.add(key)
-            samples.append((ts, source, 1.0))
-    spec = SeriesSpec("merges_per_day", "Merges", "merges", "count", MERGE_KINDS)
-    return make_series(db, q, spec, samples, samples, how="sum")
+            firsts.append((ts, source, kind))
+    firsts = drop_reconcile_backfill(firsts)
+    samples: list[Sample] = [(ts, source, 1.0) for ts, source, _ in firsts]
+    # A reconcile-detected merge is stamped when the reconciler noticed it, not when it happened.
+    approx = any(kind == "reconcile" for _, _, kind in firsts)
+    spec = SeriesSpec("merges_per_day", "Merges", "merges", "count", MERGE_KINDS, any_kind=True)
+    return make_series(db, q, spec, samples, samples, how="sum", approx=approx)
+
+
+BACKFILL_BURST = 20  # reconcile-detected merges in one repo-hour: a catch-up pass, not flow
+
+
+def drop_reconcile_backfill(
+    firsts: Sequence[tuple[str, str, str]],
+) -> list[tuple[str, str, str]]:
+    """Drop merges first seen by ``reconcile`` in a repo-hour holding ``BACKFILL_BURST`` or more.
+
+    Onboarding a repo (or the reconciler's first pass) reports every historical merged PR at
+    once, stamped with the detection time (observed: 308, 158 and 72 in a single hour against
+    5-50 a day normally). Those are state bookkeeping, not merges that happened that hour.
+    """
+    burst: dict[tuple[str, str], int] = defaultdict(int)
+    for ts, source, kind in firsts:
+        if kind == "reconcile":
+            burst[(source, ts[:13])] += 1
+    return [
+        f
+        for f in firsts
+        if not (f[2] == "reconcile" and burst[(f[1], f[0][:13])] >= BACKFILL_BURST)
+    ]
 
 
 def pass_gauge(

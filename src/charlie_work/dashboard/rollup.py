@@ -207,6 +207,25 @@ def _write_coverage(srcdb: sqlite3.Connection, dst: sqlite3.Connection, source: 
     )
 
 
+def _write_pulse(srcdb: sqlite3.Connection, dst: sqlite3.Connection, source: str) -> None:
+    """Hours (``YYYY-MM-DDTHH``) in which the source wrote an event / a dispatch / a loop pass.
+
+    Lets a metric tell a quiet hour from a blackout: coverage alone only has first/last ts.
+    """
+    dst.execute("DELETE FROM pulse WHERE source = ?", (source,))
+    for hour, is_dispatch in srcdb.execute(
+        "SELECT DISTINCT substr(ts, 1, 13), kind = 'dispatch' FROM events"
+    ):
+        dst.execute("INSERT OR IGNORE INTO pulse VALUES (?, 'events', ?)", (source, hour))
+        if is_dispatch:
+            dst.execute("INSERT OR IGNORE INTO pulse VALUES (?, 'dispatch', ?)", (source, hour))
+    dst.execute(
+        "INSERT OR IGNORE INTO pulse SELECT source, 'loop_pass', substr(completed_at, 1, 13)"
+        " FROM loop_passes WHERE source = ? AND completed_at IS NOT NULL",
+        (source,),
+    )
+
+
 def _wipe_source(dst: sqlite3.Connection, source: str) -> None:
     for table in SOURCE_SCOPED_TABLES:
         dst.execute(f"DELETE FROM {table} WHERE source = ?", (source,))
@@ -288,6 +307,7 @@ def _ingest_source(dst: sqlite3.Connection, source: str, db: Path, cutoff: str) 
             if source != FLEET_SOURCE:
                 _copy_loop_passes(srcdb, dst, source, cutoff if wm else None)
             _write_coverage(srcdb, dst, source)
+            _write_pulse(srcdb, dst, source)
             dst.execute(
                 "INSERT OR REPLACE INTO watermarks (source, max_id) VALUES (?, ?)",
                 (source, max_id),

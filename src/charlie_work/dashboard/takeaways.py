@@ -4,12 +4,17 @@
 window immediately before it (``MetricQuery.prior()``). Rules, in order:
 
 1. ``not_instrumented`` -> says so.
-2. The series must cover both windows: if coverage starts after the prior window began, or
-   ends more than one bucket before the current window ends, no trend is claimed (a gap is
-   not a decline).
-3. Fewer than ``MIN_SAMPLE`` observations in either window -> "not enough data".
+2. The series must cover both windows. ``coverage_start`` is when the LAST kind the series
+   is derived from began, so if it falls after the prior window began the comparison is
+   refused: "not comparable: <series> starts <date>" (a kind that did not exist yet is not
+   a decline, nor a surge). Coverage ending more than one bucket before the current window
+   ends is "no trend claimed, data ends ...".
+3. Gauges, durations and ratios need at least two populated buckets in each window, and
+   every series ``MIN_SAMPLE`` observations in each, else "not enough data". A count whose
+   prior window is a real zero is exempt (rule 4).
 4. Otherwise: direction and percent change, plus the repo contributing most to the change
-   when one repo carries at least half of the total per-repo movement.
+   when one repo carries at least half of the total per-repo movement. A real zero baseline
+   gives the absolute change ("up from 0 to N"). A ``partial`` series ends with "(partial)".
 
 Counts are compared as a per-day rate; gauges, durations and ratios as the mean of the
 window's bucket values. The same inputs always produce the same string.
@@ -22,6 +27,7 @@ from datetime import timedelta
 from .metrics_base import Point, Series, parse_ts
 
 MIN_SAMPLE = 5
+MIN_BUCKETS = 2  # a gauge/duration/ratio mean over one bucket is a point, not a trend
 FLAT_BELOW = 0.05  # |change| under 5% reads as flat
 DRIVER_SHARE = 0.5
 _DAY = timedelta(days=1)
@@ -45,6 +51,11 @@ def _value(points: tuple[Point, ...], kind: str, span: timedelta) -> float | Non
 
 def _pct(change: float) -> int:
     return int(abs(change) * 100 + 0.5 + 1e-9)  # half-up, immune to float dust
+
+
+def _number(value: float) -> str:
+    """At most two decimals, no trailing zeros (2.0 -> "2", 2.333 -> "2.33")."""
+    return f"{value:.2f}".rstrip("0").rstrip(".")
 
 
 def _headline_label(series: Series) -> str:
@@ -76,7 +87,7 @@ def _gap(current: Series, prior: Series) -> str | None:
     if start is None or end is None:
         return None  # handled as "not enough data"
     if parse_ts(start) > parse_ts(prior.window_start) + tol:
-        return f"history starts {start}"
+        return f"not comparable: {current.name} starts {start[:10]}"
     if parse_ts(end) < parse_ts(current.window_end) - tol:
         return f"data ends {end}"
     return None
@@ -92,20 +103,24 @@ def takeaway(current: Series, prior: Series, *, min_sample: int = MIN_SAMPLE) ->
         return f"{label}: not instrumented yet"
     gap = _gap(current, prior)
     if gap:
-        return f"{label}: no trend claimed, {gap}"
+        return gap if gap.startswith("not comparable") else f"{label}: no trend claimed, {gap}"
     window = _window_label(span)
     cur_v = _value(current.points, current.kind, span)
     pri_v = _value(prior.points, prior.kind, span)
+    suffix = (" (approx.)" if current.approx else "") + (" (partial)" if current.partial else "")
+    if current.kind == "count" and pri_v == 0 and cur_v is not None:
+        # the prior window sits inside coverage, so its zeros are real: no sample floor
+        if cur_v == 0:
+            return f"{label} unchanged at 0 vs prior {window}{suffix}"
+        return f"{label} up from 0 to {_number(cur_v)} vs prior {window}{suffix}"
+    if current.kind != "count" and min(len(current.points), len(prior.points)) < MIN_BUCKETS:
+        return f"{label}: not enough data vs prior {window}"
     if cur_v is None or pri_v is None or min(current.n, prior.n) < min_sample:
         return f"{label}: not enough data vs prior {window}"
-    suffix = " (approx.)" if current.approx else ""
     if pri_v == 0:
-        text = (
-            f"{label} unchanged at 0 vs prior {window}"
-            if cur_v == 0
-            else f"{label} up from 0 vs prior {window}"
-        )
-        return text + suffix
+        if cur_v == 0:
+            return f"{label} unchanged at 0 vs prior {window}{suffix}"
+        return f"{label} up from 0 to {_number(cur_v)} vs prior {window}{suffix}"
     change = (cur_v - pri_v) / pri_v
     if abs(change) < FLAT_BELOW:
         sign = "+" if change >= 0 else "-"

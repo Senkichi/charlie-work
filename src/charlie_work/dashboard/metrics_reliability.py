@@ -39,7 +39,9 @@ def loop_pass_duration(db: sqlite3.Connection, q: MetricQuery) -> Series:
 def loop_pass_errors(db: sqlite3.Connection, q: MetricQuery) -> Series:
     """Errors reported by loop passes completing per bucket."""
     samples = _passes(db, q, "error_count")
-    spec = SeriesSpec("loop_pass_errors", "Loop pass errors", "errors", "count", ("*",))
+    spec = SeriesSpec(
+        "loop_pass_errors", "Loop pass errors", "errors", "count", ("*",), pulse="loop_pass"
+    )
     return make_series(db, q, spec, samples, samples, how="sum")
 
 
@@ -76,7 +78,7 @@ def throttles(db: sqlite3.Connection, q: MetricQuery) -> tuple[Series, ...]:
         "throttles", "Rate limits and quota", "events", "count",
         ("review_quota_exhausted", "session_rate_limit_deferred", "graphql_rate_limit_deferred",
          "session_exited"),
-        sources="all",
+        sources="all", any_kind=True,
     )  # fmt: skip
     return category_series(db, q, spec, [*events, *exits])
 
@@ -90,6 +92,6 @@ def self_deploys(db: sqlite3.Connection, q: MetricQuery) -> tuple[Series, ...]:
     ).fetchall()
     spec = SeriesSpec(
         "self_deploys", "Self-deploys", "deploys", "count",
-        ("self_deploy_succeeded", "self_deploy_failed"), sources="all",
+        ("self_deploy_succeeded", "self_deploy_failed"), sources="all", any_kind=True,
     )  # fmt: skip
     return category_series(db, q, spec, rows, ("succeeded", "failed"))
