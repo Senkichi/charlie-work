@@ -57,14 +57,23 @@ RESCUE_REF_PREFIX = "refs/charlie/rescue"
 # kind is the death record itself, so it counts even with no ``failure_kind``
 # (an unclassified death is still the issue's newest death and must veto).
 CLASSIFYING_DEATH_KINDS: tuple[str, ...] = ("session_exited", "session_stalled")
+
+
 # Follow-up events about a death already recorded elsewhere. Without a
 # ``failure_kind`` they say nothing about why the worker died and must not mask
 # the classified death they follow.
-FOLLOW_UP_DEATH_KINDS: tuple[str, ...] = (
-    "session_failed_relabeled",
-    "session_failed_escalated",
-    "session_failed_relabeled_sweep",
-)
+# Built lazily: ``dead_worker_sweep`` imports ``worktree`` (via claude_code), which
+# imports this module, so a module-level import of the kind constant would cycle.
+def _follow_up_death_kinds() -> tuple[str, ...]:
+    from .dead_worker_sweep.decide_common import SESSION_FAILED_RELABELED
+
+    return (
+        SESSION_FAILED_RELABELED,
+        "session_failed_escalated",
+        "session_failed_relabeled_sweep",
+    )
+
+
 # Events recording a worker launch; ``issue_numbers`` lists the launched issues.
 LAUNCH_EVENT_KINDS: tuple[str, ...] = ("dispatch", "dispatch_rework")
 
@@ -128,8 +137,9 @@ def latest_death(state_file: Path, issue_number: int) -> tuple[str, float] | Non
     """
     from .instrumentation import query_events
 
+    follow_up = _follow_up_death_kinds()
     newest: tuple[float, str] | None = None
-    for kind in (*CLASSIFYING_DEATH_KINDS, *FOLLOW_UP_DEATH_KINDS):
+    for kind in (*CLASSIFYING_DEATH_KINDS, *follow_up):
         for event in query_events(state_file, kind=kind, issue_number=issue_number, limit=200):
             at = _epoch(event.get("ts"))
             payload = event.get("payload")
@@ -137,7 +147,7 @@ def latest_death(state_file: Path, issue_number: int) -> tuple[str, float] | Non
                 continue
             failure_kind = payload.get("failure_kind")
             if not isinstance(failure_kind, str):
-                if kind in FOLLOW_UP_DEATH_KINDS:
+                if kind in follow_up:
                     continue
                 failure_kind = ""
             if newest is None or at >= newest[0]:
