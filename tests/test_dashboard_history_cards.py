@@ -165,6 +165,33 @@ def test_distribution_needs_samples_and_a_known_unit() -> None:
     assert ">all</text>" not in html and "median 1m30s · p90 2m00s · n 2" in html
 
 
+def test_a_multi_panel_card_states_coverage_exactly_once() -> None:
+    from charlie_work.dashboard.history_data import HistoryView, MetricData, range_query
+    from charlie_work.dashboard.pages.history_cards import render_card
+
+    q = range_query("7d", END, UTC)
+    pts = tuple((f"2026-09-{d:02d}T00:00:00Z", 1.0) for d in range(24, 30))  # fmt: skip
+    head = _series(
+        name="m",
+        points=pts,
+        n=6,
+        per_repo={"o/alpha": pts, "o/beta": pts},
+        repo_coverage={
+            "o/alpha": ("2026-09-01T00:00:00Z", "2026-09-30T00:00:00Z"),
+            "o/beta": ("2026-09-26T00:00:00Z", "2026-09-30T00:00:00Z"),  # starts in-window
+        },
+        window_start=q.start_iso,
+        window_end=q.end_iso,
+        bucket_seconds=int(q.bucket.total_seconds()),
+    )
+    view = HistoryView("flow", "7d", q, (), END)
+    html = render_card(view, MetricData("m", (head,), {"m": "t"}), UTC)
+    assert 'data-panels="2"' in html  # the per-repo grid really rendered
+    # the combined chart and every panel draw coverage as ink; prose states it once
+    assert html.count("Coverage:") == 1
+    assert "sources:" not in html
+
+
 def test_a_render_fault_gets_its_own_message_and_is_logged(caplog) -> None:
     from charlie_work.dashboard.history_data import HistoryView, MetricData, range_query
     from charlie_work.dashboard.pages.history_cards import render_cards

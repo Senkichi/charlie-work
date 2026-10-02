@@ -68,9 +68,10 @@ def tab_results(
 ) -> dict[str, tuple[Series, ...] | Exception]:
     """Every metric of one History tab, keyed by metric id.
 
-    A metric whose stored rows are malformed (``ValueError`` etc.) comes back as its
-    exception, so that card alone degrades; a database-level fault (``sqlite3.Error``)
-    still raises — that is a whole-tab problem, not one row's.
+    A metric that raises — a malformed stored row (``ValueError``) or a fault in the
+    metric's own code — comes back as its exception, so that card alone degrades; a
+    database-level fault (``sqlite3.Error``) still raises — that is a whole-tab problem,
+    not one row's.
     """
     out: dict[str, tuple[Series, ...] | Exception] = {}
     for metric_id, fn in TABS[tab].items():

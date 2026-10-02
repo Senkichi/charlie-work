@@ -215,13 +215,25 @@ def _flags_html(notes: tuple[str, ...]) -> str:
     return '<ul class="flags">' + "".join(f"<li>{esc(n)}</li>" for n in notes) + "</ul>"
 
 
-def _error_card(metric_id: str, error: str, *, render_fault: bool = False) -> str:
-    """A data failure or a render fault degrades to this card — never the page.
+def _error_card(
+    metric_id: str, error: str, *, render_fault: bool = False, kind: str = "internal"
+) -> str:
+    """A data failure or a code fault degrades to this card — never the page.
 
     ``render_fault`` is for a card that crashed mid-render (a chart-code bug such as
     TypeError/KeyError, not a malformed stored row), so it says so in its own words.
+    ``kind`` is ``MetricData.error_kind`` — the same narrowing for query faults: only
+    ``"data"`` may claim a malformed stored row.
     """
-    detail = "the card failed to render" if render_fault else "a stored row it reads is malformed"
+    detail = (
+        "the card failed to render"
+        if render_fault
+        else {
+            "data": "a stored row it reads is malformed",
+            "takeaway": "its takeaway could not be computed",
+            "internal": "an internal error",
+        }[kind]
+    )
     return (
         f'<article class="mcard is-error" id="{esc(card_id(metric_id))}">'
         '<p class="takeaway">This metric could not be drawn.</p>'
@@ -283,7 +295,7 @@ def render_card(
     """One metric card, or its honest 'not instrumented yet' card."""
     mid = metric.metric_id
     if metric.error is not None:
-        return _error_card(mid, metric.error)
+        return _error_card(mid, metric.error, kind=metric.error_kind)
     head = metric.headline
     if head.not_instrumented:
         return _not_instrumented(mid, metric)

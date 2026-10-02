@@ -184,6 +184,14 @@ def test_each_panel_is_shaded_by_its_own_source_only() -> None:
     assert by_key["b"].count('class="uncovered"') == 1
 
 
+def test_multiples_caption_never_repeats_source_coverage() -> None:
+    spec = LineSpec("t", coverage=(Coverage("a", day(-9)), Coverage("b", day(3))))
+    html = small_multiples(_panels(), spec, UTC)
+    # like line_chart: coverage is stated once per card in its Coverage: note, so the
+    # grid caption — and no panel — may carry a "sources:" line
+    assert "sources:" not in html
+
+
 def test_empty_series_renders_an_empty_state_not_an_error() -> None:
     html = line_chart((), LineSpec("t"), UTC)
     assert "no data in this window" in html and "<svg" not in html

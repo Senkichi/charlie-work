@@ -189,6 +189,7 @@ def test_a_malformed_row_degrades_only_its_own_card(db_path: Path, caplog) -> No
         view = load_tab(db_path, "flow", "7d", NOW)
     assert isinstance(view, HistoryView)
     assert view.get("wip").error is not None
+    assert view.get("wip").error_kind == "data"  # float("not-a-number") raised ValueError
     # the degraded metric's swallowed exception is logged with its traceback
     logged = [r for r in caplog.records if "wip" in r.getMessage()]
     assert logged and all(r.exc_info for r in logged)
@@ -197,6 +198,28 @@ def test_a_malformed_row_degrades_only_its_own_card(db_path: Path, caplog) -> No
     assert "could not be drawn" in card and "malformed" in card and "<svg" not in card
     assert "<svg" in _card(page, "merges_per_day")  # the row takes down only its own card
     assert "<svg" in _card(page, "queue_depth")  # same table, other column: unaffected
+
+
+def test_a_metric_code_fault_does_not_claim_a_malformed_row(
+    db_path: Path, monkeypatch, caplog
+) -> None:
+    # A bug inside the metric function (TypeError here — KeyError behaves the same) is
+    # not a malformed stored row, and the degraded card must not claim one.
+    def boom(db, q):
+        raise TypeError("bug in the metric")
+
+    monkeypatch.setitem(metrics.TABS["Flow"], "wip", boom)
+    with caplog.at_level(logging.ERROR, "charlie_work.dashboard"):
+        view = load_tab(db_path, "flow", "7d", NOW)
+    assert isinstance(view, HistoryView)
+    assert view.get("wip").error == "TypeError: bug in the metric"
+    assert view.get("wip").error_kind == "internal"
+    assert any("wip" in r.getMessage() and r.exc_info for r in caplog.records)
+    page = render_history(view, "flow", "7d")
+    card = _card(page, "wip")
+    assert "could not be drawn" in card and "an internal error" in card
+    assert "a stored row" not in card and "malformed" not in card
+    assert "<svg" in _card(page, "merges_per_day")  # only its own card degrades
 
 
 def test_a_takeaway_fault_is_logged_and_degrades_its_card(
@@ -210,11 +233,15 @@ def test_a_takeaway_fault_is_logged_and_degrades_its_card(
         view = load_tab(db_path, "flow", "7d", NOW)
     assert isinstance(view, HistoryView)
     assert all(m.error is not None for m in view.metrics)
+    assert all(m.error_kind == "takeaway" for m in view.metrics)
     assert any(
         "takeaway assessment failed" in r.getMessage() and r.exc_info for r in caplog.records
     )
     page = render_history(view, "flow", "7d")
-    assert "could not be drawn" in _card(page, "wip")
+    card = _card(page, "wip")
+    # a fault in the takeaway code is not a malformed stored row: the card says so
+    assert "could not be drawn" in card and "its takeaway could not be computed" in card
+    assert "a stored row" not in card and "malformed" not in card
 
 
 def test_every_duration_card_states_median_and_p90(db_path: Path) -> None:

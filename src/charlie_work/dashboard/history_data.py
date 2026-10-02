@@ -80,8 +80,12 @@ def range_query(range_key: str, now: datetime, tz: tzinfo | None = None) -> Metr
 class MetricData:
     """One metric's series for the window plus each series' takeaway (by series name).
 
-    ``error`` is set when the metric's stored rows were malformed (its exception): the
-    card renders as degraded and ``series``/``takeaways`` are empty.
+    ``error`` is set when the metric could not be computed (its exception);
+    ``error_kind`` classifies the fault so the card does not blame the data for a code
+    bug: ``"data"`` — a stored row the metric reads is malformed — versus a fault in
+    the metric function (``"internal"``) or in the takeaway assessment
+    (``"takeaway"``). The card renders as degraded and ``series``/``takeaways`` are
+    empty.
     """
 
     metric_id: str
@@ -90,6 +94,7 @@ class MetricData:
     # series name -> the (current, prior) values its takeaway compares, None: no claim
     compared: dict[str, Compared | None] = field(default_factory=dict)
     error: str | None = None
+    error_kind: str = "internal"
 
     @property
     def headline(self) -> Series:
@@ -138,12 +143,16 @@ def load_tab(db_path: Path | None, tab: str, range_key: str, now: datetime) -> H
     for mid, cur in current.items():
         pri = prior.get(mid, ())
         error = cur if isinstance(cur, Exception) else pri if isinstance(pri, Exception) else None
+        # A ValueError out of a metric function is the signature of a malformed stored
+        # row (float() on a TEXT value, an unparseable timestamp); a KeyError, TypeError
+        # or anything else is a fault in the metric itself, not bad data.
+        kind = "data" if isinstance(error, ValueError) else "internal"
         if error is None:
             try:
                 got = paired_assessments(cur, pri)
-            except Exception as exc:  # noqa: BLE001 - malformed values degrade one card
+            except Exception as exc:  # noqa: BLE001 - a takeaway fault degrades one card
                 log.exception("takeaway assessment failed: %s %s", tab, mid)
-                error = exc
+                error, kind = exc, "takeaway"
             else:
                 metrics.append(
                     MetricData(
@@ -154,7 +163,9 @@ def load_tab(db_path: Path | None, tab: str, range_key: str, now: datetime) -> H
                     )
                 )
         if error is not None:
-            metrics.append(MetricData(mid, (), {}, error=f"{type(error).__name__}: {error}"))
+            metrics.append(
+                MetricData(mid, (), {}, error=f"{type(error).__name__}: {error}", error_kind=kind)
+            )
     return HistoryView(tab, range_key, query, tuple(metrics), now)
 
 

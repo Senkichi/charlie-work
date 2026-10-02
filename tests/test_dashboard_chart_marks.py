@@ -73,7 +73,12 @@ def test_bullet_svg_and_bullet_bar_share_the_track_geometry() -> None:
     # one implementation: the row's bar embeds exactly what bullet_svg draws
     assert bullet._track(2, 8, 8) in bullet_svg(2, 8, scale=8)
     assert bullet._track(2, 8, 8) in bullet_bar(Bullet("x", 2, 8), scale=8)
-    assert bullet._track(5, 4, 10) == bullet._track(5, 4, 10)  # deterministic
+    # over cap on a shared scale of 10: 5/10 fill flagged hot, cap tick at 4/10
+    assert bullet._track(5, 4, 10) == (
+        '<rect class="trk" x="0" y="5" width="240" height="6"/>'
+        '<rect class="fill hot" x="0" y="3" width="120" height="10"/>'
+        '<line class="captick" x1="96" x2="96" y1="0" y2="16"/>'
+    )
 
 
 def test_nearest_rank_is_an_observed_sample() -> None:
@@ -95,6 +100,16 @@ def test_strip_plot_dots_median_p90_and_sorted_by_median() -> None:
     assert "median 2m00s · p90 3m00s · n 3" in html
     assert ">1m</text>" in html and ">4h</text>" in html  # log duration ticks
     assert 'role="img"' in html and "<a " not in html
+
+
+def test_strip_plot_bounds_its_dots_but_stats_use_every_sample() -> None:
+    from charlie_work.dashboard.charts.strip import MAX_DOTS
+
+    # loop-pass duration scale: thousands of samples must not become thousands of circles
+    html = strip_plot((Distribution("loop pass", tuple(float(i) for i in range(5000))),), "t")
+    assert html.count('<circle class="sample"') == MAX_DOTS
+    # median, p90 and n are computed from the full 5000, not the drawn subset
+    assert "median 41m39s · p90 1h14m · n 5000" in html
 
 
 def test_strip_plot_empty_is_an_empty_state() -> None:
