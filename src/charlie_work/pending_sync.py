@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any
 
 from . import layout
+from .atomic_write import write_json_atomic
 from .instrumentation import log_event
 from .state import utc_now
 
@@ -97,9 +98,7 @@ def _write_marker(
     }
     if starved_notified or prior.get("starved_notified"):
         payload["starved_notified"] = True
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-    tmp.replace(path)
+    write_json_atomic(path, payload)
 
 
 def _read_marker(path: Path) -> dict[str, Any]:

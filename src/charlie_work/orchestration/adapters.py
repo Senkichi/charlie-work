@@ -15,16 +15,16 @@ Module-namespace rule (#1627): none of these three bodies reaches a
 workflow-defined name, so this module needs no ``import charlie_work.workflow as
 _wf`` seam at all. ``ResolvedLayout``, ``Path`` and ``Any`` are annotation-only
 and imported directly from their defining modules (matching the convention in
-the sibling ``dispatch_state.py``); ``json`` is a runtime dependency of
-``_write_json``.
+the sibling ``dispatch_state.py``); ``write_json_atomic`` is a runtime
+dependency of ``_write_json``.
 """
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
 
+from charlie_work.atomic_write import write_json_atomic
 from charlie_work.github_capabilities.cross_repo_blockers import CrossRepoBlocker
 from charlie_work.paths import ResolvedLayout
 from charlie_work.workflow_delegation import as_property, as_staticmethod
@@ -32,12 +32,7 @@ from charlie_work.workflow_delegation import as_property, as_staticmethod
 
 @as_staticmethod
 def _write_json(path: Path, value: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    with tmp_path.open("w", encoding="utf-8") as handle:
-        json.dump(value, handle, indent=2, sort_keys=True)
-        handle.write("\n")
-    tmp_path.replace(path)
+    write_json_atomic(path, value)
 
 
 @as_staticmethod
