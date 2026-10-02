@@ -43,9 +43,9 @@ from charlie_work.workflow import OrchestratorApp
 from _local_gate_async_fixtures import (  # noqa: E402
     FAIL_SUITE,
     SLEEP_SUITE,
+    UNALLOCATABLE_PID,
     _adopt_and_approve,
     _commit_file,
-    _dead_pid,
     _event_kinds,
     _events_of_kind,
     _gate_identity,
@@ -554,7 +554,13 @@ def test_malformed_result_file_is_never_green(lane_repo: Path) -> None:
     paths = _gate_paths(app, 7)
     paths.gate_dir.mkdir(parents=True, exist_ok=True)
     paths.result.write_text("{not json", encoding="utf-8")
-    stale_pid = _dead_pid()
+    # The stale claim's pid must read dead on every pass. A real just-exited
+    # pid can be recycled -- onto the relaunched wrapper itself (a bare
+    # ``new_pid != stale_pid`` then fails) or onto an unrelated process in
+    # the assertion window (``is_pid_alive`` sees it live and the pass ends
+    # as "suite_running", not "suite_launched") -- and the claim's ``None``
+    # fingerprint gives the gate nothing to disambiguate it with (#2207).
+    stale_pid = UNALLOCATABLE_PID
     with state_lock(app.paths.state_file):
         state = load_state(app.paths.state_file)
         state["prs"]["7"].update(
@@ -579,15 +585,16 @@ def test_malformed_result_file_is_never_green(lane_repo: Path) -> None:
         assert record["status"] == "approved"
         assert record["local_suite_orphan_count"] == 1
         assert not is_ancestor(lane_repo, head, branch_head_sha(lane_repo, "main"))
-        # A new claim replaced the stale one: a different pid with a fresh
-        # start-time fingerprint, and the malformed file is gone (the launch
-        # scrubs stale artifacts before the spawn; the sleeper cannot write
-        # a new result for another 600s).
-        new_pid = int(record["local_suite_pid"])
+        # A new claim replaced the stale one: the launch identity is the
+        # (pid, start-time) pair (#2207 -- a bare pid is not unique across
+        # dead processes), the fingerprint is fresh, and the malformed file
+        # is gone (the launch scrubs stale artifacts before the spawn; the
+        # sleeper cannot write a new result for another 600s).
+        new_pid, new_start = _gate_identity(app, 7)
         assert new_pid != stale_pid
-        assert record["local_suite_process_start_time"]
+        assert new_start
         assert not paths.result.exists()
-        assert is_pid_alive(new_pid)
+        assert is_pid_alive(new_pid, new_start)
     finally:
         _kill_claimed_gate(app, 7)
 
@@ -611,7 +618,10 @@ def test_result_for_wrong_head_is_not_accepted(lane_repo: Path) -> None:
         state = load_state(app.paths.state_file)
         state["prs"]["7"].update(
             {
-                "local_suite_pid": _dead_pid(),
+                # Never-allocatable pid: the dead-runner claim must read dead
+                # deterministically -- a recycled just-exited pid would read
+                # live and stall the pass as "suite_running" (#2207).
+                "local_suite_pid": UNALLOCATABLE_PID,
                 "local_suite_process_start_time": None,
                 "local_suite_started_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
                 "local_suite_log": str(paths.log),

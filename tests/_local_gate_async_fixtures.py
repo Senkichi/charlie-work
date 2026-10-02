@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import os
 import subprocess
-import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -80,6 +79,15 @@ FAIL_SUITE = "python -c \"import sys; print('=== 1 failed, 2 passed in 0.1s ==='
 KILLED_SUITE = "python -c \"import sys; sys.stdout.write('....... [ 12%]'); sys.exit(1)\""
 
 SLEEP_SUITE = 'python -c "import time; time.sleep(600)"'
+
+# A pid no supported OS can allocate (Linux ``pid_max`` caps at 2**22; the
+# Windows cid table cannot reach 2**30): deterministically dead on every pass
+# and, unlike a just-exited pid, unrecyclable -- a real dead pid can be
+# reissued to an unrelated process inside the assertion window, and a claim
+# carrying ``local_suite_process_start_time=None`` gives the gate's liveness
+# check no fingerprint to disambiguate it with (#2207: bare pids are not
+# unique across dead processes).
+UNALLOCATABLE_PID = 1 << 30
 
 
 def _lane_config(repo_root: Path, issues_dir: Path, **overrides: object) -> OrchestratorConfig:
@@ -182,13 +190,6 @@ def _gate_identity(app: OrchestratorApp, number: int) -> tuple[int, Any]:
     """
     record = load_state_locked(app.paths.state_file)["prs"][str(number)]
     return int(record["local_suite_pid"]), record["local_suite_process_start_time"]
-
-
-def _dead_pid() -> int:
-    """A pid that was real a moment ago and is now definitely exited."""
-    child = subprocess.Popen([sys.executable, "-c", "pass"])
-    child.wait(timeout=30)
-    return child.pid
 
 
 def _event_kinds(app: OrchestratorApp) -> list[str]:
