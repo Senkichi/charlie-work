@@ -265,7 +265,7 @@ def test_cache_evicts_oldest_beyond_max_entries(tmp_path: Path, monkeypatch):
     assert "/c" in entries  # most recent survives
 
 
-def test_save_cache_concurrent_writes_use_distinct_temps(tmp_path: Path, monkeypatch):
+def test_save_cache_concurrent_writes_use_distinct_temps(tmp_path: Path, patch_path_replace):
     """Issue #2265: two concurrent ``_save_cache`` calls shared one fixed
     ``http-etag-cache.json.tmp`` name, colliding on open/truncate/rename and
     surfacing ``PermissionError`` [WinError 5] on Windows. Each save now
@@ -300,7 +300,7 @@ def test_save_cache_concurrent_writes_use_distinct_temps(tmp_path: Path, monkeyp
         except BaseException as exc:  # noqa: BLE001 - collected for the assert
             errors.append(exc)
 
-    monkeypatch.setattr(Path, "replace", _blocking_replace)
+    patch_path_replace(_blocking_replace, scope=tmp_path)
     threads = [threading.Thread(target=_save, args=(f'"e{i}"',)) for i in range(2)]
     for thread in threads:
         thread.start()

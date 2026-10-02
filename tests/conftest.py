@@ -53,6 +53,59 @@ def autospec() -> Callable[..., Any]:
     return autospec_patch
 
 
+def patch_path_replace(
+    monkeypatch: pytest.MonkeyPatch,
+    fake: Callable[..., Path],
+    *,
+    scope: Path,
+) -> None:
+    """Install ``fake`` as ``Path.replace``, but only for calls inside ``scope``.
+
+    ``monkeypatch.setattr(Path, "replace", fake)`` patches the *class*, so the
+    patch is process-wide: a ``Path.replace`` fired by any other thread during
+    the window -- a leftover background writer from an earlier test on the same
+    xdist worker, the flake behind issues #2284/#2290 -- lands in ``fake`` too,
+    where it is miscounted, raised at, or deadlocked on a barrier it was never
+    meant to join.
+
+    The installed wrapper routes a call to ``fake`` only when the source path
+    resolves inside ``scope`` (resolved containment via
+    ``charlie_work.safe_path.contains``, so a junction/reparse point cannot
+    smuggle an outside path in); every other call delegates to the real
+    ``Path.replace`` untouched. Scope the patch to the directory under test
+    (usually ``tmp_path``) -- a foreign path then behaves exactly as if the
+    patch did not exist.
+
+    ``fake`` keeps the real signature ``(self, target) -> Path``. A fake that
+    delegates must call a ``real_replace`` captured *before* this helper runs;
+    calling ``Path.replace`` inside ``fake`` would re-enter the wrapper.
+    """
+    from charlie_work import safe_path
+
+    real_replace = Path.replace
+
+    def _scoped(self: Path, target: object, *args: Any, **kwargs: Any) -> Path:
+        if safe_path.contains(scope, self):
+            return fake(self, target, *args, **kwargs)
+        return real_replace(self, target, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "replace", _scoped)
+
+
+@pytest.fixture(name="patch_path_replace")
+def _patch_path_replace_fixture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Callable[..., None]:
+    """``patch_path_replace`` bound to the test's own ``monkeypatch``.
+
+    Call as ``patch_path_replace(fake, scope=tmp_path)``. A test that manages
+    a ``pytest.MonkeyPatch()`` instance by hand (e.g. to control undo timing
+    around joined threads) calls the unbound ``conftest.patch_path_replace``
+    directly.
+    """
+    return lambda fake, *, scope: patch_path_replace(monkeypatch, fake, scope=scope)
+
+
 @pytest.hookimpl(tryfirst=True)
 def pytest_sessionstart(session: pytest.Session) -> None:
     """Issue #1665: refuse to run when ``charlie_work`` resolves outside this checkout.
