@@ -78,12 +78,32 @@ def test_concurrent_writers_use_distinct_temp_files(tmp_path: Path) -> None:
     path = tmp_path / "cache.json"
     barrier = threading.Barrier(2, timeout=30)
     rendezvous_done = threading.Event()
+    hook_entered = threading.Event()
     used: list[Path] = []
     real_replace = Path.replace
     errors: list[BaseException] = []
 
+    # A foreign Path.replace fired from a background thread inside the
+    # patched window -- the api-worker terminal-record writer shape that
+    # flaked this test on #2283. Lives under tmp_path/"foreign" so its
+    # parent differs from the test writers' directory.
+    foreign_dir = tmp_path / "foreign"
+    foreign_dir.mkdir()
+    foreign_tmp = foreign_dir / "issue-1514.api.terminal.0000.json.tmp"
+    foreign_dst = foreign_dir / "issue-1514.api.terminal.json"
+    foreign_tmp.write_text("{}\n", encoding="utf-8")
+
     def _blocking_replace(self: Path, target: object) -> Path:
+        # The patch is on the Path CLASS, so every Path.replace in the
+        # process lands here -- including a leftover background thread from
+        # another test on the same xdist worker. Foreign calls must pass
+        # straight through: recording one inflates `used`, and letting one
+        # reach the barrier steals a rendezvous slot from the real writers
+        # (issue #2284).
+        if self.parent != tmp_path:
+            return real_replace(self, target)
         used.append(self)
+        hook_entered.set()
         # Rendezvous the writers' first replace calls *while both tmp files
         # exist* -- with a shared tmp name (the pre-#2265 code) both threads
         # would be holding the same file. A retried replace (transient
@@ -101,19 +121,38 @@ def test_concurrent_writers_use_distinct_temp_files(tmp_path: Path) -> None:
         except BaseException as exc:  # noqa: BLE001 - collected for the assert
             errors.append(exc)
 
+    def _foreign_replace() -> None:
+        try:
+            # Fire while a writer is inside the hook -- the interleaving
+            # that flaked #2283. Without the tmp_path filter in
+            # _blocking_replace this call is recorded in `used` and can
+            # steal a barrier slot.
+            hook_entered.wait(timeout=30)
+            foreign_tmp.replace(foreign_dst)
+        except BaseException as exc:  # noqa: BLE001 - collected for the assert
+            errors.append(exc)
+
     monkeypatch = pytest.MonkeyPatch()
     monkeypatch.setattr(Path, "replace", _blocking_replace)
     threads = [threading.Thread(target=_write, args=({"writer": i},)) for i in range(2)]
+    foreign = threading.Thread(target=_foreign_replace)
     try:
+        foreign.start()
         for thread in threads:
             thread.start()
-        for thread in threads:
+        # foreign is joined inside the patched window so its replace is
+        # guaranteed to run under the monkeypatch.
+        for thread in (*threads, foreign):
             thread.join(timeout=30)
     finally:
         monkeypatch.undo()
 
-    assert not any(thread.is_alive() for thread in threads), "barrier deadlock"
+    assert not any(thread.is_alive() for thread in (*threads, foreign)), "barrier deadlock"
     assert errors == []
+    # The foreign write passed through untouched: it renamed its own file
+    # and was never recorded or rendezvoused.
+    assert foreign_dst.read_text(encoding="utf-8") == "{}\n"
+    assert not foreign_tmp.exists()
     # Two DISTINCT tmp files coexisted at the barrier (a PermissionError
     # retry re-uses the same tmp, so compare the set, not the count).
     assert len(set(used)) == 2
