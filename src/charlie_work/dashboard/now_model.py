@@ -16,9 +16,10 @@ from __future__ import annotations
 from collections.abc import Sequence
 from datetime import datetime
 
+from ..config import LabelConfig
 from . import now_cadence
 from .now_access import as_int, dict_list, label_set, snapshot_data
-from .now_needs_me import needs_me_items
+from .now_needs_me import group_summaries, needs_me_items
 from .now_types import (
     CapacityModel,
     FindingLike,
@@ -26,6 +27,7 @@ from .now_types import (
     FlowStage,
     NowModel,
     NowTotals,
+    RepoFlow,
     RepoFreshness,
     RepoRead,
     RepoWorkers,
@@ -66,27 +68,41 @@ def _freshness(
     return tuple(rows), stale
 
 
-def _flow(sources: SourcesRead) -> tuple[FlowModel, dict[str, int]]:
-    labels = sources.labels
-    counted = (
+def counted_stages(labels: LabelConfig) -> tuple[tuple[str, str], ...]:
+    """``(stage name, label)`` for the label-counted Flow stages.
+
+    The one definition: Now counts issues carrying each label and the stage drill-down
+    (``/flow/<stage>``) lists the same issues, so the number and its list cannot drift.
+    """
+    return (
         ("Queued", labels.queued),
         ("In progress", labels.in_progress),
         ("PR open", labels.pr_open),
         ("Reviewing", labels.reviewing),
         ("Needs rework", labels.needs_rework),
     )
+
+
+def _flow(
+    sources: SourcesRead,
+) -> tuple[FlowModel, dict[str, int], dict[str, tuple[FlowStage, ...]]]:
+    counted = counted_stages(sources.labels)
     stage_counts = {name: 0 for name, _ in counted}
     dispatchable_by_repo: dict[str, int] = {}
     reasons = {reason: 0 for reason in NOT_DISPATCHABLE_REASONS}
     examples: dict[str, list[str]] = {reason: [] for reason in NOT_DISPATCHABLE_REASONS}
+    repo_counts: dict[str, dict[str, int]] = {}
     for repo in sources.repos:
         data = snapshot_data(repo)
         issues = dict_list(data, "issues")
+        mine = {name: 0 for name, _ in counted}
         for issue in issues:
             have = label_set(issue)
             for name, label in counted:
                 if label in have:
                     stage_counts[name] += 1
+                    mine[name] += 1
+        repo_counts[repo.key] = mine
         reach = data.get("backlog_reachability")
         if isinstance(reach, dict) and reach.get("observed"):
             dispatchable_by_repo[repo.key] = as_int(reach.get("dispatchable"))
@@ -105,12 +121,17 @@ def _flow(sources: SourcesRead) -> tuple[FlowModel, dict[str, int]]:
     stages = (FlowStage("Dispatchable", None, sum(dispatchable_by_repo.values())),) + tuple(
         FlowStage(name, label, stage_counts[name]) for name, label in counted
     )
+    by_repo = {
+        key: (FlowStage("Dispatchable", None, dispatchable_by_repo.get(key, 0)),)
+        + tuple(FlowStage(name, label, mine[name]) for name, label in counted)
+        for key, mine in repo_counts.items()
+    }
     breakdown = tuple(
         UnreachableReason(reason, reasons[reason], tuple(examples[reason]))
         for reason in NOT_DISPATCHABLE_REASONS
         if reasons[reason] > 0
     )
-    return FlowModel(stages, sources.done_24h, breakdown), dispatchable_by_repo
+    return FlowModel(stages, sources.done_24h, breakdown), dispatchable_by_repo, by_repo
 
 
 def _capacity(
@@ -207,15 +228,22 @@ def build_now_model(
         sources_read.snapshot_gap_p90_seconds,
     )
     fresh, _ = _freshness(sources_read.repos, threshold)
-    flow, dispatchable = _flow(sources_read)
+    flow, dispatchable, by_repo = _flow(sources_read)
     capacity = _capacity(sources_read, dispatchable, now, threshold)
     runners_stale_age = capacity.runners_age_seconds if capacity.runners_stale else None
+    needs_me = needs_me_items(sources_read, fresh, findings, now, threshold, runners_stale_age)
+    repo_flows = tuple(
+        RepoFlow(r.key, by_repo[r.key], sum(1 for i in needs_me if i.repo == r.key))
+        for r in sources_read.repos
+    )
     return NowModel(
         generated_at=now,
         stale_threshold_seconds=threshold,
         freshness=fresh,
-        needs_me=needs_me_items(sources_read, fresh, findings, now, threshold, runners_stale_age),
+        needs_me=needs_me,
         flow=flow,
         capacity=capacity,
         totals=_totals(sources_read),
+        repos=repo_flows,
+        needs_me_groups=group_summaries(needs_me),
     )

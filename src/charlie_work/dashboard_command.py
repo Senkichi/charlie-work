@@ -34,6 +34,7 @@ def register_dashboard_subparsers(subparsers: Any) -> None:
     sub = dashboard.add_subparsers(dest="dashboard_command", required=True)
     sub.add_parser("rollup", help="Run one rollup pass into dashboard.db and print the result")
     sub.add_parser("now", help="Print the Now model built from local sources")
+    sub.add_parser("serve", help="Serve the read-only dashboard on loopback until interrupted")
     history = sub.add_parser("history", help="Print History metric series with takeaways")
     history.add_argument("--days", type=int, default=7, help="Window length in days")
     history.add_argument("--bucket-hours", type=int, default=24, help="Bucket size in hours")
@@ -84,7 +85,7 @@ def _run_history(
     """Every History series over the last ``days`` plus its takeaway vs the prior window."""
     from . import layout
     from .dashboard.metrics import MetricQuery, all_series, open_dashboard_ro
-    from .dashboard.takeaways import takeaway
+    from .dashboard.takeaways import paired_takeaways
 
     if days < 1 or bucket_hours < 1:
         return CommandResult(False, "--days and --bucket-hours must be at least 1", {})
@@ -103,16 +104,9 @@ def _run_history(
     for tab, metrics in current.items():
         tabs[tab] = {}
         for metric, series in metrics.items():
-            # Category metrics may carry different categories per window: pair by name.
-            old = {s.name: s for s in prior[tab][metric]}
+            heads = paired_takeaways(series, prior[tab][metric])
             tabs[tab][metric] = [
-                {
-                    **_plain(cur),
-                    **_local_buckets(cur),
-                    "takeaway": takeaway(cur, old[cur.name])
-                    if cur.name in old
-                    else "not enough data",
-                }
+                {**_plain(cur), **_local_buckets(cur), "takeaway": heads[cur.name]}
                 for cur in series
             ]
     return CommandResult(True, f"dashboard history ({days}d)", {"tabs": tabs})
@@ -125,6 +119,11 @@ def run_dashboard_command(args: argparse.Namespace) -> CommandResult:
         config = _load_dashboard_config(override)
     except (ConfigError, ValueError, OSError, yaml.YAMLError) as exc:
         return CommandResult(False, f"dashboard config error: {exc}", {})
+    if args.dashboard_command == "serve":
+        # Owns its kill switch: disabled is a clean rc-0 no-op, not a failure.
+        from .dashboard.serve import serve_dashboard
+
+        return serve_dashboard(config, override)
     if not config.enabled:
         return CommandResult(
             False, "dashboard is disabled (dashboard.enabled: false in the fleet config)", {}

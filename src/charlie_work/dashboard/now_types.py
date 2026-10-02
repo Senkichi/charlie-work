@@ -96,6 +96,24 @@ class NeedsMeItem:
     as_of_snapshot: bool
     # An alternative remedy shown beneath the primary command (e.g. requeue vs verdict).
     secondary_command: str | None = None
+    # Issue number the row is about (None for fleet-level rows); the final sort tie-break.
+    number: int | None = None
+    # The decision the operator makes (one of ``NEEDS_ME_GROUPS``); derived from ``kind``
+    # in ``now_needs_me`` so a constructor cannot disagree with the grouping.
+    group: str = "Exceptions"
+
+
+# Needs-me groups in display order, by the decision the operator makes.
+NEEDS_ME_GROUPS = ("Exceptions", "Awaiting your verdict", "Human needed", "Operator queue")
+
+
+@dataclass(frozen=True)
+class GroupSummary:
+    """Fleet-level rollup of one Needs-me group (every group is present, count may be 0)."""
+
+    group: str
+    count: int
+    oldest_age_seconds: float | None  # None when empty or no row has a known age
 
 
 @dataclass(frozen=True)
@@ -104,6 +122,16 @@ class FlowStage:
     label: str | None  # the LabelConfig value counted, None for Dispatchable
     count: int
     as_of_snapshot: bool = True
+
+
+@dataclass(frozen=True)
+class RepoFlow:
+    """One repo's stage counts (same stage names/order as ``FlowModel.stages``)."""
+
+    repo: str
+    stages: tuple[FlowStage, ...]
+    # Needs-me rows naming this repo (alarms and stale sources included).
+    need_you: int
 
 
 @dataclass(frozen=True)
@@ -175,3 +203,5 @@ class NowModel:
     flow: FlowModel
     capacity: CapacityModel
     totals: NowTotals
+    repos: tuple[RepoFlow, ...] = ()
+    needs_me_groups: tuple[GroupSummary, ...] = ()

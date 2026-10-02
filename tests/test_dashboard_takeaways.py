@@ -57,6 +57,19 @@ def test_up_with_driver_and_window_label() -> None:
     assert takeaway(cur, pri) == "Merges/day ↑150% vs prior 3d, driven by a"
 
 
+def test_repo_uncovered_in_prior_window_never_drives() -> None:
+    # "b" only began reporting mid-way through the current window: no baseline to move from
+    late = {"b": ("2026-10-05T00:00:00Z", "2026-10-07T00:00:00Z")}
+    cur = {"a": [6, 6, 6], "b": [9, 9, 9], "c": [2, 2, 2]}
+    pri = {"a": [2, 2, 2], "b": [0, 0, 0], "c": [2, 2, 2]}
+    got = takeaway(*pair(cur, pri, repo_coverage=late))
+    assert got == "Merges/day ↑325% vs prior 3d, driven by a"
+    # a gauge is not zero-filled: a repo with no prior points has no baseline either
+    c, p = pair(cur, pri, kind="gauge", label="Lead time", n=99)
+    p = replace(p, per_repo={k: v for k, v in p.per_repo.items() if k != "b"})
+    assert takeaway(c, p).endswith("driven by a")
+
+
 def test_no_driver_when_movement_is_spread() -> None:
     cur = {"a": [2, 2, 2], "b": [2, 2, 2], "c": [2, 2, 2]}
     pri = {"a": [1, 1, 1], "b": [1, 1, 1], "c": [1, 1, 1]}
@@ -148,3 +161,15 @@ def test_not_comparable_names_the_series_and_start_date() -> None:
     cur, pri = pair({"a": [5, 5, 5]}, {"a": [5, 5, 5]}, name="salvage_share")
     late = replace(cur, coverage_start="2026-10-02T05:00:00Z")  # last contributing kind began
     assert takeaway(late, pri) == "not comparable: salvage_share starts 2026-10-02"
+
+
+def test_assess_returns_the_compared_values_in_chart_units() -> None:
+    from charlie_work.dashboard.takeaways import assess
+
+    cur, pri = pair({"a": [4, 4, 4], "b": [1, 1, 1]}, {"a": [1, 1, 1], "b": [1, 1, 1]})
+    text, compared = assess(cur, pri)
+    assert text == takeaway(cur, pri) and compared == (5.0, 2.0)  # per 1d bucket
+    hourly = replace(cur, bucket_seconds=DAY // 4), replace(pri, bucket_seconds=DAY // 4)
+    assert assess(*hourly)[1] == (1.25, 0.5)  # a 6h bucket holds a quarter of a day
+    late = replace(cur, coverage_start="2026-10-03T00:00:00Z")
+    assert assess(late, pri)[1] is None  # "not comparable": nothing to draw
