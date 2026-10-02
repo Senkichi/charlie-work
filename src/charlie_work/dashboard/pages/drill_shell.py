@@ -16,7 +16,7 @@ from datetime import tzinfo
 from ..drill import DrillError
 from ..read_model import ModelState
 from ..timeutil import iso, parse_ts
-from .nav import THEME_BUTTON, views_nav
+from .nav import HEAD_BASE, THEME_BUTTON, views_nav
 from .now import freshness_strip
 from .now_fmt import esc, link, local_time
 from .now_keyhelp import key_help
@@ -68,9 +68,9 @@ def page(state: ModelState, kind: str, title: str, trail: Sequence[Crumb], body:
     """A full drill-down page. ``kind`` names the view in the brand; ``title`` the tab."""
     links = "".join(f'<link rel="stylesheet" href="/static/{name}">' for name in _STYLES)
     return (
-        '<!doctype html><html lang="en" data-theme="auto"><head><meta charset="utf-8">'
-        '<meta name="viewport" content="width=device-width, initial-scale=1">'
-        f"<title>{esc(title)} · Fleet</title>{links}"
+        '<!doctype html><html lang="en" data-theme="auto"><head>'
+        + HEAD_BASE
+        + f"<title>{esc(title)} · Fleet</title>{links}"
         '<script src="/static/theme-init.js"></script>'
         '<script src="/static/dashboard.js" defer></script></head><body>'
         '<a class="skip" href="#content">Skip to content</a>'
