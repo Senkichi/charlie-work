@@ -34,6 +34,7 @@ import logging
 from dataclasses import dataclass
 from pathlib import Path
 
+from ..atomic_write import write_json_atomic
 from ..state import StateLockBusy, advisory_file_lock, utc_now
 
 logger = logging.getLogger(__name__)
@@ -94,8 +95,13 @@ def load_cache(cache_path: Path) -> dict[str, CachedResponse]:
 
 
 def _save_cache(cache_path: Path, entries: dict[str, CachedResponse]) -> None:
-    """Atomically persist the cache (temp-file + `replace()`)."""
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    """Atomically persist the cache (``atomic_write.write_json_atomic``).
+
+    Unique per-writer temp name + bounded ``PermissionError`` retry on the
+    rename (issue #2265): a fixed shared ``.tmp`` name let concurrent saves
+    collide, and a lock-free reader holding the destination open makes the
+    rename transiently fail on Windows.
+    """
     payload = {
         "version": 1,
         "entries": {
@@ -108,11 +114,7 @@ def _save_cache(cache_path: Path, entries: dict[str, CachedResponse]) -> None:
             for key, entry in entries.items()
         },
     }
-    tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
-    with tmp_path.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2, sort_keys=True)
-        handle.write("\n")
-    tmp_path.replace(cache_path)
+    write_json_atomic(cache_path, payload)
 
 
 def get_cached(cache_path: Path, path: str) -> CachedResponse | None:

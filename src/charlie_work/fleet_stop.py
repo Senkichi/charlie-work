@@ -43,6 +43,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from . import layout
+from .atomic_write import write_json_atomic
 from .fleet_paths import warn_fleet_dir_virtualization_on_write
 from .instrumentation import log_event
 from .process_utils import is_pid_alive
@@ -91,9 +92,7 @@ def write_fleet_stop_request(fleet_dir_override: str | None, *, drain: bool) -> 
         "drain": drain,
         "requester_pid": os.getpid(),
     }
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    tmp.replace(path)
+    write_json_atomic(path, payload)
     try:
         log_event(
             supervisor_heartbeat_path(fleet_dir_override),

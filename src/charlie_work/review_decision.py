@@ -36,6 +36,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
+from .atomic_write import write_json_atomic
+
 
 @dataclass(frozen=True)
 class ReviewDecision:
@@ -160,22 +162,16 @@ def _round_history_entries(
 
 
 def _write_json_atomic(path: Path, value: Any) -> None:
-    """Atomic temp-file + ``replace()`` write, matching the repo's canonical
-    pattern (``OrchestratorApp._write_json`` in ``workflow.py``,
-    ``adapters._write_json``, ``devin_shell._write_json`` -- see CLAUDE.md's
-    "All JSON state writes are atomic" invariant).
+    """Atomic write via the shared ``atomic_write`` primitive (unique temp
+    file + rename -- CLAUDE.md's "All JSON state writes are atomic"
+    invariant).
 
-    Hoisted here (issue #1362 Stage 2) as the one atomic-write primitive
+    Hoisted here (issue #1362 Stage 2) as the one atomic-write entry point
     :func:`record_decision` uses for both the round-file and flat-file
     writes, rather than inventing a second shape or requiring an
     ``OrchestratorApp`` instance just to reach the static method.
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    with tmp_path.open("w", encoding="utf-8") as handle:
-        json.dump(value, handle, indent=2, sort_keys=True)
-        handle.write("\n")
-    tmp_path.replace(path)
+    write_json_atomic(path, value)
 
 
 # Issue #1268 (W11): the field set that identifies a review round. Two writes
