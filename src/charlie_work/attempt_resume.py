@@ -112,20 +112,26 @@ def _epoch(ts: object) -> float | None:
     return parsed.timestamp()
 
 
-def latest_death(state_file: Path, issue_number: int) -> tuple[str | None, float] | None:
-    """``(failure_kind, epoch)`` of the issue's most recent worker death, or None."""
+def latest_death(state_file: Path, issue_number: int) -> tuple[str, float] | None:
+    """``(failure_kind, epoch)`` of the issue's most recent *classified* worker death."""
     from .instrumentation import query_events
 
-    newest: tuple[float, str | None] | None = None
+    newest: tuple[float, str] | None = None
     for kind in DEATH_EVENT_KINDS:
-        for event in query_events(state_file, kind=kind, issue_number=issue_number, limit=1):
+        for event in query_events(state_file, kind=kind, issue_number=issue_number, limit=200):
             at = _epoch(event.get("ts"))
             payload = event.get("payload")
             if at is None or not isinstance(payload, dict):
                 continue
             failure_kind = payload.get("failure_kind")
+            # An event with no classification says nothing about why the worker
+            # died (e.g. a batch ``session_failed_relabeled_sweep`` or a
+            # follow-up relabel of the same death). It must never mask the
+            # classified death it follows, so only classified events compete.
+            if not isinstance(failure_kind, str):
+                continue
             if newest is None or at >= newest[0]:
-                newest = (at, failure_kind if isinstance(failure_kind, str) else None)
+                newest = (at, failure_kind)
     if newest is None:
         return None
     return newest[1], newest[0]

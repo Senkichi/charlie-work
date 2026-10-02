@@ -225,3 +225,40 @@ def test_prompt_notice_says_continue_not_restart() -> None:
     assert "Do not restart" in notice
     assert "603" in notice
     assert apply_resume_notice("ORIGINAL PROMPT\n", resumed).startswith("ORIGINAL PROMPT\n\n## ")
+
+
+def test_kindless_follow_up_events_cannot_mask_the_throttle_death(repo: Path) -> None:
+    """Orphan-sweep batch events and relabel follow-ups carry no classification."""
+    config = OrchestratorConfig()
+    wt = _worker_dirty_tree(repo)
+    state_file = _state_file(repo, config)
+    _die(repo, config, "rate_limited")
+    ref = _rescue(repo, wt)
+    log_event(state_file, "session_failed_relabeled", {"issue_number": ISSUE, "reason": "x"})
+    log_event(
+        state_file,
+        "session_failed_relabeled_sweep",
+        {"issue_number": ISSUE, "failure_kind": None},
+    )
+    log_event(state_file, "session_exited", {"issue_number": ISSUE, "failure_kind": None})
+
+    info = create_worktree(repo, BRANCH, base_ref="HEAD", issue_number=ISSUE, config=config)
+
+    assert info.resumed_attempt is not None
+    assert info.resumed_attempt.ref == ref
+
+
+def test_later_classified_non_throttle_death_vetoes_the_resume(repo: Path) -> None:
+    config = OrchestratorConfig()
+    wt = _worker_dirty_tree(repo)
+    _die(repo, config, "rate_limited")
+    _rescue(repo, wt)
+    log_event(
+        _state_file(repo, config),
+        "session_exited",
+        {"issue_number": ISSUE, "failure_kind": "stalled"},
+    )
+
+    info = create_worktree(repo, BRANCH, base_ref="HEAD", issue_number=ISSUE, config=config)
+
+    assert info.resumed_attempt is None
