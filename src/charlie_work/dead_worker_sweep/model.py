@@ -170,6 +170,11 @@ class AdvanceToPrOpen:
 class CreditDeadWorker:
     issue: int
     classify_log: bool = True
+    # Issue #2282: the dead epoch's ``dispatched_at`` (captured before the flow
+    # clears it) and the PR, so a provider-throttle death can refund its own
+    # dispatch stamp and flag the PR (``rework_attempt_exemption``).
+    dispatched_at: str | None = None
+    pr_number: int | None = None
 
 
 @dataclass(frozen=True)
