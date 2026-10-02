@@ -29,6 +29,7 @@ from ..config import OrchestratorConfig
 from ..paths import resolved_layout
 from ..write_gate import WriteGate, require_write_gate
 from .apply_commits import LOCK_ILLEGAL_COMMITS, POST_ILLEGAL_COMMITS, apply_commit
+from . import pre_classification
 from .apply_context import SweepContext
 from .apply_requests_lock import serve
 from .decide import PhaseOrderError, decide
@@ -215,6 +216,7 @@ def _run_sweep(run: _Run) -> None:
 
     with ctx.ports.state_lock(ctx.state_file):
         ctx.state = ctx.ports.load_state(ctx.state_file)
+        pre_classification.persist_pre_classified(ctx)  # #2274: stamp + cooldown, once
         locked = copy.deepcopy(ctx.state)
         sweep_events: list[Any] = []
         try:

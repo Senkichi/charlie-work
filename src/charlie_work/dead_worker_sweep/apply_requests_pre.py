@@ -23,7 +23,7 @@ from .. import (
     no_pr_orphan_fate,
     worker_fate,
 )
-from . import effects_pr, effects_sessions, live_handoff
+from . import effects_pr, effects_sessions, live_handoff, pre_classification
 from ..cross_repo_gate import cross_repo_scope_gate
 from ..github import GitHubError, build_branch_issue_validator
 from ..process_utils import find_worker_terminal_status
@@ -176,6 +176,10 @@ def resolve_fate(ctx: SweepContext, req: ResolveFate) -> FateResult:
         branch = f"{ctx.config.dispatch.branch_prefix}-{number}-{slug}"
     ctx.branches[number] = branch
     worktree_path = _worktree(ctx, branch)
+    # Issue #2274: classify the dead worker's log BEFORE its fate resolves -- this
+    # is the first locus every pass reaches, ahead of the redispatch and phantom
+    # lanes that overwrite or reap the sidecar.
+    entry = pre_classification.classify_before_fate(ctx, number, entry)
     fate = no_pr_orphan_fate.resolve_no_pr_orphan_fate(
         issue_number=number,
         entry=entry,
