@@ -55,6 +55,7 @@ from _local_gate_async_fixtures import (  # noqa: E402
     _lane_app,
     _lane_config,
     _make_branch,
+    _seed_dead_claim,
     _wait_for_result,
     _wait_pid_dead,
 )
@@ -545,36 +546,17 @@ def test_malformed_result_file_is_never_green(lane_repo: Path) -> None:
     _init_repo(lane_repo)
     issues_dir = lane_repo / "docs" / "issues"
     head = _make_branch(lane_repo, "agent/issue-7-x", "a.py", "a = 1\n")
-    # SLEEP_SUITE keeps the relaunched wrapper alive until the ``finally``
-    # releases it -- liveness is deterministic, not a race against a suite
-    # that exits before the assertion runs (#2252 flake).
+    # SLEEP_SUITE keeps the relaunched wrapper alive until ``finally`` (#2252).
     config = _lane_config(lane_repo, issues_dir, dispatch={"test_command": SLEEP_SUITE})
     app = _lane_app(lane_repo, issues_dir, config=config)
     _adopt_and_approve(app, issues_dir, 7, "agent/issue-7-x", head)
     paths = _gate_paths(app, 7)
     paths.gate_dir.mkdir(parents=True, exist_ok=True)
     paths.result.write_text("{not json", encoding="utf-8")
-    # The stale claim's pid must read dead on every pass. A real just-exited
-    # pid can be recycled -- onto the relaunched wrapper itself (a bare
-    # ``new_pid != stale_pid`` then fails) or onto an unrelated process in
-    # the assertion window (``is_pid_alive`` sees it live and the pass ends
-    # as "suite_running", not "suite_launched") -- and the claim's ``None``
-    # fingerprint gives the gate nothing to disambiguate it with (#2207).
+    # A recycled just-exited pid could read live (or be reused by the
+    # relaunch itself), so the stale claim uses an unallocatable pid (#2207).
     stale_pid = UNALLOCATABLE_PID
-    with state_lock(app.paths.state_file):
-        state = load_state(app.paths.state_file)
-        state["prs"]["7"].update(
-            {
-                "local_suite_pid": stale_pid,
-                "local_suite_process_start_time": None,
-                "local_suite_started_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
-                "local_suite_log": str(paths.log),
-                "local_suite_gate_dir": str(paths.gate_dir),
-                "local_suite_head": head,
-                "local_suite_base_sha": branch_head_sha(lane_repo, "main"),
-            }
-        )
-        save_state(app.paths.state_file, state)
+    _seed_dead_claim(app, lane_repo, 7, head)
 
     results = app._local_merge_approved()
 
@@ -585,11 +567,8 @@ def test_malformed_result_file_is_never_green(lane_repo: Path) -> None:
         assert record["status"] == "approved"
         assert record["local_suite_orphan_count"] == 1
         assert not is_ancestor(lane_repo, head, branch_head_sha(lane_repo, "main"))
-        # A new claim replaced the stale one: the launch identity is the
-        # (pid, start-time) pair (#2207 -- a bare pid is not unique across
-        # dead processes), the fingerprint is fresh, and the malformed file
-        # is gone (the launch scrubs stale artifacts before the spawn; the
-        # sleeper cannot write a new result for another 600s).
+        # A fresh (pid, start-time) claim replaced the stale one (#2207) and
+        # the launch scrubbed the malformed file before the spawn.
         new_pid, new_start = _gate_identity(app, 7)
         assert new_pid != stale_pid
         assert new_start
@@ -614,23 +593,7 @@ def test_result_for_wrong_head_is_not_accepted(lane_repo: Path) -> None:
         '{"ok": true, "returncode": 0, "head_sha": "deadbeef", "argv": []}',
         encoding="utf-8",
     )
-    with state_lock(app.paths.state_file):
-        state = load_state(app.paths.state_file)
-        state["prs"]["7"].update(
-            {
-                # Never-allocatable pid: the dead-runner claim must read dead
-                # deterministically -- a recycled just-exited pid would read
-                # live and stall the pass as "suite_running" (#2207).
-                "local_suite_pid": UNALLOCATABLE_PID,
-                "local_suite_process_start_time": None,
-                "local_suite_started_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
-                "local_suite_log": str(paths.log),
-                "local_suite_gate_dir": str(paths.gate_dir),
-                "local_suite_head": head,
-                "local_suite_base_sha": branch_head_sha(lane_repo, "main"),
-            }
-        )
-        save_state(app.paths.state_file, state)
+    _seed_dead_claim(app, lane_repo, 7, head)
 
     results = app._local_merge_approved()
 
