@@ -3344,6 +3344,18 @@ def run_fleet_supervise(
             # the next process resumes from exactly where this one left off.
             # Bind the shas to locals so the non-None guard survives into the
             # message below; folding the check into a bool() loses it.
+            #
+            # A deferred ``uv sync`` that finally lands is the same hazard one
+            # layer down: HEAD moved on an earlier pass (that pass restarted),
+            # so this pass's ``head_changed`` is False, yet the sync just
+            # replaced third-party packages on disk that this process already
+            # imported. Without a restart here a dependency bump stays
+            # unloaded until some unrelated commit restarts the daemon
+            # (observed 2026-10-01: the sync installed ci-fleet 0.4.0 at
+            # 21:46 PDT and the running supervisor kept executing 0.3.0).
+            # ``synced`` is True only when ``uv sync`` actually ran and
+            # succeeded, which clears the pending-sync marker, so the next
+            # pass reports synced=False and this cannot loop.
             from_sha = deploy.from_sha if deploy is not None else None
             to_sha = deploy.to_sha if deploy is not None else None
             if (
@@ -3352,15 +3364,24 @@ def run_fleet_supervise(
                 and deploy.pulled
                 and from_sha
                 and to_sha
-                and deploy.head_changed
+                and (deploy.head_changed or deploy.synced)
             ):
-                print(
-                    f"[{now_str}] self-deploy: HEAD moved {from_sha[:12]} -> "
-                    f"{to_sha[:12]}; exiting for watchdog restart to pick up new code",
-                    flush=True,
-                )
+                if deploy.head_changed:
+                    print(
+                        f"[{now_str}] self-deploy: HEAD moved {from_sha[:12]} -> "
+                        f"{to_sha[:12]}; exiting for watchdog restart to pick up new code",
+                        flush=True,
+                    )
+                    _exit_reason = "self_deploy_head_moved"
+                else:
+                    print(
+                        f"[{now_str}] self-deploy: deferred dependency sync landed "
+                        f"({from_sha[:12]} -> {to_sha[:12]}); exiting for watchdog "
+                        "restart to load the new dependencies",
+                        flush=True,
+                    )
+                    _exit_reason = "self_deploy_synced"
                 exit_reason = "self_deploy"
-                _exit_reason = "self_deploy_head_moved"
                 # Issue #604: this exit assumes the watchdog scheduled task is
                 # armed and will relaunch the fleet. Verify it before trusting
                 # that -- a disabled task turns this clean restart exit into a
