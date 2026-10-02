@@ -878,6 +878,12 @@ def test_dispatch_phantom_worker_arm_clears_dead_worker_failure_kind(
     slot and starts a new epoch."""
     from charlie_work.adapters import SessionDispatchResult
 
+    # Issue #2262: the phantom lane's salvage probe needs a real git repo to
+    # prove the branch carries no commits (the verdict that permits requeue).
+    from _worktree_fixtures import _init_repo
+
+    _init_repo(tmp_path)
+
     config = OrchestratorConfig(worker=WorkerRoleConfig(harness="claude-code"))
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
