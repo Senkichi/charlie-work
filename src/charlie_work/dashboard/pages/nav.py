@@ -10,6 +10,15 @@ from .now_fmt import esc
 from .routes import VIEWS, View, live_views
 
 
+# The <head> prefix every page shares. The empty data: icon stops the browser fetching
+# /favicon.ico (a 404 on every page load); img-src already allows data:.
+HEAD_BASE = (
+    '<meta charset="utf-8">'
+    '<meta name="viewport" content="width=device-width, initial-scale=1">'
+    '<link rel="icon" href="data:,">'
+)
+
+
 def _view(v: View, current: str) -> str:
     if v.href == current:
         return f'<a href="{esc(v.href)}" aria-current="page" data-go="{v.key}">{esc(v.name)}</a>'

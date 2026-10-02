@@ -829,6 +829,10 @@ def run_quota_probe(*, repo_root: Path, config: OrchestratorConfig) -> bool:
     probe = config.quota_probe
     command = _apply_model_pin(_REVIEW_COMMAND_TEMPLATE, probe.model)
     command = _apply_max_turns_pin(command, 1)
+    # Load no settings files: quota is account-level, so the probe needs none, and
+    # running in ``repo_root`` would otherwise fire the operator's SessionStart
+    # hooks (a git fetch + fast-forward) inside the probe's timeout.
+    command = (*command, "--setting-sources", "")
     command = (resolve_cli_binary(command[0]), *command[1:])
     result = run_captured(
         list(command),

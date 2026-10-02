@@ -21,7 +21,7 @@ from ..history_data import (
 )
 from ..charts.svg import time_tag
 from .history_cards import bucket_words, render_cards
-from .nav import THEME_BUTTON, views_nav
+from .nav import HEAD_BASE, THEME_BUTTON, views_nav
 from .now_fmt import esc, local_time
 from .now_keyhelp import key_help
 
@@ -106,9 +106,9 @@ def render_history(
         f'<section id="hpanel" class="hpanel" aria-labelledby="tab-{esc(tab)}">{body}</section>'
     )
     return (
-        '<!doctype html><html lang="en" data-theme="auto"><head><meta charset="utf-8">'
-        '<meta name="viewport" content="width=device-width, initial-scale=1">'
-        f"<title>Fleet History · {esc(TAB_KEYS[tab])}</title>"
+        '<!doctype html><html lang="en" data-theme="auto"><head>'
+        + HEAD_BASE
+        + f"<title>Fleet History · {esc(TAB_KEYS[tab])}</title>"
         '<link rel="stylesheet" href="/static/dashboard.css">'
         '<link rel="stylesheet" href="/static/now.css">'
         '<link rel="stylesheet" href="/static/charts.css">'

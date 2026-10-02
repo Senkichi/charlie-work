@@ -34,6 +34,7 @@ _LABELS = {
     "rework_dispatched": "Rework dispatched",
     "pr_opened_by_worker": "PR opened by the worker",
     "pr_opened_by_salvage": "PR opened by salvage",
+    "pr_open_after_dead_worker": "Worker died; its PR moved to PR open",
     "review_claimed": "Review claimed",
     "verdict_approved": "Review verdict: approved",
     "verdict_request_changes": "Review verdict: changes requested",

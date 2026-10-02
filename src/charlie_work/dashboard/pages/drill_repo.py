@@ -15,7 +15,18 @@ from ..drill import EscalationRow, LoopPassRow, MergeRow, RepoDrill
 from ..now_types import NeedsMeItem
 from ..read_model import ModelState
 from .drill_shell import page, section, table, ts_tag
-from .now_fmt import age, esc, flow_url, issue_url, link, pass_url, pr_url, short_repo, slug
+from .now_fmt import (
+    age,
+    cap_text,
+    esc,
+    flow_url,
+    issue_url,
+    link,
+    pass_url,
+    pr_url,
+    short_repo,
+    slug,
+)
 from .now_needs import TONE
 
 _VIEWS = ("needs", "workers", "runners")
@@ -63,7 +74,7 @@ def _needs(repo: str, items: tuple[NeedsMeItem, ...]) -> str:
 def _capacity(d: RepoDrill) -> str:
     def pair(live: int | None, cap: int | None) -> str:
         shown = "?" if live is None else str(live)
-        return f"{esc(shown)} live / {esc(cap) if cap else 'cap ?'}"
+        return f"{esc(shown)} running / {cap_text(cap)}"
 
     w, r, ru = d.workers, d.reviewers, d.runners
     rows = [

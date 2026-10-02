@@ -43,9 +43,9 @@ from charlie_work.workflow import OrchestratorApp
 from _local_gate_async_fixtures import (  # noqa: E402
     FAIL_SUITE,
     SLEEP_SUITE,
+    UNALLOCATABLE_PID,
     _adopt_and_approve,
     _commit_file,
-    _dead_pid,
     _event_kinds,
     _events_of_kind,
     _gate_identity,
@@ -55,6 +55,7 @@ from _local_gate_async_fixtures import (  # noqa: E402
     _lane_app,
     _lane_config,
     _make_branch,
+    _seed_dead_claim,
     _wait_for_result,
     _wait_pid_dead,
 )
@@ -545,35 +546,34 @@ def test_malformed_result_file_is_never_green(lane_repo: Path) -> None:
     _init_repo(lane_repo)
     issues_dir = lane_repo / "docs" / "issues"
     head = _make_branch(lane_repo, "agent/issue-7-x", "a.py", "a = 1\n")
-    app = _lane_app(lane_repo, issues_dir)
+    # SLEEP_SUITE keeps the relaunched wrapper alive until ``finally`` (#2252).
+    config = _lane_config(lane_repo, issues_dir, dispatch={"test_command": SLEEP_SUITE})
+    app = _lane_app(lane_repo, issues_dir, config=config)
     _adopt_and_approve(app, issues_dir, 7, "agent/issue-7-x", head)
     paths = _gate_paths(app, 7)
     paths.gate_dir.mkdir(parents=True, exist_ok=True)
     paths.result.write_text("{not json", encoding="utf-8")
-    with state_lock(app.paths.state_file):
-        state = load_state(app.paths.state_file)
-        state["prs"]["7"].update(
-            {
-                "local_suite_pid": _dead_pid(),
-                "local_suite_process_start_time": None,
-                "local_suite_started_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
-                "local_suite_log": str(paths.log),
-                "local_suite_gate_dir": str(paths.gate_dir),
-                "local_suite_head": head,
-                "local_suite_base_sha": branch_head_sha(lane_repo, "main"),
-            }
-        )
-        save_state(app.paths.state_file, state)
+    # A recycled just-exited pid could read live (or be reused by the
+    # relaunch itself), so the stale claim uses an unallocatable pid (#2207).
+    stale_pid = UNALLOCATABLE_PID
+    _seed_dead_claim(app, lane_repo, 7, head)
 
     results = app._local_merge_approved()
 
     try:
         assert results[0]["outcome"] == "suite_launched"
         state = load_state_locked(app.paths.state_file)
-        assert state["prs"]["7"]["status"] == "approved"
+        record = state["prs"]["7"]
+        assert record["status"] == "approved"
+        assert record["local_suite_orphan_count"] == 1
         assert not is_ancestor(lane_repo, head, branch_head_sha(lane_repo, "main"))
-        # The stale file was cleared by the relaunch; a real pid now claims.
-        assert is_pid_alive(int(state["prs"]["7"]["local_suite_pid"]))
+        # A fresh (pid, start-time) claim replaced the stale one (#2207) and
+        # the launch scrubbed the malformed file before the spawn.
+        new_pid, new_start = _gate_identity(app, 7)
+        assert new_pid != stale_pid
+        assert new_start
+        assert not paths.result.exists()
+        assert is_pid_alive(new_pid, new_start)
     finally:
         _kill_claimed_gate(app, 7)
 
@@ -593,20 +593,7 @@ def test_result_for_wrong_head_is_not_accepted(lane_repo: Path) -> None:
         '{"ok": true, "returncode": 0, "head_sha": "deadbeef", "argv": []}',
         encoding="utf-8",
     )
-    with state_lock(app.paths.state_file):
-        state = load_state(app.paths.state_file)
-        state["prs"]["7"].update(
-            {
-                "local_suite_pid": _dead_pid(),
-                "local_suite_process_start_time": None,
-                "local_suite_started_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
-                "local_suite_log": str(paths.log),
-                "local_suite_gate_dir": str(paths.gate_dir),
-                "local_suite_head": head,
-                "local_suite_base_sha": branch_head_sha(lane_repo, "main"),
-            }
-        )
-        save_state(app.paths.state_file, state)
+    _seed_dead_claim(app, lane_repo, 7, head)
 
     results = app._local_merge_approved()
 
