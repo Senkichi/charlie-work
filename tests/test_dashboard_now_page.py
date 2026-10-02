@@ -239,3 +239,22 @@ def test_page_has_no_href_for_a_dot_dot_repo_key() -> None:
     page = _page(model)
     assert "/repo/.." not in page and "/issue/../" not in page
     assert 'href="/repo/../' not in page
+
+
+def test_htmx_config_disables_style_settle_eval_and_script_tags() -> None:
+    import html as html_mod
+    import json
+
+    meta = re.search(r'<meta name="htmx-config" content="([^"]*)">', _page())
+    assert meta is not None
+    config = json.loads(html_mod.unescape(meta.group(1)))
+    assert config["includeIndicatorStyles"] is False
+    assert "style" not in config["attributesToSettle"]
+    assert config["allowEval"] is False and config["allowScriptTags"] is False
+
+
+def test_every_page_head_declares_an_icon_so_no_favicon_404() -> None:
+    from charlie_work.dashboard.pages.nav import HEAD_BASE
+
+    assert '<link rel="icon" href="data:,">' in HEAD_BASE
+    assert HEAD_BASE in _page()

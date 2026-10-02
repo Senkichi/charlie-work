@@ -18,15 +18,31 @@ is the stable polite region where dashboard.js shows "Not updating" when polls f
 
 from __future__ import annotations
 
+import json
+
 from ..now_types import NowModel, RepoFreshness
 from ..read_model import ModelState
 from .now_capacity import render_capacity, render_repo_ledger
 from .now_flow import render_flow, render_not_dispatchable
 from .now_fmt import age, esc, local_time, repo_url, short_repo
 from .now_keyhelp import key_help
-from .nav import THEME_BUTTON, views_nav
+from .nav import HEAD_BASE, THEME_BUTTON, views_nav
 from .now_needs import render_needs
 from .routes import routed
+
+# htmx runs under a strict CSP (no inline style, no eval). Settling "style" would copy a
+# style attribute that a browser extension (or a test driver hiding the caret) put on an
+# old element onto its swapped twin, which the CSP blocks on every poll; eval and inline
+# script tags are disabled because nothing here needs them.
+HTMX_CONFIG = json.dumps(
+    {
+        "includeIndicatorStyles": False,
+        "attributesToSettle": ["class", "width", "height"],
+        "allowEval": False,
+        "allowScriptTags": False,
+    },
+    separators=(",", ":"),
+)
 
 
 def _fresh_chip(f: RepoFreshness) -> str:
@@ -133,9 +149,8 @@ def render_now(
 ) -> str:
     return (
         f'<!doctype html><html lang="en" data-theme="{esc(theme)}"><head>'
-        '<meta charset="utf-8">'
-        '<meta name="viewport" content="width=device-width, initial-scale=1">'
-        '<meta name="htmx-config" content=\'{"includeIndicatorStyles":false}\'>'
+        + HEAD_BASE
+        + f'<meta name="htmx-config" content="{esc(HTMX_CONFIG)}">'
         "<title>Fleet Now</title>"
         '<link rel="stylesheet" href="/static/dashboard.css">'
         '<link rel="stylesheet" href="/static/now.css">'
