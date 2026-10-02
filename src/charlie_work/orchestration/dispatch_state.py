@@ -582,7 +582,16 @@ def _dispatch_impl(
         # Best-effort label transition and issue close. A failure here is
         # non-fatal; the issue is still excluded from dispatch because the
         # merged PR reference exists, and the next pass will retry.
-        _wf.transition(self.gh, self.config.labels, issue_number, "merged")
+        _wf.transition(
+            self.gh,
+            self.config.labels,
+            issue_number,
+            "merged",
+            state_path=self.paths.state_file,
+            pr_number=int(pr_by_issue[issue_number]["number"])
+            if issue_number in pr_by_issue
+            else None,
+        )
         if self.gh.close_issue(issue_number):
             closed_merged_pr_issues.add(issue_number)
 
@@ -655,7 +664,11 @@ def _dispatch_impl(
         (
             issue_number,
             _wf.transition(
-                self.gh, self.config.labels, issue_number, "merged_pr_mention_flagged"
+                self.gh,
+                self.config.labels,
+                issue_number,
+                "merged_pr_mention_flagged",
+                state_path=self.paths.state_file,
             ).outcome,
         )
         for issue_number in newly_flagged_mention_issues
@@ -1489,6 +1502,7 @@ def _dispatch_impl(
                     self.config.labels,
                     request.issue_number,
                     target,
+                    state_path=self.paths.state_file,
                 )
                 if result.outcome != TransitionOutcome.APPLIED:
                     label_error = {
@@ -1535,6 +1549,7 @@ def _dispatch_impl(
                     self.config.labels,
                     request.issue_number,
                     edge,
+                    state_path=self.paths.state_file,
                 )
                 if result.outcome != TransitionOutcome.APPLIED:
                     label_error = {
@@ -1609,6 +1624,7 @@ def _dispatch_impl(
                 self.config.labels,
                 issue_number,
                 edge,
+                state_path=self.paths.state_file,
             )
             if result.outcome != TransitionOutcome.APPLIED:
                 label_error = {

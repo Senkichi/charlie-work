@@ -140,7 +140,14 @@ def _self_merge(
     # Cleanup is best-effort and must finish even when the pass budget is spent.
     with pass_deadline_suspended(app.gh):
         if issue_number is not None:
-            transitioned = write_gate.transition(app.gh, app.config.labels, issue_number, "merged")
+            transitioned = write_gate.transition(
+                app.gh,
+                app.config.labels,
+                issue_number,
+                "merged",
+                pr_number=pr_number,
+                cause="merge_finalize",
+            )
             label_error = label_error_of("merged", transitioned)
             app.gh.close_issue(issue_number)
         if auto.delete_branch:
@@ -198,7 +205,11 @@ def _human_merge(
         write_gate.save_state(state)
     if issue_number is not None:
         transitioned = write_gate.transition(
-            app.gh, app.config.labels, issue_number, "human_merge_required"
+            app.gh,
+            app.config.labels,
+            issue_number,
+            "human_merge_required",
+            pr_number=pr_number,
         )
         results = replace(
             results,

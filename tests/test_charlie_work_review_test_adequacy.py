@@ -73,7 +73,7 @@ def test_review_test_adequacy_hard_fail_records_request_changes(
         assert "Test-exempt:" in summary
         return CommandResult(True, "record_review called", {})
 
-    def _fake_transition(gh, labels, issue_number, edge):
+    def _fake_transition(gh, labels, issue_number, edge, **_kwargs):
         calls["transition"] += 1
         assert edge == "review_started"
         from charlie_work.labels import TransitionResult, TransitionOutcome
@@ -129,7 +129,7 @@ def test_review_test_adequacy_hard_fail_label_set(tmp_path: Path, monkeypatch) -
         transition_calls.append("rework_requested")
         return CommandResult(True, "record_review called", {})
 
-    def _fake_transition(gh, labels, issue_number, edge):
+    def _fake_transition(gh, labels, issue_number, edge, **_kwargs):
         transition_calls.append(edge)
         if edge == "review_started":
             return TransitionResult(
@@ -184,7 +184,7 @@ def test_review_test_adequacy_unchanged_head_not_rerecorded(tmp_path: Path, monk
     def _fake_record_review(pr_number, decision, **kwargs):
         return CommandResult(True, "record_review called", {})
 
-    def _fake_transition(gh, labels, issue_number, edge):
+    def _fake_transition(gh, labels, issue_number, edge, **_kwargs):
         from charlie_work.labels import TransitionResult, TransitionOutcome
 
         return TransitionResult(
@@ -288,7 +288,7 @@ def test_review_test_adequacy_escalates_at_max_rework_cycles(tmp_path: Path, mon
             escalated = False
         return CommandResult(True, "record_review called", {"escalated": escalated})
 
-    def _fake_transition(gh, labels, issue_number, edge):
+    def _fake_transition(gh, labels, issue_number, edge, **_kwargs):
         from charlie_work.labels import TransitionResult, TransitionOutcome
 
         return TransitionResult(

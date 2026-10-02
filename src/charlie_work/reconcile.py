@@ -16,8 +16,9 @@ it is never invoked implicitly — callers gate it behind an explicit
 kind that maps onto a standard lifecycle edge (a PR merged outside the
 orchestrator behaves exactly like a normal merge once discovered — label
 edge, merged-issue field set, and issue close, the same trio every other
-merged-PR door performs) and issues direct ``remove_issue_label`` calls
-only for label combinations that ``labels.transition`` has no edge for
+merged-PR door performs) and routes the computed add/remove repair sets
+through ``labels.apply_issue_labels`` — the same seam ``transition``
+delegates to — for label combinations that map to no named edge
 (contradictory terminal+active labels).
 """
 
@@ -55,7 +56,7 @@ from .github import (
 )
 from .issue_linking import linked_issue_number
 from .instrumentation import log_event, query_events
-from .labels import TransitionOutcome, _edges, transition
+from .labels import TransitionOutcome, apply_issue_labels, transition
 from .local_lane import synthesize_open_pr
 from .local_work_park import publishes_pull_requests
 from .merge_finalize import _merged_issue_fields
@@ -2821,7 +2822,15 @@ def apply_fixes(
                 new_issues[issue_key] = _merged_issue_fields(
                     new_issues.get(issue_key, {}), item.issue_number
                 )
-                result = transition(gh, config.labels, item.issue_number, "merged")
+                result = transition(
+                    gh,
+                    config.labels,
+                    item.issue_number,
+                    "merged",
+                    state_path=state_path,
+                    pr_number=item.pr_number,
+                    cause=item.kind,
+                )
                 # Record transition outcome in the event
                 fix_actions = list(item.fix_actions)
                 if result.outcome != TransitionOutcome.APPLIED:
@@ -2873,10 +2882,18 @@ def apply_fixes(
                         f"remove review checkout for PR #{item.pr_number}: skipped (no repo_root)"
                     )
             if item.issue_number is not None:
-                label_ok = True
-                for label in item.remove_labels:
-                    if not gh.remove_issue_label(item.issue_number, label):
-                        label_ok = False
+                # write-gate-exempt(issue=2226): apply_fixes is out-of-wave raw territory (no write_gate param; reachable only when fix and not dry_run — the gh client owns dry-run).
+                label_result = apply_issue_labels(
+                    gh,
+                    config.labels,
+                    item.issue_number,
+                    remove=item.remove_labels,
+                    to_state="closed",
+                    state_path=state_path,
+                    pr_number=item.pr_number,
+                    cause=item.kind,
+                )
+                label_ok = label_result.outcome is not TransitionOutcome.PARTIAL_FAILURE
                 # Record label-write failures in the event
                 fix_actions = list(item.fix_actions)
                 if item.pr_number is not None:
@@ -2947,20 +2964,27 @@ def apply_fixes(
             "escalated_labels_converged",
         ):
             if item.issue_number is not None:
-                label_ok = True
-                for label in item.remove_labels:
-                    if not gh.remove_issue_label(item.issue_number, label):
-                        label_ok = False
                 # Issue #417: issue_active_label_no_open_pr now carries
                 # add_labels=(ready,) when the ready label is missing;
                 # escalated_labels_converged carries add_labels=(<expected
                 # terminal label>,) when it never landed -- human_needed for
                 # a judgment escalation, operator_queue for a mechanical one
                 # (issue #1266) -- done_label_with_active_labels never sets
-                # add_labels, so this loop is a no-op for that sibling kind.
-                for label in item.add_labels:
-                    if not gh.add_issue_label(item.issue_number, label):
-                        label_ok = False
+                # add_labels; the issue keeps its done label, so its recorded
+                # state is "done" for the lifecycle event (issue #2226).
+                # write-gate-exempt(issue=2226): apply_fixes is out-of-wave raw territory (no write_gate param; reachable only when fix and not dry_run — the gh client owns dry-run).
+                label_result = apply_issue_labels(
+                    gh,
+                    config.labels,
+                    item.issue_number,
+                    add=item.add_labels,
+                    remove=item.remove_labels,
+                    to_state="done" if item.kind == "done_label_with_active_labels" else None,
+                    state_path=state_path,
+                    pr_number=item.pr_number,
+                    cause=item.kind,
+                )
+                label_ok = label_result.outcome is not TransitionOutcome.PARTIAL_FAILURE
                 # Record label-write failures in the event
                 fix_actions = list(item.fix_actions)
                 if not label_ok:
@@ -2987,13 +3011,18 @@ def apply_fixes(
             # once a PR is open and a review packet has actually been
             # generated -- this self-heal never generates one.
             if item.issue_number is not None:
-                label_ok = True
-                for label in item.remove_labels:
-                    if not gh.remove_issue_label(item.issue_number, label):
-                        label_ok = False
-                for label in item.add_labels:
-                    if not gh.add_issue_label(item.issue_number, label):
-                        label_ok = False
+                # write-gate-exempt(issue=2226): apply_fixes is out-of-wave raw territory (no write_gate param; reachable only when fix and not dry_run — the gh client owns dry-run).
+                label_result = apply_issue_labels(
+                    gh,
+                    config.labels,
+                    item.issue_number,
+                    add=item.add_labels,
+                    remove=item.remove_labels,
+                    state_path=state_path,
+                    pr_number=item.pr_number,
+                    cause=item.kind,
+                )
+                label_ok = label_result.outcome is not TransitionOutcome.PARTIAL_FAILURE
 
                 issue_key = str(item.issue_number)
                 existing_issue = new_issues.get(issue_key, {})
@@ -3075,12 +3104,13 @@ def apply_fixes(
             # that owns the ``status="escalated"`` literal + the paired
             # ``escalation_reason``/``reason_class``/``terminal_since``
             # fields), and the issue label changes go through
-            # ``gh.add_issue_label``/``gh.remove_issue_label`` directly rather
-            # than ``transition()`` -- ``transition`` is a WriteGate-gated
-            # primitive (issue #1264 R9 ratchet) and ``apply_fixes`` is not a
-            # WriteGate consumer. The add/remove sets are still derived from
-            # the same ``_edges(config.labels)`` table ``transition`` uses, so
-            # the label disposition is identical; only the call path differs.
+            # ``labels.transition`` -- the raw, un-gated seam. The gate
+            # concern that kept this site off ``transition`` was about the
+            # WriteGate wrapper (issue #1264 R9 ratchet), not the primitive:
+            # ``apply_fixes`` is itself the fix-application boundary, so
+            # calling ``labels.transition`` directly applies the same
+            # ``_edges(config.labels)`` disposition and now also records the
+            # lifecycle transition (issue #2226).
             # The dwell-tracking fields (mergequeue_since/mergequeue_head_sha)
             # are cleared so the post-fix re-detect does not re-fire the
             # time-in-queue trigger for the same window.
@@ -3112,18 +3142,22 @@ def apply_fixes(
                     reason="mergequeue_wedged",
                     reason_class="judgment",
                 )
-                # Apply the "escalated" edge's label changes directly (add
-                # human_needed, remove all other workflow labels) without
-                # calling the gated ``transition`` primitive.
+                # Apply the "escalated" edge (add human_needed, remove all
+                # other workflow labels) through ``transition`` — the raw,
+                # un-gated seam — so the lifecycle transition is recorded
+                # (issue #2226) without going through the WriteGate.
                 edge = _escalation_edge("escalated", "judgment")
-                add_set, remove_set = _edges(config.labels)[edge]
-                label_ok = True
-                for label in add_set:
-                    if not gh.add_issue_label(item.issue_number, label):
-                        label_ok = False
-                for label in remove_set:
-                    if not gh.remove_issue_label(item.issue_number, label):
-                        label_ok = False
+                # write-gate-exempt(issue=2226): apply_fixes is out-of-wave raw territory (no write_gate param; reachable only when `fix and not dry_run`).
+                label_result = transition(
+                    gh,
+                    config.labels,
+                    item.issue_number,
+                    edge,
+                    state_path=state_path,
+                    pr_number=item.pr_number,
+                    cause=item.kind,
+                )
+                label_ok = label_result.outcome is not TransitionOutcome.PARTIAL_FAILURE
                 if not label_ok:
                     fix_actions.append("label_write_failed: true")
             item = DriftItem(
@@ -3224,10 +3258,18 @@ def apply_fixes(
                 issue_key = str(item.issue_number)
                 existing_issue = new_issues.get(issue_key, {})
                 new_issues[issue_key] = {**existing_issue, "status": "closed"}
-                label_ok = True
-                for label in item.remove_labels:
-                    if not gh.remove_issue_label(item.issue_number, label):
-                        label_ok = False
+                # write-gate-exempt(issue=2226): apply_fixes is out-of-wave raw territory (no write_gate param; reachable only when fix and not dry_run — the gh client owns dry-run).
+                label_result = apply_issue_labels(
+                    gh,
+                    config.labels,
+                    item.issue_number,
+                    remove=item.remove_labels,
+                    to_state="closed",
+                    state_path=state_path,
+                    pr_number=item.pr_number,
+                    cause=item.kind,
+                )
+                label_ok = label_result.outcome is not TransitionOutcome.PARTIAL_FAILURE
                 fix_actions = list(item.fix_actions)
                 if not label_ok:
                     fix_actions.append("label_write_failed: true")
@@ -3306,7 +3348,15 @@ def apply_fixes(
                 )
                 reason_class = "judgment" if deterministic_judgment else "mechanical"
                 edge = _escalation_edge("redispatch_escalated", reason_class)
-                result = transition(gh, config.labels, item.issue_number, edge)
+                result = transition(
+                    gh,
+                    config.labels,
+                    item.issue_number,
+                    edge,
+                    state_path=state_path,
+                    pr_number=item.pr_number,
+                    cause=item.kind,
+                )
                 fix_actions = list(item.fix_actions)
                 if result.outcome != TransitionOutcome.APPLIED:
                     fix_actions.append(
@@ -3494,13 +3544,18 @@ def apply_fixes(
                             salvage_error = push_error or "git push failed"
 
                 if salvage_ok:
-                    label_ok = True
-                    for label in item.remove_labels:
-                        if not gh.remove_issue_label(item.issue_number, label):
-                            label_ok = False
-                    for label in item.add_labels:
-                        if not gh.add_issue_label(item.issue_number, label):
-                            label_ok = False
+                    # write-gate-exempt(issue=2226): apply_fixes is out-of-wave raw territory (no write_gate param; reachable only when fix and not dry_run — the gh client owns dry-run).
+                    label_result = apply_issue_labels(
+                        gh,
+                        config.labels,
+                        item.issue_number,
+                        add=item.add_labels,
+                        remove=item.remove_labels,
+                        state_path=state_path,
+                        pr_number=pr_number,
+                        cause=item.kind,
+                    )
+                    label_ok = label_result.outcome is not TransitionOutcome.PARTIAL_FAILURE
                     fix_actions = list(item.fix_actions)
                     if not label_ok:
                         fix_actions.append("label_write_failed: true")
@@ -3517,13 +3572,20 @@ def apply_fixes(
                     )
                 else:
                     # Fallback: treat as session_failed_relabeled and add ready label
-                    label_ok = True
-                    for label in item.remove_labels:
-                        if not gh.remove_issue_label(item.issue_number, label):
-                            label_ok = False
-                    if config.labels.ready not in item.add_labels:
-                        if not gh.add_issue_label(item.issue_number, config.labels.ready):
-                            label_ok = False
+                    # write-gate-exempt(issue=2226): apply_fixes is out-of-wave raw territory (no write_gate param; reachable only when `fix and not dry_run`).
+                    label_result = apply_issue_labels(
+                        gh,
+                        config.labels,
+                        item.issue_number,
+                        add=(config.labels.ready,)
+                        if config.labels.ready not in item.add_labels
+                        else (),
+                        remove=item.remove_labels,
+                        to_state="ready",
+                        state_path=state_path,
+                        cause="salvage_failed_fallback",
+                    )
+                    label_ok = label_result.outcome is not TransitionOutcome.PARTIAL_FAILURE
                     fix_actions = list(item.fix_actions)
                     fix_actions.append(f"salvage_failed: {salvage_error}")
                     if not label_ok:
@@ -3542,17 +3604,23 @@ def apply_fixes(
                     )
 
         elif item.kind == "session_failed_relabeled":
-            # Issue #118: reconcile labels for dead sessions with no open PR
+            # Issue #118: reconcile labels for dead sessions with no open PR.
+            # The item's computed sets strip the active labels and carry
+            # ``ready`` when it is missing; routing them through the seam
+            # records the return to ``ready`` (issue #2226).
             if item.issue_number is not None:
-                label_ok = True
-                # Remove active labels
-                for label in item.remove_labels:
-                    if not gh.remove_issue_label(item.issue_number, label):
-                        label_ok = False
-                # Add ready label if needed (structured field)
-                for label in item.add_labels:
-                    if not gh.add_issue_label(item.issue_number, label):
-                        label_ok = False
+                # write-gate-exempt(issue=2226): apply_fixes is out-of-wave raw territory (no write_gate param; reachable only when `fix and not dry_run`).
+                label_result = apply_issue_labels(
+                    gh,
+                    config.labels,
+                    item.issue_number,
+                    add=item.add_labels,
+                    remove=item.remove_labels,
+                    to_state="ready",
+                    state_path=state_path,
+                    cause=item.reason or item.kind,
+                )
+                label_ok = label_result.outcome is not TransitionOutcome.PARTIAL_FAILURE
                 # Record label-write failures in the event
                 fix_actions = list(item.fix_actions)
                 if not label_ok:

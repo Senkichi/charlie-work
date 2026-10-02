@@ -159,7 +159,13 @@ def _repair_escalated_labels(self) -> dict[str, Any]:
             if expected_label is not None and expected_label in label_names(issue_view):
                 outcomes.append((int(issue_number), None))
                 continue
-            result = _wf.transition(self.gh, self.config.labels, int(issue_number), edge)
+            result = _wf.transition(
+                self.gh,
+                self.config.labels,
+                int(issue_number),
+                edge,
+                state_path=self.paths.state_file,
+            )
         except Exception:
             logging.getLogger(__name__).warning(
                 "escalated label repair for issue %s deferred (GitHub fetch "

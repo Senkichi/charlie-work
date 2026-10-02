@@ -16,7 +16,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 from .config import LabelConfig
-from .labels import TransitionOutcome, TransitionResult, _edges
+from .labels import TransitionOutcome, TransitionResult, _edges, apply_issue_labels
 from .state import (
     ESCALATION_REASON_CLASSES,
     PASSIVE_OPEN_STATUS,
@@ -637,18 +637,32 @@ def _strip_active_and_flag_human_needed(
     issue_number: int,
     active_labels: set[str],
     issue_labels: set[str],
+    state_path: Path,
 ) -> bool:
     """Strip every active label and apply ``human_needed`` (if absent).
 
     The label writes shared by the orphan sweep's worker-blocked,
     zero-artifact and cross-repo-scope escalations. Returns False when any
     label write failed (the caller records it as ``label_write_ok``).
+
+    Issue #2226: the write goes through the canonical label seam so the
+    lifecycle transition is recorded in events.db; the conditional add
+    preserves the no-redundant-write contract (``human_needed`` is only
+    added when absent). The call is deliberately raw — sweep label writes
+    go straight to the GitHub client, which owns its own dry-run switch
+    (the WriteGate only gates state.json and events).
     """
-    label_write_ok = True
-    for label in sorted(active_labels):
-        if not gh.remove_issue_label(issue_number, label):
-            label_write_ok = False
-    if config.labels.human_needed not in issue_labels:
-        if not gh.add_issue_label(issue_number, config.labels.human_needed):
-            label_write_ok = False
-    return label_write_ok
+    # write-gate-exempt(issue=2226): sweep label writes bypass the WriteGate by contract — the client's own dry-run switch owns suppression.
+    result = apply_issue_labels(
+        gh,
+        config.labels,
+        issue_number,
+        add=(config.labels.human_needed,)
+        if config.labels.human_needed not in issue_labels
+        else (),
+        remove=sorted(active_labels),
+        to_state="human_needed",
+        state_path=state_path,
+        cause="escalated",
+    )
+    return result.outcome is not TransitionOutcome.PARTIAL_FAILURE

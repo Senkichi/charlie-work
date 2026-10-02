@@ -307,7 +307,14 @@ def _escalate_stale_checks_exhaustion(
         _wf.save_state(self.paths.state_file, state)
 
     edge = _wf._escalation_edge("escalated", "mechanical")
-    result = _wf.transition(self.gh, self.config.labels, issue_number, edge)
+    result = _wf.transition(
+        self.gh,
+        self.config.labels,
+        issue_number,
+        edge,
+        state_path=self.paths.state_file,
+        pr_number=pr_number,
+    )
     label_error = None
     if result.outcome != TransitionOutcome.APPLIED:
         label_error = {
@@ -541,7 +548,14 @@ def _check_janitor_rework_stall(
         )
         _wf.save_state(self.paths.state_file, state)
     edge = _wf._escalation_edge("escalated", "mechanical")
-    result = _wf.transition(self.gh, self.config.labels, issue_number, edge)
+    result = _wf.transition(
+        self.gh,
+        self.config.labels,
+        issue_number,
+        edge,
+        state_path=self.paths.state_file,
+        pr_number=pr_number,
+    )
     label_error = None
     if result.outcome != TransitionOutcome.APPLIED:
         label_error = {

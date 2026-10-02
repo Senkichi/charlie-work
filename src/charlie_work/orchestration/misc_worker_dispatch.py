@@ -33,6 +33,7 @@ from charlie_work.dead_worker_sweep.effects_sessions import _emit_session_failed
 from charlie_work.fleet_registry import try_acquire_fleet_lock
 from charlie_work.worker_launch_gate import acquire_fleet_launch_lock
 from charlie_work.github import label_names
+from charlie_work.labels import TransitionOutcome, apply_issue_labels
 from charlie_work.salvage_events import repeats_last_salvage_failure
 from charlie_work.state import StateLockBusy
 from charlie_work.worker import iter_workers
@@ -300,13 +301,21 @@ def _route_phantom_live_worker(
         return "dispatch_failed", None, state
 
     needs_ready = self.config.labels.ready not in issue_labels
-    label_write_ok = True
-    for label in sorted(active_labels):
-        if not self.gh.remove_issue_label(issue_number, label):
-            label_write_ok = False
-    if needs_ready:
-        if not self.gh.add_issue_label(issue_number, self.config.labels.ready):
-            label_write_ok = False
+    # Issue #2226: the strip+ready write goes through the canonical seam so
+    # the return to ``ready`` is recorded in events.db; the conditional add
+    # preserves the no-redundant-write contract.
+    # write-gate-exempt(issue=2226): preserves the pre-existing raw label-write contract — the gh client's own dry-run switch owns suppression.
+    label_result = apply_issue_labels(
+        self.gh,
+        self.config.labels,
+        issue_number,
+        add=(self.config.labels.ready,) if needs_ready else (),
+        remove=sorted(active_labels),
+        to_state="ready",
+        state_path=self.paths.state_file,
+        cause="session_failed_relabeled",
+    )
+    label_write_ok = label_result.outcome is not TransitionOutcome.PARTIAL_FAILURE
     state = _emit_session_failed_relabeled(
         state,
         issue_number=issue_number,

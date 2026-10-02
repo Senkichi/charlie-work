@@ -74,7 +74,14 @@ def _route_to_rework(
         state = self._record_event(state, event_kind, payload)
         _wf.save_state(self.paths.state_file, state)
 
-    result = _wf.transition(self.gh, self.config.labels, issue_number, "rework_requested")
+    result = _wf.transition(
+        self.gh,
+        self.config.labels,
+        issue_number,
+        "rework_requested",
+        state_path=self.paths.state_file,
+        pr_number=pr_number,
+    )
     if result.outcome == TransitionOutcome.APPLIED:
         return None
     return {
@@ -571,7 +578,14 @@ def _route_janitor_gate_failure_to_rework(
             )
             _wf.save_state(self.paths.state_file, state)
         edge = _wf._escalation_edge("escalated", "mechanical")
-        result = _wf.transition(self.gh, self.config.labels, issue_number, edge)
+        result = _wf.transition(
+            self.gh,
+            self.config.labels,
+            issue_number,
+            edge,
+            state_path=self.paths.state_file,
+            pr_number=pr_number,
+        )
         label_error = None
         if result.outcome != TransitionOutcome.APPLIED:
             label_error = {
@@ -776,16 +790,27 @@ def _reroute_stranded_request_changes(
                     "head_sha": pr.get("headRefOid"),
                 },
             )
-            _wf.save_state(self.paths.state_file, state)
+            self.write_gate.save_state(state)
         # Strip active labels from the closed issue, mirroring
         # reconcile's state_active_status_issue_closed: setting
         # status to "closed" here would prevent that drift kind from
         # firing (it requires status in ACTIVE_STATE_STATUSES), so the
         # restorer must do the label cleanup itself to avoid leaving
         # active labels on a finalized issue.
-        active_labels = _wf.label_names(issue) & self.config.labels.active
-        for label in sorted(active_labels):
-            self.gh.remove_issue_label(issue_number, label)
+        # Issue #2226: the strip routes through the canonical seam so the
+        # ``closed`` disposition is recorded in events.db; the remove set
+        # stays surgical (only the active labels actually present).
+        # write-gate-exempt(issue=2226): preserves the pre-existing raw label-write contract — the gh client's own dry-run switch owns suppression.
+        _wf.apply_issue_labels(
+            self.gh,
+            self.config.labels,
+            issue_number,
+            remove=sorted(_wf.label_names(issue) & self.config.labels.active),
+            to_state="closed",
+            state_path=self.paths.state_file,
+            pr_number=int(pr["number"]),
+            cause="closed_unmerged",
+        )
         return None
     return self._route_to_rework(
         pr,

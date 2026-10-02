@@ -704,7 +704,14 @@ def _route_workflow_no_jobs(
     Retrigger cannot fix a rejected workflow file, so ``review()`` returns this
     instead of re-parking the PR as ``janitor_blocked``.
     """
-    _wf.transition(self.gh, self.config.labels, issue_number, "review_started")
+    _wf.transition(
+        self.gh,
+        self.config.labels,
+        issue_number,
+        "review_started",
+        state_path=self.paths.state_file,
+        pr_number=pr_number,
+    )
     missing = ", ".join(verdict.missing_required_checks)
     diagnostic = (
         f"workflow file invalid: run completed with no jobs created for head "

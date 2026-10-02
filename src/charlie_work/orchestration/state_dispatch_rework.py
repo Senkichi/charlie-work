@@ -806,6 +806,7 @@ def _dispatch_rework_impl(
                 self.config.labels,
                 issue_number,
                 _wf._escalation_edge("redispatch_escalated", "mechanical"),
+                state_path=self.paths.state_file,
             )
 
     # Issue #1134: escalate worker-death loops separately from no-op
@@ -884,6 +885,7 @@ def _dispatch_rework_impl(
                 self.config.labels,
                 issue_number,
                 _wf._escalation_edge("redispatch_escalated", "mechanical"),
+                state_path=self.paths.state_file,
             )
 
     # Issue #1393: escalate issues whose pre-launch environment has
@@ -933,6 +935,7 @@ def _dispatch_rework_impl(
                 self.config.labels,
                 issue_number,
                 _wf._escalation_edge("redispatch_escalated", "mechanical"),
+                state_path=self.paths.state_file,
             )
 
     # Issue #1014 (mirroring #1005 in the fresh-dispatch path): compute
@@ -1452,6 +1455,7 @@ def _dispatch_rework_impl(
                         self.config.labels,
                         request.issue_number,
                         edge,
+                        state_path=self.paths.state_file,
                     )
                     if result.outcome != TransitionOutcome.APPLIED:
                         label_error = {
@@ -1476,6 +1480,12 @@ def _dispatch_rework_impl(
                         self.config.labels,
                         request.issue_number,
                         "rework_dispatched",
+                        state_path=self.paths.state_file,
+                        pr_number=(
+                            int(pr_by_issue[request.issue_number]["number"])
+                            if request.issue_number in pr_by_issue
+                            else None
+                        ),
                     )
                     if result.outcome != TransitionOutcome.APPLIED:
                         label_error = {
@@ -1593,6 +1603,7 @@ def _dispatch_rework_impl(
                             self.config.labels,
                             request.issue_number,
                             edge,
+                            state_path=self.paths.state_file,
                         )
                         if result.outcome != TransitionOutcome.APPLIED:
                             label_error = {
@@ -1668,6 +1679,7 @@ def _dispatch_rework_impl(
                         self.config.labels,
                         request.issue_number,
                         edge,
+                        state_path=self.paths.state_file,
                     )
                     if result.outcome != TransitionOutcome.APPLIED:
                         label_error = {

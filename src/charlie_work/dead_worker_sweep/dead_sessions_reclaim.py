@@ -23,6 +23,7 @@ from ..dispatch_selection import _windowed_redispatch_at
 from ..escalation import _escalate_issue, _escalation_edge
 from ..github import label_names
 from ..host import current as _host_current
+from ..labels import TransitionOutcome, apply_issue_labels
 from ..local_work_park import park_labelless_dead_local_session
 from ..worker import WorkerView
 from ..worktree import read_worker_outcome
@@ -203,18 +204,28 @@ def _reclaim_no_open_pr(
         state["issues"][str(w.issue_number)] = entry
         write_gate.save_state(state)
 
-    # Remove all active labels and ensure the ready label is present. Issue #417:
-    # record the bool returns instead of discarding them -- a False means this pass's
-    # label swap did not fully land, and the orphan sweep's no-open-PR lane finishes
-    # the reclaim later (it re-derives "does this still need fixing" from GitHub's live
-    # labels and never touches ``redispatch_at``, so a retry cannot double-count).
-    label_write_ok = True
-    for label in sorted(active_labels):
-        if not gh.remove_issue_label(w.issue_number, label):
-            label_write_ok = False
-    if needs_ready:
-        if not gh.add_issue_label(w.issue_number, config.labels.ready):
-            label_write_ok = False
+    # Remove all active labels and ensure the ready label is present. Issue
+    # #2226: the write routes through the canonical label seam so the return
+    # to ``ready`` is recorded as a ``lifecycle_transition`` in events.db;
+    # the conditional add preserves the no-redundant-write contract (ready
+    # is only re-added when absent). Issue #417: record the outcome instead
+    # of discarding it -- a PARTIAL_FAILURE means this pass's label swap did
+    # not fully land, and the orphan sweep's no-open-PR lane finishes the
+    # reclaim later (it re-derives "does this still need fixing" from
+    # GitHub's live labels and never touches ``redispatch_at``, so a retry
+    # cannot double-count).
+    # write-gate-exempt(issue=2226): sweep label writes bypass the WriteGate by contract — the client's own dry-run switch owns suppression.
+    label_result = apply_issue_labels(
+        gh,
+        config.labels,
+        w.issue_number,
+        add=(config.labels.ready,) if needs_ready else (),
+        remove=sorted(active_labels),
+        to_state="ready",
+        state_path=state_file,
+        cause="session_failed_relabeled",
+    )
+    label_write_ok = label_result.outcome is not TransitionOutcome.PARTIAL_FAILURE
     # Record the relabel event.
     with state_mod.state_lock(state_file):
         state = state_mod.load_state(state_file)

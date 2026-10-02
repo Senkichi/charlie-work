@@ -823,7 +823,13 @@ def unescalate(
 
     label_error = None
     if label_edge is not None and issue_number is not None:
-        result = _wf.transition(self.gh, self.config.labels, int(issue_number), label_edge)
+        result = _wf.transition(
+            self.gh,
+            self.config.labels,
+            int(issue_number),
+            label_edge,
+            state_path=self.paths.state_file,
+        )
         if result.outcome != TransitionOutcome.APPLIED:
             label_error = {
                 "edge": label_edge,

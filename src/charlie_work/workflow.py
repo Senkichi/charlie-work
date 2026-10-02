@@ -97,7 +97,12 @@ from .janitor import (
     TestAdequacyVerdict,
 )
 from .diff_coverage_probe import StaticProbeVerdict, run_static_probe
-from .labels import TransitionOutcome, transition
+from .labels import (
+    TransitionOutcome,
+    apply_issue_labels,
+    ready_episode_open,
+    transition,
+)
 from .paths import RuntimePaths, prompt_override_dirs, resolved_layout
 from .prompt_sections import section_variant_names
 from .prompts import (
@@ -2301,7 +2306,15 @@ class OrchestratorApp:
                 prose_only_deps_issues.append(issue_number)
                 if not self.dry_run:
                     try:
-                        self.gh.add_issue_label(issue_number, self.config.labels.prose_only_deps)
+                        # write-gate-exempt(issue=2226): already gated by `if not self.dry_run`; the seam records any lifecycle state the labels resolve to.
+                        apply_issue_labels(
+                            self.gh,
+                            self.config.labels,
+                            issue_number,
+                            add=(self.config.labels.prose_only_deps,),
+                            state_path=self.paths.state_file,
+                            cause="intake_prose_only_deps",
+                        )
                     except Exception:
                         # Label add failure is non-blocking for intake
                         pass
@@ -2335,8 +2348,21 @@ class OrchestratorApp:
                     issue_number = entry["issue"]
                     # Merge-update, never replace: intake used to clobber dispatch
                     # status recorded by earlier passes (production-confirmed).
+                    existing = state["issues"].get(str(issue_number), {})
+                    # Issue #2226: ``ready_observed`` fires once per issue per
+                    # Ready episode. The episode boundary lives in events.db,
+                    # not the label cache — intake only ever fetches
+                    # ready-labelled issues, so ``existing["labels"]`` cannot
+                    # record the label's absence. ``ready_episode_open`` reads
+                    # the issue's event chain: open while the last recorded
+                    # state keeps ``ready`` attached, closed by ``done`` /
+                    # ``closed`` (the states whose edges strip it), so a
+                    # re-armed issue emits again.
+                    ready_is_new_episode = self.config.labels.ready in entry[
+                        "labels"
+                    ] and not ready_episode_open(self.paths.state_file, issue_number)
                     state["issues"][str(issue_number)] = {
-                        **state["issues"].get(str(issue_number), {}),
+                        **existing,
                         "number": issue_number,
                         "title": entry["title"],
                         "url": entry["url"],
@@ -2344,6 +2370,12 @@ class OrchestratorApp:
                         "prompt_path": entry["prompt_path"],
                         "updated_at": entry["updated_at"],
                     }
+                    if ready_is_new_episode:
+                        state = self._record_event(
+                            state,
+                            "ready_observed",
+                            {"issue_number": issue_number},
+                        )
                 for failure in failed:
                     state = self._record_event(
                         state,
@@ -3200,7 +3232,14 @@ class OrchestratorApp:
                 )
 
             if issue_number is not None and verdict.is_check_failure_block:
-                transition(self.gh, self.config.labels, issue_number, "review_started")
+                transition(
+                    self.gh,
+                    self.config.labels,
+                    issue_number,
+                    "review_started",
+                    state_path=self.paths.state_file,
+                    pr_number=pr_number,
+                )
                 summary = f"CI failed on {', '.join(verdict.failed_required_checks)}; push a fix"
                 # Issue #771: name the failure, not just the check. Populated
                 # from the failing check run(s)' GitHub annotations when
@@ -3381,7 +3420,14 @@ class OrchestratorApp:
                 and not verdict.infra_definitive_failed
             )
             if issue_number is not None and is_co_occurring_check_failure_block:
-                transition(self.gh, self.config.labels, issue_number, "review_started")
+                transition(
+                    self.gh,
+                    self.config.labels,
+                    issue_number,
+                    "review_started",
+                    state_path=self.paths.state_file,
+                    pr_number=pr_number,
+                )
                 # verdict.failures always ends with the "Required check(s)
                 # failed: ..." message when failed_required_checks is
                 # truthy (janitor.run_janitor appends it last, nothing after
@@ -3583,7 +3629,14 @@ class OrchestratorApp:
                 # {in_progress} -> review_started -> {in_progress,pr_open,reviewing}
                 #               -> rework_requested (inside record_review) -> {in_progress,pr_open,needs_rework}
                 if issue_number is not None:
-                    transition(self.gh, self.config.labels, issue_number, "review_started")
+                    transition(
+                        self.gh,
+                        self.config.labels,
+                        issue_number,
+                        "review_started",
+                        state_path=self.paths.state_file,
+                        pr_number=pr_number,
+                    )
                 summary = render_test_adequacy_summary(
                     test_adequacy_verdict, self.config.test_adequacy.exempt_marker
                 )
@@ -4114,7 +4167,14 @@ class OrchestratorApp:
                     should_skip_transition = True
 
             if not should_skip_transition and not dispatch_disabled:
-                result = transition(self.gh, self.config.labels, issue_number, "review_started")
+                result = transition(
+                    self.gh,
+                    self.config.labels,
+                    issue_number,
+                    "review_started",
+                    state_path=self.paths.state_file,
+                    pr_number=pr_number,
+                )
                 if result.outcome != TransitionOutcome.APPLIED:
                     label_error = {
                         "edge": "review_started",

@@ -214,7 +214,13 @@ def _process_rescue_review(self, candidate: dict[str, Any]) -> _wf.CommandResult
         _wf.save_state(self.paths.state_file, state)
     if issue_number is not None:
         rescue_edge = _wf._escalation_edge("escalated", rescue_reason_class)
-        result = _wf.transition(self.gh, self.config.labels, int(issue_number), rescue_edge)
+        result = _wf.transition(
+            self.gh,
+            self.config.labels,
+            int(issue_number),
+            rescue_edge,
+            state_path=self.paths.state_file,
+        )
         if result.outcome != TransitionOutcome.APPLIED:
             label_error = {
                 "edge": rescue_edge,

@@ -214,7 +214,7 @@ def strip_and_flag(ctx: SweepContext, req: StripAndFlag) -> LabelWrite:
     issue_labels = label_names(_issue(ctx, req.issue))
     active = issue_labels & ctx.config.labels.active
     ok = escalation._strip_active_and_flag_human_needed(
-        ctx.gh, ctx.config, req.issue, active, issue_labels
+        ctx.gh, ctx.config, req.issue, active, issue_labels, state_path=ctx.state_file
     )
     ctx.escalations[req.kind][req.issue] = {"label_write_ok": ok}
     return LabelWrite(ok=bool(ok), removed_labels=tuple(sorted(active)))
