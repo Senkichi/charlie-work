@@ -388,7 +388,12 @@ def test_without_a_review_callback_head_change_is_recorded_as_drift() -> None:
 def test_same_head_nonzero_exit_resets_to_rework_and_credits_the_death() -> None:
     answers = _pr_answers(reviewed="live1", exit_code=1)
     pre, lock, post = drive_all_phases(make_facts(state_with({7: dispatched()})), answers)
-    assert CreditDeadWorker(7) in lock.requests
+    # Issue #2282: the request carries the dead epoch's dispatch stamp and PR so
+    # a provider-throttle death can refund its own dispatch.
+    assert (
+        CreditDeadWorker(7, dispatched_at=dispatched()["dispatched_at"], pr_number=70)
+        in lock.requests
+    )
     statuses = [u.set_fields.get("status") for u in lock.commits_of(UpdateIssue)]
     assert "rework_requested" in statuses
     assert "orphaned_worker_recovered" in lock.emitted()
