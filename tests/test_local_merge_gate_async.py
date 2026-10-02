@@ -545,16 +545,21 @@ def test_malformed_result_file_is_never_green(lane_repo: Path) -> None:
     _init_repo(lane_repo)
     issues_dir = lane_repo / "docs" / "issues"
     head = _make_branch(lane_repo, "agent/issue-7-x", "a.py", "a = 1\n")
-    app = _lane_app(lane_repo, issues_dir)
+    # SLEEP_SUITE keeps the relaunched wrapper alive until the ``finally``
+    # releases it -- liveness is deterministic, not a race against a suite
+    # that exits before the assertion runs (#2252 flake).
+    config = _lane_config(lane_repo, issues_dir, dispatch={"test_command": SLEEP_SUITE})
+    app = _lane_app(lane_repo, issues_dir, config=config)
     _adopt_and_approve(app, issues_dir, 7, "agent/issue-7-x", head)
     paths = _gate_paths(app, 7)
     paths.gate_dir.mkdir(parents=True, exist_ok=True)
     paths.result.write_text("{not json", encoding="utf-8")
+    stale_pid = _dead_pid()
     with state_lock(app.paths.state_file):
         state = load_state(app.paths.state_file)
         state["prs"]["7"].update(
             {
-                "local_suite_pid": _dead_pid(),
+                "local_suite_pid": stale_pid,
                 "local_suite_process_start_time": None,
                 "local_suite_started_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
                 "local_suite_log": str(paths.log),
@@ -570,10 +575,19 @@ def test_malformed_result_file_is_never_green(lane_repo: Path) -> None:
     try:
         assert results[0]["outcome"] == "suite_launched"
         state = load_state_locked(app.paths.state_file)
-        assert state["prs"]["7"]["status"] == "approved"
+        record = state["prs"]["7"]
+        assert record["status"] == "approved"
+        assert record["local_suite_orphan_count"] == 1
         assert not is_ancestor(lane_repo, head, branch_head_sha(lane_repo, "main"))
-        # The stale file was cleared by the relaunch; a real pid now claims.
-        assert is_pid_alive(int(state["prs"]["7"]["local_suite_pid"]))
+        # A new claim replaced the stale one: a different pid with a fresh
+        # start-time fingerprint, and the malformed file is gone (the launch
+        # scrubs stale artifacts before the spawn; the sleeper cannot write
+        # a new result for another 600s).
+        new_pid = int(record["local_suite_pid"])
+        assert new_pid != stale_pid
+        assert record["local_suite_process_start_time"]
+        assert not paths.result.exists()
+        assert is_pid_alive(new_pid)
     finally:
         _kill_claimed_gate(app, 7)
 
