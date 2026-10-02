@@ -480,7 +480,7 @@ def test_sweep_leaves_live_pid_dispatched_issue_untouched(tmp_path: Path) -> Non
     assert load_state(paths.state_file).get("events", []) == []
 
 
-def test_sweep_dry_run_gates_state_events_and_label_writes(
+def test_sweep_dry_run_gates_state_and_events_not_the_injected_github_client(
     tmp_path: Path,
 ) -> None:
     config, paths, gh = no_pr_bed(tmp_path, 1176, dispatched_at="2026-07-14T17:24:55Z")
@@ -492,8 +492,12 @@ def test_sweep_dry_run_gates_state_events_and_label_writes(
     assert load_state(paths.state_file).get("events", []) == []
     # Issue #2226: sweep label writes now route through the WriteGate, which
     # owns dry-run suppression uniformly — a dry-run sweep writes no labels
-    # to the injected client. In production ``gh.dry_run`` suppressed the
-    # same writes at the transport layer, so this is an earlier no-op of the
-    # same effective behavior.
+    # to the injected client ("not the injected github client": the gate,
+    # not ``gh.dry_run``, is what suppresses them). In production
+    # ``gh.dry_run`` suppressed the same writes at the transport layer, so
+    # this is an earlier no-op of the same effective behavior.
+    # The leaf name is load-bearing: the collect-only gate (issue #1538)
+    # fails a rename outright — a removed leaf must reappear verbatim in a
+    # sibling module, and only an operator exemption waives it.
     assert gh.labels_added == []
     assert gh.labels_removed == []
