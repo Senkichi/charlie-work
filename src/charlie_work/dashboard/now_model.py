@@ -141,7 +141,7 @@ def _capacity(
     threshold: float,
 ) -> CapacityModel:
     workers = tuple(
-        RepoWorkers(r.key, len(dict_list(snapshot_data(r), "workers")), r.worker_cap or None)
+        RepoWorkers(r.key, len(dict_list(snapshot_data(r), "workers")), r.worker_cap)
         for r in sources.repos
         if r.snapshot.data is not None
     )

@@ -9,7 +9,7 @@ repos.
 from __future__ import annotations
 
 from ..now_types import CapacityModel, NowModel, RepoFreshness, RepoWorkers, RunnerRepo
-from .now_fmt import age, esc, fmt_float, link, repo_url, short_repo
+from .now_fmt import age, cap_text, esc, fmt_float, link, repo_url, short_repo
 
 _TRACK = 240.0
 _STAGE_ABBR = (
@@ -55,13 +55,13 @@ def _over(live: int, cap: int | None) -> str:
 def _cap_row(name: str, href: str, live: int | None, cap: int | None, small: str) -> str:
     if live is None:
         bar = '<span class="unknown">not measured</span>'
-        val = '<span class="unk">—</span> live'
+        val = '<span class="unk">—</span> running'
     else:
         bar = _bullet(live, cap)
         if not cap:
             bar += '<span class="unknown">cap not reported</span>'
         cap_txt = link(href + "#cap", cap) if cap else "cap ?"
-        val = f"{link(href, live)} live / {cap_txt}{_over(live, cap)}"
+        val = f"{link(href, live)} running / {cap_txt}{_over(live, cap)}"
     return (
         f'<div class="cap-row"><span class="who">{esc(name)}<small>{small}</small></span>'
         f'<span class="bar">{bar}</span><span class="val">{val}</span></div>'
@@ -107,7 +107,7 @@ def render_capacity(model: NowModel) -> str:
         old = esc(age(cap.runners_age_seconds))
         meta = f'<span class="text-warn">runners {old} old, stale</span>'
     else:
-        meta = f"runners {esc(age(cap.runners_age_seconds))} ago"
+        meta = f"workers & reviewers as of each repo's last pass · runners {esc(age(cap.runners_age_seconds))} ago"
     if cap.capped_demand_now:
         who = ", ".join(short_repo(r) for r in cap.capped_repos) or "fleet budget"
         meta += f' · <span class="text-warn">capped demand now: {esc(who)}</span>'
@@ -219,7 +219,7 @@ def render_repo_ledger(model: NowModel) -> str:
         )
         w = _match(repo.repo, model.capacity.workers_by_repo)
         workers = (
-            f"{link(repo_url(repo.repo, view='workers'), w.live)}/{w.cap if w.cap else '?'}"
+            f"{link(repo_url(repo.repo, view='workers'), w.live)}/{cap_text(w.cap, compact=True)}"
             if isinstance(w, RepoWorkers)
             else '<span class="muted">—</span>'
         )
@@ -244,7 +244,7 @@ def render_repo_ledger(model: NowModel) -> str:
         '<div class="table-scroll" role="region" aria-label="By-repo table, scrolls sideways" tabindex="0">'
         '<table class="repos"><thead><tr><th class="l">Repo</th><th>Last pass</th>'
         f"{head}"
-        '<th class="num" title="live workers / cap">Work</th>'
+        '<th class="num" title="running workers / per-repo cap (∞ = no cap), as of the last pass">Work</th>'
         '<th title="CI runners online / slots; p parked, d demand">CI</th>'
         '<th class="num" title="Needs-me rows for this repo">You</th></tr></thead>'
         f"<tbody>{''.join(body)}</tbody></table></div></section>"

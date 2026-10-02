@@ -90,6 +90,15 @@ def link(href: str | None, text: object, cls: str = "n", title: str | None = Non
     return f'<a class="{esc(cls)}" href="{esc(href)}"{tip}>{esc(text)}</a>'
 
 
+def cap_text(cap: int | None, *, compact: bool = False) -> str:
+    """A concurrency cap: 0 means no cap (the config convention), None means unknown."""
+    if cap is None:
+        return "?" if compact else "cap ?"
+    if cap == 0:
+        return "∞" if compact else "no cap"
+    return esc(cap)
+
+
 def local_time(moment: datetime) -> str:
     """``HH:MM:SS`` in the server host's local zone inside a re-localisable ``<time>``."""
     return (
