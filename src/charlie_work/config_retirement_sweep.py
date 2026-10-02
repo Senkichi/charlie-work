@@ -393,6 +393,7 @@ def _process_key(
             entry.removal_issue,
             "config_retirement_ready",
             state_path=fleet_state_path,
+            repo="fleet",
         )
         if result.outcome.name == "PARTIAL_FAILURE":
             return summary  # retry next pass rather than recording a false arm

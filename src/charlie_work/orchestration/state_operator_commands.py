@@ -829,6 +829,7 @@ def unescalate(
             int(issue_number),
             label_edge,
             state_path=self.paths.state_file,
+            repo=self.repo_root.name,
         )
         if result.outcome != TransitionOutcome.APPLIED:
             label_error = {

@@ -1,4 +1,8 @@
-6
+3
+# Issue #2226: -3 vs the prior 6 -- the session_unpublished_work_salvaged
+# branch (3 raw log_event calls: salvage_skipped_*,
+# pr_closing_ref_rewritten, pr_closing_ref_unlinked) moved verbatim to
+# reconcile_salvage.py, which now carries its own baseline entry.
 # Issue #1241: +1 raw log_event call in the reconcile salvage lane's new
 # pre-open supersession check (the salvage_skipped_* event emitted when the
 # shared check_salvage_superseded finds the work already landed). This is

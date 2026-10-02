@@ -165,7 +165,7 @@ def test_transition_local_work_ready_adds_review_ready_keeps_ready(tmp_path: Pat
     _write_issue(issues_dir, 1, labels=(labels_cfg.ready, labels_cfg.in_progress))
     gh = LocalFileGitHub(repo_root=tmp_path, issues_dir=issues_dir)
 
-    result = transition(gh, labels_cfg, 1, "local_work_ready")
+    result = transition(gh, labels_cfg, 1, "local_work_ready", state_path=None)
 
     assert result.outcome is TransitionOutcome.APPLIED
     current_labels = {entry["name"] for entry in gh.issue_view(1)["labels"]}

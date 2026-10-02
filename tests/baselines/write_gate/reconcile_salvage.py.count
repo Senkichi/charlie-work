@@ -1,0 +1,6 @@
+3
+# Issue #2226: the session_unpublished_work_salvaged lane moved here verbatim
+# from reconcile.py (file-size ratchet). Its three raw log_event calls
+# (salvage_skipped_*, pr_closing_ref_rewritten, pr_closing_ref_unlinked) are
+# out-of-wave raw territory -- the same disposition they carried inside
+# apply_fixes, where they counted against reconcile.py.count.

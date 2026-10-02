@@ -347,6 +347,7 @@ def _finalize_externally_merged_issues(
             issue_number,
             "merged",
             state_path=self.paths.state_file,
+            repo=self.repo_root.name,
             pr_number=(int(merged_prs[0]["number"]) if merged_prs else None),
             cause="finalize_externally_merged",
         )
@@ -359,6 +360,7 @@ def _finalize_externally_merged_issues(
             issue_number,
             "closed_unmerged",
             state_path=self.paths.state_file,
+            repo=self.repo_root.name,
         )
 
     finalized: set[int] = set(issue_pr_map.keys())

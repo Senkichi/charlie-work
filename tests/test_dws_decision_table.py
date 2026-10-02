@@ -710,3 +710,47 @@ def test_draft_take_rejects_a_deleted_base_key() -> None:
     draft.work.pop("pid")
     with pytest.raises(ValueError, match="pid"):
         draft.take()
+
+
+def test_strip_and_flag_writes_through_gate_with_repo_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #2226: the sweep's strip lane writes through the WriteGate —
+    the ``lifecycle_transition`` row lands in events.db bound to the sweep's
+    repo (``_wg`` binds ``charlie-work``), not repo=NULL."""
+    from _fakes_github import FakeGitHub
+    from _rework_dispatch_fixtures import _wg
+    from charlie_work import state as state_mod
+    from charlie_work.dead_worker_sweep import SweepPorts, apply, ports_from_workflow
+    from charlie_work.dead_worker_sweep.model import SweepPlan
+
+    state_file = tmp_path / "state.json"
+    state_mod.save_state(state_file, state_with({7: dispatched()}))
+    real = ports_from_workflow()
+    ports = SweepPorts(
+        **{
+            **{f.name: getattr(real, f.name) for f in dataclasses.fields(SweepPorts)},
+            "worker_pid_alive": lambda entry: False,
+            "utc_now": lambda: STAMP,
+        }
+    )
+    gh = FakeGitHub()
+    gh.issues = [NO_PR_ISSUE]
+
+    def plans(facts, observed):
+        if facts.phase != "pre":
+            return SweepPlan((), ())
+        for req in (FetchOpenIssues(), StripAndFlag(7, "worker_declared_blocked")):
+            if req not in observed:
+                return SweepPlan((req,), ())
+        return SweepPlan((), ())
+
+    monkeypatch.setattr(apply, "decide", plans)
+    apply.run_orphan_sweep(tmp_path, state_file, CFG, gh, write_gate=_wg(state_file), ports=ports)
+
+    assert (7, CFG.labels.human_needed) in gh.labels_added
+    assert (7, ACTIVE) in gh.labels_removed
+    (event,) = _events(state_file, "lifecycle_transition")
+    assert event["payload"]["to_state"] == "human_needed"
+    assert event["payload"]["cause"] == "escalated"
+    assert event["repo"] == "charlie-work"

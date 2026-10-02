@@ -40,7 +40,7 @@ from .dead_dispatched_timer import (
     defer_or_expire_local_park,
 )
 from .github import GitHubError, GitHubLike, label_names
-from .labels import TransitionOutcome, apply_issue_labels
+from .labels import TransitionOutcome
 from .local_lane import branch_diff_result, local_base_branch, probe_branch_ref
 from .local_noop_rework_rearm import rearm_no_op_local_rework
 from .paths import resolved_layout, runtime_paths
@@ -482,21 +482,19 @@ def park_or_reclaim_local_orphan(
         _reset_probe_deferral(write_gate, state, issue_number)
 
     needs_ready = config.labels.ready not in issue_labels
-    # Issue #2226: route through the canonical seam so the return to
-    # ``ready`` lands in events.db; the conditional add preserves the
-    # no-redundant-write contract.
-    # write-gate-exempt(issue=2226): sweep label writes bypass the WriteGate by contract — the client's own dry-run switch owns suppression.
-    label_result = apply_issue_labels(
+    # Issue #2226: route through the WriteGate's canonical seam so the
+    # return to ``ready`` lands in events.db bound to this repo; the
+    # conditional add preserves the no-redundant-write contract.
+    label_result = write_gate.apply_issue_labels(
         gh,
         config.labels,
         issue_number,
         add=(config.labels.ready,) if needs_ready else (),
         remove=sorted(active_labels),
         to_state="ready",
-        state_path=state_file,
         cause="session_failed_relabeled",
     )
-    label_write_ok = label_result.outcome is not TransitionOutcome.PARTIAL_FAILURE
+    label_write_ok = label_result.ok
     reclaim_results[issue_number] = {
         "removed_labels": sorted(active_labels),
         "added_ready": needs_ready,

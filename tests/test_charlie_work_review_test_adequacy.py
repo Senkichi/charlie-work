@@ -429,7 +429,7 @@ def test_review_test_adequacy_pr_commits_none_falls_back_to_body(
         captured["verdict_provenance"] = kwargs.get("verdict_provenance")
         return CommandResult(True, "record_review called", {})
 
-    def _fake_transition(gh, labels, issue_number, edge):
+    def _fake_transition(gh, labels, issue_number, edge, **_kwargs):
         from charlie_work.labels import TransitionResult, TransitionOutcome
 
         return TransitionResult(

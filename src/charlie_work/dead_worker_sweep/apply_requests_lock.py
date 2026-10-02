@@ -20,7 +20,6 @@ from .. import (
     rework_outcome,
     worker_fate,
 )
-from ..labels import TransitionOutcome, apply_issue_labels
 from ..process_utils import find_worker_terminal_status
 from ..worktree import worktree_path_for_branch
 from . import apply_requests_pre as pre_handlers
@@ -95,21 +94,19 @@ def advance_to_pr_open(ctx: SweepContext, req: AdvanceToPrOpen) -> bool:
     """#1128: strip the active labels and add ``pr-open`` for an unverdicted PR."""
     number = req.issue
     labels = label_names((ctx.issues or {}).get(number) or {})
-    # Issue #2226: route through the canonical seam so the PR-open
-    # transition lands in events.db; the conditional add preserves the
-    # no-redundant-write contract.
-    # write-gate-exempt(issue=2226): sweep label writes bypass the WriteGate by contract — the client's own dry-run switch owns suppression.
-    result = apply_issue_labels(
+    # Issue #2226: route through the WriteGate's canonical seam so the
+    # PR-open transition lands in events.db bound to this repo; the
+    # conditional add preserves the no-redundant-write contract.
+    result = ctx.write_gate.apply_issue_labels(
         ctx.gh,
         ctx.config.labels,
         number,
         add=(ctx.config.labels.pr_open,) if ctx.config.labels.pr_open not in labels else (),
         remove=sorted(labels & ctx.config.labels.active),
         to_state="pr_open",
-        state_path=ctx.state_file,
         cause="advance_to_pr_open",
     )
-    return result.outcome is not TransitionOutcome.PARTIAL_FAILURE
+    return result.ok
 
 
 def credit_dead_worker(ctx: SweepContext, req: CreditDeadWorker) -> CreditResult:

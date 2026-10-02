@@ -45,6 +45,11 @@ class TransitionResult:
     add_failures: list[tuple[int, str]]  # (issue_number, label) pairs that failed to add
     remove_failures: list[tuple[int, str]]  # (issue_number, label) pairs that failed to remove
 
+    @property
+    def ok(self) -> bool:
+        """True unless at least one individual label write failed."""
+        return self.outcome is not TransitionOutcome.PARTIAL_FAILURE
+
 
 def _edges(labels: LabelConfig) -> dict[str, tuple[tuple[str, ...], tuple[str, ...]]]:
     # Helper to compute removal set: all workflow labels except the ones being added
@@ -313,7 +318,7 @@ def apply_issue_labels(
     add: Iterable[str] = (),
     remove: Iterable[str] = (),
     to_state: str | None = None,
-    state_path: Path | None = None,
+    state_path: Path | None,
     repo: str | None = None,
     pr_number: int | None = None,
     cause: str | None = None,
@@ -326,6 +331,12 @@ def apply_issue_labels(
     from the add-set via ``LabelConfig``) and ``state_path`` is supplied, a
     ``lifecycle_transition`` event is recorded unless the issue's recorded
     state already equals it.
+
+    ``state_path`` is a required keyword so a production caller can never
+    omit it by accident: pass ``None`` explicitly to opt out of the event
+    (e.g. a dry-run salvage probe that writes no PR), or a real path so the
+    lifecycle record stays complete. ``WriteGate.apply_issue_labels`` binds
+    it automatically.
     """
     add = tuple(add)
     remove = tuple(remove)
@@ -391,7 +402,7 @@ def transition(
     issue_number: int,
     event: str,
     *,
-    state_path: Path | None = None,
+    state_path: Path | None,
     repo: str | None = None,
     pr_number: int | None = None,
     cause: str | None = None,
@@ -399,10 +410,10 @@ def transition(
     """Apply the named lifecycle edge and record the transition (issue #2226).
 
     ``state_path`` locates the events.db the ``lifecycle_transition`` event
-    is written to; ``WriteGate.transition`` binds it automatically. Callers
-    that cannot supply it still get the label writes — only the event is
-    skipped — but every production path is expected to pass it so the
-    lifecycle record stays complete.
+    is written to and is a required keyword so no caller can omit it by
+    accident — pass ``None`` explicitly to opt out of the event while still
+    applying the label writes. ``WriteGate.transition`` binds it
+    automatically.
     """
     add, remove = _edges(labels)[event]
     return apply_issue_labels(

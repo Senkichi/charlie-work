@@ -342,7 +342,7 @@ def _parked_lane_issue(
     """The state ``park_unpublishable_work`` leaves: review-ready edge + entry."""
     labels = app.config.labels
     _write_issue(issues_dir, issue_number, state="open", labels=(labels.ready, labels.in_progress))
-    transition(app.gh, labels, issue_number, "local_work_ready")
+    transition(app.gh, labels, issue_number, "local_work_ready", state_path=app.paths.state_file)
     with state_lock(app.paths.state_file):
         state = load_state(app.paths.state_file)
         state.setdefault("issues", {})[str(issue_number)] = {

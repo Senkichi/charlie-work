@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import asdict
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Iterable
 
 from charlie_work.adapters import (
     SessionDispatchResult,
@@ -800,14 +800,7 @@ def _dispatch_rework_impl(
                     state_path=self.paths.state_file,
                 )
             _wf.save_state(self.paths.state_file, state)
-        for issue_number in no_op_rework_escalated:
-            _wf.transition(
-                self.gh,
-                self.config.labels,
-                issue_number,
-                _wf._escalation_edge("redispatch_escalated", "mechanical"),
-                state_path=self.paths.state_file,
-            )
+        self._apply_redispatch_escalated_edges(no_op_rework_escalated)
 
     # Issue #1134: escalate worker-death loops separately from no-op
     # rework loops.  A death loop means the worker keeps dying before
@@ -879,14 +872,7 @@ def _dispatch_rework_impl(
                     state_path=self.paths.state_file,
                 )
             _wf.save_state(self.paths.state_file, state)
-        for issue_number in worker_death_escalated:
-            _wf.transition(
-                self.gh,
-                self.config.labels,
-                issue_number,
-                _wf._escalation_edge("redispatch_escalated", "mechanical"),
-                state_path=self.paths.state_file,
-            )
+        self._apply_redispatch_escalated_edges(worker_death_escalated)
 
     # Issue #1393: escalate issues whose pre-launch environment has
     # blocked every dispatch attempt (e.g. a stale foreign worktree).
@@ -929,14 +915,7 @@ def _dispatch_rework_impl(
                     state_path=self.paths.state_file,
                 )
             _wf.save_state(self.paths.state_file, state)
-        for issue_number in blocked_environment_escalated:
-            _wf.transition(
-                self.gh,
-                self.config.labels,
-                issue_number,
-                _wf._escalation_edge("redispatch_escalated", "mechanical"),
-                state_path=self.paths.state_file,
-            )
+        self._apply_redispatch_escalated_edges(blocked_environment_escalated)
 
     # Issue #1014 (mirroring #1005 in the fresh-dispatch path): compute
     # deferred_by_concurrency uniformly across both the only_issues and
@@ -1456,6 +1435,7 @@ def _dispatch_rework_impl(
                         request.issue_number,
                         edge,
                         state_path=self.paths.state_file,
+                        repo=self.repo_root.name,
                     )
                     if result.outcome != TransitionOutcome.APPLIED:
                         label_error = {
@@ -1481,6 +1461,7 @@ def _dispatch_rework_impl(
                         request.issue_number,
                         "rework_dispatched",
                         state_path=self.paths.state_file,
+                        repo=self.repo_root.name,
                         pr_number=(
                             int(pr_by_issue[request.issue_number]["number"])
                             if request.issue_number in pr_by_issue
@@ -1604,6 +1585,7 @@ def _dispatch_rework_impl(
                             request.issue_number,
                             edge,
                             state_path=self.paths.state_file,
+                            repo=self.repo_root.name,
                         )
                         if result.outcome != TransitionOutcome.APPLIED:
                             label_error = {
@@ -1637,6 +1619,7 @@ def _dispatch_rework_impl(
                             "blocked_environment_count": len(blocked_environment_at),
                         },
                         state_path=self.paths.state_file,
+                        repo=self.repo_root.name,
                     )
                     _wf.save_state(self.paths.state_file, state)
                     continue
@@ -1680,6 +1663,7 @@ def _dispatch_rework_impl(
                         request.issue_number,
                         edge,
                         state_path=self.paths.state_file,
+                        repo=self.repo_root.name,
                     )
                     if result.outcome != TransitionOutcome.APPLIED:
                         label_error = {
@@ -1798,3 +1782,19 @@ def _dispatch_rework_impl(
         message,
         data,
     )
+
+
+def _apply_redispatch_escalated_edges(self, issue_numbers: Iterable[int]) -> None:
+    """Apply the ``redispatch_escalated`` (mechanical) label edge to each issue.
+
+    Issue #2226: shared by the no-op-rework, worker-death, and blocked-environment
+    cap lanes of ``_dispatch_rework_impl`` — routes through the WriteGate, which
+    binds ``state_path`` and ``repo``.
+    """
+    for issue_number in issue_numbers:
+        self.write_gate.transition(
+            self.gh,
+            self.config.labels,
+            issue_number,
+            _wf._escalation_edge("redispatch_escalated", "mechanical"),
+        )

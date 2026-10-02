@@ -24,7 +24,7 @@ from ..github import (
     PR_CLOSING_ISSUES_FIELDS,
 )
 from ..instrumentation import log_event
-from ..labels import TransitionOutcome, apply_issue_labels
+from ..labels import apply_issue_labels
 from ..local_work_park import park_unpublishable_work
 from ..pr_create_retry import create_pr_with_retry
 from ..state import (
@@ -267,10 +267,11 @@ def _open_salvage_pr(
         remove=sorted(active_labels),
         to_state="pr_open",
         state_path=state_file if pr_number else None,
+        repo=repo_root.name,
         pr_number=pr_number or None,
         cause="pr_salvage",
     )
-    if label_result.outcome is TransitionOutcome.PARTIAL_FAILURE:
+    if not label_result.ok:
         return pr_number, "PR created but label write failed", closing_ref
 
     return pr_number, None, closing_ref

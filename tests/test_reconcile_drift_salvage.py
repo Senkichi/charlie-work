@@ -347,17 +347,17 @@ def test_apply_fixes_salvage_push_failure_fallback(tmp_path: Path) -> None:
     ]
 
     # Force push to fail
-    import charlie_work.reconcile
+    import charlie_work.reconcile_salvage
 
-    original_push_branch = charlie_work.reconcile.push_branch
-    charlie_work.reconcile.push_branch = lambda repo, br, worktree_path=None: (
+    original_push_branch = charlie_work.reconcile_salvage.push_branch
+    charlie_work.reconcile_salvage.push_branch = lambda repo, br, worktree_path=None: (
         False,
         "simulated push failure",
     )
     try:
         new_state = apply_fixes(gh, empty_state(), drift, config)
     finally:
-        charlie_work.reconcile.push_branch = original_push_branch
+        charlie_work.reconcile_salvage.push_branch = original_push_branch
 
     # No PR created, active label removed, ready label added
     assert not gh.prs_created
@@ -423,9 +423,10 @@ def test_reconcile_dry_run_never_reaches_salvage_push_branch(
             push_calls.append(args)
             return True, None
 
-        # The leaf itself: reconcile.py's salvage lane calls the module-level
+        # The leaf itself: the salvage lane (reconcile_salvage.py, extracted
+        # from reconcile.py under #2226) calls the module-level
         # ``push_branch`` name with no dry_run threading.
-        monkeypatch.setattr("charlie_work.reconcile.push_branch", _spy_push_branch)
+        monkeypatch.setattr("charlie_work.reconcile_salvage.push_branch", _spy_push_branch)
 
         paths = runtime_paths(repo_root, config.runtime.state_dir)
         app = OrchestratorApp(repo_root, paths, config, gh, dry_run=True)

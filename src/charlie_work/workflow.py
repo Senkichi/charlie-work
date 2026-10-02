@@ -97,12 +97,7 @@ from .janitor import (
     TestAdequacyVerdict,
 )
 from .diff_coverage_probe import StaticProbeVerdict, run_static_probe
-from .labels import (
-    TransitionOutcome,
-    apply_issue_labels,
-    ready_episode_open,
-    transition,
-)
+from .labels import TransitionOutcome, ready_episode_open, transition
 from .paths import RuntimePaths, prompt_override_dirs, resolved_layout
 from .prompt_sections import section_variant_names
 from .prompts import (
@@ -2306,20 +2301,18 @@ class OrchestratorApp:
             # If prose-only dependencies exist without structured blockers, label for human attention
             if has_prose_deps and not has_structured_blockers:
                 prose_only_deps_issues.append(issue_number)
-                if not self.dry_run:
-                    try:
-                        # write-gate-exempt(issue=2226): already gated by `if not self.dry_run`; the seam records any lifecycle state the labels resolve to.
-                        apply_issue_labels(
-                            self.gh,
-                            self.config.labels,
-                            issue_number,
-                            add=(self.config.labels.prose_only_deps,),
-                            state_path=self.paths.state_file,
-                            cause="intake_prose_only_deps",
-                        )
-                    except Exception:
-                        # Label add failure is non-blocking for intake
-                        pass
+                try:
+                    # Issue #2226: gate-bound — state_path/repo auto-bound; dry-run no-ops.
+                    self.write_gate.apply_issue_labels(
+                        self.gh,
+                        self.config.labels,
+                        issue_number,
+                        add=(self.config.labels.prose_only_deps,),
+                        cause="intake_prose_only_deps",
+                    )
+                except Exception:
+                    # Label add failure is non-blocking for intake
+                    pass
 
             written.append(
                 {
@@ -2353,13 +2346,11 @@ class OrchestratorApp:
                     existing = state["issues"].get(str(issue_number), {})
                     # Issue #2226: ``ready_observed`` fires once per issue per
                     # Ready episode. The episode boundary lives in events.db,
-                    # not the label cache — intake only ever fetches
-                    # ready-labelled issues, so ``existing["labels"]`` cannot
-                    # record the label's absence. ``ready_episode_open`` reads
-                    # the issue's event chain: open while the last recorded
-                    # state keeps ``ready`` attached, closed by ``done`` /
-                    # ``closed`` (the states whose edges strip it), so a
-                    # re-armed issue emits again.
+                    # not the label cache — intake only fetches ready-labelled
+                    # issues, so ``existing["labels"]`` cannot record absence.
+                    # ``ready_episode_open`` reads the event chain: open while
+                    # the last recorded state keeps ``ready``, closed by
+                    # ``done``/``closed``, so a re-armed issue emits again.
                     ready_is_new_episode = self.config.labels.ready in entry[
                         "labels"
                     ] and not ready_episode_open(self.paths.state_file, issue_number)
@@ -2406,7 +2397,8 @@ class OrchestratorApp:
                         "blocker_cycles_truncated": blocker_cycle_scan.truncated,
                     },
                 )
-                save_state(self.paths.state_file, state)
+                # Issue #2226: gate-bound; a raw save_state here trips the exclusive-use check.
+                self.write_gate.save_state(state)
         message = "intake complete"
         if self.dry_run:
             message = f"dry-run: would intake {len(written)} issue(s)"
@@ -3240,6 +3232,7 @@ class OrchestratorApp:
                     issue_number,
                     "review_started",
                     state_path=self.paths.state_file,
+                    repo=self.repo_root.name,
                     pr_number=pr_number,
                 )
                 summary = f"CI failed on {', '.join(verdict.failed_required_checks)}; push a fix"
@@ -3428,6 +3421,7 @@ class OrchestratorApp:
                     issue_number,
                     "review_started",
                     state_path=self.paths.state_file,
+                    repo=self.repo_root.name,
                     pr_number=pr_number,
                 )
                 # verdict.failures always ends with the "Required check(s)
@@ -3645,6 +3639,7 @@ class OrchestratorApp:
                         issue_number,
                         "review_started",
                         state_path=self.paths.state_file,
+                        repo=self.repo_root.name,
                         pr_number=pr_number,
                     )
                 summary = render_test_adequacy_summary(
@@ -4183,6 +4178,7 @@ class OrchestratorApp:
                     issue_number,
                     "review_started",
                     state_path=self.paths.state_file,
+                    repo=self.repo_root.name,
                     pr_number=pr_number,
                 )
                 if result.outcome != TransitionOutcome.APPLIED:

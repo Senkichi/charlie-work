@@ -160,7 +160,7 @@ def _parked_issue(
     """Simulate ``park_unpublishable_work``: local_work_ready edge + state."""
     labels = app.config.labels
     _write_issue(issues_dir, issue_number, labels=(labels.ready, labels.in_progress))
-    transition(app.gh, labels, issue_number, "local_work_ready")
+    transition(app.gh, labels, issue_number, "local_work_ready", state_path=app.paths.state_file)
     _seed_issue_state(app, issue_number, branch=branch)
 
 

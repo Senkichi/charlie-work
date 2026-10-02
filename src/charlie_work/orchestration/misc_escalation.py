@@ -165,6 +165,7 @@ def _repair_escalated_labels(self) -> dict[str, Any]:
                 int(issue_number),
                 edge,
                 state_path=self.paths.state_file,
+                repo=self.repo_root.name,
             )
         except Exception:
             logging.getLogger(__name__).warning(

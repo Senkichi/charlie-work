@@ -588,6 +588,7 @@ def _dispatch_impl(
             issue_number,
             "merged",
             state_path=self.paths.state_file,
+            repo=self.repo_root.name,
             pr_number=int(pr_by_issue[issue_number]["number"])
             if issue_number in pr_by_issue
             else None,
@@ -660,7 +661,7 @@ def _dispatch_impl(
     # NOTHING_CHANGED is unreachable for this event today, but it is
     # handled here defensively since a retry would recompute the exact
     # same static edge and produce the same NOTHING_CHANGED outcome again.
-    mention_flag_outcomes: list[tuple[int, TransitionOutcome]] = [
+    mention_flag_results = [
         (
             issue_number,
             _wf.transition(
@@ -669,14 +670,13 @@ def _dispatch_impl(
                 issue_number,
                 "merged_pr_mention_flagged",
                 state_path=self.paths.state_file,
-            ).outcome,
+                repo=self.repo_root.name,
+            ),
         )
         for issue_number in newly_flagged_mention_issues
     ]
     stamped_mention_issues = [
-        issue_number
-        for issue_number, outcome in mention_flag_outcomes
-        if outcome != TransitionOutcome.PARTIAL_FAILURE
+        issue_number for issue_number, result in mention_flag_results if result.ok
     ]
 
     # Issue #429/#433: closed-unmerged stripping is handled by
@@ -1503,6 +1503,7 @@ def _dispatch_impl(
                     request.issue_number,
                     target,
                     state_path=self.paths.state_file,
+                    repo=self.repo_root.name,
                 )
                 if result.outcome != TransitionOutcome.APPLIED:
                     label_error = {
@@ -1550,6 +1551,7 @@ def _dispatch_impl(
                     request.issue_number,
                     edge,
                     state_path=self.paths.state_file,
+                    repo=self.repo_root.name,
                 )
                 if result.outcome != TransitionOutcome.APPLIED:
                     label_error = {
@@ -1625,6 +1627,7 @@ def _dispatch_impl(
                 issue_number,
                 edge,
                 state_path=self.paths.state_file,
+                repo=self.repo_root.name,
             )
             if result.outcome != TransitionOutcome.APPLIED:
                 label_error = {

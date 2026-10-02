@@ -313,6 +313,7 @@ def _escalate_stale_checks_exhaustion(
         issue_number,
         edge,
         state_path=self.paths.state_file,
+        repo=self.repo_root.name,
         pr_number=pr_number,
     )
     label_error = None
@@ -554,6 +555,7 @@ def _check_janitor_rework_stall(
         issue_number,
         edge,
         state_path=self.paths.state_file,
+        repo=self.repo_root.name,
         pr_number=pr_number,
     )
     label_error = None

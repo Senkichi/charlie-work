@@ -949,6 +949,7 @@ def record_review(
                     issue_number,
                     target,
                     state_path=self.paths.state_file,
+                    repo=self.repo_root.name,
                     pr_number=pr_number,
                 )
                 if result.outcome != TransitionOutcome.APPLIED:
@@ -970,6 +971,7 @@ def record_review(
                 issue_number,
                 _wf._escalation_edge("blocked", "judgment"),
                 state_path=self.paths.state_file,
+                repo=self.repo_root.name,
                 pr_number=pr_number,
             )
             if result.outcome != TransitionOutcome.APPLIED:
@@ -986,6 +988,7 @@ def record_review(
                 issue_number,
                 "review_approved",
                 state_path=self.paths.state_file,
+                repo=self.repo_root.name,
                 pr_number=pr_number,
             )
             if result.outcome != TransitionOutcome.APPLIED:

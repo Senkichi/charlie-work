@@ -220,6 +220,7 @@ def _process_rescue_review(self, candidate: dict[str, Any]) -> _wf.CommandResult
             int(issue_number),
             rescue_edge,
             state_path=self.paths.state_file,
+            repo=self.repo_root.name,
         )
         if result.outcome != TransitionOutcome.APPLIED:
             label_error = {

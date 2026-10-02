@@ -256,7 +256,7 @@ def test_transition_without_state_path_still_writes_labels(tmp_path: Path) -> No
     config = OrchestratorConfig()
     gh = FakeGitHub()
 
-    result = transition(gh, config.labels, 123, "dispatched")
+    result = transition(gh, config.labels, 123, "dispatched", state_path=None)
 
     assert result.outcome is TransitionOutcome.APPLIED
     assert (123, config.labels.in_progress) in gh.labels_added
@@ -309,6 +309,206 @@ def test_write_gate_transition_binds_state_path_repo_and_payload(
     assert payload["pr_number"] == 456
     assert payload["cause"] == "salvage"
     assert events[0]["repo"] == "test-repo"
+
+
+# ---------------------------------------------------------------------------
+# WriteGate.apply_issue_labels — repo-bound seam for computed repair sets.
+# ---------------------------------------------------------------------------
+
+
+def test_write_gate_apply_issue_labels_binds_repo_and_payload(
+    tmp_path: Path,
+) -> None:
+    """``gate.apply_issue_labels`` emits ``lifecycle_transition`` into the
+    bound state.db with the gate's ``repo`` on the row, forwarding
+    ``pr_number``/``cause`` verbatim."""
+    config = OrchestratorConfig()
+    sp = _state_path(tmp_path, config)
+    gh = FakeGitHub()
+    gate = WriteGate(dry_run=False, state_path=sp, repo="test-repo")
+    labels = config.labels
+
+    result = gate.apply_issue_labels(
+        gh,
+        labels,
+        123,
+        add=(labels.pr_open,),
+        remove=(labels.in_progress,),
+        pr_number=456,
+        cause="pr_salvage",
+    )
+
+    assert result.ok
+    assert (123, labels.pr_open) in gh.labels_added
+    events = query_events(sp, kind="lifecycle_transition", issue_number=123)
+    assert len(events) == 1
+    payload = events[0]["payload"]
+    assert payload["to_state"] == "pr_open"
+    assert payload["pr_number"] == 456
+    assert payload["cause"] == "pr_salvage"
+    assert events[0]["repo"] == "test-repo"
+
+
+def test_write_gate_apply_issue_labels_dry_run_is_noop(tmp_path: Path) -> None:
+    """Dry-run gate: no label writes and no event — the no-op invariant holds
+    for the repair-set seam exactly as it does for ``gate.transition``."""
+    config = OrchestratorConfig()
+    sp = _state_path(tmp_path, config)
+    gh = FakeGitHub()
+    gate = WriteGate(dry_run=True, state_path=sp, repo="test-repo")
+
+    result = gate.apply_issue_labels(
+        gh,
+        config.labels,
+        123,
+        add=(config.labels.pr_open,),
+        remove=(config.labels.in_progress,),
+        cause="pr_salvage",
+    )
+
+    assert result.outcome is TransitionOutcome.NOTHING_CHANGED
+    assert gh.labels_added == []
+    assert gh.labels_removed == []
+    assert query_events(sp, kind="lifecycle_transition") == []
+
+
+# ---------------------------------------------------------------------------
+# repo binding on the non-gate paths — events.db rows must not be repo=NULL.
+# ---------------------------------------------------------------------------
+
+
+def test_reconcile_relabel_reclaim_binds_repo(tmp_path: Path) -> None:
+    """``session_failed_relabeled`` reclaim: ``apply_fixes`` is a non-gate
+    (write-gate-exempt) caller — the emitted row still carries ``repo`` so the
+    dashboard can correlate it to the owning repository."""
+    config = OrchestratorConfig()
+    labels = config.labels
+    sp = _state_path(tmp_path, config)
+    repo_root = tmp_path / "owner-repo"
+    repo_root.mkdir()
+    gh = ReconcileFakeGitHub(prs=[], issues=[])
+    drift = [
+        DriftItem(
+            kind="session_failed_relabeled",
+            issue_number=10,
+            pr_number=None,
+            detail="dead worker with no open PR",
+            fix_actions=("relabel",),
+            remove_labels=(labels.in_progress,),
+            add_labels=(labels.ready,),
+        )
+    ]
+
+    apply_fixes(gh, empty_state(), drift, config, repo_root=repo_root, state_path=sp)
+
+    events = query_events(sp, kind="lifecycle_transition", issue_number=10)
+    assert len(events) == 1
+    payload = events[0]["payload"]
+    assert payload["to_state"] == "ready"
+    assert payload["cause"] == "session_failed_relabeled"
+    assert events[0]["repo"] == "owner-repo"
+
+
+def test_salvage_pr_open_binds_repo_and_pr_number(tmp_path: Path) -> None:
+    """``_open_salvage_pr`` (the sweep's salvage lane) is non-gate exempt —
+    the ``pr_salvage`` event still records the repo name and the created
+    PR number."""
+    from _salvage_fixtures import _SalvageTestGitHub, _salvage_labels
+
+    from charlie_work.workflow import _open_salvage_pr
+
+    config = OrchestratorConfig()
+    sp = _state_path(tmp_path, config)
+    repo_root = tmp_path / "salvage-repo"
+    repo_root.mkdir()
+    active_labels, issue_labels = _salvage_labels(config)
+    gh = _SalvageTestGitHub(repo_root=repo_root, pr_create_return=101)
+
+    pr_number, error, _closing_ref = _open_salvage_pr(
+        gh=gh,
+        config=config,
+        repo_root=repo_root,
+        branch="agent/issue-42",
+        base_ref="main",
+        issue_number=42,
+        active_labels=active_labels,
+        issue_labels=issue_labels,
+        state_file=sp,
+    )
+
+    assert (pr_number, error) == (101, None)
+    events = query_events(sp, kind="lifecycle_transition", issue_number=42)
+    assert len(events) == 1
+    payload = events[0]["payload"]
+    assert payload["to_state"] == "pr_open"
+    assert payload["pr_number"] == 101
+    assert payload["cause"] == "pr_salvage"
+    assert events[0]["repo"] == "salvage-repo"
+
+
+def test_salvage_pr_open_falsy_pr_number_sentinel_emits_nothing(
+    tmp_path: Path,
+) -> None:
+    """Dry-run sentinel: ``gh.pr_create`` returns a falsy PR number (0) under
+    dry-run — ``state_path`` degrades to ``None`` so no lifecycle event claims
+    a transition for a PR that was never opened."""
+    from _salvage_fixtures import _SalvageTestGitHub, _salvage_labels
+
+    from charlie_work.workflow import _open_salvage_pr
+
+    config = OrchestratorConfig()
+    sp = _state_path(tmp_path, config)
+    repo_root = tmp_path / "salvage-repo"
+    repo_root.mkdir()
+    active_labels, issue_labels = _salvage_labels(config)
+    gh = _SalvageTestGitHub(repo_root=repo_root, pr_create_return=0)
+
+    pr_number, error, _closing_ref = _open_salvage_pr(
+        gh=gh,
+        config=config,
+        repo_root=repo_root,
+        branch="agent/issue-42",
+        base_ref="main",
+        issue_number=42,
+        active_labels=active_labels,
+        issue_labels=issue_labels,
+        state_file=sp,
+    )
+
+    assert (pr_number, error) == (0, None)
+    assert query_events(sp, kind="lifecycle_transition") == []
+
+
+def test_sweep_strip_lane_emits_human_needed_with_repo(tmp_path: Path) -> None:
+    """The orphan sweep's strip-and-flag lane writes through the WriteGate:
+    active labels removed, ``human_needed`` applied, and the event row bound
+    to the sweep's repo."""
+    from charlie_work.escalation import _strip_active_and_flag_human_needed
+
+    config = OrchestratorConfig()
+    labels = config.labels
+    sp = _state_path(tmp_path, config)
+    gh = FakeGitHub()
+    gate = WriteGate(dry_run=False, state_path=sp, repo="sweep-repo")
+
+    ok = _strip_active_and_flag_human_needed(
+        gh,
+        config,
+        42,
+        active_labels={labels.in_progress},
+        issue_labels={labels.in_progress, labels.ready},
+        write_gate=gate,
+    )
+
+    assert ok
+    assert (42, labels.in_progress) in gh.labels_removed
+    assert (42, labels.human_needed) in gh.labels_added
+    events = query_events(sp, kind="lifecycle_transition", issue_number=42)
+    assert len(events) == 1
+    payload = events[0]["payload"]
+    assert payload["to_state"] == "human_needed"
+    assert payload["cause"] == "escalated"
+    assert events[0]["repo"] == "sweep-repo"
 
 
 # ---------------------------------------------------------------------------
@@ -520,4 +720,38 @@ def test_status_writes_of_lifecycle_states_stay_paired_with_the_seam() -> None:
                 and (path.name, func.name) not in _STATUS_CACHE_MIRROR_ALLOWLIST
             ):
                 offenders.append(f"{path.name}:{func.name}")
+    assert offenders == []
+
+
+def test_production_label_seam_calls_pass_state_path() -> None:
+    """AST-derived: every ``transition``/``apply_issue_labels`` call in src/
+    passes ``state_path=`` explicitly — the keyword is required (no default),
+    so a missing ``state_path=`` means the call would fail open as a
+    ``TypeError`` the moment it ran. Calls on a ``WriteGate`` receiver
+    (``self.write_gate``, ``ctx.write_gate``, ``write_gate``, ``gate``) are
+    exempt — the gate binds its own state path."""
+    src_root = Path(__file__).parents[1] / "src" / "charlie_work"
+    gate_receivers = {"write_gate", "gate", "wg"}
+    offenders: list[str] = []
+    for path in sorted(src_root.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func_expr = node.func
+            call_name = (
+                func_expr.attr
+                if isinstance(func_expr, ast.Attribute)
+                else getattr(func_expr, "id", "")
+            )
+            if call_name not in ("transition", "apply_issue_labels"):
+                continue
+            if isinstance(func_expr, ast.Attribute):
+                receiver = func_expr.value
+                if isinstance(receiver, ast.Attribute) and receiver.attr == "write_gate":
+                    continue
+                if isinstance(receiver, ast.Name) and receiver.id in gate_receivers:
+                    continue
+            if "state_path" not in {kw.arg for kw in node.keywords}:
+                offenders.append(f"{path.name}:{node.lineno}")
     assert offenders == []
