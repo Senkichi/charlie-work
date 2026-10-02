@@ -37,6 +37,7 @@ from charlie_work.process_utils import (
     terminal_record_proves_completion,
     worker_terminal_status_path,
 )
+from . import launch_events
 from .config import (
     CLAUDE_CODE_PROMPT_FILENAME,
     ClaudeCodeConfig,
@@ -571,8 +572,19 @@ def _error_record(
     session_id: str | None = None,
     adapter_kind: str = "claude-code",
     provider: str = "",
+    state_path: Path | None = None,
+    role: str = "worker",
+    model: str = "",
+    error_class: str = launch_events.LAUNCH_ERR_INTERNAL,
 ) -> ClaudeWorkerRecord:
-    return ClaudeWorkerRecord(
+    """The single ClaudeWorkerRecord-with-error constructor — issue #2246's
+    launch seam. Every error record produced anywhere emits exactly one
+    ``launch_failed`` event here, so no launch path can return an error value
+    without one (or emit two). ``role`` splits the numbered ref: a reviewer's
+    ``issue_number`` field is really the PR number, so reviewer events carry
+    it as ``pr_number`` and leave ``issue_number`` unset (the linked issue is
+    not known at this layer)."""
+    record = ClaudeWorkerRecord(
         issue_number=issue_number,
         branch=branch,
         worktree_path=worktree_path,
@@ -589,6 +601,18 @@ def _error_record(
         adapter_kind=adapter_kind,
         provider=provider,
     )
+    launch_events.emit_launch_failed(
+        state_path,
+        role=role,
+        harness=adapter_kind,
+        model=model,
+        issue_number=None if role == "reviewer" else issue_number,
+        pr_number=issue_number if role == "reviewer" else None,
+        error_class=error_class,
+        error=error,
+        failure_kind=failure_kind,
+    )
+    return record
 
 
 def _sanitize_review_command_template(
@@ -987,6 +1011,11 @@ def launch_claude_worker(
     pinned_model = (
         model_override if model_override is not None else resolved_config.worker.model
     ) or _DEFAULT_CLAUDE_MODEL
+    # Issue #2246: shared context for the launch_failed event every error
+    # record below emits via _error_record -- state-dir resolution is a pure
+    # path computation (no event is written on the success path).
+    launch_state_path = launch_events.state_path_for(repo_root, resolved_config)
+    launch_role = "reviewer" if review else "worker"
     command_template = _apply_model_pin(command_template, pinned_model)
     # Reviewer sessions may pin their own effort independently of worker
     # effort (empty string means fall back to claude_code.effort), optionally
@@ -1097,6 +1126,10 @@ def launch_claude_worker(
             session_id=session_id,
             adapter_kind=adapter_kind,
             provider=provider,
+            state_path=launch_state_path,
+            role=launch_role,
+            model=pinned_model,
+            error_class=launch_events.LAUNCH_ERR_WORKTREE,
         )
         return _write_record(sessions_dir, record)
 
@@ -1149,6 +1182,10 @@ def launch_claude_worker(
             error=f"failed to write prompt file: {exc}",
             adapter_kind=adapter_kind,
             provider=provider,
+            state_path=launch_state_path,
+            role=launch_role,
+            model=pinned_model,
+            error_class=launch_events.LAUNCH_ERR_PROMPT,
         )
         return _write_record(sessions_dir, record)
 
@@ -1168,6 +1205,10 @@ def launch_claude_worker(
             error=f"command template rendering failed: {exc}",
             adapter_kind=adapter_kind,
             provider=provider,
+            state_path=launch_state_path,
+            role=launch_role,
+            model=pinned_model,
+            error_class=launch_events.LAUNCH_ERR_RENDER,
         )
         return _write_record(sessions_dir, record)
 
@@ -1227,6 +1268,10 @@ def launch_claude_worker(
             error=f"failed to prepare worker environment: {exc}",
             adapter_kind=adapter_kind,
             provider=provider,
+            state_path=launch_state_path,
+            role=launch_role,
+            model=pinned_model,
+            error_class=launch_events.LAUNCH_ERR_ENV,
         )
         return _write_record(sessions_dir, record)
     # Issue #2096: harness defaults (background tasks off) sit between the
@@ -1350,6 +1395,10 @@ def launch_claude_worker(
             error=f"failed to launch claude: {exc}",
             adapter_kind=adapter_kind,
             provider=provider,
+            state_path=launch_state_path,
+            role=launch_role,
+            model=pinned_model,
+            error_class=launch_events.LAUNCH_ERR_SPAWN,
         )
         return _write_record(sessions_dir, record)
 

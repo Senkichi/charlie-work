@@ -1005,13 +1005,18 @@ def test_launch_api_worker_daily_budget_exhausted_refuses_launch(
     assert record.adapter_kind == "api"
     assert record.provider == "kimi-k3"
 
-    # An api_budget_refused warning event was emitted.
-    assert len(event_calls) == 1
-    assert event_calls[0]["kind"] == "api_budget_refused"
-    assert event_calls[0]["level"] == "warning"
-    assert event_calls[0]["payload"]["issue_number"] == 1514
-    assert event_calls[0]["payload"]["provider"] == "kimi-k3"
-    assert "daily" in event_calls[0]["payload"]["error"]
+    # An api_budget_refused warning event was emitted (alongside the
+    # launch_failed event issue #2246 adds at the error-record seam).
+    budget_events = [c for c in event_calls if c["kind"] == "api_budget_refused"]
+    assert len(budget_events) == 1
+    assert budget_events[0]["level"] == "warning"
+    assert budget_events[0]["payload"]["issue_number"] == 1514
+    assert budget_events[0]["payload"]["provider"] == "kimi-k3"
+    assert "daily" in budget_events[0]["payload"]["error"]
+    launch_failed_events = [c for c in event_calls if c["kind"] == "launch_failed"]
+    assert len(launch_failed_events) == 1
+    assert launch_failed_events[0]["payload"]["error_class"] == "budget"
+    assert launch_failed_events[0]["payload"]["model"] == "kimi-k3"
 
     # The error is durable in the sidecar (no key material).
     sidecar_path = sessions_dir / "issue-1514.api.json"

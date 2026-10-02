@@ -19,12 +19,26 @@ class ReviewLauncher(Protocol):
         ...
 
 
-def error_record(harness: str, kwargs: dict[str, Any], error: str) -> Any:
-    """A launch-failure value shaped like the success record (``pid`` is None)."""
+def error_record(
+    harness: str,
+    kwargs: dict[str, Any],
+    error: str,
+    *,
+    error_class: str | None = None,
+) -> Any:
+    """A launch-failure value shaped like the success record (``pid`` is None).
+
+    Issue #2246: this is the reviewer launch seam's error-record constructor --
+    the only place an erroring ``launch()`` result can come into existence
+    without the wrapped launcher's own seam having already emitted. Each
+    construction emits exactly one ``launch_failed`` event (role="reviewer";
+    the record's ``issue_number`` field carries the PR number).
+    """
+    from .. import launch_events
     from ..claude_code import ClaudeWorkerRecord
     from ..state import utc_now
 
-    return ClaudeWorkerRecord(
+    record = ClaudeWorkerRecord(
         issue_number=int(kwargs.get("pr_number") or 0),
         branch=str(kwargs.get("branch") or ""),
         worktree_path="",
@@ -36,6 +50,20 @@ def error_record(harness: str, kwargs: dict[str, Any], error: str) -> Any:
         error=error,
         adapter_kind=harness,
     )
+    repo_root = kwargs.get("repo_root")
+    if repo_root is not None:
+        launch_events.emit_launch_failed(
+            launch_events.state_path_for(repo_root, kwargs.get("config")),
+            role="reviewer",
+            harness=harness,
+            # The resolved role-chain reviewer entry; empty when the caller
+            # left it unset (api reviewers pin the provider model instead).
+            model=str(kwargs.get("model_override") or ""),
+            pr_number=record.issue_number or None,
+            error_class=error_class or launch_events.LAUNCH_ERR_INTERNAL,
+            error=error,
+        )
+    return record
 
 
 class RealReviewLauncher:
@@ -44,7 +72,12 @@ class RealReviewLauncher:
 
         launcher = workflow._REVIEW_LAUNCHERS.get(harness)
         if launcher is None:
-            return error_record(harness, kwargs, f"unsupported reviewer harness: {harness!r}")
+            return error_record(
+                harness,
+                kwargs,
+                f"unsupported reviewer harness: {harness!r}",
+                error_class="config",
+            )
         try:
             return launcher(**kwargs)
         except Exception as exc:  # errors from external processes come back as values
