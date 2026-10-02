@@ -285,7 +285,10 @@ def test_worker_prompt_has_no_review_exec_section(
 
 
 def test_review_prompt_write_failure_falls_back_to_original(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    patch_path_replace,
 ) -> None:
     popen_calls = _patch_launch(monkeypatch, {})
     real_replace = Path.replace
@@ -299,7 +302,7 @@ def test_review_prompt_write_failure_falls_back_to_original(
             raise OSError("disk full")
         return real_replace(self, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "replace", boom)
+    patch_path_replace(boom, scope=tmp_path)
     with caplog.at_level("WARNING"):
         record = _launch(tmp_path, review=True)
 
