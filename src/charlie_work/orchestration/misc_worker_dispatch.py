@@ -371,13 +371,20 @@ def _route_phantom_live_worker(
         # sweep's ``dead_orphans`` lane re-probes and parks next pass) and the
         # sidecar is kept (the sidecar lane can retry too). The original
         # dispatch timestamp is preserved so redispatch windowing still
-        # counts from the real dispatch.
+        # counts from the real dispatch. ``ready`` is stripped so the entry
+        # is not dispatchable while the park is pending — with a dead/popped
+        # PID and a ready-only label set it would otherwise be re-selected
+        # next pass and relaunch before the sweep's retry. The reclaim path
+        # re-adds ``ready`` when the deferral budget expires.
+        removed_ready = False
+        if self.config.labels.ready in issue_labels:
+            removed_ready = self.gh.remove_issue_label(issue_number, self.config.labels.ready)
         state = _emit_session_failed_relabeled(
             state,
             issue_number=issue_number,
             reason="phantom_live_worker_salvage_deferred",
             failure_kind="live_worker_redispatch_averted",
-            removed_labels=[],
+            removed_labels=[self.config.labels.ready] if removed_ready else [],
             added_ready=False,
             label_write_ok=False,
             salvage_status=salvage.status,

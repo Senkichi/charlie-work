@@ -520,13 +520,21 @@ def test_phantom_salvage_failure_defers_without_requeue(
     entry = state["issues"][str(ISSUE_NUMBER)]
     # Deferral: still dispatched (the sweep owns the retry), not requeued.
     assert entry["status"] == "dispatched"
-    # No ready re-add (labels untouched — review-ready add failed) and the
-    # deferral is observable.
+    # review-ready add failed (park write), and the deferral is observable.
     labels = _label_names(gh, ISSUE_NUMBER)
     assert "agent:review-ready" not in labels
+    # ``ready`` is stripped so the deferred entry is NOT dispatchable while
+    # the park is pending — otherwise a ready-only label set plus a
+    # dead/popped PID would re-select the issue and relaunch before the
+    # sweep's retry, the same requeue-into-reset shape the fix removes.
+    assert "automated-ready" not in labels
     deferred = _events(paths.state_file, "session_failed_relabeled", ISSUE_NUMBER)
     assert [e["payload"]["reason"] for e in deferred] == ["phantom_live_worker_salvage_deferred"]
     # The attempted park records its own audit event marked as a failed write.
     ready_events = _events(paths.state_file, "local_work_ready", ISSUE_NUMBER)
     assert all(e["payload"].get("label_write_ok") is False for e in ready_events)
     assert not _events(paths.state_file, "worktree_local_commits_archived")
+
+    # Non-dispatchable while deferred: a second pass selects nothing.
+    result2 = app.dispatch(limit=1)
+    assert result2.data["attempted_count"] == 0
