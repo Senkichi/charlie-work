@@ -1148,9 +1148,26 @@ def _dispatch_impl(
     manual = self.config.worker.harness == "manual"
     label_errors: list[int] = []
     label_error_failures: dict[int, str] = {}
-    # B6: fates the phantom-worker lane resolves while ``state_lock`` is held,
-    # reported (rule-1 stale evidence) once the lock is released below.
+    # B6: fates the phantom-worker lane resolves, reported (rule-1 stale
+    # evidence) once the lock below is released.
     phantom_fates: dict[int, list[worker_fate.WorkerFate]] = {}
+    # Issue #2262: the phantom lane's salvage probe (park a committed local
+    # branch for review / push + PR on a PR-capable backend) takes
+    # ``state_lock`` itself and does git + label I/O, so it must run BEFORE
+    # the lock below — the same pre-lock/two-phase pattern the dead-worker
+    # sweep uses. ``_precheck_phantom_live_worker`` also resolves each
+    # phantom sidecar's fate here (pure reads); the in-lock route consumes
+    # the verdicts.
+    phantom_prechecks: dict[int, Any] = {}
+    for request in session_requests:
+        if request.issue_number in phantom_live_worker_issue_numbers:
+            phantom_prechecks[request.issue_number] = self._precheck_phantom_live_worker(
+                request,
+                full_issues[request.issue_number],
+                sessions_dir,
+                previous_entries.get(request.issue_number, {}),
+                on_fate=lambda fate: worker_fate.collect_fate(phantom_fates, fate),
+            )
 
     with _wf.state_lock(self.paths.state_file):
         state = _wf.load_state(self.paths.state_file)
@@ -1227,7 +1244,7 @@ def _dispatch_impl(
                     request,
                     full_issue,
                     sessions_dir,
-                    on_fate=lambda fate: worker_fate.collect_fate(phantom_fates, fate),
+                    precheck=phantom_prechecks[request.issue_number],
                 )
                 # A phantom live worker is being routed as dead; do not
                 # preserve a stale worker_pid that would keep the slot
