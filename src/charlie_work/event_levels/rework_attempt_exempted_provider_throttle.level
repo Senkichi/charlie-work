@@ -1,0 +1,5 @@
+info
+# Issue #2282: a rework session died to a provider throttle (rate_limited,
+# quota_exhausted, provider_auth, ...) and its dispatch stamp was refunded so
+# the attempt does not count toward any rework cap. Expected operation, not a
+# fault: the provider ended the session, which says nothing about the work.

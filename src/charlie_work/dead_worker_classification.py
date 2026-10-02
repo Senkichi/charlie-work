@@ -50,6 +50,7 @@ from typing import TYPE_CHECKING, Any
 
 from . import worker_fate
 from .dispatch_selection import _credit_worker_death
+from .rework_attempt_exemption import exempt_provider_throttle_rework_death
 from .worker import iter_workers
 from .write_gate import WriteGate, require_write_gate
 
@@ -261,6 +262,8 @@ def classify_and_credit_dead_worker(
     at: str,
     now: datetime | None = None,
     classify_log: bool = True,
+    dispatched_at: str | None = None,
+    pr_number: int | None = None,
 ) -> str | None:
     """Classify the dead worker, then credit its death unless throttle-caused.
 
@@ -286,6 +289,12 @@ def classify_and_credit_dead_worker(
     through ``_credit_worker_death`` with ``kind=`` so the timestamp and
     its attribution are recorded together (``worker_death_failure_kinds``).
 
+    Issue #2282: the same throttle death also goes through
+    ``rework_attempt_exemption.exempt_provider_throttle_rework_death``.
+    ``dispatched_at`` (the dead epoch's) and ``pr_number`` let that call refund
+    the session's own ``redispatch_at`` stamp and flag the PR, so the attempt
+    counts toward no cap at all.
+
     Returns the resolved ``failure_kind`` (None when unclassifiable) so the
     call site can record it in its event payload.
     """
@@ -305,4 +314,17 @@ def classify_and_credit_dead_worker(
     # kind, so the stamp read agrees with ``failure_kind``.
     if not worker_fate.persisted_failure(entry).is_throttle:
         entry["worker_death_at"] = _credit_worker_death(entry, at=at, kind=failure_kind)
+    # Issue #2282: not crediting the death is only half the exemption -- the
+    # dead session's dispatch stamp would still count as a no-op. The single
+    # enforcement point refunds it and flags the PR.
+    exempt_provider_throttle_rework_death(
+        state,
+        issue_number,
+        entry,
+        failure_kind,
+        dispatched_at=dispatched_at,
+        pr_number=pr_number,
+        source="orphan_sweep_credit",
+        write_gate=write_gate,
+    )
     return failure_kind

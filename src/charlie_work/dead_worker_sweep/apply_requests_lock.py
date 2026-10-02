@@ -114,6 +114,8 @@ def credit_dead_worker(ctx: SweepContext, req: CreditDeadWorker) -> CreditResult
         write_gate=ctx.write_gate,
         at=ctx.stamp,
         classify_log=req.classify_log,
+        dispatched_at=req.dispatched_at,
+        pr_number=req.pr_number,
     )
     return CreditResult(failure_kind=kind, throttled_until=ctx.state.get("throttled_until"))
 

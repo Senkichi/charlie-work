@@ -164,10 +164,11 @@ def _same_head(
             {**ctx.base(), "reason": "dead_worker_clean_exit_no_op", **extra, **ctx.proc()},
         )
         return
+    dispatched_at = entry.get("dispatched_at")
     entry["status"] = "rework_requested"
     entry["dispatched_at"] = None
     yield from flush(draft)
-    credit = yield CreditDeadWorker(number)
+    credit = yield CreditDeadWorker(number, dispatched_at=dispatched_at, pr_number=ctx.pr_number)
     acc.throttled_until = credit.throttled_until
     yield emit(
         "orphaned_worker_recovered",
