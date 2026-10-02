@@ -13,6 +13,8 @@ from charlie_work import instrumentation
 from charlie_work.config import LabelConfig
 from charlie_work.dashboard import drill, rollup, sources
 from charlie_work.dashboard.drill.loop_pass import MAX_PASS_EVENTS, payload_preview
+from charlie_work.dashboard.drill.repo import merges_for
+from charlie_work.dashboard.metrics_flow import BACKFILL_BURST
 from charlie_work.dashboard.now_model import build_now_model
 from charlie_work.dashboard.now_types import RepoRead, SourcesRead
 from charlie_work.dashboard.sources import SnapshotRead
@@ -243,6 +245,86 @@ def test_repo_drill_errors(built) -> None:
     assert isinstance(early, drill.DrillError) and early.code == "unavailable"
     lim = drill.repo_drill(ALPHA, _model(ALPHA), db, limit=0)
     assert isinstance(lim, drill.DrillError) and lim.code == "invalid"
+
+
+def test_a_fresh_dashboard_db_carries_the_merge_scan_index(fleet) -> None:
+    """merges_for's firsts scan is backed by issue_milestones (source, milestone)."""
+    assert rollup.run_rollup(fleet.sources(), NOW).errors == ()
+    conn = fleet.db()
+    names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'index'")}
+    assert "issue_milestones_merge" in names
+
+
+def test_merges_for_dedups_a_pr_only_row_onto_its_linked_issue(fleet) -> None:
+    """A PR-only milestone shares its linked issue's key: two rows, one merge, first wins."""
+    fleet.emit(
+        fleet.beta, "2026-10-01T09:10:00Z", "finalize_externally_merged", {"pr_numbers": [555]}
+    )
+    fleet.emit(
+        fleet.beta,
+        "2026-10-01T09:20:00Z",
+        "reconcile",
+        {"kind": "merged_outside_orchestrator", "issue_number": 42, "pr_number": 555},
+    )
+    assert rollup.run_rollup(fleet.sources(), NOW).errors == ()
+    got = merges_for(fleet.db(), BETA, 20, TZ)
+    # without the linked-issue key both rows would survive; instead the earlier
+    # PR-only row is the item's first signal
+    assert [(m.ts, m.issue, m.pr) for m in got] == [("2026-10-01T09:10:00Z", None, 555)]
+
+
+def test_merges_for_keeps_a_pr_with_no_linked_issue(fleet) -> None:
+    fleet.emit(
+        fleet.beta, "2026-10-01T09:10:00Z", "finalize_externally_merged", {"pr_numbers": [700]}
+    )
+    assert rollup.run_rollup(fleet.sources(), NOW).errors == ()
+    got = merges_for(fleet.db(), BETA, 20, TZ)
+    assert [(m.issue, m.pr, m.evidence) for m in got] == [
+        (None, 700, "finalize_externally_merged")
+    ]
+
+
+def test_merges_for_drops_a_reconcile_backfill_burst(fleet) -> None:
+    """BACKFILL_BURST reconcile-detected merges in one repo-hour are a catch-up pass."""
+    for i in range(BACKFILL_BURST):
+        fleet.emit(
+            fleet.beta,
+            f"2026-10-01T10:{i:02d}:00Z",
+            "reconcile",
+            {
+                "kind": "merged_outside_orchestrator",
+                "issue_number": 900 + i,
+                "pr_number": 1900 + i,
+            },
+        )
+    assert rollup.run_rollup(fleet.sources(), NOW).errors == ()
+    assert merges_for(fleet.db(), BETA, 20, TZ) == ()
+
+
+def test_merges_for_applies_limit_after_the_backfill_drop(fleet) -> None:
+    """limit cuts what survives the drop — a burst newer than a real merge cannot starve it."""
+    fleet.emit(
+        fleet.beta,
+        "2026-10-01T08:30:00Z",
+        "merge_succeeded",
+        {"issue_number": 7, "pr_number": 8},
+    )
+    for i in range(BACKFILL_BURST):
+        fleet.emit(
+            fleet.beta,
+            f"2026-10-01T09:{i:02d}:00Z",
+            "reconcile",
+            {
+                "kind": "merged_outside_orchestrator",
+                "issue_number": 900 + i,
+                "pr_number": 1900 + i,
+            },
+        )
+    assert rollup.run_rollup(fleet.sources(), NOW).errors == ()
+    got = merges_for(fleet.db(), BETA, 1, TZ)
+    # newest-first with limit=1: if the drop ran after the limit the only returned row
+    # would be a burst reconcile, leaving nothing
+    assert [(m.issue, m.pr, m.evidence) for m in got] == [(7, 8, "merge_succeeded")]
 
 
 # --- loop pass ------------------------------------------------------------------------------

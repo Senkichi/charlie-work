@@ -7,6 +7,7 @@ tuple (total first, then ``<name>.<category>``). ``tab_series`` flattens either 
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from collections.abc import Callable
 
@@ -19,6 +20,8 @@ from .metrics_base import MetricQuery, Series, open_dashboard_ro
 __all__ = ["MetricQuery", "Series", "TABS", "all_series", "open_dashboard_ro"]
 
 Metric = Callable[[sqlite3.Connection, MetricQuery], Series | tuple[Series, ...]]
+
+log = logging.getLogger("charlie_work.dashboard")
 
 
 def _stage(stage: str) -> Metric:
@@ -76,6 +79,7 @@ def tab_results(
         except sqlite3.Error:
             raise
         except Exception as exc:  # noqa: BLE001 - degrade this metric's card, not the tab
+            log.exception("history metric failed: %s %s", tab, metric_id)
             out[metric_id] = exc
         else:
             out[metric_id] = result if isinstance(result, tuple) else (result,)

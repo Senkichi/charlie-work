@@ -114,18 +114,19 @@ class SeriesSpec:
 def open_dashboard_ro(path: Path) -> tuple[sqlite3.Connection | None, str | None]:
     """Open ``dashboard.db`` read-only; ``(conn, error)`` with exactly one None.
 
-    ``immutable=1`` keeps a WAL database's ``-shm``/``-wal`` sidecars from being created
-    by a reader (SQLite never opens the wal-index). The tradeoff is that rows committed
-    since the last checkpoint are invisible — safe here because the rollup connection is
-    the last writer, and SQLite checkpoints and empties the WAL when it closes at the
-    end of every pass, so a reader between passes sees the last completed pass's state.
+    ``mode=ro`` and deliberately no ``immutable=1``: the rollup writes this database
+    from the same process the readers live in (``server.py`` runs ``run_rollup``
+    alongside the page handlers), and WAL auto-checkpoint plus the writer's
+    close-checkpoint mutate the main file — an immutable reader takes no locks and
+    can observe a checkpoint mid-write as torn pages. Reading through the WAL
+    protocol may create ``-shm``/``-wal`` sidecars next to the database; that is the
+    accepted price, the same tradeoff ``sources.open_events_ro`` makes for
+    ``events.db``.
     """
     if not path.is_file():
         return None, f"missing: {path}"
     try:
-        conn = sqlite3.connect(
-            f"{path.resolve().as_uri()}?mode=ro&immutable=1", uri=True, timeout=5.0
-        )
+        conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=5.0)
         conn.execute("SELECT 1 FROM meta LIMIT 1")
     except sqlite3.Error as exc:
         return None, f"cannot open {path}: {exc}"

@@ -213,10 +213,11 @@ def open_events_ro(path: Path) -> tuple[sqlite3.Connection | None, str | None]:
     take a write lock against the supervisor's WAL writer. A missing file is
     reported as a value instead of letting sqlite create an empty database.
 
-    Unlike ``metrics_base.open_dashboard_ro`` this deliberately does NOT pass
+    Like ``metrics_base.open_dashboard_ro`` this deliberately does NOT pass
     ``immutable=1``: ``events.db`` is appended continuously by a live writer and its
-    WAL is not checkpointed per event, so an immutable reader would silently miss
-    every row still in the WAL. The ``-shm``/``-wal`` sidecars a plain read-only
+    WAL is not checkpointed per event, so an immutable reader — which takes no locks —
+    would silently miss every row still in the WAL and could observe a checkpoint
+    mid-write as torn pages. The ``-shm``/``-wal`` sidecars a plain read-only
     open may create next to the database are the accepted price of seeing fresh rows.
     """
     if not path.is_file():

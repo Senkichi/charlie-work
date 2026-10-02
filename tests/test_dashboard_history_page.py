@@ -6,6 +6,7 @@ Takeaways are re-derived here straight from ``metrics.tab_series`` + ``takeaways
 
 from __future__ import annotations
 
+import logging
 import re
 import sqlite3
 from html import escape
@@ -173,7 +174,7 @@ def test_locked_db_is_a_value_not_a_500(db_path: Path, monkeypatch) -> None:
     assert isinstance(result, HistoryUnavailable) and "database is locked" in result.reason
 
 
-def test_a_malformed_row_degrades_only_its_own_card(db_path: Path) -> None:
+def test_a_malformed_row_degrades_only_its_own_card(db_path: Path, caplog) -> None:
     # A TEXT value in a numeric column: SQLite stores it happily, and only the metric
     # reading that column (wip -> pass_samples.live_sessions) may fail — not its neighbours.
     conn = sqlite3.connect(db_path)
@@ -184,9 +185,13 @@ def test_a_malformed_row_degrades_only_its_own_card(db_path: Path) -> None:
     )
     conn.commit()
     conn.close()
-    view = load_tab(db_path, "flow", "7d", NOW)
+    with caplog.at_level(logging.ERROR, "charlie_work.dashboard"):
+        view = load_tab(db_path, "flow", "7d", NOW)
     assert isinstance(view, HistoryView)
     assert view.get("wip").error is not None
+    # the degraded metric's swallowed exception is logged with its traceback
+    logged = [r for r in caplog.records if "wip" in r.getMessage()]
+    assert logged and all(r.exc_info for r in logged)
     page = render_history(view, "flow", "7d")
     card = _card(page, "wip")
     assert "could not be drawn" in card and "malformed" in card and "<svg" not in card
@@ -194,7 +199,26 @@ def test_a_malformed_row_degrades_only_its_own_card(db_path: Path) -> None:
     assert "<svg" in _card(page, "queue_depth")  # same table, other column: unaffected
 
 
+def test_a_takeaway_fault_is_logged_and_degrades_its_card(
+    db_path: Path, monkeypatch, caplog
+) -> None:
+    def boom(cur, pri):
+        raise KeyError("assessment")
+
+    monkeypatch.setattr(history_data, "paired_assessments", boom)
+    with caplog.at_level(logging.ERROR, "charlie_work.dashboard"):
+        view = load_tab(db_path, "flow", "7d", NOW)
+    assert isinstance(view, HistoryView)
+    assert all(m.error is not None for m in view.metrics)
+    assert any(
+        "takeaway assessment failed" in r.getMessage() and r.exc_info for r in caplog.records
+    )
+    page = render_history(view, "flow", "7d")
+    assert "could not be drawn" in _card(page, "wip")
+
+
 def test_every_duration_card_states_median_and_p90(db_path: Path) -> None:
+    checked = 0
     for tab in ("flow", "capacity", "reliability"):
         view = load_tab(db_path, tab, "7d", NOW)
         assert isinstance(view, HistoryView)
@@ -202,10 +226,12 @@ def test_every_duration_card_states_median_and_p90(db_path: Path) -> None:
         for m in view.metrics:
             if m.error is not None or m.headline.kind != "duration" or not m.headline.samples:
                 continue
+            checked += 1
             card = _card(page, m.metric_id)
             assert re.search(r">p90 [^<]*</text>", card), m.metric_id  # labelled ref rule
             assert 'class="strip-chart"' in card, m.metric_id
             assert re.search(r"median \S+ · p90 \S+ · n \d+", card), m.metric_id
+    assert checked > 0, "no duration card carried samples — the assertions above ran zero times"
 
 
 def test_cache_keys_load_independently() -> None:

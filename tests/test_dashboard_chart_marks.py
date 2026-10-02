@@ -4,7 +4,15 @@ from __future__ import annotations
 
 import re
 
-from charlie_work.dashboard.charts import Bullet, Distribution, bullet_bar, bullet_bars, strip_plot
+from charlie_work.dashboard.charts import (
+    Bullet,
+    Distribution,
+    bullet_bar,
+    bullet_bars,
+    bullet_svg,
+    strip_plot,
+)
+from charlie_work.dashboard.charts import bullet
 from charlie_work.dashboard.charts.strip import nearest_rank
 from charlie_work.dashboard.theme import generate_css, static_asset
 
@@ -41,6 +49,31 @@ def test_bullet_bars_share_one_scale() -> None:
 
 def test_bullet_label_is_escaped() -> None:
     assert "&lt;x&gt;" in bullet_bar(Bullet("<x>", 1, 2))
+
+
+def test_bullet_svg_draws_the_full_track_and_a_cap_tick() -> None:
+    svg = bullet_svg(3, 4, scale=8)
+    assert 'viewBox="0 0 240 16"' in svg and 'aria-hidden="true"' in svg
+    assert '<rect class="trk" x="0" y="5" width="240" height="6"/>' in svg  # full-width track
+    assert '<rect class="fill" x="0" y="3" width="90" height="10"/>' in svg  # 3/8 of 240
+    assert '<line class="captick" x1="120" x2="120" y1="0" y2="16"/>' in svg  # 4/8 of 240
+
+
+def test_bullet_svg_unknown_cap_is_a_fixed_80_percent_open_fill() -> None:
+    svg = bullet_svg(2, None)
+    # the fill is fixed at 80% of the track regardless of the value (there is no scale
+    # to place it on); the rest is a dashed open track and no cap tick is drawn
+    assert '<rect class="fill" x="0" y="3" width="192" height="10"/>' in svg
+    assert '<line class="trk-open" x1="192" x2="240" y1="8" y2="8" stroke-dasharray="3 3"/>' in svg
+    assert "captick" not in svg and 'class="trk"' not in svg
+    assert 'width="0"' in bullet_svg(0, None)  # value 0: open track only
+
+
+def test_bullet_svg_and_bullet_bar_share_the_track_geometry() -> None:
+    # one implementation: the row's bar embeds exactly what bullet_svg draws
+    assert bullet._track(2, 8, 8) in bullet_svg(2, 8, scale=8)
+    assert bullet._track(2, 8, 8) in bullet_bar(Bullet("x", 2, 8), scale=8)
+    assert bullet._track(5, 4, 10) == bullet._track(5, 4, 10)  # deterministic
 
 
 def test_nearest_rank_is_an_observed_sample() -> None:

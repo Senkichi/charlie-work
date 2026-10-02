@@ -10,6 +10,7 @@ Pure functions; every dynamic value is escaped (``now_fmt.esc`` / the chart prim
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta, tzinfo
 
 from ..charts import (
@@ -32,6 +33,8 @@ from ..history_data import HistoryView, MetricData
 from ..metrics_base import Series
 from ..timeutil import iso, parse_ts
 from .now_fmt import esc, repo_url, short_repo, slug
+
+log = logging.getLogger("charlie_work.dashboard")
 
 LIFECYCLE_ISSUE = "#2226"
 # One combined chart draws at most as many lines as the renderer has distinct (colour,
@@ -212,13 +215,18 @@ def _flags_html(notes: tuple[str, ...]) -> str:
     return '<ul class="flags">' + "".join(f"<li>{esc(n)}</li>" for n in notes) + "</ul>"
 
 
-def _error_card(metric_id: str, error: str) -> str:
-    """A malformed stored row or a render fault degrades to this card — never the page."""
+def _error_card(metric_id: str, error: str, *, render_fault: bool = False) -> str:
+    """A data failure or a render fault degrades to this card — never the page.
+
+    ``render_fault`` is for a card that crashed mid-render (a chart-code bug such as
+    TypeError/KeyError, not a malformed stored row), so it says so in its own words.
+    """
+    detail = "the card failed to render" if render_fault else "a stored row it reads is malformed"
     return (
         f'<article class="mcard is-error" id="{esc(card_id(metric_id))}">'
         '<p class="takeaway">This metric could not be drawn.</p>'
         f'<h3 class="mtitle">{esc(metric_id)}</h3>'
-        f'<p class="missing">a stored row it reads is malformed ({esc(error)}); '
+        f'<p class="missing">{esc(detail)} ({esc(error)}); '
         "the other cards are unaffected.</p></article>"
     )
 
@@ -355,5 +363,8 @@ def render_cards(
         try:
             cards.append(render_card(view, m, tz, known))
         except Exception as exc:  # noqa: BLE001 - a bad card is a value, not a 500
-            cards.append(_error_card(m.metric_id, f"{type(exc).__name__}: {exc}"))
+            log.exception("history card failed to render: %s", m.metric_id)
+            cards.append(
+                _error_card(m.metric_id, f"{type(exc).__name__}: {exc}", render_fault=True)
+            )
     return "".join(cards)

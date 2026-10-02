@@ -142,6 +142,7 @@ def load_tab(db_path: Path | None, tab: str, range_key: str, now: datetime) -> H
             try:
                 got = paired_assessments(cur, pri)
             except Exception as exc:  # noqa: BLE001 - malformed values degrade one card
+                log.exception("takeaway assessment failed: %s %s", tab, mid)
                 error = exc
             else:
                 metrics.append(
