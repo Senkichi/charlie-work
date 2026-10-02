@@ -28,6 +28,7 @@ Covers, in order:
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 
 import pytest
@@ -262,6 +263,60 @@ def test_cache_evicts_oldest_beyond_max_entries(tmp_path: Path, monkeypatch):
     entries = http_cache.load_cache(path)
     assert len(entries) == 2
     assert "/c" in entries  # most recent survives
+
+
+def test_save_cache_concurrent_writes_use_distinct_temps(tmp_path: Path, monkeypatch):
+    """Issue #2265: two concurrent ``_save_cache`` calls shared one fixed
+    ``http-etag-cache.json.tmp`` name, colliding on open/truncate/rename and
+    surfacing ``PermissionError`` [WinError 5] on Windows. Each save now
+    stages a unique temp file, so both complete and the destination holds
+    one intact payload with no ``.tmp`` orphans."""
+    path = tmp_path / "http-etag-cache.json"
+    barrier = threading.Barrier(2, timeout=30)
+    rendezvous_done = threading.Event()
+    used: list[Path] = []
+    real_replace = Path.replace
+    errors: list[BaseException] = []
+
+    def _blocking_replace(self: Path, target: object) -> Path:
+        used.append(self)
+        # Rendezvous the writers' first replace calls while BOTH temp files
+        # exist -- under the fixed-name scheme this is exactly where the two
+        # writers shared one file. A retried replace (transient
+        # PermissionError -- the exact Windows condition the retry exists
+        # for) re-enters this hook, so it must pass straight through or the
+        # barrier would deadlock on its second phase.
+        if not rendezvous_done.is_set():
+            barrier.wait()
+            rendezvous_done.set()
+        return real_replace(self, target)
+
+    def _save(etag: str) -> None:
+        try:
+            http_cache._save_cache(
+                path,
+                {"/p": http_cache.CachedResponse(etag=etag, status=200, body="{}", stored_at="t")},
+            )
+        except BaseException as exc:  # noqa: BLE001 - collected for the assert
+            errors.append(exc)
+
+    monkeypatch.setattr(Path, "replace", _blocking_replace)
+    threads = [threading.Thread(target=_save, args=(f'"e{i}"',)) for i in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    assert not any(thread.is_alive() for thread in threads), "barrier deadlock"
+    assert errors == []
+    # Two DISTINCT tmp files coexisted at the barrier (a PermissionError
+    # retry re-uses the same tmp, so compare the set, not the count).
+    assert len(set(used)) == 2
+    assert used[0] != used[1]
+    loaded = http_cache.load_cache(path)
+    assert set(loaded) == {"/p"}
+    assert loaded["/p"].etag in {'"e0"', '"e1"'}
+    assert not list(tmp_path.glob("*.tmp"))
 
 
 # ---------------------------------------------------------------------------

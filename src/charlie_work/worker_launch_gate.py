@@ -68,6 +68,7 @@ from typing import TYPE_CHECKING, Any
 
 from charlie_work import layout, role_selection
 from charlie_work.adapters import AdapterSettings, SessionDispatchResult, SessionRequest
+from charlie_work.atomic_write import write_json_atomic
 from charlie_work.fleet_registry import try_acquire_fleet_lock
 
 if TYPE_CHECKING:
@@ -198,9 +199,7 @@ class FleetLaunchLock:
         }
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = path.with_suffix(path.suffix + ".tmp")
-            tmp.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
-            tmp.replace(path)
+            write_json_atomic(path, payload)
         except OSError:
             return  # best-effort metadata -- never the reason a launch fails
         self._wrote_holder = True

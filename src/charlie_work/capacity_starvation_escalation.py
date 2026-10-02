@@ -35,6 +35,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any
 
+from .atomic_write import write_json_atomic
 from .config_validation import AtLeastOne, Typed
 from .fleet_paths import warn_fleet_dir_virtualization_on_write
 from . import layout
@@ -158,11 +159,7 @@ def _save_capacity_starvation_state(path: Path, repos: dict[str, dict[str, Any]]
         path.parent, context="writing capacity_starvation_state.json"
     )
     payload = {"version": 1, "generated_at": utc_now(), "repos": repos}
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    with tmp_path.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2, sort_keys=True)
-        handle.write("\n")
-    tmp_path.replace(path)
+    write_json_atomic(path, payload)
 
 
 def _iso_utc(dt: datetime.datetime) -> str:

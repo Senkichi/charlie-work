@@ -157,7 +157,7 @@ def test_write_text_atomic_happy_path_leaves_no_tmp_sibling(tmp_path: Path) -> N
     _write_text_atomic(target, "hello world")
 
     assert target.read_text(encoding="utf-8") == "hello world"
-    assert not target.with_suffix(target.suffix + ".tmp").exists()
+    assert not list(tmp_path.glob("*.tmp"))
 
 
 def test_write_text_atomic_crash_before_rename_leaves_final_path_untouched(

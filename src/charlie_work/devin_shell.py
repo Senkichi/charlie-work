@@ -35,6 +35,7 @@ from typing import Any
 from charlie_work import process_utils as _process_utils
 from charlie_work.process_utils import CpuPriority, popen_worker
 from . import launch_events
+from .atomic_write import write_json_atomic
 from .claude_code import _events_path, _rotate_old_log
 from .config import OrchestratorConfig
 from .devin_failure_classification import (  # noqa: F401 (deliberate re-export; #1442 extraction keeps devin_shell under its mark)
@@ -194,12 +195,7 @@ def _read_sidecar_inconclusive_count(sessions_dir: Path, issue_number: int) -> i
 
 
 def _write_json(path: Path, value: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    with tmp_path.open("w", encoding="utf-8") as handle:
-        json.dump(value, handle, indent=2, sort_keys=True)
-        handle.write("\n")
-    tmp_path.replace(path)
+    write_json_atomic(path, value)
 
 
 def _render_command(
