@@ -12,8 +12,19 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, tzinfo
 
-from ..charts import Coverage, LineSpec, Marker, Panel, Size, line_chart, small_multiples
+from ..charts import (
+    Coverage,
+    Distribution,
+    LineSpec,
+    Marker,
+    Panel,
+    Size,
+    line_chart,
+    small_multiples,
+    strip_plot,
+)
 from ..charts.model import Reference
+from ..charts.strip import nearest_rank
 from ..charts import Point as ChartPoint
 from ..charts import Series as ChartSeries
 from ..charts.svg import SERIES_DASH
@@ -123,14 +134,54 @@ def _chart_coverage(series: Series, window: tuple[datetime, datetime]) -> tuple[
     return tuple(out)
 
 
-def _references(compared: tuple[float, float] | None, range_key: str) -> tuple[Reference, ...]:
-    """The two values the headline compares, as rules on the chart's own axis (D1)."""
-    if compared is None:
-        return ()
-    cur, pri = compared
-    return (
-        Reference(pri, f"prior {range_key} avg", prior=True),
-        Reference(cur, f"this {range_key} avg"),
+def _references(
+    compared: tuple[float, float] | None, range_key: str, head: Series
+) -> tuple[Reference, ...]:
+    """The values the headline compares as rules on the chart's axis (D1), plus the
+    window's p90 beside a duration card's per-bucket medians (D8)."""
+    out = (
+        []
+        if compared is None
+        else [
+            Reference(compared[1], f"prior {range_key} avg", prior=True),
+            Reference(compared[0], f"this {range_key} avg"),
+        ]
+    )
+    if head.kind == "duration":
+        vals = tuple(v for vs in head.samples.values() for v in vs)
+        if vals:
+            out.append(Reference(nearest_rank(vals, 90), "p90"))
+    return tuple(out)
+
+
+_SECONDS_PER_UNIT = {"seconds": 1.0, "minutes": 60.0, "hours": 3600.0}
+
+
+def _distribution(head: Series, window: tuple[datetime, datetime], tz: tzinfo | None) -> str:
+    """The strip plot of the raw durations behind the median line: one row per repo plus
+    the fleet as a whole, each stating its median and p90 in words (D8 remainder)."""
+    factor = _SECONDS_PER_UNIT.get(head.unit)  # the strip's log axis is in seconds
+    if factor is None or not head.samples:
+        return ""
+    rows = [
+        Distribution(
+            short_repo(repo), tuple(v * factor for v in head.samples[repo]), approx=head.approx
+        )
+        for repo in sorted(head.samples)
+        if head.samples[repo]
+    ]
+    if len(head.samples) > 1:  # "all" only adds information when several sources pool
+        pooled = tuple(v * factor for vs in head.samples.values() for v in vs)
+        if pooled:
+            rows.insert(0, Distribution("all", pooled, approx=head.approx))
+    if not rows:
+        return ""
+    return strip_plot(
+        tuple(rows),
+        f"{head.label or head.name}, per-sample distribution",
+        window=window,
+        width=COMBINED.width,
+        tz=tz,
     )
 
 
@@ -159,6 +210,17 @@ def _flags_html(notes: tuple[str, ...]) -> str:
     if not notes:
         return ""
     return '<ul class="flags">' + "".join(f"<li>{esc(n)}</li>" for n in notes) + "</ul>"
+
+
+def _error_card(metric_id: str, error: str) -> str:
+    """A malformed stored row or a render fault degrades to this card — never the page."""
+    return (
+        f'<article class="mcard is-error" id="{esc(card_id(metric_id))}">'
+        '<p class="takeaway">This metric could not be drawn.</p>'
+        f'<h3 class="mtitle">{esc(metric_id)}</h3>'
+        f'<p class="missing">a stored row it reads is malformed ({esc(error)}); '
+        "the other cards are unaffected.</p></article>"
+    )
 
 
 def _not_instrumented(metric_id: str, metric: MetricData) -> str:
@@ -211,7 +273,10 @@ def render_card(
     known: frozenset[str] = frozenset(),
 ) -> str:
     """One metric card, or its honest 'not instrumented yet' card."""
-    mid, head = metric.metric_id, metric.headline
+    mid = metric.metric_id
+    if metric.error is not None:
+        return _error_card(mid, metric.error)
+    head = metric.headline
     if head.not_instrumented:
         return _not_instrumented(mid, metric)
     cap = overlay_for(view, mid)
@@ -226,7 +291,7 @@ def render_card(
         takeaway=metric.takeaways[head.name],
         domain=window,
         size=COMBINED,
-        references=_references(metric.compared.get(head.name), view.range_key),
+        references=_references(metric.compared.get(head.name), view.range_key, head),
     )
     combined = line_chart(_chart_series(drawn, has_children), spec, tz)
     panels = _panels(drawn, has_children, known)
@@ -256,14 +321,15 @@ def render_card(
     return (
         f'<article class="{cls}" id="{esc(card_id(mid))}">'
         f"{_flags_html(flag_notes(mid, head))}{combined}{rest}"
-        f"{coverage_note(head, tz)}{multiples}</article>"
+        f"{coverage_note(head, tz)}{_distribution(head, window, tz)}{multiples}</article>"
     )
 
 
 def overlay_for(view: HistoryView, metric_id: str) -> MetricData | None:
     """The cap drawn on ``metric_id``'s chart, when it exists and is instrumented."""
     cap = view.get(OVERLAYS[metric_id]) if metric_id in OVERLAYS else None
-    return cap if cap is not None and not cap.headline.not_instrumented else None
+    ok = cap is not None and cap.error is None and not cap.headline.not_instrumented
+    return cap if ok else None
 
 
 def render_cards(
@@ -271,12 +337,23 @@ def render_cards(
 ) -> str:
     """Every card of the tab in registry order; an overlaid cap is not repeated alone.
 
-    ``known`` is the registry's repo slugs: only those panels link to a repo page."""
+    ``known`` is the registry's repo slugs: only those panels link to a repo page.
+    A card that fails to render degrades to an error card — one bad row must never
+    take down the whole page.
+    """
     overlaid = {
         cap.metric_id
         for m in view.metrics
-        if not m.headline.not_instrumented and (cap := overlay_for(view, m.metric_id))
+        if m.error is None
+        and not m.headline.not_instrumented
+        and (cap := overlay_for(view, m.metric_id))
     }
-    return "".join(
-        render_card(view, m, tz, known) for m in view.metrics if m.metric_id not in overlaid
-    )
+    cards: list[str] = []
+    for m in view.metrics:
+        if m.metric_id in overlaid:
+            continue
+        try:
+            cards.append(render_card(view, m, tz, known))
+        except Exception as exc:  # noqa: BLE001 - a bad card is a value, not a 500
+            cards.append(_error_card(m.metric_id, f"{type(exc).__name__}: {exc}"))
+    return "".join(cards)

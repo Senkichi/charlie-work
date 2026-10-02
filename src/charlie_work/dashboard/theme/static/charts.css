@@ -40,7 +40,10 @@ svg .cov-start { stroke: var(--lj-gray); stroke-width: 1; }
 svg .marker-rule { stroke: var(--lj-ink); stroke-width: 1; }
 /* Reference rules: the two window values the headline compares (prior dashed). */
 svg .ref { stroke: var(--lj-gray-text); stroke-width: 1; }
-svg text.ref-label { paint-order: stroke; stroke: var(--lj-card); stroke-width: 3px; stroke-linejoin: round; }
+/* Annotation labels get a card-coloured halo so a line or rule beneath never muddies them. */
+svg text.ref-label, svg .coverage text.note, svg .marker text.note {
+  paint-order: stroke; stroke: var(--lj-card); stroke-width: 3px; stroke-linejoin: round;
+}
 
 svg .dist .row-label { font-weight: 600; }
 svg .iqr { fill: var(--lj-raised); stroke: var(--lj-rule); }

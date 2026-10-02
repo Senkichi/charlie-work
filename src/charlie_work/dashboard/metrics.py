@@ -60,12 +60,35 @@ TABS: dict[str, dict[str, Metric]] = {
 }
 
 
-def tab_series(db: sqlite3.Connection, tab: str, q: MetricQuery) -> dict[str, tuple[Series, ...]]:
-    """Every metric of one History tab, keyed by metric id."""
-    out: dict[str, tuple[Series, ...]] = {}
+def tab_results(
+    db: sqlite3.Connection, tab: str, q: MetricQuery
+) -> dict[str, tuple[Series, ...] | Exception]:
+    """Every metric of one History tab, keyed by metric id.
+
+    A metric whose stored rows are malformed (``ValueError`` etc.) comes back as its
+    exception, so that card alone degrades; a database-level fault (``sqlite3.Error``)
+    still raises — that is a whole-tab problem, not one row's.
+    """
+    out: dict[str, tuple[Series, ...] | Exception] = {}
     for metric_id, fn in TABS[tab].items():
-        result = fn(db, q)
-        out[metric_id] = result if isinstance(result, tuple) else (result,)
+        try:
+            result = fn(db, q)
+        except sqlite3.Error:
+            raise
+        except Exception as exc:  # noqa: BLE001 - degrade this metric's card, not the tab
+            out[metric_id] = exc
+        else:
+            out[metric_id] = result if isinstance(result, tuple) else (result,)
+    return out
+
+
+def tab_series(db: sqlite3.Connection, tab: str, q: MetricQuery) -> dict[str, tuple[Series, ...]]:
+    """Every metric of one History tab, keyed by metric id — strict: bad rows raise."""
+    out: dict[str, tuple[Series, ...]] = {}
+    for metric_id, result in tab_results(db, tab, q).items():
+        if isinstance(result, Exception):
+            raise result
+        out[metric_id] = result
     return out
 
 

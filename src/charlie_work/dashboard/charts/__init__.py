@@ -7,7 +7,7 @@ drawn in the display zone (host-local by default) with UTC ISO kept in ``<time d
 
 from __future__ import annotations
 
-from .bullet import Bullet, bullet_bar, bullet_bars
+from .bullet import Bullet, bullet_bar, bullet_bars, bullet_svg
 from .line import line_chart
 from .model import Coverage, Distribution, LineSpec, Marker, Panel, Point, Series, Size
 from .multiples import small_multiples
@@ -26,6 +26,7 @@ __all__ = [
     "Size",
     "bullet_bar",
     "bullet_bars",
+    "bullet_svg",
     "line_chart",
     "nice_ticks",
     "small_multiples",
