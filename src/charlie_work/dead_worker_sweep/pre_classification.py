@@ -35,8 +35,6 @@ from typing import Any
 from .. import dead_worker_classification, worker_fate
 from .apply_context import SweepContext
 
-SOURCE = "dead_worker_classification"
-
 
 @dataclass(frozen=True)
 class PreClassifiedDeath:
@@ -74,7 +72,7 @@ def classify_before_fate(ctx: SweepContext, number: int, entry: dict[str, Any]) 
         worker_fate.FailureEvidence(kind=failure.kind, throttled_until=None, fresh=True),
         adapter_kind=adapter_kind,
         now=ctx.now,
-        source=SOURCE,
+        source="dead_worker_classification",
     )
     stamped = stamped_state["issues"][str(number)]
     issues = ctx.state.get("issues")
@@ -103,6 +101,6 @@ def persist_pre_classified(ctx: SweepContext) -> None:
             death.failure,
             adapter_kind=death.adapter_kind,
             now=ctx.now,
-            source=SOURCE,
+            source="dead_worker_classification",
             write_gate=ctx.write_gate,
         )
