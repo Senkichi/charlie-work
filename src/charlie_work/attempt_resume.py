@@ -14,8 +14,9 @@ once, from ``worktree.create_worktree``'s fresh-dispatch branch, after the
 worktree sits on the base and before the worker prompt is written:
 
 1. **Was the last death a provider throttle?** The latest per-issue death event
-   (``session_exited`` / ``session_stalled`` / ``session_failed_relabeled`` /
-   ``session_failed_escalated``) carries the classifier's ``failure_kind``.
+   (``session_exited`` / ``session_stalled``, even when unclassified, which vetoes;
+   follow-up relabel/escalate events only when classified) carries the
+   classifier's ``failure_kind``. A worker launched after that death vetoes too.
    Only :data:`rework_attempt_exemption.PROVIDER_THROTTLE_EXEMPT_KINDS` kinds
    qualify. The issue entry's own ``dead_worker_failure_kind`` stamp is cleared
    at the dispatch claim, before this runs, so the event is the durable record.
@@ -29,12 +30,14 @@ worktree sits on the base and before the worker prompt is written:
    death, so an earlier unrelated attempt's leftovers are never applied.
 3. **Apply it onto the base.** A rescue ref is a snapshot commit of a dirty
    tree, so it is squash-merged and left as uncommitted changes, exactly the
-   state the dead worker had. An attempt ref is a branch tip, so its commits
-   are cherry-picked and keep their authorship.
+   state the dead worker had. An attempt ref is applied the same way. Refs whose
+   diff against the base is empty are skipped, and a rescue ref outranks an
+   attempt ref (it is the superset for the same death).
 
-Every failure (conflict, git error, unreadable ref) restores the clean base and
-returns ``None`` after emitting ``attempt_resume_failed``: the dispatch is never
-blocked or failed. The function never raises.
+Every failure (conflict, git error, unreadable ref, empty ref) restores the clean
+base and returns ``None`` after emitting ``attempt_resume_failed``: the dispatch
+is never blocked. The one exception is :class:`ResumeRestoreError`: if the clean
+base cannot be proven after a failed seed, the caller must tear the worktree down.
 """
 
 from __future__ import annotations
@@ -50,19 +53,24 @@ from .subprocess_runner import run_captured
 
 _TIMEOUT_SECONDS = 120
 RESCUE_REF_PREFIX = "refs/charlie/rescue"
-# Event kinds whose payload carries the classifier's ``failure_kind`` for one
-# dead worker session of one issue.
-DEATH_EVENT_KINDS: tuple[str, ...] = (
-    "session_exited",
-    "session_stalled",
+# Event kinds that record one dead worker session of one issue. A classifying
+# kind is the death record itself, so it counts even with no ``failure_kind``
+# (an unclassified death is still the issue's newest death and must veto).
+CLASSIFYING_DEATH_KINDS: tuple[str, ...] = ("session_exited", "session_stalled")
+# Follow-up events about a death already recorded elsewhere. Without a
+# ``failure_kind`` they say nothing about why the worker died and must not mask
+# the classified death they follow.
+FOLLOW_UP_DEATH_KINDS: tuple[str, ...] = (
     "session_failed_relabeled",
     "session_failed_escalated",
+    "session_failed_relabeled_sweep",
 )
+# Events recording a worker launch; ``issue_numbers`` lists the launched issues.
+LAUNCH_EVENT_KINDS: tuple[str, ...] = ("dispatch", "dispatch_rework")
 
 _RESCUE_NAME = re.compile(r"/issue-(\d+)-(\d{8}T\d{6}\d*Z)$")
 _RESCUE_TS_FORMAT = "%Y%m%dT%H%M%S%fZ"
 _REFLOG_SELECTOR = re.compile(r"@\{(\d+)\}$")
-_IDENTITY = ("-c", "user.name=charlie-work resume", "-c", "user.email=charlie-work@localhost")
 
 
 @dataclass(frozen=True)
@@ -113,28 +121,50 @@ def _epoch(ts: object) -> float | None:
 
 
 def latest_death(state_file: Path, issue_number: int) -> tuple[str, float] | None:
-    """``(failure_kind, epoch)`` of the issue's most recent *classified* worker death."""
+    """``(failure_kind, epoch)`` of the issue's newest worker death.
+
+    ``failure_kind`` is ``""`` when the newest death carries no classification,
+    which never names a throttle: an unclassified death must veto a resume.
+    """
     from .instrumentation import query_events
 
     newest: tuple[float, str] | None = None
-    for kind in DEATH_EVENT_KINDS:
+    for kind in (*CLASSIFYING_DEATH_KINDS, *FOLLOW_UP_DEATH_KINDS):
         for event in query_events(state_file, kind=kind, issue_number=issue_number, limit=200):
             at = _epoch(event.get("ts"))
             payload = event.get("payload")
             if at is None or not isinstance(payload, dict):
                 continue
             failure_kind = payload.get("failure_kind")
-            # An event with no classification says nothing about why the worker
-            # died (e.g. a batch ``session_failed_relabeled_sweep`` or a
-            # follow-up relabel of the same death). It must never mask the
-            # classified death it follows, so only classified events compete.
             if not isinstance(failure_kind, str):
-                continue
+                if kind in FOLLOW_UP_DEATH_KINDS:
+                    continue
+                failure_kind = ""
             if newest is None or at >= newest[0]:
                 newest = (at, failure_kind)
     if newest is None:
         return None
     return newest[1], newest[0]
+
+
+def launched_since(state_file: Path, issue_number: int, since: float) -> bool:
+    """True when a worker was launched for the issue at or after ``since``.
+
+    Event timestamps are whole seconds, so ``>=`` fails safe: a same-second launch
+    is treated as a later one (a clean start) rather than risking a stale resume.
+    """
+    from .instrumentation import query_events
+
+    for kind in LAUNCH_EVENT_KINDS:
+        for event in query_events(state_file, kind=kind, limit=500):
+            at = _epoch(event.get("ts"))
+            payload = event.get("payload")
+            if at is None or at < since or not isinstance(payload, dict):
+                continue
+            issues = payload.get("issue_numbers")
+            if isinstance(issues, list) and issue_number in issues:
+                return True
+    return False
 
 
 def _git(repo: Path, *args: str):
@@ -179,22 +209,30 @@ def _attempt_refs(repo_root: Path, issue_number: int) -> list[PreservedRef]:
     return refs
 
 
-def select_preserved_ref(
+def preserved_ref_candidates(
     repo_root: Path, issue_number: int, *, not_before: float
-) -> PreservedRef | None:
-    """Newest rescue/attempt ref for the issue created at or after ``not_before``."""
+) -> list[PreservedRef]:
+    """Rescue/attempt refs for the issue made at or after ``not_before``, best first.
+
+    A rescue ref outranks any attempt ref: its parent is the worktree HEAD at
+    death and it snapshots the dirty tree, so it is a superset of the attempt ref
+    ``snapshot_attempt_ref`` writes for the same death (whose whole-second reflog
+    time can even read as newer). Within a kind, newest first.
+    """
     # Reflog times are whole seconds; compare at that granularity so a ref made in
     # the same second as the death event is not rejected.
     floor = int(not_before)
-    candidates = [
-        ref
-        for ref in (
-            *_rescue_refs(repo_root, issue_number),
-            *_attempt_refs(repo_root, issue_number),
-        )
-        if int(ref.created_at) >= floor
-    ]
-    return max(candidates, key=lambda ref: ref.created_at, default=None)
+    rescue = sorted(
+        (r for r in _rescue_refs(repo_root, issue_number) if int(r.created_at) >= floor),
+        key=lambda r: r.created_at,
+        reverse=True,
+    )
+    attempt = sorted(
+        (r for r in _attempt_refs(repo_root, issue_number) if int(r.created_at) >= floor),
+        key=lambda r: r.created_at,
+        reverse=True,
+    )
+    return [*rescue, *attempt]
 
 
 def _diff_stats(repo: Path, base: str, ref: str) -> tuple[int, int] | None:
@@ -211,28 +249,45 @@ def _diff_stats(repo: Path, base: str, ref: str) -> tuple[int, int] | None:
     return files, insertions
 
 
+class ResumeRestoreError(RuntimeError):
+    """The worktree could not be returned to the clean base after a failed seed."""
+
+
 def _restore_base(worktree_path: Path, head: str, exclusions: tuple[str, ...]) -> None:
-    """Best-effort return to the exact pre-seed state (never raises)."""
+    """Return to the exact pre-seed state; raise :class:`ResumeRestoreError` if not provable."""
     for argv in (
+        ("merge", "--abort"),
         ("cherry-pick", "--abort"),
         ("reset", "--hard", head),
         ("clean", "-fd", "--", ".", *exclusions),
     ):
-        _git(worktree_path, *argv)
+        _git(worktree_path, *argv)  # the aborts legitimately fail when nothing is in progress
+    now = _git(worktree_path, "rev-parse", "--verify", "HEAD")
+    if not now.ok or now.stdout.strip() != head:
+        raise ResumeRestoreError(f"worktree HEAD is not the base after restore: {now.stdout!r}")
+    status = _git(worktree_path, "status", "--porcelain", "--", ".", *exclusions)
+    if not status.ok or status.stdout.strip():
+        raise ResumeRestoreError(
+            f"worktree not clean after restore: {status.stdout.strip() or status.error}"
+        )
 
 
-def _apply(worktree_path: Path, ref: PreservedRef, merge_base: str) -> str | None:
-    """Apply ``ref`` onto the worktree's HEAD; return a failure reason or None."""
-    if ref.kind == "rescue":
-        merged = _git(worktree_path, "merge", "--squash", ref.name)
-        if not merged.ok:
-            return f"conflict applying rescue snapshot: {merged.error or merged.stderr or merged.stdout}"
-        # Leave the changes unstaged, the dead worker's own state.
-        _git(worktree_path, "reset", "--mixed", "HEAD")
-        return None
-    picked = _git(worktree_path, *_IDENTITY, "cherry-pick", f"{merge_base}..{ref.name}")
-    if not picked.ok:
-        return f"conflict cherry-picking attempt tip: {picked.error or picked.stderr or picked.stdout}"
+def _apply(worktree_path: Path, ref: PreservedRef) -> str | None:
+    """Squash ``ref`` onto the worktree's HEAD, unstaged; return a failure reason or None.
+
+    One path for both ref kinds: a squash merge tolerates merge commits in an
+    attempt branch and commits the base already holds, which a cherry-pick range
+    does not.
+    """
+    merged = _git(worktree_path, "merge", "--squash", ref.name)
+    if not merged.ok:
+        return (
+            f"conflict applying {ref.kind} ref: {merged.error or merged.stderr or merged.stdout}"
+        )
+    # Leave the changes unstaged, the dead worker's own state.
+    unstaged = _git(worktree_path, "reset", "--mixed", "HEAD")
+    if not unstaged.ok:
+        return f"cannot unstage {ref.kind} ref: {unstaged.error or unstaged.stderr}"
     return None
 
 
@@ -291,27 +346,44 @@ def seed_from_throttled_attempt(
         death = latest_death(state_file, issue_number)
         if death is None or not is_provider_throttle_rework_death(death[0]):
             return None
-        ref = select_preserved_ref(repo_root, issue_number, not_before=death[1])
-        if ref is None:
+        # The throttle death must also be the last thing that happened: a worker
+        # launched since then produced the work now in any newer ref.
+        if launched_since(state_file, issue_number, death[1]):
+            return None
+        candidates = preserved_ref_candidates(repo_root, issue_number, not_before=death[1])
+        if not candidates:
             return None
         head_result = _git(worktree_path, "rev-parse", "--verify", "HEAD")
         if not head_result.ok:
             raise RuntimeError(f"cannot resolve worktree HEAD: {head_result.stderr}")
         head = head_result.stdout.strip()
-        base = _git(worktree_path, "merge-base", head, ref.name)
-        if not base.ok or not base.stdout.strip():
-            raise RuntimeError("preserved ref shares no history with the base")
-        merge_base = base.stdout.strip()
-        stats = _diff_stats(worktree_path, merge_base, ref.name)
-        if stats is None:
-            raise RuntimeError("cannot diff the preserved ref")
-        if stats[0] == 0:
-            return None  # an empty snapshot preserves nothing
+        chosen: tuple[PreservedRef, tuple[int, int]] | None = None
+        for candidate in candidates:
+            ref = candidate
+            base = _git(worktree_path, "merge-base", head, candidate.name)
+            if not base.ok or not base.stdout.strip():
+                raise RuntimeError("preserved ref shares no history with the base")
+            stats = _diff_stats(worktree_path, base.stdout.strip(), candidate.name)
+            if stats is None:
+                raise RuntimeError("cannot diff the preserved ref")
+            if stats[0] > 0:
+                chosen = (candidate, stats)
+                break
+        if chosen is None:
+            # An empty snapshot (e.g. an attempt ref with no commits) preserves nothing.
+            raise RuntimeError("empty_ref: every preserved ref is empty against the base")
+        ref, stats = chosen
         exclusions = tuple(f":(exclude){p}" for p in (".venv", *scaffolding))
-        reason = _apply(worktree_path, ref, merge_base)
+        reason = _apply(worktree_path, ref)
         if reason is not None:
-            _restore_base(worktree_path, head, exclusions)
+            try:
+                _restore_base(worktree_path, head, exclusions)
+            except ResumeRestoreError as exc:
+                _emit_resume_failed(state_file, issue_number, ref.name, f"{reason}; {exc}")
+                raise
             raise RuntimeError(reason)
+    except ResumeRestoreError:
+        raise  # never launch a worker on a tree that is not provably the base
     except Exception as exc:  # noqa: BLE001 -- resume must never block a dispatch
         _emit_resume_failed(state_file, issue_number, ref.name if ref else None, str(exc))
         return None
@@ -321,6 +393,7 @@ def seed_from_throttled_attempt(
 
 
 __all__ = [
+    "ResumeRestoreError",
     "ResumedAttempt",
     "apply_resume_notice",
     "render_resume_notice",

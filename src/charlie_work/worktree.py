@@ -29,7 +29,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .attempt_refs import AttemptSnapshot, snapshot_attempt_ref
-from .attempt_resume import ResumedAttempt, seed_from_throttled_attempt
+from .attempt_resume import ResumedAttempt, ResumeRestoreError, seed_from_throttled_attempt
 from .config import (
     OrchestratorConfig,
     RuntimeConfig,
@@ -4026,13 +4026,19 @@ def create_worktree(
     # tree. Best-effort: never raises, never blocks the dispatch.
     resumed_attempt: ResumedAttempt | None = None
     if not rework and (config is None or config.dispatch.resume_throttled_attempts):
-        resumed_attempt = seed_from_throttled_attempt(
-            repo_root,
-            worktree_path,
-            issue_number,
-            state_file=state_file,
-            scaffolding=(*injected_paths, *materialize_dirs),
-        )
+        try:
+            resumed_attempt = seed_from_throttled_attempt(
+                repo_root,
+                worktree_path,
+                issue_number,
+                state_file=state_file,
+                scaffolding=(*injected_paths, *materialize_dirs),
+            )
+        except ResumeRestoreError:
+            # The tree is not provably the base (conflict markers / wrong HEAD):
+            # never launch on it. Same teardown as the other post-add failures.
+            remove_worktree(repo_root, worktree_path, force=True, branch=branch)
+            raise
 
     venv_junction: Path | None = None
     if venv_source is not None:

@@ -8,6 +8,7 @@ Real temporary git repos, no mocks of git: a rescue ref is captured by the real
 
 from __future__ import annotations
 
+import sys
 import time
 from pathlib import Path
 
@@ -40,7 +41,8 @@ def _die(repo_root: Path, config: OrchestratorConfig, failure_kind: str | None) 
         "session_exited",
         {"issue_number": ISSUE, "failure_kind": failure_kind},
     )
-    time.sleep(1.1)  # ref clocks are whole seconds; the ref must post-date the death
+    # No sleep needed: selection compares at whole-second granularity, so a ref
+    # made in the same second as the death event still belongs to it.
 
 
 def _worker_dirty_tree(repo_root: Path) -> Path:
@@ -108,9 +110,10 @@ def test_throttle_death_resumes_from_attempt_ref_commits(repo: Path) -> None:
     assert info2.resumed_attempt is not None
     assert info2.resumed_attempt.ref == snap.ref_name
     assert info2.resumed_attempt.ref_kind == "attempt"
-    # A branch tip is cherry-picked: the worker's commit survives.
+    # A branch tip is squash-merged like a rescue ref: the content is there,
+    # as uncommitted work on top of the base.
     assert (info2.path / "feature.py").read_text(encoding="utf-8") == "print('x')\n"
-    assert _git(info2.path, "log", "-1", "--format=%s").stdout.strip() == "worker commit"
+    assert _git(info2.path, "rev-parse", "HEAD").stdout == _git(repo, "rev-parse", "main").stdout
     [event] = _events(repo, config, "attempt_resumed")
     assert event["payload"]["ref_kind"] == "attempt"
 
@@ -240,7 +243,11 @@ def test_kindless_follow_up_events_cannot_mask_the_throttle_death(repo: Path) ->
         "session_failed_relabeled_sweep",
         {"issue_number": ISSUE, "failure_kind": None},
     )
-    log_event(state_file, "session_exited", {"issue_number": ISSUE, "failure_kind": None})
+    log_event(
+        state_file,
+        "session_failed_escalated",
+        {"issue_number": ISSUE, "failure_kind": None},
+    )
 
     info = create_worktree(repo, BRANCH, base_ref="HEAD", issue_number=ISSUE, config=config)
 
@@ -262,3 +269,195 @@ def test_later_classified_non_throttle_death_vetoes_the_resume(repo: Path) -> No
     info = create_worktree(repo, BRANCH, base_ref="HEAD", issue_number=ISSUE, config=config)
 
     assert info.resumed_attempt is None
+
+
+def test_kindless_session_exited_is_an_unclassified_death_and_vetoes(repo: Path) -> None:
+    """A death with no classification is still the newest death (S1)."""
+    config = OrchestratorConfig()
+    wt = _worker_dirty_tree(repo)
+    _die(repo, config, "rate_limited")
+    _rescue(repo, wt)
+    log_event(
+        _state_file(repo, config),
+        "session_exited",
+        {"issue_number": ISSUE, "failure_kind": None},
+    )
+
+    info = create_worktree(repo, BRANCH, base_ref="HEAD", issue_number=ISSUE, config=config)
+
+    assert info.resumed_attempt is None
+    assert not (info.path / "work.txt").exists()
+
+
+def test_old_throttle_death_cannot_authorize_a_later_workers_work(repo: Path) -> None:
+    """T0 throttle death -> T1 resumed redispatch -> T2 worker B dies unclassified
+    -> T3 fresh dispatch must NOT apply B's work as a rate-limit resume."""
+    config = OrchestratorConfig()
+    state_file = _state_file(repo, config)
+    wt_a = _worker_dirty_tree(repo)
+    _die(repo, config, "rate_limited")  # T0
+    _rescue(repo, wt_a)
+    resumed = create_worktree(repo, BRANCH, base_ref="HEAD", issue_number=ISSUE, config=config)
+    assert resumed.resumed_attempt is not None  # T1
+    log_event(state_file, "dispatch", {"issue_numbers": [ISSUE]})
+    # Worker B edits further, then dies with NO death event at all (e.g. the
+    # decide_stalled handoff skipped classification) and only a kind-less relabel.
+    (resumed.path / "b_work.txt").write_text("worker B\n", encoding="utf-8")
+    ref_b = _rescue(repo, resumed.path)  # T2
+    log_event(state_file, "session_failed_relabeled", {"issue_number": ISSUE})
+
+    info = create_worktree(repo, BRANCH, base_ref="HEAD", issue_number=ISSUE, config=config)  # T3
+
+    assert info.resumed_attempt is None
+    assert not (info.path / "b_work.txt").exists()
+    assert _git(repo, "rev-parse", "--verify", ref_b).returncode == 0
+
+
+def test_launch_after_the_throttle_death_vetoes_even_without_a_newer_death(repo: Path) -> None:
+    config = OrchestratorConfig()
+    wt = _worker_dirty_tree(repo)
+    _die(repo, config, "rate_limited")
+    _rescue(repo, wt)
+    log_event(_state_file(repo, config), "dispatch_rework", {"issue_numbers": [ISSUE]})
+
+    info = create_worktree(repo, BRANCH, base_ref="HEAD", issue_number=ISSUE, config=config)
+
+    assert info.resumed_attempt is None
+
+
+def test_empty_attempt_snapshot_cannot_beat_the_rescue_ref(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B1: ``create_worktree`` captures the rescue ref, removes the worktree, then
+    snapshots the attempt ref. If removal crosses a second boundary the (whole
+    second) attempt reflog reads newer, and the attempt ref can be empty or a
+    subset. The real capture-then-snapshot sequence, with a forced ~1s gap."""
+    from charlie_work import worktree as worktree_module
+
+    config = OrchestratorConfig()
+    info1 = create_worktree(repo, BRANCH, base_ref="HEAD", issue_number=ISSUE)
+    (info1.path / "committed.txt").write_text("committed\n", encoding="utf-8")
+    _git(info1.path, "add", "committed.txt")
+    _git(info1.path, "commit", "-m", "worker commit")
+    (info1.path / "work.txt").write_text("uncommitted work\n", encoding="utf-8")
+    _die(repo, config, "rate_limited")
+
+    real_remove = worktree_module.remove_worktree
+
+    def slow_remove(*args, **kwargs):
+        time.sleep(1.1)
+        return real_remove(*args, **kwargs)
+
+    monkeypatch.setattr(worktree_module, "remove_worktree", slow_remove)
+
+    info2 = create_worktree(repo, BRANCH, base_ref="HEAD", issue_number=ISSUE, config=config)
+
+    assert info2.rescue_capture is not None and info2.rescue_capture.ref_name is not None
+    assert info2.attempt_snapshot is not None and info2.attempt_snapshot.ref_name is not None
+    assert info2.resumed_attempt is not None
+    assert info2.resumed_attempt.ref == info2.rescue_capture.ref_name
+    assert info2.resumed_attempt.ref_kind == "rescue"
+    assert (info2.path / "work.txt").read_text(encoding="utf-8") == "uncommitted work\n"
+    assert (info2.path / "committed.txt").read_text(encoding="utf-8") == "committed\n"
+
+
+def test_empty_preserved_ref_emits_resume_failed_instead_of_silence(repo: Path) -> None:
+    config = OrchestratorConfig()
+    info1 = create_worktree(repo, BRANCH, base_ref="HEAD", issue_number=ISSUE)
+    _die(repo, config, "rate_limited")
+    snap = snapshot_attempt_ref(repo, BRANCH, ISSUE, base_ref="main")  # 0 commits ahead
+    assert snap.ref_name is not None
+    assert remove_worktree(repo, info1.path, force=True, branch=BRANCH)
+
+    info2 = create_worktree(repo, BRANCH, base_ref="HEAD", issue_number=ISSUE, config=config)
+
+    assert info2.resumed_attempt is None
+    [event] = _events(repo, config, "attempt_resume_failed")
+    assert "empty_ref" in event["payload"]["reason"]
+
+
+def test_attempt_ref_with_a_merge_commit_resumes(repo: Path) -> None:
+    """S3: rework branches carry merge commits; ``base..ref`` cherry-pick fails on them."""
+    config = OrchestratorConfig()
+    info1 = create_worktree(repo, BRANCH, base_ref="HEAD", issue_number=ISSUE)
+    (info1.path / "a.txt").write_text("a\n", encoding="utf-8")
+    _git(info1.path, "add", "a.txt")
+    _git(info1.path, "commit", "-m", "A")
+    _git(info1.path, "checkout", "-b", "side", "main")
+    (info1.path / "b.txt").write_text("b\n", encoding="utf-8")
+    _git(info1.path, "add", "b.txt")
+    _git(info1.path, "commit", "-m", "B")
+    _git(info1.path, "checkout", BRANCH)
+    assert _git(info1.path, "merge", "--no-ff", "-m", "merge side", "side").returncode == 0
+    _die(repo, config, "rate_limited")
+    snap = snapshot_attempt_ref(repo, BRANCH, ISSUE, base_ref="main")
+    assert snap.ref_name is not None
+    assert remove_worktree(repo, info1.path, force=True, branch=BRANCH)
+
+    info2 = create_worktree(repo, BRANCH, base_ref="HEAD", issue_number=ISSUE, config=config)
+
+    assert info2.resumed_attempt is not None
+    assert info2.resumed_attempt.ref_kind == "attempt"
+    assert (info2.path / "a.txt").read_text(encoding="utf-8") == "a\n"
+    assert (info2.path / "b.txt").read_text(encoding="utf-8") == "b\n"
+
+
+def test_unprovable_restore_raises_and_tears_the_worktree_down(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """S2: never launch on a tree that may hold conflict markers or a wrong HEAD."""
+    from charlie_work import attempt_resume
+
+    config = OrchestratorConfig()
+    wt = _worker_dirty_tree(repo)
+    _die(repo, config, "rate_limited")
+    _rescue(repo, wt)
+    # Conflict at apply time, so a restore is attempted...
+    (repo / "README.md").write_text("upstream readme change\n", encoding="utf-8")
+    _git(repo, "add", "README.md")
+    _git(repo, "commit", "-m", "upstream change")
+    # ...and the restore's hard reset silently does nothing.
+    real_git = attempt_resume._git
+
+    def broken_reset(repo_path, *args):
+        if args[:2] == ("reset", "--hard"):
+            return real_git(repo_path, "rev-parse", "--git-dir")
+        return real_git(repo_path, *args)
+
+    monkeypatch.setattr(attempt_resume, "_git", broken_reset)
+
+    with pytest.raises(attempt_resume.ResumeRestoreError):
+        create_worktree(repo, BRANCH, base_ref="HEAD", issue_number=ISSUE, config=config)
+
+    assert _events(repo, config, "attempt_resume_failed")
+    listing = _git(repo, "worktree", "list", "--porcelain").stdout
+    assert "issue-2289" not in listing
+
+
+def test_launch_claude_worker_puts_the_resume_notice_in_the_prompt_file(repo: Path) -> None:
+    """Adapter level: real seeded worktree, real prompt file."""
+    from charlie_work.claude_code import PROMPT_FILENAME, launch_claude_worker
+
+    config = OrchestratorConfig()
+    wt = _worker_dirty_tree(repo)
+    _die(repo, config, "rate_limited")
+    ref = _rescue(repo, wt)
+    script = repo.parent / "fake_claude.py"
+    script.write_text("import sys\nsys.exit(0)\n", encoding="utf-8")
+
+    record = launch_claude_worker(
+        ISSUE,
+        BRANCH,
+        "Implement the issue.",
+        repo_root=repo,
+        sessions_dir=repo.parent / "sessions",
+        command_template=(sys.executable, str(script)),
+        config=config,
+    )
+
+    assert record.error is None
+    prompt = (Path(record.worktree_path) / PROMPT_FILENAME).read_text(encoding="utf-8")
+    assert prompt.startswith("Implement the issue.")
+    assert "Continue that work" in prompt
+    assert ref in prompt
+    assert (Path(record.worktree_path) / "work.txt").exists()
