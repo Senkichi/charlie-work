@@ -57,6 +57,7 @@ from .throttle_signatures import (
     match_quota_tail,
     match_throttle_tail,
 )
+from .attempt_resume import apply_resume_notice
 from .worktree import (
     LiveWorkerRedispatchError,
     ReworkBranchConflictError,
@@ -1147,6 +1148,11 @@ def launch_claude_worker(
     # closed (see worktree.ReworkMergeConflict).
     if worktree.rework_conflict is not None:
         prompt_text = apply_rework_conflict_notice(prompt_text, worktree.rework_conflict)
+
+    # Issue #2289: the worktree was seeded from a throttle-killed attempt's
+    # preserved work -- tell the worker to continue it, not restart.
+    if worktree.resumed_attempt is not None:
+        prompt_text = apply_resume_notice(prompt_text, worktree.resumed_attempt)
 
     def _teardown_on_launch_failure() -> None:
         # Review checkouts live in their own PR-keyed dir, never worktrees_dir,

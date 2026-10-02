@@ -29,6 +29,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .attempt_refs import AttemptSnapshot, snapshot_attempt_ref
+from .attempt_resume import ResumedAttempt, seed_from_throttled_attempt
 from .config import (
     OrchestratorConfig,
     RuntimeConfig,
@@ -378,6 +379,10 @@ class WorktreeInfo:
     # removal, janitor sweeps) must leave it on disk. Writer-marker cleanup
     # still applies to markers this session wrote.
     foreign_adopted: bool = False
+    # Issue #2289: set when a fresh redispatch was seeded from the work a
+    # provider-throttle death preserved (see attempt_resume). The adapters append
+    # the "continue, do not restart" notice to the worker prompt.
+    resumed_attempt: ResumedAttempt | None = None
 
 
 class WorktreeState(str, Enum):
@@ -4014,6 +4019,21 @@ def create_worktree(
                     f"git worktree add failed for branch {branch!r}: {result.error or result.stderr}"
                 )
 
+    # Issue #2289: a fresh dispatch (not a rework/recovery attach of existing
+    # work) whose previous attempt died of a provider throttle starts from that
+    # death's preserved work instead of the bare base. Runs before the venv
+    # junction and materialized dirs exist so a failed seed restores a pristine
+    # tree. Best-effort: never raises, never blocks the dispatch.
+    resumed_attempt: ResumedAttempt | None = None
+    if not rework and (config is None or config.dispatch.resume_throttled_attempts):
+        resumed_attempt = seed_from_throttled_attempt(
+            repo_root,
+            worktree_path,
+            issue_number,
+            state_file=state_file,
+            scaffolding=(*injected_paths, *materialize_dirs),
+        )
+
     venv_junction: Path | None = None
     if venv_source is not None:
         venv_link = worktree_path / ".venv"
@@ -4052,6 +4072,7 @@ def create_worktree(
         materialized_paths=tuple(materialized_paths),
         rework_conflict=rework_conflict,
         rescue_capture=rescue_capture,
+        resumed_attempt=resumed_attempt,
     )
 
 
