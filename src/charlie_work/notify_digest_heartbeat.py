@@ -42,11 +42,13 @@ reached.
 
 from __future__ import annotations
 
-import json
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Protocol
+
+from charlie_work.heartbeat_alarms import emit
+from charlie_work.heartbeat_alarms_fleet import eval_notify_digest
 
 NOTIFY_RESOLUTION_EVENT_KIND = "notify_resolution"
 NOTIFY_DIGEST_STALE_EVENT_KIND = "notify_digest_stale"
@@ -78,6 +80,9 @@ def check_notify_digest_freshness(
     stale_hours: int,
 ) -> None:
     """Flag an enabled file sink whose digest is dead.
+
+    The verdict is ``heartbeat_alarms_fleet.eval_notify_digest``; this reads the
+    rows and injects the file probe.
 
     Reads the FLEET-level ``events.db`` (the sibling of
     ``supervisor-heartbeat.json`` directly under ``fleet_dir`` that
@@ -128,83 +133,13 @@ def check_notify_digest_freshness(
     finally:
         conn.close()
 
-    stale_cutoff = now - timedelta(hours=stale_hours)
-    # An unparseable ts fails toward visibility (counted as recent), the
-    # same polarity check_wedge_kill_loop uses for the same ambiguous case.
-    recent_stale_ts = [
-        ts for (ts,) in stale_rows if (parse_iso(ts) is None or parse_iso(ts) >= stale_cutoff)
-    ]
-    stale_fact = f"stale_events_{stale_hours}h={len(recent_stale_ts)}"
-
-    if res_row is None:
-        report.warn(
-            check,
-            "no notify_resolution event yet -- the supervisor predates this "
-            f"instrumentation or died before its startup report ({stale_fact})",
-        )
-        return
-    res_ts_raw, res_payload_raw = res_row
-    try:
-        resolution = json.loads(res_payload_raw) if isinstance(res_payload_raw, str) else None
-    except json.JSONDecodeError:
-        resolution = None
-    if not isinstance(resolution, dict):
-        report.warn(
-            check,
-            f"latest notify_resolution payload is not a JSON object: "
-            f"{str(res_payload_raw)[:120]!r}",
-        )
-        return
-    res_ts = parse_iso(res_ts_raw if isinstance(res_ts_raw, str) else None)
-    res_fact = f"resolved at {(res_ts.isoformat() if res_ts else res_ts_raw)}"
-
-    if not resolution.get("enabled"):
-        report.warn(
-            check,
-            "supervisor resolved notify enabled=false -- the digest writer "
-            "is off. If this fleet opted in to notifications, its notify: "
-            f"block was lost ({res_fact}; {stale_fact})",
-        )
-        return
-
-    sink = str(resolution.get("sink") or "file").lower()
-    if sink != "file":
-        report.ok(check, f"enabled with sink={sink} (no digest file to tail; {res_fact})")
-        return
-
-    resolved_raw = resolution.get("resolved_file_path")
-    if resolution.get("file_path_empty") or not isinstance(resolved_raw, str) or not resolved_raw:
-        report.anom(
-            check,
-            "enabled with sink=file but file_path is unset -- every emit "
-            "fails 'file_path is empty' (per the supervisor's own "
-            f"notify_resolution event; {res_fact})",
-        )
-        return
-
-    digest_path = Path(resolved_raw)
-    probe = ndc.probe_digest_file(digest_path, now=now, parse_iso=parse_iso)
-    if probe.error is not None:
-        report.anom(check, f"{digest_path} unreadable: {probe.error} ({stale_fact})")
-        return
-    if not probe.exists:
-        report.anom(
-            check,
-            f"notify enabled but {digest_path} does not exist -- the writer "
-            f"has never landed a line ({res_fact}; {stale_fact})",
-        )
-        return
-
-    age_hours = probe.age_hours if probe.age_hours is not None else 0.0
-    facts = (
-        f"last entry {age_hours:.1f}h old ({probe.age_source}); "
-        f"threshold={stale_hours}h path={digest_path}; {stale_fact}"
+    emit(
+        report,
+        eval_notify_digest(
+            res_row,
+            [ts for (ts,) in stale_rows],
+            now,
+            stale_hours,
+            lambda path: ndc.probe_digest_file(path, now=now, parse_iso=parse_iso),
+        ),
     )
-    if age_hours > stale_hours:
-        report.anom(
-            check,
-            f"notify digest writer looks dead: {facts} -- the enabled file "
-            "sink has produced nothing past the staleness bound",
-        )
-    else:
-        report.ok(check, facts)

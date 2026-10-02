@@ -346,10 +346,18 @@ def _stale_ci_pr(pr_number: int, issue_number: int, head: str) -> dict[str, Any]
 
 
 def _test_adequacy_app(
-    tmp_path: Path, *, enabled: bool, max_rework_cycles: int = 2
+    tmp_path: Path,
+    *,
+    enabled: bool,
+    max_rework_cycles: int = 2,
+    min_product_lines: int = 10,
 ) -> OrchestratorApp:
     config = OrchestratorConfig(
-        test_adequacy=TestAdequacyConfig(enabled=enabled, exempt_marker="Test-exempt:"),
+        test_adequacy=TestAdequacyConfig(
+            enabled=enabled,
+            exempt_marker="Test-exempt:",
+            min_product_lines=min_product_lines,
+        ),
         review=ReviewConfig(max_rework_cycles=max_rework_cycles),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)

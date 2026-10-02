@@ -107,6 +107,7 @@ from .config_deprecations import emit_deprecated_key_reads, repo_state_path
 # ``config.py`` wires the dataclass into ``OrchestratorConfig`` and delegates
 # parsing (including the legacy ``supervisor.<key>`` fallback) to it.
 from .test_slots import SlotPoolConfig  # noqa: F401  (deliberate re-export)
+from .dashboard.config import DashboardConfig  # noqa: F401  (deliberate re-export)
 from .fleet_supervisor_config import (  # noqa: F401  (deliberate re-export)
     FleetSupervisorConfig,
     parse_fleet_supervisor,
@@ -2536,6 +2537,8 @@ class OrchestratorConfig:
     )
     # One machine, one slot pool (issue #2124): host-wide like the runner sections.
     test_slots: Annotated[SlotPoolConfig, HostWideOnly] = field(default_factory=SlotPoolConfig)
+    # One dashboard per machine (ADR-0008): host-wide like the fleet supervisor.
+    dashboard: Annotated[DashboardConfig, HostWideOnly] = field(default_factory=DashboardConfig)
     post_mortem: PostMortemConfig = field(default_factory=PostMortemConfig)
     heartbeat: HeartbeatConfig = field(default_factory=HeartbeatConfig)
 

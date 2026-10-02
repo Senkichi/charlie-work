@@ -13,7 +13,6 @@ from unittest.mock import MagicMock, patch
 from _fleet_dispatch_fixtures import (
     SUPERVISOR_BEAT_AT,
     SUPERVISOR_STARTED_AT,
-    _FakeClock,
     _drained_fleet_result,
     _patch_ci_fleet_dirty_for_hermetic_tests as _patch_ci_fleet_dirty_for_hermetic_tests,
     _patch_self_deploy_for_fleet_tests as _patch_self_deploy_for_fleet_tests,
@@ -27,6 +26,7 @@ from charlie_work.fleet_dispatch import (
     _emit_fleet_transition,
     run_fleet_supervise,
 )
+from charlie_work.host.fakes import FakeClock
 from charlie_work.notify import AttentionEntry
 from charlie_work.supervise import SelfDeployResult
 
@@ -86,8 +86,8 @@ def test_supervisor_lifecycle_clean_exit_does_not_alert(
     mock_fleet_loop.return_value = _drained_fleet_result()
 
     with patch("charlie_work.fleet_dispatch._emit_fleet_transition") as mock_emit:
-        fc = _FakeClock(auto_advance=1.0)
-        run_fleet_supervise(max_passes=1, clock=fc.now, sleep=fc.sleep)
+        fc = FakeClock(auto_advance=1.0)
+        run_fleet_supervise(max_passes=1, clock=fc.monotonic, sleep=fc.sleep)
 
     # The autouse fixture's self-deploy no-op emits its own OK transition
     # unconditionally on every successful self-deploy (issue #817 fix, main-side
@@ -126,8 +126,8 @@ def test_supervisor_lifecycle_detects_and_records_prior_abnormal_exit(
     )
     mock_fleet_loop.return_value = _drained_fleet_result()
 
-    fc = _FakeClock(auto_advance=1.0)
-    run_fleet_supervise(max_passes=1, clock=fc.now, sleep=fc.sleep)
+    fc = FakeClock(auto_advance=1.0)
+    run_fleet_supervise(max_passes=1, clock=fc.monotonic, sleep=fc.sleep)
 
     mocks["detect_prior_abnormal_exit"].assert_called_once()
     mocks["record_prior_abnormal_exit"].assert_called_once()
@@ -188,8 +188,8 @@ def test_supervisor_lifecycle_head_drift_exit_reason(
     # Force the external HEAD-drift branch by making read_head_sha diverge.
     with patch("charlie_work.fleet_dispatch.read_head_sha") as mock_head:
         mock_head.side_effect = ["aaa", "bbb"]  # startup_head, then current_head
-        fc = _FakeClock(auto_advance=1.0)
-        result = run_fleet_supervise(max_passes=5, clock=fc.now, sleep=fc.sleep)
+        fc = FakeClock(auto_advance=1.0)
+        result = run_fleet_supervise(max_passes=5, clock=fc.monotonic, sleep=fc.sleep)
 
     assert result.ok is True
     mocks["record_supervisor_exit"].assert_called_once()
@@ -215,8 +215,8 @@ def test_supervisor_lifecycle_keyboard_interrupt_reason(
     )
     mock_fleet_loop.side_effect = [_drained_fleet_result(), KeyboardInterrupt]
 
-    fc = _FakeClock(auto_advance=1.0)
-    run_fleet_supervise(max_passes=5, clock=fc.now, sleep=fc.sleep)
+    fc = FakeClock(auto_advance=1.0)
+    run_fleet_supervise(max_passes=5, clock=fc.monotonic, sleep=fc.sleep)
 
     mocks["record_supervisor_exit"].assert_called_once()
     exit_kwargs = mocks["record_supervisor_exit"].call_args.kwargs
@@ -270,8 +270,8 @@ def test_supervisor_lifecycle_prior_exit_alerts_when_notify_enabled(
     mock_fleet_loop.return_value = _drained_fleet_result()
 
     with patch("charlie_work.fleet_dispatch._emit_fleet_transition") as mock_emit:
-        fc = _FakeClock(auto_advance=1.0)
-        run_fleet_supervise(max_passes=1, clock=fc.now, sleep=fc.sleep)
+        fc = FakeClock(auto_advance=1.0)
+        run_fleet_supervise(max_passes=1, clock=fc.monotonic, sleep=fc.sleep)
 
     # The prior-exit ERROR transition is emitted.
     prior_emit = [
@@ -325,8 +325,8 @@ def test_supervisor_lifecycle_records_started_and_clean_exit(
     )
     mock_fleet_loop.return_value = _drained_fleet_result()
 
-    fc = _FakeClock(auto_advance=1.0)
-    result = run_fleet_supervise(max_passes=2, clock=fc.now, sleep=fc.sleep)
+    fc = FakeClock(auto_advance=1.0)
+    result = run_fleet_supervise(max_passes=2, clock=fc.monotonic, sleep=fc.sleep)
 
     assert result.ok is True
     mocks["record_supervisor_started"].assert_called_once()
@@ -403,8 +403,8 @@ def test_supervisor_lifecycle_self_deploy_head_move_reason(
             message="moved",
         ),
     ):
-        fc = _FakeClock(auto_advance=1.0)
-        result = run_fleet_supervise(max_passes=5, clock=fc.now, sleep=fc.sleep)
+        fc = FakeClock(auto_advance=1.0)
+        result = run_fleet_supervise(max_passes=5, clock=fc.monotonic, sleep=fc.sleep)
 
     assert result.ok is True
     mocks["record_supervisor_exit"].assert_called_once()
@@ -463,11 +463,11 @@ def test_run_fleet_supervise_wires_fleet_supervisor_knobs(
     )
     monkeypatch.setattr("charlie_work.fleet_dispatch.self_deploy", deploy_mock)
 
-    fc = _FakeClock(auto_advance=1.0)
+    fc = FakeClock(auto_advance=1.0)
     result = run_fleet_supervise(
         max_passes=1,
         fleet_dir_override=str(tmp_path / "fleet"),
-        clock=fc.now,
+        clock=fc.monotonic,
         sleep=fc.sleep,
     )
 

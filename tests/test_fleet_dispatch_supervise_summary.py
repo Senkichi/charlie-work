@@ -11,7 +11,6 @@ import logging
 from unittest.mock import MagicMock, patch
 import pytest
 from _fleet_dispatch_fixtures import (
-    _FakeClock,
     _drained_fleet_result,
     _failed_fleet_result,
     _mixed_fleet_result,
@@ -23,6 +22,7 @@ from charlie_work.config import (
     SupervisorConfig,
 )
 from charlie_work.fleet_dispatch import run_fleet_supervise
+from charlie_work.host.fakes import FakeClock
 
 
 @patch("charlie_work.fleet_dispatch.fleet_loop")
@@ -52,8 +52,8 @@ def test_run_fleet_supervise_final_summary_splits_errored_from_conditions(
         errored={"owner/repo2": "fleet pass error: RuntimeError: boom"},
     )
 
-    fc = _FakeClock(auto_advance=1.0)
-    result = run_fleet_supervise(max_passes=1, clock=fc.now, sleep=fc.sleep)
+    fc = FakeClock(auto_advance=1.0)
+    result = run_fleet_supervise(max_passes=1, clock=fc.monotonic, sleep=fc.sleep)
 
     assert "1 errored" in result.message
     assert "1 with conditions" in result.message
@@ -92,8 +92,8 @@ def test_run_fleet_supervise_pass_summary_all_errored(
         }
     )
 
-    fc = _FakeClock(auto_advance=1.0)
-    run_fleet_supervise(max_passes=1, clock=fc.now, sleep=fc.sleep)
+    fc = FakeClock(auto_advance=1.0)
+    run_fleet_supervise(max_passes=1, clock=fc.monotonic, sleep=fc.sleep)
 
     captured = capsys.readouterr()
     summary_lines = [line for line in captured.out.splitlines() if "fleet pass 1:" in line]
@@ -123,8 +123,8 @@ def test_run_fleet_supervise_pass_summary_bounds_long_reason(
     huge_reason = "x" * 5000
     mock_fleet_loop.return_value = _failed_fleet_result({"owner/repo1": huge_reason})
 
-    fc = _FakeClock(auto_advance=1.0)
-    run_fleet_supervise(max_passes=1, clock=fc.now, sleep=fc.sleep)
+    fc = FakeClock(auto_advance=1.0)
+    run_fleet_supervise(max_passes=1, clock=fc.monotonic, sleep=fc.sleep)
 
     captured = capsys.readouterr()
     summary_lines = [line for line in captured.out.splitlines() if "fleet pass 1:" in line]
@@ -157,8 +157,8 @@ def test_run_fleet_supervise_pass_summary_dedupes_repeated_reasons(
         {"owner/repo1": same_reason, "owner/repo2": same_reason}
     )
 
-    fc = _FakeClock(auto_advance=1.0)
-    run_fleet_supervise(max_passes=1, clock=fc.now, sleep=fc.sleep)
+    fc = FakeClock(auto_advance=1.0)
+    run_fleet_supervise(max_passes=1, clock=fc.monotonic, sleep=fc.sleep)
 
     captured = capsys.readouterr()
     summary_lines = [line for line in captured.out.splitlines() if "fleet pass 1:" in line]
@@ -194,8 +194,8 @@ def test_run_fleet_supervise_pass_summary_guards_missing_message(
         {"owner/repo1": None, "owner/repo2": "", "owner/repo3": "   "}
     )
 
-    fc = _FakeClock(auto_advance=1.0)
-    result = run_fleet_supervise(max_passes=1, clock=fc.now, sleep=fc.sleep)
+    fc = FakeClock(auto_advance=1.0)
+    result = run_fleet_supervise(max_passes=1, clock=fc.monotonic, sleep=fc.sleep)
 
     assert result.ok is True  # the supervisor loop itself must not crash
     captured = capsys.readouterr()
@@ -243,8 +243,8 @@ def test_run_fleet_supervise_pass_summary_includes_failure_reason(
         {"owner/repo1": "loop completed with 2 PR error(s)"}
     )
 
-    fc = _FakeClock(auto_advance=1.0)
-    run_fleet_supervise(max_passes=1, clock=fc.now, sleep=fc.sleep)
+    fc = FakeClock(auto_advance=1.0)
+    run_fleet_supervise(max_passes=1, clock=fc.monotonic, sleep=fc.sleep)
 
     captured = capsys.readouterr()
     summary_lines = [line for line in captured.out.splitlines() if "fleet pass 1:" in line]
@@ -282,9 +282,9 @@ def test_run_fleet_supervise_pass_summary_logs_non_ok_reason_at_warning(
         conditions={"owner/repo1": "loop completed with 2 PR error(s)"},
     )
 
-    fc = _FakeClock(auto_advance=1.0)
+    fc = FakeClock(auto_advance=1.0)
     with caplog.at_level(logging.WARNING, logger="charlie_work.fleet_dispatch"):
-        run_fleet_supervise(max_passes=1, clock=fc.now, sleep=fc.sleep)
+        run_fleet_supervise(max_passes=1, clock=fc.monotonic, sleep=fc.sleep)
 
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert any(
@@ -312,8 +312,8 @@ def test_run_fleet_supervise_pass_summary_silent_when_all_ok(
     )
     mock_fleet_loop.return_value = _drained_fleet_result()
 
-    fc = _FakeClock(auto_advance=1.0)
-    run_fleet_supervise(max_passes=1, clock=fc.now, sleep=fc.sleep)
+    fc = FakeClock(auto_advance=1.0)
+    run_fleet_supervise(max_passes=1, clock=fc.monotonic, sleep=fc.sleep)
 
     captured = capsys.readouterr()
     summary_lines = [line for line in captured.out.splitlines() if "fleet pass 1:" in line]
@@ -357,8 +357,8 @@ def test_run_fleet_supervise_pass_summary_splits_errored_from_conditions(
         errored={"owner/repo2": "fleet pass error: RuntimeError: boom"},
     )
 
-    fc = _FakeClock(auto_advance=1.0)
-    run_fleet_supervise(max_passes=1, clock=fc.now, sleep=fc.sleep)
+    fc = FakeClock(auto_advance=1.0)
+    run_fleet_supervise(max_passes=1, clock=fc.monotonic, sleep=fc.sleep)
 
     captured = capsys.readouterr()
     summary_lines = [line for line in captured.out.splitlines() if "fleet pass 1:" in line]

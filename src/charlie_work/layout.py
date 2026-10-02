@@ -365,6 +365,7 @@ FLEET_LOCK_HOLDER_FILENAME = "fleet.lock.holder"
 FLEET_SUPERVISOR_LOCK_FILENAME = "fleet-supervisor.lock"
 FLEET_STOP_REQUEST_FILENAME = "fleet-stop-request.json"
 FLEET_PAUSE_FILENAME = "fleet-pause.json"
+DASHBOARD_DB_FILENAME = "dashboard.db"
 NOTIFY_HEALTH_STATE_FILENAME = "notify_health_state.json"
 CAPACITY_STARVATION_STATE_FILENAME = "capacity_starvation_state.json"
 CONFIG_RETIREMENT_STATE_FILENAME = "config_retirement_state.json"
@@ -468,6 +469,15 @@ def fleet_pause_path(override: str | None = None) -> Path:
     suite pins the two together.
     """
     return fleet_dir(override=override) / FLEET_PAUSE_FILENAME
+
+
+def dashboard_db_path(override: str | None = None) -> Path:
+    """Return the dashboard's derived SQLite cache path in the fleet dir (ADR-0008).
+
+    ``charlie dashboard`` is the only writer. The file is a rebuildable cache of
+    read-only fleet sources, so deleting it loses nothing.
+    """
+    return fleet_dir(override=override) / DASHBOARD_DB_FILENAME
 
 
 def notify_health_state_path(override: str | None = None) -> Path:

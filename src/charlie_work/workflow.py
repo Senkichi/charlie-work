@@ -859,8 +859,10 @@ def render_test_adequacy_summary(verdict: TestAdequacyVerdict, exempt_marker: st
         f"Test adequacy check failed: {added_loc} lines of product code added "
         f"but no test files changed.\n\n"
         f"Untested product files:\n{file_list}\n\n"
-        f"To exempt this PR from the test-adequacy gate, add "
-        f"'{exempt_marker} <reason>' to the PR body with a clear justification."
+        f"To exempt this PR from the test-adequacy gate, add a "
+        f"'{exempt_marker} <reason>' trailer to a commit (an empty commit is fine: "
+        f"`git commit --allow-empty` with the trailer as the last paragraph), "
+        f"or add the line to the PR body, with a clear justification."
     )
 
 
@@ -3623,7 +3625,15 @@ class OrchestratorApp:
         test_adequacy_section = ""
         test_adequacy_verdict = None
         if self.config.test_adequacy.enabled:
-            test_adequacy_verdict = check_test_adequacy(diff, pr, self.config.test_adequacy)
+            # Issue #2220: commit trailers are the exemption channel a worker
+            # can actually write (no GitHub token => no PR-body edits).
+            pr_commits = self.gh.pr_commits(pr_number) or []
+            test_adequacy_verdict = check_test_adequacy(
+                diff,
+                pr,
+                self.config.test_adequacy,
+                [str((c.get("commit") or {}).get("message") or "") for c in pr_commits],
+            )
             if not test_adequacy_verdict.ok:
                 # Same terminal label set as an LLM request_changes:
                 # {in_progress} -> review_started -> {in_progress,pr_open,reviewing}
