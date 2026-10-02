@@ -63,6 +63,8 @@ class SweepContext:
         default_factory=lambda: {"live_handoff": {}, "no_pr": {}, "swept": {}}
     )
     scope_context: tuple[frozenset[str], str] | None = None
+    # Issue #2274: pre-phase log classifications, persisted once under the lock.
+    pre_classified: dict[int, Any] = field(default_factory=dict)
 
     def issue_entry(self, number: int) -> dict[str, Any]:
         entry = (self.state.get("issues") or {}).get(str(number), {})

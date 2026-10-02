@@ -8,6 +8,7 @@ from typing import Any, Callable
 
 from . import launch_events, layout
 from .config import ApiWorkerConfig, OrchestratorConfig
+from .dead_sidecar_guard import classify_dead_sidecars
 from .harnesses import WORKER_HARNESSES
 from .subprocess_runner import run_captured
 
@@ -248,6 +249,8 @@ def dispatch_sessions(
                 for request in requests
             ]
         else:
+            for request in requests:  # #2274: before any launch can overwrite the sidecar
+                classify_dead_sidecars(sessions_dir, request.issue_number, settings.config)
             results = dispatcher(repo_root, requests, sessions_dir, settings)
     write_session_results(results_path, results)
     return results
