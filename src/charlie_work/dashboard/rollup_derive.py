@@ -57,8 +57,12 @@ def _dispatch(ev: dict) -> list[Row]:
 
 
 def _dispatch_rework(ev: dict) -> list[Row]:
+    """One row per reworked issue. A batch event carries ONE ``pr_number``: the first
+    *selected* issue's PR (state_dispatch_rework), which need not be the first listed one,
+    so no batch member can be told it is theirs -- only a lone issue gets the PR. Tagging
+    every member with it merged another issue's PR into their timelines (W3-02)."""
     issues = _ints(ev["payload"].get("issue_numbers")) or [ev["issue_number"]]
-    pr = ev["payload"].get("pr_number", ev["pr_number"])
+    pr = ev["payload"].get("pr_number", ev["pr_number"]) if len(issues) == 1 else None
     return [_milestone(ev, "rework_dispatched", i, pr) for i in issues]
 
 
@@ -222,12 +226,45 @@ def _capped(
     return handler
 
 
-HANDLERS: dict[str, Callable[[dict], list[Row]]] = {
-    "dispatch": _dispatch,
-    "dispatch_rework": _dispatch_rework,
+# Handlers whose rows depend only on the event's issue/PR refs, never on other payload
+# fields: exactly the ones a ``<kind>_sweep`` summary (numbers only) can be expanded into.
+REF_ONLY: dict[str, Callable[[dict], list[Row]]] = {
     "worker_handoff_pr_opened": _pr_opened("pr_opened_by_worker", False),
     "orphaned_worker_opened_pr": _pr_opened("pr_opened_by_salvage", True),
     "salvage_pushed_stranded_commits": _pr_opened("pr_opened_by_salvage", False),
+    # The worker died after opening its PR; the sweep moved the issue to PR open. The PR
+    # predates this event, so the stage boundary is approximate.
+    "orphaned_worker_advanced_to_pr_open": _pr_opened("pr_open_after_dead_worker", True),
+}
+
+SWEEP_SUFFIX = "_sweep"
+
+
+def _sweep(handler: Callable[[dict], list[Row]]) -> Callable[[dict], list[Row]]:
+    """Expand a ``<kind>_sweep`` summary into the per-issue rows of ``<kind>``.
+
+    The reaper folds several same-kind events of one pass into a single summary that keeps
+    only ``issue_numbers`` (or ``pr_numbers``) plus a count (stalled_review_reap), so the
+    per-event rows would otherwise be lost for every issue in the batch.
+    """
+
+    def expand(ev: dict) -> list[Row]:
+        payload = ev["payload"]
+        out: list[Row] = []
+        for issue in _ints(payload.get("issue_numbers")):
+            out += handler({**ev, "issue_number": issue, "pr_number": None, "payload": {}})
+        for pr in _ints(payload.get("pr_numbers")):
+            out += handler({**ev, "issue_number": None, "pr_number": pr, "payload": {}})
+        return out
+
+    return expand
+
+
+HANDLERS: dict[str, Callable[[dict], list[Row]]] = {
+    "dispatch": _dispatch,
+    "dispatch_rework": _dispatch_rework,
+    **REF_ONLY,
+    **{kind + SWEEP_SUFFIX: _sweep(handler) for kind, handler in REF_ONLY.items()},
     "review_dispatch_claim": _review_claim,
     "review_dispatch": _review_dispatch,
     "record_review": _record_review,

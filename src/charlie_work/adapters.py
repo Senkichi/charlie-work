@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from . import layout
+from . import launch_events, layout
 from .config import ApiWorkerConfig, OrchestratorConfig
 from .harnesses import WORKER_HARNESSES
 from .subprocess_runner import run_captured
@@ -143,12 +143,7 @@ def _dispatch_command(
     sessions_dir: Path,
     settings: AdapterSettings,
 ) -> list[SessionDispatchResult]:
-    return [
-        _run_command_adapter(
-            repo_root, request, settings.dispatch_command, settings.command_timeout_seconds
-        )
-        for request in requests
-    ]
+    return [_run_command_adapter(repo_root, request, settings) for request in requests]
 
 
 def _dispatch_devin_shell(
@@ -232,6 +227,17 @@ def dispatch_sessions(
     else:
         dispatcher = _ADAPTER_DISPATCHERS.get(adapter)
         if dispatcher is None:
+            # Issue #2246: a request that never reaches a dispatcher is still a
+            # failed launch -- emit one event per request, at this seam.
+            for request in requests:
+                _emit_launch_failed(
+                    repo_root,
+                    settings,
+                    request,
+                    harness=adapter,
+                    error_class=launch_events.LAUNCH_ERR_CONFIG,
+                    error=f"Unsupported Devin adapter: {adapter}",
+                )
             results = [
                 _result(
                     request,
@@ -416,6 +422,15 @@ def _run_devin_shell_adapter(
     except Exception as exc:
         # Catch any unexpected exception and return as a failure result
         # (CLAUDE.md invariant: errors from external processes come back as values)
+        _emit_launch_failed(
+            repo_root,
+            settings,
+            request,
+            harness="devin-shell",
+            model=settings.worker_model,
+            error_class=launch_events.LAUNCH_ERR_INTERNAL,
+            error=f"launch failed: {exc}",
+        )
         return _result(
             request,
             adapter="devin-shell",
@@ -435,6 +450,18 @@ def _run_claude_code_adapter(
     try:
         prompt_text = request.prompt_path.read_text(encoding="utf-8")
     except OSError as exc:
+        # Issue #2246: the prompt read fails before launch_claude_worker is
+        # reached, so the error record seam below cannot observe it -- the
+        # launch_failed event is emitted here instead (exactly once).
+        _emit_launch_failed(
+            repo_root,
+            settings,
+            request,
+            harness="claude-code",
+            model=settings.config.worker.model if settings.config else "",
+            error_class=launch_events.LAUNCH_ERR_PROMPT,
+            error=str(exc),
+        )
         return _result(request, adapter="claude-code", ok=False, error=str(exc))
     kwargs: dict[str, Any] = {}
     if settings.claude_command:
@@ -491,18 +518,33 @@ def _run_api_adapter(
 
     api_worker_config = settings.api_worker_config
     if api_worker_config is None:
-        return _result(
-            request,
-            adapter="api",
-            ok=False,
-            error=(
-                "api adapter selected but no api_worker_config was resolved into "
-                "AdapterSettings; cannot launch api worker"
-            ),
+        error = (
+            "api adapter selected but no api_worker_config was resolved into "
+            "AdapterSettings; cannot launch api worker"
         )
+        _emit_launch_failed(
+            repo_root,
+            settings,
+            request,
+            harness="api",
+            error_class=launch_events.LAUNCH_ERR_CONFIG,
+            error=error,
+        )
+        return _result(request, adapter="api", ok=False, error=error)
     try:
         prompt_text = request.prompt_path.read_text(encoding="utf-8")
     except OSError as exc:
+        # Issue #2246: fails before launch_api_worker -- emit here (exactly once).
+        provider = api_worker_config.providers.get(api_worker_config.provider)
+        _emit_launch_failed(
+            repo_root,
+            settings,
+            request,
+            harness="api",
+            model=provider.model if provider else "",
+            error_class=launch_events.LAUNCH_ERR_PROMPT,
+            error=str(exc),
+        )
         return _result(request, adapter="api", ok=False, error=str(exc))
     kwargs: dict[str, Any] = {}
     if settings.claude_command:
@@ -542,26 +584,51 @@ def _run_api_adapter(
 def _run_command_adapter(
     repo_root: Path,
     request: SessionRequest,
-    dispatch_command: str | tuple[str, ...],
-    command_timeout_seconds: int,
+    settings: AdapterSettings,
 ) -> SessionDispatchResult:
     try:
-        command = _render_command(dispatch_command, request)
+        command = _render_command(settings.dispatch_command, request)
     except (KeyError, IndexError, ValueError) as exc:
+        _emit_launch_failed(
+            repo_root,
+            settings,
+            request,
+            harness="command",
+            error_class=launch_events.LAUNCH_ERR_RENDER,
+            error=str(exc),
+        )
         return _result(request, adapter="command", ok=False, error=str(exc))
     if not command:
-        return _result(
+        error = "devin.dispatch_command is required when worker.harness is command"
+        _emit_launch_failed(
+            repo_root,
+            settings,
             request,
-            adapter="command",
-            ok=False,
-            error="devin.dispatch_command is required when worker.harness is command",
+            harness="command",
+            error_class=launch_events.LAUNCH_ERR_CONFIG,
+            error=error,
         )
+        return _result(request, adapter="command", ok=False, error=error)
     run = run_captured(
         command,
         cwd=repo_root,
-        timeout_seconds=command_timeout_seconds,
+        timeout_seconds=settings.command_timeout_seconds,
         shell=isinstance(command, str),
     )
+    if not run.ok:
+        # Issue #2246: run.error marks a spawn/timeout failure (the command
+        # never ran to completion); a non-zero returncode means the blocking
+        # adapter ran and exited nonzero.
+        _emit_launch_failed(
+            repo_root,
+            settings,
+            request,
+            harness="command",
+            error_class=(
+                launch_events.LAUNCH_ERR_SPAWN if run.error else launch_events.LAUNCH_ERR_EXIT
+            ),
+            error=run.error or "Dispatch command failed",
+        )
     return _result(
         request,
         adapter="command",
@@ -571,6 +638,37 @@ def _run_command_adapter(
         stdout=run.stdout,
         stderr=run.stderr,
         error=None if run.ok else (run.error or "Dispatch command failed"),
+    )
+
+
+def _emit_launch_failed(
+    repo_root: Path,
+    settings: AdapterSettings,
+    request: SessionRequest,
+    *,
+    harness: str,
+    error_class: str,
+    error: str,
+    model: str = "",
+) -> None:
+    """Issue #2246: emit one ``launch_failed`` event for a dispatch path that
+    produces an error value *without* reaching a record-returning launch
+    function (prompt reads, missing config, render failures, the command
+    adapter's blocking run, unsupported harnesses). Paths that DO reach
+    ``launch_devin_session``/``launch_claude_worker``/``launch_api_worker``
+    must not call this -- the error-record seam already emitted.
+
+    Every ``dispatch_sessions`` result is a worker launch (rescue-tier
+    dispatches included), so ``role`` is fixed "worker" here.
+    """
+    launch_events.emit_launch_failed(
+        launch_events.state_path_for(repo_root, settings.config),
+        role="worker",
+        harness=harness,
+        model=model,
+        issue_number=request.issue_number,
+        error_class=error_class,
+        error=error,
     )
 
 

@@ -3378,7 +3378,9 @@ def apply_fixes(
                         add_labels=item.add_labels,
                     )
 
-        elif item.kind == "session_unpublished_work_salvaged":
+        # Issue #2262: a no-PR backend cannot publish; the sweep's park lane
+        # owns local salvage and this item stays report-only via the event.
+        elif item.kind == "session_unpublished_work_salvaged" and publishes_pull_requests(gh):
             # Issue #252: push the completed branch, create a PR, and move labels to pr_open.
             # If any step fails, fall back to the normal relabel-to-ready path.
             if item.issue_number is not None and item.branch and item.base_branch:

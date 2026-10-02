@@ -11,7 +11,7 @@ re-deriving an event an idempotent ``INSERT OR REPLACE``.
 
 from __future__ import annotations
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 6  # 6: <kind>_sweep expansion, dead-worker PR open; 5: batch rework PR scoping
 FLEET_SOURCE = "fleet"
 
 _KEY = (

@@ -1,0 +1,9 @@
+error
+# Issue #2246: a worker/reviewer launch came back with an error value — the
+# session never started (missing binary, worktree/env/prompt/render failure,
+# config/credentials/budget refusal, or a spawn/exec error). The dispatch
+# burned a rework-cap slot and the lane stalls until a later pass re-runs it,
+# so a failed launch ended work-in-flight the way review_verdict_missed does
+# — error-tier, not a routine operational warning (and not a member of
+# EXPECTED_OPERATIONAL_KINDS: launch failure is an exceptional condition, not
+# steady-state volume).

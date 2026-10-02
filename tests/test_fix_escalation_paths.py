@@ -1444,6 +1444,13 @@ def test_dispatch_outcome_field_sets_pin_the_collapsed_branch(
     deterministic-escalation arm must *overwrite* the stale escalation
     reason with the new one rather than leaving it in place.
     """
+    # Issue #2262: the phantom_live_worker scenario's salvage probe needs a
+    # real git repo to prove the branch carries no commits (the verdict that
+    # permits requeue); harmless for the other scenarios, which never probe.
+    from _worktree_fixtures import _init_repo
+
+    _init_repo(tmp_path)
+
     app, fake_gh = _closed_pr_app(tmp_path)
     _seed_dispatch_failed_at(app.paths, 123, ["2020-01-01T00:00:00+00:00"])
     monkeypatch.setattr(

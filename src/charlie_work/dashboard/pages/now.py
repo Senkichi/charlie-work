@@ -18,14 +18,31 @@ is the stable polite region where dashboard.js shows "Not updating" when polls f
 
 from __future__ import annotations
 
+import json
+
 from ..now_types import NowModel, RepoFreshness
 from ..read_model import ModelState
 from .now_capacity import render_capacity, render_repo_ledger
 from .now_flow import render_flow, render_not_dispatchable
 from .now_fmt import age, esc, local_time, repo_url, short_repo
 from .now_keyhelp import key_help
+from .nav import HEAD_BASE, THEME_BUTTON, views_nav
 from .now_needs import render_needs
-from .routes import VIEWS, View, live_views, routed
+from .routes import routed
+
+# htmx runs under a strict CSP (no inline style, no eval). Settling "style" would copy a
+# style attribute that a browser extension (or a test driver hiding the caret) put on an
+# old element onto its swapped twin, which the CSP blocks on every poll; eval and inline
+# script tags are disabled because nothing here needs them.
+HTMX_CONFIG = json.dumps(
+    {
+        "includeIndicatorStyles": False,
+        "attributesToSettle": ["class", "width", "height"],
+        "allowEval": False,
+        "allowScriptTags": False,
+    },
+    separators=(",", ":"),
+)
 
 
 def _fresh_chip(f: RepoFreshness) -> str:
@@ -52,7 +69,8 @@ def _fresh_chip(f: RepoFreshness) -> str:
     )
 
 
-def _freshness(model: NowModel) -> str:
+def freshness_strip(model: NowModel) -> str:
+    """Last-pass chip per repo (shared by Now and every drill-down header)."""
     chips = "".join(_fresh_chip(f) for f in model.freshness)
     return (
         '<div class="fresh" aria-label="Last loop pass per repo"><span class="label">Last pass'
@@ -84,15 +102,6 @@ def _banner(state: ModelState) -> str:
     )
 
 
-def _view(v: View) -> str:
-    if v.href == "/now":
-        return f'<a href="/now" aria-current="page" data-go="{v.key}">{esc(v.name)}</a>'
-    if v in live_views():
-        return f'<a href="{esc(v.href)}" data-go="{v.key}">{esc(v.name)}</a>'
-    # Not built yet: plain text, not a focusable link to a 404.
-    return f'<span class="soon">{esc(v.name)} <small>(soon)</small></span>'
-
-
 def _header(state: ModelState, poll_seconds: int) -> str:
     model = state.model
     asof = (
@@ -101,15 +110,11 @@ def _header(state: ModelState, poll_seconds: int) -> str:
         if model is not None
         else '<span class="asof">collecting…</span>'
     )
-    nav = '<nav class="views" aria-label="Views">' + "".join(_view(v) for v in VIEWS) + "</nav>"
-    fresh = _freshness(model) if model is not None else ""
-    theme_btn = (
-        '<button type="button" id="theme-toggle" class="themebtn" '
-        'aria-label="Theme: system. Activate to change.">theme: system</button>'
-    )
+    nav = views_nav("/now")
+    fresh = freshness_strip(model) if model is not None else ""
     return (
         '<header class="top"><div class="top-line"><h1 class="brand">Fleet '
-        f"<em>· Now</em></h1>{nav}{asof}{theme_btn}</div>{fresh}</header>"
+        f"<em>· Now</em></h1>{nav}{asof}{THEME_BUTTON}</div>{fresh}</header>"
     )
 
 
@@ -144,9 +149,8 @@ def render_now(
 ) -> str:
     return (
         f'<!doctype html><html lang="en" data-theme="{esc(theme)}"><head>'
-        '<meta charset="utf-8">'
-        '<meta name="viewport" content="width=device-width, initial-scale=1">'
-        '<meta name="htmx-config" content=\'{"includeIndicatorStyles":false}\'>'
+        + HEAD_BASE
+        + f'<meta name="htmx-config" content="{esc(HTMX_CONFIG)}">'
         "<title>Fleet Now</title>"
         '<link rel="stylesheet" href="/static/dashboard.css">'
         '<link rel="stylesheet" href="/static/now.css">'

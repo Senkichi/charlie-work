@@ -14,7 +14,7 @@ from .now_fmt import age, esc, issue_url, link, repo_url, slug, stable_id
 from .routes import routed
 
 # severity -> (tone class, glyph, word). Colour is never the only signal: glyph + word too.
-_TONE = {
+TONE = {
     "anomaly": ("danger", "✕", "failing"),
     "warn": ("warn", "▲", "at risk"),
     "action": ("plain", "○", "to decide"),
@@ -124,7 +124,7 @@ def _go(row_id: str, target: str | None, reason: str) -> str:
 
 
 def _row(item: NeedsMeItem, over: bool = False) -> str:
-    tone, glyph, word = _TONE.get(item.severity, _TONE["warn"])
+    tone, glyph, word = TONE.get(item.severity, TONE["warn"])
     kind = _KIND.get(item.kind, item.kind)
     if item.kind == "human_needed" and item.group == "Awaiting your verdict":
         kind = "Verdict"

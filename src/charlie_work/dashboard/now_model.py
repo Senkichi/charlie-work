@@ -16,6 +16,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from datetime import datetime
 
+from ..config import LabelConfig
 from . import now_cadence
 from .now_access import as_int, dict_list, label_set, snapshot_data
 from .now_needs_me import group_summaries, needs_me_items
@@ -67,17 +68,25 @@ def _freshness(
     return tuple(rows), stale
 
 
-def _flow(
-    sources: SourcesRead,
-) -> tuple[FlowModel, dict[str, int], dict[str, tuple[FlowStage, ...]]]:
-    labels = sources.labels
-    counted = (
+def counted_stages(labels: LabelConfig) -> tuple[tuple[str, str], ...]:
+    """``(stage name, label)`` for the label-counted Flow stages.
+
+    The one definition: Now counts issues carrying each label and the stage drill-down
+    (``/flow/<stage>``) lists the same issues, so the number and its list cannot drift.
+    """
+    return (
         ("Queued", labels.queued),
         ("In progress", labels.in_progress),
         ("PR open", labels.pr_open),
         ("Reviewing", labels.reviewing),
         ("Needs rework", labels.needs_rework),
     )
+
+
+def _flow(
+    sources: SourcesRead,
+) -> tuple[FlowModel, dict[str, int], dict[str, tuple[FlowStage, ...]]]:
+    counted = counted_stages(sources.labels)
     stage_counts = {name: 0 for name, _ in counted}
     dispatchable_by_repo: dict[str, int] = {}
     reasons = {reason: 0 for reason in NOT_DISPATCHABLE_REASONS}
@@ -132,7 +141,7 @@ def _capacity(
     threshold: float,
 ) -> CapacityModel:
     workers = tuple(
-        RepoWorkers(r.key, len(dict_list(snapshot_data(r), "workers")), r.worker_cap or None)
+        RepoWorkers(r.key, len(dict_list(snapshot_data(r), "workers")), r.worker_cap)
         for r in sources.repos
         if r.snapshot.data is not None
     )

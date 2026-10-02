@@ -8,14 +8,15 @@ from __future__ import annotations
 
 import os
 import subprocess
-import sys
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from charlie_work import local_suite_runner
 from charlie_work.config import OrchestratorConfig, build_config_from_data
 from charlie_work.labels import transition
+from charlie_work.local_lane import branch_head_sha
 from charlie_work.local_issues import LocalFileGitHub
 from charlie_work.paths import runtime_paths
 from charlie_work.process_utils import is_pid_alive, kill_process_tree
@@ -80,6 +81,15 @@ FAIL_SUITE = "python -c \"import sys; print('=== 1 failed, 2 passed in 0.1s ==='
 KILLED_SUITE = "python -c \"import sys; sys.stdout.write('....... [ 12%]'); sys.exit(1)\""
 
 SLEEP_SUITE = 'python -c "import time; time.sleep(600)"'
+
+# A pid no supported OS can allocate (Linux ``pid_max`` caps at 2**22; the
+# Windows cid table cannot reach 2**30): deterministically dead on every pass
+# and, unlike a just-exited pid, unrecyclable -- a real dead pid can be
+# reissued to an unrelated process inside the assertion window, and a claim
+# carrying ``local_suite_process_start_time=None`` gives the gate's liveness
+# check no fingerprint to disambiguate it with (#2207: bare pids are not
+# unique across dead processes).
+UNALLOCATABLE_PID = 1 << 30
 
 
 def _lane_config(repo_root: Path, issues_dir: Path, **overrides: object) -> OrchestratorConfig:
@@ -184,11 +194,24 @@ def _gate_identity(app: OrchestratorApp, number: int) -> tuple[int, Any]:
     return int(record["local_suite_pid"]), record["local_suite_process_start_time"]
 
 
-def _dead_pid() -> int:
-    """A pid that was real a moment ago and is now definitely exited."""
-    child = subprocess.Popen([sys.executable, "-c", "pass"])
-    child.wait(timeout=30)
-    return child.pid
+def _seed_dead_claim(app: OrchestratorApp, repo_root: Path, number: int, head: str) -> None:
+    """Persist a claim whose runner is deterministically dead (``UNALLOCATABLE_PID``,
+    no fingerprint), as left behind by a wrapper that exited without reporting."""
+    paths = _gate_paths(app, number)
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        state["prs"][str(number)].update(
+            {
+                "local_suite_pid": UNALLOCATABLE_PID,
+                "local_suite_process_start_time": None,
+                "local_suite_started_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+                "local_suite_log": str(paths.log),
+                "local_suite_gate_dir": str(paths.gate_dir),
+                "local_suite_head": head,
+                "local_suite_base_sha": branch_head_sha(repo_root, "main"),
+            }
+        )
+        save_state(app.paths.state_file, state)
 
 
 def _event_kinds(app: OrchestratorApp) -> list[str]:
