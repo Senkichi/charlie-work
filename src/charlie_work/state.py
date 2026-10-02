@@ -12,6 +12,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Mapping
 
+from . import atomic_write
 from . import host as _host
 from .dead_dispatched_timer import LOCAL_PARK_DEFER_FIELDS
 
@@ -64,9 +65,10 @@ _LOAD_RETRY_DELAY_SECONDS = 0.1
 # (a lock-free ``load_state`` reader, ``charlie doctor``, a dashboard render)
 # raises ``PermissionError`` [WinError 5]. The failure is transient and
 # non-destructive -- the previous valid file is intact -- so retry with backoff
-# before surfacing, mirroring the reader-side knobs above.
-_SAVE_RETRY_ATTEMPTS = 3
-_SAVE_RETRY_DELAY_SECONDS = 0.1
+# before surfacing, mirroring the reader-side knobs above. The retry loop itself
+# now lives in ``atomic_write`` (issue #2265); this alias only feeds the
+# operator-facing error message below and must not drift from it.
+_SAVE_RETRY_ATTEMPTS = atomic_write.REPLACE_ATTEMPTS
 
 # Stale claim timeout (minutes) — claims older than this are re-dispatchable
 # to prevent crashed phase-2 from wedging issues
@@ -873,33 +875,20 @@ def load_state(path: Path) -> dict[str, Any]:
 def save_state(path: Path, data: dict[str, Any]) -> dict[str, Any]:
     """Persist a fresh copy of ``data`` without mutating the caller's dict."""
     to_save = {**data, "generated_at": utc_now()}
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    with tmp_path.open("w", encoding="utf-8") as handle:
-        json.dump(to_save, handle, indent=2, sort_keys=True)
-        handle.write("\n")
-    # On Windows, ``replace()`` onto a target another process currently holds
-    # open (a lock-free ``load_state`` reader, ``charlie doctor``, a dashboard
-    # render) raises ``PermissionError`` [WinError 5]. The failure is transient
-    # and non-destructive -- the previous valid file is intact -- so retry with
-    # backoff before surfacing, mirroring ``load_state``'s reader-side retry.
-    # ``PermissionError`` is caught specifically so the final message can name
-    # the condition; a bare "Access is denied" sends an operator hunting for an
-    # admin shell (issue #1062).
-    for attempt in range(_SAVE_RETRY_ATTEMPTS):
-        try:
-            tmp_path.replace(path)
-            break
-        except PermissionError as exc:
-            if attempt < _SAVE_RETRY_ATTEMPTS - 1:
-                time.sleep(_SAVE_RETRY_DELAY_SECONDS)
-                continue
-            raise PermissionError(
-                f"atomic replace of {path} failed after {_SAVE_RETRY_ATTEMPTS} "
-                f"attempts: {exc}. This is usually a transient Windows sharing "
-                f"violation (another process holds the file open); the previous "
-                f"state file is intact."
-            ) from exc
+    # The write goes through ``atomic_write.write_json_atomic`` (unique temp
+    # name + bounded ``PermissionError`` retry + orphan cleanup -- issue
+    # #2265). ``PermissionError`` is caught specifically so the final message
+    # can name the condition; a bare "Access is denied" sends an operator
+    # hunting for an admin shell (issue #1062).
+    try:
+        atomic_write.write_json_atomic(path, to_save)
+    except PermissionError as exc:
+        raise PermissionError(
+            f"atomic replace of {path} failed after {_SAVE_RETRY_ATTEMPTS} "
+            f"attempts: {exc}. This is usually a transient Windows sharing "
+            f"violation (another process holds the file open); the previous "
+            f"state file is intact."
+        ) from exc
     return to_save
 
 

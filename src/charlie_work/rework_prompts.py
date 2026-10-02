@@ -20,6 +20,7 @@ import json
 from pathlib import Path
 from typing import Any, Mapping
 
+from .atomic_write import write_text_atomic as _atomic_write_text
 from .config import OrchestratorConfig
 from .rescue_review import LEGACY_VACUOUS_SUMMARY
 from .github import defang_closing_keywords
@@ -573,20 +574,16 @@ def _is_verdict_newer_than_brief(decision_path: Path, brief_path: Path) -> bool:
 
 
 def _write_text_atomic(path: Path, text: str) -> None:
-    """Write ``text`` to ``path`` via a temp file + atomic rename.
+    """Write ``text`` to ``path`` via a unique temp file + atomic rename.
 
     Module-level (not an ``OrchestratorApp`` method) because callers that
     need it -- the module-level ``_write_rework_prompt`` below, which has no
     ``self``, and ``record_review``'s per-round archive copies -- must not
     write a torn file to a path another process may poll mid-write (the
     same failure class as the exists-is-not-content-ready incident).
-    Mirrors ``OrchestratorApp._write_json``'s tmp+replace shape.
+    Delegates to ``atomic_write.write_text_atomic`` (issue #2265).
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    with tmp_path.open("w", encoding="utf-8") as handle:
-        handle.write(text)
-    tmp_path.replace(path)
+    _atomic_write_text(path, text)
 
 
 # Issue #1268 (W11): the field set that identifies a review round. Two

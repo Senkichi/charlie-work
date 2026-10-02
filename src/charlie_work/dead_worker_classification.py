@@ -188,6 +188,44 @@ def resolve_dead_worker_failure_kind(
         return stamped
     if not classify_log:
         return None
+    classified = classify_dead_worker_log(entry, sessions_dir, issue_number, config, now=now)
+    if classified is None:
+        return None
+    adapter_kind, failure = classified
+    _persist_on_locked_entry(
+        entry,
+        state,
+        issue_number,
+        failure,
+        adapter_kind=adapter_kind,
+        now=now if now is not None else datetime.now(UTC),
+        source="dead_worker_classification",
+        write_gate=write_gate,
+    )
+    return failure.kind
+
+
+def classify_dead_worker_log(
+    entry: dict[str, Any],
+    sessions_dir: Path,
+    issue_number: int,
+    config: OrchestratorConfig,
+    *,
+    now: datetime | None = None,
+) -> tuple[str, worker_fate.FailureEvidence] | None:
+    """Classify this entry's dead-worker sidecar log; return ``(adapter_kind, failure)``.
+
+    The classification half of :func:`resolve_dead_worker_failure_kind`, with
+    no ``state`` write: the adapter helper still stamps the sidecar's
+    ``failure_kind`` and records the role-ledger restriction (#2086) itself, but
+    the issue-entry stamp and the per-repo cooldown are left to the caller.
+    The dead-worker sweep needs that split (#2274): it classifies in its
+    lock-free pre phase, whose state copy is discarded, and persists the result
+    once under the lock. Returns None when no single sidecar matches this
+    entry's epoch, the adapter has no classifier, or the log shows no
+    signature. The #656 completion guard lives inside the adapter helper
+    (``terminal_record_proves_completion``), so it applies here unchanged.
+    """
     view = _worker_view_for_entry(sessions_dir, entry, issue_number)
     if view is None:
         return None
@@ -207,17 +245,9 @@ def resolve_dead_worker_failure_kind(
     )
     if failure_kind is None:
         return None
-    _persist_on_locked_entry(
-        entry,
-        state,
-        issue_number,
-        worker_fate.FailureEvidence.from_classification(failure_kind, throttled_until, fresh=True),
-        adapter_kind=view.adapter_kind,
-        now=now if now is not None else datetime.now(UTC),
-        source="dead_worker_classification",
-        write_gate=write_gate,
+    return view.adapter_kind, worker_fate.FailureEvidence.from_classification(
+        failure_kind, throttled_until, fresh=True
     )
-    return failure_kind
 
 
 def classify_and_credit_dead_worker(

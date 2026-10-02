@@ -38,6 +38,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from charlie_work.atomic_write import write_json_atomic
 from charlie_work.process_utils import CpuPriority, get_process_start_time, popen_worker
 from charlie_work.subprocess_runner import hidden_console_kwargs
 
@@ -73,10 +74,8 @@ def suite_gate_paths(dispatches_dir: Path, pr_number: int) -> SuiteGatePaths:
 
 
 def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
-    """Temp-file + ``replace()`` -- the repo's mandatory JSON write shape."""
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    tmp.replace(path)
+    """Unique temp file + ``replace()`` -- the repo's mandatory JSON write shape."""
+    write_json_atomic(path, payload)
 
 
 def _read_json(path: Path) -> dict[str, Any] | None:
