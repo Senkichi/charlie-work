@@ -40,6 +40,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from .atomic_write import write_json_atomic
 from .fleet_paths import fleet_dir, warn_fleet_dir_virtualization_on_write
 from .instrumentation import log_event, query_events
 from .supervise_loop import EXIT_FLEET_PAUSED
@@ -148,9 +149,7 @@ def _write_heartbeat(path: Path, payload: dict[str, Any]) -> None:
     warn_fleet_dir_virtualization_on_write(
         path.parent, context="writing supervisor-heartbeat.json"
     )
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    tmp.replace(path)
+    write_json_atomic(path, payload)
 
 
 def _parse_iso(value: str | None) -> datetime | None:

@@ -26,6 +26,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, NoReturn
 
+from .atomic_write import write_json_atomic
 from .config import WRITER_MARKER_FILENAME
 from .safe_path import contains
 
@@ -38,12 +39,8 @@ OPERATOR_MARKER_KIND = "operator"
 
 
 def _write_json_atomic(path: Path, value: Any) -> None:
-    """Write JSON atomically using a temp file + rename (issue #400)."""
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with tmp.open("w", encoding="utf-8") as handle:
-        json.dump(value, handle, indent=2, sort_keys=True)
-        handle.write("\n")
-    tmp.replace(path)
+    """Write JSON atomically using a unique temp file + rename (issue #400)."""
+    write_json_atomic(path, value)
 
 
 def write_worktree_marker(

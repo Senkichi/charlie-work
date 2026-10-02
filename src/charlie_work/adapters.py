@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-import json
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from . import launch_events, layout
+from . import atomic_write, launch_events, layout
 from .config import ApiWorkerConfig, OrchestratorConfig
 from .dead_sidecar_guard import classify_dead_sidecars
 from .harnesses import WORKER_HARNESSES
@@ -739,12 +738,7 @@ def _result(
 
 
 def _write_json(path: Path, value: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    with tmp_path.open("w", encoding="utf-8") as handle:
-        json.dump(value, handle, indent=2, sort_keys=True)
-        handle.write("\n")
-    tmp_path.replace(path)
+    atomic_write.write_json_atomic(path, value)
 
 
 def cleanup_stale_session_tmp_files(sessions_dir: Path, min_age_seconds: float = 60.0) -> int:

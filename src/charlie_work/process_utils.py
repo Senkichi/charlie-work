@@ -16,6 +16,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from .atomic_write import write_json_atomic
 from .orphan_sweep import (  # noqa: F401  (deliberate re-export)
     _enumerate_fingerprinted_children,
     _reap_enumerated_children,
@@ -421,9 +422,7 @@ def write_worker_terminal_status(
     if worker_outcome_written_at is not None:
         payload["worker_outcome_written_at"] = worker_outcome_written_at
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    tmp_path.replace(path)
+    write_json_atomic(path, payload)
 
 
 def terminal_record_proves_completion(

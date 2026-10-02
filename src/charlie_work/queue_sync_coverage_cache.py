@@ -93,6 +93,7 @@ import json
 import logging
 from pathlib import Path
 
+from .atomic_write import write_json_atomic
 from .state import StateLockBusy, advisory_file_lock, utc_now
 
 logger = logging.getLogger(__name__)
@@ -149,14 +150,13 @@ def load_cache_map(path: Path) -> dict[str, str]:
 
 
 def _save_cache(path: Path, entries: dict[str, str]) -> None:
-    """Atomically persist the cache (temp-file + ``replace()``)."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"version": 1, "generated_at": utc_now(), "covered": entries}
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    with tmp_path.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2, sort_keys=True)
-        handle.write("\n")
-    tmp_path.replace(path)
+    """Atomically persist the cache (``atomic_write.write_json_atomic``).
+
+    Unique per-writer temp name + bounded ``PermissionError`` retry on the
+    rename (issue #2265) -- same collision class as the ``http_cache`` twin
+    this module was modeled on.
+    """
+    write_json_atomic(path, {"version": 1, "generated_at": utc_now(), "covered": entries})
 
 
 def is_covered_cached(

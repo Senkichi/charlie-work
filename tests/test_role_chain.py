@@ -352,7 +352,7 @@ def test_ledger_records_monotonically_and_atomically(tmp_path: Path) -> None:
     assert role_quota_ledger.load_restrictions() == {("devin-shell", "swe-2"): later}
     path = role_quota_ledger.ledger_path()
     assert json.loads(path.read_text(encoding="utf-8"))["version"] == 1
-    assert not path.with_suffix(path.suffix + ".tmp").exists()
+    assert not list(path.parent.glob("*.tmp"))
 
 
 def test_ledger_tolerates_a_corrupt_file() -> None:

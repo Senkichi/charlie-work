@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Any
 
 from . import launch_events
+from .atomic_write import write_text_atomic
 from .claude_code import _events_path, _rotate_old_log
 from .devin_review_mode import (
     _review_exec_commands_text,
@@ -248,9 +249,7 @@ def resume_exec_rejected_review(app: Any, worker: Any, pr_number: int, reviews_d
 
     nudge_path = reviews_dir / f"issue-{pr_number}.resume-nudge.md"
     try:
-        tmp = nudge_path.with_suffix(nudge_path.suffix + ".tmp")
-        tmp.write_text(review_exec_nudge_text(), encoding="utf-8")
-        tmp.replace(nudge_path)
+        write_text_atomic(nudge_path, review_exec_nudge_text())
         worker_env = app._adapter_settings(adapter="devin-shell").worker_env
         env = {**sanitize_env(checkout), **{str(k): str(v) for k, v in worker_env.items()}}
     except OSError as exc:

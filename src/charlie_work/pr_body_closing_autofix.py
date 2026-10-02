@@ -28,6 +28,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+from .atomic_write import write_text_atomic as _atomic_write_text
 from .checks import _is_failing_run
 from .closing_keyword_gate import (
     UnexpectedClosingReference,
@@ -176,10 +177,7 @@ def scan_pr_closing_references(
 
 
 def _write_text_atomic(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
-    tmp.replace(path)
+    _atomic_write_text(path, text)
 
 
 def autofix_closing_keyword_pr_body(
