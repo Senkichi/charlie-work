@@ -118,6 +118,8 @@ def test_run_quota_probe_green_returns_true_and_pins_model(
     assert command[command.index("--model") + 1] == "claude-haiku-4-5"
     assert "--max-turns" in command
     assert command[command.index("--max-turns") + 1] == "1"
+    # No settings sources: user/project SessionStart hooks must not run in repo_root.
+    assert command[command.index("--setting-sources") + 1] == ""
     assert cwd == tmp_path
     assert timeout_seconds == 42
     assert stdin == "say OK"
