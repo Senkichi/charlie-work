@@ -324,7 +324,7 @@ def test_load_state_retries_transient_oserror(tmp_path: Path, monkeypatch) -> No
     assert list(tmp_path.glob("state.json.corrupt-*")) == []
 
 
-def test_save_state_retries_transient_permission_error(tmp_path: Path, monkeypatch) -> None:
+def test_save_state_retries_transient_permission_error(tmp_path: Path, patch_path_replace) -> None:
     """A transient PermissionError on the atomic replace must retry and succeed.
 
     Mirrors ``test_load_state_retries_transient_oserror`` for the writer side
@@ -347,7 +347,7 @@ def test_save_state_retries_transient_permission_error(tmp_path: Path, monkeypat
             raise PermissionError(5, "Access is denied")
         return real_replace(self, target)
 
-    monkeypatch.setattr(pathlib.Path, "replace", flaky_replace)
+    patch_path_replace(flaky_replace, scope=tmp_path)
 
     saved = save_state(state_path, {"version": 1, "issues": {"1": {"status": "new"}}})
 
@@ -361,7 +361,7 @@ def test_save_state_retries_transient_permission_error(tmp_path: Path, monkeypat
 
 
 def test_save_state_raises_after_retry_exhausted_permission_error(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, patch_path_replace
 ) -> None:
     """Persistent PermissionError on replace must raise with a helpful message.
 
@@ -380,7 +380,7 @@ def test_save_state_raises_after_retry_exhausted_permission_error(
         calls.append(self)
         raise PermissionError(5, "Access is denied")
 
-    monkeypatch.setattr(pathlib.Path, "replace", failing_replace)
+    patch_path_replace(failing_replace, scope=tmp_path)
 
     with pytest.raises(PermissionError) as exc_info:
         save_state(state_path, {"version": 1, "issues": {"1": {"status": "new"}}})

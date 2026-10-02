@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pytest
 
+import conftest
 from charlie_work import atomic_write
 from charlie_work.atomic_write import (
     write_bytes_atomic,
@@ -43,9 +44,7 @@ def test_write_text_and_bytes_atomic(tmp_path: Path) -> None:
     assert bin_path.read_bytes() == b"\x00\x01\xff"
 
 
-def test_each_write_uses_a_unique_temp_name(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_each_write_uses_a_unique_temp_name(tmp_path: Path, patch_path_replace) -> None:
     """Two writes to the same destination must not share a temp file name --
     the fixed ``<name>.tmp`` name was the issue-#2265 collision vector."""
     path = tmp_path / "cache.json"
@@ -56,7 +55,7 @@ def test_each_write_uses_a_unique_temp_name(
         used.append(self)
         return real_replace(self, target)
 
-    monkeypatch.setattr(Path, "replace", _spy)
+    patch_path_replace(_spy, scope=tmp_path)
     write_json_atomic(path, {"n": 1})
     write_json_atomic(path, {"n": 2})
 
@@ -71,7 +70,9 @@ def test_each_write_uses_a_unique_temp_name(
         assert tmp.name.endswith(f"{path.suffix}.tmp")
 
 
-def test_concurrent_writers_use_distinct_temp_files(tmp_path: Path) -> None:
+def test_concurrent_writers_use_distinct_temp_files(
+    tmp_path: Path, tmp_path_factory: pytest.TempPathFactory
+) -> None:
     """Two threads writing the same destination at once must each rename a
     DIFFERENT tmp file; both writes succeed, the result is one intact
     payload, and no tmp file survives."""
@@ -85,23 +86,19 @@ def test_concurrent_writers_use_distinct_temp_files(tmp_path: Path) -> None:
 
     # A foreign Path.replace fired from a background thread inside the
     # patched window -- the api-worker terminal-record writer shape that
-    # flaked this test on #2283. Lives under tmp_path/"foreign" so its
-    # parent differs from the test writers' directory.
-    foreign_dir = tmp_path / "foreign"
-    foreign_dir.mkdir()
+    # flaked this test on #2283. Lives in its own basetemp dir so it is
+    # outside the patch's scope, exactly like a leftover thread from a
+    # different test.
+    foreign_dir = tmp_path_factory.mktemp("foreign")
     foreign_tmp = foreign_dir / "issue-1514.api.terminal.0000.json.tmp"
     foreign_dst = foreign_dir / "issue-1514.api.terminal.json"
     foreign_tmp.write_text("{}\n", encoding="utf-8")
 
     def _blocking_replace(self: Path, target: object) -> Path:
-        # The patch is on the Path CLASS, so every Path.replace in the
-        # process lands here -- including a leftover background thread from
-        # another test on the same xdist worker. Foreign calls must pass
-        # straight through: recording one inflates `used`, and letting one
-        # reach the barrier steals a rendezvous slot from the real writers
-        # (issue #2284).
-        if self.parent != tmp_path:
-            return real_replace(self, target)
+        # Only in-scope calls arrive here: patch_path_replace delegates
+        # every out-of-scope Path.replace (like the foreign thread's below)
+        # to the real method, so it can neither inflate `used` nor steal a
+        # barrier rendezvous slot (issue #2284).
         used.append(self)
         hook_entered.set()
         # Rendezvous the writers' first replace calls *while both tmp files
@@ -124,16 +121,17 @@ def test_concurrent_writers_use_distinct_temp_files(tmp_path: Path) -> None:
     def _foreign_replace() -> None:
         try:
             # Fire while a writer is inside the hook -- the interleaving
-            # that flaked #2283. Without the tmp_path filter in
-            # _blocking_replace this call is recorded in `used` and can
-            # steal a barrier slot.
+            # that flaked #2283. The path is outside the patch scope, so the
+            # scoped wrapper delegates it untouched; under a raw class-wide
+            # patch it would be recorded in `used` and could steal a
+            # barrier slot.
             hook_entered.wait(timeout=30)
             foreign_tmp.replace(foreign_dst)
         except BaseException as exc:  # noqa: BLE001 - collected for the assert
             errors.append(exc)
 
     monkeypatch = pytest.MonkeyPatch()
-    monkeypatch.setattr(Path, "replace", _blocking_replace)
+    conftest.patch_path_replace(monkeypatch, _blocking_replace, scope=tmp_path)
     threads = [threading.Thread(target=_write, args=({"writer": i},)) for i in range(2)]
     foreign = threading.Thread(target=_foreign_replace)
     try:
@@ -164,7 +162,7 @@ def test_concurrent_writers_use_distinct_temp_files(tmp_path: Path) -> None:
 
 
 def test_permission_error_on_replace_retries_then_succeeds(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, patch_path_replace
 ) -> None:
     """A transient PermissionError on the rename (a lock-free reader or AV
     scanner holding the destination open on Windows) retries and succeeds."""
@@ -179,7 +177,7 @@ def test_permission_error_on_replace_retries_then_succeeds(
             raise PermissionError(5, "Access is denied")
         return real_replace(self, target)
 
-    monkeypatch.setattr(Path, "replace", _flaky)
+    patch_path_replace(_flaky, scope=tmp_path)
     write_json_atomic(path, {"new": True})
 
     assert len(calls) == 3
@@ -188,29 +186,68 @@ def test_permission_error_on_replace_retries_then_succeeds(
 
 
 def test_permission_error_exhaustion_raises_and_cleans_up(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, tmp_path_factory: pytest.TempPathFactory, patch_path_replace
 ) -> None:
     """Persistent PermissionError surfaces after REPLACE_ATTEMPTS tries;
-    the destination stays intact and the unique tmp file is unlinked."""
+    the destination stays intact and the unique tmp file is unlinked.
+
+    The call count is asserted against a FOREIGN ``Path.replace`` fired on
+    a background thread during the patched window (issue #2290): the
+    class-wide patch is process-wide, and the pre-helper version of this
+    test flaked when another thread's replace landed in ``_failing`` (run
+    37005463625 saw 4 calls, not 3)."""
     path = tmp_path / "cache.json"
     path.write_text('{"old": true}', encoding="utf-8")
     calls: list[Path] = []
+    hook_entered = threading.Event()
+    foreign_done = threading.Event()
+    errors: list[BaseException] = []
+
+    # Outside the patch scope, like a leftover writer from another test.
+    foreign_dir = tmp_path_factory.mktemp("foreign")
+    foreign_tmp = foreign_dir / "foreign.json.tmp"
+    foreign_dst = foreign_dir / "foreign.json"
+    foreign_tmp.write_text("{}\n", encoding="utf-8")
 
     def _failing(self: Path, target: object) -> Path:
         calls.append(self)
+        # Hold the window open on the first call so the foreign thread's
+        # replace is guaranteed to land while the patch is installed and a
+        # fake call is in flight.
+        hook_entered.set()
+        foreign_done.wait(timeout=30)
         raise PermissionError(5, "Access is denied")
 
-    monkeypatch.setattr(Path, "replace", _failing)
-    with pytest.raises(PermissionError):
-        write_json_atomic(path, {"new": True})
+    def _foreign_replace() -> None:
+        try:
+            hook_entered.wait(timeout=30)
+            foreign_tmp.replace(foreign_dst)
+        except BaseException as exc:  # noqa: BLE001 - collected for the assert
+            errors.append(exc)
+        finally:
+            foreign_done.set()
 
+    patch_path_replace(_failing, scope=tmp_path)
+    foreign = threading.Thread(target=_foreign_replace)
+    foreign.start()
+    try:
+        with pytest.raises(PermissionError):
+            write_json_atomic(path, {"new": True})
+    finally:
+        foreign.join(timeout=30)
+
+    assert not foreign.is_alive(), "foreign replace thread wedged"
+    assert errors == []
+    # The foreign replace passed through the scoped wrapper untouched.
+    assert foreign_dst.read_text(encoding="utf-8") == "{}\n"
+    assert not foreign_tmp.exists()
     assert len(calls) == atomic_write.REPLACE_ATTEMPTS
     assert json.loads(path.read_text(encoding="utf-8")) == {"old": True}
     assert not list(tmp_path.glob("*.tmp"))
 
 
 def test_non_permission_oserror_does_not_retry_but_cleans_up(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, patch_path_replace
 ) -> None:
     """A non-transient OSError is not a sharing violation: propagate on the
     first attempt (no pointless backoff) and still remove the tmp file."""
@@ -221,7 +258,7 @@ def test_non_permission_oserror_does_not_retry_but_cleans_up(
         calls.append(self)
         raise OSError("disk gone")
 
-    monkeypatch.setattr(Path, "replace", _failing)
+    patch_path_replace(_failing, scope=tmp_path)
     with pytest.raises(OSError, match="disk gone"):
         write_json_atomic(path, {"x": 1})
 
