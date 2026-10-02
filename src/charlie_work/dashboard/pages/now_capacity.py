@@ -8,10 +8,10 @@ repos.
 
 from __future__ import annotations
 
+from ..charts import bullet_svg
 from ..now_types import CapacityModel, NowModel, RepoFreshness, RepoWorkers, RunnerRepo
 from .now_fmt import age, cap_text, esc, fmt_float, link, repo_url, short_repo
 
-_TRACK = 240.0
 _STAGE_ABBR = (
     ("Dispatchable", "Disp"),
     ("Queued", "Q"),
@@ -23,28 +23,8 @@ _STAGE_ABBR = (
 
 
 def _bullet(live: int, cap: int | None) -> str:
-    if cap:
-        scale = float(max(cap, live, 1))
-        fill = _TRACK * live / scale
-        tick = _TRACK * cap / scale
-        hot = " hot" if live > cap else ""
-        inner = (
-            f'<rect class="trk" x="0" y="5" width="{fmt_float(_TRACK)}" height="6"/>'
-            f'<rect class="fill{hot}" x="0" y="3" width="{fmt_float(fill)}" height="10"/>'
-            f'<line class="captick" x1="{fmt_float(tick)}" x2="{fmt_float(tick)}" y1="0" y2="16"/>'
-        )
-    else:
-        # Unknown cap: the fill reaches 80% of the track and the rest stays open-ended.
-        fill = _TRACK * 0.8 if live else 0.0
-        inner = (
-            f'<rect class="fill" x="0" y="3" width="{fmt_float(fill)}" height="10"/>'
-            f'<line class="trk-open" x1="{fmt_float(fill)}" x2="{fmt_float(_TRACK)}" '
-            'y1="8" y2="8"/>'
-        )
-    return (
-        f'<svg class="bullet-svg" viewBox="0 0 {fmt_float(_TRACK)} 16" aria-hidden="true">'
-        f"{inner}</svg>"
-    )
+    """The shared bullet bar (``charts.bullet``); a 0 cap reads as unreported, as before."""
+    return bullet_svg(float(live), cap or None)
 
 
 def _over(live: int, cap: int | None) -> str:

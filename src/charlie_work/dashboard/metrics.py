@@ -7,6 +7,7 @@ tuple (total first, then ``<name>.<category>``). ``tab_series`` flattens either 
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from collections.abc import Callable
 
@@ -19,6 +20,8 @@ from .metrics_base import MetricQuery, Series, open_dashboard_ro
 __all__ = ["MetricQuery", "Series", "TABS", "all_series", "open_dashboard_ro"]
 
 Metric = Callable[[sqlite3.Connection, MetricQuery], Series | tuple[Series, ...]]
+
+log = logging.getLogger("charlie_work.dashboard")
 
 
 def _stage(stage: str) -> Metric:
@@ -60,12 +63,37 @@ TABS: dict[str, dict[str, Metric]] = {
 }
 
 
-def tab_series(db: sqlite3.Connection, tab: str, q: MetricQuery) -> dict[str, tuple[Series, ...]]:
-    """Every metric of one History tab, keyed by metric id."""
-    out: dict[str, tuple[Series, ...]] = {}
+def tab_results(
+    db: sqlite3.Connection, tab: str, q: MetricQuery
+) -> dict[str, tuple[Series, ...] | Exception]:
+    """Every metric of one History tab, keyed by metric id.
+
+    A metric that raises — a malformed stored row (``ValueError``) or a fault in the
+    metric's own code — comes back as its exception, so that card alone degrades; a
+    database-level fault (``sqlite3.Error``) still raises — that is a whole-tab problem,
+    not one row's.
+    """
+    out: dict[str, tuple[Series, ...] | Exception] = {}
     for metric_id, fn in TABS[tab].items():
-        result = fn(db, q)
-        out[metric_id] = result if isinstance(result, tuple) else (result,)
+        try:
+            result = fn(db, q)
+        except sqlite3.Error:
+            raise
+        except Exception as exc:  # noqa: BLE001 - degrade this metric's card, not the tab
+            log.exception("history metric failed: %s %s", tab, metric_id)
+            out[metric_id] = exc
+        else:
+            out[metric_id] = result if isinstance(result, tuple) else (result,)
+    return out
+
+
+def tab_series(db: sqlite3.Connection, tab: str, q: MetricQuery) -> dict[str, tuple[Series, ...]]:
+    """Every metric of one History tab, keyed by metric id — strict: bad rows raise."""
+    out: dict[str, tuple[Series, ...]] = {}
+    for metric_id, result in tab_results(db, tab, q).items():
+        if isinstance(result, Exception):
+            raise result
+        out[metric_id] = result
     return out
 
 

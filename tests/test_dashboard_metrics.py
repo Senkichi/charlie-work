@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -51,6 +52,29 @@ def test_query_validation_and_prior() -> None:
 def test_open_missing_dashboard_db_is_a_value(tmp_path: Path) -> None:
     conn, err = open_dashboard_ro(tmp_path / "nope.db")
     assert conn is None and err is not None and err.startswith("missing:")
+
+
+def test_open_dashboard_ro_is_mode_ro_without_immutable(tmp_path, monkeypatch) -> None:
+    """The rollup writes dashboard.db in-process: a reader must take part in WAL locking
+    (``immutable=1`` takes no locks and can observe a checkpoint mid-write), so the open
+    mode is pinned to plain ``mode=ro``."""
+    path = tmp_path / "dashboard.db"
+    seed = sqlite3.connect(path)
+    seed.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    seed.commit()
+    seed.close()
+    uris: list[str] = []
+    real_connect = sqlite3.connect
+
+    def spy(*args, **kwargs):
+        uris.append(str(args[0]))
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", spy)
+    conn, err = open_dashboard_ro(path)
+    assert err is None and conn is not None
+    conn.close()
+    assert uris and "mode=ro" in uris[0] and "immutable" not in uris[0]
 
 
 def test_merges_per_day_and_headline(ro_db) -> None:

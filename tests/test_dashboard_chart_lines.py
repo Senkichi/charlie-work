@@ -20,7 +20,8 @@ from charlie_work.dashboard.charts import (
     time_ticks,
 )
 from charlie_work.dashboard.charts.line import segments
-from charlie_work.dashboard.charts.svg import APPROX_DASHES, fit
+from charlie_work.dashboard.charts.model import Reference
+from charlie_work.dashboard.charts.svg import APPROX_DASHES, CHAR_PX, fit
 
 T0 = datetime(2026, 9, 28, tzinfo=UTC)
 DAY = 86400.0
@@ -154,7 +155,8 @@ def test_coverage_shades_before_source_start_and_marker_is_drawn() -> None:
     assert html.count('<rect class="uncovered"') == 0
     assert html.count('<line class="cov-start"') == 1
     assert ">events.db from 2026-09-30</text>" in html
-    assert "sources: old from 2026-09-23 00:00, events.db from 2026-09-30 00:00" in html
+    # coverage text lives once per card in its Coverage: note — never in the caption
+    assert "sources:" not in html
     assert re.search(r'class="marker-rule"[^>]*stroke-dasharray="2 2"', html)
     assert ">exact series starts Oct 1</text>" in html
 
@@ -180,6 +182,14 @@ def test_each_panel_is_shaded_by_its_own_source_only() -> None:
     by_key = {re.search(r"panel-key[^>]*>([ab])<", f).group(1): f for f in figs}
     assert 'class="uncovered"' not in by_key["a"]  # a covers its whole window
     assert by_key["b"].count('class="uncovered"') == 1
+
+
+def test_multiples_caption_never_repeats_source_coverage() -> None:
+    spec = LineSpec("t", coverage=(Coverage("a", day(-9)), Coverage("b", day(3))))
+    html = small_multiples(_panels(), spec, UTC)
+    # like line_chart: coverage is stated once per card in its Coverage: note, so the
+    # grid caption — and no panel — may carry a "sources:" line
+    assert "sources:" not in html
 
 
 def test_empty_series_renders_an_empty_state_not_an_error() -> None:
@@ -250,6 +260,71 @@ def test_coverage_labels_follow_all_shading_and_collapse_past_three() -> None:
     assert group.rfind("<rect") < group.find("<text")  # no shading paints over a label
     notes = re.findall(r'<text class="note"[^>]*>([^<]*)</text>', group)
     assert len(notes) == 1 and notes[0].startswith("5 sources start")
+
+
+def _note_boxes(html: str) -> list[tuple[str, float, float, float, float]]:
+    """(class, x0, x1, y0, y1) of every in-plot annotation label, measured as the
+    renderer does: ``CHAR_PX`` per character, ``_TEXT_H`` of ink above the baseline."""
+    out = []
+    for cls, x, y, anchor, body in re.findall(
+        r'<text class="(note[^"]*)" x="(-?[\d.]+)" y="(-?[\d.]+)" text-anchor="(\w+)">'
+        r"(?:<title>[^<]*</title>)?([^<]*)</text>",
+        html,
+    ):
+        w = len(body) * CHAR_PX
+        x0, x1 = (float(x) - w, float(x)) if anchor == "end" else (float(x), float(x) + w)
+        out.append((cls, x0, x1, float(y) - 11.0, float(y) + 3.0))
+    return out
+
+
+def assert_no_overprint(html: str, width: float = 640.0) -> list:
+    """No two annotation labels' estimated boxes intersect, and none leaves the plot."""
+    boxes = _note_boxes(html)
+    for i, (cls, x0, x1, y0, y1) in enumerate(boxes):
+        assert x0 >= -0.5 and x1 <= width + 0.5, f"{cls} label left the plot: {x0:.0f}..{x1:.0f}"
+        for ocls, ox0, ox1, oy0, oy1 in boxes[i + 1 :]:
+            hit = x0 < ox1 and ox0 < x1 and y0 < oy1 and oy0 < y1
+            assert not hit, f"{cls} overprints {ocls} (x {x0:.0f}..{x1:.0f} y {y0:.0f}..{y1:.0f})"
+    return boxes
+
+
+def test_annotation_labels_never_overprint_or_leave_the_plot() -> None:
+    # coverage starts an hour apart, a marker between them, and two reference rules whose
+    # labels sit exactly where lane 0 would be — every label must land somewhere legal.
+    spec = LineSpec(
+        "t",
+        coverage=(Coverage("alpha", day(1)), Coverage("beta", day(1) + timedelta(hours=3))),
+        markers=(Marker(day(1) + timedelta(hours=1), "exact series starts"),),
+        references=(
+            Reference(4.8, "prior 7d avg", prior=True),
+            Reference(4.6, "this 7d avg"),
+        ),
+    )
+    html = line_chart((Series("a", pts(1, 2, 3, 4, 5)),), spec, UTC)
+    boxes = assert_no_overprint(html)
+    assert any("ref-label" in cls for cls, *_ in boxes)
+    # a marker's text has no card-level fallback, so it is never the label dropped
+    assert "exact series starts" in html
+
+
+def test_a_coverage_label_that_fits_nowhere_is_dropped_not_overprinted() -> None:
+    # rules ten minutes apart (~1px): nothing fits between them, so labels drop and the
+    # card's Coverage: note (not the chart) carries the names.
+    covs = tuple(Coverage(f"source-{i}", day(1) + timedelta(minutes=10 * i)) for i in range(3))
+    html = line_chart((Series("a", pts(1, 2, 3, 4)),), LineSpec("t", coverage=covs), UTC)
+    assert_no_overprint(html)
+    assert html.count('<line class="cov-start"') == 3  # the rules still draw
+
+
+def test_a_coverage_label_never_crosses_the_next_rule() -> None:
+    covs = (Coverage("fresh-eyes", day(1)), Coverage("beta", day(1) + timedelta(hours=2)))
+    html = line_chart((Series("a", pts(1, 2, 3, 4)),), LineSpec("t", coverage=covs), UTC)
+    rules = sorted(float(x) for x in re.findall(r'class="cov-start" x1="([\d.]+)"', html))
+    assert len(rules) == 2
+    for cls, x0, x1, _, _ in _note_boxes(html):
+        for rule in rules:
+            # a label box may touch a rule's side, never straddle it
+            assert not (x0 < rule - 0.5 < x1), (cls, rule)
 
 
 def test_week_window_with_three_ticks_gets_more_than_one_tick() -> None:

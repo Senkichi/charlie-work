@@ -92,6 +92,9 @@ class Series:
     # source -> (first, last) ts of that source's own coverage for this series' kinds
     repo_coverage: dict[str, tuple[str, str]] = field(default_factory=dict)
     stat: str = ""  # per-bucket statistic a chart must name ("median"), "" when obvious
+    # repo -> the raw values behind the buckets (duration kinds only), for the
+    # distribution strip and its p90 reference.
+    samples: dict[str, tuple[float, ...]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -109,7 +112,17 @@ class SeriesSpec:
 
 
 def open_dashboard_ro(path: Path) -> tuple[sqlite3.Connection | None, str | None]:
-    """Open ``dashboard.db`` read-only; ``(conn, error)`` with exactly one None."""
+    """Open ``dashboard.db`` read-only; ``(conn, error)`` with exactly one None.
+
+    ``mode=ro`` and deliberately no ``immutable=1``: the rollup writes this database
+    from the same process the readers live in (``server.py`` runs ``run_rollup``
+    alongside the page handlers), and WAL auto-checkpoint plus the writer's
+    close-checkpoint mutate the main file — an immutable reader takes no locks and
+    can observe a checkpoint mid-write as torn pages. Reading through the WAL
+    protocol may create ``-shm``/``-wal`` sidecars next to the database; that is the
+    accepted price, the same tradeoff ``sources.open_events_ro`` makes for
+    ``events.db``.
+    """
     if not path.is_file():
         return None, f"missing: {path}"
     try:
@@ -200,6 +213,7 @@ def _finish(
     per_repo: dict[str, tuple[Point, ...]],
     n: int,
     flags: dict,
+    samples: dict[str, tuple[float, ...]] | None = None,
 ) -> Series:
     return Series(
         name=spec.name,
@@ -220,6 +234,7 @@ def _finish(
         bucket_seconds=int(q.bucket.total_seconds()),
         n=n,
         repo_coverage=dict(cov.spans),
+        samples=samples or {},
     )
 
 
@@ -261,10 +276,17 @@ def make_series(
         r: _points(q, scope.active_for(r), scope.zero_for(r), b, how)
         for r, b in sorted(by_repo.items())
     }
+    # duration series keep the per-repo raw values (scope-filtered like the buckets) so a
+    # card can draw the distribution behind the per-bucket median.
+    samples = (
+        {r: tuple(v for i in sorted(b) for v in b[i]) for r, b in sorted(by_repo.items())}
+        if spec.kind == "duration"
+        else None
+    )
     # a median line must say so; a repo_sum line is a sum of repo values, not one statistic
     stat = how if how == "median" and spec.combine != "repo_sum" else ""
     flags = {"approx": approx, "partial": partial, "exact_from": exact_from, "stat": stat}
-    return _finish(db, q, spec, scope.cov, points, repo_points, n, flags)
+    return _finish(db, q, spec, scope.cov, points, repo_points, n, flags, samples)
 
 
 def make_ratio_series(

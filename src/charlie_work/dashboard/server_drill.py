@@ -40,9 +40,14 @@ class DrillContext:
     now: datetime
 
 
+# A guaranteed-missing path anchored at this module, not the process cwd: without a
+# configured dashboard.db every drill model reads it as "unavailable", an error value.
+_NOT_CONFIGURED = Path(__file__).resolve().parent / "dashboard.db-not-configured"
+
+
 def _db(ctx: DrillContext) -> Path:
     # No configured dashboard.db reads as "missing" in every model (an error value).
-    return ctx.history_db if ctx.history_db is not None else Path("dashboard.db-not-configured")
+    return ctx.history_db if ctx.history_db is not None else _NOT_CONFIGURED
 
 
 def _param(params: Mapping[str, list[str]], key: str) -> str | None:

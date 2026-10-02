@@ -1,10 +1,13 @@
 """Strip plot with a box for duration distributions (lead time, loop pass duration).
 
 Every sample is a dot (no mean bar: Franconeri rule 18), over a light inter-quartile box,
-with the median and p90 as ticks and stated in text beside the row. Rows share one log
-duration axis (durations span seconds to days; products rule 14) and are sorted by median,
-longest first, ties by label. Approximate rows draw hollow dots and say "approx.".
-Jitter is deterministic (by sample index) so a re-render never moves a dot.
+with the median and p90 as ticks and stated in text beside the row. A row with more than
+``MAX_DOTS`` samples draws a deterministic, evenly spaced subset of the sorted samples —
+the shape survives while the SVG stays bounded; median, p90, IQR and n still use every
+sample. Rows share one log duration axis (durations span seconds to days; products rule
+14) and are sorted by median, longest first, ties by label. Approximate rows draw hollow
+dots and say "approx.". Jitter is deterministic (by sample index) so a re-render never
+moves a dot.
 """
 
 from __future__ import annotations
@@ -21,6 +24,9 @@ from .svg import caption, empty_figure, num, svg_open, text
 ROW_H = 28.0
 _LEFT = 120.0
 _RIGHT_TEXT = 210.0
+# A loop-pass-duration row can carry tens of thousands of samples; the SVG must stay
+# bounded, so past this cap the dots are a subset — never the statistics.
+MAX_DOTS = 200
 
 
 def nearest_rank(values: tuple[float, ...], pct: float) -> float:
@@ -32,6 +38,16 @@ def nearest_rank(values: tuple[float, ...], pct: float) -> float:
 
 def _jitter(i: int) -> float:
     return float((i * 7) % 5 - 2) * 2.5
+
+
+def _dots(values: tuple[float, ...]) -> tuple[float, ...]:
+    """The samples drawn as dots: all of them, or ``MAX_DOTS`` evenly spaced over the
+    sorted samples (endpoints included) — deterministic, so a re-render draws the same."""
+    if len(values) <= MAX_DOTS:
+        return values
+    ordered = sorted(values)
+    last = len(ordered) - 1
+    return tuple(ordered[round(i * last / (MAX_DOTS - 1))] for i in range(MAX_DOTS))
 
 
 def _stats(d: Distribution) -> str:
@@ -55,7 +71,7 @@ def _row(d: Distribution, y: float, x: Linear) -> str:
             f'<rect class="iqr" x="{num(px(q1))}" y="{num(y - 8)}" '
             f'width="{num(max(px(q3) - px(q1), 1.0))}" height="16"/>'
         )
-        for i, v in enumerate(d.values):
+        for i, v in enumerate(_dots(d.values)):
             out.append(
                 f'<circle class="sample" cx="{num(px(v))}" cy="{num(y + _jitter(i))}" r="2.5"/>'
             )

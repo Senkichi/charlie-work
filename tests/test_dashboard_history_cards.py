@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime
 
 from charlie_work.dashboard.metrics_base import Series
-from charlie_work.dashboard.pages.history_cards import _chart_coverage, _panels
+from charlie_work.dashboard.pages.history_cards import (
+    _chart_coverage,
+    _distribution,
+    _panels,
+    _references,
+)
 
 START = datetime(2026, 9, 1, tzinfo=UTC)
 END = datetime(2026, 10, 1, tzinfo=UTC)
@@ -114,3 +120,90 @@ def test_stage_time_titles_use_display_names() -> None:
 
     assert set(STAGES) <= set(STAGE_NAMES)
     assert all("_" not in name for name in STAGE_NAMES.values())
+
+
+def test_p90_reference_uses_the_raw_samples_in_chart_units() -> None:
+    head = _series(
+        kind="duration", unit="hours", samples={"o/a": tuple(float(v) for v in range(1, 11))}
+    )
+    refs = _references(None, "7d", head)
+    # nearest-rank p90 over all repos' samples (9th of 1..10), in the series' own unit
+    # (hours here — the combined chart's axis — not the strip's seconds)
+    assert [(r.label, r.value, r.prior) for r in refs] == [("p90", 9.0, False)]
+    refs = _references((4.0, 1.0), "7d", head)
+    assert [r.label for r in refs] == ["prior 7d avg", "this 7d avg", "p90"]
+    assert [r.prior for r in refs] == [True, False, False]
+    # only duration kinds get the p90 rule; an empty sample map adds nothing
+    assert _references(None, "7d", _series(kind="count", samples={"o/a": (1.0,)})) == ()
+    assert _references(None, "7d", _series(kind="duration")) == ()
+
+
+def test_distribution_scales_samples_to_seconds_and_pools_repos() -> None:
+    head = _series(
+        label="Lead time",
+        kind="duration",
+        unit="hours",
+        approx=True,
+        samples={"o/alpha": (1.0, 2.0), "o/beta": (3.0,)},
+    )
+    html = _distribution(head, (START, END), UTC)
+    assert 'class="strip-chart"' in html
+    # hours -> seconds on the strip's log axis: alpha's 1h/2h read as 1h30m/2h00m
+    assert "median 1h30m · p90 2h00m · n 2 approx." in html
+    # several sources pool an 'all' row carrying every sample (p90 of 1h,2h,3h = 3h)
+    assert ">all</text>" in html and "median 2h00m · p90 3h00m · n 3 approx." in html
+    assert '<g class="dist approx">' in html
+
+
+def test_distribution_needs_samples_and_a_known_unit() -> None:
+    assert _distribution(_series(kind="duration", unit="hours"), (START, END), UTC) == ""
+    parsecs = _series(kind="duration", unit="parsecs", samples={"o/a": (1.0,)})
+    assert _distribution(parsecs, (START, END), UTC) == ""
+    # one repo only: no pooled 'all' row (it would repeat the same samples)
+    single = _series(kind="duration", unit="seconds", samples={"o/a": (60.0, 120.0)})
+    html = _distribution(single, (START, END), UTC)
+    assert ">all</text>" not in html and "median 1m30s · p90 2m00s · n 2" in html
+
+
+def test_a_multi_panel_card_states_coverage_exactly_once() -> None:
+    from charlie_work.dashboard.history_data import HistoryView, MetricData, range_query
+    from charlie_work.dashboard.pages.history_cards import render_card
+
+    q = range_query("7d", END, UTC)
+    pts = tuple((f"2026-09-{d:02d}T00:00:00Z", 1.0) for d in range(24, 30))  # fmt: skip
+    head = _series(
+        name="m",
+        points=pts,
+        n=6,
+        per_repo={"o/alpha": pts, "o/beta": pts},
+        repo_coverage={
+            "o/alpha": ("2026-09-01T00:00:00Z", "2026-09-30T00:00:00Z"),
+            "o/beta": ("2026-09-26T00:00:00Z", "2026-09-30T00:00:00Z"),  # starts in-window
+        },
+        window_start=q.start_iso,
+        window_end=q.end_iso,
+        bucket_seconds=int(q.bucket.total_seconds()),
+    )
+    view = HistoryView("flow", "7d", q, (), END)
+    html = render_card(view, MetricData("m", (head,), {"m": "t"}), UTC)
+    assert 'data-panels="2"' in html  # the per-repo grid really rendered
+    # the combined chart and every panel draw coverage as ink; prose states it once
+    assert html.count("Coverage:") == 1
+    assert "sources:" not in html
+
+
+def test_a_render_fault_gets_its_own_message_and_is_logged(caplog) -> None:
+    from charlie_work.dashboard.history_data import HistoryView, MetricData, range_query
+    from charlie_work.dashboard.pages.history_cards import render_cards
+
+    q = range_query("7d", END, UTC)
+    # an unparseable point timestamp crashes render_card — a render fault, not a
+    # malformed stored row, so the card must not claim one
+    head = _series(name="m", points=(("not-a-timestamp", 1.0),), n=1,
+                   window_start=q.start_iso, window_end=q.end_iso,
+                   bucket_seconds=int(q.bucket.total_seconds()))  # fmt: skip
+    view = HistoryView("flow", "7d", q, (MetricData("m", (head,), {"m": "t"}),), END)
+    with caplog.at_level(logging.ERROR, "charlie_work.dashboard"):
+        html = render_cards(view, UTC)
+    assert "the card failed to render" in html and "a stored row" not in html
+    assert any(r.name == "charlie_work.dashboard" and r.exc_info for r in caplog.records)
