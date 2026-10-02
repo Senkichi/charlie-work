@@ -3,7 +3,10 @@
 ``make_server`` builds (never starts) the server and returns a ``ServerError`` value on
 a config problem (non-loopback host, bind failure). ``run_server`` starts the collector
 thread(s) plus the accept loop and blocks until a stop ``Event`` is set. The server never
-writes fleet state and never calls GitHub: all data comes from ``ReadModel``.
+writes fleet state and never calls GitHub: Now reads ``ReadModel``; History reads
+``dashboard.db`` read-only through the per-(tab, range) ``HistoryCache``; the drill-downs
+(``server_drill``) read ``dashboard.db`` and, for one loop pass, one registered events.db,
+both read-only.
 """
 
 from __future__ import annotations
@@ -14,13 +17,17 @@ import ipaddress
 import json
 import logging
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from http.server import ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs
 
 from .config import DashboardConfig
+from .history_data import HistoryCache, history_cache, pick_range, pick_tab
+from .pages.history import render_history
 from .pages.now import render_fragment, render_now
 from .read_model import (
     Clock,
@@ -32,12 +39,15 @@ from .read_model import (
     start_workers,
     to_plain,
 )
+from .pages.drill_shell import not_found_page
+from .server_drill import DrillContext, drill_response
 from .server_http import (
     CSP,
     MAX_DRAIN_BYTES,
     DashboardHTTPServer,
     SecureHandler,
 )
+from .sources import RepoSource
 from .theme import assets
 
 __all__ = ["CSP"]
@@ -65,17 +75,23 @@ class ServerError:
 
 @dataclass(frozen=True)
 class DashboardSources:
-    """Injected data sources: the collector pass and the optional rollup pass."""
+    """Injected data sources: the collector pass, the optional rollup pass, the
+    ``dashboard.db`` History reads (None: History says the rollup is not available), and the
+    fleet registry's repos (the loop-pass drill-down opens one of their events.db files)."""
 
     collect: Collect
     rollup: RollupRun | None = None
+    history_db: Path | None = None
+    repos: Callable[[], Sequence[RepoSource]] = tuple
 
 
 def default_sources(fleet_dir_override: str | None, collector_interval: float) -> DashboardSources:
     """Real fleet sources (read-only collector + alarm leaves, and the rollup)."""
+    from .. import layout
     from .alarm_feed import loop_pass_findings
     from .now_collect import collect_sources_read
     from .rollup import rollup_sources, run_rollup
+    from .sources import enumerate_repos
 
     def collect(now: datetime):
         read = collect_sources_read(now, fleet_dir_override)
@@ -85,7 +101,12 @@ def default_sources(fleet_dir_override: str | None, collector_interval: float) -
     def rollup(now: datetime) -> tuple[str, ...]:
         return run_rollup(rollup_sources(fleet_dir_override), now).errors
 
-    return DashboardSources(collect, rollup)
+    return DashboardSources(
+        collect,
+        rollup,
+        layout.dashboard_db_path(override=fleet_dir_override),
+        lambda: enumerate_repos(fleet_dir_override),
+    )
 
 
 def _is_loopback_host(host: str) -> bool:
@@ -118,8 +139,18 @@ def _utcnow() -> datetime:
 class _App:
     """Per-server state the handler reads (set on the httpd instance)."""
 
-    def __init__(self, holder: ReadModel, config: DashboardConfig, clock: Clock, port: int):
+    def __init__(
+        self,
+        holder: ReadModel,
+        config: DashboardConfig,
+        clock: Clock,
+        port: int,
+        history: HistoryCache,
+        sources: DashboardSources,
+    ):
         self.holder = holder
+        self.history = history
+        self.sources = sources
         self.config = config
         self.clock = clock
         self.allowed_hosts = frozenset({f"127.0.0.1:{port}", f"localhost:{port}"})
@@ -167,11 +198,13 @@ class _Handler(SecureHandler):
     def _route(self) -> None:
         if not self._guard():
             return
-        path = self.path.split("?", 1)[0].split("#", 1)[0]
+        path, _, query = self.path.split("#", 1)[0].partition("?")
         state = self.app.holder.get()
         poll = self.app.config.poll_interval_seconds
         if path in ("/", "/now"):
             self._html(render_now(state, poll_seconds=poll, stalled=self._stalled(state)))
+        elif path == "/history":
+            self._history(parse_qs(query), state)
         elif path == "/now/fragment":
             self._html(render_fragment(state, poll, self._stalled(state)))
         elif path == "/api/now.json":
@@ -191,8 +224,12 @@ class _Handler(SecureHandler):
             self._send(200, assets.stylesheet().encode("utf-8"), "text/css; charset=utf-8")
         elif path.startswith("/static/"):
             self._static(path[len("/static/") :])
-        else:
+        elif (drilled := self._drill(path, query, state)) is not None:
+            self._html(drilled[1], drilled[0])
+        elif path.startswith("/api/"):
             self._text(404, "not found")
+        else:  # every other unknown page is the house-style 404, with nav and skip link
+            self._html(not_found_page(state), 404)
 
     def do_GET(self) -> None:  # noqa: N802
         try:
@@ -208,6 +245,19 @@ class _Handler(SecureHandler):
             )
 
     do_HEAD = do_GET  # noqa: N815 - same routes, no body (see ``_send``)
+
+    def _history(self, params: dict[str, list[str]], state: ModelState) -> None:
+        tab = pick_tab((params.get("tab") or [None])[0])
+        range_key = pick_range((params.get("range") or [None])[0])
+        # the same registry the /repo drill admits, so a panel link never 404s
+        known = frozenset(f.repo for f in state.model.freshness) if state.model else frozenset()
+        view = self.app.history.get(tab, range_key)
+        self._html(render_history(view, tab, range_key, known_repos=known))
+
+    def _drill(self, path: str, query: str, state: ModelState) -> tuple[int, str] | None:
+        src = self.app.sources
+        ctx = DrillContext(state, src.history_db, src.repos, self.app.clock())
+        return drill_response(path, parse_qs(query), ctx)
 
     def _static(self, relpath: str) -> None:
         try:
@@ -254,7 +304,9 @@ def make_server(
     except OSError as exc:
         return ServerError(f"cannot bind {config.host}:{config.port}: {exc}")
     holder = ReadModel()
-    httpd.app = _App(holder, config, clock, int(httpd.server_address[1]))  # type: ignore[attr-defined]
+    history = history_cache(sources.history_db, float(config.rollup_interval_seconds), clock)
+    port = int(httpd.server_address[1])
+    httpd.app = _App(holder, config, clock, port, history, sources)  # type: ignore[attr-defined]
     return DashboardServer(httpd, holder, config, sources, clock)
 
 
