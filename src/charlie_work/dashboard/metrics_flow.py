@@ -23,7 +23,7 @@ from .rollup_schema import FLEET_SOURCE
 
 EXACT_KINDS = ("lifecycle_transition", "ready_observed")
 _VERDICTS = ("verdict_approved", "verdict_request_changes", "verdict_blocked")
-_PR_OPENED = ("pr_opened_by_worker", "pr_opened_by_salvage")
+_PR_OPENED = ("pr_opened_by_worker", "pr_opened_by_salvage", "pr_open_after_dead_worker")
 # stage -> (milestones that enter it, milestones that leave it), approx path only.
 APPROX_STAGES: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
     "in_progress": (("dispatched",), _PR_OPENED),

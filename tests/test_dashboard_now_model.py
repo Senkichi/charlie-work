@@ -247,7 +247,7 @@ def test_capacity_workers_reviewers_runners_and_capped_demand(fleet) -> None:
     assert (cap.workers_live, cap.workers_cap) == (3, 3)
     assert [(w.repo, w.live, w.cap) for w in cap.workers_by_repo] == [
         ("owner/alpha", 2, 2),
-        ("owner/beta", 1, None),
+        ("owner/beta", 1, 0),  # no per-repo cap configured: 0 = no cap, not unknown
     ]
     assert (cap.reviewers_live, cap.reviewers_cap) == (1, 6)
     assert [(w.repo, w.live, w.cap) for w in cap.reviewers_by_repo] == [
@@ -389,3 +389,10 @@ def test_per_repo_stage_counts_and_need_you(fleet) -> None:
     # Per-repo counts sum to the fleet stages.
     for idx, stage in enumerate(model.flow.stages):
         assert sum(r.stages[idx].count for r in model.repos) == stage.count
+
+
+def test_cap_text_distinguishes_no_cap_from_unknown() -> None:
+    from charlie_work.dashboard.pages.now_fmt import cap_text
+
+    assert [cap_text(c, compact=True) for c in (None, 0, 5)] == ["?", "∞", "5"]
+    assert [cap_text(c) for c in (None, 0, 5)] == ["cap ?", "no cap", "5"]

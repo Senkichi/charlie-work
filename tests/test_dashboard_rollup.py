@@ -274,3 +274,64 @@ def test_replaced_source_db_is_rebuilt(fleet) -> None:
 )
 def test_reason_group(reason, group) -> None:
     assert reason_group(reason) == group
+
+
+def test_reaper_sweep_summaries_expand_into_per_issue_milestones(fleet, monkeypatch) -> None:
+    """The real reaper writer folds same-kind events into ``<kind>_sweep`` (numbers only);
+    the rollup must still give every issue in the batch its PR-open milestone."""
+    from charlie_work import instrumentation
+    from charlie_work.stalled_review_reap import _append_sweep_events
+    from charlie_work.write_gate import WriteGate
+
+    gate = WriteGate(dry_run=False, state_path=fleet.alpha / "state.json", repo=ALPHA)
+    kind = "orphaned_worker_advanced_to_pr_open"
+    batches = [
+        (
+            "2026-10-01T10:00:00Z",
+            [{"issue_number": 11, "pr_number": 21}, {"issue_number": 12, "pr_number": 22}],
+        ),
+        ("2026-10-01T10:05:00Z", [{"issue_number": 13, "pr_number": 23}]),
+        ("2026-10-01T10:10:00Z", [{"issue_number": 14}, {"issue_number": 15}]),
+    ]
+    for ts, payloads in batches:
+        monkeypatch.setattr(instrumentation, "_now_iso", lambda ts=ts: ts)
+        _append_sweep_events({}, [(kind, p) for p in payloads], write_gate=gate)
+    batches_alt = [{"issue_number": 16}, {"issue_number": 17}]
+    monkeypatch.setattr(instrumentation, "_now_iso", lambda: "2026-10-01T10:15:00Z")
+    _append_sweep_events(
+        {}, [("worker_handoff_pr_opened", p) for p in batches_alt], write_gate=gate
+    )
+
+    result = rollup.run_rollup(fleet.sources(), NOW)
+    assert result.errors == ()
+    rows = _all(
+        fleet.db(),
+        "SELECT issue, pr, milestone, event_kind, approx FROM issue_milestones "
+        "WHERE issue BETWEEN 11 AND 17 ORDER BY issue",
+    )
+    assert rows == [
+        (11, None, "pr_open_after_dead_worker", f"{kind}_sweep", 1),
+        (12, None, "pr_open_after_dead_worker", f"{kind}_sweep", 1),
+        (13, 23, "pr_open_after_dead_worker", kind, 1),
+        (14, None, "pr_open_after_dead_worker", f"{kind}_sweep", 1),
+        (15, None, "pr_open_after_dead_worker", f"{kind}_sweep", 1),
+        (16, None, "pr_opened_by_worker", "worker_handoff_pr_opened_sweep", 0),
+        (17, None, "pr_opened_by_worker", "worker_handoff_pr_opened_sweep", 0),
+    ]
+
+
+def test_sweep_expansion_only_wraps_ref_only_handlers() -> None:
+    from charlie_work.dashboard.rollup_derive import HANDLERS, REF_ONLY, SWEEP_SUFFIX, derive_event
+
+    sweeps = {k for k in HANDLERS if k.endswith(SWEEP_SUFFIX)}
+    assert sweeps == {k + SWEEP_SUFFIX for k in REF_ONLY}
+    ev = {
+        "id": 1,
+        "ts": "2026-10-01T10:00:00Z",
+        "kind": "orphaned_worker_opened_pr_sweep",
+        "issue_number": None,
+        "pr_number": None,
+        "payload": {"count": 2, "pr_numbers": [40, 41]},
+    }
+    rows = derive_event(ALPHA, ev)
+    assert [(c["issue"], c["pr"], c["seq"]) for _t, c in rows] == [(None, 40, 0), (None, 41, 1)]

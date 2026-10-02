@@ -153,8 +153,8 @@ class FlowModel:
 @dataclass(frozen=True)
 class RepoWorkers:
     repo: str
-    live: int
-    cap: int | None
+    live: int  # as of the repo's last loop-pass snapshot, not a process count
+    cap: int | None  # 0 = no per-repo cap (dispatch.max_concurrent_sessions); None = unknown
 
 
 @dataclass(frozen=True)
