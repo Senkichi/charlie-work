@@ -8,6 +8,11 @@ of ``src/charlie_work/**``, never hardcoded: any module that
 
 - contains an ``ast.Constant`` equal to ``"session_failed_relabeled"``
   (``emit(...)``, ``append_event(...)``, ``DriftItem(kind=...)``), or
+- passes the ``SESSION_FAILED_RELABELED`` constant (``Name``/``Attribute``)
+  as a positional argument or keyword value of any call -- the same emit
+  spelled through the constant owned by ``decide_common``. A reference in a
+  module-level tuple/frozenset is a read filter (e.g. attempt_resume's
+  death-kind list), not a producer, so it does not count; or
 - calls one of the relabeled-event emitters
   (``_emit_session_failed_relabeled``, ``session_failed_relabeled_payload``,
   ``_session_failed_relabeled_payload``)
@@ -77,6 +82,15 @@ def _call_name(func: ast.expr) -> str | None:
     return None
 
 
+_REQUEUE_CONST = "SESSION_FAILED_RELABELED"
+
+
+def _is_const_ref(node: ast.expr) -> bool:
+    return (isinstance(node, ast.Name) and node.id == _REQUEUE_CONST) or (
+        isinstance(node, ast.Attribute) and node.attr == _REQUEUE_CONST
+    )
+
+
 def _module_facts(tree: ast.Module) -> tuple[bool, bool, set[str]]:
     """Return (is_producer, is_definer, referenced_names) for one module."""
     is_producer = False
@@ -87,6 +101,10 @@ def _module_facts(tree: ast.Module) -> tuple[bool, bool, set[str]]:
             is_producer = True
         elif isinstance(node, ast.Call):
             if _call_name(node.func) in _EMITTER_DEFS:
+                is_producer = True
+            if any(_is_const_ref(a) for a in node.args) or any(
+                _is_const_ref(k.value) for k in node.keywords
+            ):
                 is_producer = True
         elif isinstance(node, ast.Name):
             names.add(node.id)
@@ -163,3 +181,29 @@ def test_park_salvageable_local_orphan_delegates_to_shared_helper() -> None:
         "probe lives in salvage_dead_worker_commits; duplicate probing is "
         "how the loci diverged in the first place"
     )
+
+
+def _facts(source: str) -> bool:
+    return _module_facts(ast.parse(source))[0]
+
+
+def test_guard_counts_emit_through_the_constant_as_a_producer() -> None:
+    assert _facts("emit(SESSION_FAILED_RELABELED, {'issue_number': 1})")
+    assert _facts("emit(kind=SESSION_FAILED_RELABELED)")
+    assert _facts("emit(mod.SESSION_FAILED_RELABELED, {})")
+
+
+def test_guard_ignores_the_constant_in_a_read_filter() -> None:
+    assert not _facts('X = (SESSION_FAILED_RELABELED, "session_exited")')
+    assert not _facts("Y = frozenset({SESSION_FAILED_RELABELED})")
+
+
+def test_guard_still_counts_the_bare_literal_anywhere() -> None:
+    assert _facts('emit("session_failed_relabeled", {})')
+    assert _facts('X = ("session_failed_relabeled", "session_exited")')
+
+
+def test_attempt_resume_is_not_a_requeue_locus() -> None:
+    assert "src/charlie_work/attempt_resume.py" not in {
+        p.replace("\\", "/") for p in _requeue_loci()
+    }

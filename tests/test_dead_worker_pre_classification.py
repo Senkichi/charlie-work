@@ -20,6 +20,7 @@ import pytest
 from _dispatch_fixtures import _stub_real_activity_probe_for_stalled_tests  # noqa: F401
 from _fakes_github import FakeGitHub
 from _rework_dispatch_fixtures import _wg
+from _worktree_fixtures import _wt_scratch as _register_wt_scratch  # noqa: F401 -- registers the wt_scratch fixture (shallow tmp dir for real ``git worktree add``)
 from charlie_work import role_quota_ledger, worker_fate
 from charlie_work.adapters import (
     AdapterSettings,
@@ -319,3 +320,58 @@ def test_dry_run_sweep_does_not_classify(tmp_path: Path) -> None:
     assert role_quota_ledger.load_restrictions() == {}
     sidecar = json.loads((sessions_dir / f"issue-{ISSUE}.json").read_text(encoding="utf-8"))
     assert "failure_kind" not in sidecar or sidecar["failure_kind"] is None
+
+
+def test_orphan_sweep_death_event_carries_the_throttle_classification(tmp_path: Path) -> None:
+    """Issue #2289: the no-PR orphan sweep's death event names the throttle kind.
+
+    ``attempt_resume`` reads the failure kind off this event, so a
+    ``session_failed_relabeled`` with ``failure_kind: None`` would hide every
+    throttle death this lane handles.
+    """
+    config = _config()
+    paths, sessions_dir, gh = _seed_dead_primary(tmp_path / "a", config)
+
+    _sweep(paths, sessions_dir, config, gh)
+
+    [event] = query_events(paths.state_file, kind="session_failed_relabeled")
+    assert event["payload"]["reason"] == "dead_worker_no_open_pr_orphan_sweep"
+    assert event["payload"]["failure_kind"] == "rate_limited"
+
+
+def test_orphan_sweep_throttle_death_then_rescue_ref_seeds_the_redispatch(
+    wt_scratch: Path,
+) -> None:
+    """End to end: the real sweep's event plus a rescue ref makes create_worktree seed."""
+    import time
+
+    from _worktree_fixtures import _init_repo
+    from charlie_work.worktree import (
+        _capture_worktree_work_to_rescue_ref,
+        create_worktree,
+        remove_worktree,
+    )
+
+    root = wt_scratch / "repo"
+    _init_repo(root)
+    config = _config()
+    paths, sessions_dir, gh = _seed_dead_primary(root, config)
+    branch = f"agent/issue-{ISSUE}"
+    info = create_worktree(root, branch, base_ref="HEAD", issue_number=ISSUE)
+    (info.path / "work.txt").write_text("603 lines of real work\n", encoding="utf-8")
+
+    _sweep(paths, sessions_dir, config, gh)
+    time.sleep(1.1)  # the rescue ref is made at redispatch, after the death
+    capture = _capture_worktree_work_to_rescue_ref(root, info.path, ISSUE)
+    assert capture.error is None
+    assert remove_worktree(root, info.path, force=True, branch=branch)
+
+    redispatched = create_worktree(
+        root, branch, base_ref="HEAD", issue_number=ISSUE, config=config
+    )
+
+    assert redispatched.resumed_attempt is not None
+    assert redispatched.resumed_attempt.ref == capture.ref_name
+    assert (redispatched.path / "work.txt").read_text(encoding="utf-8") == (
+        "603 lines of real work\n"
+    )
