@@ -357,7 +357,7 @@ def test_save_state_retries_transient_permission_error(tmp_path: Path, monkeypat
     on_disk = json.loads(state_path.read_text(encoding="utf-8"))
     assert on_disk["issues"]["1"]["status"] == "new"
     # No leftover tmp file.
-    assert not (tmp_path / "state.json.tmp").exists()
+    assert not list(tmp_path.glob("*.tmp"))
 
 
 def test_save_state_raises_after_retry_exhausted_permission_error(
@@ -392,9 +392,9 @@ def test_save_state_raises_after_retry_exhausted_permission_error(
     # The previous valid file is untouched.
     on_disk = json.loads(state_path.read_text(encoding="utf-8"))
     assert on_disk["issues"]["1"]["status"] == "old"
-    # The tmp file is left behind (the replace never succeeded); it is not the
-    # writer's job to clean it up, and a later successful save reuses it.
-    assert (tmp_path / "state.json.tmp").exists()
+    # The failed write's unique tmp file is unlinked on the way out (issue
+    # #2265): a failed save leaves no orphan behind.
+    assert not list(tmp_path.glob("*.tmp"))
 
 
 def test_load_state_quarantines_utf16le_bom(tmp_path: Path, caplog) -> None:

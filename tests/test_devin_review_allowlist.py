@@ -84,7 +84,7 @@ def test_review_launch_writes_allowlist_atomically(
         "permissions": {"allow": list(_REVIEW_EXEC_ALLOWLIST)}
     }
     # Atomic temp-file + replace: no leftover temp file.
-    assert not cfg.with_suffix(cfg.suffix + ".tmp").exists()
+    assert not list(cfg.parent.glob("*.tmp"))
 
 
 def test_review_allowlist_written_before_popen(
@@ -288,14 +288,18 @@ def test_review_prompt_write_failure_falls_back_to_original(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     popen_calls = _patch_launch(monkeypatch, {})
-    real_write_text = Path.write_text
+    real_replace = Path.replace
 
-    def boom(self: Path, *args: Any, **kwargs: Any) -> int:
-        if ".devin.md" in self.name:
+    def boom(self: Path, *args: Any, **kwargs: Any) -> Path:
+        # The derived prompt is staged via atomic_write's unique tmp file
+        # (``prompt.devin.<rand>.md.tmp`` -- ``Path.stem`` keeps ``.devin``)
+        # and landed by an atomic rename, so the failure is injected at the
+        # rename rather than at Path.write_text.
+        if ".devin." in self.name:
             raise OSError("disk full")
-        return real_write_text(self, *args, **kwargs)
+        return real_replace(self, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "write_text", boom)
+    monkeypatch.setattr(Path, "replace", boom)
     with caplog.at_level("WARNING"):
         record = _launch(tmp_path, review=True)
 

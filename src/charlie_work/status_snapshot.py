@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from . import layout
+from .atomic_write import write_json_atomic
 from .command_result import CommandResult
 from .state import utc_now
 
@@ -104,11 +105,6 @@ def write_status_snapshot(app: OrchestratorApp) -> None:
             "data": result.data,
         }
         path = snapshot_path(app.paths.root)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = path.with_suffix(path.suffix + ".tmp")
-        with tmp_path.open("w", encoding="utf-8") as handle:
-            json.dump(envelope, handle, indent=2, sort_keys=True)
-            handle.write("\n")
-        tmp_path.replace(path)
+        write_json_atomic(path, envelope)
     except Exception:
         _LOG.warning("status snapshot write failed for %s", app.repo_root, exc_info=True)

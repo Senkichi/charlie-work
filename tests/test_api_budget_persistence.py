@@ -149,8 +149,9 @@ def test_save_ledger_uses_atomic_temp_replace(tmp_path: Path) -> None:
     observes a half-written file)."""
     path = ledger_path(tmp_path)
     save_ledger(path, settle_session(Ledger(), _entry()))
-    # No leftover temp file.
-    assert not (tmp_path / "api-budget.json.tmp").exists()
+    # No leftover temp file (unique per-writer name, unlinked on failure —
+    # issue #2265; after a successful write the only artifact is the ledger).
+    assert not list(tmp_path.glob("*.tmp"))
     # The file is valid, parseable JSON.
     data = json.loads(path.read_text(encoding="utf-8"))
     assert "days" in data
@@ -165,10 +166,11 @@ def test_save_ledger_no_plain_open_write_on_ledger_path(tmp_path: Path) -> None:
     and no bare ``open(<ledger path>, "w")`` exists for the ledger file itself.
     """
     src = Path(api_budget.__file__).read_text(encoding="utf-8")
-    # save_ledger opens the TMP path for writing, then replaces — never the
-    # ledger path directly. Assert the canonical pattern is present.
-    assert 'tmp_path = path.with_suffix(path.suffix + ".tmp")' in src
-    assert "tmp_path.replace(path)" in src
+    # The temp + replace write is delegated to the shared atomic_write helper
+    # (issue #2265: unique temp name + retry + orphan cleanup) — never the
+    # ledger path directly, and no hand-rolled fixed-name tmp file.
+    assert "write_json_atomic" in src
+    assert 'with_suffix(path.suffix + ".tmp")' not in src
     # No plain open(path, "w") on the ledger path itself.
     assert 'open(path, "w")' not in src
     assert "open(path, 'w')" not in src

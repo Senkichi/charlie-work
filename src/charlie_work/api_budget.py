@@ -56,6 +56,8 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Iterable, Mapping
 
+from .atomic_write import write_json_atomic
+
 if TYPE_CHECKING:  # annotations only; keeps this module importable below config
     from .config import ApiBudgetConfig, ApiProviderConfig
 
@@ -502,17 +504,14 @@ def load_ledger(path: Path) -> Ledger:
 
 
 def save_ledger(path: Path, ledger: Ledger) -> None:
-    """Atomically persist ``ledger`` to ``path`` (temp-file + ``replace()``).
+    """Atomically persist ``ledger`` to ``path``.
 
-    Mirrors ``state.save_state`` / ``claude_code._write_json_atomic``: the
-    write is atomic so a concurrent reader never observes a half-written file.
+    Mirrors ``state.save_state`` / ``claude_code._write_json_atomic`` -- all
+    now delegating to ``atomic_write.write_json_atomic`` (unique temp name +
+    rename retry + orphan cleanup, issue #2265): a concurrent reader never
+    observes a half-written file.
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    with tmp_path.open("w", encoding="utf-8") as handle:
-        json.dump(ledger_to_dict(ledger), handle, indent=2, sort_keys=True)
-        handle.write("\n")
-    tmp_path.replace(path)
+    write_json_atomic(path, ledger_to_dict(ledger))
 
 
 def settle_session_to_disk(path: Path, entry: SessionEntry) -> bool:

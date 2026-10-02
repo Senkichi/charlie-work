@@ -44,6 +44,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from .atomic_write import write_json_atomic
 from .file_lock import try_acquire_byte_range_lock
 from .fleet_paths import fleet_dir
 from .harnesses import HARNESS_REGISTRY
@@ -157,9 +158,7 @@ def record_restriction(
         }
         payload = {"version": LEDGER_VERSION, "restrictions": restrictions}
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        tmp.replace(path)
+        write_json_atomic(path, payload)
         return True
     except OSError as exc:
         logger.warning("role quota ledger write failed: %s", exc)
@@ -208,9 +207,7 @@ def stamp_session(sidecar: Path | None, stamp: Mapping[str, Any]) -> bool:
         if not isinstance(payload, dict):
             return False
         payload[SESSION_ROLE_KEY] = dict(stamp)
-        tmp = sidecar.with_suffix(sidecar.suffix + ".tmp")
-        tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        tmp.replace(sidecar)
+        write_json_atomic(sidecar, payload)
         return True
     except (OSError, json.JSONDecodeError) as exc:
         logger.warning("role stamp on %s failed: %s", sidecar, exc)

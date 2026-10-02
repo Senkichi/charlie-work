@@ -66,8 +66,16 @@ def test_write_is_atomic_temp_then_replace(tmp_path: Path, monkeypatch: Any) -> 
     monkeypatch.setattr(Path, "replace", _spy)
     path = write_fleet_pause(str(tmp_path), reason="maintenance")
 
-    assert replaced == [(path.with_suffix(path.suffix + ".tmp"), path)]
-    assert not path.with_suffix(path.suffix + ".tmp").exists()
+    assert len(replaced) == 1
+    tmp_used, target = replaced[0]
+    assert target == path
+    # Unique temp name in the destination dir (issue #2265), still matching
+    # the ``*.json.tmp`` orphan-sweep glob.
+    assert tmp_used.parent == path.parent
+    assert tmp_used.name != path.with_suffix(path.suffix + ".tmp").name
+    assert tmp_used.name.startswith(f"{path.stem}.")
+    assert tmp_used.name.endswith(f"{path.suffix}.tmp")
+    assert not list(path.parent.glob("*.tmp"))
     payload = json.loads(path.read_text(encoding="utf-8"))
     assert payload["reason"] == "maintenance"
     assert path == layout.fleet_pause_path(str(tmp_path))
