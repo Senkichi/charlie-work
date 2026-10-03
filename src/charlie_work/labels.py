@@ -278,6 +278,24 @@ def ready_episode_open(state_path: Path, issue_number: int) -> bool:
     )
 
 
+def ready_observed_due(
+    state_path: Path,
+    labels: LabelConfig,
+    issue_number: int,
+    issue_labels: Iterable[str],
+) -> bool:
+    """True when this sighting of the issue should emit ``ready_observed``.
+
+    ``ready_observed`` fires once per issue per Ready episode. The episode
+    boundary lives in events.db, not the label cache — intake only fetches
+    ready-labelled issues, so an entry's ``labels`` cannot record absence.
+    ``ready_episode_open`` reads the event chain: open while the last
+    recorded state keeps ``ready``, closed by ``done``/``closed``, so a
+    re-armed issue emits again.
+    """
+    return labels.ready in issue_labels and not ready_episode_open(state_path, issue_number)
+
+
 def _emit_lifecycle_transition(
     state_path: Path,
     *,

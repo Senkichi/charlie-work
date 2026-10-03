@@ -1,7 +1,8 @@
-5600
-# Issue #2226 rework: the ready_observed intake block left this file at
-# 5399 against the 5400 mark, and the base-branch merge pushed it to 5404.
-# The new behavior lives in labels.py (ready_episode_open) -- what grew
-# here is the intake call-site glue plus a handful of merged main-side
-# lines. Reviewed mark raised to the next MARK_QUANTUM multiple per the
-# hand-raise rule.
+5400
+# Issue #2226 rework: the ready_observed intake block plus a base-branch
+# merge had pushed the live count past the 5400 mark. Rather than keep the
+# hand-raise, the ``intake`` method was extracted verbatim to
+# orchestration/state_intake.py (the canonical delegate move, per the
+# #1632/#1645-#1647 lineage) and the new-episode computation moved into
+# labels.ready_observed_due. Live count fell to 5284, so the mark returns
+# to the previous 5400 per the lower-only refresh rule.
