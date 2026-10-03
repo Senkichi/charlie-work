@@ -310,6 +310,18 @@ def role_key_for_session(
     return (stamped_harness, stamped_model)
 
 
+def role_key_for_view(sessions_dir: Path, view: Any) -> tuple[str | None, str | None]:
+    """The ``(harness, model)`` pair of the session's role stamp, unpacked.
+
+    The single unwrapping site for the #2279 window writers: every arming
+    site (``worker_fate`` evidence, the stalled/dead/reconcile throttle
+    lanes, ``stalled_review_reap``'s quota record) needs the stamp as a
+    ``harness``/``model`` kwarg pair, and ``(None, None)`` -- never the
+    ``| None`` key itself -- is the unstamped answer each one writes.
+    """
+    return role_key_for_session(sessions_dir, view.adapter_kind, view.issue_number) or (None, None)
+
+
 def record_view(
     sessions_dir: Path,
     view: Any,

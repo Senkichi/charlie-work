@@ -247,8 +247,7 @@ def test_persist_failure_stamps_the_window_with_the_role_key_that_died() -> None
         "quota_exhausted",
         "2026-01-01T12:15:00Z",
         fresh=True,
-        harness="devin-shell",
-        model="gemini-flash",
+        role_key=("devin-shell", "gemini-flash"),
     )
 
     new = persist_failure(before, 7, failure, adapter_kind="devin", now=NOW, source="test")

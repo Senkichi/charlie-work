@@ -68,7 +68,7 @@ from .throttle_signatures import (
 from .review_provider_outage import apply_provider_api_error, session_api_error_status
 from .role_quota_ledger import (
     record_view as _ledger_record,  # issue #2086
-    role_key_for_session,
+    role_key_for_view,
 )
 from .worker import _alive_review_worker_issue_numbers, iter_workers
 from .worktree import remove_review_checkout
@@ -570,15 +570,15 @@ def _detect_and_handle_stalled_reviews(
             else:
                 if not throttle_backoff_applied:
                     now_dt = resolved_now
-                    role_key = role_key_for_session(reviews_dir, w.adapter_kind, w.issue_number)
+                    harness, model = role_key_for_view(reviews_dir, w)
                     state, quota_record = _set_reviewer_quota_exhausted_with_backoff(
                         state,
                         config,
                         now_dt,
                         reset_at=reset_at,
                         adapter_kind=w.adapter_kind,
-                        harness=role_key[0] if role_key else None,
-                        model=role_key[1] if role_key else None,
+                        harness=harness,
+                        model=model,
                     )
                     throttle_backoff_applied = True
                     # Distinct, queryable event for a quota-dead reviewer session
@@ -717,7 +717,7 @@ def _detect_and_handle_stalled_reviews(
             # Issue #1808: a provider 5xx/529/429 is an outage, not a PR defect;
             # see ``review_provider_outage``. Once-per-sweep backoff latch is
             # shared with the throttle path: one outage, one backoff increment.
-            role_key = role_key_for_session(reviews_dir, w.adapter_kind, w.issue_number)
+            harness, model = role_key_for_view(reviews_dir, w)
             state, event_payload, throttle_backoff_applied = apply_provider_api_error(
                 state,
                 pr_key,
@@ -731,8 +731,8 @@ def _detect_and_handle_stalled_reviews(
                     config,
                     resolved_now,
                     adapter_kind=w.adapter_kind,
-                    harness=role_key[0] if role_key else None,
-                    model=role_key[1] if role_key else None,
+                    harness=harness,
+                    model=model,
                 ),
                 backoff_armed=throttle_backoff_applied,
             )

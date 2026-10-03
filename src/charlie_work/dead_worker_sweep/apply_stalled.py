@@ -197,8 +197,7 @@ def _arm_throttle(
     model)`` (issue #2279) -- the sidecar is never reaped in this lane, so
     the stamp is always still readable here.
     """
-    role_key = role_quota_ledger.role_key_for_session(sessions_dir, w.adapter_kind, w.issue_number)
-    harness, model = role_key if role_key is not None else (None, None)
+    harness, model = role_quota_ledger.role_key_for_view(sessions_dir, w)
     if arm.source == REAP_SOURCE:
         return set_throttled_until(
             state,

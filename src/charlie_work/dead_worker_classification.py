@@ -249,12 +249,11 @@ def classify_dead_worker_log(
     # The dead session's stamped role-chain entry rides the evidence so the
     # persist step stamps the per-repo window with it (issue #2279); the
     # adapter helper above leaves ``role_entry`` untouched.
-    role_key = role_quota_ledger.role_key_for_session(
-        sessions_dir, view.adapter_kind, issue_number
-    )
-    harness, model = role_key if role_key is not None else (None, None)
     return view.adapter_kind, worker_fate.FailureEvidence.from_classification(
-        failure_kind, throttled_until, fresh=True, harness=harness, model=model
+        failure_kind,
+        throttled_until,
+        fresh=True,
+        role_key=role_quota_ledger.role_key_for_view(sessions_dir, view),
     )
 
 

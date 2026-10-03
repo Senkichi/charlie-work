@@ -257,12 +257,11 @@ def _persist_failure(
     # died, not the adapter as a whole (issue #2279). The sidecar still
     # exists here: ``plan_dead_reap`` orders ``PersistFailure`` before
     # ``ReapSidecar``.
-    role_key = role_quota_ledger.role_key_for_session(
-        ctx.sessions_dir, w.adapter_kind, w.issue_number
-    )
-    harness, model = role_key if role_key is not None else (None, None)
     evidence = worker_fate.FailureEvidence.from_classification(
-        failure_kind, throttled_until, fresh=True, harness=harness, model=model
+        failure_kind,
+        throttled_until,
+        fresh=True,
+        role_key=role_quota_ledger.role_key_for_view(ctx.sessions_dir, w),
     )
     with state_mod.state_lock(ctx.state_file):
         state = state_mod.load_state(ctx.state_file)
