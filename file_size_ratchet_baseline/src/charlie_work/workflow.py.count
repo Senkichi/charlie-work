@@ -4,5 +4,5 @@
 # hand-raise, the ``intake`` method was extracted verbatim to
 # orchestration/state_intake.py (the canonical delegate move, per the
 # #1632/#1645-#1647 lineage) and the new-episode computation moved into
-# labels.ready_observed_due. Live count fell to 5284, so the mark returns
+# labels.ready_observed_due. Live count fell to 5286, so the mark returns
 # to the previous 5400 per the lower-only refresh rule.
