@@ -36,7 +36,11 @@ from charlie_work.checks import (
     summarize_checks,
 )
 from charlie_work.issue_linking import linked_issue_number
-from charlie_work.no_op_rework_body import _body_rework_escape_warning
+from charlie_work.no_op_rework_body import (
+    _body_rework_escape_warning,
+    _trailer_exempt_escape_warning,
+    no_op_escape_needs_pr_commits,  # noqa: F401  (deliberate re-export)
+)
 from charlie_work.safe_ref import require_valid_ref_name, require_valid_sha
 from charlie_work.subprocess_runner import run_captured
 from charlie_work.test_adequacy_exempt import (
@@ -384,6 +388,7 @@ def run_janitor(
     pr_diff: str | None = None,
     review_decision: Mapping[str, Any] | None = None,
     issue_labels: set[str] | None = None,
+    pr_commits: Sequence[Mapping[str, Any]] | None = None,
 ) -> JanitorVerdict:
     """Run deterministic pre-review checks over ``pr``/``checks`` data.
 
@@ -408,6 +413,10 @@ def run_janitor(
       baseline — a body-only rework produces no code delta by
       construction. A missing baseline or a ``pr`` without a ``body``
       key fails closed.
+
+    ``pr_commits`` (issue #2281): the PR's REST ``pulls/{n}/commits``
+    list, fetched only when ``no_op_escape_needs_pr_commits`` says the
+    escape in ``_check_no_op_rework`` is live; ``None`` fails closed.
 
     ``issue_labels`` (issue #1598) is the set of live labels on the PR's
     bound issue, when the caller already has them. When provided and any
@@ -475,7 +484,15 @@ def run_janitor(
         )
     elif repo_root is not None:
         is_no_op_rework = _check_no_op_rework(
-            pr, pr_state, failures, warnings, repo_root, pr_diff, review_decision=review_decision
+            pr,
+            pr_state,
+            failures,
+            warnings,
+            repo_root,
+            pr_diff,
+            review_decision=review_decision,
+            pr_commits=pr_commits,
+            test_adequacy=config.test_adequacy,
         )
 
     is_check_failure_block = bool(failed_required_checks) and not failures
@@ -898,6 +915,8 @@ def _check_no_op_rework(
     pr_diff: str | None = None,
     *,
     review_decision: Mapping[str, Any] | None = None,
+    pr_commits: Sequence[Mapping[str, Any]] | None = None,
+    test_adequacy: TestAdequacyConfig,
 ) -> bool:
     """Check if the PR has actual content changes since a request_changes verdict.
 
@@ -910,6 +929,10 @@ def _check_no_op_rework(
 
     Falls back to head SHA comparison if patch-id is not available (for backwards
     compatibility with old verdicts).
+
+    Two escapes satisfy the gate without a diff delta -- the #1939 body
+    change and the #2281 exemption claim -- each failing closed on a
+    missing baseline.
 
     Returns True when a no-op-rework failure was appended (any variant), so
     ``run_janitor`` can expose the finding as the structured
@@ -936,6 +959,16 @@ def _check_no_op_rework(
     body_escape_warning = _body_rework_escape_warning(pr, pr_state, review_decision)
     if body_escape_warning is not None:
         warnings.append(body_escape_warning)
+        return False
+
+    # Issue #2281: a `<marker>` exemption trailer on an (usually empty)
+    # commit is the adequacy gate's own remedy but produces no diff delta;
+    # the decision lives in no_op_rework_body beside the #1939 escape.
+    trailer_escape_warning = _trailer_exempt_escape_warning(
+        pr, pr_state, review_decision, pr_commits, test_adequacy
+    )
+    if trailer_escape_warning is not None:
+        warnings.append(trailer_escape_warning)
         return False
 
     # Primary check: compare patch-ids when both are available

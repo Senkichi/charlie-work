@@ -30,6 +30,7 @@ from pathlib import Path
 import pytest
 from _run_captured_fakes import monkeypatch_run_captured
 
+from charlie_work.config import TestAdequacyConfig
 from charlie_work.cross_pr_revert import (
     CrossPrRevertStatus,
     detect_cross_pr_revert,
@@ -127,6 +128,10 @@ def test_check_no_op_rework_timeout_returns_false_not_hang(
         repo,
         pr_diff=None,
         review_decision={"decision": "request_changes"},
+        # Issue #2281: the exemption-claim escape reads the adequacy-gate
+        # marker off this config; the default (disabled) config skips it,
+        # which is what this timeout regression wants to exercise anyway.
+        test_adequacy=TestAdequacyConfig(),
     )
 
     assert result is False

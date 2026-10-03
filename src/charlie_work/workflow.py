@@ -91,6 +91,7 @@ from .janitor import (
     check_operator_containment,
     check_test_adequacy,
     is_stale_ci_verdict,
+    no_op_escape_needs_pr_commits,
     run_janitor,
     DiffContentSignature,  # noqa: F401  (deliberate re-export; reached via _wf. by orchestration/local_lanes.py)
     TestAdequacyFacts,
@@ -2536,6 +2537,18 @@ class OrchestratorApp:
             escalated_diff = self.gh.pr_diff(pr_number)
             escalated_verdict = None
             known_ci_run_never_created_head = None
+            # Issue #2281: fetched before the state_lock -- gh calls must
+            # never run under it, and the no-op gate's exemption-claim
+            # escape only needs the commit list when a request_changes
+            # verdict + enabled adequacy gate make the escape live.
+            escalated_decision = self._review_decision(pr_number)
+            escalated_pr_commits = (
+                self.gh.pr_commits(pr_number)
+                if no_op_escape_needs_pr_commits(
+                    self.config.test_adequacy, escalated_decision, pr.get("headRefOid")
+                )
+                else None
+            )
             with state_lock(self.paths.state_file):
                 fresh_state = load_state(self.paths.state_file)
                 existing_pr_state = fresh_state["prs"].get(str(pr_number))
@@ -2550,7 +2563,8 @@ class OrchestratorApp:
                         pr_state=existing_pr_state,
                         repo_root=self.repo_root,
                         pr_diff=escalated_diff,
-                        review_decision=self._review_decision(pr_number),
+                        review_decision=escalated_decision,
+                        pr_commits=escalated_pr_commits,
                     )
                     failures_changed = existing_pr_state.get("janitor_failures") != list(
                         escalated_verdict.failures
@@ -2761,6 +2775,18 @@ class OrchestratorApp:
                     _hm_issue_labels = label_names(self.gh.issue_view(_hm_issue_num))
                 except (GitHubError, ValueError):
                     _hm_issue_labels = None
+        gate_decision = self._review_decision(pr_number)
+        # Issue #2281: the no-op gate's exemption-claim escape needs the
+        # PR's commit list -- fetched only when a request_changes verdict
+        # and an enabled adequacy gate make the escape live, so the common
+        # pass spends no extra REST call. Reused below by check_test_adequacy.
+        pr_commits = (
+            self.gh.pr_commits(pr_number)
+            if no_op_escape_needs_pr_commits(
+                self.config.test_adequacy, gate_decision, pr.get("headRefOid")
+            )
+            else None
+        )
         verdict = run_janitor(
             pr,
             checks,
@@ -2768,8 +2794,9 @@ class OrchestratorApp:
             pr_state=pr_state,
             repo_root=self.repo_root,
             pr_diff=diff,
-            review_decision=self._review_decision(pr_number),
+            review_decision=gate_decision,
             issue_labels=_hm_issue_labels,
+            pr_commits=pr_commits,
         )
 
         # Issue #1116: the stale-CI skip let a reworked-but-unchanged PR
@@ -3621,7 +3648,10 @@ class OrchestratorApp:
         if self.config.test_adequacy.enabled:
             # Issue #2220: commit trailers are the exemption channel a worker
             # can actually write (no GitHub token => no PR-body edits).
-            pr_commits = self.gh.pr_commits(pr_number) or []
+            # Reuse the list already fetched for the no-op escape (issue
+            # #2281) when one was taken this pass.
+            if pr_commits is None:
+                pr_commits = self.gh.pr_commits(pr_number) or []
             test_adequacy_verdict = check_test_adequacy(
                 diff,
                 pr,
