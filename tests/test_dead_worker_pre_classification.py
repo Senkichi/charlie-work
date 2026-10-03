@@ -12,6 +12,7 @@ overwrite. They never call ``profile.record_failure`` directly, which is how
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -68,8 +69,14 @@ def _sessions_dir(root: Path) -> Path:
     return sessions_dir
 
 
-def _seed_dead_primary(root: Path, config: OrchestratorConfig) -> tuple[Any, Path, FakeGitHub]:
-    """Repo A: a dispatched issue whose primary-entry devin worker died with no PR."""
+def _seed_dead_primary(
+    root: Path,
+    config: OrchestratorConfig,
+    *,
+    entry: RoleEntry = PRIMARY,
+    chain_index: int = 0,
+) -> tuple[Any, Path, FakeGitHub]:
+    """Repo A: a dispatched issue whose stamped-entry devin worker died with no PR."""
     paths = runtime_paths(root, config.runtime.state_dir)
     paths.root.mkdir(parents=True, exist_ok=True)
     state = load_state(paths.state_file)
@@ -95,7 +102,7 @@ def _seed_dead_primary(root: Path, config: OrchestratorConfig) -> tuple[Any, Pat
         "started_at": "2026-10-02T04:30:00Z",
         "log_path": str(log_path),
         role_quota_ledger.SESSION_ROLE_KEY: role_quota_ledger.session_stamp(
-            "worker", PRIMARY.harness, PRIMARY.model, 0
+            "worker", entry.harness, entry.model, chain_index
         ),
     }
     (sessions_dir / f"issue-{ISSUE}.json").write_text(json.dumps(sidecar), encoding="utf-8")
@@ -171,11 +178,14 @@ def _assert_primary_restricted() -> None:
     assert set(role_quota_ledger.load_restrictions()) == {PRIMARY.key}
 
 
-def _assert_repo_stamped(paths: Any) -> None:
+def _assert_repo_stamped(paths: Any, entry: RoleEntry = PRIMARY) -> None:
     state = load_state(paths.state_file)
     assert worker_fate.persisted_failure(state["issues"][str(ISSUE)]).kind == "rate_limited"
     assert state.get("throttled_until")
     assert state.get("throttle_reason") == "rate_limited"
+    # Issue #2279: the window carries the dead session's stamped role entry.
+    assert state.get("throttle_harness") == entry.harness
+    assert state.get("throttle_model") == entry.model
     windows = query_events(paths.state_file, kind="throttle_window_set")
     assert len(windows) == 1, windows
     assert windows[0]["payload"]["source"] == "dead_worker_classification"
@@ -320,6 +330,72 @@ def test_dry_run_sweep_does_not_classify(tmp_path: Path) -> None:
     assert role_quota_ledger.load_restrictions() == {}
     sidecar = json.loads((sessions_dir / f"issue-{ISSUE}.json").read_text(encoding="utf-8"))
     assert "failure_kind" not in sidecar or sidecar["failure_kind"] is None
+
+
+def test_fallback_quota_death_does_not_block_the_recovered_primary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #2279 acceptance: chain [A, B] on ONE adapter; B dies
+    ``rate_limited`` while A's own restriction has already lapsed.
+
+    Before the fix, B's death armed an adapter-wide per-repo window that
+    pinned the recovered primary for the full backoff. Now the window is
+    stamped with B's ``(harness, model)`` and covered by B's own ledger
+    entry, so the same repo's next launch proceeds on A.
+    """
+    config = _config()
+    paths, sessions_dir, gh = _seed_dead_primary(
+        tmp_path / "a", config, entry=FALLBACK, chain_index=1
+    )
+    # A's earlier restriction already expired -- B's is the only live one.
+    role_quota_ledger.record_restriction(
+        PRIMARY.harness,
+        PRIMARY.model,
+        datetime.now(UTC) - timedelta(minutes=1),
+        reason="rate_limited",
+        source="test",
+    )
+
+    _sweep(paths, sessions_dir, config, gh)
+
+    _assert_repo_stamped(paths, entry=FALLBACK)
+    assert set(role_quota_ledger.load_restrictions()) == {PRIMARY.key, FALLBACK.key}
+
+    # Same repo, same window: selection returns A with nothing skipped and
+    # B's stamped window is covered by B's ledger restriction.
+    app, calls = _fallback_app(tmp_path / "a", monkeypatch)
+    app.dispatch()
+    assert [s.worker_model for s in calls] == [PRIMARY.model]
+    assert query_events(app.paths.state_file, kind="role_fallback_selected") == []
+
+
+def test_fallback_quota_death_window_blocks_when_its_ledger_entry_lapses_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Counter-case: once B's own ledger restriction also expires, its window
+    is unexplained and blocks again -- a stamped window is not a free pass."""
+    config = _config()
+    paths, sessions_dir, gh = _seed_dead_primary(
+        tmp_path / "a", config, entry=FALLBACK, chain_index=1
+    )
+    _sweep(paths, sessions_dir, config, gh)
+    _assert_repo_stamped(paths, entry=FALLBACK)
+
+    # B's ledger restriction lapses while the per-repo window still runs.
+    ledger_path = role_quota_ledger.ledger_path()
+    raw = json.loads(ledger_path.read_text(encoding="utf-8"))
+    past = _z_datetime(datetime.now(UTC) - timedelta(minutes=1))
+    raw["restrictions"][f"{FALLBACK.harness}|{FALLBACK.model}"]["until"] = past
+    ledger_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    app, calls = _fallback_app(tmp_path / "a", monkeypatch)
+    result = app.dispatch()
+    assert calls == []
+    assert result.data.get("deferred_reason") == "provider_throttled", result.data
+
+
+def _z_datetime(moment: datetime) -> str:
+    return moment.replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def test_orphan_sweep_death_event_carries_the_throttle_classification(tmp_path: Path) -> None:

@@ -38,7 +38,7 @@ from charlie_work.rework_attempt_exemption import (
     EXEMPTION_EVENT_KIND,
     PROVIDER_THROTTLE_EXEMPT_KINDS,
 )
-from charlie_work.role_quota_ledger import RESTRICTING_FAILURE_KINDS
+from charlie_work.role_quota_ledger import RESTRICTING_FAILURE_KINDS, session_stamp
 from charlie_work.state import load_state, save_state, state_lock
 from charlie_work.throttle_signatures import PROVIDER_THROTTLE_FAILURE_KINDS
 from charlie_work.worker_fate import profile_for
@@ -134,13 +134,16 @@ class _Bed:
         log_text: str | None = None,
         exit_code: int | None = None,
         worker_outcome: dict[str, Any] | None = None,
+        role_stamp: dict[str, Any] | None = None,
     ) -> None:
         """End the dispatched session and run the real orphan sweep over it.
 
         ``stamped_kind`` is the classification an earlier lane (the stalled or
         dead-session classifier) already stamped. ``log_text`` is the captured
         worker log, left unclassified so the sweep has to classify it.
-        ``exit_code`` writes the worker's terminal record. ``worker_outcome``
+        ``role_stamp`` writes the session's ``role_entry`` (#2279) into the
+        sidecar, as a launch-time stamp would. ``exit_code`` writes the
+        worker's terminal record. ``worker_outcome``
         embeds an outcome in that record, making
         ``terminal_record_proves_completion`` hold for this pid -- the record's
         filename then carries the devin suffix, matching the sidecar's adapter,
@@ -166,6 +169,8 @@ class _Bed:
                 "started_at": _now(),
                 "log_path": str(log_path),
             }
+            if role_stamp is not None:
+                sidecar["role_entry"] = role_stamp
             (self.sessions_dir / f"issue-{ISSUE}.json").write_text(
                 json.dumps(sidecar), encoding="utf-8"
             )
@@ -308,6 +313,25 @@ def test_clean_exit_rate_limit_death_is_exempted_not_a_no_op(tmp_path: Path) -> 
     assert all(e["payload"]["refunded_redispatch_at"] for e in exempted)
     recovered = bed.events("orphaned_worker_recovered")
     assert {e["payload"]["reason"] for e in recovered} == {"dead_worker_clean_exit_throttle"}
+
+
+def test_clean_exit_throttle_arm_stamps_the_window_with_the_dead_role(
+    tmp_path: Path,
+) -> None:
+    """Issue #2279: the #2286 clean-exit exemption lane arms the per-repo
+    throttle window through ``persist_failure`` like every other lane, so the
+    evidence must carry the dead session's ``role_entry`` -- otherwise a
+    fallback's window would block the recovered primary entry."""
+    bed = _Bed(tmp_path)
+    bed.assert_dispatched_not_escalated(bed.dispatch(), 1)
+    bed.die(
+        log_text=FREE_MODEL_RATE_LIMIT_LINE,
+        exit_code=0,
+        role_stamp=session_stamp("worker", "devin-shell", "swe-2-high", 0),
+    )
+    state = load_state(bed.paths.state_file)
+    assert state["throttle_harness"] == "devin-shell"
+    assert state["throttle_model"] == "swe-2-high"
 
 
 def test_clean_exit_proven_complete_with_rate_limit_log_is_not_exempted(

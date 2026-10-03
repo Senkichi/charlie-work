@@ -401,3 +401,100 @@ def test_under_lock_throttle_read_applies_the_same_attribution(
         assert isinstance(outcome, WorkerLaunchDeferral), outcome
         assert outcome.reason == REASON_PROVIDER_THROTTLED
         assert outcome.governor is not None  # came from the under-lock gate, not the pre-check
+
+
+# ---------------------------------------------------------------------------
+# Issue #2279: the per-repo window's own (harness, model) stamp
+# ---------------------------------------------------------------------------
+
+
+@LANES
+def test_fallback_stamped_window_is_covered_once_the_primary_recovers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lane: str
+) -> None:
+    """B's quota death armed a window stamped (devin-shell, swe-2). The primary
+    is free, so selection skipped nothing -- only the stamp attributes the
+    window to the still-restricted fallback, and the launch proceeds on A."""
+    calls = _spy(monkeypatch)
+    _restrict(FALLBACK, datetime.now(UTC) + timedelta(hours=3))
+    app = _app(tmp_path / "b", lane)
+    _hold(
+        app,
+        datetime.now(UTC) + timedelta(hours=1),
+        reason="quota_exhausted",
+        adapter_kind="devin",
+        harness=FALLBACK.harness,
+        model=FALLBACK.model,
+    )
+    _run(app, lane)
+    assert [_launched_entry(s) for s, _ in calls] == [PRIMARY.key]
+
+
+@LANES
+def test_window_stamped_with_the_selected_entry_itself_still_blocks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lane: str
+) -> None:
+    """An entry's own death window is never covered -- the stamp equal to the
+    selected entry is the one attribution the rule must refuse."""
+    calls = _spy(monkeypatch)
+    app = _app(tmp_path / "b", lane)
+    _hold(
+        app,
+        datetime.now(UTC) + timedelta(hours=1),
+        reason="quota_exhausted",
+        adapter_kind="claude-code",
+        harness=PRIMARY.harness,
+        model=PRIMARY.model,
+    )
+    result = _run(app, lane)
+    assert calls == []
+    assert result.data.get("deferred_reason") == "provider_throttled", result.data
+
+
+@LANES
+def test_fallback_stamped_window_still_blocks_when_its_ledger_entry_is_shorter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lane: str
+) -> None:
+    """The ledger explains the window only through the stamped entry's
+    restriction; a window outliving it is part unexplained and blocks."""
+    calls = _spy(monkeypatch)
+    _restrict(FALLBACK, datetime.now(UTC) + timedelta(hours=1))
+    app = _app(tmp_path / "b", lane)
+    _hold(
+        app,
+        datetime.now(UTC) + timedelta(hours=3),
+        reason="quota_exhausted",
+        adapter_kind="devin",
+        harness=FALLBACK.harness,
+        model=FALLBACK.model,
+    )
+    result = _run(app, lane)
+    assert calls == []
+    assert result.data.get("deferred_reason") == "provider_throttled", result.data
+
+
+def test_under_lock_throttle_read_applies_the_stamped_entry_attribution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#2279 under-lock arm: the stamped window lands after the lock-free
+    pre-check; the authoritative read applies the same coverage."""
+    _restrict(FALLBACK, datetime.now(UTC) + timedelta(hours=3))
+    app = _app(tmp_path / "b", FRESH)
+    real_governor = app._apply_concurrency_governor
+
+    def _throttle_then_govern(*args: Any, **kwargs: Any) -> Any:
+        _hold(
+            app,
+            datetime.now(UTC) + timedelta(hours=1),
+            reason="quota_exhausted",
+            adapter_kind="devin",
+            harness=FALLBACK.harness,
+            model=FALLBACK.model,
+        )
+        return real_governor(*args, **kwargs)
+
+    monkeypatch.setattr(app, "_apply_concurrency_governor", _throttle_then_govern)
+    outcome = issue_worker_launch_permit(app, 1)
+    assert isinstance(outcome, WorkerLaunchPermit), outcome
+    assert outcome.role_selection.entry == PRIMARY
+    outcome.release()

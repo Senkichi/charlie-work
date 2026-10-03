@@ -310,6 +310,31 @@ def test_clear_quota_throttles_always_clears_reviewer_quota_and_resets_probe_fai
     assert cleared["throttled_until"] == root_throttle
 
 
+def test_clear_quota_throttles_resets_the_stamped_role_key() -> None:
+    """Issue #2279: a green probe clearing a claude-code-shaped root throttle
+    must also drop its ``throttle_harness``/``throttle_model`` stamp -- a
+    stamp that outlived its window would mis-attribute the NEXT window's
+    provenance to a role entry that did not die."""
+    from charlie_work.state import clear_quota_throttles, empty_state, set_throttled_until
+
+    future = (datetime.now(UTC) + timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    state = set_throttled_until(
+        empty_state(),
+        future,
+        source="test",
+        reason="rate_limited",
+        adapter_kind="claude-code",
+        harness="devin-shell",
+        model="swe-2-high",
+    )
+
+    cleared = clear_quota_throttles(state)
+
+    assert cleared["throttled_until"] is None
+    assert cleared["throttle_harness"] is None
+    assert cleared["throttle_model"] is None
+
+
 def test_clear_quota_throttles_records_last_probe_cleared_at() -> None:
     """Issue #662: ``clear_quota_throttles`` stamps ``last_probe_cleared_at``
     on reviewer_quota so the dead-reviewer reap sweep can tell a recovery

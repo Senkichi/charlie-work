@@ -86,17 +86,22 @@ _RATE_LIMIT_LOG = (
 def test_set_throttled_until_emits_event_with_full_payload() -> None:
     """A changed window emits exactly one ``throttle_window_set`` whose
     payload is the audit record the issue specifies: previous value, new
-    value, reason, adapter_kind, and the caller's ``source``."""
+    value, reason, adapter_kind, the stamped role ``(harness, model)`` that
+    died (issue #2279), and the caller's ``source``."""
     new_value = _future()
     state = set_throttled_until(
         empty_state(),
         new_value,
         reason="rate_limited",
         adapter_kind="devin",
+        harness="devin-shell",
+        model="swe-2-high",
         source="test_source",
     )
 
     assert state["throttled_until"] == new_value
+    assert state["throttle_harness"] == "devin-shell"
+    assert state["throttle_model"] == "swe-2-high"
     events = _throttle_window_events(state)
     assert len(events) == 1
     assert events[0]["payload"] == {
@@ -104,6 +109,8 @@ def test_set_throttled_until_emits_event_with_full_payload() -> None:
         "throttled_until": new_value,
         "reason": "rate_limited",
         "adapter_kind": "devin",
+        "harness": "devin-shell",
+        "model": "swe-2-high",
         "source": "test_source",
     }
 
