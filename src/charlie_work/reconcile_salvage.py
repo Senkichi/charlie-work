@@ -25,6 +25,7 @@ from .config import OrchestratorConfig
 from .github import PR_CLOSING_ISSUES_FIELDS, GitHubLike
 from .instrumentation import log_event
 from .labels import apply_issue_labels
+from .local_work_park import publishes_pull_requests
 from .pr_create_retry import create_pr_with_retry
 from .salvage_superseded import check_salvage_superseded, salvage_skip_event_kind
 from .worktree import push_branch, summarize_branch_work
@@ -117,8 +118,15 @@ def apply_unpublished_work_salvage(
             else:
                 push_ok, push_error = push_branch(repo_root, item.branch)
                 if push_ok:
-                    has_pr_create = getattr(gh, "pr_create", None) is not None
-                    if has_pr_create:
+                    # ``publishes_pull_requests`` is the salvage seam's
+                    # capability probe (issue #2262): a no-PR backend's
+                    # null-object ``pr_create`` exists but can never publish,
+                    # so skip the PR block rather than retrying a write that
+                    # structurally cannot land.
+                    can_publish_pr = publishes_pull_requests(gh) and (
+                        getattr(gh, "pr_create", None) is not None
+                    )
+                    if can_publish_pr:
                         # Same janitor body gate as a worker-authored PR --
                         # boilerplate alone can never satisfy it. Derive the
                         # rationale from the worker's own commit log rather
@@ -216,7 +224,11 @@ def apply_unpublished_work_salvage(
                                     },
                                 )
                     else:
-                        salvage_error = "gh pr create failed or returned no PR number"
+                        salvage_error = (
+                            "gh pr create failed or returned no PR number"
+                            if can_publish_pr
+                            else "backend does not publish pull requests"
+                        )
                 else:
                     salvage_error = push_error or "git push failed"
 

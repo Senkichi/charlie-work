@@ -378,7 +378,13 @@ def _route_phantom_live_worker(
         # re-adds ``ready`` when the deferral budget expires.
         removed_ready = False
         if self.config.labels.ready in issue_labels:
-            removed_ready = self.gh.remove_issue_label(issue_number, self.config.labels.ready)
+            removed_ready = self.write_gate.apply_issue_labels(
+                self.gh,
+                self.config.labels,
+                issue_number,
+                remove=(self.config.labels.ready,),
+                cause="phantom_live_worker_salvage_deferred",
+            ).ok
         state = _emit_session_failed_relabeled(
             state,
             issue_number=issue_number,
