@@ -41,6 +41,7 @@ from charlie_work.rework_attempt_exemption import (
 from charlie_work.role_quota_ledger import RESTRICTING_FAILURE_KINDS
 from charlie_work.state import load_state, save_state, state_lock
 from charlie_work.throttle_signatures import PROVIDER_THROTTLE_FAILURE_KINDS
+from charlie_work.worker_fate import profile_for
 from charlie_work.workflow import OrchestratorApp
 
 CAP = 2
@@ -132,13 +133,18 @@ class _Bed:
         stamped_kind: str | None = None,
         log_text: str | None = None,
         exit_code: int | None = None,
+        worker_outcome: dict[str, Any] | None = None,
     ) -> None:
         """End the dispatched session and run the real orphan sweep over it.
 
         ``stamped_kind`` is the classification an earlier lane (the stalled or
         dead-session classifier) already stamped. ``log_text`` is the captured
         worker log, left unclassified so the sweep has to classify it.
-        ``exit_code`` writes the worker's terminal record.
+        ``exit_code`` writes the worker's terminal record. ``worker_outcome``
+        embeds an outcome in that record, making
+        ``terminal_record_proves_completion`` hold for this pid -- the record's
+        filename then carries the devin suffix, matching the sidecar's adapter,
+        as the real watcher writes it.
         """
         for stale in self.sessions_dir.glob(f"issue-{ISSUE}*"):
             stale.unlink()
@@ -164,16 +170,18 @@ class _Bed:
                 json.dumps(sidecar), encoding="utf-8"
             )
         if exit_code is not None:
-            (self.sessions_dir / f"issue-{ISSUE}.command.terminal.json").write_text(
-                json.dumps(
-                    {
-                        "pid": 99999,
-                        "exit_code": exit_code,
-                        "started_at": _now(),
-                        "ended_at": _now(),
-                        "duration_seconds": 300.0,
-                    }
-                ),
+            record = {
+                "pid": 99999,
+                "exit_code": exit_code,
+                "started_at": _now(),
+                "ended_at": _now(),
+                "duration_seconds": 300.0,
+            }
+            if worker_outcome is not None:
+                record["worker_outcome"] = worker_outcome
+            suffix = "devin" if worker_outcome is not None else "command"
+            (self.sessions_dir / f"issue-{ISSUE}.{suffix}.terminal.json").write_text(
+                json.dumps(record),
                 encoding="utf-8",
             )
         _run_orphan_sweep(self.tmp_path, self.paths, self.config, self.gh)
@@ -271,6 +279,82 @@ def test_genuine_no_op_rework_still_escalates(tmp_path: Path) -> None:
     assert bed.events(EXEMPTION_EVENT_KIND) == []
 
 
+def test_clean_exit_rate_limit_death_is_exempted_not_a_no_op(tmp_path: Path) -> None:
+    """(d) Issue #2286: an exit-0 rework session whose captured log ENDS in the
+    verbatim provider free-model rate-limit error is a throttle death, not a
+    no-op attempt. Three such waves restore ``rework_requested`` every time,
+    refund each dispatch stamp, stamp the failure kind, and emit the exemption
+    from the clean-exit lane -- ``no_op_rework_attempts`` never advances."""
+    bed = _Bed(tmp_path)
+    for wave in range(1, 4):
+        bed.assert_dispatched_not_escalated(bed.dispatch(), wave)
+        assert "dead_worker_failure_kind" not in bed.entry()
+        bed.die(log_text=FREE_MODEL_RATE_LIMIT_LINE, exit_code=0)
+        entry = bed.entry()
+        assert entry.get("status") == "rework_requested", wave
+        assert entry.get("dead_worker_failure_kind") == "rate_limited", wave
+        assert entry.get("redispatch_at") == [], wave
+        assert not entry.get("worker_death_at"), wave
+        pr_state = load_state(bed.paths.state_file)["prs"][str(PR)]
+        assert pr_state.get("last_rework_was_startup_death") is True, wave
+        assert pr_state.get("last_rework_exemption") == "provider_throttle", wave
+        assert pr_state.get("last_rework_failure_kind") == "rate_limited", wave
+
+    bed.assert_dispatched_not_escalated(bed.dispatch(), 4)
+    exempted = bed.events(EXEMPTION_EVENT_KIND)
+    assert len(exempted) == 3
+    assert {e["payload"]["failure_kind"] for e in exempted} == {"rate_limited"}
+    assert {e["payload"]["source"] for e in exempted} == {"orphan_sweep_clean_exit"}
+    assert all(e["payload"]["refunded_redispatch_at"] for e in exempted)
+    recovered = bed.events("orphaned_worker_recovered")
+    assert {e["payload"]["reason"] for e in recovered} == {"dead_worker_clean_exit_throttle"}
+
+
+def test_clean_exit_proven_complete_with_rate_limit_log_is_not_exempted(
+    tmp_path: Path,
+) -> None:
+    """(e) Issue #656 control: this pid's terminal record proves completion
+    (exit 0 WITH a worker outcome), so a transcript ending in the rate-limit
+    error is completion-era quoting -- the exemption never fires and the
+    attempt is still counted as a no-op."""
+    bed = _Bed(tmp_path)
+    bed.assert_dispatched_not_escalated(bed.dispatch(), 1)
+    bed.die(
+        log_text=FREE_MODEL_RATE_LIMIT_LINE,
+        exit_code=0,
+        worker_outcome={"status": "completed", "head_sha": HEAD},
+    )
+
+    entry = bed.entry()
+    assert entry.get("status") == "escalated"
+    assert entry.get("escalation_reason") == "rework_no_op"
+    assert len(entry.get("redispatch_at", [])) == 1
+    assert bed.events(EXEMPTION_EVENT_KIND) == []
+
+
+def test_clean_exit_with_earlier_rate_limit_mention_is_not_exempted(
+    tmp_path: Path,
+) -> None:
+    """(f) Only the TERMINAL lines may carry the signature. A transcript that
+    mentions the rate limit earlier but ends in ordinary output is a genuine
+    no-op -- the whole-tail classifier would fire on it, the anchored check
+    does not -- so the attempt counts and the issue escalates."""
+    bed = _Bed(tmp_path)
+    bed.assert_dispatched_not_escalated(bed.dispatch(), 1)
+    mid_log = (
+        "Error: Reached free model rate limit. Retrying.\n"
+        "the retry succeeded\nfinished reviewing the diff\nran the tests\n"
+        "wrote the summary\nall done, nothing left to change"
+    )
+    bed.die(log_text=mid_log, exit_code=0)
+
+    entry = bed.entry()
+    assert entry.get("status") == "escalated"
+    assert entry.get("escalation_reason") == "rework_no_op"
+    assert len(entry.get("redispatch_at", [])) == 1
+    assert bed.events(EXEMPTION_EVENT_KIND) == []
+
+
 def test_non_throttle_rework_deaths_still_escalate_at_the_cap(tmp_path: Path) -> None:
     """(c) Positive control at the cap: the same three waves with an ordinary
     crash are counted and escalate. This proves the harness can escalate, and
@@ -346,3 +430,106 @@ def test_dead_session_restore_lane_refunds_and_flags_the_pr(tmp_path: Path) -> N
     (requeued,) = bed.events("rework_requeued")
     assert requeued["payload"]["provider_throttle_exempt"] is True
     assert requeued["payload"]["startup_death"] is False
+
+
+@pytest.mark.parametrize(
+    "log_text",
+    [None, "worked on it, nothing to change"],
+    ids=["no_log", "non_throttle_log"],
+)
+def test_clean_exit_stamped_throttle_is_exempted_without_terminal_signature(
+    tmp_path: Path, log_text: str | None
+) -> None:
+    """(g) Issue #2286, stamp-first resolution: the dead-session lane often
+    classifies and stamps ``dead_worker_failure_kind`` before the orphan sweep
+    reaches the issue. A clean exit already stamped ``rate_limited`` exempts on
+    the stamp alone -- the terminal-line check exists for UNCLASSIFIED deaths,
+    so an absent log or a non-throttle one cannot veto the stamp. The dead
+    session's dispatch stamp is refunded, the PR is flagged (so
+    ``no_op_rework_attempts`` never advances), and the exemption emits from the
+    clean-exit lane."""
+    bed = _Bed(tmp_path)
+    bed.assert_dispatched_not_escalated(bed.dispatch(), 1)
+    assert len(bed.entry()["redispatch_at"]) == 1
+    bed.die(stamped_kind="rate_limited", log_text=log_text, exit_code=0)
+
+    entry = bed.entry()
+    assert entry.get("status") == "rework_requested"
+    assert entry.get("dead_worker_failure_kind") == "rate_limited"
+    assert entry.get("redispatch_at") == []
+    assert not entry.get("worker_death_at")
+    pr_state = load_state(bed.paths.state_file)["prs"][str(PR)]
+    assert pr_state.get("last_rework_was_startup_death") is True
+    assert pr_state.get("last_rework_exemption") == "provider_throttle"
+    assert pr_state.get("last_rework_failure_kind") == "rate_limited"
+    assert pr_state.get("no_op_rework_attempts", 0) == 0
+    (exempted,) = bed.events(EXEMPTION_EVENT_KIND)
+    assert exempted["payload"]["issue_number"] == ISSUE
+    assert exempted["payload"]["pr_number"] == PR
+    assert exempted["payload"]["failure_kind"] == "rate_limited"
+    assert exempted["payload"]["source"] == "orphan_sweep_clean_exit"
+    assert exempted["payload"]["refunded_redispatch_at"]
+    (recovered,) = bed.events("orphaned_worker_recovered")
+    assert recovered["payload"]["reason"] == "dead_worker_clean_exit_throttle"
+    assert recovered["payload"]["failure_kind"] == "rate_limited"
+
+
+@pytest.mark.parametrize("kind", ["provider_suspended", "permission_denied"])
+def test_clean_exit_stamped_non_throttle_still_counts_as_no_op(tmp_path: Path, kind: str) -> None:
+    """(h) Negative companion to (g): the stamp-first branch resolves the kind,
+    but the exemption itself still gates on ``PROVIDER_THROTTLE_EXEMPT_KINDS``.
+    A clean exit stamped with a non-throttle kind -- ``provider_suspended``
+    sits just outside the exempt set by design (terminal, no cooldown) and
+    ``permission_denied`` is a config defect, not a provider death -- is NOT
+    exempted: the dispatch stamp stays counted and the attempt routes to a
+    real no-op."""
+    bed = _Bed(tmp_path)
+    bed.assert_dispatched_not_escalated(bed.dispatch(), 1)
+    bed.die(stamped_kind=kind, exit_code=0)
+
+    entry = bed.entry()
+    assert entry.get("status") == "escalated"
+    assert entry.get("escalation_reason") == "rework_no_op"
+    assert entry.get("dead_worker_failure_kind") == kind
+    assert len(entry.get("redispatch_at", [])) == 1
+    pr_state = load_state(bed.paths.state_file)["prs"][str(PR)]
+    assert not pr_state.get("last_rework_was_startup_death")
+    assert bed.events(EXEMPTION_EVENT_KIND) == []
+
+
+@pytest.mark.parametrize(
+    ("adapter_kind", "terminal", "expected"),
+    [
+        # The quota signature fires for every adapter -- the structured
+        # resource_exhausted trailer and the config prose fallback alike.
+        ("devin", '{"cognition.ai/errorKind": "resource_exhausted"}', True),
+        ("claude-code", "Error: weekly usage quota has been exhausted", True),
+        ("api", '{"cognition.ai/errorKind": "resource_exhausted"}', True),
+        # The generic throttle markers fire for every adapter, with or
+        # without a resolved profile.
+        ("devin", FREE_MODEL_RATE_LIMIT_LINE, True),
+        (None, FREE_MODEL_RATE_LIMIT_LINE, True),
+        # Provider-auth detection belongs to the api profile alone (#484):
+        # every other adapter (and an unresolved one) must ignore an auth
+        # failure sitting in the terminal lines.
+        ("api", "API Error: 401 Unauthorized - invalid api key", True),
+        ("devin", "API Error: 401 Unauthorized - invalid api key", False),
+        ("claude-code", "API Error: 401 Unauthorized - invalid api key", False),
+        (None, "API Error: 401 Unauthorized - invalid api key", False),
+        # No provider signature at all.
+        ("devin", "ran the tests\nall done, nothing left to change", False),
+        ("api", "ran the tests\nall done, nothing left to change", False),
+    ],
+)
+def test_terminal_is_throttle_error_signature_gating(
+    adapter_kind: str | None, terminal: str, expected: bool
+) -> None:
+    """(i) Table-driven pin of ``_terminal_is_throttle_error``: the quota
+    signature and generic throttle markers admit every adapter, while
+    provider-auth detection is gated on ``profile.account_error_detection``
+    (api only) -- a devin or claude-code worker quoting a 401 never
+    classifies as a provider death."""
+    from charlie_work.dead_worker_classification import _terminal_is_throttle_error
+
+    profile = profile_for(adapter_kind) if adapter_kind is not None else None
+    assert _terminal_is_throttle_error(terminal, profile, OrchestratorConfig()) is expected

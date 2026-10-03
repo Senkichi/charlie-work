@@ -178,6 +178,24 @@ class CreditDeadWorker:
 
 
 @dataclass(frozen=True)
+class ExemptThrottleCleanExit:
+    """Issue #2286: exempt an exit-0 session whose log ENDS in a provider throttle.
+
+    The clean-exit no-op branch cannot run the full tail classifier -- a real
+    completion's prose may quote throttle markers anywhere in the transcript
+    (the #656 false-positive class). This request answers the narrow question
+    "is the LAST non-blank log content a provider-throttle signature" and, when
+    it is, routes the death through ``rework_attempt_exemption`` so the attempt
+    is never counted. ``dispatched_at``/``pr_number`` mirror ``CreditDeadWorker``
+    for the refund and the PR flag.
+    """
+
+    issue: int
+    dispatched_at: str | None = None
+    pr_number: int | None = None
+
+
+@dataclass(frozen=True)
 class ReadTerminal:
     issue: int
 
@@ -271,6 +289,7 @@ Request = (
     | OpenPrForBranch
     | AdvanceToPrOpen
     | CreditDeadWorker
+    | ExemptThrottleCleanExit
     | ReadTerminal
     | ReadCompletedOutcome
     | ReadBlockedOutcome
@@ -289,6 +308,7 @@ LOCK_LEGAL = (
     OpenPrForBranch,
     AdvanceToPrOpen,
     CreditDeadWorker,
+    ExemptThrottleCleanExit,
     ReadTerminal,
     ReadCompletedOutcome,
     ReadBlockedOutcome,

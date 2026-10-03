@@ -47,6 +47,7 @@ from .model import (
     CreditDeadWorker,
     CreditResult,
     DrainNoOp,
+    ExemptThrottleCleanExit,
     GuardedUpdate,
     OpenPrForBranch,
     PrOpenResult,
@@ -116,6 +117,21 @@ def credit_dead_worker(ctx: SweepContext, req: CreditDeadWorker) -> CreditResult
         classify_log=req.classify_log,
         dispatched_at=req.dispatched_at,
         pr_number=req.pr_number,
+    )
+    return CreditResult(failure_kind=kind, throttled_until=ctx.state.get("throttled_until"))
+
+
+def exempt_throttle_clean_exit(ctx: SweepContext, req: ExemptThrottleCleanExit) -> CreditResult:
+    kind = dead_worker_classification.exempt_clean_exit_throttle_death(
+        ctx.issue_entry(req.issue),
+        ctx.sessions_dir,
+        req.issue,
+        ctx.state,
+        ctx.config,
+        write_gate=ctx.write_gate,
+        dispatched_at=req.dispatched_at,
+        pr_number=req.pr_number,
+        now=ctx.now,
     )
     return CreditResult(failure_kind=kind, throttled_until=ctx.state.get("throttled_until"))
 
@@ -305,6 +321,7 @@ HANDLERS: dict[type, Callable[[SweepContext, Any], Any]] = {
     OpenPrForBranch: open_pr_for_branch,
     AdvanceToPrOpen: advance_to_pr_open,
     CreditDeadWorker: credit_dead_worker,
+    ExemptThrottleCleanExit: exempt_throttle_clean_exit,
     ReadTerminal: read_terminal,
     ReadCompletedOutcome: read_completed_outcome,
     ReadBlockedOutcome: read_blocked_outcome,
