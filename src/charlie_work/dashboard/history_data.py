@@ -9,6 +9,7 @@ back as a :class:`HistoryUnavailable` value, never as zeros.
 
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
 import threading
@@ -108,6 +109,9 @@ class HistoryView:
     query: MetricQuery
     metrics: tuple[MetricData, ...]
     computed_at: datetime
+    # Event kinds the last rollup pass saw but did not interpret (issue #2269);
+    # the page names them so an unhandled kind can never drop silently.
+    unclassified_kinds: tuple[str, ...] = ()
 
     def get(self, metric_id: str) -> MetricData | None:
         return next((m for m in self.metrics if m.metric_id == metric_id), None)
@@ -124,6 +128,22 @@ class HistoryUnavailable:
 HistoryResult = HistoryView | HistoryUnavailable
 
 
+def _unclassified_kinds(db: sqlite3.Connection) -> tuple[str, ...]:
+    """Kinds the last rollup pass counted but did not interpret (issue #2269).
+
+    Written by ``rollup._record_unclassified`` as ``{source: {kind: count}}``;
+    a missing or malformed value degrades to "nothing to report", never a page error.
+    """
+    row = db.execute("SELECT value FROM meta WHERE key = 'unclassified_kinds'").fetchone()
+    if row is None:
+        return ()
+    try:
+        stored = json.loads(row[0])
+        return tuple(sorted({kind for counts in stored.values() for kind in counts}))
+    except (ValueError, AttributeError, TypeError):
+        return ()
+
+
 def load_tab(db_path: Path | None, tab: str, range_key: str, now: datetime) -> HistoryResult:
     """Every metric of one tab over the range, with takeaways vs the prior window."""
     if db_path is None:
@@ -135,6 +155,7 @@ def load_tab(db_path: Path | None, tab: str, range_key: str, now: datetime) -> H
     try:
         current = tab_results(db, TAB_KEYS[tab], query)
         prior = tab_results(db, TAB_KEYS[tab], query.prior())
+        unclassified = _unclassified_kinds(db)
     except sqlite3.Error as exc:  # locked / torn mid-rebuild: a value, not a 500
         return HistoryUnavailable(f"cannot read {db_path}: {exc}", now)
     finally:
@@ -166,7 +187,7 @@ def load_tab(db_path: Path | None, tab: str, range_key: str, now: datetime) -> H
             metrics.append(
                 MetricData(mid, (), {}, error=f"{type(error).__name__}: {error}", error_kind=kind)
             )
-    return HistoryView(tab, range_key, query, tuple(metrics), now)
+    return HistoryView(tab, range_key, query, tuple(metrics), now, unclassified)
 
 
 Loader = Callable[[str, str, datetime], HistoryResult]

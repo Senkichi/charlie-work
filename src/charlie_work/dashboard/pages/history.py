@@ -76,6 +76,19 @@ def _meta(view: HistoryView, tz: tzinfo | None) -> str:
     )
 
 
+def _unclassified_note(view: HistoryView) -> str:
+    """Coverage caveat naming the event kinds the rollup counted but has neither a
+    handler nor a known-ignored reason for (issue #2269): they dropped to no rows."""
+    kinds = view.unclassified_kinds
+    if not kinds:
+        return ""
+    return (
+        '<p class="cov-note">'
+        f"{len(kinds)} event kind{'s' if len(kinds) != 1 else ''} not interpreted "
+        f"by the rollup: {esc(', '.join(kinds))}</p>"
+    )
+
+
 def _unavailable(result: HistoryUnavailable) -> str:
     return (
         '<section class="hunavail" aria-label="Rollup not available">'
@@ -99,7 +112,9 @@ def render_history(
     slugs) are the only repos whose panels link to a repo drill-down."""
     if isinstance(result, HistoryView):
         cards = render_cards(result, tz, known_repos)
-        body = _meta(result, tz) + f'<div class="hcards">{cards}</div>'
+        body = (
+            _meta(result, tz) + _unclassified_note(result) + f'<div class="hcards">{cards}</div>'
+        )
     else:
         body = _unavailable(result)
     panel = (
