@@ -122,7 +122,7 @@ def _adopt_and_approve(
 ) -> None:
     labels = app.config.labels
     _write_issue(issues_dir, issue_number, labels=(labels.ready, labels.in_progress))
-    transition(app.gh, labels, issue_number, "local_work_ready")
+    transition(app.gh, labels, issue_number, "local_work_ready", state_path=app.paths.state_file)
     with state_lock(app.paths.state_file):
         state = load_state(app.paths.state_file)
         state.setdefault("issues", {})[str(issue_number)] = {

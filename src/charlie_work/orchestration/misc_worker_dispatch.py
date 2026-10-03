@@ -378,7 +378,13 @@ def _route_phantom_live_worker(
         # re-adds ``ready`` when the deferral budget expires.
         removed_ready = False
         if self.config.labels.ready in issue_labels:
-            removed_ready = self.gh.remove_issue_label(issue_number, self.config.labels.ready)
+            removed_ready = self.write_gate.apply_issue_labels(
+                self.gh,
+                self.config.labels,
+                issue_number,
+                remove=(self.config.labels.ready,),
+                cause="phantom_live_worker_salvage_deferred",
+            ).ok
         state = _emit_session_failed_relabeled(
             state,
             issue_number=issue_number,
@@ -424,13 +430,20 @@ def _route_phantom_live_worker(
         return "dispatch_failed", None, state
 
     needs_ready = self.config.labels.ready not in issue_labels
-    label_write_ok = True
-    for label in sorted(active_labels):
-        if not self.gh.remove_issue_label(issue_number, label):
-            label_write_ok = False
-    if needs_ready:
-        if not self.gh.add_issue_label(issue_number, self.config.labels.ready):
-            label_write_ok = False
+    # Issue #2226: the strip+ready write goes through the WriteGate's
+    # canonical seam so the return to ``ready`` is recorded in events.db
+    # bound to this repo; the conditional add preserves the
+    # no-redundant-write contract.
+    label_result = self.write_gate.apply_issue_labels(
+        self.gh,
+        self.config.labels,
+        issue_number,
+        add=(self.config.labels.ready,) if needs_ready else (),
+        remove=sorted(active_labels),
+        to_state="ready",
+        cause="session_failed_relabeled",
+    )
+    label_write_ok = label_result.ok
     state = _emit_session_failed_relabeled(
         state,
         issue_number=issue_number,

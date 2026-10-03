@@ -272,6 +272,7 @@ _GATED_PRIMITIVE_NAMES = {
     "record_event",
     "log_event",
     "transition",
+    "apply_issue_labels",
     "kill_orphan_pid",
     "kill_process",
 }

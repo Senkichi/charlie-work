@@ -948,6 +948,9 @@ def record_review(
                     self.config.labels,
                     issue_number,
                     target,
+                    state_path=self.paths.state_file,
+                    repo=self.repo_root.name,
+                    pr_number=pr_number,
                 )
                 if result.outcome != TransitionOutcome.APPLIED:
                     label_error = {
@@ -967,6 +970,9 @@ def record_review(
                 self.config.labels,
                 issue_number,
                 _wf._escalation_edge("blocked", "judgment"),
+                state_path=self.paths.state_file,
+                repo=self.repo_root.name,
+                pr_number=pr_number,
             )
             if result.outcome != TransitionOutcome.APPLIED:
                 label_error = {
@@ -976,7 +982,15 @@ def record_review(
                     "remove_failures": result.remove_failures,
                 }
         elif decision == "approved":
-            result = _wf.transition(self.gh, self.config.labels, issue_number, "review_approved")
+            result = _wf.transition(
+                self.gh,
+                self.config.labels,
+                issue_number,
+                "review_approved",
+                state_path=self.paths.state_file,
+                repo=self.repo_root.name,
+                pr_number=pr_number,
+            )
             if result.outcome != TransitionOutcome.APPLIED:
                 label_error = {
                     "edge": "review_approved",

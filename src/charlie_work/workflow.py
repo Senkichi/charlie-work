@@ -54,10 +54,10 @@ from .github import (
     GitHubError,
     GitHubLike,
     GitHubRunResult,
-    detect_prose_only_dependencies,
+    detect_prose_only_dependencies,  # noqa: F401  (deliberate re-export; used by moved delegates via _wf.)
     issue_numbers_mentioned_by_pr,  # noqa: F401  (deliberate re-export; used by moved L01 b3 delegates via _wf.)
     label_names,
-    parse_blockers,
+    parse_blockers,  # noqa: F401  (deliberate re-export; used by moved delegates via _wf.)
 )
 from .issue_linking import linked_issue_number
 from .pr_body_closing_autofix_flow import autofix_body_closing_kw
@@ -413,7 +413,9 @@ from .backlog_reachability import (  # noqa: F401  (deliberate re-export)
     resolve_dispatch_mention_coverage,
     scan_merged_pr_references,
 )
-from .blocker_cycles import detect_open_blocker_cycles
+from .blocker_cycles import (  # noqa: F401  (deliberate re-export; used by moved delegates via _wf.)
+    detect_open_blocker_cycles,
+)
 
 # Issue #1768: operator-queue impact measurement + edge-detection, extracted
 # to its own module for the same reason ``backlog_reachability`` is (a
@@ -2272,132 +2274,6 @@ class OrchestratorApp:
         return CommandResult(True, "status complete", data)
 
     @_guard_state_lock
-    def intake(self) -> CommandResult:
-        issues = self.gh.issue_list(self.config.labels.ready)
-        written: list[dict[str, Any]] = []
-        failed: list[dict[str, Any]] = []
-        prose_only_deps_issues: list[int] = []
-        # Gather all network results and write files outside the lock
-        for issue in issues:
-            issue_number = int(issue["number"])
-            try:
-                full_issue = self.gh.issue_view(issue_number)
-            except GitHubError as exc:
-                failed.append({"issue": issue_number, "error": str(exc)})
-                continue
-            issue_dir = self.paths.issues / f"issue-{issue_number}"
-            issue_json = issue_dir / "issue.json"
-            # Issue #618: in dry-run, skip all file mutations (issue dir,
-            # issue.json, worker-prompt.md) — the preview must not touch disk.
-            if not self.dry_run:
-                issue_dir.mkdir(parents=True, exist_ok=True)
-                self._write_json(issue_json, full_issue)
-            prompt_path = self._write_worker_prompt(full_issue, dry_run=self.dry_run)
-
-            # Check for prose-only dependencies (issue #225)
-            body_text = full_issue.get("body", "")
-            has_prose_deps = detect_prose_only_dependencies(body_text)
-            has_structured_blockers = bool(parse_blockers(body_text))
-
-            # If prose-only dependencies exist without structured blockers, label for human attention
-            if has_prose_deps and not has_structured_blockers:
-                prose_only_deps_issues.append(issue_number)
-                if not self.dry_run:
-                    try:
-                        self.gh.add_issue_label(issue_number, self.config.labels.prose_only_deps)
-                    except Exception:
-                        # Label add failure is non-blocking for intake
-                        pass
-
-            written.append(
-                {
-                    "issue": issue_number,
-                    "prompt_path": str(prompt_path),
-                    "title": full_issue.get("title"),
-                    "url": full_issue.get("url"),
-                    "labels": sorted(label_names(full_issue)),
-                    "updated_at": full_issue.get("updatedAt"),
-                }
-            )
-        # Issue #1848: scan the open-issue blocker graph for cycles -- a loop
-        # of open issues blocking each other (or an issue listing itself)
-        # stalls every member forever while each still looks armed. Reporting
-        # only: one warning per reported cycle is logged inside the scan, and
-        # one blocker_cycle event per reported cycle is recorded below (the
-        # report is bounded by MAX_REPORTED_CYCLES total plus per-component
-        # cycle/DFS caps inside the scan; the intake event carries the
-        # truncation marker). Runs with the rest of intake's reads, outside
-        # the state lock; fail-open.
-        blocker_cycle_scan = detect_open_blocker_cycles(self.gh)
-        blocker_cycles = blocker_cycle_scan.cycles
-        # Single lock for all state updates — skipped in dry-run (issue #618)
-        if not self.dry_run:
-            with state_lock(self.paths.state_file):
-                state = load_state(self.paths.state_file)
-                for entry in written:
-                    issue_number = entry["issue"]
-                    # Merge-update, never replace: intake used to clobber dispatch
-                    # status recorded by earlier passes (production-confirmed).
-                    state["issues"][str(issue_number)] = {
-                        **state["issues"].get(str(issue_number), {}),
-                        "number": issue_number,
-                        "title": entry["title"],
-                        "url": entry["url"],
-                        "labels": entry["labels"],
-                        "prompt_path": entry["prompt_path"],
-                        "updated_at": entry["updated_at"],
-                    }
-                for failure in failed:
-                    state = self._record_event(
-                        state,
-                        "intake_failed",
-                        {"issue_number": failure["issue"], "error": failure["error"]},
-                    )
-                if prose_only_deps_issues:
-                    state = self._record_event(
-                        state,
-                        "intake_prose_only_deps",
-                        {"issue_numbers": sorted(prose_only_deps_issues)},
-                    )
-                for cycle in blocker_cycles:
-                    state = self._record_event(
-                        state,
-                        "blocker_cycle",
-                        {"issue_numbers": cycle},
-                    )
-                state = self._record_event(
-                    state,
-                    "intake",
-                    {
-                        "issue_count": len(issues),
-                        "failed_count": len(failed),
-                        "blocker_cycles_reported": len(blocker_cycles),
-                        "blocker_cycles_truncated": blocker_cycle_scan.truncated,
-                    },
-                )
-                save_state(self.paths.state_file, state)
-        message = "intake complete"
-        if self.dry_run:
-            message = f"dry-run: would intake {len(written)} issue(s)"
-        elif failed:
-            message = f"intake completed with {len(failed)} failure(s)"
-        if prose_only_deps_issues:
-            message += (
-                f", {len(prose_only_deps_issues)} issue(s) labeled with prose-only dependencies"
-            )
-        return CommandResult(
-            not failed,
-            message,
-            {
-                "issues": written,
-                "failed": failed,
-                "prose_only_deps_issues": prose_only_deps_issues,
-                "blocker_cycles": blocker_cycles,
-                "blocker_cycles_truncated": blocker_cycle_scan.truncated,
-            },
-        )
-
-    @_guard_state_lock
     def review(
         self,
         pr_number: int,
@@ -3229,7 +3105,15 @@ class OrchestratorApp:
                 )
 
             if issue_number is not None and verdict.is_check_failure_block:
-                transition(self.gh, self.config.labels, issue_number, "review_started")
+                transition(
+                    self.gh,
+                    self.config.labels,
+                    issue_number,
+                    "review_started",
+                    state_path=self.paths.state_file,
+                    repo=self.repo_root.name,
+                    pr_number=pr_number,
+                )
                 summary = f"CI failed on {', '.join(verdict.failed_required_checks)}; push a fix"
                 # Issue #771: name the failure, not just the check. Populated
                 # from the failing check run(s)' GitHub annotations when
@@ -3410,7 +3294,15 @@ class OrchestratorApp:
                 and not verdict.infra_definitive_failed
             )
             if issue_number is not None and is_co_occurring_check_failure_block:
-                transition(self.gh, self.config.labels, issue_number, "review_started")
+                transition(
+                    self.gh,
+                    self.config.labels,
+                    issue_number,
+                    "review_started",
+                    state_path=self.paths.state_file,
+                    repo=self.repo_root.name,
+                    pr_number=pr_number,
+                )
                 # verdict.failures always ends with the "Required check(s)
                 # failed: ..." message when failed_required_checks is
                 # truthy (janitor.run_janitor appends it last, nothing after
@@ -3623,7 +3515,15 @@ class OrchestratorApp:
                 # {in_progress} -> review_started -> {in_progress,pr_open,reviewing}
                 #               -> rework_requested (inside record_review) -> {in_progress,pr_open,needs_rework}
                 if issue_number is not None:
-                    transition(self.gh, self.config.labels, issue_number, "review_started")
+                    transition(
+                        self.gh,
+                        self.config.labels,
+                        issue_number,
+                        "review_started",
+                        state_path=self.paths.state_file,
+                        repo=self.repo_root.name,
+                        pr_number=pr_number,
+                    )
                 summary = render_test_adequacy_summary(
                     test_adequacy_verdict, self.config.test_adequacy.exempt_marker
                 )
@@ -4154,7 +4054,15 @@ class OrchestratorApp:
                     should_skip_transition = True
 
             if not should_skip_transition and not dispatch_disabled:
-                result = transition(self.gh, self.config.labels, issue_number, "review_started")
+                result = transition(
+                    self.gh,
+                    self.config.labels,
+                    issue_number,
+                    "review_started",
+                    state_path=self.paths.state_file,
+                    repo=self.repo_root.name,
+                    pr_number=pr_number,
+                )
                 if result.outcome != TransitionOutcome.APPLIED:
                     label_error = {
                         "edge": "review_started",

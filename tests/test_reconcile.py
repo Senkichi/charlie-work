@@ -380,7 +380,7 @@ def test_transition_failed_add_returns_partial_failure() -> None:
         fail_add_labels={(10, config.labels.done)},
     )
 
-    result = transition(gh, config.labels, 10, "merged")
+    result = transition(gh, config.labels, 10, "merged", state_path=None)
 
     assert result.outcome == TO.PARTIAL_FAILURE
     assert (10, config.labels.done) in result.add_failures
@@ -399,7 +399,7 @@ def test_transition_failed_remove_returns_partial_failure() -> None:
         fail_remove_labels={(10, config.labels.in_progress)},
     )
 
-    result = transition(gh, config.labels, 10, "merged")
+    result = transition(gh, config.labels, 10, "merged", state_path=None)
 
     assert result.outcome == TO.PARTIAL_FAILURE
     assert (10, config.labels.in_progress) in result.remove_failures
@@ -415,7 +415,7 @@ def test_transition_no_labels_returns_nothing_changed() -> None:
 
     # Use an event that has no labels (e.g., a hypothetical no-op event)
     # For this test, we'll use the "blocked" event which only adds human_needed
-    result = transition(gh, config.labels, 10, "blocked")
+    result = transition(gh, config.labels, 10, "blocked", state_path=None)
 
     assert result.outcome == TO.APPLIED  # blocked has labels to add
     assert len(result.add_failures) == 0
@@ -433,7 +433,7 @@ def test_terminal_transition_clears_sibling_workflow_labels() -> None:
     )
 
     # Transition to agent:done should remove agent:human-needed and all other workflow labels
-    result = transition(gh, config.labels, 852, "merged")
+    result = transition(gh, config.labels, 852, "merged", state_path=None)
 
     assert result.outcome == TO.APPLIED
     assert len(result.add_failures) == 0
@@ -466,7 +466,7 @@ def test_merged_transition_removes_merge_hold_label() -> None:
         issues=[_issue(10, [config.labels.merge_hold, config.labels.in_progress])],
     )
 
-    result = transition(gh, config.labels, 10, "merged")
+    result = transition(gh, config.labels, 10, "merged", state_path=None)
 
     assert result.outcome == TO.APPLIED
     assert (10, config.labels.done) in gh.labels_added
@@ -487,7 +487,7 @@ def test_closed_unmerged_transition_removes_merge_hold_label() -> None:
         ],
     )
 
-    result = transition(gh, config.labels, 10, "closed_unmerged")
+    result = transition(gh, config.labels, 10, "closed_unmerged", state_path=None)
 
     assert result.outcome == TO.APPLIED
     assert (10, config.labels.merge_hold) in gh.labels_removed
@@ -519,7 +519,7 @@ def test_non_terminal_transition_preserves_merge_hold_label(
         issues=[_issue(10, [config.labels.merge_hold, config.labels.in_progress])],
     )
 
-    result = transition(gh, config.labels, 10, event)
+    result = transition(gh, config.labels, 10, event, state_path=None)
 
     assert result.outcome == TO.APPLIED
     for label in expected_add:
@@ -541,7 +541,7 @@ def test_mutation_gate_transition_ignoring_result_fails() -> None:
 
     # This test ensures that if someone reverts to fire-and-forget (ignoring result),
     # the test will fail because we assert on the outcome
-    result = transition(gh, config.labels, 10, "merged")
+    result = transition(gh, config.labels, 10, "merged", state_path=None)
 
     # If someone ignores the result and just calls transition(), this assertion
     # will catch that the operation didn't fully succeed

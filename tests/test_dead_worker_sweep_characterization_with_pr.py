@@ -490,6 +490,14 @@ def test_sweep_dry_run_gates_state_and_events_not_the_injected_github_client(
 
     assert issue_entry(paths, 1176) == before
     assert load_state(paths.state_file).get("events", []) == []
-    # Label writes go straight to the GitHub client, which owns its own
-    # dry-run switch; the WriteGate only gates state.json and events.
-    assert (1176, config.labels.ready) in gh.labels_added
+    # Issue #2226: sweep label writes now route through the WriteGate, which
+    # owns dry-run suppression uniformly — a dry-run sweep writes no labels
+    # to the injected client ("not the injected github client": the gate,
+    # not ``gh.dry_run``, is what suppresses them). In production
+    # ``gh.dry_run`` suppressed the same writes at the transport layer, so
+    # this is an earlier no-op of the same effective behavior.
+    # The leaf name is load-bearing: the collect-only gate (issue #1538)
+    # fails a rename outright — a removed leaf must reappear verbatim in a
+    # sibling module, and only an operator exemption waives it.
+    assert gh.labels_added == []
+    assert gh.labels_removed == []

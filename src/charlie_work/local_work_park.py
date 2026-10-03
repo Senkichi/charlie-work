@@ -547,13 +547,19 @@ def park_or_reclaim_local_orphan(
         _reset_probe_deferral(write_gate, state, issue_number)
 
     needs_ready = config.labels.ready not in issue_labels
-    label_write_ok = True
-    for label in sorted(active_labels):
-        if not gh.remove_issue_label(issue_number, label):
-            label_write_ok = False
-    if needs_ready:
-        if not gh.add_issue_label(issue_number, config.labels.ready):
-            label_write_ok = False
+    # Issue #2226: route through the WriteGate's canonical seam so the
+    # return to ``ready`` lands in events.db bound to this repo; the
+    # conditional add preserves the no-redundant-write contract.
+    label_result = write_gate.apply_issue_labels(
+        gh,
+        config.labels,
+        issue_number,
+        add=(config.labels.ready,) if needs_ready else (),
+        remove=sorted(active_labels),
+        to_state="ready",
+        cause="session_failed_relabeled",
+    )
+    label_write_ok = label_result.ok
     reclaim_results[issue_number] = {
         "removed_labels": sorted(active_labels),
         "added_ready": needs_ready,

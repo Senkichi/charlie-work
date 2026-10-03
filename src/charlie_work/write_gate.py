@@ -52,12 +52,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from .config import LabelConfig
 from .github import GitHubLike
 from .instrumentation import log_event
-from .labels import TransitionOutcome, TransitionResult, transition
+from .labels import (
+    TransitionOutcome,
+    TransitionResult,
+    apply_issue_labels,
+    transition,
+)
 from .process_utils import kill_orphan_pid, kill_process_tree
 from .state import append_event, save_state
 
@@ -156,9 +161,16 @@ class WriteGate:
         labels: LabelConfig,
         issue_number: int,
         event: str,
+        *,
+        pr_number: int | None = None,
+        cause: str | None = None,
     ) -> TransitionResult:
         """Gate ``labels.transition``, in addition to (never instead of) the
         sink-level dry-run gate already enforced by the guarded transport.
+
+        ``state_path``/``repo`` are auto-bound like every other gate method
+        so the wrapped primitive can emit the ``lifecycle_transition`` event
+        (issue #2226); ``pr_number``/``cause`` are forwarded to its payload.
 
         Dry-run: return the library's own no-op value,
         ``TransitionResult(TransitionOutcome.NOTHING_CHANGED, [], [])`` —
@@ -168,7 +180,51 @@ class WriteGate:
         """
         if self.dry_run:
             return TransitionResult(TransitionOutcome.NOTHING_CHANGED, [], [])
-        return transition(gh, labels, issue_number, event)
+        return transition(
+            gh,
+            labels,
+            issue_number,
+            event,
+            state_path=self.state_path,
+            repo=self.repo,
+            pr_number=pr_number,
+            cause=cause,
+        )
+
+    def apply_issue_labels(
+        self,
+        gh: GitHubLike,
+        labels: LabelConfig,
+        issue_number: int,
+        *,
+        add: Iterable[str] = (),
+        remove: Iterable[str] = (),
+        to_state: str | None = None,
+        pr_number: int | None = None,
+        cause: str | None = None,
+    ) -> TransitionResult:
+        """Gate ``labels.apply_issue_labels`` for callers whose label writes
+        do not map onto a named edge (conditional adds, computed repair
+        sets). ``state_path``/``repo`` are auto-bound exactly as in
+        ``transition`` so the ``lifecycle_transition`` emit still lands
+        (issue #2226).
+
+        Dry-run: same no-op ``TransitionResult`` as ``transition``.
+        """
+        if self.dry_run:
+            return TransitionResult(TransitionOutcome.NOTHING_CHANGED, [], [])
+        return apply_issue_labels(
+            gh,
+            labels,
+            issue_number,
+            add=add,
+            remove=remove,
+            to_state=to_state,
+            state_path=self.state_path,
+            repo=self.repo,
+            pr_number=pr_number,
+            cause=cause,
+        )
 
     def kill_process(self, pid: int) -> None:
         """Gate ``process_utils.kill_orphan_pid``. Dry-run: no kill, returns ``None``.
