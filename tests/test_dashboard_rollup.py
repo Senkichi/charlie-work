@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import json
+import logging
 import sqlite3
 from datetime import timedelta
 
@@ -335,3 +337,38 @@ def test_sweep_expansion_only_wraps_ref_only_handlers() -> None:
     }
     rows = derive_event(ALPHA, ev)
     assert [(c["issue"], c["pr"], c["seq"]) for _t, c in rows] == [(None, 40, 0), (None, 41, 1)]
+
+
+def test_unhandled_kind_is_counted_unclassified_per_source(fleet) -> None:
+    """#2269: a kind with neither a handler nor a KNOWN_IGNORED entry must surface.
+
+    Emitted through the real ``log_event`` (the fixture's writer); before this
+    change it produced no fact rows and no signal. Now the rollup counts it per
+    source and persists the set on ``meta`` for the History page.
+    """
+    fleet.emit(fleet.alpha, "2026-10-01T10:30:00Z", "brand_new_unclassified_kind", {"x": 1})
+    fleet.emit(fleet.alpha, "2026-10-01T10:31:00Z", "brand_new_unclassified_kind", {"x": 2})
+    result = rollup.run_rollup(fleet.sources(), NOW)
+    assert result.errors == ()
+    by = {s.source: s for s in result.sources}
+    assert by[ALPHA].unclassified == {"brand_new_unclassified_kind": 2}
+    # known-ignored (supervisor_started, unauthorized_merge_queue_sync_covered) and
+    # handled kinds never land in the count
+    assert by[BETA].unclassified == {}
+    assert by["fleet"].unclassified == {}
+    stored = _all(fleet.db(), "SELECT value FROM meta WHERE key = 'unclassified_kinds'")
+    assert json.loads(stored[0][0]) == {ALPHA: {"brand_new_unclassified_kind": 2}}
+
+
+def test_unclassified_warning_fires_only_when_the_set_changes(fleet, caplog) -> None:
+    """#2269: each rollup pass warns when the unclassified-kind set changes -- a new
+    kind appearing, one disappearing -- and stays quiet while it is stable."""
+    with caplog.at_level(logging.WARNING, "charlie_work.dashboard"):
+        rollup.run_rollup(fleet.sources(), NOW)  # nothing unclassified yet
+        fleet.emit(fleet.alpha, "2026-10-01T10:30:00Z", "brand_new_unclassified_kind", {})
+        rollup.run_rollup(fleet.sources(), NOW)
+    assert "1 event kind(s) not interpreted: brand_new_unclassified_kind" in caplog.text
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, "charlie_work.dashboard"):
+        rollup.run_rollup(fleet.sources(), NOW)  # same set: quiet
+    assert "not interpreted" not in caplog.text

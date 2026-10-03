@@ -21,8 +21,9 @@ the two never overlap and nothing is counted twice.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -30,7 +31,7 @@ from typing import Any
 from .. import layout
 from . import sources as src
 from .rollup_common import _int
-from .rollup_derive import GLOBAL_ONLY_KINDS, HANDLERS, derive_event
+from .rollup_derive import GLOBAL_ONLY_KINDS, HANDLERS, KNOWN_IGNORED, derive_event
 from .rollup_schema import (
     FLEET_SOURCE,
     LOOP_PASS_COLUMNS,
@@ -44,6 +45,7 @@ WINDOW = timedelta(hours=6)
 _IGNORE_TABLES = frozenset({"job_observations"})
 # reconcile sub-kind repeated every pass for the same issue (recon section 4): noise.
 _STALE_RECONCILE = "terminal_state_stale"
+log = logging.getLogger("charlie_work.dashboard")
 
 
 @dataclass(frozen=True)
@@ -63,6 +65,9 @@ class SourceResult:
     rederived: int  # handled events re-derived inside the trailing window
     rebuilt: bool  # source wiped and re-ingested from id 1
     error: str | None = None
+    # kind -> row count, for every kind in this source's events table the rollup
+    # neither handles nor declares in KNOWN_IGNORED (issue #2269).
+    unclassified: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -207,14 +212,21 @@ def _typed_pass(row: tuple[Any, ...]) -> tuple[Any, ...]:
     return tuple(out)
 
 
-def _write_coverage(srcdb: sqlite3.Connection, dst: sqlite3.Connection, source: str) -> None:
+def _write_coverage(
+    srcdb: sqlite3.Connection, dst: sqlite3.Connection, source: str
+) -> list[tuple]:
+    """Refresh the source's coverage rows; return the per-kind rows they came from.
+
+    The caller reuses the grouped counts for ``SourceResult.unclassified`` (issue
+    #2269) so the classification never needs a second scan of the events table.
+    """
     dst.execute("DELETE FROM coverage WHERE source = ?", (source,))
     rows = srcdb.execute(
         "SELECT kind, MIN(ts), MAX(ts), COUNT(*) FROM events GROUP BY kind"
     ).fetchall()
     total_n = sum(r[3] for r in rows)
     if not rows:
-        return
+        return rows
     first, last = min(r[1] for r in rows), max(r[2] for r in rows)
     dst.execute(
         "INSERT INTO coverage (source, kind, first_ts, last_ts, n) VALUES (?, '*', ?, ?, ?)",
@@ -224,6 +236,7 @@ def _write_coverage(srcdb: sqlite3.Connection, dst: sqlite3.Connection, source: 
         "INSERT INTO coverage (source, kind, first_ts, last_ts, n) VALUES (?, ?, ?, ?, ?)",
         [(source, str(k), lo, hi, n) for k, lo, hi, n in rows],
     )
+    return rows
 
 
 def _write_pulse(srcdb: sqlite3.Connection, dst: sqlite3.Connection, source: str) -> None:
@@ -325,7 +338,7 @@ def _ingest_source(dst: sqlite3.Connection, source: str, db: Path, cutoff: str) 
                     _insert(dst, table, cols)
             if source != FLEET_SOURCE:
                 _copy_loop_passes(srcdb, dst, source, cutoff if wm else None)
-            _write_coverage(srcdb, dst, source)
+            coverage_rows = _write_coverage(srcdb, dst, source)
             _write_pulse(srcdb, dst, source)
             dst.execute(
                 "INSERT OR REPLACE INTO watermarks (source, max_id) VALUES (?, ?)",
@@ -335,11 +348,45 @@ def _ingest_source(dst: sqlite3.Connection, source: str, db: Path, cutoff: str) 
         except BaseException:
             dst.execute("ROLLBACK")
             raise
-        return SourceResult(source, ingested, rederived, rebuilt)
+        unclassified = {
+            str(kind): int(n)
+            for kind, _first, _last, n in coverage_rows
+            if kind not in HANDLERS and kind not in KNOWN_IGNORED
+        }
+        return SourceResult(source, ingested, rederived, rebuilt, unclassified=unclassified)
     except sqlite3.Error as exc:
         return SourceResult(source, 0, 0, False, f"{type(exc).__name__}: {exc}")
     finally:
         srcdb.close()
+
+
+def _record_unclassified(dst: sqlite3.Connection, results: tuple[SourceResult, ...]) -> None:
+    """Persist the unclassified-kind counts and warn when the set changes (issue #2269).
+
+    The JSON ``{source: {kind: count}}`` lands on ``meta`` under
+    ``unclassified_kinds`` so read-only consumers (the History page) can name the
+    kinds the rollup does not interpret. A warning fires only when the set of
+    unclassified kinds differs from what the previous pass recorded -- a new kind
+    appearing, one going away, or the first pass that sees any.
+    """
+    unclassified = {s.source: s.unclassified for s in results if s.unclassified}
+    row = dst.execute("SELECT value FROM meta WHERE key = 'unclassified_kinds'").fetchone()
+    try:
+        stored = json.loads(row[0]) if row else {}
+        previous = {kind for counts in stored.values() for kind in counts}
+    except (ValueError, AttributeError, TypeError):
+        previous = set()
+    current = sorted({kind for counts in unclassified.values() for kind in counts})
+    if set(current) != previous:
+        log.warning(
+            "dashboard rollup: %d event kind(s) not interpreted: %s",
+            len(current),
+            ", ".join(current),
+        )
+    dst.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES ('unclassified_kinds', ?)",
+        (json.dumps(unclassified, sort_keys=True),),
+    )
 
 
 def run_rollup(sources: RollupSources, now: datetime) -> RollupResult:
@@ -355,9 +402,17 @@ def run_rollup(sources: RollupSources, now: datetime) -> RollupResult:
     try:
         plan = [(FLEET_SOURCE, sources.fleet_events_db), *sources.repos]
         results = tuple(_ingest_source(dst, s, db, cutoff) for s, db in plan)
-        dst.execute(
-            "INSERT OR REPLACE INTO meta (key, value) VALUES ('rolled_up_at', ?)", (_iso(now),)
-        )
+        dst.execute("BEGIN IMMEDIATE")
+        try:
+            _record_unclassified(dst, results)
+            dst.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES ('rolled_up_at', ?)",
+                (_iso(now),),
+            )
+            dst.execute("COMMIT")
+        except BaseException:
+            dst.execute("ROLLBACK")
+            raise
         return RollupResult(results, db_rebuilt, None, sources.registry_error)
     except sqlite3.Error as exc:
         return RollupResult((), db_rebuilt, f"{type(exc).__name__}: {exc}", sources.registry_error)

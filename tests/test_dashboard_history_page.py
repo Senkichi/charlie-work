@@ -123,6 +123,24 @@ def test_coverage_note_names_each_source_start_in_local_time(db_path: Path) -> N
     assert 'class="cov-note">Coverage: ' in card
 
 
+def test_unclassified_event_kinds_are_named_on_the_page(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#2269: kinds the rollup does not interpret show up in the page coverage caveat,
+    named, so a new writer kind can never drop silently again."""
+
+    def build(f: Fleet) -> None:
+        build_base(f)
+        f.emit(f.alpha, "2026-10-01T10:30:00Z", "brand_new_unclassified_kind", {})
+
+    path = _rolled(tmp_path, monkeypatch, (build,))
+    view = load_tab(path, "flow", "7d", NOW)
+    assert isinstance(view, HistoryView)
+    assert view.unclassified_kinds == ("brand_new_unclassified_kind",)
+    page = render_history(view, "flow", "7d")
+    assert "1 event kind not interpreted by the rollup: brand_new_unclassified_kind" in page
+
+
 def test_approx_series_is_dashed_and_says_why(db_path: Path) -> None:
     page = render_history(load_tab(db_path, "flow", "7d", NOW), "flow", "7d")
     card = _card(page, "lead_time")
