@@ -1,8 +1,11 @@
 """Pure event -> fact-row derivation for the dashboard rollup (events recon section 3).
 
 ``derive_event`` maps one ``events`` row to ``(table, columns)`` pairs; it does no I/O.
-Kinds without a handler (including the noise kinds) yield nothing, so the handler
-registry doubles as the allow-list the rollup selects from.
+Kinds without a handler yield nothing, so the handler registry doubles as the
+allow-list the rollup selects from. ``KNOWN_IGNORED`` names every deliberately
+un-interpreted kind with a one-line reason; a kind in neither table is
+*unclassified* and counted per source so it surfaces instead of silently dropping
+(issue #2269).
 """
 
 from __future__ import annotations
@@ -10,14 +13,294 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
+# The kind is spelled via the constant, never a literal: the #2262 salvage-seam
+# AST guard (tests/test_dead_worker_salvage_seam.py) counts any bare
+# "session_failed_relabeled" constant as a dead-worker requeue locus, which this
+# read-side classification is not.
+from ..dead_worker_sweep.decide_common import SESSION_FAILED_RELABELED
 from .rollup_common import Row, _dict, _flag, _int, _ints, _milestone, _refs, reason_group
 from .rollup_flow_handlers import FLOW_HANDLERS, escalation
 from .rollup_schema import JOB_TABLE
 
-# Excluded from every rollup (recon section 4): ~25% of cw rows / repeated every pass.
-# ``unauthorized_merge_queue_sync_covered`` has no handler; ``reconcile`` is handled but
-# only its ``merged_outside_orchestrator`` sub-kind emits (``terminal_state_stale`` never).
-NOISE_KINDS = frozenset({"unauthorized_merge_queue_sync_covered"})
+# Kinds the rollup deliberately does not interpret, with the one-line reason each is
+# skipped. A kind in an events DB that is in neither ``HANDLERS`` nor this table is
+# *unclassified*: the rollup counts it per source (``SourceResult.unclassified``) and
+# warns when the set changes (issue #2269). An emitted kind missing from both fails
+# ``test_every_emitted_kind_is_rollup_classified``, so a new writer kind cannot land
+# without someone deciding what it means for the dashboard.
+KNOWN_IGNORED: dict[str, str] = {
+    # -- Reaper / sweep bookkeeping: recovery detail (and the <kind>_sweep batch
+    #    summaries it is folded into); the corrective transitions are their own events.
+    "orphaned_worker_drift": "dead-worker sweep drift record; the corrective transition is its own event",
+    "orphaned_worker_drift_sweep": "batch form of orphaned_worker_drift",
+    "review_dispatch_stalled": "a stalled review claim was reset for retry; recovery bookkeeping",
+    "review_dispatch_stalled_sweep": "batch form of review_dispatch_stalled",
+    "review_dispatch_lifecycle_reaped": "names a merged/closed PR only; deliberately not merge evidence (see rollup_flow_handlers docstring)",
+    "review_dispatch_lifecycle_reaped_sweep": "batch form of review_dispatch_lifecycle_reaped",
+    "fleet_reap_sweep": "fleet-level reap summary; per-issue effects carry their own kinds",
+    SESSION_FAILED_RELABELED: "a dead session's failure kind was reclassified after the fact",
+    "session_salvaged": "a dead worker's salvageable work was recovered",
+    "superseded_worker_reaped": "a superseded worker was reaped at the rework trigger",
+    "superseded_worker_reap_failed": "the superseded-worker reap failed",
+    "foreign_writer_reaped": "a foreign writer's worktree state was cleaned up",
+    "foreign_issue_ref_cleared": "a foreign issue reference was cleared",
+    "orphan_processes_killed": "orphan-process sweep bookkeeping",
+    "closed_unmerged_pr_state_converged": "a closed-unmerged PR's state was converged by reconcile",
+    "escalated_label_repaired": "a stale escalated label was repaired",
+    "rework_stranded_commits_salvaged": "stranded-commit salvage record for a rework worker",
+    "worktree_foreign_adopted": "worktree hygiene: a foreign checkout was adopted",
+    "worktree_foreign_writer": "worktree hygiene: a foreign writer was detected",
+    "worktree_local_commits_archived": "worktree hygiene: local commits were archived on a no-remote repo",
+    "worktree_rescue_captured": "worktree hygiene: a rescue capture was taken",
+    "worktrees_reclaimed": "worktree hygiene: merged worktrees were reclaimed",
+    # -- Loop-pass / supervisor lifecycle: pass cadence and duration already come
+    #    from the loop_passes table; liveness is a Now concern, not History.
+    "loop_started": "pass cadence/duration comes from the loop_passes table",
+    "loop_completed": "pass cadence/duration comes from the loop_passes table",
+    "pass_skipped_locked": "a lock-skipped pass produces no work to chart",
+    "loop_pass_deadline_deferred": "in-pass deadline deferral bookkeeping",
+    "fleet_pass_completed": "fleet pass summary; per-repo pass data comes from loop_passes",
+    "fleet_pass_config_error": "supervisor-side config fault record",
+    "fleet_pass_deadline_deferred": "fleet pass deadline bookkeeping",
+    "fleet_lane_completed": "fleet lane timing bookkeeping",
+    "fleet_lane_overrun": "fleet lane timing bookkeeping",
+    "supervisor_started": "supervisor lifecycle; liveness is read live by Now",
+    "supervisor_exited": "supervisor lifecycle; liveness is read live by Now",
+    "supervisor_wedge_loop": "watchdog tripwire record",
+    "supervisor_zero_pass_alarm": "alarm record; heartbeat/Now surface it",
+    "supervisor_restart_watchdog_disabled": "watchdog configuration record",
+    "supervise_relaunch_cap_reached": "relaunch-cap tripwire record",
+    "notify_digest_stale": "notify-digest freshness record; notify supervision consumes it",
+    "fleet_paused": "operator control record",
+    "fleet_resumed": "operator control record",
+    "fleet_stop_requested": "operator control record",
+    "fleet_registry_stale_entry": "registry hygiene record",
+    "fleet_canary": "synthetic liveness probe; not pipeline data",
+    "token_unusable": "auth diagnostic",
+    # -- GitHub transport / network diagnostics: throttles and capped_demand carry
+    #    the chartable signal.
+    "github_error": "transport diagnostic",
+    "github_not_found_error": "transport diagnostic",
+    "github_transport_fallback": "transport diagnostic",
+    "github_circuit_opened": "circuit-breaker state record",
+    "github_circuit_closed": "circuit-breaker state record",
+    "github_issue_state_partial_fallback": "partial-fallback diagnostic",
+    "git_network_retry": "per-call retry diagnostic",
+    # -- Runner / CI infrastructure: capacity metrics read runner_samples and
+    #    job_observations; these are the incident records around them.
+    "runner_health": "host-health record",
+    "runner_health_alert": "host-health record",
+    "runner_health_desktop_pressure": "host-health record",
+    "runner_health_stuck_window": "host-health record",
+    "runner_keepalive": "liveness heartbeat, not pipeline data",
+    "runner_unregistered": "provisioning record; slot state comes from runner_samples",
+    "runner_allocation_refused": "allocation decision record; runner_samples carries the outcome",
+    "runner_allocation_skipped": "allocation decision record; runner_samples carries the outcome",
+    "runner_capacity_recovered": "capacity bookkeeping",
+    "ci_fleet_provenance": "ci_fleet provenance guard record",
+    "ci_fleet_worktree_dirty": "ci_fleet provenance guard record",
+    "ci_run_never_created": "CI-run creation failure record",
+    "workflow_no_jobs": "workflow discovery record",
+    "main_ci_reclaim_cancelled": "main-branch CI reclaim bookkeeping",
+    "main_ci_reclaim_failed": "main-branch CI reclaim bookkeeping",
+    "ci_retrigger_skipped_conflicting": "stale-checks retrigger bookkeeping",
+    "ci_retriggered_stale_checks": "stale-checks retrigger bookkeeping",
+    "stale_checks_retrigger_exhausted": "stale-checks retrigger bookkeeping",
+    "flake_rerun_triggered": "flake-rerun bookkeeping",
+    "flake_rerun_failed": "flake-rerun bookkeeping",
+    "infra_rerun_triggered": "infra-rerun bookkeeping",
+    "infra_rerun_failed": "infra-rerun bookkeeping",
+    "infra_rerun_escalated": "infra-rerun escalation record",
+    # -- Config / host housekeeping.
+    "config_key_deprecated_read": "deprecated-config diagnostic (issue #1976)",
+    "config_key_retirement_armed": "config-retirement bookkeeping",
+    "config_key_retirement_regressed": "config-retirement bookkeeping",
+    "config_retirement_sweep": "config-retirement bookkeeping",
+    "containment_check": "report-only merge-path diagnostic per its emit site",
+    "label_filter_fallback": "label-filter diagnostic",
+    "venv_editable_anchor_violation": "venv-anchor diagnostic",
+    "venv_pth_mismatch": "venv-anchor diagnostic",
+    "venv_pth_repair_failed": "venv-anchor repair record",
+    "venv_pth_repaired": "venv-anchor repair record",
+    "test_slot_wait_timeout": "test-slot pool bookkeeping",
+    "markdown_guard_disagreement": "guard-comparison diagnostic",
+    "outbound_body_secret_refused": "outbound secret-guard refusal record",
+    "self_deploy_alarm": "self-deploy alarm record; deploys rows cover outcomes",
+    "self_deploy_blockers_cleared": "self-deploy bookkeeping",
+    "self_deploy_ci_fleet_pull": "self-deploy bookkeeping",
+    "self_deploy_skipped": "a skipped self-deploy produces nothing to chart",
+    "self_deploy_sync_starved": "self-deploy starvation record",
+    # -- Dispatch-lane decision records: the dispatched milestone and pass_samples
+    #    carry what shipped; these record the why-not / decision detail.
+    "intake": "intake-lane bookkeeping",
+    "intake_failed": "intake-lane bookkeeping",
+    "intake_prose_only_deps": "intake-lane bookkeeping",
+    "blocker_cycle": "dependency-graph diagnostic",
+    "dispatch_skip_blocked": "dispatch-skip record; dispatchable counts come from pass_samples",
+    "dispatch_skip_operator_claimed": "dispatch-skip record; dispatchable counts come from pass_samples",
+    "dispatch_stale": "a paused fleet's stale-dispatch signal",
+    "dispatch_blocked_chain_dead": "dispatch-skip record: a blocked chain went dead",
+    "dispatch_blocked_environment": "environment-block dispatch record",
+    "dispatch_blocked_environment_reaped": "environment-block reap record",
+    "dispatch_citation_drift_flagged": "citation-drift diagnostic",
+    "dispatch_closed_unmerged_ready_stripped": "closed-PR ready-state bookkeeping",
+    "dispatch_cross_repo_gate_overridden": "cross-repo gate decision record",
+    "dispatch_merged_pr_mention_flagged": "merged-PR mention bookkeeping",
+    "dispatch_merged_pr_mention_rearmed": "merged-PR mention bookkeeping",
+    "escalation_deferred_live_worker": "deferral record: a live worker still owns the issue",
+    "live_worker_redispatch_averted": "deferral record: redispatch averted by a live worker",
+    "launch_failed": "per-launch failure record; the launch_failures metric reads verdict_missed",
+    "role_fallback_selected": "model-chain selection record (audit-only per its emit site)",
+    "rescue_dispatched": "rescue-tier dispatch record; dispatch_rework carries the rework milestone",
+    "rescue_review_escalated": "rescue-tier escalation record",
+    "rework_dispatch_blocked_environment": "environment-block rework record",
+    "rework_dispatch_blocked_environment_reaped": "environment-block reap record",
+    "rework_issue_fetch_skipped": "rework-issue bookkeeping",
+    "attempt_resumed": "attempt-resume seed record (audit-only per its emit site; issue #2289)",
+    "attempt_resume_failed": "attempt-resume fallback record (audit-only per its emit site; issue #2289)",
+    # -- Review-lane bookkeeping: verdict milestones and review_samples carry the
+    #    lane; these record packet / janitor / verdict detail around it.
+    "review_packet": "review-packet bookkeeping",
+    "review_packet_template_stale": "review-packet bookkeeping",
+    "review_reap_invoked": "review-reap bookkeeping",
+    "review_checkout_removal_failed": "review-checkout bookkeeping",
+    "review_verdict_reconciled": "verdict-reconcile bookkeeping",
+    "review_decision_reclassified_blocked": "verdict-reclassification bookkeeping",
+    "review_dispatch_skipped_ci_red": "review-skip record: CI already red",
+    "review_exec_rejection_resumed": "exec-rejection resume record",
+    "review_exec_rejection_resume_failed": "exec-rejection resume record",
+    "review_interrupted_by_deploy": "deploy-interruption record",
+    "quota_probe_succeeded": "quota-probe bookkeeping",
+    "verdict_carried_forward_clean_rebase": "verdict carry-forward bookkeeping",
+    "verdict_carried_forward_line_content": "verdict carry-forward bookkeeping",
+    "verdict_carried_forward_verified_sync": "verdict carry-forward bookkeeping",
+    "verdict_force_voided": "verdict carry-forward bookkeeping",
+    "stale_ci_verdict_gate_pass": "stale-verdict bookkeeping",
+    "stale_ci_verdict_requeued": "stale-verdict bookkeeping",
+    "required_changes_vacuous": "required-changes diagnostic",
+    "request_changes_body_changed_requeued": "requeue bookkeeping",
+    "no_op_rework_repair_requested": "rework-routing record",
+    "janitor_gate": "janitor gate decision record",
+    "janitor_rework_cycle_failed": "janitor rework-loop bookkeeping",
+    "janitor_rework_stalled": "janitor rework-loop bookkeeping",
+    "pr_body_closing_keyword_autofix_failed": "PR-body autofix bookkeeping",
+    "pr_body_closing_keyword_autofixed": "PR-body autofix bookkeeping",
+    "pr_closing_ref_rewritten": "closing-reference bookkeeping",
+    "pr_closing_ref_unlinked": "closing-reference bookkeeping",
+    # -- Rework routing records: the rework_dispatched milestone carries the
+    #    dispatch; these record the route taken and the skips.
+    "check_failure_rework_requested": "rework-routing record",
+    "cross_pr_revert_rework_requested": "rework-routing record",
+    "merge_conflict_rework_requested": "rework-routing record",
+    "readiness_no_ci_rework_requested": "rework-routing record",
+    "stranded_request_changes_rework_requested": "rework-routing record",
+    "stranded_request_changes_skipped_issue_closed": "rework-routing record",
+    "pre_review_rework_routed": "rework-routing record",
+    "rework_already_pushed": "rework-routing record",
+    "rework_attempt_exempted_provider_throttle": "rework-attempt bookkeeping",
+    "rework_brief_regenerated": "rework-packet bookkeeping",
+    "rework_no_op_ci_rework_requested": "rework-routing record",
+    "rework_no_op_deferred": "rework-routing record",
+    "rework_no_op_escalated": "rework-routing record (audit-only per its emit site)",
+    "rework_no_op_rebuttal_review": "rework-routing record",
+    "rework_outcome_applied": "rework-outcome bookkeeping",
+    "rework_outcome_skipped": "rework-outcome bookkeeping",
+    "rework_requeued": "rework-routing record",
+    # -- Merge-path bookkeeping: the merged milestone carries the outcome; these
+    #    record aborts, deferrals, de-escalations and operator hand-offs.
+    "merge_ready": "merge-path accounting record; the merged milestone carries the outcome",
+    "merge_authorized": "operator merge authorization record",
+    "head_moved": "merge-path abort record: the base head moved mid-merge",
+    "merge_deferred_stale_base": "stale-base deferral record",
+    "merge_deferred_stale_base_alarm": "stale-base deferral alarm record",
+    "merge_failed_attempt_alarm": "merge-failure alarm record",
+    "human_merge_required": "human-merge hand-off record (audit-only per its emit site)",
+    "human_merge_label_removed": "human-merge bookkeeping",
+    "unauthorized_merge_queue_sync_covered": "repeated every pass for the same PR; recon section 4 noise",
+    "unauthorized_merge_acknowledged": "unauthorized-merge bookkeeping",
+    "unauthorized_merge_baseline_armed": "unauthorized-merge bookkeeping",
+    "unauthorized_merge_check_skipped": "unauthorized-merge bookkeeping",
+    "unauthorized_merge_detected": "unauthorized-merge bookkeeping",
+    "draft_pr_blocked": "draft-PR readiness bookkeeping",
+    "draft_pr_ready_failed": "draft-PR readiness bookkeeping",
+    "draft_pr_ready_held": "draft-PR readiness bookkeeping",
+    "draft_pr_ready_triggered": "draft-PR readiness bookkeeping",
+    "deescalation_cap_exhausted": "deescalation bookkeeping",
+    "deescalation_cleared": "deescalation bookkeeping",
+    "deescalation_pass_completed": "deescalation bookkeeping",
+    "deescalation_reason_class_backfilled": "deescalation bookkeeping",
+    "deescalation_recurrence_promoted": "deescalation bookkeeping",
+    "reconcile_pass_completed": "reconcile pass bookkeeping; merge milestones come from reconcile",
+    "reconcile_pass_deferred": "reconcile pass bookkeeping",
+    "reconcile_pass_failed": "reconcile pass bookkeeping",
+    "reconcile_pass_skipped": "reconcile pass bookkeeping",
+    "salvage_skipped_already_landed": "salvage skipped: the work already landed",
+    "salvage_skipped_superseded": "salvage skipped: the work was superseded",
+    # -- Operator queue / local (no-remote) lane.
+    "operator_claim": "operator-claim bookkeeping",
+    "operator_claim_released": "operator-claim bookkeeping",
+    "operator_queue_impact": "edge-triggered operator-queue signal; Now reads the queue live",
+    "throttle_window_set": "operator throttle record; throttles rows cover the refusal kinds",
+    "local_blocker_satisfied_by_patch_equivalence": "local (no-remote) lane bookkeeping",
+    "local_lane_kill_switch_stalled": "local (no-remote) lane bookkeeping",
+    "local_no_op_rework_rearmed": "local (no-remote) lane bookkeeping",
+    "local_review_adopted": "local (no-remote) lane bookkeeping",
+    "local_suite_failed": "local (no-remote) lane bookkeeping",
+    "local_work_ready": "local (no-remote) lane bookkeeping",
+    "worktree_unsafe_stranded_salvaged": "stranded-commit salvage record",
+    "worktree_unsafe_stranded_salvage_failed": "stranded-commit salvage record",
+    # -- Registered kinds the static emit scan cannot see (dynamic or allow-listed
+    #    emit sites, or kinds retained for older events DBs): same bookkeeping class.
+    "api_worker_provider_suspended": "provider-suspension record for API workers",
+    "check_infra_blocked": "infra-block gate record",
+    "ci_headroom_unavailable": "CI headroom diagnostic",
+    "coverage_probe_flagged": "diff-coverage probe diagnostic",
+    "dead_dispatched_throttle_rearmed": "dead-dispatch throttle bookkeeping",
+    "dead_dispatched_worker_reaped": "a dead dispatched worker was reaped; recovery bookkeeping",
+    "dispatch_failed": "dispatch failure record",
+    "host_load_unavailable": "host-load diagnostic",
+    "infra_blocked_escalated": "infra-block escalation record",
+    "local_merge_deferred": "local (no-remote) lane bookkeeping",
+    "local_merge_failed": "local (no-remote) lane bookkeeping",
+    "local_merge_rework_escalated": "local (no-remote) lane bookkeeping",
+    "local_review_adopt_failed": "local (no-remote) lane bookkeeping",
+    "local_review_packet_failed": "local (no-remote) lane bookkeeping",
+    "local_suite_launched": "local (no-remote) lane bookkeeping",
+    "local_suite_ok": "local (no-remote) lane bookkeeping",
+    "local_suite_result": "local (no-remote) lane bookkeeping",
+    "loop_refused_preflight": "preflight refusal record",
+    "merge_blocked": "merge-path failure record; the merged milestone carries the outcome",
+    "merge_failed": "merge-path failure record; the merged milestone carries the outcome",
+    "notify_resolution": "notify-digest resolution record; notify supervision consumes it",
+    "operator_claim_failed": "operator-claim bookkeeping",
+    "orphan_sweep_redispatch_escalated": "orphan-sweep escalation record",
+    "orphaned_worker_recovered": "dead-worker sweep recovery record; the corrective transition is its own event",
+    "orphaned_worker_routed_to_review": "dead-worker sweep routing record; the corrective transition is its own event",
+    "pr_create_failed_branch_stranded": "PR-creation failure record",
+    "pr_unlinked_resolved": "unlinked-PR marker bookkeeping (audit-only per its emit site)",
+    "pr_unlinked_skipped": "unlinked-PR marker bookkeeping (audit-only per its emit site)",
+    "preflight_config_stale": "preflight diagnostic",
+    "preflight_warning": "preflight diagnostic",
+    "review_dispatch_skipped_empty_diff": "review-skip record: nothing to review",
+    "review_stale_claim_recovery_skipped": "stale-claim recovery bookkeeping",
+    "review_verdict_reconcile_failed": "verdict-reconcile bookkeeping",
+    "rework_outcome_apply_failed": "rework-outcome bookkeeping",
+    "runner_capacity_starvation_escalation": "capacity-starvation escalation record",
+    "salvage_push_failed": "stranded-commit salvage record",
+    "session_budget_exceeded": "session-budget record",
+    "session_stalled": "session-stall record; worker exits carry the fate",
+    "spec_review": "spec-review bookkeeping",
+    "spec_review_failed": "spec-review bookkeeping",
+    "supervisor_wedged_killed": "watchdog kill record",
+    "unwired_symbol": "unwired-symbol diagnostic (advisory-only per its level file)",
+    "worker_attachment_budget_failed": "worker-outcome bookkeeping",
+    "worker_declared_blocked": "worker-outcome bookkeeping",
+    "worker_evidence_stale": "worker-outcome bookkeeping",
+    "worker_literal_tmp_path": "post-hoc /tmp-misuse signal (issue #1780)",
+    "worker_module_map_failed": "worker-outcome bookkeeping",
+    "worker_verified_no_changes": "worker-outcome bookkeeping",
+    "worker_verified_no_changes_ignored": "worker-outcome bookkeeping",
+}
 # Written to the global DB and (also) to per-repo DBs: the global DB is authoritative.
 GLOBAL_ONLY_KINDS = frozenset({"fleet_canary", "runner_allocation", "fleet_job_observations"})
 
@@ -287,7 +570,9 @@ HANDLERS: dict[str, Callable[[dict], list[Row]]] = {
     "runner_capacity_starved": _capped("demand", "capacity", None, starved_repo=True),
 }
 HANDLERS.update(FLOW_HANDLERS)
-assert not NOISE_KINDS & HANDLERS.keys()  # a noise kind must never gain a handler
+assert (
+    not KNOWN_IGNORED.keys() & HANDLERS.keys()
+)  # a kind is either interpreted or ignored, never both
 
 
 def derive_event(source: str, ev: dict) -> list[Row]:

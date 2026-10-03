@@ -31,19 +31,33 @@ def shared_max(rows: tuple[Bullet, ...]) -> float:
 
 
 def _track(value: float, cap: float | None, scale: float) -> str:
-    fill = TRACK * value / scale
     if cap is None:
+        # Unknown cap: there is no scale to place the value on, so the fill is a fixed
+        # open-ended 80% and the rest of the track stays a dashed "open" line — an
+        # honest "reported, limit unknown", never a made-up scale.
+        fill = TRACK * 0.8 if value else 0.0
         return (
             f'<rect class="fill" x="0" y="3" width="{num(fill)}" height="10"/>'
             f'<line class="trk-open" x1="{num(fill)}" x2="{num(TRACK)}" y1="8" y2="8"'
             f"{dash_attr(UNKNOWN_DASH)}/>"
         )
+    fill = TRACK * value / scale
     tick = TRACK * cap / scale
     hot = " hot" if value > cap else ""
     return (
-        f'<rect class="trk" x="0" y="5" width="{num(tick)}" height="6"/>'
+        f'<rect class="trk" x="0" y="5" width="{num(TRACK)}" height="6"/>'
         f'<rect class="fill{hot}" x="0" y="3" width="{num(fill)}" height="10"/>'
         f'<line class="captick" x1="{num(tick)}" x2="{num(tick)}" y1="0" y2="16"/>'
+    )
+
+
+def bullet_svg(value: float, cap: float | None, scale: float | None = None) -> str:
+    """Just the SVG of ``bullet_bar`` — for rows that compose their own label/value HTML."""
+    top = scale if scale is not None else float(max(1.0, value, cap or 0.0))
+    return (
+        f'<svg class="bullet-svg" width="{num(TRACK)}" height="16" '
+        f'viewBox="0 0 {num(TRACK)} 16" aria-hidden="true">'
+        f"{_track(value, cap, top)}</svg>"
     )
 
 
@@ -53,12 +67,7 @@ def bullet_bar(row: Bullet, scale: float | None = None) -> str:
         bar = '<span class="unknown">not measured</span>'
         val = '<span class="unk">—</span>'
     else:
-        top = scale if scale is not None else shared_max((row,))
-        svg = (
-            f'<svg class="bullet-svg" width="{num(TRACK)}" height="16" '
-            f'viewBox="0 0 {num(TRACK)} 16" aria-hidden="true">'
-            f"{_track(row.value, row.cap, top)}</svg>"
-        )
+        svg = bullet_svg(row.value, row.cap, scale)
         bar = svg + ('<span class="unknown">cap not reported</span>' if row.cap is None else "")
         cap_txt = value_text(row.cap, row.unit) if row.cap is not None else "cap ?"
         over = (

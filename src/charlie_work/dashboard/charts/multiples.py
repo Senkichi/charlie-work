@@ -18,7 +18,6 @@ from .line import (
     domain,
     label_width,
     plot,
-    sources_note,
     summary,
     values,
     y_ticks_for,
@@ -92,6 +91,6 @@ def small_multiples(
         )
     return (
         f'<figure class="chart multiples" data-panels="{len(panels)}">'
-        + caption(spec.title, window, tz, spec.takeaway, sources_note(spec, tz))
+        + caption(spec.title, window, tz, spec.takeaway)
         + f'<div class="multiples-grid">{"".join(out)}</div></figure>'
     )

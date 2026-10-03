@@ -24,6 +24,7 @@
 .mcard .flags li { border: 1px dashed var(--lj-gray); border-radius: var(--lj-radius-tab); padding: 0 var(--lj-space-2); font-style: italic; }
 .cov-note { margin: 0 0 var(--lj-space-3); font-size: var(--lj-text-2); color: var(--lj-gray-text); }
 .mcard.is-missing { border-style: dashed; }
+.mcard.is-error { border-style: dashed; border-color: var(--lj-warn); }
 .mcard .mtitle { margin: 2px 0 var(--lj-space-2); font-size: var(--lj-text-3); font-weight: 600; color: var(--lj-ink); }
 .mcard .missing { margin: 0; font-size: var(--lj-text-3); color: var(--lj-gray-text); }
 

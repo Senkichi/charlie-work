@@ -449,6 +449,8 @@ def issue_worker_launch_permit(
         selection,
         reason=pre_state.get("throttle_reason"),
         adapter_kind=pre_state.get("throttle_adapter_kind"),
+        harness=pre_state.get("throttle_harness"),
+        model=pre_state.get("throttle_model"),
     ):
         return WorkerLaunchDeferral(
             REASON_PROVIDER_THROTTLED, throttled_until=pre_state.get("throttled_until")
@@ -488,6 +490,8 @@ def issue_worker_launch_permit(
                 selection,
                 reason=state.get("throttle_reason"),
                 adapter_kind=state.get("throttle_adapter_kind"),
+                harness=state.get("throttle_harness"),
+                model=state.get("throttle_model"),
             )
     except BaseException:
         if owns_lock:

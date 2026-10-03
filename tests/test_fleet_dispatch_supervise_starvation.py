@@ -88,6 +88,7 @@ def test_run_fleet_supervise_drains_new_dispatch_while_sync_starved(
     assert all(call.kwargs["drain"] is True for call in mock_fleet_loop.call_args_list)
 
 
+@patch("charlie_work.fleet_dispatch.probe_fleet_watchdog")
 @patch("charlie_work.fleet_dispatch.fleet_loop")
 @patch("charlie_work.fleet_dispatch.load_layered_config")
 @patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
@@ -95,12 +96,14 @@ def test_run_fleet_supervise_drain_lifts_once_starved_sync_lands(
     mock_lock: MagicMock,
     mock_load_config: MagicMock,
     mock_fleet_loop: MagicMock,
+    mock_probe: MagicMock,
     monkeypatch: Any,
     tmp_path: Path,
 ) -> None:
     """The starvation drain is derived per-pass from ``deploy.starved``, not
-    latched -- the pass where ``uv sync`` finally lands reports
-    ``starved=False`` and normal dispatch resumes immediately."""
+    latched. The pass where ``uv sync`` finally lands exits for a restart so
+    the new dependencies load, and the relaunched process dispatches
+    normally: nothing carries the drain across the restart."""
     cfg = OrchestratorConfig(
         supervisor=SupervisorConfig(
             poll_interval_seconds=5,
@@ -110,6 +113,11 @@ def test_run_fleet_supervise_drain_lifts_once_starved_sync_lands(
     )
     mock_load_config.return_value = cfg
     mock_fleet_loop.return_value = _drained_fleet_result()
+    # The sync-landed pass exits for a restart, which probes the watchdog
+    # task; keep it hermetic (armed=None skips the alert path).
+    from charlie_work.fleet_dispatch import WatchdogProbe
+
+    mock_probe.return_value = WatchdogProbe(armed=None, detail="not probed (mocked)")
 
     deploy_mock = MagicMock(
         side_effect=[
@@ -126,8 +134,9 @@ def test_run_fleet_supervise_drain_lifts_once_starved_sync_lands(
                 starved=True,
             ),
             # The fleet drained to zero this pass; the marker replayed and
-            # uv sync landed. head_changed stays False -- HEAD was already
-            # at the new commit -- so no restart exit; dispatch resumes.
+            # uv sync landed. head_changed stays False (HEAD was already at
+            # the new commit), but the sync replaced imported packages, so
+            # this pass exits for a restart before dispatching.
             SelfDeployResult(
                 ok=True,
                 pulled=True,
@@ -138,16 +147,6 @@ def test_run_fleet_supervise_drain_lifts_once_starved_sync_lands(
                 to_sha="def456",
                 message="updated and synced: def456",
             ),
-            # Episode fully resolved -- an ordinary up-to-date pass.
-            SelfDeployResult(
-                ok=True,
-                pulled=True,
-                changed=False,
-                synced=False,
-                from_sha="def456",
-                to_sha="def456",
-                message="already up to date",
-            ),
         ]
     )
     monkeypatch.setattr("charlie_work.fleet_dispatch.self_deploy", deploy_mock)
@@ -156,9 +155,29 @@ def test_run_fleet_supervise_drain_lifts_once_starved_sync_lands(
     result = run_fleet_supervise(max_passes=3, clock=fc.monotonic, sleep=fc.sleep)
 
     assert result.ok is True
-    assert result.data["passes"] == 3
-    assert [c.kwargs["drain"] for c in mock_fleet_loop.call_args_list] == [
-        True,
-        False,
-        False,
-    ]
+    assert result.data["passes"] == 2
+    assert result.data["exit_reason"] == "self_deploy"
+    assert result.data["restart_requested"] is True
+    assert [c.kwargs["drain"] for c in mock_fleet_loop.call_args_list] == [True]
+
+    # The relaunched process: episode fully resolved, an ordinary
+    # up-to-date pass. The drain must not survive the restart.
+    monkeypatch.setattr(
+        "charlie_work.fleet_dispatch.self_deploy",
+        MagicMock(
+            return_value=SelfDeployResult(
+                ok=True,
+                pulled=True,
+                changed=False,
+                synced=False,
+                from_sha="def456",
+                to_sha="def456",
+                message="already up to date",
+            )
+        ),
+    )
+    mock_fleet_loop.reset_mock()
+    result = run_fleet_supervise(max_passes=2, clock=fc.monotonic, sleep=fc.sleep)
+
+    assert result.data["passes"] == 2
+    assert [c.kwargs["drain"] for c in mock_fleet_loop.call_args_list] == [False, False]

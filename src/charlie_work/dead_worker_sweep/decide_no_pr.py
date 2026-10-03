@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from ..verified_no_changes import verified_detail
+from ..worker_fate import persisted_failure
 from .constants import PASSIVE_OPEN_STATUS
 from .decide_common import (
     Draft,
@@ -348,6 +349,11 @@ def lock_no_pr_flow(facts: SweepFacts, pre: PreOutcome, draft: Draft) -> Flow:
             session_failed_relabeled_payload(
                 issue_number=number,
                 reason="dead_worker_no_open_pr_orphan_sweep",
+                # Issue #2289: the death event carries the classification so a
+                # throttle death is recognisable to attempt_resume. The stamp is
+                # written by persist_pre_classified in the lock phase, before
+                # this decide runs.
+                failure_kind=persisted_failure(entry).kind,
                 **reclaim,
             ),
         )

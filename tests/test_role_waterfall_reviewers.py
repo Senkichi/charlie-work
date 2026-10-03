@@ -329,6 +329,9 @@ def test_dead_fallback_reviewer_restricts_its_own_recorded_entry(tmp_path: Path)
     restrictions = role_quota_ledger.load_restrictions()
     assert set(restrictions) == {FALLBACK.key}
     assert _z(restrictions[FALLBACK.key]) == quota_until
+    # Issue #2279: the quota record carries the dead session's role entry.
+    quota = load_state(state_file)["reviewer_quota"]
+    assert (quota["harness"], quota["model"]) == FALLBACK.key
 
 
 def _seed_quota_window(app: OrchestratorApp, until: datetime, **provenance: str | None) -> None:
@@ -391,6 +394,30 @@ def test_reviewer_window_is_not_explained_by_a_later_unselected_entry(
     assert result.data["deferred_reason"] == "reviewer_quota_probe_backoff"
 
 
+def test_reviewer_window_stamped_with_the_dead_fallbacks_entry_is_covered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #2279, reviewer lane: B's quota window carries B's stamped
+    ``(harness, model)``, so once the primary's restriction lapsed the
+    window is covered by B's own ledger entry and A launches."""
+    calls = _recorder(monkeypatch)
+    _restrict(FALLBACK, datetime.now(UTC) + timedelta(hours=3))
+    app = _app(tmp_path / "b")
+    _seed_quota_window(
+        app,
+        datetime.now(UTC) + timedelta(hours=1),
+        reason="quota_exhausted",
+        adapter_kind="claude-code",
+        harness=FALLBACK.harness,
+        model=FALLBACK.model,
+    )
+
+    result = app.dispatch_reviews()
+
+    assert _launched(calls) == [("devin-shell", PRIMARY.model, "", "devin-shell")]
+    assert result.data["probe_mode"] is False
+
+
 def test_launch_time_quota_hit_stamps_the_window_with_the_launched_adapter(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -402,6 +429,7 @@ def test_launch_time_quota_hit_stamps_the_window_with_the_launched_adapter(
 
     quota = load_state(app.paths.state_file)["reviewer_quota"]
     assert (quota["reason"], quota["adapter_kind"]) == ("quota_exhausted", "claude-code")
+    assert (quota["harness"], quota["model"]) == FALLBACK.key
 
 
 def test_dead_reviewer_sweep_stamps_the_window_with_the_dead_sessions_adapter(
@@ -416,3 +444,5 @@ def test_dead_reviewer_sweep_stamps_the_window_with_the_dead_sessions_adapter(
 
     quota = load_state(state_file)["reviewer_quota"]
     assert (quota["reason"], quota["adapter_kind"]) == ("quota_exhausted", "claude-code")
+    # No role_entry stamp on this sidecar: the window stays untagged (#2279).
+    assert (quota["harness"], quota["model"]) == (None, None)

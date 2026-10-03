@@ -103,6 +103,19 @@ def served(fleet) -> Iterator[Any]:
     server.httpd.server_close()
 
 
+def test_unconfigured_history_db_resolves_independently_of_cwd(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No configured dashboard.db must mean the same missing path from any cwd."""
+    from charlie_work.dashboard import server_drill
+
+    ctx = server_drill.DrillContext(state=None, history_db=None, repos=lambda: (), now=NOW)
+    before = server_drill._db(ctx)
+    monkeypatch.chdir(tmp_path)
+    after = server_drill._db(ctx)
+    assert after == before and before.is_absolute() and not before.exists()
+
+
 def _get(server, path: str) -> tuple[int, str, http.client.HTTPResponse]:
     conn = http.client.HTTPConnection("127.0.0.1", server.port, timeout=10)
     conn.request("GET", path)

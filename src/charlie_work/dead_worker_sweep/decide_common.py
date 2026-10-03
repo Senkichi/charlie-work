@@ -126,6 +126,12 @@ def orphan_head_fingerprint(remote_sha: str | None, local_sha: str | None) -> st
     return f"{remote_sha or 'none'}:{local_sha or 'none'}"
 
 
+# Single owner of the requeue event kind string. Producers emit it; readers
+# (e.g. attempt_resume's death filter) import this instead of re-spelling it,
+# so tests/test_dead_worker_salvage_seam.py can tell the two apart.
+SESSION_FAILED_RELABELED = "session_failed_relabeled"
+
+
 def session_failed_relabeled_payload(
     *,
     issue_number: int,

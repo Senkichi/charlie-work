@@ -234,6 +234,85 @@ def test_apply_fixes_provider_throttle_threads_reason_and_adapter_kind() -> None
     assert new_state.get("throttle_adapter_kind") == "devin"
 
 
+def test_detect_drift_provider_throttle_detected_stamps_the_sessions_role_key(
+    tmp_path: Path,
+) -> None:
+    """Issue #2279: the drift item carries the dead session's stamped
+    ``role_entry`` ``(harness, model)`` -- read off the sidecar before the
+    reap -- so ``apply_fixes`` can attribute the window to the entry that
+    died rather than the adapter as a whole."""
+    from charlie_work import role_quota_ledger
+    from charlie_work.devin_shell import SessionRecord
+
+    config = OrchestratorConfig()
+    gh = FakeGitHub(prs=[], issues=[])
+    state = empty_state()
+
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    log_path = sessions_dir / "issue-42.log"
+    log_path.write_text(
+        "Some work done...\n"
+        "Error: Reached overall message rate limit. Please try again later. "
+        "Your limit will reset in 10 minutes.\n",
+        encoding="utf-8",
+    )
+    sidecar_path = sessions_dir / "issue-42.json"
+    record = SessionRecord(
+        issue_number=42,
+        branch="agent/issue-42-x",
+        worktree_path="/tmp/worktree",
+        prompt_path="/tmp/prompt.md",
+        command=("devin", "--prompt-file", "/tmp/prompt.md"),
+        pid=None,
+        started_at=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        log_path=str(log_path),
+        error=None,
+    )
+    sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
+    assert role_quota_ledger.stamp_session(
+        sidecar_path,
+        role_quota_ledger.session_stamp("worker", "devin-shell", "swe-2-high", 0),
+    )
+
+    drift = detect_drift(gh, state, config, repo_root=tmp_path)
+
+    throttle_drift = [d for d in drift if d.kind == "provider_throttle_detected"]
+    assert len(throttle_drift) == 1
+    assert throttle_drift[0].throttle_harness == "devin-shell"
+    assert throttle_drift[0].throttle_model == "swe-2-high"
+
+
+def test_apply_fixes_provider_throttle_threads_the_role_key() -> None:
+    """Issue #2279: ``throttle_harness``/``throttle_model`` on a
+    ``provider_throttle_detected`` DriftItem must reach ``set_throttled_until``
+    -- a dropped stamp makes a fallback's window block the recovered primary."""
+    config = OrchestratorConfig()
+    gh = FakeGitHub(prs=[], issues=[])
+    state = empty_state()
+
+    throttled_until = (datetime.now(UTC) + timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    drift = [
+        DriftItem(
+            kind="provider_throttle_detected",
+            issue_number=42,
+            pr_number=None,
+            detail="issue #42 session died with rate_limited",
+            fix_actions=(f"set throttled_until={throttled_until}",),
+            throttle_reason="rate_limited",
+            throttle_adapter_kind="devin",
+            throttle_harness="devin-shell",
+            throttle_model="swe-2-high",
+        )
+    ]
+
+    new_state = apply_fixes(gh, state, drift, config)
+
+    assert new_state.get("throttled_until") == throttled_until
+    assert new_state.get("throttle_harness") == "devin-shell"
+    assert new_state.get("throttle_model") == "swe-2-high"
+
+
 def test_detect_drift_without_repo_root_skips_session_check() -> None:
     """Test that detect_drift without repo_root does not check sessions."""
     config = OrchestratorConfig()

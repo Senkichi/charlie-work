@@ -6,6 +6,7 @@ Takeaways are re-derived here straight from ``metrics.tab_series`` + ``takeaways
 
 from __future__ import annotations
 
+import logging
 import re
 import sqlite3
 from html import escape
@@ -122,6 +123,24 @@ def test_coverage_note_names_each_source_start_in_local_time(db_path: Path) -> N
     assert 'class="cov-note">Coverage: ' in card
 
 
+def test_unclassified_event_kinds_are_named_on_the_page(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#2269: kinds the rollup does not interpret show up in the page coverage caveat,
+    named, so a new writer kind can never drop silently again."""
+
+    def build(f: Fleet) -> None:
+        build_base(f)
+        f.emit(f.alpha, "2026-10-01T10:30:00Z", "brand_new_unclassified_kind", {})
+
+    path = _rolled(tmp_path, monkeypatch, (build,))
+    view = load_tab(path, "flow", "7d", NOW)
+    assert isinstance(view, HistoryView)
+    assert view.unclassified_kinds == ("brand_new_unclassified_kind",)
+    page = render_history(view, "flow", "7d")
+    assert "1 event kind not interpreted by the rollup: brand_new_unclassified_kind" in page
+
+
 def test_approx_series_is_dashed_and_says_why(db_path: Path) -> None:
     page = render_history(load_tab(db_path, "flow", "7d", NOW), "flow", "7d")
     card = _card(page, "lead_time")
@@ -168,9 +187,123 @@ def test_locked_db_is_a_value_not_a_500(db_path: Path, monkeypatch) -> None:
     def locked(*a, **k):
         raise sqlite3.OperationalError("database is locked")
 
-    monkeypatch.setattr(history_data, "tab_series", locked)
+    monkeypatch.setattr(history_data, "tab_results", locked)
     result = load_tab(db_path, "flow", "7d", NOW)
     assert isinstance(result, HistoryUnavailable) and "database is locked" in result.reason
+
+
+def test_a_malformed_row_degrades_only_its_own_card(db_path: Path, caplog) -> None:
+    # A TEXT value in a numeric column: SQLite stores it happily, and only the metric
+    # reading that column (wip -> pass_samples.live_sessions) may fail — not its neighbours.
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "INSERT INTO pass_samples (source, src_id, seq, ts, repo, live_sessions)"
+        " VALUES ('owner/alpha', 999999, 0, '2026-10-05T00:00:00Z', 'owner/alpha',"
+        " 'not-a-number')"
+    )
+    conn.commit()
+    conn.close()
+    with caplog.at_level(logging.ERROR, "charlie_work.dashboard"):
+        view = load_tab(db_path, "flow", "7d", NOW)
+    assert isinstance(view, HistoryView)
+    assert view.get("wip").error is not None
+    assert view.get("wip").error_kind == "data"  # float("not-a-number") raised ValueError
+    # the degraded metric's swallowed exception is logged with its traceback
+    logged = [r for r in caplog.records if "wip" in r.getMessage()]
+    assert logged and all(r.exc_info for r in logged)
+    page = render_history(view, "flow", "7d")
+    card = _card(page, "wip")
+    assert "could not be drawn" in card and "malformed" in card and "<svg" not in card
+    assert "<svg" in _card(page, "merges_per_day")  # the row takes down only its own card
+    assert "<svg" in _card(page, "queue_depth")  # same table, other column: unaffected
+
+
+def test_a_metric_code_fault_does_not_claim_a_malformed_row(
+    db_path: Path, monkeypatch, caplog
+) -> None:
+    # A bug inside the metric function (TypeError here — KeyError behaves the same) is
+    # not a malformed stored row, and the degraded card must not claim one.
+    def boom(db, q):
+        raise TypeError("bug in the metric")
+
+    monkeypatch.setitem(metrics.TABS["Flow"], "wip", boom)
+    with caplog.at_level(logging.ERROR, "charlie_work.dashboard"):
+        view = load_tab(db_path, "flow", "7d", NOW)
+    assert isinstance(view, HistoryView)
+    assert view.get("wip").error == "TypeError: bug in the metric"
+    assert view.get("wip").error_kind == "internal"
+    assert any("wip" in r.getMessage() and r.exc_info for r in caplog.records)
+    page = render_history(view, "flow", "7d")
+    card = _card(page, "wip")
+    assert "could not be drawn" in card and "an internal error" in card
+    assert "a stored row" not in card and "malformed" not in card
+    assert "<svg" in _card(page, "merges_per_day")  # only its own card degrades
+
+
+def test_a_takeaway_fault_is_logged_and_degrades_its_card(
+    db_path: Path, monkeypatch, caplog
+) -> None:
+    def boom(cur, pri):
+        raise KeyError("assessment")
+
+    monkeypatch.setattr(history_data, "paired_assessments", boom)
+    with caplog.at_level(logging.ERROR, "charlie_work.dashboard"):
+        view = load_tab(db_path, "flow", "7d", NOW)
+    assert isinstance(view, HistoryView)
+    assert all(m.error is not None for m in view.metrics)
+    assert all(m.error_kind == "takeaway" for m in view.metrics)
+    assert any(
+        "takeaway assessment failed" in r.getMessage() and r.exc_info for r in caplog.records
+    )
+    page = render_history(view, "flow", "7d")
+    card = _card(page, "wip")
+    # a fault in the takeaway code is not a malformed stored row: the card says so
+    assert "could not be drawn" in card and "its takeaway could not be computed" in card
+    assert "a stored row" not in card and "malformed" not in card
+
+
+def test_every_duration_card_states_median_and_p90(db_path: Path) -> None:
+    checked = 0
+    for tab in ("flow", "capacity", "reliability"):
+        view = load_tab(db_path, tab, "7d", NOW)
+        assert isinstance(view, HistoryView)
+        page = render_history(view, tab, "7d")
+        for m in view.metrics:
+            if m.error is not None or m.headline.kind != "duration" or not m.headline.samples:
+                continue
+            checked += 1
+            card = _card(page, m.metric_id)
+            assert re.search(r">p90 [^<]*</text>", card), m.metric_id  # labelled ref rule
+            assert 'class="strip-chart"' in card, m.metric_id
+            assert re.search(r"median \S+ · p90 \S+ · n \d+", card), m.metric_id
+    assert checked > 0, "no duration card carried samples — the assertions above ran zero times"
+
+
+def test_cache_keys_load_independently() -> None:
+    import threading
+
+    entered = threading.Event()
+    release = threading.Event()
+    calls: list[str] = []
+
+    def load(tab, rng, now):
+        calls.append(f"{tab}:{rng}")
+        if tab == "quality":
+            entered.set()  # a cold quality load blocks mid-flight ...
+            assert release.wait(5), "loader never released"
+        return HistoryView(tab, rng, range_query(rng, now), (), now)
+
+    cache = HistoryCache(load, ttl=60, clock=lambda: NOW)
+    slow = threading.Thread(target=lambda: cache.get("quality", "7d"))
+    fast = threading.Thread(target=lambda: cache.get("flow", "7d"))
+    slow.start()
+    assert entered.wait(5), "the quality load never started"
+    fast.start()  # ... while a different key's load must NOT wait on it
+    fast.join(5)
+    assert not fast.is_alive(), "flow load serialised behind the quality load"
+    release.set()
+    slow.join(5)
+    assert sorted(calls) == ["flow:7d", "quality:7d"]
 
 
 def test_cache_hits_until_ttl_and_retries_errors_sooner() -> None:

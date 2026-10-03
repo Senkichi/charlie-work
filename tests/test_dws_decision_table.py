@@ -37,6 +37,7 @@ from charlie_work.dead_worker_sweep.model import (
     DrainNoOp,
     Emit,
     Escalate,
+    ExemptThrottleCleanExit,
     FateResult,
     FetchOpenIssues,
     GuardedUpdate,
@@ -283,6 +284,7 @@ def _pr_answers(*, decision="request_changes", reviewed="old", exit_code=1, extr
             ApplyOutcomes: True,
             GuardedUpdate: True,
             CreditDeadWorker: CreditResult(failure_kind=None, throttled_until=None),
+            ExemptThrottleCleanExit: CreditResult(failure_kind=None, throttled_until=None),
         }
         | (extra or {})
     )
@@ -388,7 +390,12 @@ def test_without_a_review_callback_head_change_is_recorded_as_drift() -> None:
 def test_same_head_nonzero_exit_resets_to_rework_and_credits_the_death() -> None:
     answers = _pr_answers(reviewed="live1", exit_code=1)
     pre, lock, post = drive_all_phases(make_facts(state_with({7: dispatched()})), answers)
-    assert CreditDeadWorker(7) in lock.requests
+    # Issue #2282: the request carries the dead epoch's dispatch stamp and PR so
+    # a provider-throttle death can refund its own dispatch.
+    assert (
+        CreditDeadWorker(7, dispatched_at=dispatched()["dispatched_at"], pr_number=70)
+        in lock.requests
+    )
     statuses = [u.set_fields.get("status") for u in lock.commits_of(UpdateIssue)]
     assert "rework_requested" in statuses
     assert "orphaned_worker_recovered" in lock.emitted()
@@ -399,8 +406,34 @@ def test_same_head_clean_exit_queues_the_no_op_drain() -> None:
     answers = _pr_answers(reviewed="live1", exit_code=0)
     _pre, lock, post = drive_all_phases(make_facts(state_with({7: dispatched()})), answers)
     assert "CreditDeadWorker" not in lock.request_types()
+    # Issue #2286: the clean-exit branch asks the throttle question first; an
+    # unexempted answer falls through to the ordinary no-op route.
+    assert (
+        ExemptThrottleCleanExit(7, dispatched_at=dispatched()["dispatched_at"], pr_number=70)
+        in lock.requests
+    )
     (drain,) = [r for r in post.requests if isinstance(r, DrainNoOp)]
     assert [r.reason for r in drain.routes] == ["dead_worker_no_op"]
+
+
+def test_same_head_clean_exit_throttle_restores_rework_without_no_op() -> None:
+    """Issue #2286: a terminal-throttle answer resets like a death, with no drain."""
+    answers = _pr_answers(
+        reviewed="live1",
+        exit_code=0,
+        extra={
+            ExemptThrottleCleanExit: CreditResult(
+                failure_kind="rate_limited", throttled_until="2030-01-01T00:00:00Z"
+            )
+        },
+    )
+    _pre, lock, post = drive_all_phases(make_facts(state_with({7: dispatched()})), answers)
+    statuses = [u.set_fields.get("status") for u in lock.commits_of(UpdateIssue)]
+    assert "rework_requested" in statuses
+    (recovered,) = [c for c in lock.commits_of(Emit) if c.kind == "orphaned_worker_recovered"]
+    assert recovered.payload["reason"] == "dead_worker_clean_exit_throttle"
+    assert recovered.payload["failure_kind"] == "rate_limited"
+    assert "DrainNoOp" not in post.request_types()
 
 
 def test_same_head_declared_blocked_escalates_the_pr_issue() -> None:

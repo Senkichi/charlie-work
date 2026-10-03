@@ -561,6 +561,13 @@ class DispatchConfig:
     # unpushed commits there keep refusing either way, because a salvage push
     # is real.
     archive_unreachable_local_commits: Annotated[bool, Typed] = True
+    # Issue #2289: a fresh redispatch whose previous attempt died of a provider
+    # throttle (rate_limited, quota_exhausted, ...) is seeded from the work that
+    # death preserved (rescue ref or attempt ref) instead of restarting from the
+    # base, so an issue needing more than one rate-limit window can finish. ON by
+    # default; set to false to restore the always-clean-base behavior. Any
+    # conflict or error falls back to the clean base either way.
+    resume_throttled_attempts: Annotated[bool, Typed] = True
 
     def __post_init__(self) -> None:
         # Normalize to a tuple of forward-slash strings. The writer marker is

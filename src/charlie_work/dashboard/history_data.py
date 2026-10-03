@@ -9,6 +9,7 @@ back as a :class:`HistoryUnavailable` value, never as zeros.
 
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
 import threading
@@ -18,7 +19,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta, tzinfo
 from pathlib import Path
 
-from .metrics import TABS, tab_series
+from .metrics import TABS, tab_results
 from .metrics_base import MetricQuery, Series, open_dashboard_ro
 from .takeaways import Compared, paired_assessments
 
@@ -78,13 +79,23 @@ def range_query(range_key: str, now: datetime, tz: tzinfo | None = None) -> Metr
 
 @dataclass(frozen=True)
 class MetricData:
-    """One metric's series for the window plus each series' takeaway (by series name)."""
+    """One metric's series for the window plus each series' takeaway (by series name).
+
+    ``error`` is set when the metric could not be computed (its exception);
+    ``error_kind`` classifies the fault so the card does not blame the data for a code
+    bug: ``"data"`` — a stored row the metric reads is malformed — versus a fault in
+    the metric function (``"internal"``) or in the takeaway assessment
+    (``"takeaway"``). The card renders as degraded and ``series``/``takeaways`` are
+    empty.
+    """
 
     metric_id: str
     series: tuple[Series, ...]
     takeaways: dict[str, str]
     # series name -> the (current, prior) values its takeaway compares, None: no claim
     compared: dict[str, Compared | None] = field(default_factory=dict)
+    error: str | None = None
+    error_kind: str = "internal"
 
     @property
     def headline(self) -> Series:
@@ -98,6 +109,9 @@ class HistoryView:
     query: MetricQuery
     metrics: tuple[MetricData, ...]
     computed_at: datetime
+    # Event kinds the last rollup pass saw but did not interpret (issue #2269);
+    # the page names them so an unhandled kind can never drop silently.
+    unclassified_kinds: tuple[str, ...] = ()
 
     def get(self, metric_id: str) -> MetricData | None:
         return next((m for m in self.metrics if m.metric_id == metric_id), None)
@@ -114,6 +128,22 @@ class HistoryUnavailable:
 HistoryResult = HistoryView | HistoryUnavailable
 
 
+def _unclassified_kinds(db: sqlite3.Connection) -> tuple[str, ...]:
+    """Kinds the last rollup pass counted but did not interpret (issue #2269).
+
+    Written by ``rollup._record_unclassified`` as ``{source: {kind: count}}``;
+    a missing or malformed value degrades to "nothing to report", never a page error.
+    """
+    row = db.execute("SELECT value FROM meta WHERE key = 'unclassified_kinds'").fetchone()
+    if row is None:
+        return ()
+    try:
+        stored = json.loads(row[0])
+        return tuple(sorted({kind for counts in stored.values() for kind in counts}))
+    except (ValueError, AttributeError, TypeError):
+        return ()
+
+
 def load_tab(db_path: Path | None, tab: str, range_key: str, now: datetime) -> HistoryResult:
     """Every metric of one tab over the range, with takeaways vs the prior window."""
     if db_path is None:
@@ -123,23 +153,41 @@ def load_tab(db_path: Path | None, tab: str, range_key: str, now: datetime) -> H
     if db is None:
         return HistoryUnavailable(error or "dashboard.db unavailable", now)
     try:
-        current = tab_series(db, TAB_KEYS[tab], query)
-        prior = tab_series(db, TAB_KEYS[tab], query.prior())
+        current = tab_results(db, TAB_KEYS[tab], query)
+        prior = tab_results(db, TAB_KEYS[tab], query.prior())
+        unclassified = _unclassified_kinds(db)
     except sqlite3.Error as exc:  # locked / torn mid-rebuild: a value, not a 500
         return HistoryUnavailable(f"cannot read {db_path}: {exc}", now)
     finally:
         db.close()
-    metrics = tuple(
-        MetricData(
-            mid,
-            series,
-            {name: text for name, (text, _) in got.items()},
-            {name: values for name, (_, values) in got.items()},
-        )
-        for mid, series in current.items()
-        for got in (paired_assessments(series, prior[mid]),)
-    )
-    return HistoryView(tab, range_key, query, metrics, now)
+    metrics: list[MetricData] = []
+    for mid, cur in current.items():
+        pri = prior.get(mid, ())
+        error = cur if isinstance(cur, Exception) else pri if isinstance(pri, Exception) else None
+        # A ValueError out of a metric function is the signature of a malformed stored
+        # row (float() on a TEXT value, an unparseable timestamp); a KeyError, TypeError
+        # or anything else is a fault in the metric itself, not bad data.
+        kind = "data" if isinstance(error, ValueError) else "internal"
+        if error is None:
+            try:
+                got = paired_assessments(cur, pri)
+            except Exception as exc:  # noqa: BLE001 - a takeaway fault degrades one card
+                log.exception("takeaway assessment failed: %s %s", tab, mid)
+                error, kind = exc, "takeaway"
+            else:
+                metrics.append(
+                    MetricData(
+                        mid,
+                        cur,
+                        {name: text for name, (text, _) in got.items()},
+                        {name: values for name, (_, values) in got.items()},
+                    )
+                )
+        if error is not None:
+            metrics.append(
+                MetricData(mid, (), {}, error=f"{type(error).__name__}: {error}", error_kind=kind)
+            )
+    return HistoryView(tab, range_key, query, tuple(metrics), now, unclassified)
 
 
 Loader = Callable[[str, str, datetime], HistoryResult]
@@ -148,7 +196,8 @@ Loader = Callable[[str, str, datetime], HistoryResult]
 class HistoryCache:
     """Per-(tab, range) results, recomputed after ``ttl`` seconds (errors after 15s).
 
-    One lock serialises misses so concurrent requests for a cold key compute it once.
+    Each (tab, range) key has its own lock so a cold key's load never serialises a
+    different key's; ``_lock`` only guards the entry map and the per-key lock table.
     ``misses`` counts real loads (the tests read it to prove a hit did not query).
     """
 
@@ -165,24 +214,36 @@ class HistoryCache:
         self._monotonic = monotonic
         self._lock = threading.Lock()
         self._entries: dict[tuple[str, str], tuple[float, HistoryResult]] = {}
+        self._key_locks: dict[tuple[str, str], threading.Lock] = {}
         self.misses = 0
+
+    def _fresh_hit(self, key: tuple[str, str], now_m: float) -> HistoryResult | None:
+        with self._lock:
+            hit = self._entries.get(key)
+        if hit is None:
+            return None
+        ttl = self._ttl if isinstance(hit[1], HistoryView) else ERROR_TTL_SECONDS
+        return hit[1] if now_m - hit[0] < min(ttl, self._ttl) else None
 
     def get(self, tab: str, range_key: str) -> HistoryResult:
         key = (pick_tab(tab), pick_range(range_key))
+        if (hit := self._fresh_hit(key, self._monotonic())) is not None:
+            return hit
         with self._lock:
-            hit = self._entries.get(key)
+            lock = self._key_locks.setdefault(key, threading.Lock())
+        with lock:  # only this key loads; a concurrent requester rechecks and waits
             now_m = self._monotonic()
-            if hit is not None:
-                ttl = self._ttl if isinstance(hit[1], HistoryView) else ERROR_TTL_SECONDS
-                if now_m - hit[0] < min(ttl, self._ttl):
-                    return hit[1]
-            self.misses += 1
+            if (hit := self._fresh_hit(key, now_m)) is not None:
+                return hit
+            with self._lock:
+                self.misses += 1
             try:
                 result = self._load(key[0], key[1], self._clock())
             except Exception as exc:  # noqa: BLE001 - a metric bug is a value on the page
                 log.exception("history load failed: %s %s", *key)
                 result = HistoryUnavailable(f"{type(exc).__name__}: {exc}", self._clock())
-            self._entries = {**self._entries, key: (now_m, result)}
+            with self._lock:
+                self._entries[key] = (now_m, result)
             return result
 
 

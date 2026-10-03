@@ -196,6 +196,43 @@ def test_sweep_event_append_kinds_are_registered() -> None:
     assert not unregistered, f"unregistered sweep_events kinds: {sorted(unregistered)}"
 
 
+def test_every_emitted_kind_is_rollup_classified() -> None:
+    """#2269: every kind an events DB can contain must be handled or known-ignored.
+
+    The union is derived, never hand-maintained: the registry's literal kinds, the
+    emit-site scan (this package and ci_fleet, as in
+    ``test_event_kind_registry_exhaustive``), and every ``<kind>_sweep`` variant the
+    reaper can mint through ``sweep_events.append``. A kind that lands without a
+    rollup handler and without a one-line ``KNOWN_IGNORED`` reason produces no fact
+    rows silently -- this test is the tripwire that forces the classification.
+    """
+    from charlie_work.dashboard.rollup_derive import (
+        HANDLERS,
+        KNOWN_IGNORED,
+        SWEEP_SUFFIX,
+    )
+
+    src_root = Path(__file__).parents[1] / "src" / "charlie_work"
+    used, _unresolved = _scan_event_kinds(src_root)
+    spec = importlib.util.find_spec("ci_fleet")
+    if spec is not None and spec.origin:
+        ci_used, _ci_unresolved = _scan_event_kinds(Path(spec.origin).parent)
+        used |= ci_used
+    swept, unresolved_sweeps = _scan_sweep_append_kinds(src_root)
+    assert not unresolved_sweeps  # same contract as the test above
+    kinds = used | swept | {k + SWEEP_SUFFIX for k in swept} | set(_LEVEL_BY_KIND)
+
+    unclassified = sorted(k for k in kinds if k not in HANDLERS and k not in KNOWN_IGNORED)
+    assert not unclassified, (
+        "emitted event kind(s) the dashboard rollup neither handles nor declares in "
+        "KNOWN_IGNORED -- add a derive handler or a one-line ignore reason in "
+        "dashboard/rollup_derive.py: " + ", ".join(unclassified)
+    )
+    assert all(reason.strip() for reason in KNOWN_IGNORED.values()), (
+        "every KNOWN_IGNORED entry needs a non-empty one-line reason"
+    )
+
+
 def test_issue_910_active_kinds_are_error_or_warning(tmp_path: Path) -> None:
     """#910: the 11 production-missed active kinds are now classified.
 

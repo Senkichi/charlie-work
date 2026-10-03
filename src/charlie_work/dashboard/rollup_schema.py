@@ -11,7 +11,7 @@ re-deriving an event an idempotent ``INSERT OR REPLACE``.
 
 from __future__ import annotations
 
-SCHEMA_VERSION = 6  # 6: <kind>_sweep expansion, dead-worker PR open; 5: batch rework PR scoping
+SCHEMA_VERSION = 7  # 7: issue_milestones (source, milestone) index; 6: <kind>_sweep expansion, dead-worker PR open; 5: batch rework PR scoping
 FLEET_SOURCE = "fleet"
 
 _KEY = (
@@ -95,12 +95,19 @@ LOOP_PASS_COLUMNS = (
 )
 
 
+# Indexes come after the fact-table DDL in ``schema_sql`` (they reference it).
+_INDEX_DDL = (
+    "CREATE INDEX IF NOT EXISTS issue_milestones_merge ON issue_milestones (source, milestone);"
+)
+
+
 def schema_sql() -> str:
     """Full DDL for a fresh dashboard.db."""
     parts = [_OTHER_DDL]
     for name, cols in _FACT_TABLES.items():
         parts.append(f"CREATE TABLE IF NOT EXISTS {name} ({_KEY}, {cols}, {_PK});")
     parts.append(f"CREATE TABLE IF NOT EXISTS {JOB_TABLE} ({_JOB_DDL});")
+    parts.append(_INDEX_DDL)
     return "\n".join(parts)
 
 

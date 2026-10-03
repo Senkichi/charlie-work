@@ -19,6 +19,7 @@ from .model import (
     AdvanceToPrOpen,
     CreditDeadWorker,
     Escalate,
+    ExemptThrottleCleanExit,
     NoOpRoute,
     PreOutcome,
     ReadBlockedOutcome,
@@ -151,6 +152,33 @@ def _same_head(
         )
         return
     if ctx.exit_code == 0:
+        # Issue #2286: an exit-0 session whose log ENDS in a provider throttle is
+        # a provider death, not a no-op -- restore it like one. The handler's
+        # terminal-line check (never the whole transcript, per #656) decides;
+        # it also refunds the dispatch stamp, flags the PR, and arms the
+        # cooldown, so the fall-through path sees an unexempted exit as a real
+        # no-op.
+        throttle = yield ExemptThrottleCleanExit(
+            number, dispatched_at=entry.get("dispatched_at"), pr_number=ctx.pr_number
+        )
+        if throttle.failure_kind is not None:
+            entry["status"] = "rework_requested"
+            entry["dispatched_at"] = None
+            yield from flush(draft)
+            acc.throttled_until = throttle.throttled_until
+            yield emit(
+                "orphaned_worker_recovered",
+                {
+                    **ctx.base(),
+                    "new_status": "rework_requested",
+                    "reason": "dead_worker_clean_exit_throttle",
+                    **extra,
+                    **ctx.proc(),
+                    "worker_death_at": facts.stamp,
+                    "failure_kind": throttle.failure_kind,
+                },
+            )
+            return
         fingerprint = drift_fingerprint(
             reason="dead_worker_clean_exit_no_op", reviewed_head_sha=ctx.reviewed
         )
@@ -164,10 +192,11 @@ def _same_head(
             {**ctx.base(), "reason": "dead_worker_clean_exit_no_op", **extra, **ctx.proc()},
         )
         return
+    dispatched_at = entry.get("dispatched_at")
     entry["status"] = "rework_requested"
     entry["dispatched_at"] = None
     yield from flush(draft)
-    credit = yield CreditDeadWorker(number)
+    credit = yield CreditDeadWorker(number, dispatched_at=dispatched_at, pr_number=ctx.pr_number)
     acc.throttled_until = credit.throttled_until
     yield emit(
         "orphaned_worker_recovered",

@@ -56,6 +56,7 @@ from .env_sanitize import resolve_pytest_cap, resolve_uv_no_sync, sanitize_env
 from .post_mortem import merge_attempt_snapshot
 from .state import _canonical_started_at, utc_now
 from .subprocess_runner import RunResult, run_captured
+from .attempt_resume import apply_resume_notice
 from .worktree import (
     LiveWorkerRedispatchError,
     ReworkBranchConflictError,
@@ -474,6 +475,22 @@ def launch_devin_session(
             _teardown_worktree()
             return _fail(
                 f"failed to append rework conflict notice to prompt file: {exc}",
+                error_class=launch_events.LAUNCH_ERR_PROMPT,
+            )
+
+    # Issue #2289: the worktree was seeded from a throttle-killed attempt's
+    # preserved work -- tell the worker to continue it, not restart.
+    if worktree.resumed_attempt is not None:
+        try:
+            existing_prompt = prompt_path.read_text(encoding="utf-8")
+            prompt_path.write_text(
+                apply_resume_notice(existing_prompt, worktree.resumed_attempt),
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            _teardown_worktree()
+            return _fail(
+                f"failed to append attempt-resume notice to prompt file: {exc}",
                 error_class=launch_events.LAUNCH_ERR_PROMPT,
             )
 

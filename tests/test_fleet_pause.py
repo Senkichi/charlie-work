@@ -55,7 +55,7 @@ def test_exit_code_constant_is_pinned_and_distinct() -> None:
     assert is_exit_alertable(EXIT_FLEET_PAUSED) is False
 
 
-def test_write_is_atomic_temp_then_replace(tmp_path: Path, monkeypatch: Any) -> None:
+def test_write_is_atomic_temp_then_replace(tmp_path: Path, patch_path_replace: Any) -> None:
     replaced: list[tuple[Path, Path]] = []
     real_replace = Path.replace
 
@@ -63,7 +63,7 @@ def test_write_is_atomic_temp_then_replace(tmp_path: Path, monkeypatch: Any) -> 
         replaced.append((self, Path(target)))
         return real_replace(self, target)
 
-    monkeypatch.setattr(Path, "replace", _spy)
+    patch_path_replace(_spy, scope=tmp_path)
     path = write_fleet_pause(str(tmp_path), reason="maintenance")
 
     assert len(replaced) == 1

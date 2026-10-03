@@ -29,6 +29,7 @@ from ..github import (
 from ..labels import TransitionOutcome
 from ..no_op_checkpoint import _paired_death_count
 from ..review_decision import review_decision
+from ..rework_attempt_exemption import exempt_provider_throttle_rework_death
 from ..rework_prompts import _write_rework_prompt
 from ..state import (
     load_state,
@@ -363,6 +364,7 @@ def _reap_restore_rework_requested(
             )
             write_gate.save_state(state)
         else:
+            dispatched_at = entry.get("dispatched_at")
             entry["status"] = "rework_requested"
             entry["dispatched_at"] = None
             entry["redispatch_at"] = redispatch_at
@@ -384,6 +386,19 @@ def _reap_restore_rework_requested(
                 "last_rework_failure_kind": failure_kind,
                 "last_rework_was_startup_death": startup_death,
             }
+            # Issue #2282: a provider-throttle death refunds its dispatch's
+            # redispatch_at stamp and sets the PR exemption flag (single
+            # point of enforcement, see ``rework_attempt_exemption``).
+            throttle_exempt = exempt_provider_throttle_rework_death(
+                state,
+                worker.issue_number,
+                entry,
+                failure_kind,
+                dispatched_at=dispatched_at,
+                pr_number=pr_number,
+                source="dead_rework_session_restore",
+                write_gate=write_gate,
+            )
             state = write_gate.append_event(
                 state,
                 "rework_requeued",
@@ -396,6 +411,7 @@ def _reap_restore_rework_requested(
                     "has_request_changes": has_request_changes,
                     "has_rework_prompt": has_rework_prompt,
                     "startup_death": startup_death,
+                    "provider_throttle_exempt": throttle_exempt,
                 },
             )
             write_gate.save_state(state)

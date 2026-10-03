@@ -62,6 +62,7 @@ from .paths import resolved_layout, runtime_paths
 from .process_utils import kill_process_tree
 from .queue_bot import is_queue_bot_pr  # noqa: F401 (deliberate re-export)
 from .review_decision import review_decision as _resolve_review_decision
+from .role_quota_ledger import role_key_for_view
 from .state import (
     DELIBERATELY_UNCLASSIFIED_ESCALATION_EVENT_KINDS,
     ESCALATION_REASON_CLASS_BY_EVENT_KIND,
@@ -108,6 +109,10 @@ class DriftItem:
     # Unused by every other kind.
     throttle_reason: str | None = None
     throttle_adapter_kind: str | None = None
+    # The dead session's stamped role-chain ``(harness, model)`` (issue
+    # #2279), read off its sidecar while ``detect_drift`` still has it.
+    throttle_harness: str | None = None
+    throttle_model: str | None = None
     # Issue #978: structured "why" for session_failed_relabeled drift items,
     # so the machine-readable reason is not buried only in the free-text
     # ``detail`` string. ``reason`` is the canonical path identifier (e.g.
@@ -1870,6 +1875,7 @@ def detect_drift(
                     if failure_kind and throttled_until:
                         # Update state with throttle window
                         # This is a no-op drift item that just signals state update
+                        throttle_harness, throttle_model = role_key_for_view(sessions_dir, w)
                         drift.append(
                             DriftItem(
                                 kind="provider_throttle_detected",
@@ -1882,6 +1888,8 @@ def detect_drift(
                                 fix_actions=(f"set throttled_until={throttled_until}",),
                                 throttle_reason=failure_kind,
                                 throttle_adapter_kind=w.adapter_kind,
+                                throttle_harness=throttle_harness,
+                                throttle_model=throttle_model,
                             )
                         )
 
@@ -3298,6 +3306,8 @@ def apply_fixes(
                         source="reconcile_apply_fixes",
                         reason=item.throttle_reason,
                         adapter_kind=item.throttle_adapter_kind,
+                        harness=item.throttle_harness,
+                        model=item.throttle_model,
                         state_path=state_path,
                     )
                     break
