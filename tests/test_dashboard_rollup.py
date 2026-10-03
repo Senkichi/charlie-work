@@ -18,7 +18,7 @@ from _dashboard_rollup_fixtures import (  # noqa: F401  (fleet is a pytest fixtu
     fleet,
 )
 
-from charlie_work.dashboard import rollup
+from charlie_work.dashboard import history_data, rollup
 from charlie_work.dashboard.rollup_derive import reason_group
 from charlie_work.dashboard.rollup_schema import SCHEMA_VERSION
 
@@ -372,3 +372,60 @@ def test_unclassified_warning_fires_only_when_the_set_changes(fleet, caplog) -> 
     with caplog.at_level(logging.WARNING, "charlie_work.dashboard"):
         rollup.run_rollup(fleet.sources(), NOW)  # same set: quiet
     assert "not interpreted" not in caplog.text
+    # a previously unclassified kind disappearing is a set change too: warn once
+    fleet.close()
+    conn = sqlite3.connect(fleet.alpha / "events.db")
+    conn.execute("DELETE FROM events WHERE kind = 'brand_new_unclassified_kind'")
+    conn.commit()
+    conn.close()
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, "charlie_work.dashboard"):
+        rollup.run_rollup(fleet.sources(), NOW)
+    assert "0 event kind(s) not interpreted: " in caplog.text
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, "charlie_work.dashboard"):
+        rollup.run_rollup(fleet.sources(), NOW)  # still empty: quiet again
+    assert "not interpreted" not in caplog.text
+
+
+def test_unclassified_kinds_survive_a_transient_source_error(fleet, caplog) -> None:
+    """#2269: an errored source keeps its last recorded unclassified kinds.
+
+    A pass that cannot open a source's events.db must not read as "that source
+    has no unclassified kinds": the stored entry carries forward, so neither the
+    error pass nor the recovery pass fires the set-changed warning, and the
+    History page note keeps naming the kind throughout.
+    """
+    fleet.emit(fleet.alpha, "2026-10-01T10:30:00Z", "brand_new_unclassified_kind", {"x": 1})
+    rollup.run_rollup(fleet.sources(), NOW)  # pass 1: records the kind
+    stored = _all(fleet.db(), "SELECT value FROM meta WHERE key = 'unclassified_kinds'")
+    assert json.loads(stored[0][0]) == {ALPHA: {"brand_new_unclassified_kind": 1}}
+
+    fleet.close()
+    backups: dict[str, bytes] = {}
+    for suffix in ("", "-wal", "-shm"):
+        path = fleet.alpha / f"events.db{suffix}"
+        if path.is_file():
+            backups[suffix] = path.read_bytes()
+            path.unlink()
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, "charlie_work.dashboard"):
+        errored = rollup.run_rollup(fleet.sources(), NOW)  # pass 2: source unopenable
+    alpha_error = {s.source: s for s in errored.sources}[ALPHA].error
+    assert alpha_error is not None and alpha_error.startswith("missing:")
+    assert "not interpreted" not in caplog.text  # a transient error is not a set change
+    stored = _all(fleet.db(), "SELECT value FROM meta WHERE key = 'unclassified_kinds'")
+    assert json.loads(stored[0][0]) == {ALPHA: {"brand_new_unclassified_kind": 1}}
+    view = history_data.load_tab(fleet.sources().db_path, "flow", "7d", NOW)
+    assert isinstance(view, history_data.HistoryView)
+    assert view.unclassified_kinds == ("brand_new_unclassified_kind",)
+
+    for suffix, blob in backups.items():
+        (fleet.alpha / f"events.db{suffix}").write_bytes(blob)
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, "charlie_work.dashboard"):
+        recovered = rollup.run_rollup(fleet.sources(), NOW)  # pass 3: source back
+    assert {s.source: s for s in recovered.sources}[ALPHA].error is None
+    assert "not interpreted" not in caplog.text  # recovery is not a set change either
+    stored = _all(fleet.db(), "SELECT value FROM meta WHERE key = 'unclassified_kinds'")
+    assert json.loads(stored[0][0]) == {ALPHA: {"brand_new_unclassified_kind": 1}}

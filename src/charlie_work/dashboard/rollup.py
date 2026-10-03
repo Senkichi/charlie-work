@@ -367,15 +367,26 @@ def _record_unclassified(dst: sqlite3.Connection, results: tuple[SourceResult, .
     ``unclassified_kinds`` so read-only consumers (the History page) can name the
     kinds the rollup does not interpret. A warning fires only when the set of
     unclassified kinds differs from what the previous pass recorded -- a new kind
-    appearing, one going away, or the first pass that sees any.
+    appearing, one going away, or the first pass that sees any. A source whose
+    ``error`` is set never read its events table this pass, so its empty
+    ``unclassified`` is not "no unclassified kinds": the last recorded entry for
+    that source is carried forward instead -- a transient read error must neither
+    blank the kinds from the History page note nor fire a pair of false
+    set-changed warnings (one on the error pass, one on recovery).
     """
-    unclassified = {s.source: s.unclassified for s in results if s.unclassified}
     row = dst.execute("SELECT value FROM meta WHERE key = 'unclassified_kinds'").fetchone()
     try:
         stored = json.loads(row[0]) if row else {}
         previous = {kind for counts in stored.values() for kind in counts}
     except (ValueError, AttributeError, TypeError):
-        previous = set()
+        stored, previous = {}, set()
+    unclassified: dict[str, dict[str, int]] = {}
+    for s in results:
+        carried = stored.get(s.source) if s.error else None
+        if isinstance(carried, dict) and carried:
+            unclassified[s.source] = carried
+        elif s.unclassified:
+            unclassified[s.source] = s.unclassified
     current = sorted({kind for counts in unclassified.values() for kind in counts})
     if set(current) != previous:
         log.warning(
