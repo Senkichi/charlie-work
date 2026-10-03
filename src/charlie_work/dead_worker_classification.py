@@ -356,7 +356,10 @@ def classify_clean_exit_throttle(
     if not is_provider_throttle_rework_death(failure_kind):
         return None
     return view.adapter_kind, worker_fate.FailureEvidence.from_classification(
-        failure_kind, throttled_until, fresh=True
+        failure_kind,
+        throttled_until,
+        fresh=True,
+        role_key=role_quota_ledger.role_key_for_view(sessions_dir, view),
     )
 
 
