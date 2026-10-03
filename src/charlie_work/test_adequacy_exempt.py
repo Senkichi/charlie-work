@@ -6,9 +6,10 @@ file-size-ratchet mark. ``janitor.check_test_adequacy`` imports
 ``exempt_reason_from_commit_trailers`` for callers that historically
 imported it from ``janitor``), while ``workflow.review`` feeds the gate the
 ``commit.message`` strings from the PR's REST commits payload.
-``janitor._check_no_op_rework`` imports ``newly_claimed_exempt_reason`` for
-the issue #2281 exemption-claim escape. Nothing here imports back, so
-there is no cycle.
+``no_op_rework_body._trailer_exempt_escape_warning`` imports
+``newly_claimed_exempt_reason`` for the issue #2281 exemption-claim escape
+(which ``janitor._check_no_op_rework`` invokes through
+``no_op_rework_body``). Nothing here imports back, so there is no cycle.
 
 Two channels claim the ``exempt_marker`` exemption: a ``<marker> <reason>``
 line in the PR body, and the same line as a trailer in the last paragraph

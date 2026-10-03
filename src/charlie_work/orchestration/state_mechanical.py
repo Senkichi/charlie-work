@@ -309,7 +309,9 @@ def _deescalate_mechanical_issue(self, issue_number: int) -> dict[str, Any]:
         # enabled adequacy gate).
         pr_commits=(
             self.gh.pr_commits(pr_number)
-            if _wf.no_op_escape_needs_pr_commits(self.config.test_adequacy, review_decision)
+            if _wf.no_op_escape_needs_pr_commits(
+                self.config.test_adequacy, review_decision, pr.get("headRefOid")
+            )
             else None
         ),
     )

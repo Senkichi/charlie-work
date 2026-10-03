@@ -2520,7 +2520,9 @@ class OrchestratorApp:
             escalated_decision = self._review_decision(pr_number)
             escalated_pr_commits = (
                 self.gh.pr_commits(pr_number)
-                if no_op_escape_needs_pr_commits(self.config.test_adequacy, escalated_decision)
+                if no_op_escape_needs_pr_commits(
+                    self.config.test_adequacy, escalated_decision, pr.get("headRefOid")
+                )
                 else None
             )
             with state_lock(self.paths.state_file):
@@ -2756,7 +2758,9 @@ class OrchestratorApp:
         # pass spends no extra REST call. Reused below by check_test_adequacy.
         pr_commits = (
             self.gh.pr_commits(pr_number)
-            if no_op_escape_needs_pr_commits(self.config.test_adequacy, gate_decision)
+            if no_op_escape_needs_pr_commits(
+                self.config.test_adequacy, gate_decision, pr.get("headRefOid")
+            )
             else None
         )
         verdict = run_janitor(

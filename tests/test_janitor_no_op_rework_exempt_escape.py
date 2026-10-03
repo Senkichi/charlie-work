@@ -17,11 +17,18 @@ from __future__ import annotations
 import hashlib
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
+import pytest
 from _janitor_fixtures import _config, _green_checks, _green_pr
 
-from charlie_work.config import OrchestratorConfig
-from charlie_work.janitor import _calculate_patch_id, run_janitor
+from charlie_work.config import OrchestratorConfig, TestAdequacyConfig
+from charlie_work.janitor import (
+    _calculate_patch_id,
+    no_op_escape_needs_pr_commits,
+    run_janitor,
+)
+from charlie_work.test_adequacy_exempt import newly_claimed_exempt_reason
 
 
 def _adequacy_on_config() -> OrchestratorConfig:
@@ -311,3 +318,153 @@ def test_no_op_rework_exempt_escape_reads_reviewed_head_from_decision(tmp_path: 
     assert verdict.ok is False
     assert verdict.is_no_op_rework
     assert any("PR diff unchanged since request_changes verdict" in f for f in verdict.failures)
+
+
+# --- no_op_escape_needs_pr_commits: the caller-side fetch predicate -----------
+#
+# Truth table over the three inputs the predicate reads: adequacy-gate
+# enabled, the resolved decision, and (the head-not-advanced arm added in
+# the #2281 rework so an escalated, head-frozen request_changes PR does not
+# cost a REST call every loop pass) the live head vs the verdict's
+# ``reviewed_head_sha``.
+
+_RC = {"decision": "request_changes", "reviewed_head_sha": "aaa111"}
+
+
+@pytest.mark.parametrize(
+    ("enabled", "decision", "live_head", "expected"),
+    [
+        # Escape live: gate on + request_changes + head advanced.
+        (True, dict(_RC), "ccc333", True),
+        # Head unreadable/unknown cannot prove the escape dead -> still fetch.
+        (True, dict(_RC), None, True),
+        (True, dict(_RC), "", True),
+        # A verdict without reviewed_head_sha cannot prove the escape dead
+        # (the gate-side fallback reads pr_state's anchor, which this
+        # predicate cannot see) -> still fetch.
+        (True, {"decision": "request_changes"}, "ccc333", True),
+        # Head still pinned at the reviewed commit: no post-verdict commit
+        # exists to carry a claim, so the escape can never fire -> no fetch.
+        (True, dict(_RC), "aaa111", False),
+        # Non-request_changes decisions: nothing for the escape to compare.
+        (True, {"decision": "approved"}, "ccc333", False),
+        (True, {"decision": "blocked"}, "ccc333", False),
+        (True, {"decision": "missing"}, "ccc333", False),
+        (True, {}, "ccc333", False),
+        (True, None, "ccc333", False),
+        # Gate disabled: the marker channel is unsanctioned -> never fetch.
+        (False, dict(_RC), "ccc333", False),
+        (False, dict(_RC), "aaa111", False),
+        (False, {"decision": "approved"}, "ccc333", False),
+        (False, None, None, False),
+    ],
+)
+def test_no_op_escape_needs_pr_commits_truth_table(
+    enabled: bool,
+    decision: dict[str, Any] | None,
+    live_head: str | None,
+    expected: bool,
+) -> None:
+    """``no_op_escape_needs_pr_commits`` returns True only when the
+    exemption-claim escape is live: gate enabled + request_changes verdict
+    + head not provably still at the reviewed commit."""
+    config = TestAdequacyConfig(enabled=enabled, exempt_marker="Test-exempt:")
+    assert no_op_escape_needs_pr_commits(config, decision, live_head) is expected
+
+
+# --- newly_claimed_exempt_reason: direct malformed-input coverage --------------
+
+
+def test_newly_claimed_exempt_reason_returns_post_head_claim() -> None:
+    """Positive control: a trailer first appearing after the reviewed head
+    is returned verbatim."""
+    commits = [
+        _commit("aaa111", "feat: add feature without tests"),
+        _commit("bbb222", "chore: rework\n\nTest-exempt: pure refactor"),
+    ]
+    assert (
+        newly_claimed_exempt_reason("Closes #123.", commits, "aaa111", "Test-exempt:")
+        == "pure refactor"
+    )
+
+
+@pytest.mark.parametrize(
+    ("body", "commits", "reviewed_head", "marker"),
+    [
+        # Empty commit list: no evidence either way.
+        ("Closes #123.", [], "aaa111", "Test-exempt:"),
+        # Empty reviewed_head_sha: no anchor to compare against.
+        (
+            "Closes #123.",
+            [_commit("aaa111", "x\n\nTest-exempt: claim")],
+            "",
+            "Test-exempt:",
+        ),
+        # Empty marker: no sanctioned channel exists.
+        (
+            "Closes #123.",
+            [_commit("aaa111", "x"), _commit("bbb222", "y\n\nTest-exempt: claim")],
+            "aaa111",
+            "",
+        ),
+        # Reviewed head absent from the list (force-push/rebase replaced the
+        # reviewed history): newness is undeterminable.
+        (
+            "Closes #123.",
+            [_commit("zzz999", "x"), _commit("bbb222", "y\n\nTest-exempt: claim")],
+            "aaa111",
+            "Test-exempt:",
+        ),
+        # Claim already present at the reviewed head is not new.
+        (
+            "Closes #123.",
+            [
+                _commit("aaa111", "x\n\nTest-exempt: old claim"),
+                _commit("bbb222", "chore: rework"),
+            ],
+            "aaa111",
+            "Test-exempt:",
+        ),
+        # No claim anywhere in the window.
+        (
+            "Closes #123.",
+            [_commit("aaa111", "x"), _commit("bbb222", "chore: rework")],
+            "aaa111",
+            "Test-exempt:",
+        ),
+    ],
+)
+def test_newly_claimed_exempt_reason_fails_closed(
+    body: str,
+    commits: list,
+    reviewed_head: str,
+    marker: str,
+) -> None:
+    assert newly_claimed_exempt_reason(body, commits, reviewed_head, marker) == ""
+
+
+def test_newly_claimed_exempt_reason_tolerates_malformed_commit_entries() -> None:
+    """Non-Mapping entries and non-Mapping ``commit`` payloads degrade to an
+    empty message rather than raising -- matching the REST shape FakeGitHub
+    and ``GitHub.pr_commits`` can produce around API edge cases."""
+    marker = "Test-exempt:"
+    commits = [
+        "not-a-mapping",
+        42,
+        None,
+        _commit("aaa111", "feat: base"),
+        {"sha": "bbb222"},  # no commit key
+        {"sha": "ccc333", "commit": None},  # commit: null
+        {"sha": "ddd444", "commit": "not-a-mapping"},  # commit non-mapping
+        _commit("eee555", "chore: rework\n\nTest-exempt: still found"),
+    ]
+    assert newly_claimed_exempt_reason("", commits, "aaa111", marker) == "still found"
+    # A malformed entry that still carries the head sha anchors the split.
+    head_is_malformed = [
+        {"sha": "aaa111", "commit": None},
+        _commit("bbb222", "chore: rework\n\nTest-exempt: after malformed head"),
+    ]
+    assert (
+        newly_claimed_exempt_reason("", head_is_malformed, "aaa111", marker)
+        == "after malformed head"
+    )

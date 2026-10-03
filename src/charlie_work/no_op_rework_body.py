@@ -137,6 +137,7 @@ def _request_changes_body_drifted(
 def no_op_escape_needs_pr_commits(
     test_adequacy: TestAdequacyConfig,
     review_decision: Mapping[str, Any] | None,
+    live_head_sha: str | None = None,
 ) -> bool:
     """True when ``run_janitor`` can use the PR's commit list (issue #2281).
 
@@ -147,8 +148,28 @@ def no_op_escape_needs_pr_commits(
     Every other case -- no verdict, an approved/blocked verdict, the gate
     disabled -- makes the commit list dead weight, so this returns False
     and the caller may pass ``pr_commits=None``.
+
+    A ``live_head_sha`` still pinned at the verdict's ``reviewed_head_sha``
+    also returns False: a newly claimed exemption must arrive on a commit
+    AFTER the reviewed head, so an unadvanced head means the escape cannot
+    fire no matter what the commit list holds. That arm is what keeps an
+    escalated (and therefore head-frozen) request_changes PR from costing
+    a REST call on every loop pass. A missing/unknown live head or a
+    verdict without ``reviewed_head_sha`` cannot prove the escape dead, so
+    both still fetch -- undeterminable stays on the fetching side, the same
+    fail-safe direction as a ``pr_state``-only ``reviewed_head_sha`` the
+    predicate cannot see.
     """
-    return test_adequacy.enabled and (review_decision or {}).get("decision") == "request_changes"
+    decision = review_decision or {}
+    if not (test_adequacy.enabled and decision.get("decision") == "request_changes"):
+        return False
+    reviewed_head = decision.get("reviewed_head_sha")
+    return not (
+        isinstance(reviewed_head, str)
+        and reviewed_head
+        and live_head_sha
+        and str(live_head_sha) == reviewed_head
+    )
 
 
 def _trailer_exempt_escape_warning(
