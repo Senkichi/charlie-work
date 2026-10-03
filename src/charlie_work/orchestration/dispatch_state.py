@@ -84,6 +84,7 @@ from charlie_work.dispatch_selection import (
     _windowed_blocked_environment_at,
     _windowed_foreign_writer_reaps,
 )
+import charlie_work.fleet_provider_throttle as fleet_provider_throttle
 from charlie_work.escalation import _escalate_issue, _escalation_edge
 from charlie_work.fleet_registry import managed_repo_names, managed_repo_roots
 from charlie_work.github import label_names
@@ -230,6 +231,25 @@ def _dispatch_impl(
         return _wf.CommandResult(permit.ok, message, data)
     gov = permit.governor
     dispatch_limit = permit.max_launches
+
+    # Issue #1993: the provider limit is per account, so consult the fleet-wide
+    # window (and staggered-resume probe) for this repo's worker adapter.
+    resume = fleet_provider_throttle.decide_for_app(self, selection=permit.role_selection)
+    if resume.deferred:
+        return resume.deferred_result(
+            "dispatch",
+            {
+                "selected_count": 0,
+                "attempted_count": 0,
+                "failed_count": 0,
+                "skipped_issue_numbers": [],
+                "label_errors": [],
+                "sessions": [],
+                "dispatch_results": [],
+                "merged_prs": merged_prs_for_tripwire,
+            },
+        )
+    dispatch_limit = resume.cap_limit(dispatch_limit)
 
     def _resolve_merged_prs(
         outcome: _wf._MergedPRListOutcome | None,
@@ -1102,6 +1122,7 @@ def _dispatch_impl(
     manifest_path = self._layout.session_manifest
     results_path = self._layout.session_results
     dispatch_results = _launch_workers(self, permit, self._adapter_settings(), session_requests)
+    fleet_provider_throttle.note_probe_from_results(self, resume, dispatch_results)
     # Issue #2055: the sessions the fleet cap counts are on disk now -- the
     # governor -> claim -> launch window the lock exists to serialize is
     # closed. Release before the result bookkeeping below instead of holding

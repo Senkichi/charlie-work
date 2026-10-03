@@ -22,6 +22,7 @@ from charlie_work.config import (
     DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS,
     PRE_LAUNCH_BLOCKED_ENVIRONMENT_FAILURE_KINDS,
 )
+import charlie_work.fleet_provider_throttle as fleet_provider_throttle
 from charlie_work.github import GitHubError
 from charlie_work.labels import TransitionOutcome
 from charlie_work.state import StateLockBusy
@@ -213,6 +214,15 @@ def _dispatch_rework_impl(
         return _wf.CommandResult(permit.ok, message, data)
     gov = permit.governor
     rework_limit = permit.max_launches
+
+    # Issue #1993: fleet-wide window + staggered resume for this worker adapter.
+    resume = fleet_provider_throttle.decide_for_app(self, selection=permit.role_selection)
+    if resume.deferred:
+        data = {"adapter": self.config.worker.harness, "selected_count": 0}
+        if gov.any_term_enabled:
+            data.update(gov.report_fields())
+        return resume.deferred_result("rework dispatch", data)
+    rework_limit = resume.cap_limit(rework_limit)
 
     # Dry-run: read-only planning — compute selection and would-be
     # SessionRequests, but skip all state writes, label transitions,
@@ -1319,9 +1329,9 @@ def _dispatch_rework_impl(
     rescue_requests = [r for r in launchable_requests if r.issue_number in rescue_issue_numbers]
     dispatch_results: list[SessionDispatchResult] = list(superseded_blocked_results)
     if normal_requests:
-        dispatch_results.extend(
-            _launch_workers(self, permit, self._adapter_settings(), normal_requests)
-        )
+        normal_results = _launch_workers(self, permit, self._adapter_settings(), normal_requests)
+        dispatch_results.extend(normal_results)
+        fleet_provider_throttle.note_probe_from_results(self, resume, normal_results)
     if rescue_requests:
         dispatch_results.extend(
             _launch_workers(self, permit, self._rescue_adapter_settings(), rescue_requests)

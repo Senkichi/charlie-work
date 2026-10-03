@@ -5,12 +5,23 @@ Split from ``test_local_lane.py`` (file-size ratchet); reuses its fixtures.
 
 from __future__ import annotations
 
+import json
+import os
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
 from _local_lane_fixtures import new_repo_root, rework_pending_app, spy_dispatch_sessions
-from charlie_work.state import load_state, load_state_locked, save_state, state_lock
+from charlie_work import fleet_provider_throttle as fpt
+from charlie_work.adapters import SessionDispatchResult
+from charlie_work.state import (
+    load_state,
+    load_state_locked,
+    save_state,
+    set_throttled_until,
+    state_lock,
+)
 from charlie_work.workflow import OrchestratorApp
 
 
@@ -116,3 +127,79 @@ class TestLocalReworkLaunchGates:
 
         assert [r.issue_number for r in calls] == [7]
         assert result["dispatched"] == [7]
+
+
+class TestLocalReworkFleetThrottle:
+    """Issue #1993: the local rework lane honours the fleet-wide provider window
+    and the staggered resume, keyed on the selected worker adapter."""
+
+    @staticmethod
+    def _app_with_window(repo: Path, fleet: Path, *, minutes_ahead: int):
+        """Local rework app whose SIBLING repo (registered in the fleet) holds the window.
+
+        The window lives in another repo's state.json -- the cross-repo case the
+        per-repo permit gate cannot see, which only the fleet gate covers.
+        """
+        app = rework_pending_app(repo)
+        app.fleet_dir_override = str(fleet)
+        adapter = fpt.worker_adapter_kind(app.config.worker.harness)
+        sibling_state = fleet / "sibling" / "state.json"
+        sibling_state.parent.mkdir(parents=True)
+        until = datetime.now(UTC) + timedelta(minutes=minutes_ahead)
+        save_state(
+            sibling_state,
+            set_throttled_until(
+                load_state(sibling_state),
+                until.replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+                reason="rate_limited",
+                adapter_kind=adapter,
+                source="test",
+            ),
+        )
+        (fleet / "fleet.json").write_text(
+            json.dumps({"repos": {"o/sibling": {"state_dir": str(sibling_state.parent)}}}),
+            encoding="utf-8",
+        )
+        return app, adapter
+
+    def test_active_fleet_window_defers_local_rework(
+        self, repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        app, _adapter = self._app_with_window(repo, tmp_path / "fleet", minutes_ahead=30)
+        calls = spy_dispatch_sessions(monkeypatch)
+
+        result = app._local_dispatch_rework()
+
+        assert calls == []
+        TestLocalReworkLaunchGates._assert_deferred(app, result, "provider_throttled_fleet")
+
+    def test_expired_window_admits_one_launch_and_stamps_probe(
+        self, repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fleet = tmp_path / "fleet"
+        app, adapter = self._app_with_window(repo, fleet, minutes_ahead=-5)
+        launched: list[int] = []
+
+        def _fake(_root, _manifest, _results, _settings, requests):
+            launched.extend(r.issue_number for r in requests)
+            return [
+                SessionDispatchResult(
+                    issue_number=r.issue_number,
+                    issue_title=r.issue_title,
+                    prompt_path=str(r.prompt_path),
+                    branch_name=r.branch_name,
+                    adapter=adapter,
+                    ok=True,
+                    pid=os.getpid(),
+                )
+                for r in requests
+            ]
+
+        monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", _fake)
+
+        result = app._local_dispatch_rework()
+
+        assert launched == [7]
+        assert result["dispatched"] == [7]
+        stamp = json.loads(fpt.resume_probe_path(str(fleet)).read_text(encoding="utf-8"))
+        assert [p["pid"] for p in stamp[adapter]["probes"]] == [os.getpid()]

@@ -42,6 +42,7 @@ import charlie_work.workflow as _wf
 from charlie_work.worker_pid_stamp import stamp_worker_process
 from charlie_work.adapters import SessionRequest
 from charlie_work.claude_code import resolve_review_effort
+import charlie_work.fleet_provider_throttle as fleet_provider_throttle
 from charlie_work import role_selection
 from charlie_work.fleet_registry import try_acquire_fleet_lock
 from charlie_work.worker_launch_gate import (
@@ -1556,6 +1557,18 @@ def _local_dispatch_rework(self) -> dict[str, Any]:
             self, result, candidates, decision.reason, **decision.report_fields()
         )
     with decision as permit:
+        # Issue #1993: fleet-wide window + staggered resume for the selected
+        # worker adapter, same gate the remote dispatch/rework lanes apply.
+        resume = fleet_provider_throttle.decide_for_app(self, selection=permit.role_selection)
+        if resume.deferred:
+            return _defer_local_rework(
+                self,
+                result,
+                candidates,
+                str(resume.deferred_reason),
+                throttled_until=resume.deferral_data()["throttled_until"],
+            )
+        candidates = candidates[: resume.cap_limit(len(candidates))]
         if permit.max_launches < len(candidates):
             _defer_local_rework(
                 self,
@@ -1567,7 +1580,7 @@ def _local_dispatch_rework(self) -> dict[str, Any]:
             candidates = candidates[: permit.max_launches]
         if not candidates:
             return result
-        return _launch_local_rework(self, state, candidates, result, permit)
+        return _launch_local_rework(self, state, candidates, result, permit, resume)
 
 
 def _defer_local_rework(
@@ -1599,6 +1612,7 @@ def _launch_local_rework(
     candidates: list[int],
     result: dict[str, Any],
     permit: WorkerLaunchPermit,
+    resume: fleet_provider_throttle.ResumeDecision,
 ) -> dict[str, Any]:
     """Claim and launch the gated local rework candidates."""
     requests: list[SessionRequest] = []
@@ -1662,6 +1676,7 @@ def _launch_local_rework(
         dispatch_results.extend(
             _launch_workers(self, permit, self._adapter_settings(), launch_requests)
         )
+        fleet_provider_throttle.note_probe_from_results(self, resume, dispatch_results)
     successful = {r.issue_number for r in dispatch_results if r.ok}
     failed_map = {
         r.issue_number: (r.error or "dispatch failed") for r in dispatch_results if not r.ok
