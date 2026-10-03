@@ -280,3 +280,39 @@ def test_two_dead_reviewers_in_one_sweep_arm_backoff_once(tmp_path: Path) -> Non
     outage = [e for e in state["events"] if e["kind"] == "review_provider_outage"]
     assert len(outage) == 1
     assert state["reviewer_quota"]["consecutive_probe_failures"] == 1
+
+
+def test_provider_api_error_arm_stamps_quota_record_with_the_dead_role(
+    tmp_path: Path,
+) -> None:
+    """Issue #2279: the PROVIDER_API_ERROR arm of the stalled-review sweep
+    stamps ``reviewer_quota`` with the dead session's ``role_entry`` --
+    the same attribution the THROTTLED path gets, via the shared backoff
+    latch's ``arm_backoff`` callback."""
+    from charlie_work import role_quota_ledger
+
+    env = _Env(tmp_path)
+    env.plant_dead_reviewer(_result_event(500))
+    sidecar = env.reviews_dir / f"issue-{PR}.claude.json"
+    assert role_quota_ledger.stamp_session(
+        sidecar,
+        role_quota_ledger.session_stamp("reviewer", "claude-code", "claude-opus", 0),
+    )
+
+    state = env.sweep()
+
+    quota = state["reviewer_quota"]
+    assert (quota["harness"], quota["model"]) == ("claude-code", "claude-opus")
+    assert quota["adapter_kind"] == "claude-code"
+
+
+def test_provider_api_error_arm_without_a_stamp_leaves_quota_untagged(
+    tmp_path: Path,
+) -> None:
+    """A pre-#2086 sidecar (no ``role_entry``) writes the untagged record
+    shape -- it must keep blocking."""
+    env = _Env(tmp_path)
+    state = env.dispatch_and_die(_result_event(500))
+
+    quota = state["reviewer_quota"]
+    assert (quota.get("harness"), quota.get("model")) == (None, None)

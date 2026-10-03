@@ -183,10 +183,21 @@ def _mark_budget_exceeded(sessions_dir: Path, w: worker.WorkerView) -> None:
 
 
 def _arm_throttle(
-    state: dict[str, Any], arm: ThrottleArm, write_gate: WriteGate
+    state: dict[str, Any],
+    arm: ThrottleArm,
+    w: worker.WorkerView,
+    *,
+    sessions_dir: Path,
+    write_gate: WriteGate,
 ) -> dict[str, Any]:
     """``set_throttled_until`` with its ``source`` spelled as a literal at each site
-    (the audit trail's grep contract): one branch per source the decision may name."""
+    (the audit trail's grep contract): one branch per source the decision may name.
+
+    The window is stamped with the session's own role-chain ``(harness,
+    model)`` (issue #2279) -- the sidecar is never reaped in this lane, so
+    the stamp is always still readable here.
+    """
+    harness, model = role_quota_ledger.role_key_for_view(sessions_dir, w)
     if arm.source == REAP_SOURCE:
         return set_throttled_until(
             state,
@@ -194,6 +205,8 @@ def _arm_throttle(
             source="stalled_sessions_reap",
             reason=arm.reason,
             adapter_kind=arm.adapter_kind,
+            harness=harness,
+            model=model,
             write_gate=write_gate,
         )
     if arm.source == DEFER_SOURCE:
@@ -203,6 +216,8 @@ def _arm_throttle(
             source="stalled_sessions_rate_limit_defer",
             reason=arm.reason,
             adapter_kind=arm.adapter_kind,
+            harness=harness,
+            model=model,
             write_gate=write_gate,
         )
     raise ValueError(f"unknown stalled throttle source {arm.source!r}")
@@ -210,7 +225,9 @@ def _arm_throttle(
 
 def _state_txn(
     commit: StateTxn,
+    w: worker.WorkerView,
     *,
+    sessions_dir: Path,
     state_file: Path,
     now: datetime,
     write_gate: WriteGate,
@@ -219,7 +236,9 @@ def _state_txn(
     with state_lock(state_file):
         state = load_state(state_file)
         if commit.throttle is not None:
-            state = _arm_throttle(state, commit.throttle, write_gate)
+            state = _arm_throttle(
+                state, commit.throttle, w, sessions_dir=sessions_dir, write_gate=write_gate
+            )
         if commit.stamp is not None:
             # #1917: persist the classification on the issue entry so the
             # state.json-keyed orphan sweep can exempt provider-throttle deaths.
@@ -273,7 +292,14 @@ def _apply(
     elif isinstance(commit, RecordPostMortem):
         post_mortem.classify_and_record(sessions_dir, config, w, now=now)
     elif isinstance(commit, StateTxn):
-        _state_txn(commit, state_file=state_file, now=now, write_gate=write_gate)
+        _state_txn(
+            commit,
+            w,
+            sessions_dir=sessions_dir,
+            state_file=state_file,
+            now=now,
+            write_gate=write_gate,
+        )
     else:  # pragma: no cover - STALLED_COMMIT_TYPES is closed
         raise TypeError(f"unknown stalled commit {commit!r}")
 

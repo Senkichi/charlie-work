@@ -18,21 +18,31 @@ launch proceeds on the selected entry (:func:`window_covered`). Explained means
 the stored window is quota-derived (it carries the ``reason`` /
 ``adapter_kind`` provenance the writers stamp) **and** attributable to an
 entry selection skipped on that adapter -- never merely "shorter than some
-ledger restriction somewhere in the chain". A per-repo window the ledger does
-not explain -- an operator hold, a window from a session launched before the
-ledger existed -- still blocks, so nothing that blocked before this module can
-silently stop blocking. When every entry is
-restricted, selection returns ``None`` and the caller defers exactly as the
-per-repo window always did.
+ledger restriction somewhere in the chain".
+
+Issue #2279: a fallback's quota death can leave a per-repo window that
+outlives the *primary's* restriction -- selection then returns the primary
+with nothing skipped, and adapter-level provenance attributes the window to
+nobody. The throttle writers therefore stamp the window with the dead
+session's own role-chain ``(harness, model)`` (``throttle_harness`` /
+``throttle_model``, or ``harness`` / ``model`` on ``reviewer_quota``); a
+stamped window is covered when the stamp differs from the selected entry and
+the ledger restricts the stamped entry at least as long. A per-repo window
+the ledger does not explain -- an operator hold, a window from a session
+launched before the ledger existed, an unstamped window -- still blocks, so
+nothing that blocked before this module can silently stop blocking. When
+every entry is restricted, selection returns ``None`` and the caller defers
+exactly as the per-repo window always did.
 """
 
 from __future__ import annotations
 
 import logging
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 from . import role_quota_ledger
@@ -44,6 +54,9 @@ from .write_gate import WriteGate, require_write_gate
 logger = logging.getLogger(__name__)
 
 EVENT_ROLE_FALLBACK_SELECTED = "role_fallback_selected"
+
+# Shared immutable default for ``RoleSelection.restrictions``.
+_EMPTY_RESTRICTIONS: Mapping[tuple[str, str], datetime] = MappingProxyType({})
 
 
 def _format_z(moment: datetime) -> str:
@@ -68,12 +81,22 @@ class RoleSelection:
     ``entry`` is ``None`` when every entry is restricted. ``skipped`` holds the
     restricted entries ahead of the selected one; :func:`window_covered`
     attributes a per-repo window to one of them.
+
+    ``restrictions`` is the ledger snapshot the selection ran against
+    (issue #2279): a window *stamped* with the ``(harness, model)`` whose
+    death produced it is attributed even when selection skipped nothing --
+    e.g. a fallback's quota window outliving the recovered primary. It is
+    excluded from equality and hashing so a hand-built selection in a test
+    compares equal to a ledger-read one.
     """
 
     chain: tuple[RoleEntry, ...]
     entry: RoleEntry | None
     index: int | None
     skipped: tuple[SkippedEntry, ...]
+    restrictions: Mapping[tuple[str, str], datetime] = field(
+        default=_EMPTY_RESTRICTIONS, compare=False
+    )
 
     @property
     def is_fallback(self) -> bool:
@@ -141,6 +164,7 @@ def build_selection(
         entry=entry,
         index=None if entry is None else chain_tuple.index(entry),
         skipped=skipped,
+        restrictions=MappingProxyType(dict(ledger)),
     )
 
 
@@ -162,24 +186,33 @@ def window_covered(
     *,
     reason: str | None,
     adapter_kind: str | None,
+    harness: str | None = None,
+    model: str | None = None,
 ) -> bool:
-    """True when the per-repo throttle window is explained by a skipped chain entry.
+    """True when the per-repo throttle window is explained by a restricted chain entry.
 
     Covered only when all of these hold; anything else (length-1 chains,
     operator holds, windows from unstamped pre-ledger sessions, a
-    ``provider_auth`` cooldown, a window on an adapter no skipped entry uses,
-    a window outlasting every skipped entry's restriction) is not, so the
-    per-repo gate still blocks:
+    ``provider_auth`` cooldown, a window on an adapter no attributable entry
+    uses, a window outlasting the attributable entry's restriction) is not,
+    so the per-repo gate still blocks:
 
     * the role is chained and selection found an entry to launch on;
     * the window is quota-derived: ``reason`` is one of the failure kinds the
       ledger restricts on (``role_quota_ledger.RESTRICTING_FAILURE_KINDS``);
     * some **skipped** entry runs on ``adapter_kind`` and its ledger
-      restriction lasts at least as long as ``per_repo_until``.
+      restriction lasts at least as long as ``per_repo_until`` -- or, when
+      the window is stamped with the ``(harness, model)`` whose death
+      produced it (issue #2279), the stamp differs from the selected entry,
+      runs on ``adapter_kind``, and the ledger restricts it at least as long.
 
-    Entries past the selected one are deliberately not consulted: a
-    restriction on an entry selection never had to skip explains nothing
-    about why this repo is held.
+    The stamped-entry rule exists because selection can attribute nothing
+    once the dying fallback's window outlives the *primary's* restriction:
+    ``skipped`` is empty and adapter-level provenance cannot tell the two
+    models apart. A stamp equal to the selected entry is never covered --
+    an entry's own death window keeps blocking it -- and a stamp the ledger
+    does not restrict, or restricts for less than the window, explains only
+    part of the hold, so the window blocks.
     """
     if len(selection.chain) <= 1 or selection.entry is None:
         return False
@@ -194,6 +227,16 @@ def window_covered(
         if capabilities is not None and capabilities.adapter_kind == adapter_kind:
             if until <= item.until:
                 return True
+    if isinstance(harness, str) and isinstance(model, str):
+        capabilities = HARNESS_REGISTRY.get(harness)
+        if (
+            capabilities is not None
+            and capabilities.adapter_kind == adapter_kind
+            and (harness, model) != selection.entry.key
+        ):
+            stamped_until = selection.restrictions.get((harness, model))
+            if stamped_until is not None and until <= stamped_until:
+                return True
     return False
 
 
@@ -205,6 +248,8 @@ def reviewer_window_covered(state: Mapping[str, Any], selection: RoleSelection) 
         selection,
         reason=quota.get("reason"),
         adapter_kind=quota.get("adapter_kind"),
+        harness=quota.get("harness"),
+        model=quota.get("model"),
     )
 
 

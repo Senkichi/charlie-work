@@ -966,6 +966,8 @@ def set_throttled_until(
     source: str,
     reason: str | None = None,
     adapter_kind: str | None = None,
+    harness: str | None = None,
+    model: str | None = None,
     write_gate: WriteGate | None = None,
     state_path: Path | None = None,
     repo: str | None = None,
@@ -975,13 +977,13 @@ def set_throttled_until(
     ``source`` is a required keyword naming the caller (issue #2006).
     Whenever the value changes -- extended or shortened -- this function
     appends a ``throttle_window_set`` event carrying
-    ``{previous, throttled_until, reason, adapter_kind, source}`` so a moved
-    window is never invisible to the audit trail; a no-op write emits
-    nothing. Emission goes through ``write_gate`` when given (so gated lanes
-    get the gate's dry-run suppression and its bound ``state_path``/``repo``
-    dual-write), else through ``append_event`` with the optional
-    ``state_path``/``repo`` dual-write bindings; with neither, the event
-    lands only in the in-memory ``events`` ring.
+    ``{previous, throttled_until, reason, adapter_kind, harness, model,
+    source}`` so a moved window is never invisible to the audit trail; a
+    no-op write emits nothing. Emission goes through ``write_gate`` when
+    given (so gated lanes get the gate's dry-run suppression and its bound
+    ``state_path``/``repo`` dual-write), else through ``append_event`` with
+    the optional ``state_path``/``repo`` dual-write bindings; with neither,
+    the event lands only in the in-memory ``events`` ring.
 
     ``reason`` (a ``worker_fate.classify_for`` failure_kind -- e.g.
     "quota_exhausted", "provider_auth", "rate_limited") and ``adapter_kind``
@@ -993,6 +995,14 @@ def set_throttled_until(
     call sites that have not been updated to pass them keep working; a
     throttle with an unset reason/adapter_kind is treated as
     claude-code-shaped (the common case) by ``clear_quota_throttles``.
+
+    ``harness``/``model`` -- persisted as ``throttle_harness`` /
+    ``throttle_model`` -- name the dead session's stamped role-chain entry
+    (issue #2279): the quota ledger already scopes restrictions per
+    ``(harness, model)``, so a window stamped with the entry that produced it
+    lets ``role_selection.window_covered`` tell a fallback's quota window
+    from an operator hold or the selected entry's own death. They default to
+    None; a window with no stamp keeps the pre-#2279 blocking semantics.
 
     Monotonic (issue #2042): a new window never shortens a still-active one.
     When the stored ``throttled_until`` parses, is still in the future, and
@@ -1023,6 +1033,8 @@ def set_throttled_until(
         "throttled_until": throttled_until,
         "throttle_reason": reason,
         "throttle_adapter_kind": adapter_kind,
+        "throttle_harness": harness,
+        "throttle_model": model,
     }
     if previous == throttled_until:
         return new_data
@@ -1031,6 +1043,8 @@ def set_throttled_until(
         "throttled_until": throttled_until,
         "reason": reason,
         "adapter_kind": adapter_kind,
+        "harness": harness,
+        "model": model,
         "source": source,
     }
     if write_gate is not None:
@@ -1504,6 +1518,8 @@ def clear_quota_throttles(data: dict[str, Any]) -> dict[str, Any]:
             "throttled_until": None,
             "throttle_reason": None,
             "throttle_adapter_kind": None,
+            "throttle_harness": None,
+            "throttle_model": None,
         }
     cleared = clear_reviewer_quota(cleared)
     reviewer_quota = cleared.get("reviewer_quota") or {}

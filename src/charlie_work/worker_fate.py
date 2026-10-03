@@ -10,19 +10,18 @@ single point of enforcement for all nine; ``resolve_fate`` is a pure function
 over gathered evidence, so every rule is testable as a decision table with no
 fakes, no ``tmp_path`` and no git.
 
-Shape (design doc section 1, "Shape A: a pure resolver over gathered
-evidence"): every consumer already does its own reads (some under a lock)
-and builds a ``FateEvidence`` by hand; ``resolve_fate`` is the pure, 9-rule
-decision over it. The originally planned evidence-gathering reader bundle was
-deleted (wf-r2-s1): wiring it in would only add a second ``ls-remote``/outcome
-read per candidate.
+Shape (design doc §1, "Shape A: a pure resolver over gathered evidence"):
+every consumer already does its own reads (some under a lock) and builds a
+``FateEvidence`` by hand; ``resolve_fate`` is the pure 9-rule decision over
+it. The planned evidence-gathering reader bundle was deleted (wf-r2-s1):
+wiring it in would only add a second ``ls-remote``/outcome read per candidate.
 
 ``process_utils.is_pid_alive`` stays the liveness primitive, unchanged,
 including its asymmetric fail-open/fail-closed behaviour; ``is_alive`` here
 only adds the ``pid is None`` case (no process, e.g. a manual-adapter
-subject). ``classify_worker_health`` and ``is_worker_confirmed_dead`` stay in
-``worker.py`` — they own the inconclusive-probe deferral counter (#755) and
-this module only consumes their output through ``FateEvidence.health``.
+subject). ``classify_worker_health``/``is_worker_confirmed_dead`` stay in
+``worker.py`` — they own the inconclusive-probe counter (#755); this module
+only consumes their output through ``FateEvidence.health``.
 
 ``wf-4-wire-a`` adds the internal Adapter seam (design doc §7):
 ``classify_failure`` merged the two ``_classify_session_failure`` copies
@@ -32,9 +31,8 @@ fleet-wide by rule 6, so it is no longer a per-profile flag);
 ``AdapterFateProfile``/``profile_for`` replace the 14
 ``w.adapter_kind ==`` branches in ``dead_worker_reap.py``. Both copies are
 now deleted: ``classify_for`` looks the profile up and passes its two
-flags (``account_error_detection``, ``headless_permission_detection``)
-to ``classify_failure``, and the adapters' sidecar writers
-call ``classify_for``.
+flags to ``classify_failure``, and the adapters' sidecar writers call
+``classify_for``.
 
 ``FateEvidence.failure`` is supplied by the caller as already-classified
 data — ``resolve_fate`` only ever reads ``FailureEvidence.kind``/
@@ -52,17 +50,17 @@ read side feeds the persisted kind back in as ``FateEvidence.failure``
 tests patch ``charlie_work.worker_fate.is_alive`` and nothing else.
 
 Known exception to "this module owns post-exit fate": three consumers
-(``dead_worker_sweep.live_handoff``, ``misc_worker_dispatch``, ``rework_outcome``) use
-``resolve_fate`` only as the rule-1/7 freshness filter and then route on the
-surviving ``basis.outcome``'s self-reported ``push_succeeded``/``head_sha``
-themselves. Their evidence shapes never resolve to ``PushedWithoutPr`` or
-``Completed`` (no PR knowledge), so the fate variant carries no decision for
-them; those reads are legacy-compatible by design (wf-review-opus B9).
+(``dead_worker_sweep.live_handoff``, ``misc_worker_dispatch``, ``rework_outcome``)
+use ``resolve_fate`` only as the rule-1/7 freshness filter, then route on the
+surviving ``basis.outcome``'s ``push_succeeded``/``head_sha`` themselves.
+Their evidence shapes never resolve to ``PushedWithoutPr`` or ``Completed``
+(no PR knowledge), so the fate variant carries no decision for them; those
+reads are legacy-compatible by design (wf-review-opus B9).
 
 The ``entry["stale_evidence_reported"]`` dedup marker is deliberately keyed
 ``(source, written_at)`` with no dispatch epoch and is never cleared: a
-leftover file is one piece of evidence however many dispatches it outlives, so
-it is reported once per issue entry (design doc §5).
+leftover file is reported once per issue entry however many dispatches it
+outlives (design doc §5).
 """
 
 from __future__ import annotations
@@ -185,10 +183,18 @@ class FailureEvidence:
     kind: str | None  # rate_limited|quota_exhausted|provider_suspended|provider_auth|...|None
     throttled_until: datetime | None
     fresh: bool  # True = classified from the log this pass; False = persisted fallback
+    # Stamped role-chain ``(harness, model)`` of the dead session (#2279);
+    # ``persist_failure`` writes it onto the per-repo window it arms.
+    role_key: tuple[str | None, str | None] = (None, None)
 
     @classmethod
     def from_classification(
-        cls, kind: str | None, throttled_until_iso: str | None, *, fresh: bool
+        cls,
+        kind: str | None,
+        throttled_until_iso: str | None,
+        *,
+        fresh: bool,
+        role_key: tuple[str | None, str | None] = (None, None),
     ) -> FailureEvidence:
         """Build from an adapter classifier's ``(failure_kind, throttled_until_iso)``.
 
@@ -201,6 +207,7 @@ class FailureEvidence:
             kind=kind,
             throttled_until=_state_parse_iso_timestamp(throttled_until_iso),
             fresh=fresh,
+            role_key=role_key,
         )
 
 
@@ -318,11 +325,11 @@ def is_alive(pid: int | None, process_start_time: float | None) -> bool:
     are always dead -- e.g. a manual-adapter subject that never had a process
     to begin with, or a sentinel pid.
 
-    The single liveness seam for worker-fate resolution (see module docstring).
-    The primitive is looked up at call time, so a patch of
-    ``process_utils.is_pid_alive`` reaches it too. Reviewer, merge-gate and
-    worktree-marker liveness checks (and ``worker.py``'s own probe, which this
-    module imports) deliberately keep calling the primitive directly.
+    The single liveness seam for worker-fate resolution (see module
+    docstring); the primitive is looked up at call time so a patch of
+    ``process_utils.is_pid_alive`` reaches it too. Reviewer, merge-gate,
+    worktree-marker and ``worker.py``'s own probe calls deliberately keep
+    calling the primitive directly.
     """
     return _host.current().probe.is_alive(pid, process_start_time)
 
@@ -359,13 +366,11 @@ def _carries_no_claim(candidate: OutcomeEvidence) -> bool:
     """N1 (wf-review-opus.md) / design doc §3 step 0: an empty terminal or
     worktree outcome dict (``{}``) is "no claim: neither stale nor
     decisive" -- distinct from *absent* (``None``), but the SAME as absent
-    for freshness-arbitration purposes. ``_no_pr_outcome_evidence`` /
-    ``rework_outcome._outcome_evidence`` both still build a real
-    ``OutcomeEvidence`` for ``{}`` (all four claim fields ``None``) rather
-    than returning ``None`` themselves, so the check belongs here -- the
-    single point every consumer's freshness step already funnels through --
-    instead of being duplicated at (and possibly missed by) each of their
-    construction sites.
+    for freshness arbitration. ``_no_pr_outcome_evidence`` /
+    ``rework_outcome._outcome_evidence`` still build a real
+    ``OutcomeEvidence`` for ``{}`` rather than returning ``None``, so the
+    check belongs here -- the single point every consumer's freshness step
+    funnels through -- not duplicated at each construction site.
     """
     return (
         candidate.outcome is None
@@ -507,11 +512,10 @@ def resolve_fate(evidence: FateEvidence, *, now: datetime) -> WorkerFate:  # noq
 
     Corollary (pinned by ``test_worker_fate.py::test_row4_known_head_mismatch_*``):
     row 4 ("declared push, remote doesn't show it") can only ever see an
-    outcome whose ``head_sha`` is unknown. A *known* ``head_sha`` that
-    mismatches the live remote head is discarded as stale by step 0 before
-    row 4 is reached at all -- which is exactly what the precedence note
-    above depends on: a salvage push moves the remote head, so a stale
-    outcome's head claim stops matching on the very next resolve.
+    outcome whose ``head_sha`` is unknown: a known, mismatching head was
+    already discarded as stale by step 0 -- exactly what the precedence note
+    above depends on (a salvage push moves the remote head, so a stale
+    outcome's head claim stops matching on the very next resolve).
     """
     fresh = _resolve_freshness(evidence)
     outcome = fresh.outcome
@@ -602,22 +606,17 @@ def resolve_fate(evidence: FateEvidence, *, now: datetime) -> WorkerFate:  # noq
         return Throttled(basis=basis("R6"), failure=evidence.failure)
 
     # Rows 8/9 read git-confirmed evidence (exit code / remote ahead-count),
-    # not the outcome file. They must fire not only when there is no fresh
-    # outcome at all, but also when a fresh outcome exists but never
-    # confirmed a push (``push_succeeded`` False or missing, e.g. a
-    # rework-shaped outcome): by this point rows 1-4 have already returned
-    # for every case where the outcome itself decides push/PR status
-    # (``blocked``, or a push confirmed at the remote), so a non-confirming
-    # outcome has nothing left to say and must not shadow real remote
-    # evidence. Gating on bare ``outcome is None`` silently dropped
-    # confirmed pushed work whenever any non-push-claiming outcome existed
-    # -- including the #1248 salvage-push case, where the push lands on the
-    # remote after the worker's own (non-confirming) outcome file was
-    # written (B1, wf-review-opus.md). An outcome that *does* claim
-    # ``push_succeeded is True`` but couldn't be confirmed here (unknown PR
-    # existence, or no branch evidence at all) still defers to the liveness/
-    # dead rows below rather than rows 8/9 -- that self-report-with-no-
-    # evidence case stays exactly as before (see ``tests/test_issue_1006.py``).
+    # not the outcome file. They must fire also when a fresh outcome exists
+    # but never confirmed a push (``push_succeeded`` False or missing, e.g.
+    # a rework-shaped outcome): by this point rows 1-4 have already returned
+    # for every case where the outcome itself decides push/PR status, so a
+    # non-confirming outcome has nothing left to say and must not shadow real
+    # remote evidence. Gating on bare ``outcome is None`` silently dropped
+    # confirmed pushed work -- including the #1248 salvage-push case, where
+    # the push lands after the worker's (non-confirming) outcome file was
+    # written (B1, wf-review-opus.md). A ``push_succeeded is True`` claim that
+    # could not be confirmed (unknown PR existence, no branch evidence) still
+    # defers to the liveness/dead rows below, as before (``tests/test_issue_1006.py``).
     outcome_has_no_push_opinion = outcome is None or outcome.push_succeeded is not True
 
     # Row 8 (R4): dead, no outcome deciding push/PR status, a fresh clean
@@ -726,6 +725,8 @@ def persist_failure(
             source=source,
             reason=failure.kind,
             adapter_kind=adapter_kind,
+            harness=failure.role_key[0],
+            model=failure.role_key[1],
             write_gate=write_gate,
         )
     if failure.kind is not None:
