@@ -41,6 +41,7 @@ from charlie_work.rework_attempt_exemption import (
 from charlie_work.role_quota_ledger import RESTRICTING_FAILURE_KINDS
 from charlie_work.state import load_state, save_state, state_lock
 from charlie_work.throttle_signatures import PROVIDER_THROTTLE_FAILURE_KINDS
+from charlie_work.worker_fate import profile_for
 from charlie_work.workflow import OrchestratorApp
 
 CAP = 2
@@ -429,3 +430,106 @@ def test_dead_session_restore_lane_refunds_and_flags_the_pr(tmp_path: Path) -> N
     (requeued,) = bed.events("rework_requeued")
     assert requeued["payload"]["provider_throttle_exempt"] is True
     assert requeued["payload"]["startup_death"] is False
+
+
+@pytest.mark.parametrize(
+    "log_text",
+    [None, "worked on it, nothing to change"],
+    ids=["no_log", "non_throttle_log"],
+)
+def test_clean_exit_stamped_throttle_is_exempted_without_terminal_signature(
+    tmp_path: Path, log_text: str | None
+) -> None:
+    """(g) Issue #2286, stamp-first resolution: the dead-session lane often
+    classifies and stamps ``dead_worker_failure_kind`` before the orphan sweep
+    reaches the issue. A clean exit already stamped ``rate_limited`` exempts on
+    the stamp alone -- the terminal-line check exists for UNCLASSIFIED deaths,
+    so an absent log or a non-throttle one cannot veto the stamp. The dead
+    session's dispatch stamp is refunded, the PR is flagged (so
+    ``no_op_rework_attempts`` never advances), and the exemption emits from the
+    clean-exit lane."""
+    bed = _Bed(tmp_path)
+    bed.assert_dispatched_not_escalated(bed.dispatch(), 1)
+    assert len(bed.entry()["redispatch_at"]) == 1
+    bed.die(stamped_kind="rate_limited", log_text=log_text, exit_code=0)
+
+    entry = bed.entry()
+    assert entry.get("status") == "rework_requested"
+    assert entry.get("dead_worker_failure_kind") == "rate_limited"
+    assert entry.get("redispatch_at") == []
+    assert not entry.get("worker_death_at")
+    pr_state = load_state(bed.paths.state_file)["prs"][str(PR)]
+    assert pr_state.get("last_rework_was_startup_death") is True
+    assert pr_state.get("last_rework_exemption") == "provider_throttle"
+    assert pr_state.get("last_rework_failure_kind") == "rate_limited"
+    assert pr_state.get("no_op_rework_attempts", 0) == 0
+    (exempted,) = bed.events(EXEMPTION_EVENT_KIND)
+    assert exempted["payload"]["issue_number"] == ISSUE
+    assert exempted["payload"]["pr_number"] == PR
+    assert exempted["payload"]["failure_kind"] == "rate_limited"
+    assert exempted["payload"]["source"] == "orphan_sweep_clean_exit"
+    assert exempted["payload"]["refunded_redispatch_at"]
+    (recovered,) = bed.events("orphaned_worker_recovered")
+    assert recovered["payload"]["reason"] == "dead_worker_clean_exit_throttle"
+    assert recovered["payload"]["failure_kind"] == "rate_limited"
+
+
+@pytest.mark.parametrize("kind", ["provider_suspended", "permission_denied"])
+def test_clean_exit_stamped_non_throttle_still_counts_as_no_op(tmp_path: Path, kind: str) -> None:
+    """(h) Negative companion to (g): the stamp-first branch resolves the kind,
+    but the exemption itself still gates on ``PROVIDER_THROTTLE_EXEMPT_KINDS``.
+    A clean exit stamped with a non-throttle kind -- ``provider_suspended``
+    sits just outside the exempt set by design (terminal, no cooldown) and
+    ``permission_denied`` is a config defect, not a provider death -- is NOT
+    exempted: the dispatch stamp stays counted and the attempt routes to a
+    real no-op."""
+    bed = _Bed(tmp_path)
+    bed.assert_dispatched_not_escalated(bed.dispatch(), 1)
+    bed.die(stamped_kind=kind, exit_code=0)
+
+    entry = bed.entry()
+    assert entry.get("status") == "escalated"
+    assert entry.get("escalation_reason") == "rework_no_op"
+    assert entry.get("dead_worker_failure_kind") == kind
+    assert len(entry.get("redispatch_at", [])) == 1
+    pr_state = load_state(bed.paths.state_file)["prs"][str(PR)]
+    assert not pr_state.get("last_rework_was_startup_death")
+    assert bed.events(EXEMPTION_EVENT_KIND) == []
+
+
+@pytest.mark.parametrize(
+    ("adapter_kind", "terminal", "expected"),
+    [
+        # The quota signature fires for every adapter -- the structured
+        # resource_exhausted trailer and the config prose fallback alike.
+        ("devin", '{"cognition.ai/errorKind": "resource_exhausted"}', True),
+        ("claude-code", "Error: weekly usage quota has been exhausted", True),
+        ("api", '{"cognition.ai/errorKind": "resource_exhausted"}', True),
+        # The generic throttle markers fire for every adapter, with or
+        # without a resolved profile.
+        ("devin", FREE_MODEL_RATE_LIMIT_LINE, True),
+        (None, FREE_MODEL_RATE_LIMIT_LINE, True),
+        # Provider-auth detection belongs to the api profile alone (#484):
+        # every other adapter (and an unresolved one) must ignore an auth
+        # failure sitting in the terminal lines.
+        ("api", "API Error: 401 Unauthorized - invalid api key", True),
+        ("devin", "API Error: 401 Unauthorized - invalid api key", False),
+        ("claude-code", "API Error: 401 Unauthorized - invalid api key", False),
+        (None, "API Error: 401 Unauthorized - invalid api key", False),
+        # No provider signature at all.
+        ("devin", "ran the tests\nall done, nothing left to change", False),
+        ("api", "ran the tests\nall done, nothing left to change", False),
+    ],
+)
+def test_terminal_is_throttle_error_signature_gating(
+    adapter_kind: str | None, terminal: str, expected: bool
+) -> None:
+    """(i) Table-driven pin of ``_terminal_is_throttle_error``: the quota
+    signature and generic throttle markers admit every adapter, while
+    provider-auth detection is gated on ``profile.account_error_detection``
+    (api only) -- a devin or claude-code worker quoting a 401 never
+    classifies as a provider death."""
+    from charlie_work.dead_worker_classification import _terminal_is_throttle_error
+
+    profile = profile_for(adapter_kind) if adapter_kind is not None else None
+    assert _terminal_is_throttle_error(terminal, profile, OrchestratorConfig()) is expected
