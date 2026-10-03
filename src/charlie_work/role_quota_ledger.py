@@ -214,6 +214,37 @@ def stamp_session(sidecar: Path | None, stamp: Mapping[str, Any]) -> bool:
         return False
 
 
+def _session_stamp_for(
+    sessions_dir: Path, adapter_kind: str, number: int
+) -> Mapping[str, Any] | None:
+    """The ``role_entry`` stamp on the session's sidecar, else ``None``.
+
+    A missing/unreadable sidecar or an unstamped session (pre-#2086
+    launches) yields ``None``.
+    """
+    harness = _view_kind_to_harness(adapter_kind)
+    sidecar = sidecar_path_for(sessions_dir, harness, number) if harness else None
+    if sidecar is None:
+        return None
+    try:
+        payload = json.loads(sidecar.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    stamp = payload.get(SESSION_ROLE_KEY) if isinstance(payload, dict) else None
+    return stamp if isinstance(stamp, Mapping) else None
+
+
+def _record_from_stamp(
+    stamp: Mapping[str, Any], until: str | datetime, *, reason: str | None, source: str
+) -> bool:
+    harness, model = stamp.get("harness"), stamp.get("model")
+    if not isinstance(harness, str) or not isinstance(model, str):
+        return False
+    return record_restriction(
+        harness, model, until, reason=reason, source=source, role=str(stamp.get("role") or "")
+    )
+
+
 def record_from_sidecar_payload(
     payload: Mapping[str, Any],
     until: str | datetime | None,
@@ -228,12 +259,7 @@ def record_from_sidecar_payload(
     stamp = payload.get(SESSION_ROLE_KEY) if isinstance(payload, Mapping) else None
     if not isinstance(stamp, Mapping) or until is None:
         return False
-    harness, model = stamp.get("harness"), stamp.get("model")
-    if not isinstance(harness, str) or not isinstance(model, str):
-        return False
-    return record_restriction(
-        harness, model, until, reason=reason, source=source, role=str(stamp.get("role") or "")
-    )
+    return _record_from_stamp(stamp, until, reason=reason, source=source)
 
 
 def record_classified_death(
@@ -255,17 +281,33 @@ def record_for_session(
     source: str,
 ) -> bool:
     """Read a session's sidecar (by ``WorkerView.adapter_kind``) and record it."""
-    harness = _view_kind_to_harness(adapter_kind)
-    sidecar = sidecar_path_for(sessions_dir, harness, number) if harness else None
-    if sidecar is None or until is None:
+    if until is None:
         return False
-    try:
-        payload = json.loads(sidecar.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    stamp = _session_stamp_for(sessions_dir, adapter_kind, number)
+    if stamp is None:
         return False
-    if not isinstance(payload, dict):
-        return False
-    return record_from_sidecar_payload(payload, until, reason=reason, source=source)
+    return _record_from_stamp(stamp, until, reason=reason, source=source)
+
+
+def role_key_for_session(
+    sessions_dir: Path, adapter_kind: str, number: int
+) -> tuple[str, str] | None:
+    """The ``(harness, model)`` the session's role stamp names, else ``None``.
+
+    Read half of :func:`stamp_session`: the per-repo throttle writers stamp
+    the window with the chain entry whose session produced it (issue #2279)
+    so ``role_selection.window_covered`` can tell a fallback's quota window
+    from the selected entry's own death. A missing/unreadable sidecar or an
+    unstamped session (pre-#2086 launches) yields ``None`` -- the window then
+    keeps its untagged, still-blocking provenance.
+    """
+    stamp = _session_stamp_for(sessions_dir, adapter_kind, number)
+    if stamp is None:
+        return None
+    stamped_harness, stamped_model = stamp.get("harness"), stamp.get("model")
+    if not isinstance(stamped_harness, str) or not isinstance(stamped_model, str):
+        return None
+    return (stamped_harness, stamped_model)
 
 
 def record_view(

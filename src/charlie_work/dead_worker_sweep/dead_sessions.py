@@ -50,7 +50,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .. import post_mortem, worker, worker_fate, worker_literal_tmp
+from .. import post_mortem, role_quota_ledger, worker, worker_fate, worker_literal_tmp
 from .. import state as state_mod
 from ..config import OrchestratorConfig
 from ..dispatch_selection import _windowed_redispatch_at
@@ -252,8 +252,17 @@ def _persist_failure(
     carries its ``source=`` as a string literal (the repo-wide audit guard), kept equal
     to the plan's ``*_PERSIST_SOURCE`` constants by a test.
     """
+    # The dead session's stamped role-chain entry rides the evidence so the
+    # per-repo window it arms is attributed to the ``(harness, model)`` that
+    # died, not the adapter as a whole (issue #2279). The sidecar still
+    # exists here: ``plan_dead_reap`` orders ``PersistFailure`` before
+    # ``ReapSidecar``.
+    role_key = role_quota_ledger.role_key_for_session(
+        ctx.sessions_dir, w.adapter_kind, w.issue_number
+    )
+    harness, model = role_key if role_key is not None else (None, None)
     evidence = worker_fate.FailureEvidence.from_classification(
-        failure_kind, throttled_until, fresh=True
+        failure_kind, throttled_until, fresh=True, harness=harness, model=model
     )
     with state_mod.state_lock(ctx.state_file):
         state = state_mod.load_state(ctx.state_file)

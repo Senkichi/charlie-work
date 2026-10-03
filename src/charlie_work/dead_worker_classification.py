@@ -48,7 +48,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from . import worker_fate
+from . import role_quota_ledger, worker_fate
 from .dispatch_selection import _credit_worker_death
 from .rework_attempt_exemption import exempt_provider_throttle_rework_death
 from .worker import iter_workers
@@ -246,8 +246,15 @@ def classify_dead_worker_log(
     )
     if failure_kind is None:
         return None
+    # The dead session's stamped role-chain entry rides the evidence so the
+    # persist step stamps the per-repo window with it (issue #2279); the
+    # adapter helper above leaves ``role_entry`` untouched.
+    role_key = role_quota_ledger.role_key_for_session(
+        sessions_dir, view.adapter_kind, issue_number
+    )
+    harness, model = role_key if role_key is not None else (None, None)
     return view.adapter_kind, worker_fate.FailureEvidence.from_classification(
-        failure_kind, throttled_until, fresh=True
+        failure_kind, throttled_until, fresh=True, harness=harness, model=model
     )
 
 

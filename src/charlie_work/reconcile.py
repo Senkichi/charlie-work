@@ -55,6 +55,7 @@ from .github import (
 )
 from .issue_linking import linked_issue_number
 from .instrumentation import log_event, query_events
+from .role_quota_ledger import role_key_for_session
 from .labels import TransitionOutcome, _edges, transition
 from .local_lane import synthesize_open_pr
 from .local_work_park import publishes_pull_requests
@@ -113,6 +114,12 @@ class DriftItem:
     # Unused by every other kind.
     throttle_reason: str | None = None
     throttle_adapter_kind: str | None = None
+    # The dead session's stamped role-chain ``(harness, model)`` (issue
+    # #2279), read off its sidecar while detect_drift still has it -- the
+    # per-repo window attributes the death to the entry that produced it, so
+    # ``role_selection.window_covered`` can tell it from another entry's.
+    throttle_harness: str | None = None
+    throttle_model: str | None = None
     # Issue #978: structured "why" for session_failed_relabeled drift items,
     # so the machine-readable reason is not buried only in the free-text
     # ``detail`` string. ``reason`` is the canonical path identifier (e.g.
@@ -1875,6 +1882,9 @@ def detect_drift(
                     if failure_kind and throttled_until:
                         # Update state with throttle window
                         # This is a no-op drift item that just signals state update
+                        role_key = role_key_for_session(
+                            sessions_dir, w.adapter_kind, w.issue_number
+                        )
                         drift.append(
                             DriftItem(
                                 kind="provider_throttle_detected",
@@ -1887,6 +1897,8 @@ def detect_drift(
                                 fix_actions=(f"set throttled_until={throttled_until}",),
                                 throttle_reason=failure_kind,
                                 throttle_adapter_kind=w.adapter_kind,
+                                throttle_harness=role_key[0] if role_key else None,
+                                throttle_model=role_key[1] if role_key else None,
                             )
                         )
 
@@ -3253,6 +3265,8 @@ def apply_fixes(
                         source="reconcile_apply_fixes",
                         reason=item.throttle_reason,
                         adapter_kind=item.throttle_adapter_kind,
+                        harness=item.throttle_harness,
+                        model=item.throttle_model,
                         state_path=state_path,
                     )
                     break

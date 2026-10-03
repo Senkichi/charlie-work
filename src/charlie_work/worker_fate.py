@@ -185,10 +185,22 @@ class FailureEvidence:
     kind: str | None  # rate_limited|quota_exhausted|provider_suspended|provider_auth|...|None
     throttled_until: datetime | None
     fresh: bool  # True = classified from the log this pass; False = persisted fallback
+    # The dead session's stamped role-chain ``(harness, model)`` (issue
+    # #2279), read back by the classification sites. ``persist_failure``
+    # stamps it on the per-repo window so ``role_selection.window_covered``
+    # can attribute the window to the entry that died, not the adapter.
+    harness: str | None = None
+    model: str | None = None
 
     @classmethod
     def from_classification(
-        cls, kind: str | None, throttled_until_iso: str | None, *, fresh: bool
+        cls,
+        kind: str | None,
+        throttled_until_iso: str | None,
+        *,
+        fresh: bool,
+        harness: str | None = None,
+        model: str | None = None,
     ) -> FailureEvidence:
         """Build from an adapter classifier's ``(failure_kind, throttled_until_iso)``.
 
@@ -201,6 +213,8 @@ class FailureEvidence:
             kind=kind,
             throttled_until=_state_parse_iso_timestamp(throttled_until_iso),
             fresh=fresh,
+            harness=harness,
+            model=model,
         )
 
 
@@ -726,6 +740,8 @@ def persist_failure(
             source=source,
             reason=failure.kind,
             adapter_kind=adapter_kind,
+            harness=failure.harness,
+            model=failure.model,
             write_gate=write_gate,
         )
     if failure.kind is not None:

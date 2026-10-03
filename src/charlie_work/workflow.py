@@ -5186,6 +5186,11 @@ class OrchestratorApp:
                     now_dt,
                     reset_at=reset_at,
                     adapter_kind=role_selection.selection_adapter_kind(role_sel),
+                    # The hit lands on the entry selection launched (#2279):
+                    # stamp it so a fallback's window can never pin the
+                    # recovered primary on the same adapter.
+                    harness=role_sel.entry.harness if role_sel.entry is not None else None,
+                    model=role_sel.entry.model if role_sel.entry is not None else None,
                 )
                 role_selection.record_launch_quota_hit(
                     role_sel, quota_record.get("throttled_until")

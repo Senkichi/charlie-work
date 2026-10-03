@@ -332,6 +332,147 @@ def test_window_covered_never_for_a_length_one_chain_or_an_exhausted_chain() -> 
     assert not role_selection.window_covered(_z(until), exhausted, **QUOTA)
 
 
+# --- issue #2279: the window's own (harness, model) stamp ---------------------
+#
+# A chain on ONE adapter: the shape the issue hit. B's quota death arms a
+# per-repo window stamped with B's (harness, model); once A's own ledger
+# entry lapses, selection returns A with ``skipped == ()`` -- only the stamp
+# can still attribute the window to B.
+SAME_ADAPTER = (
+    RoleEntry("devin-shell", "swe-2-high"),
+    RoleEntry("devin-shell", "gemini-flash"),
+)
+
+
+def test_stamped_window_from_a_later_entry_is_covered_after_recovery() -> None:
+    """B's stamped window is covered by B's own ledger restriction even though
+    selection skipped nothing -- the primary launched on A, not through B."""
+    b_until = NOW + timedelta(hours=2)
+    selection = role_selection.build_selection(SAME_ADAPTER, {SAME_ADAPTER[1].key: b_until}, NOW)
+    assert selection.entry == SAME_ADAPTER[0]
+    assert selection.skipped == ()
+    for window in (b_until, b_until - timedelta(minutes=30)):
+        assert role_selection.window_covered(
+            _z(window),
+            selection,
+            reason="quota_exhausted",
+            adapter_kind="devin",
+            harness="devin-shell",
+            model="gemini-flash",
+        )
+
+
+def test_stamped_window_with_the_selected_entry_itself_still_blocks() -> None:
+    """An entry's own death window keeps blocking it even after its ledger
+    entry lapsed -- the stamp equal to the selected entry explains nothing."""
+    until = NOW + timedelta(hours=2)
+    selection = role_selection.build_selection(SAME_ADAPTER, {}, NOW)
+    assert not role_selection.window_covered(
+        _z(until),
+        selection,
+        reason="quota_exhausted",
+        adapter_kind="devin",
+        harness="devin-shell",
+        model="swe-2-high",
+    )
+
+
+@pytest.mark.parametrize(
+    ("ledger", "window_delta", "stamp"),
+    [
+        # The stamp names an entry the ledger does not restrict -- nothing
+        # explains the hold.
+        pytest.param(
+            {}, timedelta(hours=1), ("devin-shell", "gemini-flash"), id="no-ledger-entry"
+        ),
+        # The ledger explains only the first hour; the rest of the window is
+        # unexplained and still blocks (same rule as skipped attribution).
+        pytest.param(
+            {SAME_ADAPTER[1].key: NOW + timedelta(hours=1)},
+            timedelta(hours=2),
+            ("devin-shell", "gemini-flash"),
+            id="outlasts-the-stamped-restriction",
+        ),
+        # B's stamp with B's restriction already lapsed: the ledger explains
+        # nothing of a still-running window once the entry freed up.
+        pytest.param(
+            {SAME_ADAPTER[1].key: NOW - timedelta(minutes=1)},
+            timedelta(hours=1),
+            ("devin-shell", "gemini-flash"),
+            id="expired-stamped-restriction",
+        ),
+    ],
+)
+def test_stamped_window_still_blocks_when_the_ledger_cannot_explain_it(
+    ledger: dict, window_delta: timedelta, stamp: tuple[str, str]
+) -> None:
+    selection = role_selection.build_selection(SAME_ADAPTER, ledger, NOW)
+    assert not role_selection.window_covered(
+        _z(NOW + window_delta),
+        selection,
+        reason="quota_exhausted",
+        adapter_kind="devin",
+        harness=stamp[0],
+        model=stamp[1],
+    )
+
+
+def test_window_stamp_on_a_different_adapter_still_blocks() -> None:
+    """The stamp must agree with the window's adapter_kind provenance -- a
+    mismatched pair is never attributable."""
+    until = NOW + timedelta(hours=2)
+    selection = role_selection.build_selection(CHAIN, {CHAIN[2].key: until}, NOW)
+    # CHAIN[2] is devin-shell/swe-1-6 (adapter "devin"); stamp it on a window
+    # recorded against "claude-code" and the attribution refuses.
+    assert not role_selection.window_covered(
+        _z(until - timedelta(hours=1)),
+        selection,
+        reason="quota_exhausted",
+        adapter_kind="claude-code",
+        harness="devin-shell",
+        model="swe-1-6",
+    )
+
+
+@pytest.mark.parametrize(
+    "stamp",
+    [
+        pytest.param({"harness": "devin-shell"}, id="harness-without-model"),
+        pytest.param({"model": "gemini-flash"}, id="model-without-harness"),
+        pytest.param({"harness": None, "model": None}, id="untagged"),
+    ],
+)
+def test_an_incomplete_role_key_stamp_keeps_the_window_blocking(stamp: dict) -> None:
+    """Both halves of the stamp or none: an untagged window is the legacy
+    shape and blocks exactly as before."""
+    until = NOW + timedelta(hours=2)
+    selection = role_selection.build_selection(SAME_ADAPTER, {SAME_ADAPTER[1].key: until}, NOW)
+    assert not role_selection.window_covered(
+        _z(until),
+        selection,
+        reason="quota_exhausted",
+        adapter_kind="devin",
+        **stamp,
+    )
+
+
+def test_reviewer_window_covered_reads_the_role_key_stamp() -> None:
+    """``reviewer_quota`` carries the same stamp under ``harness``/``model``."""
+    until = NOW + timedelta(hours=2)
+    selection = role_selection.build_selection(SAME_ADAPTER, {SAME_ADAPTER[1].key: until}, NOW)
+    quota = {
+        "throttled_until": _z(until),
+        "reason": "quota_exhausted",
+        "adapter_kind": "devin",
+        "harness": "devin-shell",
+        "model": "gemini-flash",
+    }
+    assert role_selection.reviewer_window_covered({"reviewer_quota": quota}, selection)
+    quota["harness"] = "devin-shell"
+    quota["model"] = "swe-2-high"  # the selected entry's own death: still blocks
+    assert not role_selection.reviewer_window_covered({"reviewer_quota": quota}, selection)
+
+
 # --- ledger ---------------------------------------------------------------------
 
 
