@@ -24,6 +24,8 @@ the #1548 Track-1 wave-2 split: a moved ``test_charlie_work.py`` test needs
 them, and they are this module's domain -- a bare-remote-plus-clone builder
 and a worktree-with-a-commit builder. ``test_charlie_work.py`` keeps its own
 byte-identical ``_git`` for the same reason as ``test_reconcile.py``.
+``tests/_reconcile_fixtures.py`` re-exports the builder for the reconcile
+suite rather than keeping a template-unaware copy (issue #2303).
 
 ``_FakeGH`` joined under the #1713 rework: the new
 ``tests/test_worktree_clean_head_fallback.py`` needs the same
