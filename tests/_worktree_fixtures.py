@@ -44,6 +44,13 @@ instead of ``tmp_path`` for their repo roots.
 rework adoption vs recovery / teardown / probe), and both sides need the same
 bare-remote-plus-pushed-branch builders, so they live here rather than being
 duplicated.
+
+The three repo builders (``_init_repo``, ``_clone_repo``,
+``_init_bare_remote_and_clone``) copy a per-process template when they can
+(HS-CW-4, ``tests/_git_templates.py``): same files, same config, same refs as a
+fresh build, but one commit SHA shared by every copy of a shape. Pass
+``fresh=True`` where a test needs independently-timestamped histories; the
+``_fresh`` variants are the original bodies, unchanged.
 """
 
 from __future__ import annotations
@@ -57,6 +64,7 @@ from pathlib import Path
 
 import pytest
 
+import _git_templates
 from charlie_work.github import GitHubRunResult
 from charlie_work.worktree import WorktreeCleanGH, create_worktree
 
@@ -106,7 +114,15 @@ def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)
 
 
-def _clone_repo(remote_repo: Path, repo_root: Path) -> None:
+def _clone_repo(remote_repo: Path, repo_root: Path, *, fresh: bool = False) -> None:
+    """``git clone`` plus the test identity; a template copy when ``remote_repo`` is an
+    unchanged repo this process materialized (``_git_templates``)."""
+    if not fresh and _git_templates.clone_repo(remote_repo, repo_root, build=_clone_repo_fresh):
+        return
+    _clone_repo_fresh(remote_repo, repo_root)
+
+
+def _clone_repo_fresh(remote_repo: Path, repo_root: Path) -> None:
     subprocess.run(
         ["git", "clone", str(remote_repo), str(repo_root)],
         check=True,
@@ -118,7 +134,15 @@ def _clone_repo(remote_repo: Path, repo_root: Path) -> None:
     _git(repo_root, "config", "user.name", "Test User")
 
 
-def _init_repo(repo_root: Path, bare: bool = False) -> None:
+def _init_repo(repo_root: Path, bare: bool = False, *, fresh: bool = False) -> None:
+    """One-commit ``main`` repo (``bare``: a bare clone of one); a template copy unless
+    ``fresh`` or ``CI_FLEET_TEST_REUSE=off`` (``_git_templates``)."""
+    if not fresh and _git_templates.init_repo(repo_root, bare=bare, build=_init_repo_fresh):
+        return
+    _init_repo_fresh(repo_root, bare)
+
+
+def _init_repo_fresh(repo_root: Path, bare: bool = False) -> None:
     repo_root.mkdir(parents=True, exist_ok=True)
     run = lambda args: subprocess.run(  # noqa: E731
         args, cwd=repo_root, check=True, capture_output=True, text=True
@@ -183,8 +207,21 @@ def _init_repo(repo_root: Path, bare: bool = False) -> None:
         run(["git", "commit", "-m", "initial commit"])
 
 
-def _init_bare_remote_and_clone(tmp_path: Path) -> tuple[Path, Path]:
-    """Create a bare remote repo and a local clone, return (remote, clone)."""
+def _init_bare_remote_and_clone(tmp_path: Path, *, fresh: bool = False) -> tuple[Path, Path]:
+    """Create a bare remote repo and a local clone, return (remote, clone).
+
+    A template copy unless ``fresh`` or ``CI_FLEET_TEST_REUSE=off`` (``_git_templates``).
+    """
+    if not fresh:
+        pair = _git_templates.bare_remote_and_clone(
+            tmp_path, build=_init_bare_remote_and_clone_fresh
+        )
+        if pair is not None:
+            return pair
+    return _init_bare_remote_and_clone_fresh(tmp_path)
+
+
+def _init_bare_remote_and_clone_fresh(tmp_path: Path) -> tuple[Path, Path]:
     remote = tmp_path / "remote"
     remote.mkdir(parents=True, exist_ok=True)
     _git(remote, "init", "--bare", "--initial-branch=main")
