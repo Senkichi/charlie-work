@@ -696,10 +696,10 @@ def test_apply_fixes_salvage_logs_unlinked_event_on_mismatch(tmp_path: Path) -> 
     all (every existing reconcile salvage test omits ``state_path``)."""
     from _reconcile_fixtures import (
         FakeGitHub,
-        _init_bare_remote_and_clone,
         _issue,
         _setup_completed_worktree,
     )
+    from _worktree_fixtures import _init_bare_remote_and_clone
 
     from charlie_work.reconcile import DriftItem, apply_fixes
     from charlie_work.state import empty_state
@@ -753,10 +753,10 @@ def test_apply_fixes_salvage_no_unlinked_event_when_matched(tmp_path: Path) -> N
     """Discriminating negative case for the reconcile-side probe."""
     from _reconcile_fixtures import (
         FakeGitHub,
-        _init_bare_remote_and_clone,
         _issue,
         _setup_completed_worktree,
     )
+    from _worktree_fixtures import _init_bare_remote_and_clone
 
     from charlie_work.reconcile import DriftItem, apply_fixes
     from charlie_work.state import empty_state
@@ -818,10 +818,10 @@ def test_apply_fixes_salvage_passes_corrected_body_to_pr_create(
     already writes in the untouched case) but fail this one."""
     from _reconcile_fixtures import (
         FakeGitHub,
-        _init_bare_remote_and_clone,
         _issue,
         _setup_completed_worktree,
     )
+    from _worktree_fixtures import _init_bare_remote_and_clone
 
     from charlie_work.reconcile import DriftItem, apply_fixes
     from charlie_work.state import empty_state

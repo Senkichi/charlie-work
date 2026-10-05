@@ -3,10 +3,10 @@
 Hoisted out of ``test_reconcile.py`` (issue #1284): its own minimal
 reconcile-pass ``FakeGitHub`` double, PR/issue payload builders, and a
 completed-worktree git fixture builder, all imported by other test
-modules. The bare-remote-plus-clone builder is a deliberate re-export of
-``_worktree_fixtures._init_bare_remote_and_clone`` (issue #2303) so
-reconcile tests share its per-process git template instead of a stale
-copy.
+modules. This module used to carry its own bare-remote-plus-clone
+builder, a stale copy that missed the per-process git template; its
+importers now take ``_worktree_fixtures._init_bare_remote_and_clone``
+directly (issue #2303).
 
 Issue #1559 (Track-1 split of ``test_reconcile.py``) added the shared
 check-run / review-decision / empty-stdout helpers the new sibling modules
@@ -28,7 +28,6 @@ from pathlib import Path
 from typing import Any
 
 from _worktree_fixtures import _git
-from _worktree_fixtures import _init_bare_remote_and_clone  # noqa: F401  (deliberate re-export)
 from charlie_work import github as github_module
 from charlie_work.config import OrchestratorConfig
 from charlie_work.issue_linking import linked_issue_number

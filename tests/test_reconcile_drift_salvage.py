@@ -22,12 +22,11 @@ from datetime import (
 from pathlib import Path
 from _reconcile_fixtures import (
     FakeGitHub,
-    _init_bare_remote_and_clone,
     _issue,
     _pr,
     _setup_completed_worktree,
 )
-from _worktree_fixtures import _git
+from _worktree_fixtures import _git, _init_bare_remote_and_clone
 from charlie_work.config import OrchestratorConfig
 from charlie_work.devin_shell import SessionRecord
 from charlie_work.instrumentation import close_db, query_events
