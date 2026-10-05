@@ -419,9 +419,9 @@ def test_orphan_sweep_throttle_death_then_rescue_ref_seeds_the_redispatch(
     wt_scratch: Path,
 ) -> None:
     """End to end: the real sweep's event plus a rescue ref makes create_worktree seed."""
-    import time
-
+    from _time_shift import shifted_datetime
     from _worktree_fixtures import _init_repo
+    from charlie_work import worktree as worktree_module
     from charlie_work.worktree import (
         _capture_worktree_work_to_rescue_ref,
         create_worktree,
@@ -437,8 +437,11 @@ def test_orphan_sweep_throttle_death_then_rescue_ref_seeds_the_redispatch(
     (info.path / "work.txt").write_text("603 lines of real work\n", encoding="utf-8")
 
     _sweep(paths, sessions_dir, config, gh)
-    time.sleep(1.1)  # the rescue ref is made at redispatch, after the death
-    capture = _capture_worktree_work_to_rescue_ref(root, info.path, ISSUE)
+    # The rescue ref is made at redispatch, after the death: stamp it 2 s later
+    # instead of sleeping across the whole-second boundary.
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(worktree_module, "datetime", shifted_datetime(2))
+        capture = _capture_worktree_work_to_rescue_ref(root, info.path, ISSUE)
     assert capture.error is None
     assert remove_worktree(root, info.path, force=True, branch=branch)
 
