@@ -331,7 +331,9 @@ def test_empty_attempt_snapshot_cannot_beat_the_rescue_ref(
     """B1: ``create_worktree`` captures the rescue ref, removes the worktree, then
     snapshots the attempt ref. If removal crosses a second boundary the (whole
     second) attempt reflog reads newer, and the attempt ref can be empty or a
-    subset. The real capture-then-snapshot sequence, with a forced ~1s gap."""
+    subset. The real capture-then-snapshot sequence, with every git write after
+    removal stamped 2 s ahead (``GIT_COMMITTER_DATE``) instead of a 1.1 s sleep."""
+    from charlie_work import attempt_resume as attempt_resume_module
     from charlie_work import worktree as worktree_module
 
     config = OrchestratorConfig()
@@ -344,14 +346,31 @@ def test_empty_attempt_snapshot_cannot_beat_the_rescue_ref(
 
     real_remove = worktree_module.remove_worktree
 
-    def slow_remove(*args, **kwargs):
-        time.sleep(1.1)
+    def late_remove(*args, **kwargs):
+        monkeypatch.setenv("GIT_COMMITTER_DATE", f"@{int(time.time()) + 2} +0000")
         return real_remove(*args, **kwargs)
 
-    monkeypatch.setattr(worktree_module, "remove_worktree", slow_remove)
+    monkeypatch.setattr(worktree_module, "remove_worktree", late_remove)
+    real_candidates = attempt_resume_module.preserved_ref_candidates
+    offered: list[list] = []
+
+    def recording_candidates(*args, **kwargs):
+        found = real_candidates(*args, **kwargs)
+        offered.append(found)
+        return found
+
+    monkeypatch.setattr(attempt_resume_module, "preserved_ref_candidates", recording_candidates)
 
     info2 = create_worktree(repo, BRANCH, base_ref="HEAD", issue_number=ISSUE, config=config)
 
+    # Positive control: the race B1 is about really happened -- the attempt ref
+    # reads newer than the rescue ref -- and the rescue ref still wins.
+    assert offered, "preserved_ref_candidates was never consulted"
+    newest = {
+        kind: max(ref.created_at for ref in offered[-1] if ref.kind == kind)
+        for kind in ("rescue", "attempt")
+    }
+    assert newest["attempt"] > newest["rescue"]
     assert info2.rescue_capture is not None and info2.rescue_capture.ref_name is not None
     assert info2.attempt_snapshot is not None and info2.attempt_snapshot.ref_name is not None
     assert info2.resumed_attempt is not None
