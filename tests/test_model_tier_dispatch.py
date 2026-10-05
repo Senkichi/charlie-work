@@ -222,6 +222,29 @@ def test_a_mixed_batch_launches_each_tier_on_its_entry_and_keeps_one_manifest(
     assert sorted(r["issue_number"] for r in results["results"]) == [123, 124]
 
 
+def test_a_mixed_batch_paces_the_launch_between_tier_groups(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The tier split must not drop the launch stagger at the group boundary."""
+    import dataclasses
+
+    calls = _spy(monkeypatch)
+    sleeps: list[float] = []
+    monkeypatch.setattr("charlie_work.worker_launch_gate.time.sleep", sleeps.append)
+    app = _app(tmp_path, FRESH)
+    app.config = dataclasses.replace(
+        app.config,
+        dispatch=dataclasses.replace(app.config.dispatch, launch_stagger_seconds=7),
+    )
+    plain = copy.deepcopy(app.gh.issues[0])
+    plain.update(number=124, title="Fix sort", url="https://example.test/issues/124")
+    plain["labels"] = [{"name": "automated-ready"}]
+    app.gh.issues.append(plain)
+    _run(app, FRESH)
+    assert _launched(calls) == {123: OPUS.key, 124: PRIMARY.key}
+    assert sleeps == [7]
+
+
 def test_an_empty_prefix_turns_routing_off(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

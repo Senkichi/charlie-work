@@ -450,12 +450,8 @@ def _dispatch_impl(
                 recovery_record = prev_entry
 
             session_requests.append(
-                SessionRequest(
-                    issue_number=issue_number,
-                    issue_title=str(full_issue.get("title") or ""),
-                    prompt_path=prompt_path,
-                    branch_name=branch_name,
-                    recovery=recovery_record,
+                SessionRequest.for_issue(
+                    full_issue, issue_number, prompt_path, branch_name, recovery=recovery_record
                 )
             )
 

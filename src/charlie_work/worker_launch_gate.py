@@ -631,6 +631,10 @@ def _launch_workers(
     results: list[SessionDispatchResult] = []
     adapters: set[str] = set()
     for selection, tier, group in groups:
+        if results and group and settings.launch_stagger_seconds > 0 and not settings.dry_run:
+            # A batch split by tier is still one burst: pace the boundary launch
+            # the way ``dispatch_sessions`` paces launches within a group.
+            time.sleep(settings.launch_stagger_seconds)
         group_settings = settings
         if selection is not None and settings.role == "worker" and selection.is_fallback:
             # Issue #2086: worker-role settings follow the chain entry -- the
