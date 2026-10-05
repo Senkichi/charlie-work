@@ -247,6 +247,13 @@ class LabelConfig:
     human_needed: str = "agent:human-needed"
     prose_only_deps: str = "agent:prose-only-deps"
     merge_hold: str = "agent:merge-hold"
+    # TIS-CW-7: the generic issue priority. ``<prefix><level>`` (default
+    # ``priority:critical`` / ``high`` / ``normal`` / ``low``) orders fresh
+    # dispatch and puts a critical issue's PR at the front of the Aviator queue
+    # (``issue_priority``). A prefix, not a label: whoever files the issue
+    # creates the label, so it is not a member of ``all`` or
+    # ``workflow_labels``. An empty prefix turns both off.
+    priority_prefix: str = "priority:"
     # Issue #1266: mechanical escalations (reason_class == "mechanical") land
     # here instead of ``human_needed``, so human attention is reserved for
     # judgment calls. Unlike ``prose_only_deps`` -- the only other
@@ -1185,6 +1192,13 @@ class AutoMergeConfig:
     # merged, so no new post-merge bookkeeping is added here. Default None
     # preserves today's self-merge behavior byte-for-byte.
     mergequeue_label: Annotated[str | None, Typed, NonEmpty] = None
+    # TIS-CW-7: Aviator's skip-line label (``merge_rules.labels.skip_line`` in the
+    # repo's ``.aviator/config.yml``). The hand-off adds it, before
+    # ``mergequeue_label``, to a PR whose linked issue carries
+    # ``<labels.priority_prefix>critical``, so Aviator queues it at the front.
+    # Only the hand-off reads it, so it does nothing unless ``mergequeue_label``
+    # is set. ``null`` is the kill switch.
+    mergequeue_skip_line_label: Annotated[str | None, Typed, NonEmpty] = "mergequeue-skip-line"
     # Issue #1194: GitHub account login of the merge-queue bot (e.g.
     # "aviator-app[bot]") whose branch sync-merges the #502 unauthorized-merge
     # tripwire may recognize as approval-covered. Deployment config, not
@@ -1256,7 +1270,7 @@ class AutoMergeConfig:
         # Normalizations (not rules): the label/login thread verbatim into
         # `gh pr edit --add-label <label>` / a commit-author comparison, so surrounding
         # whitespace must not survive; the wedge window is stored as a float.
-        for name in ("mergequeue_label", "queue_bot_login"):
+        for name in ("mergequeue_label", "mergequeue_skip_line_label", "queue_bot_login"):
             value = getattr(self, name)
             if isinstance(value, str):
                 object.__setattr__(self, name, value.strip())
