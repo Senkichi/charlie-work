@@ -1174,12 +1174,8 @@ def _dispatch_rework_impl(
         if pr_state_for_rescue.get("rescue_attempted"):
             rescue_issue_numbers.add(issue_number)
         session_requests.append(
-            SessionRequest(
-                issue_number=issue_number,
-                issue_title=str(full_issue.get("title") or ""),
-                prompt_path=rework_prompt_path,
-                branch_name=branch_name,
-                rework=True,
+            SessionRequest.for_issue(
+                full_issue, issue_number, rework_prompt_path, branch_name, rework=True
             )
         )
 

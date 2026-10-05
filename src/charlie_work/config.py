@@ -292,6 +292,12 @@ class LabelConfig:
     # like ``collect_gate_exempt``, this is a human-applied escape hatch, not
     # a state the label-transition machine ever adds or removes on its own.
     cross_repo_override: str = "agent:cross-repo-override"
+    # TIS-CW-6: the generic per-issue model tier. An issue labelled
+    # ``<prefix><tier>`` (default ``model:opus``) launches on the first worker
+    # chain entry of that model family (``model_tier``). A prefix, not a label:
+    # whoever files the issue creates the label, so it is not a member of
+    # ``all`` or ``workflow_labels``. An empty prefix turns the routing off.
+    model_tier_prefix: str = "model:"
 
     @property
     def terminal(self) -> set[str]:

@@ -1608,6 +1608,10 @@
 "dashboard.rollup_interval_seconds": [
 "dashboard",
 "rollup_interval_seconds"
+],
+"labels.model_tier_prefix": [
+"labels",
+"model_tier_prefix"
 ]
 },
 "seeds": {
@@ -2054,7 +2058,8 @@
 "dashboard.port": {},
 "dashboard.poll_interval_seconds": {},
 "dashboard.collector_interval_seconds": {},
-"dashboard.rollup_interval_seconds": {}
+"dashboard.rollup_interval_seconds": {},
+"labels.model_tier_prefix": {}
 },
 "cells": {
 "labels": [
@@ -18688,6 +18693,50 @@
 "R",
 "R",
 "R"
+],
+"labels.model_tier_prefix": [
+"Aff9e",
+"Af79e",
+"A69a2",
+"A235d",
+"Ad52e",
+"Afcf7",
+"Ac7f9",
+"Afa1f",
+"A172e",
+"Af27d",
+"Affaa",
+"A00c1",
+"Ad5f2",
+"A0a0d",
+"A3795",
+"A241c",
+"A51fb",
+"A109e",
+"Ac533",
+"A55d9",
+"A6050",
+"A12d7",
+"Aaebd",
+"A0d0e",
+"A07a4",
+"A8ca5",
+"A408f",
+"A790b",
+"A3d03",
+"A5543",
+"A01e2",
+"A6410",
+"A140a",
+"A3933",
+"A2f4f",
+"Aae29",
+"A7283",
+"Ab801",
+"Ac6e5",
+"A5e1b",
+"A3f5c",
+"A7229"
 ]
 },
 "sections": {
