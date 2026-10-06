@@ -61,19 +61,23 @@ def served(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Any]:
 def test_history_is_served_from_the_cache(served) -> None:
     status, body, resp = _get(served, "/history?tab=quality&range=7d")
     assert status == 200 and resp.getheader("Content-Security-Policy") == CSP
-    assert '<a id="tab-quality" href="/history?tab=quality&amp;range=7d" aria-current' in body
+    assert '<button type="button" id="tab-quality" data-tab="quality" aria-pressed="true"' in body
     assert 'class="takeaway"' in body
-    assert served.httpd.app.history.misses == 1
+    assert served.httpd.app.history.misses == 4  # one range: every tab (for the tab dots)
     _get(served, "/history?range=7d&tab=quality")
     _get(served, "/history?tab=QUALITY&range=7d")
-    assert served.httpd.app.history.misses == 1  # same (tab, range): no second query
-    _get(served, "/history")  # defaults: flow, 7d
-    assert served.httpd.app.history.misses == 2
+    _get(served, "/history")  # defaults: flow, 7d -- the same four cache keys
+    status, frag, _ = _get(served, "/history/fragment?range=7d")
+    assert status == 200 and frag.startswith('<div id="hist"') and "<html" not in frag
+    assert served.httpd.app.history.misses == 4  # same range: no second query
+    _get(served, "/history/fragment?range=30d")
+    assert served.httpd.app.history.misses == 8  # the range is part of the key
 
 
 def test_history_unknown_params_fall_back_and_subpaths_404(served) -> None:
     status, body, _ = _get(served, "/history?tab=<script>&range=1y")
-    assert status == 200 and 'id="tab-flow" href="/history?tab=flow&amp;range=7d" aria' in body
+    assert status == 200 and 'id="tab-flow" data-tab="flow" aria-pressed="true"' in body
+    assert 'id="range-7d" data-range="7d" aria-pressed="true"' in body
     assert "<script>&" not in body
     for path in ("/history/flow", "/nope/x"):  # house-style 404: nav, skip link, h1
         status, body, resp = _get(served, path)

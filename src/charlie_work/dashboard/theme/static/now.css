@@ -1,18 +1,10 @@
-/* Now page layout (pages/now*.py). Served after dashboard.css; colours come only from the
-   --lj-* custom properties generated from tokens.json (no literals, no new properties).
-   The CSP forbids inline styles, so every variable geometry is an SVG attribute. */
+/* Shared page frame (pages/now.py, drill_shell.py, history.py): header, nav, source chips,
+   banners, skip link, key help, and the chart-svg classes charts/*.py emit. The Now page's
+   own layout lives in now-page.css. Served after dashboard.css; colours come only from the
+   --lj-* custom properties generated from tokens.json (no literals). The CSP forbids inline
+   styles, so every variable geometry is an SVG attribute. */
 
 html, body { min-height: 100%; }
-.shell {
-  display: grid;
-  grid-template-columns: minmax(0, 3fr) minmax(0, 2fr);
-  grid-template-rows: auto auto minmax(0, 1fr);
-  column-gap: var(--lj-space-6);
-  row-gap: var(--lj-space-3);
-  max-width: 1600px;
-  margin: 0 auto;
-  padding: var(--lj-space-4) var(--lj-space-5) var(--lj-space-4);
-}
 .sr {
   position: absolute; width: 1px; height: 1px; overflow: hidden;
   clip: rect(0 0 0 0); clip-path: inset(50%); white-space: nowrap;
@@ -24,16 +16,20 @@ a.n:hover { text-decoration: none; border-bottom-style: solid; }
 /* Numerals. The vendored Fraunces subset has no tnum feature (measured: "1111" and "0000"
    differ by 30% with tabular-nums on), so numbers that align in columns or refresh in
    place use Inter, whose tnum works; Fraunces keeps the isolated headline numerals. */
-.n, .stage-n, .big { font-variant-numeric: lining-nums tabular-nums; }
-.row .age, .repos td, .repos td .n, .cap-row .val, .cap-row .val .n, .fresh .n, .nd-row .hn {
-  font-family: var(--lj-sans); font-variant-numeric: lining-nums tabular-nums;
-}
+.n, .big { font-variant-numeric: lining-nums tabular-nums; }
+.fresh .n, .hn { font-family: var(--lj-sans); font-variant-numeric: lining-nums tabular-nums; }
 .skip { position: absolute; left: var(--lj-space-4); top: -100px; z-index: 20; background: var(--lj-card); padding: var(--lj-space-2) var(--lj-space-3); border: 1px solid var(--lj-ink); }
 .skip:focus { top: var(--lj-space-2); }
+.calm { font-family: var(--lj-serif); font-style: italic; font-size: var(--lj-text-5); color: var(--lj-gray-text); padding: var(--lj-space-4) 0; }
+.calm-sm { font-family: var(--lj-serif); font-style: italic; color: var(--lj-gray-text); }
+.sub { font-size: var(--lj-text-2); color: var(--lj-gray-text); margin: var(--lj-space-1) 0; }
+.sub .n { font-family: var(--lj-serif); font-weight: 600; color: var(--lj-ink); }
+.hn { font-weight: 600; color: var(--lj-ink); }
 
 /* ---------- header ---------- */
 .top { grid-column: 1 / -1; border-bottom: var(--lj-stroke-accentRule) solid var(--lj-ink); padding-bottom: var(--lj-space-2); }
 .top-line { display: flex; align-items: baseline; gap: var(--lj-space-4); flex-wrap: wrap; }
+.top-line .spacer { flex: 1; }
 .brand { font-family: var(--lj-serif); font-size: var(--lj-text-6); font-weight: 600; letter-spacing: -0.01em; }
 .brand em { font-weight: 400; color: var(--lj-gray-text); }
 .views { display: flex; gap: var(--lj-space-3); font-size: var(--lj-text-3); }
@@ -61,97 +57,16 @@ a.n:hover { text-decoration: none; border-bottom-style: solid; }
   font-weight: 600;
 }
 /* Client-side "Not updating" banner (dashboard.js): outside #now, so swaps never touch it. */
-.client-status { max-width: 1600px; margin: 0 auto; padding: 0 var(--lj-space-5); }
+.client-status { padding: 0 var(--lj-space-5); }
+body:not(.now) .client-status { max-width: 1600px; margin: 0 auto; }
 .client-status > .banner { margin-top: var(--lj-space-3); border-color: var(--lj-warn); }
 /* Stale page: every number goes muted so nothing reads as live (cleared on next success). */
-html.is-stale #now .n, html.is-stale #now .big, html.is-stale #now .age,
-html.is-stale #now .stage-n, html.is-stale #now .asof b { color: var(--lj-gray-text); }
-html.is-stale #now svg .bar, html.is-stale #now svg .fill, html.is-stale #now svg .hbar { fill: var(--lj-gray); }
+html.is-stale #now .n, html.is-stale #now .big, html.is-stale #now .num,
+html.is-stale #now .age, html.is-stale #now .asof b { color: var(--lj-gray-text); }
+html.is-stale #now svg .bar, html.is-stale #now svg .fill, html.is-stale #now svg .hbar,
+html.is-stale #now svg .hb-fill, html.is-stale #now svg .cbar { fill: var(--lj-gray); }
 
-/* ---------- Needs me ---------- */
-.needs { grid-column: 1; min-width: 0; }
-.needs-head { display: flex; align-items: baseline; gap: var(--lj-space-3); flex-wrap: wrap; padding-bottom: var(--lj-space-2); }
-.needs-head h2 { font-size: var(--lj-text-5); }
-.needs-head a.big { font-family: var(--lj-serif); font-weight: 600; font-size: var(--lj-text-7); line-height: 1; border-bottom: 0; font-variant-numeric: lining-nums tabular-nums; }
-.split { font-size: var(--lj-text-3); color: var(--lj-gray-text); }
-.split .grp-count .n { font-family: var(--lj-serif); font-weight: 600; color: var(--lj-ink); }
-.split .grp-count.zero, .split .grp-count.zero .n { color: var(--lj-gray-text); font-weight: 400; }
-.cols, .row { display: grid; grid-template-columns: 14px 52px 84px 76px minmax(0, 1fr) minmax(0, 270px); column-gap: var(--lj-space-3); align-items: baseline; }
-.cols { border-bottom: 1px solid var(--lj-rule); padding: 0 var(--lj-space-2) var(--lj-space-1); }
-.cols .label:nth-child(2) { text-align: right; }
-.cols .label.r { text-align: right; }
-ol.ledger-now { list-style: none; margin: 0; padding: 0; }
-.grp { display: flex; align-items: baseline; gap: var(--lj-space-2); padding: var(--lj-space-2) var(--lj-space-2) 2px; border-bottom: 1px solid var(--lj-rule); }
-.grp .label { color: var(--lj-ink); white-space: nowrap; }
-.grp .meta { font-size: var(--lj-text-1); }
-.row { padding: 5px var(--lj-space-2); border-bottom: 1px solid var(--lj-rule); font-size: var(--lj-text-3); }
-.row:hover, .row:focus-within { background: var(--lj-raised); }
-/* Dark danger text is 4.23:1 on --lj-raised but 4.64:1 on --lj-card: danger rows highlight
-   on the card surface (in light the two tokens are equal). */
-.row.tone-danger:hover, .row.tone-danger:focus-within, .row.tone-danger.is-sel { background: var(--lj-card); }
-.row .g { font-size: var(--lj-text-2); color: var(--lj-gray-text); text-align: center; }
-.row .age { text-align: right; font-weight: 600; white-space: nowrap; border-bottom: 0; }
-.row .age.unk { color: var(--lj-gray-text); font-weight: 400; }
-.row .repo { color: var(--lj-gray-text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: var(--lj-text-2); }
-.row .kind { font-size: var(--lj-text-1); font-weight: 600; text-transform: uppercase; letter-spacing: var(--lj-label-spacing); color: var(--lj-gray-text); white-space: nowrap; }
-/* One line at desktop width (the ledger must fit one 1440x900 screen); the selected (j/k)
-   or focused row opens to two lines, so the full decision text is reachable by keyboard,
-   not only by a hover title. At <=1280px the reason column is wide: two lines always. */
-.row .why { min-width: 0; overflow: hidden; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 1; line-clamp: 1; }
-.row.is-sel .why, .row:focus-within .why { -webkit-line-clamp: 2; line-clamp: 2; }
-.row .why a { text-decoration: none; }
-.row .why b.ref { font-family: var(--lj-serif); font-weight: 600; }
-.row .why a:hover { text-decoration: underline; }
-.row .cmds { display: flex; flex-direction: column; align-items: flex-end; min-width: 0; gap: 2px; }
-.row .cmd { display: flex; align-items: baseline; gap: var(--lj-space-2); min-width: 0; max-width: 100%; justify-content: flex-end; }
-.row .cmd code { color: var(--lj-gray-text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
-.row .cmd.none { color: var(--lj-gray-text); }
-.row .cmd2 { flex: none; gap: var(--lj-space-1); }
-.row .cmd2 .or { color: var(--lj-gray-text); font-style: italic; font-size: var(--lj-text-1); }
-button.copy.alt { text-transform: none; letter-spacing: 0; font-weight: 400; }
-li.more { padding: 3px var(--lj-space-2) 3px calc(14px + 52px + 2 * var(--lj-space-3) + var(--lj-space-2)); border-bottom: 1px solid var(--lj-rule); }
-.more-btn { font-size: var(--lj-text-2); color: var(--lj-gray-text); border: 0; background: none; padding: 0; text-decoration: underline dotted; cursor: pointer; }
-.more-btn:hover { color: var(--lj-ink); }
-html.js ol.ledger-now:not(.is-filtering) > .row.over:not(.is-open) { display: none; }
-html:not(.js) li.more, ol.ledger-now.is-filtering > li.more { display: none; }
-button.copy {
-  font-size: var(--lj-text-1); padding: 0 var(--lj-space-2); line-height: 1.6;
-  border-radius: var(--lj-radius-tab); flex: none; text-transform: uppercase;
-  letter-spacing: var(--lj-label-spacing); font-weight: 600; color: var(--lj-gray-text);
-}
-.row:hover button.copy, button.copy:focus-visible { color: var(--lj-ink); border-color: var(--lj-ink); }
-.row.tone-danger { box-shadow: inset 3px 0 0 var(--lj-danger); }
-.row.tone-danger .g, .row.tone-danger .kind, .row.tone-danger .age { color: var(--lj-danger); }
-.row.tone-danger .why { font-weight: 600; }
-.row.tone-warn { box-shadow: inset 3px 0 0 var(--lj-warn); }
-.row.tone-warn .g, .row.tone-warn .kind, .row.tone-warn .age { color: var(--lj-warn); }
-.calm { font-family: var(--lj-serif); font-style: italic; font-size: var(--lj-text-5); color: var(--lj-gray-text); padding: var(--lj-space-4) 0; border-bottom: 1px solid var(--lj-rule); }
-.calm-sm { font-family: var(--lj-serif); font-style: italic; color: var(--lj-gray-text); }
-
-/* ---------- right rail ---------- */
-.rail { grid-column: 2; min-width: 0; display: flex; flex-direction: column; gap: var(--lj-space-4); padding-left: var(--lj-space-5); border-left: 1px solid var(--lj-rule); }
-.rail h2 { font-size: var(--lj-text-4); display: flex; align-items: baseline; gap: var(--lj-space-2); flex-wrap: wrap; }
-.rail h2 .meta { font-family: var(--lj-sans); font-weight: 400; margin-left: auto; letter-spacing: 0; }
-.rail h2 .meta .n { font-family: var(--lj-serif); font-weight: 600; color: var(--lj-ink); }
-.sub { font-size: var(--lj-text-2); color: var(--lj-gray-text); margin: var(--lj-space-1) 0; }
-.sub .n { font-family: var(--lj-serif); font-weight: 600; color: var(--lj-ink); }
-
-/* Flow pipeline: HTML text in CSS px (never shrinks with the rail), aria-hidden SVG bars. */
-ol.pipe { list-style: none; margin: var(--lj-space-2) 0 0; padding: 0; display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); align-items: end; }
-.pipe .stage { display: flex; flex-direction: column; align-items: center; justify-content: flex-end; min-width: 0; min-height: 118px; }
-.pipe .stage.unit-sep { border-left: 1px dashed var(--lj-rule); }
-.stage-n { font-family: var(--lj-serif); font-weight: 600; font-size: var(--lj-text-6); line-height: 1.1; color: var(--lj-ink); margin-bottom: 4px; }
-.stage-n .n { color: inherit; }
-.stage-n.unk { color: var(--lj-gray-text); font-weight: 400; }
-.stage-n.done { color: var(--lj-green-text); }
-svg.pbar { display: block; width: 60%; }
-.pipe .bar.unk { display: flex; align-items: center; justify-content: center; width: 92%; height: 75px; border: 1px dashed var(--lj-gray); text-align: center; }
-.stage-l { position: relative; align-self: stretch; text-align: center; border-top: 1px solid var(--lj-gray); padding-top: var(--lj-space-1); font-size: var(--lj-text-2); font-weight: 600; color: var(--lj-gray-text); line-height: 1.25; overflow-wrap: anywhere; }
-.pipe .stage.unit-sep .stage-l { border-top-style: dashed; }
-.pipe .stage + .stage:not(.done) .stage-l::before { content: "\25B8"; position: absolute; left: 0; top: -0.72em; transform: translateX(-50%); color: var(--lj-gray); font-size: var(--lj-text-2); line-height: 1; }
-.stage-s { font-size: var(--lj-text-2); color: var(--lj-gray-text); line-height: 1.2; }
-.rework { font-size: var(--lj-text-2); color: var(--lj-gray-text); margin-top: var(--lj-space-1); }
-.hn { font-family: var(--lj-serif); font-weight: 600; color: var(--lj-ink); }
+/* ---------- chart svg (charts/*.py) ---------- */
 svg .bar { fill: var(--lj-ink); }
 svg .bar.zero { fill: none; stroke: var(--lj-gray); stroke-width: 1; }
 svg .bar.done { fill: var(--lj-green); }
@@ -160,27 +75,9 @@ svg .arrow { stroke: var(--lj-gray); stroke-width: 1; fill: none; }
 svg .arrow.rework { stroke-dasharray: 2 2; }
 svg .unit-sep { stroke: var(--lj-rule); stroke-width: 1; stroke-dasharray: 3 3; }
 svg .arrowhead { fill: var(--lj-gray); }
-/* Not-dispatchable bars: HTML label | aria-hidden SVG bar | HTML count. */
-/* One grid for the whole list (rows are display: contents) so every bar starts at the
-   same x: the label column is as wide as the longest label. */
-ul.nd-list { list-style: none; margin: var(--lj-space-1) 0 0; padding: 0; display: grid; grid-template-columns: auto minmax(60px, 1fr) 2.5em; column-gap: var(--lj-space-3); row-gap: 4px; align-items: center; }
-.nd-row { display: contents; }
-.nd-row .hl { font-size: var(--lj-text-2); color: var(--lj-ink); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.nd-row .hn { text-align: right; font-size: var(--lj-text-3); font-weight: 600; }
-svg.hbar-svg { display: block; width: 100%; height: 12px; }
 svg .hbar { fill: var(--lj-gray); }
 svg .hbar-track { fill: var(--lj-rule); }
-
-/* capacity bullets */
-.cap-row { display: grid; grid-template-columns: 168px minmax(0, 1fr) 120px; column-gap: var(--lj-space-3); align-items: center; padding: 5px 0; border-bottom: 1px solid var(--lj-rule); }
-.cap-row:last-child { border-bottom: 0; }
-.cap-row .who { font-size: var(--lj-text-3); min-width: 0; }
-.cap-row .who small { display: block; font-size: var(--lj-text-1); color: var(--lj-gray-text); line-height: 1.35; }
-.cap-row .bar { display: flex; align-items: center; gap: var(--lj-space-2); min-width: 0; }
-.cap-row .val { text-align: right; font-size: var(--lj-text-2); color: var(--lj-gray-text); white-space: nowrap; }
-.cap-row .val .n { font-weight: 600; font-size: var(--lj-text-4); color: var(--lj-ink); }
-.cap-row .val .over { display: block; font-weight: 600; }
-.cap-row .unknown { font-size: var(--lj-text-1); color: var(--lj-gray-text); font-style: italic; white-space: nowrap; }
+svg.hbar-svg { display: block; width: 100%; height: 12px; }
 svg.bullet-svg { display: block; flex: 1 1 auto; min-width: 0; height: 16px; }
 svg .trk { fill: var(--lj-rule); }
 svg .fill { fill: var(--lj-ink); }
@@ -189,99 +86,26 @@ svg .captick { stroke: var(--lj-ink); stroke-width: 2; }
 svg .trk-open { stroke: var(--lj-gray); stroke-width: 2; stroke-dasharray: 4 3; }
 svg .parked { fill: none; stroke: var(--lj-gray); stroke-width: 1; stroke-dasharray: 2 1; }
 svg .demand { stroke: var(--lj-ink); stroke-width: 1.5; }
-
-/* per-repo ledger: scrolls inside its own container when wider than the rail */
-.table-scroll { overflow-x: auto; max-width: 100%; }
-.table-scroll:focus-visible { outline-offset: 0; }
-table.repos { width: 100%; border-collapse: collapse; font-size: var(--lj-text-2); table-layout: auto; }
-.repos th { font-size: var(--lj-text-1); letter-spacing: 0.04em; padding: 0 2px 3px; border-bottom: 1px solid var(--lj-ink); text-align: right; white-space: nowrap; }
-.repos th.l { text-align: left; }
-.repos td { padding: 4px 2px; border-bottom: 1px solid var(--lj-rule); text-align: right; white-space: nowrap; vertical-align: middle; }
-.repos tbody tr:hover { background: var(--lj-raised); }
-.repos td.rname { text-align: left; font-weight: 600; max-width: 7em; overflow: hidden; text-overflow: ellipsis; }
-.repos td .n { font-weight: 600; color: var(--lj-ink); }
-.repos td.pass { color: var(--lj-gray-text); }
-.repos td.pass .n { font-weight: 400; color: inherit; }
-.repos td.need.has .n { font-size: var(--lj-text-3); }
-.repos tr.is-stale td { background: var(--lj-raised); }
-.repos tr.is-stale td:first-child { box-shadow: inset 3px 0 0 var(--lj-warn); }
-.repos .muted { color: var(--lj-gray-text); font-size: var(--lj-text-1); }
 svg.mini { display: inline-block; width: 4px; height: 12px; margin-right: 3px; vertical-align: -1px; }
 svg .mbar { fill: var(--lj-series-3); }
 svg .mzero { fill: var(--lj-rule); }
-.repos .rnr { display: inline-flex; align-items: center; gap: 3px; }
 svg.rsvg { width: 36px; height: 12px; flex: none; }
 
-/* ---------- mid (700-1280): Needs me full width, rail below it as two columns ---------- */
-@media (max-width: 1280px) {
-  .shell { grid-template-columns: minmax(0, 1fr); }
-  .rail {
-    grid-column: 1; border-left: 0; padding-left: 0; padding-top: var(--lj-space-4);
-    border-top: 1px solid var(--lj-rule);
-    display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); column-gap: var(--lj-space-6);
-    grid-template-areas: "flow cap" "nd cap" "repos repos"; align-items: start;
-  }
-  .rail > .flow-now { grid-area: flow; }
-  .rail > .nd-now { grid-area: nd; }
-  .rail > .cap-now { grid-area: cap; }
-  .rail > .repos-now { grid-area: repos; }
-  .row .why { -webkit-line-clamp: 2; line-clamp: 2; }
-}
-@media (max-width: 999px) {
-  .rail { display: flex; flex-direction: column; }
-}
-/* Command moves to its own line under the reason before the reason column gets narrow. */
-@media (max-width: 960px) {
-  .cols { grid-template-columns: 14px 52px 84px 76px minmax(0, 1fr); }
-  .cols .label.r { display: none; }
-  .row {
-    grid-template-columns: 14px 52px 84px 76px minmax(0, 1fr);
-    grid-template-areas: "g age repo kind why" ". . cmd cmd cmd"; row-gap: 2px;
-  }
-  .row .g { grid-area: g; }
-  .row .age { grid-area: age; }
-  .row .repo { grid-area: repo; }
-  .row .kind { grid-area: kind; }
-  .row .why { grid-area: why; }
-  .row .cmds { grid-area: cmd; align-items: flex-start; }
-  .row .cmd { justify-content: flex-start; }
-}
 @media (max-width: 699px) {
-  .shell { display: block; padding: var(--lj-space-3) var(--lj-space-4); } /* 16px gutters */
-  .rail, .cols, .fresh .thr { display: none; }
   .top-line { gap: var(--lj-space-2) var(--lj-space-3); }
   .asof { margin-left: 0; width: 100%; }
   .banner { margin-top: var(--lj-space-2); }
-  .needs-head { padding-top: var(--lj-space-3); }
-  .row {
-    grid-template-columns: 14px 52px minmax(0, 1fr) auto;
-    grid-template-areas: "g age repo kind" "why why why why" "cmd cmd cmd cmd";
-    row-gap: 2px;
-    padding: var(--lj-space-2) var(--lj-space-1) var(--lj-space-2) var(--lj-space-2);
-  }
-  .row .g { grid-area: g; }
-  .row .age { grid-area: age; text-align: left; }
-  .row .repo { grid-area: repo; }
-  .row .kind { grid-area: kind; text-align: right; }
-  .row .why { grid-area: why; overflow-wrap: anywhere; -webkit-line-clamp: unset; line-clamp: none; }
-  .row .cmds { grid-area: cmd; align-items: stretch; }
-  .row .cmd { justify-content: flex-start; }
-  .row .cmd > code { flex: 1 1 auto; }
-  .row .cmd2 { margin-left: var(--lj-space-2); }
-  li.more { padding-left: var(--lj-space-2); }
-  .row button.copy { padding: 2px var(--lj-space-3); }
+  .fresh .thr { display: none; }
 }
 
 /* ---------- interaction (dashboard.js) ---------- */
 .themebtn { font-size: var(--lj-text-1); text-transform: uppercase; letter-spacing: var(--lj-label-spacing); color: var(--lj-gray-text); }
-.needs-filter { padding: var(--lj-space-2) 0; }
-.needs-filter input {
-  width: 100%; font: inherit; font-size: var(--lj-text-2); color: var(--lj-ink);
-  background: var(--lj-card); border: var(--lj-stroke-cardHairline) solid var(--lj-hair);
-  border-radius: var(--lj-radius-button); padding: var(--lj-space-1) var(--lj-space-3);
+button.copy {
+  font-size: var(--lj-text-1); padding: 0 var(--lj-space-2); line-height: 1.6;
+  border-radius: var(--lj-radius-tab); flex: none; text-transform: uppercase;
+  letter-spacing: var(--lj-label-spacing); font-weight: 600; color: var(--lj-gray-text);
 }
-ol.ledger-now > [hidden] { display: none; }
-.row.is-sel { background: var(--lj-raised); outline: 2px solid var(--lj-ink); outline-offset: -2px; }
+button.copy:hover, button.copy:focus-visible { color: var(--lj-ink); border-color: var(--lj-ink); }
 .keyhelp {
   position: fixed; right: var(--lj-space-5); bottom: var(--lj-space-5); z-index: 10;
   background: var(--lj-card); border: var(--lj-stroke-cardHairline) solid var(--lj-hair);
