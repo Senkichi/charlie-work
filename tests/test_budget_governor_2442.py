@@ -40,6 +40,7 @@ from charlie_work.github_transport.shared_budget import (
     merge_github_rate,
     token_fingerprint,
 )
+from charlie_work.local_issues import LocalFileGitHub
 from charlie_work.instrumentation import close_db, query_events
 from charlie_work.budget_gates import budget_deferral, budget_gate_for
 from charlie_work.orchestration.misc_review_verdicts import _run_review_reap_sweeps
@@ -110,12 +111,15 @@ def _deferring(remaining: int | None) -> set[str]:
 
 RESERVE_LANES = {"reconcile", "drift", "review_reap", "ci_reclaim"}
 SCAN_LANES = {"intake", "dispatch_rework", "dispatch", "dispatch_reviews", "quota_probe"}
-FLOOR_LANES = {"deescalate", "local_lane"}
+FLOOR_LANES = {"deescalate"}
+EXEMPT_LANES = {"local_lane"}
 ESSENTIAL_LANES = {"merge", "label_write", "unauthorized_merge_tripwire"}
 
 
 def test_the_mapping_covers_exactly_the_documented_lanes() -> None:
-    assert set(LANE_TIERS) == RESERVE_LANES | SCAN_LANES | FLOOR_LANES | ESSENTIAL_LANES
+    assert set(LANE_TIERS) == (
+        RESERVE_LANES | SCAN_LANES | FLOOR_LANES | ESSENTIAL_LANES | EXEMPT_LANES
+    )
     assert {n for n, t in LANE_TIERS.items() if t is Tier.ESSENTIAL} == ESSENTIAL_LANES
 
 
@@ -286,8 +290,9 @@ def test_pass_deadline_phases_defer_in_tier_order_and_merge_proceeds_below_300(
     assert set(run(5000)) == everything
     assert set(run(1400)) == everything - {"ci_reclaim"}
     assert set(run(790)) == everything - {"ci_reclaim", "intake", "dispatch", "dispatch_reviews"}
-    assert set(run(250)) == {"merge", "label_write", "unauthorized_merge_tripwire"}
-    assert set(run(0)) == {"merge", "label_write", "unauthorized_merge_tripwire"}
+    survivors = {"merge", "label_write", "unauthorized_merge_tripwire", "local_lane"}
+    assert set(run(250)) == survivors  # the local lane spends no budget
+    assert set(run(0)) == survivors
 
 
 def test_a_deferred_phase_reports_budget_deferred_not_deadline_deferred(tmp_path: Path) -> None:
@@ -308,6 +313,23 @@ def test_review_reaps_defer_below_1500_and_run_above(tmp_path: Path) -> None:
     ok_app._layout = None  # the sweep proceeds and touches it: proof it did not defer
     with pytest.raises(AttributeError):
         _run_review_reap_sweeps(ok_app, None)
+
+
+def test_the_local_lane_spends_no_budget_and_proceeds_at_zero_remaining() -> None:
+    assert tier_of("local_lane") is Tier.EXEMPT
+    assert not decide("local_lane", RESERVES, _window(0)).defer
+
+
+def test_a_local_repo_app_never_defers_any_lane_at_zero_remaining(tmp_path: Path) -> None:
+    """Derived exemption: a client that publishes no PRs spends no GitHub budget."""
+    app = _app(tmp_path, 0)
+    assert budget_deferral(app, "dispatch") is not None  # a remote app at 0 does defer
+    app.write_gate.events.clear()
+    assert LocalFileGitHub.publishes_pull_requests is False
+    app.gh = SimpleNamespace(_transport_v2=app.gh._transport_v2, publishes_pull_requests=False)
+    for lane in (*LANE_TIERS, "some_new_gate"):
+        assert budget_deferral(app, lane) is None
+    assert app.write_gate.events == []
 
 
 # -- the shared budget file ------------------------------------------------------

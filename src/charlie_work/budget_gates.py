@@ -20,6 +20,7 @@ from charlie_work.github_transport.governor import (
     BudgetReserves,
 )
 from charlie_work.github_transport.guarded import GuardedTransport
+from charlie_work.local_work_park import publishes_pull_requests
 
 _EVENT_KIND = "graphql_rate_limit_deferred"
 _EMITTED: set[tuple[str, str, int | None]] = set()
@@ -27,7 +28,13 @@ _EMITTED_LOCK = threading.Lock()
 
 
 def governor_for(app: Any) -> BudgetGovernor | None:
-    """The governor over *app*'s transport, or ``None`` when it cannot apply."""
+    """The governor over *app*'s transport, or ``None`` when it cannot apply.
+
+    A client that publishes no pull requests (``LocalFileGitHub``: the no-remote
+    ``local/`` lane) spends no GitHub budget, so no lane of its app ever defers.
+    """
+    if not publishes_pull_requests(app.gh):
+        return None
     transport = getattr(app.gh, "_transport_v2", None)
     if not isinstance(transport, GuardedTransport):
         return None

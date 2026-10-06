@@ -14,9 +14,16 @@ RESERVE    reconcile, drift, review reaps, CI       ``graphql_rate_limit_thresho
 SCAN       intake, dispatch scans, review           ``graphql_scan_reserve`` (800)
            dispatch, quota probe
 FLOOR      everything else that is gated            ``graphql_floor_reserve`` (300)
-ESSENTIAL  merge, label writes, the                 never
+ESSENTIAL  merge, label writes, the                 never (spends budget, must go)
            unauthorized-merge tripwire
+EXEMPT     lanes that spend no GitHub budget         never (spends none)
 =========  =======================================  =====================
+
+Exemption is also derived, not only listed: an app whose client publishes no
+pull requests (`LocalFileGitHub`, `local/` repo keys) never defers any lane
+(`budget_gates.governor_for`), so a lane added later that runs on a local repo
+is exempt automatically. The EXEMPT tier is for lanes that touch no GitHub on
+*any* backend (`local_lane` is a no-op on a remote repo).
 
 A lane absent from the mapping is FLOOR: a new gate added without a mapping
 gives way last of the optional work rather than first, and never blocks the
@@ -41,7 +48,8 @@ class Tier(IntEnum):
     RESERVE = 0
     SCAN = 1
     FLOOR = 2
-    ESSENTIAL = 3  # never defers
+    ESSENTIAL = 3  # never defers: spends budget, but must run
+    EXEMPT = 4  # never defers: spends no GitHub budget at all
 
 
 LANE_TIERS: Mapping[str, Tier] = MappingProxyType(
@@ -56,7 +64,7 @@ LANE_TIERS: Mapping[str, Tier] = MappingProxyType(
         "dispatch_reviews": Tier.SCAN,
         "quota_probe": Tier.SCAN,
         "deescalate": Tier.FLOOR,
-        "local_lane": Tier.FLOOR,
+        "local_lane": Tier.EXEMPT,
         "merge": Tier.ESSENTIAL,
         "label_write": Tier.ESSENTIAL,
         "unauthorized_merge_tripwire": Tier.ESSENTIAL,
@@ -86,7 +94,7 @@ class BudgetReserves:
 
     def threshold(self, tier: Tier) -> int:
         """Points that must remain for a *tier* lane to run (0: always runs)."""
-        return (self.reserve, self.scan, self.floor, 0)[tier]
+        return (self.reserve, self.scan, self.floor, 0, 0)[tier]
 
 
 @dataclass(frozen=True)
