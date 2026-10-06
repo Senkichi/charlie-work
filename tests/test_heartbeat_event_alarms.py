@@ -48,6 +48,7 @@ from types import ModuleType, SimpleNamespace
 from typing import Any
 
 import pytest
+from _src_ast import parsed
 
 from charlie_work import heartbeat_alarms as leaf
 from _heartbeat_check_fixtures import _iso, _load_heartbeat_check, _write_events_db
@@ -135,7 +136,7 @@ def test_heartbeat_check_has_no_local_check_defs_to_shadow_the_reexports() -> No
     """Source-level belt for the identity test above: the ``_CHECK_NAMES``
     must not reappear as module-scope ``def``s in ``heartbeat_check.py`` --
     the extraction moved them, it did not fork them."""
-    tree = ast.parse(_HEARTBEAT_CHECK.read_text(encoding="utf-8"))
+    tree = parsed(_HEARTBEAT_CHECK)
     local_defs = {
         node.name
         for node in tree.body
@@ -206,7 +207,7 @@ def test_sibling_never_imports_heartbeat_check() -> None:
     exception is an ``if TYPE_CHECKING:`` block -- never executed at runtime,
     so it cannot cycle; that is where the ``RepoInfo``/``Report`` annotation
     imports legitimately live."""
-    tree = ast.parse(_EVENT_ALARMS.read_text(encoding="utf-8"))
+    tree = parsed(_EVENT_ALARMS)
     type_checking_only: set[int] = set()
     for node in ast.walk(tree):
         if (
@@ -238,7 +239,7 @@ def test_sibling_event_kinds_import_stays_guarded() -> None:
     ``heartbeat_check``; this pins the guard inside the sibling it moved to,
     where a future edit could drop the ``try`` without that test's author
     noticing."""
-    tree = ast.parse(_EVENT_ALARMS.read_text(encoding="utf-8"))
+    tree = parsed(_EVENT_ALARMS)
 
     def _imports_event_kinds(node: ast.AST) -> bool:
         return isinstance(node, ast.ImportFrom) and node.module == "charlie_work.event_kinds"

@@ -15,6 +15,7 @@ from _dead_session_fixtures import _write_flat_review_decision
 from _dispatch_fixtures import _stub_real_activity_probe_for_stalled_tests  # noqa: F401
 from _fakes_github import FakeGitHub
 from _rework_dispatch_fixtures import _wg
+from _host_fixtures import host_probe
 from charlie_work.config import (
     DevinConfig,
     OrchestratorConfig,
@@ -43,7 +44,6 @@ def test_orphaned_worker_sweep_records_worker_death_at_in_state(tmp_path: Path) 
     which only seed ``worker_death_at`` directly to exercise the consumption
     side.
     """
-    from unittest.mock import patch
 
     config = OrchestratorConfig(
         devin=DevinConfig(),
@@ -106,7 +106,7 @@ def test_orphaned_worker_sweep_records_worker_death_at_in_state(tmp_path: Path) 
         encoding="utf-8",
     )
 
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+    with host_probe(alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         _detect_and_handle_orphaned_workers(
@@ -153,7 +153,6 @@ def test_orphaned_worker_request_changes_recovered_with_watchdog_disabled(
     indefinitely with no path to redispatch (the exact 8+ hour stall observed
     2026-08-09/10 on jc #1358, #1479, et al.).
     """
-    from unittest.mock import patch
 
     from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
@@ -206,7 +205,7 @@ def test_orphaned_worker_request_changes_recovered_with_watchdog_disabled(
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
 
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+    with host_probe(alive=False):
         _detect_and_handle_orphaned_workers(
             sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
         )
@@ -231,9 +230,8 @@ def test_orphaned_worker_clean_exit_not_reset_to_rework(tmp_path: Path) -> None:
     """Issue #773: a worker that exited 0 (clean, no-op) must not be reset to
     rework_requested or burn a redispatch attempt, even though its dead PID and
     unchanged head otherwise look identical to a crash under
-    ``_worker_pid_alive`` alone.
+    the state-entry liveness check alone.
     """
-    from unittest.mock import patch
 
     config = OrchestratorConfig(
         devin=DevinConfig(),
@@ -299,7 +297,7 @@ def test_orphaned_worker_clean_exit_not_reset_to_rework(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+    with host_probe(alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         _detect_and_handle_orphaned_workers(
@@ -329,7 +327,6 @@ def test_orphaned_worker_clean_exit_not_reset_to_rework(tmp_path: Path) -> None:
 
 def test_orphaned_worker_with_flag_and_open_pr_request_changes_recovered(tmp_path: Path) -> None:
     """Issue #259 review: orphan suppression must not block open-PR recovery paths."""
-    from unittest.mock import patch
 
     config = OrchestratorConfig(
         devin=DevinConfig(),
@@ -377,7 +374,7 @@ def test_orphaned_worker_with_flag_and_open_pr_request_changes_recovered(tmp_pat
         }
     )
 
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+    with host_probe(alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
@@ -410,7 +407,6 @@ def test_orphaned_worker_crash_with_terminal_record_still_recovered(tmp_path: Pa
     the fix only special-cases a confirmed clean (exit code 0) exit, never a
     confirmed abnormal one.
     """
-    from unittest.mock import patch
 
     config = OrchestratorConfig(
         devin=DevinConfig(),
@@ -473,7 +469,7 @@ def test_orphaned_worker_crash_with_terminal_record_still_recovered(tmp_path: Pa
         encoding="utf-8",
     )
 
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+    with host_probe(alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         _detect_and_handle_orphaned_workers(
@@ -505,7 +501,6 @@ def test_orphaned_worker_no_pr_orphans_skips_bulk_issue_list(tmp_path: Path) -> 
     side of that invariant: when the only orphan already has a linked open
     PR, ``no_pr_orphans`` is empty and ``issue_list`` must never be called.
     """
-    from unittest.mock import patch
 
     config = OrchestratorConfig(
         devin=DevinConfig(),
@@ -571,7 +566,7 @@ def test_orphaned_worker_no_pr_orphans_skips_bulk_issue_list(tmp_path: Path) -> 
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
 
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+    with host_probe(alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         _detect_and_handle_orphaned_workers(
@@ -601,7 +596,6 @@ def _dead_worker_with_pr_sweep(
     and the paths object so each credit-gate test can assert on its own
     lane.
     """
-    from unittest.mock import patch
 
     config = OrchestratorConfig(
         devin=DevinConfig(),
@@ -670,7 +664,7 @@ def _dead_worker_with_pr_sweep(
         encoding="utf-8",
     )
 
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+    with host_probe(alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         _detect_and_handle_orphaned_workers(

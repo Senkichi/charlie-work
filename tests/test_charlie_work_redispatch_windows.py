@@ -22,6 +22,7 @@ from charlie_work.state import (
     save_state,
 )
 from _dispatch_fixtures import _stub_real_activity_probe_for_stalled_tests  # noqa: F401
+from _src_ast import parsed
 
 
 def test_redispatch_escalated_edge_clears_full_active_set(tmp_path: Path) -> None:
@@ -239,7 +240,7 @@ def test_redispatch_at_only_written_by_known_call_sites(tmp_path: Path) -> None:
     )
 
     def _count_redispatch_at_assignments(path: Path) -> int:
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        tree = parsed(path)
         count = 0
         for node in ast.walk(tree):
             if not isinstance(node, ast.Assign):

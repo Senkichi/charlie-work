@@ -59,6 +59,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
+from _src_ast import parsed_source
 
 from charlie_work import layout
 
@@ -177,7 +178,7 @@ def find_violations(
     directly unit-testable against small in-memory samples, independent of
     whatever the real source tree currently looks like.
     """
-    tree = ast.parse(source, filename=filename)
+    tree = parsed_source(source, filename)
     docstring_ids = _docstring_constant_ids(tree)
     basename = Path(filename).name
 

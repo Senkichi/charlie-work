@@ -955,12 +955,18 @@ def _check_worktrees_root_agreement(
     sites (``OrchestratorApp._adapter_settings()`` and
     ``run_worktree_clean_command``'s ``clean_worktrees`` call).
     """
-    effective_root = resolved_layout(config, repo_root).worktrees
-    add(
-        "worktrees root",
-        True,
-        f"{effective_root} (dispatch and `worktree-clean` both resolve here)",
-    )
+    resolved = resolved_layout(config, repo_root)
+    detail = f"{resolved.worktrees} (dispatch and `worktree-clean` both resolve here)"
+    status = resolved.worker_io
+    if status.io is not None:
+        detail += f"; on the host I/O volume {status.io.drive}, uv cache {status.io.uv_cache}"
+    elif status.note:
+        detail += f"; host I/O not in use: {status.note}"
+    legacy = resolved.sweep_roots()[1:]
+    if legacy:
+        entries = sum(1 for _ in legacy[0].iterdir())
+        detail += f"; legacy root {legacy[0]} still swept ({entries} entries)"
+    add("worktrees root", True, detail)
 
 
 _LANE_FAILURE_LOOKBACK_HOURS = 24

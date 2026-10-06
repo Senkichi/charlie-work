@@ -23,9 +23,10 @@ import tempfile
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
+
+from _host_fixtures import host_probe
 
 from charlie_work.config import OrchestratorConfig, load_config
 from charlie_work.local_issues import LocalFileGitHub
@@ -178,7 +179,7 @@ def _run_sweep(
 ) -> None:
     from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+    with host_probe(alive=False):
         _detect_and_handle_orphaned_workers(
             sessions_dir,
             state_file,

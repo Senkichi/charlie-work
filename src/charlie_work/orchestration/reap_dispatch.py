@@ -371,6 +371,9 @@ def _apply_concurrency_governor(
                 self.paths.root,
                 self._layout.worktrees,
                 *registered_state_dirs(self.fleet_dir_override),
+                # Worktrees on the host I/O volume carry no .var/charlie-work
+                # marker; the worker root covers every repo's worktrees there.
+                *self._layout.host_io_scope_paths(),
             ),
         )
         host_load_limit: int | None = None

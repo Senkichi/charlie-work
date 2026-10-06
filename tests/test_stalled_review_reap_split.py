@@ -98,6 +98,7 @@ import re
 from pathlib import Path
 
 import pytest
+from _src_ast import parsed, parsed_source, source_text
 
 _REPO_ROOT = Path(__file__).parents[1]
 _MODULE_PATH = _REPO_ROOT / "src" / "charlie_work" / "stalled_review_reap.py"
@@ -154,7 +155,7 @@ def _module_level_defined_names(path: Path) -> list[str]:
     added later silently invisible to the identity test below, which draws
     its candidate set from this helper).
     """
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    tree = parsed(path)
     names: list[str] = []
     for node in tree.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
@@ -173,7 +174,7 @@ def _module_level_defined_names(path: Path) -> list[str]:
 def _facade_reexported_names(workflow_path: Path) -> set[str]:
     """Names workflow.py's facade block currently re-exports from
     ``.stalled_review_reap``."""
-    tree = ast.parse(workflow_path.read_text(encoding="utf-8"), filename=str(workflow_path))
+    tree = parsed(workflow_path)
     names: set[str] = set()
     for node in ast.walk(tree):
         if (
@@ -226,7 +227,7 @@ def _module_imports_in(
     <relative_module>``, ``from <absolute_module> import X``, and ``import
     <absolute_module>``.
     """
-    tree = ast.parse(source, filename=filename)
+    tree = parsed_source(source, filename)
     offenders: list[str] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom):
@@ -437,7 +438,7 @@ def _member_content_line_count(path: Path) -> int:
     span the byte-identity check (AC1) compares, excluding the module's own
     docstring/import header.
     """
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    tree = parsed(path)
     first_member_lineno = min(
         node.lineno
         for node in tree.body
@@ -548,9 +549,9 @@ def test_ci_findings_header_ratio_still_matches_the_bands_own_justification() ->
     ``check_dispatch_staleness`` -- body growth within an existing unit, header
     unchanged at 56 -- bringing the total to 739.
     """
-    ci_findings_source = _CI_FINDINGS_PATH.read_text(encoding="utf-8")
+    ci_findings_source = source_text(_CI_FINDINGS_PATH)
     ci_findings_lines = ci_findings_source.splitlines()
-    tree = ast.parse(ci_findings_source, filename=str(_CI_FINDINGS_PATH))
+    tree = parsed(_CI_FINDINGS_PATH)
     first_member_lineno = min(
         node.lineno
         for node in tree.body

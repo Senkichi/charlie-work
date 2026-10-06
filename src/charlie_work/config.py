@@ -1601,8 +1601,12 @@ class ClaudeCodeConfig:
     command: Annotated[
         tuple[str, ...], CommandTemplate({"prompt_path", "issue_number", "branch"})
     ] = ()
-    # None -> worktree.py default (<repo_root>/.var/charlie-work/worktrees).
+    # None -> the host I/O volume when the ci-fleet manifest names one (see
+    # host_io_worker), else <state_dir>/worktrees. An explicit value always wins.
     worktrees_dir: str | None = None
+    # Kill switch for host_io_worker: False keeps worker worktrees and the uv
+    # cache off the host I/O volume even when its manifest is valid.
+    host_io_worktrees: Annotated[bool, Typed] = True
     # Disabled by default: a claude-code worker has a full agentic shell and
     # can run uv sync, which would rewrite the shared venv's editable install
     # metadata to point at the worktree (issue #274). Setting a relative path

@@ -176,3 +176,21 @@ def test_a_missing_connection_is_a_defect() -> None:
     bad = Response(200, (), json.dumps({"data": {"repository": None}}), "http")
     out = paginate_graphql(FakeTransport(lambda r: bad), GQL, connection_path=PATH, limit=5)
     assert isinstance(out, TransportFailure) and out.kind is FailureKind.ADAPTER_DEFECT
+
+
+def test_a_next_page_without_an_end_cursor_is_a_defect() -> None:
+    """``hasNextPage`` with no usable ``endCursor`` is a GitHub contract
+    violation -- an ADAPTER_DEFECT (gh fallback), not a silently short list."""
+    page = _gpage([{"n": 1}], has_next=True, cursor=None)
+    out = paginate_graphql(FakeTransport(lambda r: page), GQL, connection_path=PATH, limit=5)
+    assert isinstance(out, TransportFailure) and out.kind is FailureKind.ADAPTER_DEFECT
+
+
+def test_a_limit_hit_with_no_end_cursor_is_still_a_success() -> None:
+    """The limit is checked before the cursor: a page that already fills the
+    request is a valid answer even with a missing endCursor."""
+    page = _gpage([{"n": 1}, {"n": 2}], has_next=True, cursor=None)
+    out = paginate_graphql(FakeTransport(lambda r: page), GQL, connection_path=PATH, limit=2)
+    assert isinstance(out, Response)
+    nodes = json.loads(out.body)["data"]["repository"]["pullRequests"]["nodes"]
+    assert nodes == [{"n": 1}, {"n": 2}]

@@ -42,6 +42,7 @@ from charlie_work.ast_equivalence_gate_command import (
     run_ast_equivalence_check_command,
 )
 from charlie_work.subprocess_runner import RunResult
+from _src_ast import parsed
 
 
 # ---------------------------------------------------------------------------
@@ -208,8 +209,7 @@ def test_no_hardcoded_symbol_name_list_in_gate_source() -> None:
     """
     import charlie_work.ast_equivalence_gate as gate_mod
 
-    source = Path(gate_mod.__file__).read_text(encoding="utf-8")
-    tree = ast.parse(source, filename=gate_mod.__file__)
+    tree = parsed(Path(gate_mod.__file__))
 
     # Collect all string-literal lists (list/tuple/set of string constants).
     suspicious: list[str] = []

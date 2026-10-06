@@ -14,6 +14,7 @@ import dataclasses
 from pathlib import Path
 
 import pytest
+from _src_ast import parsed
 from _dws_facts import (
     NOW,
     STAMP,
@@ -547,7 +548,7 @@ def _imports(tree: ast.AST) -> set[str]:
 
 @pytest.mark.parametrize("path", sorted(_PKG.glob("decide*.py")), ids=lambda p: p.name)
 def test_decide_modules_are_pure(path: Path) -> None:
-    tree = ast.parse(path.read_text(encoding="utf-8"))
+    tree = parsed(path)
     bad_imports = {
         name
         for name in _imports(tree)

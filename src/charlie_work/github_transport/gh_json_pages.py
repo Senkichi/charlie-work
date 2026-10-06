@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from . import gh_json_fields as fields_mod
+from .gh_json_fields import IncompletePageError
 
 
 @dataclass(frozen=True)
@@ -42,10 +43,6 @@ _PAGED: dict[str, _Paged] = {
         ("statusCheckRollup", "contexts"), fields_mod.rollup_selection(after=True)
     ),
 }
-
-
-class IncompletePageError(ValueError):
-    """A connection reports a next page the node cannot be followed to."""
 
 
 def _id_key(item: Any) -> Any:

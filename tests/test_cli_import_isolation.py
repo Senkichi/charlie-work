@@ -30,6 +30,7 @@ import sys
 import textwrap
 
 import pytest
+from _src_ast import parsed
 
 # The three modules ci_fleet is retiring. Blocked as a set rather than only the
 # one that was actually deleted, because the point of the fix is that *none* of
@@ -91,7 +92,7 @@ def _module_scope_imports(path: pathlib.Path) -> set[str]:
         for child in ast.iter_child_nodes(node):
             visit(child)
 
-    visit(ast.parse(path.read_text(encoding="utf-8")))
+    visit(parsed(path))
     return names
 
 

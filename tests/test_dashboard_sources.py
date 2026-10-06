@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from _src_ast import parsed
 
 from charlie_work import instrumentation
 from charlie_work.dashboard import sources
@@ -204,7 +205,7 @@ def test_global_events_db_readable(fleet) -> None:
 
 
 def test_sources_does_not_import_actuating_ci_fleet_modules() -> None:
-    tree = ast.parse(Path(sources.__file__).read_text(encoding="utf-8"))
+    tree = parsed(Path(sources.__file__))
     imported: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):

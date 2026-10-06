@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
+from _src_ast import parsed, source_files
 
 _SRC = Path(__file__).resolve().parents[1] / "src" / "charlie_work"
 
@@ -121,8 +122,8 @@ def _module_facts(tree: ast.Module) -> tuple[bool, bool, set[str]]:
 def _requeue_loci() -> dict[str, set[str]]:
     """Derive {module_relpath: referenced_names} for every requeue locus."""
     loci: dict[str, set[str]] = {}
-    for path in sorted(_SRC.rglob("*.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    for path in source_files(_SRC):
+        tree = parsed(path)
         is_producer, is_definer, names = _module_facts(tree)
         if is_producer and not is_definer:
             loci[str(path.relative_to(_SRC.parent.parent))] = names
@@ -156,7 +157,7 @@ def test_park_salvageable_local_orphan_delegates_to_shared_helper() -> None:
     """The no-PR-backend gate must stay a thin gate over the shared helper —
     the probe+publish tail must live in exactly one place."""
     path = _SRC / "local_work_park.py"
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    tree = parsed(path)
     fn = next(
         node
         for node in tree.body

@@ -12,10 +12,10 @@ from datetime import (
     timedelta,
 )
 from pathlib import Path
-from unittest.mock import patch
 from _dispatch_fixtures import _stub_real_activity_probe_for_stalled_tests  # noqa: F401
 from _fakes_github import FakeGitHub
 from _rework_dispatch_fixtures import _wg
+from _host_fixtures import host_probe
 from charlie_work.config import (
     DevinConfig,
     OrchestratorConfig,
@@ -47,7 +47,6 @@ def test_orphaned_worker_no_open_pr_mention_flag_reaped_after_grace(tmp_path: Pa
     to ``escalated`` after the grace period, regardless of concurrent
     label-side transitions.
     """
-    from unittest.mock import patch
 
     config = OrchestratorConfig(
         devin=DevinConfig(),
@@ -94,7 +93,7 @@ def test_orphaned_worker_no_open_pr_mention_flag_reaped_after_grace(tmp_path: Pa
     from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
     def _run_sweep() -> None:
-        with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        with host_probe(alive=False):
             _detect_and_handle_orphaned_workers(
                 sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
             )
@@ -158,7 +157,6 @@ def test_orphaned_worker_no_open_pr_already_flagged_backstop_backfills(tmp_path:
     period already elapsed) and verifies the backstop arms on the next sweep
     pass and the issue escalates.
     """
-    from unittest.mock import patch
 
     config = OrchestratorConfig(
         devin=DevinConfig(),
@@ -213,7 +211,7 @@ def test_orphaned_worker_no_open_pr_already_flagged_backstop_backfills(tmp_path:
     from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
     def _run_sweep() -> None:
-        with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        with host_probe(alive=False):
             _detect_and_handle_orphaned_workers(
                 sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
             )
@@ -320,7 +318,7 @@ def test_orphaned_worker_no_open_pr_completes_interrupted_reclaim(tmp_path: Path
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
 
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+    with host_probe(alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         _detect_and_handle_orphaned_workers(
@@ -363,7 +361,7 @@ def test_orphaned_worker_no_open_pr_completes_interrupted_reclaim(tmp_path: Path
     fake_gh.issues[0]["labels"] = [{"name": config.labels.ready}]
     fake_gh.labels_added = []
     fake_gh.labels_removed = []
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+    with host_probe(alive=False):
         _detect_and_handle_orphaned_workers(
             sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
         )
@@ -422,7 +420,7 @@ def test_orphaned_worker_no_open_pr_reclaim_survives_label_api_failure(tmp_path:
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
 
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+    with host_probe(alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         # Pass 1: the gh API call fails.
@@ -445,7 +443,7 @@ def test_orphaned_worker_no_open_pr_reclaim_survives_label_api_failure(tmp_path:
     fake_gh.fail_remove = False
     fake_gh.labels_removed = []
 
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+    with host_probe(alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         _detect_and_handle_orphaned_workers(
@@ -509,7 +507,7 @@ def test_orphaned_worker_no_open_pr_terminal_label_only_is_left_alone(tmp_path: 
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
 
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+    with host_probe(alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         _detect_and_handle_orphaned_workers(
@@ -573,7 +571,7 @@ def test_orphaned_worker_reclaim_carries_required_reason(tmp_path: Path) -> None
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
 
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+    with host_probe(alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         _detect_and_handle_orphaned_workers(

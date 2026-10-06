@@ -22,6 +22,7 @@ from _dispatch_fixtures import _stub_real_activity_probe_for_stalled_tests  # no
 from _fakes_github import FakeGitHub
 from _rework_dispatch_fixtures import _wg
 from _worktree_fixtures import _wt_scratch as _register_wt_scratch  # noqa: F401 -- registers the wt_scratch fixture (shallow tmp dir for real ``git worktree add``)
+from _host_fixtures import host_probe
 from charlie_work import role_quota_ledger, worker_fate
 from charlie_work.adapters import (
     AdapterSettings,
@@ -129,7 +130,7 @@ def _seed_dead_primary(
 
 
 def _sweep(paths: Any, sessions_dir: Path, config: OrchestratorConfig, gh: FakeGitHub) -> None:
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+    with host_probe(alive=False):
         _detect_and_handle_orphaned_workers(
             sessions_dir, paths.state_file, config, gh, write_gate=_wg(paths.state_file)
         )
@@ -318,7 +319,7 @@ def test_dry_run_sweep_does_not_classify(tmp_path: Path) -> None:
     config = _config()
     paths, sessions_dir, gh = _seed_dead_primary(tmp_path / "a", config)
 
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+    with host_probe(alive=False):
         _detect_and_handle_orphaned_workers(
             sessions_dir,
             paths.state_file,

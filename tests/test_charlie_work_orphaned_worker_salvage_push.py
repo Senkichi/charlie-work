@@ -13,6 +13,7 @@ from _dead_session_fixtures import _write_flat_review_decision
 from _dispatch_fixtures import _stub_real_activity_probe_for_stalled_tests  # noqa: F401
 from _fakes_github import FakeGitHub
 from _rework_dispatch_fixtures import _wg
+from _host_fixtures import host_probe
 from charlie_work.config import (
     DevinConfig,
     OrchestratorConfig,
@@ -101,7 +102,7 @@ def test_orphaned_worker_salvage_push_recovers_stranded_commits_before_classific
     sessions_dir.mkdir(parents=True, exist_ok=True)
 
     with (
-        patch("charlie_work.workflow._worker_pid_alive", return_value=False),
+        host_probe(alive=False),
         patch.object(workflow_module, "salvage_push_stranded_commits", fake_salvage),
     ):
         _detect_and_handle_orphaned_workers(
@@ -230,7 +231,7 @@ def test_orphaned_worker_salvage_push_threads_dry_run_to_salvage_push_stranded_c
     sessions_dir.mkdir(parents=True, exist_ok=True)
 
     with (
-        patch("charlie_work.workflow._worker_pid_alive", return_value=False),
+        host_probe(alive=False),
         patch.object(workflow_module, "salvage_push_stranded_commits", fake_salvage),
     ):
         _detect_and_handle_orphaned_workers(
@@ -319,7 +320,7 @@ def test_orphaned_worker_salvage_push_failure_preserves_existing_classification(
     sessions_dir.mkdir(parents=True, exist_ok=True)
 
     with (
-        patch("charlie_work.workflow._worker_pid_alive", return_value=False),
+        host_probe(alive=False),
         patch.object(workflow_module, "salvage_push_stranded_commits", fake_salvage),
     ):
         _detect_and_handle_orphaned_workers(
@@ -410,7 +411,7 @@ def test_orphaned_worker_salvage_push_up_to_date_emits_no_event(tmp_path: Path) 
     sessions_dir.mkdir(parents=True, exist_ok=True)
 
     with (
-        patch("charlie_work.workflow._worker_pid_alive", return_value=False),
+        host_probe(alive=False),
         patch.object(workflow_module, "salvage_push_stranded_commits", fake_salvage),
     ):
         _detect_and_handle_orphaned_workers(
@@ -483,7 +484,7 @@ def test_orphaned_worker_salvage_push_skips_cross_repository_pr(tmp_path: Path) 
     sessions_dir.mkdir(parents=True, exist_ok=True)
 
     with (
-        patch("charlie_work.workflow._worker_pid_alive", return_value=False),
+        host_probe(alive=False),
         patch.object(workflow_module, "salvage_push_stranded_commits", fake_salvage),
     ):
         _detect_and_handle_orphaned_workers(
