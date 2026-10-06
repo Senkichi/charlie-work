@@ -35,7 +35,6 @@ below now asserts the event is never emitted.)
 from __future__ import annotations
 
 import os
-import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import Mock
@@ -44,6 +43,7 @@ import pytest
 
 import charlie_work.workflow as workflow_module
 from _fakes_github import FakeGitHub
+from _worktree_fixtures import _init_repo as _init_repo_templated
 from charlie_work.config import (
     AutoMergeConfig,
     LocalIssuesConfig,
@@ -66,41 +66,43 @@ from _reconcile_fixtures import _write_local_issue
 
 
 def _init_repo(repo_root: Path) -> None:
-    """A fresh git repo with one commit and NO origin remote -- the exact
-    shape of a ``local_issues`` repo (e.g. ``local/mdls``).
+    """A fresh git repo on ``main`` with one commit and NO origin remote --
+    the exact shape of a ``local_issues`` repo (e.g. ``local/mdls``).
 
-    ``core.longpaths`` is set because pytest's basetemp under this repo's
-    ``.var/worker-tmp`` pushes ``.git/objects/<sha>`` paths past the Windows
-    MAX_PATH limit (``error: unable to write file ... Filename too long``,
-    commit exit 1); the knob is a no-op elsewhere. The child env is also
-    scrubbed of ``GIT_*`` variables so an ambient ``GIT_DIR``/
-    ``GIT_INDEX_FILE``/``GIT_CONFIG_*`` leaked by whatever shell spawned
-    pytest cannot redirect these commands at the *outer* repo instead of
-    the fresh one.
+    Delegates to ``_worktree_fixtures._init_repo`` so the repo materializes
+    from the per-process ``plain`` git template (``shutil.copytree``, no
+    subprocesses -- HS-CW-4, ``tests/_git_templates.py``) instead of
+    re-running the ``init``/``config``/``commit`` spawn sequence per test:
+    the spawn cost, amplified on the Windows CI host, is what the ledger
+    flagged at ~2.8x baseline (issue #2425, same fix class as #2387).
+
+    The produced repo carries a README commit rather than the old body's
+    ``--allow-empty`` one -- no test here reads the tree -- and gets
+    ``core.longpaths`` through ``conftest._isolate_git_env``'s
+    ``GIT_CONFIG_*`` injection on every git child instead of an in-repo
+    ``git config`` write. The old body's ``GIT_*`` env scrub only mattered
+    while it spawned git itself.
     """
-    repo_root.mkdir(parents=True, exist_ok=True)
-    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
-    for command in (
-        ["git", "init", "--initial-branch=main"],
-        ["git", "config", "core.longpaths", "true"],
-        [
-            "git",
-            "-c",
-            "user.name=t",
-            "-c",
-            "user.email=t@t",
-            "commit",
-            "--allow-empty",
-            "-m",
-            "chore: seed",
-        ],
-    ):
-        result = subprocess.run(command, cwd=repo_root, capture_output=True, text=True, env=env)
-        if result.returncode != 0:
-            raise AssertionError(
-                f"{command[:2]} rc={result.returncode}\n"
-                f"stdout: {result.stdout}\nstderr: {result.stderr}"
-            )
+    _init_repo_templated(repo_root)
+
+
+def test_init_repo_goes_through_the_git_template(tmp_path: Path) -> None:
+    """Issue #2425 regression pin: ``_init_repo`` must materialize through the
+    per-process ``plain`` git template (``_git_templates``) instead of
+    re-running the ``init``/``config``/``commit`` spawn sequence per call --
+    the ledger measured
+    ``test_local_lane_kill_switch_stalled_when_auto_merge_disabled`` at ~2.8x
+    baseline because each of this module's tests paid the full spawn cost on
+    the Windows CI host. Mirrors ``test_git_templates``'s #2387 pin for
+    ``_helpers._init_git_repo``."""
+    import _git_templates
+    from _worktree_fixtures import _git
+
+    before = _git_templates._REGISTRY.materialized["plain"]
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    assert _git_templates._REGISTRY.materialized["plain"] == before + 1
+    assert _git(repo, "rev-parse", "--verify", "main").stdout.strip()
 
 
 def _config(*, local_enabled: bool) -> OrchestratorConfig:
