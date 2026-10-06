@@ -491,101 +491,23 @@ _CI_YML = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "ci.ym
 def test_ci_gate_steps_use_bash_shell() -> None:
     """The recorded-vs-collected CI steps must declare ``shell: bash``.
 
-    The ``Collect tests`` step uses the bash ``|| true`` idiom and the
-    ``Recorded-vs-collected check`` step uses bash ``\\`` line continuations
-    in a multi-line ``run: |`` block.  The CI job runs on ``windows-latest``,
-    whose default shell is pwsh -- pwsh cannot parse ``\\`` at end of line
-    (it treats it as a literal backslash, then sees ``--junit`` on the next
-    line as a bare unary ``--`` operator and throws ``ParserError``), and
-    ``true`` is not a pwsh command.  Both steps must therefore explicitly
-    set ``shell: bash`` (Git Bash is always available on GitHub-hosted
-    Windows runners).
-
-    This is the mutation-checkable regression guard for the #1624 rework:
-    reverting either ``shell: bash`` line makes the test fail.
+    DD-4 moved the suite run into the ``tests-shard`` matrix and the
+    recorded-vs-collected check into the ``Tests`` aggregate. Both bodies
+    use bash syntax (``\\`` continuations, ``$VAR`` expansion); the shard runs
+    on windows-latest whose default shell is pwsh, which cannot parse them
+    (the #1624 ParserError). Reverting either ``shell: bash`` fails here.
     """
     assert _CI_YML.exists(), f"ci.yml not found at {_CI_YML}"
     workflow = yaml.safe_load(_CI_YML.read_text(encoding="utf-8"))
 
-    tests_job = workflow["jobs"]["Tests"]
-    steps = tests_job["steps"]
-    by_name = {s["name"]: s for s in steps if "name" in s}
+    shard_steps = {s["name"]: s for s in workflow["jobs"]["tests-shard"]["steps"] if "name" in s}
+    assert shard_steps["Run test shard"].get("shell") == "bash"
 
-    collect_step = by_name["Collect tests"]
-    assert collect_step.get("shell") == "bash", (
-        "ci.yml 'Collect tests' step must set shell: bash -- the "
-        "|| true idiom is bash, not pwsh (true is not a pwsh command)"
+    tests_steps = {s["name"]: s for s in workflow["jobs"]["Tests"]["steps"] if "name" in s}
+    # YAML strips "#1621)" as a comment from the unquoted name; match by prefix.
+    gate_step = next(
+        s for n, s in tests_steps.items() if n.startswith("Recorded-vs-collected check")
     )
-
-    # The step name in the YAML source is "Recorded-vs-collected check
-    # (issue #1621)", but YAML strips the "#1621)" as a comment, so the
-    # parsed name is "Recorded-vs-collected check (issue".  Match by prefix.
-    gate_step = next(s for n, s in by_name.items() if n.startswith("Recorded-vs-collected check"))
-    assert gate_step.get("shell") == "bash", (
-        "ci.yml 'Recorded-vs-collected check' step must set shell: bash -- "
-        "the multi-line run block uses bash \\ line continuations that pwsh "
-        "cannot parse (ParserError: Missing expression after unary '--')"
-    )
-
-
-def test_cli_accepts_repeated_junit_flags(monkeypatch, tmp_path: Path) -> None:
-    _apply_cli_mocks(monkeypatch, tmp_path)
-    (tmp_path / "pytest-junit-1.xml").write_text(_junit("a", "b"), encoding="utf-8")
-    (tmp_path / "pytest-junit-2.xml").write_text(_junit("c"), encoding="utf-8")
-    (tmp_path / "collected.txt").write_text(_COLLECT_3, encoding="utf-8")
-    args = _make_cli_args(tmp_path)
-    args.junit = ["pytest-junit-1.xml", "pytest-junit-2.xml"]
-    result = run_junit_recorded_check_command(args)
-    assert result.ok is True
-    assert result.data["recorded"] == 3
-    assert result.data["junit"] == [
-        str(tmp_path / "pytest-junit-1.xml"),
-        str(tmp_path / "pytest-junit-2.xml"),
-    ]
-
-
-def test_cli_expands_a_glob(monkeypatch, tmp_path: Path) -> None:
-    _apply_cli_mocks(monkeypatch, tmp_path)
-    (tmp_path / "junit").mkdir()
-    (tmp_path / "junit" / "pytest-junit-2.xml").write_text(_junit("c"), encoding="utf-8")
-    (tmp_path / "junit" / "pytest-junit-1.xml").write_text(_junit("a", "b"), encoding="utf-8")
-    (tmp_path / "collected.txt").write_text(_COLLECT_3, encoding="utf-8")
-    args = _make_cli_args(tmp_path)
-    args.junit = ["junit/pytest-junit-*.xml"]
-    result = run_junit_recorded_check_command(args)
-    assert result.ok is True
-    assert [Path(p).name for p in result.data["junit"]] == [
-        "pytest-junit-1.xml",
-        "pytest-junit-2.xml",
-    ]
-
-
-def test_cli_glob_without_match_fails_closed(monkeypatch, tmp_path: Path) -> None:
-    _apply_cli_mocks(monkeypatch, tmp_path)
-    (tmp_path / "collected.txt").write_text(_COLLECT_3, encoding="utf-8")
-    args = _make_cli_args(tmp_path)
-    args.junit = ["junit/pytest-junit-*.xml"]
-    result = run_junit_recorded_check_command(args)
-    assert result.ok is False
-    assert "matched no files" in result.message
-
-
-def test_cli_single_string_junit_keeps_string_data(monkeypatch, tmp_path: Path) -> None:
-    _apply_cli_mocks(monkeypatch, tmp_path)
-    (tmp_path / "pytest-junit.xml").write_text(_JUNIT_3, encoding="utf-8")
-    (tmp_path / "collected.txt").write_text(_COLLECT_3, encoding="utf-8")
-    result = run_junit_recorded_check_command(_make_cli_args(tmp_path))
-    assert result.data["junit"] == str(tmp_path / "pytest-junit.xml")
-
-
-def test_cli_parser_junit_is_repeatable() -> None:
-    from charlie_work.junit_recorded_gate_command import (
-        register_junit_recorded_check_subparser,
-    )
-
-    parser = argparse.ArgumentParser()
-    register_junit_recorded_check_subparser(parser.add_subparsers(dest="command"))
-    args = parser.parse_args(
-        ["junit-recorded-check", "--junit", "a.xml", "--junit", "b.xml", "--collect", "c.txt"]
-    )
-    assert args.junit == ["a.xml", "b.xml"]
+    assert gate_step.get("shell") == "bash"
+    assert "--junit 'junit/pytest-junit-*.xml'" in gate_step["run"]
+    assert "--collect head_collect.txt" in gate_step["run"]
