@@ -28,7 +28,8 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, Callable, Sequence
 
-from . import atomic_write, fleet_registry, git_pull_blockers, layout, worktree
+from . import atomic_write, git_pull_blockers, layout, worktree
+from . import host as _host
 from .command_result import CommandResult
 from .config import WORKER_OUTCOME_FILENAME
 from .file_lock import ByteRangeFileLock, try_acquire_byte_range_lock
@@ -1012,7 +1013,8 @@ def self_deploy(
 
     Uses ``git diff --name-only <from>..<to>`` to detect whether the pull
     touched ``pyproject.toml`` or ``uv.lock``.  Before running ``uv sync`` the
-    fleet registry is consulted for live worker sessions; if any are active the
+    fleet live-worker count is consulted through the session-count host port
+    (issue #2230); if any are active the
     sync is deferred and a pending-sync marker is written atomically.  The
     marker is checked on every subsequent pass, so the sync retries even when
     the next ``git pull`` finds no new commits.
@@ -1532,7 +1534,13 @@ def _self_deploy_attempt(
         from_sha = marker_from or before_sha
         to_sha = after_sha
 
-        live_count, _ = fleet_registry.count_fleet_live_sessions(fleet_dir_override)
+        # Routed through the session-count host port (issue #2230): the Real
+        # late-binds workflow.count_fleet_live_sessions -- a re-export of
+        # host/sessions.py's facade, which late-binds
+        # fleet_registry.count_fleet_live_sessions in turn -- so patches
+        # against either name still intercept, and
+        # fake_host(sessions=...) reaches self-deploy too.
+        live_count, _ = _host.current().sessions.fleet_live_workers(fleet_dir_override)
         if live_count > 0:
             # Issue #1855: bound how long a pending sync may starve under
             # continuous load. ``record_sync_deferral`` rewrites the marker
