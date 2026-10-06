@@ -26,6 +26,7 @@ from . import apply_requests_pre as pre_handlers
 from .apply_context import SweepContext
 from .decide_common import label_names
 from .model import (
+    CloseVerifiedNoChanges,
     CollectLiveHandoff,
     FetchOpenIssues,
     FetchOpenPrs,
@@ -46,6 +47,7 @@ from .model import (
     CreditDeadWorker,
     CreditResult,
     DrainNoOp,
+    ExemptThrottleCleanExit,
     GuardedUpdate,
     OpenPrForBranch,
     PrOpenResult,
@@ -93,14 +95,19 @@ def advance_to_pr_open(ctx: SweepContext, req: AdvanceToPrOpen) -> bool:
     """#1128: strip the active labels and add ``pr-open`` for an unverdicted PR."""
     number = req.issue
     labels = label_names((ctx.issues or {}).get(number) or {})
-    ok = True
-    for label in sorted(labels & ctx.config.labels.active):
-        if not ctx.gh.remove_issue_label(number, label):
-            ok = False
-    if ctx.config.labels.pr_open not in labels:
-        if not ctx.gh.add_issue_label(number, ctx.config.labels.pr_open):
-            ok = False
-    return ok
+    # Issue #2226: route through the WriteGate's canonical seam so the
+    # PR-open transition lands in events.db bound to this repo; the
+    # conditional add preserves the no-redundant-write contract.
+    result = ctx.write_gate.apply_issue_labels(
+        ctx.gh,
+        ctx.config.labels,
+        number,
+        add=(ctx.config.labels.pr_open,) if ctx.config.labels.pr_open not in labels else (),
+        remove=sorted(labels & ctx.config.labels.active),
+        to_state="pr_open",
+        cause="advance_to_pr_open",
+    )
+    return result.ok
 
 
 def credit_dead_worker(ctx: SweepContext, req: CreditDeadWorker) -> CreditResult:
@@ -113,6 +120,23 @@ def credit_dead_worker(ctx: SweepContext, req: CreditDeadWorker) -> CreditResult
         write_gate=ctx.write_gate,
         at=ctx.stamp,
         classify_log=req.classify_log,
+        dispatched_at=req.dispatched_at,
+        pr_number=req.pr_number,
+    )
+    return CreditResult(failure_kind=kind, throttled_until=ctx.state.get("throttled_until"))
+
+
+def exempt_throttle_clean_exit(ctx: SweepContext, req: ExemptThrottleCleanExit) -> CreditResult:
+    kind = dead_worker_classification.exempt_clean_exit_throttle_death(
+        ctx.issue_entry(req.issue),
+        ctx.sessions_dir,
+        req.issue,
+        ctx.state,
+        ctx.config,
+        write_gate=ctx.write_gate,
+        dispatched_at=req.dispatched_at,
+        pr_number=req.pr_number,
+        now=ctx.now,
     )
     return CreditResult(failure_kind=kind, throttled_until=ctx.state.get("throttled_until"))
 
@@ -222,7 +246,7 @@ def guarded_update(ctx: SweepContext, req: GuardedUpdate) -> bool:
     Returns whether the merge was written: ``False`` means a concurrent writer
     changed the issue's status or the PR's reviewed head first, and the flow
     must not record anything that presumes the write (ADR-0001: merge, never
-    replace the entry)."""
+    replace the entry). ``req.event`` is appended in this same lock window."""
     with ctx.ports.state_lock(ctx.state_file):
         state = ctx.ports.load_state(ctx.state_file)
         entry = (state.get("issues") or {}).get(str(req.issue))
@@ -240,6 +264,17 @@ def guarded_update(ctx: SweepContext, req: GuardedUpdate) -> bool:
             stamp = ctx.ports.utc_now()
             for key in req.stamp_fields:
                 entry[key] = stamp
+        if req.event is not None:
+            kind, payload = req.event
+            # An append_event failure propagates before save_state: status and
+            # event are both absent, never status without its audit row (#2113).
+            state = ctx.write_gate.append_event(
+                state,
+                # event-consumer: audit-only -- pass-through of the kind ``decide*`` chose
+                kind,
+                dict(payload),
+                ctx.config.runtime.event_ring_size,
+            )
         ctx.write_gate.save_state(state)
     return True
 
@@ -278,6 +313,7 @@ HANDLERS: dict[type, Callable[[SweepContext, Any], Any]] = {
     FetchOpenIssues: pre_handlers.fetch_open_issues,
     ResolveFate: pre_handlers.resolve_fate,
     StripAndFlag: pre_handlers.strip_and_flag,
+    CloseVerifiedNoChanges: pre_handlers.close_verified_no_changes,
     ProbeZeroArtifact: pre_handlers.probe_zero_artifact,
     ProbeCrossRepoScope: pre_handlers.probe_cross_repo_scope,
     ParkOrReclaim: pre_handlers.park_or_reclaim,
@@ -290,6 +326,7 @@ HANDLERS: dict[type, Callable[[SweepContext, Any], Any]] = {
     OpenPrForBranch: open_pr_for_branch,
     AdvanceToPrOpen: advance_to_pr_open,
     CreditDeadWorker: credit_dead_worker,
+    ExemptThrottleCleanExit: exempt_throttle_clean_exit,
     ReadTerminal: read_terminal,
     ReadCompletedOutcome: read_completed_outcome,
     ReadBlockedOutcome: read_blocked_outcome,

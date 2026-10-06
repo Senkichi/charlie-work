@@ -805,6 +805,8 @@ def _validate_gh_field_lists(add: Any, gh: GitHubLike) -> None:
             ["pr", "checks", str(pr_number)] if pr_number else None,
             PR_CHECKS_FIELDS,
         ),
+        # `label list` is a REST read with no `gh ... --json` argv row, so this
+        # probe goes through `label_list()` instead of `gh.run` (see below).
         "LABEL_LIST_FIELDS": (["label", "list", "--limit", "1"], LABEL_LIST_FIELDS),
         "RECONCILE_PR_FIELDS": (
             ["pr", "list", "--state", "all", "--limit", "1"],
@@ -837,27 +839,30 @@ def _validate_gh_field_lists(add: Any, gh: GitHubLike) -> None:
 
         cmd = [*base_cmd, "--json", fields]
         try:
-            gh.run(cmd, json_output=True)
+            if list_name == "LABEL_LIST_FIELDS":
+                gh.label_list()  # raises GitHubError on any failed read (#756)
+            else:
+                gh.run(cmd, json_output=True)
             add(f"gh field list: {list_name}", True, f"valid ({len(fields.split(','))} fields)")
         except GitHubError as exc:
             error_msg = str(exc)
-            # Classify errors: only actual field errors get the "invalid field(s)" label
-            # Field errors have a specific shape: "Unknown JSON field: ..." or "invalid JSON field: ..."
+            # Classify errors: only actual field errors get the "invalid field(s)" label.
+            # The probes are GraphQL reads (B13), so a field the schema lacks reads
+            # "Field 'x' doesn't exist on type ..." and one the transport has no
+            # mapping for reads "unknown --json field(s) for ...".
             is_field_error = any(
                 phrase in error_msg
-                for phrase in ("Unknown JSON field:", "invalid JSON field:", "invalid field")
+                for phrase in (
+                    "doesn't exist on type",
+                    "unknown --json field",
+                    "unknown run field",
+                    "Unknown JSON field:",
+                    "invalid JSON field:",
+                    "invalid field",
+                )
             )
 
-            # Special case: gh pr checks fails with non-zero exit when no CI is configured
-            # This is not a field error - it's a missing feature
-            if list_name == "PR_CHECKS_FIELDS" and "no checks reported" in error_msg.lower():
-                add(
-                    f"gh field list: {list_name}",
-                    True,
-                    "skipped (no CI configured on probe PR)",
-                    severity="warning",
-                )
-            elif is_field_error:
+            if is_field_error:
                 add(
                     f"gh field list: {list_name}",
                     False,

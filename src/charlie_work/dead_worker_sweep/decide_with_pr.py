@@ -19,6 +19,7 @@ from .model import (
     AdvanceToPrOpen,
     CreditDeadWorker,
     Escalate,
+    ExemptThrottleCleanExit,
     NoOpRoute,
     PreOutcome,
     ReadBlockedOutcome,
@@ -151,6 +152,33 @@ def _same_head(
         )
         return
     if ctx.exit_code == 0:
+        # Issue #2286: an exit-0 session whose log ENDS in a provider throttle is
+        # a provider death, not a no-op -- restore it like one. The handler's
+        # terminal-line check (never the whole transcript, per #656) decides;
+        # it also refunds the dispatch stamp, flags the PR, and arms the
+        # cooldown, so the fall-through path sees an unexempted exit as a real
+        # no-op.
+        throttle = yield ExemptThrottleCleanExit(
+            number, dispatched_at=entry.get("dispatched_at"), pr_number=ctx.pr_number
+        )
+        if throttle.failure_kind is not None:
+            entry["status"] = "rework_requested"
+            entry["dispatched_at"] = None
+            yield from flush(draft)
+            acc.throttled_until = throttle.throttled_until
+            yield emit(
+                "orphaned_worker_recovered",
+                {
+                    **ctx.base(),
+                    "new_status": "rework_requested",
+                    "reason": "dead_worker_clean_exit_throttle",
+                    **extra,
+                    **ctx.proc(),
+                    "worker_death_at": facts.stamp,
+                    "failure_kind": throttle.failure_kind,
+                },
+            )
+            return
         fingerprint = drift_fingerprint(
             reason="dead_worker_clean_exit_no_op", reviewed_head_sha=ctx.reviewed
         )
@@ -164,10 +192,11 @@ def _same_head(
             {**ctx.base(), "reason": "dead_worker_clean_exit_no_op", **extra, **ctx.proc()},
         )
         return
+    dispatched_at = entry.get("dispatched_at")
     entry["status"] = "rework_requested"
     entry["dispatched_at"] = None
     yield from flush(draft)
-    credit = yield CreditDeadWorker(number)
+    credit = yield CreditDeadWorker(number, dispatched_at=dispatched_at, pr_number=ctx.pr_number)
     acc.throttled_until = credit.throttled_until
     yield emit(
         "orphaned_worker_recovered",
@@ -280,8 +309,23 @@ def with_pr_flow(
     )
     last_decision = resolved.decision
 
-    if last_decision == "request_changes" and ctx.reviewed and ctx.live:
-        if ctx.reviewed == ctx.live:
+    # An issue can only be ``dispatched`` while its PR's verdict is ``approved`` if
+    # that dispatch is a post-approval rework (check failure or conflict), so the
+    # PR ``status`` is not consulted: carry-forward (#2135) can rewrite it back to
+    # ``approved`` mid-rework, and enumerating writers would rot.
+    if last_decision in ("request_changes", "approved") and ctx.reviewed and ctx.live:
+        if ctx.reviewed != ctx.live:
+            yield from _head_changed(facts, draft, acc, ctx, last_decision)
+        elif last_decision == "approved":
+            yield from _same_head(
+                facts,
+                draft,
+                acc,
+                ctx,
+                recovered_reason="dead_worker_with_approved_rework",
+                extra={"decision": "approved", "pr_state_status": pr_state.get("status")},
+            )
+        else:
             yield from _same_head(
                 facts,
                 draft,
@@ -290,26 +334,6 @@ def with_pr_flow(
                 recovered_reason="dead_worker_with_request_changes",
                 extra={},
             )
-        else:
-            yield from _head_changed(facts, draft, acc, ctx, last_decision)
-        return
-
-    status = pr_state.get("status")
-    if (
-        last_decision == "approved"
-        and status == "rework_requested"
-        and ctx.reviewed
-        and ctx.live
-        and ctx.reviewed == ctx.live
-    ):
-        yield from _same_head(
-            facts,
-            draft,
-            acc,
-            ctx,
-            recovered_reason="dead_worker_with_approved_rework",
-            extra={"decision": "approved", "pr_state_status": status},
-        )
         return
 
     if last_decision is None or last_decision == "pending":

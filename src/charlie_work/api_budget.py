@@ -1,4 +1,12 @@
-"""API worker spend ledger — atomic settlement and budget status (issue #480).
+"""API budgets: worker spend ledger + GitHub rate-limit budget (issue #480, ADR-0006).
+
+Two budgets live here. The worker spend ledger (issue #480, below) and the
+GitHub rate-limit budget (``GitHubRateBudget``, last section): pure values
+fed by the response headers of every GitHub transport adapter, so one budget
+sees every response. Both sections are I/O-free computation over frozen
+values (the ledger section adds atomic persistence).
+
+--- Worker spend ledger ---
 
 The paid ``api`` worker kind (#478) needs spend accounting: USD computed from
 stream-json token usage times configured provider pricing
@@ -46,9 +54,12 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Iterable, Mapping
+from typing import TYPE_CHECKING, Any, Iterable, Mapping
 
-from .config import ApiBudgetConfig, ApiProviderConfig
+from .atomic_write import write_json_atomic
+
+if TYPE_CHECKING:  # annotations only; keeps this module importable below config
+    from .config import ApiBudgetConfig, ApiProviderConfig
 
 logger = logging.getLogger(__name__)
 
@@ -493,17 +504,14 @@ def load_ledger(path: Path) -> Ledger:
 
 
 def save_ledger(path: Path, ledger: Ledger) -> None:
-    """Atomically persist ``ledger`` to ``path`` (temp-file + ``replace()``).
+    """Atomically persist ``ledger`` to ``path``.
 
-    Mirrors ``state.save_state`` / ``claude_code._write_json_atomic``: the
-    write is atomic so a concurrent reader never observes a half-written file.
+    Mirrors ``state.save_state`` / ``claude_code._write_json_atomic`` -- all
+    now delegating to ``atomic_write.write_json_atomic`` (unique temp name +
+    rename retry + orphan cleanup, issue #2265): a concurrent reader never
+    observes a half-written file.
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    with tmp_path.open("w", encoding="utf-8") as handle:
-        json.dump(ledger_to_dict(ledger), handle, indent=2, sort_keys=True)
-        handle.write("\n")
-    tmp_path.replace(path)
+    write_json_atomic(path, ledger_to_dict(ledger))
 
 
 def settle_session_to_disk(path: Path, entry: SessionEntry) -> bool:
@@ -557,6 +565,79 @@ def ledger_path(state_dir: Path | str) -> Path:
     return Path(state_dir) / LEDGER_FILENAME
 
 
+# ---------------------------------------------------------------------------
+# GitHub rate-limit budget (ADR-0006)
+# ---------------------------------------------------------------------------
+# Pure, in-memory, no I/O: the lock-holding runtime holder lives with the
+# transport (``github_transport.guarded.RateBudgetHolder``); this section only
+# defines the values and the two pure functions over them.
+
+
+@dataclass(frozen=True)
+class GitHubRateWindow:
+    resource: str  # "core" | "graphql" | "search" | ...
+    limit: int
+    remaining: int
+    reset_epoch: int
+    observed_epoch: float
+
+
+@dataclass(frozen=True)
+class GitHubRateBudget:
+    windows: tuple[GitHubRateWindow, ...] = ()
+
+
+def _header_int(values: Mapping[str, str], name: str) -> int | None:
+    raw = values.get(name)
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def observe_github_rate(
+    budget: GitHubRateBudget, headers: Iterable[tuple[str, str]], now: float
+) -> GitHubRateBudget:
+    """Return *budget* with the window named by the ``x-ratelimit-*`` headers
+    replaced (or added). Headers that are absent or malformed leave the
+    budget unchanged -- an unparsable response must not erase what is known.
+
+    The newest observation wins, judged by the server's own numbers rather than
+    arrival order (concurrent responses can land out of order): a later
+    ``reset`` is a newer window; within one window ``remaining`` only falls, so
+    the lower value is the newer. An observation that is older by either rule
+    leaves the budget unchanged."""
+    values = {name.lower(): value for name, value in headers}
+    limit = _header_int(values, "x-ratelimit-limit")
+    remaining = _header_int(values, "x-ratelimit-remaining")
+    reset = _header_int(values, "x-ratelimit-reset")
+    if limit is None or remaining is None or reset is None:
+        return budget
+    resource = values.get("x-ratelimit-resource") or "core"
+    window = GitHubRateWindow(resource, limit, remaining, reset, now)
+    current = next((w for w in budget.windows if w.resource == resource), None)
+    if current is not None and (
+        current.reset_epoch > reset
+        or (current.reset_epoch == reset and current.remaining < remaining)
+    ):
+        return budget
+    kept = tuple(w for w in budget.windows if w.resource != resource)
+    return GitHubRateBudget(windows=(*kept, window))
+
+
+def github_headroom(
+    budget: GitHubRateBudget, resource: str, now: float
+) -> GitHubRateWindow | None:
+    """The live window for *resource*, or ``None`` when it was never observed
+    or its reset time has passed (a stale window says nothing about now)."""
+    for window in budget.windows:
+        if window.resource == resource:
+            return window if window.reset_epoch > now else None
+    return None
+
+
 __all__ = [
     "LEDGER_FILENAME",
     "Usage",
@@ -572,4 +653,8 @@ __all__ = [
     "save_ledger",
     "ledger_to_dict",
     "ledger_path",
+    "GitHubRateWindow",
+    "GitHubRateBudget",
+    "observe_github_rate",
+    "github_headroom",
 ]

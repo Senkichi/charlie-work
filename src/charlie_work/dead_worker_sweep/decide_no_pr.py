@@ -12,6 +12,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from ..verified_no_changes import verified_detail
+from ..worker_fate import persisted_failure
 from .constants import PASSIVE_OPEN_STATUS
 from .decide_common import (
     Draft,
@@ -24,6 +26,7 @@ from .decide_common import (
 )
 from .decide_redispatch import decide_redispatch_cap
 from .model import (
+    CloseVerifiedNoChanges,
     Escalate,
     FateResult,
     FetchOpenIssues,
@@ -71,6 +74,25 @@ def triage_no_pr(facts: SweepFacts, no_pr: tuple[int, ...]) -> Flow:
             continue
         removed = sorted(active)
         fate = fates[number]
+        if fate.verified_no_changes:
+            # #2185: the worker's success outcome is consumed before any orphan
+            # classification. A refused claim falls through to today's handling.
+            detail = verified_detail(fate.worker_outcome)
+            closed = yield CloseVerifiedNoChanges(number, detail)
+            if closed.ok:
+                escalations[number] = (
+                    "verified_no_changes",
+                    {"removed_labels": list(closed.removed_labels), "detail": detail},
+                )
+                continue
+            yield emit(
+                "worker_verified_no_changes_ignored",  # event-consumer: audit-only -- a refused claim falls through to the normal orphan handling, whose own events (session_failed_relabeled) are the actionable signal
+                {
+                    "issue_number": number,
+                    "previous_status": "dispatched",
+                    "reason": closed.reason,
+                },
+            )
         if fate.blocked_escalatable:
             written = yield StripAndFlag(number, "worker_declared_blocked")
             escalations[number] = (
@@ -168,6 +190,24 @@ def lock_no_pr_flow(facts: SweepFacts, pre: PreOutcome, draft: Draft) -> Flow:
     config = facts.config
     stamp = facts.stamp
 
+    escalation = pre.escalations.get(number)
+    if escalation is not None and escalation[0] == "verified_no_changes":
+        # #2185: closed pre-lock; the close wins over a pushed-orphan candidate
+        # (a stale branch is left for the operator, never salvaged into a PR on
+        # the closed issue). Release the claim. Not an escalation, not a
+        # redispatch, and deliberately returns before the #1243 cap bookkeeping.
+        entry["status"] = "closed"
+        entry["orphan_flagged_at"] = stamp
+        yield emit(
+            "worker_verified_no_changes",  # event-consumer: audit-only -- terminal success record; the closed issue and its resolution comment are the operator-facing surface
+            {
+                "issue_number": number,
+                "previous_status": "dispatched",
+                "detail": escalation[1]["detail"],
+                "removed_labels": escalation[1]["removed_labels"],
+            },
+        )
+        return False
     candidate = pre.candidates.get(number)
     if candidate is not None:
         opened = yield OpenPrForBranch(number, candidate["branch"], "pushed_orphan")
@@ -217,7 +257,6 @@ def lock_no_pr_flow(facts: SweepFacts, pre: PreOutcome, draft: Draft) -> Flow:
         )
         return False
 
-    escalation = pre.escalations.get(number)
     if escalation is not None:
         kind, detail = escalation
         yield from flush(draft)
@@ -264,6 +303,7 @@ def lock_no_pr_flow(facts: SweepFacts, pre: PreOutcome, draft: Draft) -> Flow:
         stamp=stamp,
         # Sweep-start clock: decide reads no clock of its own. The original sampled wall
         # time at this call; the skew (seconds) is negligible against the 240-minute window.
+        # Intentional (#2114 F): revisit only if ``redispatch_window_minutes`` shrinks to minutes.
         now=pre.now,
     )
     history = list(verdict.orphan_redispatch_at)
@@ -309,6 +349,11 @@ def lock_no_pr_flow(facts: SweepFacts, pre: PreOutcome, draft: Draft) -> Flow:
             session_failed_relabeled_payload(
                 issue_number=number,
                 reason="dead_worker_no_open_pr_orphan_sweep",
+                # Issue #2289: the death event carries the classification so a
+                # throttle death is recognisable to attempt_resume. The stamp is
+                # written by persist_pre_classified in the lock phase, before
+                # this decide runs.
+                failure_kind=persisted_failure(entry).kind,
                 **reclaim,
             ),
         )

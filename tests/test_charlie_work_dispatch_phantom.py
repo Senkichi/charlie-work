@@ -20,6 +20,7 @@ from pathlib import Path
 from _fakes_github import FakeGitHub
 from _worktree_fixtures import (
     _init_bare_remote_and_clone,
+    _init_repo,
     _setup_completed_worktree,
 )
 from charlie_work.claude_code import ClaudeWorkerRecord
@@ -43,6 +44,10 @@ def test_dispatch_phantom_live_worker_frees_slot_and_reaps_sidecar(
     dead must not count as a live worker slot. The phantom slot is freed, the
     stale sidecar is reaped, active labels are stripped, ready is restored, and
     the issue is re-dispatchable on the next pass."""
+
+    # Issue #2262: the dead-worker salvage probe needs a real git repo to
+    # prove the branch carries no commits (the verdict that permits requeue).
+    _init_repo(tmp_path)
 
     def _fake_launch(issue_number, branch, prompt_text, **kwargs):
         return ClaudeWorkerRecord(
@@ -170,6 +175,10 @@ def test_dispatch_phantom_live_worker_no_active_labels_skips_relabel(
     terminal-only and spurious relabeling would resurrect it. A
     ``session_failed_relabeled`` event with empty ``removed_labels`` and
     ``added_ready=False`` is still recorded so the slot-free is observable."""
+
+    # Issue #2262: the dead-worker salvage probe needs a real git repo to
+    # prove the branch carries no commits (the verdict that permits requeue).
+    _init_repo(tmp_path)
 
     def _fake_launch(issue_number, branch, prompt_text, **kwargs):
         return ClaudeWorkerRecord(
@@ -563,6 +572,10 @@ def test_dispatch_phantom_live_worker_reaps_sidecar_when_pr_created_omitted(
     opposite of the sibling test's outcome.
     """
     from charlie_work.config import WORKER_OUTCOME_FILENAME
+
+    # Issue #2262: the dead-worker salvage probe needs a real git repo to
+    # prove the branch carries no commits (the verdict that permits requeue).
+    _init_repo(tmp_path)
 
     worktree_path = tmp_path / "wt"
     worktree_path.mkdir(parents=True, exist_ok=True)

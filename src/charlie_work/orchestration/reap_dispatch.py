@@ -9,11 +9,13 @@ protocol exactly as a lexical method did).
 
 Names reached through ``_wf.`` (module-object seam, design Section 3.1 rule 2,
 #1627): ``charlie_work.workflow`` module-level definitions ``CommandResult``,
-``ConcurrencyGovernorResult``, ``_MergedPRListOutcome`` (classes),
+``_MergedPRListOutcome`` (class),
 ``_state_lock_busy_result`` (free function); and Tier-D names patched on
 ``charlie_work.workflow`` by the suite, so the moved body must keep intercepting
-those patches: ``_count_live_sessions``, ``count_fleet_live_sessions``,
-``_log_worker_census``. All other free names are imported directly from their
+those patches: ``_log_worker_census``. The live-session counters
+(``_count_live_sessions``, ``count_fleet_live_sessions``) are reached through
+``host.current().sessions``, whose Real late-binds ``charlie_work.workflow.*`` so
+those patches still intercept. All other free names are imported directly from their
 defining module (a three-form, six-alias patch census confirms no test patches
 any of them on ``charlie_work.workflow``).
 """
@@ -26,7 +28,9 @@ from typing import Any
 import charlie_work.workflow as _wf
 from charlie_work.dispatch_deferral import records_deferral
 from charlie_work import layout
+from charlie_work.ci_absence import CiAbsence, runs_terminally_without_jobs
 from charlie_work.ci_headroom import ci_headroom_available
+from charlie_work.concurrency_governor_result import ConcurrencyGovernorResult
 from charlie_work.fleet_paths import fleet_dir
 from charlie_work.fleet_registry import registered_state_dirs, try_acquire_fleet_lock
 from charlie_work.github import GitHubError, GraphQLBudgetError
@@ -40,14 +44,24 @@ from charlie_work.dead_worker_sweep.effects_pr import _safe_repo_slug
 from charlie_work.dead_worker_sweep.effects_rework import _is_pr_updated_at_older_than
 
 
-def _detect_ci_run_never_created(
+def _detect_ci_absence(
     self,
     pr: dict[str, Any],
     verdict: JanitorVerdict,
     *,
     known_head: str | None = None,
-) -> str | None:
-    """Return the head SHA when Actions never created a run for it, else None.
+    reprobe_known_head: bool = False,
+) -> CiAbsence | None:
+    """Classify a terminally-absent required check for this head, else None.
+
+    Returns ``CiAbsence(kind="never_created")`` when Actions created no run
+    object for the head, or ``CiAbsence(kind="workflow_no_jobs")`` (issue
+    #1681) when it created runs but every one is ``completed`` and none can
+    ever report the missing required checks. ``_detect_ci_run_never_created``
+    is the original, never-created-only view of this.
+
+    Original contract (``never_created``): the head SHA when Actions never
+    created a run for it.
 
     A "Required check(s) missing" janitor failure is ambiguous between
     "still pending" and "GitHub never created a workflow run for this
@@ -77,6 +91,13 @@ def _detect_ci_run_never_created(
     ``gh api`` call is skipped -- otherwise a PR that stays escalated for
     days would re-query Actions on every single pass forever (this is the
     same population the grace period targets).
+
+    The marker only records ``never_created``, so honoring it forever would
+    blind this detector to a same-head transition to ``workflow_no_jobs``
+    (e.g. the stale-checks retrigger itself creates a run for the head that
+    then completes with no jobs). ``reprobe_known_head=True`` lets the caller
+    lift the skip for one bounded re-query; the caller owns the bound (see
+    ``review()``: once per ``stale_checks_retrigger_attempts`` value).
     """
     if not verdict.missing_required_checks:
         return None
@@ -87,10 +108,10 @@ def _detect_ci_run_never_created(
     if raw_head_sha is None:
         return None
     try:
-        head_sha = require_valid_sha(raw_head_sha, context="_detect_ci_run_never_created head_sha")
+        head_sha = require_valid_sha(raw_head_sha, context="_detect_ci_absence head_sha")
     except ValueError:
         return None
-    if known_head is not None and known_head == head_sha:
+    if known_head is not None and known_head == head_sha and not reprobe_known_head:
         return None
     if not _is_pr_updated_at_older_than(pr, datetime.now(UTC), grace_minutes):
         return None
@@ -98,8 +119,34 @@ def _detect_ci_run_never_created(
     # None means the query itself failed (rate limit, transient error) --
     # fail closed: only a successful, empty response is positive evidence
     # of "never created", never the absence of a successful response.
-    if head_runs is not None and len(head_runs) == 0:
-        return head_sha
+    if head_runs is None:
+        return None
+    if len(head_runs) == 0:
+        return CiAbsence(kind="never_created", head_sha=head_sha)
+    # Issue #1681: a run object exists, so "never created" is structurally
+    # blind to this head; every run being completed with no jobs is the
+    # terminal "workflow file rejected" signature.
+    if runs_terminally_without_jobs(head_runs):
+        return CiAbsence(kind="workflow_no_jobs", head_sha=head_sha)
+    return None
+
+
+def _detect_ci_run_never_created(
+    self,
+    pr: dict[str, Any],
+    verdict: JanitorVerdict,
+    *,
+    known_head: str | None = None,
+) -> str | None:
+    """Return the head SHA when Actions never created a run for it, else None.
+
+    The never-created-only view of ``_detect_ci_absence`` (see there for the
+    full rationale); the escalated-PR path and the stale-checks retrigger
+    consume this. Does not take ``state_lock``.
+    """
+    absence = self._detect_ci_absence(pr, verdict, known_head=known_head)
+    if absence is not None and absence.kind == "never_created":
+        return absence.head_sha
     return None
 
 
@@ -109,7 +156,7 @@ def _apply_concurrency_governor(
     *,
     live_count: int | None = None,
     apply_open_pr_backpressure: bool = False,
-) -> _wf.ConcurrencyGovernorResult:
+) -> ConcurrencyGovernorResult:
     """Apply global concurrency governor cap to a dispatch limit.
 
     Returns a ConcurrencyGovernorResult with the potentially-clamped limit
@@ -179,7 +226,7 @@ def _apply_concurrency_governor(
     if max_concurrent > 0 or ci_headroom_ratio > 0:
         if live_count is None:
             sessions_dir = self._layout.sessions_dir
-            live_count = _wf._count_live_sessions(sessions_dir, self.paths.state_file)
+            live_count = self.host.sessions.live_workers(sessions_dir, self.paths.state_file)
 
     if max_concurrent > 0:
         available_slots = max(0, max_concurrent - (live_count or 0))
@@ -189,7 +236,9 @@ def _apply_concurrency_governor(
             clamped_by = "max_concurrent"
 
     if fleet_max > 0:
-        fleet_live_count, _skipped_repos = _wf.count_fleet_live_sessions(self.fleet_dir_override)
+        fleet_live_count, _skipped_repos = self.host.sessions.fleet_live_workers(
+            self.fleet_dir_override
+        )
         fleet_available = max(0, fleet_max - fleet_live_count)
         if fleet_available < dispatch_limit:
             dispatch_limit = fleet_available
@@ -374,7 +423,7 @@ def _apply_concurrency_governor(
                 clamped = True
                 clamped_by = "host_load"
 
-    return _wf.ConcurrencyGovernorResult(
+    return ConcurrencyGovernorResult(
         clamped=clamped,
         max_concurrent=max_concurrent,
         live_count=live_count or 0,
@@ -543,3 +592,136 @@ def dispatch(
         )
     finally:
         launch_lock.release()
+
+
+def _probe_ci_absence(
+    self,
+    pr: dict[str, Any],
+    verdict: JanitorVerdict,
+    pr_state: dict[str, Any] | None,
+) -> tuple[str | None, str | None, int]:
+    """Run ``_detect_ci_absence`` for ``review()``'s janitor gate (issue #1681).
+
+    Returns ``(never_created_head, workflow_no_jobs_head, attempts)``. A head
+    already recorded as never-created is re-probed once per
+    ``stale_checks_retrigger_attempts`` value (bounded by the retrigger cap), so
+    a same-head transition to ``workflow_no_jobs`` is not masked by the dedup
+    marker. Does NOT take ``state_lock``.
+    """
+    pr_state = pr_state or {}
+    raw_attempts = pr_state.get("stale_checks_retrigger_attempts")
+    attempts = raw_attempts if isinstance(raw_attempts, int) else 0
+    # ``workflow_no_jobs`` is terminal for a head: the persisted marker is the
+    # classification, so a later same-head pass must not fall back to the
+    # (stale) ``ci_run_never_created_head`` marker, which would re-blind the
+    # detector and drop the PR into the retrigger lane. Still gated on the
+    # live "required check missing" signal and the current head matching.
+    cached_no_jobs_head = pr_state.get("workflow_no_jobs_head")
+    if (
+        cached_no_jobs_head
+        and verdict.missing_required_checks
+        and str(pr.get("headRefOid") or "") == cached_no_jobs_head
+    ):
+        return None, cached_no_jobs_head, attempts
+    absence = self._detect_ci_absence(
+        pr,
+        verdict,
+        known_head=pr_state.get("ci_run_never_created_head"),
+        reprobe_known_head=pr_state.get("ci_absence_probed_attempts") != attempts,
+    )
+    kind = absence.kind if absence is not None else None
+    head_sha = absence.head_sha if absence is not None else None
+    return (
+        head_sha if kind == "never_created" else None,
+        head_sha if kind == "workflow_no_jobs" else None,
+        attempts,
+    )
+
+
+def _record_ci_absence_state(
+    self,
+    state: dict[str, Any],
+    pr_state_update: dict[str, Any],
+    existing_pr_state: dict[str, Any],
+    pr: dict[str, Any],
+    verdict: JanitorVerdict,
+    issue_number: int | None,
+    *,
+    never_created_head: str | None,
+    workflow_no_jobs_head: str | None,
+    attempts: int,
+) -> dict[str, Any]:
+    """Persist the absence markers + once-per-head events; return ``state``.
+
+    Must be called inside ``state_lock``. Marker writes go into
+    ``pr_state_update`` (the caller's fresh dict) which is then stored on
+    ``state``. The ``workflow_no_jobs`` event dedup is event-only: routing is
+    NOT gated on the marker, so a rework that pushes nothing new is re-routed
+    (and capped by ``record_review``), never re-parked.
+    """
+    pr_number = pr_state_update["number"]
+    pr_state_update["ci_absence_probed_attempts"] = attempts
+    no_jobs_new = (
+        workflow_no_jobs_head is not None
+        and existing_pr_state.get("workflow_no_jobs_head") != workflow_no_jobs_head
+    )
+    never_created_new = (
+        never_created_head is not None
+        and existing_pr_state.get("ci_run_never_created_head") != never_created_head
+    )
+    if workflow_no_jobs_head is not None:
+        pr_state_update["workflow_no_jobs_head"] = workflow_no_jobs_head
+    if never_created_head is not None:
+        pr_state_update["ci_run_never_created_head"] = never_created_head
+    state["prs"][str(pr_number)] = pr_state_update
+
+    def payload(head: str | None) -> dict[str, Any]:
+        return {
+            "pr_number": pr_number,
+            "issue_number": issue_number,
+            "head_sha": head,
+            "branch": pr.get("headRefName"),
+            "missing_checks": list(verdict.missing_required_checks),
+        }
+
+    if no_jobs_new:
+        state = self._record_event(state, "workflow_no_jobs", payload(workflow_no_jobs_head))
+    if never_created_new:
+        state = self._record_event(state, "ci_run_never_created", payload(never_created_head))
+    return state
+
+
+def _route_workflow_no_jobs(
+    self,
+    pr: dict[str, Any],
+    pr_number: int,
+    issue_number: int,
+    verdict: JanitorVerdict,
+    head_sha: str,
+) -> Any:
+    """Route a ``workflow_no_jobs`` head to rework (issue #1681).
+
+    Retrigger cannot fix a rejected workflow file, so ``review()`` returns this
+    instead of re-parking the PR as ``janitor_blocked``.
+    """
+    self.write_gate.transition(
+        self.gh,
+        self.config.labels,
+        issue_number,
+        "review_started",
+        pr_number=pr_number,
+    )
+    missing = ", ".join(verdict.missing_required_checks)
+    diagnostic = (
+        f"workflow file invalid: run completed with no jobs created for head "
+        f"{head_sha}; required check(s) {missing} can never "
+        f"report for this head. Fix the workflow file and push."
+    )
+    return self.record_review(
+        pr_number,
+        "request_changes",
+        summary=diagnostic,
+        reviewed_head=pr.get("headRefOid"),
+        required_changes=[diagnostic],
+        verdict_provenance="ci_gate_auto_reject",
+    )

@@ -475,6 +475,17 @@ _ALLOWED_UNRESOLVED_KIND_SITES: tuple[_UnresolvedKindSite, ...] = (
         ),
     ),
     _UnresolvedKindSite(
+        path="dead_worker_sweep/apply_requests_lock.py",
+        scope="guarded_update",
+        source="kind",
+        reason=(
+            "The sweep apply shell forwards the ``GuardedUpdate.event`` kind to "
+            "append_event inside the write's lock window (#2113). The literal is "
+            "chosen in decide_post.py, and tests/test_dws_event_kinds.py scans "
+            "every ``event=(kind, ...)`` literal there."
+        ),
+    ),
+    _UnresolvedKindSite(
         path="dead_worker_sweep/apply_stalled.py",
         scope="_state_txn",
         source="commit.event_kind",
@@ -610,8 +621,8 @@ _ALLOWED_UNRESOLVED_KIND_SITES: tuple[_UnresolvedKindSite, ...] = (
         ),
     ),
     _UnresolvedKindSite(
-        path="reconcile.py",
-        scope="apply_fixes",
+        path="reconcile_salvage.py",
+        scope="apply_unpublished_work_salvage",
         source="salvage_skip_event_kind(skip_reason)",
         reason=(
             "Issue #1241: same salvage_skip_event_kind mapping as the "
@@ -619,7 +630,10 @@ _ALLOWED_UNRESOLVED_KIND_SITES: tuple[_UnresolvedKindSite, ...] = (
             "salvage lane and the workflow salvage lane share the single "
             "enforcement point in salvage_superseded.py. Both target literals "
             "are in _LEVEL_BY_KIND and verified by "
-            "test_salvage_skip_event_kind_only_returns_registered_kinds."
+            "test_salvage_skip_event_kind_only_returns_registered_kinds. "
+            "Issue #2226: the site moved verbatim from "
+            "reconcile.py/apply_fixes into reconcile_salvage.py when the "
+            "salvage lane was extracted for the file-size ratchet."
         ),
     ),
 )

@@ -28,7 +28,8 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, Callable, Sequence
 
-from . import fleet_registry, git_pull_blockers, layout, worktree
+from . import atomic_write, fleet_registry, git_pull_blockers, layout, worktree
+from .command_result import CommandResult
 from .config import WORKER_OUTCOME_FILENAME
 from .file_lock import ByteRangeFileLock, try_acquire_byte_range_lock
 from .git_retry import RetryOutcome, run_git_with_retry
@@ -57,7 +58,7 @@ from .pending_sync import (  # noqa: F401  (deliberate re-export)
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from .workflow import CommandResult, OrchestratorApp
+    from .workflow import OrchestratorApp
 
 
 # ---------------------------------------------------------------------------
@@ -501,9 +502,7 @@ def _repair_venv_pth(repo_root: Path, venv_path: Path) -> tuple[bool, str, list[
         if original.endswith("\n"):
             new_content += "\n"
         try:
-            tmp = pth.with_suffix(pth.suffix + ".tmp")
-            tmp.write_text(new_content, encoding="utf-8")
-            tmp.replace(pth)
+            atomic_write.write_text_atomic(pth, new_content)
         except OSError as exc:
             return False, f"failed to rewrite {pth.name}: {exc}", repaired_files
         repaired_files.append(pth.name)
@@ -831,10 +830,7 @@ def _read_failure_streak(path: Path) -> int:
 def _write_failure_streak(path: Path, count: int) -> None:
     """Persist the consecutive-failure count atomically (temp-file + replace)."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps({"consecutive_failures": count}, indent=2) + "\n"
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(payload, encoding="utf-8")
-    tmp.replace(path)
+    atomic_write.write_json_atomic(path, {"consecutive_failures": count})
 
 
 def _record_self_deploy_failure_streak(
@@ -933,10 +929,7 @@ def _read_zero_pass_streak(path: Path) -> int:
 def _write_zero_pass_streak(path: Path, count: int) -> None:
     """Persist the consecutive-zero-repo-pass-cycle count atomically (temp-file + replace)."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps({"consecutive_zero_pass_cycles": count}, indent=2) + "\n"
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(payload, encoding="utf-8")
-    tmp.replace(path)
+    atomic_write.write_json_atomic(path, {"consecutive_zero_pass_cycles": count})
 
 
 def record_zero_pass_streak(
@@ -1656,9 +1649,6 @@ def run_supervised(
     Returns ``CommandResult(ok=True)`` on clean drain or KeyboardInterrupt.
     Returns ``CommandResult(ok=False, ...)`` when the supervisor lock is held.
     """
-    # Import here to avoid circular imports (supervise ← workflow ← supervise)
-    from .workflow import CommandResult
-
     # Same interpreter-anchored refusal as run_fleet_supervise: a repointed
     # editable means everything below runs unreviewed code (issue #974).
     from .venv_anchor import verify_interpreter_anchored_editables

@@ -9,6 +9,8 @@ patch on the source module stays live exactly as it did against the original swe
 from __future__ import annotations
 
 import copy
+import logging
+import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -21,16 +23,30 @@ from .. import (
     no_pr_orphan_fate,
     worker_fate,
 )
-from . import effects_pr, effects_sessions, live_handoff
+from . import effects_pr, effects_sessions, live_handoff, pre_classification
 from ..cross_repo_gate import cross_repo_scope_gate
-from ..github import build_branch_issue_validator
+from ..github import GitHubError, build_branch_issue_validator
 from ..process_utils import find_worker_terminal_status
 from ..review_decision import review_decision
-from ..worktree import read_worker_outcome, worktree_path_for_branch
+from ..verified_no_changes import (
+    REFUSED_CLOSE_FAILED,
+    REFUSED_DRY_RUN,
+    REFUSED_ESCALATED,
+    REFUSED_NO_WORKTREE,
+    is_verified_no_changes,
+    resolution_comment,
+)
+from ..worktree import (
+    WorktreeState,
+    inspect_worktree_state,
+    read_worker_outcome,
+    worktree_path_for_branch,
+)
 from .apply_context import SweepContext
 from .decide_common import label_names
 from .model import (
     BackstopResult,
+    CloseVerifiedNoChanges,
     CollectLiveHandoff,
     FateResult,
     FetchOpenIssues,
@@ -54,7 +70,10 @@ from .model import (
     SalvagePushResult,
     ScopeResult,
     StripAndFlag,
+    VerifiedCloseResult,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _worktree(ctx: SweepContext, branch: str) -> Path | None:
@@ -157,6 +176,10 @@ def resolve_fate(ctx: SweepContext, req: ResolveFate) -> FateResult:
         branch = f"{ctx.config.dispatch.branch_prefix}-{number}-{slug}"
     ctx.branches[number] = branch
     worktree_path = _worktree(ctx, branch)
+    # Issue #2274: classify the dead worker's log BEFORE its fate resolves -- this
+    # is the first locus every pass reaches, ahead of the redispatch and phantom
+    # lanes that overwrite or reap the sidecar.
+    entry = pre_classification.classify_before_fate(ctx, number, entry)
     fate = no_pr_orphan_fate.resolve_no_pr_orphan_fate(
         issue_number=number,
         entry=entry,
@@ -186,6 +209,7 @@ def resolve_fate(ctx: SweepContext, req: ResolveFate) -> FateResult:
         blocked_reason_kind=str((outcome or {}).get("reason_kind") or "unknown"),
         blocked_detail=str((outcome or {}).get("detail") or ""),
         throttled=worker_fate.throttle_failure(fate) is not None,
+        verified_no_changes=is_verified_no_changes(outcome),
         worker_outcome=copy.deepcopy(outcome),
     )
 
@@ -194,10 +218,61 @@ def strip_and_flag(ctx: SweepContext, req: StripAndFlag) -> LabelWrite:
     issue_labels = label_names(_issue(ctx, req.issue))
     active = issue_labels & ctx.config.labels.active
     ok = escalation._strip_active_and_flag_human_needed(
-        ctx.gh, ctx.config, req.issue, active, issue_labels
+        ctx.gh, ctx.config, req.issue, active, issue_labels, write_gate=ctx.write_gate
     )
     ctx.escalations[req.kind][req.issue] = {"label_write_ok": ok}
     return LabelWrite(ok=bool(ok), removed_labels=tuple(sorted(active)))
+
+
+def close_verified_no_changes(
+    ctx: SweepContext, req: CloseVerifiedNoChanges
+) -> VerifiedCloseResult:
+    """Guard a ``verified_no_changes`` claim (#2185), then close the issue.
+
+    The claim is accepted only when the issue is not escalated and the worker's
+    worktree is provably clean at the dispatch base (``NO_COMMITS``: no commits
+    ahead, no worker-authored dirt). Anything else -- including a probe that
+    could not run -- refuses, and the sweep falls through to today's handling, so
+    a worker cannot use the outcome to abandon real work.
+    """
+    number = req.issue
+    labels = ctx.config.labels
+    issue_labels = label_names(_issue(ctx, number))
+    if (
+        issue_labels & {labels.human_needed, labels.operator_queue}
+        or ctx.issue_entry(number).get("status") == "escalated"
+    ):
+        return VerifiedCloseResult(ok=False, reason=REFUSED_ESCALATED)
+    if ctx.write_gate.dry_run:
+        return VerifiedCloseResult(ok=False, reason=REFUSED_DRY_RUN)
+    worktree = _worktree(ctx, ctx.branches.get(number, ""))
+    if worktree is None or not worktree.is_dir():
+        return VerifiedCloseResult(ok=False, reason=REFUSED_NO_WORKTREE)
+    inspection = inspect_worktree_state(
+        worktree,
+        ctx.config.dispatch.base_ref,
+        ctx.config.dispatch.injected_paths,
+        ctx.config.dispatch.materialize_dirs,
+    )
+    if inspection.state is not WorktreeState.NO_COMMITS:
+        return VerifiedCloseResult(ok=False, reason=f"worktree_{inspection.state.value}")
+    try:
+        with tempfile.TemporaryDirectory() as scratch:
+            body_path = Path(scratch) / "verified-no-changes-comment.md"
+            body_path.write_text(resolution_comment(req.detail), encoding="utf-8")
+            ctx.gh.issue_comment(number, body_path)
+    except (OSError, GitHubError):
+        # The resolution record is the operator's only trace of why this closed;
+        # without it the claim is not honoured (the next sweep pass retries).
+        logger.warning("verified_no_changes comment failed issue=%d", number, exc_info=True)
+        return VerifiedCloseResult(ok=False, reason=REFUSED_CLOSE_FAILED)
+    if not ctx.gh.close_issue(number):
+        return VerifiedCloseResult(ok=False, reason=REFUSED_CLOSE_FAILED)
+    active = issue_labels & labels.active
+    # Success edge: strips active + ready + merge-hold from a closed issue.
+    ctx.write_gate.transition(ctx.gh, labels, number, "closed_unmerged")
+    ctx.escalations["verified_no_changes"][number] = {"label_write_ok": True}
+    return VerifiedCloseResult(ok=True, removed_labels=tuple(sorted(active)))
 
 
 def probe_zero_artifact(ctx: SweepContext, req: ProbeZeroArtifact) -> bool:
@@ -264,6 +339,7 @@ def park_backstop(ctx: SweepContext, req: ParkBackstop) -> BackstopResult:
             ctx.escalations["worker_declared_blocked"],
             ctx.escalations["zero_artifact"],
             ctx.escalations["cross_repo_scope"],
+            ctx.escalations["verified_no_changes"],
         ),
         park_verdicts=ctx.park_verdicts,
         dead_dispatched_reap_minutes=ctx.config.watchdog.dead_dispatched_reap_minutes,

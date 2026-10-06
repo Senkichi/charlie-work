@@ -17,7 +17,7 @@ from ..config import (
     OrchestratorConfig,
 )
 from ..orphan_sweep import sweep_orphan_processes
-from ..process_utils import is_pid_alive
+from .. import host as _host
 from ..state import (
     load_state,
     load_state_locked,
@@ -352,7 +352,7 @@ def _worker_pid_alive(entry: dict[str, Any]) -> bool:
     if worker_pid is None:
         return False
 
-    return is_pid_alive(worker_pid, entry.get("worker_process_start_time"))
+    return _host.current().probe.is_alive(worker_pid, entry.get("worker_process_start_time"))
 
 
 def _orphan_head_fingerprint(remote_sha: str | None, local_sha: str | None) -> str:

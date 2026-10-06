@@ -46,7 +46,10 @@ from ci_fleet.github import GitHubError
 # rationale (it is shared with ``PullRequests`` members and, until this leaf,
 # with ``GitHub.issue_list``). ``issue_list`` (moved below) references it as a
 # bare global.
+from ..github_transport.json_read import JsonRead
+from ..github_transport.request import RestRequest
 from ._base import CapabilityCollaborator, GitHubRunResult, _LIST_LIMIT
+from ._send import read_json, send_text
 from .circuit_breaker_transport import circuit_breaker_state_path
 from .cross_repo_blockers import CrossRepoBlocker, make_blocker, repo_from_repository_url
 from ..instrumentation import log_event
@@ -332,50 +335,41 @@ class Issues(CapabilityCollaborator):
         if cached is not None:
             return cached
 
-        args = [
+        label_str = ", ".join(label_tuple) if label_tuple else "all"
+        read = JsonRead(
             "issue",
             "list",
-            "--limit",
-            str(_LIST_LIMIT),
-            "--state",
-            effective_state,
-            "--json",
             ISSUE_LIST_FIELDS,
-        ]
-        for label in label_tuple:
-            args.extend(["--label", label])
-
-        label_str = ", ".join(label_tuple) if label_tuple else "all"
-        result = self._list_json(
-            args,
+            state=effective_state,
+            labels=label_tuple,
             limit=_LIST_LIMIT,
+            long_call=True,
+        )
+        result = self._list_json(
+            read,
             kind=f"issues (labels={label_str}, state={effective_state})",
         )
         self._list_cache[cache_key] = result
         return result
 
     def issue_view(self, number: int) -> dict[str, Any]:
-        result = self.run(
-            [
-                "issue",
-                "view",
-                str(number),
-                "--json",
-                ISSUE_VIEW_FIELDS,
-            ],
-            json_output=True,
-        )
+        result = read_json(self, JsonRead("issue", "view", ISSUE_VIEW_FIELDS, number=number))
         return result if isinstance(result, dict) else {}
 
     def close_issue(self, number: int) -> bool:
         """Close an issue. Idempotent — returns True even if already closed.
 
-        Uses `gh issue close`. Returns True on success, False on failure.
+        PATCHes the issue state. Returns True on success, False on failure.
         Never raises — per-issue failures are reported as values and must not
         abort a batch operation.
         """
         try:
-            self.run(["issue", "close", str(number)])
+            send_text(
+                self,
+                RestRequest.of(
+                    "PATCH", f"repos/{{owner}}/{{repo}}/issues/{number}", body={"state": "closed"}
+                ),
+            )
             return True
         except GitHubError:
             return False

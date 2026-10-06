@@ -76,6 +76,11 @@ class Draft:
     def take(self) -> UpdateIssue | None:
         if self._dead:
             return None
+        deleted = sorted(key for key in self._base if key not in self.work)
+        if deleted:
+            raise ValueError(
+                f"Draft for issue {self.issue} deleted keys {deleted}; the diff cannot express deletions"
+            )
         diff = {
             key: copy.deepcopy(value)
             for key, value in self.work.items()
@@ -119,6 +124,12 @@ def label_names(item: Mapping[str, Any]) -> set[str]:
 
 def orphan_head_fingerprint(remote_sha: str | None, local_sha: str | None) -> str:
     return f"{remote_sha or 'none'}:{local_sha or 'none'}"
+
+
+# Single owner of the requeue event kind string. Producers emit it; readers
+# (e.g. attempt_resume's death filter) import this instead of re-spelling it,
+# so tests/test_dead_worker_salvage_seam.py can tell the two apart.
+SESSION_FAILED_RELABELED = "session_failed_relabeled"
 
 
 def session_failed_relabeled_payload(

@@ -36,9 +36,13 @@ absent, not merely unimported) that prove both real failure modes are gone.
 from __future__ import annotations
 
 import ast
+import json
+import os
+import shutil
 import subprocess
 import sys
 import textwrap
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 _HEARTBEAT_CHECK = Path(__file__).parent.parent / "scripts" / "heartbeat_check.py"
@@ -291,3 +295,82 @@ def test_heartbeat_check_imports_with_charlie_work_absent() -> None:
         f"the failure class the finding named:\n{result.stderr}"
     )
     assert "IMPORT_OK" in result.stdout
+
+
+# --- file-path leaf fallback (charlie_work absent, repo src/ present) ---------
+
+_SUPERVISOR_PROBE = """
+import importlib.util, sys
+from datetime import datetime, timezone
+
+spec = importlib.util.spec_from_file_location("heartbeat_check", r"{script}")
+module = importlib.util.module_from_spec(spec)
+sys.modules["heartbeat_check"] = module
+spec.loader.exec_module(module)
+report = module.Report()
+module.check_supervisor_heartbeat(report)
+for line in report.lines:
+    print(line)
+"""
+
+
+def _write_heartbeat(fleet: Path, last_beat: datetime, exited_at: str | None = None) -> None:
+    fleet.mkdir(parents=True, exist_ok=True)
+    (fleet / "supervisor-heartbeat.json").write_text(
+        json.dumps(
+            {
+                "last_beat_at": last_beat.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "pid": 7,
+                "exited_at": exited_at,
+                "max_pass_runtime_seconds": 1800,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def _run_probe(script: Path, fleet: Path) -> "subprocess.CompletedProcess[str]":
+    env = {**os.environ, "CHARLIE_WORK_FLEET_DIR": str(fleet)}
+    return subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            _CHARLIE_WORK_BLOCKER + textwrap.dedent(_SUPERVISOR_PROBE.format(script=script)),
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+
+def test_blocked_charlie_work_still_yields_real_supervisor_verdicts(tmp_path: Path) -> None:
+    """Wrong-venv scenario: the leaves load by file path, so formerly-stdlib
+    checks keep REAL verdicts instead of blanket "cannot evaluate"."""
+    fresh = tmp_path / "fresh"
+    _write_heartbeat(fresh, datetime.now(timezone.utc) - timedelta(minutes=5))
+    ok = _run_probe(_HEARTBEAT_CHECK, fresh)
+    assert ok.returncode == 0, ok.stderr
+    assert ok.stdout.startswith("OK supervisor-heartbeat:"), ok.stdout
+    assert "cannot evaluate" not in ok.stdout
+
+    stale = tmp_path / "stale"
+    _write_heartbeat(stale, datetime.now(timezone.utc) - timedelta(days=3))
+    bad = _run_probe(_HEARTBEAT_CHECK, stale)
+    assert bad.returncode == 0, bad.stderr
+    assert "ANOMALY supervisor-heartbeat" in bad.stdout, bad.stdout
+    assert "cannot evaluate" not in bad.stdout
+
+
+def test_both_import_paths_unavailable_reports_loud_anomaly(tmp_path: Path) -> None:
+    """With the package blocked AND no ``src/charlie_work`` beside the script,
+    the check reports the cannot-evaluate ANOMALY (never silently green)."""
+    scripts = tmp_path / "repo" / "scripts"
+    scripts.mkdir(parents=True)
+    for sibling in _HEARTBEAT_CHECK.parent.glob("heartbeat_*.py"):
+        shutil.copy(sibling, scripts / sibling.name)
+    fleet = tmp_path / "fleet"
+    _write_heartbeat(fleet, datetime.now(timezone.utc) - timedelta(minutes=5))
+    result = _run_probe(scripts / "heartbeat_check.py", fleet)
+    assert result.returncode == 0, result.stderr
+    assert "ANOMALY supervisor-heartbeat" in result.stdout, result.stdout
+    assert "cannot evaluate" in result.stdout

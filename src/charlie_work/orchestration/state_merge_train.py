@@ -340,11 +340,28 @@ def _finalize_externally_merged_issues(
             _wf.save_state(self.paths.state_file, state)
 
     for issue_number in issue_pr_map:
-        _wf.transition(self.gh, self.config.labels, issue_number, "merged")
+        merged_prs = issue_pr_map[issue_number]
+        _wf.transition(
+            self.gh,
+            self.config.labels,
+            issue_number,
+            "merged",
+            state_path=self.paths.state_file,
+            repo=self.repo_root.name,
+            pr_number=(int(merged_prs[0]["number"]) if merged_prs else None),
+            cause="finalize_externally_merged",
+        )
         self.gh.close_issue(issue_number)
 
     for issue_number in closed_unmerged_ready_issues:
-        _wf.transition(self.gh, self.config.labels, issue_number, "closed_unmerged")
+        _wf.transition(
+            self.gh,
+            self.config.labels,
+            issue_number,
+            "closed_unmerged",
+            state_path=self.paths.state_file,
+            repo=self.repo_root.name,
+        )
 
     finalized: set[int] = set(issue_pr_map.keys())
     removed = finalized | closed_unmerged_ready_issues

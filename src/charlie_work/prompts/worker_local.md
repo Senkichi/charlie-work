@@ -87,3 +87,5 @@ review-ready, and records the branch name on the issue for the human reviewer.
 Uncommitted work is invisible to it and is a task FAILURE.
 
 $section_blocked_outcome
+
+$section_verified_no_changes_outcome

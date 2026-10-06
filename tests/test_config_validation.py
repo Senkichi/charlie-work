@@ -523,7 +523,13 @@ def test_host_wide_error_and_unknown_sections_messages():
 
 def test_host_wide_sections_are_derived_from_root_field_markers():
     assert cv.host_wide_sections() == frozenset(
-        {"runner_allocation", "runner_capacity_escalation", "fleet_supervisor"}
+        {
+            "runner_allocation",
+            "runner_capacity_escalation",
+            "fleet_supervisor",
+            "test_slots",
+            "dashboard",
+        }
     )
 
 

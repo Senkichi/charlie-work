@@ -1,0 +1,5 @@
+info
+# TIS-CW-6: a worker launch for issues labelled `model:<tier>` was routed to the
+# first unrestricted worker chain entry of that model family. Payload: tier,
+# numbers, chain_index, harness, model. Expected operation, not a fault; the
+# rollout step 5 canary reads it.

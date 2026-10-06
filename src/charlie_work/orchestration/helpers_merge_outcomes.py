@@ -74,6 +74,11 @@ def merge_check(self, pr_number: int) -> _wf.CommandResult:
     A preflight must be a pure question. The shared invariant is the pair
     ``decision == "approved"`` and ``reviewed_head_sha == headRefOid``,
     asserted identically here and in ``_pr_review_approved_at_head``.
+
+    Deliberately NOT ``@_guard_state_lock``: this takes no state lock, and the
+    guard's contract is to return a *successful* skip (ok=True) when the lock
+    is held. On an authorization preflight that would be fail-open -- "cannot
+    tell" rendered as "yes". Keep this function lock-free and pure.
     """
     pr = self.gh.pr_view(pr_number)
     if not isinstance(pr, dict) or not pr:

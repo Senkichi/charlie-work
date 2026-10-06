@@ -43,17 +43,19 @@ from charlie_work.workflow import OrchestratorApp
 from _local_gate_async_fixtures import (  # noqa: E402
     FAIL_SUITE,
     SLEEP_SUITE,
+    UNALLOCATABLE_PID,
     _adopt_and_approve,
     _commit_file,
-    _dead_pid,
     _event_kinds,
     _events_of_kind,
+    _gate_identity,
     _gate_paths,
     _init_repo,
     _kill_claimed_gate,
     _lane_app,
     _lane_config,
     _make_branch,
+    _seed_dead_claim,
     _wait_for_result,
     _wait_pid_dead,
 )
@@ -178,6 +180,31 @@ def test_approved_record_launches_suite_and_pass_returns_immediately(
         assert launched[0]["payload"]["pid"] == pid
         # The suite is genuinely still running -- the pass did not wait for it.
         assert is_pid_alive(pid)
+    finally:
+        _kill_claimed_gate(app, 7)
+
+
+def test_gate_suite_runs_with_the_reserved_slot_env(lane_repo: Path) -> None:
+    """Issue #2124 wiring: the launched suite sees the plugin armed for the gate
+    role (slot 0), not the agent role."""
+    _init_repo(lane_repo)
+    issues_dir = lane_repo / "docs" / "issues"
+    head = _make_branch(lane_repo, "agent/issue-7-x", "a.py", "a = 1\n")
+    out = lane_repo / "gate-env.txt"
+    suite = (
+        "python -c \"import os,pathlib; pathlib.Path(r'" + str(out) + "').write_text("
+        "os.environ.get('CHARLIE_TEST_SLOT_ROLE','')+'|'+os.environ.get('PYTEST_PLUGINS',''))\""
+    )
+    config = _lane_config(lane_repo, issues_dir, dispatch={"test_command": suite})
+    app = _lane_app(lane_repo, issues_dir, config=config)
+    _adopt_and_approve(app, issues_dir, 7, "agent/issue-7-x", head)
+    app._local_merge_approved()
+    try:
+        _wait_for_pid_file(app, 7)
+        deadline = time.monotonic() + 30
+        while (not out.exists() or not out.stat().st_size) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert out.read_text(encoding="utf-8").startswith("gate|test_slot_plugin")
     finally:
         _kill_claimed_gate(app, 7)
 
@@ -447,7 +474,8 @@ def test_timeout_kills_tree_and_relaunches_without_rework(lane_repo: Path) -> No
     _adopt_and_approve(app, issues_dir, 7, "agent/issue-7-x", head)
 
     app._local_merge_approved()
-    pid = int(load_state_locked(app.paths.state_file)["prs"]["7"]["local_suite_pid"])
+    identity = _gate_identity(app, 7)
+    pid = identity[0]
     _backdate_gate_start(app, 7)
 
     try:
@@ -458,7 +486,7 @@ def test_timeout_kills_tree_and_relaunches_without_rework(lane_repo: Path) -> No
         state = load_state_locked(app.paths.state_file)
         assert state["prs"]["7"]["status"] == "approved"
         assert state["prs"]["7"]["local_suite_infra_relaunch_count"] == 1
-        assert int(state["prs"]["7"]["local_suite_pid"]) != pid
+        assert _gate_identity(app, 7) != identity
         assert "local_suite_failed" not in _event_kinds(app)
         assert "local_suite_infra_relaunched" in _event_kinds(app)
     finally:
@@ -478,33 +506,38 @@ def test_dead_pid_missing_result_relaunches_bounded_then_escalates(
     _adopt_and_approve(app, issues_dir, 7, "agent/issue-7-x", head)
 
     app._local_merge_approved()
-    launched_pids = {int(load_state_locked(app.paths.state_file)["prs"]["7"]["local_suite_pid"])}
+    launched = {_gate_identity(app, 7)}
 
-    for orphan in range(1, LOCAL_SUITE_GATE_MAX_ORPHANS + 1):
+    try:
+        for orphan in range(1, LOCAL_SUITE_GATE_MAX_ORPHANS + 1):
+            _kill_claimed_gate(app, 7)
+            # The kill is not atomic: the runner wrapper can write a rc!=0 result in
+            # the window between its child and itself dying. That is an infra
+            # outcome (#2127), not the orphan this test exercises -- drop it.
+            _gate_paths(app, 7).result.unlink(missing_ok=True)
+            results = app._local_merge_approved()
+            assert results[0]["outcome"] == "suite_launched", f"orphan {orphan}"
+            state = load_state_locked(app.paths.state_file)
+            # Launch identity, not bare pid: the OS may reuse a dead wrapper's pid.
+            identity = _gate_identity(app, 7)
+            assert identity not in launched
+            launched.add(identity)
+            assert state["prs"]["7"]["local_suite_orphan_count"] == orphan
+            # Never green on a missing result.
+            assert state["prs"]["7"]["status"] == "approved"
+
         _kill_claimed_gate(app, 7)
-        # The kill is not atomic: the runner wrapper can write a rc!=0 result in
-        # the window between its child and itself dying. That is an infra
-        # outcome (#2127), not the orphan this test exercises -- drop it.
-        _gate_paths(app, 7).result.unlink(missing_ok=True)
+        _gate_paths(app, 7).result.unlink(missing_ok=True)  # kill-window result, see above
         results = app._local_merge_approved()
-        assert results[0]["outcome"] == "suite_launched", f"orphan {orphan}"
+
+        assert results[0]["outcome"] == "error"
         state = load_state_locked(app.paths.state_file)
-        pid = int(state["prs"]["7"]["local_suite_pid"])
-        assert pid not in launched_pids
-        launched_pids.add(pid)
-        assert state["prs"]["7"]["local_suite_orphan_count"] == orphan
-        # Never green on a missing result.
-        assert state["prs"]["7"]["status"] == "approved"
-
-    _kill_claimed_gate(app, 7)
-    _gate_paths(app, 7).result.unlink(missing_ok=True)  # kill-window result, see above
-    results = app._local_merge_approved()
-
-    assert results[0]["outcome"] == "error"
-    state = load_state_locked(app.paths.state_file)
-    assert state["prs"]["7"]["status"] == "escalated"
-    assert state["prs"]["7"]["escalation_reason"] == "local_merge_error"
-    assert "local_merge_failed" in _event_kinds(app)
+        assert state["prs"]["7"]["status"] == "escalated"
+        assert state["prs"]["7"]["escalation_reason"] == "local_merge_error"
+        assert "local_merge_failed" in _event_kinds(app)
+    finally:
+        # A failing assert must not leak the live time.sleep(600) wrapper.
+        _kill_claimed_gate(app, 7)
 
 
 def test_malformed_result_file_is_never_green(lane_repo: Path) -> None:
@@ -513,35 +546,34 @@ def test_malformed_result_file_is_never_green(lane_repo: Path) -> None:
     _init_repo(lane_repo)
     issues_dir = lane_repo / "docs" / "issues"
     head = _make_branch(lane_repo, "agent/issue-7-x", "a.py", "a = 1\n")
-    app = _lane_app(lane_repo, issues_dir)
+    # SLEEP_SUITE keeps the relaunched wrapper alive until ``finally`` (#2252).
+    config = _lane_config(lane_repo, issues_dir, dispatch={"test_command": SLEEP_SUITE})
+    app = _lane_app(lane_repo, issues_dir, config=config)
     _adopt_and_approve(app, issues_dir, 7, "agent/issue-7-x", head)
     paths = _gate_paths(app, 7)
     paths.gate_dir.mkdir(parents=True, exist_ok=True)
     paths.result.write_text("{not json", encoding="utf-8")
-    with state_lock(app.paths.state_file):
-        state = load_state(app.paths.state_file)
-        state["prs"]["7"].update(
-            {
-                "local_suite_pid": _dead_pid(),
-                "local_suite_process_start_time": None,
-                "local_suite_started_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
-                "local_suite_log": str(paths.log),
-                "local_suite_gate_dir": str(paths.gate_dir),
-                "local_suite_head": head,
-                "local_suite_base_sha": branch_head_sha(lane_repo, "main"),
-            }
-        )
-        save_state(app.paths.state_file, state)
+    # A recycled just-exited pid could read live (or be reused by the
+    # relaunch itself), so the stale claim uses an unallocatable pid (#2207).
+    stale_pid = UNALLOCATABLE_PID
+    _seed_dead_claim(app, lane_repo, 7, head)
 
     results = app._local_merge_approved()
 
     try:
         assert results[0]["outcome"] == "suite_launched"
         state = load_state_locked(app.paths.state_file)
-        assert state["prs"]["7"]["status"] == "approved"
+        record = state["prs"]["7"]
+        assert record["status"] == "approved"
+        assert record["local_suite_orphan_count"] == 1
         assert not is_ancestor(lane_repo, head, branch_head_sha(lane_repo, "main"))
-        # The stale file was cleared by the relaunch; a real pid now claims.
-        assert is_pid_alive(int(state["prs"]["7"]["local_suite_pid"]))
+        # A fresh (pid, start-time) claim replaced the stale one (#2207) and
+        # the launch scrubbed the malformed file before the spawn.
+        new_pid, new_start = _gate_identity(app, 7)
+        assert new_pid != stale_pid
+        assert new_start
+        assert not paths.result.exists()
+        assert is_pid_alive(new_pid, new_start)
     finally:
         _kill_claimed_gate(app, 7)
 
@@ -561,20 +593,7 @@ def test_result_for_wrong_head_is_not_accepted(lane_repo: Path) -> None:
         '{"ok": true, "returncode": 0, "head_sha": "deadbeef", "argv": []}',
         encoding="utf-8",
     )
-    with state_lock(app.paths.state_file):
-        state = load_state(app.paths.state_file)
-        state["prs"]["7"].update(
-            {
-                "local_suite_pid": _dead_pid(),
-                "local_suite_process_start_time": None,
-                "local_suite_started_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
-                "local_suite_log": str(paths.log),
-                "local_suite_gate_dir": str(paths.gate_dir),
-                "local_suite_head": head,
-                "local_suite_base_sha": branch_head_sha(lane_repo, "main"),
-            }
-        )
-        save_state(app.paths.state_file, state)
+    _seed_dead_claim(app, lane_repo, 7, head)
 
     results = app._local_merge_approved()
 
@@ -695,3 +714,72 @@ def test_suite_log_captures_output_under_dispatch_dir(lane_repo: Path) -> None:
     assert paths.log.is_file()
     assert paths.gate_dir.is_relative_to(app.paths.dispatches)
     assert "marker-stdout" in paths.log.read_text(encoding="utf-8", errors="surrogateescape")
+
+
+def test_ff_deferral_keeps_green_pairing_and_retries_merge_only(lane_repo: Path) -> None:
+    """Issue #2189: a green suite whose fast-forward is deferred (the base
+    checkout is dirty on a path the branch touches) must not re-run the suite
+    once the dirt clears -- the tested head/base pairing is unchanged, so the
+    next pass retries the merge alone."""
+    _init_repo(lane_repo)
+    issues_dir = lane_repo / "docs" / "issues"
+    head = _make_branch(lane_repo, "agent/issue-7-x", "a.py", "a = 1\n")
+    app = _lane_app(lane_repo, issues_dir)
+    _adopt_and_approve(app, issues_dir, 7, "agent/issue-7-x", head)
+
+    app._local_merge_approved()
+    assert _wait_for_result(app, 7)["ok"] is True
+    # Operator WIP in the base checkout on a path the branch adds: the
+    # ``git merge --ff-only`` refuses to overwrite it.
+    dirt = lane_repo / "a.py"
+    dirt.write_text("operator wip\n", encoding="utf-8")
+
+    results = app._local_merge_approved()
+    assert results[0]["outcome"] == "deferred"
+    launches_before = len(_events_of_kind(app, "local_suite_launched"))
+
+    # A deferred pairing still holds the gate: re-deferring while dirty
+    # must not relaunch either.
+    results = app._local_merge_approved()
+    assert results[0]["outcome"] == "deferred"
+    assert len(_events_of_kind(app, "local_suite_launched")) == launches_before
+
+    dirt.unlink()
+    results = app._local_merge_approved()
+
+    assert results[0]["outcome"] in ("merged", "already_merged")
+    assert len(_events_of_kind(app, "local_suite_launched")) == launches_before
+    assert is_ancestor(lane_repo, head, branch_head_sha(lane_repo, "main"))
+    record = load_state_locked(app.paths.state_file)["prs"]["7"]
+    assert record["status"] == "merged"
+    assert record.get("local_suite_passed_head") is None
+    assert record.get("local_suite_passed_base") is None
+
+
+def test_ff_deferral_then_base_moves_relaunches_suite(lane_repo: Path) -> None:
+    """Issue #2189: the retained green pairing is only honoured while the base
+    is unchanged -- a base that advances after the deferral invalidates it and
+    the gate re-syncs and re-runs, exactly as before."""
+    _init_repo(lane_repo)
+    issues_dir = lane_repo / "docs" / "issues"
+    head = _make_branch(lane_repo, "agent/issue-7-x", "a.py", "a = 1\n")
+    app = _lane_app(lane_repo, issues_dir)
+    _adopt_and_approve(app, issues_dir, 7, "agent/issue-7-x", head)
+
+    app._local_merge_approved()
+    assert _wait_for_result(app, 7)["ok"] is True
+    dirt = lane_repo / "a.py"
+    dirt.write_text("operator wip\n", encoding="utf-8")
+    assert app._local_merge_approved()[0]["outcome"] == "deferred"
+    dirt.unlink()
+    _commit_file(lane_repo, "base_new.py", "n = 1\n", "base moved after deferral")
+
+    try:
+        results = app._local_merge_approved()
+
+        assert results[0]["outcome"] == "suite_launched"
+        record = load_state_locked(app.paths.state_file)["prs"]["7"]
+        assert record.get("local_suite_passed_head") is None
+        assert not is_ancestor(lane_repo, head, branch_head_sha(lane_repo, "main"))
+    finally:
+        _kill_claimed_gate(app, 7)

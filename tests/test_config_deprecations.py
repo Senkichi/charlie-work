@@ -615,7 +615,7 @@ def test_config_retirement_ready_edge_marks_ready_and_clears_workflow():
         {"name": "agent:needs-rework"},
     ]
 
-    result = transition(gh, labels, 123, "config_retirement_ready")
+    result = transition(gh, labels, 123, "config_retirement_ready", state_path=None)
 
     assert result.outcome is TransitionOutcome.APPLIED
     assert (123, "automated-ready") in gh.labels_added

@@ -23,6 +23,7 @@ from unittest.mock import patch
 from _dispatch_fixtures import _stub_real_activity_probe_for_stalled_tests  # noqa: F401
 from _fakes_github import FakeGitHub
 from _rework_dispatch_fixtures import _wg
+from _host_fixtures import host_probe
 from charlie_work.config import WorkerRoleConfig
 
 
@@ -166,7 +167,7 @@ def test_live_pid_stale_outcome_opens_pr_without_waiting_for_exit(tmp_path: Path
 
     # The incident's whole point: the PID is still alive, so the dead-PID
     # lanes must never see this issue -- yet the PR still gets opened.
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=True):
+    with host_probe(alive=True):
         _detect_and_handle_orphaned_workers(
             sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
         )
@@ -246,7 +247,7 @@ def test_live_pid_fresh_outcome_does_not_finalize(tmp_path: Path) -> None:
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
 
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=True):
+    with host_probe(alive=True):
         _detect_and_handle_orphaned_workers(
             sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
         )
@@ -293,7 +294,7 @@ def test_live_pid_stale_outcome_disabled_by_config(tmp_path: Path) -> None:
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
 
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=True):
+    with host_probe(alive=True):
         _detect_and_handle_orphaned_workers(
             sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
         )
@@ -336,7 +337,7 @@ def test_live_pid_stale_non_handoff_outcome_does_not_finalize(tmp_path: Path) ->
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
 
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=True):
+    with host_probe(alive=True):
         _detect_and_handle_orphaned_workers(
             sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
         )
@@ -391,7 +392,7 @@ def test_live_pid_stale_outcome_skipped_when_pr_already_exists(tmp_path: Path) -
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
 
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=True):
+    with host_probe(alive=True):
         _detect_and_handle_orphaned_workers(
             sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
         )
@@ -441,7 +442,7 @@ def test_live_pid_stale_outcome_pr_create_failed_emits_stranded_drift_once(
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
 
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=True):
+    with host_probe(alive=True):
         _detect_and_handle_orphaned_workers(
             sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
         )
@@ -491,7 +492,7 @@ def test_live_pid_without_outcome_file_does_not_finalize(tmp_path: Path) -> None
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
 
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=True):
+    with host_probe(alive=True):
         _detect_and_handle_orphaned_workers(
             sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
         )
@@ -540,7 +541,7 @@ def test_live_pid_no_stale_outcome_never_calls_pr_list(tmp_path: Path) -> None:
 
     with (
         patch.object(fake_gh, "pr_list", wraps=fake_gh.pr_list) as pr_list_spy,
-        patch("charlie_work.workflow._worker_pid_alive", return_value=True),
+        host_probe(alive=True),
     ):
         _detect_and_handle_orphaned_workers(
             sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
@@ -584,7 +585,7 @@ def test_live_pid_finalize_honors_workflow_patch_of_open_pr_helper(tmp_path: Pat
     sessions_dir.mkdir(parents=True, exist_ok=True)
 
     with (
-        patch("charlie_work.workflow._worker_pid_alive", return_value=True),
+        host_probe(alive=True),
         patch(
             "charlie_work.workflow._open_pr_for_orphaned_branch",
             return_value=(None, "stubbed failure", None),
@@ -655,7 +656,7 @@ def _live_sweep(config, paths, fake_gh, sessions_dir) -> int:
 
     with (
         patch.object(fake_gh, "pr_list", wraps=fake_gh.pr_list) as pr_list_spy,
-        patch("charlie_work.workflow._worker_pid_alive", return_value=True),
+        host_probe(alive=True),
     ):
         _detect_and_handle_orphaned_workers(
             sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)

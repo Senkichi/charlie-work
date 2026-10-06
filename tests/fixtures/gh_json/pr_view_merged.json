@@ -1,0 +1,352 @@
+{
+  "fields": "number,title,url,headRefName,baseRefName,body,isDraft,labels,author,updatedAt,reviewDecision,statusCheckRollup,state,mergeable,additions,deletions,headRefOid,isCrossRepository,mergeStateStatus,closingIssuesReferences,closedAt,mergedAt",
+  "gh_json": {
+    "additions": 285,
+    "author": {
+      "id": "MDQ6VXNlcjI1NjcwNTk0",
+      "is_bot": false,
+      "login": "Senkichi",
+      "name": "Senkichi"
+    },
+    "baseRefName": "main",
+    "body": "Closes #2094\n\n## Problem\nOn a no-remote repo, a rework worker that dies without committing was parked by `local_work_park.park_unpublishable_work` (`agent:review-ready`, `open_passive`). The branch head still equals the verdict's `reviewed_head_sha`, so `_local_review_packets` sees no new head, and `_local_dispatch_rework` selects only `rework_requested`. Nothing picked the issue up again (mdls wedge, 2026-09-29).\n\n## Fix (at the park edge, the single point of enforcement)\nNew `src/charlie_work/local_noop_rework_rearm.py::rearm_no_op_local_rework`, called from `park_unpublishable_work` before the `local_work_ready` transition. When the branch head equals the local PR record's `reviewed_head_sha` AND the record status is a pending rework (`request_changes`, or `rework_requested` as set by `_route_to_rework` for an approved verdict sent back for conflict/CI), it restores issue+PR status `rework_requested` and applies the `rework_requested` label edge (the same edge `_route_to_rework` uses). It increments the existing `no_op_rework_attempts` counter on the PR record. Once attempts exceed `review.max_no_op_rework_attempts`, it escalates via `_escalate_issue` (reason `no_op_rework_attempts_cap_exceeded`, mechanical) with the matching escalation label edge. Otherwise (head moved, no pending rework, head unresolvable) it returns `None` and the park proceeds exactly as before.\n\n## Invariant enumeration (every exit of `rearm_no_op_local_rework`)\n- head unresolvable (`branch_head_sha` is None) -> `None`, normal park (existing tests use non-git dirs and still park).\n- no local record with pending rework at this head (worker committed, or no record) -> `None`, normal park.\n- attempts <= cap -> state `rework_requested` + label edge; label failure returns `(False, error)` (caller falls to its redispatch cap, same as the park's own failure contract).\n- attempts > cap -> `escalated` state + escalation label edge; same failure contract.\n- dry-run -> state written through `write_gate`, label transition is a gate no-op, returns `(True, None)`.\nNo path leaves the issue passive for a no-op rework.\n\n## Tests\n`tests/test_local_noop_rework_rearm.py` (real git repo + real `LocalFileGitHub`): request_changes no-commit exit re-arms; approved-then-merge-conflict (#144 shape) re-arms; a worker that committed still parks review-ready (control); repeat is bounded and escalates at the cap.\n\n### Commands run\n- `uv run --extra dev pytest tests/test_local_noop_rework_rearm.py -q --tb=short` -> 4 passed\n- `uv run --extra dev pytest tests/test_local_noop_rework_rearm.py tests/test_local_review_ready.py tests/test_orphan_sweep_local_park.py tests/test_orphan_sweep_backstop_local_park.py tests/test_unescalate_local_park.py tests/test_local_issues_merge_gate.py -q --tb=short` -> exit 0, all passed (progress line only, `-q`)\n- `uv run --extra dev pytest tests/test_file_size_ratchet.py tests/test_dormant_fleet_marking.py tests/test_event_kind_consumers.py -q --tb=short` -> exit 0\n- `uv run ruff check .` -> All checks passed; `uv run ruff format --check .` -> 1021 files already formatted\n- No public signature/return shape changed, so the full suite was not run locally (CI is the gate).\n\n### Mutation check\nReverted ONLY `src/charlie_work/local_work_park.py` to its merge-base version (drops the call to `rearm_no_op_local_rework`). Run against it:\n```\nFAILED tests/test_local_noop_rework_rearm.py::test_no_commit_exit_rearms_rework[request_changes-request_changes]\nFAILED tests/test_local_noop_rework_rearm.py::test_no_commit_exit_rearms_rework[approved-rework_requested]\nFAILED tests/test_local_noop_rework_rearm.py::test_repeat_is_bounded_then_escalates\nAssertionError: assert 'open_passive' == 'escalated'\n```\n(The committed-worker control test passes in both states, as intended.) With the fix restored the 4 tests pass (`4 passed` above).\n\n## Risks / uncertain areas\n- The cap reuses the PR record's `no_op_rework_attempts` (reset to 0 by the local lane on each new packet adoption) rather than the issue-level redispatch window; bounded, but a repeated no-commit exit on the same head burns the same counter as the janitor no-op lane.\n- `_local_dispatch_rework` still requires `rework-prompt.md`; it was written at the original rework routing and is not recreated here (a missing prompt is already reported as a skip, not silent).\n- Registered the new event kind via `src/charlie_work/event_levels/local_no_op_rework_rearmed.level` (`warning`); `tests/test_instrumentation_event_kind_registry.py`, `tests/test_local_noop_rework_rearm.py` and `tests/test_event_kind_consumers.py` pass together (exit 0) at the pushed head.\n- Not security-sensitive. New audit event `local_no_op_rework_rearmed` is marked audit-only (state + label are the actionable signal).",
+    "closedAt": "2026-09-30T23:59:01Z",
+    "closingIssuesReferences": [
+      {
+        "id": "I_kwDOTL3PGc8AAAABUOq_UA",
+        "number": 2094,
+        "repository": {
+          "id": "R_kgDOTL3PGQ",
+          "name": "charlie-work",
+          "owner": {
+            "id": "MDQ6VXNlcjI1NjcwNTk0",
+            "login": "Senkichi"
+          }
+        },
+        "url": "https://github.com/Senkichi/charlie-work/issues/2094"
+      }
+    ],
+    "deletions": 0,
+    "headRefName": "agent/issue-2094-fix-local-lane-no-commit-rework-exit-parks-as-re",
+    "headRefOid": "fb05ca4434feaebd0c03a2dfc6ac064b5f52f42c",
+    "isCrossRepository": false,
+    "isDraft": false,
+    "labels": [
+      {
+        "color": "BFD4F2",
+        "description": "Aviator MergeQueue trigger",
+        "id": "LA_kwDOTL3PGc8AAAACsOBcCg",
+        "name": "mergequeue"
+      }
+    ],
+    "mergeStateStatus": "UNKNOWN",
+    "mergeable": "UNKNOWN",
+    "mergedAt": "2026-09-30T23:59:01Z",
+    "number": 2121,
+    "reviewDecision": "",
+    "state": "MERGED",
+    "statusCheckRollup": [
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-30T22:44:32Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/Senkichi/charlie-work/actions/runs/36787230378/job/110131444543",
+        "name": "Attachment Contracts (shadow)",
+        "startedAt": "2026-09-30T22:43:53Z",
+        "status": "COMPLETED",
+        "workflowName": "Attachment Contracts"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-30T23:04:06Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/Senkichi/charlie-work/actions/runs/36787230376/job/110131445676",
+        "name": "Tests",
+        "startedAt": "2026-09-30T22:43:53Z",
+        "status": "COMPLETED",
+        "workflowName": "CI"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-30T22:44:38Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/Senkichi/charlie-work/actions/runs/36787227887/job/110131440448",
+        "name": "Analyze (actions)",
+        "startedAt": "2026-09-30T22:43:52Z",
+        "status": "COMPLETED",
+        "workflowName": "CodeQL"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-30T22:45:13Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/Senkichi/charlie-work/actions/runs/36787227887/job/110131440635",
+        "name": "Analyze (python)",
+        "startedAt": "2026-09-30T22:43:52Z",
+        "status": "COMPLETED",
+        "workflowName": "CodeQL"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-30T22:44:32Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/Senkichi/charlie-work/actions/runs/36787230378/job/110131444844",
+        "name": "Build attachment-contracts wheel",
+        "startedAt": "2026-09-30T22:43:53Z",
+        "status": "COMPLETED",
+        "workflowName": "Attachment Contracts"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-30T22:44:36Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/Senkichi/charlie-work/actions/runs/36787230376/job/110131445874",
+        "name": "Lint",
+        "startedAt": "2026-09-30T22:43:53Z",
+        "status": "COMPLETED",
+        "workflowName": "CI"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-30T22:45:12Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/Senkichi/charlie-work/actions/runs/36787230376/job/110131445871",
+        "name": "Collect-only gate",
+        "startedAt": "2026-09-30T22:43:53Z",
+        "status": "COMPLETED",
+        "workflowName": "CI"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-30T22:44:31Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/Senkichi/charlie-work/runs/110131635841",
+        "name": "CodeQL",
+        "startedAt": "2026-09-30T22:44:28Z",
+        "status": "COMPLETED",
+        "workflowName": ""
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-09-30T23:58:59Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://app.aviator.co/queue",
+        "name": "aviator/checks",
+        "startedAt": "2026-09-30T23:58:59Z",
+        "status": "COMPLETED",
+        "workflowName": ""
+      }
+    ],
+    "title": "fix(local-lane): re-arm no-commit rework exit instead of parking review-ready",
+    "updatedAt": "2026-09-30T23:59:03Z",
+    "url": "https://github.com/Senkichi/charlie-work/pull/2121"
+  },
+  "graphql_data": {
+    "repository": {
+      "pullRequest": {
+        "additions": 285,
+        "author": {
+          "__typename": "User",
+          "id": "MDQ6VXNlcjI1NjcwNTk0",
+          "login": "Senkichi",
+          "name": "Senkichi"
+        },
+        "baseRefName": "main",
+        "body": "Closes #2094\n\n## Problem\nOn a no-remote repo, a rework worker that dies without committing was parked by `local_work_park.park_unpublishable_work` (`agent:review-ready`, `open_passive`). The branch head still equals the verdict's `reviewed_head_sha`, so `_local_review_packets` sees no new head, and `_local_dispatch_rework` selects only `rework_requested`. Nothing picked the issue up again (mdls wedge, 2026-09-29).\n\n## Fix (at the park edge, the single point of enforcement)\nNew `src/charlie_work/local_noop_rework_rearm.py::rearm_no_op_local_rework`, called from `park_unpublishable_work` before the `local_work_ready` transition. When the branch head equals the local PR record's `reviewed_head_sha` AND the record status is a pending rework (`request_changes`, or `rework_requested` as set by `_route_to_rework` for an approved verdict sent back for conflict/CI), it restores issue+PR status `rework_requested` and applies the `rework_requested` label edge (the same edge `_route_to_rework` uses). It increments the existing `no_op_rework_attempts` counter on the PR record. Once attempts exceed `review.max_no_op_rework_attempts`, it escalates via `_escalate_issue` (reason `no_op_rework_attempts_cap_exceeded`, mechanical) with the matching escalation label edge. Otherwise (head moved, no pending rework, head unresolvable) it returns `None` and the park proceeds exactly as before.\n\n## Invariant enumeration (every exit of `rearm_no_op_local_rework`)\n- head unresolvable (`branch_head_sha` is None) -> `None`, normal park (existing tests use non-git dirs and still park).\n- no local record with pending rework at this head (worker committed, or no record) -> `None`, normal park.\n- attempts <= cap -> state `rework_requested` + label edge; label failure returns `(False, error)` (caller falls to its redispatch cap, same as the park's own failure contract).\n- attempts > cap -> `escalated` state + escalation label edge; same failure contract.\n- dry-run -> state written through `write_gate`, label transition is a gate no-op, returns `(True, None)`.\nNo path leaves the issue passive for a no-op rework.\n\n## Tests\n`tests/test_local_noop_rework_rearm.py` (real git repo + real `LocalFileGitHub`): request_changes no-commit exit re-arms; approved-then-merge-conflict (#144 shape) re-arms; a worker that committed still parks review-ready (control); repeat is bounded and escalates at the cap.\n\n### Commands run\n- `uv run --extra dev pytest tests/test_local_noop_rework_rearm.py -q --tb=short` -> 4 passed\n- `uv run --extra dev pytest tests/test_local_noop_rework_rearm.py tests/test_local_review_ready.py tests/test_orphan_sweep_local_park.py tests/test_orphan_sweep_backstop_local_park.py tests/test_unescalate_local_park.py tests/test_local_issues_merge_gate.py -q --tb=short` -> exit 0, all passed (progress line only, `-q`)\n- `uv run --extra dev pytest tests/test_file_size_ratchet.py tests/test_dormant_fleet_marking.py tests/test_event_kind_consumers.py -q --tb=short` -> exit 0\n- `uv run ruff check .` -> All checks passed; `uv run ruff format --check .` -> 1021 files already formatted\n- No public signature/return shape changed, so the full suite was not run locally (CI is the gate).\n\n### Mutation check\nReverted ONLY `src/charlie_work/local_work_park.py` to its merge-base version (drops the call to `rearm_no_op_local_rework`). Run against it:\n```\nFAILED tests/test_local_noop_rework_rearm.py::test_no_commit_exit_rearms_rework[request_changes-request_changes]\nFAILED tests/test_local_noop_rework_rearm.py::test_no_commit_exit_rearms_rework[approved-rework_requested]\nFAILED tests/test_local_noop_rework_rearm.py::test_repeat_is_bounded_then_escalates\nAssertionError: assert 'open_passive' == 'escalated'\n```\n(The committed-worker control test passes in both states, as intended.) With the fix restored the 4 tests pass (`4 passed` above).\n\n## Risks / uncertain areas\n- The cap reuses the PR record's `no_op_rework_attempts` (reset to 0 by the local lane on each new packet adoption) rather than the issue-level redispatch window; bounded, but a repeated no-commit exit on the same head burns the same counter as the janitor no-op lane.\n- `_local_dispatch_rework` still requires `rework-prompt.md`; it was written at the original rework routing and is not recreated here (a missing prompt is already reported as a skip, not silent).\n- Registered the new event kind via `src/charlie_work/event_levels/local_no_op_rework_rearmed.level` (`warning`); `tests/test_instrumentation_event_kind_registry.py`, `tests/test_local_noop_rework_rearm.py` and `tests/test_event_kind_consumers.py` pass together (exit 0) at the pushed head.\n- Not security-sensitive. New audit event `local_no_op_rework_rearmed` is marked audit-only (state + label are the actionable signal).",
+        "closedAt": "2026-09-30T23:59:01Z",
+        "closingIssuesReferences": {
+          "nodes": [
+            {
+              "id": "I_kwDOTL3PGc8AAAABUOq_UA",
+              "number": 2094,
+              "repository": {
+                "id": "R_kgDOTL3PGQ",
+                "name": "charlie-work",
+                "owner": {
+                  "id": "MDQ6VXNlcjI1NjcwNTk0",
+                  "login": "Senkichi"
+                }
+              },
+              "url": "https://github.com/Senkichi/charlie-work/issues/2094"
+            }
+          ]
+        },
+        "deletions": 0,
+        "headRefName": "agent/issue-2094-fix-local-lane-no-commit-rework-exit-parks-as-re",
+        "headRefOid": "fb05ca4434feaebd0c03a2dfc6ac064b5f52f42c",
+        "isCrossRepository": false,
+        "isDraft": false,
+        "labels": {
+          "nodes": [
+            {
+              "color": "BFD4F2",
+              "description": "Aviator MergeQueue trigger",
+              "id": "LA_kwDOTL3PGc8AAAACsOBcCg",
+              "name": "mergequeue"
+            }
+          ]
+        },
+        "mergeStateStatus": "UNKNOWN",
+        "mergeable": "UNKNOWN",
+        "mergedAt": "2026-09-30T23:59:01Z",
+        "number": 2121,
+        "reviewDecision": null,
+        "state": "MERGED",
+        "statusCheckRollup": {
+          "contexts": {
+            "nodes": [
+              {
+                "__typename": "CheckRun",
+                "checkSuite": {
+                  "workflowRun": {
+                    "event": "pull_request",
+                    "workflow": {
+                      "name": "Attachment Contracts"
+                    }
+                  }
+                },
+                "completedAt": "2026-09-30T22:44:32Z",
+                "conclusion": "SUCCESS",
+                "detailsUrl": "https://github.com/Senkichi/charlie-work/actions/runs/36787230378/job/110131444543",
+                "name": "Attachment Contracts (shadow)",
+                "startedAt": "2026-09-30T22:43:53Z",
+                "status": "COMPLETED"
+              },
+              {
+                "__typename": "CheckRun",
+                "checkSuite": {
+                  "workflowRun": {
+                    "event": "pull_request",
+                    "workflow": {
+                      "name": "CI"
+                    }
+                  }
+                },
+                "completedAt": "2026-09-30T23:04:06Z",
+                "conclusion": "SUCCESS",
+                "detailsUrl": "https://github.com/Senkichi/charlie-work/actions/runs/36787230376/job/110131445676",
+                "name": "Tests",
+                "startedAt": "2026-09-30T22:43:53Z",
+                "status": "COMPLETED"
+              },
+              {
+                "__typename": "CheckRun",
+                "checkSuite": {
+                  "workflowRun": {
+                    "event": "dynamic",
+                    "workflow": {
+                      "name": "CodeQL"
+                    }
+                  }
+                },
+                "completedAt": "2026-09-30T22:44:38Z",
+                "conclusion": "SUCCESS",
+                "detailsUrl": "https://github.com/Senkichi/charlie-work/actions/runs/36787227887/job/110131440448",
+                "name": "Analyze (actions)",
+                "startedAt": "2026-09-30T22:43:52Z",
+                "status": "COMPLETED"
+              },
+              {
+                "__typename": "CheckRun",
+                "checkSuite": {
+                  "workflowRun": {
+                    "event": "dynamic",
+                    "workflow": {
+                      "name": "CodeQL"
+                    }
+                  }
+                },
+                "completedAt": "2026-09-30T22:45:13Z",
+                "conclusion": "SUCCESS",
+                "detailsUrl": "https://github.com/Senkichi/charlie-work/actions/runs/36787227887/job/110131440635",
+                "name": "Analyze (python)",
+                "startedAt": "2026-09-30T22:43:52Z",
+                "status": "COMPLETED"
+              },
+              {
+                "__typename": "CheckRun",
+                "checkSuite": {
+                  "workflowRun": {
+                    "event": "pull_request",
+                    "workflow": {
+                      "name": "Attachment Contracts"
+                    }
+                  }
+                },
+                "completedAt": "2026-09-30T22:44:32Z",
+                "conclusion": "SUCCESS",
+                "detailsUrl": "https://github.com/Senkichi/charlie-work/actions/runs/36787230378/job/110131444844",
+                "name": "Build attachment-contracts wheel",
+                "startedAt": "2026-09-30T22:43:53Z",
+                "status": "COMPLETED"
+              },
+              {
+                "__typename": "CheckRun",
+                "checkSuite": {
+                  "workflowRun": {
+                    "event": "pull_request",
+                    "workflow": {
+                      "name": "CI"
+                    }
+                  }
+                },
+                "completedAt": "2026-09-30T22:44:36Z",
+                "conclusion": "SUCCESS",
+                "detailsUrl": "https://github.com/Senkichi/charlie-work/actions/runs/36787230376/job/110131445874",
+                "name": "Lint",
+                "startedAt": "2026-09-30T22:43:53Z",
+                "status": "COMPLETED"
+              },
+              {
+                "__typename": "CheckRun",
+                "checkSuite": {
+                  "workflowRun": {
+                    "event": "pull_request",
+                    "workflow": {
+                      "name": "CI"
+                    }
+                  }
+                },
+                "completedAt": "2026-09-30T22:45:12Z",
+                "conclusion": "SUCCESS",
+                "detailsUrl": "https://github.com/Senkichi/charlie-work/actions/runs/36787230376/job/110131445871",
+                "name": "Collect-only gate",
+                "startedAt": "2026-09-30T22:43:53Z",
+                "status": "COMPLETED"
+              },
+              {
+                "__typename": "CheckRun",
+                "checkSuite": {
+                  "workflowRun": null
+                },
+                "completedAt": "2026-09-30T22:44:31Z",
+                "conclusion": "SUCCESS",
+                "detailsUrl": "https://github.com/Senkichi/charlie-work/runs/110131635841",
+                "name": "CodeQL",
+                "startedAt": "2026-09-30T22:44:28Z",
+                "status": "COMPLETED"
+              },
+              {
+                "__typename": "CheckRun",
+                "checkSuite": {
+                  "workflowRun": null
+                },
+                "completedAt": "2026-09-30T23:58:59Z",
+                "conclusion": "SUCCESS",
+                "detailsUrl": "https://app.aviator.co/queue",
+                "name": "aviator/checks",
+                "startedAt": "2026-09-30T23:58:59Z",
+                "status": "COMPLETED"
+              }
+            ]
+          }
+        },
+        "title": "fix(local-lane): re-arm no-commit rework exit instead of parking review-ready",
+        "updatedAt": "2026-09-30T23:59:03Z",
+        "url": "https://github.com/Senkichi/charlie-work/pull/2121"
+      }
+    }
+  },
+  "number": 2121,
+  "resource": "pr"
+}

@@ -106,6 +106,8 @@ from .config_deprecations import emit_deprecated_key_reads, repo_state_path
 # not land in this over-cap monolith (file-size ratchet, issue #1442);
 # ``config.py`` wires the dataclass into ``OrchestratorConfig`` and delegates
 # parsing (including the legacy ``supervisor.<key>`` fallback) to it.
+from .test_slots import SlotPoolConfig  # noqa: F401  (deliberate re-export)
+from .dashboard.config import DashboardConfig  # noqa: F401  (deliberate re-export)
 from .fleet_supervisor_config import (  # noqa: F401  (deliberate re-export)
     FleetSupervisorConfig,
     parse_fleet_supervisor,
@@ -179,7 +181,7 @@ DETERMINISTIC_ESCALATION_FAILURE_KINDS: frozenset[str] = frozenset(
 # actively fights the safety system that raised the escalation and risks a
 # second writer on a branch that already has divergent local work.
 DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS: frozenset[str] = frozenset(
-    {"worktree_unsafe_local_commits"}
+    {"worktree_unsafe_local_commits", "worktree_unsafe_uncommitted_work"}
 )
 # Deliberately excluded: "worktree_probe_failed" (see worktree.WorktreeProbeFailedError).
 # A failed safety probe (e.g. git status --porcelain hitting an index lock) is
@@ -245,6 +247,13 @@ class LabelConfig:
     human_needed: str = "agent:human-needed"
     prose_only_deps: str = "agent:prose-only-deps"
     merge_hold: str = "agent:merge-hold"
+    # TIS-CW-7: the generic issue priority. ``<prefix><level>`` (default
+    # ``priority:critical`` / ``high`` / ``normal`` / ``low``) orders fresh
+    # dispatch and puts a critical issue's PR at the front of the Aviator queue
+    # (``issue_priority``). A prefix, not a label: whoever files the issue
+    # creates the label, so it is not a member of ``all`` or
+    # ``workflow_labels``. An empty prefix turns both off.
+    priority_prefix: str = "priority:"
     # Issue #1266: mechanical escalations (reason_class == "mechanical") land
     # here instead of ``human_needed``, so human attention is reserved for
     # judgment calls. Unlike ``prose_only_deps`` -- the only other
@@ -290,6 +299,12 @@ class LabelConfig:
     # like ``collect_gate_exempt``, this is a human-applied escape hatch, not
     # a state the label-transition machine ever adds or removes on its own.
     cross_repo_override: str = "agent:cross-repo-override"
+    # TIS-CW-6: the generic per-issue model tier. An issue labelled
+    # ``<prefix><tier>`` (default ``model:opus``) launches on the first worker
+    # chain entry of that model family (``model_tier``). A prefix, not a label:
+    # whoever files the issue creates the label, so it is not a member of
+    # ``all`` or ``workflow_labels``. An empty prefix turns the routing off.
+    model_tier_prefix: str = "model:"
 
     @property
     def terminal(self) -> set[str]:
@@ -559,6 +574,13 @@ class DispatchConfig:
     # unpushed commits there keep refusing either way, because a salvage push
     # is real.
     archive_unreachable_local_commits: Annotated[bool, Typed] = True
+    # Issue #2289: a fresh redispatch whose previous attempt died of a provider
+    # throttle (rate_limited, quota_exhausted, ...) is seeded from the work that
+    # death preserved (rescue ref or attempt ref) instead of restarting from the
+    # base, so an issue needing more than one rate-limit window can finish. ON by
+    # default; set to false to restore the always-clean-base behavior. Any
+    # conflict or error falls back to the clean base either way.
+    resume_throttled_attempts: Annotated[bool, Typed] = True
 
     def __post_init__(self) -> None:
         # Normalize to a tuple of forward-slash strings. The writer marker is
@@ -968,6 +990,16 @@ class ReviewDispatchConfig:
     # packet, operator unescalate). 0 disables the bound (preserves the
     # pre-fix unbounded rollback — not recommended).
     max_consecutive_review_log_unreadable: Annotated[int, Typed, NonNeg] = 3
+    # Issue #1808: a dead reviewer whose terminal result event is an
+    # ``api_error`` with a provider-side status (429/500/502/503/529) is a
+    # provider outage, not a PR defect. The first N consecutive such deaths on
+    # one PR roll back the claim without consuming the dispatch attempt budget
+    # and arm the fleet-wide reviewer backoff; past N they become counted
+    # failures so a persistent per-PR poison still converges on the
+    # ``max_review_dispatch_attempts`` cap. The streak resets on any definitive
+    # outcome (recorded verdict, non-api death, new packet, operator
+    # unescalate). 0 disables the rollback (api errors count as before).
+    max_consecutive_review_api_errors: Annotated[int, Typed, NonNeg] = 3
     # Maximum agentic turns for a reviewer session. Caps token spend per
     # review by limiting how many tool-call round-trips the reviewer can make.
     # 0 means unlimited (preserves pre-existing behavior). 40 is generous for
@@ -1160,6 +1192,13 @@ class AutoMergeConfig:
     # merged, so no new post-merge bookkeeping is added here. Default None
     # preserves today's self-merge behavior byte-for-byte.
     mergequeue_label: Annotated[str | None, Typed, NonEmpty] = None
+    # TIS-CW-7: Aviator's skip-line label (``merge_rules.labels.skip_line`` in the
+    # repo's ``.aviator/config.yml``). The hand-off adds it, before
+    # ``mergequeue_label``, to a PR whose linked issue carries
+    # ``<labels.priority_prefix>critical``, so Aviator queues it at the front.
+    # Only the hand-off reads it, so it does nothing unless ``mergequeue_label``
+    # is set. ``null`` is the kill switch.
+    mergequeue_skip_line_label: Annotated[str | None, Typed, NonEmpty] = "mergequeue-skip-line"
     # Issue #1194: GitHub account login of the merge-queue bot (e.g.
     # "aviator-app[bot]") whose branch sync-merges the #502 unauthorized-merge
     # tripwire may recognize as approval-covered. Deployment config, not
@@ -1231,7 +1270,7 @@ class AutoMergeConfig:
         # Normalizations (not rules): the label/login thread verbatim into
         # `gh pr edit --add-label <label>` / a commit-author comparison, so surrounding
         # whitespace must not survive; the wedge window is stored as a float.
-        for name in ("mergequeue_label", "queue_bot_login"):
+        for name in ("mergequeue_label", "mergequeue_skip_line_label", "queue_bot_login"):
             value = getattr(self, name)
             if isinstance(value, str):
                 object.__setattr__(self, name, value.strip())
@@ -1397,10 +1436,8 @@ class RuntimeConfig:
     # REST-GET/graphql read shapes, behind the same `GitHub.run()` seam.
     # Ships enabled by default (owner directive: no default-off knobs) --
     # "gh" is a kill-switch value for reverting a single repo to the
-    # subprocess-only path, not an opt-in. `GitHub` instances constructed
-    # without a `RuntimeConfig` at all (tests, legacy direct callers) do NOT
-    # get this default -- see `github_capabilities/http_transport.py`'s
-    # `_DEFAULT_GH_TRANSPORT` for why that fallback stays "gh".
+    # subprocess-only path, not an opt-in. A `GitHub` constructed without a
+    # `RuntimeConfig` also uses HTTP (ADR-0006).
     gh_transport: Annotated[str, Typed, OneOf("http", "gh")] = "http"
     # cw#1273: outer retry for `gh pr create` specifically, layered on top of
     # GitHub.run()'s inner pre-connection-only retry above. The inner retry's
@@ -1423,6 +1460,13 @@ class RuntimeConfig:
     # few hundred KB of JSON and preserves far more diagnostic history when a
     # single sweep emits repetitive events. Tuned via config (issue #525).
     event_ring_size: Annotated[int, Typed, AtLeastOne] = 2000
+    # Issue #2195: directories (relative paths resolve against the repo root)
+    # holding interactive operator session worktrees -- Claude Code puts them
+    # under ``.claude/worktrees``. Foreign-checkout adoption refuses any
+    # worktree that resolves under one: an interactive session writes no
+    # ``.charlie-writer.json`` marker, so the marker gate cannot see it. On by
+    # default; set to ``[]`` to restore marker-only adoption gating.
+    operator_worktree_roots: Annotated[tuple[str, ...], Typed, NotNull] = (".claude/worktrees",)
     # Extra safety margin added to provider-reported rate-limit reset times
     # when computing the ``throttled_until`` defer deadline. Provider reset
     # estimates are floors, not guarantees; dispatching at T+0 races the
@@ -2518,6 +2562,10 @@ class OrchestratorConfig:
     fleet_supervisor: Annotated[FleetSupervisorConfig, HostWideOnly] = field(
         default_factory=FleetSupervisorConfig
     )
+    # One machine, one slot pool (issue #2124): host-wide like the runner sections.
+    test_slots: Annotated[SlotPoolConfig, HostWideOnly] = field(default_factory=SlotPoolConfig)
+    # One dashboard per machine (ADR-0008): host-wide like the fleet supervisor.
+    dashboard: Annotated[DashboardConfig, HostWideOnly] = field(default_factory=DashboardConfig)
     post_mortem: PostMortemConfig = field(default_factory=PostMortemConfig)
     heartbeat: HeartbeatConfig = field(default_factory=HeartbeatConfig)
 

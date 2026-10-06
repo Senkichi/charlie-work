@@ -25,6 +25,10 @@ from charlie_work.claude_code import _events_path
 from charlie_work.devin_review_resume import resume_exec_rejected_review
 from charlie_work.harnesses import REVIEWER_ADAPTER_KINDS
 from charlie_work.process_utils import find_worker_terminal_status
+from charlie_work.review_deploy_interruption import (
+    deploy_interrupted_review,
+    self_deploy_state_path,
+)
 from charlie_work.stalled_review_reap import (
     _detect_and_handle_stalled_reviews,
     _reap_completed_review_checkouts,
@@ -38,6 +42,7 @@ from charlie_work.verdict_parsing import (
     _parse_review_verdict_from_log,
     _reviewer_session_metrics,
 )
+from charlie_work.state import without_review_dispatch_claim
 from charlie_work.worker import iter_workers
 
 
@@ -65,23 +70,68 @@ def _reap_review_verdicts(self, reviews_dir: Path) -> dict[str, Any]:
     Returns a dict with ``recorded`` and ``missed`` verdict info lists for
     the dispatch result and the fleet attention digest.
     """
-    recorded: list[dict[str, Any]] = []
-    missed: list[dict[str, Any]] = []
 
-    for w in iter_workers(reviews_dir):
-        if w.adapter_kind not in REVIEWER_ADAPTER_KINDS:
-            continue
-        if w.is_alive():
-            continue
+    # Helpers are nested, not module-level: every top-level def in an
+    # orchestration module is installed onto OrchestratorApp by
+    # workflow_delegation._install_delegates, so a module-level helper would
+    # silently grow the class's conserved member surface (issue #2110).
 
-        pr_number = w.issue_number
+    def _release_reap_claim(self, pr_number: int, claim_key: str) -> None:
+        """Drop this sweep's claim when it took no terminal action (issue #2110).
+
+        Without a verdict, summary or terminal record the next pass must retry, as
+        it did before the claim existed. Only our own claim is cleared.
+        """
         with _wf.state_lock(self.paths.state_file):
             state = _wf.load_state(self.paths.state_file)
-            pr_state = state["prs"].get(str(pr_number), {})
-            if pr_state.get("review_dispatch_status") != "review_dispatch_dispatched":
-                continue
-            issue_number = pr_state.get("issue_number")
+            ps = state["prs"].get(str(pr_number))
+            if ps and ps.get("review_reaped_for") == claim_key:
+                state["prs"][str(pr_number)] = {**ps, "review_reaped_for": None}
+                # write-gate-exempt(issue=2110): same raw state write shape as the other review-reap sites in this module; no write_gate param.
+                _wf.save_state(self.paths.state_file, state)
 
+    def _reviewer_alive(reviews_dir: Path, pr_number: int) -> bool:
+        """True when any review-capable sidecar for this PR names a live process."""
+        return any(
+            cur.issue_number == pr_number
+            and cur.adapter_kind in REVIEWER_ADAPTER_KINDS
+            and cur.is_alive()
+            for cur in iter_workers(reviews_dir)
+        )
+
+    def _is_current_dead_session(reviews_dir: Path, w: Any) -> bool:
+        """True when the sidecar on disk NOW is still ``w`` and its process is dead.
+
+        ``w`` comes from an eager snapshot; a concurrent reaper may have resumed the
+        session since (new pid / ``started_at``), in which case ``w`` is stale and
+        must not be resumed, parsed or torn down (issue #2110).
+        """
+        for cur in iter_workers(reviews_dir):
+            if (cur.adapter_kind, cur.issue_number, cur.pid, cur.started_at) == (
+                w.adapter_kind,
+                w.issue_number,
+                w.pid,
+                w.started_at,
+            ):
+                return not cur.is_alive()
+        return False
+
+    def _reap_dead_reviewer(
+        self: Any,
+        w: Any,
+        pr_number: int,
+        pr_state: dict[str, Any],
+        reviews_dir: Path,
+        recorded: list[dict[str, Any]],
+        missed: list[dict[str, Any]],
+    ) -> bool:
+        """Process one claimed dead reviewer. True when a terminal action was taken.
+
+        Terminal: the session was resumed, a miss summary was recorded, or
+        ``record_review`` succeeded. False means the claim must be released so the
+        next pass retries (issue #2110).
+        """
+        issue_number = pr_state.get("issue_number")
         verdict_source = "log"
         verdict = _parse_review_verdict_from_log(Path(w.log_path))
         if verdict is None:
@@ -110,7 +160,44 @@ def _reap_review_verdicts(self, reviews_dir: Path) -> dict[str, Any]:
         if verdict is None and resume_exec_rejected_review(self, w, pr_number, reviews_dir):
             # Issue #2090: the session ended on a refused exec and was resumed
             # in place (same sidecar, same slot); nothing to record this pass.
-            continue
+            return True
+        deployed_at = (
+            deploy_interrupted_review(w.started_at, self_deploy_state_path())
+            if verdict is None
+            else None
+        )
+        if deployed_at is not None:
+            # Issue #2103: a code-only self_deploy landed after this reviewer
+            # started, so the daemon restarted under it. Not a miss: roll the
+            # claim back and give the attempt back (the throttled path's
+            # shape, stalled_review_reap) so the PR re-dispatches next pass.
+            # The miss streak is deliberately untouched.
+            with _wf.state_lock(self.paths.state_file):
+                state = _wf.load_state(self.paths.state_file)
+                ps = state["prs"].get(str(pr_number), {})
+                rolled_back = without_review_dispatch_claim(ps)
+                attempts = int(ps.get("review_dispatch_attempt_count", 0))
+                if attempts > 0:
+                    rolled_back["review_dispatch_attempt_count"] = attempts - 1
+                state["prs"][str(pr_number)] = rolled_back
+                # write-gate-exempt(issue=2103): same raw state write shape as the other review-reap sites in this module; no write_gate param.
+                state = _wf.append_event(
+                    state,
+                    "review_interrupted_by_deploy",
+                    {
+                        "pr_number": pr_number,
+                        "issue_number": issue_number,
+                        "pid": w.pid,
+                        "started_at": w.started_at,
+                        "deployed_at": deployed_at,
+                    },
+                    state_path=self.paths.state_file,
+                )
+                # write-gate-exempt(issue=2103): same raw state write shape as the other review-reap sites in this module; no write_gate param.
+                _wf.save_state(self.paths.state_file, state)
+            _wf.remove_review_checkout(self.repo_root, pr_number, reviews_dir=reviews_dir)
+            w.reap_sidecar(reviews_dir)
+            return True
         if verdict is None:
             # No structured verdict found. Before discarding this reviewer's
             # work, check if it did substantial analysis (e.g. hit the
@@ -262,8 +349,14 @@ def _reap_review_verdicts(self, reviews_dir: Path) -> dict[str, Any]:
                     # condition. The stalled sweep reaps the sidecar
                     # itself after classification (or on its next pass
                     # once the stale timeout elapses).
-                    _wf.remove_review_checkout(self.repo_root, pr_number, reviews_dir=reviews_dir)
-            continue
+                    # Re-check liveness: a claim winner must never tear down a
+                    # checkout whose session was resumed since the claim (#2110).
+                    if not _reviewer_alive(reviews_dir, pr_number):
+                        _wf.remove_review_checkout(
+                            self.repo_root, pr_number, reviews_dir=reviews_dir
+                        )
+                    return True
+            return False
 
         packet_head_sha = self._read_packet_head_oid(pr_number)
         session_metrics = _reviewer_session_metrics(
@@ -345,6 +438,58 @@ def _reap_review_verdicts(self, reviews_dir: Path) -> dict[str, Any]:
                     "reason": reason,
                 }
             )
+        return bool(result.ok)
+
+    recorded: list[dict[str, Any]] = []
+    missed: list[dict[str, Any]] = []
+
+    for w in iter_workers(reviews_dir):
+        if w.adapter_kind not in REVIEWER_ADAPTER_KINDS:
+            continue
+        if w.is_alive():
+            continue
+
+        pr_number = w.issue_number
+        with _wf.state_lock(self.paths.state_file):
+            state = _wf.load_state(self.paths.state_file)
+            pr_state = state["prs"].get(str(pr_number), {})
+            if pr_state.get("review_dispatch_status") != "review_dispatch_dispatched":
+                continue
+            # Issue #2110: the loop pass and the fleet review lane both sweep
+            # here. Claim this dead session in the SAME locked section as the
+            # status check (compare-and-set), so exactly one caller parses,
+            # resumes or records it. The key includes the sidecar's
+            # ``started_at``, which a #2090 resume re-stamps, so the resumed
+            # session's own death is a fresh claim; the resume count keeps two
+            # resumes inside one clock second distinct.
+            claim_key = (
+                f"{pr_state.get('review_dispatched_at')}|{w.started_at}"
+                f"|{pr_state.get('review_exec_resume_count') or 0}"
+            )
+            if pr_state.get("review_reaped_for") == claim_key:
+                continue
+            # ``w`` is an eager snapshot. Re-validate against the sidecar on
+            # disk NOW, under the claim lock: a concurrent reaper may have
+            # resumed this session since, and its resume bumps the count so
+            # our key above would look fresh. A stale ``w`` must not be
+            # resumed again or have its checkout torn down.
+            if not _is_current_dead_session(reviews_dir, w):
+                continue
+            state["prs"][str(pr_number)] = {**pr_state, "review_reaped_for": claim_key}
+            # write-gate-exempt(issue=2110): same raw state write shape as the other review-reap sites in this module; no write_gate param.
+            _wf.save_state(self.paths.state_file, state)
+
+        settled = False
+        try:
+            settled = _reap_dead_reviewer(
+                self, w, pr_number, pr_state, reviews_dir, recorded, missed
+            )
+        finally:
+            # No terminal action (nothing to record, or an exception such as
+            # GitHubError / PassDeadlineExceeded out of record_review): drop
+            # the claim so the next pass retries, as before the claim existed.
+            if not settled:
+                _release_reap_claim(self, pr_number, claim_key)
 
     return {"recorded": recorded, "missed": missed}
 

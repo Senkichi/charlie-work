@@ -161,7 +161,7 @@ uv run charlie bash-rats --limit 3
 Every command accepts `--json` (either before or after the subcommand — the
 CLI strips `--json` from `argv` before `argparse` sees it) for
 machine-readable output, and `--dry-run` to suppress **mutating** `gh` calls
-(the `_is_mutating` guard in `github.py`).
+(the guard transport's dry-run gate, `github_transport/guarded.py`).
 
 `--dry-run` additionally suppresses these local mutations, each of which used to
 run during a "preview":

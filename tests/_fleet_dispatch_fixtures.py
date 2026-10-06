@@ -48,22 +48,6 @@ SUPERVISOR_STARTED_AT = _iso(_supervisor_started)
 SUPERVISOR_BEAT_AT = _iso(_supervisor_started + timedelta(seconds=2609))
 
 
-class _FakeClock:
-    """Monotonically advancing fake clock/sleep for supervisor tests."""
-
-    def __init__(self, start: float = 0.0, auto_advance: float = 0.0) -> None:
-        self._now = start
-        self._auto_advance = auto_advance
-        self.sleep_calls: list[float] = []
-
-    def now(self) -> float:
-        return self._now
-
-    def sleep(self, seconds: float) -> None:
-        self.sleep_calls.append(seconds)
-        self._now += self._auto_advance if self._auto_advance else seconds
-
-
 class _StepClock:
     """A deterministic fake monotonic clock for deadline tests.
 

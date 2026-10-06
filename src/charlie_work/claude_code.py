@@ -22,8 +22,6 @@ import json
 import logging
 import os
 import subprocess
-import sys
-import time
 import uuid
 from collections.abc import Iterator
 from dataclasses import asdict, dataclass
@@ -31,14 +29,16 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from charlie_work import process_utils as _process_utils
 from charlie_work.process_utils import (
     CpuPriority,
-    parse_proc_stat_starttime,
     popen_worker,
     start_terminal_status_watcher,
     terminal_record_proves_completion,
     worker_terminal_status_path,
 )
+from . import launch_events
+from .atomic_write import write_json_atomic
 from .config import (
     CLAUDE_CODE_PROMPT_FILENAME,
     ClaudeCodeConfig,
@@ -46,7 +46,7 @@ from .config import (
     ReviewerRoleConfig,
     _DEFAULT_CLAUDE_MODEL,
 )
-from .env_sanitize import resolve_pytest_cap, resolve_uv_no_sync, sanitize_env
+from .env_sanitize import build_worker_env, resolve_pytest_cap, resolve_uv_no_sync, sanitize_env
 from .post_mortem import merge_attempt_snapshot
 from .state import _canonical_started_at, utc_now
 from .subprocess_runner import RunResult, resolve_cli_binary, run_captured
@@ -57,6 +57,7 @@ from .throttle_signatures import (
     match_quota_tail,
     match_throttle_tail,
 )
+from .attempt_resume import apply_resume_notice
 from .worktree import (
     LiveWorkerRedispatchError,
     ReworkBranchConflictError,
@@ -119,7 +120,6 @@ def worker_permission_denied(sessions_dir: Path, issue_number: int, detail: str 
 # ``classify_failure`` merge (design doc §7); the classifier itself is now
 # ``worker_fate.classify_for``, which the sidecar writer below calls.
 
-_WIN_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 
 # Default command templates. A headless (``-p``) worker cannot answer a
 # permission prompt, so any mode that prompts for Bash (acceptEdits/default/
@@ -542,12 +542,7 @@ def parse_claude_events(events_path: Path) -> ClaudeProgress | None:
 
 
 def _write_json_atomic(path: Path, value: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    with tmp_path.open("w", encoding="utf-8") as handle:
-        json.dump(value, handle, indent=2, sort_keys=True)
-        handle.write("\n")
-    tmp_path.replace(path)
+    write_json_atomic(path, value)
 
 
 def _write_record(sessions_dir: Path, record: ClaudeWorkerRecord) -> ClaudeWorkerRecord:
@@ -574,8 +569,19 @@ def _error_record(
     session_id: str | None = None,
     adapter_kind: str = "claude-code",
     provider: str = "",
+    state_path: Path | None = None,
+    role: str = "worker",
+    model: str = "",
+    error_class: str = launch_events.LAUNCH_ERR_INTERNAL,
 ) -> ClaudeWorkerRecord:
-    return ClaudeWorkerRecord(
+    """The single ClaudeWorkerRecord-with-error constructor — issue #2246's
+    launch seam. Every error record produced anywhere emits exactly one
+    ``launch_failed`` event here, so no launch path can return an error value
+    without one (or emit two). ``role`` splits the numbered ref: a reviewer's
+    ``issue_number`` field is really the PR number, so reviewer events carry
+    it as ``pr_number`` and leave ``issue_number`` unset (the linked issue is
+    not known at this layer)."""
+    record = ClaudeWorkerRecord(
         issue_number=issue_number,
         branch=branch,
         worktree_path=worktree_path,
@@ -592,6 +598,18 @@ def _error_record(
         adapter_kind=adapter_kind,
         provider=provider,
     )
+    launch_events.emit_launch_failed(
+        state_path,
+        role=role,
+        harness=adapter_kind,
+        model=model,
+        issue_number=None if role == "reviewer" else issue_number,
+        pr_number=issue_number if role == "reviewer" else None,
+        error_class=error_class,
+        error=error,
+        failure_kind=failure_kind,
+    )
+    return record
 
 
 def _sanitize_review_command_template(
@@ -808,6 +826,10 @@ def run_quota_probe(*, repo_root: Path, config: OrchestratorConfig) -> bool:
     probe = config.quota_probe
     command = _apply_model_pin(_REVIEW_COMMAND_TEMPLATE, probe.model)
     command = _apply_max_turns_pin(command, 1)
+    # Load no settings files: quota is account-level, so the probe needs none, and
+    # running in ``repo_root`` would otherwise fire the operator's SessionStart
+    # hooks (a git fetch + fast-forward) inside the probe's timeout.
+    command = (*command, "--setting-sources", "")
     command = (resolve_cli_binary(command[0]), *command[1:])
     result = run_captured(
         list(command),
@@ -990,6 +1012,11 @@ def launch_claude_worker(
     pinned_model = (
         model_override if model_override is not None else resolved_config.worker.model
     ) or _DEFAULT_CLAUDE_MODEL
+    # Issue #2246: shared context for the launch_failed event every error
+    # record below emits via _error_record -- state-dir resolution is a pure
+    # path computation (no event is written on the success path).
+    launch_state_path = launch_events.state_path_for(repo_root, resolved_config)
+    launch_role = "reviewer" if review else "worker"
     command_template = _apply_model_pin(command_template, pinned_model)
     # Reviewer sessions may pin their own effort independently of worker
     # effort (empty string means fall back to claude_code.effort), optionally
@@ -1100,6 +1127,10 @@ def launch_claude_worker(
             session_id=session_id,
             adapter_kind=adapter_kind,
             provider=provider,
+            state_path=launch_state_path,
+            role=launch_role,
+            model=pinned_model,
+            error_class=launch_events.LAUNCH_ERR_WORKTREE,
         )
         return _write_record(sessions_dir, record)
 
@@ -1117,6 +1148,11 @@ def launch_claude_worker(
     # closed (see worktree.ReworkMergeConflict).
     if worktree.rework_conflict is not None:
         prompt_text = apply_rework_conflict_notice(prompt_text, worktree.rework_conflict)
+
+    # Issue #2289: the worktree was seeded from a throttle-killed attempt's
+    # preserved work -- tell the worker to continue it, not restart.
+    if worktree.resumed_attempt is not None:
+        prompt_text = apply_resume_notice(prompt_text, worktree.resumed_attempt)
 
     def _teardown_on_launch_failure() -> None:
         # Review checkouts live in their own PR-keyed dir, never worktrees_dir,
@@ -1152,6 +1188,10 @@ def launch_claude_worker(
             error=f"failed to write prompt file: {exc}",
             adapter_kind=adapter_kind,
             provider=provider,
+            state_path=launch_state_path,
+            role=launch_role,
+            model=pinned_model,
+            error_class=launch_events.LAUNCH_ERR_PROMPT,
         )
         return _write_record(sessions_dir, record)
 
@@ -1171,6 +1211,10 @@ def launch_claude_worker(
             error=f"command template rendering failed: {exc}",
             adapter_kind=adapter_kind,
             provider=provider,
+            state_path=launch_state_path,
+            role=launch_role,
+            model=pinned_model,
+            error_class=launch_events.LAUNCH_ERR_RENDER,
         )
         return _write_record(sessions_dir, record)
 
@@ -1230,12 +1274,15 @@ def launch_claude_worker(
             error=f"failed to prepare worker environment: {exc}",
             adapter_kind=adapter_kind,
             provider=provider,
+            state_path=launch_state_path,
+            role=launch_role,
+            model=pinned_model,
+            error_class=launch_events.LAUNCH_ERR_ENV,
         )
         return _write_record(sessions_dir, record)
-    worker_env = {
-        **sanitized_env,
-        **{str(k): str(v) for k, v in (env or {}).items()},
-    }
+    # Issue #2096: harness defaults (background tasks off) sit between the
+    # sanitized base and the operator `worker_env`.
+    worker_env = build_worker_env(sanitized_env, env)
     # Issue #646: resolve what sanitize_env()+worker_env actually settled on,
     # purely for the launch-time diagnostic log below (does not affect
     # worker_env itself, which already carries the real values).
@@ -1354,6 +1401,10 @@ def launch_claude_worker(
             error=f"failed to launch claude: {exc}",
             adapter_kind=adapter_kind,
             provider=provider,
+            state_path=launch_state_path,
+            role=launch_role,
+            model=pinned_model,
+            error_class=launch_events.LAUNCH_ERR_SPAWN,
         )
         return _write_record(sessions_dir, record)
 
@@ -1490,67 +1541,8 @@ def probe_claude(
 
 
 def _get_process_start_time(pid: int) -> float | None:
-    """Get the process creation time as a Unix timestamp in seconds.
-
-    Returns None if the process does not exist or the start time cannot be retrieved.
-    This is used to verify that a PID has not been recycled by the OS.
-
-    On Windows: Uses GetProcessTimes via ctypes to retrieve process creation time.
-    On POSIX: Reads /proc/<pid>/stat field 22 (starttime in clock ticks).
-    """
-    if sys.platform == "win32":
-        import ctypes
-        from ctypes import wintypes
-
-        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
-        handle = kernel32.OpenProcess(_WIN_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-        if not handle:
-            return None
-        try:
-            creation_time = wintypes.FILETIME()
-            exit_time = wintypes.FILETIME()
-            kernel_time = wintypes.FILETIME()
-            user_time = wintypes.FILETIME()
-            if not kernel32.GetProcessTimes(
-                handle,
-                ctypes.byref(creation_time),
-                ctypes.byref(exit_time),
-                ctypes.byref(kernel_time),
-                ctypes.byref(user_time),
-            ):
-                return None
-            # Convert FILETIME to Unix timestamp
-            # FILETIME is 100-nanosecond intervals since 1601-01-01
-            # Unix timestamp is seconds since 1970-01-01
-            # Difference between 1601-01-01 and 1970-01-01 is 11644473600 seconds
-            filetime = (creation_time.dwHighDateTime << 32) | creation_time.dwLowDateTime
-            unix_time = filetime / 10_000_000 - 11644473600
-            return unix_time
-        finally:
-            kernel32.CloseHandle(handle)
-    else:
-        # POSIX: read /proc/<pid>/stat
-        try:
-            with open(f"/proc/{pid}/stat", "r") as f:
-                stat = f.read()
-            starttime_ticks = parse_proc_stat_starttime(stat)
-            if starttime_ticks is None:
-                return None
-            # Convert to seconds: need system clock tick frequency
-            tick_hz = os.sysconf("SC_CLK_TCK")
-            if tick_hz <= 0:
-                tick_hz = 100  # Default fallback
-            # Get system uptime to convert to absolute time
-            try:
-                with open("/proc/uptime", "r") as f:
-                    uptime_seconds = float(f.read().split()[0])
-            except (OSError, ValueError, IndexError):
-                return None
-            # Process start time = current time - uptime + process starttime
-            boot_time = time.time() - uptime_seconds
-            return boot_time + (starttime_ticks / tick_hz)
-        except (OSError, ValueError, IndexError):
-            return None
+    """Process creation time as a Unix timestamp (delegates to ``process_utils``)."""
+    return _process_utils.get_process_start_time(pid)
 
 
 def update_worker_record_with_failure_classification(

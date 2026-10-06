@@ -9,7 +9,7 @@ import sys
 import threading
 import time
 from collections.abc import Sequence
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
@@ -1799,6 +1799,12 @@ def _fleet_notify_config(global_config: Any) -> Any:
     return resolve_fleet_notify(notify_config, state_root)
 
 
+# Issue #2142: wind-down allowance added to the remaining pass budget when
+# waiting on lanes, so a lane that stops cooperatively at the deadline can
+# still be harvested rather than reported as an overrun.
+_LANE_DRAIN_GRACE_SECONDS = 30.0
+
+
 def fleet_loop(
     fleet_dir_override: str | None = None,
     global_config: Any = None,  # GlobalConfig from #159, but we don't have the type yet
@@ -2041,20 +2047,34 @@ def fleet_loop(
     # The supervisor lock a lane acquires in phase 1 stays held until its
     # lane body returns, exactly as before.
     lane_concurrency = max(1, min(len(selected), _resolve_fleet_lane_concurrency(global_config)))
-    pending_lanes: list[tuple[str, dict[str, Any], Path, float, Any]] = []
-    collected_lane_count = 0
+    # Issue #2142: outstanding lane futures, harvested in COMPLETION order via
+    # concurrent.futures.wait so one slow lane cannot hold back the rest. The
+    # _selected_order sort below restores selection order for the results.
+    outstanding: dict[Future[CommandResult], tuple[str, dict[str, Any], Path, float]] = {}
 
-    def _collect_next_pending_lane() -> None:
-        """Resolve the oldest uncollected lane future, in selection order.
+    def _wait_budget() -> float | None:
+        """Seconds a lane wait may block: the remaining pass budget plus a
+        wind-down grace for lanes that stop cooperatively at the deadline.
+        ``None`` (wait indefinitely) when the pass has no deadline."""
+        if not deadline_seconds or deadline_seconds <= 0:
+            return None
+        remaining = deadline_seconds - (pass_clock() - pass_started_at)
+        return max(0.0, remaining) + _LANE_DRAIN_GRACE_SECONDS
 
-        Runs on the calling thread both when the submission loop throttles
-        on a full pool and in the post-loop drain, so per-repo results,
-        attention events, and the lane-elapsed log line keep serial ordering
-        no matter when a lane actually finishes.
+    def _harvest_lane(
+        future: Future[CommandResult],
+        repo_key: str,
+        entry: dict[str, Any],
+        repo_root: Path,
+        repo_lane_start: float,
+    ) -> None:
+        """Fold one FINISHED lane future into the pass aggregates.
+
+        Runs only on the calling thread and only for a done future, so
+        per_repo_results is written at collection time and a lane left
+        running past the drain deadline can never write into it later.
         """
-        nonlocal collected_lane_count, orphan_sweep_calls
-        repo_key, entry, repo_root, repo_lane_start, future = pending_lanes[collected_lane_count]
-        collected_lane_count += 1
+        nonlocal orphan_sweep_calls
         try:
             result = future.result()
         except Exception as exc:
@@ -2082,9 +2102,42 @@ def fleet_loop(
             pass_clock() - repo_lane_start,
         )
 
-    with ThreadPoolExecutor(
-        max_workers=lane_concurrency, thread_name_prefix="fleet-lane"
-    ) as lane_pool:
+    def _collect_finished_lanes(timeout: float | None) -> bool:
+        """Wait up to ``timeout`` for at least one outstanding lane to finish,
+        then harvest every finished one. Returns False if none finished."""
+        done, _not_done = wait(list(outstanding), timeout=timeout, return_when=FIRST_COMPLETED)
+        for future in done:
+            repo_key, entry, repo_root, repo_lane_start = outstanding.pop(future)
+            _harvest_lane(future, repo_key, entry, repo_root, repo_lane_start)
+        return bool(done)
+
+    def _record_lane_overruns() -> None:
+        """Final-drain deadline expired: report every lane still running.
+
+        The lane is left running (its supervisor lock stays held, so the
+        lock-held skip keeps the next pass out of that repo) and is recorded
+        as deadline-partial, never as observed.
+        """
+        for future, (repo_key, _entry, _root, repo_lane_start) in outstanding.items():
+            elapsed = pass_clock() - repo_lane_start
+            deadline_partial_repo_keys.append(repo_key)
+            logger.warning(
+                "fleet pass lane overrun: lane=%s elapsed_seconds=%.1f", repo_key, elapsed
+            )
+            try:
+                # write-gate-exempt(issue=2142): no write_gate param; sibling raw calls remain
+                log_event(
+                    fleet_state_path,
+                    "fleet_lane_overrun",
+                    {"repo_key": repo_key, "elapsed_seconds": elapsed},
+                    repo=repo_key,
+                )
+            except Exception:
+                logger.debug("Failed to record fleet_lane_overrun for %s", repo_key)
+        outstanding.clear()
+
+    lane_pool = ThreadPoolExecutor(max_workers=lane_concurrency, thread_name_prefix="fleet-lane")
+    try:
         for repo_key, entry in selected:
             if _deadline_exceeded():
                 # Issue #1832: stop starting new repo lanes once the pass is
@@ -2107,9 +2160,16 @@ def fleet_loop(
             # (re-check below), while lanes already in flight finish
             # cooperatively.
             waited_for_slot = False
-            while len(pending_lanes) - collected_lane_count >= lane_concurrency:
-                _collect_next_pending_lane()
+            while len(outstanding) >= lane_concurrency:
                 waited_for_slot = True
+                if not _collect_finished_lanes(_wait_budget()):
+                    # Issue #2142: no lane finished inside the pass budget.
+                    # Stop waiting; the repo is deferred below and the
+                    # still-running lanes are reported by the final drain.
+                    break
+            if len(outstanding) >= lane_concurrency:
+                deferred_repo_keys.append(repo_key)
+                continue
             # The wait for a pool slot can consume the rest of the budget, so
             # re-check before prep -- but only when a wait actually happened:
             # the top-of-loop check is otherwise still fresh, and an
@@ -2231,7 +2291,7 @@ def fleet_loop(
                 except Exception:
                     lock.release()
                     raise
-                pending_lanes.append((repo_key, entry, repo_root, repo_lane_start, future))
+                outstanding[future] = (repo_key, entry, repo_root, repo_lane_start)
                 lane_submitted = True
 
             except Exception as exc:
@@ -2252,13 +2312,23 @@ def fleet_loop(
                         pass_clock() - repo_lane_start,
                     )
 
-        # Drain the lanes still outstanding, in selection order (not
-        # completion order) so result/attention-event ordering is identical
-        # to the serial loop. ``future.result()`` blocks until each lane
-        # finishes; the ``with`` exit then joins the pool with nothing left
-        # to wait on.
-        while collected_lane_count < len(pending_lanes):
-            _collect_next_pending_lane()
+        # Final drain (issue #2142): harvest lanes as they finish, bounded by
+        # the remaining pass budget. A lane still running at expiry is
+        # reported by _record_lane_overruns and left running -- the pool is
+        # shut down with wait=False below instead of joined.
+        budget = _wait_budget()
+        drain_deadline = None if budget is None else time.monotonic() + budget
+        while outstanding:
+            timeout = None if drain_deadline is None else drain_deadline - time.monotonic()
+            if timeout is not None and timeout <= 0:
+                break
+            _collect_finished_lanes(timeout)
+        _record_lane_overruns()
+    finally:
+        # No cancel_futures: a submitted-but-never-started future cancelled here
+        # would skip the lane body's `finally: lock.release()` and strand the
+        # phase-1 supervisor lock for the process lifetime.
+        lane_pool.shutdown(wait=False)
 
     # Results were recorded from two interleaved sources -- skips/prep errors
     # during submission and lane completions during collection -- so restore
@@ -3274,6 +3344,18 @@ def run_fleet_supervise(
             # the next process resumes from exactly where this one left off.
             # Bind the shas to locals so the non-None guard survives into the
             # message below; folding the check into a bool() loses it.
+            #
+            # A deferred ``uv sync`` that finally lands is the same hazard one
+            # layer down: HEAD moved on an earlier pass (that pass restarted),
+            # so this pass's ``head_changed`` is False, yet the sync just
+            # replaced third-party packages on disk that this process already
+            # imported. Without a restart here a dependency bump stays
+            # unloaded until some unrelated commit restarts the daemon
+            # (observed 2026-10-01: the sync installed ci-fleet 0.4.0 at
+            # 21:46 PDT and the running supervisor kept executing 0.3.0).
+            # ``synced`` is True only when ``uv sync`` actually ran and
+            # succeeded, which clears the pending-sync marker, so the next
+            # pass reports synced=False and this cannot loop.
             from_sha = deploy.from_sha if deploy is not None else None
             to_sha = deploy.to_sha if deploy is not None else None
             if (
@@ -3282,15 +3364,24 @@ def run_fleet_supervise(
                 and deploy.pulled
                 and from_sha
                 and to_sha
-                and deploy.head_changed
+                and (deploy.head_changed or deploy.synced)
             ):
-                print(
-                    f"[{now_str}] self-deploy: HEAD moved {from_sha[:12]} -> "
-                    f"{to_sha[:12]}; exiting for watchdog restart to pick up new code",
-                    flush=True,
-                )
+                if deploy.head_changed:
+                    print(
+                        f"[{now_str}] self-deploy: HEAD moved {from_sha[:12]} -> "
+                        f"{to_sha[:12]}; exiting for watchdog restart to pick up new code",
+                        flush=True,
+                    )
+                    _exit_reason = "self_deploy_head_moved"
+                else:
+                    print(
+                        f"[{now_str}] self-deploy: deferred dependency sync landed "
+                        f"({from_sha[:12]} -> {to_sha[:12]}); exiting for watchdog "
+                        "restart to load the new dependencies",
+                        flush=True,
+                    )
+                    _exit_reason = "self_deploy_synced"
                 exit_reason = "self_deploy"
-                _exit_reason = "self_deploy_head_moved"
                 # Issue #604: this exit assumes the watchdog scheduled task is
                 # armed and will relaunch the fleet. Verify it before trusting
                 # that -- a disabled task turns this clean restart exit into a

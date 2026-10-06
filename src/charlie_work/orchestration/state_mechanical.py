@@ -73,11 +73,13 @@ def _deescalate_mechanical_issue(self, issue_number: int) -> dict[str, Any]:
     Issue #783 hazard (b) -- unbounded paid-session loop: this method
     resets ONLY the per-mechanism attempt/cap counter that gates the
     CLEARED ``escalation_reason`` (see
-    ``_REWORK_BUDGET_RESET_BY_ESCALATION_REASON``), and only once per
+    ``_REWORK_BUDGET_RESET_BY_ESCALATION_REASON`` and the issue-entry twin
+    ``_ISSUE_BUDGET_RESET_BY_ESCALATION_REASON``), and only once per
     escalation episode (tracked via ``rework_budget_reset_for_terminal_since``).
     It does NOT reset the other lanes' counters, nor the cross-lane
     bookkeeping that a full ``charlie unescalate`` clears
-    (``redispatch_at``, ``review_dispatch_attempt_count``, etc.). If the
+    (``review_dispatch_attempt_count``, etc.; the issue-entry windows that
+    gate the cleared reason, e.g. ``redispatch_at``, ARE reset). If the
     same mechanical condition recurs after a clear, the lane's counter
     has been zeroed so the cap re-trips only after a fresh
     ``max_attempts``/``max_rework_cycles`` worth of completed-but-still-
@@ -293,6 +295,7 @@ def _deescalate_mechanical_issue(self, issue_number: int) -> dict[str, Any]:
     checks = self.gh.pr_checks(pr_number)
     diff = self.gh.pr_diff(pr_number)
     pr_entry_for_janitor = state.get("prs", {}).get(str(pr_number))
+    review_decision = self._review_decision(pr_number)
     janitor_verdict = _wf.run_janitor(
         pr,
         checks,
@@ -300,7 +303,17 @@ def _deescalate_mechanical_issue(self, issue_number: int) -> dict[str, Any]:
         pr_state=pr_entry_for_janitor if isinstance(pr_entry_for_janitor, dict) else None,
         repo_root=self.repo_root,
         pr_diff=diff,
-        review_decision=self._review_decision(pr_number),
+        review_decision=review_decision,
+        # Issue #2281: commit list only fetched when the no-op gate's
+        # exemption-claim escape is live (request_changes verdict +
+        # enabled adequacy gate).
+        pr_commits=(
+            self.gh.pr_commits(pr_number)
+            if _wf.no_op_escape_needs_pr_commits(
+                self.config.test_adequacy, review_decision, pr.get("headRefOid")
+            )
+            else None
+        ),
     )
 
     with _wf.state_lock(self.paths.state_file):
@@ -400,6 +413,13 @@ def _deescalate_mechanical_issue(self, issue_number: int) -> dict[str, Any]:
                         fresh_pr[_counter_field] = 0
                     for _field in companion_fields:
                         fresh_pr.pop(_field, None)
+                    counter_reset = True
+            # Issue #2101: issue-entry windowed caps (``redispatch_at``).
+            for _issue_field in self._ISSUE_BUDGET_RESET_BY_ESCALATION_REASON.get(
+                cleared_condition, ()
+            ):
+                if _issue_field in updated_issue_entry:
+                    updated_issue_entry.pop(_issue_field)
                     counter_reset = True
         fresh_state = self.write_gate.record_event(
             fresh_state,

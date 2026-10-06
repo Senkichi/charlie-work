@@ -18,6 +18,7 @@ from typing import Any
 from _fakes_github import FakeGitHub
 from _worktree_fixtures import (
     _init_bare_remote_and_clone,
+    _init_repo,
     _setup_completed_worktree,
 )
 from charlie_work.claude_code import ClaudeWorkerRecord
@@ -47,6 +48,13 @@ def _run_phantom_blocked_dispatch(
     ``outcome_payload``; returns ``(result, sidecar_path, fake_gh, paths)``."""
     from charlie_work.config import WORKER_OUTCOME_FILENAME
 
+    # Issue #2262: the phantom lane's salvage probe runs against the app's
+    # repo_root (``tmp_path`` here -- the worker's worktree lives in the
+    # ``clone`` subdir). A real repo at tmp_path lets the probe reach the
+    # conclusive ``no_commits`` verdict (branch ref provably absent) the
+    # requeue path requires; on a non-git dir the probe is inconclusive and
+    # the lane defers instead.
+    _init_repo(tmp_path)
     remote, repo_root = _init_bare_remote_and_clone(tmp_path)
     if with_commits:
         worktree_path, branch = _setup_completed_worktree(repo_root, 1453)

@@ -483,7 +483,7 @@ def test_review_test_adequacy_exit_rejects_verdict_when_head_moved(
     )
     monkeypatch.setattr(
         "charlie_work.workflow.check_test_adequacy",
-        lambda diff, pr, cfg: hard_fail_verdict,
+        lambda diff, pr, cfg, commit_messages=(): hard_fail_verdict,
     )
 
     result = app.review(456)

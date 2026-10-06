@@ -1,6 +1,6 @@
 # The GitHub transport takes generic requests, and HTTP is the default adapter
 
-Accepted 2026-09-29; implementation pending (architecture review candidate 7).
+Accepted 2026-09-29; implemented (architecture review candidate 7).
 
 Everything below the capability collaborators talks to GitHub through one transport interface. It takes a generic request: a REST method and route with a body, or a GraphQL document with variables. There are two adapters behind it. The pooled HTTPS adapter is the default and is on. The `gh` CLI adapter renders the same request as `gh api …` and is used as a per-call fallback. Every fallback emits an event, and a config key turns HTTP off as a kill switch. Retry, the circuit breaker, dry-run suppression and the in-pass deadline wrap the transport once, so no path can reach GitHub without them.
 

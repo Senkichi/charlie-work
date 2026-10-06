@@ -215,11 +215,11 @@ def test_labels_transition_drives_real_state_machine(issues_dir: Path, tmp_path:
         ("escalated", {cfg.ready, "bug", cfg.human_needed}),
     ]
     for event, expected in steps:
-        result = labels_module.transition(client, cfg, 1, event)
+        result = labels_module.transition(client, cfg, 1, event, state_path=None)
         assert result.outcome == labels_module.TransitionOutcome.APPLIED
         assert _labels_on_disk(tmp_path, issues_dir, 1) == expected
 
-    result = labels_module.transition(client, cfg, 1, "merged")
+    result = labels_module.transition(client, cfg, 1, "merged", state_path=None)
     assert result.outcome == labels_module.TransitionOutcome.APPLIED
     final_labels = _labels_on_disk(tmp_path, issues_dir, 1)
     assert cfg.ready not in final_labels

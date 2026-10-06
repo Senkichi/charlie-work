@@ -58,7 +58,8 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class LocalParkResult:
-    """Verdict from :func:`park_salvageable_local_orphan`.
+    """Verdict from the dead-worker salvage probe
+    (:func:`salvage_dead_worker_commits` / :func:`park_salvageable_local_orphan`).
 
     Issue #1971 split "the lane found nothing" into the two answers its
     callers must not conflate: ``no_commits`` is a *proved* empty verdict
@@ -66,9 +67,11 @@ class LocalParkResult:
     provably does not exist -- callers proceed to reclaim/escalate), while
     ``probe_failed`` is an *inconclusive* verdict (git probing erred on a
     branch that may exist -- callers defer and retry next pass rather than
-    discarding possibly-salvageable work). ``parked`` means the issue was
-    parked ``review_ready`` this call; ``park_failed`` means salvageable
-    commits were found but the park write failed and must be retried.
+    discarding possibly-salvageable work). ``parked`` means the dead worker's
+    committed work was published this call -- parked ``review_ready`` on a
+    no-PR backend, pushed + PR'd (or already landed, so skipped) on a
+    PR-capable one; ``park_failed`` means salvageable commits were found but
+    the publish write failed and must be retried.
     """
 
     status: Literal["parked", "park_failed", "no_commits", "probe_failed"]
@@ -268,6 +271,68 @@ def park_salvageable_local_orphan(
     must not strand committed work that still exists in the main checkout.
     The fallback measures a content delta (``branch_diff_result`` against the
     local base), not a bare commit count.
+
+    The probe+publish tail lives in :func:`salvage_dead_worker_commits` — the
+    backend-agnostic "dead worker with commits" seam every dead-worker locus
+    shares (issue #2262); this function adds the no-PR-backend gate on top.
+    """
+    if publishes_pull_requests(gh) or repo_root is None:
+        return None
+    return salvage_dead_worker_commits(
+        gh=gh,
+        config=config,
+        repo_root=repo_root,
+        worktrees_dir=worktrees_dir,
+        state=state,
+        issue_number=issue_number,
+        issue=issue,
+        active_labels=active_labels,
+        issue_labels=issue_labels,
+        state_file=state_file,
+        worker_outcome=worker_outcome,
+        write_gate=write_gate,
+    )
+
+
+def salvage_dead_worker_commits(
+    *,
+    gh: GitHubLike,
+    config: OrchestratorConfig,
+    repo_root: Path | None,
+    worktrees_dir: Path | None,
+    state: dict[str, Any],
+    issue_number: int,
+    issue: dict[str, Any],
+    active_labels: set[str],
+    issue_labels: set[str],
+    state_file: Path,
+    worker_outcome: dict[str, Any] | None,
+    write_gate: WriteGate,
+) -> LocalParkResult | None:
+    """Issue #2262: the single "dead worker with commits" probe+publish seam.
+
+    Every dead-worker locus that would otherwise requeue the issue routes
+    committed work through here. The probe is backend-agnostic: inspect the
+    worker's worktree for commits ahead of base (falling back to a branch-ref
+    content diff when the worktree is gone), then hand committed work to
+    ``_attempt_salvage`` — which parks it review-ready via
+    ``park_unpublishable_work`` on a no-PR backend, or pushes the branch and
+    opens a PR on a PR-capable one. The capability decision therefore lives
+    in exactly one place; a locus that forgets it cannot reintroduce the
+    "requeue committed local work into a worktree reset" gap.
+
+    This function takes ``state_lock`` itself (inside ``_attempt_salvage`` /
+    ``park_unpublishable_work``) and does git + label I/O, so it must run
+    OUTSIDE ``state_lock`` — call it in a pre-lock phase and carry the
+    verdict in, the same pre-lock/two-phase pattern the dead-worker sweep
+    uses (``decide_pre`` / ``apply_requests_pre``).
+
+    Returns ``None`` only when no probe is possible (``repo_root``
+    unresolvable) — the caller proceeds to its normal handling. Otherwise a
+    :class:`LocalParkResult`: ``parked`` (published — never requeue),
+    ``park_failed`` / ``probe_failed`` (defer and retry; a transient failure
+    must never be the reason committed work is discarded), ``no_commits``
+    (proved empty — the caller's normal reclaim/requeue applies).
     """
     # Deferred: workflow.py imports this module for the sweep call site, so
     # a top-level ``import charlie_work.workflow`` would cycle. Attribute
@@ -275,7 +340,7 @@ def park_salvageable_local_orphan(
     # ``charlie_work.workflow._attempt_salvage`` / ``.slugify`` live.
     import charlie_work.workflow as _wf
 
-    if publishes_pull_requests(gh) or repo_root is None:
+    if repo_root is None:
         return None
     entry = (state.get("issues") or {}).get(str(issue_number))
     branch = entry.get("branch_name") if isinstance(entry, dict) else None
@@ -482,13 +547,19 @@ def park_or_reclaim_local_orphan(
         _reset_probe_deferral(write_gate, state, issue_number)
 
     needs_ready = config.labels.ready not in issue_labels
-    label_write_ok = True
-    for label in sorted(active_labels):
-        if not gh.remove_issue_label(issue_number, label):
-            label_write_ok = False
-    if needs_ready:
-        if not gh.add_issue_label(issue_number, config.labels.ready):
-            label_write_ok = False
+    # Issue #2226: route through the WriteGate's canonical seam so the
+    # return to ``ready`` lands in events.db bound to this repo; the
+    # conditional add preserves the no-redundant-write contract.
+    label_result = write_gate.apply_issue_labels(
+        gh,
+        config.labels,
+        issue_number,
+        add=(config.labels.ready,) if needs_ready else (),
+        remove=sorted(active_labels),
+        to_state="ready",
+        cause="session_failed_relabeled",
+    )
+    label_write_ok = label_result.ok
     reclaim_results[issue_number] = {
         "removed_labels": sorted(active_labels),
         "added_ready": needs_ready,

@@ -74,7 +74,15 @@ def _route_to_rework(
         state = self._record_event(state, event_kind, payload)
         _wf.save_state(self.paths.state_file, state)
 
-    result = _wf.transition(self.gh, self.config.labels, issue_number, "rework_requested")
+    result = _wf.transition(
+        self.gh,
+        self.config.labels,
+        issue_number,
+        "rework_requested",
+        state_path=self.paths.state_file,
+        repo=self.repo_root.name,
+        pr_number=pr_number,
+    )
     if result.outcome == TransitionOutcome.APPLIED:
         return None
     return {
@@ -571,7 +579,15 @@ def _route_janitor_gate_failure_to_rework(
             )
             _wf.save_state(self.paths.state_file, state)
         edge = _wf._escalation_edge("escalated", "mechanical")
-        result = _wf.transition(self.gh, self.config.labels, issue_number, edge)
+        result = _wf.transition(
+            self.gh,
+            self.config.labels,
+            issue_number,
+            edge,
+            state_path=self.paths.state_file,
+            repo=self.repo_root.name,
+            pr_number=pr_number,
+        )
         label_error = None
         if result.outcome != TransitionOutcome.APPLIED:
             label_error = {
@@ -759,33 +775,7 @@ def _reroute_stranded_request_changes(
         )
         return None
     if str(issue.get("state") or "OPEN").upper() == "CLOSED":
-        with _wf.state_lock(self.paths.state_file):
-            state = _wf.load_state(self.paths.state_file)
-            issues = state.setdefault("issues", {})
-            issue_entry = issues.get(str(issue_number), {})
-            issue_entry["stranded_skip_closed"] = True
-            if issue_entry.get("status") != "closed":
-                issue_entry["status"] = "closed"
-            issues[str(issue_number)] = issue_entry
-            state = self._record_event(
-                state,
-                "stranded_request_changes_skipped_issue_closed",
-                {
-                    "pr_number": int(pr["number"]),
-                    "issue_number": issue_number,
-                    "head_sha": pr.get("headRefOid"),
-                },
-            )
-            _wf.save_state(self.paths.state_file, state)
-        # Strip active labels from the closed issue, mirroring
-        # reconcile's state_active_status_issue_closed: setting
-        # status to "closed" here would prevent that drift kind from
-        # firing (it requires status in ACTIVE_STATE_STATUSES), so the
-        # restorer must do the label cleanup itself to avoid leaving
-        # active labels on a finalized issue.
-        active_labels = _wf.label_names(issue) & self.config.labels.active
-        for label in sorted(active_labels):
-            self.gh.remove_issue_label(issue_number, label)
+        self._handle_stranded_closed_issue(pr, issue_number, issue)
         return None
     return self._route_to_rework(
         pr,

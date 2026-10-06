@@ -1,0 +1,8 @@
+issue #2262: pre-lock evidence gatherer for the phantom-live-worker lane --
+inspects one phantom sidecar's worktree, reads its .worker-outcome.json, and
+resolves its fate (pure reads, runs outside state_lock). Installed from
+``orchestration/misc_worker_dispatch.py``. Net-new OrchestratorApp member
+added after the Track 2 Phase B surface baseline was pinned; declared here so
+the member-surface conservation check in
+tests/test_workflow_delegation_l00.py subtracts it before comparing moved
+delegates against the pre-campaign total (133).

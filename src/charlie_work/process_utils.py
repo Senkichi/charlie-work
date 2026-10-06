@@ -16,6 +16,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from .atomic_write import write_json_atomic
 from .orphan_sweep import (  # noqa: F401  (deliberate re-export)
     _enumerate_fingerprinted_children,
     _reap_enumerated_children,
@@ -269,7 +270,12 @@ def get_process_start_time(pid: int) -> float | None:
                 with open("/proc/uptime", "r") as f:
                     uptime_seconds = float(f.read().split()[0])
             except (OSError, ValueError, IndexError):
-                uptime_seconds = 0
+                # Indeterminate: substituting 0 would return
+                # ``time.time() + ticks/hz``, a value that drifts with the
+                # wall clock and makes later start-time fingerprints
+                # mismatch a live process (issue #2232).  ``None`` fails
+                # open the way the pre-dedup copies did.
+                return None
             boot_time = time.time() - uptime_seconds
             return boot_time + (starttime_ticks / tick_hz)
         except (OSError, ValueError, IndexError):
@@ -416,9 +422,7 @@ def write_worker_terminal_status(
     if worker_outcome_written_at is not None:
         payload["worker_outcome_written_at"] = worker_outcome_written_at
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    tmp_path.replace(path)
+    write_json_atomic(path, payload)
 
 
 def terminal_record_proves_completion(

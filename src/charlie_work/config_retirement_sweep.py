@@ -35,6 +35,7 @@ from typing import Any, Callable
 import yaml
 
 from . import layout
+from .atomic_write import write_json_atomic
 from .config import OrchestratorConfig
 from .config_deprecations import (
     DEPRECATED_CONFIG_KEYS,
@@ -102,11 +103,7 @@ def _save_retirement_state(path: Path, keys: dict[str, dict[str, Any]]) -> None:
         path.parent, context="writing config_retirement_state.json"
     )
     payload = {"version": 1, "generated_at": utc_now(), "keys": keys}
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    with tmp_path.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2, sort_keys=True)
-        handle.write("\n")
-    tmp_path.replace(path)
+    write_json_atomic(path, payload)
 
 
 @dataclass(frozen=True)
@@ -387,7 +384,14 @@ def _process_key(
             summary["adopted_existing_label"] = True
             return summary
         # write-gate-exempt(issue=1976): fleet-level sweep; no write_gate param, same shape as capacity_starvation_escalation.
-        result = transition(gh, labels, entry.removal_issue, "config_retirement_ready")
+        result = transition(
+            gh,
+            labels,
+            entry.removal_issue,
+            "config_retirement_ready",
+            state_path=fleet_state_path,
+            repo="fleet",
+        )
         if result.outcome.name == "PARTIAL_FAILURE":
             return summary  # retry next pass rather than recording a false arm
         _post_comment(

@@ -1,0 +1,280 @@
+{
+  "fields": "number,title,url,headRefName,baseRefName,body,isDraft,labels,author,updatedAt,reviewDecision,statusCheckRollup,state,mergeable,additions,deletions,headRefOid,isCrossRepository,mergeStateStatus",
+  "gh_json": {
+    "additions": 781,
+    "author": {
+      "id": "MDQ6VXNlcjI1NjcwNTk0",
+      "is_bot": false,
+      "login": "Senkichi",
+      "name": "Senkichi"
+    },
+    "baseRefName": "main",
+    "body": "Closes #2127\n\n## Problem\nThe local merge gate routed every non-ok suite outcome to worker rework and consumed the merge-rework cap (2), including outcomes that are not code defects:\n- **Timeouts:** mdls #41 and #55 were killed at 49% and 61% by the flat 3600s limit while the host was contended.\n- **Summary-less deaths:** mdls #35 died twice with rc=1 mid dot-line, with no pytest summary and no traceback.\n\nA worker cannot fix either of these. This evening they escalated #35 and burned rework on #41 and #55.\n\n## Change\n- **Classification:** `charlie_work.local_gate_infra.classify_suite_outcome` is a pure function. A non-ok result counts as a code failure only when the log tail carries a pytest terminal marker: a summary line (with or without the banner), `short test summary info`, `INTERNALERROR`, `Interrupted:`, a `!!!` banner, or `ERROR collecting`. When unsure it errs toward code failure, which is the pre-#2127 behavior.\n- **Infra outcomes:** timeouts and summary-less deaths go to `_local_gate_infra_relaunch`. It relaunches through `_local_gate_launch(reason=\"infra_relaunch\")`, bounded by `LOCAL_SUITE_GATE_MAX_INFRA_RELAUNCHES = 2`, and emits `local_suite_infra_relaunched`. Rework counters are never touched.\n  - Past the bound it escalates with `escalation_reason = local_merge_gate_infra_exhausted`.\n  - `unescalate` clears the new `local_suite_infra_relaunch_count` counter, which is carried through the resync, orphan and adoption launches and reset on merge.\n- **Derived timeout:** the timeout is `clamp(4 × median(last ≤10 ok gate durations), 3600, 10800)`, falling back to 3600 when there are fewer than 3 samples.\n  - Samples come from the per-PR `suite-result.json` files that already exist, so there is no new state.\n  - The timed-out `local_suite_result` event carries `timeout_seconds`.\n  - mdls's recent ok runs had a median of about 1650s, which gives about 6600s. Under contention its runs have been projecting 70–100 min.\n- **Code layout:**\n  - The pure logic lives outside `orchestration/`, because that package's installer attaches top-level defs to `OrchestratorApp`.\n  - The delegate is its own module, so `local_merge_gate.py` stays under its file-size mark.\n  - Shared gate test helpers moved to `tests/_local_gate_async_fixtures.py`.\n\n## Tests\n- `tests/test_local_gate_infra.py` covers:\n  - the classifier: banner and `-q` summaries, `INTERNALERROR`, a mid-dot-line kill, and a timeout;\n  - the derived timeout: under 3 samples, a 1650s median giving 6600s, the ceiling, and malformed or not-ok results being ignored;\n  - the file reader;\n  - gate integration:\n    - a summary-less death relaunches once, with no rework routing or counter change;\n    - a summary-ful failure still routes to rework;\n    - an in-flight timeout relaunches;\n    - a derived limit spares a 3700s-old suite;\n    - an exhausted bound escalates under the infra reason.\n- `test_timeout_kills_tree_and_routes_to_rework` became `...relaunches_without_rework`. `FAIL_SUITE` now prints a real pytest summary; a summary-less exit is now correctly infra, so a new `KILLED_SUITE` covers that case.\n- **Mutation control:** making the classifier return CODE_FAILURE for a summary-less tail fails 5 tests (3 classify cases, the relaunch integration test and the exhausted-bound test); restoring it makes them pass.\n- Targeted suites pass:\n  - the gate async, file-size ratchet, cross-test import guard, unescalate, local lane and local-issues merge-gate tests;\n  - the event-kind consumers, 1683 de-escalation and ci_fleet_seams tests.\n- `ruff check` and `ruff format --check` are clean.\n\n## Not changed\n`local_lane.run_full_suite`'s synchronous default `timeout_seconds` is still `SUITE_TIMEOUT_SECONDS`. That is a separate path; the async gate no longer imports it.\n",
+    "deletions": 193,
+    "headRefName": "fix/gate-infra-failures",
+    "headRefOid": "b9dbdb04dc9aad414d2ce6c308abf84087c6b555",
+    "isCrossRepository": false,
+    "isDraft": false,
+    "labels": [],
+    "mergeStateStatus": "BLOCKED",
+    "mergeable": "MERGEABLE",
+    "number": 2130,
+    "reviewDecision": "",
+    "state": "OPEN",
+    "statusCheckRollup": [
+      {
+        "__typename": "CheckRun",
+        "completedAt": "0001-01-01T00:00:00Z",
+        "conclusion": "",
+        "detailsUrl": "https://github.com/Senkichi/charlie-work/actions/runs/36803548922/job/110182915548",
+        "name": "Tests",
+        "startedAt": "2026-10-01T01:57:32Z",
+        "status": "IN_PROGRESS",
+        "workflowName": "CI"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-10-01T01:57:52Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/Senkichi/charlie-work/actions/runs/36803548915/job/110182915125",
+        "name": "Attachment Contracts (shadow)",
+        "startedAt": "2026-10-01T01:57:31Z",
+        "status": "COMPLETED",
+        "workflowName": "Attachment Contracts"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-10-01T01:58:06Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/Senkichi/charlie-work/actions/runs/36803546785/job/110182911560",
+        "name": "Analyze (actions)",
+        "startedAt": "2026-10-01T01:57:30Z",
+        "status": "COMPLETED",
+        "workflowName": "CodeQL"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-10-01T01:58:18Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/Senkichi/charlie-work/actions/runs/36803546785/job/110182911344",
+        "name": "Analyze (python)",
+        "startedAt": "2026-10-01T01:57:30Z",
+        "status": "COMPLETED",
+        "workflowName": "CodeQL"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-10-01T01:58:06Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/Senkichi/charlie-work/actions/runs/36803548915/job/110182915276",
+        "name": "Build attachment-contracts wheel",
+        "startedAt": "2026-10-01T01:57:32Z",
+        "status": "COMPLETED",
+        "workflowName": "Attachment Contracts"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-10-01T01:58:02Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/Senkichi/charlie-work/actions/runs/36803548922/job/110182915369",
+        "name": "Lint",
+        "startedAt": "2026-10-01T01:57:31Z",
+        "status": "COMPLETED",
+        "workflowName": "CI"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-10-01T01:58:46Z",
+        "conclusion": "FAILURE",
+        "detailsUrl": "https://github.com/Senkichi/charlie-work/actions/runs/36803548922/job/110182915499",
+        "name": "Collect-only gate",
+        "startedAt": "2026-10-01T01:57:31Z",
+        "status": "COMPLETED",
+        "workflowName": "CI"
+      },
+      {
+        "__typename": "CheckRun",
+        "completedAt": "2026-10-01T01:58:00Z",
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/Senkichi/charlie-work/runs/110183023764",
+        "name": "CodeQL",
+        "startedAt": "2026-10-01T01:57:58Z",
+        "status": "COMPLETED",
+        "workflowName": ""
+      }
+    ],
+    "title": "fix(gate): relaunch infra suite outcomes instead of routing to rework",
+    "updatedAt": "2026-10-01T01:57:28Z",
+    "url": "https://github.com/Senkichi/charlie-work/pull/2130"
+  },
+  "graphql_data": {
+    "repository": {
+      "pullRequest": {
+        "additions": 781,
+        "author": {
+          "__typename": "User",
+          "id": "MDQ6VXNlcjI1NjcwNTk0",
+          "login": "Senkichi",
+          "name": "Senkichi"
+        },
+        "baseRefName": "main",
+        "body": "Closes #2127\n\n## Problem\nThe local merge gate routed every non-ok suite outcome to worker rework and consumed the merge-rework cap (2), including outcomes that are not code defects:\n- **Timeouts:** mdls #41 and #55 were killed at 49% and 61% by the flat 3600s limit while the host was contended.\n- **Summary-less deaths:** mdls #35 died twice with rc=1 mid dot-line, with no pytest summary and no traceback.\n\nA worker cannot fix either of these. This evening they escalated #35 and burned rework on #41 and #55.\n\n## Change\n- **Classification:** `charlie_work.local_gate_infra.classify_suite_outcome` is a pure function. A non-ok result counts as a code failure only when the log tail carries a pytest terminal marker: a summary line (with or without the banner), `short test summary info`, `INTERNALERROR`, `Interrupted:`, a `!!!` banner, or `ERROR collecting`. When unsure it errs toward code failure, which is the pre-#2127 behavior.\n- **Infra outcomes:** timeouts and summary-less deaths go to `_local_gate_infra_relaunch`. It relaunches through `_local_gate_launch(reason=\"infra_relaunch\")`, bounded by `LOCAL_SUITE_GATE_MAX_INFRA_RELAUNCHES = 2`, and emits `local_suite_infra_relaunched`. Rework counters are never touched.\n  - Past the bound it escalates with `escalation_reason = local_merge_gate_infra_exhausted`.\n  - `unescalate` clears the new `local_suite_infra_relaunch_count` counter, which is carried through the resync, orphan and adoption launches and reset on merge.\n- **Derived timeout:** the timeout is `clamp(4 × median(last ≤10 ok gate durations), 3600, 10800)`, falling back to 3600 when there are fewer than 3 samples.\n  - Samples come from the per-PR `suite-result.json` files that already exist, so there is no new state.\n  - The timed-out `local_suite_result` event carries `timeout_seconds`.\n  - mdls's recent ok runs had a median of about 1650s, which gives about 6600s. Under contention its runs have been projecting 70–100 min.\n- **Code layout:**\n  - The pure logic lives outside `orchestration/`, because that package's installer attaches top-level defs to `OrchestratorApp`.\n  - The delegate is its own module, so `local_merge_gate.py` stays under its file-size mark.\n  - Shared gate test helpers moved to `tests/_local_gate_async_fixtures.py`.\n\n## Tests\n- `tests/test_local_gate_infra.py` covers:\n  - the classifier: banner and `-q` summaries, `INTERNALERROR`, a mid-dot-line kill, and a timeout;\n  - the derived timeout: under 3 samples, a 1650s median giving 6600s, the ceiling, and malformed or not-ok results being ignored;\n  - the file reader;\n  - gate integration:\n    - a summary-less death relaunches once, with no rework routing or counter change;\n    - a summary-ful failure still routes to rework;\n    - an in-flight timeout relaunches;\n    - a derived limit spares a 3700s-old suite;\n    - an exhausted bound escalates under the infra reason.\n- `test_timeout_kills_tree_and_routes_to_rework` became `...relaunches_without_rework`. `FAIL_SUITE` now prints a real pytest summary; a summary-less exit is now correctly infra, so a new `KILLED_SUITE` covers that case.\n- **Mutation control:** making the classifier return CODE_FAILURE for a summary-less tail fails 5 tests (3 classify cases, the relaunch integration test and the exhausted-bound test); restoring it makes them pass.\n- Targeted suites pass:\n  - the gate async, file-size ratchet, cross-test import guard, unescalate, local lane and local-issues merge-gate tests;\n  - the event-kind consumers, 1683 de-escalation and ci_fleet_seams tests.\n- `ruff check` and `ruff format --check` are clean.\n\n## Not changed\n`local_lane.run_full_suite`'s synchronous default `timeout_seconds` is still `SUITE_TIMEOUT_SECONDS`. That is a separate path; the async gate no longer imports it.\n",
+        "deletions": 193,
+        "headRefName": "fix/gate-infra-failures",
+        "headRefOid": "b9dbdb04dc9aad414d2ce6c308abf84087c6b555",
+        "isCrossRepository": false,
+        "isDraft": false,
+        "labels": {
+          "nodes": []
+        },
+        "mergeStateStatus": "BLOCKED",
+        "mergeable": "MERGEABLE",
+        "number": 2130,
+        "reviewDecision": null,
+        "state": "OPEN",
+        "statusCheckRollup": {
+          "contexts": {
+            "nodes": [
+              {
+                "__typename": "CheckRun",
+                "checkSuite": {
+                  "workflowRun": {
+                    "event": "pull_request",
+                    "workflow": {
+                      "name": "CI"
+                    }
+                  }
+                },
+                "completedAt": null,
+                "conclusion": null,
+                "detailsUrl": "https://github.com/Senkichi/charlie-work/actions/runs/36803548922/job/110182915548",
+                "name": "Tests",
+                "startedAt": "2026-10-01T01:57:32Z",
+                "status": "IN_PROGRESS"
+              },
+              {
+                "__typename": "CheckRun",
+                "checkSuite": {
+                  "workflowRun": {
+                    "event": "pull_request",
+                    "workflow": {
+                      "name": "Attachment Contracts"
+                    }
+                  }
+                },
+                "completedAt": "2026-10-01T01:57:52Z",
+                "conclusion": "SUCCESS",
+                "detailsUrl": "https://github.com/Senkichi/charlie-work/actions/runs/36803548915/job/110182915125",
+                "name": "Attachment Contracts (shadow)",
+                "startedAt": "2026-10-01T01:57:31Z",
+                "status": "COMPLETED"
+              },
+              {
+                "__typename": "CheckRun",
+                "checkSuite": {
+                  "workflowRun": {
+                    "event": "dynamic",
+                    "workflow": {
+                      "name": "CodeQL"
+                    }
+                  }
+                },
+                "completedAt": "2026-10-01T01:58:06Z",
+                "conclusion": "SUCCESS",
+                "detailsUrl": "https://github.com/Senkichi/charlie-work/actions/runs/36803546785/job/110182911560",
+                "name": "Analyze (actions)",
+                "startedAt": "2026-10-01T01:57:30Z",
+                "status": "COMPLETED"
+              },
+              {
+                "__typename": "CheckRun",
+                "checkSuite": {
+                  "workflowRun": {
+                    "event": "dynamic",
+                    "workflow": {
+                      "name": "CodeQL"
+                    }
+                  }
+                },
+                "completedAt": "2026-10-01T01:58:18Z",
+                "conclusion": "SUCCESS",
+                "detailsUrl": "https://github.com/Senkichi/charlie-work/actions/runs/36803546785/job/110182911344",
+                "name": "Analyze (python)",
+                "startedAt": "2026-10-01T01:57:30Z",
+                "status": "COMPLETED"
+              },
+              {
+                "__typename": "CheckRun",
+                "checkSuite": {
+                  "workflowRun": {
+                    "event": "pull_request",
+                    "workflow": {
+                      "name": "Attachment Contracts"
+                    }
+                  }
+                },
+                "completedAt": "2026-10-01T01:58:06Z",
+                "conclusion": "SUCCESS",
+                "detailsUrl": "https://github.com/Senkichi/charlie-work/actions/runs/36803548915/job/110182915276",
+                "name": "Build attachment-contracts wheel",
+                "startedAt": "2026-10-01T01:57:32Z",
+                "status": "COMPLETED"
+              },
+              {
+                "__typename": "CheckRun",
+                "checkSuite": {
+                  "workflowRun": {
+                    "event": "pull_request",
+                    "workflow": {
+                      "name": "CI"
+                    }
+                  }
+                },
+                "completedAt": "2026-10-01T01:58:02Z",
+                "conclusion": "SUCCESS",
+                "detailsUrl": "https://github.com/Senkichi/charlie-work/actions/runs/36803548922/job/110182915369",
+                "name": "Lint",
+                "startedAt": "2026-10-01T01:57:31Z",
+                "status": "COMPLETED"
+              },
+              {
+                "__typename": "CheckRun",
+                "checkSuite": {
+                  "workflowRun": {
+                    "event": "pull_request",
+                    "workflow": {
+                      "name": "CI"
+                    }
+                  }
+                },
+                "completedAt": "2026-10-01T01:58:46Z",
+                "conclusion": "FAILURE",
+                "detailsUrl": "https://github.com/Senkichi/charlie-work/actions/runs/36803548922/job/110182915499",
+                "name": "Collect-only gate",
+                "startedAt": "2026-10-01T01:57:31Z",
+                "status": "COMPLETED"
+              },
+              {
+                "__typename": "CheckRun",
+                "checkSuite": {
+                  "workflowRun": null
+                },
+                "completedAt": "2026-10-01T01:58:00Z",
+                "conclusion": "SUCCESS",
+                "detailsUrl": "https://github.com/Senkichi/charlie-work/runs/110183023764",
+                "name": "CodeQL",
+                "startedAt": "2026-10-01T01:57:58Z",
+                "status": "COMPLETED"
+              }
+            ]
+          }
+        },
+        "title": "fix(gate): relaunch infra suite outcomes instead of routing to rework",
+        "updatedAt": "2026-10-01T01:57:28Z",
+        "url": "https://github.com/Senkichi/charlie-work/pull/2130"
+      }
+    }
+  },
+  "number": 2130,
+  "resource": "pr"
+}

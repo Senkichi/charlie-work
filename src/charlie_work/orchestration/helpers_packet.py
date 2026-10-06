@@ -176,6 +176,25 @@ def _packet_template_current(self, pr_number: int) -> bool:
     return packet_template_sha == self._review_template_sha()
 
 
+def _packet_body_current(self, pr_number: int, pr: dict) -> bool:
+    """True if the packet's stored PR body hashes equal to the live body.
+
+    Issue #1983: a body-only rework leaves the head and template unchanged,
+    so the same-head packet skip would keep serving a packet rendered from
+    the OLD body -- the reviewer reads stale text and ``record_review``
+    stamps ``reviewed_body_sha256`` from the packet, re-creating the drift
+    it was queued to resolve. A packet with no readable body cannot prove
+    it matches, so it reads as not current; a live payload without a
+    ``body`` key has nothing to compare and reads as current.
+    """
+    if "body" not in pr:
+        return True
+    packet_body = self._read_packet_body(pr_number)
+    if packet_body is None:
+        return False
+    return _wf._body_content_sha256(packet_body) == _wf._body_content_sha256(pr.get("body"))
+
+
 def _read_packet_diff(self, pr_number: int) -> str | None:
     """Return the diff text stored in the existing review packet for
     ``pr_number``, or ``None`` if no packet exists or it cannot be read.

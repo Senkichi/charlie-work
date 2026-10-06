@@ -36,8 +36,9 @@ import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
+from charlie_work.atomic_write import write_json_atomic
 from charlie_work.process_utils import CpuPriority, get_process_start_time, popen_worker
 from charlie_work.subprocess_runner import hidden_console_kwargs
 
@@ -73,10 +74,8 @@ def suite_gate_paths(dispatches_dir: Path, pr_number: int) -> SuiteGatePaths:
 
 
 def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
-    """Temp-file + ``replace()`` -- the repo's mandatory JSON write shape."""
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    tmp.replace(path)
+    """Unique temp file + ``replace()`` -- the repo's mandatory JSON write shape."""
+    write_json_atomic(path, payload)
 
 
 def _read_json(path: Path) -> dict[str, Any] | None:
@@ -96,6 +95,30 @@ def _read_json(path: Path) -> dict[str, Any] | None:
 def read_gate_result(paths: SuiteGatePaths) -> dict[str, Any] | None:
     """The wrapper's terminal report, or None while absent/unparseable."""
     return _read_json(paths.result)
+
+
+def reusable_gate_result(
+    paths: SuiteGatePaths,
+    *,
+    head_sha: str | None,
+    base_sha: str | None,
+) -> dict[str, Any] | None:
+    """A prior passing result for exactly this ``(head_sha, base_sha)`` pair, else None.
+
+    Reuse is keyed on the full pair: a moved base means the merged tree differs,
+    so it must rerun. Fails closed -- a missing, truncated or malformed file
+    (``read_gate_result`` returns None), ``ok`` not literally ``True``, a missing
+    ``ended_at`` (an incomplete run), or an empty head/base on either side is a
+    miss, never a pass.
+    """
+    if not head_sha or not base_sha:
+        return None
+    result = read_gate_result(paths)
+    if result is None or result.get("ok") is not True or not result.get("ended_at"):
+        return None
+    if result.get("head_sha") != head_sha or result.get("base_sha") != base_sha:
+        return None
+    return result
 
 
 def read_gate_pid(paths: SuiteGatePaths) -> dict[str, Any] | None:
@@ -182,6 +205,7 @@ def launch_suite_gate(
     paths: SuiteGatePaths,
     head_sha: str,
     base_sha: str | None,
+    env: Mapping[str, str] | None = None,
 ) -> SuiteGateLaunch:
     """Spawn the detached suite runner; return immediately with its pid.
 
@@ -206,6 +230,7 @@ def launch_suite_gate(
             proc = popen_worker(
                 argv,
                 priority=CpuPriority.NORMAL,
+                env=env,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=stderr_handle,

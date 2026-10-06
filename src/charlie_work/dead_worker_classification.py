@@ -48,14 +48,32 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from . import worker_fate
+from . import role_quota_ledger, worker_fate
 from .dispatch_selection import _credit_worker_death
+from .rework_attempt_exemption import (
+    exempt_provider_throttle_rework_death,
+    is_provider_throttle_rework_death,
+)
+from .throttle_signatures import (
+    is_provider_auth_failure,
+    match_quota_tail,
+    match_throttle_tail,
+)
 from .worker import iter_workers
 from .write_gate import WriteGate, require_write_gate
 
 if TYPE_CHECKING:
+    from .adapter_fate_profile import AdapterFateProfile
     from .config import OrchestratorConfig
     from .worker import WorkerView
+
+
+# The terminal window the clean-exit throttle check matches (issue #2286):
+# the provider's error notice is one line, but the CLI may print a short exit
+# footer beneath it, so the check covers the last few non-blank lines rather
+# than the final line alone -- while still never reaching mid-transcript
+# prose (the #656 false-positive class).
+_TERMINAL_THROTTLE_LINES = 5
 
 
 def _worker_view_for_entry(
@@ -188,6 +206,44 @@ def resolve_dead_worker_failure_kind(
         return stamped
     if not classify_log:
         return None
+    classified = classify_dead_worker_log(entry, sessions_dir, issue_number, config, now=now)
+    if classified is None:
+        return None
+    adapter_kind, failure = classified
+    _persist_on_locked_entry(
+        entry,
+        state,
+        issue_number,
+        failure,
+        adapter_kind=adapter_kind,
+        now=now if now is not None else datetime.now(UTC),
+        source="dead_worker_classification",
+        write_gate=write_gate,
+    )
+    return failure.kind
+
+
+def classify_dead_worker_log(
+    entry: dict[str, Any],
+    sessions_dir: Path,
+    issue_number: int,
+    config: OrchestratorConfig,
+    *,
+    now: datetime | None = None,
+) -> tuple[str, worker_fate.FailureEvidence] | None:
+    """Classify this entry's dead-worker sidecar log; return ``(adapter_kind, failure)``.
+
+    The classification half of :func:`resolve_dead_worker_failure_kind`, with
+    no ``state`` write: the adapter helper still stamps the sidecar's
+    ``failure_kind`` and records the role-ledger restriction (#2086) itself, but
+    the issue-entry stamp and the per-repo cooldown are left to the caller.
+    The dead-worker sweep needs that split (#2274): it classifies in its
+    lock-free pre phase, whose state copy is discarded, and persists the result
+    once under the lock. Returns None when no single sidecar matches this
+    entry's epoch, the adapter has no classifier, or the log shows no
+    signature. The #656 completion guard lives inside the adapter helper
+    (``terminal_record_proves_completion``), so it applies here unchanged.
+    """
     view = _worker_view_for_entry(sessions_dir, entry, issue_number)
     if view is None:
         return None
@@ -207,16 +263,171 @@ def resolve_dead_worker_failure_kind(
     )
     if failure_kind is None:
         return None
-    _persist_on_locked_entry(
-        entry,
+    # The dead session's stamped role-chain entry rides the evidence so the
+    # persist step stamps the per-repo window with it (issue #2279); the
+    # adapter helper above leaves ``role_entry`` untouched.
+    return view.adapter_kind, worker_fate.FailureEvidence.from_classification(
+        failure_kind,
+        throttled_until,
+        fresh=True,
+        role_key=role_quota_ledger.role_key_for_view(sessions_dir, view),
+    )
+
+
+def _terminal_is_throttle_error(
+    terminal: str, profile: AdapterFateProfile | None, config: OrchestratorConfig
+) -> bool:
+    """True when the log's trailing non-blank lines carry a throttle signature.
+
+    Covers every family ``PROVIDER_THROTTLE_EXEMPT_KINDS`` admits: provider auth
+    errors only for the adapter whose profile detects account errors (api), the
+    quota signature, then the generic throttle markers.
+    """
+    if (
+        profile is not None
+        and profile.account_error_detection
+        and is_provider_auth_failure(terminal)
+    ):
+        return True
+    if match_quota_tail(terminal, config.runtime.quota_error_markers):
+        return True
+    matched, _ = match_throttle_tail(terminal, config.runtime.throttle_error_markers)
+    return matched
+
+
+def classify_clean_exit_throttle(
+    entry: dict[str, Any],
+    sessions_dir: Path,
+    issue_number: int,
+    config: OrchestratorConfig,
+    *,
+    now: datetime | None = None,
+) -> tuple[str, worker_fate.FailureEvidence] | None:
+    """Classify a clean-exit dead worker as a provider throttle, terminal lines only.
+
+    The clean-exit no-op branch's narrow classifier (issue #2286). A rework
+    session that exits 0 having changed nothing is normally a real no-op
+    attempt -- unless the provider killed it, and the evidence for that kill
+    is that the transcript STOPS on the provider's own throttle error. Unlike
+    :func:`classify_dead_worker_log` the signature must therefore anchor the
+    last ``_TERMINAL_THROTTLE_LINES`` non-blank lines of the log; a marker
+    anywhere earlier is completion-era prose (the #656 class) and never
+    classifies here.
+
+    The sidecar writer (``profile.record_failure``) still owns the kind
+    resolution, the cooldown, the ledger restriction, and the
+    ``terminal_record_proves_completion`` guard: a record proving this pid
+    exited 0 WITH a worker outcome ends the check inside the helper, so the
+    same #656 authority applies here unchanged.
+
+    Returns ``(adapter_kind, FailureEvidence)`` like
+    :func:`classify_dead_worker_log`, or None when the terminal lines carry no
+    provider signature (or the resolved kind is not a throttle kind).
+    """
+    view = _worker_view_for_entry(sessions_dir, entry, issue_number)
+    if view is None or not view.log_path:
+        return None
+    profile = worker_fate.profile_for(view.adapter_kind)
+    if profile is None or profile.record_failure is None:
+        return None
+    log_path = Path(view.log_path)
+    try:
+        log_text = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    tail = log_text[-2048:] if len(log_text) > 2048 else log_text
+    terminal_lines = [line for line in tail.splitlines() if line.strip()][
+        -_TERMINAL_THROTTLE_LINES:
+    ]
+    if not terminal_lines or not _terminal_is_throttle_error(
+        "\n".join(terminal_lines), profile, config
+    ):
+        return None
+    # The terminal gate already proved the signature sits at the end, so the
+    # adapter helper's (kind, throttled_until) describes THIS death: the
+    # emission anchor resolves to the terminal error's own timestamp, not a
+    # mid-log quote.
+    failure_kind, throttled_until = profile.record_failure(
+        sessions_dir,
+        issue_number,
+        config=config,
+        now=now,
+    )
+    if not is_provider_throttle_rework_death(failure_kind):
+        return None
+    return view.adapter_kind, worker_fate.FailureEvidence.from_classification(
+        failure_kind,
+        throttled_until,
+        fresh=True,
+        role_key=role_quota_ledger.role_key_for_view(sessions_dir, view),
+    )
+
+
+def exempt_clean_exit_throttle_death(
+    entry: dict[str, Any],
+    sessions_dir: Path,
+    issue_number: int,
+    state: dict[str, Any],
+    config: OrchestratorConfig,
+    *,
+    write_gate: WriteGate,
+    dispatched_at: str | None = None,
+    pr_number: int | None = None,
+    now: datetime | None = None,
+) -> str | None:
+    """Issue #2286: exempt a clean-exit rework death that ended on a provider throttle.
+
+    The orphan sweep's clean-exit no-op branch never classified the worker's
+    log -- a real completion's prose may quote throttle markers mid-transcript
+    (the #656 guard). That left one lane where a rate-limited rework session
+    that exited 0 still consumed a ``no_op_rework_attempts`` slot and
+    escalated a healthy PR at the cap (#2254 / PR #2264).
+
+    Resolution consults the epoch-scoped ``dead_worker_failure_kind`` stamp
+    first (the dead-session lane often classified and reaped the sidecar
+    before this sweep reaches the issue), then falls back to
+    :func:`classify_clean_exit_throttle`'s terminal-line check. A resolved
+    throttle kind is stamped via ``worker_fate.persist_failure`` (arming the
+    per-repo cooldown) and routed through the single enforcement point,
+    ``rework_attempt_exemption.exempt_provider_throttle_rework_death``, which
+    refunds the dead session's own ``redispatch_at`` stamp and flags the PR.
+
+    Returns the resolved ``failure_kind`` when the death was exempted, else
+    None -- the caller then falls through to the ordinary no-op route.
+    """
+    write_gate = require_write_gate(write_gate)
+    stamped = worker_fate.persisted_failure(entry).kind
+    if stamped is not None:
+        failure_kind = stamped
+    else:
+        classified = classify_clean_exit_throttle(
+            entry, sessions_dir, issue_number, config, now=now
+        )
+        if classified is None:
+            return None
+        adapter_kind, failure = classified
+        _persist_on_locked_entry(
+            entry,
+            state,
+            issue_number,
+            failure,
+            adapter_kind=adapter_kind,
+            now=now if now is not None else datetime.now(UTC),
+            source="dead_worker_classification",
+            write_gate=write_gate,
+        )
+        failure_kind = failure.kind
+    if not exempt_provider_throttle_rework_death(
         state,
         issue_number,
-        worker_fate.FailureEvidence.from_classification(failure_kind, throttled_until, fresh=True),
-        adapter_kind=view.adapter_kind,
-        now=now if now is not None else datetime.now(UTC),
-        source="dead_worker_classification",
+        entry,
+        failure_kind,
+        dispatched_at=dispatched_at,
+        pr_number=pr_number,
+        source="orphan_sweep_clean_exit",
         write_gate=write_gate,
-    )
+    ):
+        return None
     return failure_kind
 
 
@@ -231,6 +442,8 @@ def classify_and_credit_dead_worker(
     at: str,
     now: datetime | None = None,
     classify_log: bool = True,
+    dispatched_at: str | None = None,
+    pr_number: int | None = None,
 ) -> str | None:
     """Classify the dead worker, then credit its death unless throttle-caused.
 
@@ -256,6 +469,12 @@ def classify_and_credit_dead_worker(
     through ``_credit_worker_death`` with ``kind=`` so the timestamp and
     its attribution are recorded together (``worker_death_failure_kinds``).
 
+    Issue #2282: the same throttle death also goes through
+    ``rework_attempt_exemption.exempt_provider_throttle_rework_death``.
+    ``dispatched_at`` (the dead epoch's) and ``pr_number`` let that call refund
+    the session's own ``redispatch_at`` stamp and flag the PR, so the attempt
+    counts toward no cap at all.
+
     Returns the resolved ``failure_kind`` (None when unclassifiable) so the
     call site can record it in its event payload.
     """
@@ -275,4 +494,17 @@ def classify_and_credit_dead_worker(
     # kind, so the stamp read agrees with ``failure_kind``.
     if not worker_fate.persisted_failure(entry).is_throttle:
         entry["worker_death_at"] = _credit_worker_death(entry, at=at, kind=failure_kind)
+    # Issue #2282: not crediting the death is only half the exemption -- the
+    # dead session's dispatch stamp would still count as a no-op. The single
+    # enforcement point refunds it and flags the PR.
+    exempt_provider_throttle_rework_death(
+        state,
+        issue_number,
+        entry,
+        failure_kind,
+        dispatched_at=dispatched_at,
+        pr_number=pr_number,
+        source="orphan_sweep_credit",
+        write_gate=write_gate,
+    )
     return failure_kind

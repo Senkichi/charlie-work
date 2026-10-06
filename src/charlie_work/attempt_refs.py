@@ -147,7 +147,15 @@ def snapshot_attempt_ref(
     ref_name = f"{ATTEMPT_REF_PREFIX}/issue-{issue_number}/attempt-{attempt_num}"
 
     update_ref = run_captured(
-        ["git", "update-ref", ref_name, old_tip],
+        [
+            "git",
+            "update-ref",
+            # The reflog entry is the snapshot's creation time, which
+            # attempt_resume uses to tie the ref to the death that made it (#2289).
+            "--create-reflog",
+            ref_name,
+            old_tip,
+        ],
         cwd=repo_root,
         timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
     )

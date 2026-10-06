@@ -52,7 +52,13 @@ from .supervise_loop import (
     PREFLIGHT_REFUSAL_EXIT_CODE,
 )
 from .fleet_pause import register_fleet_pause_subparsers, run_fleet_pause, run_fleet_resume
+from .control_plane_priority import raise_supervisor_to_normal
 from .fleet_paths import fleet_dir
+from .dashboard_command import (
+    DASHBOARD_COMMAND,
+    register_dashboard_subparsers,
+    run_dashboard_command,
+)
 from .fleet_registry import _load_registry, touch_repo, count_fleet_runners
 from .fleet_status import (  # noqa: F401  (deliberate re-export)
     FLEET_STATUS_REPO_TIMEOUT_SECONDS,
@@ -187,6 +193,7 @@ def build_parser() -> argparse.ArgumentParser:
             "to GitHub."
         ),
     )
+    register_dashboard_subparsers(subparsers)
     subparsers.add_parser("bootstrap-labels")
     subparsers.add_parser("intake")
 
@@ -2569,8 +2576,10 @@ def main(argv: list[str] | None = None) -> int:
             elif args.fleet_command == "bash-rats":
                 result = run_fleet_bash_rats(args)
             elif args.fleet_command == "supervise":
+                raise_supervisor_to_normal()
                 result = run_fleet_supervise_command(args)
             elif args.fleet_command == "supervise-loop":
+                raise_supervisor_to_normal()
                 result = run_fleet_supervise_loop(
                     supervise_args=tuple(args.supervise_args),
                     max_relaunches=args.max_relaunches,
@@ -2603,6 +2612,8 @@ def main(argv: list[str] | None = None) -> int:
                 result = CommandResult(
                     False, f"unknown runners command: {args.runners_command}", {}
                 )
+        elif args.command == DASHBOARD_COMMAND:
+            result = run_dashboard_command(args)
         elif args.command == "worktree-clean":
             result = run_worktree_clean_command(args)
         elif args.command == "migrate-state-dir":

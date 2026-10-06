@@ -36,9 +36,18 @@ from charlie_work.checks import (
     summarize_checks,
 )
 from charlie_work.issue_linking import linked_issue_number
-from charlie_work.no_op_rework_body import _body_rework_escape_warning
+from charlie_work.no_op_rework_body import (
+    _body_rework_escape_warning,
+    _trailer_exempt_escape_warning,
+    no_op_escape_needs_pr_commits,  # noqa: F401  (deliberate re-export)
+)
 from charlie_work.safe_ref import require_valid_ref_name, require_valid_sha
 from charlie_work.subprocess_runner import run_captured
+from charlie_work.test_adequacy_exempt import (
+    exempt_reason_for_pr,
+    exempt_reason_from_commit_trailers,  # noqa: F401  (deliberate re-export)
+)
+from charlie_work.unified_diff import iter_diff_files  # noqa: F401  (deliberate re-export)
 
 if TYPE_CHECKING:
     from charlie_work.config import OrchestratorConfig, TestAdequacyConfig
@@ -288,6 +297,31 @@ class DiffContentSignature:
     has_binary: bool = False
 
 
+@dataclass(frozen=True)
+class CarryForwardCheck:
+    """Result of comparing a recorded review verdict's content against the
+    live PR diff (issues #411/#412 tier 1, #414 tier 2).
+
+    ``tier`` is ``"patch-id"`` when the live diff's stable patch-id matches
+    the recorded ``reviewed_patch_id`` outright (issue #412's fast path),
+    ``"line-content"`` when the patch-ids differed — which happens on every
+    ordinary main advance, since the merge-base moves — but the ordered
+    ``+``/``-`` line stream and changed-file set are identical to what was
+    recorded at review time (issue #414), or ``None`` when neither tier
+    establishes content identity: the caller must treat the verdict as
+    stale. ``live_patch_id``/``live_signature`` are populated whenever the
+    live diff was fetched, so a caller can persist the new baseline.
+    """
+
+    tier: str | None
+    live_patch_id: str
+    live_signature: DiffContentSignature
+
+    @property
+    def carry_forward(self) -> bool:
+        return self.tier is not None
+
+
 def _diff_content_signature(diff: str) -> DiffContentSignature:
     """Derive a :class:`DiffContentSignature` from a unified diff string.
 
@@ -354,6 +388,7 @@ def run_janitor(
     pr_diff: str | None = None,
     review_decision: Mapping[str, Any] | None = None,
     issue_labels: set[str] | None = None,
+    pr_commits: Sequence[Mapping[str, Any]] | None = None,
 ) -> JanitorVerdict:
     """Run deterministic pre-review checks over ``pr``/``checks`` data.
 
@@ -378,6 +413,10 @@ def run_janitor(
       baseline — a body-only rework produces no code delta by
       construction. A missing baseline or a ``pr`` without a ``body``
       key fails closed.
+
+    ``pr_commits`` (issue #2281): the PR's REST ``pulls/{n}/commits``
+    list, fetched only when ``no_op_escape_needs_pr_commits`` says the
+    escape in ``_check_no_op_rework`` is live; ``None`` fails closed.
 
     ``issue_labels`` (issue #1598) is the set of live labels on the PR's
     bound issue, when the caller already has them. When provided and any
@@ -445,7 +484,15 @@ def run_janitor(
         )
     elif repo_root is not None:
         is_no_op_rework = _check_no_op_rework(
-            pr, pr_state, failures, warnings, repo_root, pr_diff, review_decision=review_decision
+            pr,
+            pr_state,
+            failures,
+            warnings,
+            repo_root,
+            pr_diff,
+            review_decision=review_decision,
+            pr_commits=pr_commits,
+            test_adequacy=config.test_adequacy,
         )
 
     is_check_failure_block = bool(failed_required_checks) and not failures
@@ -868,6 +915,8 @@ def _check_no_op_rework(
     pr_diff: str | None = None,
     *,
     review_decision: Mapping[str, Any] | None = None,
+    pr_commits: Sequence[Mapping[str, Any]] | None = None,
+    test_adequacy: TestAdequacyConfig,
 ) -> bool:
     """Check if the PR has actual content changes since a request_changes verdict.
 
@@ -880,6 +929,10 @@ def _check_no_op_rework(
 
     Falls back to head SHA comparison if patch-id is not available (for backwards
     compatibility with old verdicts).
+
+    Two escapes satisfy the gate without a diff delta -- the #1939 body
+    change and the #2281 exemption claim -- each failing closed on a
+    missing baseline.
 
     Returns True when a no-op-rework failure was appended (any variant), so
     ``run_janitor`` can expose the finding as the structured
@@ -906,6 +959,16 @@ def _check_no_op_rework(
     body_escape_warning = _body_rework_escape_warning(pr, pr_state, review_decision)
     if body_escape_warning is not None:
         warnings.append(body_escape_warning)
+        return False
+
+    # Issue #2281: a `<marker>` exemption trailer on an (usually empty)
+    # commit is the adequacy gate's own remedy but produces no diff delta;
+    # the decision lives in no_op_rework_body beside the #1939 escape.
+    trailer_escape_warning = _trailer_exempt_escape_warning(
+        pr, pr_state, review_decision, pr_commits, test_adequacy
+    )
+    if trailer_escape_warning is not None:
+        warnings.append(trailer_escape_warning)
         return False
 
     # Primary check: compare patch-ids when both are available
@@ -1259,46 +1322,11 @@ def _get_unpushed_commit_info(
     return None
 
 
-def iter_diff_files(diff: str) -> Iterator[tuple[str, bool, list[str]]]:
-    """Split a unified diff into per-file hunk bodies.
-
-    Yields ``(filename, is_new_file, hunk_lines)`` for each file section in
-    ``diff``, where ``hunk_lines`` is every ``@@``-header and hunk-body line
-    for that file (diff-metadata lines starting with ``\\`` are dropped).
-    Sections with no discoverable ``+++ b/`` path are skipped. This performs
-    structural splitting only — it does not tally added/removed lines or
-    inspect hunk content beyond locating file/hunk boundaries; line counting
-    is the caller's responsibility (see ``check_test_adequacy`` in a later
-    module addition).
-    """
-    sections = diff.split("\ndiff --git")
-    for section in sections:
-        if not section.strip():
-            continue
-        if not section.startswith("diff --git"):
-            section = "diff --git" + section
-
-        current_file: str | None = None
-        current_hunks: list[str] = []
-        is_new_file = False
-
-        for line in section.splitlines():
-            if line.startswith("+++ b/"):
-                current_file = line[6:]
-            elif line.startswith("new file mode"):
-                is_new_file = True
-            elif line.startswith("@@"):
-                current_hunks.append(line)
-            elif current_hunks:
-                if not line.startswith("\\"):
-                    current_hunks.append(line)
-
-        if current_file is not None:
-            yield current_file, is_new_file, current_hunks
-
-
 def check_test_adequacy(
-    diff: str, pr: dict[str, Any], config: TestAdequacyConfig
+    diff: str,
+    pr: dict[str, Any],
+    config: TestAdequacyConfig,
+    commit_messages: Sequence[str] = (),
 ) -> TestAdequacyVerdict:
     """Check test adequacy of a PR diff.
 
@@ -1383,17 +1411,13 @@ def check_test_adequacy(
                     facts=default_facts,
                 )
 
-        # Step 5: Exemption check
-        exempt = False
-        exempt_reason = ""
-        body = pr.get("body") or ""
-        exempt_re = re.compile(rf"^{re.escape(config.exempt_marker)}\s*(?P<reason>.+)$", re.M)
-        match = exempt_re.search(body)
-        if match:
-            reason = match.group("reason").strip()
-            if reason:  # Non-empty reason required
-                exempt = True
-                exempt_reason = reason
+        # Step 5: Exemption check. Workers have no GitHub token and cannot
+        # edit the PR body; a commit trailer is the channel they do have
+        # (issue #2220).
+        exempt_reason = exempt_reason_for_pr(
+            pr.get("body") or "", commit_messages, config.exempt_marker
+        )
+        exempt = bool(exempt_reason)
 
         facts = TestAdequacyFacts(
             added_product_loc=added_product_loc,
@@ -1417,7 +1441,8 @@ def check_test_adequacy(
             failures.append(
                 f"Product code changed ({added_product_loc} LOC added) but no test files changed. "
                 f"Untested product files: {', '.join(untested_product_files)}. "
-                f"Add tests or use '{config.exempt_marker} <reason>' in the PR body to exempt."
+                f"Add tests or add a '{config.exempt_marker} <reason>' trailer to a commit "
+                f"(an empty commit is fine) or to the PR body to exempt."
             )
             return TestAdequacyVerdict(
                 ok=False, failures=tuple(failures), warnings=(), facts=facts

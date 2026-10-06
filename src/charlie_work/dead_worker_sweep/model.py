@@ -96,6 +96,14 @@ class StripAndFlag:
 
 
 @dataclass(frozen=True)
+class CloseVerifiedNoChanges:
+    """Guard a ``verified_no_changes`` claim and, when it holds, close the issue (#2185)."""
+
+    issue: int
+    detail: str
+
+
+@dataclass(frozen=True)
 class ProbeZeroArtifact:
     issue: int
 
@@ -162,6 +170,29 @@ class AdvanceToPrOpen:
 class CreditDeadWorker:
     issue: int
     classify_log: bool = True
+    # Issue #2282: the dead epoch's ``dispatched_at`` (captured before the flow
+    # clears it) and the PR, so a provider-throttle death can refund its own
+    # dispatch stamp and flag the PR (``rework_attempt_exemption``).
+    dispatched_at: str | None = None
+    pr_number: int | None = None
+
+
+@dataclass(frozen=True)
+class ExemptThrottleCleanExit:
+    """Issue #2286: exempt an exit-0 session whose log ENDS in a provider throttle.
+
+    The clean-exit no-op branch cannot run the full tail classifier -- a real
+    completion's prose may quote throttle markers anywhere in the transcript
+    (the #656 false-positive class). This request answers the narrow question
+    "is the LAST non-blank log content a provider-throttle signature" and, when
+    it is, routes the death through ``rework_attempt_exemption`` so the attempt
+    is never counted. ``dispatched_at``/``pr_number`` mirror ``CreditDeadWorker``
+    for the refund and the PR flag.
+    """
+
+    issue: int
+    dispatched_at: str | None = None
+    pr_number: int | None = None
 
 
 @dataclass(frozen=True)
@@ -218,6 +249,11 @@ class GuardedUpdate:
 
     ``set_items`` is a tuple of pairs (requests are dict keys); ``stamp_fields``
     names fields set to the clock at *write* time, after ``review()`` returned.
+
+    ``event`` is the audit row for this disposition as ``(kind, payload_pairs)``.
+    The shell appends it inside the same lock window as the write, only when the
+    guards pass, so status and event are durable together or not at all. The kind
+    stays a decide-chosen literal; the shell knows no event kinds.
     """
 
     issue: int
@@ -225,6 +261,7 @@ class GuardedUpdate:
     stamp_fields: tuple[str, ...] = ()
     require_status: str | None = None
     require_pr_reviewed_head: str | None = None
+    event: tuple[str, tuple[tuple[str, Any], ...]] | None = None
 
 
 @dataclass(frozen=True)
@@ -239,6 +276,7 @@ Request = (
     | FetchOpenIssues
     | ResolveFate
     | StripAndFlag
+    | CloseVerifiedNoChanges
     | ProbeZeroArtifact
     | ProbeCrossRepoScope
     | ParkOrReclaim
@@ -251,6 +289,7 @@ Request = (
     | OpenPrForBranch
     | AdvanceToPrOpen
     | CreditDeadWorker
+    | ExemptThrottleCleanExit
     | ReadTerminal
     | ReadCompletedOutcome
     | ReadBlockedOutcome
@@ -269,6 +308,7 @@ LOCK_LEGAL = (
     OpenPrForBranch,
     AdvanceToPrOpen,
     CreditDeadWorker,
+    ExemptThrottleCleanExit,
     ReadTerminal,
     ReadCompletedOutcome,
     ReadBlockedOutcome,
@@ -298,6 +338,7 @@ class FateResult:
     blocked_reason_kind: str = ""
     blocked_detail: str = ""
     throttled: bool = False  # fate is a provider-throttle death
+    verified_no_changes: bool = False  # fresh outcome declares verified_no_changes (#2185)
     pushed_without_pr: bool = False
     worker_outcome: Mapping[str, Any] | None = None
 
@@ -306,6 +347,13 @@ class FateResult:
 class LabelWrite:
     ok: bool
     removed_labels: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class VerifiedCloseResult:
+    ok: bool
+    removed_labels: tuple[str, ...] = ()
+    reason: str | None = None  # why the claim was refused when ``ok`` is False
 
 
 @dataclass(frozen=True)

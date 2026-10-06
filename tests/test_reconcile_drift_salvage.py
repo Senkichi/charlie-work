@@ -22,13 +22,14 @@ from datetime import (
 from pathlib import Path
 from _reconcile_fixtures import (
     FakeGitHub,
-    _init_bare_remote_and_clone,
     _issue,
+    _pr,
     _setup_completed_worktree,
 )
-from _worktree_fixtures import _git
+from _worktree_fixtures import _git, _init_bare_remote_and_clone
 from charlie_work.config import OrchestratorConfig
 from charlie_work.devin_shell import SessionRecord
+from charlie_work.instrumentation import close_db, query_events
 from charlie_work.paths import runtime_paths
 from charlie_work.reconcile import (
     DriftItem,
@@ -63,6 +64,18 @@ def _write_dead_session_sidecar(
 # Adapter-kind -> sidecar filename suffix. Mirrors claude_code._ADAPTER_SIDECAR_SUFFIXES
 # without importing it (keeps the test's failure surface independent of the adapter).
 _ADAPTER_SIDECAR_SUFFIX = {"devin": "", "claude-code": ".claude", "api": ".api"}
+
+
+@pytest.fixture(autouse=True)
+def _close_events_db(tmp_path: Path) -> None:
+    """Release the events.db SQLite handle so tmp_path cleanup does not fight
+    an open connection (Windows file locks)."""
+    yield
+    close_db(tmp_path / ".var" / "charlie-work" / "state.json")
+
+
+def _events_state_path(tmp_path: Path, config: OrchestratorConfig) -> Path:
+    return runtime_paths(tmp_path, config.runtime.state_dir).state_file
 
 
 def _write_dead_session_sidecar_for_adapter(
@@ -347,17 +360,17 @@ def test_apply_fixes_salvage_push_failure_fallback(tmp_path: Path) -> None:
     ]
 
     # Force push to fail
-    import charlie_work.reconcile
+    import charlie_work.reconcile_salvage
 
-    original_push_branch = charlie_work.reconcile.push_branch
-    charlie_work.reconcile.push_branch = lambda repo, br, worktree_path=None: (
+    original_push_branch = charlie_work.reconcile_salvage.push_branch
+    charlie_work.reconcile_salvage.push_branch = lambda repo, br, worktree_path=None: (
         False,
         "simulated push failure",
     )
     try:
         new_state = apply_fixes(gh, empty_state(), drift, config)
     finally:
-        charlie_work.reconcile.push_branch = original_push_branch
+        charlie_work.reconcile_salvage.push_branch = original_push_branch
 
     # No PR created, active label removed, ready label added
     assert not gh.prs_created
@@ -423,9 +436,10 @@ def test_reconcile_dry_run_never_reaches_salvage_push_branch(
             push_calls.append(args)
             return True, None
 
-        # The leaf itself: reconcile.py's salvage lane calls the module-level
+        # The leaf itself: the salvage lane (reconcile_salvage.py, extracted
+        # from reconcile.py under #2226) calls the module-level
         # ``push_branch`` name with no dry_run threading.
-        monkeypatch.setattr("charlie_work.reconcile.push_branch", _spy_push_branch)
+        monkeypatch.setattr("charlie_work.reconcile_salvage.push_branch", _spy_push_branch)
 
         paths = runtime_paths(repo_root, config.runtime.state_dir)
         app = OrchestratorApp(repo_root, paths, config, gh, dry_run=True)
@@ -452,3 +466,241 @@ def test_reconcile_dry_run_never_reaches_salvage_push_branch(
         assert branch not in _git(remote, "show-ref").stdout
     finally:
         shutil.rmtree(staging, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Issue #2226: the reconcile_salvage lane's lifecycle_transition emissions and
+# its #2262 no-PR-backend branch, driven through apply_fixes.
+# ---------------------------------------------------------------------------
+
+
+def _salvage_drift(issue_number: int, branch: str, config: OrchestratorConfig) -> list[DriftItem]:
+    return [
+        DriftItem(
+            kind="session_unpublished_work_salvaged",
+            issue_number=issue_number,
+            pr_number=None,
+            detail="salvage",
+            fix_actions=("push", "pr_create"),
+            remove_labels=(config.labels.in_progress,),
+            add_labels=(config.labels.pr_open,),
+            branch=branch,
+            base_branch="main",
+        )
+    ]
+
+
+def test_apply_fixes_salvage_success_emits_lifecycle_transition(tmp_path: Path) -> None:
+    """Issue #2226: the salvage lane's PR-open label swap must record a
+    ``lifecycle_transition`` carrying the created PR number, the pushed-to
+    repo name (never repo=NULL), and cause=session_unpublished_work_salvaged."""
+    remote, repo_root = _init_bare_remote_and_clone(tmp_path)
+    issue_number = 270
+    _worktree_path, branch = _setup_completed_worktree(repo_root, issue_number)
+
+    config = OrchestratorConfig()
+    # Plant the just-created PR so probe_closing_link's pr_view resolves the
+    # closingIssuesReferences binding on its first attempt (no rechecks).
+    created_pr = _pr(101, "OPEN", head_ref=branch, body="Closes #270")
+    created_pr["closingIssuesReferences"] = [{"number": issue_number}]
+    gh = FakeGitHub(
+        prs=[created_pr],
+        issues=[_issue(issue_number, [config.labels.in_progress])],
+        repo_root=repo_root,
+        pr_create_return=101,
+    )
+    state_path = _events_state_path(tmp_path, config)
+
+    apply_fixes(
+        gh,
+        empty_state(),
+        _salvage_drift(issue_number, branch, config),
+        config,
+        state_path=state_path,
+    )
+
+    events = query_events(state_path, kind="lifecycle_transition", issue_number=issue_number)
+    assert len(events) == 1
+    payload = events[0]["payload"]
+    assert payload["to_state"] == "pr_open"
+    assert payload["pr_number"] == 101
+    assert payload["cause"] == "session_unpublished_work_salvaged"
+    assert events[0]["repo"] == repo_root.name
+
+
+def test_apply_fixes_salvage_push_failure_emits_ready_transition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #2226: the salvage lane's relabel-to-ready fallback records a
+    ``lifecycle_transition`` to_state=ready with cause=salvage_failed_fallback."""
+    _remote, repo_root = _init_bare_remote_and_clone(tmp_path)
+    issue_number = 271
+    _worktree_path, branch = _setup_completed_worktree(repo_root, issue_number)
+
+    config = OrchestratorConfig()
+    gh = FakeGitHub(
+        prs=[],
+        issues=[_issue(issue_number, [config.labels.in_progress])],
+        repo_root=repo_root,
+        pr_create_return=102,
+    )
+    state_path = _events_state_path(tmp_path, config)
+    monkeypatch.setattr(
+        "charlie_work.reconcile_salvage.push_branch",
+        lambda repo, br, worktree_path=None: (False, "simulated push failure"),
+    )
+
+    new_state = apply_fixes(
+        gh,
+        empty_state(),
+        _salvage_drift(issue_number, branch, config),
+        config,
+        state_path=state_path,
+    )
+
+    assert gh.prs_created == []
+    events = query_events(state_path, kind="lifecycle_transition", issue_number=issue_number)
+    assert len(events) == 1
+    payload = events[0]["payload"]
+    assert payload["to_state"] == "ready"
+    assert payload["cause"] == "salvage_failed_fallback"
+    assert payload["pr_number"] is None
+    assert events[0]["repo"] == repo_root.name
+
+    reconcile_events = [e for e in new_state["events"] if e["kind"] == "reconcile"]
+    assert reconcile_events[-1]["payload"]["kind"] == "session_failed_relabeled"
+    assert (
+        "salvage_failed: simulated push failure" in reconcile_events[-1]["payload"]["fix_actions"]
+    )
+
+
+def test_apply_fixes_salvage_no_pr_capability_skips_pr_create(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #2262 branch inside the salvage lane: when the lane's own
+    ``publishes_pull_requests`` probe reports False, ``pr_create`` must not be
+    called and the item falls back to ``session_failed_relabeled`` recording
+    ``salvage_failed: backend does not publish pull requests``.
+
+    ``apply_fixes``'s outer dispatch consults the same probe -- a False there
+    keeps the item report-only without entering the lane at all (pinned by
+    ``test_apply_fixes_salvage_non_publishing_backend_stays_report_only``) --
+    so this test drives the lane end-to-end on a publishing-shaped double and
+    forces only the lane's own binding to False, which is the only way the
+    inner no-publish branch is reachable through ``apply_fixes``.
+    """
+    remote, repo_root = _init_bare_remote_and_clone(tmp_path)
+    issue_number = 272
+    _worktree_path, branch = _setup_completed_worktree(repo_root, issue_number)
+
+    config = OrchestratorConfig()
+    gh = FakeGitHub(
+        prs=[],
+        issues=[_issue(issue_number, [config.labels.in_progress])],
+        repo_root=repo_root,
+        pr_create_return=103,
+    )
+    state_path = _events_state_path(tmp_path, config)
+    monkeypatch.setattr(
+        "charlie_work.reconcile_salvage.publishes_pull_requests", lambda _gh: False
+    )
+
+    new_state = apply_fixes(
+        gh,
+        empty_state(),
+        _salvage_drift(issue_number, branch, config),
+        config,
+        state_path=state_path,
+    )
+
+    # The push precedes the capability check and still lands; the PR write is
+    # what must be skipped.
+    assert branch in _git(remote, "show-ref").stdout
+    assert gh.prs_created == []
+    assert (issue_number, config.labels.in_progress) in gh.labels_removed
+    assert (issue_number, config.labels.ready) in gh.labels_added
+
+    reconcile_events = [e for e in new_state["events"] if e["kind"] == "reconcile"]
+    assert reconcile_events[-1]["payload"]["kind"] == "session_failed_relabeled"
+    assert (
+        "salvage_failed: backend does not publish pull requests"
+        in reconcile_events[-1]["payload"]["fix_actions"]
+    )
+
+
+def test_apply_fixes_salvage_absent_pr_create_falls_back(tmp_path: Path) -> None:
+    """The same inner no-publish branch through its other disjunct: a backend
+    that passes ``publishes_pull_requests`` but has no ``pr_create`` callable
+    records the same ``backend does not publish pull requests`` salvage
+    failure -- the only unpatched way the branch is reachable through
+    ``apply_fixes`` (a real ``publishes_pull_requests=False`` backend never
+    gets past the outer dispatch gate)."""
+
+    class _NoPrCreateGitHub(FakeGitHub):
+        pr_create = None
+
+    remote, repo_root = _init_bare_remote_and_clone(tmp_path)
+    issue_number = 273
+    _worktree_path, branch = _setup_completed_worktree(repo_root, issue_number)
+
+    config = OrchestratorConfig()
+    gh = _NoPrCreateGitHub(
+        prs=[],
+        issues=[_issue(issue_number, [config.labels.in_progress])],
+        repo_root=repo_root,
+    )
+    state_path = _events_state_path(tmp_path, config)
+
+    new_state = apply_fixes(
+        gh,
+        empty_state(),
+        _salvage_drift(issue_number, branch, config),
+        config,
+        state_path=state_path,
+    )
+
+    assert branch in _git(remote, "show-ref").stdout
+    assert (issue_number, config.labels.ready) in gh.labels_added
+    reconcile_events = [e for e in new_state["events"] if e["kind"] == "reconcile"]
+    assert reconcile_events[-1]["payload"]["kind"] == "session_failed_relabeled"
+    assert (
+        "salvage_failed: backend does not publish pull requests"
+        in reconcile_events[-1]["payload"]["fix_actions"]
+    )
+
+
+def test_apply_fixes_salvage_non_publishing_backend_stays_report_only(tmp_path: Path) -> None:
+    """Issue #2262 outer gate: on a backend that cannot publish pull requests
+    (``publishes_pull_requests`` False -- e.g. ``LocalFileGitHub``, whose
+    ``pr_create`` is a null object that can never publish) ``apply_fixes``
+    never enters the salvage lane. The item stays report-only: no push, no
+    ``pr_create``, no label writes, no ``lifecycle_transition``, and the
+    reconcile event keeps the ``session_unpublished_work_salvaged`` kind --
+    the sweep's park lane owns local salvage (issue #2262)."""
+
+    class _NonPublishingGitHub(FakeGitHub):
+        publishes_pull_requests = False
+
+    issue_number = 274
+    config = OrchestratorConfig()
+    gh = _NonPublishingGitHub(
+        prs=[],
+        issues=[_issue(issue_number, [config.labels.in_progress])],
+        repo_root=None,
+    )
+    state_path = _events_state_path(tmp_path, config)
+
+    new_state = apply_fixes(
+        gh,
+        empty_state(),
+        _salvage_drift(issue_number, "agent/issue-274", config),
+        config,
+        state_path=state_path,
+    )
+
+    assert gh.prs_created == []
+    assert gh.labels_added == []
+    assert gh.labels_removed == []
+    assert query_events(state_path, kind="lifecycle_transition", issue_number=issue_number) == []
+    reconcile_events = [e for e in new_state["events"] if e["kind"] == "reconcile"]
+    assert reconcile_events[-1]["payload"]["kind"] == "session_unpublished_work_salvaged"

@@ -49,7 +49,7 @@ def test_unescalated_pr_open_edge_adds_pr_open_removes_the_rest() -> None:
     config = OrchestratorConfig()
     fake_gh = FakeGitHub()
 
-    result = transition(fake_gh, config.labels, 123, "unescalated_pr_open")
+    result = transition(fake_gh, config.labels, 123, "unescalated_pr_open", state_path=None)
 
     assert result.outcome == TransitionOutcome.APPLIED
     assert fake_gh.labels_added == [(123, config.labels.pr_open)]
@@ -62,7 +62,7 @@ def test_unescalated_requeued_edge_adds_nothing_removes_all_workflow_labels() ->
     config = OrchestratorConfig()
     fake_gh = FakeGitHub()
 
-    result = transition(fake_gh, config.labels, 123, "unescalated_requeued")
+    result = transition(fake_gh, config.labels, 123, "unescalated_requeued", state_path=None)
 
     assert result.outcome == TransitionOutcome.APPLIED
     assert fake_gh.labels_added == []
@@ -94,6 +94,8 @@ def test_unescalate_escalated_open_pr_resets_and_relabels(tmp_path: Path) -> Non
             "review_dispatch_status": "review_dispatch_failed",
             "escalation_reason": "max_review_dispatch_attempts_exceeded",
             "ci_run_never_created_head": "abc123abc123",
+            "workflow_no_jobs_head": "abc123abc123",
+            "ci_absence_probed_attempts": 2,
         }
         state["issues"]["123"] = {
             "number": 123,
@@ -123,6 +125,8 @@ def test_unescalate_escalated_open_pr_resets_and_relabels(tmp_path: Path) -> Non
         "review_dispatch_status",
         "escalation_reason",
         "ci_run_never_created_head",
+        "workflow_no_jobs_head",
+        "ci_absence_probed_attempts",
     ):
         assert stale_field not in pr_entry, stale_field
 

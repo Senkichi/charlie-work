@@ -17,7 +17,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from _fleet_dispatch_fixtures import (
-    _FakeClock,
     _drained_fleet_result,
     _patch_ci_fleet_dirty_for_hermetic_tests as _patch_ci_fleet_dirty_for_hermetic_tests,
     _patch_self_deploy_for_fleet_tests as _patch_self_deploy_for_fleet_tests,
@@ -34,6 +33,7 @@ from charlie_work.fleet_pause import (
     run_fleet_resume,
     write_fleet_pause,
 )
+from charlie_work.host.fakes import FakeClock
 from charlie_work.supervise_loop import (
     EXIT_FLEET_PAUSED,
     EXIT_RESTART_REQUESTED,
@@ -55,7 +55,7 @@ def test_exit_code_constant_is_pinned_and_distinct() -> None:
     assert is_exit_alertable(EXIT_FLEET_PAUSED) is False
 
 
-def test_write_is_atomic_temp_then_replace(tmp_path: Path, monkeypatch: Any) -> None:
+def test_write_is_atomic_temp_then_replace(tmp_path: Path, patch_path_replace: Any) -> None:
     replaced: list[tuple[Path, Path]] = []
     real_replace = Path.replace
 
@@ -63,11 +63,19 @@ def test_write_is_atomic_temp_then_replace(tmp_path: Path, monkeypatch: Any) -> 
         replaced.append((self, Path(target)))
         return real_replace(self, target)
 
-    monkeypatch.setattr(Path, "replace", _spy)
+    patch_path_replace(_spy, scope=tmp_path)
     path = write_fleet_pause(str(tmp_path), reason="maintenance")
 
-    assert replaced == [(path.with_suffix(path.suffix + ".tmp"), path)]
-    assert not path.with_suffix(path.suffix + ".tmp").exists()
+    assert len(replaced) == 1
+    tmp_used, target = replaced[0]
+    assert target == path
+    # Unique temp name in the destination dir (issue #2265), still matching
+    # the ``*.json.tmp`` orphan-sweep glob.
+    assert tmp_used.parent == path.parent
+    assert tmp_used.name != path.with_suffix(path.suffix + ".tmp").name
+    assert tmp_used.name.startswith(f"{path.stem}.")
+    assert tmp_used.name.endswith(f"{path.suffix}.tmp")
+    assert not list(path.parent.glob("*.tmp"))
     payload = json.loads(path.read_text(encoding="utf-8"))
     assert payload["reason"] == "maintenance"
     assert path == layout.fleet_pause_path(str(tmp_path))
@@ -128,9 +136,9 @@ def test_supervisor_reads_flag_at_pass_boundary_only(
 
     mock_fleet_loop.side_effect = _pass_that_gets_paused_midway
 
-    fc = _FakeClock(auto_advance=1.0)
+    fc = FakeClock(auto_advance=1.0)
     result = run_fleet_supervise(
-        fleet_dir_override=str(tmp_path), clock=fc.now, sleep=fc.sleep, max_passes=5
+        fleet_dir_override=str(tmp_path), clock=fc.monotonic, sleep=fc.sleep, max_passes=5
     )
 
     # The flag landed mid-pass 1: that pass ran to completion (never
@@ -160,9 +168,9 @@ def test_supervisor_started_while_paused_runs_no_pass(
         supervisor=SupervisorConfig(poll_interval_seconds=5, full_pass_interval_seconds=1)
     )
     write_fleet_pause(str(tmp_path))
-    fc = _FakeClock(auto_advance=1.0)
+    fc = FakeClock(auto_advance=1.0)
     result = run_fleet_supervise(
-        fleet_dir_override=str(tmp_path), clock=fc.now, sleep=fc.sleep, max_passes=5
+        fleet_dir_override=str(tmp_path), clock=fc.monotonic, sleep=fc.sleep, max_passes=5
     )
     assert mock_fleet_loop.call_count == 0
     assert result.data["exit_reason"] == "fleet_paused"

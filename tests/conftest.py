@@ -53,6 +53,59 @@ def autospec() -> Callable[..., Any]:
     return autospec_patch
 
 
+def patch_path_replace(
+    monkeypatch: pytest.MonkeyPatch,
+    fake: Callable[..., Path],
+    *,
+    scope: Path,
+) -> None:
+    """Install ``fake`` as ``Path.replace``, but only for calls inside ``scope``.
+
+    ``monkeypatch.setattr(Path, "replace", fake)`` patches the *class*, so the
+    patch is process-wide: a ``Path.replace`` fired by any other thread during
+    the window -- a leftover background writer from an earlier test on the same
+    xdist worker, the flake behind issues #2284/#2290 -- lands in ``fake`` too,
+    where it is miscounted, raised at, or deadlocked on a barrier it was never
+    meant to join.
+
+    The installed wrapper routes a call to ``fake`` only when the source path
+    resolves inside ``scope`` (resolved containment via
+    ``charlie_work.safe_path.contains``, so a junction/reparse point cannot
+    smuggle an outside path in); every other call delegates to the real
+    ``Path.replace`` untouched. Scope the patch to the directory under test
+    (usually ``tmp_path``) -- a foreign path then behaves exactly as if the
+    patch did not exist.
+
+    ``fake`` keeps the real signature ``(self, target) -> Path``. A fake that
+    delegates must call a ``real_replace`` captured *before* this helper runs;
+    calling ``Path.replace`` inside ``fake`` would re-enter the wrapper.
+    """
+    from charlie_work import safe_path
+
+    real_replace = Path.replace
+
+    def _scoped(self: Path, target: object, *args: Any, **kwargs: Any) -> Path:
+        if safe_path.contains(scope, self):
+            return fake(self, target, *args, **kwargs)
+        return real_replace(self, target, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "replace", _scoped)
+
+
+@pytest.fixture(name="patch_path_replace")
+def _patch_path_replace_fixture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Callable[..., None]:
+    """``patch_path_replace`` bound to the test's own ``monkeypatch``.
+
+    Call as ``patch_path_replace(fake, scope=tmp_path)``. A test that manages
+    a ``pytest.MonkeyPatch()`` instance by hand (e.g. to control undo timing
+    around joined threads) calls the unbound ``conftest.patch_path_replace``
+    directly.
+    """
+    return lambda fake, *, scope: patch_path_replace(monkeypatch, fake, scope=scope)
+
+
 @pytest.hookimpl(tryfirst=True)
 def pytest_sessionstart(session: pytest.Session) -> None:
     """Issue #1665: refuse to run when ``charlie_work`` resolves outside this checkout.
@@ -421,6 +474,23 @@ def _no_real_host_load_probe(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(host_load_module, "list_host_processes", lambda: ((), None))
 
 
+@pytest.fixture(autouse=True)
+def _no_real_github_network(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Never let the GitHub transport open a real connection (ADR-0006).
+
+    ``HttpAdapter`` builds its sockets through the module-level
+    ``_new_connection`` when no ``connection_factory`` is injected, so
+    patching that one hook makes "a test forgot to inject a fake" fail loudly
+    instead of calling api.github.com. Tests inject ``connection_factory=``.
+    """
+    from charlie_work.github_transport import http_adapter
+
+    def _refuse(host: str, timeout: float) -> object:
+        raise AssertionError(f"real network in tests: {host}")
+
+    monkeypatch.setattr(http_adapter, "_new_connection", _refuse)
+
+
 def _healthy_preflight(*args: object, **kwargs: object) -> PreflightResult:
     return PreflightResult(checks=())
 
@@ -461,3 +531,35 @@ def _default_healthy_preflight(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     monkeypatch.setattr("charlie_work.workflow.run_preflight", _healthy_preflight)
     monkeypatch.setattr("charlie_work.fleet_dispatch.run_preflight", _healthy_preflight)
+
+
+@pytest.fixture(autouse=True)
+def _no_live_self_deploy_history(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Issue #2103: the reviewer reap reads the orchestrator's own ``events.db``
+    for ``self_deploy_succeeded``. On a host with deploy history that would
+    reclassify every fixture reviewer (started in the past) as deploy-interrupted,
+    so tests see no deploy store unless they opt in by patching this seam."""
+    monkeypatch.setattr(
+        "charlie_work.orchestration.misc_review_verdicts.self_deploy_state_path",
+        lambda: None,
+    )
+
+
+@pytest.fixture
+def fake_host(monkeypatch: pytest.MonkeyPatch) -> Callable[..., Any]:
+    """Swap the active host ports for the test; restored by monkeypatch.
+
+    ``fake_host(clock=FakeClock(...))`` replaces the named ports on top of the
+    currently active ports (so repeated calls compose) and returns the resulting ``HostPorts``.  An app built without an
+    explicit ``host=`` and every non-app module see the same fake.
+    """
+    import dataclasses
+
+    from charlie_work import host as host_pkg
+
+    def _install(**overrides: Any) -> Any:
+        ports = dataclasses.replace(host_pkg.current(), **overrides)
+        monkeypatch.setattr(host_pkg, "_ACTIVE", ports)
+        return ports
+
+    return _install

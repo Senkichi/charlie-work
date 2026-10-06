@@ -1,0 +1,10 @@
+issue #2080: emits the ``request_changes_body_changed_requeued`` audit event
+once per live head+body drift when review_queue() supersedes a
+request_changes verdict whose PR body drifted from its
+reviewed_body_sha256 baseline -- the drift guard that stops patch-id
+carry-forward and the stranded-request_changes reroute from looping a
+body-only rework into no_op_rework_cap_exceeded. Net-new OrchestratorApp
+member added after the Track 2 Phase B surface baseline was pinned;
+declared here so the member-surface conservation check in
+tests/test_workflow_delegation_l00.py subtracts it before comparing moved
+delegates against the pre-campaign total (133).

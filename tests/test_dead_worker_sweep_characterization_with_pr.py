@@ -240,17 +240,110 @@ def test_pr_approved_rework_status_auto_resets_to_rework(tmp_path: Path) -> None
     assert events_of(paths, "orphaned_worker_drift") == []
 
 
-def test_pr_approved_without_rework_status_drifts_unsafe_to_auto_reset(
-    tmp_path: Path,
-) -> None:
-    config, paths, gh, _ = _dead_worker_rework_bed(tmp_path, decision="approved")
+def test_pr_approved_carried_forward_status_recovers_to_rework(tmp_path: Path) -> None:
+    """#2135: carry-forward resets the PR status to ``approved`` mid-rework.
+
+    ``dispatched`` + ``approved`` can only be a post-approval rework, so a
+    dead worker must recover whatever the PR ``status`` says.
+    """
+    config, paths, gh, _ = _dead_worker_rework_bed(
+        tmp_path, decision="approved", pr_state_status="approved"
+    )
+    write_terminal_exit(
+        tmp_path,
+        207,
+        exit_code=1,
+        started_at=iso(minutes_ago=30),
+        ended_at=iso(minutes_ago=25),
+    )
 
     run_sweep(tmp_path, paths, config, gh)
 
-    assert issue_entry(paths, 207)["status"] == "dispatched"
-    assert events_of(paths, "orphaned_worker_recovered") == []
+    assert issue_entry(paths, 207)["status"] == "rework_requested"
+    (event,) = events_of(paths, "orphaned_worker_recovered")
+    assert event["payload"]["reason"] == "dead_worker_with_approved_rework"
+    assert events_of(paths, "orphaned_worker_drift") == []
+
+
+def test_pr_approved_without_rework_status_drifts_unsafe_to_auto_reset(
+    tmp_path: Path,
+) -> None:
+    """#2135 (supersedes #1109): no PR ``status`` at all no longer wedges.
+
+    ``dispatched`` + ``approved`` on the same head is a post-approval rework
+    whatever the PR ``status`` says, so the dead worker recovers instead of
+    drifting. The leaf name predates #2135 and is kept so the collect-only gate
+    sees the test as modified rather than removed.
+    """
+    config, paths, gh, _ = _dead_worker_rework_bed(tmp_path, decision="approved")
+    write_terminal_exit(
+        tmp_path,
+        207,
+        exit_code=1,
+        started_at=iso(minutes_ago=30),
+        ended_at=iso(minutes_ago=25),
+    )
+
+    run_sweep(tmp_path, paths, config, gh)
+
+    assert issue_entry(paths, 207)["status"] == "rework_requested"
+    (event,) = events_of(paths, "orphaned_worker_recovered")
+    assert event["payload"]["reason"] == "dead_worker_with_approved_rework"
+    assert events_of(paths, "orphaned_worker_drift") == []
+
+
+def test_pr_approved_carried_forward_status_clean_exit_is_no_op(tmp_path: Path) -> None:
+    """#2135: exit 0 on a carried-forward approved PR counts against the no-op cap."""
+    config, paths, gh, _ = _dead_worker_rework_bed(
+        tmp_path, decision="approved", pr_state_status="approved"
+    )
+    write_terminal_exit(
+        tmp_path,
+        207,
+        started_at=iso(minutes_ago=30),
+        ended_at=iso(minutes_ago=25),
+    )
+
+    run_sweep(tmp_path, paths, config, gh)
+
+    entry = issue_entry(paths, 207)
+    assert entry["status"] == "escalated"
+    assert entry["escalation_reason"] == "rework_no_op"
     (drift,) = events_of(paths, "orphaned_worker_drift")
-    assert drift["payload"]["reason"] == "dead_worker_unsafe_to_auto_reset"
+    assert drift["payload"]["reason"] == "dead_worker_clean_exit_no_op"
+
+
+def test_pr_approved_head_advanced_routes_to_review(tmp_path: Path) -> None:
+    """#2135: approved + live head != reviewed head takes the head-change route.
+
+    Before #2135 this arm fell into ``dead_worker_unsafe_to_auto_reset`` drift;
+    with status no longer consulted it must route through ``_head_changed``.
+    """
+    config, paths, gh, _ = _dead_worker_rework_bed(tmp_path, decision="approved")
+    _advance_head(gh)
+
+    run_sweep(tmp_path, paths, config, gh, review_callback=_review_ok)
+
+    assert issue_entry(paths, 207)["status"] == "reviewing"
+    (routed,) = events_of(paths, "orphaned_worker_routed_to_review")
+    assert routed["payload"]["pr_number"] == 100
+    assert routed["payload"]["routed"] is True
+    assert events_of(paths, "orphaned_worker_drift") == []
+    assert events_of(paths, "orphaned_worker_recovered") == []
+
+
+def test_pr_approved_head_advanced_review_refused_drifts_head_change(
+    tmp_path: Path,
+) -> None:
+    config, paths, gh, _ = _dead_worker_rework_bed(tmp_path, decision="approved")
+    _advance_head(gh)
+
+    run_sweep(tmp_path, paths, config, gh, review_callback=_review_refused)
+
+    assert issue_entry(paths, 207)["status"] == "dispatched"
+    (drift,) = events_of(paths, "orphaned_worker_drift")
+    assert drift["payload"]["reason"] == "dead_worker_with_head_change"
+    assert events_of(paths, "orphaned_worker_routed_to_review") == []
 
 
 def test_pr_approved_rework_clean_exit_is_no_op_escalation(tmp_path: Path) -> None:
@@ -397,6 +490,14 @@ def test_sweep_dry_run_gates_state_and_events_not_the_injected_github_client(
 
     assert issue_entry(paths, 1176) == before
     assert load_state(paths.state_file).get("events", []) == []
-    # Label writes go straight to the GitHub client, which owns its own
-    # dry-run switch; the WriteGate only gates state.json and events.
-    assert (1176, config.labels.ready) in gh.labels_added
+    # Issue #2226: sweep label writes now route through the WriteGate, which
+    # owns dry-run suppression uniformly — a dry-run sweep writes no labels
+    # to the injected client ("not the injected github client": the gate,
+    # not ``gh.dry_run``, is what suppresses them). In production
+    # ``gh.dry_run`` suppressed the same writes at the transport layer, so
+    # this is an earlier no-op of the same effective behavior.
+    # The leaf name is load-bearing: the collect-only gate (issue #1538)
+    # fails a rename outright — a removed leaf must reappear verbatim in a
+    # sibling module, and only an operator exemption waives it.
+    assert gh.labels_added == []
+    assert gh.labels_removed == []

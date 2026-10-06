@@ -1,0 +1,38 @@
+/* History page layout (pages/history*.py). Served after dashboard.css, now.css (header,
+   nav, skip link) and charts.css. Colours come only from --lj-* tokens; approx/partial are
+   said in words and drawn dashed, never colour alone. Desktop >=1440px is primary: two
+   card columns; narrower screens stack to one, and charts scroll inside .chart-scroll. */
+
+.hist { max-width: 1600px; margin: 0 auto; padding: var(--lj-space-4) var(--lj-space-5); }
+.hcontrols { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--lj-space-3) var(--lj-space-6); margin-top: var(--lj-space-3); }
+.htabs, .hrange { display: flex; flex-wrap: wrap; gap: var(--lj-space-1) var(--lj-space-4); font-size: var(--lj-text-4); }
+.hrange { font-size: var(--lj-text-3); margin-left: auto; }
+.hrange .label { color: var(--lj-gray-text); margin-right: var(--lj-space-1); }
+.htabs a, .hrange a { color: var(--lj-gray-text); text-decoration: none; padding: 2px 0; border-bottom: 2px solid var(--lj-page); }
+.htabs a:hover, .hrange a:hover { color: var(--lj-ink); border-bottom-color: var(--lj-rule); }
+.htabs a[aria-current], .hrange a[aria-current] { color: var(--lj-ink); font-weight: 600; border-bottom-color: var(--lj-ink); }
+.htabs a:focus-visible, .hrange a:focus-visible { outline: 2px solid var(--lj-ink); outline-offset: 2px; }
+
+.hmeta { margin: var(--lj-space-3) 0 var(--lj-space-4); font-size: var(--lj-text-2); color: var(--lj-gray-text); }
+.hcards { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--lj-space-5); }
+@media (min-width: 1440px) { .hcards { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+
+.mcard { min-width: 0; padding: var(--lj-space-4); background: var(--lj-card); border: 1px solid var(--lj-rule); border-radius: var(--lj-radius-tab); }
+.mcard figure.chart { margin-bottom: var(--lj-space-3); }
+.mcard.is-approx { border-style: dashed; }
+.mcard .flags { list-style: none; margin: 0 0 var(--lj-space-2); padding: 0; display: flex; flex-wrap: wrap; gap: var(--lj-space-1) var(--lj-space-3); font-size: var(--lj-text-2); color: var(--lj-gray-text); }
+.mcard .flags li { border: 1px dashed var(--lj-gray); border-radius: var(--lj-radius-tab); padding: 0 var(--lj-space-2); font-style: italic; }
+.cov-note { margin: 0 0 var(--lj-space-3); font-size: var(--lj-text-2); color: var(--lj-gray-text); }
+.mcard.is-missing { border-style: dashed; }
+.mcard.is-error { border-style: dashed; border-color: var(--lj-warn); }
+.mcard .mtitle { margin: 2px 0 var(--lj-space-2); font-size: var(--lj-text-3); font-weight: 600; color: var(--lj-ink); }
+.mcard .missing { margin: 0; font-size: var(--lj-text-3); color: var(--lj-gray-text); }
+
+.hunavail { margin-top: var(--lj-space-5); padding: var(--lj-space-4); border: 1.5px dashed var(--lj-warn); border-radius: var(--lj-radius-tab); background: var(--lj-card); max-width: 72ch; }
+.hunavail h2 { margin: 0 0 var(--lj-space-2); font-family: var(--lj-serif); font-size: var(--lj-text-5); color: var(--lj-ink); }
+.hunavail .why { font-size: var(--lj-text-2); color: var(--lj-gray-text); overflow-wrap: anywhere; }
+
+@media (max-width: 720px) {
+  .hist { padding: var(--lj-space-3) 16px; }
+  .hrange { margin-left: 0; }
+}

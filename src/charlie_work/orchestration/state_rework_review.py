@@ -217,3 +217,58 @@ def _salvage_rework_stranded_commits(
         )
         self.write_gate.save_state(state)
     return True
+
+
+def _handle_stranded_closed_issue(
+    self,
+    pr: dict[str, Any],
+    issue_number: int,
+    issue: dict[str, Any],
+) -> None:
+    """Converge a stranded ``request_changes`` repair whose linked issue is
+    CLOSED on GitHub (issue #1123, extracted from ``state_rework_routing``
+    for the #2226 file-size ratchet).
+
+    Records the ``stranded_skip_closed`` marker and normalizes the status
+    to ``"closed"`` under the state lock so the next restorer pass
+    short-circuits without a second ``gh.issue_view()`` call or a
+    duplicate event, then strips active labels -- mirroring reconcile's
+    ``state_active_status_issue_closed``, which cannot fire here because
+    it requires a status in ``ACTIVE_STATE_STATUSES``. The label strip
+    goes through ``self.write_gate.apply_issue_labels`` so the ``closed``
+    disposition lands in this repo's events.db with ``repo`` bound (issue
+    #2226); the remove set stays surgical (only the active labels
+    actually present).
+    """
+    with _wf.state_lock(self.paths.state_file):
+        state = _wf.load_state(self.paths.state_file)
+        issues = state.setdefault("issues", {})
+        issue_entry = issues.get(str(issue_number), {})
+        issue_entry["stranded_skip_closed"] = True
+        if issue_entry.get("status") != "closed":
+            issue_entry["status"] = "closed"
+        issues[str(issue_number)] = issue_entry
+        state = self._record_event(
+            state,
+            "stranded_request_changes_skipped_issue_closed",
+            {
+                "pr_number": int(pr["number"]),
+                "issue_number": issue_number,
+                "head_sha": pr.get("headRefOid"),
+            },
+        )
+        # Issue #2226: kept ``write_gate.save_state`` — the label strip
+        # below routes through the same gate, so a raw ``save_state``
+        # inside this function would trip the exclusive-use predicate
+        # (and split the dry-run contract: gated labels + raw state
+        # write). Disclosed per review feedback on the original swap.
+        self.write_gate.save_state(state)
+    self.write_gate.apply_issue_labels(
+        self.gh,
+        self.config.labels,
+        issue_number,
+        remove=sorted(_wf.label_names(issue) & self.config.labels.active),
+        to_state="closed",
+        pr_number=int(pr["number"]),
+        cause="closed_unmerged",
+    )

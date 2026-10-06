@@ -1,0 +1,5 @@
+info
+# Issue #1983: a request_changes verdict whose live PR body drifted from its
+# reviewed_body_sha256 baseline is superseded by queueing a fresh review --
+# the corrective action is the re-review itself, same informational contract
+# as stale_ci_verdict_requeued (issue #1111).

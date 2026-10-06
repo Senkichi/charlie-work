@@ -12,7 +12,7 @@ Track 2, issue #1593; design doc Section 5, L09 (the final leaf): moves the
 twelve members below verbatim -- ``_run_bool``, ``_list_json``,
 ``_repo_owner_name``, ``_graphql_query``, ``_graphql_issue_states``,
 ``_graphql_issue_dependencies``, ``_normalize_rest_pr``,
-``_pr_checks_fallback``, ``_max_retries``, ``_retry_base_seconds``,
+``_max_retries``, ``_retry_base_seconds``,
 ``_timeout_seconds``, ``validate_field_lists``. ``_max_retries``/
 ``_retry_base_seconds``/``_timeout_seconds`` carry no property or other
 decorator (design doc Section 3.1's decorator invariant) -- confirmed by
@@ -43,24 +43,18 @@ from typing import Any
 
 from ci_fleet.github import GitHubError
 
-from ._base import (
-    CapabilityCollaborator,
-    GitHubRunResult,
-    RUN_LIST_FIELDS,
-    _is_mutating,
-)
-from .checks import PR_CHECKS_FIELDS
-from .circuit_breaker import GhFailureClass, classify_gh_failure
+from ._base import CapabilityCollaborator, GitHubRunResult
+from ._field_probes import field_list_probes, probe_verdict
 from .circuit_breaker_transport import (
     circuit_breaker_open_message,
     circuit_breaker_state_path,
     note_circuit_breaker_result,
 )
 from .cross_repo_blockers import CrossRepoBlocker, make_blocker
+from ._send import read_json, send, send_graphql
 from .graphql_issue_states import graphql_issue_states
-from .issues import ISSUE_LIST_FIELDS, ISSUE_VIEW_FIELDS
-from .labels import LABEL_LIST_FIELDS
-from .pull_requests import MERGED_PR_LIST_FIELDS, PR_LIST_FIELDS, PR_VIEW_FIELDS
+from ..github_transport.json_read import JsonRead
+from ..github_transport.request import GraphQLRequest, RestRequest
 from ..subprocess_runner import no_console_window_kwargs
 
 logger = logging.getLogger(__name__)
@@ -145,19 +139,9 @@ def _parse_git_remote_url(url: str) -> tuple[str, str] | None:
 RECONCILE_PR_FIELDS = "number,title,url,headRefName,baseRefName,body,state,labels,isCrossRepository,headRefOid,closedAt"
 RECONCILE_ISSUE_FIELDS = "number,title,url,body,labels,state"
 
-# Narrow field list for ``_pr_checks_fallback``'s ``gh pr view --json
-# statusCheckRollup`` probe (issue #1609): the fallback needs only the rollup
-# to distinguish "no checks" from "checks unavailable", so it must not go
-# through the broader PR_VIEW_FIELDS (whose ``statusCheckRollup`` forces a
-# per-item GraphQL graph walk -- see the PR_CHECKS_FIELDS note in checks.py
-# and issue #361). Kept as a module-level constant rather than an inline
-# literal so the field-list lint
-# (tests/test_doctor.py::test_gh_field_lists_use_constants_no_inline_literals)
-# covers the single-positional-list ``self.run([...], json_output=True)`` call
-# shape this body uses -- the matcher's third branch, added by #1609, inspects
-# that shape; before the fix this call was skipped entirely because it lived in
-# ``github.py`` (the file the lint skips by design). It moved here with the
-# Transport body (Track 2, issue #1593, L09), exposing it to the lint.
+# Field list for the ``statusCheckRollup`` probe ``validate_field_lists`` runs
+# (issue #1609). ``_pr_checks_fallback``, its original caller, was deleted
+# with the ``gh pr checks`` dependency (ADR-0006, B7).
 PR_STATUS_CHECK_ROLLUP_FIELDS = "statusCheckRollup"
 
 
@@ -167,7 +151,7 @@ class Transport(CapabilityCollaborator):
     Twelve members moved verbatim from ``GitHub`` (Track 2, issue #1593;
     design doc Section 5, L09): ``_max_retries``, ``_retry_base_seconds``,
     ``_timeout_seconds``, ``_normalize_rest_pr``, ``_run_bool``,
-    ``_list_json``, ``_pr_checks_fallback``, ``validate_field_lists``,
+    ``_list_json``, ``validate_field_lists``,
     ``_repo_owner_name``, ``_graphql_query``, ``_graphql_issue_states``,
     ``_graphql_issue_dependencies``. ``run`` and ``__post_init__`` stay on the
     owner permanently (module docstring above).
@@ -333,21 +317,18 @@ class Transport(CapabilityCollaborator):
         — failures are returned as False (allow_failure semantics). Dry-run mode
         returns True (the operation would succeed if not for dry-run).
         """
-        if self.dry_run and _is_mutating(args):
-            return True
         result = self.run(args, allow_failure=True)
+        if not isinstance(result, GitHubRunResult):
+            return True  # dry-run: ``run`` answered a mutating argv with a bare string
         return result.ok
 
-    def _list_json(self, args: list[str], *, limit: int, kind: str) -> list[dict[str, Any]]:
-        # run() now applies the fleet-wide bounded retry policy for transient
-        # failures, so _list_json no longer needs its own ad-hoc retry loop.
-        # long_call=True (issue #1833): every _list_json call requests up to
-        # `limit` items (hundreds), which legitimately takes longer than the
-        # fail-fast default -- this is the single chokepoint for both
-        # issue_list/pr_list's large-limit calls, so marking it here covers
-        # them with zero call-site changes (CLAUDE.md's single-point-of-
-        # enforcement invariant).
-        result = self.run(args, json_output=True, long_call=True)
+    def _list_json(self, read: JsonRead, *, kind: str) -> list[dict[str, Any]]:
+        # The guarded transport applies the fleet-wide bounded retry policy,
+        # so no ad-hoc retry loop here. Callers build the read with
+        # long_call=True (issue #1833): a list of hundreds of items
+        # legitimately takes longer than the fail-fast default.
+        limit = read.limit
+        result = read_json(self, read)
         items = result if isinstance(result, list) else []
         if len(items) >= limit:
             logger.warning(
@@ -359,232 +340,60 @@ class Transport(CapabilityCollaborator):
             )
         return items
 
-    def _pr_checks_fallback(self, number: int) -> list[dict[str, Any]] | None:
-        """Disambiguate a ``gh pr checks`` failure via ``statusCheckRollup`` (issue #846).
-
-        ``gh pr checks`` cannot represent "no checks reported yet" as a
-        successful empty response -- it exits non-zero with empty stdout for
-        that case, identically to a genuine command failure (see the caller).
-        ``gh pr view --json statusCheckRollup`` CAN: it returns a clean empty
-        list with exit 0 for a PR with zero checks (measured against PR #700
-        in this repo: ``{"statusCheckRollup":[]}``, exit 0).
-
-        This field carries its own risk -- it is a per-item GraphQL graph walk
-        that can fail on token scope (see the PR_CHECKS_FIELDS note in
-        github_capabilities/checks.py and issue #361) -- but any failure here
-        simply falls through to this function's ``None`` return, which is
-        exactly pr_checks' pre-existing
-        "unavailable" behavior. This call can never make pr_checks' result
-        worse than it was before issue #846's fix, only better (turning some
-        `None`s into accurate `[]`s).
-
-        Returns:
-        - ``None`` if the fallback call itself failed, or its rollup contains
-          an entry this function cannot faithfully map (see below). Callers
-          treat this exactly like today's "gh command failed" case.
-        - ``[]`` if the rollup is empty: legitimately no checks.
-        - a list of dicts shaped like ``gh pr checks --json name,state,link``
-          (name/state/link only -- databaseId/runId are injected by the
-          caller) if the rollup is non-empty and every entry is a GitHub
-          Actions ``CheckRun``. This covers the "gh pr checks glitched
-          transiently while checks do exist" case.
-
-        Mapping notes (verified against live PRs in this repo, not assumed):
-        - ``link`` <- ``detailsUrl``: both are the same Actions job URL in
-          every sample (PR #679, #839).
-        - ``state`` <- ``conclusion if status == "COMPLETED" else status``:
-          this is the same rule gh's own `pr checks` uses internally to
-          collapse CheckRun's two-field status/conclusion into one "state".
-          Verified pairwise on live data: PR #679 IN_PROGRESS check has
-          ``state: IN_PROGRESS`` / ``status: IN_PROGRESS, conclusion: ""``;
-          its SUCCESS check has ``state: SUCCESS`` / ``status: COMPLETED,
-          conclusion: SUCCESS``; PR #839's cancelled-run checks have
-          ``state: CANCELLED`` / ``status: COMPLETED, conclusion: CANCELLED``.
-        - ``bucket`` is intentionally NOT mapped: it is a `gh`-CLI-side
-          classification (pass/fail/pending/cancel/skipping) computed from
-          state, with no GraphQL equivalent to read it back from (see the
-          PR_CHECKS_FIELDS note in github_capabilities/checks.py). Every
-          consumer that reads "bucket"
-          (checks.py, workflow.py) only uses it as an `or` alternative to
-          "state" (e.g. ``state == "SUCCESS" or bucket == "pass"``), never as
-          an independent requirement, so an absent bucket does not change
-          classification -- "state" alone still carries it correctly.
-        - Any rollup entry whose ``__typename`` is not ``"CheckRun"`` (e.g. a
-          ``StatusContext`` from an external, non-Actions status check) makes
-          the whole call return ``None`` instead of guessing: this repo has
-          no live sample of that shape's fields, and fabricating one risks
-          silently inventing check state, which is exactly what issue #846
-          warns against doing at this boundary.
-        """
-        result = self.run(
-            ["pr", "view", str(number), "--json", PR_STATUS_CHECK_ROLLUP_FIELDS],
-            json_output=True,
-            allow_failure=True,
-        )
-        if not (
-            isinstance(result, GitHubRunResult) and result.ok and isinstance(result.value, dict)
-        ):
-            return None
-        rollup = result.value.get("statusCheckRollup")
-        if not isinstance(rollup, list):
-            return None
-        if not rollup:
-            return []
-        mapped: list[dict[str, Any]] = []
-        for entry in rollup:
-            if not isinstance(entry, dict) or entry.get("__typename") != "CheckRun":
-                return None
-            status = str(entry.get("status") or "")
-            conclusion = str(entry.get("conclusion") or "")
-            state = conclusion if status == "COMPLETED" and conclusion else status
-            mapped.append(
-                {
-                    "name": entry.get("name"),
-                    "state": state,
-                    "link": entry.get("detailsUrl"),
-                }
-            )
-        return mapped
-
     def validate_field_lists(self) -> None:
-        """Validate the compile-time ``--json`` field lists against ``gh``.
+        """Validate the compile-time field lists against the live GitHub schema.
 
-        Probes each list with an invalid field and parses the ``Available
-        fields:`` section of the stderr. Fails fast with a ``ConfigError`` naming
-        the constant and the offending field(s) when the installed ``gh`` CLI
-        does not support a configured field.
+        Sends one ``first:1`` / ``number:0`` probe per registered list through
+        the guarded transport (B13: GraphQL schema validation replaces gh's
+        ``Available fields`` stderr). GitHub rejects an unknown field before it
+        executes anything, so a ``undefinedField`` error names exactly the
+        configured field the schema lacks; a NOT_FOUND for ``number:0`` proves
+        the selection was accepted. Raises ``ConfigError`` naming the constant
+        and the offending field(s) ONLY on that positive rejection. Anything
+        else (a transport-class failure, 401/403/404, primary or secondary rate
+        limit, an inconclusive probe) is not a config error: warn and skip, so
+        startup never depends on GitHub availability or quota (issue #1833).
         """
         # Import lazily to avoid the config -> github import cycle.
         from ..config import ConfigError
 
-        probe = "nonexistent"  # Invalid field name, gh will list valid ones
-        field_lists: list[tuple[str, list[str], str]] = [
-            (
-                "ISSUE_LIST_FIELDS",
-                ["issue", "list", "--state", "open", "--limit", "1", "--json", probe],
-                ISSUE_LIST_FIELDS,
-            ),
-            ("ISSUE_VIEW_FIELDS", ["issue", "view", "0", "--json", probe], ISSUE_VIEW_FIELDS),
-            (
-                "PR_LIST_FIELDS",
-                ["pr", "list", "--state", "open", "--limit", "1", "--json", probe],
-                PR_LIST_FIELDS,
-            ),
-            (
-                "MERGED_PR_LIST_FIELDS",
-                ["pr", "list", "--state", "merged", "--limit", "1", "--json", probe],
-                MERGED_PR_LIST_FIELDS,
-            ),
-            ("PR_VIEW_FIELDS", ["pr", "view", "0", "--json", probe], PR_VIEW_FIELDS),
-            ("PR_CHECKS_FIELDS", ["pr", "checks", "0", "--json", probe], PR_CHECKS_FIELDS),
-            (
-                "LABEL_LIST_FIELDS",
-                ["label", "list", "--limit", "1", "--json", probe],
-                LABEL_LIST_FIELDS,
-            ),
-            (
-                "RECONCILE_PR_FIELDS",
-                ["pr", "list", "--state", "all", "--limit", "1", "--json", probe],
-                RECONCILE_PR_FIELDS,
-            ),
-            (
-                "RECONCILE_ISSUE_FIELDS",
-                ["issue", "list", "--state", "open", "--limit", "1", "--json", probe],
-                RECONCILE_ISSUE_FIELDS,
-            ),
-            ("RUN_LIST_FIELDS", ["run", "list", "--limit", "1", "--json", probe], RUN_LIST_FIELDS),
-        ]
+        try:
+            owner, name = self._repo_owner_name()
+        except GitHubError as exc:
+            logger.warning("Skipping gh field-list validation this pass: %s", exc)
+            return
 
-        for name, args, fields in field_lists:
-            # issue #1833: gate each probe on the breaker so a degraded
-            # network fails the rest of this loop fast (as values, per the
-            # errors-as-values invariant) instead of spawning gh ten times at
-            # up to _timeout_seconds() each. A hard ConfigError below still
-            # means "gh answered but the field list is wrong" -- that is a
-            # genuine misconfiguration this function exists to catch, not a
-            # transport problem, so it is deliberately left to raise.
-            if not self._circuit_breaker_allow_call():
+        for constant, fields, probe in field_list_probes(
+            RECONCILE_PR_FIELDS, RECONCILE_ISSUE_FIELDS
+        ):
+            outcome = (
+                send(self, probe)
+                if isinstance(probe, RestRequest)
+                else probe.execute(self._transport_v2, owner, name)
+            )
+            verdict = probe_verdict(outcome)
+            if verdict.skip:
                 logger.warning(
-                    "Skipping remaining gh --json field-list validation this pass: %s",
-                    self._circuit_breaker_open_message(["gh", *args]),
+                    "Could not validate field list %s due to a transport-class failure; "
+                    "skipping remaining field-list validation this pass: %s",
+                    constant,
+                    verdict.detail,
                 )
                 return
-
-            try:
-                result = subprocess.run(
-                    ["gh", *args],
-                    cwd=self.repo_root,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    capture_output=True,
-                    check=False,
-                    timeout=self._timeout_seconds(),
-                    **no_console_window_kwargs(),
+            if verdict.rejected is not None:
+                missing = [f for f in fields.split(",") if f in verdict.rejected] or list(
+                    verdict.rejected
                 )
-            except FileNotFoundError as exc:
-                raise ConfigError("GitHub CLI `gh` is not installed or not on PATH") from exc
-            except subprocess.TimeoutExpired:
-                # issue #1833: a hang here is transport-class, not a config
-                # error -- the #1832 outage's other signature alongside TLS
-                # handshake timeouts. Previously this always raised
-                # ConfigError and propagated out of OrchestratorApp.__init__
-                # uncaught (fleet_dispatch.py's "Error processing repo"
-                # path), which is exactly the errors-as-values invariant this
-                # fix restores: record the failure, skip the remaining
-                # probes this pass, and return normally instead of raising.
-                self._circuit_breaker_note_result(timed_out=True)
+                raise ConfigError(
+                    f"GitHub does not support field(s) for {constant}: {', '.join(missing)}"
+                )
+            if verdict.detail:
+                # Inconclusive (neither accepted nor rejected): not evidence of a bad
+                # field list, so startup must not depend on it. Warn and move on.
                 logger.warning(
-                    "gh timed out validating field list %s after %gs; skipping remaining "
-                    "field-list validation this pass (transport-class failure, not a "
-                    "config error)",
-                    name,
-                    self._timeout_seconds(),
-                )
-                return
-
-            if result.returncode == 0:
-                raise ConfigError(
-                    f"gh did not reject invalid field for {name}; cannot validate field list"
-                )
-
-            stderr = result.stderr
-            if "Unknown JSON field" not in stderr and "Available fields" not in stderr:
-                # issue #1833: this branch previously assumed any non-zero
-                # exit without the expected stderr shape meant a config
-                # problem worth a hard ConfigError. That is also reachable by
-                # a genuine transport-class failure (e.g. a connection reset
-                # mid-probe) whose stderr never mentions JSON fields at all --
-                # the same misclassification as the TimeoutExpired case
-                # above, via a different branch. Reclassify before deciding.
-                if classify_gh_failure(stderr) is GhFailureClass.TRANSPORT:
-                    self._circuit_breaker_note_result(error=stderr)
-                    logger.warning(
-                        "Could not validate field list %s due to a transport-class gh "
-                        "failure; skipping remaining field-list validation this pass: %s",
-                        name,
-                        stderr.strip() or result.stdout.strip(),
-                    )
-                    return
-                raise ConfigError(
-                    f"Could not validate field list {name}: {stderr.strip() or result.stdout.strip()}"
-                )
-
-            # A non-zero exit with the expected "Unknown JSON field"/
-            # "Available fields" stderr shape proves gh answered normally --
-            # record it so a prior transport-class streak this pass doesn't
-            # carry forward past evidence the transport is fine.
-            self._circuit_breaker_note_result()
-
-            available: set[str] = set()
-            match = re.search(r"Available fields:\n((?:  .+\n)+)", stderr)
-            if match:
-                available = {line.strip() for line in match.group(1).splitlines() if line.strip()}
-
-            unsupported = [field for field in fields.split(",") if field not in available]
-            if unsupported:
-                raise ConfigError(
-                    f"gh does not support field(s) for {name}: {', '.join(unsupported)}"
+                    "Could not validate field list %s (inconclusive probe); skipping it: %s",
+                    constant,
+                    verdict.detail,
                 )
 
     def _repo_owner_name(self) -> tuple[str, str]:
@@ -632,40 +441,16 @@ class Transport(CapabilityCollaborator):
         self._list_cache[cache_key] = parsed
         return parsed
 
-    def _graphql_query(
-        self,
-        query: str,
-        *,
-        allow_failure: bool = False,
-    ) -> dict[str, Any]:
+    def _graphql_query(self, query: str) -> dict[str, Any]:
         """Run a single read-only GraphQL query via ``gh api graphql``.
 
-        The command is classified as read-only by ``_api_is_mutating`` because
-        it starts with the GraphQL ``query`` keyword, so it is not suppressed by
-        ``--dry-run``. Raises GitHubError for non-zero exit or a response that
+        A query is a read, so ``--dry-run`` does not suppress it. Raises GitHubError for non-zero exit or a response that
         contains no usable ``data``.
         """
-        result = self.run(
-            [
-                "api",
-                "graphql",
-                "-f",
-                f"query={query}",
-                "-f",
-                f"owner={self._repo_owner_name()[0]}",
-                "-f",
-                f"name={self._repo_owner_name()[1]}",
-            ],
-            json_output=True,
-            allow_failure=allow_failure,
-        )
-
-        if isinstance(result, GitHubRunResult):
-            if not result.ok:
-                raise GitHubError(f"GraphQL query failed: {result.error}")
-            value = result.value
-        else:
-            value = result
+        owner, name = self._repo_owner_name()
+        value, error = send_graphql(self, GraphQLRequest.of(query, {"owner": owner, "name": name}))
+        if error is not None:
+            raise GitHubError(f"GraphQL query failed: {error}")
 
         if not isinstance(value, dict):
             raise GitHubError("GraphQL query returned non-dict JSON")

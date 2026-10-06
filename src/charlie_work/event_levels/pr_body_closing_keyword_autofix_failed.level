@@ -1,0 +1,3 @@
+error
+# Issue #2108: a PR-body-only closing-keyword gate failure could not be repaired
+# (scan/edit/rerun failure or attempt cap) and was escalated. Terminal for the lane.

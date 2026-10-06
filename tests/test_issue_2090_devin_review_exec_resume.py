@@ -86,7 +86,8 @@ class _Rig:
         )
         monkeypatch.setattr(devin_review_resume, "write_worktree_marker", lambda *a, **k: None)
         monkeypatch.setattr("charlie_work.worker_fate.is_alive", alive)
-        monkeypatch.setattr("charlie_work.dispatch_selection.is_pid_alive", alive)
+        monkeypatch.setattr("charlie_work.process_utils.is_pid_alive", alive)
+        monkeypatch.setattr("charlie_work.stalled_review_reap.is_pid_alive", alive)
 
     def seed_dead_review(self, log_text: str = REJECTION, *, pid: int = 40_001) -> None:
         checkout = self.reviews_dir / f"pr-{PR}"
@@ -458,3 +459,273 @@ def test_resume_never_blocks_on_the_worker() -> None:
     src = Path(devin_review_resume.__file__).read_text(encoding="utf-8")
     assert ".wait(" not in src and ".communicate(" not in src
     assert subprocess  # (module imported for the Popen-stderr redirect constant)
+
+
+# --- issue #2162: the stall sweep must not reap a resumed review ---------------
+
+
+def test_resumed_review_survives_the_stall_sweep_and_its_verdict_is_recorded(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from datetime import UTC, datetime
+
+    from charlie_work.stalled_review_reap import _detect_and_handle_stalled_reviews
+
+    rig = _rig(monkeypatch, tmp_path)
+    rig.seed_dead_review()  # original dispatch is far older than the stale timeout
+    rig.next_output = [VERDICT]
+    rig.reap()  # resume launches inside the harvest
+    rig.finish_resumed()  # ...and exits before the sweep runs
+
+    app = rig.app
+    stalled = _detect_and_handle_stalled_reviews(
+        rig.reviews_dir,
+        app.paths.state_file,
+        app.config,
+        app.repo_root,
+        write_gate=app.write_gate,
+        now=datetime.now(UTC),
+    )
+
+    assert stalled == []
+    assert rig.events("review_dispatch_stalled") == []
+    claim = load_state(app.paths.state_file)["prs"][str(PR)]
+    assert claim["review_dispatch_status"] == "review_dispatch_dispatched"
+    assert [r["decision"] for r in rig.reap()["recorded"]] == ["approved"]
+
+
+def test_truly_dead_stale_claim_without_sidecar_is_still_reaped(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from datetime import UTC, datetime
+
+    rig = _rig(monkeypatch, tmp_path)
+    rig.seed_dead_review()
+    (rig.reviews_dir / f"issue-{PR}.json").unlink()
+
+    rig.app._run_review_reap_sweeps(datetime.now(UTC))
+
+    assert len(rig.events("review_dispatch_stalled")) == 1
+    claim = load_state(rig.app.paths.state_file)["prs"][str(PR)]
+    assert claim["review_dispatch_status"] == "review_dispatch_failed"
+
+
+def test_resume_restamps_claim_age_and_keeps_the_budget_key_in_step(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    rig = _rig(monkeypatch, tmp_path, review_exec_rejection_max_resumes=1)
+    rig.seed_dead_review()
+    rig.reap()
+    claim = load_state(rig.app.paths.state_file)["prs"][str(PR)]
+    assert claim["review_dispatched_at"] != "2026-09-30T18:18:27Z"
+    assert claim["review_exec_resume_dispatched_at"] == claim["review_dispatched_at"]
+    assert claim["review_exec_resume_count"] == 1
+    rig.finish_resumed()
+    assert len(rig.reap()["missed"]) == 1  # cap still enforced
+    assert len(rig.popens) == 1
+
+
+def test_fresh_sidecar_alone_protects_a_stale_claim_from_the_stall_sweep(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Isolates ``fresh_sidecar_pr_keys``: the claim is stale with a dead pid, and only the
+    sidecar (written without a claim restamp) is fresh."""
+    from datetime import UTC, datetime
+
+    from charlie_work.stalled_review_reap import _detect_and_handle_stalled_reviews
+
+    rig = _rig(monkeypatch, tmp_path)
+    rig.seed_dead_review()
+    sidecar_path = rig.reviews_dir / f"issue-{PR}.json"
+    sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    now = datetime.now(UTC)
+    sidecar["started_at"] = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    sidecar_path.write_text(json.dumps(sidecar), encoding="utf-8")
+    before = load_state(rig.app.paths.state_file)["prs"][str(PR)]
+    assert before["review_dispatched_at"] == "2026-09-30T18:18:27Z"  # stale claim
+
+    app = rig.app
+    stalled = _detect_and_handle_stalled_reviews(
+        rig.reviews_dir,
+        app.paths.state_file,
+        app.config,
+        app.repo_root,
+        write_gate=app.write_gate,
+        now=now,
+    )
+
+    assert stalled == []
+    assert rig.events("review_dispatch_stalled") == []
+    claim = load_state(app.paths.state_file)["prs"][str(PR)]
+    assert claim["review_dispatch_status"] == "review_dispatch_dispatched"
+
+
+# --- issue #2110: two concurrent reaps of one dead reviewer are single-owner --
+
+
+def _reap_concurrently(rig: _Rig, monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    """Run two reaps so both pass the status check before either proceeds.
+
+    The barrier sits on the first log parse, i.e. right after the claim section,
+    which is exactly the window the unguarded code raced in.
+    """
+    import threading
+
+    from charlie_work.orchestration import misc_review_verdicts as mrv
+
+    barrier = threading.Barrier(2, timeout=2)
+    real = mrv._parse_review_verdict_from_log
+
+    def gated(path: Path) -> Any:
+        try:
+            barrier.wait()
+        except threading.BrokenBarrierError:
+            pass  # the claim loser never reaches the parse; the winner proceeds alone
+        return real(path)
+
+    monkeypatch.setattr(mrv, "_parse_review_verdict_from_log", gated)
+    results: list[dict[str, Any]] = []
+    threads = [threading.Thread(target=lambda: results.append(rig.reap())) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+    return results
+
+
+def test_concurrent_reaps_of_an_exec_rejected_reviewer_emit_one_outcome(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    rig = _rig(monkeypatch, tmp_path)
+    rig.seed_dead_review()
+    rig.next_output = [VERDICT]
+
+    results = _reap_concurrently(rig, monkeypatch)
+
+    assert len(results) == 2
+    assert len(rig.events("review_exec_rejection_resumed")) == 1
+    assert rig.events("review_exec_rejection_resume_failed") == []
+    assert rig.events("review_verdict_missed") == []
+    assert len(rig.popens) == 1
+    assert all(r["missed"] == [] for r in results)
+
+
+def test_concurrent_reaps_of_a_dead_reviewer_with_a_verdict_record_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    rig = _rig(monkeypatch, tmp_path)
+    rig.seed_dead_review(VERDICT)
+
+    results = _reap_concurrently(rig, monkeypatch)
+
+    assert sum(len(r["recorded"]) for r in results) == 1
+    assert sum(len(r["missed"]) for r in results) == 0
+    assert rig.popens == []
+
+
+# --- issue #2110: the claim is released on every non-terminal exit ------------
+
+
+def _claim(rig: _Rig) -> Any:
+    state = load_state(rig.app.paths.state_file)
+    return state["prs"][str(PR)].get("review_reaped_for")
+
+
+def test_failed_record_review_releases_the_claim_and_the_next_pass_retries(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    rig = _rig(monkeypatch, tmp_path)
+    rig.seed_dead_review(VERDICT)
+    real = rig.app.record_review
+    calls: list[int] = []
+
+    def flaky(*args: Any, **kwargs: Any) -> Any:
+        calls.append(1)
+        if len(calls) == 1:
+            return SimpleNamespace(ok=False, message="boom")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(rig.app, "record_review", flaky)
+
+    first = rig.reap()
+    assert [m["reason"] for m in first["missed"]] == ["boom"]
+    assert _claim(rig) is None
+
+    second = rig.reap()
+    assert len(calls) == 2
+    assert len(second["recorded"]) == 1
+
+
+def test_record_review_exception_releases_the_claim_and_the_next_pass_retries(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    rig = _rig(monkeypatch, tmp_path)
+    rig.seed_dead_review(VERDICT)
+    real = rig.app.record_review
+    calls: list[int] = []
+
+    def raising(*args: Any, **kwargs: Any) -> Any:
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("pr_view blew up")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(rig.app, "record_review", raising)
+
+    with pytest.raises(RuntimeError):
+        rig.reap()
+    assert _claim(rig) is None
+
+    assert len(rig.reap()["recorded"]) == 1
+
+
+def test_no_terminal_action_releases_the_claim_and_the_next_pass_retries(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from charlie_work.orchestration import misc_review_verdicts as mrv
+
+    rig = _rig(monkeypatch, tmp_path)
+    rig.seed_dead_review("no verdict here\n")
+    real = mrv._extract_review_session_summary
+    outcomes: list[Any] = [None]
+
+    def summary(*args: Any, **kwargs: Any) -> Any:
+        return outcomes.pop(0) if outcomes else real(*args, **kwargs)
+
+    monkeypatch.setattr(mrv, "_extract_review_session_summary", summary)
+
+    assert rig.reap() == {"recorded": [], "missed": []}
+    assert _claim(rig) is None
+
+    second = rig.reap()
+    assert len(second["missed"]) == 1
+    assert _claim(rig) is not None
+
+
+def test_stale_snapshot_of_a_resumed_session_is_not_resumed_or_torn_down(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from charlie_work.orchestration import misc_review_verdicts as mrv
+
+    rig = _rig(monkeypatch, tmp_path)
+    rig.seed_dead_review()
+    stale = mrv.iter_workers(rig.reviews_dir)
+    # A concurrent reaper resumed the session: new live pid + re-stamped sidecar.
+    sidecar = rig.reviews_dir / f"issue-{PR}.json"
+    data = json.loads(sidecar.read_text(encoding="utf-8"))
+    data.update(pid=40_002, started_at="2026-09-30T18:19:00Z")
+    sidecar.write_text(json.dumps(data), encoding="utf-8")
+    rig.live.add(40_002)
+    removed: list[int] = []
+    monkeypatch.setattr(
+        "charlie_work.workflow.remove_review_checkout", lambda *a, **k: removed.append(1)
+    )
+    snapshots = [stale]
+    real_iter = mrv.iter_workers
+    monkeypatch.setattr(
+        mrv, "iter_workers", lambda d: snapshots.pop(0) if snapshots else real_iter(d)
+    )
+
+    assert rig.reap() == {"recorded": [], "missed": []}
+    assert rig.popens == [] and removed == []
+    assert _claim(rig) is None

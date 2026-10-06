@@ -1,6 +1,6 @@
 """Issue #2005: cross-repo native blockers must not alias onto same-numbered local issues.
 
-Drives the real ``GitHub`` client with ``subprocess.run`` faked, so the whole
+Drives the real ``GitHub`` client over a scripted fake transport, so the whole
 path (REST blocked_by parse -> ``are_issues_open`` -> ``_get_open_blockers_for_issue``)
 is exercised. Payload shape follows GitHub's REST ``blocked_by`` response
 (issue objects carrying ``repository_url``).
@@ -8,47 +8,41 @@ is exercised. Payload shape follows GitHub's REST ``blocked_by`` response
 
 from __future__ import annotations
 
-import json
-import subprocess
 from pathlib import Path
 
 import pytest
+from _fake_transport import FakeAdapter, graphql_failure, graphql_ok, make_github, ok
 
-from charlie_work import github as github_module
 from charlie_work.backlog_reachability import _get_open_blockers_for_issue
 from charlie_work.blocker_cycles import declared_blockers_by_issue
 from charlie_work.github import get_github_issue_dependencies
 from charlie_work.github_capabilities.cross_repo_blockers import CrossRepoBlocker
+from charlie_work.github_transport import GraphQLRequest
 
-LOCAL = "Senkichi/jobcannon"
-FOREIGN = "Senkichi/fresh-eyes"
+# ``make_github`` pins the local slug to octo/hello.
+LOCAL = "octo/hello"
+FOREIGN = "octo/elsewhere"
 API = "https://api.github.com/repos"
 
 
-def _install(monkeypatch, tmp_path: Path, *, blocked_by: list[dict], states: dict[str, dict]):
-    """Fake git remote + gh api. ``states`` maps an api path to its JSON (or None=fail)."""
+def _install(tmp_path: Path, *, blocked_by: list[dict], states: dict[str, dict]):
+    """Fake REST: blocked_by list plus per-route issue JSON (absent route = 404)."""
     calls: list[str] = []
 
-    def fake_run(command, **kwargs):
-        if command[0] == "git":
-            return subprocess.CompletedProcess(
-                command, 0, stdout=f"https://github.com/{LOCAL}.git\n", stderr=""
-            )
-        path = command[2]
-        calls.append(path)
-        if path.endswith("/dependencies/blocked_by"):
-            return subprocess.CompletedProcess(
-                command, 0, stdout=json.dumps(blocked_by), stderr=""
-            )
-        if command[2] == "graphql":
-            return subprocess.CompletedProcess(command, 1, stdout="", stderr="boom")
-        payload = states.get(path)
+    def handler(request):
+        if isinstance(request, GraphQLRequest):
+            return graphql_failure("boom", "INTERNAL")
+        route = request.route.replace("repos/octo/hello/", f"repos/{LOCAL}/")
+        calls.append(route)
+        if route.endswith("/dependencies/blocked_by"):
+            return ok(blocked_by)
+        payload = states.get(route)
         if payload is None:
-            return subprocess.CompletedProcess(command, 1, stdout="", stderr="HTTP 500")
-        return subprocess.CompletedProcess(command, 0, stdout=json.dumps(payload), stderr="")
+            return ok({"message": "unavailable"}, status=404)
+        return ok(payload)
 
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
-    return github_module.GitHub(repo_root=tmp_path), calls
+    gh, _http, _gh = make_github(tmp_path, http=FakeAdapter("http", handler=handler))
+    return gh, calls
 
 
 def _foreign_dep(number: int = 60) -> dict:
@@ -59,12 +53,12 @@ def _local_states(**kw: str) -> dict[str, dict]:
     return {f"repos/{LOCAL}/issues/{n}": {"state": s} for n, s in kw.items()}
 
 
-def test_open_foreign_blocker_blocks_even_if_same_number_local_is_closed(monkeypatch, tmp_path):
+def test_open_foreign_blocker_blocks_even_if_same_number_local_is_closed(tmp_path):
     # Only the foreign repo's #60 is open. Every other lookup (graphql, and the
     # per-issue ``issue view`` of local #60 -- the old bug's target) resolves
     # as failed/closed in this fake, so a bare-number resolution reads closed.
     states = {f"repos/{FOREIGN.lower()}/issues/60": {"state": "open"}}
-    gh, _ = _install(monkeypatch, tmp_path, blocked_by=[_foreign_dep()], states=states)
+    gh, _ = _install(tmp_path, blocked_by=[_foreign_dep()], states=states)
     assert gh.are_issues_open([60]) == set()
 
     deps = get_github_issue_dependencies(gh, 459)
@@ -77,25 +71,25 @@ def test_open_foreign_blocker_blocks_even_if_same_number_local_is_closed(monkeyp
     assert declared == open_blockers
 
 
-def test_closed_foreign_blocker_unblocks(monkeypatch, tmp_path):
+def test_closed_foreign_blocker_unblocks(tmp_path):
     states = {f"repos/{FOREIGN.lower()}/issues/60": {"state": "closed"}}
-    gh, _ = _install(monkeypatch, tmp_path, blocked_by=[_foreign_dep()], states=states)
+    gh, _ = _install(tmp_path, blocked_by=[_foreign_dep()], states=states)
 
     declared, open_blockers = _get_open_blockers_for_issue(gh, {"number": 459, "body": ""})
     assert len(declared) == 1
     assert open_blockers == []
 
 
-def test_foreign_blocker_lookup_failure_fails_closed(monkeypatch, tmp_path):
-    gh, _ = _install(monkeypatch, tmp_path, blocked_by=[_foreign_dep()], states={})
+def test_foreign_blocker_lookup_failure_fails_closed(tmp_path):
+    gh, _ = _install(tmp_path, blocked_by=[_foreign_dep()], states={})
 
     _declared, open_blockers = _get_open_blockers_for_issue(gh, {"number": 459, "body": ""})
     assert len(open_blockers) == 1
 
 
-def test_foreign_state_lookup_targets_foreign_repo_and_is_cached(monkeypatch, tmp_path):
+def test_foreign_state_lookup_targets_foreign_repo_and_is_cached(tmp_path):
     states = {f"repos/{FOREIGN.lower()}/issues/60": {"state": "open"}}
-    gh, calls = _install(monkeypatch, tmp_path, blocked_by=[_foreign_dep()], states=states)
+    gh, calls = _install(tmp_path, blocked_by=[_foreign_dep()], states=states)
 
     blocker = get_github_issue_dependencies(gh, 459)[0]
     assert gh.are_issues_open([blocker]) == {blocker}
@@ -103,18 +97,18 @@ def test_foreign_state_lookup_targets_foreign_repo_and_is_cached(monkeypatch, tm
     assert calls.count(f"repos/{FOREIGN.lower()}/issues/60") == 1
 
 
-def test_same_repo_dependency_unchanged(monkeypatch, tmp_path):
+def test_same_repo_dependency_unchanged(tmp_path):
     same = {"number": 7, "repository_url": f"{API}/{LOCAL}"}
-    gh, _ = _install(monkeypatch, tmp_path, blocked_by=[same, {"number": 8}], states={})
+    gh, _ = _install(tmp_path, blocked_by=[same, {"number": 8}], states={})
 
     deps = get_github_issue_dependencies(gh, 459)
     assert deps == [7, 8]
     assert not any(isinstance(d, CrossRepoBlocker) for d in deps)
 
 
-def test_same_repo_repository_url_is_case_insensitive(monkeypatch, tmp_path):
+def test_same_repo_repository_url_is_case_insensitive(tmp_path):
     same = {"number": 7, "repository_url": f"{API}/{LOCAL.lower()}"}
-    gh, _ = _install(monkeypatch, tmp_path, blocked_by=[same], states={})
+    gh, _ = _install(tmp_path, blocked_by=[same], states={})
 
     deps = get_github_issue_dependencies(gh, 459)
     assert deps == [7]
@@ -146,37 +140,32 @@ def test_repo_from_repository_url_rejects_malformed(url):
     assert repo_from_repository_url(url) is None
 
 
-def _install_graphql(monkeypatch, tmp_path: Path, nodes: list[dict]):
-    """Fake gh whose batched GraphQL dependency query succeeds with ``nodes``."""
+def _install_graphql(tmp_path: Path, nodes: list[dict]):
+    """Fake transport whose batched GraphQL dependency query succeeds with ``nodes``."""
     calls: list[str] = []
 
-    def fake_run(command, **kwargs):
-        if command[0] == "git":
-            return subprocess.CompletedProcess(
-                command, 0, stdout=f"https://github.com/{LOCAL}.git\n", stderr=""
-            )
-        calls.append(command[2])
-        if command[2] != "graphql":
-            return subprocess.CompletedProcess(command, 1, stdout="", stderr="HTTP 500")
-        data = {
-            "data": {
+    def handler(request):
+        calls.append(getattr(request, "route", "graphql"))
+        if not isinstance(request, GraphQLRequest):
+            return ok({"message": "unavailable"}, status=404)
+        return graphql_ok(
+            {
                 "repository": {
                     "i_459": {"number": 459, "blockedBy": {"nodes": nodes, "pageInfo": {}}}
                 }
             }
-        }
-        return subprocess.CompletedProcess(command, 0, stdout=json.dumps(data), stderr="")
+        )
 
-    monkeypatch.setattr(github_module.subprocess, "run", fake_run)
-    return github_module.GitHub(repo_root=tmp_path), calls
+    gh, _http, _gh = make_github(tmp_path, http=FakeAdapter("http", handler=handler))
+    return gh, calls
 
 
-def test_graphql_dependencies_keep_repo_identity_and_warm_cache(monkeypatch, tmp_path):
+def test_graphql_dependencies_keep_repo_identity_and_warm_cache(tmp_path):
     nodes = [
         {"number": 60, "state": "OPEN", "repository": {"nameWithOwner": FOREIGN}},
         {"number": 7, "state": "OPEN", "repository": {"nameWithOwner": LOCAL}},
     ]
-    gh, calls = _install_graphql(monkeypatch, tmp_path, nodes)
+    gh, calls = _install_graphql(tmp_path, nodes)
 
     deps = gh.issue_dependencies([459])[459]
 

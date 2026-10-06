@@ -15,6 +15,7 @@ from charlie_work import rescue as rescue_helpers
 from charlie_work.github import GitHubError
 from charlie_work.janitor import DiffContentSignature
 from charlie_work.labels import TransitionOutcome
+from charlie_work.local_work_park import publishes_pull_requests
 from charlie_work.review_decision import (
     record_decision,
     reclassify_human_call_verdict,
@@ -37,6 +38,26 @@ def record_review(
     allow_stale_head: bool = False,
     verdict_source: str | None = None,
 ) -> _wf.CommandResult:
+    # Issue #2095: a backend that publishes no pull requests has nothing for
+    # ``pr_view`` to read, so the operator ``charlie verdict`` path must take
+    # the same local ingestion as the reviewer-verdict and stranded-verdict
+    # sites (#1844). ``record_local_review`` owns the merged/closed terminal
+    # guard, the record-authoritative issue/branch, and fails closed (never
+    # mints a non-local ``prs[N]`` record) when no lane record exists.
+    if not publishes_pull_requests(self.gh):
+        return self.record_local_review(
+            pr_number,
+            decision,
+            summary,
+            summary_file,
+            comment,
+            reviewed_head,
+            required_changes,
+            session_metrics,
+            verdict_provenance=verdict_provenance,
+            allow_stale_head=allow_stale_head,
+            verdict_source=verdict_source,
+        )
     if decision not in {"approved", "request_changes", "blocked"}:
         return _wf.CommandResult(
             False, "decision must be approved, request_changes, or blocked", {}
@@ -663,6 +684,7 @@ def record_review(
             # reviewer pipeline is healthy, so any prior
             # persistent-unreadable condition is resolved (issue #1069).
             "review_log_unreadable_streak": 0,
+            "review_api_error_streak": 0,  # issue #1808
             # Issue #1439: a recorded verdict ends the turn-limit miss
             # streak -- the reviewer reached a conclusion, so any prior
             # turn-limit deaths no longer count toward the cap-aware
@@ -926,6 +948,9 @@ def record_review(
                     self.config.labels,
                     issue_number,
                     target,
+                    state_path=self.paths.state_file,
+                    repo=self.repo_root.name,
+                    pr_number=pr_number,
                 )
                 if result.outcome != TransitionOutcome.APPLIED:
                     label_error = {
@@ -945,6 +970,9 @@ def record_review(
                 self.config.labels,
                 issue_number,
                 _wf._escalation_edge("blocked", "judgment"),
+                state_path=self.paths.state_file,
+                repo=self.repo_root.name,
+                pr_number=pr_number,
             )
             if result.outcome != TransitionOutcome.APPLIED:
                 label_error = {
@@ -954,7 +982,15 @@ def record_review(
                     "remove_failures": result.remove_failures,
                 }
         elif decision == "approved":
-            result = _wf.transition(self.gh, self.config.labels, issue_number, "review_approved")
+            result = _wf.transition(
+                self.gh,
+                self.config.labels,
+                issue_number,
+                "review_approved",
+                state_path=self.paths.state_file,
+                repo=self.repo_root.name,
+                pr_number=pr_number,
+            )
             if result.outcome != TransitionOutcome.APPLIED:
                 label_error = {
                     "edge": "review_approved",

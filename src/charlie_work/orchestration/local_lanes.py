@@ -52,13 +52,14 @@ from charlie_work.worker_launch_gate import (
     _launch_workers,
     issue_worker_launch_permit,
 )
-from charlie_work.github import GitHubError
+from charlie_work.github import GitHubError, label_names
 from charlie_work.review_fleet_gate import (
     fleet_review_lock,
     fleet_review_lock_deferral,
     read_fleet_review_cap,
 )
 from charlie_work.janitor import check_operator_containment, check_test_adequacy
+from charlie_work.local_approval_carry import approval_survives_head_move
 from charlie_work.labels import TransitionOutcome
 from charlie_work.local_lane import (
     LOCAL_PENDING_STATUS,
@@ -384,17 +385,11 @@ def _local_review_packets(self) -> dict[str, Any]:
             # invariant the remote lane records on every verdict -- keeps the
             # approval valid across the sync merge while still re-reviewing
             # any genuinely new content (different patch-id -> rebuild).
-            decision = self._review_decision(pr_number)
-            reviewed_patch = decision.get("reviewed_patch_id")
-            live_diff = branch_diff(
+            if approval_survives_head_move(
                 self.repo_root,
                 str(record.get("baseRefName") or base_branch or "HEAD"),
                 branch,
-            )
-            if (
-                reviewed_patch
-                and live_diff is not None
-                and _wf._calculate_patch_id(live_diff) == reviewed_patch
+                self._review_decision(pr_number),
             ):
                 needs_build = False
         if not needs_build or issue_live:
@@ -645,6 +640,7 @@ def _local_build_packet(
             ),
             "review_dispatch_attempt_last_head": head,
             "review_log_unreadable_streak": 0,
+            "review_api_error_streak": 0,  # issue #1808
             "review_turn_limit_miss_streak": (
                 0
                 if _fresh_dispatch_cycle
@@ -868,7 +864,6 @@ def _local_dispatch_reviewers(self, *, now: Any = None, launch_lock: Any = None)
 
     reviewer_harness = role_cfg.reviewer.harness
     reviewer_adapter_settings = self._adapter_settings(adapter=reviewer_harness)
-    reviewer_launcher = _wf._REVIEW_LAUNCHERS.get(reviewer_harness)
     launched: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
     quota_hit = False
@@ -891,16 +886,9 @@ def _local_dispatch_reviewers(self, *, now: Any = None, launch_lock: Any = None)
             if not head_sha:
                 failed.append({"pr": pr_number, "error": "packet head missing"})
                 continue
-            if reviewer_launcher is None:
-                failed.append(
-                    {
-                        "pr": pr_number,
-                        "error": f"unsupported reviewer harness: {reviewer_harness!r}",
-                    }
-                )
-                continue
             prompt_text = prompt_path.read_text(encoding="utf-8")
-            launch_record = reviewer_launcher(
+            launch_record = self.host.launch.launch(
+                reviewer_harness,
                 pr_number=pr_number,
                 branch=branch,
                 prompt_path=prompt_path,
@@ -1159,12 +1147,19 @@ def record_local_review(
     else:
         return _wf.CommandResult(False, "no packet or live branch head available", {})
 
-    diff = self._read_packet_diff(pr_number)
-    if diff is None and branch:
+    # The patch-id must describe the head the verdict is pinned to (issue
+    # #2151). The packet's diff.patch is that head's diff only when the
+    # verdict is pinned to the packet; an operator ``charlie verdict
+    # --reviewed-head <live>`` over a stale packet would otherwise record the
+    # PACKET head's patch-id against a different head, and the gate's own
+    # base-sync merge later fails the patch-id carry-forward and voids the
+    # approval. Everything else derives the diff from ``reviewed_head_sha``.
+    diff = self._read_packet_diff(pr_number) if reviewed_head_source == "packet" else None
+    if diff is None:
         diff = branch_diff(
             self.repo_root,
             str(pr_state.get("baseRefName") or local_base_branch(self.repo_root) or "HEAD"),
-            branch,
+            reviewed_head_sha,
         )
     reviewed_patch_id = _wf._calculate_patch_id(diff) if diff else ""
     reviewed_signature = (
@@ -1288,6 +1283,7 @@ def record_local_review(
             "reviewer_process_start_time": None,
             "review_dispatch_attempt_count": 0,
             "review_log_unreadable_streak": 0,
+            "review_api_error_streak": 0,  # issue #1808
             "review_turn_limit_miss_streak": 0,
             "review_session_metrics": (
                 session_metrics
@@ -1625,6 +1621,16 @@ def _launch_local_rework(
         record = (state.get("prs") or {}).get(str(pr_number), {})
         issue_number = int(record.get("issue_number") or pr_number)
         issue_entry = (state.get("issues") or {}).get(str(issue_number), {})
+        # TIS-CW-6: carry the issue's labels so a ``model:<tier>`` issue reworks
+        # on its tier, as the remote lane does. Live labels first (the local
+        # backend reads a file); the intake snapshot in state is the fallback.
+        try:
+            live_issue = self.gh.issue_view(issue_number)
+        except (GitHubError, ValueError):
+            live_issue = None
+        label_source = (
+            live_issue if isinstance(live_issue, dict) and "labels" in live_issue else issue_entry
+        )
         requests.append(
             SessionRequest(
                 issue_number=issue_number,
@@ -1632,6 +1638,7 @@ def _launch_local_rework(
                 prompt_path=self.paths.prs / f"pr-{pr_number}" / "rework-prompt.md",
                 branch_name=str(record.get("branch") or record.get("headRefName") or ""),
                 rework=True,
+                labels=tuple(sorted(label_names(label_source))),
             )
         )
         request_issues[pr_number] = issue_number

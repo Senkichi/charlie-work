@@ -1,0 +1,7 @@
+issue #2125: the local merge gate's suite-result reuse delegate (settles the
+gate from a prior passing result for the same (head, base) pair instead of
+relaunching the suite). Net-new OrchestratorApp member added after the Track 2
+Phase B surface baseline was pinned, split out of local_merge_gate.py to keep
+that file under its file-size ratchet mark; declared here so the member-surface
+conservation check in tests/test_workflow_delegation_l00.py subtracts it before
+comparing moved delegates against the pre-campaign total (133).
