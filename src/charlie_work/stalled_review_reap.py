@@ -46,8 +46,8 @@ from typing import Any
 from . import layout
 from .config import OrchestratorConfig
 from .github import GitHubLike
+from . import host as _host
 from .instrumentation import log_event
-from .process_utils import is_pid_alive
 from .review_decision import resolve_decision_payload
 from .state import (
     _REVIEW_STALE_CLAIM_TIMEOUT_MINUTES,
@@ -964,7 +964,9 @@ def _detect_and_handle_stalled_reviews(
         elif status == "review_dispatch_dispatched":
             reviewer_pid = pr_state.get("reviewer_pid")
             process_start_time = pr_state.get("reviewer_process_start_time")
-            pid_alive = reviewer_pid is not None and is_pid_alive(reviewer_pid, process_start_time)
+            pid_alive = reviewer_pid is not None and _host.current().probe.is_alive(
+                reviewer_pid, process_start_time
+            )
             if pid_alive:
                 continue
             if pr_key in fresh_sidecar_pr_keys:

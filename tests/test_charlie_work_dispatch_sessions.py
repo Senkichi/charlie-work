@@ -37,6 +37,7 @@ from charlie_work.config import (
     WorkerRoleConfig,
     load_config,
 )
+from charlie_work.host.fakes import FakeProcessProbe
 from charlie_work.instrumentation import log_event, query_events
 from charlie_work.paths import runtime_paths
 from charlie_work.state import (
@@ -362,6 +363,7 @@ def test_dispatch_config_max_open_agent_prs_validation_negative(tmp_path: Path) 
 def test_dispatch_emits_attention_digest_for_live_worker_redispatch_averted(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    fake_host,
 ) -> None:
     """Issue #506: a live-worker redispatch averted outcome surfaces in the digest."""
     from charlie_work.adapters import SessionDispatchResult
@@ -405,8 +407,8 @@ def test_dispatch_emits_attention_digest_for_live_worker_redispatch_averted(
 
     monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", fake_dispatch_sessions)
     # Issue #523: the live-worker slot count now verifies the recorded PID is
-    # actually alive at the OS level. Stub the probe so the result PID counts.
-    monkeypatch.setattr("charlie_work.workflow.is_pid_alive", lambda pid, start: True)
+    # actually alive at the OS level. Fake the probe so the result PID counts.
+    fake_host(probe=FakeProcessProbe({12345: 1_234_567.0}))
 
     result = app.dispatch(limit=1)
 

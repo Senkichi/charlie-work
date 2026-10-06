@@ -1,0 +1,8 @@
+# Test impact selection for charlie-work (ci-fleet >= 0.7.0). Defaults are on;
+# `full_triggers` and `inert` only append to the built-in lists. CI here stays
+# full (R14): PR runs record a shadow selection only, and the worker loop
+# selects (TIS-CW-2). A shadow miss is fixed with a `path_rules` entry.
+# `enabled = false` is the per-repo kill switch; `CI_FLEET_SELECT=off` the
+# per-run one.
+[test_selection]
+enabled = true

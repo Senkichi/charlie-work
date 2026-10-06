@@ -227,18 +227,15 @@ def _phantom_launch(worktree_path: Path) -> object:
 
 
 def _patch_dead_pids(monkeypatch, fake_host) -> None:
-    """All three liveness seams the dispatch path consults must read dead.
+    """Every liveness read the dispatch path consults must read dead.
 
-    ``charlie_work.workflow.is_pid_alive`` — the post-launch phantom
-    classifier's recorded-PID check. ``charlie_work.worker_fate.is_alive`` —
-    the sidecar census (``_issues_with_live_workers``). And the state-entry
-    liveness check in candidate selection, which reads the injected host
-    probe — faked all-dead here so the outcome does not depend on the
-    host's PID table, which is exactly the flakiness
+    The post-launch phantom classifier's recorded-PID check, the sidecar
+    census (``_issues_with_live_workers`` via ``worker_fate.is_alive``), and
+    the state-entry liveness check in candidate selection all read the one
+    injected host probe — faked all-dead here so the outcome does not depend
+    on the host's PID table, which is exactly the flakiness
     test_charlie_work_dispatch_phantom.py documents for PID 6262.
     """
-    monkeypatch.setattr("charlie_work.workflow.is_pid_alive", lambda pid, start: False)
-    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda pid, start: False)
     fake_host(probe=FakeProcessProbe())
 
 
