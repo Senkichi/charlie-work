@@ -90,4 +90,10 @@ def test_failing_alarm_does_not_abort_the_pass_or_skip_later_prs(
     # The alarm ran (and failed) for BOTH PRs: the scan went on past the first failure.
     assert sorted(e["payload"]["pr_number"] for e in failures) == [456, 457]
     assert "state lock busy" in failures[0]["payload"]["error"]
+    # The row really is a ``mergequeue_stall_alarm_failed`` event (kind literal in the kind
+    # slot, payload in the payload slot), not one filed under a swapped argument.
+    every_kind = {e["kind"] for e in query_events(app.paths.state_file)}
+    assert "mergequeue_stall_alarm_failed" in every_kind
+    assert all(isinstance(e["payload"].get("pr_number"), int) for e in failures)
+    assert not [k for k in every_kind if k.startswith("{") or "pr_number" in k]
     assert query_events(app.paths.state_file, kind="mergequeue_stalled") == []
