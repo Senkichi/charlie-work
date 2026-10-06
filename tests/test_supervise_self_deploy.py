@@ -93,10 +93,16 @@ def test_self_deploy_dependency_change_triggers_uv_sync(
     assert calls[-1][0] == ["uv", "sync", "--locked"]
 
 
-def test_self_deploy_fetch_failure_is_non_fatal(
+def test_self_deploy_pull_failure_is_non_fatal(
     tmp_path: Path, no_fleet_live_sessions: None
 ) -> None:
     """A network-shaped fetch refusal fails the pass without raising.
+
+    The leaf name says ``pull`` deliberately: at the deploy level the pull
+    step IS the fetch -- a fetch refusal is the failure that leaves
+    ``result.pulled`` False, exactly what the pre-#2312 fused ``git pull``
+    refusal produced. The name is also load-bearing for the collect-only
+    gate (issue #1538), which is fail-closed on test renames.
 
     Fetch failure never reaches the lossless-blocker repair -- that repair is
     for merge refusals (the tree is in the way of incoming blobs), and with a
@@ -471,7 +477,7 @@ def test_self_deploy_loud_warning_on_repeated_deferral(
     assert "abc123..def456" in out
 
 
-def test_self_deploy_merge_failure_surfaces_stderr_over_generic_error(
+def test_self_deploy_pull_failure_surfaces_stderr_over_generic_error(
     tmp_path: Path, no_fleet_live_sessions: None
 ) -> None:
     """Issue #817 item 3: a realistic failed RunResult -- as ``run_captured``
@@ -481,7 +487,7 @@ def test_self_deploy_merge_failure_surfaces_stderr_over_generic_error(
     (which names the colliding path) instead of the uninformative generic
     message.
 
-    ``test_self_deploy_fetch_failure_is_non_fatal`` above never caught the
+    ``test_self_deploy_pull_failure_is_non_fatal`` above never caught the
     old ``result.error or result.stderr`` bug because it constructs
     ``RunResult(1, "", "fatal: ...")`` without ``.error``, leaving it at the
     ``None`` default -- under the old fallback chain that made ``.stderr``
@@ -493,6 +499,9 @@ def test_self_deploy_merge_failure_surfaces_stderr_over_generic_error(
     trailing three canned responses account for
     ``_repair_lossless_pull_blockers`` short-circuiting at the
     diverged-tree check -- see the sibling test above for the same shape.
+    The leaf name predates the split and is load-bearing for the
+    collect-only gate (issue #1538): ``pull`` denotes the deploy's update
+    step, whose merge leg is where this refusal now surfaces.
     """
     runner, calls = _make_fake_runner(
         [
@@ -524,7 +533,7 @@ def test_self_deploy_merge_failure_surfaces_stderr_over_generic_error(
     assert len(calls) == 8
 
 
-def test_self_deploy_fetch_retries_transient_failure_then_succeeds(
+def test_self_deploy_pull_retries_transient_failure_then_succeeds(
     tmp_path: Path, no_fleet_live_sessions: None, monkeypatch: Any
 ) -> None:
     """A transient git-network blip on the fetch is retried in place (raw
@@ -536,7 +545,9 @@ def test_self_deploy_fetch_retries_transient_failure_then_succeeds(
     ``run_git_with_retry`` wrapping), this test fails: the fake runner would
     hand the transient-failure ``RunResult`` straight back as the fetch's
     final result instead of retrying, and the queued "origin/main"/"diff"
-    responses would never be consumed.
+    responses would never be consumed. The leaf name says ``pull`` because
+    the retried leg is the pull's fetch -- and because the collect-only
+    gate (issue #1538) is fail-closed on renames.
 
     ``git_retry``'s own ``time.sleep`` is monkeypatched out (issue #1777
     finding 8): ``self_deploy`` -> ``run_git_with_retry`` does not expose a
