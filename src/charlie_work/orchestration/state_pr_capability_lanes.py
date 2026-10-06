@@ -36,7 +36,7 @@ nothing to fetch on a no-remote repo.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 
 import charlie_work.workflow as _wf
 from charlie_work.local_work_park import publishes_pull_requests
@@ -296,7 +296,7 @@ def _maybe_reconcile_drift(self, *, now: datetime | None = None) -> None:
     # state entry to ``closed``, and the skip left closed local issues
     # parked at sink statuses like ``escalated`` forever.
 
-    resolved_now = now if now is not None else datetime.now(UTC)
+    resolved_now = now if now is not None else self.host.clock.now()
     state_file = self.paths.state_file
     with _wf.state_lock(state_file):
         state = _wf.load_state(state_file)

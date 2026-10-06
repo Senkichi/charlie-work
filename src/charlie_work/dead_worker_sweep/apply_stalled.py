@@ -29,6 +29,7 @@ from typing import Any
 from .. import devin_shell, no_pr_orphan_fate, post_mortem, role_quota_ledger, worker, worker_fate
 from . import effects_sessions
 from ..config import OrchestratorConfig
+from ..host import current as _host_current
 from ..process_utils import find_worker_terminal_status
 from ..worktree import read_worker_outcome
 from ..state import load_state, load_state_locked, set_throttled_until, state_lock
@@ -383,7 +384,7 @@ def run_stalled_sweep(
     if not config.watchdog.enabled:
         return []
     if now is None:
-        now = datetime.now(UTC)
+        now = _host_current().clock.now()
 
     stalled_entries: list[dict[str, int]] = []
     for w in worker.iter_workers(sessions_dir):
