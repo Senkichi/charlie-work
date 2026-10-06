@@ -161,6 +161,21 @@ def test_real_session_counter_late_binds_to_existing_patch_targets(monkeypatch) 
     assert REAL.sessions.live_reviews(Path("."), None) == 14
 
 
+def test_fleet_live_workers_reaches_fleet_registry_patch(monkeypatch) -> None:
+    """Issue #2230 rework: ``workflow.count_fleet_live_sessions`` is a re-export
+    of ``host/sessions.py``'s late-binding facade, not a frozen ``from
+    ... import`` binding -- so a patch against
+    ``fleet_registry.count_fleet_live_sessions`` must still reach callers
+    going through the port (the supervise self-deploy deferral).
+    """
+    from charlie_work.host import REAL
+
+    monkeypatch.setattr(
+        "charlie_work.fleet_registry.count_fleet_live_sessions", lambda o: (21, ["x"])
+    )
+    assert REAL.sessions.fleet_live_workers(None) == (21, ["x"])
+
+
 def test_command_result_reexport_is_identity() -> None:
     from charlie_work import command_result, workflow
 
