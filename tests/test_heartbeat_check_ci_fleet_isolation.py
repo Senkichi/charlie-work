@@ -157,11 +157,24 @@ sys.meta_path.insert(0, _CiFleetBlocker())
 '''
 
 
+def _clean_env() -> dict[str, str]:
+    """The environment minus ci-fleet's map-mode child hook.
+
+    During a map build (the nightly) each test's process carries
+    ``CI_FLEET_MAP_NODEID``; ``ci_fleet_probe.pth`` then imports ``ci_fleet`` at
+    interpreter startup, before any meta-path blocker in ``-c`` code can run, so
+    ``ci_fleet`` is never "absent" in the child. These tests prove import
+    isolation, which map-mode attribution is irrelevant to.
+    """
+    return {k: v for k, v in os.environ.items() if not k.startswith("CI_FLEET_MAP")}
+
+
 def _run_blocked(body: str) -> "subprocess.CompletedProcess[str]":
     return subprocess.run(
         [sys.executable, "-c", _BLOCKER + textwrap.dedent(body)],
         capture_output=True,
         text=True,
+        env=_clean_env(),
     )
 
 
@@ -177,6 +190,7 @@ def test_the_ci_fleet_blocker_actually_blocks() -> None:
         [sys.executable, "-c", "import ci_fleet; print('PRESENT')"],
         capture_output=True,
         text=True,
+        env=_clean_env(),
     )
     assert control.returncode == 0 and "PRESENT" in control.stdout, (
         "fixture premise gone: ci_fleet is not importable even without the blocker, "
@@ -243,6 +257,7 @@ def _run_charlie_work_blocked(body: str) -> "subprocess.CompletedProcess[str]":
         [sys.executable, "-c", _CHARLIE_WORK_BLOCKER + textwrap.dedent(body)],
         capture_output=True,
         text=True,
+        env=_clean_env(),
     )
 
 
@@ -252,6 +267,7 @@ def test_the_charlie_work_blocker_actually_blocks() -> None:
         [sys.executable, "-c", "import charlie_work; print('PRESENT')"],
         capture_output=True,
         text=True,
+        env=_clean_env(),
     )
     assert control.returncode == 0 and "PRESENT" in control.stdout, (
         "fixture premise gone: charlie_work is not importable even without the "
