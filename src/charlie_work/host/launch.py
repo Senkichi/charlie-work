@@ -178,6 +178,4 @@ class RealWorkerLauncher:
                 repo_root, manifest_path, results_path, settings, requests
             )
         except Exception as exc:  # errors from external processes come back as values
-            return worker_error_results(
-                repo_root, settings, requests, f"launch failed: {exc}"
-            )
+            return worker_error_results(repo_root, settings, requests, f"launch failed: {exc}")
