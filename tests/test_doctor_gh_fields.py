@@ -10,7 +10,7 @@ from __future__ import annotations
 from pathlib import Path
 from _field_list_lint import _find_gh_field_list_violations
 from _script_loader import load_script_module
-from _src_ast import parsed
+from _src_ast import parsed, source_files, source_text
 
 
 def test_gh_field_lists_use_constants_no_inline_literals() -> None:
@@ -60,9 +60,11 @@ def test_gh_field_lists_use_constants_no_inline_literals() -> None:
     src_dir = Path(__file__).parent.parent / "src" / "charlie_work"
     violations: list[tuple[str, int, str]] = []
 
-    for py_file in src_dir.rglob("*.py"):
+    for py_file in source_files(src_dir):
         if py_file.name == "github.py":
             # Constant definitions are allowed in github.py
+            continue
+        if "--json" not in source_text(py_file):
             continue
         try:
             tree = parsed(py_file)
