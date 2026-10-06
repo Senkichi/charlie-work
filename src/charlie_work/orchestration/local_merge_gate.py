@@ -73,6 +73,7 @@ from charlie_work.local_lane import (
     suite_command_argv,
 )
 from charlie_work.orchestration.local_gate_finalize import LOCAL_SUITE_PASSED_FIELDS
+from charlie_work.selection_wrapper import DISABLED, ENFORCED, SHADOW, gate_selection
 from charlie_work.worktree import (
     _merge_update_rework_branch,
 )
@@ -775,6 +776,28 @@ def _local_gate_launch(
     gate_base = resolve_ref_sha(self.repo_root, base_ref)
     paths = local_suite_runner.suite_gate_paths(self.paths.dispatches, pr_number)
 
+    # Test impact selection: the suite runs inside ``ci-fleet test --context gate``
+    # for exactly this (head, base), in shadow until the repo's shadow window is
+    # met. Wrapped before the reuse check, so a result of another command is a
+    # miss. Fail open: unwrapped, with the reason recorded.
+    selection = gate_selection(self.repo_root, argv, head=gate_head, base=gate_base)
+    if selection.mode == DISABLED:
+        self._local_gate_event(
+            "local_suite_selection_disabled",
+            {"pr_number": pr_number, "issue_number": issue_number, "detail": selection.detail},
+        )
+    elif selection.mode not in (SHADOW, ENFORCED):
+        self._local_gate_event(
+            "local_suite_selection_unavailable",
+            {
+                "pr_number": pr_number,
+                "issue_number": issue_number,
+                "reason": selection.mode,
+                "detail": selection.detail,
+            },
+        )
+    argv = list(selection.argv)
+
     reused = self._local_gate_try_reuse(
         pr_key, record, entry, branch, base_ref, decision, argv, reason, gate_head, gate_base
     )
@@ -825,6 +848,7 @@ def _local_gate_launch(
                 "head_sha": gate_head,
                 "base_sha": gate_base,
                 "argv": list(argv),
+                "selection": selection.mode,
                 "log": str(paths.log),
                 "reason": reason,
                 "resync_count": resync_count,

@@ -39,15 +39,22 @@ _WORKFLOW_ATTRS: dict[str, str] = {
     "linked_issue_number": "linked_issue_number",
     "detect_cross_pr_revert": "detect_cross_pr_revert",
     "utc_now": "utc_now",
-    "command_result": "CommandResult",
+}
+
+# ``command_result`` resolves on the leaf ``charlie_work.command_result`` module:
+# nothing patches ``CommandResult`` on the workflow facade, which stopped
+# re-exporting it (issue #2234). Kept late-bound for consistency with the
+# other ports.
+_LEAF_ATTRS: dict[str, tuple[str, str]] = {
+    "command_result": ("charlie_work.command_result", "CommandResult"),
 }
 
 
-def _late_bound(attr: str) -> Callable[..., Any]:
+def _late_bound(attr: str, module: str = "charlie_work.workflow") -> Callable[..., Any]:
     def call(*args: Any, **kwargs: Any) -> Any:
-        import charlie_work.workflow as _wf
+        import importlib
 
-        return getattr(_wf, attr)(*args, **kwargs)
+        return getattr(importlib.import_module(module), attr)(*args, **kwargs)
 
     call.__name__ = attr
     return call
@@ -55,7 +62,9 @@ def _late_bound(attr: str) -> Callable[..., Any]:
 
 def ports_from_workflow() -> MergePathPorts:
     """Ports that resolve through ``charlie_work.workflow`` on every call."""
-    return MergePathPorts(**{name: _late_bound(attr) for name, attr in _WORKFLOW_ATTRS.items()})
+    bound = {name: _late_bound(attr) for name, attr in _WORKFLOW_ATTRS.items()}
+    bound.update({name: _late_bound(attr, module) for name, (module, attr) in _LEAF_ATTRS.items()})
+    return MergePathPorts(**bound)
 
 
-assert {f.name for f in fields(MergePathPorts)} == set(_WORKFLOW_ATTRS)
+assert {f.name for f in fields(MergePathPorts)} == set(_WORKFLOW_ATTRS) | set(_LEAF_ATTRS)

@@ -47,7 +47,8 @@ from charlie_work.pass_deadline import (
 )
 from charlie_work.paths import runtime_paths
 from charlie_work.state import empty_state, load_state, save_state
-from charlie_work.workflow import CommandResult, OrchestratorApp
+from charlie_work.command_result import CommandResult
+from charlie_work.workflow import OrchestratorApp
 
 
 def _lane_lock() -> MagicMock:

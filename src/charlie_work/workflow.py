@@ -33,7 +33,7 @@ from .review_launch import (  # noqa: F401 deliberate re-export
     _launch_review_claude_code,
     _launch_review_devin_shell,
 )
-from .host import HostPorts, current as _host_current
+from .host import HostPorts, count_fleet_live_sessions, current as _host_current  # noqa: F401  (deliberate re-export; the sessions-port late-binding facade -- see host/sessions.py)
 from .worker_launch_gate import FleetLaunchLock
 from .review_fleet_gate import (
     fleet_lock_held_result_data,
@@ -41,7 +41,7 @@ from .review_fleet_gate import (
     fleet_review_lock_deferral,
     read_fleet_review_cap,
 )
-from .fleet_registry import count_fleet_live_reviews, count_fleet_live_sessions, managed_repo_names  # noqa: F401  (deliberate re-export; count_fleet_live_sessions used by moved L06 delegates via _wf., count_fleet_live_reviews by review_fleet_gate via _wf.)
+from .fleet_registry import count_fleet_live_reviews, managed_repo_names  # noqa: F401  (deliberate re-export; count_fleet_live_reviews by review_fleet_gate via _wf., managed_repo_names likewise. count_fleet_live_sessions is deliberately NOT imported from here: it is host/sessions.py's late-binding facade over fleet_registry's walker, re-exported via the .host import above -- a plain re-export would freeze fleet_registry's function object and kill the fleet_registry.* patch surface.)
 from . import layout, status_snapshot  # noqa: F401  (deliberate re-export; layout reached via _wf.layout by orchestration/misc_reconcile.py)
 from .main_ci_reclaim import reclaim_superseded_main_ci_runs  # noqa: F401  (deliberate re-export; used by moved L01 b3 delegates via _wf.)
 from .notify import AttentionDigest, AttentionEntry, emit_digest, reviewer_quota_alert_digest
@@ -129,7 +129,7 @@ from .worktree import (
     write_worktree_marker,  # noqa: F401  (deliberate re-export; used by moved L01 b4 delegates via _wf.)
 )
 from . import state as _state
-from .command_result import CommandResult  # noqa: F401  deliberate re-export
+from .command_result import CommandResult as _CommandResult
 from .unescalate_reset_fields import (
     ISSUE_BUDGET_RESET_BY_ESCALATION_REASON,
     REWORK_BUDGET_RESET_BY_ESCALATION_REASON,
@@ -663,14 +663,14 @@ def _slim_pr_json(pr: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in pr.items() if k in _PR_SLIM_FIELDS}
 
 
-def _state_lock_busy_result(message: str, **extra: Any) -> CommandResult:
+def _state_lock_busy_result(message: str, **extra: Any) -> _CommandResult:
     data: dict[str, Any] = {
         "pass_skipped": True,
         "reason": "state_lock_busy",
         "state_lock_busy": True,
     }
     data.update(extra)
-    return CommandResult(True, message, data)
+    return _CommandResult(True, message, data)
 
 
 def _truncate_reason(reason: str, max_len: int = 200) -> str:
@@ -755,7 +755,7 @@ def _guard_state_lock(func: Any) -> Any:
     """Decorator that turns StateLockBusy into a skipped CommandResult."""
 
     @functools.wraps(func)
-    def wrapper(self: Any, *args: Any, **kwargs: Any) -> CommandResult:
+    def wrapper(self: Any, *args: Any, **kwargs: Any) -> _CommandResult:
         try:
             return func(self, *args, **kwargs)
         except StateLockBusy:
@@ -1395,8 +1395,12 @@ WORKER_PROMPT_KEYS: frozenset[str] = frozenset(
         # The test command, resolved by ``prompt_test_command`` (config
         # override, else derived from the consumer's pyproject.toml, else a
         # pointer to the repository's own docs). Always supplied, never empty.
+        # The step sentence and execution contract follow the command's form
+        # (hand-picked, or ``ci-fleet test``).
         "targeted_test_command",
         "full_suite_command",
+        "test_step_instruction",
+        "test_execution_contract",
     }
 )
 REWORK_PROMPT_KEYS: frozenset[str] = frozenset(
@@ -1414,6 +1418,8 @@ REWORK_PROMPT_KEYS: frozenset[str] = frozenset(
         # Same resolution as the worker prompt's (``prompt_test_command``).
         "targeted_test_command",
         "full_suite_command",
+        "test_step_instruction",
+        "test_execution_contract",
     }
 )
 
@@ -2115,7 +2121,7 @@ class OrchestratorApp:
         return self._host if self._host is not None else _host_current()
 
     @_guard_state_lock
-    def status(self, *, use_cache: bool = True) -> CommandResult:
+    def status(self, *, use_cache: bool = True) -> _CommandResult:
         if use_cache and (cached := status_snapshot.read_status_snapshot(self)) is not None:
             return cached
         issues = self.gh.issue_list(self.config.labels.ready)
@@ -2269,7 +2275,7 @@ class OrchestratorApp:
         if runners_data is not None:
             data["runners"] = runners_data
 
-        return CommandResult(True, "status complete", data)
+        return _CommandResult(True, "status complete", data)
 
     @_guard_state_lock
     def review(
@@ -2277,7 +2283,7 @@ class OrchestratorApp:
         pr_number: int,
         *,
         force: bool = False,
-    ) -> CommandResult:
+    ) -> _CommandResult:
         """Generate a review packet for a PR.
 
         ``force`` (issue #2081, ``why-charlie-hate --force-rereview``) voids a
@@ -2314,7 +2320,7 @@ class OrchestratorApp:
         """
         pr = self.gh.pr_view(pr_number)
         if not pr:
-            return CommandResult(False, f"PR #{pr_number} was not found", {})
+            return _CommandResult(False, f"PR #{pr_number} was not found", {})
         issue_number = linked_issue_number(
             pr,
             is_cross_repository=pr.get("isCrossRepository"),
@@ -2335,7 +2341,7 @@ class OrchestratorApp:
         # worse than the bug it replaces, so this gate is a single early return
         # before any branch that has an escalation or state-write arm.
         if self.dry_run:
-            return CommandResult(
+            return _CommandResult(
                 True,
                 f"dry-run: would generate review packet for PR #{pr_number}",
                 {
@@ -2567,7 +2573,7 @@ class OrchestratorApp:
                     if routed is not None:
                         return routed
 
-            return CommandResult(
+            return _CommandResult(
                 True,
                 reason,
                 {
@@ -2748,7 +2754,7 @@ class OrchestratorApp:
                             {"pr_number": pr_number, "issue_number": issue_number},
                         )
                         save_state(self.paths.state_file, state)
-                return CommandResult(
+                return _CommandResult(
                     True,
                     f"PR #{pr_number} is CLOSED (unmerged) on GitHub; "
                     f"converged state status to 'closed'",
@@ -2804,7 +2810,7 @@ class OrchestratorApp:
                                 },
                             )
                         save_state(self.paths.state_file, state)
-                    return CommandResult(
+                    return _CommandResult(
                         False,
                         f"PR #{pr_number} is a draft; auto-ready held ({draft_hold_reason})",
                         {
@@ -2828,7 +2834,7 @@ class OrchestratorApp:
                         },
                         repo=self.repo_root.name,
                     )
-                    return CommandResult(
+                    return _CommandResult(
                         False,
                         f"PR #{pr_number} was a draft; marked ready for review "
                         "(deferring to next pass)",
@@ -2875,7 +2881,7 @@ class OrchestratorApp:
                             state_path=self.paths.state_file,
                         )
                     save_state(self.paths.state_file, state)
-                return CommandResult(
+                return _CommandResult(
                     False,
                     f"PR #{pr_number} is a draft and `gh pr ready` failed: {draft_ready_error}",
                     {
@@ -2939,7 +2945,7 @@ class OrchestratorApp:
                             state_path=self.paths.state_file,
                         )
                         save_state(self.paths.state_file, state)
-                    return CommandResult(
+                    return _CommandResult(
                         False,
                         f"flake rerun triggered for PR #{pr_number}: run(s) "
                         + ", ".join(str(rid) for rid in triggered_run_ids),
@@ -2976,7 +2982,7 @@ class OrchestratorApp:
                     and rerun_errors
                     and all(_is_rerun_already_running_error(e) for e in rerun_errors)
                 ):
-                    return CommandResult(
+                    return _CommandResult(
                         False,
                         f"flake rerun for PR #{pr_number} refused: "
                         + "workflow run(s) still in progress",
@@ -3091,7 +3097,7 @@ class OrchestratorApp:
                         level="error",
                     )
                     window["last_escalation"] = now_dt
-                return CommandResult(
+                return _CommandResult(
                     False,
                     f"PR #{pr_number} infra-blocked (billing/runner outage): "
                     + ", ".join(verdict.infra_blocked_checks),
@@ -3450,7 +3456,7 @@ class OrchestratorApp:
                 if stale_checks_retrigger_result is not None:
                     return stale_checks_retrigger_result
 
-            return CommandResult(
+            return _CommandResult(
                 False,
                 f"janitor gate blocked PR #{pr_number}: " + "; ".join(verdict.failures),
                 {
@@ -3687,7 +3693,7 @@ class OrchestratorApp:
                     level="warning",
                 )
                 save_state(self.paths.state_file, state)
-            return CommandResult(
+            return _CommandResult(
                 False,
                 f"PR #{pr_number}: head moved during packet build "
                 f"({snapshot_head_for_commit} -> {live_head_for_commit!r}); "
@@ -4075,7 +4081,7 @@ class OrchestratorApp:
         message = "review packet generated"
         if label_error:
             message += f" (label update failed: {label_error.get('outcome', label_error)})"
-        return CommandResult(
+        return _CommandResult(
             True,
             message,
             {
@@ -4102,7 +4108,7 @@ class OrchestratorApp:
         *,
         now: datetime | None = None,
         launch_lock: FleetLaunchLock | None = None,
-    ) -> CommandResult:
+    ) -> _CommandResult:
         """Launch reviewer sessions concurrently for queued PRs.
 
         Issue #370: a deterministic loop stage that turns ``review_queue()```
@@ -4185,7 +4191,7 @@ class OrchestratorApp:
             # to "nothing happened at all" — and mark ``disabled`` so a
             # caller doesn't have to string-match the message to tell this
             # apart from a real dispatch pass.
-            return CommandResult(
+            return _CommandResult(
                 True,
                 "review dispatch disabled",
                 {
@@ -4226,7 +4232,7 @@ class OrchestratorApp:
             if is_reviewer_quota_exhausted(quota_state) and not is_reviewer_probe_ready(
                 quota_state
             ):
-                return CommandResult(
+                return _CommandResult(
                     True,
                     "review dispatch deferred: reviewer quota exhausted, probe not ready",
                     {
@@ -4294,7 +4300,7 @@ class OrchestratorApp:
                 else:
                     dry_selected_after_approval.append(c)
             dry_selected = dry_selected_after_approval
-            return CommandResult(
+            return _CommandResult(
                 True,
                 f"dry-run: would dispatch {len(dry_selected)} reviewer(s)",
                 {
@@ -4400,7 +4406,7 @@ class OrchestratorApp:
             _deferred_normal, deferred_rescue_results = self._partition_rescue_candidates(
                 deferred_candidates
             )
-            return CommandResult(
+            return _CommandResult(
                 True,
                 "review dispatch deferred: reviewer quota exhausted, probe not ready",
                 {
@@ -4420,7 +4426,7 @@ class OrchestratorApp:
         queue_result = self.review_queue()
         candidates = queue_result.data.get("queue", [])
         if not candidates:
-            return CommandResult(
+            return _CommandResult(
                 True,
                 "review dispatch: no candidates",
                 {
@@ -4444,7 +4450,7 @@ class OrchestratorApp:
         # self.config.rescue.enabled -- see _partition_rescue_candidates).
         candidates, rescue_review_results = self._partition_rescue_candidates(candidates)
         if not candidates:
-            return CommandResult(
+            return _CommandResult(
                 True,
                 f"review dispatch: {len(rescue_review_results)} rescue review(s) "
                 "processed, no normal candidates",
@@ -4495,7 +4501,7 @@ class OrchestratorApp:
         # the fleet count is read; held through claim -> launch (caller releases).
         lock_deferral = fleet_review_lock_deferral(self, launch_lock)
         if lock_deferral is not None:
-            return CommandResult(
+            return _CommandResult(
                 True,
                 "review dispatch deferred: fleet_lock_held",
                 fleet_lock_held_result_data(
@@ -5211,7 +5217,7 @@ class OrchestratorApp:
         }
         data.update(local_cap.report_fields())
         data.update(selection.fleet_report_fields())
-        return CommandResult(ok, message, data)
+        return _CommandResult(ok, message, data)
 
     # Re-arm field sets live in unescalate_reset_fields.py (extracted under the
     # #1442 ratchet); the aliases keep ``self._...`` call sites and tests intact.
@@ -5227,7 +5233,7 @@ class OrchestratorApp:
         *,
         merge: bool | None = None,
         merge_train_head: int | None = None,
-    ) -> CommandResult:
+    ) -> _CommandResult:
         """Evaluate one PR and act on the verdict; the stages live in ``merge_path``.
 
         The dry-run gate stays here, above any state lock: under ``--dry-run`` the
@@ -5255,7 +5261,7 @@ class OrchestratorApp:
         merge: bool | None = None,
         now: datetime | None = None,
         deadline_exceeded: Callable[[], bool] | None = None,
-    ) -> CommandResult:
+    ) -> _CommandResult:
         # ``now`` (issue #822, extended #828) is this pass's injectable clock.
         # ``_loop_body`` forwards it, unresolved, to every cadence-gated lane
         # that samples wall-clock time: dead-session throttle classification

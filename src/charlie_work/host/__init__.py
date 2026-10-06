@@ -12,7 +12,11 @@ from dataclasses import dataclass
 from .clock import Clock, RealClock
 from .launch import RealReviewLauncher, RealWorkerLauncher, ReviewLauncher, WorkerLauncher
 from .liveness import ProcessProbe, RealProcessProbe
-from .sessions import RealSessionCounter, SessionCounter
+from .sessions import (  # noqa: F401  (count_fleet_live_sessions is a deliberate re-export for workflow.py)
+    RealSessionCounter,
+    SessionCounter,
+    count_fleet_live_sessions,
+)
 
 
 @dataclass(frozen=True)

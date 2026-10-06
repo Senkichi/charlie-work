@@ -15,12 +15,13 @@ module-level class, and ``linked_issue_number`` is patched on
 from __future__ import annotations
 
 import charlie_work.workflow as _wf
+from charlie_work.command_result import CommandResult
 from typing import Any
 from charlie_work.no_op_rework_body import _request_changes_body_drifted
 from charlie_work.state import StateLockBusy
 
 
-def review_queue(self) -> _wf.CommandResult:
+def review_queue(self) -> CommandResult:
     """Enumerate open agent PRs whose review packet is current and awaiting a verdict.
 
     When a recorded verdict (``approved``, ``request_changes``, or
@@ -302,7 +303,7 @@ def review_queue(self) -> _wf.CommandResult:
             )
 
     queue = self._sort_review_queue_by_dependency_depth(queue)
-    return _wf.CommandResult(
+    return CommandResult(
         True,
         f"review queue: {len(queue)} PR(s) awaiting verdict",
         {"queue": queue},

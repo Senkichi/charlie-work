@@ -608,3 +608,19 @@ def fake_host(monkeypatch: pytest.MonkeyPatch) -> Callable[..., Any]:
         return ports
 
     return _install
+
+
+@pytest.fixture(autouse=True)
+def _no_real_ci_fleet(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Never let a test wrap a suite in the venv's real ``ci-fleet`` executable.
+
+    The worker/rework prompts and the local merge gate wrap the runner in
+    ``ci-fleet test`` whenever the console script sits beside the interpreter,
+    which in this venv it always does -- and the locked ``ci-fleet`` may predate
+    the ``test`` subcommand. Every test therefore starts with no executable (today's
+    commands, and no git subprocess per prompt render); a test that wants the
+    wrapped form patches ``selection_wrapper.ci_fleet_executable`` itself.
+    """
+    import charlie_work.selection_wrapper as selection_wrapper
+
+    monkeypatch.setattr(selection_wrapper, "ci_fleet_executable", lambda: None)

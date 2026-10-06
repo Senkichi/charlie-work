@@ -124,7 +124,8 @@ from .supervisor_lifecycle import (
     update_supervisor_heartbeat,
 )
 from .wedge_watchdog import WedgeWatchdog
-from .workflow import DEFERRED_BY_CONCURRENCY_REASON_PREFIX, CommandResult, OrchestratorApp
+from .command_result import CommandResult
+from .workflow import DEFERRED_BY_CONCURRENCY_REASON_PREFIX, OrchestratorApp
 
 logger = logging.getLogger(__name__)
 

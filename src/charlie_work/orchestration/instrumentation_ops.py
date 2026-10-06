@@ -39,6 +39,7 @@ from pathlib import Path
 from typing import Any
 
 import charlie_work.workflow as _wf
+from charlie_work.command_result import CommandResult
 from charlie_work import layout, queue_sync_coverage_cache, status_snapshot
 from charlie_work.attachment_budget_prompt import (
     ATTACHMENT_BUDGET_CLAUSE as _ATTACHMENT_BUDGET_CLAUSE,
@@ -491,7 +492,7 @@ def _reconcile_stranded_verdicts(self) -> list[dict[str, Any]]:
     return results
 
 
-def ensure_labels(self) -> _wf.CommandResult:
+def ensure_labels(self) -> CommandResult:
     """Automatic startup label ensure (issue #1339).
 
     Runs the same idempotent LabelConfig-derived ensure as
@@ -516,7 +517,7 @@ def ensure_labels(self) -> _wf.CommandResult:
             repo=self.repo_root.name,
             level="error",
         )
-        return _wf.CommandResult(
+        return CommandResult(
             False,
             f"label ensure error: {exc}",
             {"labels": list(self.config.labels.all), "missing": None},
@@ -551,7 +552,7 @@ def ensure_labels(self) -> _wf.CommandResult:
     return result
 
 
-def tripwire_status(self) -> _wf.CommandResult:
+def tripwire_status(self) -> CommandResult:
     """Report the live unauthorized-merge tripwire state without re-running detection.
 
     The consumer for ``unauthorized_merge_detected`` (issue #933) and for
@@ -653,7 +654,7 @@ def tripwire_status(self) -> _wf.CommandResult:
             f"most recent {last_skip['ts']})"
         )
 
-    return _wf.CommandResult(
+    return CommandResult(
         True,
         message,
         {
@@ -679,7 +680,7 @@ def _loop_impl(
     merge: bool | None,
     now: datetime | None = None,
     deadline_exceeded: Callable[[], bool] | None = None,
-) -> _wf.CommandResult:
+) -> CommandResult:
     # Issue #1363: preflight gate. Runs BEFORE `loop_started` is recorded
     # -- a fatal host-precondition failure (disk_floor, venv_identity)
     # must refuse the pass with zero partial work, not half-run it and
@@ -721,7 +722,7 @@ def _loop_impl(
     if not preflight_result.ok:
         fatal_check = preflight_result.fatal_failures[0]
         emit_preflight_refusal(self.paths.state_file, fatal_check, repo=self.repo_root.name)
-        return _wf.CommandResult(
+        return CommandResult(
             False,
             f"preflight refused pass: {fatal_check.name}: {fatal_check.detail}",
             {
@@ -771,7 +772,7 @@ def _loop_impl(
             # A refusal escaped a gh call _loop_body does not wrap. The
             # pass is partial -- report it deferred (the marker is what
             # keeps fleet_loop from counting this repo as observed).
-            result = _wf.CommandResult(
+            result = CommandResult(
                 True,
                 "loop pass deferred: in-pass deadline reached",
                 {"deadline_deferred": True},

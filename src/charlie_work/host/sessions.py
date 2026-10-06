@@ -5,7 +5,9 @@ attribute its consumer reached before the port existed, so every existing
 patch (``workflow._count_live_sessions``, ``workflow.count_fleet_live_sessions``,
 ``workflow.count_fleet_live_reviews``, ``dispatch_selection._count_live_reviews``,
 ``worker.iter_workers``, ``worktree._own_live_session_pids``) keeps
-intercepting.
+intercepting. The module-level ``count_fleet_live_sessions`` below is
+what ``workflow.count_fleet_live_sessions`` is bound to -- the end of that
+late-binding chain (issue #2230).
 """
 
 from __future__ import annotations
@@ -58,3 +60,24 @@ class RealSessionCounter:
         from ..worktree import _own_live_session_pids
 
         return _own_live_session_pids(sessions_dir)
+
+
+def count_fleet_live_sessions(fleet_dir_override: str | None) -> tuple[int, list[str]]:
+    """Late-binding facade over ``fleet_registry.count_fleet_live_sessions``.
+
+    ``charlie_work.workflow`` re-exports this under the same name -- the
+    attribute ``RealSessionCounter.fleet_live_workers`` resolves at call
+    time. A plain ``from fleet_registry import ...`` re-export on workflow
+    would freeze fleet_registry's function object at import time, so a
+    patch against ``fleet_registry.count_fleet_live_sessions`` -- the
+    attribute the supervise call site used to reach -- would stop biting.
+    Resolving the attribute at call time keeps both patch surfaces live:
+    patching ``workflow.count_fleet_live_sessions`` intercepts the port's
+    lookup, patching ``fleet_registry.count_fleet_live_sessions``
+    intercepts inside this body. Lives here rather than in ``workflow.py``
+    because that file is over the per-module size cap (issue #1442
+    ratchet); moved here in the #2230 rework.
+    """
+    from .. import fleet_registry
+
+    return fleet_registry.count_fleet_live_sessions(fleet_dir_override)

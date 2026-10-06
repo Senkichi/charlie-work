@@ -59,7 +59,8 @@ from charlie_work.local_issues import LocalFileGitHub
 from charlie_work.main_ci_reclaim import MainCiReclaimResult
 from charlie_work.paths import runtime_paths
 from charlie_work.state import empty_state, load_state, save_state
-from charlie_work.workflow import CommandResult, OrchestratorApp
+from charlie_work.command_result import CommandResult
+from charlie_work.workflow import OrchestratorApp
 
 from _dispatch_fixtures import _stub_real_activity_probe_for_stalled_tests  # noqa: F401
 from _reconcile_fixtures import _write_local_issue

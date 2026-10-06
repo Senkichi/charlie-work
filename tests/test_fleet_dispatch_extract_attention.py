@@ -16,7 +16,7 @@ from charlie_work.fleet_dispatch import (
     _build_fleet_attention_digest,
     _extract_attention_events,
 )
-from charlie_work.workflow import CommandResult
+from charlie_work.command_result import CommandResult
 
 
 def test_extract_attention_events_deferred_by_concurrency_truncation_desync() -> None:

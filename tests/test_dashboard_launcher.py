@@ -71,6 +71,21 @@ def _launcher_code() -> str:
     return "\n".join(ln for ln in raw.splitlines() if not ln.lstrip().startswith("#"))
 
 
+def test_launcher_syncs_the_venv_to_the_lock_before_every_launch() -> None:
+    # A HEAD drift relaunch loads new code; serve runs --no-sync, so without this a
+    # lock bump (e.g. a newer ci-fleet the new config rules need) leaves the new tree
+    # running over the old venv and failing at config load until a manual sync.
+    code = _launcher_code()
+    sync = re.search(r"^\$syncLine = \"uv sync (.*)\"\s*$", code, re.MULTILINE)
+    assert sync is not None
+    assert "--locked" in sync.group(1)  # never rewrites uv.lock
+    assert "--inexact" in sync.group(1)  # never prunes extras/dev tools from the venv
+    assert "2>&1" in sync.group(1)  # stderr redirected inside cmd, not PowerShell
+    loop = code[code.index("while ($true) {") :]
+    assert loop.index("& cmd /c $syncLine") < loop.index("& cmd /c $cmdLine")
+    assert "sync failed" in loop  # a failed sync is logged, and the launch still happens
+
+
 def test_relaunch_budget_is_a_rate_with_a_delay_not_a_lifetime_count() -> None:
     code = _launcher_code()
     assert re.search(r"^\$maxRelaunches = 5\s*$", code, re.MULTILINE)

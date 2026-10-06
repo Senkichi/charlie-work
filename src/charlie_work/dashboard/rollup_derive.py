@@ -270,6 +270,8 @@ KNOWN_IGNORED: dict[str, str] = {
     "local_no_op_rework_rearmed": "local (no-remote) lane bookkeeping",
     "local_review_adopted": "local (no-remote) lane bookkeeping",
     "local_suite_failed": "local (no-remote) lane bookkeeping",
+    "local_suite_selection_disabled": "local (no-remote) lane bookkeeping",
+    "local_suite_selection_unavailable": "local (no-remote) lane bookkeeping",
     "local_work_ready": "local (no-remote) lane bookkeeping",
     "worktree_unsafe_stranded_salvaged": "stranded-commit salvage record",
     "worktree_unsafe_stranded_salvage_failed": "stranded-commit salvage record",
@@ -322,6 +324,8 @@ KNOWN_IGNORED: dict[str, str] = {
     "worker_evidence_stale": "worker-outcome bookkeeping",
     "worker_literal_tmp_path": "post-hoc /tmp-misuse signal (issue #1780)",
     "worker_module_map_failed": "worker-outcome bookkeeping",
+    "worker_test_selection_disabled": "worker-prompt test-command diagnostic",
+    "worker_test_selection_unavailable": "worker-prompt test-command diagnostic",
     "worker_verified_no_changes": "worker-outcome bookkeeping",
     "worker_verified_no_changes_ignored": "worker-outcome bookkeeping",
 }

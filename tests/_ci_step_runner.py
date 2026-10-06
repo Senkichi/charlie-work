@@ -26,6 +26,7 @@ _GIT_BASH = Path(r"C:\Program Files\Git\bin\bash.exe")
 FAKE_GH = """#!/usr/bin/env bash
 printf '%s\\n' "$*" >> "$FAKE_GH_LOG"
 case "$2" in
+  */actions/artifacts*) [ "${FAKE_ARTIFACTS_RC:-0}" = 0 ] || exit "$FAKE_ARTIFACTS_RC"; printf '%s' "${FAKE_ARTIFACTS_OUT:-}";;
   */commits/*/pulls) [ "${FAKE_PULLS_RC:-0}" = 0 ] || exit "$FAKE_PULLS_RC"; printf '%s' "${FAKE_PULLS_OUT:-}";;
   */pulls/*) [ "${FAKE_PR_RC:-0}" = 0 ] || exit "$FAKE_PR_RC"; printf '%s' "${FAKE_PR_OUT:-}";;
   *) exit 99;;

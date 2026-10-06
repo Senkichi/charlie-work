@@ -26,7 +26,7 @@ from charlie_work.config import (
 from charlie_work.fleet_dispatch import _CiFleetDirtyCheck
 from charlie_work.notify import NotifyResult
 from charlie_work.supervise import SelfDeployResult
-from charlie_work.workflow import CommandResult
+from charlie_work.command_result import CommandResult
 
 
 #: Where the notify-digest isolation in ``_patch_self_deploy_for_fleet_tests``

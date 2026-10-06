@@ -12,6 +12,7 @@ from typing import Any
 
 from charlie_work.github import GitHubError
 import charlie_work.workflow as _wf
+from charlie_work.command_result import CommandResult
 
 
 def _merge_train_candidates(
@@ -84,7 +85,7 @@ def _merge_deferred_stale_base_result(
     base_ref: str | None,
     head_sha: str | None,
     reason: str = "base_stale",
-) -> _wf.CommandResult:
+) -> CommandResult:
     """Return a non-mergeable result for an approved PR whose base is stale.
 
     Records a ``merge_deferred_stale_base`` event so operators can see that
@@ -136,7 +137,7 @@ def _merge_deferred_stale_base_result(
             "consecutive_stale_base_deferrals": new_stale_base_deferrals,
         }
         _wf.save_state(self.paths.state_file, state)
-    return _wf.CommandResult(
+    return CommandResult(
         True,
         f"PR #{pr_number} base is stale; merge deferred until base is current",
         {

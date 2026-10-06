@@ -15,6 +15,7 @@ from charlie_work.github import GitHubError
 from charlie_work.labels import TransitionOutcome
 from charlie_work.rescue_review import extract_report_body
 import charlie_work.workflow as _wf
+from charlie_work.command_result import CommandResult
 
 
 def _partition_rescue_candidates(
@@ -57,7 +58,7 @@ def _partition_rescue_candidates(
     return normal_candidates, rescue_review_results
 
 
-def _process_rescue_review(self, candidate: dict[str, Any]) -> _wf.CommandResult:
+def _process_rescue_review(self, candidate: dict[str, Any]) -> CommandResult:
     """Run the cross-family rescue review for one rescue-marked PR
     (issue #555) and apply the rescue tier's exit semantics.
 
@@ -92,7 +93,7 @@ def _process_rescue_review(self, candidate: dict[str, Any]) -> _wf.CommandResult
     # avoids the mkdir, the cross-family subprocess, the state/label
     # escalation write, and the PR comment entirely.
     if self.dry_run:
-        return _wf.CommandResult(
+        return CommandResult(
             True,
             f"dry-run: would run rescue review for PR #{pr_number}",
             {
@@ -155,7 +156,7 @@ def _process_rescue_review(self, candidate: dict[str, Any]) -> _wf.CommandResult
             required_changes=verdict["required_changes"],
             verdict_provenance="rescue_review",
         )
-        return _wf.CommandResult(
+        return CommandResult(
             True,
             f"PR #{pr_number} rescue review approved — {result.message}",
             {
@@ -233,7 +234,7 @@ def _process_rescue_review(self, candidate: dict[str, Any]) -> _wf.CommandResult
         self._comment_pr(pr_number, comment_body)
     except GitHubError as exc:
         label_error = {**(label_error or {}), "comment_error": str(exc)}
-    return _wf.CommandResult(
+    return CommandResult(
         True,
         f"PR #{pr_number} rescue review did not approve — escalated to human",
         {

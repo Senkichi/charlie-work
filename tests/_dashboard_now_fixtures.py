@@ -22,7 +22,7 @@ from charlie_work.dashboard.now_types import RepoRead, SourcesRead
 from charlie_work.fleet_registry import touch_repo
 from charlie_work.github import GitHub
 from charlie_work.paths import runtime_paths
-from charlie_work.workflow import CommandResult
+from charlie_work.command_result import CommandResult
 
 NOW = datetime(2026, 10, 1, 12, 0, 0, tzinfo=UTC)
 L = LabelConfig()

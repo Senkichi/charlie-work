@@ -28,7 +28,8 @@ from .instrumentation import log_event
 from .local_issues import github_client_for
 from .pass_deadline import PassDeadlineExceeded, set_pass_deadline_exceeded
 from .paths import runtime_paths
-from .workflow import CommandResult, OrchestratorApp
+from .command_result import CommandResult
+from .workflow import OrchestratorApp
 
 logger = logging.getLogger(__name__)
 
