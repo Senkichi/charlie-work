@@ -27,9 +27,9 @@ counting as a ``sink_census`` root for ``operator_queue_impact`` forever.
 
 (A third lane used to live here: the #1001 worker-GitHub-token dispatch
 probe. Issue #1853 retired it outright -- workers are credential-free by
-design, so a missing ``worker_env`` token is not a defect on ANY backend.
-The publishing-backend control below now asserts the event is never
-emitted even with ``require_worker_github_token=True`` still set.)
+design, so a missing ``worker_env`` token is not a defect on ANY backend --
+and issue #1977 deleted its config flag. The publishing-backend control
+below now asserts the event is never emitted.)
 """
 
 from __future__ import annotations
@@ -46,7 +46,6 @@ import charlie_work.workflow as workflow_module
 from _fakes_github import FakeGitHub
 from charlie_work.config import (
     AutoMergeConfig,
-    DispatchConfig,
     LocalIssuesConfig,
     LocalLaneConfig,
     MainCiReclaimConfig,
@@ -106,14 +105,10 @@ def _init_repo(repo_root: Path) -> None:
 
 def _config(*, local_enabled: bool) -> OrchestratorConfig:
     """Arms every lane this issue gates: ``reconcile_pass`` and
-    ``main_ci_reclaim`` on their production-enabled settings. The retired
-    ``require_worker_github_token`` flag is deliberately left set -- issue
-    #1853 made it a no-op, so even a config that still carries it must
-    dispatch normally with no ``worker_token_missing`` event."""
+    ``main_ci_reclaim`` on their production-enabled settings."""
     return OrchestratorConfig(
         reconcile_pass=ReconcilePassConfig(enabled=True, interval_minutes=30),
         main_ci_reclaim=MainCiReclaimConfig(enabled=True, workflow_filename="ci.yml"),
-        dispatch=DispatchConfig(require_worker_github_token=True),
         worker=WorkerRoleConfig(harness="devin-shell"),
         local_issues=LocalIssuesConfig(enabled=local_enabled, issues_dir="docs/issues"),
     )
@@ -192,10 +187,10 @@ def test_loop_pass_runs_pr_shaped_lanes_on_publishing_backend(
     would be unconditional. Empty issues/PRs keep the pass cheap; both
     gates sit ahead of any candidate fetch.
 
-    Issue #1853 addendum: the retired ``require_worker_github_token=True``
-    in ``_config`` must NOT produce a ``worker_token_missing`` event or a
-    dispatch deferral -- the gate is gone on every backend, publishing or
-    not."""
+    Issue #1977 addendum: the retired token gate's config flag is deleted
+    outright, so no config can produce a ``worker_token_missing`` event or
+    a dispatch deferral -- the gate is gone on every backend, publishing
+    or not."""
     repo_root = tmp_path / "repo"
     _init_repo(repo_root)
     config = _config(local_enabled=False)

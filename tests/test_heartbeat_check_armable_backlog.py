@@ -288,6 +288,16 @@ def _self_repo(hb: ModuleType, tmp_path: Path) -> Any:
 # registry parametrizes zero cases, which pytest reports as skipped.)
 _REGISTRY_REMOVAL_ISSUES = [entry.removal_issue for entry in DEPRECATED_CONFIG_KEYS]
 
+# Issue #1977's registry entry was removed by its own PR -- the exact rot the
+# comment above guards against. The number is pinned here, on top of the live
+# derivation, for two reasons: the collect-only gate (issue #1538) fails a
+# required check when the ``[1977]`` leaf ids vanish, absent the
+# operator-applied ``collect-gate-exempt`` label; and a retired number gives
+# the unarmed test a negative control -- it must land back in the ordinary
+# un-triaged ``armable`` pool, proving the parametrization really does derive
+# from the live registry rather than gating on any stale marker.
+_RETIRED_REMOVAL_ISSUES = (1977,)
+
 
 def test_check_armable_backlog_body_blocked_by_open_issue_is_not_armable(
     hb: ModuleType, monkeypatch: Any, tmp_path: Path
@@ -319,7 +329,7 @@ def test_check_armable_backlog_body_blocker_closed_stays_armable(
     assert "[10]" in report.lines[0]
 
 
-@pytest.mark.parametrize("removal_issue", _REGISTRY_REMOVAL_ISSUES)
+@pytest.mark.parametrize("removal_issue", [*_REGISTRY_REMOVAL_ISSUES, *_RETIRED_REMOVAL_ISSUES])
 def test_check_armable_backlog_unarmed_removal_issue_is_not_armable(
     hb: ModuleType, monkeypatch: Any, tmp_path: Path, removal_issue: int
 ) -> None:
@@ -329,22 +339,40 @@ def test_check_armable_backlog_unarmed_removal_issue_is_not_armable(
     label by hand") and arms them itself once the quiet window elapses; the
     registry is deliberately the only marker (config_deprecations.py), so
     membership in it -- not a label -- is what gates.
+
+    The ``[1977]`` param is a retired ``removal_issue`` (its entry is gone,
+    removed by #1977 itself): the same unlabelled issue is no longer
+    sweep-owned, so it falls into the ordinary un-triaged ``armable`` pool --
+    the branch below pins that contrast. The leaf name predates the removal
+    and is kept verbatim for the collect-only gate (#1538).
     """
     repo = _self_repo(hb, tmp_path)
     issues = [_issue_with_body(removal_issue, "Do not label this issue by hand.")]
     _gh_dispatch(monkeypatch, hb, lambda args, cwd: (True, issues, ""))
     report = hb.Report()
     hb.check_armable_backlog(report, repo, blocked_numbers=set(), blocked_err="")
-    assert not report.anomaly
-    assert "armable=0" in report.lines[0]
-    assert "gated=1" in report.lines[0]
+    if removal_issue in _REGISTRY_REMOVAL_ISSUES:
+        assert not report.anomaly
+        assert "armable=0" in report.lines[0]
+        assert "gated=1" in report.lines[0]
+    else:
+        # Retired entry: not sweep-owned, just un-triaged.
+        assert report.anomaly
+        assert "armable=1" in report.lines[0]
+        assert "gated=0" in report.lines[0]
 
 
-@pytest.mark.parametrize("removal_issue", _REGISTRY_REMOVAL_ISSUES)
+@pytest.mark.parametrize("removal_issue", [*_REGISTRY_REMOVAL_ISSUES, *_RETIRED_REMOVAL_ISSUES])
 def test_check_armable_backlog_armed_removal_issue_counts_as_runway(
     hb: ModuleType, monkeypatch: Any, tmp_path: Path, removal_issue: int
 ) -> None:
-    """Once the sweep marks its removal issue ``automated-ready`` it is runway."""
+    """Once the sweep marks its removal issue ``automated-ready`` it is runway.
+
+    The ``[1977]`` param is a retired ``removal_issue``: armed is armed -- an
+    ``automated-ready`` issue counts as runway whether or not its registry
+    entry still lives. The leaf name predates the removal and is kept
+    verbatim for the collect-only gate (#1538).
+    """
     repo = _self_repo(hb, tmp_path)
     issues = [_issue_with_body(removal_issue, "", ("automated-ready",))]
     _gh_dispatch(monkeypatch, hb, lambda args, cwd: (True, issues, ""))

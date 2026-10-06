@@ -555,13 +555,6 @@ class DispatchConfig:
     # root merely waiting out a slow CI cycle or an overnight review is not
     # paged as stuck.
     dependency_stall_minutes: Annotated[int, Typed, NonNeg] = 1440
-    # Issue #1853: DEPRECATED no-op, kept only so existing config files that
-    # set it still parse. The worker-GitHub-token dispatch gate (issue #1001)
-    # was retired when the operator decided workers stay credential-free by
-    # design — PR mutations flow through ``.worker-outcome.json`` and the
-    # authenticated orchestrator applies them (see ``rework_outcome.py``).
-    # The staged-rollout plan this flag served (issue #1224) is superseded.
-    require_worker_github_token: Annotated[bool, Typed] = False
     # Issue #1944: on a repo with no remote, an agent branch whose commits are
     # unreachable from the default branch can never become "pushed" — there is
     # nowhere to push — so refusing to reset it escalates the issue on every
