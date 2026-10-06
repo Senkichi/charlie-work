@@ -287,3 +287,112 @@ def test_absent_rollup_is_unknown_not_stale_empty_checks() -> None:
         True,
         "stale_empty_checks",
     )
+
+
+def test_rest_failure_is_attempted_and_reported_once_per_pass(tmp_path: Path) -> None:
+    rest_calls: list[Any] = []
+
+    def handler(request: Any) -> Any:
+        if isinstance(request, RestRequest):
+            rest_calls.append(request)
+            return ok({"message": "boom"}, status=500)
+        return graphql_ok({"repository": {"issues": {"nodes": [], "pageInfo": {}}}})
+
+    gh, _http, _ = make_github(tmp_path, http=FakeAdapter("http", handler=handler))
+    state = state_file_path(tmp_path / ".var" / "charlie-work")
+
+    def fallbacks() -> int:
+        events = query_events(state, kind="github_transport_fallback")
+        return sum(1 for e in events if e["payload"]["reason"] == "rest_issue_list_failed")
+
+    gh.issue_list(["a"])
+    attempts_first = len(rest_calls)
+    gh.issue_list(["b"])
+    gh.issue_list(["c"])
+    gh.issue_list(state="open")
+
+    assert attempts_first >= 1
+    assert len(rest_calls) == attempts_first  # no REST retry for later label queries
+    assert fallbacks() == 1
+
+    gh.invalidate_list_cache()  # next pass tries REST again
+    gh.issue_list(["a"])
+    assert len(rest_calls) > attempts_first
+    assert fallbacks() == 2
+
+
+def test_pr_list_with_checks_reads_the_rollup_and_caches_separately(tmp_path: Path) -> None:
+    from _fake_transport import connection_page
+
+    documents: list[str] = []
+
+    def handler(request: Any) -> Any:
+        assert isinstance(request, GraphQLRequest)
+        documents.append(request.document)
+        return connection_page("pullRequests", [])
+
+    gh, _http, _ = make_github(tmp_path, http=FakeAdapter("http", handler=handler))
+
+    gh.pr_list()
+    gh.pr_list_with_checks()
+    gh.pr_list_with_checks()
+    gh.pr_list()
+
+    assert len(documents) == 2  # each variant read once, repeats hit the cache
+    plain, with_checks = documents
+    assert "statusCheckRollup" not in plain
+    assert "statusCheckRollup" in with_checks
+    assert ("pr_list",) in gh._list_cache
+    assert ("pr_list_with_checks",) in gh._list_cache
+
+
+def test_broadcast_update_guard_reads_the_rollup_via_pr_list_with_checks(
+    tmp_path: Path,
+) -> None:
+    """#209 wedge guard: the in-flight required-check skip needs the rollup,
+    which only ``pr_list_with_checks`` carries (#2443). If the broadcast call
+    site reverts to ``pr_list()`` the PR is wrongly updated."""
+    from _fakes_github import FakeGitHub
+    from charlie_work.config import AutoMergeConfig, OrchestratorConfig
+    from charlie_work.paths import runtime_paths
+    from charlie_work.workflow import OrchestratorApp
+
+    row = {
+        "number": 456,
+        "title": "Fix #123: search",
+        "url": "https://example.test/pull/456",
+        "headRefName": "agent/issue-123-fix-search",
+        "headRefOid": "sha-abc123",
+        "mergeStateStatus": "BEHIND",
+        "body": "Closes #123\n\nTests: regression coverage added.",
+        "labels": [],
+        "isCrossRepository": False,
+    }
+    rollup = [
+        {
+            "__typename": "CheckRun",
+            "name": "Tests passed",
+            "status": "IN_PROGRESS",
+            "conclusion": "",
+        }
+    ]
+
+    class SplitListGitHub(FakeGitHub):
+        def pr_list(self):
+            return [dict(row)]  # no statusCheckRollup, like the real narrow list
+
+        def pr_list_with_checks(self):
+            return [{**row, "statusCheckRollup": rollup}]
+
+    config = OrchestratorConfig(
+        auto_merge=AutoMergeConfig(required_checks=("Tests passed",), update_open_prs=True)
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake = SplitListGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake)
+
+    results = app._update_open_agent_prs(merged_pr_number=999)
+
+    assert [r["skipped_reason"] for r in results] == ["pending-required-checks"]
+    assert results[0]["updated"] is False
+    assert fake.pr_update_branch_calls == []

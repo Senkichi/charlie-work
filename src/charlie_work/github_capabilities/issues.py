@@ -348,13 +348,17 @@ class Issues(CapabilityCollaborator):
             # label-specific query is a local filter over it. A REST failure
             # falls back to the GraphQL read below, per call, with an event.
             base_key = ("issue_list", "open", ())
+            failed_key = ("issue_list", "open", "rest_failed")
             all_open = self._list_cache.get(base_key)
-            if all_open is None:
+            if all_open is None and failed_key not in self._list_cache:
                 try:
                     all_open = fetch_open_issues(self)
                 except GitHubError as exc:
                     logger.warning("REST open-issue list failed, using GraphQL: %s", exc)
                     emit_fallback(self, exc)
+                    # Per-pass marker: one REST attempt and one event per pass,
+                    # not one per label query (the cache is cleared each pass).
+                    self._list_cache[failed_key] = True
                 else:
                     self._list_cache[base_key] = all_open
             if all_open is not None:
