@@ -1,7 +1,7 @@
 """``mergequeue_stalled``: one alarm per episode of a PR sitting in the merge queue too long (#2441).
 
 A PR handed to the merge queue carries ``auto_merge.mergequeue_label`` until the
-queue merges it. On 2026-10-06 ci_runners PRs held the label for hours and never
+queue merges it. On 2026-10-06 several PRs held the label for hours and never
 merged, with nothing to say so. The #1401 wedge watchdog (``reconcile``) acts at
 24h by escalating; this is the early, non-destructive signal.
 

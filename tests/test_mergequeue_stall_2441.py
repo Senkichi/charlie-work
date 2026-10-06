@@ -21,7 +21,7 @@ from charlie_work.paths import runtime_paths
 from charlie_work.state import load_state, save_state
 from charlie_work.workflow import OrchestratorApp
 
-# ci_runners #169 entered the queue at ~04:42Z on 2026-10-06 and never merged.
+# Fixture: PR 169 of a fleet repo entered the queue at ~04:42Z on 2026-10-06 and never merged.
 QUEUED_AT = datetime(2026, 10, 6, 4, 42, 30, tzinfo=UTC)
 ENTRY = {
     "number": 169,
@@ -43,7 +43,7 @@ def _since(now: datetime, **over: Any) -> datetime | None:
     return stalled_since(**kwargs)
 
 
-def test_alarm_would_have_fired_for_ci_runners_169_at_0643z() -> None:
+def test_alarm_would_have_fired_for_pr_169_at_0643z() -> None:
     # Queued 04:42:30Z + 2h = 06:42:30Z: silent just before, fires by 06:43Z.
     assert _since(datetime(2026, 10, 6, 6, 42, 0, tzinfo=UTC)) is None
     assert _since(datetime(2026, 10, 6, 6, 43, 0, tzinfo=UTC)) == QUEUED_AT
