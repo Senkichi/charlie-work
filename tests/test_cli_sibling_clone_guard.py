@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from _cli_fixtures import _FakeGitHub
+from _worktree_fixtures import _init_repo
 from charlie_work import cli
 from charlie_work.config import (
     ConfigError,
@@ -30,17 +31,14 @@ def _init_git_repo_with_origin(root: Path, remote_url: str) -> Path:
     """Create a real git repo with one commit and an ``origin`` remote."""
     import subprocess
 
-    root.mkdir(parents=True, exist_ok=True)
-    run = lambda args: subprocess.run(  # noqa: E731
-        args, cwd=root, check=True, capture_output=True, text=True
+    _init_repo(root)
+    subprocess.run(
+        ["git", "remote", "add", "origin", remote_url],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
     )
-    run(["git", "init", "--initial-branch=main"])
-    run(["git", "config", "user.email", "test@example.test"])
-    run(["git", "config", "user.name", "Test User"])
-    (root / "README.md").write_text("hello\n", encoding="utf-8")
-    run(["git", "add", "README.md"])
-    run(["git", "commit", "-m", "initial commit"])
-    run(["git", "remote", "add", "origin", remote_url])
     return root
 
 
@@ -69,6 +67,29 @@ def _make_sibling_clone_ctx(sibling_root: Path, config: OrchestratorConfig) -> c
     paths = runtime_paths(sibling_root, config.runtime.state_dir)
     gh = GitHub(repo_root=sibling_root, runtime=config.runtime, dry_run=True)
     return cli.CommandContext(repo_root=sibling_root, config=config, paths=paths, gh=gh)
+
+
+def test_init_git_repo_with_origin_goes_through_git_template(tmp_path: Path) -> None:
+    """Issue #2345: the sibling-clone repo builder must materialize through the
+    per-process ``plain`` git template (``_git_templates``, HS-CW-4) instead of
+    re-running the six-process init sequence per call — the ledger measured
+    this module's tests at ~2x baseline because each repo paid the full spawn
+    cost on Windows CI. The one remaining spawn is ``git remote add``, whose
+    URL is parameterized per call and so cannot live in the template."""
+    import subprocess
+
+    import _git_templates
+
+    remote_url = "https://github.com/test/canonical.git"
+    before = _git_templates._REGISTRY.materialized["plain"]
+    repo = _init_git_repo_with_origin(tmp_path / "repo", remote_url)
+    assert _git_templates._REGISTRY.materialized["plain"] == before + 1
+
+    run = lambda args: subprocess.run(  # noqa: E731
+        args, cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    assert run(["git", "remote", "get-url", "origin"]) == remote_url
+    assert run(["git", "rev-parse", "--verify", "main"])
 
 
 def test_sibling_clone_verdict_refused(tmp_path: Path) -> None:
@@ -281,10 +302,8 @@ def test_guard_fails_open_for_no_origin_remote(tmp_path: Path) -> None:
     """Issue #1376: when the repo has no ``origin`` remote (or a non-GitHub
     URL), ``nameWithOwner`` cannot be resolved and the guard must allow the
     command — the guard is for GitHub-fleet repos, not arbitrary checkouts."""
-    from _helpers import _init_git_repo
-
     repo = tmp_path / "no-remote"
-    _init_git_repo(repo)
+    _init_repo(repo)
 
     fleet_dir = tmp_path / "fleet"
     _write_fleet_registry(
