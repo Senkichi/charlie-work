@@ -1,0 +1,82 @@
+name: ci-fleet bisect
+
+# Dispatched by the hourly nightly triage (ci-fleet's collector step 90) for a
+# nightly break: classifies it (isolation / environment / culprit) and finds
+# the culprit commit. workflow_dispatch only, so this is never a second
+# nightly. The run name and the artifact name carry the break id; the triage
+# poller finds this run by its name and downloads its result by artifact name.
+run-name: ci-fleet-bisect break-${{ inputs.break_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      good:
+        description: last green nightly sha
+        required: true
+        type: string
+      bad:
+        description: the failing nightly's sha
+        required: true
+        type: string
+      nodeids:
+        description: failing test ids, space-separated (at most 50)
+        required: true
+        type: string
+      seed:
+        description: the nightly's pytest-randomly seed, if any
+        required: false
+        default: ''
+        type: string
+      break_id:
+        description: nightly_breaks.break_id
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-fleet-bisect-${{ inputs.break_id }}
+  cancel-in-progress: false
+
+jobs:
+  Bisect:
+    name: Bisect
+    runs-on: windows-latest
+    # ci-fleet's own bound is 4 h (BISECT_TIMEOUT_S); this one only frees the
+    # runner if that bound fails.
+    timeout-minutes: 270
+    env:
+      # Each step's sync goes to the checkout's .venv, never uvx's tool env.
+      UV_PROJECT_ENVIRONMENT: '.venv'
+      # A bisect step's pytest run is not a ledger run.
+      CI_FLEET_LEDGER: 'off'
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+
+      # The driver comes from PyPI: bisect checks out commits whose venv may
+      # predate the bisect module. Each step syncs the commit under test as
+      # the shards' "Install dependencies" does (pytest is in an extra).
+      # Inputs reach the shell only through env, never by template expansion.
+      - name: Bisect
+        env:
+          GOOD: ${{ inputs.good }}
+          BAD: ${{ inputs.bad }}
+          NODEIDS: ${{ inputs.nodeids }}
+          SEED: ${{ inputs.seed }}
+        run: |
+          $nodeids = @($env:NODEIDS -split ' ' | Where-Object { $_ })
+          $seed = @()
+          if ($env:SEED) { $seed = @('--seed', $env:SEED) }
+          uvx --from "ci-fleet~=0.7.0" ci-fleet nightly bisect --good $env:GOOD --bad $env:BAD --nodeids @nodeids @seed --sync "uv sync --frozen --all-extras" --out ci-fleet-bisect
+
+      - name: Upload the result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-fleet-bisect-${{ inputs.break_id }}
+          path: ci-fleet-bisect/
+          retention-days: 30
