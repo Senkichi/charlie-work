@@ -56,6 +56,7 @@ from typing import Any
 import charlie_work.workflow as _wf
 from charlie_work import local_suite_runner
 from charlie_work.local_approval_carry import approval_survives_head_move
+from charlie_work.ledger_context import ledger_env
 from charlie_work.test_slots import ROLE_GATE, arm_env
 from charlie_work.local_gate_infra import (
     LOCAL_SUITE_GATE_MAX_INFRA_RELAUNCHES,  # noqa: F401  (re-export; defined with the classifier)
@@ -789,7 +790,11 @@ def _local_gate_launch(
         head_sha=gate_head or "",
         base_sha=gate_base,
         # Issue #2124: the gate draws the reserved slot 0, never an agent slot.
-        env={**os.environ, **arm_env(self.config.test_slots, role=ROLE_GATE)},
+        env={
+            **os.environ,
+            **arm_env(self.config.test_slots, role=ROLE_GATE),
+            **ledger_env("gate", issue_number),
+        },
     )
     if not launch.ok:
         detail = f"suite runner failed to spawn: {launch.error}"

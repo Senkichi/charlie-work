@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any
 
 from charlie_work import process_utils as _process_utils
+from charlie_work.ledger_context import ledger_env
 from charlie_work.process_utils import (
     CpuPriority,
     popen_worker,
@@ -1282,7 +1283,10 @@ def launch_claude_worker(
         return _write_record(sessions_dir, record)
     # Issue #2096: harness defaults (background tasks off) sit between the
     # sanitized base and the operator `worker_env`.
-    worker_env = build_worker_env(sanitized_env, env)
+    # Test-ledger context: tags this worker's pytest runs; an operator worker_env key wins.
+    worker_env = build_worker_env(
+        sanitized_env, {**ledger_env("worker", issue_number), **(env or {})}
+    )
     # Issue #646: resolve what sanitize_env()+worker_env actually settled on,
     # purely for the launch-time diagnostic log below (does not affect
     # worker_env itself, which already carries the real values).
