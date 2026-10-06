@@ -98,7 +98,10 @@ ALPHA = {
     "backlog_reachability": {
         "observed": True,
         "dispatchable": 2,
-        "missing_ready": 4,
+        "missing_ready": 1,
+        # Issue #2314: parked_unready is not Ready either, so it must stay out
+        # of the "Ready but not dispatchable" breakdown alongside missing_ready.
+        "parked_unready": 3,
         "terminal_label": 2,
         "active_label": 3,
         "operator_claimed": 1,

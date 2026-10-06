@@ -360,6 +360,7 @@ def _dispatch(ev: dict) -> list[Row]:
             "dispatchable": _int(br.get("dispatchable")),
             "active_label": _int(br.get("active_label")),
             "missing_ready": _int(br.get("missing_ready")),
+            "parked_unready": _int(br.get("parked_unready")),
             "terminal_label": _int(br.get("terminal_label")),
             "blocked_by_open_dependency": _int(br.get("blocked_by_open_dependency")),
             "operator_claimed": _int(br.get("operator_claimed")),
