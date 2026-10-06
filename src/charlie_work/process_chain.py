@@ -123,6 +123,48 @@ def _optional_bulk_ppid_map() -> dict[int, int] | None:
         return None
 
 
+def _bulk_create_time_map() -> dict[int, float | None] | None:
+    """``pid -> creation time`` for every process via ``cext.proc_times``.
+
+    Asking ``process_iter`` for a ``create_time`` column is cheap only
+    while every ``OpenProcess`` succeeds: psutil's ``Process.create_time``
+    answers ``AccessDenied`` with ``proc_info(pid)`` -- a full
+    ``NtQuerySystemInformation`` table walk *per denied process* (~1.7 ms
+    each, so the ~150-200 protected pids on a busy host turn a ~10 ms
+    snapshot into a ~1 s one; that is the cost issue #2372's ledger
+    report measured in
+    ``test_win32_process_ppid_snapshot_real_rows_carry_creation_times``).
+    ``cext.proc_times`` is the fast leg of that same call -- the one
+    ``Process.__init__``'s identity probe uses as
+    ``create_time(fast_only=True)`` -- returning
+    ``(user, kernel, create_time)`` in ~5 us per pid, so the whole table
+    costs single-digit milliseconds. A denied open (``PermissionError``)
+    keeps the row with a ``None`` stamp -- the snapshot's documented
+    unknown-stamp rule -- and a mid-scan exit (``ProcessLookupError``)
+    drops the row the same way ``process_iter`` removes a gone pid.
+
+    Returns ``None`` where the platform ships no ``cext.proc_times`` --
+    the snapshot's ``process_iter`` leg remains the correct (slower)
+    fallback there.
+    """
+    cext = getattr(getattr(psutil, "_psplatform", None), "cext", None)
+    proc_times = getattr(cext, "proc_times", None)
+    if proc_times is None:
+        return None
+    times: dict[int, float | None] = {}
+    for pid in psutil.pids():
+        try:
+            _user, _system, created = proc_times(pid)
+        except ProcessLookupError:
+            continue
+        except (psutil.Error, OSError):
+            stamp: float | None = None
+        else:
+            stamp = float(created) if isinstance(created, (int, float)) else None
+        times[int(pid)] = stamp
+    return times
+
+
 def win32_process_ppid_snapshot() -> dict[int, ProcRow]:
     """Snapshot ``pid -> (ppid, creation time)`` for every process via ``psutil``.
 
@@ -138,8 +180,11 @@ def win32_process_ppid_snapshot() -> dict[int, ProcRow]:
     a DST transition -- enough to make a real parent look *newer* than its
     child, stop the ancestor walk early, and unprotect a real ancestor (the
     dangerous direction). ``psutil`` is a declared dependency: the ppid column
-    comes from one bulk ``ppid_map`` call and the creation stamp from one
-    ``process_iter`` pass, gathered rapidly with no
+    comes from one bulk ``ppid_map`` call and the creation stamp from the
+    per-pid ``cext.proc_times`` table ``_bulk_create_time_map`` builds (the
+    ``process_iter`` ``create_time`` column pays a per-denied-process
+    ``NtQuerySystemInformation`` walk -- see that helper), so the gather is
+    rapid, with no
     PowerShell spawn, no JSON round-trip, and no 10s timeout to stall the
     kill path (``kill_process_tree`` / ``kill_orphan_pid``). A process whose
     creation time is unreadable (``AccessDenied`` -> ``None``) simply keeps
@@ -155,17 +200,19 @@ def win32_process_ppid_snapshot() -> dict[int, ProcRow]:
     ppid_by_pid: dict[int, ProcRow] = {}
     try:
         ppids = _bulk_ppid_map()
-        for proc in psutil.process_iter(["pid", "create_time"]):
-            info = proc.info
-            try:
-                pid = int(info["pid"])
-            except (KeyError, TypeError, ValueError):
-                continue
-            created = info.get("create_time")
-            ppid_by_pid[pid] = ProcRow(
-                int(ppids.get(pid) or 0),
-                float(created) if isinstance(created, (int, float)) else None,
-            )
+        created_by_pid = _bulk_create_time_map()
+        if created_by_pid is None:
+            created_by_pid = {}
+            for proc in psutil.process_iter(["pid", "create_time"]):
+                info = proc.info
+                try:
+                    pid = int(info["pid"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                created = info.get("create_time")
+                created_by_pid[pid] = float(created) if isinstance(created, (int, float)) else None
+        for pid, created in created_by_pid.items():
+            ppid_by_pid[pid] = ProcRow(int(ppids.get(pid) or 0), created)
     except (psutil.Error, OSError):
         logger.warning("psutil process snapshot failed", exc_info=True)
         return {}
