@@ -293,6 +293,18 @@ def _isolate_fleet_registry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
 
 
 @pytest.fixture(autouse=True)
+def _isolate_host_io_manifest(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Point ci-fleet's host I/O manifest at a per-test path that does not exist.
+
+    On a host provisioned for fast I/O, the default manifest is real, and any
+    test that resolves the worktrees root (``paths.resolved_layout``) would put
+    worktrees on that host's volume. ``host_io_worker`` tests write their own
+    manifest at this path. Control: ``test_the_suite_never_reads_the_hosts_manifest``.
+    """
+    monkeypatch.setenv("CI_FLEET_HOST_IO_MANIFEST", str(tmp_path / "host-io" / "host-io.json"))
+
+
+@pytest.fixture(autouse=True)
 def _reset_markdown_guard_sink() -> Iterator[None]:
     """Unbind the ambient ``markdown_guard`` disagreement sink around every test.
 

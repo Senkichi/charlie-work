@@ -11,7 +11,9 @@ from __future__ import annotations
 
 from dataclasses import replace as dataclasses_replace
 
+from charlie_work import host_io_worker
 from charlie_work.adapters import AdapterSettings
+from charlie_work.fleet_paths import fleet_dir
 from charlie_work.test_slots import ROLE_AGENT, arm_env
 
 
@@ -41,7 +43,16 @@ def _adapter_settings(self, *, adapter: str | None = None) -> AdapterSettings:
         venv_source = None
         worker_env = {}
     # Issue #2124: arm the host test-slot plugin; an operator worker_env key wins.
-    worker_env = {**arm_env(self.config.test_slots, role=ROLE_AGENT), **worker_env}
+    # The host I/O layer (UV_CACHE_DIR on the worker volume) sits under both.
+    worker_io = self._layout.worker_io.io
+    worker_env = {
+        **host_io_worker.worker_env(worker_io),
+        **arm_env(self.config.test_slots, role=ROLE_AGENT),
+        **worker_env,
+    }
+    host_io_worker.record_cutover(
+        fleet_dir(override=self.fleet_dir_override), worker_io, dry_run=self.dry_run
+    )
     return AdapterSettings(
         adapter=resolved_adapter,
         dispatch_command=devin.dispatch_command,
@@ -107,7 +118,11 @@ def _rescue_adapter_settings(self) -> AdapterSettings:
         claude_command=claude.command,
         worktrees_dir=self._layout.worktrees,
         venv_source=self._resolve(claude.venv_source) if claude.venv_source else None,
-        worker_env={**arm_env(self.config.test_slots, role=ROLE_AGENT), **claude.worker_env},
+        worker_env={
+            **host_io_worker.worker_env(self._layout.worker_io.io),
+            **arm_env(self.config.test_slots, role=ROLE_AGENT),
+            **claude.worker_env,
+        },
         materialize_dirs=self.config.dispatch.materialize_dirs,
         dry_run=self.dry_run,
         base_ref=self.config.dispatch.base_ref,

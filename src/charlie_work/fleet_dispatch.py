@@ -73,7 +73,7 @@ from .notify_freshness import (
     report_notify_resolution,
     resolve_fleet_notify,
 )
-from .paths import runtime_paths
+from .paths import runtime_paths, worktree_roots
 from .venv_anchor import verify_interpreter_anchored_editables
 from .ci_fleet_anchor import ci_fleet_provenance_payload, ci_fleet_provenance_snapshot
 from .supervise import (
@@ -2569,10 +2569,10 @@ def _repo_state_dirs(
 ) -> tuple[Path, Path, Path]:
     """Return the (sessions_dir, prs_dir, worktrees_dir) for a repo given its state dir.
 
-    Honors ``devin.sessions_dir`` / ``claude_code.worktrees_dir`` when a
-    resolved config is provided, falling back to the layout defaults
-    otherwise -- mirroring ``paths.resolved_layout``'s sentinel-override
-    handling for the same two fields.
+    Honors ``devin.sessions_dir`` when a resolved config is provided, and
+    takes the worktrees root from ``paths.worktree_roots`` (the same function
+    ``paths.resolved_layout`` uses, so the host I/O volume is seen here too);
+    without a config both fall back to the layout defaults.
     """
     default_sessions_dir = layout.sessions_dir_default(state_dir)
     default_worktrees_dir = layout.worktrees_dir(state_dir)
@@ -2582,11 +2582,7 @@ def _repo_state_dirs(
             repo_root=repo_root,
             default=default_sessions_dir,
         )
-        worktrees_dir = layout.resolve_state_child(
-            config.claude_code.worktrees_dir or "",
-            repo_root=repo_root,
-            default=default_worktrees_dir,
-        )
+        worktrees_dir = worktree_roots(config, repo_root, state_dir).active
     else:
         sessions_dir = default_sessions_dir
         worktrees_dir = default_worktrees_dir

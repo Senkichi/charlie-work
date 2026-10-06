@@ -122,6 +122,7 @@ from .worktree import (
     worktree_head_sha,  # noqa: F401  (deliberate re-export; dead_worker_sweep.ports resolves it here at call time)
     worktree_path_for_branch,  # noqa: F401  (deliberate re-export; reached via _wf. by orchestration/state_*.py)
     clean_worktrees,  # noqa: F401  (deliberate re-export; used by moved L01 b3 delegates via _wf.)
+    merge_clean_results,  # noqa: F401  (deliberate re-export; used by moved L01 b3 delegates via _wf.)
     read_worktree_marker,
     remove_review_checkout,  # noqa: F401  (deliberate re-export; patched on the workflow module and reached via _wf. by orchestration/misc_review_verdicts.py)
     remove_worktree_marker,  # noqa: F401  (deliberate re-export; used by moved L01 b4 delegates via _wf.)

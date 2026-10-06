@@ -208,14 +208,19 @@ def _maybe_reclaim_worktrees(self, *, now: datetime | None = None) -> dict[str, 
     # that duplication across call sites is the exact shape of bug
     # layout.py's module docstring documents as a past production
     # incident (create and sweep sides silently disagreeing on the root).
+    # sweep_roots() adds the pre-volume root while it still has entries, so
+    # worktrees created before the host I/O switch are still reaped.
     state = _wf.load_state_locked(state_file)
-    result = _wf.clean_worktrees(
-        self.repo_root,
-        self._layout.worktrees,
-        state,
-        self.config,
-        self.gh,
-        dry_run=self.dry_run,
+    result = _wf.merge_clean_results(
+        [
+            (
+                root,
+                _wf.clean_worktrees(
+                    self.repo_root, root, state, self.config, self.gh, dry_run=self.dry_run
+                ),
+            )
+            for root in self._layout.sweep_roots()
+        ]
     )
     orphans = result.data.get("orphans", {})
     skipped_full = result.data.get("skipped", [])
