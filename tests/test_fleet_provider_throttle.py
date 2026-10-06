@@ -163,3 +163,81 @@ def test_probe_in_flight_defers_rework_in_other_repo(tmp_path: Path) -> None:
 
     assert result.ok is False
     assert result.data["deferred_reason"] == "provider_resume_staggered"
+
+
+def _chained_selection(now: datetime):
+    """Selection over [primary, fallback] where the fallback is ledger-restricted."""
+    from charlie_work import role_selection
+    from charlie_work.role_chain import RoleEntry
+
+    primary = RoleEntry("devin-shell", "swe-2-high")
+    fallback = RoleEntry("devin-shell", "gemini-flash")
+    return (
+        primary,
+        fallback,
+        role_selection.build_selection(
+            [primary, fallback],
+            {fallback.key: now + timedelta(hours=1)},
+            now,
+        ),
+    )
+
+
+def test_stamped_window_covered_by_ledger_does_not_gate(tmp_path: Path) -> None:
+    """Issue #2279 meets #1993: a window stamped with the role-chain entry
+    whose quota death produced it is a per-entry hold the ledger already
+    covers -- not an account hold. A launch the selection routed to the
+    recovered primary must not defer on it."""
+    now = datetime.now(UTC)
+    _, paths_a, _ = _repo(tmp_path, "a", "devin-shell")
+    _primary, fallback, selection = _chained_selection(now)
+    state = set_throttled_until(
+        load_state(paths_a.state_file),
+        _iso(now + timedelta(hours=1)),
+        reason="rate_limited",
+        adapter_kind="devin",
+        harness=fallback.harness,
+        model=fallback.model,
+        source="test",
+    )
+    save_state(paths_a.state_file, state)
+    assert selection.entry == _primary  # primary recovered; fallback restricted
+
+    assert fpt.latest_fleet_throttle([paths_a.state_file], "devin", selection=selection) is None
+
+
+def test_unstamped_window_still_gates_the_selected_adapter(tmp_path: Path) -> None:
+    """Counter-case: an unstamped window (operator hold, pre-ledger session)
+    attributes to no chain entry, so the fleet gate still honours it."""
+    now = datetime.now(UTC)
+    _, paths_a, _ = _repo(tmp_path, "a", "devin-shell")
+    _primary, _fallback, selection = _chained_selection(now)
+    _throttle(paths_a, until=now + timedelta(hours=1))
+
+    latest = fpt.latest_fleet_throttle([paths_a.state_file], "devin", selection=selection)
+
+    assert latest is not None and latest.replace(microsecond=0) == (
+        now + timedelta(hours=1)
+    ).replace(microsecond=0)
+
+
+def test_window_stamped_with_the_selected_entry_still_gates(tmp_path: Path) -> None:
+    """Counter-case: a stamp naming the selected entry itself is that entry's
+    own death window -- never covered, still gates."""
+    now = datetime.now(UTC)
+    _, paths_a, _ = _repo(tmp_path, "a", "devin-shell")
+    primary, _fallback, selection = _chained_selection(now)
+    state = set_throttled_until(
+        load_state(paths_a.state_file),
+        _iso(now + timedelta(hours=1)),
+        reason="rate_limited",
+        adapter_kind="devin",
+        harness=primary.harness,
+        model=primary.model,
+        source="test",
+    )
+    save_state(paths_a.state_file, state)
+
+    assert (
+        fpt.latest_fleet_throttle([paths_a.state_file], "devin", selection=selection) is not None
+    )

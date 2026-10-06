@@ -134,23 +134,46 @@ def _read_json(path: Path) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
-def latest_fleet_throttle(state_files: Iterable[Path], adapter_kind: str) -> datetime | None:
+def latest_fleet_throttle(
+    state_files: Iterable[Path], adapter_kind: str, *, selection: Any = None
+) -> datetime | None:
     """Return the latest fleet-scoped throttle deadline for ``adapter_kind``.
 
     Scans each ``state.json`` (missing/corrupt files are skipped -- additive
     evidence, never load-bearing) and returns the max ``throttled_until`` over
     windows whose reason is account-wide and whose recorded adapter matches.
     The deadline may already be in the past; callers decide what expiry means.
+
+    When ``selection`` is the launch's role-chain selection, a window the
+    fleet-wide quota ledger explains (:func:`role_selection.window_covered` --
+    a ``throttle_harness``/``throttle_model`` stamp attributable to a
+    restricted entry other than the selected one, issue #2279) is a per-entry
+    hold, not an account hold, and does not count.
     """
+    from . import role_selection
+
     latest: datetime | None = None
     for path in state_files:
         data = _read_json(path)
-        if data.get("throttle_reason") not in FLEET_SCOPED_THROTTLE_REASONS:
+        reason = data.get("throttle_reason")
+        if reason not in FLEET_SCOPED_THROTTLE_REASONS:
             continue
-        if (data.get("throttle_adapter_kind") or _DEFAULT_ADAPTER_KIND) != adapter_kind:
+        window_adapter = data.get("throttle_adapter_kind") or _DEFAULT_ADAPTER_KIND
+        if window_adapter != adapter_kind:
             continue
         until = _parse_iso(data.get("throttled_until"))
-        if until is not None and (latest is None or until > latest):
+        if until is None:
+            continue
+        if selection is not None and role_selection.window_covered(
+            data.get("throttled_until"),
+            selection,
+            reason=reason,
+            adapter_kind=window_adapter,
+            harness=data.get("throttle_harness"),
+            model=data.get("throttle_model"),
+        ):
+            continue
+        if latest is None or until > latest:
             latest = until
     return latest
 
@@ -163,12 +186,13 @@ def decide_launch(
     state_files: Iterable[Path],
     adapter_kind: str,
     *,
+    selection: Any = None,
     fleet_dir_override: str | None = None,
     now: datetime | None = None,
 ) -> ResumeDecision:
     """Decide whether a launch for ``adapter_kind`` may proceed fleet-wide."""
     resolved_now = now if now is not None else datetime.now(UTC)
-    latest = latest_fleet_throttle(state_files, adapter_kind)
+    latest = latest_fleet_throttle(state_files, adapter_kind, selection=selection)
     if latest is None:
         return ResumeDecision("open")
     if latest > resolved_now:
@@ -212,6 +236,8 @@ def _write_probe_entry(
         with advisory_file_lock(path):
             data = _read_json(path)
             data[adapter_kind] = entry
+            # Fleet-dir probe sidecar, not the repo state file a WriteGate binds.
+            # write-gate-exempt(issue=1993): module-level helper, no write_gate receiver.
             save_state(path, data)
     except (OSError, RuntimeError) as exc:
         # Best effort: a lost stamp only means the next pass admits another
@@ -309,7 +335,13 @@ def decide_for_app(
     if adapter_kind is None:
         adapter_kind = worker_adapter_kind(app.config.worker.harness)
     decision = replace(
-        decide_launch(state_files, adapter_kind, fleet_dir_override=override, now=now),
+        decide_launch(
+            state_files,
+            adapter_kind,
+            selection=selection,
+            fleet_dir_override=override,
+            now=now,
+        ),
         adapter_kind=adapter_kind,
     )
     if decision.probe_survived:

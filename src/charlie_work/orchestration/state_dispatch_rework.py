@@ -215,12 +215,10 @@ def _dispatch_rework_impl(
     gov = permit.governor
     rework_limit = permit.max_launches
 
-    # Issue #1993: fleet-wide window + staggered resume for this worker adapter.
     resume = fleet_provider_throttle.decide_for_app(self, selection=permit.role_selection)
     if resume.deferred:
         data = {"adapter": self.config.worker.harness, "selected_count": 0}
-        if gov.any_term_enabled:
-            data.update(gov.report_fields())
+        data.update(gov.report_fields() if gov.any_term_enabled else {})
         return resume.deferred_result("rework dispatch", data)
     rework_limit = resume.cap_limit(rework_limit)
 
