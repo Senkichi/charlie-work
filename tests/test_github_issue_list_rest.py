@@ -269,8 +269,9 @@ def test_pr_list_drops_the_status_check_rollup_but_with_checks_keeps_it() -> Non
     )
 
     assert "statusCheckRollup" not in PR_LIST_FIELDS.split(",")
-    assert PR_LIST_WITH_CHECKS_FIELDS.split(",")[-1] == "statusCheckRollup"
-    assert PR_LIST_WITH_CHECKS_FIELDS.startswith(PR_LIST_FIELDS)
+    with_checks = PR_LIST_WITH_CHECKS_FIELDS.split(",")
+    assert "statusCheckRollup" in with_checks
+    assert [f for f in with_checks if f != "statusCheckRollup"] == PR_LIST_FIELDS.split(",")
 
 
 def test_absent_rollup_is_unknown_not_stale_empty_checks() -> None:
