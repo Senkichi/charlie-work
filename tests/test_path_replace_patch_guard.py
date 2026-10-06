@@ -26,7 +26,8 @@ from __future__ import annotations
 
 import re
 import subprocess
-from collections.abc import Iterator
+import sys
+from collections.abc import Iterable, Iterator
 from pathlib import Path
 
 import pytest
@@ -95,13 +96,26 @@ def _git_prefilter_lines() -> list[tuple[str, int, str]] | None:
         return []
     if proc.returncode != 0:
         return None
+    return _parse_prefilter_rows(proc.stdout)
+
+
+def _parse_prefilter_rows(stdout: str) -> list[tuple[str, int, str]]:
+    """Split ``git grep -z`` output into ``(path, lineno, text)`` rows.
+
+    Records end at ``\\n`` only. ``str.splitlines()`` would also cut at
+    ``\\x0b``/``\\x0c``/``\\x1c``-``\\x1e``/``\\x85``/``\\u2028``/``\\u2029``
+    inside a line's text, orphaning the record's tail — and any banned
+    spelling in it — onto a fragment with no NUL fields that is then
+    skipped. A ``\\r`` ahead of the record newline is the line's own CRLF
+    ending, not content, so it is stripped.
+    """
     rows = []
-    for record in proc.stdout.splitlines():
+    for record in stdout.split("\n"):
         path, sep_path, rest = record.partition("\0")
         lineno, sep_lineno, text = rest.partition("\0")
         if not (sep_path and sep_lineno and lineno.isdigit()):
             continue
-        rows.append((path, int(lineno), text))
+        rows.append((path, int(lineno), text.removesuffix("\r")))
     return rows
 
 
@@ -111,6 +125,23 @@ def _disk_scan_lines() -> Iterator[tuple[str, int, str]]:
         rel = file.relative_to(TESTS_DIR.parent).as_posix()
         for lineno, line in enumerate(file.read_text(encoding="utf-8").splitlines(), 1):
             yield rel, lineno, line
+
+
+def _scan_rows() -> Iterable[tuple[str, int, str]]:
+    """(path, lineno, text) rows from ``git grep``, or the read-all path."""
+    rows = _git_prefilter_lines()
+    if rows is None:
+        rows = _disk_scan_lines()
+    return rows
+
+
+def _offenders(rows: Iterable[tuple[str, int, str]]) -> list[str]:
+    """``path:lineno`` for every row carrying a raw class-wide patch."""
+    return [
+        f"{rel}:{lineno}"
+        for rel, lineno, line in rows
+        if rel.rsplit("/", 1)[-1] not in _EXEMPT_FILENAMES and _RAW_PATCH.search(line)
+    ]
 
 
 def test_guard_detects_each_raw_spelling() -> None:
@@ -151,15 +182,46 @@ def test_git_prefilter_is_not_vacuous() -> None:
     assert any(rel.endswith("/conftest.py") for rel, _, _ in rows)
 
 
+@pytest.mark.parametrize(
+    "boundary",
+    ["\x0b", "\x0c", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029", "\r"],
+)
+def test_prefilter_rows_split_records_on_lf_only(boundary: str) -> None:
+    """A line-boundary char inside a line's text must not fragment the record.
+
+    ``str.splitlines()`` splits on every one of these; the tail of a
+    record carrying a banned spelling after one would land on a fragment
+    with no NUL fields and be silently skipped. The banned spelling is
+    concatenated so it never appears literally in this file.
+    """
+    banned = "monkeypatch.setattr(" + "Path, " + '"replace"' + ", fake)"
+    text = f"prefix{boundary}{banned}"
+    rows = _parse_prefilter_rows(f"tests/t_mod.py\0{7}\0{text}\n")
+    assert rows == [("tests/t_mod.py", 7, text)]
+    assert _RAW_PATCH.search(rows[0][2])
+
+
+def test_prefilter_rows_strip_crlf_line_endings() -> None:
+    """On a CRLF checkout each record's text ends in ``\\r`` — strip it."""
+    rows = _parse_prefilter_rows("tests/t_mod.py\0" + "3\0line text\r\n")
+    assert rows == [("tests/t_mod.py", 3, "line text")]
+
+
+def test_disk_fallback_covers_the_same_lines_and_offenders(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The read-all path must see every line and offender the git path does."""
+    git_rows = _git_prefilter_lines()
+    if git_rows is None:
+        pytest.skip("git cannot scan this tree")
+    monkeypatch.setattr(sys.modules[__name__], "_git_prefilter_lines", lambda: None)
+    fallback_rows = list(_scan_rows())
+    assert {(rel, n) for rel, n, _ in git_rows} <= {(rel, n) for rel, n, _ in fallback_rows}
+    assert _offenders(fallback_rows) == _offenders(git_rows)
+
+
 def test_no_raw_class_wide_path_replace_patch_in_tests() -> None:
-    rows = _git_prefilter_lines()
-    if rows is None:
-        rows = _disk_scan_lines()
-    offenders = [
-        f"{rel}:{lineno}"
-        for rel, lineno, line in rows
-        if rel.rsplit("/", 1)[-1] not in _EXEMPT_FILENAMES and _RAW_PATCH.search(line)
-    ]
+    offenders = _offenders(_scan_rows())
     assert not offenders, (
         "raw class-wide Path.replace patch bypasses the scoped helper "
         "patch_path_replace (issue #2290):\n  " + "\n  ".join(offenders)
