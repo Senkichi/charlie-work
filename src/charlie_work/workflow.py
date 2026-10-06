@@ -1395,8 +1395,12 @@ WORKER_PROMPT_KEYS: frozenset[str] = frozenset(
         # The test command, resolved by ``prompt_test_command`` (config
         # override, else derived from the consumer's pyproject.toml, else a
         # pointer to the repository's own docs). Always supplied, never empty.
+        # The step sentence and execution contract follow the command's form
+        # (hand-picked, or ``ci-fleet test``).
         "targeted_test_command",
         "full_suite_command",
+        "test_step_instruction",
+        "test_execution_contract",
     }
 )
 REWORK_PROMPT_KEYS: frozenset[str] = frozenset(
@@ -1414,6 +1418,8 @@ REWORK_PROMPT_KEYS: frozenset[str] = frozenset(
         # Same resolution as the worker prompt's (``prompt_test_command``).
         "targeted_test_command",
         "full_suite_command",
+        "test_step_instruction",
+        "test_execution_contract",
     }
 )
 

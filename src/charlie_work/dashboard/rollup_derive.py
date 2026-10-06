@@ -322,6 +322,8 @@ KNOWN_IGNORED: dict[str, str] = {
     "worker_evidence_stale": "worker-outcome bookkeeping",
     "worker_literal_tmp_path": "post-hoc /tmp-misuse signal (issue #1780)",
     "worker_module_map_failed": "worker-outcome bookkeeping",
+    "worker_test_selection_disabled": "worker-prompt test-command diagnostic",
+    "worker_test_selection_unavailable": "worker-prompt test-command diagnostic",
     "worker_verified_no_changes": "worker-outcome bookkeeping",
     "worker_verified_no_changes_ignored": "worker-outcome bookkeeping",
 }
