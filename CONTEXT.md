@@ -78,7 +78,7 @@ The mechanism the orchestrator uses to launch a worker on a given harness (manua
 _Avoid_: Harness, backend, driver
 
 **Host port**:
-A seam onto something the host provides (wall/monotonic clock, process liveness, live-session count, reviewer launch), with a real and a fake implementation, reached via `host.current()` or `app.host`.
+A seam onto something the host provides (wall/monotonic clock, process liveness, live-session count, worker/reviewer launch), with a real and a fake implementation, reached via `host.current()` or `app.host`.
 _Avoid_: Adapter (reserved for the worker-launch mechanism)
 
 **Sidecar**:

@@ -19,6 +19,7 @@ from _fakes_github import FakeGitHub
 from charlie_work import role_quota_ledger
 from charlie_work.adapters import AdapterSettings, SessionDispatchResult, SessionRequest
 from charlie_work.config import DispatchConfig, LabelConfig, OrchestratorConfig, WorkerRoleConfig
+from charlie_work.host.fakes import FakeWorkerLauncher
 from charlie_work.instrumentation import query_events
 from charlie_work.paths import runtime_paths
 from charlie_work.role_chain import RoleEntry
@@ -68,7 +69,7 @@ def _app(
     return app
 
 
-def _spy(monkeypatch: pytest.MonkeyPatch) -> list[tuple[AdapterSettings, SessionRequest]]:
+def _spy(fake_host) -> list[tuple[AdapterSettings, SessionRequest]]:
     """Fake ``dispatch_sessions`` that writes the sidecar a real launch would."""
     calls: list[tuple[AdapterSettings, SessionRequest]] = []
 
@@ -98,7 +99,7 @@ def _spy(monkeypatch: pytest.MonkeyPatch) -> list[tuple[AdapterSettings, Session
             )
         return results
 
-    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", _fake)
+    fake_host(worker_launch=FakeWorkerLauncher([_fake]))
     return calls
 
 
@@ -124,11 +125,9 @@ def _events(app: OrchestratorApp, kind: str) -> list[dict[str, Any]]:
 
 
 @LANES
-def test_model_opus_label_launches_on_the_opus_entry(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lane: str
-) -> None:
+def test_model_opus_label_launches_on_the_opus_entry(tmp_path: Path, fake_host, lane: str) -> None:
     """The rollout step 5 canary, in miniature."""
-    calls = _spy(monkeypatch)
+    calls = _spy(fake_host)
     app = _app(tmp_path, lane)
     result = _run(app, lane)
     assert _launched(calls) == {123: OPUS.key}, result.message
@@ -145,9 +144,9 @@ def test_model_opus_label_launches_on_the_opus_entry(
 
 @LANES
 def test_unlabelled_issue_launches_on_the_default_tier(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lane: str
+    tmp_path: Path, fake_host, lane: str
 ) -> None:
-    calls = _spy(monkeypatch)
+    calls = _spy(fake_host)
     app = _app(tmp_path, lane, labels=())
     _run(app, lane)
     assert _launched(calls) == {123: PRIMARY.key}
@@ -155,10 +154,8 @@ def test_unlabelled_issue_launches_on_the_default_tier(
     assert _events(app, "worker_model_tier_fallback") == []
 
 
-def test_a_primary_tier_label_is_honoured_at_index_zero(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    calls = _spy(monkeypatch)
+def test_a_primary_tier_label_is_honoured_at_index_zero(tmp_path: Path, fake_host) -> None:
+    calls = _spy(fake_host)
     app = _app(tmp_path, FRESH, labels=("model:sonnet",))
     _run(app, FRESH)
     assert _launched(calls) == {123: PRIMARY.key}
@@ -175,12 +172,12 @@ def test_a_primary_tier_label_is_honoured_at_index_zero(
 )
 def test_an_unservable_tier_falls_back_to_the_normal_chain(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    fake_host,
     labels: tuple[str, ...],
     tier: str,
     reason: str,
 ) -> None:
-    calls = _spy(monkeypatch)
+    calls = _spy(fake_host)
     app = _app(tmp_path, FRESH, labels=labels)
     _run(app, FRESH)
     assert _launched(calls) == {123: PRIMARY.key}
@@ -189,10 +186,8 @@ def test_an_unservable_tier_falls_back_to_the_normal_chain(
     assert _events(app, "worker_model_tier_selected") == []
 
 
-def test_a_restricted_tier_falls_back_to_the_normal_chain(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    calls = _spy(monkeypatch)
+def test_a_restricted_tier_falls_back_to_the_normal_chain(tmp_path: Path, fake_host) -> None:
+    calls = _spy(fake_host)
     later = datetime.now(UTC) + timedelta(hours=2)
     role_quota_ledger.record_restriction(
         OPUS.harness, OPUS.model, later, reason="quota_exhausted", source="test"
@@ -205,9 +200,9 @@ def test_a_restricted_tier_falls_back_to_the_normal_chain(
 
 
 def test_a_mixed_batch_launches_each_tier_on_its_entry_and_keeps_one_manifest(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, fake_host
 ) -> None:
-    calls = _spy(monkeypatch)
+    calls = _spy(fake_host)
     app = _app(tmp_path, FRESH)
     plain = copy.deepcopy(app.gh.issues[0])
     plain.update(number=124, title="Fix sort", url="https://example.test/issues/124")
@@ -223,12 +218,12 @@ def test_a_mixed_batch_launches_each_tier_on_its_entry_and_keeps_one_manifest(
 
 
 def test_a_mixed_batch_paces_the_launch_between_tier_groups(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_host
 ) -> None:
     """The tier split must not drop the launch stagger at the group boundary."""
     import dataclasses
 
-    calls = _spy(monkeypatch)
+    calls = _spy(fake_host)
     sleeps: list[float] = []
     monkeypatch.setattr("charlie_work.worker_launch_gate.time.sleep", sleeps.append)
     app = _app(tmp_path, FRESH)
@@ -245,10 +240,8 @@ def test_a_mixed_batch_paces_the_launch_between_tier_groups(
     assert sleeps == [7]
 
 
-def test_an_empty_prefix_turns_routing_off(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    calls = _spy(monkeypatch)
+def test_an_empty_prefix_turns_routing_off(tmp_path: Path, fake_host) -> None:
+    calls = _spy(fake_host)
     app = _app(tmp_path, FRESH, label_config=LabelConfig(model_tier_prefix=""))
     _run(app, FRESH)
     assert _launched(calls) == {123: PRIMARY.key}

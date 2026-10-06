@@ -10,10 +10,10 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-import pytest
 
 from charlie_work.adapters import SessionDispatchResult, SessionRequest
 from charlie_work.config import OrchestratorConfig, build_config_from_data
+from charlie_work.host.fakes import FakeWorkerLauncher
 from charlie_work.labels import transition
 from charlie_work.local_issues import LocalFileGitHub
 from charlie_work.paths import runtime_paths
@@ -188,7 +188,8 @@ def rework_pending_app(repo: Path) -> OrchestratorApp:
     return app
 
 
-def spy_dispatch_sessions(monkeypatch: pytest.MonkeyPatch) -> list[SessionRequest]:
+def spy_dispatch_sessions(fake_host) -> list[SessionRequest]:
+    """Install a launch-port fake recording each request; returns the log."""
     calls: list[SessionRequest] = []
 
     def _fake(_repo_root, _manifest, _results, _settings, requests):
@@ -205,5 +206,5 @@ def spy_dispatch_sessions(monkeypatch: pytest.MonkeyPatch) -> list[SessionReques
             for request in requests
         ]
 
-    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", _fake)
+    fake_host(worker_launch=FakeWorkerLauncher([_fake]))
     return calls

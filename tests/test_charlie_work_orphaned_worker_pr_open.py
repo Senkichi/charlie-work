@@ -9,7 +9,6 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
-import pytest
 from _dead_session_fixtures import _write_flat_review_decision
 from _dispatch_fixtures import _stub_real_activity_probe_for_stalled_tests  # noqa: F401
 from _fakes_github import FakeGitHub
@@ -21,6 +20,7 @@ from charlie_work.config import (
     WatchdogConfig,
     WorkerRoleConfig,
 )
+from charlie_work.host.fakes import FakeWorkerLauncher
 from charlie_work.paths import runtime_paths
 from charlie_work.state import (
     PASSIVE_OPEN_STATUS,
@@ -112,7 +112,7 @@ def test_orphaned_worker_approved_without_rework_status_still_drifts(tmp_path: P
 
 
 def test_orphaned_worker_drift_fingerprint_cleared_on_redispatch(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, fake_host
 ) -> None:
     """Issue #457 review: a fresh dispatch clears the drift fingerprint.
 
@@ -241,7 +241,7 @@ def test_orphaned_worker_drift_fingerprint_cleared_on_redispatch(
             for request in requests
         ]
 
-    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", fake_dispatch_sessions)
+    fake_host(worker_launch=FakeWorkerLauncher([fake_dispatch_sessions]))
 
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
     result = app.dispatch_rework()

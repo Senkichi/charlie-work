@@ -34,7 +34,7 @@ from charlie_work.config import (
     RuntimeConfig,
     WorkerRoleConfig,
 )
-from charlie_work.host.fakes import FakeProcessProbe
+from charlie_work.host.fakes import FakeProcessProbe, FakeWorkerLauncher
 from charlie_work.instrumentation import query_events
 from charlie_work.paths import runtime_paths
 from charlie_work.state import load_state, save_state, state_lock
@@ -1234,12 +1234,13 @@ def _fake_dispatch_sessions_factory(failure_kind: str | None):
 
 
 def test_dispatch_deterministic_failure_kind_escalates_on_first_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, fake_host
 ) -> None:
     app, fake_gh = _closed_pr_app(tmp_path)
-    monkeypatch.setattr(
-        "charlie_work.workflow.dispatch_sessions",
-        _fake_dispatch_sessions_factory("worktree_unsafe_shim_dirt"),
+    fake_host(
+        worker_launch=FakeWorkerLauncher(
+            [_fake_dispatch_sessions_factory("worktree_unsafe_shim_dirt")]
+        )
     )
 
     result = app.dispatch(limit=1)
@@ -1256,7 +1257,7 @@ def test_dispatch_deterministic_failure_kind_escalates_on_first_failure(
 
 
 def test_dispatch_worktree_unsafe_local_commits_escalates_as_judgment(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, fake_host
 ) -> None:
     """Issue #807: a ``worktree_unsafe_local_commits`` failure (genuine unpushed
     local commits on the worktree branch) must escalate immediately on first
@@ -1269,9 +1270,10 @@ def test_dispatch_worktree_unsafe_local_commits_escalates_as_judgment(
     ``escalated``, and this test fails.
     """
     app, fake_gh = _closed_pr_app(tmp_path)
-    monkeypatch.setattr(
-        "charlie_work.workflow.dispatch_sessions",
-        _fake_dispatch_sessions_factory("worktree_unsafe_local_commits"),
+    fake_host(
+        worker_launch=FakeWorkerLauncher(
+            [_fake_dispatch_sessions_factory("worktree_unsafe_local_commits")]
+        )
     )
 
     result = app.dispatch(limit=1)
@@ -1287,13 +1289,10 @@ def test_dispatch_worktree_unsafe_local_commits_escalates_as_judgment(
 
 
 def test_dispatch_non_deterministic_failure_kind_still_uses_redispatch_cap(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, fake_host
 ) -> None:
     app, fake_gh = _closed_pr_app(tmp_path)
-    monkeypatch.setattr(
-        "charlie_work.workflow.dispatch_sessions",
-        _fake_dispatch_sessions_factory(None),
-    )
+    fake_host(worker_launch=FakeWorkerLauncher([_fake_dispatch_sessions_factory(None)]))
 
     result = app.dispatch(limit=1)
 
@@ -1451,14 +1450,17 @@ def test_dispatch_outcome_field_sets_pin_the_collapsed_branch(
 
     app, fake_gh = _closed_pr_app(tmp_path)
     _seed_dispatch_failed_at(app.paths, 123, ["2020-01-01T00:00:00+00:00"])
-    monkeypatch.setattr(
-        "charlie_work.workflow.dispatch_sessions",
-        _fake_dispatch_result_factory(
-            ok=ok,
-            failure_kind=failure_kind,
-            pid=12345 if pid_alive is not None else None,
-            process_start_time=1_234_567.0 if pid_alive is not None else None,
-        ),
+    fake_host(
+        worker_launch=FakeWorkerLauncher(
+            [
+                _fake_dispatch_result_factory(
+                    ok=ok,
+                    failure_kind=failure_kind,
+                    pid=12345 if pid_alive is not None else None,
+                    process_start_time=1_234_567.0 if pid_alive is not None else None,
+                )
+            ]
+        )
     )
     if pid_alive is not None:
         fake_host(probe=FakeProcessProbe({12345: 1_234_567.0} if pid_alive else {}))

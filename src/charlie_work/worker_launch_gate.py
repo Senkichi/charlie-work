@@ -56,7 +56,9 @@ lock handle or permit: validity is a private mint token checked by identity at
 launch time, so a hand-built permit is refused rather than trusted.
 
 ``tests/test_worker_launch_gate_guard.py`` AST-scans ``src/charlie_work`` and
-fails if any function other than :func:`_launch_workers` references
+fails if any function other than :func:`_launch_workers` touches the
+``worker_launch`` port, or anything other than the port's Real /
+:func:`_launch_workers` itself / the ``workflow`` re-export references
 ``dispatch_sessions`` -- a new lane that bypasses the gate fails CI.
 """
 
@@ -86,6 +88,7 @@ from charlie_work.adapters import (
 )
 from charlie_work.atomic_write import write_json_atomic
 from charlie_work.fleet_registry import try_acquire_fleet_lock
+from charlie_work.host.launch import worker_error_results
 
 if TYPE_CHECKING:
     from charlie_work.workflow import OrchestratorApp
@@ -602,7 +605,7 @@ def _launch_workers(
     settings: AdapterSettings,
     requests: list[SessionRequest],
 ) -> list[SessionDispatchResult]:
-    """Launch ``requests`` against ``permit`` -- the only ``dispatch_sessions`` caller.
+    """Launch ``requests`` against ``permit`` -- the only worker-launch-port caller.
 
     Refuses (never raises -- errors from launches come back as values) when
     the permit was not minted by :func:`issue_worker_launch_permit`, its
@@ -642,15 +645,25 @@ def _launch_workers(
             # rescue-tier settings (role "") launch exactly as configured.
             group_settings = role_selection.worker_settings_for(app, selection)
         adapters.add(group_settings.adapter)
-        # Reached through the workflow re-export so test fakes that patch
-        # ``charlie_work.workflow.dispatch_sessions`` keep intercepting.
-        group_results = _wf.dispatch_sessions(
-            app.repo_root,
-            app._layout.session_manifest,
-            app._layout.session_results,
-            group_settings,
-            group,
-        )
+        # Reached through the host's worker-launch port (issue #2229); the
+        # Real late-binds ``workflow.dispatch_sessions`` so test fakes that
+        # patch ``charlie_work.workflow.dispatch_sessions`` keep intercepting.
+        try:
+            group_results = app.host.worker_launch.launch(
+                app.repo_root,
+                app._layout.session_manifest,
+                app._layout.session_results,
+                group_settings,
+                group,
+            )
+        except Exception as exc:
+            # The permit ledger already debited this batch above; a raise at
+            # the launch seam still comes back as per-request failure values
+            # (never a propagate) so the pass completes and the lane's normal
+            # path releases the permit's fleet lock.
+            group_results = worker_error_results(
+                app.repo_root, group_settings, group, f"launch failed: {exc}"
+            )
         results.extend(group_results)
         if selection is not None and group_settings.role == "worker":
             launched = [result.issue_number for result in group_results if result.ok]
