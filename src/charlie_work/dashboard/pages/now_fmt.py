@@ -121,6 +121,18 @@ def age(seconds: float | None) -> str:
     return f"{s // 86400}d{(s % 86400) // 3600}h"
 
 
+def age_compact(seconds: float | None) -> str:
+    """One-unit age for tiles and rows: ``12m``, ``5h``, ``9d``; ``-`` when unknown."""
+    if seconds is None:
+        return "—"
+    s = max(0, int(seconds))
+    if s < 3600:
+        return f"{max(1, s // 60)}m"
+    if s < 86400:
+        return f"{s // 3600}h"
+    return f"{s // 86400}d"
+
+
 def stable_id(prefix: str, *parts: object) -> str:
     """A deterministic DOM id so htmx can restore focus to the same element after a swap."""
     digest = hashlib.sha1("\x1f".join(str(p) for p in parts).encode("utf-8")).hexdigest()

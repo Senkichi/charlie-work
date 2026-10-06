@@ -1,32 +1,32 @@
-"""Right-rail Flow pipeline and Ready-but-not-dispatchable bars.
+"""The Pipeline panel: one connected track of stage nodes, the longest queue in focus.
 
-Text is HTML (sized in CSS px, so it never shrinks with the rail the way viewBox-scaled
-SVG text did) and every number goes through ``link`` (an anchor only once its drill-down
-route is registered). Only the bars are SVG: decorative, ``aria-hidden``, never links,
-with their geometry in SVG attributes (x/y/width/height) because the CSP forbids inline
-styles. Every colour comes from a CSS class bound to an ``--lj-*`` token.
+The headline is the takeaway ("15 PRs piled up at PR open"). Each node is a button that
+opens a per-repo drawer (``now.js`` shows the drawer named by the URL hash, so it survives
+refresh); the "why" link opens the ready-but-not-dispatchable breakdown. Node text is HTML;
+only the circles are ``aria-hidden`` SVG whose size is an SVG attribute in ``em``.
 """
 
 from __future__ import annotations
 
-from ..now_types import FlowModel, NowModel
-from .now_fmt import esc, flow_url, fmt_float, link
+import math
 
-_PIPE = ("Dispatchable", "Queued", "In progress", "PR open", "Reviewing")
-_MAXH, _BAR = 75.0, 48.0
-_DONE_H = 6.0
-_ND_W = 280.0
+from ..now_types import FlowModel, NowModel
+from .now_bars import hbars, repo_label
+from .now_fmt import esc, slug
+
+_TRACK = ("Dispatchable", "Queued", "In progress", "PR open", "Reviewing")
+_PR_STAGES = frozenset({"PR open", "Reviewing"})
+DONE = "Merged 24h"
+# The rework arc runs Reviewing -> In progress; now-page.css pins it to these grid columns
+# (``.arc-curve``), so a reordered ``_TRACK`` must fail loudly (tests assert it).
+ARC_COLUMNS = (_TRACK.index("In progress") + 1, _TRACK.index("Reviewing") + 2)
 _REASON_LABEL = {
     "terminal_label": "Terminal label",
-    "active_label": "Active label",
+    "active_label": "Already active",
     "operator_claimed": "Operator claimed",
     "mention_covered_awaiting_operator": "Mention awaiting operator",
-    "blocked_by_open_dependency": "Blocked by open dependency",
+    "blocked_by_open_dependency": "Blocked by a dependency",
     "unidentified": "Unidentified",
-    # parked_unready never reaches this map's consumers (it is not in
-    # now_model.NOT_DISPATCHABLE_REASONS -- a parked issue is not Ready),
-    # but the label lives here so the reason vocabulary has one display-name
-    # owner if a future breakdown surfaces it.
     "parked_unready": "Parked, not ready",
 }
 
@@ -35,101 +35,111 @@ def _count(flow: FlowModel, name: str) -> int:
     return next((s.count for s in flow.stages if s.name == name), 0)
 
 
-def _bar_svg(cls: str, h: float) -> str:
-    """A bar exactly ``h`` CSS px tall (viewBox height == svg height, no scaling)."""
-    hh = fmt_float(h)
+def _focus_stage(flow: FlowModel) -> tuple[str, int]:
+    """The queue the operator should look at: the biggest stage past Dispatchable."""
+    best = ("", 0)
+    for name in _TRACK[1:]:
+        if _count(flow, name) > best[1]:
+            best = (name, _count(flow, name))
+    return best
+
+
+def headline(flow: FlowModel) -> str:
+    name, n = _focus_stage(flow)
+    if not n:
+        return "Nothing in flight"
+    noun = "PRs" if name in _PR_STAGES else "issues"
+    return f"{n} {noun} piled up at <b>{esc(name)}</b>"
+
+
+def _dot(count: int | None) -> str:
+    """Circle sized by sqrt(count), in em so it scales with the type; ``None`` is dashed."""
+    r = 0.64 if not count else min(2.0, (9 + 3.2 * math.sqrt(count)) / 14)
+    d = f"{2 * r:.2f}"
+    unknown = ' class="unk"' if count is None else ""
     return (
-        f'<svg class="pbar" viewBox="0 0 {fmt_float(_BAR)} {hh}" height="{hh}" '
-        f'preserveAspectRatio="none" aria-hidden="true"><rect class="{cls}" x="0" y="0" '
-        f'width="{fmt_float(_BAR)}" height="{hh}"/></svg>'
+        f'<svg class="dot" width="{d}em" height="{d}em" viewBox="0 0 100 100" '
+        f'aria-hidden="true"><circle{unknown} cx="50" cy="50" r="46"/></svg>'
     )
 
 
-def _stage(name: str, count: int | None, scale: float, done: bool) -> str:
-    label = "Done 24h" if done else name
-    href = flow_url("done-24h" if done else name)
-    cls = "stage done unit-sep" if done else "stage"
-    if count is None:
-        mark = (
-            '<span class="stage-n unk">—</span>'
-            '<span class="bar unk"><span class="stage-s">unknown — rollup not current</span></span>'
-        )
-    elif count == 0:
-        mark = f'<span class="stage-n">{link(href, 0)}</span>{_bar_svg("bar zero", 2.0)}'
-    else:
-        # Done is a 24h throughput, not a queue depth: it never shares the stock scale
-        # (77 merged would flatten every stage), so it is a fixed green token bar.
-        h = _DONE_H if done else _MAXH * count / scale
-        num = "stage-n done" if done else "stage-n"
-        mark = (
-            f'<span class="{num}">{link(href, int(count))}</span>'
-            f"{_bar_svg('bar done' if done else 'bar bar', h)}"
-        )
-    return f'<li class="{cls}">{mark}<span class="stage-l">{esc(label)}</span></li>'
-
-
-def _pipeline(flow: FlowModel) -> str:
-    counts = [_count(flow, n) for n in _PIPE]
-    scale = float(max(counts) if max(counts) > 0 else 0)
-    stages = [_stage(n, c, scale, done=False) for n, c in zip(_PIPE, counts, strict=True)]
-    stages.append(_stage("Done 24h", flow.done_24h, scale, done=True))
-    rework = _count(flow, "Needs rework")
-    loop = (
-        '<p class="rework"><span aria-hidden="true">↺ </span>'
-        f"{link(flow_url('Needs rework'), rework, 'n hn')} needs rework, back to In progress</p>"
-    )
+def _node(name: str, count: int | None, focus: bool, done: bool) -> str:
+    key = "merged" if done else slug(name)
+    shown = "—" if count is None else str(count)
+    cls = "node" + (" focus" if focus else "")
     return (
-        '<ol class="pipe" aria-label="Pipeline: issues per stage, left to right">'
-        f"{''.join(stages)}</ol>{loop}"
+        f'<li class="step"><button type="button" class="{cls}" id="node-{key}" '
+        f'data-pipe="{key}" aria-pressed="false" aria-label="{esc(name)}: {esc(shown)}">'
+        f'<span class="cnt num">{esc(shown)}</span>{_dot(count)}'
+        f'<span class="lbl">{esc(name)}</span></button></li>'
     )
+
+
+def _stage_drawer(model: NowModel, name: str) -> str:
+    rows = [
+        (repo_label(r.repo), float(c), 0.0, str(c))
+        for r in model.repos
+        if (c := next((s.count for s in r.stages if s.name == name), 0))
+    ]
+    top = max((v for _, v, _, _ in rows), default=0.0)
+    rows = sorted(((lbl, v, top, t) for lbl, v, _, t in rows), key=lambda r: -r[1])
+    return hbars(f"{name} by repo", rows)
+
+
+def _why_drawer(flow: FlowModel) -> str:
+    reasons = sorted(flow.not_dispatchable, key=lambda r: (-r.count, r.reason))
+    top = max((r.count for r in reasons), default=0)
+    rows = [
+        (
+            esc(_REASON_LABEL.get(r.reason, r.reason.replace("_", " ").capitalize())),
+            float(r.count),
+            float(top),
+            str(r.count),
+        )
+        for r in reasons
+    ]
+    return hbars("Why ready issues are held", rows, empty="Every ready issue is dispatchable.")
+
+
+def _drawer(key: str, inner: str) -> str:
+    return f'<div class="drawer" id="pipe-{key}" data-pipe="{key}" hidden>{inner}</div>'
 
 
 def render_flow(model: NowModel) -> str:
-    t = model.totals
-    sub = (
-        f'<p class="sub">In flight {link(flow_url("active"), t.active_issues)} active issues '
-        f"· {link('/prs?linked=1', t.open_linked_prs)} linked PRs open "
-        f"· {link('/prs?linked=0', t.unlinked_prs)} unlinked PRs "
-        '<span class="as-of">as of snapshot</span></p>'
+    flow, t = model.flow, model.totals
+    focus, _ = _focus_stage(flow)
+    nodes = "".join(_node(n, _count(flow, n), n == focus, False) for n in _TRACK)
+    nodes += _node(DONE, flow.done_24h, True, True)
+    rework = _count(flow, "Needs rework")
+    arc = (
+        '<div class="arc" aria-hidden="true"><span class="arc-curve"></span>'
+        f'<span class="arc-note">{rework} back for rework</span></div>'
+        if rework
+        else ""
     )
+    held = sum(r.count for r in flow.not_dispatchable)
+    why = (
+        f"{held} of {t.ready_issues} ready issues cannot dispatch "
+        '(<button type="button" class="linkbtn" id="why-btn" data-pipe="why" '
+        'aria-pressed="false">why</button>).'
+        if held
+        else "Every ready issue is dispatchable."
+        if t.ready_issues
+        else "No ready issues."
+    )
+    done_note = (
+        "See the progress chart for merges over time."
+        if flow.done_24h is not None
+        else "Merged-24h is unknown: the rollup is not current."
+    )
+    drawers = "".join(_drawer(slug(n), _stage_drawer(model, n)) for n in _TRACK)
+    drawers += _drawer("merged", f'<p class="dim small">{done_note}</p>')
+    drawers += _drawer("why", _why_drawer(flow))
     return (
-        '<section class="flow-now" aria-labelledby="flow-h"><h2 id="flow-h">Flow</h2>'
-        f"{_pipeline(model.flow)}{sub}</section>"
-    )
-
-
-def _nd_row(reason: str, count: int, top: int) -> str:
-    w = _ND_W * count / top
-    label = _REASON_LABEL.get(reason, reason.replace("_", " ").capitalize())
-    return (
-        f'<li class="nd-row"><span class="hl">{esc(label)}</span>'
-        f'<svg class="hbar-svg" viewBox="0 0 {fmt_float(_ND_W)} 12" preserveAspectRatio="none" '
-        f'aria-hidden="true"><rect class="hbar-track" x="0" y="0" width="{fmt_float(_ND_W)}" '
-        f'height="12"/><rect class="hbar" x="0" y="0" width="{fmt_float(w)}" height="12"/>'
-        f"</svg>{link(f'/backlog?reason={reason}', int(count), 'n hn')}</li>"
-    )
-
-
-def render_not_dispatchable(model: NowModel) -> str:
-    reasons = sorted(model.flow.not_dispatchable, key=lambda r: (-r.count, r.reason))
-    held = sum(r.count for r in reasons)
-    ready = model.totals.ready_issues
-    head = (
-        '<h2 id="nd-h">Ready, not dispatchable <span class="meta">'
-        f"{link('/backlog?ready=0', held)} of {link('/backlog?ready=1', ready)} ready</span></h2>"
-    )
-    if not reasons:
-        line = "Every ready issue is dispatchable." if ready else "No ready issues."
-        return f'<section class="nd-now" aria-labelledby="nd-h">{head}<p class="calm-sm">{line}</p></section>'
-    top = max(r.count for r in reasons) or 1
-    rows = "".join(_nd_row(r.reason, r.count, top) for r in reasons)
-    lead = reasons[0]
-    eg = ", ".join(lead.examples[:3])
-    note = (
-        f'<p class="sub">most held: {esc(_REASON_LABEL.get(lead.reason, lead.reason).lower())}'
-        f"{' (e.g. ' + esc(eg) + ')' if eg else ''}</p>"
-    )
-    return (
-        f'<section class="nd-now" aria-labelledby="nd-h">{head}'
-        f'<ul class="nd-list" aria-label="Held issues by reason">{rows}</ul>{note}</section>'
+        '<section class="panel n-flow" id="flow" aria-labelledby="flow-h">'
+        f'<div><h2 id="flow-h">{headline(flow)}</h2>'
+        f'<p class="sub">{t.active_issues} issues in flight. {why} '
+        '<span class="as-of">as of snapshot</span></p></div>'
+        f'<ol class="track" aria-label="Pipeline: issues per stage, left to right">{nodes}</ol>'
+        f"{arc}{drawers}</section>"
     )

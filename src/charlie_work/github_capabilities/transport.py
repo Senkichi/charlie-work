@@ -43,6 +43,7 @@ from typing import Any
 
 from ci_fleet.github import GitHubError
 
+from . import _field_list_stamp as stamp
 from ._base import CapabilityCollaborator, GitHubRunResult
 from ._field_probes import field_list_probes, probe_verdict
 from .circuit_breaker_transport import (
@@ -370,9 +371,17 @@ class Transport(CapabilityCollaborator):
             logger.warning("Skipping gh field-list validation this pass: %s", exc)
             return
 
-        for constant, fields, probe in field_list_probes(
-            RECONCILE_PR_FIELDS, RECONCILE_ISSUE_FIELDS
-        ):
+        probes = field_list_probes(RECONCILE_PR_FIELDS, RECONCILE_ISSUE_FIELDS)
+        # Issue #2438: skip the 8-point probe set when this exact field-list
+        # digest already passed for this repo (in-process or a <24h stamp).
+        slug = f"{owner}/{name}"
+        digest = stamp.digest_of(probes, slug)
+        state_dir = circuit_breaker_state_path(self.runtime, self.repo_root).parent
+        if stamp.is_fresh(state_dir, slug, digest):
+            return
+
+        clean = True
+        for constant, fields, probe in probes:
             outcome = (
                 send(self, probe)
                 if isinstance(probe, RestRequest)
@@ -395,6 +404,7 @@ class Transport(CapabilityCollaborator):
                     f"GitHub does not support field(s) for {constant}: {', '.join(missing)}"
                 )
             if verdict.detail:
+                clean = False
                 # Inconclusive (neither accepted nor rejected): not evidence of a bad
                 # field list, so startup must not depend on it. Warn and move on.
                 logger.warning(
@@ -402,6 +412,8 @@ class Transport(CapabilityCollaborator):
                     constant,
                     verdict.detail,
                 )
+        if clean:
+            stamp.record(state_dir, slug, digest)
 
     def _repo_owner_name(self) -> tuple[str, str]:
         """Resolve the repository owner and name from the local git remote.

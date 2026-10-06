@@ -20,6 +20,13 @@ from charlie_work.dashboard.now_types import (
     RunnerRepo,
     UnreachableReason,
 )
+from charlie_work.dashboard.now_progress_data import (
+    METRICS,
+    RANGES,
+    ProgressData,
+    ProgressResult,
+    ProgressSeries,
+)
 from charlie_work.dashboard.pages.now import render_now
 from charlie_work.dashboard.read_model import ModelState
 
@@ -164,5 +171,23 @@ def _parse(html_text: str) -> _Collect:
     return p
 
 
-def _page(model: NowModel | None = None, **state) -> str:
-    return render_now(ModelState(model=model or _model(), **state), poll_seconds=15)
+def _progress() -> ProgressData:
+    """A literal chart payload: every (metric, range), whole buckets, one repo split."""
+    series = []
+    for metric in METRICS:
+        for key, (span, bucket, _, _) in RANGES.items():
+            n = span // bucket
+            points = tuple(
+                (f"2026-09-{1 + i % 28:02d}T{i % 24:02d}:00:00Z", float(i % 5)) for i in range(n)
+            )
+            split = {CW: tuple((i, v) for i, (_, v) in enumerate(points) if v)}
+            series.append(ProgressSeries(metric, key, points, split, 0.28, True, False))
+    return ProgressData(tuple(series))
+
+
+def _page(
+    model: NowModel | None = None, *, progress: ProgressResult | None = None, **state
+) -> str:
+    return render_now(
+        ModelState(model=model or _model(), **state), poll_seconds=15, progress=progress
+    )
