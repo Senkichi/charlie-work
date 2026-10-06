@@ -47,6 +47,7 @@ from __future__ import annotations
 import ast
 import textwrap
 from pathlib import Path
+from _src_ast import parsed, source_files
 
 _DECISION_KEYS = {"decision", "reviewed_head_sha", "decision_path"}
 
@@ -322,8 +323,8 @@ def test_pr_state_decision_writes_are_all_sanctioned() -> None:
     violations: list[str] = []
     functions_seen: set[str] = set()
     qualified_seen: set[tuple[str, str]] = set()
-    for source_file in sorted(src_root.rglob("*.py")):
-        tree = ast.parse(source_file.read_text(encoding="utf-8"))
+    for source_file in source_files(src_root):
+        tree = parsed(source_file)
         rel = source_file.relative_to(src_root).as_posix()
         for lineno, func_name, key in _scan(tree):
             functions_seen.add(func_name)

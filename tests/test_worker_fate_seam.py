@@ -39,6 +39,7 @@ import ast
 from pathlib import Path
 
 import charlie_work
+from _src_ast import parsed, source_files
 
 _ALLOWED_FILES = frozenset({"state.py", "worker_fate.py"})
 _TARGET_KEY = "dead_worker_failure_kind"
@@ -86,10 +87,10 @@ def test_raw_dead_worker_failure_kind_key_is_confined_to_allowed_files() -> None
     """
     root = _src_root()
     offenders: dict[str, list[int]] = {}
-    for path in sorted(root.rglob("*.py")):
+    for path in source_files(root):
         if path.name in _ALLOWED_FILES:
             continue
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        tree = parsed(path)
         lines = _raw_read_lines(tree)
         if lines:
             offenders[str(path.relative_to(root))] = lines
@@ -209,10 +210,10 @@ def test_dead_worker_failure_kind_writes_are_confined_to_persist_primitive() -> 
     """
     root = _src_root()
     offenders: dict[str, list[int]] = {}
-    for path in sorted(root.rglob("*.py")):
+    for path in source_files(root):
         if path.name in _ALLOWED_FILES:
             continue
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        tree = parsed(path)
         lines = _raw_write_lines(tree)
         if lines:
             offenders[str(path.relative_to(root))] = lines
@@ -312,7 +313,7 @@ def _functions_without_production_caller(fate_source: str, other_sources: list[s
 def _production_sources(root: Path) -> list[str]:
     return [
         path.read_text(encoding="utf-8")
-        for path in sorted(root.rglob("*.py"))
+        for path in source_files(root)
         if path.name != "worker_fate.py"
     ]
 

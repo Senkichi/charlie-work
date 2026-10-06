@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import pytest
+from _src_ast import parsed, source_files
 
 from charlie_work.rescue_review import run_cross_family_review
 from charlie_work.subprocess_runner import RunResult
@@ -468,8 +469,8 @@ def _call_sites(callee: str) -> list[tuple[str, int, str]]:
     (``mod.f(...)``) call forms.
     """
     sites: list[tuple[str, int, str]] = []
-    for path in sorted(SRC_ROOT.rglob("*.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    for path in source_files(SRC_ROOT):
+        tree = parsed(path)
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue

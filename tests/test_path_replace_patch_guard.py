@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from _src_ast import source_files
 
 TESTS_DIR = Path(__file__).resolve().parent
 
@@ -59,7 +60,7 @@ def test_guard_detects_each_raw_spelling() -> None:
 
 def test_no_raw_class_wide_path_replace_patch_in_tests() -> None:
     offenders: list[str] = []
-    for file in sorted(TESTS_DIR.rglob("*.py")):
+    for file in source_files(TESTS_DIR):
         if file.name in _EXEMPT_FILENAMES:
             continue
         rel = file.relative_to(TESTS_DIR.parent).as_posix()

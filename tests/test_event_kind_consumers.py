@@ -62,6 +62,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from _dws_emit_scan import is_decide_module, sweep_emit_kind
+from _src_ast import parsed
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC = REPO_ROOT / "src" / "charlie_work"
@@ -619,9 +620,8 @@ def _record_site(
 def _scan_emit_sites(root: Path) -> list[EmitSite]:
     sites: list[EmitSite] = []
     for path in _src_py_files(root):
-        text = path.read_text(encoding="utf-8")
         try:
-            tree = ast.parse(text, filename=str(path))
+            tree = parsed(path)
         except SyntaxError:
             continue
         file_sites, _, _ = _scan_emit_sites_in_tree(tree, path.relative_to(root).as_posix())
@@ -830,9 +830,8 @@ def _analyze(
     file_sites: dict[str, list[EmitSite]] = {}
     for path in _src_py_files(src_root):
         rel_path = path.relative_to(src_root).as_posix()
-        text = path.read_text(encoding="utf-8")
         try:
-            tree = ast.parse(text, filename=str(path))
+            tree = parsed(path)
         except SyntaxError:
             continue
         sites, _, _ = _scan_emit_sites_in_tree(tree, rel_path)
@@ -855,9 +854,8 @@ def _analyze(
     consumer_sites: list[ConsumerSite] = []
     for path in _src_py_files(src_root):
         rel_path = path.relative_to(src_root).as_posix()
-        text = path.read_text(encoding="utf-8")
         try:
-            tree = ast.parse(text, filename=str(path))
+            tree = parsed(path)
         except SyntaxError:
             continue
         consumer_sites.extend(_collect_src_consumer_sites(tree, rel_path))
@@ -872,7 +870,7 @@ def _analyze(
     heartbeat_literals: set[str] = set()
     for hb_path in hb_paths:
         if hb_path.is_file():
-            hb_tree = ast.parse(hb_path.read_text(encoding="utf-8"))
+            hb_tree = parsed(hb_path)
             heartbeat_literals |= _collect_literal_strings(hb_tree)
 
     test_literals: set[str] = set()
@@ -887,7 +885,7 @@ def _analyze(
                 # test file is fair game (a real assertion elsewhere).
                 continue
             try:
-                tree = ast.parse(path.read_text(encoding="utf-8"))
+                tree = parsed(path)
             except SyntaxError:
                 continue
             test_literals |= _collect_literal_strings(tree)

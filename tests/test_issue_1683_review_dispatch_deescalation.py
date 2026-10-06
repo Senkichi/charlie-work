@@ -46,6 +46,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _src_ast import parsed, source_files
 
 import charlie_work
 from charlie_work.config import DETERMINISTIC_ESCALATION_FAILURE_KINDS
@@ -442,8 +443,8 @@ class _SourceIndex:
         self.parent_scope: dict[int, ast.Module] = {}
         # every call in the package, with its innermost enclosing scope.
         self.calls: list[tuple[ast.AST, ast.Call]] = []
-        for path in sorted(pkg_dir.rglob("*.py")):
-            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for path in source_files(pkg_dir):
+            tree = parsed(path)
             self._index_module_scope(tree)
             self._walk(tree, tree)
 
