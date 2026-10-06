@@ -87,7 +87,13 @@ def _dispatch_app(
     tmp_path: Path, *, dry_run: bool = True, order: str = "oldest", prefix: str = P
 ) -> OrchestratorApp:
     config = OrchestratorConfig(
-        dispatch=DispatchConfig(default_limit=5, order=order),
+        dispatch=DispatchConfig(
+            default_limit=5,
+            order=order,
+            # Host-load brake reads live pytest processes; keep it out of ordering tests.
+            host_load_max_pytest_processes=0,
+            host_load_max_pytest_trees=0,
+        ),
         labels=LabelConfig(priority_prefix=prefix),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
