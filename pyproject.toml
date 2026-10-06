@@ -34,7 +34,7 @@ build-backend = "hatchling.build"
 packages = ["src/charlie_work"]
 
 [tool.pytest.ini_options]
-addopts = "-q --tb=short"
+addopts = "-q --tb=short -n auto --dist=load"
 testpaths = ["tests"]
 markers = [
     "real_activity_probe_live: test exercises the real (unstubbed) real_activity_probe_for instead of the autouse stale-probe stub (issue #307)",

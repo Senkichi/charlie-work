@@ -133,6 +133,26 @@ def pytest_sessionstart(session: pytest.Session) -> None:
     enforce_source_anchor(Path(__file__).resolve().parents[1])
 
 
+@pytest.hookimpl(tryfirst=True, optionalhook=True)
+def pytest_xdist_auto_num_workers(config: pytest.Config) -> int | None:
+    """HS-CW-1: run 1-3 explicit file/nodeid targets serially under ``-n auto``.
+
+    ``addopts`` carries ``-n auto``; xdist asks this hook (firstresult) how many
+    workers ``auto`` means. ``0`` makes xdist run the session in-process;
+    ``None`` falls through to xdist's default (``PYTEST_XDIST_AUTO_NUM_WORKERS``,
+    else the CPU count). ``optionalhook`` keeps ``-n0``/no-xdist runs from
+    rejecting an unknown hook. Policy and rationale: ``tests/_xdist_policy.py``.
+    """
+    from _xdist_policy import small_run_workers
+
+    return small_run_workers(
+        config.args,
+        config.invocation_params.dir,
+        config.invocation_params.args,
+        from_command_line=config.args_source == pytest.Config.ArgsSource.ARGS,
+    )
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _kill_on_close_job() -> None:
     """Issue #1851: on Windows, put this pytest process in a Job Object with
