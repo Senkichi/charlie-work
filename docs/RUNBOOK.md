@@ -369,6 +369,11 @@ default root is used for that resolution. charlie-work logs a warning and
 one until the old root is empty. `doctor` shows the old root and its entry
 count while that lasts. Nothing needs to be moved by hand.
 
+**Host-load governor.** Worktrees on the volume carry no `.var/charlie-work`
+path marker, so while the volume is in use the dispatch governor also scopes
+its pytest-load reading to `<worker_root>`. Suites in every repo's volume
+worktrees are counted, as they were under the default layout.
+
 **Cutover marker.** The first live dispatch on the volume writes
 `<fleet_dir>/host-io-worker-cutover.json` (`{"schema": 1, "cutover_at": ...}`).
 ci-fleet's worker A/B analysis uses it to split before and after. Do not
