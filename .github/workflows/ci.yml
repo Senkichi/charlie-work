@@ -82,6 +82,7 @@ jobs:
       shards: ${{ steps.plan.outputs.shards }}
       splits: ${{ steps.plan.outputs.splits }}
       shard_timeout: ${{ steps.plan.outputs.shard_timeout }}
+      covered: ${{ steps.covered.outputs.covered }}
     steps:
       - name: Plan shards
         id: plan
@@ -108,9 +109,38 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "shards=$n shard_timeout=$t"
 
+      - name: Classify covered push
+        id: covered
+        # covered=true only for a push whose merge commit was made by the
+        # merge-queue bot: the suite already ran on the queue's draft PR.
+        # Two REST calls (commits/{sha}/pulls has no merged_by). Every error
+        # path emits covered=false, so a fault costs a redundant run, never
+        # a skipped one. GraphQL reports bot logins without "[bot]"; both
+        # sides are compared with the suffix stripped.
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          SKIP_COVERED: ${{ vars.CI_SKIP_COVERED_PUSH }}
+          BOT_LOGIN: ${{ vars.MERGE_QUEUE_BOT_LOGIN }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          out="${GITHUB_OUTPUT:?}"; bot="${BOT_LOGIN:-}"; [ -n "$bot" ] || bot="aviator-app[bot]"
+          emit() { echo "covered=$1" >> "$out"; echo "covered=$1 ($2)"; exit 0; }
+          [ "${EVENT_NAME:-}" = "push" ] || emit false "event not push"
+          [ "${SKIP_COVERED:-}" != "false" ] || emit false "kill switch"
+          [ -n "${REPO:-}" ] && [ -n "${SHA:-}" ] || emit false "REPO or SHA unset"
+          pr="$(gh api "repos/$REPO/commits/$SHA/pulls" --jq "[.[] | select(.merge_commit_sha == \"$SHA\")][0].number // empty" 2>/dev/null)" || emit false "lookup failed"
+          [ -n "$pr" ] || emit false "no PR"; case "$pr" in *[!0-9]*) emit false "bad pr";; esac
+          login="$(gh api "repos/$REPO/pulls/$pr" --jq '.merged_by.login // empty' 2>/dev/null)" || emit false "PR lookup failed"
+          [ "${login%"[bot]"}" = "${bot%"[bot]"}" ] && emit true "merged by $login"; emit false "merged by ${login:-nobody}"
+
   tests-shard:
     name: Tests shard ${{ matrix.group }}/${{ needs.coverage.outputs.splits }}
     needs: coverage
+    if: needs.coverage.outputs.covered != 'true'
     # NO job-level concurrency group (#1399; pinned by tests/test_issue_1254.py).
     runs-on: windows-latest
     timeout-minutes: ${{ fromJSON(needs.coverage.outputs.shard_timeout) }}
@@ -571,6 +601,8 @@ jobs:
     # actions/checkout@v5 still needs it.
     runs-on: windows-latest
     timeout-minutes: 30
+    needs: coverage
+    if: needs.coverage.outputs.covered != 'true'
     permissions:
       contents: read
       pull-requests: read
