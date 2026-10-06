@@ -27,6 +27,8 @@ import yaml
 
 from charlie_work.junit_recorded_gate import (
     compare_recorded_vs_collected,
+    compare_recorded_vs_collected_multi,
+    junit_testcase_keys,
     count_collected_tests,
     count_junit_testcases,
     render_gate_report,
@@ -294,6 +296,62 @@ def test_render_report_fail_lists_findings() -> None:
 
 
 # ---------------------------------------------------------------------------
+# compare_recorded_vs_collected_multi (DD-3: one junit per shard)
+# ---------------------------------------------------------------------------
+
+
+def _junit(*names: str, classname: str = "t") -> str:
+    cases = "".join(f'<testcase classname="{classname}" name="{n}" time="0" />' for n in names)
+    return (
+        f'<testsuites><testsuite name="pytest" tests="{len(names)}" errors="0" '
+        f'failures="0" skipped="0">{cases}</testsuite></testsuites>'
+    )
+
+
+def test_junit_testcase_keys_lists_classname_name_pairs() -> None:
+    assert junit_testcase_keys(_JUNIT_3) == (("t", "a"), ("t", "b"), ("t", "c"))
+    assert junit_testcase_keys("<not xml") == ()
+
+
+def test_multi_single_file_matches_single_file_function() -> None:
+    assert compare_recorded_vs_collected_multi([_JUNIT_3], _COLLECT_3) == (
+        compare_recorded_vs_collected(_JUNIT_3, _COLLECT_3)
+    )
+
+
+def test_multi_sums_counts_across_shards() -> None:
+    result = compare_recorded_vs_collected_multi([_junit("a", "b"), _junit("c")], _COLLECT_3)
+    assert result.ok is True
+    assert result.recorded == 3
+    assert result.suite_tests_attr == 3
+
+
+def test_multi_flags_duplicate_even_when_counts_balance() -> None:
+    # Shard 1 ran a+b, shard 2 ran b again and omitted c: 3 recorded == 3 collected.
+    result = compare_recorded_vs_collected_multi([_junit("a", "b"), _junit("b")], _COLLECT_3)
+    assert result.ok is False
+    kinds = [f.kind for f in result.findings]
+    assert kinds == ["duplicate_testcase"]
+    assert "t::b" in result.findings[0].detail
+
+
+def test_multi_reports_shortfall_when_a_shard_is_missing() -> None:
+    result = compare_recorded_vs_collected_multi([_junit("a", "b")], _COLLECT_3)
+    assert [f.kind for f in result.findings] == ["recorded_vs_collected"]
+
+
+def test_multi_internal_inconsistency_in_one_shard_fails() -> None:
+    bad = _junit("c").replace('tests="1"', 'tests="2"')
+    result = compare_recorded_vs_collected_multi([_junit("a", "b"), bad], _COLLECT_3)
+    assert "junit_internal" in {f.kind for f in result.findings}
+
+
+def test_multi_with_no_files_is_empty_junit() -> None:
+    result = compare_recorded_vs_collected_multi([], _COLLECT_3)
+    assert "empty_junit" in {f.kind for f in result.findings}
+
+
+# ---------------------------------------------------------------------------
 # CLI command
 # ---------------------------------------------------------------------------
 
@@ -433,38 +491,23 @@ _CI_YML = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "ci.ym
 def test_ci_gate_steps_use_bash_shell() -> None:
     """The recorded-vs-collected CI steps must declare ``shell: bash``.
 
-    The ``Collect tests`` step uses the bash ``|| true`` idiom and the
-    ``Recorded-vs-collected check`` step uses bash ``\\`` line continuations
-    in a multi-line ``run: |`` block.  The CI job runs on ``windows-latest``,
-    whose default shell is pwsh -- pwsh cannot parse ``\\`` at end of line
-    (it treats it as a literal backslash, then sees ``--junit`` on the next
-    line as a bare unary ``--`` operator and throws ``ParserError``), and
-    ``true`` is not a pwsh command.  Both steps must therefore explicitly
-    set ``shell: bash`` (Git Bash is always available on GitHub-hosted
-    Windows runners).
-
-    This is the mutation-checkable regression guard for the #1624 rework:
-    reverting either ``shell: bash`` line makes the test fail.
+    DD-4 moved the suite run into the ``tests-shard`` matrix and the
+    recorded-vs-collected check into the ``Tests`` aggregate. Both bodies
+    use bash syntax (``\\`` continuations, ``$VAR`` expansion); the shard runs
+    on windows-latest whose default shell is pwsh, which cannot parse them
+    (the #1624 ParserError). Reverting either ``shell: bash`` fails here.
     """
     assert _CI_YML.exists(), f"ci.yml not found at {_CI_YML}"
     workflow = yaml.safe_load(_CI_YML.read_text(encoding="utf-8"))
 
-    tests_job = workflow["jobs"]["Tests"]
-    steps = tests_job["steps"]
-    by_name = {s["name"]: s for s in steps if "name" in s}
+    shard_steps = {s["name"]: s for s in workflow["jobs"]["tests-shard"]["steps"] if "name" in s}
+    assert shard_steps["Run test shard"].get("shell") == "bash"
 
-    collect_step = by_name["Collect tests"]
-    assert collect_step.get("shell") == "bash", (
-        "ci.yml 'Collect tests' step must set shell: bash -- the "
-        "|| true idiom is bash, not pwsh (true is not a pwsh command)"
+    tests_steps = {s["name"]: s for s in workflow["jobs"]["Tests"]["steps"] if "name" in s}
+    # YAML strips "#1621)" as a comment from the unquoted name; match by prefix.
+    gate_step = next(
+        s for n, s in tests_steps.items() if n.startswith("Recorded-vs-collected check")
     )
-
-    # The step name in the YAML source is "Recorded-vs-collected check
-    # (issue #1621)", but YAML strips the "#1621)" as a comment, so the
-    # parsed name is "Recorded-vs-collected check (issue".  Match by prefix.
-    gate_step = next(s for n, s in by_name.items() if n.startswith("Recorded-vs-collected check"))
-    assert gate_step.get("shell") == "bash", (
-        "ci.yml 'Recorded-vs-collected check' step must set shell: bash -- "
-        "the multi-line run block uses bash \\ line continuations that pwsh "
-        "cannot parse (ParserError: Missing expression after unary '--')"
-    )
+    assert gate_step.get("shell") == "bash"
+    assert "--junit 'junit/pytest-junit-*.xml'" in gate_step["run"]
+    assert "--collect head_collect.txt" in gate_step["run"]
