@@ -69,7 +69,9 @@ def _make_sibling_clone_ctx(sibling_root: Path, config: OrchestratorConfig) -> c
     return cli.CommandContext(repo_root=sibling_root, config=config, paths=paths, gh=gh)
 
 
-def test_init_git_repo_with_origin_goes_through_git_template(tmp_path: Path) -> None:
+def test_init_git_repo_with_origin_goes_through_git_template(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Issue #2345: the sibling-clone repo builder must materialize through the
     per-process ``plain`` git template (``_git_templates``, HS-CW-4) instead of
     re-running the six-process init sequence per call — the ledger measured
@@ -80,6 +82,7 @@ def test_init_git_repo_with_origin_goes_through_git_template(tmp_path: Path) -> 
 
     import _git_templates
 
+    monkeypatch.delenv(_git_templates.REUSE_ENV, raising=False)
     remote_url = "https://github.com/test/canonical.git"
     before = _git_templates._REGISTRY.materialized["plain"]
     repo = _init_git_repo_with_origin(tmp_path / "repo", remote_url)
