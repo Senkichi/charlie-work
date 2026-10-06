@@ -268,7 +268,12 @@ def test_shim_serves_run_list_over_rest(tmp_path: Path) -> None:
     lookup, request = http.api_requests
     assert lookup.route == "repos/octo/hello/actions/workflows"
     assert request.route == "repos/octo/hello/actions/workflows/5/runs"
-    assert dict(request.query) == {"per_page": "100", "branch": "main", "status": "queued"}
+    assert dict(request.query) == {
+        "per_page": "100",
+        "exclude_pull_requests": "true",
+        "branch": "main",
+        "status": "queued",
+    }
 
 
 def test_shim_dry_run_short_circuits_a_mutation(tmp_path: Path) -> None:
