@@ -216,6 +216,44 @@ def test_self_deploy_defers_sync_when_fleet_runners_active(
     assert "starved_notified" not in marker
 
 
+def test_self_deploy_defers_via_host_sessions_port(
+    tmp_path: Path, fake_host: Any, no_fleet_live_sessions: None
+) -> None:
+    """Issue #2230: ``_self_deploy_attempt`` must reach the fleet live-worker
+    count through ``host.current().sessions.fleet_live_workers`` -- the port
+    every other consumer uses -- not by calling
+    ``fleet_registry.count_fleet_live_sessions`` directly.
+
+    ``fake_host(sessions=FakeSessionCounter(...))`` only intercepts the port.
+    If the call site bypassed it (e.g. reverted to the pre-#2230 direct
+    ``fleet_registry`` call), this fake would never be consulted: the pinned
+    ``no_fleet_live_sessions`` zero would apply instead, the sync would not
+    defer, and the ``counter.calls`` assertion below would fail outright.
+    """
+    from charlie_work.host.fakes import FakeSessionCounter
+
+    counter = FakeSessionCounter(fleet_workers=(2, []))
+    fake_host(sessions=counter)
+
+    runner, calls = _make_fake_runner(
+        [
+            RunResult(0, "abc123\n", ""),  # before HEAD
+            RunResult(0, "", ""),  # pull ok
+            RunResult(0, "def456\n", ""),  # after HEAD
+            RunResult(0, "pyproject.toml\nuv.lock\n", ""),  # diff
+            RunResult(0, "", ""),  # uv sync (should not be reached)
+        ]
+    )
+
+    result = self_deploy(tmp_path, run_command=runner)
+
+    assert result.deferred is True
+    assert result.synced is False
+    assert result.message == "sync deferred: 2 runners active"
+    assert all(c[0] != ["uv", "sync"] for c in calls)
+    assert counter.calls == [("fleet_live_workers", (None,))]
+
+
 def test_self_deploy_honors_state_root_override(tmp_path: Path, monkeypatch: Any) -> None:
     """Issue #720: a configured state_root moves the pending-sync marker out of default."""
     custom_state_root = tmp_path / ".var" / "devin-orchestrator"
