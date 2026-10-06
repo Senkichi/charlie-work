@@ -34,7 +34,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from _src_ast import parsed, source_files
+from _src_ast import parsed, source_files, source_text
 
 from _fakes_github import FakeGitHub
 from _orphan_sweep_fixtures import _dead_worker_rework_bed, _run_orphan_sweep
@@ -247,6 +247,9 @@ def test_every_src_set_throttled_until_call_site_passes_source_literal() -> None
     src_root = Path(__file__).parents[1] / "src" / "charlie_work"
     violations: list[str] = []
     for path in source_files(src_root):
+        text = source_text(path)
+        if "set_throttled_until" not in text and "persist_failure" not in text:
+            continue
         tree = parsed(path)
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
