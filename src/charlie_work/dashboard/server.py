@@ -27,6 +27,7 @@ from urllib.parse import parse_qs
 
 from .config import DashboardConfig
 from .history_data import HistoryCache, history_cache, pick_range, pick_tab
+from .now_progress_data import ProgressCache
 from .pages.history import render_history
 from .pages.now import render_fragment, render_now
 from .read_model import (
@@ -147,9 +148,11 @@ class _App:
         port: int,
         history: HistoryCache,
         sources: DashboardSources,
+        progress: ProgressCache,
     ):
         self.holder = holder
         self.history = history
+        self.progress = progress
         self.sources = sources
         self.config = config
         self.clock = clock
@@ -202,11 +205,22 @@ class _Handler(SecureHandler):
         state = self.app.holder.get()
         poll = self.app.config.poll_interval_seconds
         if path in ("/", "/now"):
-            self._html(render_now(state, poll_seconds=poll, stalled=self._stalled(state)))
+            self._html(
+                render_now(
+                    state,
+                    poll_seconds=poll,
+                    stalled=self._stalled(state),
+                    progress=self.app.progress.get(),
+                )
+            )
         elif path == "/history":
             self._history(parse_qs(query), state)
         elif path == "/now/fragment":
-            self._html(render_fragment(state, poll, self._stalled(state)))
+            self._html(
+                render_fragment(
+                    state, poll, self._stalled(state), progress=self.app.progress.get()
+                )
+            )
         elif path == "/api/now.json":
             self._json(to_plain(state))
         elif path == "/healthz":
@@ -306,7 +320,10 @@ def make_server(
     holder = ReadModel()
     history = history_cache(sources.history_db, float(config.rollup_interval_seconds), clock)
     port = int(httpd.server_address[1])
-    httpd.app = _App(holder, config, clock, port, history, sources)  # type: ignore[attr-defined]
+    progress = ProgressCache(sources.history_db, float(config.rollup_interval_seconds), clock)
+    httpd.app = _App(  # type: ignore[attr-defined]
+        holder, config, clock, port, history, sources, progress
+    )
     return DashboardServer(httpd, holder, config, sources, clock)
 
 
