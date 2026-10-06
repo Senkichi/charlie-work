@@ -20,7 +20,6 @@ from .github import GitHub, GitHubError, GitHubLike
 from .paths import RepoNotFoundError, RuntimePaths, find_repo_root
 from .safe_path import contains
 from .state import save_state, state_lock
-from .worker import iter_workers
 
 if TYPE_CHECKING:
     from .config import OrchestratorConfig, RuntimeConfig
@@ -408,9 +407,19 @@ def count_fleet_live_sessions(
     """Count live worker sessions across all registered repos in the fleet.
 
     Reads the fleet registry, iterates over each registered repo, resolves its
-    sessions_dir, and counts live workers using the adapter-agnostic iter_workers
-    from worker.py. Tolerates per-repo problems by skipping them and returning a
-    list of skipped repo keys for operator visibility.
+    sessions_dir, and counts live workers. Tolerates per-repo problems by
+    skipping them and returning a list of skipped repo keys for operator
+    visibility.
+
+    Each repo contributes
+    ``dead_worker_sweep.effects_sessions._count_live_sessions(sessions_dir,
+    state_file)`` -- the SAME liveness rule the per-repo
+    ``dispatch.max_concurrent_sessions`` cap uses (sidecar ``is_alive`` plus
+    the ghost-worker corroboration against the repo's ``state.json``, issue
+    #343), so the fleet and per-repo caps cannot disagree about what "live"
+    means (issue #2230: before this, the fleet count walked sidecars only and
+    a ghost -- a dispatched issue whose worker_pid is alive but whose
+    sidecar is gone -- was invisible to it).
 
     Args:
         fleet_dir_override: Optional override for the fleet directory path.
@@ -423,6 +432,10 @@ def count_fleet_live_sessions(
         - config load failure (missing/unreadable/malformed/invalid), or
         - resolved sessions_dir missing.
     """
+    # Imported at the one call site so fleet_registry's module-load graph is
+    # unchanged for every review-lane consumer.
+    from .dead_worker_sweep.effects_sessions import _count_live_sessions
+
     total_live_count = 0
     skipped_repos: list[str] = []
 
@@ -442,10 +455,7 @@ def count_fleet_live_sessions(
             skipped_repos.append(name_with_owner)
             continue
 
-        # Count live workers using adapter-agnostic iter_workers
-        workers = iter_workers(sessions_dir, repo_key=name_with_owner)
-        live_count = sum(1 for worker in workers if worker.is_alive())
-        total_live_count += live_count
+        total_live_count += _count_live_sessions(sessions_dir, layout.state_file_path(state_dir))
 
     return total_live_count, skipped_repos
 
