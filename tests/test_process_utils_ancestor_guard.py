@@ -464,18 +464,20 @@ class _FakePsutilProc:
 def test_win32_process_ppid_snapshot_normalizes_single_result(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Rows come from one ``psutil.process_iter`` pass: pid, ppid, and the
-    UTC-derived ``create_time`` (seconds, one unit for every row). An
-    unreadable creation time (``AccessDenied`` -> ``None``) yields ``created
-    is None`` so the link is kept, and a missing ppid maps to 0."""
+    """Rows come from one ``psutil.process_iter`` pass (pid + UTC-derived
+    ``create_time``, seconds, one unit for every row) plus the bulk ppid map
+    (#2353 — a per-row ``ppid`` column is O(n²) on Windows). An unreadable
+    creation time (``AccessDenied`` -> ``None``) yields ``created is None``
+    so the link is kept, and a missing ppid maps to 0."""
+    monkeypatch.setattr(_pc, "_bulk_ppid_map", lambda: {7: 3, 8: 7})
     monkeypatch.setattr(
         _pc.psutil,
         "process_iter",
         lambda attrs=None: iter(
             [
-                _FakePsutilProc(pid=7, ppid=3, create_time=99.5),
-                _FakePsutilProc(pid=8, ppid=7, create_time=None),
-                _FakePsutilProc(pid=4, ppid=None, create_time=1.0),
+                _FakePsutilProc(pid=7, create_time=99.5),
+                _FakePsutilProc(pid=8, create_time=None),
+                _FakePsutilProc(pid=4, create_time=1.0),
             ]
         ),
     )
@@ -510,6 +512,7 @@ def test_win32_process_ppid_snapshot_real_rows_carry_creation_times() -> None:
     row = snapshot.get(os.getpid())
     assert row is not None, "own pid missing from the real snapshot"
     assert row.created is not None, "creation time unavailable: recycle guard is inert"
+    assert row.ppid == os.getppid(), "ppid table broken or zeroed: ancestor guard is unprotected"
     parent_row = snapshot.get(row.ppid)
     if parent_row is not None and parent_row.created is not None:
         assert parent_row.created <= row.created
