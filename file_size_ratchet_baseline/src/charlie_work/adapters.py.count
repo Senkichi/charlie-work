@@ -1,6 +1,0 @@
-1000
-# Issue #2229: the worker-launch errors-as-values boundary added the
-# claude-code/api ``except Exception`` shims (mirroring devin-shell) plus the
-# shared _record_result/_launch_exc_result helpers, lifting adapters.py past
-# the 800-line cap for the first time (820 live). New over-cap file -> first
-# baseline entry, quantized to the next multiple of 200 per MARK_QUANTUM.
