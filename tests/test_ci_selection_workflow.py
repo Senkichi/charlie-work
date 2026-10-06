@@ -117,6 +117,21 @@ def test_the_nightly_shard_runs_in_map_mode(tmp_path: Path) -> None:
     ]
 
 
+def test_a_dispatch_with_the_map_input_runs_in_map_mode(tmp_path: Path) -> None:
+    result, cmds = _shard(tmp_path, EVENT_NAME="workflow_dispatch", MAP_INPUT="true", GROUP="2")
+    assert result.returncode == 0, result.stderr
+    assert cmds == [
+        "uv run --no-sync ci-fleet map prepare ctx=nightly",
+        f"{PYTEST.format(g=2)} --store-durations -p ci_fleet.selection.map_mode ctx=nightly",
+    ]
+
+
+def test_a_dispatch_with_the_map_input_off_stays_unwrapped(tmp_path: Path) -> None:
+    result, cmds = _shard(tmp_path, EVENT_NAME="workflow_dispatch", MAP_INPUT="false")
+    assert result.returncode == 0, result.stderr
+    assert cmds == [f"{PYTEST.format(g=1)} ctx="]
+
+
 def test_a_failed_map_prepare_still_runs_the_nightly_shard(tmp_path: Path) -> None:
     result, cmds = _shard(tmp_path, EVENT_NAME="schedule", FAKE_PREPARE_RC="1")
     assert result.returncode == 0, result.stderr
@@ -310,6 +325,7 @@ def test_the_map_job_merges_and_uploads_the_map() -> None:
     job = JOBS["map"]
     assert set(job["needs"]) == {"coverage", "tests-shard"}
     assert "always()" in job["if"] and "github.event_name == 'schedule'" in job["if"]
+    assert "inputs.map" in job["if"]
     assert "map" not in JOBS["Tests"]["needs"]  # never part of the required check
     [download] = _uses(job, "actions/download-artifact@")
     assert download["with"]["pattern"] == "map-shard-*"
