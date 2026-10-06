@@ -235,7 +235,7 @@ def _assert_repo_b_selects_fallback(root: Path, fake_host) -> None:
 
 
 def test_one_sweep_pass_classifies_the_death_and_feeds_the_waterfall(
-    tmp_path: Path, fake_host
+    tmp_path: Path, fake_host, monkeypatch
 ) -> None:
     config = _config()
     paths, sessions_dir, gh = _seed_dead_primary(tmp_path / "a", config)
@@ -254,7 +254,7 @@ def test_one_sweep_pass_classifies_the_death_and_feeds_the_waterfall(
 
 
 def test_redispatch_and_phantom_in_the_same_pass_keep_the_ledger_entry(
-    tmp_path: Path, fake_host
+    tmp_path: Path, fake_host, monkeypatch
 ) -> None:
     config = _config()
     paths, sessions_dir, gh = _seed_dead_primary(tmp_path / "a", config)
@@ -337,7 +337,7 @@ def test_dry_run_sweep_does_not_classify(tmp_path: Path, monkeypatch) -> None:
 
 
 def test_fallback_quota_death_does_not_block_the_recovered_primary(
-    tmp_path: Path, fake_host
+    tmp_path: Path, fake_host, monkeypatch
 ) -> None:
     """Issue #2279 acceptance: chain [A, B] on ONE adapter; B dies
     ``rate_limited`` while A's own restriction has already lapsed.
@@ -374,7 +374,7 @@ def test_fallback_quota_death_does_not_block_the_recovered_primary(
 
 
 def test_fallback_quota_death_window_blocks_when_its_ledger_entry_lapses_first(
-    tmp_path: Path, fake_host
+    tmp_path: Path, fake_host, monkeypatch
 ) -> None:
     """Counter-case: once B's own ledger restriction also expires, its window
     is unexplained and blocks again -- a stamped window is not a free pass."""

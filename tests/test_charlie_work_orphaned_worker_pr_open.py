@@ -114,7 +114,7 @@ def test_orphaned_worker_approved_without_rework_status_still_drifts(
 
 
 def test_orphaned_worker_drift_fingerprint_cleared_on_redispatch(
-    tmp_path: Path, fake_host
+    tmp_path: Path, fake_host, monkeypatch
 ) -> None:
     """Issue #457 review: a fresh dispatch clears the drift fingerprint.
 
