@@ -131,6 +131,110 @@ def test_win32_snapshot_failure_returns_empty(monkeypatch: pytest.MonkeyPatch) -
     assert pc.win32_process_ppid_snapshot() == {}
 
 
+class _FakePsutilProcess:
+    """``psutil.Process`` stand-in for ``win32_ancestor_rows``: looks up
+    ``(ppid, create_time)`` rows in a dict, raising ``NoSuchProcess`` for a
+    pid with no row — the fabricated dead-pid boundary. ``probes`` records
+    which pids were touched so tests can pin the walk's scope."""
+
+    def __init__(
+        self,
+        pid: int,
+        rows: dict[int, tuple[int, float | None]],
+        probes: list[int],
+    ) -> None:
+        probes.append(pid)
+        self._pid = pid
+        self._rows = rows
+
+    def ppid(self) -> int:
+        if self._pid not in self._rows:
+            raise pc.psutil.NoSuchProcess(self._pid)
+        return self._rows[self._pid][0]
+
+    def create_time(self) -> float:
+        if self._pid not in self._rows:
+            raise pc.psutil.NoSuchProcess(self._pid)
+        created = self._rows[self._pid][1]
+        if created is None:
+            raise pc.psutil.AccessDenied(self._pid)
+        return created
+
+
+def _patch_win32_process(
+    monkeypatch: pytest.MonkeyPatch,
+    rows: dict[int, tuple[int, float | None]],
+) -> list[int]:
+    """Install the fabricated ``psutil.Process`` and return its probe log."""
+    probes: list[int] = []
+    monkeypatch.setattr(
+        pc.psutil,
+        "Process",
+        lambda pid: _FakePsutilProcess(pid, rows, probes),
+    )
+    return probes
+
+
+def test_win32_ancestor_rows_walks_only_the_chain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Chain-scoped (issue #2332): rows are gathered hop by hop through
+    ``psutil.Process`` — the host-wide ``process_iter`` must never run, and
+    pids off the chain are never touched."""
+    rows = {300: (200, 5.0), 200: (100, 3.0), 100: (1, 1.0), 50: (1, 0.5)}
+    probes = _patch_win32_process(monkeypatch, rows)
+
+    def boom(attrs: Any = None) -> Any:
+        raise AssertionError("win32_ancestor_rows must not enumerate all processes")
+
+    monkeypatch.setattr(pc.psutil, "process_iter", boom)
+
+    # pid 1 has no row: the walk names it in the child's ppid but cannot
+    # read it — the same absent-row boundary a full snapshot produces.
+    assert pc.win32_ancestor_rows(300) == {
+        300: pc.ProcRow(200, 5.0),
+        200: pc.ProcRow(100, 3.0),
+        100: pc.ProcRow(1, 1.0),
+    }
+    assert 50 not in probes
+
+
+def test_win32_ancestor_rows_keeps_link_when_create_time_unreadable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A hop whose creation time cannot be read keeps its link via
+    ``created=None`` — the same ``AccessDenied`` rule the full snapshot
+    applies, so the walk adjudicates the link, not the gather."""
+    rows = {300: (200, 5.0), 200: (100, None), 100: (1, 1.0)}
+    _patch_win32_process(monkeypatch, rows)
+
+    assert pc.win32_ancestor_rows(300) == {
+        300: pc.ProcRow(200, 5.0),
+        200: pc.ProcRow(100, None),
+        100: pc.ProcRow(1, 1.0),
+    }
+
+
+def test_win32_ancestor_rows_returns_empty_when_self_unreadable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dead/unreadable start pid yields ``{}`` — indistinguishable from a
+    failed snapshot, so the caller's degrade path treats it the same."""
+    _patch_win32_process(monkeypatch, rows={})
+
+    assert pc.win32_ancestor_rows(99999) == {}
+
+
+def test_win32_ancestor_rows_terminates_on_cycle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rows = {5: (7, 1.0), 7: (5, 1.0)}
+    probes = _patch_win32_process(monkeypatch, rows)
+
+    assert pc.win32_ancestor_rows(5) == {5: pc.ProcRow(7, 1.0), 7: pc.ProcRow(5, 1.0)}
+    assert probes == [5, 7]
+
+
 def test_posix_snapshot_reads_fabricated_procfs(tmp_path: Path) -> None:
     for pid, ppid in {100: 50, 200: 100}.items():
         proc_dir = tmp_path / str(pid)

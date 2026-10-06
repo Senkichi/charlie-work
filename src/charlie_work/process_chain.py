@@ -115,6 +115,51 @@ def win32_process_ppid_snapshot() -> dict[int, ProcRow]:
     return ppid_by_pid
 
 
+def win32_ancestor_rows(pid: int, *, max_hops: int = MAX_CHAIN_HOPS) -> dict[int, ProcRow]:
+    """``pid -> ProcRow`` for ``pid``'s own ancestor chain, gathered hop by hop.
+
+    Same row shape as ``win32_process_ppid_snapshot``, but scoped to the one
+    chain a caller-side guard actually walks: each hop is a single
+    ``psutil.Process`` read instead of a host-wide ``process_iter`` over
+    every process on the box. The snapshot costs a
+    ``NtQuerySystemInformation`` round-trip per process (seconds at a few
+    hundred processes) while a real chain is a handful of hops — and the
+    kill guard (``orphan_sweep._self_ancestor_pids``) only ever consults
+    rows on its own chain, so rows for unrelated processes were pure cost
+    on every ``kill_process_tree``/``kill_orphan_pid`` call (issue #2332).
+
+    Recording rows without adjudicating keeps ``ancestor_chain_pids`` the
+    sole owner of the termination rules: a parent created *after* its child
+    is still recorded here and rejected there, exactly as in a full
+    snapshot. A hop whose creation time is unreadable keeps its link via
+    ``created=None`` (the snapshot's ``AccessDenied`` rule); a hop whose
+    process is gone or whose ppid cannot be read simply has no row, which
+    the walk treats as the same absent-row boundary a full snapshot would.
+
+    Returns ``{}`` if ``pid``'s own row cannot be read — indistinguishable
+    from a failed snapshot for the caller's degrade path.
+    """
+    rows: dict[int, ProcRow] = {}
+    current = pid
+    for _ in range(max_hops):
+        if current <= 0 or current in rows:
+            break
+        try:
+            proc = psutil.Process(current)
+            ppid = proc.ppid()
+        except (psutil.Error, OSError):
+            break
+        try:
+            created = proc.create_time()
+        except (psutil.Error, OSError):
+            created = None
+        rows[current] = ProcRow(
+            int(ppid or 0), float(created) if isinstance(created, (int, float)) else None
+        )
+        current = rows[current].ppid
+    return rows
+
+
 def posix_process_ppid_snapshot(proc_root: Path = Path("/proc")) -> dict[int, ProcRow]:
     """Snapshot ``pid -> ppid`` from procfs (``/proc/<pid>/stat``).
 
