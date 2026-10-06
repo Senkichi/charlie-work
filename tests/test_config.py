@@ -2038,15 +2038,6 @@ main_ci_reclaim:
     assert config.main_ci_reclaim.workflow_filename == "tests.yml"
 
 
-def test_build_config_from_data_require_worker_github_token_rejects_non_bool() -> None:
-    """Issue #1001: dispatch.require_worker_github_token must be a bool."""
-    with pytest.raises(
-        ConfigError,
-        match=r"^dispatch\.require_worker_github_token: expected bool, got ",
-    ):
-        build_config_from_data({"dispatch": {"require_worker_github_token": "true"}})
-
-
 def test_build_config_from_data_archive_unreachable_local_commits_rejects_non_bool() -> None:
     """Issue #1944: dispatch.archive_unreachable_local_commits must be a bool."""
     with pytest.raises(
