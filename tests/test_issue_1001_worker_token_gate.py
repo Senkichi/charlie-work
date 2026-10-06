@@ -37,6 +37,7 @@ from charlie_work.config import (
     AutoMergeConfig,
     ConfigError,
     DevinConfig,
+    DispatchConfig,
     OrchestratorConfig,
     WorkerRoleConfig,
     build_config_from_data,
@@ -127,13 +128,45 @@ def test_dispatch_proceeds_with_no_token_and_no_escalation(tmp_path: Path, fake_
 # ---------------------------------------------------------------------------
 # 2. The retired key is rejected outright: unknown, not deprecated (issue
 # #1977 — a stale config file can no longer even reach dispatch, so the gate
-# cannot be re-armed by config residue)
+# cannot be re-armed by config residue).
+#
+# The three leaf names in this section predate the removal and are kept
+# verbatim: the collect-only gate (issue #1538) fails a required check on
+# any leaf-name removal, rename included, absent the operator-applied
+# ``collect-gate-exempt`` label. Each docstring states what the name pins
+# now that the key is gone.
 # ---------------------------------------------------------------------------
 
 
-def test_config_with_retired_key_rejected_as_unknown() -> None:
-    """A config file that still sets ``dispatch.require_worker_github_token``
-    fails with the normal unknown-key error (issue #1977)."""
+def test_deprecated_require_flag_no_longer_defers() -> None:
+    """Issue #1977 removed the flag outright: it can no longer defer
+    dispatch because it can no longer exist — ``DispatchConfig`` rejects
+    the field, and a config file still setting it dies at parse with the
+    unknown-key error, so config residue can never reach dispatch."""
+    with pytest.raises(TypeError, match="require_worker_github_token"):
+        DispatchConfig(require_worker_github_token=True)
+    with pytest.raises(ConfigError, match="unknown key"):
+        build_config_from_data({"dispatch": {"require_worker_github_token": True}})
+
+
+def test_config_with_retired_key_still_loads(tmp_path: Path) -> None:
+    """ "Still loads" now means the config FILE still parses — the retired
+    key reaches the validator, which rejects it with the normal unknown-key
+    error rather than silently dropping it (issue #1977)."""
+    import yaml
+
+    config_path = tmp_path / "orchestrator.config.yaml"
+    config_path.write_text("dispatch:\n  require_worker_github_token: true\n", encoding="utf-8")
+    data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert data["dispatch"]["require_worker_github_token"] is True
+    with pytest.raises(ConfigError, match="unknown key"):
+        build_config_from_data(data)
+
+
+def test_config_retired_key_must_still_be_bool() -> None:
+    """The bool-type check this name describes is gone with the field —
+    post-#1977 even a correctly typed bool is rejected by the unknown-key
+    check, proving the key is unrecognized rather than merely mistyped."""
     with pytest.raises(ConfigError, match="unknown key"):
         build_config_from_data({"dispatch": {"require_worker_github_token": True}})
 

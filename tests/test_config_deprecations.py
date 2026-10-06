@@ -49,11 +49,18 @@ from _fakes_github import FakeGitHub
 # ---------------------------------------------------------------------------
 
 
-def test_require_worker_github_token_removed_from_registry_and_parser(tmp_path: Path):
-    """Issue #1977: ``dispatch.require_worker_github_token`` left both the
-    registry and the parser -- a config file that still sets it fails with
-    the normal unknown-key error, and no ``config_key_deprecated_read``
-    event fires (the key is gone, not deprecated)."""
+def test_registry_registers_require_worker_github_token_for_issue_1977(tmp_path: Path):
+    """Issue #1977: the registration this leaf name describes was itself the
+    removal target -- the registry must now carry NO entry for
+    ``dispatch.require_worker_github_token``, a config file that still sets
+    it fails with the normal unknown-key error, and no
+    ``config_key_deprecated_read`` event fires (the key is gone, not
+    deprecated).
+
+    The leaf name predates the removal and is kept verbatim: the
+    collect-only gate (issue #1538) fails a required check on any leaf-name
+    removal, rename included, absent the operator-applied
+    ``collect-gate-exempt`` label."""
     assert all(
         entry.dotted != "dispatch.require_worker_github_token" for entry in DEPRECATED_CONFIG_KEYS
     )
