@@ -19,7 +19,12 @@ from _dashboard_rollup_fixtures import (  # noqa: F401  (fleet is a pytest fixtu
 )
 
 from charlie_work.dashboard import history_data, rollup
-from charlie_work.dashboard.rollup_derive import reason_group
+from charlie_work.dashboard.rollup_derive import (
+    HANDLERS,
+    KNOWN_IGNORED,
+    is_classified,
+    reason_group,
+)
 from charlie_work.dashboard.rollup_schema import SCHEMA_VERSION
 
 
@@ -471,3 +476,64 @@ def test_unclassified_kinds_survive_a_transient_source_error(fleet, caplog) -> N
     assert "not interpreted" not in caplog.text  # recovery is not a set change either
     stored = _all(fleet.db(), "SELECT value FROM meta WHERE key = 'unclassified_kinds'")
     assert json.loads(stored[0][0]) == {ALPHA: {"brand_new_unclassified_kind": 1}}
+
+
+# Issue #2459: the 25 kinds the live "not interpreted" warning listed on 2026-10-06.
+_ISSUE_2459_KINDS = (
+    "cross_family_regen_not_reached",
+    "cross_family_report_regen_exhausted",
+    "cross_family_report_regen_forced",
+    "cross_family_verdict_abandoned",
+    "cross_family_verdict_head_indeterminate",
+    "cross_family_verdict_unparseable",
+    "dead_dispatched_throttle_rearmed_sweep",
+    "dead_dispatched_worker_reaped_sweep",
+    "label_ensure_incomplete",
+    "label_ensure_ok",
+    "operator_local_park",
+    "operator_orphan_push_completed",
+    "operator_orphan_requeue",
+    "operator_probe_advanced",
+    "operator_queue_depth",
+    "operator_reviewer_quota_cleared",
+    "operator_rework_rearmed",
+    "operator_state_correction",
+    "orphaned_worker_recovered_sweep",
+    "review_packet_discarded_head_moved",
+    "rework_label_skipped_issue_closed",
+    "salvage_push_failed_sweep",
+    "session_failed_relabeled_sweep",
+    "unauthorized_merge_ack_revoked",
+    "worker_token_missing",
+)
+
+
+@pytest.mark.parametrize("kind", _ISSUE_2459_KINDS)
+def test_issue_2459_kind_is_classified(kind: str) -> None:
+    assert is_classified(kind)
+
+
+def test_ignored_sweep_variant_inherits_its_sibling_classification() -> None:
+    """A ``<kind>_sweep`` of an ignored kind is classified without its own entry."""
+    for base in (
+        "dead_dispatched_worker_reaped",
+        "salvage_push_failed",
+        "orphaned_worker_recovered",
+    ):
+        assert base in KNOWN_IGNORED
+        assert base + "_sweep" not in KNOWN_IGNORED
+        assert is_classified(base + "_sweep")
+        assert base + "_sweep" not in HANDLERS  # ignored, not silently handled
+
+
+def test_sweep_of_unknown_kind_stays_unclassified() -> None:
+    assert not is_classified("brand_new_unclassified_kind_sweep")
+    assert not is_classified("brand_new_unclassified_kind")
+
+
+def test_issue_2459_kinds_are_not_counted_unclassified_by_the_rollup(fleet) -> None:
+    for n, kind in enumerate(_ISSUE_2459_KINDS):
+        fleet.emit(fleet.alpha, f"2026-10-01T10:{n:02d}:00Z", kind, {"issue_numbers": [1]})
+    result = rollup.run_rollup(fleet.sources(), NOW)
+    assert result.errors == ()
+    assert {s.source: s for s in result.sources}[ALPHA].unclassified == {}
