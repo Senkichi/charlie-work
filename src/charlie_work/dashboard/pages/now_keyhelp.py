@@ -15,9 +15,15 @@ def _keys(page: str) -> tuple[tuple[str, str], ...]:
     views = live_views()
     go = (" / ".join(f"g {v.key}" for v in views), "go to " + " / ".join(v.name for v in views))
     if page != "now":  # j/k, Enter, c and o act on the Needs-you list, which only Now has
+        chart = (
+            (("← / →", "pick a bucket while the chart is focused (Esc clears)"),)
+            if page == "history"
+            else ()
+        )
         return (
             go,
             ("Tab", "move through tabs, range and links"),
+            *chart,
             ("?", "show or hide this panel"),
         )
     keys = [

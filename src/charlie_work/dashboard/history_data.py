@@ -23,14 +23,24 @@ from .metrics import TABS, tab_results
 from .metrics_base import MetricQuery, Series, open_dashboard_ro
 from .takeaways import Compared, paired_assessments
 
-# Range key -> (window length, bucket size): about 28-30 buckets in every range.
+# Range key -> (window length, bucket size): the same four ranges and buckets as the Now
+# page's progress chart, so a bar spans the same time on both pages.
 RANGES: dict[str, tuple[timedelta, timedelta]] = {
+    "24h": (timedelta(hours=24), timedelta(hours=1)),
     "7d": (timedelta(days=7), timedelta(hours=6)),
-    "14d": (timedelta(days=14), timedelta(hours=12)),
     "30d": (timedelta(days=30), timedelta(days=1)),
-    "90d": (timedelta(days=90), timedelta(days=3)),
+    "90d": (timedelta(days=90), timedelta(days=1)),
 }
 DEFAULT_RANGE = "7d"
+
+
+def range_phrase(range_key: str) -> str:
+    """``"last 24 hours"`` / ``"last 7 days"``, derived from the range's window length."""
+    span = RANGES[range_key][0]
+    hours = int(span.total_seconds() // 3600)
+    return f"last {hours} hours" if hours < 48 else f"last {span.days} days"
+
+
 log = logging.getLogger("charlie_work.dashboard")
 
 TAB_KEYS: dict[str, str] = {name.lower(): name for name in TABS}  # url key -> TABS name
