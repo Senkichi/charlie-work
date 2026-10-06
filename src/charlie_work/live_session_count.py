@@ -88,9 +88,7 @@ def _ghost_pid_alive(entry: dict[str, Any], kind: LiveSessionKind) -> bool:
     return _host.current().probe.is_alive(pid, entry.get(kind.start_time_field))
 
 
-def count_live_sessions(
-    directory: Path, state_file: Path | None, kind: LiveSessionKind
-) -> int:
+def count_live_sessions(directory: Path, state_file: Path | None, kind: LiveSessionKind) -> int:
     """Count live sessions under ``directory``, corroborated against ``state_file``.
 
     Sidecar pass: every ``iter_workers`` record whose pid probe is alive

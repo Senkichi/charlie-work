@@ -455,9 +455,7 @@ def count_fleet_live_sessions(
             skipped_repos.append(name_with_owner)
             continue
 
-        total_live_count += _count_live_sessions(
-            sessions_dir, layout.state_file_path(state_dir)
-        )
+        total_live_count += _count_live_sessions(sessions_dir, layout.state_file_path(state_dir))
 
     return total_live_count, skipped_repos
 

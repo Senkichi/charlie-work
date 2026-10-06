@@ -41,7 +41,7 @@ from .review_fleet_gate import (
     fleet_review_lock_deferral,
     read_fleet_review_cap,
 )
-from .fleet_registry import count_fleet_live_reviews, count_fleet_live_sessions, managed_repo_names  # noqa: F401  (deliberate re-export; count_fleet_live_sessions used by moved L06 delegates via _wf., count_fleet_live_reviews by review_fleet_gate via _wf.)
+from .fleet_registry import count_fleet_live_reviews, managed_repo_names  # noqa: F401  (deliberate re-export; count_fleet_live_reviews by review_fleet_gate via _wf., managed_repo_names likewise. count_fleet_live_sessions is deliberately NOT imported here: it is a late-binding facade defined after the import block -- see below.)
 from . import layout, status_snapshot  # noqa: F401  (deliberate re-export; layout reached via _wf.layout by orchestration/misc_reconcile.py)
 from .main_ci_reclaim import reclaim_superseded_main_ci_runs  # noqa: F401  (deliberate re-export; used by moved L01 b3 delegates via _wf.)
 from .notify import AttentionDigest, AttentionEntry, emit_digest, reviewer_quota_alert_digest
@@ -514,6 +514,28 @@ from .dead_worker_sweep import (  # noqa: F401  (deliberate re-export)
     run_stalled_sweep as _detect_and_handle_stalled_sessions,
 )
 from .iso_timestamp import parse_iso_timestamp as _parse_iso_timestamp
+
+
+def count_fleet_live_sessions(
+    fleet_dir_override: str | None,
+) -> tuple[int, list[str]]:
+    """Late-binding facade over ``fleet_registry.count_fleet_live_sessions``.
+
+    This name is BOTH a re-export (the moved L06 delegates reach it via
+    ``_wf.count_fleet_live_sessions``) and the lookup target of
+    ``RealSessionCounter.fleet_live_workers`` -- the port supervise.py's
+    self-deploy now routes through (issue #2230). A plain ``from ... import``
+    re-export would freeze fleet_registry's function object at import time,
+    so a patch against ``fleet_registry.count_fleet_live_sessions`` -- the
+    attribute that call site used to reach -- would stop biting. Resolving
+    the attribute at call time keeps both patch surfaces live: patching this
+    name intercepts the port, patching fleet_registry's name intercepts the
+    delegate body. Defined after the import block so E402 does not fire on
+    every re-export below.
+    """
+    from . import fleet_registry
+
+    return fleet_registry.count_fleet_live_sessions(fleet_dir_override)
 
 
 def _max_touched_file_line_count(diff: str, repo_root: Path) -> int:
