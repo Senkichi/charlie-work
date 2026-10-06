@@ -23,6 +23,7 @@ from .config import OrchestratorConfig
 from .fleet_paths import fleet_dir
 from .fleet_registry import _load_registry, _select_repos
 from .github import GitHub
+from .github_transport.budget_pass import emit_github_budget_pass
 from .global_config import load_layered_config
 from .instrumentation import log_event
 from .local_issues import github_client_for
@@ -68,6 +69,7 @@ def _run_fleet_repo_lane(
     limit: int | None,
     merge: bool | None,
     ensure_labels: bool,
+    fleet_state_path: Path,
     deadline_exceeded: Callable[[], bool] | None = None,
 ) -> CommandResult:
     """One repo's lane body, executed on a pool thread (issue #1934).
@@ -181,6 +183,11 @@ def _run_fleet_repo_lane(
         )
     finally:
         markdown_guard.unbind_sink(sink_token)
+        # Issue #2439: this lane's GitHub spend, by capability, in the one
+        # fleet-level events.db so the hourly ranking is a single query.
+        # ``fleet_state_path`` is required: a silent ``None`` default would
+        # disable the accounting without any signal.
+        emit_github_budget_pass(app.gh, fleet_state_path, pass_kind="lane", repo_key=repo_key)
         lock.release()
 
 
@@ -243,7 +250,12 @@ def _run_fleet_reap_sweep(
                 dry_run=dry_run,
                 fleet_dir_override=fleet_dir_override,
             )
-            sweep = app._run_review_reap_sweeps(resolved_now)
+            try:
+                sweep = app._run_review_reap_sweeps(resolved_now)
+            finally:
+                # Issue #2439: emit even when the sweep raises, like the lane
+                # pass -- the requests spent before the failure still count.
+                emit_github_budget_pass(gh, fleet_state_path, pass_kind="reap", repo_key=repo_key)
             verdict_result = sweep.get("verdict_result") or {}
             payload = {
                 "repo_key": repo_key,

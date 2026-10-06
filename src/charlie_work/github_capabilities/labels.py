@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Any, Protocol, runtime_checkable
 from urllib.parse import quote
 
+from ..github_transport.capability import capability_name, capability_scope
 from ..github_transport.outcome import Response
 from ..github_transport.pagination import paginate_rest
 from ..github_transport.request import RestRequest
@@ -115,10 +116,11 @@ class Labels(CapabilityCollaborator):
         # REST ``GET labels`` over every page (B12: quota moves from GraphQL to
         # REST core); each item already carries ``name``. A failed or unreadable
         # read raises (issue #756): "could not read GitHub" is not "no labels".
-        outcome = paginate_rest(
-            self._transport_v2,
-            RestRequest.of("GET", "repos/{owner}/{repo}/labels", query={"per_page": 100}),
-        )
+        with capability_scope(capability_name(self)):
+            outcome = paginate_rest(
+                self._transport_v2,
+                RestRequest.of("GET", "repos/{owner}/{repo}/labels", query={"per_page": 100}),
+            )
         items = expect_json(outcome, command="GET repos/{owner}/{repo}/labels")
         return (
             [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
