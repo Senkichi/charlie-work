@@ -1,0 +1,10 @@
+2
+# Test impact selection: +2 raw log_event calls in worker_selection (the
+# worker_test_selection_disabled / worker_test_selection_unavailable
+# fallback events). A standalone function in a new module, not an
+# OrchestratorApp method, so it has no self.write_gate receiver -- same
+# out-of-wave pattern as ci_headroom.py and host_load.py. Prompts are
+# rendered outside the state lock, like _build_module_map_value. Lives at
+# top-level charlie_work/selection_wrapper.py (not under orchestration/):
+# every top-level def in a flat orchestration/ submodule is auto-installed
+# onto OrchestratorApp (see workflow_delegation.py).
