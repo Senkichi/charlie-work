@@ -142,6 +142,22 @@ class UsedCursor:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._value = GitHubUsedCursor()
+        self._exhausted: set[tuple[str, int]] = set()
+
+    def first_exhaustion(self, resource: str, reset_epoch: int | None, now: float) -> bool:
+        """True exactly once per (resource, window) across every client sharing
+        this cursor. The fleet builds a fresh client per lane pass, so a
+        per-client dedupe would re-emit the same exhausted window once per
+        lane. A response without a ``reset`` header has no window identity;
+        it is bucketed by wall-clock hour (the length of GitHub's primary
+        window) so it still fires once per hour rather than never or always."""
+        window = reset_epoch if reset_epoch is not None else -(int(now) // 3600) - 1
+        key = (resource, window)
+        with self._lock:
+            if key in self._exhausted:
+                return False
+            self._exhausted.add(key)
+            return True
 
     def advance(self, sample: GitHubSample) -> int:
         with self._lock:
@@ -166,7 +182,6 @@ class RateBudgetHolder:
         self._value = GitHubRateBudget()
         self._spend = GitHubSpend()
         self._cursor = cursor if cursor is not None else PROCESS_USED_CURSOR
-        self._exhausted: set[tuple[str, int | None]] = set()
 
     @property
     def value(self) -> GitHubRateBudget:
@@ -198,15 +213,10 @@ class RateBudgetHolder:
             spend, self._spend = self._spend, GitHubSpend()
             return spend
 
-    def first_exhaustion(self, resource: str, reset_epoch: int | None) -> bool:
-        """True exactly once per (resource, window): the dedupe for the
-        rate-limit event, since a retried call hits the same limit again."""
-        key = (resource, reset_epoch)
-        with self._lock:
-            if key in self._exhausted:
-                return False
-            self._exhausted.add(key)
-            return True
+    def first_exhaustion(self, resource: str, reset_epoch: int | None, now: float) -> bool:
+        """Process-wide once-per-(resource, window) dedupe for the rate-limit
+        event (see ``UsedCursor.first_exhaustion``)."""
+        return self._cursor.first_exhaustion(resource, reset_epoch, now)
 
 
 def circuit_open_message(breaker: BreakerPort, description: str) -> str:
@@ -472,7 +482,7 @@ class GuardedTransport:
         """One ``github_rate_limited`` event per exhausted window, wherever the
         limit is hit (it used to be a log warning outside reconcile only)."""
         sample = sample_github_rate(response.headers)
-        if not self.budget.first_exhaustion(sample.resource, sample.reset_epoch):
+        if not self.budget.first_exhaustion(sample.resource, sample.reset_epoch, self._now()):
             return
         logger.warning(
             "GitHub primary rate limit hit on %s (%s): %s",

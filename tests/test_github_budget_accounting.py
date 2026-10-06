@@ -7,15 +7,20 @@ between tests through the process-wide default.
 
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 
 from charlie_work.api_budget import GitHubSpendEntry
 from charlie_work.github_capabilities._send import send as capability_send
 from charlie_work.github_transport import (
     Adapters,
+    CliCommand,
+    CliRequest,
+    GraphQLError,
     GraphQLRequest,
     GuardedTransport,
     RateBudgetHolder,
+    Response,
     RestRequest,
     capability_name,
     capability_scope,
@@ -41,12 +46,18 @@ def _h(used: int, *, resource: str = "core", reset: int = 9000, remaining: int |
     }
 
 
-def _guard(*script, state_path: Path | None = None, cursor: UsedCursor | None = None):
+def _guard(
+    *script,
+    state_path: Path | None = None,
+    cursor: UsedCursor | None = None,
+    retries: int = 2,
+    gh: FakeAdapter | None = None,
+):
     http = FakeAdapter("http", list(script))
-    gh = FakeAdapter("gh", token="tok-1")
+    gh = gh if gh is not None else FakeAdapter("gh", token="tok-1")
     guard = GuardedTransport(
         Adapters(http=http, gh=gh),
-        runtime=Runtime(gh_max_retries=2),
+        runtime=Runtime(gh_max_retries=retries),
         state_path=state_path,
         resolve_owner_repo=lambda: ("octo", "hello"),
         budget=RateBudgetHolder(cursor if cursor is not None else UsedCursor()),
@@ -114,14 +125,42 @@ def test_a_retried_call_counts_every_attempt() -> None:
 
 
 def test_guards_sharing_a_cursor_do_not_double_count_concurrent_spend() -> None:
+    """Two lanes both baseline, then both see the same counter move (10 -> 14).
+
+    With a shared cursor the first sighting claims the +4 and the second sees
+    nothing new (total 4 == the observed delta). Per-holder cursors would each
+    claim +4 (total 8). The interleave is explicit, so it is deterministic.
+    """
     cursor = UsedCursor()
     a = _guard(ok({}, headers=_h(10)), ok({}, headers=_h(14)), cursor=cursor)
-    b = _guard(ok({}, headers=_h(12)), cursor=cursor)
+    b = _guard(ok({}, headers=_h(10)), ok({}, headers=_h(14)), cursor=cursor)
     a.send(GET_PR)  # baseline 10
-    b.send(GET_PR)  # +2 (other lanes' spend, attributed once)
-    a.send(GET_PR)  # +2 (12 -> 14)
-    total = a.take_spend().points + b.take_spend().points
-    assert total == 4  # == 14 - 10, the observed counter delta
+    b.send(GET_PR)  # same window, same counter: nothing to attribute
+    a.send(GET_PR)  # 10 -> 14
+    b.send(GET_PR)  # 14 again: already attributed to a
+    assert a.take_spend().points + b.take_spend().points == 4
+
+
+def test_guards_sharing_a_cursor_stay_exact_under_real_threads() -> None:
+    cursor = UsedCursor()
+    guards = [
+        _guard(*(ok({}, headers=_h(n)) for n in range(100, 140)), cursor=cursor) for _ in range(4)
+    ]
+    barrier = threading.Barrier(len(guards))
+
+    def run(guard: GuardedTransport) -> None:
+        barrier.wait()
+        for _ in range(40):
+            guard.send(GET_PR)
+
+    threads = [threading.Thread(target=run, args=(g,)) for g in guards]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    # The cursor only advances, so what is claimed in total is last - first,
+    # however the four replays of 100..139 interleave.
+    assert sum(g.take_spend().points for g in guards) == 39
 
 
 def test_a_stale_or_out_of_order_response_counts_nothing() -> None:
@@ -238,7 +277,7 @@ def test_primary_rate_limit_emits_one_event_across_retries(tmp_path: Path) -> No
         headers=_h(5000, remaining=0, reset=9500),
         status=403,
     )
-    guard = _guard(limited, limited, limited, state_path=state)
+    guard = _guard(limited, limited, limited, state_path=state, cursor=UsedCursor())
     with capability_scope("issues"):
         guard.send(GET_PR)  # 3 attempts, one exhausted window
     try:
@@ -270,8 +309,7 @@ def test_a_new_window_emits_again(tmp_path: Path) -> None:
     state = tmp_path / "state.json"
     first = ok({}, headers=_h(5000, remaining=0, reset=9500), status=403)
     second = ok({}, headers=_h(5000, remaining=0, reset=13100), status=403)
-    guard = _guard(first, second, state_path=state)
-    guard._runtime = Runtime(gh_max_retries=0)  # type: ignore[assignment]
+    guard = _guard(first, second, state_path=state, retries=0, cursor=UsedCursor())
     guard.send(GET_PR)
     guard.send(GET_PR)
     try:
@@ -333,3 +371,178 @@ def test_a_fleet_lane_emits_one_budget_pass_event_even_when_the_lane_raises(
     assert (payload["requests"], payload["points"]) == (2, 2)
     assert payload["capabilities"][0]["capability"] == "rest.issues"
     lock.release.assert_called_once()
+
+
+def _isolated_gh(tmp_path: Path):
+    """A real ``GitHub`` over scripted fakes with its own used-cursor."""
+    from _fake_transport import make_github
+
+    gh, _, _ = make_github(
+        tmp_path,
+        http=FakeAdapter("http", [ok([], headers=_h(7)), ok([], headers=_h(9))]),
+    )
+    gh._transport_v2.budget._cursor = UsedCursor()
+    return gh
+
+
+def _two_requests(gh) -> None:
+    gh.run(["api", "repos/{owner}/{repo}/issues"])
+    gh.run(["api", "repos/{owner}/{repo}/issues"])
+
+
+def _reap_once(tmp_path: Path, monkeypatch, sweep) -> Path:
+    """Run ``_run_fleet_reap_sweep`` over one real-registry repo whose app's
+    ``_run_review_reap_sweeps`` is ``sweep(gh)``; return the fleet state path."""
+    import json
+    from unittest.mock import MagicMock
+
+    from charlie_work import fleet_lanes, layout
+    from charlie_work.config import OrchestratorConfig
+
+    fleet = tmp_path / "fleet"
+    fleet.mkdir()
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    registry = {"repos": {"octo/hello": {"repo_root": str(repo_root)}}}
+    layout.fleet_registry_path(override=str(fleet)).write_text(
+        json.dumps(registry), encoding="utf-8"
+    )
+    gh = _isolated_gh(tmp_path)
+    app = MagicMock()
+    app._run_review_reap_sweeps.side_effect = lambda now: sweep(gh)
+    monkeypatch.setattr(fleet_lanes, "load_layered_config", lambda *a, **k: OrchestratorConfig())
+    monkeypatch.setattr(fleet_lanes, "runtime_paths", lambda *a, **k: MagicMock())
+    monkeypatch.setattr(fleet_lanes, "github_client_for", lambda *a, **k: gh)
+    monkeypatch.setattr(fleet_lanes, "OrchestratorApp", lambda *a, **k: app)
+    fleet_lanes._run_fleet_reap_sweep(fleet_dir_override=str(fleet))
+    return layout.state_file_path(fleet)
+
+
+def test_reap_sweep_emits_one_budget_pass_per_repo(tmp_path: Path, monkeypatch) -> None:
+    def sweep(gh) -> dict:
+        _two_requests(gh)
+        return {}
+
+    state = _reap_once(tmp_path, monkeypatch, sweep)
+    try:
+        (event,) = query_events(state, kind="github_budget_pass")
+    finally:
+        close_db(state)
+    payload = event["payload"]
+    assert (payload["pass_kind"], payload["repo_key"]) == ("reap", "octo/hello")
+    assert (payload["requests"], payload["points"]) == (2, 2)
+
+
+def test_reap_sweep_emits_budget_pass_even_when_the_sweep_raises(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Consistent with the lane pass: spend before a failure still counts."""
+
+    def sweep(gh) -> dict:
+        _two_requests(gh)
+        raise RuntimeError("sweep blew up")
+
+    state = _reap_once(tmp_path, monkeypatch, sweep)
+    try:
+        (event,) = query_events(state, kind="github_budget_pass")
+    finally:
+        close_db(state)
+    assert event["payload"]["requests"] == 2
+
+
+# -- exhausted-window dedupe is process-wide ------------------------------------
+
+
+def test_two_clients_observing_the_same_exhausted_window_emit_once(tmp_path: Path) -> None:
+    """The fleet builds a fresh client per lane pass: dedupe is per process."""
+    state = tmp_path / "state.json"
+    cursor = UsedCursor()
+
+    def limited(*, reset: int, resource: str = "core") -> Response:
+        return ok({}, headers=_h(5000, remaining=0, reset=reset, resource=resource), status=403)
+
+    def fire(response: Response, request) -> None:
+        _guard(response, state_path=state, cursor=cursor, retries=0).send(request)
+
+    try:
+        fire(limited(reset=9500), GET_PR)
+        fire(limited(reset=9500), GET_PR)
+        assert len(query_events(state, kind="github_rate_limited")) == 1
+        fire(limited(reset=9500, resource="graphql"), QUERY)  # other resource
+        assert len(query_events(state, kind="github_rate_limited")) == 2
+        fire(limited(reset=13100), GET_PR)  # new window re-arms
+        assert len(query_events(state, kind="github_rate_limited")) == 3
+    finally:
+        close_db(state)
+
+
+def test_rate_limit_dedupe_is_thread_safe() -> None:
+    cursor = UsedCursor()
+    barrier = threading.Barrier(8)
+    wins: list[bool] = []
+
+    def run() -> None:
+        barrier.wait()
+        wins.append(cursor.first_exhaustion("core", 9500, 1000.0))
+
+    threads = [threading.Thread(target=run) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert wins.count(True) == 1
+
+
+def test_a_missing_reset_header_dedupes_per_hour_not_forever() -> None:
+    cursor = UsedCursor()
+    assert cursor.first_exhaustion("core", None, 1000.0)
+    assert not cursor.first_exhaustion("core", None, 1500.0)  # same hour
+    assert cursor.first_exhaustion("core", None, 1000.0 + 3600)  # next hour
+    assert cursor.first_exhaustion("core", 0, 1000.0)  # never collides with a real epoch
+
+
+# -- other rate-limit shapes ----------------------------------------------------
+
+
+def test_graphql_rate_limited_error_emits_event(tmp_path: Path) -> None:
+    state = tmp_path / "state.json"
+    limited = Response(
+        200,
+        (),
+        '{"data": null}',
+        "http",
+        graphql_errors=(GraphQLError("API rate limit exceeded", "RATE_LIMITED"),),
+    )
+    guard = _guard(limited, state_path=state, cursor=UsedCursor(), retries=0)
+    with capability_scope("pull_requests"):
+        guard.send(QUERY)
+    try:
+        (event,) = query_events(state, kind="github_rate_limited")
+    finally:
+        close_db(state)
+    assert event["payload"]["capability"] == "pull_requests"
+    assert event["payload"]["status"] == 200
+
+
+def test_cli_requests_are_neither_spend_nor_rate_limit(tmp_path: Path) -> None:
+    state = tmp_path / "state.json"
+    gh = FakeAdapter(
+        "gh",
+        [ok({}, headers=_h(5000, remaining=0, reset=9500), status=403)],
+        token="tok-1",
+    )
+    guard = _guard(state_path=state, cursor=UsedCursor(), retries=0, gh=gh)
+    guard.send(CliRequest(CliCommand.AUTH_STATUS))
+    try:
+        assert query_events(state, kind="github_rate_limited") == []
+    finally:
+        close_db(state)
+    assert guard.take_spend().entries == ()
+
+
+def test_legacy_gh_run_names_the_capability_from_the_argv(tmp_path: Path) -> None:
+    gh = _isolated_gh(tmp_path)
+    gh.run(["pr", "view", "7", "--json", "number"], allow_failure=True)
+    gh.run(["api", "repos/{owner}/{repo}/issues"], allow_failure=True)
+    caps = {e.capability for e in gh._transport_v2.take_spend().entries}
+    assert caps == {"gh.pr_view", "rest.issues"}
