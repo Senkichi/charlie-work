@@ -59,8 +59,8 @@ def budget_deferral(app: Any, lane: str) -> BudgetDecision | None:
         _EMITTED.add(key)
     if first:
         app.write_gate.log_event(
-            _EVENT_KIND,
-            {
+            kind=_EVENT_KIND,
+            payload={
                 "remaining": decision.remaining,
                 "reset": decision.reset,
                 "threshold": decision.threshold,
