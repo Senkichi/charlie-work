@@ -572,9 +572,7 @@ def _issues_with_live_workers(sessions_dir: Path) -> set[int]:
     """Return the set of issue numbers that have currently alive worker sessions.
 
     Reads session sidecar files from both devin-shell and claude-code adapters,
-    then checks each record's PID liveness using the adapter-specific liveness
-    probe. Returns the set of issue numbers with alive PIDs.
+    then checks each record's PID liveness through the host session port.
+    Returns the set of issue numbers with alive PIDs.
     """
-    from ..worker import iter_workers
-
-    return {w.issue_number for w in iter_workers(sessions_dir) if w.is_alive()}
+    return _host.current().sessions.live_issue_numbers(sessions_dir)

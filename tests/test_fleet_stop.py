@@ -22,6 +22,7 @@ from _fleet_dispatch_fixtures import (
 )
 from charlie_work import cli, fleet_stop, layout
 from charlie_work.config import OrchestratorConfig, ReviewDispatchConfig, SupervisorConfig
+from charlie_work.host.fakes import FakeProcessProbe
 from charlie_work.fleet_dispatch import (
     FleetLocalSnapshot,
     WatchdogProbe,
@@ -179,6 +180,7 @@ def test_run_fleet_stop_reports_a_replaced_request(
 def test_run_fleet_stop_detects_a_live_supervisor(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    fake_host,
 ) -> None:
     """A live heartbeat (pid alive, no exited_at) reports supervisor_live."""
     monkeypatch.setattr(
@@ -190,7 +192,7 @@ def test_run_fleet_stop_detects_a_live_supervisor(
         "read_supervisor_heartbeat",
         lambda _o: {"exited_at": None, "pid": 12345},
     )
-    monkeypatch.setattr(fleet_stop, "is_pid_alive", lambda pid: pid == 12345)
+    fake_host(probe=FakeProcessProbe({12345: None}))
 
     result = cli.run_fleet_stop(_stop_args(tmp_path))
 

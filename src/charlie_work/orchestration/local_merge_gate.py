@@ -74,7 +74,6 @@ from charlie_work.local_lane import (
     suite_command_argv,
 )
 from charlie_work.orchestration.local_gate_finalize import LOCAL_SUITE_PASSED_FIELDS
-from charlie_work.process_utils import is_pid_alive
 from charlie_work.worktree import (
     _merge_update_rework_branch,
 )
@@ -388,7 +387,7 @@ def _local_gate_live_runner_meta(
     pid = meta.get("pid")
     if not isinstance(pid, int) or pid <= 0:
         return None
-    if not is_pid_alive(pid, meta.get("process_start_time")):
+    if not self.host.probe.is_alive(pid, meta.get("process_start_time")):
         return None
     return meta
 
@@ -479,7 +478,7 @@ def _local_gate_poll(
     pid = record.get("local_suite_pid")
     start_time = record.get("local_suite_process_start_time")
     if isinstance(pid, int) and pid > 0:
-        if is_pid_alive(pid, start_time):
+        if self.host.probe.is_alive(pid, start_time):
             started = _iso_dt(record.get("local_suite_started_at"))
             age = (datetime.now(UTC) - started).total_seconds() if started else 0
             timeout = effective_suite_timeout(self.paths.dispatches, self.paths.state_file)
@@ -528,7 +527,7 @@ def _local_gate_poll(
         and meta_pid > 0
         and meta is not None
         and meta.get("head_sha") == gate_head
-        and is_pid_alive(meta_pid, meta.get("process_start_time"))
+        and self.host.probe.is_alive(meta_pid, meta.get("process_start_time"))
     ):
         self._local_gate_update(
             pr_key,

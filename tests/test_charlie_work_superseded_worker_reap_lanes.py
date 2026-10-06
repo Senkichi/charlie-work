@@ -281,12 +281,50 @@ def test_dispatch_rework_prior_worker_block_escalates_at_cap(
     alive = {PRIOR_PID: True}
     kill_calls: list[tuple[int, float | None]] = []
     events: list[tuple[str, dict]] = []
+
+    # One liveness probe now answers every lane: the same alive pid that used
+    # to reach only the superseded-reap's local check is also seen by the
+    # cap-escalation live-worker deferral (``issue_worker_liveness``). A live,
+    # healthy worker defers rather than escalating, so this fixture's prior
+    # worker must read stalled — alive pid but no recent activity — for the
+    # deferral to pass it through to the reap lane the test exercises. The
+    # stale log file drives Signal 3 (progress staleness) to STALLED, and the
+    # real-activity probe corroborates nothing fresh.
+    import dataclasses
+    import os
+    from datetime import UTC, datetime, timedelta
+
+    from charlie_work.post_mortem import ActivitySource, RealActivityProbe
+
+    stale_log = tmp_path / "prior-worker.log"
+    stale_log.write_text("worker output\n", encoding="utf-8")
+    old_mtime = (datetime.now(UTC) - timedelta(hours=1)).timestamp()
+    os.utime(stale_log, (old_mtime, old_mtime))
+    prior_worker = dataclasses.replace(
+        _worker_view(123, PRIOR_PID, process_start_time=None),
+        log_path=str(stale_log),
+    )
     _patch_reap_internals(
         monkeypatch,
-        workers=[_worker_view(123, PRIOR_PID, process_start_time=None)],
+        workers=[prior_worker],
         alive=alive,
         kill_calls=kill_calls,
         events=events,
+    )
+    stale_now = datetime.now(UTC)
+    stale_ts = stale_now - timedelta(minutes=30)
+    monkeypatch.setattr(
+        "charlie_work.worker.real_activity_probe_for",
+        lambda *a, **k: RealActivityProbe(
+            sources=(
+                ActivitySource(
+                    name="devin_per_pid_log",
+                    timestamp=stale_ts,
+                    staleness_seconds=(stale_now - stale_ts).total_seconds(),
+                    error=None,
+                ),
+            )
+        ),
     )
     monkeypatch.setattr(
         "charlie_work.workflow.dispatch_sessions",

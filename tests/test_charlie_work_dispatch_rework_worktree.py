@@ -29,6 +29,7 @@ from charlie_work.config import (
     WatchdogConfig,
     WorkerRoleConfig,
 )
+from charlie_work.host.fakes import FakeProcessProbe
 from charlie_work.paths import runtime_paths
 from charlie_work.state import (
     load_state,
@@ -409,7 +410,7 @@ def test_dispatch_rework_worktree_foreign_writer_redispatch_unchanged(
 
 
 def test_dispatch_rework_blocked_environment_reap_resets_counter(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_host
 ) -> None:
     """Issue #1423: at the rework-dispatch blocked-environment cap exhaustion
     (Site 3 — the post-dispatch safety net), a successful foreign-writer reap
@@ -475,7 +476,7 @@ def test_dispatch_rework_blocked_environment_reap_resets_counter(
     }
     (wt_path_pre / WRITER_MARKER_FILENAME).write_text(json.dumps(marker), encoding="utf-8")
 
-    monkeypatch.setattr("charlie_work.workflow.is_pid_alive", lambda pid, start: True)
+    fake_host(probe=FakeProcessProbe({1234: None}))
     # _reap_idle_foreign_writer is shared by Site 2 (inline) and Site 3 (via
     # _try_reap_blocked_foreign_writer). Return True without removing the
     # marker so Site 3 can read it too.
@@ -515,7 +516,7 @@ def test_dispatch_rework_blocked_environment_reap_resets_counter(
 
 
 def test_dispatch_rework_pre_escalation_safety_net_reaps_foreign_writer(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_host
 ) -> None:
     """Issue #1423: the rework candidate pre-filter loop's blocked-environment
     safety net reaps an idle foreign writer before escalating. The marker is
@@ -573,7 +574,7 @@ def test_dispatch_rework_pre_escalation_safety_net_reaps_foreign_writer(
     }
     (wt_path_pre / WRITER_MARKER_FILENAME).write_text(json.dumps(marker), encoding="utf-8")
 
-    monkeypatch.setattr("charlie_work.workflow.is_pid_alive", lambda pid, start: True)
+    fake_host(probe=FakeProcessProbe({1234: None}))
     reap_calls: list[int] = []
 
     def _fake_reap(worktree_path, marker, _config, _sessions_dir=None, **_kw):
@@ -609,7 +610,7 @@ def test_dispatch_rework_pre_escalation_safety_net_reaps_foreign_writer(
 
 
 def test_dispatch_rework_pre_filter_own_live_session_not_reaped_escalated(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_host
 ) -> None:
     """Issue #1443 review: an integration-level regression test exercising
     Site 2 (the rework pre-filter in ``_dispatch_rework_impl``) through the
@@ -686,7 +687,7 @@ def test_dispatch_rework_pre_filter_own_live_session_not_reaped_escalated(
     (wt_path_pre / WRITER_MARKER_FILENAME).write_text(json.dumps(marker), encoding="utf-8")
 
     # Genuine own-live-session sidecar: session id + pid match the marker, and
-    # ``is_pid_alive`` is mocked True so ``_own_live_session_pids`` reports the
+    # the fake probe reports it live so ``_own_live_session_pids`` reports the
     # session as live. This is what makes the marker "owned", not foreign.
     sessions_dir = app._layout.sessions_dir
     sessions_dir.mkdir(parents=True, exist_ok=True)
@@ -697,14 +698,14 @@ def test_dispatch_rework_pre_filter_own_live_session_not_reaped_escalated(
 
     # Mock only the process-liveness, activity-probe, and kill primitives (no
     # real process or filesystem interaction). The reap function itself is NOT
-    # mocked — this is the integration assertion. ``is_pid_alive`` True keeps
+    # mocked — this is the integration assertion. The probe reading live keeps
     # the marker "live" so the reap reaches the own-live-session guard instead
     # of the stale-pid short-circuit. The activity probe is forced not-fresh so
     # that WITHOUT the own-live-session guard the reap would proceed to kill
     # (and the test would fail) — this is what makes the mutation check
     # deterministic: the guard is the only thing standing between the marker
     # and the kill path.
-    monkeypatch.setattr("charlie_work.worktree.is_pid_alive", lambda pid, start: True)
+    fake_host(probe=FakeProcessProbe({1234: None}))
     monkeypatch.setattr(
         "charlie_work.worktree.real_activity_for_worker",
         lambda *a, **k: RealActivityProbe(sources=()),

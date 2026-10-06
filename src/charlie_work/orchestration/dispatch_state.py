@@ -12,7 +12,7 @@ Namespace rule (#1627). Two kinds of name are reached through the
 
 - **Patched-on-workflow (Tier D).** Names some test patches on the
   ``charlie_work.workflow`` module object -- ``state_lock``, ``load_state_locked``,
-  ``utc_now``, ``transition``, ``is_pid_alive``, ``is_claim_stale``,
+  ``utc_now``, ``transition``, ``is_claim_stale``,
   ``dispatch_sessions``, ``emit_digest``, ``linked_issue_number``,
   ``_count_live_sessions``, ``_detect_and_handle_stalled_sessions``,
   ``_worker_pid_alive``, ``_try_reap_blocked_foreign_writer`` -- must resolve
@@ -76,7 +76,6 @@ from charlie_work.cross_repo_gate import (
 from charlie_work.dead_worker_sweep.effects_pr import _dispatching_repo_name
 from charlie_work.dead_worker_sweep.effects_sessions import (
     _detect_stalled_sessions,
-    _issues_with_live_workers,
 )
 from charlie_work.dispatch_selection import (
     _MAX_DEFERRED_CONCURRENCY_EXAMPLES,
@@ -283,7 +282,7 @@ def _dispatch_impl(
         # Detect stalled sessions (read-only for dry-run)
         stalled_entries = _detect_stalled_sessions(sessions_dir, self.config)
         stalled_issues = {entry["issue"] for entry in stalled_entries}
-        live_worker_issues = _issues_with_live_workers(sessions_dir)
+        live_worker_issues = self.host.sessions.live_issue_numbers(sessions_dir)
         prs = self.gh.pr_list()
         # No ready issues means _merged_pr_referenced_issue_numbers() would
         # return empty sets regardless of what merged_pr_list() returns
@@ -516,7 +515,7 @@ def _dispatch_impl(
     skipped_issue_numbers: list[int] = []
     # Use pre-computed stalled_entries from the stall detection above
     stalled_issues = {entry["issue"] for entry in stalled_entries}
-    live_worker_issues = _issues_with_live_workers(sessions_dir)
+    live_worker_issues = self.host.sessions.live_issue_numbers(sessions_dir)
     prs = self.gh.pr_list()
     # No ready issues means _merged_pr_referenced_issue_numbers() would
     # return empty sets regardless of what merged_pr_list() returns (it
@@ -1143,7 +1142,7 @@ def _dispatch_impl(
         if (
             result.pid is not None
             and result.pid > 0
-            and _wf.is_pid_alive(result.pid, result.process_start_time)
+            and self.host.probe.is_alive(result.pid, result.process_start_time)
         ):
             live_worker_issue_numbers.add(result.issue_number)
         else:

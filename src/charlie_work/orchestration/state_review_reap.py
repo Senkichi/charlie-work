@@ -12,9 +12,9 @@ with no change at any call site (``cli.py``, the test suite).
 
 Names reached through ``_wf.`` (module-object seam, design Section 3.1 rule 2,
 #1627): ``charlie_work.workflow``'s ``CommandResult`` and the Tier-D names the
-suite patches on it (``is_claim_stale``, ``is_pid_alive``, ``load_state_locked``)
+suite patches on it (``is_claim_stale``, ``load_state_locked``)
 -- the same convention ``state_operator_commands.py`` documents for its own
-sibling delegates.
+sibling delegates. Reviewer liveness reads go through ``self.host.probe``.
 """
 
 from __future__ import annotations
@@ -43,9 +43,10 @@ def _open_review_claims(self, now: datetime) -> list[dict[str, Any]]:
     additionally reap on the sidecar's own ``started_at`` clock — this scan
     is the claim-level view, not a prediction of every branch outcome.
 
-    ``is_pid_alive``/``is_claim_stale``/``load_state_locked`` are reached
+    ``is_claim_stale``/``load_state_locked`` are reached
     through ``_wf`` because the suite patches them on ``charlie_work.workflow``
-    (the Tier-D convention documented in this module's sibling delegates).
+    (the Tier-D convention documented in this module's sibling delegates);
+    reviewer liveness reads ``self.host.probe`` instead.
     """
     state = _wf.load_state_locked(self.paths.state_file)
     claims: list[dict[str, Any]] = []
@@ -72,7 +73,7 @@ def _open_review_claims(self, now: datetime) -> list[dict[str, Any]]:
             )
         elif status == "review_dispatch_dispatched":
             pid = entry.get("reviewer_pid")
-            pid_alive = pid is not None and _wf.is_pid_alive(
+            pid_alive = pid is not None and self.host.probe.is_alive(
                 pid, entry.get("reviewer_process_start_time")
             )
             claim_at = entry.get("review_dispatched_at")

@@ -161,6 +161,41 @@ def test_real_session_counter_late_binds_to_existing_patch_targets(monkeypatch) 
     assert REAL.sessions.live_reviews(Path("."), None) == 14
 
 
+def test_fake_session_counter_scripts_issue_numbers_and_session_pids(fake_host) -> None:
+    from pathlib import Path
+
+    counter = FakeSessionCounter(issue_numbers={7, 9}, session_pids={"sess-1": 4321})
+    ports = fake_host(sessions=counter)
+    s = ports.sessions
+    assert s.live_issue_numbers(Path("w")) == {7, 9}
+    assert s.live_session_pids(Path("w")) == {"sess-1": 4321}
+    assert [c[0] for c in counter.calls] == ["live_issue_numbers", "live_session_pids"]
+
+
+def test_real_session_counter_issue_numbers_filters_dead_workers(monkeypatch) -> None:
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    from charlie_work.host import REAL
+
+    workers = [
+        SimpleNamespace(issue_number=1, is_alive=lambda: True),
+        SimpleNamespace(issue_number=2, is_alive=lambda: False),
+        SimpleNamespace(issue_number=3, is_alive=lambda: True),
+    ]
+    monkeypatch.setattr("charlie_work.worker.iter_workers", lambda _d: workers)
+    assert REAL.sessions.live_issue_numbers(Path(".")) == {1, 3}
+
+
+def test_real_session_counter_session_pids_late_binds(monkeypatch) -> None:
+    from pathlib import Path
+
+    from charlie_work.host import REAL
+
+    monkeypatch.setattr("charlie_work.worktree._own_live_session_pids", lambda _d: {"s": 11})
+    assert REAL.sessions.live_session_pids(Path(".")) == {"s": 11}
+
+
 def test_command_result_reexport_is_identity() -> None:
     from charlie_work import command_result, workflow
 

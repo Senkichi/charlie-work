@@ -86,11 +86,15 @@ class FakeSessionCounter:
         reviews: int = 0,
         fleet_workers: tuple[int, list[str]] = (0, []),
         fleet_reviews: tuple[int, list[str]] = (0, []),
+        issue_numbers: set[int] | None = None,
+        session_pids: dict[str, int] | None = None,
     ) -> None:
         self.workers = workers
         self.reviews = reviews
         self.fleet_workers = fleet_workers
         self.fleet_reviews = fleet_reviews
+        self.issue_numbers = set(issue_numbers or ())
+        self.session_pids = dict(session_pids or {})
         self.calls: list[tuple[str, tuple]] = []
 
     def live_workers(self, sessions_dir, state_file=None) -> int:
@@ -108,6 +112,14 @@ class FakeSessionCounter:
     def fleet_live_reviews(self, fleet_dir_override):
         self.calls.append(("fleet_live_reviews", (fleet_dir_override,)))
         return self.fleet_reviews
+
+    def live_issue_numbers(self, sessions_dir) -> set[int]:
+        self.calls.append(("live_issue_numbers", (sessions_dir,)))
+        return set(self.issue_numbers)
+
+    def live_session_pids(self, sessions_dir) -> dict[str, int]:
+        self.calls.append(("live_session_pids", (sessions_dir,)))
+        return dict(self.session_pids)
 
 
 class FakeReviewLauncher:

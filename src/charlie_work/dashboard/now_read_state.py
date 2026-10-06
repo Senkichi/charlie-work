@@ -12,8 +12,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from .. import host as _host
 from .. import layout
-from ..process_utils import is_pid_alive
 from ..worker import iter_workers
 from . import sources as src
 
@@ -60,7 +60,9 @@ def _live_reviewers(reviews_dir: Path, prs: Any) -> int:
         if not str(key).isdigit() or int(key) in live_prs:
             continue
         pid = entry.get("reviewer_pid")
-        if pid is not None and is_pid_alive(pid, entry.get("reviewer_process_start_time")):
+        if pid is not None and _host.current().probe.is_alive(
+            pid, entry.get("reviewer_process_start_time")
+        ):
             count += 1
     return count
 
