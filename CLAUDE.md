@@ -13,6 +13,9 @@ uv run ruff check .              # lint
 uv run ruff format .             # format
 ```
 
+xdist is on by default (`-n auto` in `addopts`; dispatched workers get 2 via `PYTEST_XDIST_AUTO_NUM_WORKERS`); one to three file/nodeid arguments run serially. Turn xdist off with `-n0` — never `-p no:xdist`, which fails with "unrecognized arguments: -n" once `-n` is in addopts.
+Test speed-ups ship on; kill switches: `CI_FLEET_TEST_REUSE=off` (git templates, parsed-source cache), `CI_FLEET_FAST_GUARDS=off` (leak-guard fast path).
+
 ## Invariants — preserve these in every PR
 
 ### Config / value objects are frozen dataclasses

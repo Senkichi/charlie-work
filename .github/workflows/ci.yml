@@ -637,7 +637,10 @@ jobs:
         # staying green for the gate to surface a clear finding. Bash is
         # always available on GitHub-hosted Windows runners (Git Bash).
         shell: bash
-        run: uv run pytest --collect-only > head_collect.txt || true
+        # -n0: addopts carries -n auto, and collection must stay in-process so the
+        # output keeps its "path: count" / nodeid shape. Never -p no:xdist: it
+        # unregisters -n and pytest exits "unrecognized arguments: -n".
+        run: uv run pytest --collect-only -n0 > head_collect.txt || true
       - name: Upload head collection
         if: always()
         uses: actions/upload-artifact@v4
@@ -682,7 +685,9 @@ jobs:
           (
             cd ./base-tree
             uv sync --frozen --all-extras
-            uv run pytest --collect-only > ../base_collect.txt || true
+            # -n0: addopts carries -n auto; keep collection in-process. Never
+            # -p no:xdist (unregisters -n -> "unrecognized arguments: -n").
+            uv run pytest --collect-only -n0 > ../base_collect.txt || true
           )
       - name: Run collect-only gate
         if: github.event_name == 'pull_request'
