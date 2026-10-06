@@ -12,12 +12,12 @@ Names reached through ``_wf.`` (module-object seam, design Section 3.1 rule 2,
 ``_MergedPRListOutcome`` (class),
 ``_state_lock_busy_result`` (free function); and Tier-D names patched on
 ``charlie_work.workflow`` by the suite, so the moved body must keep intercepting
-those patches: ``_log_worker_census``. The live-session counters
-(``_count_live_sessions``, ``count_fleet_live_sessions``) are reached through
-``host.current().sessions``, whose Real late-binds ``charlie_work.workflow.*`` so
-those patches still intercept. All other free names are imported directly from their
-defining module (a three-form, six-alias patch census confirms no test patches
-any of them on ``charlie_work.workflow``).
+those patches: ``_log_worker_census``. The live-session counters are reached
+through ``host.current().sessions``, whose Real resolves the
+``live_session_count`` / ``fleet_registry`` primitives at call time so
+patches on those modules still intercept. All other free names are imported
+directly from their defining module (a three-form, six-alias patch census
+confirms no test patches any of them on ``charlie_work.workflow``).
 """
 
 from __future__ import annotations
@@ -168,7 +168,7 @@ def _apply_concurrency_governor(
         dispatch_limit: The requested dispatch limit
         live_count: Optional pre-computed live worker count. If None and
             max_concurrent > 0 or ci_capacity_headroom_ratio > 0, this will
-            compute it via _count_live_sessions -- the CI-headroom clamp
+            compute it via the sessions port's live-worker count -- the CI-headroom clamp
             below needs it too, as a floor on demand ci_fleet's last
             allocation pass has not measured yet (issue #1770 review
             finding 3), independent of whether max_concurrent itself is

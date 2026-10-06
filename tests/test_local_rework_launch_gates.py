@@ -191,7 +191,7 @@ class TestLocalReworkFleetThrottle:
                 for r in requests
             ]
 
-        monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", _fake)
+        monkeypatch.setattr("charlie_work.adapters.dispatch_sessions", _fake)
 
         result = app._local_dispatch_rework()
 

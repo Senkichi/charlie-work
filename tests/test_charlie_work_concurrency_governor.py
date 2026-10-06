@@ -67,7 +67,7 @@ def test_concurrency_governor_clamps_dispatch_when_sessions_alive(
 ) -> None:
     """When max_concurrent_sessions is set and there are live sessions, dispatch should be clamped."""
 
-    # Mock _count_live_sessions to return 2 live sessions
+    # Fake the live-session count to return 2 live sessions
     fake_host(sessions=FakeSessionCounter(workers=2))
 
     config = OrchestratorConfig(
@@ -94,7 +94,7 @@ def test_concurrency_governor_clamps_rework_dispatch(
 ) -> None:
     """Concurrency governor should also clamp rework dispatch."""
 
-    # Mock _count_live_sessions to return 2 live sessions (at the cap)
+    # Fake the live-session count to return 2 live sessions (at the cap)
     fake_host(sessions=FakeSessionCounter(workers=2))
 
     config = OrchestratorConfig(
@@ -152,7 +152,7 @@ def test_concurrency_governor_allows_partial_dispatch(
 ) -> None:
     """When some slots are available, dispatch should launch up to that limit."""
 
-    # Mock _count_live_sessions to return 1 live session
+    # Fake the live-session count to return 1 live session
     fake_host(sessions=FakeSessionCounter(workers=1))
 
     config = OrchestratorConfig(
@@ -222,7 +222,7 @@ def test_concurrency_governor_clamps_only_issues_dispatch(
 ) -> None:
     """Issue #105: when --issues names more issues than available slots, excess should be deferred by concurrency."""
 
-    # Mock _count_live_sessions to return 0 live sessions
+    # Fake the live-session count to return 0 live sessions
     fake_host(sessions=FakeSessionCounter(workers=0))
 
     config = OrchestratorConfig(
@@ -291,7 +291,7 @@ def test_concurrency_governor_clamps_only_issues_dispatch_with_live_sessions(
 ) -> None:
     """Issue #105: when --issues names more issues than available slots (with live sessions), excess should be deferred."""
 
-    # Mock _count_live_sessions to return 1 live session
+    # Fake the live-session count to return 1 live session
     fake_host(sessions=FakeSessionCounter(workers=1))
 
     config = OrchestratorConfig(
@@ -361,7 +361,7 @@ def test_concurrency_governor_clamps_only_issues_dry_run(
 ) -> None:
     """Issue #105: dry-run with --issues should also respect concurrency governor."""
 
-    # Mock _count_live_sessions to return 0 live sessions
+    # Fake the live-session count to return 0 live sessions
     fake_host(sessions=FakeSessionCounter(workers=0))
 
     config = OrchestratorConfig(
@@ -429,7 +429,7 @@ def test_concurrency_governor_clamps_only_issues_rework_dispatch(
 ) -> None:
     """Issue #105: dispatch_rework with --issues should also respect concurrency governor."""
 
-    # Mock _count_live_sessions to return 0 live sessions
+    # Fake the live-session count to return 0 live sessions
     fake_host(sessions=FakeSessionCounter(workers=0))
 
     config = OrchestratorConfig(

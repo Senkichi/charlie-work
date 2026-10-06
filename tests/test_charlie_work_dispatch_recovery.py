@@ -629,11 +629,11 @@ def test_dispatch_stall_detection_called_once_per_dispatch(tmp_path: Path, monke
         "charlie_work.workflow._detect_and_handle_stalled_sessions", mock_stall_detection
     )
 
-    # Mock _count_live_sessions to return 0 (no live sessions)
-    def mock_count_live(sessions_dir, state_file=None):
+    # Mock the live-session counter to return 0 (no live sessions)
+    def mock_count_live(sessions_dir, state_file=None, kind=None):
         return 0
 
-    monkeypatch.setattr("charlie_work.workflow._count_live_sessions", mock_count_live)
+    monkeypatch.setattr("charlie_work.live_session_count.count_live_sessions", mock_count_live)
 
     config = OrchestratorConfig(
         dispatch=DispatchConfig(max_concurrent_sessions=2, default_limit=5),

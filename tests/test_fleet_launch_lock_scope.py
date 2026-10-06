@@ -44,6 +44,7 @@ from charlie_work.state import load_state, save_state, set_throttled_until, stat
 from charlie_work.worker_launch_gate import acquire_fleet_launch_lock
 from charlie_work.workflow import OrchestratorApp
 
+import charlie_work.live_session_count as live_session_count
 import charlie_work.workflow as wf
 
 FRESH = "fresh"
@@ -312,13 +313,13 @@ def test_governor_receives_a_live_count_computed_under_the_lock(
     calls = _spy_dispatch_sessions(fake_host)
 
     count_held: list[bool] = []
-    orig_count = wf._count_live_sessions
+    orig_count = live_session_count.count_live_sessions
 
     def _count_probe(*a: Any, **kw: Any) -> Any:
         count_held.append(not _lock_is_free(app))
         return orig_count(*a, **kw)
 
-    monkeypatch.setattr("charlie_work.workflow._count_live_sessions", _count_probe)
+    monkeypatch.setattr("charlie_work.live_session_count.count_live_sessions", _count_probe)
 
     gov_calls: list[tuple[Any, bool]] = []
     orig_gov = app._apply_concurrency_governor
@@ -432,14 +433,14 @@ def test_holder_sidecar_lifecycle(
     calls = _spy_dispatch_sessions(fake_host)
     sidecar = layout.fleet_lock_holder_path(override=app.fleet_dir_override)
     seen: list[dict[str, Any]] = []
-    orig_count = wf._count_live_sessions
+    orig_count = live_session_count.count_live_sessions
 
     def _count_probe(*a: Any, **kw: Any) -> Any:
         if sidecar.exists():
             seen.append(json.loads(sidecar.read_text(encoding="utf-8")))
         return orig_count(*a, **kw)
 
-    monkeypatch.setattr("charlie_work.workflow._count_live_sessions", _count_probe)
+    monkeypatch.setattr("charlie_work.live_session_count.count_live_sessions", _count_probe)
 
     result = _run(app, lane)
 

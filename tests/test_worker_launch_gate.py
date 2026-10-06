@@ -167,7 +167,7 @@ def test_held_fleet_lock_blocks_launch(tmp_path: Path, fake_host, lane: str) -> 
 def test_governor_at_cap_blocks_launch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_host, lane: str
 ) -> None:
-    monkeypatch.setattr("charlie_work.workflow._count_live_sessions", lambda *_a, **_k: 1)
+    monkeypatch.setattr("charlie_work.live_session_count.count_live_sessions", lambda *_a, **_k: 1)
     app = _app(tmp_path, lane, max_concurrent=1)
     calls = _spy_dispatch_sessions(fake_host)
 
@@ -255,7 +255,7 @@ def test_absent_permit_is_refused(tmp_path: Path, fake_host) -> None:
 def test_over_budget_batch_is_refused(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_host
 ) -> None:
-    monkeypatch.setattr("charlie_work.workflow._count_live_sessions", lambda *_a, **_k: 2)
+    monkeypatch.setattr("charlie_work.live_session_count.count_live_sessions", lambda *_a, **_k: 2)
     app = _app(tmp_path, FRESH, max_concurrent=3)
     calls = _spy_dispatch_sessions(fake_host)
     with _permit(app, 5) as permit:

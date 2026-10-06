@@ -276,39 +276,17 @@ def _select_rework_candidates(
 def _reviewer_pid_alive(entry: dict[str, Any]) -> bool:
     """Check if a reviewer PID from state.json is alive, with start-time verification.
 
-    Mirror of ``_worker_pid_alive`` for reviewer processes launched by
+    Reviewer-process liveness for reviewers launched by
     ``dispatch_reviews``. A reviewer is a Claude Code worker whose PID and
     process start time are stored under ``reviewer_pid`` and
     ``reviewer_process_start_time`` in the per-PR state.
 
     Issue #2230: the probe itself lives in ``live_session_count._ghost_pid_alive``,
-    shared with the worker lane's ``_worker_pid_alive``.
+    shared with the worker lane's state.json pid probe.
     """
     from .live_session_count import REVIEW_LANE, _ghost_pid_alive
 
     return _ghost_pid_alive(entry, REVIEW_LANE)
-
-
-def _count_live_reviews(reviews_dir: Path, state_file: Path | None = None) -> int:
-    """Count the number of currently alive reviewer sessions.
-
-    Reads review sidecar files (claude-code only today) from ``reviews_dir``,
-    then checks each record's PID liveness using the adapter-agnostic
-    ``WorkerView.is_alive`` probe.
-
-    When ``state_file`` is given, the count is corroborated against
-    state.json's own ``review_dispatch_dispatched`` records so a missing
-    sidecar doesn't let a live reviewer slip through the local cap.
-
-    Issue #2230: the implementation lives in
-    ``live_session_count.count_live_sessions`` -- one counter shared with the
-    worker lane's ``dead_worker_sweep.effects_sessions._count_live_sessions``.
-    This name stays a delegate so the ``dispatch_selection._count_live_reviews``
-    import/patch surface keeps resolving unchanged.
-    """
-    from .live_session_count import REVIEW_LANE, count_live_sessions
-
-    return count_live_sessions(reviews_dir, state_file, REVIEW_LANE)
 
 
 def _apply_local_review_cap(
