@@ -743,6 +743,9 @@ def test_production_label_seam_calls_pass_state_path() -> None:
     gate_receivers = {"write_gate", "gate", "wg"}
     offenders: list[str] = []
     for path in source_files(src_root):
+        text = source_text(path)
+        if "transition" not in text and "apply_issue_labels" not in text:
+            continue
         tree = parsed(path)
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
