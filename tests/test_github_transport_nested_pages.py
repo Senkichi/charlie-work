@@ -136,6 +136,30 @@ def test_a_next_page_without_an_id_is_a_defect() -> None:
     assert outcome.kind is FailureKind.ADAPTER_DEFECT
 
 
+def test_a_next_page_without_an_end_cursor_is_a_defect() -> None:
+    """``hasNextPage`` with no usable ``endCursor`` is a GitHub contract
+    violation -- an ADAPTER_DEFECT (gh fallback), not a silently short list."""
+    node = _pr(_rollup(range(1), more=True, cursor=None))
+    guard, _http = _guard(_gql({"repository": {"pullRequest": node}}))
+
+    outcome = _view("number,statusCheckRollup").execute(guard, "octo", "hello")
+
+    assert isinstance(outcome, TransportFailure)
+    assert outcome.kind is FailureKind.ADAPTER_DEFECT
+
+
+def test_checks_paging_without_an_end_cursor_is_a_defect() -> None:
+    """The ``gh pr checks`` walk has the same contract: a reported next page
+    it cannot follow must not normalize as a short list."""
+    node = _pr(_rollup(range(1), more=True, cursor=None))
+    guard, _guard_http = _guard(_gql({"repository": {"pullRequest": node}}))
+
+    outcome = JsonRead("pr", "checks", "name,bucket", number=5).execute(guard, "octo", "hello")
+
+    assert isinstance(outcome, TransportFailure)
+    assert outcome.kind is FailureKind.ADAPTER_DEFECT
+
+
 def test_a_failed_follow_up_page_is_returned_not_swallowed() -> None:
     guard, _http = _guard(
         _gql({"repository": {"pullRequest": _pr(_rollup(range(100), True))}}),
