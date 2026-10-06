@@ -27,6 +27,8 @@ import yaml
 
 from charlie_work.junit_recorded_gate import (
     compare_recorded_vs_collected,
+    compare_recorded_vs_collected_multi,
+    junit_testcase_keys,
     count_collected_tests,
     count_junit_testcases,
     render_gate_report,
@@ -291,6 +293,62 @@ def test_render_report_fail_lists_findings() -> None:
     assert "recorded_vs_collected" in report
     assert "Recorded" in report
     assert "Collected" in report
+
+
+# ---------------------------------------------------------------------------
+# compare_recorded_vs_collected_multi (DD-3: one junit per shard)
+# ---------------------------------------------------------------------------
+
+
+def _junit(*names: str, classname: str = "t") -> str:
+    cases = "".join(f'<testcase classname="{classname}" name="{n}" time="0" />' for n in names)
+    return (
+        f'<testsuites><testsuite name="pytest" tests="{len(names)}" errors="0" '
+        f'failures="0" skipped="0">{cases}</testsuite></testsuites>'
+    )
+
+
+def test_junit_testcase_keys_lists_classname_name_pairs() -> None:
+    assert junit_testcase_keys(_JUNIT_3) == (("t", "a"), ("t", "b"), ("t", "c"))
+    assert junit_testcase_keys("<not xml") == ()
+
+
+def test_multi_single_file_matches_single_file_function() -> None:
+    assert compare_recorded_vs_collected_multi([_JUNIT_3], _COLLECT_3) == (
+        compare_recorded_vs_collected(_JUNIT_3, _COLLECT_3)
+    )
+
+
+def test_multi_sums_counts_across_shards() -> None:
+    result = compare_recorded_vs_collected_multi([_junit("a", "b"), _junit("c")], _COLLECT_3)
+    assert result.ok is True
+    assert result.recorded == 3
+    assert result.suite_tests_attr == 3
+
+
+def test_multi_flags_duplicate_even_when_counts_balance() -> None:
+    # Shard 1 ran a+b, shard 2 ran b again and omitted c: 3 recorded == 3 collected.
+    result = compare_recorded_vs_collected_multi([_junit("a", "b"), _junit("b")], _COLLECT_3)
+    assert result.ok is False
+    kinds = [f.kind for f in result.findings]
+    assert kinds == ["duplicate_testcase"]
+    assert "t::b" in result.findings[0].detail
+
+
+def test_multi_reports_shortfall_when_a_shard_is_missing() -> None:
+    result = compare_recorded_vs_collected_multi([_junit("a", "b")], _COLLECT_3)
+    assert [f.kind for f in result.findings] == ["recorded_vs_collected"]
+
+
+def test_multi_internal_inconsistency_in_one_shard_fails() -> None:
+    bad = _junit("c").replace('tests="1"', 'tests="2"')
+    result = compare_recorded_vs_collected_multi([_junit("a", "b"), bad], _COLLECT_3)
+    assert "junit_internal" in {f.kind for f in result.findings}
+
+
+def test_multi_with_no_files_is_empty_junit() -> None:
+    result = compare_recorded_vs_collected_multi([], _COLLECT_3)
+    assert "empty_junit" in {f.kind for f in result.findings}
 
 
 # ---------------------------------------------------------------------------
