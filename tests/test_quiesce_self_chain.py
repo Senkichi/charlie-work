@@ -106,7 +106,7 @@ def test_recycled_parent_stranger_still_matches_pattern() -> None:
     assert report.excluded_pids == frozenset({300})
 
 
-def test_list_processes_populates_created_from_ancestor_rows(
+def test_list_processes_populates_created_from_ppid_snapshot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The UTC-sourced creation stamps ride on the CIM rows: the overlay is
@@ -116,6 +116,11 @@ def test_list_processes_populates_created_from_ancestor_rows(
     (``win32_ancestor_rows``), not a host-wide ``process_iter`` pass --
     ``created`` is only ever consulted on that one chain, and stamping all
     ~450 host processes cost about a second per listing on this host.
+
+    The leaf name predates the #2376 re-scope and is kept verbatim: the
+    collect-only gate (issue #1538) fails a required check on any leaf-name
+    removal, rename included, absent the operator-applied
+    ``collect-gate-exempt`` label.
     """
     _win32_listing_env(monkeypatch)
     sample = [
