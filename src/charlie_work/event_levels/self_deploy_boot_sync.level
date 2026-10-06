@@ -1,0 +1,9 @@
+warning
+# Issue #2312: the supervisor's boot-time pending-sync repair fired -- the
+# checkout's HEAD and the orchestrator venv had drifted (a pre-#2312 deferred
+# sync whose merge landed first, or a crash between merge and sync). One
+# event per detected skew, whether the repair synced, deferred to live
+# workers, or failed. Warning, not info: the skew existing at all means a
+# deploy landed outside the deferred-ordering invariant, and that recurrence
+# is the thing worth seeing -- a failed sync additionally puts the detail in
+# the payload.

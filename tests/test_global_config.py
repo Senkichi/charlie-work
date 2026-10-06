@@ -31,8 +31,9 @@ from pathlib import Path
 
 import yaml
 
+from charlie_work import layout
 from charlie_work.config import OrchestratorConfig, build_config_from_data, load_config
-from charlie_work.global_config import load_layered_config
+from charlie_work.global_config import load_layered_config, peek_runtime_state_dir
 
 
 def _write(path: Path, text: str) -> Path:
@@ -283,3 +284,84 @@ def test_build_config_from_data_does_not_mutate_its_input(tmp_path: Path) -> Non
     build_config_from_data(data)
 
     assert data == before
+
+
+# ---------------------------------------------------------------------------
+# peek_runtime_state_dir (issue #2312): the boot-time pending-sync repair must
+# locate the pending-sync marker BEFORE ``load_fleet_global_config`` runs --
+# the full layered load is exactly the step a dep-skewed deploy can crash on,
+# so the repair cannot depend on it. The peek reads the same two layer slots
+# ``load_layered_config`` uses and applies the same repo-wins precedence, but
+# only for the one key it needs, tolerating absent/malformed layers.
+# ---------------------------------------------------------------------------
+
+
+def test_peek_runtime_state_dir_defaults_without_layers(tmp_path: Path) -> None:
+    """No global layer and no repo config -> the layout default."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    assert (
+        peek_runtime_state_dir(repo_root, fleet_dir_override=str(tmp_path / "fleet"))
+        == layout.DEFAULT_STATE_DIR
+    )
+
+
+def test_peek_runtime_state_dir_global_layer_only(tmp_path: Path) -> None:
+    fleet = tmp_path / "fleet"
+    _write(fleet / "config.yaml", "runtime:\n  state_dir: .var/fleet-state\n")
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    assert peek_runtime_state_dir(repo_root, fleet_dir_override=str(fleet)) == ".var/fleet-state"
+
+
+def test_peek_runtime_state_dir_repo_layer_wins(tmp_path: Path) -> None:
+    """Repo ``runtime.state_dir`` overrides the global layer's, matching the
+    shallow section merge ``load_layered_config`` applies."""
+    fleet = tmp_path / "fleet"
+    _write(fleet / "config.yaml", "runtime:\n  state_dir: .var/fleet-state\n")
+    repo_root = tmp_path / "repo"
+    _write(
+        repo_root / "orchestrator.config.yaml",
+        "runtime:\n  state_dir: .var/repo-state\n",
+    )
+    assert peek_runtime_state_dir(repo_root, fleet_dir_override=str(fleet)) == ".var/repo-state"
+
+
+def test_peek_runtime_state_dir_returns_absolute_value_verbatim(tmp_path: Path) -> None:
+    """Absolute ``state_dir`` comes back unresolved -- resolution belongs to
+    ``runtime_paths``/``supervisor_runtime_paths``, not to the peek."""
+    fleet = tmp_path / "fleet"
+    _write(fleet / "config.yaml", "runtime:\n  state_dir: C:/abs/state-root\n")
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    assert peek_runtime_state_dir(repo_root, fleet_dir_override=str(fleet)) == "C:/abs/state-root"
+
+
+def test_peek_runtime_state_dir_tolerates_malformed_global_layer(tmp_path: Path) -> None:
+    """A global layer that does not parse is skipped rather than raised --
+    and the repo layer's value still wins, matching how the boot repair must
+    behave on exactly the broken-config hosts it exists to rescue."""
+    fleet = tmp_path / "fleet"
+    _write(fleet / "config.yaml", "runtime:\n  state_dir: [not: closed\n")
+    repo_root = tmp_path / "repo"
+    _write(
+        repo_root / "orchestrator.config.yaml",
+        "runtime:\n  state_dir: .var/repo-state\n",
+    )
+    assert peek_runtime_state_dir(repo_root, fleet_dir_override=str(fleet)) == ".var/repo-state"
+
+
+def test_peek_runtime_state_dir_tolerates_missing_and_non_dict(tmp_path: Path) -> None:
+    """A non-mapping document or a non-str value contributes nothing; with no
+    usable layer the default stands."""
+    fleet = tmp_path / "fleet"
+    _write(fleet / "config.yaml", "- this\n- is\n- a list\n")
+    repo_root = tmp_path / "repo"
+    _write(
+        repo_root / "orchestrator.config.yaml",
+        "runtime:\n  state_dir: 42\n",
+    )
+    assert (
+        peek_runtime_state_dir(repo_root, fleet_dir_override=str(fleet))
+        == layout.DEFAULT_STATE_DIR
+    )
