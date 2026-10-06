@@ -27,6 +27,7 @@ from charlie_work.checks import (
     summarize_checks,
     workflow_run_terminal_by_id,
 )
+from charlie_work.ci_backlog import defer_infra_rerun_for_backlog, infra_rerun_backlog
 from charlie_work.janitor import (
     CarryForwardCheck,
     DiffContentSignature,
@@ -439,6 +440,23 @@ def _drive_infra_rerun_or_escalate(
                     continue
             attempt_run_ids.append(run_id)
 
+        if attempt_run_ids:
+            backlog = infra_rerun_backlog(self)
+            if backlog is not None:
+                # Nothing is persisted to infra_rerun_attempts here, so
+                # classify_infra_failures' pre-increments are dropped and no
+                # attempt is consumed; the next pass re-evaluates.
+                return defer_infra_rerun_for_backlog(
+                    self,
+                    pr_number,
+                    issue_number,
+                    head_key=head_key,
+                    rerun_run_ids=rerun_run_ids,
+                    backlog_seconds=backlog,
+                    ok=ok,
+                    extra_data=extra_data,
+                )
+
         for run_id in attempt_run_ids:
             result = self.gh.run(["run", "rerun", str(run_id)], allow_failure=True)
             if isinstance(result, _wf.GitHubRunResult):
@@ -477,6 +495,7 @@ def _drive_infra_rerun_or_escalate(
                     "infra_rerun_deferred": (
                         {head_key: sorted(new_deferred)} if new_deferred else {}
                     ),
+                    "infra_rerun_backlog_deferred": {},
                 }
                 state = self._record_event(
                     state,

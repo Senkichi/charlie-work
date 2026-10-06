@@ -110,6 +110,7 @@ KNOWN_IGNORED: dict[str, str] = {
     "flake_rerun_failed": "flake-rerun bookkeeping",
     "infra_rerun_triggered": "infra-rerun bookkeeping",
     "infra_rerun_failed": "infra-rerun bookkeeping",
+    "infra_rerun_backlog_deferred": "infra-rerun deferral bookkeeping",
     "infra_rerun_escalated": "infra-rerun escalation record",
     # -- Config / host housekeeping.
     "config_key_deprecated_read": "deprecated-config diagnostic (issue #1976)",
