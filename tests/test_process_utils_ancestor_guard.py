@@ -254,8 +254,9 @@ def test_self_ancestor_pids_never_enumerates_the_host(
     ancestor chain, so its row source must be chain-scoped. The host-wide
     ``process_iter`` snapshot pays a ``ppid_map()`` enumeration plus a
     handle open *per process* — seconds at a few hundred processes — on
-    every guarded kill call, while ``_win32_ancestor_rows`` pays it only per
-    ancestor hop. The spy records instead of raising because
+    every guarded kill call, while ``_win32_ancestor_rows`` pays one
+    ``ppid_map()`` enumeration per walk plus a handle open per ancestor hop
+    (issue #2362). The spy records instead of raising because
     ``_self_ancestor_pids`` deliberately degrades on helper failure, which
     would hide this regression."""
     monkeypatch.setattr(_sweep.os, "name", "nt")

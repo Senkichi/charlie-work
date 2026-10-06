@@ -251,12 +251,27 @@ def _patch_win32_process(
     monkeypatch: pytest.MonkeyPatch,
     rows: dict[int, tuple[int, float | None]],
 ) -> list[int]:
-    """Install the fabricated ``psutil.Process`` and return its probe log."""
+    """Install the fabricated ``psutil.Process`` and return its probe log.
+
+    Also installs a fabricated ppid table at the ``_optional_bulk_ppid_map``
+    seam: the walk consults that table first, and fabricated pids like 200
+    or 300 can collide with real live host pids — a real table would hand
+    the walk the host's ppid for them instead of the fabricated one.
+    ``raising=False`` so the semantic pins still exercise the walk against
+    code where the helper does not exist (the per-hop path) instead of
+    erroring at patch time.
+    """
     probes: list[int] = []
     monkeypatch.setattr(
         pc.psutil,
         "Process",
         lambda pid: _FakePsutilProcess(pid, rows, probes),
+    )
+    monkeypatch.setattr(
+        pc,
+        "_optional_bulk_ppid_map",
+        lambda: {pid: row[0] for pid, row in rows.items()},
+        raising=False,
     )
     return probes
 
@@ -266,9 +281,11 @@ def test_win32_ancestor_rows_walks_only_the_chain(
 ) -> None:
     """Chain-scoped (issue #2332): rows are gathered hop by hop through
     ``psutil.Process`` — the host-wide ``process_iter`` must never run, and
-    pids off the chain are never touched. A hop is not cheap (``ppid()``
-    pays a full ``ppid_map()`` enumeration); the saving is paying that per
-    ancestor instead of per process."""
+    pids off the chain are never touched. The ppid table is taken once per
+    walk (issue #2362): ``Process.ppid()`` pays a full ``ppid_map()``
+    enumeration per call, so per-hop ``ppid()`` would be O(hops x host
+    processes); the saving is one enumeration per walk plus a handle probe
+    per ancestor, not one enumeration per ancestor or per process."""
     rows = {300: (200, 5.0), 200: (100, 3.0), 100: (1, 1.0), 50: (1, 0.5)}
     probes = _patch_win32_process(monkeypatch, rows)
 
@@ -321,6 +338,62 @@ def test_win32_ancestor_rows_terminates_on_cycle(
 
     assert pc.win32_ancestor_rows(5) == {5: pc.ProcRow(7, 1.0), 7: pc.ProcRow(5, 1.0)}
     assert probes == [5, 7]
+
+
+def test_win32_ancestor_rows_takes_ppid_table_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #2362 regression pin: on psutil 7.x ``Process.ppid()`` re-runs
+    ``ppid_map()`` — a full ``CreateToolhelp32Snapshot`` enumeration of every
+    process on the host — per call, so a per-hop ``ppid()`` is O(hops x host
+    processes) paid by every guarded kill. The walk must take the bulk table
+    exactly once and consult ``ppid()`` only for a pid the table does not
+    cover (the absent-row boundary)."""
+    rows = {300: (200, 5.0), 200: (100, 3.0), 100: (1, 1.0)}
+    _patch_win32_process(monkeypatch, rows)
+
+    map_calls: list[int] = []
+
+    def spy_map() -> dict[int, int]:
+        map_calls.append(1)
+        return {pid: row[0] for pid, row in rows.items()}
+
+    monkeypatch.setattr(pc, "_optional_bulk_ppid_map", spy_map)
+
+    ppid_calls: list[int] = []
+    real_ppid = _FakePsutilProcess.ppid
+
+    def spy_ppid(self: _FakePsutilProcess) -> int:
+        ppid_calls.append(self._pid)
+        return real_ppid(self)
+
+    monkeypatch.setattr(_FakePsutilProcess, "ppid", spy_ppid)
+
+    assert pc.win32_ancestor_rows(300) == {
+        300: pc.ProcRow(200, 5.0),
+        200: pc.ProcRow(100, 3.0),
+        100: pc.ProcRow(1, 1.0),
+    }
+    assert map_calls == [1]
+    # Only pid 1 — the chain's absent-row boundary, which the fabricated
+    # table deliberately does not cover — reaches the per-hop fallback.
+    assert ppid_calls == [1]
+
+
+def test_win32_ancestor_rows_falls_back_when_no_bulk_table(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A platform with no ``ppid_map`` (``_optional_bulk_ppid_map`` ->
+    ``None``, e.g. POSIX where ``ppid()`` is a cheap per-process read) still
+    resolves every hop through per-hop ``Process.ppid()``."""
+    rows = {300: (200, 5.0), 200: (100, 3.0)}
+    _patch_win32_process(monkeypatch, rows)
+    monkeypatch.setattr(pc, "_optional_bulk_ppid_map", lambda: None)
+
+    assert pc.win32_ancestor_rows(300) == {
+        300: pc.ProcRow(200, 5.0),
+        200: pc.ProcRow(100, 3.0),
+    }
 
 
 def test_win32_ancestor_rows_real_chain_contains_self_and_parent() -> None:
