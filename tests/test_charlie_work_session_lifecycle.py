@@ -117,7 +117,7 @@ def test_worker_death_bounded_runtime_no_signal_returns_zero(tmp_path: Path) -> 
     assert runtime == 0.0
 
 
-def test_live_session_count_counts_both_adapters(tmp_path: Path) -> None:
+def test_count_live_sessions_counts_both_adapters(tmp_path: Path) -> None:
     """count_live_sessions should count sessions from both devin-shell and claude-code adapters."""
     from charlie_work.live_session_count import WORKER_LANE, count_live_sessions
     from charlie_work.devin_shell import SessionRecord as DevinSessionRecord
@@ -162,7 +162,7 @@ def test_live_session_count_counts_both_adapters(tmp_path: Path) -> None:
     assert count == 0  # No live sessions since both have pid=None
 
 
-def test_live_session_count_corroborates_ghost_worker_via_state_json(
+def test_count_live_sessions_corroborates_ghost_worker_via_state_json(
     tmp_path: Path,
 ) -> None:
     """Issue #343: a live ``worker_pid`` recorded in state.json with NO
