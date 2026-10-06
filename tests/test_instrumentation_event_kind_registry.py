@@ -207,9 +207,9 @@ def test_every_emitted_kind_is_rollup_classified() -> None:
     rows silently -- this test is the tripwire that forces the classification.
     """
     from charlie_work.dashboard.rollup_derive import (
-        HANDLERS,
         KNOWN_IGNORED,
         SWEEP_SUFFIX,
+        is_classified,
     )
 
     src_root = Path(__file__).parents[1] / "src" / "charlie_work"
@@ -222,7 +222,7 @@ def test_every_emitted_kind_is_rollup_classified() -> None:
     assert not unresolved_sweeps  # same contract as the test above
     kinds = used | swept | {k + SWEEP_SUFFIX for k in swept} | set(_LEVEL_BY_KIND)
 
-    unclassified = sorted(k for k in kinds if k not in HANDLERS and k not in KNOWN_IGNORED)
+    unclassified = sorted(k for k in kinds if not is_classified(k))
     assert not unclassified, (
         "emitted event kind(s) the dashboard rollup neither handles nor declares in "
         "KNOWN_IGNORED -- add a derive handler or a one-line ignore reason in "

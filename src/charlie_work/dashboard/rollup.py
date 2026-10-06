@@ -31,7 +31,7 @@ from typing import Any
 from .. import layout
 from . import sources as src
 from .rollup_common import _int
-from .rollup_derive import GLOBAL_ONLY_KINDS, HANDLERS, KNOWN_IGNORED, derive_event
+from .rollup_derive import GLOBAL_ONLY_KINDS, HANDLERS, derive_event, is_classified
 from .rollup_schema import (
     FLEET_SOURCE,
     LOOP_PASS_COLUMNS,
@@ -351,7 +351,7 @@ def _ingest_source(dst: sqlite3.Connection, source: str, db: Path, cutoff: str) 
         unclassified = {
             str(kind): int(n)
             for kind, _first, _last, n in coverage_rows
-            if kind not in HANDLERS and kind not in KNOWN_IGNORED
+            if not is_classified(str(kind))
         }
         return SourceResult(source, ingested, rederived, rebuilt, unclassified=unclassified)
     except sqlite3.Error as exc:
