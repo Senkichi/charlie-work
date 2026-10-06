@@ -115,7 +115,9 @@ PR_LIST_FIELDS = "number,title,url,headRefName,baseRefName,body,isDraft,labels,a
 # one consumer that genuinely needs the whole open-PR rollup (the broadcast
 # ``update_open_prs`` required-check guard, which runs only after a merge) uses
 # ``pr_list_with_checks``.
-PR_LIST_WITH_CHECKS_FIELDS = PR_LIST_FIELDS.replace("reviewDecision,", "reviewDecision,statusCheckRollup,")
+PR_LIST_WITH_CHECKS_FIELDS = PR_LIST_FIELDS.replace(
+    "reviewDecision,", "reviewDecision,statusCheckRollup,"
+)
 PR_VIEW_FIELDS = "number,title,url,headRefName,baseRefName,body,isDraft,labels,author,updatedAt,reviewDecision,statusCheckRollup,state,mergeable,additions,deletions,headRefOid,isCrossRepository,mergeStateStatus"
 
 # Moved from ``github_capabilities/_base.py`` alongside ``merged_prs_for_issue``
