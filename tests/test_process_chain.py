@@ -103,14 +103,15 @@ class _FakePsutilProc:
 
 
 def test_win32_snapshot_normalizes_rows(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(pc, "_bulk_ppid_map", lambda: {7: 3, 8: 7})
     monkeypatch.setattr(
         pc.psutil,
         "process_iter",
         lambda attrs=None: iter(
             [
-                _FakePsutilProc(pid=7, ppid=3, create_time=99.5),
-                _FakePsutilProc(pid=8, ppid=7, create_time=None),
-                _FakePsutilProc(pid=4, ppid=None, create_time=1.0),
+                _FakePsutilProc(pid=7, create_time=99.5),
+                _FakePsutilProc(pid=8, create_time=None),
+                _FakePsutilProc(pid=4, create_time=1.0),
             ]
         ),
     )
@@ -120,6 +121,26 @@ def test_win32_snapshot_normalizes_rows(monkeypatch: pytest.MonkeyPatch) -> None
         8: pc.ProcRow(7, None),
         4: pc.ProcRow(0, 1.0),
     }
+
+
+def test_win32_snapshot_never_reads_ppid_per_row(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Issue #2353 regression pin: on Windows ``Process.ppid()`` rebuilds the
+    kernel's whole ppid table per call, so a per-row ``ppid`` column on
+    ``process_iter`` is O(n^2) — ~4 s at ~470 processes, paid by every
+    ``kill_process_tree`` ancestor guard. The snapshot must take the bulk map
+    once and never request a ``ppid`` column."""
+    requested: list[Any] = []
+    monkeypatch.setattr(pc, "_bulk_ppid_map", lambda: {7: 3})
+    monkeypatch.setattr(
+        pc.psutil,
+        "process_iter",
+        lambda attrs=None: (
+            requested.append(attrs) or iter([_FakePsutilProc(pid=7, create_time=1.0)])
+        ),
+    )
+
+    assert pc.win32_process_ppid_snapshot() == {7: pc.ProcRow(3, 1.0)}
+    assert requested and all("ppid" not in (attrs or []) for attrs in requested)
 
 
 def test_win32_snapshot_failure_returns_empty(monkeypatch: pytest.MonkeyPatch) -> None:
