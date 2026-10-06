@@ -23,6 +23,11 @@ _REASON_LABEL = {
     "mention_covered_awaiting_operator": "Mention awaiting operator",
     "blocked_by_open_dependency": "Blocked by open dependency",
     "unidentified": "Unidentified",
+    # parked_unready never reaches this map's consumers (it is not in
+    # now_model.NOT_DISPATCHABLE_REASONS -- a parked issue is not Ready),
+    # but the label lives here so the reason vocabulary has one display-name
+    # owner if a future breakdown surfaces it.
+    "parked_unready": "Parked, not ready",
 }
 
 
