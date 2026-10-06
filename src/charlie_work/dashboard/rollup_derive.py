@@ -104,6 +104,8 @@ KNOWN_IGNORED: dict[str, str] = {
     "github_not_found_error": "transport diagnostic",
     "github_transport_fallback": "transport diagnostic",
     "github_circuit_opened": "circuit-breaker state record",
+    "github_rate_limited": "rate-limit diagnostic",
+    "github_budget_pass": "per-pass spend accounting record",
     "github_circuit_closed": "circuit-breaker state record",
     "github_issue_state_partial_fallback": "partial-fallback diagnostic",
     "git_network_retry": "per-call retry diagnostic",

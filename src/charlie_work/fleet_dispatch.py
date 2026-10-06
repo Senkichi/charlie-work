@@ -2299,6 +2299,7 @@ def fleet_loop(
                         ensure_labels=ensure_labels,
                         # Issue #1948: thread the pass deadline into the lane.
                         deadline_exceeded=_deadline_exceeded,
+                        fleet_state_path=fleet_state_path,
                     )
                 except Exception:
                     lock.release()

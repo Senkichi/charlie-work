@@ -23,6 +23,7 @@ from .config import OrchestratorConfig
 from .fleet_paths import fleet_dir
 from .fleet_registry import _load_registry, _select_repos
 from .github import GitHub
+from .github_transport.budget_pass import emit_github_budget_pass
 from .global_config import load_layered_config
 from .instrumentation import log_event
 from .local_issues import github_client_for
@@ -69,6 +70,7 @@ def _run_fleet_repo_lane(
     merge: bool | None,
     ensure_labels: bool,
     deadline_exceeded: Callable[[], bool] | None = None,
+    fleet_state_path: Path | None = None,
 ) -> CommandResult:
     """One repo's lane body, executed on a pool thread (issue #1934).
 
@@ -181,6 +183,10 @@ def _run_fleet_repo_lane(
         )
     finally:
         markdown_guard.unbind_sink(sink_token)
+        if fleet_state_path is not None:
+            # Issue #2439: this lane's GitHub spend, by capability, in the one
+            # fleet-level events.db so the hourly ranking is a single query.
+            emit_github_budget_pass(app.gh, fleet_state_path, pass_kind="lane", repo_key=repo_key)
         lock.release()
 
 
@@ -244,6 +250,7 @@ def _run_fleet_reap_sweep(
                 fleet_dir_override=fleet_dir_override,
             )
             sweep = app._run_review_reap_sweeps(resolved_now)
+            emit_github_budget_pass(gh, fleet_state_path, pass_kind="reap", repo_key=repo_key)
             verdict_result = sweep.get("verdict_result") or {}
             payload = {
                 "repo_key": repo_key,
