@@ -23,7 +23,7 @@ import ast
 from pathlib import Path
 
 import pytest
-from _src_ast import parsed, source_files
+from _src_ast import parsed, source_files, source_text
 from _fakes_github import FakeGitHub
 from _reconcile_fixtures import FakeGitHub as ReconcileFakeGitHub
 from charlie_work.config import OrchestratorConfig
@@ -619,6 +619,9 @@ def test_issue_label_writes_go_through_the_seam() -> None:
     offenders: list[str] = []
     for path in source_files(src_root):
         if path.name == "labels.py":
+            continue
+        text = source_text(path)
+        if "add_issue_label" not in text and "remove_issue_label" not in text:
             continue
         tree = parsed(path)
         for node in ast.walk(tree):
