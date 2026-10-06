@@ -106,15 +106,9 @@ class _FakePsutilProc:
 def test_win32_snapshot_normalizes_rows(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(pc, "_bulk_ppid_map", lambda: {7: 3, 8: 7})
     monkeypatch.setattr(
-        pc.psutil,
-        "process_iter",
-        lambda attrs=None: iter(
-            [
-                _FakePsutilProc(pid=7, create_time=99.5),
-                _FakePsutilProc(pid=8, create_time=None),
-                _FakePsutilProc(pid=4, create_time=1.0),
-            ]
-        ),
+        pc,
+        "_bulk_create_time_map",
+        lambda: {7: 99.5, 8: None, 4: 1.0},
     )
 
     assert pc.win32_process_ppid_snapshot() == {
@@ -129,9 +123,11 @@ def test_win32_snapshot_never_reads_ppid_per_row(monkeypatch: pytest.MonkeyPatch
     kernel's whole ppid table per call, so a per-row ``ppid`` column on
     ``process_iter`` is O(n^2) — ~4 s at ~470 processes, paid by every
     ``kill_process_tree`` ancestor guard. The snapshot must take the bulk map
-    once and never request a ``ppid`` column."""
+    once and never request a ``ppid`` column — including on the
+    ``process_iter`` leg that runs when no ``cext.proc_times`` exists."""
     requested: list[Any] = []
     monkeypatch.setattr(pc, "_bulk_ppid_map", lambda: {7: 3})
+    monkeypatch.setattr(pc, "_bulk_create_time_map", lambda: None)
     monkeypatch.setattr(
         pc.psutil,
         "process_iter",
@@ -144,11 +140,56 @@ def test_win32_snapshot_never_reads_ppid_per_row(monkeypatch: pytest.MonkeyPatch
     assert requested and all("ppid" not in (attrs or []) for attrs in requested)
 
 
+def test_win32_snapshot_never_enumerates_via_process_iter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #2372 regression pin: ``process_iter``'s ``create_time`` column
+    pays a full ``NtQuerySystemInformation`` walk per AccessDenied process
+    (~1.7 ms each — ~1 s on a busy host, the ledger's measured regression).
+    While the bulk ``cext.proc_times`` table exists, the snapshot must not
+    touch ``process_iter`` at all."""
+    monkeypatch.setattr(pc, "_bulk_ppid_map", lambda: {7: 3})
+    monkeypatch.setattr(pc, "_bulk_create_time_map", lambda: {7: 1.0})
+
+    def boom(attrs: Any = None) -> Any:
+        raise AssertionError("process_iter must not run while the bulk map exists")
+
+    monkeypatch.setattr(pc.psutil, "process_iter", boom)
+
+    assert pc.win32_process_ppid_snapshot() == {7: pc.ProcRow(3, 1.0)}
+
+
+def test_win32_snapshot_falls_back_to_process_iter_without_bulk_times(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A platform with no ``cext.proc_times`` (``_bulk_create_time_map`` ->
+    ``None``) still gathers ``create_time`` from one ``process_iter`` pass —
+    the pre-#2372 leg, kept so a hypothetical port stays correct."""
+    monkeypatch.setattr(pc, "_bulk_ppid_map", lambda: {7: 3, 8: 7})
+    monkeypatch.setattr(pc, "_bulk_create_time_map", lambda: None)
+    monkeypatch.setattr(
+        pc.psutil,
+        "process_iter",
+        lambda attrs=None: iter(
+            [
+                _FakePsutilProc(pid=7, create_time=99.5),
+                _FakePsutilProc(pid=8, create_time=None),
+            ]
+        ),
+    )
+
+    assert pc.win32_process_ppid_snapshot() == {
+        7: pc.ProcRow(3, 99.5),
+        8: pc.ProcRow(7, None),
+    }
+
+
 def test_win32_snapshot_failure_returns_empty(monkeypatch: pytest.MonkeyPatch) -> None:
     def boom(attrs: Any = None) -> Any:
         raise pc.psutil.Error("substrate broken")
 
-    monkeypatch.setattr(pc.psutil, "process_iter", boom)
+    monkeypatch.setattr(pc, "_bulk_ppid_map", lambda: {})
+    monkeypatch.setattr(pc, "_bulk_create_time_map", boom)
 
     assert pc.win32_process_ppid_snapshot() == {}
 
@@ -202,6 +243,65 @@ def test_bulk_ppid_map_fallback_when_ppid_map_attribute_missing(
     )
 
     assert pc._bulk_ppid_map() == {100: 50}
+
+
+def test_bulk_create_time_map_uses_proc_times(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``cext.proc_times`` present: one call per pid from ``psutil.pids()``,
+    the creation stamp read off the third tuple element, ``None`` kept for
+    a denied open."""
+    calls: list[int] = []
+
+    def fake_proc_times(pid: int) -> tuple[float, float, float]:
+        calls.append(pid)
+        if pid == 8:
+            raise PermissionError("denied")
+        return (0.0, 0.0, {7: 99.5, 4: 1.0}[pid])
+
+    monkeypatch.setattr(
+        pc.psutil,
+        "_psplatform",
+        SimpleNamespace(cext=SimpleNamespace(proc_times=fake_proc_times)),
+        raising=False,
+    )
+    monkeypatch.setattr(pc.psutil, "pids", lambda: [7, 8, 4])
+
+    assert pc._bulk_create_time_map() == {7: 99.5, 8: None, 4: 1.0}
+    assert calls == [7, 8, 4]
+
+
+def test_bulk_create_time_map_drops_pid_gone_mid_scan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pid that exits between ``pids()`` and its ``proc_times`` read
+    (``ProcessLookupError``) yields no row — the same boundary
+    ``process_iter`` applies when it removes a gone pid."""
+
+    def fake_proc_times(pid: int) -> tuple[float, float, float]:
+        if pid == 8:
+            raise ProcessLookupError(pid)
+        return (0.0, 0.0, 1.0)
+
+    monkeypatch.setattr(
+        pc.psutil,
+        "_psplatform",
+        SimpleNamespace(cext=SimpleNamespace(proc_times=fake_proc_times)),
+        raising=False,
+    )
+    monkeypatch.setattr(pc.psutil, "pids", lambda: [7, 8])
+
+    assert pc._bulk_create_time_map() == {7: 1.0}
+
+
+def test_bulk_create_time_map_absent_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A platform shipping no ``cext.proc_times`` returns ``None`` so the
+    snapshot takes its ``process_iter`` fallback leg."""
+    monkeypatch.setattr(
+        pc.psutil, "_psplatform", SimpleNamespace(cext=SimpleNamespace()), raising=False
+    )
+
+    assert pc._bulk_create_time_map() is None
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows-only: real psutil snapshot")
