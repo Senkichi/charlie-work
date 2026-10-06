@@ -309,9 +309,8 @@ class CarryForwardCheck:
     ``+``/``-`` line stream and changed-file set are identical to what was
     recorded at review time (issue #414), or ``None`` when neither tier
     establishes content identity: the caller must treat the verdict as
-    stale. ``live_patch_id``/``live_signature`` are always populated (when
-    the live diff was fetched) so a carrying-forward caller can persist the
-    freshly computed baseline against the new head without recomputing it.
+    stale. ``live_patch_id``/``live_signature`` are always populated when the
+    live diff is fetched, so a carrying-forward caller can persist the fresh baseline.
     """
 
     tier: str | None
