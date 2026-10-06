@@ -181,12 +181,20 @@ def test_toggles_expose_their_state() -> None:
 # ---- (6) over-cap is not colour-only ---------------------------------------------------
 
 
-def test_over_cap_is_stated_in_words() -> None:
+def test_over_cap_is_stated_in_words_with_a_glyph() -> None:
     cap = replace(_model().capacity, reviewers_live=8, reviewers_cap=6)
     page = _page(_model(capacity=cap))
     reviewers = page[page.index('id="meter-reviewers"') : page.index('id="meter-runners"')]
     assert '<span class="note">over cap</span>' in reviewers
     assert "over cap" not in page.replace(reviewers, "")
+
+
+def test_no_rule_puts_aligned_numerals_back_in_fraunces() -> None:
+    for name in ("now.css", "now-page.css"):
+        for sels, body in _rules(_css(name)):
+            if "--lj-serif" in body:
+                bad = [s for s in sels if re.search(r"\.(age|hn|val)", s)]
+                assert not bad, (name, bad)
 
 
 def test_focus_is_ink_weight_not_a_second_colour() -> None:

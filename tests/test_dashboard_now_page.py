@@ -21,6 +21,7 @@ from _dashboard_page_fixtures import (
     _parse,
 )
 
+from charlie_work.dashboard.now_progress_data import ProgressData, ProgressSeries
 from charlie_work.dashboard.now_types import RepoFreshness
 from charlie_work.dashboard.pages import now_fmt, routes
 from charlie_work.dashboard.pages.now import render_fragment, render_now
@@ -56,7 +57,7 @@ def test_count_is_decisions_only_and_exceptions_leave_the_panel() -> None:
     assert "loop_errors" in _between(page, 'id="health-pop"', "</div>")  # they went to the pill
 
 
-def test_tiles_and_sections_follow_the_decision_order() -> None:
+def test_groups_render_in_decision_order() -> None:
     page = _page()
     tiles = re.findall(r'class="tile" id="tile-(\w+)" data-g="\w+" aria-pressed="(\w+)"', page)
     assert tiles == [("verdicts", "true"), ("decisions", "false"), ("requeue", "false")]
@@ -121,7 +122,7 @@ def test_command_display_drops_the_repo_prefix_and_choice_list() -> None:
     assert "charlie --repo" not in re.sub(r'(title|data-copy|aria-label)="[^"]*"', "", page)
 
 
-def test_reason_is_trimmed_for_the_row_and_kept_whole_in_the_title(drilldowns: None) -> None:
+def test_reason_drops_the_group_prefix_and_bolds_the_lead_ref(drilldowns: None) -> None:
     page = _page()
     assert (
         '<span class="what">Senkichi/charlie-work · PR #7</span>'.replace("Senkichi/", "") in page
@@ -129,6 +130,7 @@ def test_reason_is_trimmed_for_the_row_and_kept_whole_in_the_title(drilldowns: N
     assert '<span class="why">awaits your verdict</span>' in page
     assert 'title="Human needed: PR #7 (issue #6) awaits an operator verdict' in page
     assert '<span class="why">x</span>' in page  # "Human needed: #9 x" -> "x"
+    assert "Human needed:" not in re.sub(r'title="[^"]*"', "", page)  # group prefix dropped
 
 
 def test_row_budget_shows_six_then_a_toggle_and_four_behind_other_groups() -> None:
@@ -144,10 +146,36 @@ def test_row_budget_shows_six_then_a_toggle_and_four_behind_other_groups() -> No
     assert 'class="more"' not in _page()  # within budget: no toggle
 
 
-def test_hostile_reason_is_escaped_wherever_it_appears() -> None:
-    page = _page()
-    assert "<script>alert(1)" not in page
-    assert "&lt;script&gt;alert(1)&lt;/script&gt; &amp; more" in page
+def test_hostile_reason_is_escaped(drilldowns: None) -> None:
+    hostile = '<img src=x onerror=alert(1)>"&'
+    esc = "&lt;img src=x onerror=alert(1)&gt;&quot;&amp;"
+    base = _model()
+    model = replace(
+        base,
+        needs_me=(
+            _item("Awaiting your verdict", reason=f"Human needed: PR #7 {hostile}", number=7),
+            _item("Operator queue", reason=f"Operator queue: #3 {hostile}", repo=f"a/{hostile}"),
+            *base.needs_me,
+        ),
+        freshness=(RepoFreshness(f"x/{hostile}", NOW, 24.0, True, hostile), *base.freshness),
+    )
+    series = ProgressSeries(
+        "merged", "7d", (("2026-10-01T00:00:00Z", 1.0),), {hostile: ((0, 1.0),)}, None, True, False
+    )
+    page = _page(model, progress=ProgressData((series,)))
+    assert "<img src=x" not in page and "<script>alert(1)" not in page
+    assert esc in page  # rows, drawers and the health pill all go through esc()
+    pill = _between(page, 'id="health-pop"', "</div>")
+    assert esc in pill or "&lt;script&gt;" in pill
+    attr = re.search(r'data-progress="([^"]*)"', page)
+    assert attr and "<" not in attr.group(1) and ">" not in attr.group(1)
+    assert (
+        hostile
+        in json.loads(html_mod.unescape(attr.group(1)))["metrics"]["merged"]["ranges"]["7d"][
+            "repo"
+        ]
+    )
+    assert "&lt;script&gt;alert(1)&lt;/script&gt; &amp; more" in _page()
 
 
 # ---- exceptions are the header health pill ----------------------------------------------
@@ -273,7 +301,7 @@ def test_nothing_in_flight_headline() -> None:
     assert "Nothing in flight" in _page(_model(flow=flow))
 
 
-def test_capacity_unknown_cap_is_an_open_track_never_a_faked_scale() -> None:
+def test_unknown_cap_is_dashed_and_labelled_never_faked() -> None:
     page = _page()
     workers = _between(page, 'id="meter-workers"', "</button>")
     assert 'class="trk open"' in workers and "cap not reported" in workers
@@ -306,7 +334,7 @@ def test_every_capacity_meter_has_a_drawer() -> None:
 # ---- the frame ----------------------------------------------------------------------------
 
 
-def test_header_has_brand_nav_health_asof_and_theme_button() -> None:
+def test_header_as_of_local_time_nav_and_freshness() -> None:
     page = _page()
     local = NOW.astimezone().strftime("%H:%M:%S")
     assert f'<time class="js-local" datetime="{NOW.isoformat()}">{local}</time>' in page
@@ -315,6 +343,7 @@ def test_header_has_brand_nav_health_asof_and_theme_button() -> None:
     assert '<a href="/history" data-go="h">History</a>' in page
     assert 'id="theme-toggle"' in page
     assert 'class="fresh"' not in page  # the ledger strip left the front page
+    assert "swole stale" in page  # freshness: the health pill names the stale source
 
 
 def test_page_is_a_four_panel_grid_in_reading_order() -> None:
@@ -333,7 +362,7 @@ def test_registered_drill_downs_are_links_and_unbuilt_ones_stay_text() -> None:
     assert not any(h.startswith(("/backlog", "/prs", "/capacity")) for h in hrefs)
 
 
-def test_unrouted_links_render_as_text_not_dead_links(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_unrouted_numbers_render_as_text_not_dead_links(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(routes, "ROUTES", frozenset({"/now", "/history"}))
     page = _page()
     hrefs = [a["href"] for t, a in _parse(page).tags if t == "a" and a.get("href")]
@@ -341,9 +370,16 @@ def test_unrouted_links_render_as_text_not_dead_links(monkeypatch: pytest.Monkey
     assert 'class="drill' not in page  # a drill-down link with nowhere to go is not offered
 
 
-def test_row_drill_link_targets_the_issue(drilldowns: None) -> None:
+def test_numbers_link_to_drill_downs_and_done_is_unrecorded(drilldowns: None) -> None:
     page = _page()
-    assert 'href="/issue/Senkichi/charlie-work/6"' in page
+    assert 'href="/issue/Senkichi/charlie-work/6"' in page  # expanded row -> the issue
+    assert 'href="/repo/Senkichi/charlie-work"' in _between(
+        page, 'id="pipe-in-progress"', "</div></div>"
+    )
+    merged = _between(page, 'id="node-merged"', "</button>")
+    assert '<span class="cnt num">—</span>' in merged and "rollup is not current" in page
+    done = _page(_model(flow=replace(_model().flow, done_24h=9)))
+    assert '<span class="cnt num">9</span>' in _between(done, 'id="node-merged"', "</button>")
 
 
 def test_no_inline_style_or_script_anywhere() -> None:
@@ -398,7 +434,7 @@ def test_collecting_state_renders_the_frame_and_a_skip_target() -> None:
 # ---- the htmx region and the state it must not lose ----------------------------------------
 
 
-def test_fragment_is_the_htmx_target_with_stable_unique_ids() -> None:
+def test_fragment_is_the_htmx_target_with_stable_ids() -> None:
     frag = render_fragment(ModelState(model=_model()), 15)
     assert frag.startswith('<div id="now" class="shell" hx-get="/now/fragment"')
     assert 'hx-trigger="every 15s" hx-swap="outerHTML"' in frag
