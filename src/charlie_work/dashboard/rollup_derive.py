@@ -29,6 +29,27 @@ from .rollup_schema import JOB_TABLE
 # ``test_every_emitted_kind_is_rollup_classified``, so a new writer kind cannot land
 # without someone deciding what it means for the dashboard.
 KNOWN_IGNORED: dict[str, str] = {
+    # -- ci-fleet host kinds (host I/O, leak drain): host-level signals with no per-issue flow fact.
+    "host_reboot_due": "ci-fleet host-level event; no per-issue rollup fact",
+    "host_leak_warn": "ci-fleet host-level event; no per-issue rollup fact",
+    "host_io_fallback": "ci-fleet host-level event; no per-issue rollup fact",
+    "host_io_hold": "ci-fleet host-level event; no per-issue rollup fact",
+    "host_io_exclusions_applied": "ci-fleet host-level event; no per-issue rollup fact",
+    "host_io_exclusions_failed": "ci-fleet host-level event; no per-issue rollup fact",
+    "host_io_exclusions_pending": "ci-fleet host-level event; no per-issue rollup fact",
+    "host_io_verify_failed": "ci-fleet host-level event; no per-issue rollup fact",
+    "host_io_unprovisioned": "ci-fleet host-level event; no per-issue rollup fact",
+    "host_io_invalid": "ci-fleet host-level event; no per-issue rollup fact",
+    "host_io_converged": "ci-fleet host-level event; no per-issue rollup fact",
+    "host_io_reverted": "ci-fleet host-level event; no per-issue rollup fact",
+    "host_io_converge_failed": "ci-fleet host-level event; no per-issue rollup fact",
+    "host_io_rollout_complete": "ci-fleet host-level event; no per-issue rollup fact",
+    "host_io_finalize_requested": "ci-fleet host-level event; no per-issue rollup fact",
+    "host_io_ab_result": "ci-fleet host-level event; no per-issue rollup fact",
+    "host_drain_started": "ci-fleet host-level event; no per-issue rollup fact",
+    "host_drained": "ci-fleet host-level event; no per-issue rollup fact",
+    "host_drain_cleared": "ci-fleet host-level event; no per-issue rollup fact",
+    "host_probe_stale": "ci-fleet host-level event; no per-issue rollup fact",
     # -- Reaper / sweep bookkeeping: recovery detail (and the <kind>_sweep batch
     #    summaries it is folded into); the corrective transitions are their own events.
     "orphaned_worker_drift": "dead-worker sweep drift record; the corrective transition is its own event",
