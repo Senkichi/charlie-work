@@ -53,6 +53,7 @@ from unittest.mock import MagicMock, patch
 from _fakes_github import FakeGitHub
 from _run_captured_fakes import patch_run_captured
 from _sessions_db_fixtures import make_sessions_db
+from _host_fixtures import host_probe
 from charlie_work.config import (
     AutoMergeConfig,
     DeescalationConfig,
@@ -291,7 +292,7 @@ def test_detect_and_handle_orphaned_workers_dry_run_true_writes_nothing(tmp_path
     control_state_file = _seed(control_root)
     control_sessions_dir = control_root / "sessions"
     control_sessions_dir.mkdir(parents=True, exist_ok=True)
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+    with host_probe(alive=False):
         _detect_and_handle_orphaned_workers(
             control_sessions_dir,
             control_state_file,
@@ -315,7 +316,7 @@ def test_detect_and_handle_orphaned_workers_dry_run_true_writes_nothing(tmp_path
     save_calls: list[tuple[tuple, dict]] = []
     append_calls: list[tuple[tuple, dict]] = []
     with (
-        patch("charlie_work.workflow._worker_pid_alive", return_value=False),
+        host_probe(alive=False),
         patch(
             "charlie_work.write_gate.save_state",
             lambda *a, **k: save_calls.append((a, k)) or {"BUG": "raw save_state was called"},

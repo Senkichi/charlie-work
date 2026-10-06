@@ -5828,3 +5828,43 @@ def clean_worktrees(
     if not venv_ok:
         message = f"{message}; {venv_message}"
     return WorktreeCleanResult(ok=ok, message=message, data=data)
+
+
+_CLEAN_LIST_KEYS = ("planned", "removed", "skipped", "failed", "attention_events")
+_ORPHAN_KEYS = ("planned", "removed", "failed")
+
+
+def merge_clean_results(
+    swept: Sequence[tuple[Path, WorktreeCleanResult]],
+) -> WorktreeCleanResult:
+    """Combine one ``clean_worktrees`` result per swept root into one result.
+
+    A single root is returned unchanged. With the host I/O volume active the
+    legacy root is swept too (``ResolvedLayout.sweep_roots``). The roots are
+    disjoint, so ``worktrees_out_of_scope`` is the registered total minus the
+    worktrees in scope under any root; the registered total and the venv check
+    are the same for every root, so the first result's values are kept.
+    """
+    if not swept:
+        raise ValueError("merge_clean_results needs at least one swept root")
+    if len(swept) == 1:
+        return swept[0][1]
+    results = [result for _, result in swept]
+    first = results[0].data
+    registered = int(first.get("worktrees_registered", 0))
+    data: dict[str, Any] = {
+        key: [item for r in results for item in r.data.get(key, [])] for key in _CLEAN_LIST_KEYS
+    }
+    data["orphans"] = {
+        key: [item for r in results for item in r.data.get("orphans", {}).get(key, [])]
+        for key in _ORPHAN_KEYS
+    }
+    data["venv_ok"] = first.get("venv_ok")
+    data["venv_message"] = first.get("venv_message")
+    data["worktrees_registered"] = registered
+    data["worktrees_out_of_scope"] = sum(
+        int(r.data.get("worktrees_out_of_scope", 0)) for r in results
+    ) - registered * (len(results) - 1)
+    data["roots"] = [str(root) for root, _ in swept]
+    message = "; ".join(f"{root}: {result.message}" for root, result in swept)
+    return WorktreeCleanResult(ok=all(r.ok for r in results), message=message, data=data)

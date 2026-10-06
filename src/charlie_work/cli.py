@@ -124,7 +124,7 @@ from ci_fleet.charlie_work_adapter import (
 # importing back out through the adapter -- see that module's docstring on
 # the one-way boundary); the confinement here is about blast radius, not
 # layering.
-from .worktree import clean_worktrees
+from .worktree import clean_worktrees, merge_clean_results
 from .workflow import CommandResult, OrchestratorApp
 
 
@@ -940,13 +940,16 @@ def run_doctor_command(args: argparse.Namespace) -> CommandResult:
 def run_worktree_clean_command(args: argparse.Namespace) -> CommandResult:
     ctx = bootstrap_command(args)
     state = load_state_locked(ctx.paths.state_file)
-    result = clean_worktrees(
-        ctx.repo_root,
-        resolved_layout(ctx.config, ctx.repo_root).worktrees,
-        state,
-        ctx.config,
-        ctx.gh,
-        dry_run=args.dry_run,
+    result = merge_clean_results(
+        [
+            (
+                root,
+                clean_worktrees(
+                    ctx.repo_root, root, state, ctx.config, ctx.gh, dry_run=args.dry_run
+                ),
+            )
+            for root in resolved_layout(ctx.config, ctx.repo_root).sweep_roots()
+        ]
     )
     return CommandResult(result.ok, result.message, result.data)
 

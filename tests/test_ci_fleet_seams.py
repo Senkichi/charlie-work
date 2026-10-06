@@ -46,6 +46,7 @@ import sqlite3
 from pathlib import Path
 
 import pytest
+from _src_ast import parsed, source_files
 
 # ---------------------------------------------------------------------------
 # The moved exception
@@ -591,9 +592,9 @@ def _names_imported_from_the_adapter() -> dict[str, str]:
     root = Path(next(iter(charlie_work.__path__)))
 
     found: dict[str, str] = {}
-    for path in sorted(root.rglob("*.py")):
+    for path in source_files(root):
         try:
-            tree = ast.parse(path.read_text(encoding="utf-8"))
+            tree = parsed(path)
         except SyntaxError:  # pragma: no cover - a broken tree is a different failure
             continue
         for node in ast.walk(tree):

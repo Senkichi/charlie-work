@@ -25,6 +25,7 @@ import charlie_work.adapters as adapters
 import charlie_work.workflow as workflow
 from charlie_work.host import RealWorkerLauncher
 from charlie_work.worker_launch_gate import _launch_workers
+from _src_ast import parsed, source_files
 
 TARGET = adapters.dispatch_sessions.__name__
 PACKAGE_ROOT = Path(charlie_work.__file__).resolve().parent
@@ -37,9 +38,9 @@ def _module_name(path: Path) -> str:
 
 def _references(path: Path, target: str) -> list[tuple[str, str, int]]:
     """``(module, enclosing function qualname or "<module>", line)`` for every
-    reference to ``target``: a bare name, an attribute, an imported alias, or
-    the name as a string constant (``getattr(mod, "dispatch_sessions")``)."""
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    reference to TARGET: a bare name, an attribute, an imported alias, or the
+    name as a string constant (``getattr(mod, "dispatch_sessions")``)."""
+    tree = parsed(path)
     module = _module_name(path)
     found: list[tuple[str, str, int]] = []
 
@@ -70,7 +71,7 @@ def _attribute_reaches(path: Path, attr: str) -> list[tuple[str, str, int]]:
     A bare ``name`` (a dataclass field like ``HostPorts.worker_launch``) is
     deliberately not a hit: only ``.worker_launch`` accesses bypass the gate.
     """
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    tree = parsed(path)
     module = _module_name(path)
     found: list[tuple[str, str, int]] = []
 
@@ -90,14 +91,14 @@ def _attribute_reaches(path: Path, attr: str) -> list[tuple[str, str, int]]:
 
 def _all_references(target: str) -> list[tuple[str, str, int]]:
     refs: list[tuple[str, str, int]] = []
-    for path in sorted(PACKAGE_ROOT.rglob("*.py")):
+    for path in source_files(PACKAGE_ROOT):
         refs.extend(_references(path, target))
     return refs
 
 
 def _all_attribute_reaches(attr: str) -> list[tuple[str, str, int]]:
     refs: list[tuple[str, str, int]] = []
-    for path in sorted(PACKAGE_ROOT.rglob("*.py")):
+    for path in source_files(PACKAGE_ROOT):
         refs.extend(_attribute_reaches(path, attr))
     return refs
 

@@ -32,6 +32,7 @@ from _dispatch_fixtures import _stub_real_activity_probe_for_stalled_tests  # no
 from _fakes_github import FakeGitHubWithChecksAndAnnotations
 from _orphan_sweep_fixtures import _dead_worker_rework_bed, _write_outcome
 from _rework_dispatch_fixtures import _wg
+from _host_fixtures import host_probe
 from charlie_work.config import (
     AutoMergeConfig,
     DevinConfig,
@@ -159,13 +160,12 @@ def _sweep(
     review: Any = _UNSET,
     record_review: Any = _UNSET,
 ) -> None:
-    from unittest.mock import patch
 
     from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
     sessions = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions.mkdir(parents=True, exist_ok=True)
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+    with host_probe(alive=False):
         _detect_and_handle_orphaned_workers(
             sessions,
             paths.state_file,
@@ -688,7 +688,7 @@ def test_maintenance_lane_wires_no_op_drain_callbacks(tmp_path: Path) -> None:
             "charlie_work.workflow._detect_and_handle_orphaned_workers",
             side_effect=fake_detect,
         ),
-        patch("charlie_work.workflow._worker_pid_alive", return_value=True),
+        host_probe(alive=True),
     ):
         run_deadline_guarded_maintenance(PassDeadline(None, CommandResult), app)
 

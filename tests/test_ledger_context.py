@@ -6,6 +6,7 @@ import ast
 from pathlib import Path
 
 from charlie_work.ledger_context import CONTEXT_VAR, TICKET_VAR, ledger_env
+from _src_ast import parsed
 
 SRC = Path(__file__).resolve().parent.parent / "src" / "charlie_work"
 
@@ -16,7 +17,7 @@ def test_ledger_env_names_the_context_and_the_bare_ticket() -> None:
 
 
 def _calls_ledger_env(path: Path, context: str) -> bool:
-    tree = ast.parse(path.read_text(encoding="utf-8"))
+    tree = parsed(path)
     for node in ast.walk(tree):
         if (
             isinstance(node, ast.Call)

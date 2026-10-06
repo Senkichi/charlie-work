@@ -25,6 +25,7 @@ from _rework_dispatch_fixtures import (
     _wg,
 )
 from charlie_work.claude_code import ClaudeWorkerRecord
+from charlie_work.host.fakes import FakeProcessProbe
 from charlie_work.config import (
     DevinConfig,
     DispatchConfig,
@@ -161,7 +162,7 @@ def test_dispatch_does_not_recover_dead_worker_with_open_pr(tmp_path: Path) -> N
 
 
 def test_dispatch_recovery_aborts_for_live_worker_and_restores_in_progress(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, fake_host
 ) -> None:
     """Issue #282: a recovery redispatch that detects a live worker must abort
     and restore the in-progress label, not clobber the worktree."""
@@ -185,10 +186,10 @@ def test_dispatch_recovery_aborts_for_live_worker_and_restores_in_progress(
     # Issue #523: the live-worker slot count now verifies the recorded PID is
     # actually alive at the OS level (is_pid_alive + process_start_time).
     # Stub is_pid_alive so the dispatch-side result PID is treated as live,
-    # and stub _worker_pid_alive so the state.json worker_pid does not block
+    # and fake the probe dead so the state.json worker_pid does not block
     # candidate selection (the issue must be selectable to reach dispatch).
     monkeypatch.setattr("charlie_work.workflow.is_pid_alive", lambda pid, start: True)
-    monkeypatch.setattr("charlie_work.workflow._worker_pid_alive", lambda entry: False)
+    fake_host(probe=FakeProcessProbe())
     config = OrchestratorConfig(worker=WorkerRoleConfig(harness="claude-code"))
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -758,7 +759,7 @@ def test_dispatch_claim_clears_dead_worker_failure_kind(
     fake_gh.prs[0]["state"] = "CLOSED"
 
     _seed_dead_dispatched_entry(paths.state_file, failure_kind="rate_limited")
-    monkeypatch.setattr("charlie_work.workflow._worker_pid_alive", lambda entry: False)
+    fake_host(probe=FakeProcessProbe())
 
     def _fail(_repo_root, _manifest, _results, _settings, requests):
         return [
@@ -799,7 +800,7 @@ def test_dispatch_success_arm_clears_dead_worker_failure_kind(
     fake_gh.prs[0]["state"] = "CLOSED"
 
     _seed_dead_dispatched_entry(paths.state_file, failure_kind=None)
-    monkeypatch.setattr("charlie_work.workflow._worker_pid_alive", lambda entry: False)
+    fake_host(probe=FakeProcessProbe())
 
     def _ok_then_stamp(_repo_root, _manifest, _results, _settings, requests):
         _stamp_dead_worker_failure_kind_mid_dispatch(paths.state_file, 123)
@@ -839,7 +840,7 @@ def test_dispatch_live_worker_arm_clears_dead_worker_failure_kind(
     fake_gh.prs[0]["state"] = "CLOSED"
 
     _seed_dead_dispatched_entry(paths.state_file, failure_kind=None)
-    monkeypatch.setattr("charlie_work.workflow._worker_pid_alive", lambda entry: False)
+    fake_host(probe=FakeProcessProbe())
     # The averted launch's recorded PID reads alive -> live-worker arm.
     monkeypatch.setattr("charlie_work.workflow.is_pid_alive", lambda pid, start: True)
 
@@ -891,7 +892,7 @@ def test_dispatch_phantom_worker_arm_clears_dead_worker_failure_kind(
     fake_gh.prs[0]["state"] = "CLOSED"
 
     _seed_dead_dispatched_entry(paths.state_file, failure_kind=None)
-    monkeypatch.setattr("charlie_work.workflow._worker_pid_alive", lambda entry: False)
+    fake_host(probe=FakeProcessProbe())
     # The averted launch's recorded PID reads dead -> phantom arm.
     monkeypatch.setattr("charlie_work.workflow.is_pid_alive", lambda pid, start: False)
 

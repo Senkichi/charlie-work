@@ -239,12 +239,16 @@ def test_build_request_plan_graphql_body(tmp_path: Path):
 
 def test_cache_round_trip(tmp_path: Path):
     path = tmp_path / "http-etag-cache.json"
+    link = '<https://api.github.com/repos/a/b?page=2>; rel="next"'
     assert http_cache.get_cached(path, "/repos/a/b") is None
-    http_cache.record_response(path, "/repos/a/b", etag='"abc"', status=200, body='{"ok":true}')
+    http_cache.record_response(
+        path, "/repos/a/b", etag='"abc"', status=200, body='{"ok":true}', link=link
+    )
     cached = http_cache.get_cached(path, "/repos/a/b")
     assert cached is not None
     assert cached.etag == '"abc"'
     assert cached.body == '{"ok":true}'
+    assert cached.link == link
 
 
 def test_cache_corrupt_file_fails_closed(tmp_path: Path):
@@ -608,10 +612,14 @@ def test_paginate_object_first_page_falls_back(tmp_path: Path):
 def test_etag_cache_serves_body_on_304(tmp_path: Path):
     """The real ``HttpAdapter`` + the on-disk ``FileEtagCache`` over a fake
     connection: the second GET carries the cached ETag and a 304 is answered
-    from the cache as a 200."""
+    from the cache as a 200 -- Link included, so a paginated read is not
+    truncated by a 304 that omits it."""
     from _fake_transport import FakeConn, FakeRaw
 
-    conn = FakeConn([FakeRaw(200, {"ETag": '"v1"'}, b'{"n": 1}'), FakeRaw(304, {}, b"")])
+    link = '<https://api.github.com/rate_limit?page=2>; rel="next"'
+    conn = FakeConn(
+        [FakeRaw(200, {"ETag": '"v1"', "Link": link}, b'{"n": 1}'), FakeRaw(304, {}, b"")]
+    )
     adapter = HttpAdapter(
         connection_factory=lambda host, timeout: conn,
         cache=http_cache.FileEtagCache(tmp_path / "http-etag-cache.json"),
@@ -624,6 +632,7 @@ def test_etag_cache_serves_body_on_304(tmp_path: Path):
     assert isinstance(second, Response)
     assert second.status == 200
     assert second.body == '{"n": 1}'
+    assert second.header("link") == link
     # The second request carried the cached ETag as If-None-Match.
     assert conn.requests[1][3]["If-None-Match"] == '"v1"'
 

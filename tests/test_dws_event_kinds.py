@@ -19,6 +19,7 @@ from pathlib import Path
 
 from _dws_emit_scan import literals, sweep_emit_kind
 from _instrumentation_kind_scanner import _known_level
+from _src_ast import parsed
 
 _PACKAGE = Path(__file__).parents[1] / "src" / "charlie_work" / "dead_worker_sweep"
 
@@ -29,7 +30,7 @@ def _sweep_kinds() -> tuple[set[str], set[str], list[str]]:
     explicit_level: set[str] = set()
     unresolved: list[str] = []
     for path in sorted(_PACKAGE.glob("decide*.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        tree = parsed(path)
         for node in ast.walk(tree):
             site = sweep_emit_kind(node, path.name)
             if site is None:

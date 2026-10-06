@@ -35,6 +35,10 @@ class UnknownFieldError(ValueError):
     """A ``--json`` field name the dialect has no GraphQL fragment for."""
 
 
+class IncompletePageError(ValueError):
+    """A connection reports a next page the node cannot be followed to."""
+
+
 @dataclass(frozen=True)
 class FieldSpec:
     """One gh field name: its GraphQL selection and the node -> gh value map.
@@ -194,7 +198,7 @@ _CONTEXT_SELECTION = (
     "__typename "
     "... on CheckRun{name status conclusion detailsUrl startedAt completedAt "
     "checkSuite{workflowRun{event workflow{name}}}} "
-    "... on StatusContext{context state targetUrl createdAt}"
+    "... on StatusContext{context state targetUrl createdAt description}"
 )
 
 
@@ -399,14 +403,21 @@ def checks_document() -> str:
 
 
 def checks_next_cursor(pull_request: dict[str, Any]) -> str | None:
-    """``endCursor`` of the next contexts page, or ``None`` on the last page."""
+    """``endCursor`` of the next contexts page, or ``None`` on the last page.
+
+    ``hasNextPage`` without a usable ``endCursor`` is a GitHub contract
+    violation: it raises ``IncompletePageError`` rather than ending the walk
+    as if the page were the last.
+    """
     rollup = pull_request.get("statusCheckRollup")
     contexts = rollup.get("contexts") if isinstance(rollup, dict) else None
     info = contexts.get("pageInfo") if isinstance(contexts, dict) else None
     if not isinstance(info, dict) or not info.get("hasNextPage"):
         return None
     cursor = info.get("endCursor")
-    return cursor if isinstance(cursor, str) and cursor else None
+    if not isinstance(cursor, str) or not cursor:
+        raise IncompletePageError("a connection has a next page but no end cursor")
+    return cursor
 
 
 def states_for(resource: str, state: str) -> list[str] | None:
@@ -525,6 +536,7 @@ def checks_contexts(pull_request: dict[str, Any]) -> list[dict[str, Any]]:
 
 __all__ = [
     "FieldSpec",
+    "IncompletePageError",
     "UnknownFieldError",
     "bucket_for",
     "checks_contexts",

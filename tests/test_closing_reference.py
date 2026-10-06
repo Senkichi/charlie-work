@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _src_ast import parsed, source_files
 
 from charlie_work.closing_reference import (
     ValidationResult,
@@ -416,8 +417,8 @@ def test_every_pr_create_call_site_routes_through_the_validator() -> None:
     # gh.pr_create directly) and instead flag pr_create_retry.py itself --
     # a module that forwards an already-built body and has no closing-ref
     # concern of its own.
-    for path in sorted(_SRC_ROOT.rglob("*.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    for path in source_files(_SRC_ROOT):
+        tree = parsed(path)
         if not _has_create_pr_with_retry_call_site(tree):
             continue
         scanned_with_call_site.append(path.name)
@@ -455,8 +456,8 @@ def test_every_pr_create_call_site_routes_through_the_retry_wrapper() -> None:
     bypass_offenders: list[str] = []
     wrapper_consumers: list[str] = []
 
-    for path in sorted(_SRC_ROOT.rglob("*.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    for path in source_files(_SRC_ROOT):
+        tree = parsed(path)
         # pr_create_retry.py's own body is the one legitimate place a raw
         # `.pr_create(` call may live -- it *is* the routing target every
         # other module must call instead, the same way the definition of

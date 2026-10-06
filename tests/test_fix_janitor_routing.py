@@ -21,7 +21,6 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from unittest.mock import patch
 
 from _janitor_routing_fixtures import _conflicting_app, _set_decision
 from charlie_work.config import (
@@ -37,6 +36,7 @@ from charlie_work.workflow import OrchestratorApp
 from charlie_work.write_gate import WriteGate
 
 from _fakes_github import FakeGitHub
+from _host_fixtures import host_probe
 
 
 def _wg(state_file: Path, *, dry_run: bool = False) -> WriteGate:
@@ -781,7 +781,7 @@ def test_orphan_sweep_does_not_flip_to_reviewing_when_pr_closes_mid_pass(
     # orphan sweep's review() callback, not during record_review above.
     fake_gh.close_pr_view = True
 
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+    with host_probe(alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"

@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
+from _src_ast import parsed, parsed_source
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TESTS_DIR = REPO_ROOT / "tests"
@@ -205,7 +206,7 @@ def find_autospec_violations(
     enforced, including nested helper functions defined inside the test.
     """
     try:
-        tree = ast.parse(source, filename=filename)
+        tree = parsed_source(source, filename)
     except SyntaxError as exc:
         return [AutospecViolation(filename, exc.lineno or 0, "<parse>", str(exc))]
 
@@ -292,8 +293,7 @@ def test_converted_region_uses_autospec_fixture() -> None:
     converted. They now live in ``test_charlie_work_fleet_status.py`` after
     the wave-2 split (#1548).
     """
-    source = (TESTS_DIR / "test_charlie_work_fleet_status.py").read_text(encoding="utf-8")
-    tree = ast.parse(source, filename="tests/test_charlie_work_fleet_status.py")
+    tree = parsed(TESTS_DIR / "test_charlie_work_fleet_status.py")
     parents = _build_parent_map(tree)
     test_nodes = _collect_test_nodes(tree, parents)
     fleet_status_tests = [n for n in test_nodes if n.name.startswith("test_fleet_status_")]
