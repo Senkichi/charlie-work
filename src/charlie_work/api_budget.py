@@ -638,6 +638,131 @@ def github_headroom(
     return None
 
 
+# ---------------------------------------------------------------------------
+# GitHub spend accounting (issue #2439)
+# ---------------------------------------------------------------------------
+# Points are measured from ``x-ratelimit-used`` deltas on response headers,
+# never from ``gh api rate_limit`` (the audit saw it alternate between two
+# counters for the same token). ``used`` is a per-token, per-resource counter
+# that grows within one window (identified by its ``reset`` epoch), so the
+# difference between two sightings of the same window is what was spent
+# between them. The cursor is shared by every client in the process, so the
+# per-capability points of concurrent lanes sum to the observed delta.
+
+
+@dataclass(frozen=True)
+class GitHubUsedMark:
+    resource: str
+    reset_epoch: int
+    used: int
+
+
+@dataclass(frozen=True)
+class GitHubUsedCursor:
+    """The last ``used`` seen per resource window."""
+
+    marks: tuple[GitHubUsedMark, ...] = ()
+
+
+@dataclass(frozen=True)
+class GitHubSample:
+    """One response's rate-limit headers, parsed. ``used`` is ``None`` when the
+    response carried no usable counter (no headers, malformed, a ``gh`` result
+    without ``--include`` output)."""
+
+    resource: str
+    used: int | None
+    reset_epoch: int | None
+    remaining: int | None
+    limit: int | None
+
+
+def sample_github_rate(headers: Iterable[tuple[str, str]]) -> GitHubSample:
+    values = {name.lower(): value for name, value in headers}
+    limit = _header_int(values, "x-ratelimit-limit")
+    remaining = _header_int(values, "x-ratelimit-remaining")
+    used = _header_int(values, "x-ratelimit-used")
+    if used is None and limit is not None and remaining is not None:
+        used = limit - remaining
+    reset = _header_int(values, "x-ratelimit-reset")
+    resource = values.get("x-ratelimit-resource") or "core"
+    return GitHubSample(resource, used, reset, remaining, limit)
+
+
+def advance_used_cursor(
+    cursor: GitHubUsedCursor, sample: GitHubSample
+) -> tuple[GitHubUsedCursor, int]:
+    """Return the cursor after *sample* and the points spent since the last
+    sighting of the same window.
+
+    The first sighting of a window is a baseline and counts 0 (its ``used``
+    includes spend this process never saw). A response from an older window,
+    or with a lower ``used`` than already seen (out-of-order arrival), counts
+    0 and leaves the cursor unchanged, so the sum of deltas never exceeds the
+    server's own counter."""
+    if sample.used is None or sample.reset_epoch is None:
+        return cursor, 0
+    mark = GitHubUsedMark(sample.resource, sample.reset_epoch, sample.used)
+    current = next((m for m in cursor.marks if m.resource == sample.resource), None)
+    kept = tuple(m for m in cursor.marks if m.resource != sample.resource)
+    if current is None or current.reset_epoch < sample.reset_epoch:
+        return GitHubUsedCursor((*kept, mark)), 0
+    if current.reset_epoch > sample.reset_epoch or sample.used <= current.used:
+        return cursor, 0
+    return GitHubUsedCursor((*kept, mark)), sample.used - current.used
+
+
+@dataclass(frozen=True)
+class GitHubSpendEntry:
+    capability: str
+    resource: str
+    requests: int = 0
+    points: int = 0
+    unmetered_requests: int = 0  # answered, but no usable ``used`` counter
+
+
+@dataclass(frozen=True)
+class GitHubSpend:
+    """Requests and points per (capability, resource) since the last take."""
+
+    entries: tuple[GitHubSpendEntry, ...] = ()
+
+    @property
+    def requests(self) -> int:
+        return sum(e.requests for e in self.entries)
+
+    @property
+    def points(self) -> int:
+        return sum(e.points for e in self.entries)
+
+    def points_by_resource(self) -> dict[str, int]:
+        totals: dict[str, int] = {}
+        for entry in self.entries:
+            totals[entry.resource] = totals.get(entry.resource, 0) + entry.points
+        return totals
+
+
+def record_github_spend(
+    spend: GitHubSpend, capability: str, resource: str, *, points: int, metered: bool
+) -> GitHubSpend:
+    """Return *spend* with one request (and *points*) added to its entry."""
+    current = next(
+        (e for e in spend.entries if e.capability == capability and e.resource == resource),
+        GitHubSpendEntry(capability, resource),
+    )
+    updated = GitHubSpendEntry(
+        capability,
+        resource,
+        current.requests + 1,
+        current.points + points,
+        current.unmetered_requests + (0 if metered else 1),
+    )
+    kept = tuple(
+        e for e in spend.entries if not (e.capability == capability and e.resource == resource)
+    )
+    return GitHubSpend((*kept, updated))
+
+
 __all__ = [
     "LEDGER_FILENAME",
     "Usage",
@@ -657,4 +782,12 @@ __all__ = [
     "GitHubRateBudget",
     "observe_github_rate",
     "github_headroom",
+    "GitHubSample",
+    "GitHubSpend",
+    "GitHubSpendEntry",
+    "GitHubUsedCursor",
+    "GitHubUsedMark",
+    "advance_used_cursor",
+    "record_github_spend",
+    "sample_github_rate",
 ]
