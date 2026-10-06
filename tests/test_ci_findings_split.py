@@ -750,23 +750,23 @@ def test_ci_findings_write_event_surface_is_exactly_empty() -> None:
 
 def test_write_event_call_scanner_has_a_positive_control() -> None:
     """Required positive control (operator decision #4, binding): a scanner
-    that always returns ``[]`` would make the empty-result assertion above
-    pass vacuously forever. Runs the identical scanner over the orchestrator
-    corpus (workflow.py + its ``orchestration/*.py`` delegate modules,
-    globbed rather than hard-coded) and requires all four write/event names.
-
-    issue #1645 (L01 b2): ``record_review`` -- with its ``_write_text_atomic``
-    archive-copy call sites -- moved to ``orchestration/state_record_review``,
-    so the corpus spans the delegate modules; dropping a name from
-    ``expected_broad_coverage`` instead would be the weakening this prevents.
+    that always returns ``[]`` would pass the empty-result test vacuously.
+    Runs the identical scanner over the ``orchestration/*.py`` delegates
+    first (issue #1645 L01 b2 moved ``_write_text_atomic`` call sites
+    there), then workflow.py; a dropped name is the weakening prevented.
     """
-    found_names = {
-        hit["name"]
-        for path in [_WORKFLOW_PATH, *sorted(_ORCHESTRATION_DIR.glob("*.py"))]
-        for hit in _write_event_call_sites(source_text(path), filename=str(path))
-    }
-    assert found_names, "the scanner found zero call sites in the corpus -- the scanner is broken"
     expected_broad_coverage = {"_write_json", "_write_text_atomic", "append_event", "log_event"}
+    found_names: set[str] = set()
+    for path in [*sorted(_ORCHESTRATION_DIR.glob("*.py")), _WORKFLOW_PATH]:
+        source = source_text(path)
+        # A Call node cannot exist without the callee's literal name in the text,
+        # and nothing below asserts on names outside expected_broad_coverage.
+        if not any(n in source for n in _WRITE_EVENT_CALL_NAMES | _RAW_WRITE_ATTRS):
+            continue
+        found_names.update(h["name"] for h in _write_event_call_sites(source, filename=str(path)))
+        if expected_broad_coverage <= found_names:
+            break
+    assert found_names, "the scanner found zero call sites in the corpus -- the scanner is broken"
     missing = expected_broad_coverage - found_names
     assert missing == set(), (
         f"scanner found zero call sites for {sorted(missing)} across the orchestrator corpus, "
