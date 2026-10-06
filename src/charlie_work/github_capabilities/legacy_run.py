@@ -17,10 +17,12 @@ suppressed.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any
 
 from ci_fleet.github import GitHubError
 
+from ..github_transport.capability import capability_scope
 from ..github_transport.json_read import JsonRead, RunListRead
 from ..github_transport.legacy_argv import request_for_argv
 from ..github_transport.outcome import Outcome
@@ -49,13 +51,21 @@ def run_legacy(
     if gh.dry_run and request.is_mutation:
         return [] if json_output else "DRY-RUN: " + command
     outcome: Outcome
-    if isinstance(request, (JsonRead, RunListRead)):
-        owner, name = gh._repo_owner_name()
-        outcome = request.execute(transport, owner, name)
-    elif translated.paginate and isinstance(request, RestRequest):
-        outcome = paginate_rest(transport, request)
-    else:
-        outcome = transport.send(request)
+    # ``gh <noun> <verb>`` names the capability; ``gh api`` and the like fall
+    # back to the route family derived from the request itself.
+    scope = (
+        capability_scope("gh." + "_".join(args[:2]))
+        if len(args) >= 2 and args[0] != "api"
+        else nullcontext()
+    )
+    with scope:
+        if isinstance(request, (JsonRead, RunListRead)):
+            owner, name = gh._repo_owner_name()
+            outcome = request.execute(transport, owner, name)
+        elif translated.paginate and isinstance(request, RestRequest):
+            outcome = paginate_rest(transport, request)
+        else:
+            outcome = transport.send(request)
     if allow_failure:
         return to_run_result(outcome, json_output=json_output, command=command)
     if json_output:

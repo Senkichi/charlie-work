@@ -52,6 +52,7 @@ from .circuit_breaker_transport import (
     note_circuit_breaker_result,
 )
 from .cross_repo_blockers import CrossRepoBlocker, make_blocker
+from ..github_transport.capability import capability_name, capability_scope
 from ._send import read_json, send, send_graphql
 from .graphql_issue_states import graphql_issue_states
 from ..github_transport.json_read import JsonRead
@@ -144,6 +145,12 @@ RECONCILE_ISSUE_FIELDS = "number,title,url,body,labels,state"
 # (issue #1609). ``_pr_checks_fallback``, its original caller, was deleted
 # with the ``gh pr checks`` dependency (ADR-0006, B7).
 PR_STATUS_CHECK_ROLLUP_FIELDS = "statusCheckRollup"
+
+
+def _scoped_execute(collab: Any, probe: Any, owner: str, name: str) -> Any:
+    """``probe.execute`` with the collaborator's capability named for the spend ledger."""
+    with capability_scope(capability_name(collab)):
+        return probe.execute(collab._transport_v2, owner, name)
 
 
 class Transport(CapabilityCollaborator):
@@ -378,7 +385,7 @@ class Transport(CapabilityCollaborator):
             outcome = (
                 send(self, probe)
                 if isinstance(probe, RestRequest)
-                else probe.execute(self._transport_v2, owner, name)
+                else _scoped_execute(self, probe, owner, name)
             )
             verdict = probe_verdict(outcome)
             if verdict.skip:

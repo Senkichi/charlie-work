@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from ..github_transport.capability import capability_name, capability_scope
 from ..github_transport.json_read import JsonRead
 from ..github_transport.outcome import Outcome, Response
 from ..github_transport.request import GraphQLRequest, RestRequest
@@ -24,7 +25,8 @@ AnyTypedRequest = RestRequest | GraphQLRequest
 
 def send(collab: Any, request: AnyTypedRequest) -> Outcome:
     """Send *request* through the owner's guarded transport."""
-    return collab._transport_v2.send(request)
+    with capability_scope(capability_name(collab)):
+        return collab._transport_v2.send(request)
 
 
 def send_ok(collab: Any, request: AnyTypedRequest) -> bool:
@@ -78,7 +80,8 @@ def send_read(collab: Any, read: JsonRead) -> Outcome:
     propagates exactly as it does for a ``{owner}/{repo}`` REST route.
     """
     owner, name = collab._repo_owner_name()
-    outcome = read.execute(collab._transport_v2, owner, name)
+    with capability_scope(capability_name(collab)):
+        outcome = read.execute(collab._transport_v2, owner, name)
     # Issue #2438: field-list validation is cached, so a schema rejection here
     # means the cache lied -- clear it and fail loudly (no-op otherwise).
     check_real_call(collab, owner, name, outcome)

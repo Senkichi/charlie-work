@@ -35,10 +35,22 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Protocol
 
-from ..api_budget import GitHubRateBudget, GitHubRateWindow, github_headroom, observe_github_rate
+from ..api_budget import (
+    GitHubRateBudget,
+    GitHubRateWindow,
+    GitHubSample,
+    GitHubSpend,
+    GitHubUsedCursor,
+    advance_used_cursor,
+    github_headroom,
+    observe_github_rate,
+    record_github_spend,
+    sample_github_rate,
+)
 from ..instrumentation import log_event
 from ..pass_deadline import raise_if_pass_deadline_spent
 from ..transient_errors import is_transient_network_error
+from .capability import resolve_capability
 from .failure_markers import is_pre_connection_text, is_transport_class_text
 from .gh_adapter import render_argv
 from .outcome import FailureKind, Outcome, Response, TransportFailure, render_legacy_error
@@ -118,21 +130,93 @@ class Adapters:
     gh: Adapter
 
 
-class RateBudgetHolder:
-    """Runtime holder for the observed rate budget: one lock, one replaced value."""
+class UsedCursor:
+    """Lock-guarded ``GitHubUsedCursor``, shared by every holder in the process.
+
+    ``x-ratelimit-used`` is per token, not per client: with one cursor per
+    holder, N concurrent lanes would each count the others' spend as their
+    own. One shared cursor makes the per-lane points sum to the observed
+    delta (spend by other processes on the same token is attributed to
+    whichever response next sees the counter move)."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
+        self._value = GitHubUsedCursor()
+        self._exhausted: set[tuple[str, int]] = set()
+
+    def first_exhaustion(self, resource: str, reset_epoch: int | None, now: float) -> bool:
+        """True exactly once per (resource, window) across every client sharing
+        this cursor. The fleet builds a fresh client per lane pass, so a
+        per-client dedupe would re-emit the same exhausted window once per
+        lane. A response without a ``reset`` header has no window identity;
+        it is bucketed by wall-clock hour (the length of GitHub's primary
+        window) so it still fires once per hour rather than never or always."""
+        window = reset_epoch if reset_epoch is not None else -(int(now) // 3600) - 1
+        key = (resource, window)
+        with self._lock:
+            if key in self._exhausted:
+                return False
+            self._exhausted.add(key)
+            return True
+
+    def advance(self, sample: GitHubSample) -> int:
+        with self._lock:
+            self._value, points = advance_used_cursor(self._value, sample)
+            return points
+
+
+PROCESS_USED_CURSOR = UsedCursor()
+
+
+class RateBudgetHolder:
+    """Runtime holder for the observed rate budget and the spend since the
+    last ``take_spend``: one lock, replaced values.
+
+    ``value`` is what GitHub last said is left per resource (read by the
+    headroom check); ``spend`` is what this holder's client spent, per
+    capability, measured from ``x-ratelimit-used`` deltas (issue #2439). The
+    budget governor (#2442) reads both through this surface."""
+
+    def __init__(self, cursor: UsedCursor | None = None) -> None:
+        self._lock = threading.Lock()
         self._value = GitHubRateBudget()
+        self._spend = GitHubSpend()
+        self._cursor = cursor if cursor is not None else PROCESS_USED_CURSOR
 
     @property
     def value(self) -> GitHubRateBudget:
         with self._lock:
             return self._value
 
-    def observe(self, response: Response, now: float) -> None:
+    @property
+    def spend(self) -> GitHubSpend:
+        with self._lock:
+            return self._spend
+
+    def observe(self, response: Response, now: float, capability: str = "unattributed") -> None:
+        sample = sample_github_rate(response.headers)
+        points = self._cursor.advance(sample)
         with self._lock:
             self._value = observe_github_rate(self._value, response.headers, now)
+            self._spend = record_github_spend(
+                self._spend,
+                capability,
+                sample.resource,
+                points=points,
+                metered=sample.used is not None and sample.reset_epoch is not None,
+            )
+
+    def take_spend(self) -> GitHubSpend:
+        """The spend since the previous take, resetting it to empty (a pass
+        reads its own delta even on a long-lived holder)."""
+        with self._lock:
+            spend, self._spend = self._spend, GitHubSpend()
+            return spend
+
+    def first_exhaustion(self, resource: str, reset_epoch: int | None, now: float) -> bool:
+        """Process-wide once-per-(resource, window) dedupe for the rate-limit
+        event (see ``UsedCursor.first_exhaustion``)."""
+        return self._cursor.first_exhaustion(resource, reset_epoch, now)
 
 
 def circuit_open_message(breaker: BreakerPort, description: str) -> str:
@@ -149,6 +233,13 @@ def _is_rate_limited(response: Response) -> bool:
     if response.status == 429:
         return True
     if response.status == 403 and response.header("x-ratelimit-remaining") == "0":
+        return True
+    return any(error.type == "RATE_LIMITED" for error in response.graphql_errors)
+
+
+def _is_primary_rate_limited(response: Response) -> bool:
+    """The hourly quota is spent (distinct from a secondary/abuse 429)."""
+    if response.status in (403, 429) and response.header("x-ratelimit-remaining") == "0":
         return True
     return any(error.type == "RATE_LIMITED" for error in response.graphql_errors)
 
@@ -249,6 +340,10 @@ class GuardedTransport:
             return None
         return window
 
+    def take_spend(self) -> GitHubSpend:
+        """This client's spend since the last take (see ``RateBudgetHolder``)."""
+        return self.budget.take_spend()
+
     def set_pass_deadline_exceeded(self, check: Callable[[], bool] | None) -> None:
         self._exceeded = check
 
@@ -281,8 +376,13 @@ class GuardedTransport:
         for attempt in range(max_retries + 1):
             raise_if_pass_deadline_spent(self._exceeded, command)
             outcome = self._attempt(request)
-            if isinstance(outcome, Response):
-                self.budget.observe(outcome, self._now())
+            # A gh-local command (``auth token``) never reaches the API: it is
+            # no spend and no rate-limit signal.
+            if isinstance(outcome, Response) and not isinstance(request, CliRequest):
+                capability = resolve_capability(request)
+                self.budget.observe(outcome, self._now(), capability)
+                if _is_primary_rate_limited(outcome):
+                    self._emit_rate_limited(request, outcome, capability)
             if attempt >= max_retries or not is_retryable(
                 outcome, is_mutation=request.is_mutation
             ):
@@ -378,6 +478,32 @@ class GuardedTransport:
         # write-gate-exempt(issue=1834): GitHub client layer has no WriteGate; transport fallback bookkeeping is lock-free
         log_event(self._state_path, "github_transport_fallback", payload)
 
+    def _emit_rate_limited(self, request: Request, response: Response, capability: str) -> None:
+        """One ``github_rate_limited`` event per exhausted window, wherever the
+        limit is hit (it used to be a log warning outside reconcile only)."""
+        sample = sample_github_rate(response.headers)
+        if not self.budget.first_exhaustion(sample.resource, sample.reset_epoch, self._now()):
+            return
+        logger.warning(
+            "GitHub primary rate limit hit on %s (%s): %s",
+            sample.resource,
+            capability,
+            request.describe(),
+        )
+        if self._state_path is None:
+            return
+        payload = {
+            "resource": sample.resource,
+            "capability": capability,
+            "request": request.describe(),
+            "status": response.status,
+            "limit": sample.limit,
+            "remaining": sample.remaining,
+            "reset": sample.reset_epoch,
+        }
+        # write-gate-exempt(issue=2439): GitHub client layer has no WriteGate; rate-limit bookkeeping is lock-free
+        log_event(self._state_path, "github_rate_limited", payload)
+
     def _note_breaker(self, outcome: Outcome) -> None:
         """Record the FINAL outcome once: a transport-class failure counts
         toward opening; any response (even an error status) proves the
@@ -418,8 +544,10 @@ __all__ = [
     "FALLBACK_KINDS",
     "GitHubTransport",
     "GuardedTransport",
+    "PROCESS_USED_CURSOR",
     "RateBudgetHolder",
     "RuntimePort",
+    "UsedCursor",
     "circuit_open_message",
     "is_retryable",
 ]
