@@ -455,32 +455,20 @@ def test_posix_process_ppid_snapshot_parses_procfs(tmp_path: Path) -> None:
     }
 
 
-class _FakePsutilProc:
-    """Minimal ``psutil.Process`` stand-in exposing only ``.info``."""
-
-    def __init__(self, **info: Any) -> None:
-        self.info = info
-
-
 def test_win32_process_ppid_snapshot_normalizes_single_result(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Rows come from one ``psutil.process_iter`` pass (pid + UTC-derived
-    ``create_time``, seconds, one unit for every row) plus the bulk ppid map
-    (#2353 — a per-row ``ppid`` column is O(n²) on Windows). An unreadable
-    creation time (``AccessDenied`` -> ``None``) yields ``created is None``
-    so the link is kept, and a missing ppid maps to 0."""
+    """Rows come from the bulk ``cext.proc_times`` create-time map (UTC-derived
+    seconds, one unit for every row; #2372 — the ``process_iter``
+    ``create_time`` column pays a per-denied-process ``proc_info`` walk) plus
+    the bulk ppid map (#2353 — a per-row ``ppid`` column is O(n²) on Windows).
+    An unreadable creation time (``AccessDenied`` -> ``None``) yields
+    ``created is None`` so the link is kept, and a missing ppid maps to 0."""
     monkeypatch.setattr(_pc, "_bulk_ppid_map", lambda: {7: 3, 8: 7})
     monkeypatch.setattr(
-        _pc.psutil,
-        "process_iter",
-        lambda attrs=None: iter(
-            [
-                _FakePsutilProc(pid=7, create_time=99.5),
-                _FakePsutilProc(pid=8, create_time=None),
-                _FakePsutilProc(pid=4, create_time=1.0),
-            ]
-        ),
+        _pc,
+        "_bulk_create_time_map",
+        lambda: {7: 99.5, 8: None, 4: 1.0},
     )
 
     assert _sweep._win32_process_ppid_snapshot() == {
@@ -496,10 +484,10 @@ def test_win32_process_ppid_snapshot_failure_returns_empty(
     """A psutil failure must yield ``{}`` so the ancestor guard degrades
     rather than raising."""
 
-    def boom(attrs: Any = None) -> Any:
+    def boom() -> Any:
         raise _pc.psutil.Error("substrate broken")
 
-    monkeypatch.setattr(_pc.psutil, "process_iter", boom)
+    monkeypatch.setattr(_pc, "_bulk_ppid_map", boom)
     assert _sweep._win32_process_ppid_snapshot() == {}
 
 
@@ -622,17 +610,18 @@ def test_snapshot_spawn_oserror_degrades_without_raising(
     caplog: pytest.LogCaptureFixture,
     exc_type: type[OSError],
 ) -> None:
-    """A spawn-level ``OSError`` (e.g. ``PermissionError`` from a denied
-    ``CreateProcess``) is not a ``SubprocessError`` — the snapshot must
-    return ``{}``, ``_self_ancestor_pids`` must degrade to ``{os.getpid()}``
-    with a warning, and both kill primitives must return without raising.
+    """A substrate-level ``OSError`` (e.g. ``PermissionError`` from a denied
+    ``OpenProcess`` surfacing mid-enumeration) is not a ``SubprocessError``
+    — the snapshot must return ``{}``, ``_self_ancestor_pids`` must degrade
+    to ``{os.getpid()}`` with a warning, and both kill primitives must
+    return without raising.
     """
     monkeypatch.setattr(_sweep.os, "name", "nt")
 
     def boom(*args: Any, **kwargs: Any) -> Any:
         raise exc_type("denied")
 
-    monkeypatch.setattr(_pc.psutil, "process_iter", boom)
+    monkeypatch.setattr(_pc, "_bulk_ppid_map", boom)
 
     assert _sweep._win32_process_ppid_snapshot() == {}
 
