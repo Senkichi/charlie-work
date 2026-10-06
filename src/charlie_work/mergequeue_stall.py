@@ -25,7 +25,6 @@ from typing import Any
 
 from .github import label_names
 from .host import current as _host_current
-from .instrumentation import log_event
 from .state import load_state, state_lock
 
 logger = logging.getLogger(__name__)
@@ -84,7 +83,7 @@ def alarm_if_stalled(app: Any, pr: dict[str, Any], pr_entry: dict[str, Any]) -> 
         since = stalled_since(mergequeue_label=label, pr_labels=labels, pr_entry=entry, now=now)
         if since is None:
             return False
-        state = app._record_event(
+        state = app.write_gate.record_event(
             state,
             "mergequeue_stalled",  # event-consumer: scripts/heartbeat_event_alarms.py check_mergequeue_stalled
             {
@@ -111,15 +110,14 @@ def alarm_best_effort(app: Any, pr: dict[str, Any], pr_entry: dict[str, Any]) ->
     The alarm is advisory, but it takes the state lock and writes state, so a
     lock timeout or a write error must not skip review/merge handling for the
     remaining PRs. A failure is logged and recorded as a lock-free
-    ``mergequeue_stall_alarm_failed`` event (``log_event`` is itself best-effort),
+    ``mergequeue_stall_alarm_failed`` event through the WriteGate (``log_event`` is itself best-effort),
     and the next pass retries because the episode marker was never written.
     """
     try:
         return alarm_if_stalled(app, pr, pr_entry)
     except Exception as exc:  # noqa: BLE001 - advisory path: nothing may escape
         logger.warning("mergequeue stall alarm failed for PR #%s: %s", pr.get("number"), exc)
-        log_event(
-            app.paths.state_file,
+        app.write_gate.log_event(
             "mergequeue_stall_alarm_failed",  # event-consumer: audit-only advisory alarm failure; the exception is also logged
             {"pr_number": pr.get("number"), "error": f"{type(exc).__name__}: {exc}"},
         )
