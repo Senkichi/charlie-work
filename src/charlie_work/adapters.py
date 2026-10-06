@@ -414,39 +414,18 @@ def _run_devin_shell_adapter(
             base_ref=settings.base_ref,
             config=settings.config,
         )
-        # Non-blocking launch: there is no returncode/stdout to report — liveness
-        # and output live in the sidecar JSON and per-session log.
-        ok = record.error is None and record.pid is not None
-        return _result(
-            request,
-            adapter="devin-shell",
-            ok=ok,
-            command=list(record.command),
-            error=record.error if not ok else None,
-            reclaimed=record.reclaimed,
-            pid=record.pid,
-            process_start_time=record.process_start_time,
-            failure_kind=record.failure_kind,
-            worktree_path=record.worktree_path,
-        )
     except Exception as exc:
-        # Catch any unexpected exception and return as a failure result
-        # (CLAUDE.md invariant: errors from external processes come back as values)
-        _emit_launch_failed(
+        return _launch_exc_result(
             repo_root,
             settings,
             request,
-            harness="devin-shell",
-            model=settings.worker_model,
-            error_class=launch_events.LAUNCH_ERR_INTERNAL,
-            error=f"launch failed: {exc}",
-        )
-        return _result(
-            request,
             adapter="devin-shell",
-            ok=False,
-            error=f"launch failed: {exc}",
+            model=settings.worker_model,
+            exc=exc,
         )
+    # Non-blocking launch: there is no returncode/stdout to report — liveness
+    # and output live in the sidecar JSON and per-session log.
+    return _record_result(request, "devin-shell", record)
 
 
 def _run_claude_code_adapter(
@@ -478,35 +457,33 @@ def _run_claude_code_adapter(
         kwargs["command_template"] = settings.claude_command
     if settings.tee_stream_json:
         kwargs["tee_stream_json"] = settings.tee_stream_json
-    record = launch_claude_worker(
-        request.issue_number,
-        request.branch_name,
-        prompt_text,
-        repo_root=repo_root,
-        sessions_dir=sessions_dir,
-        worktrees_dir=settings.worktrees_dir,
-        venv_source=settings.venv_source,
-        env=settings.worker_env,
-        materialize_dirs=settings.materialize_dirs,
-        rework=request.rework,
-        recovery=request.recovery,
-        base_ref=settings.base_ref,
-        config=settings.config,
-        **kwargs,
-    )
-    ok = record.error is None and record.pid is not None
-    return _result(
-        request,
-        adapter="claude-code",
-        ok=ok,
-        command=list(record.command),
-        error=record.error if not ok else None,
-        reclaimed=record.reclaimed,
-        pid=record.pid,
-        process_start_time=record.process_start_time,
-        failure_kind=record.failure_kind,
-        worktree_path=record.worktree_path,
-    )
+    try:
+        record = launch_claude_worker(
+            request.issue_number,
+            request.branch_name,
+            prompt_text,
+            repo_root=repo_root,
+            sessions_dir=sessions_dir,
+            worktrees_dir=settings.worktrees_dir,
+            venv_source=settings.venv_source,
+            env=settings.worker_env,
+            materialize_dirs=settings.materialize_dirs,
+            rework=request.rework,
+            recovery=request.recovery,
+            base_ref=settings.base_ref,
+            config=settings.config,
+            **kwargs,
+        )
+    except Exception as exc:
+        return _launch_exc_result(
+            repo_root,
+            settings,
+            request,
+            adapter="claude-code",
+            model=settings.config.worker.model if settings.config else "",
+            exc=exc,
+        )
+    return _record_result(request, "claude-code", record)
 
 
 def _run_api_adapter(
@@ -559,36 +536,35 @@ def _run_api_adapter(
     kwargs: dict[str, Any] = {}
     if settings.claude_command:
         kwargs["command_template"] = settings.claude_command
-    record = launch_api_worker(
-        request.issue_number,
-        request.branch_name,
-        prompt_text,
-        repo_root=repo_root,
-        sessions_dir=sessions_dir,
-        api_worker_config=api_worker_config,
-        worktrees_dir=settings.worktrees_dir,
-        venv_source=settings.venv_source,
-        worker_env=settings.worker_env,
-        materialize_dirs=settings.materialize_dirs,
-        rework=request.rework,
-        recovery=request.recovery,
-        base_ref=settings.base_ref,
-        config=settings.config,
-        **kwargs,
-    )
-    ok = record.error is None and record.pid is not None
-    return _result(
-        request,
-        adapter="api",
-        ok=ok,
-        command=list(record.command),
-        error=record.error if not ok else None,
-        reclaimed=record.reclaimed,
-        pid=record.pid,
-        process_start_time=record.process_start_time,
-        failure_kind=record.failure_kind,
-        worktree_path=record.worktree_path,
-    )
+    try:
+        record = launch_api_worker(
+            request.issue_number,
+            request.branch_name,
+            prompt_text,
+            repo_root=repo_root,
+            sessions_dir=sessions_dir,
+            api_worker_config=api_worker_config,
+            worktrees_dir=settings.worktrees_dir,
+            venv_source=settings.venv_source,
+            worker_env=settings.worker_env,
+            materialize_dirs=settings.materialize_dirs,
+            rework=request.rework,
+            recovery=request.recovery,
+            base_ref=settings.base_ref,
+            config=settings.config,
+            **kwargs,
+        )
+    except Exception as exc:
+        provider = api_worker_config.providers.get(api_worker_config.provider)
+        return _launch_exc_result(
+            repo_root,
+            settings,
+            request,
+            adapter="api",
+            model=provider.model if provider else "",
+            exc=exc,
+        )
+    return _record_result(request, "api", record)
 
 
 def _run_command_adapter(
@@ -662,11 +638,13 @@ def _emit_launch_failed(
     model: str = "",
 ) -> None:
     """Issue #2246: emit one ``launch_failed`` event for a dispatch path that
-    produces an error value *without* reaching a record-returning launch
-    function (prompt reads, missing config, render failures, the command
-    adapter's blocking run, unsupported harnesses). Paths that DO reach
-    ``launch_devin_session``/``launch_claude_worker``/``launch_api_worker``
-    must not call this -- the error-record seam already emitted.
+    produces an error value *without* a record coming back from a
+    record-returning launch function (prompt reads, missing config, render
+    failures, the command adapter's blocking run, unsupported harnesses, and
+    an exception raised -- not recorded -- inside the launch function).
+    Paths that reach ``launch_devin_session``/``launch_claude_worker``/
+    ``launch_api_worker`` and get a record back must not call this -- the
+    error-record seam already emitted.
 
     Every ``dispatch_sessions`` result is a worker launch (rescue-tier
     dispatches included), so ``role`` is fixed "worker" here.
@@ -680,6 +658,54 @@ def _emit_launch_failed(
         error_class=error_class,
         error=error,
     )
+
+
+def _record_result(request: SessionRequest, adapter: str, record: Any) -> SessionDispatchResult:
+    """Map a launcher record into a ``SessionDispatchResult`` -- the same
+    shape for every record-returning adapter lane (errors arrive as values on
+    the record; ``ok`` is failure unless a pid came back)."""
+    ok = record.error is None and record.pid is not None
+    return _result(
+        request,
+        adapter=adapter,
+        ok=ok,
+        command=list(record.command),
+        error=record.error if not ok else None,
+        reclaimed=record.reclaimed,
+        pid=record.pid,
+        process_start_time=record.process_start_time,
+        failure_kind=record.failure_kind,
+        worktree_path=record.worktree_path,
+    )
+
+
+def _launch_exc_result(
+    repo_root: Path,
+    settings: AdapterSettings,
+    request: SessionRequest,
+    *,
+    adapter: str,
+    model: str,
+    exc: Exception,
+) -> SessionDispatchResult:
+    """The adapter lanes' errors-as-values boundary (issue #2229).
+
+    An unexpected raise inside a record-returning launch function comes back
+    as a failed result plus exactly one ``launch_failed`` event -- never a
+    raise (CLAUDE.md invariant: errors from external processes come back as
+    values).
+    """
+    error = f"launch failed: {exc}"
+    _emit_launch_failed(
+        repo_root,
+        settings,
+        request,
+        harness=adapter,
+        model=model,
+        error_class=launch_events.LAUNCH_ERR_INTERNAL,
+        error=error,
+    )
+    return _result(request, adapter=adapter, ok=False, error=error)
 
 
 def _render_command(

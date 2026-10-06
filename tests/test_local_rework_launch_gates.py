@@ -43,11 +43,9 @@ class TestLocalReworkLaunchGates:
         assert deferrals, "gated local rework deferral was not recorded"
         assert deferrals[-1].get("payload", deferrals[-1])["deferred_reason"] == reason
 
-    def test_provider_throttle_defers_local_rework(
-        self, repo: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_provider_throttle_defers_local_rework(self, repo: Path, fake_host) -> None:
         app = self._rework_pending(repo)
-        calls = self._spy(monkeypatch)
+        calls = self._spy(fake_host)
         with state_lock(app.paths.state_file):
             state = load_state(app.paths.state_file)
             state["throttled_until"] = "2999-01-01T00:00:00Z"
@@ -61,12 +59,12 @@ class TestLocalReworkLaunchGates:
         self._assert_deferred(app, result, "provider_throttled")
 
     def test_fleet_lock_held_defers_local_rework(
-        self, repo: Path, monkeypatch: pytest.MonkeyPatch
+        self, repo: Path, monkeypatch: pytest.MonkeyPatch, fake_host
     ) -> None:
         import dataclasses
 
         app = self._rework_pending(repo)
-        calls = self._spy(monkeypatch)
+        calls = self._spy(fake_host)
         app.config = dataclasses.replace(
             app.config,
             fleet=dataclasses.replace(
@@ -85,12 +83,12 @@ class TestLocalReworkLaunchGates:
         self._assert_deferred(app, result, "fleet_lock_held")
 
     def test_concurrency_governor_clamps_local_rework(
-        self, repo: Path, monkeypatch: pytest.MonkeyPatch
+        self, repo: Path, monkeypatch: pytest.MonkeyPatch, fake_host
     ) -> None:
         from types import SimpleNamespace
 
         app = self._rework_pending(repo)
-        calls = self._spy(monkeypatch)
+        calls = self._spy(fake_host)
         requested: list[int] = []
 
         def _governor(limit: int, **_kw: object) -> SimpleNamespace:
@@ -105,12 +103,10 @@ class TestLocalReworkLaunchGates:
         assert calls == []
         self._assert_deferred(app, result, "concurrency_cap")
 
-    def test_ungated_local_rework_still_launches(
-        self, repo: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_ungated_local_rework_still_launches(self, repo: Path, fake_host) -> None:
         """Control: same state, no active gate -> the worker launches."""
         app = self._rework_pending(repo)
-        calls = self._spy(monkeypatch)
+        calls = self._spy(fake_host)
 
         result = app._local_dispatch_rework()
 
@@ -124,10 +120,10 @@ class TestLocalReworkCarriesIssueLabels:
     does. Before the fix every local rework request carried no labels."""
 
     def test_live_issue_labels_reach_the_launch(
-        self, repo: Path, monkeypatch: pytest.MonkeyPatch
+        self, repo: Path, monkeypatch: pytest.MonkeyPatch, fake_host
     ) -> None:
         app = rework_pending_app(repo)
-        calls = spy_dispatch_sessions(monkeypatch)
+        calls = spy_dispatch_sessions(fake_host)
         monkeypatch.setattr(
             type(app.gh),
             "issue_view",
@@ -140,12 +136,12 @@ class TestLocalReworkCarriesIssueLabels:
         assert [r.labels for r in calls] == [("model:opus", "x")]
 
     def test_unreadable_issue_falls_back_to_the_state_snapshot(
-        self, repo: Path, monkeypatch: pytest.MonkeyPatch
+        self, repo: Path, monkeypatch: pytest.MonkeyPatch, fake_host
     ) -> None:
         from charlie_work.github import GitHubError
 
         app = rework_pending_app(repo)
-        calls = spy_dispatch_sessions(monkeypatch)
+        calls = spy_dispatch_sessions(fake_host)
         with state_lock(app.paths.state_file):
             state = load_state(app.paths.state_file)
             state["issues"]["7"]["labels"] = ["model:opus"]

@@ -32,6 +32,7 @@ from charlie_work.config import (
     WatchdogConfig,
     WorkerRoleConfig,
 )
+from charlie_work.host.fakes import FakeWorkerLauncher
 from charlie_work.paths import runtime_paths
 from charlie_work.state import (
     load_state,
@@ -304,7 +305,7 @@ def test_dispatch_clears_stale_orphan_flagged_at(tmp_path: Path) -> None:
 
 
 def test_dispatch_fresh_worktree_foreign_writer_does_not_increment_dispatch_failed(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, fake_host
 ) -> None:
     """Issue #1393: a fresh dispatch that fails at launch with
     worktree_foreign_writer must NOT increment the dispatch_failed counter.
@@ -339,7 +340,7 @@ def test_dispatch_fresh_worktree_foreign_writer_does_not_increment_dispatch_fail
             for request in requests
         ]
 
-    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", fake_dispatch_sessions)
+    fake_host(worker_launch=FakeWorkerLauncher([fake_dispatch_sessions]))
 
     # First blocked launch: blocked_environment_at grows, dispatch_failed_at stays empty.
     result1 = app.dispatch(limit=1)
@@ -367,7 +368,7 @@ def test_dispatch_fresh_worktree_foreign_writer_does_not_increment_dispatch_fail
 
 
 def test_dispatch_fresh_blocked_environment_reap_resets_counter(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_host
 ) -> None:
     """Issue #1423: at the fresh-dispatch blocked-environment cap exhaustion,
     a successful foreign-writer reap resets ``blocked_environment_at`` and
@@ -420,7 +421,7 @@ def test_dispatch_fresh_blocked_environment_reap_resets_counter(
             for request in requests
         ]
 
-    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", fake_dispatch_sessions)
+    fake_host(worker_launch=FakeWorkerLauncher([fake_dispatch_sessions]))
     reap_calls: list[int] = []
 
     def _fake_reap(failed_result, _config, _state_file, issue_number, _sessions_dir=None):
@@ -441,7 +442,7 @@ def test_dispatch_fresh_blocked_environment_reap_resets_counter(
 
 
 def test_dispatch_fresh_blocked_environment_reap_cap_escalates(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_host
 ) -> None:
     """Issue #1423 review: once ``foreign_writer_reaps`` reaches
     ``max_foreign_writer_reaps``, the cap-exhaustion site escalates instead of
@@ -497,7 +498,7 @@ def test_dispatch_fresh_blocked_environment_reap_cap_escalates(
             for request in requests
         ]
 
-    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", fake_dispatch_sessions)
+    fake_host(worker_launch=FakeWorkerLauncher([fake_dispatch_sessions]))
 
     def _reap_must_not_run(
         _failed_result, _config, _state_file, _issue_number, _sessions_dir=None
@@ -742,7 +743,7 @@ def _seed_dead_dispatched_entry(state_file: Path, *, failure_kind: str | None) -
 
 
 def test_dispatch_claim_clears_dead_worker_failure_kind(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_host
 ) -> None:
     """Issue #1917: a fresh dispatch claim drops the previous death's
     classification — a stale provider-throttle stamp must not survive into
@@ -773,7 +774,7 @@ def test_dispatch_claim_clears_dead_worker_failure_kind(
             for request in requests
         ]
 
-    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", _fail)
+    fake_host(worker_launch=FakeWorkerLauncher([_fail]))
 
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
     app.dispatch(limit=1)
@@ -784,7 +785,7 @@ def test_dispatch_claim_clears_dead_worker_failure_kind(
 
 
 def test_dispatch_success_arm_clears_dead_worker_failure_kind(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_host
 ) -> None:
     """Issue #1917: the successful-dispatch arm drops a classification
     stamped between the claim and the upgrade — the new session owns the
@@ -814,7 +815,7 @@ def test_dispatch_success_arm_clears_dead_worker_failure_kind(
             for request in requests
         ]
 
-    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", _ok_then_stamp)
+    fake_host(worker_launch=FakeWorkerLauncher([_ok_then_stamp]))
 
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
     app.dispatch(limit=1)
@@ -825,7 +826,7 @@ def test_dispatch_success_arm_clears_dead_worker_failure_kind(
 
 
 def test_dispatch_live_worker_arm_clears_dead_worker_failure_kind(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_host
 ) -> None:
     """Issue #1917: the live-worker recovery arm drops a mid-dispatch
     classification — the averted launch proves a live session owns the
@@ -860,7 +861,7 @@ def test_dispatch_live_worker_arm_clears_dead_worker_failure_kind(
             for request in requests
         ]
 
-    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", _averted_then_stamp)
+    fake_host(worker_launch=FakeWorkerLauncher([_averted_then_stamp]))
 
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
     app.dispatch(limit=1)
@@ -871,7 +872,7 @@ def test_dispatch_live_worker_arm_clears_dead_worker_failure_kind(
 
 
 def test_dispatch_phantom_worker_arm_clears_dead_worker_failure_kind(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_host
 ) -> None:
     """Issue #1917: the phantom-worker arm (averted launch whose recorded
     PID is dead) drops a mid-dispatch classification — the pass frees the
@@ -912,7 +913,7 @@ def test_dispatch_phantom_worker_arm_clears_dead_worker_failure_kind(
             for request in requests
         ]
 
-    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", _averted_then_stamp)
+    fake_host(worker_launch=FakeWorkerLauncher([_averted_then_stamp]))
 
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
     app.dispatch(limit=1)

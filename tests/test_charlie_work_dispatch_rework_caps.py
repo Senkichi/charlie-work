@@ -26,6 +26,7 @@ from charlie_work.config import (
     WatchdogConfig,
     WorkerRoleConfig,
 )
+from charlie_work.host.fakes import FakeWorkerLauncher
 from charlie_work.paths import runtime_paths
 from charlie_work.state import (
     PASSIVE_OPEN_STATUS,
@@ -94,7 +95,7 @@ def test_dispatch_rework_escalates_after_repeated_failures(tmp_path: Path) -> No
 
 
 def test_dispatch_rework_deterministic_failure_kind_escalates_immediately(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, fake_host
 ) -> None:
     """A rework dispatch failure with a deterministic failure_kind (e.g.
     rework_branch_conflict) must escalate immediately on the first occurrence,
@@ -148,7 +149,7 @@ def test_dispatch_rework_deterministic_failure_kind_escalates_immediately(
             for request in requests
         ]
 
-    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", fake_dispatch_sessions)
+    fake_host(worker_launch=FakeWorkerLauncher([fake_dispatch_sessions]))
 
     result = app.dispatch_rework()
     assert result.ok is False

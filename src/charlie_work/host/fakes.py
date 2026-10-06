@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 
@@ -144,3 +145,57 @@ def _replace_record(record: Any, **changes: Any) -> Any:
     import dataclasses
 
     return dataclasses.replace(record, **changes)
+
+
+class FakeWorkerLauncher:
+    """Scripted worker launches; never spawns a process or sleeps.
+
+    ``outcomes`` is consumed one per ``launch`` call (the last repeats). Each is
+    a ``list`` of ``SessionDispatchResult`` (returned as-is), a ``str`` (every
+    request comes back failed with that ``.error`` and one ``launch_failed``
+    event apiece, via ``worker_error_results``), or a callable taking the
+    ``dispatch_sessions`` signature -- ``(repo_root, manifest_path,
+    results_path, settings, requests)`` -- so an existing dispatch fake drops
+    in unchanged. A callable that raises propagates: the gate's
+    errors-as-values boundary is what's under test there. With no outcomes
+    every request succeeds with ``pid=1``. ``calls`` logs
+    ``(repo_root, manifest_path, results_path, settings, requests)`` per call.
+    """
+
+    def __init__(self, outcomes: Sequence[Any] = ()) -> None:
+        self._outcomes = list(outcomes)
+        self.calls: list[tuple[Any, ...]] = []
+
+    def launch(
+        self,
+        repo_root: Path,
+        manifest_path: Path,
+        results_path: Path,
+        settings: Any,
+        requests: list[Any],
+    ) -> list[Any]:
+        from ..adapters import SessionDispatchResult
+        from .launch import worker_error_results
+
+        index = len(self.calls)
+        self.calls.append((repo_root, manifest_path, results_path, settings, list(requests)))
+        if not self._outcomes:
+            return [
+                SessionDispatchResult(
+                    issue_number=request.issue_number,
+                    issue_title=request.issue_title,
+                    prompt_path=str(request.prompt_path),
+                    branch_name=request.branch_name,
+                    adapter=settings.adapter,
+                    ok=True,
+                    pid=1,
+                )
+                for request in requests
+            ]
+        outcome = self._outcomes[min(index, len(self._outcomes) - 1)]
+        if isinstance(outcome, str):
+            return worker_error_results(repo_root, settings, requests, outcome)
+        if callable(outcome):
+            call: Callable[..., list[Any]] = outcome
+            return call(repo_root, manifest_path, results_path, settings, requests)
+        return outcome

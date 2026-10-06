@@ -29,6 +29,7 @@ from charlie_work.config import (
     OrchestratorConfig,
     WorkerRoleConfig,
 )
+from charlie_work.host.fakes import FakeWorkerLauncher
 from charlie_work.instrumentation import query_events
 from charlie_work.paths import runtime_paths
 from charlie_work.state import (
@@ -384,9 +385,7 @@ def test_dispatch_rework_does_not_regenerate_when_sidecar_is_unreadable(
     assert "the operational note" in before
 
 
-def test_dispatch_rework_combined_manifest_mixed_label(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_dispatch_rework_combined_manifest_mixed_label(tmp_path: Path, fake_host) -> None:
     """Issue #626: when a rework pass dispatches both a normal issue (via the
     default adapter ``devin-shell``) and a rescue-marked issue (via the
     claude-code rescue adapter), the combined manifest's adapter label is
@@ -406,9 +405,10 @@ def test_dispatch_rework_combined_manifest_mixed_label(
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
     manifest_writes: list[str] = []
-    monkeypatch.setattr(
-        "charlie_work.workflow.dispatch_sessions",
-        _fake_dispatch_sessions_writing_manifests(manifest_writes, tmp_path),
+    fake_host(
+        worker_launch=FakeWorkerLauncher(
+            [_fake_dispatch_sessions_writing_manifests(manifest_writes, tmp_path)]
+        )
     )
 
     result = app.dispatch_rework(limit=5)
@@ -424,9 +424,7 @@ def test_dispatch_rework_combined_manifest_mixed_label(
     assert "more than one worker" in " ".join(manifest["instructions"])
 
 
-def test_dispatch_rework_combined_manifest_homogeneous_label(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_dispatch_rework_combined_manifest_homogeneous_label(tmp_path: Path, fake_host) -> None:
     """Issue #626: when a rework pass dispatches both a normal issue and a
     rescue-marked issue, but both use the same adapter kind (claude-code),
     the combined manifest's adapter label is ``"claude-code"`` — not
@@ -459,9 +457,10 @@ def test_dispatch_rework_combined_manifest_homogeneous_label(
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
 
     manifest_writes: list[str] = []
-    monkeypatch.setattr(
-        "charlie_work.workflow.dispatch_sessions",
-        _fake_dispatch_sessions_writing_manifests(manifest_writes, tmp_path),
+    fake_host(
+        worker_launch=FakeWorkerLauncher(
+            [_fake_dispatch_sessions_writing_manifests(manifest_writes, tmp_path)]
+        )
     )
 
     result = app.dispatch_rework(limit=5)
@@ -477,7 +476,7 @@ def test_dispatch_rework_combined_manifest_homogeneous_label(
 
 
 def test_dispatch_rework_no_rescue_skips_redundant_manifest_write(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_host
 ) -> None:
     """Issue #626: when a rework pass has only normal (non-rescue) issues, the
     trailing combined manifest write is skipped — ``dispatch_sessions``
@@ -547,7 +546,7 @@ def test_dispatch_rework_no_rescue_skips_redundant_manifest_write(
         write_session_results(results_path, results)
         return results
 
-    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", _fake_dispatch_sessions)
+    fake_host(worker_launch=FakeWorkerLauncher([_fake_dispatch_sessions]))
 
     result = app.dispatch_rework(limit=5)
 

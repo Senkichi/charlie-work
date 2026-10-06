@@ -10,7 +10,7 @@ from . import role_selection
 from .adapters import (
     SessionDispatchResult,
     cleanup_stale_session_tmp_files,  # noqa: F401  (deliberate re-export; used by orchestration delegates via _wf.)
-    dispatch_sessions,  # noqa: F401  (deliberate re-export; used by moved L08 delegate via _wf.)
+    dispatch_sessions,  # noqa: F401  (deliberate re-export; the worker-launch port's Real binds it late via the workflow module, and test fakes patch it here)
     write_session_manifest,  # noqa: F401  (deliberate re-export; patched on the workflow module in tests)
 )
 from .claude_code import (

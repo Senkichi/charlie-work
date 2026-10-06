@@ -47,6 +47,7 @@ from charlie_work.env_sanitize import (
     STRIPPED_GH_TOKEN_VARS,
     sanitize_env,
 )
+from charlie_work.host.fakes import FakeWorkerLauncher
 from charlie_work.paths import runtime_paths
 from charlie_work.state import load_state
 
@@ -87,9 +88,7 @@ def _events_of_kind(state: dict[str, Any], kind: str) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 
-def test_dispatch_proceeds_with_no_token_and_no_escalation(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_dispatch_proceeds_with_no_token_and_no_escalation(tmp_path: Path, fake_host) -> None:
     """No worker token + default flag -> dispatch proceeds silently.
 
     The retired gate emitted ``worker_token_missing`` once per standing
@@ -118,7 +117,7 @@ def test_dispatch_proceeds_with_no_token_and_no_escalation(
             for req in requests
         ]
 
-    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", _fake_dispatch_sessions)
+    fake_host(worker_launch=FakeWorkerLauncher([_fake_dispatch_sessions]))
 
     fake_gh.prs[0]["state"] = "CLOSED"
     result = app.dispatch(limit=1)
@@ -131,9 +130,7 @@ def test_dispatch_proceeds_with_no_token_and_no_escalation(
     assert state.get("worker_token_escalated") in (None, False)
 
 
-def test_deprecated_require_flag_no_longer_defers(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_deprecated_require_flag_no_longer_defers(tmp_path: Path, fake_host) -> None:
     """``require_worker_github_token=True`` is a deprecated no-op (#1853):
     dispatch must proceed with no token and emit no ``worker_token_missing``
     event — a config file carrying the old flag cannot accidentally re-arm
@@ -160,7 +157,7 @@ def test_deprecated_require_flag_no_longer_defers(
             for req in requests
         ]
 
-    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", _fake_dispatch_sessions)
+    fake_host(worker_launch=FakeWorkerLauncher([_fake_dispatch_sessions]))
 
     fake_gh.prs[0]["state"] = "CLOSED"
     result = app.dispatch(limit=1)
