@@ -41,6 +41,7 @@ from _local_lane_fixtures import (
 )
 from charlie_work.adapters import SessionDispatchResult, SessionRequest
 from charlie_work.claude_code import ClaudeWorkerRecord
+from charlie_work.host.fakes import FakeWorkerLauncher
 from charlie_work.labels import LabelConfig
 from charlie_work.local_issues import LocalFileGitHub
 from charlie_work.local_lane import (
@@ -859,15 +860,13 @@ class TestDrainSuppressesLocalRework:
 
     @staticmethod
     def _spy_dispatch_sessions(
-        monkeypatch: pytest.MonkeyPatch,
+        fake_host,
     ) -> list[SessionRequest]:
-        return spy_dispatch_sessions(monkeypatch)
+        return spy_dispatch_sessions(fake_host)
 
-    def test_loop_zero_limit_suppresses_local_rework_dispatch(
-        self, repo: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_loop_zero_limit_suppresses_local_rework_dispatch(self, repo: Path, fake_host) -> None:
         app = self._rework_pending(repo)
-        calls = self._spy_dispatch_sessions(monkeypatch)
+        calls = self._spy_dispatch_sessions(fake_host)
 
         result = app.loop(limit=0)
 
@@ -881,13 +880,11 @@ class TestDrainSuppressesLocalRework:
         # not the reap/review bookkeeping that lets in-flight work finish.
         assert result.data["local_lane"]["rework_launches_suspended"] is True
 
-    def test_loop_positive_limit_dispatches_local_rework(
-        self, repo: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_loop_positive_limit_dispatches_local_rework(self, repo: Path, fake_host) -> None:
         """Control: the same rework-pending state under a nonzero budget
         must dispatch -- otherwise the zero-limit test proves nothing."""
         app = self._rework_pending(repo)
-        calls = self._spy_dispatch_sessions(monkeypatch)
+        calls = self._spy_dispatch_sessions(fake_host)
 
         result = app.loop(limit=1)
 
@@ -898,7 +895,7 @@ class TestDrainSuppressesLocalRework:
         assert state["issues"]["7"]["status"] == "dispatched"
 
     def test_local_rework_claim_clears_dead_worker_failure_kind(
-        self, repo: Path, monkeypatch: pytest.MonkeyPatch
+        self, repo: Path, fake_host
     ) -> None:
         """Issue #1917: the local rework claim drops the previous death's
         classification -- a stale provider-throttle stamp must not survive
@@ -909,7 +906,7 @@ class TestDrainSuppressesLocalRework:
             state = load_state(app.paths.state_file)
             state["issues"]["7"]["dead_worker_failure_kind"] = "rate_limited"
             save_state(app.paths.state_file, state)
-        calls = self._spy_dispatch_sessions(monkeypatch)
+        calls = self._spy_dispatch_sessions(fake_host)
 
         result = app.loop(limit=1)
 
@@ -931,7 +928,7 @@ class TestDrainSuppressesLocalRework:
             save_state(app.paths.state_file, state)
 
     @staticmethod
-    def _spy_dispatch_with_pid(monkeypatch: pytest.MonkeyPatch, pid: int | None) -> None:
+    def _spy_dispatch_with_pid(fake_host, pid: int | None) -> None:
         def _fake(_repo_root, _manifest, _results, _settings, requests):
             return [
                 SessionDispatchResult(
@@ -947,11 +944,9 @@ class TestDrainSuppressesLocalRework:
                 for request in requests
             ]
 
-        monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", _fake)
+        fake_host(worker_launch=FakeWorkerLauncher([_fake]))
 
-    def test_local_rework_dispatch_stamps_new_worker_pid(
-        self, repo: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_local_rework_dispatch_stamps_new_worker_pid(self, repo: Path, fake_host) -> None:
         """The rework launch replaces the previous epoch's worker pid.
 
         With the stale pid left in place, the dead-worker reap read the NEW
@@ -962,7 +957,7 @@ class TestDrainSuppressesLocalRework:
         """
         app = self._rework_pending(repo)
         self._seed_stale_worker_pid(app)
-        self._spy_dispatch_with_pid(monkeypatch, 4242)
+        self._spy_dispatch_with_pid(fake_host, 4242)
 
         result = app.loop(limit=1)
 
@@ -973,13 +968,13 @@ class TestDrainSuppressesLocalRework:
         assert entry["worker_process_start_time"] == 1234.5
 
     def test_local_rework_dispatch_without_pid_drops_stale_pid(
-        self, repo: Path, monkeypatch: pytest.MonkeyPatch
+        self, repo: Path, fake_host
     ) -> None:
         """A launch that reports no pid must not leave the previous epoch's
         pid standing as this worker's liveness signal."""
         app = self._rework_pending(repo)
         self._seed_stale_worker_pid(app)
-        self._spy_dispatch_with_pid(monkeypatch, None)
+        self._spy_dispatch_with_pid(fake_host, None)
 
         result = app.loop(limit=1)
 

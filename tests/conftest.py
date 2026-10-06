@@ -579,6 +579,30 @@ def _default_healthy_preflight(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture(autouse=True)
+def _no_real_boot_sync_repair(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Issue #2312: default the boot-time pending-sync repair to a no-op.
+
+    ``run_fleet_supervise`` invokes ``heal_pending_sync_at_boot`` before config
+    load; the real implementation shells out to ``git``/``uv`` against the
+    checkout under test, and on a skewed or dev-extra-heavy venv would run a
+    real ``uv sync --locked`` -- mutating the very environment pytest is
+    running from (observed: it pruned the dev extras mid-suite and every
+    spawned pytest child then died on ``import pluggy``). Every caller of
+    ``run_fleet_supervise`` gets the stub, including CLI-level tests that never
+    import the fleet fixtures. Tests that target the repair itself call
+    ``pending_sync.heal_pending_sync_at_boot`` directly (unpatched); tests
+    that target the wiring re-monkeypatch this same attribute in their own
+    body, which cleanly overrides the default.
+    """
+    from charlie_work.pending_sync import BootSyncRepair
+
+    monkeypatch.setattr(
+        "charlie_work.fleet_dispatch.heal_pending_sync_at_boot",
+        lambda *a, **k: BootSyncRepair(),
+    )
+
+
+@pytest.fixture(autouse=True)
 def _no_live_self_deploy_history(monkeypatch: pytest.MonkeyPatch) -> None:
     """Issue #2103: the reviewer reap reads the orchestrator's own ``events.db``
     for ``self_deploy_succeeded``. On a host with deploy history that would

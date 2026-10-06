@@ -322,10 +322,12 @@ def test_self_deploy_does_not_pull_ci_fleet_sibling_by_default(
 
     runner, _ = _make_fake_runner(
         [
-            RunResult(0, "abc123\n", ""),  # before HEAD
-            RunResult(0, "", ""),  # pull ok
-            RunResult(0, "def456\n", ""),  # after HEAD
+            RunResult(0, "abc123\n", ""),  # HEAD
+            RunResult(0, "", ""),  # fetch ok
+            RunResult(0, "def456\n", ""),  # origin/main
+            RunResult(1, "", ""),  # merge-base: target not an ancestor of HEAD
             RunResult(0, "src/foo.py\n", ""),  # diff (code-only)
+            RunResult(0, "", ""),  # merge --ff-only ok
         ]
     )
 

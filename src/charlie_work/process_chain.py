@@ -147,6 +147,56 @@ def win32_process_ppid_snapshot() -> dict[int, ProcRow]:
     return ppid_by_pid
 
 
+def win32_ancestor_rows(pid: int, *, max_hops: int = MAX_CHAIN_HOPS) -> dict[int, ProcRow]:
+    """``pid -> ProcRow`` for ``pid``'s own ancestor chain, gathered hop by hop.
+
+    Same row shape as ``win32_process_ppid_snapshot``, but scoped to the one
+    chain a caller-side guard actually walks. Scope does not make a hop
+    cheap: on psutil 7.x ``Process.ppid()`` resolves through
+    ``cext.ppid_map()`` — a full ``CreateToolhelp32Snapshot`` enumeration of
+    every process on the box — and ``Process()``'s identity probe pays an
+    ``OpenProcess``/``GetProcessTimes`` handle query whose result also
+    answers ``create_time()`` (a protected pid's failed open falls back to
+    a ``NtQuerySystemInformation`` scan). What scope buys is paying that
+    enumeration-plus-handle-open pair once per *ancestor* — a handful of
+    hops — instead of once per *process*: ``process_iter`` runs the same
+    pair for every pid on the host, so its cost grows with host occupancy
+    rather than chain depth — the seconds-level delay issue #2332 tracks,
+    paid by every ``kill_process_tree``/``kill_orphan_pid`` call through
+    ``orphan_sweep._self_ancestor_pids``.
+
+    Recording rows without adjudicating keeps ``ancestor_chain_pids`` the
+    sole owner of the termination rules: a parent created *after* its child
+    is still recorded here and rejected there, exactly as in a full
+    snapshot. A hop whose creation time is unreadable keeps its link via
+    ``created=None`` (the snapshot's ``AccessDenied`` rule); a hop whose
+    process is gone or whose ppid cannot be read simply has no row, which
+    the walk treats as the same absent-row boundary a full snapshot would.
+
+    Returns ``{}`` if ``pid``'s own row cannot be read — indistinguishable
+    from a failed snapshot for the caller's degrade path.
+    """
+    rows: dict[int, ProcRow] = {}
+    current = pid
+    for _ in range(max_hops):
+        if current <= 0 or current in rows:
+            break
+        try:
+            proc = psutil.Process(current)
+            ppid = proc.ppid()
+        except (psutil.Error, OSError):
+            break
+        try:
+            created = proc.create_time()
+        except (psutil.Error, OSError):
+            created = None
+        rows[current] = ProcRow(
+            int(ppid or 0), float(created) if isinstance(created, (int, float)) else None
+        )
+        current = rows[current].ppid
+    return rows
+
+
 def posix_process_ppid_snapshot(proc_root: Path = Path("/proc")) -> dict[int, ProcRow]:
     """Snapshot ``pid -> ppid`` from procfs (``/proc/<pid>/stat``).
 

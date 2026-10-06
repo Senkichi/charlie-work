@@ -24,7 +24,7 @@ from typing import Any
 import pytest
 from _devin_shell_fixtures import _fake_worktree
 
-from charlie_work import claude_code, devin_review_resume, devin_shell
+from charlie_work import api_worker, claude_code, devin_review_resume, devin_shell
 from charlie_work.adapters import AdapterSettings, SessionRequest, dispatch_sessions
 from charlie_work.api_worker import launch_api_worker
 from charlie_work.claude_code import launch_claude_worker
@@ -592,6 +592,84 @@ def test_devin_shell_adapter_exception_emits_launch_failed(
     assert payload["harness"] == "devin-shell"
     assert payload["model"] == "swe-2-high"
     assert payload["issue_number"] == 22
+    assert payload["error_class"] == "internal"
+
+
+def test_claude_code_adapter_exception_emits_launch_failed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Issue #2229: the claude-code adapter path has the same errors-as-values
+    seam as devin-shell -- an unexpected raise inside ``launch_claude_worker``
+    becomes a failed result plus one ``launch_failed`` event, not a pass abort."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    manifest_path = tmp_path / "manifest.json"
+    results_path = tmp_path / "results.json"
+    prompt_path = tmp_path / "prompt.md"
+    prompt_path.write_text("prompt", encoding="utf-8")
+
+    def boom(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("adapter exploded pre-record")
+
+    monkeypatch.setattr(claude_code, "launch_claude_worker", boom)
+
+    request = SessionRequest(
+        issue_number=24,
+        issue_title="Test",
+        prompt_path=prompt_path,
+        branch_name="agent/issue-24",
+    )
+    settings = AdapterSettings(adapter="claude-code")
+
+    results = dispatch_sessions(repo_root, manifest_path, results_path, settings, [request])
+
+    assert results[0].ok is False
+    assert "launch failed" in (results[0].error or "")
+    events = _launch_failed(repo_root)
+    assert len(events) == 1
+    payload = events[0]["payload"]
+    assert payload["role"] == "worker"
+    assert payload["harness"] == "claude-code"
+    assert payload["issue_number"] == 24
+    assert payload["error_class"] == "internal"
+
+
+def test_api_adapter_exception_emits_launch_failed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Issue #2229: same boundary for the api adapter -- a raise inside
+    ``launch_api_worker`` comes back as a failed result, not a raise."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    manifest_path = tmp_path / "manifest.json"
+    results_path = tmp_path / "results.json"
+    prompt_path = tmp_path / "prompt.md"
+    prompt_path.write_text("prompt", encoding="utf-8")
+
+    def boom(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("adapter exploded pre-record")
+
+    monkeypatch.setattr(api_worker, "launch_api_worker", boom)
+
+    request = SessionRequest(
+        issue_number=25,
+        issue_title="Test",
+        prompt_path=prompt_path,
+        branch_name="agent/issue-25",
+    )
+    settings = AdapterSettings(adapter="api", api_worker_config=_api_worker_config())
+
+    results = dispatch_sessions(repo_root, manifest_path, results_path, settings, [request])
+
+    assert results[0].ok is False
+    assert "launch failed" in (results[0].error or "")
+    events = _launch_failed(repo_root)
+    assert len(events) == 1
+    payload = events[0]["payload"]
+    assert payload["role"] == "worker"
+    assert payload["harness"] == "api"
+    assert payload["model"] == "kimi-k3"
+    assert payload["issue_number"] == 25
     assert payload["error_class"] == "internal"
 
 
