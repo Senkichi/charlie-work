@@ -39,7 +39,7 @@ import ast
 from pathlib import Path
 
 import charlie_work
-from _src_ast import parsed, source_files
+from _src_ast import parsed, source_files, source_text
 
 _ALLOWED_FILES = frozenset({"state.py", "worker_fate.py"})
 _TARGET_KEY = "dead_worker_failure_kind"
@@ -89,6 +89,12 @@ def test_raw_dead_worker_failure_kind_key_is_confined_to_allowed_files() -> None
     offenders: dict[str, list[int]] = {}
     for path in source_files(root):
         if path.name in _ALLOWED_FILES:
+            continue
+        # Both flagged shapes spell the quoted literal, so a file whose text
+        # lacks it cannot offend; the filter keeps the ~430 untouched files
+        # out of the (shared-cache) parse (issue #2405; same filter shape as
+        # #2360's label-seam scan and #2361's dry_run scan).
+        if _TARGET_KEY not in source_text(path):
             continue
         tree = parsed(path)
         lines = _raw_read_lines(tree)
@@ -212,6 +218,11 @@ def test_dead_worker_failure_kind_writes_are_confined_to_persist_primitive() -> 
     offenders: dict[str, list[int]] = {}
     for path in source_files(root):
         if path.name in _ALLOWED_FILES:
+            continue
+        # All three flagged shapes need the literal in the file's text:
+        # subscript/dict-literal forms spell it, and the write-primitive name
+        # ``record_dead_worker_failure_kind`` contains it as a substring.
+        if _TARGET_KEY not in source_text(path):
             continue
         tree = parsed(path)
         lines = _raw_write_lines(tree)
