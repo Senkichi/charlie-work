@@ -177,22 +177,20 @@ def _kill_on_close_job() -> None:
 def _no_leaked_child_processes() -> Iterator[None]:
     """Issue #1851: fail a test that leaves a live descendant behind.
 
-    Snapshots this process's descendants at setup; at teardown gives new
-    children a short grace to exit on their own, kills the survivors, and
-    fails the test naming each survivor's pid and command line. Measured
-    cost: two ``psutil`` child enumerations per test ≈ 7.5 ms — ~60 s over
-    the 7909-test suite (~7 % of the ~14.5 min CI Tests job). A cheaper
-    ``create_time``-vs-``time.time()`` cutoff was tried and rejected:
-    ``time.time()`` granularity/stepping on some Windows hosts can place a
-    pre-existing child above the cutoff (see ``descendant_snapshot``).
+    ``leak_guard`` reads the kill-on-close job's member list at setup and
+    teardown (one syscall each, HS-CW-2) and falls back to the psutil walk --
+    grace, kill, report naming each survivor's pid and command line -- only
+    when the job gained a member. Off Windows, when the job was refused, or
+    with ``CI_FLEET_FAST_GUARDS=off``, every test takes the psutil walk (two
+    child enumerations, ~7.5 ms). A cheaper ``create_time``-vs-``time.time()``
+    cutoff was tried and rejected: ``time.time()`` granularity/stepping on some
+    Windows hosts can place a pre-existing child above the cutoff (see
+    ``descendant_snapshot``).
     """
-    from _process_guard import descendant_snapshot, reap_leaked_descendants
+    from _process_guard import leak_guard
 
-    before = descendant_snapshot()
-    yield
-    report = reap_leaked_descendants(before)
-    if report:
-        pytest.fail("test left live child process(es) behind:\n  " + "\n  ".join(report))
+    with leak_guard():
+        yield
 
 
 @pytest.fixture(autouse=True)
