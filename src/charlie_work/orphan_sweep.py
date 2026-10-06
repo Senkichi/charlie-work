@@ -92,11 +92,12 @@ def _self_ancestor_pids() -> frozenset[int]:
     self_pid = os.getpid()
     try:
         if os.name == "nt":
-            # Chain-scoped, not host-wide: each hop still pays psutil's
-            # ``ppid_map()`` enumeration plus a handle open, but the guard
-            # pays that once per ancestor instead of once per process on
-            # the box (issue #2332 -- a full ``process_iter`` snapshot costs
-            # seconds on a busy Windows box, paid by every guarded kill call).
+            # Chain-scoped, not host-wide: the guard pays one ``ppid_map()``
+            # enumeration plus a handle open per ancestor hop instead of the
+            # enumeration-plus-handle-open pair per process on the box
+            # (issues #2332, #2362 -- a full ``process_iter`` snapshot costs
+            # seconds on a busy Windows box, and per-hop ``ppid()`` was the
+            # same enumeration again per ancestor).
             ppid_by_pid = _win32_ancestor_rows(self_pid, max_hops=_MAX_ANCESTOR_CHAIN_HOPS)
         else:
             ppid_by_pid = _posix_process_ppid_snapshot()
