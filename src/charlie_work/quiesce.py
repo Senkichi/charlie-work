@@ -42,7 +42,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from typing import Protocol, runtime_checkable
 
-from .process_chain import ancestor_chain_pids, proc_rows, win32_process_ppid_snapshot
+from .process_chain import ancestor_chain_pids, proc_rows, win32_ancestor_rows
 from .subprocess_runner import no_console_window_kwargs
 
 logger = logging.getLogger(__name__)
@@ -303,15 +303,22 @@ def list_processes() -> tuple[Sequence[ProcessInfo], str | None]:
     "quiescent"), matching this repo's "errors from external processes come
     back as values" invariant.
 
-    Each row's ``created`` stamp is overlaid afterwards from
-    ``process_chain.win32_process_ppid_snapshot`` (psutil, UTC-derived) —
-    the source issue #2057 settled on after CIM ``CreationDate`` proved to
-    be a local-time ``DateTime`` that can sit an hour off across a DST
-    transition. The overlay can only lose information (a pid unseen by
-    psutil keeps ``created=None``, and an unknown stamp never disqualifies
-    a parent link in the chain walk); a wholly failed overlay leaves every
-    stamp ``None`` and is logged, since a permanently inert
-    recycled-parent guard would otherwise vanish silently.
+    ``created`` stamps are overlaid afterwards from
+    ``process_chain.win32_ancestor_rows(os.getpid())`` (psutil,
+    UTC-derived) — the source issue #2057 settled on after CIM
+    ``CreationDate`` proved to be a local-time ``DateTime`` that can sit
+    an hour off across a DST transition. The overlay is scoped to this
+    process's own ancestor chain because ``created`` is only ever
+    consulted on that one chain (``self_process_chain`` here,
+    ``host_load``'s own-suite exclusion there) and every real caller's
+    ``self_pid`` resolves to ``os.getpid()`` — stamping all ~450 host
+    processes paid roughly a second of ``process_iter`` ``create_time``
+    calls for rows no walk reads (issue #2376). The overlay can only
+    lose information (a pid the chain probe missed keeps
+    ``created=None``, and an unknown stamp never disqualifies a parent
+    link in the chain walk); a wholly failed probe leaves every stamp
+    ``None`` and is logged, since a permanently inert recycled-parent
+    guard would otherwise vanish silently.
     """
     if sys.platform != "win32":
         return (), "list_processes is only implemented for win32"
@@ -409,7 +416,7 @@ def list_processes() -> tuple[Sequence[ProcessInfo], str | None]:
         )
 
     if processes:
-        created_by_pid = win32_process_ppid_snapshot()
+        created_by_pid = win32_ancestor_rows(os.getpid())
         if created_by_pid:
             processes = [
                 replace(proc, created=created_by_pid[proc.pid].created)
