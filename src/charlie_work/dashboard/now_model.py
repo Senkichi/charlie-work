@@ -38,8 +38,9 @@ from .now_types import (
 from .sources import _parse_utc
 
 # Reasons a Ready issue is held back, in classifier order (backlog_reachability.py
-# :243-299). ``missing_ready`` is deliberately absent: such an issue is not Ready at
-# all, so it is not "Ready but not dispatchable". ``dispatchable`` is the other side.
+# :255-320). ``missing_ready`` and ``parked_unready`` are deliberately absent: neither
+# carries the ready label, so they are not "Ready but not dispatchable". ``dispatchable``
+# is the other side.
 NOT_DISPATCHABLE_REASONS = (
     "terminal_label",
     "active_label",

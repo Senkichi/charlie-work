@@ -2516,6 +2516,7 @@ def _render_backlog_reachability(reachability: Any) -> str:
             f"{reason}={reachability[reason]}"
             for reason in (
                 "missing_ready",
+                "parked_unready",
                 "terminal_label",
                 "active_label",
                 "operator_claimed",

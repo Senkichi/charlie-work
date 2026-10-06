@@ -218,7 +218,8 @@ def test_flow_stages_use_label_config_and_breakdown(fleet) -> None:
     ]
     assert all(s.as_of_snapshot for s in flow.stages)
     assert flow.done_24h == 9
-    # missing_ready (4) is not Ready, so it is not "Ready but not dispatchable".
+    # missing_ready (1) and parked_unready (3) are not Ready, so neither is
+    # "Ready but not dispatchable" (issue #2314 split the no-ready bin).
     assert [(r.reason, r.count, r.examples) for r in flow.not_dispatchable] == [
         ("terminal_label", 2, ("owner/alpha#4", "owner/alpha#5")),
         ("active_label", 3, ()),
