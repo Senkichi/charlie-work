@@ -186,6 +186,23 @@ def test_local_lane_stalled_collects_switches_and_issues() -> None:
     assert ha.eval_local_lane_stalled("o/r", rows[3:], BASE).severity == "ok"
 
 
+def test_mergequeue_stalled_lists_new_prs_only() -> None:
+    t = _iso(BASE + timedelta(minutes=1))
+    rows = [
+        (t, json.dumps({"pr_number": 169})),
+        (t, json.dumps({"pr_number": True})),
+        (t, "garbage"),
+        (_iso(BASE), json.dumps({"pr_number": 1})),
+    ]
+    f = ha.eval_mergequeue_stalled("o/r", rows, BASE)
+    assert f.severity == "warn"
+    assert f.detail == (
+        "3 PR(s) queued past the stall threshold since last beat: PR(s) [169] "
+        "(stalled_rows=4 new_since_last_beat=3)"
+    )
+    assert ha.eval_mergequeue_stalled("o/r", rows[3:], BASE).severity == "ok"
+
+
 # --- freshness evaluators: boundary at the threshold ---------------------------
 
 

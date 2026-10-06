@@ -42,6 +42,7 @@ from charlie_work.github import (
 )
 from charlie_work.instrumentation import log_event
 from charlie_work.merge_path.queue_skip import merge_ready_unless_queued
+from charlie_work.mergequeue_stall import alarm_best_effort
 from charlie_work.notify import AttentionDigest, AttentionEntry
 from charlie_work.no_op_rework_body import _request_changes_body_drifted
 from charlie_work.pass_deadline import (
@@ -446,6 +447,7 @@ def _loop_body(
             # that's simply waiting on pending checks.
             state = _wf.load_state_locked(self.paths.state_file)
             pr_state = state["prs"].get(str(pr_number), {})
+            alarm_best_effort(self, pr, pr_state)  # #2441: never aborts the pass
             pr_dir_for_decision = self.paths.prs / f"pr-{pr_number}"
             live_head_sha = pr.get("headRefOid")
             # Issue #1362 Stage 1 (#1340 regression): the FILE is

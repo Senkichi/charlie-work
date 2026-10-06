@@ -241,6 +241,8 @@ KNOWN_IGNORED: dict[str, str] = {
     "merge_deferred_stale_base": "stale-base deferral record",
     "merge_deferred_stale_base_alarm": "stale-base deferral alarm record",
     "merge_failed_attempt_alarm": "merge-failure alarm record",
+    "mergequeue_stalled": "merge-queue dwell alarm record; the heartbeat surfaces it",
+    "mergequeue_stall_alarm_failed": "advisory stall-alarm failure record (audit-only)",
     "human_merge_required": "human-merge hand-off record (audit-only per its emit site)",
     "human_merge_label_removed": "human-merge bookkeeping",
     "unauthorized_merge_queue_sync_covered": "repeated every pass for the same PR; recon section 4 noise",
