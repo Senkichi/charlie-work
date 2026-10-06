@@ -18,13 +18,17 @@ under the state lock through the write gate.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Collection
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from .github import label_names
 from .host import current as _host_current
+from .instrumentation import log_event
 from .state import load_state, state_lock
+
+logger = logging.getLogger(__name__)
 
 STALL_AFTER = timedelta(hours=2)
 
@@ -99,3 +103,24 @@ def alarm_if_stalled(app: Any, pr: dict[str, Any], pr_entry: dict[str, Any]) -> 
         }
         app.write_gate.save_state(state)
     return True
+
+
+def alarm_best_effort(app: Any, pr: dict[str, Any], pr_entry: dict[str, Any]) -> bool:
+    """``alarm_if_stalled`` that can never abort the per-PR scan.
+
+    The alarm is advisory, but it takes the state lock and writes state, so a
+    lock timeout or a write error must not skip review/merge handling for the
+    remaining PRs. A failure is logged and recorded as a lock-free
+    ``mergequeue_stall_alarm_failed`` event (``log_event`` is itself best-effort),
+    and the next pass retries because the episode marker was never written.
+    """
+    try:
+        return alarm_if_stalled(app, pr, pr_entry)
+    except Exception as exc:  # noqa: BLE001 - advisory path: nothing may escape
+        logger.warning("mergequeue stall alarm failed for PR #%s: %s", pr.get("number"), exc)
+        log_event(
+            app.paths.state_file,
+            "mergequeue_stall_alarm_failed",  # event-consumer: audit-only advisory alarm failure; the exception is also logged
+            {"pr_number": pr.get("number"), "error": f"{type(exc).__name__}: {exc}"},
+        )
+        return False

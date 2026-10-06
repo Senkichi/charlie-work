@@ -16,6 +16,7 @@ from ..github_transport.json_read import JsonRead
 from ..github_transport.outcome import Outcome, Response
 from ..github_transport.request import GraphQLRequest, RestRequest
 from ._base import GitHubRunResult
+from ._field_list_stamp import check_real_call
 from ._outcome import expect_json, expect_ok, failure_text, is_success, to_run_result
 
 AnyTypedRequest = RestRequest | GraphQLRequest
@@ -77,7 +78,11 @@ def send_read(collab: Any, read: JsonRead) -> Outcome:
     propagates exactly as it does for a ``{owner}/{repo}`` REST route.
     """
     owner, name = collab._repo_owner_name()
-    return read.execute(collab._transport_v2, owner, name)
+    outcome = read.execute(collab._transport_v2, owner, name)
+    # Issue #2438: field-list validation is cached, so a schema rejection here
+    # means the cache lied -- clear it and fail loudly (no-op otherwise).
+    check_real_call(collab, owner, name, outcome)
+    return outcome
 
 
 def read_json(collab: Any, read: JsonRead) -> Any:

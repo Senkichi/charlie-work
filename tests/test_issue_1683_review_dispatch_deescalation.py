@@ -364,6 +364,12 @@ _NO_COUNTER_ALLOWLIST: dict[str, str] = {
         "attempts`` budget, which re-baselines on head change and per "
         "new run id; no flat counter to reset."
     ),
+    "infra_rerun_refused": (
+        "A run GitHub permanently refuses to rerun (``infra_rerun_refused`` "
+        "per-head record, never re-requested) behind live infra-failed "
+        "required checks -- a janitor blocker, so the sweep cannot clear "
+        "while it persists; no flat counter to reset."
+    ),
     "stale_checks_retrigger_exhausted": (
         "Gated by ``stale_checks_retrigger_attempts``, a per-PR monotonic "
         "retrigger budget that even the operator door deliberately does "

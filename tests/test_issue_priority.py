@@ -206,7 +206,13 @@ def test_an_unreadable_issue_queues_without_skip_line() -> None:
         added.append((number, label))
         return True
 
-    app = SimpleNamespace(gh=SimpleNamespace(issue_view=_unreadable, add_pr_label=_add))
+    app = SimpleNamespace(
+        gh=SimpleNamespace(
+            issue_view=_unreadable,
+            issue_list=lambda state=None: [],  # cache miss -> live read
+            add_pr_label=_add,
+        )
+    )
     cfg = MergePathConfig(
         mergequeue_label="mergequeue", skip_line_label="mergequeue-skip-line", priority_prefix=P
     )

@@ -264,6 +264,8 @@ def test_merge_ready_mergequeue_handoff_refusal_propagates_cleanly(
     )
     spent = {"hit": False}
     real_issue_view = fake_gh.issue_view
+    # Cache miss on the open-issue list (#2440) so the live issue_view fallback runs.
+    fake_gh.issue_list = lambda *a, **k: []  # type: ignore[method-assign]
 
     def _issue_view_then_spend(number: int) -> Any:
         result = real_issue_view(number)
@@ -298,6 +300,8 @@ def test_merge_ready_skip_line_read_refusal_propagates_cleanly(tmp_path: Path) -
     fake_gh.issues[0]["labels"] = [{"name": "automated-ready"}, {"name": "priority:critical"}]
     spent = {"hit": False}
     real_issue_view = fake_gh.issue_view
+    # Cache miss on the open-issue list (#2440) so the live issue_view fallback runs.
+    fake_gh.issue_list = lambda *a, **k: []  # type: ignore[method-assign]
 
     def _issue_view_then_spend(number: int) -> Any:
         result = real_issue_view(number)

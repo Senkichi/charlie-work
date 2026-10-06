@@ -240,6 +240,7 @@ KNOWN_IGNORED: dict[str, str] = {
     "merge_deferred_stale_base_alarm": "stale-base deferral alarm record",
     "merge_failed_attempt_alarm": "merge-failure alarm record",
     "mergequeue_stalled": "merge-queue dwell alarm record; the heartbeat surfaces it",
+    "mergequeue_stall_alarm_failed": "advisory stall-alarm failure record (audit-only)",
     "human_merge_required": "human-merge hand-off record (audit-only per its emit site)",
     "human_merge_label_removed": "human-merge bookkeeping",
     "unauthorized_merge_queue_sync_covered": "repeated every pass for the same PR; recon section 4 noise",
@@ -330,6 +331,29 @@ KNOWN_IGNORED: dict[str, str] = {
     "worker_test_selection_unavailable": "worker-prompt test-command diagnostic",
     "worker_verified_no_changes": "worker-outcome bookkeeping",
     "worker_verified_no_changes_ignored": "worker-outcome bookkeeping",
+    # -- Issue #2459: kinds the live dashboard log listed as uninterpreted. None feeds an
+    #    existing metric; none is a candidate for a new one (retired writers, or per-pass
+    #    bookkeeping whose outcome is carried by another kind).
+    "cross_family_regen_not_reached": "retired cross-family auto-gate surface (deleted in role-config phase 2); kept for older events DBs",
+    "cross_family_report_regen_exhausted": "retired cross-family auto-gate surface (deleted in role-config phase 2); kept for older events DBs",
+    "cross_family_report_regen_forced": "retired cross-family auto-gate surface (deleted in role-config phase 2); kept for older events DBs",
+    "cross_family_verdict_abandoned": "retired cross-family auto-gate surface (deleted in role-config phase 2); kept for older events DBs",
+    "cross_family_verdict_head_indeterminate": "retired cross-family auto-gate surface (deleted in role-config phase 2); kept for older events DBs",
+    "cross_family_verdict_unparseable": "retired cross-family auto-gate surface (deleted in role-config phase 2); kept for older events DBs",
+    "label_ensure_ok": "label-ensure diagnostic; label state is read from GitHub, not this event",
+    "label_ensure_incomplete": "label-ensure diagnostic; label state is read from GitHub, not this event",
+    "operator_local_park": "operator action audit record (legacy kind); no flow fact",
+    "operator_orphan_push_completed": "operator recovery audit record (legacy kind); no flow fact",
+    "operator_orphan_requeue": "operator recovery audit record (legacy kind); no flow fact",
+    "operator_probe_advanced": "operator probe audit record (legacy kind); no flow fact",
+    "operator_queue_depth": "retired per-pass operator-queue gauge (#1768); replaced by operator_queue_impact",
+    "operator_reviewer_quota_cleared": "operator quota-clear audit record (legacy kind); no flow fact",
+    "operator_rework_rearmed": "operator rework-rearm audit record (legacy kind); no flow fact",
+    "operator_state_correction": "operator state-correction audit record (legacy kind); no flow fact",
+    "review_packet_discarded_head_moved": "review-packet bookkeeping: PR head moved, packet re-made",
+    "rework_label_skipped_issue_closed": "rework-label bookkeeping: issue already closed",
+    "unauthorized_merge_ack_revoked": "unauthorized-merge bookkeeping",
+    "worker_token_missing": "retired worker-token gate (#1877); kept for older events DBs",
 }
 # Written to the global DB and (also) to per-repo DBs: the global DB is authoritative.
 GLOBAL_ONLY_KINDS = frozenset({"fleet_canary", "runner_allocation", "fleet_job_observations"})
@@ -604,6 +628,19 @@ HANDLERS.update(FLOW_HANDLERS)
 assert (
     not KNOWN_IGNORED.keys() & HANDLERS.keys()
 )  # a kind is either interpreted or ignored, never both
+
+
+def is_classified(kind: str) -> bool:
+    """True when the rollup handles ``kind`` or deliberately ignores it (issue #2269).
+
+    A ``<kind>_sweep`` batch summary (minted by the reaper from ``sweep_events.append``)
+    inherits an ignored sibling's classification: it is the same record folded into one
+    event, so it needs no entry of its own (issue #2459). Handled sweeps are explicit in
+    ``HANDLERS`` because their per-issue expansion is handler-specific.
+    """
+    if kind in HANDLERS or kind in KNOWN_IGNORED:
+        return True
+    return kind.endswith(SWEEP_SUFFIX) and kind[: -len(SWEEP_SUFFIX)] in KNOWN_IGNORED
 
 
 def derive_event(source: str, ev: dict) -> list[Row]:
