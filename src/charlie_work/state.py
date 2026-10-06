@@ -473,7 +473,7 @@ def age_days_since(timestamp: str | None, *, now: datetime | None = None) -> flo
         since_dt = datetime.fromisoformat(str(timestamp).replace("Z", "+00:00"))
     except (ValueError, TypeError):
         return None
-    resolved_now = now if now is not None else datetime.now(UTC)
+    resolved_now = now if now is not None else _host.current().clock.now()
     return round((resolved_now - since_dt).total_seconds() / 86400.0, 2)
 
 
@@ -573,7 +573,7 @@ def is_claim_stale(
         return False
     try:
         claim_time = datetime.fromisoformat(claim_timestamp.replace("Z", "+00:00"))
-        resolved_now = now if now is not None else datetime.now(UTC)
+        resolved_now = now if now is not None else _host.current().clock.now()
         age = resolved_now - claim_time
         return age > timedelta(minutes=timeout_minutes)
     except (ValueError, TypeError):
@@ -617,7 +617,7 @@ def stale_operator_claims(
 
     Used for digest warnings; stale claims still block dispatch until released.
     """
-    now = datetime.now(UTC)
+    now = _host.current().clock.now()
     stale: set[int] = set()
     for issue_number_str, entry in data.get("issues", {}).items():
         timestamp = _operator_claim_timestamp(entry)
@@ -953,7 +953,7 @@ def is_throttled(data: dict[str, Any]) -> bool:
         return False
     try:
         throttle_time = datetime.fromisoformat(throttled_until.replace("Z", "+00:00"))
-        return datetime.now(UTC) < throttle_time
+        return _host.current().clock.now() < throttle_time
     except (ValueError, TypeError):
         # Malformed timestamp — treat as not throttled to be safe
         return False
@@ -1158,7 +1158,7 @@ def is_reviewer_quota_exhausted(data: dict[str, Any]) -> bool:
         return False
     try:
         throttle_time = datetime.fromisoformat(throttled_until.replace("Z", "+00:00"))
-        return datetime.now(UTC) < throttle_time
+        return _host.current().clock.now() < throttle_time
     except (ValueError, TypeError):
         return False
 
@@ -1174,7 +1174,7 @@ def is_reviewer_probe_ready(data: dict[str, Any]) -> bool:
         return True
     try:
         probe_time = datetime.fromisoformat(probe_after.replace("Z", "+00:00"))
-        return datetime.now(UTC) >= probe_time
+        return _host.current().clock.now() >= probe_time
     except (ValueError, TypeError):
         return True
 
@@ -1326,7 +1326,7 @@ def is_quota_probe_due(data: dict[str, Any]) -> bool:
         return False
     try:
         next_time = datetime.fromisoformat(next_at.replace("Z", "+00:00"))
-        return datetime.now(UTC) >= next_time
+        return _host.current().clock.now() >= next_time
     except (ValueError, TypeError):
         return True
 
@@ -1369,7 +1369,7 @@ def is_operator_queue_review_due(data: dict[str, Any]) -> bool:
         return True
     try:
         next_time = datetime.fromisoformat(next_at.replace("Z", "+00:00"))
-        return datetime.now(UTC) >= next_time
+        return _host.current().clock.now() >= next_time
     except (ValueError, TypeError):
         return True
 
@@ -1537,7 +1537,10 @@ def clear_quota_throttles(data: dict[str, Any]) -> dict[str, Any]:
         reviewer_quota = {
             **reviewer_quota,
             "consecutive_probe_failures": 0,
-            "last_probe_cleared_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+            "last_probe_cleared_at": _host.current()
+            .clock.now()
+            .isoformat()
+            .replace("+00:00", "Z"),
         }
         cleared = {**cleared, "reviewer_quota": reviewer_quota}
     return cleared

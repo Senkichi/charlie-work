@@ -26,7 +26,7 @@ detector, unpatched) is the decoy sibling of the ``_wf.``-rebound
 from __future__ import annotations
 
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import Any
 
 import charlie_work.workflow as _wf
@@ -305,7 +305,7 @@ def _loop_body(
     branch_validator = self._make_branch_issue_validator()
     fir_confirm_passes = self.config.review.foreign_issue_ref_confirm_passes
     fir_reprobe_hours = self.config.review.foreign_issue_ref_reprobe_hours
-    loop_now = now or datetime.now(UTC)
+    loop_now = now or self.host.clock.now()
     # Issue #1766: collected here and recorded once, after this loop, via
     # `_record_unlinked_pr_skips` -- see that method's docstring for why a
     # per-PR call site at the point of `continue` below could abort every

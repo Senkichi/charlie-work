@@ -19,7 +19,7 @@ sibling delegates.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import Any
 
 from charlie_work import layout
@@ -124,7 +124,7 @@ def reap_reviews(self, limit: int | None = None) -> _wf.CommandResult:
     is a read-only claim scan (``_open_review_claims``) reporting liveness
     and staleness against the sweep's own predicates.
     """
-    resolved_now = datetime.now(UTC)
+    resolved_now = self.host.clock.now()
 
     if self.dry_run:
         claims = self._open_review_claims(resolved_now)

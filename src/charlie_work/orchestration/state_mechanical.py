@@ -8,7 +8,7 @@ the ``workflow_delegation`` installer re-attaches each ``def`` onto the class.
 from __future__ import annotations
 
 from collections import Counter
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 from typing import Any
 
 from charlie_work.state import (
@@ -149,7 +149,7 @@ def _deescalate_mechanical_issue(self, issue_number: int) -> dict[str, Any]:
         and cleared_reason
         and cleared_reason == issue_entry.get("escalation_reason")
         and cleared_at is not None
-        and datetime.now(UTC) - cleared_at <= timedelta(minutes=recurrence_window_minutes)
+        and self.host.clock.now() - cleared_at <= timedelta(minutes=recurrence_window_minutes)
     ):
         with _wf.state_lock(self.paths.state_file):
             fresh_state = _wf.load_state(self.paths.state_file)
@@ -259,7 +259,7 @@ def _deescalate_mechanical_issue(self, issue_number: int) -> dict[str, Any]:
     from charlie_work.worker import issue_worker_liveness
 
     liveness = issue_worker_liveness(
-        issue_number, issue_entry, self._layout.sessions_dir, self.config, datetime.now(UTC)
+        issue_number, issue_entry, self._layout.sessions_dir, self.config, self.host.clock.now()
     )
     if liveness.live:
         # a live worker is using this issue; not stuck
@@ -528,7 +528,7 @@ def _maybe_deescalate_mechanical(self) -> None:
         )
 
     next_deescalation_at = (
-        (datetime.now(UTC) + timedelta(minutes=self.config.deescalation.interval_minutes))
+        (self.host.clock.now() + timedelta(minutes=self.config.deescalation.interval_minutes))
         .replace(microsecond=0)
         .isoformat()
         .replace("+00:00", "Z")
