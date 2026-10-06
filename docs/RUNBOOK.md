@@ -335,6 +335,50 @@ location) and re-link surviving worktrees, or simply tear down and recreate
 every active worktree — there is no partial-recovery path once the target
 directory's contents are gone.
 
+## Worker worktrees on the host I/O volume
+
+When ci-fleet's host I/O manifest is present and valid (`runner_allocation.host_io_manifest`,
+else `CI_FLEET_HOST_IO_MANIFEST`, else ci-fleet's default path) and its volume is mounted,
+charlie-work moves worker I/O onto that volume:
+
+- New worktrees go under `<worker_root>/<repo directory name>/worktrees`.
+- Every worker launch gets `UV_CACHE_DIR=<worker_uv_cache>`, so `uv` hardlinks
+  from the cache instead of copying. An operator `claude_code.worker_env` key
+  still wins.
+- The per-session temp dir needs nothing: it lives inside the worktree
+  (`.var/worker-tmp`), so it moves with it.
+
+`charlie doctor` shows which root is active on its `worktrees root` line, and
+why the volume is not in use when it is not.
+
+**Precedence.** An explicit `claude_code.worktrees_dir` beats the manifest
+(and then `UV_CACHE_DIR` is not set either). The manifest beats the
+`runtime.state_dir` default.
+
+**Kill switch.** Set `claude_code.host_io_worktrees: false` and restart the
+daemon. New worktrees go back to the default root, and the ones on the volume
+are still found by branch, because git registers them.
+
+**Fallback.** If the manifest is unreadable or the volume is missing, the
+default root is used for that resolution. charlie-work logs a warning and
+`doctor` names the reason. Nothing is raised, and ci-fleet's own
+`host_io_fallback` event reports the volume problem.
+
+**The old root.** Worktrees created before the switch stay where they are.
+`worktree-clean` and the tick's cleanup sweep the old root as well as the new
+one until the old root is empty. `doctor` shows the old root and its entry
+count while that lasts. Nothing needs to be moved by hand.
+
+**Cutover marker.** The first live dispatch on the volume writes
+`<fleet_dir>/host-io-worker-cutover.json` (`{"schema": 1, "cutover_at": ...}`).
+ci-fleet's worker A/B analysis uses it to split before and after. Do not
+delete it; if it is deleted, it is rewritten with a later time, and the A/B
+then compares the wrong windows.
+
+**Two repos with the same directory name** would share
+`<worker_root>/<name>/worktrees`. Give one of them an explicit
+`claude_code.worktrees_dir`.
+
 ## Local host saturation ceiling (claude-code adapter)
 
 The `claude-code` adapter runs every worker as a **local** `claude -p` process
