@@ -206,3 +206,19 @@ def test_template_with_a_linked_worktree_is_refused(tmp_path: Path) -> None:
         assert not _git_templates.init_repo(
             tmp_path / "a", bare=False, build=with_worktree, registry=registry
         )
+
+
+def test_helpers_init_git_repo_goes_through_the_template(tmp_path: Path) -> None:
+    """Issue #2387: ``_helpers._init_git_repo`` must materialize through the
+    per-process ``plain`` git template instead of re-running the five-process
+    init sequence per call — the ledger measured
+    ``test_pure_throttle_death_without_turn_limit_still_rolls_back`` at ~2.9x
+    baseline because each repo paid the full spawn cost on the Windows CI
+    host."""
+    import _helpers
+
+    before = _git_templates._REGISTRY.materialized["plain"]
+    repo = tmp_path / "repo"
+    _helpers._init_git_repo(repo)
+    assert _git_templates._REGISTRY.materialized["plain"] == before + 1
+    assert wf._git(repo, "rev-parse", "--verify", "main").stdout.strip()
