@@ -219,7 +219,8 @@ def try_acquire_supervisor_lock(lock_path: Path) -> _SupervisorLock | None:
 
 
 # ---------------------------------------------------------------------------
-# Self-deploy (FF-pull origin/main + uv sync on dependency changes)
+# Self-deploy (fetch origin/main, inspect, merge --ff-only, uv sync on
+# dependency changes)
 # ---------------------------------------------------------------------------
 
 
@@ -234,7 +235,7 @@ def orchestrator_root() -> Path:
     """Return the orchestrator source tree root.
 
     This is the directory that contains ``pyproject.toml`` and is the target
-    for ``self_deploy``'s ``git pull`` / ``uv sync``.  It is derived from this
+    for ``self_deploy``'s fetch/merge / ``uv sync``.  It is derived from this
     module's location (``src/charlie_work/supervise.py``) instead of being
     recomputed at every call site so file moves cannot silently break one copy.
     """
@@ -287,17 +288,21 @@ def read_head_sha(
 class SelfDeployResult:
     """Result of a self-deploy attempt.
 
-    ``pulled`` is True when ``git pull`` reported success (including the
-    already-up-to-date case).  ``changed`` is True when HEAD moved *or* a
-    pending-sync marker exists (i.e. some dependency change is still
-    outstanding, even if this pass's own pull was a no-op) -- callers that
-    need to know whether *this pass* moved HEAD must use ``head_changed``
-    instead, not ``changed``.  ``synced`` is True when ``uv sync`` ran and
-    succeeded.  ``ok`` is False whenever any step reported an error; callers
-    must treat this as non-fatal and continue the pass.
+    ``pulled`` is True when the ``git fetch`` of ``origin/main`` succeeded
+    (including the already-up-to-date case).  ``changed`` is True when a
+    fast-forward to ``origin/main`` is pending *or* a pending-sync marker
+    exists (i.e. some dependency change is still outstanding, even if this
+    pass's own fetch found nothing new) -- callers that need to know whether
+    *this pass* moved HEAD must use ``head_changed`` instead, not
+    ``changed``.  ``synced`` is True when ``uv sync`` ran and succeeded.
+    ``ok`` is False whenever any step reported an error; callers must treat
+    this as non-fatal and continue the pass.
 
-    ``head_changed`` is True only when ``git pull`` actually advanced HEAD on
-    *this* attempt (``before_sha != after_sha``).  This is the correct signal
+    ``head_changed`` is True only when the ``git merge --ff-only`` actually
+    advanced HEAD on *this* attempt. A deferred pass no longer moves HEAD at
+    all (issue #2312): the merge is held until zero live workers remain, so a
+    deferred ``from_sha``/``to_sha`` pair describes the *held* range. This is
+    the correct signal
     for "the running process now has stale code loaded and must exit for a
     watchdog restart" -- ``from_sha``/``to_sha`` are not, because on a
     deferred-sync pass they report the marker's original range even when
@@ -633,21 +638,22 @@ def _log_self_deploy_git_retry(
     """Record that a self-deploy network ``git`` call needed a retry.
 
     Wired as ``run_git_with_retry``'s ``on_retry`` at every self-deploy call
-    site -- the orchestrator's own pull (``site="self_deploy_pull"``), its
-    lossless-blocker-repair retry of that same pull
-    (``site="self_deploy_pull_after_repair"``), and the ci-fleet sibling pull
+    site that hits the network -- the orchestrator's own fetch
+    (``site="self_deploy_fetch"``) and the ci-fleet sibling pull
     (``site="ci_fleet_sibling_pull"``) -- it only fires once per call, and
     only when a retry actually happened, per that function's own contract.
+    The post-repair merge retry is deliberately NOT here: ``git merge
+    --ff-only`` is a local operation the network-transient allowlist can
+    never fire on, so it runs through plain ``run_command``.
 
-    ``site`` and ``cwd`` are both required, not defaulted: all three call
-    sites share this one state path (issue #1777 finding 4) and the first
-    two additionally share a byte-identical ``command`` string
-    (``git pull --ff-only origin main``), so without a discriminating field a
-    recurring blip's rows are indistinguishable -- an operator investigating
-    which checkout is flapping is the only question this event exists to
-    answer. ``cwd`` carries the checkout the command actually ran in
-    (``repo_root`` for the first two, the sibling root for the third), since
-    ``site`` alone still leaves "which path" implicit.
+    ``site`` and ``cwd`` are both required, not defaulted: the call sites
+    share this one state path (issue #1777 finding 4), so without a
+    discriminating field a recurring blip's rows are indistinguishable --
+    an operator investigating which checkout is flapping is the only
+    question this event exists to answer. ``cwd`` carries the checkout the
+    command actually ran in (``repo_root`` for the fetch, the sibling root
+    for the ci-fleet pull), since ``site`` alone still leaves "which path"
+    implicit.
 
     Best-effort like every other ``log_event`` call in this module: a
     logging failure must never fail a deploy that worked.
@@ -723,6 +729,10 @@ def _self_deploy_preview(
     notes: list[str] = []
     if head_sha == target_sha:
         notes.append("no fast-forward pending (HEAD is at last-known origin/main)")
+    elif _is_ancestor(repo_root, target_sha, "HEAD", run_command=run_command, timeout=timeout):
+        # Same gate as the real attempt: HEAD ahead of origin/main has
+        # nothing to merge, and the dependency diff would run in reverse.
+        notes.append("no fast-forward pending (HEAD already contains origin/main)")
     else:
         notes.append(f"would fast-forward {head_sha[:12]}..{target_sha[:12]}")
         diff_res = run_command(
@@ -1004,20 +1014,26 @@ def self_deploy(
     pull_ci_fleet: bool = False,
     starvation_seconds: int = DEFAULT_SYNC_STARVATION_SECONDS,
 ) -> SelfDeployResult:
-    """FF-pull ``origin/main`` and run ``uv sync`` when dependency files changed.
+    """Fast-forward the checkout to ``origin/main`` and run ``uv sync`` when
+    dependency files changed.
 
-    Before pulling, verifies the orchestrator venv's editable ``.pth`` points at
-    ``repo_root/src`` and self-heals by atomically rewriting the ``.pth`` text
-    when it does not.  The .pth rewrite is not exe-locked and can run even while
-    the current process image is in use.
+    Before anything mutates, verifies the orchestrator venv's editable
+    ``.pth`` points at ``repo_root/src`` and self-heals by atomically
+    rewriting the ``.pth`` text when it does not.  The .pth rewrite is not
+    exe-locked and can run even while the current process image is in use.
 
-    Uses ``git diff --name-only <from>..<to>`` to detect whether the pull
-    touched ``pyproject.toml`` or ``uv.lock``.  Before running ``uv sync`` the
-    fleet live-worker count is consulted through the session-count host port
-    (issue #2230); if any are active the
-    sync is deferred and a pending-sync marker is written atomically.  The
-    marker is checked on every subsequent pass, so the sync retries even when
-    the next ``git pull`` finds no new commits.
+    The update is deliberately split (issue #2312): ``git fetch`` refreshes
+    ``origin/main`` without touching HEAD, then
+    ``git diff --name-only <from>..<to>`` detects whether the pending range
+    touches ``pyproject.toml`` or ``uv.lock``. When dependency files changed
+    the fleet live-worker count is consulted through the session-count host
+    port (issue #2230); if any are
+    active the *whole* update -- merge and ``uv sync`` -- is deferred and a
+    pending-sync marker is written atomically, with HEAD left parked at the
+    pre-deploy commit so source and installed deps stay consistent. Only
+    then does ``git merge --ff-only origin/main`` move HEAD. The marker is
+    checked on every subsequent pass, so the held merge and the sync land
+    together once the fleet drains.
 
     ``starvation_seconds`` bounds how long that deferral may continue (issue
     #1855): once the marker's ``written_at`` -- the first deferral of the
@@ -1180,11 +1196,12 @@ def _repair_lossless_pull_blockers(
     def run_git(argv: list[str]) -> RunResult:
         return run_command(argv, cwd=repo_root, timeout_seconds=timeout)
 
-    # Only a *pending fast-forward* is ours to unblock. When the fetch half of
-    # `git pull` is what failed, origin/main is stale -- usually equal to HEAD
-    # -- and this returns empty, so a network failure is left alone instead of
-    # provoking a repair of a tree that was never in the way. This is also the
-    # discriminator that avoids parsing git's localized refusal text.
+    # Only a *pending fast-forward* is ours to unblock. This runs after a
+    # failed ``merge --ff-only`` (a failed fetch never reaches here at all);
+    # when origin/main is stale -- usually equal to HEAD -- it returns empty,
+    # so a network failure is left alone instead of provoking a repair of a
+    # tree that was never in the way. This is also the discriminator that
+    # avoids parsing git's localized refusal text.
     head_res = run_git(["git", "rev-parse", "HEAD"])
     target_res = run_git(["git", "rev-parse", "origin/main"])
     if not head_res.ok or not target_res.ok:
@@ -1359,6 +1376,81 @@ def _pull_ci_fleet_sibling(
     log_event(_self_deploy_state_path(repo_root), "self_deploy_ci_fleet_pull", payload)
 
 
+def _is_ancestor(
+    repo_root: Path,
+    ancestor_sha: str,
+    descendant: str,
+    *,
+    run_command: Callable[..., RunResult],
+    timeout: int,
+) -> bool:
+    """``git merge-base --is-ancestor`` probe; False when the probe itself fails.
+
+    Exit 0 means ``ancestor_sha`` is contained in ``descendant``'s history.
+    Any nonzero exit -- not an ancestor, no merge base -- and any probe
+    failure (timeout, missing binary) come back False, so "cannot prove
+    containment" never masquerades as "contained".
+    """
+    return run_command(
+        ["git", "merge-base", "--is-ancestor", ancestor_sha, descendant],
+        cwd=repo_root,
+        timeout_seconds=timeout,
+    ).ok
+
+
+def _merge_ff_only(
+    repo_root: Path,
+    *,
+    run_command: Callable[..., RunResult],
+    timeout: int,
+) -> str | None:
+    """``git merge --ff-only origin/main`` with the lossless-blocker repair.
+
+    Returns ``None`` on success, or the operator-facing error string on
+    failure. This is the one point in a self-deploy pass where HEAD actually
+    moves (issue #2312) -- the fetch already happened upstream, so a refusal
+    here is a worktree-shape problem (untracked/dirty paths shadowing
+    incoming blobs), which is exactly what ``_repair_lossless_pull_blockers``
+    clears losslessly. Exactly one retry, never a loop: the blocker set is
+    recomputed from scratch on the next pass anyway, so looping here only
+    hammers a tree that is genuinely stuck.
+
+    Not wrapped in ``run_git_with_retry``: the merge is a purely local
+    operation, so the network-transient allowlist can never fire on it.
+    """
+    merge_cmd = ["git", "merge", "--ff-only", "origin/main"]
+    merge_res = run_command(merge_cmd, cwd=repo_root, timeout_seconds=timeout)
+    if merge_res.ok:
+        return None
+
+    repair = _repair_lossless_pull_blockers(repo_root, run_command=run_command, timeout=timeout)
+    if repair.acted:
+        merge_res = run_command(merge_cmd, cwd=repo_root, timeout_seconds=timeout)
+        # A repair that WORKS is otherwise completely invisible: the wedge
+        # simply stops happening and the pass logs an ordinary success. That
+        # would make this fix a mask -- whatever keeps depositing these files
+        # (a script landing untracked, a half-applied cherry-pick) would go on
+        # doing so unobserved, and the one place it used to be visible was the
+        # outage. So record it on the success path too, not just in the
+        # failure message. Best-effort, like every other log_event here: a
+        # logging failure must never fail a deploy that worked.
+        log_event(
+            _self_deploy_state_path(repo_root),
+            "self_deploy_blockers_cleared",
+            {
+                "cleared": list(repair.cleared),
+                "retained": list(repair.retained),
+                "merge_ok_after_retry": merge_res.ok,
+            },
+        )
+    if merge_res.ok:
+        return None
+    detail = repair.describe()
+    return _command_failure_message(merge_cmd, merge_res, "merge failed") + (
+        f" -- {detail}" if detail else ""
+    )
+
+
 def _self_deploy_attempt(
     repo_root: Path,
     marker_path: Path,
@@ -1370,7 +1462,7 @@ def _self_deploy_attempt(
     pull_ci_fleet: bool = False,
     starvation_seconds: int,
 ) -> SelfDeployResult:
-    """Perform the real (non-preview) pull/diff/sync attempt.
+    """Perform the real (non-preview) fetch/diff/merge/sync attempt.
 
     Split out from :func:`self_deploy` so the public entry point can wrap
     every return path once with events.db instrumentation and failure-streak
@@ -1396,71 +1488,40 @@ def _self_deploy_attempt(
             )
         before_sha = before_res.stdout.strip()
 
-        pull_cmd = ["git", "pull", "--ff-only", "origin", "main"]
-        pull_res = run_git_with_retry(
-            pull_cmd,
+        # Issue #2312: fetch FIRST, without merging. Whether the deploy can
+        # proceed is decided below -- after the dependency-file diff and the
+        # live-runner count are known -- while HEAD is still parked at
+        # ``before_sha``. The old ``git pull --ff-only`` did fetch+merge as one
+        # step, so a dependency-changing deploy under live workers advanced
+        # HEAD before deferring ``uv sync`` -- leaving source that requires
+        # the new deps over a venv that does not have them, which crashed the
+        # next supervisor restart before it could ever retry the sync.
+        fetch_cmd = ["git", "fetch", "origin", "main"]
+        fetch_res = run_git_with_retry(
+            fetch_cmd,
             cwd=repo_root,
             timeout_seconds=pull_timeout,
             run_command=run_command,
             on_retry=lambda outcome: _log_self_deploy_git_retry(
-                repo_root, pull_cmd, outcome, site="self_deploy_pull", cwd=repo_root
+                repo_root, fetch_cmd, outcome, site="self_deploy_fetch", cwd=repo_root
             ),
         )
-        if not pull_res.ok:
-            repair = _repair_lossless_pull_blockers(
-                repo_root, run_command=run_command, timeout=pull_timeout
+        if not fetch_res.ok:
+            # A failed fetch means no new origin/main -- the lossless-blocker
+            # repair (for merge refusals) has nothing to act on here.
+            return SelfDeployResult(
+                ok=False,
+                pulled=False,
+                changed=False,
+                synced=False,
+                from_sha=before_sha,
+                venv_repaired=venv_repaired,
+                error=_command_failure_message(fetch_cmd, fetch_res, "fetch failed"),
             )
-            if repair.acted:
-                # Exactly one retry, never a loop: the blocker set is recomputed
-                # from scratch on the next pass anyway, so looping here only
-                # hammers a tree that is genuinely stuck.
-                pull_res = run_git_with_retry(
-                    pull_cmd,
-                    cwd=repo_root,
-                    timeout_seconds=pull_timeout,
-                    run_command=run_command,
-                    on_retry=lambda outcome: _log_self_deploy_git_retry(
-                        repo_root,
-                        pull_cmd,
-                        outcome,
-                        site="self_deploy_pull_after_repair",
-                        cwd=repo_root,
-                    ),
-                )
-                # A repair that WORKS is otherwise completely invisible: the
-                # wedge simply stops happening and the pass logs an ordinary
-                # success. That would make this fix a mask -- whatever keeps
-                # depositing these files (a script landing untracked, a
-                # half-applied cherry-pick) would go on doing so unobserved,
-                # and the one place it used to be visible was the outage. So
-                # record it on the success path too, not just in the failure
-                # message. Best-effort, like every other log_event here: a
-                # logging failure must never fail a deploy that worked.
-                log_event(
-                    _self_deploy_state_path(repo_root),
-                    "self_deploy_blockers_cleared",
-                    {
-                        "cleared": list(repair.cleared),
-                        "retained": list(repair.retained),
-                        "pull_ok_after_retry": pull_res.ok,
-                    },
-                )
-            if not pull_res.ok:
-                detail = repair.describe()
-                return SelfDeployResult(
-                    ok=False,
-                    pulled=False,
-                    changed=False,
-                    synced=False,
-                    from_sha=before_sha,
-                    venv_repaired=venv_repaired,
-                    error=_command_failure_message(pull_cmd, pull_res, "pull failed")
-                    + (f" -- {detail}" if detail else ""),
-                )
 
-        after_cmd = ["git", "rev-parse", "HEAD"]
-        after_res = run_command(after_cmd, cwd=repo_root, timeout_seconds=pull_timeout)
-        if not after_res.ok:
+        target_cmd = ["git", "rev-parse", "origin/main"]
+        target_res = run_command(target_cmd, cwd=repo_root, timeout_seconds=pull_timeout)
+        if not target_res.ok:
             return SelfDeployResult(
                 ok=False,
                 pulled=True,
@@ -1469,10 +1530,10 @@ def _self_deploy_attempt(
                 from_sha=before_sha,
                 venv_repaired=venv_repaired,
                 error=_command_failure_message(
-                    after_cmd, after_res, "failed to read HEAD after pull"
+                    target_cmd, target_res, "failed to read origin/main"
                 ),
             )
-        after_sha = after_res.stdout.strip()
+        target_sha = target_res.stdout.strip()
 
         if pull_ci_fleet:
             # Best-effort and deliberately outside the deploy's ok/error flow:
@@ -1483,7 +1544,23 @@ def _self_deploy_attempt(
         marker = _read_marker(marker_path) if marker_path.exists() else None
         marker_from = marker.get("from_sha") if marker else None
 
-        if before_sha == after_sha and not marker:
+        pending_ff = before_sha != target_sha
+        if pending_ff and _is_ancestor(
+            repo_root, target_sha, "HEAD", run_command=run_command, timeout=pull_timeout
+        ):
+            # ``before != target`` alone cannot tell "origin/main advanced"
+            # from "HEAD advanced past origin/main" (a local commit, or a
+            # checkout left ahead by an interrupted deploy). A target already
+            # contained in HEAD has nothing to merge: without this check the
+            # dependency diff ran in the *reverse* direction and the
+            # already-up-to-date merge reported ``head_changed=True``,
+            # restart-looping the supervisor on every pass. A failed probe
+            # keeps ``pending_ff`` set so the merge attempt still surfaces
+            # its own error.
+            pending_ff = False
+        changed = pending_ff or marker is not None
+
+        if not pending_ff and not marker:
             return SelfDeployResult(
                 ok=True,
                 pulled=True,
@@ -1491,17 +1568,14 @@ def _self_deploy_attempt(
                 synced=False,
                 head_changed=False,
                 from_sha=before_sha,
-                to_sha=after_sha,
+                to_sha=target_sha,
                 venv_repaired=venv_repaired,
                 message="already up to date",
             )
 
-        head_changed = before_sha != after_sha
-        changed = head_changed or marker is not None
-
         changed_files: set[str] = set()
-        if head_changed:
-            diff_cmd = ["git", "diff", "--name-only", f"{before_sha}..{after_sha}"]
+        if pending_ff:
+            diff_cmd = ["git", "diff", "--name-only", f"{before_sha}..{target_sha}"]
             diff_res = run_command(diff_cmd, cwd=repo_root, timeout_seconds=pull_timeout)
             if not diff_res.ok:
                 return SelfDeployResult(
@@ -1509,16 +1583,112 @@ def _self_deploy_attempt(
                     pulled=True,
                     changed=changed,
                     synced=False,
-                    head_changed=head_changed,
+                    head_changed=False,
                     from_sha=before_sha,
-                    to_sha=after_sha,
+                    to_sha=target_sha,
                     venv_repaired=venv_repaired,
                     error=_command_failure_message(diff_cmd, diff_res, "diff failed"),
                 )
             changed_files = {line.strip() for line in diff_res.stdout.splitlines() if line.strip()}
 
-        dep_files_changed = bool(changed_files & _DEP_LOCK_FILES)
-        if not dep_files_changed and not marker:
+        # A pending-sync marker alone makes this a dependency pass even when
+        # this fetch found nothing new: the marker replays the deploy whose
+        # sync was deferred (or whose merge was held -- issue #2312). A
+        # corrupt marker (``_read_marker`` -> {}) reads as absent everywhere
+        # this predicate is used -- same truthiness contract as the
+        # "already up to date" early return above.
+        dep_pending = bool(changed_files & _DEP_LOCK_FILES) or bool(marker)
+        from_sha = marker_from or before_sha
+        to_sha = target_sha
+
+        if dep_pending:
+            # Routed through the session-count host port (issue #2230): the
+            # Real late-binds workflow.count_fleet_live_sessions -- a re-export
+            # of host/sessions.py's facade, which late-binds
+            # fleet_registry.count_fleet_live_sessions in turn -- so patches
+            # against either name still intercept, and
+            # fake_host(sessions=...) reaches self-deploy too.
+            live_count, _ = _host.current().sessions.fleet_live_workers(fleet_dir_override)
+            if live_count > 0:
+                # Issue #2312: defer BEFORE the merge. Holding HEAD at
+                # ``before_sha`` keeps the checked-out source consistent with
+                # the installed venv for the whole deferral; the marker
+                # records the held range so the merge + sync land together
+                # once the fleet drains (or on the next boot -- the
+                # pending-sync repair in ``run_fleet_supervise`` runs it
+                # before config load).
+                #
+                # Issue #1855: bound how long a pending sync may starve under
+                # continuous load. ``record_sync_deferral`` rewrites the marker
+                # (carrying the episode's first-deferral ``written_at``
+                # forward), measures the episode age against the bound, and
+                # emits the once-per-episode ``self_deploy_sync_starved``
+                # event; ``starved`` reports the trip to the caller -- which
+                # stops admitting new dispatches -- rather than killing
+                # anything live.
+                deferral = record_sync_deferral(
+                    marker_path,
+                    marker,
+                    from_sha=from_sha,
+                    to_sha=to_sha,
+                    live_count=live_count,
+                    starvation_seconds=starvation_seconds,
+                    state_path=_self_deploy_state_path(repo_root),
+                )
+                starved = deferral.starved
+                runner_word = "runner" if live_count == 1 else "runners"
+                if marker is not None:
+                    starved_note = (
+                        f"; starved {int(deferral.marker_age_seconds or 0)}s >= "
+                        f"{starvation_seconds}s bound -- new dispatch suppressed "
+                        "until drained"
+                        if starved
+                        else ""
+                    )
+                    print(
+                        f"WARNING: pending dependency sync still deferred: {live_count} "
+                        f"{runner_word} active (marker {from_sha}..{to_sha}){starved_note}",
+                        flush=True,
+                    )
+                return SelfDeployResult(
+                    ok=True,
+                    pulled=True,
+                    changed=changed,
+                    synced=False,
+                    head_changed=False,
+                    from_sha=from_sha,
+                    to_sha=to_sha,
+                    venv_repaired=venv_repaired,
+                    message=f"sync deferred: {live_count} {runner_word} active",
+                    deferred=True,
+                    starved=starved,
+                )
+
+        # Reaching here means the update may land on this pass: either a
+        # code-only fast-forward, or a dependency change with zero live
+        # runners. The merge is the single point where HEAD moves.
+        head_changed = False
+        if pending_ff:
+            merge_error = _merge_ff_only(repo_root, run_command=run_command, timeout=pull_timeout)
+            if merge_error is not None:
+                return SelfDeployResult(
+                    ok=False,
+                    pulled=True,
+                    changed=changed,
+                    synced=False,
+                    head_changed=False,
+                    from_sha=from_sha,
+                    to_sha=to_sha,
+                    venv_repaired=venv_repaired,
+                    error=merge_error,
+                )
+            # The ancestor gate above makes a successful --ff-only merge an
+            # observed HEAD move: the only merge that succeeds without moving
+            # HEAD ("Already up to date") requires target already contained
+            # in HEAD -- exactly what pending_ff now excludes.
+            head_changed = True
+
+        if not dep_pending:
             return SelfDeployResult(
                 ok=True,
                 pulled=True,
@@ -1526,70 +1696,23 @@ def _self_deploy_attempt(
                 synced=False,
                 head_changed=head_changed,
                 from_sha=before_sha,
-                to_sha=after_sha,
+                to_sha=target_sha,
                 venv_repaired=venv_repaired,
-                message=f"code-only update: {after_sha}",
+                message=f"code-only update: {target_sha}",
             )
 
-        from_sha = marker_from or before_sha
-        to_sha = after_sha
-
-        # Routed through the session-count host port (issue #2230): the Real
-        # late-binds workflow.count_fleet_live_sessions -- a re-export of
-        # host/sessions.py's facade, which late-binds
-        # fleet_registry.count_fleet_live_sessions in turn -- so patches
-        # against either name still intercept, and
-        # fake_host(sessions=...) reaches self-deploy too.
-        live_count, _ = _host.current().sessions.fleet_live_workers(fleet_dir_override)
-        if live_count > 0:
-            # Issue #1855: bound how long a pending sync may starve under
-            # continuous load. ``record_sync_deferral`` rewrites the marker
-            # (carrying the episode's first-deferral ``written_at`` forward),
-            # measures the episode age against the bound, and emits the
-            # once-per-episode ``self_deploy_sync_starved`` event; ``starved``
-            # reports the trip to the caller -- which stops admitting new
-            # dispatches -- rather than killing anything live.
-            deferral = record_sync_deferral(
-                marker_path,
-                marker,
-                from_sha=from_sha,
-                to_sha=to_sha,
-                live_count=live_count,
-                starvation_seconds=starvation_seconds,
-                state_path=_self_deploy_state_path(repo_root),
-            )
-            starved = deferral.starved
-            runner_word = "runner" if live_count == 1 else "runners"
-            if marker is not None:
-                starved_note = (
-                    f"; starved {int(deferral.marker_age_seconds or 0)}s >= {starvation_seconds}s "
-                    "bound -- new dispatch suppressed until drained"
-                    if starved
-                    else ""
-                )
-                print(
-                    f"WARNING: pending dependency sync still deferred: {live_count} "
-                    f"{runner_word} active (marker {from_sha}..{to_sha}){starved_note}",
-                    flush=True,
-                )
-            return SelfDeployResult(
-                ok=True,
-                pulled=True,
-                changed=changed,
-                synced=False,
-                head_changed=head_changed,
-                from_sha=from_sha,
-                to_sha=to_sha,
-                venv_repaired=venv_repaired,
-                message=f"sync deferred: {live_count} {runner_word} active",
-                deferred=True,
-                starved=starved,
-            )
-
-        # Persist marker before attempting sync so a crash between the pull and
-        # the successful sync is retried on the next pass.
+        # Persist marker before attempting sync so a crash between the merge
+        # and the successful sync is retried on the next pass (or repaired at
+        # the next boot -- marker ``to_sha`` == checked-out HEAD is exactly
+        # the skew ``heal_pending_sync_at_boot`` detects).
         _write_marker(marker_path, from_sha, to_sha)
-        sync_cmd = ["uv", "sync"]
+        # ``--inexact`` keeps the sync from pruning packages outside the
+        # locked set -- on a host where the documented dev environment is
+        # ``uv sync --all-extras``, an exact sync would uninstall
+        # pytest/ruff/pluggy on every dependency-changing deploy. Locked
+        # packages are still installed/upgraded; only the removal of
+        # non-locked extras is suppressed (same rule as the boot repair).
+        sync_cmd = ["uv", "sync", "--locked", "--inexact"]
         sync_res = run_command(sync_cmd, cwd=repo_root, timeout_seconds=sync_timeout)
         if not sync_res.ok:
             return SelfDeployResult(
