@@ -364,13 +364,8 @@ def _dispatch_impl(
             candidates
         )
 
-        # Sort candidates by dispatch order
-        # Default (oldest) uses dependency-aware ordering; explicit newest uses creation date
-        if self.config.dispatch.order == "newest":
-            candidates = self._sort_by_dispatch_order(candidates)
-        else:
-            # Default: use dependency-aware ordering (out-degree) with oldest-first tiebreaker
-            candidates = self._sort_by_dependency_depth(candidates)
+        # Dispatch order, then priority labels (TIS-CW-7) -- the same order as the real pass
+        candidates = self._order_dispatch_candidates(candidates)
 
         # Fill fresh candidates first; recovery retries only get leftover slots
         # and are capped at one per pass (issue #506).
@@ -455,12 +450,8 @@ def _dispatch_impl(
                 recovery_record = prev_entry
 
             session_requests.append(
-                SessionRequest(
-                    issue_number=issue_number,
-                    issue_title=str(full_issue.get("title") or ""),
-                    prompt_path=prompt_path,
-                    branch_name=branch_name,
-                    recovery=recovery_record,
+                SessionRequest.for_issue(
+                    full_issue, issue_number, prompt_path, branch_name, recovery=recovery_record
                 )
             )
 
@@ -890,13 +881,8 @@ def _dispatch_impl(
     # Done outside the lock to avoid holding it during GitHub API calls
     candidates, blocked_issues, open_blockers_by_issue = self._filter_blocked_issues(candidates)
 
-    # Sort candidates by dispatch order
-    # Default (oldest) uses dependency-aware ordering; explicit newest uses creation date
-    if self.config.dispatch.order == "newest":
-        candidates = self._sort_by_dispatch_order(candidates)
-    else:
-        # Default: use dependency-aware ordering (out-degree) with oldest-first tiebreaker
-        candidates = self._sort_by_dependency_depth(candidates)
+    # Dispatch order, then priority labels: critical claims first (TIS-CW-7)
+    candidates = self._order_dispatch_candidates(candidates)
 
     # Re-enter lock to log events and claim issues
     with _wf.state_lock(self.paths.state_file):
@@ -1104,12 +1090,8 @@ def _dispatch_impl(
             recovery_record = prev_entry
 
         session_requests.append(
-            SessionRequest(
-                issue_number=issue_number,
-                issue_title=str(full_issue.get("title") or ""),
-                prompt_path=prompt_path,
-                branch_name=branch_name,
-                recovery=recovery_record,
+            SessionRequest.for_issue(
+                full_issue, issue_number, prompt_path, branch_name, recovery=recovery_record
             )
         )
     manifest_path = self._layout.session_manifest

@@ -151,6 +151,8 @@ KNOWN_IGNORED: dict[str, str] = {
     "live_worker_redispatch_averted": "deferral record: redispatch averted by a live worker",
     "launch_failed": "per-launch failure record; the launch_failures metric reads verdict_missed",
     "role_fallback_selected": "model-chain selection record (audit-only per its emit site)",
+    "worker_model_tier_selected": "model-tier routing record (audit-only per its emit site)",
+    "worker_model_tier_fallback": "model-tier fallback record (audit-only per its emit site)",
     "rescue_dispatched": "rescue-tier dispatch record; dispatch_rework carries the rework milestone",
     "rescue_review_escalated": "rescue-tier escalation record",
     "rework_dispatch_blocked_environment": "environment-block rework record",

@@ -116,3 +116,47 @@ class TestLocalReworkLaunchGates:
 
         assert [r.issue_number for r in calls] == [7]
         assert result["dispatched"] == [7]
+
+
+class TestLocalReworkCarriesIssueLabels:
+    """TIS-CW-6: the local rework lane hands the issue's labels to the launch
+    gate, so a ``model:<tier>`` issue reworks on its tier as the remote lane
+    does. Before the fix every local rework request carried no labels."""
+
+    def test_live_issue_labels_reach_the_launch(
+        self, repo: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        app = rework_pending_app(repo)
+        calls = spy_dispatch_sessions(monkeypatch)
+        monkeypatch.setattr(
+            type(app.gh),
+            "issue_view",
+            lambda _self, _n: {"number": 7, "labels": [{"name": "model:opus"}, {"name": "x"}]},
+        )
+
+        result = app._local_dispatch_rework()
+
+        assert result["dispatched"] == [7]
+        assert [r.labels for r in calls] == [("model:opus", "x")]
+
+    def test_unreadable_issue_falls_back_to_the_state_snapshot(
+        self, repo: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from charlie_work.github import GitHubError
+
+        app = rework_pending_app(repo)
+        calls = spy_dispatch_sessions(monkeypatch)
+        with state_lock(app.paths.state_file):
+            state = load_state(app.paths.state_file)
+            state["issues"]["7"]["labels"] = ["model:opus"]
+            save_state(app.paths.state_file, state)
+
+        def _boom(_self: object, _n: int) -> dict:
+            raise GitHubError("unreadable")
+
+        monkeypatch.setattr(type(app.gh), "issue_view", _boom)
+
+        result = app._local_dispatch_rework()
+
+        assert result["dispatched"] == [7]
+        assert [r.labels for r in calls] == [("model:opus",)]

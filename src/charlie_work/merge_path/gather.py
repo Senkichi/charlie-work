@@ -87,6 +87,8 @@ def config_slice(config: OrchestratorConfig) -> MergePathConfig:
         required_checks=tuple(auto.required_checks),
         readiness_no_ci_minutes=auto.readiness_no_ci_minutes,
         merge_strategy=auto.strategy,
+        skip_line_label=auto.mergequeue_skip_line_label,
+        priority_prefix=config.labels.priority_prefix,
     )
 
 

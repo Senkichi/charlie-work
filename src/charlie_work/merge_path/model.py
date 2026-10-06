@@ -134,6 +134,9 @@ class MergePathConfig:
     required_checks: tuple[str, ...] = ()
     readiness_no_ci_minutes: int = 15
     merge_strategy: str = "squash"
+    # TIS-CW-7: Aviator's skip-line label (None = off) and the priority label prefix.
+    skip_line_label: str | None = None
+    priority_prefix: str = ""
 
 
 # --------------------------------------------------------------------------- #

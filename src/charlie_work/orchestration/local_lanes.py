@@ -51,7 +51,7 @@ from charlie_work.worker_launch_gate import (
     _launch_workers,
     issue_worker_launch_permit,
 )
-from charlie_work.github import GitHubError
+from charlie_work.github import GitHubError, label_names
 from charlie_work.review_fleet_gate import (
     fleet_review_lock,
     fleet_review_lock_deferral,
@@ -1607,6 +1607,16 @@ def _launch_local_rework(
         record = (state.get("prs") or {}).get(str(pr_number), {})
         issue_number = int(record.get("issue_number") or pr_number)
         issue_entry = (state.get("issues") or {}).get(str(issue_number), {})
+        # TIS-CW-6: carry the issue's labels so a ``model:<tier>`` issue reworks
+        # on its tier, as the remote lane does. Live labels first (the local
+        # backend reads a file); the intake snapshot in state is the fallback.
+        try:
+            live_issue = self.gh.issue_view(issue_number)
+        except (GitHubError, ValueError):
+            live_issue = None
+        label_source = (
+            live_issue if isinstance(live_issue, dict) and "labels" in live_issue else issue_entry
+        )
         requests.append(
             SessionRequest(
                 issue_number=issue_number,
@@ -1614,6 +1624,7 @@ def _launch_local_rework(
                 prompt_path=self.paths.prs / f"pr-{pr_number}" / "rework-prompt.md",
                 branch_name=str(record.get("branch") or record.get("headRefName") or ""),
                 rework=True,
+                labels=tuple(sorted(label_names(label_source))),
             )
         )
         request_issues[pr_number] = issue_number
