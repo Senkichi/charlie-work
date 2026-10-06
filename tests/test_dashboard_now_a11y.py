@@ -1,4 +1,4 @@
-"""Now page review fixes: staleness, layout, numerals, charts, contrast, landmarks, alerts.
+"""Now page review fixes: staleness, layout, numerals, controls, landmarks, alerts.
 
 Structure and CSS-rule tests (no browser); the staleness rule itself runs under node when
 node is on PATH. Pixels are checked by the screenshot pass, not here.
@@ -14,11 +14,11 @@ from collections import Counter
 from dataclasses import replace
 
 import pytest
-from _dashboard_page_fixtures import NOW, _model, _page, _parse
+from _dashboard_page_fixtures import NOW, _model, _page, _parse, _progress
 
 from charlie_work.dashboard.pages.now import render_fragment, render_now
 from charlie_work.dashboard.read_model import ModelState
-from charlie_work.dashboard.theme import contrast_ratio, load_tokens, static_asset
+from charlie_work.dashboard.theme import static_asset
 from charlie_work.dashboard.theme.assets import static_dir_traversable
 
 LANDMARKS = {"main", "nav", "aside", "section", "header", "form"}
@@ -111,95 +111,97 @@ def test_staleness_rule_under_node() -> None:
     assert out["msg"].startswith("Not updating — last update 14:26:12")
 
 
-# ---- (2) mid-width layout -----------------------------------------------------------
+# ---- (2) layout: fills the window, one column below 1151px ----------------------------------
 
 
-def test_mid_breakpoint_stacks_the_rail_as_two_columns_and_nothing_clips() -> None:
-    now = _css("now.css")
-    mid = "(max-width: 1280px)"
-    assert _decl(now, ".shell", "grid-template-columns", mid) == "minmax(0, 1fr)"
-    assert _decl(now, ".rail", "grid-template-columns", mid) == "repeat(2, minmax(0, 1fr))"
-    assert '"repos repos"' in (_decl(now, ".rail", "grid-template-areas", mid) or "")
-    assert _decl(now, ".row", "grid-template-areas", "(max-width: 960px)")
-    assert _decl(now, ".table-scroll", "overflow-x") == "auto"
+def test_wide_layout_is_exactly_the_window_high_with_the_needs_list_scrolling() -> None:
+    css = _css("now-page.css")
+    assert _decl(css, ".grid", "grid-template-areas") == '"needs progress" "needs flow"'
+    assert _decl(css, ".shell", "height", "(min-width: 1151px)") == "100vh"
+    assert _decl(css, ".list", "overflow") == "auto" and _decl(css, ".list", "min-height") == "0"
+    assert _decl(css, ".shell", "max-width") is None  # no fixed content width on Now
+    assert "1600px" not in css
+
+
+def test_narrow_layout_is_one_column_in_reading_order() -> None:
+    css = _css("now-page.css")
+    narrow = "(max-width: 1150px)"
+    assert _decl(css, ".grid", "grid-template-columns", narrow) == "1fr"
+    assert _decl(css, ".grid", "grid-template-areas", narrow) == '"needs" "progress" "flow"'
+    assert _decl(css, ".flowrow", "grid-template-columns", narrow) == "1fr"
     base = _css("base.css")
     assert "overflow-x: hidden" not in base and "overflow-x:hidden" not in base
-    page = _page()
-    assert '<div class="table-scroll" role="region"' in page
-    assert page.index('class="table-scroll"') < page.index('<table class="repos">')
+
+
+def test_type_scale_is_fluid_and_hidden_means_hidden() -> None:
+    css = _css("now-page.css")
+    for var in ("--n-hero", "--n-h", "--n-num", "--n-body", "--n-small", "--n-gap"):
+        assert re.search(rf"{var}:\s*clamp\(", css), var
+    assert _decl(css, "body.now [hidden]", "display") == "none !important"
+    assert "outline: none" not in css and "outline:none" not in css  # focus rings stay
 
 
 # ---- (3) numerals ------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "selector", [".row .age", ".repos td .n", ".cap-row .val .n", ".fresh .n", ".nd-row .hn"]
-)
+@pytest.mark.parametrize("selector", [".fresh .n", ".hn"])
 def test_aligned_numerals_use_inter_with_tabular_figures(selector: str) -> None:
     css = _css("now.css")
     assert _decl(css, selector, "font-family") == "var(--lj-sans)"
     assert "tabular-nums" in (_decl(css, selector, "font-variant-numeric") or "")
 
 
-def test_no_rule_puts_aligned_numerals_back_in_fraunces() -> None:
-    css = _css("now.css")
-    for sels, body in _rules(css):
-        if "--lj-serif" in body:
-            bad = [s for s in sels if re.search(r"\.(age|repos td|cap-row \.val)", s)]
-            assert not bad, bad
+def test_ages_are_inter_and_big_numbers_are_tabular() -> None:
+    css = _css("now-page.css")
+    assert _decl(css, ".age", "font-family") == "var(--lj-sans)"
+    assert "tabular-nums" in (_decl(css, ".age", "font-variant-numeric") or "")
+    assert "tabular-nums" in (_decl(css, "body.now .num", "font-variant-numeric") or "")
 
 
-# ---- (5) charts: no shrinking SVG text, no links inside role=img ---------------------
+# ---- (5) charts: decorative svg is hidden from assistive tech, the chart is operable ------
 
 
-def test_charts_have_no_svg_text_and_no_role_img() -> None:
-    page = _page()
-    assert "<text" not in page and 'role="img"' not in page
-    for svg in re.findall(r"<svg\b[^>]*>.*?</svg>", page, re.S):
+def test_decorative_svgs_are_aria_hidden_and_the_chart_is_a_labelled_group() -> None:
+    page = _page(progress=_progress())
+    for svg in re.findall(r"<svg[^>]*>.*?</svg>", page, re.S):
         assert 'aria-hidden="true"' in svg.split(">", 1)[0], svg[:80]
-        assert "<a " not in svg
-    css = _css("now.css")
-    for selector in (".stage-l", ".stage-s", ".rework", ".nd-row .hl"):
-        size = _decl(css, selector, "font-size")
-        assert size == "var(--lj-text-2)", (selector, size)  # 11.5px, CSS px, never scaled
+        assert "<a " not in svg and 'role="img"' not in svg
+    chart = [a for t, a in _parse(page).tags if a.get("id") == "chart"]
+    assert chart and chart[0]["tabindex"] == "0" and chart[0]["role"] == "group"
+    assert "arrows" in chart[0]["aria-label"]
+
+
+def test_toggles_expose_their_state() -> None:
+    page = _page(progress=_progress())
+    seg = [a for t, a in _parse(page).tags if t == "button" and ("data-m" in a or "data-r" in a)]
+    assert len(seg) == 2 + 4 and all(a["aria-pressed"] in ("true", "false") for a in seg)
+    assert sum(a["aria-pressed"] == "true" for a in seg) == 2
 
 
 # ---- (6) over-cap is not colour-only ---------------------------------------------------
 
 
-def test_over_cap_is_stated_in_words_with_a_glyph() -> None:
+def test_over_cap_is_stated_in_words() -> None:
     cap = replace(_model().capacity, reviewers_live=8, reviewers_cap=6)
     page = _page(_model(capacity=cap))
-    reviewers = page[page.index(">Reviewers<") : page.index(">CI runners<")]
-    assert '<span class="over text-warn">over cap</span>' in reviewers
+    reviewers = page[page.index('id="meter-reviewers"') : page.index('id="meter-runners"')]
+    assert '<span class="note">over cap</span>' in reviewers
     assert "over cap" not in page.replace(reviewers, "")
 
 
-# ---- (7) contrast of danger text on the highlighted-row surface ----------------------
-
-
-@pytest.mark.parametrize("mode", ["light", "dark"])
-@pytest.mark.parametrize(
-    "selector",
-    [".row.tone-danger:hover", ".row.tone-danger:focus-within", ".row.tone-danger.is-sel"],
-)
-def test_danger_row_highlight_keeps_danger_text_at_4_5(mode: str, selector: str) -> None:
-    bg_var = _decl(_css("now.css"), selector, "background")
-    m = re.fullmatch(r"var\(--lj-(\w+)\)", bg_var or "")
-    assert m, bg_var
-    tokens = load_tokens()
-    surface = tokens["color"][mode].get(m.group(1)) or tokens["color"][mode]["card"]
-    danger = tokens["status"][mode]["danger"]["$value"]
-    assert contrast_ratio(danger, surface["$value"]) >= 4.5, (mode, m.group(1))
-
-
-def test_raised_is_the_surface_that_fails_so_the_override_matters() -> None:
-    tokens = load_tokens()  # positive control: without the override, dark would fail
-    dark = tokens["color"]["dark"]
-    assert (
-        contrast_ratio(tokens["status"]["dark"]["danger"]["$value"], dark["raised"]["$value"])
-        < 4.5
-    )
+def test_focus_is_ink_weight_not_a_second_colour() -> None:
+    """Colour has one job: --lj-warn marks "needs you" (the count and the selected tile)."""
+    css = _css("now-page.css")
+    users = [
+        sels[0] for sels, body in _rules(css) if "--lj-warn" in body or "--n-accent-bg" in body
+    ]
+    assert users == [
+        "body.now",  # the --n-accent-bg definition
+        ".hero .num",
+        'body.now .tile[aria-pressed="true"]',
+        '.tile[aria-pressed="true"] .num',
+    ]
+    assert all("--lj-danger" not in body for sels, body in _rules(css) if "dot" not in sels[-1])
 
 
 # ---- (8) landmarks -----------------------------------------------------------------
