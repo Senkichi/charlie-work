@@ -1142,6 +1142,12 @@ class AutoMergeConfig:
     # run id for a check has been retried this many times on the current
     # head, the PR escalates to a human instead of retrying forever.
     infra_rerun_attempt_cap: int = 2
+    # DD-13: defer an infra rerun (without consuming an attempt)
+    # while the repo's oldest queued CI job has waited at least this many
+    # seconds, per the freshest runner_allocation event. A rerun adds a full
+    # run to a lane that is already queuing. Fails open on missing/stale data.
+    # 0 disables (kill switch).
+    infra_rerun_backlog_defer_seconds: Annotated[int, Typed, NonNeg] = 900
     # Issue #1383: classification + escalation knobs for required checks
     # that fail because of a fleet-wide infra condition (Actions budget /
     # runner outage) rather than the PR's code. See InfraBlockedConfig.
