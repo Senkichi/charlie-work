@@ -2552,6 +2552,12 @@ class OrchestratorConfig:
             min_running_per_repo=(Typed, NonNeg),
             demand_idle_samples=(Typed, NonNeg),
             max_runs_scanned=(Typed, NonNeg),
+            # ci-fleet host I/O and leak-drain knobs: bools and paths, no coercion.
+            host_io=Typed,
+            host_io_manifest=Typed,
+            leak_drain=Typed,
+            leak_probe_path=Typed,
+            host_io_auto_exclusions=Typed,
         ),
         Check(_runner_floors_agree),
     ] = field(default_factory=RunnerAllocationConfig)
