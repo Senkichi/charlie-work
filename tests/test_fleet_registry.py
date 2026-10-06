@@ -448,21 +448,24 @@ def test_count_fleet_live_sessions_skips_repo_with_malformed_config(
     assert len(skipped_repos) == 1
 
 
-def test_count_fleet_live_sessions_does_not_corroborate_ghost_worker(
+def test_count_fleet_live_sessions_corroborates_ghost_worker(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    """Characterization for issue #2230: the fleet-wide worker count does NOT
-    corroborate state.json ghost dispatches the way its review-lane twin does.
+    """Issue #2230 behaviour flip: the fleet-wide worker count now applies the
+    same state.json ghost corroboration the review lane has had since #2084.
 
     A repo whose state.json records a ``dispatched`` issue with a live
     ``worker_pid`` but no session sidecar -- a "ghost", in the sense of issue
-    #343 -- is invisible to ``count_fleet_live_sessions`` today: the walk
-    counts live sidecars only. ``count_fleet_live_reviews`` corroborates the
-    same shape via ``dispatch_selection._count_live_reviews`` (issue #2084);
-    the worker lane's fleet count predates the per-repo #343 corroboration
-    and never gained it. This pins current behaviour -- the named
-    behaviour-flip commit in this PR flips the assertion to ``1``.
+    #343 -- counts against the fleet cap. Before the flip the walk counted
+    live sidecars only, so the ghost was invisible to
+    ``count_fleet_live_sessions`` (and therefore to the fleet
+    ``global_max_concurrent_sessions`` cap and the self-deploy sync
+    deferral, its two consumers).
+
+    MUTATION GATE: reverting ``count_fleet_live_sessions`` to the pre-flip
+    ``iter_workers``-only body makes this test fail -- the count reverts to 0
+    and the ghost worker looks like free capacity again.
     """
     from charlie_work import layout
     from charlie_work.fleet_registry import count_fleet_live_sessions
@@ -518,7 +521,7 @@ def test_count_fleet_live_sessions_does_not_corroborate_ghost_worker(
 
     live_count, skipped_repos = count_fleet_live_sessions(None)
 
-    assert live_count == 0  # ghost worker is invisible to the fleet count today
+    assert live_count == 1  # ghost worker counts, same as the review lane
     assert skipped_repos == []
 
 
