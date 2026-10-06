@@ -20,6 +20,7 @@ from charlie_work.instrumentation import query_events
 from charlie_work.subprocess_runner import RunResult, run_captured
 from charlie_work.supervise import (
     PullBlockerRepair,
+    SelfDeployResult,
     _BLOCKER_NAMES_IN_MESSAGE,
     _pending_sync_marker_path,
     _repair_lossless_pull_blockers,
@@ -467,6 +468,59 @@ def test_self_deploy_defers_without_advancing_head(
     marker = json.loads(marker_path.read_text(encoding="utf-8"))
     assert marker["from_sha"] == before_sha
     assert marker["to_sha"] == origin_sha
+
+
+def test_self_deploy_head_ahead_of_origin_main_is_stable_noop(
+    tmp_path: Path, no_fleet_live_sessions: None
+) -> None:
+    """Issue #2312 round-2: a checkout whose local HEAD is already AHEAD of
+    ``origin/main`` must be a stable no-op, not a restart loop.
+
+    ``before != target`` alone cannot distinguish "origin/main advanced"
+    from "HEAD advanced past origin/main" (a local commit, or a checkout
+    left ahead by an interrupted deploy). Without the ancestor gate the
+    attempt ran the dependency diff in the REVERSE direction
+    (``before..target`` backwards down the graph) and, when the merge came
+    back "Already up to date", still reported ``head_changed=True`` -- so
+    the caller relaunched the supervisor on every single pass. Real git
+    repos, real ``self_deploy`` -- the assertion is on the actual result,
+    the call trace, and the checkout's untouched HEAD.
+    """
+    origin_root = tmp_path / "origin"
+    clone_root = tmp_path / "clone"
+    _init_origin(origin_root)
+    _clone(origin_root, clone_root)
+
+    # A local commit origin/main does not have -- HEAD strictly ahead.
+    (clone_root / "local_only.txt").write_bytes(b"local work\n")
+    _git(clone_root, "add", "local_only.txt")
+    _git(clone_root, "commit", "-m", "local-only commit")
+    ahead_sha = _git(clone_root, "rev-parse", "HEAD").stdout.strip()
+    origin_sha = _git(clone_root, "rev-parse", "origin/main").stdout.strip()
+
+    runner, calls = _counting_git_runner()
+    result = self_deploy(clone_root, run_command=runner)
+
+    assert result == SelfDeployResult(
+        ok=True,
+        pulled=True,
+        changed=False,
+        synced=False,
+        head_changed=False,
+        from_sha=ahead_sha,
+        to_sha=origin_sha,
+        message="already up to date",
+    )
+    # The ancestor probe is the call that decided the no-op: it ran, and
+    # nothing downstream of it (reverse diff, merge, uv sync) did.
+    assert any(c[:3] == ["git", "merge-base", "--is-ancestor"] for c in calls)
+    assert not any(c[:2] == ["git", "diff"] for c in calls)
+    assert not any(c[:2] == ["git", "merge"] for c in calls)
+    assert not any(c[:2] == ["uv", "sync"] for c in calls)
+    # HEAD untouched -- the deploy moved nothing.
+    assert _git(clone_root, "rev-parse", "HEAD").stdout.strip() == ahead_sha
+    # And nothing was marked pending for a later pass.
+    assert not _pending_sync_marker_path(layout.default_state_root(clone_root)).exists()
 
 
 def test_self_deploy_records_nothing_cleared_when_no_repair_was_needed(

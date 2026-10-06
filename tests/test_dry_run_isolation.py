@@ -98,6 +98,7 @@ def test_self_deploy_dry_run_reports_the_pending_fast_forward(tmp_path: Path) ->
         [
             RunResult(0, "aaaaaaaaaaaa1\n", ""),  # HEAD
             RunResult(0, "bbbbbbbbbbbb2\n", ""),  # origin/main (ahead)
+            RunResult(1, "", ""),  # merge-base: target not an ancestor of HEAD
             RunResult(0, "pyproject.toml\nsrc/foo.py\n", ""),  # diff
         ]
     )

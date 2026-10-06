@@ -2911,146 +2911,12 @@ def run_fleet_supervise(
         return CommandResult(False, f"refusing to supervise: {anchor.detail}", {})
     logger.info("Venv editable anchor: %s", anchor.detail)
 
-    # Issue #2312: pending-sync boot repair, BEFORE the config load. A pre-fix
-    # deferral (or crash survivor) can leave HEAD on the new tree while the
-    # venv still holds the old commit's deps -- and the layered load below is
-    # the first thing that crashes on that skew, so the repair cannot depend
-    # on it. ``peek_runtime_state_dir`` reads only ``runtime.state_dir``
-    # tolerantly from the same layer slots, and ``supervisor_runtime_paths``
-    # resolves it exactly as the loaded config's state root will be. The
-    # repair never raises, emits ``self_deploy_boot_sync`` when it fires, and
-    # defers to live fleet workers on the same rule self_deploy uses. Skipped
-    # under --dry-run for the same reason self_deploy previews instead of
-    # pulling: a preview must not mutate the venv.
-    if not dry_run:
-        boot_repair = heal_pending_sync_at_boot(
-            orchestrator_root(),
-            state_root=supervisor_runtime_paths(
-                peek_runtime_state_dir(Path.cwd(), fleet_dir_override=fleet_dir_override)
-            ).root,
-            live_count=lambda: count_fleet_live_sessions(fleet_dir_override)[0],
-        )
-        if boot_repair.detail is not None:
-            logger.warning("Boot pending-sync repair: %s", boot_repair.detail)
-        elif boot_repair.synced:
-            logger.info("Boot pending-sync repair: synced via %s", boot_repair.detected_via)
-
-    def _report_global_load_failure(exc: Exception) -> None:
-        # Falling back to defaults silently is how a whole feature disappears
-        # without a trace: every config-gated behavior (notify, labels, the
-        # runner prologues) reverts to off while passes keep reporting success.
-        # A typo in the global layer must be loud.
-        logger.warning(
-            "Fleet supervisor could not load the global config layer; "
-            "continuing with per-repo config only (fleet-wide knobs fall back "
-            "to per-repo values or defaults): %s",
-            exc,
-        )
-        print(f"config load failed, continuing on per-repo config: {exc}", flush=True)
-
-    # The global layer is required, but the per-repo config is still valid and
-    # must not be discarded with it (#623); only a failing per-repo load too
-    # falls back to pristine defaults. A host-wide ConstructionError is the one
-    # error that never degrades -- see load_fleet_global_config.
-    global_config = load_fleet_global_config(
-        load_layered_config,
-        Path.cwd(),
-        fleet_dir_override=fleet_dir_override,
-        fallback=OrchestratorConfig(),
-        report=_report_global_load_failure,
-    )
-
-    # Provenance of the layer every fleet-wide knob comes from, logged once per
-    # supervisor start (not per pass -- this is startup, so it costs one stat).
-    # The prologue already logs what runner_allocation *resolved to*; the fact
-    # missing from #590 is whether the file that declares it was read at all.
-    #
-    # Deliberately one stat() rather than an exists() flag: exists() collapses a
-    # missing file, an unready device and an unresolvable path into the same bare
-    # False, and all of them take load_layered_config's silent-{} branch. A bare
-    # exists=False here would reproduce the exact ambiguity this line exists to
-    # remove. See describe_config_file for which errors are and are not hidden.
-    global_config_path = layout.global_config_path(override=fleet_dir_override)
-    logger.info(
-        "Fleet supervisor global config: path=%s %s",
-        global_config_path,
-        describe_config_file(global_config_path),
-    )
-
-    # Issue #1899: resolve the notify.file_path "" sentinel against the
-    # supervisor's own bookkeeping root (see _fleet_notify_config) before
-    # anything consumes it -- the raw layered value is the "derive from
-    # runtime.state_dir" sentinel, so without this the report below flags
-    # the documented default as misconfigured and every fleet-level emit
-    # fails "file_path is empty".
-    notify_config = _fleet_notify_config(global_config)
-
-    # Issue #1859: publish the resolved notify sink once per supervisor
-    # start, next to the global-layer provenance line -- a lost ``notify:``
-    # section otherwise degrades the whole pipeline to silence with no
-    # error anywhere. The fleet-state path targets the same events.db the
-    # heartbeat consumer reads, so the resolution (including the absolute
-    # digest path this daemon anchored) is a consumed signal, not a
-    # write-only log line.
-    report_notify_resolution(
-        notify_config,
-        global_config_path,
-        layout.state_file_path(fleet_dir(override=fleet_dir_override)),
-    )
-
-    overrides: dict[str, int] = {}
-    if poll_interval_override is not None:
-        overrides["poll_interval_seconds"] = poll_interval_override
-    if max_runtime_override is not None:
-        overrides["max_runtime_minutes"] = max_runtime_override
-    cfg = replace(global_config.supervisor, **overrides)
-    # Fleet-only knobs live on the fleet-scoped section (issue #1978). The
-    # getattr fallback tolerates a config object built by code that predates
-    # the section (the same stand-in shape ``_run_fleet_allocation_prologue``
-    # already tolerates), resolving to the dataclass defaults.
-    fleet_cfg = getattr(global_config, "fleet_supervisor", None)
-    if fleet_cfg is None:
-        fleet_cfg = FleetSupervisorConfig()
-    # The supervisor's private self-bookkeeping root is resolved via the
-    # dedicated helper, which binds the phantom-state-dir opt-out (#1754).
-    state_root = supervisor_runtime_paths(global_config.runtime.state_dir).root
-
-    # Issue #1363: supervisor-startup preflight. Runs once, before the lock is
-    # even acquired -- a fatal host precondition (disk_floor, venv_identity)
-    # means this process should never become the supervisor of record, not
-    # loop and fail midway. Unlike the per-pass gate in
-    # `OrchestratorApp._loop_impl` (which returns a refusal CommandResult for
-    # the caller to interpret), a fatal failure HERE must end the process with
-    # a distinct nonzero exit code the wrapper can recognize: PR #862's
-    # EXIT_RESTART_REQUESTED (3) means "replace me, new code is on disk" --
-    # reusing it for a refusal would tell a fresh wrapper to relaunch the very
-    # process that just refused to start, in a tight loop. Reusing plain exit
-    # 1 would fold this into "ordinary crash", losing the named condition an
-    # operator should see at a glance in the fleet pass log. So this is its
-    # own value, PREFLIGHT_REFUSAL_EXIT_CODE (4); the wrapper's relaunch logic
-    # needs no special case for it because anything other than
-    # EXIT_RESTART_REQUESTED already means "do not relaunch" (see
-    # `supervise_loop.run_supervise_relaunch_loop` and its dedicated test).
-    startup_preflight = run_preflight(
-        PreflightPaths(repo_root=orchestrator_root(), state_dir=state_root),
-        global_config.runtime.preflight,
-    )
-    if not startup_preflight.ok:
-        fatal_check = startup_preflight.fatal_failures[0]
-        detail = f"{fatal_check.name}: {fatal_check.detail}"
-        print(f"PREFLIGHT REFUSAL (supervisor startup): {detail}", file=sys.stderr, flush=True)
-        logger.error("Fleet supervisor refused to start: %s", detail)
-        return CommandResult(
-            False,
-            f"fleet supervisor refused to start: preflight failed ({detail})",
-            {
-                "exit_code": PREFLIGHT_REFUSAL_EXIT_CODE,
-                "preflight_refused": True,
-                "check": fatal_check.name,
-                "detail": fatal_check.detail,
-            },
-        )
-
+    # The fleet supervisor lock is taken before the pending-sync boot repair,
+    # not merely before the loop: the repair may run a real ``uv sync``, and
+    # a duplicate launch racing an incumbent mid-sync (its marker replaying,
+    # zero live workers) would double-sync the same venv (issue #2312
+    # round-2). Holding the lock through the heal makes "another supervisor
+    # is alive" and "no concurrent sync" the same check.
     lock_path = layout.fleet_supervisor_lock_path(override=fleet_dir_override)
     lock = try_acquire_supervisor_lock(lock_path)
     if lock is None:
@@ -3063,156 +2929,306 @@ def run_fleet_supervise(
             {"exit_reason": "lock_held", "restart_requested": False},
         )
 
-    pass_number = 0
-    total_repo_passes = 0
-    total_attention_events = 0
-    total_failed_repos = 0
-    # Issue #1339: the LabelConfig-derived label ensure runs once per supervisor
-    # startup per repo (on the first fleet_loop pass only), so a new
-    # LabelConfig field converges to its label with no operator action. Cleared
-    # to False after the first pass reaches fleet_loop regardless of outcome,
-    # so a self-deploy / head-drift restart on pass 1 still re-ensures on the
-    # next supervisor startup (a new process resets this local).
-    labels_ensure_pending = True
-    # Issue #738: split the aggregate "failed" count into genuine lane crashes
-    # (errored) vs non-fatal ok=False conditions (with conditions) so the
-    # final supervisor summary does not paint the majority of passes red the
-    # way the per-pass headline used to. ``total_failed_repos`` is kept as the
-    # sum of the two for backwards-compatible return-data consumers.
-    total_errored_repos = 0
-    total_conditions_repos = 0
-    start_time = clock()
-    # Set at every route out of the loop below; see RESTART_EXIT_REASONS.
-    exit_reason: str | None = None
-    # Issue #1716: operator stop/drain control plane (fleet_stop.FleetStopState).
-    drain_state = FleetStopState()
-    full_pass_interval = cfg.full_pass_interval_seconds
-    last_full_pass_at = start_time - full_pass_interval
-    snapshot = _take_fleet_snapshot(fleet_dir_override=fleet_dir_override)
+    # From here until the pass loop's own try/finally takes ownership of
+    # the release (issue #627's supervisor_exited block), every exit path
+    # -- a raise anywhere in startup, or the preflight refusal return --
+    # must release the fleet supervisor lock itself, or a duplicate
+    # launch would see "already running" for the life of this process.
+    try:
+        # Issue #2312: pending-sync boot repair, BEFORE the config load. A pre-fix
+        # deferral (or crash survivor) can leave HEAD on the new tree while the
+        # venv still holds the old commit's deps -- and the layered load below is
+        # the first thing that crashes on that skew, so the repair cannot depend
+        # on it. ``peek_runtime_state_dir`` reads only ``runtime.state_dir``
+        # tolerantly from the same layer slots, and ``supervisor_runtime_paths``
+        # resolves it exactly as the loaded config's state root will be. The
+        # repair never raises, emits ``self_deploy_boot_sync`` when it fires, and
+        # defers to live fleet workers on the same rule self_deploy uses. Skipped
+        # under --dry-run for the same reason self_deploy previews instead of
+        # pulling: a preview must not mutate the venv.
+        if not dry_run:
+            boot_repair = heal_pending_sync_at_boot(
+                orchestrator_root(),
+                state_root=supervisor_runtime_paths(
+                    peek_runtime_state_dir(Path.cwd(), fleet_dir_override=fleet_dir_override)
+                ).root,
+                live_count=lambda: count_fleet_live_sessions(fleet_dir_override)[0],
+            )
+            if boot_repair.detail is not None:
+                logger.warning("Boot pending-sync repair: %s", boot_repair.detail)
+            elif boot_repair.synced:
+                logger.info("Boot pending-sync repair: synced via %s", boot_repair.detected_via)
 
-    # Supervisor lifecycle instrumentation (issue #627): record started/exited
-    # events to the fleet-level events.db and maintain a heartbeat sidecar so
-    # a killed supervisor (TerminateProcess, exit=-1) leaves a diagnosable gap
-    # instead of only a launcher text marker. Acquiring the lock proves any
-    # prior supervisor is gone, so a stale heartbeat with no ``exited_at`` here
-    # means the prior one was killed — emit a retroactive supervisor_exited and
-    # alert on it before this supervisor records its own start.
-    # ``notify_config`` is the sentinel-resolved binding from startup
-    # (issue #1899), shared by every _emit_fleet_transition site below.
-    prior = detect_prior_abnormal_exit(fleet_dir_override)
-    if prior is not None:
-        record_prior_abnormal_exit(fleet_dir_override, prior)
-        print(
-            f"[{datetime.datetime.now().strftime('%H:%M:%S')}] supervisor: prior "
-            f"supervisor terminated without an exit event (last beat "
-            f"{prior.get('prior_last_beat_at')}); recorded retroactive "
-            f"supervisor_exited",
-            flush=True,
+        def _report_global_load_failure(exc: Exception) -> None:
+            # Falling back to defaults silently is how a whole feature disappears
+            # without a trace: every config-gated behavior (notify, labels, the
+            # runner prologues) reverts to off while passes keep reporting success.
+            # A typo in the global layer must be loud.
+            logger.warning(
+                "Fleet supervisor could not load the global config layer; "
+                "continuing with per-repo config only (fleet-wide knobs fall back "
+                "to per-repo values or defaults): %s",
+                exc,
+            )
+            print(f"config load failed, continuing on per-repo config: {exc}", flush=True)
+
+        # The global layer is required, but the per-repo config is still valid and
+        # must not be discarded with it (#623); only a failing per-repo load too
+        # falls back to pristine defaults. A host-wide ConstructionError is the one
+        # error that never degrades -- see load_fleet_global_config.
+        global_config = load_fleet_global_config(
+            load_layered_config,
+            Path.cwd(),
+            fleet_dir_override=fleet_dir_override,
+            fallback=OrchestratorConfig(),
+            report=_report_global_load_failure,
         )
-        if notify_config is not None and getattr(notify_config, "enabled", False):
-            _emit_fleet_transition(
-                notify_config,
-                AttentionEntry(
-                    issue_number=-1,
-                    adapter_kind="fleet-supervisor",
-                    health="ERROR",
-                    previous_health=None,
-                    last_log_line=(
-                        f"prior supervisor terminated without an exit event "
-                        f"(last beat {prior.get('prior_last_beat_at')})"
-                    ),
-                    pid=prior.get("prior_pid"),
-                ),
-                fleet_dir_override,
-                persistent=False,
+
+        # Provenance of the layer every fleet-wide knob comes from, logged once per
+        # supervisor start (not per pass -- this is startup, so it costs one stat).
+        # The prologue already logs what runner_allocation *resolved to*; the fact
+        # missing from #590 is whether the file that declares it was read at all.
+        #
+        # Deliberately one stat() rather than an exists() flag: exists() collapses a
+        # missing file, an unready device and an unresolvable path into the same bare
+        # False, and all of them take load_layered_config's silent-{} branch. A bare
+        # exists=False here would reproduce the exact ambiguity this line exists to
+        # remove. See describe_config_file for which errors are and are not hidden.
+        global_config_path = layout.global_config_path(override=fleet_dir_override)
+        logger.info(
+            "Fleet supervisor global config: path=%s %s",
+            global_config_path,
+            describe_config_file(global_config_path),
+        )
+
+        # Issue #1899: resolve the notify.file_path "" sentinel against the
+        # supervisor's own bookkeeping root (see _fleet_notify_config) before
+        # anything consumes it -- the raw layered value is the "derive from
+        # runtime.state_dir" sentinel, so without this the report below flags
+        # the documented default as misconfigured and every fleet-level emit
+        # fails "file_path is empty".
+        notify_config = _fleet_notify_config(global_config)
+
+        # Issue #1859: publish the resolved notify sink once per supervisor
+        # start, next to the global-layer provenance line -- a lost ``notify:``
+        # section otherwise degrades the whole pipeline to silence with no
+        # error anywhere. The fleet-state path targets the same events.db the
+        # heartbeat consumer reads, so the resolution (including the absolute
+        # digest path this daemon anchored) is a consumed signal, not a
+        # write-only log line.
+        report_notify_resolution(
+            notify_config,
+            global_config_path,
+            layout.state_file_path(fleet_dir(override=fleet_dir_override)),
+        )
+
+        overrides: dict[str, int] = {}
+        if poll_interval_override is not None:
+            overrides["poll_interval_seconds"] = poll_interval_override
+        if max_runtime_override is not None:
+            overrides["max_runtime_minutes"] = max_runtime_override
+        cfg = replace(global_config.supervisor, **overrides)
+        # Fleet-only knobs live on the fleet-scoped section (issue #1978). The
+        # getattr fallback tolerates a config object built by code that predates
+        # the section (the same stand-in shape ``_run_fleet_allocation_prologue``
+        # already tolerates), resolving to the dataclass defaults.
+        fleet_cfg = getattr(global_config, "fleet_supervisor", None)
+        if fleet_cfg is None:
+            fleet_cfg = FleetSupervisorConfig()
+        # The supervisor's private self-bookkeeping root is resolved via the
+        # dedicated helper, which binds the phantom-state-dir opt-out (#1754).
+        state_root = supervisor_runtime_paths(global_config.runtime.state_dir).root
+
+        # Issue #1363: supervisor-startup preflight. Runs once, before the loop
+        # starts -- a fatal host precondition (disk_floor, venv_identity)
+        # means this process should never become the supervisor of record, not
+        # loop and fail midway. Unlike the per-pass gate in
+        # `OrchestratorApp._loop_impl` (which returns a refusal CommandResult for
+        # the caller to interpret), a fatal failure HERE must end the process with
+        # a distinct nonzero exit code the wrapper can recognize: PR #862's
+        # EXIT_RESTART_REQUESTED (3) means "replace me, new code is on disk" --
+        # reusing it for a refusal would tell a fresh wrapper to relaunch the very
+        # process that just refused to start, in a tight loop. Reusing plain exit
+        # 1 would fold this into "ordinary crash", losing the named condition an
+        # operator should see at a glance in the fleet pass log. So this is its
+        # own value, PREFLIGHT_REFUSAL_EXIT_CODE (4); the wrapper's relaunch logic
+        # needs no special case for it because anything other than
+        # EXIT_RESTART_REQUESTED already means "do not relaunch" (see
+        # `supervise_loop.run_supervise_relaunch_loop` and its dedicated test).
+        startup_preflight = run_preflight(
+            PreflightPaths(repo_root=orchestrator_root(), state_dir=state_root),
+            global_config.runtime.preflight,
+        )
+        if not startup_preflight.ok:
+            fatal_check = startup_preflight.fatal_failures[0]
+            detail = f"{fatal_check.name}: {fatal_check.detail}"
+            print(f"PREFLIGHT REFUSAL (supervisor startup): {detail}", file=sys.stderr, flush=True)
+            logger.error("Fleet supervisor refused to start: %s", detail)
+            lock.release()
+            return CommandResult(
+                False,
+                f"fleet supervisor refused to start: preflight failed ({detail})",
+                {
+                    "exit_code": PREFLIGHT_REFUSAL_EXIT_CODE,
+                    "preflight_refused": True,
+                    "check": fatal_check.name,
+                    "detail": fatal_check.detail,
+                },
             )
 
-    # Issue #1832: detect a supervisor stuck relaunching into repeated
-    # wedge-kills with no completed pass recovering in between -- the
-    # wedge-kill backstop (issue #728) is itself looping instead of the
-    # relaunch converging on a healthy supervisor. Checked once at startup,
-    # same as the abnormal-exit detection above, since each wedge-kill is
-    # exactly what produces a fresh supervisor start here.
-    wedge_loop = detect_wedge_kill_loop(
-        fleet_dir_override, threshold=fleet_cfg.wedge_kill_loop_alarm
-    )
-    if wedge_loop is not None:
-        record_wedge_kill_loop(fleet_dir_override, wedge_loop)
-        print(
-            f"[{datetime.datetime.now().strftime('%H:%M:%S')}] supervisor: "
-            f"{wedge_loop['count']} consecutive wedge-kills with no completed "
-            f"pass in between (threshold={wedge_loop['threshold']}); recorded "
-            f"supervisor_wedge_loop",
-            flush=True,
-        )
-        if notify_config is not None and getattr(notify_config, "enabled", False):
-            _emit_fleet_transition(
-                notify_config,
-                AttentionEntry(
-                    issue_number=-1,
-                    adapter_kind="fleet-supervisor",
-                    health="ERROR",
-                    previous_health=None,
-                    last_log_line=(
-                        f"{wedge_loop['count']} consecutive wedge-kills with no "
-                        f"completed pass in between "
-                        f"(threshold={wedge_loop['threshold']})"
-                    ),
-                    pid=None,
-                ),
-                fleet_dir_override,
-                persistent=False,
+        pass_number = 0
+        total_repo_passes = 0
+        total_attention_events = 0
+        total_failed_repos = 0
+        # Issue #1339: the LabelConfig-derived label ensure runs once per supervisor
+        # startup per repo (on the first fleet_loop pass only), so a new
+        # LabelConfig field converges to its label with no operator action. Cleared
+        # to False after the first pass reaches fleet_loop regardless of outcome,
+        # so a self-deploy / head-drift restart on pass 1 still re-ensures on the
+        # next supervisor startup (a new process resets this local).
+        labels_ensure_pending = True
+        # Issue #738: split the aggregate "failed" count into genuine lane crashes
+        # (errored) vs non-fatal ok=False conditions (with conditions) so the
+        # final supervisor summary does not paint the majority of passes red the
+        # way the per-pass headline used to. ``total_failed_repos`` is kept as the
+        # sum of the two for backwards-compatible return-data consumers.
+        total_errored_repos = 0
+        total_conditions_repos = 0
+        start_time = clock()
+        # Set at every route out of the loop below; see RESTART_EXIT_REASONS.
+        exit_reason: str | None = None
+        # Issue #1716: operator stop/drain control plane (fleet_stop.FleetStopState).
+        drain_state = FleetStopState()
+        full_pass_interval = cfg.full_pass_interval_seconds
+        last_full_pass_at = start_time - full_pass_interval
+        snapshot = _take_fleet_snapshot(fleet_dir_override=fleet_dir_override)
+
+        # Supervisor lifecycle instrumentation (issue #627): record started/exited
+        # events to the fleet-level events.db and maintain a heartbeat sidecar so
+        # a killed supervisor (TerminateProcess, exit=-1) leaves a diagnosable gap
+        # instead of only a launcher text marker. Acquiring the lock proves any
+        # prior supervisor is gone, so a stale heartbeat with no ``exited_at`` here
+        # means the prior one was killed — emit a retroactive supervisor_exited and
+        # alert on it before this supervisor records its own start.
+        # ``notify_config`` is the sentinel-resolved binding from startup
+        # (issue #1899), shared by every _emit_fleet_transition site below.
+        prior = detect_prior_abnormal_exit(fleet_dir_override)
+        if prior is not None:
+            record_prior_abnormal_exit(fleet_dir_override, prior)
+            print(
+                f"[{datetime.datetime.now().strftime('%H:%M:%S')}] supervisor: prior "
+                f"supervisor terminated without an exit event (last beat "
+                f"{prior.get('prior_last_beat_at')}); recorded retroactive "
+                f"supervisor_exited",
+                flush=True,
             )
+            if notify_config is not None and getattr(notify_config, "enabled", False):
+                _emit_fleet_transition(
+                    notify_config,
+                    AttentionEntry(
+                        issue_number=-1,
+                        adapter_kind="fleet-supervisor",
+                        health="ERROR",
+                        previous_health=None,
+                        last_log_line=(
+                            f"prior supervisor terminated without an exit event "
+                            f"(last beat {prior.get('prior_last_beat_at')})"
+                        ),
+                        pid=prior.get("prior_pid"),
+                    ),
+                    fleet_dir_override,
+                    persistent=False,
+                )
 
-    started_at_iso = utc_now()
-    record_supervisor_started(
-        fleet_dir_override,
-        pid=os.getpid(),
-        started_at=started_at_iso,
-        full_pass_interval_seconds=full_pass_interval,
-        max_pass_runtime_seconds=fleet_cfg.max_pass_runtime_seconds,
-        wedge_kill_loop_alarm=fleet_cfg.wedge_kill_loop_alarm,
-    )
+        # Issue #1832: detect a supervisor stuck relaunching into repeated
+        # wedge-kills with no completed pass recovering in between -- the
+        # wedge-kill backstop (issue #728) is itself looping instead of the
+        # relaunch converging on a healthy supervisor. Checked once at startup,
+        # same as the abnormal-exit detection above, since each wedge-kill is
+        # exactly what produces a fresh supervisor start here.
+        wedge_loop = detect_wedge_kill_loop(
+            fleet_dir_override, threshold=fleet_cfg.wedge_kill_loop_alarm
+        )
+        if wedge_loop is not None:
+            record_wedge_kill_loop(fleet_dir_override, wedge_loop)
+            print(
+                f"[{datetime.datetime.now().strftime('%H:%M:%S')}] supervisor: "
+                f"{wedge_loop['count']} consecutive wedge-kills with no completed "
+                f"pass in between (threshold={wedge_loop['threshold']}); recorded "
+                f"supervisor_wedge_loop",
+                flush=True,
+            )
+            if notify_config is not None and getattr(notify_config, "enabled", False):
+                _emit_fleet_transition(
+                    notify_config,
+                    AttentionEntry(
+                        issue_number=-1,
+                        adapter_kind="fleet-supervisor",
+                        health="ERROR",
+                        previous_health=None,
+                        last_log_line=(
+                            f"{wedge_loop['count']} consecutive wedge-kills with no "
+                            f"completed pass in between "
+                            f"(threshold={wedge_loop['threshold']})"
+                        ),
+                        pid=None,
+                    ),
+                    fleet_dir_override,
+                    persistent=False,
+                )
 
-    # Record where ci_fleet was actually imported from plus the sibling
-    # repo's HEAD and dirty-state (issue #954). The venv anchor check above
-    # refuses a repointed install, but neither it nor declared_ci_fleet_root
-    # records what the running process *actually loaded* -- and the editable
-    # .pth means that is whatever is saved in the sibling working tree,
-    # committed or not. This does not prevent anything; it makes the coupling
-    # attributable when something breaks. Best-effort: a probe failure is
-    # recorded in the event payload, never propagated to the supervisor path.
-    _record_ci_fleet_provenance(supervisor_heartbeat_path(fleet_dir_override))
+        started_at_iso = utc_now()
+        record_supervisor_started(
+            fleet_dir_override,
+            pid=os.getpid(),
+            started_at=started_at_iso,
+            full_pass_interval_seconds=full_pass_interval,
+            max_pass_runtime_seconds=fleet_cfg.max_pass_runtime_seconds,
+            wedge_kill_loop_alarm=fleet_cfg.wedge_kill_loop_alarm,
+        )
 
-    # Exit tracking: ``_exit_code`` is 0 for every in-control clean exit (drain,
-    # max_runtime, max_passes, HEAD-drift restart, self-deploy restart,
-    # KeyboardInterrupt) and 1 for an uncaught exception. ``_exit_reason`` names
-    # the branch. Both are consumed by the ``finally`` below to emit
-    # ``supervisor_exited``. A TerminateProcess kill skips ``finally`` entirely,
-    # leaving the heartbeat's ``exited_at`` null for the next start to detect.
-    _exit_code = 0
-    _exit_reason = "completed"
+        # Record where ci_fleet was actually imported from plus the sibling
+        # repo's HEAD and dirty-state (issue #954). The venv anchor check above
+        # refuses a repointed install, but neither it nor declared_ci_fleet_root
+        # records what the running process *actually loaded* -- and the editable
+        # .pth means that is whatever is saved in the sibling working tree,
+        # committed or not. This does not prevent anything; it makes the coupling
+        # attributable when something breaks. Best-effort: a probe failure is
+        # recorded in the event payload, never propagated to the supervisor path.
+        _record_ci_fleet_provenance(supervisor_heartbeat_path(fleet_dir_override))
 
-    # Capture the HEAD SHA at process startup so we can detect drift caused
-    # by an external actor (operator pull, another process) between passes.
-    # self_deploy only reports from_sha/to_sha for pulls *it* performed; a
-    # HEAD moved out-of-band shows as "already up to date" and the daemon
-    # silently runs stale code forever (observed 2026-07-23: ~90 minutes of
-    # ConfigError crashes after an operator pulled origin/main manually while
-    # the daemon was already running).
-    startup_head = read_head_sha(orchestrator_root())
+        # Exit tracking: ``_exit_code`` is 0 for every in-control clean exit (drain,
+        # max_runtime, max_passes, HEAD-drift restart, self-deploy restart,
+        # KeyboardInterrupt) and 1 for an uncaught exception. ``_exit_reason`` names
+        # the branch. Both are consumed by the ``finally`` below to emit
+        # ``supervisor_exited``. A TerminateProcess kill skips ``finally`` entirely,
+        # leaving the heartbeat's ``exited_at`` null for the next start to detect.
+        _exit_code = 0
+        _exit_reason = "completed"
 
-    # Issue #1934: the dead-review-claim sweep set used to run only inside
-    # each repo's lane (dispatch_reviews) and via the standalone
-    # ``reap-reviews`` command, so a dead claim waited a full fleet-wide
-    # round (~55-67 min observed) to be freed. The supervisor now runs the
-    # same sweep set once per selected repo on its own cadence from a
-    # dedicated daemon thread, independent of -- and concurrent with -- the
-    # lane pool and this pass scheduler. The sweeps never launch reviewers
-    # and are state_lock-serialized / merge-on-write safe against a live
-    # lane (issue #1874), so they neither need nor take the supervisor lock.
-    # ``reap_sweep_interval_seconds`` <= 0 disables the scheduler.
-    reap_scheduler: tuple[threading.Thread, threading.Event] | None = None
+        # Capture the HEAD SHA at process startup so we can detect drift caused
+        # by an external actor (operator pull, another process) between passes.
+        # self_deploy only reports from_sha/to_sha for pulls *it* performed; a
+        # HEAD moved out-of-band shows as "already up to date" and the daemon
+        # silently runs stale code forever (observed 2026-07-23: ~90 minutes of
+        # ConfigError crashes after an operator pulled origin/main manually while
+        # the daemon was already running).
+        startup_head = read_head_sha(orchestrator_root())
+
+        # Issue #1934: the dead-review-claim sweep set used to run only inside
+        # each repo's lane (dispatch_reviews) and via the standalone
+        # ``reap-reviews`` command, so a dead claim waited a full fleet-wide
+        # round (~55-67 min observed) to be freed. The supervisor now runs the
+        # same sweep set once per selected repo on its own cadence from a
+        # dedicated daemon thread, independent of -- and concurrent with -- the
+        # lane pool and this pass scheduler. The sweeps never launch reviewers
+        # and are state_lock-serialized / merge-on-write safe against a live
+        # lane (issue #1874), so they neither need nor take the supervisor lock.
+        # ``reap_sweep_interval_seconds`` <= 0 disables the scheduler.
+        reap_scheduler: tuple[threading.Thread, threading.Event] | None = None
+    except BaseException:
+        lock.release()
+        raise
 
     try:
         if fleet_cfg.reap_sweep_interval_seconds > 0:

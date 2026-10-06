@@ -224,9 +224,10 @@ class BootSyncRepair:
     """Outcome of a single ``heal_pending_sync_at_boot`` pass.
 
     ``detected_via`` is ``"marker"`` (a pending-sync marker whose ``to_sha``
-    equals HEAD), ``"probe"`` (``uv sync --locked --check`` reported drift),
+    equals HEAD), ``"probe"`` (``uv sync --locked --check --inexact`` reported
+    a clean "would change" exit),
     or ``None`` when nothing needed repair. ``synced`` is True only after a
-    successful ``uv sync --locked``. ``deferred`` is True when skew was
+    successful ``uv sync --locked --inexact``. ``deferred`` is True when skew was
     detected but live fleet runners are active -- the merge and sync stay
     parked for ``self_deploy``/the next restart. ``detail`` carries the
     operator-facing reason for deferred/failed outcomes.
@@ -258,21 +259,32 @@ def heal_pending_sync_at_boot(
     supervisor entrypoint and:
 
     1. detects skew via a marker that is replaying (marker present and HEAD
-       equals its ``to_sha``) or via ``uv sync --locked --check`` (marker
-       lost/corrupt and a ``uv.lock`` exists -- that is precisely the
-       bricking scenario; a uv-free dev checkout without a lockfile is not),
+       equals its ``to_sha``) or via ``uv sync --locked --check --inexact``
+       (marker lost/corrupt and a ``uv.lock`` exists -- that is precisely the
+       bricking scenario; a uv-free dev checkout without a lockfile is not).
+       Only the probe's clean "would change" exit (1) counts as drift --
+       a uv failure, timeout, missing binary, or unsupported ``--check``
+       reports detail instead of triggering a sync -- and ``--inexact``
+       keeps extraneous packages (e.g. the documented ``uv sync
+       --all-extras`` dev environment) from ever reading as drift,
     2. defers when live fleet runners are active (same live-runner rule as
        ``self_deploy``: do not rebuild a venv running children use),
-    3. otherwise runs ``uv sync --locked`` and clears the marker on success.
+    3. otherwise runs ``uv sync --locked --inexact`` and clears the marker
+       on success.
 
     Every terminal state -- detected+deferred, detected+synced,
-    detected+sync-failed, and crashed -- emits a ``self_deploy_boot_sync``
-    event. A clean no-op detects nothing and emits nothing.
+    detected+sync-failed, probe-inconclusive, and crashed -- emits a
+    ``self_deploy_boot_sync`` event. A clean no-op detects nothing and
+    emits nothing.
 
     Never raises and never writes code: failures return
     ``BootSyncRepair(detail=...)`` and the caller decides whether to log or
     ignore. A failed sync leaves the marker in place so the next restart
     retries.
+
+    The caller (``run_fleet_supervise``) invokes this only while holding
+    the fleet-supervisor lock, so the probe and the sync can never run
+    concurrently with a live supervisor's own ``uv sync``.
     """
 
     marker_path = layout.pending_sync_path(state_root)
@@ -331,13 +343,43 @@ def _boot_sync_repair(
             # is an in-flight #2312 deferral; self_deploy owns its merge.
             detected_via = "marker"
     if detected_via is None and (repo_root / "uv.lock").exists():
+        # --inexact: extraneous packages are not drift. The documented dev
+        # environment is ``uv sync --all-extras``, whose pytest/ruff/pluggy
+        # sit outside the default dependency set -- an exact-mode probe
+        # reports "would uninstall" on every idle boot, and the repair below
+        # would prune the dev extras out of the very venv running it
+        # (observed: a mid-suite heal pruned pluggy and every spawned pytest
+        # child died on import). The repair only ever needs to *add* missing
+        # locked packages, so preserving installed extras is correct on the
+        # probe and the sync alike.
+        probe_cmd = ["uv", "sync", "--locked", "--check", "--inexact"]
         probe = run_command(
-            ["uv", "sync", "--locked", "--check"],
+            probe_cmd,
             cwd=repo_root,
             timeout_seconds=probe_timeout_seconds,
         )
-        if not probe.ok:
+        if probe.returncode == 1:
             detected_via = "probe"
+        elif probe.returncode != 0:
+            # Only a clean "would change" exit (1) is drift. Anything else --
+            # a spawn failure or timeout (returncode None), or a uv error
+            # like an unparseable lockfile or an unsupported ``--check``
+            # (2+) -- proves nothing about the venv, and a blind sync under a
+            # broken probe is exactly the false-positive this command exists
+            # to prevent. Report it instead of syncing.
+            detail = command_failure_message(probe_cmd, probe, "uv sync --check failed")
+            # write-gate-exempt(issue=2312): durable events.db signal, outside state lock
+            log_event(
+                state_path,
+                SELF_DEPLOY_BOOT_SYNC_KIND,
+                {
+                    "detected_via": None,
+                    "deferred": False,
+                    "synced": False,
+                    "error": detail,
+                },
+            )
+            return BootSyncRepair(detail=detail)
     if detected_via is None:
         # Nothing skewed. A marker in this state holds its merge (to_sha is
         # still ahead of HEAD); self_deploy owns it on the next pass.
@@ -362,7 +404,7 @@ def _boot_sync_repair(
             detail=f"{live} live fleet runner(s) still active",
         )
 
-    sync_cmd = ["uv", "sync", "--locked"]
+    sync_cmd = ["uv", "sync", "--locked", "--inexact"]
     sync_res = run_command(
         sync_cmd,
         cwd=repo_root,

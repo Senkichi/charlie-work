@@ -728,6 +728,10 @@ def _self_deploy_preview(
     notes: list[str] = []
     if head_sha == target_sha:
         notes.append("no fast-forward pending (HEAD is at last-known origin/main)")
+    elif _is_ancestor(repo_root, target_sha, "HEAD", run_command=run_command, timeout=timeout):
+        # Same gate as the real attempt: HEAD ahead of origin/main has
+        # nothing to merge, and the dependency diff would run in reverse.
+        notes.append("no fast-forward pending (HEAD already contains origin/main)")
     else:
         notes.append(f"would fast-forward {head_sha[:12]}..{target_sha[:12]}")
         diff_res = run_command(
@@ -1370,6 +1374,28 @@ def _pull_ci_fleet_sibling(
     log_event(_self_deploy_state_path(repo_root), "self_deploy_ci_fleet_pull", payload)
 
 
+def _is_ancestor(
+    repo_root: Path,
+    ancestor_sha: str,
+    descendant: str,
+    *,
+    run_command: Callable[..., RunResult],
+    timeout: int,
+) -> bool:
+    """``git merge-base --is-ancestor`` probe; False when the probe itself fails.
+
+    Exit 0 means ``ancestor_sha`` is contained in ``descendant``'s history.
+    Any nonzero exit -- not an ancestor, no merge base -- and any probe
+    failure (timeout, missing binary) come back False, so "cannot prove
+    containment" never masquerades as "contained".
+    """
+    return run_command(
+        ["git", "merge-base", "--is-ancestor", ancestor_sha, descendant],
+        cwd=repo_root,
+        timeout_seconds=timeout,
+    ).ok
+
+
 def _merge_ff_only(
     repo_root: Path,
     *,
@@ -1517,6 +1543,19 @@ def _self_deploy_attempt(
         marker_from = marker.get("from_sha") if marker else None
 
         pending_ff = before_sha != target_sha
+        if pending_ff and _is_ancestor(
+            repo_root, target_sha, "HEAD", run_command=run_command, timeout=pull_timeout
+        ):
+            # ``before != target`` alone cannot tell "origin/main advanced"
+            # from "HEAD advanced past origin/main" (a local commit, or a
+            # checkout left ahead by an interrupted deploy). A target already
+            # contained in HEAD has nothing to merge: without this check the
+            # dependency diff ran in the *reverse* direction and the
+            # already-up-to-date merge reported ``head_changed=True``,
+            # restart-looping the supervisor on every pass. A failed probe
+            # keeps ``pending_ff`` set so the merge attempt still surfaces
+            # its own error.
+            pending_ff = False
         changed = pending_ff or marker is not None
 
         if not pending_ff and not marker:
@@ -1635,6 +1674,10 @@ def _self_deploy_attempt(
                     venv_repaired=venv_repaired,
                     error=merge_error,
                 )
+            # The ancestor gate above makes a successful --ff-only merge an
+            # observed HEAD move: the only merge that succeeds without moving
+            # HEAD ("Already up to date") requires target already contained
+            # in HEAD -- exactly what pending_ff now excludes.
             head_changed = True
 
         if not dep_pending:
@@ -1655,7 +1698,13 @@ def _self_deploy_attempt(
         # the next boot -- marker ``to_sha`` == checked-out HEAD is exactly
         # the skew ``heal_pending_sync_at_boot`` detects).
         _write_marker(marker_path, from_sha, to_sha)
-        sync_cmd = ["uv", "sync", "--locked"]
+        # ``--inexact`` keeps the sync from pruning packages outside the
+        # locked set -- on a host where the documented dev environment is
+        # ``uv sync --all-extras``, an exact sync would uninstall
+        # pytest/ruff/pluggy on every dependency-changing deploy. Locked
+        # packages are still installed/upgraded; only the removal of
+        # non-locked extras is suppressed (same rule as the boot repair).
+        sync_cmd = ["uv", "sync", "--locked", "--inexact"]
         sync_res = run_command(sync_cmd, cwd=repo_root, timeout_seconds=sync_timeout)
         if not sync_res.ok:
             return SelfDeployResult(

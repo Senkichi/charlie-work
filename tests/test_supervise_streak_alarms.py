@@ -233,6 +233,7 @@ def test_self_deploy_streak_survives_a_real_deferral_end_to_end(
             RunResult(0, "abc123\n", ""),  # before HEAD
             RunResult(0, "", ""),  # git fetch origin main
             RunResult(0, "def456\n", ""),  # git rev-parse origin/main
+            RunResult(1, "", ""),  # merge-base: target not an ancestor of HEAD
             RunResult(0, "pyproject.toml\nuv.lock\n", ""),  # diff
             RunResult(0, "", ""),  # git merge --ff-only origin/main
             RunResult(1, "", "uv sync failed: resolution error"),  # uv sync fails

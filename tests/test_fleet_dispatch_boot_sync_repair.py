@@ -34,13 +34,17 @@ def test_run_fleet_supervise_heals_pending_sync_before_config_load(
     monkeypatch: Any,
     tmp_path: Path,
 ) -> None:
-    """Issue #2312: the pending-sync boot repair runs BEFORE the config load.
+    """Issue #2312: the pending-sync boot repair runs BEFORE the config load
+    and AFTER the fleet-supervisor lock is held.
 
     A deploy whose ``uv sync`` was deferred under live workers can leave the
     checkout ahead of the venv; the layered config load below is exactly the
     step that crashes on missing deps, so the marker/probe repair must
     precede it -- a heal wired after ``load_layered_config`` would never
-    reach the host it exists to rescue.
+    reach the host it exists to rescue. And because the repair can run a
+    real ``uv sync``, it may only run under the supervisor lock (round-2):
+    before the fix it ran unlocked, so a duplicate launch could double-sync
+    an incumbent mid-``uv sync``.
     """
     cfg = OrchestratorConfig(
         supervisor=SupervisorConfig(
@@ -52,6 +56,7 @@ def test_run_fleet_supervise_heals_pending_sync_before_config_load(
     order: list[str] = []
     mock_load_config.side_effect = lambda *a, **k: (order.append("config"), cfg)[1]
     mock_fleet_loop.return_value = _drained_fleet_result()
+    mock_lock.side_effect = lambda *a, **k: (order.append("lock"), MagicMock())[1]
 
     heal_mock = MagicMock(
         side_effect=lambda *a, **k: (
@@ -71,4 +76,26 @@ def test_run_fleet_supervise_heals_pending_sync_before_config_load(
 
     assert result.ok is True
     heal_mock.assert_called_once()
-    assert order[:2] == ["heal", "config"]
+    assert order[:3] == ["lock", "heal", "config"]
+
+
+@patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
+def test_run_fleet_supervise_heal_never_runs_without_the_lock(
+    mock_lock: MagicMock,
+    monkeypatch: Any,
+) -> None:
+    """The boot repair can never run ``uv`` concurrently with a live
+    supervisor: a launch that fails to acquire the fleet-supervisor lock
+    exits before the heal is even invoked (issue #2312 round-2)."""
+    mock_lock.return_value = None
+    heal_mock = MagicMock()
+    monkeypatch.setattr("charlie_work.fleet_dispatch.heal_pending_sync_at_boot", heal_mock)
+    config_mock = MagicMock()
+    monkeypatch.setattr("charlie_work.fleet_dispatch.load_layered_config", config_mock)
+
+    result = run_fleet_supervise()
+
+    assert result.ok is False
+    assert "fleet supervisor already running" in result.message
+    heal_mock.assert_not_called()
+    config_mock.assert_not_called()

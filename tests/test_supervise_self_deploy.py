@@ -42,6 +42,7 @@ def test_self_deploy_code_only_change_does_not_sync(
             RunResult(0, "abc123\n", ""),  # HEAD
             RunResult(0, "", ""),  # fetch ok
             RunResult(0, "def456\n", ""),  # origin/main
+            RunResult(1, "", ""),  # merge-base: target not an ancestor of HEAD
             RunResult(0, "src/foo.py\nREADME.md\n", ""),  # diff
             RunResult(0, "", ""),  # merge --ff-only ok
         ]
@@ -57,11 +58,12 @@ def test_self_deploy_code_only_change_does_not_sync(
         to_sha="def456",
         message="code-only update: def456",
     )
-    assert len(calls) == 5
+    assert len(calls) == 6
     assert [c[0] for c in calls] == [
         ["git", "rev-parse", "HEAD"],
         ["git", "fetch", "origin", "main"],
         ["git", "rev-parse", "origin/main"],
+        ["git", "merge-base", "--is-ancestor", "def456", "HEAD"],
         ["git", "diff", "--name-only", "abc123..def456"],
         ["git", "merge", "--ff-only", "origin/main"],
     ]
@@ -70,15 +72,17 @@ def test_self_deploy_code_only_change_does_not_sync(
 def test_self_deploy_dependency_change_triggers_uv_sync(
     tmp_path: Path, no_fleet_live_sessions: None
 ) -> None:
-    """A pull touching pyproject.toml/uv.lock runs uv sync --locked and reports success."""
+    """A pull touching pyproject.toml/uv.lock runs uv sync --locked --inexact
+    and reports success."""
     runner, calls = _make_fake_runner(
         [
             RunResult(0, "abc123\n", ""),
             RunResult(0, "", ""),  # fetch ok
             RunResult(0, "def456\n", ""),  # origin/main
+            RunResult(1, "", ""),  # merge-base: target not an ancestor of HEAD
             RunResult(0, "pyproject.toml\nuv.lock\n", ""),  # diff
             RunResult(0, "", ""),  # merge --ff-only ok
-            RunResult(0, "", ""),  # uv sync --locked ok
+            RunResult(0, "", ""),  # uv sync --locked --inexact ok
         ]
     )
     result = self_deploy(tmp_path, run_command=runner)
@@ -90,7 +94,7 @@ def test_self_deploy_dependency_change_triggers_uv_sync(
     assert result.to_sha == "def456"
     assert "updated and synced" in result.message
     assert ["git", "merge", "--ff-only", "origin/main"] in [c[0] for c in calls]
-    assert calls[-1][0] == ["uv", "sync", "--locked"]
+    assert calls[-1][0] == ["uv", "sync", "--locked", "--inexact"]
 
 
 def test_self_deploy_pull_failure_is_non_fatal(
@@ -133,13 +137,15 @@ def test_self_deploy_merge_failure_is_non_fatal(
     before giving up, which re-reads HEAD and ``origin/main`` and, in a genuinely
     diverged tree, bails out at the ``merge-base --is-ancestor`` check -- three
     extra canned responses (HEAD, origin/main, the ancestor check failing) beyond
-    the five the merge path itself consumed.
+    the six the merge path itself consumed (the pre-merge ancestor gate being
+    the sixth).
     """
     runner, calls = _make_fake_runner(
         [
             RunResult(0, "abc123\n", ""),
             RunResult(0, "", ""),  # fetch ok
             RunResult(0, "def456\n", ""),  # origin/main
+            RunResult(1, "", ""),  # ancestor gate: target not an ancestor of HEAD
             RunResult(0, "src/foo.py\n", ""),  # diff (code-only)
             RunResult(1, "", "fatal: Not possible to fast-forward, aborting."),
             RunResult(0, "abc123\n", ""),  # repair: rev-parse HEAD
@@ -154,7 +160,7 @@ def test_self_deploy_merge_failure_is_non_fatal(
     assert result.synced is False
     assert result.from_sha == "abc123"
     assert "fast-forward" in (result.error or "")
-    assert len(calls) == 8
+    assert len(calls) == 9
 
 
 def test_self_deploy_already_up_to_date(tmp_path: Path, no_fleet_live_sessions: None) -> None:
@@ -178,7 +184,7 @@ def test_self_deploy_already_up_to_date(tmp_path: Path, no_fleet_live_sessions: 
         message="already up to date",
     )
     assert len(calls) == 3
-    assert all(c[0] != ["uv", "sync", "--locked"] for c in calls)
+    assert all(c[0] != ["uv", "sync", "--locked", "--inexact"] for c in calls)
 
 
 def test_self_deploy_uv_sync_failure_is_non_fatal(
@@ -190,6 +196,7 @@ def test_self_deploy_uv_sync_failure_is_non_fatal(
             RunResult(0, "abc123\n", ""),
             RunResult(0, "", ""),  # fetch ok
             RunResult(0, "def456\n", ""),  # origin/main
+            RunResult(1, "", ""),  # merge-base: target not an ancestor of HEAD
             RunResult(0, "uv.lock\n", ""),  # dep file changed
             RunResult(0, "", ""),  # merge --ff-only ok
             RunResult(1, "", "failed to install"),
@@ -222,6 +229,7 @@ def test_self_deploy_defers_sync_when_fleet_runners_active(
             RunResult(0, "abc123\n", ""),  # HEAD
             RunResult(0, "", ""),  # fetch ok
             RunResult(0, "def456\n", ""),  # origin/main
+            RunResult(1, "", ""),  # merge-base: target not an ancestor of HEAD
             RunResult(0, "pyproject.toml\nuv.lock\n", ""),  # diff
             RunResult(0, "", ""),  # uv sync (should not be reached)
         ]
@@ -244,13 +252,14 @@ def test_self_deploy_defers_sync_when_fleet_runners_active(
         message="sync deferred: 2 runners active",
         deferred=True,
     )
-    assert all(c[0] != ["uv", "sync", "--locked"] for c in calls)
+    assert all(c[0] != ["uv", "sync", "--locked", "--inexact"] for c in calls)
     # Issue #2312: the merge must never have been issued -- HEAD stays parked.
     assert all(c[0][:2] != ["git", "merge"] for c in calls)
     assert [c[0] for c in calls] == [
         ["git", "rev-parse", "HEAD"],
         ["git", "fetch", "origin", "main"],
         ["git", "rev-parse", "origin/main"],
+        ["git", "merge-base", "--is-ancestor", "def456", "HEAD"],
         ["git", "diff", "--name-only", "abc123..def456"],
     ]
 
@@ -293,6 +302,7 @@ def test_self_deploy_deferred_marker_replay_defers_again_without_merging(
             RunResult(0, "abc123\n", ""),  # HEAD still parked at from_sha
             RunResult(0, "", ""),  # fetch ok
             RunResult(0, "def456\n", ""),  # origin/main
+            RunResult(1, "", ""),  # merge-base: target not an ancestor of HEAD
             RunResult(0, "uv.lock\n", ""),  # diff
         ]
     )
@@ -303,7 +313,7 @@ def test_self_deploy_deferred_marker_replay_defers_again_without_merging(
     assert result.deferred is True
     assert result.head_changed is False
     assert all(c[0][:2] != ["git", "merge"] for c in calls)
-    assert all(c[0] != ["uv", "sync", "--locked"] for c in calls)
+    assert all(c[0] != ["uv", "sync", "--locked", "--inexact"] for c in calls)
     marker = json.loads(marker_path.read_text(encoding="utf-8"))
     assert marker["to_sha"] == "def456"
 
@@ -322,6 +332,7 @@ def test_self_deploy_honors_state_root_override(tmp_path: Path, monkeypatch: Any
             RunResult(0, "abc123\n", ""),  # HEAD
             RunResult(0, "", ""),  # fetch ok
             RunResult(0, "def456\n", ""),  # origin/main
+            RunResult(1, "", ""),  # merge-base: target not an ancestor of HEAD
             RunResult(0, "pyproject.toml\nuv.lock\n", ""),  # diff
         ]
     )
@@ -342,9 +353,10 @@ def test_self_deploy_proceeds_when_zero_fleet_runners(
             RunResult(0, "abc123\n", ""),  # HEAD
             RunResult(0, "", ""),  # fetch ok
             RunResult(0, "def456\n", ""),  # origin/main
+            RunResult(1, "", ""),  # merge-base: target not an ancestor of HEAD
             RunResult(0, "pyproject.toml\nuv.lock\n", ""),  # diff
             RunResult(0, "", ""),  # merge --ff-only ok
-            RunResult(0, "", ""),  # uv sync --locked ok
+            RunResult(0, "", ""),  # uv sync --locked --inexact ok
         ]
     )
 
@@ -357,7 +369,7 @@ def test_self_deploy_proceeds_when_zero_fleet_runners(
     assert result.from_sha == "abc123"
     assert result.to_sha == "def456"
     assert "updated and synced" in result.message
-    assert calls[-1][0] == ["uv", "sync", "--locked"]
+    assert calls[-1][0] == ["uv", "sync", "--locked", "--inexact"]
     assert not _pending_sync_marker_path(layout.default_state_root(tmp_path)).exists()
 
 
@@ -368,7 +380,7 @@ def test_self_deploy_retries_sync_after_deferral(
 
     Post-#2312 shape: pass N parks HEAD at ``from_sha`` (the merge is held,
     not just the sync), so pass N+1 replays the marker *and* lands the held
-    merge before ``uv sync --locked`` -- the deferral covers the whole
+    merge before ``uv sync --locked --inexact`` -- the deferral covers the whole
     "advance checkout + sync env" transition as one unit.
     """
     live_counts = iter([2, 0])
@@ -385,6 +397,7 @@ def test_self_deploy_retries_sync_after_deferral(
             RunResult(0, "abc123\n", ""),  # HEAD
             RunResult(0, "", ""),  # fetch ok
             RunResult(0, "def456\n", ""),  # origin/main
+            RunResult(1, "", ""),  # merge-base: target not an ancestor of HEAD
             RunResult(0, "pyproject.toml\nuv.lock\n", ""),  # diff
             RunResult(0, "", ""),  # merge/uv sync (not reached)
         ]
@@ -405,9 +418,10 @@ def test_self_deploy_retries_sync_after_deferral(
             RunResult(0, "abc123\n", ""),  # HEAD (parked)
             RunResult(0, "", ""),  # fetch ok
             RunResult(0, "def456\n", ""),  # origin/main (unchanged)
+            RunResult(1, "", ""),  # merge-base: target not an ancestor of HEAD
             RunResult(0, "uv.lock\n", ""),  # diff abc123..def456
             RunResult(0, "", ""),  # merge --ff-only ok
-            RunResult(0, "", ""),  # uv sync --locked ok
+            RunResult(0, "", ""),  # uv sync --locked --inexact ok
         ]
     )
 
@@ -423,7 +437,7 @@ def test_self_deploy_retries_sync_after_deferral(
         message="updated and synced: def456",
     )
     assert ["git", "merge", "--ff-only", "origin/main"] in [c[0] for c in second_calls]
-    assert second_calls[-1][0] == ["uv", "sync", "--locked"]
+    assert second_calls[-1][0] == ["uv", "sync", "--locked", "--inexact"]
     assert not marker_path.exists()
 
 
@@ -508,6 +522,7 @@ def test_self_deploy_pull_failure_surfaces_stderr_over_generic_error(
             RunResult(0, "abc123\n", ""),  # HEAD
             RunResult(0, "", ""),  # fetch ok
             RunResult(0, "def456\n", ""),  # origin/main
+            RunResult(1, "", ""),  # ancestor gate: target not an ancestor of HEAD
             RunResult(0, "src/foo.py\n", ""),  # diff (code-only)
             RunResult(
                 returncode=1,
@@ -530,7 +545,7 @@ def test_self_deploy_pull_failure_surfaces_stderr_over_generic_error(
     assert "src/charlie_work/config.py" in result.error
     assert "command exited 1" not in result.error
     assert result.error.startswith("git merge --ff-only origin/main: ")
-    assert len(calls) == 8
+    assert len(calls) == 9
 
 
 def test_self_deploy_pull_retries_transient_failure_then_succeeds(
@@ -575,6 +590,7 @@ def test_self_deploy_pull_retries_transient_failure_then_succeeds(
             # issue #1777 finding 2)
             RunResult(0, "", ""),  # fetch attempt 2 (retry): ok
             RunResult(0, "def456\n", ""),  # origin/main
+            RunResult(1, "", ""),  # merge-base: target not an ancestor of HEAD
             RunResult(0, "src/foo.py\n", ""),  # diff (code-only)
             RunResult(0, "", ""),  # merge --ff-only ok
         ]
@@ -586,7 +602,7 @@ def test_self_deploy_pull_retries_transient_failure_then_succeeds(
     assert result.pulled is True
     assert result.from_sha == "abc123"
     assert result.to_sha == "def456"
-    assert len(calls) == 6
+    assert len(calls) == 7
     assert calls[1][0] == ["git", "fetch", "origin", "main"]
 
     retries = query_events(state_path, kind="git_network_retry")
@@ -670,6 +686,7 @@ def test_self_deploy_records_events_db_outcome_for_every_pass(
             RunResult(0, "abc123\n", ""),
             RunResult(0, "", ""),  # fetch
             RunResult(0, "def456\n", ""),  # origin/main
+            RunResult(1, "", ""),  # merge-base: target not an ancestor of HEAD
             RunResult(0, "src/foo.py\n", ""),  # diff
             RunResult(0, "", ""),  # merge --ff-only
         ]
