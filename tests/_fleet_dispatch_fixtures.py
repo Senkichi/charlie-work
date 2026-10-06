@@ -25,6 +25,7 @@ from charlie_work.config import (
 )
 from charlie_work.fleet_dispatch import _CiFleetDirtyCheck
 from charlie_work.notify import NotifyResult
+from charlie_work.pending_sync import BootSyncRepair
 from charlie_work.supervise import SelfDeployResult
 from charlie_work.command_result import CommandResult
 
@@ -107,6 +108,13 @@ def _patch_self_deploy_for_fleet_tests(monkeypatch: Any, tmp_path: Path) -> dict
             synced=False,
             message="test no-op",
         ),
+    )
+    # Issue #2312: the boot-time pending-sync repair runs on every supervise
+    # start and shells out to git/uv; default it to a no-op so these tests
+    # stay hermetic. Ordering tests patch it with their own mock.
+    monkeypatch.setattr(
+        "charlie_work.fleet_dispatch.heal_pending_sync_at_boot",
+        lambda *a, **k: BootSyncRepair(),
     )
     mocks: dict[str, MagicMock] = {}
     for name in (

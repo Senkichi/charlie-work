@@ -98,6 +98,7 @@ def test_self_deploy_dry_run_reports_the_pending_fast_forward(tmp_path: Path) ->
         [
             RunResult(0, "aaaaaaaaaaaa1\n", ""),  # HEAD
             RunResult(0, "bbbbbbbbbbbb2\n", ""),  # origin/main (ahead)
+            RunResult(1, "", ""),  # merge-base: target not an ancestor of HEAD
             RunResult(0, "pyproject.toml\nsrc/foo.py\n", ""),  # diff
         ]
     )
@@ -157,23 +158,23 @@ def test_self_deploy_dry_run_does_not_touch_the_venv(
 
 
 def test_self_deploy_without_dry_run_still_pulls(tmp_path: Path) -> None:
-    """The other direction: a real run must still fast-forward.
+    """The other direction: a real run must still fetch + fast-forward.
 
     Without this, gating the preview could silently disable self-deploy entirely and
     the suite would still be green.
     """
     runner, commands = _make_fake_runner(
         [
-            RunResult(0, "abc123\n", ""),  # before HEAD
-            RunResult(0, "", ""),  # pull
-            RunResult(0, "abc123\n", ""),  # after HEAD (unchanged)
+            RunResult(0, "abc123\n", ""),  # HEAD
+            RunResult(0, "", ""),  # fetch ok
+            RunResult(0, "abc123\n", ""),  # origin/main (unchanged)
         ]
     )
 
     result = self_deploy(tmp_path, run_command=runner, dry_run=False)
 
     assert result.pulled is True
-    assert ["git", "pull", "--ff-only", "origin", "main"] in commands
+    assert ["git", "fetch", "origin", "main"] in commands
 
 
 def test_self_deploy_dry_run_marks_the_result_as_previewed(tmp_path: Path) -> None:

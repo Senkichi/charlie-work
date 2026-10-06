@@ -11,7 +11,7 @@ re-deriving an event an idempotent ``INSERT OR REPLACE``.
 
 from __future__ import annotations
 
-SCHEMA_VERSION = 7  # 7: issue_milestones (source, milestone) index; 6: <kind>_sweep expansion, dead-worker PR open; 5: batch rework PR scoping
+SCHEMA_VERSION = 8  # 8: pass_samples.parked_unready (issue #2314); 7: issue_milestones (source, milestone) index; 6: <kind>_sweep expansion, dead-worker PR open; 5: batch rework PR scoping
 FLEET_SOURCE = "fleet"
 
 _KEY = (
@@ -26,7 +26,7 @@ _FACT_TABLES: dict[str, str] = {
         "live_sessions INT, fleet_live_sessions INT, concurrency_limit INT,"
         " fleet_concurrency_limit INT, available_slots INT, dispatch_limit INT, clamped INT,"
         " deferred_by_concurrency INT, launched INT, open_total INT, dispatchable INT,"
-        " active_label INT, missing_ready INT, terminal_label INT,"
+        " active_label INT, missing_ready INT, parked_unready INT, terminal_label INT,"
         " blocked_by_open_dependency INT, operator_claimed INT"
     ),
     "review_samples": (

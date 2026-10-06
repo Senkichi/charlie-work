@@ -21,7 +21,6 @@ import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-import pytest
 
 from _fakes_github import FakeGitHub
 from _unescalate_fixtures import _events
@@ -33,6 +32,7 @@ from charlie_work.config import (
     WorkerRoleConfig,
 )
 from charlie_work.dispatch_selection import _windowed_blocked_environment_at
+from charlie_work.host.fakes import FakeWorkerLauncher
 from charlie_work.paths import runtime_paths
 from charlie_work.state import load_state, save_state, state_lock
 from charlie_work.workflow import OrchestratorApp
@@ -156,7 +156,7 @@ def test_unescalate_dry_run_reports_blocked_environment_reset_without_clearing(
 
 
 def test_unescalate_buys_fresh_rework_dispatch_after_blocked_environment_release(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, fake_host
 ) -> None:
     """After an operator release, the next ``rework_requested`` pass must
     attempt a dispatch instead of re-escalating on the stale count. This is
@@ -200,7 +200,7 @@ def test_unescalate_buys_fresh_rework_dispatch_after_blocked_environment_release
             for request in requests
         ]
 
-    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", fake_dispatch_sessions)
+    fake_host(worker_launch=FakeWorkerLauncher([fake_dispatch_sessions]))
 
     result = app.dispatch_rework()
 
@@ -217,7 +217,7 @@ def test_unescalate_buys_fresh_rework_dispatch_after_blocked_environment_release
 
 
 def test_positive_control_stale_blocked_environment_at_still_escalates_without_release(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, fake_host
 ) -> None:
     """Current behaviour preserved: an issue in ``rework_requested`` with
     ``max_auto_redispatch`` in-window ``blocked_environment_at`` timestamps
@@ -259,7 +259,7 @@ def test_positive_control_stale_blocked_environment_at_still_escalates_without_r
             for request in requests
         ]
 
-    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", fake_dispatch_sessions)
+    fake_host(worker_launch=FakeWorkerLauncher([fake_dispatch_sessions]))
 
     result = app.dispatch_rework()
 
