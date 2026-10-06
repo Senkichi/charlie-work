@@ -29,6 +29,7 @@ from charlie_work.checks import (
     workflow_run_terminal_by_id,
 )
 from charlie_work.ci_backlog import defer_infra_rerun_for_backlog, infra_rerun_backlog
+import charlie_work.infra_rerun_refusal as _refusal
 from charlie_work.janitor import (
     CarryForwardCheck,
     DiffContentSignature,
@@ -402,7 +403,14 @@ def _drive_infra_rerun_or_escalate(
     deferred_for_head: set[int] = set()
     head_key = str(head_sha or "")
     persisted_attempts = infra_rerun_attempts
+    # Issue #2445: run ids GitHub permanently refuses are never re-requested.
+    refused_for_head: set[int] = set()
+    newly_refused: set[int] = set()
     if rerun_run_ids:
+        if head_key:
+            refused_for_head = _refusal.load_refused_run_ids(
+                self.paths.state_file, pr_number, head_key
+            )
         # Issue #1936: run ids refused "already running" on an earlier
         # pass live in this head's ``infra_rerun_deferred`` set. They are
         # probed via ``workflow_runs_for_head`` -- still in progress means
@@ -427,6 +435,8 @@ def _drive_infra_rerun_or_escalate(
         attempt_run_ids: list[int] = []
         terminal_by_id: dict[int, bool] | None = None
         for run_id in rerun_run_ids:
+            if run_id in refused_for_head:
+                continue
             if run_id in deferred_for_head:
                 if terminal_by_id is None:
                     terminal_by_id = workflow_run_terminal_by_id(
@@ -468,6 +478,8 @@ def _drive_infra_rerun_or_escalate(
                     infra_rerun_errors.append(error)
                     if _wf._is_rerun_already_running_error(error):
                         newly_deferred.add(run_id)
+                    elif _refusal.is_permanent_rerun_refusal(error):
+                        newly_refused.add(run_id)
             elif isinstance(result, str):
                 # Dry-run returns a descriptive string; treat as success.
                 infra_triggered_run_ids.append(run_id)
@@ -482,7 +494,7 @@ def _drive_infra_rerun_or_escalate(
         # run's counter stays exactly where its last real dispatch left
         # it -- the attempt is spent only when `gh run rerun` is called.
         persisted_attempts = _unwind_skipped_rerun_attempts(
-            infra_rerun_attempts, head_key, still_deferred
+            infra_rerun_attempts, head_key, still_deferred | refused_for_head
         )
 
         if infra_triggered_run_ids and not infra_rerun_errors:
@@ -535,6 +547,7 @@ def _drive_infra_rerun_or_escalate(
                     "infra_rerun_deferred": (
                         {head_key: sorted(new_deferred)} if new_deferred else {}
                     ),
+                    **_refusal.refused_state_patch(head_key, refused_for_head | newly_refused),
                 }
                 state = self._record_event(
                     state,
@@ -544,11 +557,24 @@ def _drive_infra_rerun_or_escalate(
                         "run_ids": list(rerun_run_ids),
                         "errors": infra_rerun_errors,
                         "deferred_run_ids": sorted(newly_deferred),
+                        "refused_run_ids": sorted(newly_refused),
                     },
                 )
                 self.write_gate.save_state(state)
 
-    if escalate_exhausted and issue_number is not None and definitive_failed:
+    # Issue #2445: escalate once when a permanent refusal is all that is left.
+    refused_now = (refused_for_head | newly_refused) & set(rerun_run_ids)
+    refusal_escalate = bool(refused_now) and _refusal.refusal_is_sole_remaining_work(
+        self.paths.state_file,
+        pr_number,
+        dispatched=bool(infra_triggered_run_ids),
+        deferred=bool(still_deferred or newly_deferred),
+        errors=infra_rerun_errors,
+    )
+    if escalate_exhausted and issue_number is not None and (definitive_failed or refusal_escalate):
+        reason = (
+            "infra_rerun_cap_exceeded" if definitive_failed else _refusal.REFUSED_ESCALATION_REASON
+        )
         # Attempt cap exhausted (or no parseable run id at all): there is no
         # code-fix rework path for an infra failure, so escalate straight to
         # a human instead of looping forever on a PR that can never clear
@@ -560,7 +586,7 @@ def _drive_infra_rerun_or_escalate(
             state = _wf._escalate_issue(
                 state,
                 issue_number,
-                reason="infra_rerun_cap_exceeded",
+                reason=reason,
                 reason_class="mechanical",
                 pr_number=pr_number,
                 pr_extra={"infra_rerun_attempts": persisted_attempts},
@@ -572,6 +598,8 @@ def _drive_infra_rerun_or_escalate(
                     "pr_number": pr_number,
                     "issue_number": issue_number,
                     "checks": list(definitive_failed),
+                    "reason": reason,
+                    "refused_run_ids": sorted(refused_now),
                 },
             )
             self.write_gate.save_state(state)
@@ -590,7 +618,10 @@ def _drive_infra_rerun_or_escalate(
         return CommandResult(
             ok,
             f"PR #{pr_number} infra-failed check(s) exhausted rerun cap: "
-            + ", ".join(definitive_failed),
+            + ", ".join(definitive_failed)
+            if definitive_failed
+            else f"PR #{pr_number} infra rerun refused by GitHub for run(s) "
+            + ", ".join(str(r) for r in sorted(refused_now)),
             {
                 "pr": pr_number,
                 "issue": issue_number,
