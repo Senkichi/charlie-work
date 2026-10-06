@@ -138,7 +138,48 @@ def peek_runtime_state_dir(
     return state_dir if isinstance(state_dir, str) else layout.DEFAULT_STATE_DIR
 
 
+_AVIATOR_CONFIG = Path(".aviator") / "config.yml"
+_AVIATOR_WARNED: set[Path] = set()
+
+
+def warn_if_aviator_config_missing(config: OrchestratorConfig, repo_root: Path) -> bool:
+    """Warn (once per repo per process) when ``mergequeue_label`` is set but the repo has no
+    ``.aviator/config.yml`` (#2441): the hand-off labels PRs for a queue that has no rules
+    to merge them, so they sit labelled forever. Returns True when it warned.
+    """
+    label = config.auto_merge.mergequeue_label
+    if not label or (repo_root / _AVIATOR_CONFIG).is_file():
+        return False
+    key = repo_root.resolve()
+    if key in _AVIATOR_WARNED:
+        return False
+    _AVIATOR_WARNED.add(key)
+    logger.warning(
+        "auto_merge.mergequeue_label=%r is set but %s has no %s; PRs handed to the merge "
+        "queue will not be merged until that file exists",
+        label,
+        repo_root,
+        _AVIATOR_CONFIG.as_posix(),
+    )
+    return True
+
+
 def load_layered_config(
+    repo_root: Path,
+    explicit: Path | None = None,
+    *,
+    fleet_dir_override: str | None = None,
+    require_global: bool = False,
+) -> OrchestratorConfig:
+    """``_load_layered_config`` plus the missing-``.aviator/config.yml`` warning (#2441)."""
+    config = _load_layered_config(
+        repo_root, explicit, fleet_dir_override=fleet_dir_override, require_global=require_global
+    )
+    warn_if_aviator_config_missing(config, repo_root)
+    return config
+
+
+def _load_layered_config(
     repo_root: Path,
     explicit: Path | None = None,
     *,

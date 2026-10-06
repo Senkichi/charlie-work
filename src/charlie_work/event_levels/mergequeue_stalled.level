@@ -1,0 +1,6 @@
+warning
+# Issue #2441: a PR has carried the merge-queue label for more than 2h without
+# merging. Warning, not error: the queue may simply be deep, and nothing is lost
+# -- the #1401 wedge watchdog escalates at 24h. Emitted once per queue episode
+# (``prs[n].mergequeue_since``). Consumed by ``scripts/heartbeat_event_alarms.py``
+# (``check_mergequeue_stalled``, WARN).
