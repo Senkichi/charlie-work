@@ -18,8 +18,9 @@ from typing import TYPE_CHECKING
 
 from .. import layout
 from ..github_transport.gh_adapter import GhAdapter
-from ..github_transport.guarded import Adapters, GuardedTransport
+from ..github_transport.guarded import Adapters, GuardedTransport, RateBudgetHolder
 from ..github_transport.http_adapter import HttpAdapter
+from ..github_transport.shared_budget import SharedBudgetFile
 from . import http_cache
 from .circuit_breaker_transport import circuit_breaker_state_path
 
@@ -103,8 +104,16 @@ def build_guarded_transport(gh: "GitHub") -> GuardedTransport:
         check = gh._pass_deadline_exceeded
         return bool(check is not None and check())
 
+    # Issue #2442: one observed budget per token across every client and
+    # process on this host, unless the governor's kill switch is off.
+    shared = (
+        SharedBudgetFile(layout.github_budget_path())
+        if getattr(runtime, "github_budget_governor", True)
+        else None
+    )
     return GuardedTransport(
         adapters,
+        budget=RateBudgetHolder(shared=shared),
         runtime=runtime,  # type: ignore[arg-type]
         dry_run=gh.dry_run,
         breaker=_LiveBreaker(gh),

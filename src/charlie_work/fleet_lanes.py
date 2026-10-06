@@ -30,6 +30,7 @@ from .local_issues import github_client_for
 from .pass_deadline import PassDeadlineExceeded, set_pass_deadline_exceeded
 from .paths import runtime_paths
 from .command_result import CommandResult
+from .budget_gates import budget_deferral
 from .workflow import OrchestratorApp
 
 logger = logging.getLogger(__name__)
@@ -136,6 +137,12 @@ def _run_fleet_repo_lane(
 
         if work_only:
             # Dispatch-only path (worker dispatch + optional review dispatch)
+            if budget_deferral(app, "dispatch") is not None:
+                return CommandResult(
+                    True,
+                    "work-only dispatch deferred: GitHub budget below reserve",
+                    {"budget_deferred": True},
+                )
             result = app.dispatch(0 if drain else limit)
             if config.review_dispatch.enabled:
                 # Issue #1948: yield-point check between the work lane's two

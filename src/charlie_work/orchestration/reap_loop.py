@@ -49,6 +49,7 @@ from charlie_work.pass_deadline import (
     PassDeadlineExceeded,
     run_deadline_guarded_maintenance,
 )
+from charlie_work.budget_gates import budget_gate_for
 from charlie_work.review_decision import review_decision
 
 
@@ -86,7 +87,7 @@ def _loop_body(
     # raising PassDeadlineExceeded). The full wiring policy -- what is
     # guarded, what stays unconditional, and the deferred-marking rule --
     # lives in charlie_work.pass_deadline's module docstring.
-    deadline = PassDeadline(deadline_exceeded, CommandResult)
+    deadline = PassDeadline(deadline_exceeded, CommandResult, budget_gate=budget_gate_for(self))
     early = deadline.preflight("loop pass deferred: in-pass deadline already reached")
     if early is not None:
         return early

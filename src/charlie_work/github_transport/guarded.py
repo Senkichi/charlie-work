@@ -55,6 +55,12 @@ from .failure_markers import is_pre_connection_text, is_transport_class_text
 from .gh_adapter import render_argv
 from .outcome import FailureKind, Outcome, Response, TransportFailure, render_legacy_error
 from .request import CliCommand, CliRequest, Request, RestRequest
+from .shared_budget import (
+    DEFAULT_TOKEN_KEY,
+    SharedBudgetFile,
+    merge_github_rate,
+    token_fingerprint,
+)
 from .token_hygiene import is_well_formed, redact
 
 logger = logging.getLogger(__name__)
@@ -67,6 +73,8 @@ _DEFAULT_RETRY_BASE_SECONDS = 1.0
 _DEFAULT_TIMEOUT_SECONDS = 30.0
 _DEFAULT_LONG_CALL_TIMEOUT_SECONDS = 120.0
 _RETRYABLE_STATUSES = frozenset({429, 502, 503, 504})
+_DEFAULT_PRIMARY_LIMIT_MAX_WAIT_SECONDS = 30.0
+_PRIMARY_LIMIT_RESET_MARGIN_SECONDS = 1.0
 _DETAIL_LIMIT = 300
 
 FALLBACK_KINDS = frozenset(
@@ -177,16 +185,32 @@ class RateBudgetHolder:
     capability, measured from ``x-ratelimit-used`` deltas (issue #2439). The
     budget governor (#2442) reads both through this surface."""
 
-    def __init__(self, cursor: UsedCursor | None = None) -> None:
+    def __init__(
+        self, cursor: UsedCursor | None = None, shared: SharedBudgetFile | None = None
+    ) -> None:
         self._lock = threading.Lock()
         self._value = GitHubRateBudget()
         self._spend = GitHubSpend()
         self._cursor = cursor if cursor is not None else PROCESS_USED_CURSOR
+        self._shared = shared
+        self._token_key = DEFAULT_TOKEN_KEY
 
     @property
     def value(self) -> GitHubRateBudget:
+        """What this process observed, merged (newest wins) with what other
+        clients and processes on the same token published (#2442)."""
         with self._lock:
-            return self._value
+            local, shared, key = self._value, self._shared, self._token_key
+        return local if shared is None else merge_github_rate(local, shared.read(key))
+
+    @property
+    def shared_enabled(self) -> bool:
+        return self._shared is not None
+
+    def bind_token(self, token: str | None) -> None:
+        """Key the shared snapshot by *token*'s fingerprint (never the token)."""
+        with self._lock:
+            self._token_key = token_fingerprint(token)
 
     @property
     def spend(self) -> GitHubSpend:
@@ -205,6 +229,9 @@ class RateBudgetHolder:
                 points=points,
                 metered=sample.used is not None and sample.reset_epoch is not None,
             )
+            local, shared, key = self._value, self._shared, self._token_key
+        if shared is not None:
+            shared.publish(key, local)
 
     def take_spend(self) -> GitHubSpend:
         """The spend since the previous take, resetting it to empty (a pass
@@ -305,6 +332,7 @@ class GuardedTransport:
         self._now = now
         self._token: str | None = None
         self._token_lock = threading.Lock()
+        self._token_key_tried = False
         self._breaker_lock = threading.Lock()
 
     # -- config (read live, like the legacy per-call knob reads) -------------
@@ -331,9 +359,40 @@ class GuardedTransport:
             return rt.gh_long_call_timeout_seconds if rt else _DEFAULT_LONG_CALL_TIMEOUT_SECONDS
         return self._runtime.gh_timeout_seconds if self._runtime else _DEFAULT_TIMEOUT_SECONDS
 
+    def governor_enabled(self) -> bool:
+        """The budget governor's kill switch (``runtime.github_budget_governor``)."""
+        return bool(getattr(self._runtime, "github_budget_governor", True))
+
+    def _primary_limit_wait(self, reset: int) -> float | None:
+        """Seconds to sleep until a primary limit resets at *reset*, or ``None``
+        to give the limited response back now (waiting would exceed the bound)."""
+        bound = getattr(
+            self._runtime,
+            "gh_primary_limit_max_wait_seconds",
+            _DEFAULT_PRIMARY_LIMIT_MAX_WAIT_SECONDS,
+        )
+        delay = max(0.0, reset - self._now()) + _PRIMARY_LIMIT_RESET_MARGIN_SECONDS
+        return delay if delay <= bound else None
+
+    def rate_window(self, resource: str) -> GitHubRateWindow | None:
+        """The live (not yet reset) window for *resource*, shared across clients
+        and processes, whatever its age: ``remaining`` only falls inside a
+        window, so an older reading is an upper bound for the governor."""
+        self._ensure_budget_key()
+        return github_headroom(self.budget.value, resource, self._now())
+
+    def _ensure_budget_key(self) -> None:
+        """Resolve the token once so a fresh client reads its token's shared
+        snapshot before it has sent anything (the governor asks first)."""
+        if self._token_key_tried or not self.budget.shared_enabled or self._kill_switch():
+            return
+        self._token_key_tried = True
+        self._token_or_resolve()
+
     def fresh_rate_window(self, resource: str, max_age_seconds: float) -> GitHubRateWindow | None:
         """The observed window for *resource* if seen within *max_age_seconds*
         and not yet reset (B15), else ``None``: the caller must ask GitHub."""
+        self._ensure_budget_key()
         now = self._now()
         window = github_headroom(self.budget.value, resource, now)
         if window is None or now - window.observed_epoch > max_age_seconds:
@@ -373,6 +432,7 @@ class GuardedTransport:
                 return TransportFailure(FailureKind.CIRCUIT_OPEN, detail, "guard")
         max_retries = self._max_retries()
         outcome: Outcome | None = None
+        waited_for_reset = False
         for attempt in range(max_retries + 1):
             raise_if_pass_deadline_spent(self._exceeded, command)
             outcome = self._attempt(request)
@@ -381,13 +441,39 @@ class GuardedTransport:
             if isinstance(outcome, Response) and not isinstance(request, CliRequest):
                 capability = resolve_capability(request)
                 self.budget.observe(outcome, self._now(), capability)
-                if _is_primary_rate_limited(outcome):
+                primary_limited = _is_primary_rate_limited(outcome)
+                if primary_limited:
                     self._emit_rate_limited(request, outcome, capability)
+            else:
+                primary_limited = False
             if attempt >= max_retries or not is_retryable(
                 outcome, is_mutation=request.is_mutation
             ):
                 break
             raise_if_pass_deadline_spent(self._exceeded, command)
+            reset = (
+                sample_github_rate(outcome.headers).reset_epoch
+                if primary_limited and isinstance(outcome, Response)
+                else None
+            )
+            if reset is not None and self.governor_enabled():
+                # The hourly quota is spent and its reset is known: 1s/2s/4s
+                # retries cannot succeed before it and only hammer GitHub
+                # (#2442). Wait for the reset once, or give the limited
+                # response back (defer). Without a reset time (a GraphQL
+                # RATE_LIMITED reply with no headers) the window is unknown,
+                # so the plain backoff below still applies.
+                wait = None if waited_for_reset else self._primary_limit_wait(reset)
+                if wait is None:
+                    break
+                waited_for_reset = True
+                logger.warning(
+                    "GitHub primary rate limit on %s; waiting %.0fs for the reset",
+                    request.describe(),
+                    wait,
+                )
+                self._sleep(wait)
+                continue
             delay = self._retry_base() * (2**attempt)
             wait = max(
                 0.0, delay + self._jitter(-_JITTER_FRACTION * delay, _JITTER_FRACTION * delay)
@@ -461,7 +547,9 @@ class GuardedTransport:
             token = ""
         with self._token_lock:
             self._token = token or None
-            return self._token
+            resolved = self._token
+        self.budget.bind_token(resolved)
+        return resolved
 
     # -- side effects --------------------------------------------------------
 
