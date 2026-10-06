@@ -26,9 +26,9 @@ from typing import Any
 from urllib.parse import parse_qs
 
 from .config import DashboardConfig
-from .history_data import HistoryCache, history_cache, pick_range, pick_tab
+from .history_data import TAB_KEYS, HistoryCache, history_cache, pick_range, pick_tab
 from .now_progress_data import ProgressCache
-from .pages.history import render_history
+from .pages.history import render_history, render_region
 from .pages.now import render_fragment, render_now
 from .read_model import (
     Clock,
@@ -214,7 +214,9 @@ class _Handler(SecureHandler):
                 )
             )
         elif path == "/history":
-            self._history(parse_qs(query), state)
+            self._history(parse_qs(query), state, fragment=False)
+        elif path == "/history/fragment":
+            self._history(parse_qs(query), state, fragment=True)
         elif path == "/now/fragment":
             self._html(
                 render_fragment(
@@ -260,13 +262,23 @@ class _Handler(SecureHandler):
 
     do_HEAD = do_GET  # noqa: N815 - same routes, no body (see ``_send``)
 
-    def _history(self, params: dict[str, list[str]], state: ModelState) -> None:
+    def _history(self, params: dict[str, list[str]], state: ModelState, *, fragment: bool) -> None:
+        """One range, every tab (the tab dots need all four), each from the cache."""
         tab = pick_tab((params.get("tab") or [None])[0])
         range_key = pick_range((params.get("range") or [None])[0])
-        # the same registry the /repo drill admits, so a panel link never 404s
+        # the same registry the /repo drill admits, so a drawer link never 404s
         known = frozenset(f.repo for f in state.model.freshness) if state.model else frozenset()
-        view = self.app.history.get(tab, range_key)
-        self._html(render_history(view, tab, range_key, known_repos=known))
+        results = {key: self.app.history.get(key, range_key) for key in TAB_KEYS}
+        render = render_region if fragment else render_history
+        self._html(
+            render(
+                results,
+                range_key,
+                tab,
+                known_repos=known,
+                refresh_seconds=int(self.app.config.rollup_interval_seconds),
+            )
+        )
 
     def _drill(self, path: str, query: str, state: ModelState) -> tuple[int, str] | None:
         src = self.app.sources
