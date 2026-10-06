@@ -129,6 +129,7 @@ class _Bed:
 
     def die(
         self,
+        monkeypatch,
         *,
         stamped_kind: str | None = None,
         log_text: str | None = None,
@@ -189,7 +190,7 @@ class _Bed:
                 json.dumps(record),
                 encoding="utf-8",
             )
-        _run_orphan_sweep(self.tmp_path, self.paths, self.config, self.gh)
+        _run_orphan_sweep(self.tmp_path, self.paths, self.config, self.gh, monkeypatch=monkeypatch)
         # The provider window expires before the next wave.
         with state_lock(self.paths.state_file):
             state = load_state(self.paths.state_file)
@@ -213,7 +214,7 @@ def test_exempt_kinds_derive_from_the_restricting_ledger_kinds() -> None:
 
 @pytest.mark.parametrize("kind", sorted(RESTRICTING_FAILURE_KINDS))
 def test_three_consecutive_throttle_rework_deaths_do_not_escalate(
-    tmp_path: Path, kind: str
+    tmp_path: Path, kind: str, monkeypatch
 ) -> None:
     """(a) Three provider-throttle rework deaths in a row, with a cap of 2, never
     escalate. Each death refunds its own dispatch stamp, so the redispatch
@@ -222,7 +223,7 @@ def test_three_consecutive_throttle_rework_deaths_do_not_escalate(
     for wave in range(1, 4):
         bed.assert_dispatched_not_escalated(bed.dispatch(), wave)
         assert len(bed.entry().get("redispatch_at", [])) == 1, wave
-        bed.die(stamped_kind=kind)
+        bed.die(monkeypatch, stamped_kind=kind)
         entry = bed.entry()
         assert entry.get("status") == "rework_requested", wave
         assert entry.get("redispatch_at") == [], wave
@@ -242,6 +243,7 @@ def test_three_consecutive_throttle_rework_deaths_do_not_escalate(
 
 def test_unclassified_death_with_free_model_rate_limit_log_is_exempted(
     tmp_path: Path,
+    monkeypatch,
 ) -> None:
     """(b) No lane stamped a kind. The captured log ends in the verbatim Devin
     free-model notice. The sweep classifies the log before the cap decision, and
@@ -250,7 +252,7 @@ def test_unclassified_death_with_free_model_rate_limit_log_is_exempted(
     for wave in range(1, 4):
         bed.assert_dispatched_not_escalated(bed.dispatch(), wave)
         assert "dead_worker_failure_kind" not in bed.entry()
-        bed.die(log_text=FREE_MODEL_RATE_LIMIT_LINE)
+        bed.die(monkeypatch, log_text=FREE_MODEL_RATE_LIMIT_LINE)
         entry = bed.entry()
         assert entry.get("status") == "rework_requested", wave
         assert entry.get("dead_worker_failure_kind") == "rate_limited", wave
@@ -269,13 +271,13 @@ def test_unclassified_death_with_free_model_rate_limit_log_is_exempted(
     }
 
 
-def test_genuine_no_op_rework_still_escalates(tmp_path: Path) -> None:
+def test_genuine_no_op_rework_still_escalates(tmp_path: Path, monkeypatch) -> None:
     """(c) Positive control: the session ran, exited 0, and pushed nothing. That
     is a real no-op. It is not exempted, its dispatch stamp stays counted, and
     the issue escalates."""
     bed = _Bed(tmp_path)
     bed.assert_dispatched_not_escalated(bed.dispatch(), 1)
-    bed.die(log_text="worked on it, nothing to change", exit_code=0)
+    bed.die(monkeypatch, log_text="worked on it, nothing to change", exit_code=0)
 
     entry = bed.entry()
     assert entry.get("status") == "escalated"
@@ -284,7 +286,7 @@ def test_genuine_no_op_rework_still_escalates(tmp_path: Path) -> None:
     assert bed.events(EXEMPTION_EVENT_KIND) == []
 
 
-def test_clean_exit_rate_limit_death_is_exempted_not_a_no_op(tmp_path: Path) -> None:
+def test_clean_exit_rate_limit_death_is_exempted_not_a_no_op(tmp_path: Path, monkeypatch) -> None:
     """(d) Issue #2286: an exit-0 rework session whose captured log ENDS in the
     verbatim provider free-model rate-limit error is a throttle death, not a
     no-op attempt. Three such waves restore ``rework_requested`` every time,
@@ -294,7 +296,7 @@ def test_clean_exit_rate_limit_death_is_exempted_not_a_no_op(tmp_path: Path) -> 
     for wave in range(1, 4):
         bed.assert_dispatched_not_escalated(bed.dispatch(), wave)
         assert "dead_worker_failure_kind" not in bed.entry()
-        bed.die(log_text=FREE_MODEL_RATE_LIMIT_LINE, exit_code=0)
+        bed.die(monkeypatch, log_text=FREE_MODEL_RATE_LIMIT_LINE, exit_code=0)
         entry = bed.entry()
         assert entry.get("status") == "rework_requested", wave
         assert entry.get("dead_worker_failure_kind") == "rate_limited", wave
@@ -317,6 +319,7 @@ def test_clean_exit_rate_limit_death_is_exempted_not_a_no_op(tmp_path: Path) -> 
 
 def test_clean_exit_throttle_arm_stamps_the_window_with_the_dead_role(
     tmp_path: Path,
+    monkeypatch,
 ) -> None:
     """Issue #2279: the #2286 clean-exit exemption lane arms the per-repo
     throttle window through ``persist_failure`` like every other lane, so the
@@ -325,6 +328,7 @@ def test_clean_exit_throttle_arm_stamps_the_window_with_the_dead_role(
     bed = _Bed(tmp_path)
     bed.assert_dispatched_not_escalated(bed.dispatch(), 1)
     bed.die(
+        monkeypatch,
         log_text=FREE_MODEL_RATE_LIMIT_LINE,
         exit_code=0,
         role_stamp=session_stamp("worker", "devin-shell", "swe-2-high", 0),
@@ -336,6 +340,7 @@ def test_clean_exit_throttle_arm_stamps_the_window_with_the_dead_role(
 
 def test_clean_exit_proven_complete_with_rate_limit_log_is_not_exempted(
     tmp_path: Path,
+    monkeypatch,
 ) -> None:
     """(e) Issue #656 control: this pid's terminal record proves completion
     (exit 0 WITH a worker outcome), so a transcript ending in the rate-limit
@@ -344,6 +349,7 @@ def test_clean_exit_proven_complete_with_rate_limit_log_is_not_exempted(
     bed = _Bed(tmp_path)
     bed.assert_dispatched_not_escalated(bed.dispatch(), 1)
     bed.die(
+        monkeypatch,
         log_text=FREE_MODEL_RATE_LIMIT_LINE,
         exit_code=0,
         worker_outcome={"status": "completed", "head_sha": HEAD},
@@ -358,6 +364,7 @@ def test_clean_exit_proven_complete_with_rate_limit_log_is_not_exempted(
 
 def test_clean_exit_with_earlier_rate_limit_mention_is_not_exempted(
     tmp_path: Path,
+    monkeypatch,
 ) -> None:
     """(f) Only the TERMINAL lines may carry the signature. A transcript that
     mentions the rate limit earlier but ends in ordinary output is a genuine
@@ -370,7 +377,7 @@ def test_clean_exit_with_earlier_rate_limit_mention_is_not_exempted(
         "the retry succeeded\nfinished reviewing the diff\nran the tests\n"
         "wrote the summary\nall done, nothing left to change"
     )
-    bed.die(log_text=mid_log, exit_code=0)
+    bed.die(monkeypatch, log_text=mid_log, exit_code=0)
 
     entry = bed.entry()
     assert entry.get("status") == "escalated"
@@ -379,7 +386,7 @@ def test_clean_exit_with_earlier_rate_limit_mention_is_not_exempted(
     assert bed.events(EXEMPTION_EVENT_KIND) == []
 
 
-def test_non_throttle_rework_deaths_still_escalate_at_the_cap(tmp_path: Path) -> None:
+def test_non_throttle_rework_deaths_still_escalate_at_the_cap(tmp_path: Path, monkeypatch) -> None:
     """(c) Positive control at the cap: the same three waves with an ordinary
     crash are counted and escalate. This proves the harness can escalate, and
     that only throttle kinds are exempted."""
@@ -392,7 +399,7 @@ def test_non_throttle_rework_deaths_still_escalate_at_the_cap(tmp_path: Path) ->
         ):
             escalated_at = wave
             break
-        bed.die(log_text="Traceback (most recent call last): boom")
+        bed.die(monkeypatch, log_text="Traceback (most recent call last): boom")
         assert bed.entry().get("worker_death_at"), wave
 
     assert escalated_at is not None and escalated_at <= CAP + 1
@@ -462,7 +469,7 @@ def test_dead_session_restore_lane_refunds_and_flags_the_pr(tmp_path: Path) -> N
     ids=["no_log", "non_throttle_log"],
 )
 def test_clean_exit_stamped_throttle_is_exempted_without_terminal_signature(
-    tmp_path: Path, log_text: str | None
+    tmp_path: Path, log_text: str | None, monkeypatch
 ) -> None:
     """(g) Issue #2286, stamp-first resolution: the dead-session lane often
     classifies and stamps ``dead_worker_failure_kind`` before the orphan sweep
@@ -475,7 +482,7 @@ def test_clean_exit_stamped_throttle_is_exempted_without_terminal_signature(
     bed = _Bed(tmp_path)
     bed.assert_dispatched_not_escalated(bed.dispatch(), 1)
     assert len(bed.entry()["redispatch_at"]) == 1
-    bed.die(stamped_kind="rate_limited", log_text=log_text, exit_code=0)
+    bed.die(monkeypatch, stamped_kind="rate_limited", log_text=log_text, exit_code=0)
 
     entry = bed.entry()
     assert entry.get("status") == "rework_requested"
@@ -499,7 +506,9 @@ def test_clean_exit_stamped_throttle_is_exempted_without_terminal_signature(
 
 
 @pytest.mark.parametrize("kind", ["provider_suspended", "permission_denied"])
-def test_clean_exit_stamped_non_throttle_still_counts_as_no_op(tmp_path: Path, kind: str) -> None:
+def test_clean_exit_stamped_non_throttle_still_counts_as_no_op(
+    tmp_path: Path, kind: str, monkeypatch
+) -> None:
     """(h) Negative companion to (g): the stamp-first branch resolves the kind,
     but the exemption itself still gates on ``PROVIDER_THROTTLE_EXEMPT_KINDS``.
     A clean exit stamped with a non-throttle kind -- ``provider_suspended``
@@ -509,7 +518,7 @@ def test_clean_exit_stamped_non_throttle_still_counts_as_no_op(tmp_path: Path, k
     real no-op."""
     bed = _Bed(tmp_path)
     bed.assert_dispatched_not_escalated(bed.dispatch(), 1)
-    bed.die(stamped_kind=kind, exit_code=0)
+    bed.die(monkeypatch, stamped_kind=kind, exit_code=0)
 
     entry = bed.entry()
     assert entry.get("status") == "escalated"

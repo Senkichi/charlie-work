@@ -986,7 +986,7 @@ def test_dispatch_rework_jc1320_timeline_no_op_reset_avoids_false_escalation(
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
 
-    with host_probe(alive=False):
+    with host_probe(monkeypatch, alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         _detect_and_handle_orphaned_workers(

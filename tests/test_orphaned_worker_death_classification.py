@@ -74,7 +74,7 @@ def _write_devin_sidecar(
     return sidecar_path
 
 
-def test_rate_limited_rework_death_classified_not_credited(tmp_path: Path) -> None:
+def test_rate_limited_rework_death_classified_not_credited(tmp_path: Path, monkeypatch) -> None:
     """AC1: a rate-limited rework death reaching the sweep in the same pass
     its sidecar log could be classified does NOT append ``worker_death_at``.
 
@@ -93,7 +93,7 @@ def test_rate_limited_rework_death_classified_not_credited(tmp_path: Path) -> No
     )
     sidecar_path = _write_devin_sidecar(sessions_dir, 207, pid=99999, log_path=log_path)
 
-    _run_orphan_sweep(tmp_path, paths, config, fake_gh)
+    _run_orphan_sweep(tmp_path, paths, config, fake_gh, monkeypatch=monkeypatch)
 
     state = load_state(paths.state_file)
     entry = state["issues"]["207"]
@@ -158,7 +158,7 @@ def test_resolve_persists_via_primitive_and_keeps_the_locked_entry_live(tmp_path
     close_db(tmp_path / "state.json")
 
 
-def test_unclassified_death_credited_and_records_null_kind(tmp_path: Path) -> None:
+def test_unclassified_death_credited_and_records_null_kind(tmp_path: Path, monkeypatch) -> None:
     """AC2 (unclassified arm): a death whose log shows no classification
     signature is still credited -- and the credit records its (null) kind."""
     config, paths, fake_gh, _dispatched_at = _dead_worker_rework_bed(tmp_path)
@@ -170,7 +170,7 @@ def test_unclassified_death_credited_and_records_null_kind(tmp_path: Path) -> No
     )
     _write_devin_sidecar(sessions_dir, 207, pid=99999, log_path=log_path)
 
-    _run_orphan_sweep(tmp_path, paths, config, fake_gh)
+    _run_orphan_sweep(tmp_path, paths, config, fake_gh, monkeypatch=monkeypatch)
 
     state = load_state(paths.state_file)
     entry = state["issues"]["207"]
@@ -182,7 +182,7 @@ def test_unclassified_death_credited_and_records_null_kind(tmp_path: Path) -> No
     assert not state.get("throttled_until")
 
 
-def test_stamped_death_credited_and_records_kind(tmp_path: Path) -> None:
+def test_stamped_death_credited_and_records_kind(tmp_path: Path, monkeypatch) -> None:
     """AC2 (stamped arm): a death already stamped by another lane is
     credited (non-throttle kind) and the stamp is recorded alongside the
     timestamp so the attribution survives an unescalate."""
@@ -193,7 +193,7 @@ def test_stamped_death_credited_and_records_kind(tmp_path: Path) -> None:
     # No sidecar for this worker -- the epoch stamp alone must suffice.
     _sessions_dir(tmp_path)
 
-    _run_orphan_sweep(tmp_path, paths, config, fake_gh)
+    _run_orphan_sweep(tmp_path, paths, config, fake_gh, monkeypatch=monkeypatch)
 
     state = load_state(paths.state_file)
     entry = state["issues"]["207"]
@@ -248,7 +248,9 @@ def _events(state: dict[str, Any], kind: str) -> list[dict[str, Any]]:
 # --- approved-rework restore site (real sweep) ---------------------------
 
 
-def test_approved_rework_restore_rate_limited_death_not_credited(tmp_path: Path) -> None:
+def test_approved_rework_restore_rate_limited_death_not_credited(
+    tmp_path: Path, monkeypatch
+) -> None:
     config, paths, fake_gh, _ = _dead_worker_rework_bed(
         tmp_path, decision="approved", pr_state_status="rework_requested"
     )
@@ -257,7 +259,7 @@ def test_approved_rework_restore_rate_limited_death_not_credited(tmp_path: Path)
     log_path.write_text("applying\nReached free model rate limit\n", encoding="utf-8")
     _write_devin_sidecar(sessions_dir, 207, pid=99999, log_path=log_path)
 
-    _run_orphan_sweep(tmp_path, paths, config, fake_gh)
+    _run_orphan_sweep(tmp_path, paths, config, fake_gh, monkeypatch=monkeypatch)
 
     state = load_state(paths.state_file)
     entry = state["issues"]["207"]
@@ -272,7 +274,7 @@ def test_approved_rework_restore_rate_limited_death_not_credited(tmp_path: Path)
 
 
 def test_approved_rework_restore_unclassified_death_credited_with_null_kind(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     config, paths, fake_gh, _ = _dead_worker_rework_bed(
         tmp_path, decision="approved", pr_state_status="rework_requested"
@@ -282,7 +284,7 @@ def test_approved_rework_restore_unclassified_death_credited_with_null_kind(
     log_path.write_text("applying\nTraceback: boom\n", encoding="utf-8")
     _write_devin_sidecar(sessions_dir, 207, pid=99999, log_path=log_path)
 
-    _run_orphan_sweep(tmp_path, paths, config, fake_gh)
+    _run_orphan_sweep(tmp_path, paths, config, fake_gh, monkeypatch=monkeypatch)
 
     state = load_state(paths.state_file)
     entry = state["issues"]["207"]
@@ -323,7 +325,7 @@ def _unreviewed_pr_bed(tmp_path: Path) -> tuple[Any, Any, Any]:
 
 
 def test_unreviewed_pr_clean_exit_worker_quoting_rate_limit_is_not_log_classified(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     """#656 false-positive class: a clean-exit worker that opened a PR and whose
     final prose quotes ``rate limit`` must not arm a fleet throttle, stamp the
@@ -351,7 +353,7 @@ def test_unreviewed_pr_clean_exit_worker_quoting_rate_limit_is_not_log_classifie
         encoding="utf-8",
     )
 
-    _run_orphan_sweep(tmp_path, paths, config, fake_gh)
+    _run_orphan_sweep(tmp_path, paths, config, fake_gh, monkeypatch=monkeypatch)
 
     state = load_state(paths.state_file)
     entry = state["issues"]["207"]
@@ -367,14 +369,14 @@ def test_unreviewed_pr_clean_exit_worker_quoting_rate_limit_is_not_log_classifie
     assert event["payload"]["failure_kind"] is None
 
 
-def test_unreviewed_pr_advance_honors_existing_throttle_stamp(tmp_path: Path) -> None:
+def test_unreviewed_pr_advance_honors_existing_throttle_stamp(tmp_path: Path, monkeypatch) -> None:
     config, paths, fake_gh = _unreviewed_pr_bed(tmp_path)
     state = load_state(paths.state_file)
     state["issues"]["207"]["dead_worker_failure_kind"] = "rate_limited"
     save_state(paths.state_file, state)
     _sessions_dir(tmp_path)
 
-    _run_orphan_sweep(tmp_path, paths, config, fake_gh)
+    _run_orphan_sweep(tmp_path, paths, config, fake_gh, monkeypatch=monkeypatch)
 
     state = load_state(paths.state_file)
     entry = state["issues"]["207"]
@@ -384,14 +386,14 @@ def test_unreviewed_pr_advance_honors_existing_throttle_stamp(tmp_path: Path) ->
     assert event["payload"]["failure_kind"] == "rate_limited"
 
 
-def test_unreviewed_pr_advance_credits_stamped_kind(tmp_path: Path) -> None:
+def test_unreviewed_pr_advance_credits_stamped_kind(tmp_path: Path, monkeypatch) -> None:
     config, paths, fake_gh = _unreviewed_pr_bed(tmp_path)
     state = load_state(paths.state_file)
     state["issues"]["207"]["dead_worker_failure_kind"] = "stalled"
     save_state(paths.state_file, state)
     _sessions_dir(tmp_path)
 
-    _run_orphan_sweep(tmp_path, paths, config, fake_gh)
+    _run_orphan_sweep(tmp_path, paths, config, fake_gh, monkeypatch=monkeypatch)
 
     entry = load_state(paths.state_file)["issues"]["207"]
     death_at = entry["worker_death_at"]
@@ -402,7 +404,9 @@ def test_unreviewed_pr_advance_credits_stamped_kind(tmp_path: Path) -> None:
 # --- adapter branches -----------------------------------------------------
 
 
-def _run_claude_family_case(tmp_path: Path, adapter_kind: str, log_text: str) -> tuple[Any, Path]:
+def _run_claude_family_case(
+    tmp_path: Path, adapter_kind: str, log_text: str, monkeypatch
+) -> tuple[Any, Path]:
     config, paths, fake_gh, _ = _dead_worker_rework_bed(tmp_path)
     sessions_dir = _sessions_dir(tmp_path)
     log_path = sessions_dir / "issue-207-rework.claude.log"
@@ -410,16 +414,19 @@ def _run_claude_family_case(tmp_path: Path, adapter_kind: str, log_text: str) ->
     sidecar_path = _write_claude_sidecar(
         sessions_dir, 207, adapter_kind=adapter_kind, pid=99999, log_path=log_path
     )
-    _run_orphan_sweep(tmp_path, paths, config, fake_gh)
+    _run_orphan_sweep(tmp_path, paths, config, fake_gh, monkeypatch=monkeypatch)
     return load_state(paths.state_file), sidecar_path
 
 
 @pytest.mark.parametrize("adapter_kind", ["claude-code", "api"])
 def test_claude_family_adapter_rate_limited_death_not_credited(
-    tmp_path: Path, adapter_kind: str
+    tmp_path: Path, adapter_kind: str, monkeypatch
 ) -> None:
     state, sidecar_path = _run_claude_family_case(
-        tmp_path, adapter_kind, "working\nAPI Error: 429 rate limit exceeded\n"
+        tmp_path,
+        adapter_kind,
+        "working\nAPI Error: 429 rate limit exceeded\n",
+        monkeypatch=monkeypatch,
     )
     entry = state["issues"]["207"]
     assert entry["dead_worker_failure_kind"] == "rate_limited"
@@ -430,9 +437,11 @@ def test_claude_family_adapter_rate_limited_death_not_credited(
 
 @pytest.mark.parametrize("adapter_kind", ["claude-code", "api"])
 def test_claude_family_adapter_unclassified_death_credited(
-    tmp_path: Path, adapter_kind: str
+    tmp_path: Path, adapter_kind: str, monkeypatch
 ) -> None:
-    state, _ = _run_claude_family_case(tmp_path, adapter_kind, "working\nTraceback: boom\n")
+    state, _ = _run_claude_family_case(
+        tmp_path, adapter_kind, "working\nTraceback: boom\n", monkeypatch=monkeypatch
+    )
     entry = state["issues"]["207"]
     death_at = entry["worker_death_at"]
     assert len(death_at) == 1
@@ -470,7 +479,7 @@ def test_worker_view_for_entry_multiple_sidecars_returns_none(tmp_path: Path) ->
 
 @pytest.mark.parametrize("case", ["pid_mismatch", "multiple_sidecars"])
 def test_sweep_falls_back_to_unclassified_credit_when_sidecar_unmatchable(
-    tmp_path: Path, case: str
+    tmp_path: Path, case: str, monkeypatch
 ) -> None:
     """Through the real sweep: an unmatchable sidecar set means the rate-limit
     log is never read, so the death is credited (unclassified), no throttle."""
@@ -486,7 +495,7 @@ def test_sweep_falls_back_to_unclassified_credit_when_sidecar_unmatchable(
             sessions_dir, 207, adapter_kind="claude-code", pid=99999, log_path=log_path
         )
 
-    _run_orphan_sweep(tmp_path, paths, config, fake_gh)
+    _run_orphan_sweep(tmp_path, paths, config, fake_gh, monkeypatch=monkeypatch)
 
     state = load_state(paths.state_file)
     entry = state["issues"]["207"]
@@ -567,7 +576,7 @@ def test_reap_restore_records_failure_kind_alongside_death(tmp_path: Path) -> No
 # --- unescalate survival --------------------------------------------------
 
 
-def test_worker_death_failure_kinds_survives_real_unescalate(tmp_path: Path) -> None:
+def test_worker_death_failure_kinds_survives_real_unescalate(tmp_path: Path, monkeypatch) -> None:
     """Credit a death, escalate, run the real ``unescalate``: the per-death
     kinds map survives while ``worker_death_at`` and the epoch stamp clear."""
     config, paths, fake_gh, _ = _dead_worker_rework_bed(tmp_path)
@@ -575,7 +584,7 @@ def test_worker_death_failure_kinds_survives_real_unescalate(tmp_path: Path) -> 
     state["issues"]["207"]["dead_worker_failure_kind"] = "stalled"
     save_state(paths.state_file, state)
     _sessions_dir(tmp_path)
-    _run_orphan_sweep(tmp_path, paths, config, fake_gh)
+    _run_orphan_sweep(tmp_path, paths, config, fake_gh, monkeypatch=monkeypatch)
 
     state = load_state(paths.state_file)
     entry = state["issues"]["207"]

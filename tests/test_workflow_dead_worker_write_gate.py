@@ -224,7 +224,9 @@ def test_sweep_orphan_processes_for_dead_sessions_dry_run_true_kills_nothing(
 # ---------------------------------------------------------------------------
 
 
-def test_detect_and_handle_orphaned_workers_dry_run_true_writes_nothing(tmp_path: Path) -> None:
+def test_detect_and_handle_orphaned_workers_dry_run_true_writes_nothing(
+    tmp_path: Path, monkeypatch
+) -> None:
     """C1.2: a dead worker with a ``request_changes`` review decision and an
     unchanged head normally resets the issue to ``rework_requested`` (issue
     #207) via the R5-completed sweep-events batcher plus a final
@@ -292,7 +294,7 @@ def test_detect_and_handle_orphaned_workers_dry_run_true_writes_nothing(tmp_path
     control_state_file = _seed(control_root)
     control_sessions_dir = control_root / "sessions"
     control_sessions_dir.mkdir(parents=True, exist_ok=True)
-    with host_probe(alive=False):
+    with host_probe(monkeypatch, alive=False):
         _detect_and_handle_orphaned_workers(
             control_sessions_dir,
             control_state_file,
@@ -316,7 +318,7 @@ def test_detect_and_handle_orphaned_workers_dry_run_true_writes_nothing(tmp_path
     save_calls: list[tuple[tuple, dict]] = []
     append_calls: list[tuple[tuple, dict]] = []
     with (
-        host_probe(alive=False),
+        host_probe(monkeypatch, alive=False),
         patch(
             "charlie_work.write_gate.save_state",
             lambda *a, **k: save_calls.append((a, k)) or {"BUG": "raw save_state was called"},

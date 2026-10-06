@@ -148,10 +148,12 @@ def _bed(tmp_path: Path, *, labels: tuple[str, ...] | None = None):
     return config, paths, gh, worktree
 
 
-def test_clean_zero_diff_completion_closes_the_issue_without_redispatch(tmp_path: Path) -> None:
+def test_clean_zero_diff_completion_closes_the_issue_without_redispatch(
+    tmp_path: Path, monkeypatch
+) -> None:
     config, paths, gh, _ = _bed(tmp_path)
 
-    run_sweep(tmp_path, paths, config, gh)
+    run_sweep(tmp_path, paths, config, gh, monkeypatch=monkeypatch)
 
     assert gh.closed_issues == [_NUMBER]
     (comment_number, body) = gh.issue_comments_posted[0]
@@ -177,36 +179,36 @@ def _assert_refused(paths: Any, gh: Any, reason: str) -> None:
     assert ignored["payload"]["reason"] == reason
 
 
-def test_commits_ahead_of_base_are_ignored(tmp_path: Path) -> None:
+def test_commits_ahead_of_base_are_ignored(tmp_path: Path, monkeypatch) -> None:
     config, paths, gh, worktree = _bed(tmp_path)
     (worktree / "fix.txt").write_text("fix\n", encoding="utf-8")
     _git(["add", "fix.txt"], cwd=worktree)
     _git(["commit", "-m", "fix: real work"], cwd=worktree)
 
-    run_sweep(tmp_path, paths, config, gh)
+    run_sweep(tmp_path, paths, config, gh, monkeypatch=monkeypatch)
 
     _assert_refused(paths, gh, "worktree_completed")
 
 
-def test_uncommitted_source_changes_are_ignored(tmp_path: Path) -> None:
+def test_uncommitted_source_changes_are_ignored(tmp_path: Path, monkeypatch) -> None:
     config, paths, gh, worktree = _bed(tmp_path)
     (worktree / "README.md").write_text("edited\n", encoding="utf-8")
 
-    run_sweep(tmp_path, paths, config, gh)
+    run_sweep(tmp_path, paths, config, gh, monkeypatch=monkeypatch)
 
     _assert_refused(paths, gh, "worktree_partial")
 
 
-def test_escalated_issue_is_ignored(tmp_path: Path) -> None:
+def test_escalated_issue_is_ignored(tmp_path: Path, monkeypatch) -> None:
     config, paths, gh, _ = _bed(tmp_path, labels=("agent:in-progress", "agent:human-needed"))
     assert config.labels.human_needed == "agent:human-needed"
 
-    run_sweep(tmp_path, paths, config, gh)
+    run_sweep(tmp_path, paths, config, gh, monkeypatch=monkeypatch)
 
     _assert_refused(paths, gh, "escalated")
 
 
-def test_missing_worktree_is_ignored(tmp_path: Path) -> None:
+def test_missing_worktree_is_ignored(tmp_path: Path, monkeypatch) -> None:
     config, paths, gh, worktree = _bed(tmp_path)
     # The outcome survives only via the terminal record; the worktree is gone.
     _git(["worktree", "remove", "--force", str(worktree)], cwd=tmp_path / "repo")
@@ -225,11 +227,11 @@ def test_missing_worktree_is_ignored(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    run_sweep(tmp_path, paths, config, gh)
+    run_sweep(tmp_path, paths, config, gh, monkeypatch=monkeypatch)
     _assert_refused(paths, gh, "worktree_unavailable")
 
 
-def test_verified_close_wins_over_a_stale_pushed_branch(tmp_path: Path) -> None:
+def test_verified_close_wins_over_a_stale_pushed_branch(tmp_path: Path, monkeypatch) -> None:
     """A fresh claim plus a remote branch ahead of base yields ONE winner: the close.
 
     The pushed-orphan candidate lane must not open a salvage PR on the issue the
@@ -243,7 +245,7 @@ def test_verified_close_wins_over_a_stale_pushed_branch(tmp_path: Path) -> None:
     # The worktree is back at the base; only the remote branch is ahead.
     _git(["reset", "--hard", "main"], cwd=worktree)
 
-    run_sweep(tmp_path, paths, config, gh)
+    run_sweep(tmp_path, paths, config, gh, monkeypatch=monkeypatch)
 
     assert gh.closed_issues == [_NUMBER]
     assert len(events_of(paths, "worker_verified_no_changes")) == 1

@@ -76,7 +76,7 @@ def _outcome_payload() -> dict[str, Any]:
 
 
 def test_completed_outcome_stale_ci_verdict_reaches_reviewing_via_real_review(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     """request_changes + unchanged head CAN reach ``reviewing`` under the real
     ``review()`` -- but only through the issue #1111 stale-CI lane.
@@ -112,7 +112,9 @@ def test_completed_outcome_stale_ci_verdict_reaches_reviewing_via_real_review(
 
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
     with patch.object(rework_outcome, "remote_branch_head_sha", lambda *_a: "abc123"):
-        _run_orphan_sweep(tmp_path, paths, config, fake_gh, review_callback=app.review)
+        _run_orphan_sweep(
+            tmp_path, paths, config, fake_gh, review_callback=app.review, monkeypatch=monkeypatch
+        )
 
     state = load_state(paths.state_file)
     entry = state["issues"]["207"]
@@ -152,7 +154,7 @@ def test_completed_outcome_stale_ci_verdict_reaches_reviewing_via_real_review(
 
 
 def test_completed_outcome_substantive_verdict_falls_back_and_redispatch_caps(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     """Substantive request_changes + unchanged head under real ``review()``:
     the janitor no-op gate blocks the packet, the drain returns the issue to
@@ -192,7 +194,9 @@ def test_completed_outcome_substantive_verdict_falls_back_and_redispatch_caps(
 
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
     with patch.object(rework_outcome, "remote_branch_head_sha", lambda *_a: "abc123"):
-        _run_orphan_sweep(tmp_path, paths, config, fake_gh, review_callback=app.review)
+        _run_orphan_sweep(
+            tmp_path, paths, config, fake_gh, review_callback=app.review, monkeypatch=monkeypatch
+        )
 
     state = load_state(paths.state_file)
     entry = state["issues"]["207"]
@@ -250,7 +254,7 @@ def test_completed_outcome_substantive_verdict_falls_back_and_redispatch_caps(
 
 
 def test_approved_rework_variant_completed_outcome_routes_via_real_review(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     """``approved`` + PR-state ``rework_requested`` + unchanged head: the
     #1109 classified branch reaches ``handle_dead_worker_completed_outcome``
@@ -276,7 +280,9 @@ def test_approved_rework_variant_completed_outcome_routes_via_real_review(
 
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
     with patch.object(rework_outcome, "remote_branch_head_sha", lambda *_a: "abc123"):
-        _run_orphan_sweep(tmp_path, paths, config, fake_gh, review_callback=app.review)
+        _run_orphan_sweep(
+            tmp_path, paths, config, fake_gh, review_callback=app.review, monkeypatch=monkeypatch
+        )
 
     state = load_state(paths.state_file)
     entry = state["issues"]["207"]
@@ -300,7 +306,9 @@ def test_approved_rework_variant_completed_outcome_routes_via_real_review(
     assert (paths.prs / "pr-100" / "review-prompt.md").exists()
 
 
-def test_review_route_exception_does_not_starve_remaining_routes(tmp_path: Path) -> None:
+def test_review_route_exception_does_not_starve_remaining_routes(
+    tmp_path: Path, monkeypatch
+) -> None:
     """Per-route guard: a ``review()`` that raises (network blip, malformed
     response, any unexpected escape) must not starve later routes or the
     post-drain transition loops. The failed route re-collects next pass --
@@ -358,7 +366,9 @@ def test_review_route_exception_does_not_starve_remaining_routes(tmp_path: Path)
             raise RuntimeError("simulated gh api outage")
         return CommandResult(True, "review packet generated", {"pr_number": pr_number})
 
-    _run_orphan_sweep(tmp_path, paths, config, fake_gh, review_callback=flaky_review)
+    _run_orphan_sweep(
+        tmp_path, paths, config, fake_gh, review_callback=flaky_review, monkeypatch=monkeypatch
+    )
 
     state = load_state(paths.state_file)
     # Route order is state-file order: issue 207's route throws, issue 208's
@@ -385,7 +395,7 @@ def test_review_route_exception_does_not_starve_remaining_routes(tmp_path: Path)
     assert routed[0]["payload"]["routed"] is True
 
 
-def test_rework_requested_label_failure_persists_label_error(tmp_path: Path) -> None:
+def test_rework_requested_label_failure_persists_label_error(tmp_path: Path, monkeypatch) -> None:
     """The drain's ``rework_requested`` label edge is best-effort: a failed
     transition must persist ``label_error`` on the issue entry (the marker
     ``dead_worker_reap`` uses everywhere else) instead of silently leaving
@@ -404,7 +414,14 @@ def test_rework_requested_label_failure_persists_label_error(tmp_path: Path) -> 
         return CommandResult(False, "janitor gate blocked review", {"pr_number": pr_number})
 
     with patch.object(rework_outcome, "remote_branch_head_sha", lambda *_a: "abc123"):
-        _run_orphan_sweep(tmp_path, paths, config, fake_gh, review_callback=blocked_review)
+        _run_orphan_sweep(
+            tmp_path,
+            paths,
+            config,
+            fake_gh,
+            review_callback=blocked_review,
+            monkeypatch=monkeypatch,
+        )
 
     state = load_state(paths.state_file)
     entry = state["issues"]["207"]
@@ -420,7 +437,7 @@ def test_rework_requested_label_failure_persists_label_error(tmp_path: Path) -> 
 
 
 def test_deferred_completed_outcome_route_reaps_via_orphan_drift_backstop(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     """``orphan_drift_at`` backstop: when the outcome apply can never land
     (here the remote head permanently mismatches the outcome's pin), the
@@ -443,7 +460,9 @@ def test_deferred_completed_outcome_route_reaps_via_orphan_drift_backstop(
     # is deferred (head_mismatch) and the review route stays pending -- but
     # ``orphan_drift_at`` is armed so the finding cannot hold forever.
     with patch.object(rework_outcome, "remote_branch_head_sha", lambda *_a: "other-head"):
-        _run_orphan_sweep(tmp_path, paths, config, fake_gh, review_callback=never_called)
+        _run_orphan_sweep(
+            tmp_path, paths, config, fake_gh, review_callback=never_called, monkeypatch=monkeypatch
+        )
 
     state = load_state(paths.state_file)
     entry = state["issues"]["207"]
@@ -462,7 +481,9 @@ def test_deferred_completed_outcome_route_reaps_via_orphan_drift_backstop(
     save_state(paths.state_file, state)
 
     with patch.object(rework_outcome, "remote_branch_head_sha", lambda *_a: "other-head"):
-        _run_orphan_sweep(tmp_path, paths, config, fake_gh, review_callback=never_called)
+        _run_orphan_sweep(
+            tmp_path, paths, config, fake_gh, review_callback=never_called, monkeypatch=monkeypatch
+        )
 
     state = load_state(paths.state_file)
     entry = state["issues"]["207"]

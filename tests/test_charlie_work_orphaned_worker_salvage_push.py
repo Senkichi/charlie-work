@@ -28,7 +28,7 @@ from charlie_work.state import (
 
 
 def test_orphaned_worker_salvage_push_recovers_stranded_commits_before_classification(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     """A successful pre-lock salvage push refreshes the PR snapshot's
     headRefOid before classification runs. A dead worker whose
@@ -102,7 +102,7 @@ def test_orphaned_worker_salvage_push_recovers_stranded_commits_before_classific
     sessions_dir.mkdir(parents=True, exist_ok=True)
 
     with (
-        host_probe(alive=False),
+        host_probe(monkeypatch, alive=False),
         patch.object(workflow_module, "salvage_push_stranded_commits", fake_salvage),
     ):
         _detect_and_handle_orphaned_workers(
@@ -149,7 +149,7 @@ def test_orphaned_worker_salvage_push_recovers_stranded_commits_before_classific
 
 
 def test_orphaned_worker_salvage_push_threads_dry_run_to_salvage_push_stranded_commits(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     """Issue #1326 regression: ``_detect_and_handle_orphaned_workers`` must
     thread ``write_gate.dry_run`` into ``salvage_push_stranded_commits`` (the
@@ -231,7 +231,7 @@ def test_orphaned_worker_salvage_push_threads_dry_run_to_salvage_push_stranded_c
     sessions_dir.mkdir(parents=True, exist_ok=True)
 
     with (
-        host_probe(alive=False),
+        host_probe(monkeypatch, alive=False),
         patch.object(workflow_module, "salvage_push_stranded_commits", fake_salvage),
     ):
         _detect_and_handle_orphaned_workers(
@@ -250,7 +250,7 @@ def test_orphaned_worker_salvage_push_threads_dry_run_to_salvage_push_stranded_c
 
 
 def test_orphaned_worker_salvage_push_failure_preserves_existing_classification(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     """A failed salvage push must not change downstream classification: the
     PR snapshot's headRefOid is left untouched (push never succeeded), so the
@@ -320,7 +320,7 @@ def test_orphaned_worker_salvage_push_failure_preserves_existing_classification(
     sessions_dir.mkdir(parents=True, exist_ok=True)
 
     with (
-        host_probe(alive=False),
+        host_probe(monkeypatch, alive=False),
         patch.object(workflow_module, "salvage_push_stranded_commits", fake_salvage),
     ):
         _detect_and_handle_orphaned_workers(
@@ -349,7 +349,9 @@ def test_orphaned_worker_salvage_push_failure_preserves_existing_classification(
     assert [e for e in events if e.get("kind") == "salvage_pushed_stranded_commits"] == []
 
 
-def test_orphaned_worker_salvage_push_up_to_date_emits_no_event(tmp_path: Path) -> None:
+def test_orphaned_worker_salvage_push_up_to_date_emits_no_event(
+    tmp_path: Path, monkeypatch
+) -> None:
     """skip_reason="up_to_date" is silent by design (issue #1248 docstring):
     no salvage event is recorded and classification is identical to running
     without the feature at all.
@@ -411,7 +413,7 @@ def test_orphaned_worker_salvage_push_up_to_date_emits_no_event(tmp_path: Path) 
     sessions_dir.mkdir(parents=True, exist_ok=True)
 
     with (
-        host_probe(alive=False),
+        host_probe(monkeypatch, alive=False),
         patch.object(workflow_module, "salvage_push_stranded_commits", fake_salvage),
     ):
         _detect_and_handle_orphaned_workers(
@@ -434,7 +436,9 @@ def test_orphaned_worker_salvage_push_up_to_date_emits_no_event(tmp_path: Path) 
     assert salvage_events == []
 
 
-def test_orphaned_worker_salvage_push_skips_cross_repository_pr(tmp_path: Path) -> None:
+def test_orphaned_worker_salvage_push_skips_cross_repository_pr(
+    tmp_path: Path, monkeypatch
+) -> None:
     """A fork PR (isCrossRepository=True) must never have its branch pushed
     to from this checkout -- the pre-lock salvage loop must skip calling
     salvage_push_stranded_commits entirely for that issue.
@@ -484,7 +488,7 @@ def test_orphaned_worker_salvage_push_skips_cross_repository_pr(tmp_path: Path) 
     sessions_dir.mkdir(parents=True, exist_ok=True)
 
     with (
-        host_probe(alive=False),
+        host_probe(monkeypatch, alive=False),
         patch.object(workflow_module, "salvage_push_stranded_commits", fake_salvage),
     ):
         _detect_and_handle_orphaned_workers(

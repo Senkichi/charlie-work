@@ -190,7 +190,7 @@ def test_orphaned_worker_routes_stale_empty_checks_to_rework(tmp_path: Path) -> 
     assert "no ci checks" in prompt_text
 
 
-def test_orphaned_worker_head_advanced_routes_to_review(tmp_path: Path) -> None:
+def test_orphaned_worker_head_advanced_routes_to_review(tmp_path: Path, monkeypatch) -> None:
     """Issue #457: dead worker with request_changes and an advanced head is routed
     to the review-pending path instead of being re-emitted as drift."""
 
@@ -242,7 +242,7 @@ def test_orphaned_worker_head_advanced_routes_to_review(tmp_path: Path) -> None:
     def fake_review(pr_number: int):
         return CommandResult(True, "review packet generated", {"pr_number": pr_number})
 
-    with host_probe(alive=False):
+    with host_probe(monkeypatch, alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
@@ -275,7 +275,9 @@ def test_orphaned_worker_head_advanced_routes_to_review(tmp_path: Path) -> None:
     assert routed_events[0]["payload"]["routed"] is True
 
 
-def test_orphaned_worker_head_advanced_review_failure_emits_drift_once(tmp_path: Path) -> None:
+def test_orphaned_worker_head_advanced_review_failure_emits_drift_once(
+    tmp_path: Path, monkeypatch
+) -> None:
     """Issue #457: if routing to review fails, the head-advance finding is emitted
     as a single drift event and not re-emitted on subsequent passes."""
 
@@ -327,7 +329,7 @@ def test_orphaned_worker_head_advanced_review_failure_emits_drift_once(tmp_path:
     def fake_review(pr_number: int):
         return CommandResult(False, "janitor gate blocked review", {"pr_number": pr_number})
 
-    with host_probe(alive=False):
+    with host_probe(monkeypatch, alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
@@ -368,7 +370,7 @@ def test_orphaned_worker_head_advanced_review_failure_emits_drift_once(tmp_path:
     assert len(routed_events) == 0
 
     # Second pass must not re-emit the drift.
-    with host_probe(alive=False):
+    with host_probe(monkeypatch, alive=False):
         _detect_and_handle_orphaned_workers(
             sessions_dir,
             paths.state_file,
@@ -384,7 +386,9 @@ def test_orphaned_worker_head_advanced_review_failure_emits_drift_once(tmp_path:
     assert len(drift_events) == 1, "drift must not be re-emitted for the same fingerprint"
 
 
-def test_orphaned_worker_head_advanced_no_op_refusal_reaches_drain(tmp_path: Path) -> None:
+def test_orphaned_worker_head_advanced_no_op_refusal_reaches_drain(
+    tmp_path: Path, monkeypatch
+) -> None:
     """Issue #2034: a head-change review refusal that IS the janitor's
     unchanged-diff no-op gate -- flagged ``is_no_op_rework`` in the result
     data -- reaches the no-op drain, which escalates ``rework_no_op`` once
@@ -442,7 +446,7 @@ def test_orphaned_worker_head_advanced_no_op_refusal_reaches_drain(tmp_path: Pat
             {"pr_number": pr_number, "is_no_op_rework": True},
         )
 
-    with host_probe(alive=False):
+    with host_probe(monkeypatch, alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
@@ -470,7 +474,9 @@ def test_orphaned_worker_head_advanced_no_op_refusal_reaches_drain(tmp_path: Pat
     assert escalated_events[0]["payload"]["reason"] == "dead_worker_with_head_change"
 
 
-def test_orphaned_worker_unsafe_to_auto_reset_drift_emits_once(tmp_path: Path) -> None:
+def test_orphaned_worker_unsafe_to_auto_reset_drift_emits_once(
+    tmp_path: Path, monkeypatch
+) -> None:
     """Issue #457: non-request_changes dead workers emit a drift finding once and
     are not re-emitted on every subsequent pass."""
 
@@ -520,7 +526,7 @@ def test_orphaned_worker_unsafe_to_auto_reset_drift_emits_once(tmp_path: Path) -
         }
     )
 
-    with host_probe(alive=False):
+    with host_probe(monkeypatch, alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
@@ -538,7 +544,9 @@ def test_orphaned_worker_unsafe_to_auto_reset_drift_emits_once(tmp_path: Path) -
     assert drift_events[0]["payload"]["reason"] == "dead_worker_unsafe_to_auto_reset"
 
 
-def test_orphaned_worker_approved_rework_dead_worker_auto_resets(tmp_path: Path) -> None:
+def test_orphaned_worker_approved_rework_dead_worker_auto_resets(
+    tmp_path: Path, monkeypatch
+) -> None:
     """Issue #1109: a dead worker on an approved PR whose PR state carries
     ``status="rework_requested"`` (evidence the post-approval rework lane
     dispatched this worker) and whose head is unchanged since review must be
@@ -601,7 +609,7 @@ def test_orphaned_worker_approved_rework_dead_worker_auto_resets(tmp_path: Path)
         }
     )
 
-    with host_probe(alive=False):
+    with host_probe(monkeypatch, alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
@@ -644,7 +652,9 @@ def test_orphaned_worker_approved_rework_dead_worker_auto_resets(tmp_path: Path)
     assert drift_events == []
 
 
-def test_orphaned_worker_approved_rework_clean_exit_no_op_drift(tmp_path: Path) -> None:
+def test_orphaned_worker_approved_rework_clean_exit_no_op_drift(
+    tmp_path: Path, monkeypatch
+) -> None:
     """Issue #1109: a dead worker on an approved+rework_requested PR that
     exited cleanly (exit code 0) without pushing must surface as
     ``dead_worker_clean_exit_no_op`` drift, not auto-reset -- mirroring the
@@ -714,7 +724,7 @@ def test_orphaned_worker_approved_rework_clean_exit_no_op_drift(tmp_path: Path) 
         encoding="utf-8",
     )
 
-    with host_probe(alive=False):
+    with host_probe(monkeypatch, alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         _detect_and_handle_orphaned_workers(
