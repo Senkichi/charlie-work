@@ -44,6 +44,7 @@ import sys
 import textwrap
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from _src_ast import parsed
 
 _HEARTBEAT_CHECK = Path(__file__).parent.parent / "scripts" / "heartbeat_check.py"
 # Issue #1895: the events.db anomaly checks -- including the guarded
@@ -84,7 +85,7 @@ def _module_scope_imports(path: Path) -> set[str]:
         for child in ast.iter_child_nodes(node):
             visit(child)
 
-    visit(ast.parse(path.read_text(encoding="utf-8")))
+    visit(parsed(path))
     return names
 
 

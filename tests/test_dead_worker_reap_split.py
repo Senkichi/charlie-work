@@ -88,6 +88,7 @@ from __future__ import annotations
 import ast
 import re
 from pathlib import Path
+from _src_ast import parsed, parsed_source
 
 _REPO_ROOT = Path(__file__).parents[1]
 _PACKAGE_DIR = _REPO_ROOT / "src" / "charlie_work" / "dead_worker_sweep"
@@ -169,7 +170,7 @@ _PER_MODULE_LINE_CAP = 800
 
 def _module_level_defined_names(path: Path) -> list[str]:
     """Top-level function/class/constant names a module defines."""
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    tree = parsed(path)
     names: list[str] = []
     for node in tree.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
@@ -196,7 +197,7 @@ def _all_effect_module_names() -> list[str]:
 def _facade_reexported_names(workflow_path: Path) -> set[str]:
     """Names workflow.py's facade blocks currently re-export from the three
     ``.dead_worker_sweep.effects_*`` modules."""
-    tree = ast.parse(workflow_path.read_text(encoding="utf-8"), filename=str(workflow_path))
+    tree = parsed(workflow_path)
     names: set[str] = set()
     for node in ast.walk(tree):
         if (
@@ -248,7 +249,7 @@ def _module_imports_in(
     <relative_module>``, ``from <absolute_module> import X``, and ``import
     <absolute_module>``.
     """
-    tree = ast.parse(source, filename=filename)
+    tree = parsed_source(source, filename)
     offenders: list[str] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom):
@@ -505,7 +506,7 @@ def test_orphaned_workers_stays_in_workflow_and_resolves_moved_names_via_facade(
         "not a second definition"
     )
 
-    tree = ast.parse(_WORKFLOW_PATH.read_text(encoding="utf-8"), filename=str(_WORKFLOW_PATH))
+    tree = parsed(_WORKFLOW_PATH)
     redefined = [
         node
         for node in tree.body

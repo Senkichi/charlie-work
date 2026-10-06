@@ -23,6 +23,7 @@ import ast
 from pathlib import Path
 
 import pytest
+from _src_ast import parsed, source_files
 from _fakes_github import FakeGitHub
 from _reconcile_fixtures import FakeGitHub as ReconcileFakeGitHub
 from charlie_work.config import OrchestratorConfig
@@ -616,10 +617,10 @@ def test_issue_label_writes_go_through_the_seam() -> None:
     write and emits ``lifecycle_transition``."""
     src_root = Path(__file__).parents[1] / "src" / "charlie_work"
     offenders: list[str] = []
-    for path in sorted(src_root.rglob("*.py")):
+    for path in source_files(src_root):
         if path.name == "labels.py":
             continue
-        tree = ast.parse(path.read_text(encoding="utf-8"))
+        tree = parsed(path)
         for node in ast.walk(tree):
             if (
                 isinstance(node, ast.Call)
@@ -676,8 +677,8 @@ def test_status_writes_of_lifecycle_states_stay_paired_with_the_seam() -> None:
     lifecycle_states = set(_label_state_map(OrchestratorConfig().labels).values())
     src_root = Path(__file__).parents[1] / "src" / "charlie_work"
     offenders: list[str] = []
-    for path in sorted(src_root.rglob("*.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"))
+    for path in source_files(src_root):
+        tree = parsed(path)
         for func in ast.walk(tree):
             if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
@@ -733,8 +734,8 @@ def test_production_label_seam_calls_pass_state_path() -> None:
     src_root = Path(__file__).parents[1] / "src" / "charlie_work"
     gate_receivers = {"write_gate", "gate", "wg"}
     offenders: list[str] = []
-    for path in sorted(src_root.rglob("*.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"))
+    for path in source_files(src_root):
+        tree = parsed(path)
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue

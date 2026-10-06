@@ -15,6 +15,7 @@ import ast
 from pathlib import Path
 
 import charlie_work
+from _src_ast import parsed, source_files
 
 PACKAGE_ROOT = Path(charlie_work.__file__).resolve().parent
 LAUNCH_TABLE = "_REVIEW_LAUNCHERS"
@@ -53,10 +54,10 @@ def _is_port_call(node: ast.Attribute) -> bool:
 def _launch_sites() -> list[tuple[str, str, set[str]]]:
     """``(module path, function name, names referenced)`` per function using the table."""
     sites: list[tuple[str, str, set[str]]] = []
-    for path in sorted(PACKAGE_ROOT.rglob("*.py")):
+    for path in source_files(PACKAGE_ROOT):
         if path == PORT_MODULE:
             continue
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        tree = parsed(path)
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 names = _names_in(node)

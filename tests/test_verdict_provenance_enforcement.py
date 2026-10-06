@@ -69,6 +69,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _src_ast import parsed, source_files
 
 from charlie_work.config import OrchestratorConfig
 from charlie_work.instrumentation import query_events
@@ -383,7 +384,7 @@ def test_merge_authorize_write_never_gains_verdict_provenance_key(tmp_path: Path
 
 def test_derived_from_prose_absent_from_verdict_provenance_surface() -> None:
     assert "derived_from_prose" not in VERDICT_PROVENANCE_VALUES
-    for path in sorted(_SRC_ROOT.rglob("*.py")):
+    for path in source_files(_SRC_ROOT):
         text = path.read_text(encoding="utf-8")
         assert "derived_from_prose" not in text, (
             f"{path.name} contains the literal string 'derived_from_prose' -- "
@@ -601,8 +602,8 @@ def test_every_record_review_call_site_and_review_decision_writer_supplies_prove
     scanned_write_sites: list[str] = []
     exempted_write_sites: list[str] = []
 
-    for path in sorted(_SRC_ROOT.rglob("*.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    for path in source_files(_SRC_ROOT):
+        tree = parsed(path)
 
         for call in _record_review_call_sites(tree):
             scanned_call_sites.append(f"{path.name}:{call.lineno}")
@@ -808,8 +809,8 @@ _EXPECTED_RECORD_REVIEW_PROVENANCE_BY_SITE: dict[tuple[str, str], Counter[str]] 
 def test_record_review_call_sites_map_to_expected_provenance_literal() -> None:
     actual: dict[tuple[str, str], Counter[str]] = {}
 
-    for path in sorted(_SRC_ROOT.rglob("*.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    for path in source_files(_SRC_ROOT):
+        tree = parsed(path)
         parents = _build_parent_map(tree)
         for call in _record_review_call_sites(tree):
             func = _enclosing_function(call, parents)
@@ -878,7 +879,7 @@ def test_record_review_verdict_provenance_has_no_default_in_the_ast() -> None:
     # member wherever future batches relocate it.
     host_module = inspect.getmodule(OrchestratorApp.record_review)
     host_path = Path(host_module.__file__)
-    tree = ast.parse(host_path.read_text(encoding="utf-8"), filename=host_path.name)
+    tree = parsed(host_path)
     func = _find_function_def(tree, "record_review")
 
     positional_names = [a.arg for a in func.args.posonlyargs + func.args.args]

@@ -19,6 +19,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from _src_ast import parsed
 
 from charlie_work import heartbeat_alarms as ha
 from charlie_work import heartbeat_alarms_fleet as haf
@@ -427,7 +428,7 @@ def test_supervisor_heartbeat_file_round_trip(tmp_path: Path) -> None:
 @pytest.mark.parametrize("name", ["heartbeat_alarms.py", "heartbeat_alarms_fleet.py"])
 def test_modules_are_stdlib_only_leaves_without_clock_or_io(name: str) -> None:
     src = Path(__file__).parent.parent / "src" / "charlie_work" / name
-    tree = ast.parse(src.read_text(encoding="utf-8"))
+    tree = parsed(src)
     imported = {
         (n.module if isinstance(n, ast.ImportFrom) else a.name)
         for n in ast.walk(tree)

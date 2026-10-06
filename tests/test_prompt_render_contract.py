@@ -34,6 +34,7 @@ from collections.abc import Iterable
 from pathlib import Path
 
 import pytest
+from _src_ast import parsed, source_text
 
 from charlie_work import layout
 from charlie_work.config import DispatchConfig, OrchestratorConfig, RuntimeConfig
@@ -936,10 +937,10 @@ def _resolve_cited_symbol_spans(
         cached = file_index.get(path)
         if cached is not None:
             return cached
-        text = Path(path).read_text(encoding="utf-8")
+        text = source_text(Path(path))
         offset = len(combined_lines)
         combined_lines.extend(text.splitlines())
-        entry = (offset, _resolve_symbols(ast.parse(text)))
+        entry = (offset, _resolve_symbols(parsed(Path(path))))
         file_index[path] = entry
         return entry
 

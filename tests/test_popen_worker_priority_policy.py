@@ -12,6 +12,7 @@ import ast
 from pathlib import Path
 
 import charlie_work
+from _src_ast import parsed, source_files
 
 SRC = Path(charlie_work.__file__).parent
 NORMAL_PRIORITY_MODULES = {"local_suite_runner.py"}
@@ -19,8 +20,8 @@ NORMAL_PRIORITY_MODULES = {"local_suite_runner.py"}
 
 def _launch_sites() -> list[tuple[str, int, str | None]]:
     sites = []
-    for path in sorted(SRC.rglob("*.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"))
+    for path in source_files(SRC):
+        tree = parsed(path)
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue

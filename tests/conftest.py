@@ -173,6 +173,21 @@ def _kill_on_close_job() -> None:
     enter_kill_on_close_job()
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _src_ast_mutation_guard() -> Iterator[None]:
+    """HS-CW-3: fail the session if a test mutated a shared ``_src_ast`` tree.
+
+    ``_src_ast.parsed`` hands every caller in this process the same
+    ``ast.Module``; one consumer editing it would poison every later scan.
+    Teardown re-digests every handed-out tree once per process and names each
+    file whose tree changed. Mutating callers use ``_src_ast.parsed_fresh``.
+    """
+    yield
+    from _src_ast import assert_no_mutations
+
+    assert_no_mutations()
+
+
 @pytest.fixture(autouse=True)
 def _no_leaked_child_processes() -> Iterator[None]:
     """Issue #1851: fail a test that leaves a live descendant behind.

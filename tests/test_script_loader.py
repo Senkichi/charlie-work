@@ -10,6 +10,7 @@ from pathlib import Path
 from types import ModuleType
 
 from _script_loader import load_script_module
+from _src_ast import parsed, source_files, source_text
 
 
 def test_load_script_module_loads_script(tmp_path: Path) -> None:
@@ -142,20 +143,20 @@ def test_no_hand_rolled_spec_from_file_location_in_tests() -> None:
     target = "importlib.util.spec_from_file_location"
 
     offenders: list[str] = []
-    for source_file in sorted(tests_dir.rglob("*.py")):
+    for source_file in source_files(tests_dir):
         if source_file.name == "_script_loader.py":
             continue
 
         try:
-            source_text = source_file.read_text(encoding="utf-8")
+            source = source_text(source_file)
         except UnicodeDecodeError as exc:
             offenders.append(
                 f"{source_file.relative_to(tests_dir.parent)}: could not decode as UTF-8 ({exc})"
             )
             continue
 
-        tree = ast.parse(source_text, filename=str(source_file))
-        mapping = _collect_imported_names(source_text)
+        tree = parsed(source_file)
+        mapping = _collect_imported_names(source)
         for node in ast.walk(tree):
             if isinstance(node, ast.Call):
                 resolved = _resolve_dotted(node.func, mapping)

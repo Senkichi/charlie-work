@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from charlie_work.instrumentation import _LEVEL_BY_KIND
+from _src_ast import parsed, source_files
 
 
 # ---------------------------------------------------------------------------
@@ -422,10 +423,9 @@ def _scan_event_kinds(root: Path) -> tuple[set[str], list[_UnresolvedKindSite]]:
     """Walk every Python file under ``root``; return (used kinds, unresolved sites)."""
     used: set[str] = set()
     unresolved: list[_UnresolvedKindSite] = []
-    for path in sorted(root.rglob("*.py")):
-        text = path.read_text(encoding="utf-8")
+    for path in source_files(root):
         try:
-            tree = ast.parse(text, filename=str(path))
+            tree = parsed(path)
         except SyntaxError:
             continue
         file_used, file_unresolved = _scan_tree(tree, path.relative_to(root).as_posix())
@@ -650,8 +650,8 @@ def _scan_sweep_append_kinds(root: Path) -> tuple[set[str], list[str]]:
     """
     found: set[str] = set()
     unresolved: list[str] = []
-    for path in sorted(root.rglob("*.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    for path in source_files(root):
+        tree = parsed(path)
         for node in ast.walk(tree):
             if not (
                 isinstance(node, ast.Call)

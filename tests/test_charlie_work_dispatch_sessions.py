@@ -20,6 +20,7 @@ from datetime import (
 from pathlib import Path
 
 import pytest
+from _src_ast import parsed, source_text
 
 from _dispatch_fixtures import (
     _requests,
@@ -259,8 +260,8 @@ def test_dispatch_claim_site_has_no_redundant_ci_status_check() -> None:
 
     found: dict[str, str] = {}
     for src_path in (workflow_path, dispatch_selection_path):
-        source = src_path.read_text(encoding="utf-8")
-        tree = ast.parse(source, filename=str(src_path))
+        source = source_text(src_path)
+        tree = parsed(src_path)
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in targets:
                 segment = ast.get_source_segment(source, node)

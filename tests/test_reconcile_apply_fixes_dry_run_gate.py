@@ -22,6 +22,7 @@ from __future__ import annotations
 import ast
 import textwrap
 from pathlib import Path
+from _src_ast import parsed, source_files
 
 _SRC_ROOT = Path(__file__).parents[1] / "src" / "charlie_work"
 
@@ -423,8 +424,8 @@ def test_every_apply_fixes_call_site_is_dry_run_gated() -> None:
     """
     violations: list[str] = []
     site_count = 0
-    for path in sorted(_SRC_ROOT.rglob("*.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    for path in source_files(_SRC_ROOT):
+        tree = parsed(path)
         for call, guards in _apply_fixes_call_sites(tree):
             site_count += 1
             if not _site_is_dry_run_gated(guards):

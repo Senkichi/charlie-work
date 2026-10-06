@@ -32,6 +32,7 @@ import ast
 from pathlib import Path
 
 import pytest
+from _src_ast import parsed
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SRC_ROOT = REPO_ROOT / "src" / "charlie_work"
@@ -43,7 +44,7 @@ _ALLOWED_BASENAMES = frozenset({"state.py"})
 def _literal_pair_findings(path: Path) -> list[int]:
     """Return line numbers where a live ``{"escalated", "blocked"}``-shaped
     literal (list/tuple/set of exactly those two strings) appears."""
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    tree = parsed(path)
     findings: list[int] = []
     for node in ast.walk(tree):
         if not isinstance(node, (ast.List, ast.Tuple, ast.Set)):

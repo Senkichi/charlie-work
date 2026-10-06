@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _src_ast import parsed, parsed_fresh, source_text
 
 from charlie_work.config import OrchestratorConfig, ReviewConfig
 from charlie_work.paths import runtime_paths
@@ -41,10 +42,18 @@ FORBIDDEN_STATUS = "escalated"
 HELPER_NAME = "_escalate_issue"
 
 
+# CPython hands out one shared instance of each context/operator node
+# (``Load()``, ``Add()``, ...) to every tree in the process, so a ``parent``
+# attribute set on one would leak into every other parse -- including the
+# shared trees ``_src_ast`` caches. They are never walked upward from, so skip.
+_SHARED_SINGLETONS = (ast.expr_context, ast.operator, ast.boolop, ast.unaryop, ast.cmpop)
+
+
 def _annotate_parents(tree: ast.AST) -> None:
     for parent in ast.walk(tree):
         for child in ast.iter_child_nodes(parent):
-            setattr(child, "parent", parent)
+            if not isinstance(child, _SHARED_SINGLETONS):
+                setattr(child, "parent", parent)
 
 
 def _enclosing_function(node: ast.AST) -> ast.FunctionDef | ast.AsyncFunctionDef | None:
@@ -283,13 +292,13 @@ def test_escalated_status_literal_is_only_in_helper() -> None:
     helper_path: Path | None = None
 
     for path in scanned_paths:
-        source = path.read_text(encoding="utf-8")
+        source = source_text(path)
         display = path.relative_to(REPO_ROOT).as_posix()
 
         violations = find_escalation_violations(source, str(path))
         all_violations.extend(f"{display}: {v}" for v in violations)
 
-        tree = ast.parse(source, filename=str(path))
+        tree = parsed_fresh(path)
         _annotate_parents(tree)
 
         indirect_seen.extend(
@@ -493,8 +502,7 @@ def test_set_escalation_is_not_defined() -> None:
     the status write a separate caller responsibility, so its continued
     existence would be a documented path back to the bug #750 closed.
     """
-    source = SRC_STATE.read_text(encoding="utf-8")
-    tree = ast.parse(source, filename=str(SRC_STATE))
+    tree = parsed(SRC_STATE)
     functions = {
         node.name
         for node in ast.walk(tree)
