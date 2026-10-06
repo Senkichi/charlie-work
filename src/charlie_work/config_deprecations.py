@@ -29,9 +29,7 @@ class DeprecatedConfigKey:
     """One deprecated config key and the issue that retires it.
 
     ``replacement`` is ``section.key`` form (e.g. ``"dispatch.max_limit"``),
-    or ``None`` when the knob was retired without a successor -- the
-    ``dispatch.require_worker_github_token`` case, where the gate was
-    removed outright (issue #1853).
+    or ``None`` when the knob was retired without a successor.
     """
 
     section: str
@@ -47,14 +45,6 @@ class DeprecatedConfigKey:
 #: THE registry. Membership is what makes a key "deprecated"; tests and the
 #: retirement sweep read this and nothing else.
 DEPRECATED_CONFIG_KEYS: tuple[DeprecatedConfigKey, ...] = (
-    # Issue #1853 made this a no-op kept only so existing config files parse;
-    # issue #1977 removes it once the quiet window proves it is set nowhere.
-    DeprecatedConfigKey(
-        section="dispatch",
-        key="require_worker_github_token",
-        replacement=None,
-        removal_issue=1977,
-    ),
     # Issue #1978: every ``FleetSupervisorConfig`` field is a knob relocated
     # out of ``supervisor:`` -- deriving the entries from the dataclass keeps
     # the registry in sync with the new section by construction instead of
