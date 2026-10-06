@@ -1455,6 +1455,17 @@ class RuntimeConfig:
     # verifies ``resources.graphql.remaining`` from ``gh api rate_limit`` is at
     # least this value. Set to 0 to disable the guard.
     graphql_rate_limit_threshold: Annotated[int, Typed, BoolTolerant, NonNeg] = 1500
+    # Issue #2442: the fleet-wide GraphQL budget governor. The threshold above
+    # is the first reserve (reconcile, drift, review reaps defer below it);
+    # dispatch scans and probes defer below ``graphql_scan_reserve``; everything
+    # but merge, label writes and the unauthorized-merge tripwire defers below
+    # ``graphql_floor_reserve``. ``github_budget_governor: false`` restores the
+    # per-client budget, plain retries and the single threshold.
+    graphql_scan_reserve: Annotated[int, Typed, BoolTolerant, NonNeg] = 800
+    graphql_floor_reserve: Annotated[int, Typed, BoolTolerant, NonNeg] = 300
+    github_budget_governor: Annotated[bool, Typed] = True
+    # Longest a call waits for a primary rate-limit reset before it is deferred.
+    gh_primary_limit_max_wait_seconds: Annotated[float, Typed, BoolTolerant, NonNeg] = 30.0
     # Bounded in-memory event ring for state.json. A larger cap costs only a
     # few hundred KB of JSON and preserves far more diagnostic history when a
     # single sweep emits repetitive events. Tuned via config (issue #525).

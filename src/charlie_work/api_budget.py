@@ -597,6 +597,14 @@ def _header_int(values: Mapping[str, str], name: str) -> int | None:
         return None
 
 
+def window_supersedes(candidate: GitHubRateWindow, current: GitHubRateWindow) -> bool:
+    """Whether *candidate* is at least as new as *current* (same resource): a
+    later ``reset`` is a newer window; within one window ``remaining`` only falls."""
+    return candidate.reset_epoch > current.reset_epoch or (
+        candidate.reset_epoch == current.reset_epoch and candidate.remaining <= current.remaining
+    )
+
+
 def observe_github_rate(
     budget: GitHubRateBudget, headers: Iterable[tuple[str, str]], now: float
 ) -> GitHubRateBudget:
@@ -618,10 +626,7 @@ def observe_github_rate(
     resource = values.get("x-ratelimit-resource") or "core"
     window = GitHubRateWindow(resource, limit, remaining, reset, now)
     current = next((w for w in budget.windows if w.resource == resource), None)
-    if current is not None and (
-        current.reset_epoch > reset
-        or (current.reset_epoch == reset and current.remaining < remaining)
-    ):
+    if current is not None and not window_supersedes(window, current):
         return budget
     kept = tuple(w for w in budget.windows if w.resource != resource)
     return GitHubRateBudget(windows=(*kept, window))
@@ -782,6 +787,7 @@ __all__ = [
     "GitHubRateBudget",
     "observe_github_rate",
     "github_headroom",
+    "window_supersedes",
     "GitHubSample",
     "GitHubSpend",
     "GitHubSpendEntry",
