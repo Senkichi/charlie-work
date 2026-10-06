@@ -17,10 +17,8 @@ from ..config import (
     OrchestratorConfig,
 )
 from ..orphan_sweep import sweep_orphan_processes
-from .. import host as _host
 from ..state import (
     load_state,
-    load_state_locked,
     state_lock,
 )
 from ..worker import WorkerHealth, WorkerView
@@ -230,38 +228,16 @@ def _count_live_sessions(sessions_dir: Path, state_file: Path | None = None) -> 
     recycling-safe) but has no corresponding live sidecar is counted here
     too, and printed as a loud reconcile signal rather than silently treated
     as free capacity.
+
+    Issue #2230: the implementation lives in
+    ``live_session_count.count_live_sessions`` -- one counter shared with the
+    review lane's ``dispatch_selection._count_live_reviews``. This name stays
+    a delegate so the ``workflow._count_live_sessions`` import/patch surface
+    keeps resolving unchanged.
     """
-    from ..worker import iter_workers
+    from ..live_session_count import WORKER_LANE, count_live_sessions
 
-    live_issue_numbers: set[int] = set()
-    live_count = 0
-    for w in iter_workers(sessions_dir):
-        if w.is_alive():
-            live_count += 1
-            live_issue_numbers.add(w.issue_number)
-
-    if state_file is not None:
-        state = load_state_locked(state_file)
-        for issue_number_str, entry in state.get("issues", {}).items():
-            if not isinstance(entry, dict) or entry.get("status") != "dispatched":
-                continue
-            try:
-                issue_number = int(issue_number_str)
-            except (TypeError, ValueError):
-                continue
-            if issue_number in live_issue_numbers:
-                continue
-            if _worker_pid_alive(entry):
-                live_count += 1
-                print(
-                    f"[reconcile] issue {issue_number}: worker_pid "
-                    f"{entry.get('worker_pid')} is alive with no live session "
-                    "sidecar (ghost) -- counting it against the concurrency "
-                    "governor instead of treating the slot as free",
-                    flush=True,
-                )
-
-    return live_count
+    return count_live_sessions(sessions_dir, state_file, WORKER_LANE)
 
 
 def _detect_stalled_sessions(
@@ -346,12 +322,13 @@ def _worker_pid_alive(entry: dict[str, Any]) -> bool:
     Returns:
         True if the worker PID is alive and the start time matches (if available),
         False otherwise.
-    """
-    worker_pid = entry.get("worker_pid")
-    if worker_pid is None:
-        return False
 
-    return _host.current().probe.is_alive(worker_pid, entry.get("worker_process_start_time"))
+    Issue #2230: the probe itself lives in ``live_session_count._ghost_pid_alive``,
+    shared with the review lane's ``_reviewer_pid_alive``.
+    """
+    from ..live_session_count import WORKER_LANE, _ghost_pid_alive
+
+    return _ghost_pid_alive(entry, WORKER_LANE)
 
 
 def _orphan_head_fingerprint(remote_sha: str | None, local_sha: str | None) -> str:
