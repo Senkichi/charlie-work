@@ -43,7 +43,6 @@ module below.
 from __future__ import annotations
 
 from dataclasses import asdict
-from datetime import UTC, datetime
 from typing import Any
 
 import charlie_work.workflow as _wf
@@ -834,7 +833,7 @@ def _dispatch_impl(
         # from crashed workers before PR opens.
         live_dispatched = set()
         dispatch_blocked = set()
-        now = datetime.now(UTC)
+        now = self.host.clock.now()
         for number, entry in state.get("issues", {}).items():
             if not isinstance(entry, dict):
                 continue
@@ -1277,7 +1276,7 @@ def _dispatch_impl(
             else:
                 # Issue #461: bound dispatch_failed retries with the same
                 # redispatch-window cap used for rework.
-                now = datetime.now(UTC)
+                now = self.host.clock.now()
                 failed_result = next(
                     (r for r in dispatch_results if r.issue_number == request.issue_number),
                     None,
@@ -1748,7 +1747,7 @@ def _dispatch_impl(
         # the durable baseline marker, the staleness check, and the alert
         # cadence marker all timestamp against the same instant, mirroring
         # the #828/#838 single-frozen-clock-per-pass invariant.
-        dispatch_cadence_now = datetime.now(UTC)
+        dispatch_cadence_now = self.host.clock.now()
         dispatch_cadence_now_iso = (
             dispatch_cadence_now.replace(microsecond=0).isoformat().replace("+00:00", "Z")
         )

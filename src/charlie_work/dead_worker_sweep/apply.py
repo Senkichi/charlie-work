@@ -20,12 +20,12 @@ import copy
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from .. import stalled_review_reap
 from ..config import OrchestratorConfig
+from ..host import current as _host_current
 from ..paths import resolved_layout
 from ..write_gate import WriteGate, require_write_gate
 from .apply_commits import LOCK_ILLEGAL_COMMITS, POST_ILLEGAL_COMMITS, apply_commit
@@ -166,7 +166,7 @@ def run_orphan_sweep(
     with ports.state_lock(state_file):
         state = ports.load_state(state_file)
 
-    now = datetime.now(UTC)
+    now = _host_current().clock.now()
     repo_root = getattr(gh, "repo_root", None)
     worktrees_dir = resolved_layout(config, repo_root).worktrees if repo_root is not None else None
     ctx = SweepContext(

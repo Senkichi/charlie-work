@@ -14,7 +14,7 @@ module was over its file-size ratchet mark.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from typing import Any
 
 import charlie_work.workflow as _wf
@@ -76,7 +76,7 @@ def _maybe_probe_quota_recovery(self, *, now: datetime | None = None) -> None:
     if not self.config.quota_probe.enabled:
         return
 
-    resolved_now = now if now is not None else datetime.now(UTC)
+    resolved_now = now if now is not None else self.host.clock.now()
     state_file = self.paths.state_file
     with _wf.state_lock(state_file):
         state = _wf.load_state(state_file)
@@ -182,7 +182,7 @@ def _maybe_reclaim_worktrees(self, *, now: datetime | None = None) -> dict[str, 
     """
     if not self.config.worktree_reclamation.enabled:
         return None
-    resolved_now = now if now is not None else datetime.now(UTC)
+    resolved_now = now if now is not None else self.host.clock.now()
     state_file = self.paths.state_file
     with _wf.state_lock(state_file):
         state = _wf.load_state(state_file)
@@ -394,7 +394,7 @@ def _maybe_emit_operator_queue_impact(self) -> None:
             roots,
             oldest_root_age_days=oldest_root_age_days,
         )
-        now = datetime.now(UTC)
+        now = self.host.clock.now()
 
         # Re-arm the cadence marker on every completed check, independent
         # of whether it goes on to fire below -- see this method's

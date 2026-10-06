@@ -8,7 +8,6 @@ the ``workflow_delegation`` installer re-attaches each ``def`` onto the class.
 from __future__ import annotations
 
 from dataclasses import asdict
-from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Iterable
 
 from charlie_work.adapters import (
@@ -352,7 +351,7 @@ def _dispatch_rework_impl(
             issues=dry_head_check_state.get("issues", {}),
             sessions_dir=sessions_dir,
             config=self.config,
-            now=datetime.now(UTC),
+            now=self.host.clock.now(),
         )
 
         # Apply only_issues filter and concurrency cap (read-only).
@@ -536,7 +535,7 @@ def _dispatch_rework_impl(
                                     window_minutes=self.config.watchdog.redispatch_window_minutes,
                                 )
                                 issue_entry["foreign_writer_reaps"] = existing_reaps + [
-                                    datetime.now(UTC).isoformat().replace("+00:00", "Z")
+                                    self.host.clock.now().isoformat().replace("+00:00", "Z")
                                 ]
                                 state["issues"][str(issue_number)] = issue_entry
                                 state = _wf.append_event(  # event-consumer: audit-only -- records a pre-escalation foreign-writer reap (issue #1423) already enforced by the blocked_environment_at reset and foreign_writer_reaps counter; consumed by tests/test_charlie_work.py regression tests.
@@ -758,7 +757,7 @@ def _dispatch_rework_impl(
         issues=head_check_state.get("issues", {}),
         sessions_dir=sessions_dir,
         config=self.config,
-        now=datetime.now(UTC),
+        now=self.host.clock.now(),
     )
     if live_worker_deferrals:
         _wf._record_cap_escalation_deferrals(live_worker_deferrals, write_gate=self.write_gate)
@@ -779,7 +778,7 @@ def _dispatch_rework_impl(
                 redispatch_at = _wf._windowed_redispatch_at(
                     entry,
                     window_minutes=self.config.watchdog.redispatch_window_minutes,
-                ) + [datetime.now(UTC).isoformat().replace("+00:00", "Z")]
+                ) + [self.host.clock.now().isoformat().replace("+00:00", "Z")]
                 # Issue #783: no-op rework redispatch cap is a process
                 # failure, not a judgment call -- mechanical.
                 state = _wf._escalate_issue(
@@ -1411,7 +1410,7 @@ def _dispatch_rework_impl(
                 stamp_worker_process(entry, result)
             if ok:
                 # Track redispatch count for escalation cap (issue #165)
-                now = datetime.now(UTC)
+                now = self.host.clock.now()
                 redispatch_at = _wf._windowed_redispatch_at(
                     entry, window_minutes=self.config.watchdog.redispatch_window_minutes
                 ) + [now.isoformat().replace("+00:00", "Z")]
@@ -1492,7 +1491,7 @@ def _dispatch_rework_impl(
                     None,
                 )
                 failure_kind = failed_result.failure_kind if failed_result else None
-                now = datetime.now(UTC)
+                now = self.host.clock.now()
                 # Issue #1393: a pre-launch environment block (e.g.
                 # worktree_foreign_writer) never started a worker session,
                 # so it must NOT count against the redispatch cap (which

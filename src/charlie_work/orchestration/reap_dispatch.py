@@ -22,7 +22,6 @@ any of them on ``charlie_work.workflow``).
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
 from typing import Any
 
 import charlie_work.workflow as _wf
@@ -113,7 +112,7 @@ def _detect_ci_absence(
         return None
     if known_head is not None and known_head == head_sha and not reprobe_known_head:
         return None
-    if not _is_pr_updated_at_older_than(pr, datetime.now(UTC), grace_minutes):
+    if not _is_pr_updated_at_older_than(pr, self.host.clock.now(), grace_minutes):
         return None
     head_runs = self.gh.workflow_runs_for_head(head_sha)
     # None means the query itself failed (rate limit, transient error) --

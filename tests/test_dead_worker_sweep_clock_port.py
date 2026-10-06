@@ -70,3 +70,36 @@ def test_dead_session_reclaim_stamps_redispatch_from_clock_port(
 
     (stamp,) = load_state(paths.state_file)["issues"]["99"]["redispatch_at"]
     assert datetime.fromisoformat(stamp.replace("Z", "+00:00")) == frozen
+
+
+def test_read_clock_samples_the_port(tmp_path: Path, fake_host: Callable[..., Any]) -> None:
+    # Issue #2233: the sweep's ReadClock step must stamp SweepContext.now
+    # from host.current().clock so a fake clock freezes every downstream
+    # sweep decision -- under the unfixed code it read datetime.now(UTC).
+    from charlie_work.dead_worker_sweep.apply_context import SweepContext
+    from charlie_work.dead_worker_sweep.apply_requests_pre import read_clock
+    from charlie_work.dead_worker_sweep.model import ReadClock
+    from charlie_work.dead_worker_sweep.ports import ports_from_workflow
+
+    frozen = datetime(2031, 3, 4, 5, 6, 7, tzinfo=UTC)
+    fake_host(clock=FakeClock(frozen))
+    state_file = tmp_path / "state.json"
+    ctx = SweepContext(
+        sessions_dir=tmp_path,
+        state_file=state_file,
+        config=OrchestratorConfig(),
+        gh=None,
+        write_gate=_wg(state_file),
+        ports=ports_from_workflow(),
+        review_callback=None,
+        record_review_callback=None,
+        enrich_checks_callback=None,
+        fleet_dir_override=None,
+        repo_root=None,
+        worktrees_dir=None,
+        state={},
+        now=datetime(2000, 1, 1, tzinfo=UTC),
+    )
+
+    assert read_clock(ctx, ReadClock()) == frozen
+    assert ctx.now == frozen

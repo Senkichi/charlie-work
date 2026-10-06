@@ -230,7 +230,7 @@ def _precheck_phantom_live_worker(
     push+PR ``_attempt_salvage`` path the other dead-worker loci use.
     """
     issue_number = request.issue_number
-    now = datetime.now(UTC)
+    now = self.host.clock.now()
     phantom_workers = tuple(
         w for w in iter_workers(sessions_dir) if w.issue_number == issue_number
     )

@@ -50,7 +50,6 @@ through ``_wf.<name>`` (the module-object form the monkeypatch seams need).
 from __future__ import annotations
 
 import os
-from datetime import UTC, datetime
 from typing import Any
 
 import charlie_work.workflow as _wf
@@ -480,7 +479,7 @@ def _local_gate_poll(
     if isinstance(pid, int) and pid > 0:
         if self.host.probe.is_alive(pid, start_time):
             started = _iso_dt(record.get("local_suite_started_at"))
-            age = (datetime.now(UTC) - started).total_seconds() if started else 0
+            age = (self.host.clock.now() - started).total_seconds() if started else 0
             timeout = effective_suite_timeout(self.paths.dispatches, self.paths.state_file)
             if age > timeout:
                 killed = self.write_gate.kill_process_tree(pid, start_time)
