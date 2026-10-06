@@ -95,7 +95,7 @@ def test_fleet_concurrency_governor_tighter_cap_wins(
     """When both per-repo and fleet caps are set, the tighter constraint wins."""
 
     # Mock count_fleet_live_sessions to return 1 fleet live session
-    # Mock _count_live_sessions to return 1 local live session
+    # Fake the local live-session count to return 1 local live session
     fake_host(sessions=FakeSessionCounter(fleet_workers=(1, [])))
     fake_host(sessions=FakeSessionCounter(fleet_workers=(1, []), workers=1))
 
@@ -128,7 +128,7 @@ def test_fleet_concurrency_governor_per_repo_cap_tighter(
     """When per-repo cap is tighter than fleet cap, per-repo wins."""
 
     # Mock count_fleet_live_sessions to return 1 fleet live session
-    # Mock _count_live_sessions to return 1 local live session
+    # Fake the local live-session count to return 1 local live session
     fake_host(sessions=FakeSessionCounter(fleet_workers=(1, [])))
     fake_host(sessions=FakeSessionCounter(fleet_workers=(1, []), workers=1))
 
@@ -319,7 +319,7 @@ def test_fleet_lock_serializes_cross_repo_dispatch(tmp_path: Path, monkeypatch) 
         )
         apps.append(app)
 
-    # Seed the fleet registry so both repos are visible to count_fleet_live_sessions.
+    # Seed the fleet registry so both repos are visible to the fleet live-session walker.
     save_state(fleet_dir / "fleet.json", {"repos": repo_entries})
 
     # Launch both dispatch() calls concurrently from the same barrier.

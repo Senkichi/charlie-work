@@ -51,10 +51,10 @@ def test_apply_concurrency_governor_helper_unlimited(tmp_path: Path) -> None:
 def test_apply_concurrency_governor_helper_clamped(tmp_path: Path, monkeypatch) -> None:
     """_apply_concurrency_governor returns clamped result when sessions are alive."""
 
-    def mock_count_live(sessions_dir, state_file=None):
+    def mock_count_live(sessions_dir, state_file=None, kind=None):
         return 2
 
-    monkeypatch.setattr("charlie_work.workflow._count_live_sessions", mock_count_live)
+    monkeypatch.setattr("charlie_work.live_session_count.count_live_sessions", mock_count_live)
 
     config = OrchestratorConfig(
         dispatch=DispatchConfig(max_concurrent_sessions=2, default_limit=5),
@@ -76,10 +76,10 @@ def test_apply_concurrency_governor_helper_clamped(tmp_path: Path, monkeypatch) 
 def test_apply_concurrency_governor_helper_partial_slots(tmp_path: Path, monkeypatch) -> None:
     """_apply_concurrency_governor returns partial clamped result when some slots available."""
 
-    def mock_count_live(sessions_dir, state_file=None):
+    def mock_count_live(sessions_dir, state_file=None, kind=None):
         return 1
 
-    monkeypatch.setattr("charlie_work.workflow._count_live_sessions", mock_count_live)
+    monkeypatch.setattr("charlie_work.live_session_count.count_live_sessions", mock_count_live)
 
     config = OrchestratorConfig(
         dispatch=DispatchConfig(max_concurrent_sessions=2, default_limit=5),
@@ -290,10 +290,10 @@ def test_apply_concurrency_governor_open_pr_backpressure_combined_with_sessions(
 ) -> None:
     """Issue #1129: open-PR clamp combines with session cap (min of all clamps)."""
 
-    def mock_count_live(sessions_dir, state_file=None):
+    def mock_count_live(sessions_dir, state_file=None, kind=None):
         return 1
 
-    monkeypatch.setattr("charlie_work.workflow._count_live_sessions", mock_count_live)
+    monkeypatch.setattr("charlie_work.live_session_count.count_live_sessions", mock_count_live)
 
     config = OrchestratorConfig(
         dispatch=DispatchConfig(max_concurrent_sessions=3, max_open_agent_prs=2, default_limit=5),

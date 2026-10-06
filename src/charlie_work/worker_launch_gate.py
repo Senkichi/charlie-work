@@ -646,8 +646,8 @@ def _launch_workers(
             group_settings = role_selection.worker_settings_for(app, selection)
         adapters.add(group_settings.adapter)
         # Reached through the host's worker-launch port (issue #2229); the
-        # Real late-binds ``workflow.dispatch_sessions`` so test fakes that
-        # patch ``charlie_work.workflow.dispatch_sessions`` keep intercepting.
+        # Real resolves ``adapters.dispatch_sessions`` at call time so test
+        # fakes that patch it on ``charlie_work.adapters`` keep intercepting.
         try:
             group_results = app.host.worker_launch.launch(
                 app.repo_root,

@@ -101,15 +101,18 @@ def test_fake_process_probe_mirrors_primitive_semantics() -> None:
 
 def test_fake_host_probe_reaches_worker_fate_and_sweeps(fake_host) -> None:
     from charlie_work import worker_fate
-    from charlie_work.dead_worker_sweep.effects_sessions import _worker_pid_alive
     from charlie_work.dispatch_selection import _reviewer_pid_alive
     from charlie_work.host.fakes import FakeProcessProbe
+    from charlie_work.live_session_count import WORKER_LANE, _ghost_pid_alive
 
     fake_host(probe=FakeProcessProbe({4242: 1.0}))
     assert worker_fate.is_alive(4242, 1.0) is True
     assert worker_fate.is_alive(4242, 2.0) is False
     assert worker_fate.is_alive(None, None) is False
-    assert _worker_pid_alive({"worker_pid": 4242, "worker_process_start_time": 1.0}) is True
+    assert (
+        _ghost_pid_alive({"worker_pid": 4242, "worker_process_start_time": 1.0}, WORKER_LANE)
+        is True
+    )
     assert _reviewer_pid_alive({"reviewer_pid": 4242, "reviewer_process_start_time": 9.0}) is False
 
 
@@ -145,16 +148,22 @@ def test_fake_session_counter_reaches_review_fleet_gate(fake_host) -> None:
 
 
 def test_real_session_counter_late_binds_to_existing_patch_targets(monkeypatch) -> None:
+    """Issue #2235: the Real resolves the lane counter and the fleet walkers
+    through their owning modules at call time, so patches on the primitives
+    themselves keep intercepting."""
     from pathlib import Path
 
+    from charlie_work import live_session_count
     from charlie_work.host import REAL
 
-    monkeypatch.setattr("charlie_work.workflow._count_live_sessions", lambda d, s=None: 11)
-    monkeypatch.setattr("charlie_work.workflow.count_fleet_live_sessions", lambda o: (12, []))
-    monkeypatch.setattr("charlie_work.workflow.count_fleet_live_reviews", lambda o: (13, []))
     monkeypatch.setattr(
-        "charlie_work.dispatch_selection._count_live_reviews", lambda d, s=None: 14
+        "charlie_work.live_session_count.count_live_sessions",
+        lambda d, s=None, kind=None: 11 if kind is live_session_count.WORKER_LANE else 14,
     )
+    monkeypatch.setattr(
+        "charlie_work.fleet_registry.count_fleet_live_sessions", lambda o: (12, [])
+    )
+    monkeypatch.setattr("charlie_work.fleet_registry.count_fleet_live_reviews", lambda o: (13, []))
     assert REAL.sessions.live_workers(Path("."), None) == 11
     assert REAL.sessions.fleet_live_workers(None) == (12, [])
     assert REAL.sessions.fleet_live_reviews(None) == (13, [])
@@ -197,11 +206,10 @@ def test_real_session_counter_session_pids_late_binds(monkeypatch) -> None:
 
 
 def test_fleet_live_workers_reaches_fleet_registry_patch(monkeypatch) -> None:
-    """Issue #2230 rework: ``workflow.count_fleet_live_sessions`` is a re-export
-    of ``host/sessions.py``'s late-binding facade, not a frozen ``from
-    ... import`` binding -- so a patch against
-    ``fleet_registry.count_fleet_live_sessions`` must still reach callers
-    going through the port (the supervise self-deploy deferral).
+    """Issue #2235: the Real resolves ``fleet_registry.count_fleet_live_sessions``
+    through the owning module at call time -- a patch against the
+    ``fleet_registry`` name must still reach callers going through the port
+    (the supervise self-deploy deferral).
     """
     from charlie_work.host import REAL
 
@@ -272,9 +280,9 @@ def test_real_review_launcher_returns_errors_as_values(monkeypatch) -> None:
     def _boom(**_kw):
         raise OSError("no such binary")
 
-    monkeypatch.setitem(
-        __import__("charlie_work.workflow", fromlist=["x"])._REVIEW_LAUNCHERS, "api", _boom
-    )
+    import charlie_work.review_launch
+
+    monkeypatch.setitem(charlie_work.review_launch._REVIEW_LAUNCHERS, "api", _boom)
     record = host.REAL.launch.launch("api", pr_number=3, branch="b")
     assert record.pid is None and record.error == "OSError: no such binary"
     unknown = host.REAL.launch.launch("nope", pr_number=3, branch="b")
@@ -320,9 +328,10 @@ def test_fake_worker_launcher_scripts_outcomes_and_records_calls(tmp_path) -> No
 def test_real_worker_launcher_late_binds_and_returns_errors_as_values(
     monkeypatch, tmp_path
 ) -> None:
-    """Issue #2229: ``RealWorkerLauncher`` resolves ``workflow.dispatch_sessions``
-    at call time (so existing patches keep intercepting) and converts a raise
-    into per-request failure values plus ``launch_failed`` events."""
+    """Issues #2229/#2235: ``RealWorkerLauncher`` resolves
+    ``adapters.dispatch_sessions`` at call time (so a patch on the adapters
+    name keeps intercepting) and converts a raise into per-request failure
+    values plus ``launch_failed`` events."""
     from charlie_work.adapters import AdapterSettings, SessionRequest
     from charlie_work.instrumentation import query_events
     from charlie_work.paths import runtime_paths
@@ -331,7 +340,7 @@ def test_real_worker_launcher_late_binds_and_returns_errors_as_values(
     def _boom(*_a, **_k):
         raise RuntimeError("port exploded")
 
-    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", _boom)
+    monkeypatch.setattr("charlie_work.adapters.dispatch_sessions", _boom)
 
     request = SessionRequest(
         issue_number=2,
@@ -356,7 +365,7 @@ def test_real_worker_launcher_late_binds_and_returns_errors_as_values(
 
     # And a patched success path is intercepted through the same late binding.
     monkeypatch.setattr(
-        "charlie_work.workflow.dispatch_sessions",
+        "charlie_work.adapters.dispatch_sessions",
         lambda *a, **_k: ["sentinel"],
     )
     assert host.REAL.worker_launch.launch(

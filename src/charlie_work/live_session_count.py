@@ -9,18 +9,13 @@ cap instead of reading as free capacity. The lanes differ only in which
 state map, status predicate and pid fields the corroboration consults;
 ``LiveSessionKind`` carries those differences as data.
 
-The lane names -- ``dead_worker_sweep.effects_sessions._count_live_sessions``
-and ``dispatch_selection._count_live_reviews`` -- are thin delegates onto
-``count_live_sessions``; they stay in place so every existing import and
-monkeypatch target (``workflow._count_live_sessions``,
-``dispatch_selection._count_live_reviews``) keeps resolving. The fleet-wide
-walkers (``fleet_registry.count_fleet_live_sessions`` /
-``count_fleet_live_reviews``) reach this code through those names, so the
-fleet and per-repo caps cannot disagree about what "live" means.
-``workflow.count_fleet_live_sessions`` -- the attribute the
-``host.sessions`` port late-binds -- is a facade over the fleet_registry
-walker defined in ``host/sessions.py`` (not here; ``workflow.py`` is over
-the per-module size cap, so the facade lives in the port's own module).
+Consumers reach this module directly: the ``host.sessions`` Real resolves
+``count_live_sessions`` (per lane) at call time, the fleet-wide walkers in
+``fleet_registry`` pass the lane constant themselves, and
+``orchestration.dispatch_state`` / ``dead_worker_sweep.ports`` call
+``_ghost_pid_alive`` for state.json pid probes. The thin lane delegates and
+the ``workflow.*`` re-exports that used to front this module were deleted in
+issue #2235 once their patch surfaces migrated.
 """
 
 from __future__ import annotations
@@ -81,7 +76,8 @@ REVIEW_LANE = LiveSessionKind(
 def _ghost_pid_alive(entry: dict[str, Any], kind: LiveSessionKind) -> bool:
     """pid + start-time liveness for a state.json dispatch record.
 
-    Shared body of ``_worker_pid_alive`` and ``_reviewer_pid_alive``: a
+    Shared body of the worker- and reviewer-lane state.json pid probes
+    (``dispatch_selection._reviewer_pid_alive`` wraps it for REVIEW_LANE): a
     missing pid is dead; otherwise the host liveness probe decides (live pid
     whose recorded start time matches -- recycling-safe; indeterminate
     probes fail open per ``process_utils.is_pid_alive``).

@@ -1,10 +1,11 @@
 """Host ports: worker and reviewer launch.
 
-Leaf module (stdlib only at top). ``RealReviewLauncher`` late-binds to
-``workflow._REVIEW_LAUNCHERS`` (the dict ``review_launch`` owns, re-exported by
-``workflow``) and ``RealWorkerLauncher`` late-binds ``workflow.dispatch_sessions``
-at call time (issue #2229), so ``patch``/``patch.dict``/``patch.object`` on
-either ``workflow`` name keeps intercepting. Launch is non-blocking (the
+Leaf module (stdlib only at top). ``RealReviewLauncher`` resolves
+``review_launch._REVIEW_LAUNCHERS`` and ``RealWorkerLauncher`` resolves
+``adapters.dispatch_sessions`` through the owning module at call time, so
+``patch``/``patch.dict``/``patch.object`` on the primitive's own module still
+intercepts -- the ``workflow.*`` delegate layer the Reals used to route
+through was deleted in issue #2235. Launch is non-blocking (the
 underlying launchers use ``Popen``) and failures come back as
 ``LaunchOutcome`` values -- these ports never raise.
 """
@@ -146,9 +147,9 @@ def worker_error_results(
 
 class RealReviewLauncher:
     def launch(self, harness: str, **kwargs: Any) -> LaunchOutcome:
-        from .. import workflow
+        from .. import review_launch
 
-        launcher = workflow._REVIEW_LAUNCHERS.get(harness)
+        launcher = review_launch._REVIEW_LAUNCHERS.get(harness)
         if launcher is None:
             return error_record(
                 harness,
@@ -171,10 +172,10 @@ class RealWorkerLauncher:
         settings: AdapterSettings,
         requests: list[SessionRequest],
     ) -> list[SessionDispatchResult]:
-        from .. import workflow
+        from .. import adapters
 
         try:
-            return workflow.dispatch_sessions(
+            return adapters.dispatch_sessions(
                 repo_root, manifest_path, results_path, settings, requests
             )
         except Exception as exc:  # errors from external processes come back as values

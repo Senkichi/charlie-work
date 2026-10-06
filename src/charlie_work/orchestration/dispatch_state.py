@@ -13,9 +13,9 @@ Namespace rule (#1627). Two kinds of name are reached through the
 - **Patched-on-workflow (Tier D).** Names some test patches on the
   ``charlie_work.workflow`` module object -- ``state_lock``, ``load_state_locked``,
   ``utc_now``, ``transition``, ``is_claim_stale``,
-  ``dispatch_sessions``, ``emit_digest``, ``linked_issue_number``,
-  ``_count_live_sessions``, ``_detect_and_handle_stalled_sessions``,
-  ``_worker_pid_alive``, ``_try_reap_blocked_foreign_writer`` -- must resolve
+  ``emit_digest``, ``linked_issue_number``,
+  ``_detect_and_handle_stalled_sessions``,
+  ``_try_reap_blocked_foreign_writer`` -- must resolve
   through ``_wf.`` so ``patch("charlie_work.workflow.<name>")`` still bites.
 - **Defined in workflow.py.** ``_MergedPRListOutcome``,
   ``_build_attention_digest``, ``_build_failure_map``, ``_label_error_reason``,
@@ -83,6 +83,7 @@ from charlie_work.dispatch_selection import (
     _windowed_blocked_environment_at,
     _windowed_foreign_writer_reaps,
 )
+from charlie_work.live_session_count import WORKER_LANE, _ghost_pid_alive
 import charlie_work.fleet_provider_throttle as fleet_provider_throttle
 from charlie_work.escalation import _escalate_issue, _escalation_edge
 from charlie_work.fleet_registry import managed_repo_names, managed_repo_roots
@@ -342,7 +343,7 @@ def _dispatch_impl(
                     # A dead worker with an open PR is mid-review and must not be re-dispatched.
                     # Issue #207: also check state.json worker_pid for liveness when session files are orphaned
                     issue_number = int(number)
-                    worker_alive = _wf._worker_pid_alive(entry)
+                    worker_alive = _ghost_pid_alive(entry, WORKER_LANE)
                     if (
                         issue_number in live_worker_issues
                         or worker_alive
@@ -849,7 +850,7 @@ def _dispatch_impl(
                 # A dead worker with an open PR is mid-review and must not be re-dispatched.
                 # Issue #207: also check state.json worker_pid for liveness when session files are orphaned
                 issue_number = int(number)
-                worker_alive = _wf._worker_pid_alive(entry)
+                worker_alive = _ghost_pid_alive(entry, WORKER_LANE)
                 if (
                     issue_number in live_worker_issues
                     or worker_alive
