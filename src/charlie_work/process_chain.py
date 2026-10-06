@@ -70,6 +70,34 @@ def proc_rows(processes: Iterable[_ProcessRowSource]) -> dict[int, ProcRow]:
     return {proc.pid: ProcRow(ppid=proc.ppid, created=proc.created) for proc in processes}
 
 
+def _bulk_ppid_map() -> dict[int, int]:
+    """One-shot ``pid -> ppid`` table -- the same C call ``Process.ppid()`` wraps.
+
+    On Windows ``_pswindows.Process.ppid`` is ``ppid_map()[self.pid]``: asking
+    ``process_iter`` for a ``ppid`` column rebuilds the kernel's whole process
+    table once *per row* -- O(n^2), ~4 s at ~470 processes on a busy host,
+    paid by every ``kill_process_tree`` / ``kill_orphan_pid`` ancestor guard
+    (issue #2353). psutil ships the bulk map on its private platform module
+    for ``Process.children()``'s own use; taking it once is a single C call.
+
+    A platform build without it (Windows always ships it) degrades to the
+    per-row ``ppid`` read -- the O(n^2) shape this helper exists to remove,
+    kept only so a hypothetical port stays correct rather than crashing.
+    """
+    platform = getattr(psutil, "_psplatform", None)
+    bulk = getattr(platform, "ppid_map", None)
+    if bulk is not None:
+        return {int(pid): int(ppid) for pid, ppid in bulk().items()}
+    rows: dict[int, int] = {}
+    for proc in psutil.process_iter(["pid", "ppid"]):
+        info = proc.info
+        try:
+            rows[int(info["pid"])] = int(info.get("ppid") or 0)
+        except (KeyError, TypeError, ValueError):
+            continue
+    return rows
+
+
 def win32_process_ppid_snapshot() -> dict[int, ProcRow]:
     """Snapshot ``pid -> (ppid, creation time)`` for every process via ``psutil``.
 
@@ -84,12 +112,15 @@ def win32_process_ppid_snapshot() -> dict[int, ProcRow]:
     ``DateTime`` built from local-time fields and can be off by an hour around
     a DST transition -- enough to make a real parent look *newer* than its
     child, stop the ancestor walk early, and unprotect a real ancestor (the
-    dangerous direction). ``psutil`` is a declared dependency; one
-    ``process_iter`` pass yields pid, ppid and create_time from the same
-    source, so the rows are mutually consistent, with no PowerShell spawn, no
-    JSON round-trip, and no 10s timeout to stall the kill path
-    (``kill_process_tree`` / ``kill_orphan_pid``). A process whose creation
-    time is unreadable (``AccessDenied`` -> ``None``) simply keeps its link.
+    dangerous direction). ``psutil`` is a declared dependency: the ppid column
+    comes from one bulk ``ppid_map`` call and the creation stamp from one
+    ``process_iter`` pass, gathered rapidly with no
+    PowerShell spawn, no JSON round-trip, and no 10s timeout to stall the
+    kill path (``kill_process_tree`` / ``kill_orphan_pid``). A process whose
+    creation time is unreadable (``AccessDenied`` -> ``None``) simply keeps
+    its link, and a pid absent from the ppid map (exited mid-scan) keeps its
+    row with ``ppid=0`` -- the walk ends at it, which is correct for a pid
+    that can no longer be anything's parent.
 
     Returns ``{}`` on any failure (``psutil`` error, OS error). The caller
     degrades to the bare self-pid guard rather than disabling process reaping
@@ -98,16 +129,17 @@ def win32_process_ppid_snapshot() -> dict[int, ProcRow]:
     """
     ppid_by_pid: dict[int, ProcRow] = {}
     try:
-        for proc in psutil.process_iter(["pid", "ppid", "create_time"]):
+        ppids = _bulk_ppid_map()
+        for proc in psutil.process_iter(["pid", "create_time"]):
             info = proc.info
             try:
                 pid = int(info["pid"])
-                ppid = int(info.get("ppid") or 0)
             except (KeyError, TypeError, ValueError):
                 continue
             created = info.get("create_time")
             ppid_by_pid[pid] = ProcRow(
-                ppid, float(created) if isinstance(created, (int, float)) else None
+                int(ppids.get(pid) or 0),
+                float(created) if isinstance(created, (int, float)) else None,
             )
     except (psutil.Error, OSError):
         logger.warning("psutil process snapshot failed", exc_info=True)
