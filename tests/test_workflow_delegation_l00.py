@@ -37,6 +37,7 @@ from pathlib import Path
 from unittest import mock
 
 import pytest
+from _src_ast import parsed
 
 import charlie_work.orchestration as _orchestration
 import charlie_work.workflow_delegation as wd
@@ -582,7 +583,7 @@ def test_orchestratorapp_member_surface_conserved_lexical_plus_installed() -> No
          places is exactly the shadow the installer raises on, cross-checked
          here as two disjoint sets.
     """
-    tree = ast.parse(_WORKFLOW_PY.read_text(encoding="utf-8"))
+    tree = parsed(_WORKFLOW_PY)
     cls = next(
         node
         for node in tree.body

@@ -157,11 +157,13 @@ def paginate_graphql(
         nodes.extend(page_nodes)
         page_info = connection.get("pageInfo")
         page_info = page_info if isinstance(page_info, dict) else {}
-        cursor = page_info.get("endCursor")
-        if len(nodes) >= limit or not page_info.get("hasNextPage") or not cursor:
+        if len(nodes) >= limit or not page_info.get("hasNextPage"):
             merged = copy.deepcopy(body)
             target = _connection_at(merged["data"], connection_path)
             assert target is not None
             target["nodes"] = nodes[:limit]
             return replace(outcome, body=canonical_json(merged), graphql_errors=tuple(errors))
+        cursor = page_info.get("endCursor")
+        if not isinstance(cursor, str) or not cursor:
+            return _defect(f"{'.'.join(connection_path)} reports a next page but no end cursor")
     return _defect(f"pagination exceeded {max_pages} pages with a next page still present")

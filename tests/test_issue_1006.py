@@ -24,6 +24,7 @@ from charlie_work.workflow import _detect_and_handle_orphaned_workers
 from charlie_work.write_gate import WriteGate
 
 from _fakes_github import FakeGitHub
+from _host_fixtures import host_probe
 
 
 def _wg(state_file: Path, *, dry_run: bool = False) -> WriteGate:
@@ -239,7 +240,7 @@ def test_orphan_salvage_repo_root_guard(
         return (101, None, None)
 
     with (
-        patch("charlie_work.workflow._worker_pid_alive", return_value=False),
+        host_probe(alive=False),
         patch("charlie_work.workflow._open_pr_for_orphaned_branch", side_effect=fake_open_pr),
     ):
         _detect_and_handle_orphaned_workers(

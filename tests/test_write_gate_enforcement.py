@@ -246,6 +246,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
+from _src_ast import parsed, source_files
 
 from charlie_work.ratchet_baseline import BaselineFormatError, load_count_baseline
 
@@ -660,13 +661,12 @@ def _scan_gated_mutator_layer(root: Path) -> list[_RawPrimitiveSite]:
     primitive outside write_gate.py and the primitives' own defining
     modules."""
     sites: list[_RawPrimitiveSite] = []
-    for path in sorted(root.rglob("*.py")):
+    for path in source_files(root):
         rel_path = path.relative_to(root).as_posix()
         if _is_exempt_module(rel_path):
             continue
-        text = path.read_text(encoding="utf-8")
         try:
-            tree = ast.parse(text, filename=str(path))
+            tree = parsed(path)
         except SyntaxError:
             continue
         sites.extend(_scan_module_for_raw_primitive_calls(tree, rel_path))
@@ -811,7 +811,7 @@ def _scan_exemption_markers(
     -> marker}}, [error message, ...])`."""
     markers: dict[str, dict[int, _ExemptionMarker]] = {}
     errors: list[str] = []
-    for path in sorted(root.rglob("*.py")):
+    for path in source_files(root):
         rel_path = path.relative_to(root).as_posix()
         text = path.read_text(encoding="utf-8")
         module_markers, module_errors = _scan_text_for_markers(text, path=rel_path)
@@ -1537,7 +1537,7 @@ def test_real_pr2_pr3_converted_sites_are_not_flagged() -> None:
     if R5's completion had left a residual raw call, this module's
     unaccounted count would be nonzero."""
     module_path = _SRC_ROOT / "stalled_review_reap.py"
-    tree = ast.parse(module_path.read_text(encoding="utf-8"), filename=str(module_path))
+    tree = parsed(module_path)
     sites = _scan_module_for_raw_primitive_calls(tree, "stalled_review_reap.py")
 
     scopes_found = {s.scope for s in sites}

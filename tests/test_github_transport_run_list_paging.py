@@ -62,10 +62,33 @@ def test_a_workflow_file_reads_its_own_runs_route_with_server_side_filters() -> 
     assert request.route == "repos/{owner}/{repo}/actions/workflows/ci.yml/runs"
     assert _query(request) == {
         "per_page": "100",
+        "exclude_pull_requests": "true",
         "branch": "main",
         "status": "queued",
         "event": "push",
     }
+
+
+def test_the_repo_wide_run_list_also_sends_exclude_pull_requests() -> None:
+    """gh sends ``exclude_pull_requests=true`` to shrink run-list payloads;
+    no ``_RUN_FIELDS`` column reads ``pull_requests``."""
+    transport = FakeTransport(lambda r: ok({"workflow_runs": [_run(1)]}))
+    out = RunListRead("databaseId", limit=5).execute(transport, "o", "r")
+    assert _ids(out) == [1]
+    (request,) = transport.requests
+    assert request.route == "repos/{owner}/{repo}/actions/runs"
+    assert _query(request)["exclude_pull_requests"] == "true"
+
+
+@pytest.mark.parametrize("limit", [0, -3])
+def test_a_limit_below_one_is_refused_before_any_request(limit: int) -> None:
+    """gh rejects ``run list --limit < 1``; a non-positive limit is a defect,
+    never an empty list and never a request."""
+    transport = FakeTransport(lambda r: ok({"workflow_runs": [_run(1)]}))
+    out = RunListRead("databaseId", limit=limit).execute(transport, "o", "r")
+    assert isinstance(out, TransportFailure)
+    assert out.kind is FailureKind.ADAPTER_DEFECT
+    assert transport.requests == []
 
 
 def test_a_workflow_name_is_resolved_then_its_runs_are_read() -> None:

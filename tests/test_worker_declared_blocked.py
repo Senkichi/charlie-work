@@ -32,6 +32,7 @@ from charlie_work.worktree import worktree_path_for_branch
 from charlie_work.write_gate import WriteGate
 
 from _fakes_github import FakeGitHub
+from _host_fixtures import host_probe
 
 
 def _wg(state_file: Path, *, dry_run: bool = False) -> WriteGate:
@@ -107,7 +108,7 @@ def test_blocked_outcome_routes_to_operator_queue_on_first_pass(
     fake_gh.prs = []
 
     with (
-        patch("charlie_work.workflow._worker_pid_alive", return_value=False),
+        host_probe(alive=False),
         patch("charlie_work.workflow.remote_branch_head_sha", return_value=None),
         patch("charlie_work.workflow.remote_branch_ahead_count", return_value=(0, None)),
     ):
@@ -229,7 +230,7 @@ def test_no_outcome_file_keeps_redispatch_behavior(tmp_path: Path) -> None:
     fake_gh.prs = []
 
     with (
-        patch("charlie_work.workflow._worker_pid_alive", return_value=False),
+        host_probe(alive=False),
         patch("charlie_work.workflow.remote_branch_head_sha", return_value=None),
         patch("charlie_work.workflow.remote_branch_ahead_count", return_value=(0, None)),
     ):
@@ -365,7 +366,7 @@ def test_leftover_terminal_outcome_older_than_dispatch_is_not_laundered_as_fresh
     fake_gh.prs = []
 
     with (
-        patch("charlie_work.workflow._worker_pid_alive", return_value=False),
+        host_probe(alive=False),
         patch("charlie_work.workflow.remote_branch_head_sha", return_value=None),
         patch("charlie_work.workflow.remote_branch_ahead_count", return_value=(0, None)),
     ):
@@ -499,7 +500,7 @@ def test_stale_leftover_outcome_emits_worker_evidence_stale_event(tmp_path: Path
     dispatch_2_started_at = _STALE_DISPATCH_2_STARTED_AT
 
     with (
-        patch("charlie_work.workflow._worker_pid_alive", return_value=False),
+        host_probe(alive=False),
         patch("charlie_work.workflow.remote_branch_head_sha", return_value=None),
         patch("charlie_work.workflow.remote_branch_ahead_count", return_value=(0, None)),
     ):
@@ -531,7 +532,7 @@ def test_stale_leftover_outcome_emits_worker_evidence_stale_event(tmp_path: Path
     count_before = len(query_events(paths.state_file, kind="worker_evidence_stale"))
 
     with (
-        patch("charlie_work.workflow._worker_pid_alive", return_value=False),
+        host_probe(alive=False),
         patch("charlie_work.workflow.remote_branch_head_sha", return_value=None),
         patch("charlie_work.workflow.remote_branch_ahead_count", return_value=(0, None)),
     ):
@@ -602,7 +603,7 @@ def test_permission_denial_blocked_outcome_is_not_operator_escalated(tmp_path: P
     fake_gh.prs = []
 
     with (
-        patch("charlie_work.workflow._worker_pid_alive", return_value=False),
+        host_probe(alive=False),
         patch("charlie_work.workflow.remote_branch_head_sha", return_value=None),
         patch("charlie_work.workflow.remote_branch_ahead_count", return_value=(0, None)),
     ):
@@ -637,7 +638,7 @@ def test_dry_run_no_pr_precompute_writes_no_stale_event_or_marker(tmp_path: Path
 
     def sweep(*, dry_run: bool) -> None:
         with (
-            patch("charlie_work.workflow._worker_pid_alive", return_value=False),
+            host_probe(alive=False),
             patch("charlie_work.workflow.remote_branch_head_sha", return_value=None),
             patch("charlie_work.workflow.remote_branch_ahead_count", return_value=(0, None)),
         ):

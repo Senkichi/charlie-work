@@ -94,6 +94,17 @@ def test_merge_pr_auto_still_goes_through_the_gh_cli(tmp_path: Path) -> None:
     assert gh_adapter.api_requests == []
 
 
+def test_merge_pr_auto_and_match_head_commit_are_rejected(tmp_path: Path) -> None:
+    """``--auto`` has no head-commit guard wired: the combination that would
+    silently drop ``--match-head-commit`` is refused like an unsupported flag."""
+    gh, http, gh_adapter = make_github(tmp_path)
+
+    with pytest.raises(ConfigError, match="match-head-commit"):
+        gh.merge_pr(7, "squash", merge_flags=("--auto", "--match-head-commit=abc123"))
+
+    assert http.calls == [] and gh_adapter.api_requests == []
+
+
 def test_merge_pr_dry_run_sends_nothing_and_still_reads_as_merged(tmp_path: Path) -> None:
     gh, http, gh_adapter = make_github(tmp_path, http=merge_adapter(ok({}), "CLEAN"), dry_run=True)
 
@@ -249,6 +260,31 @@ def test_merge_pr_a_partial_read_with_errors_fails_closed(tmp_path: Path) -> Non
     gh, http, _ = make_github(tmp_path, http=FakeAdapter("http", [partial]))
 
     with pytest.raises(GitHubError):
+        gh.merge_pr(7, "squash")
+
+    assert rest_sent(http) == []
+
+
+@pytest.mark.parametrize(
+    "node",
+    [
+        None,  # pullRequest: null (a 200 that resolved nothing)
+        {},  # a PR object the field was not selected on
+        {"mergeStateStatus": None},  # explicit null
+        {"mergeStateStatus": ""},  # an empty state
+    ],
+    ids=["null-pr", "missing-field", "null-field", "empty-field"],
+)
+def test_merge_pr_a_200_without_merge_state_status_fails_closed(
+    tmp_path: Path, node: object
+) -> None:
+    """A 200 body that does not carry ``mergeStateStatus`` is not a green
+    light: fail closed and never send the merge PUT."""
+    gh, http, _ = make_github(
+        tmp_path, http=FakeAdapter("http", [graphql_ok({"repository": {"pullRequest": node}})])
+    )
+
+    with pytest.raises(GitHubError, match="mergeStateStatus"):
         gh.merge_pr(7, "squash")
 
     assert rest_sent(http) == []

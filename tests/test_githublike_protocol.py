@@ -7,6 +7,7 @@ import inspect
 from pathlib import Path
 
 import pytest
+from _src_ast import parsed
 
 import charlie_work.github as _github_module
 from _fake_transport import (
@@ -722,7 +723,7 @@ def test_every_capability_module_declares_future_annotations() -> None:
     modules = sorted(pkg_dir.glob("*.py"))
     assert modules, "no github_capabilities modules found to check"
     for path in modules:
-        tree = ast.parse(path.read_text(encoding="utf-8"))
+        tree = parsed(path)
         has_future_annotations = any(
             isinstance(node, ast.ImportFrom)
             and node.module == "__future__"

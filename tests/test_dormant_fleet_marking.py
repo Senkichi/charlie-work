@@ -65,6 +65,7 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
+from _src_ast import parsed
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC = REPO_ROOT / "src" / "charlie_work"
@@ -178,7 +179,7 @@ def _sibling_imports(path: Path, known: set[str]) -> set[str]:
             if init in known:
                 found.add(init)
 
-    tree = ast.parse(path.read_text(encoding="utf-8"))
+    tree = parsed(path)
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom):
             level = node.level or 0

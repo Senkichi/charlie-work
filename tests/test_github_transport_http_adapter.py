@@ -180,20 +180,28 @@ class FakeCache:
     def get(self, path: str):
         return self.entries.get(path)
 
-    def record(self, path: str, *, etag: str, status: int, body: str) -> None:
+    def record(
+        self, path: str, *, etag: str, status: int, body: str, link: str | None = None
+    ) -> None:
         @dataclass
         class Entry:
             etag: str
             status: int
             body: str
+            link: str | None = None
 
-        self.entries[path] = Entry(etag, status, body)
+        self.entries[path] = Entry(etag, status, body, link)
 
 
 def test_etag_conditional_get_serves_a_304_from_the_cache_as_a_200() -> None:
+    link = '<https://api.github.com/repos/o/r/pulls/1?page=2>; rel="next"'
     cache = FakeCache()
     conn = FakeConn(
-        [FakeRaw(200, {"ETag": '"abc"'}, b'{"n": 1}'), FakeRaw(304, {"ETag": '"abc"'}, b"")]
+        [
+            FakeRaw(200, {"ETag": '"abc"', "Link": link}, b'{"n": 1}'),
+            FakeRaw(304, {"ETag": '"abc"'}, b""),  # a 304 may omit Link
+            FakeRaw(304, {"ETag": '"abc"', "Link": '<fresh>; rel="next"'}, b""),
+        ]
     )
     adapter = _adapter(conn, cache=cache)
     first = _send(adapter, GET)
@@ -202,6 +210,12 @@ def test_etag_conditional_get_serves_a_304_from_the_cache_as_a_200() -> None:
     assert second.status == 200 and second.json() == {"n": 1}
     assert conn.requests[0][3].get("If-None-Match") is None
     assert conn.requests[1][3]["If-None-Match"] == '"abc"'
+    # The 304 omitted Link, so the cached one is served with the cached body:
+    # paginate_rest reads the served headers to keep following pages.
+    assert second.header("link") == link
+    # A 304 that does carry Link wins over the cached one.
+    third = _send(adapter, GET)
+    assert isinstance(third, Response) and third.header("link") == '<fresh>; rel="next"'
 
 
 def test_mutations_never_use_or_fill_the_etag_cache() -> None:

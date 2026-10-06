@@ -17,6 +17,7 @@ from _sessions_db_fixtures import make_sessions_db
 from charlie_work.config import OrchestratorConfig, PostMortemConfig
 from charlie_work.post_mortem import classify_and_record, real_activity_for_worker
 from charlie_work.worker import WorkerView
+from _src_ast import parsed, source_files
 
 
 def test_make_sessions_db_schema_satisfies_post_mortem_queries(tmp_path: Path) -> None:
@@ -128,12 +129,12 @@ def test_no_hand_rolled_message_nodes_ddl_in_tests() -> None:
     tests_dir = Path(__file__).resolve().parent
 
     offenders: list[str] = []
-    for source_file in sorted(tests_dir.rglob("*.py")):
+    for source_file in source_files(tests_dir):
         if source_file.name == "_sessions_db_fixtures.py":
             continue
 
         try:
-            source_text = source_file.read_text(encoding="utf-8")
+            tree = parsed(source_file)
         except UnicodeDecodeError as exc:
             offenders.append(
                 f"{source_file.relative_to(tests_dir.parent)}: "
@@ -141,7 +142,6 @@ def test_no_hand_rolled_message_nodes_ddl_in_tests() -> None:
             )
             continue
 
-        tree = ast.parse(source_text, filename=str(source_file))
         collector = _StringLiteralCollector()
         collector.visit(tree)
 

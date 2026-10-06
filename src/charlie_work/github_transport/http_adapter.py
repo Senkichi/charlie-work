@@ -93,6 +93,7 @@ class CachedEntry(Protocol):
     etag: str
     status: int
     body: str
+    link: str | None
 
 
 class EtagCache(Protocol):
@@ -104,7 +105,9 @@ class EtagCache(Protocol):
 
     def get(self, path: str) -> CachedEntry | None: ...
 
-    def record(self, path: str, *, etag: str, status: int, body: str) -> None: ...
+    def record(
+        self, path: str, *, etag: str, status: int, body: str, link: str | None = None
+    ) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -260,7 +263,14 @@ class HttpAdapter:
         if isinstance(request, GraphQLRequest):
             return self._finish_graphql(request, outcome)
         if outcome.status == _NOT_MODIFIED and cached is not None:
-            return Response(cached.status, outcome.headers, cached.body, "http")
+            headers = outcome.headers
+            if cached.link and outcome.header("link") is None:
+                # A 304 need not repeat representation metadata (RFC 9110
+                # 15.4.5): the cached Link must come back with the cached body
+                # or paginate_rest reads the walk as over and returns a
+                # truncated list.
+                headers = (*headers, ("link", cached.link))
+            return Response(cached.status, headers, cached.body, "http")
         if self._cache is not None and request.method == "GET":
             self._remember(prepared.path, outcome)
         if request.follow_redirect and outcome.status in _REDIRECT_STATUSES:
@@ -270,7 +280,13 @@ class HttpAdapter:
     def _remember(self, path: str, response: Response) -> None:
         etag = response.header("etag")
         if self._cache is not None and response.status == 200 and etag:
-            self._cache.record(path, etag=etag, status=200, body=response.body)
+            self._cache.record(
+                path,
+                etag=etag,
+                status=200,
+                body=response.body,
+                link=response.header("link"),
+            )
 
     def _finish_graphql(self, request: GraphQLRequest, response: Response) -> Outcome:
         if not 200 <= response.status < 300:

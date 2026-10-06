@@ -48,6 +48,7 @@ import pytest
 from _fakes_github import FakeGitHub
 from _dispatch_fixtures import _stub_real_activity_probe_for_stalled_tests  # noqa: F401
 from charlie_work.claude_code import ClaudeWorkerRecord
+from charlie_work.host.fakes import FakeProcessProbe
 from charlie_work.config import OrchestratorConfig, WorkerRoleConfig, load_config
 from charlie_work.local_issues import LocalFileGitHub
 from charlie_work.paths import resolved_layout, runtime_paths
@@ -225,21 +226,20 @@ def _phantom_launch(worktree_path: Path) -> object:
     return _fake_launch
 
 
-def _patch_dead_pids(monkeypatch) -> None:
+def _patch_dead_pids(monkeypatch, fake_host) -> None:
     """All three liveness seams the dispatch path consults must read dead.
 
     ``charlie_work.workflow.is_pid_alive`` — the post-launch phantom
     classifier's recorded-PID check. ``charlie_work.worker_fate.is_alive`` —
-    the sidecar census (``_issues_with_live_workers``). And
-    ``charlie_work.workflow._worker_pid_alive`` — the state-entry check in
-    candidate selection; without it the outcome depends on the host's PID
-    table (``_worker_pid_alive`` reads ``_host.current().probe.is_alive``
-    directly), which is exactly the flakiness
+    the sidecar census (``_issues_with_live_workers``). And the state-entry
+    liveness check in candidate selection, which reads the injected host
+    probe — faked all-dead here so the outcome does not depend on the
+    host's PID table, which is exactly the flakiness
     test_charlie_work_dispatch_phantom.py documents for PID 6262.
     """
     monkeypatch.setattr("charlie_work.workflow.is_pid_alive", lambda pid, start: False)
     monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda pid, start: False)
-    monkeypatch.setattr("charlie_work.workflow._worker_pid_alive", lambda entry: False)
+    fake_host(probe=FakeProcessProbe())
 
 
 def _label_names(gh: LocalFileGitHub, issue_number: int) -> set[str]:
@@ -262,7 +262,7 @@ def _events(state_file: Path, kind: str, issue_number: int | None = None):
 
 
 def test_phantom_parks_committed_local_work(
-    tmp_path: Path, shallow_wts: Path, monkeypatch
+    tmp_path: Path, shallow_wts: Path, monkeypatch, fake_host
 ) -> None:
     """A phantom live-worker result on a local backend whose sidecar'd
     worktree carries commits ahead of base must park the branch
@@ -290,7 +290,7 @@ def test_phantom_parks_committed_local_work(
     monkeypatch.setattr(
         "charlie_work.claude_code.launch_claude_worker", _phantom_launch(worktree_path)
     )
-    _patch_dead_pids(monkeypatch)
+    _patch_dead_pids(monkeypatch, fake_host)
 
     app = OrchestratorApp(repo_root, paths, config, gh)
     result = app.dispatch(limit=1)
@@ -325,7 +325,7 @@ def test_phantom_parks_committed_local_work(
 
 
 def test_phantom_parks_committed_local_work_without_sidecar(
-    tmp_path: Path, shallow_wts: Path, monkeypatch
+    tmp_path: Path, shallow_wts: Path, monkeypatch, fake_host
 ) -> None:
     """The incident's exact shape: the dead worker's sidecar is ALREADY gone
     (reaped by an earlier lane) but its branch ref still carries the
@@ -351,7 +351,7 @@ def test_phantom_parks_committed_local_work_without_sidecar(
         "charlie_work.claude_code.launch_claude_worker",
         _phantom_launch(tmp_path / "wt"),
     )
-    _patch_dead_pids(monkeypatch)
+    _patch_dead_pids(monkeypatch, fake_host)
 
     app = OrchestratorApp(repo_root, paths, config, gh)
     result = app.dispatch(limit=1)
@@ -369,7 +369,9 @@ def test_phantom_parks_committed_local_work_without_sidecar(
     assert result2.data["attempted_count"] == 0
 
 
-def test_phantom_no_commits_still_requeues(tmp_path: Path, shallow_wts: Path, monkeypatch) -> None:
+def test_phantom_no_commits_still_requeues(
+    tmp_path: Path, shallow_wts: Path, monkeypatch, fake_host
+) -> None:
     """Control: a local-backend phantom whose branch carries NO commits keeps
     the pre-#2262 behavior — sidecar reaped, ``session_failed_relabeled``
     with ``phantom_live_worker_pid_dead``, no park, issue left dispatchable."""
@@ -395,7 +397,7 @@ def test_phantom_no_commits_still_requeues(tmp_path: Path, shallow_wts: Path, mo
     monkeypatch.setattr(
         "charlie_work.claude_code.launch_claude_worker", _phantom_launch(worktree_path)
     )
-    _patch_dead_pids(monkeypatch)
+    _patch_dead_pids(monkeypatch, fake_host)
 
     app = OrchestratorApp(repo_root, paths, config, gh)
     result = app.dispatch(limit=1)
@@ -421,7 +423,7 @@ def test_phantom_no_commits_still_requeues(tmp_path: Path, shallow_wts: Path, mo
 
 
 def test_phantom_pr_capable_backend_routes_through_attempt_salvage(
-    tmp_path: Path, shallow_wts: Path, monkeypatch
+    tmp_path: Path, shallow_wts: Path, monkeypatch, fake_host
 ) -> None:
     """PR-capable backend, no preserving fate: the probe finds commits on the
     dead worker's branch and routes them through ``_attempt_salvage`` — the
@@ -456,7 +458,7 @@ def test_phantom_pr_capable_backend_routes_through_attempt_salvage(
         "charlie_work.claude_code.launch_claude_worker",
         _phantom_launch(tmp_path / "wt"),
     )
-    _patch_dead_pids(monkeypatch)
+    _patch_dead_pids(monkeypatch, fake_host)
 
     app = OrchestratorApp(repo_root, paths, config, fake_gh)
     result = app.dispatch(limit=1)
@@ -473,7 +475,7 @@ def test_phantom_pr_capable_backend_routes_through_attempt_salvage(
 
 
 def test_phantom_salvage_failure_defers_without_requeue(
-    tmp_path: Path, shallow_wts: Path, monkeypatch
+    tmp_path: Path, shallow_wts: Path, monkeypatch, fake_host
 ) -> None:
     """A probe that finds commits but fails the park write must NOT fall back
     to requeueing — that is the archive path. With no sidecar (the incident
@@ -509,7 +511,7 @@ def test_phantom_salvage_failure_defers_without_requeue(
         "charlie_work.claude_code.launch_claude_worker",
         _phantom_launch(tmp_path / "wt"),
     )
-    _patch_dead_pids(monkeypatch)
+    _patch_dead_pids(monkeypatch, fake_host)
 
     app = OrchestratorApp(repo_root, paths, config, gh)
     result = app.dispatch(limit=1)

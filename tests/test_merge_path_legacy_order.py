@@ -17,6 +17,7 @@ from typing import Any
 
 import _merge_path_facts as mf
 import pytest
+from _src_ast import parsed
 from _fakes_github import FakeGitHub, FakeGitHubWithMissingRequired
 from _merge_path_characterization_harness import (
     _ISSUE,
@@ -152,7 +153,7 @@ def _module_tree(name: str) -> ast.Module:
     import importlib
 
     module = importlib.import_module(name)
-    return ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
+    return parsed(Path(module.__file__))
 
 
 def _decided_event_kinds() -> set[str]:

@@ -25,6 +25,7 @@ import sys
 from pathlib import Path
 
 from _fakes_github import FakeGitHub
+from _host_fixtures import host_probe
 from charlie_work.config import AutoMergeConfig, OrchestratorConfig
 from charlie_work.paths import runtime_paths
 from charlie_work.state import load_state
@@ -387,7 +388,6 @@ def test_orphaned_worker_stale_branch_does_not_bind_unrelated_pr(
     validator, 709 is closed so the binding is rejected, the orphan is treated
     as a no-open-PR orphan, and no event references the unrelated PR.
     """
-    from unittest.mock import patch
 
     from charlie_work.config import WatchdogConfig
     from charlie_work.state import load_state, save_state, state_lock
@@ -416,7 +416,7 @@ def test_orphaned_worker_stale_branch_does_not_bind_unrelated_pr(
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
 
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+    with host_probe(alive=False):
         _detect_and_handle_orphaned_workers(
             sessions_dir,
             paths.state_file,

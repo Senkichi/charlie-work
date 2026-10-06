@@ -33,6 +33,7 @@ import re
 from pathlib import Path
 
 import pytest
+from _src_ast import parsed, parsed_source, source_files, source_text
 
 _REPO_ROOT = Path(__file__).parents[1]
 _DISPATCH_SELECTION_PATH = _REPO_ROOT / "src" / "charlie_work" / "dispatch_selection.py"
@@ -55,7 +56,7 @@ def _module_level_defined_names(path: Path) -> list[str]:
     Dunders are skipped. This is the module's own public surface, read
     straight off its AST -- not restated by hand anywhere in this file.
     """
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    tree = parsed(path)
     names: list[str] = []
     for node in tree.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
@@ -73,7 +74,7 @@ def _module_level_defined_names(path: Path) -> list[str]:
 
 def _facade_reexported_names(workflow_path: Path) -> set[str]:
     """Names workflow.py's facade block currently re-exports from ``.dispatch_selection``."""
-    tree = ast.parse(workflow_path.read_text(encoding="utf-8"), filename=str(workflow_path))
+    tree = parsed(workflow_path)
     names: set[str] = set()
     for node in ast.walk(tree):
         if (
@@ -107,7 +108,7 @@ def _workflow_imports_in(source: str, *, filename: str = "<string>") -> list[str
     ``node.module`` is ``None``, not ``"workflow"``), and both ``from
     charlie_work.workflow import X`` / ``import charlie_work.workflow``.
     """
-    tree = ast.parse(source, filename=filename)
+    tree = parsed_source(source, filename)
     offenders: list[str] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom):
@@ -323,10 +324,10 @@ def _consumer_referenced_names(candidates: set[str], search_roots: list[Path]) -
     for root in search_roots:
         if not root.is_dir():
             continue
-        for path in sorted(root.rglob("*.py")):
-            source = path.read_text(encoding="utf-8")
+        for path in source_files(root):
+            source = source_text(path)
             try:
-                tree = ast.parse(source, filename=str(path))
+                tree = parsed(path)
             except SyntaxError:  # pragma: no cover - a broken tree is a different failure
                 continue
             for node in ast.walk(tree):

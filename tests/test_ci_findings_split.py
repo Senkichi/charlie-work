@@ -95,6 +95,7 @@ import re
 from pathlib import Path
 
 import pytest
+from _src_ast import parsed, parsed_source, source_files, source_text
 
 _REPO_ROOT = Path(__file__).parents[1]
 _CI_FINDINGS_PATH = _REPO_ROOT / "src" / "charlie_work" / "ci_findings.py"
@@ -137,7 +138,7 @@ def _module_level_defined_names(path: Path) -> list[str]:
     test and the AC5 completeness test below, which both draw their
     candidate set from this helper.
     """
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    tree = parsed(path)
     names: list[str] = []
     for node in tree.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
@@ -155,7 +156,7 @@ def _module_level_defined_names(path: Path) -> list[str]:
 
 def _facade_reexported_names(workflow_path: Path) -> set[str]:
     """Names workflow.py's facade block currently re-exports from ``.ci_findings``."""
-    tree = ast.parse(workflow_path.read_text(encoding="utf-8"), filename=str(workflow_path))
+    tree = parsed(workflow_path)
     names: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom) and node.level == 1 and node.module == "ci_findings":
@@ -197,7 +198,7 @@ def _module_imports_in(
     branch, a gap issue #1300 documents. Copied here verbatim rather than
     inherited from those older suites.
     """
-    tree = ast.parse(source, filename=filename)
+    tree = parsed_source(source, filename)
     offenders: list[str] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom):
@@ -235,8 +236,7 @@ def test_ci_findings_has_no_workflow_import() -> None:
     charlie_work.workflow to already be fully initialized, and vice versa).
     """
     offenders = _workflow_imports_in(
-        _CI_FINDINGS_PATH.read_text(encoding="utf-8"),
-        filename=str(_CI_FINDINGS_PATH),
+        source_text(_CI_FINDINGS_PATH), filename=str(_CI_FINDINGS_PATH)
     )
     assert offenders == [], (
         "ci_findings.py imports from charlie_work.workflow -- this creates an "
@@ -446,10 +446,10 @@ def _consumer_referenced_names(candidates: set[str], search_roots: list[Path]) -
     for root in search_roots:
         if not root.is_dir():
             continue
-        for path in sorted(root.rglob("*.py")):
-            source = path.read_text(encoding="utf-8")
+        for path in source_files(root):
+            source = source_text(path)
             try:
-                tree = ast.parse(source, filename=str(path))
+                tree = parsed(path)
             except SyntaxError:  # pragma: no cover - a broken tree is a different failure
                 continue
             for node in ast.walk(tree):
@@ -703,7 +703,7 @@ def _write_event_call_sites(source: str, *, filename: str = "<string>") -> list[
     A single ``ast.NodeVisitor`` pass (not the nested-``ast.walk`` shape
     that would double-count every call).
     """
-    tree = ast.parse(source, filename=filename)
+    tree = parsed_source(source, filename)
     hits: list[dict[str, object]] = []
 
     class _Visitor(ast.NodeVisitor):
@@ -763,7 +763,7 @@ def test_write_event_call_scanner_has_a_positive_control() -> None:
     found_names = {
         hit["name"]
         for path in [_WORKFLOW_PATH, *sorted(_ORCHESTRATION_DIR.glob("*.py"))]
-        for hit in _write_event_call_sites(path.read_text(encoding="utf-8"), filename=str(path))
+        for hit in _write_event_call_sites(source_text(path), filename=str(path))
     }
     assert found_names, "the scanner found zero call sites in the corpus -- the scanner is broken"
     expected_broad_coverage = {"_write_json", "_write_text_atomic", "append_event", "log_event"}

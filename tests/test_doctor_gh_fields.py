@@ -7,10 +7,10 @@ bodies are verbatim relocations; shared helpers live in
 
 from __future__ import annotations
 
-import ast
 from pathlib import Path
 from _field_list_lint import _find_gh_field_list_violations
 from _script_loader import load_script_module
+from _src_ast import parsed
 
 
 def test_gh_field_lists_use_constants_no_inline_literals() -> None:
@@ -65,8 +65,7 @@ def test_gh_field_lists_use_constants_no_inline_literals() -> None:
             # Constant definitions are allowed in github.py
             continue
         try:
-            source = py_file.read_text(encoding="utf-8")
-            tree = ast.parse(source, filename=str(py_file))
+            tree = parsed(py_file)
         except (OSError, SyntaxError):
             continue
 

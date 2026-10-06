@@ -20,6 +20,7 @@ from _fakes_github import FakeGitHub
 from _rework_dispatch_fixtures import (
     _wg,
 )
+from _host_fixtures import host_probe
 from charlie_work.config import (
     DevinConfig,
     OrchestratorConfig,
@@ -47,7 +48,6 @@ def test_orphan_sweep_redispatch_cap_first_observation_with_long_history(
     keeps a long adapter_history to prove the new counter does not depend
     on it.
     """
-    from unittest.mock import patch
 
     config = OrchestratorConfig(
         devin=DevinConfig(),
@@ -104,7 +104,7 @@ def test_orphan_sweep_redispatch_cap_first_observation_with_long_history(
     from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
     # First orphan-sweep pass through the cap code for this issue.
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+    with host_probe(alive=False):
         _detect_and_handle_orphaned_workers(
             sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
         )
@@ -149,7 +149,6 @@ def test_orphan_sweep_redispatch_cap_fires_with_api_worker_disabled(
        distinct redispatch (a fresh ``dispatched_at`` each attempt).
     3. The cap fires after ``max_auto_redispatch + 1`` attempts.
     """
-    from unittest.mock import patch
 
     # api_worker.enabled defaults to False -- no need to set it explicitly.
     config = OrchestratorConfig(
@@ -196,7 +195,7 @@ def test_orphan_sweep_redispatch_cap_fires_with_api_worker_disabled(
     from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
     def _run_sweep() -> None:
-        with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        with host_probe(alive=False):
             _detect_and_handle_orphaned_workers(
                 sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
             )
@@ -275,7 +274,6 @@ def test_orphan_sweep_redispatch_cap_counts_distinct_identities_and_escalates(
     only suppresses re-observation of the SAME dispatch, not real repeated
     redispatch attempts.
     """
-    from unittest.mock import patch
 
     config = OrchestratorConfig(
         devin=DevinConfig(),
@@ -316,7 +314,7 @@ def test_orphan_sweep_redispatch_cap_counts_distinct_identities_and_escalates(
     from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
     def _run_sweep() -> None:
-        with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        with host_probe(alive=False):
             _detect_and_handle_orphaned_workers(
                 sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
             )

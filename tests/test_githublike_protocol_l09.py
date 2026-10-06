@@ -29,6 +29,7 @@ import time
 from pathlib import Path
 
 import pytest
+from _src_ast import parsed
 
 import charlie_work.github as _github_module
 from _fake_transport import FakeAdapter, checks_reply, make_github, ok
@@ -123,8 +124,7 @@ def test_github_direct_def_count_is_two() -> None:
     included) rather than the shared ``_lexical_github_defs()`` helper, which
     deliberately excludes dunders for its own (protocol-conformance) purpose.
     """
-    source = Path(_github_module.__file__).read_text(encoding="utf-8")
-    tree = ast.parse(source)
+    tree = parsed(Path(_github_module.__file__))
     (github_cls,) = [
         n for n in ast.walk(tree) if isinstance(n, ast.ClassDef) and n.name == "GitHub"
     ]

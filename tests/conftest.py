@@ -173,6 +173,21 @@ def _kill_on_close_job() -> None:
     enter_kill_on_close_job()
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _src_ast_mutation_guard() -> Iterator[None]:
+    """HS-CW-3: fail the session if a test mutated a shared ``_src_ast`` tree.
+
+    ``_src_ast.parsed`` hands every caller in this process the same
+    ``ast.Module``; one consumer editing it would poison every later scan.
+    Teardown re-digests every handed-out tree once per process and names each
+    file whose tree changed. Mutating callers use ``_src_ast.parsed_fresh``.
+    """
+    yield
+    from _src_ast import assert_no_mutations
+
+    assert_no_mutations()
+
+
 @pytest.fixture(autouse=True)
 def _no_leaked_child_processes() -> Iterator[None]:
     """Issue #1851: fail a test that leaves a live descendant behind.
@@ -275,6 +290,18 @@ def _isolate_fleet_registry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
     that single knob for suite-wide isolation.
     """
     monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", str(tmp_path / "fleet"))
+
+
+@pytest.fixture(autouse=True)
+def _isolate_host_io_manifest(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Point ci-fleet's host I/O manifest at a per-test path that does not exist.
+
+    On a host provisioned for fast I/O, the default manifest is real, and any
+    test that resolves the worktrees root (``paths.resolved_layout``) would put
+    worktrees on that host's volume. ``host_io_worker`` tests write their own
+    manifest at this path. Control: ``test_the_suite_never_reads_the_hosts_manifest``.
+    """
+    monkeypatch.setenv("CI_FLEET_HOST_IO_MANIFEST", str(tmp_path / "host-io" / "host-io.json"))
 
 
 @pytest.fixture(autouse=True)
