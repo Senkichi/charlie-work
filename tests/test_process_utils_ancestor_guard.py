@@ -512,6 +512,7 @@ def test_win32_process_ppid_snapshot_real_rows_carry_creation_times() -> None:
     row = snapshot.get(os.getpid())
     assert row is not None, "own pid missing from the real snapshot"
     assert row.created is not None, "creation time unavailable: recycle guard is inert"
+    assert row.ppid == os.getppid(), "ppid table broken or zeroed: ancestor guard is unprotected"
     parent_row = snapshot.get(row.ppid)
     if parent_row is not None and parent_row.created is not None:
         assert parent_row.created <= row.created

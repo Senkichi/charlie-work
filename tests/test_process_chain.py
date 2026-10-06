@@ -153,6 +153,70 @@ def test_win32_snapshot_failure_returns_empty(monkeypatch: pytest.MonkeyPatch) -
     assert pc.win32_process_ppid_snapshot() == {}
 
 
+def test_bulk_ppid_map_with_platform_ppid_map(monkeypatch: pytest.MonkeyPatch) -> None:
+    """psutil._psplatform.ppid_map present: returns int-coerced pid->ppid map
+    in a single call, without touching process_iter."""
+    fake_platform = SimpleNamespace(ppid_map=lambda: {"100": "50", 200: 100, 300: 0})
+    monkeypatch.setattr(pc.psutil, "_psplatform", fake_platform, raising=False)
+
+    def boom(attrs: Any = None) -> Any:
+        raise AssertionError("process_iter must not be called when ppid_map is present")
+
+    monkeypatch.setattr(pc.psutil, "process_iter", boom)
+
+    assert pc._bulk_ppid_map() == {100: 50, 200: 100, 300: 0}
+
+
+def test_bulk_ppid_map_fallback_when_platform_ppid_map_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """psutil._psplatform.ppid_map absent: falls back to per-row process_iter
+    ppid read and returns the same int-coerced pid->ppid map."""
+    monkeypatch.setattr(pc.psutil, "_psplatform", None, raising=False)
+    monkeypatch.setattr(
+        pc.psutil,
+        "process_iter",
+        lambda attrs=None: iter(
+            [
+                _FakePsutilProc(pid="100", ppid="50"),
+                _FakePsutilProc(pid=200, ppid=100),
+                _FakePsutilProc(pid=300, ppid=None),
+                _FakePsutilProc(pid="invalid", ppid=1),
+                _FakePsutilProc(ppid=1),
+            ]
+        ),
+    )
+
+    assert pc._bulk_ppid_map() == {100: 50, 200: 100, 300: 0}
+
+
+def test_bulk_ppid_map_fallback_when_ppid_map_attribute_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """psutil._psplatform exists without ppid_map: falls back to process_iter."""
+    monkeypatch.setattr(pc.psutil, "_psplatform", SimpleNamespace(), raising=False)
+    monkeypatch.setattr(
+        pc.psutil,
+        "process_iter",
+        lambda attrs=None: iter([_FakePsutilProc(pid=100, ppid=50)]),
+    )
+
+    assert pc._bulk_ppid_map() == {100: 50}
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows-only: real psutil snapshot")
+def test_win32_snapshot_real_reports_actual_parent() -> None:
+    """Real psutil snapshot on Windows (issue #2353 review): assert the live
+    snapshot reports this process's actual parent (``os.getppid()``), so an
+    all-zero or malformed ppid table from ``psutil._psplatform.ppid_map`` fails
+    loudly instead of silently unprotecting ancestors."""
+    snapshot = pc.win32_process_ppid_snapshot()
+    row = snapshot.get(os.getpid())
+    assert row is not None, "own pid missing from the real snapshot"
+    assert row.ppid == os.getppid()
+    assert row.created is not None
+
+
 class _FakePsutilProcess:
     """``psutil.Process`` stand-in for ``win32_ancestor_rows``: looks up
     ``(ppid, create_time)`` rows in a dict, raising ``NoSuchProcess`` for a

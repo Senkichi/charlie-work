@@ -114,7 +114,7 @@ def win32_process_ppid_snapshot() -> dict[int, ProcRow]:
     child, stop the ancestor walk early, and unprotect a real ancestor (the
     dangerous direction). ``psutil`` is a declared dependency: the ppid column
     comes from one bulk ``ppid_map`` call and the creation stamp from one
-    ``process_iter`` pass, so the rows are mutually consistent, with no
+    ``process_iter`` pass, gathered rapidly with no
     PowerShell spawn, no JSON round-trip, and no 10s timeout to stall the
     kill path (``kill_process_tree`` / ``kill_orphan_pid``). A process whose
     creation time is unreadable (``AccessDenied`` -> ``None``) simply keeps
