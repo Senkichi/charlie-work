@@ -119,14 +119,19 @@ def win32_ancestor_rows(pid: int, *, max_hops: int = MAX_CHAIN_HOPS) -> dict[int
     """``pid -> ProcRow`` for ``pid``'s own ancestor chain, gathered hop by hop.
 
     Same row shape as ``win32_process_ppid_snapshot``, but scoped to the one
-    chain a caller-side guard actually walks: each hop is a single
-    ``psutil.Process`` read instead of a host-wide ``process_iter`` over
-    every process on the box. The snapshot costs a
-    ``NtQuerySystemInformation`` round-trip per process (seconds at a few
-    hundred processes) while a real chain is a handful of hops — and the
-    kill guard (``orphan_sweep._self_ancestor_pids``) only ever consults
-    rows on its own chain, so rows for unrelated processes were pure cost
-    on every ``kill_process_tree``/``kill_orphan_pid`` call (issue #2332).
+    chain a caller-side guard actually walks. Scope does not make a hop
+    cheap: on psutil 7.x ``Process.ppid()`` resolves through
+    ``cext.ppid_map()`` — a full ``CreateToolhelp32Snapshot`` enumeration of
+    every process on the box — and ``Process()``'s identity probe pays an
+    ``OpenProcess``/``GetProcessTimes`` handle query whose result also
+    answers ``create_time()`` (a protected pid's failed open falls back to
+    a ``NtQuerySystemInformation`` scan). What scope buys is paying that
+    enumeration-plus-handle-open pair once per *ancestor* — a handful of
+    hops — instead of once per *process*: ``process_iter`` runs the same
+    pair for every pid on the host, so its cost grows with host occupancy
+    rather than chain depth — the seconds-level delay issue #2332 tracks,
+    paid by every ``kill_process_tree``/``kill_orphan_pid`` call through
+    ``orphan_sweep._self_ancestor_pids``.
 
     Recording rows without adjudicating keeps ``ancestor_chain_pids`` the
     sole owner of the termination rules: a parent created *after* its child

@@ -9,6 +9,7 @@ rather than through any one consumer.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -180,7 +181,9 @@ def test_win32_ancestor_rows_walks_only_the_chain(
 ) -> None:
     """Chain-scoped (issue #2332): rows are gathered hop by hop through
     ``psutil.Process`` — the host-wide ``process_iter`` must never run, and
-    pids off the chain are never touched."""
+    pids off the chain are never touched. A hop is not cheap (``ppid()``
+    pays a full ``ppid_map()`` enumeration); the saving is paying that per
+    ancestor instead of per process."""
     rows = {300: (200, 5.0), 200: (100, 3.0), 100: (1, 1.0), 50: (1, 0.5)}
     probes = _patch_win32_process(monkeypatch, rows)
 
@@ -233,6 +236,23 @@ def test_win32_ancestor_rows_terminates_on_cycle(
 
     assert pc.win32_ancestor_rows(5) == {5: pc.ProcRow(7, 1.0), 7: pc.ProcRow(5, 1.0)}
     assert probes == [5, 7]
+
+
+def test_win32_ancestor_rows_real_chain_contains_self_and_parent() -> None:
+    """Real psutil, no fakes (issue #2332 review): the live walk for this
+    process must contain its own pid, record ``os.getppid()`` as its parent,
+    and carry a row for that parent — and every ``created`` stamp must be a
+    float or ``None``.
+
+    ``win32_ancestor_rows`` only uses cross-platform ``psutil.Process``
+    calls despite its name, so this runs on every CI platform rather than
+    being Windows-gated."""
+    rows = pc.win32_ancestor_rows(os.getpid())
+
+    assert os.getpid() in rows
+    assert rows[os.getpid()].ppid == os.getppid()
+    assert os.getppid() in rows
+    assert all(row.created is None or isinstance(row.created, float) for row in rows.values())
 
 
 def test_posix_snapshot_reads_fabricated_procfs(tmp_path: Path) -> None:

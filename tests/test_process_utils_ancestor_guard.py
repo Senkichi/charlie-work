@@ -251,10 +251,11 @@ def test_self_ancestor_pids_never_enumerates_the_host(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Issue #2332: the kill guard only ever consults rows on the caller's own
-    ancestor chain, so its row source must be chain-scoped — a host-wide
-    ``process_iter`` costs a ``NtQuerySystemInformation`` round-trip per
-    process (seconds at a few hundred processes) paid by every guarded kill
-    call. The spy records instead of raising because
+    ancestor chain, so its row source must be chain-scoped. The host-wide
+    ``process_iter`` snapshot pays a ``ppid_map()`` enumeration plus a
+    handle open *per process* — seconds at a few hundred processes — on
+    every guarded kill call, while ``_win32_ancestor_rows`` pays it only per
+    ancestor hop. The spy records instead of raising because
     ``_self_ancestor_pids`` deliberately degrades on helper failure, which
     would hide this regression."""
     monkeypatch.setattr(_sweep.os, "name", "nt")
@@ -270,6 +271,26 @@ def test_self_ancestor_pids_never_enumerates_the_host(
 
     assert os.getpid() in result
     assert iter_calls == []
+
+
+def test_self_ancestor_pids_scopes_gather_to_own_pid_and_hop_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_self_ancestor_pids`` must hand ``_win32_ancestor_rows`` the caller's
+    own pid and the shared ``_MAX_ANCESTOR_CHAIN_HOPS`` cap — the two knobs
+    that keep the gather chain-scoped."""
+    monkeypatch.setattr(_sweep.os, "name", "nt")
+    calls: list[tuple[int, int]] = []
+
+    def spy(pid: int, *, max_hops: int) -> dict[int, _sweep._ProcRow]:
+        calls.append((pid, max_hops))
+        return {pid: _sweep._ProcRow(1)}
+
+    monkeypatch.setattr(_sweep, "_win32_ancestor_rows", spy)
+
+    _sweep._self_ancestor_pids()
+
+    assert calls == [(os.getpid(), _sweep._MAX_ANCESTOR_CHAIN_HOPS)]
 
 
 def test_self_ancestor_pids_rejects_recycled_parent_pid(
