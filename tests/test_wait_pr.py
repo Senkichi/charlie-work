@@ -141,6 +141,38 @@ def test_required_only_ignores_unrequired_failures() -> None:
     assert [c.name for c in result.snapshot.checks] == ["lint"]
 
 
+def test_required_only_unregistered_required_check_is_pending_not_green() -> None:
+    fake = FakePR(
+        ([_run("lint")], []),
+        ([_run("lint")], []),
+        ([_run("lint"), _run("test")], []),
+    )
+    fake.required = {"contexts": ["lint", "test"]}
+    result, _, sleeps = _wait(fake, required_only=True)
+    assert result.polls == 3 and len(sleeps.delays) == 2
+    assert result.exit_code == 0
+
+    fake = FakePR(([_run("lint")], []))
+    fake.required = {"contexts": ["lint", "test"]}
+    result, _, _ = _wait(fake, required_only=True, timeout=30.0)
+    assert result.exit_code == wait_pr.EXIT_TIMEOUT
+    assert ("test", "pending", "not registered") in [
+        (c.name, c.state, c.detail) for c in result.snapshot.checks
+    ]
+
+
+def test_required_only_empty_required_set_considers_all_checks() -> None:
+    fake = FakePR(([_run("lint"), _run("other", conclusion="failure")], []))
+    fake.required = {"contexts": [], "checks": []}
+    result, _, _ = _wait(fake, required_only=True, timeout=30.0)
+    assert result.exit_code == 1  # not an idle-to-timeout; all checks considered
+
+    fake = FakePR(([_run("lint")], []))
+    fake.required = {"contexts": []}
+    result, _, _ = _wait(fake, required_only=True, timeout=30.0)
+    assert result.exit_code == 0
+
+
 def test_required_only_falls_back_to_all_checks_when_unreadable() -> None:
     fake = FakePR(([_run("lint"), _run("optional", conclusion="failure")], []))
     result, _, _ = _wait(fake, required_only=True)  # protection route 404s
@@ -164,6 +196,14 @@ def test_cli_main_maps_outcomes_to_exit_codes(
     monkeypatch.setattr(cli, "bootstrap_command", lambda args: SimpleNamespace(gh=gh))
     monkeypatch.setattr(wait_pr.time, "sleep", lambda s: None)
     assert cli.main(["wait-pr", "7", "--timeout", timeout]) == code
+
+
+def test_cli_client_without_rest_transport_is_usage_error_exit_2(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gh = SimpleNamespace(_repo_owner_name=lambda: ("octo", "hello"))  # no _transport_v2
+    monkeypatch.setattr(cli, "bootstrap_command", lambda args: SimpleNamespace(gh=gh))
+    assert cli.main(["wait-pr", "7"]) == 2
 
 
 def test_cli_rejects_malformed_repo_slug() -> None:

@@ -78,9 +78,15 @@ class Snapshot:
         return tuple(c for c in self.checks if c.state == "pass")
 
     def only(self, names: frozenset[str]) -> "Snapshot":
-        return Snapshot(
-            self.head_sha, self.base_ref, tuple(c for c in self.checks if c.name in names)
-        )
+        """Restrict to *names*; a name with no registered check is PENDING, not dropped.
+
+        Dropping an unregistered required context would let the run exit 0 before
+        the check ever appears (false green).
+        """
+        kept = [c for c in self.checks if c.name in names]
+        seen = {c.name for c in kept}
+        kept.extend(CheckState(n, "pending", "not registered") for n in sorted(names - seen))
+        return Snapshot(self.head_sha, self.base_ref, tuple(sorted(kept, key=lambda c: c.name)))
 
     def summary(self) -> str:
         return (
@@ -227,12 +233,13 @@ def wait_for_pr(
     *,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
     required_only: bool = False,
-    sleep: Callable[[float], None] = time.sleep,
+    sleep: Callable[[float], None] | None = None,
     monotonic: Callable[[], float] = time.monotonic,
     out: TextIO | None = None,
 ) -> WaitResult:
     """Poll until all checks are terminal; see the module docstring for exit codes."""
     stream = out if out is not None else sys.stderr
+    sleep = sleep if sleep is not None else time.sleep  # resolved at call time
     start = monotonic()
     interval = MIN_POLL_SECONDS
     last_line = ""
@@ -271,7 +278,13 @@ def wait_for_pr(
                             "wait-pr: required contexts unreadable; considering all checks",
                             file=stream,
                         )
-                if required is not None:
+                    elif not required:
+                        print(
+                            "wait-pr: base branch has no required contexts; "
+                            "considering all checks",
+                            file=stream,
+                        )
+                if required:
                     snapshot = snapshot.only(required)
             line = snapshot.summary()
             changed = line != last_line
@@ -322,7 +335,11 @@ def register_wait_pr_subparser(subparsers: argparse._SubParsersAction) -> None:
     parser.add_argument(
         "--required-only",
         action="store_true",
-        help="Only consider checks listed as required by the base branch's protection",
+        help=(
+            "Only consider checks required by the base branch's protection; a required "
+            "check that has not registered yet counts as pending. If the required list "
+            "is unreadable or empty, all checks are considered (a note is printed)."
+        ),
     )
 
 
@@ -360,8 +377,13 @@ def run_wait_pr_command(args: argparse.Namespace) -> CommandResult:
         target = gh._repo_owner_name()
     owner, repo = target
 
+    transport = getattr(gh, "_transport_v2", None)
+    if transport is None:
+        return _usage_error(
+            f"{type(gh).__name__} has no REST transport; wait-pr needs the GitHub client"
+        )
     result = wait_for_pr(
-        gh._transport_v2.send,
+        transport.send,
         owner,
         repo,
         args.number,
