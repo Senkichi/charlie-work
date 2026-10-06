@@ -108,7 +108,14 @@ logger = logging.getLogger(__name__)
 # ``transport.py`` (Track 2, issue #1593; design doc Section 5, L09), which
 # imports them from here rather than re-deriving a second copy -- the same
 # re-export pattern already used for ``PR_CHECKS_FIELDS``/``LABEL_LIST_FIELDS``.
-PR_LIST_FIELDS = "number,title,url,headRefName,baseRefName,body,isDraft,labels,author,updatedAt,reviewDecision,statusCheckRollup,headRefOid,isCrossRepository,mergeStateStatus,mergeable,state"
+PR_LIST_FIELDS = "number,title,url,headRefName,baseRefName,body,isDraft,labels,author,updatedAt,reviewDecision,headRefOid,isCrossRepository,mergeStateStatus,mergeable,state"
+# Issue #2443: ``PR_LIST_FIELDS`` no longer carries ``statusCheckRollup`` -- the
+# nested connection walk made the per-pass ``pr list`` the costliest GraphQL
+# read. Per-pass consumers read checks through ``pr_checks``/``pr_view``; the
+# one consumer that genuinely needs the whole open-PR rollup (the broadcast
+# ``update_open_prs`` required-check guard, which runs only after a merge) uses
+# ``pr_list_with_checks``.
+PR_LIST_WITH_CHECKS_FIELDS = PR_LIST_FIELDS + ",statusCheckRollup"
 PR_VIEW_FIELDS = "number,title,url,headRefName,baseRefName,body,isDraft,labels,author,updatedAt,reviewDecision,statusCheckRollup,state,mergeable,additions,deletions,headRefOid,isCrossRepository,mergeStateStatus"
 
 # Moved from ``github_capabilities/_base.py`` alongside ``merged_prs_for_issue``
@@ -233,6 +240,8 @@ class PullRequestsLike(Protocol):
     def pr_view(self, number: int, *, fields: str = ...) -> dict[str, Any]: ...
 
     def pr_list(self) -> list[dict[str, Any]]: ...
+
+    def pr_list_with_checks(self) -> list[dict[str, Any]]: ...
 
     def pr_diff(self, number: int) -> str: ...
 
@@ -415,6 +424,28 @@ class PullRequests(CapabilityCollaborator):
             "pr", "list", PR_LIST_FIELDS, state="open", limit=_LIST_LIMIT, long_call=True
         )
         result = self._list_json(read, kind="open PRs")
+        self._list_cache[cache_key] = result
+        return result
+
+    def pr_list_with_checks(self) -> list[dict[str, Any]]:
+        """Open PRs including ``statusCheckRollup`` (issue #2443).
+
+        Costlier than ``pr_list``; only for a consumer that must inspect every
+        open PR's checks at once. Cached per pass under its own key.
+        """
+        cache_key = ("pr_list_with_checks",)
+        cached = self._list_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        read = JsonRead(
+            "pr",
+            "list",
+            PR_LIST_WITH_CHECKS_FIELDS,
+            state="open",
+            limit=_LIST_LIMIT,
+            long_call=True,
+        )
+        result = self._list_json(read, kind="open PRs with checks")
         self._list_cache[cache_key] = result
         return result
 
