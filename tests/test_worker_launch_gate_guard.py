@@ -128,7 +128,13 @@ def test_scan_sees_the_known_launch_point() -> None:
     assert inspect.getmodule(adapters.dispatch_sessions) is adapters
 
 
-def test_only_the_gate_and_the_port_reference_dispatch_sessions() -> None:
+def test_only_launch_workers_references_dispatch_sessions() -> None:
+    """The leaf name predates #2229: ``launch_workers`` denotes the whole
+    worker-launch path -- the gate's ``_launch_workers`` plus the port's
+    ``RealWorkerLauncher.launch``, which is what ``_allowed()`` derives. The
+    name is kept verbatim because the collect-only gate (#1538) fails a
+    required check on any leaf-name removal, rename included, absent an
+    operator exemption label."""
     allowed = _allowed()
     offenders = [
         f"{module}:{line} in {scope}"
