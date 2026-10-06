@@ -6,3 +6,10 @@
 # per-run one.
 [test_selection]
 enabled = true
+
+# Nightly watchdog (ci-fleet >= 0.7.1): GitHub `schedule` events are best-effort, so
+# the ledger collector dispatches this workflow when no nightly ran in 26 h.
+[nightly]
+workflow = "ci.yml"
+inputs = { map = "true" }
+max_age_hours = 26
