@@ -1,7 +1,7 @@
 """Permanent ``gh run rerun`` refusals: one attempt, one escalation (#2445).
 
 GitHub answers a rerun of a run created over a month ago with HTTP 403 forever
-(live: ci_runners PR 73). The driver used to re-request it every pass.
+(seen on a downstream repo PR). The driver used to re-request it every pass.
 """
 
 from __future__ import annotations
@@ -115,3 +115,9 @@ def test_transient_error_keeps_retrying_without_escalation(tmp_path: Path) -> No
     assert "infra_rerun_refused" not in state["prs"].get("456", {})
     assert not _events(paths, "infra_rerun_escalated")
     assert (123, config.labels.operator_queue) not in fake_gh.labels_added
+
+
+def test_reason_constant_matches_escalation_literal() -> None:
+    from charlie_work.infra_rerun_refusal import REFUSED_ESCALATION_REASON
+
+    assert REFUSED_ESCALATION_REASON == "infra_rerun_refused"

@@ -572,9 +572,6 @@ def _drive_infra_rerun_or_escalate(
         errors=infra_rerun_errors,
     )
     if escalate_exhausted and issue_number is not None and (definitive_failed or refusal_escalate):
-        reason = (
-            "infra_rerun_cap_exceeded" if definitive_failed else _refusal.REFUSED_ESCALATION_REASON
-        )
         # Attempt cap exhausted (or no parseable run id at all): there is no
         # code-fix rework path for an infra failure, so escalate straight to
         # a human instead of looping forever on a PR that can never clear
@@ -586,7 +583,8 @@ def _drive_infra_rerun_or_escalate(
             state = _wf._escalate_issue(
                 state,
                 issue_number,
-                reason=reason,
+                # Literals (not the constant) so the #1683 reason scanner sees both.
+                reason="infra_rerun_cap_exceeded" if definitive_failed else "infra_rerun_refused",
                 reason_class="mechanical",
                 pr_number=pr_number,
                 pr_extra={"infra_rerun_attempts": persisted_attempts},
@@ -598,7 +596,6 @@ def _drive_infra_rerun_or_escalate(
                     "pr_number": pr_number,
                     "issue_number": issue_number,
                     "checks": list(definitive_failed),
-                    "reason": reason,
                     "refused_run_ids": sorted(refused_now),
                 },
             )
