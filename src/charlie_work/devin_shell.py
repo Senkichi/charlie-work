@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Any
 
 from charlie_work import process_utils as _process_utils
+from charlie_work.ledger_context import ledger_env
 from charlie_work.process_utils import CpuPriority, popen_worker
 from . import launch_events
 from .atomic_write import write_json_atomic
@@ -529,6 +530,7 @@ def launch_devin_session(
         )
     worker_env_dict = {
         **sanitized_env,
+        **ledger_env("worker", issue_number),
         **{str(k): str(v) for k, v in (worker_env or {}).items()},
     }
     # Issue #646: resolve what sanitize_env()+worker_env actually settled on,

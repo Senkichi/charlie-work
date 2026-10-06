@@ -211,6 +211,18 @@ jobs:
         # recorded set. The file is a CI artifact only (not uploaded) -- the
         # gate fails the step in-process; a human reads the gate's stdout.
         run: uv run pytest --tb=short -n auto --dist=load --junit-xml=pytest-junit.xml
+      # The test ledger (ci-fleet): the recorder wrote this run's per-test
+      # durations under RUNNER_TEMP; the workstation collector downloads them.
+      # Never allowed to change the job's result.
+      - name: Upload test-ledger spool
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-fleet-ledger-${{ github.job }}-${{ strategy.job-index }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ci-fleet-ledger/
+          retention-days: 3
+          if-no-files-found: ignore
       - name: Recorded-vs-collected check (issue #1621)
         # Fail the job when the junit <testcase> count differs from the
         # collected count -- the load-truncation failure mode where pytest
