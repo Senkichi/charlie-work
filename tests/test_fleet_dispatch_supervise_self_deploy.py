@@ -210,7 +210,8 @@ def test_run_fleet_supervise_does_not_restart_on_deferred_sync_with_unmoved_head
     HEAD did not move on *this* attempt, because those shas are carried
     forward from an earlier deferred-sync marker (see
     ``test_self_deploy_loud_warning_on_repeated_deferral`` in
-    test_supervise.py for the producer side of this exact scenario). Gating
+    test_supervise_self_deploy_deferral.py for the producer side of this
+    exact scenario). Gating
     the restart-exit on ``from_sha != to_sha`` instead of ``head_changed``
     made the supervisor exit and relaunch every single pass without ever
     reaching zero live workers to complete the deferred sync -- a total

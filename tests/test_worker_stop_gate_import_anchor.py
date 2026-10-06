@@ -308,6 +308,12 @@ def test_run_targeted_tests_real_imports_charlie_work_from_gated_worktree(
     # resolves charlie_work to "main" and the marker test fails -- the same
     # ordering the shared editable install produced before #1793.
     monkeypatch.setenv("PYTHONPATH", str(main_tree / "src"))
+    # The overwritten PYTHONPATH above deliberately drops every ambient entry,
+    # which also strips the directory that makes an ambient PYTEST_PLUGINS spec
+    # (e.g. the daemon's test_slot_plugin) importable -- leaving it armed would
+    # make the spawned pytest die on plugin import before collecting anything.
+    # Plugin loading is no part of what this test asserts, so disarm it.
+    monkeypatch.delenv("PYTEST_PLUGINS", raising=False)
 
     result = gate._run_targeted_tests(worktree, ("tests/test_marker.py",))
 
