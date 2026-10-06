@@ -10,8 +10,9 @@ orphan-sweep pipeline:
   dead session's worktree, and the ``_MIN_SWEEP_WORKTREE_PATH_LENGTH`` /
   ``_SWEEP_PATH_FORBIDDEN_CHARS`` validation keeps a degenerate needle from
   turning its ``-like "*<path>*"`` filter into a match-everything query.
-* ``_win32_process_ppid_snapshot`` / ``_posix_process_ppid_snapshot`` /
-  ``_self_ancestor_pids`` answer "who is the caller's ancestry" — the set the
+* ``_win32_ancestor_rows`` / ``_win32_process_ppid_snapshot`` /
+  ``_posix_process_ppid_snapshot`` / ``_self_ancestor_pids`` answer "who is
+  the caller's ancestry" — the set the
   kill primitives (``process_utils.kill_process_tree`` /
   ``process_utils.kill_orphan_pid``) refuse to terminate, because a sweep-hit
   PID naming any ancestor (uv, the pytest controller, the step's pwsh) fells
@@ -37,7 +38,8 @@ from . import host as _host
 from .process_chain import ancestor_chain_pids
 from .process_chain import ProcRow as _ProcRow  # noqa: F401 (deliberate re-export)
 from .process_chain import posix_process_ppid_snapshot as _posix_process_ppid_snapshot
-from .process_chain import win32_process_ppid_snapshot as _win32_process_ppid_snapshot
+from .process_chain import win32_ancestor_rows as _win32_ancestor_rows
+from .process_chain import win32_process_ppid_snapshot as _win32_process_ppid_snapshot  # noqa: F401 (deliberate re-export)
 from .subprocess_runner import command_failure_message, run_captured
 
 logger = logging.getLogger(__name__)
@@ -87,9 +89,15 @@ def _self_ancestor_pids() -> frozenset[int]:
     confirm or refute the sweep-needle hypothesis, so a silent degrade would
     erase the evidence.
     """
+    self_pid = os.getpid()
     try:
         if os.name == "nt":
-            ppid_by_pid = _win32_process_ppid_snapshot()
+            # Chain-scoped, not host-wide: each hop still pays psutil's
+            # ``ppid_map()`` enumeration plus a handle open, but the guard
+            # pays that once per ancestor instead of once per process on
+            # the box (issue #2332 -- a full ``process_iter`` snapshot costs
+            # seconds on a busy Windows box, paid by every guarded kill call).
+            ppid_by_pid = _win32_ancestor_rows(self_pid, max_hops=_MAX_ANCESTOR_CHAIN_HOPS)
         else:
             ppid_by_pid = _posix_process_ppid_snapshot()
     except Exception:
@@ -98,7 +106,6 @@ def _self_ancestor_pids() -> frozenset[int]:
             exc_info=True,
         )
         ppid_by_pid = {}
-    self_pid = os.getpid()
     if not ppid_by_pid:
         logger.warning(
             "process ppid snapshot unavailable or empty; ancestor kill guard "
