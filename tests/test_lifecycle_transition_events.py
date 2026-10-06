@@ -681,6 +681,11 @@ def test_status_writes_of_lifecycle_states_stay_paired_with_the_seam() -> None:
     src_root = Path(__file__).parents[1] / "src" / "charlie_work"
     offenders: list[str] = []
     for path in source_files(src_root):
+        text = source_text(path)
+        if ('"status"' not in text and "'status'" not in text) or not any(
+            f"{q}{state}{q}" in text for state in lifecycle_states for q in ('"', "'")
+        ):
+            continue
         tree = parsed(path)
         for func in ast.walk(tree):
             if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
