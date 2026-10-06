@@ -35,7 +35,7 @@ from . import layout
 from .atomic_write import write_json_atomic
 from .fleet_paths import warn_fleet_dir_virtualization_on_write
 from .supervisor_lifecycle import read_supervisor_heartbeat, supervisor_heartbeat_path
-from .workflow import CommandResult
+from .command_result import CommandResult
 from .write_gate import WriteGate
 
 logger = logging.getLogger(__name__)

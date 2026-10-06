@@ -22,6 +22,7 @@ from charlie_work.config import (
     OrchestratorConfig,
     WorkerRoleConfig,
 )
+from charlie_work.host.fakes import FakeWorkerLauncher
 from charlie_work.instrumentation import query_events
 from charlie_work.paths import runtime_paths
 from charlie_work.state import (
@@ -539,9 +540,7 @@ def _rework_pending_gh() -> FakeGitHub:
     return fake_gh
 
 
-def test_dispatch_rework_claim_clears_dead_worker_failure_kind(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_dispatch_rework_claim_clears_dead_worker_failure_kind(tmp_path: Path, fake_host) -> None:
     """Issue #1917: a rework dispatch claim drops the previous death's
     classification — a stale provider-throttle stamp must not survive into
     the new dispatch epoch. The failure arm does not clear the field
@@ -566,7 +565,7 @@ def test_dispatch_rework_claim_clears_dead_worker_failure_kind(
             for request in requests
         ]
 
-    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", _fail)
+    fake_host(worker_launch=FakeWorkerLauncher([_fail]))
 
     app = OrchestratorApp(tmp_path, paths, config, _rework_pending_gh())
     result = app.dispatch_rework()
@@ -581,7 +580,7 @@ def test_dispatch_rework_claim_clears_dead_worker_failure_kind(
 
 
 def test_dispatch_rework_success_arm_clears_dead_worker_failure_kind(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, fake_host
 ) -> None:
     """Issue #1917: the successful rework-dispatch arm drops a
     classification stamped between the claim and the upgrade — the new
@@ -613,7 +612,7 @@ def test_dispatch_rework_success_arm_clears_dead_worker_failure_kind(
             for request in requests
         ]
 
-    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", _ok_then_stamp)
+    fake_host(worker_launch=FakeWorkerLauncher([_ok_then_stamp]))
 
     app = OrchestratorApp(tmp_path, paths, config, _rework_pending_gh())
     result = app.dispatch_rework()

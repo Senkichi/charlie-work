@@ -24,7 +24,7 @@ from charlie_work.state import (
     load_state,
     save_state,
 )
-from charlie_work.workflow import CommandResult
+from charlie_work.command_result import CommandResult
 
 
 def test_orphaned_worker_routes_merge_conflict_to_rework(tmp_path: Path) -> None:

@@ -55,7 +55,8 @@ from .github import GitHub, GitHubError
 from .global_config import load_layered_config
 from .local_issues import github_client_for
 from .paths import RepoNotFoundError, runtime_paths
-from .workflow import CommandResult, OrchestratorApp
+from .command_result import CommandResult
+from .workflow import OrchestratorApp
 
 # Issue #1941: per-repo budget for the ``fleet status`` fan-out. Sized to
 # leave headroom under the heartbeat's 120s subprocess cap

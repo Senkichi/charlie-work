@@ -125,7 +125,8 @@ from ci_fleet.charlie_work_adapter import (
 # the one-way boundary); the confinement here is about blast radius, not
 # layering.
 from .worktree import clean_worktrees, merge_clean_results
-from .workflow import CommandResult, OrchestratorApp
+from .command_result import CommandResult
+from .workflow import OrchestratorApp
 
 
 def _add_dry_run(parser: argparse.ArgumentParser) -> None:
@@ -2516,6 +2517,7 @@ def _render_backlog_reachability(reachability: Any) -> str:
             f"{reason}={reachability[reason]}"
             for reason in (
                 "missing_ready",
+                "parked_unready",
                 "terminal_label",
                 "active_label",
                 "operator_claimed",

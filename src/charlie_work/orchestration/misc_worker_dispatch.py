@@ -19,6 +19,7 @@ class through the installer.
 from __future__ import annotations
 
 import charlie_work.workflow as _wf
+from charlie_work.command_result import CommandResult
 from charlie_work.dispatch_deferral import records_deferral
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -619,7 +620,7 @@ def dispatch_rework(
     *,
     only_issues: str | None = None,
     stalled_entries: list[dict[str, int]] | None = None,
-) -> _wf.CommandResult:
+) -> CommandResult:
     """Dispatch rework workers for issues in needs-rework state with open PRs.
 
     ``stalled_entries``: pass the result of an already-completed

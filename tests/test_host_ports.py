@@ -212,9 +212,10 @@ def test_fleet_live_workers_reaches_fleet_registry_patch(monkeypatch) -> None:
 
 
 def test_command_result_reexport_is_identity() -> None:
-    from charlie_work import command_result, workflow
+    from charlie_work import cli, command_result, workflow
 
-    assert workflow.CommandResult is command_result.CommandResult
+    assert cli.CommandResult is command_result.CommandResult
+    assert not hasattr(workflow, "CommandResult")
 
 
 def _app(tmp_path, **kwargs):
@@ -278,6 +279,89 @@ def test_real_review_launcher_returns_errors_as_values(monkeypatch) -> None:
     assert record.pid is None and record.error == "OSError: no such binary"
     unknown = host.REAL.launch.launch("nope", pr_number=3, branch="b")
     assert unknown.error == "unsupported reviewer harness: 'nope'"
+
+
+def test_fake_worker_launcher_scripts_outcomes_and_records_calls(tmp_path) -> None:
+    """Issue #2229: a callable outcome takes the ``dispatch_sessions``
+    signature so an existing dispatch fake drops in unchanged."""
+    from charlie_work.adapters import SessionDispatchResult, SessionRequest
+    from charlie_work.host.fakes import FakeWorkerLauncher
+
+    request = SessionRequest(
+        issue_number=1,
+        issue_title="t",
+        prompt_path=tmp_path / "p.md",
+        branch_name="agent/issue-1",
+    )
+    ok = SessionDispatchResult(
+        issue_number=1,
+        issue_title="t",
+        prompt_path=str(request.prompt_path),
+        branch_name="agent/issue-1",
+        adapter="command",
+        ok=True,
+        pid=42,
+    )
+    fake = FakeWorkerLauncher([lambda *a: [ok]])
+    from charlie_work.adapters import AdapterSettings
+
+    settings = AdapterSettings(adapter="command")
+    results = fake.launch(tmp_path, tmp_path / "m.json", tmp_path / "r.json", settings, [request])
+    assert results == [ok]
+    assert fake.calls == [
+        (tmp_path, tmp_path / "m.json", tmp_path / "r.json", settings, [request])
+    ]
+    # A ``str`` outcome fails every request through the worker error seam.
+    fake = FakeWorkerLauncher(["launch failed: boom"])
+    results = fake.launch(tmp_path, tmp_path / "m.json", tmp_path / "r.json", settings, [request])
+    assert results[0].ok is False and results[0].error == "launch failed: boom"
+
+
+def test_real_worker_launcher_late_binds_and_returns_errors_as_values(
+    monkeypatch, tmp_path
+) -> None:
+    """Issue #2229: ``RealWorkerLauncher`` resolves ``workflow.dispatch_sessions``
+    at call time (so existing patches keep intercepting) and converts a raise
+    into per-request failure values plus ``launch_failed`` events."""
+    from charlie_work.adapters import AdapterSettings, SessionRequest
+    from charlie_work.instrumentation import query_events
+    from charlie_work.paths import runtime_paths
+    from charlie_work.config import OrchestratorConfig
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("port exploded")
+
+    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", _boom)
+
+    request = SessionRequest(
+        issue_number=2,
+        issue_title="t",
+        prompt_path=tmp_path / "p.md",
+        branch_name="agent/issue-2",
+    )
+    settings = AdapterSettings(adapter="claude-code")
+    results = host.REAL.worker_launch.launch(
+        tmp_path, tmp_path / "m.json", tmp_path / "r.json", settings, [request]
+    )
+
+    (result,) = results
+    assert result.ok is False and "port exploded" in (result.error or "")
+    events = query_events(
+        runtime_paths(tmp_path, OrchestratorConfig().runtime.state_dir).state_file,
+        kind="launch_failed",
+    )
+    assert len(events) == 1
+    assert events[0]["payload"]["issue_number"] == 2
+    assert events[0]["payload"]["role"] == "worker"
+
+    # And a patched success path is intercepted through the same late binding.
+    monkeypatch.setattr(
+        "charlie_work.workflow.dispatch_sessions",
+        lambda *a, **_k: ["sentinel"],
+    )
+    assert host.REAL.worker_launch.launch(
+        tmp_path, tmp_path / "m.json", tmp_path / "r.json", settings, [request]
+    ) == ["sentinel"]
 
 
 def test_fake_host_clock_reaches_state_predicates(fake_host) -> None:

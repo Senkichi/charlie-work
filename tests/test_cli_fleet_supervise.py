@@ -12,7 +12,7 @@ from typing import Any
 import pytest
 
 from charlie_work import cli
-from charlie_work.workflow import CommandResult
+from charlie_work.command_result import CommandResult
 
 
 @pytest.fixture(autouse=True)

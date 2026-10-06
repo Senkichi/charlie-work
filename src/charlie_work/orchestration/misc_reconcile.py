@@ -20,6 +20,7 @@ self._reconcile_locked`` call and the ``self._record_event`` sibling call stay
 from __future__ import annotations
 
 import charlie_work.workflow as _wf
+from charlie_work.command_result import CommandResult
 from dataclasses import asdict
 
 from charlie_work.file_lock import try_acquire_byte_range_lock
@@ -41,7 +42,7 @@ def reconcile(
     fix: bool = False,
     skip_dead_session_sweep: bool = False,
     dry_run: bool | None = None,
-) -> _wf.CommandResult:
+) -> CommandResult:
     """Detect (and optionally repair) drift between GitHub reality and the
     orchestrator's labels/state — e.g. a PR merged by hand outside
     merge-ready leaving `agent:in-progress` stale forever. Read-only unless
@@ -70,7 +71,7 @@ def reconcile(
             _wf.layout.supervisor_lock_path(self.paths.root)
         )
         if supervisor_lock is None:
-            return _wf.CommandResult(
+            return CommandResult(
                 True,
                 "reconcile deferred: supervisor lock held",
                 {"pass_skipped": True, "reason": "supervisor_lock_held"},
@@ -92,7 +93,7 @@ def _reconcile_locked(
     fix: bool = False,
     skip_dead_session_sweep: bool = False,
     dry_run: bool = False,
-) -> _wf.CommandResult:
+) -> CommandResult:
     """Run drift detection (and optional repair) against GitHub/state.
 
     Precondition: the caller MUST already hold ``supervisor.lock`` — this
@@ -129,7 +130,7 @@ def _reconcile_locked(
                         state_path=self.paths.state_file,
                     )
                     _wf.save_state(self.paths.state_file, state)
-                return _wf.CommandResult(
+                return CommandResult(
                     True,
                     "reconcile deferred: GraphQL rate limit below threshold",
                     {
@@ -212,7 +213,7 @@ def _reconcile_locked(
                         },
                     )
                     _wf.save_state(self.paths.state_file, new_state)
-                return _wf.CommandResult(
+                return CommandResult(
                     True,
                     "reconcile deferred: GraphQL rate limit below threshold",
                     {
@@ -237,7 +238,7 @@ def _reconcile_locked(
         # ok=False when drift is present and not fixed: scripts and CI can gate
         # on exit code to detect unresolved drift, matching how `doctor` gates.
         ok = not drift or fixed or (dry_run and fix)
-        return _wf.CommandResult(
+        return CommandResult(
             ok,
             message,
             {

@@ -27,7 +27,7 @@ from _dead_worker_sweep_characterization_fixtures import (
 from _orphan_sweep_fixtures import _dead_worker_rework_bed, _write_outcome
 from charlie_work import rework_outcome
 from charlie_work.state import PASSIVE_OPEN_STATUS, load_state, save_state
-from charlie_work.workflow import CommandResult
+from charlie_work.command_result import CommandResult
 
 # ---------------------------------------------------------------------------
 # Open PR: request_changes verdict family

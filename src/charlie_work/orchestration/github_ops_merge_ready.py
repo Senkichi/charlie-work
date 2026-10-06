@@ -9,7 +9,7 @@ directly.
 
 from __future__ import annotations
 
-import charlie_work.workflow as _wf
+from charlie_work.command_result import CommandResult
 from charlie_work.merge_path.preview import preview_merge_ready
 
 
@@ -19,7 +19,7 @@ def _merge_ready_dry_run(
     *,
     merge: bool | None = None,
     merge_train_head: int | None = None,
-) -> _wf.CommandResult:
+) -> CommandResult:
     """Dry-run readiness evaluation for ``merge_ready`` (issue #614).
 
     Reports what ``merge_ready`` would do without a state write, label

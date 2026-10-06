@@ -37,6 +37,7 @@ from charlie_work.config import (
     WatchdogConfig,
     WorkerRoleConfig,
 )
+from charlie_work.host.fakes import FakeWorkerLauncher
 from charlie_work.instrumentation import query_events
 from charlie_work.paths import runtime_paths
 from charlie_work.role_chain import RoleEntry
@@ -194,7 +195,7 @@ def _assert_repo_stamped(paths: Any, entry: RoleEntry = PRIMARY) -> None:
     assert windows[0]["payload"]["source"] == "dead_worker_classification"
 
 
-def _fallback_app(root: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[OrchestratorApp, list]:
+def _fallback_app(root: Path, fake_host) -> tuple[OrchestratorApp, list]:
     """Repo B: a fresh app on the same chain with a fake launcher that records settings."""
     root.mkdir(parents=True, exist_ok=True)
     config = OrchestratorConfig(worker=CHAIN, dispatch=DispatchConfig(default_limit=5))
@@ -220,12 +221,12 @@ def _fallback_app(root: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Orchestr
             for r in requests
         ]
 
-    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", _fake)
+    fake_host(worker_launch=FakeWorkerLauncher([_fake]))
     return OrchestratorApp(root, paths, config, fake_gh, fleet_dir_override=None), calls
 
 
-def _assert_repo_b_selects_fallback(root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    app, calls = _fallback_app(root, monkeypatch)
+def _assert_repo_b_selects_fallback(root: Path, fake_host) -> None:
+    app, calls = _fallback_app(root, fake_host)
     result = app.dispatch()
     assert [s.worker_model for s in calls] == [FALLBACK.model], result.message
     [event] = query_events(app.paths.state_file, kind="role_fallback_selected")
@@ -234,7 +235,7 @@ def _assert_repo_b_selects_fallback(root: Path, monkeypatch: pytest.MonkeyPatch)
 
 
 def test_one_sweep_pass_classifies_the_death_and_feeds_the_waterfall(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, fake_host
 ) -> None:
     config = _config()
     paths, sessions_dir, gh = _seed_dead_primary(tmp_path / "a", config)
@@ -249,11 +250,11 @@ def test_one_sweep_pass_classifies_the_death_and_feeds_the_waterfall(
     sidecar = json.loads((sessions_dir / f"issue-{ISSUE}.json").read_text(encoding="utf-8"))
     assert sidecar["failure_kind"] == "rate_limited"
 
-    _assert_repo_b_selects_fallback(tmp_path / "b", monkeypatch)
+    _assert_repo_b_selects_fallback(tmp_path / "b", fake_host)
 
 
 def test_redispatch_and_phantom_in_the_same_pass_keep_the_ledger_entry(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, fake_host
 ) -> None:
     config = _config()
     paths, sessions_dir, gh = _seed_dead_primary(tmp_path / "a", config)
@@ -264,11 +265,11 @@ def test_redispatch_and_phantom_in_the_same_pass_keep_the_ledger_entry(
 
     _assert_primary_restricted()
     _assert_repo_stamped(paths)
-    _assert_repo_b_selects_fallback(tmp_path / "b", monkeypatch)
+    _assert_repo_b_selects_fallback(tmp_path / "b", fake_host)
 
 
 def test_redispatch_before_any_sweep_classifies_the_dead_sidecar_first(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, fake_host
 ) -> None:
     """Guard 2: the overwrite path alone (no sweep reached the death) still records
     the restriction before the averted record replaces the evidence."""
@@ -279,7 +280,7 @@ def test_redispatch_before_any_sweep_classifies_the_dead_sidecar_first(
     _phantom_reap(sessions_dir)
 
     _assert_primary_restricted()
-    _assert_repo_b_selects_fallback(tmp_path / "b", monkeypatch)
+    _assert_repo_b_selects_fallback(tmp_path / "b", fake_host)
 
 
 def test_redispatch_guard_never_classifies_a_live_worker(tmp_path: Path) -> None:
@@ -336,7 +337,7 @@ def test_dry_run_sweep_does_not_classify(tmp_path: Path, monkeypatch) -> None:
 
 
 def test_fallback_quota_death_does_not_block_the_recovered_primary(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, fake_host
 ) -> None:
     """Issue #2279 acceptance: chain [A, B] on ONE adapter; B dies
     ``rate_limited`` while A's own restriction has already lapsed.
@@ -366,14 +367,14 @@ def test_fallback_quota_death_does_not_block_the_recovered_primary(
 
     # Same repo, same window: selection returns A with nothing skipped and
     # B's stamped window is covered by B's ledger restriction.
-    app, calls = _fallback_app(tmp_path / "a", monkeypatch)
+    app, calls = _fallback_app(tmp_path / "a", fake_host)
     app.dispatch()
     assert [s.worker_model for s in calls] == [PRIMARY.model]
     assert query_events(app.paths.state_file, kind="role_fallback_selected") == []
 
 
 def test_fallback_quota_death_window_blocks_when_its_ledger_entry_lapses_first(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, fake_host
 ) -> None:
     """Counter-case: once B's own ledger restriction also expires, its window
     is unexplained and blocks again -- a stamped window is not a free pass."""
@@ -391,7 +392,7 @@ def test_fallback_quota_death_window_blocks_when_its_ledger_entry_lapses_first(
     raw["restrictions"][f"{FALLBACK.harness}|{FALLBACK.model}"]["until"] = past
     ledger_path.write_text(json.dumps(raw), encoding="utf-8")
 
-    app, calls = _fallback_app(tmp_path / "a", monkeypatch)
+    app, calls = _fallback_app(tmp_path / "a", fake_host)
     result = app.dispatch()
     assert calls == []
     assert result.data.get("deferred_reason") == "provider_throttled", result.data

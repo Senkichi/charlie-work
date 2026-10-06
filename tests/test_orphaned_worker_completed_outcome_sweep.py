@@ -292,7 +292,7 @@ def test_orphaned_worker_completed_outcome_routes_to_review(tmp_path: Path, monk
     until the dead-dispatched reap force-escalated it."""
     from unittest.mock import patch
 
-    from charlie_work.workflow import CommandResult
+    from charlie_work.command_result import CommandResult
 
     config, paths, fake_gh, _dispatched_at = _dead_worker_rework_bed(tmp_path)
     _write_outcome(
@@ -360,7 +360,7 @@ def test_orphaned_worker_completed_outcome_blocked_review_returns_to_rework(
     invariant the fix exists to preserve)."""
     from unittest.mock import patch
 
-    from charlie_work.workflow import CommandResult
+    from charlie_work.command_result import CommandResult
 
     config, paths, fake_gh, _dispatched_at = _dead_worker_rework_bed(tmp_path)
     _write_outcome(
@@ -415,7 +415,7 @@ def test_orphaned_worker_completed_outcome_defers_review_until_applied(
     out of ``dispatched`` before they land. The next pass retries."""
     from unittest.mock import patch
 
-    from charlie_work.workflow import CommandResult
+    from charlie_work.command_result import CommandResult
 
     config, paths, fake_gh, _dispatched_at = _dead_worker_rework_bed(tmp_path)
     _write_outcome(
