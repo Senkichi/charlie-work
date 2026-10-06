@@ -117,6 +117,9 @@ class PersistedPr:
     stale_base_deferrals: int = 0
     mergequeue_since: str | None = None
     mergequeue_head_sha: str | None = None
+    # Stamped by every full merge_ready pass that leaves the PR queued; the
+    # queue skip (#2440) forces a re-check once it is 30 minutes old.
+    mergequeue_checked_at: str | None = None
 
 
 @dataclass(frozen=True)

@@ -36,6 +36,7 @@ from .decide import (
     is_already_in_mergequeue,
     needs_carry_forward,
 )
+from .issue_labels import open_issue_labels
 from .model import (
     UNAVAILABLE,
     Admission,
@@ -102,6 +103,7 @@ def persisted_from(entry: dict[str, Any] | None) -> PersistedPr:
         stale_base_deferrals=entry.get("consecutive_stale_base_deferrals", 0),
         mergequeue_since=entry.get("mergequeue_since"),
         mergequeue_head_sha=entry.get("mergequeue_head_sha"),
+        mergequeue_checked_at=entry.get("mergequeue_checked_at"),
     )
 
 
@@ -451,11 +453,18 @@ def decide_readiness_lazily(
 
 
 def gather_merge_hold(app: Any, pr: dict[str, Any], issue_number: int | None) -> tuple[bool, bool]:
-    """``(merge_hold, unavailable)``: the PR's label, else the linked issue's."""
+    """``(merge_hold, unavailable)``: the PR's label, else the linked issue's.
+
+    The issue's labels come from the per-pass open-issue list when it shows the
+    issue, else a live ``issue_view``.
+    """
     labels = app.config.labels
     held = labels.merge_hold in label_names(pr)
     if held or issue_number is None:
         return held, False
+    cached = open_issue_labels(app.gh, issue_number)
+    if cached is not None:
+        return labels.merge_hold in cached, False
     try:
         issue = app.gh.issue_view(issue_number)
     except (GitHubError, ValueError):
