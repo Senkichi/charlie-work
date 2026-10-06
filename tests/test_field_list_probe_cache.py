@@ -6,8 +6,14 @@ import json
 from pathlib import Path
 
 import pytest
-from _fake_transport import FakeAdapter, make_github
-from test_charlie_work_github_checks import _schema_accepting_reply
+from _fake_transport import (
+    FakeAdapter,
+    connection_page,
+    graphql_failure,
+    graphql_variables,
+    make_github,
+    ok,
+)
 
 from ci_fleet.github import GitHubError
 
@@ -17,6 +23,7 @@ from charlie_work.github_capabilities.circuit_breaker_transport import (
     circuit_breaker_state_path,
 )
 from charlie_work.github_transport.outcome import GraphQLError, Response
+from charlie_work.github_transport.request import RestRequest
 
 _REJECT = Response(
     200,
@@ -27,6 +34,16 @@ _REJECT = Response(
         GraphQLError("Field 'bogus' doesn't exist on type 'Issue'", "undefinedField"),
     ),
 )
+
+
+def _schema_accepting_reply(request):
+    """Every probed selection is valid: empty connection, NOT_FOUND for views, empty REST."""
+    if isinstance(request, RestRequest):
+        return ok({"workflow_runs": []} if "actions/runs" in request.route else [])
+    if "number" in graphql_variables(request):
+        return graphql_failure("Could not resolve to a node with the number of 0.")
+    connection = "issues" if "issues(" in request.document else "pullRequests"
+    return connection_page(connection, [])
 
 
 @pytest.fixture(autouse=True)

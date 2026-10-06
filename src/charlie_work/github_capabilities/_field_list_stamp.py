@@ -104,12 +104,17 @@ def check_real_call(collab: Any, owner: str, name: str, outcome: Any) -> None:
     A no-op unless this process is relying on a cached validation for the repo,
     so callers that never validated keep their errors-as-values behavior.
     """
+    if not _VALIDATED:
+        return  # nothing cached in this process: the common, zero-cost path
     from ..config import ConfigError
     from ._field_probes import probe_verdict
     from .circuit_breaker_transport import circuit_breaker_state_path
 
     slug = f"{owner}/{name}"
-    state_dir = circuit_breaker_state_path(collab.runtime, collab.repo_root).parent
+    repo_root = getattr(collab, "repo_root", None)
+    if repo_root is None:
+        return  # a bare double with no repo: it cannot hold a cached validation
+    state_dir = circuit_breaker_state_path(getattr(collab, "runtime", None), repo_root).parent
     if _key(state_dir, slug) not in _VALIDATED:
         return
     rejected = probe_verdict(outcome).rejected
