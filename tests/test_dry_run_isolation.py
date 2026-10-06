@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import pytest
-from _src_ast import parsed, source_files
+from _src_ast import parsed, source_files, source_text
 
 from charlie_work.rescue_review import run_cross_family_review
 from charlie_work.subprocess_runner import RunResult
@@ -471,6 +471,12 @@ def _call_sites(callee: str) -> list[tuple[str, int, str]]:
     """
     sites: list[tuple[str, int, str]] = []
     for path in source_files(SRC_ROOT):
+        # A call to ``callee`` cannot exist in a file whose text lacks the
+        # identifier; the text filter keeps the ~430 untouched files out of the
+        # (shared-cache) parse without changing what the guard sees (issue
+        # #2361; same filter shape as #2360's label-seam scan).
+        if callee not in source_text(path):
+            continue
         tree = parsed(path)
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
