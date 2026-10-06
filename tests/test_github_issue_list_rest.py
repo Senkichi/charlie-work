@@ -396,3 +396,22 @@ def test_broadcast_update_guard_reads_the_rollup_via_pr_list_with_checks(
     assert [r["skipped_reason"] for r in results] == ["pending-required-checks"]
     assert results[0]["updated"] is False
     assert fake.pr_update_branch_calls == []
+
+
+def test_effects_rework_absent_rollup_is_unknown_not_stale_empty_checks() -> None:
+    """#2443: ``pr_list`` rows carry no rollup key. A stale PR with the key
+    absent must not read as ``stale_empty_checks``; a fetched empty rollup must."""
+    from datetime import UTC, datetime, timedelta
+
+    from charlie_work.config import OrchestratorConfig
+    from charlie_work.workflow import _is_pre_review_rework_candidate
+
+    config = OrchestratorConfig()
+    now = datetime.now(UTC)
+    stale = (now - timedelta(hours=24)).isoformat().replace("+00:00", "Z")
+    assert config.watchdog.pre_review_rework_stale_minutes > 0
+
+    assert _is_pre_review_rework_candidate({"updatedAt": stale}, config, now) == (False, "")
+    assert _is_pre_review_rework_candidate(
+        {"updatedAt": stale, "statusCheckRollup": []}, config, now
+    ) == (True, "stale_empty_checks")
