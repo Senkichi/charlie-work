@@ -635,6 +635,9 @@ def test_merge_hold_label_on_issue_blocks_mergequeue_handoff(tmp_path: Path) -> 
 
 
 class _MergeHoldIssueViewRaises(FakeGitHub):
+    def issue_list(self, labels=None, state=None):  # type: ignore[override]
+        return []  # cache miss: the hold read falls back to the (failing) live issue_view
+
     def issue_view(self, number: int):  # type: ignore[override]
         raise GitHubError("simulated gh outage")
 

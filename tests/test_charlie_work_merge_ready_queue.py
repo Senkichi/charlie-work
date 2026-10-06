@@ -184,6 +184,9 @@ def test_merge_ready_mergequeue_hold_issue_check_unavailable_fails_closed(tmp_pa
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
     class IssueViewFailGitHub(FakeGitHub):
+        def issue_list(self, labels=None, state=None):
+            return []  # cache miss: fall back to the live issue_view under test
+
         def issue_view(self, number: int):
             if number == 123:
                 raise _GitHubError("transient gh issue view failure")
@@ -222,6 +225,9 @@ def test_merge_ready_mergequeue_hold_issue_degraded_payload_fails_closed(
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
     class IssueViewDegradedGitHub(FakeGitHub):
+        def issue_list(self, labels=None, state=None):
+            return []  # cache miss: fall back to the live issue_view under test
+
         def issue_view(self, number: int):
             if number == 123:
                 return degraded_payload

@@ -58,6 +58,7 @@ from .labels import TransitionOutcome, apply_issue_labels, transition
 from .local_lane import synthesize_open_pr
 from .local_work_park import publishes_pull_requests
 from .merge_finalize import _merged_issue_fields
+from .merge_path.model import MERGEQUEUE_DWELL_FIELDS
 from .paths import resolved_layout, runtime_paths
 from .process_utils import kill_process_tree
 from .queue_bot import is_queue_bot_pr  # noqa: F401 (deliberate re-export)
@@ -3120,7 +3121,7 @@ def apply_fixes(
             # calling ``labels.transition`` directly applies the same
             # ``_edges(config.labels)`` disposition and now also records the
             # lifecycle transition (issue #2226).
-            # The dwell-tracking fields (mergequeue_since/mergequeue_head_sha)
+            # The dwell-tracking fields (MERGEQUEUE_DWELL_FIELDS)
             # are cleared so the post-fix re-detect does not re-fire the
             # time-in-queue trigger for the same window.
             fix_actions = list(item.fix_actions)
@@ -3135,9 +3136,7 @@ def apply_fixes(
                 existing_pr = new_prs.get(pr_key, {})
                 if existing_pr:
                     new_prs[pr_key] = {
-                        k: v
-                        for k, v in existing_pr.items()
-                        if k not in ("mergequeue_since", "mergequeue_head_sha")
+                        k: v for k, v in existing_pr.items() if k not in MERGEQUEUE_DWELL_FIELDS
                     }
             if item.issue_number is not None:
                 # Escalate the issue state through the canonical helper.
