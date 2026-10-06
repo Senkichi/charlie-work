@@ -162,9 +162,10 @@ def test_real_session_counter_late_binds_to_existing_patch_targets(monkeypatch) 
 
 
 def test_command_result_reexport_is_identity() -> None:
-    from charlie_work import command_result, workflow
+    from charlie_work import cli, command_result, workflow
 
-    assert workflow.CommandResult is command_result.CommandResult
+    assert cli.CommandResult is command_result.CommandResult
+    assert not hasattr(workflow, "CommandResult")
 
 
 def _app(tmp_path, **kwargs):

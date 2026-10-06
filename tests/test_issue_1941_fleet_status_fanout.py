@@ -31,7 +31,7 @@ import pytest
 from charlie_work import cli, fleet_status
 from charlie_work.config import OrchestratorConfig
 from charlie_work.github import GitHubError
-from charlie_work.workflow import CommandResult
+from charlie_work.command_result import CommandResult
 
 
 def _fleet_env(

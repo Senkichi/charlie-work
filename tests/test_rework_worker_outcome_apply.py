@@ -372,7 +372,8 @@ def test_route_rework_candidate_applies_outcome_before_review(
     """``_route_rework_candidate_to_review`` is the seam where a pushed
     rework head is routed back to review — the outcome must be applied there
     so a rerouted-but-blocked review still updates the PR."""
-    from charlie_work.workflow import CommandResult, OrchestratorApp
+    from charlie_work.command_result import CommandResult
+    from charlie_work.workflow import OrchestratorApp
 
     config = _dispatch_rework_config()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)

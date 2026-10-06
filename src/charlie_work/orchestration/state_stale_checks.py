@@ -11,6 +11,7 @@ from typing import Any, Sequence
 
 from charlie_work.labels import TransitionOutcome
 import charlie_work.workflow as _wf
+from charlie_work.command_result import CommandResult
 
 
 def _attempt_stale_checks_retrigger(
@@ -21,7 +22,7 @@ def _attempt_stale_checks_retrigger(
     issue_number: int,
     head_sha: str,
     existing_pr_state: dict[str, Any],
-) -> _wf.CommandResult | None:
+) -> CommandResult | None:
     """Follow-up retrigger policy for ``_detect_ci_run_never_created``
     (issue #1274, W17).
 
@@ -215,7 +216,7 @@ def _attempt_stale_checks_retrigger(
             },
         )
         _wf.save_state(self.paths.state_file, state)
-    return _wf.CommandResult(
+    return CommandResult(
         False,
         f"CI retrigger attempted for PR #{pr_number} "
         f"(attempt {new_attempts}/{max_retriggers}, method={method})",
@@ -238,7 +239,7 @@ def _escalate_stale_checks_exhaustion(
     attempts: int,
     max_retriggers: int,
     existing_pr_state: dict[str, Any],
-) -> _wf.CommandResult | None:
+) -> CommandResult | None:
     """Exhaustion -> escalation routing for the stale-checks retrigger
     lane (issue #1274 item 7, the W9 operator queue).
 
@@ -323,7 +324,7 @@ def _escalate_stale_checks_exhaustion(
             "add_failures": result.add_failures,
             "remove_failures": result.remove_failures,
         }
-    return _wf.CommandResult(
+    return CommandResult(
         False,
         f"PR #{pr_number} exhausted stale-checks retrigger cap "
         f"({attempts}/{max_retriggers}); escalated to human",
@@ -349,7 +350,7 @@ def _check_janitor_rework_stall(
     stall_head_key: str,
     stall_since: Any,
     stall_head: Any,
-) -> _wf.CommandResult | None:
+) -> CommandResult | None:
     """Stall bound orthogonal to the settled-head signal (issue #765).
 
     Called only from ``_route_janitor_gate_failure_to_rework``'s
@@ -584,7 +585,7 @@ def _check_janitor_rework_stall(
             f" could not fetch{issue_clause}; most recent {last_skip_at}"
             f", reason: {last_skip_reason})"
         )
-    return _wf.CommandResult(
+    return CommandResult(
         False,
         message,
         {

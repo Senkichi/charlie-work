@@ -30,6 +30,7 @@ from datetime import datetime
 from typing import Any
 
 import charlie_work.workflow as _wf
+from charlie_work.command_result import CommandResult
 from charlie_work.dead_worker_sweep.effects_sessions import _detect_stalled_sessions
 from charlie_work.escalation import _stale_template_warning_suppressed
 from charlie_work.github import (
@@ -56,7 +57,7 @@ def _loop_body(
     merge: bool | None,
     now: datetime | None = None,
     deadline_exceeded: Callable[[], bool] | None = None,
-) -> _wf.CommandResult:
+) -> CommandResult:
     # Every pass must observe a fresh GitHub snapshot. The list cache
     # dedupes calls within one pass, but a long-running supervisor
     # (charlie fleet supervise) reuses this app -- and therefore one
@@ -83,7 +84,7 @@ def _loop_body(
     # raising PassDeadlineExceeded). The full wiring policy -- what is
     # guarded, what stays unconditional, and the deferred-marking rule --
     # lives in charlie_work.pass_deadline's module docstring.
-    deadline = PassDeadline(deadline_exceeded, _wf.CommandResult)
+    deadline = PassDeadline(deadline_exceeded, CommandResult)
     early = deadline.preflight("loop pass deferred: in-pass deadline already reached")
     if early is not None:
         return early
@@ -793,8 +794,4 @@ def _loop_body(
             deferred_payload,
             repo=self.repo_root.name,
         )
-    return _wf.CommandResult(
-        ok,
-        message,
-        data,
-    )
+    return CommandResult(ok, message, data)

@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Any
 
 import charlie_work.workflow as _wf
+from charlie_work.command_result import CommandResult
 from charlie_work import rework_outcome as _rework_outcome
 
 
@@ -18,7 +19,7 @@ def _route_rework_candidate_to_review(
     issue_number: int,
     pr_number: int,
     reviewed_head_sha_before: str | None,
-) -> tuple[bool, _wf.CommandResult]:
+) -> tuple[bool, CommandResult]:
     """Route a rework_requested issue back to the review lane instead of
     relaunching a worker onto a PR whose rework was already pushed
     (issue #339): the PR head moved past the last request_changes verdict,

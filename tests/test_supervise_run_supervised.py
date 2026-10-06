@@ -15,7 +15,7 @@ from charlie_work.config import SupervisorConfig
 from charlie_work.host.fakes import FakeClock
 from charlie_work.instrumentation import query_events
 from charlie_work.supervise import run_supervised, try_acquire_supervisor_lock
-from charlie_work.workflow import CommandResult
+from charlie_work.command_result import CommandResult
 
 
 def test_run_supervised_exits_with_launch_failure_sidecar(tmp_path: Path) -> None:

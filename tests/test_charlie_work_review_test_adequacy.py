@@ -40,7 +40,7 @@ def test_review_test_adequacy_hard_fail_records_request_changes(
 ) -> None:
     """When test_adequacy hard-fails, review() calls record_review with request_changes."""
     from charlie_work.janitor import TestAdequacyFacts, TestAdequacyVerdict
-    from charlie_work.workflow import CommandResult
+    from charlie_work.command_result import CommandResult
 
     app = _test_adequacy_app(tmp_path, enabled=True)
     calls = {"check_test_adequacy": 0, "record_review": 0, "transition": 0}
@@ -102,7 +102,7 @@ def test_review_test_adequacy_hard_fail_label_set(tmp_path: Path, monkeypatch) -
     """After hard-fail, label transitions compose to {in_progress, pr_open, needs_rework}."""
     from charlie_work.janitor import TestAdequacyFacts, TestAdequacyVerdict
     from charlie_work.labels import TransitionResult, TransitionOutcome
-    from charlie_work.workflow import CommandResult
+    from charlie_work.command_result import CommandResult
 
     app = _test_adequacy_app(tmp_path, enabled=True)
     transition_calls = []
@@ -158,7 +158,7 @@ def test_review_test_adequacy_hard_fail_label_set(tmp_path: Path, monkeypatch) -
 def test_review_test_adequacy_unchanged_head_not_rerecorded(tmp_path: Path, monkeypatch) -> None:
     """A second review() on the same unchanged head is blocked by janitor gate (no-op rework check)."""
     from charlie_work.janitor import TestAdequacyFacts, TestAdequacyVerdict
-    from charlie_work.workflow import CommandResult
+    from charlie_work.command_result import CommandResult
 
     app = _test_adequacy_app(tmp_path, enabled=True)
     check_calls = {"n": 0}
@@ -246,7 +246,7 @@ def test_review_test_adequacy_unchanged_head_not_rerecorded(tmp_path: Path, monk
 def test_review_test_adequacy_escalates_at_max_rework_cycles(tmp_path: Path, monkeypatch) -> None:
     """After max_rework_cycles hard-fails, escalate to agent:human-needed."""
     from charlie_work.janitor import TestAdequacyFacts, TestAdequacyVerdict
-    from charlie_work.workflow import CommandResult
+    from charlie_work.command_result import CommandResult
 
     app = _test_adequacy_app(tmp_path, enabled=True, max_rework_cycles=2)
     check_calls = {"n": 0}
@@ -405,7 +405,7 @@ def test_review_test_adequacy_pr_commits_none_falls_back_to_body(
     """When pr_commits fails (None), review() passes no commit messages and the
     gate judges the body alone -- a no-test diff with no body marker hard-fails."""
     from charlie_work.janitor import check_test_adequacy as real_check
-    from charlie_work.workflow import CommandResult
+    from charlie_work.command_result import CommandResult
 
     app = _test_adequacy_app(tmp_path, enabled=True, min_product_lines=1)
     app.gh.diffs[456] = _NO_TEST_PRODUCT_DIFF

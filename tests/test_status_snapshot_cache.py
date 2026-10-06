@@ -579,7 +579,7 @@ def test_fleet_status_human_readable_shows_cache_age_when_cached(
     cached response from a live one — the ``snapshot_written_at`` /
     ``cache_age_seconds`` fields round-1 required need a real consumer."""
     from charlie_work import cli
-    from charlie_work.workflow import CommandResult
+    from charlie_work.command_result import CommandResult
 
     fake_result = CommandResult(
         True,
@@ -616,7 +616,7 @@ def test_fleet_status_human_readable_omits_cache_age_when_live(
     renderer must NOT print a cache-age line, so a live response is
     distinguishable from a cached one by the absence of the line."""
     from charlie_work import cli
-    from charlie_work.workflow import CommandResult
+    from charlie_work.command_result import CommandResult
 
     fake_result = CommandResult(
         True,

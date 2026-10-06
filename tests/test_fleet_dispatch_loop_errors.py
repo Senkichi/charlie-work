@@ -26,7 +26,7 @@ from charlie_work.fleet_dispatch import (
 )
 from charlie_work.instrumentation import query_events
 from charlie_work.github import GitHubError
-from charlie_work.workflow import CommandResult
+from charlie_work.command_result import CommandResult
 
 
 @patch("charlie_work.fleet_dispatch._load_registry")

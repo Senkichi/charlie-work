@@ -9,7 +9,7 @@ protocol exactly as the lexical methods did).
 
 Workflow-defined names are reached through ``_wf.<name>`` so every existing
 ``charlie_work.workflow`` monkeypatch seam keeps landing: the ``CarryForwardCheck``
-and ``CommandResult`` classes, and ``_calculate_patch_id`` (a helper a test patches
+class and ``_calculate_patch_id`` (a helper a test patches
 on the ``charlie_work.workflow`` namespace). Every other free name is imported
 directly from its defining module (none is patched on ``charlie_work.workflow``).
 """
@@ -20,6 +20,7 @@ from dataclasses import asdict
 from typing import Any
 
 import charlie_work.workflow as _wf
+from charlie_work.command_result import CommandResult
 from charlie_work.checks import (
     CheckSummary,
     classify_infra_failures,
@@ -201,7 +202,7 @@ def _still_valid_recorded_verdict(
     )
 
 
-def review_verdict_guard(self, pr_number: int) -> _wf.CommandResult | None:
+def review_verdict_guard(self, pr_number: int) -> CommandResult | None:
     """CLI-boundary guard for ``charlie why-charlie-hate`` (issue #1695).
 
     ``review()`` unconditionally regenerates the review packet: when the
@@ -231,7 +232,7 @@ def review_verdict_guard(self, pr_number: int) -> _wf.CommandResult | None:
         return None
     _decision, reason = result
     refusal = f"refusing to regenerate the review packet for PR #{pr_number}: {reason}"
-    return _wf.CommandResult(
+    return CommandResult(
         False,
         # Issue #1695 acceptance: the refusal reason must survive `head -1`
         # AND `tail -1` of the rendered output, so it is restated on the
@@ -327,7 +328,7 @@ def _drive_infra_rerun_or_escalate(
     escalate_exhausted: bool,
     ok: bool,
     extra_data: dict[str, Any] | None = None,
-) -> _wf.CommandResult | None:
+) -> CommandResult | None:
     """Drive the #841 infra-failure remediation mechanics: bounded
     ``gh run rerun`` per eligible run id, then operator-queue escalation
     once a check's run ids are exhausted (or none was parseable).
@@ -507,7 +508,7 @@ def _drive_infra_rerun_or_escalate(
                     },
                 )
                 self.write_gate.save_state(state)
-            return _wf.CommandResult(
+            return CommandResult(
                 ok,
                 f"infra rerun triggered for PR #{pr_number}: run(s) "
                 + ", ".join(str(rid) for rid in infra_triggered_run_ids),
@@ -586,7 +587,7 @@ def _drive_infra_rerun_or_escalate(
                 "add_failures": transition_result.add_failures,
                 "remove_failures": transition_result.remove_failures,
             }
-        return _wf.CommandResult(
+        return CommandResult(
             ok,
             f"PR #{pr_number} infra-failed check(s) exhausted rerun cap: "
             + ", ".join(definitive_failed),
@@ -627,7 +628,7 @@ def _drive_infra_rerun_or_escalate(
                     ),
                 }
                 self.write_gate.save_state(state)
-        return _wf.CommandResult(
+        return CommandResult(
             ok,
             f"PR #{pr_number} infra rerun deferred: workflow run(s) "
             + ", ".join(str(rid) for rid in sorted(new_deferred))
@@ -657,7 +658,7 @@ def _merge_ready_infra_remediation(
     approved: bool,
     sync_failed: bool,
     merge_conflict: bool,
-) -> _wf.CommandResult | None:
+) -> CommandResult | None:
     """Infra-failure remediation for the merge lane (issue #1912).
 
     The #841 rerun/escalate mechanics lived only in ``review()`` -- fed by

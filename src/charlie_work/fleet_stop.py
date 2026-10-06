@@ -48,7 +48,7 @@ from .fleet_paths import warn_fleet_dir_virtualization_on_write
 from .instrumentation import log_event
 from .process_utils import is_pid_alive
 from .supervisor_lifecycle import read_supervisor_heartbeat, supervisor_heartbeat_path
-from .workflow import CommandResult
+from .command_result import CommandResult
 
 if TYPE_CHECKING:
     from .config import OrchestratorConfig

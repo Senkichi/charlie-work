@@ -25,6 +25,7 @@ from typing import Any
 from charlie_work import layout
 from charlie_work.state import _REVIEW_STALE_CLAIM_TIMEOUT_MINUTES
 import charlie_work.workflow as _wf
+from charlie_work.command_result import CommandResult
 
 
 def _open_review_claims(self, now: datetime) -> list[dict[str, Any]]:
@@ -95,7 +96,7 @@ def _open_review_claims(self, now: datetime) -> list[dict[str, Any]]:
     return claims
 
 
-def reap_reviews(self, limit: int | None = None) -> _wf.CommandResult:
+def reap_reviews(self, limit: int | None = None) -> CommandResult:
     """Force-reap dead review claims without waiting for a loop pass (issue #1874).
 
     The dead-reviewer reap normally runs inside ``dispatch_reviews`` at the
@@ -129,7 +130,7 @@ def reap_reviews(self, limit: int | None = None) -> _wf.CommandResult:
     if self.dry_run:
         claims = self._open_review_claims(resolved_now)
         reapable = [c["pr"] for c in claims if c["would_reap"]]
-        return _wf.CommandResult(
+        return CommandResult(
             True,
             f"dry-run: {len(reapable)} of {len(claims)} open review claim(s) would be reaped",
             {
@@ -161,7 +162,7 @@ def reap_reviews(self, limit: int | None = None) -> _wf.CommandResult:
         )
         data = dict(result.data)
         data["mode"] = "reap_and_dispatch"
-        return _wf.CommandResult(result.ok, result.message, data)
+        return CommandResult(result.ok, result.message, data)
 
     # Lock held: a supervisor owns this repo's lane — possibly the wedged
     # pass this command exists to route around. Reap anyway; the sweeps
@@ -182,7 +183,7 @@ def reap_reviews(self, limit: int | None = None) -> _wf.CommandResult:
             "reaped_prs": [entry.get("pr") for entry in stalled],
         },
     )
-    return _wf.CommandResult(
+    return CommandResult(
         True,
         f"reaped {len(stalled)} stalled review claim(s); dispatch skipped "
         "(supervisor lock held — freed claims re-dispatch on the next pass)",
