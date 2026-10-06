@@ -78,11 +78,14 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
+      # "Locate the map" lists the nightly `ci-fleet-map` artifacts.
+      actions: read
     outputs:
       shards: ${{ steps.plan.outputs.shards }}
       splits: ${{ steps.plan.outputs.splits }}
       shard_timeout: ${{ steps.plan.outputs.shard_timeout }}
       covered: ${{ steps.covered.outputs.covered }}
+      map_artifact_id: ${{ steps.map.outputs.id }}
     steps:
       - name: Plan shards
         id: plan
@@ -94,6 +97,7 @@ jobs:
         env:
           SHARDS_VAR: ${{ vars.CI_TEST_SHARDS }}
           SHARDS_DEFAULT: "6"
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
           n="${SHARDS_VAR:-}"
@@ -102,6 +106,9 @@ jobs:
           [ "$n" -ge 1 ] || n=1
           [ "$n" -le 20 ] || n=20
           if [ "$n" -le 2 ]; then t=30; else t=15; fi
+          # The nightly runs in map mode (coverage on every test): its bound
+          # is A2's 3x map-mode overhead ceiling over the PR bound.
+          if [ "${EVENT_NAME:-}" = "schedule" ]; then t=$((t * 3)); fi
           {
             echo "shards=[$(seq -s, 1 "$n")]"
             echo "splits=$n"
@@ -137,6 +144,23 @@ jobs:
           login="$(gh api "repos/$REPO/pulls/$pr" --jq '.merged_by.login // empty' 2>/dev/null)" || emit false "PR lookup failed"
           [ "${login%"[bot]"}" = "${bot%"[bot]"}" ] && emit true "merged by $login"; emit false "merged by ${login:-nobody}"
 
+      - name: Locate the map
+        id: map
+        # The newest unexpired nightly map, read once so every selector in
+        # this run uses the same one. Any failure leaves the id empty, and
+        # the selector then looks the map up itself (and runs full without one).
+        if: github.event_name == 'pull_request'
+        shell: bash
+        env:
+          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          id="$(gh api "repos/$REPO/actions/artifacts?name=ci-fleet-map&per_page=100" --jq '[.artifacts[] | select(.expired | not)] | sort_by(.created_at) | last | .id // empty' 2>/dev/null)" || id=""
+          case "$id" in ''|*[!0-9]*) id="";; esac
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+          echo "map artifact: ${id:-none}"
+
   tests-shard:
     name: Tests shard ${{ matrix.group }}/${{ needs.coverage.outputs.splits }}
     needs: coverage
@@ -144,17 +168,36 @@ jobs:
     # NO job-level concurrency group (#1399; pinned by tests/test_issue_1254.py).
     runs-on: windows-latest
     timeout-minutes: ${{ fromJSON(needs.coverage.outputs.shard_timeout) }}
+    permissions:
+      contents: read
+      # The shadow selector downloads the nightly `ci-fleet-map` artifact.
+      actions: read
     strategy:
       fail-fast: false
       matrix:
         group: ${{ fromJSON(needs.coverage.outputs.shards) }}
     steps:
+      # Full history only where the selector diffs a PR against its base
+      # (shard 1). The string '0' is truthy in an expression, so `&& '0' ||`
+      # yields it; a number 0 would fall through to '1'.
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: ${{ (github.event_name == 'pull_request' && matrix.group == 1) && '0' || '1' }}
       # SHA-pinned setup-uv, enable-cache left at `auto` (see the git history
       # of this file for the 2026-08-28 rationale).
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
       - name: Install dependencies
         run: uv sync --frozen --all-extras
+      # The nightly only: map mode needs ci-fleet's `map` extra (coverage,
+      # pytest-cov), which charlie-work's lock does not carry. It goes into
+      # this job's venv alone, so every later `uv run` is `--no-sync` (a plain
+      # `uv run` would sync the venv back to the lock). Map mode itself is
+      # switched on inside "Run test shard" only, so no later step starts a
+      # coverage tracer (gap 47).
+      - name: Map mode
+        if: github.event_name == 'schedule'
+        shell: bash
+        run: uv pip install "ci-fleet[map]~=0.7.0"
       - name: Restore test durations
         # Saved by the nightly `schedule` run on main (ubuntu), restored here
         # on windows: enableCrossOsArchive on both sides. A miss is fine:
@@ -169,20 +212,45 @@ jobs:
         # duration_based_chunks keeps collection order, so each shard is a
         # contiguous run of files (module/class fixtures stay local).
         # -n auto / --dist=load as before (2 workers on windows-latest).
-        # --store-durations only on the nightly; -q comes from addopts.
+        # The nightly stores durations and runs in map mode (`map prepare` is
+        # idempotent and prints the pytest arguments, CRLF under Git Bash; a
+        # failure there costs tonight's map, never the run). Shard 1 of a PR
+        # (and of a merge-queue draft) records a shadow selection: the suite
+        # runs unchanged. One shard only, so each run is one selection record.
+        # The selector comes from PyPI, never from this checkout.
         shell: bash
         env:
           SPLITS: ${{ needs.coverage.outputs.splits }}
           GROUP: ${{ matrix.group }}
           EVENT_NAME: ${{ github.event_name }}
+          REPO: ${{ github.repository }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          CI_FLEET_MAP_ARTIFACT_ID: ${{ needs.coverage.outputs.map_artifact_id }}
+          CI_FLEET_SELECT_LEVEL: ${{ vars.CI_FLEET_SELECT_LEVEL }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          store=""
-          if [ "$EVENT_NAME" = "schedule" ]; then store="--store-durations"; fi
-          uv run pytest --tb=short -n auto --dist=load \
-            --splits "$SPLITS" --group "$GROUP" \
-            --splitting-algorithm duration_based_chunks \
-            --durations-path .test_durations $store \
-            --junit-xml="pytest-junit-$GROUP.xml"
+          set -uo pipefail
+          cmd=(uv run --no-sync pytest --tb=short -n auto --dist=load
+            --splits "$SPLITS" --group "$GROUP"
+            --splitting-algorithm duration_based_chunks
+            --durations-path .test_durations
+            --junit-xml="pytest-junit-$GROUP.xml")
+          if [ "$EVENT_NAME" = "schedule" ]; then
+            export CI_FLEET_LEDGER_CONTEXT=nightly
+            cmd+=(--store-durations)
+            if prep="$(uv run --no-sync ci-fleet map prepare)"; then
+              export CI_FLEET_MAP=1 COVERAGE_CORE=ctrace
+              while IFS= read -r arg; do
+                [ -n "$arg" ] && cmd+=("$arg")
+              done < <(printf '%s\n' "$prep" | tr -d '\r')
+            else
+              echo "::warning::ci-fleet map prepare failed: this shard runs without map mode"
+            fi
+          elif [ "$EVENT_NAME" = "pull_request" ] && [ "$GROUP" = "1" ]; then
+            cmd=(uvx --from "ci-fleet~=0.7.0" ci-fleet test --repo "$REPO" --base "$BASE_SHA"
+              --context ci --shadow -- "${cmd[@]}")
+          fi
+          exec "${cmd[@]}"
       - name: Upload junit
         if: always()
         uses: actions/upload-artifact@v4
@@ -191,9 +259,11 @@ jobs:
           path: pytest-junit-${{ matrix.group }}.xml
           if-no-files-found: ignore
           retention-days: 7
-      # The test ledger (ci-fleet, LG-C1a; moved here from the old `Tests` job by
-      # DD-4): this shard's recorder spool under RUNNER_TEMP. Ledger S1 artifact.
-      # Never allowed to change the job's result.
+      # The test ledger (ci-fleet): the recorder wrote this shard's per-test
+      # durations under RUNNER_TEMP, and shard 1's shadow selection record
+      # sits beside them; the workstation collector downloads them.
+      # Never allowed to change the job's result. This step already exists
+      # (LG-C1a, moved into tests-shard by DD-4); keep it byte-identical.
       - name: Upload test-ledger spool
         if: always()
         continue-on-error: true
@@ -212,6 +282,85 @@ jobs:
           include-hidden-files: true
           if-no-files-found: ignore
           retention-days: 7
+      # A failing nightly still maps every test that ran, and its failures
+      # become the map's `known_failing`. The `map` job merges the shards'.
+      - name: Build the shard map
+        if: github.event_name == 'schedule' && !cancelled()
+        shell: bash
+        env:
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          GROUP: ${{ matrix.group }}
+        run: uv run --no-sync ci-fleet map build --repo "$REPO" --map-sha "$SHA" --out "map-shard-$GROUP.json.gz"
+      # Not `ci-fleet-map-*`: the ledger routes artifacts by name prefix.
+      - name: Upload the shard map
+        if: github.event_name == 'schedule' && !cancelled()
+        uses: actions/upload-artifact@v4
+        with:
+          name: map-shard-${{ matrix.group }}
+          path: map-shard-${{ matrix.group }}.json.gz
+          if-no-files-found: warn
+          retention-days: 1
+      - name: Upload the coverage data
+        if: github.event_name == 'schedule' && !cancelled()
+        uses: actions/upload-artifact@v4
+        with:
+          name: map-coverage-data-${{ matrix.group }}
+          path: .ci-fleet-map/.coverage
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 7
+
+  map:
+    name: Merge the nightly map
+    # The nightly only, and never part of the required `Tests` check. Every
+    # shard's map, merged into the one `ci-fleet-map` artifact. A missing
+    # shard map means no map tonight: a partial map would leave tests out,
+    # and the selector keeps the last full one until `max_map_age_h`.
+    needs: [coverage, tests-shard]
+    if: always() && github.event_name == 'schedule' && needs.coverage.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+      - name: Download the shard maps
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          pattern: map-shard-*
+          path: shard-maps
+          merge-multiple: true
+      - name: Check every shard mapped
+        id: complete
+        shell: bash
+        env:
+          SPLITS: ${{ needs.coverage.outputs.splits }}
+          MAPS_DIR: shard-maps
+        run: |
+          set -uo pipefail
+          shopt -s nullglob
+          maps=("$MAPS_DIR"/map-shard-*.json.gz)
+          case "${SPLITS:-}" in ''|*[!0-9]*) want=0;; *) want=$((10#$SPLITS));; esac
+          if [ "$want" -gt 0 ] && [ "${#maps[@]}" -eq "$want" ]; then
+            echo "complete=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::${#maps[@]} of ${SPLITS:-?} shard maps: no map tonight (the selector keeps the last one)"
+            echo "complete=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Merge
+        if: steps.complete.outputs.complete == 'true'
+        run: uvx --from "ci-fleet~=0.7.0" ci-fleet map build --merge shard-maps/map-shard-*.json.gz --out ci-fleet-map.json.gz
+      - name: Upload the map
+        if: steps.complete.outputs.complete == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-fleet-map
+          path: ci-fleet-map.json.gz
+          if-no-files-found: error
+          retention-days: 30
 
   Tests:
     name: Tests
