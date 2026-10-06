@@ -7,7 +7,6 @@ the ``workflow_delegation`` installer re-attaches each ``def`` onto the class.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
 from typing import Any, Callable
 import logging
 
@@ -437,7 +436,7 @@ def _route_janitor_gate_failure_to_rework(
         sessions_dir=self._layout.sessions_dir,
         config=self.config,
         write_gate=self.write_gate,
-        now=datetime.now(UTC),
+        now=self.host.clock.now(),
     )
     if deferred_verdict is not None:
         return _wf.CommandResult(

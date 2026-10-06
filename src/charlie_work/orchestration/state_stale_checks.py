@@ -7,7 +7,6 @@ the ``workflow_delegation`` installer re-attaches each ``def`` onto the class.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
 from typing import Any, Sequence
 
 from charlie_work.labels import TransitionOutcome
@@ -167,7 +166,7 @@ def _attempt_stale_checks_retrigger(
         last_dt = _wf._parse_iso_timestamp(str(last_retrigger_at))
         if last_dt is not None:
             grace_minutes = self.config.review.stale_checks_grace_minutes
-            elapsed_minutes = (datetime.now(UTC) - last_dt).total_seconds() / 60.0
+            elapsed_minutes = (self.host.clock.now() - last_dt).total_seconds() / 60.0
             if elapsed_minutes < grace_minutes:
                 # Still inside the post-retrigger grace wait: skip this
                 # pass silently -- no event, no bookkeeping change
@@ -194,7 +193,7 @@ def _attempt_stale_checks_retrigger(
         return None
 
     new_attempts = attempts + 1
-    now_iso = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    now_iso = self.host.clock.now().isoformat().replace("+00:00", "Z")
     with _wf.state_lock(self.paths.state_file):
         state = _wf.load_state(self.paths.state_file)
         state["prs"][str(pr_number)] = {
@@ -449,7 +448,7 @@ def _check_janitor_rework_stall(
     threshold_minutes = self.config.review.rework_stall_minutes
     if threshold_minutes <= 0:
         return None
-    elapsed_minutes = (datetime.now(UTC) - started).total_seconds() / 60
+    elapsed_minutes = (self.host.clock.now() - started).total_seconds() / 60
     if elapsed_minutes < threshold_minutes:
         return None
 

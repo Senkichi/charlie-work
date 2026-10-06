@@ -11,7 +11,7 @@ from __future__ import annotations
 import copy
 import logging
 import tempfile
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +26,7 @@ from .. import (
 from . import effects_pr, effects_sessions, live_handoff, pre_classification
 from ..cross_repo_gate import cross_repo_scope_gate
 from ..github import GitHubError, build_branch_issue_validator
+from ..host import current as _host_current
 from ..process_utils import find_worker_terminal_status
 from ..review_decision import review_decision
 from ..verified_no_changes import (
@@ -87,7 +88,7 @@ def _issue(ctx: SweepContext, number: int) -> dict[str, Any]:
 
 
 def read_clock(ctx: SweepContext, _req: ReadClock) -> datetime:
-    ctx.now = datetime.now(UTC)
+    ctx.now = _host_current().clock.now()
     return ctx.now
 
 

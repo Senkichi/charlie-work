@@ -26,6 +26,7 @@ from ..escalation import _escalate_issue, _escalation_edge
 from ..github import (
     GitHubLike,
 )
+from ..host import current as _host_current
 from ..labels import TransitionOutcome
 from ..no_op_checkpoint import _paired_death_count
 from ..review_decision import review_decision
@@ -258,7 +259,9 @@ def _reap_restore_rework_requested(
             entry, window_minutes=config.watchdog.redispatch_window_minutes
         )
         if not provider_throttled:
-            redispatch_at = redispatch_at + [datetime.now(UTC).isoformat().replace("+00:00", "Z")]
+            redispatch_at = redispatch_at + [
+                _host_current().clock.now().isoformat().replace("+00:00", "Z")
+            ]
 
         terminal_failure = failure_kind in DETERMINISTIC_ESCALATION_FAILURE_KINDS
         # Issue #807: a deterministic judgment failure (e.g. genuine local
@@ -568,7 +571,9 @@ def _route_dead_worker_to_pre_review_rework(
         # arm ``throttled_until``) is a global provider condition, not a
         # worker-quality signal — it must not consume the redispatch cap.
         if not is_provider_throttle_failure(failure_kind):
-            redispatch_at = redispatch_at + [datetime.now(UTC).isoformat().replace("+00:00", "Z")]
+            redispatch_at = redispatch_at + [
+                _host_current().clock.now().isoformat().replace("+00:00", "Z")
+            ]
 
         terminal_failure = failure_kind in DETERMINISTIC_ESCALATION_FAILURE_KINDS
         # Issue #807: a deterministic judgment failure escalates immediately
