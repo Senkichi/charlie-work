@@ -24,10 +24,12 @@ from __future__ import annotations
 
 import ast
 import functools
+import os
 import pathlib
 import subprocess
 import sys
 import textwrap
+from collections.abc import Callable
 
 import pytest
 from _src_ast import parsed
@@ -57,11 +59,29 @@ sys.meta_path.insert(0, _Blocker())
 '''
 
 
+def _clean_env() -> dict[str, str]:
+    """The environment minus ci-fleet's map-mode child hook.
+
+    During a map build (the nightly -- also the only run that records
+    durations, so every ledger sample is a map-mode sample) each test's
+    process carries ``CI_FLEET_MAP_NODEID``; ``ci_fleet_probe.pth`` then arms
+    child recording -- ``coverage.process_startup()`` under ``ctrace`` plus a
+    file-read audit hook -- at interpreter startup, before any meta-path
+    blocker in ``-c`` code can run. That doubled this file's subprocess
+    imports (issue #2388) and lets ``ci_fleet`` load ahead of the blocker, the
+    hole #2374 closed in ``test_heartbeat_check_ci_fleet_isolation.py``.
+    These tests prove import isolation, which map-mode attribution is
+    irrelevant to.
+    """
+    return {k: v for k, v in os.environ.items() if not k.startswith("CI_FLEET_MAP")}
+
+
 def _run(body: str) -> "subprocess.CompletedProcess[str]":
     return subprocess.run(
         [sys.executable, "-c", _BLOCKER + textwrap.dedent(body)],
         capture_output=True,
         text=True,
+        env=_clean_env(),
     )
 
 
@@ -70,6 +90,7 @@ def _run_unblocked(body: str) -> "subprocess.CompletedProcess[str]":
         [sys.executable, "-c", textwrap.dedent(body)],
         capture_output=True,
         text=True,
+        env=_clean_env(),
     )
 
 
@@ -209,6 +230,43 @@ def test_the_blocker_actually_blocks() -> None:
 
     assert blocked.returncode != 0, "blocker did not block; the other tests are vacuous"
     assert "diff_journal" in blocked.stderr
+
+
+@pytest.mark.parametrize("runner", [_run, _run_unblocked], ids=["blocked", "unblocked"])
+def test_subprocesses_do_not_carry_map_mode_env(
+    monkeypatch: pytest.MonkeyPatch, runner: "Callable[..., subprocess.CompletedProcess[str]]"
+) -> None:
+    """Map-mode env must not follow these probes into their children.
+
+    Issue #2388. Under a map build -- which is also the only run recording
+    ledger durations -- every test process carries ``CI_FLEET_MAP_NODEID``.
+    A child that inherits it has ``ci_fleet_probe.pth`` arm
+    ``ci_fleet.selection.map_child`` at interpreter startup:
+    ``coverage.process_startup()`` under ``ctrace`` plus a file-read audit
+    hook, ~2x on ``import charlie_work.cli``, all before the meta-path
+    blocker runs. The pth latches ``sys._ci_fleet_map_child_started`` the
+    moment the nodeid is present, so the latch is the honest signal.
+    """
+    monkeypatch.setenv("CI_FLEET_MAP", "1")
+    monkeypatch.setenv("CI_FLEET_MAP_NODEID", "tests/test_cli_import_isolation.py::probe")
+    monkeypatch.setenv("CI_FLEET_MAP_ROOT", str(pathlib.Path(__file__).parent.parent))
+    monkeypatch.setenv("CI_FLEET_MAP_DIR", str(pathlib.Path(__file__).parent))
+
+    result = runner(
+        """
+        import os
+        import sys
+        if os.environ.get("CI_FLEET_MAP_NODEID"):
+            print("LEAKED")
+        elif getattr(sys, "_ci_fleet_map_child_started", False):
+            print("ARMED")
+        else:
+            print("CLEAN")
+        """
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "CLEAN" in result.stdout
 
 
 def test_ci_fleet_itself_still_imports_under_the_blocker() -> None:
