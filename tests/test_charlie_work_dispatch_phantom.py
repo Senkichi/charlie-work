@@ -24,6 +24,7 @@ from _worktree_fixtures import (
     _setup_completed_worktree,
 )
 from charlie_work.claude_code import ClaudeWorkerRecord
+from charlie_work.host.fakes import FakeProcessProbe
 from charlie_work.config import (
     OrchestratorConfig,
     WorkerRoleConfig,
@@ -38,7 +39,7 @@ from _dispatch_fixtures import _stub_real_activity_probe_for_stalled_tests  # no
 
 
 def test_dispatch_phantom_live_worker_frees_slot_and_reaps_sidecar(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, fake_host
 ) -> None:
     """Issue #523: a live_worker_redispatch_averted result whose recorded PID is
     dead must not count as a live worker slot. The phantom slot is freed, the
@@ -66,8 +67,9 @@ def test_dispatch_phantom_live_worker_frees_slot_and_reaps_sidecar(
 
     monkeypatch.setattr("charlie_work.claude_code.launch_claude_worker", _fake_launch)
     # Issue #523: the recorded PID is dead, so the result must not count as a
-    # live worker slot. This also makes _worker_pid_alive return False so the
-    # issue is selectable despite state.json recording a worker_pid.
+    # live worker slot. The all-dead probe below makes the state-entry
+    # liveness check return False so the issue is selectable despite
+    # state.json recording a worker_pid.
     monkeypatch.setattr("charlie_work.workflow.is_pid_alive", lambda pid, start: False)
     # The sidecar-driven live-worker census (_issues_with_live_workers ->
     # worker.iter_workers().is_alive() -> worker_fate.is_alive) reads a
@@ -77,6 +79,9 @@ def test_dispatch_phantom_live_worker_frees_slot_and_reaps_sidecar(
     # as indeterminate-so-alive by design), so leaving it unpatched makes the
     # test's outcome depend on host state, not the code under test.
     monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda pid, start: False)
+    # State-entry worker-liveness reads the injected host probe; fake it
+    # all-dead so the outcome never depends on the host's real PID table.
+    fake_host(probe=FakeProcessProbe())
 
     config = OrchestratorConfig(worker=WorkerRoleConfig(harness="claude-code"))
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -167,7 +172,7 @@ def test_dispatch_phantom_live_worker_frees_slot_and_reaps_sidecar(
 
 
 def test_dispatch_phantom_live_worker_no_active_labels_skips_relabel(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, fake_host
 ) -> None:
     """Issue #523: a phantom live worker whose issue carries only a terminal
     label (no active labels) must still free the slot and reap the sidecar,
@@ -205,6 +210,9 @@ def test_dispatch_phantom_live_worker_no_active_labels_skips_relabel(
     # as indeterminate-so-alive by design), so leaving it unpatched makes the
     # test's outcome depend on host state, not the code under test.
     monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda pid, start: False)
+    # State-entry worker-liveness reads the injected host probe; fake it
+    # all-dead so the outcome never depends on the host's real PID table.
+    fake_host(probe=FakeProcessProbe())
 
     config = OrchestratorConfig(worker=WorkerRoleConfig(harness="claude-code"))
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -295,7 +303,7 @@ def test_dispatch_phantom_live_worker_no_active_labels_skips_relabel(
 
 
 def test_dispatch_phantom_live_worker_preserves_sidecar_for_completed_worktree(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, fake_host
 ) -> None:
     """Issue #1122: a phantom live worker whose worktree is COMPLETED (clean,
     ahead of base) must NOT have its sidecar reaped or labels stripped. The
@@ -350,6 +358,9 @@ def test_dispatch_phantom_live_worker_preserves_sidecar_for_completed_worktree(
     # of the dispatch candidate set before the phantom-live-worker routing
     # under test ever runs.
     monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda pid, start: False)
+    # State-entry worker-liveness reads the injected host probe; fake it
+    # all-dead so the outcome never depends on the host's real PID table.
+    fake_host(probe=FakeProcessProbe())
 
     config = OrchestratorConfig(worker=WorkerRoleConfig(harness="claude-code"))
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -434,7 +445,7 @@ def test_dispatch_phantom_live_worker_preserves_sidecar_for_completed_worktree(
 
 
 def test_dispatch_phantom_live_worker_preserves_sidecar_for_push_succeeded_outcome(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, fake_host
 ) -> None:
     """Issue #1122: a phantom live worker whose ``.worker-outcome.json`` reports
     ``push_succeeded=true, pr_created=false`` must NOT have its sidecar reaped,
@@ -477,6 +488,9 @@ def test_dispatch_phantom_live_worker_preserves_sidecar_for_push_succeeded_outco
     # from OpenProcess is treated as indeterminate-so-alive by design) instead
     # of the code under test.
     monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda pid, start: False)
+    # State-entry worker-liveness reads the injected host probe; fake it
+    # all-dead so the outcome never depends on the host's real PID table.
+    fake_host(probe=FakeProcessProbe())
 
     config = OrchestratorConfig(worker=WorkerRoleConfig(harness="claude-code"))
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -554,7 +568,7 @@ def test_dispatch_phantom_live_worker_preserves_sidecar_for_push_succeeded_outco
 
 
 def test_dispatch_phantom_live_worker_reaps_sidecar_when_pr_created_omitted(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, fake_host
 ) -> None:
     """B9 (wf-review-opus.md): an outcome that OMITS ``pr_created`` entirely
     must NOT get the same preservation treatment as one that explicitly
@@ -602,6 +616,9 @@ def test_dispatch_phantom_live_worker_reaps_sidecar_when_pr_created_omitted(
     monkeypatch.setattr("charlie_work.claude_code.launch_claude_worker", _fake_launch)
     monkeypatch.setattr("charlie_work.workflow.is_pid_alive", lambda pid, start: False)
     monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda pid, start: False)
+    # State-entry worker-liveness reads the injected host probe; fake it
+    # all-dead so the outcome never depends on the host's real PID table.
+    fake_host(probe=FakeProcessProbe())
 
     config = OrchestratorConfig(worker=WorkerRoleConfig(harness="claude-code"))
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
