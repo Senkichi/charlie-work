@@ -155,6 +155,58 @@ def test_the_kill_switch_restores_the_default_root(tmp_path: Path, mounted: None
         runtime_paths(repo, RuntimeConfig().state_dir).root
     )
     assert resolved.legacy_worktrees is None
+    assert "UV_CACHE_DIR" not in host_io_worker.worker_env(resolved.worker_io.io)
+
+
+def test_the_kill_switch_never_reads_the_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def _boom(path: Path):
+        raise AssertionError("manifest read with the kill switch off")
+
+    monkeypatch.setattr(host_io_worker, "load_manifest", _boom)
+    repo = _repo(tmp_path)
+    with pytest.raises(AssertionError):  # control: the patch is on the read path
+        resolved_layout(OrchestratorConfig(), repo)
+    config = OrchestratorConfig(claude_code=ClaudeCodeConfig(host_io_worktrees=False))
+    assert resolved_layout(config, repo).worker_io.io is None
+
+
+def test_no_manifest_leaves_the_layout_exactly_as_before(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    resolved = resolved_layout(OrchestratorConfig(), repo)
+    assert resolved.worktrees == layout.worktrees_dir(
+        runtime_paths(repo, RuntimeConfig().state_dir).root
+    )
+    assert resolved.legacy_worktrees is None
+    assert resolved.worker_io == host_io_worker.NO_WORKER_IO
+    assert resolved.sweep_roots() == (resolved.worktrees,)
+    assert resolved.host_io_scope_paths() == ()
+
+
+def test_sweep_roots_skip_a_nested_legacy_root(tmp_path: Path) -> None:
+    import dataclasses
+
+    repo = _repo(tmp_path)
+    base = resolved_layout(OrchestratorConfig(), repo)
+    outer = tmp_path / "outer"
+    inner = outer / "repo-a" / "worktrees"
+    (inner / "agent-issue-1").mkdir(parents=True)
+    for active, legacy in ((outer, inner), (inner, outer)):
+        nested = dataclasses.replace(base, worktrees=active, legacy_worktrees=legacy)
+        assert nested.sweep_roots() == (active,)
+
+
+def test_host_load_scope_covers_the_volume_only_while_in_use(
+    tmp_path: Path, mounted: None
+) -> None:
+    _write_manifest()
+    repo = _repo(tmp_path)
+    assert resolved_layout(OrchestratorConfig(), repo).host_io_scope_paths() == (
+        Path("Y:\\fleet"),
+    )
+    off = OrchestratorConfig(claude_code=ClaudeCodeConfig(host_io_worktrees=False))
+    assert resolved_layout(off, repo).host_io_scope_paths() == ()
 
 
 def test_the_fleet_snapshot_resolves_the_same_root(tmp_path: Path, mounted: None) -> None:
@@ -322,6 +374,18 @@ def test_no_cutover_marker_without_the_volume_or_on_a_dry_run(tmp_path: Path) ->
     assert not (tmp_path / host_io_worker.CUTOVER_FILENAME).exists()
 
 
+def test_a_cutover_write_failure_never_fails_the_dispatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    io = host_io_worker.WorkerIo(Path("Y:\\fleet"), Path("Y:\\fleet\\uv-cache"), "Y:")
+
+    def _boom(*a, **k):
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(host_io_worker, "write_json_atomic", _boom)
+    assert host_io_worker.record_cutover(tmp_path, io, dry_run=False) is False
+
+
 def test_a_live_dispatch_records_the_cutover(tmp_path: Path, mounted: None) -> None:
     from charlie_work.fleet_paths import fleet_dir
     from charlie_work.workflow import OrchestratorApp
@@ -337,3 +401,26 @@ def test_a_live_dispatch_records_the_cutover(tmp_path: Path, mounted: None) -> N
 
 def test_the_kill_switch_defaults_on() -> None:
     assert OrchestratorConfig().claude_code.host_io_worktrees is True
+
+
+def test_a_sibling_repos_suite_on_the_volume_is_attributed(tmp_path: Path, mounted: None) -> None:
+    """The governor's scope (reap_dispatch) must count suites in any repo's volume worktree."""
+    from charlie_work import host_load, quiesce
+
+    _write_manifest()
+    resolved = resolved_layout(OrchestratorConfig(), _repo(tmp_path))
+    sibling = r"Y:\fleet\repo-b\worktrees\agent-issue-9"
+    procs = [
+        quiesce.ProcessInfo(pid=50, ppid=1, name="", command_line=f"claude --cwd {sibling}"),
+        quiesce.ProcessInfo(pid=60, ppid=50, name="", command_line="python -m pytest -q"),
+    ]
+    own_only = (str(resolved.worktrees),)
+    with_volume = (*own_only, *resolved.host_io_scope_paths())
+    assert (
+        host_load.pytest_tree_load(procs, self_pid=999, scope_paths=own_only).pytest_tree_count
+        == 0
+    )
+    assert (
+        host_load.pytest_tree_load(procs, self_pid=999, scope_paths=with_volume).pytest_tree_count
+        == 1
+    )

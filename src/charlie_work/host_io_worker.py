@@ -103,13 +103,21 @@ def worker_env(io: WorkerIo | None) -> dict[str, str]:
 def record_cutover(
     fleet_dir: Path, io: WorkerIo | None, *, dry_run: bool, now: datetime | None = None
 ) -> bool:
-    """Write the cutover marker once, the first time a live dispatch uses the volume."""
+    """Write the cutover marker once, the first time a live dispatch uses the volume.
+
+    Best-effort: it runs on every adapter-settings build, so a write failure
+    is logged and never fails the dispatch.
+    """
     if io is None or dry_run:
         return False
     marker = fleet_dir / CUTOVER_FILENAME
-    if marker.exists():
-        return False
     at = (now or datetime.now(UTC)).astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-    marker.parent.mkdir(parents=True, exist_ok=True)
-    write_json_atomic(marker, {"schema": CUTOVER_SCHEMA, "cutover_at": at})
+    try:
+        if marker.exists():
+            return False
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        write_json_atomic(marker, {"schema": CUTOVER_SCHEMA, "cutover_at": at})
+    except OSError as exc:
+        logger.warning("could not write host-io cutover marker %s: %s", marker, exc)
+        return False
     return True

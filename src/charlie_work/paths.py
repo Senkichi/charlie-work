@@ -260,12 +260,27 @@ class ResolvedLayout:
     def sweep_roots(self) -> tuple[Path, ...]:
         """Roots ``clean_worktrees`` must sweep: the active one, plus the legacy
         one while it still has entries (worktrees created before the switch)."""
-        legacy = self.legacy_worktrees
-        if legacy is None or legacy == self.worktrees or not legacy.is_dir():
-            return (self.worktrees,)
-        if not any(legacy.iterdir()):
-            return (self.worktrees,)
-        return (self.worktrees, legacy)
+        active, legacy = self.worktrees, self.legacy_worktrees
+        if legacy is None or legacy.is_relative_to(active) or active.is_relative_to(legacy):
+            # Nested roots would be swept twice (merge_clean_results assumes
+            # disjoint roots); the outer one already covers the inner.
+            return (active,)
+        try:
+            if not legacy.is_dir() or not any(legacy.iterdir()):
+                return (active,)
+        except OSError:
+            # Unlistable: skip it this pass rather than fail the whole sweep.
+            return (active,)
+        return (active, legacy)
+
+    def host_io_scope_paths(self) -> tuple[Path, ...]:
+        """The volume's worker root while it is in use, for host-load attribution.
+
+        Worktrees there carry no ``.var/charlie-work`` path marker, so without
+        this a sibling repo's suites on the volume would not be counted.
+        """
+        io = self.worker_io.io
+        return () if io is None else (io.worker_root,)
 
 
 @dataclass(frozen=True)
