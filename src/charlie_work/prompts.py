@@ -135,6 +135,14 @@ EXECUTION_CONTRACT_MARKERS: tuple[str, ...] = (
     "Execution contract (self-detect from your diff)",
     "run the **FULL suite** locally at the final head before pushing",
 )
+# The same contract when the test command is ``ci-fleet test``: the selector widens
+# for contract changes and runs the full suite itself when the change needs it
+# (``prompt_test_command`` renders one wording or the other). A prompt must carry
+# one of the two marker sets in full.
+SELECTION_CONTRACT_MARKERS: tuple[str, ...] = (
+    "Execution contract (selection decides scope)",
+    "runs the **FULL suite** itself whenever the change needs it",
+)
 
 
 class MissingExecutionContractError(RuntimeError):
@@ -174,7 +182,7 @@ def assert_execution_contract(prompt: str, *, context: str = "worker prompt") ->
     """
 
     missing = tuple(m for m in EXECUTION_CONTRACT_MARKERS if m not in prompt)
-    if missing:
+    if missing and any(m not in prompt for m in SELECTION_CONTRACT_MARKERS):
         raise MissingExecutionContractError(context, missing)
 
 

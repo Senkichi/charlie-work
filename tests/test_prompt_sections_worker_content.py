@@ -29,24 +29,28 @@ def test_execution_contract_section_present_and_rendered() -> None:
 
     assert "section_execution_contract" in sections
     contract = sections["section_execution_contract"]
-    assert "self-detect from your diff" in contract
-    assert "the default is the targeted command" in contract
-    assert "public function signature" in contract
-    assert "return shape" in contract
-    assert "exception type" in contract
-    assert "DB schema" in contract
-    assert "module re-export" in contract
-    assert "run the **FULL suite** locally at the final head before pushing" in contract
-    assert "For all other diffs, do NOT run the full suite locally" in contract
-    assert "CI runs it on every push and is the merge gate" in contract
+    # The partial names the contract through a placeholder: ``prompt_test_command``
+    # renders the hand-picked wording or the ``ci-fleet test`` wording. The
+    # reporting rule is shared by both.
+    assert contract.startswith("$test_execution_contract ")
     assert "Quote the exact command you ran" in contract
 
-    # The partial names the full-suite command through a placeholder; the rendered
-    # prompt carries it with the resolved command spliced in.
-    assert "$full_suite_command" in contract
-    rendered_contract = contract.replace(
-        "$full_suite_command", TEST_COMMAND_VALUES["full_suite_command"]
+    targeted = TEST_COMMAND_VALUES["test_execution_contract"]
+    assert "self-detect from your diff" in targeted
+    assert "the default is the targeted command" in targeted
+    assert "public function signature" in targeted
+    assert "return shape" in targeted
+    assert "exception type" in targeted
+    assert "DB schema" in targeted
+    assert "module re-export" in targeted
+    assert "run the **FULL suite** locally at the final head before pushing" in targeted
+    assert "For all other diffs, do NOT run the full suite locally" in targeted
+    assert "CI runs the same selection or the full suite, and the nightly runs everything" in (
+        targeted
     )
+    assert TEST_COMMAND_VALUES["full_suite_command"] in targeted
+
+    rendered_contract = contract.replace("$test_execution_contract", targeted)
     for template_name in ("worker.md", "worker_claude_code.md", "rework.md"):
         prompt = _render_worker_with_sections(template_name)
         assert rendered_contract in prompt
@@ -143,6 +147,11 @@ def test_rework_prompt_includes_push_then_verify_final_step() -> None:
         pr_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
         pr_dir.mkdir(parents=True, exist_ok=True)
         rework_path = app._write_rework_prompt(pr, 123, "Fix the typo in the search function.")
+        # The writer records why ``ci-fleet test`` was unavailable (tests have no
+        # executable); release events.db so Windows can remove the temporary directory.
+        from charlie_work import instrumentation
+
+        instrumentation.close_db(paths.state_file)
 
         # Read the rendered prompt
         prompt = rework_path.read_text(encoding="utf-8")
@@ -269,10 +278,11 @@ def test_worker_and_rework_templates_contain_identical_canonical_test_command() 
         assert "test_<touched_module>" not in text, (
             f"Template {template_name} still names the flat test_<touched_module>.py shape"
         )
-    # The full-suite command is spliced in by the shared execution-contract partial,
-    # which every one of those templates includes.
+    # The full-suite command reaches the shared execution-contract partial inside
+    # ``$test_execution_contract`` (``prompt_test_command``), and every one of those
+    # templates includes the partial.
     contract = (sections_dir / "execution_contract.md").read_text(encoding="utf-8")
-    assert "$full_suite_command" in contract
+    assert "$test_execution_contract" in contract
     assert "uv run --extra" not in contract
     for template_name in ("worker.md", "worker_claude_code.md", "rework.md"):
         text = (prompts_dir / template_name).read_text(encoding="utf-8")

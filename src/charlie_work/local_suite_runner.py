@@ -102,14 +102,17 @@ def reusable_gate_result(
     *,
     head_sha: str | None,
     base_sha: str | None,
+    suite_argv: Sequence[str],
 ) -> dict[str, Any] | None:
-    """A prior passing result for exactly this ``(head_sha, base_sha)`` pair, else None.
+    """A prior passing result for exactly this ``(head_sha, base_sha)`` pair and argv, else None.
 
     Reuse is keyed on the full pair: a moved base means the merged tree differs,
-    so it must rerun. Fails closed -- a missing, truncated or malformed file
+    so it must rerun. It is also keyed on the argv: a suite that ran a different
+    command -- unwrapped, or in the other selection mode -- did not test what this
+    launch would. Fails closed -- a missing, truncated or malformed file
     (``read_gate_result`` returns None), ``ok`` not literally ``True``, a missing
-    ``ended_at`` (an incomplete run), or an empty head/base on either side is a
-    miss, never a pass.
+    ``ended_at`` (an incomplete run), an empty head/base on either side, or a
+    missing or different ``suite_argv`` is a miss, never a pass.
     """
     if not head_sha or not base_sha:
         return None
@@ -117,6 +120,8 @@ def reusable_gate_result(
     if result is None or result.get("ok") is not True or not result.get("ended_at"):
         return None
     if result.get("head_sha") != head_sha or result.get("base_sha") != base_sha:
+        return None
+    if result.get("suite_argv") != list(suite_argv):
         return None
     return result
 

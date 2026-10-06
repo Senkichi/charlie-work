@@ -1,0 +1,6 @@
+warning
+# A worker or rework prompt fell back to the hand-picked targeted command
+# because ``ci-fleet test`` could not be used (no executable beside the
+# interpreter, an origin that is not GitHub, or no base ref). Warning: the
+# worker still tests, but without selection, and heartbeat_check.py's
+# check_warning_events surfaces it from the level column.

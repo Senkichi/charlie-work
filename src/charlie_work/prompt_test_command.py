@@ -30,6 +30,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .selection_wrapper import SelectionTarget, worker_command
+
 PYTEST_FLAGS = "-q --tb=short"
 
 # What the worker substitutes for the placeholder; the worker, not the orchestrator,
@@ -59,6 +61,48 @@ class WorkerTestCommands:
 
     targeted: str
     full_suite: str
+    # ``targeted`` runs ``ci-fleet test``, which selects the tests itself.
+    selected: bool = False
+
+
+# The step sentence above the ```bash block, and the execution contract, for each
+# form of ``targeted``. The contract's markers are pinned by ``prompts.py``'s
+# ``EXECUTION_CONTRACT_MARKERS`` / ``SELECTION_CONTRACT_MARKERS``.
+TARGETED_STEP = (
+    "Run the tests impacted by your change from the worktree root: the test file(s) you "
+    "added or modified, plus `grep tests/` for every module/function/symbol your "
+    "production diff touched and run every matching test file — not just the tests you "
+    "wrote:"
+)
+SELECTED_STEP = (
+    "Run exactly this command from the worktree root; it selects every test your diff "
+    "can affect. To add test files of your own, put `--also <path> ...` before the `--`:"
+)
+_CI_SENTENCE = "CI runs the same selection or the full suite, and the nightly runs everything."
+
+
+def _targeted_contract(full_suite: str) -> str:
+    return (
+        "**Execution contract (self-detect from your diff):** the default is the targeted "
+        "command above (changed test files + the named deciders only). Only if the diff "
+        "changes any public function signature/return shape, exception type/message "
+        "consumed elsewhere, DB schema, or module re-export, run the **FULL suite** "
+        f"locally at the final head before pushing ({full_suite}). The blast radius of a "
+        "contract change is by definition outside the changed files. For all other diffs, "
+        f"do NOT run the full suite locally — {_CI_SENTENCE}"
+    )
+
+
+def _selected_contract(full_suite: str) -> str:
+    return (
+        "**Execution contract (selection decides scope):** the command above is your whole "
+        "local test run. `ci-fleet test` already widens for contract changes: a changed "
+        "function signature, return shape or exception selects every test that ran the "
+        "changed file, and a module-level or re-export change selects every test that "
+        "imports the module. It runs the **FULL suite** itself whenever the change needs "
+        "it (it prints `full` and the reason), so do not run a separate full suite "
+        f"({full_suite}) unless that command could not start. {_CI_SENTENCE}"
+    )
 
 
 def _dist_name(requirement: str) -> str:
@@ -161,25 +205,50 @@ def derive_pytest_runner(repo_root: Path) -> str | None:
     return f"uv run --group {_prefer_dev(group_names)} pytest"
 
 
-def resolve_test_commands(configured_runner: str, repo_root: Path | None) -> WorkerTestCommands:
-    """Resolve the prompt's test commands: config override, then derivation, then neither."""
+def resolve_test_commands(
+    configured_runner: str,
+    repo_root: Path | None,
+    *,
+    selection: SelectionTarget | None = None,
+) -> WorkerTestCommands:
+    """Resolve the prompt's test commands: config override, then derivation, then neither.
+
+    With a ``selection`` target the targeted command is ``ci-fleet test`` around the
+    runner; without one (or with no runner to wrap) it is today's hand-picked form.
+    """
     runner = configured_runner.strip()
     if not runner and repo_root is not None:
         runner = derive_pytest_runner(repo_root) or ""
     if not runner:
         return WorkerTestCommands(targeted=UNRESOLVED_TARGETED, full_suite=UNRESOLVED_FULL_SUITE)
+    full_suite = f"`{runner} {PYTEST_FLAGS}`"
+    if selection is not None:
+        return WorkerTestCommands(
+            targeted=worker_command(selection, runner, PYTEST_FLAGS),
+            full_suite=full_suite,
+            selected=True,
+        )
     return WorkerTestCommands(
         targeted=f"{runner} {IMPACTED_TESTS_PLACEHOLDER} {PYTEST_FLAGS}",
-        full_suite=f"`{runner} {PYTEST_FLAGS}`",
+        full_suite=full_suite,
     )
 
 
 def prompt_test_command_values(
-    configured_runner: str, repo_root: Path | None
+    configured_runner: str,
+    repo_root: Path | None,
+    *,
+    selection: SelectionTarget | None = None,
 ) -> Mapping[str, str]:
     """The ``render_prompt`` values every worker/rework writer supplies for the test command."""
-    commands = resolve_test_commands(configured_runner, repo_root)
+    commands = resolve_test_commands(configured_runner, repo_root, selection=selection)
+    if commands.selected:
+        step, contract = SELECTED_STEP, _selected_contract(commands.full_suite)
+    else:
+        step, contract = TARGETED_STEP, _targeted_contract(commands.full_suite)
     return {
         "targeted_test_command": commands.targeted,
         "full_suite_command": commands.full_suite,
+        "test_step_instruction": step,
+        "test_execution_contract": contract,
     }

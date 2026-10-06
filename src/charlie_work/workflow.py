@@ -33,7 +33,7 @@ from .review_launch import (  # noqa: F401 deliberate re-export
     _launch_review_claude_code,
     _launch_review_devin_shell,
 )
-from .host import HostPorts, current as _host_current
+from .host import HostPorts, count_fleet_live_sessions, current as _host_current  # noqa: F401  (deliberate re-export; the sessions-port late-binding facade -- see host/sessions.py)
 from .worker_launch_gate import FleetLaunchLock
 from .review_fleet_gate import (
     fleet_lock_held_result_data,
@@ -41,7 +41,7 @@ from .review_fleet_gate import (
     fleet_review_lock_deferral,
     read_fleet_review_cap,
 )
-from .fleet_registry import count_fleet_live_reviews, count_fleet_live_sessions, managed_repo_names  # noqa: F401  (deliberate re-export; count_fleet_live_sessions used by moved L06 delegates via _wf., count_fleet_live_reviews by review_fleet_gate via _wf.)
+from .fleet_registry import count_fleet_live_reviews, managed_repo_names  # noqa: F401  (deliberate re-export; count_fleet_live_reviews by review_fleet_gate via _wf., managed_repo_names likewise. count_fleet_live_sessions is deliberately NOT imported from here: it is host/sessions.py's late-binding facade over fleet_registry's walker, re-exported via the .host import above -- a plain re-export would freeze fleet_registry's function object and kill the fleet_registry.* patch surface.)
 from . import layout, status_snapshot  # noqa: F401  (deliberate re-export; layout reached via _wf.layout by orchestration/misc_reconcile.py)
 from .main_ci_reclaim import reclaim_superseded_main_ci_runs  # noqa: F401  (deliberate re-export; used by moved L01 b3 delegates via _wf.)
 from .notify import AttentionDigest, AttentionEntry, emit_digest, reviewer_quota_alert_digest
@@ -1395,8 +1395,12 @@ WORKER_PROMPT_KEYS: frozenset[str] = frozenset(
         # The test command, resolved by ``prompt_test_command`` (config
         # override, else derived from the consumer's pyproject.toml, else a
         # pointer to the repository's own docs). Always supplied, never empty.
+        # The step sentence and execution contract follow the command's form
+        # (hand-picked, or ``ci-fleet test``).
         "targeted_test_command",
         "full_suite_command",
+        "test_step_instruction",
+        "test_execution_contract",
     }
 )
 REWORK_PROMPT_KEYS: frozenset[str] = frozenset(
@@ -1414,6 +1418,8 @@ REWORK_PROMPT_KEYS: frozenset[str] = frozenset(
         # Same resolution as the worker prompt's (``prompt_test_command``).
         "targeted_test_command",
         "full_suite_command",
+        "test_step_instruction",
+        "test_execution_contract",
     }
 )
 

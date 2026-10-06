@@ -29,6 +29,7 @@ from .paths import prompt_override_dirs
 from .prompt_skills import active_prompt_variants
 from .prompt_test_command import prompt_test_command_values
 from .prompts import assert_rework_prompt_contracts, render_prompt
+from .selection_wrapper import worker_selection
 from .review_decision import _round_history_entries  # noqa: F401  (re-exported)
 from .review_decision import resolve_decision_payload
 from .verdict_parsing import body_has_crash_signature
@@ -839,7 +840,16 @@ def _render_rework_prompt(
             "branch_name": pr.get("headRefName", ""),
             # Same derivation as the worker prompt (``prompt_test_command``); the
             # fresh and rework lanes must not disagree about how to run tests.
-            **prompt_test_command_values(config.dispatch.test_command, repo_root),
+            **prompt_test_command_values(
+                config.dispatch.test_command,
+                repo_root,
+                selection=worker_selection(
+                    repo_root,
+                    config.dispatch.base_ref,
+                    state_file=state_file,
+                    payload={"pr_number": pr.get("number"), "issue_number": issue_number},
+                ),
+            ),
         },
         search_dirs=search_dirs,
         variants=active_prompt_variants(

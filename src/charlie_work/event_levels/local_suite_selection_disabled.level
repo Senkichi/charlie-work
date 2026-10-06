@@ -1,0 +1,3 @@
+info
+# The repo's ci-fleet.toml sets ``[test_selection] enabled = false``, so the
+# local merge gate ran its suite unwrapped. The repo's own choice, not a fault.
