@@ -87,14 +87,18 @@ def _hand_off(
 ) -> EffectResults:
     """Aviator hand-off: add the mergequeue label, and on success mark the PR queued (ADR-0003).
 
-    A PR whose snapshot already shows the label is not re-POSTed (#2440): the add
-    is idempotent, so the call would only cost budget.
+    A PR whose snapshot already shows the queue label is not re-POSTed (#2440): the
+    add is idempotent, so the call would only cost budget. The skip-line check
+    runs on every full pass regardless, unless the skip-line label is already there.
 
     A PR whose linked issue is ``priority:critical`` gets the skip-line label
     first, so Aviator queues it at the front (TIS-CW-7).
     """
-    already_labelled = cfg.mergequeue_label in label_names(pr)
-    if not already_labelled:
+    labels_on_pr = label_names(pr)
+    already_labelled = cfg.mergequeue_label in labels_on_pr
+    # Only the queue-label POST is gated on already_labelled: an issue that gains
+    # priority:critical after the PR was queued must still get the skip-line label.
+    if not (cfg.skip_line_label and cfg.skip_line_label in labels_on_pr):
         _add_skip_line_if_critical(app, pr_number, issue_number, cfg)
     applied = already_labelled or app.gh.add_pr_label(pr_number, cfg.mergequeue_label)
     if applied:

@@ -100,6 +100,7 @@ class _CountingGitHub(FakeGitHub):
     def __init__(self) -> None:
         super().__init__()
         self.calls: list[str] = []
+        self.pr_labels_posted: list[str] = []
 
     def pr_view(self, number: int, *, fields: str | None = None):  # type: ignore[override]
         self.calls.append("pr_view")
@@ -115,6 +116,7 @@ class _CountingGitHub(FakeGitHub):
 
     def add_pr_label(self, number: int, label: str) -> bool:  # type: ignore[override]
         self.calls.append("add_pr_label")
+        self.pr_labels_posted.append(label)
         return super().add_pr_label(number, label)
 
 
@@ -131,6 +133,7 @@ def _queued_app(tmp_path: Path) -> tuple[OrchestratorApp, _CountingGitHub, dict[
     assert state["mergequeue_head_sha"] == "sha-abc123"  # the hand-off SHA
     assert state["mergequeue_checked_at"]
     gh.calls.clear()
+    gh.pr_labels_posted.clear()
     # The per-pass PR snapshot (pr_list row) after Aviator's label landed.
     snapshot = {**gh.prs[0], "labels": [{"name": "mergequeue"}]}
     return app, gh, snapshot
@@ -205,3 +208,27 @@ def test_full_check_reads_issue_labels_from_cached_list_not_issue_view(tmp_path:
     app.merge_ready(456, merge=True)
 
     assert "issue_view" not in gh.calls
+
+
+def test_late_critical_issue_gets_skip_line_label_without_reposting_queue_label(
+    tmp_path: Path,
+) -> None:
+    app, gh, _ = _queued_app(tmp_path)
+    gh.prs[0]["labels"] = [{"name": "mergequeue"}]  # already queued
+    gh.issues[0]["labels"].append({"name": "priority:critical"})  # promoted after hand-off
+
+    app.merge_ready(456, merge=True)
+
+    skip_line = app.config.auto_merge.mergequeue_skip_line_label
+    assert gh.pr_labels_posted == [skip_line]  # skip-line added, mergequeue not re-POSTed
+
+
+def test_skip_line_label_already_on_pr_is_not_re_added(tmp_path: Path) -> None:
+    app, gh, _ = _queued_app(tmp_path)
+    skip_line = app.config.auto_merge.mergequeue_skip_line_label
+    gh.prs[0]["labels"] = [{"name": "mergequeue"}, {"name": skip_line}]
+    gh.issues[0]["labels"].append({"name": "priority:critical"})
+
+    app.merge_ready(456, merge=True)
+
+    assert gh.pr_labels_posted == []

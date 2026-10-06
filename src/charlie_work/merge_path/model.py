@@ -20,6 +20,15 @@ from typing import Any, Mapping
 
 from ..checks import CheckSummary
 
+# ``state.prs[n]`` fields that live only while a PR sits in the merge queue: the
+# dwell clock (#1401) and the last-full-check stamp (#2440). One list, so the
+# accounting write and the reconcile fix clear exactly the same set.
+MERGEQUEUE_DWELL_FIELDS: tuple[str, ...] = (
+    "mergequeue_since",
+    "mergequeue_head_sha",
+    "mergequeue_checked_at",
+)
+
 
 class FactNotGathered(ValueError):
     """A decide function needed a fact the gather step left unread.
