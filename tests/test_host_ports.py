@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -161,6 +161,41 @@ def test_real_session_counter_late_binds_to_existing_patch_targets(monkeypatch) 
     assert REAL.sessions.live_reviews(Path("."), None) == 14
 
 
+def test_fake_session_counter_scripts_issue_numbers_and_session_pids(fake_host) -> None:
+    from pathlib import Path
+
+    counter = FakeSessionCounter(issue_numbers={7, 9}, session_pids={"sess-1": 4321})
+    ports = fake_host(sessions=counter)
+    s = ports.sessions
+    assert s.live_issue_numbers(Path("w")) == {7, 9}
+    assert s.live_session_pids(Path("w")) == {"sess-1": 4321}
+    assert [c[0] for c in counter.calls] == ["live_issue_numbers", "live_session_pids"]
+
+
+def test_real_session_counter_issue_numbers_filters_dead_workers(monkeypatch) -> None:
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    from charlie_work.host import REAL
+
+    workers = [
+        SimpleNamespace(issue_number=1, is_alive=lambda: True),
+        SimpleNamespace(issue_number=2, is_alive=lambda: False),
+        SimpleNamespace(issue_number=3, is_alive=lambda: True),
+    ]
+    monkeypatch.setattr("charlie_work.worker.iter_workers", lambda _d: workers)
+    assert REAL.sessions.live_issue_numbers(Path(".")) == {1, 3}
+
+
+def test_real_session_counter_session_pids_late_binds(monkeypatch) -> None:
+    from pathlib import Path
+
+    from charlie_work.host import REAL
+
+    monkeypatch.setattr("charlie_work.worktree._own_live_session_pids", lambda _d: {"s": 11})
+    assert REAL.sessions.live_session_pids(Path(".")) == {"s": 11}
+
+
 def test_fleet_live_workers_reaches_fleet_registry_patch(monkeypatch) -> None:
     """Issue #2230 rework: ``workflow.count_fleet_live_sessions`` is a re-export
     of ``host/sessions.py``'s late-binding facade, not a frozen ``from
@@ -243,3 +278,74 @@ def test_real_review_launcher_returns_errors_as_values(monkeypatch) -> None:
     assert record.pid is None and record.error == "OSError: no such binary"
     unknown = host.REAL.launch.launch("nope", pr_number=3, branch="b")
     assert unknown.error == "unsupported reviewer harness: 'nope'"
+
+
+def test_fake_host_clock_reaches_state_predicates(fake_host) -> None:
+    """Issue #2233: ``state.py``'s wall-clock reads must resolve through
+    ``host.current().clock`` so ``fake_host(clock=...)`` can freeze them.
+
+    The frozen instant sits in the wall-clock future, so every predicate
+    discriminates between the two clocks: under the unfixed code the
+    ``past`` timestamps still read as upcoming and each assertion flips.
+    """
+    from charlie_work import state
+
+    frozen = datetime(2031, 3, 4, 5, 6, 7, tzinfo=UTC)
+    fake_host(clock=FakeClock(frozen))
+    past = (frozen - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    future = (frozen + timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+
+    assert state.is_throttled({"throttled_until": past}) is False
+    assert state.is_throttled({"throttled_until": future}) is True
+    assert (
+        state.is_reviewer_quota_exhausted({"reviewer_quota": {"throttled_until": past}}) is False
+    )
+    assert state.is_claim_stale(past) is True
+    assert state.is_claim_stale(future) is False
+    assert state.stale_operator_claims({"issues": {"7": {"operator_claimed_at": past}}}) == {7}
+    assert state.is_quota_probe_due({"quota_probe": {"next_probe_at": past}}) is True
+    assert (
+        state.is_operator_queue_review_due(
+            {"deescalation_pass": {"next_operator_queue_review_at": past}}
+        )
+        is True
+    )
+    assert state.age_days_since(past) == 0.04
+
+
+def test_fake_host_clock_reaches_due_schedulers(fake_host) -> None:
+    """Issue #2233: the periodic-pass due-checks extracted from ``state.py``
+    into ``periodic_pass_schedule.py`` are the same wall-clock family --
+    they must resolve through the port or a frozen clock cannot gate the
+    matching ``_maybe_*`` schedulers (which already read ``self.host``).
+    """
+    from charlie_work import state
+
+    frozen = datetime(2031, 3, 4, 5, 6, 7, tzinfo=UTC)
+    fake_host(clock=FakeClock(frozen))
+    past = (frozen - timedelta(minutes=1)).isoformat().replace("+00:00", "Z")
+
+    assert state.is_deescalation_due({"deescalation_pass": {"next_deescalation_at": past}}) is True
+    assert state.is_reconcile_due({"reconcile_pass": {"next_reconcile_at": past}}) is True
+    assert (
+        state.is_worktree_reclamation_due({"worktree_reclamation": {"next_run_at": past}}) is True
+    )
+
+
+def test_fake_host_clock_stamps_reconcile_schedule(fake_host, tmp_path) -> None:
+    """Issue #2233: ``_maybe_reconcile_drift``'s cadence stamp must be a
+    port-clock reading, not the wall clock -- the armed ``next_reconcile_at``
+    must be exactly ``frozen + interval_minutes``.
+    """
+    from _dispatch_fixtures import _reconcile_pass_app
+    from charlie_work.state import load_state
+
+    frozen = datetime(2031, 3, 4, 5, 6, 7, tzinfo=UTC)
+    fake_host(clock=FakeClock(frozen))
+    app = _reconcile_pass_app(tmp_path, interval_minutes=30)
+
+    app._maybe_reconcile_drift()
+
+    assert load_state(app.paths.state_file)["reconcile_pass"]["next_reconcile_at"] == (
+        "2031-03-04T05:36:07Z"
+    )

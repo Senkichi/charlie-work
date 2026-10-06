@@ -191,9 +191,6 @@ from .throttle_signatures import (
     match_throttle_tail,
     parse_reset_clock_time,
 )
-from .process_utils import (
-    is_pid_alive,  # noqa: F401  (deliberate re-export; used by moved L08 delegate via _wf.)
-)
 from . import markdown_guard
 from .write_gate import WriteGate
 

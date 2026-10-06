@@ -15,7 +15,6 @@ file-size ratchet mark, same pattern as ``state_review_reap.py`` (#1874).
 
 from __future__ import annotations
 
-from datetime import datetime
 from typing import Any
 import json
 
@@ -414,13 +413,11 @@ def unescalate(
     # and last-activity diagnostics so an operator can tell a wedged
     # worker from a working one.
     if issue_number is not None:
-        from datetime import UTC
-
         from charlie_work.worker import issue_worker_liveness
 
         sessions_dir = self._layout.sessions_dir
         verdict = issue_worker_liveness(
-            issue_number, issue_state, sessions_dir, self.config, datetime.now(UTC)
+            issue_number, issue_state, sessions_dir, self.config, self.host.clock.now()
         )
     else:
         verdict = None

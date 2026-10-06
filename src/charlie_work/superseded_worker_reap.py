@@ -41,8 +41,8 @@ from typing import Any
 
 from .adapters import SessionDispatchResult, SessionRequest
 from .config import PRIOR_WORKER_STILL_ALIVE_FAILURE_KIND
+from . import host as _host
 from .orphan_sweep import sweep_orphan_processes
-from .process_utils import is_pid_alive
 from .worktree import worktree_path_for_branch
 from .write_gate import WriteGate, require_write_gate
 
@@ -150,7 +150,7 @@ def _reap_superseded_workers(
     for pid, candidate in candidates.items():
         raw_start = candidate["process_start_time"]
         start_time = raw_start if isinstance(raw_start, (int, float)) else None
-        if not is_pid_alive(pid, start_time):
+        if not _host.current().probe.is_alive(pid, start_time):
             # Dead already, or the pid was recycled and its fingerprint no
             # longer matches — the recorded worker is gone either way.
             continue
@@ -179,7 +179,7 @@ def _reap_superseded_workers(
             survivors.append(pid)
             continue
         killed_pids = write_gate.kill_process_tree(pid, start_time)
-        if pid not in killed_pids and is_pid_alive(pid, start_time):
+        if pid not in killed_pids and _host.current().probe.is_alive(pid, start_time):
             # The kill was refused (identity re-verification failed) or the
             # process survived it — gate launch on confirmed death, the same
             # "plan is a snapshot" re-check _reap_idle_foreign_writer does.

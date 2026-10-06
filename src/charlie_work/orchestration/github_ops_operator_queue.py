@@ -14,7 +14,6 @@ names are imported directly (no test patches them on ``charlie_work.workflow``).
 from __future__ import annotations
 
 import charlie_work.workflow as _wf
-from datetime import UTC, datetime
 from typing import Any
 from charlie_work.github import label_names
 from charlie_work.instrumentation import query_events
@@ -62,7 +61,7 @@ def operator_queue(self) -> _wf.CommandResult:
     if not isinstance(state_issues, dict):
         state_issues = {}
 
-    now = datetime.now(UTC)
+    now = self.host.clock.now()
     escalation_kinds = (
         frozenset(ESCALATION_REASON_CLASS_BY_EVENT_KIND)
         | DELIBERATELY_UNCLASSIFIED_ESCALATION_EVENT_KINDS

@@ -23,6 +23,7 @@ from _review_fixtures import (
 from _rework_dispatch_fixtures import _wg
 from charlie_work.claude_code import ClaudeWorkerRecord
 from charlie_work.config import OrchestratorConfig, ReviewDispatchConfig
+from charlie_work.host.fakes import FakeProcessProbe
 from charlie_work.state import empty_state, load_state, save_state, state_lock
 from charlie_work.workflow import _detect_and_handle_stalled_reviews
 from _dispatch_fixtures import _stub_real_activity_probe_for_stalled_tests  # noqa: F401
@@ -564,7 +565,7 @@ def test_detect_and_handle_stalled_reviews_warns_on_checkout_removal_failure(
 
 
 def test_detect_and_handle_stalled_reviews_aggregates_same_pass_events(
-    monkeypatch, tmp_path: Path
+    monkeypatch, tmp_path: Path, fake_host
 ) -> None:
     """Issue #525: multiple stalled reviewer claims in one pass become one sweep event."""
     from charlie_work.worker import WorkerView
@@ -592,7 +593,7 @@ def test_detect_and_handle_stalled_reviews_aggregates_same_pass_events(
         _make_dead_review_sidecar(reviews_dir, pr, "no verdict")
 
     monkeypatch.setattr(WorkerView, "is_alive", lambda self: False)
-    monkeypatch.setattr("charlie_work.stalled_review_reap.is_pid_alive", lambda *_: False)
+    fake_host(probe=FakeProcessProbe())
     monkeypatch.setattr(
         "charlie_work.stalled_review_reap.remove_review_checkout", lambda *a, **k: True
     )

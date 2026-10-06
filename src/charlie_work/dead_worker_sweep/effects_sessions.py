@@ -9,7 +9,7 @@ from __future__ import annotations
 
 
 import os
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +17,7 @@ from ..config import (
     OrchestratorConfig,
 )
 from ..orphan_sweep import sweep_orphan_processes
+from .. import host as _host
 from ..state import (
     load_state,
     state_lock,
@@ -261,7 +262,6 @@ def _detect_stalled_sessions(
     ``terminal_reason`` are populated only for DEAD entries with a matching
     post-mortem sidecar (best-effort — absent when extraction found nothing).
     """
-    from datetime import UTC, datetime
     from ..post_mortem import read_post_mortem
     from ..worker import classify_worker_health, iter_workers, real_activity_probe_for
 
@@ -270,7 +270,7 @@ def _detect_stalled_sessions(
 
     stalled_entries: list[dict[str, Any]] = []
     if now is None:
-        now = datetime.now(UTC)
+        now = _host.current().clock.now()
 
     for w in iter_workers(sessions_dir):
         if w.pid is None or w.error is not None:
@@ -504,7 +504,7 @@ def _log_worker_census(sessions_dir: Path) -> None:
     from ..claude_code import read_worker_records
     from ..devin_shell import read_session_records
 
-    now = datetime.now(UTC)
+    now = _host.current().clock.now()
 
     def _age_seconds(started_at: str) -> int | None:
         try:
@@ -549,9 +549,7 @@ def _issues_with_live_workers(sessions_dir: Path) -> set[int]:
     """Return the set of issue numbers that have currently alive worker sessions.
 
     Reads session sidecar files from both devin-shell and claude-code adapters,
-    then checks each record's PID liveness using the adapter-specific liveness
-    probe. Returns the set of issue numbers with alive PIDs.
+    then checks each record's PID liveness through the host session port.
+    Returns the set of issue numbers with alive PIDs.
     """
-    from ..worker import iter_workers
-
-    return {w.issue_number for w in iter_workers(sessions_dir) if w.is_alive()}
+    return _host.current().sessions.live_issue_numbers(sessions_dir)
