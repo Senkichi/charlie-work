@@ -10,10 +10,10 @@ modules that need the same shapes.
 
 from __future__ import annotations
 
-import subprocess
 from pathlib import Path
 
 from _fakes_github import FakeGitHub
+from _worktree_fixtures import _init_repo
 from charlie_work.config import OrchestratorConfig
 from charlie_work.paths import runtime_paths
 from charlie_work.workflow import OrchestratorApp
@@ -42,17 +42,17 @@ _STALE_CI_CONTAMINATED_REQUIRED_CHANGES = [
 
 
 def _init_git_repo(repo_root: Path) -> None:
-    """Create a real non-bare git repo with one commit on ``main``."""
-    repo_root.mkdir(parents=True, exist_ok=True)
-    run = lambda args: subprocess.run(  # noqa: E731
-        args, cwd=repo_root, check=True, capture_output=True, text=True
-    )
-    run(["git", "init", "--initial-branch=main"])
-    run(["git", "config", "user.email", "test@example.test"])
-    run(["git", "config", "user.name", "Test User"])
-    (repo_root / "README.md").write_text("hello\n", encoding="utf-8")
-    run(["git", "add", "README.md"])
-    run(["git", "commit", "-m", "initial commit"])
+    """Create a real non-bare git repo with one commit on ``main``.
+
+    Delegates to ``_worktree_fixtures._init_repo`` so the repo materializes
+    from the per-process ``plain`` git template (HS-CW-4,
+    ``tests/_git_templates.py``) instead of re-running the five-process init
+    sequence per call — the spawn cost is what the test ledger flagged at
+    ~2.9x baseline on Windows CI (issue #2387). A test that builds two
+    repos that must not share a commit SHA needs a ``fresh=True`` builder,
+    which this helper deliberately does not expose.
+    """
+    _init_repo(repo_root)
 
 
 def _cross_family_app(tmp_path: Path) -> OrchestratorApp:
