@@ -17,6 +17,10 @@ monkeypatch target (``workflow._count_live_sessions``,
 walkers (``fleet_registry.count_fleet_live_sessions`` /
 ``count_fleet_live_reviews``) reach this code through those names, so the
 fleet and per-repo caps cannot disagree about what "live" means.
+``workflow.count_fleet_live_sessions`` -- the attribute the
+``host.sessions`` port late-binds -- is a facade over the fleet_registry
+walker defined in ``host/sessions.py`` (not here; ``workflow.py`` is over
+the per-module size cap, so the facade lives in the port's own module).
 """
 
 from __future__ import annotations

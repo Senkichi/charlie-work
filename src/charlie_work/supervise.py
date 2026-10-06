@@ -1535,9 +1535,11 @@ def _self_deploy_attempt(
         to_sha = after_sha
 
         # Routed through the session-count host port (issue #2230): the Real
-        # late-binds workflow.count_fleet_live_sessions, so patches against
-        # either that name or fleet_registry.count_fleet_live_sessions still
-        # intercept, and fake_host(sessions=...) reaches self-deploy too.
+        # late-binds workflow.count_fleet_live_sessions -- a re-export of
+        # host/sessions.py's facade, which late-binds
+        # fleet_registry.count_fleet_live_sessions in turn -- so patches
+        # against either name still intercept, and
+        # fake_host(sessions=...) reaches self-deploy too.
         live_count, _ = _host.current().sessions.fleet_live_workers(fleet_dir_override)
         if live_count > 0:
             # Issue #1855: bound how long a pending sync may starve under
