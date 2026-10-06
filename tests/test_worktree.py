@@ -6409,14 +6409,21 @@ def test_clean_worktrees_skips_worktree_with_live_writer_marker(tmp_path: Path) 
     _init_repo(repo_root)
     (repo_root / "src" / "charlie_work").mkdir(parents=True)
     (repo_root / "src" / "charlie_work" / "__init__.py").write_text("", encoding="utf-8")
-    _git(repo_root, "add", "src/charlie_work/__init__.py")
-    _git(repo_root, "commit", "-m", "add charlie_work")
     _create_shared_venv(repo_root, pth_target=repo_root / "src")
 
-    info = create_worktree(repo_root, "agent/issue-4-marker", base_ref="HEAD")
-    head_sha = _git(info.path, "rev-parse", "HEAD").stdout.strip()
-    write_worktree_marker(info.path, os.getpid(), "session-live")
+    # Register the worktree with git directly rather than create_worktree:
+    # the cleanup lane is the subject here, and a pristine fresh repo
+    # exercises none of create_worktree's leftover/reclaim checks (each of
+    # which costs a git subprocess — the dominant per-test cost on Windows,
+    # issue #2363). ``src/`` likewise stays uncommitted: the shared-venv
+    # verifier reads the filesystem, not the index.
+    branch = "agent/issue-4-marker"
     worktrees_dir = _default_worktrees_dir(repo_root)
+    worktrees_dir.mkdir(parents=True, exist_ok=True)
+    wt_path = worktrees_dir / _slugify(branch)
+    _git(repo_root, "worktree", "add", "-b", branch, str(wt_path), "HEAD")
+    head_sha = _git(wt_path, "rev-parse", "HEAD").stdout.strip()
+    write_worktree_marker(wt_path, os.getpid(), "session-live")
     config = OrchestratorConfig(devin=DevinConfig(venv_source="shared-venv"))
     state = _make_state(issue_number=4, pr_number=104)
 
@@ -6431,7 +6438,7 @@ def test_clean_worktrees_skips_worktree_with_live_writer_marker(tmp_path: Path) 
     assert result.data["removed"] == []
     assert len(result.data["skipped"]) == 1
     assert "live writer marker" in result.data["skipped"][0]["reason"]
-    assert info.path.exists()
+    assert wt_path.exists()
 
 
 def test_clean_worktrees_skips_operator_claimed_worktree(tmp_path: Path) -> None:
