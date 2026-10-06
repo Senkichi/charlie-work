@@ -13,6 +13,7 @@ from unittest.mock import patch
 import pytest
 from _fakes_github import FakeGitHub
 from _orphan_sweep_fixtures import _dead_worker_rework_bed, _run_orphan_sweep, _write_outcome
+from _host_fixtures import host_probe
 
 from charlie_work import worker_fate
 from charlie_work.config import (
@@ -236,7 +237,7 @@ def _sweep_no_pr_pushed(detail: str, tmp_path: Path) -> tuple[dict[str, Any], li
         return 555, None, None
 
     with (
-        patch("charlie_work.workflow._worker_pid_alive", return_value=False),
+        host_probe(alive=False),
         patch("charlie_work.workflow.remote_branch_head_sha", return_value="abc123"),
         patch("charlie_work.workflow.remote_branch_ahead_count", return_value=(3, None)),
         patch("charlie_work.workflow._open_pr_for_orphaned_branch", side_effect=_fake_open_pr),

@@ -19,9 +19,8 @@ import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
-
 from _fakes_github import FakeGitHub
+from _host_fixtures import host_probe
 from _rework_dispatch_fixtures import _wg
 from charlie_work.config import (
     DevinConfig,
@@ -133,9 +132,7 @@ def run_sweep(
     if fleet_dir is not None:
         kwargs["fleet_dir_override"] = str(fleet_dir)
     with ExitStack() as stack:
-        stack.enter_context(
-            patch("charlie_work.workflow._worker_pid_alive", return_value=pid_alive)
-        )
+        stack.enter_context(host_probe(alive=pid_alive))
         for p in patches:
             stack.enter_context(p)
         _detect_and_handle_orphaned_workers(

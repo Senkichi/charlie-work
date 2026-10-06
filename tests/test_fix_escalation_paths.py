@@ -34,6 +34,7 @@ from charlie_work.config import (
     RuntimeConfig,
     WorkerRoleConfig,
 )
+from charlie_work.host.fakes import FakeProcessProbe
 from charlie_work.instrumentation import query_events
 from charlie_work.paths import runtime_paths
 from charlie_work.state import load_state, save_state, state_lock
@@ -114,9 +115,7 @@ def _seed_dispatched_at_cap(paths, pr_number: int, issue_number: int, count: int
         save_state(paths.state_file, state)
 
 
-def test_attempt_cap_never_escalates_over_live_reviewer(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_attempt_cap_never_escalates_over_live_reviewer(tmp_path: Path, fake_host) -> None:
     """Issue #573: a PR at the attempt cap whose dispatched reviewer is ALIVE
     must not be escalated out from under it — the in-flight verdict would be
     orphaned (the reaper only records verdicts for dispatched claims).
@@ -130,7 +129,7 @@ def test_attempt_cap_never_escalates_over_live_reviewer(
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
     _write_review_packet(paths, 456, "sha-abc123")
     _seed_dispatched_at_cap(paths, 456, 123, 2)
-    monkeypatch.setattr("charlie_work.workflow._reviewer_pid_alive", lambda *_: True)
+    fake_host(probe=FakeProcessProbe({424242: 1.0}))
 
     result = app.dispatch_reviews()
 
@@ -143,9 +142,7 @@ def test_attempt_cap_never_escalates_over_live_reviewer(
     assert (123, config.labels.human_needed) not in fake_gh.labels_added
 
 
-def test_attempt_cap_still_escalates_dead_dispatched_claim(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_attempt_cap_still_escalates_dead_dispatched_claim(tmp_path: Path, fake_host) -> None:
     """The cap keeps escalating when the dispatched reviewer is dead — the
     liveness guard must not shield corpses."""
     config = OrchestratorConfig(
@@ -156,7 +153,7 @@ def test_attempt_cap_still_escalates_dead_dispatched_claim(
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
     _write_review_packet(paths, 456, "sha-abc123")
     _seed_dispatched_at_cap(paths, 456, 123, 2)
-    monkeypatch.setattr("charlie_work.workflow._reviewer_pid_alive", lambda *_: False)
+    fake_host(probe=FakeProcessProbe())
 
     result = app.dispatch_reviews()
 
