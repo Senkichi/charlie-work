@@ -40,7 +40,7 @@ from charlie_work.instrumentation import query_events
 from charlie_work.supervise import LocalSnapshot
 from charlie_work.supervise_loop import EXIT_RESTART_REQUESTED
 from charlie_work.supervisor_lifecycle import supervisor_heartbeat_path
-from charlie_work.workflow import CommandResult
+from charlie_work.command_result import CommandResult
 
 
 def test_write_then_read_round_trips(tmp_path: Path) -> None:

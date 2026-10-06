@@ -20,7 +20,7 @@ from charlie_work import rework_outcome
 from charlie_work.dead_worker_sweep import apply as sweep_apply
 from charlie_work.dead_worker_sweep.model import Review
 from charlie_work.state import load_state, save_state
-from charlie_work.workflow import CommandResult
+from charlie_work.command_result import CommandResult
 
 _COMPLETED_OUTCOME = {
     "push_succeeded": True,

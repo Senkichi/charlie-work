@@ -14,6 +14,7 @@ names are imported directly (no test patches them on ``charlie_work.workflow``).
 from __future__ import annotations
 
 import charlie_work.workflow as _wf
+from charlie_work.command_result import CommandResult
 from typing import Any
 from charlie_work.github import label_names
 from charlie_work.instrumentation import query_events
@@ -24,7 +25,7 @@ from charlie_work.state import (
 )
 
 
-def operator_queue(self) -> _wf.CommandResult:
+def operator_queue(self) -> CommandResult:
     """List issues currently parked on ``agent:operator-queue`` (issue #1314 item 1).
 
     An operator-facing inspection command that joins three data sources
@@ -130,7 +131,7 @@ def operator_queue(self) -> _wf.CommandResult:
     # terminal_since sort last.
     queue.sort(key=lambda e: (e["terminal_since"] is None, e["terminal_since"] or ""))
 
-    return _wf.CommandResult(
+    return CommandResult(
         True,
         f"operator queue: {len(queue)} issue(s) parked on {operator_queue_label}",
         {"queue": queue, "depth": len(queue)},

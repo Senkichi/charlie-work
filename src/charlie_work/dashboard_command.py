@@ -21,7 +21,7 @@ from .dashboard.timeutil import local_iso
 from .dashboard.config import DASHBOARD_SECTION, DashboardConfig
 from .fleet_paths import fleet_dir
 from .layout import GLOBAL_CONFIG_FILENAME
-from .workflow import CommandResult
+from .command_result import CommandResult
 
 DASHBOARD_COMMAND = "dashboard"
 

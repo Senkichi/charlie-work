@@ -25,6 +25,7 @@ from __future__ import annotations
 from typing import Any
 
 import charlie_work.workflow as _wf
+from charlie_work.command_result import CommandResult
 from charlie_work.dispatch_deferral import records_deferral
 from charlie_work import layout
 from charlie_work.ci_absence import CiAbsence, runs_terminally_without_jobs
@@ -456,7 +457,7 @@ def dispatch(
     *,
     only_issues: str | None = None,
     stalled_entries: list[dict[str, int]] | None = None,
-) -> _wf.CommandResult:
+) -> CommandResult:
     """Dispatch fresh workers for ready issues.
 
     ``stalled_entries``: pass the result of an already-completed
@@ -535,7 +536,7 @@ def dispatch(
             data["merged_pr_referenced_issue_numbers"] = sorted(
                 set(data.get("merged_pr_referenced_issue_numbers", [])) | finalized
             )
-        return _wf.CommandResult(result.ok, result.message, data)
+        return CommandResult(result.ok, result.message, data)
     except StateLockBusy:
         return _wf._state_lock_busy_result(
             "dispatch deferred: state lock held",
@@ -546,7 +547,7 @@ def dispatch(
             merged_pr_referenced_issue_numbers=sorted(finalized),
         )
     except GraphQLBudgetError as exc:
-        return _wf.CommandResult(
+        return CommandResult(
             True,
             "dispatch deferred: GraphQL rate limit below threshold",
             {
@@ -580,7 +581,7 @@ def dispatch(
         # transient gh failure. Any claim written before a later
         # GitHubError (e.g. issue_view mid-launch) is recovered by the
         # existing stale-claim sweep on the next pass.
-        return _wf.CommandResult(
+        return CommandResult(
             True,
             f"dispatch deferred: GitHub API error ({exc})",
             {

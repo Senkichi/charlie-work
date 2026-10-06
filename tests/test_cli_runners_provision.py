@@ -18,7 +18,7 @@ from charlie_work.config import (
     RunnerAllocationConfig,
     RunnerScalingConfig,
 )
-from charlie_work.workflow import CommandResult
+from charlie_work.command_result import CommandResult
 from ci_fleet.charlie_work_adapter import ScaleAction
 from ci_fleet.runners import ScaleDecision
 

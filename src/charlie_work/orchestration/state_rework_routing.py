@@ -14,6 +14,7 @@ from charlie_work.checks import CheckSummary
 from charlie_work.labels import TransitionOutcome
 from charlie_work import rescue as rescue_helpers
 import charlie_work.workflow as _wf
+from charlie_work.command_result import CommandResult
 
 
 def _route_to_rework(
@@ -217,7 +218,7 @@ def _route_janitor_gate_failure_to_rework(
     max_attempts: int,
     reason: str,
     router: Callable[..., dict[str, Any] | None],
-) -> _wf.CommandResult | None:
+) -> CommandResult | None:
     """Shared cap/escalation wrapper for janitor-gate rework routing.
 
     ``router`` is ``_request_merge_conflict_rework`` or
@@ -401,7 +402,7 @@ def _route_janitor_gate_failure_to_rework(
         if head_sha:
             route_extra_state[last_head_key] = head_sha
         label_error = router(pr, issue_number, decision, extra_state=route_extra_state)
-        return _wf.CommandResult(
+        return CommandResult(
             True,
             f"PR #{pr_number} requeued after startup death "
             f"({existing_pr_state.get('last_rework_failure_kind')}); "
@@ -439,7 +440,7 @@ def _route_janitor_gate_failure_to_rework(
         now=self.host.clock.now(),
     )
     if deferred_verdict is not None:
-        return _wf.CommandResult(
+        return CommandResult(
             True,
             f"PR #{pr_number} janitor {reason} rework cap exceeded "
             f"({attempts}/{max_attempts}); escalation deferred -- {deferred_verdict.reason}",
@@ -528,7 +529,7 @@ def _route_janitor_gate_failure_to_rework(
         route_extra_state["last_rework_failure_kind"] = None
         route_extra_state["last_rework_was_startup_death"] = False
         label_error = router(pr, issue_number, decision, extra_state=route_extra_state)
-        return _wf.CommandResult(
+        return CommandResult(
             True,
             f"PR #{pr_number} janitor {reason} rework cap exceeded "
             f"({attempts}/{max_attempts}); rescue tier dispatched instead of escalating",
@@ -595,7 +596,7 @@ def _route_janitor_gate_failure_to_rework(
                 "add_failures": result.add_failures,
                 "remove_failures": result.remove_failures,
             }
-        return _wf.CommandResult(
+        return CommandResult(
             False,
             f"PR #{pr_number} janitor {reason} rework cap exceeded "
             f"({attempts}/{max_attempts}); escalated",
@@ -663,7 +664,7 @@ def _route_janitor_gate_failure_to_rework(
     route_extra_state["last_rework_failure_kind"] = None
     route_extra_state["last_rework_was_startup_death"] = False
     label_error = router(pr, issue_number, decision, extra_state=route_extra_state)
-    return _wf.CommandResult(
+    return CommandResult(
         True,
         f"PR #{pr_number} routed to rework ({reason}, attempt {attempts}/{max_attempts})",
         {

@@ -12,7 +12,7 @@ import pytest
 
 from charlie_work import cli, fleet_status
 from charlie_work.fleet_dispatch import ApiWorkerFleetReport
-from charlie_work.workflow import CommandResult
+from charlie_work.command_result import CommandResult
 
 
 # ---------------------------------------------------------------------------

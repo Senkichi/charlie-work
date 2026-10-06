@@ -38,7 +38,7 @@ from .junit_recorded_gate import (
     compare_recorded_vs_collected_multi,
     render_gate_report,
 )
-from .workflow import CommandResult
+from .command_result import CommandResult
 
 
 def register_junit_recorded_check_subparser(

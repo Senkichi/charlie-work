@@ -17,7 +17,7 @@ Namespace rule (#1627). Two kinds of name are reached through the
   ``_count_live_sessions``, ``_detect_and_handle_stalled_sessions``,
   ``_worker_pid_alive``, ``_try_reap_blocked_foreign_writer`` -- must resolve
   through ``_wf.`` so ``patch("charlie_work.workflow.<name>")`` still bites.
-- **Defined in workflow.py.** ``CommandResult``, ``_MergedPRListOutcome``,
+- **Defined in workflow.py.** ``_MergedPRListOutcome``,
   ``_build_attention_digest``, ``_build_failure_map``, ``_label_error_reason``,
   ``_recent_dispatch_failed_attempts`` live in ``workflow`` itself; reaching them
   via ``_wf.`` avoids an import cycle and keeps a single definition site.
@@ -46,6 +46,7 @@ from dataclasses import asdict
 from typing import Any
 
 import charlie_work.workflow as _wf
+from charlie_work.command_result import CommandResult
 from charlie_work import worker_fate
 from charlie_work.worker_pid_stamp import stamp_worker_process
 from charlie_work.worker_launch_gate import (
@@ -109,7 +110,7 @@ def _dispatch_impl(
     ready_issues: list[dict[str, Any]] | None = None,
     merged_prs: _wf._MergedPRListOutcome | None = None,
     launch_lock: FleetLaunchLock,
-) -> _wf.CommandResult:
+) -> CommandResult:
     # Issue #427: include closed ready-labeled issues so externally-merged PRs
     # (e.g. Aviator MergeQueue) can be finalized even after GitHub closes the issue.
     if ready_issues is None:
@@ -226,7 +227,7 @@ def _dispatch_impl(
             message = f"dispatch deferred: provider throttled until {permit.throttled_until}"
         else:
             message = f"dispatch deferred: {permit.reason}"
-        return _wf.CommandResult(permit.ok, message, data)
+        return CommandResult(permit.ok, message, data)
     gov = permit.governor
     dispatch_limit = permit.max_launches
 
@@ -502,7 +503,7 @@ def _dispatch_impl(
         }
         if gov.any_term_enabled:
             data.update(gov.report_fields())
-        return _wf.CommandResult(
+        return CommandResult(
             True,
             f"dry-run: would dispatch {len(session_requests)} issue(s)",
             data,
@@ -1947,7 +1948,7 @@ def _dispatch_impl(
         if dispatch_digest:
             _wf.emit_digest(self._layout.notify, dispatch_digest)
 
-    return _wf.CommandResult(
+    return CommandResult(
         not failed_issue_numbers,
         message,
         data,

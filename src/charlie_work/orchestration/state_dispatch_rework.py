@@ -29,6 +29,7 @@ from charlie_work.worker_fate import persisted_failure
 from charlie_work.worktree import worktree_ahead_of_sha
 import charlie_work.superseded_worker_reap as superseded_worker_reap
 import charlie_work.workflow as _wf
+from charlie_work.command_result import CommandResult
 from charlie_work.worker_pid_stamp import stamp_worker_process
 from charlie_work.worker_launch_gate import (
     REASON_PROVIDER_THROTTLED,
@@ -49,7 +50,7 @@ def _dispatch_rework_impl(
     only_issues: str | None = None,
     stalled_entries: list[dict[str, int]] | None = None,
     launch_lock: FleetLaunchLock,
-) -> _wf.CommandResult:
+) -> CommandResult:
     """Dispatch rework workers for issues in needs-rework state with open PRs.
 
     This is only for non-manual adapters. The manual adapter's human-paste
@@ -60,7 +61,7 @@ def _dispatch_rework_impl(
     The label is used for display only and never for selection.
     """
     if self.config.worker.harness == "manual":
-        return _wf.CommandResult(
+        return CommandResult(
             True,
             "rework dispatch skipped for manual adapter",
             {"adapter": "manual", "selected_count": 0},
@@ -210,7 +211,7 @@ def _dispatch_rework_impl(
             )
         else:
             message = f"rework dispatch deferred: {permit.reason}"
-        return _wf.CommandResult(permit.ok, message, data)
+        return CommandResult(permit.ok, message, data)
     gov = permit.governor
     rework_limit = permit.max_launches
 
@@ -427,7 +428,7 @@ def _dispatch_rework_impl(
         }
         if gov.any_term_enabled:
             data.update(gov.report_fields())
-        return _wf.CommandResult(
+        return CommandResult(
             True,
             f"dry-run: would dispatch rework for {len(dry_session_requests)} issue(s)",
             data,
@@ -955,7 +956,7 @@ def _dispatch_rework_impl(
         }
         if gov.any_term_enabled:
             data.update(gov.report_fields())
-        return _wf.CommandResult(
+        return CommandResult(
             True,
             "no rework candidates found",
             data,
@@ -1023,7 +1024,7 @@ def _dispatch_rework_impl(
         }
         if gov.any_term_enabled:
             data.update(gov.report_fields())
-        return _wf.CommandResult(
+        return CommandResult(
             True,
             "all rework candidates already dispatched",
             data,
@@ -1254,7 +1255,7 @@ def _dispatch_rework_impl(
         }
         if gov.any_term_enabled:
             data.update(gov.report_fields())
-        return _wf.CommandResult(
+        return CommandResult(
             True,
             "no valid rework prompts found",
             data,
@@ -1776,7 +1777,7 @@ def _dispatch_rework_impl(
         if digest:
             _wf.emit_digest(self._layout.notify, digest)
 
-    return _wf.CommandResult(
+    return CommandResult(
         not failed_issue_numbers,
         message,
         data,
