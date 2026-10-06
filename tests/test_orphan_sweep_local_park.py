@@ -48,6 +48,7 @@ import pytest
 
 import charlie_work.dead_worker_sweep.effects_pr as effects_pr
 from _fakes_github import FakeGitHub
+from _host_fixtures import host_probe
 from charlie_work.config import (
     ClaudeCodeConfig,
     LabelConfig,
@@ -231,7 +232,7 @@ def _run_sweep(
 ) -> None:
     from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+    with host_probe(alive=False):
         _detect_and_handle_orphaned_workers(
             sessions_dir,
             state_file,

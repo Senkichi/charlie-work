@@ -19,10 +19,10 @@ import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
 
 import pytest
 from _dws_facts import run_reap
+from _host_fixtures import host_probe
 
 from charlie_work.config import (
     DevinConfig,
@@ -265,7 +265,7 @@ def test_zero_artifact_guard_skips_throttle_death(
     ]
     fake_gh.prs = []
 
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+    with host_probe(alive=False):
         _detect_and_handle_orphaned_workers(
             sessions_dir,
             paths.state_file,

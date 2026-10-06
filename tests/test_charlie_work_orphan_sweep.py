@@ -22,6 +22,7 @@ from _fakes_github import FakeGitHub
 from _rework_dispatch_fixtures import (
     _wg,
 )
+from _host_fixtures import host_probe
 from charlie_work.config import (
     DevinConfig,
     OrchestratorConfig,
@@ -53,7 +54,6 @@ def test_orphan_sweep_redispatch_cap_escalates_after_no_progress_loop(
     on genuine redispatch attempts in the default (non-API-routed)
     configuration.
     """
-    from unittest.mock import patch
 
     config = OrchestratorConfig(
         devin=DevinConfig(),
@@ -94,7 +94,7 @@ def test_orphan_sweep_redispatch_cap_escalates_after_no_progress_loop(
     from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
     def _run_sweep() -> None:
-        with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        with host_probe(alive=False):
             _detect_and_handle_orphaned_workers(
                 sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
             )
@@ -245,7 +245,7 @@ def test_orphan_sweep_redispatch_cap_resets_on_moving_head(tmp_path: Path) -> No
     # so the counter resets and the cap does not fire.
     new_sha = "abc123def456"
     with (
-        patch("charlie_work.workflow._worker_pid_alive", return_value=False),
+        host_probe(alive=False),
         patch("charlie_work.workflow.remote_branch_head_sha", return_value=new_sha),
         patch("charlie_work.workflow.worktree_head_sha", return_value=None),
     ):
@@ -368,7 +368,7 @@ def test_orphan_sweep_redispatch_cap_resets_on_stranded_local_commits(
     # fingerprint's remote half; worktree_head_sha is deliberately NOT
     # patched -- the real implementation must read the real repo above.
     with (
-        patch("charlie_work.workflow._worker_pid_alive", return_value=False),
+        host_probe(alive=False),
         patch("charlie_work.workflow.remote_branch_head_sha", return_value=remote_sha),
     ):
         _detect_and_handle_orphaned_workers(
@@ -404,7 +404,6 @@ def test_orphan_sweep_redispatch_cap_dedupes_repeated_observation(tmp_path: Path
     ``worker_pid``) never changes between passes, so the count must stay at
     1 and the cap must never fire, no matter how many passes run.
     """
-    from unittest.mock import patch
 
     config = OrchestratorConfig(
         devin=DevinConfig(),
@@ -445,7 +444,7 @@ def test_orphan_sweep_redispatch_cap_dedupes_repeated_observation(tmp_path: Path
     from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
     def _run_sweep() -> None:
-        with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+        with host_probe(alive=False):
             _detect_and_handle_orphaned_workers(
                 sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
             )

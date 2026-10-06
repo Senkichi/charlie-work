@@ -20,6 +20,7 @@ from _rework_dispatch_fixtures import (
     _init_repo_with_remote_inline,
     _wg,
 )
+from _host_fixtures import host_probe
 from charlie_work.config import (
     DevinConfig,
     OrchestratorConfig,
@@ -922,7 +923,6 @@ def test_dispatch_rework_jc1320_timeline_no_op_reset_avoids_false_escalation(
     (``charlie_work.workflow.utc_now``) and in ``ts()``.
     """
     from datetime import UTC, datetime, timedelta
-    from unittest.mock import patch
 
     import charlie_work.workflow as workflow_module
     from charlie_work.dispatch_selection import (
@@ -986,7 +986,7 @@ def test_dispatch_rework_jc1320_timeline_no_op_reset_avoids_false_escalation(
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
 
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+    with host_probe(alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         _detect_and_handle_orphaned_workers(

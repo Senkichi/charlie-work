@@ -20,7 +20,6 @@ import json
 import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 
@@ -43,6 +42,7 @@ from charlie_work.worktree import create_worktree, worktree_path_for_branch
 from charlie_work.write_gate import WriteGate
 
 from _fakes_github import FakeGitHub
+from _host_fixtures import host_probe
 
 
 # ---------------------------------------------------------------------------
@@ -355,7 +355,7 @@ def test_orphan_sweep_escalates_cross_repo_scoped_issue(tmp_path: Path) -> None:
     ]
     fake_gh.prs = []
 
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+    with host_probe(alive=False):
         _detect_and_handle_orphaned_workers(
             sessions_dir,
             paths.state_file,

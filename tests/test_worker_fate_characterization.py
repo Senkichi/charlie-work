@@ -43,6 +43,7 @@ from _worker_fate_characterization_fixtures import (
     _seed_no_pr_dispatched_issue,
     _wg,
 )
+from _host_fixtures import host_probe
 
 
 # ---------------------------------------------------------------------------
@@ -91,7 +92,7 @@ def test_flip1_a9_workflow_uses_stale_worker_outcome_from_prior_dispatch(tmp_pat
     fake_gh = _no_pr_fake_gh(tmp_path, config, issue_number)
 
     with (
-        patch("charlie_work.workflow._worker_pid_alive", return_value=False),
+        host_probe(alive=False),
         patch("charlie_work.workflow.remote_branch_head_sha", return_value=None),
         patch("charlie_work.workflow.remote_branch_ahead_count", return_value=(0, None)),
     ):

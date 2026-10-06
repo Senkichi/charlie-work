@@ -8,12 +8,12 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
-from unittest.mock import patch
 from _dead_session_fixtures import _write_flat_review_decision
 from _dispatch_fixtures import _stub_real_activity_probe_for_stalled_tests  # noqa: F401
 from _fakes_github import FakeGitHub
 from _rework_dispatch_fixtures import _wg
 from _host_fixtures import host_probe
+from charlie_work.host.fakes import FakeProcessProbe
 from charlie_work.config import (
     DevinConfig,
     OrchestratorConfig,
@@ -267,7 +267,7 @@ def test_orphaned_worker_detection_with_live_pid(tmp_path: Path) -> None:
     assert len(orphaned_events) == 0
 
 
-def test_orphaned_worker_detection_with_pid_recycled(tmp_path: Path) -> None:
+def test_orphaned_worker_detection_with_pid_recycled(tmp_path: Path, fake_host) -> None:
     """Regression test for issue #207: PID recycled (start-time mismatch) should be treated as dead."""
 
     config = OrchestratorConfig(
@@ -317,20 +317,17 @@ def test_orphaned_worker_detection_with_pid_recycled(tmp_path: Path) -> None:
         }
     )
 
-    # Mock the helper to simulate PID recycling (alive check returns False due to start-time mismatch)
-    def mock_worker_pid_alive(entry):
-        # Simulate start-time mismatch by returning False even though PID is set
-        return False
+    # Fake the probe with a mismatched start time: PID recycled -> dead.
+    fake_host(probe=FakeProcessProbe({99999: 999.0}))
 
-    with patch("charlie_work.workflow._worker_pid_alive", side_effect=mock_worker_pid_alive):
-        from charlie_work.workflow import _detect_and_handle_orphaned_workers
+    from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
-        sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
-        sessions_dir.mkdir(parents=True, exist_ok=True)
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
 
-        _detect_and_handle_orphaned_workers(
-            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
-        )
+    _detect_and_handle_orphaned_workers(
+        sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+    )
 
     # Load state and verify it was treated as dead
     state = load_state(paths.state_file)
