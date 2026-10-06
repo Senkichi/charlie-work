@@ -151,7 +151,7 @@ def launches(monkeypatch: pytest.MonkeyPatch) -> list[int]:
             for r in requests
         ]
 
-    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", fake_dispatch_sessions)
+    monkeypatch.setattr("charlie_work.adapters.dispatch_sessions", fake_dispatch_sessions)
     return launched
 
 
@@ -286,7 +286,7 @@ def chained_launches(monkeypatch: pytest.MonkeyPatch) -> list[str]:
             for r in requests
         ]
 
-    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", fake_dispatch_sessions)
+    monkeypatch.setattr("charlie_work.adapters.dispatch_sessions", fake_dispatch_sessions)
     return adapters
 
 

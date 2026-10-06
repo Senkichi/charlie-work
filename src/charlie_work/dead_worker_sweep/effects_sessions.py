@@ -207,40 +207,6 @@ def _emit_session_failed_relabeled(
     )
 
 
-def _count_live_sessions(sessions_dir: Path, state_file: Path | None = None) -> int:
-    """Count the number of currently alive worker sessions across both adapters.
-
-    Reads session sidecar files from both devin-shell and claude-code adapters,
-    then checks each record's PID liveness using the adapter-specific liveness
-    probe. Returns the total count of sessions with alive PIDs.
-
-    When ``state_file`` is given, this also corroborates the sidecar-based
-    count against state.json's own dispatched-issue ``worker_pid``/
-    ``worker_process_start_time`` records (issue #343). A sidecar can go
-    missing for a still-live process -- a "ghost" -- if a reap lane removes
-    it on ambiguous evidence (see ``_classify_dead_sessions_and_update_
-    throttle_state``'s corroboration gate) or through any other path that
-    strands state.json's dispatch record. Because the governor's dispatch
-    cap (``_apply_concurrency_governor``) is built on top of this count, a
-    ghost previously made a live process invisible to concurrency accounting
-    and let the next pass over-dispatch past the configured cap. state.json's
-    worker_pid fields are not touched by sidecar reaping, so any issue still
-    recorded as ``dispatched`` whose worker_pid is alive (pid + start-time,
-    recycling-safe) but has no corresponding live sidecar is counted here
-    too, and printed as a loud reconcile signal rather than silently treated
-    as free capacity.
-
-    Issue #2230: the implementation lives in
-    ``live_session_count.count_live_sessions`` -- one counter shared with the
-    review lane's ``dispatch_selection._count_live_reviews``. This name stays
-    a delegate so the ``workflow._count_live_sessions`` import/patch surface
-    keeps resolving unchanged.
-    """
-    from ..live_session_count import WORKER_LANE, count_live_sessions
-
-    return count_live_sessions(sessions_dir, state_file, WORKER_LANE)
-
-
 def _detect_stalled_sessions(
     sessions_dir: Path, config: OrchestratorConfig, *, now: datetime | None = None
 ) -> list[dict[str, Any]]:
@@ -307,29 +273,6 @@ def _detect_stalled_sessions(
 # dry-run leak -- so they call the hoisted primitive raw, unchanged in
 # behavior. The one in-scope call site (`_sweep_orphan_processes_for_dead_sessions`)
 # now goes through `write_gate.kill_process` instead.
-
-
-def _worker_pid_alive(entry: dict[str, Any]) -> bool:
-    """Check if a worker PID from state.json is alive, with start-time verification.
-
-    This helper deduplicates the PID liveness check used across dispatch and
-    orphaned worker detection. It checks both PID liveness and process identity
-    via start time to detect PID recycling.
-
-    Args:
-        entry: A state.json issue entry containing worker_pid and optionally
-               worker_process_start_time.
-
-    Returns:
-        True if the worker PID is alive and the start time matches (if available),
-        False otherwise.
-
-    Issue #2230: the probe itself lives in ``live_session_count._ghost_pid_alive``,
-    shared with the review lane's ``_reviewer_pid_alive``.
-    """
-    from ..live_session_count import WORKER_LANE, _ghost_pid_alive
-
-    return _ghost_pid_alive(entry, WORKER_LANE)
 
 
 def _orphan_head_fingerprint(remote_sha: str | None, local_sha: str | None) -> str:

@@ -4762,7 +4762,7 @@ def test_push_branch_rejects_invalid_ref_name(tmp_path: Path) -> None:
     assert "not a valid git ref name" in error
 
 
-def test_recovery_aborts_when_worker_pid_alive(tmp_path: Path) -> None:
+def test_recovery_aborts_when_worker_pid_still_alive(tmp_path: Path) -> None:
     """Issue #282: recovery must not remove a worktree if the recorded worker PID is still alive."""
     repo_root = tmp_path / "repo"
     _init_repo(repo_root)

@@ -103,8 +103,9 @@ def test_reap_completed_review_checkouts_skips_while_reviewer_still_alive(
     Uses this test process's own PID/start-time as the sidecar's recorded
     identity, so the real (non-monkeypatched) worker_fate.is_alive
     liveness+identity check reports it genuinely alive — matching how
-    test_count_live_sessions_ghost_worker_pid_corroborated_by_state (same
-    file) proves a "ghost" liveness case elsewhere in this suite.
+    test_live_session_count_corroborates_ghost_worker_via_state_json (in
+    test_charlie_work_session_lifecycle.py) proves a "ghost" liveness case
+    elsewhere in this suite.
     """
     from charlie_work.claude_code import _get_process_start_time
     from charlie_work.workflow import _reap_completed_review_checkouts

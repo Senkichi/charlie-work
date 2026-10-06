@@ -3,8 +3,9 @@
 Moved verbatim out of ``workflow.py`` (wave D, D6a). The primitive launchers
 are reached through a lazy ``_wf()`` accessor (``workflow.launch_claude_worker``
 etc.) so patches on the ``workflow`` module's bindings, and conftest
-``wrap_launchers``, still intercept them. ``workflow`` re-exports the three
-functions and the same ``_REVIEW_LAUNCHERS`` dict object.
+``wrap_launchers``, still intercept them. The ``_launch_review_*`` functions
+and ``_REVIEW_LAUNCHERS`` itself are reached on *this* module by the host
+launch port's Real (issue #2235 deleted the ``workflow`` re-exports).
 """
 
 from __future__ import annotations

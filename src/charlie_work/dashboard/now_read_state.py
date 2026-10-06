@@ -1,7 +1,7 @@
 """Per-repo ``state.json`` + reviewer-sidecar reads for the Now collector (read-only).
 
 ``state.json`` is replaced atomically by its writer, so a lock-free read never sees a torn
-file (``dispatch_selection._count_live_reviews`` takes the state lock; a read-only page
+file (the live-review counter takes the state lock; a read-only page
 must not contend for it). Unreadable inputs come back as ``None`` / empty, never as zero.
 """
 
@@ -46,8 +46,8 @@ def _escalated_since(issues: Any) -> tuple[tuple[int, datetime], ...]:
 def _live_reviewers(reviews_dir: Path, prs: Any) -> int:
     """Sidecar-alive reviewers plus state.json-dispatched ghosts with a live pid.
 
-    Same corroboration as ``dispatch_selection._count_live_reviews``: a missing sidecar
-    must not make a live reviewer invisible.
+    Same corroboration as ``live_session_count.count_live_sessions`` (REVIEW_LANE):
+    a missing sidecar must not make a live reviewer invisible.
     """
     live_prs: set[int] = set()
     for worker in iter_workers(reviews_dir):

@@ -95,7 +95,7 @@ def _register_repo(fleet_dir: Path, tmp_path: Path, name: str, *, live_reviewers
 
     A ghost is a ``review_dispatch_dispatched`` state record whose
     ``reviewer_pid`` is alive with no sidecar -- the same state.json
-    corroboration ``_count_live_reviews`` applies, here pointed at this test
+    corroboration the live-review counter applies, here pointed at this test
     process's own pid so it is deterministically alive.
     """
     repo_root = tmp_path / name
@@ -296,7 +296,7 @@ def test_cap_zero_is_unlimited_and_never_reads_the_fleet(
     def _boom(_override: str | None) -> tuple[int, list[str]]:
         raise AssertionError("fleet review count read while the cap is disabled")
 
-    monkeypatch.setattr("charlie_work.workflow.count_fleet_live_reviews", _boom)
+    monkeypatch.setattr("charlie_work.fleet_registry.count_fleet_live_reviews", _boom)
     # Hold the fleet lock: a disabled cap must not contend for it either.
     held = try_acquire_fleet_lock(str(fleet_dir))
     assert held is not None
@@ -388,7 +388,7 @@ def test_lock_is_released_when_the_pass_raises(tmp_path: Path, monkeypatch: Any)
 
     monkeypatch.setattr("charlie_work.workflow.launch_claude_worker", _explode)
     monkeypatch.setattr(
-        "charlie_work.workflow.count_fleet_live_reviews",
+        "charlie_work.fleet_registry.count_fleet_live_reviews",
         lambda _o: (_ for _ in ()).throw(OSError()),
     )
     with pytest.raises(OSError):
@@ -448,7 +448,7 @@ def test_local_review_lane_is_clamped_by_the_fleet_cap(
     tmp_path: Path, launches: list[int], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     app = _local_review_app(tmp_path, fleet_cap=3)
-    monkeypatch.setattr("charlie_work.workflow.count_fleet_live_reviews", lambda _o: (2, []))
+    monkeypatch.setattr("charlie_work.fleet_registry.count_fleet_live_reviews", lambda _o: (2, []))
 
     result = app._local_dispatch_reviewers()
 
@@ -485,7 +485,7 @@ def test_local_review_lane_cap_zero_is_unlimited(
     def _boom(_override: str | None) -> tuple[int, list[str]]:
         raise AssertionError("fleet review count read while the cap is disabled")
 
-    monkeypatch.setattr("charlie_work.workflow.count_fleet_live_reviews", _boom)
+    monkeypatch.setattr("charlie_work.fleet_registry.count_fleet_live_reviews", _boom)
 
     result = app._local_dispatch_reviewers()
 

@@ -412,8 +412,8 @@ def count_fleet_live_sessions(
     visibility.
 
     Each repo contributes
-    ``dead_worker_sweep.effects_sessions._count_live_sessions(sessions_dir,
-    state_file)`` -- the SAME liveness rule the per-repo
+    ``live_session_count.count_live_sessions(sessions_dir,
+    state_file, WORKER_LANE)`` -- the SAME liveness rule the per-repo
     ``dispatch.max_concurrent_sessions`` cap uses (sidecar ``is_alive`` plus
     the ghost-worker corroboration against the repo's ``state.json``, issue
     #343), so the fleet and per-repo caps cannot disagree about what "live"
@@ -434,7 +434,7 @@ def count_fleet_live_sessions(
     """
     # Imported at the one call site so fleet_registry's module-load graph is
     # unchanged for every review-lane consumer.
-    from .dead_worker_sweep.effects_sessions import _count_live_sessions
+    from .live_session_count import WORKER_LANE, count_live_sessions
 
     total_live_count = 0
     skipped_repos: list[str] = []
@@ -455,7 +455,9 @@ def count_fleet_live_sessions(
             skipped_repos.append(name_with_owner)
             continue
 
-        total_live_count += _count_live_sessions(sessions_dir, layout.state_file_path(state_dir))
+        total_live_count += count_live_sessions(
+            sessions_dir, layout.state_file_path(state_dir), WORKER_LANE
+        )
 
     return total_live_count, skipped_repos
 
@@ -467,8 +469,9 @@ def count_fleet_live_reviews(
 
     The review-lane twin of :func:`count_fleet_live_sessions` (issue #2084):
     same registry walk and per-repo skip semantics, but each repo contributes
-    ``dispatch_selection._count_live_reviews(reviews_dir, state_file)`` -- the
-    SAME liveness rule the per-repo ``max_concurrent_reviews`` cap uses
+    ``live_session_count.count_live_sessions(reviews_dir, state_file,
+    REVIEW_LANE)`` -- the SAME liveness rule the per-repo
+    ``max_concurrent_reviews`` cap uses
     (sidecar ``is_alive`` plus the ghost-reviewer corroboration against the
     repo's ``state.json``), so the fleet and per-repo caps cannot disagree
     about what "live" means.
@@ -482,7 +485,7 @@ def count_fleet_live_reviews(
     """
     # Imported at the one call site so fleet_registry's module-load graph is
     # unchanged for every worker-lane consumer.
-    from .dispatch_selection import _count_live_reviews
+    from .live_session_count import REVIEW_LANE, count_live_sessions
 
     total_live_count = 0
     skipped_repos: list[str] = []
@@ -497,7 +500,9 @@ def count_fleet_live_reviews(
         )
         if not reviews_dir.exists():
             continue
-        total_live_count += _count_live_reviews(reviews_dir, layout.state_file_path(state_dir))
+        total_live_count += count_live_sessions(
+            reviews_dir, layout.state_file_path(state_dir), REVIEW_LANE
+        )
 
     return total_live_count, skipped_repos
 

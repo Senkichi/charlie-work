@@ -4,8 +4,10 @@ The sweep historically reached the workflow namespace through scattered deferred
 ``import charlie_work.workflow as _wf`` lookups so suite patches on
 ``charlie_work.workflow.<name>`` stayed live. ``SweepPorts`` names every such
 lookup once. ``ports_from_workflow`` resolves each attribute at *call* time (never
-at construction), so a ``patch("charlie_work.workflow._worker_pid_alive")`` taken
-after the ports were built still takes effect.
+at construction), so a ``patch("charlie_work.workflow.<name>")`` taken
+after the ports were built still takes effect. ``worker_pid_alive`` is the one
+exception: its workflow delegate was deleted in issue #2235, so it resolves
+``live_session_count._ghost_pid_alive`` (worker lane) at call time instead.
 """
 
 from __future__ import annotations
@@ -32,9 +34,20 @@ class SweepPorts:
     linked_issue_number: Callable[..., Any]
 
 
+def _sweep_pid_alive(entry: dict[str, Any]) -> bool:
+    """``SweepPorts.worker_pid_alive`` bound to the live_session_count probe.
+
+    Resolves the attribute per call so a patch on
+    ``charlie_work.live_session_count._ghost_pid_alive`` still intercepts --
+    the same call-time rule ``_late_bound`` applies to the workflow names.
+    """
+    from ..live_session_count import WORKER_LANE, _ghost_pid_alive
+
+    return _ghost_pid_alive(entry, WORKER_LANE)
+
+
 # ``SweepPorts`` field -> attribute name on ``charlie_work.workflow``.
 _WORKFLOW_ATTRS: dict[str, str] = {
-    "worker_pid_alive": "_worker_pid_alive",
     "remote_branch_head_sha": "remote_branch_head_sha",
     "remote_branch_ahead_count": "remote_branch_ahead_count",
     "open_pr_for_orphaned_branch": "_open_pr_for_orphaned_branch",
@@ -62,7 +75,10 @@ def _late_bound(attr: str) -> Callable[..., Any]:
 
 def ports_from_workflow() -> SweepPorts:
     """Ports that resolve through ``charlie_work.workflow`` on every call."""
-    return SweepPorts(**{name: _late_bound(attr) for name, attr in _WORKFLOW_ATTRS.items()})
+    return SweepPorts(
+        worker_pid_alive=_sweep_pid_alive,
+        **{name: _late_bound(attr) for name, attr in _WORKFLOW_ATTRS.items()},
+    )
 
 
-assert {f.name for f in fields(SweepPorts)} == set(_WORKFLOW_ATTRS)
+assert {f.name for f in fields(SweepPorts)} == {"worker_pid_alive"} | set(_WORKFLOW_ATTRS)

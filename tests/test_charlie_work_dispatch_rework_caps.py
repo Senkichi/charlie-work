@@ -398,15 +398,15 @@ def test_dispatch_rework_deaths_below_cap_still_dispatched(tmp_path: Path) -> No
             for request in requests
         ]
 
-    import charlie_work.workflow as workflow_module
+    import charlie_work.adapters as adapters_module
 
-    original = workflow_module.dispatch_sessions
-    workflow_module.dispatch_sessions = fake_dispatch_sessions
+    original = adapters_module.dispatch_sessions
+    adapters_module.dispatch_sessions = fake_dispatch_sessions
     try:
         app = OrchestratorApp(tmp_path, paths, config, fake_gh)
         result = app.dispatch_rework()
     finally:
-        workflow_module.dispatch_sessions = original
+        adapters_module.dispatch_sessions = original
 
     # Not escalated — both counts below cap.
     assert 123 not in result.data.get("no_op_rework_escalated", [])
@@ -489,15 +489,15 @@ def test_dispatch_rework_death_loop_does_not_escalate_before_matching_redispatch
             for request in requests
         ]
 
-    import charlie_work.workflow as workflow_module
+    import charlie_work.adapters as adapters_module
 
-    original = workflow_module.dispatch_sessions
-    workflow_module.dispatch_sessions = fake_dispatch_sessions
+    original = adapters_module.dispatch_sessions
+    adapters_module.dispatch_sessions = fake_dispatch_sessions
     try:
         app = OrchestratorApp(tmp_path, paths, config, fake_gh)
         result = app.dispatch_rework()
     finally:
-        workflow_module.dispatch_sessions = original
+        adapters_module.dispatch_sessions = original
 
     assert result.ok is True
     # Not escalated by either cap: no_op_count = max(0, 1 - 3) = 0, and the
@@ -1094,12 +1094,14 @@ def test_dispatch_rework_jc1320_timeline_no_op_reset_avoids_false_escalation(
             for request in requests
         ]
 
-    original = workflow_module.dispatch_sessions
-    workflow_module.dispatch_sessions = fake_dispatch_sessions
+    import charlie_work.adapters as adapters_module
+
+    original = adapters_module.dispatch_sessions
+    adapters_module.dispatch_sessions = fake_dispatch_sessions
     try:
         result = app.dispatch_rework()
     finally:
-        workflow_module.dispatch_sessions = original
+        adapters_module.dispatch_sessions = original
 
     # Despite three total redispatch attempts across the timeline, the two
     # genuine-progress resets mean only the third survives at this check --
