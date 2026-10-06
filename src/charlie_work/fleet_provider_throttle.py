@@ -46,7 +46,7 @@ from typing import Any, Literal
 from . import host as _host
 from .layout import fleet_dir
 from .state import advisory_file_lock, save_state
-from .workflow import CommandResult
+from .command_result import CommandResult
 
 logger = logging.getLogger(__name__)
 

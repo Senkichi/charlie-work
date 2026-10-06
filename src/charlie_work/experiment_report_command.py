@@ -41,7 +41,7 @@ from .experiment_report import (
     parse_window_bound,
     render_text,
 )
-from .workflow import CommandResult
+from .command_result import CommandResult
 
 
 def register_experiment_report_subparser(

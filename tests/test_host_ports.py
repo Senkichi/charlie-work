@@ -212,9 +212,10 @@ def test_fleet_live_workers_reaches_fleet_registry_patch(monkeypatch) -> None:
 
 
 def test_command_result_reexport_is_identity() -> None:
-    from charlie_work import command_result, workflow
+    from charlie_work import cli, command_result, workflow
 
-    assert workflow.CommandResult is command_result.CommandResult
+    assert cli.CommandResult is command_result.CommandResult
+    assert not hasattr(workflow, "CommandResult")
 
 
 def _app(tmp_path, **kwargs):

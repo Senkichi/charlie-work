@@ -15,11 +15,12 @@ from __future__ import annotations
 from typing import Any
 
 import charlie_work.workflow as _wf
+from charlie_work.command_result import CommandResult
 from charlie_work import labels as _labels
 
 
 @_wf._guard_state_lock
-def intake(self) -> _wf.CommandResult:
+def intake(self) -> CommandResult:
     issues = self.gh.issue_list(self.config.labels.ready)
     written: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
@@ -150,7 +151,7 @@ def intake(self) -> _wf.CommandResult:
         message = f"intake completed with {len(failed)} failure(s)"
     if prose_only_deps_issues:
         message += f", {len(prose_only_deps_issues)} issue(s) labeled with prose-only dependencies"
-    return _wf.CommandResult(
+    return CommandResult(
         not failed,
         message,
         {

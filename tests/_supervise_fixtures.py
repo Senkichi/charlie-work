@@ -17,7 +17,7 @@ import pytest
 from charlie_work.config import OrchestratorConfig, SupervisorConfig
 from charlie_work.paths import resolved_layout
 from charlie_work.subprocess_runner import RunResult
-from charlie_work.workflow import CommandResult
+from charlie_work.command_result import CommandResult
 
 
 class _FakePaths:

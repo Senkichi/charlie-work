@@ -60,7 +60,8 @@ from charlie_work.state import (
     load_state,
     save_state,
 )
-from charlie_work.workflow import CommandResult, OrchestratorApp
+from charlie_work.command_result import CommandResult
+from charlie_work.workflow import OrchestratorApp
 
 
 def _outcome_payload() -> dict[str, Any]:

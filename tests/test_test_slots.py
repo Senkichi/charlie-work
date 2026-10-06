@@ -323,7 +323,7 @@ def _app(tmp_path: Path, config):
 def test_maintenance_pass_turns_timeout_records_into_events(tmp_path: Path, monkeypatch) -> None:
     from charlie_work.instrumentation import query_events
     from charlie_work.pass_deadline import PassDeadline, run_deadline_guarded_maintenance
-    from charlie_work.workflow import CommandResult
+    from charlie_work.command_result import CommandResult
 
     slots = tmp_path / "slots"
     (slots / "timeouts").mkdir(parents=True)
@@ -340,7 +340,7 @@ def test_maintenance_pass_turns_timeout_records_into_events(tmp_path: Path, monk
 
 def test_maintenance_pass_leaves_records_alone_when_disabled(tmp_path: Path, monkeypatch) -> None:
     from charlie_work.pass_deadline import PassDeadline, run_deadline_guarded_maintenance
-    from charlie_work.workflow import CommandResult
+    from charlie_work.command_result import CommandResult
 
     slots = tmp_path / "slots"
     (slots / "timeouts").mkdir(parents=True)

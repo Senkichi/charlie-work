@@ -1,7 +1,7 @@
 """Renderers of the **Merge path**: plan values in, ``CommandResult`` out.
 
 Pure apart from building the result through ``MergePathPorts.command_result``
-(the workflow module's ``CommandResult``). Message rules are tables here, not
+(``charlie_work.command_result.CommandResult``). Message rules are tables here, not
 decisions: the order of the suffix rules is rendering, never a verdict. Two
 modes keep the payload shapes the legacy bodies produced -- live results carry
 the effect outcomes, the preview's carry ``"dry_run": True`` and report effects

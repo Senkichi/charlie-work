@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import charlie_work.workflow as _wf
+from charlie_work.command_result import CommandResult
 
 
 def _record_event(
@@ -44,7 +45,7 @@ def _resolve(self, value: str) -> Path:
     return self.repo_root / value
 
 
-def merge_check(self, pr_number: int) -> _wf.CommandResult:
+def merge_check(self, pr_number: int) -> CommandResult:
     """Answer "is this PR merge-authorized *right now*?" without merging it.
 
     Issue #894. Merge authorization was enforced only on the paths that
@@ -82,13 +83,13 @@ def merge_check(self, pr_number: int) -> _wf.CommandResult:
     """
     pr = self.gh.pr_view(pr_number)
     if not isinstance(pr, dict) or not pr:
-        return _wf.CommandResult(
+        return CommandResult(
             False,
             f"PR #{pr_number}: cannot read PR from GitHub — refusing to authorize",
             {"pr": pr_number, "authorized": False, "reason": "pr_unreadable"},
         )
     if str(pr.get("state", "")).upper() == "MERGED":
-        return _wf.CommandResult(
+        return CommandResult(
             False,
             f"PR #{pr_number} is already merged — nothing to authorize",
             {"pr": pr_number, "authorized": False, "reason": "already_merged"},
@@ -106,7 +107,7 @@ def merge_check(self, pr_number: int) -> _wf.CommandResult:
     }
 
     if not live_head_sha:
-        return _wf.CommandResult(
+        return CommandResult(
             False,
             f"PR #{pr_number}: no live head sha — refusing to authorize",
             {**base, "authorized": False, "reason": "no_live_head"},
@@ -122,7 +123,7 @@ def merge_check(self, pr_number: int) -> _wf.CommandResult:
     # adding a way to skip the control.
     if _wf._authorized_override_matches(decision, live_head_sha):
         override = decision["authorized_override"]
-        return _wf.CommandResult(
+        return CommandResult(
             True,
             f"PR #{pr_number}: authorized by operator override at head "
             f"{live_head_sha} (by {override.get('by') or 'unknown'})",
@@ -142,19 +143,19 @@ def merge_check(self, pr_number: int) -> _wf.CommandResult:
         # "invalid" sentinel no longer exists) -- both are equally
         # non-terminal for authorization purposes, so this one reason
         # covers what used to be two.
-        return _wf.CommandResult(
+        return CommandResult(
             False,
             f"PR #{pr_number}: no readable review-decision.json — not authorized",
             {**base, "authorized": False, "reason": "no_decision"},
         )
     if decision_value != "approved":
-        return _wf.CommandResult(
+        return CommandResult(
             False,
             f"PR #{pr_number}: recorded decision is {decision_value!r}, not 'approved'",
             {**base, "authorized": False, "reason": "not_approved"},
         )
     if reviewed_head_sha != live_head_sha:
-        return _wf.CommandResult(
+        return CommandResult(
             False,
             (
                 f"PR #{pr_number}: approved at {reviewed_head_sha} but head is now "
@@ -162,7 +163,7 @@ def merge_check(self, pr_number: int) -> _wf.CommandResult:
             ),
             {**base, "authorized": False, "reason": "head_moved"},
         )
-    return _wf.CommandResult(
+    return CommandResult(
         True,
         f"PR #{pr_number}: approved at current head {live_head_sha}",
         {**base, "authorized": True, "reason": "approved_at_head"},
@@ -171,7 +172,7 @@ def merge_check(self, pr_number: int) -> _wf.CommandResult:
 
 def _record_review_or_error(
     self,
-    review_result: _wf.CommandResult,
+    review_result: CommandResult,
     errors: list[dict[str, Any]],
     reviews: list[dict[str, Any]],
 ) -> bool:
@@ -189,7 +190,7 @@ def _record_review_or_error(
 
 def _record_merge_or_error(
     self,
-    merge_result: _wf.CommandResult,
+    merge_result: CommandResult,
     errors: list[dict[str, Any]],
     merges: list[dict[str, Any]],
 ) -> None:

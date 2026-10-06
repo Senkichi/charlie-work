@@ -36,6 +36,7 @@ from __future__ import annotations
 from typing import Any
 
 import charlie_work.workflow as _wf
+from charlie_work.command_result import CommandResult
 from charlie_work.labels import TransitionOutcome
 from charlie_work.pr_body_closing_autofix import (
     MAX_AUTOFIX_ATTEMPTS_PER_HEAD,
@@ -56,7 +57,7 @@ def autofix_body_closing_kw(
     issue_number: int | None,
     verdict: Any,
     checks: list[dict[str, Any]] | None,
-) -> _wf.CommandResult | None:
+) -> CommandResult | None:
     """Repair a PR-body-only closing-keyword gate failure; ``None`` when not applicable."""
     if issue_number is None or not verdict.is_check_failure_block:
         return None
@@ -97,12 +98,12 @@ def autofix_body_closing_kw(
             # A persistent fetch failure must not hold the Lint-red lane forever:
             # each held pass spends the per-head budget, so the cap escalates it.
             _persist_attempts(app, pr_number, issue_number, head_sha, attempts_by_head)
-            return _wf.CommandResult(
+            return CommandResult(
                 False,
                 f"PR #{pr_number} closing-keyword autofix held: PR scan unavailable, retrying",
                 {"pr": pr_number, "issue": issue_number, "scan_unavailable": True},
             )
-        return _wf.CommandResult(
+        return CommandResult(
             False,
             f"PR #{pr_number} closing-keyword autofix held: Lint run still in progress",
             {"pr": pr_number, "issue": issue_number, "already_running": True},
@@ -151,7 +152,7 @@ def _record_autofix(
     head_sha: str,
     attempts_by_head: dict[str, int],
     result: AutofixResult,
-) -> _wf.CommandResult:
+) -> CommandResult:
     """Persist the attempt count and emit ``pr_body_closing_keyword_autofixed``."""
     with _wf.state_lock(app.paths.state_file):
         state = _wf.load_state(app.paths.state_file)
@@ -172,7 +173,7 @@ def _record_autofix(
             },
         )
         app.write_gate.save_state(state)
-    return _wf.CommandResult(
+    return CommandResult(
         False,
         f"PR #{pr_number} closing-keyword gate failure repaired by the orchestrator; "
         f"Lint re-run requested (run(s) {', '.join(str(r) for r in result.run_ids)})",
@@ -188,7 +189,7 @@ def _record_autofix(
 
 def _escalate_autofix_failure(
     app: Any, pr_number: int, issue_number: int, head_sha: str, reason: str
-) -> _wf.CommandResult:
+) -> CommandResult:
     """Escalate to the operator queue -- never to worker rework, which cannot edit the body."""
     with _wf.state_lock(app.paths.state_file):
         state = _wf.load_state(app.paths.state_file)
@@ -219,7 +220,7 @@ def _escalate_autofix_failure(
     label_error = None
     if transition_result.outcome != TransitionOutcome.APPLIED:
         label_error = {"edge": edge, "outcome": transition_result.outcome.value}
-    return _wf.CommandResult(
+    return CommandResult(
         False,
         f"PR #{pr_number} closing-keyword gate failure could not be repaired "
         f"({reason}); escalated to human",

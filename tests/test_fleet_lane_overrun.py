@@ -25,7 +25,7 @@ from charlie_work import fleet_dispatch, layout
 from charlie_work.config import FleetSupervisorConfig, OrchestratorConfig
 from charlie_work.fleet_dispatch import fleet_loop
 from charlie_work.instrumentation import query_events
-from charlie_work.workflow import CommandResult
+from charlie_work.command_result import CommandResult
 
 # Cap on how long a fake wedged lane blocks, and the wall-clock backstop for
 # the bounded-return assertion: a pass that ever waited on the wedged lane

@@ -39,6 +39,7 @@ from typing import Any, Sequence
 
 import charlie_work.superseded_worker_reap as superseded_worker_reap
 import charlie_work.workflow as _wf
+from charlie_work.command_result import CommandResult
 from charlie_work.worker_pid_stamp import stamp_worker_process
 from charlie_work.adapters import SessionRequest
 from charlie_work.claude_code import resolve_review_effort
@@ -105,7 +106,7 @@ _REVIEW_STALE_CLAIM_TIMEOUT_MINUTES = 5
 # ``local_lane_stall_alarm.py`` (#1968).
 
 
-def _local_lane(self, *, now: Any = None, limit: int | None = None) -> _wf.CommandResult:
+def _local_lane(self, *, now: Any = None, limit: int | None = None) -> CommandResult:
     """One pass of the local review/merge/rework lane.
 
     Runs inside ``loop()`` after ``dispatch_reviews``. Read-only no-op on a
@@ -126,13 +127,13 @@ def _local_lane(self, *, now: Any = None, limit: int | None = None) -> _wf.Comma
     pre-drain behavior -- it only claims verdict-driven candidates.
     """
     if publishes_pull_requests(self.gh):
-        return _wf.CommandResult(
+        return CommandResult(
             True,
             "backend publishes pull requests; local lane not applicable",
             {"local": False},
         )
     if self.dry_run:
-        return _wf.CommandResult(
+        return CommandResult(
             True,
             "dry run",
             {"local": True, "dry_run": True},
@@ -152,7 +153,7 @@ def _local_lane(self, *, now: Any = None, limit: int | None = None) -> _wf.Comma
         if launches_suspended
         else self._local_dispatch_rework()
     )
-    return _wf.CommandResult(
+    return CommandResult(
         True,
         "local lane pass complete",
         {
@@ -680,7 +681,7 @@ def _local_build_packet(
     return {"issue": issue_number, "ok": True, "head": head, "branch": branch}
 
 
-@fleet_review_lock(lambda data: _wf.CommandResult(True, "local review dispatch pass", data))
+@fleet_review_lock(lambda data: CommandResult(True, "local review dispatch pass", data))
 def _local_dispatch_reviewers(self, *, now: Any = None, launch_lock: Any = None) -> dict[str, Any]:
     """Claim and launch reviewers for lane records whose head is packetized.
 
@@ -1010,7 +1011,7 @@ def record_local_review(
     verdict_provenance: str,
     allow_stale_head: bool = False,
     verdict_source: str | None = None,
-) -> _wf.CommandResult:
+) -> CommandResult:
     """Record a review verdict for a local-lane record (no ``pr_view``).
 
     Local mirror of ``record_review``: same decision file (``prs/pr-<n>/
@@ -1022,16 +1023,16 @@ def record_local_review(
     issue via ``issue_comment`` instead of ``pr_comment``.
     """
     if decision not in ("approved", "request_changes", "blocked"):
-        return _wf.CommandResult(False, f"invalid decision: {decision}", {})
+        return CommandResult(False, f"invalid decision: {decision}", {})
     if verdict_provenance not in _wf.VERDICT_PROVENANCE_VALUES:
-        return _wf.CommandResult(False, f"invalid verdict provenance: {verdict_provenance}", {})
+        return CommandResult(False, f"invalid verdict provenance: {verdict_provenance}", {})
     summary_text = summary_file.read_text(encoding="utf-8") if summary_file else summary
     # Same rule as record_review: empty summary rejects, empty
     # required_changes never does -- it derives from the summary (or marks
     # the channel "vacuous") so a malformed verdict can never wedge the lane
     # in a silent re-review loop.
     if decision in {"request_changes", "blocked"} and not summary_text.strip():
-        return _wf.CommandResult(
+        return CommandResult(
             False,
             f"--summary or --summary-file is required for decision '{decision}'",
             {},
@@ -1060,7 +1061,7 @@ def record_local_review(
     guard_state = _wf.load_state_locked(self.paths.state_file)
     pr_state = (guard_state.get("prs") or {}).get(str(pr_number), {})
     if not is_local_pr_record(pr_state):
-        return _wf.CommandResult(
+        return CommandResult(
             False,
             f"prs[{pr_number}] is not a local-lane record",
             {"pr": pr_number},
@@ -1069,13 +1070,13 @@ def record_local_review(
     issue_number = int(issue_number) if issue_number is not None else pr_number
     guard_issue_state = (guard_state.get("issues") or {}).get(str(issue_number), {})
     if pr_state.get("status") in ("merged", "closed"):
-        return _wf.CommandResult(
+        return CommandResult(
             False,
             f"local record {pr_number} is already {pr_state.get('status')}; verdict not recorded",
             {"pr": pr_number, "issue": issue_number, "terminal": True},
         )
     if pr_state.get("status") == "escalated" or guard_issue_state.get("status") == "escalated":
-        return _wf.CommandResult(
+        return CommandResult(
             False,
             f"local record {pr_number} is escalated; verdict not recorded "
             "(unescalate the issue first)",
@@ -1095,7 +1096,7 @@ def record_local_review(
                 and live_head_sha is not None
                 and packet_head_sha != live_head_sha
             ):
-                return _wf.CommandResult(
+                return CommandResult(
                     False,
                     f"reviewed head ({reviewed_head}) matches packet head "
                     f"({packet_head_sha}) but live branch head has moved to "
@@ -1120,7 +1121,7 @@ def record_local_review(
                 options.append(f"packet head {packet_head_sha}")
             if live_head_sha is not None:
                 options.append(f"live head {live_head_sha}")
-            return _wf.CommandResult(
+            return CommandResult(
                 False,
                 f"reviewed-head {reviewed_head} does not match "
                 f"{' or '.join(options) if options else 'any available head'}",
@@ -1131,7 +1132,7 @@ def record_local_review(
         and live_head_sha is not None
         and packet_head_sha != live_head_sha
     ):
-        return _wf.CommandResult(
+        return CommandResult(
             False,
             f"review packet head ({packet_head_sha}) differs from live branch "
             f"head ({live_head_sha}); pass reviewed_head to choose the head "
@@ -1145,7 +1146,7 @@ def record_local_review(
         reviewed_head_sha = live_head_sha
         reviewed_head_source = "live"
     else:
-        return _wf.CommandResult(False, "no packet or live branch head available", {})
+        return CommandResult(False, "no packet or live branch head available", {})
 
     # The patch-id must describe the head the verdict is pinned to (issue
     # #2151). The packet's diff.patch is that head's diff only when the
@@ -1486,7 +1487,7 @@ def record_local_review(
         )
     if label_error:
         message += f" (label update failed: {label_error.get('outcome', label_error)})"
-    return _wf.CommandResult(
+    return CommandResult(
         True,
         message,
         {

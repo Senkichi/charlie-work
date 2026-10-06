@@ -48,7 +48,7 @@ from _cap_deferral_fixtures import (
 from _janitor_routing_fixtures import _set_decision
 from charlie_work.config import RescueConfig
 from charlie_work.state import load_state, save_state, state_lock
-from charlie_work.workflow import CommandResult
+from charlie_work.command_result import CommandResult
 
 
 # ---------------------------------------------------------------------------
