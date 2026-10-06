@@ -1403,7 +1403,6 @@ def test_dispatch_outcome_field_sets_pin_the_collapsed_branch(
     expect_status: str,
     expect_dispatch_failed_at_len: int | None,
     expect_escalation_reason: str | None,
-    fake_host,
 ) -> None:
     """Issues #837 / #779 regression pin.
 
