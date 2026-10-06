@@ -21,6 +21,7 @@ from charlie_work.config import (
     WatchdogConfig,
     WorkerRoleConfig,
 )
+from charlie_work.host.fakes import FakeProcessProbe
 from charlie_work.process_utils import get_process_start_time
 from charlie_work.subprocess_runner import RunResult
 from charlie_work import worktree as worktree_module
@@ -7700,7 +7701,7 @@ def _seed_live_writer_worktree(
 
 
 def test_worktree_unsafe_defers_when_writer_marker_is_live(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_host
 ) -> None:
     """Issue #1141: a dirty worktree whose writer marker has a LIVE pid must
     defer (LiveWorkerRedispatchError), not escalate (WorktreeUnsafeError).
@@ -7733,10 +7734,7 @@ def test_worktree_unsafe_defers_when_writer_marker_is_live(
     }
 
     # Only the marker's pid is alive; the recovery record's pid is dead.
-    monkeypatch.setattr(
-        "charlie_work.worktree.is_pid_alive",
-        lambda pid, start: pid == marker_pid,
-    )
+    fake_host(probe=FakeProcessProbe({marker_pid: None}))
 
     with pytest.raises(LiveWorkerRedispatchError) as exc_info:
         create_worktree(
@@ -7762,7 +7760,7 @@ def test_worktree_unsafe_defers_when_writer_marker_is_live(
 
 
 def test_worktree_unsafe_still_escalates_when_writer_marker_is_dead(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_host
 ) -> None:
     """Issue #1141 inverse: a dirty worktree whose writer marker has a DEAD
     pid must still escalate (WorktreeUnsafeError) — death is established, so
@@ -7793,10 +7791,7 @@ def test_worktree_unsafe_still_escalates_when_writer_marker_is_dead(
     # Every pid is dead — the marker is stale, the recovery record's pid is
     # stale. The marker check at entry cleans the stale marker; the dirt check
     # then escalates normally.
-    monkeypatch.setattr(
-        "charlie_work.worktree.is_pid_alive",
-        lambda pid, start: False,
-    )
+    fake_host(probe=FakeProcessProbe())
     _force_capture_failure(monkeypatch)
 
     with pytest.raises(WorktreeUnsafeError, match="worktree has uncommitted source work"):

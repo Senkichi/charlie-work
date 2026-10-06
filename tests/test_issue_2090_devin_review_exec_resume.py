@@ -87,7 +87,6 @@ class _Rig:
         monkeypatch.setattr(devin_review_resume, "write_worktree_marker", lambda *a, **k: None)
         monkeypatch.setattr("charlie_work.worker_fate.is_alive", alive)
         monkeypatch.setattr("charlie_work.process_utils.is_pid_alive", alive)
-        monkeypatch.setattr("charlie_work.stalled_review_reap.is_pid_alive", alive)
 
     def seed_dead_review(self, log_text: str = REJECTION, *, pid: int = 40_001) -> None:
         checkout = self.reviews_dir / f"pr-{PR}"

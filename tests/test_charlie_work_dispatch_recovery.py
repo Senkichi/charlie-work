@@ -174,7 +174,7 @@ def test_dispatch_recovery_aborts_for_live_worker_and_restores_in_progress(
             worktree_path=str(tmp_path / "wt"),
             prompt_path=str(tmp_path / "wt" / ".orchestrator-prompt.md"),
             command=("claude", "-p"),
-            pid=4242,
+            pid=4343,
             started_at="2026-07-02T00:00:00Z",
             log_path=str(tmp_path / "log"),
             error="pid_alive",
@@ -184,12 +184,11 @@ def test_dispatch_recovery_aborts_for_live_worker_and_restores_in_progress(
 
     monkeypatch.setattr("charlie_work.claude_code.launch_claude_worker", _fake_launch)
     # Issue #523: the live-worker slot count now verifies the recorded PID is
-    # actually alive at the OS level (is_pid_alive + process_start_time).
-    # Stub is_pid_alive so the dispatch-side result PID is treated as live,
-    # and fake the probe dead so the state.json worker_pid does not block
-    # candidate selection (the issue must be selectable to reach dispatch).
-    monkeypatch.setattr("charlie_work.workflow.is_pid_alive", lambda pid, start: True)
-    fake_host(probe=FakeProcessProbe())
+    # actually alive at the OS level (probe + process_start_time). One probe
+    # answers both reads now, so the averted record carries a distinct live
+    # PID (the one the adapter found) while state.json's recorded worker_pid
+    # reads dead — the issue must be selectable to reach dispatch.
+    fake_host(probe=FakeProcessProbe({4343: 1_234_567.0}))
     config = OrchestratorConfig(worker=WorkerRoleConfig(harness="claude-code"))
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -840,9 +839,9 @@ def test_dispatch_live_worker_arm_clears_dead_worker_failure_kind(
     fake_gh.prs[0]["state"] = "CLOSED"
 
     _seed_dead_dispatched_entry(paths.state_file, failure_kind=None)
-    fake_host(probe=FakeProcessProbe())
-    # The averted launch's recorded PID reads alive -> live-worker arm.
-    monkeypatch.setattr("charlie_work.workflow.is_pid_alive", lambda pid, start: True)
+    # The averted launch's reported PID reads alive -> live-worker arm, while
+    # the seeded worker_pid (4242) reads dead so the issue stays selectable.
+    fake_host(probe=FakeProcessProbe({4343: 1_234_567.0}))
 
     def _averted_then_stamp(_repo_root, _manifest, _results, _settings, requests):
         _stamp_dead_worker_failure_kind_mid_dispatch(paths.state_file, 123)
@@ -856,7 +855,7 @@ def test_dispatch_live_worker_arm_clears_dead_worker_failure_kind(
                 ok=False,
                 error="pid_alive",
                 failure_kind="live_worker_redispatch_averted",
-                pid=4242,
+                pid=4343,
                 process_start_time=1_234_567.0,
             )
             for request in requests
@@ -893,8 +892,7 @@ def test_dispatch_phantom_worker_arm_clears_dead_worker_failure_kind(
 
     _seed_dead_dispatched_entry(paths.state_file, failure_kind=None)
     fake_host(probe=FakeProcessProbe())
-    # The averted launch's recorded PID reads dead -> phantom arm.
-    monkeypatch.setattr("charlie_work.workflow.is_pid_alive", lambda pid, start: False)
+    # The averted launch's recorded PID reads dead via the probe -> phantom arm.
 
     def _averted_then_stamp(_repo_root, _manifest, _results, _settings, requests):
         _stamp_dead_worker_failure_kind_mid_dispatch(paths.state_file, 123)

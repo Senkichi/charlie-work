@@ -33,6 +33,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from . import host as _host
 from .process_chain import ancestor_chain_pids
 from .process_chain import ProcRow as _ProcRow  # noqa: F401 (deliberate re-export)
 from .process_chain import posix_process_ppid_snapshot as _posix_process_ppid_snapshot
@@ -304,8 +305,12 @@ def _reap_enumerated_children(
     """
     # Routed through ``process_utils``'s own names at call time so a patched
     # ``charlie_work.process_utils.run_captured`` covers the individual kill
-    # too — same seam the tree kill uses.
-    from .process_utils import get_process_start_time, is_pid_alive, run_captured
+    # too — same seam the tree kill uses. Liveness goes through the host
+    # probe, which late-binds ``process_utils.is_pid_alive``, so a patch of
+    # the primitive still reaches it.
+    from .process_utils import get_process_start_time, run_captured
+
+    probe = _host.current().probe
 
     root_start = expected_root_start_time
     if root_start is None:
@@ -326,7 +331,7 @@ def _reap_enumerated_children(
             )
             continue
         if start is None:
-            if not is_pid_alive(child):
+            if not probe.is_alive(child):
                 confirmed_dead.append(child)
             else:
                 logger.warning(
@@ -336,7 +341,7 @@ def _reap_enumerated_children(
                     root_pid,
                 )
             continue
-        if not is_pid_alive(child, start):
+        if not probe.is_alive(child, start):
             confirmed_dead.append(child)
             continue
         if os.name == "nt" and root_start is not None and start <= root_start:
@@ -382,7 +387,7 @@ def _reap_enumerated_children(
             kill_detail = f"; direct kill raised {exc!r}"
         deadline = time.monotonic() + _CHILD_KILL_CONFIRM_SECONDS
         while time.monotonic() < deadline:
-            if not is_pid_alive(child, start):
+            if not probe.is_alive(child, start):
                 confirmed_dead.append(child)
                 break
             time.sleep(_CHILD_KILL_CONFIRM_POLL_SECONDS)

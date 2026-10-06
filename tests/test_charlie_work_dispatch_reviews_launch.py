@@ -27,6 +27,7 @@ from charlie_work.config import (
     ReviewDispatchConfig,
     ReviewerRoleConfig,
 )
+from charlie_work.host.fakes import FakeProcessProbe
 from charlie_work.paths import runtime_paths
 from charlie_work.state import (
     load_state,
@@ -420,7 +421,7 @@ def test_dispatch_reviews_launch_success_clears_stale_review_dispatch_error(
     assert state["prs"]["100"]["review_dispatch_error"] is None
 
 
-def test_dispatch_reviews_prevents_double_dispatch(monkeypatch, tmp_path: Path) -> None:
+def test_dispatch_reviews_prevents_double_dispatch(monkeypatch, tmp_path: Path, fake_host) -> None:
     """Issue #370: a live reviewer blocks re-dispatch of the same PR."""
     prs = [
         {
@@ -446,12 +447,9 @@ def test_dispatch_reviews_prevents_double_dispatch(monkeypatch, tmp_path: Path) 
         launched.append((args, kwargs))
         return _fake_claude_worker_record(100, "agent/issue-10-fix")
 
-    def fake_is_pid_alive(pid: int, *_args: Any, **_kwargs: Any) -> bool:
-        # Pretend the fake reviewer PID is still alive.
-        return pid == 12345
-
     monkeypatch.setattr("charlie_work.workflow.launch_claude_worker", fake_launch)
-    monkeypatch.setattr("charlie_work.workflow.is_pid_alive", fake_is_pid_alive)
+    # Pretend the fake reviewer PID (12345, start-time 1.0) is still alive.
+    fake_host(probe=FakeProcessProbe({12345: 1.0}))
 
     first = app.dispatch_reviews()
     assert first.data["launched_count"] == 1

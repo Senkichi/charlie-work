@@ -10,11 +10,13 @@ other -- see ``tests/test_zero_cross_test_import_guard.py``).
 
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 
 import pytest
 
 from _fakes_github import FakeGitHub
+from charlie_work import host as host_pkg
 from charlie_work.adapters import SessionDispatchResult
 from charlie_work.config import OrchestratorConfig
 from charlie_work.paths import runtime_paths
@@ -26,6 +28,24 @@ from charlie_work.write_gate import WriteGate
 
 PRIOR_PID = 48840
 PRIOR_START = 1234567890.0
+
+
+class _AliveDictProbe:
+    """Host probe reading a shared ``alive`` dict lazily.
+
+    Unlike ``FakeProcessProbe`` (which snapshots its map), this reads the
+    caller's dict on every call so the fake ``kill_process_tree`` flipping a
+    pid to dead is observed by the post-kill recheck.
+    """
+
+    def __init__(self, alive: dict[int, bool]) -> None:
+        self._alive = alive
+
+    def is_alive(self, pid: int | None, start_time: float | None = None) -> bool:
+        return self._alive.get(pid, False)
+
+    def start_time(self, pid: int) -> float | None:
+        return None
 
 
 def _worker_view(
@@ -83,8 +103,9 @@ def _patch_reap_internals(
     )
     monkeypatch.setattr("charlie_work.worker.iter_workers", lambda _sessions_dir: list(workers))
     monkeypatch.setattr(
-        "charlie_work.superseded_worker_reap.is_pid_alive",
-        lambda pid, _st=None: alive.get(pid, False),
+        host_pkg,
+        "_ACTIVE",
+        dataclasses.replace(host_pkg.current(), probe=_AliveDictProbe(alive)),
     )
 
     def _fake_kill_process_tree(pid: int, st: float | None = None) -> list[int]:

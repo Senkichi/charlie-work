@@ -31,7 +31,7 @@ from .post_mortem import (
     _events_path_from_log,
     real_activity_for_worker,
 )
-from .process_utils import is_pid_alive
+from . import host as _host
 
 logger = logging.getLogger(__name__)
 
@@ -984,7 +984,7 @@ def _alive_review_worker_issue_numbers(sessions_dir: Path) -> set[int]:
     fixers. A PR whose reviewer process has not exited is deferred until a
     later pass, so its isolated review checkout is not torn down mid-session.
     """
-    return {w.issue_number for w in iter_workers(sessions_dir) if w.is_alive()}
+    return _host.current().sessions.live_issue_numbers(sessions_dir)
 
 
 def _log_activity_advanced(
@@ -1268,7 +1268,9 @@ def issue_worker_liveness(
     started_at_dt = _state_session_start_dt(issue_state)
     started_at_iso = started_at_dt.isoformat() if started_at_dt is not None else None
 
-    if not is_pid_alive(worker_pid, issue_state.get("worker_process_start_time")):
+    if not _host.current().probe.is_alive(
+        worker_pid, issue_state.get("worker_process_start_time")
+    ):
         return IssueWorkerLiveness(
             live=False,
             reason=f"state worker_pid={worker_pid} is not alive",

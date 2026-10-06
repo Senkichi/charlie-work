@@ -36,6 +36,20 @@ from charlie_work.worktree import create_worktree
 from _dispatch_fixtures import _stub_real_activity_probe_for_stalled_tests  # noqa: F401
 
 
+def _dead_probe(monkeypatch: Any) -> None:
+    """Install an all-dead host probe so liveness reads never hit the host PID table."""
+    import dataclasses
+
+    from charlie_work import host as host_pkg
+    from charlie_work.host.fakes import FakeProcessProbe
+
+    monkeypatch.setattr(
+        host_pkg,
+        "_ACTIVE",
+        dataclasses.replace(host_pkg.current(), probe=FakeProcessProbe()),
+    )
+
+
 def _run_phantom_blocked_dispatch(
     tmp_path: Path,
     monkeypatch: Any,
@@ -84,11 +98,10 @@ def _run_phantom_blocked_dispatch(
         )
 
     monkeypatch.setattr("charlie_work.claude_code.launch_claude_worker", _fake_launch)
-    monkeypatch.setattr("charlie_work.workflow.is_pid_alive", lambda pid, start: False)
-    # See the sibling completed-worktree test above: the sidecar's PID must
-    # also read as dead through worker_fate.is_alive, not just
-    # workflow's is_pid_alive.
-    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda pid, start: False)
+    # Every liveness read — the post-launch result check and the sidecar's
+    # PID through ``worker_fate.is_alive`` — goes through the one injected
+    # host probe; the all-dead fake keeps the outcome off the host PID table.
+    _dead_probe(monkeypatch)
 
     config = OrchestratorConfig(worker=WorkerRoleConfig(harness="claude-code"))
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -296,8 +309,7 @@ def test_dispatch_phantom_stale_outcome_emits_worker_evidence_stale(
         )
 
     monkeypatch.setattr("charlie_work.claude_code.launch_claude_worker", _fake_launch)
-    monkeypatch.setattr("charlie_work.workflow.is_pid_alive", lambda pid, start: False)
-    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda pid, start: False)
+    _dead_probe(monkeypatch)
 
     config = OrchestratorConfig(worker=WorkerRoleConfig(harness="claude-code"))
     paths = runtime_paths(tmp_path, config.runtime.state_dir)

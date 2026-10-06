@@ -1395,6 +1395,7 @@ def _fake_dispatch_result_factory(
 def test_dispatch_outcome_field_sets_pin_the_collapsed_branch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    fake_host,
     scenario: str,
     ok: bool,
     failure_kind: str | None,
@@ -1463,7 +1464,7 @@ def test_dispatch_outcome_field_sets_pin_the_collapsed_branch(
         )
     )
     if pid_alive is not None:
-        monkeypatch.setattr("charlie_work.workflow.is_pid_alive", lambda pid, start: pid_alive)
+        fake_host(probe=FakeProcessProbe({12345: 1_234_567.0} if pid_alive else {}))
 
     app.dispatch(limit=1)
 

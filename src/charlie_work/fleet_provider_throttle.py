@@ -43,8 +43,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
 
+from . import host as _host
 from .layout import fleet_dir
-from .process_utils import is_pid_alive
 from .state import advisory_file_lock, save_state
 from .workflow import CommandResult
 
@@ -222,7 +222,9 @@ def _any_probe_alive(probes: Any) -> bool:
         if not isinstance(entry, dict) or not isinstance(entry.get("pid"), int):
             continue
         start = entry.get("process_start_time")
-        if is_pid_alive(entry["pid"], start if isinstance(start, (int, float)) else None):
+        if _host.current().probe.is_alive(
+            entry["pid"], start if isinstance(start, (int, float)) else None
+        ):
             return True
     return False
 
