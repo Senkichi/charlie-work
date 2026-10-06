@@ -8,6 +8,7 @@ from typing import Any, Callable
 from . import atomic_write, launch_events, layout
 from .config import ApiWorkerConfig, OrchestratorConfig
 from .dead_sidecar_guard import classify_dead_sidecars
+from .github import label_names
 from .harnesses import WORKER_HARNESSES
 from .subprocess_runner import run_captured
 
@@ -20,6 +21,13 @@ class SessionRequest:
     branch_name: str
     rework: bool = False
     recovery: dict[str, Any] | None = None
+    labels: tuple[str, ...] = ()  # TIS-CW-6: for ``model:<tier>``; not in the manifest
+
+    @classmethod
+    def for_issue(cls, issue: dict[str, Any], number: int, prompt: Path, branch: str, **kw: Any):
+        """The one issue -> request mapping: title and labels come from the issue (TIS-CW-6)."""
+        title, labels = str(issue.get("title") or ""), tuple(sorted(label_names(issue)))
+        return cls(number, title, prompt, branch, labels=labels, **kw)
 
 
 @dataclass(frozen=True)
