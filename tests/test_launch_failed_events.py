@@ -35,6 +35,7 @@ from charlie_work.config import (
     OrchestratorConfig,
 )
 from charlie_work.devin_shell import launch_devin_session
+from charlie_work.host.fakes import FakeProcessProbe
 from charlie_work.host.launch import RealReviewLauncher
 from charlie_work.instrumentation import _LEVEL_BY_KIND, query_events
 from charlie_work.paths import runtime_paths
@@ -427,7 +428,7 @@ def test_review_launch_unsupported_harness_emits_launch_failed(tmp_path: Path) -
 
 
 def test_review_resume_popen_failure_emits_launch_failed(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, fake_host
 ) -> None:
     """devin_review_resume's Popen failure is a reviewer launch that came
     back as an error value -- it must emit launch_failed too (the site the
@@ -473,7 +474,7 @@ def test_review_resume_popen_failure_emits_launch_failed(
         ),
     )
     monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *a, **k: False)
-    monkeypatch.setattr("charlie_work.stalled_review_reap.is_pid_alive", lambda *a, **k: False)
+    fake_host(probe=FakeProcessProbe())
 
     def boom(*args: Any, **kwargs: Any) -> Any:
         raise OSError("devin binary gone")

@@ -7,6 +7,13 @@ read time and pid liveness through the host port (``host.current()`` /
 ``tests/baselines/host_ports/<path>.count``.  The baseline is a ratchet: growth
 fails, and so does shrinkage until the baseline is lowered (regenerate with
 ``HOST_PORTS_GUARD_WRITE=1``), so it can only ever move down.
+
+Liveness additionally has a repo-wide hard floor (issue #2228): after the host
+probe migration, ``is_pid_alive(`` may be called directly only inside
+``process_utils.py`` (the primitive) and ``host/liveness.py`` (the late-binding
+adapter).  ``test_no_direct_is_pid_alive`` scans every file under
+``src/charlie_work`` outside that two-file allowlist at baseline 0, so a
+reintroduced direct call fails here rather than regrowing silently.
 """
 
 from __future__ import annotations
@@ -16,11 +23,17 @@ import os
 from pathlib import Path
 
 import pytest
+from _src_ast import parsed, source_files
 
 ROOT = Path(__file__).resolve().parent.parent
 SRC = ROOT / "src" / "charlie_work"
 BASELINES = Path(__file__).resolve().parent / "baselines" / "host_ports"
 SCAN_TARGETS = ("workflow.py", "orchestration", "merge_path", "dead_worker_sweep")
+
+# Files allowed to call ``is_pid_alive`` directly: the primitive's own module
+# and the late-binding host adapter.  Every other consumer reads liveness
+# through ``host.current().probe`` / ``app.host.probe``.
+DIRECT_LIVENESS_ALLOWLIST = ("host/liveness.py", "process_utils.py")
 
 
 def _call_name(node: ast.Call) -> str | None:
@@ -37,13 +50,28 @@ def _call_name(node: ast.Call) -> str | None:
     return None
 
 
+def _count_calls(tree: ast.AST, match) -> int:
+    return sum(
+        1 for node in ast.walk(tree) if isinstance(node, ast.Call) and match(_call_name(node))
+    )
+
+
 def count_direct_host_reads(source: str) -> int:
     """Count direct clock / pid-liveness call sites in ``source``."""
-    return sum(
-        1
-        for node in ast.walk(ast.parse(source))
-        if isinstance(node, ast.Call) and _call_name(node) is not None
-    )
+    return _count_calls(ast.parse(source), lambda name: name is not None)
+
+
+def _count_is_pid_alive_calls(tree: ast.AST) -> int:
+    return _count_calls(tree, lambda name: name == "is_pid_alive")
+
+
+def count_direct_is_pid_alive(source: str) -> int:
+    """Count direct ``is_pid_alive(`` call sites in ``source``.
+
+    Both the bare name and the ``module.is_pid_alive`` attribute form count —
+    either one bypasses the host probe port.
+    """
+    return _count_is_pid_alive_calls(ast.parse(source))
 
 
 def _scan_files() -> list[Path]:
@@ -60,6 +88,10 @@ def _rel(path: Path) -> str:
 
 def _baseline_path(rel: str) -> Path:
     return BASELINES / f"{rel}.count"
+
+
+def _liveness_scan_files() -> list[Path]:
+    return [p for p in source_files(SRC) if _rel(p) not in DIRECT_LIVENESS_ALLOWLIST]
 
 
 def test_counter_positive_control() -> None:
@@ -97,4 +129,38 @@ def test_no_new_direct_host_reads(path: Path) -> None:
         f"{rel}: down to {count} (baseline {baseline}). Lower the ratchet: "
         "HOST_PORTS_GUARD_WRITE=1 uv run --no-sync pytest "
         "tests/test_host_ports_guard.py"
+    )
+
+
+def test_is_pid_alive_counter_positive_control() -> None:
+    assert count_direct_is_pid_alive("is_pid_alive(1)\n") == 1
+    assert count_direct_is_pid_alive("pu.is_pid_alive(pid, start_time)\n") == 1
+    assert count_direct_is_pid_alive("probe.is_alive(pid)\n") == 0
+    assert count_direct_is_pid_alive("self.host.probe.is_alive(pid)\n") == 0
+    assert count_direct_is_pid_alive("x = is_pid_alive  # referenced, not called\n") == 0
+
+
+@pytest.mark.parametrize("rel", DIRECT_LIVENESS_ALLOWLIST)
+def test_liveness_allowlist_still_calls_primitive(rel: str) -> None:
+    """Non-vacuity check: the two allowlisted files really do contain direct
+    ``is_pid_alive(`` calls, so a rename of the primitive — which would empty
+    the scan's target — fails here instead of passing the repo-wide guard on
+    zero real call sites."""
+    count = _count_is_pid_alive_calls(parsed(SRC / rel))
+    assert count >= 1, (
+        f"{rel} no longer calls is_pid_alive directly; if the primitive was "
+        "renamed, update the scan and this allowlist together."
+    )
+
+
+@pytest.mark.parametrize("path", _liveness_scan_files(), ids=_rel)
+def test_no_direct_is_pid_alive(path: Path) -> None:
+    """Hard floor at baseline 0 for every non-allowlisted file under
+    ``src/charlie_work`` — including modules added after this guard."""
+    rel = _rel(path)
+    count = _count_is_pid_alive_calls(parsed(path))
+    assert count == 0, (
+        f"{rel}: {count} direct is_pid_alive( call(s). Route liveness through "
+        "host.current().probe / app.host.probe instead; only process_utils.py "
+        "(the primitive) and host/liveness.py (the adapter) may call it."
     )
