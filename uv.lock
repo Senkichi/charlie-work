@@ -24,7 +24,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "ci-fleet", specifier = ">=0.6.0" },
+    { name = "ci-fleet", specifier = ">=0.7.0" },
     { name = "psutil", specifier = ">=5.9" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8" },
     { name = "pytest-split", marker = "extra == 'dev'", specifier = ">=0.11" },
@@ -38,7 +38,7 @@ provides-extras = ["dev"]
 
 [[package]]
 name = "ci-fleet"
-version = "0.6.0"
+version = "0.7.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "filelock" },
@@ -46,7 +46,7 @@ dependencies = [
     { name = "pyyaml" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/77/14/f5fae5c75eb10472768263a5b9c1321a98d3552416c29fc1d0c349dc5daa/ci_fleet-0.6.0-py3-none-any.whl", hash = "sha256:ae9f1b53d207b58c1c09545b2e8c125c8e455d6c690cfc6731b571a95d1d17df", size = 407822, upload-time = "2026-10-06T03:04:06.719Z" },
+    { url = "https://files.pythonhosted.org/packages/81/73/826a52873f9f54664a415fa24a021b2c64d78a9e5327673d456e20f6eeec/ci_fleet-0.7.0-py3-none-any.whl", hash = "sha256:3495f74e972ac2b956d144a70cedca17478b9e4e437311415a2d7d84cfd821e2", size = 472501, upload-time = "2026-10-06T07:28:28.89Z" },
 ]
 
 [[package]]
