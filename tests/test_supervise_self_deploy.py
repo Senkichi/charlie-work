@@ -39,10 +39,11 @@ def test_self_deploy_code_only_change_does_not_sync(
     """A pull that changes only source files triggers no uv sync."""
     runner, calls = _make_fake_runner(
         [
-            RunResult(0, "abc123\n", ""),  # before HEAD
-            RunResult(0, "", ""),  # pull ok
-            RunResult(0, "def456\n", ""),  # after HEAD
+            RunResult(0, "abc123\n", ""),  # HEAD
+            RunResult(0, "", ""),  # fetch ok
+            RunResult(0, "def456\n", ""),  # origin/main
             RunResult(0, "src/foo.py\nREADME.md\n", ""),  # diff
+            RunResult(0, "", ""),  # merge --ff-only ok
         ]
     )
     result = self_deploy(tmp_path, run_command=runner)
@@ -56,26 +57,28 @@ def test_self_deploy_code_only_change_does_not_sync(
         to_sha="def456",
         message="code-only update: def456",
     )
-    assert len(calls) == 4
+    assert len(calls) == 5
     assert [c[0] for c in calls] == [
         ["git", "rev-parse", "HEAD"],
-        ["git", "pull", "--ff-only", "origin", "main"],
-        ["git", "rev-parse", "HEAD"],
+        ["git", "fetch", "origin", "main"],
+        ["git", "rev-parse", "origin/main"],
         ["git", "diff", "--name-only", "abc123..def456"],
+        ["git", "merge", "--ff-only", "origin/main"],
     ]
 
 
 def test_self_deploy_dependency_change_triggers_uv_sync(
     tmp_path: Path, no_fleet_live_sessions: None
 ) -> None:
-    """A pull touching pyproject.toml/uv.lock runs uv sync and reports success."""
+    """A pull touching pyproject.toml/uv.lock runs uv sync --locked and reports success."""
     runner, calls = _make_fake_runner(
         [
             RunResult(0, "abc123\n", ""),
-            RunResult(0, "", ""),
-            RunResult(0, "def456\n", ""),
-            RunResult(0, "pyproject.toml\nuv.lock\n", ""),
-            RunResult(0, "", ""),
+            RunResult(0, "", ""),  # fetch ok
+            RunResult(0, "def456\n", ""),  # origin/main
+            RunResult(0, "pyproject.toml\nuv.lock\n", ""),  # diff
+            RunResult(0, "", ""),  # merge --ff-only ok
+            RunResult(0, "", ""),  # uv sync --locked ok
         ]
     )
     result = self_deploy(tmp_path, run_command=runner)
@@ -86,27 +89,23 @@ def test_self_deploy_dependency_change_triggers_uv_sync(
     assert result.from_sha == "abc123"
     assert result.to_sha == "def456"
     assert "updated and synced" in result.message
-    assert calls[-1][0] == ["uv", "sync"]
+    assert ["git", "merge", "--ff-only", "origin/main"] in [c[0] for c in calls]
+    assert calls[-1][0] == ["uv", "sync", "--locked"]
 
 
-def test_self_deploy_pull_failure_is_non_fatal(
+def test_self_deploy_fetch_failure_is_non_fatal(
     tmp_path: Path, no_fleet_live_sessions: None
 ) -> None:
-    """A diverged/dirty tree causes the pull to fail; self_deploy returns but does not raise.
+    """A network-shaped fetch refusal fails the pass without raising.
 
-    On failure, ``_self_deploy_attempt`` now calls ``_repair_lossless_pull_blockers``
-    before giving up, which re-reads HEAD and ``origin/main`` and, in a genuinely
-    diverged tree, bails out at the ``merge-base --is-ancestor`` check -- three
-    extra canned responses (HEAD, origin/main, the ancestor check failing) beyond
-    the original two.
+    Fetch failure never reaches the lossless-blocker repair -- that repair is
+    for merge refusals (the tree is in the way of incoming blobs), and with a
+    failed fetch there is no new origin/main to be in the way of.
     """
     runner, calls = _make_fake_runner(
         [
             RunResult(0, "abc123\n", ""),
-            RunResult(1, "", "fatal: Not possible to fast-forward, aborting."),
-            RunResult(0, "abc123\n", ""),  # repair: rev-parse HEAD
-            RunResult(0, "def999\n", ""),  # repair: rev-parse origin/main (diverged)
-            RunResult(1, "", ""),  # repair: merge-base --is-ancestor fails
+            RunResult(1, "", "fatal: could not read from remote repository."),
         ]
     )
     result = self_deploy(tmp_path, run_command=runner)
@@ -115,17 +114,50 @@ def test_self_deploy_pull_failure_is_non_fatal(
     assert result.changed is False
     assert result.synced is False
     assert result.from_sha == "abc123"
-    assert "fast-forward" in (result.error or "")
-    assert len(calls) == 5
+    assert "could not read from remote" in (result.error or "")
+    assert len(calls) == 2
 
 
-def test_self_deploy_already_up_to_date(tmp_path: Path, no_fleet_live_sessions: None) -> None:
-    """When the pull succeeds but HEAD does not move, no sync is attempted."""
+def test_self_deploy_merge_failure_is_non_fatal(
+    tmp_path: Path, no_fleet_live_sessions: None
+) -> None:
+    """A diverged/dirty tree makes the merge fail; self_deploy returns but does not raise.
+
+    On failure, ``_self_deploy_attempt`` calls ``_repair_lossless_pull_blockers``
+    before giving up, which re-reads HEAD and ``origin/main`` and, in a genuinely
+    diverged tree, bails out at the ``merge-base --is-ancestor`` check -- three
+    extra canned responses (HEAD, origin/main, the ancestor check failing) beyond
+    the five the merge path itself consumed.
+    """
     runner, calls = _make_fake_runner(
         [
             RunResult(0, "abc123\n", ""),
-            RunResult(0, "Already up to date.\n", ""),
+            RunResult(0, "", ""),  # fetch ok
+            RunResult(0, "def456\n", ""),  # origin/main
+            RunResult(0, "src/foo.py\n", ""),  # diff (code-only)
+            RunResult(1, "", "fatal: Not possible to fast-forward, aborting."),
+            RunResult(0, "abc123\n", ""),  # repair: rev-parse HEAD
+            RunResult(0, "def999\n", ""),  # repair: rev-parse origin/main (diverged)
+            RunResult(1, "", ""),  # repair: merge-base --is-ancestor fails
+        ]
+    )
+    result = self_deploy(tmp_path, run_command=runner)
+    assert result.ok is False
+    assert result.pulled is True
+    assert result.changed is True
+    assert result.synced is False
+    assert result.from_sha == "abc123"
+    assert "fast-forward" in (result.error or "")
+    assert len(calls) == 8
+
+
+def test_self_deploy_already_up_to_date(tmp_path: Path, no_fleet_live_sessions: None) -> None:
+    """When the fetch succeeds but origin/main does not move, no sync is attempted."""
+    runner, calls = _make_fake_runner(
+        [
             RunResult(0, "abc123\n", ""),
+            RunResult(0, "From https://x\n", ""),  # fetch ok
+            RunResult(0, "abc123\n", ""),  # origin/main (same as HEAD)
         ]
     )
     result = self_deploy(tmp_path, run_command=runner)
@@ -140,19 +172,20 @@ def test_self_deploy_already_up_to_date(tmp_path: Path, no_fleet_live_sessions: 
         message="already up to date",
     )
     assert len(calls) == 3
-    assert all(c[0] != ["uv", "sync"] for c in calls)
+    assert all(c[0] != ["uv", "sync", "--locked"] for c in calls)
 
 
 def test_self_deploy_uv_sync_failure_is_non_fatal(
     tmp_path: Path, no_fleet_live_sessions: None
 ) -> None:
-    """If uv sync fails after a dependency-changing pull, self_deploy reports the error."""
+    """If uv sync fails after a dependency-changing merge, self_deploy reports the error."""
     runner, calls = _make_fake_runner(
         [
             RunResult(0, "abc123\n", ""),
-            RunResult(0, "", ""),
-            RunResult(0, "def456\n", ""),
-            RunResult(0, "uv.lock\n", ""),
+            RunResult(0, "", ""),  # fetch ok
+            RunResult(0, "def456\n", ""),  # origin/main
+            RunResult(0, "uv.lock\n", ""),  # dep file changed
+            RunResult(0, "", ""),  # merge --ff-only ok
             RunResult(1, "", "failed to install"),
         ]
     )
@@ -168,12 +201,21 @@ def test_self_deploy_uv_sync_failure_is_non_fatal(
 def test_self_deploy_defers_sync_when_fleet_runners_active(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
-    """A dependency-changing pull defers uv sync while fleet live sessions are active."""
+    """A dependency-changing update defers BEFORE the merge while fleet live
+    sessions are active (issue #2312).
+
+    The deferral decision now sits between the fetch and the merge, so a
+    deferred pass leaves HEAD parked at ``before_sha`` -- the checkout's
+    source and its installed venv stay consistent, and a supervisor
+    restarted mid-deferral cannot crash on missing deps. ``head_changed``
+    is therefore False here (previously True: the old ordering merged first
+    and parked a *broken* environment).
+    """
     runner, calls = _make_fake_runner(
         [
-            RunResult(0, "abc123\n", ""),  # before HEAD
-            RunResult(0, "", ""),  # pull ok
-            RunResult(0, "def456\n", ""),  # after HEAD
+            RunResult(0, "abc123\n", ""),  # HEAD
+            RunResult(0, "", ""),  # fetch ok
+            RunResult(0, "def456\n", ""),  # origin/main
             RunResult(0, "pyproject.toml\nuv.lock\n", ""),  # diff
             RunResult(0, "", ""),  # uv sync (should not be reached)
         ]
@@ -190,17 +232,19 @@ def test_self_deploy_defers_sync_when_fleet_runners_active(
         pulled=True,
         changed=True,
         synced=False,
-        head_changed=True,
+        head_changed=False,
         from_sha="abc123",
         to_sha="def456",
         message="sync deferred: 2 runners active",
         deferred=True,
     )
-    assert all(c[0] != ["uv", "sync"] for c in calls)
+    assert all(c[0] != ["uv", "sync", "--locked"] for c in calls)
+    # Issue #2312: the merge must never have been issued -- HEAD stays parked.
+    assert all(c[0][:2] != ["git", "merge"] for c in calls)
     assert [c[0] for c in calls] == [
         ["git", "rev-parse", "HEAD"],
-        ["git", "pull", "--ff-only", "origin", "main"],
-        ["git", "rev-parse", "HEAD"],
+        ["git", "fetch", "origin", "main"],
+        ["git", "rev-parse", "origin/main"],
         ["git", "diff", "--name-only", "abc123..def456"],
     ]
 
@@ -216,6 +260,48 @@ def test_self_deploy_defers_sync_when_fleet_runners_active(
     assert "starved_notified" not in marker
 
 
+def test_self_deploy_deferred_marker_replay_defers_again_without_merging(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """A deferred pass holds HEAD parked; the next pass replays the marker.
+
+    Issue #2312's companion invariant: once a deferral has parked HEAD below
+    the marker's ``to_sha``, subsequent passes must keep holding the merge --
+    not just the sync -- until the fleet drains. The marker from a pre-#2312
+    deploy (HEAD already at ``to_sha``, covered by
+    ``test_self_deploy_loud_warning_on_repeated_deferral``) still defers on
+    the same ``live_count > 0`` gate; only the shape of what is held differs.
+    """
+    marker_path = _pending_sync_marker_path(layout.default_state_root(tmp_path))
+    marker_path.parent.mkdir(parents=True, exist_ok=True)
+    marker_path.write_text(
+        json.dumps({"from_sha": "abc123", "to_sha": "def456"}), encoding="utf-8"
+    )
+
+    monkeypatch.setattr(
+        "charlie_work.fleet_registry.count_fleet_live_sessions",
+        lambda _fleet_dir_override: (1, []),
+    )
+    runner, calls = _make_fake_runner(
+        [
+            RunResult(0, "abc123\n", ""),  # HEAD still parked at from_sha
+            RunResult(0, "", ""),  # fetch ok
+            RunResult(0, "def456\n", ""),  # origin/main
+            RunResult(0, "uv.lock\n", ""),  # diff
+        ]
+    )
+
+    result = self_deploy(tmp_path, run_command=runner)
+
+    assert result.ok is True
+    assert result.deferred is True
+    assert result.head_changed is False
+    assert all(c[0][:2] != ["git", "merge"] for c in calls)
+    assert all(c[0] != ["uv", "sync", "--locked"] for c in calls)
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    assert marker["to_sha"] == "def456"
+
+
 def test_self_deploy_honors_state_root_override(tmp_path: Path, monkeypatch: Any) -> None:
     """Issue #720: a configured state_root moves the pending-sync marker out of default."""
     custom_state_root = tmp_path / ".var" / "devin-orchestrator"
@@ -227,11 +313,10 @@ def test_self_deploy_honors_state_root_override(tmp_path: Path, monkeypatch: Any
 
     runner, _ = _make_fake_runner(
         [
-            RunResult(0, "abc123\n", ""),  # before HEAD
-            RunResult(0, "", ""),  # pull ok
-            RunResult(0, "def456\n", ""),  # after HEAD
+            RunResult(0, "abc123\n", ""),  # HEAD
+            RunResult(0, "", ""),  # fetch ok
+            RunResult(0, "def456\n", ""),  # origin/main
             RunResult(0, "pyproject.toml\nuv.lock\n", ""),  # diff
-            RunResult(0, "", ""),  # uv sync (not reached)
         ]
     )
 
@@ -244,14 +329,16 @@ def test_self_deploy_honors_state_root_override(tmp_path: Path, monkeypatch: Any
 def test_self_deploy_proceeds_when_zero_fleet_runners(
     tmp_path: Path, no_fleet_live_sessions: None
 ) -> None:
-    """A dependency-changing pull runs uv sync when no fleet live sessions are active."""
+    """A dependency-changing pull merges and runs uv sync when no fleet live
+    sessions are active."""
     runner, calls = _make_fake_runner(
         [
-            RunResult(0, "abc123\n", ""),  # before HEAD
-            RunResult(0, "", ""),  # pull ok
-            RunResult(0, "def456\n", ""),  # after HEAD
+            RunResult(0, "abc123\n", ""),  # HEAD
+            RunResult(0, "", ""),  # fetch ok
+            RunResult(0, "def456\n", ""),  # origin/main
             RunResult(0, "pyproject.toml\nuv.lock\n", ""),  # diff
-            RunResult(0, "", ""),  # uv sync ok
+            RunResult(0, "", ""),  # merge --ff-only ok
+            RunResult(0, "", ""),  # uv sync --locked ok
         ]
     )
 
@@ -264,7 +351,7 @@ def test_self_deploy_proceeds_when_zero_fleet_runners(
     assert result.from_sha == "abc123"
     assert result.to_sha == "def456"
     assert "updated and synced" in result.message
-    assert calls[-1][0] == ["uv", "sync"]
+    assert calls[-1][0] == ["uv", "sync", "--locked"]
     assert not _pending_sync_marker_path(layout.default_state_root(tmp_path)).exists()
 
 
@@ -273,9 +360,10 @@ def test_self_deploy_retries_sync_after_deferral(
 ) -> None:
     """A deferred dependency sync is retried on the next pass once runners are idle.
 
-    Regression for the pass-after-deferral convergence bug: the original code
-    returned "already up to date" on the next pass (because HEAD did not move)
-    before checking the deferred sync, so uv sync never ran.
+    Post-#2312 shape: pass N parks HEAD at ``from_sha`` (the merge is held,
+    not just the sync), so pass N+1 replays the marker *and* lands the held
+    merge before ``uv sync --locked`` -- the deferral covers the whole
+    "advance checkout + sync env" transition as one unit.
     """
     live_counts = iter([2, 0])
 
@@ -284,31 +372,36 @@ def test_self_deploy_retries_sync_after_deferral(
 
     monkeypatch.setattr("charlie_work.fleet_registry.count_fleet_live_sessions", _fake_count)
 
-    # Pass N: dependency-changing pull, two active runners -> defer and write marker.
+    # Pass N: dependency-changing update, two active runners -> defer before
+    # the merge; HEAD stays at abc123 and the marker records the held range.
     first_runner, first_calls = _make_fake_runner(
         [
-            RunResult(0, "abc123\n", ""),  # before HEAD
-            RunResult(0, "", ""),  # pull ok
-            RunResult(0, "def456\n", ""),  # after HEAD
+            RunResult(0, "abc123\n", ""),  # HEAD
+            RunResult(0, "", ""),  # fetch ok
+            RunResult(0, "def456\n", ""),  # origin/main
             RunResult(0, "pyproject.toml\nuv.lock\n", ""),  # diff
-            RunResult(0, "", ""),  # uv sync (not reached)
+            RunResult(0, "", ""),  # merge/uv sync (not reached)
         ]
     )
 
     first = self_deploy(tmp_path, run_command=first_runner)
     assert first.synced is False
+    assert first.head_changed is False
     assert first.message == "sync deferred: 2 runners active"
 
     marker_path = _pending_sync_marker_path(layout.default_state_root(tmp_path))
     assert marker_path.exists()
 
-    # Pass N+1: no new commits, runners now idle -> sync from marker and clear it.
+    # Pass N+1: HEAD still parked at abc123, no new origin commits, runners
+    # now idle -> merge the held range, then sync from marker and clear it.
     second_runner, second_calls = _make_fake_runner(
         [
-            RunResult(0, "def456\n", ""),  # before HEAD
-            RunResult(0, "Already up to date.\n", ""),  # pull
-            RunResult(0, "def456\n", ""),  # after HEAD (unchanged)
-            RunResult(0, "", ""),  # uv sync ok
+            RunResult(0, "abc123\n", ""),  # HEAD (parked)
+            RunResult(0, "", ""),  # fetch ok
+            RunResult(0, "def456\n", ""),  # origin/main (unchanged)
+            RunResult(0, "uv.lock\n", ""),  # diff abc123..def456
+            RunResult(0, "", ""),  # merge --ff-only ok
+            RunResult(0, "", ""),  # uv sync --locked ok
         ]
     )
 
@@ -318,11 +411,13 @@ def test_self_deploy_retries_sync_after_deferral(
         pulled=True,
         changed=True,
         synced=True,
+        head_changed=True,
         from_sha="abc123",
         to_sha="def456",
         message="updated and synced: def456",
     )
-    assert second_calls[-1][0] == ["uv", "sync"]
+    assert ["git", "merge", "--ff-only", "origin/main"] in [c[0] for c in second_calls]
+    assert second_calls[-1][0] == ["uv", "sync", "--locked"]
     assert not marker_path.exists()
 
 
@@ -355,9 +450,11 @@ def test_self_deploy_loud_warning_on_repeated_deferral(
 
     runner, _ = _make_fake_runner(
         [
-            RunResult(0, "def456\n", ""),  # before HEAD
-            RunResult(0, "Already up to date.\n", ""),  # pull
-            RunResult(0, "def456\n", ""),  # after HEAD (unchanged)
+            RunResult(0, "def456\n", ""),  # HEAD (already at the marker's to_sha
+            # -- the pre-#2312 residue shape: the deploy merged but the sync
+            # was deferred, so only the marker replays)
+            RunResult(0, "", ""),  # fetch ok
+            RunResult(0, "def456\n", ""),  # origin/main (unchanged)
             RunResult(0, "", ""),  # uv sync (not reached)
         ]
     )
@@ -374,7 +471,7 @@ def test_self_deploy_loud_warning_on_repeated_deferral(
     assert "abc123..def456" in out
 
 
-def test_self_deploy_pull_failure_surfaces_stderr_over_generic_error(
+def test_self_deploy_merge_failure_surfaces_stderr_over_generic_error(
     tmp_path: Path, no_fleet_live_sessions: None
 ) -> None:
     """Issue #817 item 3: a realistic failed RunResult -- as ``run_captured``
@@ -384,21 +481,25 @@ def test_self_deploy_pull_failure_surfaces_stderr_over_generic_error(
     (which names the colliding path) instead of the uninformative generic
     message.
 
-    ``test_self_deploy_pull_failure_is_non_fatal`` above never caught the
+    ``test_self_deploy_fetch_failure_is_non_fatal`` above never caught the
     old ``result.error or result.stderr`` bug because it constructs
     ``RunResult(1, "", "fatal: ...")`` without ``.error``, leaving it at the
     ``None`` default -- under the old fallback chain that made ``.stderr``
     win "by accident" (None is falsy), masking the real production
     shadowing where ``.error`` is always truthy.
 
-    Three extra canned responses beyond the original two account for
-    ``_repair_lossless_pull_blockers`` (invoked on every pull failure since
-    this feature landed) short-circuiting at the diverged-tree check -- see
-    the sibling test above for the same shape.
+    Since #2312 the colliding-worktree refusal comes from
+    ``git merge --ff-only`` (the fetch half already succeeded), and the
+    trailing three canned responses account for
+    ``_repair_lossless_pull_blockers`` short-circuiting at the
+    diverged-tree check -- see the sibling test above for the same shape.
     """
     runner, calls = _make_fake_runner(
         [
-            RunResult(0, "abc123\n", ""),  # before HEAD
+            RunResult(0, "abc123\n", ""),  # HEAD
+            RunResult(0, "", ""),  # fetch ok
+            RunResult(0, "def456\n", ""),  # origin/main
+            RunResult(0, "src/foo.py\n", ""),  # diff (code-only)
             RunResult(
                 returncode=1,
                 stdout="",
@@ -408,7 +509,7 @@ def test_self_deploy_pull_failure_surfaces_stderr_over_generic_error(
                     "Please commit your changes or stash them before you merge."
                 ),
                 error="command exited 1",
-            ),
+            ),  # merge --ff-only refuses
             RunResult(0, "abc123\n", ""),  # repair: rev-parse HEAD
             RunResult(0, "def999\n", ""),  # repair: rev-parse origin/main (diverged)
             RunResult(1, "", ""),  # repair: merge-base --is-ancestor fails
@@ -419,22 +520,22 @@ def test_self_deploy_pull_failure_surfaces_stderr_over_generic_error(
     assert result.error is not None
     assert "src/charlie_work/config.py" in result.error
     assert "command exited 1" not in result.error
-    assert result.error.startswith("git pull --ff-only origin main: ")
-    assert len(calls) == 5
+    assert result.error.startswith("git merge --ff-only origin/main: ")
+    assert len(calls) == 8
 
 
-def test_self_deploy_pull_retries_transient_failure_then_succeeds(
+def test_self_deploy_fetch_retries_transient_failure_then_succeeds(
     tmp_path: Path, no_fleet_live_sessions: None, monkeypatch: Any
 ) -> None:
-    """A transient git-network blip on the pull is retried in place (raw
+    """A transient git-network blip on the fetch is retried in place (raw
     ``git`` calls previously had zero retry, unlike ``GitHub.run()``'s ``gh``
     calls) rather than failing the whole pass -- and exactly one
     ``git_network_retry`` event lands in events.db, not one per attempt.
 
-    If the pull call site were reverted to a bare ``run_command`` call (no
+    If the fetch call site were reverted to a bare ``run_command`` call (no
     ``run_git_with_retry`` wrapping), this test fails: the fake runner would
-    hand the transient-failure ``RunResult`` straight back as the pull's
-    final result instead of retrying, and the queued "after HEAD"/"diff"
+    hand the transient-failure ``RunResult`` straight back as the fetch's
+    final result instead of retrying, and the queued "origin/main"/"diff"
     responses would never be consumed.
 
     ``git_retry``'s own ``time.sleep`` is monkeypatched out (issue #1777
@@ -449,7 +550,7 @@ def test_self_deploy_pull_retries_transient_failure_then_succeeds(
     state_path = _self_deploy_state_path(tmp_path)
     runner, calls = _make_fake_runner(
         [
-            RunResult(0, "abc123\n", ""),  # before HEAD
+            RunResult(0, "abc123\n", ""),  # HEAD
             RunResult(
                 returncode=128,
                 stdout="",
@@ -458,12 +559,13 @@ def test_self_deploy_pull_retries_transient_failure_then_succeeds(
                     "connect to github.com port 443 after 2093 ms: Couldn't connect to "
                     "server"
                 ),
-            ),  # pull attempt 1: transient (real curl/schannel shape, not the
+            ),  # fetch attempt 1: transient (real curl/schannel shape, not the
             # hand-assembled `connectex` hybrid no tool actually emits --
             # issue #1777 finding 2)
-            RunResult(0, "", ""),  # pull attempt 2 (retry): ok
-            RunResult(0, "def456\n", ""),  # after HEAD
+            RunResult(0, "", ""),  # fetch attempt 2 (retry): ok
+            RunResult(0, "def456\n", ""),  # origin/main
             RunResult(0, "src/foo.py\n", ""),  # diff (code-only)
+            RunResult(0, "", ""),  # merge --ff-only ok
         ]
     )
 
@@ -473,15 +575,14 @@ def test_self_deploy_pull_retries_transient_failure_then_succeeds(
     assert result.pulled is True
     assert result.from_sha == "abc123"
     assert result.to_sha == "def456"
-    assert len(calls) == 5
-    assert calls[1][0] == ["git", "pull", "--ff-only", "origin", "main"]
+    assert len(calls) == 6
+    assert calls[1][0] == ["git", "fetch", "origin", "main"]
 
     retries = query_events(state_path, kind="git_network_retry")
     assert len(retries) == 1
     # site is call-site-specific (issue #1777 finding 4), not a shared
-    # "self_deploy" literal indistinguishable from the after-repair retry or
-    # the ci-fleet sibling pull.
-    assert retries[0]["payload"]["site"] == "self_deploy_pull"
+    # "self_deploy" literal indistinguishable from the ci-fleet sibling pull.
+    assert retries[0]["payload"]["site"] == "self_deploy_fetch"
     assert retries[0]["payload"]["cwd"] == str(tmp_path)
     assert retries[0]["payload"]["attempts"] == 2
     assert retries[0]["payload"]["ok"] is True
@@ -490,13 +591,11 @@ def test_self_deploy_pull_retries_transient_failure_then_succeeds(
 def test_log_self_deploy_git_retry_site_and_cwd_distinguish_call_sites(
     tmp_path: Path,
 ) -> None:
-    """Issue #1777 finding 4: the orchestrator's own pull, its post-repair
-    retry of that same pull, and the ci-fleet sibling pull all log to this
-    one state path and (before this fix) all shared a hardcoded
-    ``site="self_deploy"`` -- indistinguishable in events.db despite the
-    first two also sharing a byte-identical ``command`` string. ``site`` is
-    now a required keyword-only parameter (not a default), and ``cwd``
-    carries the checkout the command actually ran in.
+    """Issue #1777 finding 4: the orchestrator's own fetch and the ci-fleet
+    sibling pull both log to this one state path and (before this fix)
+    shared a hardcoded ``site="self_deploy"`` -- indistinguishable in
+    events.db. ``site`` is now a required keyword-only parameter (not a
+    default), and ``cwd`` carries the checkout the command actually ran in.
 
     Calling with the old two-positional-argument signature would now raise
     ``TypeError`` (missing keyword-only ``site``), which is itself a strong
@@ -505,14 +604,13 @@ def test_log_self_deploy_git_retry_site_and_cwd_distinguish_call_sites(
     only).
     """
     sibling = tmp_path / "ci-fleet"
-    for site, cwd in (
-        ("self_deploy_pull", tmp_path),
-        ("self_deploy_pull_after_repair", tmp_path),
-        ("ci_fleet_sibling_pull", sibling),
+    for command, site, cwd in (
+        (["git", "fetch", "origin", "main"], "self_deploy_fetch", tmp_path),
+        (["git", "pull", "--ff-only", "origin", "main"], "ci_fleet_sibling_pull", sibling),
     ):
         _log_self_deploy_git_retry(
             tmp_path,
-            ["git", "pull", "--ff-only", "origin", "main"],
+            command,
             RetryOutcome(attempts=2, ok=True, error=None),
             site=site,
             cwd=cwd,
@@ -520,11 +618,10 @@ def test_log_self_deploy_git_retry_site_and_cwd_distinguish_call_sites(
 
     events = query_events(_self_deploy_state_path(tmp_path), kind="git_network_retry")
     assert [e["payload"]["site"] for e in events] == [
-        "self_deploy_pull",
-        "self_deploy_pull_after_repair",
+        "self_deploy_fetch",
         "ci_fleet_sibling_pull",
     ]
-    assert [e["payload"]["cwd"] for e in events] == [str(tmp_path), str(tmp_path), str(sibling)]
+    assert [e["payload"]["cwd"] for e in events] == [str(tmp_path), str(sibling)]
 
 
 def test_command_failure_message_falls_back_to_error_then_fallback() -> None:
@@ -560,9 +657,10 @@ def test_self_deploy_records_events_db_outcome_for_every_pass(
     runner1, _ = _make_fake_runner(
         [
             RunResult(0, "abc123\n", ""),
-            RunResult(0, "", ""),
-            RunResult(0, "def456\n", ""),
-            RunResult(0, "src/foo.py\n", ""),
+            RunResult(0, "", ""),  # fetch
+            RunResult(0, "def456\n", ""),  # origin/main
+            RunResult(0, "src/foo.py\n", ""),  # diff
+            RunResult(0, "", ""),  # merge --ff-only
         ]
     )
     self_deploy(tmp_path, run_command=runner1)
@@ -571,17 +669,15 @@ def test_self_deploy_records_events_db_outcome_for_every_pass(
     runner2, _ = _make_fake_runner(
         [
             RunResult(0, "def456\n", ""),
-            RunResult(0, "Already up to date.\n", ""),
-            RunResult(0, "def456\n", ""),
+            RunResult(0, "", ""),  # fetch
+            RunResult(0, "def456\n", ""),  # origin/main (same)
         ]
     )
     self_deploy(tmp_path, run_command=runner2)
 
-    # Pass 3: pull failure. On failure, ``_self_deploy_attempt`` now calls
-    # ``_repair_lossless_pull_blockers`` before giving up, which re-reads HEAD
-    # and ``origin/main`` and, in a genuinely diverged tree, bails out at the
-    # ``merge-base --is-ancestor`` check -- three extra canned responses
-    # (HEAD, origin/main, the ancestor check failing) beyond the original two.
+    # Pass 3: fetch failure. A failed fetch never reaches the lossless
+    # blocker repair (there is no new origin/main to be in the way of), so
+    # this pass consumes exactly two canned responses.
     runner3, _ = _make_fake_runner(
         [
             RunResult(0, "def456\n", ""),
@@ -591,9 +687,6 @@ def test_self_deploy_records_events_db_outcome_for_every_pass(
                 stderr="fatal: could not read from remote repository.",
                 error="command exited 1",
             ),
-            RunResult(0, "def456\n", ""),  # repair: rev-parse HEAD
-            RunResult(0, "xyz789\n", ""),  # repair: rev-parse origin/main (diverged)
-            RunResult(1, "", ""),  # repair: merge-base --is-ancestor fails
         ]
     )
     self_deploy(tmp_path, run_command=runner3)

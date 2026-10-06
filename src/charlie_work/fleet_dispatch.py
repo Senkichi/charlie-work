@@ -41,7 +41,12 @@ from .fleet_health_baseline import (  # noqa: F401  (deliberate re-export)
     reconcile_fleet_health_baselines,
 )
 from .fleet_paths import fleet_dir, warn_fleet_dir_virtualization_on_write
-from .fleet_registry import _load_registry, _select_repos, count_fleet_runners
+from .fleet_registry import (
+    _load_registry,
+    _select_repos,
+    count_fleet_live_sessions,
+    count_fleet_runners,
+)
 
 # Re-exported so the issue #1934 extraction keeps the
 # ``fleet_dispatch.<name>`` facade intact for existing callers/tests; the
@@ -64,7 +69,12 @@ from .fleet_stop import (
 )
 from . import layout
 from .github import GitHub, GitHubError
-from .global_config import describe_config_file, load_fleet_global_config, load_layered_config
+from .global_config import (
+    describe_config_file,
+    load_fleet_global_config,
+    load_layered_config,
+    peek_runtime_state_dir,
+)
 from .instrumentation import log_event
 from .local_issues import github_client_for
 from .notify import AttentionDigest, AttentionEntry, emit_digest
@@ -74,6 +84,7 @@ from .notify_freshness import (
     resolve_fleet_notify,
 )
 from .paths import runtime_paths
+from .pending_sync import heal_pending_sync_at_boot
 from .venv_anchor import verify_interpreter_anchored_editables
 from .ci_fleet_anchor import ci_fleet_provenance_payload, ci_fleet_provenance_snapshot
 from .supervise import (
@@ -2903,6 +2914,30 @@ def run_fleet_supervise(
         )
         return CommandResult(False, f"refusing to supervise: {anchor.detail}", {})
     logger.info("Venv editable anchor: %s", anchor.detail)
+
+    # Issue #2312: pending-sync boot repair, BEFORE the config load. A pre-fix
+    # deferral (or crash survivor) can leave HEAD on the new tree while the
+    # venv still holds the old commit's deps -- and the layered load below is
+    # the first thing that crashes on that skew, so the repair cannot depend
+    # on it. ``peek_runtime_state_dir`` reads only ``runtime.state_dir``
+    # tolerantly from the same layer slots, and ``supervisor_runtime_paths``
+    # resolves it exactly as the loaded config's state root will be. The
+    # repair never raises, emits ``self_deploy_boot_sync`` when it fires, and
+    # defers to live fleet workers on the same rule self_deploy uses. Skipped
+    # under --dry-run for the same reason self_deploy previews instead of
+    # pulling: a preview must not mutate the venv.
+    if not dry_run:
+        boot_repair = heal_pending_sync_at_boot(
+            orchestrator_root(),
+            state_root=supervisor_runtime_paths(
+                peek_runtime_state_dir(Path.cwd(), fleet_dir_override=fleet_dir_override)
+            ).root,
+            live_count=lambda: count_fleet_live_sessions(fleet_dir_override)[0],
+        )
+        if boot_repair.detail is not None:
+            logger.warning("Boot pending-sync repair: %s", boot_repair.detail)
+        elif boot_repair.synced:
+            logger.info("Boot pending-sync repair: synced via %s", boot_repair.detected_via)
 
     def _report_global_load_failure(exc: Exception) -> None:
         # Falling back to defaults silently is how a whole feature disappears

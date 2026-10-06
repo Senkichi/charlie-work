@@ -149,6 +149,7 @@ KNOWN_IGNORED: dict[str, str] = {
     "outbound_body_secret_refused": "outbound secret-guard refusal record",
     "self_deploy_alarm": "self-deploy alarm record; deploys rows cover outcomes",
     "self_deploy_blockers_cleared": "self-deploy bookkeeping",
+    "self_deploy_boot_sync": "self-deploy bookkeeping",
     "self_deploy_ci_fleet_pull": "self-deploy bookkeeping",
     "self_deploy_skipped": "a skipped self-deploy produces nothing to chart",
     "self_deploy_sync_starved": "self-deploy starvation record",

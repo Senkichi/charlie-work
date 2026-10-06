@@ -7,16 +7,21 @@ bodies are verbatim relocations; shared helpers live in
 
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 from typing import Callable
 
+import pytest
+
 from _supervise_fixtures import no_fleet_live_sessions as no_fleet_live_sessions
+from charlie_work import layout
 from charlie_work.instrumentation import query_events
 from charlie_work.subprocess_runner import RunResult, run_captured
 from charlie_work.supervise import (
     PullBlockerRepair,
     _BLOCKER_NAMES_IN_MESSAGE,
+    _pending_sync_marker_path,
     _repair_lossless_pull_blockers,
     _repairable_blocker_path,
     _self_deploy_state_path,
@@ -413,7 +418,55 @@ def test_self_deploy_end_to_end_repairs_lossless_blocker_and_retries_pull(
     payload = cleared_events[0]["payload"]
     assert payload["cleared"] == ["new_untracked.txt"]
     assert payload["retained"] == []
-    assert payload["pull_ok_after_retry"] is True
+    assert payload["merge_ok_after_retry"] is True
+
+
+def test_self_deploy_defers_without_advancing_head(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #2312: a dependency-changing deploy with live workers must defer
+    BEFORE the merge -- ``git rev-parse HEAD`` afterwards still returns the
+    pre-deploy sha, so a supervisor restarted mid-deferral finds a checkout
+    whose source and installed deps are consistent, not the new code over the
+    old venv that bricked it in the incident.
+
+    Real git repos, real ``self_deploy`` -- the assertion is on the checkout's
+    actual HEAD, not on a fake runner's queue.
+    """
+    monkeypatch.setattr(
+        "charlie_work.fleet_registry.count_fleet_live_sessions",
+        lambda _fleet_dir_override: (1, []),
+    )
+    origin_root = tmp_path / "origin"
+    clone_root = tmp_path / "clone"
+    _init_origin(origin_root)
+    _clone(origin_root, clone_root)
+    before_sha = _git(clone_root, "rev-parse", "HEAD").stdout.strip()
+
+    # Advance origin with a lockfile change -- the shape of the deploy that
+    # raised the dependency floor in the incident.
+    (origin_root / "uv.lock").write_bytes(b"lockfile-v2\n")
+    _git(origin_root, "add", "uv.lock")
+    _git(origin_root, "commit", "-m", "raise dep floor")
+    origin_sha = _git(origin_root, "rev-parse", "HEAD").stdout.strip()
+
+    result = self_deploy(clone_root, run_command=run_captured)
+
+    assert result.deferred is True
+    assert result.head_changed is False
+    assert result.from_sha == before_sha
+    assert result.to_sha == origin_sha
+    after_sha = _git(clone_root, "rev-parse", "HEAD").stdout.strip()
+    assert after_sha == before_sha, (
+        f"deferred deploy advanced HEAD anyway: {before_sha} -> {after_sha}"
+    )
+    # The marker records the held range so the deferred sync still lands once
+    # the fleet drains.
+    marker_path = _pending_sync_marker_path(layout.default_state_root(clone_root))
+    assert marker_path.exists()
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    assert marker["from_sha"] == before_sha
+    assert marker["to_sha"] == origin_sha
 
 
 def test_self_deploy_records_nothing_cleared_when_no_repair_was_needed(
