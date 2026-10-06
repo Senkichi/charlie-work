@@ -98,6 +98,31 @@ def _bulk_ppid_map() -> dict[int, int]:
     return rows
 
 
+def _optional_bulk_ppid_map() -> dict[int, int] | None:
+    """The one-shot ppid table where the platform ships it, else ``None``.
+
+    ``win32_ancestor_rows`` takes this once per walk: on Windows
+    ``Process.ppid()`` re-runs ``ppid_map()`` — a full
+    ``CreateToolhelp32Snapshot`` enumeration of every process on the box —
+    per call, so a per-hop ``ppid()`` is O(hops x host processes), paid by
+    every ``kill_process_tree``/``kill_orphan_pid`` ancestor guard (issue
+    #2362). Where no ``ppid_map`` exists (POSIX) ``Process.ppid()`` is
+    already a cheap per-process ``/proc`` read, and ``_bulk_ppid_map``'s
+    ``process_iter`` fallback would be the very host-wide enumeration the
+    chain-scoped walk exists to avoid — hence ``None``, not the fallback.
+    A failed table read degrades to the same ``None``: the per-hop
+    ``ppid()`` it falls back to wraps the same kernel call and will fail
+    identically on the first hop.
+    """
+    platform = getattr(psutil, "_psplatform", None)
+    if getattr(platform, "ppid_map", None) is None:
+        return None
+    try:
+        return _bulk_ppid_map()
+    except (psutil.Error, OSError):
+        return None
+
+
 def win32_process_ppid_snapshot() -> dict[int, ProcRow]:
     """Snapshot ``pid -> (ppid, creation time)`` for every process via ``psutil``.
 
@@ -151,19 +176,25 @@ def win32_ancestor_rows(pid: int, *, max_hops: int = MAX_CHAIN_HOPS) -> dict[int
     """``pid -> ProcRow`` for ``pid``'s own ancestor chain, gathered hop by hop.
 
     Same row shape as ``win32_process_ppid_snapshot``, but scoped to the one
-    chain a caller-side guard actually walks. Scope does not make a hop
-    cheap: on psutil 7.x ``Process.ppid()`` resolves through
+    chain a caller-side guard actually walks. Scope alone does not make a
+    hop cheap: on psutil 7.x ``Process.ppid()`` resolves through
     ``cext.ppid_map()`` — a full ``CreateToolhelp32Snapshot`` enumeration of
-    every process on the box — and ``Process()``'s identity probe pays an
-    ``OpenProcess``/``GetProcessTimes`` handle query whose result also
+    every process on the box — so asking it per hop is O(hops x host
+    processes), and chains are not shallow (a worker session sits ~20 hops
+    under uv/pytest/pwsh). The walk therefore takes the same one-shot bulk
+    table ``win32_process_ppid_snapshot`` uses — once per *walk* (issue
+    #2362) — leaving each hop to pay only ``Process()``'s
+    ``OpenProcess``/``GetProcessTimes`` identity probe, whose result also
     answers ``create_time()`` (a protected pid's failed open falls back to
-    a ``NtQuerySystemInformation`` scan). What scope buys is paying that
-    enumeration-plus-handle-open pair once per *ancestor* — a handful of
-    hops — instead of once per *process*: ``process_iter`` runs the same
-    pair for every pid on the host, so its cost grows with host occupancy
-    rather than chain depth — the seconds-level delay issue #2332 tracks,
-    paid by every ``kill_process_tree``/``kill_orphan_pid`` call through
-    ``orphan_sweep._self_ancestor_pids``.
+    a ``NtQuerySystemInformation`` scan). A pid absent from the table (born
+    mid-walk) or a platform with no bulk table falls back to the per-hop
+    ``ppid()`` read this replaces. Compared with ``process_iter`` — which
+    pays the enumeration-plus-handle-open pair once per *process*, growing
+    with host occupancy rather than chain depth — this keeps the
+    seconds-level delay issue #2332 tracked bounded per guard call: the
+    ``kill_process_tree``/``kill_orphan_pid`` ancestry check pays one
+    enumeration plus a handful of handle opens, not one enumeration per
+    hop or per host process.
 
     Recording rows without adjudicating keeps ``ancestor_chain_pids`` the
     sole owner of the termination rules: a parent created *after* its child
@@ -176,6 +207,10 @@ def win32_ancestor_rows(pid: int, *, max_hops: int = MAX_CHAIN_HOPS) -> dict[int
     Returns ``{}`` if ``pid``'s own row cannot be read — indistinguishable
     from a failed snapshot for the caller's degrade path.
     """
+    # The table is point-in-time and covers every process live when it was
+    # taken, so a map miss is a mid-walk spawn (or no bulk table at all) —
+    # exactly the cases the per-hop ``ppid()`` read still answers.
+    ppids = _optional_bulk_ppid_map()
     rows: dict[int, ProcRow] = {}
     current = pid
     for _ in range(max_hops):
@@ -183,7 +218,10 @@ def win32_ancestor_rows(pid: int, *, max_hops: int = MAX_CHAIN_HOPS) -> dict[int
             break
         try:
             proc = psutil.Process(current)
-            ppid = proc.ppid()
+            if ppids is not None and current in ppids:
+                ppid = ppids[current]
+            else:
+                ppid = proc.ppid()
         except (psutil.Error, OSError):
             break
         try:
