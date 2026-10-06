@@ -43,6 +43,7 @@ from charlie_work.config import (
     RunnersConfig,
     WorkerRoleConfig,
 )
+from charlie_work.host.fakes import FakeWorkerLauncher
 from charlie_work.instrumentation import query_events
 from charlie_work.pass_deadline import (
     PassDeadlineExceeded,
@@ -324,7 +325,7 @@ def test_merge_ready_skip_line_read_refusal_propagates_cleanly(tmp_path: Path) -
 
 
 def test_dispatch_refusal_between_claim_and_launch_leaves_recoverable_claim(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, fake_host
 ) -> None:
     """A BaseException refusal after the claim write strands nothing unsafe.
 
@@ -354,7 +355,7 @@ def test_dispatch_refusal_between_claim_and_launch_leaves_recoverable_claim(
         dispatch_calls.append(requests)
         return _ok_dispatch_sessions(requests)
 
-    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", _spy_dispatch_sessions)
+    fake_host(worker_launch=FakeWorkerLauncher([_spy_dispatch_sessions]))
 
     # Spent exactly when the claim exists: the refusal lands between the
     # claim write (first lock) and the worker launch (dispatch_sessions).
@@ -390,7 +391,7 @@ def test_dispatch_refusal_between_claim_and_launch_leaves_recoverable_claim(
 
 
 def test_dispatch_rework_refusal_between_claim_and_launch_leaves_recoverable_claim(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, fake_host
 ) -> None:
     """Same claim->launch contract for the rework lane.
 
@@ -434,7 +435,7 @@ def test_dispatch_rework_refusal_between_claim_and_launch_leaves_recoverable_cla
         dispatch_calls.append(requests)
         return _ok_dispatch_sessions(requests)
 
-    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", _spy_dispatch_sessions)
+    fake_host(worker_launch=FakeWorkerLauncher([_spy_dispatch_sessions]))
 
     set_pass_deadline_exceeded(fake_gh, lambda: _dispatch_pending_claim(paths))
 

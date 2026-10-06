@@ -107,7 +107,11 @@ class _Bed:
 
     def dispatch(self) -> Any:
         """One real ``dispatch_rework`` pass; only the process launch is faked."""
+        import dataclasses
+
+        import charlie_work.host as host_pkg
         from charlie_work.adapters import SessionDispatchResult
+        from charlie_work.host.fakes import FakeWorkerLauncher
 
         def fake_dispatch_sessions(_repo_root, _manifest, _results, _settings, requests):
             return [
@@ -124,7 +128,10 @@ class _Bed:
                 for request in requests
             ]
 
-        with patch("charlie_work.workflow.dispatch_sessions", fake_dispatch_sessions):
+        ports = dataclasses.replace(
+            host_pkg.current(), worker_launch=FakeWorkerLauncher([fake_dispatch_sessions])
+        )
+        with patch.object(host_pkg, "_ACTIVE", ports):
             return self.app.dispatch_rework()
 
     def die(

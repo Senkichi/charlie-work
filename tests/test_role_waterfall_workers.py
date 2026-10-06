@@ -25,6 +25,7 @@ from charlie_work.config import (
     OrchestratorConfig,
     WorkerRoleConfig,
 )
+from charlie_work.host.fakes import FakeWorkerLauncher
 from charlie_work.instrumentation import query_events
 from charlie_work.paths import runtime_paths
 from charlie_work.role_chain import RoleEntry
@@ -71,7 +72,7 @@ def _app(root: Path, lane: str, worker: WorkerRoleConfig = CHAINED) -> Orchestra
     return app
 
 
-def _spy(monkeypatch: pytest.MonkeyPatch) -> list[tuple[AdapterSettings, SessionRequest]]:
+def _spy(fake_host) -> list[tuple[AdapterSettings, SessionRequest]]:
     """Fake ``dispatch_sessions`` that writes the sidecar a real launch would."""
     calls: list[tuple[AdapterSettings, SessionRequest]] = []
 
@@ -111,7 +112,7 @@ def _spy(monkeypatch: pytest.MonkeyPatch) -> list[tuple[AdapterSettings, Session
             )
         return results
 
-    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", _fake)
+    fake_host(worker_launch=FakeWorkerLauncher([_fake]))
     return calls
 
 
@@ -145,9 +146,9 @@ def _stamp(app: OrchestratorApp, harness: str) -> dict[str, Any]:
 
 @LANES
 def test_quota_death_on_primary_moves_other_repo_to_fallback_and_back(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lane: str
+    tmp_path: Path, fake_host, lane: str
 ) -> None:
-    calls = _spy(monkeypatch)
+    calls = _spy(fake_host)
     repo_a = _app(tmp_path / "a", lane)
     repo_b = _app(tmp_path / "b", lane)
 
@@ -187,9 +188,9 @@ def test_quota_death_on_primary_moves_other_repo_to_fallback_and_back(
 
 @LANES
 def test_all_entries_restricted_defers_with_no_launch(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lane: str
+    tmp_path: Path, fake_host, lane: str
 ) -> None:
-    calls = _spy(monkeypatch)
+    calls = _spy(fake_host)
     later = datetime.now(UTC) + timedelta(hours=2)
     for entry in (PRIMARY, FALLBACK):
         role_quota_ledger.record_restriction(
@@ -203,10 +204,8 @@ def test_all_entries_restricted_defers_with_no_launch(
 
 
 @LANES
-def test_expired_restriction_returns_to_primary(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lane: str
-) -> None:
-    calls = _spy(monkeypatch)
+def test_expired_restriction_returns_to_primary(tmp_path: Path, fake_host, lane: str) -> None:
+    calls = _spy(fake_host)
     ledger_path = role_quota_ledger.ledger_path()
     ledger_path.parent.mkdir(parents=True, exist_ok=True)
     past = (datetime.now(UTC) - timedelta(minutes=1)).replace(microsecond=0)
@@ -229,10 +228,10 @@ def test_expired_restriction_returns_to_primary(
 
 @LANES
 def test_per_repo_window_the_ledger_does_not_explain_still_blocks(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lane: str
+    tmp_path: Path, fake_host, lane: str
 ) -> None:
     """An operator hold / pre-ledger throttle outlasting every ledger entry blocks."""
-    calls = _spy(monkeypatch)
+    calls = _spy(fake_host)
     role_quota_ledger.record_restriction(
         PRIMARY.harness,
         PRIMARY.model,
@@ -251,12 +250,10 @@ def test_per_repo_window_the_ledger_does_not_explain_still_blocks(
 
 
 @LANES
-def test_length_one_chain_is_unchanged_by_the_ledger(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lane: str
-) -> None:
+def test_length_one_chain_is_unchanged_by_the_ledger(tmp_path: Path, fake_host, lane: str) -> None:
     """Existing behavior: no fallbacks -> the primary launches regardless of the
     ledger, and a per-repo throttle blocks exactly as before."""
-    calls = _spy(monkeypatch)
+    calls = _spy(fake_host)
     role_quota_ledger.record_restriction(
         PRIMARY.harness,
         PRIMARY.model,
@@ -285,11 +282,11 @@ def test_length_one_chain_is_unchanged_by_the_ledger(
 
 @LANES
 def test_same_repo_throttle_explained_by_the_ledger_is_covered(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lane: str
+    tmp_path: Path, fake_host, lane: str
 ) -> None:
     """The dying repo's own per-repo window (same ``until`` as the ledger entry,
     written by ``persist_failure``) does not stop it launching the fallback."""
-    calls = _spy(monkeypatch)
+    calls = _spy(fake_host)
     until = (datetime.now(UTC) + timedelta(hours=2)).replace(microsecond=0)
     until_z = until.isoformat().replace("+00:00", "Z")
     role_quota_ledger.record_restriction(
@@ -324,11 +321,11 @@ def _restrict(entry: RoleEntry, until: datetime) -> None:
 
 @LANES
 def test_unstamped_hold_ending_before_a_skipped_entrys_restriction_still_blocks(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lane: str
+    tmp_path: Path, fake_host, lane: str
 ) -> None:
     """An operator hold (no provenance) that is SHORTER than the primary's ledger
     restriction used to be waved through as "explained"; it must still block."""
-    calls = _spy(monkeypatch)
+    calls = _spy(fake_host)
     _restrict(PRIMARY, datetime.now(UTC) + timedelta(hours=3))
     app = _app(tmp_path / "b", lane)
     _hold(app, datetime.now(UTC) + timedelta(hours=1))
@@ -339,11 +336,11 @@ def test_unstamped_hold_ending_before_a_skipped_entrys_restriction_still_blocks(
 
 @LANES
 def test_hold_is_not_explained_by_a_restriction_on_an_unselected_later_entry(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lane: str
+    tmp_path: Path, fake_host, lane: str
 ) -> None:
     """Primary free, only the FALLBACK restricted: selection skipped nothing, so
     even a fully stamped quota window on the primary's adapter blocks."""
-    calls = _spy(monkeypatch)
+    calls = _spy(fake_host)
     _restrict(FALLBACK, datetime.now(UTC) + timedelta(hours=3))
     app = _app(tmp_path / "b", lane)
     _hold(
@@ -359,9 +356,9 @@ def test_hold_is_not_explained_by_a_restriction_on_an_unselected_later_entry(
 
 @LANES
 def test_stamped_window_on_an_adapter_no_skipped_entry_uses_still_blocks(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lane: str
+    tmp_path: Path, fake_host, lane: str
 ) -> None:
-    calls = _spy(monkeypatch)
+    calls = _spy(fake_host)
     _restrict(PRIMARY, datetime.now(UTC) + timedelta(hours=3))  # claude-code skipped
     app = _app(tmp_path / "b", lane)
     _hold(
@@ -410,12 +407,12 @@ def test_under_lock_throttle_read_applies_the_same_attribution(
 
 @LANES
 def test_fallback_stamped_window_is_covered_once_the_primary_recovers(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lane: str
+    tmp_path: Path, fake_host, lane: str
 ) -> None:
     """B's quota death armed a window stamped (devin-shell, swe-2). The primary
     is free, so selection skipped nothing -- only the stamp attributes the
     window to the still-restricted fallback, and the launch proceeds on A."""
-    calls = _spy(monkeypatch)
+    calls = _spy(fake_host)
     _restrict(FALLBACK, datetime.now(UTC) + timedelta(hours=3))
     app = _app(tmp_path / "b", lane)
     _hold(
@@ -432,11 +429,11 @@ def test_fallback_stamped_window_is_covered_once_the_primary_recovers(
 
 @LANES
 def test_window_stamped_with_the_selected_entry_itself_still_blocks(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lane: str
+    tmp_path: Path, fake_host, lane: str
 ) -> None:
     """An entry's own death window is never covered -- the stamp equal to the
     selected entry is the one attribution the rule must refuse."""
-    calls = _spy(monkeypatch)
+    calls = _spy(fake_host)
     app = _app(tmp_path / "b", lane)
     _hold(
         app,
@@ -453,11 +450,11 @@ def test_window_stamped_with_the_selected_entry_itself_still_blocks(
 
 @LANES
 def test_fallback_stamped_window_still_blocks_when_its_ledger_entry_is_shorter(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lane: str
+    tmp_path: Path, fake_host, lane: str
 ) -> None:
     """The ledger explains the window only through the stamped entry's
     restriction; a window outliving it is part unexplained and blocks."""
-    calls = _spy(monkeypatch)
+    calls = _spy(fake_host)
     _restrict(FALLBACK, datetime.now(UTC) + timedelta(hours=1))
     app = _app(tmp_path / "b", lane)
     _hold(

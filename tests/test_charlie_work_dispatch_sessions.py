@@ -37,7 +37,7 @@ from charlie_work.config import (
     WorkerRoleConfig,
     load_config,
 )
-from charlie_work.host.fakes import FakeProcessProbe
+from charlie_work.host.fakes import FakeProcessProbe, FakeWorkerLauncher
 from charlie_work.instrumentation import log_event, query_events
 from charlie_work.paths import runtime_paths
 from charlie_work.state import (
@@ -405,7 +405,7 @@ def test_dispatch_emits_attention_digest_for_live_worker_redispatch_averted(
             for request in requests
         ]
 
-    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", fake_dispatch_sessions)
+    fake_host(worker_launch=FakeWorkerLauncher([fake_dispatch_sessions]))
     # Issue #523: the live-worker slot count now verifies the recorded PID is
     # actually alive at the OS level. Fake the probe so the result PID counts.
     fake_host(probe=FakeProcessProbe({12345: 1_234_567.0}))

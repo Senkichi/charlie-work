@@ -19,6 +19,7 @@ from charlie_work.config import (
     OrchestratorConfig,
     load_config,
 )
+from charlie_work.host.fakes import FakeWorkerLauncher
 from charlie_work.issue_priority import is_critical, order_by_priority, priority_level
 from charlie_work.merge_path.apply_merge import _add_skip_line_if_critical
 from charlie_work.merge_path.model import MergePathConfig
@@ -127,9 +128,7 @@ def test_a_tight_limit_claims_the_critical_issue_first(tmp_path: Path) -> None:
     assert _dry_claims(_dispatch_app(tmp_path), limit=1) == [200]
 
 
-def test_the_real_pass_launches_in_priority_order(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_the_real_pass_launches_in_priority_order(tmp_path: Path, fake_host) -> None:
     launched: list[int] = []
 
     def _fake(_repo_root, _manifest, _results, settings, requests):
@@ -146,7 +145,7 @@ def test_the_real_pass_launches_in_priority_order(
             for request in requests
         ]
 
-    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", _fake)
+    fake_host(worker_launch=FakeWorkerLauncher([_fake]))
     app = _dispatch_app(tmp_path, dry_run=False)
     result = app.dispatch(limit=2)
     assert launched == [200, 400], result.message

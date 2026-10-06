@@ -99,6 +99,45 @@ def _deep_merge(base: Any, override: Any) -> Any:
     return override
 
 
+def peek_runtime_state_dir(
+    repo_root: Path,
+    explicit: Path | None = None,
+    *,
+    fleet_dir_override: str | None = None,
+) -> str:
+    """Best-effort read of ``runtime.state_dir`` from the config layers.
+
+    Exists for one caller: the boot-time pending-sync repair (issue #2312)
+    must locate the marker *before* ``load_fleet_global_config`` runs -- the
+    dependency skew it repairs is exactly what can crash that load. Reads the
+    same two layer slots ``load_layered_config`` uses and applies the same
+    repo-wins-per-key precedence, but only for ``runtime.state_dir``, and
+    tolerates every failure the real loader would surface: absent files,
+    malformed YAML, non-mapping documents, and non-mapping ``runtime``
+    sections all contribute nothing.
+
+    A layer that declares ``state_dir`` wins even when the value is unusable:
+    the real loader would raise ``ConfigError`` on it and the fleet entry
+    points fall back to defaults, so the peek's own default matches where
+    that fallback puts the marker. The string comes back unresolved --
+    resolution belongs to ``runtime_paths``/``supervisor_runtime_paths``.
+    """
+    state_dir: Any = None
+    for _layer, path in config_layer_paths(
+        repo_root, explicit, fleet_dir_override=fleet_dir_override
+    ):
+        try:
+            raw = yaml.safe_load(path.read_text(encoding="utf-8")) if path.exists() else None
+        except (OSError, yaml.YAMLError):
+            continue
+        if not isinstance(raw, dict):
+            continue
+        runtime = raw.get("runtime")
+        if isinstance(runtime, dict) and "state_dir" in runtime:
+            state_dir = runtime["state_dir"]
+    return state_dir if isinstance(state_dir, str) else layout.DEFAULT_STATE_DIR
+
+
 def load_layered_config(
     repo_root: Path,
     explicit: Path | None = None,

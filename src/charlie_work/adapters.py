@@ -8,6 +8,18 @@ from typing import Any, Callable
 from . import atomic_write, launch_events, layout
 from .config import ApiWorkerConfig, OrchestratorConfig
 from .dead_sidecar_guard import classify_dead_sidecars
+
+# Issue #2229 rework: the result value object and the launch-failure seam
+# (result constructor, record/exception mapping, ``launch_failed`` emit) live
+# in the ``dispatch_results`` leaf; re-exported here so every
+# ``charlie_work.adapters.<name>`` import path and patch target is unchanged.
+from .dispatch_results import (
+    SessionDispatchResult,
+    _emit_launch_failed,
+    _launch_exc_result,
+    _record_result,
+    _result,
+)
 from .github import label_names
 from .harnesses import WORKER_HARNESSES
 from .subprocess_runner import run_captured
@@ -90,50 +102,6 @@ class AdapterSettings:
     # role-chain fallback in ``_launch_workers``; rescue-tier and reviewer
     # settings leave it empty and launch exactly as configured.
     role: str = ""
-
-
-@dataclass(frozen=True)
-class SessionDispatchResult:
-    issue_number: int
-    issue_title: str
-    prompt_path: str
-    branch_name: str
-    adapter: str
-    ok: bool
-    command: str | list[str] | None = None
-    returncode: int | None = None
-    stdout: str = ""
-    stderr: str = ""
-    error: str | None = None
-    reclaimed: str | None = None  # "fetch-fallback" | "pruned" | "salvaged" | None
-    pid: int | None = None  # Worker process PID for state-based liveness detection
-    process_start_time: float | None = None  # Process creation time for PID recycling protection
-    failure_kind: str | None = None  # stable machine-readable classification of a failure
-    # Issue #1423: the worktree path the launch resolved to. Carried so the
-    # blocked-environment reap path (``_try_reap_blocked_foreign_writer``) can
-    # read the writer marker without re-deriving the path from the branch name.
-    # Empty for adapters that never create a worktree (command/manual/dry-run).
-    worktree_path: str = ""
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "issue_number": self.issue_number,
-            "issue_title": self.issue_title,
-            "prompt_path": self.prompt_path,
-            "branch_name": self.branch_name,
-            "adapter": self.adapter,
-            "ok": self.ok,
-            "command": self.command,
-            "returncode": self.returncode,
-            "stdout": self.stdout,
-            "stderr": self.stderr,
-            "error": self.error,
-            "reclaimed": self.reclaimed,
-            "pid": self.pid,
-            "process_start_time": self.process_start_time,
-            "failure_kind": self.failure_kind,
-            "worktree_path": self.worktree_path,
-        }
 
 
 def _dispatch_manual(
@@ -414,39 +382,18 @@ def _run_devin_shell_adapter(
             base_ref=settings.base_ref,
             config=settings.config,
         )
-        # Non-blocking launch: there is no returncode/stdout to report — liveness
-        # and output live in the sidecar JSON and per-session log.
-        ok = record.error is None and record.pid is not None
-        return _result(
-            request,
-            adapter="devin-shell",
-            ok=ok,
-            command=list(record.command),
-            error=record.error if not ok else None,
-            reclaimed=record.reclaimed,
-            pid=record.pid,
-            process_start_time=record.process_start_time,
-            failure_kind=record.failure_kind,
-            worktree_path=record.worktree_path,
-        )
     except Exception as exc:
-        # Catch any unexpected exception and return as a failure result
-        # (CLAUDE.md invariant: errors from external processes come back as values)
-        _emit_launch_failed(
+        return _launch_exc_result(
             repo_root,
             settings,
             request,
-            harness="devin-shell",
-            model=settings.worker_model,
-            error_class=launch_events.LAUNCH_ERR_INTERNAL,
-            error=f"launch failed: {exc}",
-        )
-        return _result(
-            request,
             adapter="devin-shell",
-            ok=False,
-            error=f"launch failed: {exc}",
+            model=settings.worker_model,
+            exc=exc,
         )
+    # Non-blocking launch: there is no returncode/stdout to report — liveness
+    # and output live in the sidecar JSON and per-session log.
+    return _record_result(request, "devin-shell", record)
 
 
 def _run_claude_code_adapter(
@@ -478,35 +425,33 @@ def _run_claude_code_adapter(
         kwargs["command_template"] = settings.claude_command
     if settings.tee_stream_json:
         kwargs["tee_stream_json"] = settings.tee_stream_json
-    record = launch_claude_worker(
-        request.issue_number,
-        request.branch_name,
-        prompt_text,
-        repo_root=repo_root,
-        sessions_dir=sessions_dir,
-        worktrees_dir=settings.worktrees_dir,
-        venv_source=settings.venv_source,
-        env=settings.worker_env,
-        materialize_dirs=settings.materialize_dirs,
-        rework=request.rework,
-        recovery=request.recovery,
-        base_ref=settings.base_ref,
-        config=settings.config,
-        **kwargs,
-    )
-    ok = record.error is None and record.pid is not None
-    return _result(
-        request,
-        adapter="claude-code",
-        ok=ok,
-        command=list(record.command),
-        error=record.error if not ok else None,
-        reclaimed=record.reclaimed,
-        pid=record.pid,
-        process_start_time=record.process_start_time,
-        failure_kind=record.failure_kind,
-        worktree_path=record.worktree_path,
-    )
+    try:
+        record = launch_claude_worker(
+            request.issue_number,
+            request.branch_name,
+            prompt_text,
+            repo_root=repo_root,
+            sessions_dir=sessions_dir,
+            worktrees_dir=settings.worktrees_dir,
+            venv_source=settings.venv_source,
+            env=settings.worker_env,
+            materialize_dirs=settings.materialize_dirs,
+            rework=request.rework,
+            recovery=request.recovery,
+            base_ref=settings.base_ref,
+            config=settings.config,
+            **kwargs,
+        )
+    except Exception as exc:
+        return _launch_exc_result(
+            repo_root,
+            settings,
+            request,
+            adapter="claude-code",
+            model=settings.config.worker.model if settings.config else "",
+            exc=exc,
+        )
+    return _record_result(request, "claude-code", record)
 
 
 def _run_api_adapter(
@@ -559,36 +504,35 @@ def _run_api_adapter(
     kwargs: dict[str, Any] = {}
     if settings.claude_command:
         kwargs["command_template"] = settings.claude_command
-    record = launch_api_worker(
-        request.issue_number,
-        request.branch_name,
-        prompt_text,
-        repo_root=repo_root,
-        sessions_dir=sessions_dir,
-        api_worker_config=api_worker_config,
-        worktrees_dir=settings.worktrees_dir,
-        venv_source=settings.venv_source,
-        worker_env=settings.worker_env,
-        materialize_dirs=settings.materialize_dirs,
-        rework=request.rework,
-        recovery=request.recovery,
-        base_ref=settings.base_ref,
-        config=settings.config,
-        **kwargs,
-    )
-    ok = record.error is None and record.pid is not None
-    return _result(
-        request,
-        adapter="api",
-        ok=ok,
-        command=list(record.command),
-        error=record.error if not ok else None,
-        reclaimed=record.reclaimed,
-        pid=record.pid,
-        process_start_time=record.process_start_time,
-        failure_kind=record.failure_kind,
-        worktree_path=record.worktree_path,
-    )
+    try:
+        record = launch_api_worker(
+            request.issue_number,
+            request.branch_name,
+            prompt_text,
+            repo_root=repo_root,
+            sessions_dir=sessions_dir,
+            api_worker_config=api_worker_config,
+            worktrees_dir=settings.worktrees_dir,
+            venv_source=settings.venv_source,
+            worker_env=settings.worker_env,
+            materialize_dirs=settings.materialize_dirs,
+            rework=request.rework,
+            recovery=request.recovery,
+            base_ref=settings.base_ref,
+            config=settings.config,
+            **kwargs,
+        )
+    except Exception as exc:
+        provider = api_worker_config.providers.get(api_worker_config.provider)
+        return _launch_exc_result(
+            repo_root,
+            settings,
+            request,
+            adapter="api",
+            model=provider.model if provider else "",
+            exc=exc,
+        )
+    return _record_result(request, "api", record)
 
 
 def _run_command_adapter(
@@ -651,37 +595,6 @@ def _run_command_adapter(
     )
 
 
-def _emit_launch_failed(
-    repo_root: Path,
-    settings: AdapterSettings,
-    request: SessionRequest,
-    *,
-    harness: str,
-    error_class: str,
-    error: str,
-    model: str = "",
-) -> None:
-    """Issue #2246: emit one ``launch_failed`` event for a dispatch path that
-    produces an error value *without* reaching a record-returning launch
-    function (prompt reads, missing config, render failures, the command
-    adapter's blocking run, unsupported harnesses). Paths that DO reach
-    ``launch_devin_session``/``launch_claude_worker``/``launch_api_worker``
-    must not call this -- the error-record seam already emitted.
-
-    Every ``dispatch_sessions`` result is a worker launch (rescue-tier
-    dispatches included), so ``role`` is fixed "worker" here.
-    """
-    launch_events.emit_launch_failed(
-        launch_events.state_path_for(repo_root, settings.config),
-        role="worker",
-        harness=harness,
-        model=model,
-        issue_number=request.issue_number,
-        error_class=error_class,
-        error=error,
-    )
-
-
 def _render_command(
     dispatch_command: str | tuple[str, ...], request: SessionRequest
 ) -> str | list[str] | None:
@@ -707,42 +620,6 @@ def _render_command(
             "(shell) commands — use the list form, which runs without a shell"
         )
     return text.format(**values)
-
-
-def _result(
-    request: SessionRequest,
-    *,
-    adapter: str,
-    ok: bool,
-    command: str | list[str] | None = None,
-    returncode: int | None = None,
-    stdout: str = "",
-    stderr: str = "",
-    error: str | None = None,
-    reclaimed: str | None = None,
-    pid: int | None = None,
-    process_start_time: float | None = None,
-    failure_kind: str | None = None,
-    worktree_path: str = "",
-) -> SessionDispatchResult:
-    return SessionDispatchResult(
-        issue_number=request.issue_number,
-        issue_title=request.issue_title,
-        prompt_path=str(request.prompt_path),
-        branch_name=request.branch_name,
-        adapter=adapter,
-        ok=ok,
-        command=command,
-        returncode=returncode,
-        stdout=stdout,
-        stderr=stderr,
-        error=error,
-        reclaimed=reclaimed,
-        pid=pid,
-        process_start_time=process_start_time,
-        failure_kind=failure_kind,
-        worktree_path=worktree_path,
-    )
 
 
 def _write_json(path: Path, value: Any) -> None:

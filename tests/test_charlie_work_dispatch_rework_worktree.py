@@ -29,7 +29,7 @@ from charlie_work.config import (
     WatchdogConfig,
     WorkerRoleConfig,
 )
-from charlie_work.host.fakes import FakeProcessProbe
+from charlie_work.host.fakes import FakeProcessProbe, FakeWorkerLauncher
 from charlie_work.paths import runtime_paths
 from charlie_work.state import (
     load_state,
@@ -40,7 +40,7 @@ from charlie_work.workflow import OrchestratorApp
 
 
 def test_dispatch_rework_worktree_unsafe_local_commits_escalates_as_judgment(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, fake_host
 ) -> None:
     """Issue #807: a rework-dispatch attempt whose failure_kind is
     ``worktree_unsafe_local_commits`` (genuine unpushed local commits on the
@@ -110,7 +110,7 @@ def test_dispatch_rework_worktree_unsafe_local_commits_escalates_as_judgment(
             for request in requests
         ]
 
-    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", fake_dispatch_sessions)
+    fake_host(worker_launch=FakeWorkerLauncher([fake_dispatch_sessions]))
 
     # A deterministic judgment failure escalates on the FIRST attempt, not
     # after burning max_auto_redispatch.
@@ -130,7 +130,7 @@ def test_dispatch_rework_worktree_unsafe_local_commits_escalates_as_judgment(
 
 
 def test_dispatch_rework_worktree_unsafe_preserves_conflict_rework_attempts(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, fake_host
 ) -> None:
     """Issue #777(d): the conflict-rework attempt must be counted (via
     _route_janitor_gate_failure_to_rework's conflict_rework_attempts write,
@@ -201,7 +201,7 @@ def test_dispatch_rework_worktree_unsafe_preserves_conflict_rework_attempts(
             for request in requests
         ]
 
-    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", fake_dispatch_sessions)
+    fake_host(worker_launch=FakeWorkerLauncher([fake_dispatch_sessions]))
 
     result = app.dispatch_rework()
     assert result.ok is False
@@ -221,7 +221,7 @@ def test_dispatch_rework_worktree_unsafe_preserves_conflict_rework_attempts(
 
 
 def test_dispatch_rework_worktree_foreign_writer_does_not_increment_redispatch(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, fake_host
 ) -> None:
     """Issue #1393: a rework dispatch that fails at launch with
     worktree_foreign_writer must NOT increment the redispatch counter.
@@ -287,7 +287,7 @@ def test_dispatch_rework_worktree_foreign_writer_does_not_increment_redispatch(
             for request in requests
         ]
 
-    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", fake_dispatch_sessions)
+    fake_host(worker_launch=FakeWorkerLauncher([fake_dispatch_sessions]))
 
     # First blocked launch: blocked_environment_at grows, redispatch_at stays empty.
     result = app.dispatch_rework()
@@ -321,7 +321,7 @@ def test_dispatch_rework_worktree_foreign_writer_does_not_increment_redispatch(
 
 
 def test_dispatch_rework_worktree_foreign_writer_redispatch_unchanged(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, fake_host
 ) -> None:
     """Issue #1393: after blocked-environment failures are resolved, a
     subsequent genuine redispatch failure still counts against the
@@ -377,7 +377,7 @@ def test_dispatch_rework_worktree_foreign_writer_redispatch_unchanged(
             for request in requests
         ]
 
-    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", fake_blocked)
+    fake_host(worker_launch=FakeWorkerLauncher([fake_blocked]))
     app.dispatch_rework()
     state = load_state(paths.state_file)
     assert state["issues"]["123"].get("redispatch_at") is None
@@ -401,7 +401,7 @@ def test_dispatch_rework_worktree_foreign_writer_redispatch_unchanged(
             for request in requests
         ]
 
-    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", fake_generic)
+    fake_host(worker_launch=FakeWorkerLauncher([fake_generic]))
     result = app.dispatch_rework()
     assert result.ok is False
     state = load_state(paths.state_file)
@@ -502,7 +502,7 @@ def test_dispatch_rework_blocked_environment_reap_resets_counter(
             for request in requests
         ]
 
-    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", fake_dispatch_sessions)
+    fake_host(worker_launch=FakeWorkerLauncher([fake_dispatch_sessions]))
 
     result = app.dispatch_rework()
     assert result.ok is False
@@ -597,7 +597,7 @@ def test_dispatch_rework_pre_escalation_safety_net_reaps_foreign_writer(
             for request in requests
         ]
 
-    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", fake_dispatch_sessions)
+    fake_host(worker_launch=FakeWorkerLauncher([fake_dispatch_sessions]))
 
     app.dispatch_rework()
 
@@ -723,7 +723,7 @@ def test_dispatch_rework_pre_filter_own_live_session_not_reaped_escalated(
     def _dispatch_must_not_run(_repo_root, _manifest, _results, _settings, _requests):
         raise AssertionError("dispatch must not run when the pre-filter escalates")
 
-    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", _dispatch_must_not_run)
+    fake_host(worker_launch=FakeWorkerLauncher([_dispatch_must_not_run]))
 
     result = app.dispatch_rework()
     # The issue was filtered out by the pre-filter (escalated, not dispatched),
