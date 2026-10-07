@@ -670,7 +670,10 @@ def _committed_issues_repo(tmp_path: Path):
     (tmp_path / ".gitignore").write_text(".var/\n", encoding="utf-8")
     issues_dir = tmp_path / "docs" / "issues"
     _write_issue(issues_dir, 1)
-    for argv in (["git", "add", "--", "docs/issues"], ["git", "commit", "-m", "seed"]):
+    for argv in (
+        ["git", "add", "--", "docs/issues"],
+        ["git", "-c", "user.name=t", "-c", "user.email=t", "commit", "-m", "seed"],
+    ):
         subprocess.run(argv, cwd=tmp_path, check=True, capture_output=True, text=True)
     return issues_dir
 
