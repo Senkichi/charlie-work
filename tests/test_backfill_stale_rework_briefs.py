@@ -21,6 +21,7 @@ from types import ModuleType
 import pytest
 
 from _script_loader import load_script_module
+from _worktree_fixtures import _init_repo
 from charlie_work.workflow import _is_verdict_newer_than_brief
 
 
@@ -391,13 +392,7 @@ def _git(repo: Path, *args: str) -> subprocess.CompletedProcess:
 @pytest.fixture
 def tiny_git_repo(tmp_path: Path) -> Path:
     repo = tmp_path / "repo"
-    repo.mkdir()
-    _git(repo, "init", "-q")
-    _git(repo, "config", "user.email", "test@example.com")
-    _git(repo, "config", "user.name", "Test")
-    (repo / "a.txt").write_text("a", encoding="utf-8")
-    _git(repo, "add", "a.txt")
-    _git(repo, "commit", "-q", "-m", "initial")
+    _init_repo(repo)
     return repo
 
 
@@ -457,15 +452,17 @@ def test_deployment_gate_requires_all_of_multiple_commits(
 
 
 def _make_repo_with_fix(tmp_path: Path, name: str) -> tuple[Path, str]:
-    """Create a git repo whose HEAD contains a 'fix' commit; return (repo, fix_sha)."""
+    """Create a git repo whose HEAD contains a 'fix' commit; return (repo, fix_sha).
+
+    The base repo materializes from the per-process ``plain`` git template
+    (``_worktree_fixtures._init_repo`` -> ``tests/_git_templates.py``,
+    HS-CW-4: ``shutil.copytree``, no subprocesses); only the per-test fix
+    commit itself still spawns git. The fix SHA stays unique to this repo
+    because the commit is created after the copy -- no other template copy's
+    object store contains it, which is what the renderer-vs-state-repo tests
+    rely on."""
     repo = tmp_path / name
-    repo.mkdir()
-    _git(repo, "init", "-q")
-    _git(repo, "config", "user.email", "test@example.com")
-    _git(repo, "config", "user.name", "Test")
-    (repo / "a.txt").write_text("a", encoding="utf-8")
-    _git(repo, "add", "a.txt")
-    _git(repo, "commit", "-q", "-m", "initial")
+    _init_repo(repo)
     (repo / "fix.txt").write_text("fix", encoding="utf-8")
     _git(repo, "add", "fix.txt")
     _git(repo, "commit", "-q", "-m", "the renderer fix")
@@ -475,16 +472,36 @@ def _make_repo_with_fix(tmp_path: Path, name: str) -> tuple[Path, str]:
 
 def _make_repo_without_fix(tmp_path: Path, name: str) -> Path:
     """Create a git repo whose HEAD does NOT contain the fix (simulates a
-    state root / different repo that cannot resolve the fix SHA)."""
+    state root / different repo that cannot resolve the fix SHA).
+
+    A ``plain`` template copy is sufficient here: the gate only requires a
+    real git work tree whose object store lacks the fix SHA, and the fix
+    commit is only ever created inside ``_make_repo_with_fix``'s copy."""
     repo = tmp_path / name
-    repo.mkdir()
-    _git(repo, "init", "-q")
-    _git(repo, "config", "user.email", "test@example.com")
-    _git(repo, "config", "user.name", "Test")
-    (repo / "a.txt").write_text("a", encoding="utf-8")
-    _git(repo, "add", "a.txt")
-    _git(repo, "commit", "-q", "-m", "initial")
+    _init_repo(repo)
     return repo
+
+
+def test_repo_builders_go_through_the_git_template(tmp_path: Path) -> None:
+    """Issue #2463 regression pin: the repo builders must materialize through
+    the per-process ``plain`` git template (``_git_templates``, HS-CW-4)
+    instead of re-running the ``init``/``config``/``commit`` spawn sequence
+    per call -- the ledger measured
+    ``test_main_gate_fails_when_renderer_lacks_fix_even_if_state_repo_has_it``
+    at ~2.5x baseline because each of this module's gate tests paid the full
+    spawn cost on the Windows CI host. Mirrors ``test_git_templates``'s #2387
+    pin for ``_helpers._init_git_repo`` and the #2425 pin in
+    ``test_local_issues_loop_gates``."""
+    import _git_templates
+
+    before = _git_templates._REGISTRY.materialized["plain"]
+    repo, fix_sha = _make_repo_with_fix(tmp_path, "with-fix")
+    assert _git_templates._REGISTRY.materialized["plain"] == before + 1
+    # The fix commit is a real object in this copy's store.
+    assert _git(repo, "rev-parse", "--verify", fix_sha).stdout.strip()
+    without = _make_repo_without_fix(tmp_path, "without-fix")
+    assert _git_templates._REGISTRY.materialized["plain"] == before + 2
+    assert _git(without, "rev-parse", "--verify", "main").stdout.strip()
 
 
 def test_deployment_gate_anchors_to_renderer_not_state_repo(
