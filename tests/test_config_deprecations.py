@@ -18,13 +18,16 @@ from __future__ import annotations
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
 from charlie_work import layout
+import charlie_work.config_deprecations as config_deprecations_module
 from charlie_work.config import ConfigError, OrchestratorConfig, load_config
 from charlie_work.config_deprecations import (
     DEPRECATED_CONFIG_KEYS,
+    DeprecatedConfigKey,
     deprecated_keys_in,
 )
 from charlie_work.global_config import load_layered_config
@@ -42,6 +45,22 @@ from _config_deprecations_fixtures import (
     _write_repo_config,
 )
 from _fakes_github import FakeGitHub
+
+
+# A registered-but-still-parseable key, injected via ``patch.object`` into
+# the module-level registry for the read-time-signal tests. The live
+# registry is empty since #1979 retired the ``supervisor.*`` family (its
+# last members) -- the same reason ``_SWEEP_ENTRY`` exists for the sweep
+# tests -- so exercising ``emit_deprecated_key_reads`` /
+# ``deprecated_keys_in`` against a real deprecated key needs a synthetic
+# one, and it must name a key the parser still accepts or the load fails
+# before the emit can be asserted on.
+_SIGNAL_ENTRY = DeprecatedConfigKey(
+    section="dispatch",
+    key="default_limit",
+    replacement=None,
+    removal_issue=4242,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -73,9 +92,10 @@ def test_registry_registers_require_worker_github_token_for_issue_1977(tmp_path:
 
 
 def test_deprecated_keys_in_finds_registered_key_in_section():
-    data = {"supervisor": {"zero_pass_alarm": 5}}
-    found = deprecated_keys_in(data)
-    assert [entry.dotted for entry in found] == ["supervisor.zero_pass_alarm"]
+    data = {"dispatch": {"default_limit": 2}}
+    with patch.object(config_deprecations_module, "DEPRECATED_CONFIG_KEYS", (_SIGNAL_ENTRY,)):
+        found = deprecated_keys_in(data)
+    assert [entry.dotted for entry in found] == ["dispatch.default_limit"]
 
 
 def test_deprecated_keys_in_ignores_unregistered_key():
@@ -93,17 +113,18 @@ def test_load_config_emits_deprecated_read_event(tmp_path: Path):
     repo.mkdir()
     _write_repo_config(
         repo,
-        "supervisor:\n  zero_pass_alarm: 5\n",
+        "dispatch:\n  default_limit: 2\n",
     )
-    load_config(repo / "orchestrator.config.yaml")
+    with patch.object(config_deprecations_module, "DEPRECATED_CONFIG_KEYS", (_SIGNAL_ENTRY,)):
+        load_config(repo / "orchestrator.config.yaml")
 
     rows = query_events(_repo_state_path(repo), kind="config_key_deprecated_read")
     assert len(rows) == 1
     payload = rows[0]["payload"]
-    assert payload["section"] == "supervisor"
-    assert payload["key"] == "zero_pass_alarm"
+    assert payload["section"] == "dispatch"
+    assert payload["key"] == "default_limit"
     assert payload["source"] == str(repo / "orchestrator.config.yaml")
-    assert payload["issue_number"] == 1979
+    assert payload["issue_number"] == 4242
     assert rows[0]["level"] == "warning"
 
 
@@ -123,13 +144,14 @@ def test_layered_config_emits_per_layer(tmp_path: Path):
     fleet_dir = tmp_path / "fleet"
     fleet_dir.mkdir()
     (fleet_dir / layout.GLOBAL_CONFIG_FILENAME).write_text(
-        "supervisor:\n  zero_pass_alarm: 9\n", encoding="utf-8"
+        "dispatch:\n  default_limit: 9\n", encoding="utf-8"
     )
     repo = tmp_path / "repo"
     repo.mkdir()
-    _write_repo_config(repo, "supervisor:\n  wedge_kill_loop_alarm: 2\n")
+    _write_repo_config(repo, "dispatch:\n  default_limit: 2\n")
 
-    load_layered_config(repo, fleet_dir_override=str(fleet_dir))
+    with patch.object(config_deprecations_module, "DEPRECATED_CONFIG_KEYS", (_SIGNAL_ENTRY,)):
+        load_layered_config(repo, fleet_dir_override=str(fleet_dir))
 
     fleet_rows = query_events(layout.state_file_path(fleet_dir), kind="config_key_deprecated_read")
     assert len(fleet_rows) == 1

@@ -288,15 +288,23 @@ def _self_repo(hb: ModuleType, tmp_path: Path) -> Any:
 # registry parametrizes zero cases, which pytest reports as skipped.)
 _REGISTRY_REMOVAL_ISSUES = [entry.removal_issue for entry in DEPRECATED_CONFIG_KEYS]
 
-# Issue #1977's registry entry was removed by its own PR -- the exact rot the
-# comment above guards against. The number is pinned here, on top of the live
-# derivation, for two reasons: the collect-only gate (issue #1538) fails a
-# required check when the ``[1977]`` leaf ids vanish, absent the
-# operator-applied ``collect-gate-exempt`` label; and a retired number gives
-# the unarmed test a negative control -- it must land back in the ordinary
-# un-triaged ``armable`` pool, proving the parametrization really does derive
-# from the live registry rather than gating on any stale marker.
-_RETIRED_REMOVAL_ISSUES = (1977,)
+# Issues #1977's and #1979's registry entries were removed by their own PRs
+# -- the exact rot the comment above guards against. The numbers are pinned
+# here, on top of the live derivation, for two reasons: the collect-only
+# gate (issue #1538) fails a required check when the ``[1977]`` leaf ids
+# vanish, absent the operator-applied ``collect-gate-exempt`` label; and a
+# retired number gives the unarmed test a negative control -- it must land
+# back in the ordinary un-triaged ``armable`` pool, proving the
+# parametrization really does derive from the live registry rather than
+# gating on any stale marker.
+#
+# The eight copies of 1979 are deliberate, not a typo: #1979 retired EIGHT
+# registry entries (one per moved fleet_supervisor field, all carrying
+# removal_issue=1979), so the base-time leaf ids were ``[1979_0]`` ..
+# ``[1979_7]`` -- pytest's dedup suffixes on eight duplicate params. The
+# pin must reproduce that multiplicity; a single ``(1979,)`` collects only
+# ``[1979]`` and the gate reads the eight missing leaves as removed tests.
+_RETIRED_REMOVAL_ISSUES = (1977,) + (1979,) * 8
 
 
 def test_check_armable_backlog_body_blocked_by_open_issue_is_not_armable(
@@ -340,11 +348,13 @@ def test_check_armable_backlog_unarmed_removal_issue_is_not_armable(
     registry is deliberately the only marker (config_deprecations.py), so
     membership in it -- not a label -- is what gates.
 
-    The ``[1977]`` param is a retired ``removal_issue`` (its entry is gone,
-    removed by #1977 itself): the same unlabelled issue is no longer
-    sweep-owned, so it falls into the ordinary un-triaged ``armable`` pool --
-    the branch below pins that contrast. The leaf name predates the removal
-    and is kept verbatim for the collect-only gate (#1538).
+    The ``[1977]``/``[1979_N]`` params are retired ``removal_issue`` numbers
+    (their entries are gone, removed by #1977 and #1979 themselves; #1979's
+    eight retired entries yield the eight duplicate ``[1979_0]`` ..
+    ``[1979_7]`` params): the same unlabelled issue is no longer
+    sweep-owned, so it falls into the ordinary un-triaged ``armable`` pool
+    -- the branch below pins that contrast. The leaf name predates the
+    removal and is kept verbatim for the collect-only gate (#1538).
     """
     repo = _self_repo(hb, tmp_path)
     issues = [_issue_with_body(removal_issue, "Do not label this issue by hand.")]
@@ -368,10 +378,11 @@ def test_check_armable_backlog_armed_removal_issue_counts_as_runway(
 ) -> None:
     """Once the sweep marks its removal issue ``automated-ready`` it is runway.
 
-    The ``[1977]`` param is a retired ``removal_issue``: armed is armed -- an
-    ``automated-ready`` issue counts as runway whether or not its registry
-    entry still lives. The leaf name predates the removal and is kept
-    verbatim for the collect-only gate (#1538).
+    The ``[1977]``/``[1979_N]`` params are retired ``removal_issue`` numbers
+    (see ``_RETIRED_REMOVAL_ISSUES`` for why 1979 appears eight times):
+    armed is armed -- an ``automated-ready`` issue counts as runway whether
+    or not its registry entry still lives. The leaf name predates the
+    removal and is kept verbatim for the collect-only gate (#1538).
     """
     repo = _self_repo(hb, tmp_path)
     issues = [_issue_with_body(removal_issue, "", ("automated-ready",))]

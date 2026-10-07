@@ -101,16 +101,14 @@ from .deescalation_config import project_scoped_keys
 from .config_deprecations import emit_deprecated_key_reads, repo_state_path
 
 # Re-exported from the domain module (issue #1978) for the same reason
-# ``RunnerCapacityEscalationConfig`` is re-exported above: the dataclass and
-# its section parser live in their own module so new fleet-scoped knobs do
-# not land in this over-cap monolith (file-size ratchet, issue #1442);
-# ``config.py`` wires the dataclass into ``OrchestratorConfig`` and delegates
-# parsing (including the legacy ``supervisor.<key>`` fallback) to it.
+# ``RunnerCapacityEscalationConfig`` is re-exported above: the dataclass
+# lives in its own module so new fleet-scoped knobs do not land in this
+# over-cap monolith (file-size ratchet, issue #1442); ``config.py`` wires it
+# into ``OrchestratorConfig`` and the generic section loop validates it.
 from .test_slots import SlotPoolConfig  # noqa: F401  (deliberate re-export)
 from .dashboard.config import DashboardConfig  # noqa: F401  (deliberate re-export)
 from .fleet_supervisor_config import (  # noqa: F401  (deliberate re-export)
     FleetSupervisorConfig,
-    parse_fleet_supervisor,
 )
 
 from . import layout
@@ -2310,10 +2308,9 @@ class SupervisorConfig:
     ``FleetSupervisorConfig`` under the ``fleet_supervisor:`` section. The
     four fields below are the ones both loops share -- ``run_supervised``
     (per-repo) and ``run_fleet_supervise`` (fleet) each poll, cool down, and
-    bound their own runtime on the same cadence knobs. A moved key still
-    written under ``supervisor:`` keeps working during the migration window
-    (``parse_fleet_supervisor`` honors it and ``DEPRECATED_CONFIG_KEYS``
-    reports the read); issue #1979 removes the legacy locations.
+    bound their own runtime on the same cadence knobs. Issue #1979 removed
+    the migration window's legacy fallback: a moved key still written under
+    ``supervisor:`` now fails validation as an ordinary unknown key.
     """
 
     poll_interval_seconds: Annotated[int, Typed, BoolTolerant] = 20
@@ -2711,19 +2708,10 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
     unknown = sorted(set(data) - known_sections)
     if unknown:
         raise unknown_sections_error(unknown, known_sections)
-    # Issue #1978: parse the fleet-scoped section BEFORE the loop reaches
-    # ``supervisor`` -- the parser pops the relocated keys out of
-    # ``data['supervisor']`` (the private deepcopy above, so the caller's dict
-    # is untouched) and applies the new-location > legacy > default precedence
-    # itself, raising ConfigError when both locations disagree.
-    prebuilt: dict[str, Any] = {"fleet_supervisor": parse_fleet_supervisor(data)}
     by_name = {spec.name: spec for spec in field_specs(OrchestratorConfig)}
     built: dict[str, Any] = {}
     for f in fields(OrchestratorConfig):
         if f.metadata.get("provenance"):
-            continue
-        if f.name in prebuilt:
-            built[f.name] = prebuilt[f.name]
             continue
         raw = _section(data, f.name)
         built[f.name] = validate_section(

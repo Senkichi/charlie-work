@@ -355,12 +355,15 @@ def test_load_config_supervisor_self_deploy_pull_ci_fleet_accepts_true(
 def test_load_config_supervisor_self_deploy_pull_ci_fleet_rejects_non_bool(
     tmp_path: Path,
 ) -> None:
-    """A non-bool under the legacy ``supervisor:`` location still errors."""
+    """A value under the legacy ``supervisor:`` location still errors --
+    as an unknown key now (#1979 removed the fallback; this input simply
+    cannot reach a bool check anymore). The leaf name predates the removal
+    and is kept verbatim for the collect-only gate (#1538)."""
     config_file = tmp_path / "orchestrator.config.yaml"
     _write_config(config_file, "supervisor:\n  self_deploy_pull_ci_fleet: not-a-bool\n")
     with pytest.raises(
         ConfigError,
-        match=r"^supervisor\.self_deploy_pull_ci_fleet: expected bool, got ",
+        match=r"^supervisor: expected known keys .*unknown key\(s\) self_deploy_pull_ci_fleet",
     ):
         load_config(config_file)
 

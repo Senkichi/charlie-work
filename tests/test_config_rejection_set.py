@@ -408,7 +408,9 @@ def walk_targets() -> list[dict]:
         out.append({"id": f.name, "path": [f.name], "seed": {}, "sub": True})
         if _is_dc(tp):
             visit(tp, [f.name], {})
-    # Legacy ``supervisor.<key>`` spellings of the relocated fleet_supervisor keys.
+    # Retired ``supervisor.<key>`` spellings of the relocated fleet_supervisor
+    # keys: since #1979 they are unknown keys, and keeping the probes pins the
+    # rejection for every future fleet_supervisor knob as well.
     from charlie_work.fleet_supervisor_config import FleetSupervisorConfig
 
     for f in dataclasses.fields(FleetSupervisorConfig):

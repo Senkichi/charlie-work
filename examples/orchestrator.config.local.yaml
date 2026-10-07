@@ -166,5 +166,5 @@ supervisor:
 # host-wide `fleet_supervisor:` section in issue #1978. Declare it in the
 # GLOBAL fleet layer (<fleet_dir>/config.yaml), not here -- a per-repo
 # `fleet_supervisor:` section is a ConfigError. See docs/RUNBOOK.md.
-# The legacy `supervisor.<key>` spellings still parse during the migration
-# window (they emit config_key_deprecated_read; removal tracked by #1979).
+# The legacy `supervisor.<key>` spellings were removed by #1979: they now
+# fail like any other unknown key.
