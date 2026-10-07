@@ -49,7 +49,7 @@ def _concurrent_writer(paths: Any, mutate: Any) -> Any:
     return serve
 
 
-def _run_with_gap(tmp_path: Path, mutate: Any) -> tuple[Any, Any, Any]:
+def _run_with_gap(tmp_path: Path, mutate: Any, monkeypatch) -> tuple[Any, Any, Any]:
     config, paths, gh, _ = _dead_worker_rework_bed(tmp_path)
     _write_outcome(paths, tmp_path, _COMPLETED_OUTCOME)
     run_sweep(
@@ -62,15 +62,18 @@ def _run_with_gap(tmp_path: Path, mutate: Any) -> tuple[Any, Any, Any]:
             patch.object(rework_outcome, "remote_branch_head_sha", lambda *_a: "abc123"),
             patch.object(sweep_apply, "serve", _concurrent_writer(paths, mutate)),
         ),
+        monkeypatch=monkeypatch,
     )
     return config, paths, gh
 
 
-def test_status_moved_in_gap_suppresses_rework_label_and_recovery(tmp_path: Path) -> None:
+def test_status_moved_in_gap_suppresses_rework_label_and_recovery(
+    tmp_path: Path, monkeypatch
+) -> None:
     def escalate(state: dict[str, Any]) -> None:
         state["issues"]["207"]["status"] = "escalated"
 
-    config, paths, gh = _run_with_gap(tmp_path, escalate)
+    config, paths, gh = _run_with_gap(tmp_path, escalate, monkeypatch=monkeypatch)
 
     assert issue_entry(paths, 207)["status"] == "escalated"
     assert (207, config.labels.needs_rework) not in gh.labels_added
@@ -78,12 +81,12 @@ def test_status_moved_in_gap_suppresses_rework_label_and_recovery(tmp_path: Path
 
 
 def test_reviewed_head_moved_in_gap_suppresses_rework_label_and_recovery(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     def new_verdict(state: dict[str, Any]) -> None:
         state["prs"]["100"]["reviewed_head_sha"] = "zzz999"
 
-    config, paths, gh = _run_with_gap(tmp_path, new_verdict)
+    config, paths, gh = _run_with_gap(tmp_path, new_verdict, monkeypatch=monkeypatch)
 
     assert issue_entry(paths, 207)["status"] == "dispatched"
     assert (207, config.labels.needs_rework) not in gh.labels_added
@@ -97,7 +100,7 @@ def _advance_head(gh: Any) -> None:
     gh.prs[0]["headRefOid"] = "def456"
 
 
-def test_review_route_failure_is_audit_only_not_a_ring_event(tmp_path: Path) -> None:
+def test_review_route_failure_is_audit_only_not_a_ring_event(tmp_path: Path, monkeypatch) -> None:
     """N1: the original wrote it with ``log_event`` (events.db), never the state ring."""
     from charlie_work.instrumentation import query_events
 
@@ -107,14 +110,14 @@ def test_review_route_failure_is_audit_only_not_a_ring_event(tmp_path: Path) -> 
     def boom(pr_number: int) -> CommandResult:
         raise RuntimeError("reviewer down")
 
-    run_sweep(tmp_path, paths, config, gh, review_callback=boom)
+    run_sweep(tmp_path, paths, config, gh, review_callback=boom, monkeypatch=monkeypatch)
 
     assert events_of(paths, "orphaned_worker_review_route_failed") == []
     rows = query_events(paths.state_file, kind="orphaned_worker_review_route_failed")
     assert len(rows) == 1
 
 
-def test_drift_anchor_is_stamped_after_review_returns(tmp_path: Path) -> None:
+def test_drift_anchor_is_stamped_after_review_returns(tmp_path: Path, monkeypatch) -> None:
     """N2: ``orphan_drift_at`` feeds the #654 backstop; it must not predate review()."""
     config, paths, gh, _ = _dead_worker_rework_bed(tmp_path)
     _advance_head(gh)
@@ -131,6 +134,7 @@ def test_drift_anchor_is_stamped_after_review_returns(tmp_path: Path) -> None:
         gh,
         review_callback=slow_refusal,
         patches=(patch("charlie_work.workflow.utc_now", lambda: clock["now"]),),
+        monkeypatch=monkeypatch,
     )
 
     assert issue_entry(paths, 207)["orphan_drift_at"] == "2026-09-30T10:10:00Z"
@@ -188,7 +192,7 @@ def test_applied_heads_are_read_per_route() -> None:
 # ------------------------------------------------- #2113: status and event share a lock window
 
 
-def test_append_event_failure_leaves_neither_status_nor_event(tmp_path: Path) -> None:
+def test_append_event_failure_leaves_neither_status_nor_event(tmp_path: Path, monkeypatch) -> None:
     """The audit event rides the guarded write: if ``append_event`` raises, the status
     flip is not saved, there is no recovery row and no label edge, and the sweep
     does not swallow it."""
@@ -216,6 +220,7 @@ def test_append_event_failure_leaves_neither_status_nor_event(tmp_path: Path) ->
                 patch.object(rework_outcome, "remote_branch_head_sha", lambda *_a: "abc123"),
                 patch.object(WriteGate, "append_event", failing_append),
             ),
+            monkeypatch=monkeypatch,
         )
 
     assert issue_entry(paths, 207)["status"] == "dispatched"
@@ -223,9 +228,9 @@ def test_append_event_failure_leaves_neither_status_nor_event(tmp_path: Path) ->
     assert (207, config.labels.needs_rework) not in gh.labels_added
 
 
-def test_recovery_event_and_status_land_together(tmp_path: Path) -> None:
+def test_recovery_event_and_status_land_together(tmp_path: Path, monkeypatch) -> None:
     """Positive control for the test above: the same bed, unpatched, records both."""
-    config, paths, gh = _run_with_gap(tmp_path, lambda state: None)
+    config, paths, gh = _run_with_gap(tmp_path, lambda state: None, monkeypatch=monkeypatch)
 
     assert issue_entry(paths, 207)["status"] == "rework_requested"
     assert len(events_of(paths, "orphaned_worker_recovered")) == 1

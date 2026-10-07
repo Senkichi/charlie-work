@@ -30,7 +30,9 @@ from charlie_work.state import (
 from charlie_work.workflow import OrchestratorApp
 
 
-def test_orphaned_worker_approved_without_rework_status_still_drifts(tmp_path: Path) -> None:
+def test_orphaned_worker_approved_without_rework_status_still_drifts(
+    tmp_path: Path, monkeypatch
+) -> None:
     """#2135 (supersedes #1109): an approved PR whose PR state carries no
     ``status="rework_requested"`` is still a post-approval rework when its issue
     is ``dispatched`` -- carry-forward can rewrite the status back to ``approved``
@@ -88,7 +90,7 @@ def test_orphaned_worker_approved_without_rework_status_still_drifts(tmp_path: P
         }
     )
 
-    with host_probe(alive=False):
+    with host_probe(monkeypatch, alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
@@ -112,7 +114,7 @@ def test_orphaned_worker_approved_without_rework_status_still_drifts(tmp_path: P
 
 
 def test_orphaned_worker_drift_fingerprint_cleared_on_redispatch(
-    tmp_path: Path, fake_host
+    tmp_path: Path, fake_host, monkeypatch
 ) -> None:
     """Issue #457 review: a fresh dispatch clears the drift fingerprint.
 
@@ -204,7 +206,7 @@ def test_orphaned_worker_drift_fingerprint_cleared_on_redispatch(
 
     from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
-    with host_probe(alive=False):
+    with host_probe(monkeypatch, alive=False):
         _detect_and_handle_orphaned_workers(
             sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
         )
@@ -254,7 +256,7 @@ def test_orphaned_worker_drift_fingerprint_cleared_on_redispatch(
     assert "orphan_drift_fingerprint" not in state["issues"]["457"]
 
     # Force the identical drift conditions again after the redispatch.
-    with host_probe(alive=False):
+    with host_probe(monkeypatch, alive=False):
         _detect_and_handle_orphaned_workers(
             sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
         )
@@ -269,7 +271,7 @@ def test_orphaned_worker_drift_fingerprint_cleared_on_redispatch(
 
 
 def test_orphaned_worker_unreviewed_open_pr_pending_file_advances_to_pr_open(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     """Issue #1362 Stage 1 regression: a dead worker with an OPEN PR that has
     a *pending* placeholder ``review-decision.json`` (not a missing file, and
@@ -342,7 +344,7 @@ def test_orphaned_worker_unreviewed_open_pr_pending_file_advances_to_pr_open(
 
     fake_gh = FakeGitHubForOrphan()
 
-    with host_probe(alive=False):
+    with host_probe(monkeypatch, alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
@@ -371,7 +373,9 @@ def test_orphaned_worker_unreviewed_open_pr_pending_file_advances_to_pr_open(
     assert (1578, pr_open) in fake_gh.labels_added
 
 
-def test_orphaned_worker_unreviewed_open_pr_advances_to_pr_open(tmp_path: Path) -> None:
+def test_orphaned_worker_unreviewed_open_pr_advances_to_pr_open(
+    tmp_path: Path, monkeypatch
+) -> None:
     """Issue #1128: a dead worker with an OPEN, unreviewed PR (no decision)
     must be advanced from ``agent:in-progress`` to ``agent:pr-open`` so review
     dispatch can claim the salvage PR.  Before the fix this cell advanced no
@@ -432,7 +436,7 @@ def test_orphaned_worker_unreviewed_open_pr_advances_to_pr_open(tmp_path: Path) 
 
     fake_gh = FakeGitHubForOrphan()
 
-    with host_probe(alive=False):
+    with host_probe(monkeypatch, alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
@@ -470,7 +474,7 @@ def test_orphaned_worker_unreviewed_open_pr_advances_to_pr_open(tmp_path: Path) 
 
     # A second pass must not re-advance or re-emit (status is no longer
     # dispatched, so the sweep skips it entirely).
-    with host_probe(alive=False):
+    with host_probe(monkeypatch, alive=False):
         _detect_and_handle_orphaned_workers(
             sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
         )
@@ -481,7 +485,9 @@ def test_orphaned_worker_unreviewed_open_pr_advances_to_pr_open(tmp_path: Path) 
     assert len(advance_events) == 1, "advance must not be re-emitted on the second pass"
 
 
-def test_orphaned_worker_unreviewed_open_pr_credits_worker_death(tmp_path: Path) -> None:
+def test_orphaned_worker_unreviewed_open_pr_credits_worker_death(
+    tmp_path: Path, monkeypatch
+) -> None:
     """Job-cannon #1320: before this fix, the #1128 advance-to-pr-open lane
     was the one dead-worker branch (of four across this file and
     ``dead_worker_reap.py``) that never touched ``worker_death_at`` -- a
@@ -548,7 +554,7 @@ def test_orphaned_worker_unreviewed_open_pr_credits_worker_death(tmp_path: Path)
 
     fake_gh = FakeGitHubForOrphan()
 
-    with host_probe(alive=False):
+    with host_probe(monkeypatch, alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
@@ -584,7 +590,7 @@ def test_orphaned_worker_unreviewed_open_pr_credits_worker_death(tmp_path: Path)
 
 
 def test_orphaned_worker_unreviewed_open_pr_label_failure_falls_back_to_drift(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     """Issue #1128: when the label write fails, the sweep must keep the
     conservative drift behavior (stay ``dispatched``, emit drift once) so the
@@ -647,7 +653,7 @@ def test_orphaned_worker_unreviewed_open_pr_label_failure_falls_back_to_drift(
 
     fake_gh = FakeGitHubForOrphan()
 
-    with host_probe(alive=False):
+    with host_probe(monkeypatch, alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
@@ -676,7 +682,7 @@ def test_orphaned_worker_unreviewed_open_pr_label_failure_falls_back_to_drift(
 
 
 def test_orphaned_worker_unreviewed_pr_with_rework_status_advances_not_resets(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     """Issue #1128 rework after merge with #1109: an issue that could plausibly
     match both lanes -- ``last_decision`` is None (the #1128 condition) while
@@ -748,7 +754,7 @@ def test_orphaned_worker_unreviewed_pr_with_rework_status_advances_not_resets(
 
     fake_gh = FakeGitHubForOrphan()
 
-    with host_probe(alive=False):
+    with host_probe(monkeypatch, alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"

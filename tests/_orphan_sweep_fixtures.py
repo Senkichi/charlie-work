@@ -170,6 +170,7 @@ def _run_orphan_sweep(
     paths: Any,
     config: Any,
     fake_gh: Any,
+    monkeypatch,
     *,
     review_callback: Any = None,
     dry_run: bool = False,
@@ -180,7 +181,7 @@ def _run_orphan_sweep(
 
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
-    with host_probe(alive=False):
+    with host_probe(monkeypatch, alive=False):
         _detect_and_handle_orphaned_workers(
             sessions_dir,
             paths.state_file,

@@ -17,10 +17,12 @@ Namespace rule (#1627). Two kinds of name are reached through the
   ``_detect_and_handle_stalled_sessions``,
   ``_try_reap_blocked_foreign_writer`` -- must resolve
   through ``_wf.`` so ``patch("charlie_work.workflow.<name>")`` still bites.
-- **Defined in workflow.py.** ``_MergedPRListOutcome``,
-  ``_build_attention_digest``, ``_build_failure_map``, ``_label_error_reason``,
-  ``_recent_dispatch_failed_attempts`` live in ``workflow`` itself; reaching them
-  via ``_wf.`` avoids an import cycle and keeps a single definition site.
+- **Reached through workflow.py.** ``_build_attention_digest``,
+  ``_build_failure_map``, ``_label_error_reason`` and
+  ``_recent_dispatch_failed_attempts`` are defined in ``workflow`` itself;
+  ``_MergedPRListOutcome`` is a re-export (``backlog_reachability.py`` owns
+  the definition). Reaching all of them via ``_wf.`` avoids an import cycle
+  and keeps a single name site.
 
 The three state primitives ``load_state`` / ``save_state`` / ``append_event`` are
 also routed via ``_wf.`` (matching ``state_maintenance.py``). ``load_state`` in

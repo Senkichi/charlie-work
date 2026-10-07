@@ -307,7 +307,7 @@ def _charlie_work_gh(repo_root: Path) -> FakeGitHub:
 # ---------------------------------------------------------------------------
 
 
-def test_orphan_sweep_escalates_cross_repo_scoped_issue(tmp_path: Path) -> None:
+def test_orphan_sweep_escalates_cross_repo_scoped_issue(tmp_path: Path, monkeypatch) -> None:
     """The orphan-sweep no-PR path escalates a cross-repo-scoped issue to
     ``agent:human-needed`` (removing active labels, NOT adding
     ``automated-ready``) instead of redispatching.
@@ -355,7 +355,7 @@ def test_orphan_sweep_escalates_cross_repo_scoped_issue(tmp_path: Path) -> None:
     ]
     fake_gh.prs = []
 
-    with host_probe(alive=False):
+    with host_probe(monkeypatch, alive=False):
         _detect_and_handle_orphaned_workers(
             sessions_dir,
             paths.state_file,
