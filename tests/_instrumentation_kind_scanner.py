@@ -10,10 +10,17 @@ target for shared test helpers (see
 from __future__ import annotations
 
 import ast
+import inspect
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from charlie_work.instrumentation import _LEVEL_BY_KIND
+from charlie_work.instrumentation import log_event as _instrumentation_log_event
+from charlie_work.state import append_event as _state_append_event
+from charlie_work.workflow import OrchestratorApp
+from charlie_work.write_gate import WriteGate
 from _src_ast import parsed, source_files
 
 
@@ -254,23 +261,114 @@ def _has_explicit_level(
     return False
 
 
-def _locate_arg(node: ast.Call, position: int, keyword: str) -> ast.expr | None:
-    """Find an argument by position or by keyword name, whichever the call used.
+# ---------------------------------------------------------------------------
+# Issue #2481: the ``kind`` argument's positional slot belongs to the callee,
+# not the emit-call name
+#
+# The scanner used to read every emit call's kind from positional slot 1,
+# which only fits the ``instrumentation.log_event(state_path, kind, payload)``
+# shape. ``WriteGate.log_event(kind, payload)`` auto-binds ``state_path``, so
+# its kind sits at slot 0 -- a correct positional ``gate.log_event("x", {...})``
+# call had the payload dict quoted back as the "unresolved kind" and failed CI
+# on a bug that did not exist (PR #2458). The slot is now derived from the
+# callee's own signature via ``inspect``: whichever parameter is named ``kind``
+# (or ``event_kind`` for the ``_route_to_rework`` wrapper) determines the index,
+# so a future signature change moves the index with it instead of silently
+# re-breaking the read.
+# ---------------------------------------------------------------------------
 
-    A call that supplies the kind (or ``event_kind``) as a keyword argument
-    -- ``log_event(state_path, kind=k, payload=p)`` -- must not silently fall
-    through just because it doesn't match the common positional shape. That
-    is the same fail-open pattern #995 was filed against, one layer down: a
-    scanner that only recognizes the arity/shape it expects and drops
-    everything else. No call site in this package currently uses ``*args``
-    unpacking into these functions, so positional lookup by index is sound;
-    if that ever changes, the returned ``None`` correctly routes the site to
+# Emit-call name -> the module-level callable that name reaches.
+# ``record_event`` is deliberately absent: the only callable by that name is
+# ``WriteGate.record_event``, reached through a ``write_gate`` receiver. A bare
+# or non-gate ``record_event(...)`` has no known callee and surfaces as
+# unresolved rather than trusting a guessed slot.
+_EMIT_CALLEES: dict[str, Callable[..., Any]] = {
+    "log_event": _instrumentation_log_event,
+    "append_event": _state_append_event,
+    # ``OrchestratorApp`` methods read off the class so the scanned
+    # ``self._record_event``/``self._route_to_rework`` shapes resolve against
+    # the installed delegate -- importing the delegate submodule directly
+    # would trip workflow_delegation's partial-init guard.
+    "_record_event": OrchestratorApp._record_event,
+    "_route_to_rework": OrchestratorApp._route_to_rework,
+}
+
+# The parameter that carries the event kind on each emit callable.
+_KIND_PARAMS = {name: "kind" for name in _EMIT_FUNCS} | {"_route_to_rework": "event_kind"}
+
+
+def _is_write_gate_receiver(expr: ast.expr) -> bool:
+    """True when an attribute receiver denotes a ``WriteGate``.
+
+    Recognises ``write_gate``/``WriteGate`` as a bare name and any
+    ``<x>.write_gate`` attribute tail (``self.write_gate``, ``app.write_gate``,
+    ``ctx.write_gate``). A ``WriteGate`` bound to a differently-named variable
+    is not statically distinguishable from a module re-exporting ``log_event``;
+    its calls fall through to the module-level callee, and a kind read from the
+    wrong slot lands on the unresolved list (fail closed) rather than being
+    silently trusted.
+    """
+    if isinstance(expr, ast.Name):
+        return expr.id in {"write_gate", "WriteGate"}
+    return isinstance(expr, ast.Attribute) and expr.attr == "write_gate"
+
+
+def _emit_callee(node: ast.Call, func_name: str) -> Callable[..., Any] | None:
+    """The real callable an emit-site shape invokes, or ``None`` if unknown."""
+    func = node.func
+    if isinstance(func, ast.Attribute) and _is_write_gate_receiver(func.value):
+        return getattr(WriteGate, func_name, None)
+    return _EMIT_CALLEES.get(func_name)
+
+
+def _kind_param_index(func: Callable[..., Any], param: str) -> int | None:
+    """Positional-call index of ``param`` in ``func``'s signature, or ``None``.
+
+    ``func`` is inspected unbound, so a leading ``self`` is dropped: scanned
+    call sites use bound-call syntax (``self._record_event(...)``,
+    ``gate.log_event(...)``) where ``self`` is never passed positionally.
+    ``None`` means the signature could not be inspected or has no positional
+    parameter named ``param`` (e.g. a hypothetical keyword-only ``kind``).
+    """
+    try:
+        parameters = inspect.signature(func).parameters.values()
+    except (TypeError, ValueError):
+        return None
+    positional = [
+        p.name
+        for p in parameters
+        if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    ]
+    if positional and positional[0] == "self":
+        positional.pop(0)
+    try:
+        return positional.index(param)
+    except ValueError:
+        return None
+
+
+def _emit_kind_arg(node: ast.Call, func_name: str) -> ast.expr | None:
+    """Locate the emit call's kind argument against the callee's signature.
+
+    Positional first, keyword second -- the same precedence the old fixed-slot
+    lookup had -- but the index is the callee's own ``kind`` (or ``event_kind``)
+    parameter position, derived by ``_kind_param_index``. A keyword ``kind=``
+    is unambiguous whichever callee the shape resolves to, so it is still
+    consulted when the positional slot is absent or the callee is unknown.
+    A call supplying neither returns ``None``, which ``_record_kind_site``
+    records as an unresolved site. No call site in this package uses ``*args``
+    unpacking into these functions; if that ever changes, the starred
+    expression itself fails to resolve and correctly routes the site to
     "unresolved" rather than silently skipping it.
     """
-    if len(node.args) > position:
-        return node.args[position]
+    param = _KIND_PARAMS[func_name]
+    callee = _emit_callee(node, func_name)
+    if callee is not None:
+        index = _kind_param_index(callee, param)
+        if index is not None and len(node.args) > index:
+            return node.args[index]
     for kw in node.keywords:
-        if kw.arg == keyword:
+        if kw.arg == param:
             return kw.value
     return None
 
@@ -328,7 +426,7 @@ def _scan_node(
         func_name = _emit_func_name(node)
         if func_name in _EMIT_FUNCS:
             if not _has_explicit_level(node, local_assigns, module_constants, local_params):
-                kind_node = _locate_arg(node, 1, "kind")
+                kind_node = _emit_kind_arg(node, func_name)
                 _record_kind_site(
                     kind_node,
                     node,
@@ -340,8 +438,8 @@ def _scan_node(
                     used,
                     unresolved,
                 )
-        elif func_name == "_route_to_rework":
-            kind_node = _locate_arg(node, 4, "event_kind")
+        elif func_name in _WRAPPER_FUNCS:
+            kind_node = _emit_kind_arg(node, func_name)
             _record_kind_site(
                 kind_node,
                 node,

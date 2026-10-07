@@ -3,22 +3,17 @@
    - copy buttons (clipboard API, textarea fallback, polite live announcement)
    - theme toggle: system -> light -> dark, stored under 'cw-dash-theme'
    - <time class="js-local">: re-rendered as local HH:MM:SS
-   - keys: g <view> (via the nav's data-go links), '/' filter, j/k select, Enter open,
-     c copy, '?' help
+   - keys: g <view> (via the nav's data-go links), '?' help (the Now list keys live in now.js)
    - staleness: no successful swap for 2x the poll interval => "Not updating" banner in
      #client-status + html.is-stale (muted numbers); cleared by the next success
    - server banners ([data-alert]) are announced once, when their set changes
    Key and click handling is delegated on document, so an htmx swap of #now needs no
-   re-binding; the afterSwap hook only restores selection (by row id), filter and labels. */
+   re-binding; the afterSwap hook only restores labels. */
 (function () {
   "use strict";
 
   var THEME_KEY = "cw-dash-theme";
   var THEMES = ["system", "light", "dark"];
-  var reduceMotion = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-  var selectedId = null;
-  var filterText = "";
-  var expanded = {}; /* group slug -> true once "+N more" was opened (survives swaps) */
   var pendingG = false;
   var live = null;
   var lastOk = Date.now();
@@ -121,80 +116,6 @@
     announce("Theme " + next);
   }
 
-  /* ---- needs-me rows: selection and filter ---- */
-  function allRows() { return Array.prototype.slice.call(document.querySelectorAll("#needs-list .row")); }
-  function visibleRows() {
-    return allRows().filter(function (r) { return !r.hidden && r.getClientRects().length > 0; });
-  }
-
-  function applyExpanded() {
-    var items = document.querySelectorAll("#needs-list > [data-grp]");
-    for (var i = 0; i < items.length; i++) {
-      var li = items[i], open = !!expanded[li.getAttribute("data-grp")];
-      if (li.classList.contains("row")) { li.classList.toggle("is-open", open); }
-      var b = li.querySelector(".more-btn");
-      if (b) {
-        b.setAttribute("aria-expanded", open ? "true" : "false");
-        b.textContent = open ? "show fewer" : "+" + b.getAttribute("data-more") + " more";
-      }
-    }
-  }
-
-  function paintSelection() {
-    var rows = allRows();
-    for (var i = 0; i < rows.length; i++) {
-      var on = rows[i].id === selectedId;
-      rows[i].classList.toggle("is-sel", on);
-      if (on) { rows[i].setAttribute("aria-current", "true"); }
-      else { rows[i].removeAttribute("aria-current"); }
-    }
-  }
-
-  function select(row) {
-    selectedId = row ? row.id : null;
-    paintSelection();
-    if (row && row.scrollIntoView) {
-      row.scrollIntoView({ block: "nearest", behavior: reduceMotion ? "auto" : "smooth" });
-    }
-  }
-
-  function applyFilter() {
-    var q = filterText.trim().toLowerCase();
-    var list = document.getElementById("needs-list");
-    if (list) { list.classList.toggle("is-filtering", !!q); }
-    var items = document.querySelectorAll("#needs-list > li");
-    var groupHead = null, groupHasRow = false;
-    var closeGroup = function () { if (groupHead) { groupHead.hidden = !!q && !groupHasRow; } };
-    for (var i = 0; i < items.length; i++) {
-      var li = items[i];
-      if (li.classList.contains("grp")) {
-        closeGroup();
-        groupHead = li; groupHasRow = false;
-      } else if (li.classList.contains("row")) {
-        var repo = (li.querySelector(".repo") || {}).title || "";
-        var hit = !q || li.textContent.toLowerCase().indexOf(q) !== -1 ||
-          repo.toLowerCase().indexOf(q) !== -1;
-        li.hidden = !hit;
-        if (hit) { groupHasRow = true; }
-      }
-    }
-    closeGroup();
-    var sel = selectedId && document.getElementById(selectedId);
-    if (sel && (sel.hidden || !sel.getClientRects().length)) { select(null); }
-  }
-
-  function move(delta) {
-    var rows = visibleRows();
-    if (!rows.length) { return; }
-    var i = -1;
-    for (var k = 0; k < rows.length; k++) { if (rows[k].id === selectedId) { i = k; } }
-    var next = i === -1 ? (delta > 0 ? 0 : rows.length - 1)
-                        : Math.max(0, Math.min(rows.length - 1, i + delta));
-    select(rows[next]);
-  }
-
-  function selectedRow() { return selectedId ? document.getElementById(selectedId) : null; }
-
   function toggleHelp(force) {
     var p = document.getElementById("keyhelp");
     if (!p) { return; }
@@ -258,36 +179,13 @@
     var b = t.closest("button[data-copy]");
     if (b) { copy(b); return; }
     if (t.closest("#theme-toggle")) { cycleTheme(); return; }
-    var more = t.closest(".more-btn");
-    if (more) {
-      var g = more.getAttribute("data-grp");
-      expanded[g] = !expanded[g];
-      applyExpanded();
-      applyFilter();
-      return;
-    }
-    var row = t.closest("#needs-list .row");
-    if (row && !t.closest("a, button")) { select(row); }
-  });
-
-  document.addEventListener("input", function (e) {
-    if (e.target && e.target.id === "needs-filter") {
-      filterText = e.target.value;
-      applyFilter();
-    }
   });
 
   document.addEventListener("keydown", function (e) {
     var t = e.target;
     var typing = t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" ||
       t.tagName === "SELECT" || t.isContentEditable);
-    if (typing) {
-      if (e.key === "Escape" && t.id === "needs-filter") {
-        t.value = ""; filterText = ""; applyFilter(); t.blur();
-      }
-      return;
-    }
-    if (e.ctrlKey || e.metaKey || e.altKey) { return; }
+    if (typing || e.ctrlKey || e.metaKey || e.altKey) { return; }
     if (pendingG) {
       pendingG = false;
       var view = /^[a-z]$/.test(e.key) && document.querySelector('nav.views a[data-go="' + e.key + '"]');
@@ -296,22 +194,6 @@
     }
     switch (e.key) {
       case "g": pendingG = true; setTimeout(function () { pendingG = false; }, 1500); break;
-      case "/":
-        var f = document.getElementById("needs-filter");
-        if (f) { f.focus(); f.select(); e.preventDefault(); }
-        break;
-      case "j": move(1); e.preventDefault(); break;
-      case "k": move(-1); e.preventDefault(); break;
-      case "Enter":
-        var r = selectedRow();
-        var a = r && r.querySelector(".why a");
-        if (a && !(t && t.closest && t.closest("a, button"))) { location.href = a.href; e.preventDefault(); }
-        break;
-      case "c":
-        var sr = selectedRow();
-        var cb = sr && sr.querySelector("button[data-copy]");
-        if (cb) { copy(cb); }
-        break;
       case "?": toggleHelp(); e.preventDefault(); break;
       case "Escape": toggleHelp(false); break;
       default: break;
@@ -320,11 +202,6 @@
 
   /* ---- (re)apply state: first load and after every htmx swap ---- */
   function restore() {
-    var f = document.getElementById("needs-filter");
-    if (f && f.value !== filterText) { f.value = filterText; }
-    applyExpanded();
-    applyFilter();
-    paintSelection();
     syncThemeButton(storedTheme());
     localise(document);
   }

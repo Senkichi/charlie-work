@@ -249,6 +249,27 @@ def eval_ci_headroom_unavailable(
     return ok_finding(check, slug, facts)
 
 
+def eval_mergequeue_stalled(
+    slug: str, rows: Sequence[tuple[str, str]], baseline: datetime
+) -> Finding:
+    """``rows`` = ``(ts, payload_json)`` of ``mergequeue_stalled`` (one per queue episode)."""
+    check = f"mergequeue_stalled {slug}"
+    new = new_event_rows(rows, baseline)
+    prs: set[int] = set()
+    for _ts, payload_json in new:
+        payload = _payload_dict(payload_json)
+        number = payload.get("pr_number") if payload is not None else None
+        if isinstance(number, int) and not isinstance(number, bool):
+            prs.add(number)
+    facts = f"stalled_rows={len(rows)} new_since_last_beat={len(new)}"
+    if not new:
+        return ok_finding(check, slug, facts)
+    detail = f"{len(new)} PR(s) queued past the stall threshold since last beat"
+    if prs:
+        detail += f": PR(s) {sorted(prs)}"
+    return Finding(check, slug, "warn", f"{detail} ({facts})", facts)
+
+
 def eval_local_lane_stalled(
     slug: str, rows: Sequence[tuple[str, str]], baseline: datetime
 ) -> Finding:

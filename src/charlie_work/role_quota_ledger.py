@@ -181,9 +181,9 @@ def sidecar_path_for(sessions_dir: Path, harness: str, number: int) -> Path | No
         from . import devin_shell
 
         return devin_shell._sidecar_path(sessions_dir, number)
-    if capabilities.adapter_kind in ("claude-code", "api"):
-        from . import claude_code
+    from . import claude_code
 
+    if capabilities.adapter_kind in claude_code.CLAUDE_RECORD_KINDS:
         return claude_code._sidecar_path(sessions_dir, number, capabilities.adapter_kind)
     return None
 

@@ -151,9 +151,9 @@ def reap_reviews(self, limit: int | None = None) -> CommandResult:
             result = self.dispatch_reviews(limit, now=resolved_now)
         finally:
             lock.release()
-        # ``kind=`` by keyword: the event-kind scanner reads positional arg 1
-        # as the kind (the ``log_event(state_path, kind, ...)`` shape), so a
-        # positional kind here would leave the payload dict unresolved.
+        # ``kind=`` by keyword for readability; the event-kind scanner
+        # derives the kind slot from the callee's signature (#2481), so
+        # either spelling resolves.
         self.write_gate.log_event(
             kind="review_reap_invoked",
             payload={
@@ -173,8 +173,7 @@ def reap_reviews(self, limit: int | None = None) -> CommandResult:
     sweep = self._run_review_reap_sweeps(resolved_now)
     verdict_result = sweep["verdict_result"]
     stalled = sweep["stalled"]
-    # Same keyword-kind shape as the lock-free branch above — see that call
-    # site for why ``kind`` must not be positional.
+    # Same keyword-kind shape as the lock-free branch above.
     self.write_gate.log_event(
         kind="review_reap_invoked",
         payload={

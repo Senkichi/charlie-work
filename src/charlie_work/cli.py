@@ -17,6 +17,7 @@ from .closing_keyword_gate_command import (
     run_closing_keyword_check_command,
 )
 from .mojibake_gate import find_mojibake_in_diff
+from .wait_pr import register_wait_pr_subparser, run_wait_pr_command
 from .ast_equivalence_gate_command import (
     register_ast_equivalence_check_subparser,
     run_ast_equivalence_check_command,
@@ -583,6 +584,7 @@ def build_parser() -> argparse.ArgumentParser:
     register_collect_only_check_subparser(subparsers)
     register_junit_recorded_check_subparser(subparsers)
     register_experiment_report_subparser(subparsers)
+    register_wait_pr_subparser(subparsers)
 
     migrate_parser = subparsers.add_parser(
         "migrate-state-dir",
@@ -2637,6 +2639,8 @@ def main(argv: list[str] | None = None) -> int:
             result = run_junit_recorded_check_command(args)
         elif args.command == "experiment-report":
             result = run_experiment_report_command(args)
+        elif args.command == "wait-pr":
+            result = run_wait_pr_command(args)
         else:
             app = build_app(args)
             result = run_command(app, args)
@@ -2840,8 +2844,14 @@ def main(argv: list[str] | None = None) -> int:
                     print("  Errors:")
                     for error in errors:
                         print(f"    {error}")
+    elif args.command == "wait-pr" and not args.json_output:
+        print(result.message)
     else:
         print_result(result, json_output=args.json_output)
+
+    # #2444: wait-pr distinguishes failed (1) from timeout (2); ok alone can't.
+    if isinstance(result.data, dict) and "wait_pr_exit_code" in result.data:
+        return int(result.data["wait_pr_exit_code"])
 
     # #862: a supervisor exit that asked to be replaced must be distinguishable
     # from a deliberate stop, so the wrapper relaunches on the former and not

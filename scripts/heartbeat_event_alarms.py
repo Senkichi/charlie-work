@@ -282,6 +282,10 @@ def check_ci_headroom_unavailable(report: Report, repo: RepoInfo, baseline: date
 # against any installed package version.
 LOCAL_LANE_KILL_SWITCH_STALLED = "local_lane_kill_switch_stalled"
 
+# Issue #2441: emitted once per episode of a PR sitting in the merge queue past
+# the stall threshold. Literal declared here for the same reason as above.
+MERGEQUEUE_STALLED = "mergequeue_stalled"
+
 
 def check_local_lane_kill_switch_stalled(
     report: Report, repo: RepoInfo, baseline: datetime
@@ -297,4 +301,18 @@ def check_local_lane_kill_switch_stalled(
         "cannot check",
         [("SELECT ts, payload FROM events WHERE kind = ?", (LOCAL_LANE_KILL_SWITCH_STALLED,))],
         lambda rows: _ha.eval_local_lane_stalled(repo.slug, rows, baseline),
+    )
+
+
+def check_mergequeue_stalled(report: Report, repo: RepoInfo, baseline: datetime) -> None:
+    """Surface ``mergequeue_stalled`` events as WARN (#2441): a PR has carried the
+    merge-queue label past the stall threshold without merging. Forwards the
+    event detail only. Verdict: ``heartbeat_alarms.eval_mergequeue_stalled``."""
+    _run(
+        report,
+        repo,
+        "mergequeue_stalled",
+        "cannot check",
+        [("SELECT ts, payload FROM events WHERE kind = ?", (MERGEQUEUE_STALLED,))],
+        lambda rows: _ha.eval_mergequeue_stalled(repo.slug, rows, baseline),
     )

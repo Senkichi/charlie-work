@@ -67,6 +67,7 @@ check_infra_blocked_events = _event_alarms.check_infra_blocked_events
 check_draft_pr_blocked_events = _event_alarms.check_draft_pr_blocked_events
 check_ci_headroom_unavailable = _event_alarms.check_ci_headroom_unavailable
 check_local_lane_kill_switch_stalled = _event_alarms.check_local_lane_kill_switch_stalled
+check_mergequeue_stalled = _event_alarms.check_mergequeue_stalled
 
 # Issue #1476: the config + worktree-path resolution helpers
 # (``load_orchestrator_config``, ``_slugify_branch``,
@@ -2489,6 +2490,7 @@ def main() -> int:
         check_draft_pr_blocked_events(report, repo, baseline)
         check_ci_headroom_unavailable(report, repo, baseline)
         check_local_lane_kill_switch_stalled(report, repo, baseline)
+        check_mergequeue_stalled(report, repo, baseline)
         check_log_freshness(report, repo, now=now)
         check_loop_pass_freshness(report, repo, now=now)
         check_merge_flow(report, repo, prev_repo_state, new_repo_state, skip_delta)

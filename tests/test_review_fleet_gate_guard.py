@@ -15,7 +15,7 @@ import ast
 from pathlib import Path
 
 import charlie_work
-from _src_ast import parsed, source_files
+from _src_ast import parsed, source_files, source_text
 
 PACKAGE_ROOT = Path(charlie_work.__file__).resolve().parent
 LAUNCH_TABLE = "_REVIEW_LAUNCHERS"
@@ -56,6 +56,9 @@ def _launch_sites() -> list[tuple[str, str, set[str]]]:
     sites: list[tuple[str, str, set[str]]] = []
     for path in source_files(PACKAGE_ROOT):
         if path == PORT_MODULE:
+            continue
+        text = source_text(path)
+        if LAUNCH_TABLE not in text and PORT_CALL not in text:
             continue
         tree = parsed(path)
         for node in ast.walk(tree):

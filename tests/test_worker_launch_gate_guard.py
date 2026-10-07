@@ -8,10 +8,9 @@ directly, bypassing the port (issue #2229) -- skips every limit: the #2039
 defect shape, where the local rework lane launched Devin workers uncounted
 against the fleet cap. This scan fails CI on any new reference.
 
-Nothing is listed by hand: the allowed caller, the port's Real binding, the
-definition site, and the re-export site are all derived from the live
-objects, and the scanned set is every ``.py`` under the ``charlie_work``
-package.
+Nothing is listed by hand: the allowed caller, the port's Real binding, and
+the definition site are all derived from the live objects, and the scanned
+set is every ``.py`` under the ``charlie_work`` package.
 """
 
 from __future__ import annotations
@@ -22,7 +21,6 @@ from pathlib import Path
 
 import charlie_work
 import charlie_work.adapters as adapters
-import charlie_work.workflow as workflow
 from charlie_work.host import RealWorkerLauncher
 from charlie_work.worker_launch_gate import _launch_workers
 from _src_ast import parsed, source_files
@@ -107,14 +105,10 @@ def _allowed() -> set[tuple[str, str]]:
     # The one launch point, derived from the function object itself: the gate
     # may still reach ``dispatch_sessions`` directly if it ever needs to.
     allowed = {(_launch_workers.__module__, _launch_workers.__qualname__)}
-    # The port's Real binds ``workflow.dispatch_sessions`` at call time so
-    # patches on that name keep intercepting (issue #2229).
+    # The port's Real resolves ``adapters.dispatch_sessions`` at call time so
+    # patches on that name keep intercepting (issues #2229, #2235).
     real_launch = RealWorkerLauncher.launch
     allowed.add((inspect.getmodule(real_launch).__name__, real_launch.__qualname__))
-    # The workflow module's deliberate re-export (the name every test fake
-    # patches) -- a module-level import, derived by identity, not by name.
-    assert workflow.dispatch_sessions is adapters.dispatch_sessions
-    allowed.add((workflow.__name__, "<module>"))
     return allowed
 
 

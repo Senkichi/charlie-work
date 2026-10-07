@@ -23,7 +23,7 @@ import logging
 import os
 import subprocess
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -223,7 +223,14 @@ class ClaudeWorkerRecord:
 _ADAPTER_SIDECAR_SUFFIXES: dict[str, str] = {
     "claude-code": "claude",
     "api": "api",
+    "opencode": "opencode",
 }
+
+# Adapter kinds whose sessions are ``ClaudeWorkerRecord`` sidecars written by
+# ``launch_claude_worker``. Callers branch on membership here -- never on a
+# hand-written ``("claude-code", "api")`` tuple -- so a new kind sharing this
+# record shape is picked up everywhere by adding one suffix above.
+CLAUDE_RECORD_KINDS: frozenset[str] = frozenset(_ADAPTER_SIDECAR_SUFFIXES)
 
 
 def _sidecar_suffix(adapter_kind: str) -> str:
@@ -891,6 +898,7 @@ def launch_claude_worker(
     resolved_review_effort: str | None = None,
     model_override: str | None = None,
     max_turns_override: int | None = None,
+    cli_pins: Callable[[tuple[str, ...]], tuple[str, ...]] | None = None,
 ) -> ClaudeWorkerRecord:
     """Create an isolated worktree/checkout and launch a headless Claude Code
     worker (or reviewer) in it.
@@ -961,6 +969,10 @@ def launch_claude_worker(
     whatever ambient CLI/global state happens to be active for this
     headless process, exactly the failure this pin exists to prevent.
 
+    ``cli_pins`` replaces the Claude ``--model``/``--effort`` pins with the
+    caller's own (``opencode_worker`` pins ``--model provider/model``); the
+    caller then owns the never-empty-model guarantee for its CLI.
+
     ``max_turns_override``, when provided on a ``review=True`` launch, is
     pinned as the ``--max-turns`` value instead of
     ``resolved_config.review_dispatch.review_max_turns``. Issue #1439: the
@@ -1018,7 +1030,13 @@ def launch_claude_worker(
     # path computation (no event is written on the success path).
     launch_state_path = launch_events.state_path_for(repo_root, resolved_config)
     launch_role = "reviewer" if review else "worker"
-    command_template = _apply_model_pin(command_template, pinned_model)
+    # A non-Claude CLI sharing this launch path (opencode_worker) supplies its
+    # own flag pins; the Claude --model/--effort pins below would be invalid
+    # argv for it. ``cli_pins`` is worker-only (never combined with review).
+    if cli_pins is not None:
+        command_template = cli_pins(command_template)
+    else:
+        command_template = _apply_model_pin(command_template, pinned_model)
     # Reviewer sessions may pin their own effort independently of worker
     # effort (empty string means fall back to claude_code.effort), optionally
     # split into a per-PR randomized treatment/control experiment — see
@@ -1037,7 +1055,8 @@ def launch_claude_worker(
         )
     else:
         effort = resolved_config.claude_code.effort
-    command_template = _apply_effort_pin(command_template, effort)
+    if cli_pins is None:
+        command_template = _apply_effort_pin(command_template, effort)
     if review:
         # Cap agentic turns for reviewer sessions to prevent unbounded
         # codebase exploration and runaway token spend. 0 = unlimited.

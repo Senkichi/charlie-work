@@ -942,14 +942,9 @@ fleet_supervisor:
   dependency_sync_starvation_seconds: 14400
 ```
 
-During the migration window the legacy `supervisor.<key>` spellings still
-parse in *either* layer — emitting `config_key_deprecated_read`, removal
-tracked by #1979. Each layer resolves `fleet_supervisor` > `supervisor`
-before the repo-over-global merge: both spellings disagreeing inside one
-file is a `ConfigError` naming both, while a repo layer's leftover
-`supervisor.<key>` that disagrees with the global `fleet_supervisor.<key>`
-simply wins that key (the ordinary repo-wins rule) — deterministic, and
-visible in the deprecation events until the legacy key is deleted.
+Issue #1979 removed the migration window's legacy `supervisor.<key>`
+fallback: a moved key still written under `supervisor:` — in any layer —
+is now an ordinary unknown-key `ConfigError`.
 
 ### Detection latency
 

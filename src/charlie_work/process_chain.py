@@ -70,6 +70,101 @@ def proc_rows(processes: Iterable[_ProcessRowSource]) -> dict[int, ProcRow]:
     return {proc.pid: ProcRow(ppid=proc.ppid, created=proc.created) for proc in processes}
 
 
+def _bulk_ppid_map() -> dict[int, int]:
+    """One-shot ``pid -> ppid`` table -- the same C call ``Process.ppid()`` wraps.
+
+    On Windows ``_pswindows.Process.ppid`` is ``ppid_map()[self.pid]``: asking
+    ``process_iter`` for a ``ppid`` column rebuilds the kernel's whole process
+    table once *per row* -- O(n^2), ~4 s at ~470 processes on a busy host,
+    paid by every ``kill_process_tree`` / ``kill_orphan_pid`` ancestor guard
+    (issue #2353). psutil ships the bulk map on its private platform module
+    for ``Process.children()``'s own use; taking it once is a single C call.
+
+    A platform build without it (Windows always ships it) degrades to the
+    per-row ``ppid`` read -- the O(n^2) shape this helper exists to remove,
+    kept only so a hypothetical port stays correct rather than crashing.
+    """
+    platform = getattr(psutil, "_psplatform", None)
+    bulk = getattr(platform, "ppid_map", None)
+    if bulk is not None:
+        return {int(pid): int(ppid) for pid, ppid in bulk().items()}
+    rows: dict[int, int] = {}
+    for proc in psutil.process_iter(["pid", "ppid"]):
+        info = proc.info
+        try:
+            rows[int(info["pid"])] = int(info.get("ppid") or 0)
+        except (KeyError, TypeError, ValueError):
+            continue
+    return rows
+
+
+def _optional_bulk_ppid_map() -> dict[int, int] | None:
+    """The one-shot ppid table where the platform ships it, else ``None``.
+
+    ``win32_ancestor_rows`` takes this once per walk: on Windows
+    ``Process.ppid()`` re-runs ``ppid_map()`` — a full
+    ``CreateToolhelp32Snapshot`` enumeration of every process on the box —
+    per call, so a per-hop ``ppid()`` is O(hops x host processes), paid by
+    every ``kill_process_tree``/``kill_orphan_pid`` ancestor guard (issue
+    #2362). Where no ``ppid_map`` exists (POSIX) ``Process.ppid()`` is
+    already a cheap per-process ``/proc`` read, and ``_bulk_ppid_map``'s
+    ``process_iter`` fallback would be the very host-wide enumeration the
+    chain-scoped walk exists to avoid — hence ``None``, not the fallback.
+    A failed table read degrades to the same ``None``: the per-hop
+    ``ppid()`` it falls back to wraps the same kernel call and will fail
+    identically on the first hop.
+    """
+    platform = getattr(psutil, "_psplatform", None)
+    if getattr(platform, "ppid_map", None) is None:
+        return None
+    try:
+        return _bulk_ppid_map()
+    except (psutil.Error, OSError):
+        return None
+
+
+def _bulk_create_time_map() -> dict[int, float | None] | None:
+    """``pid -> creation time`` for every process via ``cext.proc_times``.
+
+    Asking ``process_iter`` for a ``create_time`` column is cheap only
+    while every ``OpenProcess`` succeeds: psutil's ``Process.create_time``
+    answers ``AccessDenied`` with ``proc_info(pid)`` -- a full
+    ``NtQuerySystemInformation`` table walk *per denied process* (~1.7 ms
+    each, so the ~150-200 protected pids on a busy host turn a ~10 ms
+    snapshot into a ~1 s one; that is the cost issue #2372's ledger
+    report measured in
+    ``test_win32_process_ppid_snapshot_real_rows_carry_creation_times``).
+    ``cext.proc_times`` is the fast leg of that same call -- the one
+    ``Process.__init__``'s identity probe uses as
+    ``create_time(fast_only=True)`` -- returning
+    ``(user, kernel, create_time)`` in ~5 us per pid, so the whole table
+    costs single-digit milliseconds. A denied open (``PermissionError``)
+    keeps the row with a ``None`` stamp -- the snapshot's documented
+    unknown-stamp rule -- and a mid-scan exit (``ProcessLookupError``)
+    drops the row the same way ``process_iter`` removes a gone pid.
+
+    Returns ``None`` where the platform ships no ``cext.proc_times`` --
+    the snapshot's ``process_iter`` leg remains the correct (slower)
+    fallback there.
+    """
+    cext = getattr(getattr(psutil, "_psplatform", None), "cext", None)
+    proc_times = getattr(cext, "proc_times", None)
+    if proc_times is None:
+        return None
+    times: dict[int, float | None] = {}
+    for pid in psutil.pids():
+        try:
+            _user, _system, created = proc_times(pid)
+        except ProcessLookupError:
+            continue
+        except (psutil.Error, OSError):
+            stamp: float | None = None
+        else:
+            stamp = float(created) if isinstance(created, (int, float)) else None
+        times[int(pid)] = stamp
+    return times
+
+
 def win32_process_ppid_snapshot() -> dict[int, ProcRow]:
     """Snapshot ``pid -> (ppid, creation time)`` for every process via ``psutil``.
 
@@ -84,12 +179,18 @@ def win32_process_ppid_snapshot() -> dict[int, ProcRow]:
     ``DateTime`` built from local-time fields and can be off by an hour around
     a DST transition -- enough to make a real parent look *newer* than its
     child, stop the ancestor walk early, and unprotect a real ancestor (the
-    dangerous direction). ``psutil`` is a declared dependency; one
-    ``process_iter`` pass yields pid, ppid and create_time from the same
-    source, so the rows are mutually consistent, with no PowerShell spawn, no
-    JSON round-trip, and no 10s timeout to stall the kill path
-    (``kill_process_tree`` / ``kill_orphan_pid``). A process whose creation
-    time is unreadable (``AccessDenied`` -> ``None``) simply keeps its link.
+    dangerous direction). ``psutil`` is a declared dependency: the ppid column
+    comes from one bulk ``ppid_map`` call and the creation stamp from the
+    per-pid ``cext.proc_times`` table ``_bulk_create_time_map`` builds (the
+    ``process_iter`` ``create_time`` column pays a per-denied-process
+    ``NtQuerySystemInformation`` walk -- see that helper), so the gather is
+    rapid, with no
+    PowerShell spawn, no JSON round-trip, and no 10s timeout to stall the
+    kill path (``kill_process_tree`` / ``kill_orphan_pid``). A process whose
+    creation time is unreadable (``AccessDenied`` -> ``None``) simply keeps
+    its link, and a pid absent from the ppid map (exited mid-scan) keeps its
+    row with ``ppid=0`` -- the walk ends at it, which is correct for a pid
+    that can no longer be anything's parent.
 
     Returns ``{}`` on any failure (``psutil`` error, OS error). The caller
     degrades to the bare self-pid guard rather than disabling process reaping
@@ -98,17 +199,20 @@ def win32_process_ppid_snapshot() -> dict[int, ProcRow]:
     """
     ppid_by_pid: dict[int, ProcRow] = {}
     try:
-        for proc in psutil.process_iter(["pid", "ppid", "create_time"]):
-            info = proc.info
-            try:
-                pid = int(info["pid"])
-                ppid = int(info.get("ppid") or 0)
-            except (KeyError, TypeError, ValueError):
-                continue
-            created = info.get("create_time")
-            ppid_by_pid[pid] = ProcRow(
-                ppid, float(created) if isinstance(created, (int, float)) else None
-            )
+        ppids = _bulk_ppid_map()
+        created_by_pid = _bulk_create_time_map()
+        if created_by_pid is None:
+            created_by_pid = {}
+            for proc in psutil.process_iter(["pid", "create_time"]):
+                info = proc.info
+                try:
+                    pid = int(info["pid"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                created = info.get("create_time")
+                created_by_pid[pid] = float(created) if isinstance(created, (int, float)) else None
+        for pid, created in created_by_pid.items():
+            ppid_by_pid[pid] = ProcRow(int(ppids.get(pid) or 0), created)
     except (psutil.Error, OSError):
         logger.warning("psutil process snapshot failed", exc_info=True)
         return {}
@@ -119,19 +223,25 @@ def win32_ancestor_rows(pid: int, *, max_hops: int = MAX_CHAIN_HOPS) -> dict[int
     """``pid -> ProcRow`` for ``pid``'s own ancestor chain, gathered hop by hop.
 
     Same row shape as ``win32_process_ppid_snapshot``, but scoped to the one
-    chain a caller-side guard actually walks. Scope does not make a hop
-    cheap: on psutil 7.x ``Process.ppid()`` resolves through
+    chain a caller-side guard actually walks. Scope alone does not make a
+    hop cheap: on psutil 7.x ``Process.ppid()`` resolves through
     ``cext.ppid_map()`` — a full ``CreateToolhelp32Snapshot`` enumeration of
-    every process on the box — and ``Process()``'s identity probe pays an
-    ``OpenProcess``/``GetProcessTimes`` handle query whose result also
+    every process on the box — so asking it per hop is O(hops x host
+    processes), and chains are not shallow (a worker session sits ~20 hops
+    under uv/pytest/pwsh). The walk therefore takes the same one-shot bulk
+    table ``win32_process_ppid_snapshot`` uses — once per *walk* (issue
+    #2362) — leaving each hop to pay only ``Process()``'s
+    ``OpenProcess``/``GetProcessTimes`` identity probe, whose result also
     answers ``create_time()`` (a protected pid's failed open falls back to
-    a ``NtQuerySystemInformation`` scan). What scope buys is paying that
-    enumeration-plus-handle-open pair once per *ancestor* — a handful of
-    hops — instead of once per *process*: ``process_iter`` runs the same
-    pair for every pid on the host, so its cost grows with host occupancy
-    rather than chain depth — the seconds-level delay issue #2332 tracks,
-    paid by every ``kill_process_tree``/``kill_orphan_pid`` call through
-    ``orphan_sweep._self_ancestor_pids``.
+    a ``NtQuerySystemInformation`` scan). A pid absent from the table (born
+    mid-walk) or a platform with no bulk table falls back to the per-hop
+    ``ppid()`` read this replaces. Compared with ``process_iter`` — which
+    pays the enumeration-plus-handle-open pair once per *process*, growing
+    with host occupancy rather than chain depth — this keeps the
+    seconds-level delay issue #2332 tracked bounded per guard call: the
+    ``kill_process_tree``/``kill_orphan_pid`` ancestry check pays one
+    enumeration plus a handful of handle opens, not one enumeration per
+    hop or per host process.
 
     Recording rows without adjudicating keeps ``ancestor_chain_pids`` the
     sole owner of the termination rules: a parent created *after* its child
@@ -144,6 +254,10 @@ def win32_ancestor_rows(pid: int, *, max_hops: int = MAX_CHAIN_HOPS) -> dict[int
     Returns ``{}`` if ``pid``'s own row cannot be read — indistinguishable
     from a failed snapshot for the caller's degrade path.
     """
+    # The table is point-in-time and covers every process live when it was
+    # taken, so a map miss is a mid-walk spawn (or no bulk table at all) —
+    # exactly the cases the per-hop ``ppid()`` read still answers.
+    ppids = _optional_bulk_ppid_map()
     rows: dict[int, ProcRow] = {}
     current = pid
     for _ in range(max_hops):
@@ -151,7 +265,10 @@ def win32_ancestor_rows(pid: int, *, max_hops: int = MAX_CHAIN_HOPS) -> dict[int
             break
         try:
             proc = psutil.Process(current)
-            ppid = proc.ppid()
+            if ppids is not None and current in ppids:
+                ppid = ppids[current]
+            else:
+                ppid = proc.ppid()
         except (psutil.Error, OSError):
             break
         try:

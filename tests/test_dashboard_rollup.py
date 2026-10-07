@@ -18,9 +18,16 @@ from _dashboard_rollup_fixtures import (  # noqa: F401  (fleet is a pytest fixtu
     fleet,
 )
 
-from charlie_work.dashboard import history_data, rollup
-from charlie_work.dashboard.rollup_derive import reason_group
+from charlie_work import instrumentation
+from charlie_work.dashboard import history_data, metrics_coverage, rollup, sources
+from charlie_work.dashboard.rollup_derive import (
+    HANDLERS,
+    KNOWN_IGNORED,
+    is_classified,
+    reason_group,
+)
 from charlie_work.dashboard.rollup_schema import SCHEMA_VERSION
+from charlie_work.supervisor_lifecycle import write_supervisor_heartbeat
 
 
 def test_facts_exact_values(fleet) -> None:
@@ -471,3 +478,167 @@ def test_unclassified_kinds_survive_a_transient_source_error(fleet, caplog) -> N
     assert "not interpreted" not in caplog.text  # recovery is not a set change either
     stored = _all(fleet.db(), "SELECT value FROM meta WHERE key = 'unclassified_kinds'")
     assert json.loads(stored[0][0]) == {ALPHA: {"brand_new_unclassified_kind": 1}}
+
+
+# Issue #2459: the 25 kinds the live "not interpreted" warning listed on 2026-10-06.
+_ISSUE_2459_KINDS = (
+    "cross_family_regen_not_reached",
+    "cross_family_report_regen_exhausted",
+    "cross_family_report_regen_forced",
+    "cross_family_verdict_abandoned",
+    "cross_family_verdict_head_indeterminate",
+    "cross_family_verdict_unparseable",
+    "dead_dispatched_throttle_rearmed_sweep",
+    "dead_dispatched_worker_reaped_sweep",
+    "label_ensure_incomplete",
+    "label_ensure_ok",
+    "operator_local_park",
+    "operator_orphan_push_completed",
+    "operator_orphan_requeue",
+    "operator_probe_advanced",
+    "operator_queue_depth",
+    "operator_reviewer_quota_cleared",
+    "operator_rework_rearmed",
+    "operator_state_correction",
+    "orphaned_worker_recovered_sweep",
+    "review_packet_discarded_head_moved",
+    "rework_label_skipped_issue_closed",
+    "salvage_push_failed_sweep",
+    "session_failed_relabeled_sweep",
+    "unauthorized_merge_ack_revoked",
+    "worker_token_missing",
+)
+
+
+@pytest.mark.parametrize("kind", _ISSUE_2459_KINDS)
+def test_issue_2459_kind_is_classified(kind: str) -> None:
+    assert is_classified(kind)
+
+
+def test_ignored_sweep_variant_inherits_its_sibling_classification() -> None:
+    """A ``<kind>_sweep`` of an ignored kind is classified without its own entry."""
+    for base in (
+        "dead_dispatched_worker_reaped",
+        "salvage_push_failed",
+        "orphaned_worker_recovered",
+    ):
+        assert base in KNOWN_IGNORED
+        assert base + "_sweep" not in KNOWN_IGNORED
+        assert is_classified(base + "_sweep")
+        assert base + "_sweep" not in HANDLERS  # ignored, not silently handled
+
+
+def test_sweep_of_unknown_kind_stays_unclassified() -> None:
+    assert not is_classified("brand_new_unclassified_kind_sweep")
+    assert not is_classified("brand_new_unclassified_kind")
+
+
+def test_issue_2459_kinds_are_not_counted_unclassified_by_the_rollup(fleet) -> None:
+    for n, kind in enumerate(_ISSUE_2459_KINDS):
+        fleet.emit(fleet.alpha, f"2026-10-01T10:{n:02d}:00Z", kind, {"issue_numbers": [1]})
+    result = rollup.run_rollup(fleet.sources(), NOW)
+    assert result.errors == ()
+    assert {s.source: s for s in result.sources}[ALPHA].unclassified == {}
+
+
+def test_orchestrator_source_backfills_self_deploy_history(fleet, tmp_path) -> None:
+    """Issue #2475: a heartbeat-stamped checkout contributes its self_deploy_* events.
+
+    Deploys were frozen since 08-14 because the supervisor's deployment checkout
+    writes them to its own events.db, which no source read. The heartbeat's
+    ``orchestrator_root`` names that checkout; a fresh watermark then backfills
+    its entire history on first read (the 08-14 event is months before ``NOW``).
+    """
+    checkout = tmp_path / "daemon-checkout"
+    state_dir = checkout / ".var" / "charlie-work"
+    fleet.emit(
+        state_dir,
+        "2026-08-14T09:00:00Z",
+        "self_deploy_succeeded",
+        {"changed": True, "from_sha": "aaaa1111", "to_sha": "bbbb2222"},
+    )
+    fleet.emit(
+        state_dir,
+        "2026-08-15T09:30:00Z",
+        "self_deploy_failed",
+        {"changed": False, "error": "merge conflict"},
+    )
+    fleet.emit(
+        state_dir,
+        "2026-08-15T09:31:00Z",
+        "self_deploy_sync_starved",
+        {"pending": 3},  # bookkeeping kind: coverage only, no fact rows
+    )
+    instrumentation.close_db(state_dir / "state.json")
+    write_supervisor_heartbeat(fleet.fleet_state, {"orchestrator_root": str(checkout)})
+
+    result = rollup.run_rollup(fleet.sources(), NOW)
+
+    assert result.errors == ()
+    by = {s.source: s for s in result.sources}
+    assert by["orchestrator"].ingested == 2  # starved is KNOWN_IGNORED, not a fact
+    assert _all(
+        fleet.db(),
+        "SELECT source, ok, changed, from_sha, to_sha, error FROM deploys ORDER BY ts",
+    ) == [
+        ("orchestrator", 1, 1, "aaaa1111", "bbbb2222", None),
+        ("orchestrator", 0, 0, None, None, "merge conflict"),
+        (ALPHA, 1, 1, "32e8", "d6c3", None),
+    ]
+    # coverage is honest about everything in the source, including ignored kinds
+    assert _all(
+        fleet.db(),
+        "SELECT kind, n FROM coverage WHERE source = 'orchestrator' ORDER BY kind",
+    ) == [
+        ("*", 3),
+        ("self_deploy_failed", 1),
+        ("self_deploy_succeeded", 1),
+        ("self_deploy_sync_starved", 1),
+    ]
+
+
+def test_orchestrator_source_deduped_against_a_registered_repo(fleet, tmp_path) -> None:
+    """A supervisor running from a registered checkout adds no second source."""
+    write_supervisor_heartbeat(fleet.fleet_state, {"orchestrator_root": str(tmp_path / "alpha")})
+    resolved = fleet.sources()
+    assert resolved.orchestrator_events_db is None  # alpha's own events.db
+    result = rollup.run_rollup(resolved, NOW)
+    assert "orchestrator" not in {s.source for s in result.sources}
+    # alpha's self_deploy row is still present exactly once, under its repo key
+    assert _all(fleet.db(), "SELECT source FROM deploys") == [(ALPHA,)]
+
+
+def test_orchestrator_source_deduped_against_the_fleet_db(tmp_path) -> None:
+    """When the supervisor's state dir IS the fleet dir, its DB is already the
+    fleet source -- the orchestrator source must not double-read it."""
+    root = tmp_path / "checkout"
+    fleet_dir = root / ".var" / "charlie-work"
+    fleet_dir.mkdir(parents=True)
+    write_supervisor_heartbeat(
+        fleet_dir / sources.HEARTBEAT_FILENAME, {"orchestrator_root": str(root)}
+    )
+
+    resolved = rollup.rollup_sources(str(fleet_dir))
+
+    assert resolved.fleet_events_db == fleet_dir / "events.db"
+    assert resolved.orchestrator_events_db is None
+
+
+def test_orchestrator_source_excluded_from_repos_metric_scope(fleet, tmp_path) -> None:
+    """Issue #2475: the orchestrator source is not a registry repo; ``repos``
+    scopes must not count its activity as repository evidence."""
+    checkout = tmp_path / "daemon-checkout"
+    state_dir = checkout / ".var" / "charlie-work"
+    fleet.emit(state_dir, "2026-10-01T10:30:00Z", "self_deploy_succeeded", {"ok": True})
+    instrumentation.close_db(state_dir / "state.json")
+    write_supervisor_heartbeat(fleet.fleet_state, {"orchestrator_root": str(checkout)})
+    rollup.run_rollup(fleet.sources(), NOW)
+    db = fleet.db()
+
+    kinds = ("self_deploy_succeeded",)
+    assert set(metrics_coverage.load_coverage(db, kinds, "repos").spans) == {ALPHA}
+    assert set(metrics_coverage.load_coverage(db, kinds, "all").spans) == {
+        ALPHA,
+        "orchestrator",
+    }
+    assert metrics_coverage.load_coverage(db, kinds, "fleet").spans == {}

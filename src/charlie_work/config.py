@@ -101,20 +101,19 @@ from .deescalation_config import project_scoped_keys
 from .config_deprecations import emit_deprecated_key_reads, repo_state_path
 
 # Re-exported from the domain module (issue #1978) for the same reason
-# ``RunnerCapacityEscalationConfig`` is re-exported above: the dataclass and
-# its section parser live in their own module so new fleet-scoped knobs do
-# not land in this over-cap monolith (file-size ratchet, issue #1442);
-# ``config.py`` wires the dataclass into ``OrchestratorConfig`` and delegates
-# parsing (including the legacy ``supervisor.<key>`` fallback) to it.
+# ``RunnerCapacityEscalationConfig`` is re-exported above: the dataclass
+# lives in its own module so new fleet-scoped knobs do not land in this
+# over-cap monolith (file-size ratchet, issue #1442); ``config.py`` wires it
+# into ``OrchestratorConfig`` and the generic section loop validates it.
 from .test_slots import SlotPoolConfig  # noqa: F401  (deliberate re-export)
 from .dashboard.config import DashboardConfig  # noqa: F401  (deliberate re-export)
 from .fleet_supervisor_config import (  # noqa: F401  (deliberate re-export)
     FleetSupervisorConfig,
-    parse_fleet_supervisor,
 )
 
 from . import layout
 from .harnesses import REVIEWER_HARNESSES, WORKER_HARNESSES
+from .opencode_config import OpenCodeConfig
 from .role_chain import (
     RoleEntry,
     chain_of,
@@ -555,13 +554,6 @@ class DispatchConfig:
     # root merely waiting out a slow CI cycle or an overnight review is not
     # paged as stuck.
     dependency_stall_minutes: Annotated[int, Typed, NonNeg] = 1440
-    # Issue #1853: DEPRECATED no-op, kept only so existing config files that
-    # set it still parse. The worker-GitHub-token dispatch gate (issue #1001)
-    # was retired when the operator decided workers stay credential-free by
-    # design — PR mutations flow through ``.worker-outcome.json`` and the
-    # authenticated orchestrator applies them (see ``rework_outcome.py``).
-    # The staged-rollout plan this flag served (issue #1224) is superseded.
-    require_worker_github_token: Annotated[bool, Typed] = False
     # Issue #1944: on a repo with no remote, an agent branch whose commits are
     # unreachable from the default branch can never become "pushed" — there is
     # nowhere to push — so refusing to reset it escalates the issue on every
@@ -1406,6 +1398,9 @@ class RuntimeConfig:
         "usage quota has been exhausted",
         "quota exceeded",
         "usage limit",
+        # opencode run: OpenCode Go / Zen limit types (error JSON responseBody).
+        "GoUsageLimitError",
+        "FreeUsageLimitError",
     )
     # Bounded retry for transient GitHub API failures (TLS blips, connection
     # resets, gateway 5xx, secondary rate limits, etc.) in GitHub.run().
@@ -1462,6 +1457,17 @@ class RuntimeConfig:
     # verifies ``resources.graphql.remaining`` from ``gh api rate_limit`` is at
     # least this value. Set to 0 to disable the guard.
     graphql_rate_limit_threshold: Annotated[int, Typed, BoolTolerant, NonNeg] = 1500
+    # Issue #2442: the fleet-wide GraphQL budget governor. The threshold above
+    # is the first reserve (reconcile, drift, review reaps defer below it);
+    # dispatch scans and probes defer below ``graphql_scan_reserve``; everything
+    # but merge, label writes and the unauthorized-merge tripwire defers below
+    # ``graphql_floor_reserve``. ``github_budget_governor: false`` restores the
+    # per-client budget, plain retries and the single threshold.
+    graphql_scan_reserve: Annotated[int, Typed, BoolTolerant, NonNeg] = 800
+    graphql_floor_reserve: Annotated[int, Typed, BoolTolerant, NonNeg] = 300
+    github_budget_governor: Annotated[bool, Typed] = True
+    # Longest a call waits for a primary rate-limit reset before it is deferred.
+    gh_primary_limit_max_wait_seconds: Annotated[float, Typed, BoolTolerant, NonNeg] = 30.0
     # Bounded in-memory event ring for state.json. A larger cap costs only a
     # few hundred KB of JSON and preserves far more diagnostic history when a
     # single sweep emits repetitive events. Tuned via config (issue #525).
@@ -2302,10 +2308,9 @@ class SupervisorConfig:
     ``FleetSupervisorConfig`` under the ``fleet_supervisor:`` section. The
     four fields below are the ones both loops share -- ``run_supervised``
     (per-repo) and ``run_fleet_supervise`` (fleet) each poll, cool down, and
-    bound their own runtime on the same cadence knobs. A moved key still
-    written under ``supervisor:`` keeps working during the migration window
-    (``parse_fleet_supervisor`` honors it and ``DEPRECATED_CONFIG_KEYS``
-    reports the read); issue #1979 removes the legacy locations.
+    bound their own runtime on the same cadence knobs. Issue #1979 removed
+    the migration window's legacy fallback: a moved key still written under
+    ``supervisor:`` now fails validation as an ordinary unknown key.
     """
 
     poll_interval_seconds: Annotated[int, Typed, BoolTolerant] = 20
@@ -2497,6 +2502,7 @@ class OrchestratorConfig:
     devin: DevinConfig = field(default_factory=DevinConfig)
     claude_code: ClaudeCodeConfig = field(default_factory=ClaudeCodeConfig)
     api_worker: ApiWorkerConfig = field(default_factory=ApiWorkerConfig)
+    opencode: OpenCodeConfig = field(default_factory=OpenCodeConfig)
     rescue: RescueConfig = field(default_factory=RescueConfig)
     worker: Annotated[
         WorkerRoleConfig,
@@ -2702,19 +2708,10 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
     unknown = sorted(set(data) - known_sections)
     if unknown:
         raise unknown_sections_error(unknown, known_sections)
-    # Issue #1978: parse the fleet-scoped section BEFORE the loop reaches
-    # ``supervisor`` -- the parser pops the relocated keys out of
-    # ``data['supervisor']`` (the private deepcopy above, so the caller's dict
-    # is untouched) and applies the new-location > legacy > default precedence
-    # itself, raising ConfigError when both locations disagree.
-    prebuilt: dict[str, Any] = {"fleet_supervisor": parse_fleet_supervisor(data)}
     by_name = {spec.name: spec for spec in field_specs(OrchestratorConfig)}
     built: dict[str, Any] = {}
     for f in fields(OrchestratorConfig):
         if f.metadata.get("provenance"):
-            continue
-        if f.name in prebuilt:
-            built[f.name] = prebuilt[f.name]
             continue
         raw = _section(data, f.name)
         built[f.name] = validate_section(

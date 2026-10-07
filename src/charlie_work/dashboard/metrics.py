@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 from collections.abc import Callable
+from dataclasses import dataclass
 
 from . import metrics_capacity as cap
 from . import metrics_flow as flow
@@ -61,6 +62,83 @@ TABS: dict[str, dict[str, Metric]] = {
         "self_deploys": rel.self_deploys,
     },
 }
+
+
+UP_GOOD, DOWN_GOOD, NEUTRAL = 1, -1, 0
+# How a History card summarises a window, by series kind: a count is the window's total,
+# a duration the median of its samples, a ratio or a level the mean of its buckets.
+SUMMARY_BY_KIND: dict[str, str] = {
+    "count": "sum",
+    "duration": "median",
+    "ratio": "mean",
+    "gauge": "mean",
+}
+
+
+@dataclass(frozen=True)
+class Presentation:
+    """The presentation-only facts about one metric that its series cannot carry.
+
+    ``polarity`` is which direction is good (``UP_GOOD``/``DOWN_GOOD``) or ``NEUTRAL`` when
+    neither is (a cap, a level the operator sets); only a non-neutral metric can be
+    flagged as moving the wrong way. ``summary`` overrides ``SUMMARY_BY_KIND`` for a level
+    whose latest value matters more than its average (``"last"``).
+    """
+
+    name: str
+    polarity: int
+    summary: str | None = None
+
+
+_STAGE_NAMES = {
+    "in_progress": "Time in progress",
+    "pr_open": "Time at PR open",
+    "reviewing": "Time in review",
+    "needs_rework": "Time in rework",
+}
+
+# One row per metric id in ``TABS`` (tests/test_dashboard_history_model.py holds the two
+# in step): the plain name a card shows, which way is good, and any summary override.
+PRESENTATION: dict[str, Presentation] = {
+    "merges_per_day": Presentation("PRs merged", UP_GOOD),
+    "lead_time": Presentation("Lead time", DOWN_GOOD),
+    **{
+        f"stage_time.{s}": Presentation(_STAGE_NAMES.get(s, flow.STAGE_NAMES.get(s, s)), DOWN_GOOD)
+        for s in flow.STAGES
+    },
+    "wip": Presentation("Work in progress", NEUTRAL),
+    "queue_depth": Presentation("Queue depth", NEUTRAL, "last"),
+    "verdict_mix": Presentation("Review verdicts", UP_GOOD),
+    "rework_rate": Presentation("Rework rate", DOWN_GOOD),
+    "escalations": Presentation("Escalations", DOWN_GOOD),
+    "worker_fate": Presentation("Worker exits", NEUTRAL),
+    "salvage_share": Presentation("Salvage share", NEUTRAL),
+    "verdicts_missed": Presentation("Verdicts missed", DOWN_GOOD),
+    "workers_cap": Presentation("Worker cap", NEUTRAL, "last"),
+    "reviewers_live": Presentation("Reviewers live", NEUTRAL),
+    "reviewers_cap": Presentation("Reviewer cap", NEUTRAL, "last"),
+    "runners_running": Presentation("Runners running", NEUTRAL),
+    "runners_capacity": Presentation("Runner capacity", NEUTRAL),
+    "ci_queue_wait": Presentation("CI queue wait", DOWN_GOOD),
+    "capped_demand": Presentation("Capped demand", DOWN_GOOD),
+    "loop_pass_duration": Presentation("Loop pass time", DOWN_GOOD),
+    "loop_pass_errors": Presentation("Loop errors", DOWN_GOOD),
+    "launch_failures": Presentation("Launch failures", DOWN_GOOD),
+    "throttles": Presentation("Rate limits", DOWN_GOOD),
+    "self_deploys": Presentation("Self-deploys", NEUTRAL),
+}
+
+
+def presentation(metric_id: str, series: Series | None) -> Presentation:
+    """The metric's presentation with its summary resolved from the series kind.
+
+    A metric missing from ``PRESENTATION`` is shown under its series label, neutral (it is
+    never flagged on a guessed polarity)."""
+    got = PRESENTATION.get(metric_id) or Presentation(
+        (series.label or series.name) if series is not None else metric_id, NEUTRAL
+    )
+    kind = series.kind if series is not None else "gauge"
+    return Presentation(got.name, got.polarity, got.summary or SUMMARY_BY_KIND.get(kind, "mean"))
 
 
 def tab_results(

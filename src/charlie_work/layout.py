@@ -361,6 +361,7 @@ def worker_tmp_dir(target_path: Path) -> Path:
 GLOBAL_CONFIG_FILENAME = "config.yaml"
 FLEET_REGISTRY_FILENAME = "fleet.json"
 FLEET_LOCK_FILENAME = "fleet.lock"
+GITHUB_BUDGET_FILENAME = "github-budget.json"
 FLEET_LOCK_HOLDER_FILENAME = "fleet.lock.holder"
 FLEET_SUPERVISOR_LOCK_FILENAME = "fleet-supervisor.lock"
 FLEET_STOP_REQUEST_FILENAME = "fleet-stop-request.json"
@@ -421,6 +422,12 @@ def global_config_path(override: str | None = None) -> Path:
 def fleet_registry_path(override: str | None = None) -> Path:
     """Return the fleet registry (``fleet.json``) path in the fleet dir."""
     return fleet_dir(override=override) / FLEET_REGISTRY_FILENAME
+
+
+def github_budget_path(override: str | None = None) -> Path:
+    """The observed-GitHub-budget snapshot every client and process on this
+    host shares (issue #2442): a per-token rate-limit window, not per-repo state."""
+    return fleet_dir(override=override) / GITHUB_BUDGET_FILENAME
 
 
 def fleet_lock_path(override: str | None = None) -> Path:

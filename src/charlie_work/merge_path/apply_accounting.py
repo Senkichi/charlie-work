@@ -16,6 +16,7 @@ from ..write_gate import WriteGate, require_write_gate
 from .decide import decide_accounting, mergequeue_stamp_needs_now
 from .gather import persisted_from
 from .model import (
+    MERGEQUEUE_DWELL_FIELDS,
     Accounting,
     AccountingFacts,
     EffectResults,
@@ -84,9 +85,11 @@ def settle_accounting(
         if accounting.mergequeue_since is not None and accounting.mergequeue_head_sha is not None:
             prs_entry["mergequeue_since"] = accounting.mergequeue_since
             prs_entry["mergequeue_head_sha"] = accounting.mergequeue_head_sha
+            # #2440: every full pass re-proves the queued PR; the skip trusts it for 30 min.
+            prs_entry["mergequeue_checked_at"] = ports.utc_now()
         else:
-            prs_entry.pop("mergequeue_since", None)
-            prs_entry.pop("mergequeue_head_sha", None)
+            for field_name in MERGEQUEUE_DWELL_FIELDS:
+                prs_entry.pop(field_name, None)
         state["prs"][str(pr_number)] = prs_entry
         for spec in accounting.events:
             state = _record(write_gate, state, spec)

@@ -27,6 +27,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from datetime import datetime
+from functools import partial
 from typing import Any
 
 import charlie_work.workflow as _wf
@@ -40,6 +41,8 @@ from charlie_work.github import (
     is_transient_repo_resolution_failure,
 )
 from charlie_work.instrumentation import log_event
+from charlie_work.merge_path.queue_skip import merge_ready_unless_queued
+from charlie_work.mergequeue_stall import alarm_best_effort
 from charlie_work.notify import AttentionDigest, AttentionEntry
 from charlie_work.no_op_rework_body import _request_changes_body_drifted
 from charlie_work.pass_deadline import (
@@ -47,6 +50,7 @@ from charlie_work.pass_deadline import (
     PassDeadlineExceeded,
     run_deadline_guarded_maintenance,
 )
+from charlie_work.budget_gates import budget_gate_for
 from charlie_work.review_decision import review_decision
 
 
@@ -84,7 +88,7 @@ def _loop_body(
     # raising PassDeadlineExceeded). The full wiring policy -- what is
     # guarded, what stays unconditional, and the deferred-marking rule --
     # lives in charlie_work.pass_deadline's module docstring.
-    deadline = PassDeadline(deadline_exceeded, CommandResult)
+    deadline = PassDeadline(deadline_exceeded, CommandResult, budget_gate=budget_gate_for(self))
     early = deadline.preflight("loop pass deferred: in-pass deadline already reached")
     if early is not None:
         return early
@@ -317,6 +321,15 @@ def _loop_body(
     # so `_record_unlinked_pr_skips` can evict standing `unlinked_pr_notice`
     # markers whose PR is no longer issue-less (the falling edge).
     linked_prs: dict[int, int] = {}
+    # Merge-ready for one PR, skipping a queued PR whose hand-off still holds (#2440).
+    merge_queued_aware = partial(
+        merge_ready_unless_queued,
+        self,
+        merge=merge,
+        merge_train_head=merge_train_head,
+        errors=errors,
+        merges=merges,
+    )
     for pr in prs:
         # Issue #1948: stop the review/merge scan at the first PR after the
         # budget is spent -- the remaining PRs defer to the next pass
@@ -435,6 +448,7 @@ def _loop_body(
             # that's simply waiting on pending checks.
             state = _wf.load_state_locked(self.paths.state_file)
             pr_state = state["prs"].get(str(pr_number), {})
+            alarm_best_effort(self, pr, pr_state)  # #2441: never aborts the pass
             pr_dir_for_decision = self.paths.prs / f"pr-{pr_number}"
             live_head_sha = pr.get("headRefOid")
             # Issue #1362 Stage 1 (#1340 regression): the FILE is
@@ -467,10 +481,7 @@ def _loop_body(
                 # used to hand-roll.
                 head_matches = not resolved_decision.stale
                 if head_matches and is_merge_head:
-                    merge_result = self.merge_ready(
-                        pr_number, merge=merge, merge_train_head=merge_train_head
-                    )
-                    self._record_merge_or_error(merge_result, errors, merges)
+                    merge_queued_aware(pr, pr_state, issue_number)
                 elif not head_matches:
                     review = self.review(pr_number)
                     if self._record_review_or_error(review, errors, reviews):
@@ -483,10 +494,7 @@ def _loop_body(
                         and not post_review_decision.stale
                         and is_merge_head
                     ):
-                        merge_result = self.merge_ready(
-                            pr_number, merge=merge, merge_train_head=merge_train_head
-                        )
-                        self._record_merge_or_error(merge_result, errors, merges)
+                        merge_queued_aware(pr, pr_state, issue_number)
             else:
                 # Same-head packet skip: if we already have a review packet
                 # for this exact head SHA and no decision has been recorded
@@ -539,10 +547,7 @@ def _loop_body(
                         and not packet_skip_decision.stale
                         and is_merge_head
                     ):
-                        merge_result = self.merge_ready(
-                            pr_number, merge=merge, merge_train_head=merge_train_head
-                        )
-                        self._record_merge_or_error(merge_result, errors, merges)
+                        merge_queued_aware(pr, pr_state, issue_number)
                 else:
                     issue_state = (
                         state.get("issues", {}).get(str(issue_number), {})
@@ -578,10 +583,7 @@ def _loop_body(
                         continue
                     decision = self._review_decision(pr_number)
                     if decision.get("decision") == "approved" and is_merge_head:
-                        merge_result = self.merge_ready(
-                            pr_number, merge=merge, merge_train_head=merge_train_head
-                        )
-                        self._record_merge_or_error(merge_result, errors, merges)
+                        merge_queued_aware(pr, pr_state, issue_number)
         except PassDeadlineExceeded:
             # Issue #1948: budget spent mid-item -- latch it and stop the
             # scan. A refusal is NOT a GitHub failure: no github_error

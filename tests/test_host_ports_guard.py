@@ -20,10 +20,15 @@ adapter).  ``test_no_direct_is_pid_alive`` scans every file under
 ``src/charlie_work`` outside that two-file allowlist at baseline 0, so a
 reintroduced direct call fails here rather than regrowing silently.
 
-Both file scans are single aggregate tests rather than per-file
-parametrizations: a parametrized case per scanned path means deleting or
-renaming a module drops a parametrize id, which the collect-only gate reads
-as a removed test leaf (issue #2237).
+Both file scans stay parametrized per scanned path so their leaf names persist
+for the collect-only gate: deleting or renaming a scanned module drops a
+parametrize id, which the gate reads as a removed test leaf (issue #1538).
+The escape hatch is a skipped leaf with the retired id — see
+``_RETIRED_LIVENESS_MODULES`` below and ``_RETIRED_MODULES`` in
+test_sink_statuses_no_literal_pair.py — never an aggregate test, which would
+drop every per-path leaf at once.  A baseline file whose module left the scan
+is reported by ``test_no_orphaned_host_ports_baselines`` instead of silently
+rotting (issue #2237).
 """
 
 from __future__ import annotations
@@ -44,6 +49,18 @@ SCAN_TARGETS = ("workflow.py", "orchestration", "merge_path", "dead_worker_sweep
 # and the late-binding host adapter.  Every other consumer reads liveness
 # through ``host.current().probe`` / ``app.host.probe``.
 DIRECT_LIVENESS_ALLOWLIST = ("host/liveness.py", "process_utils.py")
+
+# Source modules deleted by issue #2479 (the History-redesign chart cleanup).
+# Their parametrize ids are kept as skipped leaves so the collect-only gate
+# sees no removed leaf -- same mechanism as ``_RETIRED_MODULES`` in
+# test_sink_statuses_no_literal_pair.py.
+_RETIRED_LIVENESS_MODULES = (
+    "dashboard/charts/bullet.py",
+    "dashboard/charts/line.py",
+    "dashboard/charts/model.py",
+    "dashboard/charts/multiples.py",
+    "dashboard/charts/strip.py",
+)
 
 # Dotted call names that bypass the host ports. ``is_pid_alive`` also matches
 # any ``*.is_pid_alive`` attribute call — either form bypasses the probe.
@@ -152,7 +169,8 @@ def _baseline_path(rel: str) -> Path:
 
 
 def _liveness_scan_files() -> list[Path]:
-    return [p for p in source_files(SRC) if _rel(p) not in DIRECT_LIVENESS_ALLOWLIST]
+    live = [p for p in source_files(SRC) if _rel(p) not in DIRECT_LIVENESS_ALLOWLIST]
+    return [*live, *(SRC / rel for rel in _RETIRED_LIVENESS_MODULES)]
 
 
 def test_counter_positive_control() -> None:
@@ -176,56 +194,58 @@ def test_scan_targets_exist() -> None:
     assert len(files) > 5 and all(f.exists() for f in files)
 
 
-def test_no_new_direct_host_reads() -> None:
-    """Ratchet per scanned file, asserted in one aggregate test.
+@pytest.mark.parametrize("path", _scan_files(), ids=_rel)
+def test_no_new_direct_host_reads(path: Path) -> None:
+    rel = _rel(path)
+    count = count_direct_host_reads(path.read_text(encoding="utf-8"))
+    baseline_file = _baseline_path(rel)
+    if os.environ.get("HOST_PORTS_GUARD_WRITE") == "1":
+        if count:
+            baseline_file.parent.mkdir(parents=True, exist_ok=True)
+            baseline_file.write_text(f"{count}\n", encoding="utf-8")
+        elif baseline_file.exists():
+            baseline_file.unlink()
+        return
+    baseline = (
+        int(baseline_file.read_text(encoding="utf-8").strip()) if baseline_file.exists() else 0
+    )
+    assert count <= baseline, (
+        f"{rel}: {count} direct datetime.now/time.monotonic/time.time/"
+        f"is_pid_alive call(s), baseline {baseline}. Read time and liveness "
+        "through host.current() / app.host instead."
+    )
+    assert count >= baseline, (
+        f"{rel}: down to {count} (baseline {baseline}). Lower the ratchet: "
+        "HOST_PORTS_GUARD_WRITE=1 uv run --no-sync pytest "
+        "tests/test_host_ports_guard.py"
+    )
 
-    A single leaf keeps the collect-only gate honest: deleting or renaming a
-    scanned module changes no leaf name here, and its orphaned baseline is
-    reported below instead of silently rotting (issue #2237).
+
+def test_no_orphaned_host_ports_baselines() -> None:
+    """Report baseline files whose module left the scan (issue #2237).
+
+    Aggregate in its own leaf — the per-file ratchet above stays parametrized
+    so its ids persist for the collect-only gate, while this sweep keeps a
+    deleted module's ``.count`` file from silently rotting.
+    ``HOST_PORTS_GUARD_WRITE=1`` deletes the orphans.
     """
     write = os.environ.get("HOST_PORTS_GUARD_WRITE") == "1"
     scanned = {_rel(path) for path in _scan_files()}
-    violations: list[str] = []
-    for path in _scan_files():
-        rel = _rel(path)
-        count = count_direct_host_reads(path.read_text(encoding="utf-8"))
-        baseline_file = _baseline_path(rel)
-        if write:
-            if count:
-                baseline_file.parent.mkdir(parents=True, exist_ok=True)
-                baseline_file.write_text(f"{count}\n", encoding="utf-8")
-            elif baseline_file.exists():
-                baseline_file.unlink()
-            continue
-        baseline = (
-            int(baseline_file.read_text(encoding="utf-8").strip()) if baseline_file.exists() else 0
-        )
-        if count > baseline:
-            violations.append(
-                f"{rel}: {count} direct datetime.now/time.monotonic/time.time/"
-                f"is_pid_alive call(s), baseline {baseline}. Read time and "
-                "liveness through host.current() / app.host instead."
-            )
-        elif count < baseline:
-            violations.append(
-                f"{rel}: down to {count} (baseline {baseline}). Lower the "
-                "ratchet: HOST_PORTS_GUARD_WRITE=1 uv run --no-sync pytest "
-                "tests/test_host_ports_guard.py"
-            )
-    for baseline_file in sorted(BASELINES.rglob("*.count")):
-        rel = baseline_file.relative_to(BASELINES).as_posix()[: -len(".count")]
-        if rel not in scanned:
-            if write:
-                baseline_file.unlink()
-                continue
-            violations.append(
-                f"{rel}: baseline exists but the module is gone from the scan. "
-                "Regenerate: HOST_PORTS_GUARD_WRITE=1 uv run --no-sync pytest "
-                "tests/test_host_ports_guard.py"
-            )
+    orphans = [
+        baseline_file
+        for baseline_file in sorted(BASELINES.rglob("*.count"))
+        if baseline_file.relative_to(BASELINES).as_posix()[: -len(".count")] not in scanned
+    ]
     if write:
+        for baseline_file in orphans:
+            baseline_file.unlink()
         return
-    assert not violations, "\n".join(violations)
+    assert not orphans, "\n".join(
+        f"{baseline_file.relative_to(BASELINES).as_posix()[: -len('.count')]}: "
+        "baseline exists but the module is gone from the scan. Regenerate: "
+        "HOST_PORTS_GUARD_WRITE=1 uv run --no-sync pytest tests/test_host_ports_guard.py"
+        for baseline_file in orphans
+    )
 
 
 def test_is_pid_alive_counter_positive_control() -> None:
@@ -255,21 +275,16 @@ def test_liveness_allowlist_still_calls_primitive(rel: str) -> None:
     )
 
 
-def test_no_direct_is_pid_alive() -> None:
+@pytest.mark.parametrize("path", _liveness_scan_files(), ids=_rel)
+def test_no_direct_is_pid_alive(path: Path) -> None:
     """Hard floor at baseline 0 for every non-allowlisted file under
-    ``src/charlie_work`` — including modules added after this guard.
-
-    Aggregate assertion for the same collect-only reason as
-    ``test_no_new_direct_host_reads`` (issue #2237).
-    """
-    violations = []
-    for path in _liveness_scan_files():
-        count = _count_is_pid_alive_calls(parsed(path))
-        if count:
-            violations.append(
-                f"{_rel(path)}: {count} direct is_pid_alive( call(s). Route "
-                "liveness through host.current().probe / app.host.probe "
-                "instead; only process_utils.py (the primitive) and "
-                "host/liveness.py (the adapter) may call it."
-            )
-    assert not violations, "\n".join(violations)
+    ``src/charlie_work`` — including modules added after this guard."""
+    if not path.exists():
+        pytest.skip(f"{path.name} was deleted; id kept for the collect-only gate")
+    rel = _rel(path)
+    count = _count_is_pid_alive_calls(parsed(path))
+    assert count == 0, (
+        f"{rel}: {count} direct is_pid_alive( call(s). Route liveness through "
+        "host.current().probe / app.host.probe instead; only process_utils.py "
+        "(the primitive) and host/liveness.py (the adapter) may call it."
+    )

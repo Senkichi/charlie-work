@@ -73,6 +73,7 @@ _ISSUE_CONSTANTS = [
 ]
 _PR_CONSTANTS = [
     pull_requests.PR_LIST_FIELDS,
+    pull_requests.PR_LIST_WITH_CHECKS_FIELDS,
     pull_requests.PR_VIEW_FIELDS,
     pull_requests.MERGED_PR_LIST_FIELDS,
     transport.RECONCILE_PR_FIELDS,

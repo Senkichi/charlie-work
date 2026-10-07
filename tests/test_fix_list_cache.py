@@ -52,13 +52,16 @@ def test_issue_list_caches_within_pass_and_refetches_after_invalidate(tmp_path: 
     counter: dict[str, int] = {}
     gh = _counting_github(tmp_path, counter)
 
+    # Issue #2443: open issues are one REST read (counted under "api").
     gh.issue_list("automated-ready")
     gh.issue_list("automated-ready")
-    assert counter["issue"] == 1, "second call within a pass must hit the cache"
+    gh.issue_list("some-other-label")
+    assert counter["api"] == 1, "calls within a pass must share one cached read"
+    assert counter.get("issue", 0) == 0, "no GraphQL issue list"
 
     gh.invalidate_list_cache()
     gh.issue_list("automated-ready")
-    assert counter["issue"] == 2, "post-invalidation call must refetch"
+    assert counter["api"] == 2, "post-invalidation call must refetch"
 
 
 def test_pr_and_merged_pr_lists_refetch_after_invalidate(tmp_path: Path) -> None:

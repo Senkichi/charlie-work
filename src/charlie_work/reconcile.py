@@ -58,6 +58,7 @@ from .labels import TransitionOutcome, apply_issue_labels, transition
 from .local_lane import synthesize_open_pr
 from .local_work_park import publishes_pull_requests
 from .merge_finalize import _merged_issue_fields
+from .merge_path.model import MERGEQUEUE_DWELL_FIELDS
 from .paths import resolved_layout, runtime_paths
 from .process_utils import kill_process_tree
 from .queue_bot import is_queue_bot_pr  # noqa: F401 (deliberate re-export)
@@ -1628,7 +1629,10 @@ def detect_drift(
     # This must happen AFTER the PR loop (to populate open_prs_by_issue) but BEFORE
     # the issue loop (to populate issues_handled_by_session_relabel for mutual exclusion)
     if repo_root is not None:
-        from .claude_code import update_worker_record_with_failure_classification
+        from .claude_code import (
+            CLAUDE_RECORD_KINDS,
+            update_worker_record_with_failure_classification,
+        )
         from .devin_shell import update_session_record_with_failure_classification
         from .post_mortem import classify_and_record
         from .worker import (
@@ -1671,20 +1675,13 @@ def detect_drift(
                                 fallback_kind="launch_stalled",
                                 config=config,
                             )
-                        elif w.adapter_kind == "claude-code":
+                        elif w.adapter_kind in CLAUDE_RECORD_KINDS:
                             update_worker_record_with_failure_classification(
                                 sessions_dir,
                                 w.issue_number,
                                 fallback_kind="launch_stalled",
                                 config=config,
-                            )
-                        elif w.adapter_kind == "api":
-                            update_worker_record_with_failure_classification(
-                                sessions_dir,
-                                w.issue_number,
-                                fallback_kind="launch_stalled",
-                                config=config,
-                                adapter_kind="api",
+                                adapter_kind=w.adapter_kind,
                             )
 
                         # Kill the process tree to free the slot
@@ -1787,24 +1784,14 @@ def detect_drift(
                                     session_completed=True,
                                 )
                             )
-                        elif w.adapter_kind == "claude-code":
+                        elif w.adapter_kind in CLAUDE_RECORD_KINDS:
                             failure_kind, throttled_until = (
                                 update_worker_record_with_failure_classification(
                                     sessions_dir,
                                     w.issue_number,
                                     fallback_kind="unpublished_work",
                                     config=config,
-                                    session_completed=True,
-                                )
-                            )
-                        elif w.adapter_kind == "api":
-                            failure_kind, throttled_until = (
-                                update_worker_record_with_failure_classification(
-                                    sessions_dir,
-                                    w.issue_number,
-                                    fallback_kind="unpublished_work",
-                                    config=config,
-                                    adapter_kind="api",
+                                    adapter_kind=w.adapter_kind,
                                     session_completed=True,
                                 )
                             )
@@ -1827,23 +1814,14 @@ def detect_drift(
                                     config=config,
                                 )
                             )
-                        elif w.adapter_kind == "claude-code":
+                        elif w.adapter_kind in CLAUDE_RECORD_KINDS:
                             failure_kind, throttled_until = (
                                 update_worker_record_with_failure_classification(
                                     sessions_dir,
                                     w.issue_number,
                                     fallback_kind=fallback_kind,
                                     config=config,
-                                )
-                            )
-                        elif w.adapter_kind == "api":
-                            failure_kind, throttled_until = (
-                                update_worker_record_with_failure_classification(
-                                    sessions_dir,
-                                    w.issue_number,
-                                    fallback_kind=fallback_kind,
-                                    config=config,
-                                    adapter_kind="api",
+                                    adapter_kind=w.adapter_kind,
                                 )
                             )
                         else:
@@ -3120,7 +3098,7 @@ def apply_fixes(
             # calling ``labels.transition`` directly applies the same
             # ``_edges(config.labels)`` disposition and now also records the
             # lifecycle transition (issue #2226).
-            # The dwell-tracking fields (mergequeue_since/mergequeue_head_sha)
+            # The dwell-tracking fields (MERGEQUEUE_DWELL_FIELDS)
             # are cleared so the post-fix re-detect does not re-fire the
             # time-in-queue trigger for the same window.
             fix_actions = list(item.fix_actions)
@@ -3135,9 +3113,7 @@ def apply_fixes(
                 existing_pr = new_prs.get(pr_key, {})
                 if existing_pr:
                     new_prs[pr_key] = {
-                        k: v
-                        for k, v in existing_pr.items()
-                        if k not in ("mergequeue_since", "mergequeue_head_sha")
+                        k: v for k, v in existing_pr.items() if k not in MERGEQUEUE_DWELL_FIELDS
                     }
             if item.issue_number is not None:
                 # Escalate the issue state through the canonical helper.

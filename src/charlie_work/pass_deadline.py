@@ -219,8 +219,8 @@ class PassDeadline:
       the predicate.
     * :meth:`skipped` -- the ``deadline_deferred`` placeholder
       CommandResult a skipped sub-phase contributes to the pass data.
-    * :meth:`phase` -- guarded CommandResult-producing sub-phase: skip
-      when spent, run otherwise, and convert a mid-phase refusal into the
+    * :meth:`phase` -- guarded CommandResult-producing sub-phase (its name is
+      also its budget-governor lane, #2442): skip when spent, run otherwise, and convert a mid-phase refusal into the
       same deferred placeholder so already-collected pass data survives.
     * :meth:`call` -- the same guard for non-CommandResult steps (list
       fetches, void maintenance calls), returning a caller-chosen
@@ -243,9 +243,12 @@ class PassDeadline:
         self,
         exceeded: Callable[[], bool] | None,
         result_type: Callable[[bool, str, dict[str, Any]], Any],
+        *,
+        budget_gate: Callable[[str], bool] | None = None,
     ) -> None:
         self._exceeded = exceeded
         self._result_type = result_type
+        self._budget_gate = budget_gate
         self._hit = False
         # Seed the latch once at construction so "already spent at pass
         # start" is indistinguishable downstream from "tripped later".
@@ -286,16 +289,25 @@ class PassDeadline:
         if self.now():
             return self.skipped(name)
         try:
+            if self._budget_gate is not None and self._budget_gate(name):
+                return self._result_type(
+                    True,
+                    f"{name} deferred: GitHub budget below reserve",
+                    {"budget_deferred": True},
+                )
             return fn()
         except PassDeadlineExceeded:
             self.trip()
             return self.skipped(name)
 
-    def call(self, fn: Callable[[], Any], fallback: Any) -> Any:
-        """Guarded non-CommandResult step: skip-or-run, refusal -> fallback."""
+    def call(self, fn: Callable[[], Any], fallback: Any, *, lane: str | None = None) -> Any:
+        """Guarded non-CommandResult step: skip-or-run, refusal -> fallback.
+        A *lane* is also gated on the GraphQL budget (#2442)."""
         if self.now():
             return fallback
         try:
+            if lane is not None and self._budget_gate is not None and self._budget_gate(lane):
+                return fallback
             return fn()
         except PassDeadlineExceeded:
             self.trip()
@@ -400,7 +412,7 @@ def run_deadline_guarded_maintenance(
     # `now` (issue #828) is this pass's single injected clock, forwarded
     # so the probe's own cadence-scheduling samples stay consistent with
     # the rest of this pass instead of independently racing wall clock.
-    deadline.call(lambda: app._maybe_probe_quota_recovery(now=now), None)
+    deadline.call(lambda: app._maybe_probe_quota_recovery(now=now), None, lane="quota_probe")
 
     # Periodic in-loop reconcile (merge-lane-recovery §6-B): repairs
     # GitHub label / state.json divergence on a fixed cadence instead of
@@ -414,7 +426,7 @@ def run_deadline_guarded_maintenance(
     # every pass -- no runner needed, so unlike the workflow-based
     # reaper this cannot lose the race for the capacity it exists to
     # free. See _maybe_reclaim_superseded_main_ci's docstring.
-    deadline.call(lambda: app._maybe_reclaim_superseded_main_ci(), None)
+    deadline.call(lambda: app._maybe_reclaim_superseded_main_ci(), None, lane="ci_reclaim")
 
     # Issue #783: periodic re-evaluation of `mechanical` escalations --
     # the only automated re-entry from `agent:human-needed` for pure
@@ -423,7 +435,7 @@ def run_deadline_guarded_maintenance(
     # since become mergeable and janitor-clean. `judgment` escalations
     # and any pre-existing escalation with no recorded reason_class are
     # untouched by construction (see _maybe_deescalate_mechanical).
-    deadline.call(lambda: app._maybe_deescalate_mechanical(), None)
+    deadline.call(lambda: app._maybe_deescalate_mechanical(), None, lane="deescalate")
 
     # Sweep for orphan processes in dead session worktrees (issue #139)
     # This catches detached/daemonized processes that survived session kills

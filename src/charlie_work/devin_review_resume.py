@@ -18,7 +18,7 @@ Invariants: the relaunch is a non-blocking ``Popen`` (no wait/communicate);
 every failure comes back as a value (``False`` plus a
 ``review_exec_rejection_resume_failed`` event), never a raise; the sidecar is
 rewritten atomically over the SAME ``issue-<pr>.json`` so the resumed process
-occupies the same review slot -- ``_count_live_reviews`` and the fleet reviewer
+occupies the same review slot -- the live-review counter and the fleet reviewer
 cap count sidecars/pids, so a resume replaces the dead session and is never a
 second live reviewer.
 """

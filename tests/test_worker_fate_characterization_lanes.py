@@ -527,7 +527,7 @@ def test_preserve_a2_is_worker_alive_and_is_session_alive_agree(tmp_path: Path) 
     dead_pid = 999_999_937
     for pid in (None, 0, -1, dead_pid):
         expected = worker_fate.is_alive(pid, None)
-        for kind in ("devin", "claude-code", "api"):
+        for kind in ("devin", "claude-code", "api", "opencode"):
             assert view(kind, pid).is_alive() is expected, (kind, pid)
     # None / non-positive pids are dead by definition, independent of the host.
     assert worker_fate.is_alive(None, None) is False
@@ -536,5 +536,5 @@ def test_preserve_a2_is_worker_alive_and_is_session_alive_agree(tmp_path: Path) 
     # An unrecognised adapter kind has no fate profile -> conservatively dead.
     assert view("no-such-adapter", os.getpid()).is_alive() is False
     # A live pid reads alive through every adapter's view.
-    for kind in ("devin", "claude-code", "api"):
+    for kind in ("devin", "claude-code", "api", "opencode"):
         assert view(kind, os.getpid()).is_alive() is True, kind

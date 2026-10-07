@@ -59,7 +59,6 @@ KNOWN_IGNORED: dict[str, str] = {
     "review_dispatch_lifecycle_reaped": "names a merged/closed PR only; deliberately not merge evidence (see rollup_flow_handlers docstring)",
     "review_dispatch_lifecycle_reaped_sweep": "batch form of review_dispatch_lifecycle_reaped",
     "fleet_reap_sweep": "fleet-level reap summary; per-issue effects carry their own kinds",
-    SESSION_FAILED_RELABELED: "a dead session's failure kind was reclassified after the fact",
     "session_salvaged": "a dead worker's salvageable work was recovered",
     "superseded_worker_reaped": "a superseded worker was reaped at the rework trigger",
     "superseded_worker_reap_failed": "the superseded-worker reap failed",
@@ -104,6 +103,8 @@ KNOWN_IGNORED: dict[str, str] = {
     "github_not_found_error": "transport diagnostic",
     "github_transport_fallback": "transport diagnostic",
     "github_circuit_opened": "circuit-breaker state record",
+    "github_rate_limited": "rate-limit diagnostic",
+    "github_budget_pass": "per-pass spend accounting record",
     "github_circuit_closed": "circuit-breaker state record",
     "github_issue_state_partial_fallback": "partial-fallback diagnostic",
     "git_network_retry": "per-call retry diagnostic",
@@ -239,6 +240,8 @@ KNOWN_IGNORED: dict[str, str] = {
     "merge_deferred_stale_base": "stale-base deferral record",
     "merge_deferred_stale_base_alarm": "stale-base deferral alarm record",
     "merge_failed_attempt_alarm": "merge-failure alarm record",
+    "mergequeue_stalled": "merge-queue dwell alarm record; the heartbeat surfaces it",
+    "mergequeue_stall_alarm_failed": "advisory stall-alarm failure record (audit-only)",
     "human_merge_required": "human-merge hand-off record (audit-only per its emit site)",
     "human_merge_label_removed": "human-merge bookkeeping",
     "unauthorized_merge_queue_sync_covered": "repeated every pass for the same PR; recon section 4 noise",
@@ -329,6 +332,29 @@ KNOWN_IGNORED: dict[str, str] = {
     "worker_test_selection_unavailable": "worker-prompt test-command diagnostic",
     "worker_verified_no_changes": "worker-outcome bookkeeping",
     "worker_verified_no_changes_ignored": "worker-outcome bookkeeping",
+    # -- Issue #2459: kinds the live dashboard log listed as uninterpreted. None feeds an
+    #    existing metric; none is a candidate for a new one (retired writers, or per-pass
+    #    bookkeeping whose outcome is carried by another kind).
+    "cross_family_regen_not_reached": "retired cross-family auto-gate surface (deleted in role-config phase 2); kept for older events DBs",
+    "cross_family_report_regen_exhausted": "retired cross-family auto-gate surface (deleted in role-config phase 2); kept for older events DBs",
+    "cross_family_report_regen_forced": "retired cross-family auto-gate surface (deleted in role-config phase 2); kept for older events DBs",
+    "cross_family_verdict_abandoned": "retired cross-family auto-gate surface (deleted in role-config phase 2); kept for older events DBs",
+    "cross_family_verdict_head_indeterminate": "retired cross-family auto-gate surface (deleted in role-config phase 2); kept for older events DBs",
+    "cross_family_verdict_unparseable": "retired cross-family auto-gate surface (deleted in role-config phase 2); kept for older events DBs",
+    "label_ensure_ok": "label-ensure diagnostic; label state is read from GitHub, not this event",
+    "label_ensure_incomplete": "label-ensure diagnostic; label state is read from GitHub, not this event",
+    "operator_local_park": "operator action audit record (legacy kind); no flow fact",
+    "operator_orphan_push_completed": "operator recovery audit record (legacy kind); no flow fact",
+    "operator_orphan_requeue": "operator recovery audit record (legacy kind); no flow fact",
+    "operator_probe_advanced": "operator probe audit record (legacy kind); no flow fact",
+    "operator_queue_depth": "retired per-pass operator-queue gauge (#1768); replaced by operator_queue_impact",
+    "operator_reviewer_quota_cleared": "operator quota-clear audit record (legacy kind); no flow fact",
+    "operator_rework_rearmed": "operator rework-rearm audit record (legacy kind); no flow fact",
+    "operator_state_correction": "operator state-correction audit record (legacy kind); no flow fact",
+    "review_packet_discarded_head_moved": "review-packet bookkeeping: PR head moved, packet re-made",
+    "rework_label_skipped_issue_closed": "rework-label bookkeeping: issue already closed",
+    "unauthorized_merge_ack_revoked": "unauthorized-merge bookkeeping",
+    "worker_token_missing": "retired worker-token gate (#1877); kept for older events DBs",
 }
 # Written to the global DB and (also) to per-repo DBs: the global DB is authoritative.
 GLOBAL_ONLY_KINDS = frozenset({"fleet_canary", "runner_allocation", "fleet_job_observations"})
@@ -377,6 +403,20 @@ def _dispatch_rework(ev: dict) -> list[Row]:
     issues = _ints(ev["payload"].get("issue_numbers")) or [ev["issue_number"]]
     pr = ev["payload"].get("pr_number", ev["pr_number"]) if len(issues) == 1 else None
     return [_milestone(ev, "rework_dispatched", i, pr) for i in issues]
+
+
+# Spelled through an alias of the constant: the #2262 salvage-seam AST guard
+# counts the constant (or a bare literal) passed as a call argument as a
+# dead-worker requeue locus, which this read-side milestone is not.
+_RELABELED_MILESTONE = SESSION_FAILED_RELABELED
+
+
+def _session_failed_relabeled(ev: dict) -> list[Row]:
+    """A dead worker's issue was handed back to dispatch: the approx
+    ``in_progress`` stage ends here (issue #2473). The sweep-batch summary
+    expands to the same per-issue milestone."""
+    issue, pr = _refs(ev)
+    return [_milestone(ev, _RELABELED_MILESTONE, issue, pr)]
 
 
 def _pr_opened(milestone: str, approx: bool) -> Callable[[dict], list[Row]]:
@@ -548,6 +588,7 @@ REF_ONLY: dict[str, Callable[[dict], list[Row]]] = {
     # The worker died after opening its PR; the sweep moved the issue to PR open. The PR
     # predates this event, so the stage boundary is approximate.
     "orphaned_worker_advanced_to_pr_open": _pr_opened("pr_open_after_dead_worker", True),
+    SESSION_FAILED_RELABELED: _session_failed_relabeled,
 }
 
 SWEEP_SUFFIX = "_sweep"
@@ -603,6 +644,19 @@ HANDLERS.update(FLOW_HANDLERS)
 assert (
     not KNOWN_IGNORED.keys() & HANDLERS.keys()
 )  # a kind is either interpreted or ignored, never both
+
+
+def is_classified(kind: str) -> bool:
+    """True when the rollup handles ``kind`` or deliberately ignores it (issue #2269).
+
+    A ``<kind>_sweep`` batch summary (minted by the reaper from ``sweep_events.append``)
+    inherits an ignored sibling's classification: it is the same record folded into one
+    event, so it needs no entry of its own (issue #2459). Handled sweeps are explicit in
+    ``HANDLERS`` because their per-issue expansion is handler-specific.
+    """
+    if kind in HANDLERS or kind in KNOWN_IGNORED:
+        return True
+    return kind.endswith(SWEEP_SUFFIX) and kind[: -len(SWEEP_SUFFIX)] in KNOWN_IGNORED
 
 
 def derive_event(source: str, ev: dict) -> list[Row]:

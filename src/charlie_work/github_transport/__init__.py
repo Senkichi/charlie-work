@@ -21,6 +21,8 @@ from .guarded import (
     RateBudgetHolder,
     RuntimePort,
 )
+from .budget_pass import budget_pass_payload, emit_github_budget_pass
+from .capability import capability_name, capability_scope, current_capability
 from .http_adapter import HttpAdapter
 from .outcome import (
     FailureKind,
@@ -53,6 +55,11 @@ __all__ = [
     "RestRequest",
     "RuntimePort",
     "TransportFailure",
+    "budget_pass_payload",
+    "capability_name",
+    "capability_scope",
+    "current_capability",
+    "emit_github_budget_pass",
     "paginate_graphql",
     "paginate_rest",
     "render_legacy_error",

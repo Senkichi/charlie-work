@@ -687,7 +687,11 @@ def test_ports_cover_exactly_the_workflow_attributes() -> None:
     import charlie_work.workflow as wf
     from charlie_work.dead_worker_sweep.ports import _WORKFLOW_ATTRS, SweepPorts
 
-    assert {f.name for f in dataclasses.fields(SweepPorts)} == set(_WORKFLOW_ATTRS)
+    # ``worker_pid_alive`` is the one port with no workflow delegate left
+    # (issue #2235): it binds ``live_session_count._ghost_pid_alive`` instead.
+    assert {f.name for f in dataclasses.fields(SweepPorts)} == {"worker_pid_alive"} | set(
+        _WORKFLOW_ATTRS
+    )
     missing = [attr for attr in _WORKFLOW_ATTRS.values() if not hasattr(wf, attr)]
     assert missing == []
 

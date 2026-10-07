@@ -76,7 +76,10 @@ _EXTRACTION_CHECK_NAMES = (
 # ``check_local_lane_kill_switch_stalled`` (issue #1968). The re-export
 # identity and no-shadowing sweeps below iterate this -- they must cover
 # every name ``heartbeat_check`` re-exports, not just the original five.
-_CHECK_NAMES = _EXTRACTION_CHECK_NAMES + ("check_local_lane_kill_switch_stalled",)
+_CHECK_NAMES = _EXTRACTION_CHECK_NAMES + (
+    "check_local_lane_kill_switch_stalled",
+    "check_mergequeue_stalled",  # issue #2441
+)
 
 
 @pytest.fixture(scope="module")
@@ -495,3 +498,32 @@ def test_local_lane_kill_switch_stalled_counts_unparseable_ts_as_new(
     alarms.check_local_lane_kill_switch_stalled(report, repo, baseline)
     assert report.anomaly
     assert "1 event(s) since last beat" in report.lines[-1]
+
+
+# ---------------------------------------------------------------------------
+# check_mergequeue_stalled (issue #2441)
+# ---------------------------------------------------------------------------
+
+
+def test_mergequeue_stalled_warns_on_seeded_row_and_is_ok_otherwise(
+    alarms: ModuleType, tmp_path: Path
+) -> None:
+    repo = _make_duck_repo(tmp_path)
+    _write_events_db(repo.state_dir, [])
+    baseline = datetime.now(timezone.utc) - timedelta(minutes=10)
+
+    quiet = _RecordingReport()
+    alarms.check_mergequeue_stalled(quiet, repo, baseline)
+    assert quiet.lines[-1].startswith("OK mergequeue_stalled")
+
+    _insert_event(
+        repo.state_dir,
+        _iso(1),
+        "mergequeue_stalled",
+        "warning",
+        '{"pr_number": 169, "dwell_hours": 2.01, "threshold_hours": 2.0}',
+    )
+    report = _RecordingReport()
+    alarms.check_mergequeue_stalled(report, repo, baseline)
+    assert report.lines[-1].startswith("WARN mergequeue_stalled")
+    assert "169" in report.lines[-1]

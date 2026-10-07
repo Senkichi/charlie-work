@@ -1603,11 +1603,9 @@ def _self_deploy_attempt(
 
         if dep_pending:
             # Routed through the session-count host port (issue #2230): the
-            # Real late-binds workflow.count_fleet_live_sessions -- a re-export
-            # of host/sessions.py's facade, which late-binds
-            # fleet_registry.count_fleet_live_sessions in turn -- so patches
-            # against either name still intercept, and
-            # fake_host(sessions=...) reaches self-deploy too.
+            # Real resolves fleet_registry.count_fleet_live_sessions at call
+            # time, so a patch on ``charlie_work.fleet_registry`` still
+            # intercepts, and fake_host(sessions=...) reaches self-deploy too.
             live_count, _ = _host.current().sessions.fleet_live_workers(fleet_dir_override)
             if live_count > 0:
                 # Issue #2312: defer BEFORE the merge. Holding HEAD at

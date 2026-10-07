@@ -30,7 +30,7 @@ from charlie_work.devin_review_resume import (
     review_exec_nudge_text,
 )
 from charlie_work.devin_shell import _REVIEW_EXEC_ALLOWLIST
-from charlie_work.dispatch_selection import _count_live_reviews
+from charlie_work.live_session_count import REVIEW_LANE, count_live_sessions
 from charlie_work.state import load_state
 
 PR = 2087
@@ -336,13 +336,14 @@ def test_resumed_session_is_not_double_counted_in_either_cap(
     rig = _rig(monkeypatch, tmp_path)
     rig.seed_dead_review()
     state_file = rig.app.paths.state_file
-    assert _count_live_reviews(rig.reviews_dir, state_file) == 0  # dead original: no slot
+    # dead original: no slot
+    assert count_live_sessions(rig.reviews_dir, state_file, REVIEW_LANE) == 0
 
     rig.reap()
 
     # Per-repo cap: one sidecar, one live pid -> exactly one slot, not two.
     assert len(list(rig.reviews_dir.glob("issue-*.json"))) == 1
-    assert _count_live_reviews(rig.reviews_dir, state_file) == 1
+    assert count_live_sessions(rig.reviews_dir, state_file, REVIEW_LANE) == 1
     entry = load_state(state_file)["prs"][str(PR)]
     assert entry["reviewer_pid"] == rig.popens[0]["pid"]
     assert entry["review_dispatch_status"] == "review_dispatch_dispatched"

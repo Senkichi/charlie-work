@@ -1,231 +1,132 @@
-"""Right-rail Capacity bullet bars and the compact per-repo ledger.
+"""The Capacity panel: three meters (workers, reviewers, CI runners), the full ones in focus.
 
-A cap that was not reported is drawn as an open, dashed track with the words
-"cap not reported" -- never a made-up scale. The per-repo ledger draws every stage cell on
-ONE shared scale and every runner cell on one shared slot scale, so cells compare across
-repos.
+The headline is the takeaway ("Workers at capacity"). Each meter is a button that opens a
+per-repo drawer. A cap that was not reported is an open, dashed track with the words "cap
+not reported", never a made-up scale; an over-cap value is stated in words, not colour.
 """
 
 from __future__ import annotations
 
-from ..charts import bullet_svg
-from ..now_types import CapacityModel, NowModel, RepoFreshness, RepoWorkers, RunnerRepo
-from .now_fmt import age, cap_text, esc, fmt_float, link, repo_url, short_repo
+from dataclasses import dataclass
 
-_STAGE_ABBR = (
-    ("Dispatchable", "Disp"),
-    ("Queued", "Q"),
-    ("In progress", "Prog"),
-    ("PR open", "PR"),
-    ("Reviewing", "Rev"),
-    ("Needs rework", "Rwk"),
-)
+from ..now_types import CapacityModel, NowModel, RepoWorkers, RunnerRepo
+from .now_bars import hbars, repo_label
+from .now_fmt import esc, fmt_float
 
 
-def _bullet(live: int, cap: int | None) -> str:
-    """The shared bullet bar (``charts.bullet``); a 0 cap reads as unreported, as before."""
-    return bullet_svg(float(live), cap or None)
+@dataclass(frozen=True)
+class Meter:
+    key: str
+    name: str
+    live: int | None  # None: not measured
+    cap: int | None  # None / 0: no cap reported
+
+    @property
+    def full(self) -> bool:
+        return bool(self.cap) and self.live is not None and self.live >= self.cap
 
 
-def _over(live: int, cap: int | None) -> str:
-    """Over-cap is stated in words + glyph (text-warn prepends the triangle), not colour only."""
-    return '<span class="over text-warn">over cap</span>' if cap and live > cap else ""
-
-
-def _cap_row(name: str, href: str, live: int | None, cap: int | None, small: str) -> str:
-    if live is None:
-        bar = '<span class="unknown">not measured</span>'
-        val = '<span class="unk">—</span> running'
-    else:
-        bar = _bullet(live, cap)
-        if not cap:
-            bar += '<span class="unknown">cap not reported</span>'
-        cap_txt = link(href + "#cap", cap) if cap else "cap ?"
-        val = f"{link(href, live)} running / {cap_txt}{_over(live, cap)}"
+def meters(cap: CapacityModel) -> tuple[Meter, ...]:
+    online = sum(r.online for r in cap.runners) if cap.runners else None
+    slots = sum(r.capacity for r in cap.runners) if cap.runners else None
     return (
-        f'<div class="cap-row"><span class="who">{esc(name)}<small>{small}</small></span>'
-        f'<span class="bar">{bar}</span><span class="val">{val}</span></div>'
+        Meter("workers", "Workers", cap.workers_live, cap.workers_cap),
+        Meter("reviewers", "Reviewers", cap.reviewers_live, cap.reviewers_cap),
+        Meter("runners", "CI runners", online, slots),
     )
 
 
-def _by_repo(rows: tuple[RepoWorkers, ...]) -> str:
-    busy = [r for r in rows if r.live]
-    if not busy:
-        return "none running"
-    return " · ".join(f"{esc(short_repo(r.repo))} {link(repo_url(r.repo), r.live)}" for r in busy)
+def headline(ms: tuple[Meter, ...]) -> str:
+    full = [m.name for m in ms if m.full]
+    return f"{' and '.join(full)} at capacity" if full else "Capacity has headroom"
 
 
-def _runner_row(cap: CapacityModel) -> str:
-    if not cap.runners:
+def _track(m: Meter) -> str:
+    if not m.cap:
         return (
-            '<div class="cap-row"><span class="who">CI runners<small>no allocation event'
-            '</small></span><span class="bar"><span class="unknown">not reported</span></span>'
-            '<span class="val">—</span></div>'
+            '<svg class="trk open" viewBox="0 0 100 10" preserveAspectRatio="none" '
+            'aria-hidden="true"><line x1="0" x2="100" y1="5" y2="5"/></svg>'
         )
-    online = sum(r.online for r in cap.runners)
-    slots = sum(r.capacity for r in cap.runners)
-    parked = sum(r.parked for r in cap.runners)
-    demand = sum(r.demand for r in cap.runners)
-    busy_known = [r.busy for r in cap.runners if r.busy is not None]
-    busy = f"busy {sum(busy_known)}" if busy_known else "busy not reported"
-    small = f"{link('/capacity/runners#parked', parked)} parked · demand " + link(
-        "/capacity/runners#demand", demand
-    )
+    pct = fmt_float(min(100.0, 100.0 * (m.live or 0) / m.cap))
     return (
-        f'<div class="cap-row"><span class="who">CI runners<small>{small} · {busy}'
-        f'</small></span><span class="bar">{_bullet(online, slots)}</span><span class="val">'
-        f"{link('/capacity/runners', online)} online / {link('/capacity/runners#slots', slots)}"
-        f"{_over(online, slots)}</span></div>"
+        '<svg class="trk" viewBox="0 0 100 10" preserveAspectRatio="none" aria-hidden="true">'
+        f'<rect class="bg" x="0" y="0" width="100" height="10"/>'
+        f'<rect class="fill" x="0" y="0" width="{pct}" height="10"/></svg>'
     )
+
+
+def _meter(m: Meter) -> str:
+    live = "—" if m.live is None else str(m.live)
+    cap = "?" if m.cap is None else "∞" if m.cap == 0 else str(m.cap)
+    words = (
+        "not measured"
+        if m.live is None
+        else "cap not reported"
+        if m.cap is None
+        else "over cap"
+        if m.cap and m.live > m.cap
+        else ""
+    )
+    note = f'<span class="note">{words}</span>' if words else ""
+    cls = "meter" + (" focus" if m.full else "")
+    return (
+        f'<button type="button" class="{cls}" id="meter-{m.key}" data-cap="{m.key}" '
+        f'aria-pressed="false" aria-label="{esc(m.name)}: {esc(live)} of {esc(cap)}">'
+        f'<span class="mname">{esc(m.name)}{note}</span>'
+        f'<span class="val"><span class="num">{esc(live)}</span> / {esc(cap)}</span>'
+        f"{_track(m)}</button>"
+    )
+
+
+def _workers_rows(rows: tuple[RepoWorkers, ...]) -> list[tuple[str, float, float, str]]:
+    shown = [r for r in rows if r.live or r.cap]
+    top = float(max((r.live for r in shown), default=0) or 1)
+    return [
+        (
+            repo_label(r.repo),
+            float(r.live),
+            float(r.cap) if r.cap else top,
+            f"{r.live}/{r.cap if r.cap else '∞'}",
+        )
+        for r in shown
+    ]
+
+
+def _runner_rows(rows: tuple[RunnerRepo, ...]) -> list[tuple[str, float, float, str]]:
+    return [
+        (
+            repo_label(r.repo),
+            float(r.online),
+            float(r.capacity),
+            f"{r.online}/{r.capacity} · {r.parked} parked · demand {r.demand}",
+        )
+        for r in rows
+        if r.online or r.capacity
+    ]
+
+
+def _drawer(m: Meter, cap: CapacityModel) -> str:
+    if m.key == "runners":
+        inner = hbars("CI runners by repo (online / slots)", _runner_rows(cap.runners))
+    else:
+        by = cap.workers_by_repo if m.key == "workers" else cap.reviewers_by_repo
+        inner = hbars(f"{m.name} by repo (live / cap)", _workers_rows(by))
+    return f'<div class="drawer" id="cap-{m.key}" data-cap="{m.key}" hidden>{inner}</div>'
 
 
 def render_capacity(model: NowModel) -> str:
     cap = model.capacity
-    if cap.runners_age_seconds is None:
-        meta = "runners not reported"
-    elif cap.runners_stale:
-        old = esc(age(cap.runners_age_seconds))
-        meta = f'<span class="text-warn">runners {old} old, stale</span>'
-    else:
-        meta = f"workers & reviewers as of each repo's last pass · runners {esc(age(cap.runners_age_seconds))} ago"
-    if cap.capped_demand_now:
-        who = ", ".join(short_repo(r) for r in cap.capped_repos) or "fleet budget"
-        meta += f' · <span class="text-warn">capped demand now: {esc(who)}</span>'
-    else:
-        meta += " · no capped demand now"
-    return (
-        '<section class="cap-now" aria-labelledby="cap-h">'
-        f'<h2 id="cap-h">Capacity <span class="meta">{meta}</span></h2>'
-        + _cap_row(
-            "Workers",
-            "/capacity/workers",
-            cap.workers_live,
-            cap.workers_cap,
-            _by_repo(cap.workers_by_repo),
-        )
-        + _cap_row(
-            "Reviewers",
-            "/capacity/reviewers",
-            cap.reviewers_live,
-            cap.reviewers_cap,
-            _by_repo(cap.reviewers_by_repo),
-        )
-        + _runner_row(cap)
-        + "</section>"
-    )
-
-
-def _match(key: str, rows: tuple) -> object | None:
-    """Exact repo-key match, else the same short name (runner targets may omit the owner)."""
-    exact = next((r for r in rows if r.repo == key), None)
-    if exact is not None:
-        return exact
-    return next((r for r in rows if short_repo(r.repo) == short_repo(key)), None)
-
-
-def _mini(count: int, scale: int, cls: str = "mbar") -> str:
-    h = 12.0 * count / scale if scale else 0.0
-    rect = (
-        f'<rect class="{cls}" x="0" y="{fmt_float(12 - h)}" width="4" height="{fmt_float(h)}"/>'
-        if count
-        else '<rect class="mzero" x="0" y="11" width="4" height="1"/>'
-    )
-    return f'<svg class="mini" viewBox="0 0 4 12" aria-hidden="true">{rect}</svg>'
-
-
-def _runner_cell(r: RunnerRepo | None, slot_scale: int, key: str) -> str:
-    if r is None:
-        return '<span class="muted">—</span>'
-    w = 60.0 / slot_scale if slot_scale else 0.0
-    parts = [f'<rect class="trk" x="0" y="4" width="{fmt_float(w * r.capacity)}" height="4"/>']
-    parts.append(f'<rect class="fill" x="0" y="2" width="{fmt_float(w * r.online)}" height="8"/>')
-    if r.parked:
-        parts.append(
-            f'<rect class="parked" x="{fmt_float(w * r.online)}" y="2" '
-            f'width="{fmt_float(w * r.parked)}" height="8"/>'
-        )
-    if r.demand:
-        d = min(w * r.demand, 60.0)
-        parts.append(
-            f'<line class="demand" x1="{fmt_float(d)}" x2="{fmt_float(d)}" y1="0" y2="12"/>'
-        )
-    short = r.demand > r.online
-    glyph = (
-        '<span class="text-warn"><span class="sr">demand above online</span></span>'
-        if short
+    ms = meters(cap)
+    waiting = next((s.count for s in model.flow.stages if s.name == "Dispatchable"), 0)
+    workers_full = ms[0].full
+    sub = (
+        f"{waiting} dispatchable issues are waiting on a free worker."
+        if workers_full and waiting
         else ""
     )
     return (
-        f'<span class="rnr"><svg class="rsvg" viewBox="0 0 60 12" aria-hidden="true">'
-        f"{''.join(parts)}</svg>{glyph}{link(repo_url(key, view='runners'), r.online)}/"
-        f"{r.capacity}"
-        + (f' <span class="muted">p{r.parked}</span>' if r.parked else "")
-        + (f' <span class="muted">d{r.demand}</span>' if r.demand else "")
-        + "</span>"
-    )
-
-
-def _pass_cell(f: RepoFreshness | None, key: str) -> str:
-    if f is None:
-        return '<td class="pass">—</td>'
-    if f.error:
-        return (
-            f'<td class="pass"><span class="text-danger" title="{esc(f.error)}">'
-            f'{link(repo_url(key), age(f.age_seconds))}<span class="sr"> read error</span></span></td>'
-        )
-    if f.stale:
-        return (
-            f'<td class="pass"><span class="text-warn" title="stale">'
-            f'{link(repo_url(key), age(f.age_seconds))}<span class="sr"> stale</span></span></td>'
-        )
-    return f'<td class="pass">{link(repo_url(key), age(f.age_seconds))}</td>'
-
-
-def render_repo_ledger(model: NowModel) -> str:
-    if not model.repos:
-        return ""
-    fresh = {f.repo: f for f in model.freshness}
-    stage_scale = max((s.count for r in model.repos for s in r.stages), default=0)
-    slot_scale = max((r.capacity for r in model.capacity.runners), default=0)
-    head = "".join(f'<th class="num" title="{esc(n)}">{esc(a)}</th>' for n, a in _STAGE_ABBR)
-    body = []
-    for repo in sorted(model.repos, key=lambda r: (-r.need_you, r.repo)):
-        f = fresh.get(repo.repo)
-        counts = {s.name: s.count for s in repo.stages}
-        cells = "".join(
-            f'<td class="stg">{_mini(counts.get(n, 0), stage_scale)}'
-            f"{link(repo_url(repo.repo, stage=a.lower()), counts.get(n, 0))}</td>"
-            for n, a in _STAGE_ABBR
-        )
-        w = _match(repo.repo, model.capacity.workers_by_repo)
-        workers = (
-            f"{link(repo_url(repo.repo, view='workers'), w.live)}/{cap_text(w.cap, compact=True)}"
-            if isinstance(w, RepoWorkers)
-            else '<span class="muted">—</span>'
-        )
-        runner = _match(repo.repo, model.capacity.runners)
-        rcell = _runner_cell(
-            runner if isinstance(runner, RunnerRepo) else None, slot_scale, repo.repo
-        )
-        stale = " is-stale" if f is not None and f.stale else ""
-        need = link(repo_url(repo.repo, view="needs"), repo.need_you)
-        body.append(
-            f'<tr class="repo-row{stale}"><td class="rname" title="{esc(repo.repo)}">'
-            f"{esc(short_repo(repo.repo))}</td>{_pass_cell(f, repo.repo)}{cells}"
-            f'<td class="num">{workers}</td><td class="ci">{rcell}</td>'
-            f'<td class="num need{" has" if repo.need_you else ""}">{need}</td></tr>'
-        )
-    return (
-        '<section class="repos-now" aria-labelledby="repos-h">'
-        '<h2 id="repos-h">By repo <span class="meta">shared scales · sorted by need-you'
-        " · CI: p parked, d demand</span></h2>"
-        # Its own horizontal scroller: at mid widths the table may be wider than the rail,
-        # and the page itself never clips (no overflow-x: hidden on html/body).
-        '<div class="table-scroll" role="region" aria-label="By-repo table, scrolls sideways" tabindex="0">'
-        '<table class="repos"><thead><tr><th class="l">Repo</th><th>Last pass</th>'
-        f"{head}"
-        '<th class="num" title="running workers / per-repo cap (∞ = no cap), as of the last pass">Work</th>'
-        '<th title="CI runners online / slots; p parked, d demand">CI</th>'
-        '<th class="num" title="Needs-me rows for this repo">You</th></tr></thead>'
-        f"<tbody>{''.join(body)}</tbody></table></div></section>"
+        '<section class="panel n-cap" id="capacity" aria-labelledby="cap-h">'
+        f'<div><h2 id="cap-h">{esc(headline(ms))}</h2><p class="sub">{esc(sub)}</p></div>'
+        f'<div class="meters">{"".join(_meter(m) for m in ms)}</div>'
+        f"{''.join(_drawer(m, cap) for m in ms)}</section>"
     )
