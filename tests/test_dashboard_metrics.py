@@ -107,8 +107,10 @@ def test_lead_time_approx_from_milestones(ro_db) -> None:
     assert s.per_repo[ALPHA] == pts((2, 10.0), (3, 36.0))
     assert s.per_repo[BETA] == pts((2, 5.0), (5, 12.5))
     assert (s.approx, s.exact_from, s.unit, s.n) == (True, None, "hours", 5)
-    # no dispatched->pr_opened pair exists in the fixture, so stage time is empty, not zero
-    assert flow.stage_time(ro_db, CURRENT, "in_progress").points == ()
+    # no dispatched->pr_opened pair exists in the fixture, so each in_progress visit is
+    # a dispatched->merged span -- the same interval lead time reports (issue #2473: any
+    # other milestone, including the merge itself, ends an open visit)
+    assert flow.stage_time(ro_db, CURRENT, "in_progress").points == s.points
     with pytest.raises(ValueError):
         flow.stage_time(ro_db, CURRENT, "nope")
 
@@ -254,6 +256,124 @@ def test_not_instrumented_when_no_source_ever_emitted(tmp_path, monkeypatch) -> 
     f.close()
 
 
+def test_stage_time_approx_excludes_parked_and_dead_time(tmp_path, monkeypatch) -> None:
+    """Issue #2473: an approx ``in_progress`` visit ends at any exit, not only at PR open.
+
+    The incident behind #2473 -- dispatched, escalated, parked ~10 days,
+    unescalated, redispatched, PR opened 17 min later -- was recorded as one
+    1534h visit because ``escalated`` never closed the open interval and a
+    second ``dispatched`` did not restart it.
+    """
+    monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", str(tmp_path / "fleet"))
+    f = Fleet(tmp_path, monkeypatch)
+    a = f.alpha
+    # The incident shape: a 1h first run, a long park, then a 17-minute winning run.
+    dispatch(f, a, "2026-09-25T00:00:00Z", [1427])
+    f.emit(
+        a, "2026-09-25T01:00:00Z", "session_failed_escalated",
+        {"issue_number": 1427, "reason": "worker_dead"},
+    )  # fmt: skip
+    f.emit(
+        a, "2026-10-05T00:00:00Z", "unescalate",
+        {"issue_number": 1427, "cleared_escalation_reason": "operator_reviewed"},
+    )  # fmt: skip
+    dispatch(f, a, "2026-10-05T12:00:00Z", [1427])
+    f.emit(
+        a, "2026-10-05T12:17:00Z", "worker_handoff_pr_opened",
+        {"issue_number": 1427, "pr_number": 6427},
+    )  # fmt: skip
+    # A dead worker's relabel exits in_progress too: 2h dead run + 30min winning run.
+    dispatch(f, a, "2026-10-06T00:00:00Z", [2700])
+    f.emit(
+        a, "2026-10-06T02:00:00Z", "session_failed_relabeled",
+        {"issue_number": 2700, "reason": "dead_worker_no_open_pr_orphan_sweep"},
+    )  # fmt: skip
+    dispatch(f, a, "2026-10-06T10:00:00Z", [2700])
+    f.emit(
+        a, "2026-10-06T10:30:00Z", "worker_handoff_pr_opened",
+        {"issue_number": 2700, "pr_number": 7700},
+    )  # fmt: skip
+    # A re-dispatch while the visit is still open restarts it: the last dispatch wins.
+    dispatch(f, a, "2026-10-04T00:00:00Z", [2702])
+    dispatch(f, a, "2026-10-04T06:00:00Z", [2702])
+    f.emit(
+        a, "2026-10-04T06:20:00Z", "worker_handoff_pr_opened",
+        {"issue_number": 2702, "pr_number": 7702},
+    )  # fmt: skip
+    # The same review for pr_open: an escalation mid-review-wait ends the visit.
+    f.emit(
+        a, "2026-10-03T00:00:00Z", "worker_handoff_pr_opened",
+        {"issue_number": 2704, "pr_number": 7704},
+    )  # fmt: skip
+    f.emit(
+        a, "2026-10-03T02:00:00Z", "session_failed_escalated",
+        {"issue_number": 2704, "pr_number": 7704, "reason": "review_dispatch_escalated"},
+    )  # fmt: skip
+    f.emit(
+        a, "2026-10-03T10:00:00Z", "unescalate",
+        {"issue_number": 2704, "cleared_escalation_reason": "operator_reviewed"},
+    )  # fmt: skip
+    f.emit(a, "2026-10-03T12:00:00Z", "review_dispatch_claim", {"pr_numbers": [7704]})
+    f.emit(
+        a, "2026-10-03T13:00:00Z", "record_review",
+        {"decision": "approved", "issue_number": 2704, "pr_number": 7704},
+    )  # fmt: skip
+    rollup.run_rollup(f.sources(), NOW)
+    db, err = open_dashboard_ro(f.sources().db_path)
+    assert db is not None, err
+
+    s = flow.stage_time(db, CURRENT, "in_progress")
+    assert [p for p, _ in s.points] == [day(4), day(5), day(6)]
+    assert [v for _, v in s.points] == pytest.approx([1 / 3, 77 / 60, 2.5])
+    # pr_open for 2704 ends at its escalation; the unescalate->claim wait is not
+    # re-opened without a new PR-open milestone. reviewing runs claim -> verdict.
+    assert flow.stage_time(db, CURRENT, "pr_open").points == ((day(3), 2.0),)
+    assert flow.stage_time(db, CURRENT, "reviewing").points == ((day(3), 1.0),)
+    assert flow.stage_time(db, CURRENT, "needs_rework").points == ()
+    db.close()
+    f.close()
+
+
+def test_relabeled_sweep_expands_to_milestones_that_close_in_progress(
+    tmp_path, monkeypatch
+) -> None:
+    """Issue #2473: the sweep's batch form expands to per-issue milestone rows.
+
+    ``_append_sweep_events`` folds a multi-issue relabel into one
+    ``session_failed_relabeled_sweep`` event carrying only ``issue_numbers``;
+    the rollup expands it back so each batched issue's open ``in_progress``
+    visit ends at the relabel, not at a far-later close.
+    """
+    monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", str(tmp_path / "fleet"))
+    f = Fleet(tmp_path, monkeypatch)
+    a = f.alpha
+    dispatch(f, a, day(4, 0), [2710, 2711])
+    f.emit(
+        a, day(4, 2), "session_failed_relabeled_sweep",
+        {"count": 2, "issue_numbers": [2710, 2711]},
+    )  # fmt: skip
+    f.emit(
+        a, day(6, 0), "worker_handoff_pr_opened",
+        {"issue_number": 2710, "pr_number": 7710},
+    )  # fmt: skip
+    rollup.run_rollup(f.sources(), NOW)
+    db, err = open_dashboard_ro(f.sources().db_path)
+    assert db is not None, err
+    # both batched issues got their own milestone row off the one sweep event
+    assert db.execute(
+        "SELECT issue, milestone, event_kind FROM issue_milestones"
+        " WHERE event_kind = 'session_failed_relabeled_sweep' ORDER BY issue"
+    ).fetchall() == [
+        (2710, "session_failed_relabeled", "session_failed_relabeled_sweep"),
+        (2711, "session_failed_relabeled", "session_failed_relabeled_sweep"),
+    ]
+    # each visit closed at the relabel (2h); without the milestone 2710's would
+    # stretch to the PR open 46h later (the #2473 phantom shape)
+    assert flow.stage_time(db, CURRENT, "in_progress").points == ((day(4), 2.0),)
+    db.close()
+    f.close()
+
+
 def test_lifecycle_exact_path_takes_over_at_cutover(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", str(tmp_path / "fleet"))
     f = Fleet(tmp_path, monkeypatch)
@@ -283,7 +403,9 @@ def test_lifecycle_exact_path_takes_over_at_cutover(tmp_path, monkeypatch) -> No
     assert lead.points == ((at(-3), 10.0), (at(2), 20.0))
     assert (lead.approx, lead.exact_from) == (True, cut)  # window still holds the approx era
     assert flow.stage_time(db, q, "in_progress").points == ((at(-3), 4.0), (at(2), 6.0))
-    assert flow.stage_time(db, q, "pr_open").points == ((at(2), 10.0),)  # 2h + 8h, two visits
+    # approx-era pr_open: issue 800's PR sat open 6h before merging unclaimed (issue
+    # #2473: the merge itself ends the visit); exact era: 2h + 8h over two visits
+    assert flow.stage_time(db, q, "pr_open").points == ((at(-3), 6.0), (at(2), 10.0))
     assert flow.stage_time(db, q, "needs_rework").points == ((at(2), 1.0),)
     assert flow.stage_time(db, q, "reviewing").points == ((at(2), 1.0),)
     assert [p for p in flow.merges_per_day(db, q).points if p[1]] == [(at(-3), 1.0), (at(2), 1.0)]
