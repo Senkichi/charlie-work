@@ -23,6 +23,11 @@ from ..checks import CheckSummary
 # ``state.prs[n]`` fields that live only while a PR sits in the merge queue: the
 # dwell clock (#1401) and the last-full-check stamp (#2440). One list, so the
 # accounting write and the reconcile fix clear exactly the same set.
+# ``state.prs[n].mergequeue_revoked_reason`` written by reconcile's
+# ``mergequeue_wedged`` fix: it pulled the PR out of Aviator's queue on purpose
+# (and escalated the issue), so merge_ready reads it as a self-revocation.
+MERGEQUEUE_WEDGED_REVOKE = "mergequeue_wedged"
+
 MERGEQUEUE_DWELL_FIELDS: tuple[str, ...] = (
     "mergequeue_since",
     "mergequeue_head_sha",
