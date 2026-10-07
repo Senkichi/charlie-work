@@ -238,15 +238,24 @@ def test_remove_worktree_force_removes_real_venv_dir_but_not_junction_targets(
 ) -> None:
     repo_root = tmp_path / "repo"
     _init_repo(repo_root)
-    info = create_worktree(repo_root, "agent/issue-4-force", base_ref="HEAD")
-    real_venv = info.path / ".venv"
+    # Register the worktree with git directly rather than create_worktree:
+    # remove_worktree is the subject here, and a pristine fresh repo
+    # exercises none of create_worktree's leftover/reclaim checks (each of
+    # which costs a git subprocess — the dominant per-test cost on Windows,
+    # issue #2465).
+    branch = "agent/issue-4-force"
+    worktrees_dir = _default_worktrees_dir(repo_root)
+    worktrees_dir.mkdir(parents=True, exist_ok=True)
+    wt_path = worktrees_dir / _slugify(branch)
+    _git(repo_root, "worktree", "add", "-b", branch, str(wt_path), "HEAD")
+    real_venv = wt_path / ".venv"
     real_venv.mkdir()
     (real_venv / "pyvenv.cfg").write_text("home = somewhere\n", encoding="utf-8")
 
-    removed = remove_worktree(repo_root, info.path, force=True)
+    removed = remove_worktree(repo_root, wt_path, force=True)
 
     assert removed is True
-    assert not info.path.exists()
+    assert not wt_path.exists()
 
 
 def test_remove_worktree_junction_removal_preserves_shared_venv_contents(
