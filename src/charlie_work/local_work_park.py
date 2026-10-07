@@ -116,8 +116,11 @@ def park_unpublishable_work(
 
     # Issue #2094: a rework worker that died without moving the branch must
     # re-arm (or escalate), never park -- nothing selects a parked issue whose
-    # head equals the verdict's reviewed head.
-    rearmed = rearm_no_op_local_rework(gh, config, repo_root, branch, issue_number, write_gate)
+    # head equals the verdict's reviewed head. The classification rides along
+    # so a provider-throttled death re-arms without burning the no-op cap.
+    rearmed = rearm_no_op_local_rework(
+        gh, config, repo_root, branch, issue_number, write_gate, failure_kind
+    )
     if rearmed is not None:
         return rearmed
 
