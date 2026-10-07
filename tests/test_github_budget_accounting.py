@@ -10,7 +10,7 @@ from __future__ import annotations
 import threading
 from pathlib import Path
 
-from charlie_work.api_budget import GitHubSpendEntry
+from charlie_work.api_budget import GitHubSample, GitHubSpendEntry
 from charlie_work.github_capabilities._send import send as capability_send
 from charlie_work.github_transport import (
     Adapters,
@@ -204,6 +204,38 @@ def test_alternating_windows_each_attribute_their_own_deltas() -> None:
     for _ in range(6):
         guard.send(GET_PR)
     assert _by_cap(guard.take_spend()) == {("rest.pulls", "core"): (6, 10)}
+
+
+def _sample(used: int, *, reset: int, resource: str = "core") -> GitHubSample:
+    return GitHubSample(resource, used, reset, None, None)
+
+
+def test_successive_windows_leave_the_cursor_bounded() -> None:
+    """Hourly windows marching forward: dead-window marks are pruned, so the
+    process-wide cursor never holds more than a resource's two live windows
+    (#2488 rework: the (resource, reset) keying removed the old
+    one-mark-per-resource bound)."""
+    cursor = UsedCursor()
+    for i in range(50):
+        cursor.advance(_sample(10 + i, reset=9000 + 3600 * i))
+        assert len(cursor._value.marks) <= 2
+    assert [m.reset_epoch for m in cursor._value.marks] == [9000 + 3600 * 48, 9000 + 3600 * 49]
+
+
+def test_a_late_sample_for_a_pruned_window_rebaselines_at_zero() -> None:
+    """A response naming a window more than 3600s behind the newest reset
+    counts 0 -- its ``used`` includes spend this process never saw -- and is
+    not retained, so a second late sighting baselines at 0 again instead of
+    summing a dead window's counter."""
+    cursor = UsedCursor()
+    cursor.advance(_sample(10, reset=9000))
+    cursor.advance(_sample(3, reset=12600))
+    cursor.advance(_sample(7, reset=16200))  # new frontier: 9000 is now prunable
+    assert cursor.advance(_sample(80, reset=9000)) == 0
+    assert cursor.advance(_sample(85, reset=9000)) == 0  # still dead: re-baseline
+    # the window exactly one behind the frontier stays live and attributes
+    assert cursor.advance(_sample(5, reset=12600)) == 2
+    assert [m.reset_epoch for m in cursor._value.marks] == [16200, 12600]
 
 
 def test_take_spend_resets_so_each_pass_reads_its_own_delta() -> None:
