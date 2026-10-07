@@ -20,9 +20,6 @@ from . import layout
 from .config_deprecations import emit_deprecated_key_reads, repo_state_path
 from .config_validation import ConstructionError, host_wide_error, host_wide_sections
 from .fleet_paths import fleet_dir
-from .fleet_supervisor_config import (
-    resolve_fleet_supervisor_layer,
-)
 
 from .paths import RepoNotFoundError
 
@@ -319,38 +316,24 @@ def _load_layered_config(
     # rejection a per-repo ``orchestrator.config.yaml`` could silently override a
     # host-wide knob -- the exact confusion that made #590 expensive to diagnose. Reject
     # the key outright so the invalid state is unrepresentable rather than merely unused
-    # (issues #600, #763, #1978). The legacy ``supervisor.<key>`` spellings of the moved
-    # fleet-supervisor knobs stay legal here during the #1979 migration window: the fold
-    # below lifts them into the repo layer's effective ``fleet_supervisor`` mapping,
-    # where they keep the ordinary repo-wins-per-key merge semantics.
+    # (issues #600, #763, #1978). A legacy ``supervisor.<key>`` spelling of a
+    # moved fleet-supervisor knob needs no carve-out here: since #1979 it is
+    # just an unknown key, and the ordinary validation below rejects it like
+    # any other.
     for host_wide in sorted(host_wide_sections()):
         if host_wide in repo_data:
             raise host_wide_error(
                 host_wide, fleet_dir=global_config_path.parent, repo_path=repo_config_path
             )
 
-    # Issue #1978: resolve each layer's fleet_supervisor/supervisor pair
-    # *before* merging. Adoption on the post-merge view cannot tell a
-    # same-file disagreement (a hard ConfigError -- the operator wrote both
-    # spellings) from a cross-layer one (the global file's new-style key vs a
-    # repo's still-deprecated legacy key, which is just the ordinary
-    # repo-wins merge). Conflicting spellings surfacing only after the merge
-    # made the merged build raise, which the #665 rescue below treated like
-    # any broken global layer -- discarding the entire global config over
-    # one disputed key. The fold works on copies; ``global_data`` /
-    # ``repo_data`` keep the legacy spellings for the deprecation-event
-    # emits above and below.
-    global_layer = resolve_fleet_supervisor_layer(global_data)
-    repo_layer = resolve_fleet_supervisor_layer(repo_data)
-
     # Merge: global as base, per-repo as override (section-by-section, deep)
     merged_data: dict[str, Any] = {}
-    all_sections = set(global_layer.keys()) | set(repo_layer.keys())
+    all_sections = set(global_data.keys()) | set(repo_data.keys())
     known_sections = known_config_sections()
 
     for section in all_sections:
-        global_section = global_layer.get(section, {})
-        repo_section = repo_layer.get(section, {})
+        global_section = global_data.get(section, {})
+        repo_section = repo_data.get(section, {})
 
         # Both should be dicts for a proper merge
         global_section = global_section if isinstance(global_section, dict) else {}

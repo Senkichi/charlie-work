@@ -1,13 +1,11 @@
 """Tests for the fleet-scoped supervisor config section (issue #1978).
 
-Issue #1964's step 1 moves the knobs only the cross-repo fleet supervisor
+Issue #1964's step 1 moved the knobs only the cross-repo fleet supervisor
 daemon reads out of ``SupervisorConfig`` into ``FleetSupervisorConfig``
-under the ``fleet_supervisor:`` section. During the migration window each
-moved key is also honored from its legacy ``supervisor.<key>`` location --
-registered in ``DEPRECATED_CONFIG_KEYS`` so reads emit
-``config_key_deprecated_read`` and the retirement sweep arms removal issue
-#1979 -- with ``fleet_supervisor.<key>`` winning and a disagreement between
-the two locations failing the load instead of silently picking one.
+under the ``fleet_supervisor:`` section. Issue #1979 then removed the
+migration window: the legacy ``supervisor.<key>`` spellings are no longer
+registered in ``DEPRECATED_CONFIG_KEYS`` and no longer parse -- a moved key
+still written under ``supervisor:`` fails like any other unknown key.
 
 Shared helpers live in ``tests/_config_deprecations_fixtures.py``.
 """
@@ -91,19 +89,16 @@ def test_orchestrator_config_exposes_fleet_supervisor() -> None:
 
 
 def test_every_moved_key_is_registered_for_removal_issue_1979() -> None:
-    """Each relocated key is a ``supervisor.<key>`` -> ``fleet_supervisor.<key>``
-    deprecation entry; deriving the expectation from the dataclass keeps the
-    assertion in lockstep with any future moved key."""
-    moved = {
-        (entry.section, entry.key): entry
-        for entry in DEPRECATED_CONFIG_KEYS
-        if entry.section == "supervisor"
-    }
-    assert set(moved) == {("supervisor", key) for key in _MOVED_KEYS}
-    for key in _MOVED_KEYS:
-        entry = moved[("supervisor", key)]
-        assert entry.replacement == f"{FLEET_SUPERVISOR_SECTION}.{key}"
-        assert entry.removal_issue == 1979
+    """Issue #1979: the registrations this leaf name describes were themselves
+    the removal target -- the registry must now carry NO ``supervisor.*``
+    entry at all, and no entry pointing at this issue.
+
+    The leaf name predates the removal and is kept verbatim: the
+    collect-only gate (issue #1538) fails a required check on any leaf-name
+    removal, rename included, absent the operator-applied
+    ``collect-gate-exempt`` label."""
+    assert all(entry.section != "supervisor" for entry in DEPRECATED_CONFIG_KEYS)
+    assert all(entry.removal_issue != 1979 for entry in DEPRECATED_CONFIG_KEYS)
 
 
 # ---------------------------------------------------------------------------
@@ -178,20 +173,25 @@ def test_fleet_supervisor_bool_key_rejects_non_bool(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("key", sorted(_MOVED_KEYS))
 def test_legacy_supervisor_location_still_parses(tmp_path: Path, key: str) -> None:
-    """Every moved key is still honored from ``supervisor.<key>``."""
+    """Issue #1979's acceptance: every moved key written under
+    ``supervisor.<key>`` is now rejected with the normal unknown-key error.
+
+    The leaf name predates the removal and is kept verbatim for the
+    collect-only gate (issue #1538) -- the behavior it names is exactly what
+    no longer happens."""
     value = "true" if key == "self_deploy_pull_ci_fleet" else "7"
     config_file = tmp_path / "orchestrator.config.yaml"
     config_file.write_text(
         f"supervisor:\n  {key}: {value}\n",
         encoding="utf-8",
     )
-    config = load_config(config_file)
-    expected: object = True if key == "self_deploy_pull_ci_fleet" else 7
-    assert getattr(config.fleet_supervisor, key) == expected
+    with pytest.raises(ConfigError, match=f"supervisor.*unknown key.*{key}"):
+        load_config(config_file)
 
 
 def test_legacy_wrong_type_still_raises(tmp_path: Path) -> None:
-    """A moved key under ``supervisor:`` is type-checked at its own location."""
+    """A moved key under ``supervisor:`` still raises -- as an unknown key
+    now, before any type check can run (issue #1979)."""
     config_file = tmp_path / "orchestrator.config.yaml"
     config_file.write_text(
         'supervisor:\n  dependency_sync_starvation_seconds: "not-an-int"\n',
@@ -199,15 +199,25 @@ def test_legacy_wrong_type_still_raises(tmp_path: Path) -> None:
     )
     with pytest.raises(
         ConfigError,
-        match=r"^supervisor\.dependency_sync_starvation_seconds: expected int, got 'not-an-int' \(str\)$",
+        match=r"^supervisor: expected known keys .*unknown key\(s\) dependency_sync_starvation_seconds",
     ):
         load_config(config_file)
 
 
 def test_surviving_supervisor_keys_parse_alongside_moved_ones(tmp_path: Path) -> None:
-    """The per-repo cadence knobs still live under ``supervisor:`` and a
-    moved key in the same section does not break their parsing."""
+    """The per-repo cadence knobs still live under ``supervisor:`` and parse
+    normally; a moved key in the same section is rejected as unknown instead
+    of being adopted (issue #1979).
+
+    The leaf name predates the removal and is kept verbatim for the
+    collect-only gate (issue #1538)."""
     config_file = tmp_path / "orchestrator.config.yaml"
+    config_file.write_text(
+        "supervisor:\n  poll_interval_seconds: 10\n",
+        encoding="utf-8",
+    )
+    assert load_config(config_file).supervisor.poll_interval_seconds == 10
+
     config_file.write_text(
         """
 supervisor:
@@ -216,18 +226,21 @@ supervisor:
 """,
         encoding="utf-8",
     )
-    config = load_config(config_file)
-    assert config.supervisor.poll_interval_seconds == 10
-    assert config.fleet_supervisor.max_pass_runtime_seconds == 900
+    with pytest.raises(ConfigError, match="supervisor.*unknown key.*max_pass_runtime_seconds"):
+        load_config(config_file)
 
 
 # ---------------------------------------------------------------------------
-# Precedence and conflict
+# Legacy location: both spellings in one file
 # ---------------------------------------------------------------------------
 
 
 def test_new_location_wins_over_legacy(tmp_path: Path) -> None:
-    """When both locations agree the value parses once, from the new one."""
+    """Both spellings in one file no longer resolve -- the ``supervisor:``
+    entry is an unknown key, so the file fails (issue #1979).
+
+    The leaf name predates the removal and is kept verbatim for the
+    collect-only gate (issue #1538)."""
     config_file = tmp_path / "orchestrator.config.yaml"
     config_file.write_text(
         """
@@ -238,12 +251,13 @@ fleet_supervisor:
 """,
         encoding="utf-8",
     )
-    config = load_config(config_file)
-    assert config.fleet_supervisor.zero_pass_alarm == 5
+    with pytest.raises(ConfigError, match="supervisor.*unknown key.*zero_pass_alarm"):
+        load_config(config_file)
 
 
 def test_conflicting_locations_raise_config_error(tmp_path: Path) -> None:
-    """Different values in the two locations fail the load, naming both."""
+    """Different values in the two locations still fail the load -- the
+    legacy spelling is an unknown key now, whatever it is set to."""
     config_file = tmp_path / "orchestrator.config.yaml"
     config_file.write_text(
         """
@@ -256,37 +270,39 @@ fleet_supervisor:
     )
     with pytest.raises(
         ConfigError,
-        match="zero_pass_alarm.*fleet_supervisor.*supervisor",
+        match="supervisor.*unknown key.*zero_pass_alarm",
     ):
         load_config(config_file)
 
 
 def test_build_config_from_data_does_not_mutate_caller_dict() -> None:
-    """Legacy-key hoisting happens on the function's private deepcopy."""
-    data = {"supervisor": {"zero_pass_alarm": 5, "poll_interval_seconds": 10}}
+    """``build_config_from_data`` keeps its "reads a dict, does not touch it"
+    contract: any in-place section work happens on its private deepcopy."""
+    data = {"supervisor": {"poll_interval_seconds": 10}}
     config = build_config_from_data(data)
-    assert config.fleet_supervisor.zero_pass_alarm == 5
-    assert data == {"supervisor": {"zero_pass_alarm": 5, "poll_interval_seconds": 10}}
+    assert config.supervisor.poll_interval_seconds == 10
+    assert data == {"supervisor": {"poll_interval_seconds": 10}}
 
 
 # ---------------------------------------------------------------------------
-# Deprecated-read telemetry and layering
+# Read-time signal and layering
 # ---------------------------------------------------------------------------
 
 
 def test_legacy_read_emits_deprecated_key_event(tmp_path: Path) -> None:
+    """A moved key under ``supervisor:`` is GONE, not deprecated: the load
+    fails as unknown and no ``config_key_deprecated_read`` event fires
+    (the registry carries no ``supervisor.*`` entry to attribute it to).
+
+    The leaf name predates the removal and is kept verbatim for the
+    collect-only gate (issue #1538)."""
     repo = tmp_path / "repo"
     repo.mkdir()
-    _write_repo_config(repo, "supervisor:\n  zero_pass_alarm: 5\n")
-    load_config(repo / "orchestrator.config.yaml")
+    config_path = _write_repo_config(repo, "supervisor:\n  zero_pass_alarm: 5\n")
+    with pytest.raises(ConfigError, match="unknown key"):
+        load_config(config_path)
 
-    rows = query_events(_repo_state_path(repo), kind="config_key_deprecated_read")
-    assert len(rows) == 1
-    payload = rows[0]["payload"]
-    assert payload["section"] == "supervisor"
-    assert payload["key"] == "zero_pass_alarm"
-    assert payload["replacement"] == "fleet_supervisor.zero_pass_alarm"
-    assert payload["issue_number"] == 1979
+    assert query_events(_repo_state_path(repo), kind="config_key_deprecated_read") == []
 
 
 def test_new_location_read_emits_no_event(tmp_path: Path) -> None:
@@ -299,8 +315,13 @@ def test_new_location_read_emits_no_event(tmp_path: Path) -> None:
 
 
 def test_layered_config_honors_legacy_key_from_global_layer(tmp_path: Path) -> None:
-    """A legacy key in the fleet layer merges into the fleet-scoped value and
-    is reported against the layer file it was read from."""
+    """A legacy ``supervisor.<key>`` in the global layer is an unknown key
+    now: it breaks the *merged* load, so the #665 rescue discards the global
+    layer and the repo file alone builds -- the fleet knob reverts to its
+    default rather than honoring the legacy spelling (issue #1979).
+
+    The leaf name predates the removal and is kept verbatim for the
+    collect-only gate (issue #1538)."""
     fleet_dir = tmp_path / "fleet"
     fleet_dir.mkdir()
     (fleet_dir / layout.GLOBAL_CONFIG_FILENAME).write_text(
@@ -308,16 +329,16 @@ def test_layered_config_honors_legacy_key_from_global_layer(tmp_path: Path) -> N
     )
     repo = tmp_path / "repo"
     repo.mkdir()
-    _write_repo_config(repo, "supervisor:\n  poll_interval_seconds: 10\n")
+    repo_config = _write_repo_config(repo, "supervisor:\n  poll_interval_seconds: 10\n")
 
     config = load_layered_config(repo, fleet_dir_override=str(fleet_dir))
 
-    assert config.fleet_supervisor.fleet_lane_concurrency == 4
+    # The global layer was discarded wholesale: the legacy key is an unknown
+    # key, the merged build cannot run, and only the repo file contributes.
+    assert config.fleet_supervisor.fleet_lane_concurrency == 8
     assert config.supervisor.poll_interval_seconds == 10
-    fleet_rows = query_events(layout.state_file_path(fleet_dir), kind="config_key_deprecated_read")
-    assert len(fleet_rows) == 1
-    assert fleet_rows[0]["payload"]["key"] == "fleet_lane_concurrency"
-    assert fleet_rows[0]["payload"]["source"] == str(fleet_dir / layout.GLOBAL_CONFIG_FILENAME)
+    assert config.sources == (str(repo_config),)
+    assert query_events(layout.state_file_path(fleet_dir), kind="config_key_deprecated_read") == []
 
 
 def test_layered_config_rejects_per_repo_fleet_supervisor(tmp_path: Path) -> None:
@@ -342,17 +363,17 @@ def test_layered_config_rejects_per_repo_fleet_supervisor(tmp_path: Path) -> Non
 def test_layered_config_cross_layer_disagreement_resolves_per_layer(
     tmp_path: Path,
 ) -> None:
-    """A ``fleet_supervisor.<key>`` in the global layer disagreeing with a
-    legacy ``supervisor.<key>`` in the repo layer is NOT a merged-view
-    conflict: each layer resolves new>legacy on its own before the merge,
-    so the repo layer wins the disputed key by the ordinary repo-over-global
-    rule -- and the rest of the global layer is NOT discarded over it (the
-    pre-fix outcome this replaces: the merged-view conflict tripped the #665
-    rescue and dropped every global section)."""
+    """A ``fleet_supervisor.<key>`` in the global layer plus a legacy
+    ``supervisor.<key>`` in the repo layer is no longer a resolvable
+    disagreement: the repo file's legacy spelling is an unknown key, so the
+    merged build fails and -- since the repo file cannot build alone either
+    -- the ConfigError propagates (issue #1979).
+
+    The leaf name predates the removal and is kept verbatim for the
+    collect-only gate (issue #1538)."""
     fleet_dir = tmp_path / "fleet"
     fleet_dir.mkdir()
-    global_path = fleet_dir / layout.GLOBAL_CONFIG_FILENAME
-    global_path.write_text(
+    (fleet_dir / layout.GLOBAL_CONFIG_FILENAME).write_text(
         "fleet_supervisor:\n  zero_pass_alarm: 9\n"
         "notify:\n  enabled: true\n"
         "runner_scaling:\n  min_runners: 4\n",
@@ -360,27 +381,23 @@ def test_layered_config_cross_layer_disagreement_resolves_per_layer(
     )
     repo = tmp_path / "repo"
     repo.mkdir()
-    repo_config = _write_repo_config(repo, "supervisor:\n  zero_pass_alarm: 5\n")
+    _write_repo_config(repo, "supervisor:\n  zero_pass_alarm: 5\n")
 
-    config = load_layered_config(repo, fleet_dir_override=str(fleet_dir))
-
-    # The disputed key resolves deterministically: the repo layer wins, like
-    # every other repo-layer key.
-    assert config.fleet_supervisor.zero_pass_alarm == 5
-    # The global layer's other sections survive the disagreement.
-    assert config.notify.enabled is True
-    assert config.runner_scaling.min_runners == 4
-    # Both layers were read -- no rescue discard.
-    assert config.sources == (str(global_path), str(repo_config))
+    with pytest.raises(ConfigError, match="supervisor.*unknown key.*zero_pass_alarm"):
+        load_layered_config(repo, fleet_dir_override=str(fleet_dir))
 
 
 def test_layered_config_same_file_conflict_in_global_layer_raises(
     tmp_path: Path,
 ) -> None:
-    """Both spellings disagreeing inside the *global* file is still the
-    same-file ConfigError -- per-layer resolution happens before the merge,
-    so a conflicting global file cannot be laundered into a cross-layer
-    repo override."""
+    """Both spellings inside the *global* file still fail: the
+    ``supervisor:`` entry is an unknown key, so the merged build rejects it.
+    The per-repo file is valid, so the #665 rescue then lands the repo-only
+    load -- the whole global layer, new-style ``fleet_supervisor`` section
+    included, is discarded over the one dead key.
+
+    The leaf name predates the removal and is kept verbatim for the
+    collect-only gate (issue #1538)."""
     fleet_dir = tmp_path / "fleet"
     fleet_dir.mkdir()
     (fleet_dir / layout.GLOBAL_CONFIG_FILENAME).write_text(
@@ -389,23 +406,25 @@ def test_layered_config_same_file_conflict_in_global_layer_raises(
     )
     repo = tmp_path / "repo"
     repo.mkdir()
-    _write_repo_config(repo, "supervisor:\n  poll_interval_seconds: 10\n")
+    repo_config = _write_repo_config(repo, "supervisor:\n  poll_interval_seconds: 10\n")
 
-    with pytest.raises(ConfigError, match="zero_pass_alarm.*fleet_supervisor.*supervisor"):
-        load_layered_config(repo, fleet_dir_override=str(fleet_dir))
+    config = load_layered_config(repo, fleet_dir_override=str(fleet_dir))
+
+    assert config.supervisor.poll_interval_seconds == 10
+    assert config.fleet_supervisor.zero_pass_alarm == 3  # default; global layer discarded
+    assert config.sources == (str(repo_config),)
 
 
 def test_layered_config_repo_legacy_key_folds_and_still_emits(
     tmp_path: Path,
 ) -> None:
-    """A repo layer's legacy ``supervisor.<key>`` folds into its effective
-    ``fleet_supervisor`` mapping AND still emits the deprecation read -- the
-    fold works on a copy so ``emit_deprecated_key_reads`` sees the raw file's
-    legacy spelling. The ``notify`` assertion pins that the value came from
-    the merged load: without the per-layer fold, the same-file-looking
-    conflict trips the #665 rescue, which still lands this key at 5 (the
-    repo-only reload adopts it) but silently drops the global layer's other
-    sections."""
+    """A repo layer's legacy ``supervisor.<key>`` no longer folds anywhere
+    and no longer emits a deprecation read: the key is unregistered, so the
+    merged build rejects it as unknown, the #665 repo-only retry rejects it
+    identically, and the ConfigError propagates (issue #1979).
+
+    The leaf name predates the removal and is kept verbatim for the
+    collect-only gate (issue #1538)."""
     fleet_dir = tmp_path / "fleet"
     fleet_dir.mkdir()
     (fleet_dir / layout.GLOBAL_CONFIG_FILENAME).write_text(
@@ -414,15 +433,9 @@ def test_layered_config_repo_legacy_key_folds_and_still_emits(
     )
     repo = tmp_path / "repo"
     repo.mkdir()
-    repo_config = _write_repo_config(repo, "supervisor:\n  wedge_kill_loop_alarm: 5\n")
+    _write_repo_config(repo, "supervisor:\n  wedge_kill_loop_alarm: 5\n")
 
-    config = load_layered_config(repo, fleet_dir_override=str(fleet_dir))
+    with pytest.raises(ConfigError, match="supervisor.*unknown key.*wedge_kill_loop_alarm"):
+        load_layered_config(repo, fleet_dir_override=str(fleet_dir))
 
-    assert config.fleet_supervisor.wedge_kill_loop_alarm == 5
-    assert config.notify.enabled is True
-    rows = query_events(_repo_state_path(repo), kind="config_key_deprecated_read")
-    assert len(rows) == 1
-    payload = rows[0]["payload"]
-    assert payload["section"] == "supervisor"
-    assert payload["key"] == "wedge_kill_loop_alarm"
-    assert payload["source"] == str(repo_config)
+    assert query_events(_repo_state_path(repo), kind="config_key_deprecated_read") == []
