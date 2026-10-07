@@ -21,7 +21,7 @@ from datetime import timedelta
 from .charts.strip import nearest_rank
 from .history_data import HistoryView, MetricData
 from .metrics import NEUTRAL, presentation
-from .metrics_base import MetricQuery, Point, Series, iso
+from .metrics_base import MetricQuery, Point, Series, iso, pooled
 from .takeaways import FLAT_BELOW, Compared
 
 WRONG_WAY = 0.20  # a move of 20% or more against the metric's good direction is flagged
@@ -111,10 +111,6 @@ def summarize(
     if how == "median":
         return float(statistics.median(vals))
     return float(statistics.fmean(vals))
-
-
-def pooled(series: Series) -> tuple[float, ...]:
-    return tuple(v for vs in series.samples.values() for v in vs)
 
 
 def fmt_value(value: float | None, unit: str) -> str:
