@@ -302,6 +302,12 @@ class _FakeGH(WorktreeCleanGH):
     issue-#1713 fallback lookup ``clean_worktrees`` makes when state.json
     has no linked PR. Every invocation is recorded in ``calls`` so tests
     can assert whether the fallback ran at all.
+
+    ``issue_states`` maps an issue number to the ``state`` a
+    ``gh issue view <n> --json state`` call should report -- the
+    issue-#2487 closed-issue check ``clean_worktrees`` makes per
+    candidate. Issues absent from the map report ``OPEN`` so the
+    closed-issue lane stays inactive unless a test opts in.
     """
 
     def __init__(
@@ -313,6 +319,7 @@ class _FakeGH(WorktreeCleanGH):
         available: bool = True,
         error: str = "gh: could not resolve to a PullRequest",
         head_branch_prs: dict[str, list[int]] | None = None,
+        issue_states: dict[int, str] | None = None,
     ) -> None:
         self.pr_state = pr_state
         self.merged_at = merged_at
@@ -320,6 +327,7 @@ class _FakeGH(WorktreeCleanGH):
         self.available = available
         self.error = error
         self.head_branch_prs = head_branch_prs or {}
+        self.issue_states = issue_states or {}
         self.calls: list[list[str]] = []
 
     def run(
@@ -365,6 +373,28 @@ class _FakeGH(WorktreeCleanGH):
                     "mergedAt": self.merged_at,
                     "headRefOid": self.head_sha,
                 },
+                error=None,
+            )
+        if args[:2] == ["issue", "view"] and json_output and allow_failure:
+            if not self.available:
+                return GitHubRunResult(
+                    ok=False,
+                    returncode=1,
+                    stdout="",
+                    stderr=self.error,
+                    value=None,
+                    error=self.error,
+                )
+            try:
+                issue_number = int(args[2])
+            except (IndexError, ValueError):
+                issue_number = -1
+            return GitHubRunResult(
+                ok=True,
+                returncode=0,
+                stdout="",
+                stderr="",
+                value={"state": self.issue_states.get(issue_number, "OPEN")},
                 error=None,
             )
         return GitHubRunResult(
