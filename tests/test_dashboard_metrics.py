@@ -248,7 +248,7 @@ def test_not_instrumented_when_no_source_ever_emitted(tmp_path, monkeypatch) -> 
 def test_stage_time_approx_excludes_parked_and_dead_time(tmp_path, monkeypatch) -> None:
     """Issue #2473: an approx ``in_progress`` visit ends at any exit, not only at PR open.
 
-    job-cannon #1427's sequence -- dispatched, escalated, parked ~10 days,
+    The incident behind #2473 -- dispatched, escalated, parked ~10 days,
     unescalated, redispatched, PR opened 17 min later -- was recorded as one
     1534h visit because ``escalated`` never closed the open interval and a
     second ``dispatched`` did not restart it.
@@ -256,7 +256,7 @@ def test_stage_time_approx_excludes_parked_and_dead_time(tmp_path, monkeypatch) 
     monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", str(tmp_path / "fleet"))
     f = Fleet(tmp_path, monkeypatch)
     a = f.alpha
-    # The #1427 shape: a 1h first run, a long park, then a 17-minute winning run.
+    # The incident shape: a 1h first run, a long park, then a 17-minute winning run.
     dispatch(f, a, "2026-09-25T00:00:00Z", [1427])
     f.emit(
         a, "2026-09-25T01:00:00Z", "session_failed_escalated",
