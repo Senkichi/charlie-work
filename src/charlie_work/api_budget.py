@@ -664,7 +664,7 @@ class GitHubUsedMark:
 
 @dataclass(frozen=True)
 class GitHubUsedCursor:
-    """The last ``used`` seen per resource window."""
+    """The last ``used`` seen per (resource, window)."""
 
     marks: tuple[GitHubUsedMark, ...] = ()
 
@@ -698,23 +698,24 @@ def advance_used_cursor(
     cursor: GitHubUsedCursor, sample: GitHubSample
 ) -> tuple[GitHubUsedCursor, int]:
     """Return the cursor after *sample* and the points spent since the last
-    sighting of the same window.
+    sighting of the same window -- one mark per (resource, reset) pair,
+    pruned to within one window (3600s) of the newest reset (issue #2488).
 
     The first sighting of a window is a baseline and counts 0 (its ``used``
-    includes spend this process never saw). A response from an older window,
-    or with a lower ``used`` than already seen (out-of-order arrival), counts
-    0 and leaves the cursor unchanged, so the sum of deltas never exceeds the
-    server's own counter."""
+    includes spend this process never saw); a stale repeat counts 0 and
+    leaves the mark unchanged, so summed deltas never exceed the server's
+    counters -- and a pruned-window sample baselines at 0, unretained."""
     if sample.used is None or sample.reset_epoch is None:
         return cursor, 0
-    mark = GitHubUsedMark(sample.resource, sample.reset_epoch, sample.used)
-    current = next((m for m in cursor.marks if m.resource == sample.resource), None)
-    kept = tuple(m for m in cursor.marks if m.resource != sample.resource)
-    if current is None or current.reset_epoch < sample.reset_epoch:
-        return GitHubUsedCursor((*kept, mark)), 0
-    if current.reset_epoch > sample.reset_epoch or sample.used <= current.used:
+    window = (sample.resource, sample.reset_epoch)
+    current = next((m for m in cursor.marks if (m.resource, m.reset_epoch) == window), None)
+    if current is not None and sample.used <= current.used:
         return cursor, 0
-    return GitHubUsedCursor((*kept, mark)), sample.used - current.used
+    mark = GitHubUsedMark(*window, sample.used)
+    marks = tuple(m for m in cursor.marks if (m.resource, m.reset_epoch) != window) + (mark,)
+    cutoff = max(m.reset_epoch for m in marks if m.resource == sample.resource) - 3600
+    marks = tuple(m for m in marks if m.resource != sample.resource or m.reset_epoch >= cutoff)
+    return GitHubUsedCursor(marks), 0 if current is None else sample.used - current.used
 
 
 @dataclass(frozen=True)
