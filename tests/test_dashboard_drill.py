@@ -154,6 +154,25 @@ def test_escalations_show_reason_and_current_state_from_snapshot(built) -> None:
     assert isinstance(only, drill.IssueDrill) and only.issue == 2060 and only.known
 
 
+def test_verdict_missed_entry_prefers_detail_then_reason(built) -> None:
+    """Issue #2476: the timeline's missed-verdict entry shows the
+    human-readable ``detail`` when present -- ``reason`` is now a stable
+    token -- and falls back to ``reason`` for rows with no detail."""
+    got = drill.issue_drill(ALPHA, 2084, built.sources().db_path, None, NOW)
+    assert isinstance(got, drill.IssueDrill)
+    missed = [e for e in got.timeline if e.event_kind == "review_verdict_missed"]
+    assert [(e.label, e.detail) for e in missed] == [
+        ("Review verdict missed", "reviewer exited before writing a verdict (API error 429)")
+    ]
+
+    bare = drill.issue_drill(ALPHA, 2081, built.sources().db_path, None, NOW)
+    assert isinstance(bare, drill.IssueDrill)
+    bare_missed = [e for e in bare.timeline if e.event_kind == "review_verdict_missed"]
+    assert [(e.label, e.detail) for e in bare_missed] == [
+        ("Review verdict missed", "launch_failed")
+    ]
+
+
 def test_unknown_item_is_a_value_not_an_error(built) -> None:
     got = drill.issue_drill(ALPHA, 424242, built.sources().db_path, None, NOW)
     assert isinstance(got, drill.IssueDrill) and not got.known and got.timeline == ()

@@ -8,7 +8,10 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+
+import pytest
 from _fakes_github import FakeGitHub
+from _review_fixtures import _write_review_packet
 from charlie_work.config import OrchestratorConfig, ReviewConfig
 from charlie_work.paths import runtime_paths
 from charlie_work.state import load_state, save_state, state_lock
@@ -655,3 +658,77 @@ def test_record_review_persists_required_changes(tmp_path: Path) -> None:
         (paths.prs / "pr-456" / "review-decision.json").read_text(encoding="utf-8")
     )
     assert decision["required_changes"] == ["add null check", "update tests"]
+
+
+# --- Issue #2476: every refusal branch carries a stable ``reason`` token ------
+
+
+@pytest.mark.parametrize(
+    ("expected_reason", "call", "prepare"),
+    [
+        pytest.param("invalid_decision", {"decision": "lgtm"}, None, id="invalid_decision"),
+        pytest.param(
+            "invalid_verdict_provenance",
+            {"verdict_provenance": "made_up"},
+            None,
+            id="invalid_verdict_provenance",
+        ),
+        pytest.param(
+            "missing_summary",
+            {"decision": "request_changes", "summary": ""},
+            None,
+            id="missing_summary",
+        ),
+        pytest.param("pr_terminal_state", {}, "pr_merged", id="pr_terminal_state"),
+        pytest.param("pr_escalated", {}, "issue_escalated", id="pr_escalated"),
+        # The other head_moved_during_build site (``--reviewed-head`` equal to
+        # the packet head while the live head moved, the #1072 CAS guard) was
+        # tokenized before #2476 and is pinned by test_fix_verdict_write_race.py.
+        pytest.param(
+            "head_moved_during_build", {}, "packet_then_head_moves", id="head_moved_during_build"
+        ),
+        pytest.param(
+            "reviewed_head_mismatch",
+            {"reviewed_head": "sha-nope"},
+            None,
+            id="reviewed_head_mismatch",
+        ),
+        pytest.param("no_head_available", {}, "no_live_head", id="no_head_available"),
+    ],
+)
+def test_record_review_refusals_carry_reason_token(
+    tmp_path: Path, expected_reason: str, call: dict, prepare: str | None
+) -> None:
+    """Issue #2476: ``_reap_review_verdicts`` emits ``result.data["reason"]``
+    as the ``review_verdict_missed`` event's reason (the free-text message
+    moves to ``detail``). A refusal branch that forgets the token degrades to
+    the opaque ``record_review_refused`` fallback, so every refusal branch is
+    pinned here."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    if prepare == "pr_merged":
+        fake_gh.prs[0]["state"] = "MERGED"
+    elif prepare == "issue_escalated":
+        with state_lock(paths.state_file):
+            state = load_state(paths.state_file)
+            state["issues"]["123"] = {"number": 123, "status": "escalated"}
+            save_state(paths.state_file, state)
+    elif prepare == "packet_then_head_moves":
+        # Packet head was the live head at review() time; a commit then lands
+        # before the verdict, so packet and live heads differ.
+        _write_review_packet(tmp_path, 456, "sha-abc123")
+        fake_gh.pr_head_shas[456] = "sha-new789"
+    elif prepare == "no_live_head":
+        # pr_view returns a record with no headRefOid and no packet exists.
+        fake_gh.prs[0].pop("headRefOid")
+
+    kwargs = {"summary": "lgtm", "verdict_provenance": "fresh_llm_review", **call}
+    result = app.record_review(
+        kwargs.pop("pr_number", 456), kwargs.pop("decision", "approved"), **kwargs
+    )
+
+    assert result.ok is False
+    assert result.data["reason"] == expected_reason

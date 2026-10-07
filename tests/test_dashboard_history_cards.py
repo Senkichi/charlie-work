@@ -7,9 +7,9 @@ import logging
 from datetime import UTC, datetime
 
 from charlie_work.dashboard.history_data import HistoryView, MetricData, range_query
-from charlie_work.dashboard.history_model import card_of, duration_stats
+from charlie_work.dashboard.history_model import bucket_grid, card_of, duration_stats
 from charlie_work.dashboard.metrics_base import Series
-from charlie_work.dashboard.pages.history_detail import render_head, render_lower
+from charlie_work.dashboard.pages.history_detail import chart_entry, render_head, render_lower
 
 START = datetime(2026, 9, 1, tzinfo=UTC)
 END = datetime(2026, 10, 1, tzinfo=UTC)
@@ -78,6 +78,35 @@ def test_stage_time_titles_use_display_names() -> None:
 
     assert set(STAGES) <= set(STAGE_NAMES)
     assert all("_" not in name for name in STAGE_NAMES.values())
+
+
+def test_prs_companion_leads_the_card_and_causes_get_their_own_axis() -> None:
+    """Issue #2476: a ``<name>.prs`` child re-expresses the count in distinct PRs
+    ("3 PRs (6 attempts)"), and ``<name>.cause.*`` children are a separate axis
+    from the reason parts -- in the window drawers and in the chart payload."""
+    pts = (("2026-09-25T00:00:00Z", 6.0),)
+    head = _window(name="verdicts_missed", label="Review verdicts missed",
+                   unit="verdicts", points=pts, n=6)  # fmt: skip
+    prs = _window(name="verdicts_missed.prs", label="PRs with missed verdicts",
+                  points=(("2026-09-25T00:00:00Z", 3.0),), n=3)  # fmt: skip
+    reason = _window(name="verdicts_missed.died_mid_session",
+                     points=(("2026-09-25T00:00:00Z", 4.0),), n=4)  # fmt: skip
+    cause = _window(name="verdicts_missed.cause.api_error:429",
+                    points=(("2026-09-25T00:00:00Z", 4.0),), n=4)  # fmt: skip
+    metric = MetricData("verdicts_missed", (head, prs, reason, cause), {})
+    card = card_of(metric)
+    # distinct PRs lead, attempts in parentheses -- in the card and the detail head
+    assert (card.prs, card.value) == (3.0, 6.0)
+    assert '<span class="num">3 PRs (6 attempts)</span>' in render_head(card, "7d")
+    lower = render_lower(card, metric, frozenset(), UTC)
+    assert "By reason over the window" in lower and "died mid session" in lower
+    assert "By cause over the window" in lower and "api error:429" in lower
+    q = range_query("7d", END, UTC)
+    entry = chart_entry(card, metric, bucket_grid(q))
+    assert set(entry["parts"]) == {"died mid session"}  # prs/cause are not reasons
+    assert set(entry["causes"]) == {"api error:429"}
+    idx = list(bucket_grid(q)).index("2026-09-25T00:00:00Z")
+    assert entry["prs"] == [[idx, 3.0, "3"]]
 
 
 def test_p90_reference_uses_the_raw_samples_in_chart_units() -> None:

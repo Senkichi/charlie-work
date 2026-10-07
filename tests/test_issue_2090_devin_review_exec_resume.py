@@ -648,7 +648,9 @@ def test_failed_record_review_releases_the_claim_and_the_next_pass_retries(
     monkeypatch.setattr(rig.app, "record_review", flaky)
 
     first = rig.reap()
-    assert [m["reason"] for m in first["missed"]] == ["boom"]
+    # Issue #2476: reason is the stable token; the refusal message is detail.
+    assert [m["reason"] for m in first["missed"]] == ["record_review_refused"]
+    assert [m["detail"] for m in first["missed"]] == ["boom"]
     assert _claim(rig) is None
 
     second = rig.reap()

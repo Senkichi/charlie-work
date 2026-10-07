@@ -46,6 +46,9 @@ class Card:
     takeaway: str = ""
     error: str = ""
     stats: tuple[int, float, float] | None = None  # duration only: (n, median, p90)
+    # Distinct PRs behind the count when the metric exposes a ``<name>.prs``
+    # companion series (issue #2476): the card shows "<prs> PRs (<value> attempts)".
+    prs: float | None = None
 
     @property
     def summary_word(self) -> str:
@@ -144,6 +147,10 @@ def card_of(metric: MetricData) -> Card:
     head = metric.headline
     p = presentation(mid, head)
     summary = p.summary or "mean"
+    # A ``<headline>.prs`` companion series re-expresses the count in distinct
+    # PRs (issue #2476); the card leads with it ("88 PRs (300 attempts)") while
+    # the delta and takeaway keep describing the headline's attempt count.
+    prs_series = next((s for s in metric.series[1:] if s.name == f"{head.name}.prs" and s.n), None)
     common = dict(
         unit=head.unit,
         kind=head.kind,
@@ -164,6 +171,7 @@ def card_of(metric: MetricData) -> Card:
         change=change,
         bad=wrong_way(p.polarity, change),
         stats=duration_stats(head),
+        prs=float(prs_series.n) if prs_series is not None else None,
         **common,
     )
 
