@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from charlie_work.claude_code import _events_path
+from charlie_work.budget_gates import budget_deferral
 from charlie_work.devin_review_resume import resume_exec_rejected_review
 from charlie_work.harnesses import REVIEWER_ADAPTER_KINDS
 from charlie_work.process_utils import find_worker_terminal_status
@@ -530,7 +531,7 @@ def _run_review_reap_sweeps(self, resolved_now: datetime) -> dict[str, Any]:
     so the whole block must stay behind this guard, matching the pre-
     extraction ``if not self.dry_run:`` gate in ``dispatch_reviews``).
     """
-    if self.dry_run:
+    if self.dry_run or budget_deferral(self, "review_reap") is not None:
         return {
             "verdict_result": {"recorded": [], "missed": []},
             "reconciled_verdicts": [],
