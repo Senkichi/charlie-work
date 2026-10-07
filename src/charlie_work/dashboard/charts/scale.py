@@ -1,4 +1,4 @@
-"""Axis scales and tick generation: nice linear ticks, local-time ticks, duration ticks.
+"""Axis scale and tick generation: a linear mapping and local-time ticks.
 
 Pure arithmetic, no markup. Times are converted to the display zone (``tz``; the host's
 local zone when ``None``) only for choosing boundaries and labels; positions stay on the
@@ -7,36 +7,8 @@ absolute timeline, so a DST change never bends the x axis.
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta, tzinfo
-
-
-def _nice(x: float, *, round_: bool) -> float:
-    """Heckbert's nice number: 1, 2, 5 or 10 times a power of ten."""
-    exp = math.floor(math.log10(x))
-    f = x / 10**exp
-    if round_:
-        nf = 1.0 if f < 1.5 else 2.0 if f < 3 else 5.0 if f < 7 else 10.0
-    else:
-        nf = 1.0 if f <= 1 else 2.0 if f <= 2 else 5.0 if f <= 5 else 10.0
-    return nf * 10**exp
-
-
-def nice_ticks(lo: float, hi: float, target: int = 5, integer: bool = False) -> tuple[float, ...]:
-    """Evenly spaced 1/2/5 ticks covering ``[lo, hi]``; the first and last enclose it."""
-    if not (math.isfinite(lo) and math.isfinite(hi)):
-        return (0.0, 1.0)
-    if hi <= lo:
-        hi = lo + 1.0
-    step = _nice(_nice(hi - lo, round_=False) / max(target - 1, 1), round_=True)
-    if integer:
-        step = max(step, 1.0)
-    digits = max(0, -math.floor(math.log10(step)))
-    start = math.floor(lo / step + 1e-9) * step
-    end = math.ceil(hi / step - 1e-9) * step
-    count = int(round((end - start) / step))
-    return tuple(round(start + i * step, digits) + 0.0 for i in range(count + 1))
 
 
 @dataclass(frozen=True)
@@ -98,25 +70,3 @@ def time_ticks(
             ticks.append(TimeTick(cursor, text))
         cursor = (cursor + timedelta(seconds=step)).astimezone(tz)
     return tuple(ticks)
-
-
-_DURATION_TICKS = (1, 10, 60, 300, 900, 3600, 4 * 3600, 86400, 7 * 86400)
-
-
-def duration_label(seconds: float) -> str:
-    s = int(seconds)
-    if s < 60:
-        return f"{s}s"
-    if s < 3600:
-        return f"{s // 60}m"
-    if s < 86400:
-        return f"{s // 3600}h"
-    return f"{s // 86400}d"
-
-
-def duration_ticks(lo: float, hi: float) -> tuple[float, ...]:
-    """Round durations enclosing ``[lo, hi]`` seconds, for a log axis."""
-    lo, hi = max(lo, 1.0), max(hi, 1.0)
-    below = [t for t in _DURATION_TICKS if t <= lo] or [_DURATION_TICKS[0]]
-    above = [t for t in _DURATION_TICKS if t >= hi] or [_DURATION_TICKS[-1]]
-    return tuple(t for t in _DURATION_TICKS if below[-1] <= t <= above[0])

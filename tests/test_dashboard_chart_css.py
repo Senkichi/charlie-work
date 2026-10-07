@@ -42,6 +42,16 @@ def test_direct_label_text_meets_aa_on_the_card(theme: str) -> None:
         assert _contrast(tokens[tok], tokens["--lj-card"]) >= 4.5, (theme, tok)
 
 
+def test_charts_css_uses_only_tokens_and_px_text_at_least_11() -> None:
+    css = static_asset("charts.css").read_text(encoding="utf-8")
+    defined = set(re.findall(r"(--[\w-]+)\s*:", generate_css()))
+    used = set(re.findall(r"var\((--[\w-]+)", css))
+    assert used and used <= defined, sorted(used - defined)
+    assert not re.search(r"#[0-9a-fA-F]{3,8}\b|rgba?\(", css)
+    sizes = re.findall(r"font-size:\s*([\d.]+)px", css)
+    assert sizes and all(float(s) >= 11 for s in sizes)
+
+
 @pytest.mark.parametrize("sheet", ["charts.css", "history.css", "drill.css"])
 def test_new_sheets_never_use_the_10px_text_token(sheet: str) -> None:
     css = static_asset(sheet).read_text(encoding="utf-8")
