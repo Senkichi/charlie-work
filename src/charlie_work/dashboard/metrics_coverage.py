@@ -21,14 +21,24 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import TYPE_CHECKING
 
-from .rollup_schema import FLEET_SOURCE
+from .rollup_schema import FLEET_SOURCE, ORCHESTRATOR_SOURCE
 from .timeutil import parse_ts
 
 if TYPE_CHECKING:
     from .metrics_base import MetricQuery
 
 _HOUR = timedelta(hours=1)
-_SCOPE_SQL = {"repos": " AND source != ?", "fleet": " AND source = ?", "all": ""}
+#: Sources that are not a registered repo: the global DB and the supervisor's own
+#: checkout DB (issue #2475). Both are excluded from ``sources="repos"`` scopes --
+#: the orchestrator checkout's near-continuous bookkeeping pulse would otherwise
+#: mark repo-quiet buckets as real zeros for every repo-scoped metric.
+_NON_REPO_SOURCES = (FLEET_SOURCE, ORCHESTRATOR_SOURCE)
+#: scope name -> (SQL predicate, predicate args). "repos" is per-registered-repo only.
+_SCOPE_SQL = {
+    "repos": (" AND source NOT IN (?, ?)", _NON_REPO_SOURCES),
+    "fleet": (" AND source = ?", (FLEET_SOURCE,)),
+    "all": ("", ()),
+}
 
 
 @dataclass(frozen=True)
@@ -42,8 +52,8 @@ def load_coverage(
     db: sqlite3.Connection, kinds: Sequence[str], sources: str, any_kind: bool = False
 ) -> Coverage:
     marks = ", ".join("?" for _ in kinds)
-    where = _SCOPE_SQL[sources]
-    args = (*kinds, *((FLEET_SOURCE,) if where else ()))
+    where, extra = _SCOPE_SQL[sources]
+    args = (*kinds, *extra)
     rows = db.execute(
         f"SELECT source, kind, first_ts, last_ts FROM coverage WHERE (kind IN ({marks})"
         f" OR kind = '*'){where} AND first_ts IS NOT NULL",
@@ -79,9 +89,9 @@ def alive_buckets(
     db: sqlite3.Connection, q: MetricQuery, stream: str, sources: str
 ) -> dict[str, frozenset[int]]:
     """Per source, the buckets in which it wrote anything on ``stream`` (hourly resolution)."""
-    where = _SCOPE_SQL[sources]
+    where, extra = _SCOPE_SQL[sources]
     first_hour = q.start.strftime("%Y-%m-%dT%H")
-    args = (stream, first_hour, q.end_iso[:13], *((FLEET_SOURCE,) if where else ()))
+    args = (stream, first_hour, q.end_iso[:13], *extra)
     rows = db.execute(
         f"SELECT source, hour FROM pulse WHERE stream = ? AND hour >= ? AND hour <= ?{where}",
         args,

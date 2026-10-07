@@ -16,6 +16,7 @@ from charlie_work.dashboard import sources
 from charlie_work.fleet_registry import touch_repo
 from charlie_work.github import GitHub
 from charlie_work.paths import runtime_paths
+from charlie_work.supervisor_lifecycle import write_supervisor_heartbeat
 
 NOW = datetime(2026, 10, 1, 12, 0, 0, tzinfo=UTC)
 
@@ -202,6 +203,50 @@ def test_global_events_db_readable(fleet) -> None:
         assert event is not None and event["payload"] == {"pid": 42}
     finally:
         conn.close()
+
+
+def test_orchestrator_events_db_follows_heartbeat_stamp(fleet, tmp_path: Path) -> None:
+    """Issue #2475: the supervisor's checkout DB resolves from its heartbeat.
+
+    ``self_deploy`` logs beside the checkout's own ``state.json``
+    (``supervise._self_deploy_state_path``); the heartbeat's
+    ``orchestrator_root`` is the durable record the dashboard derives the
+    same path from. The returned path must be the DB the writer actually
+    writes -- asserted by writing a real event through ``log_event``.
+    """
+    fleet_dir, _, _ = fleet
+    checkout = tmp_path / "daemon-checkout"
+    log = checkout / ".var" / "charlie-work" / "state.json"
+    instrumentation.log_event(log, "self_deploy_succeeded", {"ok": True})
+    instrumentation.close_db(log)
+    write_supervisor_heartbeat(
+        fleet_dir / sources.HEARTBEAT_FILENAME, {"orchestrator_root": str(checkout)}
+    )
+
+    resolved = sources.orchestrator_events_db(str(fleet_dir))
+
+    assert resolved == checkout / ".var" / "charlie-work" / "events.db"
+    assert resolved.exists()  # the DB the self-deploy writer just wrote
+
+
+def test_orchestrator_events_db_missing_or_malformed_is_none(tmp_path: Path) -> None:
+    """Absent, predating, unreadable, or wrongly-typed stamps all read as None."""
+    fleet_dir = tmp_path / "fleet"
+    heartbeat = fleet_dir / sources.HEARTBEAT_FILENAME
+
+    assert sources.orchestrator_events_db(str(fleet_dir)) is None  # no heartbeat
+
+    write_supervisor_heartbeat(heartbeat, {"pid": 1})
+    assert sources.orchestrator_events_db(str(fleet_dir)) is None  # predates the stamp
+
+    heartbeat.write_text("{not json", encoding="utf-8")
+    assert sources.orchestrator_events_db(str(fleet_dir)) is None  # unreadable
+
+    write_supervisor_heartbeat(heartbeat, {"orchestrator_root": 42})
+    assert sources.orchestrator_events_db(str(fleet_dir)) is None  # non-string field
+
+    write_supervisor_heartbeat(heartbeat, {"orchestrator_root": ""})
+    assert sources.orchestrator_events_db(str(fleet_dir)) is None  # empty string
 
 
 def test_sources_does_not_import_actuating_ci_fleet_modules() -> None:

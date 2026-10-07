@@ -4,8 +4,9 @@ Bump ``SCHEMA_VERSION`` whenever a table or its derivation changes; ``rollup`` d
 and rebuilds the whole file on a mismatch, so no migration code exists or is needed.
 
 Every per-event fact table is keyed ``(source, src_id, seq)``: ``source`` is the events
-DB the row came from (a ``fleet.json`` repo key, or ``FLEET_SOURCE`` for the global DB),
-``src_id`` the source event id, ``seq`` the row's index within that event. The key makes
+DB the row came from (a ``fleet.json`` repo key, ``FLEET_SOURCE`` for the global DB, or
+``ORCHESTRATOR_SOURCE`` for the checkout the supervisor runs from), ``src_id`` the
+source event id, ``seq`` the row's index within that event. The key makes
 re-deriving an event an idempotent ``INSERT OR REPLACE``.
 """
 
@@ -13,6 +14,13 @@ from __future__ import annotations
 
 SCHEMA_VERSION = 9  # 9: session_failed_relabeled milestone (issue #2473); 8: pass_samples.parked_unready (issue #2314); 7: issue_milestones (source, milestone) index; 6: <kind>_sweep expansion, dead-worker PR open; 5: batch rework PR scoping
 FLEET_SOURCE = "fleet"
+#: The supervisor's own checkout's events.db (``orchestrator_root`` stamped in
+#: ``supervisor-heartbeat.json``), where ``self_deploy_*`` events live (issue #2475).
+#: Not a registry repo: the rollup admits only ``self_deploy_*`` evidence from it
+#: (``rollup._kind_filter`` for facts, ``rollup._write_coverage``/``_write_pulse``
+#: for coverage and pulse), and ``sources="repos"`` metric scopes exclude it
+#: alongside ``fleet``.
+ORCHESTRATOR_SOURCE = "orchestrator"
 
 _KEY = (
     "source TEXT NOT NULL, src_id INTEGER NOT NULL, seq INTEGER NOT NULL,"

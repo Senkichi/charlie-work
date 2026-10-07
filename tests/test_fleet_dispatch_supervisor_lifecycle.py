@@ -28,7 +28,7 @@ from charlie_work.fleet_dispatch import (
 )
 from charlie_work.host.fakes import FakeClock
 from charlie_work.notify import AttentionEntry
-from charlie_work.supervise import SelfDeployResult
+from charlie_work.supervise import SelfDeployResult, orchestrator_root
 
 
 @patch("charlie_work.fleet_dispatch.fleet_loop")
@@ -480,3 +480,39 @@ def test_run_fleet_supervise_wires_fleet_supervisor_knobs(
     assert start_kwargs["max_pass_runtime_seconds"] == 42
     assert start_kwargs["wedge_kill_loop_alarm"] == 9
     assert mock_fleet_loop.call_args.kwargs["deadline_seconds"] == 42
+
+
+@patch("charlie_work.fleet_dispatch.fleet_loop")
+@patch("charlie_work.fleet_dispatch.load_layered_config")
+@patch("charlie_work.fleet_dispatch.try_acquire_supervisor_lock")
+def test_supervise_stamps_orchestrator_root_on_start_and_every_beat(
+    mock_lock: MagicMock,
+    mock_load_config: MagicMock,
+    mock_fleet_loop: MagicMock,
+    tmp_path: Path,
+    _patch_self_deploy_for_fleet_tests: dict[str, MagicMock],
+) -> None:
+    """Issue #2475 regression: both lifecycle writers get ``orchestrator_root``.
+
+    The dashboard resolves the self-deploy events DB through the heartbeat's
+    ``orchestrator_root`` stamp. Dropping the kwarg at either call site leaves
+    the stamp absent -- or unrestored after a mid-run heartbeat deletion -- and
+    the deploys source silently goes away, so both are asserted here.
+    """
+    mocks = _patch_self_deploy_for_fleet_tests
+    mock_load_config.return_value = OrchestratorConfig(
+        supervisor=SupervisorConfig(poll_interval_seconds=5, full_pass_interval_seconds=1)
+    )
+    mock_fleet_loop.return_value = _drained_fleet_result()
+
+    fc = FakeClock(auto_advance=1.0)
+    result = run_fleet_supervise(max_passes=2, clock=fc.monotonic, sleep=fc.sleep)
+
+    assert result.ok is True
+    expected = str(orchestrator_root())
+    start_kwargs = mocks["record_supervisor_started"].call_args.kwargs
+    assert start_kwargs["orchestrator_root"] == expected
+    beats = mocks["update_supervisor_heartbeat"].call_args_list
+    assert beats, "heartbeat was never updated"
+    for call in beats:
+        assert call.kwargs["orchestrator_root"] == expected

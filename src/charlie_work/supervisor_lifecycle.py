@@ -188,6 +188,7 @@ def record_supervisor_started(
     full_pass_interval_seconds: int,
     max_pass_runtime_seconds: int | None = None,
     wedge_kill_loop_alarm: int | None = None,
+    orchestrator_root: str | None = None,
 ) -> None:
     """Emit ``supervisor_started`` and write a fresh heartbeat.
 
@@ -201,6 +202,12 @@ def record_supervisor_started(
     logged) so ``scripts/heartbeat_check.py`` — which deliberately never
     imports ``charlie_work.config`` — can read the configured threshold
     without hardcoding a duplicate default (issue #1832).
+
+    ``orchestrator_root`` names the checkout this supervisor executes
+    (issue #2475): the ``self_deploy_*`` events it writes land in that
+    checkout's own ``events.db``, not necessarily a registry repo's, so
+    the dashboard derives the deploys source from this record rather
+    than hardcoding a daemon path.
     """
     if max_pass_runtime_seconds is None:
         max_pass_runtime_seconds = full_pass_interval_seconds
@@ -213,6 +220,7 @@ def record_supervisor_started(
         "full_pass_interval_seconds": full_pass_interval_seconds,
         "max_pass_runtime_seconds": max_pass_runtime_seconds,
         "wedge_kill_loop_alarm": wedge_kill_loop_alarm,
+        "orchestrator_root": orchestrator_root,
         "exited_at": None,
         "exit_code": None,
     }
@@ -233,6 +241,7 @@ def record_supervisor_started(
                 "full_pass_interval_seconds": full_pass_interval_seconds,
                 "max_pass_runtime_seconds": max_pass_runtime_seconds,
                 "wedge_kill_loop_alarm": wedge_kill_loop_alarm,
+                "orchestrator_root": orchestrator_root,
             },
             repo=_FLEET_REPO,
         )
@@ -245,6 +254,7 @@ def update_supervisor_heartbeat(
     *,
     pass_number: int,
     last_beat_at: str,
+    orchestrator_root: str | None = None,
 ) -> None:
     """Refresh ``last_beat_at`` / ``pass_number`` on the existing heartbeat.
 
@@ -256,6 +266,10 @@ def update_supervisor_heartbeat(
     is skipped (and logged) rather than overwriting it with a record
     that drops those fields. Best-effort: a write failure is logged and
     swallowed so a disk hiccup does not abort the pass.
+
+    ``orchestrator_root`` (issue #2475) is restamped each beat so the
+    record survives a mid-run heartbeat deletion instead of waiting for
+    the next supervisor start to restore it.
     """
     path = supervisor_heartbeat_path(fleet_dir_override)
     existing = _read_heartbeat_for_merge(path)
@@ -272,6 +286,8 @@ def update_supervisor_heartbeat(
             "pass_number": pass_number,
         }
     )
+    if orchestrator_root is not None:
+        existing["orchestrator_root"] = orchestrator_root
     try:
         _write_heartbeat(path, existing)
     except OSError as exc:

@@ -20,6 +20,7 @@ from _dashboard_metrics_fixtures import (  # noqa: F401  (ro_db is a pytest fixt
 )
 from _dashboard_rollup_fixtures import ALPHA, BETA, Fleet
 
+from charlie_work import instrumentation
 from charlie_work.dashboard import metrics, rollup
 from charlie_work.dashboard import metrics_capacity as cap
 from charlie_work.dashboard import metrics_flow as flow
@@ -27,6 +28,7 @@ from charlie_work.dashboard import metrics_quality as quality
 from charlie_work.dashboard import metrics_reliability as rel
 from charlie_work.dashboard.metrics_base import MetricQuery, open_dashboard_ro
 from charlie_work.dashboard.takeaways import takeaway
+from charlie_work.supervisor_lifecycle import write_supervisor_heartbeat
 
 ZEROS = [0.0] * 7
 q_day = timedelta(days=1)
@@ -227,6 +229,193 @@ def test_bucket_size_changes_resolution(ro_db) -> None:
     week = MetricQuery(CURRENT.start, CURRENT.end, timedelta(days=7))
     s = flow.merges_per_day(ro_db, week)
     assert s.points == ((CURRENT.start_iso, 5.0),)
+
+
+def test_orchestrator_source_is_ingested_but_never_a_repo(tmp_path, monkeypatch) -> None:
+    """Issue #2475: the supervisor's checkout DB is a rollup source, not a repo.
+
+    Its ``self_deploy_*`` events must reach ``deploys`` (the point of the fix),
+    while any repo-loop history the checkout's DB happens to hold is filtered
+    out at ingest, so a repo-scoped gauge cannot grow a phantom ``orchestrator``
+    line -- the source never contributes its rows.
+    """
+    monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", str(tmp_path / "fleet"))
+    f = Fleet(tmp_path, monkeypatch)
+    checkout = tmp_path / "daemon-checkout"
+    state_dir = checkout / ".var" / "charlie-work"
+    # a checkout that once ran a repo loop can carry dispatch history; the deploy
+    # event is the one this issue is about
+    dispatch(f, state_dir, day(2, 5), live=9)
+    f.emit(state_dir, day(3, 5), "self_deploy_succeeded", {"ok": True})
+    instrumentation.close_db(state_dir / "state.json")
+    write_supervisor_heartbeat(f.fleet_state, {"orchestrator_root": str(checkout)})
+    result = rollup.run_rollup(f.sources(), NOW)
+    # alpha/beta/fleet DBs legitimately do not exist in this fixture; the
+    # orchestrator source itself ingested only the deploy event, skipping the
+    # dispatch history its kind filter does not admit.
+    by = {s.source: s for s in result.sources}
+    assert by["orchestrator"].error is None and by["orchestrator"].ingested == 1
+    db, err = open_dashboard_ro(f.sources().db_path)
+    assert db is not None, err
+    try:
+        # the dispatch never left the source: deploys are the only facts it makes
+        assert db.execute("SELECT source FROM pass_samples").fetchall() == []
+        wip = flow.work_in_progress(db, CURRENT)
+        assert "orchestrator" not in wip.per_repo  # per-repo = registered repos
+        assert wip.points == ()  # no repo wrote a pass sample: nothing to chart
+        deploys = {s.name: s for s in rel.self_deploys(db, CURRENT)}
+        assert (day(3), 1.0) in deploys["self_deploys"].points
+        assert (day(3), 1.0) in deploys["self_deploys"].per_repo["orchestrator"]
+    finally:
+        db.close()
+        f.close()
+
+
+def test_orchestrator_repo_history_never_reaches_a_repos_scope(tmp_path, monkeypatch) -> None:
+    """Issue #2475: checkout fact history cannot mint an ``orchestrator`` repo line.
+
+    A supervisor deployment checkout may once have run a repo loop, so its
+    events.db can hold real dispatch-era history (an escalation, a worker exit,
+    finished loop passes). The orchestrator source is ingest-filtered to the
+    handled ``self_deploy_*`` kinds, so that history reaches no fact table --
+    and no ``sources="repos"`` series or ``per_repo`` map can draw an
+    ``orchestrator`` line. Mutation control: reverting the ``_kind_filter``
+    restriction (or the ``_copy_loop_passes`` exclusion) lets the rows land and
+    bucket under ``active_for``'s fallback, failing every assertion below.
+    """
+    monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", str(tmp_path / "fleet"))
+    f = Fleet(tmp_path, monkeypatch)
+    # Alpha's coverage spans days 1-3 for both metrics under test, so a
+    # non-repo sample at day 2 would land (its ``active_for`` falls back to
+    # the repos' union) if the orchestrator source could emit fact rows.
+    for kind, payload in (
+        ("session_failed_escalated", {"issue_number": 1, "reason": "capped"}),
+        ("session_exited", {"failure_kind": "stalled", "issue_number": 1}),
+    ):
+        for n in (1, 3):
+            f.emit(f.alpha, day(n, 1), kind, payload)
+    checkout = tmp_path / "daemon-checkout"
+    state_dir = checkout / ".var" / "charlie-work"
+    f.emit(
+        state_dir,
+        day(2, 5),
+        "session_failed_escalated",
+        {"issue_number": 60, "reason": "capped"},
+    )
+    f.emit(state_dir, day(2, 6), "session_exited", {"failure_kind": "stalled"})
+    instrumentation.record_loop_pass(state_dir / "state.json", "c0", day(2, 1))
+    instrumentation.record_loop_pass(
+        state_dir / "state.json", "c0", day(2, 1), day(2, 2), ok=True, elapsed_seconds=60.0
+    )
+    instrumentation.close_db(state_dir / "state.json")
+    write_supervisor_heartbeat(f.fleet_state, {"orchestrator_root": str(checkout)})
+    result = rollup.run_rollup(f.sources(), NOW)
+    by = {s.source: s for s in result.sources}
+    assert by["orchestrator"].error is None and by["orchestrator"].ingested == 0
+    db, err = open_dashboard_ro(f.sources().db_path)
+    assert db is not None, err
+    try:
+        # Nothing left the source: no orchestrator rows in any fact table.
+        for table in ("escalations", "worker_exits", "issue_milestones", "loop_passes"):
+            assert (
+                db.execute(f"SELECT * FROM {table} WHERE source = 'orchestrator'").fetchall() == []
+            )
+        # ...so a repos-scope series counts only alpha's events, with no
+        # "orchestrator" key in its per_repo map.
+        esc = {s.name: s for s in quality.escalations(db, CURRENT)}
+        assert esc["escalations"].points == pts((1, 1.0), (3, 1.0))
+        assert all("orchestrator" not in s.per_repo for s in esc.values())
+        fate = {s.name: s for s in quality.worker_fate(db, CURRENT)}
+        assert fate["worker_fate"].points == pts((1, 1.0), (3, 1.0))
+        assert all("orchestrator" not in s.per_repo for s in fate.values())
+    finally:
+        db.close()
+        f.close()
+
+
+def test_orchestrator_history_never_reaches_all_scope_coverage_or_pulse(
+    tmp_path, monkeypatch
+) -> None:
+    """Issue #2475: ingest bounds the deploys-only source's coverage and pulse too.
+
+    A deployment checkout's DB can hold real repo-loop history (dispatches,
+    worker exits, finished loop passes). ``_kind_filter`` already keeps it out
+    of every fact table; ``_write_coverage``/``_write_pulse`` must apply the
+    same bound or a ``sources="all"`` series leaks: the checkout's
+    ``session_exited`` history would pull ``throttles`` coverage_start two days
+    early and grow its active buckets, and its ``dispatch`` pulse would mint
+    real zeros for ``capped_demand`` in buckets where only the stale history
+    was alive. Mutation control: with the unfiltered writers (this file's
+    ``rollup.py`` at the remote branch head) every assertion below fails.
+    """
+    monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", str(tmp_path / "fleet"))
+    f = Fleet(tmp_path, monkeypatch)
+    a = f.alpha
+    # Alpha: a capped pass + a backpressure on day 2, a rate-limited exit on day
+    # 3, an uncapped pass on day 7 (a real zero on the dispatch pulse).
+    dispatch(f, a, day(2, 2), dispatchable=5, limit=1)
+    f.emit(a, day(2, 5), "dispatch_backpressure", {"clamped_by": "host_load"})
+    f.emit(a, day(3, 8), "session_exited", {"failure_kind": "rate_limited"})
+    dispatch(f, a, day(7, 1), dispatchable=0)
+
+    rollup.run_rollup(f.sources(), NOW)
+    db = f.db()
+    base_capped = cap.capped_demand(db, CURRENT)
+    base_throttles = {s.name: s for s in rel.throttles(db, CURRENT)}
+    db.close()
+
+    checkout = tmp_path / "daemon-checkout"
+    state_dir = checkout / ".var" / "charlie-work"
+    # Repo-loop history the checkout legitimately holds: an exit predating
+    # alpha's first throttles kind, dispatches on days alpha never dispatched
+    # (day 1) or dispatched nothing countable (day 3), a finished loop pass.
+    f.emit(state_dir, day(1, 3), "session_exited", {"failure_kind": "stalled"})
+    dispatch(f, state_dir, day(1, 5))
+    dispatch(f, state_dir, day(3, 5))
+    instrumentation.record_loop_pass(
+        state_dir / "state.json", "ck0", day(2, 1), day(2, 2), ok=True, elapsed_seconds=30.0
+    )
+    f.emit(state_dir, day(3, 9), "self_deploy_succeeded", {"ok": True})
+    # bookkeeping keeps the '*' envelope alive past the deploy: day-7 deploys is
+    # a real zero, not a coverage gap
+    f.emit(state_dir, day(7, 10), "self_deploy_sync_starved", {"pending": 2})
+    instrumentation.close_db(state_dir / "state.json")
+    write_supervisor_heartbeat(f.fleet_state, {"orchestrator_root": str(checkout)})
+
+    result = rollup.run_rollup(f.sources(), NOW)
+    by = {s.source: s for s in result.sources}
+    assert by["orchestrator"].error is None and by["orchestrator"].ingested == 1
+    db = f.db()
+    try:
+        # The source's footprint is deploy evidence only: '*' still spans every
+        # checkout event (the liveness envelope self_deploys reads), but the
+        # per-kind rows stop at the deploy domain and the pulse is events-only.
+        assert db.execute(
+            "SELECT kind, n FROM coverage WHERE source = 'orchestrator' ORDER BY kind"
+        ).fetchall() == [("*", 5), ("self_deploy_succeeded", 1), ("self_deploy_sync_starved", 1)]
+        assert db.execute(
+            "SELECT DISTINCT stream FROM pulse WHERE source = 'orchestrator'"
+        ).fetchall() == [("events",)]
+        assert (
+            db.execute("SELECT * FROM loop_passes WHERE source = 'orchestrator'").fetchall() == []
+        )
+
+        capped = cap.capped_demand(db, CURRENT)
+        assert capped.points == ((day(2), 2.0), (day(7), 0.0))
+        assert capped.coverage_start == day(2, 5) and capped == base_capped
+        throttles = {s.name: s for s in rel.throttles(db, CURRENT)}
+        assert throttles["throttles"].points == ((day(3), 1.0), (day(7), 0.0))
+        assert throttles["throttles"].coverage_start == day(3, 8)
+        assert throttles == base_throttles
+        deploys = {s.name: s for s in rel.self_deploys(db, CURRENT)}
+        assert deploys["self_deploys"].points == ((day(3), 1.0), (day(7), 0.0))
+        assert deploys["self_deploys"].per_repo["orchestrator"] == (
+            (day(3), 1.0),
+            (day(7), 0.0),
+        )
+    finally:
+        db.close()
+        f.close()
 
 
 def test_not_instrumented_when_no_source_ever_emitted(tmp_path, monkeypatch) -> None:
