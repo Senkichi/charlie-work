@@ -449,6 +449,44 @@ def test_record_supervisor_started_stamps_wedge_kill_loop_alarm(tmp_path: Path) 
     assert events[0]["payload"]["wedge_kill_loop_alarm"] == 5
 
 
+def test_record_supervisor_started_stamps_orchestrator_root(tmp_path: Path) -> None:
+    """Issue #2475: the heartbeat records which checkout the supervisor executes.
+
+    ``self_deploy_*`` events land in that checkout's own ``events.db``; the
+    dashboard derives its deploys source from this field rather than a
+    hardcoded daemon path.
+    """
+    fleet_dir = str(tmp_path / "fleet")
+    record_supervisor_started(
+        fleet_dir,
+        pid=12345,
+        started_at=STARTED_AT,
+        full_pass_interval_seconds=300,
+        orchestrator_root="C:/srv/charlie-work-daemon",
+    )
+    hb = json.loads(_heartbeat_file(tmp_path / "fleet").read_text(encoding="utf-8"))
+    assert hb["orchestrator_root"] == "C:/srv/charlie-work-daemon"
+    events = query_events(supervisor_heartbeat_path(fleet_dir), kind=SUPERVISOR_STARTED)
+    assert events[0]["payload"]["orchestrator_root"] == "C:/srv/charlie-work-daemon"
+
+
+def test_update_supervisor_heartbeat_restamps_orchestrator_root(tmp_path: Path) -> None:
+    """Issue #2475: each beat restamps the field so a heartbeat recreated mid-run
+    (or written before the stamp existed) picks it up without a restart — while a
+    caller that does not pass it leaves the recorded value alone."""
+    fleet_dir = str(tmp_path / "fleet")
+    update_supervisor_heartbeat(
+        fleet_dir,
+        pass_number=4,
+        last_beat_at=BEAT_AT,
+        orchestrator_root="C:/srv/charlie-work-daemon",
+    )
+    update_supervisor_heartbeat(fleet_dir, pass_number=5, last_beat_at=BEAT_AT)
+    hb = json.loads(_heartbeat_file(tmp_path / "fleet").read_text(encoding="utf-8"))
+    assert hb["orchestrator_root"] == "C:/srv/charlie-work-daemon"
+    assert hb["pass_number"] == 5
+
+
 def test_record_fleet_pass_completed_writes_event(tmp_path: Path) -> None:
     fleet_dir = str(tmp_path / "fleet")
     record_fleet_pass_completed(fleet_dir, pass_number=3, outcome="ok")

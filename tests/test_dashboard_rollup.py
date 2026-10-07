@@ -18,7 +18,8 @@ from _dashboard_rollup_fixtures import (  # noqa: F401  (fleet is a pytest fixtu
     fleet,
 )
 
-from charlie_work.dashboard import history_data, rollup
+from charlie_work import instrumentation
+from charlie_work.dashboard import history_data, metrics_coverage, rollup, sources
 from charlie_work.dashboard.rollup_derive import (
     HANDLERS,
     KNOWN_IGNORED,
@@ -26,6 +27,7 @@ from charlie_work.dashboard.rollup_derive import (
     reason_group,
 )
 from charlie_work.dashboard.rollup_schema import SCHEMA_VERSION
+from charlie_work.supervisor_lifecycle import write_supervisor_heartbeat
 
 
 def test_facts_exact_values(fleet) -> None:
@@ -537,3 +539,106 @@ def test_issue_2459_kinds_are_not_counted_unclassified_by_the_rollup(fleet) -> N
     result = rollup.run_rollup(fleet.sources(), NOW)
     assert result.errors == ()
     assert {s.source: s for s in result.sources}[ALPHA].unclassified == {}
+
+
+def test_orchestrator_source_backfills_self_deploy_history(fleet, tmp_path) -> None:
+    """Issue #2475: a heartbeat-stamped checkout contributes its self_deploy_* events.
+
+    Deploys were frozen since 08-14 because the supervisor's deployment checkout
+    writes them to its own events.db, which no source read. The heartbeat's
+    ``orchestrator_root`` names that checkout; a fresh watermark then backfills
+    its entire history on first read (the 08-14 event is months before ``NOW``).
+    """
+    checkout = tmp_path / "daemon-checkout"
+    state_dir = checkout / ".var" / "charlie-work"
+    fleet.emit(
+        state_dir,
+        "2026-08-14T09:00:00Z",
+        "self_deploy_succeeded",
+        {"changed": True, "from_sha": "aaaa1111", "to_sha": "bbbb2222"},
+    )
+    fleet.emit(
+        state_dir,
+        "2026-08-15T09:30:00Z",
+        "self_deploy_failed",
+        {"changed": False, "error": "merge conflict"},
+    )
+    fleet.emit(
+        state_dir,
+        "2026-08-15T09:31:00Z",
+        "self_deploy_sync_starved",
+        {"pending": 3},  # bookkeeping kind: coverage only, no fact rows
+    )
+    instrumentation.close_db(state_dir / "state.json")
+    write_supervisor_heartbeat(fleet.fleet_state, {"orchestrator_root": str(checkout)})
+
+    result = rollup.run_rollup(fleet.sources(), NOW)
+
+    assert result.errors == ()
+    by = {s.source: s for s in result.sources}
+    assert by["orchestrator"].ingested == 2  # starved is KNOWN_IGNORED, not a fact
+    assert _all(
+        fleet.db(),
+        "SELECT source, ok, changed, from_sha, to_sha, error FROM deploys ORDER BY ts",
+    ) == [
+        ("orchestrator", 1, 1, "aaaa1111", "bbbb2222", None),
+        ("orchestrator", 0, 0, None, None, "merge conflict"),
+        (ALPHA, 1, 1, "32e8", "d6c3", None),
+    ]
+    # coverage is honest about everything in the source, including ignored kinds
+    assert _all(
+        fleet.db(),
+        "SELECT kind, n FROM coverage WHERE source = 'orchestrator' ORDER BY kind",
+    ) == [
+        ("*", 3),
+        ("self_deploy_failed", 1),
+        ("self_deploy_succeeded", 1),
+        ("self_deploy_sync_starved", 1),
+    ]
+
+
+def test_orchestrator_source_deduped_against_a_registered_repo(fleet, tmp_path) -> None:
+    """A supervisor running from a registered checkout adds no second source."""
+    write_supervisor_heartbeat(fleet.fleet_state, {"orchestrator_root": str(tmp_path / "alpha")})
+    resolved = fleet.sources()
+    assert resolved.orchestrator_events_db is None  # alpha's own events.db
+    result = rollup.run_rollup(resolved, NOW)
+    assert "orchestrator" not in {s.source for s in result.sources}
+    # alpha's self_deploy row is still present exactly once, under its repo key
+    assert _all(fleet.db(), "SELECT source FROM deploys") == [(ALPHA,)]
+
+
+def test_orchestrator_source_deduped_against_the_fleet_db(tmp_path) -> None:
+    """When the supervisor's state dir IS the fleet dir, its DB is already the
+    fleet source -- the orchestrator source must not double-read it."""
+    root = tmp_path / "checkout"
+    fleet_dir = root / ".var" / "charlie-work"
+    fleet_dir.mkdir(parents=True)
+    write_supervisor_heartbeat(
+        fleet_dir / sources.HEARTBEAT_FILENAME, {"orchestrator_root": str(root)}
+    )
+
+    resolved = rollup.rollup_sources(str(fleet_dir))
+
+    assert resolved.fleet_events_db == fleet_dir / "events.db"
+    assert resolved.orchestrator_events_db is None
+
+
+def test_orchestrator_source_excluded_from_repos_metric_scope(fleet, tmp_path) -> None:
+    """Issue #2475: the orchestrator source is not a registry repo; ``repos``
+    scopes must not count its activity as repository evidence."""
+    checkout = tmp_path / "daemon-checkout"
+    state_dir = checkout / ".var" / "charlie-work"
+    fleet.emit(state_dir, "2026-10-01T10:30:00Z", "self_deploy_succeeded", {"ok": True})
+    instrumentation.close_db(state_dir / "state.json")
+    write_supervisor_heartbeat(fleet.fleet_state, {"orchestrator_root": str(checkout)})
+    rollup.run_rollup(fleet.sources(), NOW)
+    db = fleet.db()
+
+    kinds = ("self_deploy_succeeded",)
+    assert set(metrics_coverage.load_coverage(db, kinds, "repos").spans) == {ALPHA}
+    assert set(metrics_coverage.load_coverage(db, kinds, "all").spans) == {
+        ALPHA,
+        "orchestrator",
+    }
+    assert metrics_coverage.load_coverage(db, kinds, "fleet").spans == {}

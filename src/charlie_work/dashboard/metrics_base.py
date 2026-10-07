@@ -19,8 +19,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from .metrics_coverage import Coverage, Scope, build_scope
-from .rollup_schema import FLEET_SOURCE
+from .metrics_coverage import _SCOPE_SQL, Coverage, Scope, build_scope
 from .timeutil import iso, parse_ts
 
 __all__ = ["iso", "parse_ts"]  # re-exported: metric modules and tests import them from here
@@ -138,8 +137,8 @@ def coverage(db: sqlite3.Connection, kinds: Sequence[str], sources: str) -> tupl
     if not kinds:
         return None
     marks = ", ".join("?" for _ in kinds)
-    where = {"repos": " AND source != ?", "fleet": " AND source = ?", "all": ""}[sources]
-    args = (*kinds, *((FLEET_SOURCE,) if where else ()))
+    where, extra = _SCOPE_SQL[sources]
+    args = (*kinds, *extra)
     row = db.execute(
         f"SELECT MIN(first_ts), MAX(last_ts) FROM coverage WHERE kind IN ({marks}){where}", args
     ).fetchone()

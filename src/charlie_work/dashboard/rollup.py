@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -35,6 +36,7 @@ from .rollup_derive import GLOBAL_ONLY_KINDS, HANDLERS, derive_event, is_classif
 from .rollup_schema import (
     FLEET_SOURCE,
     LOOP_PASS_COLUMNS,
+    ORCHESTRATOR_SOURCE,
     SCHEMA_VERSION,
     SOURCE_SCOPED_TABLES,
     WINDOWED_TABLES,
@@ -55,6 +57,9 @@ class RollupSources:
     db_path: Path
     fleet_events_db: Path
     repos: tuple[tuple[str, Path], ...]  # (repo key, that repo's events.db)
+    # The supervisor's checkout's events.db (its heartbeat's orchestrator_root),
+    # already deduplicated against the two source kinds above (issue #2475).
+    orchestrator_events_db: Path | None = None
     registry_error: str | None = None  # fleet.json exists but is unusable
 
 
@@ -89,12 +94,23 @@ class RollupResult:
 
 
 def rollup_sources(fleet_dir_override: str | None = None) -> RollupSources:
-    """Resolve rollup inputs from ``fleet.json`` plus the global events DB."""
+    """Resolve rollup inputs from ``fleet.json``, the global DB, and the heartbeat."""
     repos, registry_error = src.load_repos(fleet_dir_override)
+    fleet_db = src.fleet_sources(fleet_dir_override).events_db
+    # Path identity: resolve() chases links/junctions, then normcase() folds
+    # the Windows case differences resolve() can leave on path tails that do
+    # not exist yet (same convention as fleet_registry's normcase keys).
+    known = {
+        os.path.normcase(str(db.resolve())) for db in (fleet_db, *(r.events_db for r in repos))
+    }
+    orchestrator_db = src.orchestrator_events_db(fleet_dir_override)
+    if orchestrator_db is not None and os.path.normcase(str(orchestrator_db.resolve())) in known:
+        orchestrator_db = None  # supervisor runs from a covered checkout: same DB
     return RollupSources(
         db_path=layout.dashboard_db_path(override=fleet_dir_override),
-        fleet_events_db=src.fleet_sources(fleet_dir_override).events_db,
+        fleet_events_db=fleet_db,
         repos=tuple((r.key, r.events_db) for r in repos),
+        orchestrator_events_db=orchestrator_db,
         registry_error=registry_error,
     )
 
@@ -412,6 +428,10 @@ def run_rollup(sources: RollupSources, now: datetime) -> RollupResult:
     cutoff = _iso(now - WINDOW)
     try:
         plan = [(FLEET_SOURCE, sources.fleet_events_db), *sources.repos]
+        if sources.orchestrator_events_db is not None:
+            # Non-fleet source: the ordinary kind filter applies, which is what
+            # admits self_deploy_succeeded / self_deploy_failed (issue #2475).
+            plan.append((ORCHESTRATOR_SOURCE, sources.orchestrator_events_db))
         results = tuple(_ingest_source(dst, s, db, cutoff) for s, db in plan)
         dst.execute("BEGIN IMMEDIATE")
         try:

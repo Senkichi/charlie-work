@@ -20,6 +20,7 @@ from _dashboard_metrics_fixtures import (  # noqa: F401  (ro_db is a pytest fixt
 )
 from _dashboard_rollup_fixtures import ALPHA, BETA, Fleet
 
+from charlie_work import instrumentation
 from charlie_work.dashboard import metrics, rollup
 from charlie_work.dashboard import metrics_capacity as cap
 from charlie_work.dashboard import metrics_flow as flow
@@ -27,6 +28,7 @@ from charlie_work.dashboard import metrics_quality as quality
 from charlie_work.dashboard import metrics_reliability as rel
 from charlie_work.dashboard.metrics_base import MetricQuery, open_dashboard_ro
 from charlie_work.dashboard.takeaways import takeaway
+from charlie_work.supervisor_lifecycle import write_supervisor_heartbeat
 
 ZEROS = [0.0] * 7
 q_day = timedelta(days=1)
@@ -225,6 +227,44 @@ def test_bucket_size_changes_resolution(ro_db) -> None:
     week = MetricQuery(CURRENT.start, CURRENT.end, timedelta(days=7))
     s = flow.merges_per_day(ro_db, week)
     assert s.points == ((CURRENT.start_iso, 5.0),)
+
+
+def test_orchestrator_source_is_ingested_but_never_a_repo(tmp_path, monkeypatch) -> None:
+    """Issue #2475: the supervisor's checkout DB is a rollup source, not a repo.
+
+    Its ``self_deploy_*`` events must reach ``deploys`` (the point of the fix),
+    while repo-scoped gauges must not grow a phantom ``orchestrator`` line from
+    any repo-loop history the checkout's DB happens to hold.
+    """
+    monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", str(tmp_path / "fleet"))
+    f = Fleet(tmp_path, monkeypatch)
+    checkout = tmp_path / "daemon-checkout"
+    state_dir = checkout / ".var" / "charlie-work"
+    # a checkout that once ran a repo loop can carry dispatch history; the deploy
+    # event is the one this issue is about
+    dispatch(f, state_dir, day(2, 5), live=9)
+    f.emit(state_dir, day(3, 5), "self_deploy_succeeded", {"ok": True})
+    instrumentation.close_db(state_dir / "state.json")
+    write_supervisor_heartbeat(f.fleet_state, {"orchestrator_root": str(checkout)})
+    result = rollup.run_rollup(f.sources(), NOW)
+    # alpha/beta/fleet DBs legitimately do not exist in this fixture; the
+    # orchestrator source itself ingested both events without error.
+    by = {s.source: s for s in result.sources}
+    assert by["orchestrator"].error is None and by["orchestrator"].ingested == 2
+    db, err = open_dashboard_ro(f.sources().db_path)
+    assert db is not None, err
+    try:
+        # facts are honestly attributed to the new source
+        assert db.execute("SELECT source FROM pass_samples").fetchall() == [("orchestrator",)]
+        wip = flow.work_in_progress(db, CURRENT)
+        assert "orchestrator" not in wip.per_repo  # per-repo = registered repos
+        assert wip.points == ()  # no repo wrote a pass sample: nothing to chart
+        deploys = {s.name: s for s in rel.self_deploys(db, CURRENT)}
+        assert (day(3), 1.0) in deploys["self_deploys"].points
+        assert (day(3), 1.0) in deploys["self_deploys"].per_repo["orchestrator"]
+    finally:
+        db.close()
+        f.close()
 
 
 def test_not_instrumented_when_no_source_ever_emitted(tmp_path, monkeypatch) -> None:
