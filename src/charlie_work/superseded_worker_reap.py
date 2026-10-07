@@ -160,10 +160,9 @@ def _reap_superseded_workers(
             # risking an unrelated process that now holds the pid — the
             # same refusal _reap_idle_foreign_writer applies to
             # fingerprint-less markers. Fail closed: block the launch.
-            # ``kind=`` by keyword: the event-kind scanner reads positional
-            # arg 1 as the kind (the ``log_event(state_path, kind, ...)``
-            # shape), so a positional kind here would leave the payload dict
-            # unresolved.
+            # ``kind=`` by keyword for readability; the event-kind scanner
+            # derives the kind slot from the callee's signature (#2481), so
+            # either spelling resolves.
             write_gate.log_event(
                 kind="superseded_worker_reap_failed",
                 payload={
