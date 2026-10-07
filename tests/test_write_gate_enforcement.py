@@ -246,7 +246,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
-from _src_ast import parsed, source_files
+from _src_ast import parsed, source_files, source_text
 
 from charlie_work.ratchet_baseline import BaselineFormatError, load_count_baseline
 
@@ -659,11 +659,24 @@ def _scan_gated_mutator_layer(root: Path) -> list[_RawPrimitiveSite]:
     """Walk every `.py` module under `root` (dynamically discovered, no
     hardcoded module list); return every raw (un-gated) call to a gated
     primitive outside write_gate.py and the primitives' own defining
-    modules."""
+    modules.
+
+    `parsed()` is gated on a `source_text()` pre-filter -- the same
+    convention as the #2422/#2431/#2498/#2500 sibling scans. Every site the
+    walk can report resolves to a gated-primitive name either directly (a
+    `Name`/`Attribute` carrying the literal name) or through an issue-#1374
+    alias whose definition (`emit=log_event`, `_LOG = log_event`) spells
+    the primitive name literally in the same file's text. Either way the
+    name must appear in the source, so a file containing none of the
+    `_GATED_PRIMITIVE_NAMES` can yield no site and its parse is skipped.
+    Files that only mention a name in prose still pass the filter and are
+    still walked -- the filter can only drop files, never sites."""
     sites: list[_RawPrimitiveSite] = []
     for path in source_files(root):
         rel_path = path.relative_to(root).as_posix()
         if _is_exempt_module(rel_path):
+            continue
+        if not any(name in source_text(path) for name in _GATED_PRIMITIVE_NAMES):
             continue
         try:
             tree = parsed(path)
@@ -813,7 +826,7 @@ def _scan_exemption_markers(
     errors: list[str] = []
     for path in source_files(root):
         rel_path = path.relative_to(root).as_posix()
-        text = path.read_text(encoding="utf-8")
+        text = source_text(path)
         module_markers, module_errors = _scan_text_for_markers(text, path=rel_path)
         errors.extend(module_errors)
         if module_markers:
