@@ -276,6 +276,7 @@ KNOWN_IGNORED: dict[str, str] = {
     "local_suite_failed": "local (no-remote) lane bookkeeping",
     "local_suite_selection_disabled": "local (no-remote) lane bookkeeping",
     "local_suite_selection_unavailable": "local (no-remote) lane bookkeeping",
+    "local_tracker_writes_deferred": "local (no-remote) lane bookkeeping",
     "local_work_ready": "local (no-remote) lane bookkeeping",
     "worktree_unsafe_stranded_salvaged": "stranded-commit salvage record",
     "worktree_unsafe_stranded_salvage_failed": "stranded-commit salvage record",
