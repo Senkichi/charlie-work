@@ -2637,15 +2637,36 @@ def _robust_rmtree(path: Path) -> bool:
     Unlinks all junctions/symlinks first, then deletes the remaining files and
     directories with ``shutil.rmtree``.  Returns True when the path no longer
     exists.
+
+    Read-only entries (git object files, some wheel contents) make Windows
+    refuse the unlink with ``PermissionError``; :func:`_clear_readonly_and_retry`
+    clears the bit and retries once. Without it every orphan holding a git
+    clone or a copied ``.venv`` failed removal on every reclaim pass.
     """
     if not path.exists() and not is_junction(path):
         return True
     _unlink_worktree_reparse_points(path)
     try:
-        shutil.rmtree(path)
+        shutil.rmtree(path, onexc=_clear_readonly_and_retry)
     except OSError:
         return False
     return not path.exists() and not is_junction(path)
+
+
+def _clear_readonly_and_retry(func: Callable[[str], Any], path: str, exc: BaseException) -> None:
+    """``shutil.rmtree`` ``onexc`` hook: clear read-only, retry *func* once.
+
+    Re-raises the original error for anything that is not a permission
+    failure, and for reparse points -- ``os.chmod`` would follow one into its
+    target, which is exactly what :func:`_robust_rmtree` must never touch.
+    """
+    if not isinstance(exc, PermissionError) or os.path.islink(path) or is_junction(Path(path)):
+        raise exc
+    try:
+        os.chmod(path, stat.S_IWRITE)
+    except OSError:
+        raise exc from None
+    func(path)
 
 
 # Issue #1767 follow-up: relocating worker TMP/TEMP/TMPDIR from the host temp
