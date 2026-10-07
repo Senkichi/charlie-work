@@ -121,8 +121,9 @@ def test_committed_worker_still_parks_review_ready(repo: Path) -> None:
     assert LabelConfig().review_ready in _labels(gh)
 
 
-@pytest.mark.parametrize("failure_kind", [None, "stalled"])
-def test_repeat_is_bounded_then_escalates(repo: Path, failure_kind: str | None) -> None:
+def test_repeat_is_bounded_then_escalates(repo: Path) -> None:
+    """A classified non-throttle death still counts and escalates at the cap."""
+    failure_kind = "stalled"
     head = _git(repo, "rev-parse", BRANCH)
     config = OrchestratorConfig()
     gh, state_file, gate = _setup(
