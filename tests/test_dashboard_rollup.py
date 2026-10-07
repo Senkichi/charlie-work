@@ -7,6 +7,7 @@ import json
 import logging
 import sqlite3
 from datetime import timedelta
+from pathlib import Path
 
 import pytest
 from _dashboard_rollup_fixtures import (  # noqa: F401  (fleet is a pytest fixture)
@@ -439,31 +440,54 @@ def test_unhandled_kind_is_counted_unclassified_per_source(fleet) -> None:
     assert json.loads(stored[0][0]) == {ALPHA: {"brand_new_unclassified_kind": 2}}
 
 
-def test_unclassified_warning_fires_only_when_the_set_changes(fleet, caplog) -> None:
+def test_unclassified_warning_fires_only_when_the_set_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog
+) -> None:
     """#2269: each rollup pass warns when the unclassified-kind set changes -- a new
-    kind appearing, one disappearing -- and stays quiet while it is stable."""
+    kind appearing, one disappearing -- and stays quiet while it is stable.
+
+    #2529: one events.db, two events, five single-source passes. The ``fleet``
+    fixture's ~45 WAL inserts, two ``touch_repo`` writes and three-source rollup
+    paid host-bound I/O the set-change warning never reads (0.19 s -> 1.13 s
+    median); the transient-error carry-forward test below still exercises the
+    multi-source shape.
+    """
+    state = tmp_path / "repo" / ".var" / "charlie-work" / "state.json"
+    events_db = state.parent / "events.db"
+
+    def emit(ts: str, kind: str) -> None:
+        monkeypatch.setattr(instrumentation, "_now_iso", lambda: ts)
+        instrumentation.log_event(state, kind, {})
+
+    emit("2026-10-01T10:00:00Z", "supervisor_started")  # known-ignored: a clean pass
+    (tmp_path / "fleet").mkdir()
+    sources = rollup.RollupSources(
+        db_path=tmp_path / "fleet" / "dashboard.db",
+        fleet_events_db=events_db,
+        repos=(),
+    )
     with caplog.at_level(logging.WARNING, "charlie_work.dashboard"):
-        rollup.run_rollup(fleet.sources(), NOW)  # nothing unclassified yet
-        fleet.emit(fleet.alpha, "2026-10-01T10:30:00Z", "brand_new_unclassified_kind", {})
-        rollup.run_rollup(fleet.sources(), NOW)
+        assert rollup.run_rollup(sources, NOW).errors == ()  # nothing unclassified yet
+        emit("2026-10-01T10:30:00Z", "brand_new_unclassified_kind")
+        assert rollup.run_rollup(sources, NOW).errors == ()
     assert "1 event kind(s) not interpreted: brand_new_unclassified_kind" in caplog.text
     caplog.clear()
     with caplog.at_level(logging.WARNING, "charlie_work.dashboard"):
-        rollup.run_rollup(fleet.sources(), NOW)  # same set: quiet
+        rollup.run_rollup(sources, NOW)  # same set: quiet
     assert "not interpreted" not in caplog.text
     # a previously unclassified kind disappearing is a set change too: warn once
-    fleet.close()
-    conn = sqlite3.connect(fleet.alpha / "events.db")
+    instrumentation.close_db(state)
+    conn = sqlite3.connect(events_db)
     conn.execute("DELETE FROM events WHERE kind = 'brand_new_unclassified_kind'")
     conn.commit()
     conn.close()
     caplog.clear()
     with caplog.at_level(logging.WARNING, "charlie_work.dashboard"):
-        rollup.run_rollup(fleet.sources(), NOW)
+        assert rollup.run_rollup(sources, NOW).errors == ()
     assert "0 event kind(s) not interpreted: " in caplog.text
     caplog.clear()
     with caplog.at_level(logging.WARNING, "charlie_work.dashboard"):
-        rollup.run_rollup(fleet.sources(), NOW)  # still empty: quiet again
+        rollup.run_rollup(sources, NOW)  # still empty: quiet again
     assert "not interpreted" not in caplog.text
 
 
