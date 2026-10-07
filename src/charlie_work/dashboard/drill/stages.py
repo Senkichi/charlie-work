@@ -35,9 +35,11 @@ def stage_spans(milestones: Sequence[Milestone], now: datetime) -> tuple[StageSp
     out: list[StageSpan] = []
     for stage in STAGES:
         # A visit ends on any milestone that is not a start of the stage -- the
-        # approx and exact paths differ only in where the starts come from.
+        # approx and exact paths differ only in where the starts come from. The
+        # approx path restarts on a repeated start (a re-dispatch); the exact path
+        # keeps the pre-#2473 first-start rule for lifecycle_transition rows.
         starts = (stage,) if exact else APPROX_STAGES[stage]
-        spans, opened = _scan(evs, starts, tuple(names - set(starts)))
+        spans, opened = _scan(evs, starts, tuple(names - set(starts)), restart=not exact)
         out += [StageSpan(stage, a, b, _secs(a, b), False) for a, b in spans]
         if opened is not None:
             end = now.isoformat()

@@ -323,6 +323,46 @@ def test_stage_time_approx_excludes_parked_and_dead_time(tmp_path, monkeypatch) 
     f.close()
 
 
+def test_relabeled_sweep_expands_to_milestones_that_close_in_progress(
+    tmp_path, monkeypatch
+) -> None:
+    """Issue #2473: the sweep's batch form expands to per-issue milestone rows.
+
+    ``_append_sweep_events`` folds a multi-issue relabel into one
+    ``session_failed_relabeled_sweep`` event carrying only ``issue_numbers``;
+    the rollup expands it back so each batched issue's open ``in_progress``
+    visit ends at the relabel, not at a far-later close.
+    """
+    monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", str(tmp_path / "fleet"))
+    f = Fleet(tmp_path, monkeypatch)
+    a = f.alpha
+    dispatch(f, a, day(4, 0), [2710, 2711])
+    f.emit(
+        a, day(4, 2), "session_failed_relabeled_sweep",
+        {"count": 2, "issue_numbers": [2710, 2711]},
+    )  # fmt: skip
+    f.emit(
+        a, day(6, 0), "worker_handoff_pr_opened",
+        {"issue_number": 2710, "pr_number": 7710},
+    )  # fmt: skip
+    rollup.run_rollup(f.sources(), NOW)
+    db, err = open_dashboard_ro(f.sources().db_path)
+    assert db is not None, err
+    # both batched issues got their own milestone row off the one sweep event
+    assert db.execute(
+        "SELECT issue, milestone, event_kind FROM issue_milestones"
+        " WHERE event_kind = 'session_failed_relabeled_sweep' ORDER BY issue"
+    ).fetchall() == [
+        (2710, "session_failed_relabeled", "session_failed_relabeled_sweep"),
+        (2711, "session_failed_relabeled", "session_failed_relabeled_sweep"),
+    ]
+    # each visit closed at the relabel (2h); without the milestone 2710's would
+    # stretch to the PR open 46h later (the #2473 phantom shape)
+    assert flow.stage_time(db, CURRENT, "in_progress").points == ((day(4), 2.0),)
+    db.close()
+    f.close()
+
+
 def test_lifecycle_exact_path_takes_over_at_cutover(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", str(tmp_path / "fleet"))
     f = Fleet(tmp_path, monkeypatch)

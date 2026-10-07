@@ -171,7 +171,9 @@ def stage_time(db: sqlite3.Connection, q: MetricQuery, stage: str) -> Series:
             samples.append((spans[-1][1], source, sum(_hours(a, b) for a, b in spans)))
     exact_names = {m.name for m in ms if m.exact} - {stage, "ready_observed"}
     for (source, _), evs in _grouped(ms, True).items():
-        spans, _ = _scan(evs, (stage,), tuple(exact_names))
+        # lifecycle_transition rows name the stage entered, so a repeated start is a
+        # data anomaly rather than a re-dispatch: keep the pre-#2473 first-start rule.
+        spans, _ = _scan(evs, (stage,), tuple(exact_names), restart=False)
         if spans:
             samples.append((spans[-1][1], source, sum(_hours(a, b) for a, b in spans)))
     spec = SeriesSpec(
