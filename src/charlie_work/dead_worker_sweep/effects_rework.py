@@ -500,8 +500,10 @@ def _is_pre_review_rework_candidate(
     if stale_minutes <= 0:
         return False, ""
 
+    # Issue #2443: an absent key (``pr_list`` rows carry no rollup) means the
+    # checks are unknown, not empty -- never ``stale_empty_checks``.
     status_rollup = pr.get("statusCheckRollup")
-    if status_rollup:
+    if "statusCheckRollup" not in pr or status_rollup:
         return False, ""
 
     if _is_pr_updated_at_older_than(pr, now, stale_minutes):

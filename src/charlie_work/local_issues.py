@@ -477,6 +477,9 @@ class LocalFileGitHub:
     def pr_list(self) -> list[dict[str, Any]]:
         return []
 
+    def pr_list_with_checks(self) -> list[dict[str, Any]]:
+        return []
+
     def pr_diff(self, number: int) -> str:
         return ""
 
