@@ -542,6 +542,41 @@ def test_extract_attention_events_review_verdicts() -> None:
     assert missed[0]["cause"] == {"cause": "died_mid_session", "api_error_status": 429}
 
 
+def test_review_verdict_missed_digest_renders_detail_over_reason_token() -> None:
+    """Issue #2476 review: ``review_verdict_missed`` now carries the refusal's
+    free-text message in ``detail`` and a stable token in ``reason``. The
+    rendered ``AttentionEntry`` must show the message in ``last_log_line``
+    (the digest is for a human reader), falling back to the token for misses
+    that carry no ``detail`` (e.g. turn-limit/launch-failure classifications).
+    """
+    result = CommandResult(
+        True,
+        "review dispatch: 0 launched, 0 failed; 0 verdict(s) recorded, 2 missed",
+        {
+            "stalled": [],
+            "errors": [],
+            "missed_verdicts": [
+                {
+                    "pr": 101,
+                    "issue": 11,
+                    "reason": "pr_terminal_state",
+                    "detail": "PR #101 is MERGED on GitHub; verdict not recorded",
+                },
+                {"pr": 102, "issue": 12, "reason": "launch_failed"},
+            ],
+        },
+    )
+
+    events = _extract_attention_events("owner/repo1", result)
+    digest = _build_fleet_attention_digest(events)
+
+    entries = {e.issue_number: e for e in digest.transitions}
+    assert entries[11].health == "ERROR"
+    assert entries[11].last_log_line == "PR #101 is MERGED on GitHub; verdict not recorded"
+    assert entries[12].health == "ERROR"
+    assert entries[12].last_log_line == "launch_failed"
+
+
 def test_extract_attention_events_stalled() -> None:
     """_extract_attention_events extracts stalled sessions."""
     result = CommandResult(
