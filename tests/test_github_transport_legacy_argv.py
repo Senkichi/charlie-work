@@ -309,9 +309,14 @@ def test_shim_multi_label_issue_list_is_refused_on_both_transports(
 
 @pytest.mark.parametrize("kill_switch", [False, True])
 def test_issue_list_capability_refuses_multiple_labels_on_both_transports(
-    tmp_path: Path, kill_switch: bool
+    tmp_path: Path, kill_switch: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """``gh.issue_list(labels=[a, b])`` must not return GraphQL's OR superset."""
+    """``gh.issue_list(labels=[a, b])`` must not return GraphQL's OR superset.
+
+    The REST open-issue read (issue #2443) filters locally with AND semantics;
+    the refusal guards the GraphQL path, restored by its kill switch.
+    """
+    monkeypatch.setenv("CHARLIE_WORK_ISSUE_LIST_REST", "off")
     gh_adapter = FakeAdapter("gh", [ok([])], token="tok-1")
     runtime = gh_kill_switch_runtime() if kill_switch else None
     gh, http, gh_adapter = make_github(tmp_path, gh=gh_adapter, runtime=runtime)

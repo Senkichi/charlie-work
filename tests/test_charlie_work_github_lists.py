@@ -89,7 +89,11 @@ def test_github_merged_pr_list_does_not_retry_non_transient_error(
     ] * 2
 
 
-def test_issue_list_raises_limit_to_500_and_warns_on_truncation(tmp_path: Path, caplog) -> None:
+def test_issue_list_raises_limit_to_500_and_warns_on_truncation(
+    tmp_path: Path, caplog, monkeypatch
+) -> None:
+    # The GraphQL path (REST open-issue list off, issue #2443) pages to the cap.
+    monkeypatch.setenv("CHARLIE_WORK_ISSUE_LIST_REST", "off")
     caplog.set_level(logging.WARNING)
     limit = github_module._LIST_LIMIT
     # More nodes than the cap exist: the read pages up to the cap, then warns.
