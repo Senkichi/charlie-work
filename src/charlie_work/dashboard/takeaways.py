@@ -29,7 +29,7 @@ from __future__ import annotations
 import statistics
 from datetime import timedelta
 
-from .metrics_base import Point, Series, parse_ts
+from .metrics_base import Point, Series, parse_ts, pooled
 
 MIN_SAMPLE = 5
 MIN_BUCKETS = 2  # a gauge/duration/ratio mean over one bucket is a point, not a trend
@@ -48,18 +48,13 @@ def _window_label(span: timedelta) -> str:
     return f"{int(days)}d" if days == int(days) else f"{int(span.total_seconds() // 3600)}h"
 
 
-def _pooled(series: Series) -> tuple[float, ...]:
-    """Every raw sample the window holds, all repos pooled (empty without samples)."""
-    return tuple(v for vs in series.samples.values() for v in vs)
-
-
 def _value(
     points: tuple[Point, ...],
     kind: str,
     span: timedelta,
     *,
     samples: tuple[float, ...] = (),
-    bucket_n: dict[str, int] | None = None,
+    bucket_n: dict[str, float] | None = None,
     min_bucket_n: int = MIN_BUCKET_N,
 ) -> float | None:
     """The window value a headline compares.
@@ -227,7 +222,7 @@ def _headline(
         current.points,
         current.kind,
         span,
-        samples=_pooled(current),
+        samples=pooled(current),
         bucket_n=current.bucket_n,
         min_bucket_n=min_bucket_n,
     )
@@ -235,7 +230,7 @@ def _headline(
         prior.points,
         prior.kind,
         span,
-        samples=_pooled(prior),
+        samples=pooled(prior),
         bucket_n=prior.bucket_n,
         min_bucket_n=min_bucket_n,
     )

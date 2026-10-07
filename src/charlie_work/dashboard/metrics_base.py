@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import sqlite3
 import statistics
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -96,10 +96,10 @@ class Series:
     # distribution strip and its p90 reference.
     samples: dict[str, tuple[float, ...]] = field(default_factory=dict)
     # bucket-start ISO ts -> observations the combined line's point rests on (a
-    # ratio's denominator count); lets takeaways keep thin buckets out of a mean.
-    bucket_n: dict[str, int] = field(default_factory=dict)
+    # ratio's denominator mass); lets takeaways keep thin buckets out of a mean.
+    bucket_n: dict[str, float] = field(default_factory=dict)
     # repo -> the same counts for that repo's points (per_repo in count form).
-    repo_bucket_n: dict[str, dict[str, int]] = field(default_factory=dict)
+    repo_bucket_n: dict[str, dict[str, float]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -183,9 +183,11 @@ def _count(by_bucket: dict[int, list[float]]) -> int:
     return sum(len(v) for v in by_bucket.values())
 
 
-def _bucket_counts(q: MetricQuery, by_bucket: dict[int, list[float]]) -> dict[str, int]:
-    """Bucket-start ts -> observations the bucket's point rests on."""
-    return {iso(q.bucket_start(i)): len(vals) for i, vals in sorted(by_bucket.items())}
+def _bucket_counts(
+    q: MetricQuery, by_bucket: dict[int, list[float]], weight: Callable = len
+) -> dict[str, float]:
+    """Bucket-start ts -> observations the bucket's point rests on (``weight`` over its values)."""
+    return {iso(q.bucket_start(i)): weight(vals) for i, vals in sorted(by_bucket.items())}
 
 
 def _points(
@@ -225,8 +227,8 @@ def _finish(
     flags: dict,
     *,
     samples: dict[str, tuple[float, ...]] | None = None,
-    bucket_n: dict[str, int] | None = None,
-    repo_bucket_n: dict[str, dict[str, int]] | None = None,
+    bucket_n: dict[str, float] | None = None,
+    repo_bucket_n: dict[str, dict[str, float]] | None = None,
 ) -> Series:
     return Series(
         name=spec.name,
@@ -336,10 +338,12 @@ def make_ratio_series(
     repo_points = {r: pts(scope.active_for(r), n_all.get(r, {}), d_all[r]) for r in sorted(d_all)}
     d_merged = _merge_repos(d_all)
     points = pts(scope.all_active, _merge_repos(n_all), d_merged)
-    repo_bucket_n = {r: _bucket_counts(q, d_all[r]) for r in sorted(d_all)}
+    # a bucket's weight is its denominator mass (sum, not the count of den samples),
+    # the same denominator ``pts`` divides by — unit denominators make the two equal
+    repo_bucket_n = {r: _bucket_counts(q, d_all[r], sum) for r in sorted(d_all)}
     return _finish(
         db, q, spec, scope.cov, points, repo_points, _count(d_merged), {},
-        bucket_n=_bucket_counts(q, d_merged), repo_bucket_n=repo_bucket_n,
+        bucket_n=_bucket_counts(q, d_merged, sum), repo_bucket_n=repo_bucket_n,
     )  # fmt: skip
 
 
@@ -385,3 +389,8 @@ def category_series(
 def gauge_samples(rows: Iterable[tuple]) -> list[Sample]:
     """``(ts, repo, value)`` rows with a non-null value, as floats."""
     return [(ts, repo, float(v)) for ts, repo, v in rows if v is not None]
+
+
+def pooled(series: Series) -> tuple[float, ...]:
+    """Every raw sample the window holds, all repos pooled (empty without samples)."""
+    return tuple(v for vs in series.samples.values() for v in vs)
