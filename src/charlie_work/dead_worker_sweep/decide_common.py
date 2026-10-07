@@ -126,6 +126,12 @@ def orphan_head_fingerprint(remote_sha: str | None, local_sha: str | None) -> st
     return f"{remote_sha or 'none'}:{local_sha or 'none'}"
 
 
+# Single owner of the requeue event kind string. Producers emit it; readers
+# (e.g. attempt_resume's death filter) import this instead of re-spelling it,
+# so tests/test_dead_worker_salvage_seam.py can tell the two apart.
+SESSION_FAILED_RELABELED = "session_failed_relabeled"
+
+
 def session_failed_relabeled_payload(
     *,
     issue_number: int,
@@ -201,7 +207,10 @@ def is_pre_review_rework_candidate(
         return True, "rework_branch_conflict"
     if stale_minutes <= 0:
         return False, ""
-    if pr.get("statusCheckRollup"):
+    # Issue #2443: ``pr_list`` rows carry no rollup key. Absent means the
+    # checks are unknown (not "empty"), which must never read as
+    # ``stale_empty_checks``; only a fetched, empty rollup may.
+    if "statusCheckRollup" not in pr or pr.get("statusCheckRollup"):
         return False, ""
     if is_pr_updated_at_older_than(pr, now, stale_minutes):
         return True, "stale_empty_checks"

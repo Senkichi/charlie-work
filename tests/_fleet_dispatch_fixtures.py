@@ -25,8 +25,9 @@ from charlie_work.config import (
 )
 from charlie_work.fleet_dispatch import _CiFleetDirtyCheck
 from charlie_work.notify import NotifyResult
+from charlie_work.pending_sync import BootSyncRepair
 from charlie_work.supervise import SelfDeployResult
-from charlie_work.workflow import CommandResult
+from charlie_work.command_result import CommandResult
 
 
 #: Where the notify-digest isolation in ``_patch_self_deploy_for_fleet_tests``
@@ -46,22 +47,6 @@ SUPERVISOR_STARTED_AT = _iso(_supervisor_started)
 
 
 SUPERVISOR_BEAT_AT = _iso(_supervisor_started + timedelta(seconds=2609))
-
-
-class _FakeClock:
-    """Monotonically advancing fake clock/sleep for supervisor tests."""
-
-    def __init__(self, start: float = 0.0, auto_advance: float = 0.0) -> None:
-        self._now = start
-        self._auto_advance = auto_advance
-        self.sleep_calls: list[float] = []
-
-    def now(self) -> float:
-        return self._now
-
-    def sleep(self, seconds: float) -> None:
-        self.sleep_calls.append(seconds)
-        self._now += self._auto_advance if self._auto_advance else seconds
 
 
 class _StepClock:
@@ -123,6 +108,13 @@ def _patch_self_deploy_for_fleet_tests(monkeypatch: Any, tmp_path: Path) -> dict
             synced=False,
             message="test no-op",
         ),
+    )
+    # Issue #2312: the boot-time pending-sync repair runs on every supervise
+    # start and shells out to git/uv; default it to a no-op so these tests
+    # stay hermetic. Ordering tests patch it with their own mock.
+    monkeypatch.setattr(
+        "charlie_work.fleet_dispatch.heal_pending_sync_at_boot",
+        lambda *a, **k: BootSyncRepair(),
     )
     mocks: dict[str, MagicMock] = {}
     for name in (

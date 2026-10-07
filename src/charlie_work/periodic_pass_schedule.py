@@ -8,14 +8,17 @@ mechanical de-escalation sweep (issue #783).
 ``state.py`` re-exports every public symbol here via a facade import block
 (the ``dispatch_cadence.py`` pattern), so existing import paths
 (``charlie_work.state.arm_reconcile_pass`` and friends) and the
-``workflow.py`` facade keep working unchanged. This module imports nothing
-from the package, so it cannot create an import cycle.
+``workflow.py`` facade keep working unchanged. This module imports only
+the stdlib-only ``host`` leaf from the package, so it cannot create an
+import cycle.
 """
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import Any
+
+from . import host as _host
 
 
 def _worktree_reclamation(data: dict[str, Any]) -> dict[str, Any]:
@@ -45,7 +48,7 @@ def is_worktree_reclamation_due(data: dict[str, Any]) -> bool:
         return True
     try:
         next_time = datetime.fromisoformat(next_at.replace("Z", "+00:00"))
-        return datetime.now(UTC) >= next_time
+        return _host.current().clock.now() >= next_time
     except (ValueError, TypeError):
         return True
 
@@ -96,7 +99,7 @@ def is_reconcile_due(data: dict[str, Any]) -> bool:
         return True
     try:
         next_time = datetime.fromisoformat(next_at.replace("Z", "+00:00"))
-        return datetime.now(UTC) >= next_time
+        return _host.current().clock.now() >= next_time
     except (ValueError, TypeError):
         return True
 
@@ -137,7 +140,7 @@ def is_deescalation_due(data: dict[str, Any]) -> bool:
         return True
     try:
         next_time = datetime.fromisoformat(next_at.replace("Z", "+00:00"))
-        return datetime.now(UTC) >= next_time
+        return _host.current().clock.now() >= next_time
     except (ValueError, TypeError):
         return True
 

@@ -33,6 +33,8 @@ from typing import Any
 
 import yaml
 
+from .atomic_write import write_bytes_atomic
+
 # ``NNN_anything.md``. Deliberately the *only* selector for "is this an issue":
 # issue directories also hold ``README.md`` / ``_template.md``, and a
 # ``*.md.tmp`` staging file from an in-flight atomic write must not be read as
@@ -289,6 +291,4 @@ def append_comment(text: str, comment: str, *, timestamp: str) -> str:
 
 def write_text_atomic(path: Path, text: str) -> None:
     """Temp file + ``replace``; bytes, so no newline translation on Windows."""
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_bytes(text.encode("utf-8"))
-    tmp.replace(path)
+    write_bytes_atomic(path, text.encode("utf-8"))

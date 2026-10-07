@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterable
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -159,6 +160,17 @@ def classify_backlog_reachability(
         "consistent": None,
         "open_total": 0,
         "dispatchable": 0,
+        # Issue #2314: the no-ready-label arm splits in two. An open issue
+        # carrying a parked/triage label (``config.heartbeat.
+        # stale_mention_parked_labels`` -- blocked, needs-design,
+        # human-action, question, wontfix, duplicate, invalid, tracker,
+        # umbrella, epic by default) was deliberately parked by a human and
+        # bins as ``parked_unready``; only an issue with neither the ready
+        # label nor a parked label bins as ``missing_ready``, the genuinely
+        # un-triaged pool. Without the split every parked issue inflated
+        # ``missing_ready``, so the payload read as "N issues need triage"
+        # when a triage pass found none.
+        "parked_unready": 0,
         "missing_ready": 0,
         "terminal_label": 0,
         "active_label": 0,
@@ -227,6 +239,10 @@ def classify_backlog_reachability(
 
     claimed = operator_claimed or set()
     covered = mention_covered or {}
+    # Issue #2314: the parked/triage taxonomy a non-ready issue is checked
+    # against -- the configured heartbeat.stale_mention_parked_labels set,
+    # not a second hard-coded list.
+    parked_labels = frozenset(config.heartbeat.stale_mention_parked_labels)
     covered_prs: dict[int, list[int]] = {}
     ready_seen = 0
     examples: dict[str, list[int]] = {}
@@ -242,7 +258,16 @@ def classify_backlog_reachability(
         number = int(number)
         names = label_names(issue)
         if config.labels.ready not in names:
-            reason = "missing_ready"
+            # Issue #2314: split the un-triaged bin. A parked label (the
+            # configured ``heartbeat.stale_mention_parked_labels`` taxonomy --
+            # the same parked set heartbeat_stale_mentions and the armable
+            # gate use, so this module does not grow a second hard-coded
+            # list) means a human already triaged and parked the issue; it is
+            # not part of the un-triaged pool ``missing_ready`` names.
+            if names & parked_labels:
+                reason = "parked_unready"
+            else:
+                reason = "missing_ready"
         else:
             ready_seen += 1
             if names & config.labels.terminal:
@@ -686,3 +711,10 @@ def resolve_dispatch_mention_coverage(
     except GitHubError:
         return {}, None
     return compute_mention_coverage_map(issues, fetched, app), fetched
+
+
+@dataclass(frozen=True)
+class _MergedPRListOutcome:
+    items: list[dict[str, Any]] = field(default_factory=list)
+    error: GitHubError | None = None
+    called: bool = False

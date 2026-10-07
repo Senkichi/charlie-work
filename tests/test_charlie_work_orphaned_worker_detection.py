@@ -8,11 +8,12 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
-from unittest.mock import patch
 from _dead_session_fixtures import _write_flat_review_decision
 from _dispatch_fixtures import _stub_real_activity_probe_for_stalled_tests  # noqa: F401
 from _fakes_github import FakeGitHub
 from _rework_dispatch_fixtures import _wg
+from _host_fixtures import host_probe
+from charlie_work.host.fakes import FakeProcessProbe
 from charlie_work.config import (
     DevinConfig,
     OrchestratorConfig,
@@ -30,7 +31,6 @@ from charlie_work.state import (
 
 def test_orphaned_worker_detection_with_request_changes_and_unchanged_head(tmp_path: Path) -> None:
     """Regression test for issue #207: dead worker with request_changes and unchanged head should reset to rework_requested."""
-    from unittest.mock import patch
 
     config = OrchestratorConfig(
         devin=DevinConfig(),
@@ -80,7 +80,7 @@ def test_orphaned_worker_detection_with_request_changes_and_unchanged_head(tmp_p
     )
 
     # Mock PID liveness check to return False (dead PID)
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+    with host_probe(alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
@@ -120,7 +120,6 @@ def test_orphaned_worker_detection_with_request_changes_and_unchanged_head(tmp_p
 
 def test_orphaned_worker_detection_with_head_change(tmp_path: Path) -> None:
     """Regression test for issue #207: dead worker with head change should emit drift event, not auto-reset."""
-    from unittest.mock import patch
 
     config = OrchestratorConfig(
         devin=DevinConfig(),
@@ -170,7 +169,7 @@ def test_orphaned_worker_detection_with_head_change(tmp_path: Path) -> None:
     )
 
     # Mock PID liveness check to return False (dead PID)
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+    with host_probe(alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
@@ -203,7 +202,6 @@ def test_orphaned_worker_detection_with_head_change(tmp_path: Path) -> None:
 
 def test_orphaned_worker_detection_with_live_pid(tmp_path: Path) -> None:
     """Regression test for issue #207: live worker with matching start time should be untouched."""
-    from unittest.mock import patch
 
     config = OrchestratorConfig(
         devin=DevinConfig(),
@@ -238,7 +236,7 @@ def test_orphaned_worker_detection_with_live_pid(tmp_path: Path) -> None:
     fake_gh = FakeGitHubForOrphan()
 
     # Mock PID liveness check to return True (live PID) with matching start time
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=True):
+    with host_probe(alive=True):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
@@ -269,9 +267,8 @@ def test_orphaned_worker_detection_with_live_pid(tmp_path: Path) -> None:
     assert len(orphaned_events) == 0
 
 
-def test_orphaned_worker_detection_with_pid_recycled(tmp_path: Path) -> None:
+def test_orphaned_worker_detection_with_pid_recycled(tmp_path: Path, fake_host) -> None:
     """Regression test for issue #207: PID recycled (start-time mismatch) should be treated as dead."""
-    from unittest.mock import patch
 
     config = OrchestratorConfig(
         devin=DevinConfig(),
@@ -320,20 +317,17 @@ def test_orphaned_worker_detection_with_pid_recycled(tmp_path: Path) -> None:
         }
     )
 
-    # Mock the helper to simulate PID recycling (alive check returns False due to start-time mismatch)
-    def mock_worker_pid_alive(entry):
-        # Simulate start-time mismatch by returning False even though PID is set
-        return False
+    # Fake the probe with a mismatched start time: PID recycled -> dead.
+    fake_host(probe=FakeProcessProbe({99999: 999.0}))
 
-    with patch("charlie_work.workflow._worker_pid_alive", side_effect=mock_worker_pid_alive):
-        from charlie_work.workflow import _detect_and_handle_orphaned_workers
+    from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
-        sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
-        sessions_dir.mkdir(parents=True, exist_ok=True)
+    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
 
-        _detect_and_handle_orphaned_workers(
-            sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
-        )
+    _detect_and_handle_orphaned_workers(
+        sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
+    )
 
     # Load state and verify it was treated as dead
     state = load_state(paths.state_file)
@@ -354,7 +348,6 @@ def test_orphaned_worker_detection_with_pid_recycled(tmp_path: Path) -> None:
 
 def test_orphaned_worker_detection_no_open_pr(tmp_path: Path) -> None:
     """Regression test for issue #207: dead worker with no open PR should emit drift event (not auto-reset status)."""
-    from unittest.mock import patch
 
     config = OrchestratorConfig(
         devin=DevinConfig(),
@@ -381,7 +374,7 @@ def test_orphaned_worker_detection_no_open_pr(tmp_path: Path) -> None:
     fake_gh = FakeGitHubForOrphan()
 
     # Mock PID liveness check to return False (dead PID)
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+    with host_probe(alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
@@ -419,7 +412,6 @@ def test_orphaned_worker_detection_no_open_pr(tmp_path: Path) -> None:
 
 def test_orphaned_worker_detection_no_open_pr_emits_once(tmp_path: Path) -> None:
     """Issue #259: sweep must emit only one drift event per zombie across N passes."""
-    from unittest.mock import patch
 
     config = OrchestratorConfig(
         devin=DevinConfig(),
@@ -443,7 +435,7 @@ def test_orphaned_worker_detection_no_open_pr_emits_once(tmp_path: Path) -> None
 
     fake_gh = FakeGitHubForOrphan()
 
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+    with host_probe(alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
@@ -474,7 +466,6 @@ def test_orphaned_worker_detection_bulk_sweep_excludes_pre_flagged(tmp_path: Pat
     before aggregation. A fresh bulk sweep of the remaining orphans is emitted
     as a single aggregated event.
     """
-    from unittest.mock import patch
 
     config = OrchestratorConfig(
         devin=DevinConfig(),
@@ -503,7 +494,7 @@ def test_orphaned_worker_detection_bulk_sweep_excludes_pre_flagged(tmp_path: Pat
 
     fake_gh = FakeGitHubNoOrphanPrs()
 
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+    with host_probe(alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
@@ -564,7 +555,7 @@ def test_orphaned_worker_detection_bulk_sweep_does_not_flood_event_buffer(tmp_pa
 
     fake_gh = FakeGitHubNoPrs()
 
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+    with host_probe(alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
@@ -596,7 +587,6 @@ def test_orphaned_worker_sweep_runs_with_watchdog_disabled(tmp_path: Path) -> No
     salvage, #417 label reclaim, orphan drift diagnostics). A deployment that
     disables watchdog must not lose these backstops.
     """
-    from unittest.mock import patch
 
     from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
@@ -714,7 +704,7 @@ def test_orphaned_worker_sweep_runs_with_watchdog_disabled(tmp_path: Path) -> No
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
 
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+    with host_probe(alive=False):
         _detect_and_handle_orphaned_workers(
             sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
         )

@@ -20,11 +20,10 @@ from pathlib import Path
 
 from _fakes_github import FakeGitHub
 from _reconcile_fixtures import (
-    _init_bare_remote_and_clone,
     _issue,
     _setup_completed_worktree,
 )
-from _worktree_fixtures import _git
+from _worktree_fixtures import _git, _init_bare_remote_and_clone
 from charlie_work.config import OrchestratorConfig
 from charlie_work.devin_shell import SessionRecord
 from charlie_work.instrumentation import read_event_log

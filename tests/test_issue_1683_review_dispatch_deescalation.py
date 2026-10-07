@@ -46,6 +46,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _src_ast import parsed, source_files
 
 import charlie_work
 from charlie_work.config import DETERMINISTIC_ESCALATION_FAILURE_KINDS
@@ -363,6 +364,12 @@ _NO_COUNTER_ALLOWLIST: dict[str, str] = {
         "attempts`` budget, which re-baselines on head change and per "
         "new run id; no flat counter to reset."
     ),
+    "infra_rerun_refused": (
+        "A run GitHub permanently refuses to rerun (``infra_rerun_refused`` "
+        "per-head record, never re-requested) behind live infra-failed "
+        "required checks -- a janitor blocker, so the sweep cannot clear "
+        "while it persists; no flat counter to reset."
+    ),
     "stale_checks_retrigger_exhausted": (
         "Gated by ``stale_checks_retrigger_attempts``, a per-PR monotonic "
         "retrigger budget that even the operator door deliberately does "
@@ -442,8 +449,8 @@ class _SourceIndex:
         self.parent_scope: dict[int, ast.Module] = {}
         # every call in the package, with its innermost enclosing scope.
         self.calls: list[tuple[ast.AST, ast.Call]] = []
-        for path in sorted(pkg_dir.rglob("*.py")):
-            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for path in source_files(pkg_dir):
+            tree = parsed(path)
             self._index_module_scope(tree)
             self._walk(tree, tree)
 

@@ -49,7 +49,6 @@ import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
 
 from charlie_work.config import (
     DevinConfig,
@@ -63,6 +62,7 @@ from charlie_work.state import load_state, save_state
 from charlie_work.write_gate import WriteGate
 
 from _reconcile_fixtures import FakeGitHub, _issue, _pr
+from _host_fixtures import host_probe
 
 
 def _wg(state_file: Path, *, dry_run: bool = False) -> WriteGate:
@@ -514,7 +514,7 @@ def test_orphan_sweep_escalates_zero_artifact_loop(tmp_path: Path) -> None:
     ]
     fake_gh.prs = []
 
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+    with host_probe(alive=False):
         _detect_and_handle_orphaned_workers(
             sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
         )
@@ -589,7 +589,7 @@ def test_orphan_sweep_relabels_when_not_zero_artifact_loop(tmp_path: Path) -> No
     ]
     fake_gh.prs = []
 
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+    with host_probe(alive=False):
         _detect_and_handle_orphaned_workers(
             sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
         )

@@ -11,7 +11,7 @@ from __future__ import annotations
 import copy
 import logging
 import tempfile
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -23,9 +23,10 @@ from .. import (
     no_pr_orphan_fate,
     worker_fate,
 )
-from . import effects_pr, effects_sessions, live_handoff
+from . import effects_pr, effects_sessions, live_handoff, pre_classification
 from ..cross_repo_gate import cross_repo_scope_gate
 from ..github import GitHubError, build_branch_issue_validator
+from ..host import current as _host_current
 from ..process_utils import find_worker_terminal_status
 from ..review_decision import review_decision
 from ..verified_no_changes import (
@@ -87,7 +88,7 @@ def _issue(ctx: SweepContext, number: int) -> dict[str, Any]:
 
 
 def read_clock(ctx: SweepContext, _req: ReadClock) -> datetime:
-    ctx.now = datetime.now(UTC)
+    ctx.now = _host_current().clock.now()
     return ctx.now
 
 
@@ -176,6 +177,10 @@ def resolve_fate(ctx: SweepContext, req: ResolveFate) -> FateResult:
         branch = f"{ctx.config.dispatch.branch_prefix}-{number}-{slug}"
     ctx.branches[number] = branch
     worktree_path = _worktree(ctx, branch)
+    # Issue #2274: classify the dead worker's log BEFORE its fate resolves -- this
+    # is the first locus every pass reaches, ahead of the redispatch and phantom
+    # lanes that overwrite or reap the sidecar.
+    entry = pre_classification.classify_before_fate(ctx, number, entry)
     fate = no_pr_orphan_fate.resolve_no_pr_orphan_fate(
         issue_number=number,
         entry=entry,
@@ -214,7 +219,7 @@ def strip_and_flag(ctx: SweepContext, req: StripAndFlag) -> LabelWrite:
     issue_labels = label_names(_issue(ctx, req.issue))
     active = issue_labels & ctx.config.labels.active
     ok = escalation._strip_active_and_flag_human_needed(
-        ctx.gh, ctx.config, req.issue, active, issue_labels
+        ctx.gh, ctx.config, req.issue, active, issue_labels, write_gate=ctx.write_gate
     )
     ctx.escalations[req.kind][req.issue] = {"label_write_ok": ok}
     return LabelWrite(ok=bool(ok), removed_labels=tuple(sorted(active)))

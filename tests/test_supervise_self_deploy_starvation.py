@@ -56,13 +56,15 @@ def _plant_marker(tmp_path: Path, *, written_at: str | None = None) -> Path:
 
 
 def _idle_pass_runner() -> Any:
-    """Runner responses for a pass where HEAD sits at def456 (marker replayed)."""
+    """Runner responses for a marker-replay pass where HEAD sits at def456
+    (the marker's ``to_sha`` -- the pre-#2312 residue shape, where the merge
+    already landed and only the sync is owed)."""
     runner, calls = _make_fake_runner(
         [
-            RunResult(0, "def456\n", ""),  # before HEAD
-            RunResult(0, "Already up to date.\n", ""),  # pull
-            RunResult(0, "def456\n", ""),  # after HEAD (unchanged)
-            RunResult(0, "", ""),  # uv sync (only reached when fleet idle)
+            RunResult(0, "def456\n", ""),  # HEAD
+            RunResult(0, "", ""),  # fetch ok
+            RunResult(0, "def456\n", ""),  # origin/main (unchanged)
+            RunResult(0, "", ""),  # uv sync --locked --inexact (only reached when fleet idle)
         ]
     )
     return runner, calls
@@ -83,7 +85,7 @@ def test_self_deploy_deferral_below_bound_is_not_starved(tmp_path: Path, monkeyp
     assert result.ok is True
     assert result.deferred is True
     assert result.starved is False
-    assert all(c[0] != ["uv", "sync"] for c in calls)
+    assert all(c[0] != ["uv", "sync", "--locked", "--inexact"] for c in calls)
     assert query_events(_self_deploy_state_path(tmp_path), kind="self_deploy_sync_starved") == []
     # The rewrite carries the original episode timestamp forward verbatim.
     marker = json.loads(marker_path.read_text(encoding="utf-8"))
@@ -112,7 +114,7 @@ def test_self_deploy_starved_after_bound_trips(tmp_path: Path, monkeypatch: Any)
     assert result.deferred is True
     assert result.starved is True
     assert result.synced is False
-    assert all(c[0] != ["uv", "sync"] for c in calls)
+    assert all(c[0] != ["uv", "sync", "--locked", "--inexact"] for c in calls)
 
     events = query_events(_self_deploy_state_path(tmp_path), kind="self_deploy_sync_starved")
     assert len(events) == 1
@@ -185,7 +187,7 @@ def test_self_deploy_starved_episode_syncs_once_fleet_drains(
     assert drained.synced is True
     assert drained.starved is False
     assert drained.deferred is False
-    assert drained_calls[-1][0] == ["uv", "sync"]
+    assert drained_calls[-1][0] == ["uv", "sync", "--locked", "--inexact"]
     assert not marker_path.exists()
     # Still exactly one starvation event for the whole episode.
     assert (

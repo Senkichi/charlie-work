@@ -217,6 +217,13 @@ def sanitize_env(target_path: Path, *, tmp_dir: Path | None = None) -> dict[str,
     # any ambient UV_PROJECT_ENVIRONMENT at this point is by definition the
     # orchestrator's.
     env.pop("UV_PROJECT_ENVIRONMENT", None)
+    # An inherited PWD names the ORCHESTRATOR's directory, not the worker's
+    # cwd. opencode (Bun) trusts PWD over the real process cwd for its tools:
+    # with a stale PWD, a worker launched with cwd=<worktree> ran git in the
+    # main checkout and committed there (observed 2026-10-06). Dropping it lets
+    # every shell/runtime derive PWD from the actual cwd.
+    env.pop("PWD", None)
+    env.pop("OLDPWD", None)
 
     # A .venv reparse point (junction/symlink) is a view into a shared venv,
     # not an owned local venv. Unlink it inside a worktree so uv cannot

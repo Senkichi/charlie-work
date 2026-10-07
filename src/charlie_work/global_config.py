@@ -20,9 +20,6 @@ from . import layout
 from .config_deprecations import emit_deprecated_key_reads, repo_state_path
 from .config_validation import ConstructionError, host_wide_error, host_wide_sections
 from .fleet_paths import fleet_dir
-from .fleet_supervisor_config import (
-    resolve_fleet_supervisor_layer,
-)
 
 from .paths import RepoNotFoundError
 
@@ -99,7 +96,87 @@ def _deep_merge(base: Any, override: Any) -> Any:
     return override
 
 
+def peek_runtime_state_dir(
+    repo_root: Path,
+    explicit: Path | None = None,
+    *,
+    fleet_dir_override: str | None = None,
+) -> str:
+    """Best-effort read of ``runtime.state_dir`` from the config layers.
+
+    Exists for one caller: the boot-time pending-sync repair (issue #2312)
+    must locate the marker *before* ``load_fleet_global_config`` runs -- the
+    dependency skew it repairs is exactly what can crash that load. Reads the
+    same two layer slots ``load_layered_config`` uses and applies the same
+    repo-wins-per-key precedence, but only for ``runtime.state_dir``, and
+    tolerates every failure the real loader would surface: absent files,
+    malformed YAML, non-mapping documents, and non-mapping ``runtime``
+    sections all contribute nothing.
+
+    A layer that declares ``state_dir`` wins even when the value is unusable:
+    the real loader would raise ``ConfigError`` on it and the fleet entry
+    points fall back to defaults, so the peek's own default matches where
+    that fallback puts the marker. The string comes back unresolved --
+    resolution belongs to ``runtime_paths``/``supervisor_runtime_paths``.
+    """
+    state_dir: Any = None
+    for _layer, path in config_layer_paths(
+        repo_root, explicit, fleet_dir_override=fleet_dir_override
+    ):
+        try:
+            raw = yaml.safe_load(path.read_text(encoding="utf-8")) if path.exists() else None
+        except (OSError, yaml.YAMLError):
+            continue
+        if not isinstance(raw, dict):
+            continue
+        runtime = raw.get("runtime")
+        if isinstance(runtime, dict) and "state_dir" in runtime:
+            state_dir = runtime["state_dir"]
+    return state_dir if isinstance(state_dir, str) else layout.DEFAULT_STATE_DIR
+
+
+_AVIATOR_CONFIG = Path(".aviator") / "config.yml"
+_AVIATOR_WARNED: set[Path] = set()
+
+
+def warn_if_aviator_config_missing(config: OrchestratorConfig, repo_root: Path) -> bool:
+    """Warn (once per repo per process) when ``mergequeue_label`` is set but the repo has no
+    ``.aviator/config.yml`` (#2441): the hand-off labels PRs for a queue that has no rules
+    to merge them, so they sit labelled forever. Returns True when it warned.
+    """
+    label = config.auto_merge.mergequeue_label
+    if not label or (repo_root / _AVIATOR_CONFIG).is_file():
+        return False
+    key = repo_root.resolve()
+    if key in _AVIATOR_WARNED:
+        return False
+    _AVIATOR_WARNED.add(key)
+    logger.warning(
+        "auto_merge.mergequeue_label=%r is set but %s has no %s; PRs handed to the merge "
+        "queue will not be merged until that file exists",
+        label,
+        repo_root,
+        _AVIATOR_CONFIG.as_posix(),
+    )
+    return True
+
+
 def load_layered_config(
+    repo_root: Path,
+    explicit: Path | None = None,
+    *,
+    fleet_dir_override: str | None = None,
+    require_global: bool = False,
+) -> OrchestratorConfig:
+    """``_load_layered_config`` plus the missing-``.aviator/config.yml`` warning (#2441)."""
+    config = _load_layered_config(
+        repo_root, explicit, fleet_dir_override=fleet_dir_override, require_global=require_global
+    )
+    warn_if_aviator_config_missing(config, repo_root)
+    return config
+
+
+def _load_layered_config(
     repo_root: Path,
     explicit: Path | None = None,
     *,
@@ -239,38 +316,24 @@ def load_layered_config(
     # rejection a per-repo ``orchestrator.config.yaml`` could silently override a
     # host-wide knob -- the exact confusion that made #590 expensive to diagnose. Reject
     # the key outright so the invalid state is unrepresentable rather than merely unused
-    # (issues #600, #763, #1978). The legacy ``supervisor.<key>`` spellings of the moved
-    # fleet-supervisor knobs stay legal here during the #1979 migration window: the fold
-    # below lifts them into the repo layer's effective ``fleet_supervisor`` mapping,
-    # where they keep the ordinary repo-wins-per-key merge semantics.
+    # (issues #600, #763, #1978). A legacy ``supervisor.<key>`` spelling of a
+    # moved fleet-supervisor knob needs no carve-out here: since #1979 it is
+    # just an unknown key, and the ordinary validation below rejects it like
+    # any other.
     for host_wide in sorted(host_wide_sections()):
         if host_wide in repo_data:
             raise host_wide_error(
                 host_wide, fleet_dir=global_config_path.parent, repo_path=repo_config_path
             )
 
-    # Issue #1978: resolve each layer's fleet_supervisor/supervisor pair
-    # *before* merging. Adoption on the post-merge view cannot tell a
-    # same-file disagreement (a hard ConfigError -- the operator wrote both
-    # spellings) from a cross-layer one (the global file's new-style key vs a
-    # repo's still-deprecated legacy key, which is just the ordinary
-    # repo-wins merge). Conflicting spellings surfacing only after the merge
-    # made the merged build raise, which the #665 rescue below treated like
-    # any broken global layer -- discarding the entire global config over
-    # one disputed key. The fold works on copies; ``global_data`` /
-    # ``repo_data`` keep the legacy spellings for the deprecation-event
-    # emits above and below.
-    global_layer = resolve_fleet_supervisor_layer(global_data)
-    repo_layer = resolve_fleet_supervisor_layer(repo_data)
-
     # Merge: global as base, per-repo as override (section-by-section, deep)
     merged_data: dict[str, Any] = {}
-    all_sections = set(global_layer.keys()) | set(repo_layer.keys())
+    all_sections = set(global_data.keys()) | set(repo_data.keys())
     known_sections = known_config_sections()
 
     for section in all_sections:
-        global_section = global_layer.get(section, {})
-        repo_section = repo_layer.get(section, {})
+        global_section = global_data.get(section, {})
+        repo_section = repo_data.get(section, {})
 
         # Both should be dicts for a proper merge
         global_section = global_section if isinstance(global_section, dict) else {}

@@ -20,7 +20,6 @@ from .github import GitHub, GitHubError, GitHubLike
 from .paths import RepoNotFoundError, RuntimePaths, find_repo_root
 from .safe_path import contains
 from .state import save_state, state_lock
-from .worker import iter_workers
 
 if TYPE_CHECKING:
     from .config import OrchestratorConfig, RuntimeConfig
@@ -408,9 +407,19 @@ def count_fleet_live_sessions(
     """Count live worker sessions across all registered repos in the fleet.
 
     Reads the fleet registry, iterates over each registered repo, resolves its
-    sessions_dir, and counts live workers using the adapter-agnostic iter_workers
-    from worker.py. Tolerates per-repo problems by skipping them and returning a
-    list of skipped repo keys for operator visibility.
+    sessions_dir, and counts live workers. Tolerates per-repo problems by
+    skipping them and returning a list of skipped repo keys for operator
+    visibility.
+
+    Each repo contributes
+    ``live_session_count.count_live_sessions(sessions_dir,
+    state_file, WORKER_LANE)`` -- the SAME liveness rule the per-repo
+    ``dispatch.max_concurrent_sessions`` cap uses (sidecar ``is_alive`` plus
+    the ghost-worker corroboration against the repo's ``state.json``, issue
+    #343), so the fleet and per-repo caps cannot disagree about what "live"
+    means (issue #2230: before this, the fleet count walked sidecars only and
+    a ghost -- a dispatched issue whose worker_pid is alive but whose
+    sidecar is gone -- was invisible to it).
 
     Args:
         fleet_dir_override: Optional override for the fleet directory path.
@@ -423,6 +432,10 @@ def count_fleet_live_sessions(
         - config load failure (missing/unreadable/malformed/invalid), or
         - resolved sessions_dir missing.
     """
+    # Imported at the one call site so fleet_registry's module-load graph is
+    # unchanged for every review-lane consumer.
+    from .live_session_count import WORKER_LANE, count_live_sessions
+
     total_live_count = 0
     skipped_repos: list[str] = []
 
@@ -442,10 +455,9 @@ def count_fleet_live_sessions(
             skipped_repos.append(name_with_owner)
             continue
 
-        # Count live workers using adapter-agnostic iter_workers
-        workers = iter_workers(sessions_dir, repo_key=name_with_owner)
-        live_count = sum(1 for worker in workers if worker.is_alive())
-        total_live_count += live_count
+        total_live_count += count_live_sessions(
+            sessions_dir, layout.state_file_path(state_dir), WORKER_LANE
+        )
 
     return total_live_count, skipped_repos
 
@@ -457,8 +469,9 @@ def count_fleet_live_reviews(
 
     The review-lane twin of :func:`count_fleet_live_sessions` (issue #2084):
     same registry walk and per-repo skip semantics, but each repo contributes
-    ``dispatch_selection._count_live_reviews(reviews_dir, state_file)`` -- the
-    SAME liveness rule the per-repo ``max_concurrent_reviews`` cap uses
+    ``live_session_count.count_live_sessions(reviews_dir, state_file,
+    REVIEW_LANE)`` -- the SAME liveness rule the per-repo
+    ``max_concurrent_reviews`` cap uses
     (sidecar ``is_alive`` plus the ghost-reviewer corroboration against the
     repo's ``state.json``), so the fleet and per-repo caps cannot disagree
     about what "live" means.
@@ -472,7 +485,7 @@ def count_fleet_live_reviews(
     """
     # Imported at the one call site so fleet_registry's module-load graph is
     # unchanged for every worker-lane consumer.
-    from .dispatch_selection import _count_live_reviews
+    from .live_session_count import REVIEW_LANE, count_live_sessions
 
     total_live_count = 0
     skipped_repos: list[str] = []
@@ -487,7 +500,9 @@ def count_fleet_live_reviews(
         )
         if not reviews_dir.exists():
             continue
-        total_live_count += _count_live_reviews(reviews_dir, layout.state_file_path(state_dir))
+        total_live_count += count_live_sessions(
+            reviews_dir, layout.state_file_path(state_dir), REVIEW_LANE
+        )
 
     return total_live_count, skipped_repos
 

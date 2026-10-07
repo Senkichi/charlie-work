@@ -53,6 +53,59 @@ def autospec() -> Callable[..., Any]:
     return autospec_patch
 
 
+def patch_path_replace(
+    monkeypatch: pytest.MonkeyPatch,
+    fake: Callable[..., Path],
+    *,
+    scope: Path,
+) -> None:
+    """Install ``fake`` as ``Path.replace``, but only for calls inside ``scope``.
+
+    ``monkeypatch.setattr(Path, "replace", fake)`` patches the *class*, so the
+    patch is process-wide: a ``Path.replace`` fired by any other thread during
+    the window -- a leftover background writer from an earlier test on the same
+    xdist worker, the flake behind issues #2284/#2290 -- lands in ``fake`` too,
+    where it is miscounted, raised at, or deadlocked on a barrier it was never
+    meant to join.
+
+    The installed wrapper routes a call to ``fake`` only when the source path
+    resolves inside ``scope`` (resolved containment via
+    ``charlie_work.safe_path.contains``, so a junction/reparse point cannot
+    smuggle an outside path in); every other call delegates to the real
+    ``Path.replace`` untouched. Scope the patch to the directory under test
+    (usually ``tmp_path``) -- a foreign path then behaves exactly as if the
+    patch did not exist.
+
+    ``fake`` keeps the real signature ``(self, target) -> Path``. A fake that
+    delegates must call a ``real_replace`` captured *before* this helper runs;
+    calling ``Path.replace`` inside ``fake`` would re-enter the wrapper.
+    """
+    from charlie_work import safe_path
+
+    real_replace = Path.replace
+
+    def _scoped(self: Path, target: object, *args: Any, **kwargs: Any) -> Path:
+        if safe_path.contains(scope, self):
+            return fake(self, target, *args, **kwargs)
+        return real_replace(self, target, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "replace", _scoped)
+
+
+@pytest.fixture(name="patch_path_replace")
+def _patch_path_replace_fixture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Callable[..., None]:
+    """``patch_path_replace`` bound to the test's own ``monkeypatch``.
+
+    Call as ``patch_path_replace(fake, scope=tmp_path)``. A test that manages
+    a ``pytest.MonkeyPatch()`` instance by hand (e.g. to control undo timing
+    around joined threads) calls the unbound ``conftest.patch_path_replace``
+    directly.
+    """
+    return lambda fake, *, scope: patch_path_replace(monkeypatch, fake, scope=scope)
+
+
 @pytest.hookimpl(tryfirst=True)
 def pytest_sessionstart(session: pytest.Session) -> None:
     """Issue #1665: refuse to run when ``charlie_work`` resolves outside this checkout.
@@ -80,6 +133,26 @@ def pytest_sessionstart(session: pytest.Session) -> None:
     enforce_source_anchor(Path(__file__).resolve().parents[1])
 
 
+@pytest.hookimpl(tryfirst=True, optionalhook=True)
+def pytest_xdist_auto_num_workers(config: pytest.Config) -> int | None:
+    """HS-CW-1: run 1-3 explicit file/nodeid targets serially under ``-n auto``.
+
+    ``addopts`` carries ``-n auto``; xdist asks this hook (firstresult) how many
+    workers ``auto`` means. ``0`` makes xdist run the session in-process;
+    ``None`` falls through to xdist's default (``PYTEST_XDIST_AUTO_NUM_WORKERS``,
+    else the CPU count). ``optionalhook`` keeps ``-n0``/no-xdist runs from
+    rejecting an unknown hook. Policy and rationale: ``tests/_xdist_policy.py``.
+    """
+    from _xdist_policy import small_run_workers
+
+    return small_run_workers(
+        config.args,
+        config.invocation_params.dir,
+        config.invocation_params.args,
+        from_command_line=config.args_source == pytest.Config.ArgsSource.ARGS,
+    )
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _kill_on_close_job() -> None:
     """Issue #1851: on Windows, put this pytest process in a Job Object with
@@ -100,26 +173,39 @@ def _kill_on_close_job() -> None:
     enter_kill_on_close_job()
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _src_ast_mutation_guard() -> Iterator[None]:
+    """HS-CW-3: fail the session if a test mutated a shared ``_src_ast`` tree.
+
+    ``_src_ast.parsed`` hands every caller in this process the same
+    ``ast.Module``; one consumer editing it would poison every later scan.
+    Teardown re-digests every handed-out tree once per process and names each
+    file whose tree changed. Mutating callers use ``_src_ast.parsed_fresh``.
+    """
+    yield
+    from _src_ast import assert_no_mutations
+
+    assert_no_mutations()
+
+
 @pytest.fixture(autouse=True)
 def _no_leaked_child_processes() -> Iterator[None]:
     """Issue #1851: fail a test that leaves a live descendant behind.
 
-    Snapshots this process's descendants at setup; at teardown gives new
-    children a short grace to exit on their own, kills the survivors, and
-    fails the test naming each survivor's pid and command line. Measured
-    cost: two ``psutil`` child enumerations per test ≈ 7.5 ms — ~60 s over
-    the 7909-test suite (~7 % of the ~14.5 min CI Tests job). A cheaper
-    ``create_time``-vs-``time.time()`` cutoff was tried and rejected:
-    ``time.time()`` granularity/stepping on some Windows hosts can place a
-    pre-existing child above the cutoff (see ``descendant_snapshot``).
+    ``leak_guard`` reads the kill-on-close job's member list at setup and
+    teardown (one syscall each, HS-CW-2) and falls back to the psutil walk --
+    grace, kill, report naming each survivor's pid and command line -- only
+    when the job gained a member. Off Windows, when the job was refused, or
+    with ``CI_FLEET_FAST_GUARDS=off``, every test takes the psutil walk (two
+    child enumerations, ~7.5 ms). A cheaper ``create_time``-vs-``time.time()``
+    cutoff was tried and rejected: ``time.time()`` granularity/stepping on some
+    Windows hosts can place a pre-existing child above the cutoff (see
+    ``descendant_snapshot``).
     """
-    from _process_guard import descendant_snapshot, reap_leaked_descendants
+    from _process_guard import leak_guard
 
-    before = descendant_snapshot()
-    yield
-    report = reap_leaked_descendants(before)
-    if report:
-        pytest.fail("test left live child process(es) behind:\n  " + "\n  ".join(report))
+    with leak_guard():
+        yield
 
 
 @pytest.fixture(autouse=True)
@@ -204,6 +290,18 @@ def _isolate_fleet_registry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
     that single knob for suite-wide isolation.
     """
     monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", str(tmp_path / "fleet"))
+
+
+@pytest.fixture(autouse=True)
+def _isolate_host_io_manifest(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Point ci-fleet's host I/O manifest at a per-test path that does not exist.
+
+    On a host provisioned for fast I/O, the default manifest is real, and any
+    test that resolves the worktrees root (``paths.resolved_layout``) would put
+    worktrees on that host's volume. ``host_io_worker`` tests write their own
+    manifest at this path. Control: ``test_the_suite_never_reads_the_hosts_manifest``.
+    """
+    monkeypatch.setenv("CI_FLEET_HOST_IO_MANIFEST", str(tmp_path / "host-io" / "host-io.json"))
 
 
 @pytest.fixture(autouse=True)
@@ -481,6 +579,30 @@ def _default_healthy_preflight(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture(autouse=True)
+def _no_real_boot_sync_repair(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Issue #2312: default the boot-time pending-sync repair to a no-op.
+
+    ``run_fleet_supervise`` invokes ``heal_pending_sync_at_boot`` before config
+    load; the real implementation shells out to ``git``/``uv`` against the
+    checkout under test, and on a skewed or dev-extra-heavy venv would run a
+    real ``uv sync --locked`` -- mutating the very environment pytest is
+    running from (observed: it pruned the dev extras mid-suite and every
+    spawned pytest child then died on ``import pluggy``). Every caller of
+    ``run_fleet_supervise`` gets the stub, including CLI-level tests that never
+    import the fleet fixtures. Tests that target the repair itself call
+    ``pending_sync.heal_pending_sync_at_boot`` directly (unpatched); tests
+    that target the wiring re-monkeypatch this same attribute in their own
+    body, which cleanly overrides the default.
+    """
+    from charlie_work.pending_sync import BootSyncRepair
+
+    monkeypatch.setattr(
+        "charlie_work.fleet_dispatch.heal_pending_sync_at_boot",
+        lambda *a, **k: BootSyncRepair(),
+    )
+
+
+@pytest.fixture(autouse=True)
 def _no_live_self_deploy_history(monkeypatch: pytest.MonkeyPatch) -> None:
     """Issue #2103: the reviewer reap reads the orchestrator's own ``events.db``
     for ``self_deploy_succeeded``. On a host with deploy history that would
@@ -490,3 +612,39 @@ def _no_live_self_deploy_history(monkeypatch: pytest.MonkeyPatch) -> None:
         "charlie_work.orchestration.misc_review_verdicts.self_deploy_state_path",
         lambda: None,
     )
+
+
+@pytest.fixture
+def fake_host(monkeypatch: pytest.MonkeyPatch) -> Callable[..., Any]:
+    """Swap the active host ports for the test; restored by monkeypatch.
+
+    ``fake_host(clock=FakeClock(...))`` replaces the named ports on top of the
+    currently active ports (so repeated calls compose) and returns the resulting ``HostPorts``.  An app built without an
+    explicit ``host=`` and every non-app module see the same fake.
+    """
+    import dataclasses
+
+    from charlie_work import host as host_pkg
+
+    def _install(**overrides: Any) -> Any:
+        ports = dataclasses.replace(host_pkg.current(), **overrides)
+        monkeypatch.setattr(host_pkg, "_ACTIVE", ports)
+        return ports
+
+    return _install
+
+
+@pytest.fixture(autouse=True)
+def _no_real_ci_fleet(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Never let a test wrap a suite in the venv's real ``ci-fleet`` executable.
+
+    The worker/rework prompts and the local merge gate wrap the runner in
+    ``ci-fleet test`` whenever the console script sits beside the interpreter,
+    which in this venv it always does -- and the locked ``ci-fleet`` may predate
+    the ``test`` subcommand. Every test therefore starts with no executable (today's
+    commands, and no git subprocess per prompt render); a test that wants the
+    wrapped form patches ``selection_wrapper.ci_fleet_executable`` itself.
+    """
+    import charlie_work.selection_wrapper as selection_wrapper
+
+    monkeypatch.setattr(selection_wrapper, "ci_fleet_executable", lambda: None)

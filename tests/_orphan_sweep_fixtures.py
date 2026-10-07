@@ -174,13 +174,13 @@ def _run_orphan_sweep(
     review_callback: Any = None,
     dry_run: bool = False,
 ) -> None:
-    from unittest.mock import patch
+    from _host_fixtures import host_probe
 
     from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+    with host_probe(alive=False):
         _detect_and_handle_orphaned_workers(
             sessions_dir,
             paths.state_file,

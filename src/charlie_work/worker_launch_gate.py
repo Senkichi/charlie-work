@@ -42,6 +42,12 @@ worker-role settings on the selected entry, stamps each launched session's
 sidecar with it, and emits ``role_fallback_selected`` past the primary. A
 length-1 chain never reads the ledger and behaves exactly as before.
 
+Model tier (TIS-CW-6): :func:`_launch_workers` splits a worker-role batch by the
+issues' ``model:<tier>`` labels (``model_tier``). Each tier the chain can
+serve launches on the first unrestricted entry of that model family and emits
+``worker_model_tier_selected``; unlabelled issues, and tiers the chain cannot
+serve (``worker_model_tier_fallback``), launch on the permit's selection.
+
 The fresh and remote-rework lanes mint a *pending* lock handle at their entry
 point via :func:`acquire_fleet_launch_lock` -- which does NOT touch the OS
 lock -- and hand it to :func:`issue_worker_launch_permit`; the local lane lets
@@ -50,7 +56,9 @@ lock handle or permit: validity is a private mint token checked by identity at
 launch time, so a hand-built permit is refused rather than trusted.
 
 ``tests/test_worker_launch_gate_guard.py`` AST-scans ``src/charlie_work`` and
-fails if any function other than :func:`_launch_workers` references
+fails if any function other than :func:`_launch_workers` touches the
+``worker_launch`` port, or anything other than the port's Real /
+:func:`_launch_workers` itself / the ``workflow`` re-export references
 ``dispatch_sessions`` -- a new lane that bypasses the gate fails CI.
 """
 
@@ -66,9 +74,21 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
+# The dotted form, not ``from charlie_work import model_tier``: the dormant-module
+# import graph (tests/test_dormant_fleet_marking.py) cannot see the bare-package
+# form, and this is model_tier's only importer.
+import charlie_work.model_tier as model_tier
 from charlie_work import layout, role_selection
-from charlie_work.adapters import AdapterSettings, SessionDispatchResult, SessionRequest
+from charlie_work.adapters import (
+    AdapterSettings,
+    SessionDispatchResult,
+    SessionRequest,
+    manifest_adapter_label,
+    write_session_results,
+)
+from charlie_work.atomic_write import write_json_atomic
 from charlie_work.fleet_registry import try_acquire_fleet_lock
+from charlie_work.host.launch import worker_error_results
 
 if TYPE_CHECKING:
     from charlie_work.workflow import OrchestratorApp
@@ -198,9 +218,7 @@ class FleetLaunchLock:
         }
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = path.with_suffix(path.suffix + ".tmp")
-            tmp.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
-            tmp.replace(path)
+            write_json_atomic(path, payload)
         except OSError:
             return  # best-effort metadata -- never the reason a launch fails
         self._wrote_holder = True
@@ -450,6 +468,8 @@ def issue_worker_launch_permit(
         selection,
         reason=pre_state.get("throttle_reason"),
         adapter_kind=pre_state.get("throttle_adapter_kind"),
+        harness=pre_state.get("throttle_harness"),
+        model=pre_state.get("throttle_model"),
     ):
         return WorkerLaunchDeferral(
             REASON_PROVIDER_THROTTLED, throttled_until=pre_state.get("throttled_until")
@@ -473,7 +493,9 @@ def issue_worker_launch_permit(
 
     try:
         if live_count is None:
-            live_count = _wf._count_live_sessions(app._layout.sessions_dir, app.paths.state_file)
+            live_count = app.host.sessions.live_workers(
+                app._layout.sessions_dir, app.paths.state_file
+            )
         governor_kwargs: dict[str, Any] = {"live_count": live_count}
         if apply_open_pr_backpressure:
             governor_kwargs["apply_open_pr_backpressure"] = True
@@ -487,6 +509,8 @@ def issue_worker_launch_permit(
                 selection,
                 reason=state.get("throttle_reason"),
                 adapter_kind=state.get("throttle_adapter_kind"),
+                harness=state.get("throttle_harness"),
+                model=state.get("throttle_model"),
             )
     except BaseException:
         if owns_lock:
@@ -523,13 +547,65 @@ def _refusal_reason(permit: object, count: int) -> str | None:
     return None
 
 
+def _tier_groups(
+    app: OrchestratorApp,
+    selection: Any,
+    settings: AdapterSettings,
+    requests: list[SessionRequest],
+) -> list[tuple[Any, str | None, list[SessionRequest]]]:
+    """Split a worker batch by ``model:<tier>`` label (TIS-CW-6): ``(selection, tier, requests)``.
+
+    The first group launches on the permit's own selection (the fleet's default
+    tier): unlabelled requests, plus every request whose tier the chain cannot
+    serve, each recorded as ``worker_model_tier_fallback``. Each tier the chain
+    serves gets its own group on that tier's entry. Rescue-tier settings (role
+    ``""``), a permit without a selection, or an empty prefix give one group,
+    launched exactly as before TIS-CW-6; so does an empty batch, so the manifest is
+    still written.
+    """
+    prefix = app.config.labels.model_tier_prefix
+    if selection is None or settings.role != "worker" or not prefix:
+        return [(selection, None, list(requests))]
+    default: list[SessionRequest] = []
+    by_tier: dict[str, list[SessionRequest]] = {}
+    for request in requests:
+        tiers = model_tier.model_tiers(request.labels, prefix)
+        if len(tiers) == 1:
+            by_tier.setdefault(tiers[0], []).append(request)
+            continue
+        if tiers:
+            model_tier.emit_tier_fallback(
+                app.write_gate,
+                tier=",".join(tiers),
+                reason=model_tier.CONFLICTING,
+                numbers=[request.issue_number],
+            )
+        default.append(request)
+    served: list[tuple[Any, str | None, list[SessionRequest]]] = []
+    for tier, members in sorted(by_tier.items()):
+        tier_selection, reason = model_tier.select_tier_for_launch(selection.chain, tier)
+        if tier_selection is None:
+            model_tier.emit_tier_fallback(
+                app.write_gate,
+                tier=tier,
+                reason=reason,
+                numbers=[request.issue_number for request in members],
+            )
+            default.extend(members)
+        else:
+            served.append((tier_selection, tier, members))
+    if default or not served:
+        return [(selection, None, default), *served]
+    return served
+
+
 def _launch_workers(
     app: OrchestratorApp,
     permit: WorkerLaunchPermit,
     settings: AdapterSettings,
     requests: list[SessionRequest],
 ) -> list[SessionDispatchResult]:
-    """Launch ``requests`` against ``permit`` -- the only ``dispatch_sessions`` caller.
+    """Launch ``requests`` against ``permit`` -- the only worker-launch-port caller.
 
     Refuses (never raises -- errors from launches come back as values) when
     the permit was not minted by :func:`issue_worker_launch_permit`, its
@@ -553,27 +629,62 @@ def _launch_workers(
             for request in requests
         ]
     permit._ledger.launched += len(requests)
-    selection = permit.role_selection
-    if selection is not None and settings.role == "worker" and selection.is_fallback:
-        # Issue #2086: worker-role settings follow the permit's chain entry;
-        # rescue-tier settings (role "") launch exactly as configured.
-        settings = role_selection.worker_settings_for(app, selection)
     _wf = _workflow()
-    # Reached through the workflow re-export so test fakes that patch
-    # ``charlie_work.workflow.dispatch_sessions`` keep intercepting.
-    results = _wf.dispatch_sessions(
-        app.repo_root,
-        app._layout.session_manifest,
-        app._layout.session_results,
-        settings,
-        requests,
-    )
-    if selection is not None and settings.role == "worker":
-        launched = [result.issue_number for result in results if result.ok]
-        for number in launched:
-            role_selection.stamp_launch(settings.sessions_dir, number, "worker", selection)
-        if launched:
-            role_selection.emit_fallback_selected(
-                app.write_gate, role="worker", selection=selection, numbers=launched
+    groups = _tier_groups(app, permit.role_selection, settings, requests)
+    results: list[SessionDispatchResult] = []
+    adapters: set[str] = set()
+    for selection, tier, group in groups:
+        if results and group and settings.launch_stagger_seconds > 0 and not settings.dry_run:
+            # A batch split by tier is still one burst: pace the boundary launch
+            # the way ``dispatch_sessions`` paces launches within a group.
+            time.sleep(settings.launch_stagger_seconds)
+        group_settings = settings
+        if selection is not None and settings.role == "worker" and selection.is_fallback:
+            # Issue #2086: worker-role settings follow the chain entry -- the
+            # permit's, or the one a ``model:<tier>`` label picked (TIS-CW-6);
+            # rescue-tier settings (role "") launch exactly as configured.
+            group_settings = role_selection.worker_settings_for(app, selection)
+        adapters.add(group_settings.adapter)
+        # Reached through the host's worker-launch port (issue #2229); the
+        # Real resolves ``adapters.dispatch_sessions`` at call time so test
+        # fakes that patch it on ``charlie_work.adapters`` keep intercepting.
+        try:
+            group_results = app.host.worker_launch.launch(
+                app.repo_root,
+                app._layout.session_manifest,
+                app._layout.session_results,
+                group_settings,
+                group,
             )
+        except Exception as exc:
+            # The permit ledger already debited this batch above; a raise at
+            # the launch seam still comes back as per-request failure values
+            # (never a propagate) so the pass completes and the lane's normal
+            # path releases the permit's fleet lock.
+            group_results = worker_error_results(
+                app.repo_root, group_settings, group, f"launch failed: {exc}"
+            )
+        results.extend(group_results)
+        if selection is not None and group_settings.role == "worker":
+            launched = [result.issue_number for result in group_results if result.ok]
+            for number in launched:
+                role_selection.stamp_launch(
+                    group_settings.sessions_dir, number, "worker", selection
+                )
+            if launched and tier is None:
+                role_selection.emit_fallback_selected(
+                    app.write_gate, role="worker", selection=selection, numbers=launched
+                )
+            elif launched:
+                model_tier.emit_tier_selected(
+                    app.write_gate, tier=tier, selection=selection, numbers=launched
+                )
+    if len(groups) > 1:
+        # Each group's ``dispatch_sessions`` overwrote the manifest and results
+        # files with its own subset; rewrite both once with the whole batch, as
+        # dispatch_rework does for its rescue-tier split.
+        _wf.write_session_manifest(
+            app._layout.session_manifest, requests, adapter=manifest_adapter_label(adapters)
+        )
+        write_session_results(app._layout.session_results, results)
     return results

@@ -1,1 +1,4 @@
-5800
+6000
+# Issue #2195 / PR #2197 rework: the foreign-worktree adoption kwargs wiring grew
+# the live count to 5803, past the 5800 mark. Reviewed hand-raise to the next
+# MARK_QUANTUM multiple.

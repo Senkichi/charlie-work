@@ -56,6 +56,8 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Iterable, Mapping
 
+from .atomic_write import write_json_atomic
+
 if TYPE_CHECKING:  # annotations only; keeps this module importable below config
     from .config import ApiBudgetConfig, ApiProviderConfig
 
@@ -502,17 +504,14 @@ def load_ledger(path: Path) -> Ledger:
 
 
 def save_ledger(path: Path, ledger: Ledger) -> None:
-    """Atomically persist ``ledger`` to ``path`` (temp-file + ``replace()``).
+    """Atomically persist ``ledger`` to ``path``.
 
-    Mirrors ``state.save_state`` / ``claude_code._write_json_atomic``: the
-    write is atomic so a concurrent reader never observes a half-written file.
+    Mirrors ``state.save_state`` / ``claude_code._write_json_atomic`` -- all
+    now delegating to ``atomic_write.write_json_atomic`` (unique temp name +
+    rename retry + orphan cleanup, issue #2265): a concurrent reader never
+    observes a half-written file.
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    with tmp_path.open("w", encoding="utf-8") as handle:
-        json.dump(ledger_to_dict(ledger), handle, indent=2, sort_keys=True)
-        handle.write("\n")
-    tmp_path.replace(path)
+    write_json_atomic(path, ledger_to_dict(ledger))
 
 
 def settle_session_to_disk(path: Path, entry: SessionEntry) -> bool:
@@ -598,6 +597,14 @@ def _header_int(values: Mapping[str, str], name: str) -> int | None:
         return None
 
 
+def window_supersedes(candidate: GitHubRateWindow, current: GitHubRateWindow) -> bool:
+    """Whether *candidate* is at least as new as *current* (same resource): a
+    later ``reset`` is a newer window; within one window ``remaining`` only falls."""
+    return candidate.reset_epoch > current.reset_epoch or (
+        candidate.reset_epoch == current.reset_epoch and candidate.remaining <= current.remaining
+    )
+
+
 def observe_github_rate(
     budget: GitHubRateBudget, headers: Iterable[tuple[str, str]], now: float
 ) -> GitHubRateBudget:
@@ -619,10 +626,7 @@ def observe_github_rate(
     resource = values.get("x-ratelimit-resource") or "core"
     window = GitHubRateWindow(resource, limit, remaining, reset, now)
     current = next((w for w in budget.windows if w.resource == resource), None)
-    if current is not None and (
-        current.reset_epoch > reset
-        or (current.reset_epoch == reset and current.remaining < remaining)
-    ):
+    if current is not None and not window_supersedes(window, current):
         return budget
     kept = tuple(w for w in budget.windows if w.resource != resource)
     return GitHubRateBudget(windows=(*kept, window))
@@ -637,6 +641,132 @@ def github_headroom(
         if window.resource == resource:
             return window if window.reset_epoch > now else None
     return None
+
+
+# ---------------------------------------------------------------------------
+# GitHub spend accounting (issue #2439)
+# ---------------------------------------------------------------------------
+# Points are measured from ``x-ratelimit-used`` deltas on response headers,
+# never from ``gh api rate_limit`` (the audit saw it alternate between two
+# counters for the same token). ``used`` is a per-token, per-resource counter
+# that grows within one window (identified by its ``reset`` epoch), so the
+# difference between two sightings of the same window is what was spent
+# between them. The cursor is shared by every client in the process, so the
+# per-capability points of concurrent lanes sum to the observed delta.
+
+
+@dataclass(frozen=True)
+class GitHubUsedMark:
+    resource: str
+    reset_epoch: int
+    used: int
+
+
+@dataclass(frozen=True)
+class GitHubUsedCursor:
+    """The last ``used`` seen per (resource, window)."""
+
+    marks: tuple[GitHubUsedMark, ...] = ()
+
+
+@dataclass(frozen=True)
+class GitHubSample:
+    """One response's rate-limit headers, parsed. ``used`` is ``None`` when the
+    response carried no usable counter (no headers, malformed, a ``gh`` result
+    without ``--include`` output)."""
+
+    resource: str
+    used: int | None
+    reset_epoch: int | None
+    remaining: int | None
+    limit: int | None
+
+
+def sample_github_rate(headers: Iterable[tuple[str, str]]) -> GitHubSample:
+    values = {name.lower(): value for name, value in headers}
+    limit = _header_int(values, "x-ratelimit-limit")
+    remaining = _header_int(values, "x-ratelimit-remaining")
+    used = _header_int(values, "x-ratelimit-used")
+    if used is None and limit is not None and remaining is not None:
+        used = limit - remaining
+    reset = _header_int(values, "x-ratelimit-reset")
+    resource = values.get("x-ratelimit-resource") or "core"
+    return GitHubSample(resource, used, reset, remaining, limit)
+
+
+def advance_used_cursor(
+    cursor: GitHubUsedCursor, sample: GitHubSample
+) -> tuple[GitHubUsedCursor, int]:
+    """Return the cursor after *sample* and the points spent since the last
+    sighting of the same window -- one mark per (resource, reset) pair,
+    pruned to within one window (3600s) of the newest reset (issue #2488).
+
+    The first sighting of a window is a baseline and counts 0 (its ``used``
+    includes spend this process never saw); a stale repeat counts 0 and
+    leaves the mark unchanged, so summed deltas never exceed the server's
+    counters -- and a pruned-window sample baselines at 0, unretained."""
+    if sample.used is None or sample.reset_epoch is None:
+        return cursor, 0
+    window = (sample.resource, sample.reset_epoch)
+    current = next((m for m in cursor.marks if (m.resource, m.reset_epoch) == window), None)
+    if current is not None and sample.used <= current.used:
+        return cursor, 0
+    mark = GitHubUsedMark(*window, sample.used)
+    marks = tuple(m for m in cursor.marks if (m.resource, m.reset_epoch) != window) + (mark,)
+    cutoff = max(m.reset_epoch for m in marks if m.resource == sample.resource) - 3600
+    marks = tuple(m for m in marks if m.resource != sample.resource or m.reset_epoch >= cutoff)
+    return GitHubUsedCursor(marks), 0 if current is None else sample.used - current.used
+
+
+@dataclass(frozen=True)
+class GitHubSpendEntry:
+    capability: str
+    resource: str
+    requests: int = 0
+    points: int = 0
+    unmetered_requests: int = 0  # answered, but no usable ``used`` counter
+
+
+@dataclass(frozen=True)
+class GitHubSpend:
+    """Requests and points per (capability, resource) since the last take."""
+
+    entries: tuple[GitHubSpendEntry, ...] = ()
+
+    @property
+    def requests(self) -> int:
+        return sum(e.requests for e in self.entries)
+
+    @property
+    def points(self) -> int:
+        return sum(e.points for e in self.entries)
+
+    def points_by_resource(self) -> dict[str, int]:
+        totals: dict[str, int] = {}
+        for entry in self.entries:
+            totals[entry.resource] = totals.get(entry.resource, 0) + entry.points
+        return totals
+
+
+def record_github_spend(
+    spend: GitHubSpend, capability: str, resource: str, *, points: int, metered: bool
+) -> GitHubSpend:
+    """Return *spend* with one request (and *points*) added to its entry."""
+    current = next(
+        (e for e in spend.entries if e.capability == capability and e.resource == resource),
+        GitHubSpendEntry(capability, resource),
+    )
+    updated = GitHubSpendEntry(
+        capability,
+        resource,
+        current.requests + 1,
+        current.points + points,
+        current.unmetered_requests + (0 if metered else 1),
+    )
+    kept = tuple(
+        e for e in spend.entries if not (e.capability == capability and e.resource == resource)
+    )
+    return GitHubSpend((*kept, updated))
 
 
 __all__ = [
@@ -658,4 +788,13 @@ __all__ = [
     "GitHubRateBudget",
     "observe_github_rate",
     "github_headroom",
+    "window_supersedes",
+    "GitHubSample",
+    "GitHubSpend",
+    "GitHubSpendEntry",
+    "GitHubUsedCursor",
+    "GitHubUsedMark",
+    "advance_used_cursor",
+    "record_github_spend",
+    "sample_github_rate",
 ]

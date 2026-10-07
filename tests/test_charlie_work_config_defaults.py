@@ -354,13 +354,12 @@ supervisor:
 
 
 def test_supervisor_config_self_deploy_failure_alarm_wrong_type_raises(tmp_path: Path) -> None:
-    """Wrong type for self_deploy_failure_alarm raises ConfigError.
-
-    Issue #817 item 5 added this field alongside the existing supervisor int
-    fields; the supervisor section has its own manual int-type-validation
-    tuple in config.py (separate from the generic validate_section machinery),
-    which needed the new key added explicitly. Locks that in so a future
-    refactor of the tuple can't silently drop validation for this field.
+    """A legacy ``supervisor.self_deploy_failure_alarm`` entry raises
+    ConfigError -- as an unknown key now, before any type check can run:
+    #1978 moved the knob to ``fleet_supervisor:`` and #1979 removed the
+    fallback, so this input can no longer reach a type check at all. The
+    leaf name predates the removal and is kept verbatim for the collect-only
+    gate (#1538).
     """
     from charlie_work.config import ConfigError
 
@@ -373,21 +372,15 @@ supervisor:
     )
     with pytest.raises(
         ConfigError,
-        match=r"^supervisor\.self_deploy_failure_alarm: expected int, got 'not-an-int' \(str\)$",
+        match=r"^supervisor: expected known keys .*unknown key\(s\) self_deploy_failure_alarm",
     ):
         load_config(config_file)
 
 
 def test_supervisor_config_zero_pass_alarm_wrong_type_raises(tmp_path: Path) -> None:
-    """Wrong type for zero_pass_alarm raises ConfigError.
-
-    Issue #855 added this field alongside the existing supervisor int
-    fields; the supervisor section has its own manual int-type-validation
-    tuple in config.py (separate from the generic validate_section machinery),
-    which needed the new key added explicitly -- mirrors
+    """A legacy ``supervisor.zero_pass_alarm`` entry raises ConfigError --
+    as an unknown key now, before any type check can run; mirrors
     test_supervisor_config_self_deploy_failure_alarm_wrong_type_raises.
-    Locks that in so a future refactor of the tuple can't silently drop
-    validation for this field.
     """
     from charlie_work.config import ConfigError
 
@@ -399,7 +392,8 @@ supervisor:
 """
     )
     with pytest.raises(
-        ConfigError, match=r"^supervisor\.zero_pass_alarm: expected int, got 'not-an-int' \(str\)$"
+        ConfigError,
+        match=r"^supervisor: expected known keys .*unknown key\(s\) zero_pass_alarm",
     ):
         load_config(config_file)
 
@@ -407,15 +401,10 @@ supervisor:
 def test_supervisor_config_dependency_sync_starvation_wrong_type_raises(
     tmp_path: Path,
 ) -> None:
-    """Wrong type for dependency_sync_starvation_seconds raises ConfigError.
-
-    Issue #1855 added this field alongside the existing supervisor int
-    fields; the supervisor section has its own manual int-type-validation
-    tuple in config.py (separate from the generic validate_section machinery),
-    which needed the new key added explicitly -- mirrors
+    """A legacy ``supervisor.dependency_sync_starvation_seconds`` entry
+    raises ConfigError -- as an unknown key now, before any type check can
+    run; mirrors
     test_supervisor_config_self_deploy_failure_alarm_wrong_type_raises.
-    Locks that in so a future refactor of the tuple can't silently drop
-    validation for this field.
     """
     from charlie_work.config import ConfigError
 
@@ -428,7 +417,7 @@ supervisor:
     )
     with pytest.raises(
         ConfigError,
-        match=r"^supervisor\.dependency_sync_starvation_seconds: expected int, got 'not-an-int' \(str\)$",
+        match=r"^supervisor: expected known keys .*unknown key\(s\) dependency_sync_starvation_seconds",
     ):
         load_config(config_file)
 
@@ -436,7 +425,8 @@ supervisor:
 def test_supervisor_config_fleet_lane_concurrency_wrong_type_raises(
     tmp_path: Path,
 ) -> None:
-    """Wrong type for fleet_lane_concurrency raises ConfigError (issue #1934)."""
+    """A legacy ``supervisor.fleet_lane_concurrency`` entry raises
+    ConfigError -- as an unknown key now, before any type check can run."""
     from charlie_work.config import ConfigError
 
     config_file = tmp_path / "orchestrator.config.yaml"
@@ -448,7 +438,7 @@ supervisor:
     )
     with pytest.raises(
         ConfigError,
-        match=r"^supervisor\.fleet_lane_concurrency: expected int, got 'not-an-int' \(str\)$",
+        match=r"^supervisor: expected known keys .*unknown key\(s\) fleet_lane_concurrency",
     ):
         load_config(config_file)
 
@@ -456,7 +446,8 @@ supervisor:
 def test_supervisor_config_reap_sweep_interval_wrong_type_raises(
     tmp_path: Path,
 ) -> None:
-    """Wrong type for reap_sweep_interval_seconds raises ConfigError (issue #1934)."""
+    """A legacy ``supervisor.reap_sweep_interval_seconds`` entry raises
+    ConfigError -- as an unknown key now, before any type check can run."""
     from charlie_work.config import ConfigError
 
     config_file = tmp_path / "orchestrator.config.yaml"
@@ -468,7 +459,7 @@ supervisor:
     )
     with pytest.raises(
         ConfigError,
-        match=r"^supervisor\.reap_sweep_interval_seconds: expected int, got 'not-an-int' \(str\)$",
+        match=r"^supervisor: expected known keys .*unknown key\(s\) reap_sweep_interval_seconds",
     ):
         load_config(config_file)
 

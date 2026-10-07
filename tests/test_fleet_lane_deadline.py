@@ -65,7 +65,8 @@ from charlie_work.pass_deadline import (
 )
 from charlie_work.paths import runtime_paths
 from charlie_work.state import empty_state, save_state
-from charlie_work.workflow import CommandResult, OrchestratorApp
+from charlie_work.command_result import CommandResult
+from charlie_work.workflow import OrchestratorApp
 
 
 # ---------------------------------------------------------------------------
@@ -214,6 +215,7 @@ def test_fleet_repo_lane_arms_deadline_on_real_github(tmp_path: Path) -> None:
         limit=3,
         merge=True,
         ensure_labels=False,
+        fleet_state_path=tmp_path / "state.json",
         deadline_exceeded=predicate,
     )
 
@@ -225,7 +227,7 @@ def test_fleet_repo_lane_arms_deadline_on_real_github(tmp_path: Path) -> None:
         real_gh.run(["api", "rate_limit"], allow_failure=True)
 
 
-def test_fleet_repo_lane_stops_between_dispatch_and_review_dispatch() -> None:
+def test_fleet_repo_lane_stops_between_dispatch_and_review_dispatch(tmp_path: Path) -> None:
     """work_only lane: deadline tripped after dispatch defers dispatch_reviews."""
     app = MagicMock()
     app.dispatch.return_value = CommandResult(True, "dispatched", {"selected_count": 1})
@@ -243,6 +245,7 @@ def test_fleet_repo_lane_stops_between_dispatch_and_review_dispatch() -> None:
         limit=3,
         merge=None,
         ensure_labels=False,
+        fleet_state_path=tmp_path / "state.json",
         deadline_exceeded=lambda: next(checks),
     )
 
@@ -253,7 +256,7 @@ def test_fleet_repo_lane_stops_between_dispatch_and_review_dispatch() -> None:
     lock.release.assert_called_once()
 
 
-def test_fleet_repo_lane_bails_before_first_phase() -> None:
+def test_fleet_repo_lane_bails_before_first_phase(tmp_path: Path) -> None:
     """Deadline already spent at lane start: no dispatch/loop call at all."""
     app = MagicMock()
     lock = _lane_lock()
@@ -268,6 +271,7 @@ def test_fleet_repo_lane_bails_before_first_phase() -> None:
         limit=3,
         merge=None,
         ensure_labels=False,
+        fleet_state_path=tmp_path / "state.json",
         deadline_exceeded=lambda: True,
     )
 
@@ -278,7 +282,7 @@ def test_fleet_repo_lane_bails_before_first_phase() -> None:
     lock.release.assert_called_once()
 
 
-def test_fleet_repo_lane_threads_deadline_into_loop() -> None:
+def test_fleet_repo_lane_threads_deadline_into_loop(tmp_path: Path) -> None:
     """The full-loop lane forwards the SAME predicate object into app.loop()."""
     app = MagicMock()
     app.loop.return_value = CommandResult(True, "ok", {})
@@ -294,13 +298,14 @@ def test_fleet_repo_lane_threads_deadline_into_loop() -> None:
         limit=3,
         merge=True,
         ensure_labels=False,
+        fleet_state_path=tmp_path / "state.json",
         deadline_exceeded=predicate,
     )
 
     app.loop.assert_called_once_with(3, merge=True, deadline_exceeded=predicate)
 
 
-def test_fleet_repo_lane_no_deadline_is_inert() -> None:
+def test_fleet_repo_lane_no_deadline_is_inert(tmp_path: Path) -> None:
     """deadline_exceeded=None keeps the pre-#1948 lane behavior byte-identical."""
     app = MagicMock()
     app.loop.return_value = CommandResult(True, "ok", {})
@@ -315,6 +320,7 @@ def test_fleet_repo_lane_no_deadline_is_inert() -> None:
         limit=3,
         merge=True,
         ensure_labels=False,
+        fleet_state_path=tmp_path / "state.json",
     )
 
     app.loop.assert_called_once_with(3, merge=True, deadline_exceeded=None)

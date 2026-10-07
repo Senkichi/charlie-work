@@ -18,7 +18,7 @@ from charlie_work import cli
 from charlie_work.config import OrchestratorConfig
 from charlie_work.instrumentation import log_event
 from charlie_work.paths import runtime_paths
-from charlie_work.workflow import CommandResult
+from charlie_work.command_result import CommandResult
 
 
 # --------------------------------------------------------------------------

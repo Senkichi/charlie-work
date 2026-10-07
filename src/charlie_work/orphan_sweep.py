@@ -10,8 +10,9 @@ orphan-sweep pipeline:
   dead session's worktree, and the ``_MIN_SWEEP_WORKTREE_PATH_LENGTH`` /
   ``_SWEEP_PATH_FORBIDDEN_CHARS`` validation keeps a degenerate needle from
   turning its ``-like "*<path>*"`` filter into a match-everything query.
-* ``_win32_process_ppid_snapshot`` / ``_posix_process_ppid_snapshot`` /
-  ``_self_ancestor_pids`` answer "who is the caller's ancestry" — the set the
+* ``_win32_ancestor_rows`` / ``_win32_process_ppid_snapshot`` /
+  ``_posix_process_ppid_snapshot`` / ``_self_ancestor_pids`` answer "who is
+  the caller's ancestry" — the set the
   kill primitives (``process_utils.kill_process_tree`` /
   ``process_utils.kill_orphan_pid``) refuse to terminate, because a sweep-hit
   PID naming any ancestor (uv, the pytest controller, the step's pwsh) fells
@@ -33,10 +34,12 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from . import host as _host
 from .process_chain import ancestor_chain_pids
 from .process_chain import ProcRow as _ProcRow  # noqa: F401 (deliberate re-export)
 from .process_chain import posix_process_ppid_snapshot as _posix_process_ppid_snapshot
-from .process_chain import win32_process_ppid_snapshot as _win32_process_ppid_snapshot
+from .process_chain import win32_ancestor_rows as _win32_ancestor_rows
+from .process_chain import win32_process_ppid_snapshot as _win32_process_ppid_snapshot  # noqa: F401 (deliberate re-export)
 from .subprocess_runner import command_failure_message, run_captured
 
 logger = logging.getLogger(__name__)
@@ -86,9 +89,16 @@ def _self_ancestor_pids() -> frozenset[int]:
     confirm or refute the sweep-needle hypothesis, so a silent degrade would
     erase the evidence.
     """
+    self_pid = os.getpid()
     try:
         if os.name == "nt":
-            ppid_by_pid = _win32_process_ppid_snapshot()
+            # Chain-scoped, not host-wide: the guard pays one ``ppid_map()``
+            # enumeration plus a handle open per ancestor hop instead of the
+            # enumeration-plus-handle-open pair per process on the box
+            # (issues #2332, #2362 -- a full ``process_iter`` snapshot costs
+            # seconds on a busy Windows box, and per-hop ``ppid()`` was the
+            # same enumeration again per ancestor).
+            ppid_by_pid = _win32_ancestor_rows(self_pid, max_hops=_MAX_ANCESTOR_CHAIN_HOPS)
         else:
             ppid_by_pid = _posix_process_ppid_snapshot()
     except Exception:
@@ -97,7 +107,6 @@ def _self_ancestor_pids() -> frozenset[int]:
             exc_info=True,
         )
         ppid_by_pid = {}
-    self_pid = os.getpid()
     if not ppid_by_pid:
         logger.warning(
             "process ppid snapshot unavailable or empty; ancestor kill guard "
@@ -304,8 +313,12 @@ def _reap_enumerated_children(
     """
     # Routed through ``process_utils``'s own names at call time so a patched
     # ``charlie_work.process_utils.run_captured`` covers the individual kill
-    # too — same seam the tree kill uses.
-    from .process_utils import get_process_start_time, is_pid_alive, run_captured
+    # too — same seam the tree kill uses. Liveness goes through the host
+    # probe, which late-binds ``process_utils.is_pid_alive``, so a patch of
+    # the primitive still reaches it.
+    from .process_utils import get_process_start_time, run_captured
+
+    probe = _host.current().probe
 
     root_start = expected_root_start_time
     if root_start is None:
@@ -326,7 +339,7 @@ def _reap_enumerated_children(
             )
             continue
         if start is None:
-            if not is_pid_alive(child):
+            if not probe.is_alive(child):
                 confirmed_dead.append(child)
             else:
                 logger.warning(
@@ -336,7 +349,7 @@ def _reap_enumerated_children(
                     root_pid,
                 )
             continue
-        if not is_pid_alive(child, start):
+        if not probe.is_alive(child, start):
             confirmed_dead.append(child)
             continue
         if os.name == "nt" and root_start is not None and start <= root_start:
@@ -382,7 +395,7 @@ def _reap_enumerated_children(
             kill_detail = f"; direct kill raised {exc!r}"
         deadline = time.monotonic() + _CHILD_KILL_CONFIRM_SECONDS
         while time.monotonic() < deadline:
-            if not is_pid_alive(child, start):
+            if not probe.is_alive(child, start):
                 confirmed_dead.append(child)
                 break
             time.sleep(_CHILD_KILL_CONFIRM_POLL_SECONDS)

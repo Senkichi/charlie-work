@@ -10,6 +10,7 @@ from pathlib import Path
 from _dispatch_fixtures import _stub_real_activity_probe_for_stalled_tests  # noqa: F401
 from _fakes_github import FakeGitHub
 from _rework_dispatch_fixtures import _wg
+from _host_fixtures import host_probe
 from charlie_work.config import WorkerRoleConfig
 
 
@@ -18,7 +19,6 @@ def test_orphaned_worker_pushed_branch_opens_pr(tmp_path: Path) -> None:
     should have its PR opened by the orchestrator instead of being re-dispatched.
     """
     import subprocess
-    from unittest.mock import patch
 
     from charlie_work.config import DevinConfig, OrchestratorConfig, WatchdogConfig
     from charlie_work.paths import runtime_paths
@@ -140,7 +140,7 @@ def test_orphaned_worker_pushed_branch_opens_pr(tmp_path: Path) -> None:
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
 
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+    with host_probe(alive=False):
         _detect_and_handle_orphaned_workers(
             sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
         )
@@ -184,7 +184,6 @@ def test_orphaned_worker_pushed_branch_uses_worker_drafted_pr_content(tmp_path: 
     branch inferred only from ``ahead_count``) still emits unchanged.
     """
     import subprocess
-    from unittest.mock import patch
 
     from charlie_work.config import DevinConfig, OrchestratorConfig, WatchdogConfig
     from charlie_work.paths import runtime_paths
@@ -328,7 +327,7 @@ def test_orphaned_worker_pushed_branch_uses_worker_drafted_pr_content(tmp_path: 
 
     fake_gh = FakeGitHubForPushedBranch()
 
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+    with host_probe(alive=False):
         _detect_and_handle_orphaned_workers(
             sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
         )
@@ -388,7 +387,6 @@ def test_orphaned_worker_reported_push_pr_create_failed_emits_distinct_drift(
     never reaches the PR-create attempt this test means to exercise.
     """
     import subprocess
-    from unittest.mock import patch
 
     from charlie_work.config import DevinConfig, OrchestratorConfig, WatchdogConfig
     from charlie_work.paths import runtime_paths
@@ -528,7 +526,7 @@ def test_orphaned_worker_reported_push_pr_create_failed_emits_distinct_drift(
 
     fake_gh = FakeGitHubForFailedPr()
 
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+    with host_probe(alive=False):
         _detect_and_handle_orphaned_workers(
             sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
         )
@@ -578,7 +576,6 @@ def test_orphaned_worker_pr_create_failed_stranded_drift_dedups_on_repeat_sweep(
     git-confirmed push, so this fixture needs a real pushed branch too.
     """
     import subprocess
-    from unittest.mock import patch
 
     from charlie_work.config import DevinConfig, OrchestratorConfig, WatchdogConfig
     from charlie_work.paths import runtime_paths
@@ -717,7 +714,7 @@ def test_orphaned_worker_pr_create_failed_stranded_drift_dedups_on_repeat_sweep(
 
     fake_gh = FakeGitHubForFailedPr()
 
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+    with host_probe(alive=False):
         _detect_and_handle_orphaned_workers(
             sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
         )
@@ -752,7 +749,7 @@ def test_orphaned_worker_pr_create_failed_stranded_drift_dedups_on_repeat_sweep(
     state["issues"]["935"].pop("orphan_drift_fingerprint", None)
     save_state(paths.state_file, state)
 
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+    with host_probe(alive=False):
         _detect_and_handle_orphaned_workers(
             sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
         )

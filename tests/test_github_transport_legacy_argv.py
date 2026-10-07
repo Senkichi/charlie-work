@@ -129,9 +129,9 @@ def test_row_count_ratchet() -> None:
             JsonRead("pr", "checks", "name", number=7),
         ),
         (
-            ["issue", "list", "--limit", "5", "--state", "closed", "--label", "a", "--label", "b",
+            ["issue", "list", "--limit", "5", "--state", "closed", "--label", "a",
              "--json", "number"],
-            JsonRead("issue", "list", "number", state="closed", labels=("a", "b"), limit=5),
+            JsonRead("issue", "list", "number", state="closed", labels=("a",), limit=5),
         ),
         (
             ["pr", "list", "--head", "agent/x", "--state", "all", "--json", "number"],
@@ -163,6 +163,8 @@ def test_json_rows_translate_to_dialect_reads(argv: list[str], expected: object)
         ["pr", "view", "x", "--json", "state"],
         ["issue", "checks", "1", "--json", "name"],
         ["issue", "list", "--search", "x", "--json", "number"],
+        # GraphQL `labels:` is OR, `gh --label a --label b` is AND: no row matches, so the shim refuses.
+        ["issue", "list", "--label", "a", "--label", "b", "--json", "number"],
         ["pr", "list", "--state", "bogus", "--json", "number"],
         ["pr", "list", "--limit", "0", "--json", "number"],
         ["run", "list", "--user", "me", "--json", "databaseId"],
@@ -246,7 +248,9 @@ def test_shim_dry_run_does_not_suppress_a_dialect_read(tmp_path: Path) -> None:
 
 def test_shim_serves_run_list_over_rest(tmp_path: Path) -> None:
     """A workflow name is resolved, then its own runs route is read with the filters."""
-    workflows = {"workflows": [{"id": 5, "name": "CI"}, {"id": 6, "name": "Other"}]}
+    workflows = {
+        "workflows": [{"id": 5, "name": "CI", "state": "active"}, {"id": 6, "name": "Other"}]
+    }
     runs = {"workflow_runs": [
         {"id": 1, "name": "CI", "status": "queued", "created_at": "t1", "head_branch": "main"},
     ]}  # fmt: skip
@@ -264,7 +268,12 @@ def test_shim_serves_run_list_over_rest(tmp_path: Path) -> None:
     lookup, request = http.api_requests
     assert lookup.route == "repos/octo/hello/actions/workflows"
     assert request.route == "repos/octo/hello/actions/workflows/5/runs"
-    assert dict(request.query) == {"per_page": "100", "branch": "main", "status": "queued"}
+    assert dict(request.query) == {
+        "per_page": "100",
+        "exclude_pull_requests": "true",
+        "branch": "main",
+        "status": "queued",
+    }
 
 
 def test_shim_dry_run_short_circuits_a_mutation(tmp_path: Path) -> None:
@@ -281,3 +290,37 @@ def test_shim_refuses_an_argv_with_no_row(tmp_path: Path) -> None:
     with pytest.raises(GitHubError, match="unsupported argv"):
         gh.run(["pr", "merge", "1"])
     assert http.calls == [] and gh_adapter.calls == []
+
+
+@pytest.mark.parametrize("kill_switch", [False, True])
+def test_shim_multi_label_issue_list_is_refused_on_both_transports(
+    tmp_path: Path, kill_switch: bool
+) -> None:
+    """Two labels would be OR (GraphQL) not AND (gh CLI): refuse, send nothing."""
+    gh_adapter = FakeAdapter("gh", [ok([])], token="tok-1")
+    runtime = gh_kill_switch_runtime() if kill_switch else None
+    gh, http, gh_adapter = make_github(tmp_path, gh=gh_adapter, runtime=runtime)
+    argv = ["issue", "list", "--label", "a", "--label", "b", "--json", "number"]
+    with pytest.raises(GitHubError, match="unsupported argv"):
+        gh.run(argv, json_output=True)
+    assert http.calls == []
+    assert gh_adapter.calls == []
+
+
+@pytest.mark.parametrize("kill_switch", [False, True])
+def test_issue_list_capability_refuses_multiple_labels_on_both_transports(
+    tmp_path: Path, kill_switch: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``gh.issue_list(labels=[a, b])`` must not return GraphQL's OR superset.
+
+    The REST open-issue read (issue #2443) filters locally with AND semantics;
+    the refusal guards the GraphQL path, restored by its kill switch.
+    """
+    monkeypatch.setenv("CHARLIE_WORK_ISSUE_LIST_REST", "off")
+    gh_adapter = FakeAdapter("gh", [ok([])], token="tok-1")
+    runtime = gh_kill_switch_runtime() if kill_switch else None
+    gh, http, gh_adapter = make_github(tmp_path, gh=gh_adapter, runtime=runtime)
+    with pytest.raises(GitHubError, match="unsupported"):
+        gh.issue_list(labels=["a", "b"])
+    assert http.calls == []
+    assert gh_adapter.calls == []

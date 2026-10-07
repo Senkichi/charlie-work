@@ -98,6 +98,7 @@ import re
 from pathlib import Path
 
 import pytest
+from _src_ast import parsed, parsed_source, source_text
 
 _REPO_ROOT = Path(__file__).parents[1]
 _MODULE_PATH = _REPO_ROOT / "src" / "charlie_work" / "stalled_review_reap.py"
@@ -130,8 +131,11 @@ _MOVED_NAMES = (
 # 30-line headroom margin.
 # Re-derived under issue #1808: the PROVIDER_API_ERROR classification and its
 # delegating branch (measured total 1453) plus the same 30-line headroom.
+# Re-derived under issue #2279: the quota-backoff record now stamps the dead
+# reviewer's ``(harness, model)`` role entry (measured total 1489) plus the
+# same 30-line headroom.
 _CAP_BAND_MIN = 1308
-_CAP_BAND_MAX = 1483
+_CAP_BAND_MAX = 1519
 
 
 # ---------------------------------------------------------------------------
@@ -151,7 +155,7 @@ def _module_level_defined_names(path: Path) -> list[str]:
     added later silently invisible to the identity test below, which draws
     its candidate set from this helper).
     """
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    tree = parsed(path)
     names: list[str] = []
     for node in tree.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
@@ -170,7 +174,7 @@ def _module_level_defined_names(path: Path) -> list[str]:
 def _facade_reexported_names(workflow_path: Path) -> set[str]:
     """Names workflow.py's facade block currently re-exports from
     ``.stalled_review_reap``."""
-    tree = ast.parse(workflow_path.read_text(encoding="utf-8"), filename=str(workflow_path))
+    tree = parsed(workflow_path)
     names: set[str] = set()
     for node in ast.walk(tree):
         if (
@@ -223,7 +227,7 @@ def _module_imports_in(
     <relative_module>``, ``from <absolute_module> import X``, and ``import
     <absolute_module>``.
     """
-    tree = ast.parse(source, filename=filename)
+    tree = parsed_source(source, filename)
     offenders: list[str] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom):
@@ -434,7 +438,7 @@ def _member_content_line_count(path: Path) -> int:
     span the byte-identity check (AC1) compares, excluding the module's own
     docstring/import header.
     """
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    tree = parsed(path)
     first_member_lineno = min(
         node.lineno
         for node in tree.body
@@ -477,7 +481,7 @@ def test_member_content_defines_exactly_the_ten_moved_symbols() -> None:
 
 def test_module_total_line_count_is_within_the_recorded_cap_band() -> None:
     """BAND gate: the new module's total (docstring + imports + body) must
-    fall within [1308, 1483]. A6's Preflight step originally derived
+    fall within [1308, 1519]. A6's Preflight step originally derived
     [1308, 1338] live from ci_findings.py's own header/import-surface ratio
     (recorded in wf-a6-notes.md Step 10). W6 PR2 (issue #1264) widened the
     upper bound to 1391 -- the real post-conversion total this PR measured
@@ -486,9 +490,10 @@ def test_module_total_line_count_is_within_the_recorded_cap_band() -> None:
     the conversion adds. Issue #1684 re-derived the upper bound to 1424 --
     the dead-reviewer log-tail check now consults ``match_quota_tail``
     (measured total 1394) plus the same 30-line headroom margin. Issue #1808
-    re-derived it to 1483 (measured 1453 + the same margin). This is
-    NOT the repo's normal 800-line cap (explicitly waived for this
-    extraction by operator decision).
+    re-derived it to 1483 (measured 1453 + the same margin), and issue #2279
+    to 1519 (measured 1489 + the same margin) for the quota-backoff role-entry
+    stamp. This is NOT the repo's normal 800-line cap (explicitly waived for
+    this extraction by operator decision).
     """
     total = len(_MODULE_PATH.read_text(encoding="utf-8").splitlines())
     assert _CAP_BAND_MIN <= total <= _CAP_BAND_MAX, (
@@ -544,9 +549,9 @@ def test_ci_findings_header_ratio_still_matches_the_bands_own_justification() ->
     ``check_dispatch_staleness`` -- body growth within an existing unit, header
     unchanged at 56 -- bringing the total to 739.
     """
-    ci_findings_source = _CI_FINDINGS_PATH.read_text(encoding="utf-8")
+    ci_findings_source = source_text(_CI_FINDINGS_PATH)
     ci_findings_lines = ci_findings_source.splitlines()
-    tree = ast.parse(ci_findings_source, filename=str(_CI_FINDINGS_PATH))
+    tree = parsed(_CI_FINDINGS_PATH)
     first_member_lineno = min(
         node.lineno
         for node in tree.body

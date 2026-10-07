@@ -64,7 +64,11 @@ module is loaded that way today.
 from __future__ import annotations
 
 import ast
+import io
+import re
+import tokenize
 from pathlib import Path
+from _src_ast import source_text
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC = REPO_ROOT / "src" / "charlie_work"
@@ -141,12 +145,72 @@ def _resolve_node(parts: list[str], known: set[str]) -> str | None:
     return None
 
 
+# A file can only contribute a sibling edge if its source contains an absolute
+# ``charlie_work.`` import or a relative ``from``+dots import -- the hint is a
+# necessary condition, not a sufficient one, so over-matches (``raise X from
+# .y``, a docstring naming ``charlie_work.``) only cost a tokenize pass while
+# files lacking both are skipped before it (#2472).
+_EDGE_HINT = re.compile(r"charlie_work\.|from\s*\.")
+
+
+def _import_statement_spans(text: str) -> list[tuple[int, int, int, int]]:
+    """(start_row, start_col, end_row, end_col) of every import statement.
+
+    Token-level extraction, not a text scan: ``tokenize`` emits strings and
+    comments as their own token types, so an ``import`` named in a docstring
+    never surfaces here -- the same boundary ``ast.walk`` drew. A NAME
+    ``import``/``from`` token begins a statement exactly when the previous
+    significant token is a statement boundary (NEWLINE/INDENT/DEDENT, ``;``,
+    ``:``, or start-of-file); the only other positions those keywords can
+    occupy in valid source are the ``import`` inside ``from x import y`` and
+    the ``from`` inside ``raise ... from ...``, both of which follow a
+    non-boundary token. Each span runs to its NEWLINE token, so parenthesized
+    and backslash continuations come along intact (tokenize emits NL, not
+    NEWLINE, inside brackets).
+
+    This exists because whole-file ``ast.parse`` was the ledger-flagged cost:
+    ~1.3 s to parse the tree just to reach a few thousand import nodes. The
+    caller re-parses each span with ``ast.parse``, so edge resolution still
+    runs on real ``ast.Import``/``ast.ImportFrom`` nodes -- identical
+    semantics, verified edge-set-equal against the prior ``ast.walk`` scan
+    over all 467 files (#2472).
+    """
+    spans: list[tuple[int, int, int, int]] = []
+    start: tuple[int, int] | None = None
+    prev: tokenize.TokenInfo | None = None
+    for tok in tokenize.generate_tokens(io.StringIO(text).readline):
+        if start is not None:
+            if tok.type == tokenize.NEWLINE:
+                spans.append((*start, *tok.end))
+                start = None
+                prev = tok
+            continue
+        if tok.type in (tokenize.COMMENT, tokenize.NL):
+            continue
+        if (
+            tok.type == tokenize.NAME
+            and tok.string in ("import", "from")
+            and (
+                prev is None
+                or prev.type in (tokenize.NEWLINE, tokenize.INDENT, tokenize.DEDENT)
+                or prev.string in (";", ":")
+            )
+        ):
+            start = tok.start
+            continue
+        prev = tok
+    return spans
+
+
 def _sibling_imports(path: Path, known: set[str]) -> set[str]:
     """Graph nodes imported by one module, resolved to node identities.
 
     AST rather than regex, and the whole tree rather than just the header: a
     fleet module imported lazily inside a function body is still an edge in
-    the graph, and a name mentioned in a comment or a docstring is not.
+    the graph, and a name mentioned in a comment or a docstring is not. The
+    statements are located by ``_import_statement_spans`` (token-level) and
+    re-parsed with ``ast.parse``, so the edge rules below still see real
+    Import/ImportFrom nodes.
 
     Relative imports resolve against the importing file's own package, so
     ``from ._base import x`` inside ``github_capabilities/`` names
@@ -178,29 +242,39 @@ def _sibling_imports(path: Path, known: set[str]) -> set[str]:
             if init in known:
                 found.add(init)
 
-    tree = ast.parse(path.read_text(encoding="utf-8"))
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom):
-            level = node.level or 0
-            if level > len(pkg_parts) + 1:
-                # Climbs past the charlie_work package root -- not a sibling
-                # edge this graph can express.
-                continue
-            if level == 0:
-                if not (node.module and node.module.startswith("charlie_work.")):
+    text = source_text(path)
+    if _EDGE_HINT.search(text) is None:
+        return found
+    lines = text.splitlines(keepends=True)
+    for srow, scol, erow, ecol in _import_statement_spans(text):
+        if srow == erow:
+            snippet = lines[srow - 1][scol:ecol]
+        else:
+            snippet = "".join(
+                [lines[srow - 1][scol:], *lines[srow : erow - 1], lines[erow - 1][:ecol]]
+            )
+        for node in ast.parse(snippet, filename=str(path)).body:
+            if isinstance(node, ast.ImportFrom):
+                level = node.level or 0
+                if level > len(pkg_parts) + 1:
+                    # Climbs past the charlie_work package root -- not a sibling
+                    # edge this graph can express.
                     continue
-                base = node.module.split(".")[1:]
-            else:
-                base = list(pkg_parts[: len(pkg_parts) - (level - 1)])
-                if node.module:
-                    base.extend(node.module.split("."))
-            add(_resolve_node(base, known))
-            for alias in node.names:
-                add(_resolve_node([*base, alias.name], known))
-        elif isinstance(node, ast.Import):
-            for alias in node.names:
-                if alias.name.startswith("charlie_work."):
-                    add(_resolve_node(alias.name.split(".")[1:], known))
+                if level == 0:
+                    if not (node.module and node.module.startswith("charlie_work.")):
+                        continue
+                    base = node.module.split(".")[1:]
+                else:
+                    base = list(pkg_parts[: len(pkg_parts) - (level - 1)])
+                    if node.module:
+                        base.extend(node.module.split("."))
+                add(_resolve_node(base, known))
+                for alias in node.names:
+                    add(_resolve_node([*base, alias.name], known))
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name.startswith("charlie_work."):
+                        add(_resolve_node(alias.name.split(".")[1:], known))
     return found
 
 
@@ -258,7 +332,7 @@ def _graph() -> dict[str, set[str]]:
     return graph
 
 
-def _live_modules() -> set[str]:
+def _live_modules(graph: dict[str, set[str]] | None = None) -> set[str]:
     """Everything transitively reachable from the package's entry points.
 
     Entry points are the declared top-level ``ENTRY_MODULES`` plus every
@@ -267,7 +341,8 @@ def _live_modules() -> set[str]:
     ``attachment_contracts/__main__``, invoked out-of-band by the
     attachment-contracts CI workflow, is never mistaken for an island).
     """
-    graph = _graph()
+    if graph is None:
+        graph = _graph()
     seen: set[str] = set()
     stack = [e for e in ENTRY_MODULES if e in graph]
     stack.extend(n for n in graph if n.endswith("/__main__"))
@@ -282,7 +357,7 @@ def _live_modules() -> set[str]:
 
 def _dormant_modules() -> set[str]:
     graph = _graph()
-    live = _live_modules()  # hoisted: calling it per module rebuilt the graph N times
+    live = _live_modules(graph)  # shared: _live_modules() alone would rebuild it
     return {name for name in graph if name not in live and name != "__init__"}
 
 

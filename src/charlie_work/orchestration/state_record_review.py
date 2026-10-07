@@ -21,6 +21,7 @@ from charlie_work.review_decision import (
     reclassify_human_call_verdict,
 )
 import charlie_work.workflow as _wf
+from charlie_work.command_result import CommandResult
 
 
 def record_review(
@@ -37,7 +38,7 @@ def record_review(
     verdict_provenance: str,
     allow_stale_head: bool = False,
     verdict_source: str | None = None,
-) -> _wf.CommandResult:
+) -> CommandResult:
     # Issue #2095: a backend that publishes no pull requests has nothing for
     # ``pr_view`` to read, so the operator ``charlie verdict`` path must take
     # the same local ingestion as the reviewer-verdict and stranded-verdict
@@ -59,15 +60,13 @@ def record_review(
             verdict_source=verdict_source,
         )
     if decision not in {"approved", "request_changes", "blocked"}:
-        return _wf.CommandResult(
-            False, "decision must be approved, request_changes, or blocked", {}
-        )
+        return CommandResult(False, "decision must be approved, request_changes, or blocked", {})
     # Issue #1265: no default above -- every caller must say where the
     # verdict came from. This membership check catches a garbage/typo'd
     # literal (a missing argument is already caught earlier, at the call
     # boundary, by the keyword-only parameter having no default).
     if verdict_provenance not in _wf.VERDICT_PROVENANCE_VALUES:
-        return _wf.CommandResult(
+        return CommandResult(
             False,
             "verdict_provenance must be one of: "
             + ", ".join(sorted(_wf.VERDICT_PROVENANCE_VALUES)),
@@ -77,7 +76,7 @@ def record_review(
     # Issue #11: reject empty summary for request_changes/blocked decisions
     # before any state/label mutation
     if decision in {"request_changes", "blocked"} and not summary_text.strip():
-        return _wf.CommandResult(
+        return CommandResult(
             False,
             f"--summary or --summary-file is required for decision '{decision}'",
             {},
@@ -180,7 +179,7 @@ def record_review(
     # fire on missing data.
     pr_github_state = str(pr.get("state") or "").upper() if pr else ""
     if pr and pr_github_state in ("MERGED", "CLOSED"):
-        return _wf.CommandResult(
+        return CommandResult(
             False,
             f"PR #{pr_number} is {pr_github_state}; verdict not recorded "
             f"(terminal-state PR decision file is preserved)",
@@ -209,7 +208,7 @@ def record_review(
         guard_pr_state.get("status") == "escalated"
         or guard_issue_state.get("status") == "escalated"
     ):
-        return _wf.CommandResult(
+        return CommandResult(
             False,
             f"PR #{pr_number} is escalated; verdict not recorded "
             f"(run `charlie unescalate --pr {pr_number}` to re-arm it first)",
@@ -260,7 +259,7 @@ def record_review(
                 and live_head_sha is not None
                 and packet_head_sha != live_head_sha
             ):
-                return _wf.CommandResult(
+                return CommandResult(
                     False,
                     f"reviewed head ({reviewed_head}) matches packet head "
                     f"({packet_head_sha}) but live PR head has moved to "
@@ -286,7 +285,7 @@ def record_review(
             if live_head_sha is not None:
                 options.append(f"live head {live_head_sha}")
             options_str = " or ".join(options) if options else "any available head"
-            return _wf.CommandResult(
+            return CommandResult(
                 False,
                 f"--reviewed-head {reviewed_head} does not match {options_str}",
                 {},
@@ -296,7 +295,7 @@ def record_review(
         and live_head_sha is not None
         and packet_head_sha != live_head_sha
     ):
-        return _wf.CommandResult(
+        return CommandResult(
             False,
             f"review packet head ({packet_head_sha}) differs from live PR head ({live_head_sha}); "
             "use --reviewed-head to choose the head the verdict applies to",
@@ -309,7 +308,7 @@ def record_review(
         reviewed_head_sha = live_head_sha
         reviewed_head_source = "live"
     else:
-        return _wf.CommandResult(False, "no packet or live PR head available", {})
+        return CommandResult(False, "no packet or live PR head available", {})
 
     # Calculate patch-id for the PR diff to detect actual content changes
     # (issue #222: base-update merges can advance head SHA without changing diff content).
@@ -948,6 +947,9 @@ def record_review(
                     self.config.labels,
                     issue_number,
                     target,
+                    state_path=self.paths.state_file,
+                    repo=self.repo_root.name,
+                    pr_number=pr_number,
                 )
                 if result.outcome != TransitionOutcome.APPLIED:
                     label_error = {
@@ -967,6 +969,9 @@ def record_review(
                 self.config.labels,
                 issue_number,
                 _wf._escalation_edge("blocked", "judgment"),
+                state_path=self.paths.state_file,
+                repo=self.repo_root.name,
+                pr_number=pr_number,
             )
             if result.outcome != TransitionOutcome.APPLIED:
                 label_error = {
@@ -976,7 +981,15 @@ def record_review(
                     "remove_failures": result.remove_failures,
                 }
         elif decision == "approved":
-            result = _wf.transition(self.gh, self.config.labels, issue_number, "review_approved")
+            result = _wf.transition(
+                self.gh,
+                self.config.labels,
+                issue_number,
+                "review_approved",
+                state_path=self.paths.state_file,
+                repo=self.repo_root.name,
+                pr_number=pr_number,
+            )
             if result.outcome != TransitionOutcome.APPLIED:
                 label_error = {
                     "edge": "review_approved",
@@ -1068,7 +1081,7 @@ def record_review(
         )
     if label_error:
         message += f" (label update failed: {label_error.get('outcome', label_error)})"
-    return _wf.CommandResult(
+    return CommandResult(
         True,
         message,
         {

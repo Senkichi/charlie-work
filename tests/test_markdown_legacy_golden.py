@@ -31,6 +31,7 @@ from typing import Any
 
 import markdown_guard_corpus as corpus
 import pytest
+from _src_ast import parsed, source_text
 
 from charlie_work import outbound_body_guard, rescue_review, verdict_parsing
 from charlie_work.outbound_body_guard import _legacy_masked_text, _scan_masked
@@ -209,7 +210,11 @@ def test_every_legacy_function_in_src_is_pinned() -> None:
     """Derived from the source tree, so a NEW `_legacy_*` function cannot skip the pins."""
     found = set()
     for path in sorted(_SRC.glob("*.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"))
+        # A `def _legacy_*` cannot exist without the literal text, so files
+        # lacking the marker skip the (much pricier) parse.
+        if "_legacy_" not in source_text(path):
+            continue
+        tree = parsed(path)
         found |= {
             f"{path.stem}.{node.name}"
             for node in tree.body

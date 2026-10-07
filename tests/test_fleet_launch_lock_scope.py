@@ -38,11 +38,13 @@ from charlie_work.config import (
     build_config_from_data,
 )
 from charlie_work.fleet_registry import try_acquire_fleet_lock
+from charlie_work.host.fakes import FakeWorkerLauncher
 from charlie_work.paths import runtime_paths
 from charlie_work.state import load_state, save_state, set_throttled_until, state_lock
 from charlie_work.worker_launch_gate import acquire_fleet_launch_lock
 from charlie_work.workflow import OrchestratorApp
 
+import charlie_work.live_session_count as live_session_count
 import charlie_work.workflow as wf
 
 FRESH = "fresh"
@@ -102,7 +104,7 @@ def _app(tmp_path: Path, lane: str, *, dry_run: bool = False, **config_kw: Any) 
     return app
 
 
-def _spy_dispatch_sessions(monkeypatch: pytest.MonkeyPatch) -> list[SessionRequest]:
+def _spy_dispatch_sessions(fake_host) -> list[SessionRequest]:
     calls: list[SessionRequest] = []
 
     def _fake(_repo_root, _manifest, _results, settings, requests):
@@ -121,7 +123,7 @@ def _spy_dispatch_sessions(monkeypatch: pytest.MonkeyPatch) -> list[SessionReque
             for r in requests
         ]
 
-    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", _fake)
+    fake_host(worker_launch=FakeWorkerLauncher([_fake]))
     return calls
 
 
@@ -151,12 +153,12 @@ def _lock_is_free(app: OrchestratorApp) -> bool:
 
 @LANES
 def test_read_only_scan_runs_without_the_fleet_lock(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lane: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lane: str, fake_host
 ) -> None:
     """Every scan call issued before issue_worker_launch_permit must observe a
     free fleet lock -- the lock is realized inside the permit, after the scan."""
     app = _app(tmp_path, lane, fleet_cap=4, launch_lock_wait=0.5)
-    calls = _spy_dispatch_sessions(monkeypatch)
+    calls = _spy_dispatch_sessions(fake_host)
     order = itertools.count()
     probes: list[tuple[int, str, bool]] = []
     boundary: list[int] = []
@@ -197,12 +199,12 @@ def test_read_only_scan_runs_without_the_fleet_lock(
 
 @LANES
 def test_throttled_repo_never_contends_for_the_fleet_lock(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lane: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lane: str, fake_host
 ) -> None:
     """A throttled repo defers on the lock-free pre-check -- the acquirer is
     never invoked, so a throttled fleet cannot saturate the shared lock."""
     app = _app(tmp_path, lane, fleet_cap=4)
-    calls = _spy_dispatch_sessions(monkeypatch)
+    calls = _spy_dispatch_sessions(fake_host)
     acquire_calls: list[int] = []
 
     def _counting_acquire(*a: Any, **kw: Any) -> Any:
@@ -225,7 +227,7 @@ def test_throttled_repo_never_contends_for_the_fleet_lock(
 
 @LANES
 def test_briefly_held_lock_is_acquired_within_the_wait(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lane: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lane: str, fake_host
 ) -> None:
     """A lock released inside the wait budget does not cost a whole pass --
     the bounded jittered retry lands it and the lane launches.
@@ -236,7 +238,7 @@ def test_briefly_held_lock_is_acquired_within_the_wait(
     against a still-held lock -- no wall-clock race (a ``threading.Timer``
     release made this test load-sensitive under xdist)."""
     app = _app(tmp_path, lane, fleet_cap=4, launch_lock_wait=2.0)
-    calls = _spy_dispatch_sessions(monkeypatch)
+    calls = _spy_dispatch_sessions(fake_host)
     held = try_acquire_fleet_lock(app.fleet_dir_override)
     assert held is not None
     attempts: list[int] = []
@@ -303,21 +305,21 @@ def test_retry_acquires_a_lock_released_mid_wait(tmp_path: Path) -> None:
 
 @LANES
 def test_governor_receives_a_live_count_computed_under_the_lock(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lane: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lane: str, fake_host
 ) -> None:
     """The governor's ``live_count`` kwarg is the int the permit computed while
     holding the fleet lock, and the governor itself runs under the lock."""
     app = _app(tmp_path, lane, fleet_cap=4)
-    calls = _spy_dispatch_sessions(monkeypatch)
+    calls = _spy_dispatch_sessions(fake_host)
 
     count_held: list[bool] = []
-    orig_count = wf._count_live_sessions
+    orig_count = live_session_count.count_live_sessions
 
     def _count_probe(*a: Any, **kw: Any) -> Any:
         count_held.append(not _lock_is_free(app))
         return orig_count(*a, **kw)
 
-    monkeypatch.setattr("charlie_work.workflow._count_live_sessions", _count_probe)
+    monkeypatch.setattr("charlie_work.live_session_count.count_live_sessions", _count_probe)
 
     gov_calls: list[tuple[Any, bool]] = []
     orig_gov = app._apply_concurrency_governor
@@ -341,7 +343,7 @@ def test_governor_receives_a_live_count_computed_under_the_lock(
 
 @LANES
 def test_fleet_lock_is_released_before_post_launch_bookkeeping(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lane: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lane: str, fake_host
 ) -> None:
     """Every ``state_lock`` entry after ``_launch_workers`` returns -- the
     dispatch_pending -> dispatched upgrade and the rest of the pass's
@@ -351,7 +353,7 @@ def test_fleet_lock_is_released_before_post_launch_bookkeeping(
     has already run, so the claim-phase entries (held, by design) do not
     count."""
     app = _app(tmp_path, lane, fleet_cap=4)
-    calls = _spy_dispatch_sessions(monkeypatch)
+    calls = _spy_dispatch_sessions(fake_host)
     probes: list[tuple[bool, int]] = []
     orig_state_lock = wf.state_lock
 
@@ -378,7 +380,7 @@ _DRY_RUN_PROBE = {FRESH: "pr_list", REWORK: "issue_view"}
 
 @LANES
 def test_fleet_lock_is_released_before_dry_run_planning(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lane: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lane: str, fake_host
 ) -> None:
     """The dry-run branch releases the realized lock before its read-only
     planning pass: every planning probe after issue_worker_launch_permit ran
@@ -386,7 +388,7 @@ def test_fleet_lock_is_released_before_dry_run_planning(
     lock stayed held to the lane's finally, i.e. across the whole planning
     pass."""
     app = _app(tmp_path, lane, fleet_cap=4, dry_run=True)
-    calls = _spy_dispatch_sessions(monkeypatch)
+    calls = _spy_dispatch_sessions(fake_host)
     order = itertools.count()
     probes: list[tuple[int, bool]] = []
     boundary: list[int] = []
@@ -423,22 +425,22 @@ def test_fleet_lock_is_released_before_dry_run_planning(
 
 @LANES
 def test_holder_sidecar_lifecycle(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lane: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lane: str, fake_host
 ) -> None:
     """``fleet.lock.holder`` names the holder while the lock is held and is
     removed on release -- never a stale sidecar."""
     app = _app(tmp_path, lane, fleet_cap=4)
-    calls = _spy_dispatch_sessions(monkeypatch)
+    calls = _spy_dispatch_sessions(fake_host)
     sidecar = layout.fleet_lock_holder_path(override=app.fleet_dir_override)
     seen: list[dict[str, Any]] = []
-    orig_count = wf._count_live_sessions
+    orig_count = live_session_count.count_live_sessions
 
     def _count_probe(*a: Any, **kw: Any) -> Any:
         if sidecar.exists():
             seen.append(json.loads(sidecar.read_text(encoding="utf-8")))
         return orig_count(*a, **kw)
 
-    monkeypatch.setattr("charlie_work.workflow._count_live_sessions", _count_probe)
+    monkeypatch.setattr("charlie_work.live_session_count.count_live_sessions", _count_probe)
 
     result = _run(app, lane)
 
@@ -453,12 +455,12 @@ def test_holder_sidecar_lifecycle(
 
 @LANES
 def test_fleet_lock_held_deferral_reports_holder_and_wait(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lane: str
+    tmp_path: Path, fake_host, lane: str
 ) -> None:
     """A ``fleet_lock_held`` deferral (ok=True so dispatch_deferral counts it
     toward starvation) carries the wait budget and the recorded holder."""
     app = _app(tmp_path, lane, fleet_cap=4, launch_lock_wait=0.2)
-    calls = _spy_dispatch_sessions(monkeypatch)
+    calls = _spy_dispatch_sessions(fake_host)
     held = try_acquire_fleet_lock(app.fleet_dir_override)
     assert held is not None
     sidecar = layout.fleet_lock_holder_path(override=app.fleet_dir_override)

@@ -16,8 +16,9 @@ it is never invoked implicitly — callers gate it behind an explicit
 kind that maps onto a standard lifecycle edge (a PR merged outside the
 orchestrator behaves exactly like a normal merge once discovered — label
 edge, merged-issue field set, and issue close, the same trio every other
-merged-PR door performs) and issues direct ``remove_issue_label`` calls
-only for label combinations that ``labels.transition`` has no edge for
+merged-PR door performs) and routes the computed add/remove repair sets
+through ``labels.apply_issue_labels`` — the same seam ``transition``
+delegates to — for label combinations that map to no named edge
 (contradictory terminal+active labels).
 """
 
@@ -30,8 +31,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from . import worker_fate
-from .closing_reference import probe_closing_link, validate_closing_reference
+from . import reconcile_salvage, worker_fate
 from .config import (
     DETERMINISTIC_ESCALATION_FAILURE_KINDS,
     DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS,
@@ -47,23 +47,23 @@ from .github import (
     GitHubError,
     GitHubLike,
     GraphQLBudgetError,
-    PR_CLOSING_ISSUES_FIELDS,
     _LIST_LIMIT,
     build_branch_issue_validator,
     build_branch_issue_validator_from_issues,
     label_names,
 )
 from .issue_linking import linked_issue_number
-from .instrumentation import log_event, query_events
-from .labels import TransitionOutcome, _edges, transition
+from .instrumentation import query_events
+from .labels import TransitionOutcome, apply_issue_labels, transition
 from .local_lane import synthesize_open_pr
 from .local_work_park import publishes_pull_requests
 from .merge_finalize import _merged_issue_fields
+from .merge_path.model import MERGEQUEUE_DWELL_FIELDS
 from .paths import resolved_layout, runtime_paths
-from .pr_create_retry import create_pr_with_retry
 from .process_utils import kill_process_tree
 from .queue_bot import is_queue_bot_pr  # noqa: F401 (deliberate re-export)
 from .review_decision import review_decision as _resolve_review_decision
+from .role_quota_ledger import role_key_for_view
 from .state import (
     DELIBERATELY_UNCLASSIFIED_ESCALATION_EVENT_KINDS,
     ESCALATION_REASON_CLASS_BY_EVENT_KIND,
@@ -80,12 +80,9 @@ from .state import (
 from .worktree import (
     WorktreeState,
     inspect_worktree_state,
-    push_branch,
     remove_review_checkout,
     resolve_base_branch_name,
-    summarize_branch_work,
 )
-from .salvage_superseded import check_salvage_superseded, salvage_skip_event_kind
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +110,10 @@ class DriftItem:
     # Unused by every other kind.
     throttle_reason: str | None = None
     throttle_adapter_kind: str | None = None
+    # The dead session's stamped role-chain ``(harness, model)`` (issue
+    # #2279), read off its sidecar while ``detect_drift`` still has it.
+    throttle_harness: str | None = None
+    throttle_model: str | None = None
     # Issue #978: structured "why" for session_failed_relabeled drift items,
     # so the machine-readable reason is not buried only in the free-text
     # ``detail`` string. ``reason`` is the canonical path identifier (e.g.
@@ -1628,7 +1629,10 @@ def detect_drift(
     # This must happen AFTER the PR loop (to populate open_prs_by_issue) but BEFORE
     # the issue loop (to populate issues_handled_by_session_relabel for mutual exclusion)
     if repo_root is not None:
-        from .claude_code import update_worker_record_with_failure_classification
+        from .claude_code import (
+            CLAUDE_RECORD_KINDS,
+            update_worker_record_with_failure_classification,
+        )
         from .devin_shell import update_session_record_with_failure_classification
         from .post_mortem import classify_and_record
         from .worker import (
@@ -1671,20 +1675,13 @@ def detect_drift(
                                 fallback_kind="launch_stalled",
                                 config=config,
                             )
-                        elif w.adapter_kind == "claude-code":
+                        elif w.adapter_kind in CLAUDE_RECORD_KINDS:
                             update_worker_record_with_failure_classification(
                                 sessions_dir,
                                 w.issue_number,
                                 fallback_kind="launch_stalled",
                                 config=config,
-                            )
-                        elif w.adapter_kind == "api":
-                            update_worker_record_with_failure_classification(
-                                sessions_dir,
-                                w.issue_number,
-                                fallback_kind="launch_stalled",
-                                config=config,
-                                adapter_kind="api",
+                                adapter_kind=w.adapter_kind,
                             )
 
                         # Kill the process tree to free the slot
@@ -1787,24 +1784,14 @@ def detect_drift(
                                     session_completed=True,
                                 )
                             )
-                        elif w.adapter_kind == "claude-code":
+                        elif w.adapter_kind in CLAUDE_RECORD_KINDS:
                             failure_kind, throttled_until = (
                                 update_worker_record_with_failure_classification(
                                     sessions_dir,
                                     w.issue_number,
                                     fallback_kind="unpublished_work",
                                     config=config,
-                                    session_completed=True,
-                                )
-                            )
-                        elif w.adapter_kind == "api":
-                            failure_kind, throttled_until = (
-                                update_worker_record_with_failure_classification(
-                                    sessions_dir,
-                                    w.issue_number,
-                                    fallback_kind="unpublished_work",
-                                    config=config,
-                                    adapter_kind="api",
+                                    adapter_kind=w.adapter_kind,
                                     session_completed=True,
                                 )
                             )
@@ -1827,23 +1814,14 @@ def detect_drift(
                                     config=config,
                                 )
                             )
-                        elif w.adapter_kind == "claude-code":
+                        elif w.adapter_kind in CLAUDE_RECORD_KINDS:
                             failure_kind, throttled_until = (
                                 update_worker_record_with_failure_classification(
                                     sessions_dir,
                                     w.issue_number,
                                     fallback_kind=fallback_kind,
                                     config=config,
-                                )
-                            )
-                        elif w.adapter_kind == "api":
-                            failure_kind, throttled_until = (
-                                update_worker_record_with_failure_classification(
-                                    sessions_dir,
-                                    w.issue_number,
-                                    fallback_kind=fallback_kind,
-                                    config=config,
-                                    adapter_kind="api",
+                                    adapter_kind=w.adapter_kind,
                                 )
                             )
                         else:
@@ -1875,6 +1853,7 @@ def detect_drift(
                     if failure_kind and throttled_until:
                         # Update state with throttle window
                         # This is a no-op drift item that just signals state update
+                        throttle_harness, throttle_model = role_key_for_view(sessions_dir, w)
                         drift.append(
                             DriftItem(
                                 kind="provider_throttle_detected",
@@ -1887,6 +1866,8 @@ def detect_drift(
                                 fix_actions=(f"set throttled_until={throttled_until}",),
                                 throttle_reason=failure_kind,
                                 throttle_adapter_kind=w.adapter_kind,
+                                throttle_harness=throttle_harness,
+                                throttle_model=throttle_model,
                             )
                         )
 
@@ -2750,6 +2731,9 @@ def apply_fixes(
     new_issues: dict[str, Any] = dict(state.get("issues", {}))
     new_prs: dict[str, Any] = dict(state.get("prs", {}))
     new_state: dict[str, Any] = {**state, "issues": new_issues, "prs": new_prs}
+    # Issue #2226: bind repo on every lifecycle_transition this function
+    # emits so events.db rows carry repository correlation, not repo=NULL.
+    repo_name = repo_root.name if repo_root is not None else None
 
     alive_pr_numbers: set[int] = set()
     if repo_root is not None:
@@ -2821,7 +2805,16 @@ def apply_fixes(
                 new_issues[issue_key] = _merged_issue_fields(
                     new_issues.get(issue_key, {}), item.issue_number
                 )
-                result = transition(gh, config.labels, item.issue_number, "merged")
+                result = transition(
+                    gh,
+                    config.labels,
+                    item.issue_number,
+                    "merged",
+                    state_path=state_path,
+                    repo=repo_name,
+                    pr_number=item.pr_number,
+                    cause=item.kind,
+                )
                 # Record transition outcome in the event
                 fix_actions = list(item.fix_actions)
                 if result.outcome != TransitionOutcome.APPLIED:
@@ -2873,10 +2866,19 @@ def apply_fixes(
                         f"remove review checkout for PR #{item.pr_number}: skipped (no repo_root)"
                     )
             if item.issue_number is not None:
-                label_ok = True
-                for label in item.remove_labels:
-                    if not gh.remove_issue_label(item.issue_number, label):
-                        label_ok = False
+                # write-gate-exempt(issue=2226): apply_fixes is out-of-wave raw territory (no write_gate param; reachable only when fix and not dry_run — the gh client owns dry-run).
+                label_result = apply_issue_labels(
+                    gh,
+                    config.labels,
+                    item.issue_number,
+                    remove=item.remove_labels,
+                    to_state="closed",
+                    state_path=state_path,
+                    repo=repo_name,
+                    pr_number=item.pr_number,
+                    cause=item.kind,
+                )
+                label_ok = label_result.ok
                 # Record label-write failures in the event
                 fix_actions = list(item.fix_actions)
                 if item.pr_number is not None:
@@ -2947,20 +2949,28 @@ def apply_fixes(
             "escalated_labels_converged",
         ):
             if item.issue_number is not None:
-                label_ok = True
-                for label in item.remove_labels:
-                    if not gh.remove_issue_label(item.issue_number, label):
-                        label_ok = False
                 # Issue #417: issue_active_label_no_open_pr now carries
                 # add_labels=(ready,) when the ready label is missing;
                 # escalated_labels_converged carries add_labels=(<expected
                 # terminal label>,) when it never landed -- human_needed for
                 # a judgment escalation, operator_queue for a mechanical one
                 # (issue #1266) -- done_label_with_active_labels never sets
-                # add_labels, so this loop is a no-op for that sibling kind.
-                for label in item.add_labels:
-                    if not gh.add_issue_label(item.issue_number, label):
-                        label_ok = False
+                # add_labels; the issue keeps its done label, so its recorded
+                # state is "done" for the lifecycle event (issue #2226).
+                # write-gate-exempt(issue=2226): apply_fixes is out-of-wave raw territory (no write_gate param; reachable only when fix and not dry_run — the gh client owns dry-run).
+                label_result = apply_issue_labels(
+                    gh,
+                    config.labels,
+                    item.issue_number,
+                    add=item.add_labels,
+                    remove=item.remove_labels,
+                    to_state="done" if item.kind == "done_label_with_active_labels" else None,
+                    state_path=state_path,
+                    repo=repo_name,
+                    pr_number=item.pr_number,
+                    cause=item.kind,
+                )
+                label_ok = label_result.ok
                 # Record label-write failures in the event
                 fix_actions = list(item.fix_actions)
                 if not label_ok:
@@ -2987,13 +2997,19 @@ def apply_fixes(
             # once a PR is open and a review packet has actually been
             # generated -- this self-heal never generates one.
             if item.issue_number is not None:
-                label_ok = True
-                for label in item.remove_labels:
-                    if not gh.remove_issue_label(item.issue_number, label):
-                        label_ok = False
-                for label in item.add_labels:
-                    if not gh.add_issue_label(item.issue_number, label):
-                        label_ok = False
+                # write-gate-exempt(issue=2226): apply_fixes is out-of-wave raw territory (no write_gate param; reachable only when fix and not dry_run — the gh client owns dry-run).
+                label_result = apply_issue_labels(
+                    gh,
+                    config.labels,
+                    item.issue_number,
+                    add=item.add_labels,
+                    remove=item.remove_labels,
+                    state_path=state_path,
+                    repo=repo_name,
+                    pr_number=item.pr_number,
+                    cause=item.kind,
+                )
+                label_ok = label_result.ok
 
                 issue_key = str(item.issue_number)
                 existing_issue = new_issues.get(issue_key, {})
@@ -3075,13 +3091,14 @@ def apply_fixes(
             # that owns the ``status="escalated"`` literal + the paired
             # ``escalation_reason``/``reason_class``/``terminal_since``
             # fields), and the issue label changes go through
-            # ``gh.add_issue_label``/``gh.remove_issue_label`` directly rather
-            # than ``transition()`` -- ``transition`` is a WriteGate-gated
-            # primitive (issue #1264 R9 ratchet) and ``apply_fixes`` is not a
-            # WriteGate consumer. The add/remove sets are still derived from
-            # the same ``_edges(config.labels)`` table ``transition`` uses, so
-            # the label disposition is identical; only the call path differs.
-            # The dwell-tracking fields (mergequeue_since/mergequeue_head_sha)
+            # ``labels.transition`` -- the raw, un-gated seam. The gate
+            # concern that kept this site off ``transition`` was about the
+            # WriteGate wrapper (issue #1264 R9 ratchet), not the primitive:
+            # ``apply_fixes`` is itself the fix-application boundary, so
+            # calling ``labels.transition`` directly applies the same
+            # ``_edges(config.labels)`` disposition and now also records the
+            # lifecycle transition (issue #2226).
+            # The dwell-tracking fields (MERGEQUEUE_DWELL_FIELDS)
             # are cleared so the post-fix re-detect does not re-fire the
             # time-in-queue trigger for the same window.
             fix_actions = list(item.fix_actions)
@@ -3096,9 +3113,7 @@ def apply_fixes(
                 existing_pr = new_prs.get(pr_key, {})
                 if existing_pr:
                     new_prs[pr_key] = {
-                        k: v
-                        for k, v in existing_pr.items()
-                        if k not in ("mergequeue_since", "mergequeue_head_sha")
+                        k: v for k, v in existing_pr.items() if k not in MERGEQUEUE_DWELL_FIELDS
                     }
             if item.issue_number is not None:
                 # Escalate the issue state through the canonical helper.
@@ -3112,18 +3127,23 @@ def apply_fixes(
                     reason="mergequeue_wedged",
                     reason_class="judgment",
                 )
-                # Apply the "escalated" edge's label changes directly (add
-                # human_needed, remove all other workflow labels) without
-                # calling the gated ``transition`` primitive.
+                # Apply the "escalated" edge (add human_needed, remove all
+                # other workflow labels) through ``transition`` — the raw,
+                # un-gated seam — so the lifecycle transition is recorded
+                # (issue #2226) without going through the WriteGate.
                 edge = _escalation_edge("escalated", "judgment")
-                add_set, remove_set = _edges(config.labels)[edge]
-                label_ok = True
-                for label in add_set:
-                    if not gh.add_issue_label(item.issue_number, label):
-                        label_ok = False
-                for label in remove_set:
-                    if not gh.remove_issue_label(item.issue_number, label):
-                        label_ok = False
+                # write-gate-exempt(issue=2226): apply_fixes is out-of-wave raw territory (no write_gate param; reachable only when `fix and not dry_run`).
+                label_result = transition(
+                    gh,
+                    config.labels,
+                    item.issue_number,
+                    edge,
+                    state_path=state_path,
+                    repo=repo_name,
+                    pr_number=item.pr_number,
+                    cause=item.kind,
+                )
+                label_ok = label_result.ok
                 if not label_ok:
                     fix_actions.append("label_write_failed: true")
             item = DriftItem(
@@ -3224,10 +3244,19 @@ def apply_fixes(
                 issue_key = str(item.issue_number)
                 existing_issue = new_issues.get(issue_key, {})
                 new_issues[issue_key] = {**existing_issue, "status": "closed"}
-                label_ok = True
-                for label in item.remove_labels:
-                    if not gh.remove_issue_label(item.issue_number, label):
-                        label_ok = False
+                # write-gate-exempt(issue=2226): apply_fixes is out-of-wave raw territory (no write_gate param; reachable only when fix and not dry_run — the gh client owns dry-run).
+                label_result = apply_issue_labels(
+                    gh,
+                    config.labels,
+                    item.issue_number,
+                    remove=item.remove_labels,
+                    to_state="closed",
+                    state_path=state_path,
+                    repo=repo_name,
+                    pr_number=item.pr_number,
+                    cause=item.kind,
+                )
+                label_ok = label_result.ok
                 fix_actions = list(item.fix_actions)
                 if not label_ok:
                     fix_actions.append("label_write_failed: true")
@@ -3253,6 +3282,8 @@ def apply_fixes(
                         source="reconcile_apply_fixes",
                         reason=item.throttle_reason,
                         adapter_kind=item.throttle_adapter_kind,
+                        harness=item.throttle_harness,
+                        model=item.throttle_model,
                         state_path=state_path,
                     )
                     break
@@ -3306,7 +3337,16 @@ def apply_fixes(
                 )
                 reason_class = "judgment" if deterministic_judgment else "mechanical"
                 edge = _escalation_edge("redispatch_escalated", reason_class)
-                result = transition(gh, config.labels, item.issue_number, edge)
+                result = transition(
+                    gh,
+                    config.labels,
+                    item.issue_number,
+                    edge,
+                    state_path=state_path,
+                    repo=repo_name,
+                    pr_number=item.pr_number,
+                    cause=item.kind,
+                )
                 fix_actions = list(item.fix_actions)
                 if result.outcome != TransitionOutcome.APPLIED:
                     fix_actions.append(
@@ -3324,235 +3364,35 @@ def apply_fixes(
                         add_labels=item.add_labels,
                     )
 
-        elif item.kind == "session_unpublished_work_salvaged":
+        # Issue #2262: a no-PR backend cannot publish; the sweep's park lane
+        # owns local salvage and this item stays report-only via the event.
+        elif item.kind == "session_unpublished_work_salvaged" and publishes_pull_requests(gh):
             # Issue #252: push the completed branch, create a PR, and move labels to pr_open.
             # If any step fails, fall back to the normal relabel-to-ready path.
             if item.issue_number is not None and item.branch and item.base_branch:
-                repo_root = getattr(gh, "repo_root", None)
-                salvage_ok = False
-                salvage_error = "repo_root not available"
-                pr_number = None
-                if repo_root is not None:
-                    # Issue #1241: before pushing/opening a PR, re-check LIVE
-                    # terminal state through the shared single enforcement
-                    # point (``check_salvage_superseded``). This salvage lane
-                    # is the second of the two salvage paths (the workflow
-                    # lane is the other) and previously had NO supersession
-                    # check -- it opened a vestigial duplicate PR whenever the
-                    # work had already landed through a sibling merge while
-                    # the dead session's snapshot still looked stranded. On a
-                    # skip, do NOT push, do NOT open a PR, and do NOT relabel
-                    # to ready (the work already landed -- redispatching would
-                    # loop). Label convergence is left to the closed-issue /
-                    # merged-PR drift kinds that fire alongside this one. The
-                    # skip is recorded as an observable event plus a
-                    # fix_action on the reconcile event.
-                    superseded, skip_reason = check_salvage_superseded(
-                        gh=gh,
-                        config=config,
-                        repo_root=repo_root,
-                        branch=item.branch,
-                        base_ref=item.base_branch,
-                        issue_number=item.issue_number,
-                    )
-                    if superseded:
-                        if state_path is not None:
-                            log_event(
-                                state_path,
-                                salvage_skip_event_kind(
-                                    skip_reason
-                                ),  # event-consumer: audit-only -- kind resolves to one of two registered literals (salvage_skipped_already_landed / salvage_skipped_superseded), both in _LEVEL_BY_KIND; the actionable label convergence happens in the sibling closed-issue / merged-PR drift kinds, this event is the observable skip record (issue #1241)
-                                {
-                                    "issue_number": item.issue_number,
-                                    "reason": skip_reason,
-                                    "branch": item.branch,
-                                },
-                            )
-                        item = DriftItem(
-                            kind=item.kind,
-                            issue_number=item.issue_number,
-                            pr_number=item.pr_number,
-                            detail=item.detail,
-                            fix_actions=item.fix_actions + (f"salvage_skipped: {skip_reason}",),
-                            remove_labels=(),
-                            add_labels=(),
-                            branch=item.branch,
-                            base_branch=item.base_branch,
-                        )
-                        # Skip the push/PR/relabel block: mark salvage_ok True
-                        # with no PR so the ``if salvage_ok`` label-swap block
-                        # below runs against empty remove/add label sets (a
-                        # no-op) rather than falling through to the
-                        # relabel-to-ready fallback. The work already landed;
-                        # redispatch is wrong.
-                        salvage_ok = True
-                        salvage_error = None
-                    else:
-                        push_ok, push_error = push_branch(repo_root, item.branch)
-                        if push_ok:
-                            has_pr_create = getattr(gh, "pr_create", None) is not None
-                            if has_pr_create:
-                                # Same janitor body gate as a worker-authored PR --
-                                # boilerplate alone can never satisfy it. Derive the
-                                # rationale from the worker's own commit log rather
-                                # than injecting the gate's keywords.
-                                salvage_body = (
-                                    f"Closes #{item.issue_number}\n\n"
-                                    "Salvaged by the orchestrator from a completed-but-unpublished "
-                                    "worker worktree."
-                                )
-                                branch_summary = summarize_branch_work(
-                                    repo_root,
-                                    item.branch,
-                                    item.base_branch,
-                                    test_path_globs=config.test_adequacy.test_path_globs,
-                                )
-                                if branch_summary:
-                                    salvage_body = f"{salvage_body}\n\n{branch_summary}"
-                                # cw#1263: canonicalize/validate the closing-reference
-                                # line the same way workflow.py's `_open_salvage_pr`
-                                # does, via the shared `closing_reference` module.
-                                # `workflow.py` imports `reconcile.py` (for
-                                # `apply_fixes`/`detect_drift`), so importing
-                                # `workflow._open_salvage_pr` back into this module
-                                # would cycle -- the standalone third module is what
-                                # lets both salvage-body builders share one
-                                # implementation without either importing the other.
-                                closing_ref = validate_closing_reference(
-                                    salvage_body, item.issue_number, repo=_repo_slug(gh), gh=gh
-                                )
-                                salvage_body = closing_ref.body
-                                if closing_ref.changed and state_path is not None:
-                                    log_event(
-                                        state_path,
-                                        "pr_closing_ref_rewritten",
-                                        {
-                                            "issue_number": item.issue_number,
-                                            "findings": list(closing_ref.findings),
-                                            "source": "session_unpublished_work_salvaged",
-                                        },
-                                    )
-                                # cw#1273: route through the bounded outer retry
-                                # + duplicate-PR guard instead of calling
-                                # gh.pr_create directly, matching workflow.py's
-                                # _open_salvage_pr (the other pr_create call site).
-                                #
-                                # cw#1771: unlike workflow.py's _open_salvage_pr,
-                                # this lane deliberately does NOT read
-                                # worker_outcome for a drafted title/body. This
-                                # branch fires for unpushed work -- the worker
-                                # died (or was reaped) before ever running
-                                # `git push` -- so any pr_title/pr_body the
-                                # worker drafted would describe a push that
-                                # never happened and may reference state (a PR
-                                # number, a verified head sha) that is false at
-                                # the head this code just pushed on the
-                                # worker's behalf. Synthesis-only is correct
-                                # here; do not "fix" this to match the
-                                # clean-handoff lane.
-                                retry_result = create_pr_with_retry(
-                                    gh,
-                                    head=item.branch,
-                                    base=item.base_branch,
-                                    title=f"Salvaged work for issue #{item.issue_number}",
-                                    body=salvage_body,
-                                    max_retries=config.runtime.pr_create_retry_max_attempts,
-                                    base_seconds=config.runtime.pr_create_retry_base_seconds,
-                                )
-                                pr_number = retry_result.pr_number
-                            if pr_number is not None:
-                                salvage_ok = True
-                                # `pr_number` is falsy (0) under `dry_run`, where no
-                                # real PR was opened -- only probe a real, truthy PR
-                                # number (mirrors workflow.py::_open_salvage_pr).
-                                if pr_number and state_path is not None:
-                                    # cw#1868: settled across GitHub's indexing
-                                    # race; None = failed query, never a miss (see
-                                    # dead_worker_reap._open_salvage_pr).
-                                    linked_numbers = probe_closing_link(
-                                        gh,
-                                        pr_number,
-                                        item.issue_number,
-                                        fields=PR_CLOSING_ISSUES_FIELDS,
-                                    )
-                                    if (
-                                        linked_numbers is not None
-                                        and item.issue_number not in linked_numbers
-                                    ):
-                                        log_event(
-                                            state_path,
-                                            "pr_closing_ref_unlinked",
-                                            {
-                                                "issue_number": item.issue_number,
-                                                "pr_number": pr_number,
-                                                "linked_issue_numbers": sorted(linked_numbers),
-                                            },
-                                        )
-                            else:
-                                salvage_error = "gh pr create failed or returned no PR number"
-                        else:
-                            salvage_error = push_error or "git push failed"
-
-                if salvage_ok:
-                    label_ok = True
-                    for label in item.remove_labels:
-                        if not gh.remove_issue_label(item.issue_number, label):
-                            label_ok = False
-                    for label in item.add_labels:
-                        if not gh.add_issue_label(item.issue_number, label):
-                            label_ok = False
-                    fix_actions = list(item.fix_actions)
-                    if not label_ok:
-                        fix_actions.append("label_write_failed: true")
-                    item = DriftItem(
-                        kind=item.kind,
-                        issue_number=item.issue_number,
-                        pr_number=pr_number,
-                        detail=item.detail,
-                        fix_actions=tuple(fix_actions),
-                        remove_labels=item.remove_labels,
-                        add_labels=item.add_labels,
-                        branch=item.branch,
-                        base_branch=item.base_branch,
-                    )
-                else:
-                    # Fallback: treat as session_failed_relabeled and add ready label
-                    label_ok = True
-                    for label in item.remove_labels:
-                        if not gh.remove_issue_label(item.issue_number, label):
-                            label_ok = False
-                    if config.labels.ready not in item.add_labels:
-                        if not gh.add_issue_label(item.issue_number, config.labels.ready):
-                            label_ok = False
-                    fix_actions = list(item.fix_actions)
-                    fix_actions.append(f"salvage_failed: {salvage_error}")
-                    if not label_ok:
-                        fix_actions.append("label_write_failed: true")
-                    item = DriftItem(
-                        kind="session_failed_relabeled",
-                        issue_number=item.issue_number,
-                        pr_number=None,
-                        reason="salvage_failed_fallback",
-                        detail=item.detail,
-                        fix_actions=tuple(fix_actions),
-                        remove_labels=item.remove_labels,
-                        add_labels=(config.labels.ready,),
-                        branch=item.branch,
-                        base_branch=item.base_branch,
-                    )
+                item = reconcile_salvage.apply_unpublished_work_salvage(
+                    gh, config, item, state_path=state_path
+                )
 
         elif item.kind == "session_failed_relabeled":
-            # Issue #118: reconcile labels for dead sessions with no open PR
+            # Issue #118: reconcile labels for dead sessions with no open PR.
+            # The item's computed sets strip the active labels and carry
+            # ``ready`` when it is missing; routing them through the seam
+            # records the return to ``ready`` (issue #2226).
             if item.issue_number is not None:
-                label_ok = True
-                # Remove active labels
-                for label in item.remove_labels:
-                    if not gh.remove_issue_label(item.issue_number, label):
-                        label_ok = False
-                # Add ready label if needed (structured field)
-                for label in item.add_labels:
-                    if not gh.add_issue_label(item.issue_number, label):
-                        label_ok = False
+                # write-gate-exempt(issue=2226): apply_fixes is out-of-wave raw territory (no write_gate param; reachable only when `fix and not dry_run`).
+                label_result = apply_issue_labels(
+                    gh,
+                    config.labels,
+                    item.issue_number,
+                    add=item.add_labels,
+                    remove=item.remove_labels,
+                    to_state="ready",
+                    state_path=state_path,
+                    repo=repo_name,
+                    cause=item.reason or item.kind,
+                )
+                label_ok = label_result.ok
                 # Record label-write failures in the event
                 fix_actions = list(item.fix_actions)
                 if not label_ok:

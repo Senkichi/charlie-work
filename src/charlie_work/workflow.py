@@ -2,8 +2,7 @@ from __future__ import annotations
 
 import functools
 import re
-from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
@@ -11,25 +10,23 @@ from . import role_selection
 from .adapters import (
     SessionDispatchResult,
     cleanup_stale_session_tmp_files,  # noqa: F401  (deliberate re-export; used by orchestration delegates via _wf.)
-    dispatch_sessions,  # noqa: F401  (deliberate re-export; used by moved L08 delegate via _wf.)
     write_session_manifest,  # noqa: F401  (deliberate re-export; patched on the workflow module in tests)
 )
 from .claude_code import (
-    launch_claude_worker,
+    launch_claude_worker,  # noqa: F401  (deliberate re-export; patched on the workflow module, reached via review_launch._wf())
     resolve_review_effort,
     run_quota_probe,  # noqa: F401  (deliberate re-export; used by moved L01 b3 delegates via _wf.)
 )
-from .api_worker import launch_api_worker
-from .devin_shell import launch_devin_session
+from .api_worker import launch_api_worker  # noqa: F401  (deliberate re-export; see review_launch)
+from .devin_shell import launch_devin_session  # noqa: F401  (deliberate re-export; see review_launch)
 from .checks import (
     summarize_checks,
 )
 from .config import (
-    ApiWorkerConfig,
     OrchestratorConfig,
     ReviewDispatchConfig,
 )
-from .harnesses import REVIEWER_HARNESSES
+from .host import HostPorts, current as _host_current
 from .worker_launch_gate import FleetLaunchLock
 from .review_fleet_gate import (
     fleet_lock_held_result_data,
@@ -37,7 +34,7 @@ from .review_fleet_gate import (
     fleet_review_lock_deferral,
     read_fleet_review_cap,
 )
-from .fleet_registry import count_fleet_live_reviews, count_fleet_live_sessions, managed_repo_names  # noqa: F401  (deliberate re-export; count_fleet_live_sessions used by moved L06 delegates via _wf., count_fleet_live_reviews by review_fleet_gate via _wf.)
+from .fleet_registry import managed_repo_names  # noqa: F401  (deliberate re-export; used by review_fleet_gate via _wf.)
 from . import layout, status_snapshot  # noqa: F401  (deliberate re-export; layout reached via _wf.layout by orchestration/misc_reconcile.py)
 from .main_ci_reclaim import reclaim_superseded_main_ci_runs  # noqa: F401  (deliberate re-export; used by moved L01 b3 delegates via _wf.)
 from .notify import AttentionDigest, AttentionEntry, emit_digest, reviewer_quota_alert_digest
@@ -50,10 +47,10 @@ from .github import (
     GitHubError,
     GitHubLike,
     GitHubRunResult,
-    detect_prose_only_dependencies,
+    detect_prose_only_dependencies,  # noqa: F401  (deliberate re-export; used by moved delegates via _wf.)
     issue_numbers_mentioned_by_pr,  # noqa: F401  (deliberate re-export; used by moved L01 b3 delegates via _wf.)
     label_names,
-    parse_blockers,
+    parse_blockers,  # noqa: F401  (deliberate re-export; used by moved delegates via _wf.)
 )
 from .issue_linking import linked_issue_number
 from .pr_body_closing_autofix_flow import autofix_body_closing_kw
@@ -71,6 +68,10 @@ from .pr_unlinked_visibility import summarize_unlinked_prs
 from .attachment_budget_prompt import (  # noqa: F401  (deliberate re-export)
     ATTACHMENT_BUDGET_CLAUSE as _ATTACHMENT_BUDGET_CLAUSE,
     render_attachment_budget_section,
+    OverCapFileFinding,
+    _diff_file_summary,
+    _over_cap_file_findings,
+    render_over_cap_section,
 )
 from .cross_pr_revert import (  # noqa: F401  (deliberate re-export)
     CrossPrRevertResult,
@@ -83,8 +84,9 @@ from .janitor import (
     check_operator_containment,
     check_test_adequacy,
     is_stale_ci_verdict,
+    no_op_escape_needs_pr_commits,
     run_janitor,
-    DiffContentSignature,
+    DiffContentSignature,  # noqa: F401  (deliberate re-export; reached via _wf. by orchestration/local_lanes.py)
     TestAdequacyFacts,
     TestAdequacyVerdict,
 )
@@ -93,6 +95,7 @@ from .labels import TransitionOutcome, transition
 from .paths import RuntimePaths, prompt_override_dirs, resolved_layout
 from .prompt_sections import section_variant_names
 from .prompts import (
+    PromptOverrideDriftError,  # noqa: F401  (deliberate re-export)
     PromptTemplateError,
     render_prompt,  # noqa: F401  (deliberate re-export; patched on the workflow module in tests, reached via _wf.render_prompt by orchestration/prompt_ops.py -- Tier D, #1627)
     resolve_template,
@@ -112,12 +115,14 @@ from .worktree import (
     worktree_head_sha,  # noqa: F401  (deliberate re-export; dead_worker_sweep.ports resolves it here at call time)
     worktree_path_for_branch,  # noqa: F401  (deliberate re-export; reached via _wf. by orchestration/state_*.py)
     clean_worktrees,  # noqa: F401  (deliberate re-export; used by moved L01 b3 delegates via _wf.)
+    merge_clean_results,  # noqa: F401  (deliberate re-export; used by moved L01 b3 delegates via _wf.)
     read_worktree_marker,
     remove_review_checkout,  # noqa: F401  (deliberate re-export; patched on the workflow module and reached via _wf. by orchestration/misc_review_verdicts.py)
     remove_worktree_marker,  # noqa: F401  (deliberate re-export; used by moved L01 b4 delegates via _wf.)
     write_worktree_marker,  # noqa: F401  (deliberate re-export; used by moved L01 b4 delegates via _wf.)
 )
 from . import state as _state
+from .command_result import CommandResult as _CommandResult
 from .unescalate_reset_fields import (
     ISSUE_BUDGET_RESET_BY_ESCALATION_REASON,
     REWORK_BUDGET_RESET_BY_ESCALATION_REASON,
@@ -179,9 +184,6 @@ from .throttle_signatures import (
     match_throttle_tail,
     parse_reset_clock_time,
 )
-from .process_utils import (
-    is_pid_alive,  # noqa: F401  (deliberate re-export; used by moved L08 delegate via _wf.)
-)
 from . import markdown_guard
 from .write_gate import WriteGate
 
@@ -205,7 +207,6 @@ from .dispatch_selection import (  # noqa: F401  (deliberate re-export)
     _select_dispatch_candidates,
     _select_rework_candidates,
     _reviewer_pid_alive,
-    _count_live_reviews,
     _apply_local_review_cap,
     _windowed_redispatch_at,
     _windowed_worker_death_at,
@@ -218,6 +219,11 @@ from .dispatch_selection import (  # noqa: F401  (deliberate re-export)
 )
 from .no_op_checkpoint import _paired_death_count  # noqa: F401  (deliberate re-export)
 from .no_op_rework_body import _body_content_sha256  # noqa: F401  (deliberate re-export; reached via _wf. by orchestration/state_record_review.py)
+from .orchestration.helpers_merge_gate import (  # noqa: F401  (deliberate re-export; reached via _wf. by orchestration/)
+    _BASE_CURRENT_UNSET,
+    _BaseCurrentUnset,
+)
+from .concurrency_governor_result import ConcurrencyGovernorResult  # noqa: F401  (deliberate re-export)
 from . import orchestration as _orchestration
 from .workflow_delegation import _install_delegates, discover_delegate_modules
 
@@ -388,6 +394,7 @@ from .ci_findings import (  # noqa: F401  (deliberate re-export)
 # `.dispatch_selection` / `.escalation` / `.verdict_parsing` /
 # `.rework_prompts` / `.ci_findings` blocks above.
 from .backlog_reachability import (  # noqa: F401  (deliberate re-export)
+    _MergedPRListOutcome,
     _get_open_blockers_for_issue,
     classify_backlog_reachability,
     compute_mention_coverage_map,
@@ -396,7 +403,9 @@ from .backlog_reachability import (  # noqa: F401  (deliberate re-export)
     resolve_dispatch_mention_coverage,
     scan_merged_pr_references,
 )
-from .blocker_cycles import detect_open_blocker_cycles
+from .blocker_cycles import (  # noqa: F401  (deliberate re-export; used by moved delegates via _wf.)
+    detect_open_blocker_cycles,
+)
 
 # Issue #1768: operator-queue impact measurement + edge-detection, extracted
 # to its own module for the same reason ``backlog_reachability`` is (a
@@ -457,9 +466,7 @@ from .dead_worker_sweep.effects_sessions import (  # noqa: F401  (deliberate re-
     _worker_death_bounded_runtime_seconds,
     _session_failed_relabeled_payload,
     _emit_session_failed_relabeled,
-    _count_live_sessions,
     _detect_stalled_sessions,
-    _worker_pid_alive,
     _orphan_head_fingerprint,
     _ZERO_ARTIFACT_ESCALATION_THRESHOLD,
     _is_zero_artifact_dispatch_loop,
@@ -495,45 +502,6 @@ from .dead_worker_sweep import (  # noqa: F401  (deliberate re-export)
     run_stalled_sweep as _detect_and_handle_stalled_sessions,
 )
 from .iso_timestamp import parse_iso_timestamp as _parse_iso_timestamp
-
-
-def _diff_file_summary(diff: str) -> tuple[int, list[tuple[str, int, int]]]:
-    """Return (total_lines, per_file_stats) from a unified diff.
-
-    ``per_file_stats`` is a list of ``(filename, added, deleted)`` tuples.
-    ``total_lines`` counts content lines (not diff headers/meta lines).
-    """
-    files: list[tuple[str, int, int]] = []
-    current_file = ""
-    added = 0
-    deleted = 0
-    total = 0
-    for line in diff.splitlines():
-        if line.startswith("diff --git"):
-            if current_file:
-                files.append((current_file, added, deleted))
-            current_file = ""
-            added = 0
-            deleted = 0
-        elif line.startswith("+++ "):
-            current_file = line[4:].strip()
-            if current_file == "/dev/null":
-                current_file = ""
-        elif line.startswith("--- "):
-            # Use the source file if the dest is /dev/null (deletion)
-            if not current_file:
-                current_file = line[4:].strip()
-                if current_file == "/dev/null":
-                    current_file = ""
-        elif line.startswith("+") and not line.startswith("+++"):
-            added += 1
-            total += 1
-        elif line.startswith("-") and not line.startswith("---"):
-            deleted += 1
-            total += 1
-    if current_file:
-        files.append((current_file, added, deleted))
-    return total, files
 
 
 def _max_touched_file_line_count(diff: str, repo_root: Path) -> int:
@@ -573,100 +541,6 @@ def _max_touched_file_line_count(diff: str, repo_root: Path) -> int:
         if line_count > max_lines:
             max_lines = line_count
     return max_lines
-
-
-@dataclass(frozen=True)
-class OverCapFileFinding:
-    """One file whose post-diff line count exceeds the repo size cap and whose
-    diff adds code to it (issue #1445).
-
-    ``line_count`` is the post-diff line count (base file at ``repo_root`` plus
-    the diff's net added lines, or the added-line count for a new file).
-    ``added_lines`` is the diff's gross added content lines for this file --
-    the quantity the rubric flags as "new code added to an over-cap file".
-    """
-
-    filename: str
-    line_count: int
-    cap: int
-    added_lines: int
-
-
-def _over_cap_file_findings(
-    diff: str, repo_root: Path, cap: int
-) -> tuple[OverCapFileFinding, ...]:
-    """Detect files this diff adds code to that are over the repo size cap.
-
-    Returns findings only for files that (a) have at least one added content
-    line in the diff and (b) whose post-diff line count exceeds ``cap``. A
-    ``cap`` of 0 disables the check (returns ``()``) -- mirrors
-    ``turn_cap_large_file_threshold``'s 0-disables convention.
-
-    File sizes are read from ``repo_root`` (the orchestrator's checkout) plus
-    the diff's net added lines, mirroring ``_max_touched_file_line_count``; a
-    new file's size is its added lines. Best-effort: a file that cannot be read
-    is skipped, never raises -- the same posture as the static probe and
-    ``check_operator_containment``.
-    """
-    if cap <= 0:
-        return ()
-    _total, files = _diff_file_summary(diff)
-    findings: list[OverCapFileFinding] = []
-    for name, added, deleted in files:
-        if not name or added <= 0:
-            continue
-        # Unified diff ``+++`` paths are prefixed with ``b/``; strip it so the
-        # path resolves under ``repo_root`` and the reported filename is the
-        # repo-relative path (not the diff's ``b/``-prefixed form). A literal
-        # ``b/...`` file would be vanishingly rare and only makes the lookup
-        # miss (falling back to the added-line count), never reads the wrong
-        # file -- mirrors ``_max_touched_file_line_count``'s stance.
-        filename = name[2:] if name.startswith("b/") else name
-        path = repo_root / filename
-        if path.exists() and path.is_file():
-            try:
-                with path.open("r", encoding="utf-8", errors="replace") as handle:
-                    base = sum(1 for _ in handle)
-            except OSError:
-                continue
-            line_count = base + added - deleted
-        else:
-            # New file (not present at repo_root): its size is the added lines.
-            line_count = added
-        if line_count > cap:
-            findings.append(OverCapFileFinding(filename, line_count, cap, added))
-    return tuple(findings)
-
-
-def render_over_cap_section(findings: tuple[OverCapFileFinding, ...] | None) -> str:
-    """Render the ``$over_cap_section`` packet block (issue #1445).
-
-    Returns ``""`` when ``findings`` is ``None`` (cap disabled -- the caller in
-    ``review()`` passes ``None`` when ``file_size_cap_lines`` is 0), mirroring
-    ``render_static_probe_section``'s disabled contract. When enabled, this
-    ALWAYS renders visible text -- even with zero findings -- rather than ``"``
-    for a clean pass, mirroring ``render_static_probe_section``'s never-silent
-    contract: an advisory probe that goes silent on a clean run is
-    indistinguishable, from the rendered packet alone, from one that never ran.
-    """
-    if findings is None:
-        return ""
-    if not findings:
-        return "File-size cap: no over-cap additions in this diff.\n"
-    lines = ["**Over-cap file additions (issue #1445):**"]
-    for finding in findings:
-        lines.append(
-            f"- `{finding.filename}`: {finding.line_count} lines "
-            f"(cap {finding.cap}), +{finding.added_lines} added -- "
-            "REPORTABLE FINDING. Suggested remedy: extract the new code to a "
-            "domain module (facade re-export block in the monolith, "
-            "implementation in the module), matching the #1283-era extractions. "
-            "Then run `python scripts/refresh_file_size_ratchet.py` and commit "
-            "the resulting `file_size_ratchet_baseline/` entry tightening in this "
-            "PR -- the script's default mode is lower-only (never raises a "
-            "mark), so it is safe to run mid-PR (#1495)."
-        )
-    return "\n".join(lines) + "\n"
 
 
 def structure_turn_cap_multiplier(
@@ -779,21 +653,14 @@ def _slim_pr_json(pr: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in pr.items() if k in _PR_SLIM_FIELDS}
 
 
-@dataclass(frozen=True)
-class CommandResult:
-    ok: bool
-    message: str
-    data: dict[str, Any]
-
-
-def _state_lock_busy_result(message: str, **extra: Any) -> CommandResult:
+def _state_lock_busy_result(message: str, **extra: Any) -> _CommandResult:
     data: dict[str, Any] = {
         "pass_skipped": True,
         "reason": "state_lock_busy",
         "state_lock_busy": True,
     }
     data.update(extra)
-    return CommandResult(True, message, data)
+    return _CommandResult(True, message, data)
 
 
 def _truncate_reason(reason: str, max_len: int = 200) -> str:
@@ -878,178 +745,13 @@ def _guard_state_lock(func: Any) -> Any:
     """Decorator that turns StateLockBusy into a skipped CommandResult."""
 
     @functools.wraps(func)
-    def wrapper(self: Any, *args: Any, **kwargs: Any) -> CommandResult:
+    def wrapper(self: Any, *args: Any, **kwargs: Any) -> _CommandResult:
         try:
             return func(self, *args, **kwargs)
         except StateLockBusy:
             return _state_lock_busy_result("state lock held, skipped")
 
     return wrapper
-
-
-@dataclass(frozen=True)
-class ConcurrencyGovernorResult:
-    """Result of applying concurrency governor to a dispatch limit.
-
-    This encapsulates the concurrency limiting logic and ensures all related
-    fields are bound together, eliminating Pyright's reportPossiblyUnbound
-    warnings for live_count.
-    """
-
-    clamped: bool
-    max_concurrent: int
-    live_count: int
-    available_slots: int
-    dispatch_limit: int
-    fleet_live_count: int = 0
-    fleet_max: int = 0
-    # Issue #1129: open-PR backpressure fields. Populated only when the
-    # governor was called with ``apply_open_pr_backpressure=True`` (fresh-issue
-    # dispatch) and ``dispatch.max_open_agent_prs`` is > 0. Left at 0 for
-    # rework/recovery/loop paths, which are exempt from this clamp.
-    open_pr_count: int = 0
-    open_pr_max: int = 0
-    # Issue #1770: CI-capacity headroom fields. ``ci_headroom_ratio`` mirrors
-    # ``open_pr_max``'s exemption -- populated only for the same
-    # ``apply_open_pr_backpressure=True`` (fresh-issue) call, 0.0 for
-    # rework/recovery/loop paths regardless of the configured ratio.
-    # ``ci_headroom`` is the ``ci_headroom_available()`` reading: ``None``
-    # when the ratio is 0 (clamp off) or the data could not be trusted this
-    # pass (fail-open -- see ``ci_headroom``'s docstring), an
-    # int otherwise.
-    ci_headroom: int | None = None
-    ci_headroom_ratio: float = 0.0
-    # Issue #1843: host-load backpressure fields. Unlike the two fields above
-    # this term applies to EVERY governor caller (loop wave budget, rework,
-    # fresh dispatch) -- a worker launch adds real host load regardless of
-    # lane. ``host_load_pytest_processes``/``host_load_pytest_trees`` are the
-    # ``host_load.measure_host_load`` reading for this call: ``None`` when
-    # both knobs are 0 (off), when the running limit was already 0 (no launch
-    # could happen, so no probe), or when the probe itself failed (fail-open
-    # -- see host_load.py), ints otherwise. Issue #1903 split the term into
-    # two knobs: ``host_load_max_pytest_trees`` (the governor -- clamps by
-    # suite headroom ``cap - live_trees``) and ``host_load_max_pytest_processes``
-    # (the fan-out brake -- strict ``>`` trip to 0 on abnormal ``-n`` width).
-    # Issue #1943: both reported counts are scoped to
-    # orchestrator-attributable trees (any member/ancestor command line
-    # referencing a managed state/worktree path) -- CI-runner and other
-    # foreign suites feed neither count.
-    host_load_max_pytest_processes: int = 0
-    host_load_max_pytest_trees: int = 0
-    host_load_pytest_processes: int | None = None
-    host_load_pytest_trees: int | None = None
-    # Which term actually bound ``dispatch_limit`` this call, e.g.
-    # "ci_headroom", "open_pr_max", "fleet_max", "max_concurrent",
-    # "host_load", or ``None`` when nothing clamped. The terms apply in
-    # sequence, each only tightening (never loosening) the running limit, so
-    # whichever term last reduced it is the true binding constraint -- this
-    # is what makes a "0 dispatched" pass explainable from the event alone
-    # instead of requiring a reader to redo the min() by hand
-    # (zero-dispatch-is-a-capacity-question-first).
-    clamped_by: str | None = None
-
-    @property
-    def enabled(self) -> bool:
-        """Return True if the governor is enabled (max_concurrent > 0)."""
-        return self.max_concurrent > 0
-
-    @property
-    def fleet_enabled(self) -> bool:
-        """Return True if the fleet governor is enabled (fleet_max > 0)."""
-        return self.fleet_max > 0
-
-    @property
-    def open_pr_enabled(self) -> bool:
-        """Return True if the open-PR backpressure clamp is enabled (open_pr_max > 0)."""
-        return self.open_pr_max > 0
-
-    @property
-    def ci_headroom_enabled(self) -> bool:
-        """Return True if the CI-headroom clamp is enabled (ci_headroom_ratio > 0)."""
-        return self.ci_headroom_ratio > 0
-
-    @property
-    def host_load_enabled(self) -> bool:
-        """Return True if the host-load clamp is enabled (either knob > 0)."""
-        return self.host_load_max_pytest_processes > 0 or self.host_load_max_pytest_trees > 0
-
-    @property
-    def any_term_enabled(self) -> bool:
-        """Return True if any governor term is enabled.
-
-        Single point of enforcement (issue #1770 review finding 1): every
-        call site that decides whether to splat ``report_fields()`` into a
-        ``CommandResult.data`` dict must gate on this property, never on a
-        hand-written ``or``-chain of the individual ``*_enabled`` flags. A
-        hand-written chain silently stops covering new terms the moment one
-        is added -- exactly what happened when ``ci_headroom_enabled`` shipped
-        without being added to the ten pre-existing
-        ``gov.enabled or gov.fleet_enabled or gov.open_pr_enabled`` sites, so
-        a repo that opted into *only* the CI-headroom clamp (the other three
-        left at 0, precisely the "opt into just the new clamp" rollout the
-        config comment advertises) got its ``dispatch_limit`` clamped to 0
-        with no ``ci_headroom``/``clamped_by`` field in the result to explain
-        why. Deriving this from the flags themselves means the next new term
-        cannot repeat that gap.
-        """
-        return (
-            self.enabled
-            or self.fleet_enabled
-            or self.open_pr_enabled
-            or self.ci_headroom_enabled
-            or self.host_load_enabled
-        )
-
-    def report_fields(self) -> dict[str, Any]:
-        """Return the fields to include in CommandResult.data when clamped."""
-        fields: dict[str, Any] = {
-            "concurrency_limit": self.max_concurrent,
-            "live_session_count": self.live_count,
-            "available_slots": self.available_slots,
-        }
-        if self.fleet_enabled:
-            fields["fleet_concurrency_limit"] = self.fleet_max
-            fields["fleet_live_session_count"] = self.fleet_live_count
-        if self.open_pr_enabled:
-            fields["open_pr_count"] = self.open_pr_count
-            fields["open_pr_max"] = self.open_pr_max
-        if self.ci_headroom_enabled:
-            fields["ci_headroom"] = self.ci_headroom
-            fields["ci_headroom_ratio"] = self.ci_headroom_ratio
-        if self.host_load_enabled:
-            fields["host_load_max_pytest_processes"] = self.host_load_max_pytest_processes
-            fields["host_load_max_pytest_trees"] = self.host_load_max_pytest_trees
-            fields["host_load_pytest_processes"] = self.host_load_pytest_processes
-            fields["host_load_pytest_trees"] = self.host_load_pytest_trees
-        if self.clamped_by is not None:
-            fields["clamped_by"] = self.clamped_by
-        return fields
-
-
-@dataclass(frozen=True)
-class CarryForwardCheck:
-    """Result of comparing a recorded review verdict's content against the
-    live PR diff (issues #411/#412 tier 1, #414 tier 2).
-
-    ``tier`` is ``"patch-id"`` when the live diff's stable patch-id matches
-    the recorded ``reviewed_patch_id`` outright (issue #412's fast path),
-    ``"line-content"`` when the patch-ids differed — which happens on every
-    ordinary main advance, since the merge-base moves — but the ordered
-    ``+``/``-`` line stream and changed-file set are identical to what was
-    recorded at review time (issue #414), or ``None`` when neither tier
-    establishes content identity: the caller must treat the verdict as
-    stale. ``live_patch_id``/``live_signature`` are always populated (when
-    the live diff was fetched) so a carrying-forward caller can persist the
-    freshly computed baseline against the new head without recomputing it.
-    """
-
-    tier: str | None
-    live_patch_id: str
-    live_signature: DiffContentSignature
-
-    @property
-    def carry_forward(self) -> bool:
-        return self.tier is not None
 
 
 def _summary_is_vacuous(summary: str) -> bool:
@@ -1143,8 +845,10 @@ def render_test_adequacy_summary(verdict: TestAdequacyVerdict, exempt_marker: st
         f"Test adequacy check failed: {added_loc} lines of product code added "
         f"but no test files changed.\n\n"
         f"Untested product files:\n{file_list}\n\n"
-        f"To exempt this PR from the test-adequacy gate, add "
-        f"'{exempt_marker} <reason>' to the PR body with a clear justification."
+        f"To exempt this PR from the test-adequacy gate, add a "
+        f"'{exempt_marker} <reason>' trailer to a commit (an empty commit is fine: "
+        f"`git commit --allow-empty` with the trailer as the last paragraph), "
+        f"or add the line to the PR body, with a clear justification."
     )
 
 
@@ -1681,8 +1385,12 @@ WORKER_PROMPT_KEYS: frozenset[str] = frozenset(
         # The test command, resolved by ``prompt_test_command`` (config
         # override, else derived from the consumer's pyproject.toml, else a
         # pointer to the repository's own docs). Always supplied, never empty.
+        # The step sentence and execution contract follow the command's form
+        # (hand-picked, or ``ci-fleet test``).
         "targeted_test_command",
         "full_suite_command",
+        "test_step_instruction",
+        "test_execution_contract",
     }
 )
 REWORK_PROMPT_KEYS: frozenset[str] = frozenset(
@@ -1700,6 +1408,8 @@ REWORK_PROMPT_KEYS: frozenset[str] = frozenset(
         # Same resolution as the worker prompt's (``prompt_test_command``).
         "targeted_test_command",
         "full_suite_command",
+        "test_step_instruction",
+        "test_execution_contract",
     }
 )
 
@@ -1773,27 +1483,6 @@ VERDICT_PROVENANCE_VALUES: frozenset[str] = frozenset(
 #   carried_forward -- never reaches record_review at all (see the mapping
 #     comment above).
 NO_OP_RESET_PROVENANCES: frozenset[str] = frozenset({"fresh_llm_review", "operator_manual"})
-
-
-class PromptOverrideDriftError(RuntimeError):
-    """One or more configured prompt templates reference placeholders their
-    writer does not supply (issue #713).
-
-    Raised at supervisor startup (and asserted in CI) by
-    :func:`check_prompt_template_drift` so a repo-local flat whole-file
-    override that drifted out of sync with the orchestrator's writer -- e.g.
-    a flat ``rework.md`` still referencing ``$review_summary`` after the
-    writer renamed it to ``$dispatch_note`` -- fails fast before any
-    dispatch, instead of staying live-armed until the next dispatch crashes
-    with an uncaught :class:`PromptTemplateError`.
-    """
-
-    def __init__(self, errors: Sequence["PromptTemplateError"]) -> None:
-        self.errors = tuple(errors)
-        details = "; ".join(str(error) for error in self.errors)
-        super().__init__(
-            f"prompt template drift detected (issue #713); refusing to start: {details}"
-        )
 
 
 def check_prompt_template_drift(
@@ -2257,22 +1946,6 @@ def _format_stale_base_alarm_message(pr_number: int, attempts: int, reason: str)
     return f"PR #{pr_number} approved but {detail} for {attempts} consecutive {pass_str}"
 
 
-# Sentinel used to distinguish "no base-current signal was supplied" from
-# an explicit ``None`` (compare API unavailable) in _should_update_pr_branch.
-class _BaseCurrentUnset:
-    __slots__ = ()
-
-
-_BASE_CURRENT_UNSET = _BaseCurrentUnset()
-
-
-@dataclass(frozen=True)
-class _MergedPRListOutcome:
-    items: list[dict[str, Any]] = field(default_factory=list)
-    error: GitHubError | None = None
-    called: bool = False
-
-
 def _is_rerun_already_running_error(error: str) -> bool:
     """Return True if a ``gh run rerun`` error means the run is still in progress.
 
@@ -2373,142 +2046,6 @@ def _has_other_open_pr(
     return False
 
 
-def _launch_review_claude_code(
-    *,
-    pr_number: int,
-    branch: str,
-    prompt_path: Path,
-    prompt_text: str,
-    head_sha: str,
-    repo_root: Path,
-    reviews_dir: Path,
-    config: OrchestratorConfig,
-    worker_env: dict[str, str],
-    materialize_dirs: tuple[str, ...],
-    resolved_review_effort: str | None,
-    max_turns_override: int | None,
-    model_override: str | None,
-    api_worker_config: ApiWorkerConfig | None,
-) -> Any:
-    return launch_claude_worker(
-        issue_number=pr_number,
-        branch=branch,
-        prompt_text=prompt_text,
-        repo_root=repo_root,
-        sessions_dir=reviews_dir,
-        config=config,
-        env=worker_env,
-        materialize_dirs=materialize_dirs,
-        review=True,
-        head_sha=head_sha,
-        # Force-enabled for reviewers: the structured events.jsonl is needed
-        # for verdict fallback parsing (issue #540) and token/turn monitoring.
-        tee_stream_json=True,
-        resolved_review_effort=resolved_review_effort,
-        max_turns_override=max_turns_override,
-        model_override=model_override,
-    )
-
-
-def _launch_review_devin_shell(
-    *,
-    pr_number: int,
-    branch: str,
-    prompt_path: Path,
-    prompt_text: str,
-    head_sha: str,
-    repo_root: Path,
-    reviews_dir: Path,
-    config: OrchestratorConfig,
-    worker_env: dict[str, str],
-    materialize_dirs: tuple[str, ...],
-    resolved_review_effort: str | None,
-    max_turns_override: int | None,
-    model_override: str | None,
-    api_worker_config: ApiWorkerConfig | None,
-) -> Any:
-    # devin_shell has no notion of review-effort/turn-cap resolution (those
-    # are claude-code CLI concepts -- --effort and --max-turns flags); a
-    # devin-routed reviewer runs with the CLI's own defaults for both.
-    return launch_devin_session(
-        pr_number,
-        branch,
-        prompt_path,
-        repo_root=repo_root,
-        sessions_dir=reviews_dir,
-        config=config,
-        worker_env=worker_env,
-        materialize_dirs=materialize_dirs,
-        review=True,
-        head_sha=head_sha,
-        worker_model=model_override or "",
-    )
-
-
-def _launch_review_api(
-    *,
-    pr_number: int,
-    branch: str,
-    prompt_path: Path,
-    prompt_text: str,
-    head_sha: str,
-    repo_root: Path,
-    reviews_dir: Path,
-    config: OrchestratorConfig,
-    worker_env: dict[str, str],
-    materialize_dirs: tuple[str, ...],
-    resolved_review_effort: str | None,
-    max_turns_override: int | None,
-    model_override: str | None,
-    api_worker_config: ApiWorkerConfig | None,
-) -> Any:
-    # model_override is deliberately unused here: an api-routed reviewer
-    # always runs the configured provider's pinned model (see
-    # api_worker.launch_api_worker's own model_override=provider.model),
-    # the same as an api-routed worker -- reviewer.model has no effect on
-    # this harness.
-    assert api_worker_config is not None  # only None for a non-api harness
-    return launch_api_worker(
-        pr_number,
-        branch,
-        prompt_text,
-        repo_root=repo_root,
-        sessions_dir=reviews_dir,
-        api_worker_config=api_worker_config,
-        worker_env=worker_env,
-        materialize_dirs=materialize_dirs,
-        review=True,
-        head_sha=head_sha,
-        resolved_review_effort=resolved_review_effort,
-        max_turns_override=max_turns_override,
-        config=config,
-    )
-
-
-# Single dispatch table keyed by ``reviewer.harness`` name -- this, not a
-# per-harness if/elif chain, is what ``OrchestratorApp.dispatch_reviews``
-# consumes (issue #1513). Every launcher above shares one keyword-only
-# signature so the call site does not need to know which positional/keyword
-# convention the underlying launch function uses (``launch_claude_worker``/
-# ``launch_api_worker`` take ``prompt_text``; ``launch_devin_session`` takes
-# ``prompt_path``); each returns a record with ``.error``/``.pid``/
-# ``.process_start_time``, which is all the post-launch handling below reads.
-# The assertion is the drift guard: it fails at import time if a harness is
-# ever added to (or removed from) ``harnesses.REVIEWER_HARNESSES`` without a
-# matching entry here, the same pattern ``adapters._ADAPTER_DISPATCHERS``
-# uses for the worker side.
-_REVIEW_LAUNCHERS: dict[str, Callable[..., Any]] = {
-    "claude-code": _launch_review_claude_code,
-    "devin-shell": _launch_review_devin_shell,
-    "api": _launch_review_api,
-}
-
-assert set(_REVIEW_LAUNCHERS) == REVIEWER_HARNESSES, (
-    "workflow._REVIEW_LAUNCHERS must launch exactly the harnesses "
-    "harnesses.REVIEWER_HARNESSES declares review-capable -- keep both in sync"
-)
-
-
 class OrchestratorApp:
     def __init__(
         self,
@@ -2519,7 +2056,10 @@ class OrchestratorApp:
         *,
         dry_run: bool = False,
         fleet_dir_override: str | None = None,
+        host: HostPorts | None = None,
     ):
+        # Production composition only; tests use the ``fake_host`` fixture.
+        self._host = host
         self.repo_root = repo_root
         self.paths = paths
         self.config = config
@@ -2565,8 +2105,13 @@ class OrchestratorApp:
         if isinstance(self.gh, GitHub):
             self.gh.validate_field_lists()
 
+    @property
+    def host(self) -> HostPorts:
+        """Explicit ``host=`` if given, else the active ports, read at access time."""
+        return self._host if self._host is not None else _host_current()
+
     @_guard_state_lock
-    def status(self, *, use_cache: bool = True) -> CommandResult:
+    def status(self, *, use_cache: bool = True) -> _CommandResult:
         if use_cache and (cached := status_snapshot.read_status_snapshot(self)) is not None:
             return cached
         issues = self.gh.issue_list(self.config.labels.ready)
@@ -2600,7 +2145,7 @@ class OrchestratorApp:
         from .worker import classify_worker_health, iter_workers, real_activity_probe_for
 
         worker_views = list(iter_workers(sessions_dir))
-        now = datetime.now(UTC)
+        now = self.host.clock.now()
         workers = []
         for view in worker_views:
             if not view.is_alive():
@@ -2720,133 +2265,7 @@ class OrchestratorApp:
         if runners_data is not None:
             data["runners"] = runners_data
 
-        return CommandResult(True, "status complete", data)
-
-    @_guard_state_lock
-    def intake(self) -> CommandResult:
-        issues = self.gh.issue_list(self.config.labels.ready)
-        written: list[dict[str, Any]] = []
-        failed: list[dict[str, Any]] = []
-        prose_only_deps_issues: list[int] = []
-        # Gather all network results and write files outside the lock
-        for issue in issues:
-            issue_number = int(issue["number"])
-            try:
-                full_issue = self.gh.issue_view(issue_number)
-            except GitHubError as exc:
-                failed.append({"issue": issue_number, "error": str(exc)})
-                continue
-            issue_dir = self.paths.issues / f"issue-{issue_number}"
-            issue_json = issue_dir / "issue.json"
-            # Issue #618: in dry-run, skip all file mutations (issue dir,
-            # issue.json, worker-prompt.md) — the preview must not touch disk.
-            if not self.dry_run:
-                issue_dir.mkdir(parents=True, exist_ok=True)
-                self._write_json(issue_json, full_issue)
-            prompt_path = self._write_worker_prompt(full_issue, dry_run=self.dry_run)
-
-            # Check for prose-only dependencies (issue #225)
-            body_text = full_issue.get("body", "")
-            has_prose_deps = detect_prose_only_dependencies(body_text)
-            has_structured_blockers = bool(parse_blockers(body_text))
-
-            # If prose-only dependencies exist without structured blockers, label for human attention
-            if has_prose_deps and not has_structured_blockers:
-                prose_only_deps_issues.append(issue_number)
-                if not self.dry_run:
-                    try:
-                        self.gh.add_issue_label(issue_number, self.config.labels.prose_only_deps)
-                    except Exception:
-                        # Label add failure is non-blocking for intake
-                        pass
-
-            written.append(
-                {
-                    "issue": issue_number,
-                    "prompt_path": str(prompt_path),
-                    "title": full_issue.get("title"),
-                    "url": full_issue.get("url"),
-                    "labels": sorted(label_names(full_issue)),
-                    "updated_at": full_issue.get("updatedAt"),
-                }
-            )
-        # Issue #1848: scan the open-issue blocker graph for cycles -- a loop
-        # of open issues blocking each other (or an issue listing itself)
-        # stalls every member forever while each still looks armed. Reporting
-        # only: one warning per reported cycle is logged inside the scan, and
-        # one blocker_cycle event per reported cycle is recorded below (the
-        # report is bounded by MAX_REPORTED_CYCLES total plus per-component
-        # cycle/DFS caps inside the scan; the intake event carries the
-        # truncation marker). Runs with the rest of intake's reads, outside
-        # the state lock; fail-open.
-        blocker_cycle_scan = detect_open_blocker_cycles(self.gh)
-        blocker_cycles = blocker_cycle_scan.cycles
-        # Single lock for all state updates — skipped in dry-run (issue #618)
-        if not self.dry_run:
-            with state_lock(self.paths.state_file):
-                state = load_state(self.paths.state_file)
-                for entry in written:
-                    issue_number = entry["issue"]
-                    # Merge-update, never replace: intake used to clobber dispatch
-                    # status recorded by earlier passes (production-confirmed).
-                    state["issues"][str(issue_number)] = {
-                        **state["issues"].get(str(issue_number), {}),
-                        "number": issue_number,
-                        "title": entry["title"],
-                        "url": entry["url"],
-                        "labels": entry["labels"],
-                        "prompt_path": entry["prompt_path"],
-                        "updated_at": entry["updated_at"],
-                    }
-                for failure in failed:
-                    state = self._record_event(
-                        state,
-                        "intake_failed",
-                        {"issue_number": failure["issue"], "error": failure["error"]},
-                    )
-                if prose_only_deps_issues:
-                    state = self._record_event(
-                        state,
-                        "intake_prose_only_deps",
-                        {"issue_numbers": sorted(prose_only_deps_issues)},
-                    )
-                for cycle in blocker_cycles:
-                    state = self._record_event(
-                        state,
-                        "blocker_cycle",
-                        {"issue_numbers": cycle},
-                    )
-                state = self._record_event(
-                    state,
-                    "intake",
-                    {
-                        "issue_count": len(issues),
-                        "failed_count": len(failed),
-                        "blocker_cycles_reported": len(blocker_cycles),
-                        "blocker_cycles_truncated": blocker_cycle_scan.truncated,
-                    },
-                )
-                save_state(self.paths.state_file, state)
-        message = "intake complete"
-        if self.dry_run:
-            message = f"dry-run: would intake {len(written)} issue(s)"
-        elif failed:
-            message = f"intake completed with {len(failed)} failure(s)"
-        if prose_only_deps_issues:
-            message += (
-                f", {len(prose_only_deps_issues)} issue(s) labeled with prose-only dependencies"
-            )
-        return CommandResult(
-            not failed,
-            message,
-            {
-                "issues": written,
-                "failed": failed,
-                "prose_only_deps_issues": prose_only_deps_issues,
-                "blocker_cycles": blocker_cycles,
-                "blocker_cycles_truncated": blocker_cycle_scan.truncated,
-            },
-        )
+        return _CommandResult(True, "status complete", data)
 
     @_guard_state_lock
     def review(
@@ -2854,7 +2273,7 @@ class OrchestratorApp:
         pr_number: int,
         *,
         force: bool = False,
-    ) -> CommandResult:
+    ) -> _CommandResult:
         """Generate a review packet for a PR.
 
         ``force`` (issue #2081, ``why-charlie-hate --force-rereview``) voids a
@@ -2891,7 +2310,7 @@ class OrchestratorApp:
         """
         pr = self.gh.pr_view(pr_number)
         if not pr:
-            return CommandResult(False, f"PR #{pr_number} was not found", {})
+            return _CommandResult(False, f"PR #{pr_number} was not found", {})
         issue_number = linked_issue_number(
             pr,
             is_cross_repository=pr.get("isCrossRepository"),
@@ -2912,7 +2331,7 @@ class OrchestratorApp:
         # worse than the bug it replaces, so this gate is a single early return
         # before any branch that has an escalation or state-write arm.
         if self.dry_run:
-            return CommandResult(
+            return _CommandResult(
                 True,
                 f"dry-run: would generate review packet for PR #{pr_number}",
                 {
@@ -2964,6 +2383,18 @@ class OrchestratorApp:
             escalated_diff = self.gh.pr_diff(pr_number)
             escalated_verdict = None
             known_ci_run_never_created_head = None
+            # Issue #2281: fetched before the state_lock -- gh calls must
+            # never run under it, and the no-op gate's exemption-claim
+            # escape only needs the commit list when a request_changes
+            # verdict + enabled adequacy gate make the escape live.
+            escalated_decision = self._review_decision(pr_number)
+            escalated_pr_commits = (
+                self.gh.pr_commits(pr_number)
+                if no_op_escape_needs_pr_commits(
+                    self.config.test_adequacy, escalated_decision, pr.get("headRefOid")
+                )
+                else None
+            )
             with state_lock(self.paths.state_file):
                 fresh_state = load_state(self.paths.state_file)
                 existing_pr_state = fresh_state["prs"].get(str(pr_number))
@@ -2978,7 +2409,8 @@ class OrchestratorApp:
                         pr_state=existing_pr_state,
                         repo_root=self.repo_root,
                         pr_diff=escalated_diff,
-                        review_decision=self._review_decision(pr_number),
+                        review_decision=escalated_decision,
+                        pr_commits=escalated_pr_commits,
                     )
                     failures_changed = existing_pr_state.get("janitor_failures") != list(
                         escalated_verdict.failures
@@ -3131,7 +2563,7 @@ class OrchestratorApp:
                     if routed is not None:
                         return routed
 
-            return CommandResult(
+            return _CommandResult(
                 True,
                 reason,
                 {
@@ -3189,6 +2621,18 @@ class OrchestratorApp:
                     _hm_issue_labels = label_names(self.gh.issue_view(_hm_issue_num))
                 except (GitHubError, ValueError):
                     _hm_issue_labels = None
+        gate_decision = self._review_decision(pr_number)
+        # Issue #2281: the no-op gate's exemption-claim escape needs the
+        # PR's commit list -- fetched only when a request_changes verdict
+        # and an enabled adequacy gate make the escape live, so the common
+        # pass spends no extra REST call. Reused below by check_test_adequacy.
+        pr_commits = (
+            self.gh.pr_commits(pr_number)
+            if no_op_escape_needs_pr_commits(
+                self.config.test_adequacy, gate_decision, pr.get("headRefOid")
+            )
+            else None
+        )
         verdict = run_janitor(
             pr,
             checks,
@@ -3196,8 +2640,9 @@ class OrchestratorApp:
             pr_state=pr_state,
             repo_root=self.repo_root,
             pr_diff=diff,
-            review_decision=self._review_decision(pr_number),
+            review_decision=gate_decision,
             issue_labels=_hm_issue_labels,
+            pr_commits=pr_commits,
         )
 
         # Issue #1116: the stale-CI skip let a reworked-but-unchanged PR
@@ -3299,7 +2744,7 @@ class OrchestratorApp:
                             {"pr_number": pr_number, "issue_number": issue_number},
                         )
                         save_state(self.paths.state_file, state)
-                return CommandResult(
+                return _CommandResult(
                     True,
                     f"PR #{pr_number} is CLOSED (unmerged) on GitHub; "
                     f"converged state status to 'closed'",
@@ -3355,7 +2800,7 @@ class OrchestratorApp:
                                 },
                             )
                         save_state(self.paths.state_file, state)
-                    return CommandResult(
+                    return _CommandResult(
                         False,
                         f"PR #{pr_number} is a draft; auto-ready held ({draft_hold_reason})",
                         {
@@ -3379,7 +2824,7 @@ class OrchestratorApp:
                         },
                         repo=self.repo_root.name,
                     )
-                    return CommandResult(
+                    return _CommandResult(
                         False,
                         f"PR #{pr_number} was a draft; marked ready for review "
                         "(deferring to next pass)",
@@ -3426,7 +2871,7 @@ class OrchestratorApp:
                             state_path=self.paths.state_file,
                         )
                     save_state(self.paths.state_file, state)
-                return CommandResult(
+                return _CommandResult(
                     False,
                     f"PR #{pr_number} is a draft and `gh pr ready` failed: {draft_ready_error}",
                     {
@@ -3490,7 +2935,7 @@ class OrchestratorApp:
                             state_path=self.paths.state_file,
                         )
                         save_state(self.paths.state_file, state)
-                    return CommandResult(
+                    return _CommandResult(
                         False,
                         f"flake rerun triggered for PR #{pr_number}: run(s) "
                         + ", ".join(str(rid) for rid in triggered_run_ids),
@@ -3527,7 +2972,7 @@ class OrchestratorApp:
                     and rerun_errors
                     and all(_is_rerun_already_running_error(e) for e in rerun_errors)
                 ):
-                    return CommandResult(
+                    return _CommandResult(
                         False,
                         f"flake rerun for PR #{pr_number} refused: "
                         + "workflow run(s) still in progress",
@@ -3624,7 +3069,7 @@ class OrchestratorApp:
                     window["consecutive_passes"] = window.get("consecutive_passes", 0) + 1
                     window["last_pass_cid"] = cid
                 last_esc = window.get("last_escalation")
-                now_dt = datetime.now(UTC)
+                now_dt = self.host.clock.now()
                 should_escalate = window["consecutive_passes"] >= cfg.persistence_passes
                 if should_escalate and (
                     last_esc is None
@@ -3642,7 +3087,7 @@ class OrchestratorApp:
                         level="error",
                     )
                     window["last_escalation"] = now_dt
-                return CommandResult(
+                return _CommandResult(
                     False,
                     f"PR #{pr_number} infra-blocked (billing/runner outage): "
                     + ", ".join(verdict.infra_blocked_checks),
@@ -3654,7 +3099,15 @@ class OrchestratorApp:
                 )
 
             if issue_number is not None and verdict.is_check_failure_block:
-                transition(self.gh, self.config.labels, issue_number, "review_started")
+                transition(
+                    self.gh,
+                    self.config.labels,
+                    issue_number,
+                    "review_started",
+                    state_path=self.paths.state_file,
+                    repo=self.repo_root.name,
+                    pr_number=pr_number,
+                )
                 summary = f"CI failed on {', '.join(verdict.failed_required_checks)}; push a fix"
                 # Issue #771: name the failure, not just the check. Populated
                 # from the failing check run(s)' GitHub annotations when
@@ -3835,7 +3288,15 @@ class OrchestratorApp:
                 and not verdict.infra_definitive_failed
             )
             if issue_number is not None and is_co_occurring_check_failure_block:
-                transition(self.gh, self.config.labels, issue_number, "review_started")
+                transition(
+                    self.gh,
+                    self.config.labels,
+                    issue_number,
+                    "review_started",
+                    state_path=self.paths.state_file,
+                    repo=self.repo_root.name,
+                    pr_number=pr_number,
+                )
                 # verdict.failures always ends with the "Required check(s)
                 # failed: ..." message when failed_required_checks is
                 # truthy (janitor.run_janitor appends it last, nothing after
@@ -3985,7 +3446,7 @@ class OrchestratorApp:
                 if stale_checks_retrigger_result is not None:
                     return stale_checks_retrigger_result
 
-            return CommandResult(
+            return _CommandResult(
                 False,
                 f"janitor gate blocked PR #{pr_number}: " + "; ".join(verdict.failures),
                 {
@@ -4031,13 +3492,32 @@ class OrchestratorApp:
         test_adequacy_section = ""
         test_adequacy_verdict = None
         if self.config.test_adequacy.enabled:
-            test_adequacy_verdict = check_test_adequacy(diff, pr, self.config.test_adequacy)
+            # Issue #2220: commit trailers are the exemption channel a worker
+            # can actually write (no GitHub token => no PR-body edits).
+            # Reuse the list already fetched for the no-op escape (issue
+            # #2281) when one was taken this pass.
+            if pr_commits is None:
+                pr_commits = self.gh.pr_commits(pr_number) or []
+            test_adequacy_verdict = check_test_adequacy(
+                diff,
+                pr,
+                self.config.test_adequacy,
+                [str((c.get("commit") or {}).get("message") or "") for c in pr_commits],
+            )
             if not test_adequacy_verdict.ok:
                 # Same terminal label set as an LLM request_changes:
                 # {in_progress} -> review_started -> {in_progress,pr_open,reviewing}
                 #               -> rework_requested (inside record_review) -> {in_progress,pr_open,needs_rework}
                 if issue_number is not None:
-                    transition(self.gh, self.config.labels, issue_number, "review_started")
+                    transition(
+                        self.gh,
+                        self.config.labels,
+                        issue_number,
+                        "review_started",
+                        state_path=self.paths.state_file,
+                        repo=self.repo_root.name,
+                        pr_number=pr_number,
+                    )
                 summary = render_test_adequacy_summary(
                     test_adequacy_verdict, self.config.test_adequacy.exempt_marker
                 )
@@ -4203,7 +3683,7 @@ class OrchestratorApp:
                     level="warning",
                 )
                 save_state(self.paths.state_file, state)
-            return CommandResult(
+            return _CommandResult(
                 False,
                 f"PR #{pr_number}: head moved during packet build "
                 f"({snapshot_head_for_commit} -> {live_head_for_commit!r}); "
@@ -4568,7 +4048,15 @@ class OrchestratorApp:
                     should_skip_transition = True
 
             if not should_skip_transition and not dispatch_disabled:
-                result = transition(self.gh, self.config.labels, issue_number, "review_started")
+                result = transition(
+                    self.gh,
+                    self.config.labels,
+                    issue_number,
+                    "review_started",
+                    state_path=self.paths.state_file,
+                    repo=self.repo_root.name,
+                    pr_number=pr_number,
+                )
                 if result.outcome != TransitionOutcome.APPLIED:
                     label_error = {
                         "edge": "review_started",
@@ -4583,7 +4071,7 @@ class OrchestratorApp:
         message = "review packet generated"
         if label_error:
             message += f" (label update failed: {label_error.get('outcome', label_error)})"
-        return CommandResult(
+        return _CommandResult(
             True,
             message,
             {
@@ -4610,14 +4098,14 @@ class OrchestratorApp:
         *,
         now: datetime | None = None,
         launch_lock: FleetLaunchLock | None = None,
-    ) -> CommandResult:
+    ) -> _CommandResult:
         """Launch reviewer sessions concurrently for queued PRs.
 
         Issue #370: a deterministic loop stage that turns ``review_queue()```
         into launched, sidecar-tracked reviewer processes. Reviewers are
         launched through whichever harness ``self.config.reviewer.harness``
-        names (issue #1513: claude-code, devin-shell, or api -- see
-        ``_REVIEW_LAUNCHERS`` below); there is no provider-rate-limit
+        names (issue #1513: claude-code, devin-shell, or api -- the
+        ``review_launch._REVIEW_LAUNCHERS`` table); there is no provider-rate-limit
         governor here — only an optional local-only process cap
         (``max_local_review_processes``) to protect the host from too many
         concurrent reviewer worktrees.
@@ -4645,7 +4133,7 @@ class OrchestratorApp:
         byte-identical; tests can freeze it and assert exact equality instead
         of a wall-clock-tolerance proximity check.
         """
-        resolved_now = now if now is not None else datetime.now(UTC)
+        resolved_now = now if now is not None else self.host.clock.now()
         reviews_dir = self._layout.reviews_dir
 
         # Run the verdict-reaper and orphan/stalled sweeps BEFORE the quota
@@ -4693,7 +4181,7 @@ class OrchestratorApp:
             # to "nothing happened at all" — and mark ``disabled`` so a
             # caller doesn't have to string-match the message to tell this
             # apart from a real dispatch pass.
-            return CommandResult(
+            return _CommandResult(
                 True,
                 "review dispatch disabled",
                 {
@@ -4734,7 +4222,7 @@ class OrchestratorApp:
             if is_reviewer_quota_exhausted(quota_state) and not is_reviewer_probe_ready(
                 quota_state
             ):
-                return CommandResult(
+                return _CommandResult(
                     True,
                     "review dispatch deferred: reviewer quota exhausted, probe not ready",
                     {
@@ -4802,7 +4290,7 @@ class OrchestratorApp:
                 else:
                     dry_selected_after_approval.append(c)
             dry_selected = dry_selected_after_approval
-            return CommandResult(
+            return _CommandResult(
                 True,
                 f"dry-run: would dispatch {len(dry_selected)} reviewer(s)",
                 {
@@ -4851,7 +4339,7 @@ class OrchestratorApp:
                         "reviewer_quota": {
                             **(state.get("reviewer_quota") or {}),
                             "consecutive_probe_failures": 0,
-                            "last_probe_cleared_at": datetime.now(UTC)
+                            "last_probe_cleared_at": self.host.clock.now()
                             .isoformat()
                             .replace("+00:00", "Z"),
                         },
@@ -4908,7 +4396,7 @@ class OrchestratorApp:
             _deferred_normal, deferred_rescue_results = self._partition_rescue_candidates(
                 deferred_candidates
             )
-            return CommandResult(
+            return _CommandResult(
                 True,
                 "review dispatch deferred: reviewer quota exhausted, probe not ready",
                 {
@@ -4928,7 +4416,7 @@ class OrchestratorApp:
         queue_result = self.review_queue()
         candidates = queue_result.data.get("queue", [])
         if not candidates:
-            return CommandResult(
+            return _CommandResult(
                 True,
                 "review dispatch: no candidates",
                 {
@@ -4952,7 +4440,7 @@ class OrchestratorApp:
         # self.config.rescue.enabled -- see _partition_rescue_candidates).
         candidates, rescue_review_results = self._partition_rescue_candidates(candidates)
         if not candidates:
-            return CommandResult(
+            return _CommandResult(
                 True,
                 f"review dispatch: {len(rescue_review_results)} rescue review(s) "
                 "processed, no normal candidates",
@@ -5003,7 +4491,7 @@ class OrchestratorApp:
         # the fleet count is read; held through claim -> launch (caller releases).
         lock_deferral = fleet_review_lock_deferral(self, launch_lock)
         if lock_deferral is not None:
-            return CommandResult(
+            return _CommandResult(
                 True,
                 "review dispatch deferred: fleet_lock_held",
                 fleet_lock_held_result_data(
@@ -5415,7 +4903,6 @@ class OrchestratorApp:
         # ``self.config.reviewer.model`` below instead, exactly as before.
         reviewer_harness = role_cfg.reviewer.harness  # issue #2086: the selected chain entry
         reviewer_adapter_settings = self._adapter_settings(adapter=reviewer_harness)
-        reviewer_launcher = _REVIEW_LAUNCHERS.get(reviewer_harness)
         for candidate in selected:
             pr_number = candidate["pr"]
             issue_number = candidate["issue"]
@@ -5477,23 +4964,8 @@ class OrchestratorApp:
                 # an actual dispatch pass. adapters.py's worker-dispatch path
                 # (_run_claude_code_adapter) already forwards config the same
                 # way.
-                if reviewer_launcher is None:
-                    # Unreachable in production: ReviewerRoleConfig.__post_init__
-                    # already restricts reviewer.harness to
-                    # harnesses.REVIEWER_HARNESSES, which _REVIEW_LAUNCHERS'
-                    # keys are asserted equal to at import time. Guarded
-                    # anyway so a config object built directly (bypassing
-                    # validation, e.g. in a test) fails as a per-PR error
-                    # value rather than a raise.
-                    failed.append(
-                        {
-                            "pr": pr_number,
-                            "error": f"unsupported reviewer harness: {reviewer_harness!r}",
-                        }
-                    )
-                    continue
-
-                record = reviewer_launcher(
+                record = self.host.launch.launch(
+                    reviewer_harness,
                     pr_number=pr_number,
                     branch=branch,
                     prompt_path=prompt_path,
@@ -5632,7 +5104,7 @@ class OrchestratorApp:
                     state["prs"][str(pr_number)] = rolled_back
 
             if quota_hit:
-                now_dt = datetime.now(UTC)
+                now_dt = self.host.clock.now()
                 # Issue #612: parse the provider's named reset clock time
                 # from the launch error (e.g. "resets 1:20am
                 # (America/Los_Angeles)") so the backoff targets the stated
@@ -5646,6 +5118,11 @@ class OrchestratorApp:
                     now_dt,
                     reset_at=reset_at,
                     adapter_kind=role_selection.selection_adapter_kind(role_sel),
+                    # The hit lands on the entry selection launched (#2279):
+                    # stamp it so a fallback's window can never pin the
+                    # recovered primary on the same adapter.
+                    harness=role_sel.entry.harness if role_sel.entry is not None else None,
+                    model=role_sel.entry.model if role_sel.entry is not None else None,
                 )
                 role_selection.record_launch_quota_hit(
                     role_sel, quota_record.get("throttled_until")
@@ -5730,7 +5207,7 @@ class OrchestratorApp:
         }
         data.update(local_cap.report_fields())
         data.update(selection.fleet_report_fields())
-        return CommandResult(ok, message, data)
+        return _CommandResult(ok, message, data)
 
     # Re-arm field sets live in unescalate_reset_fields.py (extracted under the
     # #1442 ratchet); the aliases keep ``self._...`` call sites and tests intact.
@@ -5739,10 +5216,6 @@ class OrchestratorApp:
     _REWORK_BUDGET_RESET_BY_ESCALATION_REASON = REWORK_BUDGET_RESET_BY_ESCALATION_REASON
     _ISSUE_BUDGET_RESET_BY_ESCALATION_REASON = ISSUE_BUDGET_RESET_BY_ESCALATION_REASON
 
-    # Deliberately NOT @_guard_state_lock: merge_check takes no state lock, and
-    # the guard's contract is to return a *successful* skip (ok=True) when the
-    # lock is held. On an authorization preflight that would be fail-open —
-    # "cannot tell" rendered as "yes". Keep this method lock-free and pure.
     @_guard_state_lock
     def merge_ready(
         self,
@@ -5750,7 +5223,7 @@ class OrchestratorApp:
         *,
         merge: bool | None = None,
         merge_train_head: int | None = None,
-    ) -> CommandResult:
+    ) -> _CommandResult:
         """Evaluate one PR and act on the verdict; the stages live in ``merge_path``.
 
         The dry-run gate stays here, above any state lock: under ``--dry-run`` the
@@ -5778,7 +5251,7 @@ class OrchestratorApp:
         merge: bool | None = None,
         now: datetime | None = None,
         deadline_exceeded: Callable[[], bool] | None = None,
-    ) -> CommandResult:
+    ) -> _CommandResult:
         # ``now`` (issue #822, extended #828) is this pass's injectable clock.
         # ``_loop_body`` forwards it, unresolved, to every cadence-gated lane
         # that samples wall-clock time: dead-session throttle classification

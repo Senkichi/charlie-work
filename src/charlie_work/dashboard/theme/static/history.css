@@ -1,0 +1,96 @@
+/* The History page (pages/history*.py). Served after now.css (shared header frame) and
+   now-page.css, whose body.now rules give the fluid type scale (--n-*), the button reset,
+   .shell, .panel, .seg, .chartbox, .tip, .drawer and .hbar; History is <body class="now
+   hist">. Colour has ONE job, as on Now: --lj-warn marks a metric that moved the wrong way
+   (its card's change line, the headline's change, the tab dot); everything else is ink at
+   full or dimmed brightness. Tokens only, no inline style (CSP): variable geometry is an
+   SVG attribute. Fills the window from 1151px; narrower, the cards wrap above the chart. */
+
+/* ---- controls: tabs left, range right ---- */
+.hbody { display: flex; flex-direction: column; gap: var(--n-gap); min-height: 0; flex: 1; }
+.hctl { display: flex; align-items: center; gap: 0.6em 1.2em; flex-wrap: wrap; }
+.hctl .spacer { flex: 1; }
+.htabs { display: flex; flex-wrap: wrap; gap: 0.2em 1em; }
+body.hist .htabs button {
+  font-family: var(--lj-serif); font-size: var(--n-h); color: var(--lj-gray-text);
+  padding-bottom: 0.1em; border-bottom: 2px solid var(--lj-page);
+}
+body.hist .htabs button:hover { color: var(--lj-ink); }
+body.hist .htabs button[aria-pressed="true"] { color: var(--lj-ink); border-bottom-color: var(--lj-ink); }
+.htabs .flag {
+  display: inline-block; width: 0.42em; height: 0.42em; border-radius: 50%;
+  background: var(--lj-warn); vertical-align: super; margin-left: 0.2em;
+}
+.hmeta { margin: 0; font-size: var(--n-small); color: var(--lj-gray-text); }
+.sr {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+}
+
+/* ---- the two columns ---- */
+.hgrid {
+  display: grid; gap: var(--n-gap); min-height: 0; flex: 1;
+  grid-template-columns: minmax(300px, 1fr) minmax(0, 2.6fr);
+}
+#hist[aria-busy="true"] .hgrid { opacity: 0.4; }
+.hcards { overflow: auto; gap: 0; padding: clamp(8px, 0.8vw, 16px); }
+.hmain { min-height: 0; }
+@media (min-width: 1151px) {
+  .hcards, .hmain { min-height: 0; }
+}
+@media (max-width: 1150px) {
+  .hgrid { grid-template-columns: minmax(0, 1fr); }
+  .hcards { overflow: visible; }
+  .hcards .cardlist { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); }
+  .hmain .chartbox { flex: none; height: 45vh; min-height: 260px; }
+}
+
+/* ---- metric cards ---- */
+body.hist button.card {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 0.1em 1em; width: 100%;
+  padding: 0.75em 0.7em; border-radius: 12px; border: 1px solid var(--lj-card);
+}
+body.hist button.card:hover { border-color: var(--lj-hair); }
+body.hist button.card[aria-pressed="true"] { border-color: var(--lj-ink); }
+body.hist button.card:focus-visible { outline: 2px solid var(--lj-ink); outline-offset: 1px; }
+.card .cname { font-weight: 600; grid-column: 1; grid-row: 1; }
+.card .cval { grid-column: 2; grid-row: 1 / span 2; text-align: right; font-size: var(--n-num); line-height: 1; align-self: center; }
+.card .cdelta { grid-column: 1; grid-row: 2; font-size: var(--n-small); color: var(--lj-gray-text); }
+.card[data-bad] .cdelta { color: var(--lj-warn); font-weight: 600; }
+.card .cstat { grid-column: 1; grid-row: 3; font-size: var(--n-small); color: var(--lj-gray-text); align-self: end; }
+.card svg.spark { grid-column: 2; grid-row: 3; width: 7em; height: 1.8em; overflow: visible; }
+.card .spark path { fill: none; stroke: var(--lj-ink); stroke-width: 1.5; vector-effect: non-scaling-stroke; stroke-linecap: round; }
+.card[data-state="missing"] .cval, .card[data-state="error"] .cval { color: var(--lj-gray-text); }
+
+/* ---- the selected metric ---- */
+.mhead h2 { font-family: var(--lj-serif); font-weight: 500; font-size: var(--n-h); margin: 0; line-height: 1.25; }
+.mhead .vs { color: var(--lj-gray-text); font-family: var(--lj-sans); font-size: var(--n-body); }
+.mhead .vs[data-bad] { color: var(--lj-warn); font-weight: 600; }
+.mhead .sub { color: var(--lj-gray-text); }
+.mhead .takeaway { color: var(--lj-ink); }
+.hmain .chartbox { min-height: 240px; }
+.chartbox .cline { fill: none; stroke: var(--lj-ink); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+.chartbox .cline.approx { stroke-dasharray: 6 4; }
+.chartbox .cdot { fill: var(--lj-ink); }
+.chartbox .cpick { stroke: var(--lj-gray-text); stroke-dasharray: 2 3; }
+.chartbox .chit { fill: var(--lj-card); fill-opacity: 0; }
+.lower { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 340px), 1fr)); gap: var(--n-gap); }
+.hdrawer h3 {
+  font-size: var(--n-small); letter-spacing: 0.1em; text-transform: uppercase;
+  color: var(--lj-gray-text); font-weight: 500; margin: 0 0 0.5em; font-family: var(--lj-sans);
+}
+.hdrawer .hbar { grid-template-columns: minmax(90px, 11em) 1fr 4em; }
+.hdrawer .hb-fill { fill: var(--lj-gray-text); }
+.hdrawer .hbar.lead .hb-fill { fill: var(--lj-ink); }
+.hbucket { flex: none; }
+body.hist .linkish { text-decoration: underline; color: var(--lj-ink); }
+.mlower { display: flex; flex-direction: column; gap: 0.6em; }
+.cov-note { margin: 0; font-size: var(--n-small); color: var(--lj-gray-text); }
+.hcards .cov-note { padding: 0.75em 0.7em 0; }
+.missing { color: var(--lj-gray-text); }
+
+/* ---- rollup not available ---- */
+.hunavail { padding: 0.75em 0.7em; }
+.hunavail h2 { font-family: var(--lj-serif); font-weight: 500; font-size: var(--n-h); margin: 0 0 0.3em; }
+.hunavail p { margin: 0.3em 0; }
+.hunavail .why { color: var(--lj-gray-text); font-size: var(--n-small); }

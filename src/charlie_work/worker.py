@@ -7,6 +7,7 @@ adapter-iteration loops in workflow.py into a single abstraction point.
 
 import json
 import logging
+import shutil
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from enum import Enum
@@ -16,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from .claude_code import (
+    CLAUDE_RECORD_KINDS,
     ClaudeWorkerRecord,
     _sidecar_path as claude_sidecar_path,
     read_worker_records,
@@ -31,7 +33,7 @@ from .post_mortem import (
     _events_path_from_log,
     real_activity_for_worker,
 )
-from .process_utils import is_pid_alive
+from . import host as _host
 
 logger = logging.getLogger(__name__)
 
@@ -346,15 +348,13 @@ class WorkerView:
         """
         if self.adapter_kind == "devin":
             sidecar_path = devin_sidecar_path(sessions_dir, self.issue_number)
-        elif self.adapter_kind == "claude-code":
-            sidecar_path = claude_sidecar_path(sessions_dir, self.issue_number)
-        elif self.adapter_kind == "api":
-            # api sidecars share the claude-code sidecar-path derivation,
-            # routed through the adapter_kind-aware _sidecar_path helper so the
-            # .api.json suffix is selected.
-            sidecar_path = claude_sidecar_path(sessions_dir, self.issue_number, "api")
+        elif self.adapter_kind in CLAUDE_RECORD_KINDS:
+            # api/opencode sidecars share the claude-code sidecar-path
+            # derivation; the adapter_kind-aware _sidecar_path helper selects
+            # the .api.json / .opencode.json suffix.
+            sidecar_path = claude_sidecar_path(sessions_dir, self.issue_number, self.adapter_kind)
             # Best-effort spend settlement before the sidecar is unlinked (issue #480).
-            if api_config is not None and state_dir is not None:
+            if self.adapter_kind == "api" and api_config is not None and state_dir is not None:
                 self._settle_api_budget(sidecar_path, api_config, state_dir)
         else:
             # Unknown adapter kind - nothing to reap
@@ -365,6 +365,11 @@ class WorkerView:
         except OSError:
             # Best-effort cleanup - don't fail if unlink fails
             pass
+        if self.adapter_kind == "opencode":
+            # The per-worker opencode data dir (db, transcripts) dies with it.
+            from .opencode_log import opencode_data_dir
+
+            shutil.rmtree(opencode_data_dir(sessions_dir, self.issue_number), ignore_errors=True)
 
         self._remove_writer_marker()
 
@@ -739,6 +744,23 @@ def classify_worker_health(
             tail = log_text[-2048:] if len(log_text) > 2048 else log_text
             if _provider_suspension_in_tail(tail):
                 has_provider_suspension = True
+        else:
+            # opencode: a usage-limited provider makes opencode sleep out
+            # retry-after (hours) behind one logged ERROR record. Kill on the
+            # first quota record so the dead reap classifies quota_exhausted and
+            # restricts the chain entry within one pass, instead of ~37 min of
+            # stall + rate-limit defer while every failover launches onto the
+            # same exhausted account. Only the profile's digest (opencode's own
+            # provider-error records since the last progress event) is matched,
+            # never tool output; transient 429s are left to opencode's retry.
+            from . import worker_fate
+            from .throttle_signatures import match_quota_tail
+
+            profile = worker_fate.profile_for(view.adapter_kind)
+            if profile is not None and profile.log_digest is not None:
+                digest = profile.log_digest(log_text)
+                if digest and match_quota_tail(digest, config.runtime.quota_error_markers):
+                    has_provider_suspension = True
     except OSError:
         pass
 
@@ -973,6 +995,12 @@ def iter_workers(sessions_dir: Path, *, repo_key: str = "") -> list[WorkerView]:
     for record in read_worker_records(sessions_dir, adapter_kind="api"):
         workers.append(_from_claude_record(record, repo_key))
 
+    # Read opencode-worker sidecars (issue-<n>.opencode.json): same
+    # ClaudeWorkerRecord shape, written by launch_claude_worker for the
+    # opencode harness (opencode_worker.launch_opencode_worker).
+    for record in read_worker_records(sessions_dir, adapter_kind="opencode"):
+        workers.append(_from_claude_record(record, repo_key))
+
     return workers
 
 
@@ -984,7 +1012,7 @@ def _alive_review_worker_issue_numbers(sessions_dir: Path) -> set[int]:
     fixers. A PR whose reviewer process has not exited is deferred until a
     later pass, so its isolated review checkout is not torn down mid-session.
     """
-    return {w.issue_number for w in iter_workers(sessions_dir) if w.is_alive()}
+    return _host.current().sessions.live_issue_numbers(sessions_dir)
 
 
 def _log_activity_advanced(
@@ -1049,10 +1077,8 @@ def update_worker_log_stat(
 
     if worker.adapter_kind == "devin":
         sidecar_path = devin_sidecar_path(sessions_dir, worker.issue_number)
-    elif worker.adapter_kind == "claude-code":
-        sidecar_path = claude_sidecar_path(sessions_dir, worker.issue_number)
-    elif worker.adapter_kind == "api":
-        sidecar_path = claude_sidecar_path(sessions_dir, worker.issue_number, "api")
+    elif worker.adapter_kind in CLAUDE_RECORD_KINDS:
+        sidecar_path = claude_sidecar_path(sessions_dir, worker.issue_number, worker.adapter_kind)
     else:
         # Unknown adapter kind - nothing to update
         return
@@ -1103,8 +1129,8 @@ def update_worker_log_stat(
         from .devin_shell import _write_json
 
         _write_json(sidecar_path, payload)
-    elif worker.adapter_kind in ("claude-code", "api"):
-        # api sidecars share the claude-code atomic-write helper (same on-disk
+    elif worker.adapter_kind in CLAUDE_RECORD_KINDS:
+        # api/opencode sidecars share the claude-code atomic-write helper (same on-disk
         # record shape, just a different filename suffix).
         from .claude_code import _write_json_atomic
 
@@ -1268,7 +1294,9 @@ def issue_worker_liveness(
     started_at_dt = _state_session_start_dt(issue_state)
     started_at_iso = started_at_dt.isoformat() if started_at_dt is not None else None
 
-    if not is_pid_alive(worker_pid, issue_state.get("worker_process_start_time")):
+    if not _host.current().probe.is_alive(
+        worker_pid, issue_state.get("worker_process_start_time")
+    ):
         return IssueWorkerLiveness(
             live=False,
             reason=f"state worker_pid={worker_pid} is not alive",

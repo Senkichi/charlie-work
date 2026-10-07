@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any
 
 from charlie_work import layout
+from charlie_work.atomic_write import write_json_atomic
 from charlie_work.instrumentation import log_event
 from charlie_work.state import StateLockBusy, state_lock
 
@@ -71,10 +72,7 @@ def _read_streaks(path: Path) -> dict[str, int]:
 
 
 def _write_streaks(path: Path, streaks: dict[str, int]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(streaks, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    tmp.replace(path)
+    write_json_atomic(path, streaks)
 
 
 def _advance_streak(state_file: Path, lane: str, deferred: bool) -> int:

@@ -20,6 +20,15 @@ from typing import Any, Mapping
 
 from ..checks import CheckSummary
 
+# ``state.prs[n]`` fields that live only while a PR sits in the merge queue: the
+# dwell clock (#1401) and the last-full-check stamp (#2440). One list, so the
+# accounting write and the reconcile fix clear exactly the same set.
+MERGEQUEUE_DWELL_FIELDS: tuple[str, ...] = (
+    "mergequeue_since",
+    "mergequeue_head_sha",
+    "mergequeue_checked_at",
+)
+
 
 class FactNotGathered(ValueError):
     """A decide function needed a fact the gather step left unread.
@@ -117,6 +126,9 @@ class PersistedPr:
     stale_base_deferrals: int = 0
     mergequeue_since: str | None = None
     mergequeue_head_sha: str | None = None
+    # Stamped by every full merge_ready pass that leaves the PR queued; the
+    # queue skip (#2440) forces a re-check once it is 30 minutes old.
+    mergequeue_checked_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -134,6 +146,9 @@ class MergePathConfig:
     required_checks: tuple[str, ...] = ()
     readiness_no_ci_minutes: int = 15
     merge_strategy: str = "squash"
+    # TIS-CW-7: Aviator's skip-line label (None = off) and the priority label prefix.
+    skip_line_label: str | None = None
+    priority_prefix: str = ""
 
 
 # --------------------------------------------------------------------------- #

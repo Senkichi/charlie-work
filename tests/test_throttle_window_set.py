@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _src_ast import parsed, source_files, source_text
 
 from _fakes_github import FakeGitHub
 from _orphan_sweep_fixtures import _dead_worker_rework_bed, _run_orphan_sweep
@@ -86,17 +87,22 @@ _RATE_LIMIT_LOG = (
 def test_set_throttled_until_emits_event_with_full_payload() -> None:
     """A changed window emits exactly one ``throttle_window_set`` whose
     payload is the audit record the issue specifies: previous value, new
-    value, reason, adapter_kind, and the caller's ``source``."""
+    value, reason, adapter_kind, the stamped role ``(harness, model)`` that
+    died (issue #2279), and the caller's ``source``."""
     new_value = _future()
     state = set_throttled_until(
         empty_state(),
         new_value,
         reason="rate_limited",
         adapter_kind="devin",
+        harness="devin-shell",
+        model="swe-2-high",
         source="test_source",
     )
 
     assert state["throttled_until"] == new_value
+    assert state["throttle_harness"] == "devin-shell"
+    assert state["throttle_model"] == "swe-2-high"
     events = _throttle_window_events(state)
     assert len(events) == 1
     assert events[0]["payload"] == {
@@ -104,6 +110,8 @@ def test_set_throttled_until_emits_event_with_full_payload() -> None:
         "throttled_until": new_value,
         "reason": "rate_limited",
         "adapter_kind": "devin",
+        "harness": "devin-shell",
+        "model": "swe-2-high",
         "source": "test_source",
     }
 
@@ -238,8 +246,11 @@ def test_every_src_set_throttled_until_call_site_passes_source_literal() -> None
     writer names itself."""
     src_root = Path(__file__).parents[1] / "src" / "charlie_work"
     violations: list[str] = []
-    for path in sorted(src_root.rglob("*.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    for path in source_files(src_root):
+        text = source_text(path)
+        if "set_throttled_until" not in text and "persist_failure" not in text:
+            continue
+        tree = parsed(path)
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue

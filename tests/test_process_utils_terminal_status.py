@@ -36,7 +36,7 @@ def test_write_worker_terminal_status_round_trips_and_is_atomic(tmp_path: Path) 
     )
 
     assert path.exists()
-    assert not path.with_suffix(path.suffix + ".tmp").exists()
+    assert not list(tmp_path.glob("*.tmp"))
 
     payload = json.loads(path.read_text(encoding="utf-8"))
     assert payload == {

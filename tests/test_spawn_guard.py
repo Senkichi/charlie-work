@@ -10,6 +10,7 @@ import re
 from pathlib import Path
 
 import charlie_work
+from _src_ast import parsed, source_files, source_text
 
 HELPER_NAMES = {"no_console_window_kwargs", "hidden_console_kwargs"}
 # Module name components from which the spawn helpers may be imported via a
@@ -293,10 +294,10 @@ def _source_package_dir() -> Path:
 def find_spawn_guard_violations(root: Path) -> list[str]:
     """Statically scan ``root/**/*.py`` and return actionable violation messages."""
     violations: list[str] = []
-    for path in sorted(root.rglob("*.py")):
-        source = path.read_text(encoding="utf-8")
+    for path in source_files(root):
+        source = source_text(path)
         try:
-            tree = ast.parse(source)
+            tree = parsed(path)
         except SyntaxError as exc:
             violations.append(f"{path}:{exc.lineno}: syntax error while scanning")
             continue

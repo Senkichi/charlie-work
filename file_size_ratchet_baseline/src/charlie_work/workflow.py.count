@@ -1,8 +1,8 @@
-6000
-# Issue #1971 / PR #1999 rework: the merged #2049 worker-fate wiring plus
-# this PR's pre-lock park-drain call site grew the live count to 8621, past
-# the 8600 mark. The added behavior lives in the domain modules
-# (local_work_park.py / dead_dispatched_timer.py / orphaned_worker_sweep.py)
-# -- what grew here is the call-site glue the no-PR sweep needs, which the
-# extraction remedy cannot shrink further. Reviewed mark raised to the
-# next MARK_QUANTUM multiple per the hand-raise rule.
+5400
+# Issue #2226 rework: the ready_observed intake block plus a base-branch
+# merge had pushed the live count past the 5400 mark. Rather than keep the
+# hand-raise, the ``intake`` method was extracted verbatim to
+# orchestration/state_intake.py (the canonical delegate move, per the
+# #1632/#1645-#1647 lineage) and the new-episode computation moved into
+# labels.ready_observed_due. Live count fell to 5286, so the mark returns
+# to the previous 5400 per the lower-only refresh rule.

@@ -24,18 +24,19 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 import subprocess
-import sys
-import time
 import uuid
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from charlie_work.process_utils import CpuPriority, parse_proc_stat_starttime, popen_worker
+from charlie_work import process_utils as _process_utils
+from charlie_work.ledger_context import ledger_env
+from charlie_work.process_utils import CpuPriority, popen_worker
+from . import launch_events
+from .atomic_write import write_json_atomic
 from .claude_code import _events_path, _rotate_old_log
 from .config import OrchestratorConfig
 from .devin_failure_classification import (  # noqa: F401 (deliberate re-export; #1442 extraction keeps devin_shell under its mark)
@@ -56,6 +57,7 @@ from .env_sanitize import resolve_pytest_cap, resolve_uv_no_sync, sanitize_env
 from .post_mortem import merge_attempt_snapshot
 from .state import _canonical_started_at, utc_now
 from .subprocess_runner import RunResult, run_captured
+from .attempt_resume import apply_resume_notice
 from .worktree import (
     LiveWorkerRedispatchError,
     ReworkBranchConflictError,
@@ -71,7 +73,6 @@ from .worktree import (
     write_worktree_marker,
 )
 
-_WIN_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 
 logger = logging.getLogger(__name__)
 
@@ -196,12 +197,7 @@ def _read_sidecar_inconclusive_count(sessions_dir: Path, issue_number: int) -> i
 
 
 def _write_json(path: Path, value: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    with tmp_path.open("w", encoding="utf-8") as handle:
-        json.dump(value, handle, indent=2, sort_keys=True)
-        handle.write("\n")
-    tmp_path.replace(path)
+    write_json_atomic(path, value)
 
 
 def _render_command(
@@ -312,6 +308,27 @@ def launch_devin_session(
             _read_sidecar_inconclusive_count(sessions_dir, issue_number),
         )
 
+    # Issue #2246: every error record produced below emits exactly one
+    # launch_failed event at the seam. State-dir resolution is a pure path
+    # computation -- no event is written on the success path. A reviewer's
+    # ``issue_number`` is really the PR number, so it lands on ``pr_number``.
+    launch_state_path = launch_events.state_path_for(repo_root, config)
+
+    def _emit_launch_failed(
+        error_class: str, error: str, *, failure_kind: str | None = None
+    ) -> None:
+        launch_events.emit_launch_failed(
+            launch_state_path,
+            role="reviewer" if review else "worker",
+            harness="devin-shell",
+            model=worker_model,
+            issue_number=None if review else issue_number,
+            pr_number=issue_number if review else None,
+            error_class=error_class,
+            error=error,
+            failure_kind=failure_kind,
+        )
+
     # --- worktree creation ---------------------------------------------------
     try:
         if review:
@@ -388,6 +405,11 @@ def launch_devin_session(
             else 0,
         )
         _write_json(_sidecar_path(sessions_dir, issue_number), record.to_dict())
+        _emit_launch_failed(
+            launch_events.LAUNCH_ERR_WORKTREE,
+            record.error or "",
+            failure_kind=failure_kind,
+        )
         return record
 
     def _teardown_worktree() -> None:
@@ -405,7 +427,7 @@ def launch_devin_session(
                 repo_root, worktree.path, force=True, branch=None if rework else branch
             )
 
-    def _fail(error: str) -> SessionRecord:
+    def _fail(error: str, *, error_class: str) -> SessionRecord:
         # Shared by the three post-worktree-creation failure paths below
         # (rework-conflict-notice, command-rendering, env-sanitization): each
         # already called _teardown_worktree() and just needs an identically
@@ -426,6 +448,7 @@ def launch_devin_session(
             error=error,
         )
         _write_json(_sidecar_path(sessions_dir, issue_number), record.to_dict())
+        _emit_launch_failed(error_class, error)
         return record
 
     # A redispatch may have just preserved the prior attempt's branch tip
@@ -451,7 +474,26 @@ def launch_devin_session(
             )
         except OSError as exc:
             _teardown_worktree()
-            return _fail(f"failed to append rework conflict notice to prompt file: {exc}")
+            return _fail(
+                f"failed to append rework conflict notice to prompt file: {exc}",
+                error_class=launch_events.LAUNCH_ERR_PROMPT,
+            )
+
+    # Issue #2289: the worktree was seeded from a throttle-killed attempt's
+    # preserved work -- tell the worker to continue it, not restart.
+    if worktree.resumed_attempt is not None:
+        try:
+            existing_prompt = prompt_path.read_text(encoding="utf-8")
+            prompt_path.write_text(
+                apply_resume_notice(existing_prompt, worktree.resumed_attempt),
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            _teardown_worktree()
+            return _fail(
+                f"failed to append attempt-resume notice to prompt file: {exc}",
+                error_class=launch_events.LAUNCH_ERR_PROMPT,
+            )
 
     # --- command rendering (prompt_path is caller-supplied, lives outside wt) -
     launch_prompt_path = _write_devin_review_prompt(prompt_path) if review else prompt_path
@@ -465,7 +507,10 @@ def launch_devin_session(
         )
     except (KeyError, IndexError, ValueError) as exc:
         _teardown_worktree()
-        return _fail(f"command template rendering failed: {exc}")
+        return _fail(
+            f"command template rendering failed: {exc}",
+            error_class=launch_events.LAUNCH_ERR_RENDER,
+        )
 
     # Sanitize environment to prevent VIRTUAL_ENV leaks from the orchestrator,
     # then merge user-provided worker_env overrides on top (e.g. PYTEST_XDIST_AUTO_NUM_WORKERS).
@@ -479,9 +524,13 @@ def launch_devin_session(
         sanitized_env = sanitize_env(worktree.path)
     except OSError as exc:
         _teardown_worktree()
-        return _fail(f"failed to prepare worker environment: {exc}")
+        return _fail(
+            f"failed to prepare worker environment: {exc}",
+            error_class=launch_events.LAUNCH_ERR_ENV,
+        )
     worker_env_dict = {
         **sanitized_env,
+        **ledger_env("worker", issue_number),
         **{str(k): str(v) for k, v in (worker_env or {}).items()},
     }
     # Issue #646: resolve what sanitize_env()+worker_env actually settled on,
@@ -513,6 +562,7 @@ def launch_devin_session(
     except OSError as exc:
         _teardown_worktree()
         error = f"failed to launch devin: {exc}"
+        _emit_launch_failed(launch_events.LAUNCH_ERR_SPAWN, error)
 
     if pid is not None and error is None:
         # Issue #2052: devin-shell joins the terminal-record contract. The
@@ -632,67 +682,8 @@ def probe_devin(
 
 
 def _get_process_start_time(pid: int) -> float | None:
-    """Get the process creation time as a Unix timestamp in seconds.
-
-    Returns None if the process does not exist or the start time cannot be retrieved.
-    This is used to verify that a PID has not been recycled by the OS.
-
-    On Windows: Uses GetProcessTimes via ctypes to retrieve process creation time.
-    On POSIX: Reads /proc/<pid>/stat field 22 (starttime in clock ticks).
-    """
-    if sys.platform == "win32":
-        import ctypes
-        from ctypes import wintypes
-
-        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
-        handle = kernel32.OpenProcess(_WIN_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-        if not handle:
-            return None
-        try:
-            creation_time = wintypes.FILETIME()
-            exit_time = wintypes.FILETIME()
-            kernel_time = wintypes.FILETIME()
-            user_time = wintypes.FILETIME()
-            if not kernel32.GetProcessTimes(
-                handle,
-                ctypes.byref(creation_time),
-                ctypes.byref(exit_time),
-                ctypes.byref(kernel_time),
-                ctypes.byref(user_time),
-            ):
-                return None
-            # Convert FILETIME to Unix timestamp
-            # FILETIME is 100-nanosecond intervals since 1601-01-01
-            # Unix timestamp is seconds since 1970-01-01
-            # Difference between 1601-01-01 and 1970-01-01 is 11644473600 seconds
-            filetime = (creation_time.dwHighDateTime << 32) | creation_time.dwLowDateTime
-            unix_time = filetime / 10_000_000 - 11644473600
-            return unix_time
-        finally:
-            kernel32.CloseHandle(handle)
-    else:
-        # POSIX: read /proc/<pid>/stat
-        try:
-            with open(f"/proc/{pid}/stat", "r") as f:
-                stat = f.read()
-            starttime_ticks = parse_proc_stat_starttime(stat)
-            if starttime_ticks is None:
-                return None
-            # Convert to seconds: need system clock tick frequency
-            tick_hz = os.sysconf("SC_CLK_TCK")
-            if tick_hz <= 0:
-                tick_hz = 100  # Default fallback
-            # Get system uptime to convert to absolute time
-            try:
-                with open("/proc/uptime", "r") as f:
-                    uptime_seconds = float(f.read().split()[0])
-            except (OSError, ValueError, IndexError):
-                return None
-            # Process start time = current time - uptime + process starttime
-            boot_time = time.time() - uptime_seconds
-            return boot_time + (starttime_ticks / tick_hz)
-        except (OSError, ValueError, IndexError):
-            return None
+    """Process creation time as a Unix timestamp (delegates to ``process_utils``)."""
+    return _process_utils.get_process_start_time(pid)
 
 
 __all__ = [

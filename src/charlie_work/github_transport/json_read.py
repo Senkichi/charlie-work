@@ -58,6 +58,13 @@ class JsonRead:
     # -- execution -----------------------------------------------------------
 
     def execute(self, transport: GitHubTransport, owner: str, repo: str) -> Outcome:
+        if self.resource == "issue" and self.shape == "list" and len(self.labels) > 1:
+            # GraphQL ``issues(labels:)`` is OR; ``gh --label a --label b`` is AND.
+            # Refuse rather than return the silently-wrong superset; nothing is sent.
+            return _defect(
+                f"issue list with {len(self.labels)} labels is unsupported: "
+                "GraphQL matches any label (OR), gh matched all (AND)"
+            )
         try:
             if self.shape == "view":
                 return self._view(transport, owner, repo)
@@ -124,7 +131,7 @@ class JsonRead:
                     cursor = next_cursor
                 else:
                     return _defect(f"{name} exceeded {MAX_PAGES} pages with a next page present")
-        except pages_mod.IncompletePageError as exc:
+        except fields_mod.IncompletePageError as exc:
             return _defect(str(exc))
         return node
 
@@ -211,7 +218,10 @@ class JsonRead:
                 return _defect(f"no pull request #{self.number} in GraphQL response")
             assert isinstance(outcome, Response)
             contexts = pages_mod.dedupe_by_id([*contexts, *fields_mod.checks_contexts(node)])
-            cursor = fields_mod.checks_next_cursor(node)
+            try:
+                cursor = fields_mod.checks_next_cursor(node)
+            except fields_mod.IncompletePageError as exc:
+                return _defect(str(exc))
             if cursor is None:
                 return _with_body(outcome, fields_mod.normalize_checks(contexts, self.fields))
         return _defect(f"check contexts exceeded {MAX_PAGES} pages with a next page present")
@@ -236,7 +246,7 @@ _RUN_FIELDS = {
 
 
 def _is_file_name(workflow: str) -> bool:
-    return workflow.isdigit() or workflow.endswith((".yml", ".yaml"))
+    return workflow.isdigit() or workflow.lower().endswith((".yml", ".yaml"))
 
 
 @dataclass(frozen=True)
@@ -244,12 +254,16 @@ class RunListRead:
     """``gh run list --json F`` as a REST read (B1: a read).
 
     Without ``workflow`` it reads ``GET actions/runs``. With one it resolves
-    the workflow exactly as gh does (a numeric id or ``*.yml|*.yaml`` file name
-    is used as given; anything else is matched against the repo's workflow
-    names, and must match exactly one) and reads
+    the workflow exactly as gh does (a numeric id or ``*.yml|*.yaml`` file name,
+    suffix case-insensitive, is used as given; anything else is matched
+    case-insensitively against the names of the repo's workflows other than
+    those in state ``disabled_manually``, and must match exactly one) and reads
     ``GET actions/workflows/{id_or_file}/runs``. Either way ``branch``,
-    ``status`` and ``event`` are server-side filters and ``per_page`` is
-    ``min(limit, 100)``, so ``limit <= 100`` is one request. The repo-wide list
+    ``status`` and ``event`` are server-side filters, ``per_page`` is
+    ``min(limit, 100)`` so ``limit <= 100`` is one request, and
+    ``exclude_pull_requests=true`` is sent like gh does (no ``--json`` column
+    reads ``pull_requests``). A ``limit`` under 1 is refused up front: gh
+    rejects ``--limit < 1`` rather than listing nothing. The repo-wide list
     is never filtered client-side: it pages by offset over a list that keeps
     changing, and a shifted page repeats an entry. A ``limit`` over 100 pages
     the filtered endpoint and drops a repeated run id.
@@ -274,11 +288,16 @@ class RunListRead:
         unknown = [c for c in columns if c not in _RUN_FIELDS]
         if unknown:
             return _defect(f"unknown run field(s): {', '.join(unknown)}")
+        if self.limit < 1:
+            # gh rejects `run list --limit < 1`; refuse before any request.
+            return _defect(f"run list needs a --limit of at least 1, got {self.limit}")
         route = self._route(transport)
         if not isinstance(route, str):
             return route
-        per_page = max(1, min(self.limit, _PAGE))
-        filters: dict[str, Any] = {"per_page": per_page}
+        per_page = min(self.limit, _PAGE)
+        # gh sends exclude_pull_requests to shrink run-list payloads; no
+        # _RUN_FIELDS column reads pull_requests.
+        filters: dict[str, Any] = {"per_page": per_page, "exclude_pull_requests": "true"}
         for name, value in (
             ("branch", self.branch),
             ("status", self.status),
@@ -332,7 +351,11 @@ class RunListRead:
         ids = [
             w.get("id")
             for w in workflows
-            if isinstance(w, dict) and w.get("name") == self.workflow and w.get("id") is not None
+            if isinstance(w, dict)
+            and isinstance(w.get("name"), str)
+            and w["name"].casefold() == self.workflow.casefold()
+            and w.get("state") != "disabled_manually"
+            and w.get("id") is not None
         ]
         if len(ids) != 1:
             return _defect(f"{len(ids)} workflows named {self.workflow!r} (gh needs exactly one)")

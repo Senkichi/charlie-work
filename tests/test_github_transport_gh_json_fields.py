@@ -73,6 +73,7 @@ _ISSUE_CONSTANTS = [
 ]
 _PR_CONSTANTS = [
     pull_requests.PR_LIST_FIELDS,
+    pull_requests.PR_LIST_WITH_CHECKS_FIELDS,
     pull_requests.PR_VIEW_FIELDS,
     pull_requests.MERGED_PR_LIST_FIELDS,
     transport.RECONCILE_PR_FIELDS,
@@ -230,6 +231,51 @@ def test_status_context_is_a_check_named_by_its_context() -> None:
     assert g.normalize_checks(contexts, "name,state,bucket") == [
         {"name": "ci/x", "state": "PENDING", "bucket": "pending"}
     ]
+
+
+def test_status_context_selection_asks_for_description() -> None:
+    """gh selects ``description`` on StatusContext; without it ``pr checks
+    --json description`` normalizes every status context to ""."""
+    fragment = "... on StatusContext{context state targetUrl createdAt description}"
+
+    assert fragment in g.checks_document()
+    assert fragment in g.document_for("pr", "number,statusCheckRollup", "view")
+
+
+def test_status_context_description_is_emitted() -> None:
+    contexts = [
+        {
+            "__typename": "StatusContext",
+            "context": "ci/x",
+            "state": "SUCCESS",
+            "description": "build finished",
+        }
+    ]
+
+    assert g.normalize_checks(contexts, "name,description") == [
+        {"name": "ci/x", "description": "build finished"}
+    ]
+
+
+def test_checks_next_cursor_raises_on_a_next_page_without_an_end_cursor() -> None:
+    """``hasNextPage`` without ``endCursor`` is a contract violation, not the
+    end of the walk."""
+    node = {
+        "statusCheckRollup": {
+            "contexts": {"nodes": [], "pageInfo": {"hasNextPage": True, "endCursor": None}}
+        }
+    }
+
+    with pytest.raises(g.IncompletePageError):
+        g.checks_next_cursor(node)
+
+
+def test_checks_next_cursor_returns_none_on_the_last_page() -> None:
+    assert g.checks_next_cursor({"statusCheckRollup": None}) is None
+    info = {"hasNextPage": False, "endCursor": None}
+    node = {"statusCheckRollup": {"contexts": {"nodes": [], "pageInfo": info}}}
+
+    assert g.checks_next_cursor(node) is None
 
 
 # -- executor ---------------------------------------------------------------

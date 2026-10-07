@@ -33,7 +33,9 @@ def _local_gate_try_reuse(
     same merge bookkeeping.
     """
     paths = local_suite_runner.suite_gate_paths(self.paths.dispatches, int(pr_key))
-    reused = local_suite_runner.reusable_gate_result(paths, head_sha=gate_head, base_sha=gate_base)
+    reused = local_suite_runner.reusable_gate_result(
+        paths, head_sha=gate_head, base_sha=gate_base, suite_argv=argv
+    )
     if reused is None:
         return None
     pr_number = int(pr_key)

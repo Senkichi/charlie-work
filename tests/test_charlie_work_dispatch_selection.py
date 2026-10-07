@@ -16,6 +16,8 @@ import sys
 import time
 from pathlib import Path
 
+import pytest
+
 from _fakes_github import FakeGitHub
 from charlie_work.config import (
     DevinConfig,
@@ -479,7 +481,9 @@ def test_dispatch_excludes_issue_with_operator_queue_label(tmp_path: Path) -> No
     assert (123, "agent:in-progress") not in fake_gh.labels_added
 
 
-def test_dispatch_excludes_stalled_session_dry_run(tmp_path: Path) -> None:
+def test_dispatch_excludes_stalled_session_dry_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Test that dispatch excludes issues with stalled sessions (dry-run path)."""
     from datetime import UTC, datetime, timedelta
     from charlie_work.devin_shell import SessionRecord
@@ -519,6 +523,23 @@ def test_dispatch_excludes_stalled_session_dry_run(tmp_path: Path) -> None:
     )
     session_file.write_text(json.dumps(session_record.to_dict()), encoding="utf-8")
 
+    # Issue #2401: the stalled lane's KillOrphans request runs a real
+    # PowerShell ``Get-CimInstance Win32_Process`` enumeration on Windows --
+    # ~all of this test's runtime on the CI host. The sweep's result only
+    # feeds kill effects and event payloads that are suppressed under
+    # dry-run, so stub it through the same ``effects_sessions`` seam the
+    # stalled-session test modules patch. Recording the call also pins that
+    # the stalled lane still reaches the sweep through this seam.
+    from charlie_work.dead_worker_sweep import effects_sessions
+
+    orphan_sweep_calls: list[str] = []
+
+    def _record_orphan_sweep(worktree_path: str) -> list:
+        orphan_sweep_calls.append(worktree_path)
+        return []
+
+    monkeypatch.setattr(effects_sessions, "sweep_orphan_processes", _record_orphan_sweep)
+
     # Mock the liveness check to return True (simulating a live but stalled process).
     # Patch target is the single liveness seam, charlie_work.worker_fate.is_alive:
     # the stalled-detection path goes through worker.WorkerView.is_alive(), which
@@ -533,9 +554,12 @@ def test_dispatch_excludes_stalled_session_dry_run(tmp_path: Path) -> None:
     assert result.ok is True
     assert result.data["selected_count"] == 0
     assert result.data["stalled"] == [{"issue": 123, "pid": 99999, "health": "STALLED"}]
+    assert orphan_sweep_calls == [session_record.worktree_path]
 
 
-def test_dispatch_excludes_stalled_session_real(tmp_path: Path) -> None:
+def test_dispatch_excludes_stalled_session_real(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Test that dispatch excludes issues with stalled sessions (real dispatch path)."""
     from datetime import UTC, datetime, timedelta
     from charlie_work.devin_shell import SessionRecord
@@ -584,6 +608,20 @@ def test_dispatch_excludes_stalled_session_real(tmp_path: Path) -> None:
     )
     session_file.write_text(json.dumps(session_record.to_dict()), encoding="utf-8")
 
+    # Issue #2401: stub the stalled lane's orphan sweep at the same
+    # ``effects_sessions`` seam as the dry-run sibling above -- on Windows it
+    # spawns a real ``Get-CimInstance Win32_Process`` enumeration that
+    # dominates this test's runtime. The recording double also pins the seam.
+    from charlie_work.dead_worker_sweep import effects_sessions
+
+    orphan_sweep_calls: list[str] = []
+
+    def _record_orphan_sweep(worktree_path: str) -> list:
+        orphan_sweep_calls.append(worktree_path)
+        return []
+
+    monkeypatch.setattr(effects_sessions, "sweep_orphan_processes", _record_orphan_sweep)
+
     # Mock the liveness check to return True (simulating a live but stalled process)
     from unittest.mock import patch
 
@@ -595,6 +633,7 @@ def test_dispatch_excludes_stalled_session_real(tmp_path: Path) -> None:
     assert result.ok is True
     assert result.data["selected_count"] == 0
     assert result.data["stalled"] == [{"issue": 123, "pid": 99999}]
+    assert orphan_sweep_calls == [session_record.worktree_path]
 
 
 def test_dispatch_issues_reports_skipped(tmp_path: Path) -> None:

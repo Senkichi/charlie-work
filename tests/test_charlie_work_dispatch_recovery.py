@@ -25,6 +25,7 @@ from _rework_dispatch_fixtures import (
     _wg,
 )
 from charlie_work.claude_code import ClaudeWorkerRecord
+from charlie_work.host.fakes import FakeProcessProbe
 from charlie_work.config import (
     DevinConfig,
     DispatchConfig,
@@ -32,6 +33,7 @@ from charlie_work.config import (
     WatchdogConfig,
     WorkerRoleConfig,
 )
+from charlie_work.host.fakes import FakeWorkerLauncher
 from charlie_work.paths import runtime_paths
 from charlie_work.state import (
     load_state,
@@ -160,7 +162,7 @@ def test_dispatch_does_not_recover_dead_worker_with_open_pr(tmp_path: Path) -> N
 
 
 def test_dispatch_recovery_aborts_for_live_worker_and_restores_in_progress(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, fake_host
 ) -> None:
     """Issue #282: a recovery redispatch that detects a live worker must abort
     and restore the in-progress label, not clobber the worktree."""
@@ -172,7 +174,7 @@ def test_dispatch_recovery_aborts_for_live_worker_and_restores_in_progress(
             worktree_path=str(tmp_path / "wt"),
             prompt_path=str(tmp_path / "wt" / ".orchestrator-prompt.md"),
             command=("claude", "-p"),
-            pid=4242,
+            pid=4343,
             started_at="2026-07-02T00:00:00Z",
             log_path=str(tmp_path / "log"),
             error="pid_alive",
@@ -182,12 +184,11 @@ def test_dispatch_recovery_aborts_for_live_worker_and_restores_in_progress(
 
     monkeypatch.setattr("charlie_work.claude_code.launch_claude_worker", _fake_launch)
     # Issue #523: the live-worker slot count now verifies the recorded PID is
-    # actually alive at the OS level (is_pid_alive + process_start_time).
-    # Stub is_pid_alive so the dispatch-side result PID is treated as live,
-    # and stub _worker_pid_alive so the state.json worker_pid does not block
-    # candidate selection (the issue must be selectable to reach dispatch).
-    monkeypatch.setattr("charlie_work.workflow.is_pid_alive", lambda pid, start: True)
-    monkeypatch.setattr("charlie_work.workflow._worker_pid_alive", lambda entry: False)
+    # actually alive at the OS level (probe + process_start_time). One probe
+    # answers both reads now, so the averted record carries a distinct live
+    # PID (the one the adapter found) while state.json's recorded worker_pid
+    # reads dead — the issue must be selectable to reach dispatch.
+    fake_host(probe=FakeProcessProbe({4343: 1_234_567.0}))
     config = OrchestratorConfig(worker=WorkerRoleConfig(harness="claude-code"))
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -304,7 +305,7 @@ def test_dispatch_clears_stale_orphan_flagged_at(tmp_path: Path) -> None:
 
 
 def test_dispatch_fresh_worktree_foreign_writer_does_not_increment_dispatch_failed(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, fake_host
 ) -> None:
     """Issue #1393: a fresh dispatch that fails at launch with
     worktree_foreign_writer must NOT increment the dispatch_failed counter.
@@ -339,7 +340,7 @@ def test_dispatch_fresh_worktree_foreign_writer_does_not_increment_dispatch_fail
             for request in requests
         ]
 
-    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", fake_dispatch_sessions)
+    fake_host(worker_launch=FakeWorkerLauncher([fake_dispatch_sessions]))
 
     # First blocked launch: blocked_environment_at grows, dispatch_failed_at stays empty.
     result1 = app.dispatch(limit=1)
@@ -367,7 +368,7 @@ def test_dispatch_fresh_worktree_foreign_writer_does_not_increment_dispatch_fail
 
 
 def test_dispatch_fresh_blocked_environment_reap_resets_counter(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_host
 ) -> None:
     """Issue #1423: at the fresh-dispatch blocked-environment cap exhaustion,
     a successful foreign-writer reap resets ``blocked_environment_at`` and
@@ -420,7 +421,7 @@ def test_dispatch_fresh_blocked_environment_reap_resets_counter(
             for request in requests
         ]
 
-    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", fake_dispatch_sessions)
+    fake_host(worker_launch=FakeWorkerLauncher([fake_dispatch_sessions]))
     reap_calls: list[int] = []
 
     def _fake_reap(failed_result, _config, _state_file, issue_number, _sessions_dir=None):
@@ -441,7 +442,7 @@ def test_dispatch_fresh_blocked_environment_reap_resets_counter(
 
 
 def test_dispatch_fresh_blocked_environment_reap_cap_escalates(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_host
 ) -> None:
     """Issue #1423 review: once ``foreign_writer_reaps`` reaches
     ``max_foreign_writer_reaps``, the cap-exhaustion site escalates instead of
@@ -497,7 +498,7 @@ def test_dispatch_fresh_blocked_environment_reap_cap_escalates(
             for request in requests
         ]
 
-    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", fake_dispatch_sessions)
+    fake_host(worker_launch=FakeWorkerLauncher([fake_dispatch_sessions]))
 
     def _reap_must_not_run(
         _failed_result, _config, _state_file, _issue_number, _sessions_dir=None
@@ -628,11 +629,11 @@ def test_dispatch_stall_detection_called_once_per_dispatch(tmp_path: Path, monke
         "charlie_work.workflow._detect_and_handle_stalled_sessions", mock_stall_detection
     )
 
-    # Mock _count_live_sessions to return 0 (no live sessions)
-    def mock_count_live(sessions_dir, state_file=None):
+    # Mock the live-session counter to return 0 (no live sessions)
+    def mock_count_live(sessions_dir, state_file=None, kind=None):
         return 0
 
-    monkeypatch.setattr("charlie_work.workflow._count_live_sessions", mock_count_live)
+    monkeypatch.setattr("charlie_work.live_session_count.count_live_sessions", mock_count_live)
 
     config = OrchestratorConfig(
         dispatch=DispatchConfig(max_concurrent_sessions=2, default_limit=5),
@@ -742,7 +743,7 @@ def _seed_dead_dispatched_entry(state_file: Path, *, failure_kind: str | None) -
 
 
 def test_dispatch_claim_clears_dead_worker_failure_kind(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_host
 ) -> None:
     """Issue #1917: a fresh dispatch claim drops the previous death's
     classification — a stale provider-throttle stamp must not survive into
@@ -757,7 +758,7 @@ def test_dispatch_claim_clears_dead_worker_failure_kind(
     fake_gh.prs[0]["state"] = "CLOSED"
 
     _seed_dead_dispatched_entry(paths.state_file, failure_kind="rate_limited")
-    monkeypatch.setattr("charlie_work.workflow._worker_pid_alive", lambda entry: False)
+    fake_host(probe=FakeProcessProbe())
 
     def _fail(_repo_root, _manifest, _results, _settings, requests):
         return [
@@ -773,7 +774,7 @@ def test_dispatch_claim_clears_dead_worker_failure_kind(
             for request in requests
         ]
 
-    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", _fail)
+    fake_host(worker_launch=FakeWorkerLauncher([_fail]))
 
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
     app.dispatch(limit=1)
@@ -784,7 +785,7 @@ def test_dispatch_claim_clears_dead_worker_failure_kind(
 
 
 def test_dispatch_success_arm_clears_dead_worker_failure_kind(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_host
 ) -> None:
     """Issue #1917: the successful-dispatch arm drops a classification
     stamped between the claim and the upgrade — the new session owns the
@@ -798,7 +799,7 @@ def test_dispatch_success_arm_clears_dead_worker_failure_kind(
     fake_gh.prs[0]["state"] = "CLOSED"
 
     _seed_dead_dispatched_entry(paths.state_file, failure_kind=None)
-    monkeypatch.setattr("charlie_work.workflow._worker_pid_alive", lambda entry: False)
+    fake_host(probe=FakeProcessProbe())
 
     def _ok_then_stamp(_repo_root, _manifest, _results, _settings, requests):
         _stamp_dead_worker_failure_kind_mid_dispatch(paths.state_file, 123)
@@ -814,7 +815,7 @@ def test_dispatch_success_arm_clears_dead_worker_failure_kind(
             for request in requests
         ]
 
-    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", _ok_then_stamp)
+    fake_host(worker_launch=FakeWorkerLauncher([_ok_then_stamp]))
 
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
     app.dispatch(limit=1)
@@ -825,7 +826,7 @@ def test_dispatch_success_arm_clears_dead_worker_failure_kind(
 
 
 def test_dispatch_live_worker_arm_clears_dead_worker_failure_kind(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_host
 ) -> None:
     """Issue #1917: the live-worker recovery arm drops a mid-dispatch
     classification — the averted launch proves a live session owns the
@@ -838,9 +839,9 @@ def test_dispatch_live_worker_arm_clears_dead_worker_failure_kind(
     fake_gh.prs[0]["state"] = "CLOSED"
 
     _seed_dead_dispatched_entry(paths.state_file, failure_kind=None)
-    monkeypatch.setattr("charlie_work.workflow._worker_pid_alive", lambda entry: False)
-    # The averted launch's recorded PID reads alive -> live-worker arm.
-    monkeypatch.setattr("charlie_work.workflow.is_pid_alive", lambda pid, start: True)
+    # The averted launch's reported PID reads alive -> live-worker arm, while
+    # the seeded worker_pid (4242) reads dead so the issue stays selectable.
+    fake_host(probe=FakeProcessProbe({4343: 1_234_567.0}))
 
     def _averted_then_stamp(_repo_root, _manifest, _results, _settings, requests):
         _stamp_dead_worker_failure_kind_mid_dispatch(paths.state_file, 123)
@@ -854,13 +855,13 @@ def test_dispatch_live_worker_arm_clears_dead_worker_failure_kind(
                 ok=False,
                 error="pid_alive",
                 failure_kind="live_worker_redispatch_averted",
-                pid=4242,
+                pid=4343,
                 process_start_time=1_234_567.0,
             )
             for request in requests
         ]
 
-    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", _averted_then_stamp)
+    fake_host(worker_launch=FakeWorkerLauncher([_averted_then_stamp]))
 
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
     app.dispatch(limit=1)
@@ -871,12 +872,18 @@ def test_dispatch_live_worker_arm_clears_dead_worker_failure_kind(
 
 
 def test_dispatch_phantom_worker_arm_clears_dead_worker_failure_kind(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_host
 ) -> None:
     """Issue #1917: the phantom-worker arm (averted launch whose recorded
     PID is dead) drops a mid-dispatch classification — the pass frees the
     slot and starts a new epoch."""
     from charlie_work.adapters import SessionDispatchResult
+
+    # Issue #2262: the phantom lane's salvage probe needs a real git repo to
+    # prove the branch carries no commits (the verdict that permits requeue).
+    from _worktree_fixtures import _init_repo
+
+    _init_repo(tmp_path)
 
     config = OrchestratorConfig(worker=WorkerRoleConfig(harness="claude-code"))
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -884,9 +891,8 @@ def test_dispatch_phantom_worker_arm_clears_dead_worker_failure_kind(
     fake_gh.prs[0]["state"] = "CLOSED"
 
     _seed_dead_dispatched_entry(paths.state_file, failure_kind=None)
-    monkeypatch.setattr("charlie_work.workflow._worker_pid_alive", lambda entry: False)
-    # The averted launch's recorded PID reads dead -> phantom arm.
-    monkeypatch.setattr("charlie_work.workflow.is_pid_alive", lambda pid, start: False)
+    fake_host(probe=FakeProcessProbe())
+    # The averted launch's recorded PID reads dead via the probe -> phantom arm.
 
     def _averted_then_stamp(_repo_root, _manifest, _results, _settings, requests):
         _stamp_dead_worker_failure_kind_mid_dispatch(paths.state_file, 123)
@@ -906,7 +912,7 @@ def test_dispatch_phantom_worker_arm_clears_dead_worker_failure_kind(
             for request in requests
         ]
 
-    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", _averted_then_stamp)
+    fake_host(worker_launch=FakeWorkerLauncher([_averted_then_stamp]))
 
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
     app.dispatch(limit=1)

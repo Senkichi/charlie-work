@@ -64,9 +64,9 @@ def _setup(repo: Path, *, record: dict[str, Any], issue_extra: dict[str, Any] | 
     return gh, state_file, WriteGate(dry_run=False, state_path=state_file, repo="r")
 
 
-def _park(gh, repo, config, write_gate):
+def _park(gh, repo, config, write_gate, failure_kind: str | None = None):
     return park_unpublishable_work(
-        gh, config, repo, BRANCH, 7, {LabelConfig().in_progress}, "rate_limited", write_gate
+        gh, config, repo, BRANCH, 7, {LabelConfig().in_progress}, failure_kind, write_gate
     )
 
 
@@ -122,6 +122,8 @@ def test_committed_worker_still_parks_review_ready(repo: Path) -> None:
 
 
 def test_repeat_is_bounded_then_escalates(repo: Path) -> None:
+    """A classified non-throttle death still counts and escalates at the cap."""
+    failure_kind = "stalled"
     head = _git(repo, "rev-parse", BRANCH)
     config = OrchestratorConfig()
     gh, state_file, gate = _setup(
@@ -134,7 +136,7 @@ def test_repeat_is_bounded_then_escalates(repo: Path) -> None:
         },
     )
 
-    assert _park(gh, repo, config, gate) == (True, None)
+    assert _park(gh, repo, config, gate, failure_kind) == (True, None)
 
     state = load_state(state_file)
     issue = state["issues"]["7"]
@@ -143,3 +145,77 @@ def test_repeat_is_bounded_then_escalates(repo: Path) -> None:
     labels = LabelConfig()
     assert labels.operator_queue in _labels(gh)
     assert labels.review_ready not in _labels(gh)
+
+
+def _rearm_events(state: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        e.get("payload", e) for e in state["events"] if e["kind"] == "local_no_op_rework_rearmed"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("passed_kind", "stamped_kind"),
+    [
+        ("rate_limited", None),
+        ("quota_exhausted", None),
+        # The park edge got no kind, but the classifier stamped this epoch's
+        # entry: the locked stamp is the classification.
+        (None, "rate_limited"),
+    ],
+)
+def test_provider_throttle_death_rearms_without_counting(
+    repo: Path, passed_kind: str | None, stamped_kind: str | None
+) -> None:
+    """mdls #109 (2026-10-06): three throttled deaths escalated an issue no
+    worker ever attempted. A throttle death re-arms, never counts, never
+    escalates -- even with the counter already at the cap."""
+    head = _git(repo, "rev-parse", BRANCH)
+    config = OrchestratorConfig()
+    cap = config.review.max_no_op_rework_attempts
+    gh, state_file, gate = _setup(
+        repo,
+        record={
+            "decision": "request_changes",
+            "status": "request_changes",
+            "reviewed_head_sha": head,
+            "no_op_rework_attempts": cap,
+        },
+        issue_extra=(
+            {"dead_worker_failure_kind": stamped_kind} if stamped_kind is not None else None
+        ),
+    )
+
+    assert _park(gh, repo, config, gate, passed_kind) == (True, None)
+
+    state = load_state(state_file)
+    assert state["issues"]["7"]["status"] == "rework_requested"
+    assert state["prs"]["7"]["status"] == "rework_requested"
+    assert state["prs"]["7"]["no_op_rework_attempts"] == cap
+    labels = LabelConfig()
+    assert labels.needs_rework in _labels(gh)
+    assert labels.operator_queue not in _labels(gh)
+    [event] = _rearm_events(state)
+    assert event["counted"] is False
+    assert event["escalated"] is False
+    assert event["reason"] == "provider_throttle"
+    assert event["failure_kind"] == (passed_kind or stamped_kind)
+    assert event["attempts"] == cap
+
+
+def test_non_throttle_death_is_counted_in_the_event(repo: Path) -> None:
+    head = _git(repo, "rev-parse", BRANCH)
+    gh, state_file, gate = _setup(
+        repo,
+        record={
+            "decision": "request_changes",
+            "status": "request_changes",
+            "reviewed_head_sha": head,
+        },
+    )
+
+    assert _park(gh, repo, OrchestratorConfig(), gate, "stalled") == (True, None)
+
+    [event] = _rearm_events(load_state(state_file))
+    assert event["counted"] is True
+    assert event["reason"] is None
+    assert event["attempts"] == 1

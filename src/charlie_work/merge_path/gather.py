@@ -17,7 +17,7 @@ could be attempted rather than only when a mergequeue label is set.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import datetime
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Callable, Literal
 
@@ -25,6 +25,7 @@ from ..checks import CheckSummary, summarize_checks
 from ..cross_pr_revert import CrossPrRevertStatus
 from ..escalation import _escalation_flags
 from ..github import GitHubError, label_names
+from ..host import current as _host_current
 from ..janitor import check_operator_containment
 from .decide import (
     SYNC_STRATEGIES,
@@ -35,6 +36,7 @@ from .decide import (
     is_already_in_mergequeue,
     needs_carry_forward,
 )
+from .issue_labels import open_issue_labels
 from .model import (
     UNAVAILABLE,
     Admission,
@@ -86,6 +88,8 @@ def config_slice(config: OrchestratorConfig) -> MergePathConfig:
         required_checks=tuple(auto.required_checks),
         readiness_no_ci_minutes=auto.readiness_no_ci_minutes,
         merge_strategy=auto.strategy,
+        skip_line_label=auto.mergequeue_skip_line_label,
+        priority_prefix=config.labels.priority_prefix,
     )
 
 
@@ -99,6 +103,7 @@ def persisted_from(entry: dict[str, Any] | None) -> PersistedPr:
         stale_base_deferrals=entry.get("consecutive_stale_base_deferrals", 0),
         mergequeue_since=entry.get("mergequeue_since"),
         mergequeue_head_sha=entry.get("mergequeue_head_sha"),
+        mergequeue_checked_at=entry.get("mergequeue_checked_at"),
     )
 
 
@@ -413,7 +418,7 @@ def readiness_facts(
         checks=checks.summary,
         checks_unavailable=checks.unavailable,
         check_names_seen=frozenset(str(c.get("name") or "") for c in checks.enriched),
-        now=now or datetime.now(UTC),
+        now=now or _host_current().clock.now(),
         pr_updated_at=pr.get("updatedAt"),
         is_draft=bool(pr.get("isDraft")),
         human_merge_hold=human_merge[0],
@@ -448,11 +453,18 @@ def decide_readiness_lazily(
 
 
 def gather_merge_hold(app: Any, pr: dict[str, Any], issue_number: int | None) -> tuple[bool, bool]:
-    """``(merge_hold, unavailable)``: the PR's label, else the linked issue's."""
+    """``(merge_hold, unavailable)``: the PR's label, else the linked issue's.
+
+    The issue's labels come from the per-pass open-issue list when it shows the
+    issue, else a live ``issue_view``.
+    """
     labels = app.config.labels
     held = labels.merge_hold in label_names(pr)
     if held or issue_number is None:
         return held, False
+    cached = open_issue_labels(app.gh, issue_number)
+    if cached is not None:
+        return labels.merge_hold in cached, False
     try:
         issue = app.gh.issue_view(issue_number)
     except (GitHubError, ValueError):

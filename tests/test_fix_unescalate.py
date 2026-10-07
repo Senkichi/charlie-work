@@ -49,7 +49,7 @@ def test_unescalated_pr_open_edge_adds_pr_open_removes_the_rest() -> None:
     config = OrchestratorConfig()
     fake_gh = FakeGitHub()
 
-    result = transition(fake_gh, config.labels, 123, "unescalated_pr_open")
+    result = transition(fake_gh, config.labels, 123, "unescalated_pr_open", state_path=None)
 
     assert result.outcome == TransitionOutcome.APPLIED
     assert fake_gh.labels_added == [(123, config.labels.pr_open)]
@@ -62,7 +62,7 @@ def test_unescalated_requeued_edge_adds_nothing_removes_all_workflow_labels() ->
     config = OrchestratorConfig()
     fake_gh = FakeGitHub()
 
-    result = transition(fake_gh, config.labels, 123, "unescalated_requeued")
+    result = transition(fake_gh, config.labels, 123, "unescalated_requeued", state_path=None)
 
     assert result.outcome == TransitionOutcome.APPLIED
     assert fake_gh.labels_added == []

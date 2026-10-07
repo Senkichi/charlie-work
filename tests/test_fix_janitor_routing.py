@@ -19,9 +19,11 @@ and CLEAN checks) rather than duplicating that fixture.
 
 from __future__ import annotations
 
+import hashlib
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from unittest.mock import patch
+
+import pytest
 
 from _janitor_routing_fixtures import _conflicting_app, _set_decision
 from charlie_work.config import (
@@ -33,14 +35,74 @@ from charlie_work.config import (
 )
 from charlie_work.paths import runtime_paths
 from charlie_work.state import load_state, save_state
+from charlie_work.subprocess_runner import RunResult
 from charlie_work.workflow import OrchestratorApp
 from charlie_work.write_gate import WriteGate
 
 from _fakes_github import FakeGitHub
+from _host_fixtures import host_probe
 
 
 def _wg(state_file: Path, *, dry_run: bool = False) -> WriteGate:
     return WriteGate(dry_run=dry_run, state_path=state_file, repo="charlie-work")
+
+
+def _suppress_events_db_writes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No-op the ``events.db`` dual-write (#2507; same mitigation as #2432).
+
+    Every routing pass emits ``log_event`` calls that each pay for a SQLite
+    ``events.db`` create + WAL setup + insert next to ``state.json`` — the
+    largest host-bound cost the ledger flagged (0.44s → 1.14s median).
+    Nothing in these tests reads ``events.db``; the ``state.json`` event ring
+    is still written by ``append_event`` before the dual-write, and
+    ``log_event`` is bound into ``labels`` / ``write_gate`` at import time,
+    so patching ``instrumentation`` alone would not cover those paths.
+    """
+    for target in (
+        "charlie_work.instrumentation.log_event",
+        "charlie_work.labels.log_event",
+        "charlie_work.write_gate.log_event",
+    ):
+        monkeypatch.setattr(target, lambda *a, **k: None)
+
+
+def _stub_janitor_git_probes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Replace the ``git`` subprocesses the no-op-rework path spawns (#2507).
+
+    ``_calculate_patch_id`` shells out to ``git patch-id --stable`` and the
+    unchanged-diff finding's enrichment calls ``_get_unpushed_commit_info``,
+    which runs ``git worktree list`` — real process spawns on every
+    ``record_review``/``review()`` call even though ``FakeGitHub`` supplies
+    the diff. This test only needs the same diff to yield the same patch-id,
+    so a sha256 of the stdin diff preserves the contract; a failed
+    ``worktree list`` is exactly what happens today under ``tmp_path`` (not
+    a git repo), so ``_get_unpushed_commit_info`` still returns None.
+    ``selection_wrapper`` gets the same stub so ``resolve_selection``'s
+    ``git remote`` probe fails fast wherever it runs. The real git plumbing
+    stays covered by test_janitor_patch_id.py and
+    test_janitor_no_op_rework_unpushed.py.
+    """
+
+    def fake_run_captured(
+        command: list[str] | str,
+        *,
+        cwd: Path | str,
+        timeout_seconds: int,
+        shell: bool = False,
+        stdin: str | None = None,
+        extra_env: dict[str, str] | None = None,
+    ) -> RunResult:
+        argv = command if isinstance(command, list) else [command]
+        if argv[:3] == ["git", "patch-id", "--stable"]:
+            digest = hashlib.sha256((stdin or "").encode()).hexdigest()
+            return RunResult(returncode=0, stdout=f"{digest} -\n", stderr="")
+        return RunResult(returncode=1, stdout="", stderr="", error="command exited 1")
+
+    for target in (
+        "charlie_work.janitor.run_captured",
+        "charlie_work.selection_wrapper.run_captured",
+    ):
+        monkeypatch.setattr(target, fake_run_captured)
 
 
 def test_janitor_conflict_routes_to_rework_when_request_changes(tmp_path: Path) -> None:
@@ -337,7 +399,9 @@ def test_janitor_no_op_rework_waits_while_rework_pending(tmp_path: Path) -> None
     assert (123, app.config.labels.human_needed) not in app.gh.labels_added
 
 
-def test_janitor_no_op_rework_cap_exceeded_escalates_with_label(tmp_path: Path) -> None:
+def test_janitor_no_op_rework_cap_exceeded_escalates_with_label(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Cap mechanics of the shared wrapper for the no-op reason: each
     re-entry from a non-pending stuck state consumes an attempt, and past
     ``max_no_op_rework_attempts`` the issue escalates with the label
@@ -348,6 +412,8 @@ def test_janitor_no_op_rework_cap_exceeded_escalates_with_label(tmp_path: Path) 
     judgment call), so it lands agent:operator-queue, not
     agent:human-needed.
     """
+    _suppress_events_db_writes(monkeypatch)
+    _stub_janitor_git_probes(monkeypatch)
     config = OrchestratorConfig(review=ReviewConfig(max_no_op_rework_attempts=2))
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     fake_gh = FakeGitHub()
@@ -781,7 +847,7 @@ def test_orphan_sweep_does_not_flip_to_reviewing_when_pr_closes_mid_pass(
     # orphan sweep's review() callback, not during record_review above.
     fake_gh.close_pr_view = True
 
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+    with host_probe(alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"

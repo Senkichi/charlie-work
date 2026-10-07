@@ -8,8 +8,7 @@ the ``workflow_delegation`` installer re-attaches each ``def`` onto the class.
 from __future__ import annotations
 
 from dataclasses import asdict
-from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Iterable
 
 from charlie_work.adapters import (
     SessionDispatchResult,
@@ -22,6 +21,7 @@ from charlie_work.config import (
     DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS,
     PRE_LAUNCH_BLOCKED_ENVIRONMENT_FAILURE_KINDS,
 )
+import charlie_work.fleet_provider_throttle as fleet_provider_throttle
 from charlie_work.github import GitHubError
 from charlie_work.labels import TransitionOutcome
 from charlie_work.state import StateLockBusy
@@ -29,6 +29,7 @@ from charlie_work.worker_fate import persisted_failure
 from charlie_work.worktree import worktree_ahead_of_sha
 import charlie_work.superseded_worker_reap as superseded_worker_reap
 import charlie_work.workflow as _wf
+from charlie_work.command_result import CommandResult
 from charlie_work.worker_pid_stamp import stamp_worker_process
 from charlie_work.worker_launch_gate import (
     REASON_PROVIDER_THROTTLED,
@@ -49,7 +50,7 @@ def _dispatch_rework_impl(
     only_issues: str | None = None,
     stalled_entries: list[dict[str, int]] | None = None,
     launch_lock: FleetLaunchLock,
-) -> _wf.CommandResult:
+) -> CommandResult:
     """Dispatch rework workers for issues in needs-rework state with open PRs.
 
     This is only for non-manual adapters. The manual adapter's human-paste
@@ -60,7 +61,7 @@ def _dispatch_rework_impl(
     The label is used for display only and never for selection.
     """
     if self.config.worker.harness == "manual":
-        return _wf.CommandResult(
+        return CommandResult(
             True,
             "rework dispatch skipped for manual adapter",
             {"adapter": "manual", "selected_count": 0},
@@ -210,9 +211,16 @@ def _dispatch_rework_impl(
             )
         else:
             message = f"rework dispatch deferred: {permit.reason}"
-        return _wf.CommandResult(permit.ok, message, data)
+        return CommandResult(permit.ok, message, data)
     gov = permit.governor
     rework_limit = permit.max_launches
+
+    resume = fleet_provider_throttle.decide_for_app(self, selection=permit.role_selection)
+    if resume.deferred:
+        data = {"adapter": self.config.worker.harness, "selected_count": 0}
+        data.update(gov.report_fields() if gov.any_term_enabled else {})
+        return resume.deferred_result("rework dispatch", data)
+    rework_limit = resume.cap_limit(rework_limit)
 
     # Dry-run: read-only planning — compute selection and would-be
     # SessionRequests, but skip all state writes, label transitions,
@@ -344,7 +352,7 @@ def _dispatch_rework_impl(
             issues=dry_head_check_state.get("issues", {}),
             sessions_dir=sessions_dir,
             config=self.config,
-            now=datetime.now(UTC),
+            now=self.host.clock.now(),
         )
 
         # Apply only_issues filter and concurrency cap (read-only).
@@ -387,12 +395,8 @@ def _dispatch_rework_impl(
             if pr_state_for_rescue.get("rescue_attempted"):
                 dry_rescue_issue_numbers.add(issue_number)
             dry_session_requests.append(
-                SessionRequest(
-                    issue_number=issue_number,
-                    issue_title=str(full_issue.get("title") or ""),
-                    prompt_path=rework_prompt_path,
-                    branch_name=branch_name,
-                    rework=True,
+                SessionRequest.for_issue(
+                    full_issue, issue_number, rework_prompt_path, branch_name, rework=True
                 )
             )
 
@@ -424,7 +428,7 @@ def _dispatch_rework_impl(
         }
         if gov.any_term_enabled:
             data.update(gov.report_fields())
-        return _wf.CommandResult(
+        return CommandResult(
             True,
             f"dry-run: would dispatch rework for {len(dry_session_requests)} issue(s)",
             data,
@@ -532,7 +536,7 @@ def _dispatch_rework_impl(
                                     window_minutes=self.config.watchdog.redispatch_window_minutes,
                                 )
                                 issue_entry["foreign_writer_reaps"] = existing_reaps + [
-                                    datetime.now(UTC).isoformat().replace("+00:00", "Z")
+                                    self.host.clock.now().isoformat().replace("+00:00", "Z")
                                 ]
                                 state["issues"][str(issue_number)] = issue_entry
                                 state = _wf.append_event(  # event-consumer: audit-only -- records a pre-escalation foreign-writer reap (issue #1423) already enforced by the blocked_environment_at reset and foreign_writer_reaps counter; consumed by tests/test_charlie_work.py regression tests.
@@ -754,7 +758,7 @@ def _dispatch_rework_impl(
         issues=head_check_state.get("issues", {}),
         sessions_dir=sessions_dir,
         config=self.config,
-        now=datetime.now(UTC),
+        now=self.host.clock.now(),
     )
     if live_worker_deferrals:
         _wf._record_cap_escalation_deferrals(live_worker_deferrals, write_gate=self.write_gate)
@@ -775,7 +779,7 @@ def _dispatch_rework_impl(
                 redispatch_at = _wf._windowed_redispatch_at(
                     entry,
                     window_minutes=self.config.watchdog.redispatch_window_minutes,
-                ) + [datetime.now(UTC).isoformat().replace("+00:00", "Z")]
+                ) + [self.host.clock.now().isoformat().replace("+00:00", "Z")]
                 # Issue #783: no-op rework redispatch cap is a process
                 # failure, not a judgment call -- mechanical.
                 state = _wf._escalate_issue(
@@ -800,13 +804,7 @@ def _dispatch_rework_impl(
                     state_path=self.paths.state_file,
                 )
             _wf.save_state(self.paths.state_file, state)
-        for issue_number in no_op_rework_escalated:
-            _wf.transition(
-                self.gh,
-                self.config.labels,
-                issue_number,
-                _wf._escalation_edge("redispatch_escalated", "mechanical"),
-            )
+        self._apply_redispatch_escalated_edges(no_op_rework_escalated)
 
     # Issue #1134: escalate worker-death loops separately from no-op
     # rework loops.  A death loop means the worker keeps dying before
@@ -878,13 +876,7 @@ def _dispatch_rework_impl(
                     state_path=self.paths.state_file,
                 )
             _wf.save_state(self.paths.state_file, state)
-        for issue_number in worker_death_escalated:
-            _wf.transition(
-                self.gh,
-                self.config.labels,
-                issue_number,
-                _wf._escalation_edge("redispatch_escalated", "mechanical"),
-            )
+        self._apply_redispatch_escalated_edges(worker_death_escalated)
 
     # Issue #1393: escalate issues whose pre-launch environment has
     # blocked every dispatch attempt (e.g. a stale foreign worktree).
@@ -927,13 +919,7 @@ def _dispatch_rework_impl(
                     state_path=self.paths.state_file,
                 )
             _wf.save_state(self.paths.state_file, state)
-        for issue_number in blocked_environment_escalated:
-            _wf.transition(
-                self.gh,
-                self.config.labels,
-                issue_number,
-                _wf._escalation_edge("redispatch_escalated", "mechanical"),
-            )
+        self._apply_redispatch_escalated_edges(blocked_environment_escalated)
 
     # Issue #1014 (mirroring #1005 in the fresh-dispatch path): compute
     # deferred_by_concurrency uniformly across both the only_issues and
@@ -970,7 +956,7 @@ def _dispatch_rework_impl(
         }
         if gov.any_term_enabled:
             data.update(gov.report_fields())
-        return _wf.CommandResult(
+        return CommandResult(
             True,
             "no rework candidates found",
             data,
@@ -1038,7 +1024,7 @@ def _dispatch_rework_impl(
         }
         if gov.any_term_enabled:
             data.update(gov.report_fields())
-        return _wf.CommandResult(
+        return CommandResult(
             True,
             "all rework candidates already dispatched",
             data,
@@ -1192,12 +1178,8 @@ def _dispatch_rework_impl(
         if pr_state_for_rescue.get("rescue_attempted"):
             rescue_issue_numbers.add(issue_number)
         session_requests.append(
-            SessionRequest(
-                issue_number=issue_number,
-                issue_title=str(full_issue.get("title") or ""),
-                prompt_path=rework_prompt_path,
-                branch_name=branch_name,
-                rework=True,
+            SessionRequest.for_issue(
+                full_issue, issue_number, rework_prompt_path, branch_name, rework=True
             )
         )
 
@@ -1273,7 +1255,7 @@ def _dispatch_rework_impl(
         }
         if gov.any_term_enabled:
             data.update(gov.report_fields())
-        return _wf.CommandResult(
+        return CommandResult(
             True,
             "no valid rework prompts found",
             data,
@@ -1319,9 +1301,9 @@ def _dispatch_rework_impl(
     rescue_requests = [r for r in launchable_requests if r.issue_number in rescue_issue_numbers]
     dispatch_results: list[SessionDispatchResult] = list(superseded_blocked_results)
     if normal_requests:
-        dispatch_results.extend(
-            _launch_workers(self, permit, self._adapter_settings(), normal_requests)
-        )
+        normal_results = _launch_workers(self, permit, self._adapter_settings(), normal_requests)
+        dispatch_results.extend(normal_results)
+        fleet_provider_throttle.note_probe_from_results(self, resume, normal_results)
     if rescue_requests:
         dispatch_results.extend(
             _launch_workers(self, permit, self._rescue_adapter_settings(), rescue_requests)
@@ -1429,7 +1411,7 @@ def _dispatch_rework_impl(
                 stamp_worker_process(entry, result)
             if ok:
                 # Track redispatch count for escalation cap (issue #165)
-                now = datetime.now(UTC)
+                now = self.host.clock.now()
                 redispatch_at = _wf._windowed_redispatch_at(
                     entry, window_minutes=self.config.watchdog.redispatch_window_minutes
                 ) + [now.isoformat().replace("+00:00", "Z")]
@@ -1452,6 +1434,8 @@ def _dispatch_rework_impl(
                         self.config.labels,
                         request.issue_number,
                         edge,
+                        state_path=self.paths.state_file,
+                        repo=self.repo_root.name,
                     )
                     if result.outcome != TransitionOutcome.APPLIED:
                         label_error = {
@@ -1476,6 +1460,13 @@ def _dispatch_rework_impl(
                         self.config.labels,
                         request.issue_number,
                         "rework_dispatched",
+                        state_path=self.paths.state_file,
+                        repo=self.repo_root.name,
+                        pr_number=(
+                            int(pr_by_issue[request.issue_number]["number"])
+                            if request.issue_number in pr_by_issue
+                            else None
+                        ),
                     )
                     if result.outcome != TransitionOutcome.APPLIED:
                         label_error = {
@@ -1501,7 +1492,7 @@ def _dispatch_rework_impl(
                     None,
                 )
                 failure_kind = failed_result.failure_kind if failed_result else None
-                now = datetime.now(UTC)
+                now = self.host.clock.now()
                 # Issue #1393: a pre-launch environment block (e.g.
                 # worktree_foreign_writer) never started a worker session,
                 # so it must NOT count against the redispatch cap (which
@@ -1593,6 +1584,8 @@ def _dispatch_rework_impl(
                             self.config.labels,
                             request.issue_number,
                             edge,
+                            state_path=self.paths.state_file,
+                            repo=self.repo_root.name,
                         )
                         if result.outcome != TransitionOutcome.APPLIED:
                             label_error = {
@@ -1626,6 +1619,7 @@ def _dispatch_rework_impl(
                             "blocked_environment_count": len(blocked_environment_at),
                         },
                         state_path=self.paths.state_file,
+                        repo=self.repo_root.name,
                     )
                     _wf.save_state(self.paths.state_file, state)
                     continue
@@ -1668,6 +1662,8 @@ def _dispatch_rework_impl(
                         self.config.labels,
                         request.issue_number,
                         edge,
+                        state_path=self.paths.state_file,
+                        repo=self.repo_root.name,
                     )
                     if result.outcome != TransitionOutcome.APPLIED:
                         label_error = {
@@ -1781,8 +1777,24 @@ def _dispatch_rework_impl(
         if digest:
             _wf.emit_digest(self._layout.notify, digest)
 
-    return _wf.CommandResult(
+    return CommandResult(
         not failed_issue_numbers,
         message,
         data,
     )
+
+
+def _apply_redispatch_escalated_edges(self, issue_numbers: Iterable[int]) -> None:
+    """Apply the ``redispatch_escalated`` (mechanical) label edge to each issue.
+
+    Issue #2226: shared by the no-op-rework, worker-death, and blocked-environment
+    cap lanes of ``_dispatch_rework_impl`` — routes through the WriteGate, which
+    binds ``state_path`` and ``repo``.
+    """
+    for issue_number in issue_numbers:
+        self.write_gate.transition(
+            self.gh,
+            self.config.labels,
+            issue_number,
+            _wf._escalation_edge("redispatch_escalated", "mechanical"),
+        )

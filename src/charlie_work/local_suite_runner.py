@@ -38,6 +38,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from charlie_work.atomic_write import write_json_atomic
 from charlie_work.process_utils import CpuPriority, get_process_start_time, popen_worker
 from charlie_work.subprocess_runner import hidden_console_kwargs
 
@@ -73,10 +74,8 @@ def suite_gate_paths(dispatches_dir: Path, pr_number: int) -> SuiteGatePaths:
 
 
 def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
-    """Temp-file + ``replace()`` -- the repo's mandatory JSON write shape."""
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    tmp.replace(path)
+    """Unique temp file + ``replace()`` -- the repo's mandatory JSON write shape."""
+    write_json_atomic(path, payload)
 
 
 def _read_json(path: Path) -> dict[str, Any] | None:
@@ -103,14 +102,17 @@ def reusable_gate_result(
     *,
     head_sha: str | None,
     base_sha: str | None,
+    suite_argv: Sequence[str],
 ) -> dict[str, Any] | None:
-    """A prior passing result for exactly this ``(head_sha, base_sha)`` pair, else None.
+    """A prior passing result for exactly this ``(head_sha, base_sha)`` pair and argv, else None.
 
     Reuse is keyed on the full pair: a moved base means the merged tree differs,
-    so it must rerun. Fails closed -- a missing, truncated or malformed file
+    so it must rerun. It is also keyed on the argv: a suite that ran a different
+    command -- unwrapped, or in the other selection mode -- did not test what this
+    launch would. Fails closed -- a missing, truncated or malformed file
     (``read_gate_result`` returns None), ``ok`` not literally ``True``, a missing
-    ``ended_at`` (an incomplete run), or an empty head/base on either side is a
-    miss, never a pass.
+    ``ended_at`` (an incomplete run), an empty head/base on either side, or a
+    missing or different ``suite_argv`` is a miss, never a pass.
     """
     if not head_sha or not base_sha:
         return None
@@ -118,6 +120,8 @@ def reusable_gate_result(
     if result is None or result.get("ok") is not True or not result.get("ended_at"):
         return None
     if result.get("head_sha") != head_sha or result.get("base_sha") != base_sha:
+        return None
+    if result.get("suite_argv") != list(suite_argv):
         return None
     return result
 

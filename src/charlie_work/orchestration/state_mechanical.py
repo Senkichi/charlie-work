@@ -8,7 +8,7 @@ the ``workflow_delegation`` installer re-attaches each ``def`` onto the class.
 from __future__ import annotations
 
 from collections import Counter
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 from typing import Any
 
 from charlie_work.state import (
@@ -149,7 +149,7 @@ def _deescalate_mechanical_issue(self, issue_number: int) -> dict[str, Any]:
         and cleared_reason
         and cleared_reason == issue_entry.get("escalation_reason")
         and cleared_at is not None
-        and datetime.now(UTC) - cleared_at <= timedelta(minutes=recurrence_window_minutes)
+        and self.host.clock.now() - cleared_at <= timedelta(minutes=recurrence_window_minutes)
     ):
         with _wf.state_lock(self.paths.state_file):
             fresh_state = _wf.load_state(self.paths.state_file)
@@ -259,7 +259,7 @@ def _deescalate_mechanical_issue(self, issue_number: int) -> dict[str, Any]:
     from charlie_work.worker import issue_worker_liveness
 
     liveness = issue_worker_liveness(
-        issue_number, issue_entry, self._layout.sessions_dir, self.config, datetime.now(UTC)
+        issue_number, issue_entry, self._layout.sessions_dir, self.config, self.host.clock.now()
     )
     if liveness.live:
         # a live worker is using this issue; not stuck
@@ -295,6 +295,7 @@ def _deescalate_mechanical_issue(self, issue_number: int) -> dict[str, Any]:
     checks = self.gh.pr_checks(pr_number)
     diff = self.gh.pr_diff(pr_number)
     pr_entry_for_janitor = state.get("prs", {}).get(str(pr_number))
+    review_decision = self._review_decision(pr_number)
     janitor_verdict = _wf.run_janitor(
         pr,
         checks,
@@ -302,7 +303,17 @@ def _deescalate_mechanical_issue(self, issue_number: int) -> dict[str, Any]:
         pr_state=pr_entry_for_janitor if isinstance(pr_entry_for_janitor, dict) else None,
         repo_root=self.repo_root,
         pr_diff=diff,
-        review_decision=self._review_decision(pr_number),
+        review_decision=review_decision,
+        # Issue #2281: commit list only fetched when the no-op gate's
+        # exemption-claim escape is live (request_changes verdict +
+        # enabled adequacy gate).
+        pr_commits=(
+            self.gh.pr_commits(pr_number)
+            if _wf.no_op_escape_needs_pr_commits(
+                self.config.test_adequacy, review_decision, pr.get("headRefOid")
+            )
+            else None
+        ),
     )
 
     with _wf.state_lock(self.paths.state_file):
@@ -517,7 +528,7 @@ def _maybe_deescalate_mechanical(self) -> None:
         )
 
     next_deescalation_at = (
-        (datetime.now(UTC) + timedelta(minutes=self.config.deescalation.interval_minutes))
+        (self.host.clock.now() + timedelta(minutes=self.config.deescalation.interval_minutes))
         .replace(microsecond=0)
         .isoformat()
         .replace("+00:00", "Z")

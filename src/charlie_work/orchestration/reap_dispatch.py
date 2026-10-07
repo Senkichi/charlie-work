@@ -9,25 +9,28 @@ protocol exactly as a lexical method did).
 
 Names reached through ``_wf.`` (module-object seam, design Section 3.1 rule 2,
 #1627): ``charlie_work.workflow`` module-level definitions ``CommandResult``,
-``ConcurrencyGovernorResult``, ``_MergedPRListOutcome`` (classes),
+``_MergedPRListOutcome`` (class),
 ``_state_lock_busy_result`` (free function); and Tier-D names patched on
 ``charlie_work.workflow`` by the suite, so the moved body must keep intercepting
-those patches: ``_count_live_sessions``, ``count_fleet_live_sessions``,
-``_log_worker_census``. All other free names are imported directly from their
-defining module (a three-form, six-alias patch census confirms no test patches
-any of them on ``charlie_work.workflow``).
+those patches: ``_log_worker_census``. The live-session counters are reached
+through ``host.current().sessions``, whose Real resolves the
+``live_session_count`` / ``fleet_registry`` primitives at call time so
+patches on those modules still intercept. All other free names are imported
+directly from their defining module (a three-form, six-alias patch census
+confirms no test patches any of them on ``charlie_work.workflow``).
 """
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
 from typing import Any
 
 import charlie_work.workflow as _wf
+from charlie_work.command_result import CommandResult
 from charlie_work.dispatch_deferral import records_deferral
 from charlie_work import layout
 from charlie_work.ci_absence import CiAbsence, runs_terminally_without_jobs
 from charlie_work.ci_headroom import ci_headroom_available
+from charlie_work.concurrency_governor_result import ConcurrencyGovernorResult
 from charlie_work.fleet_paths import fleet_dir
 from charlie_work.fleet_registry import registered_state_dirs, try_acquire_fleet_lock
 from charlie_work.github import GitHubError, GraphQLBudgetError
@@ -110,7 +113,7 @@ def _detect_ci_absence(
         return None
     if known_head is not None and known_head == head_sha and not reprobe_known_head:
         return None
-    if not _is_pr_updated_at_older_than(pr, datetime.now(UTC), grace_minutes):
+    if not _is_pr_updated_at_older_than(pr, self.host.clock.now(), grace_minutes):
         return None
     head_runs = self.gh.workflow_runs_for_head(head_sha)
     # None means the query itself failed (rate limit, transient error) --
@@ -153,7 +156,7 @@ def _apply_concurrency_governor(
     *,
     live_count: int | None = None,
     apply_open_pr_backpressure: bool = False,
-) -> _wf.ConcurrencyGovernorResult:
+) -> ConcurrencyGovernorResult:
     """Apply global concurrency governor cap to a dispatch limit.
 
     Returns a ConcurrencyGovernorResult with the potentially-clamped limit
@@ -165,7 +168,7 @@ def _apply_concurrency_governor(
         dispatch_limit: The requested dispatch limit
         live_count: Optional pre-computed live worker count. If None and
             max_concurrent > 0 or ci_capacity_headroom_ratio > 0, this will
-            compute it via _count_live_sessions -- the CI-headroom clamp
+            compute it via the sessions port's live-worker count -- the CI-headroom clamp
             below needs it too, as a floor on demand ci_fleet's last
             allocation pass has not measured yet (issue #1770 review
             finding 3), independent of whether max_concurrent itself is
@@ -223,7 +226,7 @@ def _apply_concurrency_governor(
     if max_concurrent > 0 or ci_headroom_ratio > 0:
         if live_count is None:
             sessions_dir = self._layout.sessions_dir
-            live_count = _wf._count_live_sessions(sessions_dir, self.paths.state_file)
+            live_count = self.host.sessions.live_workers(sessions_dir, self.paths.state_file)
 
     if max_concurrent > 0:
         available_slots = max(0, max_concurrent - (live_count or 0))
@@ -233,7 +236,9 @@ def _apply_concurrency_governor(
             clamped_by = "max_concurrent"
 
     if fleet_max > 0:
-        fleet_live_count, _skipped_repos = _wf.count_fleet_live_sessions(self.fleet_dir_override)
+        fleet_live_count, _skipped_repos = self.host.sessions.fleet_live_workers(
+            self.fleet_dir_override
+        )
         fleet_available = max(0, fleet_max - fleet_live_count)
         if fleet_available < dispatch_limit:
             dispatch_limit = fleet_available
@@ -366,6 +371,9 @@ def _apply_concurrency_governor(
                 self.paths.root,
                 self._layout.worktrees,
                 *registered_state_dirs(self.fleet_dir_override),
+                # Worktrees on the host I/O volume carry no .var/charlie-work
+                # marker; the worker root covers every repo's worktrees there.
+                *self._layout.host_io_scope_paths(),
             ),
         )
         host_load_limit: int | None = None
@@ -418,7 +426,7 @@ def _apply_concurrency_governor(
                 clamped = True
                 clamped_by = "host_load"
 
-    return _wf.ConcurrencyGovernorResult(
+    return ConcurrencyGovernorResult(
         clamped=clamped,
         max_concurrent=max_concurrent,
         live_count=live_count or 0,
@@ -449,7 +457,7 @@ def dispatch(
     *,
     only_issues: str | None = None,
     stalled_entries: list[dict[str, int]] | None = None,
-) -> _wf.CommandResult:
+) -> CommandResult:
     """Dispatch fresh workers for ready issues.
 
     ``stalled_entries``: pass the result of an already-completed
@@ -528,7 +536,7 @@ def dispatch(
             data["merged_pr_referenced_issue_numbers"] = sorted(
                 set(data.get("merged_pr_referenced_issue_numbers", [])) | finalized
             )
-        return _wf.CommandResult(result.ok, result.message, data)
+        return CommandResult(result.ok, result.message, data)
     except StateLockBusy:
         return _wf._state_lock_busy_result(
             "dispatch deferred: state lock held",
@@ -539,7 +547,7 @@ def dispatch(
             merged_pr_referenced_issue_numbers=sorted(finalized),
         )
     except GraphQLBudgetError as exc:
-        return _wf.CommandResult(
+        return CommandResult(
             True,
             "dispatch deferred: GraphQL rate limit below threshold",
             {
@@ -573,7 +581,7 @@ def dispatch(
         # transient gh failure. Any claim written before a later
         # GitHubError (e.g. issue_view mid-launch) is recovered by the
         # existing stale-claim sweep on the next pass.
-        return _wf.CommandResult(
+        return CommandResult(
             True,
             f"dispatch deferred: GitHub API error ({exc})",
             {
@@ -699,7 +707,13 @@ def _route_workflow_no_jobs(
     Retrigger cannot fix a rejected workflow file, so ``review()`` returns this
     instead of re-parking the PR as ``janitor_blocked``.
     """
-    _wf.transition(self.gh, self.config.labels, issue_number, "review_started")
+    self.write_gate.transition(
+        self.gh,
+        self.config.labels,
+        issue_number,
+        "review_started",
+        pr_number=pr_number,
+    )
     missing = ", ".join(verdict.missing_required_checks)
     diagnostic = (
         f"workflow file invalid: run completed with no jobs created for head "

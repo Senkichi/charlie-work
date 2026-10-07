@@ -17,7 +17,7 @@ import pytest
 from charlie_work.config import OrchestratorConfig, SupervisorConfig
 from charlie_work.paths import resolved_layout
 from charlie_work.subprocess_runner import RunResult
-from charlie_work.workflow import CommandResult
+from charlie_work.command_result import CommandResult
 
 
 class _FakePaths:
@@ -131,28 +131,6 @@ def _active_result(
             "skipped_reviews": 0,
         },
     )
-
-
-class FakeClock:
-    """Monotonically advancing fake clock.
-
-    Advances by ``auto_advance`` on each ``sleep()`` call.
-    """
-
-    def __init__(self, start: float = 0.0, auto_advance: float = 0.0) -> None:
-        self._now = start
-        self._auto_advance = auto_advance
-        self.sleep_calls: list[float] = []
-
-    def now(self) -> float:
-        return self._now
-
-    def advance(self, seconds: float) -> None:
-        self._now += seconds
-
-    def sleep(self, seconds: float) -> None:
-        self.sleep_calls.append(seconds)
-        self._now += self._auto_advance if self._auto_advance else seconds
 
 
 def _make_fake_runner(

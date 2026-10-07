@@ -130,12 +130,17 @@ def test_worker_test_commands_is_a_frozen_value_object() -> None:
         commands.targeted = "c"  # type: ignore[misc]
 
 
-def test_prompt_values_keys_are_exactly_the_two_template_placeholders(tmp_path: Path) -> None:
+def test_prompt_values_keys_are_exactly_the_four_template_placeholders(tmp_path: Path) -> None:
     _dev_extra_repo(tmp_path)
 
     values = prompt_test_command_values("", tmp_path)
 
-    assert set(values) == {"targeted_test_command", "full_suite_command"}
+    assert set(values) == {
+        "targeted_test_command",
+        "full_suite_command",
+        "test_step_instruction",
+        "test_execution_contract",
+    }
     commands = resolve_test_commands("", tmp_path)
     assert values["targeted_test_command"] == commands.targeted
     assert values["full_suite_command"] == commands.full_suite

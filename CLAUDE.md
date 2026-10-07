@@ -13,6 +13,9 @@ uv run ruff check .              # lint
 uv run ruff format .             # format
 ```
 
+xdist is on by default (`-n auto` in `addopts`; dispatched workers get 2 via `PYTEST_XDIST_AUTO_NUM_WORKERS`); one to three file/nodeid arguments run serially. Turn xdist off with `-n0` — never `-p no:xdist`, which fails with "unrecognized arguments: -n" once `-n` is in addopts.
+Test speed-ups ship on; kill switches: `CI_FLEET_TEST_REUSE=off` (git templates, parsed-source cache), `CI_FLEET_FAST_GUARDS=off` (leak-guard fast path).
+
 ## Invariants — preserve these in every PR
 
 ### Config / value objects are frozen dataclasses
@@ -22,15 +25,14 @@ All config and value-object types (`LabelConfig`, `DispatchConfig`, `ReviewConfi
 `@dataclass(frozen=True)`. Never convert them to mutable classes or dicts.
 
 ### All JSON state writes are atomic
-Every JSON file written by the orchestrator uses a temp-file + `replace()` pattern:
-```python
-tmp = path.with_suffix(path.suffix + ".tmp")
-tmp.write_text(...)        # or json.dump + handle.write("\n")
-tmp.replace(path)          # atomic rename
-```
-This is implemented in `state.save_state`, `adapters._write_json`,
-`devin_shell._write_json`, and `claude_code._write_json_atomic`. Never use a plain
-`open(path, "w")` for any file that another process may read.
+Every JSON file written by the orchestrator goes through the shared
+`charlie_work.atomic_write` helpers (`write_json_atomic`, `write_text_atomic`,
+`write_bytes_atomic`): a *unique* per-writer temp file in the destination's
+directory (`<stem>.<random><suffix>.tmp` — still matching the `*.json.tmp`
+orphan sweeps), a bounded `PermissionError` retry on the rename, and tmp
+unlink on failure (issue #2265). Never hand-roll a fixed-name
+`path.with_suffix(".tmp")` write, and never use a plain `open(path, "w")`
+for any file that another process may read.
 
 ### State lives in GitHub labels + state.json — never in chat memory
 Issue workflow state (`queued`, `in-progress`, `pr-open`, …) is stored as GitHub

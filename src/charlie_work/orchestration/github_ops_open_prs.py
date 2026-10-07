@@ -136,7 +136,10 @@ def _update_open_agent_prs(self, merged_pr_number: int) -> list[dict[str, Any]]:
 
     # mode == "broadcast": update every eligible PR.
     try:
-        prs = self.gh.pr_list()
+        # Issue #2443: the one pr_list consumer that needs every open PR's
+        # statusCheckRollup (required-check in-flight guard below); the shared
+        # per-pass ``pr_list`` no longer carries it.
+        prs = self.gh.pr_list_with_checks()
     except GitHubError as exc:
         # Report the pr_list failure as a value instead of raising
         return [{"error": f"pr_list failed: {exc}"}]

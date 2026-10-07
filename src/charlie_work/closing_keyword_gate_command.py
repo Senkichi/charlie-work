@@ -25,7 +25,7 @@ from .closing_keyword_gate import (
 )
 from .github import CLOSING_KEYWORD_PR_FIELDS, defang_closing_keywords
 from .issue_linking import linked_issue_number
-from .workflow import CommandResult
+from .command_result import CommandResult
 
 
 def register_closing_keyword_check_subparser(

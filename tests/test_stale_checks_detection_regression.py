@@ -62,6 +62,7 @@ from charlie_work.paths import runtime_paths
 from charlie_work.workflow import OrchestratorApp
 
 from _fakes_github import FakeGitHub
+from _src_ast import parsed, source_files
 
 _SRC_ROOT = Path(__file__).resolve().parent.parent / "src" / "charlie_work"
 
@@ -329,8 +330,8 @@ def test_workflow_runs_for_head_call_sites_are_the_registered_ones() -> None:
     the third unregistered); removed after confirming the failure.
     """
     call_sites: list[tuple[str, str | None]] = []
-    for py_file in sorted(_SRC_ROOT.rglob("*.py")):
-        tree = ast.parse(py_file.read_text(encoding="utf-8"), filename=str(py_file))
+    for py_file in source_files(_SRC_ROOT):
+        tree = parsed(py_file)
         parents = _build_parent_map(tree)
         for node in ast.walk(tree):
             if (

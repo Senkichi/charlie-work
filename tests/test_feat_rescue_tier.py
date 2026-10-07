@@ -29,6 +29,7 @@ from charlie_work.config import (
     ReviewConfig,
     WorkerRoleConfig,
 )
+from charlie_work.host.fakes import FakeWorkerLauncher
 from charlie_work.rescue_review import CrossFamilyResult
 from charlie_work.paths import runtime_paths
 from charlie_work.state import load_state, save_state, state_lock
@@ -256,7 +257,7 @@ def test_review_dispatch_attempt_cap_ineligible_still_escalates_with_rescue_enab
 
 
 def test_dispatch_rework_routes_rescue_marked_issue_via_rescue_adapter_settings(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, fake_host
 ) -> None:
     config = OrchestratorConfig(
         # worker.harness must not be the default "manual" -- dispatch_rework's
@@ -306,7 +307,7 @@ def test_dispatch_rework_routes_rescue_marked_issue_via_rescue_adapter_settings(
             for r in requests
         ]
 
-    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", fake_dispatch_sessions)
+    fake_host(worker_launch=FakeWorkerLauncher([fake_dispatch_sessions]))
 
     result = app.dispatch_rework(limit=5)
 
@@ -322,7 +323,7 @@ def test_dispatch_rework_routes_rescue_marked_issue_via_rescue_adapter_settings(
 
 
 def test_dispatch_rework_normal_issue_unaffected_by_rescue_config(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, fake_host
 ) -> None:
     """A normal (non-rescue-marked) rework candidate must keep using the
     primary configured adapter settings even when rescue.enabled is True."""
@@ -363,7 +364,7 @@ def test_dispatch_rework_normal_issue_unaffected_by_rescue_config(
             for r in requests
         ]
 
-    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", fake_dispatch_sessions)
+    fake_host(worker_launch=FakeWorkerLauncher([fake_dispatch_sessions]))
 
     app.dispatch_rework(limit=5)
 
@@ -784,7 +785,7 @@ def test_quota_deferred_rescue_candidate_still_processed_normal_still_deferred(
 
 
 def test_rescue_marker_routes_correctly_even_when_rescue_disabled_in_config(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_host
 ) -> None:
     """rescue.enabled only gates NEW rescue entry at the three cap sites.
     A PR that already carries rescue_attempted must keep routing through
@@ -868,7 +869,7 @@ def test_rescue_marker_routes_correctly_even_when_rescue_disabled_in_config(
             for r in requests
         ]
 
-    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", fake_dispatch_sessions)
+    fake_host(worker_launch=FakeWorkerLauncher([fake_dispatch_sessions]))
 
     rework_app.dispatch_rework(limit=5)
 

@@ -26,9 +26,11 @@ from ..escalation import _escalate_issue, _escalation_edge
 from ..github import (
     GitHubLike,
 )
+from ..host import current as _host_current
 from ..labels import TransitionOutcome
 from ..no_op_checkpoint import _paired_death_count
 from ..review_decision import review_decision
+from ..rework_attempt_exemption import exempt_provider_throttle_rework_death
 from ..rework_prompts import _write_rework_prompt
 from ..state import (
     load_state,
@@ -257,7 +259,9 @@ def _reap_restore_rework_requested(
             entry, window_minutes=config.watchdog.redispatch_window_minutes
         )
         if not provider_throttled:
-            redispatch_at = redispatch_at + [datetime.now(UTC).isoformat().replace("+00:00", "Z")]
+            redispatch_at = redispatch_at + [
+                _host_current().clock.now().isoformat().replace("+00:00", "Z")
+            ]
 
         terminal_failure = failure_kind in DETERMINISTIC_ESCALATION_FAILURE_KINDS
         # Issue #807: a deterministic judgment failure (e.g. genuine local
@@ -363,6 +367,7 @@ def _reap_restore_rework_requested(
             )
             write_gate.save_state(state)
         else:
+            dispatched_at = entry.get("dispatched_at")
             entry["status"] = "rework_requested"
             entry["dispatched_at"] = None
             entry["redispatch_at"] = redispatch_at
@@ -384,6 +389,19 @@ def _reap_restore_rework_requested(
                 "last_rework_failure_kind": failure_kind,
                 "last_rework_was_startup_death": startup_death,
             }
+            # Issue #2282: a provider-throttle death refunds its dispatch's
+            # redispatch_at stamp and sets the PR exemption flag (single
+            # point of enforcement, see ``rework_attempt_exemption``).
+            throttle_exempt = exempt_provider_throttle_rework_death(
+                state,
+                worker.issue_number,
+                entry,
+                failure_kind,
+                dispatched_at=dispatched_at,
+                pr_number=pr_number,
+                source="dead_rework_session_restore",
+                write_gate=write_gate,
+            )
             state = write_gate.append_event(
                 state,
                 "rework_requeued",
@@ -396,6 +414,7 @@ def _reap_restore_rework_requested(
                     "has_request_changes": has_request_changes,
                     "has_rework_prompt": has_rework_prompt,
                     "startup_death": startup_death,
+                    "provider_throttle_exempt": throttle_exempt,
                 },
             )
             write_gate.save_state(state)
@@ -481,8 +500,10 @@ def _is_pre_review_rework_candidate(
     if stale_minutes <= 0:
         return False, ""
 
+    # Issue #2443: an absent key (``pr_list`` rows carry no rollup) means the
+    # checks are unknown, not empty -- never ``stale_empty_checks``.
     status_rollup = pr.get("statusCheckRollup")
-    if status_rollup:
+    if "statusCheckRollup" not in pr or status_rollup:
         return False, ""
 
     if _is_pr_updated_at_older_than(pr, now, stale_minutes):
@@ -552,7 +573,9 @@ def _route_dead_worker_to_pre_review_rework(
         # arm ``throttled_until``) is a global provider condition, not a
         # worker-quality signal — it must not consume the redispatch cap.
         if not is_provider_throttle_failure(failure_kind):
-            redispatch_at = redispatch_at + [datetime.now(UTC).isoformat().replace("+00:00", "Z")]
+            redispatch_at = redispatch_at + [
+                _host_current().clock.now().isoformat().replace("+00:00", "Z")
+            ]
 
         terminal_failure = failure_kind in DETERMINISTIC_ESCALATION_FAILURE_KINDS
         # Issue #807: a deterministic judgment failure escalates immediately

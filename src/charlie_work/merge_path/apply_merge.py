@@ -16,8 +16,10 @@ from ..escalation import _escalate_issue
 from ..labels import TransitionOutcome
 from ..merge_finalize import _merged_issue_fields
 from ..pass_deadline import pass_deadline_suspended
-from ..github import cancel_superseded_runs
+from ..github import GitHubError, cancel_superseded_runs, label_names
+from ..issue_priority import is_critical
 from ..write_gate import WriteGate, require_write_gate
+from .issue_labels import open_issue_labels
 from .model import EffectResults, MergePathConfig, MergePlan
 from .ports import MergePathPorts
 
@@ -59,7 +61,9 @@ def apply_merge_plan(
     write_gate = require_write_gate(write_gate)
     label_error: dict[str, Any] | None = None
     if plan.action_hand_off:
-        results = _hand_off(app, ports, write_gate, pr_number, issue_number, cfg, plan, results)
+        results = _hand_off(
+            app, ports, write_gate, pr, pr_number, issue_number, cfg, plan, results
+        )
     elif plan.action_merge:
         results, label_error = _self_merge(
             app, ports, write_gate, pr, pr_number, issue_number, results
@@ -74,14 +78,29 @@ def _hand_off(
     app: Any,
     ports: MergePathPorts,
     write_gate: WriteGate,
+    pr: dict[str, Any],
     pr_number: int,
     issue_number: int | None,
     cfg: MergePathConfig,
     plan: MergePlan,
     results: EffectResults,
 ) -> EffectResults:
-    """Aviator hand-off: add the mergequeue label, and on success mark the PR queued (ADR-0003)."""
-    applied = app.gh.add_pr_label(pr_number, cfg.mergequeue_label)
+    """Aviator hand-off: add the mergequeue label, and on success mark the PR queued (ADR-0003).
+
+    A PR whose snapshot already shows the queue label is not re-POSTed (#2440): the
+    add is idempotent, so the call would only cost budget. The skip-line check
+    runs on every full pass regardless, unless the skip-line label is already there.
+
+    A PR whose linked issue is ``priority:critical`` gets the skip-line label
+    first, so Aviator queues it at the front (TIS-CW-7).
+    """
+    labels_on_pr = label_names(pr)
+    already_labelled = cfg.mergequeue_label in labels_on_pr
+    # Only the queue-label POST is gated on already_labelled: an issue that gains
+    # priority:critical after the PR was queued must still get the skip-line label.
+    if not (cfg.skip_line_label and cfg.skip_line_label in labels_on_pr):
+        _add_skip_line_if_critical(app, pr_number, issue_number, cfg)
+    applied = already_labelled or app.gh.add_pr_label(pr_number, cfg.mergequeue_label)
     if applied:
         state_file = app.paths.state_file
         with ports.state_lock(state_file):
@@ -101,6 +120,35 @@ def _hand_off(
                 state["issues"][key] = {**state["issues"].get(key, {}), "merge_alert": "OK"}
             write_gate.save_state(state)
     return replace(results, mergequeue_label_applied=applied)
+
+
+def _add_skip_line_if_critical(
+    app: Any, pr_number: int, issue_number: int | None, cfg: MergePathConfig
+) -> bool:
+    """Add ``cfg.skip_line_label`` when the PR's linked issue is ``priority:critical``.
+
+    Runs before the queue label so Aviator sees both when it queues the PR. Reads
+    the issue labels from the per-pass open-issue list, else live. Best effort: an
+    unreadable issue or a failed label add leaves the PR to queue in normal
+    order; it never blocks the hand-off.
+    """
+    if not cfg.skip_line_label or not cfg.priority_prefix or issue_number is None:
+        return False
+    labels = open_issue_labels(app.gh, issue_number)
+    if labels is None:
+        try:
+            issue = app.gh.issue_view(issue_number)
+        except (GitHubError, ValueError):
+            logger.warning(
+                "skip-line: issue #%d unreadable; PR #%d queues in normal order",
+                issue_number,
+                pr_number,
+            )
+            return False
+        labels = label_names(issue) if isinstance(issue, dict) else set()
+    if not is_critical(labels, cfg.priority_prefix):
+        return False
+    return bool(app.gh.add_pr_label(pr_number, cfg.skip_line_label))
 
 
 def _self_merge(
@@ -140,7 +188,14 @@ def _self_merge(
     # Cleanup is best-effort and must finish even when the pass budget is spent.
     with pass_deadline_suspended(app.gh):
         if issue_number is not None:
-            transitioned = write_gate.transition(app.gh, app.config.labels, issue_number, "merged")
+            transitioned = write_gate.transition(
+                app.gh,
+                app.config.labels,
+                issue_number,
+                "merged",
+                pr_number=pr_number,
+                cause="merge_finalize",
+            )
             label_error = label_error_of("merged", transitioned)
             app.gh.close_issue(issue_number)
         if auto.delete_branch:
@@ -198,7 +253,11 @@ def _human_merge(
         write_gate.save_state(state)
     if issue_number is not None:
         transitioned = write_gate.transition(
-            app.gh, app.config.labels, issue_number, "human_merge_required"
+            app.gh,
+            app.config.labels,
+            issue_number,
+            "human_merge_required",
+            pr_number=pr_number,
         )
         results = replace(
             results,

@@ -9,7 +9,7 @@ protocol exactly as the lexical methods did).
 
 Workflow-defined names are reached through ``_wf.<name>`` so every existing
 ``charlie_work.workflow`` monkeypatch seam keeps landing: the ``CarryForwardCheck``
-and ``CommandResult`` classes, and ``_calculate_patch_id`` (a helper a test patches
+class and ``_calculate_patch_id`` (a helper a test patches
 on the ``charlie_work.workflow`` namespace). Every other free name is imported
 directly from its defining module (none is patched on ``charlie_work.workflow``).
 """
@@ -20,6 +20,7 @@ from dataclasses import asdict
 from typing import Any
 
 import charlie_work.workflow as _wf
+from charlie_work.command_result import CommandResult
 from charlie_work.checks import (
     CheckSummary,
     classify_infra_failures,
@@ -27,7 +28,10 @@ from charlie_work.checks import (
     summarize_checks,
     workflow_run_terminal_by_id,
 )
+from charlie_work.ci_backlog import defer_infra_rerun_for_backlog, infra_rerun_backlog
+import charlie_work.infra_rerun_refusal as _refusal
 from charlie_work.janitor import (
+    CarryForwardCheck,
     DiffContentSignature,
     _diff_content_signature,
     _unwind_skipped_rerun_attempts,
@@ -36,7 +40,7 @@ from charlie_work.janitor import (
 )
 
 
-def _check_carry_forward(self, pr_number: int, decision: dict[str, Any]) -> _wf.CarryForwardCheck:
+def _check_carry_forward(self, pr_number: int, decision: dict[str, Any]) -> CarryForwardCheck:
     """Determine whether ``decision``'s verdict can carry forward to the
     PR's live head, and via which tier (issues #411/#412, #414).
 
@@ -99,7 +103,7 @@ def _check_carry_forward(self, pr_number: int, decision: dict[str, Any]) -> _wf.
     """
     live_diff = self.gh.pr_diff(pr_number) or ""
     if not live_diff:
-        return _wf.CarryForwardCheck(None, "", DiffContentSignature((), frozenset()))
+        return CarryForwardCheck(None, "", DiffContentSignature((), frozenset()))
 
     live_patch_id = _wf._calculate_patch_id(live_diff)
     live_signature = _diff_content_signature(live_diff)
@@ -108,7 +112,7 @@ def _check_carry_forward(self, pr_number: int, decision: dict[str, Any]) -> _wf.
     if not reviewed_patch_id:
         # No baseline recorded at all (e.g. a "blocked" verdict never
         # computes a patch-id) — nothing to compare against.
-        return _wf.CarryForwardCheck(None, live_patch_id, live_signature)
+        return CarryForwardCheck(None, live_patch_id, live_signature)
 
     if live_patch_id and live_patch_id == reviewed_patch_id:
         # Issue #1187: ``git patch-id --stable`` strips leading
@@ -127,36 +131,36 @@ def _check_carry_forward(self, pr_number: int, decision: dict[str, Any]) -> _wf.
             # Decision predates tier-2 (no signature recorded) —
             # patch-id is the only available signal; preserve #412's
             # original carry-forward behavior for legacy decisions.
-            return _wf.CarryForwardCheck("patch-id", live_patch_id, live_signature)
+            return CarryForwardCheck("patch-id", live_patch_id, live_signature)
         lines_match = tuple(reviewed_changed_lines) == live_signature.changed_lines
         files_match = frozenset(reviewed_changed_files) == live_signature.changed_files
         if lines_match and files_match:
-            return _wf.CarryForwardCheck("patch-id", live_patch_id, live_signature)
+            return CarryForwardCheck("patch-id", live_patch_id, live_signature)
         # Patch-id matched but tier-2 signatures differ — a
         # whitespace-only change that patch-id collapsed (issue #1187).
         # Fail closed to stale rather than carrying forward an approved
         # verdict across a semantically different, unreviewed head.
-        return _wf.CarryForwardCheck(None, live_patch_id, live_signature)
+        return CarryForwardCheck(None, live_patch_id, live_signature)
 
     reviewed_changed_lines = decision.get("reviewed_changed_lines")
     reviewed_changed_files = decision.get("reviewed_changed_files")
     if reviewed_changed_lines is None or reviewed_changed_files is None:
         # Decision predates tier-2 (no signature recorded) — cannot
         # establish content identity; fail closed to stale.
-        return _wf.CarryForwardCheck(None, live_patch_id, live_signature)
+        return CarryForwardCheck(None, live_patch_id, live_signature)
 
     if decision.get("reviewed_has_binary") or live_signature.has_binary:
         # A binary payload emits no +/- content lines, so the signature
         # cannot see it — never rely on its silence for content it
         # never observed (issue #414 review follow-up).
-        return _wf.CarryForwardCheck(None, live_patch_id, live_signature)
+        return CarryForwardCheck(None, live_patch_id, live_signature)
 
     lines_match = tuple(reviewed_changed_lines) == live_signature.changed_lines
     files_match = frozenset(reviewed_changed_files) == live_signature.changed_files
     if lines_match and files_match:
-        return _wf.CarryForwardCheck("line-content", live_patch_id, live_signature)
+        return CarryForwardCheck("line-content", live_patch_id, live_signature)
 
-    return _wf.CarryForwardCheck(None, live_patch_id, live_signature)
+    return CarryForwardCheck(None, live_patch_id, live_signature)
 
 
 def _still_valid_recorded_verdict(
@@ -199,7 +203,7 @@ def _still_valid_recorded_verdict(
     )
 
 
-def review_verdict_guard(self, pr_number: int) -> _wf.CommandResult | None:
+def review_verdict_guard(self, pr_number: int) -> CommandResult | None:
     """CLI-boundary guard for ``charlie why-charlie-hate`` (issue #1695).
 
     ``review()`` unconditionally regenerates the review packet: when the
@@ -229,7 +233,7 @@ def review_verdict_guard(self, pr_number: int) -> _wf.CommandResult | None:
         return None
     _decision, reason = result
     refusal = f"refusing to regenerate the review packet for PR #{pr_number}: {reason}"
-    return _wf.CommandResult(
+    return CommandResult(
         False,
         # Issue #1695 acceptance: the refusal reason must survive `head -1`
         # AND `tail -1` of the rendered output, so it is restated on the
@@ -325,7 +329,7 @@ def _drive_infra_rerun_or_escalate(
     escalate_exhausted: bool,
     ok: bool,
     extra_data: dict[str, Any] | None = None,
-) -> _wf.CommandResult | None:
+) -> CommandResult | None:
     """Drive the #841 infra-failure remediation mechanics: bounded
     ``gh run rerun`` per eligible run id, then operator-queue escalation
     once a check's run ids are exhausted (or none was parseable).
@@ -399,7 +403,14 @@ def _drive_infra_rerun_or_escalate(
     deferred_for_head: set[int] = set()
     head_key = str(head_sha or "")
     persisted_attempts = infra_rerun_attempts
+    # Issue #2445: run ids GitHub permanently refuses are never re-requested.
+    refused_for_head: set[int] = set()
+    newly_refused: set[int] = set()
     if rerun_run_ids:
+        if head_key:
+            refused_for_head = _refusal.load_refused_run_ids(
+                self.paths.state_file, pr_number, head_key
+            )
         # Issue #1936: run ids refused "already running" on an earlier
         # pass live in this head's ``infra_rerun_deferred`` set. They are
         # probed via ``workflow_runs_for_head`` -- still in progress means
@@ -424,6 +435,8 @@ def _drive_infra_rerun_or_escalate(
         attempt_run_ids: list[int] = []
         terminal_by_id: dict[int, bool] | None = None
         for run_id in rerun_run_ids:
+            if run_id in refused_for_head:
+                continue
             if run_id in deferred_for_head:
                 if terminal_by_id is None:
                     terminal_by_id = workflow_run_terminal_by_id(
@@ -438,6 +451,23 @@ def _drive_infra_rerun_or_escalate(
                     continue
             attempt_run_ids.append(run_id)
 
+        if attempt_run_ids:
+            backlog = infra_rerun_backlog(self)
+            if backlog is not None:
+                # Nothing is persisted to infra_rerun_attempts here, so
+                # classify_infra_failures' pre-increments are dropped and no
+                # attempt is consumed; the next pass re-evaluates.
+                return defer_infra_rerun_for_backlog(
+                    self,
+                    pr_number,
+                    issue_number,
+                    head_key=head_key,
+                    rerun_run_ids=rerun_run_ids,
+                    backlog_seconds=backlog,
+                    ok=ok,
+                    extra_data=extra_data,
+                )
+
         for run_id in attempt_run_ids:
             result = self.gh.run(["run", "rerun", str(run_id)], allow_failure=True)
             if isinstance(result, _wf.GitHubRunResult):
@@ -448,6 +478,8 @@ def _drive_infra_rerun_or_escalate(
                     infra_rerun_errors.append(error)
                     if _wf._is_rerun_already_running_error(error):
                         newly_deferred.add(run_id)
+                    elif _refusal.is_permanent_rerun_refusal(error):
+                        newly_refused.add(run_id)
             elif isinstance(result, str):
                 # Dry-run returns a descriptive string; treat as success.
                 infra_triggered_run_ids.append(run_id)
@@ -462,7 +494,7 @@ def _drive_infra_rerun_or_escalate(
         # run's counter stays exactly where its last real dispatch left
         # it -- the attempt is spent only when `gh run rerun` is called.
         persisted_attempts = _unwind_skipped_rerun_attempts(
-            infra_rerun_attempts, head_key, still_deferred
+            infra_rerun_attempts, head_key, still_deferred | refused_for_head
         )
 
         if infra_triggered_run_ids and not infra_rerun_errors:
@@ -476,6 +508,7 @@ def _drive_infra_rerun_or_escalate(
                     "infra_rerun_deferred": (
                         {head_key: sorted(new_deferred)} if new_deferred else {}
                     ),
+                    "infra_rerun_backlog_deferred": {},
                 }
                 state = self._record_event(
                     state,
@@ -487,7 +520,7 @@ def _drive_infra_rerun_or_escalate(
                     },
                 )
                 self.write_gate.save_state(state)
-            return _wf.CommandResult(
+            return CommandResult(
                 ok,
                 f"infra rerun triggered for PR #{pr_number}: run(s) "
                 + ", ".join(str(rid) for rid in infra_triggered_run_ids),
@@ -514,6 +547,7 @@ def _drive_infra_rerun_or_escalate(
                     "infra_rerun_deferred": (
                         {head_key: sorted(new_deferred)} if new_deferred else {}
                     ),
+                    **_refusal.refused_state_patch(head_key, refused_for_head | newly_refused),
                 }
                 state = self._record_event(
                     state,
@@ -523,11 +557,21 @@ def _drive_infra_rerun_or_escalate(
                         "run_ids": list(rerun_run_ids),
                         "errors": infra_rerun_errors,
                         "deferred_run_ids": sorted(newly_deferred),
+                        "refused_run_ids": sorted(newly_refused),
                     },
                 )
                 self.write_gate.save_state(state)
 
-    if escalate_exhausted and issue_number is not None and definitive_failed:
+    # Issue #2445: escalate once when a permanent refusal is all that is left.
+    refused_now = (refused_for_head | newly_refused) & set(rerun_run_ids)
+    refusal_escalate = bool(refused_now) and _refusal.refusal_is_sole_remaining_work(
+        self.paths.state_file,
+        pr_number,
+        dispatched=bool(infra_triggered_run_ids),
+        deferred=bool(still_deferred or newly_deferred),
+        errors=infra_rerun_errors,
+    )
+    if escalate_exhausted and issue_number is not None and (definitive_failed or refusal_escalate):
         # Attempt cap exhausted (or no parseable run id at all): there is no
         # code-fix rework path for an infra failure, so escalate straight to
         # a human instead of looping forever on a PR that can never clear
@@ -539,7 +583,8 @@ def _drive_infra_rerun_or_escalate(
             state = _wf._escalate_issue(
                 state,
                 issue_number,
-                reason="infra_rerun_cap_exceeded",
+                # Literals (not the constant) so the #1683 reason scanner sees both.
+                reason="infra_rerun_cap_exceeded" if definitive_failed else "infra_rerun_refused",
                 reason_class="mechanical",
                 pr_number=pr_number,
                 pr_extra={"infra_rerun_attempts": persisted_attempts},
@@ -551,6 +596,7 @@ def _drive_infra_rerun_or_escalate(
                     "pr_number": pr_number,
                     "issue_number": issue_number,
                     "checks": list(definitive_failed),
+                    "refused_run_ids": sorted(refused_now),
                 },
             )
             self.write_gate.save_state(state)
@@ -566,10 +612,13 @@ def _drive_infra_rerun_or_escalate(
                 "add_failures": transition_result.add_failures,
                 "remove_failures": transition_result.remove_failures,
             }
-        return _wf.CommandResult(
+        return CommandResult(
             ok,
             f"PR #{pr_number} infra-failed check(s) exhausted rerun cap: "
-            + ", ".join(definitive_failed),
+            + ", ".join(definitive_failed)
+            if definitive_failed
+            else f"PR #{pr_number} infra rerun refused by GitHub for run(s) "
+            + ", ".join(str(r) for r in sorted(refused_now)),
             {
                 "pr": pr_number,
                 "issue": issue_number,
@@ -607,7 +656,7 @@ def _drive_infra_rerun_or_escalate(
                     ),
                 }
                 self.write_gate.save_state(state)
-        return _wf.CommandResult(
+        return CommandResult(
             ok,
             f"PR #{pr_number} infra rerun deferred: workflow run(s) "
             + ", ".join(str(rid) for rid in sorted(new_deferred))
@@ -637,7 +686,7 @@ def _merge_ready_infra_remediation(
     approved: bool,
     sync_failed: bool,
     merge_conflict: bool,
-) -> _wf.CommandResult | None:
+) -> CommandResult | None:
     """Infra-failure remediation for the merge lane (issue #1912).
 
     The #841 rerun/escalate mechanics lived only in ``review()`` -- fed by

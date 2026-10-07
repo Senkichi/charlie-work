@@ -30,11 +30,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from . import host as _host
 from . import layout
+from .atomic_write import write_json_atomic
 from .fleet_paths import warn_fleet_dir_virtualization_on_write
-from .process_utils import is_pid_alive
 from .supervisor_lifecycle import read_supervisor_heartbeat, supervisor_heartbeat_path
-from .workflow import CommandResult
+from .command_result import CommandResult
 from .write_gate import WriteGate
 
 logger = logging.getLogger(__name__)
@@ -79,9 +80,7 @@ def write_fleet_pause(fleet_dir_override: str | None, *, reason: str | None = No
         "reason": reason,
         "requester_pid": os.getpid(),
     }
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    tmp.replace(path)
+    write_json_atomic(path, payload)
     try:
         write_gate = _fleet_write_gate(fleet_dir_override)
         write_gate.log_event(kind=FLEET_PAUSED, payload={"flag": str(path), "reason": reason})
@@ -148,7 +147,7 @@ def _supervisor_live(fleet_dir_override: str | None) -> bool:
         heartbeat
         and not heartbeat.get("exited_at")
         and isinstance(heartbeat.get("pid"), int)
-        and is_pid_alive(heartbeat["pid"])
+        and _host.current().probe.is_alive(heartbeat["pid"])
     )
 
 

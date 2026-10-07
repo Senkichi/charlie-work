@@ -476,9 +476,13 @@ def decide_merge(readiness: Readiness, holds: HoldFacts) -> MergePlan:
     action_human_merge = human_hold and can_merge and should_merge and not escalated_merge_hold
 
     # ``int()``: legacy coerced the persisted counter (a hand-edited state file).
-    prior = int(holds.persisted.failed_attempts) if holds.persisted is not None else 0
+    # Both rework routes require ``not can_merge``, so the counter is read only
+    # then; a malformed counter on a mergeable PR must not raise (#2206).
     threshold = cfg.failed_attempt_alarm
-    debounced = threshold > 0 and prior + 1 >= threshold
+    debounced = False
+    if threshold > 0 and not can_merge:
+        prior = int(holds.persisted.failed_attempts) if holds.persisted is not None else 0
+        debounced = prior + 1 >= threshold
     issue_bound = readiness.issue_number is not None
     approved = gate.approved
     merge_conflict = readiness.branch.merge_conflict
@@ -616,14 +620,16 @@ def decide_accounting(
         adm.mergequeue_label_reverted and can_merge and not adm.self_revoked_stale_head
     )
 
-    attempts = int(facts.locked.failed_attempts)
+    attempts = 0
     alarm = False
     warning: str | None = None
     events: list[EventSpec] = []
     threshold = cfg.failed_attempt_alarm
     counts = (approved and not can_merge and not readiness.pending_only) or handoff_failed
     if not facts.deadline_spent and counts:
-        attempts = attempts + 1
+        # Coerced only on this path: a malformed counter on a pass that resets
+        # or carries it must not raise (#2206).
+        attempts = int(facts.locked.failed_attempts) + 1
         if threshold > 0:
             attempts = min(attempts, threshold + 1)
         alarm = threshold > 0 and attempts == threshold
@@ -646,8 +652,8 @@ def decide_accounting(
                     ),
                 )
             )
-    elif can_merge and not facts.deadline_spent:
-        attempts = 0
+    elif not (can_merge and not facts.deadline_spent):
+        attempts = int(facts.locked.failed_attempts)
 
     merge_alert_ok = (
         approved

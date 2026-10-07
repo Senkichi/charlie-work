@@ -15,6 +15,7 @@ from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 
 import pytest
+from _src_ast import parsed_source
 
 import charlie_work
 from charlie_work.config import (
@@ -179,7 +180,7 @@ def _own_call_names(node: ast.AST) -> set[str]:
 def find_bypass_violations(source: str, filename: str = "<source>") -> list[str]:
     """Return ``filename:function`` for every function calling an app builder
     AND a bare ``GitHub(`` in its own (non-nested) body."""
-    tree = ast.parse(source, filename=filename)
+    tree = parsed_source(source, filename)
     violations = []
     for node in ast.walk(tree):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -191,7 +192,7 @@ def find_bypass_violations(source: str, filename: str = "<source>") -> list[str]
 
 
 def _app_builder_function_names(source: str, filename: str = "<source>") -> list[str]:
-    tree = ast.parse(source, filename=filename)
+    tree = parsed_source(source, filename)
     found = []
     for node in ast.walk(tree):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):

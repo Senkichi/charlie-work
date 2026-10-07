@@ -29,7 +29,7 @@ owns the devin-adapter-specific cooldown policy around it.
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -56,6 +56,7 @@ def get_rate_limit_defer_until(
     now: datetime | None = None,
     throttle_error_markers: Sequence[str] | None = None,
     resume_margin_seconds: int = 0,
+    log_digest: Callable[[str], str] | None = None,
 ) -> str | None:
     """Return a defer-until ISO timestamp for a log tail containing a rate-limit signature.
 
@@ -92,6 +93,9 @@ def get_rate_limit_defer_until(
         log_text = log_path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None
+    if log_digest is not None:
+        # Same narrowing classify_failure applies (AdapterFateProfile.log_digest).
+        log_text = log_digest(log_text)
 
     tail = log_text[-2048:] if len(log_text) > 2048 else log_text
 

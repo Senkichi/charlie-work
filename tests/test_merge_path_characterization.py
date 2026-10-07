@@ -26,6 +26,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import pytest
 
 from _fakes_github import FakeGitHub
 from charlie_work.config import (
@@ -102,7 +103,9 @@ def test_pr_not_found_returns_empty_data_both_paths(tmp_path: Path) -> None:
         assert out.result.message == f"PR #{_PR} was not found"
         # Neither path carries a dry_run marker on this shape.
         assert out.data == {}
-        assert out.state_after == out.state_before
+        # ``generated_at`` is a wall-clock stamp that ticks across a second boundary.
+        stable = lambda state: {k: v for k, v in state.items() if k != "generated_at"}  # noqa: E731
+        assert stable(out.state_after) == stable(out.state_before)
         assert out.gh.merged == []
 
 
@@ -264,6 +267,29 @@ def test_head_moved_with_identical_patch_carries_verdict_forward_then_merges_liv
     assert dry.data["can_merge"] is True
     assert "would merge" in dry.result.message
     _assert_dry_run_inert(dry)
+
+
+def test_carry_forward_refused_approval_update_does_not_restamp_or_merge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #2205: a newer verdict made ``_update_approval_head`` refuse the carry."""
+    monkeypatch.setattr(OrchestratorApp, "_update_approval_head", lambda self, *a, **k: False)
+
+    def gh_factory() -> FakeGitHub:
+        gh = FakeGitHub()
+        gh.diffs[_PR] = _CARRY_DIFF
+        return gh
+
+    def pre(_app: OrchestratorApp, _paths: Any, gh: FakeGitHub) -> None:
+        gh.prs[0] = {**gh.prs[0], "headRefOid": "sha-rebased"}
+        gh.pr_head_shas[_PR] = "sha-rebased"
+
+    live = _run(tmp_path / "live", _cfg(), gh_factory, dry_run=False, pre=pre)
+
+    assert live.result.ok is False
+    assert live.data["merged"] is False
+    assert live.gh.merged == []
+    assert live.pr_entry.get("carry_forward_tier") is None
 
 
 # ===========================================================================
@@ -609,6 +635,9 @@ def test_merge_hold_label_on_issue_blocks_mergequeue_handoff(tmp_path: Path) -> 
 
 
 class _MergeHoldIssueViewRaises(FakeGitHub):
+    def issue_list(self, labels=None, state=None):  # type: ignore[override]
+        return []  # cache miss: the hold read falls back to the (failing) live issue_view
+
     def issue_view(self, number: int):  # type: ignore[override]
         raise GitHubError("simulated gh outage")
 

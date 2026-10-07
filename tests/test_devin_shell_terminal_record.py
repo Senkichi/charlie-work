@@ -116,6 +116,7 @@ def test_devin_profile_declares_writes_terminal_record() -> None:
     # no worker process, so there is nothing to watch.
     assert worker_fate.profile_for("claude-code").writes_terminal_record is True
     assert worker_fate.profile_for("api").writes_terminal_record is True
+    assert worker_fate.profile_for("opencode").writes_terminal_record is True
     assert worker_fate.profile_for("command").writes_terminal_record is False
     assert worker_fate.profile_for("manual").writes_terminal_record is False
 
@@ -238,17 +239,19 @@ def test_devin_launch_skips_terminal_record_when_profile_undeclares_it(
         lambda kind: flipped if kind == "devin" else original(kind),
     )
 
+    # A started watcher would poll every 0.05 s instead of 2 s, so a short
+    # wait after the process dies is ten full poll intervals.
+    monkeypatch.setattr("charlie_work.process_utils._TERMINAL_STATUS_POLL_INTERVAL_SECONDS", 0.05)
     record, sessions_dir, _ = _launch_worker(tmp_path, monkeypatch, 2054, _CRASH_SCRIPT)
     assert record.error is None
     assert record.pid is not None
 
-    # Wait for the spawned process to die, then allow a full watcher poll
-    # interval (2s) plus margin -- had a watcher been started, the file
-    # would exist by then.
+    # Wait for the spawned process to die, then allow ten watcher poll
+    # intervals -- had a watcher been started, the file would exist by then.
     assert _wait_for(lambda: not worker_fate.is_alive(record.pid, record.process_start_time)), (
         "fake devin process never exited"
     )
-    time.sleep(3.0)
+    time.sleep(0.5)
     assert not (sessions_dir / "issue-2054.devin.terminal.json").exists()
     assert find_worker_terminal_status(sessions_dir, 2054) is None
 

@@ -46,8 +46,8 @@ from typing import Any
 from . import layout
 from .config import OrchestratorConfig
 from .github import GitHubLike
+from . import host as _host
 from .instrumentation import log_event
-from .process_utils import is_pid_alive
 from .review_decision import resolve_decision_payload
 from .state import (
     _REVIEW_STALE_CLAIM_TIMEOUT_MINUTES,
@@ -66,7 +66,10 @@ from .throttle_signatures import (
     parse_reset_clock_time,
 )
 from .review_provider_outage import apply_provider_api_error, session_api_error_status
-from .role_quota_ledger import record_view as _ledger_record  # issue #2086
+from .role_quota_ledger import (
+    record_view as _ledger_record,  # issue #2086
+    role_key_for_view,
+)
 from .worker import _alive_review_worker_issue_numbers, iter_workers
 from .worktree import remove_review_checkout
 from .write_gate import WriteGate, require_write_gate
@@ -135,6 +138,8 @@ def _set_reviewer_quota_exhausted_with_backoff(
     *,
     reset_at: datetime | None = None,
     adapter_kind: str | None = None,
+    harness: str | None = None,
+    model: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Record a quota-exhaustion episode with exponential probe backoff.
 
@@ -173,6 +178,9 @@ def _set_reviewer_quota_exhausted_with_backoff(
 
     Issue #2086: the record carries ``reason`` and the hitting session's
     ``adapter_kind`` so ``role_selection.window_covered`` can attribute it.
+    Issue #2279: ``harness``/``model`` stamp the dead session's role-chain
+    entry so a fallback reviewer's quota window does not block a recovered
+    primary on the same adapter.
     """
     rd = config.review_dispatch
     quota = state.get("reviewer_quota") or {}
@@ -200,6 +208,8 @@ def _set_reviewer_quota_exhausted_with_backoff(
         **state["reviewer_quota"],
         "reason": "quota_exhausted",
         "adapter_kind": adapter_kind,
+        "harness": harness,
+        "model": model,
         "consecutive_probe_failures": consecutive_failures,
         "reset_at": (
             reset_at.replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -560,8 +570,15 @@ def _detect_and_handle_stalled_reviews(
             else:
                 if not throttle_backoff_applied:
                     now_dt = resolved_now
+                    harness, model = role_key_for_view(reviews_dir, w)
                     state, quota_record = _set_reviewer_quota_exhausted_with_backoff(
-                        state, config, now_dt, reset_at=reset_at, adapter_kind=w.adapter_kind
+                        state,
+                        config,
+                        now_dt,
+                        reset_at=reset_at,
+                        adapter_kind=w.adapter_kind,
+                        harness=harness,
+                        model=model,
                     )
                     throttle_backoff_applied = True
                     # Distinct, queryable event for a quota-dead reviewer session
@@ -700,6 +717,7 @@ def _detect_and_handle_stalled_reviews(
             # Issue #1808: a provider 5xx/529/429 is an outage, not a PR defect;
             # see ``review_provider_outage``. Once-per-sweep backoff latch is
             # shared with the throttle path: one outage, one backoff increment.
+            harness, model = role_key_for_view(reviews_dir, w)
             state, event_payload, throttle_backoff_applied = apply_provider_api_error(
                 state,
                 pr_key,
@@ -709,7 +727,12 @@ def _detect_and_handle_stalled_reviews(
                 api_error_status=api_error_status,
                 log_mtime_dt=log_mtime_dt,
                 arm_backoff=lambda st: _set_reviewer_quota_exhausted_with_backoff(
-                    st, config, resolved_now, adapter_kind=w.adapter_kind
+                    st,
+                    config,
+                    resolved_now,
+                    adapter_kind=w.adapter_kind,
+                    harness=harness,
+                    model=model,
                 ),
                 backoff_armed=throttle_backoff_applied,
             )
@@ -941,7 +964,9 @@ def _detect_and_handle_stalled_reviews(
         elif status == "review_dispatch_dispatched":
             reviewer_pid = pr_state.get("reviewer_pid")
             process_start_time = pr_state.get("reviewer_process_start_time")
-            pid_alive = reviewer_pid is not None and is_pid_alive(reviewer_pid, process_start_time)
+            pid_alive = reviewer_pid is not None and _host.current().probe.is_alive(
+                reviewer_pid, process_start_time
+            )
             if pid_alive:
                 continue
             if pr_key in fresh_sidecar_pr_keys:

@@ -16,13 +16,13 @@ from unittest.mock import ANY, MagicMock, patch
 import pytest
 
 from _fleet_dispatch_fixtures import (
-    _FakeClock,
     _drained_fleet_result,
     _patch_ci_fleet_dirty_for_hermetic_tests as _patch_ci_fleet_dirty_for_hermetic_tests,
     _patch_self_deploy_for_fleet_tests as _patch_self_deploy_for_fleet_tests,
 )
 from charlie_work import cli, fleet_stop, layout
 from charlie_work.config import OrchestratorConfig, ReviewDispatchConfig, SupervisorConfig
+from charlie_work.host.fakes import FakeProcessProbe
 from charlie_work.fleet_dispatch import (
     FleetLocalSnapshot,
     WatchdogProbe,
@@ -35,11 +35,12 @@ from charlie_work.fleet_stop import (
     read_fleet_stop_request,
     write_fleet_stop_request,
 )
+from charlie_work.host.fakes import FakeClock
 from charlie_work.instrumentation import query_events
 from charlie_work.supervise import LocalSnapshot
 from charlie_work.supervise_loop import EXIT_RESTART_REQUESTED
 from charlie_work.supervisor_lifecycle import supervisor_heartbeat_path
-from charlie_work.workflow import CommandResult
+from charlie_work.command_result import CommandResult
 
 
 def test_write_then_read_round_trips(tmp_path: Path) -> None:
@@ -179,6 +180,7 @@ def test_run_fleet_stop_reports_a_replaced_request(
 def test_run_fleet_stop_detects_a_live_supervisor(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    fake_host,
 ) -> None:
     """A live heartbeat (pid alive, no exited_at) reports supervisor_live."""
     monkeypatch.setattr(
@@ -190,7 +192,7 @@ def test_run_fleet_stop_detects_a_live_supervisor(
         "read_supervisor_heartbeat",
         lambda _o: {"exited_at": None, "pid": 12345},
     )
-    monkeypatch.setattr(fleet_stop, "is_pid_alive", lambda pid: pid == 12345)
+    fake_host(probe=FakeProcessProbe({12345: None}))
 
     result = cli.run_fleet_stop(_stop_args(tmp_path))
 
@@ -327,13 +329,13 @@ def test_run_fleet_supervise_stop_marker_exits_before_any_pass(
     )
     write_fleet_stop_request(str(tmp_path), drain=False)
 
-    fc = _FakeClock(auto_advance=1.0)
+    fc = FakeClock(auto_advance=1.0)
     # max_passes=1 as a hang guard (round-4 review): pass_number is 0 going
     # into the very first tick regardless of the cap, so this changes nothing
     # about the intended exit path -- it only stops the loop from running
     # forever if a regression made the marker check never fire.
     result = run_fleet_supervise(
-        fleet_dir_override=str(tmp_path), clock=fc.now, sleep=fc.sleep, max_passes=1
+        fleet_dir_override=str(tmp_path), clock=fc.monotonic, sleep=fc.sleep, max_passes=1
     )
 
     assert result.ok is True
@@ -375,7 +377,7 @@ def test_run_fleet_supervise_stop_marker_written_mid_run_exits_after_pass(
 
     mock_fleet_loop.side_effect = _loop_writes_stop_marker
 
-    fc = _FakeClock(auto_advance=1.0)
+    fc = FakeClock(auto_advance=1.0)
     # max_passes=2 as a hang guard (round-4 review): the marker is only
     # checked at the *second* tick's boundary here (the first tick's fallback
     # pass is what writes it), so a cap of 1 would cut the loop off with
@@ -384,7 +386,7 @@ def test_run_fleet_supervise_stop_marker_written_mid_run_exits_after_pass(
     # intended operator_stop exit path reachable while still bounding a
     # regression that stops the marker check from firing at all.
     result = run_fleet_supervise(
-        fleet_dir_override=str(tmp_path), clock=fc.now, sleep=fc.sleep, max_passes=2
+        fleet_dir_override=str(tmp_path), clock=fc.monotonic, sleep=fc.sleep, max_passes=2
     )
 
     assert result.ok is True
@@ -440,7 +442,7 @@ def test_run_fleet_supervise_drain_suppresses_dispatch_and_exits_at_zero(
         ),
     )
 
-    fc = _FakeClock(auto_advance=1.0)
+    fc = FakeClock(auto_advance=1.0)
     # max_passes=2 as a hang guard (round-4 review): this scenario needs
     # exactly the 2 passes asserted below (drain_complete_if_empty's post-pass
     # check is what ends it, on the second pass, before a third tick's top
@@ -450,7 +452,7 @@ def test_run_fleet_supervise_drain_suppresses_dispatch_and_exits_at_zero(
     # while still bounding a regression that stops the drain-exit check from
     # firing at all.
     result = run_fleet_supervise(
-        fleet_dir_override=str(tmp_path), clock=fc.now, sleep=fc.sleep, max_passes=2
+        fleet_dir_override=str(tmp_path), clock=fc.monotonic, sleep=fc.sleep, max_passes=2
     )
 
     assert result.ok is True

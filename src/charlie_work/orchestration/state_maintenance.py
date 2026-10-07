@@ -14,7 +14,7 @@ module was over its file-size ratchet mark.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from typing import Any
 
 import charlie_work.workflow as _wf
@@ -76,7 +76,7 @@ def _maybe_probe_quota_recovery(self, *, now: datetime | None = None) -> None:
     if not self.config.quota_probe.enabled:
         return
 
-    resolved_now = now if now is not None else datetime.now(UTC)
+    resolved_now = now if now is not None else self.host.clock.now()
     state_file = self.paths.state_file
     with _wf.state_lock(state_file):
         state = _wf.load_state(state_file)
@@ -182,7 +182,7 @@ def _maybe_reclaim_worktrees(self, *, now: datetime | None = None) -> dict[str, 
     """
     if not self.config.worktree_reclamation.enabled:
         return None
-    resolved_now = now if now is not None else datetime.now(UTC)
+    resolved_now = now if now is not None else self.host.clock.now()
     state_file = self.paths.state_file
     with _wf.state_lock(state_file):
         state = _wf.load_state(state_file)
@@ -208,14 +208,19 @@ def _maybe_reclaim_worktrees(self, *, now: datetime | None = None) -> dict[str, 
     # that duplication across call sites is the exact shape of bug
     # layout.py's module docstring documents as a past production
     # incident (create and sweep sides silently disagreeing on the root).
+    # sweep_roots() adds the pre-volume root while it still has entries, so
+    # worktrees created before the host I/O switch are still reaped.
     state = _wf.load_state_locked(state_file)
-    result = _wf.clean_worktrees(
-        self.repo_root,
-        self._layout.worktrees,
-        state,
-        self.config,
-        self.gh,
-        dry_run=self.dry_run,
+    result = _wf.merge_clean_results(
+        [
+            (
+                root,
+                _wf.clean_worktrees(
+                    self.repo_root, root, state, self.config, self.gh, dry_run=self.dry_run
+                ),
+            )
+            for root in self._layout.sweep_roots()
+        ]
     )
     orphans = result.data.get("orphans", {})
     skipped_full = result.data.get("skipped", [])
@@ -389,7 +394,7 @@ def _maybe_emit_operator_queue_impact(self) -> None:
             roots,
             oldest_root_age_days=oldest_root_age_days,
         )
-        now = datetime.now(UTC)
+        now = self.host.clock.now()
 
         # Re-arm the cadence marker on every completed check, independent
         # of whether it goes on to fire below -- see this method's

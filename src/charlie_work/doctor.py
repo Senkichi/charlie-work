@@ -199,6 +199,8 @@ def _probe_adapter(add: Any, repo_root: Path, config: OrchestratorConfig) -> Non
             probe.ok,
             (probe.stdout.strip() or "ok") if probe.ok else (probe.error or probe.stderr.strip()),
         )
+    elif adapter == "opencode":
+        _probe_opencode(add, repo_root, config)
     elif adapter == "claude-code":
         from .claude_code import probe_claude
 
@@ -220,6 +222,23 @@ def _probe_adapter(add: Any, repo_root: Path, config: OrchestratorConfig) -> Non
             f"adapter `{adapter}` launches nothing itself — no CLI probe applies",
             severity="warning",
         )
+    # A fallback harness is only exercised on failover -- probe it now so a
+    # missing binary surfaces here rather than as a launch failure mid-wave.
+    if adapter != "opencode" and any(e.harness == "opencode" for e in config.worker.chain):
+        _probe_opencode(add, repo_root, config)
+
+
+def _probe_opencode(add: Any, repo_root: Path, config: OrchestratorConfig) -> None:
+    from .claude_code import probe_claude
+    from .opencode_worker import DEFAULT_COMMAND_TEMPLATE
+
+    binary = (config.opencode.command or DEFAULT_COMMAND_TEMPLATE)[0]
+    probe = probe_claude(repo_root, command=(binary, "--version"))
+    add(
+        "opencode CLI probe",
+        probe.ok,
+        (probe.stdout.strip() or "ok") if probe.ok else (probe.error or probe.stderr.strip()),
+    )
 
 
 def _probe_api_worker(
@@ -955,12 +974,18 @@ def _check_worktrees_root_agreement(
     sites (``OrchestratorApp._adapter_settings()`` and
     ``run_worktree_clean_command``'s ``clean_worktrees`` call).
     """
-    effective_root = resolved_layout(config, repo_root).worktrees
-    add(
-        "worktrees root",
-        True,
-        f"{effective_root} (dispatch and `worktree-clean` both resolve here)",
-    )
+    resolved = resolved_layout(config, repo_root)
+    detail = f"{resolved.worktrees} (dispatch and `worktree-clean` both resolve here)"
+    status = resolved.worker_io
+    if status.io is not None:
+        detail += f"; on the host I/O volume {status.io.drive}, uv cache {status.io.uv_cache}"
+    elif status.note:
+        detail += f"; host I/O not in use: {status.note}"
+    legacy = resolved.sweep_roots()[1:]
+    if legacy:
+        entries = sum(1 for _ in legacy[0].iterdir())
+        detail += f"; legacy root {legacy[0]} still swept ({entries} entries)"
+    add("worktrees root", True, detail)
 
 
 _LANE_FAILURE_LOOKBACK_HOURS = 24

@@ -1,0 +1,67 @@
+/* Drill-down pages (pages/drill_*.py): repo, issue/PR, loop pass, flow stage, 404.
+   Served after dashboard.css, now.css (header, nav, chips, skip link) and charts.css.
+   Colours come only from --lj-* tokens; state is a glyph plus a word, never colour alone;
+   approximate values say "approx." in text and are drawn dashed. */
+
+.drill { max-width: 1600px; margin: 0 auto; padding: var(--lj-space-4) var(--lj-space-5); }
+.drill .top { border-bottom: var(--lj-stroke-accentRule) solid var(--lj-ink); padding-bottom: var(--lj-space-2); }
+
+.crumbs ol { display: flex; flex-wrap: wrap; gap: var(--lj-space-2); list-style: none; margin: var(--lj-space-3) 0 0; padding: 0; font-size: var(--lj-text-3); color: var(--lj-gray-text); }
+.crumbs li + li::before { content: "\203A\00a0"; color: var(--lj-gray); }
+.crumbs a { color: var(--lj-gray-text); }
+.crumbs a:hover { color: var(--lj-ink); }
+.crumbs [aria-current] { color: var(--lj-ink); font-weight: 600; }
+a.crumb:focus-visible, .dtable a:focus-visible, .dlead a:focus-visible { outline: 2px solid var(--lj-ink); outline-offset: 2px; }
+
+.dcontent { margin-top: var(--lj-space-3); }
+.dlead { margin: var(--lj-space-3) 0; font-size: var(--lj-text-4); color: var(--lj-ink); overflow-wrap: anywhere; }
+.dlead b { font-family: var(--lj-serif); font-weight: 600; }
+.dnote { margin: 0 0 var(--lj-space-3); font-size: var(--lj-text-2); color: var(--lj-gray-text); }
+.aprx { font-style: italic; color: var(--lj-gray-text); border-bottom: 1px dashed var(--lj-gray); }
+.unk { color: var(--lj-gray-text); }
+
+.dgrid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 0 var(--lj-space-6); }
+@media (min-width: 1200px) { .dgrid { grid-template-columns: minmax(0, 1fr) minmax(0, 2fr) minmax(0, 1fr); } }
+
+.dsec { min-width: 0; margin: 0 0 var(--lj-space-5); }
+.dsec > h2 { display: flex; align-items: baseline; gap: var(--lj-space-3); margin: 0 0 var(--lj-space-2); padding-bottom: 2px; border-bottom: 1px solid var(--lj-rule); font-family: var(--lj-serif); font-size: var(--lj-text-5); font-weight: 600; color: var(--lj-ink); }
+.dsec > h2 .meta { font-family: var(--lj-sans); font-size: var(--lj-text-2); font-weight: 400; color: var(--lj-gray-text); }
+/* The section a Now number linked to (?view= / ?stage=): position + rule, not colour. */
+.dsec.focus > h2 { border-bottom: 2px solid var(--lj-ink); }
+.dsec.focus > h2::after { content: "\2190 from Now"; margin-left: auto; font-family: var(--lj-sans); font-size: var(--lj-text-2); font-weight: 400; color: var(--lj-gray-text); }
+
+.tscroll { overflow-x: auto; max-width: 100%; }
+.dtable { width: 100%; border-collapse: collapse; font-size: var(--lj-text-2); }
+.dtable th, .dtable td { padding: 3px var(--lj-space-2) 3px 0; text-align: left; vertical-align: baseline; border-bottom: 1px solid var(--lj-rule); }
+.dtable thead th { font-weight: 600; color: var(--lj-gray-text); font-size: var(--lj-text-2); letter-spacing: var(--lj-label-spacing); text-transform: uppercase; }
+.dtable tbody th { font-weight: 600; color: var(--lj-ink); }
+.dtable .num { text-align: right; font-family: var(--lj-sans); font-variant-numeric: lining-nums tabular-nums; white-space: nowrap; }
+.dtable td time { font-family: var(--lj-sans); font-variant-numeric: lining-nums tabular-nums; white-space: nowrap; }
+.dtable code { font-size: var(--lj-text-2); overflow-wrap: anywhere; }
+.dtable .preview { max-width: 60ch; }
+.dtable .labels { color: var(--lj-gray-text); }
+.dtable .lvl { white-space: nowrap; }
+.dtable tr[aria-current] th { text-decoration: underline; text-decoration-thickness: 2px; }
+.dtable tr.tone-danger .lvl { color: var(--lj-danger); font-weight: 700; }
+.dtable tr.tone-danger td:first-child { box-shadow: inset 3px 0 0 var(--lj-danger); padding-left: var(--lj-space-2); }
+.dtable tr.tone-warn .lvl { color: var(--lj-warn); }
+.dtable tr.tone-warn td:first-child { box-shadow: inset 3px 0 0 var(--lj-warn); padding-left: var(--lj-space-2); }
+
+.dkv { border-collapse: collapse; font-size: var(--lj-text-3); }
+.dkv th { padding: 2px var(--lj-space-3) 2px 0; text-align: left; font-weight: 400; color: var(--lj-gray-text); white-space: nowrap; }
+.dkv td { padding: 2px 0; color: var(--lj-ink); overflow-wrap: anywhere; }
+
+svg.lane-chart text { font-family: var(--lj-sans); font-size: 12px; fill: var(--lj-ink); }
+svg.lane-chart .row-label { font-weight: 600; }
+svg .lane-rule { stroke: var(--lj-rule); stroke-width: 1; shape-rendering: crispEdges; }
+svg .band { fill: var(--lj-ink); }
+svg .lane.approx .band { fill: var(--lj-raised); stroke: var(--lj-ink); stroke-width: 1.5; }
+
+.dmissing { margin-top: var(--lj-space-5); padding: var(--lj-space-4); border: 1.5px dashed var(--lj-gray); border-radius: var(--lj-radius-tab); background: var(--lj-card); max-width: 72ch; }
+.dmissing h2 { margin: 0 0 var(--lj-space-2); font-family: var(--lj-serif); font-size: var(--lj-text-5); color: var(--lj-ink); }
+.dmissing .why { font-size: var(--lj-text-2); color: var(--lj-gray-text); overflow-wrap: anywhere; }
+
+@media (max-width: 720px) {
+  .drill { padding: var(--lj-space-3) 16px; }
+  .dtable .preview { max-width: none; }
+}

@@ -24,6 +24,7 @@ from ..github import (
     PR_CLOSING_ISSUES_FIELDS,
 )
 from ..instrumentation import log_event
+from ..labels import apply_issue_labels
 from ..local_work_park import park_unpublishable_work
 from ..pr_create_retry import create_pr_with_retry
 from ..state import (
@@ -251,15 +252,26 @@ def _open_salvage_pr(
                 },
             )
 
-    label_write_ok = True
-    for label in sorted(active_labels):
-        if not gh.remove_issue_label(issue_number, label):
-            label_write_ok = False
-    if config.labels.pr_open not in issue_labels:
-        if not gh.add_issue_label(issue_number, config.labels.pr_open):
-            label_write_ok = False
-
-    if not label_write_ok:
+    # Issue #2226: the label write routes through the canonical seam so the
+    # PR-open transition lands in events.db as ``lifecycle_transition``; the
+    # conditional add preserves the no-redundant-write contract.
+    # ``pr_number`` is falsy (0) under ``dry_run`` — the same discriminator the
+    # probe above uses — so ``state_path=None`` then, keeping dry-run free of
+    # both the label write's intent and the lifecycle event.
+    # write-gate-exempt(issue=2226): ~15 callers and no write_gate param; dry-run suppression via falsy pr_number sentinel.
+    label_result = apply_issue_labels(
+        gh,
+        config.labels,
+        issue_number,
+        add=(config.labels.pr_open,) if config.labels.pr_open not in issue_labels else (),
+        remove=sorted(active_labels),
+        to_state="pr_open",
+        state_path=state_file if pr_number else None,
+        repo=repo_root.name,
+        pr_number=pr_number or None,
+        cause="pr_salvage",
+    )
+    if not label_result.ok:
         return pr_number, "PR created but label write failed", closing_ref
 
     return pr_number, None, closing_ref

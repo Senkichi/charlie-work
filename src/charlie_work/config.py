@@ -101,19 +101,19 @@ from .deescalation_config import project_scoped_keys
 from .config_deprecations import emit_deprecated_key_reads, repo_state_path
 
 # Re-exported from the domain module (issue #1978) for the same reason
-# ``RunnerCapacityEscalationConfig`` is re-exported above: the dataclass and
-# its section parser live in their own module so new fleet-scoped knobs do
-# not land in this over-cap monolith (file-size ratchet, issue #1442);
-# ``config.py`` wires the dataclass into ``OrchestratorConfig`` and delegates
-# parsing (including the legacy ``supervisor.<key>`` fallback) to it.
+# ``RunnerCapacityEscalationConfig`` is re-exported above: the dataclass
+# lives in its own module so new fleet-scoped knobs do not land in this
+# over-cap monolith (file-size ratchet, issue #1442); ``config.py`` wires it
+# into ``OrchestratorConfig`` and the generic section loop validates it.
 from .test_slots import SlotPoolConfig  # noqa: F401  (deliberate re-export)
+from .dashboard.config import DashboardConfig  # noqa: F401  (deliberate re-export)
 from .fleet_supervisor_config import (  # noqa: F401  (deliberate re-export)
     FleetSupervisorConfig,
-    parse_fleet_supervisor,
 )
 
 from . import layout
 from .harnesses import REVIEWER_HARNESSES, WORKER_HARNESSES
+from .opencode_config import OpenCodeConfig
 from .role_chain import (
     RoleEntry,
     chain_of,
@@ -246,6 +246,13 @@ class LabelConfig:
     human_needed: str = "agent:human-needed"
     prose_only_deps: str = "agent:prose-only-deps"
     merge_hold: str = "agent:merge-hold"
+    # TIS-CW-7: the generic issue priority. ``<prefix><level>`` (default
+    # ``priority:critical`` / ``high`` / ``normal`` / ``low``) orders fresh
+    # dispatch and puts a critical issue's PR at the front of the Aviator queue
+    # (``issue_priority``). A prefix, not a label: whoever files the issue
+    # creates the label, so it is not a member of ``all`` or
+    # ``workflow_labels``. An empty prefix turns both off.
+    priority_prefix: str = "priority:"
     # Issue #1266: mechanical escalations (reason_class == "mechanical") land
     # here instead of ``human_needed``, so human attention is reserved for
     # judgment calls. Unlike ``prose_only_deps`` -- the only other
@@ -291,6 +298,12 @@ class LabelConfig:
     # like ``collect_gate_exempt``, this is a human-applied escape hatch, not
     # a state the label-transition machine ever adds or removes on its own.
     cross_repo_override: str = "agent:cross-repo-override"
+    # TIS-CW-6: the generic per-issue model tier. An issue labelled
+    # ``<prefix><tier>`` (default ``model:opus``) launches on the first worker
+    # chain entry of that model family (``model_tier``). A prefix, not a label:
+    # whoever files the issue creates the label, so it is not a member of
+    # ``all`` or ``workflow_labels``. An empty prefix turns the routing off.
+    model_tier_prefix: str = "model:"
 
     @property
     def terminal(self) -> set[str]:
@@ -541,13 +554,6 @@ class DispatchConfig:
     # root merely waiting out a slow CI cycle or an overnight review is not
     # paged as stuck.
     dependency_stall_minutes: Annotated[int, Typed, NonNeg] = 1440
-    # Issue #1853: DEPRECATED no-op, kept only so existing config files that
-    # set it still parse. The worker-GitHub-token dispatch gate (issue #1001)
-    # was retired when the operator decided workers stay credential-free by
-    # design — PR mutations flow through ``.worker-outcome.json`` and the
-    # authenticated orchestrator applies them (see ``rework_outcome.py``).
-    # The staged-rollout plan this flag served (issue #1224) is superseded.
-    require_worker_github_token: Annotated[bool, Typed] = False
     # Issue #1944: on a repo with no remote, an agent branch whose commits are
     # unreachable from the default branch can never become "pushed" — there is
     # nowhere to push — so refusing to reset it escalates the issue on every
@@ -560,6 +566,13 @@ class DispatchConfig:
     # unpushed commits there keep refusing either way, because a salvage push
     # is real.
     archive_unreachable_local_commits: Annotated[bool, Typed] = True
+    # Issue #2289: a fresh redispatch whose previous attempt died of a provider
+    # throttle (rate_limited, quota_exhausted, ...) is seeded from the work that
+    # death preserved (rescue ref or attempt ref) instead of restarting from the
+    # base, so an issue needing more than one rate-limit window can finish. ON by
+    # default; set to false to restore the always-clean-base behavior. Any
+    # conflict or error falls back to the clean base either way.
+    resume_throttled_attempts: Annotated[bool, Typed] = True
 
     def __post_init__(self) -> None:
         # Normalize to a tuple of forward-slash strings. The writer marker is
@@ -1121,6 +1134,12 @@ class AutoMergeConfig:
     # run id for a check has been retried this many times on the current
     # head, the PR escalates to a human instead of retrying forever.
     infra_rerun_attempt_cap: int = 2
+    # DD-13: defer an infra rerun (without consuming an attempt)
+    # while the repo's oldest queued CI job has waited at least this many
+    # seconds, per the freshest runner_allocation event. A rerun adds a full
+    # run to a lane that is already queuing. Fails open on missing/stale data.
+    # 0 disables (kill switch).
+    infra_rerun_backlog_defer_seconds: Annotated[int, Typed, NonNeg] = 900
     # Issue #1383: classification + escalation knobs for required checks
     # that fail because of a fleet-wide infra condition (Actions budget /
     # runner outage) rather than the PR's code. See InfraBlockedConfig.
@@ -1171,6 +1190,13 @@ class AutoMergeConfig:
     # merged, so no new post-merge bookkeeping is added here. Default None
     # preserves today's self-merge behavior byte-for-byte.
     mergequeue_label: Annotated[str | None, Typed, NonEmpty] = None
+    # TIS-CW-7: Aviator's skip-line label (``merge_rules.labels.skip_line`` in the
+    # repo's ``.aviator/config.yml``). The hand-off adds it, before
+    # ``mergequeue_label``, to a PR whose linked issue carries
+    # ``<labels.priority_prefix>critical``, so Aviator queues it at the front.
+    # Only the hand-off reads it, so it does nothing unless ``mergequeue_label``
+    # is set. ``null`` is the kill switch.
+    mergequeue_skip_line_label: Annotated[str | None, Typed, NonEmpty] = "mergequeue-skip-line"
     # Issue #1194: GitHub account login of the merge-queue bot (e.g.
     # "aviator-app[bot]") whose branch sync-merges the #502 unauthorized-merge
     # tripwire may recognize as approval-covered. Deployment config, not
@@ -1242,7 +1268,7 @@ class AutoMergeConfig:
         # Normalizations (not rules): the label/login thread verbatim into
         # `gh pr edit --add-label <label>` / a commit-author comparison, so surrounding
         # whitespace must not survive; the wedge window is stored as a float.
-        for name in ("mergequeue_label", "queue_bot_login"):
+        for name in ("mergequeue_label", "mergequeue_skip_line_label", "queue_bot_login"):
             value = getattr(self, name)
             if isinstance(value, str):
                 object.__setattr__(self, name, value.strip())
@@ -1372,6 +1398,9 @@ class RuntimeConfig:
         "usage quota has been exhausted",
         "quota exceeded",
         "usage limit",
+        # opencode run: OpenCode Go / Zen limit types (error JSON responseBody).
+        "GoUsageLimitError",
+        "FreeUsageLimitError",
     )
     # Bounded retry for transient GitHub API failures (TLS blips, connection
     # resets, gateway 5xx, secondary rate limits, etc.) in GitHub.run().
@@ -1428,10 +1457,28 @@ class RuntimeConfig:
     # verifies ``resources.graphql.remaining`` from ``gh api rate_limit`` is at
     # least this value. Set to 0 to disable the guard.
     graphql_rate_limit_threshold: Annotated[int, Typed, BoolTolerant, NonNeg] = 1500
+    # Issue #2442: the fleet-wide GraphQL budget governor. The threshold above
+    # is the first reserve (reconcile, drift, review reaps defer below it);
+    # dispatch scans and probes defer below ``graphql_scan_reserve``; everything
+    # but merge, label writes and the unauthorized-merge tripwire defers below
+    # ``graphql_floor_reserve``. ``github_budget_governor: false`` restores the
+    # per-client budget, plain retries and the single threshold.
+    graphql_scan_reserve: Annotated[int, Typed, BoolTolerant, NonNeg] = 800
+    graphql_floor_reserve: Annotated[int, Typed, BoolTolerant, NonNeg] = 300
+    github_budget_governor: Annotated[bool, Typed] = True
+    # Longest a call waits for a primary rate-limit reset before it is deferred.
+    gh_primary_limit_max_wait_seconds: Annotated[float, Typed, BoolTolerant, NonNeg] = 30.0
     # Bounded in-memory event ring for state.json. A larger cap costs only a
     # few hundred KB of JSON and preserves far more diagnostic history when a
     # single sweep emits repetitive events. Tuned via config (issue #525).
     event_ring_size: Annotated[int, Typed, AtLeastOne] = 2000
+    # Issue #2195: directories (relative paths resolve against the repo root)
+    # holding interactive operator session worktrees -- Claude Code puts them
+    # under ``.claude/worktrees``. Foreign-checkout adoption refuses any
+    # worktree that resolves under one: an interactive session writes no
+    # ``.charlie-writer.json`` marker, so the marker gate cannot see it. On by
+    # default; set to ``[]`` to restore marker-only adoption gating.
+    operator_worktree_roots: Annotated[tuple[str, ...], Typed, NotNull] = (".claude/worktrees",)
     # Extra safety margin added to provider-reported rate-limit reset times
     # when computing the ``throttled_until`` defer deadline. Provider reset
     # estimates are floors, not guarantees; dispatching at T+0 races the
@@ -1560,8 +1607,12 @@ class ClaudeCodeConfig:
     command: Annotated[
         tuple[str, ...], CommandTemplate({"prompt_path", "issue_number", "branch"})
     ] = ()
-    # None -> worktree.py default (<repo_root>/.var/charlie-work/worktrees).
+    # None -> the host I/O volume when the ci-fleet manifest names one (see
+    # host_io_worker), else <state_dir>/worktrees. An explicit value always wins.
     worktrees_dir: str | None = None
+    # Kill switch for host_io_worker: False keeps worker worktrees and the uv
+    # cache off the host I/O volume even when its manifest is valid.
+    host_io_worktrees: Annotated[bool, Typed] = True
     # Disabled by default: a claude-code worker has a full agentic shell and
     # can run uv sync, which would rewrite the shared venv's editable install
     # metadata to point at the worktree (issue #274). Setting a relative path
@@ -2257,10 +2308,9 @@ class SupervisorConfig:
     ``FleetSupervisorConfig`` under the ``fleet_supervisor:`` section. The
     four fields below are the ones both loops share -- ``run_supervised``
     (per-repo) and ``run_fleet_supervise`` (fleet) each poll, cool down, and
-    bound their own runtime on the same cadence knobs. A moved key still
-    written under ``supervisor:`` keeps working during the migration window
-    (``parse_fleet_supervisor`` honors it and ``DEPRECATED_CONFIG_KEYS``
-    reports the read); issue #1979 removes the legacy locations.
+    bound their own runtime on the same cadence knobs. Issue #1979 removed
+    the migration window's legacy fallback: a moved key still written under
+    ``supervisor:`` now fails validation as an ordinary unknown key.
     """
 
     poll_interval_seconds: Annotated[int, Typed, BoolTolerant] = 20
@@ -2452,6 +2502,7 @@ class OrchestratorConfig:
     devin: DevinConfig = field(default_factory=DevinConfig)
     claude_code: ClaudeCodeConfig = field(default_factory=ClaudeCodeConfig)
     api_worker: ApiWorkerConfig = field(default_factory=ApiWorkerConfig)
+    opencode: OpenCodeConfig = field(default_factory=OpenCodeConfig)
     rescue: RescueConfig = field(default_factory=RescueConfig)
     worker: Annotated[
         WorkerRoleConfig,
@@ -2517,6 +2568,12 @@ class OrchestratorConfig:
             min_running_per_repo=(Typed, NonNeg),
             demand_idle_samples=(Typed, NonNeg),
             max_runs_scanned=(Typed, NonNeg),
+            # ci-fleet host I/O and leak-drain knobs: bools and paths, no coercion.
+            host_io=Typed,
+            host_io_manifest=Typed,
+            leak_drain=Typed,
+            leak_probe_path=Typed,
+            host_io_auto_exclusions=Typed,
         ),
         Check(_runner_floors_agree),
     ] = field(default_factory=RunnerAllocationConfig)
@@ -2529,6 +2586,8 @@ class OrchestratorConfig:
     )
     # One machine, one slot pool (issue #2124): host-wide like the runner sections.
     test_slots: Annotated[SlotPoolConfig, HostWideOnly] = field(default_factory=SlotPoolConfig)
+    # One dashboard per machine (ADR-0008): host-wide like the fleet supervisor.
+    dashboard: Annotated[DashboardConfig, HostWideOnly] = field(default_factory=DashboardConfig)
     post_mortem: PostMortemConfig = field(default_factory=PostMortemConfig)
     heartbeat: HeartbeatConfig = field(default_factory=HeartbeatConfig)
 
@@ -2649,19 +2708,10 @@ def build_config_from_data(data: dict[str, Any]) -> OrchestratorConfig:
     unknown = sorted(set(data) - known_sections)
     if unknown:
         raise unknown_sections_error(unknown, known_sections)
-    # Issue #1978: parse the fleet-scoped section BEFORE the loop reaches
-    # ``supervisor`` -- the parser pops the relocated keys out of
-    # ``data['supervisor']`` (the private deepcopy above, so the caller's dict
-    # is untouched) and applies the new-location > legacy > default precedence
-    # itself, raising ConfigError when both locations disagree.
-    prebuilt: dict[str, Any] = {"fleet_supervisor": parse_fleet_supervisor(data)}
     by_name = {spec.name: spec for spec in field_specs(OrchestratorConfig)}
     built: dict[str, Any] = {}
     for f in fields(OrchestratorConfig):
         if f.metadata.get("provenance"):
-            continue
-        if f.name in prebuilt:
-            built[f.name] = prebuilt[f.name]
             continue
         raw = _section(data, f.name)
         built[f.name] = validate_section(

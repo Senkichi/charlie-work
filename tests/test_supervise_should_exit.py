@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from _supervise_fixtures import _active_result, _drained_result
 from charlie_work.supervise import should_exit
-from charlie_work.workflow import CommandResult
+from charlie_work.command_result import CommandResult
 
 
 def test_should_exit_drained_returns_true() -> None:

@@ -32,6 +32,7 @@ from dataclasses import dataclass
 from typing import Annotated, Any
 
 from .config_validation import Entries, FieldError, NotNull, NullIsDefault, OneOf, Typed
+from .harnesses import HARNESS_REGISTRY
 
 logger = logging.getLogger(__name__)
 
@@ -92,12 +93,21 @@ def _text(value: Any) -> str:
 
 
 def check_role_chain(role: Any, config: Any = None) -> None:  # noqa: ARG001 (Check signature)
-    """Section hook: the chain-wide rules that need the primary. A chain with no
-    fallbacks is never checked, so a role without them behaves as before #2086."""
+    """Section hook: the chain-wide rules that need the primary. Only the
+    ``requires_model`` rule applies to a chain with no fallbacks (it guards a
+    harness that is new with it), so such a role otherwise behaves as before #2086."""
     entries = tuple(role.fallbacks or ())
+    chain = (RoleEntry(_text(role.harness), _text(role.model)), *entries)
+    for index, entry in enumerate(chain):
+        capabilities = HARNESS_REGISTRY.get(entry.harness)
+        if capabilities is not None and capabilities.requires_model and not entry.model.strip():
+            raise FieldError(
+                "model" if index == 0 else f"fallbacks[{index - 1}].model",
+                f"a non-empty model (harness {entry.harness!r} has no default model)",
+                entry.model,
+            )
     if not entries:
         return
-    chain = (RoleEntry(_text(role.harness), _text(role.model)), *entries)
     for index, entry in enumerate(chain):
         if entry.harness in _NON_SESSION_HARNESSES:
             raise FieldError(
@@ -154,7 +164,9 @@ def model_family(entry: RoleEntry) -> str | None:
     An empty claude-code model resolves to the harness's pinned Claude default,
     so it is ``anthropic``; any other empty model is unknown.
     """
-    model = entry.model.strip().lower()
+    # A provider-qualified model (``opencode-go/glm-5.3-flash``) names its
+    # family after the provider prefix.
+    model = entry.model.strip().lower().rpartition("/")[2]
     if not model:
         return "anthropic" if entry.harness == "claude-code" else None
     for prefix, family in _FAMILY_PREFIXES:

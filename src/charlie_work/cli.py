@@ -17,6 +17,7 @@ from .closing_keyword_gate_command import (
     run_closing_keyword_check_command,
 )
 from .mojibake_gate import find_mojibake_in_diff
+from .wait_pr import register_wait_pr_subparser, run_wait_pr_command
 from .ast_equivalence_gate_command import (
     register_ast_equivalence_check_subparser,
     run_ast_equivalence_check_command,
@@ -54,6 +55,11 @@ from .supervise_loop import (
 from .fleet_pause import register_fleet_pause_subparsers, run_fleet_pause, run_fleet_resume
 from .control_plane_priority import raise_supervisor_to_normal
 from .fleet_paths import fleet_dir
+from .dashboard_command import (
+    DASHBOARD_COMMAND,
+    register_dashboard_subparsers,
+    run_dashboard_command,
+)
 from .fleet_registry import _load_registry, touch_repo, count_fleet_runners
 from .fleet_status import (  # noqa: F401  (deliberate re-export)
     FLEET_STATUS_REPO_TIMEOUT_SECONDS,
@@ -119,8 +125,9 @@ from ci_fleet.charlie_work_adapter import (
 # importing back out through the adapter -- see that module's docstring on
 # the one-way boundary); the confinement here is about blast radius, not
 # layering.
-from .worktree import clean_worktrees
-from .workflow import CommandResult, OrchestratorApp
+from .worktree import clean_worktrees, merge_clean_results
+from .command_result import CommandResult
+from .workflow import OrchestratorApp
 
 
 def _add_dry_run(parser: argparse.ArgumentParser) -> None:
@@ -188,6 +195,7 @@ def build_parser() -> argparse.ArgumentParser:
             "to GitHub."
         ),
     )
+    register_dashboard_subparsers(subparsers)
     subparsers.add_parser("bootstrap-labels")
     subparsers.add_parser("intake")
 
@@ -576,6 +584,7 @@ def build_parser() -> argparse.ArgumentParser:
     register_collect_only_check_subparser(subparsers)
     register_junit_recorded_check_subparser(subparsers)
     register_experiment_report_subparser(subparsers)
+    register_wait_pr_subparser(subparsers)
 
     migrate_parser = subparsers.add_parser(
         "migrate-state-dir",
@@ -934,13 +943,16 @@ def run_doctor_command(args: argparse.Namespace) -> CommandResult:
 def run_worktree_clean_command(args: argparse.Namespace) -> CommandResult:
     ctx = bootstrap_command(args)
     state = load_state_locked(ctx.paths.state_file)
-    result = clean_worktrees(
-        ctx.repo_root,
-        resolved_layout(ctx.config, ctx.repo_root).worktrees,
-        state,
-        ctx.config,
-        ctx.gh,
-        dry_run=args.dry_run,
+    result = merge_clean_results(
+        [
+            (
+                root,
+                clean_worktrees(
+                    ctx.repo_root, root, state, ctx.config, ctx.gh, dry_run=args.dry_run
+                ),
+            )
+            for root in resolved_layout(ctx.config, ctx.repo_root).sweep_roots()
+        ]
     )
     return CommandResult(result.ok, result.message, result.data)
 
@@ -2507,6 +2519,7 @@ def _render_backlog_reachability(reachability: Any) -> str:
             f"{reason}={reachability[reason]}"
             for reason in (
                 "missing_ready",
+                "parked_unready",
                 "terminal_label",
                 "active_label",
                 "operator_claimed",
@@ -2606,6 +2619,8 @@ def main(argv: list[str] | None = None) -> int:
                 result = CommandResult(
                     False, f"unknown runners command: {args.runners_command}", {}
                 )
+        elif args.command == DASHBOARD_COMMAND:
+            result = run_dashboard_command(args)
         elif args.command == "worktree-clean":
             result = run_worktree_clean_command(args)
         elif args.command == "migrate-state-dir":
@@ -2624,6 +2639,8 @@ def main(argv: list[str] | None = None) -> int:
             result = run_junit_recorded_check_command(args)
         elif args.command == "experiment-report":
             result = run_experiment_report_command(args)
+        elif args.command == "wait-pr":
+            result = run_wait_pr_command(args)
         else:
             app = build_app(args)
             result = run_command(app, args)
@@ -2827,8 +2844,14 @@ def main(argv: list[str] | None = None) -> int:
                     print("  Errors:")
                     for error in errors:
                         print(f"    {error}")
+    elif args.command == "wait-pr" and not args.json_output:
+        print(result.message)
     else:
         print_result(result, json_output=args.json_output)
+
+    # #2444: wait-pr distinguishes failed (1) from timeout (2); ok alone can't.
+    if isinstance(result.data, dict) and "wait_pr_exit_code" in result.data:
+        return int(result.data["wait_pr_exit_code"])
 
     # #862: a supervisor exit that asked to be replaced must be distinguishable
     # from a deliberate stop, so the wrapper relaunches on the former and not

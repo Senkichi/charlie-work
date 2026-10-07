@@ -51,6 +51,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from .atomic_write import write_json_atomic
 from .config import OrchestratorConfig, PostMortemConfig, SignatureRule, WatchdogConfig
 
 if TYPE_CHECKING:
@@ -285,12 +286,7 @@ def _sidecar_path(sessions_dir: Path, issue_number: int) -> Path:
 
 
 def _write_json_atomic(path: Path, value: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    with tmp_path.open("w", encoding="utf-8") as handle:
-        json.dump(value, handle, indent=2, sort_keys=True)
-        handle.write("\n")
-    tmp_path.replace(path)
+    write_json_atomic(path, value)
 
 
 def read_post_mortem(sessions_dir: Path, issue_number: int) -> PostMortemRecord | None:
@@ -1229,17 +1225,19 @@ def _write_failure_kind_to_sidecar(
     see devin_shell.py / claude_code.py. Best-effort: any I/O failure here
     just means the existing log-tail classifier runs normally instead.
     """
+    from .claude_code import CLAUDE_RECORD_KINDS
+
     if worker.adapter_kind == "devin":
         from .devin_shell import _sidecar_path as devin_sidecar_path
         from .devin_shell import _write_json
 
         sidecar_path = devin_sidecar_path(sessions_dir, worker.issue_number)
         writer = _write_json
-    elif worker.adapter_kind == "claude-code":
+    elif worker.adapter_kind in CLAUDE_RECORD_KINDS:
         from .claude_code import _sidecar_path as claude_sidecar_path
         from .claude_code import _write_json_atomic as writer_fn
 
-        sidecar_path = claude_sidecar_path(sessions_dir, worker.issue_number)
+        sidecar_path = claude_sidecar_path(sessions_dir, worker.issue_number, worker.adapter_kind)
         writer = writer_fn
     else:
         return

@@ -34,6 +34,7 @@ from charlie_work.config import (
     RuntimeConfig,
     WorkerRoleConfig,
 )
+from charlie_work.host.fakes import FakeProcessProbe, FakeWorkerLauncher
 from charlie_work.instrumentation import query_events
 from charlie_work.paths import runtime_paths
 from charlie_work.state import load_state, save_state, state_lock
@@ -114,9 +115,7 @@ def _seed_dispatched_at_cap(paths, pr_number: int, issue_number: int, count: int
         save_state(paths.state_file, state)
 
 
-def test_attempt_cap_never_escalates_over_live_reviewer(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_attempt_cap_never_escalates_over_live_reviewer(tmp_path: Path, fake_host) -> None:
     """Issue #573: a PR at the attempt cap whose dispatched reviewer is ALIVE
     must not be escalated out from under it — the in-flight verdict would be
     orphaned (the reaper only records verdicts for dispatched claims).
@@ -130,7 +129,7 @@ def test_attempt_cap_never_escalates_over_live_reviewer(
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
     _write_review_packet(paths, 456, "sha-abc123")
     _seed_dispatched_at_cap(paths, 456, 123, 2)
-    monkeypatch.setattr("charlie_work.workflow._reviewer_pid_alive", lambda *_: True)
+    fake_host(probe=FakeProcessProbe({424242: 1.0}))
 
     result = app.dispatch_reviews()
 
@@ -143,9 +142,7 @@ def test_attempt_cap_never_escalates_over_live_reviewer(
     assert (123, config.labels.human_needed) not in fake_gh.labels_added
 
 
-def test_attempt_cap_still_escalates_dead_dispatched_claim(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_attempt_cap_still_escalates_dead_dispatched_claim(tmp_path: Path, fake_host) -> None:
     """The cap keeps escalating when the dispatched reviewer is dead — the
     liveness guard must not shield corpses."""
     config = OrchestratorConfig(
@@ -156,7 +153,7 @@ def test_attempt_cap_still_escalates_dead_dispatched_claim(
     app = OrchestratorApp(tmp_path, paths, config, fake_gh)
     _write_review_packet(paths, 456, "sha-abc123")
     _seed_dispatched_at_cap(paths, 456, 123, 2)
-    monkeypatch.setattr("charlie_work.workflow._reviewer_pid_alive", lambda *_: False)
+    fake_host(probe=FakeProcessProbe())
 
     result = app.dispatch_reviews()
 
@@ -1237,12 +1234,13 @@ def _fake_dispatch_sessions_factory(failure_kind: str | None):
 
 
 def test_dispatch_deterministic_failure_kind_escalates_on_first_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, fake_host
 ) -> None:
     app, fake_gh = _closed_pr_app(tmp_path)
-    monkeypatch.setattr(
-        "charlie_work.workflow.dispatch_sessions",
-        _fake_dispatch_sessions_factory("worktree_unsafe_shim_dirt"),
+    fake_host(
+        worker_launch=FakeWorkerLauncher(
+            [_fake_dispatch_sessions_factory("worktree_unsafe_shim_dirt")]
+        )
     )
 
     result = app.dispatch(limit=1)
@@ -1259,7 +1257,7 @@ def test_dispatch_deterministic_failure_kind_escalates_on_first_failure(
 
 
 def test_dispatch_worktree_unsafe_local_commits_escalates_as_judgment(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, fake_host
 ) -> None:
     """Issue #807: a ``worktree_unsafe_local_commits`` failure (genuine unpushed
     local commits on the worktree branch) must escalate immediately on first
@@ -1272,9 +1270,10 @@ def test_dispatch_worktree_unsafe_local_commits_escalates_as_judgment(
     ``escalated``, and this test fails.
     """
     app, fake_gh = _closed_pr_app(tmp_path)
-    monkeypatch.setattr(
-        "charlie_work.workflow.dispatch_sessions",
-        _fake_dispatch_sessions_factory("worktree_unsafe_local_commits"),
+    fake_host(
+        worker_launch=FakeWorkerLauncher(
+            [_fake_dispatch_sessions_factory("worktree_unsafe_local_commits")]
+        )
     )
 
     result = app.dispatch(limit=1)
@@ -1290,13 +1289,10 @@ def test_dispatch_worktree_unsafe_local_commits_escalates_as_judgment(
 
 
 def test_dispatch_non_deterministic_failure_kind_still_uses_redispatch_cap(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, fake_host
 ) -> None:
     app, fake_gh = _closed_pr_app(tmp_path)
-    monkeypatch.setattr(
-        "charlie_work.workflow.dispatch_sessions",
-        _fake_dispatch_sessions_factory(None),
-    )
+    fake_host(worker_launch=FakeWorkerLauncher([_fake_dispatch_sessions_factory(None)]))
 
     result = app.dispatch(limit=1)
 
@@ -1399,6 +1395,7 @@ def _fake_dispatch_result_factory(
 def test_dispatch_outcome_field_sets_pin_the_collapsed_branch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    fake_host,
     scenario: str,
     ok: bool,
     failure_kind: str | None,
@@ -1444,19 +1441,29 @@ def test_dispatch_outcome_field_sets_pin_the_collapsed_branch(
     deterministic-escalation arm must *overwrite* the stale escalation
     reason with the new one rather than leaving it in place.
     """
+    # Issue #2262: the phantom_live_worker scenario's salvage probe needs a
+    # real git repo to prove the branch carries no commits (the verdict that
+    # permits requeue); harmless for the other scenarios, which never probe.
+    from _worktree_fixtures import _init_repo
+
+    _init_repo(tmp_path)
+
     app, fake_gh = _closed_pr_app(tmp_path)
     _seed_dispatch_failed_at(app.paths, 123, ["2020-01-01T00:00:00+00:00"])
-    monkeypatch.setattr(
-        "charlie_work.workflow.dispatch_sessions",
-        _fake_dispatch_result_factory(
-            ok=ok,
-            failure_kind=failure_kind,
-            pid=12345 if pid_alive is not None else None,
-            process_start_time=1_234_567.0 if pid_alive is not None else None,
-        ),
+    fake_host(
+        worker_launch=FakeWorkerLauncher(
+            [
+                _fake_dispatch_result_factory(
+                    ok=ok,
+                    failure_kind=failure_kind,
+                    pid=12345 if pid_alive is not None else None,
+                    process_start_time=1_234_567.0 if pid_alive is not None else None,
+                )
+            ]
+        )
     )
     if pid_alive is not None:
-        monkeypatch.setattr("charlie_work.workflow.is_pid_alive", lambda pid, start: pid_alive)
+        fake_host(probe=FakeProcessProbe({12345: 1_234_567.0} if pid_alive else {}))
 
     app.dispatch(limit=1)
 

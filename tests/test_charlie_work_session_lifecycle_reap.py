@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 from _fakes_github import FakeGitHub
 from _rework_dispatch_fixtures import _wg
+from _host_fixtures import host_probe
 from charlie_work.config import (
     DevinConfig,
     OrchestratorConfig,
@@ -41,7 +42,6 @@ def test_dead_dispatched_worker_reaped_after_grace_period(tmp_path: Path) -> Non
     pushing, and the dispatch label held for 1+ hour because the #773 branch
     surfaces drift but never resets status or clears the label.
     """
-    from unittest.mock import patch
 
     config = OrchestratorConfig(
         devin=DevinConfig(),
@@ -115,7 +115,7 @@ def test_dead_dispatched_worker_reaped_after_grace_period(tmp_path: Path) -> Non
         encoding="utf-8",
     )
 
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+    with host_probe(alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         _detect_and_handle_orphaned_workers(
@@ -164,7 +164,6 @@ def test_dead_dispatched_worker_not_reaped_within_grace_period(tmp_path: Path) -
     ``continue``) is preserved so a freshly-dead worker is not prematurely
     escalated before its specific sub-branch has had a chance to act.
     """
-    from unittest.mock import patch
 
     config = OrchestratorConfig(
         devin=DevinConfig(),
@@ -251,7 +250,7 @@ def test_dead_dispatched_worker_not_reaped_within_grace_period(tmp_path: Path) -
         encoding="utf-8",
     )
 
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+    with host_probe(alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         _detect_and_handle_orphaned_workers(
@@ -281,7 +280,6 @@ def test_dead_dispatched_worker_reap_disabled_by_config(tmp_path: Path) -> None:
     worker with old drift stays ``dispatched`` -- the operator explicitly opted
     out.
     """
-    from unittest.mock import patch
 
     config = OrchestratorConfig(
         devin=DevinConfig(),
@@ -341,7 +339,7 @@ def test_dead_dispatched_worker_reap_disabled_by_config(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+    with host_probe(alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         _detect_and_handle_orphaned_workers(
@@ -373,7 +371,6 @@ def test_dead_dispatched_worker_provider_throttled_not_reaped(tmp_path: Path) ->
     issue's labels back to the dispatchable pool, and the redispatch is held
     by the ``throttled_until`` governor deferral until the window passes.
     """
-    from unittest.mock import patch
 
     config = OrchestratorConfig(
         devin=DevinConfig(),
@@ -462,7 +459,7 @@ def test_dead_dispatched_worker_provider_throttled_not_reaped(tmp_path: Path) ->
         encoding="utf-8",
     )
 
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+    with host_probe(alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         _detect_and_handle_orphaned_workers(
@@ -495,7 +492,6 @@ def test_dead_dispatched_worker_provider_throttled_reclaimed_and_retried(
     dispatchable pool, and becomes eligible for dispatch again once
     ``throttled_until`` passes.
     """
-    from unittest.mock import patch
 
     from _worker_fixtures import _make_stalled_devin_session, _stale_devin_probe
     from charlie_work.dead_worker_sweep import effects_sessions
@@ -578,7 +574,7 @@ def test_dead_dispatched_worker_provider_throttled_reclaimed_and_retried(
         }
     )
 
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+    with host_probe(alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         _detect_and_handle_orphaned_workers(
@@ -628,7 +624,6 @@ def test_dead_dispatched_worker_expired_throttle_window_still_reclaimed(
     minutes`` grace past the window's end for normal handling to reclaim
     the issue — and ``not is_throttled`` means it can redispatch at once.
     """
-    from unittest.mock import patch
 
     from _worker_fixtures import _make_stalled_devin_session, _stale_devin_probe
     from charlie_work.dead_worker_sweep import effects_sessions
@@ -715,7 +710,7 @@ def test_dead_dispatched_worker_expired_throttle_window_still_reclaimed(
         }
     )
 
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+    with host_probe(alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         _detect_and_handle_orphaned_workers(
@@ -745,7 +740,6 @@ def test_dead_dispatched_worker_non_throttle_kind_still_reaped(tmp_path: Path) -
     ``"stalled"``) must NOT disable the timed reap -- the exemption is
     scoped to ``PROVIDER_THROTTLE_FAILURE_KINDS``, not to any stamp.
     """
-    from unittest.mock import patch
 
     config = OrchestratorConfig(
         devin=DevinConfig(),
@@ -808,7 +802,7 @@ def test_dead_dispatched_worker_non_throttle_kind_still_reaped(tmp_path: Path) -
         encoding="utf-8",
     )
 
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+    with host_probe(alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         _detect_and_handle_orphaned_workers(
@@ -849,7 +843,6 @@ def test_dead_dispatched_worker_provider_throttled_reaped_once_window_inactive(
     to reclaim it — or was never armed, or is unparseable, the backstop
     resumes and the issue must escalate after the reap minutes elapse.
     """
-    from unittest.mock import patch
 
     config = OrchestratorConfig(
         devin=DevinConfig(),
@@ -921,7 +914,7 @@ def test_dead_dispatched_worker_provider_throttled_reaped_once_window_inactive(
         encoding="utf-8",
     )
 
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+    with host_probe(alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         _detect_and_handle_orphaned_workers(
@@ -1109,7 +1102,6 @@ def _run_no_pr_dead_worker_sweep(
     list, and counted-dispatch identity each pass, so one pass is enough to
     observe which branch the #1917 gate took.
     """
-    from unittest.mock import patch
 
     config = OrchestratorConfig(
         devin=DevinConfig(),
@@ -1147,7 +1139,7 @@ def _run_no_pr_dead_worker_sweep(
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
 
-    with patch("charlie_work.workflow._worker_pid_alive", return_value=False):
+    with host_probe(alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         _detect_and_handle_orphaned_workers(

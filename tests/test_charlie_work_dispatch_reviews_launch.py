@@ -27,6 +27,7 @@ from charlie_work.config import (
     ReviewDispatchConfig,
     ReviewerRoleConfig,
 )
+from charlie_work.host.fakes import FakeProcessProbe
 from charlie_work.paths import runtime_paths
 from charlie_work.state import (
     load_state,
@@ -315,7 +316,9 @@ def test_dispatch_reviews_experiment_disabled_records_no_arm(monkeypatch, tmp_pa
     assert state["prs"]["100"]["review_effort_used"] == "high"
 
 
-def test_dispatch_reviews_launch_failure_releases_claim(monkeypatch, tmp_path: Path) -> None:
+def test_dispatch_reviews_launch_failure_releases_claim(
+    monkeypatch, tmp_path: Path, fake_host
+) -> None:
     """Issue #487: a failed reviewer launch (e.g. WinError 2 from an
     unresolved npm ``.CMD`` shim) must not strand the PR at
     ``review_dispatch_pending`` forever. ``dispatch_reviews`` claims the PR
@@ -345,20 +348,9 @@ def test_dispatch_reviews_launch_failure_releases_claim(monkeypatch, tmp_path: P
         "failed to launch claude: [WinError 2] The system cannot find the file specified"
     )
 
-    def fake_launch_failure(*args: Any, **kwargs: Any) -> ClaudeWorkerRecord:
-        return ClaudeWorkerRecord(
-            issue_number=kwargs.get("issue_number") or args[0],
-            branch=kwargs.get("branch") or args[1],
-            worktree_path="/fake/worktree",
-            prompt_path="/fake/prompt.md",
-            command=("claude", "-p", "--permission-mode", "plan"),
-            pid=None,
-            started_at="2026-07-20T12:00:00Z",
-            log_path="/fake/log.log",
-            error=launch_error,
-        )
+    from charlie_work.host.fakes import FakeReviewLauncher
 
-    monkeypatch.setattr("charlie_work.workflow.launch_claude_worker", fake_launch_failure)
+    fake_host(launch=FakeReviewLauncher([launch_error]))
 
     result = app.dispatch_reviews()
 
@@ -429,7 +421,7 @@ def test_dispatch_reviews_launch_success_clears_stale_review_dispatch_error(
     assert state["prs"]["100"]["review_dispatch_error"] is None
 
 
-def test_dispatch_reviews_prevents_double_dispatch(monkeypatch, tmp_path: Path) -> None:
+def test_dispatch_reviews_prevents_double_dispatch(monkeypatch, tmp_path: Path, fake_host) -> None:
     """Issue #370: a live reviewer blocks re-dispatch of the same PR."""
     prs = [
         {
@@ -455,12 +447,9 @@ def test_dispatch_reviews_prevents_double_dispatch(monkeypatch, tmp_path: Path) 
         launched.append((args, kwargs))
         return _fake_claude_worker_record(100, "agent/issue-10-fix")
 
-    def fake_is_pid_alive(pid: int, *_args: Any, **_kwargs: Any) -> bool:
-        # Pretend the fake reviewer PID is still alive.
-        return pid == 12345
-
     monkeypatch.setattr("charlie_work.workflow.launch_claude_worker", fake_launch)
-    monkeypatch.setattr("charlie_work.workflow.is_pid_alive", fake_is_pid_alive)
+    # Pretend the fake reviewer PID (12345, start-time 1.0) is still alive.
+    fake_host(probe=FakeProcessProbe({12345: 1.0}))
 
     first = app.dispatch_reviews()
     assert first.data["launched_count"] == 1

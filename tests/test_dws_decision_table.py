@@ -14,6 +14,7 @@ import dataclasses
 from pathlib import Path
 
 import pytest
+from _src_ast import parsed
 from _dws_facts import (
     NOW,
     STAMP,
@@ -37,6 +38,7 @@ from charlie_work.dead_worker_sweep.model import (
     DrainNoOp,
     Emit,
     Escalate,
+    ExemptThrottleCleanExit,
     FateResult,
     FetchOpenIssues,
     GuardedUpdate,
@@ -283,6 +285,7 @@ def _pr_answers(*, decision="request_changes", reviewed="old", exit_code=1, extr
             ApplyOutcomes: True,
             GuardedUpdate: True,
             CreditDeadWorker: CreditResult(failure_kind=None, throttled_until=None),
+            ExemptThrottleCleanExit: CreditResult(failure_kind=None, throttled_until=None),
         }
         | (extra or {})
     )
@@ -388,7 +391,12 @@ def test_without_a_review_callback_head_change_is_recorded_as_drift() -> None:
 def test_same_head_nonzero_exit_resets_to_rework_and_credits_the_death() -> None:
     answers = _pr_answers(reviewed="live1", exit_code=1)
     pre, lock, post = drive_all_phases(make_facts(state_with({7: dispatched()})), answers)
-    assert CreditDeadWorker(7) in lock.requests
+    # Issue #2282: the request carries the dead epoch's dispatch stamp and PR so
+    # a provider-throttle death can refund its own dispatch.
+    assert (
+        CreditDeadWorker(7, dispatched_at=dispatched()["dispatched_at"], pr_number=70)
+        in lock.requests
+    )
     statuses = [u.set_fields.get("status") for u in lock.commits_of(UpdateIssue)]
     assert "rework_requested" in statuses
     assert "orphaned_worker_recovered" in lock.emitted()
@@ -399,8 +407,34 @@ def test_same_head_clean_exit_queues_the_no_op_drain() -> None:
     answers = _pr_answers(reviewed="live1", exit_code=0)
     _pre, lock, post = drive_all_phases(make_facts(state_with({7: dispatched()})), answers)
     assert "CreditDeadWorker" not in lock.request_types()
+    # Issue #2286: the clean-exit branch asks the throttle question first; an
+    # unexempted answer falls through to the ordinary no-op route.
+    assert (
+        ExemptThrottleCleanExit(7, dispatched_at=dispatched()["dispatched_at"], pr_number=70)
+        in lock.requests
+    )
     (drain,) = [r for r in post.requests if isinstance(r, DrainNoOp)]
     assert [r.reason for r in drain.routes] == ["dead_worker_no_op"]
+
+
+def test_same_head_clean_exit_throttle_restores_rework_without_no_op() -> None:
+    """Issue #2286: a terminal-throttle answer resets like a death, with no drain."""
+    answers = _pr_answers(
+        reviewed="live1",
+        exit_code=0,
+        extra={
+            ExemptThrottleCleanExit: CreditResult(
+                failure_kind="rate_limited", throttled_until="2030-01-01T00:00:00Z"
+            )
+        },
+    )
+    _pre, lock, post = drive_all_phases(make_facts(state_with({7: dispatched()})), answers)
+    statuses = [u.set_fields.get("status") for u in lock.commits_of(UpdateIssue)]
+    assert "rework_requested" in statuses
+    (recovered,) = [c for c in lock.commits_of(Emit) if c.kind == "orphaned_worker_recovered"]
+    assert recovered.payload["reason"] == "dead_worker_clean_exit_throttle"
+    assert recovered.payload["failure_kind"] == "rate_limited"
+    assert "DrainNoOp" not in post.request_types()
 
 
 def test_same_head_declared_blocked_escalates_the_pr_issue() -> None:
@@ -514,7 +548,7 @@ def _imports(tree: ast.AST) -> set[str]:
 
 @pytest.mark.parametrize("path", sorted(_PKG.glob("decide*.py")), ids=lambda p: p.name)
 def test_decide_modules_are_pure(path: Path) -> None:
-    tree = ast.parse(path.read_text(encoding="utf-8"))
+    tree = parsed(path)
     bad_imports = {
         name
         for name in _imports(tree)
@@ -653,7 +687,11 @@ def test_ports_cover_exactly_the_workflow_attributes() -> None:
     import charlie_work.workflow as wf
     from charlie_work.dead_worker_sweep.ports import _WORKFLOW_ATTRS, SweepPorts
 
-    assert {f.name for f in dataclasses.fields(SweepPorts)} == set(_WORKFLOW_ATTRS)
+    # ``worker_pid_alive`` is the one port with no workflow delegate left
+    # (issue #2235): it binds ``live_session_count._ghost_pid_alive`` instead.
+    assert {f.name for f in dataclasses.fields(SweepPorts)} == {"worker_pid_alive"} | set(
+        _WORKFLOW_ATTRS
+    )
     missing = [attr for attr in _WORKFLOW_ATTRS.values() if not hasattr(wf, attr)]
     assert missing == []
 
@@ -710,3 +748,47 @@ def test_draft_take_rejects_a_deleted_base_key() -> None:
     draft.work.pop("pid")
     with pytest.raises(ValueError, match="pid"):
         draft.take()
+
+
+def test_strip_and_flag_writes_through_gate_with_repo_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #2226: the sweep's strip lane writes through the WriteGate —
+    the ``lifecycle_transition`` row lands in events.db bound to the sweep's
+    repo (``_wg`` binds ``charlie-work``), not repo=NULL."""
+    from _fakes_github import FakeGitHub
+    from _rework_dispatch_fixtures import _wg
+    from charlie_work import state as state_mod
+    from charlie_work.dead_worker_sweep import SweepPorts, apply, ports_from_workflow
+    from charlie_work.dead_worker_sweep.model import SweepPlan
+
+    state_file = tmp_path / "state.json"
+    state_mod.save_state(state_file, state_with({7: dispatched()}))
+    real = ports_from_workflow()
+    ports = SweepPorts(
+        **{
+            **{f.name: getattr(real, f.name) for f in dataclasses.fields(SweepPorts)},
+            "worker_pid_alive": lambda entry: False,
+            "utc_now": lambda: STAMP,
+        }
+    )
+    gh = FakeGitHub()
+    gh.issues = [NO_PR_ISSUE]
+
+    def plans(facts, observed):
+        if facts.phase != "pre":
+            return SweepPlan((), ())
+        for req in (FetchOpenIssues(), StripAndFlag(7, "worker_declared_blocked")):
+            if req not in observed:
+                return SweepPlan((req,), ())
+        return SweepPlan((), ())
+
+    monkeypatch.setattr(apply, "decide", plans)
+    apply.run_orphan_sweep(tmp_path, state_file, CFG, gh, write_gate=_wg(state_file), ports=ports)
+
+    assert (7, CFG.labels.human_needed) in gh.labels_added
+    assert (7, ACTIVE) in gh.labels_removed
+    (event,) = _events(state_file, "lifecycle_transition")
+    assert event["payload"]["to_state"] == "human_needed"
+    assert event["payload"]["cause"] == "escalated"
+    assert event["repo"] == "charlie-work"

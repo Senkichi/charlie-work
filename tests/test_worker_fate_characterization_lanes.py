@@ -31,6 +31,7 @@ from _worker_fate_characterization_fixtures import (
     _seed_no_pr_dispatched_issue,
     _wg,
 )
+from _host_fixtures import host_probe
 
 
 # ---------------------------------------------------------------------------
@@ -276,7 +277,7 @@ def test_flip7_workflow_empty_terminal_outcome_falls_through_to_worktree(tmp_pat
     fake_gh = _no_pr_fake_gh(tmp_path, config, issue_number)
 
     with (
-        patch("charlie_work.workflow._worker_pid_alive", return_value=False),
+        host_probe(alive=False),
         patch("charlie_work.workflow.remote_branch_head_sha", return_value=None),
         patch("charlie_work.workflow.remote_branch_ahead_count", return_value=(0, None)),
     ):
@@ -524,7 +525,7 @@ def test_preserve_a2_is_worker_alive_and_is_session_alive_agree(tmp_path: Path) 
     dead_pid = 999_999_937
     for pid in (None, 0, -1, dead_pid):
         expected = worker_fate.is_alive(pid, None)
-        for kind in ("devin", "claude-code", "api"):
+        for kind in ("devin", "claude-code", "api", "opencode"):
             assert view(kind, pid).is_alive() is expected, (kind, pid)
     # None / non-positive pids are dead by definition, independent of the host.
     assert worker_fate.is_alive(None, None) is False
@@ -533,5 +534,5 @@ def test_preserve_a2_is_worker_alive_and_is_session_alive_agree(tmp_path: Path) 
     # An unrecognised adapter kind has no fate profile -> conservatively dead.
     assert view("no-such-adapter", os.getpid()).is_alive() is False
     # A live pid reads alive through every adapter's view.
-    for kind in ("devin", "claude-code", "api"):
+    for kind in ("devin", "claude-code", "api", "opencode"):
         assert view(kind, os.getpid()).is_alive() is True, kind

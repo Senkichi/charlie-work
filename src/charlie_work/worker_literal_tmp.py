@@ -140,7 +140,9 @@ def emit_literal_tmp_path_warning(
     The consumer is ``heartbeat_check.py``'s ``check_warning_events``,
     which reads every ``level='warning'`` row.
     """
-    if worker.adapter_kind not in ("claude-code", "api"):
+    from .claude_code import CLAUDE_RECORD_KINDS
+
+    if worker.adapter_kind not in CLAUDE_RECORD_KINDS:
         return
     tmp_commands = literal_tmp_shell_commands(worker.log_path)
     if not tmp_commands:

@@ -191,6 +191,7 @@ _FLEET_DIR_HELPERS: list[object] = [
         "fleet-supervisor.lock",
         id="fleet_supervisor_lock_path",
     ),
+    pytest.param(layout.dashboard_db_path, "dashboard.db", id="dashboard_db_path"),
     pytest.param(
         layout.notify_health_state_path,
         "notify_health_state.json",

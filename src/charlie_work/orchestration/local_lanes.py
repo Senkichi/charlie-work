@@ -39,9 +39,11 @@ from typing import Any, Sequence
 
 import charlie_work.superseded_worker_reap as superseded_worker_reap
 import charlie_work.workflow as _wf
+from charlie_work.command_result import CommandResult
 from charlie_work.worker_pid_stamp import stamp_worker_process
 from charlie_work.adapters import SessionRequest
 from charlie_work.claude_code import resolve_review_effort
+import charlie_work.fleet_provider_throttle as fleet_provider_throttle
 from charlie_work import role_selection
 from charlie_work.fleet_registry import try_acquire_fleet_lock
 from charlie_work.worker_launch_gate import (
@@ -51,7 +53,7 @@ from charlie_work.worker_launch_gate import (
     _launch_workers,
     issue_worker_launch_permit,
 )
-from charlie_work.github import GitHubError
+from charlie_work.github import GitHubError, label_names
 from charlie_work.review_fleet_gate import (
     fleet_review_lock,
     fleet_review_lock_deferral,
@@ -104,7 +106,7 @@ _REVIEW_STALE_CLAIM_TIMEOUT_MINUTES = 5
 # ``local_lane_stall_alarm.py`` (#1968).
 
 
-def _local_lane(self, *, now: Any = None, limit: int | None = None) -> _wf.CommandResult:
+def _local_lane(self, *, now: Any = None, limit: int | None = None) -> CommandResult:
     """One pass of the local review/merge/rework lane.
 
     Runs inside ``loop()`` after ``dispatch_reviews``. Read-only no-op on a
@@ -125,13 +127,13 @@ def _local_lane(self, *, now: Any = None, limit: int | None = None) -> _wf.Comma
     pre-drain behavior -- it only claims verdict-driven candidates.
     """
     if publishes_pull_requests(self.gh):
-        return _wf.CommandResult(
+        return CommandResult(
             True,
             "backend publishes pull requests; local lane not applicable",
             {"local": False},
         )
     if self.dry_run:
-        return _wf.CommandResult(
+        return CommandResult(
             True,
             "dry run",
             {"local": True, "dry_run": True},
@@ -151,7 +153,7 @@ def _local_lane(self, *, now: Any = None, limit: int | None = None) -> _wf.Comma
         if launches_suspended
         else self._local_dispatch_rework()
     )
-    return _wf.CommandResult(
+    return CommandResult(
         True,
         "local lane pass complete",
         {
@@ -679,7 +681,7 @@ def _local_build_packet(
     return {"issue": issue_number, "ok": True, "head": head, "branch": branch}
 
 
-@fleet_review_lock(lambda data: _wf.CommandResult(True, "local review dispatch pass", data))
+@fleet_review_lock(lambda data: CommandResult(True, "local review dispatch pass", data))
 def _local_dispatch_reviewers(self, *, now: Any = None, launch_lock: Any = None) -> dict[str, Any]:
     """Claim and launch reviewers for lane records whose head is packetized.
 
@@ -863,7 +865,6 @@ def _local_dispatch_reviewers(self, *, now: Any = None, launch_lock: Any = None)
 
     reviewer_harness = role_cfg.reviewer.harness
     reviewer_adapter_settings = self._adapter_settings(adapter=reviewer_harness)
-    reviewer_launcher = _wf._REVIEW_LAUNCHERS.get(reviewer_harness)
     launched: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
     quota_hit = False
@@ -886,16 +887,9 @@ def _local_dispatch_reviewers(self, *, now: Any = None, launch_lock: Any = None)
             if not head_sha:
                 failed.append({"pr": pr_number, "error": "packet head missing"})
                 continue
-            if reviewer_launcher is None:
-                failed.append(
-                    {
-                        "pr": pr_number,
-                        "error": f"unsupported reviewer harness: {reviewer_harness!r}",
-                    }
-                )
-                continue
             prompt_text = prompt_path.read_text(encoding="utf-8")
-            launch_record = reviewer_launcher(
+            launch_record = self.host.launch.launch(
+                reviewer_harness,
                 pr_number=pr_number,
                 branch=branch,
                 prompt_path=prompt_path,
@@ -1017,7 +1011,7 @@ def record_local_review(
     verdict_provenance: str,
     allow_stale_head: bool = False,
     verdict_source: str | None = None,
-) -> _wf.CommandResult:
+) -> CommandResult:
     """Record a review verdict for a local-lane record (no ``pr_view``).
 
     Local mirror of ``record_review``: same decision file (``prs/pr-<n>/
@@ -1029,16 +1023,16 @@ def record_local_review(
     issue via ``issue_comment`` instead of ``pr_comment``.
     """
     if decision not in ("approved", "request_changes", "blocked"):
-        return _wf.CommandResult(False, f"invalid decision: {decision}", {})
+        return CommandResult(False, f"invalid decision: {decision}", {})
     if verdict_provenance not in _wf.VERDICT_PROVENANCE_VALUES:
-        return _wf.CommandResult(False, f"invalid verdict provenance: {verdict_provenance}", {})
+        return CommandResult(False, f"invalid verdict provenance: {verdict_provenance}", {})
     summary_text = summary_file.read_text(encoding="utf-8") if summary_file else summary
     # Same rule as record_review: empty summary rejects, empty
     # required_changes never does -- it derives from the summary (or marks
     # the channel "vacuous") so a malformed verdict can never wedge the lane
     # in a silent re-review loop.
     if decision in {"request_changes", "blocked"} and not summary_text.strip():
-        return _wf.CommandResult(
+        return CommandResult(
             False,
             f"--summary or --summary-file is required for decision '{decision}'",
             {},
@@ -1067,7 +1061,7 @@ def record_local_review(
     guard_state = _wf.load_state_locked(self.paths.state_file)
     pr_state = (guard_state.get("prs") or {}).get(str(pr_number), {})
     if not is_local_pr_record(pr_state):
-        return _wf.CommandResult(
+        return CommandResult(
             False,
             f"prs[{pr_number}] is not a local-lane record",
             {"pr": pr_number},
@@ -1076,13 +1070,13 @@ def record_local_review(
     issue_number = int(issue_number) if issue_number is not None else pr_number
     guard_issue_state = (guard_state.get("issues") or {}).get(str(issue_number), {})
     if pr_state.get("status") in ("merged", "closed"):
-        return _wf.CommandResult(
+        return CommandResult(
             False,
             f"local record {pr_number} is already {pr_state.get('status')}; verdict not recorded",
             {"pr": pr_number, "issue": issue_number, "terminal": True},
         )
     if pr_state.get("status") == "escalated" or guard_issue_state.get("status") == "escalated":
-        return _wf.CommandResult(
+        return CommandResult(
             False,
             f"local record {pr_number} is escalated; verdict not recorded "
             "(unescalate the issue first)",
@@ -1102,7 +1096,7 @@ def record_local_review(
                 and live_head_sha is not None
                 and packet_head_sha != live_head_sha
             ):
-                return _wf.CommandResult(
+                return CommandResult(
                     False,
                     f"reviewed head ({reviewed_head}) matches packet head "
                     f"({packet_head_sha}) but live branch head has moved to "
@@ -1127,7 +1121,7 @@ def record_local_review(
                 options.append(f"packet head {packet_head_sha}")
             if live_head_sha is not None:
                 options.append(f"live head {live_head_sha}")
-            return _wf.CommandResult(
+            return CommandResult(
                 False,
                 f"reviewed-head {reviewed_head} does not match "
                 f"{' or '.join(options) if options else 'any available head'}",
@@ -1138,7 +1132,7 @@ def record_local_review(
         and live_head_sha is not None
         and packet_head_sha != live_head_sha
     ):
-        return _wf.CommandResult(
+        return CommandResult(
             False,
             f"review packet head ({packet_head_sha}) differs from live branch "
             f"head ({live_head_sha}); pass reviewed_head to choose the head "
@@ -1152,7 +1146,7 @@ def record_local_review(
         reviewed_head_sha = live_head_sha
         reviewed_head_source = "live"
     else:
-        return _wf.CommandResult(False, "no packet or live branch head available", {})
+        return CommandResult(False, "no packet or live branch head available", {})
 
     # The patch-id must describe the head the verdict is pinned to (issue
     # #2151). The packet's diff.patch is that head's diff only when the
@@ -1493,7 +1487,7 @@ def record_local_review(
         )
     if label_error:
         message += f" (label update failed: {label_error.get('outcome', label_error)})"
-    return _wf.CommandResult(
+    return CommandResult(
         True,
         message,
         {
@@ -1527,8 +1521,16 @@ def _local_dispatch_rework(self) -> dict[str, Any]:
     attachment, the base sync-merge, and the conflict notice are all
     origin-tolerant already.
     """
-    result: dict[str, Any] = {"dispatched": [], "failed": [], "skipped": []}
+    result: dict[str, Any] = {
+        "dispatched": [],
+        "failed": [],
+        "skipped": [],
+        "operator_claimed_skipped": [],
+    }
     state = _wf.load_state_locked(self.paths.state_file)
+    # Issue #400, as the remote lane applies it: ``charlie claim N`` hands the
+    # branch to the operator, so a rework worker must not launch onto it.
+    operator_claimed = _wf.operator_claimed_issues(state)
     candidates: list[int] = []
     for pr_key, record in sorted(local_pr_records(state).items(), key=lambda kv: int(kv[0])):
         issue_number = int(record.get("issue_number") or pr_key)
@@ -1541,6 +1543,9 @@ def _local_dispatch_rework(self) -> dict[str, Any]:
         # status ("dispatched"/"dispatch_pending"), so this filter alone
         # excludes it; a stale claim is recovered by the dead-worker reap.
         if issue_entry.get("status") != "rework_requested":
+            continue
+        if issue_number in operator_claimed:
+            result["operator_claimed_skipped"].append(issue_number)
             continue
         prompt_path = self.paths.prs / f"pr-{pr_key}" / "rework-prompt.md"
         if not prompt_path.exists():
@@ -1564,6 +1569,18 @@ def _local_dispatch_rework(self) -> dict[str, Any]:
             self, result, candidates, decision.reason, **decision.report_fields()
         )
     with decision as permit:
+        # Issue #1993: fleet-wide window + staggered resume for the selected
+        # worker adapter, same gate the remote dispatch/rework lanes apply.
+        resume = fleet_provider_throttle.decide_for_app(self, selection=permit.role_selection)
+        if resume.deferred:
+            return _defer_local_rework(
+                self,
+                result,
+                candidates,
+                str(resume.deferred_reason),
+                throttled_until=resume.deferral_data()["throttled_until"],
+            )
+        candidates = candidates[: resume.cap_limit(len(candidates))]
         if permit.max_launches < len(candidates):
             _defer_local_rework(
                 self,
@@ -1575,7 +1592,7 @@ def _local_dispatch_rework(self) -> dict[str, Any]:
             candidates = candidates[: permit.max_launches]
         if not candidates:
             return result
-        return _launch_local_rework(self, state, candidates, result, permit)
+        return _launch_local_rework(self, state, candidates, result, permit, resume)
 
 
 def _defer_local_rework(
@@ -1607,6 +1624,7 @@ def _launch_local_rework(
     candidates: list[int],
     result: dict[str, Any],
     permit: WorkerLaunchPermit,
+    resume: fleet_provider_throttle.ResumeDecision,
 ) -> dict[str, Any]:
     """Claim and launch the gated local rework candidates."""
     requests: list[SessionRequest] = []
@@ -1615,6 +1633,16 @@ def _launch_local_rework(
         record = (state.get("prs") or {}).get(str(pr_number), {})
         issue_number = int(record.get("issue_number") or pr_number)
         issue_entry = (state.get("issues") or {}).get(str(issue_number), {})
+        # TIS-CW-6: carry the issue's labels so a ``model:<tier>`` issue reworks
+        # on its tier, as the remote lane does. Live labels first (the local
+        # backend reads a file); the intake snapshot in state is the fallback.
+        try:
+            live_issue = self.gh.issue_view(issue_number)
+        except (GitHubError, ValueError):
+            live_issue = None
+        label_source = (
+            live_issue if isinstance(live_issue, dict) and "labels" in live_issue else issue_entry
+        )
         requests.append(
             SessionRequest(
                 issue_number=issue_number,
@@ -1622,6 +1650,7 @@ def _launch_local_rework(
                 prompt_path=self.paths.prs / f"pr-{pr_number}" / "rework-prompt.md",
                 branch_name=str(record.get("branch") or record.get("headRefName") or ""),
                 rework=True,
+                labels=tuple(sorted(label_names(label_source))),
             )
         )
         request_issues[pr_number] = issue_number
@@ -1670,6 +1699,7 @@ def _launch_local_rework(
         dispatch_results.extend(
             _launch_workers(self, permit, self._adapter_settings(), launch_requests)
         )
+        fleet_provider_throttle.note_probe_from_results(self, resume, dispatch_results)
     successful = {r.issue_number for r in dispatch_results if r.ok}
     failed_map = {
         r.issue_number: (r.error or "dispatch failed") for r in dispatch_results if not r.ok

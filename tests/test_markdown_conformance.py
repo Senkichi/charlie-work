@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Protocol
 
 import pytest
+from _src_ast import parsed
 
 from _heartbeat_check_fixtures import _load_heartbeat_check
 from charlie_work import markdown_fence
@@ -87,7 +88,7 @@ def test_heartbeat_check_never_imports_markdown_fence() -> None:
     scripts_dir = Path(__file__).resolve().parent.parent / "scripts"
     offenders: list[str] = []
     for script in sorted(scripts_dir.glob("*.py")):
-        tree = ast.parse(script.read_text(encoding="utf-8"), filename=str(script))
+        tree = parsed(script)
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 names = [alias.name for alias in node.names]

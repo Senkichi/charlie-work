@@ -9,7 +9,7 @@ from __future__ import annotations
 
 
 import os
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -17,10 +17,9 @@ from ..config import (
     OrchestratorConfig,
 )
 from ..orphan_sweep import sweep_orphan_processes
-from ..process_utils import is_pid_alive
+from .. import host as _host
 from ..state import (
     load_state,
-    load_state_locked,
     state_lock,
 )
 from ..worker import WorkerHealth, WorkerView
@@ -208,62 +207,6 @@ def _emit_session_failed_relabeled(
     )
 
 
-def _count_live_sessions(sessions_dir: Path, state_file: Path | None = None) -> int:
-    """Count the number of currently alive worker sessions across both adapters.
-
-    Reads session sidecar files from both devin-shell and claude-code adapters,
-    then checks each record's PID liveness using the adapter-specific liveness
-    probe. Returns the total count of sessions with alive PIDs.
-
-    When ``state_file`` is given, this also corroborates the sidecar-based
-    count against state.json's own dispatched-issue ``worker_pid``/
-    ``worker_process_start_time`` records (issue #343). A sidecar can go
-    missing for a still-live process -- a "ghost" -- if a reap lane removes
-    it on ambiguous evidence (see ``_classify_dead_sessions_and_update_
-    throttle_state``'s corroboration gate) or through any other path that
-    strands state.json's dispatch record. Because the governor's dispatch
-    cap (``_apply_concurrency_governor``) is built on top of this count, a
-    ghost previously made a live process invisible to concurrency accounting
-    and let the next pass over-dispatch past the configured cap. state.json's
-    worker_pid fields are not touched by sidecar reaping, so any issue still
-    recorded as ``dispatched`` whose worker_pid is alive (pid + start-time,
-    recycling-safe) but has no corresponding live sidecar is counted here
-    too, and printed as a loud reconcile signal rather than silently treated
-    as free capacity.
-    """
-    from ..worker import iter_workers
-
-    live_issue_numbers: set[int] = set()
-    live_count = 0
-    for w in iter_workers(sessions_dir):
-        if w.is_alive():
-            live_count += 1
-            live_issue_numbers.add(w.issue_number)
-
-    if state_file is not None:
-        state = load_state_locked(state_file)
-        for issue_number_str, entry in state.get("issues", {}).items():
-            if not isinstance(entry, dict) or entry.get("status") != "dispatched":
-                continue
-            try:
-                issue_number = int(issue_number_str)
-            except (TypeError, ValueError):
-                continue
-            if issue_number in live_issue_numbers:
-                continue
-            if _worker_pid_alive(entry):
-                live_count += 1
-                print(
-                    f"[reconcile] issue {issue_number}: worker_pid "
-                    f"{entry.get('worker_pid')} is alive with no live session "
-                    "sidecar (ghost) -- counting it against the concurrency "
-                    "governor instead of treating the slot as free",
-                    flush=True,
-                )
-
-    return live_count
-
-
 def _detect_stalled_sessions(
     sessions_dir: Path, config: OrchestratorConfig, *, now: datetime | None = None
 ) -> list[dict[str, Any]]:
@@ -285,7 +228,6 @@ def _detect_stalled_sessions(
     ``terminal_reason`` are populated only for DEAD entries with a matching
     post-mortem sidecar (best-effort — absent when extraction found nothing).
     """
-    from datetime import UTC, datetime
     from ..post_mortem import read_post_mortem
     from ..worker import classify_worker_health, iter_workers, real_activity_probe_for
 
@@ -294,7 +236,7 @@ def _detect_stalled_sessions(
 
     stalled_entries: list[dict[str, Any]] = []
     if now is None:
-        now = datetime.now(UTC)
+        now = _host.current().clock.now()
 
     for w in iter_workers(sessions_dir):
         if w.pid is None or w.error is not None:
@@ -331,28 +273,6 @@ def _detect_stalled_sessions(
 # dry-run leak -- so they call the hoisted primitive raw, unchanged in
 # behavior. The one in-scope call site (`_sweep_orphan_processes_for_dead_sessions`)
 # now goes through `write_gate.kill_process` instead.
-
-
-def _worker_pid_alive(entry: dict[str, Any]) -> bool:
-    """Check if a worker PID from state.json is alive, with start-time verification.
-
-    This helper deduplicates the PID liveness check used across dispatch and
-    orphaned worker detection. It checks both PID liveness and process identity
-    via start time to detect PID recycling.
-
-    Args:
-        entry: A state.json issue entry containing worker_pid and optionally
-               worker_process_start_time.
-
-    Returns:
-        True if the worker PID is alive and the start time matches (if available),
-        False otherwise.
-    """
-    worker_pid = entry.get("worker_pid")
-    if worker_pid is None:
-        return False
-
-    return is_pid_alive(worker_pid, entry.get("worker_process_start_time"))
 
 
 def _orphan_head_fingerprint(remote_sha: str | None, local_sha: str | None) -> str:
@@ -451,8 +371,8 @@ def _sweep_orphan_processes_for_dead_sessions(
         if not worker_fate.is_alive(record.pid, record.process_start_time):
             dead_worktree_paths.add(record.worktree_path)
 
-    # Check claude-code sessions
-    for record in read_worker_records(sessions_dir):
+    # Check every ClaudeWorkerRecord kind (claude-code, api, opencode)
+    for record in read_worker_records(sessions_dir, adapter_kind=None):
         if record.pid is None or record.error is not None:
             continue
         if not worker_fate.is_alive(record.pid, record.process_start_time):
@@ -527,7 +447,7 @@ def _log_worker_census(sessions_dir: Path) -> None:
     from ..claude_code import read_worker_records
     from ..devin_shell import read_session_records
 
-    now = datetime.now(UTC)
+    now = _host.current().clock.now()
 
     def _age_seconds(started_at: str) -> int | None:
         try:
@@ -572,9 +492,7 @@ def _issues_with_live_workers(sessions_dir: Path) -> set[int]:
     """Return the set of issue numbers that have currently alive worker sessions.
 
     Reads session sidecar files from both devin-shell and claude-code adapters,
-    then checks each record's PID liveness using the adapter-specific liveness
-    probe. Returns the set of issue numbers with alive PIDs.
+    then checks each record's PID liveness through the host session port.
+    Returns the set of issue numbers with alive PIDs.
     """
-    from ..worker import iter_workers
-
-    return {w.issue_number for w in iter_workers(sessions_dir) if w.is_alive()}
+    return _host.current().sessions.live_issue_numbers(sessions_dir)

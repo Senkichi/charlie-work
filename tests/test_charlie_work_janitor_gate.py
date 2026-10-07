@@ -9,6 +9,7 @@ from __future__ import annotations
 import dataclasses
 from pathlib import Path
 import pytest
+from _src_ast import parsed
 from _dispatch_fixtures import _fail_if_launched
 from _fakes_github import FakeGitHubWithMissingRequired
 from _review_fixtures import _required_checks_config
@@ -94,8 +95,7 @@ def test_co_occurring_ci_red_branch_stays_inside_janitor_ok_gate() -> None:
     import ast
 
     src_path = Path(__file__).parents[1] / "src" / "charlie_work" / "workflow.py"
-    source = src_path.read_text(encoding="utf-8")
-    tree = ast.parse(source, filename=str(src_path))
+    tree = parsed(src_path)
 
     review_fn = None
     for node in ast.walk(tree):

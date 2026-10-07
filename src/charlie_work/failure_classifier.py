@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -253,6 +253,7 @@ def classify_failure(
     account_error_detection: bool = False,
     headless_permission_detection: bool = False,
     now: datetime | None = None,
+    log_digest: Callable[[str], str] | None = None,
 ) -> tuple[str | None, str | None]:
     """Classify a session failure by matching the log tail against provider
     throttle/auth/suspension signatures. Called after a session exits.
@@ -287,6 +288,10 @@ def classify_failure(
 
     ``now`` is the injectable clock: defaults to ``datetime.now(UTC)`` when
     not supplied, so production behaviour is byte-identical (issue #822).
+
+    ``log_digest`` (``AdapterFateProfile.log_digest``) narrows the log to the
+    harness's own provider-error records before the tail is taken, for a
+    harness whose log also carries tool output (opencode).
     """
     if not log_path.exists():
         return None, None
@@ -295,6 +300,8 @@ def classify_failure(
         log_text = log_path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None, None
+    if log_digest is not None:
+        log_text = log_digest(log_text)
 
     resolved_now = now if now is not None else datetime.now(UTC)
     # Check the last 2KB of the log (where error messages appear).

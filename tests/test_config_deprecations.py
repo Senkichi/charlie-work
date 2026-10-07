@@ -18,10 +18,12 @@ from __future__ import annotations
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
 from charlie_work import layout
+import charlie_work.config_deprecations as config_deprecations_module
 from charlie_work.config import ConfigError, OrchestratorConfig, load_config
 from charlie_work.config_deprecations import (
     DEPRECATED_CONFIG_KEYS,
@@ -45,28 +47,55 @@ from _config_deprecations_fixtures import (
 from _fakes_github import FakeGitHub
 
 
+# A registered-but-still-parseable key, injected via ``patch.object`` into
+# the module-level registry for the read-time-signal tests. The live
+# registry is empty since #1979 retired the ``supervisor.*`` family (its
+# last members) -- the same reason ``_SWEEP_ENTRY`` exists for the sweep
+# tests -- so exercising ``emit_deprecated_key_reads`` /
+# ``deprecated_keys_in`` against a real deprecated key needs a synthetic
+# one, and it must name a key the parser still accepts or the load fails
+# before the emit can be asserted on.
+_SIGNAL_ENTRY = DeprecatedConfigKey(
+    section="dispatch",
+    key="default_limit",
+    replacement=None,
+    removal_issue=4242,
+)
+
+
 # ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
 
 
-def test_registry_registers_require_worker_github_token_for_issue_1977():
-    match = [
-        entry
-        for entry in DEPRECATED_CONFIG_KEYS
-        if entry.section == "dispatch" and entry.key == "require_worker_github_token"
-    ]
-    assert len(match) == 1
-    entry = match[0]
-    assert isinstance(entry, DeprecatedConfigKey)
-    assert entry.removal_issue == 1977
-    assert entry.replacement is None or isinstance(entry.replacement, str)
+def test_registry_registers_require_worker_github_token_for_issue_1977(tmp_path: Path):
+    """Issue #1977: the registration this leaf name describes was itself the
+    removal target -- the registry must now carry NO entry for
+    ``dispatch.require_worker_github_token``, a config file that still sets
+    it fails with the normal unknown-key error, and no
+    ``config_key_deprecated_read`` event fires (the key is gone, not
+    deprecated).
+
+    The leaf name predates the removal and is kept verbatim: the
+    collect-only gate (issue #1538) fails a required check on any leaf-name
+    removal, rename included, absent the operator-applied
+    ``collect-gate-exempt`` label."""
+    assert all(
+        entry.dotted != "dispatch.require_worker_github_token" for entry in DEPRECATED_CONFIG_KEYS
+    )
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    config_path = _write_repo_config(repo, "dispatch:\n  require_worker_github_token: true\n")
+    with pytest.raises(ConfigError, match="unknown key"):
+        load_config(config_path)
+    assert query_events(_repo_state_path(repo), kind="config_key_deprecated_read") == []
 
 
 def test_deprecated_keys_in_finds_registered_key_in_section():
-    data = {"dispatch": {"require_worker_github_token": True}}
-    found = deprecated_keys_in(data)
-    assert [entry.dotted for entry in found] == ["dispatch.require_worker_github_token"]
+    data = {"dispatch": {"default_limit": 2}}
+    with patch.object(config_deprecations_module, "DEPRECATED_CONFIG_KEYS", (_SIGNAL_ENTRY,)):
+        found = deprecated_keys_in(data)
+    assert [entry.dotted for entry in found] == ["dispatch.default_limit"]
 
 
 def test_deprecated_keys_in_ignores_unregistered_key():
@@ -84,17 +113,18 @@ def test_load_config_emits_deprecated_read_event(tmp_path: Path):
     repo.mkdir()
     _write_repo_config(
         repo,
-        "dispatch:\n  require_worker_github_token: true\n",
+        "dispatch:\n  default_limit: 2\n",
     )
-    load_config(repo / "orchestrator.config.yaml")
+    with patch.object(config_deprecations_module, "DEPRECATED_CONFIG_KEYS", (_SIGNAL_ENTRY,)):
+        load_config(repo / "orchestrator.config.yaml")
 
     rows = query_events(_repo_state_path(repo), kind="config_key_deprecated_read")
     assert len(rows) == 1
     payload = rows[0]["payload"]
     assert payload["section"] == "dispatch"
-    assert payload["key"] == "require_worker_github_token"
+    assert payload["key"] == "default_limit"
     assert payload["source"] == str(repo / "orchestrator.config.yaml")
-    assert payload["issue_number"] == 1977
+    assert payload["issue_number"] == 4242
     assert rows[0]["level"] == "warning"
 
 
@@ -114,13 +144,14 @@ def test_layered_config_emits_per_layer(tmp_path: Path):
     fleet_dir = tmp_path / "fleet"
     fleet_dir.mkdir()
     (fleet_dir / layout.GLOBAL_CONFIG_FILENAME).write_text(
-        "dispatch:\n  require_worker_github_token: true\n", encoding="utf-8"
+        "dispatch:\n  default_limit: 9\n", encoding="utf-8"
     )
     repo = tmp_path / "repo"
     repo.mkdir()
-    _write_repo_config(repo, "dispatch:\n  require_worker_github_token: false\n")
+    _write_repo_config(repo, "dispatch:\n  default_limit: 2\n")
 
-    load_layered_config(repo, fleet_dir_override=str(fleet_dir))
+    with patch.object(config_deprecations_module, "DEPRECATED_CONFIG_KEYS", (_SIGNAL_ENTRY,)):
+        load_layered_config(repo, fleet_dir_override=str(fleet_dir))
 
     fleet_rows = query_events(layout.state_file_path(fleet_dir), kind="config_key_deprecated_read")
     assert len(fleet_rows) == 1
@@ -141,7 +172,7 @@ def test_sweep_key_only_in_untracked_local_layer_keeps_issue_unarmed(tmp_path: P
     repo.mkdir()
     _write_repo_config(
         repo,
-        "dispatch:\n  require_worker_github_token: true\n",
+        "dispatch:\n  synthetic_retired_key: true\n",
     )
     _write_fleet_registry(tmp_path / "fleet", {"repo-a": _registry_entry(repo)})
     gh = _fake_gh_with_issue(1977)
@@ -150,8 +181,8 @@ def test_sweep_key_only_in_untracked_local_layer_keeps_issue_unarmed(tmp_path: P
     result = _run_sweep(tmp_path, gh=gh, now=_NOW + timedelta(days=30))
 
     assert gh.labels_added == []
-    assert result["keys"]["dispatch.require_worker_github_token"]["present_in"]
-    finding = result["keys"]["dispatch.require_worker_github_token"]["present_in"][0]
+    assert result["keys"][_DOTTED]["present_in"]
+    finding = result["keys"][_DOTTED]["present_in"][0]
     assert finding["layer"] == "repo-untracked-local"
     assert finding["repo"] == "repo-a"
 
@@ -222,7 +253,7 @@ def test_sweep_reappearance_resets_quiet_clock(tmp_path: Path):
 
     _run_sweep(tmp_path, gh=gh, now=_NOW)
     # Key reappears mid-window.
-    config_path.write_text("dispatch:\n  require_worker_github_token: true\n", encoding="utf-8")
+    config_path.write_text("dispatch:\n  synthetic_retired_key: true\n", encoding="utf-8")
     _run_sweep(tmp_path, gh=gh, now=_NOW + timedelta(days=4))
     # Key removed again — the quiet clock restarts at the first pass that
     # observes the re-disappearance (+10d), not the original observation.
@@ -247,7 +278,7 @@ def test_sweep_reappearance_after_arming_regresses_and_keeps_label(tmp_path: Pat
     assert (1977, "automated-ready") in gh.labels_added
 
     # Key reappears after the issue was marked Ready.
-    config_path.write_text("dispatch:\n  require_worker_github_token: true\n", encoding="utf-8")
+    config_path.write_text("dispatch:\n  synthetic_retired_key: true\n", encoding="utf-8")
     _run_sweep(tmp_path, gh=gh, now=_NOW + timedelta(days=8))
 
     fleet_state = layout.state_file_path(tmp_path / "fleet")
@@ -322,7 +353,7 @@ def test_sweep_reports_presence_per_pass(tmp_path: Path):
     """The sweep's per-pass event reports where a registered key is still set."""
     repo = tmp_path / "repo-a"
     repo.mkdir()
-    _write_repo_config(repo, "dispatch:\n  require_worker_github_token: true\n")
+    _write_repo_config(repo, "dispatch:\n  synthetic_retired_key: true\n")
     _write_fleet_registry(tmp_path / "fleet", {"repo-a": _registry_entry(repo)})
     gh = _fake_gh_with_issue(1977)
 
@@ -332,10 +363,10 @@ def test_sweep_reports_presence_per_pass(tmp_path: Path):
     rows = query_events(fleet_state, kind="config_retirement_sweep")
     assert len(rows) == 1
     keys = rows[0]["payload"]["keys"]
-    present = keys["dispatch.require_worker_github_token"]["present_in"]
+    present = keys[_DOTTED]["present_in"]
     assert present[0]["repo"] == "repo-a"
     assert present[0]["layer"] == "repo-untracked-local"
-    assert keys["dispatch.require_worker_github_token"]["armed"] is False
+    assert keys[_DOTTED]["armed"] is False
     assert rows[0]["payload"]["checked"]  # every layer slot was visited
 
 
@@ -420,7 +451,7 @@ def test_sweep_unparseable_layer_blocks_arming(tmp_path: Path):
     cannot arm while any registered layer is unreadable."""
     repo = tmp_path / "repo-a"
     repo.mkdir()
-    _write_repo_config(repo, "dispatch:\n  require_worker_github_token: [\n")
+    _write_repo_config(repo, "dispatch:\n  synthetic_retired_key: [\n")
     _write_fleet_registry(tmp_path / "fleet", {"repo-a": _registry_entry(repo)})
     gh = _fake_gh_with_issue(1977)
 
@@ -443,8 +474,8 @@ def test_sweep_git_tracked_config_classified_repo_tracked(tmp_path: Path):
     untracked = tmp_path / "repo-untracked"
     tracked.mkdir()
     untracked.mkdir()
-    _write_repo_config(tracked, "dispatch:\n  require_worker_github_token: true\n")
-    _write_repo_config(untracked, "dispatch:\n  require_worker_github_token: true\n")
+    _write_repo_config(tracked, "dispatch:\n  synthetic_retired_key: true\n")
+    _write_repo_config(untracked, "dispatch:\n  synthetic_retired_key: true\n")
     _write_fleet_registry(
         tmp_path / "fleet",
         {
@@ -525,7 +556,7 @@ def test_sweep_regression_comment_dedupes_per_episode(tmp_path: Path):
     assert (1977, "automated-ready") in gh.labels_added
     assert len(gh.issue_comments_posted) == 1  # arm comment
 
-    config_path.write_text("dispatch:\n  require_worker_github_token: true\n", encoding="utf-8")
+    config_path.write_text("dispatch:\n  synthetic_retired_key: true\n", encoding="utf-8")
     _run_sweep(tmp_path, gh=gh, now=_NOW + timedelta(days=8))
     assert len(gh.issue_comments_posted) == 2  # regression comment
 
@@ -537,7 +568,7 @@ def test_sweep_regression_comment_dedupes_per_episode(tmp_path: Path):
     # that is a *new* episode and comments fresh.
     config_path.write_text("labels:\n  ready: automated-ready\n", encoding="utf-8")
     _run_sweep(tmp_path, gh=gh, now=_NOW + timedelta(days=10))
-    config_path.write_text("dispatch:\n  require_worker_github_token: true\n", encoding="utf-8")
+    config_path.write_text("dispatch:\n  synthetic_retired_key: true\n", encoding="utf-8")
     _run_sweep(tmp_path, gh=gh, now=_NOW + timedelta(days=11))
     assert len(gh.issue_comments_posted) == 3
 
@@ -572,7 +603,7 @@ def test_sweep_corrupt_sidecar_starts_fresh(tmp_path: Path):
     _write_repo_config(repo, "labels:\n  ready: automated-ready\n")
     _write_fleet_registry(tmp_path / "fleet", {"repo-a": _registry_entry(repo)})
     sidecar_path = layout.config_retirement_state_path(override=str(tmp_path / "fleet"))
-    sidecar_path.write_text('{"keys": {"dispatch.require_', encoding="utf-8")
+    sidecar_path.write_text('{"keys": {"dispatch.synthetic_', encoding="utf-8")
     gh = _fake_gh_with_issue(1977)
 
     result = _run_sweep(tmp_path, gh=gh, now=_NOW + timedelta(days=30))
@@ -615,7 +646,7 @@ def test_config_retirement_ready_edge_marks_ready_and_clears_workflow():
         {"name": "agent:needs-rework"},
     ]
 
-    result = transition(gh, labels, 123, "config_retirement_ready")
+    result = transition(gh, labels, 123, "config_retirement_ready", state_path=None)
 
     assert result.outcome is TransitionOutcome.APPLIED
     assert (123, "automated-ready") in gh.labels_added

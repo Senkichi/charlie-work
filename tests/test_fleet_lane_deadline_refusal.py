@@ -47,7 +47,8 @@ from charlie_work.pass_deadline import (
 )
 from charlie_work.paths import runtime_paths
 from charlie_work.state import empty_state, load_state, save_state
-from charlie_work.workflow import CommandResult, OrchestratorApp
+from charlie_work.command_result import CommandResult
+from charlie_work.workflow import OrchestratorApp
 
 
 def _lane_lock() -> MagicMock:
@@ -59,7 +60,7 @@ def _lane_lock() -> MagicMock:
 # ---------------------------------------------------------------------------
 
 
-def test_fleet_repo_lane_converts_mid_loop_refusal_to_partial() -> None:
+def test_fleet_repo_lane_converts_mid_loop_refusal_to_partial(tmp_path: Path) -> None:
     """A PassDeadlineExceeded escaping app.loop() becomes a deferred result.
 
     ``_loop_impl`` normally converts the refusal first; this lane-level
@@ -83,6 +84,7 @@ def test_fleet_repo_lane_converts_mid_loop_refusal_to_partial() -> None:
         limit=3,
         merge=True,
         ensure_labels=False,
+        fleet_state_path=tmp_path / "state.json",
         deadline_exceeded=lambda: False,
     )
 
@@ -91,7 +93,7 @@ def test_fleet_repo_lane_converts_mid_loop_refusal_to_partial() -> None:
     lock.release.assert_called_once()
 
 
-def test_fleet_repo_lane_converts_work_only_refusal_to_partial() -> None:
+def test_fleet_repo_lane_converts_work_only_refusal_to_partial(tmp_path: Path) -> None:
     """work_only lanes have no _loop_impl wrapper -- the lane catch is it.
 
     A dispatch-time refusal must surface as ``deadline_deferred`` (the
@@ -114,6 +116,7 @@ def test_fleet_repo_lane_converts_work_only_refusal_to_partial() -> None:
         limit=3,
         merge=None,
         ensure_labels=False,
+        fleet_state_path=tmp_path / "state.json",
         deadline_exceeded=lambda: False,
     )
 

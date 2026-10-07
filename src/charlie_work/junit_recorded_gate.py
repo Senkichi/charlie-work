@@ -40,6 +40,8 @@ from __future__ import annotations
 
 import re
 import xml.etree.ElementTree as ET
+from collections import Counter
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 
@@ -84,6 +86,9 @@ class JunitRecordedFinding:
       always a wiring error (wrong file, empty run) rather than truncation.
     * ``"empty_collect"`` -- the collect-only output yielded zero tests, which
       means collection itself failed or the wrong output was captured.
+    * ``"duplicate_testcase"`` -- the same ``(classname, name)`` appears in more
+      than one junit file (two shards ran one test); reported even when the
+      totals balance.
     """
 
     kind: str
@@ -259,9 +264,17 @@ def compare_recorded_vs_collected(
     counts come directly from pytest's own output; no hardcoded test count or
     file list exists anywhere in this function.
     """
-    junit = count_junit_testcases(junit_xml)
-    collected = count_collected_tests(collect_output)
+    return _result_from(
+        count_junit_testcases(junit_xml), count_collected_tests(collect_output), ()
+    )
 
+
+def _result_from(
+    junit: JunitCount,
+    collected: int,
+    extra_findings: tuple[JunitRecordedFinding, ...],
+) -> JunitRecordedResult:
+    """Build the result from already-counted sides (shared by the 1- and N-file paths)."""
     findings: list[JunitRecordedFinding] = []
 
     if junit.testcase_count == 0 and junit.suite_tests_attr == 0:
@@ -311,6 +324,7 @@ def compare_recorded_vs_collected(
                 ),
             )
         )
+    findings.extend(extra_findings)
 
     return JunitRecordedResult(
         recorded=junit.testcase_count,
@@ -318,6 +332,55 @@ def compare_recorded_vs_collected(
         suite_tests_attr=junit.suite_tests_attr,
         findings=tuple(findings),
     )
+
+
+def junit_testcase_keys(junit_xml: str) -> tuple[tuple[str, str], ...]:
+    """Every ``(classname, name)`` pair in document order; ``()`` on a parse error."""
+    try:
+        root = ET.fromstring(junit_xml)
+    except ET.ParseError:
+        return ()
+    return tuple(
+        (case.get("classname", ""), case.get("name", "")) for case in root.iter("testcase")
+    )
+
+
+def compare_recorded_vs_collected_multi(
+    junit_xmls: Sequence[str],
+    collect_output: str,
+) -> JunitRecordedResult:
+    """Recorded-vs-collected over one junit file per shard (DD-3).
+
+    One file delegates to :func:`compare_recorded_vs_collected` unchanged.
+    Several files: counts and ``tests`` attributes are summed, internal
+    consistency must hold in every file, and a ``(classname, name)`` pair
+    found in more than one file is a ``duplicate_testcase`` finding -- two
+    shards running one test is a fault even when an omission elsewhere
+    makes the totals balance.
+    """
+    if len(junit_xmls) == 1:
+        return compare_recorded_vs_collected(junit_xmls[0], collect_output)
+    counts = [count_junit_testcases(xml) for xml in junit_xmls]
+    total = JunitCount(
+        testcase_count=sum(c.testcase_count for c in counts),
+        suite_tests_attr=sum(c.suite_tests_attr for c in counts),
+        internal_consistency_ok=all(c.internal_consistency_ok for c in counts),
+    )
+    seen_in: Counter[tuple[str, str]] = Counter()
+    for xml in junit_xmls:
+        for key in set(junit_testcase_keys(xml)):
+            seen_in[key] += 1
+    duplicates = tuple(
+        JunitRecordedFinding(
+            kind="duplicate_testcase",
+            detail=(
+                f"{classname}::{name} recorded in {n} junit files -- two shards ran the same test"
+            ),
+        )
+        for (classname, name), n in sorted(seen_in.items())
+        if n > 1
+    )
+    return _result_from(total, count_collected_tests(collect_output), duplicates)
 
 
 # ---------------------------------------------------------------------------

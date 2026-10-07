@@ -409,9 +409,9 @@ def test_list_processes_windows_parses_snapshot(monkeypatch: pytest.MonkeyPatch)
 
     monkeypatch.setattr("shutil.which", lambda _name: "C:\\Windows\\powershell.exe")
     monkeypatch.setattr("subprocess.run", lambda *a, **k: _FakeResult())
-    # Deterministic overlay: a real psutil map would stamp a fabricated pid
+    # Deterministic overlay: a real chain probe would stamp a fabricated pid
     # that happened to collide with a live one.
-    monkeypatch.setattr("charlie_work.quiesce.win32_process_ppid_snapshot", lambda: {})
+    monkeypatch.setattr("charlie_work.quiesce.win32_ancestor_rows", lambda _pid, **_k: {})
 
     processes, error = list_processes()
 
@@ -495,6 +495,9 @@ def test_list_processes_actually_runs_against_this_host() -> None:
     own = [p for p in processes if p.pid == os.getpid()]
     assert own, "the running interpreter did not appear in its own process snapshot"
     assert own[0].command_line, "own process reported an empty command line"
+    # The recycled-parent guard's stamp source is the self chain itself --
+    # an unstamped self pid means the whole guard is inert (issue #2376).
+    assert own[0].created is not None, "own process carried no creation stamp"
 
 
 # ---------------------------------------------------------------------------
@@ -516,9 +519,9 @@ def _win32_listing_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """Get ``list_processes`` past its win32/PATH guards on any platform."""
     monkeypatch.setattr(sys, "platform", "win32")
     monkeypatch.setattr(shutil, "which", lambda name: name)
-    # Keep the creation-time overlay deterministic: the real psutil map
+    # Keep the creation-time overlay deterministic: the real chain probe
     # would stamp a fabricated pid that happened to collide with a live one.
-    monkeypatch.setattr("charlie_work.quiesce.win32_process_ppid_snapshot", lambda: {})
+    monkeypatch.setattr("charlie_work.quiesce.win32_ancestor_rows", lambda _pid, **_k: {})
 
 
 def test_list_processes_retries_once_on_timeout(monkeypatch: pytest.MonkeyPatch) -> None:

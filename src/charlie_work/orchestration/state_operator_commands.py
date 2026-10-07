@@ -15,7 +15,6 @@ file-size ratchet mark, same pattern as ``state_review_reap.py`` (#1874).
 
 from __future__ import annotations
 
-from datetime import datetime
 from typing import Any
 import json
 
@@ -35,6 +34,7 @@ from charlie_work.worktree import (
     WORKTREE_UNSAFE_KINDS,
 )
 import charlie_work.workflow as _wf
+from charlie_work.command_result import CommandResult
 
 
 # ``unescalate`` record targets that trigger the full counter/cache reset in
@@ -45,7 +45,7 @@ import charlie_work.workflow as _wf
 _PR_REENTRY_TARGETS = frozenset({PASSIVE_OPEN_STATUS, LOCAL_PENDING_STATUS, "approved"})
 
 
-def claim(self, issue_number: int, release: bool = False) -> _wf.CommandResult:
+def claim(self, issue_number: int, release: bool = False) -> CommandResult:
     """Record or release an operator claim on an issue.
 
     A claimed issue is excluded from fresh dispatch and rework dispatch
@@ -57,7 +57,7 @@ def claim(self, issue_number: int, release: bool = False) -> _wf.CommandResult:
     try:
         issue = self.gh.issue_view(issue_number)
     except GitHubError as exc:
-        return _wf.CommandResult(
+        return CommandResult(
             False, f"issue #{issue_number} not found: {exc}", {"issue_number": issue_number}
         )
 
@@ -113,7 +113,7 @@ def claim(self, issue_number: int, release: bool = False) -> _wf.CommandResult:
         if release
         else f"operator claim recorded for issue #{issue_number}"
     )
-    return _wf.CommandResult(
+    return CommandResult(
         True,
         message,
         {
@@ -133,7 +133,7 @@ def merge_authorize(
     *,
     by: str | None = None,
     sha: str | None = None,
-) -> _wf.CommandResult:
+) -> CommandResult:
     """Record an operator's explicit authorization to merge a worker PR (issue #934).
 
     The unauthorized-merge tripwire (#673) and the ``merge-check`` preflight
@@ -178,7 +178,7 @@ def merge_authorize(
     the override is the authorization.
     """
     if not reason.strip():
-        return _wf.CommandResult(
+        return CommandResult(
             False,
             "a non-empty --reason is required to record a merge authorization "
             "(a tripwire that can be silenced silently is no control)",
@@ -187,7 +187,7 @@ def merge_authorize(
 
     pr = self.gh.pr_view(pr_number)
     if not isinstance(pr, dict) or not pr:
-        return _wf.CommandResult(
+        return CommandResult(
             False,
             f"PR #{pr_number}: cannot read PR from GitHub — refusing to authorize",
             {"pr": pr_number, "authorized": False, "reason": "pr_unreadable"},
@@ -195,7 +195,7 @@ def merge_authorize(
 
     authorized_sha = sha if sha is not None else pr.get("headRefOid")
     if not authorized_sha or not isinstance(authorized_sha, str):
-        return _wf.CommandResult(
+        return CommandResult(
             False,
             f"PR #{pr_number}: no head SHA to bind the authorization to "
             "— refusing to record an unbound override",
@@ -257,7 +257,7 @@ def merge_authorize(
         )
         _wf.save_state(self.paths.state_file, state)
 
-    return _wf.CommandResult(
+    return CommandResult(
         True,
         f"PR #{pr_number}: recorded operator authorization to merge at head "
         f"{authorized_sha} (by {by or 'unknown'})",
@@ -280,7 +280,7 @@ def unescalate(
     *,
     dry_run: bool = False,
     requeue: bool = False,
-) -> _wf.CommandResult:
+) -> CommandResult:
     """Operator re-arm for a PR/issue parked in the human/operator sink.
 
     Escalation is deliberately terminal for every automated path (review()
@@ -342,7 +342,7 @@ def unescalate(
     labels, or events.
     """
     if pr_number is None and issue_number is None:
-        return _wf.CommandResult(False, "unescalate requires --pr and/or --issue", {})
+        return CommandResult(False, "unescalate requires --pr and/or --issue", {})
 
     state = _wf.load_state_locked(self.paths.state_file)
 
@@ -381,7 +381,7 @@ def unescalate(
         and not issue_state.get("mention_rearmed_at")
     )
     if not pr_stuck and not issue_stuck and not mention_flagged:
-        return _wf.CommandResult(
+        return CommandResult(
             True,
             f"nothing to unescalate (pr={pr_number} status="
             f"{pr_state.get('status')!r}, issue={issue_number} status="
@@ -414,18 +414,16 @@ def unescalate(
     # and last-activity diagnostics so an operator can tell a wedged
     # worker from a working one.
     if issue_number is not None:
-        from datetime import UTC
-
         from charlie_work.worker import issue_worker_liveness
 
         sessions_dir = self._layout.sessions_dir
         verdict = issue_worker_liveness(
-            issue_number, issue_state, sessions_dir, self.config, datetime.now(UTC)
+            issue_number, issue_state, sessions_dir, self.config, self.host.clock.now()
         )
     else:
         verdict = None
     if verdict is not None and verdict.live:
-        return _wf.CommandResult(
+        return CommandResult(
             True,
             f"issue #{issue_number} has a live worker session; nothing to "
             f"unescalate (pr={pr_number} left untouched) -- {verdict.reason}",
@@ -459,7 +457,7 @@ def unescalate(
     ):
         unsafe_reason = self._worktree_still_unsafe(issue_number, state, dry_run=dry_run)
         if unsafe_reason:
-            return _wf.CommandResult(
+            return CommandResult(
                 True,
                 f"issue #{issue_number} escalated as worktree_unsafe; "
                 f"worktree is still unsafe ({unsafe_reason}) — clearing "
@@ -682,7 +680,7 @@ def unescalate(
     )
 
     if dry_run:
-        return _wf.CommandResult(
+        return CommandResult(
             True,
             f"dry-run: would unescalate pr={pr_number} issue={issue_number} "
             f"(label edge: {label_edge})",
@@ -823,7 +821,14 @@ def unescalate(
 
     label_error = None
     if label_edge is not None and issue_number is not None:
-        result = _wf.transition(self.gh, self.config.labels, int(issue_number), label_edge)
+        result = _wf.transition(
+            self.gh,
+            self.config.labels,
+            int(issue_number),
+            label_edge,
+            state_path=self.paths.state_file,
+            repo=self.repo_root.name,
+        )
         if result.outcome != TransitionOutcome.APPLIED:
             label_error = {
                 "edge": label_edge,
@@ -858,7 +863,7 @@ def unescalate(
         message += f" (parked branch {parked_branch} for the local path)"
     if label_error:
         message += f" (label update failed: {label_error['outcome']})"
-    return _wf.CommandResult(
+    return CommandResult(
         True,
         message,
         {
@@ -878,7 +883,7 @@ def unescalate(
 
 def ack_unauthorized_merge(
     self, pr_number: int, reason: str, *, by: str | None = None
-) -> _wf.CommandResult:
+) -> CommandResult:
     """Acknowledge a post-arming unauthorized-merge finding so it stops pinning ok=False.
 
     The #502 tripwire's pre-arming baseline (``_apply_unauthorized_merge_baseline``)
@@ -903,7 +908,7 @@ def ack_unauthorized_merge(
     duplicating or refusing, so a finding's triage state can be corrected.
     """
     if not reason.strip():
-        return _wf.CommandResult(
+        return CommandResult(
             False,
             "a non-empty --reason is required to acknowledge an unauthorized-merge "
             "finding (a tripwire that can be silenced silently is no control)",
@@ -948,7 +953,7 @@ def ack_unauthorized_merge(
     # security control's audit record, and the operator's only evidence of
     # *which repo* received it was previously the exit code. Naming the
     # path makes a misrouted ack visible in the output that reports success.
-    return _wf.CommandResult(
+    return CommandResult(
         True,
         f"acknowledged unauthorized-merge finding for PR #{pr_number} "
         f"in {self.paths.state_file}; it will no longer pin ok=False",

@@ -159,6 +159,13 @@ class MergeBranch(CapabilityCollaborator):
                     f"auto_merge.merge_flags: unsupported flag {flag!r}; supported: "
                     f"{_ADMIN_FLAG}, {_AUTO_FLAG}, {_MATCH_HEAD_FLAG}=<sha>"
                 )
+        if auto and sha is not None:
+            # The auto-merge enrollment has no head-commit guard wired; taking
+            # the flag and dropping it would promise a safety gh would keep.
+            raise ConfigError(
+                f"auto_merge.merge_flags: {_AUTO_FLAG} cannot be combined with "
+                f"{_MATCH_HEAD_FLAG}=<sha>"
+            )
         if auto:
             # B10: no REST route; the node id costs one extra read.
             enabled = enable_auto_merge(self, number, strategy)
@@ -192,10 +199,11 @@ class MergeBranch(CapabilityCollaborator):
         """Raise ``GitHubError`` where ``gh pr merge`` would have refused.
 
         One read of ``mergeStateStatus`` (the read gh made itself); a failed
-        or unrecognised read raises/proceeds exactly as gh did: an
-        unreadable PR is an error, ``UNKNOWN``/``CLEAN``/``UNSTABLE``/
-        ``HAS_HOOKS`` merge. The merge PUT is only ever sent after this
-        passes, so a refusal never sends a mutation.
+        or unreadable read raises -- an unreadable PR is an error and a 200
+        body that does not carry the field fails closed rather than merging
+        blind. ``UNKNOWN``/``CLEAN``/``UNSTABLE``/``HAS_HOOKS`` and any other
+        unrecognised state proceed, exactly as gh did. The merge PUT is only
+        ever sent after this passes, so a refusal never sends a mutation.
         """
         owner, name = self._repo_owner_name()
         request = GraphQLRequest.of(
@@ -205,7 +213,12 @@ class MergeBranch(CapabilityCollaborator):
         node = _dig(body, "data", "repository", "pullRequest")
         if error is not None:
             raise GitHubError(f"gh pr merge {number} failed: {error}")
-        status = str(node.get("mergeStateStatus") or "").upper() if isinstance(node, dict) else ""
+        state = node.get("mergeStateStatus") if isinstance(node, dict) else None
+        if not isinstance(state, str) or not state:
+            raise GitHubError(
+                f"gh pr merge {number} failed: pull request #{number} returned no mergeStateStatus"
+            )
+        status = state.upper()
         reason = _REFUSAL_REASONS.get(status)
         if reason is None or (admin and status in _ADMIN_WAIVES):
             return

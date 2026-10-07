@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -24,21 +25,56 @@ from charlie_work import fleet_dispatch, layout
 from charlie_work.config import FleetSupervisorConfig, OrchestratorConfig
 from charlie_work.fleet_dispatch import fleet_loop
 from charlie_work.instrumentation import query_events
-from charlie_work.workflow import CommandResult
+from charlie_work.command_result import CommandResult
 
-_RELEASE_TIMEOUT = 15.0
+# Cap on how long a fake wedged lane blocks, and the wall-clock backstop for
+# the bounded-return assertion: a pass that ever waited on the wedged lane
+# takes at least this long, while a correct pass is bounded by its
+# deadline-derived wait budgets (~deadline + drain grace, twice over).
+_RELEASE_TIMEOUT = 30.0
 
 
-def _app(key: str, release: threading.Event | None) -> MagicMock:
+def _app(
+    key: str,
+    release: threading.Event | None,
+    finished: threading.Event | None = None,
+) -> MagicMock:
     app = MagicMock()
 
     def _loop(limit: int | None, merge: bool | None = None, **_kwargs: Any) -> CommandResult:
         if release is not None:
             release.wait(timeout=_RELEASE_TIMEOUT)
+        if finished is not None:
+            finished.set()
         return CommandResult(True, f"{key} loop complete", {})
 
     app.loop.side_effect = _loop
     return app
+
+
+def _tick_clock() -> Callable[[], float]:
+    """A deterministic ``pass_clock``: one millisecond per call, no wall time.
+
+    Issue #2251: ``fleet_loop`` measures ``deadline_seconds`` from pass
+    entry, but the allocation/autoscale prologues and per-repo prep run
+    before the first lane is submitted -- on a loaded runner the whole 1s
+    budget can be spent before any lane holds a pool slot, deferring every
+    repo. A call-counted clock keeps every deadline-derived bound (the
+    full-pool wait budget, the final drain) intact while making the lane
+    submission order independent of wall-clock timing: the deadline cannot
+    trip during submission, so which repo defers is decided by the pool
+    throttle alone, and the wedged lane's ``release`` event -- not elapsed
+    time -- decides when its lane ends. The clock is strictly increasing,
+    so recorded ``elapsed_seconds`` values stay positive.
+    """
+    tick = 0.0
+
+    def _clock() -> float:
+        nonlocal tick
+        tick += 0.001
+        return tick
+
+    return _clock
 
 
 @patch("charlie_work.fleet_dispatch._load_registry")
@@ -69,7 +105,8 @@ def test_blocked_lane_overruns_without_blocking_pass(
     mock_gh_class.return_value = MagicMock()
 
     release = threading.Event()
-    apps = {"slow": _app("slow", release), "fast": _app("fast", None)}
+    slow_finished = threading.Event()
+    apps = {"slow": _app("slow", release, finished=slow_finished), "fast": _app("fast", None)}
     mock_app_class.side_effect = lambda root, *a, **k: apps[Path(root).name]
     fleet_dir = str(tmp_path / "fleet")
 
@@ -83,6 +120,7 @@ def test_blocked_lane_overruns_without_blocking_pass(
             dry_run=False,
             work_only=False,
             deadline_seconds=1,
+            pass_clock=_tick_clock(),
         )
 
     try:
@@ -90,7 +128,11 @@ def test_blocked_lane_overruns_without_blocking_pass(
         result = _run_pass()
         elapsed = time.monotonic() - started
 
-        assert elapsed < _RELEASE_TIMEOUT / 2
+        # Bounded return: the pass came back while the wedged lane was still
+        # blocked on ``release`` (the deterministic check), long before the
+        # lane's own self-unblock cap (the wall-clock backstop).
+        assert not slow_finished.is_set()
+        assert elapsed < _RELEASE_TIMEOUT
         assert result.data["repos"]["owner/fast"]["ok"] is True
         assert "owner/slow" not in result.data["repos"]
         assert "owner/slow" in result.data["deadline_partial_repo_keys"]
@@ -140,7 +182,8 @@ def test_wedged_lane_on_full_pool_defers_waiting_repo_and_returns_bounded(
     mock_gh_class.return_value = MagicMock()
 
     release = threading.Event()
-    apps = {n: _app(n, release) for n in names}
+    lane_finished = threading.Event()
+    apps = {n: _app(n, release, finished=lane_finished) for n in names}
     mock_app_class.side_effect = lambda root, *a, **k: apps[Path(root).name]
     fleet_dir = str(tmp_path / "fleet")
 
@@ -157,10 +200,15 @@ def test_wedged_lane_on_full_pool_defers_waiting_repo_and_returns_bounded(
             dry_run=False,
             work_only=False,
             deadline_seconds=1,
+            pass_clock=_tick_clock(),
         )
         elapsed = time.monotonic() - started
 
-        assert elapsed < _RELEASE_TIMEOUT / 2
+        # Bounded return: the pass came back while the wedged lane was still
+        # blocked on ``release`` (the deterministic check), long before the
+        # lane's own self-unblock cap (the wall-clock backstop).
+        assert not lane_finished.is_set()
+        assert elapsed < _RELEASE_TIMEOUT
         # Exactly one repo got the single pool slot (wedged); the other waited.
         assert len(result.data["deferred"]) == 1
         assert len(result.data["deadline_partial_repo_keys"]) == 1

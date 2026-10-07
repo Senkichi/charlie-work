@@ -28,9 +28,12 @@ from enum import Enum
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from . import host as _host
 from .attempt_refs import AttemptSnapshot, snapshot_attempt_ref
+from .attempt_resume import ResumedAttempt, ResumeRestoreError, seed_from_throttled_attempt
 from .config import (
     OrchestratorConfig,
+    RuntimeConfig,
     WORKER_OUTCOME_FILENAME,
 )
 from . import git_pull_blockers
@@ -42,7 +45,7 @@ from . import layout
 from .orphan_sweep import sweep_orphan_processes
 from .paths import runtime_paths
 from .post_mortem import real_activity_for_worker
-from .process_utils import is_pid_alive, kill_orphan_pid, kill_process_tree
+from .process_utils import kill_orphan_pid, kill_process_tree
 from .safe_path import contains
 from .safe_ref import require_valid_ref_name, require_valid_rev, require_valid_sha
 from .subprocess_runner import RunResult, command_failure_message, run_captured
@@ -377,6 +380,10 @@ class WorktreeInfo:
     # removal, janitor sweeps) must leave it on disk. Writer-marker cleanup
     # still applies to markers this session wrote.
     foreign_adopted: bool = False
+    # Issue #2289: set when a fresh redispatch was seeded from the work a
+    # provider-throttle death preserved (see attempt_resume). The adapters append
+    # the "continue, do not restart" notice to the worker prompt.
+    resumed_attempt: ResumedAttempt | None = None
 
 
 class WorktreeState(str, Enum):
@@ -494,7 +501,7 @@ def _own_live_session_pids(sessions_dir: Path) -> dict[str, int]:
         pid = payload.get("pid")
         if not session_id or not isinstance(pid, int) or pid <= 0:
             continue
-        if is_pid_alive(pid, payload.get("process_start_time")):
+        if _host.current().probe.is_alive(pid, payload.get("process_start_time")):
             live[str(session_id)] = pid
     return live
 
@@ -565,11 +572,11 @@ def _check_worktree_writer_marker(
         )
         return
 
-    if not isinstance(pid, int) or pid <= 0 or not is_pid_alive(pid, None):
+    if not isinstance(pid, int) or pid <= 0 or not _host.current().probe.is_alive(pid, None):
         # Marker is stale — clean it and proceed.
         remove_worktree_marker(worktree_path)
         return
-    own = _own_live_session_pids(sessions_dir)
+    own = _host.current().sessions.live_session_pids(sessions_dir)
     if session_id and own.get(session_id) == pid:
         # Marker belongs to a live session we already know about.
         return
@@ -707,7 +714,7 @@ def _reap_idle_foreign_writer(
     # Stale-pid guard: the writer is confirmably gone. Clean the marker and
     # report the path clear so the caller proceeds / resets the counter
     # instead of escalating a writer that is already dead.
-    if not is_pid_alive(pid, None):
+    if not _host.current().probe.is_alive(pid, None):
         remove_worktree_marker(worktree_path)
         return True
 
@@ -720,7 +727,7 @@ def _reap_idle_foreign_writer(
     # that drops or misorders it raises ``TypeError`` instead of silently
     # disabling this guard — the exact bug shape #1443 was filed to fix.
     if isinstance(session_id, str) and session_id:
-        own = _own_live_session_pids(sessions_dir)
+        own = _host.current().sessions.live_session_pids(sessions_dir)
         if own.get(session_id) == pid:
             return False
 
@@ -764,7 +771,7 @@ def _reap_idle_foreign_writer(
     # alive, do NOT remove the marker and do not claim a reap — removing the
     # marker would admit a second writer into a worktree that still holds a
     # live one (the #400 invariant inverted).
-    if pid not in killed_pids and is_pid_alive(pid, process_start_time):
+    if pid not in killed_pids and _host.current().probe.is_alive(pid, process_start_time):
         return False
 
     orphan_pids: list[int] = []
@@ -2630,15 +2637,36 @@ def _robust_rmtree(path: Path) -> bool:
     Unlinks all junctions/symlinks first, then deletes the remaining files and
     directories with ``shutil.rmtree``.  Returns True when the path no longer
     exists.
+
+    Read-only entries (git object files, some wheel contents) make Windows
+    refuse the unlink with ``PermissionError``; :func:`_clear_readonly_and_retry`
+    clears the bit and retries once. Without it every orphan holding a git
+    clone or a copied ``.venv`` failed removal on every reclaim pass.
     """
     if not path.exists() and not is_junction(path):
         return True
     _unlink_worktree_reparse_points(path)
     try:
-        shutil.rmtree(path)
+        shutil.rmtree(path, onexc=_clear_readonly_and_retry)
     except OSError:
         return False
     return not path.exists() and not is_junction(path)
+
+
+def _clear_readonly_and_retry(func: Callable[[str], Any], path: str, exc: BaseException) -> None:
+    """``shutil.rmtree`` ``onexc`` hook: clear read-only, retry *func* once.
+
+    Re-raises the original error for anything that is not a permission
+    failure, and for reparse points -- ``os.chmod`` would follow one into its
+    target, which is exactly what :func:`_robust_rmtree` must never touch.
+    """
+    if not isinstance(exc, PermissionError) or os.path.islink(path) or is_junction(Path(path)):
+        raise exc
+    try:
+        os.chmod(path, stat.S_IWRITE)
+    except OSError:
+        raise exc from None
+    func(path)
 
 
 # Issue #1767 follow-up: relocating worker TMP/TEMP/TMPDIR from the host temp
@@ -2924,7 +2952,7 @@ def _probe_recovery_liveness(
 
     pid_alive = False
     if worker_pid is not None:
-        pid_alive = is_pid_alive(worker_pid, worker_process_start_time)
+        pid_alive = _host.current().probe.is_alive(worker_pid, worker_process_start_time)
         if pid_alive:
             raise LiveWorkerRedispatchError(
                 issue_number=issue_number,
@@ -3307,12 +3335,14 @@ def create_worktree(
             if sessions_dir is not None and isinstance(marker_session_id, str):
                 # Prefer the recorded session sidecar: it carries the
                 # process-start-time fingerprint, defeating pid recycling.
-                live_pid = _own_live_session_pids(sessions_dir).get(marker_session_id)
+                live_pid = (
+                    _host.current().sessions.live_session_pids(sessions_dir).get(marker_session_id)
+                )
             if (
                 live_pid is None
                 and isinstance(marker_pid, int)
                 and marker_pid > 0
-                and is_pid_alive(marker_pid, None)
+                and _host.current().probe.is_alive(marker_pid, None)
             ):
                 live_pid = marker_pid
             if live_pid is not None:
@@ -3368,6 +3398,11 @@ def create_worktree(
             repo_root=repo_root,
             registered=registered,
             recovery=recovery is not None,
+            operator_worktree_roots=(
+                config.runtime.operator_worktree_roots
+                if config is not None
+                else RuntimeConfig().operator_worktree_roots
+            ),
             marker_guard=(
                 (
                     lambda path: _check_worktree_writer_marker(
@@ -4008,6 +4043,27 @@ def create_worktree(
                     f"git worktree add failed for branch {branch!r}: {result.error or result.stderr}"
                 )
 
+    # Issue #2289: a fresh dispatch (not a rework/recovery attach of existing
+    # work) whose previous attempt died of a provider throttle starts from that
+    # death's preserved work instead of the bare base. Runs before the venv
+    # junction and materialized dirs exist so a failed seed restores a pristine
+    # tree. Best-effort: never raises, never blocks the dispatch.
+    resumed_attempt: ResumedAttempt | None = None
+    if not rework and (config is None or config.dispatch.resume_throttled_attempts):
+        try:
+            resumed_attempt = seed_from_throttled_attempt(
+                repo_root,
+                worktree_path,
+                issue_number,
+                state_file=state_file,
+                scaffolding=(*injected_paths, *materialize_dirs),
+            )
+        except ResumeRestoreError:
+            # The tree is not provably the base (conflict markers / wrong HEAD):
+            # never launch on it. Same teardown as the other post-add failures.
+            remove_worktree(repo_root, worktree_path, force=True, branch=branch)
+            raise
+
     venv_junction: Path | None = None
     if venv_source is not None:
         venv_link = worktree_path / ".venv"
@@ -4046,6 +4102,7 @@ def create_worktree(
         materialized_paths=tuple(materialized_paths),
         rework_conflict=rework_conflict,
         rescue_capture=rescue_capture,
+        resumed_attempt=resumed_attempt,
     )
 
 
@@ -5192,7 +5249,7 @@ def _cleanup_live_writer_reason(issue_state: dict[str, Any], worktree_path: Path
         worker_pid = int(worker_pid) if worker_pid is not None else None
     except (TypeError, ValueError):
         worker_pid = None
-    if worker_pid is not None and is_pid_alive(worker_pid, process_start_time):
+    if worker_pid is not None and _host.current().probe.is_alive(worker_pid, process_start_time):
         return f"recorded worker pid {worker_pid} is alive"
 
     marker = read_worktree_marker(worktree_path)
@@ -5207,7 +5264,11 @@ def _cleanup_live_writer_reason(issue_state: dict[str, Any], worktree_path: Path
         if _state.is_operator_claimed(issue_state):
             return "worktree is operator-claimed"
         return None
-    if isinstance(marker_pid, int) and marker_pid > 0 and is_pid_alive(marker_pid, None):
+    if (
+        isinstance(marker_pid, int)
+        and marker_pid > 0
+        and _host.current().probe.is_alive(marker_pid, None)
+    ):
         return f"live writer marker (pid={marker_pid}, session_id={session_id})"
     return None
 
@@ -5795,3 +5856,43 @@ def clean_worktrees(
     if not venv_ok:
         message = f"{message}; {venv_message}"
     return WorktreeCleanResult(ok=ok, message=message, data=data)
+
+
+_CLEAN_LIST_KEYS = ("planned", "removed", "skipped", "failed", "attention_events")
+_ORPHAN_KEYS = ("planned", "removed", "failed")
+
+
+def merge_clean_results(
+    swept: Sequence[tuple[Path, WorktreeCleanResult]],
+) -> WorktreeCleanResult:
+    """Combine one ``clean_worktrees`` result per swept root into one result.
+
+    A single root is returned unchanged. With the host I/O volume active the
+    legacy root is swept too (``ResolvedLayout.sweep_roots``). The roots are
+    disjoint, so ``worktrees_out_of_scope`` is the registered total minus the
+    worktrees in scope under any root; the registered total and the venv check
+    are the same for every root, so the first result's values are kept.
+    """
+    if not swept:
+        raise ValueError("merge_clean_results needs at least one swept root")
+    if len(swept) == 1:
+        return swept[0][1]
+    results = [result for _, result in swept]
+    first = results[0].data
+    registered = int(first.get("worktrees_registered", 0))
+    data: dict[str, Any] = {
+        key: [item for r in results for item in r.data.get(key, [])] for key in _CLEAN_LIST_KEYS
+    }
+    data["orphans"] = {
+        key: [item for r in results for item in r.data.get("orphans", {}).get(key, [])]
+        for key in _ORPHAN_KEYS
+    }
+    data["venv_ok"] = first.get("venv_ok")
+    data["venv_message"] = first.get("venv_message")
+    data["worktrees_registered"] = registered
+    data["worktrees_out_of_scope"] = sum(
+        int(r.data.get("worktrees_out_of_scope", 0)) for r in results
+    ) - registered * (len(results) - 1)
+    data["roots"] = [str(root) for root, _ in swept]
+    message = "; ".join(f"{root}: {result.message}" for root, result in swept)
+    return WorktreeCleanResult(ok=all(r.ok for r in results), message=message, data=data)

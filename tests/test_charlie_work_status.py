@@ -158,6 +158,24 @@ def test_status_prefetch_uses_batched_graphql_for_blocker_data(
             # (The startup field-list probes also list labels and workflow runs.)
             if request.route.endswith("/actions/runs"):
                 return ok({"workflow_runs": []})
+            if request.route.endswith("/issues"):
+                # Issue #2443: open issues are one REST read, filtered locally.
+                return ok(
+                    [
+                        {
+                            "number": n,
+                            "title": f"Issue {n}",
+                            "html_url": f"https://example.test/issues/{n}",
+                            "body": "",
+                            "state": "open",
+                            "labels": [{"name": "automated-ready", "node_id": "L1"}],
+                            "user": {"login": "tester", "type": "User"},
+                            "created_at": "2026-01-01T00:00:00Z",
+                            "updated_at": "2026-01-01T00:00:00Z",
+                        }
+                        for n in (887, 888)
+                    ]
+                )
             assert request.route.endswith(("/pulls", "/labels")), request
             return ok([])
         document = request.document

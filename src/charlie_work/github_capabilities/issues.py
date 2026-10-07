@@ -50,6 +50,12 @@ from ..github_transport.json_read import JsonRead
 from ..github_transport.request import RestRequest
 from ._base import CapabilityCollaborator, GitHubRunResult, _LIST_LIMIT
 from ._send import read_json, send_text
+from .issue_list_rest import (
+    emit_fallback,
+    fetch_open_issues,
+    filter_by_labels,
+    rest_issue_list_enabled,
+)
 from .circuit_breaker_transport import circuit_breaker_state_path
 from .cross_repo_blockers import CrossRepoBlocker, make_blocker, repo_from_repository_url
 from ..instrumentation import log_event
@@ -336,6 +342,38 @@ class Issues(CapabilityCollaborator):
             return cached
 
         label_str = ", ".join(label_tuple) if label_tuple else "all"
+        if effective_state == "open" and rest_issue_list_enabled():
+            # Issue #2443: ONE paged REST read of every open issue per pass
+            # (ETag-cached, so an unchanged repo pays only 304s); every
+            # label-specific query is a local filter over it. A REST failure
+            # falls back to the GraphQL read below, per call, with an event.
+            base_key = ("issue_list", "open", ())
+            failed_key = ("issue_list", "open", "rest_failed")
+            all_open = self._list_cache.get(base_key)
+            if all_open is None and failed_key not in self._list_cache:
+                try:
+                    all_open = fetch_open_issues(self)
+                except GitHubError as exc:
+                    logger.warning("REST open-issue list failed, using GraphQL: %s", exc)
+                    emit_fallback(self, exc)
+                    # Per-pass marker: one REST attempt and one event per pass,
+                    # not one per label query (the cache is cleared each pass).
+                    self._list_cache[failed_key] = True
+                else:
+                    self._list_cache[base_key] = all_open
+            if all_open is not None:
+                result = filter_by_labels(all_open, label_tuple)
+                if label_tuple and len(result) >= _LIST_LIMIT:
+                    logger.warning(
+                        "GitHub returned %d issues (labels=%s), matching the page limit "
+                        "(%d); further items may be truncated",
+                        len(result),
+                        label_str,
+                        _LIST_LIMIT,
+                    )
+                    result = result[:_LIST_LIMIT]
+                self._list_cache[cache_key] = result
+                return result
         read = JsonRead(
             "issue",
             "list",

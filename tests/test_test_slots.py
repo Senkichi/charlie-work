@@ -101,6 +101,12 @@ def _env(slot_dir: Path, *, role: str = "agent", count: int = 2, min_items: int 
         k: v for k, v in os.environ.items() if not k.startswith(("PYTEST_", "CHARLIE_TEST_SLOT"))
     }
     env.update(
+        # The spawned suite needs only ``test_slot_plugin`` (explicit via
+        # PYTEST_PLUGINS) plus xdist for the ``-n`` tests (explicit ``-p``);
+        # entry-point autoload would re-import every installed plugin in every
+        # inner run -- the dominant share of its startup under a loaded host
+        # (issue #2390).
+        PYTEST_DISABLE_PLUGIN_AUTOLOAD="1",
         PYTHONPATH=str(test_slots.plugin_dir()),
         PYTEST_PLUGINS="test_slot_plugin",
         CHARLIE_TEST_SLOT_DIR=str(slot_dir),
@@ -117,6 +123,10 @@ def _env(slot_dir: Path, *, role: str = "agent", count: int = 2, min_items: int 
 def _project(tmp_path: Path, n_tests: int, *, ready: Path | None = None, hold: float = 0) -> Path:
     proj = tmp_path / "proj"
     proj.mkdir(exist_ok=True)
+    # Keep the inner run's rootdir at the project: a basetemp inside a
+    # checkout would otherwise let the spawned pytest inherit that repo's
+    # addopts (e.g. "-n auto" spawns an xdist fleet for a 2-item suite).
+    (proj / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
     body = textwrap.dedent(
         f"""
         import pathlib, time
@@ -205,10 +215,13 @@ def test_killed_holder_releases_its_slot(tmp_path: Path) -> None:
 
 def test_run_under_threshold_never_takes_a_slot(tmp_path: Path) -> None:
     slots = tmp_path / "slots"
-    proc = _pytest(_project(tmp_path, 2), _env(slots, min_items=3))
+    env = _env(slots, min_items=3)
+    assert env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] == "1"  # issue #2390 regression pin
+    proc = _pytest(_project(tmp_path, 2), env)
     out, _ = proc.communicate(timeout=120)
     assert proc.returncode == 0, out
     assert not (slots / "slot-1.lock").exists()
+    assert "bringing up nodes" not in out
 
 
 def test_run_at_threshold_takes_an_agent_slot_and_releases_it(tmp_path: Path) -> None:
@@ -268,6 +281,8 @@ def test_xdist_only_the_controller_takes_a_slot(tmp_path: Path) -> None:
     proc = _pytest(
         _project(tmp_path, 6, ready=ready, hold=3),
         _env(slots, CHARLIE_TEST_SLOT_WAIT_TIMEOUT_SECONDS=15),
+        "-p",
+        "xdist.plugin",
         "-n",
         "2",
     )
@@ -287,6 +302,8 @@ def test_xdist_timeout_does_not_hang(tmp_path: Path) -> None:
         proc = _pytest(
             _project(tmp_path, 6),
             _env(slots, CHARLIE_TEST_SLOT_WAIT_TIMEOUT_SECONDS=2),
+            "-p",
+            "xdist.plugin",
             "-n",
             "2",
         )
@@ -323,7 +340,7 @@ def _app(tmp_path: Path, config):
 def test_maintenance_pass_turns_timeout_records_into_events(tmp_path: Path, monkeypatch) -> None:
     from charlie_work.instrumentation import query_events
     from charlie_work.pass_deadline import PassDeadline, run_deadline_guarded_maintenance
-    from charlie_work.workflow import CommandResult
+    from charlie_work.command_result import CommandResult
 
     slots = tmp_path / "slots"
     (slots / "timeouts").mkdir(parents=True)
@@ -340,7 +357,7 @@ def test_maintenance_pass_turns_timeout_records_into_events(tmp_path: Path, monk
 
 def test_maintenance_pass_leaves_records_alone_when_disabled(tmp_path: Path, monkeypatch) -> None:
     from charlie_work.pass_deadline import PassDeadline, run_deadline_guarded_maintenance
-    from charlie_work.workflow import CommandResult
+    from charlie_work.command_result import CommandResult
 
     slots = tmp_path / "slots"
     (slots / "timeouts").mkdir(parents=True)

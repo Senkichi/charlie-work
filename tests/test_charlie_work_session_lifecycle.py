@@ -118,8 +118,8 @@ def test_worker_death_bounded_runtime_no_signal_returns_zero(tmp_path: Path) -> 
 
 
 def test_count_live_sessions_counts_both_adapters(tmp_path: Path) -> None:
-    """_count_live_sessions should count sessions from both devin-shell and claude-code adapters."""
-    from charlie_work.workflow import _count_live_sessions
+    """count_live_sessions should count sessions from both devin-shell and claude-code adapters."""
+    from charlie_work.live_session_count import WORKER_LANE, count_live_sessions
     from charlie_work.devin_shell import SessionRecord as DevinSessionRecord
     from charlie_work.claude_code import ClaudeWorkerRecord
 
@@ -158,7 +158,7 @@ def test_count_live_sessions_counts_both_adapters(tmp_path: Path) -> None:
     claude_path.write_text(json.dumps(claude_record.to_dict()), encoding="utf-8")
 
     # Count live sessions (both have pid=None, so count should be 0)
-    count = _count_live_sessions(sessions_dir)
+    count = count_live_sessions(sessions_dir, None, WORKER_LANE)
     assert count == 0  # No live sessions since both have pid=None
 
 
@@ -169,7 +169,7 @@ def test_count_live_sessions_corroborates_ghost_worker_via_state_json(
     corresponding session sidecar (a "ghost") must still be counted against
     the concurrency governor.
 
-    Before this fix, ``_count_live_sessions`` only counted sidecar files on
+    Before this fix, the live-session counter only counted sidecar files on
     disk. If a sidecar goes missing for a still-live process -- e.g. the
     dead-session reap lane removed it on ambiguous evidence, or any other
     path stranded state.json's dispatch record -- the live worker became
@@ -184,12 +184,12 @@ def test_count_live_sessions_corroborates_ghost_worker_via_state_json(
     now counted, without needing to spawn or mock a child process.
 
     MUTATION GATE: removing the ``if state_file is not None:`` state.json
-    corroboration block in ``_count_live_sessions``
-    (src/charlie_work/workflow.py) makes this test fail -- the count would
+    corroboration block in ``live_session_count.count_live_sessions``
+    (src/charlie_work/live_session_count.py) makes this test fail -- the count would
     revert to 0 and the ghost worker would look like free capacity again.
     """
     from charlie_work.devin_shell import _get_process_start_time
-    from charlie_work.workflow import _count_live_sessions
+    from charlie_work.live_session_count import WORKER_LANE, count_live_sessions
 
     config = OrchestratorConfig()
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
@@ -210,13 +210,13 @@ def test_count_live_sessions_corroborates_ghost_worker_via_state_json(
     }
     save_state(paths.state_file, state)
 
-    count = _count_live_sessions(sessions_dir, paths.state_file)
+    count = count_live_sessions(sessions_dir, paths.state_file, WORKER_LANE)
     assert count == 1, "a ghost worker_pid that is genuinely alive must count against the cap"
 
     # Without state.json corroboration (the pre-fix behavior), the same ghost
     # is invisible -- pin the contrast so a future regression that silently
     # drops the state_file argument elsewhere is easy to diagnose.
-    assert _count_live_sessions(sessions_dir) == 0
+    assert count_live_sessions(sessions_dir, None, WORKER_LANE) == 0
 
 
 def test_stalled_session_emits_event_with_required_fields(tmp_path: Path) -> None:

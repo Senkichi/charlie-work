@@ -16,10 +16,9 @@ intended state, not a defect.
 What this file now pins:
 
 1. Dispatch never emits ``worker_token_missing`` and never defers on a
-   missing worker token — even with the deprecated
-   ``dispatch.require_worker_github_token`` flag still set.
-2. The retired config key still parses (backward compatibility) but must
-   remain a bool.
+   missing worker token.
+2. The retired config key is gone outright (issue #1977): a config file
+   that still sets it fails with the normal unknown-key error.
 3. ``sanitize_env``'s stripping behaviour is UNCHANGED — the security
    control the gate once warned about still stands on its own.
 4. The retired predicate machinery (``worker_github_token_findings`` /
@@ -47,6 +46,7 @@ from charlie_work.env_sanitize import (
     STRIPPED_GH_TOKEN_VARS,
     sanitize_env,
 )
+from charlie_work.host.fakes import FakeWorkerLauncher
 from charlie_work.paths import runtime_paths
 from charlie_work.state import load_state
 
@@ -62,7 +62,6 @@ def _config(
     *,
     adapter: str = "devin-shell",
     devin_worker_env: dict[str, str] | None = None,
-    require_token: bool = False,
 ) -> OrchestratorConfig:
     """Build a minimal OrchestratorConfig for the retirement tests."""
     return OrchestratorConfig(
@@ -72,9 +71,6 @@ def _config(
             worker_env=devin_worker_env or {},
         ),
         worker=WorkerRoleConfig(harness=adapter),
-        dispatch=DispatchConfig(
-            require_worker_github_token=require_token,
-        ),
     )
 
 
@@ -87,9 +83,7 @@ def _events_of_kind(state: dict[str, Any], kind: str) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 
-def test_dispatch_proceeds_with_no_token_and_no_escalation(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_dispatch_proceeds_with_no_token_and_no_escalation(tmp_path: Path, fake_host) -> None:
     """No worker token + default flag -> dispatch proceeds silently.
 
     The retired gate emitted ``worker_token_missing`` once per standing
@@ -118,7 +112,7 @@ def test_dispatch_proceeds_with_no_token_and_no_escalation(
             for req in requests
         ]
 
-    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", _fake_dispatch_sessions)
+    fake_host(worker_launch=FakeWorkerLauncher([_fake_dispatch_sessions]))
 
     fake_gh.prs[0]["state"] = "CLOSED"
     result = app.dispatch(limit=1)
@@ -131,68 +125,50 @@ def test_dispatch_proceeds_with_no_token_and_no_escalation(
     assert state.get("worker_token_escalated") in (None, False)
 
 
-def test_deprecated_require_flag_no_longer_defers(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """``require_worker_github_token=True`` is a deprecated no-op (#1853):
-    dispatch must proceed with no token and emit no ``worker_token_missing``
-    event — a config file carrying the old flag cannot accidentally re-arm
-    the gate."""
-    from charlie_work.adapters import SessionDispatchResult
-    from charlie_work.workflow import OrchestratorApp
-
-    config = _config(adapter="devin-shell", require_token=True)
-    paths = runtime_paths(tmp_path, config.runtime.state_dir)
-    fake_gh = FakeGitHub()
-    app = OrchestratorApp(tmp_path, paths, config, fake_gh, dry_run=False)
-
-    def _fake_dispatch_sessions(repo_root, manifest_path, results_path, settings, requests):
-        return [
-            SessionDispatchResult(
-                issue_number=req.issue_number,
-                issue_title=req.issue_title,
-                prompt_path=req.prompt_path,
-                branch_name=req.branch_name,
-                adapter=settings.adapter,
-                ok=True,
-                pid=999,
-            )
-            for req in requests
-        ]
-
-    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", _fake_dispatch_sessions)
-
-    fake_gh.prs[0]["state"] = "CLOSED"
-    result = app.dispatch(limit=1)
-
-    assert result.ok is True
-    assert result.data["selected_count"] == 1
-    assert result.data.get("deferred_reason") is None or (
-        result.data["deferred_reason"] != "worker_token_missing"
-    )
-    state = load_state(paths.state_file)
-    assert _events_of_kind(state, "worker_token_missing") == []
-
-
 # ---------------------------------------------------------------------------
-# 2. Config backward compatibility: the retired key still parses
+# 2. The retired key is rejected outright: unknown, not deprecated (issue
+# #1977 — a stale config file can no longer even reach dispatch, so the gate
+# cannot be re-armed by config residue).
+#
+# The three leaf names in this section predate the removal and are kept
+# verbatim: the collect-only gate (issue #1538) fails a required check on
+# any leaf-name removal, rename included, absent the operator-applied
+# ``collect-gate-exempt`` label. Each docstring states what the name pins
+# now that the key is gone.
 # ---------------------------------------------------------------------------
 
 
-def test_config_with_retired_key_still_loads() -> None:
-    """A config file that still sets ``dispatch.require_worker_github_token``
-    must parse unchanged (issue #1853 acceptance criterion)."""
-    config = build_config_from_data({"dispatch": {"require_worker_github_token": True}})
-    assert config.dispatch.require_worker_github_token is True
+def test_deprecated_require_flag_no_longer_defers() -> None:
+    """Issue #1977 removed the flag outright: it can no longer defer
+    dispatch because it can no longer exist — ``DispatchConfig`` rejects
+    the field, and a config file still setting it dies at parse with the
+    unknown-key error, so config residue can never reach dispatch."""
+    with pytest.raises(TypeError, match="require_worker_github_token"):
+        DispatchConfig(require_worker_github_token=True)
+    with pytest.raises(ConfigError, match="unknown key"):
+        build_config_from_data({"dispatch": {"require_worker_github_token": True}})
+
+
+def test_config_with_retired_key_still_loads(tmp_path: Path) -> None:
+    """ "Still loads" now means the config FILE still parses — the retired
+    key reaches the validator, which rejects it with the normal unknown-key
+    error rather than silently dropping it (issue #1977)."""
+    import yaml
+
+    config_path = tmp_path / "orchestrator.config.yaml"
+    config_path.write_text("dispatch:\n  require_worker_github_token: true\n", encoding="utf-8")
+    data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert data["dispatch"]["require_worker_github_token"] is True
+    with pytest.raises(ConfigError, match="unknown key"):
+        build_config_from_data(data)
 
 
 def test_config_retired_key_must_still_be_bool() -> None:
-    """Backward-compat parsing still validates the type."""
-    with pytest.raises(
-        ConfigError,
-        match=r"^dispatch\.require_worker_github_token: expected bool, got 'true' \(str\)$",
-    ):
-        build_config_from_data({"dispatch": {"require_worker_github_token": "true"}})
+    """The bool-type check this name describes is gone with the field —
+    post-#1977 even a correctly typed bool is rejected by the unknown-key
+    check, proving the key is unrecognized rather than merely mistyped."""
+    with pytest.raises(ConfigError, match="unknown key"):
+        build_config_from_data({"dispatch": {"require_worker_github_token": True}})
 
 
 # ---------------------------------------------------------------------------

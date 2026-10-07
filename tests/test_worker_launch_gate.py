@@ -25,6 +25,7 @@ from charlie_work.config import (
     WorkerRoleConfig,
 )
 from charlie_work.fleet_registry import try_acquire_fleet_lock
+from charlie_work.host.fakes import FakeWorkerLauncher
 from charlie_work.paths import runtime_paths
 from charlie_work.state import load_state, save_state, set_throttled_until, state_lock
 from charlie_work.worker_launch_gate import (
@@ -80,7 +81,8 @@ def _app(tmp_path: Path, lane: str, **config_kw: Any) -> OrchestratorApp:
     return app
 
 
-def _spy_dispatch_sessions(monkeypatch: pytest.MonkeyPatch) -> list[SessionRequest]:
+def _spy_dispatch_sessions(fake_host) -> list[SessionRequest]:
+    """Install a launch-port fake recording each request; returns the log."""
     calls: list[SessionRequest] = []
 
     def _fake(_repo_root, _manifest, _results, settings, requests):
@@ -99,7 +101,7 @@ def _spy_dispatch_sessions(monkeypatch: pytest.MonkeyPatch) -> list[SessionReque
             for r in requests
         ]
 
-    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", _fake)
+    fake_host(worker_launch=FakeWorkerLauncher([_fake]))
     return calls
 
 
@@ -119,11 +121,11 @@ LANES = pytest.mark.parametrize("lane", [FRESH, REWORK])
 
 
 @LANES
-def test_ungated_lane_launches(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lane: str) -> None:
+def test_ungated_lane_launches(tmp_path: Path, fake_host, lane: str) -> None:
     """Control: with no gate active the lane launches -- otherwise every
     zero-launch assertion below proves nothing."""
     app = _app(tmp_path, lane)
-    calls = _spy_dispatch_sessions(monkeypatch)
+    calls = _spy_dispatch_sessions(fake_host)
 
     result = _run(app, lane)
 
@@ -132,11 +134,9 @@ def test_ungated_lane_launches(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, 
 
 
 @LANES
-def test_provider_throttle_blocks_launch(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lane: str
-) -> None:
+def test_provider_throttle_blocks_launch(tmp_path: Path, fake_host, lane: str) -> None:
     app = _app(tmp_path, lane)
-    calls = _spy_dispatch_sessions(monkeypatch)
+    calls = _spy_dispatch_sessions(fake_host)
     _throttle(app)
 
     result = _run(app, lane)
@@ -147,13 +147,11 @@ def test_provider_throttle_blocks_launch(
 
 
 @LANES
-def test_held_fleet_lock_blocks_launch(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lane: str
-) -> None:
+def test_held_fleet_lock_blocks_launch(tmp_path: Path, fake_host, lane: str) -> None:
     """The real fleet lock, held by another dispatcher, not a patched stub.
     Issue #2055: a short bounded wait is retried before the deferral."""
     app = _app(tmp_path, lane, fleet_cap=4, launch_lock_wait=0.2)
-    calls = _spy_dispatch_sessions(monkeypatch)
+    calls = _spy_dispatch_sessions(fake_host)
     held = try_acquire_fleet_lock(app.fleet_dir_override)
     assert held is not None
     try:
@@ -167,11 +165,11 @@ def test_held_fleet_lock_blocks_launch(
 
 @LANES
 def test_governor_at_cap_blocks_launch(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lane: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_host, lane: str
 ) -> None:
-    monkeypatch.setattr("charlie_work.workflow._count_live_sessions", lambda *_a, **_k: 1)
+    monkeypatch.setattr("charlie_work.live_session_count.count_live_sessions", lambda *_a, **_k: 1)
     app = _app(tmp_path, lane, max_concurrent=1)
-    calls = _spy_dispatch_sessions(monkeypatch)
+    calls = _spy_dispatch_sessions(fake_host)
 
     result = _run(app, lane)
 
@@ -181,13 +179,11 @@ def test_governor_at_cap_blocks_launch(
 
 
 @LANES
-def test_lane_releases_fleet_lock_after_launch(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lane: str
-) -> None:
+def test_lane_releases_fleet_lock_after_launch(tmp_path: Path, fake_host, lane: str) -> None:
     """The lock is held across the launch and released afterwards -- a leaked
     lock would starve every other repo's dispatcher."""
     app = _app(tmp_path, lane, fleet_cap=4)
-    calls = _spy_dispatch_sessions(monkeypatch)
+    calls = _spy_dispatch_sessions(fake_host)
 
     _run(app, lane)
 
@@ -225,12 +221,10 @@ def _assert_refused(results: list[SessionDispatchResult], calls: list, n: int) -
     assert all(not r.ok and (r.error or "").startswith("worker launch refused") for r in results)
 
 
-def test_issued_permit_launches_within_budget(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_issued_permit_launches_within_budget(tmp_path: Path, fake_host) -> None:
     """Control for the refusals below: a gate-issued permit launches."""
     app = _app(tmp_path, FRESH)
-    calls = _spy_dispatch_sessions(monkeypatch)
+    calls = _spy_dispatch_sessions(fake_host)
     with _permit(app, 2) as permit:
         results = _launch_workers(app, permit, _settings(), [_request(1), _request(2)])
 
@@ -238,9 +232,9 @@ def test_issued_permit_launches_within_budget(
     assert all(r.ok for r in results)
 
 
-def test_forged_permit_is_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_forged_permit_is_refused(tmp_path: Path, fake_host) -> None:
     app = _app(tmp_path, FRESH)
-    calls = _spy_dispatch_sessions(monkeypatch)
+    calls = _spy_dispatch_sessions(fake_host)
     lock = acquire_fleet_launch_lock(app)
     forged = WorkerLaunchPermit(requested=5, max_launches=5, governor=None, _launch_lock=lock)
 
@@ -249,19 +243,21 @@ def test_forged_permit_is_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     _assert_refused(results, calls, 1)
 
 
-def test_absent_permit_is_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_absent_permit_is_refused(tmp_path: Path, fake_host) -> None:
     app = _app(tmp_path, FRESH)
-    calls = _spy_dispatch_sessions(monkeypatch)
+    calls = _spy_dispatch_sessions(fake_host)
 
     results = _launch_workers(app, None, _settings(), [_request(1)])  # type: ignore[arg-type]
 
     _assert_refused(results, calls, 1)
 
 
-def test_over_budget_batch_is_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("charlie_work.workflow._count_live_sessions", lambda *_a, **_k: 2)
+def test_over_budget_batch_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_host
+) -> None:
+    monkeypatch.setattr("charlie_work.live_session_count.count_live_sessions", lambda *_a, **_k: 2)
     app = _app(tmp_path, FRESH, max_concurrent=3)
-    calls = _spy_dispatch_sessions(monkeypatch)
+    calls = _spy_dispatch_sessions(fake_host)
     with _permit(app, 5) as permit:
         assert permit.max_launches == 1
         results = _launch_workers(app, permit, _settings(), [_request(1), _request(2)])
@@ -269,13 +265,11 @@ def test_over_budget_batch_is_refused(tmp_path: Path, monkeypatch: pytest.Monkey
     _assert_refused(results, calls, 2)
 
 
-def test_successive_launches_share_one_budget(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_successive_launches_share_one_budget(tmp_path: Path, fake_host) -> None:
     """The remote rework lane's normal + rescue tiers launch in two calls on
     one permit; together they may not exceed it."""
     app = _app(tmp_path, FRESH)
-    calls = _spy_dispatch_sessions(monkeypatch)
+    calls = _spy_dispatch_sessions(fake_host)
     with _permit(app, 2) as permit:
         first = _launch_workers(app, permit, _settings(), [_request(1)])
         over = _launch_workers(app, permit, _settings(), [_request(2), _request(3)])
@@ -287,17 +281,48 @@ def test_successive_launches_share_one_budget(
     assert [r.issue_number for r in calls] == [1, 4]
 
 
-def test_permit_is_refused_once_its_fleet_lock_is_released(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_permit_is_refused_once_its_fleet_lock_is_released(tmp_path: Path, fake_host) -> None:
     app = _app(tmp_path, FRESH, fleet_cap=4)
-    calls = _spy_dispatch_sessions(monkeypatch)
+    calls = _spy_dispatch_sessions(fake_host)
     with _permit(app, 2) as permit:
         pass
 
     results = _launch_workers(app, permit, _settings(), [_request(1)])
 
     _assert_refused(results, calls, 1)
+
+
+def test_launcher_exception_is_a_recorded_failure_and_releases_the_permit(
+    tmp_path: Path, fake_host
+) -> None:
+    """Issue #2229: a raise out of the worker launch port comes back as
+    per-request failure values -- the errors-as-values boundary at the launch
+    seam converts it, one ``launch_failed`` event lands per request, the
+    permit ledger still debits the batch, and the pass completes so the
+    permit-owned fleet lock is released."""
+    from charlie_work.instrumentation import query_events
+
+    app = _app(tmp_path, FRESH, fleet_cap=4)
+
+    def _boom(*_a: Any, **_k: Any) -> list[Any]:
+        raise RuntimeError("dispatch exploded")
+
+    fake_host(worker_launch=FakeWorkerLauncher([_boom]))
+    with _permit(app, 2) as permit:
+        results = _launch_workers(app, permit, _settings(), [_request(1), _request(2)])
+        # The ledger debited the failed batch: the permit's budget is spent.
+        over = _launch_workers(app, permit, _settings(), [_request(3)])
+
+    assert [r.ok for r in results] == [False, False]
+    assert all("dispatch exploded" in (r.error or "") for r in results)
+    assert (over[0].error or "").startswith("worker launch refused")
+    events = query_events(app.paths.state_file, kind="launch_failed")
+    assert [e["payload"]["issue_number"] for e in events] == [1, 2]
+    assert all(e["payload"]["role"] == "worker" for e in events)
+    assert all(e["payload"]["error_class"] == "internal" for e in events)
+    lock = try_acquire_fleet_lock(app.fleet_dir_override)
+    assert lock is not None, "a raising launch leaked the permit's fleet lock"
+    lock.release()
 
 
 def test_throttle_deferral_releases_the_permit_owned_lock(

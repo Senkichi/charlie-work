@@ -34,6 +34,7 @@ import logging
 from dataclasses import dataclass
 from pathlib import Path
 
+from ..atomic_write import write_json_atomic
 from ..state import StateLockBusy, advisory_file_lock, utc_now
 
 logger = logging.getLogger(__name__)
@@ -46,12 +47,18 @@ _MAX_ENTRIES = 500
 
 @dataclass(frozen=True)
 class CachedResponse:
-    """One memoized REST GET response, keyed by request path."""
+    """One memoized REST GET response, keyed by request path.
+
+    ``link`` is the response's ``Link`` header when it carried one: a 304
+    need not repeat it (RFC 9110 15.4.5), and ``paginate_rest`` reads the
+    served response's headers to keep following pages.
+    """
 
     etag: str
     status: int
     body: str
     stored_at: str
+    link: str | None = None
 
 
 def _cache_key(path: str) -> str:
@@ -85,17 +92,29 @@ def load_cache(cache_path: Path) -> dict[str, CachedResponse]:
         status = value.get("status")
         body = value.get("body")
         stored_at = value.get("stored_at")
+        link = value.get("link")
         if not isinstance(etag, str) or not isinstance(status, int):
             continue
         if not isinstance(body, str) or not isinstance(stored_at, str):
             continue
-        result[str(key)] = CachedResponse(etag=etag, status=status, body=body, stored_at=stored_at)
+        result[str(key)] = CachedResponse(
+            etag=etag,
+            status=status,
+            body=body,
+            stored_at=stored_at,
+            link=link if isinstance(link, str) else None,
+        )
     return result
 
 
 def _save_cache(cache_path: Path, entries: dict[str, CachedResponse]) -> None:
-    """Atomically persist the cache (temp-file + `replace()`)."""
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    """Atomically persist the cache (``atomic_write.write_json_atomic``).
+
+    Unique per-writer temp name + bounded ``PermissionError`` retry on the
+    rename (issue #2265): a fixed shared ``.tmp`` name let concurrent saves
+    collide, and a lock-free reader holding the destination open makes the
+    rename transiently fail on Windows.
+    """
     payload = {
         "version": 1,
         "entries": {
@@ -104,15 +123,12 @@ def _save_cache(cache_path: Path, entries: dict[str, CachedResponse]) -> None:
                 "status": entry.status,
                 "body": entry.body,
                 "stored_at": entry.stored_at,
+                "link": entry.link,
             }
             for key, entry in entries.items()
         },
     }
-    tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
-    with tmp_path.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2, sort_keys=True)
-        handle.write("\n")
-    tmp_path.replace(cache_path)
+    write_json_atomic(cache_path, payload)
 
 
 def get_cached(cache_path: Path, path: str) -> CachedResponse | None:
@@ -120,7 +136,15 @@ def get_cached(cache_path: Path, path: str) -> CachedResponse | None:
     return load_cache(cache_path).get(_cache_key(path))
 
 
-def record_response(cache_path: Path, path: str, *, etag: str, status: int, body: str) -> None:
+def record_response(
+    cache_path: Path,
+    path: str,
+    *,
+    etag: str,
+    status: int,
+    body: str,
+    link: str | None = None,
+) -> None:
     """Durably record a fresh `(etag, status, body)` for `path`.
 
     Locked read-modify-write, mirroring `queue_sync_coverage_cache.record_covered`:
@@ -134,7 +158,9 @@ def record_response(cache_path: Path, path: str, *, etag: str, status: int, body
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         with advisory_file_lock(cache_path):
             entries = load_cache(cache_path)
-            entries[key] = CachedResponse(etag=etag, status=status, body=body, stored_at=utc_now())
+            entries[key] = CachedResponse(
+                etag=etag, status=status, body=body, stored_at=utc_now(), link=link
+            )
             if len(entries) > _MAX_ENTRIES:
                 oldest_key = min(entries, key=lambda k: entries[k].stored_at)
                 if oldest_key != key:
@@ -162,5 +188,7 @@ class FileEtagCache:
     def get(self, path: str) -> CachedResponse | None:
         return get_cached(self._cache_path, path)
 
-    def record(self, path: str, *, etag: str, status: int, body: str) -> None:
-        record_response(self._cache_path, path, etag=etag, status=status, body=body)
+    def record(
+        self, path: str, *, etag: str, status: int, body: str, link: str | None = None
+    ) -> None:
+        record_response(self._cache_path, path, etag=etag, status=status, body=body, link=link)

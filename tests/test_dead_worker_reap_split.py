@@ -60,7 +60,7 @@ byte-identity discipline over the cap. In place of the 800-line gate, this
 file asserts two things, mirroring ``test_stalled_review_reap_split.py``:
 
 * An AST-derived name-set equality on the module's top-level definitions:
-  must be exactly the 27 known moved names, no more, no fewer.
+  must be exactly the 23 surviving moved names, no more, no fewer.
 * A BAND on the new module's total line count (docstring + imports + body),
   derived live from this PR's own measured total (2667 lines) with headroom
   margin on both sides for legitimate future per-function growth (e.g. a
@@ -88,6 +88,7 @@ from __future__ import annotations
 import ast
 import re
 from pathlib import Path
+from _src_ast import parsed, parsed_source
 
 _REPO_ROOT = Path(__file__).parents[1]
 _PACKAGE_DIR = _REPO_ROOT / "src" / "charlie_work" / "dead_worker_sweep"
@@ -102,9 +103,7 @@ _MOVED_NAMES = (
     "_worker_death_bounded_runtime_seconds",
     "_session_failed_relabeled_payload",
     "_emit_session_failed_relabeled",
-    "_count_live_sessions",
     "_detect_stalled_sessions",
-    "_worker_pid_alive",
     "_orphan_head_fingerprint",
     "_ZERO_ARTIFACT_ESCALATION_THRESHOLD",
     "_is_zero_artifact_dispatch_loop",
@@ -169,7 +168,7 @@ _PER_MODULE_LINE_CAP = 800
 
 def _module_level_defined_names(path: Path) -> list[str]:
     """Top-level function/class/constant names a module defines."""
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    tree = parsed(path)
     names: list[str] = []
     for node in tree.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
@@ -196,7 +195,7 @@ def _all_effect_module_names() -> list[str]:
 def _facade_reexported_names(workflow_path: Path) -> set[str]:
     """Names workflow.py's facade blocks currently re-export from the three
     ``.dead_worker_sweep.effects_*`` modules."""
-    tree = ast.parse(workflow_path.read_text(encoding="utf-8"), filename=str(workflow_path))
+    tree = parsed(workflow_path)
     names: set[str] = set()
     for node in ast.walk(tree):
         if (
@@ -248,7 +247,7 @@ def _module_imports_in(
     <relative_module>``, ``from <absolute_module> import X``, and ``import
     <absolute_module>``.
     """
-    tree = ast.parse(source, filename=filename)
+    tree = parsed_source(source, filename)
     offenders: list[str] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom):
@@ -350,7 +349,7 @@ def test_dead_worker_reap_module_actually_imports_cleanly() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Facade-completeness identity checks -- all 27 names importable from BOTH
+# Facade-completeness identity checks -- all 23 names importable from BOTH
 # charlie_work.workflow and charlie_work.dead_worker_reap, and `is`-identical
 # (not merely equal), for every name.
 # ---------------------------------------------------------------------------
@@ -376,7 +375,7 @@ def test_all_moved_names_are_reexported_by_identity() -> None:
     names = _all_effect_module_names()
     assert len(names) == len(set(names)), "a name is defined in more than one effect module"
     assert names, "AST derivation found zero module-level names -- derivation is broken"
-    assert len(names) == 25, f"expected 25 moved units, found {len(names)}: {sorted(names)}"
+    assert len(names) == 23, f"expected 23 moved units, found {len(names)}: {sorted(names)}"
     assert set(names) == set(_MOVED_NAMES), (
         f"AST-derived names {sorted(names)} do not match the expected moved set "
         f"{sorted(_MOVED_NAMES)}"
@@ -426,7 +425,7 @@ def test_facade_reexported_names_match_the_moved_set() -> None:
     """The facade block's own AST-derived import list (not just attribute
     presence on the ``workflow`` module object, which could also be
     satisfied by an unrelated same-named attribute elsewhere in the file)
-    contains exactly the 27 expected names, no more, no fewer.
+    contains exactly the 23 expected names, no more, no fewer.
     """
     facade_names = _facade_reexported_names(_WORKFLOW_PATH)
     assert facade_names == set(_MOVED_NAMES), (
@@ -505,7 +504,7 @@ def test_orphaned_workers_stays_in_workflow_and_resolves_moved_names_via_facade(
         "not a second definition"
     )
 
-    tree = ast.parse(_WORKFLOW_PATH.read_text(encoding="utf-8"), filename=str(_WORKFLOW_PATH))
+    tree = parsed(_WORKFLOW_PATH)
     redefined = [
         node
         for node in tree.body

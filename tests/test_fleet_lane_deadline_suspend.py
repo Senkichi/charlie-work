@@ -43,6 +43,7 @@ from charlie_work.config import (
     RunnersConfig,
     WorkerRoleConfig,
 )
+from charlie_work.host.fakes import FakeWorkerLauncher
 from charlie_work.instrumentation import query_events
 from charlie_work.pass_deadline import (
     PassDeadlineExceeded,
@@ -256,9 +257,15 @@ def test_merge_ready_mergequeue_handoff_refusal_propagates_cleanly(
     re-derives readiness from scratch. Assert the refusal escapes merge_ready
     without touching the merge counters, the alarm, or the mergequeue status.
     """
-    app, paths, fake_gh = _merge_ready_app(tmp_path, mergequeue_label="mergequeue")
+    # Skip-line off: its issue read would otherwise be the first refusal site
+    # (pinned by the TIS-CW-7 test below).
+    app, paths, fake_gh = _merge_ready_app(
+        tmp_path, mergequeue_label="mergequeue", mergequeue_skip_line_label=None
+    )
     spent = {"hit": False}
     real_issue_view = fake_gh.issue_view
+    # Cache miss on the open-issue list (#2440) so the live issue_view fallback runs.
+    fake_gh.issue_list = lambda *a, **k: []  # type: ignore[method-assign]
 
     def _issue_view_then_spend(number: int) -> Any:
         result = real_issue_view(number)
@@ -283,6 +290,37 @@ def test_merge_ready_mergequeue_handoff_refusal_propagates_cleanly(
     assert alarm_events == []
 
 
+def test_merge_ready_skip_line_read_refusal_propagates_cleanly(tmp_path: Path) -> None:
+    """TIS-CW-7: with skip-line on, the hand-off's issue read is the refusal site.
+
+    It runs before the queue label, so a refusal there leaves nothing applied,
+    exactly like a refusal at the label add.
+    """
+    app, paths, fake_gh = _merge_ready_app(tmp_path, mergequeue_label="mergequeue")
+    fake_gh.issues[0]["labels"] = [{"name": "automated-ready"}, {"name": "priority:critical"}]
+    spent = {"hit": False}
+    real_issue_view = fake_gh.issue_view
+    # Cache miss on the open-issue list (#2440) so the live issue_view fallback runs.
+    fake_gh.issue_list = lambda *a, **k: []  # type: ignore[method-assign]
+
+    def _issue_view_then_spend(number: int) -> Any:
+        result = real_issue_view(number)
+        spent["hit"] = True
+        return result
+
+    fake_gh.issue_view = _issue_view_then_spend  # type: ignore[method-assign]
+    set_pass_deadline_exceeded(fake_gh, lambda: spent["hit"])
+
+    with pytest.raises(PassDeadlineExceeded):
+        app.merge_ready(456, merge=True)
+
+    assert fake_gh.deadline_refusals == ["issue_view"]
+    assert fake_gh.pr_labels_added == []
+    assert fake_gh.merged == []
+    pr_state = load_state(paths.state_file)["prs"].get("456", {})
+    assert pr_state.get("status") != "mergequeue"
+
+
 # ---------------------------------------------------------------------------
 # dispatch / dispatch_rework: a refusal between claim and launch must not
 # strand the issue -- the claim is durable state, the in-progress label is
@@ -291,7 +329,7 @@ def test_merge_ready_mergequeue_handoff_refusal_propagates_cleanly(
 
 
 def test_dispatch_refusal_between_claim_and_launch_leaves_recoverable_claim(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, fake_host
 ) -> None:
     """A BaseException refusal after the claim write strands nothing unsafe.
 
@@ -321,7 +359,7 @@ def test_dispatch_refusal_between_claim_and_launch_leaves_recoverable_claim(
         dispatch_calls.append(requests)
         return _ok_dispatch_sessions(requests)
 
-    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", _spy_dispatch_sessions)
+    fake_host(worker_launch=FakeWorkerLauncher([_spy_dispatch_sessions]))
 
     # Spent exactly when the claim exists: the refusal lands between the
     # claim write (first lock) and the worker launch (dispatch_sessions).
@@ -357,7 +395,7 @@ def test_dispatch_refusal_between_claim_and_launch_leaves_recoverable_claim(
 
 
 def test_dispatch_rework_refusal_between_claim_and_launch_leaves_recoverable_claim(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, fake_host
 ) -> None:
     """Same claim->launch contract for the rework lane.
 
@@ -401,7 +439,7 @@ def test_dispatch_rework_refusal_between_claim_and_launch_leaves_recoverable_cla
         dispatch_calls.append(requests)
         return _ok_dispatch_sessions(requests)
 
-    monkeypatch.setattr("charlie_work.workflow.dispatch_sessions", _spy_dispatch_sessions)
+    fake_host(worker_launch=FakeWorkerLauncher([_spy_dispatch_sessions]))
 
     set_pass_deadline_exceeded(fake_gh, lambda: _dispatch_pending_claim(paths))
 

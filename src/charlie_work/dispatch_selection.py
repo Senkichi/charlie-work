@@ -17,14 +17,12 @@ from typing import TYPE_CHECKING, Any, Callable
 
 from .config import ReviewDispatchConfig
 from .no_op_checkpoint import _no_op_window_start, _normalized_timestamps
-from .process_utils import is_pid_alive
+from . import host as _host
 from .state import (
     _REVIEW_DEAD_CLAIM_BACKSTOP_TIMEOUT_MINUTES,
     _REVIEW_STALE_CLAIM_TIMEOUT_MINUTES,
     is_claim_stale,
-    load_state_locked,
 )
-from .worker import iter_workers
 
 if TYPE_CHECKING:
     from .review_fleet_gate import FleetReviewCap
@@ -278,59 +276,17 @@ def _select_rework_candidates(
 def _reviewer_pid_alive(entry: dict[str, Any]) -> bool:
     """Check if a reviewer PID from state.json is alive, with start-time verification.
 
-    Mirror of ``_worker_pid_alive`` for reviewer processes launched by
+    Reviewer-process liveness for reviewers launched by
     ``dispatch_reviews``. A reviewer is a Claude Code worker whose PID and
     process start time are stored under ``reviewer_pid`` and
     ``reviewer_process_start_time`` in the per-PR state.
+
+    Issue #2230: the probe itself lives in ``live_session_count._ghost_pid_alive``,
+    shared with the worker lane's state.json pid probe.
     """
-    reviewer_pid = entry.get("reviewer_pid")
-    if reviewer_pid is None:
-        return False
+    from .live_session_count import REVIEW_LANE, _ghost_pid_alive
 
-    return is_pid_alive(reviewer_pid, entry.get("reviewer_process_start_time"))
-
-
-def _count_live_reviews(reviews_dir: Path, state_file: Path | None = None) -> int:
-    """Count the number of currently alive reviewer sessions.
-
-    Reads review sidecar files (claude-code only today) from ``reviews_dir``,
-    then checks each record's PID liveness using the adapter-agnostic
-    ``WorkerView.is_alive`` probe.
-
-    When ``state_file`` is given, the count is corroborated against
-    state.json's own ``review_dispatch_dispatched`` records so a missing
-    sidecar doesn't let a live reviewer slip through the local cap.
-    """
-    live_pr_numbers: set[int] = set()
-    live_count = 0
-    for w in iter_workers(reviews_dir):
-        if w.is_alive():
-            live_count += 1
-            live_pr_numbers.add(w.issue_number)
-
-    if state_file is not None:
-        state = load_state_locked(state_file)
-        for pr_number_str, entry in state.get("prs", {}).items():
-            if not isinstance(entry, dict):
-                continue
-            if entry.get("review_dispatch_status") != "review_dispatch_dispatched":
-                continue
-            try:
-                pr_number = int(pr_number_str)
-            except (TypeError, ValueError):
-                continue
-            if pr_number in live_pr_numbers:
-                continue
-            if _reviewer_pid_alive(entry):
-                live_count += 1
-                print(
-                    f"[reconcile] PR {pr_number}: reviewer_pid {entry.get('reviewer_pid')} "
-                    "is alive with no live review sidecar (ghost) -- counting it against "
-                    "the local review cap instead of treating the slot as free",
-                    flush=True,
-                )
-
-    return live_count
+    return _ghost_pid_alive(entry, REVIEW_LANE)
 
 
 def _apply_local_review_cap(
@@ -754,7 +710,7 @@ def _select_review_dispatch_candidates(
     ]
     max_local = review_dispatch_config.max_local_review_processes
     max_concurrent = review_dispatch_config.max_concurrent_reviews
-    live_count = _count_live_reviews(reviews_dir, state_file)
+    live_count = _host.current().sessions.live_reviews(reviews_dir, state_file)
     requested_limit = limit if limit is not None else len(dispatchable)
     local_cap = _apply_local_review_cap(requested_limit, max_local, live_count)
     if max_concurrent > 0:

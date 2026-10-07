@@ -10,11 +10,12 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from ..config import OrchestratorConfig
+from ..host import current as _host_current
 from ..write_gate import WriteGate
 from .ports import SweepPorts
 
@@ -36,7 +37,7 @@ class SweepContext:
     repo_root: Any
     worktrees_dir: Path | None
     state: dict[str, Any]
-    now: datetime = field(default_factory=lambda: datetime.now(UTC))
+    now: datetime = field(default_factory=lambda: _host_current().clock.now())
     stamp: str = ""
     pid_alive: dict[int, bool] = field(default_factory=dict)
     issues: dict[int, dict[str, Any]] | None = None
@@ -62,6 +63,8 @@ class SweepContext:
         default_factory=lambda: {"live_handoff": {}, "no_pr": {}, "swept": {}}
     )
     scope_context: tuple[frozenset[str], str] | None = None
+    # Issue #2274: pre-phase log classifications, persisted once under the lock.
+    pre_classified: dict[int, Any] = field(default_factory=dict)
 
     def issue_entry(self, number: int) -> dict[str, Any]:
         entry = (self.state.get("issues") or {}).get(str(number), {})
