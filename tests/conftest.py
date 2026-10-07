@@ -536,6 +536,27 @@ def _no_real_github_network(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(http_adapter, "_new_connection", _refuse)
 
 
+@pytest.fixture(autouse=True)
+def _no_real_opencode_go_network(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Never let the OpenCode Go quota probe reach opencode.ai.
+
+    Any opencode ``quota_exhausted`` classification probes the Go API with the
+    operator's real credential (``opencode_limits.go_quota_reset``). By default
+    no credential is found -- the same on every host, so a classification test
+    sees the 24h fallback -- and any connection is refused. Probe tests inject
+    ``_go_api_key`` and ``_open``; the per-process probe cache is cleared so
+    one test's answer never leaks into another.
+    """
+    from charlie_work import opencode_limits
+
+    def _refuse(request: object, timeout: float) -> object:
+        raise AssertionError(f"real network in tests: {getattr(request, 'full_url', request)}")
+
+    monkeypatch.setattr(opencode_limits, "_go_api_key", lambda: None)
+    monkeypatch.setattr(opencode_limits, "_open", _refuse)
+    monkeypatch.setattr(opencode_limits, "_cache", None)
+
+
 def _healthy_preflight(*args: object, **kwargs: object) -> PreflightResult:
     return PreflightResult(checks=())
 
