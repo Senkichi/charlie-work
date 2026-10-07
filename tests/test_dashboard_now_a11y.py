@@ -86,8 +86,17 @@ def test_dashboard_js_wires_every_htmx_failure_event_and_success() -> None:
 _NODE = shutil.which("node")
 
 
-@pytest.mark.skipif(_NODE is None, reason="node not on PATH")
-def test_staleness_rule_under_node() -> None:
+@pytest.fixture(scope="module")
+def _staleness_js_api() -> dict[str, object]:
+    """The ``staleness.js`` API evaluated once under node, shared by the module.
+
+    Booting the interpreter dominates the assertions: on hosted windows-latest a
+    first-touch exec of node.exe costs seconds (cold binary, AV, shard load), so
+    the spawn belongs to module setup, not to one test's call time. Keep the
+    spawn here for any future node-backed check in this module.
+    """
+    if _NODE is None:
+        pytest.skip("node not on PATH")
     path = static_dir_traversable().joinpath("staleness.js")
     script = (
         f"const s = require({json.dumps(str(path))});"
@@ -102,7 +111,12 @@ def test_staleness_rule_under_node() -> None:
     )
     run = subprocess.run([_NODE, "-e", script], capture_output=True, text=True, timeout=30)
     assert run.returncode == 0, run.stderr
-    out = json.loads(run.stdout)
+    return json.loads(run.stdout)
+
+
+@pytest.mark.skipif(_NODE is None, reason="node not on PATH")
+def test_staleness_rule_under_node(_staleness_js_api: dict[str, object]) -> None:
+    out = _staleness_js_api
     assert out["fresh"] is None  # exactly 2x poll: still fresh
     assert out["stale"] == {"since": 0, "unreachable": False}
     assert out["down"] == {"since": 1000, "unreachable": True}
