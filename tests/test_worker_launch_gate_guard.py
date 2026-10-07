@@ -23,7 +23,7 @@ import charlie_work
 import charlie_work.adapters as adapters
 from charlie_work.host import RealWorkerLauncher
 from charlie_work.worker_launch_gate import _launch_workers
-from _src_ast import parsed, source_files
+from _src_ast import parsed, source_files, source_text
 
 TARGET = adapters.dispatch_sessions.__name__
 PACKAGE_ROOT = Path(charlie_work.__file__).resolve().parent
@@ -90,6 +90,11 @@ def _attribute_reaches(path: Path, attr: str) -> list[tuple[str, str, int]]:
 def _all_references(target: str) -> list[tuple[str, str, int]]:
     refs: list[tuple[str, str, int]] = []
     for path in source_files(PACKAGE_ROOT):
+        # A reference to ``target`` cannot exist in a file whose text lacks
+        # the identifier; the filter keeps the ~450 untouched files out of
+        # the (shared-cache) parse (issue #2447; same filter shape as #2403).
+        if target not in source_text(path):
+            continue
         refs.extend(_references(path, target))
     return refs
 
@@ -97,6 +102,10 @@ def _all_references(target: str) -> list[tuple[str, str, int]]:
 def _all_attribute_reaches(attr: str) -> list[tuple[str, str, int]]:
     refs: list[tuple[str, str, int]] = []
     for path in source_files(PACKAGE_ROOT):
+        # Same filter: a ``.<attr>`` reach or ``"<attr>"`` constant requires
+        # the literal text.
+        if attr not in source_text(path):
+            continue
         refs.extend(_attribute_reaches(path, attr))
     return refs
 
