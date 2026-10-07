@@ -12,6 +12,7 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+from _worktree_fixtures import _init_repo as _init_repo_templated
 from charlie_work.attempt_refs import (
     ATTEMPT_REF_PREFIX,
     AttemptSnapshot,
@@ -25,13 +26,35 @@ def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
 
 
 def _init_repo(repo_root: Path) -> None:
-    repo_root.mkdir(parents=True, exist_ok=True)
-    _git(repo_root, "init", "--initial-branch=main")
-    _git(repo_root, "config", "user.email", "test@example.test")
-    _git(repo_root, "config", "user.name", "Test User")
-    (repo_root / "README.md").write_text("hello\n", encoding="utf-8")
-    _git(repo_root, "add", "README.md")
-    _git(repo_root, "commit", "-m", "initial commit")
+    """A one-commit ``main`` repo with the test identity — byte-identical to the
+    ``init``/``config``/``commit`` spawn sequence this helper used to run inline.
+
+    Delegates to ``_worktree_fixtures._init_repo`` so the repo materializes
+    from the per-process ``plain`` git template (``shutil.copytree``, no
+    subprocesses — HS-CW-4, ``tests/_git_templates.py``): the spawn cost,
+    amplified on the Windows CI host, is what the ledger flagged at ~3.4x
+    baseline (issue #2462, same fix class as #2387/#2425).
+    """
+    _init_repo_templated(repo_root)
+
+
+def test_init_repo_goes_through_the_git_template(tmp_path: Path) -> None:
+    """Issue #2462 regression pin: ``_init_repo`` must materialize through the
+    per-process ``plain`` git template (``_git_templates``) instead of
+    re-running the ``init``/``config``/``commit`` spawn sequence per call —
+    the ledger measured
+    ``test_snapshot_attempt_ref_no_commits_returns_all_none`` at ~3.4x
+    baseline because each of this module's tests paid the full spawn cost on
+    the Windows CI host. Mirrors ``test_local_issues_loop_gates``'s #2425 pin.
+    """
+    import _git_templates
+    from _worktree_fixtures import _git as wt_git
+
+    before = _git_templates._REGISTRY.materialized["plain"]
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    assert _git_templates._REGISTRY.materialized["plain"] == before + 1
+    assert wt_git(repo, "rev-parse", "--verify", "main").stdout.strip()
 
 
 def _commit(repo_root: Path, name: str, content: str) -> str:
