@@ -14,15 +14,29 @@ from __future__ import annotations
 
 import json
 import shutil
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from .config import OrchestratorConfig
 from .github import GitHubError, GitHubLike
+from .instrumentation import query_events
+from .local_issue_commits import dirty_tracker_files
 from .local_issue_files import scan_issues
 from .local_lane import disabled_lane_switches, kill_switch_stall_payloads
 from .paths import RuntimePaths
 from .subprocess_runner import run_captured
+
+# How far back the deferred-flush events doctor counts belong (issue #2434):
+# the pass-end flush runs every pass, so two -- or more -- recorded deferrals
+# inside this window mean the consumer's issues dir has stayed dirty across
+# more than one pass, which is exactly the accumulation the tracker-write
+# commits exist to prevent.
+_DEFERRAL_LOOKBACK_HOURS = 24.0
+
+# Doctor warns once the deferral has been observed on this many passes within
+# the lookback window -- the issue text's "non-empty for more than one pass".
+_DEFERRAL_WARN_THRESHOLD = 2
 
 
 def _check_local_issue_backend(
@@ -169,6 +183,86 @@ def _check_local_issue_backend(
         )
 
     _check_local_lane_kill_switch(add, gh, paths, config)
+    _check_local_tracker_writes(add, gh, repo_root, paths, config)
+
+
+def _check_local_tracker_writes(
+    add: Any,
+    gh: GitHubLike,
+    repo_root: Path,
+    paths: RuntimePaths,
+    config: OrchestratorConfig,
+) -> None:
+    """Warn when tracker writes accumulate uncommitted across passes (#2434).
+
+    The backend's tracker writes are committed once per loop pass
+    (``orchestration.local_tracker_flush``), so the tracked issue files under
+    ``issues_dir`` are normally clean at any doctor run. Dirt at check time is
+    one of: the flush being repeatedly skipped (HEAD detached, a merge/rebase
+    in progress, a missing committer identity) -- each skip leaves a
+    ``local_tracker_writes_deferred`` event -- or the ``commit_writes`` kill
+    switch, which is configuration and only worth a note.
+
+    The warning is deliberately threshold-gated: ``>= 2`` recorded deferrals
+    within the lookback window means the directory stayed dirty across more
+    than one pass. A single deferral (typically yesterday's mid-merge, since
+    committed by the next pass's flush) gets an informational note instead,
+    because the accumulator's real failure mode is repetition, not a one-off.
+    """
+    if not config.local_issues.enabled:
+        return
+    issues_dir = getattr(gh, "issues_dir", None)
+    if not isinstance(issues_dir, Path):
+        return
+    cutoff = (
+        (datetime.now(UTC) - timedelta(hours=_DEFERRAL_LOOKBACK_HOURS))
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    dirty = dirty_tracker_files(repo_root, issues_dir)
+    if not dirty:
+        add(
+            "local tracker writes",
+            True,
+            "issues dir clean — tracker writes are committed at each pass flush",
+        )
+        return
+    if not config.local_issues.commit_writes:
+        add(
+            "local tracker writes",
+            True,
+            f"{len(dirty)} issue file(s) uncommitted — local_issues.commit_writes "
+            "is false (kill switch); the flush is disabled by config",
+            severity="warning",
+        )
+        return
+    deferred = query_events(paths.state_file, kind="local_tracker_writes_deferred", since=cutoff)
+    reason_values: list[str] = []
+    for event in deferred:
+        payload = event.get("payload")
+        reason = payload.get("reason") if isinstance(payload, dict) else None
+        if isinstance(reason, str) and reason:
+            reason_values.append(reason)
+    reasons = "; ".join(dict.fromkeys(reason_values))
+    if len(deferred) >= _DEFERRAL_WARN_THRESHOLD:
+        add(
+            "local tracker writes",
+            False,
+            f"{len(dirty)} issue file(s) left dirty across more than one pass — "
+            f"the pass-end commit flush keeps failing/skipping ({reasons or 'no reason recorded'}): "
+            "resolve the stated cause or run `charlie doctor` after the next pass; "
+            "the tracker's source of truth is slipping out of git history",
+            severity="warning",
+        )
+        return
+    add(
+        "local tracker writes",
+        True,
+        f"{len(dirty)} issue file(s) uncommitted at check time — the end-of-pass "
+        "flush commits these once passes run (or the next pass sweeps them); "
+        f"{len(deferred)} recent pass-flush deferral(s) recorded",
+        severity="warning",
+    )
 
 
 def _check_local_lane_kill_switch(

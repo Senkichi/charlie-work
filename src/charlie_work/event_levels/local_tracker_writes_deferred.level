@@ -1,0 +1,11 @@
+warning
+# Issue #2434: the pass-end tracker-write flush could not commit the local
+# backend's accumulated issue-file writes this pass -- HEAD detached, a
+# merge/rebase in progress, a failed commit group, or the writes flushed
+# only partially. Warning, not error: nothing is lost (the next pass's
+# flush sweeps the dirt up; the flush rescan reads the real working tree),
+# and a one-pass deferral heals itself. But repetition means the consumer
+# repo's tracker files have stayed dirty across multiple passes -- the
+# accumulation the flush exists to prevent -- so ``charlie doctor``'s
+# "local tracker writes" check counts these events within a window and
+# warns past its threshold. Emitted at most once per loop pass.
