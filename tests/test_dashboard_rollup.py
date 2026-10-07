@@ -33,7 +33,7 @@ def test_facts_exact_values(fleet) -> None:
     assert result.errors == ()
     by = {s.source: s for s in result.sources}
     # handled-kind events only: unhandled supervisor_started and the 2 noise rows never count
-    assert (by[ALPHA].ingested, by[BETA].ingested, by["fleet"].ingested) == (18, 2, 4)
+    assert (by[ALPHA].ingested, by[BETA].ingested, by["fleet"].ingested) == (19, 2, 4)
     db = fleet.db()
 
     assert _all(
@@ -137,11 +137,41 @@ def test_facts_exact_values(fleet) -> None:
     ]
     assert _all(
         db,
-        "SELECT pr, reason, reason_group, exit_code, turn_count, tool_call_count FROM verdict_missed ORDER BY ts",
+        "SELECT pr, reason, reason_group, detail, cause, exit_code, turn_count, tool_call_count"
+        " FROM verdict_missed ORDER BY ts",
     ) == [
-        (2087, "launch_failed", "launch_failed", 0, 0, 0),
-        (2088, "PR #2088 is MERGED on GitHub", "pr #", None, None, None),
-        (2089, "PR #2089 is MERGED on GitHub", "pr #", None, None, None),
+        (2087, "launch_failed", "launch_failed", None, None, 0, 0, 0),
+        # pre-#2476 rows kept free text in reason: it survives as detail
+        (
+            2088,
+            "PR #2088 is MERGED on GitHub",
+            "pr #",
+            "PR #2088 is MERGED on GitHub",
+            None,
+            None,
+            None,
+            None,
+        ),
+        (
+            2089,
+            "PR #2089 is MERGED on GitHub",
+            "pr #",
+            "PR #2089 is MERGED on GitHub",
+            None,
+            None,
+            None,
+            None,
+        ),
+        (
+            2090,
+            "died_mid_session",
+            "died_mid_session",
+            "reviewer exited before writing a verdict (API error 429)",
+            "api_error:429",
+            1,
+            None,
+            None,
+        ),
     ]
     assert _all(
         db,
@@ -181,7 +211,7 @@ def test_facts_exact_values(fleet) -> None:
         "SELECT kind, first_ts, last_ts, n FROM coverage WHERE source = ? AND kind IN ('*', 'unauthorized_merge_queue_sync_covered', 'dispatch')",
         ALPHA,
     ) == [
-        ("*", "2026-10-01T08:00:00Z", "2026-10-01T10:06:00Z", 23),
+        ("*", "2026-10-01T08:00:00Z", "2026-10-01T10:06:00Z", 24),
         ("dispatch", "2026-10-01T08:00:00Z", "2026-10-01T08:00:00Z", 1),
         (
             "unauthorized_merge_queue_sync_covered",
@@ -216,7 +246,7 @@ def test_second_run_is_idempotent(fleet) -> None:
     result = rollup.run_rollup(fleet.sources(), NOW)
     assert result.errors == ()
     assert result.ingested == 0
-    assert {s.source: s.rederived for s in result.sources} == {ALPHA: 18, BETA: 2, "fleet": 4}
+    assert {s.source: s.rederived for s in result.sources} == {ALPHA: 19, BETA: 2, "fleet": 4}
     assert _facts(fleet.db()) == before  # re-derived window leaves no duplicates
 
 
@@ -243,7 +273,7 @@ def test_rebuild_from_scratch_reproduces_identical_facts(fleet) -> None:
     fleet.release()
     fleet.sources().db_path.unlink()
     result = rollup.run_rollup(fleet.sources(), NOW)
-    assert result.ingested == 24
+    assert result.ingested == 25
     assert _facts(fleet.db()) == before
 
 
@@ -282,7 +312,7 @@ def test_schema_version_mismatch_drops_and_rebuilds(fleet) -> None:
     db.close()
     result = rollup.run_rollup(fleet.sources(), NOW)
     assert result.db_rebuilt is True
-    assert result.ingested == 24
+    assert result.ingested == 25
     assert _facts(fleet.db()) == before  # ghost row gone, facts reproduced
 
 
@@ -294,7 +324,7 @@ def test_missing_source_is_an_error_value_not_a_failure(fleet) -> None:
     result = rollup.run_rollup(fleet.sources(), NOW)
     by = {s.source: s for s in result.sources}
     assert by[BETA].error is not None and by[BETA].error.startswith("missing:")
-    assert (by[ALPHA].ingested, by["fleet"].ingested) == (18, 4)
+    assert (by[ALPHA].ingested, by["fleet"].ingested) == (19, 4)
     assert len(result.errors) == 1
 
 

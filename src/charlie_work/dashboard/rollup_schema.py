@@ -11,7 +11,7 @@ re-deriving an event an idempotent ``INSERT OR REPLACE``.
 
 from __future__ import annotations
 
-SCHEMA_VERSION = 8  # 8: pass_samples.parked_unready (issue #2314); 7: issue_milestones (source, milestone) index; 6: <kind>_sweep expansion, dead-worker PR open; 5: batch rework PR scoping
+SCHEMA_VERSION = 9  # 9: verdict_missed detail/cause (issue #2476); 8: pass_samples.parked_unready (issue #2314); 7: issue_milestones (source, milestone) index; 6: <kind>_sweep expansion, dead-worker PR open; 5: batch rework PR scoping
 FLEET_SOURCE = "fleet"
 
 _KEY = (
@@ -39,8 +39,8 @@ _FACT_TABLES: dict[str, str] = {
     "worker_exits": "issue INT, failure_kind TEXT, worker_health TEXT",
     "escalations": ("issue INT, pr INT, event_kind TEXT NOT NULL, reason TEXT, detail TEXT"),
     "verdict_missed": (
-        "issue INT, pr INT, reason TEXT, reason_group TEXT, exit_code INT, turn_count INT,"
-        " tool_call_count INT"
+        "issue INT, pr INT, reason TEXT, reason_group TEXT, detail TEXT, cause TEXT,"
+        " exit_code INT, turn_count INT, tool_call_count INT"
     ),
     "runner_samples": (
         "target_repo TEXT NOT NULL, capacity INT, demand INT, running INT, target INT,"

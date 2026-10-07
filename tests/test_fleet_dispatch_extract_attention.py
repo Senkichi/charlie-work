@@ -514,7 +514,16 @@ def test_extract_attention_events_review_verdicts() -> None:
             "stalled": [],
             "errors": [],
             "recorded_verdicts": [{"pr": 100, "issue": 10, "decision": "approved"}],
-            "missed_verdicts": [{"pr": 101, "issue": 11, "reason": "no parseable verdict"}],
+            "missed_verdicts": [
+                {
+                    "pr": 101,
+                    "issue": 11,
+                    "reason": "no parseable verdict",
+                    # issue #2476: the refusal's message rides along as detail
+                    "detail": "PR #101 is MERGED on GitHub; verdict not recorded",
+                    "cause": {"cause": "died_mid_session", "api_error_status": 429},
+                }
+            ],
         },
     )
 
@@ -529,6 +538,8 @@ def test_extract_attention_events_review_verdicts() -> None:
     assert len(missed) == 1
     assert missed[0]["pr"] == 101
     assert missed[0]["reason"] == "no parseable verdict"
+    assert missed[0]["detail"] == "PR #101 is MERGED on GitHub; verdict not recorded"
+    assert missed[0]["cause"] == {"cause": "died_mid_session", "api_error_status": 429}
 
 
 def test_extract_attention_events_stalled() -> None:

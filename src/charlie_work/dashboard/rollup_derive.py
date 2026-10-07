@@ -461,12 +461,31 @@ def _session_exited(ev: dict) -> list[Row]:
 def _verdict_missed(ev: dict) -> list[Row]:
     p = ev["payload"]
     issue, pr = _refs(ev)
+    cause = _dict(p.get("cause"))
+    api_status = _int(cause.get("api_error_status"))
+    raw_cause = cause.get("cause")
+    if api_status is not None:
+        cause_label = f"api_error:{api_status}"
+    elif isinstance(raw_cause, str) and raw_cause:
+        cause_label = raw_cause
+    else:
+        cause_label = None
+    reason = p.get("reason") if isinstance(p.get("reason"), str) else None
+    group = reason_group(reason)
+    detail = p.get("detail") if isinstance(p.get("detail"), str) else None
+    if detail is None and reason is not None and reason != group:
+        # Pre-#2476 events kept the free-text message in ``reason``; keep it
+        # reachable as ``detail`` so the token-vs-message split holds for every
+        # row regardless of when it was written.
+        detail = reason
     row = {
         "issue": _int(issue),
         "pr": _int(pr),
-        "reason": p.get("reason") if isinstance(p.get("reason"), str) else None,
-        "reason_group": reason_group(p.get("reason")),
-        "exit_code": _int(_dict(p.get("cause")).get("exit_code")),
+        "reason": reason,
+        "reason_group": group,
+        "detail": detail,
+        "cause": cause_label,
+        "exit_code": _int(cause.get("exit_code")),
         "turn_count": _int(p.get("turn_count")),
         "tool_call_count": _int(p.get("tool_call_count")),
     }

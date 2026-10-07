@@ -1285,6 +1285,12 @@ def _add_review_verdict_events(
         cause = verdict.get("cause")
         if cause is not None:
             event["cause"] = cause
+        # Issue #2476: misses from the record_review refusal path carry the
+        # refusal's free-text message in ``detail`` (``reason`` is the stable
+        # token). Keep it so the digest's human-readable context survives.
+        detail = verdict.get("detail")
+        if detail is not None:
+            event["detail"] = detail
         events.append(event)
 
 

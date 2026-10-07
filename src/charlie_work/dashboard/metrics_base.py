@@ -149,6 +149,8 @@ def coverage(db: sqlite3.Connection, kinds: Sequence[str], sources: str) -> tupl
 def _reduce(values: list[float], how: str) -> float:
     if how == "sum":
         return float(sum(values))
+    if how == "nunique":  # distinct values in the cell (e.g. PRs behind miss attempts)
+        return float(len(set(values)))
     if how == "median":
         return float(statistics.median(values))
     return float(statistics.fmean(values))
@@ -191,7 +193,7 @@ def _points(
         vals = by_bucket.get(i)
         if vals:
             out.append((iso(q.bucket_start(i)), _reduce(vals, how)))
-        elif how == "sum" and i in zero_ok:
+        elif how in ("sum", "nunique") and i in zero_ok:
             out.append((iso(q.bucket_start(i)), 0.0))
     return tuple(out)
 

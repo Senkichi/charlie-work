@@ -1023,9 +1023,15 @@ def record_local_review(
     issue via ``issue_comment`` instead of ``pr_comment``.
     """
     if decision not in ("approved", "request_changes", "blocked"):
-        return CommandResult(False, f"invalid decision: {decision}", {})
+        return CommandResult(
+            False, f"invalid decision: {decision}", {"reason": "invalid_decision"}
+        )
     if verdict_provenance not in _wf.VERDICT_PROVENANCE_VALUES:
-        return CommandResult(False, f"invalid verdict provenance: {verdict_provenance}", {})
+        return CommandResult(
+            False,
+            f"invalid verdict provenance: {verdict_provenance}",
+            {"reason": "invalid_verdict_provenance"},
+        )
     summary_text = summary_file.read_text(encoding="utf-8") if summary_file else summary
     # Same rule as record_review: empty summary rejects, empty
     # required_changes never does -- it derives from the summary (or marks
@@ -1035,7 +1041,7 @@ def record_local_review(
         return CommandResult(
             False,
             f"--summary or --summary-file is required for decision '{decision}'",
-            {},
+            {"reason": "missing_summary"},
         )
     effective_required_changes = (
         [str(item) for item in required_changes] if required_changes else []
@@ -1064,7 +1070,7 @@ def record_local_review(
         return CommandResult(
             False,
             f"prs[{pr_number}] is not a local-lane record",
-            {"pr": pr_number},
+            {"pr": pr_number, "reason": "not_local_record"},
         )
     issue_number = pr_state.get("issue_number")
     issue_number = int(issue_number) if issue_number is not None else pr_number
@@ -1073,14 +1079,19 @@ def record_local_review(
         return CommandResult(
             False,
             f"local record {pr_number} is already {pr_state.get('status')}; verdict not recorded",
-            {"pr": pr_number, "issue": issue_number, "terminal": True},
+            {
+                "pr": pr_number,
+                "issue": issue_number,
+                "reason": "pr_terminal_state",
+                "terminal": True,
+            },
         )
     if pr_state.get("status") == "escalated" or guard_issue_state.get("status") == "escalated":
         return CommandResult(
             False,
             f"local record {pr_number} is escalated; verdict not recorded "
             "(unescalate the issue first)",
-            {"pr": pr_number, "issue": issue_number, "escalated": True},
+            {"pr": pr_number, "issue": issue_number, "reason": "pr_escalated", "escalated": True},
         )
 
     # Head pinning: same packet-vs-live rule as record_review. The "live"
@@ -1125,7 +1136,7 @@ def record_local_review(
                 False,
                 f"reviewed-head {reviewed_head} does not match "
                 f"{' or '.join(options) if options else 'any available head'}",
-                {},
+                {"reason": "reviewed_head_mismatch"},
             )
     elif (
         packet_head_sha is not None
@@ -1137,7 +1148,7 @@ def record_local_review(
             f"review packet head ({packet_head_sha}) differs from live branch "
             f"head ({live_head_sha}); pass reviewed_head to choose the head "
             "the verdict applies to",
-            {},
+            {"reason": "head_moved_during_build"},
         )
     elif packet_head_sha is not None:
         reviewed_head_sha = packet_head_sha
@@ -1146,7 +1157,9 @@ def record_local_review(
         reviewed_head_sha = live_head_sha
         reviewed_head_source = "live"
     else:
-        return CommandResult(False, "no packet or live branch head available", {})
+        return CommandResult(
+            False, "no packet or live branch head available", {"reason": "no_head_available"}
+        )
 
     # The patch-id must describe the head the verdict is pinned to (issue
     # #2151). The packet's diff.patch is that head's diff only when the
