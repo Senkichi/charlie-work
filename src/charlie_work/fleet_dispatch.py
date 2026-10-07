@@ -1285,6 +1285,14 @@ def _add_review_verdict_events(
         cause = verdict.get("cause")
         if cause is not None:
             event["cause"] = cause
+        # Issue #2476: misses from the record_review refusal path carry the
+        # refusal's free-text message in ``detail`` (``reason`` is the stable
+        # token). ``_build_fleet_attention_digest`` renders ``detail`` as the
+        # entry's ``last_log_line`` when present, so the digest keeps its
+        # human-readable context.
+        detail = verdict.get("detail")
+        if detail is not None:
+            event["detail"] = detail
         events.append(event)
 
 
@@ -1549,7 +1557,9 @@ def _build_fleet_attention_digest(
                     adapter_kind=event["repo_key"],
                     health="ERROR",
                     previous_health=None,
-                    last_log_line=event.get("reason"),
+                    # Issue #2476: ``reason`` is now the stable token; the
+                    # human-readable refusal message rides in ``detail``.
+                    last_log_line=event.get("detail") or event.get("reason"),
                     pid=None,
                 )
             )

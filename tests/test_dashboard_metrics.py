@@ -160,11 +160,22 @@ def test_quality_metrics(ro_db) -> None:
     }
     share = quality.salvage_share(ro_db, CURRENT)
     assert share.points == pts((3, 0.25)) and share.per_repo[ALPHA] == pts((3, 0.25))
-    assert by_name(quality.verdicts_missed(ro_db, CURRENT)) == {
-        "verdicts_missed": 3.0,
+    missed = {s.name: s for s in quality.verdicts_missed(ro_db, CURRENT)}
+    assert by_name(missed.values()) == {
+        # 6 attempts over 3 distinct PRs (PR 3 was redispatched and missed 3x, issue #2476)
+        "verdicts_missed": 6.0,
         "verdicts_missed.launch_failed": 1.0,
+        "verdicts_missed.died_mid_session": 3.0,
         "verdicts_missed.pr #": 2.0,
+        # .prs is per-bucket distinct: PR 3 counts again in its second bucket
+        "verdicts_missed.prs": 4.0,
+        "verdicts_missed.cause.api_error:429": 3.0,
+        "verdicts_missed.cause.launch_failed": 1.0,
+        "verdicts_missed.cause.pr #": 2.0,
     }
+    # ...but the window's distinct-PR total is 3: the card shows "3 PRs (6 attempts)"
+    assert missed["verdicts_missed.prs"].n == 3
+    assert missed["verdicts_missed"].n == 6
 
 
 def test_capacity_metrics(ro_db) -> None:

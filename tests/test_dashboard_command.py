@@ -25,10 +25,10 @@ def test_rollup_prints_result_and_writes_only_dashboard_db(fleet, capsys) -> Non
     rc, out = _run(capsys, "--fleet-dir", str(fleet.dir), "dashboard", "rollup")
     assert rc == 0 and out["ok"] is True
     data = out["data"]
-    assert data["ingested"] == 24  # 18 alpha + 2 beta + 4 fleet handled events
+    assert data["ingested"] == 25  # 19 alpha + 2 beta + 4 fleet handled events
     assert data["errors"] == [] and data["error"] is None and data["db_rebuilt"] is False
     assert {s["source"]: s["ingested"] for s in data["sources"]} == {
-        ALPHA: 18,
+        ALPHA: 19,
         BETA: 2,
         "fleet": 4,
     }

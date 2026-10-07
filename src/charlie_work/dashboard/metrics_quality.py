@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+from dataclasses import replace
 
 from .metrics_base import (
     MetricQuery,
@@ -11,6 +12,7 @@ from .metrics_base import (
     SeriesSpec,
     category_series,
     make_ratio_series,
+    make_series,
 )
 
 _WINDOW = "ts >= ? AND ts < ?"
@@ -109,10 +111,20 @@ def salvage_share(db: sqlite3.Connection, q: MetricQuery) -> Series:
 
 
 def verdicts_missed(db: sqlite3.Connection, q: MetricQuery) -> tuple[Series, ...]:
-    """``review_verdict_missed`` per bucket: total, then by grouped reason."""
+    """``review_verdict_missed`` per bucket: attempts total and distinct PRs, then
+    attempts split by grouped reason and by terminating cause.
+
+    Issue #2476: a retry storm reads as hundreds of misses against a handful of
+    PRs. The headline stays attempt counts; the ``.prs`` companion counts
+    distinct (repo, pr) pairs per bucket (``n`` is the window's distinct total)
+    so the card can say "88 PRs (300 attempts)". ``.cause.*`` children group
+    attempts by the derived cause label (``api_error:<status>`` when the
+    reviewer died on an API error, else ``cause.cause``, else the reason group).
+    """
     rows = _rows(
         db,
-        "SELECT ts, source, COALESCE(reason_group, 'unknown') FROM verdict_missed"
+        "SELECT ts, source, COALESCE(reason_group, 'unknown'),"
+        " COALESCE(cause, reason_group, 'unknown'), pr FROM verdict_missed"
         f" WHERE {_WINDOW}",
         q,
     )
@@ -123,4 +135,33 @@ def verdicts_missed(db: sqlite3.Connection, q: MetricQuery) -> tuple[Series, ...
         "count",
         ("review_verdict_missed",),
     )
-    return category_series(db, q, spec, rows)
+    total, *reasons = category_series(
+        db, q, spec, [(ts, repo, group) for ts, repo, group, _c, _p in rows]
+    )
+    # repo_sum keeps the same PR number in two repos distinct: each repo's
+    # bucket is deduped first, then the per-repo counts are summed.
+    pr_samples = [(ts, repo, float(pr)) for ts, repo, _g, _c, pr in rows if pr is not None]
+    prs = make_series(
+        db,
+        q,
+        replace(
+            spec, name=f"{spec.name}.prs", label="PRs with missed verdicts", combine="repo_sum"
+        ),  # fmt: skip
+        pr_samples,
+        pr_samples,
+        how="nunique",
+    )
+    prs = replace(prs, n=len({(repo, pr) for _t, repo, _g, _c, pr in rows if pr is not None}))
+    cause_rows = [(ts, repo, c) for ts, repo, _g, c, _p in rows]
+    causes = [
+        make_series(
+            db,
+            q,
+            replace(spec, name=f"{spec.name}.cause.{cat}", label=f"{spec.label}: {cat}"),
+            part := [(ts, repo, 1.0) for ts, repo, c in cause_rows if c == cat],
+            part,
+            how="sum",
+        )
+        for cat in sorted({c for _t, _r, c in cause_rows})
+    ]
+    return (total, prs, *reasons, *causes)

@@ -60,7 +60,11 @@ def record_review(
             verdict_source=verdict_source,
         )
     if decision not in {"approved", "request_changes", "blocked"}:
-        return CommandResult(False, "decision must be approved, request_changes, or blocked", {})
+        return CommandResult(
+            False,
+            "decision must be approved, request_changes, or blocked",
+            {"reason": "invalid_decision"},
+        )
     # Issue #1265: no default above -- every caller must say where the
     # verdict came from. This membership check catches a garbage/typo'd
     # literal (a missing argument is already caught earlier, at the call
@@ -70,7 +74,7 @@ def record_review(
             False,
             "verdict_provenance must be one of: "
             + ", ".join(sorted(_wf.VERDICT_PROVENANCE_VALUES)),
-            {},
+            {"reason": "invalid_verdict_provenance"},
         )
     summary_text = summary_file.read_text(encoding="utf-8") if summary_file else summary
     # Issue #11: reject empty summary for request_changes/blocked decisions
@@ -79,7 +83,7 @@ def record_review(
         return CommandResult(
             False,
             f"--summary or --summary-file is required for decision '{decision}'",
-            {},
+            {"reason": "missing_summary"},
         )
 
     # Issue #792: required_changes has a near-0% fill rate because
@@ -186,6 +190,7 @@ def record_review(
             {
                 "pr": pr_number,
                 "issue": issue_number,
+                "reason": "pr_terminal_state",
                 "terminal_state": pr_github_state,
             },
         )
@@ -212,7 +217,7 @@ def record_review(
             False,
             f"PR #{pr_number} is escalated; verdict not recorded "
             f"(run `charlie unescalate --pr {pr_number}` to re-arm it first)",
-            {"pr": pr_number, "issue": issue_number, "escalated": True},
+            {"pr": pr_number, "issue": issue_number, "reason": "pr_escalated", "escalated": True},
         )
 
     pr_dir = self.paths.prs / f"pr-{pr_number}"
@@ -288,7 +293,7 @@ def record_review(
             return CommandResult(
                 False,
                 f"--reviewed-head {reviewed_head} does not match {options_str}",
-                {},
+                {"reason": "reviewed_head_mismatch"},
             )
     elif (
         packet_head_sha is not None
@@ -299,7 +304,7 @@ def record_review(
             False,
             f"review packet head ({packet_head_sha}) differs from live PR head ({live_head_sha}); "
             "use --reviewed-head to choose the head the verdict applies to",
-            {},
+            {"reason": "head_moved_during_build"},
         )
     elif packet_head_sha is not None:
         reviewed_head_sha = packet_head_sha
@@ -308,7 +313,9 @@ def record_review(
         reviewed_head_sha = live_head_sha
         reviewed_head_source = "live"
     else:
-        return CommandResult(False, "no packet or live PR head available", {})
+        return CommandResult(
+            False, "no packet or live PR head available", {"reason": "no_head_available"}
+        )
 
     # Calculate patch-id for the PR diff to detect actual content changes
     # (issue #222: base-update merges can advance head SHA without changing diff content).

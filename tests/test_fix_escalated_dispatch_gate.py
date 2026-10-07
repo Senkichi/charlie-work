@@ -240,7 +240,9 @@ def test_reap_review_verdicts_emits_event_when_record_review_refuses_escalated(
     missed = result["missed"][0]
     assert missed["pr"] == 100
     assert missed["issue"] == 10
-    assert "escalated" in missed["reason"]
+    # Issue #2476: reason is the stable token; the message moves to detail.
+    assert missed["reason"] == "pr_escalated"
+    assert "escalated" in missed["detail"]
 
     state = load_state(app.paths.state_file)
     missed_events = _events(state, "review_verdict_missed")
@@ -248,7 +250,8 @@ def test_reap_review_verdicts_emits_event_when_record_review_refuses_escalated(
     payload = missed_events[0]["payload"]
     assert payload["pr_number"] == 100
     assert payload["issue_number"] == 10
-    assert "escalated" in payload["reason"]
+    assert payload["reason"] == "pr_escalated"
+    assert "escalated" in payload["detail"]
 
     # The escalation guard is a hard block: no decision file, no state churn
     # beyond the event -- the claim stays dispatched so the stalled-review
