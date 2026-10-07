@@ -54,6 +54,7 @@ from .local_issue_files import (
     scan_issues,
     write_text_atomic,
 )
+from .local_issue_commits import queue_issue_write
 from .local_lane import (
     branch_head_sha,
     is_ancestor,
@@ -65,6 +66,12 @@ from .safe_path import require_contained
 logger = logging.getLogger(__name__)
 
 _NO_REMOTE = "local-file issue source: this repo has no GitHub remote"
+
+# Per-flush commit verbs (issue #2434): the frontmatter key a write touched
+# maps to the ``<verb>`` in ``chore(issues): <verb> #<n>``. ``close_issue``
+# touches ``state`` and ``resolved``; both map to "close" so the flush's
+# verb-dedupe keeps one word for the intent.
+_TRACKER_VERB_BY_KEY = {"state": "close", "labels": "label", "resolved": "close"}
 
 # How ``local_work_park._post_branch_comment`` records the worker branch on
 # the issue itself: "Work for this issue is committed on branch `<name>`."
@@ -264,6 +271,11 @@ class LocalFileGitHub:
         except (OSError, UnicodeDecodeError, IssueFileError) as exc:
             logger.warning("local issue #%d: could not update '%s': %s", number, key, exc)
             return False
+        # Issue #2434: the write happened; queue it for the pass-end commit so
+        # the consumer repo's tracked tracker files do not stay dirty.
+        queue_issue_write(
+            self.repo_root, self.issues_dir, issue.path, _TRACKER_VERB_BY_KEY.get(key, "update")
+        )
         return True
 
     # -- IssuesLike --------------------------------------------------------
@@ -413,6 +425,9 @@ class LocalFileGitHub:
             raise GitHubError(f"issue_comment #{number}: {exc}") from exc
         except (OSError, UnicodeDecodeError) as exc:
             raise GitHubError(f"local issue #{number}: could not append comment: {exc}") from exc
+        # Issue #2434: queue the appended comment so the pass-end commit
+        # covers it (same enforcement point as the frontmatter writes).
+        queue_issue_write(self.repo_root, self.issues_dir, issue.path, "comment")
 
     def pr_comment(self, number: int, body_file: Path) -> None:
         raise GitHubError(_NO_REMOTE)

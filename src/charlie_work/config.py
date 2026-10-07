@@ -2220,10 +2220,19 @@ class LocalIssuesConfig:
     relative, non-escaping path; the resolved-path containment check (the one
     a junction cannot fool) runs where the path is first used, in
     ``LocalFileGitHub.__post_init__``.
+
+    ``commit_writes`` (issue #2434): the backend's tracker writes are committed
+    at the end of every loop pass (``orchestration.local_tracker_flush``, one
+    batched ``chore(issues): <verb> #<n>`` commit per issue), so the consumer
+    repo's tracked issue files never stay dirty and the tracker's source of
+    truth lives in git history, not only the working tree. ``false`` is the
+    kill switch: writes accumulate uncommitted exactly as before, and the
+    doctor's tracker-writes check turns into a note instead of escalating.
     """
 
     enabled: Annotated[bool, Typed] = False
     issues_dir: Annotated[str, Typed, NonEmpty, RelativePath] = "docs/issues"
+    commit_writes: Annotated[bool, Typed] = True
 
 
 @dataclass(frozen=True)
