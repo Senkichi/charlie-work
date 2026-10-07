@@ -98,6 +98,15 @@ _correlation_local = threading.local()
 _db_locks: dict[str, threading.Lock] = {}
 _db_connections: dict[str, sqlite3.Connection] = {}
 _db_init_lock = threading.Lock()
+# Memoized ``state_path`` -> resolved ``events.db`` key. Every write primitive
+# used to re-resolve the db path with ``Path.resolve()`` on each call (two
+# resolves per ``log_event`` call: once in ``_get_db``, once for the lock key),
+# and ``nt._getfinalpathname`` is expensive on filesystems holding
+# ``tmp_path`` (network/junctioned volumes), so a burst of events paid it
+# 2N times per N events (issue #2566). A path's resolved form cannot change
+# while the same process holds an open sqlite connection for it, so the
+# memo is invalidated exactly where the connection cache is (``close_db``).
+_resolved_db_keys: dict[str, str] = {}
 
 # Tracks unknown event kinds we have already warned about once. A one-time
 # warning preserves the best-effort contract (log_event never raises) while
@@ -314,6 +323,27 @@ def correlation_context(correlation_id: str | None = None) -> Generator[str, Non
 def _db_path(state_path: Path) -> Path:
     """Derive the ``events.db`` SQLite path from a ``state.json`` path."""
     return state_path.parent / "events.db"
+
+
+def _db_key(state_path: Path) -> str:
+    """Return the memoized resolved key for a ``state_path``'s ``events.db``.
+
+    The key identifies the per-path connection and lock entries. Resolution is
+    memoized per input ``state_path`` string: ``Path.resolve()`` bottoms out
+    in ``nt._getfinalpathname``, which is a real syscall cost on network /
+    junctioned filesystems, and every event write used to pay it twice per
+    call. A path string's resolved form only changes if the filesystem it
+    names is re-linked mid-process, which also invalidates the open sqlite
+    handle ``_get_db`` would have returned — so the memo shares
+    ``close_db``'s invalidation point and is never stale for a connection
+    the cache would still hand out.
+    """
+    key_input = str(state_path)
+    cached = _resolved_db_keys.get(key_input)
+    if cached is None:
+        cached = str(_db_path(state_path).resolve())
+        _resolved_db_keys[key_input] = cached
+    return cached
 
 
 def _jsonl_path(state_path: Path) -> Path:
@@ -597,7 +627,7 @@ def _get_db(state_path: Path) -> sqlite3.Connection | None:
     Thread safety is ensured via a per-path lock.
     """
     db_path = _db_path(state_path)
-    key = str(db_path.resolve())
+    key = _db_key(state_path)
 
     with _db_init_lock:
         if key not in _db_locks:
@@ -694,7 +724,7 @@ def log_event(
     if conn is None:
         return
 
-    key = str(_db_path(state_path).resolve())
+    key = _db_key(state_path)
     lock = _db_locks.get(key)
     if lock is None:
         return
@@ -741,7 +771,7 @@ def record_loop_pass(
     conn = _get_db(state_path)
     if conn is None:
         return
-    key = str(_db_path(state_path).resolve())
+    key = _db_key(state_path)
     lock = _db_locks.get(key)
     if lock is None:
         return
@@ -995,11 +1025,13 @@ def close_db(state_path: Path) -> None:
 
     Primarily useful for tests that need to ensure clean teardown.
     """
-    db_path = _db_path(state_path)
-    key = str(db_path.resolve())
+    key = _db_key(state_path)
     with _db_init_lock:
         lock = _db_locks.get(key)
         conn = _db_connections.pop(key, None)
+    # Invalidate the memo for this state_path alongside the connection/lock:
+    # a path re-linked after this point must re-resolve on the next lookup.
+    _resolved_db_keys.pop(str(state_path), None)
     if conn is not None:
         try:
             conn.close()
