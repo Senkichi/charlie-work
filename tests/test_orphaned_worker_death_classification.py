@@ -435,14 +435,16 @@ def test_claude_family_adapter_rate_limited_death_not_credited(
     assert json.loads(sidecar_path.read_text(encoding="utf-8"))["failure_kind"] == "rate_limited"
 
 
-def test_opencode_provider_error_death_not_credited(tmp_path: Path) -> None:
+def test_opencode_provider_error_death_not_credited(tmp_path: Path, monkeypatch) -> None:
     """opencode logs classify through its provider-error digest, not raw text."""
     log = (
         '{"type":"step_start"}\n'
         '{"type":"error","error":{"name":"APIError","data":{"message":"Usage limit reached",'
         '"statusCode":429,"isRetryable":true}}}\n'
     )
-    state, sidecar_path = _run_claude_family_case(tmp_path, "opencode", log)
+    state, sidecar_path = _run_claude_family_case(
+        tmp_path, "opencode", log, monkeypatch=monkeypatch
+    )
     entry = state["issues"]["207"]
     assert entry["dead_worker_failure_kind"] == "quota_exhausted"
     assert not entry.get("worker_death_at")
