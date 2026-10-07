@@ -54,6 +54,7 @@ from .worktree_archive import (
     _archive_unreachable_tip_if_applicable,
     _is_confirmed_missing_ref,
 )
+from .worktree_closed_reclaim import issue_confirmed_closed, reclaim_closed_issue_worktree
 from .worktree_pr_lookup import WorktreeCleanGH, _pr_number_for_head_branch
 from .rescue_capture_exclusions import (  # noqa: F401  (deliberate re-export)
     _build_rescue_capture_exclusions,
@@ -5306,10 +5307,23 @@ def clean_worktrees(
     *,
     dry_run: bool = False,
 ) -> WorktreeCleanResult:
-    """Junction-safe cleanup of worker worktrees for merged or closed-unmerged PRs.
+    """Junction-safe cleanup of worker worktrees for closed issues and for merged or closed-unmerged PRs.
 
-    Enumerates worktrees under ``worktrees_dir`` whose linked issue/PR resolves
-    to a PR number in ``state.json`` -- or, when state.json has no link, via a
+    Enumerates worktrees under ``worktrees_dir`` and, per candidate, first
+    checks the linked GitHub issue's state:
+
+    **Closed-issue path** (issue #2487): a live ``gh issue view`` confirming
+    ``CLOSED`` is terminal -- nothing will ever advance the issue again, so
+    the PR-gated lanes below could only produce permanent skips for it ("no
+    linked PR", dirty tree, stray commits). The worktree is reclaimed
+    directly by ``reclaim_closed_issue_worktree``: same live-session gate,
+    a ``refs/charlie/rescue/`` capture for any uncommitted work, then
+    ``remove_worktree(force=True)`` with the branch KEPT so unpushed
+    commits survive. Issue state -- never worktree cleanliness -- is the
+    discriminator; an open/unconfirmed issue falls through to the PR lanes.
+
+    Otherwise the worktree's linked issue/PR resolves to a PR number in
+    ``state.json`` -- or, when state.json has no link, via a
     ``gh pr list --head <branch> --state all`` fallback that adopts the PR only
     when exactly one matches the branch (issue #1713; see
     ``_pr_number_for_head_branch``) -- then applies one of two eligibility
@@ -5434,6 +5448,35 @@ def clean_worktrees(
             continue
         issue_state = state_issues.get(str(issue_number), {})
         pr_number = _find_linked_pr_number(issue_number, issue_state, state_prs)
+        # Issue #2487: a CLOSED GitHub issue is terminal -- nothing will
+        # ever advance it again, so the PR-gated lanes below can only
+        # produce permanent skips for its worktree ("no linked PR", dirty
+        # tree, HEAD not contained in a merged head). Check issue state
+        # first and reclaim directly: same live-session gate, a rescue
+        # capture for any uncommitted work, forced removal, branch kept.
+        # Issue state -- never worktree cleanliness -- is the
+        # discriminator, so open/unconfirmed issues reach the PR-based
+        # gates untouched.
+        if issue_confirmed_closed(gh, issue_number):
+            lane = reclaim_closed_issue_worktree(
+                repo_root,
+                wt_path,
+                branch,
+                issue_number,
+                issue_state,
+                pr_number,
+                config,
+                dry_run=dry_run,
+            )
+            if lane.bucket == "removed":
+                removed.append(lane.entry)
+            elif lane.bucket == "planned":
+                planned.append(lane.entry)
+            elif lane.bucket == "failed":
+                failed.append(lane.entry)
+            else:
+                skipped.append(lane.entry)
+            continue
         if not pr_number:
             # Issue #1713: a worktree whose state entry was pruned, or that
             # was created outside the normal dispatch path, has no state.json
