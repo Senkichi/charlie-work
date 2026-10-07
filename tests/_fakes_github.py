@@ -191,6 +191,9 @@ class FakeGitHub:
     def pr_list(self):
         return [pr for pr in self.prs if pr.get("state", "OPEN").upper() == "OPEN"]
 
+    def pr_list_with_checks(self):
+        return self.pr_list()
+
     def merged_pr_list(self):
         return [pr for pr in self.prs if pr.get("state", "OPEN").upper() == "MERGED"]
 

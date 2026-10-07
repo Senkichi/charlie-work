@@ -207,7 +207,10 @@ def is_pre_review_rework_candidate(
         return True, "rework_branch_conflict"
     if stale_minutes <= 0:
         return False, ""
-    if pr.get("statusCheckRollup"):
+    # Issue #2443: ``pr_list`` rows carry no rollup key. Absent means the
+    # checks are unknown (not "empty"), which must never read as
+    # ``stale_empty_checks``; only a fetched, empty rollup may.
+    if "statusCheckRollup" not in pr or pr.get("statusCheckRollup"):
         return False, ""
     if is_pr_updated_at_older_than(pr, now, stale_minutes):
         return True, "stale_empty_checks"
