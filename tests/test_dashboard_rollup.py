@@ -279,7 +279,16 @@ def test_rebuild_from_scratch_reproduces_identical_facts(fleet) -> None:
     assert _facts(fleet.db()) == before
 
 
-def test_rederive_window_drops_deduped_rows_but_keeps_old_ones(fleet) -> None:
+@pytest.fixture
+def deduped_fleet(fleet):
+    """Arrange for the rederive-window test, outside the measured call phase.
+
+    A baseline rollup, two source rows deleted (what ``_dedupe_events`` would
+    have removed), and one pass whose window starts after both -- so the test
+    body pays for only the pass under test. Ledger-regress #2528: three rollup
+    passes in the call phase made the test the file's most sensitive to host
+    I/O contention (median 0.15s -> 0.80s under a host-wide ~5x spike).
+    """
     rollup.run_rollup(fleet.sources(), NOW)
     fleet.close()
     conn = sqlite3.connect(fleet.alpha / "events.db")
@@ -290,11 +299,17 @@ def test_rederive_window_drops_deduped_rows_but_keeps_old_ones(fleet) -> None:
     conn.close()
     later = NOW + timedelta(hours=3)  # window now starts 09:00Z; both deleted rows are older
     rollup.run_rollup(fleet.sources(), later)
-    assert _all(fleet.db(), "SELECT COUNT(*) FROM pass_samples WHERE source = ?", ALPHA) == [
-        (1,)
-    ]  # stale, kept
-    rollup.run_rollup(fleet.sources(), NOW)  # window from 06:00Z reaches 08:00Z rows
-    db = fleet.db()
+    return fleet
+
+
+def test_rederive_window_drops_deduped_rows_but_keeps_old_ones(deduped_fleet) -> None:
+    # the fixture's 09:00Z-window pass could not see the deleted 08:0x rows,
+    # so it left their stale facts alone
+    assert _all(
+        deduped_fleet.db(), "SELECT COUNT(*) FROM pass_samples WHERE source = ?", ALPHA
+    ) == [(1,)]  # stale, kept
+    rollup.run_rollup(deduped_fleet.sources(), NOW)  # window from 06:00Z reaches 08:00Z rows
+    db = deduped_fleet.db()
     assert _all(db, "SELECT COUNT(*) FROM pass_samples WHERE source = ?", ALPHA) == [(0,)]
     assert _all(db, "SELECT COUNT(*) FROM escalations WHERE event_kind = 'unescalate'") == [(0,)]
 
