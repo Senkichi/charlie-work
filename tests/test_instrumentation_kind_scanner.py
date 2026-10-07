@@ -113,7 +113,7 @@ def test_scanner_flags_unresolved_nonliteral_kind_forms(source: str) -> None:
     exercises the literal case cannot detect a regression back to that
     behavior; this asserts the *unresolved* branch is reached instead.
 
-    The keyword-passed-kind case guards the scanner's own `_locate_arg`
+    The keyword-passed-kind case guards the scanner's own `_emit_kind_arg`
     fallback: a call site that passes ``kind=`` by keyword must be located
     the same as a positional one, not silently skipped because
     ``len(node.args) < 2``. The reassigned-on-one-branch case guards
@@ -246,3 +246,120 @@ def test_has_explicit_level_fails_closed_on_none_admitting_expressions(
     """
     call, local_assigns, local_params = _call_node_for(source)
     assert _has_explicit_level(call, local_assigns, {}, local_params) is expected
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        pytest.param(
+            "def emit(app):\n    app.write_gate.log_event('lit_kind', {'x': 1})\n",
+            id="app.write_gate-attribute",
+        ),
+        pytest.param(
+            "class C:\n    def emit(self):\n        self.write_gate.log_event('lit_kind', {})\n",
+            id="self.write_gate-attribute",
+        ),
+        pytest.param(
+            "def emit(write_gate):\n    write_gate.log_event('lit_kind', {})\n",
+            id="bare-write_gate-name",
+        ),
+        pytest.param(
+            "def emit(ctx):\n    ctx.write_gate.log_event('lit_kind', {})\n",
+            id="ctx.write_gate-attribute",
+        ),
+        pytest.param(
+            "def emit(gate):\n    gate.log_event(kind='lit_kind', payload={})\n",
+            id="kind-by-keyword-any-receiver",
+        ),
+    ],
+)
+def test_scanner_resolves_write_gate_log_event_kind(source: str) -> None:
+    """#2481: ``WriteGate.log_event(kind, payload)`` binds ``kind`` at slot 0.
+
+    The scanner used to read slot 1 for every emit call -- the
+    ``log_event(state_path, kind, ...)`` shape -- so a positional gate call
+    had its payload dict quoted back as the unresolved "kind" and failed CI
+    on a bug that did not exist (PR #2458). The slot is now derived from the
+    callee's own signature: ``WriteGate.log_event`` auto-binds ``state_path``,
+    so its kind leads the bound argument list. The keyword path (the
+    workaround callers used while the bug stood) must keep resolving too.
+    """
+    tree = ast.parse(source)
+    used, unresolved = _scan_tree(tree, "fixture.py")
+    assert used == {"lit_kind"}
+    assert not unresolved
+
+
+def test_scanner_still_flags_dynamic_write_gate_log_event_kind() -> None:
+    """#2481: the fix must not loosen the unresolved path for dynamic kinds.
+
+    An f-string interpolation is not statically provable, so the site is
+    still surfaced -- and the recorded source is now the actual ``kind``
+    expression, not the neighbouring payload argument the fixed slot used to
+    quote.
+    """
+    source = (
+        "def emit(write_gate, suffix):\n    write_gate.log_event(f'kind_{suffix}', {'x': 1})\n"
+    )
+    tree = ast.parse(source)
+    used, unresolved = _scan_tree(tree, "fixture.py")
+    assert not used
+    assert len(unresolved) == 1
+    assert unresolved[0].source == "f'kind_{suffix}'"
+
+
+@pytest.mark.parametrize(
+    "source,expected",
+    [
+        pytest.param(
+            "def emit():\n    log_event(state_path, 'lit_kind', {})\n",
+            {"lit_kind"},
+            id="instrumentation.log_event-slot-1",
+        ),
+        pytest.param(
+            "def emit(mod):\n    mod.log_event(state_path, 'lit_kind', {})\n",
+            {"lit_kind"},
+            id="module-attribute-log_event-slot-1",
+        ),
+        pytest.param(
+            "def emit(write_gate, state):\n    write_gate.append_event(state, 'lit_kind', {})\n",
+            {"lit_kind"},
+            id="write_gate.append_event-slot-1",
+        ),
+        pytest.param(
+            "def emit(write_gate, state):\n    write_gate.record_event(state, 'lit_kind', {})\n",
+            {"lit_kind"},
+            id="write_gate.record_event-slot-1",
+        ),
+        pytest.param(
+            "class C:\n"
+            "    def emit(self, state):\n"
+            "        self._record_event(state, 'lit_kind', {})\n",
+            {"lit_kind"},
+            id="self._record_event-slot-1",
+        ),
+        pytest.param(
+            "class C:\n"
+            "    def emit(self, pr, issue, decision, summary):\n"
+            "        self._route_to_rework(pr, issue, decision, summary, 'lit_kind')\n",
+            {"lit_kind"},
+            id="self._route_to_rework-event_kind-slot-4",
+        ),
+    ],
+)
+def test_scanner_derives_kind_slot_from_each_callee_signature(
+    source: str, expected: set[str]
+) -> None:
+    """#2481 contrast case: every other emit-callee shape keeps its own slot.
+
+    ``instrumentation.log_event`` (and module re-exports of it, whatever the
+    receiver's local name), ``state.append_event``, the ``_record_event``
+    delegate, the ``WriteGate`` wrappers that still take a state/data
+    argument first, and the ``_route_to_rework`` wrapper whose kind
+    parameter is named ``event_kind`` -- each resolves through the derived
+    index for *its* signature, not a shared fixed slot.
+    """
+    tree = ast.parse(source)
+    used, unresolved = _scan_tree(tree, "fixture.py")
+    assert used == expected
+    assert not unresolved
