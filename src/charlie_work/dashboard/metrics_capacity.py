@@ -6,10 +6,12 @@ import sqlite3
 from dataclasses import replace
 
 from .metrics_base import MetricQuery, Sample, Series, SeriesSpec, gauge_samples, make_series
+from .metrics_coverage import _NON_REPO_SOURCES
 from .metrics_flow import pass_gauge
-from .rollup_schema import FLEET_SOURCE
 
-_WINDOW = "ts >= ? AND ts < ? AND source != ?"
+# Per-repo gauges exclude both non-repo sources (fleet DB and the supervisor's
+# own checkout DB, issue #2475): neither is a registered repository.
+_WINDOW = "ts >= ? AND ts < ? AND source NOT IN (?, ?)"
 
 
 def workers_cap(db: sqlite3.Connection, q: MetricQuery) -> Series:
@@ -26,7 +28,7 @@ def _review_gauge(
     """Mean of a ``review_samples`` column (already fleet-wide, so one line serves both views)."""
     rows = db.execute(
         f"SELECT ts, source, {col} FROM review_samples WHERE {_WINDOW}",
-        (q.start_iso, q.end_iso, FLEET_SOURCE),
+        (q.start_iso, q.end_iso, *_NON_REPO_SOURCES),
     ).fetchall()
     samples = gauge_samples(rows)
     spec = SeriesSpec(

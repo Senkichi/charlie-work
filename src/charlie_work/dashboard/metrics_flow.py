@@ -19,7 +19,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 from .metrics_base import MetricQuery, Sample, Series, SeriesSpec, make_series, parse_ts
-from .rollup_schema import FLEET_SOURCE
+from .metrics_coverage import _NON_REPO_SOURCES
 
 EXACT_KINDS = ("lifecycle_transition", "ready_observed")
 _VERDICTS = ("verdict_approved", "verdict_request_changes", "verdict_blocked")
@@ -257,9 +257,12 @@ def pass_gauge(
 ) -> Series:
     """Mean of a ``pass_samples`` column per bucket; ``fleet_col`` feeds the combined line."""
     cols = f"ts, source, {col}" + (f", {fleet_col}" if fleet_col else "")
+    # Non-repo sources are excluded so a fleet/global or supervisor-checkout row
+    # can never surface as a phantom repo line; for the orchestrator source this
+    # is a second fence -- ingest already restricts it to deploys (issue #2475).
     rows = db.execute(
-        f"SELECT {cols} FROM pass_samples WHERE ts >= ? AND ts < ? AND source != ?",
-        (q.start_iso, q.end_iso, FLEET_SOURCE),
+        f"SELECT {cols} FROM pass_samples WHERE ts >= ? AND ts < ? AND source NOT IN (?, ?)",
+        (q.start_iso, q.end_iso, *_NON_REPO_SOURCES),
     ).fetchall()
     per_repo = [(r[0], r[1], float(r[2])) for r in rows if r[2] is not None]
     combined = [(r[0], r[1], float(r[3])) for r in rows if fleet_col and r[3] is not None]

@@ -33,7 +33,7 @@ from .. import layout
 # Private on purpose: no public events-DB path helper exists (`_db_path` is the one derivation
 # log_event itself uses, and cli/doctor/fleet_status import it too); promote it in a follow-up.
 from ..instrumentation import _db_path
-from ..supervisor_lifecycle import HEARTBEAT_FILENAME
+from ..supervisor_lifecycle import HEARTBEAT_FILENAME, supervisor_heartbeat_path
 
 # Same file name as ``ci_fleet.runner_slots.ALLOCATION_STATE_FILENAME``; spelled
 # here to avoid importing that actuating module (see module docstring).
@@ -155,6 +155,32 @@ def enumerate_repos(fleet_dir_override: str | None = None) -> tuple[RepoSource, 
     use ``load_repos``.
     """
     return load_repos(fleet_dir_override)[0]
+
+
+def orchestrator_events_db(fleet_dir_override: str | None = None) -> Path | None:
+    """The events DB of the checkout the fleet supervisor actually runs from.
+
+    ``self_deploy`` logs to the events.db beside its own checkout's
+    ``state.json`` (``supervise._self_deploy_state_path``). Since the
+    supervisor moved to a dedicated deployment checkout that is no
+    registry repo, neither the fleet source nor ``enumerate_repos``
+    reaches those events (issue #2475). The supervisor stamps
+    ``orchestrator_root`` into ``supervisor-heartbeat.json``; this
+    resolves the DB through the writer's own path helper so the two
+    derivations cannot diverge. ``None`` when the heartbeat is absent,
+    unreadable, or predates the stamp. Callers dedupe the result against
+    sources they already read: a supervisor running from a registered
+    repo's checkout yields that repo's own DB.
+    """
+    heartbeat = read_json_file(supervisor_heartbeat_path(fleet_dir_override))
+    root = (heartbeat.data or {}).get("orchestrator_root")
+    if not isinstance(root, str) or not root:
+        return None
+    # Lazy: ``supervise`` is a heavy module, and this is a read-only path that
+    # only needs the same ``state.json`` derivation the writer uses.
+    from ..supervise import _self_deploy_state_path
+
+    return _db_path(_self_deploy_state_path(Path(root)))
 
 
 def _parse_utc(value: Any) -> datetime | None:

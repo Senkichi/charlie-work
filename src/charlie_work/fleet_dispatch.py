@@ -3187,6 +3187,7 @@ def run_fleet_supervise(
             full_pass_interval_seconds=full_pass_interval,
             max_pass_runtime_seconds=fleet_cfg.max_pass_runtime_seconds,
             wedge_kill_loop_alarm=fleet_cfg.wedge_kill_loop_alarm,
+            orchestrator_root=str(orchestrator_root()),
         )
 
         # Record where ci_fleet was actually imported from plus the sibling
@@ -3251,6 +3252,7 @@ def run_fleet_supervise(
                 fleet_dir_override,
                 pass_number=pass_number,
                 last_beat_at=utc_now(),
+                orchestrator_root=str(orchestrator_root()),
             )
             if cfg.max_runtime_minutes is not None and cfg.max_runtime_minutes > 0:
                 elapsed_minutes = (now - start_time) / 60.0
