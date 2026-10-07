@@ -220,7 +220,7 @@ def _write_claude_sidecar(
     log_path: Path,
 ) -> Path:
     """Write the ``issue-<n>.claude.json`` / ``issue-<n>.api.json`` sidecar."""
-    suffix = {"claude-code": "claude", "api": "api"}[adapter_kind]
+    suffix = {"claude-code": "claude", "api": "api", "opencode": "opencode"}[adapter_kind]
     payload = {
         "issue_number": issue_number,
         "branch": f"agent/issue-{issue_number}",
@@ -428,7 +428,24 @@ def test_claude_family_adapter_rate_limited_death_not_credited(
     assert json.loads(sidecar_path.read_text(encoding="utf-8"))["failure_kind"] == "rate_limited"
 
 
-@pytest.mark.parametrize("adapter_kind", ["claude-code", "api"])
+def test_opencode_provider_error_death_not_credited(tmp_path: Path) -> None:
+    """opencode logs classify through its provider-error digest, not raw text."""
+    log = (
+        '{"type":"step_start"}\n'
+        '{"type":"error","error":{"name":"APIError","data":{"message":"Usage limit reached",'
+        '"statusCode":429,"isRetryable":true}}}\n'
+    )
+    state, sidecar_path = _run_claude_family_case(tmp_path, "opencode", log)
+    entry = state["issues"]["207"]
+    assert entry["dead_worker_failure_kind"] == "quota_exhausted"
+    assert not entry.get("worker_death_at")
+    assert state.get("throttled_until")
+    assert json.loads(sidecar_path.read_text(encoding="utf-8"))["failure_kind"] == (
+        "quota_exhausted"
+    )
+
+
+@pytest.mark.parametrize("adapter_kind", ["claude-code", "api", "opencode"])
 def test_claude_family_adapter_unclassified_death_credited(
     tmp_path: Path, adapter_kind: str
 ) -> None:

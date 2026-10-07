@@ -39,6 +39,10 @@ def _adapter_settings(self, *, adapter: str | None = None) -> AdapterSettings:
         # operator's worker_env cannot accidentally override the provider.
         venv_source = self._resolve(claude.venv_source) if claude.venv_source else None
         worker_env = claude.worker_env
+    elif resolved_adapter == "opencode":
+        opencode = self.config.opencode
+        venv_source = self._resolve(opencode.venv_source) if opencode.venv_source else None
+        worker_env = opencode.worker_env
     else:
         venv_source = None
         worker_env = {}
@@ -60,6 +64,7 @@ def _adapter_settings(self, *, adapter: str | None = None) -> AdapterSettings:
         sessions_dir=self._layout.sessions_dir,
         shell_command=devin.shell_command,
         claude_command=claude.command,
+        opencode_command=self.config.opencode.command,
         worktrees_dir=self._layout.worktrees,
         venv_source=venv_source,
         worker_env=worker_env,

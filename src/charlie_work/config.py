@@ -115,6 +115,7 @@ from .fleet_supervisor_config import (  # noqa: F401  (deliberate re-export)
 
 from . import layout
 from .harnesses import REVIEWER_HARNESSES, WORKER_HARNESSES
+from .opencode_config import OpenCodeConfig
 from .role_chain import (
     RoleEntry,
     chain_of,
@@ -1399,6 +1400,9 @@ class RuntimeConfig:
         "usage quota has been exhausted",
         "quota exceeded",
         "usage limit",
+        # opencode run: OpenCode Go / Zen limit types (error JSON responseBody).
+        "GoUsageLimitError",
+        "FreeUsageLimitError",
     )
     # Bounded retry for transient GitHub API failures (TLS blips, connection
     # resets, gateway 5xx, secondary rate limits, etc.) in GitHub.run().
@@ -2501,6 +2505,7 @@ class OrchestratorConfig:
     devin: DevinConfig = field(default_factory=DevinConfig)
     claude_code: ClaudeCodeConfig = field(default_factory=ClaudeCodeConfig)
     api_worker: ApiWorkerConfig = field(default_factory=ApiWorkerConfig)
+    opencode: OpenCodeConfig = field(default_factory=OpenCodeConfig)
     rescue: RescueConfig = field(default_factory=RescueConfig)
     worker: Annotated[
         WorkerRoleConfig,

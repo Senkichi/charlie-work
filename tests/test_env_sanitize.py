@@ -113,6 +113,19 @@ def test_sanitize_env_respects_ambient_uv_no_sync(
 # ---------------------------------------------------------------------------
 
 
+def test_sanitize_env_drops_inherited_pwd(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An inherited PWD names the orchestrator's directory; opencode trusts it
+    over the real cwd, so a stale value ran a worker's git in the main checkout.
+    The sanitized env must carry neither PWD nor OLDPWD."""
+    monkeypatch.setenv("PWD", str(tmp_path / "orchestrator-checkout"))
+    monkeypatch.setenv("OLDPWD", str(tmp_path / "elsewhere"))
+
+    env = sanitize_env(tmp_path)
+
+    assert "PWD" not in env
+    assert "OLDPWD" not in env
+
+
 def test_resolve_pytest_cap_default(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     worktree_path = tmp_path / "worktree"
     worktree_path.mkdir()

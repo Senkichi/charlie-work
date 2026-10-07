@@ -86,7 +86,17 @@ def test_n6_build_profiles_completeness_check_survives_dash_o(
     monkeypatch.setattr(adapter_fate_profile, "_PROFILES", None)
     monkeypatch.setattr(
         "charlie_work.harnesses.WORKER_HARNESSES",
-        frozenset({"devin-shell", "claude-code", "api", "command", "manual", "bogus-harness"}),
+        frozenset(
+            {
+                "devin-shell",
+                "claude-code",
+                "api",
+                "opencode",
+                "command",
+                "manual",
+                "bogus-harness",
+            }
+        ),
     )
     with pytest.raises(AssertionError, match="WORKER_HARNESSES"):
         adapter_fate_profile._build_profiles()
@@ -492,6 +502,12 @@ def test_stale_evidence_events_emit_a_shared_key_once() -> None:
             "charlie_work.claude_code",
             "update_worker_record_with_failure_classification",
             {"adapter_kind": "api"},
+        ),
+        (
+            "opencode",
+            "charlie_work.claude_code",
+            "update_worker_record_with_failure_classification",
+            {"adapter_kind": "opencode"},
         ),
     ],
 )
