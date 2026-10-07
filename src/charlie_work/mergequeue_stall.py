@@ -117,8 +117,8 @@ def alarm_best_effort(app: Any, pr: dict[str, Any], pr_entry: dict[str, Any]) ->
         return alarm_if_stalled(app, pr, pr_entry)
     except Exception as exc:  # noqa: BLE001 - advisory path: nothing may escape
         logger.warning("mergequeue stall alarm failed for PR #%s: %s", pr.get("number"), exc)
-        # WriteGate.log_event takes (kind, payload) -- no state_path first -- and the
-        # kind scanner reads a keyword ``kind=``; keywords keep both unambiguous.
+        # WriteGate.log_event takes (kind, payload) -- no state_path first; the
+        # kind scanner derives the slot from the callee's signature (#2481).
         app.write_gate.log_event(
             # event-consumer: audit-only -- advisory alarm failure; the exception is also logged
             kind="mergequeue_stall_alarm_failed",
