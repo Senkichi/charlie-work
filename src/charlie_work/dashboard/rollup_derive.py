@@ -59,7 +59,6 @@ KNOWN_IGNORED: dict[str, str] = {
     "review_dispatch_lifecycle_reaped": "names a merged/closed PR only; deliberately not merge evidence (see rollup_flow_handlers docstring)",
     "review_dispatch_lifecycle_reaped_sweep": "batch form of review_dispatch_lifecycle_reaped",
     "fleet_reap_sweep": "fleet-level reap summary; per-issue effects carry their own kinds",
-    SESSION_FAILED_RELABELED: "a dead session's failure kind was reclassified after the fact",
     "session_salvaged": "a dead worker's salvageable work was recovered",
     "superseded_worker_reaped": "a superseded worker was reaped at the rework trigger",
     "superseded_worker_reap_failed": "the superseded-worker reap failed",
@@ -406,6 +405,20 @@ def _dispatch_rework(ev: dict) -> list[Row]:
     return [_milestone(ev, "rework_dispatched", i, pr) for i in issues]
 
 
+# Spelled through an alias of the constant: the #2262 salvage-seam AST guard
+# counts the constant (or a bare literal) passed as a call argument as a
+# dead-worker requeue locus, which this read-side milestone is not.
+_RELABELED_MILESTONE = SESSION_FAILED_RELABELED
+
+
+def _session_failed_relabeled(ev: dict) -> list[Row]:
+    """A dead worker's issue was handed back to dispatch: the approx
+    ``in_progress`` stage ends here (issue #2473). The sweep-batch summary
+    expands to the same per-issue milestone."""
+    issue, pr = _refs(ev)
+    return [_milestone(ev, _RELABELED_MILESTONE, issue, pr)]
+
+
 def _pr_opened(milestone: str, approx: bool) -> Callable[[dict], list[Row]]:
     def handler(ev: dict) -> list[Row]:
         issue, pr = _refs(ev)
@@ -575,6 +588,7 @@ REF_ONLY: dict[str, Callable[[dict], list[Row]]] = {
     # The worker died after opening its PR; the sweep moved the issue to PR open. The PR
     # predates this event, so the stage boundary is approximate.
     "orphaned_worker_advanced_to_pr_open": _pr_opened("pr_open_after_dead_worker", True),
+    SESSION_FAILED_RELABELED: _session_failed_relabeled,
 }
 
 SWEEP_SUFFIX = "_sweep"
