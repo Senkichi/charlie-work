@@ -35,6 +35,18 @@ SCAN_TARGETS = ("workflow.py", "orchestration", "merge_path", "dead_worker_sweep
 # through ``host.current().probe`` / ``app.host.probe``.
 DIRECT_LIVENESS_ALLOWLIST = ("host/liveness.py", "process_utils.py")
 
+# Source modules deleted by issue #2479 (the History-redesign chart cleanup).
+# Their parametrize ids are kept as skipped leaves so the collect-only gate
+# sees no removed leaf -- same mechanism as ``_RETIRED_MODULES`` in
+# test_sink_statuses_no_literal_pair.py.
+_RETIRED_LIVENESS_MODULES = (
+    "dashboard/charts/bullet.py",
+    "dashboard/charts/line.py",
+    "dashboard/charts/model.py",
+    "dashboard/charts/multiples.py",
+    "dashboard/charts/strip.py",
+)
+
 
 def _call_name(node: ast.Call) -> str | None:
     func = node.func
@@ -91,7 +103,8 @@ def _baseline_path(rel: str) -> Path:
 
 
 def _liveness_scan_files() -> list[Path]:
-    return [p for p in source_files(SRC) if _rel(p) not in DIRECT_LIVENESS_ALLOWLIST]
+    live = [p for p in source_files(SRC) if _rel(p) not in DIRECT_LIVENESS_ALLOWLIST]
+    return [*live, *(SRC / rel for rel in _RETIRED_LIVENESS_MODULES)]
 
 
 def test_counter_positive_control() -> None:
@@ -157,6 +170,8 @@ def test_liveness_allowlist_still_calls_primitive(rel: str) -> None:
 def test_no_direct_is_pid_alive(path: Path) -> None:
     """Hard floor at baseline 0 for every non-allowlisted file under
     ``src/charlie_work`` — including modules added after this guard."""
+    if not path.exists():
+        pytest.skip(f"{path.name} was deleted; id kept for the collect-only gate")
     rel = _rel(path)
     count = _count_is_pid_alive_calls(parsed(path))
     assert count == 0, (

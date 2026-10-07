@@ -20,6 +20,7 @@ from charlie_work.dashboard.history_model import (
     change_of,
     delta_text,
     fmt_value,
+    nearest_rank,
     tab_cards,
     wrong_way,
 )
@@ -51,6 +52,11 @@ def test_every_history_metric_has_a_presentation() -> None:
     assert set(PRESENTATION) == ids, sorted(set(PRESENTATION) ^ ids)
     assert all(p.polarity in (UP_GOOD, DOWN_GOOD, NEUTRAL) for p in PRESENTATION.values())
     assert all(p.name and "_" not in p.name for p in PRESENTATION.values())
+
+
+def test_nearest_rank_is_an_observed_sample() -> None:
+    assert nearest_rank((1, 2, 3, 4, 5, 6, 7, 8, 9, 10), 90) == 9
+    assert nearest_rank((5,), 90) == 5
 
 
 def test_change_is_the_takeaways_own_comparison() -> None:

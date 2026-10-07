@@ -18,7 +18,6 @@ import statistics
 from dataclasses import dataclass
 from datetime import timedelta
 
-from .charts.strip import nearest_rank
 from .history_data import HistoryView, MetricData
 from .metrics import NEUTRAL, presentation
 from .metrics_base import MetricQuery, Point, Series, iso, pooled
@@ -196,6 +195,13 @@ def nice_top(peak: float) -> float:
         return 1.0
     step = 10 ** math.floor(math.log10(peak))
     return math.ceil(peak / step - 1e-9) * step
+
+
+def nearest_rank(values: tuple[float, ...], pct: float) -> float:
+    """Nearest-rank percentile: always an observed sample, never interpolated."""
+    ordered = sorted(values)
+    idx = max(0, math.ceil(pct / 100 * len(ordered)) - 1)
+    return ordered[idx]
 
 
 def duration_stats(series: Series) -> tuple[int, float, float] | None:
