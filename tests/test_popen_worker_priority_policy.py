@@ -12,7 +12,7 @@ import ast
 from pathlib import Path
 
 import charlie_work
-from _src_ast import parsed, source_files
+from _src_ast import parsed, source_files, source_text
 
 SRC = Path(charlie_work.__file__).parent
 NORMAL_PRIORITY_MODULES = {"local_suite_runner.py"}
@@ -21,6 +21,8 @@ NORMAL_PRIORITY_MODULES = {"local_suite_runner.py"}
 def _launch_sites() -> list[tuple[str, int, str | None]]:
     sites = []
     for path in source_files(SRC):
+        if "popen_worker" not in source_text(path):
+            continue
         tree = parsed(path)
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
