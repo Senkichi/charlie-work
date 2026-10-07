@@ -186,6 +186,26 @@ def test_a_new_window_rebaselines() -> None:
     assert guard.take_spend().points == 2
 
 
+def test_alternating_windows_each_attribute_their_own_deltas() -> None:
+    """GitHub can answer one resource from two live windows at once (#2488).
+
+    The cursor keys its mark by (resource, reset), so a response naming the
+    older window still deltas against that window's baseline instead of being
+    dropped -- otherwise every older-window sample after the first
+    newer-window sighting attributes nothing and ``points`` undercounts."""
+    guard = _guard(
+        ok({}, headers=_h(10, reset=9000)),  # window A baseline
+        ok({}, headers=_h(50, reset=9500)),  # window B baseline
+        ok({}, headers=_h(12, reset=9000)),  # A: +2
+        ok({}, headers=_h(55, reset=9500)),  # B: +5
+        ok({}, headers=_h(13, reset=9000)),  # A: +1
+        ok({}, headers=_h(57, reset=9500)),  # B: +2
+    )
+    for _ in range(6):
+        guard.send(GET_PR)
+    assert _by_cap(guard.take_spend()) == {("rest.pulls", "core"): (6, 10)}
+
+
 def test_take_spend_resets_so_each_pass_reads_its_own_delta() -> None:
     guard = _guard(ok({}, headers=_h(1)), ok({}, headers=_h(4)), ok({}, headers=_h(9)))
     guard.send(GET_PR)
