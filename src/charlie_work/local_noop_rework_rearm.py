@@ -17,6 +17,14 @@ record status is ``rework_requested``), it restores ``rework_requested`` instead
 The repeat is bounded by the same ``no_op_rework_attempts`` counter and
 ``review.max_no_op_rework_attempts`` cap the remote janitor lane uses; past the
 cap the issue is escalated, never left passive.
+
+A death the dead-worker classification resolved to a provider throttle
+(``rate_limited``, ``quota_exhausted``, ... -- the kinds
+``rework_attempt_exemption.is_provider_throttle_rework_death`` admits) is not a
+no-op attempt: the worker never got to try the rework. It is re-armed without
+advancing the counter, so it can never escalate; the provider-throttle launch
+gate defers the relaunch until the window passes. The mdls #109 wedge of
+2026-10-06 escalated an issue on three throttled deaths and zero real attempts.
 """
 
 from __future__ import annotations
@@ -30,7 +38,12 @@ from .escalation import _escalate_issue, _escalation_edge
 from .github import GitHubLike
 from .labels import TransitionOutcome
 from .local_lane import branch_head_sha, local_pr_records
+from .rework_attempt_exemption import (
+    PROVIDER_THROTTLE_EXEMPTION,
+    is_provider_throttle_rework_death,
+)
 from .state import load_state, state_lock
+from .worker_fate import persisted_failure
 from .write_gate import WriteGate
 
 ATTEMPTS_KEY = "no_op_rework_attempts"
@@ -63,8 +76,15 @@ def rearm_no_op_local_rework(
     branch: str,
     issue_number: int,
     write_gate: WriteGate,
+    failure_kind: str | None = None,
 ) -> tuple[bool, str | None] | None:
     """Re-arm (or escalate) a dead local rework worker that changed nothing.
+
+    ``failure_kind`` is the dead worker's classification as the park edge
+    received it. When the caller has none, the locked entry's epoch-scoped
+    ``dead_worker_failure_kind`` stamp is read instead (the rework dispatch
+    clears it, so it can only describe this death). A provider-throttle kind
+    re-arms without counting.
 
     Returns ``None`` when the park should proceed as usual: the branch head
     moved (the worker committed), no local record carries a pending rework for
@@ -83,9 +103,11 @@ def rearm_no_op_local_rework(
         if match is None:
             return None
         pr_key, record = match
-        attempts = int(record.get(ATTEMPTS_KEY) or 0) + 1
-        escalate = attempts > max_attempts
         issue_entry = {**((state.get("issues") or {}).get(str(issue_number)) or {})}
+        kind = failure_kind or persisted_failure(issue_entry).kind
+        counted = not is_provider_throttle_rework_death(kind)
+        attempts = int(record.get(ATTEMPTS_KEY) or 0) + int(counted)
+        escalate = counted and attempts > max_attempts
         for field in ("orphan_flagged_at", "orphan_drift_fingerprint", "orphan_drift_at"):
             issue_entry.pop(field, None)
         clear_local_park_deferral(issue_entry)
@@ -112,7 +134,7 @@ def rearm_no_op_local_rework(
             edge = "rework_requested"
         state = write_gate.append_event(
             state,
-            "local_no_op_rework_rearmed",  # event-consumer: audit-only -- the actionable state (issue status rework_requested, or the escalation label) is written in this same lock; this records which no-commit exit was re-armed and whether the cap escalated it
+            "local_no_op_rework_rearmed",  # event-consumer: audit-only -- the actionable state (issue status rework_requested, or the escalation label) is written in this same lock; this records which no-commit exit was re-armed, whether it counted toward the cap (a provider-throttle death does not), and whether the cap escalated it
             {
                 "issue_number": issue_number,
                 "branch": branch,
@@ -120,6 +142,9 @@ def rearm_no_op_local_rework(
                 "attempts": attempts,
                 "max_attempts": max_attempts,
                 "escalated": escalate,
+                "counted": counted,
+                "failure_kind": kind,
+                "reason": None if counted else PROVIDER_THROTTLE_EXEMPTION,
             },
         )
         write_gate.save_state(state)

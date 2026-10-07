@@ -18,7 +18,9 @@ from charlie_work.adapters import SessionDispatchResult
 from charlie_work.state import (
     load_state,
     load_state_locked,
+    release_operator_claimed,
     save_state,
+    set_operator_claimed,
     set_throttled_until,
     state_lock,
 )
@@ -123,6 +125,43 @@ class TestLocalReworkLaunchGates:
 
         assert [r.issue_number for r in calls] == [7]
         assert result["dispatched"] == [7]
+
+
+class TestLocalReworkOperatorClaim:
+    """``charlie claim N`` hands a no-remote branch to the operator; the local
+    rework lane must skip it exactly as remote ``dispatch_rework`` does."""
+
+    @staticmethod
+    def _claim(app: OrchestratorApp, *, release: bool = False) -> None:
+        with state_lock(app.paths.state_file):
+            state = set_operator_claimed(load_state(app.paths.state_file), 7)
+            if release:
+                state = release_operator_claimed(state, 7)
+            save_state(app.paths.state_file, state)
+
+    def test_claimed_issue_is_not_launched(self, repo: Path, fake_host) -> None:
+        app = rework_pending_app(repo)
+        calls = spy_dispatch_sessions(fake_host)
+        self._claim(app)
+
+        result = app._local_dispatch_rework()
+
+        assert calls == []
+        assert result["dispatched"] == []
+        assert result["operator_claimed_skipped"] == [7]
+        state = load_state_locked(app.paths.state_file)
+        assert state["issues"]["7"]["status"] == "rework_requested"
+
+    def test_released_claim_launches(self, repo: Path, fake_host) -> None:
+        """Control: the same state with the claim released launches."""
+        app = rework_pending_app(repo)
+        calls = spy_dispatch_sessions(fake_host)
+        self._claim(app, release=True)
+
+        result = app._local_dispatch_rework()
+
+        assert [r.issue_number for r in calls] == [7]
+        assert result["operator_claimed_skipped"] == []
 
 
 class TestLocalReworkFleetThrottle:

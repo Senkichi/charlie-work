@@ -40,7 +40,10 @@ throttle death it:
    observed.
 
 The ``worker_death_at`` non-credit stays at its existing call sites, which
-already gate on the same predicate.
+already gate on the same predicate. So does the no-remote park edge
+(``local_noop_rework_rearm``): the local lane stamps no ``redispatch_at`` and
+reads no PR flag, so it consults :func:`is_provider_throttle_rework_death`
+directly to leave its own ``no_op_rework_attempts`` counter untouched.
 
 The exempt kinds are derived, never listed here. They are the fleet ledger's
 ``RESTRICTING_FAILURE_KINDS`` (the kinds that restrict a model) united with

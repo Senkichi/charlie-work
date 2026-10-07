@@ -1521,8 +1521,16 @@ def _local_dispatch_rework(self) -> dict[str, Any]:
     attachment, the base sync-merge, and the conflict notice are all
     origin-tolerant already.
     """
-    result: dict[str, Any] = {"dispatched": [], "failed": [], "skipped": []}
+    result: dict[str, Any] = {
+        "dispatched": [],
+        "failed": [],
+        "skipped": [],
+        "operator_claimed_skipped": [],
+    }
     state = _wf.load_state_locked(self.paths.state_file)
+    # Issue #400, as the remote lane applies it: ``charlie claim N`` hands the
+    # branch to the operator, so a rework worker must not launch onto it.
+    operator_claimed = _wf.operator_claimed_issues(state)
     candidates: list[int] = []
     for pr_key, record in sorted(local_pr_records(state).items(), key=lambda kv: int(kv[0])):
         issue_number = int(record.get("issue_number") or pr_key)
@@ -1535,6 +1543,9 @@ def _local_dispatch_rework(self) -> dict[str, Any]:
         # status ("dispatched"/"dispatch_pending"), so this filter alone
         # excludes it; a stale claim is recovered by the dead-worker reap.
         if issue_entry.get("status") != "rework_requested":
+            continue
+        if issue_number in operator_claimed:
+            result["operator_claimed_skipped"].append(issue_number)
             continue
         prompt_path = self.paths.prs / f"pr-{pr_key}" / "rework-prompt.md"
         if not prompt_path.exists():
