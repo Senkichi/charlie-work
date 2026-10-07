@@ -49,9 +49,7 @@ def test_none_not_in_deterministic_escalation_failure_kinds() -> None:
     ],
 )
 def test_orphan_salvage_repo_root_guard(
-    repo_root_value: Any,
-    is_valid_path: bool,
-    tmp_path: Path,
+    repo_root_value: Any, is_valid_path: bool, tmp_path: Path, monkeypatch
 ) -> None:
     """The no-open-PR orphan salvage path narrows ``repo_root`` to ``Path | None``.
 
@@ -240,7 +238,7 @@ def test_orphan_salvage_repo_root_guard(
         return (101, None, None)
 
     with (
-        host_probe(alive=False),
+        host_probe(monkeypatch, alive=False),
         patch("charlie_work.workflow._open_pr_for_orphaned_branch", side_effect=fake_open_pr),
     ):
         _detect_and_handle_orphaned_workers(

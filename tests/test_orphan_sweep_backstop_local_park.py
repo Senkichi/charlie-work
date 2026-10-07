@@ -75,7 +75,9 @@ from charlie_work.state import load_state
 # ---------------------------------------------------------------------------
 
 
-def test_backstop_due_labelless_local_orphan_parks(tmp_path: Path, shallow_wts: Path) -> None:
+def test_backstop_due_labelless_local_orphan_parks(
+    tmp_path: Path, shallow_wts: Path, monkeypatch
+) -> None:
     """The issue #1971 shape: the worker committed locally and exited, the
     active label is already gone (the #1923 reclaim lane skips such issues),
     and ``orphan_drift_at`` has long expired. Before the fix the timer
@@ -105,6 +107,7 @@ def test_backstop_due_labelless_local_orphan_parks(tmp_path: Path, shallow_wts: 
         gh,
         _wg(paths.state_file),
         tmp_path / "fleet",
+        monkeypatch=monkeypatch,
     )
 
     current = _label_names(gh, issue_number)
@@ -121,7 +124,9 @@ def test_backstop_due_labelless_local_orphan_parks(tmp_path: Path, shallow_wts: 
     assert _events(paths.state_file, "dead_dispatched_worker_reaped", issue_number) == []
 
 
-def test_backstop_due_probe_failure_defers_escalation(tmp_path: Path, shallow_wts: Path) -> None:
+def test_backstop_due_probe_failure_defers_escalation(
+    tmp_path: Path, shallow_wts: Path, monkeypatch
+) -> None:
     """An inconclusive branch probe must NEVER read as no-work: with the
     worktree gone the park lane falls back to ``branch_diff``; when the diff
     errors while the branch ref still exists the verdict is
@@ -155,7 +160,13 @@ def test_backstop_due_probe_failure_defers_escalation(tmp_path: Path, shallow_wt
         return_value=(None, "git diff main...b: fatal: bad revision"),
     ):
         _run_sweep(
-            sessions_dir, paths.state_file, config, gh, _wg(paths.state_file), tmp_path / "fleet"
+            sessions_dir,
+            paths.state_file,
+            config,
+            gh,
+            _wg(paths.state_file),
+            tmp_path / "fleet",
+            monkeypatch=monkeypatch,
         )
 
     state = load_state(paths.state_file)
@@ -171,7 +182,13 @@ def test_backstop_due_probe_failure_defers_escalation(tmp_path: Path, shallow_wt
 
     # Pass 2: probe healthy again -> the real diff is non-empty -> parked.
     _run_sweep(
-        sessions_dir, paths.state_file, config, gh, _wg(paths.state_file), tmp_path / "fleet"
+        sessions_dir,
+        paths.state_file,
+        config,
+        gh,
+        _wg(paths.state_file),
+        tmp_path / "fleet",
+        monkeypatch=monkeypatch,
     )
     state = load_state(paths.state_file)
     assert state["issues"][str(issue_number)]["status"] == "open_passive"
@@ -180,7 +197,7 @@ def test_backstop_due_probe_failure_defers_escalation(tmp_path: Path, shallow_wt
 
 
 def test_backstop_due_park_label_failure_defers_escalation(
-    tmp_path: Path, shallow_wts: Path
+    tmp_path: Path, shallow_wts: Path, monkeypatch
 ) -> None:
     """A failed ``local_work_ready`` label write must not escalate in the
     same pass: the issue may still carry salvageable commits, so the
@@ -220,7 +237,13 @@ def test_backstop_due_park_label_failure_defers_escalation(
     sessions_dir = _sessions_dir(tmp_path)
 
     _run_sweep(
-        sessions_dir, paths.state_file, config, gh, _wg(paths.state_file), tmp_path / "fleet"
+        sessions_dir,
+        paths.state_file,
+        config,
+        gh,
+        _wg(paths.state_file),
+        tmp_path / "fleet",
+        monkeypatch=monkeypatch,
     )
 
     state = load_state(paths.state_file)
@@ -234,14 +257,22 @@ def test_backstop_due_park_label_failure_defers_escalation(
     # Pass 2: label backend recovered -> the same branch parks.
     gh.fail_labels = False
     _run_sweep(
-        sessions_dir, paths.state_file, config, gh, _wg(paths.state_file), tmp_path / "fleet"
+        sessions_dir,
+        paths.state_file,
+        config,
+        gh,
+        _wg(paths.state_file),
+        tmp_path / "fleet",
+        monkeypatch=monkeypatch,
     )
     state = load_state(paths.state_file)
     assert state["issues"][str(issue_number)]["status"] == "open_passive"
     assert labels_cfg.review_ready in _label_names(gh, issue_number)
 
 
-def test_backstop_due_no_branch_ref_still_escalates(tmp_path: Path, shallow_wts: Path) -> None:
+def test_backstop_due_no_branch_ref_still_escalates(
+    tmp_path: Path, shallow_wts: Path, monkeypatch
+) -> None:
     """Control: a labelless backstop-due orphan whose branch ref provably
     does not exist gets the unchanged #654 escalation -- deferral only
     applies while salvage is unproven."""
@@ -268,6 +299,7 @@ def test_backstop_due_no_branch_ref_still_escalates(tmp_path: Path, shallow_wts:
         gh,
         _wg(paths.state_file),
         tmp_path / "fleet",
+        monkeypatch=monkeypatch,
     )
 
     state = load_state(paths.state_file)
@@ -279,7 +311,9 @@ def test_backstop_due_no_branch_ref_still_escalates(tmp_path: Path, shallow_wts:
     assert _events(paths.state_file, "local_work_ready", issue_number) == []
 
 
-def test_backstop_due_pr_backend_still_escalates(tmp_path: Path, shallow_wts: Path) -> None:
+def test_backstop_due_pr_backend_still_escalates(
+    tmp_path: Path, shallow_wts: Path, monkeypatch
+) -> None:
     """Control: identical git/label state on a PR-capable backend keeps the
     unchanged #654 escalation -- the capability probe, not the branch's
     commits, selects the lane."""
@@ -323,6 +357,7 @@ def test_backstop_due_pr_backend_still_escalates(tmp_path: Path, shallow_wts: Pa
         fake_gh,
         _wg(paths.state_file),
         tmp_path / "fleet",
+        monkeypatch=monkeypatch,
     )
 
     state = load_state(paths.state_file)

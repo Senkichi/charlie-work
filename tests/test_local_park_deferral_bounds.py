@@ -103,7 +103,7 @@ def _worktree_gone_setup(tmp_path: Path, shallow_wts: Path, number: int, labels:
 
 
 def test_reclaim_lane_probe_failed_skips_reclaim_then_parks(
-    tmp_path: Path, shallow_wts: Path
+    tmp_path: Path, shallow_wts: Path, monkeypatch
 ) -> None:
     labels_cfg = LabelConfig()
     number = 1981
@@ -117,7 +117,13 @@ def test_reclaim_lane_probe_failed_skips_reclaim_then_parks(
 
     with _probe_error():
         _run_sweep(
-            sessions_dir, paths.state_file, config, gh, _wg(paths.state_file), tmp_path / "fleet"
+            sessions_dir,
+            paths.state_file,
+            config,
+            gh,
+            _wg(paths.state_file),
+            tmp_path / "fleet",
+            monkeypatch=monkeypatch,
         )
 
     current = _label_names(gh, number)
@@ -134,7 +140,13 @@ def test_reclaim_lane_probe_failed_skips_reclaim_then_parks(
 
     # Healthy next pass: the real diff is non-empty -> parked, counters gone.
     _run_sweep(
-        sessions_dir, paths.state_file, config, gh, _wg(paths.state_file), tmp_path / "fleet"
+        sessions_dir,
+        paths.state_file,
+        config,
+        gh,
+        _wg(paths.state_file),
+        tmp_path / "fleet",
+        monkeypatch=monkeypatch,
     )
     current = _label_names(gh, number)
     assert labels_cfg.review_ready in current
@@ -145,7 +157,7 @@ def test_reclaim_lane_probe_failed_skips_reclaim_then_parks(
 
 
 def test_reclaim_lane_probe_failure_budget_spent_reclaims_with_git_error(
-    tmp_path: Path, shallow_wts: Path
+    tmp_path: Path, shallow_wts: Path, monkeypatch
 ) -> None:
     """The cap: a deterministic probe failure cannot wedge the entry."""
     labels_cfg = LabelConfig()
@@ -165,13 +177,20 @@ def test_reclaim_lane_probe_failure_budget_spent_reclaims_with_git_error(
                 gh,
                 _wg(paths.state_file),
                 tmp_path / "fleet",
+                monkeypatch=monkeypatch,
             )
         assert labels_cfg.in_progress in _label_names(gh, number)
         assert _events(paths.state_file, "session_failed_relabeled", number) == []
 
     with _probe_error():
         _run_sweep(
-            sessions_dir, paths.state_file, config, gh, _wg(paths.state_file), tmp_path / "fleet"
+            sessions_dir,
+            paths.state_file,
+            config,
+            gh,
+            _wg(paths.state_file),
+            tmp_path / "fleet",
+            monkeypatch=monkeypatch,
         )
 
     current = _label_names(gh, number)
@@ -193,7 +212,7 @@ def test_reclaim_lane_probe_failure_budget_spent_reclaims_with_git_error(
 
 
 def test_backstop_deferral_is_bounded_and_escalation_carries_probe_error(
-    tmp_path: Path, shallow_wts: Path
+    tmp_path: Path, shallow_wts: Path, monkeypatch
 ) -> None:
     labels_cfg = LabelConfig()
     number = 1983
@@ -210,6 +229,7 @@ def test_backstop_deferral_is_bounded_and_escalation_carries_probe_error(
                 gh,
                 _wg(paths.state_file),
                 tmp_path / "fleet",
+                monkeypatch=monkeypatch,
             )
         entry = load_state(paths.state_file)["issues"][str(number)]
         assert entry["status"] == "dispatched"
@@ -220,7 +240,13 @@ def test_backstop_deferral_is_bounded_and_escalation_carries_probe_error(
 
     with _probe_error():
         _run_sweep(
-            sessions_dir, paths.state_file, config, gh, _wg(paths.state_file), tmp_path / "fleet"
+            sessions_dir,
+            paths.state_file,
+            config,
+            gh,
+            _wg(paths.state_file),
+            tmp_path / "fleet",
+            monkeypatch=monkeypatch,
         )
 
     entry = load_state(paths.state_file)["issues"][str(number)]
@@ -571,7 +597,7 @@ def test_drain_rechecks_due_against_fresh_state(tmp_path: Path, shallow_wts: Pat
 
 
 def test_probe_failed_then_conclusive_verdict_clears_deferral(
-    tmp_path: Path, shallow_wts: Path
+    tmp_path: Path, shallow_wts: Path, monkeypatch
 ) -> None:
     """A conclusive verdict after a deferred probe clears the stamped budget.
 
@@ -598,6 +624,7 @@ def test_probe_failed_then_conclusive_verdict_clears_deferral(
             gh,
             _wg(paths.state_file),
             tmp_path / "fleet",
+            monkeypatch=monkeypatch,
         )
     entry = load_state(paths.state_file)["issues"][str(number)]
     assert entry["local_park_defer_count"] == 1
@@ -615,6 +642,7 @@ def test_probe_failed_then_conclusive_verdict_clears_deferral(
             gh,
             _wg(paths.state_file),
             tmp_path / "fleet",
+            monkeypatch=monkeypatch,
         )
 
     entry = load_state(paths.state_file)["issues"][str(number)]

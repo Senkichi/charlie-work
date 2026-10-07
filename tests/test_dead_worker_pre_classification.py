@@ -130,8 +130,10 @@ def _seed_dead_primary(
     return paths, sessions_dir, fake_gh
 
 
-def _sweep(paths: Any, sessions_dir: Path, config: OrchestratorConfig, gh: FakeGitHub) -> None:
-    with host_probe(alive=False):
+def _sweep(
+    paths: Any, sessions_dir: Path, config: OrchestratorConfig, gh: FakeGitHub, monkeypatch
+) -> None:
+    with host_probe(monkeypatch, alive=False):
         _detect_and_handle_orphaned_workers(
             sessions_dir, paths.state_file, config, gh, write_gate=_wg(paths.state_file)
         )
@@ -233,12 +235,12 @@ def _assert_repo_b_selects_fallback(root: Path, fake_host) -> None:
 
 
 def test_one_sweep_pass_classifies_the_death_and_feeds_the_waterfall(
-    tmp_path: Path, fake_host
+    tmp_path: Path, fake_host, monkeypatch
 ) -> None:
     config = _config()
     paths, sessions_dir, gh = _seed_dead_primary(tmp_path / "a", config)
 
-    _sweep(paths, sessions_dir, config, gh)
+    _sweep(paths, sessions_dir, config, gh, monkeypatch=monkeypatch)
 
     _assert_primary_restricted()
     _assert_repo_stamped(paths)
@@ -252,12 +254,12 @@ def test_one_sweep_pass_classifies_the_death_and_feeds_the_waterfall(
 
 
 def test_redispatch_and_phantom_in_the_same_pass_keep_the_ledger_entry(
-    tmp_path: Path, fake_host
+    tmp_path: Path, fake_host, monkeypatch
 ) -> None:
     config = _config()
     paths, sessions_dir, gh = _seed_dead_primary(tmp_path / "a", config)
 
-    _sweep(paths, sessions_dir, config, gh)
+    _sweep(paths, sessions_dir, config, gh, monkeypatch=monkeypatch)
     _redispatch_averted(tmp_path / "a", sessions_dir, config)
     _phantom_reap(sessions_dir)
 
@@ -291,7 +293,7 @@ def test_redispatch_guard_never_classifies_a_live_worker(tmp_path: Path) -> None
     assert role_quota_ledger.load_restrictions() == {}
 
 
-def test_completed_worker_is_not_classified_by_the_sweep(tmp_path: Path) -> None:
+def test_completed_worker_is_not_classified_by_the_sweep(tmp_path: Path, monkeypatch) -> None:
     """#656 guard: a terminal record proving this pid exited 0 with an outcome makes
     the log tail completion prose, so the sweep's classification stays off."""
     config = _config()
@@ -308,7 +310,7 @@ def test_completed_worker_is_not_classified_by_the_sweep(tmp_path: Path) -> None
         encoding="utf-8",
     )
 
-    _sweep(paths, sessions_dir, config, gh)
+    _sweep(paths, sessions_dir, config, gh, monkeypatch=monkeypatch)
 
     assert role_quota_ledger.load_restrictions() == {}
     state = load_state(paths.state_file)
@@ -316,11 +318,11 @@ def test_completed_worker_is_not_classified_by_the_sweep(tmp_path: Path) -> None
     assert not state.get("throttled_until")
 
 
-def test_dry_run_sweep_does_not_classify(tmp_path: Path) -> None:
+def test_dry_run_sweep_does_not_classify(tmp_path: Path, monkeypatch) -> None:
     config = _config()
     paths, sessions_dir, gh = _seed_dead_primary(tmp_path / "a", config)
 
-    with host_probe(alive=False):
+    with host_probe(monkeypatch, alive=False):
         _detect_and_handle_orphaned_workers(
             sessions_dir,
             paths.state_file,
@@ -335,7 +337,7 @@ def test_dry_run_sweep_does_not_classify(tmp_path: Path) -> None:
 
 
 def test_fallback_quota_death_does_not_block_the_recovered_primary(
-    tmp_path: Path, fake_host
+    tmp_path: Path, fake_host, monkeypatch
 ) -> None:
     """Issue #2279 acceptance: chain [A, B] on ONE adapter; B dies
     ``rate_limited`` while A's own restriction has already lapsed.
@@ -358,7 +360,7 @@ def test_fallback_quota_death_does_not_block_the_recovered_primary(
         source="test",
     )
 
-    _sweep(paths, sessions_dir, config, gh)
+    _sweep(paths, sessions_dir, config, gh, monkeypatch=monkeypatch)
 
     _assert_repo_stamped(paths, entry=FALLBACK)
     assert set(role_quota_ledger.load_restrictions()) == {PRIMARY.key, FALLBACK.key}
@@ -372,7 +374,7 @@ def test_fallback_quota_death_does_not_block_the_recovered_primary(
 
 
 def test_fallback_quota_death_window_blocks_when_its_ledger_entry_lapses_first(
-    tmp_path: Path, fake_host
+    tmp_path: Path, fake_host, monkeypatch
 ) -> None:
     """Counter-case: once B's own ledger restriction also expires, its window
     is unexplained and blocks again -- a stamped window is not a free pass."""
@@ -380,7 +382,7 @@ def test_fallback_quota_death_window_blocks_when_its_ledger_entry_lapses_first(
     paths, sessions_dir, gh = _seed_dead_primary(
         tmp_path / "a", config, entry=FALLBACK, chain_index=1
     )
-    _sweep(paths, sessions_dir, config, gh)
+    _sweep(paths, sessions_dir, config, gh, monkeypatch=monkeypatch)
     _assert_repo_stamped(paths, entry=FALLBACK)
 
     # B's ledger restriction lapses while the per-repo window still runs.
@@ -400,7 +402,9 @@ def _z_datetime(moment: datetime) -> str:
     return moment.replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
-def test_orphan_sweep_death_event_carries_the_throttle_classification(tmp_path: Path) -> None:
+def test_orphan_sweep_death_event_carries_the_throttle_classification(
+    tmp_path: Path, monkeypatch
+) -> None:
     """Issue #2289: the no-PR orphan sweep's death event names the throttle kind.
 
     ``attempt_resume`` reads the failure kind off this event, so a
@@ -410,7 +414,7 @@ def test_orphan_sweep_death_event_carries_the_throttle_classification(tmp_path: 
     config = _config()
     paths, sessions_dir, gh = _seed_dead_primary(tmp_path / "a", config)
 
-    _sweep(paths, sessions_dir, config, gh)
+    _sweep(paths, sessions_dir, config, gh, monkeypatch=monkeypatch)
 
     [event] = query_events(paths.state_file, kind="session_failed_relabeled")
     assert event["payload"]["reason"] == "dead_worker_no_open_pr_orphan_sweep"
@@ -418,7 +422,7 @@ def test_orphan_sweep_death_event_carries_the_throttle_classification(tmp_path: 
 
 
 def test_orphan_sweep_throttle_death_then_rescue_ref_seeds_the_redispatch(
-    wt_scratch: Path,
+    wt_scratch: Path, monkeypatch
 ) -> None:
     """End to end: the real sweep's event plus a rescue ref makes create_worktree seed."""
     from _time_shift import shifted_datetime
@@ -438,7 +442,7 @@ def test_orphan_sweep_throttle_death_then_rescue_ref_seeds_the_redispatch(
     info = create_worktree(root, branch, base_ref="HEAD", issue_number=ISSUE)
     (info.path / "work.txt").write_text("603 lines of real work\n", encoding="utf-8")
 
-    _sweep(paths, sessions_dir, config, gh)
+    _sweep(paths, sessions_dir, config, gh, monkeypatch=monkeypatch)
     # The rescue ref is made at redispatch, after the death: stamp it 2 s later
     # instead of sleeping across the whole-second boundary.
     with pytest.MonkeyPatch.context() as mp:

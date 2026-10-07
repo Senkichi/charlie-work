@@ -553,7 +553,9 @@ def test_reconcile_apply_fixes_emits_throttle_window_set(tmp_path: Path) -> None
     assert db_events[0]["level"] == "info"
 
 
-def test_orphan_sweep_classification_emits_throttle_window_set(tmp_path: Path) -> None:
+def test_orphan_sweep_classification_emits_throttle_window_set(
+    tmp_path: Path, monkeypatch
+) -> None:
     """Call site 6: the state.json-keyed orphan sweep's classify-at-credit
     seam (``dead_worker_classification``, reached through
     ``orphaned_worker_sweep.handle_dead_worker_with_pr``) arms the cooldown
@@ -571,7 +573,7 @@ def test_orphan_sweep_classification_emits_throttle_window_set(tmp_path: Path) -
         pid=99999,
     )
 
-    _run_orphan_sweep(tmp_path, paths, config, fake_gh)
+    _run_orphan_sweep(tmp_path, paths, config, fake_gh, monkeypatch=monkeypatch)
 
     state = load_state(paths.state_file)
     # The classification still lands: kind stamped, cooldown armed, the
@@ -597,7 +599,7 @@ def test_orphan_sweep_classification_emits_throttle_window_set(tmp_path: Path) -
 
 
 def test_orphan_sweep_classification_dry_run_suppresses_throttle_window_set(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     """The threaded gate's dry-run suppression applies to this lane too:
     under ``dry_run=True`` no ``throttle_window_set`` is emitted and no
@@ -613,7 +615,7 @@ def test_orphan_sweep_classification_dry_run_suppresses_throttle_window_set(
         pid=99999,
     )
 
-    _run_orphan_sweep(tmp_path, paths, config, fake_gh, dry_run=True)
+    _run_orphan_sweep(tmp_path, paths, config, fake_gh, dry_run=True, monkeypatch=monkeypatch)
 
     state = load_state(paths.state_file)
     assert not state.get("throttled_until")

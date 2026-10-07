@@ -171,14 +171,27 @@ def test_unclassified_event_kinds_are_named_on_the_page(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """#2269: kinds the rollup does not interpret show up in the page coverage caveat,
-    named, so a new writer kind can never drop silently again."""
+    named, so a new writer kind can never drop silently again.
 
-    def build(f: Fleet) -> None:
-        build_base(f)
-        f.emit(f.alpha, "2026-10-01T10:30:00Z", "brand_new_unclassified_kind", {})
-
-    path = _rolled(tmp_path, monkeypatch, (build,))
-    view = load_tab(path, "flow", "7d", NOW)
+    #2525: one events.db with one event. ``_rolled``'s registry-plus-``build_base``
+    fleet pays two ``touch_repo`` writes, ~45 WAL inserts and four closeable
+    database files for an assertion that only needs the real
+    ``log_event`` -> ``run_rollup`` -> ``load_tab`` chain to run once -- and the
+    ledger flagged exactly that host-bound cost (0.17 s -> 1.07 s median).
+    The multi-source shape is still covered by the ``db_path`` fixture's tests.
+    """
+    state = tmp_path / "orch" / ".var" / "charlie-work" / "state.json"
+    monkeypatch.setattr(instrumentation, "_now_iso", lambda: "2026-10-01T10:30:00Z")
+    instrumentation.log_event(state, "brand_new_unclassified_kind", {})
+    instrumentation.close_db(state)
+    (tmp_path / "fleet").mkdir()
+    sources = rollup.RollupSources(
+        db_path=tmp_path / "fleet" / "dashboard.db",
+        fleet_events_db=state.parent / "events.db",
+        repos=(),
+    )
+    assert rollup.run_rollup(sources, NOW).errors == ()
+    view = load_tab(sources.db_path, "flow", "7d", NOW)
     assert isinstance(view, HistoryView)
     assert view.unclassified_kinds == ("brand_new_unclassified_kind",)
     page = _view_page(view, "flow")

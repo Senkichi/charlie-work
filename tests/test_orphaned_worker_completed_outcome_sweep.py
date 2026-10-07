@@ -45,7 +45,7 @@ def _iso(value: datetime) -> str:
 
 
 def test_orphaned_worker_fresh_outcome_without_terminal_record_is_not_a_death(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     """Acceptance: dead worker, no terminal record, fresh on-target outcome.
 
@@ -71,7 +71,7 @@ def test_orphaned_worker_fresh_outcome_without_terminal_record_is_not_a_death(
     # (e.g. orchestrator restart mid-session).
 
     with patch.object(rework_outcome, "remote_branch_head_sha", lambda *_a: "abc123"):
-        _run_orphan_sweep(tmp_path, paths, config, fake_gh)
+        _run_orphan_sweep(tmp_path, paths, config, fake_gh, monkeypatch=monkeypatch)
 
     state = load_state(paths.state_file)
     entry = state["issues"]["207"]
@@ -97,7 +97,7 @@ def test_orphaned_worker_fresh_outcome_without_terminal_record_is_not_a_death(
 
 
 def test_orphaned_worker_fresh_outcome_approved_rework_is_not_a_death(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     """Approved + PR-state ``rework_requested`` branch of the same recovery.
 
@@ -124,7 +124,7 @@ def test_orphaned_worker_fresh_outcome_approved_rework_is_not_a_death(
     )
 
     with patch.object(rework_outcome, "remote_branch_head_sha", lambda *_a: "abc123"):
-        _run_orphan_sweep(tmp_path, paths, config, fake_gh)
+        _run_orphan_sweep(tmp_path, paths, config, fake_gh, monkeypatch=monkeypatch)
 
     state = load_state(paths.state_file)
     entry = state["issues"]["207"]
@@ -146,7 +146,7 @@ def test_orphaned_worker_fresh_outcome_approved_rework_is_not_a_death(
 
 
 def test_orphaned_worker_stale_outcome_without_terminal_record_is_a_death(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     """An outcome file from a PREVIOUS dispatch (mtime before dispatched_at)
     must not suppress the death credit -- otherwise a redispatch would read
@@ -167,7 +167,7 @@ def test_orphaned_worker_stale_outcome_without_terminal_record_is_a_death(
         mtime=stale_mtime,
     )
 
-    _run_orphan_sweep(tmp_path, paths, config, fake_gh)
+    _run_orphan_sweep(tmp_path, paths, config, fake_gh, monkeypatch=monkeypatch)
 
     state = load_state(paths.state_file)
     entry = state["issues"]["207"]
@@ -180,7 +180,7 @@ def test_orphaned_worker_stale_outcome_without_terminal_record_is_a_death(
     assert fake_gh.pr_edits == []
 
 
-def test_orphaned_worker_outcome_at_other_head_is_a_death(tmp_path: Path) -> None:
+def test_orphaned_worker_outcome_at_other_head_is_a_death(tmp_path: Path, monkeypatch) -> None:
     """A fresh outcome pinning a head other than the live head describes a
     different remote state -- not proof this dispatch completed."""
     config, paths, fake_gh, _dispatched_at = _dead_worker_rework_bed(tmp_path)
@@ -195,7 +195,7 @@ def test_orphaned_worker_outcome_at_other_head_is_a_death(tmp_path: Path) -> Non
         },
     )
 
-    _run_orphan_sweep(tmp_path, paths, config, fake_gh)
+    _run_orphan_sweep(tmp_path, paths, config, fake_gh, monkeypatch=monkeypatch)
 
     state = load_state(paths.state_file)
     entry = state["issues"]["207"]
@@ -208,7 +208,7 @@ def test_orphaned_worker_outcome_at_other_head_is_a_death(tmp_path: Path) -> Non
 
 
 def test_orphaned_worker_recorded_crash_with_fresh_outcome_is_a_death(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     """B3 (wf-review-opus.md), rule 4 flip: was a "boundary pin" -- a
     terminal record carrying a confirmed non-zero exit used to be treated
@@ -250,7 +250,7 @@ def test_orphaned_worker_recorded_crash_with_fresh_outcome_is_a_death(
         encoding="utf-8",
     )
 
-    _run_orphan_sweep(tmp_path, paths, config, fake_gh)
+    _run_orphan_sweep(tmp_path, paths, config, fake_gh, monkeypatch=monkeypatch)
 
     state = load_state(paths.state_file)
     entry = state["issues"]["207"]
@@ -284,7 +284,7 @@ def test_orphaned_worker_recorded_crash_with_fresh_outcome_is_a_death(
 # ---------------------------------------------------------------------------
 
 
-def test_orphaned_worker_completed_outcome_routes_to_review(tmp_path: Path) -> None:
+def test_orphaned_worker_completed_outcome_routes_to_review(tmp_path: Path, monkeypatch) -> None:
     """A fresh, applied completed outcome must route the still-``dispatched``
     issue through ``review()`` and flip it to ``reviewing`` on a fresh packet
     -- the same ``review_routes`` machinery ``dead_worker_with_head_change``
@@ -313,7 +313,9 @@ def test_orphaned_worker_completed_outcome_routes_to_review(tmp_path: Path) -> N
         return CommandResult(True, "review packet generated", {"pr_number": pr_number})
 
     with patch.object(rework_outcome, "remote_branch_head_sha", lambda *_a: "abc123"):
-        _run_orphan_sweep(tmp_path, paths, config, fake_gh, review_callback=fake_review)
+        _run_orphan_sweep(
+            tmp_path, paths, config, fake_gh, review_callback=fake_review, monkeypatch=monkeypatch
+        )
 
     state = load_state(paths.state_file)
     entry = state["issues"]["207"]
@@ -335,7 +337,9 @@ def test_orphaned_worker_completed_outcome_routes_to_review(tmp_path: Path) -> N
 
     # A second pass must not re-review or re-emit: the issue is no longer
     # dispatched, so the sweep leaves it alone.
-    _run_orphan_sweep(tmp_path, paths, config, fake_gh, review_callback=fake_review)
+    _run_orphan_sweep(
+        tmp_path, paths, config, fake_gh, review_callback=fake_review, monkeypatch=monkeypatch
+    )
     state = load_state(paths.state_file)
     assert state["issues"]["207"]["status"] == "reviewing"
     assert review_calls == [100]
@@ -346,7 +350,7 @@ def test_orphaned_worker_completed_outcome_routes_to_review(tmp_path: Path) -> N
 
 
 def test_orphaned_worker_completed_outcome_blocked_review_returns_to_rework(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     """Issue #1915 fallback: when ``review()`` cannot produce a fresh packet
     for the applied outcome (e.g. the janitor's unchanged-head no-op gate for
@@ -374,7 +378,9 @@ def test_orphaned_worker_completed_outcome_blocked_review_returns_to_rework(
         return CommandResult(False, "janitor gate blocked review", {"pr_number": pr_number})
 
     with patch.object(rework_outcome, "remote_branch_head_sha", lambda *_a: "abc123"):
-        _run_orphan_sweep(tmp_path, paths, config, fake_gh, review_callback=fake_review)
+        _run_orphan_sweep(
+            tmp_path, paths, config, fake_gh, review_callback=fake_review, monkeypatch=monkeypatch
+        )
 
     state = load_state(paths.state_file)
     entry = state["issues"]["207"]
@@ -400,7 +406,7 @@ def test_orphaned_worker_completed_outcome_blocked_review_returns_to_rework(
 
 
 def test_orphaned_worker_completed_outcome_defers_review_until_applied(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     """Issue #1915: routing to review is gated on the outcome actually being
     applied this pass or earlier. A transient apply failure (here the live
@@ -432,7 +438,9 @@ def test_orphaned_worker_completed_outcome_defers_review_until_applied(
     # Pass 1: the remote head no longer matches the reported outcome head, so
     # the apply is skipped (head_mismatch) and no review may run.
     with patch.object(rework_outcome, "remote_branch_head_sha", lambda *_a: "other-head"):
-        _run_orphan_sweep(tmp_path, paths, config, fake_gh, review_callback=fake_review)
+        _run_orphan_sweep(
+            tmp_path, paths, config, fake_gh, review_callback=fake_review, monkeypatch=monkeypatch
+        )
 
     state = load_state(paths.state_file)
     entry = state["issues"]["207"]
@@ -445,7 +453,9 @@ def test_orphaned_worker_completed_outcome_defers_review_until_applied(
     # Pass 2: the remote head agrees again, the outcome applies, and the
     # deferred review route finally runs.
     with patch.object(rework_outcome, "remote_branch_head_sha", lambda *_a: "abc123"):
-        _run_orphan_sweep(tmp_path, paths, config, fake_gh, review_callback=fake_review)
+        _run_orphan_sweep(
+            tmp_path, paths, config, fake_gh, review_callback=fake_review, monkeypatch=monkeypatch
+        )
 
     state = load_state(paths.state_file)
     entry = state["issues"]["207"]
@@ -454,7 +464,9 @@ def test_orphaned_worker_completed_outcome_defers_review_until_applied(
     assert entry.get("status") == "reviewing"
 
 
-def test_with_pr_stale_outcome_emits_worker_evidence_stale_once(tmp_path: Path) -> None:
+def test_with_pr_stale_outcome_emits_worker_evidence_stale_once(
+    tmp_path: Path, monkeypatch
+) -> None:
     """B6 (wf-r2-s6): the dead-worker-with-PR path resolves a fate through
     ``fresh_completed_worker_outcome``; an outcome older than this dispatch is
     ignored by rule 1 and must surface as a ``worker_evidence_stale`` warning
@@ -475,8 +487,8 @@ def test_with_pr_stale_outcome_emits_worker_evidence_stale_once(tmp_path: Path) 
     )
 
     with patch.object(rework_outcome, "remote_branch_head_sha", lambda *_a: "abc123"):
-        _run_orphan_sweep(tmp_path, paths, config, fake_gh)
-        _run_orphan_sweep(tmp_path, paths, config, fake_gh)
+        _run_orphan_sweep(tmp_path, paths, config, fake_gh, monkeypatch=monkeypatch)
+        _run_orphan_sweep(tmp_path, paths, config, fake_gh, monkeypatch=monkeypatch)
 
     stale = query_events(paths.state_file, kind="worker_evidence_stale")
     assert len(stale) == 1
@@ -494,7 +506,7 @@ def test_with_pr_stale_outcome_emits_worker_evidence_stale_once(tmp_path: Path) 
 
 
 def test_with_pr_fresh_outcome_with_mismatching_head_emits_head_mismatch_stale(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     """Review wf-r2-1 #1: a fresh outcome claiming a push whose head is not on
     the remote is rule 1's ``head_mismatch`` stale evidence. The with-PR lane
@@ -511,8 +523,8 @@ def test_with_pr_fresh_outcome_with_mismatching_head_emits_head_mismatch_stale(
     )
 
     # The bed's live PR head is ``abc123``; the outcome claims ``def456``.
-    _run_orphan_sweep(tmp_path, paths, config, fake_gh)
-    _run_orphan_sweep(tmp_path, paths, config, fake_gh)
+    _run_orphan_sweep(tmp_path, paths, config, fake_gh, monkeypatch=monkeypatch)
+    _run_orphan_sweep(tmp_path, paths, config, fake_gh, monkeypatch=monkeypatch)
 
     stale = query_events(paths.state_file, kind="worker_evidence_stale")
     assert len(stale) == 1
