@@ -22,6 +22,7 @@ from types import MappingProxyType
 from typing import Any, Mapping
 
 from .model import (
+    MERGEQUEUE_WEDGED_REVOKE,
     PersistedPr,
     Accounting,
     AccountingFacts,
@@ -57,6 +58,11 @@ from .rules import (
 
 _SYNC_STRATEGIES = frozenset({"front_of_train", "broadcast"})
 _CARRY_FORWARD_FROM_REVOKE = "stale_head_pending_carry_forward"
+# Revocations reconcile made ON PURPOSE: the missing label is not a failed
+# hand-off, so it must not climb the failed-attempt counter or raise the
+# "label failed to apply" alarm. ("not_approved" is absent: it already keeps
+# can_merge False.)
+_SELF_REVOKE_REASONS = frozenset({_CARRY_FORWARD_FROM_REVOKE, MERGEQUEUE_WEDGED_REVOKE})
 SYNC_STRATEGIES = _SYNC_STRATEGIES
 
 
@@ -158,10 +164,10 @@ def decide_admission(
     label = f.config.mergequeue_label
     prior_status = persisted.status if persisted is not None else None
     reverted = bool(label and prior_status == "mergequeue" and label not in f.live_labels)
-    # Only a reconcile-recorded stale-head revocation is a self-revocation; a
-    # "not_approved" revocation already keeps can_merge False (issue #1402).
+    # A reconcile-recorded stale-head or wedged revocation is a self-revocation;
+    # a "not_approved" revocation already keeps can_merge False (issue #1402).
     revoked_reason = persisted.mergequeue_revoked_reason if persisted is not None else None
-    self_revoked = bool(reverted and revoked_reason == _CARRY_FORWARD_FROM_REVOKE)
+    self_revoked = bool(reverted and revoked_reason in _SELF_REVOKE_REASONS)
     base = Admission(
         kind=StageKind.PROCEED,
         approved=f.verdict.approved,
