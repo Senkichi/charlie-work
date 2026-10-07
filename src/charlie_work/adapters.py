@@ -49,7 +49,8 @@ class AdapterSettings:
     ``adapter`` values: "manual" (manifest for the operator), "command"
     (blocking per-issue dispatch_command), "devin-shell" (non-blocking headless
     devin CLI with sidecar tracking), "claude-code" (worktree-isolated Claude
-    Code workers).
+    Code workers), "api" (Claude Code CLI against a provider endpoint),
+    "opencode" (worktree-isolated ``opencode run`` workers).
     """
 
     adapter: str = "manual"
@@ -58,6 +59,9 @@ class AdapterSettings:
     sessions_dir: Path | None = None
     shell_command: tuple[str, ...] = ()
     claude_command: tuple[str, ...] = ()
+    # opencode worker command template (``OpenCodeConfig.command``); empty means
+    # ``opencode_worker.DEFAULT_COMMAND_TEMPLATE``.
+    opencode_command: tuple[str, ...] = ()
     worktrees_dir: Path | None = None
     venv_source: Path | None = None
     # Extra env merged over the orchestrator's env in each worker process
@@ -161,6 +165,19 @@ def _dispatch_api(
     )
 
 
+def _dispatch_opencode(
+    repo_root: Path,
+    requests: list[SessionRequest],
+    sessions_dir: Path,
+    settings: AdapterSettings,
+) -> list[SessionDispatchResult]:
+    return _launch_staggered(
+        requests,
+        lambda request: _run_opencode_adapter(repo_root, request, sessions_dir, settings),
+        settings.launch_stagger_seconds,
+    )
+
+
 # Single dispatch table keyed by ``worker.harness`` name. This -- not a
 # separate if/elif chain -- is what ``dispatch_sessions`` consumes, and the
 # assertion below fails import if it ever drifts from ``harnesses.py``'s
@@ -175,6 +192,7 @@ _ADAPTER_DISPATCHERS: dict[
     "devin-shell": _dispatch_devin_shell,
     "claude-code": _dispatch_claude_code,
     "api": _dispatch_api,
+    "opencode": _dispatch_opencode,
 }
 
 assert set(_ADAPTER_DISPATCHERS) == WORKER_HARNESSES, (
@@ -314,6 +332,12 @@ def _instructions(adapter: str) -> list[str]:
             "sessions directory; the provider env is injected into the child process",
             "only — the API key never appears in sidecars, logs, or argv.",
         ]
+    if adapter == "opencode":
+        return [
+            "opencode workers were launched headless (`opencode run`) in isolated git",
+            "worktrees. Per-worker sidecar JSON (issue-<n>.opencode.json) and logs live",
+            "under the sessions directory.",
+        ]
     if adapter == "mixed":
         return [
             "This manifest combines sessions launched by more than one worker",
@@ -452,6 +476,54 @@ def _run_claude_code_adapter(
             exc=exc,
         )
     return _record_result(request, "claude-code", record)
+
+
+def _run_opencode_adapter(
+    repo_root: Path,
+    request: SessionRequest,
+    sessions_dir: Path,
+    settings: AdapterSettings,
+) -> SessionDispatchResult:
+    """Launch an opencode worker. Mirrors ``_run_claude_code_adapter``."""
+    from .opencode_worker import launch_opencode_worker
+
+    model = settings.config.worker.model if settings.config else ""
+    try:
+        prompt_text = request.prompt_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        # Issue #2246: fails before the launcher -- emit here (exactly once).
+        _emit_launch_failed(
+            repo_root,
+            settings,
+            request,
+            harness="opencode",
+            model=model,
+            error_class=launch_events.LAUNCH_ERR_PROMPT,
+            error=str(exc),
+        )
+        return _result(request, adapter="opencode", ok=False, error=str(exc))
+    try:
+        record = launch_opencode_worker(
+            request.issue_number,
+            request.branch_name,
+            prompt_text,
+            repo_root=repo_root,
+            sessions_dir=sessions_dir,
+            worktrees_dir=settings.worktrees_dir,
+            venv_source=settings.venv_source,
+            command_template=settings.opencode_command or None,
+            worker_env=settings.worker_env,
+            materialize_dirs=settings.materialize_dirs,
+            rework=request.rework,
+            recovery=request.recovery,
+            base_ref=settings.base_ref,
+            config=settings.config,
+        )
+    except Exception as exc:
+        return _launch_exc_result(
+            repo_root, settings, request, adapter="opencode", model=model, exc=exc
+        )
+    return _record_result(request, "opencode", record)
 
 
 def _run_api_adapter(

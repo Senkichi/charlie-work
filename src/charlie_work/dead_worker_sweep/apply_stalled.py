@@ -132,6 +132,7 @@ def _serve(
             now,
             config.runtime.throttle_error_markers,
             config.runtime.throttle_resume_margin_s,
+            log_digest=getattr(worker_fate.profile_for(w.adapter_kind), "log_digest", None),
         )
     if isinstance(request, KillTree):
         # Start-time verification (inside the primitive) prevents PID recycling kills.

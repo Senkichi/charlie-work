@@ -164,6 +164,51 @@ present. See
 [RUNBOOK.md](RUNBOOK.md#worktree-cleanup-gone-wrong-junction-hazard) for the
 full hazard writeup and manual recovery steps.
 
+## (d) opencode worker harness
+
+`worker.harness: opencode` -- or, more usefully, an `opencode` entry in
+`worker.fallbacks` -- launches a headless `opencode run` session through the
+same worktree/sidecar/terminal-watcher stack as a claude-code worker
+(`opencode_worker.launch_opencode_worker`; sidecar `issue-<n>.opencode.json`).
+Worker-only: opencode is not a reviewer harness.
+
+```yaml
+worker:
+  harness: devin-shell
+  model: swe-2-high
+  fallbacks:
+    - {harness: devin-shell, model: gemini-3-8-flash-high}
+    - {harness: opencode, model: glm-5.3-flash}   # OpenCode Go subscription
+
+opencode:            # all optional
+  provider: opencode-go   # prefixed onto a bare model -> opencode-go/glm-5.3-flash
+  variant: ""             # --variant (low | high | max for glm-5.3-flash)
+  worker_env: {}          # merged last; operator values win
+```
+
+What the launcher pins, and why:
+
+- `opencode run --auto --format json --model <provider>/<model>`, prompt on
+  stdin. `--auto` matters: without it `run` auto-*rejects* permission requests
+  (e.g. `external_directory`) instead of prompting. An empty model is refused
+  as a launch error rather than falling back to opencode's last-used model.
+- `OPENCODE_CONFIG_CONTENT` allows every tool (parity with the claude-code
+  worker's `bypassPermissions`) and turns off autoupdate, sharing and
+  snapshots.
+- A per-worker `XDG_DATA_HOME` (`<sessions_dir>/opencode-data/issue-<n>`):
+  concurrent runs sharing one `opencode.db` die at startup with `database is
+  locked`. The host `opencode auth login` credentials are forwarded in memory
+  via `OPENCODE_AUTH_CONTENT` (child env only -- never a sidecar, log or argv).
+- `OPENCODE_DISABLE_CLAUDE_CODE_PROMPT=1`: opencode otherwise injects the
+  operator's personal `~/.claude/CLAUDE.md` into the worker. The repo's own
+  `CLAUDE.md`/`AGENTS.md` and `.claude/skills` still load.
+- `OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS=1800000`: the default 2-minute
+  bash-tool timeout kills a full local test run.
+
+`charlie doctor --adapter-probe` probes the opencode binary whenever opencode is
+the primary *or* any fallback entry, so a missing binary surfaces before a
+failover needs it.
+
 ## Cross-family review flow (removed)
 
 The automatic non-Claude "second opinion" pass this section used to document

@@ -63,7 +63,12 @@ def _write_dead_session_sidecar(
 
 # Adapter-kind -> sidecar filename suffix. Mirrors claude_code._ADAPTER_SIDECAR_SUFFIXES
 # without importing it (keeps the test's failure surface independent of the adapter).
-_ADAPTER_SIDECAR_SUFFIX = {"devin": "", "claude-code": ".claude", "api": ".api"}
+_ADAPTER_SIDECAR_SUFFIX = {
+    "devin": "",
+    "claude-code": ".claude",
+    "api": ".api",
+    "opencode": ".opencode",
+}
 
 
 @pytest.fixture(autouse=True)
@@ -136,7 +141,7 @@ def _write_dead_session_sidecar_for_adapter(
     return sidecar_path
 
 
-@pytest.mark.parametrize("adapter_kind", ["devin", "claude-code", "api"])
+@pytest.mark.parametrize("adapter_kind", ["devin", "claude-code", "api", "opencode"])
 def test_detect_drift_completed_worktree_skips_log_tail_throttle_classification(
     tmp_path: Path, adapter_kind: str
 ) -> None:

@@ -1629,7 +1629,10 @@ def detect_drift(
     # This must happen AFTER the PR loop (to populate open_prs_by_issue) but BEFORE
     # the issue loop (to populate issues_handled_by_session_relabel for mutual exclusion)
     if repo_root is not None:
-        from .claude_code import update_worker_record_with_failure_classification
+        from .claude_code import (
+            CLAUDE_RECORD_KINDS,
+            update_worker_record_with_failure_classification,
+        )
         from .devin_shell import update_session_record_with_failure_classification
         from .post_mortem import classify_and_record
         from .worker import (
@@ -1672,20 +1675,13 @@ def detect_drift(
                                 fallback_kind="launch_stalled",
                                 config=config,
                             )
-                        elif w.adapter_kind == "claude-code":
+                        elif w.adapter_kind in CLAUDE_RECORD_KINDS:
                             update_worker_record_with_failure_classification(
                                 sessions_dir,
                                 w.issue_number,
                                 fallback_kind="launch_stalled",
                                 config=config,
-                            )
-                        elif w.adapter_kind == "api":
-                            update_worker_record_with_failure_classification(
-                                sessions_dir,
-                                w.issue_number,
-                                fallback_kind="launch_stalled",
-                                config=config,
-                                adapter_kind="api",
+                                adapter_kind=w.adapter_kind,
                             )
 
                         # Kill the process tree to free the slot
@@ -1788,24 +1784,14 @@ def detect_drift(
                                     session_completed=True,
                                 )
                             )
-                        elif w.adapter_kind == "claude-code":
+                        elif w.adapter_kind in CLAUDE_RECORD_KINDS:
                             failure_kind, throttled_until = (
                                 update_worker_record_with_failure_classification(
                                     sessions_dir,
                                     w.issue_number,
                                     fallback_kind="unpublished_work",
                                     config=config,
-                                    session_completed=True,
-                                )
-                            )
-                        elif w.adapter_kind == "api":
-                            failure_kind, throttled_until = (
-                                update_worker_record_with_failure_classification(
-                                    sessions_dir,
-                                    w.issue_number,
-                                    fallback_kind="unpublished_work",
-                                    config=config,
-                                    adapter_kind="api",
+                                    adapter_kind=w.adapter_kind,
                                     session_completed=True,
                                 )
                             )
@@ -1828,23 +1814,14 @@ def detect_drift(
                                     config=config,
                                 )
                             )
-                        elif w.adapter_kind == "claude-code":
+                        elif w.adapter_kind in CLAUDE_RECORD_KINDS:
                             failure_kind, throttled_until = (
                                 update_worker_record_with_failure_classification(
                                     sessions_dir,
                                     w.issue_number,
                                     fallback_kind=fallback_kind,
                                     config=config,
-                                )
-                            )
-                        elif w.adapter_kind == "api":
-                            failure_kind, throttled_until = (
-                                update_worker_record_with_failure_classification(
-                                    sessions_dir,
-                                    w.issue_number,
-                                    fallback_kind=fallback_kind,
-                                    config=config,
-                                    adapter_kind="api",
+                                    adapter_kind=w.adapter_kind,
                                 )
                             )
                         else:

@@ -116,6 +116,7 @@ def test_devin_profile_declares_writes_terminal_record() -> None:
     # no worker process, so there is nothing to watch.
     assert worker_fate.profile_for("claude-code").writes_terminal_record is True
     assert worker_fate.profile_for("api").writes_terminal_record is True
+    assert worker_fate.profile_for("opencode").writes_terminal_record is True
     assert worker_fate.profile_for("command").writes_terminal_record is False
     assert worker_fate.profile_for("manual").writes_terminal_record is False
 

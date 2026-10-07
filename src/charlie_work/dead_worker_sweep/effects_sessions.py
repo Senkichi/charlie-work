@@ -371,8 +371,8 @@ def _sweep_orphan_processes_for_dead_sessions(
         if not worker_fate.is_alive(record.pid, record.process_start_time):
             dead_worktree_paths.add(record.worktree_path)
 
-    # Check claude-code sessions
-    for record in read_worker_records(sessions_dir):
+    # Check every ClaudeWorkerRecord kind (claude-code, api, opencode)
+    for record in read_worker_records(sessions_dir, adapter_kind=None):
         if record.pid is None or record.error is not None:
             continue
         if not worker_fate.is_alive(record.pid, record.process_start_time):

@@ -308,7 +308,7 @@ def test_build_config_from_data_invalid_worker_harness_is_rejected() -> None:
     refactor cannot silently drop it."""
     with pytest.raises(
         ConfigError,
-        match=r"^worker\.harness: expected one of 'api', 'claude-code', 'command', 'devin-shell', 'manual', got 'bogus-harness'$",
+        match=r"^worker\.harness: expected one of 'api', 'claude-code', 'command', 'devin-shell', 'manual', 'opencode', got 'bogus-harness'$",
     ):
         build_config_from_data({"worker": {"harness": "bogus-harness"}})
 
@@ -338,15 +338,19 @@ def test_build_config_from_data_worker_harness_matches_registry() -> None:
     """Issue #1513: worker-harness validation is derived from
     ``harnesses.WORKER_HARNESSES`` -- not a second hardcoded list in
     config.py -- so every currently-registered harness is accepted."""
-    from charlie_work.harnesses import WORKER_HARNESSES
+    from charlie_work.harnesses import HARNESS_REGISTRY, WORKER_HARNESSES
 
     for harness in WORKER_HARNESSES:
-        config = build_config_from_data({"worker": {"harness": harness}})
+        # A requires_model harness (opencode) rejects an empty model at load.
+        worker = {"harness": harness}
+        if HARNESS_REGISTRY[harness].requires_model:
+            worker["model"] = "some-model"
+        config = build_config_from_data({"worker": worker})
         assert config.worker.harness == harness
 
     with pytest.raises(
         ConfigError,
-        match=r"^worker\.harness: expected one of 'api', 'claude-code', 'command', 'devin-shell', 'manual', got 'not-a-real-harness'$",
+        match=r"^worker\.harness: expected one of 'api', 'claude-code', 'command', 'devin-shell', 'manual', 'opencode', got 'not-a-real-harness'$",
     ):
         build_config_from_data({"worker": {"harness": "not-a-real-harness"}})
 
