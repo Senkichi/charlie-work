@@ -205,6 +205,17 @@ What the launcher pins, and why:
 - `OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS=1800000`: the default 2-minute
   bash-tool timeout kills a full local test run.
 
+**Usage-limit cooldowns.** OpenCode Go meters a rolling 5-hour, a weekly and a
+monthly budget, and opencode logs only "Usage limit reached" -- never which one
+tripped or when it resets. When an opencode death classifies `quota_exhausted`,
+`opencode_limits.go_quota_reset` (`AdapterFateProfile.quota_reset`) probes the
+Go API once (`GET /models`, then a 1-token chat request with the host
+credential): a `GoUsageLimitError` 429 gives the real reset (`retry-after`, else
+the `limitName` window), so the ledger restricts the entry until exactly then; a
+200 means the limit already reset (15-minute cooldown). No credential, a
+network error or any other answer keeps the fixed 24h. One probe per 2 minutes
+per process.
+
 `charlie doctor --adapter-probe` probes the opencode binary whenever opencode is
 the primary *or* any fallback entry, so a missing binary surfaces before a
 failover needs it.
