@@ -58,7 +58,7 @@ from .labels import TransitionOutcome, apply_issue_labels, transition
 from .local_lane import synthesize_open_pr
 from .local_work_park import publishes_pull_requests
 from .merge_finalize import _merged_issue_fields
-from .merge_path.model import MERGEQUEUE_DWELL_FIELDS
+from .merge_path.model import MERGEQUEUE_DWELL_FIELDS, MERGEQUEUE_WEDGED_REVOKE
 from .paths import resolved_layout, runtime_paths
 from .process_utils import kill_process_tree
 from .queue_bot import is_queue_bot_pr  # noqa: F401 (deliberate re-export)
@@ -3115,6 +3115,13 @@ def apply_fixes(
                     new_prs[pr_key] = {
                         k: v for k, v in existing_pr.items() if k not in MERGEQUEUE_DWELL_FIELDS
                     }
+                    if label_ok:
+                        # The label is gone on purpose (and the issue escalated):
+                        # merge_ready must read it as a self-revocation, not a
+                        # failed hand-off that climbs the alarm counter every pass
+                        # (2026-10-07: a consumer repo raised "mergequeue label failed
+                        # to apply" on 8 PRs reconcile itself had pulled).
+                        new_prs[pr_key]["mergequeue_revoked_reason"] = MERGEQUEUE_WEDGED_REVOKE
             if item.issue_number is not None:
                 # Escalate the issue state through the canonical helper.
                 # ``pr_number=None`` so the helper does not overwrite the PR
