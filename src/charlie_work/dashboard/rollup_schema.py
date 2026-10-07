@@ -16,9 +16,10 @@ SCHEMA_VERSION = 9  # 9: session_failed_relabeled milestone (issue #2473); 8: pa
 FLEET_SOURCE = "fleet"
 #: The supervisor's own checkout's events.db (``orchestrator_root`` stamped in
 #: ``supervisor-heartbeat.json``), where ``self_deploy_*`` events live (issue #2475).
-#: Not a registry repo: the rollup ingests it for the handled ``self_deploy_*``
-#: kinds only (``rollup._kind_filter``), and ``sources="repos"`` metric scopes
-#: exclude it alongside ``fleet``.
+#: Not a registry repo: the rollup admits only ``self_deploy_*`` evidence from it
+#: (``rollup._kind_filter`` for facts, ``rollup._write_coverage``/``_write_pulse``
+#: for coverage and pulse), and ``sources="repos"`` metric scopes exclude it
+#: alongside ``fleet``.
 ORCHESTRATOR_SOURCE = "orchestrator"
 
 _KEY = (

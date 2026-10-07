@@ -333,6 +333,91 @@ def test_orchestrator_repo_history_never_reaches_a_repos_scope(tmp_path, monkeyp
         f.close()
 
 
+def test_orchestrator_history_never_reaches_all_scope_coverage_or_pulse(
+    tmp_path, monkeypatch
+) -> None:
+    """Issue #2475: ingest bounds the deploys-only source's coverage and pulse too.
+
+    A deployment checkout's DB can hold real repo-loop history (dispatches,
+    worker exits, finished loop passes). ``_kind_filter`` already keeps it out
+    of every fact table; ``_write_coverage``/``_write_pulse`` must apply the
+    same bound or a ``sources="all"`` series leaks: the checkout's
+    ``session_exited`` history would pull ``throttles`` coverage_start two days
+    early and grow its active buckets, and its ``dispatch`` pulse would mint
+    real zeros for ``capped_demand`` in buckets where only the stale history
+    was alive. Mutation control: with the unfiltered writers (this file's
+    ``rollup.py`` at the remote branch head) every assertion below fails.
+    """
+    monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", str(tmp_path / "fleet"))
+    f = Fleet(tmp_path, monkeypatch)
+    a = f.alpha
+    # Alpha: a capped pass + a backpressure on day 2, a rate-limited exit on day
+    # 3, an uncapped pass on day 7 (a real zero on the dispatch pulse).
+    dispatch(f, a, day(2, 2), dispatchable=5, limit=1)
+    f.emit(a, day(2, 5), "dispatch_backpressure", {"clamped_by": "host_load"})
+    f.emit(a, day(3, 8), "session_exited", {"failure_kind": "rate_limited"})
+    dispatch(f, a, day(7, 1), dispatchable=0)
+
+    rollup.run_rollup(f.sources(), NOW)
+    db = f.db()
+    base_capped = cap.capped_demand(db, CURRENT)
+    base_throttles = {s.name: s for s in rel.throttles(db, CURRENT)}
+    db.close()
+
+    checkout = tmp_path / "daemon-checkout"
+    state_dir = checkout / ".var" / "charlie-work"
+    # Repo-loop history the checkout legitimately holds: an exit predating
+    # alpha's first throttles kind, dispatches on days alpha never dispatched
+    # (day 1) or dispatched nothing countable (day 3), a finished loop pass.
+    f.emit(state_dir, day(1, 3), "session_exited", {"failure_kind": "stalled"})
+    dispatch(f, state_dir, day(1, 5))
+    dispatch(f, state_dir, day(3, 5))
+    instrumentation.record_loop_pass(
+        state_dir / "state.json", "ck0", day(2, 1), day(2, 2), ok=True, elapsed_seconds=30.0
+    )
+    f.emit(state_dir, day(3, 9), "self_deploy_succeeded", {"ok": True})
+    # bookkeeping keeps the '*' envelope alive past the deploy: day-7 deploys is
+    # a real zero, not a coverage gap
+    f.emit(state_dir, day(7, 10), "self_deploy_sync_starved", {"pending": 2})
+    instrumentation.close_db(state_dir / "state.json")
+    write_supervisor_heartbeat(f.fleet_state, {"orchestrator_root": str(checkout)})
+
+    result = rollup.run_rollup(f.sources(), NOW)
+    by = {s.source: s for s in result.sources}
+    assert by["orchestrator"].error is None and by["orchestrator"].ingested == 1
+    db = f.db()
+    try:
+        # The source's footprint is deploy evidence only: '*' still spans every
+        # checkout event (the liveness envelope self_deploys reads), but the
+        # per-kind rows stop at the deploy domain and the pulse is events-only.
+        assert db.execute(
+            "SELECT kind, n FROM coverage WHERE source = 'orchestrator' ORDER BY kind"
+        ).fetchall() == [("*", 5), ("self_deploy_succeeded", 1), ("self_deploy_sync_starved", 1)]
+        assert db.execute(
+            "SELECT DISTINCT stream FROM pulse WHERE source = 'orchestrator'"
+        ).fetchall() == [("events",)]
+        assert (
+            db.execute("SELECT * FROM loop_passes WHERE source = 'orchestrator'").fetchall() == []
+        )
+
+        capped = cap.capped_demand(db, CURRENT)
+        assert capped.points == ((day(2), 2.0), (day(7), 0.0))
+        assert capped.coverage_start == day(2, 5) and capped == base_capped
+        throttles = {s.name: s for s in rel.throttles(db, CURRENT)}
+        assert throttles["throttles"].points == ((day(3), 1.0), (day(7), 0.0))
+        assert throttles["throttles"].coverage_start == day(3, 8)
+        assert throttles == base_throttles
+        deploys = {s.name: s for s in rel.self_deploys(db, CURRENT)}
+        assert deploys["self_deploys"].points == ((day(3), 1.0), (day(7), 0.0))
+        assert deploys["self_deploys"].per_repo["orchestrator"] == (
+            (day(3), 1.0),
+            (day(7), 0.0),
+        )
+    finally:
+        db.close()
+        f.close()
+
+
 def test_not_instrumented_when_no_source_ever_emitted(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", str(tmp_path / "fleet"))
     f = Fleet(tmp_path, monkeypatch)

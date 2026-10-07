@@ -235,6 +235,14 @@ def _write_coverage(
 
     The caller reuses the grouped counts for ``SourceResult.unclassified`` (issue
     #2269) so the classification never needs a second scan of the events table.
+
+    The orchestrator source is deploys-only (issue #2475): its per-kind rows name
+    only ``self_deploy_*`` kinds -- the same bound ``_kind_filter`` applies to
+    facts -- so repo-loop history in the checkout's DB cannot widen a
+    ``sources="all"`` series' coverage or its active buckets. The ``*`` row still
+    spans every event the checkout wrote: it is the source's liveness envelope,
+    and ``self_deploys`` needs it to read a deploy-quiet bucket while the daemon
+    was alive as a real zero.
     """
     dst.execute("DELETE FROM coverage WHERE source = ?", (source,))
     rows = srcdb.execute(
@@ -248,30 +256,41 @@ def _write_coverage(
         "INSERT INTO coverage (source, kind, first_ts, last_ts, n) VALUES (?, '*', ?, ?, ?)",
         (source, first, last, total_n),
     )
+    admitted = [
+        r for r in rows if source != ORCHESTRATOR_SOURCE or str(r[0]).startswith("self_deploy_")
+    ]
     dst.executemany(
         "INSERT INTO coverage (source, kind, first_ts, last_ts, n) VALUES (?, ?, ?, ?, ?)",
-        [(source, str(k), lo, hi, n) for k, lo, hi, n in rows],
+        [(source, str(k), lo, hi, n) for k, lo, hi, n in admitted],
     )
-    return rows
+    return admitted
 
 
 def _write_pulse(srcdb: sqlite3.Connection, dst: sqlite3.Connection, source: str) -> None:
     """Hours (``YYYY-MM-DDTHH``) in which the source wrote an event / a dispatch / a loop pass.
 
     Lets a metric tell a quiet hour from a blackout: coverage alone only has first/last ts.
+
+    The orchestrator source writes only the ``events`` stream (issue #2475):
+    ``dispatch`` and ``loop_pass`` liveness is repo-loop evidence, and checkout
+    history must not mint real zeros in a ``sources="all"`` series such as
+    ``capped_demand``. ``events`` stays because ``self_deploys`` needs "the
+    checkout was writing" to read a deploy-quiet bucket as a real zero.
     """
     dst.execute("DELETE FROM pulse WHERE source = ?", (source,))
+    deploys_only = source == ORCHESTRATOR_SOURCE
     for hour, is_dispatch in srcdb.execute(
         "SELECT DISTINCT substr(ts, 1, 13), kind = 'dispatch' FROM events"
     ):
         dst.execute("INSERT OR IGNORE INTO pulse VALUES (?, 'events', ?)", (source, hour))
-        if is_dispatch:
+        if is_dispatch and not deploys_only:
             dst.execute("INSERT OR IGNORE INTO pulse VALUES (?, 'dispatch', ?)", (source, hour))
-    dst.execute(
-        "INSERT OR IGNORE INTO pulse SELECT source, 'loop_pass', substr(completed_at, 1, 13)"
-        " FROM loop_passes WHERE source = ? AND completed_at IS NOT NULL",
-        (source,),
-    )
+    if not deploys_only:
+        dst.execute(
+            "INSERT OR IGNORE INTO pulse SELECT source, 'loop_pass', substr(completed_at, 1, 13)"
+            " FROM loop_passes WHERE source = ? AND completed_at IS NOT NULL",
+            (source,),
+        )
 
 
 def _wipe_source(dst: sqlite3.Connection, source: str) -> None:
@@ -289,8 +308,10 @@ def _kind_filter(dst: sqlite3.Connection, source: str) -> tuple[str, tuple[str, 
     the handled ``self_deploy_*`` kinds (issue #2475): it exists to feed ``deploys``,
     and restricting it here -- the single ingest point -- is what keeps checkout
     history that is not deploy evidence (a supervisor deployment checkout may once
-    have run a repo loop) out of every fact table, so it can never surface as a
-    phantom ``orchestrator`` line in a repo-scoped series. A per-repo source takes
+    have run a repo loop) out of every fact table. ``_write_coverage`` and
+    ``_write_pulse`` bound the source to the same domain, so it can never surface
+    as a phantom ``orchestrator`` line in a repo-scoped series or widen a
+    ``sources="all"`` series' coverage or liveness. A per-repo source takes
     the ordinary kinds plus, for each ``GLOBAL_ONLY_KINDS`` kind, only rows older
     than the global DB's first row of that kind (taken from the global source's
     ``coverage``, written earlier in the same pass because the global source is
@@ -442,8 +463,10 @@ def run_rollup(sources: RollupSources, now: datetime) -> RollupResult:
         plan = [(FLEET_SOURCE, sources.fleet_events_db), *sources.repos]
         if sources.orchestrator_events_db is not None:
             # Deploys-only source: ``_kind_filter`` restricts it to the handled
-            # ``self_deploy_*`` kinds, so nothing else in the checkout's DB can
-            # reach a fact table (issue #2475).
+            # ``self_deploy_*`` kinds and ``_write_coverage``/``_write_pulse``
+            # bound its coverage and pulse to the same domain, so nothing else
+            # in the checkout's DB can reach a fact table, a per-kind coverage
+            # row, or a non-``events`` pulse (issue #2475).
             plan.append((ORCHESTRATOR_SOURCE, sources.orchestrator_events_db))
         results = tuple(_ingest_source(dst, s, db, cutoff) for s, db in plan)
         dst.execute("BEGIN IMMEDIATE")
