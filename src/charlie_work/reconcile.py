@@ -3119,7 +3119,7 @@ def apply_fixes(
                         # The label is gone on purpose (and the issue escalated):
                         # merge_ready must read it as a self-revocation, not a
                         # failed hand-off that climbs the alarm counter every pass
-                        # (2026-10-07: ci_runners raised "mergequeue label failed
+                        # (2026-10-07: a consumer repo raised "mergequeue label failed
                         # to apply" on 8 PRs reconcile itself had pulled).
                         new_prs[pr_key]["mergequeue_revoked_reason"] = MERGEQUEUE_WEDGED_REVOKE
             if item.issue_number is not None:
