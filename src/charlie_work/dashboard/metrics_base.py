@@ -95,6 +95,11 @@ class Series:
     # repo -> the raw values behind the buckets (duration kinds only), for the
     # distribution strip and its p90 reference.
     samples: dict[str, tuple[float, ...]] = field(default_factory=dict)
+    # bucket-start ISO ts -> observations the combined line's point rests on (a
+    # ratio's denominator count); lets takeaways keep thin buckets out of a mean.
+    bucket_n: dict[str, int] = field(default_factory=dict)
+    # repo -> the same counts for that repo's points (per_repo in count form).
+    repo_bucket_n: dict[str, dict[str, int]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -178,6 +183,11 @@ def _count(by_bucket: dict[int, list[float]]) -> int:
     return sum(len(v) for v in by_bucket.values())
 
 
+def _bucket_counts(q: MetricQuery, by_bucket: dict[int, list[float]]) -> dict[str, int]:
+    """Bucket-start ts -> observations the bucket's point rests on."""
+    return {iso(q.bucket_start(i)): len(vals) for i, vals in sorted(by_bucket.items())}
+
+
 def _points(
     q: MetricQuery,
     active: frozenset[int],
@@ -213,7 +223,10 @@ def _finish(
     per_repo: dict[str, tuple[Point, ...]],
     n: int,
     flags: dict,
+    *,
     samples: dict[str, tuple[float, ...]] | None = None,
+    bucket_n: dict[str, int] | None = None,
+    repo_bucket_n: dict[str, dict[str, int]] | None = None,
 ) -> Series:
     return Series(
         name=spec.name,
@@ -235,6 +248,8 @@ def _finish(
         n=n,
         repo_coverage=dict(cov.spans),
         samples=samples or {},
+        bucket_n=bucket_n or {},
+        repo_bucket_n=repo_bucket_n or {},
     )
 
 
@@ -276,6 +291,11 @@ def make_series(
         r: _points(q, scope.active_for(r), scope.zero_for(r), b, how)
         for r, b in sorted(by_repo.items())
     }
+    repo_bucket_n = {r: _bucket_counts(q, b) for r, b in sorted(by_repo.items())}
+    if spec.combine == "repo_sum":
+        bucket_n = _bucket_counts(q, _merge_repos(by_repo))
+    else:
+        bucket_n = _bucket_counts(q, merged)
     # duration series keep the per-repo raw values (scope-filtered like the buckets) so a
     # card can draw the distribution behind the per-bucket median.
     samples = (
@@ -286,7 +306,10 @@ def make_series(
     # a median line must say so; a repo_sum line is a sum of repo values, not one statistic
     stat = how if how == "median" and spec.combine != "repo_sum" else ""
     flags = {"approx": approx, "partial": partial, "exact_from": exact_from, "stat": stat}
-    return _finish(db, q, spec, scope.cov, points, repo_points, n, flags, samples)
+    return _finish(
+        db, q, spec, scope.cov, points, repo_points, n, flags,
+        samples=samples, bucket_n=bucket_n, repo_bucket_n=repo_bucket_n,
+    )  # fmt: skip
 
 
 def make_ratio_series(
@@ -313,7 +336,11 @@ def make_ratio_series(
     repo_points = {r: pts(scope.active_for(r), n_all.get(r, {}), d_all[r]) for r in sorted(d_all)}
     d_merged = _merge_repos(d_all)
     points = pts(scope.all_active, _merge_repos(n_all), d_merged)
-    return _finish(db, q, spec, scope.cov, points, repo_points, _count(d_merged), {})
+    repo_bucket_n = {r: _bucket_counts(q, d_all[r]) for r in sorted(d_all)}
+    return _finish(
+        db, q, spec, scope.cov, points, repo_points, _count(d_merged), {},
+        bucket_n=_bucket_counts(q, d_merged), repo_bucket_n=repo_bucket_n,
+    )  # fmt: skip
 
 
 OTHER = "other"

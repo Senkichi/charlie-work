@@ -85,6 +85,67 @@ def test_flat_and_unchanged_and_from_zero() -> None:
     assert takeaway(cur, pri) == "Merges/day unchanged at 0 vs prior 3d"
 
 
+def test_a_thin_outlier_bucket_cannot_swing_a_duration_headline() -> None:
+    """#2474: one n=4 storm bucket (~23h median) beside five normal n=6 buckets
+    (~1h). The mean of bucket medians reads ↑367%; the pooled sample median is flat."""
+    cur = series(
+        "2026-10-04T00:00:00Z", "2026-10-07T00:00:00Z", {"a": [23.0, 1, 1, 1, 1, 1]},
+        kind="duration", label="Lead time", bucket_seconds=DAY // 2, n=34,
+        samples={"a": (20.0, 22.0, 24.0, 26.0) + (1.0,) * 30},
+    )  # fmt: skip
+    pri = series(
+        "2026-10-01T00:00:00Z", "2026-10-04T00:00:00Z", {"a": [1, 1, 1, 1, 1, 1]},
+        kind="duration", label="Lead time", bucket_seconds=DAY // 2, n=30,
+        samples={"a": (1.0,) * 30},
+    )  # fmt: skip
+    assert takeaway(cur, pri) == "Lead time flat vs prior 3d (+0%)"
+
+
+def test_driver_uses_the_same_pooled_statistic() -> None:
+    """#2474: repo b's apparent surge is one n=4 bucket; pooled, only repo a moved."""
+    cur = series(
+        "2026-10-04T00:00:00Z", "2026-10-07T00:00:00Z", {"a": [3, 3, 3], "b": [30, 1, 1]},
+        kind="duration", label="Lead time", n=34,
+        samples={"a": (3.0,) * 20, "b": (1.0,) * 10 + (28.0, 30.0, 31.0, 32.0)},
+    )  # fmt: skip
+    pri = series(
+        "2026-10-01T00:00:00Z", "2026-10-04T00:00:00Z", {"a": [1, 1, 1], "b": [1, 1, 1]},
+        kind="duration", label="Lead time", n=30,
+        samples={"a": (1.0,) * 15, "b": (1.0,) * 15},
+    )  # fmt: skip
+    # b's pooled median is still 1.0; under a mean of bucket medians b (10.67) would
+    # outweigh a (3.0) and steal the driver attribution.
+    assert takeaway(cur, pri) == "Lead time ↑200% vs prior 3d, driven by a"
+
+
+def test_thin_buckets_never_enter_a_mean_of_buckets() -> None:
+    """A bucket under MIN_BUCKET_N is excluded; too few qualifiers -> no trend."""
+    counts = {"2026-10-04T00:00:00Z": 4, "2026-10-05T00:00:00Z": 8, "2026-10-06T00:00:00Z": 8}
+    cur = series(
+        "2026-10-04T00:00:00Z", "2026-10-07T00:00:00Z", {"a": [1.0, 0.5, 0.25]},
+        kind="ratio", label="Rework rate", n=48,
+        bucket_n=dict(counts), repo_bucket_n={"a": dict(counts)},
+    )  # fmt: skip
+    pri = series(
+        "2026-10-01T00:00:00Z", "2026-10-04T00:00:00Z", {"a": [0.25, 0.25, 0.25]},
+        kind="ratio", label="Rework rate", n=24,
+    )  # fmt: skip
+    pri = replace(
+        pri,
+        bucket_n={ts: 8 for ts, _ in pri.points},
+        repo_bucket_n={"a": {ts: 8 for ts, _ in pri.points}},
+    )
+    # bucket 1 (n=4) is out: the mean is (0.5*8 + 0.25*8)/16 = 0.375, not 0.58
+    assert takeaway(cur, pri) == "Rework rate ↑50% vs prior 3d"
+    thin = replace(
+        cur,
+        bucket_n={ts: 4 for ts, _ in cur.points},
+        repo_bucket_n={"a": {ts: 4 for ts, _ in cur.points}},
+    )
+    assert takeaway(thin, pri) == "Rework rate: not enough data vs prior 3d"
+    assert takeaway(thin, pri, min_bucket_n=4) == "Rework rate ↑133% vs prior 3d"
+
+
 def test_not_enough_data_below_minimum_sample() -> None:
     cur, pri = pair({"a": [1, 1, 1]}, {"a": [3, 3, 3]})  # n = 3 and 9
     assert takeaway(cur, pri) == "Merges/day: not enough data vs prior 3d"
