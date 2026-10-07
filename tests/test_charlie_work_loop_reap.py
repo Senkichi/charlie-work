@@ -488,7 +488,9 @@ def test_loop_pid_none_no_error_not_classified_as_launch_failed(
     assert matching[0]["failure_kind"] != "launch_failed"
 
 
-def test_loop_reaps_stalled_session_with_no_candidates(tmp_path: Path) -> None:
+def test_loop_reaps_stalled_session_with_no_candidates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Test that loop() reaps stalled sessions even with zero ready/rework candidates (issue #165)."""
     from datetime import UTC, datetime, timedelta
     from charlie_work.devin_shell import SessionRecord
@@ -532,6 +534,24 @@ def test_loop_reaps_stalled_session_with_no_candidates(tmp_path: Path) -> None:
     )
     session_file.write_text(json.dumps(session_record.to_dict()), encoding="utf-8")
 
+    # Issue #2446: the stalled lane's KillOrphans request runs a real
+    # PowerShell ``Get-CimInstance Win32_Process`` enumeration on Windows --
+    # ~all of this test's runtime on the CI host. The fixture's worktree path
+    # names a nonexistent directory no real process CommandLine can reference,
+    # so the real sweep would return [] too, after paying the spawn. Stub it
+    # through the same ``effects_sessions`` seam the other stalled-lane test
+    # modules patch (issue #2413 precedent). Recording the call also pins
+    # that the stalled lane still reaches the sweep through this seam.
+    from charlie_work.dead_worker_sweep import effects_sessions
+
+    orphan_sweep_calls: list[str] = []
+
+    def _record_orphan_sweep(worktree_path: str) -> list:
+        orphan_sweep_calls.append(worktree_path)
+        return []
+
+    monkeypatch.setattr(effects_sessions, "sweep_orphan_processes", _record_orphan_sweep)
+
     # Ensure zero ready issues and zero rework candidates
     fake_gh.issues = []
     fake_gh.prs = []
@@ -545,6 +565,7 @@ def test_loop_reaps_stalled_session_with_no_candidates(tmp_path: Path) -> None:
     # Verify the session file was marked with failure_kind: stalled
     updated_session = json.loads(session_file.read_text(encoding="utf-8"))
     assert updated_session.get("failure_kind") == "stalled"
+    assert orphan_sweep_calls == [session_record.worktree_path]
 
 
 def test_loop_advances_inconclusive_probe_deferral_counter_once_per_pass(
