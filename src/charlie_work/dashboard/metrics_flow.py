@@ -232,9 +232,9 @@ def pass_gauge(
 ) -> Series:
     """Mean of a ``pass_samples`` column per bucket; ``fleet_col`` feeds the combined line."""
     cols = f"ts, source, {col}" + (f", {fleet_col}" if fleet_col else "")
-    # Non-repo sources only carry per-repo column values for the registered
-    # repo DBs; fleet/orchestrator rows are excluded so a supervisor checkout's
-    # own history can never surface as a phantom repo line (issue #2475).
+    # Non-repo sources are excluded so a fleet/global or supervisor-checkout row
+    # can never surface as a phantom repo line; for the orchestrator source this
+    # is a second fence -- ingest already restricts it to deploys (issue #2475).
     rows = db.execute(
         f"SELECT {cols} FROM pass_samples WHERE ts >= ? AND ts < ? AND source NOT IN (?, ?)",
         (q.start_iso, q.end_iso, *_NON_REPO_SOURCES),

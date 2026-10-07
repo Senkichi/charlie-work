@@ -285,14 +285,23 @@ _NO_GLOBAL_ROWS = "9999-12-31T23:59:59Z"
 def _kind_filter(dst: sqlite3.Connection, source: str) -> tuple[str, tuple[str, ...]]:
     """SQL predicate over ``kind`` (plus its args) for what ``source`` may contribute.
 
-    The global source takes every handled kind. A per-repo source takes the ordinary kinds
-    plus, for each ``GLOBAL_ONLY_KINDS`` kind, only rows older than the global DB's first row
-    of that kind (taken from the global source's ``coverage``, written earlier in the same
-    pass because the global source is ingested first). No global row yet means every copy
-    predates it, so all are admitted.
+    The global source takes every handled kind. The orchestrator source takes only
+    the handled ``self_deploy_*`` kinds (issue #2475): it exists to feed ``deploys``,
+    and restricting it here -- the single ingest point -- is what keeps checkout
+    history that is not deploy evidence (a supervisor deployment checkout may once
+    have run a repo loop) out of every fact table, so it can never surface as a
+    phantom ``orchestrator`` line in a repo-scoped series. A per-repo source takes
+    the ordinary kinds plus, for each ``GLOBAL_ONLY_KINDS`` kind, only rows older
+    than the global DB's first row of that kind (taken from the global source's
+    ``coverage``, written earlier in the same pass because the global source is
+    ingested first). No global row yet means every copy predates it, so all are
+    admitted.
     """
     if source == FLEET_SOURCE:
         kinds = sorted(HANDLERS)
+        return f"kind IN ({', '.join('?' for _ in kinds)})", tuple(kinds)
+    if source == ORCHESTRATOR_SOURCE:
+        kinds = sorted(k for k in HANDLERS if k.startswith("self_deploy_"))
         return f"kind IN ({', '.join('?' for _ in kinds)})", tuple(kinds)
     ordinary = sorted(k for k in HANDLERS if k not in GLOBAL_ONLY_KINDS)
     first = dict(
@@ -352,7 +361,10 @@ def _ingest_source(dst: sqlite3.Connection, source: str, db: Path, cutoff: str) 
                     rederived += 1
                 for table, cols in derive_event(source, ev):
                     _insert(dst, table, cols)
-            if source != FLEET_SOURCE:
+            if source not in (FLEET_SOURCE, ORCHESTRATOR_SOURCE):
+                # loop_passes bypasses the event-kind filter (it copies a table),
+                # so the deploys-only orchestrator source is excluded here too:
+                # a checkout's old repo-loop passes are not repo evidence either.
                 _copy_loop_passes(srcdb, dst, source, cutoff if wm else None)
             coverage_rows = _write_coverage(srcdb, dst, source)
             _write_pulse(srcdb, dst, source)
@@ -429,8 +441,9 @@ def run_rollup(sources: RollupSources, now: datetime) -> RollupResult:
     try:
         plan = [(FLEET_SOURCE, sources.fleet_events_db), *sources.repos]
         if sources.orchestrator_events_db is not None:
-            # Non-fleet source: the ordinary kind filter applies, which is what
-            # admits self_deploy_succeeded / self_deploy_failed (issue #2475).
+            # Deploys-only source: ``_kind_filter`` restricts it to the handled
+            # ``self_deploy_*`` kinds, so nothing else in the checkout's DB can
+            # reach a fact table (issue #2475).
             plan.append((ORCHESTRATOR_SOURCE, sources.orchestrator_events_db))
         results = tuple(_ingest_source(dst, s, db, cutoff) for s, db in plan)
         dst.execute("BEGIN IMMEDIATE")

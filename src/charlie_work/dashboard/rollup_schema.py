@@ -16,7 +16,9 @@ SCHEMA_VERSION = 8  # 8: pass_samples.parked_unready (issue #2314); 7: issue_mil
 FLEET_SOURCE = "fleet"
 #: The supervisor's own checkout's events.db (``orchestrator_root`` stamped in
 #: ``supervisor-heartbeat.json``), where ``self_deploy_*`` events live (issue #2475).
-#: Not a registry repo: ``sources="repos"`` metric scopes exclude it alongside ``fleet``.
+#: Not a registry repo: the rollup ingests it for the handled ``self_deploy_*``
+#: kinds only (``rollup._kind_filter``), and ``sources="repos"`` metric scopes
+#: exclude it alongside ``fleet``.
 ORCHESTRATOR_SOURCE = "orchestrator"
 
 _KEY = (
