@@ -55,6 +55,22 @@ def _unlinked_state(issue_number: int) -> dict[str, Any]:
     }
 
 
+def _linked_state(issue_number: int, pr_number: int, *, status: str = "merged") -> dict[str, Any]:
+    """state.json shape with the issue linked to a PR record."""
+    return {
+        "issues": {str(issue_number): {"number": issue_number}},
+        "prs": {
+            str(pr_number): {
+                "number": pr_number,
+                "issue_number": issue_number,
+                "status": status,
+                "merged": status == "merged",
+            }
+        },
+        "events": [],
+    }
+
+
 def _repo_with_worktree(scratch: Path, branch: str) -> tuple[Path, Path, Path]:
     """Init a repo plus one dispatch-prefix worktree at the main tip.
 
@@ -228,6 +244,96 @@ def test_closed_issue_lane_is_dry_run_safe(wt_scratch: Path) -> None:
     # No rescue ref was created for a dry-run plan.
     refs = _git(repo_root, "for-each-ref", "--format=%(refname)", RESCUE_REF_PREFIX).stdout
     assert refs.strip() == ""
+
+
+def test_closed_issue_merged_pr_uses_merged_lane_and_deletes_branch(
+    wt_scratch: Path,
+) -> None:
+    """Ordering regression (review finding): closing keywords auto-close the
+    issue when its PR merges, so closed-issue + merged-PR is the COMMON
+    merged shape. The merged lane must still see it -- it is the lane that
+    deletes the branch -- and the closed-issue lane must never run ahead
+    of it, or every merged branch leaks."""
+    branch = "agent/issue-31-merged"
+    repo_root, wt_path, worktrees_dir = _repo_with_worktree(wt_scratch, branch)
+    head_sha = _git(wt_path, "rev-parse", "HEAD").stdout.strip()
+    gh = _FakeGH(head_sha=head_sha, issue_states={31: "CLOSED"})
+
+    result = clean_worktrees(
+        repo_root, worktrees_dir, _linked_state(31, 131), OrchestratorConfig(), gh
+    )
+
+    assert result.ok is True, result.message
+    assert len(result.data["removed"]) == 1
+    entry = result.data["removed"][0]
+    assert entry["pr_number"] == 131
+    # The merged lane's removal record carries no closed_issue flag --
+    # proving the PR lane, not the closed-issue lane, handled it.
+    assert "closed_issue" not in entry
+    assert not wt_path.exists()
+    # The merged lane confirmed the PR and deleted the branch, exactly as
+    # it did before the closed-issue lane existed.
+    assert any(call[:2] == ["pr", "view"] for call in gh.calls)
+    assert _git(repo_root, "branch", "--list", branch).stdout.strip() == ""
+
+
+def test_closed_issue_open_pr_keeps_worktree_skipped(wt_scratch: Path) -> None:
+    """Open-PR gate (review finding): an issue can be closed by hand while
+    its PR is still under review rework. The closed-issue lane must not
+    reclaim the checkout out from under a live review -- a resolved PR
+    that is not terminal keeps the ordinary "PR not merged" wait."""
+    branch = "agent/issue-32-open-pr"
+    repo_root, wt_path, worktrees_dir = _repo_with_worktree(wt_scratch, branch)
+    gh = _FakeGH(pr_state="OPEN", issue_states={32: "CLOSED"})
+
+    result = clean_worktrees(
+        repo_root,
+        worktrees_dir,
+        _linked_state(32, 132, status="open"),
+        OrchestratorConfig(),
+        gh,
+    )
+
+    assert result.data["removed"] == []
+    assert len(result.data["skipped"]) == 1
+    assert result.data["skipped"][0]["reason"] == "PR not merged"
+    assert wt_path.exists()
+    assert _git(repo_root, "rev-parse", "--verify", f"refs/heads/{branch}").stdout.strip()
+    # The lane never even consulted the issue: a live PR owns the wait.
+    assert _issue_view_calls(gh) == []
+
+
+def test_closed_issue_merged_pr_dirty_worktree_rescued_and_removed(
+    wt_scratch: Path,
+) -> None:
+    """The merged lane declines a dirty worktree even when the PR merged;
+    on a confirmed-CLOSED issue that decline is terminal, so the
+    closed-issue lane captures the uncommitted work to a rescue ref and
+    removes the checkout -- branch kept, as with no PR at all."""
+    branch = "agent/issue-33-merged-dirty"
+    repo_root, wt_path, worktrees_dir = _repo_with_worktree(wt_scratch, branch)
+    head_sha = _git(wt_path, "rev-parse", "HEAD").stdout.strip()
+    dirty_contents = "uncommitted worker work\n"
+    (wt_path / "wip.txt").write_text(dirty_contents, encoding="utf-8")
+    gh = _FakeGH(head_sha=head_sha, issue_states={33: "CLOSED"})
+
+    result = clean_worktrees(
+        repo_root, worktrees_dir, _linked_state(33, 133), OrchestratorConfig(), gh
+    )
+
+    assert result.ok is True, result.message
+    assert len(result.data["removed"]) == 1
+    entry = result.data["removed"][0]
+    # The closed-issue lane handled it AFTER the merged lane declined on
+    # the dirty tree -- the live `gh pr view` really ran first.
+    assert entry["closed_issue"] is True
+    assert entry["pr_number"] == 133
+    assert any(call[:2] == ["pr", "view"] for call in gh.calls)
+    assert not wt_path.exists()
+    assert _git(repo_root, "rev-parse", "--verify", f"refs/heads/{branch}").stdout.strip()
+    rescue_ref = entry["rescue_ref"]
+    assert rescue_ref.startswith(RESCUE_REF_PREFIX)
+    assert _git(repo_root, "show", f"{rescue_ref}:wip.txt").stdout == dirty_contents
 
 
 def test_issue_view_failure_falls_through_to_pr_lanes(wt_scratch: Path) -> None:

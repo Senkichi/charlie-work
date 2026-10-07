@@ -9,8 +9,13 @@ accumulated (issue #2487).
 A closed GitHub issue is a terminal orchestrator decision: nothing will
 ever advance it again, so waiting for "the work to become clean" or "a PR
 to appear" can never resolve. This module is the third
-``clean_worktrees`` lane: once a live ``gh issue view`` confirms the
-linked issue is CLOSED, the worktree is reclaimed
+``clean_worktrees`` lane, consulted only after the resolved-PR lanes have
+declined a candidate and only when no PR resolved or the resolved PR was
+itself confirmed terminal (``worktree_pr_lanes.pr_lane_verdict``): a
+still-open or unconfirmable PR keeps the ordinary wait even on a closed
+issue, because an issue can be closed by hand while its PR is still
+under review. Once a live ``gh issue view`` confirms the linked issue is
+CLOSED, the worktree is reclaimed
 
 1. after the same live-session gate every other lane uses
    (``_cleanup_live_writer_reason`` -- positive evidence only), then
