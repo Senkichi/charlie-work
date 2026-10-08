@@ -17,9 +17,9 @@ workflow functions, not ``cross_repo_scope_gate`` in isolation.
 from __future__ import annotations
 
 import json
-import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import NamedTuple
 
 import pytest
 
@@ -34,15 +34,20 @@ from charlie_work.cross_repo_gate import (
     CrossRepoGateResult,
     cross_repo_scope_gate,
 )
-from charlie_work.devin_shell import SessionRecord
 from charlie_work.fleet_registry import managed_repo_names
 from charlie_work.paths import runtime_paths
 from charlie_work.state import load_state, save_state
-from charlie_work.worktree import create_worktree, worktree_path_for_branch
+from charlie_work.worktree import create_worktree
 from charlie_work.write_gate import WriteGate
 
+from _dead_session_fixtures import _make_classify_state, _write_dead_session_sidecar
 from _fakes_github import FakeGitHub
 from _host_fixtures import host_probe
+from _worktree_fixtures import (
+    _git,
+    _init_bare_remote_and_clone,
+    _wt_scratch as _register_wt_scratch,  # noqa: F401 -- registers the wt_scratch fixture (shallow tmp dir for real ``git worktree add``)
+)
 
 
 # ---------------------------------------------------------------------------
@@ -226,62 +231,6 @@ def _wg(state_file: Path, *, dry_run: bool = False) -> WriteGate:
     return WriteGate(dry_run=dry_run, state_path=state_file, repo="charlie-work")
 
 
-def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)
-
-
-def _init_bare_remote_and_clone(tmp_path: Path) -> tuple[Path, Path]:
-    """Create a bare remote repo and a local clone, return (remote, clone)."""
-    remote = tmp_path / "remote"
-    remote.mkdir(parents=True, exist_ok=True)
-    _git(remote, "init", "--bare", "--initial-branch=main")
-    # The remote's receive-pack needs repo-level longpaths: git scrubs the
-    # GIT_CONFIG_* env config (set by conftest for local invocations) when
-    # spawning transport children, so object writes on the receive side can
-    # only read the setting from the remote's own config file.
-    _git(remote, "config", "core.longpaths", "true")
-    clone = tmp_path / "clone"
-    clone.mkdir(parents=True, exist_ok=True)
-    _git(clone, "init", "--initial-branch=main")
-    _git(clone, "config", "user.email", "test@example.test")
-    _git(clone, "config", "user.name", "Test User")
-    _git(clone, "config", "commit.gpgSign", "false")
-    _git(clone, "remote", "add", "origin", str(remote))
-    (clone / "README.md").write_text("hello\n", encoding="utf-8")
-    _git(clone, "add", "README.md")
-    _git(clone, "commit", "-m", "initial commit")
-    _git(clone, "push", "-u", "origin", "main")
-    return remote, clone
-
-
-def _make_classify_state(tmp_path: Path) -> tuple[Path, Path]:
-    """Create a state file and sessions dir under tmp_path, return (sessions_dir, state_file)."""
-    sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
-    sessions_dir.mkdir(parents=True, exist_ok=True)
-    state_file = tmp_path / "state.json"
-    state_file.write_text(json.dumps({"events": []}), encoding="utf-8")
-    return sessions_dir, state_file
-
-
-def _write_dead_session_sidecar(
-    sessions_dir: Path, issue_number: int, branch: str, worktree_path: Path
-) -> None:
-    sessions_dir.mkdir(parents=True, exist_ok=True)
-    record = SessionRecord(
-        issue_number=issue_number,
-        branch=branch,
-        worktree_path=str(worktree_path),
-        prompt_path="/tmp/prompt.md",
-        command=("devin", "--prompt-file", "/tmp/prompt.md"),
-        pid=None,
-        started_at=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
-        log_path=str(sessions_dir / f"issue-{issue_number}.log"),
-        error=None,
-    )
-    sidecar_path = sessions_dir / f"issue-{issue_number}.json"
-    sidecar_path.write_text(json.dumps(record.to_dict()), encoding="utf-8")
-
-
 def _make_fleet_dir(tmp_path: Path) -> Path:
     """Write a fleet.json with charlie-work + job-cannon, return the fleet dir path."""
     fleet_dir = tmp_path / "fleet"
@@ -388,63 +337,53 @@ def test_orphan_sweep_escalates_cross_repo_scoped_issue(tmp_path: Path, monkeypa
 # ---------------------------------------------------------------------------
 
 
-def test_classify_dead_sessions_cross_repo_hop_escalates_on_first_occurrence(
-    tmp_path: Path,
-) -> None:
-    """``_classify_dead_sessions_and_update_throttle_state`` overrides
-    ``failure_kind`` to ``cross_repo_hop`` and escalates on the FIRST
-    occurrence for a dead session whose issue title names another managed
-    repo.
+class _CrossRepoDeadSession(NamedTuple):
+    """Everything the cross-repo-hop classify test needs except the call under test."""
 
-    Without the scope gate, a dead session with a non-terminal failure kind
-    (``stalled``) would relabel to ``automated-ready`` for redispatch —
-    repeating the hop forever.  The scope gate override makes
-    ``cross_repo_hop`` a deterministic escalation kind, so the terminal-failure
-    check fires on the first occurrence instead of waiting for the redispatch
-    cap.
+    sessions_dir: Path
+    state_file: Path
+    fleet_dir: Path
+    gh: FakeGitHub
+    config: OrchestratorConfig
 
-    Drives the real classification function with a real git worktree (no
-    commits → no salvage, ``fallback_kind="stalled"``) and a fleet registry
-    on disk, not a monkeypatched helper.
+
+@pytest.fixture
+def _cross_repo_dead_session(tmp_path: Path, wt_scratch: Path) -> _CrossRepoDeadSession:
+    """Resource acquisition for the cross-repo-hop classify test.
+
+    Issue #2608 (ledger-regress: the test slowed 2.0x on the shared CI host):
+    the bare-remote/clone pair, the worktree, the dead-session sidecar, the
+    state.json seed and the fake GitHub world are *acquisition*, not the
+    property under test — the measured ``call`` phase was paying for ~15 git
+    subprocess spawns whose per-spawn cost is set by the runner, not by this
+    repo's code (the attributed SHA touched only tests/test_quiesce.py).
+    Charging the scaffold to setup follows the #2515/#2587/#2624 precedent;
+    the test body keeps the real
+    ``_classify_dead_sessions_and_update_throttle_state`` call and every
+    assertion verbatim.
+
+    The repo pair is built under ``wt_scratch`` (the shallow per-test root
+    for real ``git worktree add`` ops, issue #1944) instead of probing
+    ``tmp_path`` depth and skipping on "fatal: '$GIT_DIR' too big" — the
+    path-length bound the probe skipped on cannot be reached from a shallow
+    root, so the test now exercises the real worktree on every host rather
+    than skipping on deep checkouts.
+
+    The fixture also stamps ``refs/remotes/origin/HEAD`` on the clone (one
+    ``symbolic-ref`` write): an init+remote-add+push clone never gets the ref
+    a real ``git clone`` writes, so the call-phase ``inspect_worktree_state``
+    would pay the ``remote set-head --auto`` heal (two extra spawns) to
+    resolve the ``""`` base_ref. The heal path itself stays covered by
+    tests/test_base_branch.py and tests/test_worktree.py.
     """
-    from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
-
-    remote, repo_root = _init_bare_remote_and_clone(tmp_path / "repo")
+    remote, repo_root = _init_bare_remote_and_clone(wt_scratch / "repo")
+    _git(
+        repo_root,
+        "symbolic-ref",
+        "refs/remotes/origin/HEAD",
+        "refs/remotes/origin/main",
+    )
     branch = "agent/issue-709"
-    worktree_path = worktree_path_for_branch(repo_root, branch)
-    # Environmental bound, not a code defect: git for Windows aborts
-    # `worktree add` during checkout with "fatal: '$GIT_DIR' too big" once
-    # the worktree path exceeds git's fixed internal buffer (empirically
-    # ~216 chars on this build — core.longpaths and worktree.useRelativePaths
-    # do not cover it, and create_worktree resolves the real path so a
-    # subst/junction alias cannot shorten what git sees). Probe git itself
-    # at the exact target path and skip only on the literal signature —
-    # run_captured's RuntimeError does not carry stderr, so a code change
-    # that regresses `worktree add` differently still fails. CI's short
-    # checkout paths exercise the test fully.
-    probe = subprocess.run(
-        ["git", "worktree", "add", "--detach", str(worktree_path), "origin/main"],
-        cwd=repo_root,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
-    # Remove whatever the probe left (a completed worktree or partial admin
-    # state); a failure just means nothing was there to remove.
-    subprocess.run(
-        ["git", "worktree", "remove", "--force", str(worktree_path)],
-        cwd=repo_root,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if probe.returncode != 0:
-        if "too big" in probe.stderr:
-            pytest.skip(
-                "git's internal $GIT_DIR buffer rejects worktree creation at this checkout depth"
-            )
-        raise AssertionError(f"git worktree add probe failed: {probe.stderr}")
     info = create_worktree(repo_root, branch, base_ref="origin/main")
     sessions_dir, state_file = _make_classify_state(tmp_path)
     _write_dead_session_sidecar(sessions_dir, 709, branch, info.path)
@@ -464,13 +403,48 @@ def test_classify_dead_sessions_cross_repo_hop_escalates_on_first_occurrence(
     ]
     gh.prs = []
 
+    return _CrossRepoDeadSession(
+        sessions_dir=sessions_dir,
+        state_file=state_file,
+        fleet_dir=fleet_dir,
+        gh=gh,
+        config=config,
+    )
+
+
+def test_classify_dead_sessions_cross_repo_hop_escalates_on_first_occurrence(
+    _cross_repo_dead_session: _CrossRepoDeadSession,
+) -> None:
+    """``_classify_dead_sessions_and_update_throttle_state`` overrides
+    ``failure_kind`` to ``cross_repo_hop`` and escalates on the FIRST
+    occurrence for a dead session whose issue title names another managed
+    repo.
+
+    Without the scope gate, a dead session with a non-terminal failure kind
+    (``stalled``) would relabel to ``automated-ready`` for redispatch —
+    repeating the hop forever.  The scope gate override makes
+    ``cross_repo_hop`` a deterministic escalation kind, so the terminal-failure
+    check fires on the first occurrence instead of waiting for the redispatch
+    cap.
+
+    Drives the real classification function with a real git worktree (no
+    commits → no salvage, ``fallback_kind="stalled"``) and a fleet registry
+    on disk, not a monkeypatched helper.
+    """
+    from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
+
+    sessions_dir = _cross_repo_dead_session.sessions_dir
+    state_file = _cross_repo_dead_session.state_file
+    gh = _cross_repo_dead_session.gh
+    config = _cross_repo_dead_session.config
+
     _classify_dead_sessions_and_update_throttle_state(
         sessions_dir,
         state_file,
         gh,
         config,
         write_gate=_wg(state_file),
-        fleet_dir_override=str(fleet_dir),
+        fleet_dir_override=str(_cross_repo_dead_session.fleet_dir),
     )
 
     state = json.loads(state_file.read_text(encoding="utf-8"))
