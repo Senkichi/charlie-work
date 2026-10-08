@@ -15,6 +15,9 @@ from datetime import (
 )
 from pathlib import Path
 from typing import Any
+
+import pytest
+
 from _fakes_github import FakeGitHub
 from _helpers import _init_git_repo
 from _review_fixtures import (
@@ -44,6 +47,25 @@ from charlie_work.workflow import (
     _detect_and_handle_stalled_reviews,
 )
 from _dispatch_fixtures import _stub_real_activity_probe_for_stalled_tests  # noqa: F401
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _warm_plain_git_template(tmp_path_factory: pytest.TempPathFactory) -> None:
+    """HS-CW-4: charge the ``plain`` git-template cold build to module setup.
+
+    ``test_stalled_review_throttled_rolls_back_attempt_count`` is this
+    module's only consumer of ``_init_git_repo`` (via
+    ``_git_templates.init_repo``), so when the module runs first in a
+    worker process -- as it does in the ledger's selected ``test`` runs --
+    that test's ``call`` phase absorbed the template's once-per-process
+    five-process ``git`` boot (~0.5-1.2 s on this host) instead of the
+    ~40 ms copy, which is what the ledger flagged at 3.2x baseline
+    (issue #2565). Materializing one scratch plain repo here keeps the
+    same transition in the ``setup`` phase column, where resource
+    acquisition belongs; when the template is already warm the warmup is
+    one additional ~40 ms copy.
+    """
+    _init_git_repo(tmp_path_factory.mktemp("plain-template-warmup") / "repo")
 
 
 def test_stale_claim_recovery_skipped_logs_when_prompt_path_missing_from_state(
@@ -468,6 +490,17 @@ def test_stalled_review_throttled_rolls_back_attempt_count(monkeypatch, tmp_path
         save_state(app.paths.state_file, state)
 
     monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: False)
+    # HS-CW-7 (issue #2565): the sweep's checkout teardown runs a real
+    # ``git worktree list`` spawn (and would run ``git worktree remove``
+    # against a registered checkout) per reap. This test has no review
+    # checkout at all, so the teardown is a pure host-bound spawn cost paid
+    # inside the call phase; its behavior is owned by
+    # ``tests/test_review_checkout_reap.py``. Stub it the way #2519 stubbed
+    # the no-op-rework cap test's git probes.
+    monkeypatch.setattr(
+        "charlie_work.stalled_review_reap.remove_review_checkout",
+        lambda *_a, **_k: True,
+    )
 
     stalled = _detect_and_handle_stalled_reviews(
         reviews_dir,
