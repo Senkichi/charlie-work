@@ -43,7 +43,7 @@ import pytest
 
 import charlie_work.workflow as workflow_module
 from _fakes_github import FakeGitHub
-from _worktree_fixtures import _init_repo as _init_repo_templated
+from _worktree_fixtures import _git, _init_repo as _init_repo_templated
 from charlie_work.config import (
     AutoMergeConfig,
     LocalIssuesConfig,
@@ -214,16 +214,25 @@ def test_loop_pass_runs_pr_shaped_lanes_on_publishing_backend(
     assert "worker_token_missing" not in kinds
 
 
-def test_loop_pass_reconcile_finalizes_closed_escalated_issue_on_local_backend(
-    tmp_path: Path,
-) -> None:
-    """Issue #1969 regression, end to end through ``app.loop()``: a local
-    issue closed out from under an ``escalated`` state entry (the repo's own
-    #131/#132 were stuck that way since 2026-09-23) is finalized to
-    ``closed`` by the periodic reconcile pass inside the loop -- no operator
-    action, no mocked lane -- and stops counting as a ``sink_census`` root
-    for ``operator_queue_impact``. The still-open ``escalated`` control
-    issue is untouched (``escalated_labels_converged`` D-2)."""
+@pytest.fixture
+def _committed_tracker_repo(tmp_path: Path) -> tuple[Path, OrchestratorConfig, Path]:
+    """A ``local_issues`` repo whose seed issue files are already committed --
+    the shape the tracker has in production, where ``issues_dir`` is tracked.
+
+    Issue #2567: left uncommitted, the seed files reach the pass-end tracker
+    flush (``local_issue_commits.flush_tracker_writes``, issue #2434) as one
+    collapsed ``?? docs/issues/`` entry, and the flush sweeps them as two
+    ``chore(issues): update`` commit groups inside the test's measured
+    ``call`` phase -- nine git spawns (status, the detached/merge safety
+    probes, and add+commit per issue) that a real ``loop()`` pass never
+    pays on files it did not write. Committing them here -- fixture setup,
+    which the ledger deliberately excludes from per-test alerting --
+    confines the measured ``call`` phase to the work the pass itself
+    produces, which is what the #1969 regression being pinned is about.
+    The flush still runs end to end and would still commit any pass-time
+    ``_mutate``/``issue_comment`` write; its own sweep/commit machinery is
+    covered by ``test_local_issue_commits.py``.
+    """
     repo_root = tmp_path / "repo"
     _init_repo(repo_root)
     config = _config(local_enabled=True)
@@ -246,6 +255,22 @@ def test_loop_pass_reconcile_finalizes_closed_escalated_issue_on_local_backend(
         f"[{config.labels.human_needed}]",
         "waiting on human.",
     )
+    _git(repo_root, "add", "--", config.local_issues.issues_dir)
+    _git(repo_root, "commit", "-m", "seed tracker issues")
+    return repo_root, config, issues_dir
+
+
+def test_loop_pass_reconcile_finalizes_closed_escalated_issue_on_local_backend(
+    _committed_tracker_repo: tuple[Path, OrchestratorConfig, Path],
+) -> None:
+    """Issue #1969 regression, end to end through ``app.loop()``: a local
+    issue closed out from under an ``escalated`` state entry (the repo's own
+    #131/#132 were stuck that way since 2026-09-23) is finalized to
+    ``closed`` by the periodic reconcile pass inside the loop -- no operator
+    action, no mocked lane -- and stops counting as a ``sink_census`` root
+    for ``operator_queue_impact``. The still-open ``escalated`` control
+    issue is untouched (``escalated_labels_converged`` D-2)."""
+    repo_root, config, issues_dir = _committed_tracker_repo
     gh = LocalFileGitHub(
         repo_root=repo_root,
         issues_dir=issues_dir,
