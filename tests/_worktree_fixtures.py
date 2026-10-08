@@ -49,12 +49,13 @@ rework adoption vs recovery / teardown / probe), and both sides need the same
 bare-remote-plus-pushed-branch builders, so they live here rather than being
 duplicated.
 
-The three repo builders (``_init_repo``, ``_clone_repo``,
-``_init_bare_remote_and_clone``) copy a per-process template when they can
-(HS-CW-4, ``tests/_git_templates.py``): same files, same config, same refs as a
-fresh build, but one commit SHA shared by every copy of a shape. Pass
-``fresh=True`` where a test needs independently-timestamped histories; the
-``_fresh`` variants are the original bodies, unchanged.
+The repo builders (``_init_repo``, ``_init_repo_with_origin``,
+``_clone_repo``, ``_init_bare_remote_and_clone``) copy a per-process template
+when they can (HS-CW-4, ``tests/_git_templates.py``): same files, same
+config, same refs as a fresh build, but one commit SHA shared by every copy
+of a shape. Pass ``fresh=True`` where a test needs
+independently-timestamped histories; the ``_fresh`` variants are the
+original bodies, unchanged.
 """
 
 from __future__ import annotations
@@ -274,6 +275,19 @@ def _init_repo_fresh(repo_root: Path, bare: bool = False) -> None:
         (repo_root / "README.md").write_text("hello\n", encoding="utf-8")
         run(["git", "add", "README.md"])
         run(["git", "commit", "-m", "initial commit"])
+
+
+def _init_repo_with_origin(repo_root: Path, remote_url: str, *, fresh: bool = False) -> None:
+    """``_init_repo`` plus ``git remote add origin <remote_url>``; the
+    remote-add spawn is paid once per process inside the template build
+    (``_git_templates.init_repo_with_origin``), so a materialized call spawns
+    no process at all."""
+    if not fresh and _git_templates.init_repo_with_origin(
+        repo_root, remote_url, build=_init_repo_fresh
+    ):
+        return
+    _init_repo_fresh(repo_root)
+    _git(repo_root, "remote", "add", "origin", remote_url)
 
 
 def _init_bare_remote_and_clone(tmp_path: Path, *, fresh: bool = False) -> tuple[Path, Path]:

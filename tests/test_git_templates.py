@@ -14,6 +14,9 @@ import _worktree_fixtures as wf
 from _git_templates import REUSE_ENV, TemplateRegistry
 
 
+_ORIGIN_URL = "https://github.com/test/canonical.git"
+
+
 def _forms(path: Path) -> tuple[str, str]:
     return str(path), str(path).replace("\\", "/")
 
@@ -46,6 +49,10 @@ def _fresh(shape: str, base: Path) -> list[Path]:
     if shape == "plain":
         wf._init_repo_fresh(base / "repo")
         return [base / "repo"]
+    if shape == "plain-origin":
+        wf._init_repo_fresh(base / "repo")
+        wf._git(base / "repo", "remote", "add", "origin", _ORIGIN_URL)
+        return [base / "repo"]
     if shape == "bare":
         wf._init_repo_fresh(base / "remote.git", True)
         return [base / "remote.git"]
@@ -61,6 +68,11 @@ def _copied(shape: str, base: Path, registry: TemplateRegistry) -> list[Path]:
     if shape == "plain":
         assert _git_templates.init_repo(
             base / "repo", bare=False, build=wf._init_repo_fresh, registry=registry
+        )
+        return [base / "repo"]
+    if shape == "plain-origin":
+        assert _git_templates.init_repo_with_origin(
+            base / "repo", _ORIGIN_URL, build=wf._init_repo_fresh, registry=registry
         )
         return [base / "repo"]
     if shape in ("bare", "clone"):
@@ -85,7 +97,7 @@ def _reuse_on(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv(REUSE_ENV, raising=False)
 
 
-@pytest.mark.parametrize("shape", ["plain", "bare", "clone", "ebc"])
+@pytest.mark.parametrize("shape", ["plain", "bare", "clone", "ebc", "plain-origin"])
 def test_template_copy_matches_a_fresh_build(tmp_path: Path, shape: str) -> None:
     registry = TemplateRegistry()
     fresh_base, copy_base = tmp_path / "fresh", tmp_path / "copy"
@@ -206,6 +218,43 @@ def test_template_with_a_linked_worktree_is_refused(tmp_path: Path) -> None:
         assert not _git_templates.init_repo(
             tmp_path / "a", bare=False, build=with_worktree, registry=registry
         )
+
+
+def test_init_repo_with_origin_rewrites_the_url_per_copy(tmp_path: Path) -> None:
+    """Copies of the ``plain-origin`` shape carry the caller's URL, not the
+    build-time placeholder or a sibling copy's URL."""
+    registry = TemplateRegistry()
+    assert _git_templates.init_repo_with_origin(
+        tmp_path / "a",
+        "https://github.com/test/alpha.git",
+        build=wf._init_repo_fresh,
+        registry=registry,
+    )
+    assert _git_templates.init_repo_with_origin(
+        tmp_path / "b",
+        "https://github.com/test/beta.git",
+        build=wf._init_repo_fresh,
+        registry=registry,
+    )
+    assert registry.materialized["plain-origin"] == 2
+    config_a = (tmp_path / "a" / ".git" / "config").read_text(encoding="utf-8")
+    config_b = (tmp_path / "b" / ".git" / "config").read_text(encoding="utf-8")
+    assert "url = https://github.com/test/alpha.git" in config_a
+    assert "url = https://github.com/test/beta.git" in config_b
+    assert _git_templates._ORIGIN_URL_PLACEHOLDER not in config_a + config_b
+
+
+def test_init_repo_with_origin_unsafe_url_builds_fresh(tmp_path: Path) -> None:
+    """A URL git would quote in config is not byte-rewritable; the caller takes
+    the fresh path (real ``git remote add``) instead."""
+    registry = TemplateRegistry()
+    assert not _git_templates.init_repo_with_origin(
+        tmp_path / "repo",
+        "https://github.com/test/x.git#frag",
+        build=wf._init_repo_fresh,
+        registry=registry,
+    )
+    assert registry.materialized["plain-origin"] == 0
 
 
 def test_helpers_init_git_repo_goes_through_the_template(tmp_path: Path) -> None:
