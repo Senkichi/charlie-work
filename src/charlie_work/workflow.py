@@ -2525,6 +2525,11 @@ class OrchestratorApp:
             checks = self._enrich_checks_infra_blocked(
                 checks, self.config.auto_merge.required_checks
             )
+            # Issue #2540: resolve workflow run ids for required checks whose
+            # link is the app-assigned .../runs/<id> check-run shape, so the
+            # flake-aware debounce and the infra-rerun driver see a run id
+            # instead of treating the first failure as definitive.
+            checks = self._enrich_checks_run_ids(checks, self.config.auto_merge.required_checks)
 
         # Load PR state for no-op rework detection (only if PR has verdict history)
         pr_state = None
