@@ -22,6 +22,7 @@ from _run_captured_fakes import patch_run_captured
 from charlie_work.config import (
     DevinConfig,
     OrchestratorConfig,
+    PostMortemConfig,
     WatchdogConfig,
     WorkerRoleConfig,
 )
@@ -231,6 +232,12 @@ def test_stalled_session_emits_event_with_required_fields(tmp_path: Path) -> Non
             harness="devin-shell"
         ),  # Use devin-shell adapter for watchdog support
         watchdog=WatchdogConfig(enabled=True, stall_minutes=20),
+        # Keep the RecordPostMortem commit's sessions.db read off the real
+        # host store (%APPDATA%\devin\cli\sessions.db): the stalled sweep
+        # still runs classify_and_record, but against a path that cannot
+        # exist, so the extraction degrades to its fast "not found" branch
+        # instead of scanning a host-sized DB (issue #2599).
+        post_mortem=PostMortemConfig(db_path=str(tmp_path / "no-such-sessions.db")),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
@@ -306,6 +313,13 @@ def test_stalled_session_emits_event_with_required_fields(tmp_path: Path) -> Non
             "charlie_work.dead_worker_sweep.effects_sessions.sweep_orphan_processes",
             return_value=[{"pid": 3492, "name": "python.exe", "command_line": "python worker.py"}],
         ),  # Fixed mock return
+        # The KillOrphans commit would otherwise run the real
+        # kill_orphan_pid against the fake pid: one host-wide ppid snapshot
+        # for the caller-ancestry guard plus a real taskkill spawn -- both
+        # host-load-dependent costs this event-payload test does not need
+        # (issue #2599). The orphan pid still reaches the kill seam, which
+        # the assertion below proves.
+        patch("charlie_work.write_gate.kill_orphan_pid") as orphan_kill,
         patch(
             "charlie_work.devin_shell.update_session_record_with_failure_classification",
             return_value=(None, None),
@@ -320,6 +334,10 @@ def test_stalled_session_emits_event_with_required_fields(tmp_path: Path) -> Non
 
     # Check that the stalled issue was detected
     assert any(entry["issue"] == 109 for entry in result)
+
+    # The mocked orphan still went through the write_gate kill seam -- the
+    # stub removes the OS call, not the KillOrphans commit that issues it.
+    orphan_kill.assert_called_once_with(3492)
 
     # Load state and check for the event
     state = load_state(paths.state_file)
