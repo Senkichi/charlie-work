@@ -76,6 +76,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import sqlite3
 import threading
@@ -103,9 +104,14 @@ _db_init_lock = threading.Lock()
 # resolves per ``log_event`` call: once in ``_get_db``, once for the lock key),
 # and ``nt._getfinalpathname`` is expensive on filesystems holding
 # ``tmp_path`` (network/junctioned volumes), so a burst of events paid it
-# 2N times per N events (issue #2566). A path's resolved form cannot change
-# while the same process holds an open sqlite connection for it, so the
-# memo is invalidated exactly where the connection cache is (``close_db``).
+# 2N times per N events (issue #2566). Keys are absolute
+# (``os.path.abspath``): a relative ``state_path`` outliving a cwd change
+# keys a fresh entry against the new cwd instead of returning the previous
+# cwd's resolved form. While that holds, the only way the memo can go stale
+# without the cwd changing is the filesystem it names being re-linked
+# mid-process, which also invalidates the open sqlite handle ``_get_db``
+# would have returned — so the memo is invalidated exactly where the
+# connection cache is (``close_db``).
 _resolved_db_keys: dict[str, str] = {}
 
 # Tracks unknown event kinds we have already warned about once. A one-time
@@ -325,20 +331,39 @@ def _db_path(state_path: Path) -> Path:
     return state_path.parent / "events.db"
 
 
+def _db_memo_key(state_path: Path) -> str:
+    """Return the memo/connection key spelling for a ``state_path``.
+
+    Relative paths are normalized against the current working directory at
+    lookup time (:func:`os.path.abspath`), so a relative ``state_path``
+    outliving a cwd change keys a fresh cache entry instead of colliding
+    with the previous cwd's.
+    """
+    return os.path.abspath(str(state_path))
+
+
 def _db_key(state_path: Path) -> str:
     """Return the memoized resolved key for a ``state_path``'s ``events.db``.
 
-    The key identifies the per-path connection and lock entries. Resolution is
-    memoized per input ``state_path`` string: ``Path.resolve()`` bottoms out
-    in ``nt._getfinalpathname``, which is a real syscall cost on network /
-    junctioned filesystems, and every event write used to pay it twice per
-    call. A path string's resolved form only changes if the filesystem it
-    names is re-linked mid-process, which also invalidates the open sqlite
-    handle ``_get_db`` would have returned — so the memo shares
-    ``close_db``'s invalidation point and is never stale for a connection
-    the cache would still hand out.
+    The key identifies the per-path connection and lock entries. Resolution
+    is memoized, keyed on the ``state_path`` string normalized to its
+    absolute form via :func:`os.path.abspath`: ``Path.resolve()`` bottoms
+    out in ``nt._getfinalpathname``, which is a real syscall cost on
+    network / junctioned filesystems, and every event write used to pay it
+    twice per call. Keying on the absolute form keeps relative
+    ``state_path`` values correct across cwd changes — a cwd change yields
+    a different key (and a re-resolve) instead of serving the previous
+    cwd's memo — while the absolute-spelling lookup itself is a string
+    operation, not a syscall.
+
+    The memo is invalidated by ``close_db`` alongside the connection and
+    lock the key identifies. Within one open connection, the only way a
+    key's resolved form can change is the filesystem it names being
+    re-linked mid-process, which would invalidate the open sqlite handle
+    ``_get_db`` would have returned — so the memo cannot outlive a
+    connection the cache would still hand out under it.
     """
-    key_input = str(state_path)
+    key_input = _db_memo_key(state_path)
     cached = _resolved_db_keys.get(key_input)
     if cached is None:
         cached = str(_db_path(state_path).resolve())
@@ -1031,7 +1056,7 @@ def close_db(state_path: Path) -> None:
         conn = _db_connections.pop(key, None)
     # Invalidate the memo for this state_path alongside the connection/lock:
     # a path re-linked after this point must re-resolve on the next lookup.
-    _resolved_db_keys.pop(str(state_path), None)
+    _resolved_db_keys.pop(_db_memo_key(state_path), None)
     if conn is not None:
         try:
             conn.close()
