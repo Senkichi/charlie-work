@@ -25,6 +25,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from charlie_work.config import DevinConfig, OrchestratorConfig
 from charlie_work.paths import runtime_paths
 from charlie_work.state import load_state, save_state, state_lock
@@ -32,6 +34,30 @@ from charlie_work.workflow import OrchestratorApp
 
 from _fakes_github import FakeGitHub, FakeGitHubWithChecks, FakeGitHubWithMissingRequiredAndRuns
 from _review_fixtures import _required_checks_config
+
+
+@pytest.fixture(autouse=True)
+def _no_prompt_template_drift_rescan(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep ``OrchestratorApp.__init__``'s drift check off the timed call phase.
+
+    Every app construction runs ``check_prompt_template_drift`` -- the #713
+    placeholder-subset startup guard -- which re-reads every
+    ``prompts/worker_sections/*.md`` for the base set plus each on-disk
+    variant, once per configured template (~150 file opens per construction;
+    ``test_ci_run_never_created_emitted_once_per_head_with_control`` builds
+    two apps, so ~300 opens land in its ``call`` phase). That per-file-open
+    cost is what inflates under runner load: the ledger flagged the test at
+    5.3x (issue #2628) with the attributed SHA touching only an unrelated
+    test file. No test in this module exercises template drift -- the guard's
+    coverage lives in test_prompt_template_drift_check.py,
+    test_fix_prompt_template_drift.py and test_prompt_section_variants.py,
+    which call the real function directly. The drift check still runs for
+    real at every production supervisor startup.
+    """
+    monkeypatch.setattr(
+        "charlie_work.workflow.check_prompt_template_drift",
+        lambda config, *, search_dirs=(): [],
+    )
 
 
 def _events(state, kind: str) -> list[dict]:
