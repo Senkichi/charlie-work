@@ -9,9 +9,12 @@ from __future__ import annotations
 import os
 import subprocess
 import time
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+import pytest
 
 from charlie_work import local_suite_runner
 from charlie_work.config import OrchestratorConfig, build_config_from_data
@@ -220,3 +223,50 @@ def _event_kinds(app: OrchestratorApp) -> list[str]:
 
 def _events_of_kind(app: OrchestratorApp, kind: str) -> list[dict]:
     return [e for e in load_state_locked(app.paths.state_file)["events"] if e["kind"] == kind]
+
+
+@pytest.fixture(autouse=True)
+def _no_windows_child_enumeration(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep ``kill_process_tree``'s child enumeration off the PowerShell path.
+
+    Every gate kill in the importing module -- the in-flight timeout, plus
+    each ``_kill_claimed_gate`` teardown -- enumerates the suite's children
+    for the ``killed_pids`` report, and on Windows that enumeration is one
+    ``Get-CimInstance Win32_Process`` spawn whose latency swings from ~0.3 s
+    to its 5 s timeout under host load. That bimodal ~4.5 s per kill is the
+    ledger-flagged regression (#2597; #2642 flagged the same cost inside the
+    async module's measured call phases). ``taskkill /T`` still fells the
+    real tree; the enumeration only feeds a report these tests never assert
+    on. Autouse, so importing the name arms it for the importing module.
+    """
+    import charlie_work.process_utils as process_utils
+
+    monkeypatch.setattr(process_utils, "_enumerate_child_pids", lambda _pid: [])
+
+
+# Explicit fixture name (the ``_wt_scratch`` pattern): importing modules bring
+# the private symbol into their namespace so pytest registers the fixture; a
+# matching function name would collide with the fixture parameter in test
+# signatures (ruff F811).
+@pytest.fixture(name="approved_sleep_gate")
+def _approved_sleep_gate(lane_repo: Path) -> Iterator[OrchestratorApp]:
+    """Lane scaffold charged to setup: repo, branch, app, approved record.
+
+    None of the acquisition is the property under test, and its per-spawn
+    git/process cost drifts with shared-runner load -- paying it inside the
+    measured ``call`` phase is what the ledger flagged as a 2.4x regression
+    (#2642; same fix shape as #2624/#2634). The call phase keeps only the
+    launch pass plus its assertions, and the in-flight suite's kill lands in
+    teardown instead of the test's ``finally`` (which still counts as
+    ``call``). Requests the importing module's ``lane_repo`` fixture.
+    """
+    _init_repo(lane_repo)
+    issues_dir = lane_repo / "docs" / "issues"
+    head = _make_branch(lane_repo, "agent/issue-7-x", "a.py", "a = 1\n")
+    config = _lane_config(lane_repo, issues_dir, dispatch={"test_command": SLEEP_SUITE})
+    app = _lane_app(lane_repo, issues_dir, config=config)
+    _adopt_and_approve(app, issues_dir, 7, "agent/issue-7-x", head)
+    yield app
+    # Tolerant of a cleared claim -- the kill is a no-op when the test
+    # escalated or the suite resolved on its own.
+    _kill_claimed_gate(app, 7)
