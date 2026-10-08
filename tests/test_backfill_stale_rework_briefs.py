@@ -501,17 +501,46 @@ def _make_repo_with_fix(tmp_path: Path, name: str) -> tuple[Path, str]:
 
     The base repo materializes from the per-process ``plain`` git template
     (``_worktree_fixtures._init_repo`` -> ``tests/_git_templates.py``,
-    HS-CW-4: ``shutil.copytree``, no subprocesses); only the per-test fix
-    commit itself still spawns git. The fix SHA stays unique to this repo
-    because the commit is created after the copy -- no other template copy's
-    object store contains it, which is what the renderer-vs-state-repo tests
-    rely on."""
+    HS-CW-4: ``shutil.copytree``, no subprocesses); the fix commit is one
+    ``git fast-import`` rather than an add/commit/rev-parse trio (issue
+    #2605, the same runner-pool spawn slowdown #2592 fixed elsewhere), and
+    ``--export-marks`` returns the new SHA without a ``rev-parse``. Callers
+    only ever resolve the SHA, so the stream adds ``fix.txt`` to the commit
+    without touching the worktree or index. The commit is created after
+    the copy, so no other template copy's object store contains it -- what
+    the renderer-vs-state-repo tests rely on."""
     repo = tmp_path / name
     _init_repo(repo)
-    (repo / "fix.txt").write_text("fix", encoding="utf-8")
-    _git(repo, "add", "fix.txt")
-    _git(repo, "commit", "-q", "-m", "the renderer fix")
-    fix_sha = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    marks_path = tmp_path / f"{name}.marks"
+    # ``from refs/heads/main`` on the branch being committed is a hard error
+    # ("Can't create a branch from itself"), so the stream commits on a
+    # scratch branch, fast-forwards main to it, and deletes the scratch ref.
+    subprocess.run(
+        ["git", "fast-import", "--quiet", f"--export-marks={marks_path}"],
+        cwd=repo,
+        # input as bytes: text=True would translate \n to \r\n on Windows
+        # stdin, and git parses the \r as part of each command line.
+        input=b"""\
+commit refs/heads/fix-tip
+mark :1
+committer Test User <test@example.test> 0 +0000
+data <<MSG
+the renderer fix
+MSG
+from refs/heads/main
+M 100644 inline fix.txt
+data <<EOT
+fix
+EOT
+reset refs/heads/main
+from :1
+reset refs/heads/fix-tip
+from 0000000000000000000000000000000000000000
+""",
+        check=True,
+        capture_output=True,
+    )
+    fix_sha = marks_path.read_text(encoding="utf-8").split()[1]  # ":1 <sha>"
     return repo, fix_sha
 
 
@@ -536,17 +565,21 @@ def test_repo_builders_go_through_the_git_template(tmp_path: Path) -> None:
     at ~2.5x baseline because each of this module's gate tests paid the full
     spawn cost on the Windows CI host. Mirrors ``test_git_templates``'s #2387
     pin for ``_helpers._init_git_repo`` and the #2425 pin in
-    ``test_local_issues_loop_gates``."""
+    ``test_local_issues_loop_gates``.
+
+    Issue #2605: same spawn slowdown regressed the pin to 4.3x baseline --
+    five call-phase ``git`` spawns, now two."""
     import _git_templates
 
     before = _git_templates._REGISTRY.materialized["plain"]
     repo, fix_sha = _make_repo_with_fix(tmp_path, "with-fix")
     assert _git_templates._REGISTRY.materialized["plain"] == before + 1
-    # The fix commit is a real object in this copy's store.
-    assert _git(repo, "rev-parse", "--verify", fix_sha).stdout.strip()
+    # ^{commit} forces object lookup; a bare 40-hex echoes back unresolved.
+    assert _git(repo, "rev-parse", "--verify", f"{fix_sha}^{{commit}}").stdout.strip()
     without = _make_repo_without_fix(tmp_path, "without-fix")
     assert _git_templates._REGISTRY.materialized["plain"] == before + 2
-    assert _git(without, "rev-parse", "--verify", "main").stdout.strip()
+    # init_repo already byte-compared the copy's refs against the template.
+    assert (without / ".git" / "refs" / "heads" / "main").read_text(encoding="ascii").strip()
 
 
 @pytest.mark.skipif(
