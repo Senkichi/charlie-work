@@ -9,7 +9,9 @@ treated its first failure as definitive -- no flake-aware rerun was ever
 scheduled. These tests pin the data-boundary enrichment
 (``_enrich_checks_run_ids`` / ``_resolve_run_id_via_check_run`` in
 ``orchestration.misc_checks``) that resolves the workflow run id through
-the check run itself, and the end-to-end ``review()`` behavior.
+the check run itself, the end-to-end ``review()`` behavior, and the
+merge-lane wiring in ``merge_path.gather.gather_checks`` (the
+``merge_ready`` data boundary).
 
 API shapes consumed by the resolver (REST, apiVersion 2022-11-28):
 ``GET /repos/{owner}/{repo}/check-runs/{id}`` returns ``check_suite``
@@ -21,13 +23,18 @@ and ``GET /repos/{owner}/{repo}/actions/runs`` accepts a
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from _checks_fixtures import REQUIRED
+from _dispatch_fixtures import _stub_real_activity_probe_for_stalled_tests  # noqa: F401
 from _fakes_github_rerun import FakeGitHubWithRerunCapture
 from _review_fixtures import _required_checks_config
 from charlie_work.check_run_resolution import _check_run_id_from_link
+from charlie_work.merge_path.gather import gather_checks
 from charlie_work.orchestration.check_run_ids import (
     _enrich_checks_run_ids,
     _resolve_run_id_via_check_run,
@@ -264,3 +271,88 @@ def test_review_infra_rerun_for_check_run_linked_required_check(tmp_path: Path) 
     assert result.data.get("infra_rerun_run_ids") == [RUN_ID]
     assert fake_gh.rerun_calls == [["run", "rerun", str(RUN_ID)]]
     assert "--failed" not in fake_gh.rerun_calls[0]
+
+
+@pytest.mark.parametrize("state", ["CANCELLED", "FAILURE"])
+def test_gather_checks_resolves_run_id_for_check_run_linked_required_check(
+    tmp_path: Path, state: str
+) -> None:
+    """Merge-lane wiring: ``gather_checks`` (the ``merge_ready``/preview data
+    boundary in ``merge_path/gather.py``) must run the same
+    ``_enrich_checks_run_ids`` enrichment ``review()`` does. A required
+    check in a rerun-relevant state (``CANCELLED`` for the infra lane,
+    ``FAILURE`` for the flake-debounce lane) whose link is the app-assigned
+    ``.../runs/<id>`` check-run shape must come out of ``gather_checks``
+    with ``runId`` resolved. Without that call the id stays ``None`` and
+    the merge lane's ``classify_infra_failures``/``classify_check_failures``
+    see an unrerunnable failure -- definitive on first sight."""
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = _FakeCheckRunGitHub(
+        checks=[
+            {"name": "Tests passed", "state": state, "link": CHECK_RUN_LINK},
+            {"name": "Lint & Format", "bucket": "pass"},
+            {"name": "Pre-commit", "state": "SUCCESS"},
+        ],
+        check_run_payloads={CHECK_RUN_ID: {"check_suite": {"id": SUITE_ID}}},
+        runs_by_check_suite={SUITE_ID: [{"id": RUN_ID, "check_suite_id": SUITE_ID}]},
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    read = gather_checks(app, 456)
+
+    assert not read.unavailable
+    assert read.enriched[0]["name"] == "Tests passed"
+    assert read.enriched[0]["runId"] == RUN_ID
+    assert fake_gh.check_run_calls == [CHECK_RUN_ID]
+    assert fake_gh.suite_calls == [SUITE_ID]
+    if state == "CANCELLED":
+        assert read.summary.infra_failed == ("Tests passed",)
+    else:
+        assert read.summary.failed == ("Tests passed",)
+
+
+def test_merge_ready_infra_rerun_for_check_run_linked_required_check(tmp_path: Path) -> None:
+    """Merge-lane end to end: an approved-at-live-head PR whose CANCELLED
+    required check is ``.../runs/<id>``-linked gets the resolved workflow
+    run retried via ``gh run rerun`` -- the carried-forward lane never
+    re-enters ``review()``, so this is the consumer the ``gather_checks``
+    wiring exists for (mirrors
+    ``test_charlie_work_merge_ready_infra_rerun``'s approved-head setup).
+    Without the ``gather_checks`` enrichment the runId stays ``None`` and
+    the pass escalates immediately instead of rerunning."""
+    config = _required_checks_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = _FakeCheckRunGitHub(
+        checks=[
+            {"name": "Tests passed", "state": "CANCELLED", "link": CHECK_RUN_LINK},
+            {"name": "Lint & Format", "bucket": "pass"},
+            {"name": "Pre-commit", "state": "SUCCESS"},
+        ],
+        check_run_payloads={CHECK_RUN_ID: {"check_suite": {"id": SUITE_ID}}},
+        runs_by_check_suite={SUITE_ID: [{"id": RUN_ID, "check_suite_id": SUITE_ID}]},
+    )
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+    decision_dir = tmp_path / ".var" / "charlie-work" / "prs" / "pr-456"
+    decision_dir.mkdir(parents=True)
+    (decision_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "approved", "reviewed_head_sha": "sha-abc123"}),
+        encoding="utf-8",
+    )
+
+    result = app.merge_ready(456)
+
+    assert result.ok is True
+    assert result.data["can_merge"] is False
+    assert result.data["merged"] is False
+    assert result.data.get("infra_rerun_run_ids") == [RUN_ID]
+    assert fake_gh.rerun_calls == [["run", "rerun", str(RUN_ID)]]
+    assert "--failed" not in fake_gh.rerun_calls[0]
+    state = load_state(paths.state_file)
+    assert state["prs"]["456"]["infra_rerun_attempts"] == {
+        "sha-abc123": {"Tests passed": {str(RUN_ID): 1}}
+    }
+    # Not escalated, not merged, no rework label -- remediation is in flight.
+    assert (123, config.labels.operator_queue) not in fake_gh.labels_added
+    assert (123, config.labels.needs_rework) not in fake_gh.labels_added
+    assert fake_gh.merged == []
