@@ -64,8 +64,49 @@ def _warm_plain_git_template(tmp_path_factory: pytest.TempPathFactory) -> None:
     same transition in the ``setup`` phase column, where resource
     acquisition belongs; when the template is already warm the warmup is
     one additional ~40 ms copy.
+
+    ``TemplateRegistry`` keys templates by ``(shape, env_fingerprint())``,
+    and the fingerprint includes every ``GIT_*`` variable except
+    ``GIT_CEILING_DIRECTORIES``. The function-scoped autouse
+    ``_isolate_git_env`` (tests/conftest.py) sets the
+    ``GIT_CONFIG_COUNT/KEY_0/VALUE_0`` trio *after* this module fixture
+    runs, so a warm-up without the trio would build a template under a
+    fingerprint the call phase never looks up again. This fixture applies
+    the same trio (the values conftest injects are constant) through a
+    ``pytest.MonkeyPatch`` context before building, so the warm-up's
+    fingerprint matches the test's own environment and the call phase
+    reuses the template. The trio is NOT excluded from
+    ``env_fingerprint()`` instead, because a future test could set a
+    config that changes builder output; the local env match is provably
+    safe. The call-phase reuse is pinned by
+    ``test_plain_git_template_warmed_by_module_setup`` below.
     """
-    _init_git_repo(tmp_path_factory.mktemp("plain-template-warmup") / "repo")
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("GIT_CONFIG_COUNT", "1")
+        mp.setenv("GIT_CONFIG_KEY_0", "core.longpaths")
+        mp.setenv("GIT_CONFIG_VALUE_0", "true")
+        _init_git_repo(tmp_path_factory.mktemp("plain-template-warmup") / "repo")
+
+
+def test_plain_git_template_warmed_by_module_setup() -> None:
+    """Pin the module warm-up so the flagged test never cold-builds ``plain``.
+
+    Regression for issue #2565 rework: the previous untested fixture built
+    the template under a *different* ``env_fingerprint`` than the call
+    phase (the conftest ``GIT_CONFIG_COUNT/KEY_0/VALUE_0`` trio is absent
+    at module setup), so the lookup missed and the cold ``git`` boot
+    landed in the test's call phase anyway. A registry lookup hit under
+    THIS test's own environment (with the trio applied by
+    ``_isolate_git_env``) plus a materialized copy proves the warm-up's
+    template is actually reused; without the warm-up hooking the same
+    environment, ``lookup`` returns ``None`` or the counter catches the
+    cold build instead.
+    """
+    from _git_templates import _REGISTRY
+
+    template = _REGISTRY.lookup("plain")
+    assert template is not None, "module warm-up missed the call-phase env fingerprint"
+    assert _REGISTRY.materialized["plain"] >= 1, "no plain template was copied yet"
 
 
 def test_stale_claim_recovery_skipped_logs_when_prompt_path_missing_from_state(
