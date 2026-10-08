@@ -9,7 +9,7 @@ from typing import Any, cast
 
 import pytest
 
-from charlie_work.config import OrchestratorConfig
+from charlie_work.config import OrchestratorConfig, PostMortemConfig
 from charlie_work.github import GitHubLike
 from charlie_work.host.fakes import FakeProcessProbe
 from charlie_work.paths import runtime_paths
@@ -205,7 +205,14 @@ def test_foreign_writer_live_pid_stale_mtime_reaped(
     monkeypatch.setattr("charlie_work.worktree.sweep_orphan_processes", lambda wt: [])
     monkeypatch.setattr("charlie_work.worktree.kill_orphan_pid", lambda pid: None)
 
-    config = OrchestratorConfig()
+    # Keep the reap path's sessions.db probe off the real host store
+    # (%APPDATA%\devin\cli\sessions.db — 7.9 GB on the fleet host): a db_path
+    # that cannot exist degrades real_activity_for_worker to its fast "not
+    # found" branch. Same convention as test_charlie_work_stall_reap.py
+    # (issue #2604).
+    config = OrchestratorConfig(
+        post_mortem=PostMortemConfig(db_path=str(tmp_path / "no-such-sessions.db"))
+    )
     state_file = tmp_path / "state.json"
     state_file.parent.mkdir(parents=True, exist_ok=True)
 
@@ -248,7 +255,10 @@ def test_foreign_writer_live_pid_fresh_mtime_blocked(
     monkeypatch.setattr("charlie_work.worktree.sweep_orphan_processes", lambda wt: [])
     monkeypatch.setattr("charlie_work.worktree.kill_orphan_pid", lambda pid: None)
 
-    config = OrchestratorConfig()
+    # Off the real host store — see test_foreign_writer_live_pid_stale_mtime_reaped.
+    config = OrchestratorConfig(
+        post_mortem=PostMortemConfig(db_path=str(tmp_path / "no-such-sessions.db"))
+    )
     state_file = tmp_path / "state.json"
 
     # Should raise — the writer is active, so dispatch is blocked.
@@ -286,7 +296,10 @@ def test_foreign_writer_reaped_event_logged(
     monkeypatch.setattr("charlie_work.worktree.sweep_orphan_processes", lambda wt: [])
     monkeypatch.setattr("charlie_work.worktree.kill_orphan_pid", lambda pid: None)
 
-    config = OrchestratorConfig()
+    # Off the real host store — see test_foreign_writer_live_pid_stale_mtime_reaped.
+    config = OrchestratorConfig(
+        post_mortem=PostMortemConfig(db_path=str(tmp_path / "no-such-sessions.db"))
+    )
     state_file = tmp_path / "state.json"
     save_state(state_file, empty_state())
 
@@ -336,7 +349,10 @@ def test_foreign_writer_reap_passes_process_start_time_to_kill(
     monkeypatch.setattr("charlie_work.worktree.sweep_orphan_processes", lambda wt: [])
     monkeypatch.setattr("charlie_work.worktree.kill_orphan_pid", lambda pid: None)
 
-    config = OrchestratorConfig()
+    # Off the real host store — see test_foreign_writer_live_pid_stale_mtime_reaped.
+    config = OrchestratorConfig(
+        post_mortem=PostMortemConfig(db_path=str(tmp_path / "no-such-sessions.db"))
+    )
     state_file = tmp_path / "state.json"
 
     _check_worktree_writer_marker(
@@ -524,7 +540,10 @@ def test_reap_idle_foreign_writer_kill_noop_keeps_marker(
     monkeypatch.setattr("charlie_work.worktree.sweep_orphan_processes", lambda wt: [])
     monkeypatch.setattr("charlie_work.worktree.kill_orphan_pid", lambda pid: None)
 
-    config = OrchestratorConfig()
+    # Off the real host store — see test_foreign_writer_live_pid_stale_mtime_reaped.
+    config = OrchestratorConfig(
+        post_mortem=PostMortemConfig(db_path=str(tmp_path / "no-such-sessions.db"))
+    )
     marker = read_worktree_marker(worktree_path)
     assert marker is not None
 
@@ -563,7 +582,10 @@ def test_try_reap_blocked_foreign_writer_derives_pid_from_marker(
     monkeypatch.setattr("charlie_work.worktree.sweep_orphan_processes", lambda wt: [])
     monkeypatch.setattr("charlie_work.worktree.kill_orphan_pid", lambda pid: None)
 
-    config = OrchestratorConfig()
+    # Off the real host store — see test_foreign_writer_live_pid_stale_mtime_reaped.
+    config = OrchestratorConfig(
+        post_mortem=PostMortemConfig(db_path=str(tmp_path / "no-such-sessions.db"))
+    )
     state_file = tmp_path / "state.json"
     state_file.parent.mkdir(parents=True, exist_ok=True)
 
