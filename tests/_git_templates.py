@@ -9,9 +9,11 @@ rewrites the one value the copy inherits from the template's location -- the
 messages. The copy path spawns no process.
 
 Shapes: ``plain`` (``_init_repo``), ``bare`` (``_init_repo(bare=True)``),
-``ebc`` (``_init_bare_remote_and_clone``), and ``clone-of-<shape>``
-(``_clone_repo`` from a repo this registry materialized that nothing has
-changed since: same refs, same config, same git environment).
+``ebc`` (``_init_bare_remote_and_clone``), ``plain-origin``
+(``_init_repo_with_origin``: a plain repo whose ``origin`` remote the build
+sets to a placeholder URL, rewritten per copy like the clone shapes), and
+``clone-of-<shape>`` (``_clone_repo`` from a repo this registry materialized
+that nothing has changed since: same refs, same config, same git environment).
 
 Copies of one shape share commit SHAs where fresh builds differ by
 timestamp. A test that builds two "independent" repos and pushes, fetches or
@@ -31,6 +33,7 @@ import os
 import re
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 import warnings
@@ -40,6 +43,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 REUSE_ENV = "CI_FLEET_TEST_REUSE"
+# Written into the ``plain-origin`` template's config by ``git remote add`` at
+# build time; every copy rewrites it to the caller's URL. Chosen to be
+# ``_config_safe`` and to collide with no real remote URL.
+_ORIGIN_URL_PLACEHOLDER = "https://git-template.invalid/origin.git"
 _ENV_EXTRA = frozenset({"HOME", "USERPROFILE", "XDG_CONFIG_HOME"})
 # The ``GIT_CONFIG_*`` env ``conftest._isolate_git_env`` injects into every
 # test so spawned ``git`` gets ``core.longpaths`` on deep Windows paths.
@@ -318,6 +325,48 @@ def init_repo(
         new_url = _forms(dst.parent / f"{dst.name}-temp")[template.url_form]
         _rewrite_url(gitdir / "config", template.url, new_url)
         _rewrite_logs(gitdir, template.url, new_url)
+    _verify_copy(_gitdir(template.repo), gitdir)
+    registry.materialized[shape] += 1
+    registry.mark_pristine(dst, shape)
+    return True
+
+
+def init_repo_with_origin(
+    dst: Path, url: str, *, build: InitBuilder, registry: TemplateRegistry | None = None
+) -> bool:
+    """Materialize a ``plain`` repo plus an ``origin`` remote at ``url``; False
+    means "take the fresh path".
+
+    The ``git remote add`` spawn is paid once per process inside the template
+    build, against ``_ORIGIN_URL_PLACEHOLDER``; each copy then rewrites the
+    ``url =`` line to ``url`` through the same machinery the clone shapes use
+    for their per-copy remote path, so a materialized call spawns no process.
+    """
+    registry = registry or _REGISTRY
+    if not reuse_enabled() or not _eligible(dst) or not _config_safe(url):
+        return False
+    shape = "plain-origin"
+
+    def _build(root: Path) -> _Template:
+        repo = root / "repo"
+        build(repo, False)
+        subprocess.run(
+            ["git", "remote", "add", "origin", _ORIGIN_URL_PLACEHOLDER],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        _check_invariants(_gitdir(repo), identity=True)
+        return _Template(repo=repo, url=_ORIGIN_URL_PLACEHOLDER)
+
+    template = registry.template(shape, _build)
+    if template is None or template.url is None:
+        return False
+    _copy_tree(template.repo, dst)
+    gitdir = _gitdir(dst)
+    _rewrite_url(gitdir / "config", template.url, url)
+    _rewrite_logs(gitdir, template.url, url)
     _verify_copy(_gitdir(template.repo), gitdir)
     registry.materialized[shape] += 1
     registry.mark_pristine(dst, shape)
