@@ -7,7 +7,9 @@ from pathlib import Path
 
 import pytest
 
+import charlie_work.instrumentation as _instrumentation
 from charlie_work.instrumentation import (
+    _db_key,
     close_db,
     correlation_context,
     current_correlation_id,
@@ -42,6 +44,43 @@ def test_log_event_writes_sqlite(tmp_path: Path) -> None:
     assert events[0]["payload"] == {"key": "value"}
     assert events[0]["repo"] == "test-repo"
     assert "ts" in events[0]
+
+
+def test_db_key_memo_resolution_across_event_writes(tmp_path: Path, monkeypatch) -> None:
+    """Issue #2566: the resolved ``events.db`` key resolves once per ``state_path``.
+
+    Every event write used to pay two ``Path.resolve()`` calls (once in
+    ``_get_db``, once for the write-lock key), and on filesystems holding
+    ``tmp_path`` those syscalls are expensive enough that a test burst of
+    ~500 events doubled its call time. ``_db_key`` memoizes per input path
+    string, so a second ``log_event``/``record_loop_pass`` call on the same
+    ``state_path`` must not resolve again. This is a syscall-count contract,
+    not a timing assertion.
+    """
+    state_path = tmp_path / "state.json"
+    expected_key = str((tmp_path / "events.db").resolve())
+    # A unique tmp_path starts clean, but pop explicitly so the test stays
+    # true even if a shared spelling ever leaks in.
+    _instrumentation._resolved_db_keys.pop(str(state_path), None)
+
+    real_resolve = Path.resolve
+    resolve_calls = {"count": 0}
+
+    def counting_resolve(path: Path, *args: object, **kwargs: object) -> object:
+        resolve_calls["count"] += 1
+        return real_resolve(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "resolve", counting_resolve)
+
+    assert _db_key(state_path)
+    assert _db_key(state_path)
+    assert resolve_calls["count"] == 1
+
+    _instrumentation.close_db(state_path)
+    # close_db invalidates the memo alongside the connection, so the next
+    # lookup must re-resolve rather than return a stale key.
+    assert _db_key(state_path) == expected_key
+    assert resolve_calls["count"] == 2
 
 
 def test_log_event_with_correlation_id(tmp_path: Path) -> None:
