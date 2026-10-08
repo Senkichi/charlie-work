@@ -48,6 +48,17 @@ REUSE_ENV = "CI_FLEET_TEST_REUSE"
 # ``_config_safe`` and to collide with no real remote URL.
 _ORIGIN_URL_PLACEHOLDER = "https://git-template.invalid/origin.git"
 _ENV_EXTRA = frozenset({"HOME", "USERPROFILE", "XDG_CONFIG_HOME"})
+# The ``GIT_CONFIG_*`` env ``conftest._isolate_git_env`` injects into every
+# test so spawned ``git`` gets ``core.longpaths`` on deep Windows paths.
+# ``env_fingerprint()`` covers ``GIT_*`` variables, so a fixture that warms a
+# template outside function scope must apply this same mapping or its build
+# lands under a fingerprint the call phase never looks up (issue #2565).
+# Shared, not per-use literals: do not mutate the dict in place.
+GIT_CONFIG_ENV = {
+    "GIT_CONFIG_COUNT": "1",
+    "GIT_CONFIG_KEY_0": "core.longpaths",
+    "GIT_CONFIG_VALUE_0": "true",
+}
 # A test that points HOME/GIT_* somewhere unique would otherwise build one
 # template per test; past this many distinct environments, build fresh.
 _MAX_ENVS = 8

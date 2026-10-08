@@ -15,6 +15,10 @@ from datetime import (
 )
 from pathlib import Path
 from typing import Any
+
+import pytest
+
+import _git_templates
 from _fakes_github import FakeGitHub
 from _helpers import _init_git_repo
 from _review_fixtures import (
@@ -44,6 +48,93 @@ from charlie_work.workflow import (
     _detect_and_handle_stalled_reviews,
 )
 from _dispatch_fixtures import _stub_real_activity_probe_for_stalled_tests  # noqa: F401
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _warm_plain_git_template(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> _git_templates.EnvKey | None:
+    """HS-CW-4: charge the ``plain`` git-template cold build to module setup.
+
+    ``test_stalled_review_throttled_rolls_back_attempt_count`` and the pin
+    test's probe below are this module's ``_init_git_repo`` consumers (via
+    ``_git_templates.init_repo``), so when the module runs first in a
+    worker process -- as it does in the ledger's selected ``test`` runs --
+    whichever ``call`` phase ran first absorbed the template's
+    once-per-process five-process ``git`` boot (~0.5-1.2 s on this host)
+    instead of the ~40 ms copy; the ledger flagged the stalled-review test
+    at 3.2x baseline (issue #2565). Materializing one scratch plain repo
+    here keeps the
+    same transition in the ``setup`` phase column, where resource
+    acquisition belongs; when the template is already warm the warmup is
+    one additional ~40 ms copy.
+
+    ``TemplateRegistry`` keys templates by ``(shape, env_fingerprint())``,
+    and the fingerprint includes every ``GIT_*`` variable except
+    ``GIT_CEILING_DIRECTORIES``. The function-scoped autouse
+    ``_isolate_git_env`` (tests/conftest.py) sets the
+    ``GIT_CONFIG_COUNT/KEY_0/VALUE_0`` trio *after* this module fixture
+    runs, so a warm-up without the trio would build a template under a
+    fingerprint the call phase never looks up again. This fixture applies
+    ``_git_templates.GIT_CONFIG_ENV`` -- the same mapping conftest reads,
+    so the two cannot drift -- through a ``pytest.MonkeyPatch`` context
+    before building, then returns the fingerprint it warmed under so
+    ``test_plain_git_template_warmed_by_module_setup`` can pin it against
+    the call-phase environment directly. The trio is NOT excluded from
+    ``env_fingerprint()`` instead, because a future test could set a
+    config that changes builder output; the local env match is provably
+    safe. Under ``CI_FLEET_TEST_REUSE=off`` there is no registry to warm
+    and the pin test skips itself, so the fixture returns ``None``
+    without spending the build.
+    """
+    if not _git_templates.reuse_enabled():
+        return None
+    with pytest.MonkeyPatch.context() as mp:
+        for key, value in _git_templates.GIT_CONFIG_ENV.items():
+            mp.setenv(key, value)
+        _init_git_repo(tmp_path_factory.mktemp("plain-template-warmup") / "repo")
+        return _git_templates.env_fingerprint()
+
+
+@pytest.mark.skipif(
+    not _git_templates.reuse_enabled(),
+    reason="CI_FLEET_TEST_REUSE=off forces the fresh path; there is no template to pin",
+)
+def test_plain_git_template_warmed_by_module_setup(
+    _warm_plain_git_template: _git_templates.EnvKey | None, tmp_path: Path
+) -> None:
+    """Pin the module warm-up to the fingerprint the call phase looks up.
+
+    Regression for the issue #2565 rework: the fixture's first version ran
+    ``_init_git_repo`` at module setup without the ``GIT_CONFIG_*`` trio
+    that ``conftest._isolate_git_env`` injects per test, so the template
+    was keyed under an ``env_fingerprint()`` the call phase never
+    reproduces and the cold ``git`` boot landed in the flagged test's
+    call phase anyway. The fixture returns the fingerprint it warmed
+    under; asserting it equals this test's own call-phase fingerprint
+    fails on any drift between the two environments regardless of what
+    other modules warmed in this worker. The probe below then drives the
+    real consumer path and proves it copied the warmed template:
+    ``materialized["plain"]`` must increment while the registry's key set
+    stays fixed -- a cold build would add a ``("plain", env)`` key.
+    """
+    warmed_env = _warm_plain_git_template
+    call_env = _git_templates.env_fingerprint()
+    assert warmed_env == call_env, (
+        "module warm-up ran under a different env fingerprint than the call "
+        "phase; its template can never be looked up"
+    )
+    registry = _git_templates._REGISTRY
+    assert registry.lookup("plain") is not None, (
+        "no plain template under the call-phase fingerprint; the warm-up took the fresh path"
+    )
+    keys_before = set(registry._templates)
+    copies_before = registry.materialized["plain"]
+    _init_git_repo(tmp_path / "probe")
+    assert registry.materialized["plain"] == copies_before + 1
+    assert set(registry._templates) == keys_before, (
+        "the call phase built a new plain template instead of copying the warmed one"
+    )
 
 
 def test_stale_claim_recovery_skipped_logs_when_prompt_path_missing_from_state(
@@ -468,6 +559,17 @@ def test_stalled_review_throttled_rolls_back_attempt_count(monkeypatch, tmp_path
         save_state(app.paths.state_file, state)
 
     monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: False)
+    # HS-CW-7 (issue #2565): the sweep's checkout teardown runs a real
+    # ``git worktree list`` spawn (and would run ``git worktree remove``
+    # against a registered checkout) per reap. This test has no review
+    # checkout at all, so the teardown is a pure host-bound spawn cost paid
+    # inside the call phase; its behavior is owned by
+    # ``tests/test_review_checkout_reap.py``. Stub it the way #2519 stubbed
+    # the no-op-rework cap test's git probes.
+    monkeypatch.setattr(
+        "charlie_work.stalled_review_reap.remove_review_checkout",
+        lambda *_a, **_k: True,
+    )
 
     stalled = _detect_and_handle_stalled_reviews(
         reviews_dir,
