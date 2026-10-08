@@ -368,6 +368,9 @@ def gather_checks(app: Any, pr_number: int) -> ChecksRead:
     else:
         # Issue #1383: shared data-boundary enrichment.
         enriched = app._enrich_checks_infra_blocked(checks, required)
+        # Issue #2540: resolve run ids for .../runs/<id>-linked required
+        # checks so the merge lane's infra-rerun classification sees them.
+        enriched = app._enrich_checks_run_ids(enriched, required)
         summary = summarize_checks(enriched, required)
     diff = app.gh.pr_diff(pr_number)
     warnings = check_operator_containment(app.repo_root, diff, pr_number)
