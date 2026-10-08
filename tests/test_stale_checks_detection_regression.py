@@ -62,7 +62,7 @@ from charlie_work.paths import runtime_paths
 from charlie_work.workflow import OrchestratorApp
 
 from _fakes_github import FakeGitHub
-from _src_ast import parsed, source_files
+from _src_ast import parsed, source_files, source_text
 
 _SRC_ROOT = Path(__file__).resolve().parent.parent / "src" / "charlie_work"
 
@@ -328,9 +328,23 @@ def test_workflow_runs_for_head_call_sites_are_the_registered_ones() -> None:
     ``self.gh.workflow_runs_for_head(head_sha)`` inside
     ``_attempt_stale_checks_retrigger`` made this test fail (3 call sites,
     the third unregistered); removed after confirming the failure.
+
+    Issue #2598: per-file work is gated on a ``workflow_runs_for_head``
+    substring in the cached source text -- a parse + parent-map + walk for
+    every file under ``src/`` cost ~3s when only a handful of files can
+    contain a matching call site. The substring check rejects, never
+    accepts; the AST assertions below are unchanged.
     """
     call_sites: list[tuple[str, str | None]] = []
     for py_file in source_files(_SRC_ROOT):
+        # Necessary-condition rejection on the cached source text, NOT the
+        # assertion itself: an ``x.workflow_runs_for_head(...)`` Call requires
+        # the attribute's literal identifier in the file, so a file without it
+        # cannot contain a matching call site. The AST walk below still decides
+        # membership -- this only skips the parse + parent-map + walk for the
+        # overwhelming majority of src/ files that never mention the name.
+        if "workflow_runs_for_head" not in source_text(py_file):
+            continue
         tree = parsed(py_file)
         parents = _build_parent_map(tree)
         for node in ast.walk(tree):
