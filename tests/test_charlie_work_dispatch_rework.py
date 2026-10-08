@@ -640,11 +640,21 @@ def test_dispatch_rework_stall_probe_follows_notify_enabled(
     from charlie_work.adapters import SessionDispatchResult
     from charlie_work.config import NotifyConfig
 
+    # The probe lives in charlie_work.attention_digest now (issue #2600 rework
+    # extraction); the bare-name call inside _detect_stalled_sessions_for_notify
+    # resolves through that module's globals, so the patch target moves with it
+    # -- the same mechanical repoint the #1283 Phase-A lineage documents. The
+    # pre-extraction lane reached the same function through the workflow facade,
+    # so the workflow name is patched too: either binding regressing back to an
+    # unconditional probe is caught on the notify_enabled=False arm.
     probe_calls: list[int] = []
-    monkeypatch.setattr(
-        "charlie_work.workflow._detect_stalled_sessions",
-        lambda _sessions_dir, _config: probe_calls.append(1) or [],
-    )
+
+    def _record_probe(_sessions_dir, _config):
+        probe_calls.append(1)
+        return []
+
+    monkeypatch.setattr("charlie_work.attention_digest._detect_stalled_sessions", _record_probe)
+    monkeypatch.setattr("charlie_work.workflow._detect_stalled_sessions", _record_probe)
 
     config = OrchestratorConfig(
         worker=WorkerRoleConfig(harness="command"),
@@ -673,3 +683,21 @@ def test_dispatch_rework_stall_probe_follows_notify_enabled(
 
     assert result.ok is True
     assert len(probe_calls) == (1 if notify_enabled else 0)
+
+
+def test_attention_digest_names_reexported_by_identity() -> None:
+    """The attention-digest pipeline moved to ``charlie_work.attention_digest``
+    (issue #2600): every name must resolve through the ``charlie_work.workflow``
+    facade to the SAME object -- a re-declared copy, not an import, is the
+    failure mode the facade pattern exists to catch.
+    """
+    import charlie_work.attention_digest as attention_digest
+    import charlie_work.workflow as workflow
+
+    for name in (
+        "_build_attention_digest",
+        "_detect_stalled_sessions_for_notify",
+        "_emit_attention_digest",
+        "_emit_stalled_session_digest",
+    ):
+        assert getattr(workflow, name) is getattr(attention_digest, name), name
