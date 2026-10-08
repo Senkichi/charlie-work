@@ -347,13 +347,14 @@ def _isolate_git_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     long"); injected via the ``GIT_CONFIG_*`` env mechanism so it also
     covers ``git`` spawned by production code, not just tests' own calls.
     """
+    from _git_templates import GIT_CONFIG_ENV
+
     monkeypatch.setenv(
         "GIT_CEILING_DIRECTORIES",
         os.pathsep.join([str(tmp_path.parent), _tempfile_module.gettempdir()]),
     )
-    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
-    monkeypatch.setenv("GIT_CONFIG_KEY_0", "core.longpaths")
-    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "true")
+    for key, value in GIT_CONFIG_ENV.items():
+        monkeypatch.setenv(key, value)
 
 
 @pytest.fixture(autouse=True)

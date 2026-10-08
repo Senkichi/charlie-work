@@ -18,6 +18,7 @@ from typing import Any
 
 import pytest
 
+import _git_templates
 from _fakes_github import FakeGitHub
 from _helpers import _init_git_repo
 from _review_fixtures import (
@@ -50,7 +51,9 @@ from _dispatch_fixtures import _stub_real_activity_probe_for_stalled_tests  # no
 
 
 @pytest.fixture(scope="module", autouse=True)
-def _warm_plain_git_template(tmp_path_factory: pytest.TempPathFactory) -> None:
+def _warm_plain_git_template(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> _git_templates.EnvKey | None:
     """HS-CW-4: charge the ``plain`` git-template cold build to module setup.
 
     ``test_stalled_review_throttled_rolls_back_attempt_count`` is this
@@ -72,41 +75,65 @@ def _warm_plain_git_template(tmp_path_factory: pytest.TempPathFactory) -> None:
     ``GIT_CONFIG_COUNT/KEY_0/VALUE_0`` trio *after* this module fixture
     runs, so a warm-up without the trio would build a template under a
     fingerprint the call phase never looks up again. This fixture applies
-    the same trio (the values conftest injects are constant) through a
-    ``pytest.MonkeyPatch`` context before building, so the warm-up's
-    fingerprint matches the test's own environment and the call phase
-    reuses the template. The trio is NOT excluded from
+    ``_git_templates.GIT_CONFIG_ENV`` -- the same mapping conftest reads,
+    so the two cannot drift -- through a ``pytest.MonkeyPatch`` context
+    before building, then returns the fingerprint it warmed under so
+    ``test_plain_git_template_warmed_by_module_setup`` can pin it against
+    the call-phase environment directly. The trio is NOT excluded from
     ``env_fingerprint()`` instead, because a future test could set a
     config that changes builder output; the local env match is provably
-    safe. The call-phase reuse is pinned by
-    ``test_plain_git_template_warmed_by_module_setup`` below.
+    safe. Under ``CI_FLEET_TEST_REUSE=off`` there is no registry to warm
+    and the pin test skips itself, so the fixture returns ``None``
+    without spending the build.
     """
+    if not _git_templates.reuse_enabled():
+        return None
     with pytest.MonkeyPatch.context() as mp:
-        mp.setenv("GIT_CONFIG_COUNT", "1")
-        mp.setenv("GIT_CONFIG_KEY_0", "core.longpaths")
-        mp.setenv("GIT_CONFIG_VALUE_0", "true")
+        for key, value in _git_templates.GIT_CONFIG_ENV.items():
+            mp.setenv(key, value)
         _init_git_repo(tmp_path_factory.mktemp("plain-template-warmup") / "repo")
+        return _git_templates.env_fingerprint()
 
 
-def test_plain_git_template_warmed_by_module_setup() -> None:
-    """Pin the module warm-up so the flagged test never cold-builds ``plain``.
+@pytest.mark.skipif(
+    not _git_templates.reuse_enabled(),
+    reason="CI_FLEET_TEST_REUSE=off forces the fresh path; there is no template to pin",
+)
+def test_plain_git_template_warmed_by_module_setup(
+    _warm_plain_git_template: _git_templates.EnvKey | None, tmp_path: Path
+) -> None:
+    """Pin the module warm-up to the fingerprint the call phase looks up.
 
-    Regression for issue #2565 rework: the previous untested fixture built
-    the template under a *different* ``env_fingerprint`` than the call
-    phase (the conftest ``GIT_CONFIG_COUNT/KEY_0/VALUE_0`` trio is absent
-    at module setup), so the lookup missed and the cold ``git`` boot
-    landed in the test's call phase anyway. A registry lookup hit under
-    THIS test's own environment (with the trio applied by
-    ``_isolate_git_env``) plus a materialized copy proves the warm-up's
-    template is actually reused; without the warm-up hooking the same
-    environment, ``lookup`` returns ``None`` or the counter catches the
-    cold build instead.
+    Regression for the issue #2565 rework: the fixture's first version ran
+    ``_init_git_repo`` at module setup without the ``GIT_CONFIG_*`` trio
+    that ``conftest._isolate_git_env`` injects per test, so the template
+    was keyed under an ``env_fingerprint()`` the call phase never
+    reproduces and the cold ``git`` boot landed in the flagged test's
+    call phase anyway. The fixture returns the fingerprint it warmed
+    under; asserting it equals this test's own call-phase fingerprint
+    fails on any drift between the two environments regardless of what
+    other modules warmed in this worker. The probe below then drives the
+    real consumer path and proves it copied the warmed template:
+    ``materialized["plain"]`` must increment while the registry's key set
+    stays fixed -- a cold build would add a ``("plain", env)`` key.
     """
-    from _git_templates import _REGISTRY
-
-    template = _REGISTRY.lookup("plain")
-    assert template is not None, "module warm-up missed the call-phase env fingerprint"
-    assert _REGISTRY.materialized["plain"] >= 1, "no plain template was copied yet"
+    warmed_env = _warm_plain_git_template
+    call_env = _git_templates.env_fingerprint()
+    assert warmed_env == call_env, (
+        "module warm-up ran under a different env fingerprint than the call "
+        "phase; its template can never be looked up"
+    )
+    registry = _git_templates._REGISTRY
+    assert registry.lookup("plain") is not None, (
+        "no plain template under the call-phase fingerprint; the warm-up took the fresh path"
+    )
+    keys_before = set(registry._templates)
+    copies_before = registry.materialized["plain"]
+    _init_git_repo(tmp_path / "probe")
+    assert registry.materialized["plain"] == copies_before + 1
+    assert set(registry._templates) == keys_before, (
+        "the call phase built a new plain template instead of copying the warmed one"
+    )
 
 
 def test_stale_claim_recovery_skipped_logs_when_prompt_path_missing_from_state(
