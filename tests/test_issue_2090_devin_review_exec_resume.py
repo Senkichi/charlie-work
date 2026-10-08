@@ -10,6 +10,7 @@ source). State, events, sidecars, caps and the reaper itself are real.
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -87,6 +88,19 @@ class _Rig:
         monkeypatch.setattr(devin_review_resume, "write_worktree_marker", lambda *a, **k: None)
         monkeypatch.setattr("charlie_work.worker_fate.is_alive", alive)
         monkeypatch.setattr("charlie_work.process_utils.is_pid_alive", alive)
+
+        # Issue #2643: every miss-path reap ends in _wf.remove_review_checkout,
+        # whose git worktree list/remove/prune spawns (4 against a plain dir)
+        # are real host processes priced by runner load -- the drift the ledger
+        # flagged. The seeded checkout is never a registered worktree, so the
+        # real function's only observable effect here is the directory's
+        # removal; do that directly. stalled_review_reap binds the function on
+        # its own namespace and is not covered -- its tests pay the real cost.
+        def _drop_checkout(repo_root: Any, pr_number: int, *, reviews_dir: Path) -> bool:
+            shutil.rmtree(reviews_dir / f"pr-{pr_number}", ignore_errors=True)
+            return True
+
+        monkeypatch.setattr("charlie_work.workflow.remove_review_checkout", _drop_checkout)
 
     def seed_dead_review(self, log_text: str = REJECTION, *, pid: int = 40_001) -> None:
         checkout = self.reviews_dir / f"pr-{PR}"
