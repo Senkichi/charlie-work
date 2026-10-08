@@ -549,7 +549,13 @@ class LocalFileGitHub:
     def actions_job(self, job_id: int) -> dict[str, Any] | None:
         return None
 
+    def check_run(self, check_run_id: int) -> dict[str, Any] | None:
+        return None
+
     def workflow_runs_for_head(self, head_sha: str) -> list[dict[str, Any]] | None:
+        return None
+
+    def workflow_runs_for_check_suite(self, check_suite_id: int) -> list[dict[str, Any]] | None:
         return None
 
     def check_graphql_rate_limit(self, threshold: int = 0) -> tuple[bool, int, int | None]:
