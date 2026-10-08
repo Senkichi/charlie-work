@@ -56,14 +56,15 @@ def _warm_plain_git_template(
 ) -> _git_templates.EnvKey | None:
     """HS-CW-4: charge the ``plain`` git-template cold build to module setup.
 
-    ``test_stalled_review_throttled_rolls_back_attempt_count`` is this
-    module's only consumer of ``_init_git_repo`` (via
+    ``test_stalled_review_throttled_rolls_back_attempt_count`` and the pin
+    test's probe below are this module's ``_init_git_repo`` consumers (via
     ``_git_templates.init_repo``), so when the module runs first in a
     worker process -- as it does in the ledger's selected ``test`` runs --
-    that test's ``call`` phase absorbed the template's once-per-process
-    five-process ``git`` boot (~0.5-1.2 s on this host) instead of the
-    ~40 ms copy, which is what the ledger flagged at 3.2x baseline
-    (issue #2565). Materializing one scratch plain repo here keeps the
+    whichever ``call`` phase ran first absorbed the template's
+    once-per-process five-process ``git`` boot (~0.5-1.2 s on this host)
+    instead of the ~40 ms copy; the ledger flagged the stalled-review test
+    at 3.2x baseline (issue #2565). Materializing one scratch plain repo
+    here keeps the
     same transition in the ``setup`` phase column, where resource
     acquisition belongs; when the template is already warm the warmup is
     one additional ~40 ms copy.
