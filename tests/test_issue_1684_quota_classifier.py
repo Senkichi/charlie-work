@@ -20,7 +20,6 @@ period-agnostic prose markers in ``RuntimeConfig.quota_error_markers``.
 from __future__ import annotations
 
 import json
-import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -31,6 +30,7 @@ from charlie_work import claude_code, devin_shell, worker_fate
 from charlie_work.config import (
     ConfigError,
     OrchestratorConfig,
+    PostMortemConfig,
     ReviewDispatchConfig,
     build_config_from_data,
 )
@@ -53,6 +53,7 @@ from charlie_work.write_gate import WriteGate
 from _fakes_github import FakeGitHub
 from _helpers import _init_git_repo
 from _review_fixtures import _dispatch_reviews_app, _write_review_packet
+from _worktree_fixtures import _git, _init_bare_remote_and_clone
 
 # The exact message observed live 2026-09-17 on PR #1595 (issue #1684).
 _WEEKLY_QUOTA_LOG = (
@@ -69,28 +70,6 @@ _RESOURCE_EXHAUSTED_TRAILER = '{"cognition.ai/errorKind": "resource_exhausted"}'
 
 def _wg(state_file: Path, *, dry_run: bool = False) -> WriteGate:
     return WriteGate(dry_run=dry_run, state_path=state_file, repo="charlie-work")
-
-
-def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)
-
-
-def _init_bare_remote_and_clone(tmp_path: Path) -> tuple[Path, Path]:
-    remote = tmp_path / "remote"
-    remote.mkdir(parents=True, exist_ok=True)
-    _git(remote, "init", "--bare", "--initial-branch=main")
-    clone = tmp_path / "clone"
-    clone.mkdir(parents=True, exist_ok=True)
-    _git(clone, "init", "--initial-branch=main")
-    _git(clone, "config", "user.email", "test@example.test")
-    _git(clone, "config", "user.name", "Test User")
-    _git(clone, "config", "commit.gpgSign", "false")
-    _git(clone, "remote", "add", "origin", str(remote))
-    (clone / "README.md").write_text("hello\n", encoding="utf-8")
-    _git(clone, "add", "README.md")
-    _git(clone, "commit", "-m", "initial commit")
-    _git(clone, "push", "-u", "origin", "main")
-    return remote, clone
 
 
 _DEFAULT_MARKERS = OrchestratorConfig().runtime.quota_error_markers
@@ -523,12 +502,25 @@ def _write_dead_devin_worker(
     return sidecar_path
 
 
-def _classify_fixture(tmp_path: Path, issue_number: int, log_text: str):
+def _classify_fixture(
+    tmp_path: Path, issue_number: int, log_text: str
+) -> tuple[Path, Path, Path, FakeGitHub, OrchestratorConfig, Path]:
     """Dead devin worker + empty worktree + active-label issue, no open PRs.
 
     Returns (repo_root, sessions_dir, state_file, gh, config, sidecar_path).
     """
     remote, repo_root = _init_bare_remote_and_clone(tmp_path / "repo")
+    # A real ``git clone`` writes refs/remotes/origin/HEAD; this init +
+    # remote-add clone never got one, so ``inspect_worktree_state`` would pay
+    # the ``remote set-head --auto`` heal (two extra spawns) to auto-resolve
+    # the "" base_ref. Stamp the symref once here so the clone carries the
+    # shape a real clone has (same stamp as the #2624 fixture).
+    _git(
+        repo_root,
+        "symbolic-ref",
+        "refs/remotes/origin/HEAD",
+        "refs/remotes/origin/main",
+    )
     branch = f"agent/issue-{issue_number}"
     info = create_worktree(repo_root, branch, base_ref="origin/main")
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
@@ -537,7 +529,15 @@ def _classify_fixture(tmp_path: Path, issue_number: int, log_text: str):
     )
     state_file = tmp_path / "state.json"
     state_file.write_text(json.dumps({"events": []}), encoding="utf-8")
-    config = OrchestratorConfig()
+    config = OrchestratorConfig(
+        # Keep ``post_mortem.classify_and_record``'s sessions.db read off the
+        # real host store (%APPDATA%\devin\cli\sessions.db): a dead devin
+        # session still runs the extraction, but against a path that cannot
+        # exist, so it degrades to the fast "not found" branch instead of
+        # scanning a host-sized DB -- the host-load drift the ledger tracked
+        # as this test's regression (issue #2609; the #2602/#2619 convention).
+        post_mortem=PostMortemConfig(db_path=str(tmp_path / "missing-sessions.db")),
+    )
     gh = FakeGitHub(repo_root=repo_root)
     gh.issues = [
         {
@@ -553,7 +553,36 @@ def _classify_fixture(tmp_path: Path, issue_number: int, log_text: str):
     return repo_root, sessions_dir, state_file, gh, config, sidecar_path
 
 
-def test_dead_worker_quota_death_does_not_burn_redispatch_cap(tmp_path: Path) -> None:
+@pytest.fixture
+def _quota_dead_worker(
+    tmp_path: Path,
+) -> tuple[Path, Path, Path, FakeGitHub, OrchestratorConfig, Path]:
+    """Resource acquisition for the quota-death reap test (issue #2609).
+
+    Ledger-regress fix: the bare-remote/clone pair, the worktree, the
+    dead-session sidecar, the state.json seed and the fake GitHub world are
+    *acquisition*, not the property under test -- the measured ``call`` phase
+    was paying for ~12 git subprocess spawns whose cost is set by the shared
+    runner, not by this repo's code (no code at the attributed SHA touched
+    this path). Charging the drive to setup follows the #2515/#2587/#2624
+    precedent; the test body keeps the real
+    ``_classify_dead_sessions_and_update_throttle_state`` call and every
+    assertion verbatim.
+    """
+    return _classify_fixture(tmp_path, 1684, _WEEKLY_QUOTA_LOG)
+
+
+@pytest.fixture
+def _non_throttle_dead_worker(
+    tmp_path: Path,
+) -> tuple[Path, Path, Path, FakeGitHub, OrchestratorConfig, Path]:
+    """Same acquisition shape for the non-throttle control test (issue #2609)."""
+    return _classify_fixture(tmp_path, 1685, "Error: worker crashed unexpectedly\n")
+
+
+def test_dead_worker_quota_death_does_not_burn_redispatch_cap(
+    _quota_dead_worker: tuple[Path, Path, Path, FakeGitHub, OrchestratorConfig, Path],
+) -> None:
     """A zero-turn worker death on ``resource_exhausted`` is a global provider
     condition: the fleet-wide cooldown is armed and the issue relabels to
     ready, but the death must NOT consume the issue's redispatch cap."""
@@ -564,7 +593,7 @@ def test_dead_worker_quota_death_does_not_burn_redispatch_cap(tmp_path: Path) ->
         gh,
         config,
         sidecar_path,
-    ) = _classify_fixture(tmp_path, 1684, _WEEKLY_QUOTA_LOG)
+    ) = _quota_dead_worker
 
     reaped = _classify_dead_sessions_and_update_throttle_state(
         sessions_dir, state_file, gh, config, write_gate=_wg(state_file)
@@ -586,7 +615,9 @@ def test_dead_worker_quota_death_does_not_burn_redispatch_cap(tmp_path: Path) ->
     assert entry.get("status") != "escalated"
 
 
-def test_dead_worker_non_throttle_death_counts_redispatch(tmp_path: Path) -> None:
+def test_dead_worker_non_throttle_death_counts_redispatch(
+    _non_throttle_dead_worker: tuple[Path, Path, Path, FakeGitHub, OrchestratorConfig, Path],
+) -> None:
     """Control for the cap gate: an ordinary dead worker still counts one
     redispatch entry, proving the gate is specific to provider-throttle
     kinds."""
@@ -597,7 +628,7 @@ def test_dead_worker_non_throttle_death_counts_redispatch(tmp_path: Path) -> Non
         gh,
         config,
         _sidecar_path,
-    ) = _classify_fixture(tmp_path, 1685, "Error: worker crashed unexpectedly\n")
+    ) = _non_throttle_dead_worker
 
     _classify_dead_sessions_and_update_throttle_state(
         sessions_dir, state_file, gh, config, write_gate=_wg(state_file)
