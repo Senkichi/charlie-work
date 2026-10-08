@@ -13,7 +13,13 @@ from typing import Any
 import pytest
 
 from _sessions_db_fixtures import make_sessions_db
-from _worktree_fixtures import _FakeGH, _clone_repo, _git, _init_repo
+from _worktree_fixtures import (
+    _FakeGH,
+    _clone_repo,
+    _git,
+    _init_repo,
+    _seed_staged_addition_bubble,
+)
 from charlie_work.config import (
     DevinConfig,
     OrchestratorConfig,
@@ -915,22 +921,7 @@ def test_modified_paths_overwritten_by_ref_excludes_staged_addition(
     """
     repo_root = tmp_path / "repo"
     _init_repo(repo_root)
-
-    (repo_root / "tracked.txt").write_text("ancestor v0\n", encoding="utf-8")
-    _git(repo_root, "add", "tracked.txt")
-    _git(repo_root, "commit", "-m", "add ancestor file")
-
-    _git(repo_root, "checkout", "-b", "feature")
-
-    _git(repo_root, "checkout", "main")
-    (repo_root / "tracked.txt").write_text("main committed v1\n", encoding="utf-8")
-    _git(repo_root, "add", "tracked.txt")
-    _git(repo_root, "commit", "-m", "base changes tracked file")
-    (repo_root / "new_file.txt").write_text("base version\n", encoding="utf-8")
-    _git(repo_root, "add", "new_file.txt")
-    _git(repo_root, "commit", "-m", "base adds new file")
-
-    _git(repo_root, "checkout", "feature")
+    _seed_staged_addition_bubble(repo_root)
     (repo_root / "tracked.txt").write_text("locally edited\n", encoding="utf-8")
     # A staged ADDITION: in the index, not in HEAD. Same path name as
     # something the base independently added, so an unfiltered diff would
