@@ -17,6 +17,7 @@ import pytest
 
 from _janitor_fixtures import _config, _green_checks, _green_pr, _init_repo
 from _worktree_fixtures import _git, _init_bare_remote_and_clone
+from _worktree_fixtures import _init_repo as _init_repo_templated
 
 from charlie_work.janitor import run_janitor
 
@@ -339,55 +340,43 @@ def test_no_op_rework_real_commit_clears_gate(_real_commit_repo: _AdvancedBranch
     assert not any("git fetch/rev-list failed" in w for w in verdict.warnings)
 
 
-def test_no_op_rework_git_failure_degrades_to_warning(tmp_path: Path) -> None:
+@pytest.fixture
+def _no_origin_commit_repo(tmp_path: Path) -> _AdvancedBranchRepo:
+    """One-commit repo with no ``origin``; ``agent/issue-123-test`` advanced by a real commit.
+
+    Same ``_AdvancedBranchRepo`` shape as ``_real_commit_repo``, but the repo
+    carries no remote, so the gate's ``git fetch origin`` fails -- the
+    degrade-to-warning property under test. Every git spawn of repo
+    acquisition lives here so the measured ``call`` phase holds only
+    ``run_janitor`` -- the gate's own failing fetch probe -- plus
+    assertions (issue #2664). The one-commit repo materializes from the
+    per-process ``plain`` git template rather than the ~10 inline spawns
+    the pre-#2664 body paid.
+    """
+    repo = tmp_path / "repo"
+    _init_repo_templated(repo)
+    reviewed_sha = _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    # Create agent branch and advance it with a real commit (no push -- no origin)
+    _git(repo, "checkout", "-b", "agent/issue-123-test")
+    (repo / "test2.txt").write_text("some work", encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-m", "some work")
+    head_sha = _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    return _AdvancedBranchRepo(repo=repo, reviewed_sha=reviewed_sha, head_sha=head_sha)
+
+
+def test_no_op_rework_git_failure_degrades_to_warning(
+    _no_origin_commit_repo: _AdvancedBranchRepo,
+) -> None:
     """Git failures in criterion-2 detection degrade to warning, not failure."""
-    # Set up a git repo WITHOUT origin (so git fetch will fail)
-    _init_repo(tmp_path)
-    # Create initial commit
-    (tmp_path / "test.txt").write_text("initial content")
-    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "commit", "-m", "initial"],
-        cwd=tmp_path,
-        check=True,
-        capture_output=True,
-    )
-    initial_sha = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=tmp_path,
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-
-    # Create a branch and advance it (no origin, so fetch will fail)
-    subprocess.run(
-        ["git", "checkout", "-b", "agent/issue-123-test"],
-        cwd=tmp_path,
-        check=True,
-        capture_output=True,
-    )
-    (tmp_path / "test2.txt").write_text("some work")
-    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "commit", "-m", "some work"],
-        cwd=tmp_path,
-        check=True,
-        capture_output=True,
-    )
-    advanced_sha = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=tmp_path,
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-
-    # Test with a PR that has advanced but no origin (git fetch will fail)
-    pr = _green_pr(headRefOid=advanced_sha, headRefName="agent/issue-123-test")
+    # Test with a PR that has advanced but whose repo has no origin
+    # (git fetch will fail).
+    pr = _green_pr(headRefOid=_no_origin_commit_repo.head_sha, headRefName="agent/issue-123-test")
     pr_state = {
         "decision": "request_changes",
-        "reviewed_head_sha": initial_sha,
+        "reviewed_head_sha": _no_origin_commit_repo.reviewed_sha,
     }
 
     verdict = run_janitor(
@@ -395,7 +384,7 @@ def test_no_op_rework_git_failure_degrades_to_warning(tmp_path: Path) -> None:
         _green_checks(),
         _config(),
         pr_state=pr_state,
-        repo_root=tmp_path,
+        repo_root=_no_origin_commit_repo.repo,
         review_decision=pr_state,
     )
 
