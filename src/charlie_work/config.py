@@ -1760,6 +1760,10 @@ class WorkerRoleConfig:
     """
 
     harness: str = "manual"
+    # ``model`` is validated (``Typed``, ``NotNull``) at the top-level ``worker:`` section's
+    # ``FieldRules`` on ``OrchestratorConfig.worker``, not as field metadata here -- same
+    # reason as ``harness`` above: this class is reused for ``rescue.worker``/``rescue.reviewer``,
+    # whose nested ``worker:``/``reviewer:`` sections are parsed with no such rule (issue #2117).
     model: str = ""
     # Issue #2086: role chain, see role_chain.py. ``Verbatim`` because rescue.worker /
     # rescue.reviewer reuse this class and never parsed ``fallbacks`` (main stores the raw
@@ -1787,7 +1791,11 @@ class ReviewerRoleConfig:
     """
 
     harness: Annotated[str, Typed, NotNull, OneOf(*sorted(REVIEWER_HARNESSES))] = "claude-code"
-    model: str = _DEFAULT_CLAUDE_MODEL
+    # Issue #2117: a non-string (or null) model is a FieldError, not a silent coercion into
+    # ``role_chain.model_family``, which would otherwise crash on it with an AttributeError.
+    # Safe as a class-level marker here (unlike ``WorkerRoleConfig.model``): no reuse site
+    # parses a ``ReviewerRoleConfig`` with looser expectations.
+    model: Annotated[str, Typed, NotNull] = _DEFAULT_CLAUDE_MODEL
     effort: Annotated[str, Typed, NotNull] = ""
     effort_experiment_fraction: Annotated[float, Typed, NotNull, InRange(0.0, 1.0)] = 0.0
     effort_experiment_salt: Annotated[str, Typed, NotNull] = ""
@@ -2515,12 +2523,14 @@ class OrchestratorConfig:
     rescue: RescueConfig = field(default_factory=RescueConfig)
     worker: Annotated[
         WorkerRoleConfig,
-        # Harness membership is enforced at the top-level worker only, not on
+        # Harness/model are enforced at the top-level worker only, not on
         # ``WorkerRoleConfig`` itself: the class is reused for rescue.worker/.reviewer,
         # and rescue.reviewer's documented default harness ("devin") is not a member of
-        # ``harnesses.WORKER_HARNESSES``.
+        # ``harnesses.WORKER_HARNESSES`` (and its nested model is parsed with no such
+        # rule -- issue #2117).
         FieldRules(
             harness=(Typed, NotNull, OneOf(*sorted(WORKER_HARNESSES))),
+            model=(Typed, NotNull),
             fallbacks=(NullIsDefault, role_entries(WORKER_HARNESSES, allow_effort=False)),
         ),
         Check(check_role_chain),
