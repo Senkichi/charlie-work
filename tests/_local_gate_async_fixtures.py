@@ -170,6 +170,25 @@ def _wait_pid_dead(pid: int, timeout_seconds: float = 15) -> None:
     raise AssertionError(f"pid {pid} still alive after {timeout_seconds}s")
 
 
+def _drop_claim(app: OrchestratorApp, pr_number: int) -> None:
+    """Lose the claim (supervisor restart / re-arm) while the result file stays."""
+    # Local import: ``local_merge_gate`` does ``import charlie_work.workflow``
+    # at module level, so it may only load after workflow is fully built.
+    from charlie_work.orchestration import local_merge_gate
+
+    # The result lands just before the runner exits; a still-live pid file would
+    # make the gate defer instead of launching.
+    _wait_pid_dead(
+        int(load_state_locked(app.paths.state_file)["prs"][str(pr_number)]["local_suite_pid"])
+    )
+    with state_lock(app.paths.state_file):
+        state = load_state(app.paths.state_file)
+        record = state["prs"][str(pr_number)]
+        for field in local_merge_gate.LOCAL_SUITE_CLAIM_FIELDS:
+            record.pop(field, None)
+        save_state(app.paths.state_file, state)
+
+
 def _kill_claimed_gate(app: OrchestratorApp, pr_number: int) -> int:
     """Kill the in-flight suite tree named by the record's claim; returns pid.
 
@@ -242,6 +261,35 @@ def _no_windows_child_enumeration(monkeypatch: pytest.MonkeyPatch) -> None:
     import charlie_work.process_utils as process_utils
 
     monkeypatch.setattr(process_utils, "_enumerate_child_pids", lambda _pid: [])
+
+
+@pytest.fixture(name="moved_base_gate")
+def _moved_base_gate(lane_repo: Path) -> Iterator[OrchestratorApp]:
+    """Completed-gate scaffold charged to setup: green suite, dropped claim, moved base.
+
+    The reuse keying under test (#2125) needs a *finished* green gate whose
+    base then moved; the real suite run (``_wait_for_result`` polls a detached
+    interpreter plus its suite child) and the ~11 git/process spawns of lane
+    acquisition drift with shared-runner load, none of it the property under
+    test -- the property is the *second* pass relaunching instead of reusing.
+    Paying it inside ``call`` is what the ledger flagged as a 2.1x regression
+    (#2662; same fix shape as #2642/#2624/#2634). The kill of the second,
+    in-flight suite lands in teardown -- a ``finally`` in the body would
+    count as ``call``. Requests the importing module's ``lane_repo`` fixture.
+    """
+    _init_repo(lane_repo)
+    issues_dir = lane_repo / "docs" / "issues"
+    head = _make_branch(lane_repo, "agent/issue-7-x", "a.py", "a = 1\n")
+    app = _lane_app(lane_repo, issues_dir)
+    _adopt_and_approve(app, issues_dir, 7, "agent/issue-7-x", head)
+    assert app._local_merge_approved()[0]["outcome"] == "suite_launched"
+    _wait_for_result(app, 7)
+    _drop_claim(app, 7)
+    _commit_file(lane_repo, "other.py", "x = 1\n", "another PR merged first")
+    yield app
+    # Tolerant of a cleared claim -- the kill is a no-op when the test
+    # escalated or the suite resolved on its own.
+    _kill_claimed_gate(app, 7)
 
 
 # Explicit fixture name (the ``_wt_scratch`` pattern): importing modules bring
