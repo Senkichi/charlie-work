@@ -86,6 +86,22 @@ def test_dashboard_js_wires_every_htmx_failure_event_and_success() -> None:
 _NODE = shutil.which("node")
 
 
+def _node_eval(script: str) -> subprocess.CompletedProcess[str]:
+    """``node -e`` once; on a first-spawn timeout, retry once under a longer budget.
+
+    A first-touch exec of node.exe on a hosted windows-latest runner can outlast
+    the normal budget (cold binary, Defender scan, shard CPU contention) -- the
+    30 s spawn timed out once in 383 CI-context executions (issue #2740). The
+    killed spawn leaves the OS and AV caches warm, so a single retry covers the
+    slow-exec tail. A second ``TimeoutExpired`` propagates: a node that still
+    cannot answer is a real failure, never something to skip.
+    """
+    try:
+        return subprocess.run([_NODE, "-e", script], capture_output=True, text=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        return subprocess.run([_NODE, "-e", script], capture_output=True, text=True, timeout=120)
+
+
 @pytest.fixture(scope="module")
 def _staleness_js_api() -> dict[str, object]:
     """The ``staleness.js`` API evaluated once under node, shared by the module.
@@ -109,9 +125,35 @@ def _staleness_js_api() -> dict[str, object]:
         " msg: s.message({since: 0, unreachable: true}, '14:26:12')};"
         "process.stdout.write(JSON.stringify(out));"
     )
-    run = subprocess.run([_NODE, "-e", script], capture_output=True, text=True, timeout=30)
+    run = _node_eval(script)
     assert run.returncode == 0, run.stderr
     return json.loads(run.stdout)
+
+
+def test_node_eval_retries_once_on_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A first-spawn timeout earns one retry under a longer budget (issue #2740)."""
+    timeouts: list[float] = []
+
+    def fake_run(cmd: list[object], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        timeouts.append(kwargs["timeout"])
+        if len(timeouts) == 1:
+            raise subprocess.TimeoutExpired(cmd=cmd, timeout=kwargs["timeout"])
+        return subprocess.CompletedProcess(cmd, 0, stdout="{}", stderr="")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    run = _node_eval("script")
+    assert run.returncode == 0 and len(timeouts) == 2 and timeouts[1] > timeouts[0]
+
+
+def test_node_eval_second_timeout_propagates(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A spawn that times out twice is a real setup error, not a silent skip."""
+
+    def always_timeout(cmd: list[object], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        raise subprocess.TimeoutExpired(cmd=cmd, timeout=kwargs["timeout"])
+
+    monkeypatch.setattr("subprocess.run", always_timeout)
+    with pytest.raises(subprocess.TimeoutExpired):
+        _node_eval("script")
 
 
 @pytest.mark.skipif(_NODE is None, reason="node not on PATH")
