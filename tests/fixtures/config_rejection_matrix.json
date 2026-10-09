@@ -1691,6 +1691,10 @@
 "auto_merge.mergequeue_skip_line_label": [
 "auto_merge",
 "mergequeue_skip_line_label"
+],
+"auto_merge.mergequeue_requeue_cap": [
+"auto_merge",
+"mergequeue_requeue_cap"
 ]
 },
 "seeds": {
@@ -2158,7 +2162,8 @@
 "dashboard.rollup_interval_seconds": {},
 "labels.model_tier_prefix": {},
 "labels.priority_prefix": {},
-"auto_merge.mergequeue_skip_line_label": {}
+"auto_merge.mergequeue_skip_line_label": {},
+"auto_merge.mergequeue_requeue_cap": {}
 },
 "cells": {
 "labels": [
@@ -19705,6 +19710,50 @@
 "A31ee",
 "A8a6c",
 "A9d1d",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R"
+],
+"auto_merge.mergequeue_requeue_cap": [
+"Aad8f",
+"R",
+"R",
+"Aa0bf",
+"A8270",
+"R",
+"A5ecd",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
 "R",
 "R",
 "R",

@@ -28,10 +28,8 @@ from .apply_stages import (
     route_cross_pr_revert,
     sync_branch,
 )
-from .decide import (
-    decide_merge,
-    merge_hold_read_needed,
-)
+from .decide import decide_merge
+from .mergequeue import merge_hold_read_needed
 from .gather import (
     BranchRead,
     Opening,
@@ -286,6 +284,7 @@ def _readiness_and_merge(
         pr_number,
         issue_number,
         should_merge=should_merge,
+        live_head_sha=pr.get("headRefOid"),
     )
     if merge_hold_read_needed(readiness, holds):
         merge_hold, unavailable = gather_merge_hold(app, pr, issue_number)

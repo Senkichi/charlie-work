@@ -1219,6 +1219,15 @@ class AutoMergeConfig:
     # ``mergequeue_label`` is set -- it is a definitive "Aviator will not merge
     # this" signal, not a heuristic, so it does not need a time floor.
     mergequeue_wedge_hours: Annotated[float, Typed, NonNeg] = 24.0
+    # Issue #2743: bound on mergequeue label re-adds after Aviator reverts the
+    # queue at the SAME PR head (the #2649 loop: every queue-branch failure
+    # strips the label, the next pass re-adds it, and queue CI burns another
+    # run). After this many same-head reverts the pass refuses the re-add,
+    # routes the PR to rework with the queue-branch failure as evidence, and
+    # emits ``mergequeue_requeue_capped``; reconcile's stale-blocked lane
+    # honours the same bound so it cannot re-add behind the cap's back. A new
+    # head SHA gets a fresh budget. 0 disables the gate (counting continues).
+    mergequeue_requeue_cap: Annotated[int, Typed, NonNeg] = 3
 
     def __post_init__(self) -> None:
         legacy_to_strategy = {

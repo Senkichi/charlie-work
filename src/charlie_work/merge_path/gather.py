@@ -33,9 +33,9 @@ from .decide import (
     decide_admission,
     decide_branch,
     decide_readiness,
-    is_already_in_mergequeue,
     needs_carry_forward,
 )
+from .mergequeue import is_already_in_mergequeue
 from .issue_labels import open_issue_labels
 from .model import (
     UNAVAILABLE,
@@ -90,6 +90,7 @@ def config_slice(config: OrchestratorConfig) -> MergePathConfig:
         merge_strategy=auto.strategy,
         skip_line_label=auto.mergequeue_skip_line_label,
         priority_prefix=config.labels.priority_prefix,
+        mergequeue_requeue_cap=auto.mergequeue_requeue_cap,
     )
 
 
@@ -104,6 +105,8 @@ def persisted_from(entry: dict[str, Any] | None) -> PersistedPr:
         mergequeue_since=entry.get("mergequeue_since"),
         mergequeue_head_sha=entry.get("mergequeue_head_sha"),
         mergequeue_checked_at=entry.get("mergequeue_checked_at"),
+        mergequeue_requeues=entry.get("consecutive_mergequeue_requeues", 0),
+        mergequeue_requeues_head_sha=entry.get("mergequeue_requeues_head_sha"),
     )
 
 
@@ -484,6 +487,7 @@ def holds_from_snapshot(
     issue_number: int | None,
     *,
     should_merge: bool,
+    live_head_sha: str | None = None,
 ) -> HoldFacts:
     """Escalation flags, counters and issue status from one state snapshot."""
     pr_esc, issue_esc = escalation_from(snapshot, pr_number, issue_number)
@@ -497,6 +501,7 @@ def holds_from_snapshot(
         pr_escalated=pr_esc,
         issue_escalated=issue_esc,
         should_merge=should_merge,
+        live_head_sha=live_head_sha,
     )
 
 

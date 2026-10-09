@@ -1,0 +1,8 @@
+warning
+# Issue #2743: the same-head mergequeue re-add budget is spent -- Aviator
+# reverted the queue this many times at one PR head, so the fleet stopped
+# re-adding the label and routed the PR to rework instead of burning another
+# queue CI run (PR #2649: ~106 runs in 13h). Warning, not error: the bounded
+# response already fired, this is the operator-visible record of why the PR
+# left the queue. Emitted exactly once, on the pass whose counted revert
+# reaches ``auto_merge.mergequeue_requeue_cap``.

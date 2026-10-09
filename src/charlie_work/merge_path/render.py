@@ -178,6 +178,8 @@ class PreviewFinal:
     merge_hold_label: str
     failed_attempts: int
     stale_base_deferrals: int
+    mergequeue_requeues: int = 0
+    mergequeue_requeue_capped: bool = False
 
 
 def preview_message(p: PreviewFinal) -> str:
@@ -185,6 +187,12 @@ def preview_message(p: PreviewFinal) -> str:
     r = p.readiness
     can_merge = r.gate.can_merge
     base = "dry-run: merge readiness evaluated"
+    if p.mergequeue_requeue_capped:
+        return base + (
+            f" (mergequeue label {p.cfg.mergequeue_label!r} reverts at this head "
+            f"capped ({p.mergequeue_requeues}/{p.cfg.mergequeue_requeue_cap}) — "
+            "would hold and route to rework)"
+        )
     if (
         can_merge
         and p.should_merge
@@ -252,6 +260,10 @@ def render_preview_final(ports: MergePathPorts, p: PreviewFinal) -> Any:
             "cross_pr_revert_routed": False,
             "cross_pr_revert_undetermined": r.cross_pr_revert_undetermined,
             "mergequeue_label_applied": None,
+            "mergequeue_requeue_capped": p.mergequeue_requeue_capped,
+            "consecutive_mergequeue_requeues": p.mergequeue_requeues,
+            "requeue_routed": False,
+            "requeue_escalated": False,
             "merge_hold": p.merge_hold,
             "merge_hold_check_unavailable": p.merge_hold_unavailable,
             "human_merge_hold": r.human_merge_hold,
@@ -423,6 +435,17 @@ def live_message(f: LiveFinal) -> str:
         )
     if f.plan.merge_hold:
         return base + f" (merge-hold label {f.merge_hold_label!r} present — left alone)"
+    if f.plan.mergequeue_requeue_capped:
+        if res.requeue_escalated:
+            outcome = "escalated to a human"
+        elif res.requeue_routed:
+            outcome = "routed to rework"
+        else:
+            outcome = "held"
+        return base + (
+            f" (mergequeue label {label!r} reverts at this head capped "
+            f"({f.plan.mergequeue_requeues}/{f.cfg.mergequeue_requeue_cap}) — {outcome})"
+        )
     if res.mergequeue_label_applied is False:
         return base + (
             f" (mergequeue label {label!r} FAILED to "
@@ -468,6 +491,14 @@ def render_live_final(ports: MergePathPorts, f: LiveFinal) -> Any:
         "cross_pr_revert_routed": res.cross_pr_revert_routed,
         "cross_pr_revert_undetermined": r.cross_pr_revert_undetermined,
         "mergequeue_label_applied": res.mergequeue_label_applied,
+        "mergequeue_requeue_capped": f.plan.mergequeue_requeue_capped,
+        "consecutive_mergequeue_requeues": (
+            acc.mergequeue_requeues
+            if acc.mergequeue_requeues is not None
+            else f.plan.mergequeue_requeues
+        ),
+        "requeue_routed": res.requeue_routed,
+        "requeue_escalated": res.requeue_escalated,
         "merge_hold": f.plan.merge_hold,
         "merge_hold_check_unavailable": f.plan.merge_hold_unavailable,
         "human_merge_hold": r.human_merge_hold,

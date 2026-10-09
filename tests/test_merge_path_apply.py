@@ -16,7 +16,7 @@ from charlie_work.labels import TransitionOutcome
 from charlie_work.merge_path.apply import run_merge_ready
 from charlie_work.merge_path.apply_accounting import settle_accounting
 from charlie_work.merge_path.apply_merge import apply_merge_plan, label_error_of
-from charlie_work.merge_path.decide import mergequeue_stamp_needs_now
+from charlie_work.merge_path.mergequeue import mergequeue_stamp_needs_now
 from charlie_work.merge_path.readiness_gates import deescalation_read_needed
 from charlie_work.merge_path.gather import gather_skip
 from charlie_work.merge_path.model import EffectResults, MergePlan, PlanKind

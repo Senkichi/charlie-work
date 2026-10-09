@@ -57,6 +57,17 @@ UNESCALATE_PR_RESET_FIELDS = (
     # derives the required companions from that map).
     "conflict_rework_attempts_stall_since",
     "conflict_rework_attempts_stall_head",
+    # Issue #2743: the queue-revert lane's whole ledger -- the cap counter and
+    # its head anchor plus the rework-attempt companions the shared wrapper
+    # keeps. A re-arm that left ``consecutive_mergequeue_requeues`` at cap
+    # would re-block the hand-off on the very next pass, and a stale attempt
+    # ledger would re-escalate without a single fresh rework cycle.
+    "consecutive_mergequeue_requeues",
+    "mergequeue_requeues_head_sha",
+    "mergequeue_rework_attempts",
+    "mergequeue_rework_attempts_last_head",
+    "mergequeue_rework_attempts_stall_since",
+    "mergequeue_rework_attempts_stall_head",
     # Issue #1972: the local merge gate's per-kind rework counters and the
     # last-failure-kind marker (``local_merge_rework._local_route_merge_rework``).
     # A re-arm that left them behind would re-escalate on the next gate
@@ -309,6 +320,29 @@ REWORK_BUDGET_RESET_BY_ESCALATION_REASON: dict[str, tuple[tuple[str, ...], tuple
             "conflict_rework_attempts_last_head",
             "conflict_rework_attempts_stall_since",
             "conflict_rework_attempts_stall_head",
+        ),
+    ),
+    # Issue #2743: clearing either mergequeue-cap escalation must re-arm the
+    # FULL lane -- the same-head queue-revert counter that gates the label
+    # re-add AND the rework-attempt ledger. Resetting only the attempts would
+    # leave ``consecutive_mergequeue_requeues`` at cap, so the next pass
+    # re-blocks the hand-off and re-escalates without a single fresh cycle.
+    "mergequeue_rework_attempts_cap_exceeded": (
+        ("mergequeue_rework_attempts", "consecutive_mergequeue_requeues"),
+        (
+            "mergequeue_requeues_head_sha",
+            "mergequeue_rework_attempts_last_head",
+            "mergequeue_rework_attempts_stall_since",
+            "mergequeue_rework_attempts_stall_head",
+        ),
+    ),
+    "mergequeue_rework_attempts_stall_exceeded": (
+        ("mergequeue_rework_attempts", "consecutive_mergequeue_requeues"),
+        (
+            "mergequeue_requeues_head_sha",
+            "mergequeue_rework_attempts_last_head",
+            "mergequeue_rework_attempts_stall_since",
+            "mergequeue_rework_attempts_stall_head",
         ),
     ),
     # Issue #2108: the PR-body closing-keyword autofix's per-head attempt map; no

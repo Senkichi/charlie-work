@@ -187,7 +187,12 @@ def _recorded_event_kinds() -> set[str]:
 
 def test_every_decided_accounting_event_has_a_literal_record_call() -> None:
     decided = _decided_event_kinds()
-    assert decided == {"merge_ready", "merge_succeeded", "merge_failed_attempt_alarm"}
+    assert decided == {
+        "merge_ready",
+        "merge_succeeded",
+        "merge_failed_attempt_alarm",
+        "mergequeue_requeue_capped",
+    }
     assert _recorded_event_kinds() == decided
 
 

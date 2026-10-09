@@ -364,3 +364,160 @@ def test_rework_routes_exclude_merge_and_hand_off_actions(
         acted = plan.action_merge or plan.action_hand_off or plan.action_human_merge
         assert not (routed and acted)
         assert not (plan.action_merge and plan.action_hand_off)
+
+
+# --------------------------------------------------------------------------- #
+# mergequeue requeue cap (issue #2743)
+# --------------------------------------------------------------------------- #
+
+REQUEUE_CFG = mf.cfg(mergequeue_label=mf.LABEL)
+
+
+def _requeue_persisted(requeues: int, head: str | None = mf.HEAD) -> Any:
+    return mf.persisted(
+        status="mergequeue",
+        mergequeue_requeues=requeues,
+        mergequeue_requeues_head_sha=head,
+    )
+
+
+def _reverted_readiness(**over: Any) -> Any:
+    """Green approved readiness whose prior queue hand-off was reverted this pass."""
+    base: dict[str, Any] = {
+        "branch": mf.branch_gate(admission=mf.admission(mergequeue_label_reverted=True))
+    }
+    return mf.readiness(**{**base, **over})
+
+
+def test_requeue_cap_blocks_the_hand_off_and_routes_to_rework() -> None:
+    """The Nth same-head queue revert refuses the re-add and routes to rework."""
+    facts = mf.hold_facts(
+        config=REQUEUE_CFG,
+        persisted=_requeue_persisted(2),  # this pass's revert is the 3rd
+        merge_hold=False,
+        issue_status="pr_open",
+        live_head_sha=mf.HEAD,
+    )
+    plan = decide_merge(_reverted_readiness(), facts)
+    assert plan.mergequeue_requeue_capped is True
+    assert plan.requeue_rework is True
+    assert plan.action_hand_off is False
+    assert plan.kind == PlanKind.REQUEST_REWORK
+    assert Hold.REQUEUE_CAPPED in plan.holds
+    assert plan.mergequeue_requeues == 3
+
+
+@pytest.mark.parametrize(
+    ("persisted_requeues", "reverted", "self_revoked", "head", "live_head", "cap", "capped"),
+    [
+        pytest.param(1, True, False, mf.HEAD, mf.HEAD, 3, False, id="below-cap"),
+        pytest.param(2, True, False, mf.HEAD, mf.HEAD, 3, True, id="revert-reaches-cap"),
+        pytest.param(3, False, False, mf.HEAD, mf.HEAD, 3, True, id="persisted-at-cap"),
+        pytest.param(3, True, False, mf.HEAD, mf.HEAD, 3, True, id="past-cap-stays-capped"),
+        pytest.param(
+            3, True, False, mf.NEW_HEAD, mf.HEAD, 3, False, id="new-head-resets-the-count"
+        ),
+        pytest.param(3, True, False, mf.HEAD, None, 3, False, id="unknown-head-not-capped"),
+        pytest.param(
+            2, True, True, mf.HEAD, mf.HEAD, 3, False, id="self-revocation-does-not-count"
+        ),
+        pytest.param(2, True, False, mf.HEAD, mf.HEAD, 0, False, id="cap-zero-disables"),
+        pytest.param(0, True, False, mf.HEAD, mf.HEAD, 1, True, id="cap-one-first-revert"),
+        pytest.param(0, False, False, None, mf.HEAD, 3, False, id="never-queued"),
+    ],
+)
+def test_requeue_cap_gate(
+    persisted_requeues: int,
+    reverted: bool,
+    self_revoked: bool,
+    head: str | None,
+    live_head: str | None,
+    cap: int,
+    capped: bool,
+) -> None:
+    readiness = mf.readiness(
+        branch=mf.branch_gate(
+            admission=mf.admission(
+                mergequeue_label_reverted=reverted, self_revoked_stale_head=self_revoked
+            )
+        )
+    )
+    facts = mf.hold_facts(
+        config=mf.cfg(mergequeue_label=mf.LABEL, mergequeue_requeue_cap=cap),
+        persisted=_requeue_persisted(persisted_requeues, head),
+        merge_hold=False,
+        issue_status="pr_open",
+        live_head_sha=live_head,
+    )
+    plan = decide_merge(readiness, facts)
+    assert plan.mergequeue_requeue_capped is capped
+    assert plan.action_hand_off is not capped
+
+
+def test_requeue_cap_without_a_mergequeue_label_never_applies() -> None:
+    """With the queue label unset the fleet self-merges; the cap is inert."""
+    facts = mf.hold_facts(
+        config=mf.cfg(mergequeue_requeue_cap=1),
+        persisted=_requeue_persisted(9),
+        live_head_sha=mf.HEAD,
+    )
+    plan = decide_merge(mf.readiness(), facts)
+    assert plan.mergequeue_requeue_capped is False
+    assert plan.action_merge is True
+
+
+def test_requeue_cap_needs_can_merge_to_count_the_revert() -> None:
+    """A same-pass check failure owns the revert (issue #823 lane) -- not the cap."""
+    facts = mf.hold_facts(
+        config=REQUEUE_CFG,
+        persisted=_requeue_persisted(2),
+        merge_hold=False,
+        live_head_sha=mf.HEAD,
+    )
+    plan = decide_merge(_reverted_readiness(gate=BLOCKED_GATE), facts)
+    assert plan.mergequeue_requeue_capped is False
+    assert plan.mergequeue_requeues == 2
+
+
+@pytest.mark.parametrize("status", ALL_STATUSES, ids=str)
+def test_requeue_route_status_exclusions(status: str | None) -> None:
+    facts = mf.hold_facts(
+        config=REQUEUE_CFG,
+        persisted=_requeue_persisted(2),
+        merge_hold=False,
+        issue_status=status,
+        live_head_sha=mf.HEAD,
+    )
+    plan = decide_merge(_reverted_readiness(), facts)
+    assert plan.mergequeue_requeue_capped is True
+    assert plan.requeue_rework is (status not in CHECK_ROUTE_EXCLUDED)
+    expected = PlanKind.REQUEST_REWORK if status not in CHECK_ROUTE_EXCLUDED else PlanKind.HOLD
+    assert plan.kind == expected
+
+
+def test_requeue_route_needs_a_linked_issue() -> None:
+    readiness = _reverted_readiness(issue_number=None)
+    facts = mf.hold_facts(
+        config=REQUEUE_CFG,
+        persisted=_requeue_persisted(2),
+        merge_hold=False,
+        live_head_sha=mf.HEAD,
+    )
+    plan = decide_merge(readiness, facts)
+    assert (plan.mergequeue_requeue_capped, plan.requeue_rework) == (True, False)
+    assert plan.kind == PlanKind.HOLD
+
+
+def test_requeue_route_defers_to_a_human_merge_hand_off() -> None:
+    """A human-merge label escalates as policy; the requeue route must not also fire."""
+    facts = mf.hold_facts(
+        config=REQUEUE_CFG,
+        persisted=_requeue_persisted(2),
+        merge_hold=False,
+        issue_status="pr_open",
+        live_head_sha=mf.HEAD,
+    )
+    plan = decide_merge(_reverted_readiness(human_merge_hold=True), facts)
+    assert plan.action_human_merge is True
+    assert plan.requeue_rework is False
+    assert plan.mergequeue_requeue_capped is True

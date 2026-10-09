@@ -386,3 +386,123 @@ def test_a_merged_pr_drops_the_mergequeue_stamps() -> None:
         _plan(PlanKind.MERGE), EffectResults(merge_output="merged"), _facts(locked=locked)
     )
     assert (acc.mergequeue_since, acc.mergequeue_head_sha) == (None, None)
+
+
+# --------------------------------------------------------------------------- #
+# mergequeue requeue counter and cap event (issue #2743)
+# --------------------------------------------------------------------------- #
+
+
+def _reverted_plan(**over: Any) -> MergePlan:
+    admission = mf.admission(mergequeue_label_reverted=True)
+    base: dict[str, Any] = {"branch": mf.branch_gate(admission=admission)}
+    return _plan(**{**base, **over})
+
+
+def _requeue_locked(requeues: int, head: str | None = mf.HEAD, **over: Any) -> Any:
+    return mf.persisted(
+        status="mergequeue",
+        mergequeue_requeues=requeues,
+        mergequeue_requeues_head_sha=head,
+        **over,
+    )
+
+
+def test_a_counted_revert_increments_the_requeue_counter_at_the_live_head() -> None:
+    acc = decide_accounting(
+        _reverted_plan(),
+        EffectResults(mergequeue_label_applied=True),
+        _facts(config=HANDOFF_CFG, locked=_requeue_locked(1), live_head_sha=mf.HEAD),
+    )
+    assert acc.mergequeue_requeues == 2
+    assert acc.mergequeue_requeues_head_sha == mf.HEAD
+
+
+def test_a_revert_at_a_new_head_restarts_the_count() -> None:
+    acc = decide_accounting(
+        _reverted_plan(),
+        EffectResults(mergequeue_label_applied=True),
+        _facts(
+            config=HANDOFF_CFG,
+            locked=_requeue_locked(5, head=mf.NEW_HEAD),
+            live_head_sha=mf.HEAD,
+        ),
+    )
+    assert acc.mergequeue_requeues == 1
+    assert acc.mergequeue_requeues_head_sha == mf.HEAD
+
+
+@pytest.mark.parametrize(
+    ("reverted", "self_revoked", "can_merge", "live_head"),
+    [
+        pytest.param(True, True, True, mf.HEAD, id="self-revocation-is-not-counted"),
+        pytest.param(True, False, False, mf.HEAD, id="failed-pr-checks-own-the-revert"),
+        pytest.param(True, False, True, None, id="unknown-head-cannot-anchor"),
+        pytest.param(False, False, True, mf.HEAD, id="no-revert-nothing-to-count"),
+    ],
+)
+def test_uncounted_reverts_leave_the_requeue_fields_alone(
+    reverted: bool, self_revoked: bool, can_merge: bool, live_head: str | None
+) -> None:
+    admission = mf.admission(
+        mergequeue_label_reverted=reverted, self_revoked_stale_head=self_revoked
+    )
+    gate = mf.gate() if can_merge else BLOCKED_GATE
+    plan = _plan(branch=mf.branch_gate(admission=admission), gate=gate)
+    acc = decide_accounting(
+        plan,
+        EffectResults(mergequeue_label_applied=True),
+        _facts(config=HANDOFF_CFG, locked=_requeue_locked(1), live_head_sha=live_head),
+    )
+    assert acc.mergequeue_requeues is None
+    assert acc.mergequeue_requeues_head_sha is None
+
+
+def test_reaching_the_cap_emits_mergequeue_requeue_capped_once() -> None:
+    acc = decide_accounting(
+        _reverted_plan(),
+        EffectResults(mergequeue_label_applied=None),
+        _facts(config=HANDOFF_CFG, locked=_requeue_locked(2), live_head_sha=mf.HEAD),
+    )
+    events = [e for e in acc.events if e.kind == "mergequeue_requeue_capped"]
+    assert len(events) == 1
+    payload = events[0].payload
+    assert payload["pr_number"] == mf.PR
+    assert payload["issue_number"] == mf.ISSUE
+    assert payload["head_sha"] == mf.HEAD
+    assert payload["requeues"] == 3
+    assert payload["cap"] == 3
+    assert payload["mergequeue_label"] == mf.LABEL
+
+
+def test_past_the_cap_does_not_reemit_the_event() -> None:
+    acc = decide_accounting(
+        _reverted_plan(),
+        EffectResults(mergequeue_label_applied=None),
+        _facts(config=HANDOFF_CFG, locked=_requeue_locked(3), live_head_sha=mf.HEAD),
+    )
+    assert acc.mergequeue_requeues == 4
+    assert "mergequeue_requeue_capped" not in _kinds(acc)
+
+
+def test_cap_zero_still_counts_but_never_emits() -> None:
+    cfg = mf.cfg(mergequeue_label=mf.LABEL, mergequeue_requeue_cap=0)
+    acc = decide_accounting(
+        _reverted_plan(),
+        EffectResults(mergequeue_label_applied=True),
+        _facts(config=cfg, locked=_requeue_locked(9), live_head_sha=mf.HEAD),
+    )
+    assert acc.mergequeue_requeues == 10
+    assert "mergequeue_requeue_capped" not in _kinds(acc)
+
+
+def test_a_self_revoked_revert_neither_counts_nor_emits() -> None:
+    admission = mf.admission(mergequeue_label_reverted=True, self_revoked_stale_head=True)
+    plan = _plan(branch=mf.branch_gate(admission=admission))
+    acc = decide_accounting(
+        plan,
+        EffectResults(mergequeue_label_applied=True),
+        _facts(config=HANDOFF_CFG, locked=_requeue_locked(2), live_head_sha=mf.HEAD),
+    )
+    assert acc.mergequeue_requeues is None
+    assert "mergequeue_requeue_capped" not in _kinds(acc)
