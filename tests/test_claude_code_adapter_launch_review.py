@@ -12,6 +12,8 @@ from __future__ import annotations
 import subprocess
 import threading
 from pathlib import Path
+from types import SimpleNamespace
+
 import pytest
 
 from _claude_adapter_fixtures import (
@@ -21,6 +23,7 @@ from _claude_adapter_fixtures import (
 )
 
 from charlie_work import claude_code
+from charlie_work.worktree import WorktreeInfo
 from charlie_work.config import (
     ClaudeCodeConfig,
     OrchestratorConfig,
@@ -300,18 +303,38 @@ def test_launch_claude_worker_review_uses_review_effort_when_set(tmp_path: Path)
 
 
 def test_launch_claude_worker_review_falls_back_to_claude_code_effort_when_unset(
-    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """reviewer.effort empty (the default) must fall back to
     claude_code.effort, same as any other reviewer launch before this config
     knob existed."""
     repo_root = tmp_path / "repo"
-    _init_real_repo(repo_root)
+    repo_root.mkdir()
     sessions_dir = tmp_path / "reviews"
-    head_sha = _repo_head_sha(repo_root)
     config = OrchestratorConfig(
         claude_code=ClaudeCodeConfig(effort="medium"),
         reviewer=ReviewerRoleConfig(effort=""),
+    )
+
+    # Issue #2689: this test asserts only on the rendered --effort argv, so
+    # keep it off the real subprocess spawns a live launch pays -- the ledger
+    # flagged exactly that host-priced drift. The real checkout is ~3 git
+    # spawns on top of _init_real_repo's 6, and on a host with the claude CLI
+    # installed popen_worker resolves the default review template's argv[0]
+    # to the real binary and spawns a live agent session. The real
+    # checkout/Popen coverage stays in the isolation and terminal-status
+    # tests above; test_devin_review_allowlist._patch_launch fakes the same
+    # two seams for the same reason.
+    def fake_create_review_checkout(
+        repo_root: Path, pr_number: int, head_sha: str, *, reviews_dir: Path
+    ) -> WorktreeInfo:
+        checkout_path = reviews_dir / f"pr-{pr_number}"
+        checkout_path.mkdir(parents=True, exist_ok=True)
+        return WorktreeInfo(path=checkout_path, branch=head_sha, venv_junction=None)
+
+    monkeypatch.setattr(claude_code, "create_review_checkout", fake_create_review_checkout)
+    monkeypatch.setattr(
+        claude_code, "popen_worker", lambda *args, **kwargs: SimpleNamespace(pid=4242)
     )
 
     record = launch_claude_worker(
@@ -321,7 +344,7 @@ def test_launch_claude_worker_review_falls_back_to_claude_code_effort_when_unset
         repo_root=repo_root,
         sessions_dir=sessions_dir,
         review=True,
-        head_sha=head_sha,
+        head_sha="a" * 40,
         config=config,
     )
 
