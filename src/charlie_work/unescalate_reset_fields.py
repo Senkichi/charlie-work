@@ -65,6 +65,11 @@ UNESCALATE_PR_RESET_FIELDS = (
     "local_suite_failed_rework_attempts",
     "local_suite_infra_relaunch_count",
     "local_merge_rework_reason",
+    # Issue #2739: the gate's "record left approved" abort streak and its
+    # patch-id companion. A re-arm that left them behind would re-escalate
+    # on the very next abort instead of taking a fresh bound.
+    "local_gate_abort_streak",
+    "local_gate_abort_streak_patch_id",
     "no_op_rework_attempts",
     "no_op_rework_attempts_last_head",
     "no_op_rework_attempts_stall_since",
@@ -327,6 +332,13 @@ REWORK_BUDGET_RESET_BY_ESCALATION_REASON: dict[str, tuple[tuple[str, ...], tuple
     # Issue #2127: the gate's infra-relaunch bound (timeout / summary-less
     # death); an unreset count would re-escalate on the very next infra blip.
     "local_merge_gate_infra_exhausted": (("local_suite_infra_relaunch_count",), ()),
+    # Issue #2739: the gate's "record left approved" abort bound; the
+    # patch-id companion is popped so a re-arm re-baselines the streak
+    # rather than comparing against the exhausted episode's verdict.
+    "local_gate_abort_streak_exceeded": (
+        ("local_gate_abort_streak",),
+        ("local_gate_abort_streak_patch_id",),
+    ),
     # Issue #1683: the review-dispatch lanes were missing from this map
     # entirely, so every automated clear of either reason was inert -- the
     # gating counter stayed at cap, the next dispatch pass re-escalated

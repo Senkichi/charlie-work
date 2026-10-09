@@ -45,6 +45,11 @@ record holding the gate sorts.
 Every top-level ``def`` is installed on ``OrchestratorApp`` by
 ``workflow_delegation._install_delegates``; workflow helpers are reached
 through ``_wf.<name>`` (the module-object form the monkeypatch seams need).
+
+Issue #2739's already-landed terminal edge, the packet phase's
+landed/closed pre-build check, and the abort-streak counter live in
+``orchestration/local_landed_finalize.py`` -- the net-new-member-in-its-own
+-submodule pattern that keeps this file under its file-size-ratchet mark.
 """
 
 from __future__ import annotations
@@ -65,6 +70,7 @@ from charlie_work.local_gate_infra import (
 )
 from charlie_work.local_lane import (
     _iso_dt,
+    branch_diff,
     branch_head_sha,
     ensure_branch_worktree,
     local_base_branch,
@@ -101,6 +107,17 @@ LOCAL_SUITE_CLAIM_FIELDS = (
 # escalates the infrastructure anomaly like any other local_merge_error.
 LOCAL_SUITE_GATE_MAX_RESYNCS = 3
 LOCAL_SUITE_GATE_MAX_ORPHANS = 3
+
+# Issue #2739: bound on consecutive "record left approved with a suite in
+# flight" aborts under an unchanged ``reviewed_patch_id``. The zero-net-diff
+# livelock's signature was exactly that abort firing once per review cycle
+# (rebuild -> re-approve -> sync-merge head move -> abort) against the same
+# approved content. The landed short-circuit makes the loop unreachable, but
+# if the shape ever re-forms some other way the streak escalates it
+# mechanically instead of burning a reviewer cycle per pass forever. A
+# patch-id change -- genuinely new content re-entered review -- re-baselines
+# the count.
+LOCAL_GATE_ABORT_STREAK_LIMIT = 3
 
 
 def _local_merge_approved(self) -> list[dict[str, Any]]:
@@ -160,6 +177,30 @@ def _local_merge_approved(self) -> list[dict[str, Any]]:
                     reason="record left approved with a suite in flight",
                 )
                 entry["outcome"] = "gate_aborted"
+                # Issue #2739: bound the abort -> rebuild -> re-approve
+                # cycle. One abort per review pass against an unchanged
+                # approved patch-id is the livelock's signature; at the
+                # bound the record escalates mechanically instead of
+                # spending another reviewer + suite cycle.
+                abort_streak = self._local_gate_abort_streak_tick(pr_key, record)
+                entry["abort_streak"] = abort_streak
+                if abort_streak >= LOCAL_GATE_ABORT_STREAK_LIMIT:
+                    detail = (
+                        f"local merge gate aborted {abort_streak} consecutive "
+                        "in-flight suites while the record's approved "
+                        "patch-id never changed (record keeps leaving "
+                        "'approved' after the gate claims it -- the "
+                        "zero-net-diff livelock shape, issue #2739)"
+                    )
+                    entry["outcome"] = "error"
+                    entry["detail"] = detail
+                    self._local_merge_error_escalate(
+                        pr_number,
+                        issue_number,
+                        branch,
+                        detail,
+                        reason="local_gate_abort_streak_exceeded",
+                    )
                 results.append(entry)
             continue
 
@@ -183,6 +224,26 @@ def _local_merge_approved(self) -> list[dict[str, Any]]:
             entry["detail"] = f"branch {branch!r} does not resolve"
             results.append(entry)
             continue
+        if branch_diff(self.repo_root, base_ref, branch) == "":
+            # Issue #2739: the branch carries no net delta against the base
+            # -- its content already landed (often by another path) and the
+            # gate's own sync merge has advanced the merge base past it.
+            # Neither the suite nor a reviewer can prove anything about an
+            # empty diff, so the record takes the terminal landed edge here
+            # (killing a stray claimed suite, if any) rather than stalling
+            # at ``skipped_head_moved`` until the packet phase gets to it.
+            self._local_finalize_landed(
+                pr_key=pr_key,
+                record=record,
+                entry=entry,
+                branch=branch,
+                base_ref=base_ref,
+                live_head=live_head,
+                decision=decision,
+            )
+            results.append(entry)
+            continue
+
         # A claimed record's expected head is ``local_suite_head`` -- the
         # post-sync-merge sha the suite is actually testing -- not
         # ``reviewed_head``: the gate's own base-sync merge at launch
@@ -716,6 +777,21 @@ def _local_gate_launch(
     """
     pr_number = int(pr_key)
     issue_number = int(record.get("issue_number") or pr_number)
+    if branch_diff(self.repo_root, base_ref, branch) == "":
+        # Issue #2739: an empty three-dot diff means the branch's content is
+        # already on the base -- nothing for a suite to prove and nothing
+        # for the sync merge to add. Finalize through the terminal edge
+        # instead of spawning (or re-spawning, on the poll/relaunch
+        # callers) a suite that can only churn the record.
+        return self._local_finalize_landed(
+            pr_key=pr_key,
+            record=record,
+            entry=entry,
+            branch=branch,
+            base_ref=base_ref,
+            live_head=branch_head_sha(self.repo_root, branch) or "",
+            decision=decision,
+        )
     argv = suite_command_argv(self.config.dispatch.test_command, self.repo_root)
     if argv is None:
         # No resolvable suite command: fail closed. A lane that cannot

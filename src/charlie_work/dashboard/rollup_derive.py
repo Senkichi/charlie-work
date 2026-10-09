@@ -273,6 +273,8 @@ KNOWN_IGNORED: dict[str, str] = {
     "local_lane_kill_switch_stalled": "local (no-remote) lane bookkeeping",
     "local_no_op_rework_rearmed": "local (no-remote) lane bookkeeping",
     "local_review_adopted": "local (no-remote) lane bookkeeping",
+    "local_review_skipped_issue_closed": "local (no-remote) lane bookkeeping",
+    "local_review_skipped_landed": "local (no-remote) lane bookkeeping",
     "local_suite_failed": "local (no-remote) lane bookkeeping",
     "local_suite_selection_disabled": "local (no-remote) lane bookkeeping",
     "local_suite_selection_unavailable": "local (no-remote) lane bookkeeping",

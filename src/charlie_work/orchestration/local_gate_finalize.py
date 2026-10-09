@@ -174,6 +174,10 @@ def _local_gate_finalize_merge(
             "local_suite_failed_rework_attempts": 0,
             "local_suite_infra_relaunch_count": 0,
             "local_merge_rework_reason": None,
+            # Issue #2739: the abort streak is per-episode -- a terminal
+            # edge restarts it clean alongside the rework counters.
+            "local_gate_abort_streak": 0,
+            "local_gate_abort_streak_patch_id": None,
             **{field: None for field in LOCAL_SUITE_PASSED_FIELDS},
         }
         issue_entry = state["issues"].get(str(issue_number), {})

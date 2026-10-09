@@ -27,10 +27,21 @@ def approval_survives_head_move(
     the reviewed head -- the patch-id is re-derived from ``reviewed_head_sha``
     itself, so a mis-recorded baseline cannot void an approval whose content is
     unchanged. A genuinely different diff matches neither and returns False.
+
+    Issue #2739: ``branch_diff``'s three outcomes carry different semantics
+    here -- ``None`` is a failed diff (carries nothing), ``""`` is the
+    legitimate "already landed" answer (the branch's whole content is on the
+    base), and anything else is real content to compare by patch-id. An
+    empty live diff carries an approval only when the verdict was recorded
+    over that same empty shape (``reviewed_patch_id == ""``); a verdict
+    recorded over real content whose diff later empties is the terminal
+    landed path's job, not this predicate's.
     """
     live_diff = branch_diff(repo_root, base_ref, branch)
-    if not live_diff:
+    if live_diff is None:
         return False
+    if live_diff == "":
+        return decision.get("reviewed_patch_id") == ""
     live_patch = _calculate_patch_id(live_diff)
     if not live_patch:
         return False

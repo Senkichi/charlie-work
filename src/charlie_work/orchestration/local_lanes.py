@@ -364,6 +364,24 @@ def _local_review_packets(self) -> dict[str, Any]:
         issue_live = issue_status == "dispatch_pending" or (
             issue_status in _LIVE_DISPATCH_STATUSES and issue_number in live_sidecar_issues
         )
+        base_ref = str(record.get("baseRefName") or base_branch or "HEAD")
+        # Issue #2739: the already-landed / closed-issue terminal decisions
+        # live in ``orchestration/local_landed_finalize.py`` -- an empty
+        # three-dot diff retires the record through the gate's terminal
+        # bookkeeping instead of rebuilding a packet and re-entering the
+        # review cycle.
+        skipped = self._local_landed_or_closed_skip(
+            pr_key=pr_key,
+            record=record,
+            issue_number=issue_number,
+            issue_live=issue_live,
+            branch=branch,
+            base_ref=base_ref,
+            head=head,
+        )
+        if skipped is not None:
+            results["skipped"].append(skipped)
+            continue
         needs_build = (
             status == LOCAL_PENDING_STATUS
             or packet_head != head
