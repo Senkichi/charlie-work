@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
+from typing import NamedTuple
 
 import pytest
 
@@ -55,14 +56,40 @@ def _detach(repo_root: Path) -> None:
     )
 
 
-def test_mutation_writes_queue_into_the_pass_flush(tmp_path: Path) -> None:
-    """End to end through the backend write site: a close lands on disk and
-    one flush pass later it is committed as ``chore(issues): close #1``."""
+class _SeededTrackerRepo(NamedTuple):
+    """What ``_seeded_tracker_repo`` arranges: a repo with one tracked issue file."""
+
+    repo_root: Path
+    issues_dir: Path
+    issue_path: Path
+
+
+@pytest.fixture
+def _seeded_tracker_repo(tmp_path: Path) -> _SeededTrackerRepo:
+    """One-commit repo whose ``docs/issues`` holds a single tracked issue file.
+
+    Every git spawn of repo acquisition lives here so the measured ``call``
+    phase holds only the backend mutation, ``flush_tracker_writes`` -- the
+    property under test -- and the assertions (issue #2690). The repo
+    materializes from the per-process ``plain`` git template rather than a
+    fresh ``git init``+config+add+commit sequence.
+    """
     repo_root = tmp_path / "repo"
     _init_repo(repo_root)
     issues_dir = repo_root / "docs" / "issues"
     path = _write_issue(issues_dir, 1)
     _seed_tracked(repo_root, path)
+    return _SeededTrackerRepo(repo_root=repo_root, issues_dir=issues_dir, issue_path=path)
+
+
+def test_mutation_writes_queue_into_the_pass_flush(
+    _seeded_tracker_repo: _SeededTrackerRepo,
+) -> None:
+    """End to end through the backend write site: a close lands on disk and
+    one flush pass later it is committed as ``chore(issues): close #1``."""
+    repo_root = _seeded_tracker_repo.repo_root
+    issues_dir = _seeded_tracker_repo.issues_dir
+    path = _seeded_tracker_repo.issue_path
     gh = LocalFileGitHub(repo_root=repo_root, issues_dir=issues_dir)
 
     assert gh.close_issue(1) is True

@@ -210,17 +210,27 @@ def _unsafe_commit_reason(repo_root: Path) -> str | None:
     """Why committing tracker writes right now is unsafe, or None when safe.
 
     HEAD detached (``symbolic-ref -q HEAD`` fails) or any merge/rebase/
-    cherry-pick state ref resolving: committing now would land on a
-    temporary branch or inside an interrupted operation. Plumbing only
-    (``rev-parse --verify``), so the probe stays worktree-agnostic and never
-    reaches for the ``.git`` filesystem directly.
+    cherry-pick state file present: committing now would land on a
+    temporary branch or inside an interrupted operation. The three
+    pseudo-refs probe in one spawn via ``rev-parse --git-path`` -- plumbing
+    resolves each state file under the worktree's real gitdir, so the
+    check stays worktree-agnostic without hardcoding ``.git/`` paths.
     """
     symbolic = _run_git(repo_root, ["git", "symbolic-ref", "-q", "--short", "HEAD"])
     if not symbolic.ok:
         return "HEAD is detached"
-    for ref in ("MERGE_HEAD", "REBASE_HEAD", "CHERRY_PICK_HEAD"):
-        probe = _run_git(repo_root, ["git", "rev-parse", "--verify", "-q", ref])
-        if probe.ok:
+    refs = ("MERGE_HEAD", "REBASE_HEAD", "CHERRY_PICK_HEAD")
+    probe_command = [
+        "git",
+        "rev-parse",
+        *(arg for ref in refs for arg in ("--git-path", ref)),
+    ]
+    probe = _run_git(repo_root, probe_command)
+    paths = probe.stdout.splitlines()
+    if not probe.ok or len(paths) != len(refs):
+        return command_failure_message(probe_command, probe, "interrupted-operation probe failed")
+    for ref, raw in zip(refs, paths, strict=True):
+        if (repo_root / raw).exists():
             return f"{ref} references an interrupted merge/rebase"
     return None
 
