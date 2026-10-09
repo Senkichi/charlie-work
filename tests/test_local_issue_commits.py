@@ -228,7 +228,7 @@ def test_flush_skips_when_a_merge_is_in_progress(tmp_path: Path) -> None:
     result = flush_tracker_writes(repo_root, issues_dir)
 
     assert result.deferred is True
-    assert "MERGE_HEAD" in result.defer_reason
+    assert result.defer_reason == "MERGE_HEAD references an interrupted merge/rebase"
     assert result.committed == ()
     subprocess.run(
         ["git", "merge", "--abort"],
@@ -237,6 +237,78 @@ def test_flush_skips_when_a_merge_is_in_progress(tmp_path: Path) -> None:
         capture_output=True,
         text=True,
     )
+
+
+@pytest.mark.parametrize("ref", ["MERGE_HEAD", "REBASE_HEAD", "CHERRY_PICK_HEAD"])
+def test_flush_defers_on_each_interrupted_operation_state_ref(
+    ref: str,
+    _seeded_tracker_repo: _SeededTrackerRepo,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every slot of the batched ``rev-parse --git-path`` probe defers: a
+    state file at any position must read as an interrupted operation, and
+    all three resolve in one spawn (the #2690 batching, asserted on argv)."""
+    repo_root = _seeded_tracker_repo.repo_root
+    issues_dir = _seeded_tracker_repo.issues_dir
+    gh = LocalFileGitHub(repo_root=repo_root, issues_dir=issues_dir)
+    assert gh.close_issue(1) is True
+    head = _run_git(repo_root, ["git", "rev-parse", "HEAD"]).stdout.strip()
+    (repo_root / ".git" / ref).write_text(f"{head}\n", encoding="utf-8")
+    real = commits_module.run_captured
+    probes: list[list[str]] = []
+
+    def recording_run_captured(command: list[str], **kwargs: object) -> RunResult:
+        if "rev-parse" in command:
+            probes.append(list(command))
+        return real(command, **kwargs)
+
+    monkeypatch.setattr(commits_module, "run_captured", recording_run_captured)
+
+    result = flush_tracker_writes(repo_root, issues_dir)
+
+    assert result.deferred is True
+    assert result.committed == ()
+    assert result.defer_reason == f"{ref} references an interrupted merge/rebase"
+    assert probes == [
+        [
+            "git",
+            "rev-parse",
+            "--git-path",
+            "MERGE_HEAD",
+            "--git-path",
+            "REBASE_HEAD",
+            "--git-path",
+            "CHERRY_PICK_HEAD",
+        ]
+    ]
+
+
+def test_flush_defers_when_the_state_ref_probe_fails(
+    _seeded_tracker_repo: _SeededTrackerRepo,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed ``--git-path`` probe defers rather than guessing: without a
+    resolved path list the flush cannot prove the repo is safe to commit."""
+    repo_root = _seeded_tracker_repo.repo_root
+    issues_dir = _seeded_tracker_repo.issues_dir
+    gh = LocalFileGitHub(repo_root=repo_root, issues_dir=issues_dir)
+    assert gh.close_issue(1) is True
+    real = commits_module.run_captured
+
+    def refusing_probe(command: list[str], **kwargs: object) -> RunResult:
+        if "--git-path" in command:
+            return RunResult(
+                returncode=128, stdout="", stderr="simulated probe refusal", error="boom"
+            )
+        return real(command, **kwargs)
+
+    monkeypatch.setattr(commits_module, "run_captured", refusing_probe)
+
+    result = flush_tracker_writes(repo_root, issues_dir)
+
+    assert result.deferred is True
+    assert result.committed == ()
+    assert "simulated probe refusal" in result.defer_reason
 
 
 def test_flush_defers_on_conflicts_inside_issues_dir(tmp_path: Path) -> None:
