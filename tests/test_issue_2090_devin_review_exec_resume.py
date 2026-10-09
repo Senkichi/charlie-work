@@ -3,8 +3,11 @@
 App-level: every test drives ``OrchestratorApp._reap_review_verdicts`` against a
 real devin review sidecar + log on disk. Only the process boundary is faked:
 ``popen_worker`` (records the resume argv, writes what the "resumed Devin"
-would print into the log handle it was given) and ``devin list`` (the session-id
-source). State, events, sidecars, caps and the reaper itself are real.
+would print into the log handle it was given), ``devin list`` (the session-id
+source), and the checkout teardown (``charlie_work.workflow.remove_review_checkout``,
+the suite-patchable seam the miss path calls -- the real one shells out to
+``git worktree list/remove/prune`` against a tmp_path that is not a git repo).
+State, events, sidecars, caps and the reaper itself are real.
 """
 
 from __future__ import annotations
@@ -60,6 +63,7 @@ class _Rig:
         self.list_rows: list[dict[str, Any]] | None = [
             {"id": SESSION, "last_activity_at": 4_000_000_000}
         ]
+        self.checkout_teardowns: list[int] = []
         self._pid = 50_000
 
         def fake_popen(argv: Any, **kwargs: Any) -> Any:
@@ -78,7 +82,17 @@ class _Rig:
                 return SimpleNamespace(ok=False, stdout="", returncode=1)
             return SimpleNamespace(ok=True, stdout=json.dumps(self.list_rows), returncode=0)
 
+        def fake_remove_review_checkout(
+            repo_root: Any, pr_number: int, *, reviews_dir: Path
+        ) -> bool:
+            self.checkout_teardowns.append(pr_number)
+            shutil.rmtree(reviews_dir / f"pr-{pr_number}", ignore_errors=True)
+            return True
+
         alive = lambda pid, *_: pid in self.live  # noqa: E731
+        monkeypatch.setattr(
+            "charlie_work.workflow.remove_review_checkout", fake_remove_review_checkout
+        )
         monkeypatch.setattr(devin_review_resume, "popen_worker", fake_popen)
         monkeypatch.setattr(devin_review_resume, "run_captured", fake_list)
         monkeypatch.setattr(devin_review_resume, "_get_process_start_time", lambda pid: 1.0)
@@ -745,3 +759,27 @@ def test_stale_snapshot_of_a_resumed_session_is_not_resumed_or_torn_down(
     assert rig.reap() == {"recorded": [], "missed": []}
     assert rig.popens == [] and removed == []
     assert _claim(rig) is None
+
+
+# --- the checkout teardown stays behind the faked seam (issue #2586) ---------
+
+
+def test_the_miss_path_releases_the_checkout_through_the_faked_seam(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Pin: a verdict-miss teardown must reach ``workflow.remove_review_checkout``.
+
+    The ledger flagged this module's miss-path tests for a real-git teardown
+    (``git worktree list/remove/prune`` against a non-repo tmp_path) priced into
+    the ``call`` phase. This pin fails if the reaper stops releasing the
+    checkout on a miss (no recorded teardown), if the rig's seam patch is
+    dropped (real git runs and ``checkout_teardowns`` stays empty), or if the
+    fake stops removing the directory.
+    """
+    rig = _rig(monkeypatch, tmp_path, review_exec_rejection_max_resumes=0)
+    rig.seed_dead_review()
+
+    assert len(rig.reap()["missed"]) == 1
+
+    assert rig.checkout_teardowns == [PR]
+    assert not (rig.reviews_dir / f"pr-{PR}").exists()
