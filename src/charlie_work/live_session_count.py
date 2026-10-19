@@ -138,3 +138,22 @@ def count_live_sessions(directory: Path, state_file: Path | None, kind: LiveSess
                 )
 
     return live_count
+
+
+def count_live_sessions_by_adapter_kind(directory: Path) -> dict[str, int]:
+    """Live sidecar sessions under ``directory``, keyed by ``WorkerView.adapter_kind``.
+
+    The per-harness view (issue #2757) of the sidecar pass in
+    :func:`count_live_sessions`: the same ``iter_workers`` + ``is_alive`` rule,
+    so a per-harness count can never disagree with the total about what "live"
+    means. The state.json ghost corroboration is deliberately NOT repeated: a
+    ghost has no sidecar and therefore no known adapter, so it counts toward the
+    total cap (which does corroborate) but cannot be attributed to a harness.
+    """
+    from .worker import iter_workers
+
+    counts: dict[str, int] = {}
+    for w in iter_workers(directory):
+        if w.is_alive():
+            counts[w.adapter_kind] = counts.get(w.adapter_kind, 0) + 1
+    return counts

@@ -462,6 +462,42 @@ def count_fleet_live_sessions(
     return total_live_count, skipped_repos
 
 
+def count_fleet_live_sessions_by_adapter_kind(
+    fleet_dir_override: str | None,
+) -> tuple[dict[str, int], list[str]]:
+    """Live worker sessions across all registered repos, keyed by ``adapter_kind``.
+
+    The per-harness twin of :func:`count_fleet_live_sessions` (issue #2757):
+    same registry walk, same skip semantics, same sidecar liveness rule (see
+    ``live_session_count.count_live_sessions_by_adapter_kind`` for why ghosts
+    are not attributed). Returns ``(counts_by_adapter_kind, skipped_repos)``.
+    """
+    from .live_session_count import count_live_sessions_by_adapter_kind
+
+    totals: dict[str, int] = {}
+    skipped_repos: list[str] = []
+
+    for name_with_owner, repo_root, state_dir, repo_config in _iter_registered_repo_contexts(
+        fleet_dir_override, skipped_repos
+    ):
+        sessions_dir = layout.resolve_state_child(
+            repo_config.devin.sessions_dir,
+            repo_root=repo_root,
+            default=layout.sessions_dir_default(state_dir),
+        )
+        if not sessions_dir.exists():
+            logger.warning(
+                f"Skipping fleet per-harness live-count for {name_with_owner}: "
+                f"sessions_dir {sessions_dir} does not exist"
+            )
+            skipped_repos.append(name_with_owner)
+            continue
+        for kind, count in count_live_sessions_by_adapter_kind(sessions_dir).items():
+            totals[kind] = totals.get(kind, 0) + count
+
+    return totals, skipped_repos
+
+
 def count_fleet_live_reviews(
     fleet_dir_override: str | None,
 ) -> tuple[int, list[str]]:

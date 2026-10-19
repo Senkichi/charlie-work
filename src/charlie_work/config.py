@@ -112,6 +112,7 @@ from .fleet_supervisor_config import (  # noqa: F401  (deliberate re-export)
 )
 
 from . import layout
+from .fleet_harness_caps import freeze_harness_caps
 from .harnesses import REVIEWER_HARNESSES, WORKER_HARNESSES
 from .opencode_config import OpenCodeConfig
 from .role_chain import (
@@ -2167,6 +2168,9 @@ class FleetConfig:
     restores the old single-try behavior. Non-finite values are rejected: an
     infinite budget would hang a lane on a wedged lock, and NaN reaches
     ``time.sleep`` (which raises) inside the retry loop.
+
+    ``max_concurrent_sessions_by_harness`` (issue #2757): per-harness ceilings; see
+    :mod:`charlie_work.fleet_harness_caps` for the shape and semantics.
     """
 
     global_max_concurrent_sessions: Annotated[int, Typed, BoolTolerant] = 0
@@ -2174,6 +2178,11 @@ class FleetConfig:
     # always rejected a bool and a negative (no BoolTolerant, NonNeg).
     global_max_concurrent_reviews: Annotated[int, Typed, NonNeg] = 0
     launch_lock_wait_seconds: Annotated[float, Typed, NonNeg, Finite] = 10.0
+    max_concurrent_sessions_by_harness: Mapping[str, int] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:  # validate + freeze: one point for parsed and hand-built
+        key = "max_concurrent_sessions_by_harness"
+        object.__setattr__(self, key, freeze_harness_caps(getattr(self, key)))
 
 
 @dataclass(frozen=True)
