@@ -185,7 +185,14 @@ def _app(
         worker=WorkerRoleConfig(
             harness=primary.harness, model=primary.model, fallbacks=tuple(fallbacks)
         ),
-        dispatch=DispatchConfig(default_limit=5),
+        # The tree-headroom term ships ON (default cpu_count//2) and would clamp a
+        # 5-wide request on small hosts -- pin both host-load knobs to 0 so these
+        # tests exercise the harness ceilings alone.
+        dispatch=DispatchConfig(
+            default_limit=5,
+            host_load_max_pytest_processes=0,
+            host_load_max_pytest_trees=0,
+        ),
         fleet=FleetConfig(
             global_max_concurrent_sessions=total_cap,
             max_concurrent_sessions_by_harness=caps or {},
