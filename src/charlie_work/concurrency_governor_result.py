@@ -6,8 +6,14 @@ A leaf module: stdlib only, so both ``workflow`` (re-export) and
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any
+
+
+def _empty_mapping() -> Mapping[str, int]:
+    return MappingProxyType({})
 
 
 @dataclass(frozen=True)
@@ -70,6 +76,16 @@ class ConcurrencyGovernorResult:
     # instead of requiring a reader to redo the min() by hand
     # (zero-dispatch-is-a-capacity-question-first).
     clamped_by: str | None = None
+    # Issue #2757: per-harness ceilings (``fleet.max_concurrent_sessions_by_harness``)
+    # and the fleet-wide live count behind each, both keyed by HARNESS name (the
+    # live count is derived from sidecar ``adapter_kind`` through the harness
+    # registry). Empty -- the default and the unconfigured case -- means the term is
+    # off and nothing about the report changes. The governor only MEASURES these:
+    # which harness a launch lands on is decided by the role-chain selection in
+    # ``worker_launch_gate.issue_worker_launch_permit``, which reads them back via
+    # :meth:`harness_available` and sets ``clamped_by="harness_max"`` when it binds.
+    harness_caps: Mapping[str, int] = field(default_factory=_empty_mapping)
+    harness_live_counts: Mapping[str, int] = field(default_factory=_empty_mapping)
 
     @property
     def enabled(self) -> bool:
@@ -80,6 +96,18 @@ class ConcurrencyGovernorResult:
     def fleet_enabled(self) -> bool:
         """Return True if the fleet governor is enabled (fleet_max > 0)."""
         return self.fleet_max > 0
+
+    @property
+    def harness_enabled(self) -> bool:
+        """Return True if any per-harness ceiling is configured."""
+        return bool(self.harness_caps)
+
+    def harness_available(self, harness: str) -> int | None:
+        """Free slots under ``harness``'s ceiling; ``None`` when it has none."""
+        cap = self.harness_caps.get(harness)
+        if cap is None:
+            return None
+        return max(0, cap - self.harness_live_counts.get(harness, 0))
 
     @property
     def open_pr_enabled(self) -> bool:
@@ -121,6 +149,7 @@ class ConcurrencyGovernorResult:
             or self.open_pr_enabled
             or self.ci_headroom_enabled
             or self.host_load_enabled
+            or self.harness_enabled
         )
 
     def report_fields(self) -> dict[str, Any]:
@@ -133,6 +162,11 @@ class ConcurrencyGovernorResult:
         if self.fleet_enabled:
             fields["fleet_concurrency_limit"] = self.fleet_max
             fields["fleet_live_session_count"] = self.fleet_live_count
+        if self.harness_enabled:
+            fields["harness_concurrency_limits"] = dict(self.harness_caps)
+            fields["harness_live_session_counts"] = {
+                harness: self.harness_live_counts.get(harness, 0) for harness in self.harness_caps
+            }
         if self.open_pr_enabled:
             fields["open_pr_count"] = self.open_pr_count
             fields["open_pr_max"] = self.open_pr_max
