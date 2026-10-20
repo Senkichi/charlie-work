@@ -509,7 +509,11 @@ def test_requeue_route_needs_a_linked_issue() -> None:
 
 
 def test_requeue_route_defers_to_a_human_merge_hand_off() -> None:
-    """A human-merge label escalates as policy; the requeue route must not also fire."""
+    """A human-merge label escalates as policy; the rework route must not also fire.
+
+    Review round 1 (issue #2743): the hold also means no re-add was attempted,
+    so the ledger stays flat and the cap does not engage under it.
+    """
     facts = mf.hold_facts(
         config=REQUEUE_CFG,
         persisted=_requeue_persisted(2),
@@ -520,4 +524,49 @@ def test_requeue_route_defers_to_a_human_merge_hand_off() -> None:
     plan = decide_merge(_reverted_readiness(human_merge_hold=True), facts)
     assert plan.action_human_merge is True
     assert plan.requeue_rework is False
-    assert plan.mergequeue_requeue_capped is True
+    assert plan.mergequeue_requeue_capped is False
+    assert Hold.REQUEUE_CAPPED not in plan.holds
+    assert plan.mergequeue_requeues == 2
+
+
+def _requeue_cap_facts(**over: Any) -> Any:
+    """Hold facts for a PR one counted revert under the cap of 3."""
+    base: dict[str, Any] = {
+        "config": REQUEUE_CFG,
+        "persisted": _requeue_persisted(2),
+        "merge_hold": False,
+        "issue_status": "pr_open",
+        "live_head_sha": mf.HEAD,
+    }
+    return mf.hold_facts(**{**base, **over})
+
+
+@pytest.mark.parametrize(
+    "over",
+    [
+        pytest.param({"pr_escalated": True}, id="pr-escalated"),
+        pytest.param({"issue_escalated": True}, id="issue-escalated"),
+    ],
+)
+def test_requeue_rework_requires_a_non_escalated_merge_pass(over: dict[str, Any]) -> None:
+    """Review round 1 (issue #2743): an escalated hold leaves ``can_merge``
+    intact but must neither cap the pass nor route it to rework by the queue
+    cap -- and the counter stays flat, because no re-add was attempted."""
+    plan = decide_merge(_reverted_readiness(), _requeue_cap_facts(**over))
+    assert plan.requeue_rework is False
+    assert plan.mergequeue_requeue_capped is False
+    assert Hold.REQUEUE_CAPPED not in plan.holds
+    assert plan.mergequeue_requeues == 2
+    # The escalated hold itself still holds the pass as usual.
+    assert plan.escalated_merge_hold is True
+
+
+def test_requeue_rework_requires_should_merge() -> None:
+    """Review round 1 (issue #2743): a non-merge pass is never routed to
+    rework, never capped, and never counts the reverted label."""
+    plan = decide_merge(
+        _reverted_readiness(), _requeue_cap_facts(should_merge=False)
+    )
+    assert (plan.requeue_rework, plan.mergequeue_requeue_capped) == (False, False)
+    assert plan.mergequeue_requeues == 2
+    assert plan.kind == PlanKind.NONE

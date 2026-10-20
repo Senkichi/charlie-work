@@ -49,6 +49,7 @@ from .mergequeue import (
     is_already_in_mergequeue,
     merge_entry,
     merge_hold_read_needed,
+    mergequeue_re_add_pending,
     mergequeue_stamp_needs_now,
     requeue_accounting,
     requeue_gate,
@@ -438,14 +439,17 @@ def decide_merge(readiness: Readiness, holds: HoldFacts) -> MergePlan:
     merge_hold = read_merge_hold and holds.merge_hold is True
     merge_hold_unavailable = read_merge_hold and holds.merge_hold_unavailable
 
-    # Issue #2743: the projected same-head queue-revert count and cap verdict.
-    requeue = requeue_gate(readiness, holds)
+    # Issue #2743: the projected same-head queue-revert count and cap verdict,
+    # counted only when this pass would attempt the re-add (a held pass is a
+    # a hold, not an Aviator revert). The cap gate itself holds only on a
+    # merge pass -- should_merge, no escalated hold -- so a held PR never
+    # caps and is never routed to rework by the queue cap.
+    re_add_pending = mergequeue_re_add_pending(readiness, holds)
+    requeue = requeue_gate(readiness, holds, re_add_pending=re_add_pending)
     requeue_capped = requeue.capped
     requeue_rework = requeue.rework
 
-    action_hand_off = (
-        read_merge_hold and not merge_hold and not merge_hold_unavailable and not requeue_capped
-    )
+    action_hand_off = re_add_pending and not requeue_capped
     action_merge = enter and not label
     action_human_merge = human_hold and can_merge and should_merge and not escalated_merge_hold
 
@@ -653,9 +657,18 @@ def decide_accounting(
         else:
             since, head_sha = facts.locked.mergequeue_since, facts.locked.mergequeue_head_sha
 
-    # Issue #2743: persist the same-head requeue count when this pass observed
-    # a counted revert; the cap event fires exactly once, at the crossing pass.
-    delta = requeue_accounting(adm, can_merge, facts)
+    # Issue #2743 (review round 1): the requeue ledger advances only when this
+    # pass engaged the queue cycle -- a re-add was attempted (the hand-off
+    # effect ran and reported its outcome) or the cap gate itself refused one
+    # at the crossing/post-cap pass. A held pass (merge-hold, escalated or
+    # human-merge hold, should_merge=False) observes the reverted label but
+    # stays flat: no re-add, no climb, no cap event.
+    re_add_wanted = (
+        plan.action_hand_off
+        or results.mergequeue_label_applied is not None
+        or plan.mergequeue_requeue_capped
+    )
+    delta = requeue_accounting(adm, can_merge, facts, re_add_wanted=re_add_wanted)
     requeues = delta.requeues
     requeues_head = delta.head_sha
     if delta.capped_payload is not None:

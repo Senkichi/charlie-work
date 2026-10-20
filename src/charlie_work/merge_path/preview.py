@@ -14,7 +14,7 @@ from __future__ import annotations
 from typing import Any
 
 from .decide import decide_readiness
-from .mergequeue import merge_entry, mergequeue_requeue_count
+from .mergequeue import merge_entry, requeue_gate
 from .gather import (
     config_slice,
     gather_branch,
@@ -113,18 +113,16 @@ def preview_merge_ready(
         gather_merge_hold(app, opening.pr, issue_number) if enter else (False, False)
     )
     # The preview runs no accounting, so report the projection decide_merge
-    # would see (persisted count plus this pass's counted revert, if any) and
-    # whether the cap gate would fire -- a capped PR must not read "would hand
-    # off" in a dry run (issue #2743).
-    requeues = mergequeue_requeue_count(
-        persisted, gate.admission, readiness.gate.can_merge, live_head
-    )
-    requeue_capped = bool(
-        cfg.mergequeue_label
-        and readiness.gate.can_merge
-        and live_head
-        and cfg.mergequeue_requeue_cap > 0
-        and requeues >= cfg.mergequeue_requeue_cap
+    # would see through its own ``requeue_gate`` (issue #2743): the ledger
+    # climbs only when this pass would attempt the re-add, so a held dry run
+    # (merge-hold, should_merge=False) does not project the count toward the
+    # cap, and a capped PR must not read "would hand off" (issue #2743).
+    requeue = requeue_gate(
+        readiness,
+        holds,
+        re_add_pending=bool(
+            enter and merge_hold is False and not merge_hold_unavailable
+        ),
     )
     return render_preview_final(
         ports,
@@ -141,7 +139,7 @@ def preview_merge_ready(
             merge_hold_label=app.config.labels.merge_hold,
             failed_attempts=persisted.failed_attempts,
             stale_base_deferrals=persisted.stale_base_deferrals,
-            mergequeue_requeues=requeues,
-            mergequeue_requeue_capped=requeue_capped,
+            mergequeue_requeues=requeue.requeues,
+            mergequeue_requeue_capped=requeue.capped,
         ),
     )

@@ -6,7 +6,14 @@ from typing import Any
 
 import _merge_path_facts as mf
 import pytest
-from charlie_work.merge_path import EffectResults, MergePlan, PlanKind, decide_accounting
+from charlie_work.merge_path import (
+    EffectResults,
+    Hold,
+    MergePlan,
+    PlanKind,
+    decide_accounting,
+    decide_merge,
+)
 
 BLOCKED_GATE = mf.gate(summary_ready=False)
 PENDING = mf.summary(passed=(), pending=mf.REQUIRED)
@@ -393,10 +400,21 @@ def test_a_merged_pr_drops_the_mergequeue_stamps() -> None:
 # --------------------------------------------------------------------------- #
 
 
-def _reverted_plan(**over: Any) -> MergePlan:
+def _reverted_plan(**readiness_over: Any) -> MergePlan:
     admission = mf.admission(mergequeue_label_reverted=True)
     base: dict[str, Any] = {"branch": mf.branch_gate(admission=admission)}
-    return _plan(**{**base, **over})
+    return _plan(**{**base, **readiness_over})
+
+
+def _capped_reverted_plan() -> MergePlan:
+    """The plan decide_merge returns at the crossing pass: the cap gate fired
+    (no re-add was attempted), which is itself the accounting advance."""
+    admission = mf.admission(mergequeue_label_reverted=True)
+    return MergePlan(
+        kind=PlanKind.REQUEST_REWORK,
+        readiness=mf.readiness(branch=mf.branch_gate(admission=admission)),
+        mergequeue_requeue_capped=True,
+    )
 
 
 def _requeue_locked(requeues: int, head: str | None = mf.HEAD, **over: Any) -> Any:
@@ -459,8 +477,11 @@ def test_uncounted_reverts_leave_the_requeue_fields_alone(
 
 
 def test_reaching_the_cap_emits_mergequeue_requeue_capped_once() -> None:
+    """The crossing pass: no re-add was attempted (the cap refused it) but the
+    plan carries the cap verdict, so the count still reaches the cap and the
+    event fires exactly once."""
     acc = decide_accounting(
-        _reverted_plan(),
+        _capped_reverted_plan(),
         EffectResults(mergequeue_label_applied=None),
         _facts(config=HANDOFF_CFG, locked=_requeue_locked(2), live_head_sha=mf.HEAD),
     )
@@ -477,7 +498,9 @@ def test_reaching_the_cap_emits_mergequeue_requeue_capped_once() -> None:
 
 def test_past_the_cap_does_not_reemit_the_event() -> None:
     acc = decide_accounting(
-        _reverted_plan(),
+        # Still carrying the cap verdict: a post-cap pass with no re-add keeps
+        # climbing the ledger without re-emitting (same as before round 1).
+        _capped_reverted_plan(),
         EffectResults(mergequeue_label_applied=None),
         _facts(config=HANDOFF_CFG, locked=_requeue_locked(3), live_head_sha=mf.HEAD),
     )
@@ -506,3 +529,63 @@ def test_a_self_revoked_revert_neither_counts_nor_emits() -> None:
     )
     assert acc.mergequeue_requeues is None
     assert "mergequeue_requeue_capped" not in _kinds(acc)
+
+
+# --------------------------------------------------------------------------- #
+# The re-add gate on the requeue ledger (review round 1, issue #2743)
+# --------------------------------------------------------------------------- #
+
+
+def _requeue_pass(locked: Any, hold_over: dict[str, Any]) -> tuple[MergePlan, Any]:
+    """One decide_merge + decide_accounting round against the given lock."""
+    config = mf.cfg(mergequeue_label=mf.LABEL)
+    admission = mf.admission(mergequeue_label_reverted=True)
+    readiness = mf.readiness(branch=mf.branch_gate(admission=admission))
+    hold = mf.hold_facts(
+        config=config,
+        persisted=locked,
+        issue_status="pr_open",
+        live_head_sha=mf.HEAD,
+        **hold_over,
+    )
+    plan = decide_merge(readiness, hold)
+    acc = decide_accounting(
+        plan,
+        EffectResults(),
+        _facts(config=config, locked=locked, live_head_sha=mf.HEAD),
+    )
+    return plan, acc
+
+
+@pytest.mark.parametrize(
+    ("hold_over", "hold"),
+    [
+        pytest.param({"merge_hold": True}, Hold.MERGE_HOLD, id="merge-hold"),
+        pytest.param({"issue_escalated": True}, Hold.ESCALATED, id="escalated-hold"),
+        pytest.param({"should_merge": False}, None, id="not-a-merge-pass"),
+    ],
+)
+def test_a_held_pass_never_climbs_toward_the_requeue_cap(
+    hold_over: dict[str, Any], hold: Hold | None
+) -> None:
+    """Review round 1 (issue #2743): a pass that observes the reverted label
+    but attempts no re-add (merge-hold, escalated hold, should_merge=False)
+    keeps ``consecutive_mergequeue_requeues`` flat and never engages the cap,
+    no matter how many such passes repeat."""
+    locked = mf.persisted(
+        status="mergequeue",
+        mergequeue_requeues=2,  # one counted revert short of the cap of 3
+        mergequeue_requeues_head_sha=mf.HEAD,
+    )
+    for _ in range(3):
+        plan, acc = _requeue_pass(locked, hold_over)
+        assert acc.mergequeue_requeues is None
+        assert acc.mergequeue_requeues_head_sha is None
+        assert "mergequeue_requeue_capped" not in _kinds(acc)
+        assert plan.requeue_rework is False
+        assert plan.mergequeue_requeues == 2
+        assert Hold.REQUEUE_CAPPED not in plan.holds
+        if hold is None:
+            assert plan.kind == PlanKind.NONE
+        else:
+            assert hold in plan.holds

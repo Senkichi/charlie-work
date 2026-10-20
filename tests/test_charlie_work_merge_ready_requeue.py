@@ -181,6 +181,78 @@ def test_requeue_cap_zero_disables_the_gate(tmp_path: Path) -> None:
     assert _events(paths, "mergequeue_requeue_capped") == []
 
 
+def _seed_reverted_requeue(paths) -> None:
+    """A PR parked in the queue one counted revert under the cap of 3."""
+    _seed_pr(
+        paths,
+        status="mergequeue",
+        consecutive_mergequeue_requeues=2,
+        mergequeue_requeues_head_sha="sha-abc123",
+    )
+
+
+def _assert_held_pass_never_climbs(paths) -> None:
+    """Round 1 invariant: hold passes that never re-add never touch the cap lane."""
+    state = load_state(paths.state_file)
+    pr_entry = state["prs"][str(_PR)]
+    assert pr_entry["consecutive_mergequeue_requeues"] == 2
+    assert state["issues"].get(str(_ISSUE), {}).get("status") != "rework_requested"
+    assert _events(paths, "mergequeue_requeue_capped") == []
+    assert _events(paths, "mergequeue_requeue_rework_requested") == []
+
+
+def test_a_merge_held_pr_does_not_climb_toward_the_requeue_cap(tmp_path: Path) -> None:
+    """E2E variant of the review round 1 fix (issue #2743): a merge-hold PR in
+    the queue keeps observing the reverted label for pass after pass -- but no
+    re-add is attempted, so the ledger stays flat and the cap never fires."""
+    app, gh, paths = _app(tmp_path)
+    _seed_reverted_requeue(paths)
+    gh.prs[0]["labels"] = [{"name": "agent:merge-hold"}]
+
+    for _ in range(3):
+        result = app.merge_ready(_PR, merge=True)
+        assert result.data["consecutive_mergequeue_requeues"] == 2
+        assert result.data["mergequeue_requeue_capped"] is False
+
+    assert _mergequeue_adds(gh) == 0
+    _assert_held_pass_never_climbs(paths)
+
+
+def test_an_escalated_hold_does_not_climb_toward_the_requeue_cap(tmp_path: Path) -> None:
+    """Round 1 (issue #2743): while the linked issue sits escalated the pass
+    still observes the reverted label, but the escalated hold blocks the
+    re-add, so the ledger stays flat and the cap never routes to rework."""
+    app, gh, paths = _app(tmp_path)
+    _seed_reverted_requeue(paths)
+    with state_lock(paths.state_file):
+        state = load_state(paths.state_file)
+        state["issues"][str(_ISSUE)] = {"number": _ISSUE, "status": "escalated"}
+        save_state(paths.state_file, state)
+
+    for _ in range(3):
+        result = app.merge_ready(_PR, merge=True)
+        assert result.data["consecutive_mergequeue_requeues"] == 2
+        assert result.data["mergequeue_requeue_capped"] is False
+
+    assert _mergequeue_adds(gh) == 0
+    _assert_held_pass_never_climbs(paths)
+
+
+def test_a_non_merge_pass_does_not_climb_toward_the_requeue_cap(tmp_path: Path) -> None:
+    """Round 1 (issue #2743): a pass with should_merge=False observes the
+    reverted label but attempts no re-add -- the ledger stays flat."""
+    app, gh, paths = _app(tmp_path)
+    _seed_reverted_requeue(paths)
+
+    for _ in range(3):
+        result = app.merge_ready(_PR, merge=False)
+        assert result.data["consecutive_mergequeue_requeues"] == 2
+        assert result.data["mergequeue_requeue_capped"] is False
+
+    assert _mergequeue_adds(gh) == 0
+    _assert_held_pass_never_climbs(paths)
+
+
 def test_requeue_cap_escalates_when_the_rework_budget_is_spent(tmp_path: Path) -> None:
     """Issue #2743 AC-2: an exhausted mergequeue_rework_attempts budget turns
     the capped PR into an escalation, not another rework dispatch."""
