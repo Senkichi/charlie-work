@@ -4,4 +4,8 @@ warning
 # bookkeeping without running review or the suite gate. Warning, not info:
 # a record reaching this edge means work landed by another path -- exactly
 # the shape that used to livelock -- so each fire is worth an operator's
-# glance; the record is terminal afterwards, so it cannot repeat.
+# glance. The event fires only when the base advance completes (merged or
+# already-contained), so it cannot repeat while a deferred advance holds
+# the record non-terminal (review round 2): a deferral reports
+# local_merge_deferred instead and the record retries the merge on a
+# later pass without re-emitting this event.

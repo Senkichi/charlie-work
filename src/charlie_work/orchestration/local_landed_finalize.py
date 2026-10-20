@@ -20,8 +20,10 @@ Three delegates live here:
   record to the gate's existing merge bookkeeping, which reports ``already``
   or performs a content-free merge, lands the issue at done, and closes it.
 * ``_local_landed_or_closed_skip`` -- the packet phase's pre-build check:
-  finalize the landed shape; decline to rebuild a packet (or apply the
-  ``review_started`` edge) for a record whose tracker issue is already
+  finalize the landed shape (behind the same ``auto_merge.enabled`` switch
+  that gates ``_local_merge_approved`` -- it mutates the base, tears down
+  the branch and closes the issue); decline to rebuild a packet (or apply
+  the ``review_started`` edge) for a record whose tracker issue is already
   closed when the branch cannot prove unmerged content.
 * ``_local_gate_abort_streak_tick`` -- the bounded backstop. The
   livelock's signature is one "record left approved" gate abort per review
@@ -67,6 +69,16 @@ def _local_finalize_landed(
     gate walk abort it as "record left approved" -- one round of the churn
     this issue is about.
 
+    The claim clear is its own locked write (a crash mid-finalize can never
+    leave a stale suite claim); the ``local_review_skipped_landed`` audit
+    event follows the merge outcome instead (review round 2, issue #2739):
+    on a deferred base advance the record is not terminal yet, so emitting
+    the event would repeat it on every pass while the diff stays empty.
+    The event fires only when the finalize reaches a merged / already-
+    contained outcome, and the durable terminal signal is the
+    ``merge_succeeded`` event inside ``_local_gate_finalize_merge``'s
+    locked terminal write.
+
     Returns ``_local_gate_finalize_merge``'s bool: True only when the base
     advance deferred (the gate stays held for a retry).
     """
@@ -78,24 +90,11 @@ def _local_finalize_landed(
         killed = self.write_gate.kill_process_tree(
             pid, record.get("local_suite_process_start_time")
         )
-    # Claim clear + audit event go through one locked write so a crash can
-    # never tear them apart (``_local_gate_update``'s contract).
     self._local_gate_update(
         pr_key,
         {field: None for field in LOCAL_SUITE_CLAIM_FIELDS},
-        event=(
-            "local_review_skipped_landed",
-            {
-                "pr_number": pr_number,
-                "issue_number": issue_number,
-                "branch": branch,
-                "base_ref": base_ref,
-                "head_sha": live_head,
-                "killed_pids": killed,
-            },
-        ),
     )
-    return self._local_gate_finalize_merge(
+    deferred = self._local_gate_finalize_merge(
         pr_key=pr_key,
         record={**record, **{field: None for field in LOCAL_SUITE_CLAIM_FIELDS}},
         entry=entry,
@@ -104,6 +103,21 @@ def _local_finalize_landed(
         live_head=live_head,
         decision=decision,
     )
+    if entry.get("outcome") in ("merged", "already_merged"):
+        self._local_gate_event(
+            "local_review_skipped_landed",
+            {
+                "pr_number": pr_number,
+                "issue_number": issue_number,
+                "branch": branch,
+                "base_ref": base_ref,
+                "head_sha": live_head,
+                "killed_pids": killed,
+                "outcome": entry.get("outcome"),
+                "merged_sha": entry.get("merged_sha"),
+            },
+        )
+    return deferred
 
 
 def _local_landed_or_closed_skip(
@@ -137,9 +151,20 @@ def _local_landed_or_closed_skip(
       edge -- otherwise the lane re-applies the pr-open/reviewing labels
       the drift reconciler strips, forever. A non-empty diff still
       surfaces (``are_issues_open`` treats the same shape as still-open).
+
+    The landed finalize is a ``_local_merge_approved`` action: it advances
+    the base, tears down the branch/worktree and closes the issue, so it
+    runs behind the same ``auto_merge.enabled`` switch ``_local_lane``
+    gates ``_local_merge_approved`` on (review round 2, issue #2739). With
+    the switch off the record is left untouched -- no finalize, no packet
+    rebuild -- and the skip is reported as ``landed_auto_merge_off`` so the
+    lane's result report shows why nothing moved.
     """
     live_diff = branch_diff(self.repo_root, base_ref, branch)
-    if live_diff == "" and not issue_live:
+    landed = live_diff == "" and not issue_live
+    if landed and not self.config.auto_merge.enabled:
+        return {"issue": issue_number, "reason": "landed_auto_merge_off"}
+    if landed:
         entry: dict[str, Any] = {"issue": issue_number, "pr": int(pr_key)}
         self._local_finalize_landed(
             pr_key=pr_key,

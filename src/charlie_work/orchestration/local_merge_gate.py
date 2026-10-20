@@ -774,24 +774,17 @@ def _local_gate_launch(
     The base-sync merge is fast git plumbing and stays inline; everything
     after it (attach, spawn, claim write) returns in well under a second.
     Returns True only when a suite is actually in flight.
+
+    Precondition: the caller verified the branch diff is non-empty this
+    pass. Every launch path -- new launch, orphan relaunch, resync (this
+    module and ``local_gate_infra_relaunch.py``) -- runs inside
+    ``_local_merge_approved`` after its single landed check, which fires
+    the terminal edge and skips every downstream launch path in the same
+    walk. The launch-site re-check reviewed as redundant in issue #2739's
+    round 2 was removed here; the walk's per-pass check is the one seam.
     """
     pr_number = int(pr_key)
     issue_number = int(record.get("issue_number") or pr_number)
-    if branch_diff(self.repo_root, base_ref, branch) == "":
-        # Issue #2739: an empty three-dot diff means the branch's content is
-        # already on the base -- nothing for a suite to prove and nothing
-        # for the sync merge to add. Finalize through the terminal edge
-        # instead of spawning (or re-spawning, on the poll/relaunch
-        # callers) a suite that can only churn the record.
-        return self._local_finalize_landed(
-            pr_key=pr_key,
-            record=record,
-            entry=entry,
-            branch=branch,
-            base_ref=base_ref,
-            live_head=branch_head_sha(self.repo_root, branch) or "",
-            decision=decision,
-        )
     argv = suite_command_argv(self.config.dispatch.test_command, self.repo_root)
     if argv is None:
         # No resolvable suite command: fail closed. A lane that cannot

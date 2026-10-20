@@ -12,9 +12,12 @@ repeat. A closed tracker issue with stale ``agent:pr-open`` /
 stripped them, the packet phase re-applied ``review_started``, repeat.
 
 The fix gives an empty *successful* ``branch_diff`` terminal semantics at
-three seams: the shared carry-forward predicate, the packet phase
-(``_local_review_packets``), and the gate's launch site
-(``_local_gate_launch``). A bounded "record left approved" abort streak
+two seams: the shared carry-forward predicate and the packet phase
+(``_local_review_packets``); the merge walk keeps the single landed check
+that delegates to the shared finalize (the launch-site re-check in
+``_local_gate_launch`` was removed as redundant in review round 2 -- every
+launch path runs inside ``_local_merge_approved``, after its per-pass
+landed check). A bounded "record left approved" abort streak
 (``LOCAL_GATE_ABORT_STREAK_LIMIT``) escalates the cycle mechanically if it
 ever re-forms.
 """
@@ -27,7 +30,7 @@ from pathlib import Path
 import pytest
 
 from charlie_work.labels import transition
-from charlie_work.local_lane import branch_diff, worktree_for_branch
+from charlie_work.local_lane import branch_diff, branch_head_sha, worktree_for_branch
 from charlie_work.process_utils import is_pid_alive
 from charlie_work.state import load_state, load_state_locked, save_state, state_lock
 from charlie_work.workflow import OrchestratorApp
@@ -261,10 +264,12 @@ def test_closed_issue_with_real_diff_still_surfaces(lane_repo: Path) -> None:
     assert [p["issue"] for p in outcome["packets"]] == [7]
 
 
-def test_gate_launch_on_landed_branch_merges_without_suite(lane_repo: Path) -> None:
-    """The gate's own seam: an approved record whose diff is already empty
-    takes the terminal bookkeeping at launch time instead of spawning a
-    suite that can prove nothing -- and does not hold the one-gate slot."""
+def test_merge_walk_landed_edge_finalizes_without_suite(lane_repo: Path) -> None:
+    """The merge walk's single landed check: an approved record whose diff
+    is already empty takes the terminal bookkeeping instead of spawning a
+    suite that can prove nothing -- and does not hold the one-gate slot.
+    (The launch-site re-check was removed as redundant in review round 2;
+    this walk-level check is the one seam every launch path runs after.)"""
     issues_dir = lane_repo / "docs" / "issues"
     _init_repo(lane_repo)
     head = _make_branch(lane_repo, BRANCH, "a.py", "a = 1\n")
@@ -369,6 +374,235 @@ def test_abort_streak_resets_when_patch_id_changes(lane_repo: Path) -> None:
     assert entry["outcome"] == "gate_aborted"
     assert record["local_gate_abort_streak"] == 1
     assert record["status"] == "reviewing"
+
+
+def test_landed_record_with_auto_merge_disabled_is_left_untouched(
+    lane_repo: Path,
+) -> None:
+    """Review round 2: the packet phase's landed finalization mutates the
+    base, tears down the branch and closes the issue -- actions
+    ``_local_lane`` runs behind the ``auto_merge.enabled`` switch. With the
+    switch off, the landed shape is skipped without touching the record:
+    no base advance, no issue close, no finalize events, no packet
+    rebuild."""
+    issues_dir = lane_repo / "docs" / "issues"
+    _init_repo(lane_repo)
+    head = _make_branch(lane_repo, BRANCH, "a.py", "a = 1\n")
+    app = _lane_app(
+        lane_repo,
+        issues_dir,
+        config=_lane_config(lane_repo, issues_dir, auto_merge={"enabled": False}),
+    )
+    _adopt_and_approve(app, issues_dir, 7, BRANCH, head)
+    labels_before = {label["name"] for label in app.gh.issue_view(7)["labels"]}
+    _commit_file(lane_repo, "a.py", "a = 1\n", "feat: same content landed directly")
+    _landed_sync_merge(lane_repo, BRANCH)
+    assert branch_diff(lane_repo, "main", BRANCH) == ""
+    main_before = branch_head_sha(lane_repo, "main")
+
+    outcome = app._local_review_packets()
+
+    assert outcome["packets"] == []
+    assert {e["reason"] for e in outcome["skipped"]} == {"landed_auto_merge_off"}
+    marker = len(_event_kinds(app))
+    second = app._local_review_packets()
+    assert second["packets"] == []
+    assert {e["reason"] for e in second["skipped"]} == {"landed_auto_merge_off"}
+    assert len(_event_kinds(app)) == marker  # no audit event repeats per pass
+    record = load_state_locked(app.paths.state_file)["prs"]["7"]
+    assert record["status"] == "approved"
+    assert branch_head_sha(lane_repo, "main") == main_before
+    issue = app.gh.issue_view(7)
+    assert issue["state"] == "OPEN"
+    assert {label["name"] for label in issue["labels"]} == labels_before
+
+
+def test_packet_phase_landed_deferral_does_not_repeat_landed_event(
+    lane_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review round 2: while the base advance is deferred, the record is
+    NOT terminal yet -- the landed audit event must not fire, and must not
+    repeat on every retry pass; it fires once when a later pass completes
+    the advance.
+
+    The deferral is engineered: an empty-diff branch's base advance is
+    content-free, so real git on this shape reports merged/already (the
+    merge never needs to rewrite the base checkout, so base dirt cannot
+    defer it). A fake ``merge_branch_into_base`` yields one outcome per
+    pass -- deferred, deferred, merged -- while the real finalize
+    bookkeeping runs for each (the third call therefore also exercises the
+    real teardown/close/label edge over a merged outcome)."""
+    issues_dir = lane_repo / "docs" / "issues"
+    _init_repo(lane_repo)
+    head = _make_branch(lane_repo, BRANCH, "a.py", "a = 1\n")
+    app = _lane_app(lane_repo, issues_dir)
+    _adopt_and_approve(app, issues_dir, 7, BRANCH, head)
+    _commit_file(lane_repo, "a.py", "a = 1\n", "feat: same content landed directly")
+    _landed_sync_merge(lane_repo, BRANCH)
+    assert branch_diff(lane_repo, "main", BRANCH) == ""
+    main_before = branch_head_sha(lane_repo, "main")
+
+    # Local import: the delegate module imports ``workflow`` at module level.
+    from charlie_work.local_lane import LocalMergeOutcome
+    from charlie_work.orchestration import local_gate_finalize
+
+    outcomes: list[tuple[str, str]] = [
+        ("deferred", "ff-only refused"),
+        ("deferred", "ff-only refused"),
+        ("merged", ""),
+    ]
+
+    def scripted_merge(
+        _repo_root: Path, _base: str, _branch: str, **_kwargs: Path
+    ) -> LocalMergeOutcome:
+        status, detail = outcomes.pop(0)
+        return LocalMergeOutcome(
+            status=status,
+            fast_forward=False,
+            merged_sha=head if status == "merged" else None,
+            detail=detail,
+        )
+
+    monkeypatch.setattr(local_gate_finalize, "merge_branch_into_base", scripted_merge)
+
+    first = app._local_review_packets()
+
+    assert first["packets"] == []
+    assert first["skipped"] == [{"issue": 7, "reason": "landed", "outcome": "deferred"}]
+    events = load_state_locked(app.paths.state_file)["events"]
+    kinds = [e["kind"] for e in events]
+    assert "local_review_skipped_landed" not in kinds
+    deferred = [e for e in events if e["kind"] == "local_merge_deferred"]
+    assert len(deferred) == 1
+    assert "ff-only" in deferred[-1]["payload"]["detail"]
+    record = load_state_locked(app.paths.state_file)["prs"]["7"]
+    assert record["status"] == "approved"  # not terminal yet
+    assert branch_head_sha(lane_repo, "main") == main_before
+    assert app.gh.issue_view(7)["state"] == "OPEN"
+
+    # A second pass retries the merge alone (issue #2189 shape): the landed
+    # audit event must not appear, let alone repeat.
+    second = app._local_review_packets()
+    assert second["skipped"][0]["outcome"] == "deferred"
+    record = load_state_locked(app.paths.state_file)["prs"]["7"]
+    assert record["status"] == "approved"
+    kinds = [e["kind"] for e in load_state_locked(app.paths.state_file)["events"]]
+    assert "local_review_skipped_landed" not in kinds
+
+    # The third pass completes the advance: the record goes terminal and
+    # the landed event fires exactly once -- at terminal.
+    third = app._local_review_packets()
+
+    assert third["skipped"][0]["outcome"] == "merged"
+    record = load_state_locked(app.paths.state_file)["prs"]["7"]
+    assert record["status"] == "merged"
+    landed = [e for e in _event_kinds(app) if e == "local_review_skipped_landed"]
+    assert len(landed) == 1
+    issue = app.gh.issue_view(7)
+    assert issue["state"] == "CLOSED"
+    assert {label["name"] for label in issue["labels"]} == {app.config.labels.done}
+
+
+def test_packet_phase_landed_conflict_routes_rework_without_landed_event(
+    lane_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review round 2: a conflict outcome from the packet phase's landed
+    edge routes the record to rework through the gate's existing routing --
+    no ``local_review_skipped_landed`` audit event and no merged
+    bookkeeping, because the record is not terminal."""
+    issues_dir = lane_repo / "docs" / "issues"
+    _init_repo(lane_repo)
+    head = _make_branch(lane_repo, BRANCH, "a.py", "a = 1\n")
+    app = _lane_app(lane_repo, issues_dir)
+    _adopt_and_approve(app, issues_dir, 7, BRANCH, head)
+    _commit_file(lane_repo, "a.py", "a = 1\n", "feat: same content landed directly")
+    _landed_sync_merge(lane_repo, BRANCH)
+    assert branch_diff(lane_repo, "main", BRANCH) == ""
+    main_before = branch_head_sha(lane_repo, "main")
+
+    # Local import: the delegate module imports ``workflow`` at module level.
+    from charlie_work.local_lane import LocalMergeOutcome
+    from charlie_work.orchestration import local_gate_finalize
+
+    def conflicted_merge(
+        _repo_root: Path, _base: str, _branch: str, **_kwargs: Path
+    ) -> LocalMergeOutcome:
+        return LocalMergeOutcome(
+            status="conflict",
+            fast_forward=False,
+            merged_sha=None,
+            detail="staged for test",
+            conflicted_paths=("a.py",),
+        )
+
+    monkeypatch.setattr(local_gate_finalize, "merge_branch_into_base", conflicted_merge)
+
+    outcome = app._local_review_packets()
+
+    assert outcome["packets"] == []
+    assert outcome["skipped"] == [{"issue": 7, "reason": "landed", "outcome": "conflict"}]
+    kinds = _event_kinds(app)
+    assert "local_review_skipped_landed" not in kinds
+    assert "merge_succeeded" not in kinds
+    assert "merge_conflict_rework_requested" in kinds
+    record = load_state_locked(app.paths.state_file)["prs"]["7"]
+    assert record["status"] == "rework_requested"
+    assert record["local_merge_conflict_rework_attempts"] == 1
+    assert branch_head_sha(lane_repo, "main") == main_before
+    assert app.gh.issue_view(7)["state"] == "OPEN"
+
+
+def test_packet_phase_landed_error_escalates_without_landed_event(
+    lane_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review round 2: an error outcome from the packet phase's landed edge
+    escalates mechanically through the gate's own escalation -- never a
+    ``local_review_skipped_landed`` audit event claiming the record is
+    terminal."""
+    issues_dir = lane_repo / "docs" / "issues"
+    _init_repo(lane_repo)
+    head = _make_branch(lane_repo, BRANCH, "a.py", "a = 1\n")
+    app = _lane_app(lane_repo, issues_dir)
+    _adopt_and_approve(app, issues_dir, 7, BRANCH, head)
+    _commit_file(lane_repo, "a.py", "a = 1\n", "feat: same content landed directly")
+    _landed_sync_merge(lane_repo, BRANCH)
+    assert branch_diff(lane_repo, "main", BRANCH) == ""
+    main_before = branch_head_sha(lane_repo, "main")
+
+    from charlie_work.local_lane import LocalMergeOutcome
+    from charlie_work.orchestration import local_gate_finalize
+
+    def failing_merge(
+        _repo_root: Path, _base: str, _branch: str, **_kwargs: Path
+    ) -> LocalMergeOutcome:
+        return LocalMergeOutcome(
+            status="error", fast_forward=False, merged_sha=None, detail="git exploded"
+        )
+
+    monkeypatch.setattr(local_gate_finalize, "merge_branch_into_base", failing_merge)
+
+    outcome = app._local_review_packets()
+
+    assert outcome["packets"] == []
+    assert outcome["skipped"] == [{"issue": 7, "reason": "landed", "outcome": "error"}]
+    kinds = _event_kinds(app)
+    assert "local_review_skipped_landed" not in kinds
+    assert "merge_succeeded" not in kinds
+    assert "local_merge_failed" in kinds
+    record = load_state_locked(app.paths.state_file)["prs"]["7"]
+    assert record["status"] == "escalated"
+    assert record["escalation_reason"] == "local_merge_error"
+    assert branch_head_sha(lane_repo, "main") == main_before
+    issue = app.gh.issue_view(7)
+    assert {label["name"] for label in issue["labels"]} == {
+        app.config.labels.operator_queue,
+        # ``automated-ready`` is not a workflow label, so the mechanical
+        # escalation edge leaves it alone.
+        app.config.labels.ready,
+    }
 
 
 def test_finalize_resets_abort_streak(lane_repo: Path) -> None:
