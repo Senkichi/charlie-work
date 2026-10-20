@@ -250,6 +250,110 @@ def test_detect_aviator_stale_blocked_readds_mergequeue_when_approved_at_live_he
     assert drift[0].add_labels == (mergequeue_label,)
 
 
+def _seed_requeue_count(
+    tmp_path: Path, config: OrchestratorConfig, pr_number: int, requeues: int, head: str
+) -> None:
+    from charlie_work.paths import runtime_paths
+    from charlie_work.state import load_state, save_state
+
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    paths.state_file.parent.mkdir(parents=True, exist_ok=True)
+    state = load_state(paths.state_file)
+    state["prs"][str(pr_number)] = {
+        "number": pr_number,
+        "status": "mergequeue",
+        "consecutive_mergequeue_requeues": requeues,
+        "mergequeue_requeues_head_sha": head,
+    }
+    save_state(paths.state_file, state)
+
+
+def test_detect_aviator_stale_blocked_cap_suppresses_the_requeue_but_not_the_repair(
+    tmp_path: Path,
+) -> None:
+    """Issue #2743: reconcile is the second unbounded re-add path -- after a
+    queue-branch failure Aviator leaves ``blocked`` + failing aviator/checks,
+    which is exactly this detector's trigger. At the per-head requeue cap the
+    stale ``blocked`` repair still runs but the label must NOT be re-added,
+    or the cap merge_ready enforces is bypassed on every reconcile pass."""
+    config = OrchestratorConfig()
+    mergequeue_label = config.auto_merge.mergequeue_label or "mergequeue"
+    config = replace(
+        config,
+        auto_merge=replace(config.auto_merge, mergequeue_label=mergequeue_label),
+    )
+    _pr, gh = _aviator_blocked_pr_and_gh(1408, "sha-1408")
+    _write_review_decision(
+        tmp_path,
+        config,
+        1408,
+        {"decision": "approved", "reviewed_head_sha": "sha-1408"},
+    )
+    cap = config.auto_merge.mergequeue_requeue_cap
+    _seed_requeue_count(tmp_path, config, 1408, cap, "sha-1408")
+
+    drift = detect_aviator_stale_blocked(gh, config, repo_root=tmp_path)
+
+    assert len(drift) == 1
+    assert drift[0].remove_labels == ("blocked",)
+    assert drift[0].add_labels == ()
+
+
+def test_detect_aviator_stale_blocked_readds_below_the_cap_at_the_same_head(
+    tmp_path: Path,
+) -> None:
+    """Cap - 1 recorded reverts: the bounded re-add still applies."""
+    config = OrchestratorConfig()
+    mergequeue_label = config.auto_merge.mergequeue_label or "mergequeue"
+    config = replace(
+        config,
+        auto_merge=replace(config.auto_merge, mergequeue_label=mergequeue_label),
+    )
+    _pr, gh = _aviator_blocked_pr_and_gh(1408, "sha-1408")
+    _write_review_decision(
+        tmp_path,
+        config,
+        1408,
+        {"decision": "approved", "reviewed_head_sha": "sha-1408"},
+    )
+    _seed_requeue_count(
+        tmp_path, config, 1408, config.auto_merge.mergequeue_requeue_cap - 1, "sha-1408"
+    )
+
+    drift = detect_aviator_stale_blocked(gh, config, repo_root=tmp_path)
+
+    assert len(drift) == 1
+    assert drift[0].add_labels == (mergequeue_label,)
+
+
+def test_detect_aviator_stale_blocked_readds_at_cap_under_a_new_head(
+    tmp_path: Path,
+) -> None:
+    """The counter is anchored to a head SHA: a pushed fix gets a fresh
+    queue budget even when the old head's count is at cap."""
+    config = OrchestratorConfig()
+    mergequeue_label = config.auto_merge.mergequeue_label or "mergequeue"
+    config = replace(
+        config,
+        auto_merge=replace(config.auto_merge, mergequeue_label=mergequeue_label),
+    )
+    _pr, gh = _aviator_blocked_pr_and_gh(1408, "sha-1408")
+    _write_review_decision(
+        tmp_path,
+        config,
+        1408,
+        {"decision": "approved", "reviewed_head_sha": "sha-1408"},
+    )
+    _seed_requeue_count(
+        tmp_path, config, 1408, config.auto_merge.mergequeue_requeue_cap, "sha-older"
+    )
+
+    drift = detect_aviator_stale_blocked(gh, config, repo_root=tmp_path)
+
+    assert len(drift) == 1
+    assert drift[0].add_labels == (mergequeue_label,)
+
+
 def test_apply_fixes_aviator_stale_blocked_removes_blocked_readds_mergequeue() -> None:
     config = OrchestratorConfig()
     mergequeue_label = config.auto_merge.mergequeue_label or "mergequeue"

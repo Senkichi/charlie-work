@@ -1,0 +1,4 @@
+info
+# Issue #2743: a queue-capped PR was routed to rework with the queue-branch
+# (``mq-bot-*``) failure as evidence. Routine state transition, same posture
+# as ``check_failure_rework_requested`` / ``merge_conflict_rework_requested``.

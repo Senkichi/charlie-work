@@ -23,7 +23,6 @@ from typing import Any, Mapping
 
 from .model import (
     MERGEQUEUE_WEDGED_REVOKE,
-    PersistedPr,
     Accounting,
     AccountingFacts,
     Admission,
@@ -45,6 +44,15 @@ from .model import (
     SyncOutcome,
     Unavailable,
     VerdictFact,
+)
+from .mergequeue import (
+    is_already_in_mergequeue,
+    merge_entry,
+    merge_hold_read_needed,
+    mergequeue_re_add_pending,
+    mergequeue_stamp_needs_now,
+    requeue_accounting,
+    requeue_gate,
 )
 from .readiness_gates import decide_revert, deescalates
 from .rules import (
@@ -83,53 +91,6 @@ def is_head_moved(verdict: VerdictFact, live_head_sha: str | None) -> bool:
 def needs_carry_forward(verdict: VerdictFact, live_head_sha: str | None) -> bool:
     """``AdmissionFacts.carry_forward`` is consumed: approved, head moved, live head known."""
     return verdict.approved and is_head_moved(verdict, live_head_sha) and bool(live_head_sha)
-
-
-def is_already_in_mergequeue(persisted: PersistedPr | None, admission: Admission) -> bool:
-    """Parked in the merge queue and the label is still on (a revert voids the park)."""
-    status = persisted.status if persisted is not None else None
-    return status == "mergequeue" and not admission.mergequeue_label_reverted
-
-
-def merge_entry(readiness: Readiness, holds: HoldFacts) -> tuple[bool, bool]:
-    """``(escalated_merge_hold, enter)``: may a merge or hand-off be attempted at all.
-
-    The escalated hold leaves ``gate.can_merge`` untouched (#840 / #777b); it
-    only blocks the actions. Shared by ``decide_merge``, the merge-hold read
-    guard and the preview so the three cannot drift.
-    """
-    can_merge = readiness.gate.can_merge
-    escalated = can_merge and (holds.pr_escalated or holds.issue_escalated)
-    enter = (
-        can_merge
-        and holds.should_merge
-        and not escalated
-        and not readiness.human_merge_hold
-        and not readiness.human_merge_check_unavailable
-    )
-    return escalated, enter
-
-
-def mergequeue_stamp_needs_now(
-    locked: PersistedPr, merged: bool, live_head_sha: str | None
-) -> bool:
-    """``AccountingFacts.now_iso`` is consumed: a fresh mergequeue stamp will be written."""
-    status = "merged" if merged else locked.status
-    if status != "mergequeue" or not live_head_sha:
-        return False
-    return not (locked.mergequeue_head_sha == live_head_sha and bool(locked.mergequeue_since))
-
-
-def merge_hold_read_needed(
-    readiness: Readiness, holds: HoldFacts, *, require_label: bool = True
-) -> bool:
-    """``HoldFacts.merge_hold`` is consumed: a hand-off (or, in preview, a merge) is possible.
-
-    ``require_label=False`` is the dry-run preview's (legacy) behaviour of
-    reading the hold whenever a merge could be attempted, label or not.
-    """
-    _, enter = merge_entry(readiness, holds)
-    return bool(enter and (holds.config.mergequeue_label or not require_label))
 
 
 # --------------------------------------------------------------------------- #
@@ -173,6 +134,7 @@ def decide_admission(
         approved=f.verdict.approved,
         mergequeue_label_reverted=reverted,
         self_revoked_stale_head=self_revoked,
+        mergequeue_revoked_reason=revoked_reason,
     )
     if not f.verdict.approved:
         return base
@@ -477,7 +439,17 @@ def decide_merge(readiness: Readiness, holds: HoldFacts) -> MergePlan:
     merge_hold = read_merge_hold and holds.merge_hold is True
     merge_hold_unavailable = read_merge_hold and holds.merge_hold_unavailable
 
-    action_hand_off = read_merge_hold and not merge_hold and not merge_hold_unavailable
+    # Issue #2743: the projected same-head queue-revert count and cap verdict,
+    # counted only when this pass would attempt the re-add (a held pass is a
+    # a hold, not an Aviator revert). The cap gate itself holds only on a
+    # merge pass -- should_merge, no escalated hold -- so a held PR never
+    # caps and is never routed to rework by the queue cap.
+    re_add_pending = mergequeue_re_add_pending(readiness, holds)
+    requeue = requeue_gate(readiness, holds, re_add_pending=re_add_pending)
+    requeue_capped = requeue.capped
+    requeue_rework = requeue.rework
+
+    action_hand_off = re_add_pending and not requeue_capped
     action_merge = enter and not label
     action_human_merge = human_hold and can_merge and should_merge and not escalated_merge_hold
 
@@ -534,6 +506,8 @@ def decide_merge(readiness: Readiness, holds: HoldFacts) -> MergePlan:
         held.add(Hold.REVERT_UNDETERMINED)
     if readiness.checks_unavailable:
         held.add(Hold.CHECKS_UNAVAILABLE)
+    if requeue_capped:
+        held.add(Hold.REQUEUE_CAPPED)
 
     kind: PlanKind
     if readiness.kind is not StageKind.PROCEED:
@@ -544,7 +518,7 @@ def decide_merge(readiness: Readiness, holds: HoldFacts) -> MergePlan:
         kind = PlanKind.HAND_OFF
     elif action_human_merge:
         kind = PlanKind.ESCALATE
-    elif conflict_rework or check_failure_rework:
+    elif conflict_rework or check_failure_rework or requeue_rework:
         kind = PlanKind.REQUEST_REWORK
     elif held:
         kind = PlanKind.HOLD
@@ -568,6 +542,9 @@ def decide_merge(readiness: Readiness, holds: HoldFacts) -> MergePlan:
         holds=frozenset(held),
         conflict_rework=conflict_rework,
         check_failure_rework=check_failure_rework,
+        mergequeue_requeues=requeue.requeues,
+        mergequeue_requeue_capped=requeue_capped,
+        requeue_rework=requeue_rework,
     )
 
 
@@ -680,6 +657,23 @@ def decide_accounting(
         else:
             since, head_sha = facts.locked.mergequeue_since, facts.locked.mergequeue_head_sha
 
+    # Issue #2743 (review round 1): the requeue ledger advances only when this
+    # pass engaged the queue cycle -- a re-add was attempted (the hand-off
+    # effect ran and reported its outcome) or the cap gate itself refused one
+    # at the crossing/post-cap pass. A held pass (merge-hold, escalated or
+    # human-merge hold, should_merge=False) observes the reverted label but
+    # stays flat: no re-add, no climb, no cap event.
+    re_add_wanted = (
+        plan.action_hand_off
+        or results.mergequeue_label_applied is not None
+        or plan.mergequeue_requeue_capped
+    )
+    delta = requeue_accounting(adm, can_merge, facts, re_add_wanted=re_add_wanted)
+    requeues = delta.requeues
+    requeues_head = delta.head_sha
+    if delta.capped_payload is not None:
+        events.append(EventSpec("mergequeue_requeue_capped", _frozen(delta.capped_payload)))
+
     events.append(
         EventSpec(
             "merge_ready",
@@ -726,6 +720,8 @@ def decide_accounting(
         pr_status="merged" if merged else None,
         mergequeue_since=since,
         mergequeue_head_sha=head_sha,
+        mergequeue_requeues=requeues,
+        mergequeue_requeues_head_sha=requeues_head,
         events=tuple(events),
     )
 

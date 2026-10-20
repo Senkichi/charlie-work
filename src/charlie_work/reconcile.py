@@ -73,6 +73,7 @@ from .state import (
     SINK_STATUSES,
     append_event,
     is_claim_stale,
+    load_state_locked,
     set_throttled_until,
     utc_now,
     without_review_dispatch_claim,
@@ -516,6 +517,35 @@ def _pr_review_approved_at_head(
     return resolved.decision == "approved" and not resolved.stale
 
 
+def _mergequeue_requeue_capped(
+    config: OrchestratorConfig, repo_root: Path | None, pr_number: int, head_sha: str
+) -> bool:
+    """Issue #2743: this head's mergequeue re-add budget is already spent.
+
+    This detector is the second unbounded re-add path -- an Aviator
+    queue-branch failure leaves exactly the state it keys on (``blocked``
+    label + failing ``aviator/checks`` + all real checks green), so without
+    the cap check it would re-add ``mergequeue`` on every reconcile pass
+    regardless of the bound merge_ready enforces. The counter merge-path
+    accounting persists anchors to ``mergequeue_requeues_head_sha``: a
+    different live head gets a fresh budget. Fails OPEN on a missing or
+    malformed counter -- this detector's whole posture is best-effort
+    repair, and a corrupt count delays the cap rather than wrongly
+    suppressing the re-add forever (the next counted revert re-anchors it).
+    """
+    cap = config.auto_merge.mergequeue_requeue_cap
+    if not (config.auto_merge.mergequeue_label and cap > 0 and head_sha and repo_root):
+        return False
+    try:
+        paths = runtime_paths(repo_root, config.runtime.state_dir)
+        entry = load_state_locked(paths.state_file).get("prs", {}).get(str(pr_number), {})
+        if not isinstance(entry, dict) or entry.get("mergequeue_requeues_head_sha") != head_sha:
+            return False
+        return int(entry.get("consecutive_mergequeue_requeues") or 0) >= cap
+    except (OSError, TypeError, ValueError, KeyError):
+        return False
+
+
 def detect_aviator_stale_blocked(
     gh: GitHubLike, config: OrchestratorConfig, *, repo_root: Path | None = None
 ) -> list[DriftItem]:
@@ -548,7 +578,8 @@ def detect_aviator_stale_blocked(
     is re-added only when ``_pr_review_approved_at_head`` confirms the PR is
     currently approved at its live head -- otherwise this function would
     reintroduce the exact worker-self-merge-without-review gap issue #502's
-    unauthorized-merge tripwire exists to catch.
+    unauthorized-merge tripwire exists to catch -- and only while the head's
+    queue-revert budget (#2743) is unspent.
     """
     drift: list[DriftItem] = []
     for pr in _fetch_prs(gh):
@@ -614,6 +645,7 @@ def detect_aviator_stale_blocked(
             mergequeue_label
             and mergequeue_label not in label_names(pr)
             and _pr_review_approved_at_head(config, repo_root, pr_number, str(head_sha))
+            and not _mergequeue_requeue_capped(config, repo_root, pr_number, str(head_sha))
         ):
             add_labels = (mergequeue_label,)
 

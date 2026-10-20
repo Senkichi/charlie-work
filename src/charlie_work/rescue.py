@@ -24,6 +24,7 @@ _CAUSE_LABELS: dict[str, str] = {
     "rework_cycle_cap": "the normal rework-cycle cap (max_rework_cycles)",
     "merge_conflict": "the conflict-rework cap (max_conflict_rework_attempts)",
     "no_op_rework": "the no-op-rework cap (max_no_op_rework_attempts)",
+    "mergequeue_requeue": "the mergequeue-rework cap (requeue-lane attempts)",
 }
 
 

@@ -98,6 +98,7 @@ class Hold(StrEnum):
     MERGE_HOLD_UNAVAILABLE = "merge_hold_unavailable"
     REVERT_UNDETERMINED = "revert_undetermined"
     CHECKS_UNAVAILABLE = "checks_unavailable"
+    REQUEUE_CAPPED = "requeue_capped"
 
 
 @dataclass(frozen=True)
@@ -134,6 +135,11 @@ class PersistedPr:
     # Stamped by every full merge_ready pass that leaves the PR queued; the
     # queue skip (#2440) forces a re-check once it is 30 minutes old.
     mergequeue_checked_at: str | None = None
+    # Issue #2743: same-head queue-revert counter and its head anchor.
+    # ``mergequeue_requeues_head_sha`` names the head the count belongs to;
+    # a revert observed under a different live head restarts the count.
+    mergequeue_requeues: int = 0
+    mergequeue_requeues_head_sha: str | None = None
 
 
 @dataclass(frozen=True)
@@ -154,6 +160,9 @@ class MergePathConfig:
     # TIS-CW-7: Aviator's skip-line label (None = off) and the priority label prefix.
     skip_line_label: str | None = None
     priority_prefix: str = ""
+    # Issue #2743: max same-head queue reverts before the hand-off stops being
+    # admissible and the PR routes to rework instead. 0 disables the gate.
+    mergequeue_requeue_cap: int = 3
 
 
 # --------------------------------------------------------------------------- #
@@ -184,6 +193,10 @@ class Admission:
     approved: bool = False
     mergequeue_label_reverted: bool = False
     self_revoked_stale_head: bool = False
+    # Issue #2743: the persisted ``mergequeue_revoked_reason`` itself, so the
+    # requeue cap can treat ANY reconcile-recorded revocation (including
+    # "not_approved") as a self-revocation rather than a queue failure.
+    mergequeue_revoked_reason: str | None = None
     # PROCEED that still needs the approval-head write + refetch (live) before
     # the second ``decide_admission(..., observed_carry_forward=True)`` call.
     carry_forward_needed: bool = False
@@ -334,6 +347,8 @@ class HoldFacts:
     # None = not read. Read only when a hand-off could happen.
     merge_hold: bool | None = None
     merge_hold_unavailable: bool = False
+    # Live PR head: anchors the requeue counter's per-head comparison (#2743).
+    live_head_sha: str | None = None
 
 
 @dataclass(frozen=True)
@@ -352,6 +367,11 @@ class MergePlan:
     holds: frozenset[Hold] = frozenset()
     conflict_rework: bool = False
     check_failure_rework: bool = False
+    # Issue #2743: the projected same-head requeue count (persisted base plus
+    # this pass's counted revert, when any) and the cap gate it feeds.
+    mergequeue_requeues: int = 0
+    mergequeue_requeue_capped: bool = False
+    requeue_rework: bool = False
 
 
 # --------------------------------------------------------------------------- #
@@ -374,6 +394,8 @@ class EffectResults:
     conflict_routed: bool = False
     conflict_escalated: bool = False
     check_failure_routed: bool = False
+    requeue_routed: bool = False
+    requeue_escalated: bool = False
     rework_label_error: Mapping[str, Any] | None = None
     issue_status_after: str | None = None
 
@@ -411,4 +433,8 @@ class Accounting:
     pr_status: str | None  # "merged" when we merged, else None (leave status as-is)
     mergequeue_since: str | None
     mergequeue_head_sha: str | None
+    # Issue #2743: the requeue counter write. ``None`` leaves the persisted
+    # fields untouched (no counted revert this pass); a pair means write both.
+    mergequeue_requeues: int | None = None
+    mergequeue_requeues_head_sha: str | None = None
     events: tuple[EventSpec, ...] = ()

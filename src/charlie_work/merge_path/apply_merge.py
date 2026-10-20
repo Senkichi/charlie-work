@@ -282,8 +282,27 @@ def _route_rework(
     plan: MergePlan,
     results: EffectResults,
 ) -> EffectResults:
-    """Conflict and check-failure rework routes (exclusive with every merge action)."""
+    """Conflict, check-failure and queue-cap rework routes (exclusive with merge actions)."""
     summary = plan.readiness.summary
+    if plan.requeue_rework:
+        # Issue #2743: the same cap/rescue/escalation wrapper the conflict
+        # route uses, with its own attempt ledger so rework cycles for the
+        # queue-cap lane stay bounded independently of conflict rework.
+        routed = app._route_janitor_gate_failure_to_rework(
+            pr,
+            issue_number,
+            attempts_key="mergequeue_rework_attempts",
+            max_attempts=cfg.max_conflict_rework_attempts,
+            reason="mergequeue_requeue",
+            router=app._request_mergequeue_requeue_rework,
+        )
+        if routed is not None:
+            results = replace(
+                results,
+                requeue_routed=bool(routed.data.get("routed_to_rework")),
+                requeue_escalated=bool(routed.data.get("escalated")),
+                rework_label_error=routed.data.get("label_error"),
+            )
     if plan.conflict_rework:
         routed = app._route_janitor_gate_failure_to_rework(
             pr,
