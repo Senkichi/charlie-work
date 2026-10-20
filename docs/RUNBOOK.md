@@ -614,6 +614,20 @@ does not bound CPU or RAM. The governor applies this cap at every dispatch
 path alongside the per-repo `dispatch.max_concurrent_sessions` cap
 (`_apply_concurrency_governor()` in `workflow.py`).
 
+**Per-harness budget**: `fleet.max_concurrent_sessions_by_harness` (issue #2757,
+default empty = off) scopes a ceiling to the provider quota it protects, e.g.
+`{devin-shell: 3}` for a shared Devin account, while
+`global_max_concurrent_sessions` stays the host-level total across every harness.
+Without it a free-model worker (say an `opencode` chain entry) occupies a slot
+sized for the Devin ceiling. The live count per harness is derived from session
+sidecars through the harness registry's `adapter_kind`, measured under the fleet
+lock. After role-chain selection, a launch whose entry is on a full harness falls
+through to the next entry with room; with none left it is clamped to zero and the
+`dispatch` event reports `clamped_by: harness_max` plus
+`harness_concurrency_limits` / `harness_live_session_counts`. A state.json "ghost"
+(live pid, no sidecar) has no known harness, so it counts toward the total only.
+The rescue tier launches on its configured harness and is not bounded per harness.
+
 **Reviewer budget**: `fleet.global_max_concurrent_reviews` (issue #2084, default
 `0` = disabled) is the same kind of cap for live *reviewer* sessions across all
 registered repos -- a separate budget from the worker one, stacking on the

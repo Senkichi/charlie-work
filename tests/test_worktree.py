@@ -3538,8 +3538,16 @@ branch refs/heads/{branch_name}
         remove_worktree(repo_root, info1.path)
 
 
-def test_create_worktree_materialize_dirs_error_cleanup(tmp_path: Path) -> None:
-    """Materialization failure should clean up the worktree and branch."""
+@pytest.fixture
+def _materialize_fail_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Scaffold for ``test_create_worktree_materialize_dirs_error_cleanup``.
+
+    The one-commit repo, the untracked ``.devin`` directory, and the failing
+    ``_materialize_directory`` patch are acquisition, not the property under
+    test. Housing them here charges the git-template copy to the ``setup``
+    phase so the ledger's ``call`` phase holds only ``create_worktree``'s
+    error-cleanup path -- the same remedy as #2624/#2634/#2670 (issue #2746).
+    """
     repo_root = tmp_path / "repo"
     _init_repo(repo_root)
 
@@ -3548,41 +3556,39 @@ def test_create_worktree_materialize_dirs_error_cleanup(tmp_path: Path) -> None:
     untracked_dir.mkdir()
     (untracked_dir / "config.json").write_text("config\n", encoding="utf-8")
 
-    # Monkeypatch _materialize_directory to raise an error
-    import charlie_work.worktree
-
-    original_materialize = charlie_work.worktree._materialize_directory
-
     def mock_materialize(*args: object, **kwargs: object) -> None:
         raise OSError("Mock materialization failure")
 
-    charlie_work.worktree._materialize_directory = mock_materialize
+    monkeypatch.setattr(worktree_module, "_materialize_directory", mock_materialize)
+    return repo_root
 
-    try:
-        with pytest.raises(RuntimeError, match="Failed to materialize directory"):
-            create_worktree(
-                repo_root,
-                "agent/issue-2-materialize-fail",
-                base_ref="HEAD",
-                materialize_dirs=(".devin",),
-            )
 
-        # Verify the worktree was cleaned up
-        worktrees_dir = _default_worktrees_dir(repo_root)
-        worktree_path = worktrees_dir / "agent-issue-2-materialize-fail"
-        assert not worktree_path.exists()
+def test_create_worktree_materialize_dirs_error_cleanup(
+    _materialize_fail_repo: Path,
+) -> None:
+    """Materialization failure should clean up the worktree and branch."""
+    repo_root = _materialize_fail_repo
 
-        # Verify the branch was deleted
-        result = subprocess.run(
-            ["git", "branch", "--list", "agent/issue-2-materialize-fail"],
-            cwd=repo_root,
-            check=True,
-            capture_output=True,
-            text=True,
+    with pytest.raises(RuntimeError, match="Failed to materialize directory"):
+        create_worktree(
+            repo_root,
+            "agent/issue-2-materialize-fail",
+            base_ref="HEAD",
+            materialize_dirs=(".devin",),
         )
-        assert "agent/issue-2-materialize-fail" not in result.stdout
-    finally:
-        charlie_work.worktree._materialize_directory = original_materialize
+
+    # Verify the worktree was cleaned up
+    worktrees_dir = _default_worktrees_dir(repo_root)
+    worktree_path = worktrees_dir / "agent-issue-2-materialize-fail"
+    assert not worktree_path.exists()
+
+    # Verify the branch was deleted. A branch ``git worktree add -b`` just
+    # created is a loose ref under the common gitdir's refs/heads; ``git
+    # branch -D`` removes that file, so its absence is the same verdict
+    # ``git branch --list`` reported -- without another git spawn in the
+    # measured call phase (issue #2746).
+    branch_ref = repo_root / ".git" / "refs" / "heads" / "agent" / "issue-2-materialize-fail"
+    assert not branch_ref.exists()
 
 
 def test_fresh_dispatch_with_explicit_base_ref_fetches(tmp_path: Path) -> None:

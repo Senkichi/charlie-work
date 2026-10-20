@@ -19,7 +19,8 @@ Gate sequence -- the ONE implementation, inside
    point, so a pre-check deferral carries ``throttled_until`` and NO governor
    report fields -- only the step-4 deferral carries those;
 1. fleet lock (``try_acquire_fleet_lock``) realized when
-   ``fleet.global_max_concurrent_sessions > 0``, retried with jitter for up
+   ``fleet.global_max_concurrent_sessions > 0`` or
+   ``fleet.max_concurrent_sessions_by_harness`` is non-empty, retried with jitter for up
    to ``fleet.launch_lock_wait_seconds`` -- held only across
    governor -> claim -> launch so independently-running repos cannot both
    read a stale fleet live count and over-dispatch the shared cap, and a
@@ -41,6 +42,23 @@ The selection rides on the permit, and :func:`_launch_workers` launches the
 worker-role settings on the selected entry, stamps each launched session's
 sidecar with it, and emits ``role_fallback_selected`` past the primary. A
 length-1 chain never reads the ledger and behaves exactly as before.
+
+Per-harness ceilings (issue #2757): ``fleet.global_max_concurrent_sessions``
+counts every live session whatever its harness, but a provider quota (e.g. a
+shared Devin account) binds only the sessions that draw on it.
+``fleet.max_concurrent_sessions_by_harness`` adds a ceiling per harness. The
+governor measures the fleet-wide live count per harness under the fleet lock
+(step 3); right after it :func:`_apply_harness_caps` bounds the launch by the
+role-chain entry selected above. An entry whose harness is full is passed over
+for the next entry whose harness has room (the same fall-through a quota
+restriction takes); with none left -- a length-1 chain, or every entry full or
+restricted -- the launch is clamped to zero with ``clamped_by: harness_max``
+(a deferral, never a provider throttle). The total cap still bounds every
+harness, so a launch on an uncapped harness is limited only by it. A
+``model:<tier>`` group that lands on a different capped harness than the
+permit's is bounded in :func:`_tier_groups`. The rescue tier (role ``""``)
+launches on its own configured harness exactly as configured and is not
+bounded by a per-harness ceiling; it still counts against the total.
 
 Model tier (TIS-CW-6): :func:`_launch_workers` splits a worker-role batch by the
 issues' ``model:<tier>`` labels (``model_tier``). Each tier the chain can
@@ -70,7 +88,7 @@ import os
 import random
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
@@ -113,6 +131,10 @@ REASON_FLEET_LOCK_HELD = "fleet_lock_held"
 REASON_PROVIDER_THROTTLED = "provider_throttled"
 REASON_CONCURRENCY_CAP = "concurrency_cap"
 REASON_LAUNCH_LOCK_INVALID = "launch_lock_invalid"
+
+# ``ConcurrencyGovernorResult.clamped_by`` when a per-harness ceiling (issue #2757)
+# is the term that bound ``dispatch_limit``.
+CLAMPED_BY_HARNESS_MAX = "harness_max"
 
 FleetLockAcquirer = Callable[[str | None], Any]
 
@@ -294,6 +316,10 @@ class _LaunchLedger:
     """
 
     launched: int = 0
+    # Issue #2757: free slots left under each ``max_concurrent_sessions_by_harness``
+    # ceiling when the permit was issued, drawn down by tier groups that launch on
+    # a harness other than the permit's own (see ``_tier_groups``).
+    harness_free: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -362,6 +388,11 @@ def acquire_fleet_launch_lock(
     """
     if cap is None:
         cap = app.config.fleet.global_max_concurrent_sessions
+        if cap <= 0 and app.config.fleet.max_concurrent_sessions_by_harness:
+            # Issue #2757: a per-harness ceiling is cross-repo accounting too -- two
+            # repos reading the same stale per-harness live count would both launch
+            # past it -- so it needs the lock even with no total cap configured.
+            cap = 1
     if cap <= 0:
         return FleetLaunchLock(None, _MINT)
     return FleetLaunchLock(
@@ -500,6 +531,7 @@ def issue_worker_launch_permit(
         if apply_open_pr_backpressure:
             governor_kwargs["apply_open_pr_backpressure"] = True
         gov = app._apply_concurrency_governor(requested, **governor_kwargs)
+        selection, gov = _apply_harness_caps(app, selection, gov)
 
         with _wf.state_lock(app.paths.state_file):
             state = _wf.load_state(app.paths.state_file)
@@ -529,9 +561,58 @@ def issue_worker_launch_permit(
         governor=gov,
         _launch_lock=launch_lock,
         _owns_lock=owns_lock,
+        _ledger=_LaunchLedger(harness_free=_harness_free_slots(app, gov)),
         _token=_MINT,
         role_selection=selection,
     )
+
+
+def _harness_free_slots(app: OrchestratorApp, gov: Any) -> dict[str, int]:
+    """Free slots under each configured per-harness ceiling (empty when none is set)."""
+    free: dict[str, int] = {}
+    if not app.config.fleet.max_concurrent_sessions_by_harness:
+        return free
+    for harness in gov.harness_caps:
+        slots = gov.harness_available(harness)
+        if slots is not None:
+            free[harness] = slots
+    return free
+
+
+def _apply_harness_caps(
+    app: OrchestratorApp, selection: role_selection.RoleSelection, gov: Any
+) -> tuple[role_selection.RoleSelection, Any]:
+    """Bound the launch by the selected entry's harness ceiling (issue #2757).
+
+    ``fleet.max_concurrent_sessions_by_harness`` limits only the sessions that
+    draw on a given harness's quota, so it can only be enforced once the harness
+    is known -- i.e. after role-chain selection -- and, like the fleet cap, on a
+    live count taken under the fleet lock (the governor measured it). Unset map:
+    ``gov`` and ``selection`` come back untouched.
+
+    * Selected entry's harness has no ceiling, or has room: the launch is bounded
+      to the free slots (``clamped_by="harness_max"`` when that binds).
+    * Selected entry's harness is full: fall through to the next chain entry that
+      is neither quota-restricted nor on a full harness
+      (:func:`role_selection.reselect_within_harness_caps`), exactly as a quota
+      restriction routes past an entry, then bound by that entry's free slots.
+    * No such entry (a length-1 chain, or every entry restricted / full): the
+      launch is clamped to zero with ``clamped_by="harness_max"`` -- a deferral,
+      not a provider throttle, so no repo-wide throttle window is implied.
+    """
+    # Gated on config, the source of truth, not on ``gov``: the governor only
+    # populates the harness fields when the same map is set.
+    if not app.config.fleet.max_concurrent_sessions_by_harness or selection.entry is None:
+        return selection, gov
+    reselected = role_selection.reselect_within_harness_caps(selection, gov.harness_available)
+    if reselected.entry is None:
+        if gov.dispatch_limit > 0:
+            gov = replace(gov, dispatch_limit=0, clamped=True, clamped_by=CLAMPED_BY_HARNESS_MAX)
+        return selection, gov
+    free = gov.harness_available(reselected.entry.harness)
+    if free is not None and free < gov.dispatch_limit:
+        gov = replace(gov, dispatch_limit=free, clamped=True, clamped_by=CLAMPED_BY_HARNESS_MAX)
+    return reselected, gov
 
 
 def _refusal_reason(permit: object, count: int) -> str | None:
@@ -552,6 +633,7 @@ def _tier_groups(
     selection: Any,
     settings: AdapterSettings,
     requests: list[SessionRequest],
+    harness_free: dict[str, int] | None = None,
 ) -> list[tuple[Any, str | None, list[SessionRequest]]]:
     """Split a worker batch by ``model:<tier>`` label (TIS-CW-6): ``(selection, tier, requests)``.
 
@@ -562,6 +644,17 @@ def _tier_groups(
     ``""``), a permit without a selection, or an empty prefix give one group,
     launched exactly as before TIS-CW-6; so does an empty batch, so the manifest is
     still written.
+
+    ``harness_free`` (issue #2757, the permit ledger's free slots under each
+    ``fleet.max_concurrent_sessions_by_harness`` ceiling) bounds a tier group that
+    would land on a capped harness *other than the permit's own*: the permit's
+    ``max_launches`` was clamped by the permit's harness only, so a tier entry on
+    a different capped harness needs its own check. A group that does not fit in
+    that harness's free slots launches on the permit's selection instead
+    (``worker_model_tier_fallback`` with reason ``harness_cap``); one that fits
+    draws the slots down so a second tier on the same harness sees what is left.
+    A tier group on the permit's own harness needs no check -- the whole batch is
+    already within the permit's clamp.
     """
     prefix = app.config.labels.model_tier_prefix
     if selection is None or settings.role != "worker" or not prefix:
@@ -592,8 +685,22 @@ def _tier_groups(
                 numbers=[request.issue_number for request in members],
             )
             default.extend(members)
-        else:
-            served.append((tier_selection, tier, members))
+            continue
+        harness = tier_selection.entry.harness
+        own_harness = selection.entry is not None and selection.entry.harness == harness
+        if harness_free is not None and harness in harness_free and not own_harness:
+            free = harness_free[harness]
+            if len(members) > free:
+                model_tier.emit_tier_fallback(
+                    app.write_gate,
+                    tier=tier,
+                    reason=model_tier.HARNESS_CAP,
+                    numbers=[request.issue_number for request in members],
+                )
+                default.extend(members)
+                continue
+            harness_free[harness] = free - len(members)
+        served.append((tier_selection, tier, members))
     if default or not served:
         return [(selection, None, default), *served]
     return served
@@ -630,7 +737,9 @@ def _launch_workers(
         ]
     permit._ledger.launched += len(requests)
     _wf = _workflow()
-    groups = _tier_groups(app, permit.role_selection, settings, requests)
+    groups = _tier_groups(
+        app, permit.role_selection, settings, requests, permit._ledger.harness_free
+    )
     results: list[SessionDispatchResult] = []
     adapters: set[str] = set()
     for selection, tier, group in groups:
