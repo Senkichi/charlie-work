@@ -18,7 +18,18 @@ def reap_flow(
     pr_data: Mapping[str, Any] | None,
     acc: LockAcc,
 ) -> Flow:
-    """Returns True when the entry was escalated (the caller records it and moves on)."""
+    """Returns True when the entry was escalated (the caller records it and moves on).
+
+    Issue #2748: an entry the no-PR reclaim lane has already successfully
+    returned to ``ready`` (labels: ``ready``, no active label) is not a
+    dispatched worker nobody reclaimed, so the backstop never escalates it --
+    not even once ``orphan_drift_at`` (armed by an earlier failed relabel
+    pass) has expired. Otherwise a saturated fleet turns ordinary dispatch
+    queue wait into a ``mechanical`` operator-queue escalation. The labels
+    are this pass's pre-lock issue fetch -- the ground truth the reclaim's
+    label write landed against; entries whose labels are unavailable (the
+    PR-linked arm) keep the existing timer semantics.
+    """
     number = draft.issue
     entry = draft.work
     config = facts.config
@@ -28,6 +39,12 @@ def reap_flow(
         entry, throttled_until=acc.throttled_until, reap_minutes=reap_minutes, now=now
     ):
         return False
+    head_details = pre.details.get(number)
+    if head_details is not None:
+        active_labels = set(head_details.get("active_labels") or ())
+        issue_labels = set(head_details.get("issue_labels") or ())
+        if not active_labels and config.labels.ready in issue_labels:
+            return False
 
     orphan_drift_at = entry.get("orphan_drift_at")
     failure = persisted_failure(entry)
