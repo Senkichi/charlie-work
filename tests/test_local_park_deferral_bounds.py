@@ -665,3 +665,48 @@ def test_reap_due_throttle_exemption_is_not_vacuous() -> None:
     assert dead_dispatched_reap_due(
         state={}, entry=entry, dead_dispatched_reap_minutes=60, now=_NOW
     )
+
+
+@pytest.mark.parametrize(
+    ("issue_labels", "reaped"),
+    [
+        ((("ready",)), False),  # #2748: reclaim landed; queue wait is not a failure
+        ((("in-progress",)), True),  # active label present: reclaim never landed
+        ((), True),  # labels unavailable (the PR-linked arm): timer unchanged
+    ],
+)
+def test_reap_flow_skips_issue_already_reclaimed_to_ready(
+    tmp_path: Path, issue_labels: tuple[str], reaped: bool
+) -> None:
+    """Issue #2748: ``reap_flow`` itself skips a due entry whose issue's
+    labels already read ``ready`` with no active label (the reclaim-success
+    edge); with an active label present or labels unavailable the backstop
+    escalates exactly as before. The shared due predicate
+    (``dead_dispatched_reap_due``) keeps its semantics untouched -- the skip
+    is one enforcement point in ``reap_flow``."""
+    label_map = {"ready": LabelConfig().ready, "in-progress": LabelConfig().in_progress}
+    resolved_labels = [label_map[name] for name in issue_labels]
+    active = [name for name in resolved_labels if name != label_map["ready"]]
+    entry = {
+        "status": "dispatched",
+        "orphan_drift_at": _iso(_NOW - timedelta(minutes=120)),
+        "orphan_flagged_at": _iso(_NOW - timedelta(minutes=30)),
+    }
+    details = {
+        42: {"issue_labels": resolved_labels, "active_labels": active},
+    }
+    run = run_reap(entry, issue=42, reap_minutes=60, max_rearms=0, now=_NOW, issue_details=details)
+    assert run.reaped is reaped
+    if not reaped:
+        assert [kind for kind, _payload in run.events] == [], (
+            "the reclaimed-ready issue must reap nothing"
+        )
+    # The predicate itself (the park drain's due-check) still reports due for
+    # the same entry -- the disarm is reap_flow-local, not predicate-local.
+    state: dict[str, Any] = {"issues": {"42": dict(entry)}, "prs": {}}
+    assert dead_dispatched_reap_due(
+        state=state,
+        entry=state["issues"]["42"],
+        dead_dispatched_reap_minutes=60,
+        now=_NOW,
+    )
