@@ -4,8 +4,9 @@ App-level: every test drives ``OrchestratorApp._reap_review_verdicts`` against a
 real devin review sidecar + log on disk. Only the process boundary is faked:
 ``popen_worker`` (records the resume argv, writes what the "resumed Devin"
 would print into the log handle it was given), ``devin list`` (the session-id
-source), and the checkout teardown (``charlie_work.workflow.remove_review_checkout``,
-the suite-patchable seam the miss path calls -- the real one shells out to
+source), and the checkout teardown (``remove_review_checkout`` as bound by
+``charlie_work.workflow`` -- the suite-patchable seam the miss path calls -- and by
+``charlie_work.stalled_review_reap``; the real one shells out to
 ``git worktree list/remove/prune`` against a tmp_path that is not a git repo).
 State, events, sidecars, caps and the reaper itself are real.
 """
@@ -90,9 +91,14 @@ class _Rig:
             return True
 
         alive = lambda pid, *_: pid in self.live  # noqa: E731
-        monkeypatch.setattr(
-            "charlie_work.workflow.remove_review_checkout", fake_remove_review_checkout
-        )
+        # Two import sites reach the same teardown: the miss path calls it through
+        # ``charlie_work.workflow``, while the stall sweep binds it on its own
+        # namespace. Both go to the one recording fake so no reap in this module
+        # shells out to ``git worktree`` (issue #2643). Patch each site exactly
+        # once: a second patch of the same attribute would silently bypass the
+        # recorder the pin test relies on.
+        for seam in ("charlie_work.workflow", "charlie_work.stalled_review_reap"):
+            monkeypatch.setattr(f"{seam}.remove_review_checkout", fake_remove_review_checkout)
         monkeypatch.setattr(devin_review_resume, "popen_worker", fake_popen)
         monkeypatch.setattr(devin_review_resume, "run_captured", fake_list)
         monkeypatch.setattr(devin_review_resume, "_get_process_start_time", lambda pid: 1.0)
