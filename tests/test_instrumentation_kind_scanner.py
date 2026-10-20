@@ -16,9 +16,44 @@ import pytest
 from _instrumentation_kind_scanner import (
     _call_node_for,
     _has_explicit_level,
+    _scan_event_kinds,
     _scan_sweep_append_kinds,
     _scan_tree,
 )
+
+
+def test_emit_kind_text_prefilter_finds_every_emit_spelling(tmp_path: Path) -> None:
+    """#2751: one file per recognised emit shape survives the text filter.
+
+    A pure token-coverage assertion cannot catch a filter wired to the wrong
+    name or a call spelled only through an attribute; this drives each shape
+    through the real ``_scan_event_kinds`` entry point and asserts every kind
+    still reaches ``used``.
+    """
+    sources = {
+        "log.py": "def emit(state):\n    log_event(state, 'k_log', {})\n",
+        "append.py": "def emit(data):\n    append_event(data, 'k_append', {})\n",
+        "record.py": (
+            "def emit(write_gate, state):\n    write_gate.record_event(state, 'k_record', {})\n"
+        ),
+        "underscore_record.py": (
+            "class C:\n"
+            "    def emit(self, state):\n"
+            "        self._record_event(state, 'k_underscore', {})\n"
+        ),
+        "rework.py": (
+            "class C:\n"
+            "    def emit(self, pr, issue, decision, summary):\n"
+            "        self._route_to_rework(pr, issue, decision, summary, 'k_rework')\n"
+        ),
+    }
+    for filename, source in sources.items():
+        (tmp_path / filename).write_text(source, encoding="utf-8")
+
+    used, unresolved = _scan_event_kinds(tmp_path)
+
+    assert used == {"k_log", "k_append", "k_record", "k_underscore", "k_rework"}
+    assert not unresolved
 
 
 def test_sweep_append_kind_scan_flags_unresolvable_element_not_silently_dropped(
