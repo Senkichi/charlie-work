@@ -1,0 +1,5 @@
+issue #2739: the local merge gate's 'record left approved' abort
+streak counter -- bounds the abort/rebuild/re-approve cycle signature
+of the zero-net-diff livelock. Installed from
+``orchestration/local_landed_finalize.py``. Net-new OrchestratorApp
+member added after the Track 2 Phase B surface baseline was pinned.
