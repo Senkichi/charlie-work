@@ -271,7 +271,7 @@ def _close_pipes(proc: subprocess.Popen[str]) -> None:
 def run_captured(
     command: list[str] | str,
     *,
-    cwd: Path | str,
+    cwd: Path | str | None,
     timeout_seconds: int,
     shell: bool = False,
     stdin: str | None = None,
@@ -289,6 +289,8 @@ def run_captured(
     timeout the process *tree* is killed and the pipe drain is itself bounded
     (issue #2139). ``stdin=None`` gives the child ``DEVNULL`` -- never the
     parent's stdin -- so an interactive prompt reads EOF instead of waiting.
+    ``cwd=None`` inherits the current directory -- it must reach ``Popen`` as
+    ``None``, never as ``str(None)`` (issue #2450).
     """
     env = {**os.environ, **_NON_INTERACTIVE_ENV, **(extra_env or {})}
     # POSIX: a new session puts the child in its own process group so
@@ -298,7 +300,7 @@ def run_captured(
     try:
         proc = subprocess.Popen(
             command,
-            cwd=str(cwd),
+            cwd=None if cwd is None else str(cwd),
             text=True,
             encoding="utf-8",
             errors="replace",

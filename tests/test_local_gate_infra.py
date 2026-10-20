@@ -151,6 +151,23 @@ def test_reader_skips_truncated_files_and_reads_real_results(tmp_path: Path) -> 
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _no_windows_child_enumeration(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep ``kill_process_tree``'s child enumeration off the PowerShell path.
+
+    Every gate kill in this module -- the in-flight timeout, plus each
+    ``_kill_claimed_gate`` teardown -- enumerates the suite's children for the
+    ``killed_pids`` report, and on Windows that enumeration is one
+    ``Get-CimInstance Win32_Process`` spawn whose latency swings from ~0.3 s
+    to its 5 s timeout under host load. That bimodal ~4.5 s per kill is the
+    ledger-flagged regression (#2597). ``taskkill /T`` still fells the real
+    tree; the enumeration only feeds a report these tests never assert on.
+    """
+    import charlie_work.process_utils as process_utils
+
+    monkeypatch.setattr(process_utils, "_enumerate_child_pids", lambda _pid: [])
+
+
 @pytest.fixture
 def lane_repo() -> Path:
     return Path(tempfile.mkdtemp(prefix="cw-gate-infra-"))

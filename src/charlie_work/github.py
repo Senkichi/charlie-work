@@ -140,6 +140,12 @@ PR_VIEW_MERGED_FIELDS = "state,mergedAt,headRefOid"
 # ``gh pr view`` confirmation above, which re-fetches merge state rather
 # than trusting the list row.
 WORKTREE_PR_HEAD_FIELDS = "number"
+# Field list for the worktree-GC closed-issue probe (issue #2487): the
+# sweep asks only whether a worktree's linked GitHub issue is CLOSED, so
+# the query is exactly ``state`` -- the general-purpose ISSUE_VIEW_FIELDS
+# would drag title/body/comments into a per-candidate sweep call it never
+# reads.
+WORKTREE_ISSUE_STATE_FIELDS = "state"
 # MERGED_PR_LIST_FIELDS (the field contract for every merged-PR listing) moved
 # to github_capabilities/pull_requests.py (Track 2, issue #1613; design doc
 # Section 5, L06b), imported above -- it is a bare global in both

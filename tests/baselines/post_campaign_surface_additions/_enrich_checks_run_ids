@@ -1,0 +1,6 @@
+issue #2540: the data-boundary enrichment that resolves workflow run ids
+for required checks whose details_url is the app-assigned
+``.../runs/<check_run_id>`` shape. Net-new OrchestratorApp member declared
+here so the member-surface conservation check in
+tests/test_workflow_delegation_l00.py subtracts it before comparing moved
+delegates against the pre-campaign total.

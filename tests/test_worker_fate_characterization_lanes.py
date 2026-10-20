@@ -60,7 +60,7 @@ def _seed_dead_worker_fresh_outcome_and_clean_exit(
     )
 
 
-def test_flip4_request_changes_exit0_discards_fresh_outcome(tmp_path: Path) -> None:
+def test_flip4_request_changes_exit0_discards_fresh_outcome(tmp_path: Path, monkeypatch) -> None:
     """FLIP 4: was a clean exit code short-circuiting before the fresh
     outcome file was ever consulted; now the with-PR lane consults the
     fresh outcome first and only falls back to the exit code when there is
@@ -87,7 +87,7 @@ def test_flip4_request_changes_exit0_discards_fresh_outcome(tmp_path: Path) -> N
     sessions_dir.mkdir(parents=True, exist_ok=True)
     _seed_dead_worker_fresh_outcome_and_clean_exit(tmp_path, paths, sessions_dir)
 
-    _run_orphan_sweep(tmp_path, paths, config, fake_gh)
+    _run_orphan_sweep(tmp_path, paths, config, fake_gh, monkeypatch=monkeypatch)
 
     state = load_state(paths.state_file)
     entry = state["issues"]["207"]
@@ -114,7 +114,7 @@ def test_flip4_request_changes_exit0_discards_fresh_outcome(tmp_path: Path) -> N
     assert not any(e.get("kind") == "orphaned_worker_recovered" for e in events)
 
 
-def test_flip4_approved_rework_exit0_discards_fresh_outcome(tmp_path: Path) -> None:
+def test_flip4_approved_rework_exit0_discards_fresh_outcome(tmp_path: Path, monkeypatch) -> None:
     """FLIP 4: was a clean exit code short-circuiting before the fresh
     outcome file was ever consulted; now the with-PR lane consults the
     fresh outcome first (rule 4). Contrast/companion to the test above.
@@ -131,7 +131,7 @@ def test_flip4_approved_rework_exit0_discards_fresh_outcome(tmp_path: Path) -> N
     sessions_dir.mkdir(parents=True, exist_ok=True)
     _seed_dead_worker_fresh_outcome_and_clean_exit(tmp_path, paths, sessions_dir)
 
-    _run_orphan_sweep(tmp_path, paths, config, fake_gh)
+    _run_orphan_sweep(tmp_path, paths, config, fake_gh, monkeypatch=monkeypatch)
 
     state = load_state(paths.state_file)
     entry = state["issues"]["207"]
@@ -157,7 +157,7 @@ def test_flip4_approved_rework_exit0_discards_fresh_outcome(tmp_path: Path) -> N
 
 
 def test_flip4_nonzero_exit_still_consults_fresh_confirmed_push_outcome(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     """B3 (wf-review-opus.md): rule 4 ("a fresh outcome file beats the exit
     code; the exit code decides only without one") is unconditional --
@@ -189,7 +189,7 @@ def test_flip4_nonzero_exit_still_consults_fresh_confirmed_push_outcome(
         mtime=datetime.now(UTC),
     )
 
-    _run_orphan_sweep(tmp_path, paths, config, fake_gh)
+    _run_orphan_sweep(tmp_path, paths, config, fake_gh, monkeypatch=monkeypatch)
 
     state = load_state(paths.state_file)
     entry = state["issues"]["207"]
@@ -216,7 +216,9 @@ def test_flip4_nonzero_exit_still_consults_fresh_confirmed_push_outcome(
 # ---------------------------------------------------------------------------
 
 
-def test_flip7_workflow_empty_terminal_outcome_falls_through_to_worktree(tmp_path: Path) -> None:
+def test_flip7_workflow_empty_terminal_outcome_falls_through_to_worktree(
+    tmp_path: Path, monkeypatch
+) -> None:
     """FLIP 7 / N1 (wf-review-opus.md), design doc §3 step 0: current
     (fixed) behaviour.
 
@@ -277,7 +279,7 @@ def test_flip7_workflow_empty_terminal_outcome_falls_through_to_worktree(tmp_pat
     fake_gh = _no_pr_fake_gh(tmp_path, config, issue_number)
 
     with (
-        host_probe(alive=False),
+        host_probe(monkeypatch, alive=False),
         patch("charlie_work.workflow.remote_branch_head_sha", return_value=None),
         patch("charlie_work.workflow.remote_branch_ahead_count", return_value=(0, None)),
     ):

@@ -32,7 +32,7 @@ from charlie_work.state import (
 from _dispatch_fixtures import _stub_real_activity_probe_for_stalled_tests  # noqa: F401
 
 
-def test_dead_dispatched_worker_reaped_after_grace_period(tmp_path: Path) -> None:
+def test_dead_dispatched_worker_reaped_after_grace_period(tmp_path: Path, monkeypatch) -> None:
     """Issue #654: a dead dispatched worker whose drift was already surfaced on
     a prior pass (``orphan_drift_at`` set) but whose PR state did not qualify
     for auto-reset (clean exit with no push -- the #773 no-op branch) must be
@@ -115,7 +115,7 @@ def test_dead_dispatched_worker_reaped_after_grace_period(tmp_path: Path) -> Non
         encoding="utf-8",
     )
 
-    with host_probe(alive=False):
+    with host_probe(monkeypatch, alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         _detect_and_handle_orphaned_workers(
@@ -157,7 +157,9 @@ def test_dead_dispatched_worker_reaped_after_grace_period(tmp_path: Path) -> Non
     assert payload["exit_code"] == 0
 
 
-def test_dead_dispatched_worker_not_reaped_within_grace_period(tmp_path: Path) -> None:
+def test_dead_dispatched_worker_not_reaped_within_grace_period(
+    tmp_path: Path, monkeypatch
+) -> None:
     """Issue #654: a dead dispatched worker whose drift was surfaced recently
     (within ``dead_dispatched_reap_minutes``) must NOT be time-escalated.  The
     existing drift-only behavior (fingerprint match short-circuits to
@@ -250,7 +252,7 @@ def test_dead_dispatched_worker_not_reaped_within_grace_period(tmp_path: Path) -
         encoding="utf-8",
     )
 
-    with host_probe(alive=False):
+    with host_probe(monkeypatch, alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         _detect_and_handle_orphaned_workers(
@@ -274,7 +276,7 @@ def test_dead_dispatched_worker_not_reaped_within_grace_period(tmp_path: Path) -
     assert (207, config.labels.human_needed) not in fake_gh.labels_added
 
 
-def test_dead_dispatched_worker_reap_disabled_by_config(tmp_path: Path) -> None:
+def test_dead_dispatched_worker_reap_disabled_by_config(tmp_path: Path, monkeypatch) -> None:
     """Issue #654: ``dead_dispatched_reap_minutes=0`` disables the time-based
     escape, reverting to the pre-#654 hold-forever behavior.  A dead dispatched
     worker with old drift stays ``dispatched`` -- the operator explicitly opted
@@ -339,7 +341,7 @@ def test_dead_dispatched_worker_reap_disabled_by_config(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    with host_probe(alive=False):
+    with host_probe(monkeypatch, alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         _detect_and_handle_orphaned_workers(
@@ -358,7 +360,7 @@ def test_dead_dispatched_worker_reap_disabled_by_config(tmp_path: Path) -> None:
     assert reaped_events == []
 
 
-def test_dead_dispatched_worker_provider_throttled_not_reaped(tmp_path: Path) -> None:
+def test_dead_dispatched_worker_provider_throttled_not_reaped(tmp_path: Path, monkeypatch) -> None:
     """Issue #1917: a dead dispatched worker whose death was classified as a
     provider throttle (``failure_kind="rate_limited"``) must NOT be escalated
     by the ``dead_dispatched_reap_minutes`` timed backstop, even after the
@@ -459,7 +461,7 @@ def test_dead_dispatched_worker_provider_throttled_not_reaped(tmp_path: Path) ->
         encoding="utf-8",
     )
 
-    with host_probe(alive=False):
+    with host_probe(monkeypatch, alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         _detect_and_handle_orphaned_workers(
@@ -574,7 +576,7 @@ def test_dead_dispatched_worker_provider_throttled_reclaimed_and_retried(
         }
     )
 
-    with host_probe(alive=False):
+    with host_probe(monkeypatch, alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         _detect_and_handle_orphaned_workers(
@@ -710,7 +712,7 @@ def test_dead_dispatched_worker_expired_throttle_window_still_reclaimed(
         }
     )
 
-    with host_probe(alive=False):
+    with host_probe(monkeypatch, alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         _detect_and_handle_orphaned_workers(
@@ -735,7 +737,9 @@ def test_dead_dispatched_worker_expired_throttle_window_still_reclaimed(
     assert (issue_number, config.labels.ready) in fake_gh.labels_added
 
 
-def test_dead_dispatched_worker_non_throttle_kind_still_reaped(tmp_path: Path) -> None:
+def test_dead_dispatched_worker_non_throttle_kind_still_reaped(
+    tmp_path: Path, monkeypatch
+) -> None:
     """Issue #1917 control: a stamped non-throttle classification (e.g.
     ``"stalled"``) must NOT disable the timed reap -- the exemption is
     scoped to ``PROVIDER_THROTTLE_FAILURE_KINDS``, not to any stamp.
@@ -802,7 +806,7 @@ def test_dead_dispatched_worker_non_throttle_kind_still_reaped(tmp_path: Path) -
         encoding="utf-8",
     )
 
-    with host_probe(alive=False):
+    with host_probe(monkeypatch, alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         _detect_and_handle_orphaned_workers(
@@ -829,7 +833,7 @@ def test_dead_dispatched_worker_non_throttle_kind_still_reaped(tmp_path: Path) -
     ids=["expired", "unset", "malformed"],
 )
 def test_dead_dispatched_worker_provider_throttled_reaped_once_window_inactive(
-    tmp_path: Path, throttled_until: str | None
+    tmp_path: Path, throttled_until: str | None, monkeypatch
 ) -> None:
     """Issue #1917: the provider-throttle exemption from the
     ``dead_dispatched_reap_minutes`` timed backstop is bounded — it must
@@ -914,7 +918,7 @@ def test_dead_dispatched_worker_provider_throttled_reaped_once_window_inactive(
         encoding="utf-8",
     )
 
-    with host_probe(alive=False):
+    with host_probe(monkeypatch, alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         _detect_and_handle_orphaned_workers(
@@ -1091,6 +1095,7 @@ def test_launch_failure_lane_stamps_kind_without_window_for_non_throttle(
 
 def _run_no_pr_dead_worker_sweep(
     tmp_path: Path,
+    monkeypatch,
     *,
     failure_kind: str | None,
     seed_entry_fields: dict | None = None,
@@ -1139,7 +1144,7 @@ def _run_no_pr_dead_worker_sweep(
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
 
-    with host_probe(alive=False):
+    with host_probe(monkeypatch, alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         _detect_and_handle_orphaned_workers(
@@ -1154,14 +1159,16 @@ def _run_no_pr_dead_worker_sweep(
     [("rate_limited", 0), ("stalled", 1), (None, 1)],
 )
 def test_orphan_redispatch_seed_first_observation_gated_by_failure_kind(
-    tmp_path: Path, failure_kind: str | None, expected_len: int
+    tmp_path: Path, failure_kind: str | None, expected_len: int, monkeypatch
 ) -> None:
     """Issue #1917: on the first observation of a dead dispatched worker
     (``orphan_redispatch_head_sha`` never seeded), a provider-throttle
     classification must seed ``orphan_redispatch_at`` as ``[]`` — the death
     does not consume a redispatch attempt — while a non-throttle (or
     unclassified) death seeds it with the pass timestamp."""
-    entry = _run_no_pr_dead_worker_sweep(tmp_path, failure_kind=failure_kind)
+    entry = _run_no_pr_dead_worker_sweep(
+        tmp_path, failure_kind=failure_kind, monkeypatch=monkeypatch
+    )
 
     assert len(entry["orphan_redispatch_at"]) == expected_len
     # With no repo/worktree, the fingerprint is "none:none" and the counted
@@ -1175,7 +1182,7 @@ def test_orphan_redispatch_seed_first_observation_gated_by_failure_kind(
     [("rate_limited", 0), ("stalled", 1), (None, 1)],
 )
 def test_orphan_redispatch_seed_head_changed_gated_by_failure_kind(
-    tmp_path: Path, failure_kind: str | None, expected_len: int
+    tmp_path: Path, failure_kind: str | None, expected_len: int, monkeypatch
 ) -> None:
     """Issue #1917: on a head change (the seeded fingerprint differs from
     the current ``none:none``), the timestamp list is re-seeded — ``[]``
@@ -1188,6 +1195,7 @@ def test_orphan_redispatch_seed_head_changed_gated_by_failure_kind(
             "orphan_redispatch_counted_dispatch": "old-identity",
             "orphan_redispatch_at": ["2024-06-01T00:00:00Z"],
         },
+        monkeypatch=monkeypatch,
     )
 
     assert len(entry["orphan_redispatch_at"]) == expected_len
@@ -1199,7 +1207,7 @@ def test_orphan_redispatch_seed_head_changed_gated_by_failure_kind(
     [("rate_limited", 1), ("stalled", 2), (None, 2)],
 )
 def test_orphan_redispatch_append_new_dispatch_gated_by_failure_kind(
-    tmp_path: Path, failure_kind: str | None, expected_len: int
+    tmp_path: Path, failure_kind: str | None, expected_len: int, monkeypatch
 ) -> None:
     """Issue #1917: the ``elif`` branch — same head fingerprint but a
     dispatch identity not yet counted — appends this pass's timestamp for a
@@ -1216,6 +1224,7 @@ def test_orphan_redispatch_append_new_dispatch_gated_by_failure_kind(
             "orphan_redispatch_counted_dispatch": "prior-dispatch-identity",
             "orphan_redispatch_at": [recent_ts],
         },
+        monkeypatch=monkeypatch,
     )
 
     assert len(entry["orphan_redispatch_at"]) == expected_len

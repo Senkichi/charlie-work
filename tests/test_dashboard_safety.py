@@ -141,5 +141,5 @@ def test_concurrent_pass_does_not_double_report_ingested(fleet) -> None:
         peer.close()
     peer_ingested = proxy.peer_result.ingested if proxy.peer_result else 0
     assert mine.error is None
-    # 18 handled events plus alpha's 2 global-kind copies (no global rows in this dst: admitted)
-    assert mine.ingested + peer_ingested == 20  # each counted once
+    # 19 handled events plus alpha's 2 global-kind copies (no global rows in this dst: admitted)
+    assert mine.ingested + peer_ingested == 21  # each counted once

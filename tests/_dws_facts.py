@@ -183,6 +183,7 @@ def run_reap(
     local_park_deferred: Mapping[int, str] | None = None,
     now: datetime = NOW,
     exit_code: int | None = None,
+    issue_details: Mapping[int, Mapping[str, Any]] | None = None,
 ) -> ReapRun:
     """Drive ``reap_flow`` (the dead-dispatched backstop) for one dispatched entry.
 
@@ -212,7 +213,7 @@ def run_reap(
         orphans=(issue,),
         no_pr_orphans=(),
         pr_by_issue={} if pr_data is None else {issue: pr_data},
-        details={},
+        details={} if issue_details is None else {k: dict(v) for k, v in issue_details.items()},
         candidates={},
         escalations={},
         deferred=dict(local_park_deferred or {}),

@@ -47,6 +47,7 @@ from charlie_work.orchestration.misc_review_verdicts import _run_review_reap_swe
 from charlie_work.pass_deadline import PassDeadline
 
 from _fake_transport import FakeAdapter, Runtime, Sleeps, ok
+from _src_ast import parsed, source_files
 
 SRC = Path(__file__).resolve().parents[1] / "src" / "charlie_work"
 NOW = 1000.0
@@ -166,8 +167,8 @@ def test_a_disabled_governor_never_defers() -> None:
 def _lane_names_in_source() -> set[str]:
     """Every lane name a source file hands the gate, derived from the AST."""
     names: set[str] = set()
-    for path in SRC.rglob("*.py"):
-        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+    for path in source_files(SRC):
+        for node in ast.walk(parsed(path)):
             if not isinstance(node, ast.Call):
                 continue
             fn = node.func

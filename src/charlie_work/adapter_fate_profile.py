@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -46,9 +46,20 @@ class AdapterFateProfile:
     # tail classifier reads it -- for a harness whose log also carries tool
     # output (opencode: opencode_log.provider_error_digest). None = raw log.
     log_digest: Callable[[str], str] | None = None
+    # (provider-error tail) -> how long until the tripped quota resets, or None
+    # for the classifier's fixed 24h -- for a provider whose quota windows are
+    # not 24h (opencode Go: opencode_limits.go_quota_reset). None = 24h.
+    quota_reset: Callable[[str], timedelta | None] | None = None
 
 
 _PROFILES: dict[str, AdapterFateProfile] | None = None
+
+
+def _opencode_quota_reset(tail: str) -> timedelta | None:
+    """Late-bound ``opencode_limits.go_quota_reset`` (it imports the worker module)."""
+    from . import opencode_limits
+
+    return opencode_limits.go_quota_reset(tail)
 
 
 def _devin_record_failure(*args: Any, **kwargs: Any) -> tuple[str | None, str | None]:
@@ -152,6 +163,7 @@ def _build_profiles() -> dict[str, AdapterFateProfile]:
             over_budget=None,
             writes_terminal_record=True,
             log_digest=provider_error_digest,
+            quota_reset=_opencode_quota_reset,
         ),
         # "command" and "manual" have no failure-classification or budget
         # consumer today: dead_worker_reap.py's 14 sites never branch on
@@ -264,4 +276,5 @@ def classify_for(
         headless_permission_detection=profile.headless_permission_detection,
         now=now,
         log_digest=profile.log_digest,
+        quota_reset=profile.quota_reset,
     )

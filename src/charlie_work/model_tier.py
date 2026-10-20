@@ -9,7 +9,8 @@ not restrict. Families come from the configured model ids themselves --
 lives here.
 
 When the chain cannot serve a tier (no entry of the family, every such entry
-restricted, or two tiers on one issue) the issue launches on the normal chain,
+restricted, two tiers on one issue, or -- issue #2757 -- the entry's harness is
+at its ``fleet.max_concurrent_sessions_by_harness`` ceiling) the issue launches on the normal chain,
 exactly as an unlabelled one would, and ``worker_model_tier_fallback`` records
 why. An unlabelled issue never reaches this module's selection: it launches on
 the permit's selection, the fleet's default tier.
@@ -40,6 +41,9 @@ EVENT_TIER_FALLBACK = "worker_model_tier_fallback"
 NO_ENTRY = "no_entry"
 RESTRICTED = "restricted"
 CONFLICTING = "conflicting_labels"
+# Issue #2757: the tier's entry runs on a harness whose
+# ``fleet.max_concurrent_sessions_by_harness`` ceiling has no room for the group.
+HARNESS_CAP = "harness_cap"
 
 _TOKEN = re.compile(r"[^a-z0-9]+")
 

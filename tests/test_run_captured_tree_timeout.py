@@ -229,3 +229,16 @@ def test_missing_binary_comes_back_as_value(tmp_path: Path) -> None:
     assert result.ok is False
     assert result.returncode is None
     assert result.error
+
+
+def test_cwd_none_inherits_current_directory() -> None:
+    """``cwd=None`` means inherit -- ``str(None)`` ("None") must never reach
+    ``Popen`` as a directory name (issue #2450)."""
+    result = run_captured(
+        [sys.executable, "-c", "import os; print(os.getcwd())"],
+        cwd=None,
+        timeout_seconds=20,
+    )
+
+    assert result.ok, result
+    assert os.path.samefile(result.stdout.strip(), os.getcwd())

@@ -112,6 +112,7 @@ from .fleet_supervisor_config import (  # noqa: F401  (deliberate re-export)
 )
 
 from . import layout
+from .fleet_harness_caps import freeze_harness_caps
 from .harnesses import REVIEWER_HARNESSES, WORKER_HARNESSES
 from .opencode_config import OpenCodeConfig
 from .role_chain import (
@@ -1219,6 +1220,15 @@ class AutoMergeConfig:
     # ``mergequeue_label`` is set -- it is a definitive "Aviator will not merge
     # this" signal, not a heuristic, so it does not need a time floor.
     mergequeue_wedge_hours: Annotated[float, Typed, NonNeg] = 24.0
+    # Issue #2743: bound on mergequeue label re-adds after Aviator reverts the
+    # queue at the SAME PR head (the #2649 loop: every queue-branch failure
+    # strips the label, the next pass re-adds it, and queue CI burns another
+    # run). After this many same-head reverts the pass refuses the re-add,
+    # routes the PR to rework with the queue-branch failure as evidence, and
+    # emits ``mergequeue_requeue_capped``; reconcile's stale-blocked lane
+    # honours the same bound so it cannot re-add behind the cap's back. A new
+    # head SHA gets a fresh budget. 0 disables the gate (counting continues).
+    mergequeue_requeue_cap: Annotated[int, Typed, NonNeg] = 3
 
     def __post_init__(self) -> None:
         legacy_to_strategy = {
@@ -2167,6 +2177,9 @@ class FleetConfig:
     restores the old single-try behavior. Non-finite values are rejected: an
     infinite budget would hang a lane on a wedged lock, and NaN reaches
     ``time.sleep`` (which raises) inside the retry loop.
+
+    ``max_concurrent_sessions_by_harness`` (issue #2757): per-harness ceilings; see
+    :mod:`charlie_work.fleet_harness_caps` for the shape and semantics.
     """
 
     global_max_concurrent_sessions: Annotated[int, Typed, BoolTolerant] = 0
@@ -2174,6 +2187,11 @@ class FleetConfig:
     # always rejected a bool and a negative (no BoolTolerant, NonNeg).
     global_max_concurrent_reviews: Annotated[int, Typed, NonNeg] = 0
     launch_lock_wait_seconds: Annotated[float, Typed, NonNeg, Finite] = 10.0
+    max_concurrent_sessions_by_harness: Mapping[str, int] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:  # validate + freeze: one point for parsed and hand-built
+        key = "max_concurrent_sessions_by_harness"
+        object.__setattr__(self, key, freeze_harness_caps(getattr(self, key)))
 
 
 @dataclass(frozen=True)
@@ -2220,10 +2238,19 @@ class LocalIssuesConfig:
     relative, non-escaping path; the resolved-path containment check (the one
     a junction cannot fool) runs where the path is first used, in
     ``LocalFileGitHub.__post_init__``.
+
+    ``commit_writes`` (issue #2434): the backend's tracker writes are committed
+    at the end of every loop pass (``orchestration.local_tracker_flush``, one
+    batched ``chore(issues): <verb> #<n>`` commit per issue), so the consumer
+    repo's tracked issue files never stay dirty and the tracker's source of
+    truth lives in git history, not only the working tree. ``false`` is the
+    kill switch: writes accumulate uncommitted exactly as before, and the
+    doctor's tracker-writes check turns into a note instead of escalating.
     """
 
     enabled: Annotated[bool, Typed] = False
     issues_dir: Annotated[str, Typed, NonEmpty, RelativePath] = "docs/issues"
+    commit_writes: Annotated[bool, Typed] = True
 
 
 @dataclass(frozen=True)

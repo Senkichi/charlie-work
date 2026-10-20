@@ -1,4 +1,4 @@
-37
+36
 # Issue #1131: +2 raw primitives in record_review's rework-label-skip
 # guard (_record_event + save_state for rework_label_skipped_issue_closed).
 # These match the existing raw pattern in record_review (which has not
@@ -238,3 +238,13 @@
 # to charlie_work.merge_path.apply*, where every write goes through a Convention-B
 # write_gate parameter (zero out-of-predicate raw sites, so no baseline entry).
 # workflow.py's live raw count fell 50 -> 32; baseline 37 = 32 + the usual slack of 5.
+
+# Issue #2600: _build_attention_digest moved verbatim out of workflow.py into
+# the new charlie_work.attention_digest module (the file-size-ratchet
+# extraction carrying the dispatch lanes' notify-gated digest tails). Its one
+# raw gated-primitive site -- the save_state inside the state_lock baseline
+# write-back -- relocates to attention_digest.py, which gets its own entry (1,
+# slack 0). workflow.py's live raw count fell 32 -> 31, so the entry drops by
+# exactly 1 (37 -> 36) holding the usual slack of 5. Same total-preserving
+# redistribution as #1317/#1632/#1645-#1647/#1636/#1637/L08: the
+# baseline-dict sum is unchanged and no ratchet ceiling loosens.

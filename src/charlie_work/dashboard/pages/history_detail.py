@@ -12,6 +12,7 @@ script cannot disagree about units. There is one block of each per metric and
 from __future__ import annotations
 
 import statistics
+from collections.abc import Callable
 from datetime import timedelta, tzinfo
 
 from ..history_data import MetricData, range_phrase
@@ -112,12 +113,16 @@ def render_head(card: Card, range_key: str, error_kind: str = "internal") -> str
         )
     word = "" if card.summary == "sum" else f' <span class="dim">{esc(card.summary_word)}</span>'
     bad = ' data-bad="1"' if card.bad else ""
+    num = fmt_value(card.value, card.unit)
+    if card.prs is not None:
+        # "<prs> PRs (<value> attempts)": distinct PRs lead the headline (issue #2476).
+        num = f"{fmt_value(card.prs, card.unit)} PRs ({num} attempts)"
     sentences = [_sentence(n) for n in flag_notes(card)]
     if card.stats is not None:
         sentences.append(_sentence(stats_text(card)))
     sentences.append("Click a bar to see what drove it")
     return (
-        f'{head}<h2>{name}: <span class="num">{esc(fmt_value(card.value, card.unit))}</span>'
+        f'{head}<h2>{name}: <span class="num">{esc(num)}</span>'
         f"{word} in the {esc(range_phrase(range_key))} "
         f'<span class="vs"{bad}>{esc(delta_text(card.change))}</span></h2>'
         f'<p class="sub"><span class="takeaway">{esc(card.takeaway)}</span>. '
@@ -131,6 +136,33 @@ def _part_key(child: Series, head: Series) -> str:
     return key.replace("_", " ")
 
 
+def _cause_key(child: Series, head: Series) -> str:
+    """The category of a ``<head>.cause.<x>`` series: the cause label alone."""
+    prefix = f"{head.name}.cause."
+    key = child.name[len(prefix) :] if child.name.startswith(prefix) else child.name
+    return key.replace("_", " ")
+
+
+def _children(metric: MetricData) -> tuple[Series | None, list[Series], list[Series]]:
+    """Split a metric's children: ``(prs companion, category series, cause series)``.
+
+    ``<head>.prs`` is the distinct-PR companion, not a category (issue #2476);
+    ``<head>.cause.<x>`` children are the cause breakdown axis; everything else
+    is a plain category of the headline's count."""
+    head = metric.headline
+    prs: Series | None = None
+    parts: list[Series] = []
+    causes: list[Series] = []
+    for child in metric.series[1:]:
+        if child.name == f"{head.name}.prs":
+            prs = child
+        elif child.name.startswith(f"{head.name}.cause."):
+            causes.append(child)
+        else:
+            parts.append(child)
+    return prs, parts, causes
+
+
 def repo_rows(card: Card, head: Series) -> list[tuple[str, float]]:
     """``(repo, window value)`` per repo, largest first; repos with nothing are left out."""
     rows = []
@@ -141,15 +173,28 @@ def repo_rows(card: Card, head: Series) -> list[tuple[str, float]]:
     return sorted(rows, key=lambda r: (-r[1], r[0]))
 
 
-def part_rows(card: Card, metric: MetricData) -> list[tuple[str, float]]:
-    """``(category, window value)`` per category of a category metric, largest first."""
-    head = metric.headline
+def _category_rows(
+    card: Card, children: list[Series], key: Callable[[Series], str]
+) -> list[tuple[str, float]]:
+    """``(category, window value)`` per child series, largest first."""
     rows = []
-    for child in metric.series[1:]:
+    for child in children:
         value = summarize(child.points, card.summary)
         if value:
-            rows.append((_part_key(child, head), value))
+            rows.append((key(child), value))
     return sorted(rows, key=lambda r: (-r[1], r[0]))
+
+
+def part_rows(card: Card, metric: MetricData) -> list[tuple[str, float]]:
+    """``(category, window value)`` per category of a category metric, largest first."""
+    _, parts, _ = _children(metric)
+    return _category_rows(card, parts, lambda c: _part_key(c, metric.headline))
+
+
+def cause_rows(card: Card, metric: MetricData) -> list[tuple[str, float]]:
+    """``(cause, window value)`` per ``.cause.*`` child (issue #2476), largest first."""
+    _, _, causes = _children(metric)
+    return _category_rows(card, causes, lambda c: _cause_key(c, metric.headline))
 
 
 def _bar_row(label: str, value: float, top: float, unit: str, first: bool) -> str:
@@ -192,16 +237,26 @@ def render_lower(card: Card, metric: MetricData, known: frozenset[str], tz: tzin
     head = metric.headline
     repos = repo_rows(card, head)
     parts = part_rows(card, metric)
-    drawers = _drawer(
-        "By repo over the window",
-        repos,
-        [_repo_label(r, known) for r, _ in repos[:MAX_ROWS]],
-        card.unit,
-    ) + _drawer(
-        "By reason over the window",
-        parts,
-        [f"<span>{esc(k)}</span>" for k, _ in parts[:MAX_ROWS]],
-        card.unit,
+    causes = cause_rows(card, metric)
+    drawers = (
+        _drawer(
+            "By repo over the window",
+            repos,
+            [_repo_label(r, known) for r, _ in repos[:MAX_ROWS]],
+            card.unit,
+        )
+        + _drawer(
+            "By reason over the window",
+            parts,
+            [f"<span>{esc(k)}</span>" for k, _ in parts[:MAX_ROWS]],
+            card.unit,
+        )
+        + _drawer(
+            "By cause over the window",
+            causes,
+            [f"<span>{esc(k)}</span>" for k, _ in causes[:MAX_ROWS]],
+            card.unit,
+        )
     )
     box = f'<div class="lower">{drawers}</div>' if drawers else ""
     return f"{lower}{box}{coverage_note(head, tz)}</div>"
@@ -232,6 +287,7 @@ def chart_entry(card: Card, metric: MetricData, grid: tuple[str, ...]) -> dict:
     ticks.append([_r(top), fmt_value(top, unit)])
     avg = statistics.fmean(seen) if seen else None
     index = {ts: i for i, ts in enumerate(grid)}
+    prs, parts, causes = _children(metric)
     return {
         "chart": card.chart,
         "approx": card.approx,
@@ -243,9 +299,9 @@ def chart_entry(card: Card, metric: MetricData, grid: tuple[str, ...]) -> dict:
         "repo": {
             r: c for r, pts in sorted(head.per_repo.items()) if (c := _cells(pts, index, unit))
         },
-        "parts": {
-            _part_key(s, head): c
-            for s in metric.series[1:]
-            if (c := _cells(s.points, index, unit))
-        },
+        "parts": {_part_key(s, head): c for s in parts if (c := _cells(s.points, index, unit))},
+        # Issue #2476 companions: distinct PRs per bucket (``prs``) and the
+        # cause breakdown (``causes``), keyed by the cause label alone.
+        "prs": _cells(prs.points, index, unit) if prs is not None else [],
+        "causes": {_cause_key(s, head): c for s in causes if (c := _cells(s.points, index, unit))},
     }

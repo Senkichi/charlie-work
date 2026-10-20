@@ -50,28 +50,32 @@ def _drift_reasons(state: dict[str, Any]) -> list[str]:
     ]
 
 
-def test_stale_exit_zero_record_does_not_route_to_clean_exit_no_op(tmp_path: Path) -> None:
+def test_stale_exit_zero_record_does_not_route_to_clean_exit_no_op(
+    tmp_path: Path, monkeypatch
+) -> None:
     config, paths, fake_gh, _dispatched_at = _dead_worker_rework_bed(
         tmp_path, decision="request_changes"
     )
     # The bed dispatched one hour ago; this record ended three hours ago.
     _write_terminal(tmp_path, ended_ago=timedelta(hours=3))
 
-    _run_orphan_sweep(tmp_path, paths, config, fake_gh)
+    _run_orphan_sweep(tmp_path, paths, config, fake_gh, monkeypatch=monkeypatch)
 
     state = load_state(paths.state_file)
     assert state["issues"]["207"]["status"] == "rework_requested"
     assert "dead_worker_clean_exit_no_op" not in _drift_reasons(state)
 
 
-def test_fresh_exit_zero_record_still_routes_to_clean_exit_no_op(tmp_path: Path) -> None:
+def test_fresh_exit_zero_record_still_routes_to_clean_exit_no_op(
+    tmp_path: Path, monkeypatch
+) -> None:
     """Positive control: the same bed with a record from THIS dispatch keeps #773."""
     config, paths, fake_gh, _dispatched_at = _dead_worker_rework_bed(
         tmp_path, decision="request_changes"
     )
     _write_terminal(tmp_path, ended_ago=timedelta(minutes=5))
 
-    _run_orphan_sweep(tmp_path, paths, config, fake_gh)
+    _run_orphan_sweep(tmp_path, paths, config, fake_gh, monkeypatch=monkeypatch)
 
     state = load_state(paths.state_file)
     # #773: no death-redispatch credit. #2034: the no-op finding is dispositioned
@@ -82,7 +86,9 @@ def test_fresh_exit_zero_record_still_routes_to_clean_exit_no_op(tmp_path: Path)
     assert _drift_reasons(state) == ["dead_worker_clean_exit_no_op"]
 
 
-def test_dead_dispatched_reap_ignores_a_stale_terminal_exit_code(tmp_path: Path) -> None:
+def test_dead_dispatched_reap_ignores_a_stale_terminal_exit_code(
+    tmp_path: Path, monkeypatch
+) -> None:
     config, paths, fake_gh, _dispatched_at = _dead_worker_rework_bed(
         tmp_path, decision="request_changes"
     )
@@ -93,7 +99,7 @@ def test_dead_dispatched_reap_ignores_a_stale_terminal_exit_code(tmp_path: Path)
     state["issues"]["207"]["orphan_drift_at"] = _iso(now - timedelta(hours=2))
     save_state(paths.state_file, state)
 
-    _run_orphan_sweep(tmp_path, paths, config, fake_gh)
+    _run_orphan_sweep(tmp_path, paths, config, fake_gh, monkeypatch=monkeypatch)
 
     state = load_state(paths.state_file)
     assert state["issues"]["207"]["escalation_reason"] == "dead_dispatched_worker_reap"

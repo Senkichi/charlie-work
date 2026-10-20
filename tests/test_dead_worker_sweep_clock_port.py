@@ -15,6 +15,7 @@ from charlie_work.config import (
     AutoMergeConfig,
     DevinConfig,
     OrchestratorConfig,
+    PostMortemConfig,
     WorkerRoleConfig,
 )
 from charlie_work.devin_shell import SessionRecord
@@ -34,6 +35,16 @@ def test_dead_session_reclaim_stamps_redispatch_from_clock_port(
         auto_merge=AutoMergeConfig(required_checks=("Tests passed",)),
         devin=DevinConfig(dispatch_command=(sys.executable, "-c", "print('ok')")),
         worker=WorkerRoleConfig(harness="command"),
+        # Issue #2602 (ledger-regress): a devin-adapter dead session runs
+        # post_mortem.classify_and_record, whose default db_path resolves the
+        # host's real %APPDATA%\devin\cli\sessions.db. The fake worktree never
+        # exact-matches a row, so _find_matching_session fell back to
+        # normalizing every working_directory in the table -- a whole-table
+        # scan that grew with the shared host's session history (the 7.1x).
+        # Point the read at a path that never exists, the convention the
+        # sibling dead-sweep tests use, so the extraction misses fast and
+        # deterministically and the log-tail fallback covers classification.
+        post_mortem=PostMortemConfig(db_path=str(tmp_path / "missing-sessions.db")),
     )
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     gh = FakeGitHub()

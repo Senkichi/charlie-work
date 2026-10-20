@@ -241,6 +241,20 @@ def fleet(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         "review_verdict_missed",
         {"issue_number": 2083, "pr_number": 2089, "reason": "PR #2089 is MERGED on GitHub"},
     )
+    # Issue #2476 shape: a stable token reason, the free-text message in
+    # detail, and a cause object whose api_error_status wins the cause label.
+    e(
+        a,
+        "2026-10-01T08:15:30Z",
+        "review_verdict_missed",
+        {
+            "cause": {"cause": "died_mid_session", "api_error_status": 429, "exit_code": 1},
+            "detail": "reviewer exited before writing a verdict (API error 429)",
+            "issue_number": 2084,
+            "pr_number": 2090,
+            "reason": "died_mid_session",
+        },
+    )
     e(
         a,
         "2026-10-01T08:16:00Z",

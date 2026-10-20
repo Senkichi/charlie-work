@@ -142,7 +142,7 @@ def test_stall_and_dead_lane_increment_deferral_counter_at_most_once_per_pass(
 
 @pytest.mark.real_activity_probe_live
 def test_stall_then_dead_lane_composition_survives_phantom_post_mortem_sidecar(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Issue #343 Finding 1 (composition gap): every pre-existing test drives
     ``_classify_dead_sessions_and_update_throttle_state`` in isolation. In
@@ -236,6 +236,27 @@ def test_stall_then_dead_lane_composition_survives_phantom_post_mortem_sidecar(
         )
     )
 
+    # Issue #2563 (same root cause as #2446/#2401): the stall lane's DEAD
+    # verdict serves KillOrphans through ``apply_stalled._serve``, which calls
+    # ``effects_sessions.sweep_orphan_processes`` -- a real PowerShell
+    # ``Get-CimInstance Win32_Process`` enumeration, ~0.6s on an idle host and
+    # ~4s on the loaded Windows CI runner, the whole 0.666s -> 4.840s ledger
+    # delta. The fixture's worktree path (``tmp_path/worktree-343``, never
+    # created) can match no real process CommandLine, so the real sweep would
+    # return [] too, after paying the spawn. Stub it through the same
+    # ``effects_sessions`` seam the sibling tests in this module patch (and the
+    # #2446 fix patches for its stalled-lane sibling), and record the call to
+    # pin that the lane still reaches the sweep through this seam.
+    from charlie_work.dead_worker_sweep import effects_sessions
+
+    orphan_sweep_calls: list[str] = []
+
+    def _record_orphan_sweep(worktree_path: str) -> list:
+        orphan_sweep_calls.append(worktree_path)
+        return []
+
+    monkeypatch.setattr(effects_sessions, "sweep_orphan_processes", _record_orphan_sweep)
+
     def _run_stall_lane() -> None:
         with (
             patch("charlie_work.worker_fate.is_alive", return_value=False),
@@ -306,6 +327,13 @@ def test_stall_then_dead_lane_composition_survives_phantom_post_mortem_sidecar(
     assert persisted.get("inconclusive_probe_deferred_count") == 2, (
         "counter must advance by exactly 1 per pass across both passes"
     )
+    # Issue #2563 seam pin: the stalled lane sweeps exactly once per pass for
+    # this fixture (setup -- the only pass where it reaches DEAD); if the
+    # stall lane ever rebinds the sweep call (e.g. imports
+    # orphan_sweep.sweep_orphan_processes directly, bypassing the
+    # effects_sessions module attribute), the list goes empty and the test
+    # fails instead of silently re-paying a real spawn per pass.
+    assert orphan_sweep_calls == [str(tmp_path / "worktree-343")]
 
 
 def test_stall_reap_classifies_rate_limit_before_stalled_fallback(tmp_path: Path) -> None:

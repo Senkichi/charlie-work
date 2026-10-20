@@ -35,7 +35,7 @@ from charlie_work.state import (
 
 
 def test_orphan_sweep_redispatch_cap_first_observation_with_long_history(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     """Issue #1243 regression: an issue whose adapter_history already exceeds
     max_auto_redispatch from an earlier, unrelated PR cycle must NOT be
@@ -104,7 +104,7 @@ def test_orphan_sweep_redispatch_cap_first_observation_with_long_history(
     from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
     # First orphan-sweep pass through the cap code for this issue.
-    with host_probe(alive=False):
+    with host_probe(monkeypatch, alive=False):
         _detect_and_handle_orphaned_workers(
             sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
         )
@@ -131,7 +131,7 @@ def test_orphan_sweep_redispatch_cap_first_observation_with_long_history(
 
 
 def test_orphan_sweep_redispatch_cap_fires_with_api_worker_disabled(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     """Issue #1243 regression: the redispatch cap must fire in the default
     configuration where ``api_worker.enabled`` is ``False`` (the production
@@ -194,8 +194,8 @@ def test_orphan_sweep_redispatch_cap_fires_with_api_worker_disabled(
 
     from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
-    def _run_sweep() -> None:
-        with host_probe(alive=False):
+    def _run_sweep(monkeypatch) -> None:
+        with host_probe(monkeypatch, alive=False):
             _detect_and_handle_orphaned_workers(
                 sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
             )
@@ -226,7 +226,7 @@ def test_orphan_sweep_redispatch_cap_fires_with_api_worker_disabled(
     # Run max_attempts sweeps that proceed (count 1..max_attempts), then
     # one more that must escalate (count max_attempts+1 > max_attempts).
     for attempt in range(1, max_attempts + 1):
-        _run_sweep()
+        _run_sweep(monkeypatch=monkeypatch)
         st = load_state(paths.state_file)
         entry = st["issues"]["1243"]
         # adapter_history must stay empty -- the old counter's source never
@@ -245,7 +245,7 @@ def test_orphan_sweep_redispatch_cap_fires_with_api_worker_disabled(
         _simulate_dispatch(attempt + 1)
 
     # Final sweep: count = max_attempts + 1 > max_attempts -> ESCALATE.
-    _run_sweep()
+    _run_sweep(monkeypatch=monkeypatch)
     st = load_state(paths.state_file)
     entry = st["issues"]["1243"]
 
@@ -265,7 +265,7 @@ def test_orphan_sweep_redispatch_cap_fires_with_api_worker_disabled(
 
 
 def test_orphan_sweep_redispatch_cap_counts_distinct_identities_and_escalates(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     """Issue #1243 round-3 fix: when each sweep pass observes a genuinely
     NEW dead dispatch (distinct ``worker_pid`` each time, head unchanged),
@@ -313,8 +313,8 @@ def test_orphan_sweep_redispatch_cap_counts_distinct_identities_and_escalates(
 
     from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
-    def _run_sweep() -> None:
-        with host_probe(alive=False):
+    def _run_sweep(monkeypatch) -> None:
+        with host_probe(monkeypatch, alive=False):
             _detect_and_handle_orphaned_workers(
                 sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
             )
@@ -337,7 +337,7 @@ def test_orphan_sweep_redispatch_cap_counts_distinct_identities_and_escalates(
     max_attempts = config.watchdog.max_auto_redispatch
 
     for attempt in range(1, max_attempts + 1):
-        _run_sweep()
+        _run_sweep(monkeypatch=monkeypatch)
         st = load_state(paths.state_file)
         entry = st["issues"]["1243"]
         assert entry.get("status") == "dispatched"
@@ -348,7 +348,7 @@ def test_orphan_sweep_redispatch_cap_counts_distinct_identities_and_escalates(
         _simulate_redispatch(90001 + attempt)
 
     # Final sweep: count = max_attempts + 1 > max_attempts -> ESCALATE.
-    _run_sweep()
+    _run_sweep(monkeypatch=monkeypatch)
     st = load_state(paths.state_file)
     entry = st["issues"]["1243"]
 

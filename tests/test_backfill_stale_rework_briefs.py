@@ -20,6 +20,12 @@ from types import ModuleType
 
 import pytest
 
+import _git_templates
+from _backfill_gate_fixtures import (
+    _deployment_gate_repos as _register_deployment_gate_repos,  # noqa: F401 -- registers fixture
+    _make_repo_with_fix,
+    _make_repo_without_fix,
+)
 from _script_loader import load_script_module
 from _worktree_fixtures import _init_repo
 from charlie_work.workflow import _is_verdict_newer_than_brief
@@ -33,6 +39,52 @@ def _load_backfill_script() -> ModuleType:
 @pytest.fixture(scope="module")
 def bf() -> ModuleType:
     return _load_backfill_script()
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _warm_plain_git_template(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> _git_templates.EnvKey | None:
+    """HS-CW-4: charge the ``plain`` git-template cold build to module setup.
+
+    ``test_repo_builders_go_through_the_git_template`` is this module's pin
+    for the repo builders materializing from the per-process ``plain`` git
+    template, and the deployment-gate tests below it call the same builders
+    (``tiny_git_repo`` directly; ``_make_repo_with_fix`` /
+    ``_make_repo_without_fix`` once per worker through the module-scoped
+    ``deployment_gate_repos`` fixture in ``_backfill_gate_fixtures``).
+    Whichever test lands first on its xdist worker pays the template BUILD --
+    five ``git`` spawns whose cost swells from ~0.15 s idle to 1.3-5 s on
+    loaded self-hosted Windows runners -- and once the worker's first
+    ``plain`` user is the pin test itself, the ledger sees the whole build
+    inside the pin test's call. The ledger's samples are therefore bimodal
+    (~0.25 s warm, 1.3-5.1 s cold) with the cold share stochastic, and the
+    alert over a 10-sample window fires on the share rather than on any
+    repo change (issue #2577).
+
+    The order dependence is the root cause and the build is shared per
+    process, so the fix charges it to module setup: the idiom
+    ``test_charlie_work_review_claims.py`` already established for the
+    same ledger mechanism on its flagged test. The build runs with the
+    ``GIT_CONFIG_COUNT/KEY_0/VALUE_0`` trio that ``conftest._isolate_git_env``
+    injects into every test (applied through its own ``MonkeyPatch``
+    context so the builder's spawned ``git`` sees it), because
+    ``env_fingerprint()`` keys the registry by ``GIT_*`` env and the
+    per-test fixtures that set the trio are NOT active at module setup:
+    a warm-up without the trio builds a template under a fingerprint the
+    call phase never looks up. The trio's values are constants shared
+    with the conftest injection, so the local env match is provably safe.
+    Returns the fingerprint it warmed under (``None`` without the kill
+    switch) for the phase pin below.
+    """
+    if not _git_templates.reuse_enabled():
+        return None
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("GIT_CONFIG_COUNT", "1")
+        mp.setenv("GIT_CONFIG_KEY_0", "core.longpaths")
+        mp.setenv("GIT_CONFIG_VALUE_0", "true")
+        _init_repo(tmp_path_factory.mktemp("plain-template-warmup") / "repo")
+        return _git_templates.env_fingerprint()
 
 
 def _write_pr(
@@ -451,37 +503,6 @@ def test_deployment_gate_requires_all_of_multiple_commits(
 # ---------------------------------------------------------------------------
 
 
-def _make_repo_with_fix(tmp_path: Path, name: str) -> tuple[Path, str]:
-    """Create a git repo whose HEAD contains a 'fix' commit; return (repo, fix_sha).
-
-    The base repo materializes from the per-process ``plain`` git template
-    (``_worktree_fixtures._init_repo`` -> ``tests/_git_templates.py``,
-    HS-CW-4: ``shutil.copytree``, no subprocesses); only the per-test fix
-    commit itself still spawns git. The fix SHA stays unique to this repo
-    because the commit is created after the copy -- no other template copy's
-    object store contains it, which is what the renderer-vs-state-repo tests
-    rely on."""
-    repo = tmp_path / name
-    _init_repo(repo)
-    (repo / "fix.txt").write_text("fix", encoding="utf-8")
-    _git(repo, "add", "fix.txt")
-    _git(repo, "commit", "-q", "-m", "the renderer fix")
-    fix_sha = _git(repo, "rev-parse", "HEAD").stdout.strip()
-    return repo, fix_sha
-
-
-def _make_repo_without_fix(tmp_path: Path, name: str) -> Path:
-    """Create a git repo whose HEAD does NOT contain the fix (simulates a
-    state root / different repo that cannot resolve the fix SHA).
-
-    A ``plain`` template copy is sufficient here: the gate only requires a
-    real git work tree whose object store lacks the fix SHA, and the fix
-    commit is only ever created inside ``_make_repo_with_fix``'s copy."""
-    repo = tmp_path / name
-    _init_repo(repo)
-    return repo
-
-
 def test_repo_builders_go_through_the_git_template(tmp_path: Path) -> None:
     """Issue #2463 regression pin: the repo builders must materialize through
     the per-process ``plain`` git template (``_git_templates``, HS-CW-4)
@@ -491,27 +512,70 @@ def test_repo_builders_go_through_the_git_template(tmp_path: Path) -> None:
     at ~2.5x baseline because each of this module's gate tests paid the full
     spawn cost on the Windows CI host. Mirrors ``test_git_templates``'s #2387
     pin for ``_helpers._init_git_repo`` and the #2425 pin in
-    ``test_local_issues_loop_gates``."""
+    ``test_local_issues_loop_gates``.
+
+    Issue #2605: same spawn slowdown regressed the pin to 4.3x baseline --
+    five call-phase ``git`` spawns, now two."""
     import _git_templates
 
     before = _git_templates._REGISTRY.materialized["plain"]
     repo, fix_sha = _make_repo_with_fix(tmp_path, "with-fix")
     assert _git_templates._REGISTRY.materialized["plain"] == before + 1
-    # The fix commit is a real object in this copy's store.
-    assert _git(repo, "rev-parse", "--verify", fix_sha).stdout.strip()
+    # ^{commit} forces object lookup; a bare 40-hex echoes back unresolved.
+    assert _git(repo, "rev-parse", "--verify", f"{fix_sha}^{{commit}}").stdout.strip()
     without = _make_repo_without_fix(tmp_path, "without-fix")
     assert _git_templates._REGISTRY.materialized["plain"] == before + 2
-    assert _git(without, "rev-parse", "--verify", "main").stdout.strip()
+    # init_repo already byte-compared the copy's refs against the template.
+    assert (without / ".git" / "refs" / "heads" / "main").read_text(encoding="ascii").strip()
+
+
+@pytest.mark.skipif(
+    not _git_templates.reuse_enabled(),
+    reason="CI_FLEET_TEST_REUSE=off forces the fresh path; there is no template to pin",
+)
+def test_plain_git_template_warmed_by_module_setup(
+    _warm_plain_git_template: _git_templates.EnvKey | None, tmp_path: Path
+) -> None:
+    """Pin the module warm-up to the environment the call phase looks up.
+
+    The ``test_charlie_work_review_claims.py`` pin's lesson: a warm-up that
+    builds under a different ``env_fingerprint`` than the call phase
+    silently buys nothing -- the lookup misses and the cold ``git`` boot
+    lands in the call phase anyway. The fixture returns the fingerprint
+    it warmed under; comparing it against this test's own call-phase
+    fingerprint fails on any drift regardless of what other modules
+    warmed in this worker. The probe then drives the real consumer path
+    (_init_repo) and proves it copies the warmed template:
+    ``materialized["plain"]`` increments while the registry's key set
+    stays fixed -- a cold build would add a ``("plain", env)`` key
+    instead (issue #2577).
+    """
+    warmed_env = _warm_plain_git_template
+    call_env = _git_templates.env_fingerprint()
+    assert warmed_env == call_env, (
+        "module warm-up ran under a different env fingerprint than the call "
+        "phase; its template can never be looked up"
+    )
+    registry = _git_templates._REGISTRY
+    assert registry.lookup("plain") is not None, (
+        "no plain template under the call-phase fingerprint; the warm-up took the fresh path"
+    )
+    keys_before = set(registry._templates)
+    copies_before = registry.materialized["plain"]
+    _init_repo(tmp_path / "probe")
+    assert registry.materialized["plain"] == copies_before + 1
+    assert set(registry._templates) == keys_before, (
+        "the call phase built a new plain template instead of copying the warmed one"
+    )
 
 
 def test_deployment_gate_anchors_to_renderer_not_state_repo(
-    tmp_path: Path, bf: ModuleType
+    deployment_gate_repos: tuple[Path, str, Path], bf: ModuleType
 ) -> None:
     """The fix SHA lives in the renderer repo's history but NOT in the state
     repo's object store. Gate against the renderer -> PASS; gate against the
     state repo -> FAIL with git 128 (the cross-repo defect #2)."""
-    renderer_repo, fix_sha = _make_repo_with_fix(tmp_path, "renderer")
-    state_repo = _make_repo_without_fix(tmp_path, "state")
+    renderer_repo, fix_sha, state_repo = deployment_gate_repos
 
     # Gate against the renderer checkout: fix is an ancestor of HEAD -> PASS.
     ok, failures = bf.check_deployment_gate(renderer_repo, [fix_sha])
@@ -528,8 +592,35 @@ def test_deployment_gate_anchors_to_renderer_not_state_repo(
     assert "128" in failures[0]
 
 
+def test_deployment_gate_pass_never_resolves_head(
+    deployment_gate_repos: tuple[Path, str, Path],
+    bf: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #2663 pin: a passing gate pays only the ``merge-base`` probes.
+
+    ``check_deployment_gate`` resolves HEAD lazily -- the value only feeds
+    the failure messages -- so a fully-passing call must never spawn the
+    ``rev-parse``. On the spawn-degraded runner pool each extra spawn is
+    billed to the caller's ``call`` phase at ~300 ms, which is what the
+    ledger flagged."""
+    repo_with_fix, fix_sha, _ = deployment_gate_repos
+
+    def _boom(_repo: Path) -> str:
+        raise AssertionError("_current_head ran on the all-pass path")
+
+    monkeypatch.setattr(bf, "_current_head", _boom)
+    ok, failures = bf.check_deployment_gate(repo_with_fix, [fix_sha])
+    assert ok is True
+    assert failures == []
+
+
 def test_main_renderer_repo_separates_gate_from_state_repo(
-    tmp_path: Path, bf: ModuleType, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    deployment_gate_repos: tuple[Path, str, Path],
+    tmp_path: Path,
+    bf: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
 ) -> None:
     """--renderer-repo anchors the gate to the renderer checkout, independent
     of --repo. The state repo lacks the fix SHA entirely (defect #2: git 128
@@ -537,8 +628,7 @@ def test_main_renderer_repo_separates_gate_from_state_repo(
     renderer. The OLD code evaluated against --repo and would have FAILED."""
     # Isolate from the real host fleet config layer.
     monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", str(tmp_path / "fleet-dir"))
-    renderer_repo, fix_sha = _make_repo_with_fix(tmp_path, "renderer")
-    state_repo = _make_repo_without_fix(tmp_path, "state")
+    renderer_repo, fix_sha, state_repo = deployment_gate_repos
 
     rc = bf.main(
         [
@@ -559,14 +649,17 @@ def test_main_renderer_repo_separates_gate_from_state_repo(
 
 
 def test_main_gate_fails_when_renderer_lacks_fix_even_if_state_repo_has_it(
-    tmp_path: Path, bf: ModuleType, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    deployment_gate_repos: tuple[Path, str, Path],
+    tmp_path: Path,
+    bf: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
 ) -> None:
     """Defect #1 (cw false-PASS): --repo's HEAD contains the fix, but the
     renderer checkout does NOT. The gate must FAIL (the renderer is not
     deployed), even though the OLD code would have PASSed against --repo."""
     monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", str(tmp_path / "fleet-dir"))
-    state_repo, fix_sha = _make_repo_with_fix(tmp_path, "state")
-    renderer_repo = _make_repo_without_fix(tmp_path, "renderer")
+    state_repo, fix_sha, renderer_repo = deployment_gate_repos
 
     rc = bf.main(
         [
@@ -586,14 +679,17 @@ def test_main_gate_fails_when_renderer_lacks_fix_even_if_state_repo_has_it(
 
 
 def test_main_apply_refused_when_renderer_lacks_fix(
-    tmp_path: Path, bf: ModuleType, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    deployment_gate_repos: tuple[Path, str, Path],
+    tmp_path: Path,
+    bf: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
 ) -> None:
     """--apply is refused when the renderer checkout lacks the fix, even
     though --repo has it (defect #1). The OLD code would have allowed the
     apply, regenerating briefs through the pre-fix renderer."""
     monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", str(tmp_path / "fleet-dir"))
-    state_repo, fix_sha = _make_repo_with_fix(tmp_path, "state")
-    renderer_repo = _make_repo_without_fix(tmp_path, "renderer")
+    state_repo, fix_sha, renderer_repo = deployment_gate_repos
 
     rc = bf.main(
         [
@@ -614,13 +710,17 @@ def test_main_apply_refused_when_renderer_lacks_fix(
 
 
 def test_main_renderer_repo_defaults_to_repo(
-    tmp_path: Path, bf: ModuleType, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    deployment_gate_repos: tuple[Path, str, Path],
+    tmp_path: Path,
+    bf: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
 ) -> None:
     """Without --renderer-repo, the gate evaluates against --repo (backward
     compatibility for the single-checkout layout where the state repo IS the
     renderer)."""
     monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", str(tmp_path / "fleet-dir"))
-    repo, fix_sha = _make_repo_with_fix(tmp_path, "repo")
+    repo, fix_sha, _ = deployment_gate_repos
 
     rc = bf.main(["--repo", str(repo), "--require-commit", fix_sha])
     assert rc == 0

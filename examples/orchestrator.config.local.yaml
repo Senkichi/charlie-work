@@ -17,6 +17,12 @@ local_issues:
   # Relative to the repo root. One file per issue: NNN_*.md, YAML
   # frontmatter (title/state/labels/…) + body. Non-recursive scan.
   issues_dir: docs/issues
+  # Default true: commit the tracker writes (state flips, label edges,
+  # appended comments) at the end of every loop pass — one batched
+  # `chore(issues): <verb> #N` commit per issue — so the tracked issue
+  # files never stay dirty. Set to false only as a kill switch; the
+  # writes then accumulate uncommitted, exactly as before issue #2434.
+  commit_writes: true
 
 labels:
   ready: automated-ready

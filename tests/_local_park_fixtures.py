@@ -176,10 +176,11 @@ def _run_sweep(
     gh,
     write_gate: WriteGate,
     fleet_dir: Path,
+    monkeypatch,
 ) -> None:
     from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
-    with host_probe(alive=False):
+    with host_probe(monkeypatch, alive=False):
         _detect_and_handle_orphaned_workers(
             sessions_dir,
             state_file,

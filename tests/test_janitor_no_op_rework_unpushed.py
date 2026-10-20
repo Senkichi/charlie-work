@@ -16,6 +16,10 @@ from _janitor_fixtures import _config, _green_checks, _green_pr, _init_repo
 from charlie_work.janitor import _get_unpushed_commit_info, run_janitor
 
 
+def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)
+
+
 def test_no_op_rework_unpushed_commit_enrichment(tmp_path: Path) -> None:
     """Enrich failure message with unpushed commit count when worktree exists."""
     # Set up a git repo with a worktree
@@ -94,142 +98,136 @@ def test_get_unpushed_commit_info_excludes_base_update_merge_noise(tmp_path: Pat
     local ``git merge origin/main`` transitively drags in — including other PRs'
     already-landed squash-merge commits — as "unpushed". None of that is genuine
     unpushed work.
+
+    The scenario needs nothing but the commit graph and the
+    ``refs/remotes/origin/*`` refs the function's rev-list exclusions read,
+    so ``git fast-import`` builds the whole history — base commits, the
+    agent branch's base-update merge, and the remote-tracking refs a real
+    clone/push/fetch would leave — in a single process. The earlier version
+    spawned ~18 ``git`` processes for a clone + push + fetch + merge cycle
+    that produced the identical graph.
     """
-    remote_repo = tmp_path / "remote"
-    _init_repo(remote_repo)
-    (remote_repo / "test.txt").write_text("initial content")
-    subprocess.run(["git", "add", "."], cwd=remote_repo, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "commit", "-m", "initial"], cwd=remote_repo, check=True, capture_output=True
-    )
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "--initial-branch=main")
 
-    # Clone the remote repo to create a local repo. A plain clone still reports
-    # itself as a worktree via `git worktree list --porcelain`, so it doubles as
-    # "the branch's worktree" for _get_unpushed_commit_info's lookup.
-    local_repo = tmp_path / "local"
+    # History: initial commit I on main, two already-landed squash-merge
+    # commits S0/S1 on top (each a single non-merge commit, like GitHub's
+    # squash-merge default), and the agent branch forked at I with an
+    # unpushed base-update merge M (parents I and main's tip) dragging the
+    # landed commits in. origin/* tracking refs sit at the pushed points, so
+    # the old `rev-list --count origin/branch..HEAD` would count 3
+    # "unpushed" commits here — all already on origin/main, none genuine.
     subprocess.run(
-        ["git", "clone", str(remote_repo), str(local_repo)],
+        ["git", "fast-import", "--quiet"],
+        cwd=repo,
+        # input as bytes: text=True would translate \n to \r\n on Windows
+        # stdin, and git parses the \r as part of each command line.
+        input=b"""\
+commit refs/heads/main
+mark :1
+committer Test User <test@example.test> 0 +0000
+data <<MSG
+initial
+MSG
+commit refs/heads/main
+mark :2
+committer Test User <test@example.test> 0 +0000
+data <<MSG
+squash-merged PR #0
+MSG
+from :1
+commit refs/heads/main
+mark :3
+committer Test User <test@example.test> 0 +0000
+data <<MSG
+squash-merged PR #1
+MSG
+from :2
+commit refs/heads/agent/issue-123-test
+mark :4
+committer Test User <test@example.test> 0 +0000
+data <<MSG
+merge origin/main
+MSG
+from :1
+merge :3
+reset refs/remotes/origin/agent/issue-123-test
+from :1
+reset refs/remotes/origin/main
+from :3
+""",
         check=True,
         capture_output=True,
-        text=True,
     )
-    subprocess.run(
-        ["git", "config", "user.email", "test@example.com"],
-        cwd=local_repo,
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "config", "user.name", "Test User"],
-        cwd=local_repo,
-        check=True,
-        capture_output=True,
-    )
+    # Point HEAD at the agent branch so `git worktree list --porcelain`
+    # reports this repo as the branch's worktree (there are no files to
+    # check out — every commit is tree-empty).
+    _git(repo, "symbolic-ref", "HEAD", "refs/heads/agent/issue-123-test")
 
-    # Create and push the agent branch (nothing unpushed yet)
-    subprocess.run(
-        ["git", "checkout", "-b", "agent/issue-123-test"],
-        cwd=local_repo,
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "push", "-u", "origin", "agent/issue-123-test"],
-        cwd=local_repo,
-        check=True,
-        capture_output=True,
-    )
-
-    # Simulate two other PRs landing on main via squash-merge (each a single
-    # non-merge commit, exactly like GitHub's squash-merge default)
-    subprocess.run(["git", "checkout", "main"], cwd=remote_repo, check=True, capture_output=True)
-    for i in range(2):
-        (remote_repo / f"squash-{i}.txt").write_text(f"squashed PR #{i}")
-        subprocess.run(["git", "add", "."], cwd=remote_repo, check=True, capture_output=True)
-        subprocess.run(
-            ["git", "commit", "-m", f"squash-merged PR #{i}"],
-            cwd=remote_repo,
-            check=True,
-            capture_output=True,
-        )
-
-    # In the local worktree, pull those in via a base-update merge — but don't push.
-    # Old behavior (`rev-list --count origin/branch..HEAD`) would report 3
-    # "unpushed" commits here (the 2 squashed commits + the merge commit itself),
-    # all of them already on origin/main, none of them genuine unpushed work.
-    subprocess.run(
-        ["git", "checkout", "agent/issue-123-test"],
-        cwd=local_repo,
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(["git", "fetch", "origin"], cwd=local_repo, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "merge", "--no-ff", "origin/main"],
-        cwd=local_repo,
-        check=True,
-        capture_output=True,
-    )
-
-    result = _get_unpushed_commit_info("agent/issue-123-test", local_repo, base_ref="main")
+    result = _get_unpushed_commit_info("agent/issue-123-test", repo, base_ref="main")
     assert result is None, f"expected no unpushed-commit message, got: {result!r}"
 
 
 def test_get_unpushed_commit_info_reports_genuine_unpushed_commit(tmp_path: Path) -> None:
     """A worktree with a real unpushed non-merge commit still reports it, with the
-    correct count, even when a base_ref is supplied for exclusion."""
-    remote_repo = tmp_path / "remote"
-    _init_repo(remote_repo)
-    (remote_repo / "test.txt").write_text("initial content")
-    subprocess.run(["git", "add", "."], cwd=remote_repo, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "commit", "-m", "initial"], cwd=remote_repo, check=True, capture_output=True
-    )
+    correct count, even when a base_ref is supplied for exclusion.
 
-    local_repo = tmp_path / "local"
-    subprocess.run(
-        ["git", "clone", str(remote_repo), str(local_repo)],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    subprocess.run(
-        ["git", "config", "user.email", "test@example.com"],
-        cwd=local_repo,
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "config", "user.name", "Test User"],
-        cwd=local_repo,
-        check=True,
-        capture_output=True,
-    )
+    The scenario needs nothing but the commit graph and the
+    ``refs/remotes/origin/*`` refs the function's rev-list exclusions read,
+    so ``git fast-import`` builds the whole history — the base commit, the
+    agent branch's genuine unpushed content commit, and the remote-tracking
+    refs a real clone/push would leave — in a single process. The earlier
+    version spawned ~13 ``git`` processes for an init + clone + config +
+    push cycle that produced the identical graph (ledger-regress for the
+    same runner-pool spawn slowdown that #2559 fixed in the sibling test).
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "--initial-branch=main")
 
+    # History: initial commit I on main, and the agent branch forked at I
+    # with a genuine unpushed non-merge commit W. Both origin/* tracking
+    # refs sit at I — the state a `git push -u origin agent/issue-123-test`
+    # immediately after branching would leave — so
+    # `rev-list --no-merges --count HEAD ^origin/agent/issue-123-test
+    # ^origin/main` counts exactly W.
     subprocess.run(
-        ["git", "checkout", "-b", "agent/issue-123-test"],
-        cwd=local_repo,
+        ["git", "fast-import", "--quiet"],
+        cwd=repo,
+        # input as bytes: text=True would translate \n to \r\n on Windows
+        # stdin, and git parses the \r as part of each command line.
+        input=b"""\
+commit refs/heads/main
+mark :1
+committer Test User <test@example.test> 0 +0000
+data <<MSG
+initial
+MSG
+commit refs/heads/agent/issue-123-test
+mark :2
+committer Test User <test@example.test> 0 +0000
+data <<MSG
+real unpushed work
+MSG
+from :1
+M 100644 inline worker-change.txt
+data <<EOF
+real unpushed work
+EOF
+reset refs/remotes/origin/agent/issue-123-test
+from :1
+reset refs/remotes/origin/main
+from :1
+""",
         check=True,
         capture_output=True,
     )
-    subprocess.run(
-        ["git", "push", "-u", "origin", "agent/issue-123-test"],
-        cwd=local_repo,
-        check=True,
-        capture_output=True,
-    )
+    # Point HEAD at the agent branch so `git worktree list --porcelain`
+    # reports this repo as the branch's worktree.
+    _git(repo, "symbolic-ref", "HEAD", "refs/heads/agent/issue-123-test")
 
-    # A genuine unpushed content commit
-    (local_repo / "worker-change.txt").write_text("real unpushed work")
-    subprocess.run(["git", "add", "."], cwd=local_repo, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "commit", "-m", "real unpushed work"],
-        cwd=local_repo,
-        check=True,
-        capture_output=True,
-    )
-
-    result = _get_unpushed_commit_info("agent/issue-123-test", local_repo, base_ref="main")
+    result = _get_unpushed_commit_info("agent/issue-123-test", repo, base_ref="main")
     assert result is not None
     assert "1 unpushed commit(s)" in result
     assert "git push origin agent/issue-123-test" in result

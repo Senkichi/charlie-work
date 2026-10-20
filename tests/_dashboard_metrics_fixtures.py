@@ -105,8 +105,31 @@ def build_quality(f: Fleet) -> None:
         f.emit(a, ts, "session_exited", {"failure_kind": kind, "issue_number": 5})
     f.emit(b, day(2, 8), "session_exited", {"failure_kind": None, "issue_number": 6})
     f.emit(a, day(3, 5), "review_verdict_missed", {"reason": "launch_failed", "pr_number": 3})
+    # Issue #2476: token reason + human detail + a cause object; PR 3 collects
+    # three more misses from redispatch retries (one on a later day), so
+    # attempts (6) outnumber distinct PRs (3) and api_error_status beats
+    # cause.cause for the cause label.
+    for d in (3, 3, 4):
+        f.emit(
+            a,
+            day(d, 6),
+            "review_verdict_missed",
+            {
+                "reason": "died_mid_session",
+                "detail": "reviewer exited before writing a verdict (API error 429)",
+                "pr_number": 3,
+                "cause": {"cause": "died_mid_session", "api_error_status": 429},
+            },
+        )
+    # Pre-#2476 shape: free text in ``reason`` (still carrying pr_number, as the
+    # emit site always did) -- the rollup moves the text to ``detail``.
     for pr in (4, 5):
-        f.emit(a, day(3, 6), "review_verdict_missed", {"reason": f"PR #{pr} is MERGED on GitHub"})
+        f.emit(
+            a,
+            day(3, 7),
+            "review_verdict_missed",
+            {"reason": f"PR #{pr} is MERGED on GitHub", "pr_number": pr},
+        )
 
 
 def build_capacity(f: Fleet) -> None:

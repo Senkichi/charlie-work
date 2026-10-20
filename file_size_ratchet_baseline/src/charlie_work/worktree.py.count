@@ -1,4 +1,7 @@
-6000
+5800
 # Issue #2195 / PR #2197 rework: the foreign-worktree adoption kwargs wiring grew
 # the live count to 5803, past the 5800 mark. Reviewed hand-raise to the next
 # MARK_QUANTUM multiple.
+# Issue #2487 / PR #2517 rework: the resolved-PR eligibility lanes were
+# extracted to worktree_pr_lanes.py so clean_worktrees can order its lanes;
+# the live count fell to 5724. Lowered by refresh_file_size_ratchet.py.

@@ -166,12 +166,14 @@ def _entries(db: sqlite3.Connection, repo: str, scope: str, args: list, issue, t
         label = "Escalation cleared" if kind == "unescalate" else "Escalated"
         text = " - ".join(x for x in (reason, detail) if x) or None
         out.append(_entry(ts, tz, "escalation", label, text, kind, False, i, pr))
-    for ts, i, pr, reason in db.execute(
-        f"SELECT ts, issue, pr, reason FROM verdict_missed WHERE source = ? AND {scope} {tail}",
+    for ts, i, pr, reason, detail in db.execute(
+        f"SELECT ts, issue, pr, reason, detail FROM verdict_missed"
+        f" WHERE source = ? AND {scope} {tail}",
         [repo, *args],
     ):
+        # `reason` is the stable token; `detail` is the human-readable message (issue #2476).
         out.append(
-            _entry(ts, tz, "review", "Review verdict missed", reason,
+            _entry(ts, tz, "review", "Review verdict missed", detail or reason,
                    "review_verdict_missed", False, i, pr)
         )  # fmt: skip
     if issue is not None:  # worker exits carry an issue number only (no PR column)

@@ -47,7 +47,7 @@ def _write_blocked_outcome(worktree_path: Path, reason_kind: str, detail: str) -
 
 
 def test_blocked_outcome_routes_to_operator_queue_on_first_pass(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     """A worktree containing a ``blocked`` worker outcome and no PR is routed
     to the operator queue on the FIRST sweep pass, with zero redispatches.
@@ -108,7 +108,7 @@ def test_blocked_outcome_routes_to_operator_queue_on_first_pass(
     fake_gh.prs = []
 
     with (
-        host_probe(alive=False),
+        host_probe(monkeypatch, alive=False),
         patch("charlie_work.workflow.remote_branch_head_sha", return_value=None),
         patch("charlie_work.workflow.remote_branch_ahead_count", return_value=(0, None)),
     ):
@@ -178,7 +178,7 @@ def test_blocked_outcome_routes_to_operator_queue_on_first_pass(
     assert len(drift_events) == 0
 
 
-def test_no_outcome_file_keeps_redispatch_behavior(tmp_path: Path) -> None:
+def test_no_outcome_file_keeps_redispatch_behavior(tmp_path: Path, monkeypatch) -> None:
     """Regression guard: a worktree with NO outcome file and no PR keeps
     today's redispatch behavior -- the issue is NOT escalated on the first
     pass, and the redispatch counter is seeded.
@@ -230,7 +230,7 @@ def test_no_outcome_file_keeps_redispatch_behavior(tmp_path: Path) -> None:
     fake_gh.prs = []
 
     with (
-        host_probe(alive=False),
+        host_probe(monkeypatch, alive=False),
         patch("charlie_work.workflow.remote_branch_head_sha", return_value=None),
         patch("charlie_work.workflow.remote_branch_ahead_count", return_value=(0, None)),
     ):
@@ -261,7 +261,7 @@ def test_no_outcome_file_keeps_redispatch_behavior(tmp_path: Path) -> None:
 
 
 def test_leftover_terminal_outcome_older_than_dispatch_is_not_laundered_as_fresh(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     """B5 (wf-review-opus.md), rule 1: the terminal-status watcher copies
     whatever ``.worker-outcome.json`` sits in the worktree at process exit,
@@ -366,7 +366,7 @@ def test_leftover_terminal_outcome_older_than_dispatch_is_not_laundered_as_fresh
     fake_gh.prs = []
 
     with (
-        host_probe(alive=False),
+        host_probe(monkeypatch, alive=False),
         patch("charlie_work.workflow.remote_branch_head_sha", return_value=None),
         patch("charlie_work.workflow.remote_branch_ahead_count", return_value=(0, None)),
     ):
@@ -480,7 +480,9 @@ def _stale_leftover_bed(tmp_path: Path) -> tuple[Any, Any, Path, Any]:
     return config, paths, sessions_dir, fake_gh
 
 
-def test_stale_leftover_outcome_emits_worker_evidence_stale_event(tmp_path: Path) -> None:
+def test_stale_leftover_outcome_emits_worker_evidence_stale_event(
+    tmp_path: Path, monkeypatch
+) -> None:
     """B6 (wf-review-opus.md), design doc §5: rule 1 dropping a stale
     candidate must emit a ``worker_evidence_stale`` warning event so the
     operator has a signal in events.db -- before this fix, ``FateBasis.stale``
@@ -500,7 +502,7 @@ def test_stale_leftover_outcome_emits_worker_evidence_stale_event(tmp_path: Path
     dispatch_2_started_at = _STALE_DISPATCH_2_STARTED_AT
 
     with (
-        host_probe(alive=False),
+        host_probe(monkeypatch, alive=False),
         patch("charlie_work.workflow.remote_branch_head_sha", return_value=None),
         patch("charlie_work.workflow.remote_branch_ahead_count", return_value=(0, None)),
     ):
@@ -532,7 +534,7 @@ def test_stale_leftover_outcome_emits_worker_evidence_stale_event(tmp_path: Path
     count_before = len(query_events(paths.state_file, kind="worker_evidence_stale"))
 
     with (
-        host_probe(alive=False),
+        host_probe(monkeypatch, alive=False),
         patch("charlie_work.workflow.remote_branch_head_sha", return_value=None),
         patch("charlie_work.workflow.remote_branch_ahead_count", return_value=(0, None)),
     ):
@@ -550,7 +552,9 @@ def test_stale_leftover_outcome_emits_worker_evidence_stale_event(tmp_path: Path
     assert count_after == count_before, "same stale candidate re-emitted on the next pass"
 
 
-def test_permission_denial_blocked_outcome_is_not_operator_escalated(tmp_path: Path) -> None:
+def test_permission_denial_blocked_outcome_is_not_operator_escalated(
+    tmp_path: Path, monkeypatch
+) -> None:
     """Issue #2010: a ``blocked`` outcome that is the headless permission-denial
     signature must not escalate to the operator as a blocked task."""
     from charlie_work.workflow import _detect_and_handle_orphaned_workers
@@ -603,7 +607,7 @@ def test_permission_denial_blocked_outcome_is_not_operator_escalated(tmp_path: P
     fake_gh.prs = []
 
     with (
-        host_probe(alive=False),
+        host_probe(monkeypatch, alive=False),
         patch("charlie_work.workflow.remote_branch_head_sha", return_value=None),
         patch("charlie_work.workflow.remote_branch_ahead_count", return_value=(0, None)),
     ):
@@ -625,7 +629,9 @@ def test_permission_denial_blocked_outcome_is_not_operator_escalated(tmp_path: P
     assert not [e for e in st.get("events", []) if e.get("kind") == "worker_declared_blocked"]
 
 
-def test_dry_run_no_pr_precompute_writes_no_stale_event_or_marker(tmp_path: Path) -> None:
+def test_dry_run_no_pr_precompute_writes_no_stale_event_or_marker(
+    tmp_path: Path, monkeypatch
+) -> None:
     """Review wf-r2-1 #2: ``--dry-run`` promises no local writes (#1325). The
     no-PR precompute reported stale evidence without the dry-run gate, writing
     events.db and a ``stale_evidence_reported`` marker -- which then suppressed
@@ -636,9 +642,9 @@ def test_dry_run_no_pr_precompute_writes_no_stale_event_or_marker(tmp_path: Path
 
     config, paths, sessions_dir, fake_gh = _stale_leftover_bed(tmp_path)
 
-    def sweep(*, dry_run: bool) -> None:
+    def sweep(monkeypatch, *, dry_run: bool) -> None:
         with (
-            host_probe(alive=False),
+            host_probe(monkeypatch, alive=False),
             patch("charlie_work.workflow.remote_branch_head_sha", return_value=None),
             patch("charlie_work.workflow.remote_branch_ahead_count", return_value=(0, None)),
         ):
@@ -650,10 +656,10 @@ def test_dry_run_no_pr_precompute_writes_no_stale_event_or_marker(tmp_path: Path
                 write_gate=_wg(paths.state_file, dry_run=dry_run),
             )
 
-    sweep(dry_run=True)
+    sweep(dry_run=True, monkeypatch=monkeypatch)
     assert query_events(paths.state_file, kind="worker_evidence_stale") == []
     entry = load_state(paths.state_file)["issues"][str(_STALE_ISSUE)]
     assert not entry.get("stale_evidence_reported")
 
-    sweep(dry_run=False)
+    sweep(dry_run=False, monkeypatch=monkeypatch)
     assert len(query_events(paths.state_file, kind="worker_evidence_stale")) >= 1

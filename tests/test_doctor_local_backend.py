@@ -655,3 +655,133 @@ def test_doctor_local_lane_kill_switch_quiet_under_threshold(tmp_path: Path) -> 
     assert by_name["local lane kill switch"].ok is True
     assert "nothing" in by_name["local lane kill switch"].detail
     assert ok is True
+
+
+# ---------------------------------------------------------------------------
+# Issue #2434: the "local tracker writes" check. The backend's tracker writes
+# commit once per pass (orchestration.local_tracker_flush), so doctor reads
+# the real working tree and escalates on repeated pass-flush deferrals.
+# ---------------------------------------------------------------------------
+
+
+def _committed_issues_repo(tmp_path: Path):
+    """A git repo with the issues dir tracked and CLEAN (commits the files)."""
+    _init_repo(tmp_path)
+    (tmp_path / ".gitignore").write_text(".var/\n", encoding="utf-8")
+    issues_dir = tmp_path / "docs" / "issues"
+    _write_issue(issues_dir, 1)
+    for argv in (
+        ["git", "add", "--", "docs/issues"],
+        ["git", "-c", "user.name=t", "-c", "user.email=t", "commit", "-m", "seed"],
+    ):
+        subprocess.run(argv, cwd=tmp_path, check=True, capture_output=True, text=True)
+    return issues_dir
+
+
+def _dirty_one_issue(issues_dir: Path) -> None:
+    path = issues_dir / "001_issue.md"
+    path.write_text(
+        '---\ntitle: "issue 1"\nstate: closed\nlabels: []\n---\nBody.\n',
+        encoding="utf-8",
+    )
+
+
+def _run_local_doctor(tmp_path: Path, paths, config, gh):
+    return run_doctor(
+        tmp_path,
+        paths,
+        config,
+        tmp_path / "orchestrator.config.yaml",
+        gh,
+        fleet_dir_override=str(tmp_path / "fleet"),
+    )
+
+
+def test_doctor_tracker_writes_green_when_issues_dir_clean(tmp_path: Path) -> None:
+    """A clean issues dir (every flush committed) is a green check with the
+    mechanism named, so the operator can see what keeps the tree clean."""
+    issues_dir = _committed_issues_repo(tmp_path)
+    config = _local_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    gh = _local_gh(tmp_path, issues_dir)
+
+    ok, checks = _run_local_doctor(tmp_path, paths, config, gh)
+
+    check = _by_name(checks)["local tracker writes"]
+    assert check.ok is True
+    assert "committed at each pass flush" in check.detail
+    assert ok is True
+
+
+def test_doctor_tracker_writes_notes_a_single_deferral(tmp_path: Path) -> None:
+    """Dirty + one recorded deferral: not yet an accumulation warning (the
+    next pass's flush sweeps it), but the note names the mechanism."""
+    from charlie_work.instrumentation import log_event
+
+    issues_dir = _committed_issues_repo(tmp_path)
+    _dirty_one_issue(issues_dir)
+    config = _local_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    log_event(
+        paths.state_file,
+        "local_tracker_writes_deferred",
+        {"reason": "unresolved merge conflicts inside issues_dir"},
+        repo=tmp_path.name,
+    )
+    gh = _local_gh(tmp_path, issues_dir)
+
+    ok, checks = _run_local_doctor(tmp_path, paths, config, gh)
+
+    check = _by_name(checks)["local tracker writes"]
+    assert check.ok is True
+    assert check.severity == "warning"
+    assert "1 issue file(s) uncommitted" in check.detail
+    assert ok is True
+
+
+def test_doctor_tracker_writes_warns_after_repeated_deferrals(tmp_path: Path) -> None:
+    """Dirty + two deferrals within the window: the accumulation the fix
+    exists to prevent -- a warning-severity finding naming the reasons."""
+    from charlie_work.instrumentation import log_event
+
+    issues_dir = _committed_issues_repo(tmp_path)
+    _dirty_one_issue(issues_dir)
+    config = _local_config()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    for reason in ("HEAD is detached", "MERGE_HEAD references an interrupted merge"):
+        log_event(
+            paths.state_file,
+            "local_tracker_writes_deferred",
+            {"reason": reason},
+            repo=tmp_path.name,
+        )
+    gh = _local_gh(tmp_path, issues_dir)
+
+    ok, checks = _run_local_doctor(tmp_path, paths, config, gh)
+
+    check = _by_name(checks)["local tracker writes"]
+    assert check.ok is False
+    assert check.severity == "warning"
+    assert "across more than one pass" in check.detail
+    assert "HEAD is detached" in check.detail
+    assert ok is True  # warning-severity
+
+
+def test_doctor_tracker_writes_notes_disabled_kill_switch(tmp_path: Path) -> None:
+    """``commit_writes: false``: the dirt is deliberate config -- a note, not
+    an escalation, and no deferral threshold is consulted."""
+    from charlie_work.config import LocalIssuesConfig
+
+    issues_dir = _committed_issues_repo(tmp_path)
+    _dirty_one_issue(issues_dir)
+    config = _local_config(local_issues=LocalIssuesConfig(enabled=True, commit_writes=False))
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    gh = _local_gh(tmp_path, issues_dir)
+
+    ok, checks = _run_local_doctor(tmp_path, paths, config, gh)
+
+    check = _by_name(checks)["local tracker writes"]
+    assert check.ok is True
+    assert check.severity == "warning"
+    assert "commit_writes" in check.detail
+    assert ok is True

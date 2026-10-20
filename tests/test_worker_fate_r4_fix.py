@@ -51,12 +51,12 @@ def _blocked_payload(detail: str) -> dict[str, Any]:
 
 
 def _assert_escalation(
-    tmp_path: Path, bed: tuple[Any, ...], *, detail: str, escalated: bool
+    tmp_path: Path, bed: tuple[Any, ...], monkeypatch, *, detail: str, escalated: bool
 ) -> None:
     config, paths, fake_gh, _dispatched_at = bed
     _write_outcome(paths, tmp_path, _blocked_payload(detail), mtime=datetime.now(UTC))
 
-    _run_orphan_sweep(tmp_path, paths, config, fake_gh)
+    _run_orphan_sweep(tmp_path, paths, config, fake_gh, monkeypatch=monkeypatch)
 
     state = load_state(paths.state_file)
     entry = state["issues"]["207"]
@@ -80,13 +80,13 @@ def _assert_escalation(
     [("request_changes", None), ("approved", "rework_requested")],
 )
 def test_with_pr_permission_denial_blocked_outcome_is_not_operator_escalated(
-    tmp_path: Path, decision: str, pr_state_status: str | None
+    tmp_path: Path, decision: str, pr_state_status: str | None, monkeypatch
 ) -> None:
     """Issue #2010, with-PR lane (both sweep sites): the headless
     permission-denial signature is a worker-config defect, not a blocked task,
     so it takes the ordinary reset path exactly as on origin/main."""
     bed = _dead_worker_rework_bed(tmp_path, decision=decision, pr_state_status=pr_state_status)
-    _assert_escalation(tmp_path, bed, detail=DENIAL, escalated=False)
+    _assert_escalation(tmp_path, bed, detail=DENIAL, escalated=False, monkeypatch=monkeypatch)
 
 
 @pytest.mark.parametrize(
@@ -94,11 +94,17 @@ def test_with_pr_permission_denial_blocked_outcome_is_not_operator_escalated(
     [("request_changes", None), ("approved", "rework_requested")],
 )
 def test_with_pr_genuine_blocked_outcome_still_escalates(
-    tmp_path: Path, decision: str, pr_state_status: str | None
+    tmp_path: Path, decision: str, pr_state_status: str | None, monkeypatch
 ) -> None:
     """Positive control for the test above: same bed, non-denial detail."""
     bed = _dead_worker_rework_bed(tmp_path, decision=decision, pr_state_status=pr_state_status)
-    _assert_escalation(tmp_path, bed, detail="needs a human to disambiguate", escalated=True)
+    _assert_escalation(
+        tmp_path,
+        bed,
+        detail="needs a human to disambiguate",
+        escalated=True,
+        monkeypatch=monkeypatch,
+    )
 
 
 def _write_stale_terminal(tmp_path: Path) -> Path:
@@ -117,14 +123,14 @@ def _write_stale_terminal(tmp_path: Path) -> Path:
 
 
 def test_sweep_emits_stale_evidence_event_for_dropped_stale_terminal_record(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     config, paths, fake_gh, _dispatched_at = _dead_worker_rework_bed(
         tmp_path, decision="request_changes"
     )
     _write_stale_terminal(tmp_path)
 
-    _run_orphan_sweep(tmp_path, paths, config, fake_gh)
+    _run_orphan_sweep(tmp_path, paths, config, fake_gh, monkeypatch=monkeypatch)
 
     events = query_events(paths.state_file, kind="worker_evidence_stale")
     stale = [e for e in events if e["payload"]["source"] == "terminal"]
@@ -133,7 +139,9 @@ def test_sweep_emits_stale_evidence_event_for_dropped_stale_terminal_record(
     assert load_state(paths.state_file)["issues"]["207"]["stale_evidence_reported"]
 
 
-def test_dead_dispatched_reap_reports_dropped_stale_terminal_record(tmp_path: Path) -> None:
+def test_dead_dispatched_reap_reports_dropped_stale_terminal_record(
+    tmp_path: Path, monkeypatch
+) -> None:
     config, paths, fake_gh, _dispatched_at = _dead_worker_rework_bed(
         tmp_path, decision="request_changes"
     )
@@ -144,7 +152,7 @@ def test_dead_dispatched_reap_reports_dropped_stale_terminal_record(tmp_path: Pa
     state["issues"]["207"]["orphan_drift_at"] = _iso(now - timedelta(hours=2))
     save_state(paths.state_file, state)
 
-    _run_orphan_sweep(tmp_path, paths, config, fake_gh)
+    _run_orphan_sweep(tmp_path, paths, config, fake_gh, monkeypatch=monkeypatch)
 
     state = load_state(paths.state_file)
     assert state["issues"]["207"]["escalation_reason"] == "dead_dispatched_worker_reap"
@@ -226,7 +234,9 @@ def _no_pr_pushed_bed(tmp_path: Path, *, detail: str) -> tuple[Any, Any, Path, A
     return config, paths, sessions_dir, fake_gh
 
 
-def _sweep_no_pr_pushed(detail: str, tmp_path: Path) -> tuple[dict[str, Any], list[Any]]:
+def _sweep_no_pr_pushed(
+    detail: str, tmp_path: Path, monkeypatch
+) -> tuple[dict[str, Any], list[Any]]:
     from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
     config, paths, sessions_dir, fake_gh = _no_pr_pushed_bed(tmp_path, detail=detail)
@@ -237,7 +247,7 @@ def _sweep_no_pr_pushed(detail: str, tmp_path: Path) -> tuple[dict[str, Any], li
         return 555, None, None
 
     with (
-        host_probe(alive=False),
+        host_probe(monkeypatch, alive=False),
         patch("charlie_work.workflow.remote_branch_head_sha", return_value="abc123"),
         patch("charlie_work.workflow.remote_branch_ahead_count", return_value=(3, None)),
         patch("charlie_work.workflow._open_pr_for_orphaned_branch", side_effect=_fake_open_pr),
@@ -253,13 +263,13 @@ def _sweep_no_pr_pushed(detail: str, tmp_path: Path) -> tuple[dict[str, Any], li
 
 
 def test_no_pr_permission_denial_blocked_with_pushed_commits_still_opens_the_pr(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     """Issue #2010: the exemption must not also suppress the pushed-branch
     PR-open path. On origin/main a permission-denial worker whose branch is
     ahead got its PR opened; the exempt Blocked fate used to shadow
     PushedWithoutPr and send the issue to reclaim/redispatch instead."""
-    entry, opened = _sweep_no_pr_pushed(DENIAL, tmp_path)
+    entry, opened = _sweep_no_pr_pushed(DENIAL, tmp_path, monkeypatch=monkeypatch)
 
     assert opened == ["agent/issue-2010-test"]
     assert entry["status"] == PASSIVE_OPEN_STATUS
@@ -267,10 +277,12 @@ def test_no_pr_permission_denial_blocked_with_pushed_commits_still_opens_the_pr(
 
 
 def test_no_pr_genuine_blocked_with_pushed_commits_escalates_without_a_pr(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     """Positive control: same bed, non-denial detail -> escalated, no PR."""
-    entry, opened = _sweep_no_pr_pushed("needs a human to disambiguate", tmp_path)
+    entry, opened = _sweep_no_pr_pushed(
+        "needs a human to disambiguate", tmp_path, monkeypatch=monkeypatch
+    )
 
     assert opened == []
     assert entry["status"] == "escalated"

@@ -418,7 +418,15 @@ def _reap_review_verdicts(self, reviews_dir: Path) -> dict[str, Any]:
                 }
             )
         else:
-            reason = result.message or "record_review failed"
+            # Issue #2476: ``reason`` is the stable token record_review put on
+            # its refusal (``pr_terminal_state``, ``head_moved_during_build``,
+            # ...) so the rollup can bucket misses; the free-text message moves
+            # to ``detail`` and stays available for diagnostics.
+            detail = result.message or "record_review failed"
+            data = getattr(result, "data", None)  # CommandResult.data; fakes may lack it
+            reason = (data.get("reason") if isinstance(data, dict) else None) or (
+                "record_review_refused"
+            )
             with _wf.state_lock(self.paths.state_file):
                 state = _wf.load_state(self.paths.state_file)
                 state = _wf.append_event(
@@ -428,6 +436,7 @@ def _reap_review_verdicts(self, reviews_dir: Path) -> dict[str, Any]:
                         "pr_number": pr_number,
                         "issue_number": issue_number,
                         "reason": reason,
+                        "detail": detail,
                     },
                     state_path=self.paths.state_file,
                 )
@@ -437,6 +446,7 @@ def _reap_review_verdicts(self, reviews_dir: Path) -> dict[str, Any]:
                     "pr": pr_number,
                     "issue": issue_number,
                     "reason": reason,
+                    "detail": detail,
                 }
             )
         return bool(result.ok)

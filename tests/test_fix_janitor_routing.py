@@ -802,7 +802,7 @@ def test_route_rework_candidate_to_review_does_not_flip_when_pr_closes_mid_pass(
 
 
 def test_orphan_sweep_does_not_flip_to_reviewing_when_pr_closes_mid_pass(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     """The dead-worker orphan sweep snapshots the PR as OPEN (via
     ``pr_list``) to detect a head-advance, then calls ``review()`` which
@@ -847,7 +847,7 @@ def test_orphan_sweep_does_not_flip_to_reviewing_when_pr_closes_mid_pass(
     # orphan sweep's review() callback, not during record_review above.
     fake_gh.close_pr_view = True
 
-    with host_probe(alive=False):
+    with host_probe(monkeypatch, alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"

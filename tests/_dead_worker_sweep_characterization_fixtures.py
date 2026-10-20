@@ -111,6 +111,7 @@ def run_sweep(
     paths: Any,
     config: OrchestratorConfig,
     gh: Any,
+    monkeypatch,
     *,
     review_callback: Any = None,
     pid_alive: bool = False,
@@ -132,7 +133,7 @@ def run_sweep(
     if fleet_dir is not None:
         kwargs["fleet_dir_override"] = str(fleet_dir)
     with ExitStack() as stack:
-        stack.enter_context(host_probe(alive=pid_alive))
+        stack.enter_context(host_probe(monkeypatch, alive=pid_alive))
         for p in patches:
             stack.enter_context(p)
         _detect_and_handle_orphaned_workers(

@@ -154,16 +154,20 @@
     all(".mlower .lower").forEach(function (el) { el.hidden = idx >= 0; });
     if (idx < 0) { return; }
     var when = window.CwHistChart.fmtTime(d.t[idx], d.range, d.range === "7d");
+    var prsCell = (e.prs || []).filter(function (c) { return c[0] === idx; })[0];
+    var prsBit = prsCell ? " (" + prsCell[2] + " PRs)" : "";
     drawer.appendChild(h("p", { "class": "dtitle" }, [
-      "Selected bucket: " + when + " · " + (e.f[idx] === null ? "no data" : e.f[idx]) + " · "
+      "Selected bucket: " + when + " · " + (e.f[idx] === null ? "no data" : e.f[idx] + prsBit) + " · "
     ]));
     drawer.firstChild.appendChild(h("button", { type: "button", "class": "linkish", "data-clear": "1" }, ["back to the whole window"]));
     var box = h("div", { "class": "lower" });
     var repos = barSection("By repo in the selected bucket", rowsAt(e.repo, idx), function (r) { return repoLabel(d, r); });
     var parts = barSection("By reason in the selected bucket", rowsAt(e.parts, idx), function (k) { return h("span", {}, [k]); });
+    var causes = barSection("By cause in the selected bucket", rowsAt(e.causes, idx), function (k) { return h("span", {}, [k]); });
     if (repos) { box.appendChild(repos); }
     if (parts) { box.appendChild(parts); }
-    if (!repos && !parts) { box.appendChild(h("p", { "class": "dim" }, ["Nothing attributed to a repo or reason in this bucket."])); }
+    if (causes) { box.appendChild(causes); }
+    if (!repos && !parts && !causes) { box.appendChild(h("p", { "class": "dim" }, ["Nothing attributed to a repo, reason or cause in this bucket."])); }
     drawer.appendChild(box);
   }
 

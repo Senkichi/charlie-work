@@ -33,12 +33,18 @@ launched before the ledger existed, an unstamped window -- still blocks, so
 nothing that blocked before this module can silently stop blocking. When
 every entry is restricted, selection returns ``None`` and the caller defers
 exactly as the per-repo window always did.
+
+Issue #2757: :func:`reselect_within_harness_caps` re-runs the selection with
+``fleet.max_concurrent_sessions_by_harness`` in mind -- an entry whose harness is
+at its ceiling is passed over (recorded as ``capped``, not ``skipped``, because
+it carries no quota window) so a worker chain can fall through to a harness with
+room. It is a no-op when the map is unset or the selected harness has room.
 """
 
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -75,6 +81,23 @@ class SkippedEntry:
 
 
 @dataclass(frozen=True)
+class CappedEntry:
+    """A chain entry passed over because its harness is at its concurrency ceiling.
+
+    Issue #2757: unlike a :class:`SkippedEntry` there is no ``until`` -- the entry
+    frees up when a live session on that harness exits, not at a wall-clock time --
+    so it is kept apart from ``RoleSelection.skipped`` (which :func:`window_covered`
+    reads as "this entry's quota is restricted until T").
+    """
+
+    index: int
+    entry: RoleEntry
+
+    def to_payload(self) -> dict[str, Any]:
+        return {**self.entry.to_payload(), "index": self.index}
+
+
+@dataclass(frozen=True)
 class RoleSelection:
     """The outcome of one selection over a role chain.
 
@@ -97,6 +120,10 @@ class RoleSelection:
     restrictions: Mapping[tuple[str, str], datetime] = field(
         default=_EMPTY_RESTRICTIONS, compare=False
     )
+    # Issue #2757: entries ahead of the selected one whose harness is at its
+    # ``fleet.max_concurrent_sessions_by_harness`` ceiling. Empty unless
+    # :func:`reselect_within_harness_caps` moved the selection.
+    capped: tuple[CappedEntry, ...] = ()
 
     @property
     def is_fallback(self) -> bool:
@@ -123,6 +150,8 @@ class RoleSelection:
             fields["model"] = self.entry.model
         if self.exhausted and self.earliest_until is not None:
             fields["chain_retry_at"] = _format_z(self.earliest_until)
+        if self.capped:
+            fields["harness_capped"] = [item.to_payload() for item in self.capped]
         return fields
 
     def chain_report_fields(self) -> dict[str, Any]:
@@ -178,6 +207,45 @@ def select_for_launch(chain: Sequence[RoleEntry], now: datetime | None = None) -
         return RoleSelection(chain=chain_tuple, entry=chain_tuple[0], index=0, skipped=())
     resolved_now = now if now is not None else datetime.now(UTC)
     return build_selection(chain_tuple, role_quota_ledger.load_restrictions(), resolved_now)
+
+
+def reselect_within_harness_caps(
+    selection: RoleSelection,
+    free_slots: Callable[[str], int | None],
+    now: datetime | None = None,
+) -> RoleSelection:
+    """Move ``selection`` past chain entries whose harness has no free slot (issue #2757).
+
+    ``free_slots(harness)`` is the number of slots left under that harness's
+    ``fleet.max_concurrent_sessions_by_harness`` ceiling, or ``None`` when the
+    harness has no ceiling. When the selected entry's harness has room -- or
+    ``None`` -- the SAME selection object is returned, so an unconfigured or
+    unsaturated map changes nothing. Otherwise the chain is walked again from the
+    top against the selection's own ledger snapshot: a ledger-restricted entry is
+    ``skipped`` (it never became selectable), an entry on a full harness is
+    ``capped``, and the first remaining entry is selected. Returns a selection
+    with ``entry is None`` when every entry is one or the other -- the caller
+    keeps its original selection and clamps the launch to zero instead of
+    reporting a provider throttle, because nothing here is a quota restriction.
+    """
+    chosen = selection.entry
+    if chosen is None or free_slots(chosen.harness) != 0:
+        return selection
+    resolved_now = now if now is not None else datetime.now(UTC)
+    skipped: list[SkippedEntry] = []
+    capped: list[CappedEntry] = []
+    for index, entry in enumerate(selection.chain):
+        until = selection.restrictions.get(entry.key)
+        if until is not None and until > resolved_now:
+            skipped.append(SkippedEntry(index=index, entry=entry, until=until))
+            continue
+        if free_slots(entry.harness) == 0:
+            capped.append(CappedEntry(index=index, entry=entry))
+            continue
+        return replace(
+            selection, entry=entry, index=index, skipped=tuple(skipped), capped=tuple(capped)
+        )
+    return replace(selection, entry=None, index=None, skipped=tuple(skipped), capped=tuple(capped))
 
 
 def window_covered(

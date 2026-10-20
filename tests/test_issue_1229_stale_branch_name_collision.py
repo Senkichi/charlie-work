@@ -374,7 +374,7 @@ def test_classify_dead_session_stale_branch_does_not_mask_escalation(
 
 
 def test_orphaned_worker_stale_branch_does_not_bind_unrelated_pr(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     """Issue #1229: a stale branch name must not bind an unrelated PR to a
     closed issue in ``_detect_and_handle_orphaned_workers``'s ``pr_by_issue``.
@@ -416,7 +416,7 @@ def test_orphaned_worker_stale_branch_does_not_bind_unrelated_pr(
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
 
-    with host_probe(alive=False):
+    with host_probe(monkeypatch, alive=False):
         _detect_and_handle_orphaned_workers(
             sessions_dir,
             paths.state_file,

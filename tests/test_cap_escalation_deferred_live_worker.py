@@ -629,7 +629,7 @@ def test_janitor_cap_deferral_does_not_flip_route_candidate_to_reviewing(
 
 
 def test_orphan_drain_does_not_report_deferral_as_routed_to_review(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     """The orphan sweep's post-lock review drain consumer contract: an
     ``ok=True`` result carrying ``escalation_deferred_live_worker`` is not
@@ -657,7 +657,9 @@ def test_orphan_drain_does_not_report_deferral_as_routed_to_review(
             {"pr": 100, "issue": 207, "escalation_deferred_live_worker": True},
         )
 
-    _run_orphan_sweep(tmp_path, paths, config, fake_gh, review_callback=deferred_review)
+    _run_orphan_sweep(
+        tmp_path, paths, config, fake_gh, review_callback=deferred_review, monkeypatch=monkeypatch
+    )
 
     state = load_state(paths.state_file)
     issue = state["issues"]["207"]

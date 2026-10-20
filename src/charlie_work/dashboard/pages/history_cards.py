@@ -59,6 +59,9 @@ def render_card(card: Card, metric: MetricData, grid: tuple[str, ...]) -> str:
     """One card button. ``grid`` is the window's bucket starts (the sparkline's x)."""
     if card.state == "ok":
         value = fmt_value(card.value, card.unit)
+        if card.prs is not None:
+            # "<prs> PRs (<value> attempts)": the distinct-PR count leads (issue #2476).
+            value = f"{fmt_value(card.prs, card.unit)} PRs ({value} attempts)"
         delta = delta_text(card.change)
         stat = _stat_words(card)
         line = spark(on_grid(metric.headline.points, grid))

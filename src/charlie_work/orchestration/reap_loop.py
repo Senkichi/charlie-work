@@ -656,6 +656,7 @@ def _loop_body(
     # `linked_prs` complement (issue #1781) lets the same call evict stale
     # `unlinked_pr_notice` markers for PRs that resolved an issue this pass.
     self._record_unlinked_pr_skips(unlinked_pr_entries, now=loop_now, linked_prs=linked_prs)
+    self._flush_pass_tracker_writes()  # issue #2434: pass-end tracker flush (no-op off local backend)
     warnings: list[str] = []
     merge_alert_transitions: dict[int, dict[str, Any]] = {}
     for merge_entry in merges:

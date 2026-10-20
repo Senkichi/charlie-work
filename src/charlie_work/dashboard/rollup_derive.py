@@ -218,6 +218,7 @@ KNOWN_IGNORED: dict[str, str] = {
     "check_failure_rework_requested": "rework-routing record",
     "cross_pr_revert_rework_requested": "rework-routing record",
     "merge_conflict_rework_requested": "rework-routing record",
+    "mergequeue_requeue_rework_requested": "rework-routing record",
     "readiness_no_ci_rework_requested": "rework-routing record",
     "stranded_request_changes_rework_requested": "rework-routing record",
     "stranded_request_changes_skipped_issue_closed": "rework-routing record",
@@ -241,6 +242,7 @@ KNOWN_IGNORED: dict[str, str] = {
     "merge_deferred_stale_base_alarm": "stale-base deferral alarm record",
     "merge_failed_attempt_alarm": "merge-failure alarm record",
     "mergequeue_stalled": "merge-queue dwell alarm record; the heartbeat surfaces it",
+    "mergequeue_requeue_capped": "merge-queue re-add cap record; the heartbeat surfaces it",
     "mergequeue_stall_alarm_failed": "advisory stall-alarm failure record (audit-only)",
     "human_merge_required": "human-merge hand-off record (audit-only per its emit site)",
     "human_merge_label_removed": "human-merge bookkeeping",
@@ -273,9 +275,12 @@ KNOWN_IGNORED: dict[str, str] = {
     "local_lane_kill_switch_stalled": "local (no-remote) lane bookkeeping",
     "local_no_op_rework_rearmed": "local (no-remote) lane bookkeeping",
     "local_review_adopted": "local (no-remote) lane bookkeeping",
+    "local_review_skipped_issue_closed": "local (no-remote) lane bookkeeping",
+    "local_review_skipped_landed": "local (no-remote) lane bookkeeping",
     "local_suite_failed": "local (no-remote) lane bookkeeping",
     "local_suite_selection_disabled": "local (no-remote) lane bookkeeping",
     "local_suite_selection_unavailable": "local (no-remote) lane bookkeeping",
+    "local_tracker_writes_deferred": "local (no-remote) lane bookkeeping",
     "local_work_ready": "local (no-remote) lane bookkeeping",
     "worktree_unsafe_stranded_salvaged": "stranded-commit salvage record",
     "worktree_unsafe_stranded_salvage_failed": "stranded-commit salvage record",
@@ -474,12 +479,31 @@ def _session_exited(ev: dict) -> list[Row]:
 def _verdict_missed(ev: dict) -> list[Row]:
     p = ev["payload"]
     issue, pr = _refs(ev)
+    cause = _dict(p.get("cause"))
+    api_status = _int(cause.get("api_error_status"))
+    raw_cause = cause.get("cause")
+    if api_status is not None:
+        cause_label = f"api_error:{api_status}"
+    elif isinstance(raw_cause, str) and raw_cause:
+        cause_label = raw_cause
+    else:
+        cause_label = None
+    reason = p.get("reason") if isinstance(p.get("reason"), str) else None
+    group = reason_group(reason)
+    detail = p.get("detail") if isinstance(p.get("detail"), str) else None
+    if detail is None and reason is not None and reason != group:
+        # Pre-#2476 events kept the free-text message in ``reason``; keep it
+        # reachable as ``detail`` so the token-vs-message split holds for every
+        # row regardless of when it was written.
+        detail = reason
     row = {
         "issue": _int(issue),
         "pr": _int(pr),
-        "reason": p.get("reason") if isinstance(p.get("reason"), str) else None,
-        "reason_group": reason_group(p.get("reason")),
-        "exit_code": _int(_dict(p.get("cause")).get("exit_code")),
+        "reason": reason,
+        "reason_group": group,
+        "detail": detail,
+        "cause": cause_label,
+        "exit_code": _int(cause.get("exit_code")),
         "turn_count": _int(p.get("turn_count")),
         "tool_call_count": _int(p.get("tool_call_count")),
     }

@@ -29,7 +29,9 @@ from charlie_work.state import (
 )
 
 
-def test_orphaned_worker_sweep_records_worker_death_at_in_state(tmp_path: Path) -> None:
+def test_orphaned_worker_sweep_records_worker_death_at_in_state(
+    tmp_path: Path, monkeypatch
+) -> None:
     """Issue #1134: ``_detect_and_handle_orphaned_workers`` must write
     ``worker_death_at`` into the issue's state entry (and the
     ``orphaned_worker_recovered`` event payload) when it recovers a dead
@@ -106,7 +108,7 @@ def test_orphaned_worker_sweep_records_worker_death_at_in_state(tmp_path: Path) 
         encoding="utf-8",
     )
 
-    with host_probe(alive=False):
+    with host_probe(monkeypatch, alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         _detect_and_handle_orphaned_workers(
@@ -136,7 +138,7 @@ def test_orphaned_worker_sweep_records_worker_death_at_in_state(tmp_path: Path) 
 
 
 def test_orphaned_worker_request_changes_recovered_with_watchdog_disabled(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     """Issue #1108: the dead-pid orphan recovery sweep must reset a
     ``status=dispatched`` issue with a dead PID and an open PR carrying a
@@ -205,7 +207,7 @@ def test_orphaned_worker_request_changes_recovered_with_watchdog_disabled(
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
 
-    with host_probe(alive=False):
+    with host_probe(monkeypatch, alive=False):
         _detect_and_handle_orphaned_workers(
             sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
         )
@@ -226,7 +228,7 @@ def test_orphaned_worker_request_changes_recovered_with_watchdog_disabled(
     assert recovered_events[0]["payload"]["reason"] == "dead_worker_with_request_changes"
 
 
-def test_orphaned_worker_clean_exit_not_reset_to_rework(tmp_path: Path) -> None:
+def test_orphaned_worker_clean_exit_not_reset_to_rework(tmp_path: Path, monkeypatch) -> None:
     """Issue #773: a worker that exited 0 (clean, no-op) must not be reset to
     rework_requested or burn a redispatch attempt, even though its dead PID and
     unchanged head otherwise look identical to a crash under
@@ -297,7 +299,7 @@ def test_orphaned_worker_clean_exit_not_reset_to_rework(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    with host_probe(alive=False):
+    with host_probe(monkeypatch, alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         _detect_and_handle_orphaned_workers(
@@ -325,7 +327,9 @@ def test_orphaned_worker_clean_exit_not_reset_to_rework(tmp_path: Path) -> None:
     assert payload["duration_seconds"] == 300.0
 
 
-def test_orphaned_worker_with_flag_and_open_pr_request_changes_recovered(tmp_path: Path) -> None:
+def test_orphaned_worker_with_flag_and_open_pr_request_changes_recovered(
+    tmp_path: Path, monkeypatch
+) -> None:
     """Issue #259 review: orphan suppression must not block open-PR recovery paths."""
 
     config = OrchestratorConfig(
@@ -374,7 +378,7 @@ def test_orphaned_worker_with_flag_and_open_pr_request_changes_recovered(tmp_pat
         }
     )
 
-    with host_probe(alive=False):
+    with host_probe(monkeypatch, alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
@@ -401,7 +405,9 @@ def test_orphaned_worker_with_flag_and_open_pr_request_changes_recovered(tmp_pat
     assert recovered_events[0]["payload"]["reason"] == "dead_worker_with_request_changes"
 
 
-def test_orphaned_worker_crash_with_terminal_record_still_recovered(tmp_path: Path) -> None:
+def test_orphaned_worker_crash_with_terminal_record_still_recovered(
+    tmp_path: Path, monkeypatch
+) -> None:
     """Issue #773: a non-zero exit code recorded in the terminal-status file
     must still take the pre-#773 recovery path (reset to rework_requested) --
     the fix only special-cases a confirmed clean (exit code 0) exit, never a
@@ -469,7 +475,7 @@ def test_orphaned_worker_crash_with_terminal_record_still_recovered(tmp_path: Pa
         encoding="utf-8",
     )
 
-    with host_probe(alive=False):
+    with host_probe(monkeypatch, alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         _detect_and_handle_orphaned_workers(
@@ -491,7 +497,7 @@ def test_orphaned_worker_crash_with_terminal_record_still_recovered(tmp_path: Pa
     assert payload["duration_seconds"] == 5.0
 
 
-def test_orphaned_worker_no_pr_orphans_skips_bulk_issue_list(tmp_path: Path) -> None:
+def test_orphaned_worker_no_pr_orphans_skips_bulk_issue_list(tmp_path: Path, monkeypatch) -> None:
     """Regression test for issue #996.
 
     The #417 ground-truth label-reclaim sweep only calls the bounded-cost
@@ -566,7 +572,7 @@ def test_orphaned_worker_no_pr_orphans_skips_bulk_issue_list(tmp_path: Path) -> 
     sessions_dir = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions_dir.mkdir(parents=True, exist_ok=True)
 
-    with host_probe(alive=False):
+    with host_probe(monkeypatch, alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         _detect_and_handle_orphaned_workers(
@@ -582,6 +588,7 @@ def test_orphaned_worker_no_pr_orphans_skips_bulk_issue_list(tmp_path: Path) -> 
 
 def _dead_worker_with_pr_sweep(
     tmp_path: Path,
+    monkeypatch,
     *,
     decision: str | None,
     pr_state_status: str | None,
@@ -664,7 +671,7 @@ def _dead_worker_with_pr_sweep(
         encoding="utf-8",
     )
 
-    with host_probe(alive=False):
+    with host_probe(monkeypatch, alive=False):
         from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
         _detect_and_handle_orphaned_workers(
@@ -679,7 +686,7 @@ def _dead_worker_with_pr_sweep(
     [("rate_limited", False), ("stalled", True), (None, True)],
 )
 def test_dead_worker_request_changes_lane_death_credit_gated_by_failure_kind(
-    tmp_path: Path, failure_kind: str | None, expect_credit: bool
+    tmp_path: Path, failure_kind: str | None, expect_credit: bool, monkeypatch
 ) -> None:
     """Issue #1917: the ``_credit_worker_death`` gate in the
     request_changes restore branch of ``handle_dead_worker_with_pr`` skips
@@ -692,6 +699,7 @@ def test_dead_worker_request_changes_lane_death_credit_gated_by_failure_kind(
         pr_state_status=None,
         issue_labels=[],
         failure_kind=failure_kind,
+        monkeypatch=monkeypatch,
     )
 
     # The recovery itself still runs either way.
@@ -716,7 +724,7 @@ def test_dead_worker_request_changes_lane_death_credit_gated_by_failure_kind(
     [("rate_limited", False), ("stalled", True), (None, True)],
 )
 def test_dead_worker_approved_rework_lane_death_credit_gated_by_failure_kind(
-    tmp_path: Path, failure_kind: str | None, expect_credit: bool
+    tmp_path: Path, failure_kind: str | None, expect_credit: bool, monkeypatch
 ) -> None:
     """Issue #1917: same ``_credit_worker_death`` gate in the
     approved+``rework_requested`` restore branch."""
@@ -726,6 +734,7 @@ def test_dead_worker_approved_rework_lane_death_credit_gated_by_failure_kind(
         pr_state_status="rework_requested",
         issue_labels=[],
         failure_kind=failure_kind,
+        monkeypatch=monkeypatch,
     )
 
     entry = state["issues"]["207"]
@@ -749,7 +758,7 @@ def test_dead_worker_approved_rework_lane_death_credit_gated_by_failure_kind(
     [("rate_limited", False), ("stalled", True), (None, True)],
 )
 def test_dead_worker_unreviewed_pr_lane_death_credit_gated_by_failure_kind(
-    tmp_path: Path, failure_kind: str | None, expect_credit: bool
+    tmp_path: Path, failure_kind: str | None, expect_credit: bool, monkeypatch
 ) -> None:
     """Issue #1917: same ``_credit_worker_death`` gate in the
     unreviewed-open-PR advance branch (the #1128 lane)."""
@@ -762,6 +771,7 @@ def test_dead_worker_unreviewed_pr_lane_death_credit_gated_by_failure_kind(
         pr_state_status=None,
         issue_labels=[{"name": config.labels.in_progress}],
         failure_kind=failure_kind,
+        monkeypatch=monkeypatch,
     )
 
     entry = state["issues"]["207"]

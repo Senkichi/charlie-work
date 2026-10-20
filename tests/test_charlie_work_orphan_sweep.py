@@ -37,7 +37,7 @@ from charlie_work.state import (
 
 
 def test_orphan_sweep_redispatch_cap_escalates_after_no_progress_loop(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     """Issue #1243: 3+ no-progress orphan-sweep redispatches must escalate
     instead of a 4th dispatch. The branch head is unchanged across attempts
@@ -93,8 +93,8 @@ def test_orphan_sweep_redispatch_cap_escalates_after_no_progress_loop(
 
     from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
-    def _run_sweep() -> None:
-        with host_probe(alive=False):
+    def _run_sweep(monkeypatch) -> None:
+        with host_probe(monkeypatch, alive=False):
             _detect_and_handle_orphaned_workers(
                 sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
             )
@@ -126,7 +126,7 @@ def test_orphan_sweep_redispatch_cap_escalates_after_no_progress_loop(
 
     # Pass 1: first observation. orphan_redispatch_at = [now], count=1 <= 3,
     # proceed with reclaim.
-    _run_sweep()
+    _run_sweep(monkeypatch=monkeypatch)
     st = load_state(paths.state_file)
     assert st["issues"]["1243"].get("status") == "dispatched"
     assert st["issues"]["1243"].get("orphan_redispatch_head_sha") == "none:none"
@@ -138,7 +138,7 @@ def test_orphan_sweep_redispatch_cap_escalates_after_no_progress_loop(
     _simulate_redispatch(2)
 
     # Pass 2: head unchanged. count=2 <= 3, proceed.
-    _run_sweep()
+    _run_sweep(monkeypatch=monkeypatch)
     st = load_state(paths.state_file)
     assert st["issues"]["1243"].get("status") == "dispatched"
     assert len(st["issues"]["1243"].get("orphan_redispatch_at", [])) == 2
@@ -148,7 +148,7 @@ def test_orphan_sweep_redispatch_cap_escalates_after_no_progress_loop(
     _simulate_redispatch(3)
 
     # Pass 3: head unchanged. count=3 <= 3, proceed.
-    _run_sweep()
+    _run_sweep(monkeypatch=monkeypatch)
     st = load_state(paths.state_file)
     assert st["issues"]["1243"].get("status") == "dispatched"
     assert len(st["issues"]["1243"].get("orphan_redispatch_at", [])) == 3
@@ -158,7 +158,7 @@ def test_orphan_sweep_redispatch_cap_escalates_after_no_progress_loop(
     _simulate_redispatch(4)
 
     # Pass 4: head unchanged. count=4 > 3, ESCALATE!
-    _run_sweep()
+    _run_sweep(monkeypatch=monkeypatch)
     st = load_state(paths.state_file)
     entry = st["issues"]["1243"]
     assert entry.get("status") == "escalated"
@@ -185,7 +185,7 @@ def test_orphan_sweep_redispatch_cap_escalates_after_no_progress_loop(
     assert len(relabel_events) == 3
 
 
-def test_orphan_sweep_redispatch_cap_resets_on_moving_head(tmp_path: Path) -> None:
+def test_orphan_sweep_redispatch_cap_resets_on_moving_head(tmp_path: Path, monkeypatch) -> None:
     """Issue #1243: a moving branch head (remote push or local stranded
     commits) resets the redispatch counter, so the cap does not fire even
     after max_auto_redispatch+1 attempts. A moving head with a dead worker
@@ -245,7 +245,7 @@ def test_orphan_sweep_redispatch_cap_resets_on_moving_head(tmp_path: Path) -> No
     # so the counter resets and the cap does not fire.
     new_sha = "abc123def456"
     with (
-        host_probe(alive=False),
+        host_probe(monkeypatch, alive=False),
         patch("charlie_work.workflow.remote_branch_head_sha", return_value=new_sha),
         patch("charlie_work.workflow.worktree_head_sha", return_value=None),
     ):
@@ -275,7 +275,7 @@ def test_orphan_sweep_redispatch_cap_resets_on_moving_head(tmp_path: Path) -> No
 
 
 def test_orphan_sweep_redispatch_cap_resets_on_stranded_local_commits(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     """Issue #1243: stranded LOCAL commits (worktree head moved, remote head
     unchanged) reset the redispatch counter. Unlike the moving-remote-head
@@ -368,7 +368,7 @@ def test_orphan_sweep_redispatch_cap_resets_on_stranded_local_commits(
     # fingerprint's remote half; worktree_head_sha is deliberately NOT
     # patched -- the real implementation must read the real repo above.
     with (
-        host_probe(alive=False),
+        host_probe(monkeypatch, alive=False),
         patch("charlie_work.workflow.remote_branch_head_sha", return_value=remote_sha),
     ):
         _detect_and_handle_orphaned_workers(
@@ -394,7 +394,9 @@ def test_orphan_sweep_redispatch_cap_resets_on_stranded_local_commits(
     assert len(escalated_events) == 0
 
 
-def test_orphan_sweep_redispatch_cap_dedupes_repeated_observation(tmp_path: Path) -> None:
+def test_orphan_sweep_redispatch_cap_dedupes_repeated_observation(
+    tmp_path: Path, monkeypatch
+) -> None:
     """Issue #1243 round-3 fix: re-observing the SAME dead dispatch across
     multiple orphan-sweep passes must not grow the redispatch counter. The
     #417 reclaim deliberately leaves ``status``/``worker_pid`` stale on the
@@ -443,8 +445,8 @@ def test_orphan_sweep_redispatch_cap_dedupes_repeated_observation(tmp_path: Path
 
     from charlie_work.workflow import _detect_and_handle_orphaned_workers
 
-    def _run_sweep() -> None:
-        with host_probe(alive=False):
+    def _run_sweep(monkeypatch) -> None:
+        with host_probe(monkeypatch, alive=False):
             _detect_and_handle_orphaned_workers(
                 sessions_dir, paths.state_file, config, fake_gh, write_gate=_wg(paths.state_file)
             )
@@ -453,7 +455,7 @@ def test_orphan_sweep_redispatch_cap_dedupes_repeated_observation(tmp_path: Path
     # changing dispatched_at/worker_pid, simulating the #417 reclaim leaving
     # the dead entry's identity untouched pass after pass.
     for pass_number in range(1, 6):
-        _run_sweep()
+        _run_sweep(monkeypatch=monkeypatch)
         st = load_state(paths.state_file)
         entry = st["issues"]["1243"]
         assert entry.get("status") == "dispatched", f"must not escalate on pass {pass_number}"

@@ -7,6 +7,7 @@ import json
 import logging
 import sqlite3
 from datetime import timedelta
+from pathlib import Path
 
 import pytest
 from _dashboard_rollup_fixtures import (  # noqa: F401  (fleet is a pytest fixture)
@@ -35,7 +36,7 @@ def test_facts_exact_values(fleet) -> None:
     assert result.errors == ()
     by = {s.source: s for s in result.sources}
     # handled-kind events only: unhandled supervisor_started and the 2 noise rows never count
-    assert (by[ALPHA].ingested, by[BETA].ingested, by["fleet"].ingested) == (18, 2, 4)
+    assert (by[ALPHA].ingested, by[BETA].ingested, by["fleet"].ingested) == (19, 2, 4)
     db = fleet.db()
 
     assert _all(
@@ -139,11 +140,41 @@ def test_facts_exact_values(fleet) -> None:
     ]
     assert _all(
         db,
-        "SELECT pr, reason, reason_group, exit_code, turn_count, tool_call_count FROM verdict_missed ORDER BY ts",
+        "SELECT pr, reason, reason_group, detail, cause, exit_code, turn_count, tool_call_count"
+        " FROM verdict_missed ORDER BY ts",
     ) == [
-        (2087, "launch_failed", "launch_failed", 0, 0, 0),
-        (2088, "PR #2088 is MERGED on GitHub", "pr #", None, None, None),
-        (2089, "PR #2089 is MERGED on GitHub", "pr #", None, None, None),
+        (2087, "launch_failed", "launch_failed", None, None, 0, 0, 0),
+        # pre-#2476 rows kept free text in reason: it survives as detail
+        (
+            2088,
+            "PR #2088 is MERGED on GitHub",
+            "pr #",
+            "PR #2088 is MERGED on GitHub",
+            None,
+            None,
+            None,
+            None,
+        ),
+        (
+            2089,
+            "PR #2089 is MERGED on GitHub",
+            "pr #",
+            "PR #2089 is MERGED on GitHub",
+            None,
+            None,
+            None,
+            None,
+        ),
+        (
+            2090,
+            "died_mid_session",
+            "died_mid_session",
+            "reviewer exited before writing a verdict (API error 429)",
+            "api_error:429",
+            1,
+            None,
+            None,
+        ),
     ]
     assert _all(
         db,
@@ -183,7 +214,7 @@ def test_facts_exact_values(fleet) -> None:
         "SELECT kind, first_ts, last_ts, n FROM coverage WHERE source = ? AND kind IN ('*', 'unauthorized_merge_queue_sync_covered', 'dispatch')",
         ALPHA,
     ) == [
-        ("*", "2026-10-01T08:00:00Z", "2026-10-01T10:06:00Z", 23),
+        ("*", "2026-10-01T08:00:00Z", "2026-10-01T10:06:00Z", 24),
         ("dispatch", "2026-10-01T08:00:00Z", "2026-10-01T08:00:00Z", 1),
         (
             "unauthorized_merge_queue_sync_covered",
@@ -218,7 +249,7 @@ def test_second_run_is_idempotent(fleet) -> None:
     result = rollup.run_rollup(fleet.sources(), NOW)
     assert result.errors == ()
     assert result.ingested == 0
-    assert {s.source: s.rederived for s in result.sources} == {ALPHA: 18, BETA: 2, "fleet": 4}
+    assert {s.source: s.rederived for s in result.sources} == {ALPHA: 19, BETA: 2, "fleet": 4}
     assert _facts(fleet.db()) == before  # re-derived window leaves no duplicates
 
 
@@ -245,11 +276,20 @@ def test_rebuild_from_scratch_reproduces_identical_facts(fleet) -> None:
     fleet.release()
     fleet.sources().db_path.unlink()
     result = rollup.run_rollup(fleet.sources(), NOW)
-    assert result.ingested == 24
+    assert result.ingested == 25
     assert _facts(fleet.db()) == before
 
 
-def test_rederive_window_drops_deduped_rows_but_keeps_old_ones(fleet) -> None:
+@pytest.fixture
+def deduped_fleet(fleet):
+    """Arrange for the rederive-window test, outside the measured call phase.
+
+    A baseline rollup, two source rows deleted (what ``_dedupe_events`` would
+    have removed), and one pass whose window starts after both -- so the test
+    body pays for only the pass under test. Ledger-regress #2528: three rollup
+    passes in the call phase made the test the file's most sensitive to host
+    I/O contention (median 0.15s -> 0.80s under a host-wide ~5x spike).
+    """
     rollup.run_rollup(fleet.sources(), NOW)
     fleet.close()
     conn = sqlite3.connect(fleet.alpha / "events.db")
@@ -260,11 +300,17 @@ def test_rederive_window_drops_deduped_rows_but_keeps_old_ones(fleet) -> None:
     conn.close()
     later = NOW + timedelta(hours=3)  # window now starts 09:00Z; both deleted rows are older
     rollup.run_rollup(fleet.sources(), later)
-    assert _all(fleet.db(), "SELECT COUNT(*) FROM pass_samples WHERE source = ?", ALPHA) == [
-        (1,)
-    ]  # stale, kept
-    rollup.run_rollup(fleet.sources(), NOW)  # window from 06:00Z reaches 08:00Z rows
-    db = fleet.db()
+    return fleet
+
+
+def test_rederive_window_drops_deduped_rows_but_keeps_old_ones(deduped_fleet) -> None:
+    # the fixture's 09:00Z-window pass could not see the deleted 08:0x rows,
+    # so it left their stale facts alone
+    assert _all(
+        deduped_fleet.db(), "SELECT COUNT(*) FROM pass_samples WHERE source = ?", ALPHA
+    ) == [(1,)]  # stale, kept
+    rollup.run_rollup(deduped_fleet.sources(), NOW)  # window from 06:00Z reaches 08:00Z rows
+    db = deduped_fleet.db()
     assert _all(db, "SELECT COUNT(*) FROM pass_samples WHERE source = ?", ALPHA) == [(0,)]
     assert _all(db, "SELECT COUNT(*) FROM escalations WHERE event_kind = 'unescalate'") == [(0,)]
 
@@ -284,7 +330,7 @@ def test_schema_version_mismatch_drops_and_rebuilds(fleet) -> None:
     db.close()
     result = rollup.run_rollup(fleet.sources(), NOW)
     assert result.db_rebuilt is True
-    assert result.ingested == 24
+    assert result.ingested == 25
     assert _facts(fleet.db()) == before  # ghost row gone, facts reproduced
 
 
@@ -296,7 +342,7 @@ def test_missing_source_is_an_error_value_not_a_failure(fleet) -> None:
     result = rollup.run_rollup(fleet.sources(), NOW)
     by = {s.source: s for s in result.sources}
     assert by[BETA].error is not None and by[BETA].error.startswith("missing:")
-    assert (by[ALPHA].ingested, by["fleet"].ingested) == (18, 4)
+    assert (by[ALPHA].ingested, by["fleet"].ingested) == (19, 4)
     assert len(result.errors) == 1
 
 
@@ -409,31 +455,54 @@ def test_unhandled_kind_is_counted_unclassified_per_source(fleet) -> None:
     assert json.loads(stored[0][0]) == {ALPHA: {"brand_new_unclassified_kind": 2}}
 
 
-def test_unclassified_warning_fires_only_when_the_set_changes(fleet, caplog) -> None:
+def test_unclassified_warning_fires_only_when_the_set_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog
+) -> None:
     """#2269: each rollup pass warns when the unclassified-kind set changes -- a new
-    kind appearing, one disappearing -- and stays quiet while it is stable."""
+    kind appearing, one disappearing -- and stays quiet while it is stable.
+
+    #2529: one events.db, two events, five single-source passes. The ``fleet``
+    fixture's ~45 WAL inserts, two ``touch_repo`` writes and three-source rollup
+    paid host-bound I/O the set-change warning never reads (0.19 s -> 1.13 s
+    median); the transient-error carry-forward test below still exercises the
+    multi-source shape.
+    """
+    state = tmp_path / "repo" / ".var" / "charlie-work" / "state.json"
+    events_db = state.parent / "events.db"
+
+    def emit(ts: str, kind: str) -> None:
+        monkeypatch.setattr(instrumentation, "_now_iso", lambda: ts)
+        instrumentation.log_event(state, kind, {})
+
+    emit("2026-10-01T10:00:00Z", "supervisor_started")  # known-ignored: a clean pass
+    (tmp_path / "fleet").mkdir()
+    sources = rollup.RollupSources(
+        db_path=tmp_path / "fleet" / "dashboard.db",
+        fleet_events_db=events_db,
+        repos=(),
+    )
     with caplog.at_level(logging.WARNING, "charlie_work.dashboard"):
-        rollup.run_rollup(fleet.sources(), NOW)  # nothing unclassified yet
-        fleet.emit(fleet.alpha, "2026-10-01T10:30:00Z", "brand_new_unclassified_kind", {})
-        rollup.run_rollup(fleet.sources(), NOW)
+        assert rollup.run_rollup(sources, NOW).errors == ()  # nothing unclassified yet
+        emit("2026-10-01T10:30:00Z", "brand_new_unclassified_kind")
+        assert rollup.run_rollup(sources, NOW).errors == ()
     assert "1 event kind(s) not interpreted: brand_new_unclassified_kind" in caplog.text
     caplog.clear()
     with caplog.at_level(logging.WARNING, "charlie_work.dashboard"):
-        rollup.run_rollup(fleet.sources(), NOW)  # same set: quiet
+        rollup.run_rollup(sources, NOW)  # same set: quiet
     assert "not interpreted" not in caplog.text
     # a previously unclassified kind disappearing is a set change too: warn once
-    fleet.close()
-    conn = sqlite3.connect(fleet.alpha / "events.db")
+    instrumentation.close_db(state)
+    conn = sqlite3.connect(events_db)
     conn.execute("DELETE FROM events WHERE kind = 'brand_new_unclassified_kind'")
     conn.commit()
     conn.close()
     caplog.clear()
     with caplog.at_level(logging.WARNING, "charlie_work.dashboard"):
-        rollup.run_rollup(fleet.sources(), NOW)
+        assert rollup.run_rollup(sources, NOW).errors == ()
     assert "0 event kind(s) not interpreted: " in caplog.text
     caplog.clear()
     with caplog.at_level(logging.WARNING, "charlie_work.dashboard"):
-        rollup.run_rollup(fleet.sources(), NOW)  # still empty: quiet again
+        rollup.run_rollup(sources, NOW)  # still empty: quiet again
     assert "not interpreted" not in caplog.text
 
 

@@ -42,10 +42,10 @@ def _review_refused(pr_number: int) -> CommandResult:
     return CommandResult(False, "transient refusal", {"pr_number": pr_number})
 
 
-def test_pr_request_changes_unchanged_head_resets_to_rework(tmp_path: Path) -> None:
+def test_pr_request_changes_unchanged_head_resets_to_rework(tmp_path: Path, monkeypatch) -> None:
     config, paths, gh, _ = _dead_worker_rework_bed(tmp_path)
 
-    run_sweep(tmp_path, paths, config, gh)
+    run_sweep(tmp_path, paths, config, gh, monkeypatch=monkeypatch)
 
     entry = issue_entry(paths, 207)
     assert entry["status"] == "rework_requested"
@@ -59,7 +59,9 @@ def test_pr_request_changes_unchanged_head_resets_to_rework(tmp_path: Path) -> N
     assert events_of(paths, "orphaned_worker_routed_to_review") == []
 
 
-def test_pr_request_changes_clean_exit_is_no_op_escalation_not_reset(tmp_path: Path) -> None:
+def test_pr_request_changes_clean_exit_is_no_op_escalation_not_reset(
+    tmp_path: Path, monkeypatch
+) -> None:
     config, paths, gh, _ = _dead_worker_rework_bed(tmp_path)
     write_terminal_exit(
         tmp_path,
@@ -68,7 +70,7 @@ def test_pr_request_changes_clean_exit_is_no_op_escalation_not_reset(tmp_path: P
         ended_at=iso(minutes_ago=25),
     )
 
-    run_sweep(tmp_path, paths, config, gh)
+    run_sweep(tmp_path, paths, config, gh, monkeypatch=monkeypatch)
 
     entry = issue_entry(paths, 207)
     assert entry["status"] == "escalated"
@@ -88,7 +90,7 @@ _COMPLETED_OUTCOME = {
 
 
 def test_pr_request_changes_completed_outcome_applies_and_routes_to_review(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     config, paths, gh, _ = _dead_worker_rework_bed(tmp_path)
     _write_outcome(paths, tmp_path, _COMPLETED_OUTCOME)
@@ -105,6 +107,7 @@ def test_pr_request_changes_completed_outcome_applies_and_routes_to_review(
         gh,
         review_callback=review,
         patches=(patch.object(rework_outcome, "remote_branch_head_sha", lambda *_a: "abc123"),),
+        monkeypatch=monkeypatch,
     )
 
     entry = issue_entry(paths, 207)
@@ -119,7 +122,7 @@ def test_pr_request_changes_completed_outcome_applies_and_routes_to_review(
 
 
 def test_pr_request_changes_completed_outcome_review_refused_returns_to_rework(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     config, paths, gh, _ = _dead_worker_rework_bed(tmp_path)
     _write_outcome(paths, tmp_path, _COMPLETED_OUTCOME)
@@ -131,6 +134,7 @@ def test_pr_request_changes_completed_outcome_review_refused_returns_to_rework(
         gh,
         review_callback=_review_refused,
         patches=(patch.object(rework_outcome, "remote_branch_head_sha", lambda *_a: "abc123"),),
+        monkeypatch=monkeypatch,
     )
 
     entry = issue_entry(paths, 207)
@@ -142,7 +146,7 @@ def test_pr_request_changes_completed_outcome_review_refused_returns_to_rework(
     assert recovered["payload"]["new_status"] == "rework_requested"
 
 
-def test_pr_request_changes_blocked_outcome_escalates(tmp_path: Path) -> None:
+def test_pr_request_changes_blocked_outcome_escalates(tmp_path: Path, monkeypatch) -> None:
     config, paths, gh, _ = _dead_worker_rework_bed(tmp_path)
     _write_outcome(
         paths,
@@ -150,7 +154,7 @@ def test_pr_request_changes_blocked_outcome_escalates(tmp_path: Path) -> None:
         {"outcome": "blocked", "reason_kind": "cross_repo_scope", "detail": "needs jc change"},
     )
 
-    run_sweep(tmp_path, paths, config, gh)
+    run_sweep(tmp_path, paths, config, gh, monkeypatch=monkeypatch)
 
     entry = issue_entry(paths, 207)
     assert entry["status"] == "escalated"
@@ -168,11 +172,11 @@ def _advance_head(gh: Any, sha: str = "def456") -> None:
     gh.prs[0]["headRefOid"] = sha
 
 
-def test_pr_head_advanced_routes_to_review(tmp_path: Path) -> None:
+def test_pr_head_advanced_routes_to_review(tmp_path: Path, monkeypatch) -> None:
     config, paths, gh, _ = _dead_worker_rework_bed(tmp_path)
     _advance_head(gh)
 
-    run_sweep(tmp_path, paths, config, gh, review_callback=_review_ok)
+    run_sweep(tmp_path, paths, config, gh, review_callback=_review_ok, monkeypatch=monkeypatch)
 
     assert issue_entry(paths, 207)["status"] == "reviewing"
     (routed,) = events_of(paths, "orphaned_worker_routed_to_review")
@@ -183,13 +187,17 @@ def test_pr_head_advanced_routes_to_review(tmp_path: Path) -> None:
 
 
 def test_pr_head_advanced_review_refused_drifts_once_and_stays_dispatched(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     config, paths, gh, _ = _dead_worker_rework_bed(tmp_path)
     _advance_head(gh)
 
-    run_sweep(tmp_path, paths, config, gh, review_callback=_review_refused)
-    run_sweep(tmp_path, paths, config, gh, review_callback=_review_refused)
+    run_sweep(
+        tmp_path, paths, config, gh, review_callback=_review_refused, monkeypatch=monkeypatch
+    )
+    run_sweep(
+        tmp_path, paths, config, gh, review_callback=_review_refused, monkeypatch=monkeypatch
+    )
 
     entry = issue_entry(paths, 207)
     assert entry["status"] == "dispatched"
@@ -201,12 +209,12 @@ def test_pr_head_advanced_review_refused_drifts_once_and_stays_dispatched(
 
 
 def test_pr_head_advanced_without_review_callback_drifts_then_no_op_escalates(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     config, paths, gh, _ = _dead_worker_rework_bed(tmp_path)
     _advance_head(gh)
 
-    run_sweep(tmp_path, paths, config, gh, review_callback=None)
+    run_sweep(tmp_path, paths, config, gh, review_callback=None, monkeypatch=monkeypatch)
 
     entry = issue_entry(paths, 207)
     assert entry["status"] == "escalated"
@@ -224,12 +232,12 @@ def test_pr_head_advanced_without_review_callback_drifts_then_no_op_escalates(
 # ---------------------------------------------------------------------------
 
 
-def test_pr_approved_rework_status_auto_resets_to_rework(tmp_path: Path) -> None:
+def test_pr_approved_rework_status_auto_resets_to_rework(tmp_path: Path, monkeypatch) -> None:
     config, paths, gh, _ = _dead_worker_rework_bed(
         tmp_path, decision="approved", pr_state_status="rework_requested"
     )
 
-    run_sweep(tmp_path, paths, config, gh)
+    run_sweep(tmp_path, paths, config, gh, monkeypatch=monkeypatch)
 
     entry = issue_entry(paths, 207)
     assert entry["status"] == "rework_requested"
@@ -240,7 +248,9 @@ def test_pr_approved_rework_status_auto_resets_to_rework(tmp_path: Path) -> None
     assert events_of(paths, "orphaned_worker_drift") == []
 
 
-def test_pr_approved_carried_forward_status_recovers_to_rework(tmp_path: Path) -> None:
+def test_pr_approved_carried_forward_status_recovers_to_rework(
+    tmp_path: Path, monkeypatch
+) -> None:
     """#2135: carry-forward resets the PR status to ``approved`` mid-rework.
 
     ``dispatched`` + ``approved`` can only be a post-approval rework, so a
@@ -257,7 +267,7 @@ def test_pr_approved_carried_forward_status_recovers_to_rework(tmp_path: Path) -
         ended_at=iso(minutes_ago=25),
     )
 
-    run_sweep(tmp_path, paths, config, gh)
+    run_sweep(tmp_path, paths, config, gh, monkeypatch=monkeypatch)
 
     assert issue_entry(paths, 207)["status"] == "rework_requested"
     (event,) = events_of(paths, "orphaned_worker_recovered")
@@ -266,7 +276,7 @@ def test_pr_approved_carried_forward_status_recovers_to_rework(tmp_path: Path) -
 
 
 def test_pr_approved_without_rework_status_drifts_unsafe_to_auto_reset(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     """#2135 (supersedes #1109): no PR ``status`` at all no longer wedges.
 
@@ -284,7 +294,7 @@ def test_pr_approved_without_rework_status_drifts_unsafe_to_auto_reset(
         ended_at=iso(minutes_ago=25),
     )
 
-    run_sweep(tmp_path, paths, config, gh)
+    run_sweep(tmp_path, paths, config, gh, monkeypatch=monkeypatch)
 
     assert issue_entry(paths, 207)["status"] == "rework_requested"
     (event,) = events_of(paths, "orphaned_worker_recovered")
@@ -292,7 +302,9 @@ def test_pr_approved_without_rework_status_drifts_unsafe_to_auto_reset(
     assert events_of(paths, "orphaned_worker_drift") == []
 
 
-def test_pr_approved_carried_forward_status_clean_exit_is_no_op(tmp_path: Path) -> None:
+def test_pr_approved_carried_forward_status_clean_exit_is_no_op(
+    tmp_path: Path, monkeypatch
+) -> None:
     """#2135: exit 0 on a carried-forward approved PR counts against the no-op cap."""
     config, paths, gh, _ = _dead_worker_rework_bed(
         tmp_path, decision="approved", pr_state_status="approved"
@@ -304,7 +316,7 @@ def test_pr_approved_carried_forward_status_clean_exit_is_no_op(tmp_path: Path) 
         ended_at=iso(minutes_ago=25),
     )
 
-    run_sweep(tmp_path, paths, config, gh)
+    run_sweep(tmp_path, paths, config, gh, monkeypatch=monkeypatch)
 
     entry = issue_entry(paths, 207)
     assert entry["status"] == "escalated"
@@ -313,7 +325,7 @@ def test_pr_approved_carried_forward_status_clean_exit_is_no_op(tmp_path: Path) 
     assert drift["payload"]["reason"] == "dead_worker_clean_exit_no_op"
 
 
-def test_pr_approved_head_advanced_routes_to_review(tmp_path: Path) -> None:
+def test_pr_approved_head_advanced_routes_to_review(tmp_path: Path, monkeypatch) -> None:
     """#2135: approved + live head != reviewed head takes the head-change route.
 
     Before #2135 this arm fell into ``dead_worker_unsafe_to_auto_reset`` drift;
@@ -322,7 +334,7 @@ def test_pr_approved_head_advanced_routes_to_review(tmp_path: Path) -> None:
     config, paths, gh, _ = _dead_worker_rework_bed(tmp_path, decision="approved")
     _advance_head(gh)
 
-    run_sweep(tmp_path, paths, config, gh, review_callback=_review_ok)
+    run_sweep(tmp_path, paths, config, gh, review_callback=_review_ok, monkeypatch=monkeypatch)
 
     assert issue_entry(paths, 207)["status"] == "reviewing"
     (routed,) = events_of(paths, "orphaned_worker_routed_to_review")
@@ -333,12 +345,14 @@ def test_pr_approved_head_advanced_routes_to_review(tmp_path: Path) -> None:
 
 
 def test_pr_approved_head_advanced_review_refused_drifts_head_change(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     config, paths, gh, _ = _dead_worker_rework_bed(tmp_path, decision="approved")
     _advance_head(gh)
 
-    run_sweep(tmp_path, paths, config, gh, review_callback=_review_refused)
+    run_sweep(
+        tmp_path, paths, config, gh, review_callback=_review_refused, monkeypatch=monkeypatch
+    )
 
     assert issue_entry(paths, 207)["status"] == "dispatched"
     (drift,) = events_of(paths, "orphaned_worker_drift")
@@ -346,7 +360,7 @@ def test_pr_approved_head_advanced_review_refused_drifts_head_change(
     assert events_of(paths, "orphaned_worker_routed_to_review") == []
 
 
-def test_pr_approved_rework_clean_exit_is_no_op_escalation(tmp_path: Path) -> None:
+def test_pr_approved_rework_clean_exit_is_no_op_escalation(tmp_path: Path, monkeypatch) -> None:
     config, paths, gh, _ = _dead_worker_rework_bed(
         tmp_path, decision="approved", pr_state_status="rework_requested"
     )
@@ -357,7 +371,7 @@ def test_pr_approved_rework_clean_exit_is_no_op_escalation(tmp_path: Path) -> No
         ended_at=iso(minutes_ago=25),
     )
 
-    run_sweep(tmp_path, paths, config, gh)
+    run_sweep(tmp_path, paths, config, gh, monkeypatch=monkeypatch)
 
     entry = issue_entry(paths, 207)
     assert entry["status"] == "escalated"
@@ -383,10 +397,10 @@ def _unreviewed_pr_bed(tmp_path: Path, **pr_fields: Any):
     return config, paths, gh
 
 
-def test_pr_unreviewed_open_pr_advances_to_pr_open(tmp_path: Path) -> None:
+def test_pr_unreviewed_open_pr_advances_to_pr_open(tmp_path: Path, monkeypatch) -> None:
     config, paths, gh = _unreviewed_pr_bed(tmp_path)
 
-    run_sweep(tmp_path, paths, config, gh)
+    run_sweep(tmp_path, paths, config, gh, monkeypatch=monkeypatch)
 
     entry = issue_entry(paths, 207)
     assert entry["status"] == PASSIVE_OPEN_STATUS
@@ -399,11 +413,13 @@ def test_pr_unreviewed_open_pr_advances_to_pr_open(tmp_path: Path) -> None:
     assert events_of(paths, "orphaned_worker_drift") == []
 
 
-def test_pr_unreviewed_open_pr_label_failure_falls_back_to_drift(tmp_path: Path) -> None:
+def test_pr_unreviewed_open_pr_label_failure_falls_back_to_drift(
+    tmp_path: Path, monkeypatch
+) -> None:
     config, paths, gh = _unreviewed_pr_bed(tmp_path)
     gh.remove_issue_label = lambda number, label: False  # type: ignore[method-assign]
 
-    run_sweep(tmp_path, paths, config, gh)
+    run_sweep(tmp_path, paths, config, gh, monkeypatch=monkeypatch)
 
     assert issue_entry(paths, 207)["status"] == "dispatched"
     assert events_of(paths, "orphaned_worker_advanced_to_pr_open") == []
@@ -415,12 +431,14 @@ def test_pr_unreviewed_open_pr_label_failure_falls_back_to_drift(tmp_path: Path)
     assert len(drift) == 1
 
 
-def test_pr_unreviewed_merge_conflict_routes_to_pre_review_rework(tmp_path: Path) -> None:
+def test_pr_unreviewed_merge_conflict_routes_to_pre_review_rework(
+    tmp_path: Path, monkeypatch
+) -> None:
     config, paths, gh = _unreviewed_pr_bed(
         tmp_path, mergeable="CONFLICTING", mergeStateStatus="DIRTY", statusCheckRollup=[]
     )
 
-    run_sweep(tmp_path, paths, config, gh)
+    run_sweep(tmp_path, paths, config, gh, monkeypatch=monkeypatch)
 
     entry = issue_entry(paths, 207)
     assert entry["status"] == "rework_requested"
@@ -437,7 +455,9 @@ def test_pr_unreviewed_merge_conflict_routes_to_pre_review_rework(tmp_path: Path
 # ---------------------------------------------------------------------------
 
 
-def test_pr_armed_drift_past_backstop_window_is_reaped_to_escalated(tmp_path: Path) -> None:
+def test_pr_armed_drift_past_backstop_window_is_reaped_to_escalated(
+    tmp_path: Path, monkeypatch
+) -> None:
     config, paths, gh, _ = _dead_worker_rework_bed(tmp_path, decision="approved")
     seed_issue(
         paths,
@@ -446,7 +466,7 @@ def test_pr_armed_drift_past_backstop_window_is_reaped_to_escalated(tmp_path: Pa
         orphan_drift_at=iso(minutes_ago=180),
     )
 
-    run_sweep(tmp_path, paths, config, gh)
+    run_sweep(tmp_path, paths, config, gh, monkeypatch=monkeypatch)
 
     entry = issue_entry(paths, 207)
     assert entry["status"] == "escalated"
@@ -459,21 +479,21 @@ def test_pr_armed_drift_past_backstop_window_is_reaped_to_escalated(tmp_path: Pa
 # ---------------------------------------------------------------------------
 
 
-def test_sweep_with_nothing_dispatched_writes_no_events(tmp_path: Path) -> None:
+def test_sweep_with_nothing_dispatched_writes_no_events(tmp_path: Path, monkeypatch) -> None:
     config, paths, gh = no_pr_bed(tmp_path, 55, status=PASSIVE_OPEN_STATUS)
 
-    run_sweep(tmp_path, paths, config, gh)
+    run_sweep(tmp_path, paths, config, gh, monkeypatch=monkeypatch)
 
     assert issue_entry(paths, 55)["status"] == PASSIVE_OPEN_STATUS
     assert load_state(paths.state_file).get("events", []) == []
     assert gh.labels_added == [] and gh.labels_removed == []
 
 
-def test_sweep_leaves_live_pid_dispatched_issue_untouched(tmp_path: Path) -> None:
+def test_sweep_leaves_live_pid_dispatched_issue_untouched(tmp_path: Path, monkeypatch) -> None:
     config, paths, gh = no_pr_bed(tmp_path, 56, dispatched_at=iso())
     before = issue_entry(paths, 56)
 
-    run_sweep(tmp_path, paths, config, gh, pid_alive=True)
+    run_sweep(tmp_path, paths, config, gh, pid_alive=True, monkeypatch=monkeypatch)
 
     assert issue_entry(paths, 56) == before
     assert gh.labels_added == [] and gh.labels_removed == []
@@ -481,12 +501,12 @@ def test_sweep_leaves_live_pid_dispatched_issue_untouched(tmp_path: Path) -> Non
 
 
 def test_sweep_dry_run_gates_state_and_events_not_the_injected_github_client(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     config, paths, gh = no_pr_bed(tmp_path, 1176, dispatched_at="2026-07-14T17:24:55Z")
     before = issue_entry(paths, 1176)
 
-    run_sweep(tmp_path, paths, config, gh, dry_run=True)
+    run_sweep(tmp_path, paths, config, gh, dry_run=True, monkeypatch=monkeypatch)
 
     assert issue_entry(paths, 1176) == before
     assert load_state(paths.state_file).get("events", []) == []

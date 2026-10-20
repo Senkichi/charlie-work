@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from _src_ast import parsed, parsed_fresh, source_text
+from _src_ast import parsed, parsed_source, source_text
 
 from charlie_work.config import OrchestratorConfig, ReviewConfig
 from charlie_work.paths import runtime_paths
@@ -43,29 +43,39 @@ HELPER_NAME = "_escalate_issue"
 
 
 # CPython hands out one shared instance of each context/operator node
-# (``Load()``, ``Add()``, ...) to every tree in the process, so a ``parent``
-# attribute set on one would leak into every other parse -- including the
-# shared trees ``_src_ast`` caches. They are never walked upward from, so skip.
+# (``Load()``, ``Add()``, ...) to every tree in the process, so one of them as
+# a dict key would map to whichever parent the walk saw last. No consumer
+# walks upward from one, so leave them unmapped.
 _SHARED_SINGLETONS = (ast.expr_context, ast.operator, ast.boolop, ast.unaryop, ast.cmpop)
 
 
-def _annotate_parents(tree: ast.AST) -> None:
-    for parent in ast.walk(tree):
-        for child in ast.iter_child_nodes(parent):
-            if not isinstance(child, _SHARED_SINGLETONS):
-                setattr(child, "parent", parent)
+def _parents(tree: ast.AST) -> dict[ast.AST, ast.AST]:
+    """Child -> parent map, built without mutating ``tree``.
+
+    The tree may be a shared ``_src_ast``-cached parse, so bolting ``parent``
+    attributes onto its nodes is not an option: the session mutation guard
+    re-digests every handed-out tree and would name the file.
+    """
+    return {
+        child: parent
+        for parent in ast.walk(tree)
+        for child in ast.iter_child_nodes(parent)
+        if not isinstance(child, _SHARED_SINGLETONS)
+    }
 
 
-def _enclosing_function(node: ast.AST) -> ast.FunctionDef | ast.AsyncFunctionDef | None:
-    current = getattr(node, "parent", None)
+def _enclosing_function(
+    node: ast.AST, parents: dict[ast.AST, ast.AST]
+) -> ast.FunctionDef | ast.AsyncFunctionDef | None:
+    current = parents.get(node)
     while current is not None:
         if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef)):
             return current
-        current = getattr(current, "parent", None)
+        current = parents.get(current)
     return None
 
 
-def _in_helper(node: ast.AST) -> bool:
+def _in_helper(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> bool:
     current: ast.AST | None = node
     while current is not None:
         if (
@@ -73,7 +83,7 @@ def _in_helper(node: ast.AST) -> bool:
             and current.name == HELPER_NAME
         ):
             return True
-        current = getattr(current, "parent", None)
+        current = parents.get(current)
     return False
 
 
@@ -172,21 +182,21 @@ def find_escalation_violations(source: str, filename: str = "<src>") -> list[str
     frame. Deriving the exemption from the call graph -- rather than listing
     exempt file/line pairs -- is what keeps this from rotting as lines move.
     """
-    tree = ast.parse(source, filename=filename)
-    _annotate_parents(tree)
+    tree = parsed_source(source, filename)
+    parents = _parents(tree)
     violations: list[str] = []
 
     for node, value in _status_writes(tree):
         line = getattr(node, "lineno", "?")
 
         if _is_direct_constant(value):
-            if not _in_helper(node):
+            if not _in_helper(node, parents):
                 violations.append(f"tier-A direct constant at line {line}")
             continue
 
-        fn = _enclosing_function(node)
+        fn = _enclosing_function(node, parents)
         indirect = _mentions_forbidden(value) or _name_bound_to_forbidden(value, fn)
-        if indirect and not (_in_helper(node) or _function_calls_helper(fn)):
+        if indirect and not (_in_helper(node, parents) or _function_calls_helper(fn)):
             violations.append(f"tier-B indirect value at line {line}")
 
     return violations
@@ -298,8 +308,8 @@ def test_escalated_status_literal_is_only_in_helper() -> None:
         violations = find_escalation_violations(source, str(path))
         all_violations.extend(f"{display}: {v}" for v in violations)
 
-        tree = parsed_fresh(path)
-        _annotate_parents(tree)
+        tree = parsed(path)
+        parents = _parents(tree)
 
         indirect_seen.extend(
             node
@@ -307,7 +317,7 @@ def test_escalated_status_literal_is_only_in_helper() -> None:
             if not _is_direct_constant(value)
             and (
                 _mentions_forbidden(value)
-                or _name_bound_to_forbidden(value, _enclosing_function(node))
+                or _name_bound_to_forbidden(value, _enclosing_function(node, parents))
             )
         )
 

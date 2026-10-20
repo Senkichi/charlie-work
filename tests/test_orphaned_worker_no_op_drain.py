@@ -158,6 +158,7 @@ def _sweep(
     config,
     gh,
     app: OrchestratorApp,
+    monkeypatch,
     review: Any = _UNSET,
     record_review: Any = _UNSET,
 ) -> None:
@@ -166,7 +167,7 @@ def _sweep(
 
     sessions = tmp_path / ".var" / "charlie-work" / "dispatches" / "sessions"
     sessions.mkdir(parents=True, exist_ok=True)
-    with host_probe(alive=False):
+    with host_probe(monkeypatch, alive=False):
         _detect_and_handle_orphaned_workers(
             sessions,
             paths.state_file,
@@ -204,14 +205,14 @@ def _assert_ci_rework_brief(paths, tmp_path: Path, app: OrchestratorApp, gh) -> 
 
 
 def test_2005_shape_merge_only_push_lint_red_reaches_rework_naming_failing_step(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     """Regression: exit 0, only a merge commit pushed (head moved, diff unchanged),
     Lint red. The janitor refuses the head-change review; the issue must still reach
     a rework whose prompt contains the failing step."""
     config, paths, gh = _bed_lint(tmp_path, lint_red=True, live_head="def456")
     app = OrchestratorApp(tmp_path, paths, config, gh)
-    _sweep(tmp_path, paths, config, gh, app)
+    _sweep(tmp_path, paths, config, gh, app, monkeypatch=monkeypatch)
 
     state = load_state(paths.state_file)
     assert state["issues"]["207"]["status"] == "rework_requested"
@@ -222,26 +223,26 @@ def test_2005_shape_merge_only_push_lint_red_reaches_rework_naming_failing_step(
     assert "rework_no_op_ci_rework_requested" in kinds
 
 
-def test_clean_exit_red_ci_records_ci_rework(tmp_path: Path) -> None:
+def test_clean_exit_red_ci_records_ci_rework(tmp_path: Path, monkeypatch) -> None:
     config, paths, gh = _bed_lint(tmp_path, lint_red=True)
     _terminal_exit_zero(tmp_path)
     app = OrchestratorApp(tmp_path, paths, config, gh)
-    _sweep(tmp_path, paths, config, gh, app)
+    _sweep(tmp_path, paths, config, gh, app, monkeypatch=monkeypatch)
 
     state = load_state(paths.state_file)
     assert state["issues"]["207"]["status"] == "rework_requested"
     _assert_ci_rework_brief(paths, tmp_path, app, gh)
 
 
-def test_repeat_no_op_on_same_head_escalates_after_ci_rework(tmp_path: Path) -> None:
+def test_repeat_no_op_on_same_head_escalates_after_ci_rework(tmp_path: Path, monkeypatch) -> None:
     config, paths, gh = _bed_lint(tmp_path, lint_red=True)
     _terminal_exit_zero(tmp_path)
     app = OrchestratorApp(tmp_path, paths, config, gh)
-    _sweep(tmp_path, paths, config, gh, app)
+    _sweep(tmp_path, paths, config, gh, app, monkeypatch=monkeypatch)
     assert load_state(paths.state_file)["issues"]["207"]["status"] == "rework_requested"
 
     _redispatch(paths)  # the CI-rework worker no-oped on the same head
-    _sweep(tmp_path, paths, config, gh, app)
+    _sweep(tmp_path, paths, config, gh, app, monkeypatch=monkeypatch)
 
     entry = load_state(paths.state_file)["issues"]["207"]
     assert entry["status"] == "escalated"
@@ -249,7 +250,9 @@ def test_repeat_no_op_on_same_head_escalates_after_ci_rework(tmp_path: Path) -> 
     assert (207, config.labels.human_needed) in gh.labels_added
 
 
-def test_ci_green_with_rebuttal_returns_to_review_once_per_head(tmp_path: Path) -> None:
+def test_ci_green_with_rebuttal_returns_to_review_once_per_head(
+    tmp_path: Path, monkeypatch
+) -> None:
     config, paths, gh = _bed_lint(tmp_path, lint_red=False)
     _terminal_exit_zero(tmp_path)
     _write_outcome(
@@ -264,13 +267,13 @@ def test_ci_green_with_rebuttal_returns_to_review_once_per_head(tmp_path: Path) 
         calls.append(pr_number)
         return CommandResult(True, "packet", {"pr": pr_number})
 
-    _sweep(tmp_path, paths, config, gh, app, review=review)
+    _sweep(tmp_path, paths, config, gh, app, review=review, monkeypatch=monkeypatch)
     entry = load_state(paths.state_file)["issues"]["207"]
     assert calls == [100]
     assert entry["status"] == "reviewing"
 
     _redispatch(paths)  # second no-op on the same head: no second rebuttal review
-    _sweep(tmp_path, paths, config, gh, app, review=review)
+    _sweep(tmp_path, paths, config, gh, app, review=review, monkeypatch=monkeypatch)
     entry = load_state(paths.state_file)["issues"]["207"]
     assert calls == [100]
     assert entry["status"] == "escalated"
@@ -278,7 +281,9 @@ def test_ci_green_with_rebuttal_returns_to_review_once_per_head(tmp_path: Path) 
     assert entry["no_op_worker_comment"] == "Head already fixes it."
 
 
-def test_ci_green_rebuttal_review_refused_escalates_with_worker_comment(tmp_path: Path) -> None:
+def test_ci_green_rebuttal_review_refused_escalates_with_worker_comment(
+    tmp_path: Path, monkeypatch
+) -> None:
     config, paths, gh = _bed_lint(tmp_path, lint_red=False)
     _terminal_exit_zero(tmp_path)
     _write_outcome(
@@ -294,6 +299,7 @@ def test_ci_green_rebuttal_review_refused_escalates_with_worker_comment(tmp_path
         gh,
         app,
         review=lambda n: CommandResult(False, "janitor refused", {"pr": n}),
+        monkeypatch=monkeypatch,
     )
     state = load_state(paths.state_file)
     entry = state["issues"]["207"]
@@ -304,7 +310,7 @@ def test_ci_green_rebuttal_review_refused_escalates_with_worker_comment(tmp_path
 
 
 def test_stale_prior_round_outcome_is_not_quoted_in_rebuttal_or_escalation(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     """#2102: an outcome written before this dispatch is an earlier round's."""
     config, paths, gh = _bed_lint(tmp_path, lint_red=False)
@@ -322,7 +328,7 @@ def test_stale_prior_round_outcome_is_not_quoted_in_rebuttal_or_escalation(
         calls.append(pr_number)
         return CommandResult(True, "packet", {"pr": pr_number})
 
-    _sweep(tmp_path, paths, config, gh, app, review=review)
+    _sweep(tmp_path, paths, config, gh, app, review=review, monkeypatch=monkeypatch)
     state = load_state(paths.state_file)
     entry = state["issues"]["207"]
     assert calls == []  # no comment -> no rebuttal review
@@ -336,7 +342,7 @@ def test_stale_prior_round_outcome_is_not_quoted_in_rebuttal_or_escalation(
 
 
 def test_fresh_terminal_record_embedding_leftover_outcome_is_not_quoted(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     """#2102: a fresh ``ended_at`` must not launder a reused worktree's leftover.
 
@@ -369,7 +375,7 @@ def test_fresh_terminal_record_embedding_leftover_outcome_is_not_quoted(
         calls.append(pr_number)
         return CommandResult(True, "packet", {"pr": pr_number})
 
-    _sweep(tmp_path, paths, config, gh, app, review=review)
+    _sweep(tmp_path, paths, config, gh, app, review=review, monkeypatch=monkeypatch)
     state = load_state(paths.state_file)
     entry = state["issues"]["207"]
     assert calls == []
@@ -378,7 +384,7 @@ def test_fresh_terminal_record_embedding_leftover_outcome_is_not_quoted(
     assert any(k.startswith("terminal:") for k in entry["stale_evidence_reported"])
 
 
-def test_fresh_outcome_after_dispatch_is_still_quoted(tmp_path: Path) -> None:
+def test_fresh_outcome_after_dispatch_is_still_quoted(tmp_path: Path, monkeypatch) -> None:
     config, paths, gh = _bed_lint(tmp_path, lint_red=False)
     _terminal_exit_zero(tmp_path)
     _write_outcome(
@@ -395,17 +401,18 @@ def test_fresh_outcome_after_dispatch_is_still_quoted(tmp_path: Path) -> None:
         gh,
         app,
         review=lambda n: CommandResult(False, "janitor refused", {"pr": n}),
+        monkeypatch=monkeypatch,
     )
     state = load_state(paths.state_file)
     escalated = [e for e in state["events"] if e["kind"] == "rework_no_op_escalated"]
     assert escalated[0]["payload"]["worker_comment"] == "Fresh rebuttal."
 
 
-def test_ci_green_without_rebuttal_escalates_human_needed(tmp_path: Path) -> None:
+def test_ci_green_without_rebuttal_escalates_human_needed(tmp_path: Path, monkeypatch) -> None:
     config, paths, gh = _bed_lint(tmp_path, lint_red=False)
     _terminal_exit_zero(tmp_path)
     app = OrchestratorApp(tmp_path, paths, config, gh)
-    _sweep(tmp_path, paths, config, gh, app)
+    _sweep(tmp_path, paths, config, gh, app, monkeypatch=monkeypatch)
 
     entry = load_state(paths.state_file)["issues"]["207"]
     assert entry["status"] == "escalated"
@@ -413,12 +420,12 @@ def test_ci_green_without_rebuttal_escalates_human_needed(tmp_path: Path) -> Non
     assert (207, config.labels.human_needed) in gh.labels_added
 
 
-def test_unknown_ci_state_defers_instead_of_escalating(tmp_path: Path) -> None:
+def test_unknown_ci_state_defers_instead_of_escalating(tmp_path: Path, monkeypatch) -> None:
     config, paths, gh = _bed_lint(tmp_path, lint_red=True)
     gh.checks_unavailable = True
     _terminal_exit_zero(tmp_path)
     app = OrchestratorApp(tmp_path, paths, config, gh)
-    _sweep(tmp_path, paths, config, gh, app)
+    _sweep(tmp_path, paths, config, gh, app, monkeypatch=monkeypatch)
 
     _assert_deferred(load_state(paths.state_file)["issues"]["207"], head="abc123")
 
@@ -447,7 +454,7 @@ def _assert_deferred(entry: dict[str, Any], head: str) -> None:
     ids=["pending", "missing", "infra_blocked", "infra_failed"],
 )
 def test_clean_exit_unsettled_ci_defers_then_disposes_when_settled(
-    tmp_path: Path, checks: list[dict[str, Any]]
+    tmp_path: Path, checks: list[dict[str, Any]], monkeypatch
 ) -> None:
     """Clean-exit no-op + unsettled required CI -> defer, not escalate.
 
@@ -458,7 +465,7 @@ def test_clean_exit_unsettled_ci_defers_then_disposes_when_settled(
     config, paths, gh = _bed(tmp_path, checks=checks)
     _terminal_exit_zero(tmp_path)
     app = OrchestratorApp(tmp_path, paths, config, gh)
-    _sweep(tmp_path, paths, config, gh, app)
+    _sweep(tmp_path, paths, config, gh, app, monkeypatch=monkeypatch)
 
     state = load_state(paths.state_file)
     _assert_deferred(state["issues"]["207"], head="abc123")
@@ -467,14 +474,14 @@ def test_clean_exit_unsettled_ci_defers_then_disposes_when_settled(
     assert any(e["kind"] == "rework_no_op_deferred" for e in state["events"])
 
     # Second pass while still unsettled: deferred again, event dedup'd per head.
-    _sweep(tmp_path, paths, config, gh, app)
+    _sweep(tmp_path, paths, config, gh, app, monkeypatch=monkeypatch)
     state = load_state(paths.state_file)
     _assert_deferred(state["issues"]["207"], head="abc123")
     assert len([e for e in state["events"] if e["kind"] == "rework_no_op_deferred"]) == 1
 
     # CI settles green: the deferred finding still reaches a disposition.
     gh.checks = [{"name": _LINT, "state": "SUCCESS", "link": _LINT_LINK}]
-    _sweep(tmp_path, paths, config, gh, app)
+    _sweep(tmp_path, paths, config, gh, app, monkeypatch=monkeypatch)
     entry = load_state(paths.state_file)["issues"]["207"]
     assert entry["status"] == "escalated"
     assert entry["escalation_reason"] == "rework_no_op"
@@ -486,7 +493,7 @@ def test_clean_exit_unsettled_ci_defers_then_disposes_when_settled(
     ids=["pending", "missing", "infra_blocked", "infra_failed"],
 )
 def test_head_change_unsettled_ci_defers_instead_of_escalating(
-    tmp_path: Path, checks: list[dict[str, Any]]
+    tmp_path: Path, checks: list[dict[str, Any]], monkeypatch
 ) -> None:
     """Head-change no-op route + unsettled required CI -> defer.
 
@@ -506,6 +513,7 @@ def test_head_change_unsettled_ci_defers_instead_of_escalating(
         review=lambda n: CommandResult(
             False, "janitor gate blocked PR #100", {"is_no_op_rework": True}
         ),
+        monkeypatch=monkeypatch,
     )
 
     state = load_state(paths.state_file)
@@ -517,7 +525,7 @@ def test_head_change_unsettled_ci_defers_instead_of_escalating(
 
 
 def test_head_change_deferred_no_op_retries_to_ci_rework_when_ci_settles_red(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     """A deferred head-change no-op must be retried, not fingerprint-wedged.
 
@@ -542,14 +550,14 @@ def test_head_change_deferred_no_op_retries_to_ci_rework_when_ci_settles_red(
         review_calls.append(pr_number)
         return CommandResult(False, "janitor gate blocked PR #100", {"is_no_op_rework": True})
 
-    _sweep(tmp_path, paths, config, gh, app, review=counted_review)
+    _sweep(tmp_path, paths, config, gh, app, review=counted_review, monkeypatch=monkeypatch)
     state = load_state(paths.state_file)
     _assert_deferred(state["issues"]["207"], head="def456")
     assert review_calls == [100]
 
     # Still pending: the route is re-collected and re-deferred, review() is
     # not re-run, and the deferred event stays once-per-head.
-    _sweep(tmp_path, paths, config, gh, app, review=counted_review)
+    _sweep(tmp_path, paths, config, gh, app, review=counted_review, monkeypatch=monkeypatch)
     state = load_state(paths.state_file)
     _assert_deferred(state["issues"]["207"], head="def456")
     assert review_calls == [100]
@@ -557,7 +565,7 @@ def test_head_change_deferred_no_op_retries_to_ci_rework_when_ci_settles_red(
 
     # CI settles red: the re-collected route reaches the CI-rework lane.
     gh.checks = [{"name": _LINT, "state": "FAILURE", "link": _LINT_LINK}]
-    _sweep(tmp_path, paths, config, gh, app, review=counted_review)
+    _sweep(tmp_path, paths, config, gh, app, review=counted_review, monkeypatch=monkeypatch)
     state = load_state(paths.state_file)
     entry = state["issues"]["207"]
     assert entry["status"] == "rework_requested"
@@ -569,7 +577,7 @@ def test_head_change_deferred_no_op_retries_to_ci_rework_when_ci_settles_red(
 
 
 def test_head_change_deferred_no_op_retries_to_escalation_when_ci_settles_green(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     """Green variant: the retried head-change deferral escalates rework_no_op.
 
@@ -589,11 +597,11 @@ def test_head_change_deferred_no_op_retries_to_escalation_when_ci_settles_green(
         review_calls.append(pr_number)
         return CommandResult(False, "janitor gate blocked PR #100", {"is_no_op_rework": True})
 
-    _sweep(tmp_path, paths, config, gh, app, review=counted_review)
+    _sweep(tmp_path, paths, config, gh, app, review=counted_review, monkeypatch=monkeypatch)
     _assert_deferred(load_state(paths.state_file)["issues"]["207"], head="def456")
 
     # Still pending: re-collected and re-deferred without a second review().
-    _sweep(tmp_path, paths, config, gh, app, review=counted_review)
+    _sweep(tmp_path, paths, config, gh, app, review=counted_review, monkeypatch=monkeypatch)
     state = load_state(paths.state_file)
     _assert_deferred(state["issues"]["207"], head="def456")
     assert review_calls == [100]
@@ -601,7 +609,7 @@ def test_head_change_deferred_no_op_retries_to_escalation_when_ci_settles_green(
 
     # CI settles green with no rebuttal: the deferred finding escalates.
     gh.checks = [{"name": _LINT, "state": "SUCCESS", "link": _LINT_LINK}]
-    _sweep(tmp_path, paths, config, gh, app, review=counted_review)
+    _sweep(tmp_path, paths, config, gh, app, review=counted_review, monkeypatch=monkeypatch)
     state = load_state(paths.state_file)
     entry = state["issues"]["207"]
     assert entry["status"] == "escalated"
@@ -611,7 +619,7 @@ def test_head_change_deferred_no_op_retries_to_escalation_when_ci_settles_green(
     assert len([e for e in state["events"] if e["kind"] == "rework_no_op_deferred"]) == 1
 
 
-def test_clean_exit_ci_red_record_review_failure_escalates(tmp_path: Path) -> None:
+def test_clean_exit_ci_red_record_review_failure_escalates(tmp_path: Path, monkeypatch) -> None:
     """CI-red tier degraded: record_review returning not-ok falls through to
     the rework_no_op escalation -- the issue must not rest dispatched."""
     config, paths, gh = _bed_lint(tmp_path, lint_red=True)
@@ -624,6 +632,7 @@ def test_clean_exit_ci_red_record_review_failure_escalates(tmp_path: Path) -> No
         gh,
         app,
         record_review=lambda *a, **kw: CommandResult(False, "record refused", {}),
+        monkeypatch=monkeypatch,
     )
 
     entry = load_state(paths.state_file)["issues"]["207"]
@@ -632,20 +641,22 @@ def test_clean_exit_ci_red_record_review_failure_escalates(tmp_path: Path) -> No
     assert (207, config.labels.human_needed) in gh.labels_added
 
 
-def test_clean_exit_ci_red_without_record_review_callback_escalates(tmp_path: Path) -> None:
+def test_clean_exit_ci_red_without_record_review_callback_escalates(
+    tmp_path: Path, monkeypatch
+) -> None:
     """CI-red tier unavailable: a None record_review_callback (a caller that
     never wired it) falls through to escalation rather than stranding."""
     config, paths, gh = _bed_lint(tmp_path, lint_red=True)
     _terminal_exit_zero(tmp_path)
     app = OrchestratorApp(tmp_path, paths, config, gh)
-    _sweep(tmp_path, paths, config, gh, app, record_review=None)
+    _sweep(tmp_path, paths, config, gh, app, record_review=None, monkeypatch=monkeypatch)
 
     entry = load_state(paths.state_file)["issues"]["207"]
     assert entry["status"] == "escalated"
     assert entry["escalation_reason"] == "rework_no_op"
 
 
-def test_approved_rework_clean_exit_no_op_reaches_drain(tmp_path: Path) -> None:
+def test_approved_rework_clean_exit_no_op_reaches_drain(tmp_path: Path, monkeypatch) -> None:
     """approved + PR-status rework_requested + head unchanged + exit 0.
 
     The post-approval rework lane's clean-exit no-op collects the same route
@@ -660,7 +671,7 @@ def test_approved_rework_clean_exit_no_op_reaches_drain(tmp_path: Path) -> None:
     )
     _terminal_exit_zero(tmp_path)
     app = OrchestratorApp(tmp_path, paths, config, gh)
-    _sweep(tmp_path, paths, config, gh, app)
+    _sweep(tmp_path, paths, config, gh, app, monkeypatch=monkeypatch)
 
     state = load_state(paths.state_file)
     entry = state["issues"]["207"]
@@ -669,7 +680,7 @@ def test_approved_rework_clean_exit_no_op_reaches_drain(tmp_path: Path) -> None:
     assert "rework_no_op_ci_rework_requested" in [e["kind"] for e in state["events"]]
 
 
-def test_maintenance_lane_wires_no_op_drain_callbacks(tmp_path: Path) -> None:
+def test_maintenance_lane_wires_no_op_drain_callbacks(tmp_path: Path, monkeypatch) -> None:
     """Wiring: run_deadline_guarded_maintenance must forward
     ``record_review_callback`` and ``enrich_checks_callback`` into the orphan
     sweep -- without them the no-op drain's CI-red tier is dead code."""
@@ -689,7 +700,7 @@ def test_maintenance_lane_wires_no_op_drain_callbacks(tmp_path: Path) -> None:
             "charlie_work.workflow._detect_and_handle_orphaned_workers",
             side_effect=fake_detect,
         ),
-        host_probe(alive=True),
+        host_probe(monkeypatch, alive=True),
     ):
         run_deadline_guarded_maintenance(PassDeadline(None, CommandResult), app)
 

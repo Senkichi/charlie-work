@@ -14,6 +14,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+
+import _git_templates
 from _claude_adapter_fixtures import _install_fake_create_worktree
 from _dead_session_fixtures import _git, _make_classify_state
 from _fakes_github import FakeGitHub
@@ -21,7 +23,7 @@ from _rework_dispatch_fixtures import _wg
 from _worktree_fixtures import _init_bare_remote_and_clone
 
 from charlie_work.claude_code import ClaudeWorkerRecord, launch_claude_worker
-from charlie_work.config import OrchestratorConfig
+from charlie_work.config import DispatchConfig, OrchestratorConfig, PostMortemConfig
 from charlie_work.dead_worker_sweep.decide_dead_sessions import (
     BACKGROUND_EXIT_FAILURE_KIND,
     dead_fallback_kind,
@@ -29,6 +31,83 @@ from charlie_work.dead_worker_sweep.decide_dead_sessions import (
 )
 
 _ENV = "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _warm_ebc_git_template(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> _git_templates.EnvKey | None:
+    """HS-CW-4: charge the ``ebc`` git-template cold build to module setup.
+
+    ``test_fake_worker_exit_zero_dirty_no_commit_emits_classification_event``
+    is this module's ``_init_bare_remote_and_clone`` consumer (via
+    ``_git_templates.bare_remote_and_clone``), so when the module runs first
+    in a worker process -- as it does in the ledger's selected ``test`` runs --
+    its ``call`` phase absorbed the template's once-per-process nine-process
+    ``git`` boot instead of the ~40 ms copy; the ledger flagged the test at
+    2.3x baseline (issue #2603). Materializing one scratch remote+clone pair
+    here keeps the same transition in the ``setup`` phase column, where
+    resource acquisition belongs; when the template is already warm the
+    warmup is one additional ~40 ms copy.
+
+    ``TemplateRegistry`` keys templates by ``(shape, env_fingerprint())``, and
+    the fingerprint includes every ``GIT_*`` variable except
+    ``GIT_CEILING_DIRECTORIES``. The function-scoped autouse
+    ``_isolate_git_env`` (tests/conftest.py) sets the
+    ``GIT_CONFIG_COUNT/KEY_0/VALUE_0`` trio *after* this module fixture runs,
+    so a warm-up without the trio would build a template under a fingerprint
+    the call phase never looks up again. This fixture applies
+    ``_git_templates.GIT_CONFIG_ENV`` -- the same mapping conftest reads, so
+    the two cannot drift -- through a ``pytest.MonkeyPatch`` context before
+    building, then returns the fingerprint it warmed under so
+    ``test_ebc_git_template_warmed_by_module_setup`` can pin it against the
+    call-phase environment directly. Under ``CI_FLEET_TEST_REUSE=off`` there
+    is no registry to warm and the pin test skips itself, so the fixture
+    returns ``None`` without spending the build.
+    """
+    if not _git_templates.reuse_enabled():
+        return None
+    with pytest.MonkeyPatch.context() as mp:
+        for key, value in _git_templates.GIT_CONFIG_ENV.items():
+            mp.setenv(key, value)
+        _init_bare_remote_and_clone(tmp_path_factory.mktemp("ebc-template-warmup"))
+        return _git_templates.env_fingerprint()
+
+
+@pytest.mark.skipif(
+    not _git_templates.reuse_enabled(),
+    reason="CI_FLEET_TEST_REUSE=off forces the fresh path; there is no template to pin",
+)
+def test_ebc_git_template_warmed_by_module_setup(
+    _warm_ebc_git_template: _git_templates.EnvKey | None, tmp_path: Path
+) -> None:
+    """Pin the module warm-up to the fingerprint the call phase looks up.
+
+    The fixture returns the fingerprint it warmed under; asserting it equals
+    this test's own call-phase fingerprint fails on any drift between the two
+    environments regardless of what other modules warmed in this worker. The
+    probe below then drives the real consumer path and proves it copied the
+    warmed template: ``materialized["ebc"]`` must increment while the
+    registry's key set stays fixed -- a cold build would add an
+    ``("ebc", env)`` key.
+    """
+    warmed_env = _warm_ebc_git_template
+    call_env = _git_templates.env_fingerprint()
+    assert warmed_env == call_env, (
+        "module warm-up ran under a different env fingerprint than the call "
+        "phase; its template can never be looked up"
+    )
+    registry = _git_templates._REGISTRY
+    assert registry.lookup("ebc") is not None, (
+        "no ebc template under the call-phase fingerprint; the warm-up took the fresh path"
+    )
+    keys_before = set(registry._templates)
+    copies_before = registry.materialized["ebc"]
+    _init_bare_remote_and_clone(tmp_path)
+    assert registry.materialized["ebc"] == copies_before + 1
+    assert set(registry._templates) == keys_before, (
+        "the call phase built a new ebc template instead of copying the warmed one"
+    )
 
 
 def _probe(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, env: dict[str, str] | None) -> str:
@@ -140,7 +219,16 @@ def test_fake_worker_exit_zero_dirty_no_commit_emits_classification_event(
     )
     assert _git(worktree_path, "status", "--porcelain").stdout.strip()
 
-    config = OrchestratorConfig()
+    # Keep the reap pass off real host state (issue #2603): the default
+    # post_mortem db_path resolves to the host's sessions.db under %APPDATA%
+    # (a host-sized table scan inside the call phase), the default fleet dir
+    # resolves to %LOCALAPPDATA%\charlie-work, and an empty dispatch.base_ref
+    # pays a four-spawn origin/HEAD resolve-and-heal chain in
+    # inspect_worktree_state that the remote-tracking ref already answers.
+    config = OrchestratorConfig(
+        dispatch=DispatchConfig(base_ref="origin/main"),
+        post_mortem=PostMortemConfig(db_path=str(tmp_path / "no-such-sessions.db")),
+    )
     gh = FakeGitHub(repo_root=repo_root)
     gh.issues = [
         {
@@ -153,7 +241,12 @@ def test_fake_worker_exit_zero_dirty_no_commit_emits_classification_event(
         }
     ]
     _classify_dead_sessions_and_update_throttle_state(
-        sessions_dir, state_file, gh, config, write_gate=_wg(state_file)
+        sessions_dir,
+        state_file,
+        gh,
+        config,
+        write_gate=_wg(state_file),
+        fleet_dir_override=str(tmp_path / "no-fleet-dir"),
     )
 
     state = json.loads(state_file.read_text(encoding="utf-8"))

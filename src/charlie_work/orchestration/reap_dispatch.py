@@ -22,6 +22,7 @@ confirms no test patches any of them on ``charlie_work.workflow``).
 
 from __future__ import annotations
 
+from types import MappingProxyType
 from typing import Any
 
 import charlie_work.workflow as _wf
@@ -34,6 +35,7 @@ from charlie_work.concurrency_governor_result import ConcurrencyGovernorResult
 from charlie_work.fleet_paths import fleet_dir
 from charlie_work.fleet_registry import registered_state_dirs, try_acquire_fleet_lock
 from charlie_work.github import GitHubError, GraphQLBudgetError
+from charlie_work.harnesses import HARNESS_REGISTRY
 from charlie_work.host_load import measure_host_load
 from charlie_work.instrumentation import log_event
 from charlie_work.janitor import JanitorVerdict
@@ -245,6 +247,23 @@ def _apply_concurrency_governor(
             clamped = True
             clamped_by = "fleet_max"
 
+    # Issue #2757: per-harness live counts for ``fleet.max_concurrent_sessions_by_harness``.
+    # Measured here -- under the same fleet lock and registry walk the fleet count
+    # above uses -- but NOT enforced: which harness a launch lands on is decided by
+    # the role-chain selection in ``worker_launch_gate.issue_worker_launch_permit``,
+    # which reads these back off the result. Skipped entirely (no registry walk, empty
+    # fields, an unchanged report) when the map is unset.
+    harness_caps = self.config.fleet.max_concurrent_sessions_by_harness
+    harness_live_counts: dict[str, int] = {}
+    if harness_caps:
+        live_by_kind, _skipped = self.host.sessions.fleet_live_workers_by_adapter_kind(
+            self.fleet_dir_override
+        )
+        harness_live_counts = {
+            harness: live_by_kind.get(HARNESS_REGISTRY[harness].adapter_kind, 0)
+            for harness in harness_caps
+        }
+
     if open_pr_max > 0 or ci_headroom_ratio > 0:
         # Issue #1129: count open agent PRs from live GitHub state (the
         # same pr_list() + branch_prefix derivation _merge_train_candidates
@@ -447,6 +466,8 @@ def _apply_concurrency_governor(
             host_load_reading.pytest_tree_count if host_load_reading is not None else None
         ),
         clamped_by=clamped_by,
+        harness_caps=harness_caps,
+        harness_live_counts=MappingProxyType(harness_live_counts),
     )
 
 

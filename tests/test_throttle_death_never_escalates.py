@@ -222,7 +222,7 @@ def _write_zero_artifact_post_mortem(sessions_dir: Path, issue_number: int) -> N
     ids=["rate_limited", "quota_exhausted", "control-unclassified"],
 )
 def test_zero_artifact_guard_skips_throttle_death(
-    tmp_path: Path, kind: str | None, expect_escalated: bool
+    tmp_path: Path, kind: str | None, expect_escalated: bool, monkeypatch
 ) -> None:
     """#1983's shape: two zero-artifact attempts, the latest a rate-limit
     death. The guard must relabel for redispatch, not escalate; the
@@ -265,7 +265,7 @@ def test_zero_artifact_guard_skips_throttle_death(
     ]
     fake_gh.prs = []
 
-    with host_probe(alive=False):
+    with host_probe(monkeypatch, alive=False):
         _detect_and_handle_orphaned_workers(
             sessions_dir,
             paths.state_file,

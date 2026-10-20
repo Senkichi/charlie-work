@@ -1755,27 +1755,13 @@ def _dispatch_rework_impl(
         data.update(gov.report_fields())
 
     # Emit notification digest if there are health transitions (stalled sessions)
-    # This will be enhanced by #165 to include RUNAWAY/DEAD/escalated transitions
-    sessions_dir = self._layout.sessions_dir
-    stalled_entries = _wf._detect_stalled_sessions(sessions_dir, self.config)
-    if stalled_entries and self.config.notify.enabled:
-        health_transitions: dict[int, dict[str, Any]] = {}
-        for entry in stalled_entries:
-            health_transitions[entry["issue"]] = {
-                "adapter_kind": "unknown",  # Will be filled by #165's full supervisor
-                "health": entry.get("health", "STALLED"),
-                "last_log_line": None,
-                "pid": entry.get("pid"),
-                "terminal_tool": entry.get("terminal_tool"),
-                "terminal_reason": entry.get("terminal_reason"),
-            }
-        digest = _wf._build_attention_digest(
-            self.paths.state_file,
-            health_transitions,
-            repo=self.repo_root.name,
-        )
-        if digest:
-            _wf.emit_digest(self._layout.notify, digest)
+    # This will be enhanced by #165 to include RUNAWAY/DEAD/escalated transitions.
+    # Issue #2600: the probe is a per-worker real-activity scan (sessions.db
+    # open, per-PID log glob, worktree walk) whose only consumer here is the
+    # notify digest -- when notify is disabled (the default) the result is
+    # discarded, so _detect_stalled_sessions_for_notify skips the scan rather
+    # than pay host-store I/O for it.
+    _wf._emit_stalled_session_digest(self, _wf._detect_stalled_sessions_for_notify(self))
 
     return CommandResult(
         not failed_issue_numbers,

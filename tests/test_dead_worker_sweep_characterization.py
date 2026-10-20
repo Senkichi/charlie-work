@@ -57,7 +57,9 @@ from charlie_work.state import PASSIVE_OPEN_STATUS
 # ---------------------------------------------------------------------------
 
 
-def test_no_pr_worker_declared_blocked_escalates_to_operator_queue(tmp_path: Path) -> None:
+def test_no_pr_worker_declared_blocked_escalates_to_operator_queue(
+    tmp_path: Path, monkeypatch
+) -> None:
     branch = "agent/issue-1453-test"
     config = sweep_config(max_auto_redispatch=3)
     config, paths, gh = no_pr_bed(
@@ -74,6 +76,7 @@ def test_no_pr_worker_declared_blocked_escalates_to_operator_queue(tmp_path: Pat
             patch("charlie_work.workflow.remote_branch_head_sha", return_value=None),
             patch("charlie_work.workflow.remote_branch_ahead_count", return_value=(0, None)),
         ),
+        monkeypatch=monkeypatch,
     )
 
     entry = issue_entry(paths, 1453)
@@ -110,11 +113,11 @@ def _write_zero_artifact_post_mortem(tmp_path: Path, number: int) -> None:
     )
 
 
-def test_no_pr_zero_artifact_dispatch_loop_escalates(tmp_path: Path) -> None:
+def test_no_pr_zero_artifact_dispatch_loop_escalates(tmp_path: Path, monkeypatch) -> None:
     config, paths, gh = no_pr_bed(tmp_path, 1983, dispatched_at=iso())
     _write_zero_artifact_post_mortem(tmp_path, 1983)
 
-    run_sweep(tmp_path, paths, config, gh)
+    run_sweep(tmp_path, paths, config, gh, monkeypatch=monkeypatch)
 
     entry = issue_entry(paths, 1983)
     assert entry["status"] == "escalated"
@@ -123,13 +126,15 @@ def test_no_pr_zero_artifact_dispatch_loop_escalates(tmp_path: Path) -> None:
     assert (1983, config.labels.ready) not in gh.labels_added
 
 
-def test_no_pr_zero_artifact_throttle_death_is_relabeled_not_escalated(tmp_path: Path) -> None:
+def test_no_pr_zero_artifact_throttle_death_is_relabeled_not_escalated(
+    tmp_path: Path, monkeypatch
+) -> None:
     config, paths, gh = no_pr_bed(
         tmp_path, 1983, dispatched_at=iso(), dead_worker_failure_kind="rate_limited"
     )
     _write_zero_artifact_post_mortem(tmp_path, 1983)
 
-    run_sweep(tmp_path, paths, config, gh)
+    run_sweep(tmp_path, paths, config, gh, monkeypatch=monkeypatch)
 
     entry = issue_entry(paths, 1983)
     assert entry.get("status") != "escalated"
@@ -139,7 +144,9 @@ def test_no_pr_zero_artifact_throttle_death_is_relabeled_not_escalated(tmp_path:
     assert len(events_of(paths, "session_failed_relabeled")) == 1
 
 
-def test_no_pr_cross_repo_scoped_issue_escalates_cross_repo_hop(tmp_path: Path) -> None:
+def test_no_pr_cross_repo_scoped_issue_escalates_cross_repo_hop(
+    tmp_path: Path, monkeypatch
+) -> None:
     import json
 
     fleet_dir = tmp_path / "fleet"
@@ -161,7 +168,7 @@ def test_no_pr_cross_repo_scoped_issue_escalates_cross_repo_hop(tmp_path: Path) 
     )
     gh.name_with_owner = lambda: "Senkichi/charlie-work"  # type: ignore[method-assign]
 
-    run_sweep(tmp_path, paths, config, gh, fleet_dir=fleet_dir)
+    run_sweep(tmp_path, paths, config, gh, fleet_dir=fleet_dir, monkeypatch=monkeypatch)
 
     entry = issue_entry(paths, 709)
     assert entry["status"] == "escalated"
@@ -178,10 +185,10 @@ def test_no_pr_cross_repo_scoped_issue_escalates_cross_repo_hop(tmp_path: Path) 
 # ---------------------------------------------------------------------------
 
 
-def test_no_pr_active_label_is_reclaimed_to_ready(tmp_path: Path) -> None:
+def test_no_pr_active_label_is_reclaimed_to_ready(tmp_path: Path, monkeypatch) -> None:
     config, paths, gh = no_pr_bed(tmp_path, 1176, dispatched_at="2026-07-14T17:24:55Z")
 
-    run_sweep(tmp_path, paths, config, gh)
+    run_sweep(tmp_path, paths, config, gh, monkeypatch=monkeypatch)
 
     entry = issue_entry(paths, 1176)
     # The #282 liveness fingerprint survives; status stays dispatched.
@@ -205,13 +212,13 @@ class _FlakyLabelGitHub(NoPrGitHub):
 
 
 def test_no_pr_reclaim_label_failure_is_recorded_then_completed_on_recovery(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     config, paths, gh = no_pr_bed(tmp_path, 1176, dispatched_at="2026-07-14T17:24:55Z")
     flaky = _FlakyLabelGitHub(repo_root=tmp_path)
     flaky.issues = gh.issues
 
-    run_sweep(tmp_path, paths, config, flaky)
+    run_sweep(tmp_path, paths, config, flaky, monkeypatch=monkeypatch)
 
     entry = issue_entry(paths, 1176)
     assert entry["status"] == "dispatched"
@@ -222,7 +229,7 @@ def test_no_pr_reclaim_label_failure_is_recorded_then_completed_on_recovery(
 
     flaky.fail_remove = False
     flaky.labels_removed = []
-    run_sweep(tmp_path, paths, config, flaky)
+    run_sweep(tmp_path, paths, config, flaky, monkeypatch=monkeypatch)
 
     assert (1176, config.labels.in_progress) in flaky.labels_removed
     assert (1176, config.labels.ready) in flaky.labels_added
@@ -231,7 +238,9 @@ def test_no_pr_reclaim_label_failure_is_recorded_then_completed_on_recovery(
     assert issue_entry(paths, 1176)["status"] == "dispatched"
 
 
-def test_no_pr_terminal_label_only_is_flagged_and_reaped_after_grace(tmp_path: Path) -> None:
+def test_no_pr_terminal_label_only_is_flagged_and_reaped_after_grace(
+    tmp_path: Path, monkeypatch
+) -> None:
     config = sweep_config(dead_dispatched_reap_minutes=60)
     config, paths, gh = no_pr_bed(
         tmp_path,
@@ -241,7 +250,7 @@ def test_no_pr_terminal_label_only_is_flagged_and_reaped_after_grace(tmp_path: P
         dispatched_at="2026-08-09T07:33:24Z",
     )
 
-    run_sweep(tmp_path, paths, config, gh)
+    run_sweep(tmp_path, paths, config, gh, monkeypatch=monkeypatch)
     entry = issue_entry(paths, 1421)
     # Nothing to reclaim: drift branch stamps both markers, status unchanged.
     assert entry["status"] == "dispatched"
@@ -250,7 +259,7 @@ def test_no_pr_terminal_label_only_is_flagged_and_reaped_after_grace(tmp_path: P
     assert gh.labels_added == []
 
     seed_issue(paths, 1421, orphan_drift_at=iso(minutes_ago=120))
-    run_sweep(tmp_path, paths, config, gh)
+    run_sweep(tmp_path, paths, config, gh, monkeypatch=monkeypatch)
 
     entry = issue_entry(paths, 1421)
     assert entry["status"] == "escalated"
@@ -260,7 +269,9 @@ def test_no_pr_terminal_label_only_is_flagged_and_reaped_after_grace(tmp_path: P
     assert reaped["payload"]["reap_minutes"] == 60
 
 
-def test_no_pr_throttle_death_backstop_rearms_instead_of_escalating(tmp_path: Path) -> None:
+def test_no_pr_throttle_death_backstop_rearms_instead_of_escalating(
+    tmp_path: Path, monkeypatch
+) -> None:
     config = sweep_config(dead_dispatched_reap_minutes=60)
     config, paths, gh = no_pr_bed(
         tmp_path,
@@ -273,7 +284,7 @@ def test_no_pr_throttle_death_backstop_rearms_instead_of_escalating(tmp_path: Pa
         orphan_drift_fingerprint='{"dead": true}',
     )
 
-    run_sweep(tmp_path, paths, config, gh)
+    run_sweep(tmp_path, paths, config, gh, monkeypatch=monkeypatch)
 
     entry = issue_entry(paths, 1993)
     assert entry["status"] == "dispatched"
@@ -300,10 +311,12 @@ def _cap_bed(tmp_path: Path, **fields: Any) -> tuple[Any, Any, NoPrGitHub]:
     )
 
 
-def test_no_pr_redispatch_cap_exceeded_without_progress_escalates(tmp_path: Path) -> None:
+def test_no_pr_redispatch_cap_exceeded_without_progress_escalates(
+    tmp_path: Path, monkeypatch
+) -> None:
     config, paths, gh = _cap_bed(tmp_path)
 
-    run_sweep(tmp_path, paths, config, gh)
+    run_sweep(tmp_path, paths, config, gh, monkeypatch=monkeypatch)
 
     entry = issue_entry(paths, 1243)
     assert entry["status"] == "escalated"
@@ -318,10 +331,10 @@ def test_no_pr_redispatch_cap_exceeded_without_progress_escalates(tmp_path: Path
     assert (1243, config.labels.operator_queue) in gh.labels_added
 
 
-def test_no_pr_redispatch_cap_ignores_throttle_death(tmp_path: Path) -> None:
+def test_no_pr_redispatch_cap_ignores_throttle_death(tmp_path: Path, monkeypatch) -> None:
     config, paths, gh = _cap_bed(tmp_path, dead_worker_failure_kind="rate_limited")
 
-    run_sweep(tmp_path, paths, config, gh)
+    run_sweep(tmp_path, paths, config, gh, monkeypatch=monkeypatch)
 
     entry = issue_entry(paths, 1243)
     assert entry["status"] == "dispatched"
@@ -330,7 +343,7 @@ def test_no_pr_redispatch_cap_ignores_throttle_death(tmp_path: Path) -> None:
     assert len(events_of(paths, "session_failed_relabeled")) == 1
 
 
-def test_no_pr_redispatch_cap_resets_on_moving_head(tmp_path: Path) -> None:
+def test_no_pr_redispatch_cap_resets_on_moving_head(tmp_path: Path, monkeypatch) -> None:
     config, paths, gh = _cap_bed(tmp_path)
 
     run_sweep(
@@ -342,6 +355,7 @@ def test_no_pr_redispatch_cap_resets_on_moving_head(tmp_path: Path) -> None:
             patch("charlie_work.workflow.remote_branch_head_sha", return_value="movedhead"),
             patch("charlie_work.workflow.remote_branch_ahead_count", return_value=(0, None)),
         ),
+        monkeypatch=monkeypatch,
     )
 
     entry = issue_entry(paths, 1243)
@@ -352,7 +366,7 @@ def test_no_pr_redispatch_cap_resets_on_moving_head(tmp_path: Path) -> None:
 
 
 def test_no_pr_local_backend_parks_committed_work_for_review(
-    tmp_path: Path, shallow_wts: Path
+    tmp_path: Path, shallow_wts: Path, monkeypatch
 ) -> None:
     labels_cfg = LabelConfig()
     repo_root = tmp_path / "repo"
@@ -366,7 +380,7 @@ def test_no_pr_local_backend_parks_committed_work_for_review(
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
     _seed_dead_dispatched(paths.state_file, 1923, branch, armed_drift_minutes_ago=120)
 
-    run_sweep(tmp_path, paths, config, gh, fleet_dir=tmp_path / "fleet")
+    run_sweep(tmp_path, paths, config, gh, fleet_dir=tmp_path / "fleet", monkeypatch=monkeypatch)
 
     names = {entry["name"] for entry in gh.issue_view(1923)["labels"]}
     assert labels_cfg.review_ready in names
@@ -397,10 +411,10 @@ def _pushed_branch_bed(tmp_path: Path, *, pr_create_return: int | None):
     return config, paths, gh
 
 
-def test_no_pr_pushed_branch_opens_pr_and_advances_to_pr_open(tmp_path: Path) -> None:
+def test_no_pr_pushed_branch_opens_pr_and_advances_to_pr_open(tmp_path: Path, monkeypatch) -> None:
     config, paths, gh = _pushed_branch_bed(tmp_path, pr_create_return=9001)
 
-    run_sweep(tmp_path, paths, config, gh)
+    run_sweep(tmp_path, paths, config, gh, monkeypatch=monkeypatch)
 
     entry = issue_entry(paths, 935)
     assert entry["status"] == PASSIVE_OPEN_STATUS
@@ -415,7 +429,7 @@ def test_no_pr_pushed_branch_opens_pr_and_advances_to_pr_open(tmp_path: Path) ->
 
 
 def test_no_pr_pushed_branch_pr_create_failure_is_stranded_not_redispatched(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     config, paths, gh = _pushed_branch_bed(tmp_path, pr_create_return=None)
     # A worker-reported push whose PR create failed (terminal record carries it).
@@ -438,7 +452,7 @@ def test_no_pr_pushed_branch_pr_create_failure_is_stranded_not_redispatched(
         },
     )
 
-    run_sweep(tmp_path, paths, config, gh)
+    run_sweep(tmp_path, paths, config, gh, monkeypatch=monkeypatch)
 
     entry = issue_entry(paths, 935)
     assert entry["status"] == "dispatched"
@@ -455,7 +469,9 @@ def test_no_pr_pushed_branch_pr_create_failure_is_stranded_not_redispatched(
     assert drift == []
 
 
-def test_live_pid_stale_handoff_outcome_opens_pr_without_waiting_for_exit(tmp_path: Path) -> None:
+def test_live_pid_stale_handoff_outcome_opens_pr_without_waiting_for_exit(
+    tmp_path: Path, monkeypatch
+) -> None:
     config, paths, gh = _pushed_branch_bed(tmp_path, pr_create_return=9001)
     write_aged_outcome(
         tmp_path / "repo",
@@ -470,7 +486,7 @@ def test_live_pid_stale_handoff_outcome_opens_pr_without_waiting_for_exit(tmp_pa
         age_seconds=3600,
     )
 
-    run_sweep(tmp_path, paths, config, gh, pid_alive=True)
+    run_sweep(tmp_path, paths, config, gh, pid_alive=True, monkeypatch=monkeypatch)
 
     entry = issue_entry(paths, 935)
     assert entry["status"] == PASSIVE_OPEN_STATUS

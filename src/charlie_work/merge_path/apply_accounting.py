@@ -13,7 +13,8 @@ from typing import Any
 
 from ..pass_deadline import pass_deadline_spent
 from ..write_gate import WriteGate, require_write_gate
-from .decide import decide_accounting, mergequeue_stamp_needs_now
+from .decide import decide_accounting
+from .mergequeue import mergequeue_stamp_needs_now
 from .gather import persisted_from
 from .model import (
     MERGEQUEUE_DWELL_FIELDS,
@@ -90,6 +91,11 @@ def settle_accounting(
         else:
             for field_name in MERGEQUEUE_DWELL_FIELDS:
                 prs_entry.pop(field_name, None)
+        # Issue #2743: a counted queue revert rewrites the counter at the live
+        # head; any other pass leaves both fields untouched.
+        if accounting.mergequeue_requeues is not None:
+            prs_entry["consecutive_mergequeue_requeues"] = accounting.mergequeue_requeues
+            prs_entry["mergequeue_requeues_head_sha"] = accounting.mergequeue_requeues_head_sha
         state["prs"][str(pr_number)] = prs_entry
         for spec in accounting.events:
             state = _record(write_gate, state, spec)
@@ -114,4 +120,6 @@ def _record(write_gate: WriteGate, state: dict[str, Any], spec: EventSpec) -> di
         return write_gate.record_event(state, "merge_succeeded", payload)
     if spec.kind == "merge_failed_attempt_alarm":
         return write_gate.record_event(state, "merge_failed_attempt_alarm", payload)
+    if spec.kind == "mergequeue_requeue_capped":
+        return write_gate.record_event(state, "mergequeue_requeue_capped", payload)
     raise ValueError(f"unrecognised merge-path accounting event kind: {spec.kind!r}")
