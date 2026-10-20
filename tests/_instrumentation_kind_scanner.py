@@ -21,7 +21,12 @@ from charlie_work.instrumentation import log_event as _instrumentation_log_event
 from charlie_work.state import append_event as _state_append_event
 from charlie_work.workflow import OrchestratorApp
 from charlie_work.write_gate import WriteGate
-from _src_ast import parsed, source_files
+from _instrumentation_kind_scopes import (
+    LazyScopeAssignments,
+    LocalAssignments,
+    _collect_local_assignments,
+)
+from _src_ast import parsed, source_files, source_text
 
 
 # ---------------------------------------------------------------------------
@@ -55,35 +60,15 @@ _EMIT_FUNCS = {"log_event", "append_event", "_record_event", "record_event"}
 
 _WRAPPER_FUNCS = {"_route_to_rework"}
 
+# Every emit call the scanner can resolve spells one of these names literally
+# in the file's source text, so a file carrying none of them holds no call
+# ``_emit_func_name`` could match and is skipped before ``parsed()``: under
+# xdist the shared ``_src_ast`` cache's cold fill otherwise lands on whichever
+# whole-tree scanner runs first on the worker (issue #2751; same filter shape
+# as #2447/#2548, #2406, #2422, #2493, #2516, #2554).
+_EMIT_NAMES = _EMIT_FUNCS | _WRAPPER_FUNCS
+
 _VALID_LEVELS = {"info", "warning", "error"}
-
-
-def _is_scope_boundary(node: ast.AST) -> bool:
-    """True for nodes that start a new variable-assignment scope."""
-    return isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef))
-
-
-def _collect_local_assignments(scope: ast.AST) -> dict[str, list[ast.expr]]:
-    """Every ``name = <expr>`` assigned directly within ``scope``.
-
-    Descends through control flow (if/for/while/try/with) but stops at any
-    nested function, lambda, or class body -- those are separate scopes with
-    their own assignment map, not this one.
-    """
-    assigns: dict[str, list[ast.expr]] = {}
-
-    def walk(node: ast.AST) -> None:
-        for child in ast.iter_child_nodes(node):
-            if _is_scope_boundary(child):
-                continue
-            if isinstance(child, ast.Assign):
-                for target in child.targets:
-                    if isinstance(target, ast.Name):
-                        assigns.setdefault(target.id, []).append(child.value)
-            walk(child)
-
-    walk(scope)
-    return assigns
 
 
 def _collect_param_names(node: ast.FunctionDef | ast.AsyncFunctionDef) -> frozenset[str]:
@@ -99,7 +84,7 @@ def _collect_param_names(node: ast.FunctionDef | ast.AsyncFunctionDef) -> frozen
 
 def _resolve_literal(
     node: ast.expr,
-    local_assigns: dict[str, list[ast.expr]],
+    local_assigns: LocalAssignments,
     module_constants: dict[str, set[str]],
     local_params: frozenset[str] = frozenset(),
 ) -> set[str] | None:
@@ -232,16 +217,16 @@ class _UnresolvedKindSite:
 
 
 def _emit_func_name(node: ast.Call) -> str | None:
-    if isinstance(node.func, ast.Name) and node.func.id in _EMIT_FUNCS | _WRAPPER_FUNCS:
+    if isinstance(node.func, ast.Name) and node.func.id in _EMIT_NAMES:
         return node.func.id
-    if isinstance(node.func, ast.Attribute) and node.func.attr in _EMIT_FUNCS | _WRAPPER_FUNCS:
+    if isinstance(node.func, ast.Attribute) and node.func.attr in _EMIT_NAMES:
         return node.func.attr
     return None
 
 
 def _has_explicit_level(
     node: ast.Call,
-    local_assigns: dict[str, list[ast.expr]],
+    local_assigns: LocalAssignments,
     module_constants: dict[str, set[str]],
     local_params: frozenset[str],
 ) -> bool:
@@ -377,7 +362,7 @@ def _record_kind_site(
     kind_node: ast.expr | None,
     call_node: ast.Call,
     module_constants: dict[str, set[str]],
-    local_assigns: dict[str, list[ast.expr]],
+    local_assigns: LocalAssignments,
     local_params: frozenset[str],
     scope_name: str,
     rel_path: str,
@@ -415,7 +400,7 @@ def _record_kind_site(
 def _scan_node(
     node: ast.AST,
     module_constants: dict[str, set[str]],
-    local_assigns: dict[str, list[ast.expr]],
+    local_assigns: LocalAssignments,
     local_params: frozenset[str],
     scope_name: str,
     rel_path: str,
@@ -455,7 +440,7 @@ def _scan_node(
     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
         # Entering a new function scope: its local assignments and parameters
         # shadow the enclosing ones rather than extending them.
-        scoped_assigns = _collect_local_assignments(node)
+        scoped_assigns = LazyScopeAssignments(node)
         scoped_params = _collect_param_names(node)
         for child in ast.iter_child_nodes(node):
             _scan_node(
@@ -522,6 +507,8 @@ def _scan_event_kinds(root: Path) -> tuple[set[str], list[_UnresolvedKindSite]]:
     used: set[str] = set()
     unresolved: list[_UnresolvedKindSite] = []
     for path in source_files(root):
+        if not any(name in source_text(path) for name in _EMIT_NAMES):
+            continue
         try:
             tree = parsed(path)
         except SyntaxError:
@@ -749,6 +736,8 @@ def _scan_sweep_append_kinds(root: Path) -> tuple[set[str], list[str]]:
     found: set[str] = set()
     unresolved: list[str] = []
     for path in source_files(root):
+        if "sweep_events" not in source_text(path):
+            continue
         tree = parsed(path)
         for node in ast.walk(tree):
             if not (
