@@ -11,10 +11,11 @@ read from the opening snapshot) lives here, not in the decisions.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 
 from .decide import decide_readiness
-from .mergequeue import merge_entry, requeue_gate
+from .mergequeue import merge_entry, mergequeue_re_add_pending, requeue_gate
 from .gather import (
     config_slice,
     gather_branch,
@@ -112,16 +113,24 @@ def preview_merge_ready(
     merge_hold, merge_hold_unavailable = (
         gather_merge_hold(app, opening.pr, issue_number) if enter else (False, False)
     )
+    if enter:
+        # The preview reads the hold whenever a merge could be attempted (its
+        # legacy breadth, wider than the live path's label-gated read), so
+        # rebuild the holds with the read values exactly as the live shell
+        # (apply.py) does: the shared re-add predicate below then decides on
+        # the same facts decide_merge sees and cannot drift from it
+        # (issue #2743 review round 2).
+        holds = replace(
+            holds, merge_hold=merge_hold, merge_hold_unavailable=merge_hold_unavailable
+        )
     # The preview runs no accounting, so report the projection decide_merge
     # would see through its own ``requeue_gate`` (issue #2743): the ledger
-    # climbs only when this pass would attempt the re-add, so a held dry run
+    # climbs only when the shared ``mergequeue_re_add_pending`` predicate
+    # says this pass would attempt the re-add, so a held dry run
     # (merge-hold, should_merge=False) does not project the count toward the
     # cap, and a capped PR must not read "would hand off" (issue #2743).
-    requeue = requeue_gate(
-        readiness,
-        holds,
-        re_add_pending=bool(enter and merge_hold is False and not merge_hold_unavailable),
-    )
+    re_add_pending = mergequeue_re_add_pending(readiness, holds)
+    requeue = requeue_gate(readiness, holds, re_add_pending=re_add_pending)
     return render_preview_final(
         ports,
         PreviewFinal(

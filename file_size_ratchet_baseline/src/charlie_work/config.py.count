@@ -9,7 +9,9 @@
 # build_config_from_data). A config field cannot be extracted into a domain
 # module, so this is a deliberate reviewed mark raise to the next
 # MARK_QUANTUM multiple above the live count (4218 -> 4400).
-# Issue #2757 (merged from main): auto_merge per-harness session-ceiling
-# fields grew config.py past its mark (2800 -> 2809). A config knob cannot
-# be extracted into a domain module, so this is a deliberate mark raise to
+# Issue #2743: the auto_merge mergequeue_requeue_cap knob grew config.py
+# past its mark -- origin/main's config.py is exactly 2800 lines and this
+# PR adds the 9 lines of the field (+ its comment), so the +9 is this
+# change's growth, not merged #2757 work. A config field cannot be
+# extracted into a domain module, so this is a deliberate mark raise to
 # the next MARK_QUANTUM multiple above the live count (2800 -> 3000).
