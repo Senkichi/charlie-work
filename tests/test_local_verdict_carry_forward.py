@@ -57,6 +57,23 @@ def _gate_sync_merge(repo: Path) -> str:
     return head
 
 
+def _zero_diff_branch(repo: Path) -> str:
+    """Branch whose three-dot diff against main is empty.
+
+    The content lands on ``main`` by another path, then a sync merge
+    advances the merge base past it -- the shape a branch reaches once
+    everything it carried is already on the base (issue #2739).
+    """
+    _make_branch(repo, BRANCH, "a.py", "a = 1\n")
+    _commit_file(repo, "a.py", "a = 1\n", "feat: same content landed directly")
+    _git(repo, "checkout", BRANCH)
+    _git(repo, "merge", "--no-ff", "main", "-m", "merge: sync main")
+    head = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    _git(repo, "checkout", "main")
+    assert branch_diff(repo, "main", BRANCH) == ""
+    return head
+
+
 def _stale_packet_then_operator_approval(repo: Path):
     """Packet built at head A; branch advanced to B; operator approves B."""
     _init_repo(repo)
@@ -124,3 +141,41 @@ class TestApprovalSurvivesHeadMove:
         _advance_branch(repo, "c.py", "c = 1\n")
 
         assert not approval_survives_head_move(repo, "main", BRANCH, app._review_decision(7))
+
+    def test_empty_live_diff_survives_when_verdict_recorded_empty_patch_id(
+        self, repo: Path
+    ) -> None:
+        """A verdict pinned while the diff was already empty (recorded
+        patch-id ``""``) must survive a later sync-merge head move: an empty
+        three-dot diff is the "already landed" shape, not a failed diff."""
+        _init_repo(repo)
+        head = _zero_diff_branch(repo)
+        decision = {"reviewed_patch_id": "", "reviewed_head_sha": head}
+
+        _commit_file(repo, "other.py", "o = 1\n", "base moved")
+        _git(repo, "checkout", BRANCH)
+        _git(repo, "merge", "--no-ff", "main", "-m", "merge: sync main again")
+        _git(repo, "checkout", "main")
+
+        assert branch_diff(repo, "main", BRANCH) == ""
+        assert approval_survives_head_move(repo, "main", BRANCH, decision)
+
+    def test_empty_live_diff_does_not_match_a_real_patch_id(self, repo: Path) -> None:
+        """An emptied diff does not carry a verdict recorded over real
+        content -- the landed path (not approval carry-forward) owns that
+        shape."""
+        _init_repo(repo)
+        head = _zero_diff_branch(repo)
+        decision = {"reviewed_patch_id": "a-real-patch-id", "reviewed_head_sha": head}
+
+        assert not approval_survives_head_move(repo, "main", BRANCH, decision)
+
+    def test_diff_failure_never_counts_as_empty(self, repo: Path) -> None:
+        """``branch_diff`` returning None (unresolvable ref) is not the
+        empty string: a failed diff carries no approval, even onto an
+        empty-patch-id verdict."""
+        _init_repo(repo)
+        head = _zero_diff_branch(repo)
+        decision = {"reviewed_patch_id": "", "reviewed_head_sha": head}
+
+        assert not approval_survives_head_move(repo, "no-such-base", BRANCH, decision)
