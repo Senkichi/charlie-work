@@ -100,9 +100,7 @@ def mergequeue_re_add_pending(readiness: Readiness, holds: HoldFacts) -> bool:
     toward the cap.
     """
     read_needed = merge_hold_read_needed(readiness, holds)
-    return bool(
-        read_needed and holds.merge_hold is False and not holds.merge_hold_unavailable
-    )
+    return bool(read_needed and holds.merge_hold is False and not holds.merge_hold_unavailable)
 
 
 def mergequeue_requeue_count(

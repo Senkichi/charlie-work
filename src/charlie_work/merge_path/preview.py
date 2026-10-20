@@ -120,9 +120,7 @@ def preview_merge_ready(
     requeue = requeue_gate(
         readiness,
         holds,
-        re_add_pending=bool(
-            enter and merge_hold is False and not merge_hold_unavailable
-        ),
+        re_add_pending=bool(enter and merge_hold is False and not merge_hold_unavailable),
     )
     return render_preview_final(
         ports,

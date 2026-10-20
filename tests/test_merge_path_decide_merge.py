@@ -564,9 +564,7 @@ def test_requeue_rework_requires_a_non_escalated_merge_pass(over: dict[str, Any]
 def test_requeue_rework_requires_should_merge() -> None:
     """Review round 1 (issue #2743): a non-merge pass is never routed to
     rework, never capped, and never counts the reverted label."""
-    plan = decide_merge(
-        _reverted_readiness(), _requeue_cap_facts(should_merge=False)
-    )
+    plan = decide_merge(_reverted_readiness(), _requeue_cap_facts(should_merge=False))
     assert (plan.requeue_rework, plan.mergequeue_requeue_capped) == (False, False)
     assert plan.mergequeue_requeues == 2
     assert plan.kind == PlanKind.NONE
