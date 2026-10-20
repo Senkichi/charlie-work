@@ -402,6 +402,17 @@ _NON_CLOSING_KEYWORDS_RE = re.compile(
 # the rule needs (present for Refs, absent for the #817 regression shape).
 _NON_CLOSING_CLAUSE_BOUNDARIES = frozenset(".;!?()—–")
 
+# Issue #2100: a `#N` inside a sentence introduced by a scope-exclusion marker
+# ("Out of scope per the issue: ... a counterpart to `X` (#223) ...") is a
+# scope exclusion, not closure evidence -- the same direction as the #790/#902
+# negation suppression (marker must PRECEDE the mention, within its sentence;
+# one line only, so a bullet list's later items are judged on their own).
+_OUT_OF_SCOPE_MARKERS_RE = re.compile(
+    r"\b(?:out[-\s]of[-\s]scope|not[-\s]in[-\s]scope|deferred[-\s]to|follow[-\s]?up|left[-\s]for)\b",
+    flags=re.IGNORECASE,
+)
+_SENTENCE_END_RE = re.compile(r"[.!?]\s")
+
 
 def _is_non_closing_context(text: str, match_start: int) -> bool:
     """True if a non-closing keyword precedes the `#N` at ``match_start`` in
@@ -421,7 +432,19 @@ def _is_non_closing_context(text: str, match_start: int) -> bool:
     prefix = text[line_start:match_start]
     boundary = max(prefix.rfind(c) for c in _NON_CLOSING_CLAUSE_BOUNDARIES)
     clause = prefix[boundary + 1 :]
-    return bool(_NON_CLOSING_KEYWORDS_RE.search(clause))
+    if _NON_CLOSING_KEYWORDS_RE.search(clause):
+        return True
+    return bool(_OUT_OF_SCOPE_MARKERS_RE.search(_sentence_prefix(prefix)))
+
+
+def _sentence_prefix(prefix: str) -> str:
+    """The part of ``prefix`` (the line text before a mention) after the last
+    sentence end -- ``.``/``!``/``?`` followed by whitespace. Unlike the clause
+    scope above, parens and dashes do not cut it: an out-of-scope exclusion
+    list routinely parenthesizes its ``#N`` ("a HealthKit counterpart to
+    `X` (#223)")."""
+    ends = [m.end() for m in _SENTENCE_END_RE.finditer(prefix)]
+    return prefix[ends[-1] :] if ends else prefix
 
 
 def issue_mention_occurrences(text: str) -> list[tuple[int, bool]]:

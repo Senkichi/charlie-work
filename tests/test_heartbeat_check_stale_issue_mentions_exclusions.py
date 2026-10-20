@@ -432,3 +432,77 @@ def test_stale_mention_parked_labels_default_mirrors_heartbeat_config(
     assert hb.STALE_MENTION_PARKED_LABELS_DEFAULT == frozenset(
         HeartbeatConfig().stale_mention_parked_labels
     )
+
+
+# ---------------------------------------------------------------------------
+# Issue #2100: a `#N` inside an out-of-scope sentence is non-closing.
+# ---------------------------------------------------------------------------
+
+# Shape of swole PR #318's scope-exclusion paragraph that wrongly flagged #223.
+_SWOLE_318_PARAGRAPH = (
+    "Out of scope per the issue: a HealthKit counterpart to `HealthConnectGateway` "
+    "(#223) and the iOS settings screen, which wait on the macOS host."
+)
+
+
+def test_issue_mention_occurrences_out_of_scope_paragraph_is_non_closing(hb: ModuleType) -> None:
+    assert hb.issue_mention_occurrences(_SWOLE_318_PARAGRAPH) == [(223, True)]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "This is deferred to #700.",
+        "Left for #700 once the host exists",
+        "Fixed the parser. Out of scope here: the exporter (#700)",
+    ],
+    ids=["deferred-to", "left-for", "marker-sentence-after-period"],
+)
+def test_issue_mention_occurrences_out_of_scope_markers(hb: ModuleType, body: str) -> None:
+    assert (700, True) in hb.issue_mention_occurrences(body)
+
+
+def test_issue_mention_occurrences_not_in_scope_never_flags(hb: ModuleType) -> None:
+    """``not in scope`` is already dropped by the negation suppression (#790/#902);
+    pin that it can never surface as a closing mention."""
+    assert (700, False) not in hb.issue_mention_occurrences("Not in scope: the importer (#700).")
+
+
+def test_issue_mention_occurrences_out_of_scope_does_not_leak_across_sentences(
+    hb: ModuleType,
+) -> None:
+    """The marker scopes to its own sentence/line: a genuine fix mention in a
+    later sentence or on a later line keeps flagging."""
+    assert hb.issue_mention_occurrences("Out of scope: the exporter. Fixes #700") == [(700, False)]
+    assert hb.issue_mention_occurrences("Out of scope: the exporter\nFixes #700") == [(700, False)]
+
+
+def test_check_stale_open_issue_mentions_out_of_scope_does_not_flag_but_866_does(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    """Acceptance: swole #318's paragraph does not count #223, while a bare
+    #866 reproduction (an unqualified ``(#866)`` commit message; a literal ``refs #866`` is
+    deliberately non-closing since #2048) is still flagged."""
+    repo = _make_repo(hb, tmp_path)
+    _stale_mention_gh_dispatch(
+        monkeypatch,
+        hb,
+        open_numbers=[223, 866],
+        merged_prs=[_merged_pr(318, _SWOLE_318_PARAGRAPH)],
+    )
+    monkeypatch.setattr(
+        hb,
+        "get_merged_commit_messages",
+        lambda root, limit: (
+            True,
+            [("abc1234", "fix: surface unconsumed error events (#866)")],
+            "",
+        ),
+    )
+
+    report = hb.Report()
+    hb.check_stale_open_issue_mentions(report, repo)
+
+    assert report.anomaly
+    assert "#866" in report.lines[-1]
+    assert "#223" not in report.lines[-1]
