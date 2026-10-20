@@ -1,4 +1,4 @@
-2800
+3000
 # Issue #1934: +25 lines for SupervisorConfig.fleet_lane_concurrency and
 # SupervisorConfig.reap_sweep_interval_seconds (fields + _SUPERVISOR_INT_KEYS
 # validation entries). Dataclass fields cannot be extracted into a domain
@@ -9,3 +9,7 @@
 # build_config_from_data). A config field cannot be extracted into a domain
 # module, so this is a deliberate reviewed mark raise to the next
 # MARK_QUANTUM multiple above the live count (4218 -> 4400).
+# Issue #2757 (merged from main): auto_merge per-harness session-ceiling
+# fields grew config.py past its mark (2800 -> 2809). A config knob cannot
+# be extracted into a domain module, so this is a deliberate mark raise to
+# the next MARK_QUANTUM multiple above the live count (2800 -> 3000).
