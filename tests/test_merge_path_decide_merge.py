@@ -570,3 +570,36 @@ def test_requeue_rework_requires_should_merge() -> None:
     assert (plan.requeue_rework, plan.mergequeue_requeue_capped) == (False, False)
     assert plan.mergequeue_requeues == 2
     assert plan.kind == PlanKind.NONE
+
+
+@pytest.mark.parametrize(
+    "over",
+    [
+        pytest.param({"pr_escalated": True}, id="pr-escalated"),
+        pytest.param({"issue_escalated": True}, id="issue-escalated"),
+        pytest.param({"should_merge": False}, id="not-a-merge-pass"),
+    ],
+)
+def test_requeue_cap_gates_on_a_merge_pass_even_at_the_cap(over: dict[str, Any]) -> None:
+    """The counting gate keeps the ledger flat below the cap; the verdict gate
+    is what stops a held pass from capping when its persisted count already
+    reached the cap (review round 1, issue #2743)."""
+    plan = decide_merge(
+        _reverted_readiness(), _requeue_cap_facts(persisted=_requeue_persisted(3), **over)
+    )
+    assert plan.requeue_rework is False
+    assert plan.mergequeue_requeue_capped is False
+    assert Hold.REQUEUE_CAPPED not in plan.holds
+    assert plan.mergequeue_requeues == 3
+
+
+def test_requeue_cap_still_holds_under_a_merge_hold_at_the_cap() -> None:
+    """A merge hold blocks the re-add, but the cap verdict itself stays so the
+    pass still surfaces the stuck queue budget (unchanged behaviour)."""
+    plan = decide_merge(
+        _reverted_readiness(),
+        _requeue_cap_facts(persisted=_requeue_persisted(3), merge_hold=True),
+    )
+    assert plan.mergequeue_requeues == 3
+    assert plan.mergequeue_requeue_capped is True
+    assert Hold.REQUEUE_CAPPED in plan.holds
