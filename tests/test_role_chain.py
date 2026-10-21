@@ -177,6 +177,20 @@ def test_rescue_roles_reject_fallbacks(section: str, fallbacks: object) -> None:
         build_config_from_data({"rescue": {section: {"fallbacks": fallbacks}}})
 
 
+def test_rescue_roles_keep_fallbacks_unparsed() -> None:
+    """Leaf name kept verbatim for the collect-only gate (issue #1538).
+
+    The #2118 fix changed what this name used to pin ("rescue.* stores
+    ``fallbacks`` as written", the known gap from #2088), so the body asserts
+    the replacement truth: the unparsed-verbatim storage is gone and the raw
+    value is rejected instead. Precedent for restoring a renamed leaf with the
+    body updated to the post-change truth: 141ac0202c, 50bb9fa0d, b0ddd09de.
+    """
+    raw = [{"harness": "not-a-harness"}]
+    with pytest.raises(ConfigError, match=r"^rescue\.worker\.fallbacks: "):
+        build_config_from_data({"rescue": {"worker": {"fallbacks": raw}}})
+
+
 def test_rescue_roles_without_fallbacks_still_load() -> None:
     """The fix must not narrow the accepted rescue section: an absent ``fallbacks``
     key (the only accepted spelling) builds the roles exactly as before."""
