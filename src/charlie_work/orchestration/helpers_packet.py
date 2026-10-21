@@ -12,6 +12,8 @@ import json
 import charlie_work.workflow as _wf
 from charlie_work.attachment_contracts import hook_entry as attachment_hook_entry
 from charlie_work.attachment_contracts.model import AdvisoryRecord
+from charlie_work.command_result import CommandResult
+from charlie_work.workflow_delegation import as_staticmethod
 
 
 def _read_advisories_from_pr_comment(self, pr_number: int) -> tuple[AdvisoryRecord, ...] | None:
@@ -224,3 +226,35 @@ def _comment_pr(self, pr_number: int, summary: str) -> None:
     body_path = pr_dir / "review-comment.md"
     body_path.write_text(f"{_wf.ORCHESTRATOR_COMMENT_MARKER}\n{summary}", encoding="utf-8")
     self.gh.pr_comment(pr_number, body_path)
+
+
+@as_staticmethod
+def _diff_unavailable_no_packet_result(pr_number: int, issue_number: int | None) -> CommandResult:
+    """The #1807 ``review()`` refusal when no diff could be fetched at all.
+
+    ``pr_diff`` returns ``None`` when the remote refused or failed the fetch
+    AND the local-git fallback could not produce a diff either (e.g. GitHub's
+    300-file ``too_large`` diff cap). Before this gate a failed fetch
+    collapsed to ``""`` and the packet's diff.patch was empty; the #1251
+    empty-diff gate then read that packet as a zero-delta PR and skipped
+    review dispatch on every pass, forever (PR #2160: 461 files, >100
+    ``review_dispatch_skipped_empty_diff`` warnings, no error event, no
+    escalation). The refusal is ``ok=False`` on purpose -- matching
+    ``head_moved_during_build`` and the janitor-gate block, the other
+    no-packet retry exits in ``review()`` -- so
+    ``_route_rework_candidate_to_review`` cannot flip a
+    ``rework_requested`` issue to ``reviewing`` on a pass that built no
+    packet: the issue stays ``rework_requested`` and the next pass retries.
+    """
+    return CommandResult(
+        False,
+        (
+            f"PR #{pr_number}: diff unavailable (fetch failed, local-git "
+            "fallback exhausted); packet not built, retries next pass"
+        ),
+        {
+            "pr": pr_number,
+            "issue": issue_number,
+            "reason": "diff_unavailable",
+        },
+    )

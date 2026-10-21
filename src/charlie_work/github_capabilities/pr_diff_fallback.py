@@ -54,6 +54,7 @@ from pathlib import Path
 from typing import Any
 
 from ..git_retry import run_git_with_retry
+from ..safe_ref import require_valid_ref_name
 from ..subprocess_runner import RunResult, run_captured
 
 logger = logging.getLogger(__name__)
@@ -75,9 +76,14 @@ def base_ref_from_rest_pr(payload: Any) -> str | None:
     """Extract the PR's ``baseRefName`` from a REST ``pulls/{number}`` body.
 
     Tolerant by design: anything that is not a PR-shaped dict (a transport
-    failure value, aGraphQL body, empty stdout) returns ``None``; the caller
-    treats that as "fallback cannot determine the base branch" rather than
-    guessing ``main``.
+    failure value, a GraphQL body, empty stdout) returns ``None``, and a
+    well-formed body whose ref does not pass
+    ``safe_ref.require_valid_ref_name`` (issue #1807 rework: the value is
+    interpolated into ``git diff --merge-base origin/<ref>`` argv, so a
+    hostile or malformed name -- ``main..HEAD``, ``--flag`` -- is rejected
+    instead of reaching git) also returns ``None``; the caller treats that
+    as "fallback cannot determine the base branch" rather than guessing
+    ``main``.
     """
     if not isinstance(payload, dict):
         return None
@@ -85,9 +91,12 @@ def base_ref_from_rest_pr(payload: Any) -> str | None:
     if not isinstance(base, dict):
         return None
     ref = base.get("ref")
-    if isinstance(ref, str) and ref.strip():
-        return ref
-    return None
+    if not isinstance(ref, str) or not ref.strip():
+        return None
+    try:
+        return require_valid_ref_name(ref, context="pr_diff fallback baseRefName")
+    except ValueError:
+        return None
 
 
 def _git_error_text(result: RunResult, fallback: str) -> str:

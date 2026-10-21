@@ -571,7 +571,9 @@ class PullRequests(CapabilityCollaborator):
             RestRequest.of("GET", f"repos/{{owner}}/{{repo}}/pulls/{number}"),
             json_output=True,
         )
-        base_ref = base_ref_from_rest_pr(base_read.value)
+        # Errors come back as values: ``value`` is only meaningful when the
+        # read succeeded (GitHubRunResult's own contract, issue #1807 rework).
+        base_ref = base_ref_from_rest_pr(base_read.value) if base_read.ok else None
         if base_ref is not None:
             local = local_pr_diff(self.repo_root, number, base_ref)
             if local is not None:

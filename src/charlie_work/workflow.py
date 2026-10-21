@@ -2540,12 +2540,8 @@ class OrchestratorApp:
 
         # Fetch diff for patch-id based no-op rework detection (issue #222)
         # This is needed before the janitor gate to detect actual content changes
-        # Issue #1807: ``pr_diff`` returns ``None`` when the remote refused or
-        # failed the fetch AND the local-git fallback could not produce a
-        # diff either (e.g. GitHub's 300-file ``too_large`` diff cap). A None
-        # here is a fetch failure, not an empty diff; review() must not build
-        # a packet from it -- the gate below keeps its empty-diff behavior
-        # only for a diff that was fetched successfully.
+        # Issue #1807: a None here is a *fetch failure*, not an empty diff
+        # -- the #1807 gate below refuses to build a packet from it.
         diff = self.gh.pr_diff(pr_number)
 
         # Deterministic janitor gate BEFORE any packet spend: an
@@ -3408,27 +3404,10 @@ class OrchestratorApp:
                     "is_no_op_rework": verdict.is_no_op_rework,
                 },
             )
-        # Issue #1807: refuse to build a packet when no diff could be
-        # fetched. Before this gate a failed fetch collapsed to "" and the
-        # packet's diff.patch was empty; the #1251 empty-diff gate then read
-        # that packet as a zero-delta PR and skipped review dispatch on
-        # every pass, forever (PR #2160: 461 files, >100
-        # review_dispatch_skipped_empty_diff warnings, no error event, no
-        # escalation). A genuinely empty-and-fetched diff keeps its existing
-        # behavior: the gate handling that is already written above.
+        # Issue #1807: no packet from a fetch-failure None (the delegate
+        # module owns the #1251 empty-diff skip-forever rationale).
         if diff is None:
-            return _CommandResult(
-                True,
-                (
-                    f"PR #{pr_number}: diff unavailable (fetch failed, local-git "
-                    "fallback exhausted); packet not built, retries next pass"
-                ),
-                {
-                    "pr": pr_number,
-                    "issue": issue_number,
-                    "reason": "diff_unavailable",
-                },
-            )
+            return self._diff_unavailable_no_packet_result(pr_number, issue_number)
         pr_dir = self.paths.prs / f"pr-{pr_number}"
         pr_dir.mkdir(parents=True, exist_ok=True)
         # Issue #592: stamp the digest of the resolved review template +
