@@ -375,7 +375,10 @@ def gather_checks(app: Any, pr_number: int) -> ChecksRead:
         # checks so the merge lane's infra-rerun classification sees them.
         enriched = app._enrich_checks_run_ids(enriched, required)
         summary = summarize_checks(enriched, required)
-    diff = app.gh.pr_diff(pr_number)
+    # Issue #1807: pr_diff may now return None when the remote refused the
+    # fetch and the local-git fallback failed too; the containment scan takes
+    # a str, and an unavailable diff carries no outbound text to scan.
+    diff = app.gh.pr_diff(pr_number) or ""
     warnings = check_operator_containment(app.repo_root, diff, pr_number)
     return ChecksRead(summary, unavailable, enriched, tuple(warnings))
 
