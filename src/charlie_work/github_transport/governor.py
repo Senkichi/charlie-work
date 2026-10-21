@@ -64,6 +64,11 @@ LANE_TIERS: Mapping[str, Tier] = MappingProxyType(
         "dispatch_reviews": Tier.SCAN,
         "quota_probe": Tier.SCAN,
         "deescalate": Tier.FLOOR,
+        # #1717 post-merge outcome attribution: optional per-pass read work
+        # (merged-PR CI probes, follow-up scan) that gives way first of none
+        # -- FLOOR, the catch-all for optional gated work. It retries the
+        # next pass, so a drained hour simply delays convergence.
+        "post_merge_attribution": Tier.FLOOR,
         "local_lane": Tier.EXEMPT,
         "merge": Tier.ESSENTIAL,
         "label_write": Tier.ESSENTIAL,
