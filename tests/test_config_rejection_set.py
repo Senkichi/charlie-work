@@ -8,7 +8,16 @@ automatic signal: a probe matrix recorded against the pre-migration build code
 Each cell is one ``build_config_from_data`` call with one probe value placed at
 one key path, recorded as:
 
-* ``R``   -- rejected (``ValueError``/``TypeError``; ``ConfigError`` is a ``ValueError``)
+* ``R``   -- rejected by a rescuable ``ConfigError`` (a ``FieldError``; any
+  ConfigError that is not a ``ConstructionError``)
+* ``RC``  -- rejected by a non-rescuable class: a ``ConstructionError``, or a
+  raw ``ValueError``/``TypeError`` that escaped before the wrap. Both are
+  ``ValueError``, so an unqualified ``except`` cannot tell them apart -- but
+  the #665 layered-load rescue discards the global layer on ``ConfigError``
+  and re-raises a ``ConstructionError``, so turning an ``RC`` into an ``R``
+  (e.g. a use-site ``NotNull`` on a ``runner_allocation`` field) flips
+  layered-rescue behaviour from fail-loud to silently-discarding-global
+  (the #623 shape) while this matrix would have shown only ``R`` either way.
 * ``X``   -- crashed with some other exception (a clean rejection now also passes)
 * ``A<h>`` -- accepted; ``h`` digests the fields that differ from the default
   config, so a change in coercion (``str(item)``, ``float(x)``, ``.strip()``)
@@ -37,6 +46,7 @@ from unittest import mock
 import pytest
 
 from charlie_work.config import OrchestratorConfig, build_config_from_data
+from charlie_work.config_validation import ConfigError, ConstructionError
 
 FIXTURE = Path(__file__).parent / "fixtures" / "config_rejection_matrix.json"
 
@@ -478,8 +488,15 @@ def code_of(raw: dict) -> str:
 def _code_of(raw: dict) -> str:
     try:
         cfg = build_config_from_data(copy.deepcopy(raw))
-    except (ValueError, TypeError):
+    except ConstructionError:
+        return "RC"
+    except ConfigError:
         return "R"
+    except (ValueError, TypeError):
+        # ConstructionError subclasses ConfigError, so a raw ValueError here is
+        # either a build failure that slipped past validate_section's wrap or an
+        # earlier structural escape -- not rescuable either way.
+        return "RC"
     except Exception:  # noqa: BLE001 - recorded as a crash class, not hidden
         return "X"
     return "A" + hashlib.md5(repr(_changed(cfg)).encode()).hexdigest()[:4]
@@ -488,7 +505,7 @@ def _code_of(raw: dict) -> str:
 def same(recorded: str, now: str) -> bool:
     if recorded == now:
         return True
-    return {recorded, now} <= {"R", "X"}  # a clean rejection replacing a crash is fine
+    return recorded == "X" and now in {"R", "RC"}  # a clean rejection replacing a crash is fine
 
 
 def compute() -> dict:
@@ -526,13 +543,15 @@ def recorded() -> dict:
 
 
 def test_probe_matrix_is_nontrivial(recorded):
-    """Positive control: the fixture contains both rejections and acceptances, broadly."""
+    """Positive control: the fixture contains both rejections and acceptances, broadly,
+    and both rescue classes among the rejections."""
     flat = [c for row in recorded["cells"].values() for c in row]
-    rejected = sum(1 for c in flat if c == "R")
+    rejected = sum(1 for c in flat if c in {"R", "RC"})
     accepted = sum(1 for c in flat if c.startswith("A"))
     assert len(recorded["targets"]) > 300
     assert rejected > 2000
     assert accepted > 5000
+    assert sum(1 for c in flat if c == "RC") > 0
     assert recorded["cases"]["deadlock"] == "R"
     assert recorded["cases"]["no_deadlock"].startswith("A")
 
