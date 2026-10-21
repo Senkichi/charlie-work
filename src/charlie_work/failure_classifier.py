@@ -348,13 +348,21 @@ def classify_failure(
             else _DEFAULT_RATE_LIMIT_COOLDOWN_MINUTES,
             seconds=resume_margin_seconds,
         )
-        # The byte slice can cut the first line mid-event: its embedded
-        # timestamps are not emission times, so the anchor never reads it.
-        whole_lines = tail.partition("\n")[2] if len(log_text) > len(tail) else tail
-        emitted_at = _throttle_emission_anchor(
-            log_path, whole_lines, now=resolved_now, throttle_markers=markers
-        )
-        throttled_until = max(resolved_now, emitted_at + cooldown)
+        if reset_minutes is None:
+            # No stated countdown: the default cooldown is a synthetic
+            # post-classification window, not a provider countdown that began
+            # at emission. Anchoring it at a stale emission time (a
+            # stall-reaped worker's log is >= a stall window old) would clamp
+            # max(now, emitted_at + 15m) to now -- a zero-length window.
+            throttled_until = resolved_now + cooldown
+        else:
+            # The byte slice can cut the first line mid-event: its embedded
+            # timestamps are not emission times, so the anchor never reads it.
+            whole_lines = tail.partition("\n")[2] if len(log_text) > len(tail) else tail
+            emitted_at = _throttle_emission_anchor(
+                log_path, whole_lines, now=resolved_now, throttle_markers=markers
+            )
+            throttled_until = max(resolved_now, emitted_at + cooldown)
         return "rate_limited", throttled_until.replace(microsecond=0).isoformat().replace(
             "+00:00", "Z"
         )

@@ -40,7 +40,7 @@ import logging
 import random
 import time
 from collections.abc import Mapping
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -63,6 +63,17 @@ SESSION_ROLE_KEY = "role_entry"
 # a dead credential is not a quota window, and it keeps its own per-repo
 # handling (``clear_quota_throttles`` treats it specially).
 RESTRICTING_FAILURE_KINDS = frozenset({"rate_limited", "quota_exhausted"})
+
+# Consecutive-hit backoff (issue #2767): a (harness, model) that fails again
+# after its window expired gets an escalating restriction, doubling the base
+# cooldown per consecutive hit. The count resets once a restriction has been
+# expired for longer than the reset window without a new hit.
+CONSECUTIVE_HIT_RESET_WINDOW = timedelta(hours=2)
+MAX_ESCALATED_BACKOFF = timedelta(hours=4)
+# Only short base windows escalate -- a base already past this is a provider
+# reset window (5h Go window, 24h quota, weekly/monthly), not a short
+# unstated-reset cooldown (15m rate limit or 1h Zen cooldown + resume margin).
+_ESCALATABLE_BASE_MAX = timedelta(hours=2)
 
 _LOCK_WAIT_SECONDS = 2.0
 
@@ -130,7 +141,8 @@ def record_restriction(
     until_dt = parse_iso_timestamp(until)
     if until_dt is None or not isinstance(harness, str) or not isinstance(model, str):
         return False
-    resolved_now = now if now is not None else datetime.now(UTC)
+    resolved_now = (now if now is not None else datetime.now(UTC)).replace(microsecond=0)
+    until_dt = until_dt.replace(microsecond=0)
     path = ledger_path()
     lock = _acquire_lock(path.with_name(LEDGER_LOCK_FILENAME))
     if lock is None:
@@ -145,6 +157,29 @@ def record_restriction(
         existing_until = (
             parse_iso_timestamp(existing.get("until")) if isinstance(existing, dict) else None
         )
+        prev_hits = existing.get("consecutive_hits", 1) if isinstance(existing, dict) else 1
+        if not (isinstance(prev_hits, int) and prev_hits >= 1):
+            prev_hits = 1
+        if (
+            existing_until is not None
+            and existing_until <= resolved_now
+            and resolved_now - existing_until <= CONSECUTIVE_HIT_RESET_WINDOW
+        ):
+            # A post-expiry hit within the reset window: a subsequent launch
+            # failed again, so the short base cooldown escalates. A hit while
+            # the window was still live is the same batch dying, not a new
+            # launch, and never reaches this branch.
+            consecutive_hits = prev_hits + 1
+            base_duration = until_dt - resolved_now
+            if timedelta(0) < base_duration <= _ESCALATABLE_BASE_MAX:
+                until_dt = resolved_now + min(
+                    base_duration * (2 ** min(consecutive_hits - 1, 3)),
+                    MAX_ESCALATED_BACKOFF,
+                )
+        elif existing_until is not None and existing_until > resolved_now:
+            consecutive_hits = prev_hits
+        else:
+            consecutive_hits = 1
         if existing_until is not None and existing_until >= until_dt:
             return False
         restrictions[_key(harness, model)] = {
@@ -155,6 +190,7 @@ def record_restriction(
             "source": source,
             "role": role,
             "updated_at": _format_z(resolved_now),
+            "consecutive_hits": consecutive_hits,
         }
         payload = {"version": LEDGER_VERSION, "restrictions": restrictions}
         path.parent.mkdir(parents=True, exist_ok=True)
