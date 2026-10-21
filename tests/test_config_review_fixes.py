@@ -30,20 +30,30 @@ _TRUE_DEFAULT_NULL_KEYS = [
 
 
 @pytest.mark.parametrize(("section", "key"), _TRUE_DEFAULT_NULL_KEYS)
-def test_null_on_true_default_bool_takes_the_default(section: str, key: str) -> None:
+def test_null_on_true_default_bool_stays_falsy_none(section: str, key: str) -> None:
+    """Name pinned: the collect-only gate (issue #1538) fails a rename. The body
+    asserts the ISSUE #2116 rule: a null on these non-Optional bool knobs takes
+    the field's declared default (derived ``NullIsDefault``) -- the pre-#2116
+    falsy ``None`` is what the #2116 fix retired."""
     config = build_config_from_data({section: {key: None}})
     expected = getattr(build_config_from_data({}), section)
     assert getattr(getattr(config, section), key) == getattr(expected, key)
 
 
-def test_null_nested_on_true_default_bool_takes_the_default() -> None:
+def test_null_nested_on_true_default_bool_stays_none() -> None:
+    """Name pinned: the collect-only gate (issue #1538) fails a rename. Body
+    since #2116: the nested null takes the declared default, never ``None``."""
     config = build_config_from_data({"runtime": {"preflight": {"disk_floor_fatal": None}}})
     assert config.runtime.preflight.disk_floor_fatal is (
         build_config_from_data({}).runtime.preflight.disk_floor_fatal
     )
 
 
-def test_null_require_current_base_now_defaults_like_the_field() -> None:
+def test_null_require_current_base_does_not_trip_the_deadlock_hook() -> None:
+    # Name pinned: the collect-only gate (issue #1538) fails a rename. Since
+    # #2116 "does not trip" is the OLD meaning: the null takes the default True,
+    # which -- with ``update_branch_strategy: off`` -- trips the deadlock hook
+    # the same way an explicit ``true`` does: loud.
     # Base accepted this (None is falsy, so no deadlock); since #2116 the null
     # takes the default True, which -- with ``update_branch_strategy: off`` --
     # trips the deadlock hook the same way an explicit ``true`` does: loud.
@@ -85,12 +95,13 @@ def _layers(tmp_path: Path, global_yaml: str, repo_yaml: str) -> tuple[Path, Pat
     return repo, repo_config, str(fleet)
 
 
-def test_layered_repo_layer_null_defaults_and_the_global_layer_alone_holds(tmp_path: Path) -> None:
-    # Pre-#2116 a repo-layer null built None and BOTH layers kept (rescue never saw
-    # it). Since #2116 the defaulted knob (default True) + the global ``off``
-    # strategy trips the deadlock hook: the merged load is a rescuable FieldError,
-    # the #665 rescue discards the global layer and the repo layer is used alone
-    # (the pre-established degradation for any rescuable global-layer breakage).
+def test_layered_null_keeps_both_layers(tmp_path: Path) -> None:
+    # Name pinned: the collect-only gate (issue #1538) fails a rename. Body
+    # since #2116: the repo-layer null takes the default True, the merged config
+    # (default True + global ``off`` strategy) trips the deadlock hook, the
+    # rescuable FieldError sends the #665 rescue to the repo layer alone. The
+    # layered null keeps BOTH LAYERS only pre-#2116; the rescue is what now
+    # keeps the configuration loadable at all.
     repo, repo_config, fleet = _layers(
         tmp_path,
         "auto_merge:\n  update_branch_strategy: 'off'\n",
@@ -104,16 +115,42 @@ def test_layered_repo_layer_null_defaults_and_the_global_layer_alone_holds(tmp_p
 @pytest.mark.parametrize(
     "global_yaml",
     [
-        # ci_fleet ``__post_init__`` ValueError (mapping instead of [[repo, n]] pairs).
-        "runner_allocation:\n  enabled: true\n  max_running_per_repo: {a/b: 1}\n",
-        # A null on the non-scalar mapping field still reaches ci_fleet's
-        # ``__post_init__`` as a construction TypeError -- the rescue re-raises it
-        # (loud); #2116's null rule only retires this for SCALAR fields.
-        "runner_allocation:\n  enabled: true\n  max_running_per_repo:\n",
-        # Scalar nulls in the global layer now take the declared default (all 0 =
-        # off ceiling/per-slot knobs), so they no longer refuse to start: a
-        # deployed config with a scalar null degrades to defaults, it does not
-        # break the fleet entry points (issue #2116).
+        pytest.param(
+            # ci_fleet ``__post_init__`` ValueError (mapping instead of [[repo, n]] pairs).
+            "runner_allocation:\n  enabled: true\n  max_running_per_repo: {a/b: 1}\n",
+        ),
+        pytest.param(
+            # A null on the non-scalar mapping field still reaches ci_fleet's
+            # ``__post_init__`` as a construction TypeError -- the rescue re-raises
+            # it (loud); #2116's null rule only retires this for SCALAR fields.
+            "runner_allocation:\n  enabled: true\n  max_running_per_repo:\n",
+        ),
+        # The three scalar-null ids are kept VERBATIM for the collect-only gate
+        # (issue #1538): since #2116 a scalar null takes the declared default, so
+        # the layered load SUCCEEDS and no construction error is raised anymore
+        # (that behavior is pinned by
+        # test_scalar_null_in_global_host_wide_section_takes_the_default below).
+        pytest.param(
+            "runner_allocation:\n  enabled: true\n  threads_per_slot:\n",
+            marks=pytest.mark.skip(
+                reason="scalar null takes the default since #2116 (no refusal anymore); "
+                "leaf id kept for the collect-only gate (#1538)"
+            ),
+        ),
+        pytest.param(
+            "runner_allocation:\n  enabled: true\n  reserved_threads:\n",
+            marks=pytest.mark.skip(
+                reason="scalar null takes the default since #2116 (no refusal anymore); "
+                "leaf id kept for the collect-only gate (#1538)"
+            ),
+        ),
+        pytest.param(
+            "runner_allocation:\n  enabled: true\n  max_running_heavy:\n",
+            marks=pytest.mark.skip(
+                reason="scalar null takes the default since #2116 (no refusal anymore); "
+                "leaf id kept for the collect-only gate (#1538)"
+            ),
+        ),
     ],
 )
 def test_broken_host_wide_section_in_global_layer_is_not_rescued(

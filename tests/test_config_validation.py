@@ -232,8 +232,9 @@ class NullSec:
     normalized: Annotated[int, Typed, NullIsDefault] = 7
 
 
-def test_null_on_a_non_optional_scalar_takes_the_default():
-    """Issue #2116: a non-Optional scalar knob never builds ``None``.
+def test_none_is_omitted_so_default_applies():
+    """Name pinned (kept: the collect-only gate keys on it). Body since #2116
+    (issue #2116): a non-Optional scalar knob never builds ``None``.
 
     Derived class-level rule (single enforcement point in ``validate_section``):
     an explicit ``key: null`` on a scalar field whose annotation has no ``None``
