@@ -112,7 +112,7 @@ def _deferring(remaining: int | None) -> set[str]:
 
 RESERVE_LANES = {"reconcile", "drift", "review_reap", "ci_reclaim"}
 SCAN_LANES = {"intake", "dispatch_rework", "dispatch", "dispatch_reviews", "quota_probe"}
-FLOOR_LANES = {"deescalate"}
+FLOOR_LANES = {"deescalate", "post_merge_attribution"}
 EXEMPT_LANES = {"local_lane"}
 ESSENTIAL_LANES = {"merge", "label_write", "unauthorized_merge_tripwire"}
 

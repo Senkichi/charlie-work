@@ -316,7 +316,10 @@ def test_workflow_runs_for_head_call_sites_are_the_registered_ones() -> None:
     a deferred infra-rerun follow-up probes the CONTAINING run's
     terminal status before re-calling ``gh run rerun`` -- a different
     question (per-run status, not run existence), deliberately registered
-    rather than smuggled in. Call-site SET, not a text-pattern match for
+    rather than smuggled in. Issue #1717 adds the same shape again:
+    ``probe_merged_main_ci`` (post_merge_attribution_scan.py) probes a
+    MERGED PR's commit for the outcome record; registered below with the
+    same reasoning. Call-site SET, not a text-pattern match for
     "grace" nearby -- a differently-phrased second window still shows up
     here as another ``ast.Call`` node. The stale-checks-internal half of
     the original fence (exactly one call site inside the detector) lives
@@ -359,4 +362,9 @@ def test_workflow_runs_for_head_call_sites_are_the_registered_ones() -> None:
     assert call_sites == [
         ("misc_checks.py", "_drive_infra_rerun_or_escalate"),
         ("reap_dispatch.py", "_detect_ci_absence"),
+        # #1717: the post-merge outcome scanner probes the merged PR's
+        # merge-commit SHA for Actions runs -- again a different question
+        # (recorded post-merge CI outcome, not CI retrigger candidacy),
+        # registered rather than smuggled in, like #1936's consumer above.
+        ("post_merge_attribution_scan.py", "probe_merged_main_ci"),
     ], f"unexpected workflow_runs_for_head call site(s); found {call_sites!r}"

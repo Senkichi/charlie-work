@@ -396,6 +396,30 @@ def test_stopping_rule_met_on_outcome_difference() -> None:
     assert outcome["per_arm"]["b"]["k"] == 0
 
 
+@pytest.mark.parametrize("kind", ["post_merge_main_ci_failure", "post_merge_followup_attribution"])
+def test_post_merge_kinds_count_as_review_defect_outcomes(kind: str) -> None:
+    """#1717 kinds are REVIEW_DEFECT_KINDS members, not merely declared:
+    an assigned PR's recorded post-merge outcome (a required main-branch
+    check failure, a follow-up PR naming the merge) counts toward
+    post_approval_defect_rate's k and the liveness signal, exactly like a
+    cross-PR revert does."""
+    events = []
+    for i in range(6):
+        pra, prb = 2600 + i, 2700 + i
+        events.append(_round(pra, "approved", "a", ts="2026-08-01T00:00:00Z"))
+        events.append(_round(prb, "approved", "b", ts="2026-08-01T00:00:00Z"))
+    for i in range(4):
+        events.append(
+            _evt("2026-08-05T00:00:00Z", kind, {"pr_number": 2600 + i, "issue_number": 1})
+        )
+    report = build_report(events, KEY, min_prs_per_arm=6)
+    outcome = report["metrics"]["post_approval_defect_rate"]
+    assert outcome["measure"] == "outcome"
+    assert outcome["per_arm"]["a"]["k"] == 4 and outcome["per_arm"]["a"]["n"] == 6
+    assert outcome["per_arm"]["b"]["k"] == 0
+    assert outcome["observed_events_per_arm"] == {"a": 4, "b": 0}
+
+
 def test_zero_outcome_events_cannot_end_experiment() -> None:
     """Regression: 200 approved PRs per arm and ZERO outcome events used
     to return met/no_detectable_difference off a degenerate [0, 0] Wald
@@ -647,10 +671,12 @@ def test_every_metric_labelled_and_at_least_one_outcome() -> None:
     assert report["metrics"]["post_approval_defect_rate"]["measure"] == "outcome"
     text = render_text(report)
     assert "[activity]" in text and "[outcome]" in text
-    # the report must not imply a conclusion from activity metrics alone:
-    # the not-derivable outcome candidates are stated explicitly
-    assert "NOT derivable" in text
-    assert report["outcome_coverage"]["not_derivable"]
+    # issue #1717: the two outcome candidates #1701 declared not derivable
+    # (post-merge main-branch CI failure; a follow-up fix/revert naming the
+    # merged PR) are now recorded events, folded into the outcome signal,
+    # so the coverage section no longer states any not-derivable candidate
+    assert report["outcome_coverage"]["not_derivable"] == []
+    assert "NOT derivable" not in text
 
 
 def test_rates_carry_wilson_intervals_and_pairs_carry_differences() -> None:
@@ -718,8 +744,8 @@ def test_stopping_rule_is_documented() -> None:
         # the stated equivalence margin and the observed-event floor
         "equivalence margin",
         "MIN_EQUIVALENCE_EVENTS_PER_ARM",
-        # outcome claims must match what is measured, and the missing
-        # post-merge attribution recording must be linked (issue #1717)
+        # outcome claims must match what is measured, and the
+        # post-merge attribution recording (issue #1717) stays documented
         "no content change",
         "#1717",
     ):

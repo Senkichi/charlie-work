@@ -1,0 +1,6 @@
+warning
+# Issue #1717: a merged PR's own merge commit failed main-branch CI on a
+# required check (any check when auto_merge.required_checks is empty).
+# Warning, not error: one failed merge does not break the fleet, but it is
+# the exit path defect signal the #1701 reviewer-effort experiment folds
+# into post_approval_defect_rate, and an operator should see it.
