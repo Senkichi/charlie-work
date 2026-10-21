@@ -115,14 +115,18 @@ issue-authored-new-file (#1758) cases for free: both degrade to "not
 found anywhere in the fleet" without any new prose-parsing heuristic,
 exactly the way this module already collapses distinguishable-in-theory
 cases into one bucket wherever the distinction carries no decision-layer
-weight. (#1757's own module-relative *same-repo* fallback for
+weight. #1757's own module-relative *same-repo* fallback for
 ``_path_exists_in_repo`` — resolving ``schemas/coach.py`` against the real,
 more deeply nested ``server/src/swole/schemas/coach.py`` in the *same*
-repo — is a related but separate fix tracked on that issue and not
-implemented here; this module's contribution toward it is the shared
-segment-boundary suffix-match helper, :func:`_segment_boundary_suffix_match`,
-used today by :func:`_find_owning_repo` and written so #1757's fix can
-reuse it rather than duplicate the segment-boundary logic.)
+repo — reuses that shared helper rather than duplicating the
+segment-boundary logic: :func:`_path_exists_in_repo` now suffix-matches the
+dispatching repo's own tracked-file listing when the direct
+repo-root-anchored resolution misses, so the #92/#218 shape ("one suffix
+match inside this repo") passes the gate as ordinary in-repo evidence
+instead of being counted against the sibling search, while an ambiguous
+suffix (2+ real files share the candidate — plausible once a real
+``shared/`` module exists alongside ``swole/app/mobile/``) degrades to
+"missing" exactly as the sibling arm does.
 
 Founding #1010/#953 protection, restored unconditionally (2026-09-21
 review of the positive-evidence redesign, finding 5): narrowing escalation
@@ -566,27 +570,70 @@ def _iter_candidate_matches(issue_body: str) -> tuple[list[tuple[str, int, int]]
     return candidates, stripped
 
 
-def _path_exists_in_repo(path_str: str, repo_root: Path) -> bool:
-    """Return ``True`` when ``path_str`` resolves to an existing file inside ``repo_root``.
+def _path_exists_in_repo(
+    path_str: str,
+    repo_root: Path,
+    listing_cache: dict[Path, list[str]] | None = None,
+) -> bool:
+    """Return ``True`` when ``path_str`` names a file inside ``repo_root``.
 
-    Containment runs before the existence check on *both* branches, via
-    :func:`_resolve_within_root` (``safe_path.contains`` resolves both
-    sides): a relative candidate carrying a ``..`` segment can walk outside
-    ``repo_root`` entirely, and a bare ``(repo_root / path).exists()`` would
-    report a coincidental file at that escaped location as "in the target
-    repo" (issue #1772). Routing the absolute branch through the same helper
-    also recognizes POSIX-style absolute candidates that
-    ``Path.is_absolute()`` misclassifies as relative on Windows — those were
-    previously joined onto ``repo_root`` (collapsing to the drive root) and
-    existence-checked without any containment check at all.
+    Two resolutions, tried in order:
+
+    1. **Direct** (repo-root-anchored): :func:`_resolve_within_root` plus
+       ``exists()``. Containment runs before the existence check:
+       a relative candidate carrying a ``..`` segment can walk outside
+       ``repo_root`` entirely, and a bare ``(repo_root / path).exists()``
+       would report a coincidental file at that escaped location as "in
+       the target repo" (issue #1772). Routing the absolute branch through
+       the same helper also recognizes POSIX-style absolute candidates
+       that ``Path.is_absolute()`` misclassifies as relative on Windows —
+       those were previously joined onto ``repo_root`` (collapsing to the
+       drive root) and existence-checked without any containment check.
+    2. **Segment-boundary suffix fallback** (issue #1757): issue bodies
+       routinely cite paths in a natural, module-relative form —
+       ``schemas/coach.py`` for the real, more deeply nested
+       ``server/src/swole/schemas/coach.py`` in a monorepo with nested
+       project roots — and a direct miss on such a citation is not
+       "absent from this repo". When the direct arm misses, the candidate
+       is matched against the repo's own tracked-file listing
+       (:func:`_repo_tracked_files`, POSIX-separated and relative to
+       ``repo_root``) via :func:`_segment_boundary_suffix_match`: exactly
+       one real file whose path ends with the candidate on a path-segment
+       boundary (never a raw string suffix — ``"ngs/coach.py"`` must not
+       match ``".../settings/coach.py"``) resolves it. An ambiguous
+       suffix (2+ real files share the candidate — plausible once a real
+       ``shared/`` module exists alongside ``swole/app/mobile/``) must
+       not silently pick one, so the helper returns ``None`` there and
+       this function reports "missing" — the conservative fallback that
+       the sibling-ownership arm and the shorthand classifier already
+       use for anything ambiguous.
+
+    ``listing_cache`` memoizes ``repo_root``'s listing for the caller's
+    lifetime (issue #1757): the listing is computed lazily on the first
+    direct miss — candidates that resolve directly never pay for it — and
+    shared across every candidate checked against the same root within one
+    :func:`cross_repo_gate` call, the same per-call memoization pattern
+    :func:`_find_owning_repo` uses for sibling roots (one ``git ls-files``
+    per gate call, not one per candidate). Standalone callers that pass no
+    cache get a fresh, correct listing per call.
     """
     resolved = _resolve_within_root(repo_root, path_str)
-    if resolved is None:
-        return False
-    try:
-        return resolved.exists()
-    except (OSError, ValueError):
-        return False
+    direct = False
+    if resolved is not None:
+        try:
+            direct = resolved.exists()
+        except (OSError, ValueError):
+            direct = False
+    if direct:
+        return True
+    files: list[str] | None = None
+    if listing_cache is not None:
+        files = listing_cache.get(repo_root)
+    if files is None:
+        files = _repo_tracked_files(repo_root)
+        if listing_cache is not None:
+            listing_cache[repo_root] = files
+    return _segment_boundary_suffix_match(path_str, files) is not None
 
 
 def _is_absolute_path(candidate: str) -> bool:
@@ -1025,10 +1072,17 @@ def cross_repo_gate(
             ),
             neutral_paths=tuple(neutral),
         )
+    # One tracked-file listing of the dispatching root at most for this
+    # whole call (issue #1757): _path_exists_in_repo's suffix fallback
+    # computes it lazily on the first direct-resolution miss and shares it
+    # across every survivor checked here — the same per-call memoization
+    # pattern the sibling search below uses (one listing per root per call,
+    # review finding 1, never once per candidate).
+    repo_listings: dict[Path, list[str]] = {}
     missing_pairs = [
         (raw, effective)
         for raw, effective in survivors
-        if not _path_exists_in_repo(effective, repo_root)
+        if not _path_exists_in_repo(effective, repo_root, repo_listings)
     ]
     missing = tuple(raw for raw, _ in missing_pairs)
     # Pass when at least one survivor exists here — the worker has something
