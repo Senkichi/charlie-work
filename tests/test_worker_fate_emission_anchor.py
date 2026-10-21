@@ -94,6 +94,25 @@ def test_devin_plain_text_without_timestamp_still_anchors_at_log_mtime(tmp_path:
     assert throttled_until == _iso(EMITTED + timedelta(minutes=30))
 
 
+def test_unstated_reset_rate_limit_anchors_at_now_not_stale_mtime(tmp_path: Path) -> None:
+    # No "resets in N minutes": the 15-minute default is a synthetic
+    # post-classification cooldown, not a countdown that started at the
+    # emission time. Anchoring it at a stale mtime (a stall-reaped worker's
+    # log can be 45+ minutes old) would clamp max(now, emitted_at+15m) to
+    # `now` -- a zero-length window. The anchor is classification time.
+    log_path = tmp_path / "session.log"
+    log_path.write_text(
+        "Error: Rate limit exceeded. Please try again later.\n",
+        encoding="utf-8",
+    )
+    os.utime(log_path, (EMITTED.timestamp(), EMITTED.timestamp()))
+
+    failure_kind, throttled_until = worker_fate.classify_for("devin", log_path, now=NOW)
+
+    assert failure_kind == "rate_limited"
+    assert throttled_until == _iso(NOW + timedelta(minutes=15))
+
+
 def test_classify_for_unknown_adapter_kind_classifies_nothing(tmp_path: Path) -> None:
     log_path = _copy_fixture(
         tmp_path,
