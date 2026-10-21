@@ -1,0 +1,9 @@
+warning
+# Issue #1807: a PR diff that GitHub refuses to serve (its 300-file
+# ``too_large`` cap, or any other fetch failure) AND that the local-git
+# fallback could not produce either. Before this event existed the fetch
+# failure collapsed to an empty diff, the #1251 empty-diff gate skipped
+# review dispatch on every pass forever, and the only visible trace was
+# repeated ``review_dispatch_skipped_empty_diff`` warnings that read as a
+# legitimately zero-delta PR -- a handled-but-notable condition an operator
+# must see.

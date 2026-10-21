@@ -360,6 +360,7 @@ KNOWN_IGNORED: dict[str, str] = {
     "operator_rework_rearmed": "operator rework-rearm audit record (legacy kind); no flow fact",
     "operator_state_correction": "operator state-correction audit record (legacy kind); no flow fact",
     "review_packet_discarded_head_moved": "review-packet bookkeeping: PR head moved, packet re-made",
+    "review_packet_diff_unavailable": "review-packet bookkeeping: diff fetch unavailable (issue #1807 event); the packet/build retry carries the outcome",
     "rework_label_skipped_issue_closed": "rework-label bookkeeping: issue already closed",
     "unauthorized_merge_ack_revoked": "unauthorized-merge bookkeeping",
     "worker_token_missing": "retired worker-token gate (#1877); kept for older events DBs",
