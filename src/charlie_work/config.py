@@ -257,7 +257,8 @@ class LabelConfig:
     # Issue #1266: mechanical escalations (reason_class == "mechanical") land
     # here instead of ``human_needed``, so human attention is reserved for
     # judgment calls. Unlike ``prose_only_deps`` -- the only other
-    # terminal-but-not-workflow_labels label -- this one IS actively
+    # terminal-but-not-workflow_labels label (intake adds it and strips it
+    # again via issue #1902's re-check) -- this one IS actively
     # added/removed by automated ``labels.py`` transitions (the
     # "operator_queued"/"redispatch_operator_queued" edges and the
     # de-escalation cap-exhaustion path), so it must be a member of
