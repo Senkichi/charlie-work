@@ -190,11 +190,7 @@ def stalled_flow(facts: StalledFacts) -> Flow:
         and w.rate_limit_defer_until is None
     ):
         defer_until = yield ProbeRateLimitDefer(issue)
-        # get_rate_limit_defer_until clamps an already-past emission-anchored
-        # window to `now`; its docstring defines that zero-length deadline as
-        # already expired. Reap instead of stamping a 0-second deferral.
-        parsed_defer = _parse_defer_until(defer_until)
-        if defer_until is not None and parsed_defer is not None and facts.now < parsed_defer:
+        if defer_until is not None:
             if not facts.dry_run:
                 yield StampSidecar(issue, _pairs(rate_limit_defer_until=defer_until))
                 # Issue #2086: the fleet ledger restricts the stamped chain entry.

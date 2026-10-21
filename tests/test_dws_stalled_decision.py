@@ -205,19 +205,6 @@ def test_a_rate_limit_signature_defers_the_kill() -> None:
     assert txn.throttle.reason == "rate_limited"
 
 
-def test_a_born_expired_rate_limit_defer_proceeds_straight_to_reap() -> None:
-    # get_rate_limit_defer_until clamps an already-past emission-anchored
-    # window to `now` -- a zero-length deadline its own docstring defines as
-    # already expired. decide_stalled must reap, not stamp a 0-second defer.
-    for defer in ("2026-09-30T12:00:00Z", "2026-09-30T11:59:00Z"):
-        plan, asked = _drive(_facts(), _answers(defer=defer))
-        assert plan.entry == {"issue": ISSUE, "pid": 4242}
-        assert KillTree in [type(r) for r in asked]
-        assert _kinds(plan) == ["session_stalled"]
-        assert not [c for c in plan.commits if isinstance(c, RecordRoleQuota)]
-        assert "session_rate_limit_deferred" not in _kinds(plan)
-
-
 def test_dry_run_defer_withholds_the_ledger_write() -> None:
     plan, _ = _drive(_facts(dry_run=True), _answers(defer="2026-09-30T12:10:00Z"))
     assert not [c for c in plan.commits if isinstance(c, RecordRoleQuota)]

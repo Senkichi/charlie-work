@@ -100,6 +100,8 @@ def test_unstated_reset_rate_limit_anchors_at_now_not_stale_mtime(tmp_path: Path
     # emission time. Anchoring it at a stale mtime (a stall-reaped worker's
     # log can be 45+ minutes old) would clamp max(now, emitted_at+15m) to
     # `now` -- a zero-length window. The anchor is classification time.
+    from charlie_work.devin_failure_classification import get_rate_limit_defer_until
+
     log_path = tmp_path / "session.log"
     log_path.write_text(
         "Error: Rate limit exceeded. Please try again later.\n",
@@ -108,9 +110,11 @@ def test_unstated_reset_rate_limit_anchors_at_now_not_stale_mtime(tmp_path: Path
     os.utime(log_path, (EMITTED.timestamp(), EMITTED.timestamp()))
 
     failure_kind, throttled_until = worker_fate.classify_for("devin", log_path, now=NOW)
+    defer_until = get_rate_limit_defer_until(log_path, slack_minutes=5, now=NOW)
 
     assert failure_kind == "rate_limited"
     assert throttled_until == _iso(NOW + timedelta(minutes=15))
+    assert defer_until == _iso(NOW + timedelta(minutes=20))
 
 
 def test_classify_for_unknown_adapter_kind_classifies_nothing(tmp_path: Path) -> None:
