@@ -128,6 +128,55 @@ def test_get_rate_limit_defer_until_applies_log_digest(tmp_path: Path) -> None:
     assert get_rate_limit_defer_until(log, 5, log_digest=provider_error_digest) is None
 
 
+ZEN_FREE_STREAM_ERROR = (
+    "timestamp=2026-10-20T06:17:00.000Z level=ERROR "
+    'message="stream error" providerID=opencode modelID=glm-5.3-flash-free '
+    "session.id=ses_1 small=false agent=build mode=primary "
+    'error.error="AI_APICallError: Rate limit exceeded. Please try again later."'
+)
+GO_STREAM_ERROR = (
+    "timestamp=2026-10-20T06:17:00.000Z level=ERROR "
+    'message="stream error" providerID=opencode-go modelID=glm-5.3-flash '
+    'error.error="AI_APICallError: Rate limit exceeded. Please try again later."'
+)
+
+
+def test_zen_free_rate_limit_stream_error_classifies_as_quota_exhausted(
+    tmp_path: Path,
+) -> None:
+    """Issue #2767: Zen free-tier "Rate limit exceeded" carries no reset and
+    is not the Go subscription -- classify quota_exhausted on a 1h cooldown."""
+    log = _log(tmp_path, '{"type":"step_start"}\n' + ZEN_FREE_STREAM_ERROR + "\n")
+    now = datetime(2026, 10, 20, 6, 30, tzinfo=UTC)
+    kind, until = worker_fate.classify_for(
+        "opencode", log, quota_error_markers=RuntimeConfig().quota_error_markers, now=now
+    )
+    assert kind == "quota_exhausted"
+    assert until == (now + timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+
+
+def test_non_free_opencode_rate_limit_and_tool_output_do_not_classify_as_zen_quota(
+    tmp_path: Path,
+) -> None:
+    """A non-free providerID/modelID on the same error text is a plain
+    rate_limited death, and rate-limit text in tool output is nothing."""
+    log = _log(tmp_path, '{"type":"step_start"}\n' + GO_STREAM_ERROR + "\n")
+    kind, _ = worker_fate.classify_for(
+        "opencode", log, quota_error_markers=RuntimeConfig().quota_error_markers
+    )
+    assert kind == "rate_limited"
+
+    tool_output = (
+        '{"type":"step_start"}\n'
+        '{"type":"tool_use","part":{"tool":"bash","state":{"output":'
+        '"API rate limit exceeded"}}}\n'
+    )
+    log = _log(tmp_path, tool_output)
+    assert worker_fate.classify_for(
+        "opencode", log, quota_error_markers=RuntimeConfig().quota_error_markers
+    ) == (None, None)
+
+
 # --- classify_worker_health early kill ---------------------------------------
 
 
@@ -161,6 +210,28 @@ def test_health_opencode_quota_record_is_dead_immediately(tmp_path: Path) -> Non
 
 def test_health_opencode_quota_text_in_tool_output_is_not_dead(tmp_path: Path) -> None:
     assert _health(_view(_log(tmp_path, TOOL_OUTPUT_ONLY))) == WorkerHealth.HEALTHY
+
+
+def test_health_opencode_quiet_stream_error_is_dead_before_stall_minutes(
+    tmp_path: Path,
+) -> None:
+    """Issue #2767: an unrecovered non-quota stream error leaves opencode hung
+    silent -- DEAD once the log is quiet past the stream-error window, HEALTHY
+    before it (transient 429s stay with opencode's retry)."""
+    stream_error = (
+        "timestamp=2026-10-20T06:17:00.000Z level=ERROR "
+        'message="stream error" providerID=opencode-go modelID=glm-5.3-flash '
+        'error.error="AI_APICallError: Rate limit exceeded"'
+    )
+    log = _log(tmp_path, '{"type":"step_start"}\n' + stream_error + "\n")
+
+    quiet = datetime.now(UTC) - timedelta(minutes=6)
+    os.utime(log, (quiet.timestamp(), quiet.timestamp()))
+    assert _health(_view(log)) == WorkerHealth.DEAD
+
+    fresh = datetime.now(UTC) - timedelta(minutes=1)
+    os.utime(log, (fresh.timestamp(), fresh.timestamp()))
+    assert _health(_view(log)) == WorkerHealth.HEALTHY
 
 
 # --- data dir lifecycle ------------------------------------------------------

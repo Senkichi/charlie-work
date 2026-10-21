@@ -42,6 +42,12 @@ logger = logging.getLogger(__name__)
 # Workers that hang at this line are detected as launch_stalled
 _SHIM_MARKER = "[shim] .devin infra materialized"
 
+# Issue #2767: minutes an opencode log may sit silent after an unrecovered
+# provider stream error before the worker is killed early (a retry sleep that
+# is not coming back is otherwise indistinguishable from a live session until
+# stall_minutes).
+OPENCODE_STREAM_ERROR_QUIET_MINUTES = 5
+
 
 def _log_has_shim_marker(log_path: Path) -> bool:
     """Check if a log file contains the shim marker line.
@@ -759,7 +765,18 @@ def classify_worker_health(
             profile = worker_fate.profile_for(view.adapter_kind)
             if profile is not None and profile.log_digest is not None:
                 digest = profile.log_digest(log_text)
-                if digest and match_quota_tail(digest, config.runtime.quota_error_markers):
+                if digest and (
+                    match_quota_tail(digest, config.runtime.quota_error_markers)
+                    # Issue #2767: a non-quota stream error with no subsequent
+                    # progress event leaves opencode hung silent -- kill once
+                    # the log has been quiet past the stream-error window,
+                    # instead of waiting for stall_minutes.
+                    or (
+                        (log_stat := view.log_stat()) is not None
+                        and now - datetime.fromtimestamp(log_stat.st_mtime, tz=UTC)
+                        >= timedelta(minutes=OPENCODE_STREAM_ERROR_QUIET_MINUTES)
+                    )
+                ):
                     has_provider_suspension = True
     except OSError:
         pass

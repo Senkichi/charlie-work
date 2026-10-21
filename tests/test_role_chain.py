@@ -506,6 +506,38 @@ def test_ledger_tolerates_a_corrupt_file() -> None:
     )
 
 
+def test_ledger_escalates_backoff_on_consecutive_post_expiry_restrictions() -> None:
+    """A (harness, model) that fails again right after its window expired gets
+    a doubled base window each consecutive hit, until the 2h reset window
+    lapses and the backoff returns to 1x."""
+    key = ("opencode", "glm-free")
+    restrictions = role_quota_ledger.load_restrictions
+
+    t0 = NOW
+    assert role_quota_ledger.record_restriction(
+        *key, t0 + timedelta(minutes=15), reason="rate_limited", source="t", now=t0
+    )
+    assert restrictions()[key] == t0 + timedelta(minutes=15)
+
+    t1 = t0 + timedelta(minutes=20)  # 5m past expiry, inside the 2h reset window
+    assert role_quota_ledger.record_restriction(
+        *key, t1 + timedelta(minutes=15), reason="rate_limited", source="t", now=t1
+    )
+    assert restrictions()[key] == t1 + timedelta(minutes=30)
+
+    t2 = t1 + timedelta(minutes=35)  # 5m past the doubled window's expiry
+    assert role_quota_ledger.record_restriction(
+        *key, t2 + timedelta(minutes=15), reason="rate_limited", source="t", now=t2
+    )
+    assert restrictions()[key] == t2 + timedelta(minutes=60)
+
+    t3 = t2 + timedelta(hours=4)  # 3h past the third expiry: reset window lapsed
+    assert role_quota_ledger.record_restriction(
+        *key, t3 + timedelta(minutes=15), reason="rate_limited", source="t", now=t3
+    )
+    assert restrictions()[key] == t3 + timedelta(minutes=15)
+
+
 def test_classified_death_records_only_stamped_throttle_kinds() -> None:
     until = _z(NOW + timedelta(hours=1))
     stamped = {role_quota_ledger.SESSION_ROLE_KEY: {"harness": "devin-shell", "model": "swe-2"}}

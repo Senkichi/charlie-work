@@ -38,6 +38,7 @@ from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
 from typing import Any
 
+from .opencode_log import ZEN_FREE_LIMIT_MARKER
 from .opencode_worker import _host_auth_path
 
 log = logging.getLogger(__name__)
@@ -49,6 +50,10 @@ GO_LIMIT_ERROR = "GoUsageLimitError"
 # A limit that has already reset when probed: re-dispatch soon, but not into
 # the same second (the death may have raced the reset).
 CLEARED_COOLDOWN = timedelta(minutes=15)
+# Issue #2767: Zen free-tier "Rate limit exceeded" carries no reset timestamp;
+# cool down 1h instead of the classifier's 24h default so the ledger re-probes
+# after a short window.
+ZEN_FREE_COOLDOWN = timedelta(hours=1)
 # Repeated classifications of one death (dead reap, sweep, reconcile) within a
 # pass reuse the first probe instead of re-asking the API.
 _CACHE_SECONDS = 120.0
@@ -210,6 +215,11 @@ def go_quota_reset(tail: str) -> timedelta | None:
     stated = reset_from_text(tail)
     if stated is not None:
         return stated
+    if ZEN_FREE_LIMIT_MARKER in tail:
+        # Issue #2767: OpenCode Zen free-tier "Rate limit exceeded" carries no
+        # reset timestamp and must not probe the Go subscription; cool down 1h
+        # so the ledger re-probes after a short window instead of 24h.
+        return ZEN_FREE_COOLDOWN
     if "FreeUsageLimitError" in tail:
         # opencode Zen's free tier, not the Go subscription: a Go probe would
         # answer for the wrong account.
