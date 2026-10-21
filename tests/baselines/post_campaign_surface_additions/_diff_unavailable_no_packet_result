@@ -1,0 +1,13 @@
+issue #1807 rework: the review packet's diff-unavailable refusal, extracted
+out of the over-cap ``workflow.py`` (which had grown +27 lines for it) and
+installed from ``orchestration/helpers_packet.py`` as a net-new
+``@as_staticmethod`` member -- ``review()`` now calls
+``self._diff_unavailable_no_packet_result(pr_number, issue_number)``, and the
+refusal is ``ok=False`` matching ``head_moved_during_build`` and the
+janitor-gate block, the other no-packet retry exits, so
+``_route_rework_candidate_to_review`` cannot flip a ``rework_requested``
+issue to ``reviewing`` on a pass that built no packet. Net-new OrchestratorApp
+member added after the Track 2 Phase B surface baseline was pinned; declared
+here so the member-surface conservation check in
+tests/test_workflow_delegation_l00.py subtracts it before comparing moved
+delegates against the pre-campaign total.
