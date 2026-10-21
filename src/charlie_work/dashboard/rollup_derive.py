@@ -244,6 +244,8 @@ KNOWN_IGNORED: dict[str, str] = {
     "mergequeue_stalled": "merge-queue dwell alarm record; the heartbeat surfaces it",
     "mergequeue_requeue_capped": "merge-queue re-add cap record; the heartbeat surfaces it",
     "mergequeue_stall_alarm_failed": "advisory stall-alarm failure record (audit-only)",
+    "post_merge_followup_attribution": "experiment outcome record; the experiment report reads events live",
+    "post_merge_main_ci_failure": "experiment outcome record; the experiment report reads events live",
     "human_merge_required": "human-merge hand-off record (audit-only per its emit site)",
     "human_merge_label_removed": "human-merge bookkeeping",
     "unauthorized_merge_queue_sync_covered": "repeated every pass for the same PR; recon section 4 noise",

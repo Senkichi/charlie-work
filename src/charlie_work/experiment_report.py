@@ -40,19 +40,22 @@ Design invariants:
   records an ``*_arm`` key (e.g. the planned ``brief_arm``, issue #1276).
 * **Outcomes vs. activity.**  Every metric is labelled ``"activity"`` or
   ``"outcome"``.  Outcome metrics measure *whether the review was right*
-  and are the only signals allowed to drive the stopping rule.  Only one
-  outcome signal is derivable today -- an approved branch found to
-  silently revert a base commit.  ``check_failure_rework_requested`` is
-  deliberately **not** an outcome: its own rework brief says the approval
-  stands ("do not re-litigate the review"), so it is pipeline state, not
-  evidence the review was wrong.  ``no_op_rework_repair_requested``
-  measures an empty rework *cycle*, not a wrong kickback.  Where no
-  outcome metric is derivable, the report says so explicitly and the
-  stopping rule stays ``not_met`` -- activity metrics never imply a
-  conclusion they cannot support.  "Derivable" means the emitter exists;
-  the report additionally distinguishes *events observed in the window*
-  from a merely-derivable metric, because an outcome channel that never
-  fires cannot conclude the experiment either way.
+  and are the only signals allowed to drive the stopping rule.  The
+  events under ``REVIEW_DEFECT_KINDS`` are the recorded outcome signals
+  (issue #1717 landed the post-merge recording): an approved branch found
+  to silently revert a base commit, a main-branch CI failure on a required
+  check attributable to the merged PR, and a follow-up fix or revert PR
+  naming that merged PR -- each a miss an approval cannot have gotten.  ``check_failure_rework_requested`` is deliberately **not** an
+  outcome: its own rework brief says the approval stands ("do not
+  re-litigate the review"), so it is pipeline state, not evidence the
+  review was wrong.  ``no_op_rework_repair_requested`` measures an empty
+  rework *cycle*, not a wrong kickback.  Where no outcome metric is
+  derivable, the report says so explicitly and the stopping rule stays
+  ``not_met`` -- activity metrics never imply a conclusion they cannot
+  support.  "Derivable" means the emitter exists; the report additionally
+  distinguishes *events observed in the window* from a merely-derivable
+  metric, because an outcome channel that never fires cannot conclude the
+  experiment either way.
 * **Merged status comes from state.json, not only from events.**  Most
   merges land through the Aviator merge queue, which emits no
   ``merge_succeeded`` event, so the merge-event vocabulary alone
@@ -109,9 +112,19 @@ from .experiment_report_stopping import (
 
 # Post-approval signals that measure review correctness -- the only kind
 # allowed into the outcome aggregate and the stopping rule.
+#
+# ``post_merge_main_ci_failure`` and ``post_merge_followup_attribution``
+# (issue #1717) are recorded by
+# ``post_merge_attribution_scan``/``orchestration.post_merge_attribution``:
+# a merged PR whose merge commit failed a required check on main, and an
+# open follow-up fix/revert PR naming the merged PR. Each is an exit-path
+# miss the approval could not have prevented -- same error class as the
+# silent-revert signal already here.
 REVIEW_DEFECT_KINDS = frozenset(
     {
         "cross_pr_revert_rework_requested",
+        "post_merge_followup_attribution",
+        "post_merge_main_ci_failure",
     }
 )
 
@@ -599,12 +612,15 @@ def build_report(
     metrics["post_approval_defect_rate"] = _rate_metric(
         "post_approval_defect_rate",
         "outcome",
-        "share of approved PRs later routed to rework by a post-approval "
-        "review-correctness defect signal (cross_pr_revert_rework_requested: "
-        "the approved branch silently reverted a base commit) -- an approval "
-        "that did not hold up. check_failure_rework_requested is excluded "
-        "by construction: its rework brief keeps the approval standing, so "
-        "it measures pipeline state, not whether the review was right",
+        "share of assigned PRs whose recorded outcome is a review-correctness "
+        "defect (REVIEW_DEFECT_KINDS: cross_pr_revert_rework_requested -- the "
+        "approved branch silently reverted a base commit; plus #1717's "
+        "post_merge_main_ci_failure -- a required main-branch check failed on "
+        "the merged PR -- and post_merge_followup_attribution -- a later "
+        "fix/revert PR naming that merged PR): an approval or merge that did "
+        "not hold up. check_failure_rework_requested is excluded by "
+        "construction: its rework brief keeps the approval standing, so it "
+        "measures pipeline state, not whether the review was right",
         arms,
         review_defect_k,
         approved_n,

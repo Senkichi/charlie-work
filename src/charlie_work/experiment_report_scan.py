@@ -10,12 +10,21 @@ event dicts.
 
 ## Post-approval signal taxonomy
 
-Post-approval rework events are partitioned by *what they measure*,
-because only review-correctness signals may drive the stopping rule:
+Post-approval events are partitioned by *what they measure*, because only
+review-correctness signals may drive the stopping rule:
 
 * ``cross_pr_revert_rework_requested`` -- an approved branch was found to
   silently revert a base commit.  Approving that branch was a review
-  miss: this is the only derivable **outcome** signal today.
+  miss: a review-correctness **outcome**.
+* ``post_merge_main_ci_failure`` -- a merged PR's merge commit failed
+  main-branch CI on a required check (recorded by the #1717 pass lane).
+  The reviewers approved code whose merge did not hold up on main: the
+  second recorded **outcome** signal.
+* ``post_merge_followup_attribution`` -- an open fix/revert-style PR
+  names a merged PR (keyword-reference recording, #1717): the approval
+  did not survive contact with later work, so it is the third recorded
+  **outcome** signal.  A keyword heuristic, so its attribution is
+  recorded with the exact matched text for audit.
 * ``check_failure_rework_requested`` -- required checks genuinely failed
   on the approved head (``merge_ready`` path, issue #674).  The rework
   brief it emits says "The code changes are already approved; do not
@@ -79,26 +88,15 @@ NO_OUTCOME_STATEMENT = (
     "stopping rule cannot be met on activity metrics alone"
 )
 
-# Outcome candidates the recorded event stream cannot produce today.  The
-# report states this explicitly rather than implying a conclusion from
-# activity metrics (issue #1701's contract); issue #1717 tracks adding the
-# missing recording.
-NOT_DERIVABLE: tuple[dict[str, str], ...] = (
-    {
-        "candidate": "post-merge main-branch CI failure attributed to the merged PR",
-        "reason": (
-            "no recorded event links a main-branch check failure after a merge "
-            "back to the PR that merged (recording tracked by issue #1717)"
-        ),
-    },
-    {
-        "candidate": "follow-up fix or revert naming the merged PR",
-        "reason": (
-            "no recorded event attributes a later fix or revert commit/PR to a "
-            "previously merged PR (recording tracked by issue #1717)"
-        ),
-    },
-)
+# Outcome candidates the recorded event stream could not produce when the
+# report first shipped (issue #1701's contract -- the report must never
+# imply a conclusion from activity metrics).  Issue #1717 landed the
+# recording for the two remaining candidates
+# (``post_merge_main_ci_failure`` / ``post_merge_followup_attribution``,
+# folded into REVIEW_DEFECT_KINDS above in experiment_report.py), so this
+# is deliberately empty and the list stays typed for a future candidate
+# whose recording still has to be built.
+NOT_DERIVABLE: tuple[dict[str, str], ...] = ()
 
 
 def _pr_of(payload: Mapping[str, Any], event: Mapping[str, Any]) -> int | None:
