@@ -1773,8 +1773,9 @@ class WorkerRoleConfig:
     harness: str = "manual"
     model: str = ""
     # Issue #2086: role chain, see role_chain.py. ``Verbatim`` because rescue.worker /
-    # rescue.reviewer reuse this class and never parsed ``fallbacks`` (main stores the raw
-    # value); the top-level ``worker:`` section opts in with a use-site ``Entries``.
+    # rescue.reviewer reuse this class and treat ``fallbacks`` as a forbidden key turned
+    # away by RescueConfig.validate (issue #2118); the top-level ``worker:`` section opts
+    # in with a use-site ``Entries`` (which overrides ``Verbatim``).
     fallbacks: Annotated[tuple[RoleEntry, ...], Verbatim] = ()
     chain = property(chain_of)
 
@@ -1874,6 +1875,13 @@ class RescueConfig:
     ``claude_code.launch_claude_worker`` -- so ``ReviewerRoleConfig``'s
     claude-code-only harness restriction and its effort/experiment fields
     would both be wrong here.
+
+    Issue #2118: ``fallbacks`` is a forbidden key at both rescue use-sites
+    (``validate()`` below). Rescue dispatch consumes only the flat fields
+    above -- no consumer reads the nested roles or their ``fallbacks`` --
+    so option (a) (parse + ``check_role_chain``) would validate config that
+    is never launched, while option (b) (reject the key, like an unknown
+    one) matches how rescue dispatch actually consumes roles.
     """
 
     enabled: Annotated[bool, Typed] = False
@@ -1900,6 +1908,25 @@ class RescueConfig:
     reviewer: Annotated[WorkerRoleConfig, LenientMapping] = field(
         default_factory=lambda: WorkerRoleConfig(harness="devin", model="codex")
     )
+
+    def validate(self, config: OrchestratorConfig) -> None:
+        """``fallbacks`` is a forbidden key at both rescue use-sites (issue #2118).
+
+        Rejected exactly like an unknown key whenever the key appears at all:
+        absent builds the field default ``()``; an explicit ``fallbacks: null``
+        is preserved as ``None`` (design P2); anything else is kept as written
+        by the class's ``Verbatim`` annotation and lands here unchecked. Field
+        keys are relative -- ``run_section_hooks`` adds the ``rescue.`` prefix.
+        """
+        for name in ("worker", "reviewer"):
+            fallbacks = getattr(getattr(self, name), "fallbacks")
+            if fallbacks != ():
+                raise FieldError(
+                    f"{name}.fallbacks",
+                    f"absent ({name} takes no fallbacks)",
+                    fallbacks,
+                    "raw",
+                )
 
 
 @dataclass(frozen=True)
