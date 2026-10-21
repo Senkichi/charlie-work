@@ -46,7 +46,7 @@ from unittest import mock
 import pytest
 
 from charlie_work.config import OrchestratorConfig, build_config_from_data
-from charlie_work.config_validation import ConfigError, ConstructionError
+from charlie_work.config_validation import ConfigError, ConstructionError, NotNull
 
 FIXTURE = Path(__file__).parent / "fixtures" / "config_rejection_matrix.json"
 
@@ -578,6 +578,60 @@ def test_probe_replay_detects_a_loosened_validator(recorded, monkeypatch):
         )
     ]
     assert len(mismatches) > 100
+
+
+def test_probe_replay_detects_a_rescuable_flip(recorded, monkeypatch):
+    """Specificity control: flipping a recorded RC into a rescuable R must surface too,
+    not only a loosened validator. A use-site ``NotNull`` on
+    ``runner_allocation.reserved_threads`` is exactly that flip (cfg review R2-B1):
+    the field is ci-fleet-owned, so a null reaches its ``__post_init__`` and the
+    TypeError is wrapped as a non-rescuable ``ConstructionError`` (RC), while the
+    NotNull rule fires inside ``validate_section`` and raises a rescuable
+    ``FieldError`` (R) -- which would flip the #665 layered rescue to
+    silently-discarding-global with no signal, if the replay missed it."""
+    import charlie_work.config as config_module
+
+    real = config_module.field_rules
+
+    def notnull_on_reserved_threads(cls, name):
+        rules = real(cls, name)
+        if cls is OrchestratorConfig and name == "runner_allocation":
+            return {**rules, "reserved_threads": (*rules.get("reserved_threads", ()), NotNull)}
+        return rules
+
+    monkeypatch.setattr(config_module, "field_rules", notnull_on_reserved_threads)
+    with pytest.raises(
+        AssertionError, match=r"runner_allocation\.reserved_threads <- none: recorded RC, now R"
+    ):
+        test_key_probe_matrix_unchanged(recorded)
+
+
+def test_same_on_non_equal_pairs():
+    """Pin every non-equal code pair: only exact equality and the documented
+    X -> clean-rejection upgrade are true; anything else (in particular RC <-> R,
+    the two rescue classes) must be False or the replay could hide a flip."""
+    assert not same("RC", "R")
+    assert not same("R", "RC")
+    assert same("X", "R")  # documented: a clean rejection replacing a crash is fine
+    assert same("X", "RC")
+    assert not same("R", "X")
+    assert not same("RC", "X")
+
+
+def test_code_of_records_raw_valueerror_and_typeerror_as_rc(monkeypatch):
+    """A raw ``ValueError``/``TypeError`` that escaped before the wrap is recorded
+    RC (docstring's third class), not R and not X."""
+
+    def raise_valueerror(data):
+        raise ValueError("boom")
+
+    def raise_typeerror(data):
+        raise TypeError("boom")
+
+    monkeypatch.setitem(globals(), "build_config_from_data", raise_valueerror)
+    assert _code_of({}) == "RC"
+    monkeypatch.setitem(globals(), "build_config_from_data", raise_typeerror)
+    assert _code_of({}) == "RC"
 
 
 def test_key_probe_matrix_unchanged(recorded):
