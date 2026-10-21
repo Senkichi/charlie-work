@@ -159,6 +159,7 @@ KNOWN_IGNORED: dict[str, str] = {
     "intake": "intake-lane bookkeeping",
     "intake_failed": "intake-lane bookkeeping",
     "intake_prose_only_deps": "intake-lane bookkeeping",
+    "intake_prose_only_deps_cleared": "intake-lane bookkeeping",
     "blocker_cycle": "dependency-graph diagnostic",
     "dispatch_skip_blocked": "dispatch-skip record; dispatchable counts come from pass_samples",
     "dispatch_skip_operator_claimed": "dispatch-skip record; dispatchable counts come from pass_samples",

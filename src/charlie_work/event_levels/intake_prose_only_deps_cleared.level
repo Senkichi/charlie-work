@@ -1,0 +1,9 @@
+info
+# Issue #1902: a prior intake pass flagged this issue with
+# agent:prose-only-deps, and this pass's re-check no longer trips it --
+# the prose trigger was reworded away, or structured blockers are now
+# declared -- so the terminal hold label was removed. Info, not warning:
+# this is the heuristic correcting its own false positive on the issue
+# #1819 shape (its own body once tripped Pattern 3), the sanctioned
+# counterpart of the info-level intake_prose_only_deps flag, never a
+# condition that lost work.
