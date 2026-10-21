@@ -63,6 +63,25 @@ def test_fallbacks_parse_into_frozen_entries_in_order() -> None:
         config.worker.fallbacks[0].model = "x"  # type: ignore[misc]
 
 
+@pytest.mark.parametrize(
+    ("section", "match"),
+    [
+        pytest.param("worker", r"^worker\.model: expected string, got 5 \(int\)$", id="worker"),
+        pytest.param(
+            "reviewer", r"^reviewer\.model: expected string, got 5 \(int\)$", id="reviewer"
+        ),
+    ],
+)
+def test_non_string_primary_model_is_a_configerror(section: str, match: str) -> None:
+    """Issue #2117: without a ``Typed`` marker, ``worker.model``/``reviewer.model`` store a
+    non-string value as-is; it later reaches ``role_chain.model_family``'s
+    ``entry.model.strip()`` (via ``check_reviewer_role_chain``'s ``warn_same_family`` call,
+    which always runs during build) and crashes with a raw ``AttributeError`` instead of being
+    rejected as a ``ConfigError`` naming the offending key at the config boundary."""
+    with pytest.raises(ConfigError, match=match):
+        build_config_from_data({section: {"model": 5}})
+
+
 # Explicit ids keep every leaf's node id as it was when ``match`` was a loose substring
 # (the collect-only gate treats a renamed leaf as a deletion); ``match`` itself is now
 # anchored to the key path the section validator reports (ADR-0007).
