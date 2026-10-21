@@ -2540,6 +2540,8 @@ class OrchestratorApp:
 
         # Fetch diff for patch-id based no-op rework detection (issue #222)
         # This is needed before the janitor gate to detect actual content changes
+        # Issue #1807: a None here is a *fetch failure*, not an empty diff
+        # -- the #1807 gate below refuses to build a packet from it.
         diff = self.gh.pr_diff(pr_number)
 
         # Deterministic janitor gate BEFORE any packet spend: an
@@ -3402,6 +3404,10 @@ class OrchestratorApp:
                     "is_no_op_rework": verdict.is_no_op_rework,
                 },
             )
+        # Issue #1807: no packet from a fetch-failure None (the delegate
+        # module owns the #1251 empty-diff skip-forever rationale).
+        if diff is None:
+            return self._diff_unavailable_no_packet_result(pr_number, issue_number)
         pr_dir = self.paths.prs / f"pr-{pr_number}"
         pr_dir.mkdir(parents=True, exist_ok=True)
         # Issue #592: stamp the digest of the resolved review template +

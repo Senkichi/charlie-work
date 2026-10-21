@@ -25,6 +25,7 @@ def intake(self) -> CommandResult:
     written: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
     prose_only_deps_issues: list[int] = []
+    prose_only_deps_cleared: list[int] = []
     # Gather all network results and write files outside the lock
     for issue in issues:
         issue_number = int(issue["number"])
@@ -44,11 +45,13 @@ def intake(self) -> CommandResult:
 
         # Check for prose-only dependencies (issue #225)
         body_text = full_issue.get("body", "")
-        has_prose_deps = _wf.detect_prose_only_dependencies(body_text)
-        has_structured_blockers = bool(_wf.parse_blockers(body_text))
+        prose_deps_hold = _wf.detect_prose_only_dependencies(body_text) and not bool(
+            _wf.parse_blockers(body_text)
+        )
+        holds_prose_deps_label = self.config.labels.prose_only_deps in _wf.label_names(full_issue)
 
         # If prose-only dependencies exist without structured blockers, label for human attention
-        if has_prose_deps and not has_structured_blockers:
+        if prose_deps_hold:
             prose_only_deps_issues.append(issue_number)
             try:
                 # Issue #2226: gate-bound — state_path/repo auto-bound; dry-run no-ops.
@@ -61,6 +64,26 @@ def intake(self) -> CommandResult:
                 )
             except Exception:
                 # Label add failure is non-blocking for intake
+                pass
+        elif holds_prose_deps_label:
+            # Issue #1902: the hold is re-evaluated, not a one-way ratchet.
+            # This pass's re-check no longer trips (the prose trigger was
+            # reworded away, or structured blockers now exist), so the
+            # terminal label loses its cause and is stripped -- without this
+            # removal path the only way out was a human running raw
+            # ``gh issue edit --remove-label``. Intake is the sole writer of
+            # this label, so its re-check is the single removal point.
+            prose_only_deps_cleared.append(issue_number)
+            try:
+                self.write_gate.apply_issue_labels(
+                    self.gh,
+                    self.config.labels,
+                    issue_number,
+                    remove=(self.config.labels.prose_only_deps,),
+                    cause="intake_prose_only_deps_cleared",
+                )
+            except Exception:
+                # Label remove failure is non-blocking for intake
                 pass
 
         written.append(
@@ -126,6 +149,12 @@ def intake(self) -> CommandResult:
                     "intake_prose_only_deps",
                     {"issue_numbers": sorted(prose_only_deps_issues)},
                 )
+            if prose_only_deps_cleared:
+                state = self._record_event(
+                    state,
+                    "intake_prose_only_deps_cleared",
+                    {"issue_numbers": sorted(prose_only_deps_cleared)},
+                )
             for cycle in blocker_cycles:
                 state = self._record_event(
                     state,
@@ -151,6 +180,11 @@ def intake(self) -> CommandResult:
         message = f"intake completed with {len(failed)} failure(s)"
     if prose_only_deps_issues:
         message += f", {len(prose_only_deps_issues)} issue(s) labeled with prose-only dependencies"
+    if prose_only_deps_cleared:
+        message += (
+            f", {len(prose_only_deps_cleared)} issue(s) cleared of the "
+            "prose-only-dependencies hold"
+        )
     return CommandResult(
         not failed,
         message,
@@ -158,6 +192,7 @@ def intake(self) -> CommandResult:
             "issues": written,
             "failed": failed,
             "prose_only_deps_issues": prose_only_deps_issues,
+            "prose_only_deps_cleared_issues": prose_only_deps_cleared,
             "blocker_cycles": blocker_cycles,
             "blocker_cycles_truncated": blocker_cycle_scan.truncated,
         },
