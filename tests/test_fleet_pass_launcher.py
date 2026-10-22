@@ -124,3 +124,63 @@ def test_module_entry_point_exists() -> None:
     assert main_module.is_file(), "src/charlie_work/__main__.py is required by the launcher"
     source = main_module.read_text(encoding="utf-8")
     assert "main" in source, "__main__.py must dispatch to the CLI entry point"
+
+
+def test_fleet_pass_wraps_launch_in_secretenv_guarded() -> None:
+    """Issue #2795: fleet-pass.ps1 must inject the secretenv provider key.
+
+    The `api` adapter resolves the provider key from the supervisor's own env
+    (`os.environ.get(provider.api_key_env)`), and the key lives only in the
+    DPAPI secretenv store -- so the scheduled-task-spawned supervisor cannot
+    run `harness: api` launches unless the launcher wraps the supervisor in
+    `secretenv run`. The wrap must be guarded (never double-wrap an env that
+    already has the key, never allow a missing/undecryptable secret to strand
+    the whole fleet) and must never emit the secret value.
+    """
+    script = SCRIPTS_DIR / "fleet-pass.ps1"
+    code = _command_lines(script)
+    key = "EMPERICUS_ANTHROPIC_API_KEY"
+    assert "Join-Path $env:USERPROFILE '.local\\bin\\secretenv.exe'" in code, (
+        "fleet-pass.ps1 must resolve secretenv.exe from the per-user install path "
+        "(Join-Path $env:USERPROFILE '.local\\bin\\secretenv.exe'), not from PATH"
+    )
+    assert f"{key} *> $null" in code, (
+        "fleet-pass.ps1 must verify the secret with "
+        "`secretenv verify EMPERICUS_ANTHROPIC_API_KEY *> $null` so nothing is emitted"
+    )
+    assert f"secretenv run {key} -- cmd /c $cmdLine" in code, (
+        "fleet-pass.ps1 must launch the supervisor via "
+        "`secretenv run EMPERICUS_ANTHROPIC_API_KEY -- cmd /c $cmdLine` (issue #2795)"
+    )
+    # Guard 1: never double-wrap an env that already has the key.
+    assert "-not [Environment]::GetEnvironmentVariable('" + key + "')" in code, (
+        "the secretenv wrap must require the key to be ABSENT from the process env "
+        "(don't double-wrap an env that already has it)"
+    )
+    # Guard 2: the run path is only taken when verify exited 0.
+    assert "$LASTEXITCODE) -eq 0" in code or "$LASTEXITCODE -eq 0" in code, (
+        "the secretenv run must be gated on `secretenv verify ...` exiting 0"
+    )
+
+
+def test_fleet_pass_keeps_plain_launch_fallback() -> None:
+    """Issue #2795: a missing secret must never strand the whole fleet.
+
+    When any guard fails (key already present, secretenv.exe missing, secret
+    absent/undecryptable) the launcher must still start the supervisor via the
+    plain cmd invocation; a missing key only makes `harness: api` launches
+    self-limit with an error record.
+    """
+    script = SCRIPTS_DIR / "fleet-pass.ps1"
+    code = _command_lines(script)
+    assert "& cmd /c $cmdLine" in code, (
+        "fleet-pass.ps1 must keep the plain `& cmd /c $cmdLine` launch path so the "
+        "supervisor still starts without the secretenv key"
+    )
+    assert "} else {" in code, (
+        "the secretenv run must be an if/else whose else branch is the plain launch"
+    )
+    assert "exit=$LASTEXITCODE" in script.read_text(encoding="utf-8"), (
+        "fleet-pass.ps1 must keep the trailing `exit=$LASTEXITCODE` log marker "
+        "(secretenv propagates the child exit code)"
+    )
