@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 from charlie_work import role_chain, role_quota_ledger, role_selection
-from charlie_work.config import ConfigError, build_config_from_data
+from charlie_work.config import ConfigError, WorkerRoleConfig, build_config_from_data
 from charlie_work.role_chain import RoleEntry
 from charlie_work.role_selection import select_role_entry
 
@@ -153,17 +153,116 @@ def test_null_fallbacks_normalize_to_an_empty_chain(section: str) -> None:
     assert len(role.chain) == 1
 
 
+@pytest.mark.parametrize(
+    ("section", "fallbacks"),
+    [
+        pytest.param("worker", 5, id="int"),
+        pytest.param("worker", [{"harness": "bogus"}], id="malformed-list"),
+        pytest.param("worker", None, id="null"),
+        pytest.param("worker", [], id="empty"),
+        pytest.param("reviewer", 5, id="reviewer-int"),
+        pytest.param("reviewer", [{"harness": "bogus"}], id="reviewer-malformed-list"),
+        pytest.param("reviewer", None, id="reviewer-null"),
+        pytest.param("reviewer", [], id="reviewer-empty"),
+    ],
+)
+def test_rescue_roles_reject_fallbacks(section: str, fallbacks: object) -> None:
+    """Issue #2118: ``fallbacks`` is a forbidden key at the rescue use-sites.
+
+    No ``src/`` consumer reads the nested ``config.rescue.worker``/``.reviewer``
+    roles (rescue dispatch consumes the flat ``rescue.*`` fields), so the key is
+    rejected like an unknown key instead of being parsed and chain-checked.
+    """
+    with pytest.raises(ConfigError, match=rf"^rescue\.{section}\.fallbacks: "):
+        build_config_from_data({"rescue": {section: {"fallbacks": fallbacks}}})
+
+
 def test_rescue_roles_keep_fallbacks_unparsed() -> None:
-    """Known gap carried over from #2088: rescue.* stores ``fallbacks`` as written."""
+    """Leaf name kept verbatim for the collect-only gate (issue #1538).
+
+    The #2118 fix changed what this name used to pin ("rescue.* stores
+    ``fallbacks`` as written", the known gap from #2088), so the body asserts
+    the replacement truth: the unparsed-verbatim storage is gone and the raw
+    value is rejected instead. Precedent for restoring a renamed leaf with the
+    body updated to the post-change truth: 141ac0202c, 50bb9fa0d, b0ddd09de.
+    """
     raw = [{"harness": "not-a-harness"}]
-    config = build_config_from_data({"rescue": {"worker": {"fallbacks": raw}}})
-    assert config.rescue.worker.fallbacks == raw
+    with pytest.raises(ConfigError, match=r"^rescue\.worker\.fallbacks: "):
+        build_config_from_data({"rescue": {"worker": {"fallbacks": raw}}})
+
+
+def test_rescue_roles_without_fallbacks_still_load() -> None:
+    """The fix must not narrow the accepted rescue section: an absent ``fallbacks``
+    key (the only accepted spelling) builds the roles exactly as before."""
+    config = build_config_from_data(
+        {
+            "rescue": {
+                "worker": {"harness": "claude-code", "model": "claude-opus-5-5"},
+                "reviewer": {"harness": "devin", "model": "codex"},
+                "enabled": True,
+            }
+        }
+    )
+    assert config.rescue.worker == WorkerRoleConfig(harness="claude-code", model="claude-opus-5-5")
+    assert config.rescue.reviewer == WorkerRoleConfig(harness="devin", model="codex")
 
 
 def test_reviewer_fallback_harness_must_be_review_capable() -> None:
     """``command`` is a worker harness but cannot review: reviewer chains reject it."""
     with pytest.raises(ConfigError, match=r"^reviewer\.fallbacks\[0\]\.harness: expected one of "):
         build_config_from_data({"reviewer": {"fallbacks": [{"harness": "command"}]}})
+
+
+# Issue #2117: the primaries' ``model`` fields carry ``Typed``/``NotNull`` metadata
+# so a non-string is a FieldError at the boundary; without it the raw value survived
+# the build and only crashed ``model_family`` with a bare AttributeError later.
+# Fallbacks entries are checked separately (``worker-fallbacks8-must be a string``
+# above); rescue reuses ``WorkerRoleConfig``, so it is covered by the same marker.
+@pytest.mark.parametrize(
+    ("raw", "match"),
+    [
+        pytest.param(
+            {"worker": {"model": 5}},
+            r"^worker\.model: expected string, got 5 \(int\)$",
+            id="worker-int",
+        ),
+        pytest.param(
+            {"reviewer": {"model": 5}},
+            r"^reviewer\.model: expected string, got 5 \(int\)$",
+            id="reviewer-int",
+        ),
+        pytest.param(
+            {"worker": {"model": None}},
+            r"^worker\.model: expected a value, got null$",
+            id="worker-null",
+        ),
+        pytest.param(
+            {"reviewer": {"model": None}},
+            r"^reviewer\.model: expected a value, got null$",
+            id="reviewer-null",
+        ),
+        pytest.param(
+            {"rescue": {"worker": {"model": 5}}},
+            r"^rescue\.worker\.model: expected string, got 5 \(int\)$",
+            id="rescue-worker-int",
+        ),
+        pytest.param(
+            {"rescue": {"reviewer": {"model": 5}}},
+            r"^rescue\.reviewer\.model: expected string, got 5 \(int\)$",
+            id="rescue-reviewer-int",
+        ),
+    ],
+)
+def test_non_string_role_model_rejected_at_build(raw: dict, match: str) -> None:
+    with pytest.raises(ConfigError, match=match):
+        build_config_from_data(raw)
+
+
+def test_empty_string_worker_model_still_means_harness_default() -> None:
+    """Positive control: the Typed marker checks the type, it does not change the
+    empty-string-is-default contract of ``worker.model``."""
+    config = build_config_from_data({"worker": {"model": ""}})
+    assert config.worker.model == ""
 
 
 def test_same_family_fallback_warns_but_loads(caplog: pytest.LogCaptureFixture) -> None:
