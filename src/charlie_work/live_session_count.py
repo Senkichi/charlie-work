@@ -94,8 +94,8 @@ def count_live_sessions_with_adapter_kinds(
     """One ``iter_workers`` pass returning the corroborated total AND the per-kind counts.
 
     The single-pass body behind :func:`count_live_sessions` (which returns the
-    total) and :func:`count_live_sessions_by_adapter_kind` (which returns the
-    per-``adapter_kind`` breakdown): one sidecar walk feeds both results, then
+    total) and the fleet governor's also-needed per-``adapter_kind`` breakdown:
+    one sidecar walk feeds both results, then
     the ghost corroboration adds to the total only (issue #2764 -- a caller
     that needs both numbers, the fleet governor, walks the sessions dir once).
 
@@ -158,19 +158,3 @@ def count_live_sessions(directory: Path, state_file: Path | None, kind: LiveSess
     #2764): the total half of its single sidecar pass, unchanged in behavior.
     """
     return count_live_sessions_with_adapter_kinds(directory, state_file, kind)[0]
-
-
-def count_live_sessions_by_adapter_kind(directory: Path) -> dict[str, int]:
-    """Live sidecar sessions under ``directory``, keyed by ``WorkerView.adapter_kind``.
-
-    The per-harness view (issue #2757) of the sidecar pass in
-    :func:`count_live_sessions`: the same ``iter_workers`` + ``is_alive`` rule,
-    so a per-harness count can never disagree with the total about what "live"
-    means. Thin wrapper over :func:`count_live_sessions_with_adapter_kinds`
-    (issue #2764): the per-kind half of its single sidecar pass, with no
-    ``state_file`` -- the state.json ghost corroboration is deliberately NOT
-    applied, because a ghost has no sidecar and therefore no known adapter, so
-    it counts toward the total cap (which does corroborate) but cannot be
-    attributed to a harness.
-    """
-    return count_live_sessions_with_adapter_kinds(directory, None, WORKER_LANE)[1]

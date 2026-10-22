@@ -211,9 +211,13 @@ def _live(
     fake_host, *, devin: int = 0, opencode: int = 0, total: int | None = None
 ) -> FakeSessionCounter:
     by_kind = {k: v for k, v in {"devin": devin, "opencode": opencode}.items() if v}
+    live_total = devin + opencode if total is None else total
     counter = FakeSessionCounter(
-        fleet_workers=(devin + opencode if total is None else total, []),
-        fleet_workers_by_adapter_kind=(by_kind, []),
+        fleet_workers=(live_total, []),
+        # The combined one-walk tuple is scripted explicitly: the fake's default
+        # derives it from fleet_workers alone (empty kinds), and the governor
+        # now reads only this one surface (issue #2764).
+        fleet_workers_with_adapter_kinds=(live_total, by_kind, []),
     )
     fake_host(sessions=counter)
     return counter
@@ -236,8 +240,25 @@ def test_unset_map_changes_nothing(tmp_path: Path, fake_host) -> None:
         assert not permit.governor.harness_enabled
         assert "harness_concurrency_limits" not in permit.governor.report_fields()
         assert permit._ledger.harness_free == {}
-    # No registry walk for per-harness counts when nothing is configured.
-    assert not any(name == "fleet_live_workers_by_adapter_kind" for name, _ in counter.calls)
+    # The combined one-walk port is engaged exactly once by the total cap; the
+    # unset map only suppresses the per-harness report fields.
+    assert sum(name == "fleet_live_workers_with_adapter_kinds" for name, _ in counter.calls) == 1
+
+
+def test_no_total_cap_and_no_map_never_walks_the_fleet(tmp_path: Path, fake_host) -> None:
+    """Issue #2764 mutation gate: with ``fleet.global_max_concurrent_sessions = 0``
+    and no harness map, the governor has no fleet reason to measure and the
+    combined one-walk port method is NOT called.
+
+    Mutating the guard ``if fleet_max > 0 or harness_caps:`` to a blind
+    ``if True:`` (orchestration/reap_dispatch.py) calls it and fails this test.
+    """
+    counter = _live(fake_host, devin=1)
+    app = _app(tmp_path, DEVIN)
+    with _permit(app) as permit:
+        assert permit.max_launches == 5
+        assert not permit.governor.harness_enabled
+    assert not any(name == "fleet_live_workers_with_adapter_kinds" for name, _ in counter.calls)
 
 
 def test_devin_selected_launch_is_clamped_at_the_harness_cap(tmp_path: Path, fake_host) -> None:
@@ -437,7 +458,11 @@ def test_live_counts_by_adapter_kind_count_only_live_sidecars(
 
     views = [_View("devin"), _View("devin"), _View("devin", alive=False), _View("opencode")]
     monkeypatch.setattr("charlie_work.worker.iter_workers", lambda _dir: views)
-    assert live_session_count.count_live_sessions_by_adapter_kind(tmp_path) == {
+    total, counts = live_session_count.count_live_sessions_with_adapter_kinds(
+        tmp_path, None, live_session_count.WORKER_LANE
+    )
+    assert total == 3  # dead sidecar counted against the total, not any kind
+    assert counts == {
         "devin": 2,
         "opencode": 1,
     }
@@ -449,7 +474,7 @@ def test_fleet_live_counts_by_adapter_kind_sum_across_repos(
     import json
 
     from charlie_work import layout
-    from charlie_work.fleet_registry import count_fleet_live_sessions_by_adapter_kind
+    from charlie_work.fleet_registry import count_fleet_live_sessions_with_adapter_kinds
 
     fleet_dir = tmp_path / ".fleet"
     fleet_dir.mkdir(parents=True)
@@ -479,9 +504,10 @@ def test_fleet_live_counts_by_adapter_kind_sum_across_repos(
     monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", str(fleet_dir))
     monkeypatch.setattr("charlie_work.worker.iter_workers", lambda d: views_by_dir[Path(d)])
 
-    counts, skipped = count_fleet_live_sessions_by_adapter_kind(None)
+    total, counts, skipped = count_fleet_live_sessions_with_adapter_kinds(None)
 
     assert counts == {"devin": 3, "opencode": 1}
+    assert total == 4
     assert skipped == []
 
 
@@ -563,8 +589,8 @@ def test_governor_walks_the_registry_once_with_the_map_set(
     """Issue #2764: with the harness map set, ONE registry walk per governor call.
 
     The pre-fix governor walked the fleet registry twice under the fleet launch
-    lock -- once via ``count_fleet_live_sessions`` for the total, once via
-    ``count_fleet_live_sessions_by_adapter_kind`` for the breakdown -- and each
+    lock -- once via ``count_fleet_live_sessions`` for the total, once for the
+    per-``adapter_kind`` breakdown -- and each
     walk loads every registered repo's config and reads its sessions dir, so
     the doubled walk lengthens a lock other repos wait on
     (``fleet_lock_held`` deferrals of 15-111s when several launch together).

@@ -333,8 +333,7 @@ def _iter_registered_repo_contexts(
     """Yield ``(name_with_owner, repo_root, state_dir, repo_config)`` per registered repo.
 
     The shared per-repo resolution the fleet walkers all use:
-    ``count_fleet_live_sessions`` (via the combined walker it wraps),
-    ``count_fleet_live_sessions_with_adapter_kinds``, and
+    ``count_fleet_live_sessions`` (via the combined walker it wraps) and
     ``count_fleet_live_reviews``. A repo that cannot be resolved is
     appended to ``skipped_repos`` (the caller's operator-visibility list) and
     not yielded: ``repo_root`` missing or not a git worktree, ``state_dir``
@@ -447,25 +446,6 @@ def count_fleet_live_sessions(
         count_fleet_live_sessions_with_adapter_kinds(fleet_dir_override)
     )
     return total_live_count, skipped_repos
-
-
-def count_fleet_live_sessions_by_adapter_kind(
-    fleet_dir_override: str | None,
-) -> tuple[dict[str, int], list[str]]:
-    """Live worker sessions across all registered repos, keyed by ``adapter_kind``.
-
-    The per-harness twin of :func:`count_fleet_live_sessions` (issue #2757).
-    Thin wrapper over
-    :func:`fleet_live_counts.count_fleet_live_sessions_with_adapter_kinds`
-    (issue #2764): the per-kind half of its one registry walk -- same walk,
-    same skip semantics, same sidecar liveness rule (see
-    ``live_session_count.count_live_sessions_by_adapter_kind`` for why ghosts
-    are not attributed). Returns ``(counts_by_adapter_kind, skipped_repos)``.
-    """
-    _total_live_count, totals_by_kind, skipped_repos = (
-        count_fleet_live_sessions_with_adapter_kinds(fleet_dir_override)
-    )
-    return totals_by_kind, skipped_repos
 
 
 def count_fleet_live_reviews(
