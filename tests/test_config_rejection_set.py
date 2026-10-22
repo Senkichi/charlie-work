@@ -8,7 +8,16 @@ automatic signal: a probe matrix recorded against the pre-migration build code
 Each cell is one ``build_config_from_data`` call with one probe value placed at
 one key path, recorded as:
 
-* ``R``   -- rejected (``ValueError``/``TypeError``; ``ConfigError`` is a ``ValueError``)
+* ``R``   -- rejected by a rescuable ``ConfigError`` (a ``FieldError``; any
+  ConfigError that is not a ``ConstructionError``)
+* ``RC``  -- rejected by a non-rescuable class: a ``ConstructionError``, or a
+  raw ``ValueError``/``TypeError`` that escaped before the wrap. Both are
+  ``ValueError``, so an unqualified ``except`` cannot tell them apart -- but
+  the #665 layered-load rescue discards the global layer on ``ConfigError``
+  and re-raises a ``ConstructionError``, so turning an ``RC`` into an ``R``
+  (e.g. a use-site ``NotNull`` on a ``runner_allocation`` field) flips
+  layered-rescue behaviour from fail-loud to silently-discarding-global
+  (the #623 shape) while this matrix would have shown only ``R`` either way.
 * ``X``   -- crashed with some other exception (a clean rejection now also passes)
 * ``A<h>`` -- accepted; ``h`` digests the fields that differ from the default
   config, so a change in coercion (``str(item)``, ``float(x)``, ``.strip()``)
@@ -37,6 +46,7 @@ from unittest import mock
 import pytest
 
 from charlie_work.config import OrchestratorConfig, build_config_from_data
+from charlie_work.config_validation import ConfigError, ConstructionError, NotNull
 
 FIXTURE = Path(__file__).parent / "fixtures" / "config_rejection_matrix.json"
 
@@ -181,8 +191,10 @@ CASES: dict[str, dict] = {
     "reviewer_fallbacks_devin_primary": {
         "reviewer": {"harness": "devin", "fallbacks": [_FB]}
     },
-    # rescue.worker / rescue.reviewer reuse WorkerRoleConfig and store ``fallbacks`` unparsed
-    # (main's known gap): anything is accepted, verbatim, and a null stays ``None``.
+    # Issue #2118: rescue.worker / rescue.reviewer reuse WorkerRoleConfig, but the
+    # nested roles are never read at runtime, so ``fallbacks`` is a forbidden key at
+    # both rescue use-sites (RescueConfig.validate): every spelling rejects.
+    "rescue_worker_fallbacks_int": {"rescue": {"worker": {"fallbacks": 5}}},
     "rescue_worker_fallbacks_raw": {"rescue": {"worker": {"fallbacks": [{"harness": "bogus"}]}}},
     "rescue_worker_fallbacks_str": {"rescue": {"worker": {"fallbacks": "zz"}}},
     "rescue_reviewer_fallbacks_null": {"rescue": {"reviewer": {"fallbacks": None}}},
@@ -478,8 +490,15 @@ def code_of(raw: dict) -> str:
 def _code_of(raw: dict) -> str:
     try:
         cfg = build_config_from_data(copy.deepcopy(raw))
-    except (ValueError, TypeError):
+    except ConstructionError:
+        return "RC"
+    except ConfigError:
         return "R"
+    except (ValueError, TypeError):
+        # ConstructionError subclasses ConfigError, so a raw ValueError here is
+        # either a build failure that slipped past validate_section's wrap or an
+        # earlier structural escape -- not rescuable either way.
+        return "RC"
     except Exception:  # noqa: BLE001 - recorded as a crash class, not hidden
         return "X"
     return "A" + hashlib.md5(repr(_changed(cfg)).encode()).hexdigest()[:4]
@@ -488,7 +507,7 @@ def _code_of(raw: dict) -> str:
 def same(recorded: str, now: str) -> bool:
     if recorded == now:
         return True
-    return {recorded, now} <= {"R", "X"}  # a clean rejection replacing a crash is fine
+    return recorded == "X" and now in {"R", "RC"}  # a clean rejection replacing a crash is fine
 
 
 def compute() -> dict:
@@ -526,13 +545,15 @@ def recorded() -> dict:
 
 
 def test_probe_matrix_is_nontrivial(recorded):
-    """Positive control: the fixture contains both rejections and acceptances, broadly."""
+    """Positive control: the fixture contains both rejections and acceptances, broadly,
+    and both rescue classes among the rejections."""
     flat = [c for row in recorded["cells"].values() for c in row]
-    rejected = sum(1 for c in flat if c == "R")
+    rejected = sum(1 for c in flat if c in {"R", "RC"})
     accepted = sum(1 for c in flat if c.startswith("A"))
     assert len(recorded["targets"]) > 300
     assert rejected > 2000
     assert accepted > 5000
+    assert sum(1 for c in flat if c == "RC") > 0
     assert recorded["cases"]["deadlock"] == "R"
     assert recorded["cases"]["no_deadlock"].startswith("A")
 
@@ -559,6 +580,60 @@ def test_probe_replay_detects_a_loosened_validator(recorded, monkeypatch):
         )
     ]
     assert len(mismatches) > 100
+
+
+def test_probe_replay_detects_a_rescuable_flip(recorded, monkeypatch):
+    """Specificity control: an RC-class change must surface, not only a loosened
+    validator. A use-site ``NotNull`` on ``runner_allocation.reserved_threads``
+    (cfg review R2-B1): the NotNull rule fires inside ``validate_section`` and
+    raises a rescuable ``FieldError`` (R). Since #2116 a null on the knob builds
+    the default (so the mutated replay flips an accepted A code to R rather than
+    the pre-#2116 RC), and that rescuable-class change would flip the #665
+    layered rescue to silently-discarding-global with no signal, if the replay
+    missed it."""
+    import charlie_work.config as config_module
+
+    real = config_module.field_rules
+
+    def notnull_on_reserved_threads(cls, name):
+        rules = real(cls, name)
+        if cls is OrchestratorConfig and name == "runner_allocation":
+            return {**rules, "reserved_threads": (*rules.get("reserved_threads", ()), NotNull)}
+        return rules
+
+    monkeypatch.setattr(config_module, "field_rules", notnull_on_reserved_threads)
+    with pytest.raises(
+        AssertionError, match=r"runner_allocation\.reserved_threads <- none: recorded Ad751, now R"
+    ):
+        test_key_probe_matrix_unchanged(recorded)
+
+
+def test_same_on_non_equal_pairs():
+    """Pin every non-equal code pair: only exact equality and the documented
+    X -> clean-rejection upgrade are true; anything else (in particular RC <-> R,
+    the two rescue classes) must be False or the replay could hide a flip."""
+    assert not same("RC", "R")
+    assert not same("R", "RC")
+    assert same("X", "R")  # documented: a clean rejection replacing a crash is fine
+    assert same("X", "RC")
+    assert not same("R", "X")
+    assert not same("RC", "X")
+
+
+def test_code_of_records_raw_valueerror_and_typeerror_as_rc(monkeypatch):
+    """A raw ``ValueError``/``TypeError`` that escaped before the wrap is recorded
+    RC (docstring's third class), not R and not X."""
+
+    def raise_valueerror(data):
+        raise ValueError("boom")
+
+    def raise_typeerror(data):
+        raise TypeError("boom")
+
+    monkeypatch.setitem(globals(), "build_config_from_data", raise_valueerror)
+    assert _code_of({}) == "RC"
+    monkeypatch.setitem(globals(), "build_config_from_data", raise_typeerror)
+    assert _code_of({}) == "RC"
 
 
 def test_key_probe_matrix_unchanged(recorded):

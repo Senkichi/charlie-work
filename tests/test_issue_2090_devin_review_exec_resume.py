@@ -468,6 +468,15 @@ def test_the_allow_list_is_not_widened() -> None:
 
 def test_knob_defaults_to_two_and_validates() -> None:
     assert build_config_from_data({}).review_dispatch.review_exec_rejection_max_resumes == 2
+    # Issue #2116: YAML null on this non-Optional int knob used to build None and
+    # raise "<=' not supported between 'NoneType' and 'int'" inside the review pass;
+    # the validator's class-level null rule defaults it instead.
+    null = build_config_from_data({"review_dispatch": {"review_exec_rejection_max_resumes": None}})
+    assert (
+        null.review_dispatch.review_exec_rejection_max_resumes
+        == build_config_from_data({}).review_dispatch.review_exec_rejection_max_resumes
+        == 2
+    )
     zero = build_config_from_data({"review_dispatch": {"review_exec_rejection_max_resumes": 0}})
     assert zero.review_dispatch.review_exec_rejection_max_resumes == 0
     for bad in (-1, True, "2"):
