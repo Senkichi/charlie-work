@@ -96,6 +96,10 @@
 "labels",
 "merge_hold"
 ],
+"labels.priority_prefix": [
+"labels",
+"priority_prefix"
+],
 "labels.operator_queue": [
 "labels",
 "operator_queue"
@@ -111,6 +115,10 @@
 "labels.cross_repo_override": [
 "labels",
 "cross_repo_override"
+],
+"labels.model_tier_prefix": [
+"labels",
+"model_tier_prefix"
 ],
 "dispatch": [
 "dispatch"
@@ -206,10 +214,6 @@
 "dispatch.dependency_stall_minutes": [
 "dispatch",
 "dependency_stall_minutes"
-],
-"dispatch.require_worker_github_token": [
-"dispatch",
-"require_worker_github_token"
 ],
 "dispatch.archive_unreachable_local_commits": [
 "dispatch",
@@ -506,6 +510,10 @@
 "auto_merge",
 "mergequeue_label"
 ],
+"auto_merge.mergequeue_skip_line_label": [
+"auto_merge",
+"mergequeue_skip_line_label"
+],
 "auto_merge.queue_bot_login": [
 "auto_merge",
 "queue_bot_login"
@@ -513,6 +521,10 @@
 "auto_merge.mergequeue_wedge_hours": [
 "auto_merge",
 "mergequeue_wedge_hours"
+],
+"auto_merge.mergequeue_requeue_cap": [
+"auto_merge",
+"mergequeue_requeue_cap"
 ],
 "runtime": [
 "runtime"
@@ -642,6 +654,10 @@
 "runtime",
 "event_ring_size"
 ],
+"runtime.operator_worktree_roots": [
+"runtime",
+"operator_worktree_roots"
+],
 "runtime.throttle_resume_margin_s": [
 "runtime",
 "throttle_resume_margin_s"
@@ -716,6 +732,10 @@
 "claude_code",
 "worktrees_dir"
 ],
+"claude_code.host_io_worktrees": [
+"claude_code",
+"host_io_worktrees"
+],
 "claude_code.venv_source": [
 "claude_code",
 "venv_source"
@@ -727,10 +747,6 @@
 "claude_code.tee_stream_json": [
 "claude_code",
 "tee_stream_json"
-],
-"claude_code.host_io_worktrees": [
-"claude_code",
-"host_io_worktrees"
 ],
 "api_worker": [
 "api_worker"
@@ -1543,6 +1559,52 @@
 "fleet_supervisor",
 "reap_sweep_interval_seconds"
 ],
+"test_slots": [
+"test_slots"
+],
+"test_slots.enabled": [
+"test_slots",
+"enabled"
+],
+"test_slots.width": [
+"test_slots",
+"width"
+],
+"test_slots.min_items": [
+"test_slots",
+"min_items"
+],
+"test_slots.wait_timeout_seconds": [
+"test_slots",
+"wait_timeout_seconds"
+],
+"dashboard": [
+"dashboard"
+],
+"dashboard.enabled": [
+"dashboard",
+"enabled"
+],
+"dashboard.host": [
+"dashboard",
+"host"
+],
+"dashboard.port": [
+"dashboard",
+"port"
+],
+"dashboard.poll_interval_seconds": [
+"dashboard",
+"poll_interval_seconds"
+],
+"dashboard.collector_interval_seconds": [
+"dashboard",
+"collector_interval_seconds"
+],
+"dashboard.rollup_interval_seconds": [
+"dashboard",
+"rollup_interval_seconds"
+],
 "post_mortem": [
 "post_mortem"
 ],
@@ -1633,72 +1695,6 @@
 "supervisor.reap_sweep_interval_seconds": [
 "supervisor",
 "reap_sweep_interval_seconds"
-],
-"test_slots": [
-"test_slots"
-],
-"test_slots.enabled": [
-"test_slots",
-"enabled"
-],
-"test_slots.width": [
-"test_slots",
-"width"
-],
-"test_slots.min_items": [
-"test_slots",
-"min_items"
-],
-"test_slots.wait_timeout_seconds": [
-"test_slots",
-"wait_timeout_seconds"
-],
-"runtime.operator_worktree_roots": [
-"runtime",
-"operator_worktree_roots"
-],
-"dashboard": [
-"dashboard"
-],
-"dashboard.enabled": [
-"dashboard",
-"enabled"
-],
-"dashboard.host": [
-"dashboard",
-"host"
-],
-"dashboard.port": [
-"dashboard",
-"port"
-],
-"dashboard.poll_interval_seconds": [
-"dashboard",
-"poll_interval_seconds"
-],
-"dashboard.collector_interval_seconds": [
-"dashboard",
-"collector_interval_seconds"
-],
-"dashboard.rollup_interval_seconds": [
-"dashboard",
-"rollup_interval_seconds"
-],
-"labels.model_tier_prefix": [
-"labels",
-"model_tier_prefix"
-],
-"labels.priority_prefix": [
-"labels",
-"priority_prefix"
-],
-"auto_merge.mergequeue_skip_line_label": [
-"auto_merge",
-"mergequeue_skip_line_label"
-],
-"auto_merge.mergequeue_requeue_cap": [
-"auto_merge",
-"mergequeue_requeue_cap"
 ]
 },
 "seeds": {
@@ -1713,10 +1709,12 @@
 "labels.human_needed": {},
 "labels.prose_only_deps": {},
 "labels.merge_hold": {},
+"labels.priority_prefix": {},
 "labels.operator_queue": {},
 "labels.collect_gate_exempt": {},
 "labels.review_ready": {},
 "labels.cross_repo_override": {},
+"labels.model_tier_prefix": {},
 "dispatch": {},
 "dispatch.default_limit": {},
 "dispatch.branch_prefix": {},
@@ -1741,7 +1739,6 @@
 "dispatch.worker_prompt_max_comment_chars": {},
 "dispatch.dispatch_staleness_minutes": {},
 "dispatch.dependency_stall_minutes": {},
-"dispatch.require_worker_github_token": {},
 "dispatch.archive_unreachable_local_commits": {},
 "dispatch.resume_throttled_attempts": {},
 "review": {},
@@ -1816,8 +1813,10 @@
 "auto_merge.update_open_prs": {},
 "auto_merge.require_current_base": {},
 "auto_merge.mergequeue_label": {},
+"auto_merge.mergequeue_skip_line_label": {},
 "auto_merge.queue_bot_login": {},
 "auto_merge.mergequeue_wedge_hours": {},
+"auto_merge.mergequeue_requeue_cap": {},
 "runtime": {},
 "runtime.state_dir": {},
 "runtime.preflight": {},
@@ -1848,6 +1847,7 @@
 "runtime.github_budget_governor": {},
 "runtime.gh_primary_limit_max_wait_seconds": {},
 "runtime.event_ring_size": {},
+"runtime.operator_worktree_roots": {},
 "runtime.throttle_resume_margin_s": {},
 "runtime.escalated_label_repair_max_per_pass": {},
 "runtime.fleet_registry_stale_grace_days": {},
@@ -1867,10 +1867,10 @@
 "claude_code.effort": {},
 "claude_code.command": {},
 "claude_code.worktrees_dir": {},
+"claude_code.host_io_worktrees": {},
 "claude_code.venv_source": {},
 "claude_code.worker_env": {},
 "claude_code.tee_stream_json": {},
-"claude_code.host_io_worktrees": {},
 "api_worker": {},
 "api_worker.enabled": {},
 "api_worker.provider": {},
@@ -2124,6 +2124,18 @@
 "fleet_supervisor.dependency_sync_starvation_seconds": {},
 "fleet_supervisor.fleet_lane_concurrency": {},
 "fleet_supervisor.reap_sweep_interval_seconds": {},
+"test_slots": {},
+"test_slots.enabled": {},
+"test_slots.width": {},
+"test_slots.min_items": {},
+"test_slots.wait_timeout_seconds": {},
+"dashboard": {},
+"dashboard.enabled": {},
+"dashboard.host": {},
+"dashboard.port": {},
+"dashboard.poll_interval_seconds": {},
+"dashboard.collector_interval_seconds": {},
+"dashboard.rollup_interval_seconds": {},
 "post_mortem": {},
 "post_mortem.enabled": {},
 "post_mortem.db_path": {},
@@ -2151,24 +2163,7 @@
 "supervisor.wedge_kill_loop_alarm": {},
 "supervisor.dependency_sync_starvation_seconds": {},
 "supervisor.fleet_lane_concurrency": {},
-"supervisor.reap_sweep_interval_seconds": {},
-"test_slots": {},
-"test_slots.enabled": {},
-"test_slots.width": {},
-"test_slots.min_items": {},
-"test_slots.wait_timeout_seconds": {},
-"runtime.operator_worktree_roots": {},
-"dashboard": {},
-"dashboard.enabled": {},
-"dashboard.host": {},
-"dashboard.port": {},
-"dashboard.poll_interval_seconds": {},
-"dashboard.collector_interval_seconds": {},
-"dashboard.rollup_interval_seconds": {},
-"labels.model_tier_prefix": {},
-"labels.priority_prefix": {},
-"auto_merge.mergequeue_skip_line_label": {},
-"auto_merge.mergequeue_requeue_cap": {}
+"supervisor.reap_sweep_interval_seconds": {}
 },
 "cells": {
 "labels": [
@@ -2216,7 +2211,7 @@
 "R"
 ],
 "labels.ready": [
-"Ad751",
+"A6d1f",
 "A2e88",
 "Ac94d",
 "Af532",
@@ -2260,7 +2255,7 @@
 "A8ac7"
 ],
 "labels.queued": [
-"Ad751",
+"A8714",
 "Acce5",
 "Aa01a",
 "A8ef5",
@@ -2304,7 +2299,7 @@
 "A0d52"
 ],
 "labels.in_progress": [
-"Ad751",
+"Aa002",
 "Aa705",
 "A95e8",
 "A4f1a",
@@ -2348,7 +2343,7 @@
 "Acb64"
 ],
 "labels.pr_open": [
-"Ad751",
+"A5e42",
 "Ae3b9",
 "A4e39",
 "A6529",
@@ -2392,7 +2387,7 @@
 "Af6a1"
 ],
 "labels.reviewing": [
-"Ad751",
+"A6e10",
 "A1244",
 "Aa8b7",
 "Ab1ad",
@@ -2436,7 +2431,7 @@
 "A65c8"
 ],
 "labels.needs_rework": [
-"Ad751",
+"Aa040",
 "A28a1",
 "A4245",
 "Af9a0",
@@ -2480,7 +2475,7 @@
 "A6531"
 ],
 "labels.done": [
-"Ad751",
+"A7b62",
 "A7eff",
 "A837c",
 "A6aa3",
@@ -2524,7 +2519,7 @@
 "Acbd3"
 ],
 "labels.human_needed": [
-"Ad751",
+"A428f",
 "A32db",
 "A81fc",
 "A194d",
@@ -2568,7 +2563,7 @@
 "A2896"
 ],
 "labels.prose_only_deps": [
-"Ad751",
+"A618f",
 "Acc29",
 "A003f",
 "Aee02",
@@ -2612,7 +2607,7 @@
 "Afbaf"
 ],
 "labels.merge_hold": [
-"Ad751",
+"A3389",
 "Af1d9",
 "Acf02",
 "Aeba5",
@@ -2655,8 +2650,52 @@
 "Ace5a",
 "Ad443"
 ],
+"labels.priority_prefix": [
+"A1c74",
+"A8127",
+"A978d",
+"Ac994",
+"A92f5",
+"A4200",
+"A35f4",
+"Abc98",
+"A2534",
+"A22b5",
+"A4446",
+"Ada55",
+"A1b84",
+"Ad92c",
+"A9fdb",
+"A63c0",
+"A0de7",
+"A61c9",
+"Acd82",
+"Acc5b",
+"A0298",
+"Aa1c9",
+"A524c",
+"A779c",
+"A5f3b",
+"A198f",
+"Abbb1",
+"A0c1a",
+"A4d47",
+"A941d",
+"Ad05d",
+"Aafcd",
+"A5da0",
+"A51ec",
+"A5d85",
+"A863f",
+"Af1cb",
+"A842b",
+"Ab848",
+"Aaf0e",
+"Ada13",
+"A7f94"
+],
 "labels.operator_queue": [
-"Ad751",
+"A6b4d",
 "A8484",
 "A9068",
 "A8784",
@@ -2700,7 +2739,7 @@
 "Ab303"
 ],
 "labels.collect_gate_exempt": [
-"Ad751",
+"Acec7",
 "Af1bc",
 "Ad59b",
 "A657c",
@@ -2744,7 +2783,7 @@
 "Adeb0"
 ],
 "labels.review_ready": [
-"Ad751",
+"Ab3ce",
 "Ac8e0",
 "A92a8",
 "A13fc",
@@ -2788,7 +2827,7 @@
 "A88dc"
 ],
 "labels.cross_repo_override": [
-"Ad751",
+"Aca7b",
 "A8cd7",
 "A19d0",
 "Aa3eb",
@@ -2830,6 +2869,50 @@
 "Ae1e2",
 "A5b31",
 "Ac1f4"
+],
+"labels.model_tier_prefix": [
+"Aff9e",
+"Af79e",
+"A69a2",
+"A235d",
+"Ad52e",
+"Afcf7",
+"Ac7f9",
+"Afa1f",
+"A172e",
+"Af27d",
+"Affaa",
+"A00c1",
+"Ad5f2",
+"A0a0d",
+"A3795",
+"A241c",
+"A51fb",
+"A109e",
+"Ac533",
+"A55d9",
+"A6050",
+"A12d7",
+"Aaebd",
+"A0d0e",
+"A07a4",
+"A8ca5",
+"A408f",
+"A790b",
+"A3d03",
+"A5543",
+"A01e2",
+"A6410",
+"A140a",
+"A3933",
+"A2f4f",
+"Aae29",
+"A7283",
+"Ab801",
+"Ac6e5",
+"A5e1b",
+"A3f5c",
+"A7229"
 ],
 "dispatch": [
 "Ad751",
@@ -2876,7 +2959,7 @@
 "R"
 ],
 "dispatch.default_limit": [
-"Ad751",
+"A71ec",
 "Ab259",
 "Ade13",
 "A0f22",
@@ -2920,7 +3003,7 @@
 "Ac95d"
 ],
 "dispatch.branch_prefix": [
-"Ad751",
+"A7ae7",
 "Ac170",
 "Aabd6",
 "A970b",
@@ -3008,7 +3091,7 @@
 "R"
 ],
 "dispatch.worker_template": [
-"Ad751",
+"A2de1",
 "A7b14",
 "A1fc9",
 "Ab7d7",
@@ -3052,7 +3135,7 @@
 "A8142"
 ],
 "dispatch.rework_template": [
-"Ad751",
+"A9e4b",
 "A8c09",
 "A3f7a",
 "A1f09",
@@ -3140,7 +3223,7 @@
 "R"
 ],
 "dispatch.max_concurrent_sessions": [
-"Ad751",
+"Aec01",
 "A4be5",
 "A9f1f",
 "Ad751",
@@ -3184,7 +3267,7 @@
 "A8713"
 ],
 "dispatch.max_open_agent_prs": [
-"Ad751",
+"A5cbd",
 "R",
 "R",
 "Ad751",
@@ -3228,7 +3311,7 @@
 "R"
 ],
 "dispatch.ci_capacity_headroom_ratio": [
-"Ad751",
+"A34fe",
 "R",
 "R",
 "Aaecb",
@@ -3272,7 +3355,7 @@
 "R"
 ],
 "dispatch.host_load_max_pytest_processes": [
-"Ad751",
+"A9e04",
 "R",
 "R",
 "A4692",
@@ -3316,7 +3399,7 @@
 "R"
 ],
 "dispatch.host_load_max_pytest_trees": [
-"Ad751",
+"A942a",
 "R",
 "R",
 "A13b7",
@@ -3404,7 +3487,7 @@
 "R"
 ],
 "dispatch.base_ref": [
-"Ad751",
+"Aeae9",
 "R",
 "R",
 "R",
@@ -3448,7 +3531,7 @@
 "R"
 ],
 "dispatch.order": [
-"Ad751",
+"A22c5",
 "R",
 "R",
 "R",
@@ -3492,7 +3575,7 @@
 "R"
 ],
 "dispatch.launch_stagger_seconds": [
-"Ad751",
+"A9edb",
 "A53b4",
 "Ac5a8",
 "Aa6eb",
@@ -3536,7 +3619,7 @@
 "R"
 ],
 "dispatch.finalize_limit": [
-"Ad751",
+"Aca4a",
 "A6dd0",
 "A617c",
 "A20e1",
@@ -3712,7 +3795,7 @@
 "R"
 ],
 "dispatch.worker_prompt_max_comments": [
-"Ad751",
+"A65a4",
 "R",
 "R",
 "A8f0d",
@@ -3756,7 +3839,7 @@
 "R"
 ],
 "dispatch.worker_prompt_max_comment_chars": [
-"Ad751",
+"Acc1d",
 "R",
 "R",
 "Ab6d0",
@@ -3800,7 +3883,7 @@
 "R"
 ],
 "dispatch.dispatch_staleness_minutes": [
-"Ad751",
+"Ad0bf",
 "R",
 "R",
 "A743b",
@@ -3844,7 +3927,7 @@
 "R"
 ],
 "dispatch.dependency_stall_minutes": [
-"Ad751",
+"Af0f7",
 "R",
 "R",
 "A7c44",
@@ -3887,52 +3970,8 @@
 "R",
 "R"
 ],
-"dispatch.require_worker_github_token": [
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R"
-],
 "dispatch.archive_unreachable_local_commits": [
-"Ad751",
+"A0107",
 "Ad751",
 "A13f1",
 "R",
@@ -3976,7 +4015,7 @@
 "R"
 ],
 "dispatch.resume_throttled_attempts": [
-"Ad751",
+"A816b",
 "Ad751",
 "Aea98",
 "R",
@@ -4064,7 +4103,7 @@
 "R"
 ],
 "review.max_rework_cycles": [
-"Ad751",
+"Ac356",
 "Ae502",
 "A2389",
 "A495a",
@@ -4108,7 +4147,7 @@
 "A1bc0"
 ],
 "review.require_tests_or_rationale": [
-"Ad751",
+"Aad7b",
 "Ad751",
 "A5f9a",
 "Abf51",
@@ -4152,7 +4191,7 @@
 "Ae2a1"
 ],
 "review.require_issue_link": [
-"Ad751",
+"A604d",
 "Ad751",
 "A6517",
 "Ad285",
@@ -4196,7 +4235,7 @@
 "Ad36a"
 ],
 "review.max_conflict_rework_attempts": [
-"Ad751",
+"A8581",
 "A15ea",
 "Ac6ad",
 "Aeb3f",
@@ -4240,7 +4279,7 @@
 "A99b6"
 ],
 "review.max_no_op_rework_attempts": [
-"Ad751",
+"Ab220",
 "A6883",
 "A1168",
 "Ab7bb",
@@ -4284,7 +4323,7 @@
 "Ac823"
 ],
 "review.rework_stall_minutes": [
-"Ad751",
+"A7237",
 "A0a4f",
 "Ae889",
 "Af998",
@@ -4328,7 +4367,7 @@
 "A8357"
 ],
 "review.post_verdict_comment": [
-"Ad751",
+"Aee5d",
 "Ad751",
 "Ac2f5",
 "A9877",
@@ -4372,7 +4411,7 @@
 "A87bb"
 ],
 "review.stale_checks_grace_minutes": [
-"Ad751",
+"A98fd",
 "R",
 "R",
 "A33d6",
@@ -4416,7 +4455,7 @@
 "R"
 ],
 "review.stale_checks_max_retriggers": [
-"Ad751",
+"A92dc",
 "R",
 "R",
 "Aee8e",
@@ -4460,7 +4499,7 @@
 "R"
 ],
 "review.foreign_issue_ref_confirm_passes": [
-"Ad751",
+"A5211",
 "R",
 "R",
 "R",
@@ -4504,7 +4543,7 @@
 "R"
 ],
 "review.foreign_issue_ref_reprobe_hours": [
-"Ad751",
+"Aec29",
 "R",
 "R",
 "Ade5b",
@@ -4636,7 +4675,7 @@
 "R"
 ],
 "review_dispatch.enabled": [
-"Ad751",
+"Af5f7",
 "Ac6f6",
 "Ad751",
 "R",
@@ -4680,7 +4719,7 @@
 "R"
 ],
 "review_dispatch.reviews_dir": [
-"Ad751",
+"A075b",
 "R",
 "R",
 "R",
@@ -4724,7 +4763,7 @@
 "R"
 ],
 "review_dispatch.max_local_review_processes": [
-"Ad751",
+"Ae54c",
 "A301d",
 "Abebb",
 "Ab494",
@@ -4768,7 +4807,7 @@
 "R"
 ],
 "review_dispatch.max_concurrent_reviews": [
-"Ad751",
+"Aad09",
 "Af698",
 "Aedfe",
 "Aa239",
@@ -4812,7 +4851,7 @@
 "Aa80b"
 ],
 "review_dispatch.quota_probe_interval_minutes": [
-"Ad751",
+"Aa8b8",
 "A537c",
 "A7f43",
 "A36a5",
@@ -4856,7 +4895,7 @@
 "Ac6e8"
 ],
 "review_dispatch.quota_probe_max_interval_minutes": [
-"Ad751",
+"A2bb9",
 "R",
 "R",
 "Ae810",
@@ -4900,7 +4939,7 @@
 "R"
 ],
 "review_dispatch.quota_reset_hours": [
-"Ad751",
+"Ae0ec",
 "A8445",
 "Aed27",
 "A430a",
@@ -4944,7 +4983,7 @@
 "A8798"
 ],
 "review_dispatch.max_review_dispatch_attempts": [
-"Ad751",
+"A1ec6",
 "R",
 "R",
 "R",
@@ -4988,7 +5027,7 @@
 "R"
 ],
 "review_dispatch.max_consecutive_review_log_unreadable": [
-"Ad751",
+"A8247",
 "R",
 "R",
 "Af81e",
@@ -5032,7 +5071,7 @@
 "R"
 ],
 "review_dispatch.max_consecutive_review_api_errors": [
-"Ad751",
+"A23a8",
 "R",
 "R",
 "A6ebc",
@@ -5076,7 +5115,7 @@
 "R"
 ],
 "review_dispatch.review_max_turns": [
-"Ad751",
+"A9eb5",
 "R",
 "R",
 "Ab32a",
@@ -5120,7 +5159,7 @@
 "R"
 ],
 "review_dispatch.diff_line_threshold": [
-"Ad751",
+"A193d",
 "R",
 "R",
 "Ae86c",
@@ -5164,7 +5203,7 @@
 "R"
 ],
 "review_dispatch.turn_cap_large_file_threshold": [
-"Ad751",
+"A37de",
 "R",
 "R",
 "Ae5b8",
@@ -5208,7 +5247,7 @@
 "R"
 ],
 "review_dispatch.turn_cap_large_file_multiplier": [
-"Ad751",
+"A8902",
 "R",
 "R",
 "A7dee",
@@ -5252,7 +5291,7 @@
 "R"
 ],
 "review_dispatch.turn_cap_max_multiplier": [
-"Ad751",
+"A69cd",
 "R",
 "R",
 "Ad4fe",
@@ -5296,7 +5335,7 @@
 "R"
 ],
 "review_dispatch.max_consecutive_turn_limit_misses": [
-"Ad751",
+"A1406",
 "R",
 "R",
 "Ab1db",
@@ -5340,7 +5379,7 @@
 "R"
 ],
 "review_dispatch.file_size_cap_lines": [
-"Ad751",
+"A732e",
 "R",
 "R",
 "Ad751",
@@ -5384,7 +5423,7 @@
 "R"
 ],
 "review_dispatch.review_exec_rejection_max_resumes": [
-"Ad751",
+"A23f6",
 "R",
 "R",
 "A83b5",
@@ -5472,7 +5511,7 @@
 "R"
 ],
 "quota_probe.enabled": [
-"Ad751",
+"A3734",
 "Ad751",
 "A0a32",
 "R",
@@ -5516,7 +5555,7 @@
 "R"
 ],
 "quota_probe.interval_minutes": [
-"Ad751",
+"Af512",
 "R",
 "R",
 "R",
@@ -5560,7 +5599,7 @@
 "R"
 ],
 "quota_probe.model": [
-"Ad751",
+"A0f52",
 "R",
 "R",
 "R",
@@ -5604,7 +5643,7 @@
 "R"
 ],
 "quota_probe.timeout_seconds": [
-"Ad751",
+"A490d",
 "R",
 "R",
 "R",
@@ -5648,7 +5687,7 @@
 "R"
 ],
 "quota_probe.prompt": [
-"Ad751",
+"Ad4fc",
 "R",
 "R",
 "R",
@@ -5736,7 +5775,7 @@
 "R"
 ],
 "reconcile_pass.enabled": [
-"Ad751",
+"A2513",
 "Ad751",
 "Ac0dd",
 "R",
@@ -5780,7 +5819,7 @@
 "R"
 ],
 "reconcile_pass.interval_minutes": [
-"Ad751",
+"Aaf9e",
 "R",
 "R",
 "R",
@@ -5824,7 +5863,7 @@
 "R"
 ],
 "reconcile_pass.terminal_state_alert_days": [
-"Ad751",
+"A4615",
 "R",
 "R",
 "R",
@@ -6220,7 +6259,7 @@
 "R"
 ],
 "auto_merge.enabled": [
-"Ad751",
+"A1c81",
 "Ad751",
 "Ae212",
 "Afb68",
@@ -6264,7 +6303,7 @@
 "A62ac"
 ],
 "auto_merge.strategy": [
-"Ad751",
+"A0513",
 "A92da",
 "A25c1",
 "A5e4c",
@@ -6308,7 +6347,7 @@
 "A1b24"
 ],
 "auto_merge.admin": [
-"Ad751",
+"A1f7b",
 "Ab01d",
 "Ad751",
 "Afc46",
@@ -6396,7 +6435,7 @@
 "R"
 ],
 "auto_merge.delete_branch": [
-"Ad751",
+"Ad471",
 "Ad751",
 "A2408",
 "Ab464",
@@ -6440,7 +6479,7 @@
 "Ae9be"
 ],
 "auto_merge.require_approved_review": [
-"Ad751",
+"A4b74",
 "Ad751",
 "Afefe",
 "A0859",
@@ -6528,7 +6567,7 @@
 "Abe16"
 ],
 "auto_merge.failed_attempt_alarm": [
-"Ad751",
+"A3b96",
 "A36dd",
 "Af681",
 "A4877",
@@ -6572,7 +6611,7 @@
 "R"
 ],
 "auto_merge.infra_rerun_attempt_cap": [
-"Ad751",
+"Ab899",
 "A7eb6",
 "A1a7a",
 "A0a07",
@@ -6616,7 +6655,7 @@
 "A07b8"
 ],
 "auto_merge.infra_rerun_backlog_defer_seconds": [
-"Ad751",
+"Adbab",
 "R",
 "R",
 "Afa87",
@@ -6704,7 +6743,7 @@
 "R"
 ],
 "auto_merge.infra_blocked.enabled": [
-"Ad751",
+"A98f4",
 "Ad751",
 "Addd9",
 "R",
@@ -6748,7 +6787,7 @@
 "R"
 ],
 "auto_merge.infra_blocked.instant_fail_seconds": [
-"Ad751",
+"Afca6",
 "R",
 "R",
 "A27bb",
@@ -6836,7 +6875,7 @@
 "R"
 ],
 "auto_merge.infra_blocked.persistence_passes": [
-"Ad751",
+"Af4f2",
 "R",
 "R",
 "A2329",
@@ -6880,7 +6919,7 @@
 "R"
 ],
 "auto_merge.infra_blocked.escalation_window_minutes": [
-"Ad751",
+"A85bc",
 "R",
 "R",
 "Ab5f2",
@@ -6924,7 +6963,7 @@
 "R"
 ],
 "auto_merge.readiness_no_ci_minutes": [
-"Ad751",
+"A084a",
 "R",
 "R",
 "Adf13",
@@ -6968,7 +7007,7 @@
 "R"
 ],
 "auto_merge.ci_run_never_created_grace_minutes": [
-"Ad751",
+"A4416",
 "R",
 "R",
 "Ad431",
@@ -7100,7 +7139,7 @@
 "R"
 ],
 "auto_merge.require_current_base": [
-"Ad751",
+"A3b80",
 "Ad751",
 "A6216",
 "Ab77c",
@@ -7187,6 +7226,50 @@
 "R",
 "R"
 ],
+"auto_merge.mergequeue_skip_line_label": [
+"A9940",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"Aa4f3",
+"A73c1",
+"A01cb",
+"A3d1e",
+"A9416",
+"A215f",
+"Aa7eb",
+"A5de4",
+"A1e3e",
+"Ab5c5",
+"A3442",
+"A9417",
+"A46a6",
+"A05ef",
+"A31ee",
+"A8a6c",
+"A9d1d",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R"
+],
 "auto_merge.queue_bot_login": [
 "Ad751",
 "R",
@@ -7232,7 +7315,7 @@
 "R"
 ],
 "auto_merge.mergequeue_wedge_hours": [
-"Ad751",
+"A7ba0",
 "R",
 "R",
 "Ad8d1",
@@ -7244,6 +7327,50 @@
 "R",
 "A46e9",
 "Aa4d7",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R"
+],
+"auto_merge.mergequeue_requeue_cap": [
+"Aad8f",
+"R",
+"R",
+"Aa0bf",
+"A8270",
+"R",
+"A5ecd",
+"R",
+"R",
+"R",
+"R",
+"R",
 "R",
 "R",
 "R",
@@ -7320,7 +7447,7 @@
 "R"
 ],
 "runtime.state_dir": [
-"Ad751",
+"Af275",
 "Aa4cd",
 "A191c",
 "A8632",
@@ -7408,7 +7535,7 @@
 "R"
 ],
 "runtime.preflight.disk_floor_gb": [
-"Ad751",
+"Acdd4",
 "R",
 "R",
 "Af207",
@@ -7452,7 +7579,7 @@
 "R"
 ],
 "runtime.preflight.disk_floor_fatal": [
-"Ad751",
+"Aa82a",
 "Ad751",
 "A88af",
 "R",
@@ -7496,7 +7623,7 @@
 "R"
 ],
 "runtime.preflight.clock_max_skew_hours": [
-"Ad751",
+"Af35c",
 "R",
 "R",
 "Ad793",
@@ -7540,7 +7667,7 @@
 "R"
 ],
 "runtime.preflight.clock_sanity_fatal": [
-"Ad751",
+"Af599",
 "Aae20",
 "Ad751",
 "R",
@@ -7584,7 +7711,7 @@
 "R"
 ],
 "runtime.preflight.venv_identity_fatal": [
-"Ad751",
+"A734b",
 "Ad751",
 "A40c5",
 "R",
@@ -7628,7 +7755,7 @@
 "R"
 ],
 "runtime.preflight.config_freshness_fatal": [
-"Ad751",
+"Abca6",
 "A8b7b",
 "Ad751",
 "R",
@@ -7672,7 +7799,7 @@
 "R"
 ],
 "runtime.preflight.git_identity_fatal": [
-"Ad751",
+"A2c13",
 "Ad751",
 "Ac76a",
 "R",
@@ -7892,7 +8019,7 @@
 "R"
 ],
 "runtime.gh_max_retries": [
-"Ad751",
+"A0a40",
 "Add27",
 "A379a",
 "A730b",
@@ -7936,7 +8063,7 @@
 "R"
 ],
 "runtime.gh_retry_base_seconds": [
-"Ad751",
+"Af289",
 "A170e",
 "A94bb",
 "Aab2c",
@@ -7980,7 +8107,7 @@
 "R"
 ],
 "runtime.gh_timeout_seconds": [
-"Ad751",
+"A3245",
 "R",
 "R",
 "R",
@@ -8024,7 +8151,7 @@
 "R"
 ],
 "runtime.gh_long_call_timeout_seconds": [
-"Ad751",
+"A0cb9",
 "R",
 "R",
 "R",
@@ -8112,7 +8239,7 @@
 "R"
 ],
 "runtime.gh_circuit_breaker.failure_threshold": [
-"Ad751",
+"Aaecd",
 "R",
 "R",
 "R",
@@ -8156,7 +8283,7 @@
 "R"
 ],
 "runtime.gh_circuit_breaker.cooldown_seconds": [
-"Ad751",
+"Ae682",
 "R",
 "R",
 "A1da7",
@@ -8200,7 +8327,7 @@
 "R"
 ],
 "runtime.gh_transport": [
-"Ad751",
+"A5a71",
 "R",
 "R",
 "R",
@@ -8244,7 +8371,7 @@
 "R"
 ],
 "runtime.pr_create_retry_max_attempts": [
-"Ad751",
+"A3325",
 "A68e9",
 "Ac2c2",
 "A07e4",
@@ -8288,7 +8415,7 @@
 "R"
 ],
 "runtime.pr_create_retry_base_seconds": [
-"Ad751",
+"A1dff",
 "A7cd9",
 "A4d1b",
 "Aaa2f",
@@ -8332,7 +8459,7 @@
 "R"
 ],
 "runtime.graphql_rate_limit_threshold": [
-"Ad751",
+"A38f5",
 "Aac7b",
 "A57fe",
 "Aa4e1",
@@ -8376,7 +8503,7 @@
 "R"
 ],
 "runtime.graphql_scan_reserve": [
-"Ad751",
+"A4763",
 "A8661",
 "A370a",
 "Ad462",
@@ -8420,7 +8547,7 @@
 "R"
 ],
 "runtime.graphql_floor_reserve": [
-"Ad751",
+"A237c",
 "A74dc",
 "Aaeca",
 "A99ef",
@@ -8464,7 +8591,7 @@
 "R"
 ],
 "runtime.github_budget_governor": [
-"Ad751",
+"A93d4",
 "Ad751",
 "A2712",
 "R",
@@ -8508,7 +8635,7 @@
 "R"
 ],
 "runtime.gh_primary_limit_max_wait_seconds": [
-"Ad751",
+"Ae3b1",
 "Aac83",
 "A2426",
 "A5445",
@@ -8552,7 +8679,7 @@
 "R"
 ],
 "runtime.event_ring_size": [
-"Ad751",
+"Adb61",
 "R",
 "R",
 "R",
@@ -8595,8 +8722,52 @@
 "R",
 "R"
 ],
+"runtime.operator_worktree_roots": [
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"A571c",
+"Abf80",
+"Ac301",
+"A2af5",
+"R",
+"R",
+"A3066",
+"Af6d6",
+"R",
+"R",
+"R"
+],
 "runtime.throttle_resume_margin_s": [
-"Ad751",
+"Af217",
 "A7012",
 "Aaf6e",
 "A60f7",
@@ -8640,7 +8811,7 @@
 "R"
 ],
 "runtime.escalated_label_repair_max_per_pass": [
-"Ad751",
+"A9f75",
 "R",
 "R",
 "Af396",
@@ -8684,7 +8855,7 @@
 "R"
 ],
 "runtime.fleet_registry_stale_grace_days": [
-"Ad751",
+"Abafb",
 "R",
 "R",
 "Af86e",
@@ -8728,7 +8899,7 @@
 "R"
 ],
 "runtime.status_snapshot_ttl_seconds": [
-"Ad751",
+"Aa9fd",
 "R",
 "R",
 "Abeb0",
@@ -8772,7 +8943,7 @@
 "R"
 ],
 "runtime.config_retirement_quiet_days": [
-"Ad751",
+"A4cdd",
 "R",
 "R",
 "Adb26",
@@ -8860,7 +9031,7 @@
 "R"
 ],
 "devin.session_manifest": [
-"Ad751",
+"A9f54",
 "Abe0a",
 "A436e",
 "Ac6ad",
@@ -8904,7 +9075,7 @@
 "Ae4f7"
 ],
 "devin.session_results": [
-"Ad751",
+"A8340",
 "Ab7ae",
 "Adeec",
 "A460a",
@@ -8992,7 +9163,7 @@
 "R"
 ],
 "devin.command_timeout_seconds": [
-"Ad751",
+"A4391",
 "A4017",
 "A431e",
 "Acb2e",
@@ -9036,7 +9207,7 @@
 "Af991"
 ],
 "devin.sessions_dir": [
-"Ad751",
+"A267f",
 "Ab550",
 "A6b6c",
 "A5344",
@@ -9124,7 +9295,7 @@
 "R"
 ],
 "devin.worker_model": [
-"Ad751",
+"Aef18",
 "Ac4e7",
 "Abdee",
 "A564d",
@@ -9300,7 +9471,7 @@
 "R"
 ],
 "claude_code.effort": [
-"Ad751",
+"A2105",
 "R",
 "R",
 "R",
@@ -9431,6 +9602,50 @@
 "A0b7a",
 "Aa442"
 ],
+"claude_code.host_io_worktrees": [
+"A6f01",
+"Ad751",
+"A5c23",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R"
+],
 "claude_code.venv_source": [
 "Ad751",
 "Aceef",
@@ -9520,7 +9735,7 @@
 "A429b"
 ],
 "claude_code.tee_stream_json": [
-"Ad751",
+"A46cd",
 "Af937",
 "Ad751",
 "A0e74",
@@ -9562,50 +9777,6 @@
 "A806a",
 "A2a76",
 "Ac2e2"
-],
-"claude_code.host_io_worktrees": [
-"Ad751",
-"Ad751",
-"A5c23",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R"
 ],
 "api_worker": [
 "Ad751",
@@ -9652,7 +9823,7 @@
 "R"
 ],
 "api_worker.enabled": [
-"Ad751",
+"A693c",
 "R",
 "Ad751",
 "R",
@@ -9696,7 +9867,7 @@
 "R"
 ],
 "api_worker.provider": [
-"Ad751",
+"A9bfa",
 "R",
 "R",
 "R",
@@ -9740,7 +9911,7 @@
 "R"
 ],
 "api_worker.max_concurrent_sessions": [
-"Ad751",
+"A03a9",
 "R",
 "R",
 "Ac5d3",
@@ -10356,7 +10527,7 @@
 "R"
 ],
 "api_worker.worker_template": [
-"Ad751",
+"A0837",
 "R",
 "R",
 "R",
@@ -10400,7 +10571,7 @@
 "R"
 ],
 "api_worker.rework_template": [
-"Ad751",
+"Aff05",
 "R",
 "R",
 "R",
@@ -10532,7 +10703,7 @@
 "R"
 ],
 "opencode.provider": [
-"Ad751",
+"A42c1",
 "R",
 "R",
 "R",
@@ -10576,7 +10747,7 @@
 "R"
 ],
 "opencode.variant": [
-"Ad751",
+"A80f1",
 "R",
 "R",
 "R",
@@ -10752,7 +10923,7 @@
 "R"
 ],
 "rescue.enabled": [
-"Ad751",
+"A5295",
 "Abdb9",
 "Ad751",
 "R",
@@ -10796,7 +10967,7 @@
 "R"
 ],
 "rescue.worker_adapter": [
-"Ad751",
+"A7dbe",
 "R",
 "R",
 "R",
@@ -10840,7 +11011,7 @@
 "R"
 ],
 "rescue.worker_model": [
-"Ad751",
+"A7cbb",
 "R",
 "R",
 "R",
@@ -10884,7 +11055,7 @@
 "R"
 ],
 "rescue.reviewer_adapter": [
-"Ad751",
+"A902e",
 "R",
 "R",
 "R",
@@ -10928,7 +11099,7 @@
 "R"
 ],
 "rescue.reviewer_model": [
-"Ad751",
+"Aee66",
 "R",
 "R",
 "R",
@@ -11016,7 +11187,7 @@
 "R"
 ],
 "rescue.reviewer_timeout_seconds": [
-"Ad751",
+"A2b43",
 "R",
 "R",
 "A212c",
@@ -11104,7 +11275,7 @@
 "R"
 ],
 "rescue.worker.harness": [
-"A94ac",
+"Aed24",
 "Af229",
 "Aae78",
 "A9a2a",
@@ -11148,18 +11319,18 @@
 "A14e5"
 ],
 "rescue.worker.model": [
-"A94ac",
-"Ab55e",
-"A244a",
-"A1ae6",
-"A0b8b",
-"A5e2c",
-"A84f8",
-"A8f9a",
-"A3aeb",
-"Abf8d",
-"A4fc3",
-"A88e2",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
 "A94ac",
 "Aa3dd",
 "A176d",
@@ -11179,17 +11350,17 @@
 "Ada34",
 "A108e",
 "A314f",
-"A275d",
-"A2ef1",
-"A2168",
-"A31cd",
-"A029d",
-"A7184",
-"A06d4",
-"Ac7c7",
-"A881e",
-"A70e4",
-"A5f8d"
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R"
 ],
 "rescue.worker.fallbacks": [
 "A18ce",
@@ -11456,7 +11627,7 @@
 "R"
 ],
 "rescue.reviewer.harness": [
-"A127f",
+"A041e",
 "A8910",
 "A3d3b",
 "A649c",
@@ -11500,18 +11671,18 @@
 "Aec1f"
 ],
 "rescue.reviewer.model": [
-"A127f",
-"A9655",
-"A0cf5",
-"A07cc",
-"Aa70d",
-"Af340",
-"Accc2",
-"A5e3b",
-"A14d5",
-"A281f",
-"A3396",
-"Aae1c",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
 "A127f",
 "A5123",
 "A5e0c",
@@ -11531,17 +11702,17 @@
 "Ab026",
 "A20ff",
 "A8c59",
-"Aef4d",
-"A51b7",
-"Ad769",
-"A98c7",
-"Aca61",
-"Ac897",
-"A187b",
-"A051e",
-"Adadd",
-"A2e6e",
-"A0eec"
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R"
 ],
 "rescue.reviewer.fallbacks": [
 "Ab051",
@@ -11852,18 +12023,18 @@
 "R"
 ],
 "worker.model": [
-"Ad751",
-"X",
-"X",
-"X",
-"X",
-"X",
-"X",
-"X",
-"X",
-"X",
-"X",
-"X",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
 "Ad751",
 "A2eda",
 "Ad5cf",
@@ -11883,17 +12054,17 @@
 "Ab769",
 "Aee32",
 "Ae0ca",
-"X",
-"X",
-"X",
-"X",
-"X",
-"X",
-"X",
-"X",
-"X",
-"X",
-"X"
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R"
 ],
 "worker.fallbacks": [
 "Aa146",
@@ -12204,18 +12375,18 @@
 "R"
 ],
 "reviewer.model": [
-"Ad751",
-"A0e1c",
-"A9067",
-"Ab981",
-"A0b4a",
-"A70a8",
-"Ac3a3",
-"A4916",
-"A6268",
-"Ab71a",
-"A839a",
-"A78eb",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
 "A4abb",
 "A3013",
 "Add8e",
@@ -12235,17 +12406,17 @@
 "A7b11",
 "A751e",
 "A7b51",
-"A3736",
-"A1d07",
-"A64f9",
-"A821a",
-"Ab5b7",
-"A410e",
-"A51c0",
-"A4be8",
-"Af7bb",
-"A7670",
-"Abae1"
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R"
 ],
 "reviewer.effort": [
 "R",
@@ -12644,7 +12815,7 @@
 "R"
 ],
 "watchdog.enabled": [
-"Ad751",
+"Ae53a",
 "Ad751",
 "A24b8",
 "Ac020",
@@ -12688,7 +12859,7 @@
 "A97ef"
 ],
 "watchdog.stall_minutes": [
-"Ad751",
+"A0446",
 "A7742",
 "A304b",
 "A2fc4",
@@ -12732,7 +12903,7 @@
 "A91c0"
 ],
 "watchdog.redispatch_window_minutes": [
-"Ad751",
+"A3e7c",
 "A42d8",
 "A1b8d",
 "A38ad",
@@ -12776,7 +12947,7 @@
 "Ab1c7"
 ],
 "watchdog.max_auto_redispatch": [
-"Ad751",
+"A5390",
 "A2efd",
 "A5412",
 "Ac6d7",
@@ -12864,7 +13035,7 @@
 "R"
 ],
 "watchdog.wall_clock_minutes": [
-"Ad751",
+"A8c90",
 "A29b3",
 "Aa191",
 "Ac29d",
@@ -12908,7 +13079,7 @@
 "Ae7f4"
 ],
 "watchdog.wall_clock_kill": [
-"Ad751",
+"A0108",
 "A38e9",
 "Ad751",
 "A6023",
@@ -12952,7 +13123,7 @@
 "Ad0f9"
 ],
 "watchdog.loop_stall_multiplier": [
-"Ad751",
+"A63ab",
 "A5801",
 "A3d68",
 "A5f7c",
@@ -12996,7 +13167,7 @@
 "A6423"
 ],
 "watchdog.loop_kill": [
-"Ad751",
+"A0436",
 "A097a",
 "Ad751",
 "Aae9a",
@@ -13128,7 +13299,7 @@
 "R"
 ],
 "watchdog.cost_budget_action": [
-"Ad751",
+"A0cca",
 "R",
 "R",
 "R",
@@ -13172,7 +13343,7 @@
 "R"
 ],
 "watchdog.launch_stall_grace_minutes": [
-"Ad751",
+"A4c7c",
 "Acd37",
 "A1634",
 "Ab926",
@@ -13216,7 +13387,7 @@
 "R"
 ],
 "watchdog.rate_limit_defer_enabled": [
-"Ad751",
+"A8ee7",
 "Ad751",
 "A2760",
 "R",
@@ -13260,7 +13431,7 @@
 "R"
 ],
 "watchdog.rate_limit_defer_slack_minutes": [
-"Ad751",
+"A5f10",
 "A2863",
 "A9b6a",
 "A2b92",
@@ -13304,7 +13475,7 @@
 "R"
 ],
 "watchdog.max_inconclusive_probe_deferrals": [
-"Ad751",
+"Ad88c",
 "Ac262",
 "A564a",
 "A3934",
@@ -13348,7 +13519,7 @@
 "R"
 ],
 "watchdog.pre_review_rework_stale_minutes": [
-"Ad751",
+"A2bda",
 "Aba5e",
 "A6644",
 "Abd8c",
@@ -13392,7 +13563,7 @@
 "R"
 ],
 "watchdog.worktree_mtime_enabled": [
-"Ad751",
+"A4cba",
 "Ad751",
 "A0b5e",
 "R",
@@ -13436,7 +13607,7 @@
 "R"
 ],
 "watchdog.worktree_mtime_threshold_minutes": [
-"Ad751",
+"A269e",
 "Acc66",
 "Aee55",
 "A5b74",
@@ -13480,7 +13651,7 @@
 "R"
 ],
 "watchdog.worktree_mtime_max_depth": [
-"Ad751",
+"A9549",
 "A2b72",
 "Ac47f",
 "Ad09b",
@@ -13568,7 +13739,7 @@
 "R"
 ],
 "watchdog.dead_dispatched_reap_minutes": [
-"Ad751",
+"A8d34",
 "Aec32",
 "A3f38",
 "A3c18",
@@ -13612,7 +13783,7 @@
 "Ac2b0"
 ],
 "watchdog.max_foreign_writer_reaps": [
-"Ad751",
+"A715a",
 "A7fd3",
 "Ae564",
 "Adfac",
@@ -13656,7 +13827,7 @@
 "A38b4"
 ],
 "watchdog.worker_outcome_finalize_minutes": [
-"Ad751",
+"Aa56c",
 "R",
 "R",
 "A79a5",
@@ -13744,7 +13915,7 @@
 "R"
 ],
 "worktree_reclamation.enabled": [
-"Ad751",
+"Aa9ed",
 "Ad751",
 "Ab86d",
 "R",
@@ -13788,7 +13959,7 @@
 "R"
 ],
 "worktree_reclamation.interval_minutes": [
-"Ad751",
+"Ad1d9",
 "R",
 "R",
 "R",
@@ -13876,7 +14047,7 @@
 "R"
 ],
 "test_adequacy.enabled": [
-"Ad751",
+"A886a",
 "Abd3b",
 "Ad751",
 "R",
@@ -13920,7 +14091,7 @@
 "R"
 ],
 "test_adequacy.min_product_lines": [
-"Ad751",
+"A5777",
 "A771a",
 "A1efa",
 "Aebd5",
@@ -14140,7 +14311,7 @@
 "R"
 ],
 "test_adequacy.require_assertions": [
-"Ad751",
+"A3ab6",
 "A5d94",
 "Ad751",
 "R",
@@ -14228,7 +14399,7 @@
 "R"
 ],
 "test_adequacy.exempt_marker": [
-"Ad751",
+"Aa9db",
 "R",
 "R",
 "R",
@@ -14272,7 +14443,7 @@
 "R"
 ],
 "test_adequacy.coverage_enabled": [
-"Ad751",
+"A5f31",
 "A89cf",
 "Ad751",
 "R",
@@ -14360,7 +14531,7 @@
 "R"
 ],
 "test_adequacy.min_diff_coverage": [
-"Ad751",
+"Ac853",
 "A142f",
 "A58e2",
 "Ab2ae",
@@ -14448,7 +14619,7 @@
 "R"
 ],
 "coverage_probe.enabled": [
-"Ad751",
+"Adf17",
 "A3c13",
 "Ad751",
 "R",
@@ -14712,7 +14883,7 @@
 "R"
 ],
 "coverage_probe.test_function_prefix": [
-"Ad751",
+"A9869",
 "R",
 "R",
 "R",
@@ -14756,7 +14927,7 @@
 "R"
 ],
 "coverage_probe.branch_to_assert_ratio_threshold": [
-"Ad751",
+"A6737",
 "Ab56f",
 "Af698",
 "Ac630",
@@ -14800,7 +14971,7 @@
 "R"
 ],
 "coverage_probe.check_unwired_symbols": [
-"Ad751",
+"A1ab4",
 "Ad751",
 "Ab970",
 "R",
@@ -14844,7 +15015,7 @@
 "R"
 ],
 "coverage_probe.private_name_prefix": [
-"Ad751",
+"A6e5d",
 "R",
 "R",
 "R",
@@ -14932,7 +15103,7 @@
 "R"
 ],
 "fleet.global_max_concurrent_sessions": [
-"Ad751",
+"A48ef",
 "A5efe",
 "A6a56",
 "Ad751",
@@ -14976,7 +15147,7 @@
 "R"
 ],
 "fleet.global_max_concurrent_reviews": [
-"Ad751",
+"Acedb",
 "R",
 "R",
 "Ad751",
@@ -15020,7 +15191,7 @@
 "R"
 ],
 "fleet.launch_lock_wait_seconds": [
-"Ad751",
+"Ad330",
 "R",
 "R",
 "A75f4",
@@ -15152,7 +15323,7 @@
 "R"
 ],
 "notify.enabled": [
-"Ad751",
+"Ac898",
 "A2c4d",
 "Ad751",
 "A41cd",
@@ -15196,7 +15367,7 @@
 "A8186"
 ],
 "notify.sink": [
-"Ad751",
+"Abe47",
 "Ad49c",
 "A95aa",
 "Ab842",
@@ -15240,7 +15411,7 @@
 "A4e83"
 ],
 "notify.webhook_url": [
-"Ad751",
+"A76c6",
 "A407d",
 "A2b40",
 "A10d1",
@@ -15328,7 +15499,7 @@
 "A1aa9"
 ],
 "notify.file_path": [
-"Ad751",
+"Ad808",
 "A301b",
 "Abdc9",
 "A9155",
@@ -15416,7 +15587,7 @@
 "R"
 ],
 "local_issues.enabled": [
-"Ad751",
+"A74c2",
 "A29f0",
 "Ad751",
 "R",
@@ -15460,7 +15631,7 @@
 "R"
 ],
 "local_issues.issues_dir": [
-"Ad751",
+"A7a40",
 "R",
 "R",
 "R",
@@ -15504,7 +15675,7 @@
 "R"
 ],
 "local_issues.commit_writes": [
-"Ad751",
+"Ad3cd",
 "Ad751",
 "A868c",
 "R",
@@ -15592,7 +15763,7 @@
 "R"
 ],
 "local_lane.kill_switch_stall_hours": [
-"Ad751",
+"A3efe",
 "R",
 "R",
 "A8504",
@@ -15680,7 +15851,7 @@
 "R"
 ],
 "runners.enabled": [
-"Ad751",
+"Aa900",
 "Ab662",
 "Ad751",
 "R",
@@ -15724,7 +15895,7 @@
 "R"
 ],
 "runners.cancel_superseded_main_runs": [
-"Ad751",
+"Adcbb",
 "Ab604",
 "Ad751",
 "R",
@@ -15768,7 +15939,7 @@
 "R"
 ],
 "runners.default_branch": [
-"Ad751",
+"A73bd",
 "R",
 "R",
 "R",
@@ -15812,7 +15983,7 @@
 "R"
 ],
 "runners.workflow_name": [
-"Ad751",
+"Ac2c9",
 "R",
 "R",
 "R",
@@ -15856,7 +16027,7 @@
 "R"
 ],
 "runners.fleet_autoscale_prologue": [
-"Ad751",
+"A79bb",
 "A18d2",
 "Ad751",
 "A43cf",
@@ -15944,7 +16115,7 @@
 "R"
 ],
 "main_ci_reclaim.enabled": [
-"Ad751",
+"A5178",
 "Ad751",
 "A8bc3",
 "R",
@@ -15988,7 +16159,7 @@
 "R"
 ],
 "main_ci_reclaim.workflow_filename": [
-"Ad751",
+"Af393",
 "R",
 "R",
 "R",
@@ -16076,7 +16247,7 @@
 "R"
 ],
 "runner_scaling.enabled": [
-"Ad751",
+"Aef64",
 "A9041",
 "Ad751",
 "R",
@@ -16120,7 +16291,7 @@
 "R"
 ],
 "runner_scaling.managed_root": [
-"Ad751",
+"A1177",
 "R",
 "R",
 "R",
@@ -16164,7 +16335,7 @@
 "R"
 ],
 "runner_scaling.runner_dir_prefix": [
-"Ad751",
+"Aa568",
 "R",
 "R",
 "R",
@@ -16208,7 +16379,7 @@
 "R"
 ],
 "runner_scaling.runner_name_template": [
-"Ad751",
+"A305b",
 "R",
 "R",
 "R",
@@ -16252,7 +16423,7 @@
 "R"
 ],
 "runner_scaling.package_zip": [
-"Ad751",
+"A8693",
 "R",
 "R",
 "R",
@@ -16296,7 +16467,7 @@
 "R"
 ],
 "runner_scaling.min_runners": [
-"Ad751",
+"A9767",
 "A1454",
 "A2fdd",
 "A8982",
@@ -16340,7 +16511,7 @@
 "R"
 ],
 "runner_scaling.max_runners": [
-"Ad751",
+"A1fde",
 "A7588",
 "A41b5",
 "Acc4b",
@@ -16384,7 +16555,7 @@
 "R"
 ],
 "runner_scaling.ram_per_job_gb": [
-"Ad751",
+"Aff1c",
 "A27e7",
 "A550b",
 "A8d53",
@@ -16428,7 +16599,7 @@
 "R"
 ],
 "runner_scaling.min_free_ram_gb": [
-"Ad751",
+"Afc59",
 "A4364",
 "A60e2",
 "Aedb6",
@@ -16472,7 +16643,7 @@
 "R"
 ],
 "runner_scaling.max_host_cpu_pct": [
-"Ad751",
+"A83ab",
 "A047f",
 "Aa06d",
 "A9de8",
@@ -16516,7 +16687,7 @@
 "R"
 ],
 "runner_scaling.idle_scale_down_minutes": [
-"Ad751",
+"A20c1",
 "A599b",
 "A72d5",
 "A0122",
@@ -16560,7 +16731,7 @@
 "R"
 ],
 "runner_scaling.cooldown_minutes": [
-"Ad751",
+"Ada2b",
 "Aaed5",
 "A9236",
 "A421c",
@@ -16648,7 +16819,7 @@
 "R"
 ],
 "runner_allocation.enabled": [
-"Ad751",
+"Acc00",
 "Afa5a",
 "Ad751",
 "R",
@@ -16692,7 +16863,7 @@
 "R"
 ],
 "runner_allocation.managed_root": [
-"Ad751",
+"A5ef3",
 "R",
 "R",
 "R",
@@ -16736,7 +16907,7 @@
 "R"
 ],
 "runner_allocation.max_running_runners": [
-"Ad751",
+"A265d",
 "R",
 "R",
 "Ad751",
@@ -16780,7 +16951,7 @@
 "R"
 ],
 "runner_allocation.min_running_per_repo": [
-"Ad751",
+"Aae9d",
 "R",
 "R",
 "A0f57",
@@ -16824,7 +16995,7 @@
 "R"
 ],
 "runner_allocation.demand_idle_samples": [
-"Ad751",
+"Aee59",
 "R",
 "R",
 "Ad0e9",
@@ -16868,7 +17039,7 @@
 "R"
 ],
 "runner_allocation.max_runs_scanned": [
-"Ad751",
+"A1826",
 "R",
 "R",
 "A146b",
@@ -16912,139 +17083,139 @@
 "R"
 ],
 "runner_allocation.max_running_per_repo": [
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
 "Af461",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
 "Abfad",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R"
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC"
 ],
 "runner_allocation.reserved_threads": [
-"Ad751",
+"RC",
 "A832e",
 "A2802",
 "Ad751",
 "Adc62",
-"R",
+"RC",
 "A6f65",
 "A21a6",
 "A1993",
-"R",
+"RC",
 "A55fc",
 "Ab510",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R"
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC"
 ],
 "runner_allocation.threads_per_slot": [
-"Ad751",
+"RC",
 "A473c",
 "Ae638",
 "Ad751",
 "Acddd",
-"R",
+"RC",
 "A3307",
 "A2951",
 "A0ee5",
-"R",
+"RC",
 "A4b1a",
 "A6dec",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R"
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC"
 ],
 "runner_allocation.heavy_label": [
-"Ad751",
+"Acd64",
 "A73a6",
 "Af931",
 "A0bd3",
@@ -17088,51 +17259,51 @@
 "A5d3a"
 ],
 "runner_allocation.max_running_heavy": [
-"Ad751",
+"RC",
 "Af12a",
 "A96af",
 "Ad751",
 "A4cc1",
-"R",
+"RC",
 "Addea",
 "Ae690",
 "Ae834",
-"R",
+"RC",
 "Ad175",
 "Ad3ef",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R"
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC",
+"RC"
 ],
 "runner_allocation.host_io": [
-"Ad751",
+"A8903",
 "Ad751",
 "A8eed",
 "R",
@@ -17176,7 +17347,7 @@
 "R"
 ],
 "runner_allocation.host_io_manifest": [
-"Ad751",
+"A7b17",
 "R",
 "R",
 "R",
@@ -17220,7 +17391,7 @@
 "R"
 ],
 "runner_allocation.leak_drain": [
-"Ad751",
+"Aad5c",
 "Ad751",
 "Afa78",
 "R",
@@ -17264,7 +17435,7 @@
 "R"
 ],
 "runner_allocation.leak_probe_path": [
-"Ad751",
+"A72fe",
 "R",
 "R",
 "R",
@@ -17308,7 +17479,7 @@
 "R"
 ],
 "runner_allocation.host_io_auto_exclusions": [
-"Ad751",
+"A62cd",
 "Ad751",
 "A0eb5",
 "R",
@@ -17396,7 +17567,7 @@
 "R"
 ],
 "runner_capacity_escalation.enabled": [
-"Ad751",
+"Ad299",
 "Ad751",
 "Ae100",
 "R",
@@ -17440,7 +17611,7 @@
 "R"
 ],
 "runner_capacity_escalation.starvation_escalation_minutes": [
-"Ad751",
+"A401d",
 "R",
 "R",
 "R",
@@ -17528,7 +17699,7 @@
 "R"
 ],
 "supervisor.poll_interval_seconds": [
-"Ad751",
+"A04ec",
 "Aada8",
 "Ac6ba",
 "A81ba",
@@ -17572,7 +17743,7 @@
 "R"
 ],
 "supervisor.full_pass_interval_seconds": [
-"Ad751",
+"Aa955",
 "Ac0a6",
 "Aa2b0",
 "A6be5",
@@ -17616,7 +17787,7 @@
 "R"
 ],
 "supervisor.active_cooldown_seconds": [
-"Ad751",
+"A11c4",
 "A5384",
 "Aade3",
 "Acbf0",
@@ -17660,7 +17831,7 @@
 "R"
 ],
 "supervisor.max_runtime_minutes": [
-"Ad751",
+"Aa78b",
 "Ae2a7",
 "A4153",
 "Ad751",
@@ -17748,7 +17919,7 @@
 "R"
 ],
 "fleet_supervisor.max_pass_runtime_seconds": [
-"Ad751",
+"Ab9ab",
 "A73c9",
 "Aa724",
 "A11db",
@@ -17792,7 +17963,7 @@
 "R"
 ],
 "fleet_supervisor.self_deploy_failure_alarm": [
-"Ad751",
+"A359b",
 "A6a7f",
 "A8e32",
 "A757e",
@@ -17836,7 +18007,7 @@
 "R"
 ],
 "fleet_supervisor.self_deploy_pull_ci_fleet": [
-"Ad751",
+"A6ed5",
 "A8de0",
 "Ad751",
 "R",
@@ -17880,7 +18051,7 @@
 "R"
 ],
 "fleet_supervisor.zero_pass_alarm": [
-"Ad751",
+"A642a",
 "A73fc",
 "A6f9b",
 "Adf80",
@@ -17924,7 +18095,7 @@
 "R"
 ],
 "fleet_supervisor.wedge_kill_loop_alarm": [
-"Ad751",
+"A96ca",
 "A68eb",
 "Ad8e3",
 "Aeb0b",
@@ -17968,7 +18139,7 @@
 "R"
 ],
 "fleet_supervisor.dependency_sync_starvation_seconds": [
-"Ad751",
+"A1848",
 "A427e",
 "A3bcb",
 "Ad16a",
@@ -18012,7 +18183,7 @@
 "R"
 ],
 "fleet_supervisor.fleet_lane_concurrency": [
-"Ad751",
+"A20de",
 "A7800",
 "A1c0f",
 "A4d9c",
@@ -18056,13 +18227,541 @@
 "R"
 ],
 "fleet_supervisor.reap_sweep_interval_seconds": [
-"Ad751",
+"Ac7b8",
 "A7640",
 "A1d49",
 "A312f",
 "Acfe1",
 "A874a",
 "A4cbc",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R"
+],
+"test_slots": [
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"R",
+"R"
+],
+"test_slots.enabled": [
+"A6ca7",
+"Ad751",
+"Ac3ca",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R"
+],
+"test_slots.width": [
+"Ab5a1",
+"R",
+"R",
+"R",
+"Aaa36",
+"R",
+"Ad4af",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R"
+],
+"test_slots.min_items": [
+"Adc94",
+"R",
+"R",
+"Aacfa",
+"A879b",
+"R",
+"A7e12",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R"
+],
+"test_slots.wait_timeout_seconds": [
+"Ab8cd",
+"R",
+"R",
+"R",
+"Abfc1",
+"R",
+"Ae4e7",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R"
+],
+"dashboard": [
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"R",
+"R"
+],
+"dashboard.enabled": [
+"A42f3",
+"Ad751",
+"Ab3d6",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R"
+],
+"dashboard.host": [
+"Ab9d8",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"Aace9",
+"A388b",
+"A28f6",
+"A92a3",
+"A5480",
+"A7f8d",
+"A7b50",
+"A825d",
+"Aed96",
+"A5f3e",
+"A399d",
+"A2afb",
+"Ab600",
+"A624c",
+"A0667",
+"A6ade",
+"A4b0e",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R"
+],
+"dashboard.port": [
+"Abc6a",
+"R",
+"R",
+"R",
+"A056b",
+"R",
+"Aab16",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R"
+],
+"dashboard.poll_interval_seconds": [
+"A93b2",
+"R",
+"R",
+"R",
+"Aa1d5",
+"R",
+"A2fae",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R"
+],
+"dashboard.collector_interval_seconds": [
+"A49fe",
+"R",
+"R",
+"R",
+"A5575",
+"R",
+"A1254",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R"
+],
+"dashboard.rollup_interval_seconds": [
+"A2a62",
+"R",
+"R",
+"R",
+"Aacb0",
+"R",
+"Ad5a9",
 "R",
 "R",
 "R",
@@ -18144,7 +18843,7 @@
 "R"
 ],
 "post_mortem.enabled": [
-"Ad751",
+"A3b62",
 "Ad751",
 "A6709",
 "R",
@@ -18188,7 +18887,7 @@
 "R"
 ],
 "post_mortem.db_path": [
-"Ad751",
+"A90be",
 "R",
 "R",
 "R",
@@ -18232,7 +18931,7 @@
 "R"
 ],
 "post_mortem.message_node_limit": [
-"Ad751",
+"A4eb2",
 "Adad5",
 "Ab9ee",
 "A8cb8",
@@ -18276,7 +18975,7 @@
 "R"
 ],
 "post_mortem.match_window_margin_seconds": [
-"Ad751",
+"A6a6d",
 "A5211",
 "Abd1d",
 "A5607",
@@ -18320,7 +19019,7 @@
 "R"
 ],
 "post_mortem.unparseable_started_at_lookback_seconds": [
-"Ad751",
+"A3a3c",
 "A539e",
 "Ada46",
 "A891e",
@@ -18540,7 +19239,7 @@
 "R"
 ],
 "post_mortem.temp_copy_max_bytes": [
-"Ad751",
+"Af657",
 "Aa2c6",
 "A5cdf",
 "Ae40c",
@@ -18584,7 +19283,7 @@
 "Aa563"
 ],
 "post_mortem.temp_copy_reclaim_max_age_hours": [
-"Ad751",
+"A8fa0",
 "A55c0",
 "Ace9b",
 "Ab2e0",
@@ -19066,754 +19765,6 @@
 "R",
 "R",
 "R"
-],
-"test_slots": [
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"R",
-"R"
-],
-"test_slots.enabled": [
-"Ad751",
-"Ad751",
-"Ac3ca",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R"
-],
-"test_slots.width": [
-"Ad751",
-"R",
-"R",
-"R",
-"Aaa36",
-"R",
-"Ad4af",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R"
-],
-"test_slots.min_items": [
-"Ad751",
-"R",
-"R",
-"Aacfa",
-"A879b",
-"R",
-"A7e12",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R"
-],
-"test_slots.wait_timeout_seconds": [
-"Ad751",
-"R",
-"R",
-"R",
-"Abfc1",
-"R",
-"Ae4e7",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R"
-],
-"runtime.operator_worktree_roots": [
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"A571c",
-"Abf80",
-"Ac301",
-"A2af5",
-"R",
-"R",
-"A3066",
-"Af6d6",
-"R",
-"R",
-"R"
-],
-"dashboard": [
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"R",
-"R"
-],
-"dashboard.enabled": [
-"Ad751",
-"Ad751",
-"Ab3d6",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R"
-],
-"dashboard.host": [
-"Ad751",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"Aace9",
-"A388b",
-"A28f6",
-"A92a3",
-"A5480",
-"A7f8d",
-"A7b50",
-"A825d",
-"Aed96",
-"A5f3e",
-"A399d",
-"A2afb",
-"Ab600",
-"A624c",
-"A0667",
-"A6ade",
-"A4b0e",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R"
-],
-"dashboard.port": [
-"Ad751",
-"R",
-"R",
-"R",
-"A056b",
-"R",
-"Aab16",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R"
-],
-"dashboard.poll_interval_seconds": [
-"Ad751",
-"R",
-"R",
-"R",
-"Aa1d5",
-"R",
-"A2fae",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R"
-],
-"dashboard.collector_interval_seconds": [
-"Ad751",
-"R",
-"R",
-"R",
-"A5575",
-"R",
-"A1254",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R"
-],
-"dashboard.rollup_interval_seconds": [
-"Ad751",
-"R",
-"R",
-"R",
-"Aacb0",
-"R",
-"Ad5a9",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R"
-],
-"labels.model_tier_prefix": [
-"Ad751",
-"Af79e",
-"A69a2",
-"A235d",
-"Ad52e",
-"Afcf7",
-"Ac7f9",
-"Afa1f",
-"A172e",
-"Af27d",
-"Affaa",
-"A00c1",
-"Ad5f2",
-"A0a0d",
-"A3795",
-"A241c",
-"A51fb",
-"A109e",
-"Ac533",
-"A55d9",
-"A6050",
-"A12d7",
-"Aaebd",
-"A0d0e",
-"A07a4",
-"A8ca5",
-"A408f",
-"A790b",
-"A3d03",
-"A5543",
-"A01e2",
-"A6410",
-"A140a",
-"A3933",
-"A2f4f",
-"Aae29",
-"A7283",
-"Ab801",
-"Ac6e5",
-"A5e1b",
-"A3f5c",
-"A7229"
-],
-"labels.priority_prefix": [
-"Ad751",
-"A8127",
-"A978d",
-"Ac994",
-"A92f5",
-"A4200",
-"A35f4",
-"Abc98",
-"A2534",
-"A22b5",
-"A4446",
-"Ada55",
-"A1b84",
-"Ad92c",
-"A9fdb",
-"A63c0",
-"A0de7",
-"A61c9",
-"Acd82",
-"Acc5b",
-"A0298",
-"Aa1c9",
-"A524c",
-"A779c",
-"A5f3b",
-"A198f",
-"Abbb1",
-"A0c1a",
-"A4d47",
-"A941d",
-"Ad05d",
-"Aafcd",
-"A5da0",
-"A51ec",
-"A5d85",
-"A863f",
-"Af1cb",
-"A842b",
-"Ab848",
-"Aaf0e",
-"Ada13",
-"A7f94"
-],
-"auto_merge.mergequeue_skip_line_label": [
-"A9940",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"Aa4f3",
-"A73c1",
-"A01cb",
-"A3d1e",
-"A9416",
-"A215f",
-"Aa7eb",
-"A5de4",
-"A1e3e",
-"Ab5c5",
-"A3442",
-"A9417",
-"A46a6",
-"A05ef",
-"A31ee",
-"A8a6c",
-"A9d1d",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R"
-],
-"auto_merge.mergequeue_requeue_cap": [
-"Ad751",
-"R",
-"R",
-"Aa0bf",
-"A8270",
-"R",
-"A5ecd",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R",
-"R"
 ]
 },
 "sections": {
@@ -20096,24 +20047,6 @@
 "Ad751",
 "Ad751"
 ],
-"post_mortem": [
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751"
-],
-"heartbeat": [
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751",
-"Ad751"
-],
 "test_slots": [
 "Ad751",
 "Ad751",
@@ -20124,6 +20057,24 @@
 "Ad751"
 ],
 "dashboard": [
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751"
+],
+"post_mortem": [
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751",
+"Ad751"
+],
+"heartbeat": [
 "Ad751",
 "Ad751",
 "Ad751",
@@ -20181,12 +20132,12 @@
 "runner_capacity_escalation": "R",
 "supervisor": "R",
 "fleet_supervisor": "R",
+"test_slots": "R",
+"dashboard": "R",
 "post_mortem": "R",
 "post_mortem.signature_rules": "R",
 "post_mortem.signature_rules.0": "R",
-"heartbeat": "R",
-"test_slots": "R",
-"dashboard": "R"
+"heartbeat": "R"
 },
 "cases": {
 "deadlock": "R",
@@ -20222,7 +20173,7 @@
 "worker_harness_bad": "R",
 "worker_harness_command": "Af56e",
 "worker_harness_int": "R",
-"worker_model_int": "X",
+"worker_model_int": "R",
 "rescue_worker_nonmapping": "A94ac",
 "rescue_worker_none": "A94ac",
 "rescue_worker_unknown": "R",
@@ -20282,11 +20233,11 @@
 "runner_floors_disagree": "R",
 "runner_floors_ok": "A2d3b",
 "runner_floors_scaling_off": "Afe79",
-"alloc_max_running_mapping": "R",
+"alloc_max_running_mapping": "RC",
 "alloc_max_running_pairs": "A057d",
-"alloc_max_running_dup": "R",
-"alloc_min_above_ceiling": "R",
-"alloc_reserved_neg": "R",
+"alloc_max_running_dup": "RC",
+"alloc_min_above_ceiling": "RC",
+"alloc_reserved_neg": "RC",
 "alloc_bool_int": "R",
 "scaling_bool_int": "A1454",
 "scaling_min_gt_max": "A246e",

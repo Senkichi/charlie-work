@@ -1771,7 +1771,16 @@ class WorkerRoleConfig:
     """
 
     harness: str = "manual"
-    model: str = ""
+    # Issue #2117: reject a non-string model at the boundary as a FieldError.
+    # Without the ``Typed`` marker the raw value (e.g. ``model: 5``) is stored
+    # as-is and later crashes ``role_chain.model_family`` with a bare
+    # ``AttributeError`` on ``.strip()`` -- not a ``ConfigError``, so callers
+    # that catch ``ConfigError`` keep going. ``model`` is a plain string on
+    # every use site of this class (top-level worker and rescue.worker /
+    # rescue.reviewer), so the check can live here, on the field itself,
+    # unlike ``harness`` which diverges per use site. ``NotNull``: only
+    # ``""`` means "harness default"; null stays the crash it always was.
+    model: Annotated[str, Typed, NotNull] = ""
     # Issue #2086: role chain, see role_chain.py. ``Verbatim`` because rescue.worker /
     # rescue.reviewer reuse this class and never parsed ``fallbacks`` (main stores the raw
     # value); the top-level ``worker:`` section opts in with a use-site ``Entries``.
@@ -1798,7 +1807,12 @@ class ReviewerRoleConfig:
     """
 
     harness: Annotated[str, Typed, NotNull, OneOf(*sorted(REVIEWER_HARNESSES))] = "claude-code"
-    model: str = _DEFAULT_CLAUDE_MODEL
+    # Issue #2117: a non-string model is a FieldError here too; without the
+    # marker ``reviewer.model: 5`` / ``model: null`` were silently stored and
+    # only crashed ``role_chain.model_family`` once the worker side had a
+    # known family. The fallbacks entries' ``model`` is checked separately by
+    # ``RoleEntry.model`` (role_chain.py).
+    model: Annotated[str, Typed, NotNull] = _DEFAULT_CLAUDE_MODEL
     effort: Annotated[str, Typed, NotNull] = ""
     effort_experiment_fraction: Annotated[float, Typed, NotNull, InRange(0.0, 1.0)] = 0.0
     effort_experiment_salt: Annotated[str, Typed, NotNull] = ""
