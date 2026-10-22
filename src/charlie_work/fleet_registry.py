@@ -16,6 +16,12 @@ from .config import DEFAULT_CONFIG_FILENAME
 from .global_config import load_layered_config
 from .file_lock import ByteRangeFileLock, try_acquire_byte_range_lock
 from .fleet_paths import warn_fleet_dir_virtualization_on_write
+
+# Deliberate re-export (issue #2764): the one-walk fleet counter is extracted
+# to its own domain module; its public name stays reachable (and patchable)
+# through ``charlie_work.fleet_registry`` for every consumer and test that
+# late-binds to this module.
+from .fleet_live_counts import count_fleet_live_sessions_with_adapter_kinds
 from .github import GitHub, GitHubError, GitHubLike
 from .paths import RepoNotFoundError, RuntimePaths, find_repo_root
 from .safe_path import contains
@@ -326,8 +332,10 @@ def _iter_registered_repo_contexts(
 ) -> Iterator[tuple[str, Path, Path, OrchestratorConfig]]:
     """Yield ``(name_with_owner, repo_root, state_dir, repo_config)`` per registered repo.
 
-    The shared per-repo resolution ``count_fleet_live_sessions`` and
-    ``count_fleet_live_reviews`` both walk. A repo that cannot be resolved is
+    The shared per-repo resolution the fleet walkers all use:
+    ``count_fleet_live_sessions`` (via the combined walker it wraps),
+    ``count_fleet_live_sessions_with_adapter_kinds``, and
+    ``count_fleet_live_reviews``. A repo that cannot be resolved is
     appended to ``skipped_repos`` (the caller's operator-visibility list) and
     not yielded: ``repo_root`` missing or not a git worktree, ``state_dir``
     missing, or a config load failure (missing/unreadable/malformed/invalid).
@@ -411,15 +419,18 @@ def count_fleet_live_sessions(
     skipping them and returning a list of skipped repo keys for operator
     visibility.
 
-    Each repo contributes
-    ``live_session_count.count_live_sessions(sessions_dir,
-    state_file, WORKER_LANE)`` -- the SAME liveness rule the per-repo
-    ``dispatch.max_concurrent_sessions`` cap uses (sidecar ``is_alive`` plus
-    the ghost-worker corroboration against the repo's ``state.json``, issue
-    #343), so the fleet and per-repo caps cannot disagree about what "live"
-    means (issue #2230: before this, the fleet count walked sidecars only and
-    a ghost -- a dispatched issue whose worker_pid is alive but whose
-    sidecar is gone -- was invisible to it).
+    Thin wrapper over
+    :func:`fleet_live_counts.count_fleet_live_sessions_with_adapter_kinds`
+    (issue #2764): the total half of its one registry walk. Each repo
+    contributes
+    ``live_session_count.count_live_sessions_with_adapter_kinds(sessions_dir,
+    state_file, WORKER_LANE)`` -- the SAME single sidecar pass plus liveness
+    rule the per-repo ``dispatch.max_concurrent_sessions`` cap uses (sidecar
+    ``is_alive`` plus the ghost-worker corroboration against the repo's
+    ``state.json``, issue #343), so the fleet and per-repo caps cannot
+    disagree about what "live" means (issue #2230: before this, the fleet
+    count walked sidecars only and a ghost -- a dispatched issue whose
+    worker_pid is alive but whose sidecar is gone -- was invisible to it).
 
     Args:
         fleet_dir_override: Optional override for the fleet directory path.
@@ -432,33 +443,9 @@ def count_fleet_live_sessions(
         - config load failure (missing/unreadable/malformed/invalid), or
         - resolved sessions_dir missing.
     """
-    # Imported at the one call site so fleet_registry's module-load graph is
-    # unchanged for every review-lane consumer.
-    from .live_session_count import WORKER_LANE, count_live_sessions
-
-    total_live_count = 0
-    skipped_repos: list[str] = []
-
-    for name_with_owner, repo_root, state_dir, repo_config in _iter_registered_repo_contexts(
-        fleet_dir_override, skipped_repos
-    ):
-        sessions_dir = layout.resolve_state_child(
-            repo_config.devin.sessions_dir,
-            repo_root=repo_root,
-            default=layout.sessions_dir_default(state_dir),
-        )
-        if not sessions_dir.exists():
-            logger.warning(
-                f"Skipping fleet live-count for {name_with_owner}: "
-                f"sessions_dir {sessions_dir} does not exist"
-            )
-            skipped_repos.append(name_with_owner)
-            continue
-
-        total_live_count += count_live_sessions(
-            sessions_dir, layout.state_file_path(state_dir), WORKER_LANE
-        )
-
+    total_live_count, _totals_by_kind, skipped_repos = (
+        count_fleet_live_sessions_with_adapter_kinds(fleet_dir_override)
+    )
     return total_live_count, skipped_repos
 
 
@@ -467,35 +454,18 @@ def count_fleet_live_sessions_by_adapter_kind(
 ) -> tuple[dict[str, int], list[str]]:
     """Live worker sessions across all registered repos, keyed by ``adapter_kind``.
 
-    The per-harness twin of :func:`count_fleet_live_sessions` (issue #2757):
-    same registry walk, same skip semantics, same sidecar liveness rule (see
+    The per-harness twin of :func:`count_fleet_live_sessions` (issue #2757).
+    Thin wrapper over
+    :func:`fleet_live_counts.count_fleet_live_sessions_with_adapter_kinds`
+    (issue #2764): the per-kind half of its one registry walk -- same walk,
+    same skip semantics, same sidecar liveness rule (see
     ``live_session_count.count_live_sessions_by_adapter_kind`` for why ghosts
     are not attributed). Returns ``(counts_by_adapter_kind, skipped_repos)``.
     """
-    from .live_session_count import count_live_sessions_by_adapter_kind
-
-    totals: dict[str, int] = {}
-    skipped_repos: list[str] = []
-
-    for name_with_owner, repo_root, state_dir, repo_config in _iter_registered_repo_contexts(
-        fleet_dir_override, skipped_repos
-    ):
-        sessions_dir = layout.resolve_state_child(
-            repo_config.devin.sessions_dir,
-            repo_root=repo_root,
-            default=layout.sessions_dir_default(state_dir),
-        )
-        if not sessions_dir.exists():
-            logger.warning(
-                f"Skipping fleet per-harness live-count for {name_with_owner}: "
-                f"sessions_dir {sessions_dir} does not exist"
-            )
-            skipped_repos.append(name_with_owner)
-            continue
-        for kind, count in count_live_sessions_by_adapter_kind(sessions_dir).items():
-            totals[kind] = totals.get(kind, 0) + count
-
-    return totals, skipped_repos
+    _total_live_count, totals_by_kind, skipped_repos = (
+        count_fleet_live_sessions_with_adapter_kinds(fleet_dir_override)
+    )
+    return totals_by_kind, skipped_repos
 
 
 def count_fleet_live_reviews(

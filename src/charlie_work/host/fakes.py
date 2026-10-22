@@ -90,8 +90,19 @@ class FakeSessionCounter:
         issue_numbers: set[int] | None = None,
         session_pids: dict[str, int] | None = None,
         fleet_workers_by_adapter_kind: tuple[dict[str, int], list[str]] = ({}, []),
+        fleet_workers_with_adapter_kinds: tuple[int, dict[str, int], list[str]] | None = None,
     ) -> None:
         self.fleet_workers_by_adapter_kind = fleet_workers_by_adapter_kind
+        if fleet_workers_with_adapter_kinds is None:
+            # One-registry-walk default (issue #2764): derived from the two
+            # scripted halves so constructions that only script those keep
+            # working unchanged.
+            fleet_workers_with_adapter_kinds = (
+                fleet_workers[0],
+                dict(fleet_workers_by_adapter_kind[0]),
+                list(fleet_workers_by_adapter_kind[1]),
+            )
+        self.fleet_workers_with_adapter_kinds = fleet_workers_with_adapter_kinds
         self.workers = workers
         self.reviews = reviews
         self.fleet_workers = fleet_workers
@@ -111,6 +122,10 @@ class FakeSessionCounter:
     def fleet_live_workers_by_adapter_kind(self, fleet_dir_override):
         self.calls.append(("fleet_live_workers_by_adapter_kind", (fleet_dir_override,)))
         return self.fleet_workers_by_adapter_kind
+
+    def fleet_live_workers_with_adapter_kinds(self, fleet_dir_override):
+        self.calls.append(("fleet_live_workers_with_adapter_kinds", (fleet_dir_override,)))
+        return self.fleet_workers_with_adapter_kinds
 
     def live_reviews(self, reviews_dir, state_file=None) -> int:
         self.calls.append(("live_reviews", (reviews_dir, state_file)))

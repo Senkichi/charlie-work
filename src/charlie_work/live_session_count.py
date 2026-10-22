@@ -88,8 +88,16 @@ def _ghost_pid_alive(entry: dict[str, Any], kind: LiveSessionKind) -> bool:
     return _host.current().probe.is_alive(pid, entry.get(kind.start_time_field))
 
 
-def count_live_sessions(directory: Path, state_file: Path | None, kind: LiveSessionKind) -> int:
-    """Count live sessions under ``directory``, corroborated against ``state_file``.
+def count_live_sessions_with_adapter_kinds(
+    directory: Path, state_file: Path | None, kind: LiveSessionKind
+) -> tuple[int, dict[str, int]]:
+    """One ``iter_workers`` pass returning the corroborated total AND the per-kind counts.
+
+    The single-pass body behind :func:`count_live_sessions` (which returns the
+    total) and :func:`count_live_sessions_by_adapter_kind` (which returns the
+    per-``adapter_kind`` breakdown): one sidecar walk feeds both results, then
+    the ghost corroboration adds to the total only (issue #2764 -- a caller
+    that needs both numbers, the fleet governor, walks the sessions dir once).
 
     Sidecar pass: every ``iter_workers`` record whose pid probe is alive
     counts once, keyed on ``issue_number`` so the corroboration pass never
@@ -103,16 +111,19 @@ def count_live_sessions(directory: Path, state_file: Path | None, kind: LiveSess
     it, a reap lane that strands state.json's dispatch record (or any other
     path that loses the sidecar of a still-live process) makes a running
     worker/reviewer invisible to concurrency accounting and the next pass
-    can launch past the configured cap (issue #343).
+    can launch past the configured cap (issue #343). A ghost has no sidecar
+    and therefore no known adapter, so it never enters the per-kind counts.
     """
     from .worker import iter_workers
 
     live_numbers: set[int] = set()
     live_count = 0
+    counts: dict[str, int] = {}
     for w in iter_workers(directory):
         if w.is_alive():
             live_count += 1
             live_numbers.add(w.issue_number)
+            counts[w.adapter_kind] = counts.get(w.adapter_kind, 0) + 1
 
     if state_file is not None:
         state = load_state_locked(state_file)
@@ -137,7 +148,16 @@ def count_live_sessions(directory: Path, state_file: Path | None, kind: LiveSess
                     flush=True,
                 )
 
-    return live_count
+    return live_count, counts
+
+
+def count_live_sessions(directory: Path, state_file: Path | None, kind: LiveSessionKind) -> int:
+    """Count live sessions under ``directory``, corroborated against ``state_file``.
+
+    Thin wrapper over :func:`count_live_sessions_with_adapter_kinds` (issue
+    #2764): the total half of its single sidecar pass, unchanged in behavior.
+    """
+    return count_live_sessions_with_adapter_kinds(directory, state_file, kind)[0]
 
 
 def count_live_sessions_by_adapter_kind(directory: Path) -> dict[str, int]:
@@ -146,14 +166,11 @@ def count_live_sessions_by_adapter_kind(directory: Path) -> dict[str, int]:
     The per-harness view (issue #2757) of the sidecar pass in
     :func:`count_live_sessions`: the same ``iter_workers`` + ``is_alive`` rule,
     so a per-harness count can never disagree with the total about what "live"
-    means. The state.json ghost corroboration is deliberately NOT repeated: a
-    ghost has no sidecar and therefore no known adapter, so it counts toward the
-    total cap (which does corroborate) but cannot be attributed to a harness.
+    means. Thin wrapper over :func:`count_live_sessions_with_adapter_kinds`
+    (issue #2764): the per-kind half of its single sidecar pass, with no
+    ``state_file`` -- the state.json ghost corroboration is deliberately NOT
+    applied, because a ghost has no sidecar and therefore no known adapter, so
+    it counts toward the total cap (which does corroborate) but cannot be
+    attributed to a harness.
     """
-    from .worker import iter_workers
-
-    counts: dict[str, int] = {}
-    for w in iter_workers(directory):
-        if w.is_alive():
-            counts[w.adapter_kind] = counts.get(w.adapter_kind, 0) + 1
-    return counts
+    return count_live_sessions_with_adapter_kinds(directory, None, WORKER_LANE)[1]
