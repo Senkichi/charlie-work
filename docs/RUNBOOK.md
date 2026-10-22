@@ -1171,8 +1171,12 @@ the deleted per-issue routing layer used to run). It calls
 `max_usd_per_session` when set above 0, else `preflight_reserve_usd`), and
 the lifetime check is strict `lifetime_spent < lifetime_usd` — spend exactly
 at the lifetime cap is exhausted. On exhaustion no worker process is
-spawned: an `api_budget_refused` warning event is appended to `state.json`,
-and the launch comes back as an error record (sidecar) whose launch error
+spawned: an `api_budget_refused` warning event is recorded (via
+`instrumentation.log_event`) in `events.db`, the SQLite audit log beside
+`state.json` — not in the state.json `events` ring. Query it with
+`query_events(Path('.var/charlie-work/state.json'), kind='api_budget_refused')`,
+or run the one-liner from the Events section above filtered to that kind. The
+launch also comes back as an error record (sidecar) whose launch error
 class is `budget` (`launch_events.LAUNCH_ERR_BUDGET`, "spend-cap refusal").
 A missing or corrupt ledger is treated as empty spend and never refuses a
 launch, and the check is skipped when no `config` is passed (direct
@@ -1205,18 +1209,6 @@ write makes a torn final file rare, but does not protect a manually edited file.
 Three api-specific failure outcomes. The first two are surfaced as values on
 the sidecar (`failure_kind` field of `issue-<n>.api.json`) and never raised;
 the third is a launch refusal before any worker process exists:
-
-**`budget` launch refusal (daily/lifetime cap exhausted).** Before any
-process spawns, `launch_api_worker` refuses the launch when
-`api_budget.budget_status` reports the daily or lifetime cap exhausted (see
-Budget operations above for the exact checks). The launch returns an error
-record — the sidecar `issue-<n>.api.json` with `.error` set — with launch
-error class `budget` (`launch_events.LAUNCH_ERR_BUDGET`), and an
-`api_budget_refused` warning event is appended to `state.json`. Recovery:
-raise `budget.max_usd_per_day` and/or `budget.lifetime_usd` in config
-(global or per-repo) and reload — there is no ledger reset, so raising the
-cap restores headroom immediately (see "Raising caps" above). No timeout
-clears it; a held launch stays held until the config changes.
 
 **`budget_exceeded` (in-flight per-session cap).** When
 `budget.max_usd_per_session` is set (`> 0`), each supervision pass accumulates
@@ -1257,6 +1249,28 @@ itself. Recovery:
    `now >= throttled_until`) or **clear the throttle state** by setting
    `throttled_until` to `null` in `.var/charlie-work/state.json` (atomic write —
    never edit in place while a pass is running).
+
+**`budget` launch refusal (daily/lifetime cap exhausted).** Before any
+process spawns, `launch_api_worker` refuses the launch when
+`api_budget.budget_status` reports the daily or lifetime cap exhausted (see
+Budget operations above for the exact checks). The launch returns an error
+record — the sidecar `issue-<n>.api.json` with `.error` set — with launch
+error class `budget` (`launch_events.LAUNCH_ERR_BUDGET`), and an
+`api_budget_refused` warning event is recorded (via
+`instrumentation.log_event`) in `events.db` — query it with
+`query_events(Path('.var/charlie-work/state.json'), kind='api_budget_refused')`.
+Recovery depends on which cap is exhausted (a missing or corrupt ledger makes
+`budget_status` report empty spend, so neither refusal applies):
+
+- **Daily cap exhaustion self-clears at the UTC date rollover.** The daily
+  check reads `ledger.days[<UTC date today>]`, so once the clock ticks into a
+  new UTC date the ledger shows no spend for "today" and lifts are allowed
+  again — no config change or operator action needed. To lift it sooner,
+  raise `budget.max_usd_per_day` in config (global or per-repo) and reload.
+- **Lifetime cap exhaustion does not self-clear.** Lifetime spend never
+  decays; the only recovery is raising `budget.lifetime_usd` in config
+  (global or per-repo) and reloading. There is no ledger reset (see
+  "Raising caps" above).
 
 `doctor` surfaces both failure kinds: its launched-sessions probe appends
 `provider-auth: <issues>` and `budget-exceeded: <issues>` fragments to the
