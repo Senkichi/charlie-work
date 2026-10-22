@@ -24,7 +24,7 @@ from _dashboard_metrics_fixtures import (
 from _dashboard_rollup_fixtures import Fleet
 
 from charlie_work import instrumentation
-from charlie_work.dashboard import history_data, metrics, rollup
+from charlie_work.dashboard import history_data, metrics, rollup, sources
 from charlie_work.dashboard.history_data import (
     HistoryCache,
     HistoryUnavailable,
@@ -217,8 +217,18 @@ def test_approx_series_is_dashed_and_says_why(db_path: Path) -> None:
     )
 
 
-def test_not_instrumented_card_is_honest(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    path = _rolled(tmp_path, monkeypatch, (build_base,))  # no runner_allocation anywhere
+def test_not_instrumented_card_is_honest(tmp_path: Path) -> None:
+    # #2526: the card only needs a live fleet source that never wrote
+    # runner_allocation — a 3-repo Fleet + build_base's full history made this
+    # test a ledger hot spot for no extra coverage.
+    fleet_dir = tmp_path / "fleet"
+    fleet_dir.mkdir()
+    heartbeat = fleet_dir / sources.HEARTBEAT_FILENAME
+    instrumentation.log_event(heartbeat, "supervisor_started", {})
+    instrumentation.close_db(heartbeat)
+    resolved = rollup.rollup_sources(str(fleet_dir))
+    assert rollup.run_rollup(resolved, NOW).errors == ()
+    path = resolved.db_path  # no runner_allocation anywhere
     view = load_tab(path, "capacity", "7d", NOW)
     assert isinstance(view, HistoryView) and view.get("runners_running").headline.not_instrumented
     page = _view_page(view, "capacity")
