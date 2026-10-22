@@ -1025,8 +1025,8 @@ workers like any other, and dead-worker reconciliation is unchanged. Selection
 is whole-pass, not per-issue: set `worker.harness: api` and every issue this
 pass dispatches uses the api worker. (Phase 2 of the role-config refactor
 deleted the per-issue routing/fallback layer that used to send only reworks
-and `complexity:high` first-pass issues to api — see the budget-exhaustion
-note below for the one open question that deletion left.)
+and `complexity:high` first-pass issues to api; its launch-time budget
+preflight lives on in `launch_api_worker` — see Budget operations below.)
 
 Design reference: [docs/design/api-worker-adapter.md](design/api-worker-adapter.md).
 The config dataclasses are `ApiWorkerConfig`, `ApiProviderConfig`, and
@@ -1141,8 +1141,8 @@ measure first:
 
 **Daily/lifetime caps while the per-session cap is unset.** With
 `max_usd_per_session: 0`, `budget.max_usd_per_day` and `budget.lifetime_usd`
-are the only caps in play — see the budget-exhaustion note below for what
-currently enforces them.
+are the only caps in play — `launch_api_worker` refuses a new api launch
+once either is exhausted (see Budget operations below).
 
 ### Budget operations
 
@@ -1162,20 +1162,22 @@ Get-Content .var\charlie-work\api-budget.json | ConvertFrom-Json
 Today's spend is `days[<UTC date>].usd`; lifetime is `lifetime_usd`;
 per-session detail is `sessions` (the calibration source).
 
-**What happens at daily/lifetime exhaustion — a known open gap.** Before the
-role-config refactor's Phase 2, a preflight in the now-deleted per-issue
-routing layer (`routing._api_preflight`) refused a new api launch once
-`spent_today + reserve > max_usd_per_day` or lifetime spend reached
-`lifetime_usd`, falling back to a different adapter for that issue. That
-preflight lived nowhere else — it was called only from the routing-selection
-path Phase 2 deletes wholesale (per-issue routing is gone; the api adapter is
-now selected for a whole pass via `worker.harness: api`, not per issue), and
-no replacement pre-launch budget check was introduced in its place. Until a
-follow-up adds one, `days[<date>].usd`/`lifetime_usd` in the ledger are
-monitoring figures only (`doctor` / `fleet status`'s attention digest can
-surface them) — dispatching a pass with `worker.harness: api` set does not
-itself stop at either cap. A follow-up issue should be filed for this gap
-before relying on an automatic cutoff in production.
+**What happens at daily/lifetime exhaustion — launch refusal.**
+`launch_api_worker` refuses a new api launch once either cap is exhausted
+(`_budget_exhausted_error`, added by issue #1514 to replace the preflight
+the deleted per-issue routing layer used to run). It calls
+`api_budget.budget_status` against the ledger: the daily check is
+`spent_today + reserve <= max_usd_per_day` (reserve is
+`max_usd_per_session` when set above 0, else `preflight_reserve_usd`), and
+the lifetime check is strict `lifetime_spent < lifetime_usd` — spend exactly
+at the lifetime cap is exhausted. On exhaustion no worker process is
+spawned: an `api_budget_refused` warning event is appended to `state.json`,
+and the launch comes back as an error record (sidecar) whose launch error
+class is `budget` (`launch_events.LAUNCH_ERR_BUDGET`, "spend-cap refusal").
+A missing or corrupt ledger is treated as empty spend and never refuses a
+launch, and the check is skipped when no `config` is passed (direct
+construction only — the production dispatch path always passes one). See
+Failure modes below for the recovery path.
 
 **Raising caps.** Edit `budget.max_usd_per_day` and/or `budget.lifetime_usd` in
 config (global or per-repo) and reload. There is no ledger reset — raising
@@ -1200,8 +1202,21 @@ write makes a torn final file rare, but does not protect a manually edited file.
 
 ### Failure modes
 
-Two api-specific failure kinds, both surfaced as values on the sidecar
-(`failure_kind` field of `issue-<n>.api.json`) and never raised:
+Three api-specific failure outcomes. The first two are surfaced as values on
+the sidecar (`failure_kind` field of `issue-<n>.api.json`) and never raised;
+the third is a launch refusal before any worker process exists:
+
+**`budget` launch refusal (daily/lifetime cap exhausted).** Before any
+process spawns, `launch_api_worker` refuses the launch when
+`api_budget.budget_status` reports the daily or lifetime cap exhausted (see
+Budget operations above for the exact checks). The launch returns an error
+record — the sidecar `issue-<n>.api.json` with `.error` set — with launch
+error class `budget` (`launch_events.LAUNCH_ERR_BUDGET`), and an
+`api_budget_refused` warning event is appended to `state.json`. Recovery:
+raise `budget.max_usd_per_day` and/or `budget.lifetime_usd` in config
+(global or per-repo) and reload — there is no ledger reset, so raising the
+cap restores headroom immediately (see "Raising caps" above). No timeout
+clears it; a held launch stays held until the config changes.
 
 **`budget_exceeded` (in-flight per-session cap).** When
 `budget.max_usd_per_session` is set (`> 0`), each supervision pass accumulates
@@ -1222,7 +1237,7 @@ budget-evaluated.
 
 **`provider_auth` (dead/invalid API key).** When an api session exits, its log
 tail is matched against 401/403/authentication/invalid-api-key patterns
-(`claude_code._PROVIDER_AUTH_PATTERN`, api-kind only, checked **before** generic
+(`throttle_signatures._PROVIDER_AUTH_PATTERN`, api-kind only, checked **before** generic
 throttle markers so a dead key is never mislabeled as a throttle). On a match,
 `failure_kind` is set to `provider_auth` and the provider enters a cooldown
 reusing the existing `throttled_until` state mechanism
