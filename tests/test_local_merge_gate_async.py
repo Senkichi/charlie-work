@@ -45,6 +45,7 @@ from _local_gate_async_fixtures import (  # noqa: E402
     SLEEP_SUITE,
     UNALLOCATABLE_PID,
     _adopt_and_approve,
+    _approved_sleep_gate,  # noqa: F401 -- registers the scaffold fixture (#2642)
     _commit_file,
     _event_kinds,
     _events_of_kind,
@@ -55,6 +56,7 @@ from _local_gate_async_fixtures import (  # noqa: E402
     _lane_app,
     _lane_config,
     _make_branch,
+    _no_windows_child_enumeration,  # noqa: F401 -- registers the kill-stub autouse fixture
     _seed_dead_claim,
     _wait_for_result,
     _wait_pid_dead,
@@ -152,36 +154,29 @@ def _backdate_gate_start(app: OrchestratorApp, pr_number: int) -> None:
 
 
 def test_approved_record_launches_suite_and_pass_returns_immediately(
+    approved_sleep_gate: OrchestratorApp,
     lane_repo: Path,
 ) -> None:
-    _init_repo(lane_repo)
-    issues_dir = lane_repo / "docs" / "issues"
-    head = _make_branch(lane_repo, "agent/issue-7-x", "a.py", "a = 1\n")
-    config = _lane_config(lane_repo, issues_dir, dispatch={"test_command": SLEEP_SUITE})
-    app = _lane_app(lane_repo, issues_dir, config=config)
-    _adopt_and_approve(app, issues_dir, 7, "agent/issue-7-x", head)
+    app = approved_sleep_gate
 
     t0 = time.monotonic()
     results = app._local_merge_approved()
     elapsed = time.monotonic() - t0
 
-    try:
-        assert elapsed < 60, f"gate pass blocked for {elapsed:.1f}s on a 600s suite"
-        assert results[0]["outcome"] == "suite_launched"
-        state = load_state_locked(app.paths.state_file)
-        record = state["prs"]["7"]
-        pid = int(record["local_suite_pid"])
-        assert is_pid_alive(pid)
-        assert record["local_suite_started_at"]
-        assert record["local_suite_log"].endswith("suite.log")
-        assert record["local_suite_head"] == branch_head_sha(lane_repo, "agent/issue-7-x")
-        launched = _events_of_kind(app, "local_suite_launched")
-        assert len(launched) == 1
-        assert launched[0]["payload"]["pid"] == pid
-        # The suite is genuinely still running -- the pass did not wait for it.
-        assert is_pid_alive(pid)
-    finally:
-        _kill_claimed_gate(app, 7)
+    assert elapsed < 60, f"gate pass blocked for {elapsed:.1f}s on a 600s suite"
+    assert results[0]["outcome"] == "suite_launched"
+    state = load_state_locked(app.paths.state_file)
+    record = state["prs"]["7"]
+    pid = int(record["local_suite_pid"])
+    assert is_pid_alive(pid)
+    assert record["local_suite_started_at"]
+    assert record["local_suite_log"].endswith("suite.log")
+    assert record["local_suite_head"] == branch_head_sha(lane_repo, "agent/issue-7-x")
+    launched = _events_of_kind(app, "local_suite_launched")
+    assert len(launched) == 1
+    assert launched[0]["payload"]["pid"] == pid
+    # The suite is genuinely still running -- the pass did not wait for it.
+    assert is_pid_alive(pid)
 
 
 def test_gate_suite_runs_with_the_reserved_slot_env(lane_repo: Path) -> None:

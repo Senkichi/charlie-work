@@ -319,7 +319,16 @@ def test_live_pid_stale_non_handoff_outcome_does_not_finalize(tmp_path: Path, mo
     paths = runtime_paths(tmp_path, config.runtime.state_dir)
 
     branch = "agent/issue-1867-stale-outcome-live-pid"
-    repo_root = _make_repo_with_pushed_branch(tmp_path, branch)
+    # A ``blocked`` outcome is rejected inside the filesystem-only
+    # live-handoff pre-check (``collect_stale_live_handoff_pids``) -- the sweep
+    # never asks git or gh anything on this path, and a worker that declared
+    # ``blocked`` never pushed in the first place, so the pushed-branch
+    # scaffold the handoff tests share was ~13 git spawns of fixture noise in
+    # the measured call phase (issue #2616). A bare directory is enough:
+    # ``worktree_path_for_branch``'s registered-worktree probe fails closed
+    # to the managed path.
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
     _seed_dispatched_issue(paths, issue_number=1867, branch=branch)
 
     worktrees_dir = resolved_layout(config, repo_root).worktrees

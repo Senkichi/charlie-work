@@ -37,7 +37,12 @@ from .review_fleet_gate import (
 from .fleet_registry import managed_repo_names  # noqa: F401  (deliberate re-export; used by review_fleet_gate via _wf.)
 from . import layout, status_snapshot  # noqa: F401  (deliberate re-export; layout reached via _wf.layout by orchestration/misc_reconcile.py)
 from .main_ci_reclaim import reclaim_superseded_main_ci_runs  # noqa: F401  (deliberate re-export; used by moved L01 b3 delegates via _wf.)
-from .notify import AttentionDigest, AttentionEntry, emit_digest, reviewer_quota_alert_digest
+from .notify import (  # noqa: F401  (AttentionDigest/AttentionEntry are deliberate re-exports; reached via _wf. by orchestration/state_maintenance.py)
+    AttentionDigest,
+    AttentionEntry,
+    emit_digest,
+    reviewer_quota_alert_digest,
+)
 from .rescue_review import (
     LEGACY_VACUOUS_SUMMARY,
     run_cross_family_review,  # noqa: F401  (deliberate re-export; patched on the workflow module in tests)
@@ -219,6 +224,22 @@ from .dispatch_selection import (  # noqa: F401  (deliberate re-export)
 )
 from .no_op_checkpoint import _paired_death_count  # noqa: F401  (deliberate re-export)
 from .no_op_rework_body import _body_content_sha256  # noqa: F401  (deliberate re-export; reached via _wf. by orchestration/state_record_review.py)
+
+# LOAD-BEARING RE-EXPORT — NOT AN UNUSED IMPORT. Do not delete; the `noqa`
+# below marks a deliberate re-export, not a lint concession.
+#
+# issue #2600: the attention-digest build/emit pipeline for the dispatch lanes
+# (the stateful digest builder plus the notify-gated stalled-session probe and
+# emit tails) now lives in `charlie_work.attention_digest`. Re-exported here,
+# not re-declared, so every existing `charlie_work.workflow.<name>` import and
+# monkeypatch target keeps resolving unchanged — the same pattern this file's
+# own `.dispatch_selection` block above uses.
+from .attention_digest import (  # noqa: F401  (deliberate re-export)
+    _build_attention_digest,
+    _detect_stalled_sessions_for_notify,
+    _emit_attention_digest,
+    _emit_stalled_session_digest,
+)
 from .orchestration.helpers_merge_gate import (  # noqa: F401  (deliberate re-export; reached via _wf. by orchestration/)
     _BASE_CURRENT_UNSET,
     _BaseCurrentUnset,
@@ -1849,91 +1870,6 @@ def _truncate_for_event(text: str, max_bytes: int = _EVENT_TEXT_MAX_BYTES) -> st
     return encoded[:keep].decode("utf-8", errors="ignore") + _EVENT_TRUNCATE_MARKER
 
 
-def _build_attention_digest(
-    state_file: Path,
-    health_transitions: dict[int, dict[str, Any]],
-    repo: str,
-    state_field: str = "health",
-) -> AttentionDigest | None:
-    """Build an AttentionDigest from health transitions observed in a pass.
-
-    Args:
-        state_file: Path to state.json for reading/writing per-issue health baseline
-        health_transitions: Dict mapping issue_number to transition data:
-            {
-                issue_number: {
-                    "adapter_kind": str,
-                    "health": str,  # current health (e.g., "STALLED", "RUNAWAY", "DEAD")
-                    "last_log_line": str | None,
-                    "pid": int | None,
-                    "terminal_tool": str | None,  # issue #261: post-mortem terminal tool (DEAD only)
-                    "terminal_reason": str | None,  # issue #261: one-line terminal cause
-                }
-            }
-        repo: Repository name for the digest
-        state_field: The state["issues"][n] field to read/write for transition
-            comparison. Defaults to "health"; callers tracking a separate alert
-            dimension (e.g. merge_alert) can pass their own field name.
-
-    Returns:
-        AttentionDigest if there are transitions, None otherwise. Updates per-issue
-        health field in state.json to the current health for transition comparison
-        on the next pass.
-    """
-    if not health_transitions:
-        return None
-
-    from .state import load_state, save_state, state_lock
-    from .state import utc_now
-
-    entries: list[AttentionEntry] = []
-
-    with state_lock(state_file):
-        state = load_state(state_file)
-
-        for issue_number, transition in health_transitions.items():
-            current_health = transition["health"]
-
-            # Read the last persisted health for this issue
-            issue_key = str(issue_number)
-            issue_entry = state.get("issues", {}).get(issue_key, {})
-            last_health = issue_entry.get(state_field)
-
-            # Only include if health changed (or no previous health persisted)
-            if last_health != current_health:
-                entries.append(
-                    AttentionEntry(
-                        issue_number=issue_number,
-                        adapter_kind=transition["adapter_kind"],
-                        health=current_health,
-                        previous_health=last_health,
-                        last_log_line=transition.get("last_log_line"),
-                        pid=transition.get("pid"),
-                        terminal_tool=transition.get("terminal_tool"),
-                        terminal_reason=transition.get("terminal_reason"),
-                    )
-                )
-
-                # Update the persisted health for this issue
-                state["issues"][issue_key] = {
-                    **issue_entry,
-                    state_field: current_health,
-                }
-
-        # Save the updated health baselines
-        if entries:
-            save_state(state_file, state)
-
-    if not entries:
-        return None
-
-    return AttentionDigest(
-        generated_at=utc_now(),
-        repo=repo,
-        transitions=tuple(entries),
-    )
-
-
 def _format_stale_base_alarm_message(pr_number: int, attempts: int, reason: str) -> str:
     """Human-readable alarm message for an approved PR whose base is not current."""
     pass_str = "pass" if attempts == 1 else "passes"
@@ -2589,6 +2525,11 @@ class OrchestratorApp:
             checks = self._enrich_checks_infra_blocked(
                 checks, self.config.auto_merge.required_checks
             )
+            # Issue #2540: resolve workflow run ids for required checks whose
+            # link is the app-assigned .../runs/<id> check-run shape, so the
+            # flake-aware debounce and the infra-rerun driver see a run id
+            # instead of treating the first failure as definitive.
+            checks = self._enrich_checks_run_ids(checks, self.config.auto_merge.required_checks)
 
         # Load PR state for no-op rework detection (only if PR has verdict history)
         pr_state = None
@@ -2599,6 +2540,8 @@ class OrchestratorApp:
 
         # Fetch diff for patch-id based no-op rework detection (issue #222)
         # This is needed before the janitor gate to detect actual content changes
+        # Issue #1807: a None here is a *fetch failure*, not an empty diff
+        # -- the #1807 gate below refuses to build a packet from it.
         diff = self.gh.pr_diff(pr_number)
 
         # Deterministic janitor gate BEFORE any packet spend: an
@@ -3461,6 +3404,10 @@ class OrchestratorApp:
                     "is_no_op_rework": verdict.is_no_op_rework,
                 },
             )
+        # Issue #1807: no packet from a fetch-failure None (the delegate
+        # module owns the #1251 empty-diff skip-forever rationale).
+        if diff is None:
+            return self._diff_unavailable_no_packet_result(pr_number, issue_number)
         pr_dir = self.paths.prs / f"pr-{pr_number}"
         pr_dir.mkdir(parents=True, exist_ok=True)
         # Issue #592: stamp the digest of the resolved review template +

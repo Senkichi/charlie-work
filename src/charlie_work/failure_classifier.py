@@ -254,6 +254,7 @@ def classify_failure(
     headless_permission_detection: bool = False,
     now: datetime | None = None,
     log_digest: Callable[[str], str] | None = None,
+    quota_reset: Callable[[str], timedelta | None] | None = None,
 ) -> tuple[str | None, str | None]:
     """Classify a session failure by matching the log tail against provider
     throttle/auth/suspension signatures. Called after a session exits.
@@ -282,9 +283,11 @@ def classify_failure(
     Rule 6 (design doc, FLIP 6): claude-code/api used to anchor at
     classification time instead; devin already used the emission anchor, so
     this is the one fleet-wide throttle-timing change in the nine-rule
-    resolution. ``quota_exhausted`` always anchors at classification time --
-    its fixed 24h cooldown has no provider-stated reset to anchor against,
-    so rule 6 does not affect it.
+    resolution. ``quota_exhausted`` always anchors at classification time,
+    so rule 6 does not affect it. Its cooldown is a fixed 24h unless
+    ``quota_reset`` (``AdapterFateProfile.quota_reset``) recovers the
+    provider's own reset from the tail -- opencode's Go limits are 5-hour,
+    weekly and monthly windows, none of them 24h.
 
     ``now`` is the injectable clock: defaults to ``datetime.now(UTC)`` when
     not supplied, so production behaviour is byte-identical (issue #822).
@@ -323,7 +326,10 @@ def classify_failure(
         else _CLASSIFY_DEFAULT_QUOTA_ERROR_MARKERS
     )
     if match_quota_tail(tail, quota_markers):
-        cooldown = timedelta(hours=_DEFAULT_QUOTA_COOLDOWN_HOURS, seconds=resume_margin_seconds)
+        reset = quota_reset(tail) if quota_reset is not None else None
+        if reset is None:
+            reset = timedelta(hours=_DEFAULT_QUOTA_COOLDOWN_HOURS)
+        cooldown = reset + timedelta(seconds=resume_margin_seconds)
         throttled_until = resolved_now + cooldown
         return "quota_exhausted", throttled_until.replace(microsecond=0).isoformat().replace(
             "+00:00", "Z"
@@ -342,13 +348,21 @@ def classify_failure(
             else _DEFAULT_RATE_LIMIT_COOLDOWN_MINUTES,
             seconds=resume_margin_seconds,
         )
-        # The byte slice can cut the first line mid-event: its embedded
-        # timestamps are not emission times, so the anchor never reads it.
-        whole_lines = tail.partition("\n")[2] if len(log_text) > len(tail) else tail
-        emitted_at = _throttle_emission_anchor(
-            log_path, whole_lines, now=resolved_now, throttle_markers=markers
-        )
-        throttled_until = max(resolved_now, emitted_at + cooldown)
+        if reset_minutes is None:
+            # No stated countdown: the default cooldown is a synthetic
+            # post-classification window, not a provider countdown that began
+            # at emission. Anchoring it at a stale emission time (a
+            # stall-reaped worker's log is >= a stall window old) would clamp
+            # max(now, emitted_at + 15m) to now -- a zero-length window.
+            throttled_until = resolved_now + cooldown
+        else:
+            # The byte slice can cut the first line mid-event: its embedded
+            # timestamps are not emission times, so the anchor never reads it.
+            whole_lines = tail.partition("\n")[2] if len(log_text) > len(tail) else tail
+            emitted_at = _throttle_emission_anchor(
+                log_path, whole_lines, now=resolved_now, throttle_markers=markers
+            )
+            throttled_until = max(resolved_now, emitted_at + cooldown)
         return "rate_limited", throttled_until.replace(microsecond=0).isoformat().replace(
             "+00:00", "Z"
         )

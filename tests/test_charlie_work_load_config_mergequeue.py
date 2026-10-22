@@ -156,3 +156,65 @@ auto_merge:
     )
     config = load_config(config_file)
     assert config.auto_merge.queue_bot_login == "aviator-app[bot]"
+
+
+def test_load_config_mergequeue_requeue_cap_defaults_to_three(tmp_path: Path) -> None:
+    """Issue #2743: an absent knob is a cap of 3 -- the feature ships ON."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    config_file.write_text("{}\n")
+    config = load_config(config_file)
+    assert config.auto_merge.mergequeue_requeue_cap == 3
+
+
+def test_load_config_parses_mergequeue_requeue_cap(tmp_path: Path) -> None:
+    config_file = tmp_path / "orchestrator.config.yaml"
+    config_file.write_text(
+        """
+auto_merge:
+  mergequeue_requeue_cap: 5
+"""
+    )
+    config = load_config(config_file)
+    assert config.auto_merge.mergequeue_requeue_cap == 5
+
+
+def test_load_config_mergequeue_requeue_cap_zero_disables(tmp_path: Path) -> None:
+    """The kill switch: 0 counts reverts but never gates the hand-off."""
+    config_file = tmp_path / "orchestrator.config.yaml"
+    config_file.write_text(
+        """
+auto_merge:
+  mergequeue_requeue_cap: 0
+"""
+    )
+    config = load_config(config_file)
+    assert config.auto_merge.mergequeue_requeue_cap == 0
+
+
+def test_load_config_rejects_negative_mergequeue_requeue_cap(tmp_path: Path) -> None:
+    config_file = tmp_path / "orchestrator.config.yaml"
+    config_file.write_text(
+        """
+auto_merge:
+  mergequeue_requeue_cap: -1
+"""
+    )
+    with pytest.raises(
+        ConfigError, match=r"^auto_merge\.mergequeue_requeue_cap: expected >= 0, got -1$"
+    ):
+        load_config(config_file)
+
+
+def test_load_config_rejects_non_int_mergequeue_requeue_cap(tmp_path: Path) -> None:
+    config_file = tmp_path / "orchestrator.config.yaml"
+    config_file.write_text(
+        """
+auto_merge:
+  mergequeue_requeue_cap: "many"
+"""
+    )
+    with pytest.raises(
+        ConfigError,
+        match=r"^auto_merge\.mergequeue_requeue_cap: expected int, got 'many' \(str\)$",
+    ):
+        load_config(config_file)

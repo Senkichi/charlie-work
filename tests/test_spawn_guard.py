@@ -49,6 +49,18 @@ SPAWN_ATTRS: dict[str, set[str]] = {
     "subprocess": {"run", "Popen", "check_output", "check_call", "call"},
 }
 
+# Every flaggable spawn call spells one of these tokens literally in the
+# file's source text: "subprocess" for any ``import subprocess`` /
+# ``from subprocess import ...`` binding (aliased or not -- the module name
+# is always written out), and the attribute or imported name for each ``os``
+# spawn function (``os.spawn*`` / ``os.posix_spawn*`` share "spawn"; the
+# remaining targets are "system", "popen" and "startfile"). A file without
+# any token holds no call the guard can resolve, so it is skipped before
+# ``parsed()`` -- under xdist the shared ``_src_ast`` cache's cold fill
+# otherwise lands on whichever whole-tree scanner runs first on the worker
+# (issue #2554; same filter shape as #2447, #2406, #2422, #2493, #2516).
+SPAWN_TOKENS = ("subprocess", "spawn", "system", "popen", "startfile")
+
 
 def _is_os_spawn(name: str) -> bool:
     return name in {"system", "popen", "startfile"} or name.startswith(("spawn", "posix_spawn"))
@@ -296,17 +308,17 @@ def find_spawn_guard_violations(root: Path) -> list[str]:
     violations: list[str] = []
     for path in source_files(root):
         source = source_text(path)
+        if not any(token in source for token in SPAWN_TOKENS):
+            continue
         try:
             tree = parsed(path)
         except SyntaxError as exc:
             violations.append(f"{path}:{exc.lineno}: syntax error while scanning")
             continue
 
-        lines = source.splitlines()
         module_aliases, func_aliases, helper_names, helper_modules = _collect_aliases(tree)
-        parent_map = _ParentMap()
-        parent_map.visit(tree)
-        parents = parent_map.parents
+        parents: dict[ast.AST, ast.AST] | None = None
+        lines: list[str] | None = None
 
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
@@ -317,11 +329,20 @@ def find_spawn_guard_violations(root: Path) -> list[str]:
 
             module, attr = spawn
             line_no = node.lineno
+            if lines is None:
+                lines = source.splitlines()
             if line_no and line_no <= len(lines):
                 line_text = lines[line_no - 1]
                 if ALLOWLIST_RE.search(line_text):
                     continue
 
+            if parents is None:
+                # Built only for the rare file with a spawn call that survives
+                # the allowlist check -- the map is what ``_enclosing_scope``
+                # and the ``**kwargs`` chase below walk.
+                parent_map = _ParentMap()
+                parent_map.visit(tree)
+                parents = parent_map.parents
             scope = _enclosing_scope(node, parents)
             if _call_has_spawn_kwargs(
                 node, scope, parents, helper_names, helper_modules, module_aliases
@@ -341,6 +362,42 @@ def test_all_source_spawn_sites_rout_through_helper() -> None:
     """Every existing subprocess/os spawn site in src/charlie_work routes through the helper."""
     violations = find_spawn_guard_violations(_source_package_dir())
     assert not violations, "\n".join(violations)
+
+
+def test_spawn_prefilter_never_skips_a_flaggable_spelling(tmp_path: Path) -> None:
+    """Every call spelling the guard flags must carry a ``SPAWN_TOKENS`` literal.
+
+    The text prefilter is only sound because every flaggable shape writes one
+    of the tokens into the file: the ``subprocess`` module name for the
+    ``subprocess.*`` targets (aliased or not, import or from-import) and the
+    attribute name for each ``os`` spawn target. If ``SPAWN_ATTRS`` or
+    ``_is_os_spawn`` ever accepts a name no token covers, the prefilter would
+    skip the very file the guard exists to flag -- this pins the invariant
+    spelling by spelling (issue #2554).
+    """
+    spellings = {
+        "run.py": "import subprocess\nsubprocess.run(['echo'])\n",
+        "run_alias.py": "import subprocess as sp\nsp.run(['echo'])\n",
+        "run_from.py": "from subprocess import check_output\ncheck_output(['echo'])\n",
+        "os_system.py": "import os\nos.system('echo')\n",
+        "os_spawn.py": "from os import spawnl\nspawnl(0, 'x')\n",
+        "os_posix_spawn.py": "import os as o\no.posix_spawn('x', [], None)\n",
+        "os_startfile.py": "import os\nos.startfile('x')\n",
+        "os_popen.py": "import os\nos.popen('x')\n",
+    }
+    source_dir = tmp_path / "pkg"
+    source_dir.mkdir()
+    for name, text in spellings.items():
+        # The file must survive the prefilter (i.e. carry a token) ...
+        assert any(token in text for token in SPAWN_TOKENS), (
+            f"{name}: no SPAWN_TOKENS literal in a spelling the guard must flag"
+        )
+        (source_dir / name).write_text(text, encoding="utf-8")
+    # ... and be flagged once scanned.
+    violations = find_spawn_guard_violations(source_dir)
+    assert len(violations) == len(spellings), (
+        f"each spelling must produce one violation; got {len(violations)}: {violations}"
+    )
 
 
 def test_guard_flags_bare_subprocess_run(tmp_path: Path) -> None:

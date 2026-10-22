@@ -166,6 +166,58 @@ def test_reviewer_fallback_harness_must_be_review_capable() -> None:
         build_config_from_data({"reviewer": {"fallbacks": [{"harness": "command"}]}})
 
 
+# Issue #2117: the primaries' ``model`` fields carry ``Typed``/``NotNull`` metadata
+# so a non-string is a FieldError at the boundary; without it the raw value survived
+# the build and only crashed ``model_family`` with a bare AttributeError later.
+# Fallbacks entries are checked separately (``worker-fallbacks8-must be a string``
+# above); rescue reuses ``WorkerRoleConfig``, so it is covered by the same marker.
+@pytest.mark.parametrize(
+    ("raw", "match"),
+    [
+        pytest.param(
+            {"worker": {"model": 5}},
+            r"^worker\.model: expected string, got 5 \(int\)$",
+            id="worker-int",
+        ),
+        pytest.param(
+            {"reviewer": {"model": 5}},
+            r"^reviewer\.model: expected string, got 5 \(int\)$",
+            id="reviewer-int",
+        ),
+        pytest.param(
+            {"worker": {"model": None}},
+            r"^worker\.model: expected a value, got null$",
+            id="worker-null",
+        ),
+        pytest.param(
+            {"reviewer": {"model": None}},
+            r"^reviewer\.model: expected a value, got null$",
+            id="reviewer-null",
+        ),
+        pytest.param(
+            {"rescue": {"worker": {"model": 5}}},
+            r"^rescue\.worker\.model: expected string, got 5 \(int\)$",
+            id="rescue-worker-int",
+        ),
+        pytest.param(
+            {"rescue": {"reviewer": {"model": 5}}},
+            r"^rescue\.reviewer\.model: expected string, got 5 \(int\)$",
+            id="rescue-reviewer-int",
+        ),
+    ],
+)
+def test_non_string_role_model_rejected_at_build(raw: dict, match: str) -> None:
+    with pytest.raises(ConfigError, match=match):
+        build_config_from_data(raw)
+
+
+def test_empty_string_worker_model_still_means_harness_default() -> None:
+    """Positive control: the Typed marker checks the type, it does not change the
+    empty-string-is-default contract of ``worker.model``."""
+    config = build_config_from_data({"worker": {"model": ""}})
+    assert config.worker.model == ""
+
+
 def test_same_family_fallback_warns_but_loads(caplog: pytest.LogCaptureFixture) -> None:
     role_chain._WARNED.clear()
     with caplog.at_level(logging.WARNING, logger="charlie_work.role_chain"):
@@ -504,6 +556,38 @@ def test_ledger_tolerates_a_corrupt_file() -> None:
     assert role_quota_ledger.record_restriction(
         "claude-code", "m", NOW + timedelta(hours=1), reason="quota_exhausted", source="t"
     )
+
+
+def test_ledger_escalates_backoff_on_consecutive_post_expiry_restrictions() -> None:
+    """A (harness, model) that fails again right after its window expired gets
+    a doubled base window each consecutive hit, until the 2h reset window
+    lapses and the backoff returns to 1x."""
+    key = ("opencode", "glm-free")
+    restrictions = role_quota_ledger.load_restrictions
+
+    t0 = NOW
+    assert role_quota_ledger.record_restriction(
+        *key, t0 + timedelta(minutes=15), reason="rate_limited", source="t", now=t0
+    )
+    assert restrictions()[key] == t0 + timedelta(minutes=15)
+
+    t1 = t0 + timedelta(minutes=20)  # 5m past expiry, inside the 2h reset window
+    assert role_quota_ledger.record_restriction(
+        *key, t1 + timedelta(minutes=15), reason="rate_limited", source="t", now=t1
+    )
+    assert restrictions()[key] == t1 + timedelta(minutes=30)
+
+    t2 = t1 + timedelta(minutes=35)  # 5m past the doubled window's expiry
+    assert role_quota_ledger.record_restriction(
+        *key, t2 + timedelta(minutes=15), reason="rate_limited", source="t", now=t2
+    )
+    assert restrictions()[key] == t2 + timedelta(minutes=60)
+
+    t3 = t2 + timedelta(hours=4)  # 3h past the third expiry: reset window lapsed
+    assert role_quota_ledger.record_restriction(
+        *key, t3 + timedelta(minutes=15), reason="rate_limited", source="t", now=t3
+    )
+    assert restrictions()[key] == t3 + timedelta(minutes=15)
 
 
 def test_classified_death_records_only_stamped_throttle_kinds() -> None:

@@ -77,7 +77,7 @@ definitions and the experiment's stopping rule.
 | `agent:done` | PR merged via `ship-it`. Every `active` label is removed in the same transition. | `ship-it` → event `merged`. |
 | `agent:human-needed` | `verdict --decision blocked` (a product/security decision is needed) or the rework cap exhausted. Terminal — no further automation happens until a human clears it. | `verdict` → event `escalated`/`blocked`. |
 | `agent:operator-queue` | Mechanical escalations (`reason_class == "mechanical"`) land here instead of `agent:human-needed`, so human attention is reserved for judgment calls. Terminal. | `operator_queued` / `redispatch_operator_queued` edges and the de-escalation cap-exhaustion path. |
-| `agent:prose-only-deps` | Issue has prose-only dependencies that need structured blocker declarations (`Blocked by #N`). Terminal — held out of dispatch. | Intake pass (`workflow.py`, event `intake_prose_only_deps`). |
+| `agent:prose-only-deps` | Issue has prose-only dependencies that need structured blocker declarations (`Blocked by #N`). Terminal — held out of dispatch. Intake re-checks the body every pass and strips the label again once the trigger no longer trips (issue #1902, event `intake_prose_only_deps_cleared`). | Intake pass (event `intake_prose_only_deps` / `intake_prose_only_deps_cleared`). |
 | `agent:merge-hold` | Transient operator signal, not a workflow state: while present on the PR or its issue, `ship-it`/merge-ready refuses to merge. Survives non-terminal transitions; stripped by `merged` and `closed_unmerged`. | Human, on GitHub. |
 | `collect-gate-exempt` | PR-only, operator-applied escape hatch for the collect-only gate's fail-closed verdict (legitimate test deletions/renames); the gate reads the PR's live labels. Not a workflow or terminal label. | Human, on the PR (see the collect-only gate section below). |
 | `agent:cross-repo-override` | Operator's one-step recovery valve for a cross-repo-gate false positive: when present, both `cross_repo_gate` and `cross_repo_scope_gate` are skipped for that issue. Not a workflow or terminal label. | Human, on the issue. |
@@ -613,6 +613,20 @@ sessions across all registered repos. This is a worker-count budget only — it
 does not bound CPU or RAM. The governor applies this cap at every dispatch
 path alongside the per-repo `dispatch.max_concurrent_sessions` cap
 (`_apply_concurrency_governor()` in `workflow.py`).
+
+**Per-harness budget**: `fleet.max_concurrent_sessions_by_harness` (issue #2757,
+default empty = off) scopes a ceiling to the provider quota it protects, e.g.
+`{devin-shell: 3}` for a shared Devin account, while
+`global_max_concurrent_sessions` stays the host-level total across every harness.
+Without it a free-model worker (say an `opencode` chain entry) occupies a slot
+sized for the Devin ceiling. The live count per harness is derived from session
+sidecars through the harness registry's `adapter_kind`, measured under the fleet
+lock. After role-chain selection, a launch whose entry is on a full harness falls
+through to the next entry with room; with none left it is clamped to zero and the
+`dispatch` event reports `clamped_by: harness_max` plus
+`harness_concurrency_limits` / `harness_live_session_counts`. A state.json "ghost"
+(live pid, no sidecar) has no known harness, so it counts toward the total only.
+The rescue tier launches on its configured harness and is not bounded per harness.
 
 **Reviewer budget**: `fleet.global_max_concurrent_reviews` (issue #2084, default
 `0` = disabled) is the same kind of cap for live *reviewer* sessions across all

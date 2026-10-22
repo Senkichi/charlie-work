@@ -35,6 +35,9 @@ def test_local_issues_config_defaults() -> None:
     cfg = LocalIssuesConfig()
     assert cfg.enabled is False
     assert cfg.issues_dir == "docs/issues"
+    # Issue #2434: tracker writes commit at the end of every pass by default;
+    # the flag exists only to be turned OFF as a kill switch.
+    assert cfg.commit_writes is True
 
 
 def test_local_issues_config_is_frozen() -> None:
@@ -106,6 +109,11 @@ def _legacy_id(yaml_body: str, old_match: str) -> str:
             "local_issues:\n  nope: 1\n",
             r"^local_issues: expected known keys .*got unknown key\(s\) nope$",
             id=_legacy_id("local_issues:\n  nope: 1\n", "unknown key"),
+        ),
+        pytest.param(
+            'local_issues:\n  commit_writes: "yes"\n',
+            r"^local_issues\.commit_writes: expected bool, got 'yes' \(str\)$",
+            id=_legacy_id('local_issues:\n  commit_writes: "yes"\n', "must be a bool"),
         ),
     ],
 )

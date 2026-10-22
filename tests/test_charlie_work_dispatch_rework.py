@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+
+import pytest
 from _fakes_github import FakeGitHub
 from charlie_work.config import (
     DevinConfig,
@@ -622,3 +624,80 @@ def test_dispatch_rework_success_arm_clears_dead_worker_failure_kind(
     entry = load_state(paths.state_file)["issues"]["123"]
     assert entry["status"] == "dispatched"
     assert "dead_worker_failure_kind" not in entry
+
+
+@pytest.mark.parametrize("notify_enabled", [False, True])
+def test_dispatch_rework_stall_probe_follows_notify_enabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_host, notify_enabled: bool
+) -> None:
+    """Issue #2600: the notify-digest stall probe at the tail of
+    ``dispatch_rework`` is a per-worker real-activity scan (sessions.db open,
+    per-PID log glob, worktree walk) whose only consumer is the notify digest.
+    With ``notify.enabled=False`` -- the default -- the probe must not run at
+    all: on a host with a live Devin CLI store the scan reads megabytes of
+    real state for a result the lane would then discard (the flagged ledger
+    regression was exactly that scan hitting the host's real store)."""
+    from charlie_work.adapters import SessionDispatchResult
+    from charlie_work.config import NotifyConfig
+
+    # The probe lives in charlie_work.attention_digest now (issue #2600 rework
+    # extraction); the bare-name call inside _detect_stalled_sessions_for_notify
+    # resolves through that module's globals, so the patch target moves with it
+    # -- the same mechanical repoint the #1283 Phase-A lineage documents. The
+    # pre-extraction lane reached the same function through the workflow facade,
+    # so the workflow name is patched too: either binding regressing back to an
+    # unconditional probe is caught on the notify_enabled=False arm.
+    probe_calls: list[int] = []
+
+    def _record_probe(_sessions_dir, _config):
+        probe_calls.append(1)
+        return []
+
+    monkeypatch.setattr("charlie_work.attention_digest._detect_stalled_sessions", _record_probe)
+    monkeypatch.setattr("charlie_work.workflow._detect_stalled_sessions", _record_probe)
+
+    config = OrchestratorConfig(
+        worker=WorkerRoleConfig(harness="command"),
+        notify=NotifyConfig(enabled=notify_enabled),
+    )
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    _rework_pending_state(paths, failure_kind=None)
+
+    def _ok(_repo_root, _manifest, _results, _settings, requests):
+        return [
+            SessionDispatchResult(
+                issue_number=request.issue_number,
+                issue_title=request.issue_title,
+                prompt_path=str(request.prompt_path),
+                branch_name=request.branch_name,
+                adapter="command",
+                ok=True,
+            )
+            for request in requests
+        ]
+
+    fake_host(worker_launch=FakeWorkerLauncher([_ok]))
+
+    app = OrchestratorApp(tmp_path, paths, config, _rework_pending_gh())
+    result = app.dispatch_rework()
+
+    assert result.ok is True
+    assert len(probe_calls) == (1 if notify_enabled else 0)
+
+
+def test_attention_digest_names_reexported_by_identity() -> None:
+    """The attention-digest pipeline moved to ``charlie_work.attention_digest``
+    (issue #2600): every name must resolve through the ``charlie_work.workflow``
+    facade to the SAME object -- a re-declared copy, not an import, is the
+    failure mode the facade pattern exists to catch.
+    """
+    import charlie_work.attention_digest as attention_digest
+    import charlie_work.workflow as workflow
+
+    for name in (
+        "_build_attention_digest",
+        "_detect_stalled_sessions_for_notify",
+        "_emit_attention_digest",
+        "_emit_stalled_session_digest",
+    ):
+        assert getattr(workflow, name) is getattr(attention_digest, name), name

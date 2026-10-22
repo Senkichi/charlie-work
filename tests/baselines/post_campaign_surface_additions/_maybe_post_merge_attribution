@@ -1,0 +1,7 @@
+issue #1717: post-merge outcome attribution -- records the two experiment
+outcome candidates #1701 declared not derivable (a merged PR's main-CI
+failure on a required check; a follow-up fix/revert PR naming the merged
+PR) as events, wired as a per-pass maintenance lane. The mechanical scans
+live in ``post_merge_attribution_scan`` (a plain module, not a delegate
+module), so this is the only net-new OrchestratorApp member. Installed
+from ``orchestration/post_merge_attribution.py``.

@@ -347,13 +347,14 @@ def _isolate_git_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     long"); injected via the ``GIT_CONFIG_*`` env mechanism so it also
     covers ``git`` spawned by production code, not just tests' own calls.
     """
+    from _git_templates import GIT_CONFIG_ENV
+
     monkeypatch.setenv(
         "GIT_CEILING_DIRECTORIES",
         os.pathsep.join([str(tmp_path.parent), _tempfile_module.gettempdir()]),
     )
-    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
-    monkeypatch.setenv("GIT_CONFIG_KEY_0", "core.longpaths")
-    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "true")
+    for key, value in GIT_CONFIG_ENV.items():
+        monkeypatch.setenv(key, value)
 
 
 @pytest.fixture(autouse=True)
@@ -534,6 +535,27 @@ def _no_real_github_network(monkeypatch: pytest.MonkeyPatch) -> None:
         raise AssertionError(f"real network in tests: {host}")
 
     monkeypatch.setattr(http_adapter, "_new_connection", _refuse)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_opencode_go_network(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Never let the OpenCode Go quota probe reach opencode.ai.
+
+    Any opencode ``quota_exhausted`` classification probes the Go API with the
+    operator's real credential (``opencode_limits.go_quota_reset``). By default
+    no credential is found -- the same on every host, so a classification test
+    sees the 24h fallback -- and any connection is refused. Probe tests inject
+    ``_go_api_key`` and ``_open``; the per-process probe cache is cleared so
+    one test's answer never leaks into another.
+    """
+    from charlie_work import opencode_limits
+
+    def _refuse(request: object, timeout: float) -> object:
+        raise AssertionError(f"real network in tests: {getattr(request, 'full_url', request)}")
+
+    monkeypatch.setattr(opencode_limits, "_go_api_key", lambda: None)
+    monkeypatch.setattr(opencode_limits, "_open", _refuse)
+    monkeypatch.setattr(opencode_limits, "_cache", None)
 
 
 def _healthy_preflight(*args: object, **kwargs: object) -> PreflightResult:

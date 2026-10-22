@@ -444,6 +444,25 @@ def test_list_processes_windows_subprocess_error(monkeypatch: pytest.MonkeyPatch
     assert "powershell invocation failed" in error
 
 
+@pytest.fixture(scope="module")
+def _real_process_snapshot() -> tuple[tuple[ProcessInfo, ...], str | None]:
+    """The real-host process snapshot, acquired once for the module.
+
+    A full ``Get-CimInstance Win32_Process`` enumeration via PowerShell is
+    environment-bound resource acquisition -- its cost is the host's process
+    count plus spawn overhead under runner load -- not the test's own work.
+    Keeping it in one test's ``call`` phase let a per-spawn cost drift on the
+    shared runner register as a 2.4x per-test regression (issue #2538) even
+    though nothing in the repo touched quiesce; the ledger deliberately
+    excludes setup from per-test alerting for exactly this reason (precedent:
+    ``test_dashboard_now_a11y``'s module-scoped node boot). The snapshot
+    stays ledger-visible under ``--section slow-fixtures`` either way.
+    """
+    if sys.platform != "win32":
+        pytest.skip("list_processes is win32-only")
+    return list_processes()
+
+
 # ---------------------------------------------------------------------------
 # check_quiescence() -- lister + assert_quiescent glued together.
 # ---------------------------------------------------------------------------
@@ -472,7 +491,9 @@ def test_check_quiescence_delegates_to_assert_quiescent_on_success() -> None:
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="list_processes is win32-only")
-def test_list_processes_actually_runs_against_this_host() -> None:
+def test_list_processes_actually_runs_against_this_host(
+    _real_process_snapshot: tuple[tuple[ProcessInfo, ...], str | None],
+) -> None:
     """Execute the real PowerShell snapshot -- no injected lister.
 
     Every other test in this file substitutes a fake ``lister``, which is why a
@@ -485,9 +506,14 @@ def test_list_processes_actually_runs_against_this_host() -> None:
     This asserts the level the fake-lister tests structurally cannot: that the
     real command runs on the real interpreter and returns parseable data. The
     running interpreter must appear in its own snapshot, which also pins the
-    ProcessId/CommandLine field names the parser depends on.
+    ProcessId/CommandLine field names the parser depends on. The snapshot is
+    acquired once per module by `_real_process_snapshot` -- acquiring it is
+    host-bound resource acquisition, not this test's call-phase work, so its
+    drift with runner load lands in the fixture ledger, not the per-test alert.
     """
-    processes, error = list_processes()
+    processes, error = _real_process_snapshot
+
+    assert error is None, f"real process listing failed: {error}"
 
     assert error is None, f"real process listing failed: {error}"
     assert processes, "process listing returned no processes"

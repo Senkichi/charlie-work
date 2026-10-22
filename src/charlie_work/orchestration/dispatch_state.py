@@ -13,16 +13,18 @@ Namespace rule (#1627). Two kinds of name are reached through the
 - **Patched-on-workflow (Tier D).** Names some test patches on the
   ``charlie_work.workflow`` module object -- ``state_lock``, ``load_state_locked``,
   ``utc_now``, ``transition``, ``is_claim_stale``,
-  ``emit_digest``, ``linked_issue_number``,
+  ``linked_issue_number``,
   ``_detect_and_handle_stalled_sessions``,
   ``_try_reap_blocked_foreign_writer`` -- must resolve
   through ``_wf.`` so ``patch("charlie_work.workflow.<name>")`` still bites.
-- **Reached through workflow.py.** ``_build_attention_digest``,
-  ``_build_failure_map``, ``_label_error_reason`` and
-  ``_recent_dispatch_failed_attempts`` are defined in ``workflow`` itself;
-  ``_MergedPRListOutcome`` is a re-export (``backlog_reachability.py`` owns
-  the definition). Reaching all of them via ``_wf.`` avoids an import cycle
-  and keeps a single name site.
+- **Reached through workflow.py.** ``_build_failure_map``,
+  ``_label_error_reason`` and ``_recent_dispatch_failed_attempts`` are defined
+  in ``workflow`` itself; ``_MergedPRListOutcome`` is a re-export
+  (``backlog_reachability.py`` owns the definition), and so are the
+  attention-digest emit tails ``_emit_stalled_session_digest`` /
+  ``_emit_attention_digest`` (``attention_digest.py`` owns those, issue #2600).
+  Reaching all of them via ``_wf.`` avoids an import cycle and keeps a single
+  name site.
 
 The three state primitives ``load_state`` / ``save_state`` / ``append_event`` are
 also routed via ``_wf.`` (matching ``state_maintenance.py``). ``load_state`` in
@@ -1919,37 +1921,12 @@ def _dispatch_impl(
 
     # Emit notification digest if there are health transitions (stalled sessions)
     # This will be enhanced by #165 to include RUNAWAY/DEAD/escalated transitions
-    if stalled_entries and self.config.notify.enabled:
-        health_transitions: dict[int, dict[str, Any]] = {}
-        for entry in stalled_entries:
-            health_transitions[entry["issue"]] = {
-                "adapter_kind": "unknown",  # Will be filled by #165's full supervisor
-                "health": entry.get("health", "STALLED"),
-                "last_log_line": None,
-                "pid": entry.get("pid"),
-                "terminal_tool": entry.get("terminal_tool"),
-                "terminal_reason": entry.get("terminal_reason"),
-            }
-        digest = _wf._build_attention_digest(
-            self.paths.state_file,
-            health_transitions,
-            repo=self.repo_root.name,
-        )
-        if digest:
-            _wf.emit_digest(self._layout.notify, digest)
+    _wf._emit_stalled_session_digest(self, stalled_entries)
 
     # Emit dispatch-alert digest for live-worker redispatch averted outcomes.
     # This surfaces the silent-stall class of dispatch failures in the same
     # attention pipeline used for stalled workers (issue #506 / #497).
-    if dispatch_alert_transitions and self.config.notify.enabled:
-        dispatch_digest = _wf._build_attention_digest(
-            self.paths.state_file,
-            dispatch_alert_transitions,
-            repo=self.repo_root.name,
-            state_field="dispatch_alert",
-        )
-        if dispatch_digest:
-            _wf.emit_digest(self._layout.notify, dispatch_digest)
+    _wf._emit_attention_digest(self, dispatch_alert_transitions, state_field="dispatch_alert")
 
     return CommandResult(
         not failed_issue_numbers,

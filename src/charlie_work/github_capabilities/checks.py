@@ -2,7 +2,9 @@
 
 Cluster C of the design doc's capability segmentation (Section 3.1):
 ``pr_checks``, ``check_run_annotations``, ``commit_check_runs``,
-``actions_job``, ``workflow_runs_for_head``, ``check_graphql_rate_limit``.
+``actions_job``, ``workflow_runs_for_head``, ``check_graphql_rate_limit``,
+plus the issue #2540 resolution pair ``check_run`` /
+``workflow_runs_for_check_suite``.
 
 ``check_graphql_rate_limit`` is an ambiguity call (Section 3.1): it wraps a
 GraphQL rate probe used by the checks path, though it is transport-adjacent.
@@ -101,6 +103,8 @@ class ChecksLike(Protocol):
 
     def pr_checks(self, number: int) -> list[dict[str, Any]] | None: ...
 
+    def check_run(self, check_run_id: int) -> dict[str, Any] | None: ...
+
     def check_run_annotations(self, check_run_id: int) -> list[dict[str, Any]]: ...
 
     def commit_check_runs(self, sha: str) -> list[dict[str, Any]] | None: ...
@@ -108,6 +112,10 @@ class ChecksLike(Protocol):
     def actions_job(self, job_id: int) -> dict[str, Any] | None: ...
 
     def workflow_runs_for_head(self, head_sha: str) -> list[dict[str, Any]] | None: ...
+
+    def workflow_runs_for_check_suite(
+        self, check_suite_id: int
+    ) -> list[dict[str, Any]] | None: ...
 
     def check_graphql_rate_limit(self, threshold: int = ...) -> tuple[bool, int, int | None]: ...
 
@@ -121,10 +129,10 @@ class Checks(CapabilityCollaborator):
     Section 3.3). ``pr_checks`` reads over GraphQL (``JsonRead``); the old
     ``_pr_checks_fallback`` disambiguation is gone (B7).
 
-    Two of the six also reference module-level bare globals relocated
-    alongside them: ``pr_checks`` uses ``PR_CHECKS_FIELDS``,
+    Two of the pre-#2540 six also reference module-level bare globals
+    relocated alongside them: ``pr_checks`` uses ``PR_CHECKS_FIELDS``,
     ``_job_id_from_link``, and ``_run_id_from_link`` (the last still defined
-    in the top-level ``charlie_work.checks`` module); all six use
+    in the top-level ``charlie_work.checks`` module); all use
     ``GitHubRunResult``, relocated to ``_base.py`` and re-exported through
     ``github.py`` rather than imported back from it, to avoid a circular
     import (``github.py`` imports ``github_capabilities`` before its own,
@@ -221,6 +229,24 @@ class Checks(CapabilityCollaborator):
             return result.value if result.ok and isinstance(result.value, dict) else None
         return result if isinstance(result, dict) else None
 
+    def check_run(self, check_run_id: int) -> dict[str, Any] | None:
+        """Fetch a single check run by ID (``GET /repos/{owner}/{repo}/check-runs/{id}``).
+
+        Used to resolve the workflow run behind a check whose ``details_url``
+        is the app-assigned ``.../runs/<id>`` shape (issue #2540): the
+        payload's ``check_suite.id`` and its caller-supplied ``output`` text
+        are the only fields that still point at the real Actions job. Returns
+        None on failure (allow_failure=True), mirroring ``actions_job``.
+        """
+        result = send_result(
+            self,
+            RestRequest.of("GET", f"repos/{{owner}}/{{repo}}/check-runs/{check_run_id}"),
+            json_output=True,
+        )
+        if isinstance(result, GitHubRunResult):
+            return result.value if result.ok and isinstance(result.value, dict) else None
+        return result if isinstance(result, dict) else None
+
     def check_run_annotations(self, check_run_id: int) -> list[dict[str, Any]]:
         """Fetch annotations for a specific check run.
 
@@ -278,6 +304,31 @@ class Checks(CapabilityCollaborator):
             self,
             RestRequest.of(
                 "GET", "repos/{owner}/{repo}/actions/runs", query={"head_sha": head_sha}
+            ),
+            json_output=True,
+        )
+        value = result.value if isinstance(result, GitHubRunResult) and result.ok else None
+        if not isinstance(value, dict):
+            return None
+        runs = value.get("workflow_runs")
+        return runs if isinstance(runs, list) else None
+
+    def workflow_runs_for_check_suite(self, check_suite_id: int) -> list[dict[str, Any]] | None:
+        """Fetch the GitHub Actions workflow runs created for a check suite id.
+
+        Wraps ``gh api "repos/{owner}/{repo}/actions/runs?check_suite_id=<id>"``
+        (the List-workflow-runs endpoint's own ``check_suite_id`` filter) and
+        returns its ``workflow_runs`` array, or ``None`` on failure. The
+        counterpart to ``workflow_runs_for_head`` for check-run-derived
+        resolution (issue #2540): a check run knows its check suite, not a
+        head SHA to filter on. Errors are returned as values, never raised.
+        """
+        result = send_result(
+            self,
+            RestRequest.of(
+                "GET",
+                "repos/{owner}/{repo}/actions/runs",
+                query={"check_suite_id": check_suite_id},
             ),
             json_output=True,
         )

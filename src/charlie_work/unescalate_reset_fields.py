@@ -57,6 +57,17 @@ UNESCALATE_PR_RESET_FIELDS = (
     # derives the required companions from that map).
     "conflict_rework_attempts_stall_since",
     "conflict_rework_attempts_stall_head",
+    # Issue #2743: the queue-revert lane's whole ledger -- the cap counter and
+    # its head anchor plus the rework-attempt companions the shared wrapper
+    # keeps. A re-arm that left ``consecutive_mergequeue_requeues`` at cap
+    # would re-block the hand-off on the very next pass, and a stale attempt
+    # ledger would re-escalate without a single fresh rework cycle.
+    "consecutive_mergequeue_requeues",
+    "mergequeue_requeues_head_sha",
+    "mergequeue_rework_attempts",
+    "mergequeue_rework_attempts_last_head",
+    "mergequeue_rework_attempts_stall_since",
+    "mergequeue_rework_attempts_stall_head",
     # Issue #1972: the local merge gate's per-kind rework counters and the
     # last-failure-kind marker (``local_merge_rework._local_route_merge_rework``).
     # A re-arm that left them behind would re-escalate on the next gate
@@ -65,6 +76,11 @@ UNESCALATE_PR_RESET_FIELDS = (
     "local_suite_failed_rework_attempts",
     "local_suite_infra_relaunch_count",
     "local_merge_rework_reason",
+    # Issue #2739: the gate's "record left approved" abort streak and its
+    # patch-id companion. A re-arm that left them behind would re-escalate
+    # on the very next abort instead of taking a fresh bound.
+    "local_gate_abort_streak",
+    "local_gate_abort_streak_patch_id",
     "no_op_rework_attempts",
     "no_op_rework_attempts_last_head",
     "no_op_rework_attempts_stall_since",
@@ -311,6 +327,29 @@ REWORK_BUDGET_RESET_BY_ESCALATION_REASON: dict[str, tuple[tuple[str, ...], tuple
             "conflict_rework_attempts_stall_head",
         ),
     ),
+    # Issue #2743: clearing either mergequeue-cap escalation must re-arm the
+    # FULL lane -- the same-head queue-revert counter that gates the label
+    # re-add AND the rework-attempt ledger. Resetting only the attempts would
+    # leave ``consecutive_mergequeue_requeues`` at cap, so the next pass
+    # re-blocks the hand-off and re-escalates without a single fresh cycle.
+    "mergequeue_rework_attempts_cap_exceeded": (
+        ("mergequeue_rework_attempts", "consecutive_mergequeue_requeues"),
+        (
+            "mergequeue_requeues_head_sha",
+            "mergequeue_rework_attempts_last_head",
+            "mergequeue_rework_attempts_stall_since",
+            "mergequeue_rework_attempts_stall_head",
+        ),
+    ),
+    "mergequeue_rework_attempts_stall_exceeded": (
+        ("mergequeue_rework_attempts", "consecutive_mergequeue_requeues"),
+        (
+            "mergequeue_requeues_head_sha",
+            "mergequeue_rework_attempts_last_head",
+            "mergequeue_rework_attempts_stall_since",
+            "mergequeue_rework_attempts_stall_head",
+        ),
+    ),
     # Issue #2108: the PR-body closing-keyword autofix's per-head attempt map; no
     # head-baseline or stall clock companion (the map is keyed by head itself).
     "pr_body_closing_keyword_autofix_failed": (("closing_keyword_autofix_attempts",), ()),
@@ -327,6 +366,13 @@ REWORK_BUDGET_RESET_BY_ESCALATION_REASON: dict[str, tuple[tuple[str, ...], tuple
     # Issue #2127: the gate's infra-relaunch bound (timeout / summary-less
     # death); an unreset count would re-escalate on the very next infra blip.
     "local_merge_gate_infra_exhausted": (("local_suite_infra_relaunch_count",), ()),
+    # Issue #2739: the gate's "record left approved" abort bound; the
+    # patch-id companion is popped so a re-arm re-baselines the streak
+    # rather than comparing against the exhausted episode's verdict.
+    "local_gate_abort_streak_exceeded": (
+        ("local_gate_abort_streak",),
+        ("local_gate_abort_streak_patch_id",),
+    ),
     # Issue #1683: the review-dispatch lanes were missing from this map
     # entirely, so every automated clear of either reason was inert -- the
     # gating counter stayed at cap, the next dispatch pass re-escalated

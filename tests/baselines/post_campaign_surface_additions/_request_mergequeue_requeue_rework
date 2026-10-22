@@ -1,0 +1,7 @@
+issue #2743: the mergequeue-requeue rework router installed by
+``charlie_work.orchestration.state_mergequeue_requeue`` — the lane the
+per-head requeue cap hands a capped PR off to. Net-new OrchestratorApp
+member added after the Track 2 Phase B surface baseline was pinned;
+declared here so the member-surface conservation check in
+tests/test_workflow_delegation_l00.py subtracts it before comparing moved
+delegates against the pre-campaign total (133).

@@ -40,6 +40,8 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
+
+import pytest
 from _src_ast import parsed, source_files
 
 _SRC = Path(__file__).resolve().parents[1] / "src" / "charlie_work"
@@ -130,19 +132,31 @@ def _requeue_loci() -> dict[str, set[str]]:
     return loci
 
 
-def test_derived_locus_set_is_nonempty() -> None:
+@pytest.fixture(scope="module")
+def requeue_loci() -> dict[str, set[str]]:
+    """The derived locus set, computed once per module (issue #2679).
+
+    The derivation parses and walks all of ``src/charlie_work`` — the first
+    ``parsed()`` caller in a worker also pays the per-file digest charge. In a
+    test body that whole-tree scan lands in the measured ``call`` phase of
+    whichever test runs first; as a module fixture it is charged to ``setup``
+    and shared by every consumer.
+    """
+    return _requeue_loci()
+
+
+def test_derived_locus_set_is_nonempty(requeue_loci: dict[str, set[str]]) -> None:
     """The derivation must not silently produce an empty set — that would
     make the pin vacuous the day the emitters get renamed."""
-    loci = _requeue_loci()
-    assert loci, "no session_failed_relabeled loci found — the derivation is broken"
+    assert requeue_loci, "no session_failed_relabeled loci found — the derivation is broken"
 
 
-def test_every_dead_worker_requeue_locus_routes_through_salvage_seam() -> None:
+def test_every_dead_worker_requeue_locus_routes_through_salvage_seam(
+    requeue_loci: dict[str, set[str]],
+) -> None:
     """Every module that can hand a dead worker's issue back to dispatch
     must consult the shared committed-work salvage seam."""
-    offenders = {
-        path for path, names in _requeue_loci().items() if not names & _SALVAGE_SEAM_NAMES
-    }
+    offenders = {path for path, names in requeue_loci.items() if not names & _SALVAGE_SEAM_NAMES}
     assert not offenders, (
         "dead-worker requeue loci that do not reference the shared salvage "
         f"seam ({sorted(_SALVAGE_SEAM_NAMES)}): {sorted(offenders)}. A locus "
@@ -204,7 +218,5 @@ def test_guard_still_counts_the_bare_literal_anywhere() -> None:
     assert _facts('X = ("session_failed_relabeled", "session_exited")')
 
 
-def test_attempt_resume_is_not_a_requeue_locus() -> None:
-    assert "src/charlie_work/attempt_resume.py" not in {
-        p.replace("\\", "/") for p in _requeue_loci()
-    }
+def test_attempt_resume_is_not_a_requeue_locus(requeue_loci: dict[str, set[str]]) -> None:
+    assert "src/charlie_work/attempt_resume.py" not in {p.replace("\\", "/") for p in requeue_loci}

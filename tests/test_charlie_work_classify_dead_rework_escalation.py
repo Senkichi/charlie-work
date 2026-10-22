@@ -8,6 +8,9 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from typing import NamedTuple
+
+import pytest
 from _dead_session_fixtures import (
     _write_dead_session_sidecar,
     _make_classify_state,
@@ -16,6 +19,7 @@ from _dispatch_fixtures import _stub_real_activity_probe_for_stalled_tests  # no
 from _fakes_github import FakeGitHub
 from _rework_dispatch_fixtures import _wg
 from _worktree_fixtures import (
+    _git,
     _init_bare_remote_and_clone,
     _setup_completed_worktree,
 )
@@ -334,29 +338,55 @@ def test_classify_dead_rework_session_rework_branch_conflict_escalates_immediate
     assert "rework_requeued" not in event_kinds
 
 
-def test_classify_dead_rework_session_completed_worktree_not_rolled_back(
-    tmp_path: Path,
-) -> None:
-    """LOW (issue #315 review): a rework worker that actually finished its
-    work (worktree ahead of base and clean -- is_completed=True) must never be
-    rolled back to rework_requested, even if this reap pass's PR-list
-    snapshot (fetched once, at the top of
-    _classify_dead_sessions_and_update_throttle_state) hasn't caught up to a
-    fresh push yet and still shows the pre-rework head that matches a live
-    request_changes decision. has_request_changes alone cannot catch this --
-    it would look identical to a genuine, never-pushed rework -- so the
-    open-PR branch must ALSO consult is_completed (issue #315 finding 1's
-    second half).
+class _CompletedReworkScenario(NamedTuple):
+    """Everything the completed-worktree test needs except the call under test."""
 
-    Mutation gate: removing the `if not is_completed:` guard around the
-    _reap_restore_rework_requested call in the open-PR dead-session branch
-    makes this test fail (the stale PR-list snapshot would incorrectly
-    trigger a rollback to rework_requested).
+    sessions_dir: Path
+    state_file: Path
+    gh: FakeGitHub
+    config: OrchestratorConfig
+
+
+@pytest.fixture
+def _completed_rework_scenario(tmp_path: Path) -> _CompletedReworkScenario:
+    """Resource acquisition for the completed-worktree reap test.
+
+    Issue #2601 (ledger-regress: the test slowed 2.2x on the shared CI host):
+    the bare-remote/clone pair, the completed worktree, the dead-session
+    sidecar, the state.json seed and the fake GitHub world are *acquisition*,
+    not the property under test -- the measured ``call`` phase was paying for
+    ~15 git subprocess spawns whose cost is set by the runner, not by this
+    repo's code (no code at the attributed SHA touched this path). Charging
+    the drive to setup follows the #2515/#2584/#2587 precedent; the test body
+    keeps the real ``_classify_dead_sessions_and_update_throttle_state`` call
+    and every assertion verbatim.
+
+    The fixture also repairs a coverage gap found while moving it: issue
+    #1362 made ``review_decision`` file-first for control flow, and this
+    test never wrote ``prs/pr-900/review-decision.json`` -- the decision it
+    planted only in ``state.json`` was invisible, so ``has_request_changes``
+    was False and the ``is_completed`` guard it exists to pin was never
+    reached (the test passed with the guard deleted). The flat file below
+    makes the stale-snapshot verdict live, restoring the mutation gate.
     """
+    import json
+
     from charlie_work.state import load_state, save_state, state_lock
-    from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
 
     remote, repo_root = _init_bare_remote_and_clone(tmp_path)
+    # A real ``git clone`` writes refs/remotes/origin/HEAD; this fixture's
+    # init+remote-add clone never got one, so the call-phase
+    # ``inspect_worktree_state`` would pay the set-head --auto heal (two
+    # extra spawns) to auto-resolve the "" base_ref. Stamp the symref once
+    # here so the clone carries the shape a real clone has; the heal path
+    # itself stays covered by tests/test_base_branch.py and
+    # tests/test_worktree.py.
+    _git(
+        repo_root,
+        "symbolic-ref",
+        "refs/remotes/origin/HEAD",
+        "refs/remotes/origin/main",
+    )
     worktree_path, branch = _setup_completed_worktree(repo_root, 315)
     sessions_dir, state_file = _make_classify_state(tmp_path)
     _write_dead_session_sidecar(sessions_dir, 315, branch, worktree_path)
@@ -408,6 +438,52 @@ def test_classify_dead_rework_session_completed_worktree_not_rolled_back(
             "reviewed_head_sha": "sha-stale-snapshot",
         }
         save_state(state_file, state)
+
+    # Issue #1362 Stage 1: the reader is file-first for control flow, so the
+    # live request_changes decision must exist on disk, not only in
+    # state.json (``_reap_restore_rework_requested`` resolves it from
+    # ``state_file.parent / "prs"``).
+    pr_decision_dir = tmp_path / "prs" / "pr-900"
+    pr_decision_dir.mkdir(parents=True, exist_ok=True)
+    (pr_decision_dir / "review-decision.json").write_text(
+        json.dumps({"decision": "request_changes", "reviewed_head_sha": "sha-stale-snapshot"}),
+        encoding="utf-8",
+    )
+
+    return _CompletedReworkScenario(
+        sessions_dir=sessions_dir,
+        state_file=state_file,
+        gh=gh,
+        config=config,
+    )
+
+
+def test_classify_dead_rework_session_completed_worktree_not_rolled_back(
+    _completed_rework_scenario: _CompletedReworkScenario,
+) -> None:
+    """LOW (issue #315 review): a rework worker that actually finished its
+    work (worktree ahead of base and clean -- is_completed=True) must never be
+    rolled back to rework_requested, even if this reap pass's PR-list
+    snapshot (fetched once, at the top of
+    _classify_dead_sessions_and_update_throttle_state) hasn't caught up to a
+    fresh push yet and still shows the pre-rework head that matches a live
+    request_changes decision. has_request_changes alone cannot catch this --
+    it would look identical to a genuine, never-pushed rework -- so the
+    open-PR branch must ALSO consult is_completed (issue #315 finding 1's
+    second half).
+
+    Mutation gate: removing the `if not is_completed:` guard around the
+    _reap_restore_rework_requested call in the open-PR dead-session branch
+    makes this test fail (the stale PR-list snapshot would incorrectly
+    trigger a rollback to rework_requested).
+    """
+    from charlie_work.state import load_state
+    from charlie_work.workflow import _classify_dead_sessions_and_update_throttle_state
+
+    sessions_dir = _completed_rework_scenario.sessions_dir
+    state_file = _completed_rework_scenario.state_file
+    gh = _completed_rework_scenario.gh
+    config = _completed_rework_scenario.config
 
     _classify_dead_sessions_and_update_throttle_state(
         sessions_dir, state_file, gh, config, write_gate=_wg(state_file)

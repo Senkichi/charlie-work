@@ -47,7 +47,7 @@ from __future__ import annotations
 import ast
 import textwrap
 from pathlib import Path
-from _src_ast import parsed, source_files
+from _src_ast import parsed, source_files, source_text
 
 _DECISION_KEYS = {"decision", "reviewed_head_sha", "decision_path"}
 
@@ -324,6 +324,18 @@ def test_pr_state_decision_writes_are_all_sanctioned() -> None:
     functions_seen: set[str] = set()
     qualified_seen: set[tuple[str, str]] = set()
     for source_file in source_files(src_root):
+        # Every flagged write shape bottoms out at a ``<expr>["prs"][<expr>]``
+        # double subscript -- ``_is_prs_subscript`` requires the inner slice
+        # to be a ``Constant`` ``"prs"``, and both alias chains
+        # (``_alias_stack`` / ``_dict_alias_stack``) are seeded only by such
+        # a literal inside the same function. A lone ``X["prs"]`` read is
+        # never flagged, so a file whose text lacks both ``["prs"][``
+        # spellings cannot contain a flagged write; skipping it keeps the
+        # ~430 untouched files out of the shared-cache parse (issue #2576;
+        # same filter shape as #2447/#2548).
+        text = source_text(source_file)
+        if '["prs"][' not in text and "['prs'][" not in text:
+            continue
         tree = parsed(source_file)
         rel = source_file.relative_to(src_root).as_posix()
         for lineno, func_name, key in _scan(tree):

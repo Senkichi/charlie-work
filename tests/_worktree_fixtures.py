@@ -49,12 +49,13 @@ rework adoption vs recovery / teardown / probe), and both sides need the same
 bare-remote-plus-pushed-branch builders, so they live here rather than being
 duplicated.
 
-The three repo builders (``_init_repo``, ``_clone_repo``,
-``_init_bare_remote_and_clone``) copy a per-process template when they can
-(HS-CW-4, ``tests/_git_templates.py``): same files, same config, same refs as a
-fresh build, but one commit SHA shared by every copy of a shape. Pass
-``fresh=True`` where a test needs independently-timestamped histories; the
-``_fresh`` variants are the original bodies, unchanged.
+The repo builders (``_init_repo``, ``_init_repo_with_origin``,
+``_clone_repo``, ``_init_bare_remote_and_clone``) copy a per-process template
+when they can (HS-CW-4, ``tests/_git_templates.py``): same files, same
+config, same refs as a fresh build, but one commit SHA shared by every copy
+of a shape. Pass ``fresh=True`` where a test needs
+independently-timestamped histories; the ``_fresh`` variants are the
+original bodies, unchanged.
 """
 
 from __future__ import annotations
@@ -116,6 +117,71 @@ def _wt_scratch() -> Iterator[Path]:
 
 def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)
+
+
+def _seed_staged_addition_bubble(repo_root: Path) -> None:
+    """Build the overwritten-paths commit bubble for the staged-addition
+    scenario in one ``git fast-import`` process and check ``feature`` out.
+
+    ``feature`` branches from the template's initial ``main`` commit; ``main``
+    then gains a commit changing ``tracked.txt`` and one independently adding
+    ``new_file.txt``. One spawn replaces the ~10 ``git`` children (add /
+    commit / checkout per step) the inline version spawned — the per-spawn
+    host cost was what the ledger's 2x call-phase regression on
+    ``test_modified_paths_overwritten_by_ref_excludes_staged_addition``
+    tracked (issue #2569).
+
+    Caller leaves here exactly where it must before applying its local dirty
+    state: on ``feature`` with the initial commit checked out.
+    """
+    subprocess.run(
+        ["git", "fast-import", "--quiet"],
+        cwd=repo_root,
+        # input as bytes: text=True would translate \n to \r\n on Windows
+        # stdin, and git parses the \r as part of each command line.
+        input=b"""\
+commit refs/heads/feature
+mark :1
+committer Test User <test@example.test> 0 +0000
+data <<MSG
+add ancestor file
+MSG
+from refs/heads/main
+M 100644 inline tracked.txt
+data <<EOT
+ancestor v0
+EOT
+commit refs/heads/main
+mark :2
+committer Test User <test@example.test> 0 +0000
+data <<MSG
+base changes tracked file
+MSG
+from :1
+M 100644 inline tracked.txt
+data <<EOT
+main committed v1
+EOT
+commit refs/heads/main
+mark :3
+committer Test User <test@example.test> 0 +0000
+data <<MSG
+base adds new file
+MSG
+from :2
+M 100644 inline new_file.txt
+data <<EOT
+base version
+EOT
+""",
+        check=True,
+        capture_output=True,
+    )
+    # fast-import advances refs only — the index and worktree still reflect the
+    # initial commit while main's tip moved, so a plain checkout would refuse
+    # the stale state as local changes. ``checkout -f`` repopulates both from
+    # the feature tree and moves HEAD to it.
+    _git(repo_root, "checkout", "-f", "feature")
 
 
 def _clone_repo(remote_repo: Path, repo_root: Path, *, fresh: bool = False) -> None:
@@ -209,6 +275,19 @@ def _init_repo_fresh(repo_root: Path, bare: bool = False) -> None:
         (repo_root / "README.md").write_text("hello\n", encoding="utf-8")
         run(["git", "add", "README.md"])
         run(["git", "commit", "-m", "initial commit"])
+
+
+def _init_repo_with_origin(repo_root: Path, remote_url: str, *, fresh: bool = False) -> None:
+    """``_init_repo`` plus ``git remote add origin <remote_url>``; the
+    remote-add spawn is paid once per process inside the template build
+    (``_git_templates.init_repo_with_origin``), so a materialized call spawns
+    no process at all."""
+    if not fresh and _git_templates.init_repo_with_origin(
+        repo_root, remote_url, build=_init_repo_fresh
+    ):
+        return
+    _init_repo_fresh(repo_root)
+    _git(repo_root, "remote", "add", "origin", remote_url)
 
 
 def _init_bare_remote_and_clone(tmp_path: Path, *, fresh: bool = False) -> tuple[Path, Path]:

@@ -1443,10 +1443,15 @@ def test_dispatch_outcome_field_sets_pin_the_collapsed_branch(
     """
     # Issue #2262: the phantom_live_worker scenario's salvage probe needs a
     # real git repo to prove the branch carries no commits (the verdict that
-    # permits requeue); harmless for the other scenarios, which never probe.
-    from _worktree_fixtures import _init_repo
+    # permits requeue). Only that scenario reaches the probe -- it runs just
+    # for a live_worker_redispatch_averted result whose recorded PID is dead
+    # (_precheck_phantom_live_worker in _dispatch_impl) -- so the other
+    # scenarios skip the repo build, which costs a git-template build or
+    # copy per worker process (issue #2596 ledger regression).
+    if failure_kind == "live_worker_redispatch_averted" and pid_alive is False:
+        from _worktree_fixtures import _init_repo
 
-    _init_repo(tmp_path)
+        _init_repo(tmp_path)
 
     app, fake_gh = _closed_pr_app(tmp_path)
     _seed_dispatch_failed_at(app.paths, 123, ["2020-01-01T00:00:00+00:00"])

@@ -11,6 +11,12 @@ from __future__ import annotations
 
 from _checks_fixtures import REQUIRED, _link
 
+from charlie_work.check_run_resolution import (
+    _check_run_id_from_link,
+    _check_suite_id_from_payload,
+    _run_id_for_check_suite,
+    _run_id_from_check_run_output,
+)
 from charlie_work.checks import (
     CheckDebounceResult,
     _run_id_from_link,
@@ -27,6 +33,101 @@ def test_run_id_from_link_returns_none_for_external_status() -> None:
     assert _run_id_from_link("https://external.ci/some/path") is None
     assert _run_id_from_link(None) is None
     assert _run_id_from_link("") is None
+
+
+def test_check_run_id_from_link_parses_app_assigned_runs_link() -> None:
+    """The live shape from issue #2540: a check run the Actions app created
+    via ``POST /repos/{owner}/{repo}/check-runs`` from inside a merged job
+    carries ``details_url`` ``.../runs/<check_run_id>`` (GitHub ignores the
+    caller-supplied value)."""
+    link = "https://github.com/owner/repo/runs/112064484398"
+    assert _check_run_id_from_link(link) == 112064484398
+
+
+def test_check_run_id_from_link_tolerates_query_and_fragment() -> None:
+    assert _check_run_id_from_link("https://github.com/owner/repo/runs/7?focus=true") == 7
+    assert _check_run_id_from_link("https://github.com/owner/repo/runs/7#summary") == 7
+
+
+def test_check_run_id_from_link_rejects_actions_job_link() -> None:
+    """The ``/runs/<id>`` segment of a real Actions job link is followed by
+    ``/job/``, so the end-anchored check-run pattern must never match it --
+    otherwise the resolver would fetch a workflow-run id as a check run."""
+    assert (
+        _check_run_id_from_link(
+            "https://github.com/owner/repo/actions/runs/29525590823/job/87713099471"
+            "?check_suite_focus=true"
+        )
+        is None
+    )
+
+
+def test_check_run_id_from_link_returns_none_for_external_status() -> None:
+    assert _check_run_id_from_link("https://external.ci/some/path") is None
+    assert _check_run_id_from_link(None) is None
+    assert _check_run_id_from_link("") is None
+
+
+def test_run_id_from_check_run_output_parses_summary_job_link() -> None:
+    """A posting step that embeds the real job URL in its ``output.summary``
+    gives the resolver a one-call path: the summary text is caller-supplied,
+    so GitHub's ``details_url`` rewrite never touches it."""
+    payload = {
+        "output": {
+            "summary": "Guard failed; see [the job]"
+            "(https://github.com/owner/repo/actions/runs/37398606691/job/112063807090)."
+        }
+    }
+    assert _run_id_from_check_run_output(payload) == 37398606691
+
+
+def test_run_id_from_check_run_output_scans_title_and_text_too() -> None:
+    title_only = {"output": {"title": "run 123 / job 456"}}
+    assert _run_id_from_check_run_output(title_only) is None
+    text_only = {
+        "output": {
+            "title": "no link here",
+            "text": "https://github.com/owner/repo/actions/runs/55/job/66",
+        }
+    }
+    assert _run_id_from_check_run_output(text_only) == 55
+
+
+def test_run_id_from_check_run_output_none_without_actions_link() -> None:
+    assert _run_id_from_check_run_output(None) is None
+    assert _run_id_from_check_run_output({}) is None
+    assert _run_id_from_check_run_output({"output": None}) is None
+    assert _run_id_from_check_run_output({"output": {"summary": "no link"}}) is None
+    # A check-run link in the output is not an Actions job link.
+    assert (
+        _run_id_from_check_run_output({"output": {"summary": "https://github.com/o/r/runs/9"}})
+        is None
+    )
+
+
+def test_check_suite_id_from_payload_extracts_suite_id() -> None:
+    assert _check_suite_id_from_payload({"check_suite": {"id": 4242}}) == 4242
+    assert _check_suite_id_from_payload({"check_suite": None}) is None
+    assert _check_suite_id_from_payload({}) is None
+    assert _check_suite_id_from_payload(None) is None
+    assert _check_suite_id_from_payload({"check_suite": {"id": "4242"}}) is None
+
+
+def test_run_id_for_check_suite_matches_owning_run() -> None:
+    runs = [
+        {"id": 111, "check_suite_id": 1},
+        {"id": 37398606691, "check_suite_id": 4242},
+    ]
+    assert _run_id_for_check_suite(runs, 4242) == 37398606691
+
+
+def test_run_id_for_check_suite_no_match_or_malformed_returns_none() -> None:
+    # An external-CI check run's suite belongs to no workflow run.
+    assert _run_id_for_check_suite([{"id": 111, "check_suite_id": 1}], 4242) is None
+    assert _run_id_for_check_suite(None, 4242) is None
+    assert _run_id_for_check_suite([], 4242) is None
+    assert _run_id_for_check_suite([{"id": "x", "check_suite_id": 4242}], 4242) is None
+    assert _run_id_for_check_suite([{"check_suite_id": 4242}], 4242) is None
 
 
 def test_classify_first_failure_requests_rerun_and_records_attempt() -> None:

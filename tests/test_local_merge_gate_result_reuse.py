@@ -18,25 +18,25 @@ import sys
 
 from charlie_work import local_suite_runner, selection_wrapper
 from charlie_work.local_lane import branch_head_sha, is_ancestor, suite_command_argv
-from charlie_work.state import load_state, load_state_locked, save_state, state_lock
+from charlie_work.state import load_state_locked
 from charlie_work.workflow import OrchestratorApp
 
 from _local_gate_async_fixtures import (  # noqa: E402
     FAIL_SUITE,
     _adopt_and_approve,
-    _commit_file,
+    _drop_claim,
     _event_kinds,
     _events_of_kind,
     _gate_paths,
     _init_repo,
     _kill_claimed_gate,
-    _wait_pid_dead,
+    _moved_base_gate,  # noqa: F401 -- registers the scaffold fixture (#2662)
     _lane_app,
     _lane_config,
     _make_branch,
+    _no_windows_child_enumeration,  # noqa: F401 -- registers the kill-stub autouse fixture
     _wait_for_result,
 )
-from charlie_work.orchestration import local_merge_gate  # noqa: E402,F401
 
 HEAD = "a" * 40
 BASE = "b" * 40
@@ -128,21 +128,6 @@ def lane_repo() -> Path:
     return Path(tempfile.mkdtemp(prefix="cw-gate-reuse-"))
 
 
-def _drop_claim(app: OrchestratorApp, pr_number: int) -> None:
-    """Lose the claim (supervisor restart / re-arm) while the result file stays."""
-    # The result lands just before the runner exits; a still-live pid file would
-    # make the gate defer instead of launching.
-    _wait_pid_dead(
-        int(load_state_locked(app.paths.state_file)["prs"][str(pr_number)]["local_suite_pid"])
-    )
-    with state_lock(app.paths.state_file):
-        state = load_state(app.paths.state_file)
-        record = state["prs"][str(pr_number)]
-        for field in local_merge_gate.LOCAL_SUITE_CLAIM_FIELDS:
-            record.pop(field, None)
-        save_state(app.paths.state_file, state)
-
-
 def test_same_head_and_base_reuses_result_without_launching(lane_repo: Path) -> None:
     _init_repo(lane_repo)
     issues_dir = lane_repo / "docs" / "issues"
@@ -168,26 +153,14 @@ def test_same_head_and_base_reuses_result_without_launching(lane_repo: Path) -> 
     assert load_state_locked(app.paths.state_file)["prs"]["7"]["status"] == "merged"
 
 
-def test_moved_base_reruns_the_suite(lane_repo: Path) -> None:
-    _init_repo(lane_repo)
-    issues_dir = lane_repo / "docs" / "issues"
-    head = _make_branch(lane_repo, "agent/issue-7-x", "a.py", "a = 1\n")
-    app = _lane_app(lane_repo, issues_dir)
-    _adopt_and_approve(app, issues_dir, 7, "agent/issue-7-x", head)
-
-    assert app._local_merge_approved()[0]["outcome"] == "suite_launched"
-    _wait_for_result(app, 7)
-    _drop_claim(app, 7)
-    _commit_file(lane_repo, "other.py", "x = 1\n", "another PR merged first")
+def test_moved_base_reruns_the_suite(moved_base_gate: OrchestratorApp) -> None:
+    app = moved_base_gate
 
     results = app._local_merge_approved()
 
-    try:
-        assert results[0]["outcome"] == "suite_launched"
-        assert "local_merge_gate_result_reused" not in _event_kinds(app)
-        assert len(_events_of_kind(app, "local_suite_launched")) == 2
-    finally:
-        _kill_claimed_gate(app, 7)
+    assert results[0]["outcome"] == "suite_launched"
+    assert "local_merge_gate_result_reused" not in _event_kinds(app)
+    assert len(_events_of_kind(app, "local_suite_launched")) == 2
 
 
 def test_failed_prior_result_reruns_the_suite(lane_repo: Path) -> None:

@@ -183,6 +183,115 @@ def test_intake_labels_prose_only_dependencies(tmp_path: Path) -> None:
     assert prose_event.get("payload", {}).get("issue_numbers") == [908]
 
 
+def test_intake_clears_prose_only_deps_label_when_trigger_gone(tmp_path: Path) -> None:
+    """Issue #1902: ``agent:prose-only-deps`` has an automated removal path.
+
+    A previously flagged issue whose body no longer trips
+    ``detect_prose_only_dependencies`` (e.g. the #1819 self-referential false
+    positive, reworded away) must get the terminal label stripped by the next
+    intake pass instead of being parked forever behind a raw
+    ``gh issue edit --remove-label``.
+    """
+
+    class ClearedProseOnlyDepsGitHub(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issues = [
+                {
+                    "number": 908,
+                    "title": "Issue whose prose trigger was reworded away",
+                    "url": "https://example.test/issues/908",
+                    "body": "Service A must exist before service B can be built.",
+                    "labels": [
+                        {"name": "automated-ready"},
+                        {"name": "agent:prose-only-deps"},
+                    ],
+                },
+            ]
+
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = ClearedProseOnlyDepsGitHub()
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.intake()
+
+    assert result.ok is True
+    assert result.data["prose_only_deps_issues"] == []
+    assert result.data["prose_only_deps_cleared_issues"] == [908]
+    assert (908, config.labels.prose_only_deps) in fake_gh.labels_removed
+    assert (908, config.labels.prose_only_deps) not in fake_gh.labels_added
+
+    state = load_state(paths.state_file)
+    assert not any(e.get("kind") == "intake_prose_only_deps" for e in state["events"])
+    cleared_event = next(
+        e for e in state["events"] if e.get("kind") == "intake_prose_only_deps_cleared"
+    )
+    assert cleared_event.get("payload", {}).get("issue_numbers") == [908]
+
+
+def test_intake_clears_prose_only_deps_label_once_structured_blockers_declared(
+    tmp_path: Path,
+) -> None:
+    """Issue #1902: declaring structured blockers satisfies the label's own
+    purpose ("needs structured blocker declarations"), so a labeled issue
+    that now declares them is cleared on the next intake pass."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.issues = [
+        {
+            "number": 908,
+            "title": "Issue that declared its blockers properly",
+            "url": "https://example.test/issues/908",
+            "body": "Blocked by #123",
+            "labels": [
+                {"name": "automated-ready"},
+                {"name": "agent:prose-only-deps"},
+            ],
+        },
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.intake()
+
+    assert result.ok is True
+    assert result.data["prose_only_deps_cleared_issues"] == [908]
+    assert list(fake_gh.labels_removed) == [(908, config.labels.prose_only_deps)]
+
+
+def test_intake_keeps_reapplying_prose_only_deps_label_while_trigger_persists(
+    tmp_path: Path,
+) -> None:
+    """Issue #1902: the removal path fires only when the re-check is clean.
+    While the body still trips the heuristic, the existing #225 behavior is
+    unchanged: the label is (re)applied and never removed."""
+    config = OrchestratorConfig()
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    fake_gh = FakeGitHub()
+    fake_gh.issues = [
+        {
+            "number": 908,
+            "title": "Issue with prose-only deps",
+            "url": "https://example.test/issues/908",
+            "body": "Do not dispatch before P2-T2/P2-T3 have landed.",
+            "labels": [
+                {"name": "automated-ready"},
+                {"name": "agent:prose-only-deps"},
+            ],
+        },
+    ]
+    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
+
+    result = app.intake()
+
+    assert result.ok is True
+    assert result.data["prose_only_deps_issues"] == [908]
+    assert result.data["prose_only_deps_cleared_issues"] == []
+    assert (908, config.labels.prose_only_deps) in fake_gh.labels_added
+    assert (908, config.labels.prose_only_deps) not in fake_gh.labels_removed
+
+
 def test_concurrent_dispatch_claims_prevent_double_launch(tmp_path: Path) -> None:
     """A dispatch_pending claim must block a second dispatch for the same issue."""
     config = OrchestratorConfig(

@@ -80,6 +80,11 @@ from ._base import CapabilityCollaborator, GitHubRunResult, _LIST_LIMIT
 from ._pr_mutations import mark_ready
 from ._outcome import failure_text, is_success
 from ._send import read_json, read_result, send, send_json, send_result, send_text
+from .pr_diff_fallback import (
+    base_ref_from_rest_pr,
+    emit_unavailable_event,
+    local_pr_diff,
+)
 
 # Outbound secret guard (issue #1505): ``pr_create`` scans title+body before
 # any ``gh`` invocation -- a credential in a PR body survives deletion via
@@ -245,7 +250,7 @@ class PullRequestsLike(Protocol):
 
     def pr_list_with_checks(self) -> list[dict[str, Any]]: ...
 
-    def pr_diff(self, number: int) -> str: ...
+    def pr_diff(self, number: int) -> str | None: ...
 
     def pr_commits(self, number: int) -> list[dict[str, Any]] | None: ...
 
@@ -526,12 +531,74 @@ class PullRequests(CapabilityCollaborator):
         result = read_json(self, JsonRead("pr", "view", fields, number=number))
         return result if isinstance(result, dict) else {}
 
-    def pr_diff(self, number: int) -> str:
+    def pr_diff(self, number: int) -> str | None:
+        """Fetch a PR's diff via the REST ``pulls/{number}`` endpoint with
+        the diff media type.
+
+        Three outcomes, deliberately distinct (issue #1807):
+
+        - a diff string, possibly ``""`` when the PR's merge-base diff is
+          *genuinely empty and was successfully fetched* -- the #1251
+          empty-diff gate relies on this exact shape to skip a zero-delta
+          PR's review dispatch;
+        - a diff string from the local-git fallback
+          (``pr_diff_fallback.local_pr_diff``): ``git fetch origin
+          pull/N/head`` + ``git diff --merge-base`` against the fetched
+          head, which survives GitHub's 300-file ``too_large`` diff cap
+          (observed on PR #2160, a 461-file mechanical ledger split) and
+          every other fetch failure;
+        - ``None`` when the remote refused or failed the fetch AND the
+          local fallback could not produce a diff either. ``None`` is NOT
+          an empty diff: a packet that treated it as one would read as a
+          zero-delta PR and skip review dispatch on every pass, forever.
+          Callers must not write a ``diff.patch`` / packet from ``None``;
+          the ``review_packet_diff_unavailable`` warning event fires here
+          (with the transport's error text) so the condition is observable.
+        """
         result = send_result(
             self,
             RestRequest.of("GET", f"repos/{{owner}}/{{repo}}/pulls/{number}", accept=ACCEPT_DIFF),
         )
-        return result.value if result.ok and isinstance(result.value, str) else ""
+        if result.ok and isinstance(result.value, str):
+            return result.value
+        remote_error = (result.error or "").strip() or "diff fetch failed"
+        # Fallback step 1: no GraphQL -- read the baseRefName from the same
+        # REST endpoint without the diff media type, which happy-succeeds
+        # under the transport where a follow-up pr_view read raises on
+        # failure instead of returning a value.
+        base_read = send_result(
+            self,
+            RestRequest.of("GET", f"repos/{{owner}}/{{repo}}/pulls/{number}"),
+            json_output=True,
+        )
+        # Errors come back as values: ``value`` is only meaningful when the
+        # read succeeded (GitHubRunResult's own contract, issue #1807 rework).
+        base_ref = base_ref_from_rest_pr(base_read.value) if base_read.ok else None
+        if base_ref is not None:
+            local = local_pr_diff(self.repo_root, number, base_ref)
+            if local is not None:
+                logger.warning(
+                    "pr_diff #%d: remote diff failed (%s); serving the local "
+                    "git fallback vs origin/%s",
+                    number,
+                    remote_error,
+                    base_ref,
+                )
+                return local
+        fallback_note = " (local git fallback unavailable or failed)"
+        emit_unavailable_event(
+            self.repo_root,
+            getattr(self.runtime, "state_dir", None),
+            number,
+            remote_error,
+        )
+        logger.warning(
+            "pr_diff #%d unavailable: %s%s",
+            number,
+            remote_error,
+            fallback_note,
+        )
+        return None
 
     def pr_commits(self, number: int) -> list[dict[str, Any]] | None:
         """Fetch a PR's commits via the REST ``pulls/{number}/commits`` endpoint.
