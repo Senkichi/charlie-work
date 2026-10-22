@@ -18,6 +18,7 @@ from .file_lock import ByteRangeFileLock, try_acquire_byte_range_lock
 from .fleet_paths import warn_fleet_dir_virtualization_on_write
 from .github import GitHub, GitHubError, GitHubLike
 from .paths import RepoNotFoundError, RuntimePaths, find_repo_root
+from . import repo_retirement as _retirement
 from .safe_path import contains
 from .state import save_state, state_lock
 
@@ -111,7 +112,6 @@ def _select_repos(
         # Explicit subset: use exactly the given keys in the given order
         # Skip keys that don't exist in the registry
         selected = [(key, repos_map[key]) for key in repos if key in repos_map]
-        return selected
     else:
         # All repos: sort by oldest last_seen first
         all_repos = list(repos_map.items())
@@ -126,8 +126,9 @@ def _select_repos(
             has_last_seen = last_seen != ""
             return (not has_last_seen, last_seen)
 
-        all_repos.sort(key=last_seen_key)
-        return all_repos
+        selected = sorted(all_repos, key=last_seen_key)
+    _retirement.mark_selection_retired(selected)
+    return selected
 
 
 def _resolved_canonical_root(path: Path) -> Path | None:
@@ -314,6 +315,7 @@ def touch_repo(
                     "last_seen": now,
                 }
 
+        updated_entry[_retirement.RETIRED_FIELD] = _retirement.touched_retired_flag(updated_entry)
         repos[name_with_owner] = updated_entry
         data["repos"] = repos
 
@@ -396,6 +398,9 @@ def _iter_registered_repo_contexts(
                 f"failed to load repo config for {repo_root}: {exc}"
             )
             skipped_repos.append(name_with_owner)
+            continue
+
+        if repo_config.fleet.retired:
             continue
 
         yield name_with_owner, repo_root, state_dir, repo_config
@@ -733,7 +738,7 @@ def managed_repo_names(fleet_dir_override: str | None) -> frozenset[str]:
     """
     fleet_json_path = layout.fleet_registry_path(override=fleet_dir_override)
     data = _load_registry(fleet_json_path)
-    repos = data.get("repos", {})
+    repos = _retirement.active_registry_repos(data.get("repos", {}))
     return frozenset(_repo_name_segment(name) for name in repos)
 
 
@@ -769,7 +774,7 @@ def managed_repo_roots(fleet_dir_override: str | None) -> Mapping[str, Path]:
     """
     fleet_json_path = layout.fleet_registry_path(override=fleet_dir_override)
     data = _load_registry(fleet_json_path)
-    repos = data.get("repos", {})
+    repos = _retirement.active_registry_repos(data.get("repos", {}))
     roots: dict[str, Path] = {}
     owners_by_name: dict[str, str] = {}
     for name_with_owner, entry in repos.items():

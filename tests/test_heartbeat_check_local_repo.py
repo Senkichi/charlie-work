@@ -391,3 +391,56 @@ def test_main_emits_no_anomaly_or_gh_repo_call_for_local_repo(
     assert any(line.startswith("OK dispatch-throttle local/mdls:") for line in lines), (
         f"missing dispatch-throttle line in:\n{output}"
     )
+
+
+# ---------------------------------------------------------------------------
+# load_repos: fleet.retired resolution (issue #2754)
+# ---------------------------------------------------------------------------
+
+
+def test_load_repos_marks_retired_repo(hb: ModuleType, monkeypatch: Any, tmp_path: Path) -> None:
+    fleet_dir = tmp_path / "fleet"
+    config_path = tmp_path / "orchestrator.config.yaml"
+    config_path.write_text("fleet:\n  retired: true\n", encoding="utf-8")
+    _write_fleet_json(
+        fleet_dir,
+        {
+            "local/mdls": {
+                "repo_root": str(tmp_path),
+                "state_dir": str(tmp_path / "state"),
+                "config_path": str(config_path),
+            }
+        },
+    )
+    monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", str(fleet_dir))
+
+    repos, err = hb.load_repos()
+    assert err is None
+    assert len(repos) == 1
+    assert repos[0].retired is True
+
+
+def test_load_repos_ignores_fleet_layer_retirement(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    """retirement is per-repo: a global fleet.retired must not apply."""
+    fleet_dir = tmp_path / "fleet"
+    fleet_dir.mkdir(parents=True)
+    (fleet_dir / "config.yaml").write_text("fleet:\n  retired: true\n", encoding="utf-8")
+    config_path = tmp_path / "orchestrator.config.yaml"
+    config_path.write_text("dispatch:\n  max_concurrent_sessions: 2\n", encoding="utf-8")
+    _write_fleet_json(
+        fleet_dir,
+        {
+            "owner/repo": {
+                "repo_root": str(tmp_path),
+                "state_dir": str(tmp_path / "state"),
+                "config_path": str(config_path),
+            }
+        },
+    )
+    monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", str(fleet_dir))
+
+    repos, err = hb.load_repos()
+    assert err is None
+    assert repos[0].retired is False

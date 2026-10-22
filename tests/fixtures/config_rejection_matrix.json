@@ -1699,6 +1699,10 @@
 "auto_merge.mergequeue_requeue_cap": [
 "auto_merge",
 "mergequeue_requeue_cap"
+],
+"fleet.retired": [
+"fleet",
+"retired"
 ]
 },
 "seeds": {
@@ -2168,7 +2172,8 @@
 "labels.model_tier_prefix": {},
 "labels.priority_prefix": {},
 "auto_merge.mergequeue_skip_line_label": {},
-"auto_merge.mergequeue_requeue_cap": {}
+"auto_merge.mergequeue_requeue_cap": {},
+"fleet.retired": {}
 },
 "cells": {
 "labels": [
@@ -19779,6 +19784,50 @@
 "A8270",
 "R",
 "A5ecd",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R",
+"R"
+],
+"fleet.retired": [
+"A490d",
+"Ad8bf",
+"Ad751",
+"R",
+"R",
+"R",
+"R",
 "R",
 "R",
 "R",

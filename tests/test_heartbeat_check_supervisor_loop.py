@@ -415,3 +415,19 @@ def test_check_wedge_kill_loop_anomaly_on_unreadable_db(
     hb.check_wedge_kill_loop(report)
     assert report.anomaly
     assert "unreadable" in report.lines[0]
+
+
+def test_check_loop_pass_freshness_ok_for_retired_repo(hb: ModuleType, tmp_path: Path) -> None:
+    """Issue #2754: retirement intentionally stops passes, so no anomaly."""
+    from dataclasses import replace
+
+    repo = replace(_make_repo(hb, tmp_path), retired=True)
+    repo.state_dir.mkdir(parents=True, exist_ok=True)
+    (repo.state_dir / "state.json").write_text("{}", encoding="utf-8")
+    _write_events_db(repo.state_dir, [(_iso(240), "loop_started")])
+
+    report = hb.Report()
+    hb.check_loop_pass_freshness(report, repo)
+
+    assert not report.anomaly
+    assert "retired" in report.lines[0]
