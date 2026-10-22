@@ -191,8 +191,10 @@ CASES: dict[str, dict] = {
     "reviewer_fallbacks_devin_primary": {
         "reviewer": {"harness": "devin", "fallbacks": [_FB]}
     },
-    # rescue.worker / rescue.reviewer reuse WorkerRoleConfig and store ``fallbacks`` unparsed
-    # (main's known gap): anything is accepted, verbatim, and a null stays ``None``.
+    # Issue #2118: rescue.worker / rescue.reviewer reuse WorkerRoleConfig, but the
+    # nested roles are never read at runtime, so ``fallbacks`` is a forbidden key at
+    # both rescue use-sites (RescueConfig.validate): every spelling rejects.
+    "rescue_worker_fallbacks_int": {"rescue": {"worker": {"fallbacks": 5}}},
     "rescue_worker_fallbacks_raw": {"rescue": {"worker": {"fallbacks": [{"harness": "bogus"}]}}},
     "rescue_worker_fallbacks_str": {"rescue": {"worker": {"fallbacks": "zz"}}},
     "rescue_reviewer_fallbacks_null": {"rescue": {"reviewer": {"fallbacks": None}}},
