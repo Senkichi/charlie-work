@@ -2623,10 +2623,13 @@ class OrchestratorConfig:
     ] = field(default_factory=RunnerScalingConfig)
     # Host-wide (#600, #763): one physical machine, so a per-repo layer must not hold its
     # own opinion. ``ci_fleet``'s own ``__post_init__`` owns the remaining rules
-    # (per-repo ceilings, affinity), including ``key: null`` on the four fields it cannot
-    # compare against ``None``: that ``TypeError`` becomes a ``ConstructionError``, which the
-    # #665 layered rescue re-raises (a use-site ``NotNull`` would make it a rescuable
-    # ``FieldError`` and silently discard the global layer -- cfg review R2-B1).
+    # (per-repo ceilings, affinity). Since issue #2116 the validator's class-level
+    # null rule defaults a scalar ``key: null`` back to the field's declared default
+    # before the constructed value reaches those comparisons (it used to surface as a
+    # ``ConstructionError`` the #665 rescue re-raised); a non-scalar ``null`` (e.g.
+    # ``max_running_per_repo``) still raises -- construction errors stay loud, and a
+    # use-site ``NotNull`` on this section would make the failure a rescuable
+    # ``FieldError`` silently discarding the global layer (cfg review R2-B1).
     runner_allocation: Annotated[
         RunnerAllocationConfig,
         HostWideOnly,
