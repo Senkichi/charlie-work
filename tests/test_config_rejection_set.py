@@ -583,14 +583,14 @@ def test_probe_replay_detects_a_loosened_validator(recorded, monkeypatch):
 
 
 def test_probe_replay_detects_a_rescuable_flip(recorded, monkeypatch):
-    """Specificity control: flipping a recorded RC into a rescuable R must surface too,
-    not only a loosened validator. A use-site ``NotNull`` on
-    ``runner_allocation.reserved_threads`` is exactly that flip (cfg review R2-B1):
-    the field is ci-fleet-owned, so a null reaches its ``__post_init__`` and the
-    TypeError is wrapped as a non-rescuable ``ConstructionError`` (RC), while the
-    NotNull rule fires inside ``validate_section`` and raises a rescuable
-    ``FieldError`` (R) -- which would flip the #665 layered rescue to
-    silently-discarding-global with no signal, if the replay missed it."""
+    """Specificity control: an RC-class change must surface, not only a loosened
+    validator. A use-site ``NotNull`` on ``runner_allocation.reserved_threads``
+    (cfg review R2-B1): the NotNull rule fires inside ``validate_section`` and
+    raises a rescuable ``FieldError`` (R). Since #2116 a null on the knob builds
+    the default (so the mutated replay flips an accepted A code to R rather than
+    the pre-#2116 RC), and that rescuable-class change would flip the #665
+    layered rescue to silently-discarding-global with no signal, if the replay
+    missed it."""
     import charlie_work.config as config_module
 
     real = config_module.field_rules
@@ -603,7 +603,7 @@ def test_probe_replay_detects_a_rescuable_flip(recorded, monkeypatch):
 
     monkeypatch.setattr(config_module, "field_rules", notnull_on_reserved_threads)
     with pytest.raises(
-        AssertionError, match=r"runner_allocation\.reserved_threads <- none: recorded RC, now R"
+        AssertionError, match=r"runner_allocation\.reserved_threads <- none: recorded Ad751, now R"
     ):
         test_key_probe_matrix_unchanged(recorded)
 
