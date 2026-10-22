@@ -1771,10 +1771,20 @@ class WorkerRoleConfig:
     """
 
     harness: str = "manual"
-    model: str = ""
+    # Issue #2117: reject a non-string model at the boundary as a FieldError.
+    # Without the ``Typed`` marker the raw value (e.g. ``model: 5``) is stored
+    # as-is and later crashes ``role_chain.model_family`` with a bare
+    # ``AttributeError`` on ``.strip()`` -- not a ``ConfigError``, so callers
+    # that catch ``ConfigError`` keep going. ``model`` is a plain string on
+    # every use site of this class (top-level worker and rescue.worker /
+    # rescue.reviewer), so the check can live here, on the field itself,
+    # unlike ``harness`` which diverges per use site. ``NotNull``: only
+    # ``""`` means "harness default"; null stays the crash it always was.
+    model: Annotated[str, Typed, NotNull] = ""
     # Issue #2086: role chain, see role_chain.py. ``Verbatim`` because rescue.worker /
-    # rescue.reviewer reuse this class and never parsed ``fallbacks`` (main stores the raw
-    # value); the top-level ``worker:`` section opts in with a use-site ``Entries``.
+    # rescue.reviewer reuse this class and treat ``fallbacks`` as a forbidden key turned
+    # away by RescueConfig.validate (issue #2118); the top-level ``worker:`` section opts
+    # in with a use-site ``Entries`` (which overrides ``Verbatim``).
     fallbacks: Annotated[tuple[RoleEntry, ...], Verbatim] = ()
     chain = property(chain_of)
 
@@ -1798,7 +1808,12 @@ class ReviewerRoleConfig:
     """
 
     harness: Annotated[str, Typed, NotNull, OneOf(*sorted(REVIEWER_HARNESSES))] = "claude-code"
-    model: str = _DEFAULT_CLAUDE_MODEL
+    # Issue #2117: a non-string model is a FieldError here too; without the
+    # marker ``reviewer.model: 5`` / ``model: null`` were silently stored and
+    # only crashed ``role_chain.model_family`` once the worker side had a
+    # known family. The fallbacks entries' ``model`` is checked separately by
+    # ``RoleEntry.model`` (role_chain.py).
+    model: Annotated[str, Typed, NotNull] = _DEFAULT_CLAUDE_MODEL
     effort: Annotated[str, Typed, NotNull] = ""
     effort_experiment_fraction: Annotated[float, Typed, NotNull, InRange(0.0, 1.0)] = 0.0
     effort_experiment_salt: Annotated[str, Typed, NotNull] = ""
@@ -1874,6 +1889,13 @@ class RescueConfig:
     ``claude_code.launch_claude_worker`` -- so ``ReviewerRoleConfig``'s
     claude-code-only harness restriction and its effort/experiment fields
     would both be wrong here.
+
+    Issue #2118: ``fallbacks`` is a forbidden key at both rescue use-sites
+    (``validate()`` below). Rescue dispatch consumes only the flat fields
+    above -- no consumer reads the nested roles or their ``fallbacks`` --
+    so option (a) (parse + ``check_role_chain``) would validate config that
+    is never launched, while option (b) (reject the key, like an unknown
+    one) matches how rescue dispatch actually consumes roles.
     """
 
     enabled: Annotated[bool, Typed] = False
@@ -1900,6 +1922,25 @@ class RescueConfig:
     reviewer: Annotated[WorkerRoleConfig, LenientMapping] = field(
         default_factory=lambda: WorkerRoleConfig(harness="devin", model="codex")
     )
+
+    def validate(self, config: OrchestratorConfig) -> None:
+        """``fallbacks`` is a forbidden key at both rescue use-sites (issue #2118).
+
+        Rejected exactly like an unknown key whenever the key appears at all:
+        absent builds the field default ``()``; an explicit ``fallbacks: null``
+        is preserved as ``None`` (design P2); anything else is kept as written
+        by the class's ``Verbatim`` annotation and lands here unchecked. Field
+        keys are relative -- ``run_section_hooks`` adds the ``rescue.`` prefix.
+        """
+        for name in ("worker", "reviewer"):
+            fallbacks = getattr(getattr(self, name), "fallbacks")
+            if fallbacks != ():
+                raise FieldError(
+                    f"{name}.fallbacks",
+                    f"absent ({name} takes no fallbacks)",
+                    fallbacks,
+                    "raw",
+                )
 
 
 @dataclass(frozen=True)
@@ -2582,10 +2623,13 @@ class OrchestratorConfig:
     ] = field(default_factory=RunnerScalingConfig)
     # Host-wide (#600, #763): one physical machine, so a per-repo layer must not hold its
     # own opinion. ``ci_fleet``'s own ``__post_init__`` owns the remaining rules
-    # (per-repo ceilings, affinity), including ``key: null`` on the four fields it cannot
-    # compare against ``None``: that ``TypeError`` becomes a ``ConstructionError``, which the
-    # #665 layered rescue re-raises (a use-site ``NotNull`` would make it a rescuable
-    # ``FieldError`` and silently discard the global layer -- cfg review R2-B1).
+    # (per-repo ceilings, affinity). Since issue #2116 the validator's class-level
+    # null rule defaults a scalar ``key: null`` back to the field's declared default
+    # before the constructed value reaches those comparisons (it used to surface as a
+    # ``ConstructionError`` the #665 rescue re-raised); a non-scalar ``null`` (e.g.
+    # ``max_running_per_repo``) still raises -- construction errors stay loud, and a
+    # use-site ``NotNull`` on this section would make the failure a rescuable
+    # ``FieldError`` silently discarding the global layer (cfg review R2-B1).
     runner_allocation: Annotated[
         RunnerAllocationConfig,
         HostWideOnly,
