@@ -1169,22 +1169,27 @@ the deleted per-issue routing layer used to run). It calls
 `api_budget.budget_status` against the ledger: the daily check is
 `spent_today + reserve <= max_usd_per_day` (reserve is
 `max_usd_per_session` when set above 0, else `preflight_reserve_usd`), and
-the lifetime check is strict `lifetime_spent < lifetime_usd` — spend exactly
-at the lifetime cap is exhausted. On exhaustion no worker process is
-spawned: an `api_budget_refused` warning event is recorded (via
-`instrumentation.log_event`) in `events.db`, the SQLite audit log beside
-`state.json` — not in the state.json `events` ring. Query it with
+the lifetime check is strict `ledger.lifetime_usd < budget.lifetime_usd` —
+ledger spend exactly at the `budget.lifetime_usd` cap is exhausted. On
+exhaustion no worker process is spawned: an `api_budget_refused` warning
+event is recorded (via `instrumentation.log_event`) in `events.db`, the
+SQLite audit log beside `state.json` — not in the state.json `events` ring.
+Query it with
 `query_events(Path('.var/charlie-work/state.json'), kind='api_budget_refused')`,
 or run the one-liner from the Events section above and read the
 `api_budget_refused` count (event_counts_by_kind prints counts for all kinds;
 there is no kind filter). The
 launch also comes back as an error record (sidecar) whose launch error
 class is `budget` (`launch_events.LAUNCH_ERR_BUDGET`, "spend-cap refusal").
-A missing or corrupt ledger is treated as empty spend; that lifts the lifetime
-refusal whenever `lifetime_usd` is `0`, but the daily check still refuses even
-on empty spend whenever the configured reserve (`max_usd_per_session` when
-set, else `preflight_reserve_usd`) exceeds `max_usd_per_day` (or
-`max_usd_per_day` is `0`), and the check is skipped when no `config` is passed
+A missing or corrupt ledger is treated as empty spend. That lifts the lifetime
+refusal only when `budget.lifetime_usd` is above `0` (empty-ledger spend `0`
+compares `0 < budget.lifetime_usd`); when `budget.lifetime_usd` is `0` the
+strict check is `0 < 0`, which refuses every launch — so a zero value is a
+zero cap, never "unlimited" or "disabled". With an empty ledger the daily
+check refuses exactly when the configured reserve (`max_usd_per_session`
+when set above 0, else `preflight_reserve_usd`) exceeds `max_usd_per_day`
+(so a `max_usd_per_day: 0` cap plus a positive reserve also refuses every
+launch), and the check is skipped when no `config` is passed
 (direct construction only — the production dispatch path always passes one).
 Current and remaining headroom is surfaced by `doctor`'s api-worker probe and
 the `fleet status` snapshot. See Failure modes below for the accounting and
@@ -1193,8 +1198,8 @@ recovery path.
 **Raising caps.** Edit `budget.max_usd_per_day` and/or `budget.lifetime_usd` in
 config (global or per-repo) and reload. Raising a cap lets *new* launches
 through as soon as the check passes. There is no ledger reset — raising
-`lifetime_usd` above the current `lifetime_usd` immediately restores headroom
-for new launches. Raising a cap does **not**, however, clear issues already
+`budget.lifetime_usd` above the ledger's `lifetime_usd` immediately restores
+headroom for new launches. Raising a cap does **not**, however, clear issues already
 escalated for repeated refusals under `dispatch_failed_cap_exceeded` (see
 Failure modes below): re-queue those with `charlie unescalate --issue <n>`.
 To start a fresh accounting period (e.g. a new billing month), the lifetime
@@ -1271,9 +1276,10 @@ error class `budget` (`launch_events.LAUNCH_ERR_BUDGET`), and an
 `instrumentation.log_event`) in `events.db` — query it with
 `query_events(Path('.var/charlie-work/state.json'), kind='api_budget_refused')`.
 Recovery depends on which cap is exhausted. (A missing or corrupt ledger makes
-`budget_status` report empty spend, so the refusal still does not apply to
-lifetime headroom — but the daily check fails even on an empty ledger whenever
-the configured reserve exceeds `max_usd_per_day`, or `max_usd_per_day` is `0`.)
+`budget_status` report empty spend. That lifts the lifetime refusal only when
+`budget.lifetime_usd` is above `0`; with `budget.lifetime_usd: 0` the strict
+check is `0 < 0`, which refuses every launch. The daily check fails on an
+empty ledger exactly when the configured reserve exceeds `max_usd_per_day`.)
 
 - **Daily cap exhaustion: the refusal itself lifts at the UTC date
   rollover.** The daily check reads `ledger.days[<UTC date today>]`, so once
