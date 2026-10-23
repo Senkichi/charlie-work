@@ -27,10 +27,17 @@ from charlie_work.live_session_count import (
 
 
 class _SidecarStub:
-    """Minimal ``iter_workers`` record: an issue number plus a liveness flag."""
+    """Minimal ``iter_workers`` record: an issue number plus a liveness flag.
 
-    def __init__(self, issue_number: int, alive: bool = True) -> None:
+    Carries ``adapter_kind`` because the single-pass counter behind
+    ``count_live_sessions`` now reads it too (issue #2764).
+    """
+
+    def __init__(
+        self, issue_number: int, alive: bool = True, adapter_kind: str = "claude-code"
+    ) -> None:
         self.issue_number = issue_number
+        self.adapter_kind = adapter_kind
         self._alive = alive
 
     def is_alive(self) -> bool:
