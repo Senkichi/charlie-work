@@ -20,7 +20,7 @@ wins and the orchestrator's config/token never reaches the worker process.
 Dispatch parallelism cap (issue #646): the same "sanitize once, merge
 worker_env after" chokepoint also injects a safe-default
 ``PYTEST_XDIST_AUTO_NUM_WORKERS`` and, when the target has a real local
-``.venv`` (not a reparse point), ``UV_NO_SYNC=1`` â€” both via ``dict.setdefault``,
+``.venv`` (not a reparse point), ``UV_NO_SYNC=1`` — both via ``dict.setdefault``,
 so an ambient value already present in the orchestrator's own environment, or
 an operator override supplied via ``worker_env``, always wins over the default.
 See ``resolve_pytest_cap``/``resolve_uv_no_sync`` for the precedence helper used
@@ -99,15 +99,15 @@ from .worktree import _unlink_reparse_point, is_junction
 # cores, CI runtime 6.4min -> ~145min). This mirrors the manual operator
 # recipe already used by a sibling repo's scripts/orchestrator/launch_devin_worker.sh,
 # which exports this same variable ("3 concurrent tracks x 2 xdist workers ~= 8
-# physical cores") â€” this constant is that same value, applied automatically
+# physical cores") — this constant is that same value, applied automatically
 # instead of requiring every dispatch path to remember to set it. Cited by
 # path + variable name rather than line number: the previous form pointed at
-# .var/devin-orchestrator/â€¦:49, and both the directory and the line moved.
+# .var/devin-orchestrator/…:49, and both the directory and the line moved.
 PYTEST_XDIST_AUTO_NUM_WORKERS_VAR = "PYTEST_XDIST_AUTO_NUM_WORKERS"
 DEFAULT_PYTEST_XDIST_AUTO_NUM_WORKERS = "2"
 
 # Issue #646 / #649: pairs with the cap above. UV_NO_SYNC gates only `uv run`'s
-# *implicit* sync (the `--no-sync` flag, per uv docs) â€” it does NOT gate an
+# *implicit* sync (the `--no-sync` flag, per uv docs) — it does NOT gate an
 # explicit `uv sync`, which still resolves and rewrites the project environment.
 # So UV_NO_SYNC alone cannot protect a shared/junctioned .venv from a worker's
 # explicit `uv sync` rewriting it out from under sibling workers. The real
@@ -117,7 +117,7 @@ DEFAULT_PYTEST_XDIST_AUTO_NUM_WORKERS = "2"
 # UV_NO_SYNC is still worth keeping alongside a confirmed real .venv: it
 # prevents `uv run`'s implicit sync from pruning extras a worker needs, but it
 # is a convenience guard, not the shared-venv safety boundary. UV_NO_SYNC must
-# only ever be set alongside a confirmed real .venv â€” never unconditionally,
+# only ever be set alongside a confirmed real .venv — never unconditionally,
 # since a worktree that legitimately manages its own venv still wants uv to
 # manage its own.
 UV_NO_SYNC_VAR = "UV_NO_SYNC"
@@ -129,14 +129,14 @@ if TYPE_CHECKING:
 
 def provider_api_key_env_vars(config: "OrchestratorConfig | None") -> tuple[str, ...]:
     """Return the provider-key *variable names* configured under
-    ``api_worker.providers``, derived from config (issue #2795) â€” never a
+    ``api_worker.providers``, derived from config (issue #2795) — never a
     hardcoded list, so a repo that re-keys its providers stays in step.
 
     The api adapter resolves the provider key from the ORCHESTRATOR process's
     own env (``api_worker.launch_api_worker``: ``os.environ.get(provider.api_key_env)``),
     which means the key value sits in the supervisor's ambient environment.
     Every other worker launch goes through ``sanitize_env``, so the names
-    returned here must be popped there â€” otherwise every claude_code /
+    returned here must be popped there — otherwise every claude_code /
     devin_shell / devin_review_resume / rescue_review session inherits the
     orchestrator's provider key ambiently. The api adapter keeps working
     because its routing env (``ANTHROPIC_AUTH_TOKEN`` et al., built by
@@ -168,7 +168,7 @@ def provider_api_key_env_vars(config: "OrchestratorConfig | None") -> tuple[str,
 # every worker subprocess's environment. The single source of truth for both
 # sanitize_env's strip loop and the worker-github-token predicate shared by
 # doctor.py's preflight check and workflow.py's dispatch gate (issue #1001).
-# Mirrored nowhere â€” doctor.py imports this constant instead of maintaining a
+# Mirrored nowhere — doctor.py imports this constant instead of maintaining a
 # private copy (the pre-#1001 _STRIPPED_GH_TOKEN_VARS was deleted when this
 # became the shared predicate).
 STRIPPED_GH_TOKEN_VARS = (
@@ -256,7 +256,7 @@ def sanitize_env(
 
         config: The orchestrator config, when the caller has one in scope, so
             the provider-key variable names configured under
-            ``api_worker.providers`` are popped too (issue #2795) â€” see
+            ``api_worker.providers`` are popped too (issue #2795) — see
             :func:`provider_api_key_env_vars`. Omitted/None strips nothing
             extra, preserving every existing caller's behavior.
 
@@ -290,7 +290,7 @@ def sanitize_env(
             pass
 
     if _is_owned_venv(target_venv):
-        # Target has its own real local venv â€” let direct `python` invocations
+        # Target has its own real local venv — let direct `python` invocations
         # find it. uv ignores VIRTUAL_ENV and resolves .venv by default, which
         # is the same path, so we do not need to set UV_PROJECT_ENVIRONMENT.
         env["VIRTUAL_ENV"] = str(target_venv)
@@ -298,7 +298,7 @@ def sanitize_env(
         # worker may have added; explicit `uv sync` is still possible.
         env.setdefault(UV_NO_SYNC_VAR, _UV_NO_SYNC_DEFAULT)
     else:
-        # No owned local venv â€” drop VIRTUAL_ENV to prevent leaks.
+        # No owned local venv — drop VIRTUAL_ENV to prevent leaks.
         env.pop("VIRTUAL_ENV", None)
 
     # Issue #502: never inherit the orchestrator's GitHub auth tokens. Workers
@@ -310,7 +310,7 @@ def sanitize_env(
 
     # Issue #2795: never let the orchestrator's api-provider keys reach a
     # worker session ambiently. The api adapter resolves the key from the
-    # supervisor's own env, which is why the supervisor carries it here â€”
+    # supervisor's own env, which is why the supervisor carries it here —
     # see provider_api_key_env_vars() for the full invariant. config=None
     # (the default, i.e. a caller with no config in scope) strips nothing;
     # launch sites that carry config must pass it through.
@@ -362,7 +362,7 @@ def sanitize_env(
 
     # Issue #646: cap xdist worker fan-out and guard a real local .venv from a
     # concurrent uv sync. setdefault() so an already-exported ambient value
-    # always wins over the built-in safety-net default â€” and a caller merging
+    # always wins over the built-in safety-net default — and a caller merging
     # a config-level worker_env override AFTER this function returns (the
     # established pattern in claude_code.py/devin_shell.py) can still override
     # either value. See resolve_pytest_cap()/resolve_uv_no_sync() for the full
@@ -378,7 +378,7 @@ def resolve_pytest_cap(
 ) -> tuple[str, str]:
     """Return ``(value, source)`` for ``PYTEST_XDIST_AUTO_NUM_WORKERS`` after
     the full merge a launcher performs: ``sanitize_env()`` output, then
-    ``worker_env_override`` (the adapter config knob) layered on top â€” the
+    ``worker_env_override`` (the adapter config knob) layered on top — the
     same order ``launch_claude_worker``/``launch_devin_session`` use to build
     the actual subprocess environment.
 
@@ -389,7 +389,7 @@ def resolve_pytest_cap(
       - ``"default"`` -- neither was set; the built-in safety-net default
         (``DEFAULT_PYTEST_XDIST_AUTO_NUM_WORKERS``) applied
 
-    Used purely for launch-time diagnostics (issue #646) â€” does not itself
+    Used purely for launch-time diagnostics (issue #646) — does not itself
     mutate any environment.
     """
     override = (worker_env_override or {}).get(PYTEST_XDIST_AUTO_NUM_WORKERS_VAR)
@@ -414,12 +414,12 @@ def resolve_uv_no_sync(
     merge described in ``resolve_pytest_cap``.
 
     ``value`` is ``None`` only when ``target_path`` has no real local ``.venv``,
-    no override forced one, AND no ambient ``UV_NO_SYNC`` was already exported â€”
+    no override forced one, AND no ambient ``UV_NO_SYNC`` was already exported —
     the safety-net default is only ever injected alongside a real ``.venv``
     (see ``sanitize_env``'s docstring for why an unconditional default would
     be wrong for a worktree that legitimately manages its own venv). But
-    ``sanitize_env`` never *pops* an ambient ``UV_NO_SYNC`` â€” it only skips
-    the ``setdefault`` when there's no owned ``.venv`` â€” so an operator-exported
+    ``sanitize_env`` never *pops* an ambient ``UV_NO_SYNC`` — it only skips
+    the ``setdefault`` when there's no owned ``.venv`` — so an operator-exported
     value still reaches the child process regardless of ``.venv``
     presence. The ambient-env check must therefore run BEFORE the no-venv
     short-circuit, or this function reports ``None`` while the subprocess
