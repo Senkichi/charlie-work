@@ -166,17 +166,35 @@ def test_fleet_pass_launch_structure_ties_secretenv_wrap_to_its_guards() -> None
     """Issue #2795: the secretenv wrap and its guards are one invariant.
 
     The `api` adapter resolves the provider key from the supervisor's own env
-    (    `os.environ.get(provider.api_key_env)`), and the key lives only in the
+    (`os.environ.get(provider.api_key_env)`), and the key lives only in the
     DPAPI secretenv store -- so the scheduled-task-spawned supervisor cannot
     run `harness: api` launches unless the launcher wraps the supervisor in
     `secretenv run`. The wrap must be guarded (never double-wrap an env that
     already has the key, never trust a secretenv.exe that disappears between
     the exists-check and the spawn, never allow a missing/undecryptable secret
-    to strand the whole fleet) and must never emit the secret value. The
-    single structural match is mutation-hard: each of the launcher mutants
-    listed in this PR's verification section (operative join, inverted/removed
-    either guard, removed init/verify/exit-code assignment, PATH-resolved
-    binary, unconditional wrap, deleted fallback branch) fails this test.
+    to strand the whole fleet) and must never emit the secret value.
+
+    The single structural match is mutation-hard: applied by textual edit to
+    `scripts/fleet-pass.ps1`, each of these mutants makes the regex stop
+    matching, i.e. this test fails —
+    - `-and` between the key-absence test and `Test-Path` rewritten to `-or`,
+    - the `-not` key-absence test dropped from the gate condition,
+    - the `Test-Path -LiteralPath $secretenv` operand dropped,
+    - the gate inverted (`if (-not $secretenvOk)`),
+    - the gate condition replaced with `if ($true)`,
+    - `$secretenvOk = $false` initialized to `$true`,
+    - `$secretenvOk` assigned `$true` instead of `($LASTEXITCODE -eq 0)`,
+    - the exit-code comparison `-eq` flipped to `-ne`,
+    - the if/else wrap-or-plain branches swapped,
+    - the `else` plain-launch fallback branch dropped,
+    - `*> $null` dropped from the verify call (unredirected verify),
+    - the `& $secretenv verify` line dropped, and
+    - the key name `EMPERICUS_ANTHROPIC_API_KEY` replaced with a different
+      key's name.
+
+    Every fragment of the guarded structure is required together: operations
+    like a substring check catch only some of these, because mutated
+    fragments can still exist individually.
     """
     script = SCRIPTS_DIR / "fleet-pass.ps1"
     code = _command_lines(script)

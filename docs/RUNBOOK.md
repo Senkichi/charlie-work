@@ -1100,14 +1100,16 @@ orchestrator spawns. This residual ambient exposure is documented here as
   `PIP_`/`CLAUDE` prefixes, so the runner listeners the allocator starts — and,
   transitively, every self-hosted CI job step — still inherit the configured
   provider key. Mitigation belongs at the allocator's env boundary in
-  `ci_fleet`, stripping the same config-derived provider-key names; **an issue
-  must be filed against the `ci_fleet` repo for this** (the rework worker that
-  wrote this section has no GitHub access; the filing is orchestrator-side).
+  `ci_fleet`, stripping the same config-derived provider-key names; that is a
+  `ci_fleet`-repo change, outside this branch's diff.
 - **Raw `run_captured` children**: `charlie_work.subprocess_runner.run_captured`
-  builds its env as `{**os.environ, ...}`, so any GitHub/doctor/housekeeping
-  child it spawns also sees the key. These are short-lived, in-repo,
-  first-party commands with no third-party tooling attached, which is why the
-  exposure is accepted rather than treated as a leak.
+  builds its env as `{**os.environ, ...}`, so every child the supervisor or
+  orchestrator spawns through it also sees the key. That includes
+  `claude_code.run_quota_probe` (a real Claude CLI session launched via
+  `run_captured` with a raw `os.environ`), self-deploy/pending-sync `uv sync`
+  runs (whose build backends are third-party tooling), and the first-party
+  git/GitHub/doctor/housekeeping commands. These are short-lived, in-repo
+  calls, which is why the exposure is accepted rather than treated as a leak.
 
 Operators who consider either surface provider key-sensitive should treat the
 fleet host as holding the key in the clear (it does — the whole point of
