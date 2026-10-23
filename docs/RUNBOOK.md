@@ -1092,8 +1092,13 @@ cross-family rescue launches; the api adapter keeps working because its
 routing env (`ANTHROPIC_AUTH_TOKEN` et al.) is merged *after* sanitization.
 
 The strip does **not** cover every child process the supervisor or
-orchestrator spawns. This residual ambient exposure is documented here as
-**accepted** for this repo:
+orchestrator spawns. A dedicated helper, `env_sanitize.strip_provider_api_keys`,
+applies the same config-derived pop to any env built by copying the
+supervisor's ambient environment; it runs in `sanitize_env()` and in the local
+merge gate's suite launch (`orchestration.local_merge_gate` ->
+`local_suite_runner.launch_suite_gate`), which executes the PR branch's
+worker-authored test suite, so that child no longer inherits the key. The
+remaining surfaces, documented here as **accepted** for this repo, are:
 
 - **ci_runner listeners and CI job steps** (owned by `ci_fleet`, not here):
   `ci_fleet.runners._sanitize_env` strips only `UV_`/`VIRTUAL_ENV`/`PYTHON`/
@@ -1108,8 +1113,11 @@ orchestrator spawns. This residual ambient exposure is documented here as
   `claude_code.run_quota_probe` (a real Claude CLI session launched via
   `run_captured` with a raw `os.environ`), self-deploy/pending-sync `uv sync`
   runs (whose build backends are third-party tooling), and the first-party
-  git/GitHub/doctor/housekeeping commands. These are short-lived, in-repo
-  calls, which is why the exposure is accepted rather than treated as a leak.
+  git/GitHub/doctor/housekeeping commands. These children run first-party,
+  reviewed command lines against in-repo targets for seconds, not minutes —
+  narrower than a worker session, but still external code running under the
+  supervisor's credential, so the exposure remains recorded rather than
+  dismissed.
 
 Operators who consider either surface provider key-sensitive should treat the
 fleet host as holding the key in the clear (it does — the whole point of

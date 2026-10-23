@@ -59,6 +59,7 @@ from typing import Any
 
 import charlie_work.workflow as _wf
 from charlie_work import local_suite_runner
+from charlie_work.env_sanitize import strip_provider_api_keys
 from charlie_work.local_approval_carry import approval_survives_head_move
 from charlie_work.ledger_context import ledger_env
 from charlie_work.test_slots import ROLE_GATE, arm_env
@@ -873,6 +874,15 @@ def _local_gate_launch(
     if reused is not None:
         return reused
 
+    # Issue #2795: the gate suite runs the PR branch's worker-authored tests,
+    # so its env must not inherit the supervisor's api-provider keys. The
+    # config-derived strip runs AFTER the os.environ copy, before the spawn.
+    gate_env = {
+        **os.environ,
+        **arm_env(self.config.test_slots, role=ROLE_GATE),
+        **ledger_env("gate", issue_number),
+    }
+    strip_provider_api_keys(gate_env, self.config)
     launch = local_suite_runner.launch_suite_gate(
         worktree_path,
         argv,
@@ -880,11 +890,7 @@ def _local_gate_launch(
         head_sha=gate_head or "",
         base_sha=gate_base,
         # Issue #2124: the gate draws the reserved slot 0, never an agent slot.
-        env={
-            **os.environ,
-            **arm_env(self.config.test_slots, role=ROLE_GATE),
-            **ledger_env("gate", issue_number),
-        },
+        env=gate_env,
     )
     if not launch.ok:
         detail = f"suite runner failed to spawn: {launch.error}"

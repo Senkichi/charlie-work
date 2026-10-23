@@ -19,7 +19,9 @@ wins and the orchestrator's config/token never reaches the worker process.
 
 Dispatch parallelism cap (issue #646): the same "sanitize once, merge
 worker_env after" pass (the chokepoint every WORKER/REVIEWER SESSION goes
-through -- but not the only child-process env path on this host: raw
+through; since #2795, ``strip_provider_api_keys`` also covers the local
+merge-gate suite launch -- but this is still not the only child-process env
+path on this host: raw
 ``run_captured`` children and ci_fleet runner listeners/job steps inherit
 ``os.environ`` untouched; issue #2795 documents the accepted residual
 exposure) also injects a safe-default
@@ -152,15 +154,19 @@ def provider_api_key_env_vars(config: "OrchestratorConfig | None") -> tuple[str,
     strip identically.
 
     Scope note (issue #2795): sanitize_env covers worker/reviewer SESSION
-    launches only. Other children of the orchestrator or supervisor process
-    inherit ``os.environ`` raw — ``subprocess_runner.run_captured`` children
+    launches, and :func:`strip_provider_api_keys` additionally covers the local
+    merge-gate suite launch (``orchestration.local_merge_gate`` ->
+    ``local_suite_runner.launch_suite_gate``), which runs the PR branch's
+    worker-authored test suite. Other children of the orchestrator or
+    supervisor process inherit ``os.environ`` raw —
+    ``subprocess_runner.run_captured`` children
     (``env = {**os.environ, ...}``) and, via ci_fleet's own
     ``runners._sanitize_env`` (which strips only ``UV_/VIRTUAL_ENV/PYTHON/
     PIP_/CLAUDE`` prefixes), every runner listener the allocator starts and
     every self-hosted CI job step. That residual ambient exposure is
     documented as accepted in docs/RUNBOOK.md's API-worker section; stripping
-    those surfaces is a ci_fleet-side change keyed on the same config-derived
-    names this function returns.
+    those surfaces is a ci_fleet-side or future charlie-work change keyed on
+    the same config-derived names this function returns.
     """
     if config is None:
         return ()
@@ -192,6 +198,43 @@ STRIPPED_GH_TOKEN_VARS = (
     "GH_ENTERPRISE_TOKEN",
     "GITHUB_ENTERPRISE_TOKEN",
 )
+
+
+def strip_provider_api_keys(
+    env: dict[str, str],
+    config: "OrchestratorConfig | None",
+) -> dict[str, str]:
+    """Pop the configured provider-key variable *names* from ``env`` in place,
+    and return ``env`` for chaining.
+
+    The one implementation every env-construction site that copies the
+    supervisor's ambient environment into a child process must run through
+    (issue #2795): :func:`sanitize_env` for worker/reviewer session launches
+    and the local merge-gate suite launch (``orchestration.local_merge_gate``
+    -> ``local_suite_runner.launch_suite_gate``) for the gate env built from
+    ``{**os.environ, ...}`` — that child runs the PR branch's worker-authored
+    test suite, so it must not inherit the supervisor's provider key either.
+
+    See :func:`provider_api_key_env_vars` for where the names come from and
+    which surfaces still carry the residual exposure.
+    """
+    key_vars = provider_api_key_env_vars(config)
+    if key_vars and os.name == "nt":
+        # Windows casefolds environment-variable KEYS: dict(os.environ) hands
+        # back upper-cased keys, so an exact env.pop("Mixed_Case") silently
+        # fails open — while the api adapter's own os.environ.get() lookup
+        # would still FIND the value (os.environ.get is case-insensitive on
+        # Windows). Match case-insensitively so the strip keeps up with the
+        # api adapter's read; the pop still deletes whatever key casing the
+        # dict actually carries.
+        wanted = {name.upper() for name in key_vars}
+        for env_key in [k for k in env if k.upper() in wanted]:
+            del env[env_key]
+    else:
+        # POSIX keeps case-sensitive env keys, so the exact-name pop is exact.
+        for env_key in key_vars:
+            env.pop(env_key, None)
+    return env
 
 
 # Env every claude-code worker launches with unless `worker_env` overrides it
@@ -328,25 +371,10 @@ def sanitize_env(
     # Issue #2795: never let the orchestrator's api-provider keys reach a
     # worker session ambiently. The api adapter resolves the key from the
     # supervisor's own env, which is why the supervisor carries it here —
-    # see provider_api_key_env_vars() for the full invariant. config=None
+    # see strip_provider_api_keys() for the full invariant. config=None
     # fails open (strips nothing); every in-tree launch site passes config
     # under the AST guard test, so None only ever reaches out-of-tree callers.
-    key_vars = provider_api_key_env_vars(config)
-    if key_vars and os.name == "nt":
-        # Windows casefolds environment-variable KEYS: dict(os.environ) hands
-        # back upper-cased keys, so an exact env.pop("Mixed_Case") silently
-        # fails open — while the api adapter's own os.environ.get() lookup
-        # would still FIND the value (os.environ.get is case-insensitive on
-        # Windows). Match case-insensitively so the strip keeps up with the
-        # api adapter's read; the pop still deletes whatever key casing the
-        # dict actually carries.
-        wanted = {name.upper() for name in key_vars}
-        for env_key in [k for k in env if k.upper() in wanted]:
-            del env[env_key]
-    else:
-        # POSIX keeps case-sensitive env keys, so the exact-name pop is exact.
-        for env_key in key_vars:
-            env.pop(env_key, None)
+    strip_provider_api_keys(env, config)
 
     # Issue #502: isolate gh's config directory so the worker cannot fall back
     # to the orchestrator's stored ``gh auth login`` credentials. A
@@ -472,6 +500,7 @@ def resolve_uv_no_sync(
 __all__ = [
     "sanitize_env",
     "provider_api_key_env_vars",
+    "strip_provider_api_keys",
     "resolve_pytest_cap",
     "resolve_uv_no_sync",
     "PYTEST_XDIST_AUTO_NUM_WORKERS_VAR",
