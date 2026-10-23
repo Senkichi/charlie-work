@@ -13,6 +13,10 @@ for the Track-1 attachment-budget split (#1564).
 
 from __future__ import annotations
 
+import json
+import os
+import pathlib
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -151,3 +155,156 @@ def test_decide_mcp_genuinely_empty_fleet_passes_through(
         tmp_path,
     )
     assert reason is None
+
+
+# ---------------------------------------------------------------------------
+# _load_fleet_roots across the MSIX per-file fork (#2806)
+# ---------------------------------------------------------------------------
+#
+# The #2806 fixture: the host's real fleet.json lists 9 repos, but a packaged
+# (MSIX) session reading the same literal path gets a private fork from an
+# earlier packaged write, listing only 3. Nothing flagged it: the directory
+# resolves to itself (MSIX redirects files, never directories), so the
+# #624 probe and the hook's own registry read both reported a healthy,
+# smaller fleet -- bypassing the merge guard for 6 of 9 repos. Here the
+# fork is simulated by patching ``Path.resolve`` so the literal fleet.json
+# resolves elsewhere, the way a packaged session's ``resolve()`` reveals
+# the LocalCache backing file.
+
+_FLEET_REPOS = (
+    "charlie-work",
+    "job-cannon",
+    "swole",
+    "empericus",
+    "fresh-eyes",
+    "ci_runners",
+    "hosts",
+    "jobcannon",
+    "local/mdls",
+)
+
+
+def _registry(repo_roots_dir: Path, names: tuple[str, ...]) -> dict[str, Any]:
+    return {
+        "version": 1,
+        "repos": {f"Senkichi/{name}": {"repo_root": str(repo_roots_dir / name)} for name in names},
+    }
+
+
+def _virtualized_fleet_dir_with_route(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, registry: dict[str, Any]
+) -> None:
+    """Plant a stale forked fleet.json and route reads to the real one.
+
+    Patches, in order of where each matters:
+    - ``Path.resolve``: the literal fleet.json diverges to a LocalCache-like
+      copy (what a packaged session's resolve() reveals), everything under
+      the administrative-share route short-circuits, and resolve failures
+      degrade to the input path so the UNC route never trips on a host
+      without admin shares.
+    - ``Path.exists`` / ``Path.read_text``: the administrative-share route
+      to the real registry "exists" and reads ``registry`` — a real
+      ``\\\\localhost\\C$`` share is neither writable nor reliably on.
+    """
+    from charlie_work import fleet_paths
+
+    localappdata = tmp_path / "AppData" / "Local"
+    literal_dir = localappdata / "charlie-work"
+    literal_dir.mkdir(parents=True)
+    fleet_json = literal_dir / "fleet.json"
+    # What the packaged session itself reads at the literal path: the stale
+    # fork's content.
+    fleet_json.write_text(
+        json.dumps(_registry(tmp_path, tuple(_FLEET_REPOS[:3]))), encoding="utf-8"
+    )
+
+    admin_dir = fleet_paths._administrative_share_form(literal_dir)
+    assert admin_dir is not None
+    admin_registry = admin_dir / "fleet.json"
+
+    real_resolve = pathlib.Path.resolve
+
+    def fake_resolve(self: Path, *args: Any, **kwargs: Any) -> Path:
+        if os.path.normcase(os.fspath(self)) == os.path.normcase(os.fspath(fleet_json)):
+            return (
+                tmp_path
+                / "Packages"
+                / "app"
+                / "LocalCache"
+                / "Local"
+                / "charlie-work"
+                / "fleet.json"
+            )
+        if str(self).lower().startswith("\\\\localhost\\"):
+            return self
+        try:
+            return real_resolve(self, *args, **kwargs)
+        except OSError:
+            return self
+
+    real_exists = pathlib.Path.exists
+    real_read_text = pathlib.Path.read_text
+
+    def fake_exists(self: Path) -> bool:
+        if os.path.normcase(os.fspath(self)) == os.path.normcase(os.fspath(admin_registry)):
+            return True
+        return real_exists(self)
+
+    def fake_read_text(self: Path, *args: Any, **kwargs: Any) -> str:
+        if os.path.normcase(os.fspath(self)) == os.path.normcase(os.fspath(admin_registry)):
+            return json.dumps(registry)
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(pathlib.Path, "resolve", fake_resolve)
+    monkeypatch.setattr(pathlib.Path, "exists", fake_exists)
+    monkeypatch.setattr(pathlib.Path, "read_text", fake_read_text)
+    monkeypatch.setenv("LOCALAPPDATA", str(localappdata))
+    monkeypatch.delenv("CHARLIE_WORK_FLEET_DIR", raising=False)
+    monkeypatch.setattr(sys, "platform", "win32")
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows-only test")
+def test_load_fleet_roots_routes_around_virtualized_fleet_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Forked fleet.json (3 repos) + routable admin share -> all 9 roots.
+
+    The hook itself needs no changes: routing ``fleet_dir()`` to the
+    non-redirected administrative share is enough for
+    ``layout.fleet_registry_path()`` to read the daemon-visible registry.
+    """
+    real_registry = _registry(tmp_path / "roots", _FLEET_REPOS)
+    (tmp_path / "roots").mkdir()
+    _virtualized_fleet_dir_with_route(monkeypatch, tmp_path, real_registry)
+
+    roots = hook._load_fleet_roots()
+    assert roots is not None
+    assert set(roots) == {f"senkichi/{name}" for name in _FLEET_REPOS}
+    assert "senkichi/empericus" in roots
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows-only test")
+def test_decide_bash_fleet_repo_merge_reaches_merge_check_despite_fork(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``gh pr merge 5 --repo Senkichi/empericus`` runs merge-check, not pass-through.
+
+    Before #2806 the forked registry listed 3 repos, so empericus looked
+    "outside the fleet" and the hook left the call undecided — merging
+    without a preflight on 6 of 9 fleet repos.
+    """
+    real_registry = _registry(tmp_path / "roots", _FLEET_REPOS)
+    (tmp_path / "roots").mkdir()
+    _virtualized_fleet_dir_with_route(monkeypatch, tmp_path, real_registry)
+
+    called: list[tuple[Path, int]] = []
+
+    def _recorded_merge_check(repo_root: Path, pr_number: int) -> tuple[bool, str]:
+        called.append((repo_root, pr_number))
+        return True, ""
+
+    monkeypatch.setattr(hook, "_run_merge_check", _recorded_merge_check)
+
+    reason = hook._decide("Bash", {"command": "gh pr merge 5 --repo Senkichi/empericus"}, tmp_path)
+    assert reason is None
+    assert called == [(Path(str(tmp_path / "roots" / "empericus")), 5)]
