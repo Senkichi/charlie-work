@@ -407,6 +407,13 @@ def _iter_registered_repo_contexts(
             skipped_repos.append(name_with_owner)
             continue
 
+        # Issue #2754: a retired repo is out of the fleet. Its live work is
+        # winding down in its own lane, and this is the one place where the
+        # skip changes a count: the fleet-wide session/review caps stop
+        # reserving budget for it, freeing those slots for active repos.
+        # Counting a non-quiescent retired repo's work here instead is a
+        # behaviour change for the operator to decide -- pinned by
+        # test_non_quiescent_retired_repo_is_excluded_from_fleet_caps.
         if repo_config.fleet.retired:
             continue
 

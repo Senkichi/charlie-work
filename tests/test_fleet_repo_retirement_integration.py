@@ -11,7 +11,7 @@ anything through ``fleet_loop``.
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -159,23 +159,57 @@ def test_real_wind_down_reaps_a_dead_worker_and_leaves_no_live_work(
     assert retired_pass_disposition("owner/retired", repo, app.config, app.paths.root, {}) is True
 
 
-def test_retired_worker_eligible_repo_launches_nothing(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Full pass: wind-down only, then the quiescent retired repo is skipped."""
+def _write_review_sidecar(reviews: Path, *, pr: int, pid: int) -> Path:
+    """A claude-code review sidecar whose claim is well past the stale timeout."""
+    reviews.mkdir(parents=True, exist_ok=True)
+    log_path = reviews / f"issue-{pr}-review.claude.log"
+    log_path.write_text("reviewer log\n", encoding="utf-8")
+    started = (
+        (datetime.now(UTC) - timedelta(hours=1))
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    sidecar = reviews / f"issue-{pr}.claude.json"
+    sidecar.write_text(
+        json.dumps(
+            {
+                "issue_number": pr,
+                "branch": f"agent/issue-{pr}",
+                "worktree_path": str(reviews / f"issue-{pr}"),
+                "prompt_path": str(reviews / f"issue-{pr}-review-prompt.md"),
+                "command": ["claude", "-p"],
+                "pid": pid,
+                "started_at": started,
+                "log_path": str(log_path),
+                "error": None,
+                "process_start_time": 1.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return sidecar
+
+
+def _run_worker_eligible_passes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, retired: bool
+) -> dict[str, Any]:
+    """Run two real ``fleet_loop`` passes over the same worker-eligible fixture.
+
+    Issue 1 is labeled ready but has a dead dispatched worker; issue 2 is
+    plainly ready. The retired run must launch nothing, the active run must
+    launch at least one thing (the positive control).
+    """
     repo = tmp_path / "repo"
     _init_repo(repo)
     issues_dir = repo / "docs" / "issues"
-    config_path = _write_repo_config(repo, retired=True)
-    config = build_config_from_data(_retirement_data(retired=True))
-    number = 1
-    branch = f"agent/issue-{number}"
-    _write_local_issue(issues_dir, number, labels=(config.labels.ready,))
-    # A dead worker makes the first pass run the real wind-down lane while a
-    # ready issue sits eligible for a fresh dispatch.
+    config_path = _write_repo_config(repo, retired=retired)
+    config = build_config_from_data(_retirement_data(retired=retired))
+    _write_local_issue(issues_dir, 1, labels=(config.labels.ready,))
+    _write_local_issue(issues_dir, 2, labels=(config.labels.ready,))
     app = _app(repo, issues_dir, config)
-    _seed_dispatched_issue(app, number, branch)
-    sidecar = _write_dead_session(app, repo, number, branch)
+    _seed_dispatched_issue(app, 1, "agent/issue-1")
+    sidecar = _write_dead_session(app, repo, 1, "agent/issue-1")
 
     fleet_dir = tmp_path / "fleet"
     fleet_dir.mkdir()
@@ -183,38 +217,39 @@ def test_retired_worker_eligible_repo_launches_nothing(
     state_dir.mkdir(parents=True, exist_ok=True)
     entry = {
         "repo_root": str(repo),
-        "name_with_owner": "owner/retired",
+        "name_with_owner": "owner/retired" if retired else "owner/active",
         "config_path": str(config_path),
         "state_dir": str(state_dir),
         "first_seen": _now_iso(),
         "last_seen": _now_iso(),
     }
     (fleet_dir / "fleet.json").write_text(
-        json.dumps({"version": 1, "repos": {"owner/retired": entry}}),
+        json.dumps({"version": 1, "repos": {entry["name_with_owner"]: entry}}),
         encoding="utf-8",
     )
 
-    worker_launches: list[object] = []
-    reviewer_launches: list[object] = []
-    suite_launches: list[object] = []
-    tracker_commits: list[object] = []
-
+    launches: dict[str, list[object]] = {
+        "workers": [],
+        "reviewers": [],
+        "suites": [],
+        "tracker_commits": [],
+    }
     monkeypatch.setattr(
         "charlie_work.adapters.dispatch_sessions",
-        lambda *args, **kwargs: worker_launches.append(args) or [],
+        lambda *args, **kwargs: launches["workers"].append(args) or [],
     )
     for name in ("launch_claude_worker", "launch_devin_session", "launch_api_worker"):
         monkeypatch.setattr(
             f"charlie_work.workflow.{name}",
-            lambda *args, _name=name, **kwargs: reviewer_launches.append(_name),
+            lambda *args, _name=name, **kwargs: launches["reviewers"].append(_name),
         )
     monkeypatch.setattr(
         "charlie_work.local_suite_runner.launch_suite_gate",
-        lambda *args, **kwargs: suite_launches.append(args),
+        lambda *args, **kwargs: launches["suites"].append(args),
     )
     monkeypatch.setattr(
         "charlie_work.orchestration.local_tracker_flush.flush_tracker_writes",
-        lambda *args, **kwargs: tracker_commits.append(args),
+        lambda *args, **kwargs: launches["tracker_commits"].append(args),
     )
     monkeypatch.setattr(
         "charlie_work.fleet_dispatch._run_fleet_allocation_prologue",
@@ -241,16 +276,6 @@ def test_retired_worker_eligible_repo_launches_nothing(
         dry_run=False,
         work_only=False,
     )
-
-    assert first.data["retired"] == ["owner/retired"]
-    assert first.data["repos"]["owner/retired"]["wind_down"] is True
-    assert not sidecar.exists()
-    assert worker_launches == []
-    assert reviewer_launches == []
-    assert suite_launches == []
-    assert tracker_commits == []
-    assert query_events(app.paths.state_file, kind="local_lane_kill_switch_stalled") == []
-
     second = fleet_loop(
         fleet_dir_override=str(fleet_dir),
         global_config=None,
@@ -258,11 +283,102 @@ def test_retired_worker_eligible_repo_launches_nothing(
         dry_run=False,
         work_only=False,
     )
+    return {
+        "repo": repo,
+        "app": app,
+        "sidecar": sidecar,
+        "key": entry["name_with_owner"],
+        "first": first,
+        "second": second,
+        "launches": launches,
+    }
+
+
+def test_retired_worker_eligible_repo_launches_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Full pass: wind-down only, then the quiescent retired repo is skipped."""
+    run = _run_worker_eligible_passes(tmp_path, monkeypatch, retired=True)
+    first = run["first"]
+    second = run["second"]
+    launches = run["launches"]
+
+    assert first.data["retired"] == ["owner/retired"]
+    assert first.data["repos"]["owner/retired"]["wind_down"] is True
+    assert not run["sidecar"].exists()
+    for hook in ("workers", "reviewers", "suites", "tracker_commits"):
+        assert launches[hook] == [], hook
+    assert query_events(run["app"].paths.state_file, kind="local_lane_kill_switch_stalled") == []
 
     assert second.data["retired_quiescent"] == ["owner/retired"]
     assert "owner/retired" not in second.data["repos"]
-    assert worker_launches == []
-    assert reviewer_launches == []
-    assert suite_launches == []
-    assert tracker_commits == []
-    assert query_events(app.paths.state_file, kind="local_lane_kill_switch_stalled") == []
+    for hook in ("workers", "reviewers", "suites", "tracker_commits"):
+        assert launches[hook] == [], hook
+    assert query_events(run["app"].paths.state_file, kind="local_lane_kill_switch_stalled") == []
+
+
+def test_active_worker_eligible_repo_launches_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Positive control for the retirement test: the same fixture does launch.
+
+    Without this, ``== []`` above could never fail for a fixture that was
+    simply not dispatchable.
+    """
+    run = _run_worker_eligible_passes(tmp_path, monkeypatch, retired=False)
+    launches = run["launches"]
+
+    assert "owner/active" in run["first"].data["repos"]
+    assert launches["workers"], "the active fixture must dispatch a worker"
+    assert run["first"].data["retired"] == []
+
+
+def test_retired_repo_reaps_dead_and_live_reviewers_then_goes_quiescent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The reviewer half of wind-down (issue #2754 rework).
+
+    A retired repo with a live and a dead review sidecar counts both as live
+    work (so it does not skip), reaps the dead one through
+    ``_run_review_reap_sweeps``, stays non-quiescent while the live one is
+    alive, and only skips once the last reviewer is reaped. This guards the
+    "winds down forever and never skips" failure.
+    """
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    issues_dir = repo / "docs" / "issues"
+    _write_repo_config(repo, retired=True)
+    config = build_config_from_data(_retirement_data(retired=True))
+    app = _app(repo, issues_dir, config)
+    reviews = app._layout.reviews_dir
+    live_pid = 7001
+    dead_pid = 7002
+    live = _write_review_sidecar(reviews, pr=7, pid=live_pid)
+    dead = _write_review_sidecar(reviews, pr=8, pid=dead_pid)
+    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda pid, *_a: pid == live_pid)
+
+    initial = repo_live_work(repo, app.config, app.paths.root)
+    assert initial.reviewers == 2
+    assert initial.quiescent is False
+    assert retired_pass_disposition("owner/retired", repo, app.config, app.paths.root, {}) is False
+
+    first = run_wind_down(app)
+
+    assert first["review_sweep"]["stalled_reaped"] == 1
+    assert not dead.exists(), "the dead reviewer's sidecar must be reaped"
+    assert live.exists(), "the live reviewer must not be reaped"
+    remaining = repo_live_work(repo, app.config, app.paths.root)
+    assert remaining.reviewers == 1
+    assert remaining.quiescent is False
+    assert retired_pass_disposition("owner/retired", repo, app.config, app.paths.root, {}) is False
+
+    # The last reviewer dies; the next wind-down reaps it and the repo is
+    # quiescent, so the following pass skips it entirely.
+    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_a: False)
+    second = run_wind_down(app)
+
+    assert second["review_sweep"]["stalled_reaped"] == 1
+    assert not live.exists()
+    final = repo_live_work(repo, app.config, app.paths.root)
+    assert final.quiescent is True
+    assert retired_pass_disposition("owner/retired", repo, app.config, app.paths.root, {}) is True

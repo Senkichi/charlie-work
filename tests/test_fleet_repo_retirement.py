@@ -238,73 +238,8 @@ def test_retired_quiescent_repo_launches_nothing(
     mock_app_class.assert_not_called()
 
 
-@patch("charlie_work.fleet_lanes.run_wind_down")
 @patch("charlie_work.fleet_dispatch.compute_api_worker_fleet_report")
 @patch("charlie_work.fleet_dispatch._load_registry")
-@patch("charlie_work.fleet_dispatch.load_layered_config")
-@patch("charlie_work.fleet_dispatch.runtime_paths")
-@patch("charlie_work.fleet_dispatch.GitHub")
-@patch("charlie_work.fleet_dispatch.OrchestratorApp")
-def test_retired_live_worker_winds_down_then_becomes_quiescent(
-    mock_app_class: MagicMock,
-    mock_gh_class: MagicMock,
-    mock_runtime_paths: MagicMock,
-    mock_load_config: MagicMock,
-    mock_load_registry: MagicMock,
-    mock_report: MagicMock,
-    mock_wind_down: MagicMock,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A live worker is reaped in wind-down; the next quiescent pass skips."""
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    config_path = _write_config(repo, retired=True)
-    sidecar = _write_worker_sidecar(repo)
-    entry = _repo_entry(repo, config_path)
-
-    mock_load_registry.return_value = {"repos": {"local/localrepo": entry}}
-    mock_load_config.return_value = OrchestratorConfig(fleet=FleetConfig(retired=True))
-    mock_runtime_paths.side_effect = _per_repo_runtime_paths
-    mock_gh_class.return_value = MagicMock()
-    mock_report.return_value = None
-    mock_wind_down.return_value = {"retired": True, "wind_down": True}
-    apps = [MagicMock(), MagicMock()]
-    mock_app_class.side_effect = apps
-    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: True)
-
-    first = fleet_loop(
-        fleet_dir_override=str(tmp_path / "fleet"),
-        global_config=None,
-        limit=2,
-        dry_run=False,
-        work_only=False,
-    )
-
-    # Wind-down ran, and no normal loop/dispatch lane did.
-    first_app = apps[0]
-    assert first.data["repos"]["local/localrepo"]["wind_down"] is True
-    first_app.loop.assert_not_called()
-    first_app.dispatch.assert_not_called()
-    first_app.dispatch_reviews.assert_not_called()
-    mock_wind_down.assert_called_once()
-
-    # Once the worker is gone the repo is skipped entirely.
-    sidecar.unlink()
-    second = fleet_loop(
-        fleet_dir_override=str(tmp_path / "fleet"),
-        global_config=None,
-        limit=2,
-        dry_run=False,
-        work_only=False,
-    )
-    assert second.data["retired_quiescent"] == ["local/localrepo"]
-    assert mock_app_class.call_count == 1
-
-
-@patch("charlie_work.fleet_dispatch.compute_api_worker_fleet_report")
-@patch("charlie_work.fleet_dispatch._load_registry")
-@patch("charlie_work.fleet_dispatch.load_layered_config")
 @patch("charlie_work.fleet_dispatch.runtime_paths")
 @patch("charlie_work.fleet_dispatch.GitHub")
 @patch("charlie_work.fleet_dispatch.OrchestratorApp")
@@ -312,12 +247,16 @@ def test_flipping_the_key_takes_effect_on_the_next_pass(
     mock_app_class: MagicMock,
     mock_gh_class: MagicMock,
     mock_runtime_paths: MagicMock,
-    mock_load_config: MagicMock,
     mock_load_registry: MagicMock,
     mock_report: MagicMock,
     tmp_path: Path,
 ) -> None:
-    """No supervisor restart: the next pass reads the new config value."""
+    """No supervisor restart: the real layered loader sees the flipped key.
+
+    The config is written to the repo's own file and read through the real
+    ``load_layered_config`` both passes -- only the file is flipped, so the
+    test cannot pass by patching the loader's return value.
+    """
     repo = tmp_path / "repo"
     repo.mkdir()
     config_path = _write_config(repo, retired=False)
@@ -329,7 +268,6 @@ def test_flipping_the_key_takes_effect_on_the_next_pass(
     app = MagicMock()
     app.loop.return_value = CommandResult(True, "loop complete", {})
     mock_app_class.return_value = app
-    mock_load_config.return_value = OrchestratorConfig(fleet=FleetConfig(retired=False))
 
     fleet_loop(
         fleet_dir_override=str(tmp_path / "fleet"),
@@ -341,7 +279,6 @@ def test_flipping_the_key_takes_effect_on_the_next_pass(
     app.loop.assert_called_once_with(2, merge=None, deadline_exceeded=ANY)
 
     _write_config(repo, retired=True)
-    mock_load_config.return_value = OrchestratorConfig(fleet=FleetConfig(retired=True))
     result = fleet_loop(
         fleet_dir_override=str(tmp_path / "fleet"),
         global_config=None,
@@ -583,6 +520,48 @@ def test_live_counts_skip_retired_repos(tmp_path: Path, monkeypatch: pytest.Monk
     assert count_fleet_live_reviews(None) == (1, [])
 
 
+def test_non_quiescent_retired_repo_is_excluded_from_fleet_caps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pin the intentional exclusion of winding-down live work (issue #2754).
+
+    A retired repo with a live worker and reviewer is still winding down, but
+    ``_iter_registered_repo_contexts`` skips it, so that work does not consume
+    the fleet-wide session/review budgets. The plan mandates *some* behaviour
+    here; this repository keeps the issue's exclusion and flags the
+    alternative (counting winding-down work) for the operator in the PR body.
+    The flipped-key half is the positive control: the same fixture counts when
+    it is not retired, so the zeroes above are the skip, not an empty fixture.
+    """
+    from charlie_work.fleet_registry import _iter_registered_repo_contexts
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    config_path = _write_config(repo, retired=True)
+    _write_worker_sidecar(repo)
+    _write_review_sidecar(repo)
+    entry = _repo_entry(repo, config_path)
+    fleet_dir = tmp_path / "fleet"
+    fleet_dir.mkdir()
+    (fleet_dir / "fleet.json").write_text(
+        json.dumps({"version": 1, "repos": {"owner/retired": entry}}), encoding="utf-8"
+    )
+    monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", str(fleet_dir))
+    monkeypatch.setattr("charlie_work.worker_fate.is_alive", lambda *_: True)
+
+    state_dir = repo / ".var" / "charlie-work"
+    assert repo_live_work(repo, OrchestratorConfig(), state_dir).total == 2
+    assert list(_iter_registered_repo_contexts(None, [])) == []
+    assert count_fleet_live_sessions(None) == (0, [])
+    assert count_fleet_live_reviews(None) == (0, [])
+
+    # Positive control: the same fixture is counted once it is not retired.
+    _write_config(repo, retired=False)
+    assert count_fleet_live_sessions(None) == (1, [])
+    assert count_fleet_live_reviews(None) == (1, [])
+
+
 def test_run_fleet_reap_sweep_skips_retired_repos(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -745,3 +724,192 @@ def test_fleet_retire_inserts_the_flag_into_an_existing_block(tmp_path: Path) ->
         "  retired: true",
         "# below",
     ]
+
+
+def _retire_repo(repo: Path) -> CommandResult:
+    args = cli.build_parser().parse_args(["--repo", str(repo), "fleet", "retire"])
+    return cli.run_fleet_retire(args)
+
+
+def _git_repo(tmp_path: Path) -> Path:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    return repo
+
+
+def test_fleet_retire_rewrites_a_single_line_flow_mapping_keeping_siblings(
+    tmp_path: Path,
+) -> None:
+    """Issue #2754 rework: flow style must not drop the sibling keys."""
+    import yaml
+
+    repo = _git_repo(tmp_path)
+    config = repo / "orchestrator.config.yaml"
+    config.write_text(
+        "fleet: {global_max_concurrent_sessions: 3, retired: false}\n"
+        "dispatch:\n  default_limit: 2\n",
+        encoding="utf-8",
+    )
+
+    result = _retire_repo(repo)
+
+    assert result.ok is True
+    after = yaml.safe_load(config.read_text(encoding="utf-8"))
+    assert after == {
+        "fleet": {"global_max_concurrent_sessions": 3, "retired": True},
+        "dispatch": {"default_limit": 2},
+    }
+    assert repo_retirement_state(repo) is True
+
+
+def test_fleet_retire_rewrites_a_multiline_flow_mapping(tmp_path: Path) -> None:
+    """Issue #2754 rework: a multi-line flow mapping must stay parseable."""
+    import yaml
+
+    repo = _git_repo(tmp_path)
+    config = repo / "orchestrator.config.yaml"
+    config.write_text(
+        "fleet: {\n"
+        "  global_max_concurrent_sessions: 3,\n"
+        "  retired: false,\n"
+        "}\n"
+        "dispatch:\n  default_limit: 2\n",
+        encoding="utf-8",
+    )
+
+    result = _retire_repo(repo)
+
+    assert result.ok is True
+    assert yaml.safe_load(config.read_text(encoding="utf-8")) == {
+        "fleet": {"global_max_concurrent_sessions": 3, "retired": True},
+        "dispatch": {"default_limit": 2},
+    }
+    assert repo_retirement_state(repo) is True
+
+
+def test_fleet_retire_handles_a_column_zero_comment_before_the_key(tmp_path: Path) -> None:
+    """A comment at column 0 inside the fleet block must not split it.
+
+    Before the rework the edit inserted a second ``retired:`` above the
+    comment; YAML accepted the duplicate and the last value won, so the
+    command reported success while ``fleet.retired`` stayed false.
+    """
+    repo = _git_repo(tmp_path)
+    config = repo / "orchestrator.config.yaml"
+    config.write_text(
+        "fleet:\n"
+        "# operator note inside the fleet block\n"
+        "  retired: false  # flipped during incidents\n"
+        "  global_max_concurrent_sessions: 3\n"
+        "dispatch:\n  default_limit: 2\n",
+        encoding="utf-8",
+    )
+
+    result = _retire_repo(repo)
+
+    assert result.ok is True
+    after_text = config.read_text(encoding="utf-8")
+    assert repo_retirement_state(repo) is True
+    assert "# operator note inside the fleet block" in after_text
+    assert "retired: true  # flipped during incidents" in after_text
+    assert after_text.count("retired:") == 1
+
+
+def test_fleet_retire_appends_when_the_file_has_no_fleet_key(tmp_path: Path) -> None:
+    repo = _git_repo(tmp_path)
+    config = repo / "orchestrator.config.yaml"
+    config.write_text("dispatch:\n  default_limit: 2\n", encoding="utf-8")
+
+    result = _retire_repo(repo)
+
+    assert result.ok is True
+    assert config.read_text(encoding="utf-8") == (
+        "dispatch:\n  default_limit: 2\n\nfleet:\n  retired: true\n"
+    )
+    assert repo_retirement_state(repo) is True
+
+
+def test_fleet_retire_writes_an_empty_config_file(tmp_path: Path) -> None:
+    repo = _git_repo(tmp_path)
+    config = repo / "orchestrator.config.yaml"
+    config.write_text("", encoding="utf-8")
+
+    result = _retire_repo(repo)
+
+    assert result.ok is True
+    assert config.read_text(encoding="utf-8") == "fleet:\n  retired: true\n"
+    assert repo_retirement_state(repo) is True
+
+
+def test_fleet_retire_is_an_idempotent_no_op(tmp_path: Path) -> None:
+    repo = _git_repo(tmp_path)
+    config = repo / "orchestrator.config.yaml"
+    before = b"fleet:\n  retired: true\n  global_max_concurrent_sessions: 3\n"
+    config.write_bytes(before)
+
+    result = _retire_repo(repo)
+
+    assert result.ok is True
+    assert result.data["changed"] is False
+    assert config.read_bytes() == before
+
+
+def test_fleet_retire_preserves_crlf_newlines(tmp_path: Path) -> None:
+    repo = _git_repo(tmp_path)
+    config = repo / "orchestrator.config.yaml"
+    config.write_bytes(
+        b"fleet:\r\n  retired: false\r\n  global_max_concurrent_sessions: 3\r\n"
+        b"dispatch:\r\n  default_limit: 2\r\n"
+    )
+
+    result = _retire_repo(repo)
+
+    assert result.ok is True
+    assert config.read_bytes() == (
+        b"fleet:\r\n  retired: true\r\n  global_max_concurrent_sessions: 3\r\n"
+        b"dispatch:\r\n  default_limit: 2\r\n"
+    )
+    assert b"\r\r\n" not in config.read_bytes()
+
+
+def test_fleet_retire_rejects_a_non_mapping_fleet_section(tmp_path: Path) -> None:
+    repo = _git_repo(tmp_path)
+    config = repo / "orchestrator.config.yaml"
+    before = b"fleet: [1, 2]\n"
+    config.write_bytes(before)
+
+    result = _retire_repo(repo)
+
+    assert result.ok is False
+    assert "fleet must be a mapping" in result.message
+    assert config.read_bytes() == before
+
+
+def test_fleet_retire_rejects_an_unreadable_config_file(tmp_path: Path) -> None:
+    repo = _git_repo(tmp_path)
+    (repo / "orchestrator.config.yaml").mkdir()
+
+    result = _retire_repo(repo)
+
+    assert result.ok is False
+    assert "unreadable config" in result.message
+
+
+def test_fleet_retire_refuses_a_render_that_would_not_round_trip(tmp_path: Path) -> None:
+    """The post-render verification is a write gate, not a decoration."""
+    import yaml
+
+    repo = _git_repo(tmp_path)
+    config = repo / "orchestrator.config.yaml"
+    before = b"fleet:\n  retired: false\n  retired: false\n"
+    config.write_bytes(before)
+    # PyYAML accepts the duplicate and keeps the last value, so editing only
+    # the first line would leave the effective value false.
+    assert yaml.safe_load(before.decode())["fleet"]["retired"] is False
+
+    result = _retire_repo(repo)
+
+    assert result.ok is False
+    assert "would not preserve" in result.message
+    assert config.read_bytes() == before
