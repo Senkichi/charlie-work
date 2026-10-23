@@ -1083,6 +1083,37 @@ travels only in the child process env — it is never written to a sidecar, log,
 prompt, or command argv. `doctor`'s launched-sessions probe surfaces
 `provider-auth` and `budget-exceeded` failure kinds on dead sidecars.
 
+**Where the key is stripped — and the residual exposure (issue #2795).** Because
+the key value sits in the supervisor process's own environment, every
+worker/reviewer *session* env is sanitized of it: `sanitize_env()` pops each
+configured provider's `api_key_env` name (derived from `api_worker.providers`,
+never hardcoded) for the `claude-code`, `devin-shell`, resumed-review, and
+cross-family rescue launches; the api adapter keeps working because its
+routing env (`ANTHROPIC_AUTH_TOKEN` et al.) is merged *after* sanitization.
+
+The strip does **not** cover every child process the supervisor or
+orchestrator spawns. This residual ambient exposure is documented here as
+**accepted** for this repo:
+
+- **ci_runner listeners and CI job steps** (owned by `ci_fleet`, not here):
+  `ci_fleet.runners._sanitize_env` strips only `UV_`/`VIRTUAL_ENV`/`PYTHON`/
+  `PIP_`/`CLAUDE` prefixes, so the runner listeners the allocator starts — and,
+  transitively, every self-hosted CI job step — still inherit the configured
+  provider key. Mitigation belongs at the allocator's env boundary in
+  `ci_fleet`, stripping the same config-derived provider-key names; **an issue
+  must be filed against the `ci_fleet` repo for this** (the rework worker that
+  wrote this section has no GitHub access; the filing is orchestrator-side).
+- **Raw `run_captured` children**: `charlie_work.subprocess_runner.run_captured`
+  builds its env as `{**os.environ, ...}`, so any GitHub/doctor/housekeeping
+  child it spawns also sees the key. These are short-lived, in-repo,
+  first-party commands with no third-party tooling attached, which is why the
+  exposure is accepted rather than treated as a leak.
+
+Operators who consider either surface provider key-sensitive should treat the
+fleet host as holding the key in the clear (it does — the whole point of
+`secretenv`'s DPAPI storage is lost the moment any child inherits it) and scope
+`api_worker.enabled` / self-hosted CI accordingly.
+
 **Validation at config load** (`ApiWorkerConfig.__post_init__`): when
 `enabled: true`, `provider` must be a non-empty string naming a key in
 `providers`; the active provider's `api_key_env` must be non-empty; its

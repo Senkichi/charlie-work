@@ -131,8 +131,12 @@ def test_module_entry_point_exists() -> None:
 # fragments cannot drift apart. It ties the whole guarded launch together:
 #   1. `$secretenv` resolves to the per-user secretenv.exe (not PATH),
 #   2. `$secretenvOk` is initialised to $false,
-#   3. the if-condition carries BOTH guards — the key-absence (no double-wrap)
-#      test AND `Test-Path -LiteralPath $secretenv`,
+#   3. the if-condition carries BOTH guards joined by `-and` — the key-absence
+#      (no double-wrap) test AND `Test-Path -LiteralPath $secretenv`. The `-and`
+#      is required literally between them: without it a `-and`-to-`-or` mutant
+#      still matched (the round-1 pattern's `[^{}]*?` tail spanned the
+#      operator), and `-or` would wrap whenever EITHER guard holds instead of
+#      requiring both.
 #   4. inside that same guard block, `secretenv verify ... *> $null` runs and
 #      `$secretenvOk` is assigned from ($LASTEXITCODE -eq 0) right after it,
 #   5. the launch is `if ($secretenvOk) { & $secretenv run ... -- cmd /c $cmdLine
@@ -145,7 +149,7 @@ _SECRETENV_LAUNCH_RE = re.compile(
     r"\$secretenv\s*=\s*Join-Path\s+\$env:USERPROFILE\s+'\.local\\bin\\secretenv\.exe'"
     r"[^{}]*?\$secretenvOk\s*=\s*\$false\b"
     r"[^{}]*?if\s*\([^\n\(]*-not\s+\[Environment\]::GetEnvironmentVariable\('EMPERICUS_ANTHROPIC_API_KEY'\)"
-    r"[^{}]*?Test-Path\s+-LiteralPath\s+\$secretenv"
+    r"[^{}]*-and[^{}]*?Test-Path\s+-LiteralPath\s+\$secretenv"
     r"[^{}]*?\)[^\n{]*\{\s*\n\s*"
     r"&\s*\$secretenv\s+verify\s+EMPERICUS_ANTHROPIC_API_KEY\s+\*>\s*\$null\s*\n\s*"
     r"\$secretenvOk\s*=\s*\(\s*\n?\s*\$LASTEXITCODE\s+-eq\s+0\s*\)\s*\n"
@@ -162,17 +166,17 @@ def test_fleet_pass_launch_structure_ties_secretenv_wrap_to_its_guards() -> None
     """Issue #2795: the secretenv wrap and its guards are one invariant.
 
     The `api` adapter resolves the provider key from the supervisor's own env
-    (`os.environ.get(provider.api_key_env)`), and the key lives only in the
+    (    `os.environ.get(provider.api_key_env)`), and the key lives only in the
     DPAPI secretenv store -- so the scheduled-task-spawned supervisor cannot
     run `harness: api` launches unless the launcher wraps the supervisor in
     `secretenv run`. The wrap must be guarded (never double-wrap an env that
     already has the key, never trust a secretenv.exe that disappears between
     the exists-check and the spawn, never allow a missing/undecryptable secret
-    to strand the whole fleet) and must never emit the secret value. Smaller
-    mutants than the full block (inverted gate, `if ($true)`, dropped
-    Test-Path guard, swapped branches, `$secretenvOk = $true`) all fail this
-    single structural match -- see the E-field in the mutation matrix this
-    test's PR documents.
+    to strand the whole fleet) and must never emit the secret value. The
+    single structural match is mutation-hard: each of the launcher mutants
+    listed in this PR's verification section (operative join, inverted/removed
+    either guard, removed init/verify/exit-code assignment, PATH-resolved
+    binary, unconditional wrap, deleted fallback branch) fails this test.
     """
     script = SCRIPTS_DIR / "fleet-pass.ps1"
     code = _command_lines(script)

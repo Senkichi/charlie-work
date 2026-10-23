@@ -627,3 +627,69 @@ def test_api_worker_launch_strips_provider_key_but_routes_auth_token(
     ).split("|")
     assert auth_token == "sk-test-key-value-1234"
     assert provider_key == "<unset>"
+
+
+def test_sanitize_env_provider_key_pop_is_case_insensitive_on_windows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Windows casefolds env KEYS — the pop must keep up (issue #2795 review).
+
+    ``dict(os.environ)`` upper-cases keys on Windows, so the pre-fix exact
+    ``env.pop("Mixed_Case")`` failed open (the key survived sanitization) while
+    the api adapter's ``os.environ.get()`` lookup is case-insensitive and would
+    still have FOUND the value. The strip must therefore match
+    case-insensitively on Windows so both halves of the api path agree.
+
+    The configured name (and the value monkeypatch.setenv plants) is
+    mixed-case; on
+    Windows ``os.environ`` stores it under whatever casing the platform
+    normalizes to, and on POSIX the exact-case name is stored verbatim — the
+    assertion (no case-variant of the name survives sanitization) is
+    platform-agnostic and fails on the pre-fix code on Windows.
+    """
+    config = _api_orchestrator_config(
+        provider_name="mixed-provider", api_key_env="Empericus_Anthropic_Api_Key"
+    )
+    monkeypatch.setenv("Empericus_Anthropic_Api_Key", "sk-mixed-case-key")
+
+    env = sanitize_env(tmp_path, config=config)
+
+    leaked = [k for k in env if k.upper() == "EMPERICUS_ANTHROPIC_API_KEY"]
+    assert not leaked, (
+        f"a configured provider key env var must not survive sanitization under "
+        f"any casing on this platform: {leaked} (issue #2795)"
+    )
+
+
+def test_sanitize_env_call_sites_in_src_all_pass_config() -> None:
+    """AST guard: every ``sanitize_env(`` call in src/ must pass ``config=``.
+
+    ``sanitize_env``'s ``config`` default is None, which fails OPEN — a call
+    site that forgets it hands the worker a base env that still carries the
+    orchestrator's api-provider keys (issue #2795). Because every in-tree launch
+    site plausibly has the orchestrator config in scope, forgetting ``config=``
+    is always a bug, never a deliberate choice, so instead of relying on a
+    reviewer noticing at diff time this test mechanically fails whenever a
+    ``src/`` call site omits the keyword (or a new call site appears without
+    it).
+    """
+    import ast
+
+    src_root = Path(__file__).resolve().parent.parent / "src"
+    bad: list[str] = []
+    for py_file in sorted(src_root.rglob("*.py")):
+        tree = ast.parse(py_file.read_text(encoding="utf-8"), filename=str(py_file))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            called = (isinstance(func, ast.Name) and func.id == "sanitize_env") or (
+                isinstance(func, ast.Attribute) and func.attr == "sanitize_env"
+            )
+            if called and not any(kw.arg == "config" for kw in node.keywords):
+                bad.append(f"{py_file.relative_to(src_root.parent)}:{node.lineno}")
+    assert not bad, (
+        "every sanitize_env( call in src/ must pass config= (the None default "
+        f"fails open and would leave api-provider keys in the worker base env): "
+        f"{bad}"
+    )

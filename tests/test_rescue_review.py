@@ -266,6 +266,78 @@ def test_run_cross_family_sanitizes_environment_at_spawn(
     )
 
 
+def test_run_cross_family_strips_configured_provider_key_from_spawn_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The rescue reviewer's subprocess env must not carry the provider key (#2795).
+
+    The rescue review runs against the shared main checkout, whose ambient env
+    carries the orchestrator's api provider key (the api adapter resolves the
+    key from the supervisor's own os.environ). run_cross_family_review builds
+    the spawn env via sanitize_env, so its ``config=`` parameter is what pops
+    the configured ``api_key_env`` name. Reverting rescue_review.py to the
+    pre-#2795 wiring (no ``config=`` kwarg on run_cross_family_review or on its
+    sanitize_env call) makes this fail: the captured runner env still carries
+    ``MOONSHOT_API_KEY``.
+    """
+    from charlie_work.config import ApiProviderConfig, ApiWorkerConfig, OrchestratorConfig
+    from charlie_work.rescue_review import run_cross_family_review
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    report_path = tmp_path / "report.md"
+    prompt_path = tmp_path / "prompt.md"
+    prompt_path.write_text("test prompt", encoding="utf-8")
+
+    monkeypatch.setenv("MOONSHOT_API_KEY", "sk-configured-provider-key")
+
+    captured_env: dict[str, str] | None = None
+
+    def _fake_runner(command, **kwargs):
+        nonlocal captured_env
+        captured_env = kwargs.get("env")
+        return _fake_completed()(command)
+
+    config = OrchestratorConfig(
+        api_worker=ApiWorkerConfig(
+            enabled=True,
+            provider="kimi-k3",
+            max_concurrent_sessions=1,
+            providers={
+                "kimi-k3": ApiProviderConfig(
+                    base_url="https://api.moonshot.ai/anthropic",
+                    api_key_env="MOONSHOT_API_KEY",
+                    model="kimi-k3",
+                    input_usd_per_mtok=3.0,
+                    output_usd_per_mtok=15.0,
+                    cached_input_usd_per_mtok=0.30,
+                )
+            },
+        )
+    )
+
+    result = run_cross_family_review(
+        model="codex",
+        command=("echo", "test"),
+        repo_root=repo_root,
+        prompt_text="test prompt",
+        prompt_path=prompt_path,
+        report_path=report_path,
+        timeout_seconds=30,
+        runner=_fake_runner,
+        config=config,
+    )
+
+    assert result.ok is True
+    assert captured_env is not None, "Runner should have received env kwarg"
+    assert "MOONSHOT_API_KEY" not in captured_env, (
+        "the rescue reviewer's spawn env must not carry the configured provider key (issue #2795)"
+    )
+    # Positive control: the runner env is sanitize_env's output, not raw
+    # os.environ (repo-root GH_CONFIG_DIR proves the sanitized base).
+    assert "GH_CONFIG_DIR" in captured_env
+
+
 def test_run_cross_family_review_tmp_dir_creation_failure_returns_stub_not_raise(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
