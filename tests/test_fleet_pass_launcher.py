@@ -126,60 +126,74 @@ def test_module_entry_point_exists() -> None:
     assert "main" in source, "__main__.py must dispatch to the CLI entry point"
 
 
-def test_fleet_pass_wraps_launch_in_secretenv_guarded() -> None:
-    """Issue #2795: fleet-pass.ps1 must inject the secretenv provider key.
+# Structural invariant for the issue #2795 secretenv injection, matched as ONE
+# multi-line regex over the script's non-comment lines so the individual
+# fragments cannot drift apart. It ties the whole guarded launch together:
+#   1. `$secretenv` resolves to the per-user secretenv.exe (not PATH),
+#   2. `$secretenvOk` is initialised to $false,
+#   3. the if-condition carries BOTH guards — the key-absence (no double-wrap)
+#      test AND `Test-Path -LiteralPath $secretenv`,
+#   4. inside that same guard block, `secretenv verify ... *> $null` runs and
+#      `$secretenvOk` is assigned from ($LASTEXITCODE -eq 0) right after it,
+#   5. the launch is `if ($secretenvOk) { & $secretenv run ... -- cmd /c $cmdLine
+#      } else { & cmd /c $cmdLine }` — wrap in the if-branch, plain launch
+#      (a missing secret never strands the fleet) in the else-branch.
+# Each of these can only be checked together: the substring form previously in
+# this module passed even when the gate was inverted (`if (-not $secretenvOk)`)
+# or the branches swapped, because every fragment still existed individually.
+_SECRETENV_LAUNCH_RE = re.compile(
+    r"\$secretenv\s*=\s*Join-Path\s+\$env:USERPROFILE\s+'\.local\\bin\\secretenv\.exe'"
+    r"[^{}]*?\$secretenvOk\s*=\s*\$false\b"
+    r"[^{}]*?if\s*\([^\n\(]*-not\s+\[Environment\]::GetEnvironmentVariable\('EMPERICUS_ANTHROPIC_API_KEY'\)"
+    r"[^{}]*?Test-Path\s+-LiteralPath\s+\$secretenv"
+    r"[^{}]*?\)[^\n{]*\{\s*\n\s*"
+    r"&\s*\$secretenv\s+verify\s+EMPERICUS_ANTHROPIC_API_KEY\s+\*>\s*\$null\s*\n\s*"
+    r"\$secretenvOk\s*=\s*\(\s*\n?\s*\$LASTEXITCODE\s+-eq\s+0\s*\)\s*\n"
+    r"\}\s*\n"
+    r"if\s*\(\s*\$secretenvOk\s*\)\s*\{\s*\n\s*"
+    r"&\s*\$secretenv\s+run\s+EMPERICUS_ANTHROPIC_API_KEY\s+--\s+cmd\s+/c\s+\$cmdLine\s*\n"
+    r"\}\s*else\s*\{\s*\n\s*"
+    r"&\s*cmd\s+/c\s+\$cmdLine\s*\n?"
+    r"\}",
+)
+
+
+def test_fleet_pass_launch_structure_ties_secretenv_wrap_to_its_guards() -> None:
+    """Issue #2795: the secretenv wrap and its guards are one invariant.
 
     The `api` adapter resolves the provider key from the supervisor's own env
     (`os.environ.get(provider.api_key_env)`), and the key lives only in the
     DPAPI secretenv store -- so the scheduled-task-spawned supervisor cannot
     run `harness: api` launches unless the launcher wraps the supervisor in
     `secretenv run`. The wrap must be guarded (never double-wrap an env that
-    already has the key, never allow a missing/undecryptable secret to strand
-    the whole fleet) and must never emit the secret value.
+    already has the key, never trust a secretenv.exe that disappears between
+    the exists-check and the spawn, never allow a missing/undecryptable secret
+    to strand the whole fleet) and must never emit the secret value. Smaller
+    mutants than the full block (inverted gate, `if ($true)`, dropped
+    Test-Path guard, swapped branches, `$secretenvOk = $true`) all fail this
+    single structural match -- see the E-field in the mutation matrix this
+    test's PR documents.
     """
     script = SCRIPTS_DIR / "fleet-pass.ps1"
     code = _command_lines(script)
-    key = "EMPERICUS_ANTHROPIC_API_KEY"
-    assert "Join-Path $env:USERPROFILE '.local\\bin\\secretenv.exe'" in code, (
-        "fleet-pass.ps1 must resolve secretenv.exe from the per-user install path "
-        "(Join-Path $env:USERPROFILE '.local\\bin\\secretenv.exe'), not from PATH"
-    )
-    assert f"{key} *> $null" in code, (
-        "fleet-pass.ps1 must verify the secret with "
-        "`secretenv verify EMPERICUS_ANTHROPIC_API_KEY *> $null` so nothing is emitted"
-    )
-    assert f"secretenv run {key} -- cmd /c $cmdLine" in code, (
-        "fleet-pass.ps1 must launch the supervisor via "
-        "`secretenv run EMPERICUS_ANTHROPIC_API_KEY -- cmd /c $cmdLine` (issue #2795)"
-    )
-    # Guard 1: never double-wrap an env that already has the key.
-    assert "-not [Environment]::GetEnvironmentVariable('" + key + "')" in code, (
-        "the secretenv wrap must require the key to be ABSENT from the process env "
-        "(don't double-wrap an env that already has it)"
-    )
-    # Guard 2: the run path is only taken when verify exited 0.
-    assert "$LASTEXITCODE) -eq 0" in code or "$LASTEXITCODE -eq 0" in code, (
-        "the secretenv run must be gated on `secretenv verify ...` exiting 0"
+    assert _SECRETENV_LAUNCH_RE.search(code), (
+        "fleet-pass.ps1's secretenv launch must keep the full guarded structure: "
+        "$secretenv per-user path, $secretenvOk=$false, an if-condition with BOTH "
+        "the key-absence and Test-Path guards, $secretenvOk=($LASTEXITCODE -eq 0) "
+        "right after the verify call, and the wrap/`& cmd /c $cmdLine` split as "
+        "if/else (issue #2795)"
     )
 
 
 def test_fleet_pass_keeps_plain_launch_fallback() -> None:
     """Issue #2795: a missing secret must never strand the whole fleet.
 
-    When any guard fails (key already present, secretenv.exe missing, secret
-    absent/undecryptable) the launcher must still start the supervisor via the
-    plain cmd invocation; a missing key only makes `harness: api` launches
-    self-limit with an error record.
+    The structural regex above pins the if/else split itself; this test keeps
+    the trailing `exit=$LASTEXITCODE` log marker, which must stay OUTSIDE both
+    branches so the marker records the same child exit code regardless of
+    whether the launch was wrapped.
     """
     script = SCRIPTS_DIR / "fleet-pass.ps1"
-    code = _command_lines(script)
-    assert "& cmd /c $cmdLine" in code, (
-        "fleet-pass.ps1 must keep the plain `& cmd /c $cmdLine` launch path so the "
-        "supervisor still starts without the secretenv key"
-    )
-    assert "} else {" in code, (
-        "the secretenv run must be an if/else whose else branch is the plain launch"
-    )
     assert "exit=$LASTEXITCODE" in script.read_text(encoding="utf-8"), (
         "fleet-pass.ps1 must keep the trailing `exit=$LASTEXITCODE` log marker "
         "(secretenv propagates the child exit code)"
