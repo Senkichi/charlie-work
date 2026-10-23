@@ -103,7 +103,7 @@ def run_fleet_status(args: argparse.Namespace) -> CommandResult:
     Note: This command does not include per-worker health fields yet. That will be added
     in a follow-up issue (#167) once the worker health abstraction lands.
     """
-    fleet_json_path = layout.fleet_registry_path()
+    fleet_json_path = layout.fleet_registry_path(override=args.fleet_dir)
     registry = _load_registry(fleet_json_path)
     per_repo: dict[str, Any] = {}
     errors: list[dict[str, str]] = []

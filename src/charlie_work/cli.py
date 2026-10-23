@@ -1439,7 +1439,7 @@ def run_fleet_review_queue(args: argparse.Namespace) -> CommandResult:
     - Aggregates per-repo queue entries keyed by repo_key (nameWithOwner)
     - Isolates per-repo errors (missing/broken repos) without aborting aggregation
     """
-    fleet_json_path = layout.fleet_registry_path()
+    fleet_json_path = layout.fleet_registry_path(override=args.fleet_dir)
     registry = _load_registry(fleet_json_path)
     per_repo: dict[str, Any] = {}
     errors: list[dict[str, str]] = []
@@ -1475,7 +1475,7 @@ def run_fleet_operator_queue(args: argparse.Namespace) -> CommandResult:
     per-repo queue entries keyed by repo_key (nameWithOwner), and isolates
     per-repo errors without aborting aggregation.
     """
-    fleet_json_path = layout.fleet_registry_path()
+    fleet_json_path = layout.fleet_registry_path(override=args.fleet_dir)
     registry = _load_registry(fleet_json_path)
     per_repo: dict[str, Any] = {}
     errors: list[dict[str, str]] = []
