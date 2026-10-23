@@ -431,3 +431,18 @@ def test_check_loop_pass_freshness_ok_for_retired_repo(hb: ModuleType, tmp_path:
 
     assert not report.anomaly
     assert "retired" in report.lines[0]
+
+
+def test_check_log_freshness_ok_for_retired_repo(hb: ModuleType, tmp_path: Path) -> None:
+    """A retired repo's stale/absent logs are the desired state (issue #2754)."""
+    from dataclasses import replace
+
+    repo = replace(_make_repo(hb, tmp_path), retired=True)
+    # No log/state/checkpoint files at all -- an active repo would ANOMALY.
+    repo.state_dir.mkdir(parents=True, exist_ok=True)
+
+    report = hb.Report()
+    hb.check_log_freshness(report, repo)
+
+    assert not report.anomaly
+    assert "retired" in report.lines[0]

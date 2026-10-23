@@ -444,3 +444,51 @@ def test_load_repos_ignores_fleet_layer_retirement(
     repos, err = hb.load_repos()
     assert err is None
     assert repos[0].retired is False
+
+
+def test_main_skips_every_per_repo_check_for_a_retired_repo(
+    hb: ModuleType, monkeypatch: Any, tmp_path: Path
+) -> None:
+    """A retired repo emits one OK line and no per-repo check at all."""
+    fleet_dir = tmp_path / "fleet"
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    config_path = tmp_path / "orchestrator.config.yaml"
+    config_path.write_text("fleet:\n  retired: true\n", encoding="utf-8")
+    _write_fleet_json(
+        fleet_dir,
+        {
+            "owner/retired": {
+                "repo_root": str(repo_root),
+                "state_dir": str(tmp_path / "state"),
+                "config_path": str(config_path),
+            }
+        },
+    )
+    monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", str(fleet_dir))
+    monkeypatch.setenv("CHARLIE_WORK_HEARTBEAT_STATE", str(tmp_path / "hb-state.json"))
+    monkeypatch.setenv(
+        "CHARLIE_WORK_HEARTBEAT_SUPPRESSIONS", str(tmp_path / "no-suppressions.yaml")
+    )
+    for name in (
+        "check_github_rate",
+        "check_disk_space",
+        "check_runners",
+        "check_supervisor_venv_refusal",
+        "check_supervisor_heartbeat",
+        "check_wedge_kill_loop",
+        "check_notify_digest_freshness",
+    ):
+        monkeypatch.setattr(hb, name, lambda *_a, **_k: None)
+    monkeypatch.setattr(hb, "get_blocked_issue_numbers", lambda *_a, **_k: ({}, ""))
+
+    captured = io.StringIO()
+    monkeypatch.setattr(hb.sys, "stdout", captured)
+    rc = hb.main()
+
+    assert rc == 0
+    lines = captured.getvalue().splitlines()
+    assert "OK retired owner/retired: retired; per-repo checks skipped" in lines
+    assert not any("log-freshness owner/retired" in line for line in lines)
+    assert not any("loop-pass-freshness owner/retired" in line for line in lines)
+    assert not any(line.startswith("ANOMALY") for line in lines)

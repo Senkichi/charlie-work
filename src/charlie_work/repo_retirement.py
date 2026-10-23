@@ -29,7 +29,7 @@ import yaml
 
 from . import host as _host
 from . import layout
-from .config import ConfigError, find_config_path, load_config
+from .config import find_config_path
 from .live_session_count import REVIEW_LANE, WORKER_LANE, count_live_sessions
 from .local_suite_runner import RUNNER_STATUS_FILENAME, _GATE_DIR_NAME
 
@@ -66,29 +66,47 @@ def repo_retirement_state(repo_root: Path, explicit: Path | None = None) -> bool
     """``fleet.retired`` from the repo's own config, or ``None`` if unreadable.
 
     Only the repo layer is consulted -- never ``<fleet_dir>/config.yaml``.
+    The file is read as raw YAML rather than through ``load_config``: this
+    runs in read-only fleet enumerations (``_select_repos``,
+    ``managed_repo_names``/``managed_repo_roots``,
+    ``_take_fleet_snapshot``) on every pass, so it must not re-validate the
+    whole config, emit ``config_key_deprecated_read`` events, or raise on a
+    config that a full load would reject.
+
     ``None`` lets callers preserve a previously recorded retirement rather
     than clearing it on a transient read failure (issue #2754's "never
-    clears retirement" contract).
+    clears retirement" contract). Every read is contained: an unreadable or
+    malformed file is a warning, never an exception escaping a fleet walk.
     """
-    path = _config_path(repo_root, explicit)
-    if path is None or not path.exists():
-        return None
+    path: Path | None = None
     try:
-        config = load_config(path)
-    except (ConfigError, OSError, ValueError, yaml.YAMLError) as exc:
-        logger.warning("repo retirement: could not read %s (%s)", path, exc)
+        path = _config_path(repo_root, explicit)
+        if path is None or not path.exists():
+            return None
+        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001 - total by contract (see docstring)
+        logger.warning(
+            "repo retirement: could not read %s (%s)",
+            path if path is not None else (explicit or repo_root),
+            exc,
+        )
         return None
-    return bool(config.fleet.retired)
-
-
-def repo_is_retired(repo_root: Path, explicit: Path | None = None) -> bool:
-    """Return ``fleet.retired`` from the repo's own config file.
-
-    An absent or unreadable config reads as not retired for a bare repo
-    (there is no prior state to preserve); ``entry_is_retired`` keeps the
-    registry's recorded value in that case.
-    """
-    return bool(repo_retirement_state(repo_root, explicit))
+    if raw is None:
+        return False
+    if not isinstance(raw, dict):
+        logger.warning(
+            "repo retirement: expected a YAML mapping in %s, got %s",
+            path,
+            type(raw).__name__,
+        )
+        return None
+    fleet = raw.get("fleet")
+    if fleet is None:
+        return False
+    if not isinstance(fleet, dict):
+        logger.warning("repo retirement: %s: fleet must be a mapping", path)
+        return None
+    return bool(fleet.get(RETIRED_FIELD, False))
 
 
 def entry_is_retired(entry: Mapping[str, Any]) -> bool:
@@ -133,17 +151,31 @@ def _running_gate_suites(state_dir: Path) -> int:
     return running
 
 
+def _pending_session_sidecars(directory: Path) -> int:
+    """Count every session sidecar under *directory*, live or dead.
+
+    A dead sidecar is unfinished wind-down bookkeeping: the retired repo must
+    still run its reap lane so the sidecar can be removed. Counting only
+    alive sessions would make a repo whose last worker just died look
+    quiescent and skip the very lane that reaps it.
+    """
+    from .worker import iter_workers
+
+    return len(iter_workers(directory)) if directory.exists() else 0
+
+
 def repo_live_work(
     repo_root: Path,
     config: Any,
     state_dir: Path,
 ) -> LiveWork:
-    """Count live workers, reviewers and gate suites for one repo.
+    """Count work a retired repo must wind down before it is quiescent.
 
-    Reuses the same ``count_live_sessions`` rule the per-repo caps use, so
-    "quiescent" cannot disagree with what the governor considers live. A
-    non-``Path`` state dir (a test double) reads as no live work rather than
-    raising.
+    ``workers``/``reviewers`` use the same ``count_live_sessions`` rule the
+    per-repo caps use, but take the larger of that and the number of session
+    sidecars present: a dead sidecar is pending reap work, not quiescence.
+    A non-``Path`` state dir (a test double) reads as no live work rather
+    than raising.
     """
     if not isinstance(state_dir, Path):
         return LiveWork()
@@ -158,11 +190,13 @@ def repo_live_work(
         default=layout.reviews_dir_default(state_dir),
     )
     state_file = layout.state_file_path(state_dir)
-    workers = (
-        count_live_sessions(sessions_dir, state_file, WORKER_LANE) if sessions_dir.exists() else 0
+    workers = max(
+        count_live_sessions(sessions_dir, state_file, WORKER_LANE),
+        _pending_session_sidecars(sessions_dir),
     )
-    reviewers = (
-        count_live_sessions(reviews_dir, state_file, REVIEW_LANE) if reviews_dir.exists() else 0
+    reviewers = max(
+        count_live_sessions(reviews_dir, state_file, REVIEW_LANE),
+        _pending_session_sidecars(reviews_dir),
     )
     return LiveWork(
         workers=workers, reviewers=reviewers, gate_suites=_running_gate_suites(state_dir)
@@ -209,7 +243,9 @@ def run_wind_down(app: Any, now: datetime.datetime | None = None) -> dict[str, A
     return {
         "retired": True,
         "wind_down": True,
-        "stalled": len(stalled or []),
+        # Not ``stalled``: fleet_loop's attention extractor reads that key as
+        # a list of stalled-session dicts and a count here would crash it.
+        "stalled_reaped": len(stalled or []),
         "reaped": len(reaped or []),
         "review_sweep": {
             "stalled_reaped": len(review_sweep.get("stalled") or []),
