@@ -1175,17 +1175,28 @@ spawned: an `api_budget_refused` warning event is recorded (via
 `instrumentation.log_event`) in `events.db`, the SQLite audit log beside
 `state.json` — not in the state.json `events` ring. Query it with
 `query_events(Path('.var/charlie-work/state.json'), kind='api_budget_refused')`,
-or run the one-liner from the Events section above filtered to that kind. The
+or run the one-liner from the Events section above and read the
+`api_budget_refused` count (event_counts_by_kind prints counts for all kinds;
+there is no kind filter). The
 launch also comes back as an error record (sidecar) whose launch error
 class is `budget` (`launch_events.LAUNCH_ERR_BUDGET`, "spend-cap refusal").
-A missing or corrupt ledger is treated as empty spend and never refuses a
-launch, and the check is skipped when no `config` is passed (direct
-construction only — the production dispatch path always passes one). See
-Failure modes below for the recovery path.
+A missing or corrupt ledger is treated as empty spend; that lifts the lifetime
+refusal whenever `lifetime_usd` is `0`, but the daily check still refuses even
+on empty spend whenever the configured reserve (`max_usd_per_session` when
+set, else `preflight_reserve_usd`) exceeds `max_usd_per_day` (or
+`max_usd_per_day` is `0`), and the check is skipped when no `config` is passed
+(direct construction only — the production dispatch path always passes one).
+Current and remaining headroom is surfaced by `doctor`'s api-worker probe and
+the `fleet status` snapshot. See Failure modes below for the accounting and
+recovery path.
 
 **Raising caps.** Edit `budget.max_usd_per_day` and/or `budget.lifetime_usd` in
-config (global or per-repo) and reload. There is no ledger reset — raising
-`lifetime_usd` above the current `lifetime_usd` immediately restores headroom.
+config (global or per-repo) and reload. Raising a cap lets *new* launches
+through as soon as the check passes. There is no ledger reset — raising
+`lifetime_usd` above the current `lifetime_usd` immediately restores headroom
+for new launches. Raising a cap does **not**, however, clear issues already
+escalated for repeated refusals under `dispatch_failed_cap_exceeded` (see
+Failure modes below): re-queue those with `charlie unescalate --issue <n>`.
 To start a fresh accounting period (e.g. a new billing month), the lifetime
 total is the cumulative sum of all settled sessions; you raise the ceiling, you
 do not zero the ledger.
@@ -1259,18 +1270,43 @@ error class `budget` (`launch_events.LAUNCH_ERR_BUDGET`), and an
 `api_budget_refused` warning event is recorded (via
 `instrumentation.log_event`) in `events.db` — query it with
 `query_events(Path('.var/charlie-work/state.json'), kind='api_budget_refused')`.
-Recovery depends on which cap is exhausted (a missing or corrupt ledger makes
-`budget_status` report empty spend, so neither refusal applies):
+Recovery depends on which cap is exhausted. (A missing or corrupt ledger makes
+`budget_status` report empty spend, so the refusal still does not apply to
+lifetime headroom — but the daily check fails even on an empty ledger whenever
+the configured reserve exceeds `max_usd_per_day`, or `max_usd_per_day` is `0`.)
 
-- **Daily cap exhaustion self-clears at the UTC date rollover.** The daily
-  check reads `ledger.days[<UTC date today>]`, so once the clock ticks into a
-  new UTC date the ledger shows no spend for "today" and lifts are allowed
-  again — no config change or operator action needed. To lift it sooner,
-  raise `budget.max_usd_per_day` in config (global or per-repo) and reload.
+- **Daily cap exhaustion: the refusal itself lifts at the UTC date
+  rollover.** The daily check reads `ledger.days[<UTC date today>]`, so once
+  the clock ticks into a new UTC date the ledger shows no spend for "today"
+  and launches are allowed again. To lift it sooner, raise
+  `budget.max_usd_per_day` in config (global or per-repo) and reload.
 - **Lifetime cap exhaustion does not self-clear.** Lifetime spend never
   decays; the only recovery is raising `budget.lifetime_usd` in config
   (global or per-repo) and reloading. There is no ledger reset (see
   "Raising caps" above).
+
+**What lifting the cap does and does not do.** For a *fresh first-pass*
+dispatch, each refusal is accounted as a launch failure: the refused launch
+carries `failure_kind: None` (the refusal records only the `budget` launch
+error class), so it flows through the generic dispatch-failure path
+(`orchestration/dispatch_state.py`, the `dispatch_failed` branch) and every
+refusal appends one timestamp to the issue entry's `dispatch_failed_at` list.
+Within `watchdog.redispatch_window_minutes` (default 240), once more than
+`watchdog.max_auto_redispatch` (default 3) refusals have accumulated, the
+issue escalates with reason `dispatch_failed_cap_exceeded`
+(`reason_class: mechanical` — see
+`orchestration/state_mechanical.py`). Escalations with this reason are never
+auto-cleared: the mechanical de-escalation sweep skips them (`no_open_pr` —
+the launch never produced a PR). Lifting the cap (UTC rollover for the daily
+cap, or raising `max_usd_per_day`/`lifetime_usd`) restores headroom for
+*future* launches only; an issue already escalated this way stays escalated
+until you re-queue it explicitly with `charlie unescalate --issue <n>` —
+which also resets the issue's `dispatch_failed_at` window (add `--requeue`
+if the issue's own branch already carries a diff against the base and you
+want a fresh worker anyway), so the next refusal starts a fresh count. The
+sub-bullets above therefore describe only when new launches stop being
+refused — recovering an issue already escalated under
+`dispatch_failed_cap_exceeded` requires this operator action.
 
 `doctor` surfaces both failure kinds: its launched-sessions probe appends
 `provider-auth: <issues>` and `budget-exceeded: <issues>` fragments to the
