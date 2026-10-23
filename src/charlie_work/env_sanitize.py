@@ -1,4 +1,4 @@
-﻿"""Shared environment sanitization for worker subprocesses.
+"""Shared environment sanitization for worker subprocesses.
 
 Provides a single implementation of environment sanitization to prevent
 VIRTUAL_ENV and UV_PROJECT_ENVIRONMENT leaks from the orchestrator into
