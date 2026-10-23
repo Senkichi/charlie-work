@@ -674,11 +674,12 @@ def test_sanitize_env_call_sites_in_src_all_pass_config() -> None:
     it).
     """
     import ast
+    from _src_ast import parsed, source_files
 
     src_root = Path(__file__).resolve().parent.parent / "src"
     bad: list[str] = []
-    for py_file in sorted(src_root.rglob("*.py")):
-        tree = ast.parse(py_file.read_text(encoding="utf-8"), filename=str(py_file))
+    for py_file in source_files(src_root):
+        tree = parsed(py_file)
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
