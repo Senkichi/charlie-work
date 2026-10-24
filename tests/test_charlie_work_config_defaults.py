@@ -54,10 +54,13 @@ def test_default_config_require_current_base() -> None:
     assert config.auto_merge.require_current_base is True
 
 
-def test_default_config_tee_stream_json_enabled() -> None:
-    """ClaudeCodeConfig.tee_stream_json defaults to True (issue #2814: the
+def test_default_config_tee_stream_json_disabled() -> None:
+    """Name kept verbatim: the collect-only gate (#1538) treats a leaf rename
+    as a deletion and fails a required check; the body was re-recorded in
+    #2814. ClaudeCodeConfig.tee_stream_json now defaults to True (the
     watchdog needs the tee'd stream-json log/events to tell a healthy
-    session apart from a stall). Config is the kill switch."""
+    session apart from a stall) and ``tee_stream_json: false`` in config is
+    the typed kill switch reproducing the old default-off behaviour."""
     config = load_config()
     assert config.claude_code.tee_stream_json is True
 
