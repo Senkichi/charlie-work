@@ -141,19 +141,27 @@ def test_cw_1518_single_space_multi_path_span_split_into_two_candidates(
     assert "abstaining" in result.reason
 
 
-def test_module_relative_suffix_path_present_only_in_dispatching_repo_abstains(
+def test_module_relative_suffix_path_present_in_dispatching_repo_resolves(
     tmp_path: Path,
 ) -> None:
     """Issue #1757's shape (module-relative citation, e.g.
     ``schemas/coach.py`` for the real, more deeply nested
-    ``server/src/swole/schemas/coach.py``) — but present only in the
-    *dispatching* repo itself, not a sibling. #1757's own same-repo suffix
-    fallback for ``_path_exists_in_repo`` is explicitly NOT implemented by
-    this change (see the module docstring) — only the shared
-    ``_segment_boundary_suffix_match`` helper is provided for that future
-    fix to reuse. With the only registered repo being the dispatching repo
-    itself (excluded from the sibling search), the gate correctly abstains
-    rather than crashing or escalating on its own nested file."""
+    ``server/src/swole/schemas/coach.py``) present only in the
+    *dispatching* repo itself — the same-repo segment-boundary suffix
+    fallback in ``_path_exists_in_repo`` now resolves it directly, so the
+    gate passes as ordinary in-repo evidence without ever reaching the
+    sibling search.
+
+    Before the #1757 fallback, only the shared
+    ``_segment_boundary_suffix_match`` helper existed (provided by the
+    sibling-ownership redesign for #1757's fix to reuse): the dispatching
+    repo's own registration was then the only thing standing between the
+    candidate and a self-escalation, and the gate abstained with
+    ``schemas/coach.py`` counted as missing. Names matter here beyond the
+    rename: this pins the flip to the pass branch — ``passed is True``,
+    ``missing_paths`` empty, the "at least one referenced path exists"
+    reason — not merely a lack of escalation, which the suffix fallback
+    also delivers for any sibling-registered same-repo citation."""
     this_repo = tmp_path / "charlie-work"
     (this_repo / "server" / "src" / "swole" / "schemas").mkdir(parents=True)
     (this_repo / "server" / "src" / "swole" / "schemas" / "coach.py").write_text(
@@ -170,9 +178,10 @@ def test_module_relative_suffix_path_present_only_in_dispatching_repo_abstains(
     )
 
     assert result.passed is True
-    assert result.missing_paths == ("schemas/coach.py",)
+    assert result.referenced_paths == ("schemas/coach.py",)
+    assert result.missing_paths == ()
     assert result.found_in_repo is None
-    assert "abstaining" in result.reason
+    assert result.reason == "at least one referenced path exists in the target repo"
 
 
 def test_found_in_two_sibling_repos_abstains_ambiguous(tmp_path: Path) -> None:
@@ -455,12 +464,11 @@ def test_sibling_file_listing_computed_once_per_root_per_gate_call(
         "# runner_slots", encoding="utf-8"
     )
 
-    call_count = 0
+    call_roots: list[Path] = []
     real_repo_tracked_files = cross_repo_gate_module._repo_tracked_files
 
     def _counting_repo_tracked_files(repo_root: Path) -> list[str]:
-        nonlocal call_count
-        call_count += 1
+        call_roots.append(repo_root)
         return real_repo_tracked_files(repo_root)
 
     monkeypatch.setattr(
@@ -484,9 +492,16 @@ def test_sibling_file_listing_computed_once_per_root_per_gate_call(
         "charlie-work",
     )
 
+    # One listing per ROOT for the whole call -- the dispatching root's own
+    # listing comes from issue #1757's same-repo suffix fallback in
+    # `_path_exists_in_repo`, the sibling's from `_find_owning_repo`; the
+    # per-root memoization the review finding pins must not count per
+    # candidate on either side.
     assert result.passed is False
     assert result.found_in_repo == "ci_runners"
-    assert call_count == 1
+    assert call_roots.count(sibling_repo) == 1
+    assert call_roots.count(this_repo) == 1
+    assert len(call_roots) == 2
 
 
 def test_dispatching_repo_excluded_by_root_when_name_mismatches(tmp_path: Path) -> None:
@@ -499,31 +514,45 @@ def test_dispatching_repo_excluded_by_root_when_name_mismatches(tmp_path: Path) 
     ``_dispatching_repo_name`` falls back to ``repo_root.name`` (a
     directory name, e.g. a deployment dir like ``charlie-work-daemon``)
     when the ``gh`` lookup fails -- which need not match the fleet
-    registry's ``owner/repo``-derived key (``charlie-work``). Without the
-    root-based exclusion, a module-relative citation (``schemas/coach.py``
-    for the real, more deeply nested
-    ``server/src/swole/schemas/coach.py`` -- the same #1757 shape as
-    ``test_module_relative_suffix_path_present_only_in_dispatching_repo_abstains``
-    above) would match the dispatching repo's OWN entry via the
-    segment-boundary suffix fallback, since name-exclusion alone fails to
-    recognize the mismatched name as "self" -- escalating the repo against
-    itself instead of abstaining."""
-    this_repo = tmp_path / "charlie-work"
-    (this_repo / "server" / "src" / "swole" / "schemas").mkdir(parents=True)
-    (this_repo / "server" / "src" / "swole" / "schemas" / "coach.py").write_text(
-        "# coach", encoding="utf-8"
-    )
+    registry's ``owner/repo``-derived key (``charlie-work``). The
+    exclusion is exercised here through a registry entry whose root
+    *contains* the dispatching repo (a fleet layout where the registered
+    repo key wraps a nested checkout): a candidate missing from the
+    dispatching subroot but resolving directly under the wrapper root is
+    thereby excluded as "self", and the gate abstains instead of
+    escalating. Without the root-based exclusion, the name mismatch alone
+    fails to recognize the wrapper entry as "self" -- escalating the repo
+    against its own enclosing registry entry.
 
-    body = "The bug is in `schemas/coach.py`."
+    (The sibling-search suffix arm of this same shape -- a module-relative
+    citation of the dispatching repo's OWN nested file, the
+    #1757 citation form -- is now absorbed upstream by the same-repo
+    suffix fallback in ``_path_exists_in_repo``, which resolves such
+    candidates before the sibling search runs; see
+    ``test_module_relative_suffix_path_present_in_dispatching_repo_resolves``
+    above. What remains testable here is the direct-resolution arm of the
+    exclusion, which the suffix fallback cannot short-circuit: the
+    candidate genuinely is absent from the dispatching subroot.)"""
+    fleet_root = tmp_path / "fleet"
+    this_repo = fleet_root / "charlie-work"
+    this_repo.mkdir(parents=True)
+    (fleet_root / "shared").mkdir()
+    (fleet_root / "shared" / "tools.py").write_text("# tools", encoding="utf-8")
+
+    body = "The bug is in `shared/tools.py`."
 
     result = cross_repo_gate(
         body,
         this_repo,
-        {"charlie-work": this_repo},
-        "charlie-work-daemon",  # mismatches the registry key "charlie-work"
+        # Registry key "charlie-work" vs the (fallback-computed, mismatched)
+        # dispatching repo name "charlie-work-daemon": only the root
+        # containment check can recognize the entry as "self".
+        {"charlie-work": fleet_root},
+        "charlie-work-daemon",
     )
 
     assert result.passed is True
+    assert result.missing_paths == ("shared/tools.py",)
     assert result.found_in_repo is None
     assert "abstaining" in result.reason
 
