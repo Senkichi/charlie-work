@@ -75,7 +75,8 @@ SRC = REPO_ROOT / "src" / "charlie_work"
 TESTS = REPO_ROOT / "tests"
 
 # Ways into the package: `[project.scripts]` in pyproject.toml declares
-# charlie = "charlie_work.cli:main", and `python -m charlie_work` enters through
+# charlie = "charlie_work._entry:main" (a dependency guard that lazily imports
+# cli, so cli stays reachable), and `python -m charlie_work` enters through
 # __main__. Omitting the second classified __main__ itself as dormant, which is
 # how this list got checked rather than assumed. merge_preflight_hook is a
 # third entry point: `.claude/settings.json` registers it as a PreToolUse
