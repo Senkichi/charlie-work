@@ -73,12 +73,18 @@ _ADMIN_SHARE_WARNED: set[str] = set()
 # 13-32 ms against a ~95-file fleet dir (and seconds against the UNC route),
 # and the callers (:func:`_route_around_fork` and
 # :func:`warn_fleet_dir_virtualization_on_write`) run on every fleet read and
-# every fleet write. A deliberately short TTL keeps mid-session fork
-# detection: a fork written after the cached scan is noticed at the next TTL
-# refresh. :func:`fleet_dir_virtualization` (the ``charlie doctor`` probe)
-# deliberately bypasses this cache and reads fresh.
+# every fleet write. The third slot of each entry is the routing decision for
+# that dir (the route, or ``None`` when no route applies) so the route's
+# ``exists()`` stat on the ``\\localhost\`` admin share also runs at most once
+# per TTL, not on every fleet read; ``_ROUTE_UNPROBED`` marks an entry the
+# write guard refreshed whose route decision no one has needed yet. A
+# deliberately short TTL keeps mid-session fork detection: a fork written
+# after the cached scan is noticed at the next TTL refresh.
+# :func:`fleet_dir_virtualization` (the ``charlie doctor`` probe) deliberately
+# bypasses this cache and reads fresh.
 _FLEET_PROBE_CACHE_TTL_SECONDS = 30.0
-_FLEET_PROBE_CACHE: dict[str, tuple[float, list[tuple[Path, Path]]]] = {}
+_FLEET_PROBE_CACHE: dict[str, tuple[float, list[tuple[Path, Path]], Path | None | object]] = {}
+_ROUTE_UNPROBED: object = object()
 _MONOTONIC = time.monotonic
 
 
@@ -114,7 +120,10 @@ def _fleet_file_findings_cached(literal: Path) -> list[tuple[Path, Path]]:
 
     Shared by :func:`_route_around_fork` and the write guard, which run per
     read/per write and therefore cannot afford a fresh directory scan per
-    call. :func:`fleet_dir_virtualization` (``charlie doctor``) calls
+    call. An entry refreshed here carries the ``_ROUTE_UNPROBED`` sentinel in
+    the route slot until :func:`_fleet_probe_cached` decides the route for
+    that generation, so the route's ``exists()`` stat also runs at most once
+    per TTL. :func:`fleet_dir_virtualization` (``charlie doctor``) calls
     :func:`_fleet_file_findings` directly so the doctor always reports fresh
     state.
     """
@@ -124,8 +133,53 @@ def _fleet_file_findings_cached(literal: Path) -> list[tuple[Path, Path]]:
     if cached is not None and (now - cached[0]) < _FLEET_PROBE_CACHE_TTL_SECONDS:
         return cached[1]
     findings = _fleet_file_findings(literal)
-    _FLEET_PROBE_CACHE[key] = (now, findings)
+    _FLEET_PROBE_CACHE[key] = (now, findings, _ROUTE_UNPROBED)
     return findings
+
+
+def _administrative_route(literal: Path) -> Path | None:
+    """The admin-share route for ``literal`` when it exists, else ``None``.
+
+    Pure decision, uncached: the caller (:func:`_fleet_probe_cached`) owns the
+    TTL so the ``exists()`` stat on the localhost admin share runs at most
+    once per TTL per dir, not on every fleet read.
+    """
+    admin = _administrative_share_form(literal)
+    if admin is None:
+        return None
+    try:
+        return admin if admin.exists() else None
+    except OSError:
+        return None
+
+
+def _fleet_probe_cached(
+    literal: Path,
+) -> tuple[list[tuple[Path, Path]], Path | None]:
+    """TTL-cached per-file findings plus the cached route decision for a dir.
+
+    Returns ``(findings, route)`` for the current TTL generation, where
+    ``route`` is the admin-share route or ``None``. The route decision is
+    part of the same cache entry as the findings it is derived from, so
+    :func:`fleet_dir` stats the localhost admin share at most once per TTL
+    regardless of how often it is called (:func:`_route_around_fork` runs on
+    every fleet read). If only the write guard has refreshed this generation
+    so far, the route slot holds ``_ROUTE_UNPROBED`` and this computes — and
+    stores — the decision exactly once for the generation.
+    """
+    key = os.path.normcase(os.path.abspath(str(literal)))
+    now = _MONOTONIC()
+    cached = _FLEET_PROBE_CACHE.get(key)
+    if cached is not None and (now - cached[0]) < _FLEET_PROBE_CACHE_TTL_SECONDS:
+        _stamp, findings, route = cached
+        if route is _ROUTE_UNPROBED:
+            route = _administrative_route(literal)
+            _FLEET_PROBE_CACHE[key] = (cached[0], cached[1], route)
+        return findings, route
+    findings = _fleet_file_findings(literal)
+    route = _administrative_route(literal) if findings else None
+    _FLEET_PROBE_CACHE[key] = (now, findings, route)
+    return findings, route
 
 
 def _default_fleet_dir_literal() -> Path:
@@ -210,22 +264,17 @@ def _route_around_fork(literal: Path) -> Path:
     env var -- callers that pin a path mean it. Never raises: the probe is
     best-effort and any failure degrades to returning ``literal``.
 
-    The per-file probe behind the routing decision is cached per process for
-    ``_FLEET_PROBE_CACHE_TTL_SECONDS``, keyed on the literal dir: a fork
-    written after the cached scan is picked up at the next TTL refresh rather
-    than on every call.
+    The per-file probe AND the routing decision behind it are cached per
+    process in one TTL entry keyed on the literal dir (see
+    :func:`_fleet_probe_cached`): the route's ``exists()`` stat on the
+    localhost admin share runs at most once per
+    ``_FLEET_PROBE_CACHE_TTL_SECONDS``, not on every fleet read. A fork
+    written after the cached scan — or a route that appears mid-session — is
+    picked up at the next TTL refresh rather than on every call.
     """
-    findings = _fleet_file_findings_cached(literal)
+    findings, route = _fleet_probe_cached(literal)
     if not findings:
         return literal
-    admin = _administrative_share_form(literal)
-    route: Path | None = None
-    if admin is not None:
-        try:
-            if admin.exists():
-                route = admin
-        except OSError:
-            route = None
     names = ", ".join(pair[0].name for pair in findings)
     # Once per process per literal dir: daemons log this once, not per read.
     if str(literal) not in _ADMIN_SHARE_WARNED:
@@ -330,10 +379,11 @@ def fleet_dir(*, override: str | None = None) -> Path:
     returned directory is the non-redirected administrative-share route to
     the same location (``\\\\localhost\\<drive>$\\...``) if it exists, so
     host-wide state reads and writes reach the daemon-visible copies; when
-    the route does not exist, the literal path is returned unchanged (the
+    the route does not exist, the literal     path is returned unchanged (the
     #624 behavior) and the condition is logged as a warning. Overrides and
     the env var are returned unchanged — the caller pinned that path. The
-    probe is keyed on the literal default dir and cached for
+    probe — the per-file scan and the route's ``exists()`` stat alike — is
+    keyed on the literal default dir and cached in one entry for
     ``_FLEET_PROBE_CACHE_TTL_SECONDS`` per process (see
     :func:`_route_around_fork`), so a fork written mid-session is detected
     at the next TTL refresh, not only at process start; scheduled tasks,

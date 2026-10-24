@@ -330,6 +330,58 @@ def test_fleet_dir_route_probe_scans_once_within_ttl_and_reprobes_after_expiry(
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows-only test")
+def test_fleet_dir_route_exist_stat_runs_once_per_ttl(tmp_path: Path, monkeypatch: Any) -> None:
+    """The route's localhost admin-share ``exists()`` stat is TTL-cached too.
+
+    Issue #2806 rework round 7: the per-file scan was already TTL-cached, but
+    the route decision's ``admin.exists()`` stat on ``\\\\localhost\\...`` ran
+    on every ``fleet_dir()`` call while a fork was detected (reviewer-measured
+    at 163 ms cold / ~3 ms warm median / 93 ms worst case). Two ``fleet_dir()``
+    calls inside the TTL must perform exactly one localhost ``exists()``
+    probe, and a call after fake-clock expiry must perform a second — the
+    route decision is stored in the same cache entry as the findings.
+    """
+    from charlie_work import fleet_paths
+
+    literal, _fleet_json, _redirected = _routing_fixture(monkeypatch, tmp_path)
+
+    admin_dir = fleet_paths._administrative_share_form(literal)
+    assert admin_dir is not None
+    probes: list[Path] = []
+    real_exists = pathlib.Path.exists
+
+    def fake_exists(self: Path) -> bool:
+        if str(self).lower().startswith("\\\\localhost\\"):
+            probes.append(self)
+            return os.path.normcase(os.fspath(self)) == os.path.normcase(os.fspath(admin_dir))
+        return real_exists(self)
+
+    monkeypatch.setattr(pathlib.Path, "exists", fake_exists)
+
+    clock = [1000.0]
+
+    def fake_monotonic() -> float:
+        return clock[0]
+
+    monkeypatch.setattr(fleet_paths, "_MONOTONIC", fake_monotonic)
+
+    first = fleet_paths.fleet_dir()
+    second = fleet_paths.fleet_dir()
+    assert os.path.normcase(str(first)) == os.path.normcase(str(admin_dir))
+    assert second == first
+    assert len(probes) == 1, (
+        "two fleet_dir() calls inside the TTL must stat the localhost admin share once"
+    )
+
+    clock[0] = 1000.0 + fleet_paths._FLEET_PROBE_CACHE_TTL_SECONDS + 0.001
+    third = fleet_paths.fleet_dir()
+    assert os.path.normcase(str(third)) == os.path.normcase(str(admin_dir))
+    assert len(probes) == 2, (
+        "a fleet_dir() call after TTL expiry must re-stat the localhost admin share"
+    )
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows-only test")
 def test_fleet_dir_route_cache_reprobes_after_mid_session_fork_appears(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
@@ -448,6 +500,7 @@ def test_warn_on_write_directory_probe_scans_once_within_ttl_and_reprobes_after_
     assert any("test-c" in record.message for record in caplog.records)
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows-only behavior (UNC skip)")
 def test_warn_on_write_skips_per_file_probe_for_unc_directory(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
