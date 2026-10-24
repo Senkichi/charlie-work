@@ -31,7 +31,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from . import reconcile_salvage, worker_fate
+from . import host_routing, reconcile_salvage, worker_fate
 from .config import (
     DETERMINISTIC_ESCALATION_FAILURE_KINDS,
     DETERMINISTIC_JUDGMENT_ESCALATION_FAILURE_KINDS,
@@ -1254,6 +1254,9 @@ def detect_drift(
         prs = []
         issues = gh.issue_list(state="all")
     issues_by_number = {int(issue["number"]): issue for issue in issues if issue.get("number")}
+    # Spec C2 (host_routing): issues another host owns, and the PRs bound to them,
+    # are that host's to reconcile. They are skipped, never reported as drift.
+    foreign_issues = host_routing.foreign_issue_numbers(issues, config)
     # Issue #762: issues are now fetched via a paginated REST ``issues``
     # snapshot. The list is either complete (we stopped because GitHub returned
     # an under-full page) or the fetch raised. It is no longer a fixed
@@ -1359,6 +1362,8 @@ def detect_drift(
             branch_prefix=config.dispatch.branch_prefix,
             branch_issue_validator=branch_validator,
         )
+        if issue_number in foreign_issues:
+            continue
         if issue_number is not None:
             prs_linking_issue.setdefault(issue_number, []).append(pr)
             if gh_state == "OPEN":
@@ -2036,6 +2041,8 @@ def detect_drift(
 
     for issue in issues:
         issue_number = int(issue["number"])
+        if issue_number in foreign_issues:
+            continue
         issue_labels = label_names(issue)
         active_present = issue_labels & labels_cfg.active
         terminal_present = issue_labels & labels_cfg.terminal
