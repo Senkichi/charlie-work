@@ -175,6 +175,29 @@ def test_fleet_dir_returns_literal_when_administrative_share_absent(
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows-only test")
+def test_fleet_dir_returns_literal_when_admin_share_probe_raises_oserror(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """An OSError from the route's ``exists()`` degrades to the literal path.
+
+    ``Path.exists`` re-raises non-ENOENT ``OSError``s (a permission error or a
+    bad reparse point on the share), so routing must catch it: the probe is
+    best-effort and ``fleet_dir()`` is documented as never raising — an
+    exists() failure keeps the literal path (the #624 fallback).
+    """
+    from charlie_work import fleet_paths
+
+    literal, _fleet_json, _redirected = _routing_fixture(monkeypatch, tmp_path)
+
+    def raising_exists(self: Path) -> bool:
+        raise OSError("simulated share probe failure")
+
+    monkeypatch.setattr(pathlib.Path, "exists", raising_exists)
+
+    assert fleet_paths.fleet_dir() == literal
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows-only test")
 def test_fleet_dir_env_and_override_bypass_routing(tmp_path: Path, monkeypatch: Any) -> None:
     """A forked pinned dir with an available route is still returned unchanged.
 
