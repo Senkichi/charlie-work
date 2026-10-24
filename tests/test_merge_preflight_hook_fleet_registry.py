@@ -18,11 +18,29 @@ import os
 import pathlib
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import pytest
 
 from charlie_work import merge_preflight_hook as hook
+
+
+@pytest.fixture(autouse=True)
+def _fresh_fleet_route_cache() -> Iterator[None]:
+    """Start and end every test with an empty route cache / warn set.
+
+    ``fleet_path._route_around_fork`` caches its per-file probe per literal
+    dir for a TTL; without this reset one test's routing decision could leak
+    into another test for the same default-dir spelling.
+    """
+    from charlie_work import fleet_paths
+
+    fleet_paths._ROUTE_CACHE.clear()
+    fleet_paths._ADMIN_SHARE_WARNED.clear()
+    yield
+    fleet_paths._ROUTE_CACHE.clear()
+    fleet_paths._ADMIN_SHARE_WARNED.clear()
+
 
 # ---------------------------------------------------------------------------
 # _load_fleet_roots / _repo_for_cwd
@@ -172,15 +190,15 @@ def test_decide_mcp_genuinely_empty_fleet_passes_through(
 # the LocalCache backing file.
 
 _FLEET_REPOS = (
-    "charlie-work",
-    "job-cannon",
-    "swole",
-    "empericus",
-    "fresh-eyes",
-    "ci_runners",
-    "hosts",
-    "jobcannon",
-    "local/mdls",
+    "fleet-alpha",
+    "fleet-bravo",
+    "fleet-gamma",
+    "fleet-delta",
+    "fleet-epsilon",
+    "fleet-zeta",
+    "fleet-eta",
+    "fleet-theta",
+    "sub/nested-repo",
 )
 
 
@@ -192,7 +210,11 @@ def _registry(repo_roots_dir: Path, names: tuple[str, ...]) -> dict[str, Any]:
 
 
 def _virtualized_fleet_dir_with_route(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, registry: dict[str, Any]
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    registry: dict[str, Any],
+    *,
+    route_exists: bool = True,
 ) -> None:
     """Plant a stale forked fleet.json and route reads to the real one.
 
@@ -202,9 +224,13 @@ def _virtualized_fleet_dir_with_route(
       the administrative-share route short-circuits, and resolve failures
       degrade to the input path so the UNC route never trips on a host
       without admin shares.
-    - ``Path.exists`` / ``Path.read_text``: the administrative-share route
-      to the real registry "exists" and reads ``registry`` — a real
-      ``\\\\localhost\\C$`` share is neither writable nor reliably on.
+    - ``Path.exists``: ONLY the administrative-share DIRECTORY exists (the
+      path ``_route_around_fork`` actually probes, per the PR #2817 review
+      finding -- the earlier fixture faked only ``<share>/fleet.json``), and
+      every other ``\\\\localhost\\`` probe is False, so the routing result
+      never depends on the host's admin-share loopback being up.
+    - ``Path.read_text``: the real registry at the (not really existing)
+      route reads ``registry`` when ``route_exists`` is True.
     """
     from charlie_work import fleet_paths
 
@@ -246,12 +272,22 @@ def _virtualized_fleet_dir_with_route(
     real_read_text = pathlib.Path.read_text
 
     def fake_exists(self: Path) -> bool:
-        if os.path.normcase(os.fspath(self)) == os.path.normcase(os.fspath(admin_registry)):
-            return True
+        probe = os.path.normcase(os.fspath(self))
+        if str(self).lower().startswith("\\\\localhost\\"):
+            if not route_exists:
+                return False
+            # The routed DIRECTORY (what _route_around_fork probes) and the
+            # registry file inside it -- nothing else on the share.
+            return probe in (
+                os.path.normcase(os.fspath(admin_dir)),
+                os.path.normcase(os.fspath(admin_registry)),
+            )
         return real_exists(self)
 
     def fake_read_text(self: Path, *args: Any, **kwargs: Any) -> str:
-        if os.path.normcase(os.fspath(self)) == os.path.normcase(os.fspath(admin_registry)):
+        if route_exists and os.path.normcase(os.fspath(self)) == os.path.normcase(
+            os.fspath(admin_registry)
+        ):
             return json.dumps(registry)
         return real_read_text(self, *args, **kwargs)
 
@@ -280,16 +316,44 @@ def test_load_fleet_roots_routes_around_virtualized_fleet_json(
     roots = hook._load_fleet_roots()
     assert roots is not None
     assert set(roots) == {f"senkichi/{name}" for name in _FLEET_REPOS}
-    assert "senkichi/empericus" in roots
+    assert "senkichi/fleet-delta" in roots
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows-only test")
+def test_load_fleet_roots_falls_back_to_forked_literal_when_route_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No admin share on this host -> the literal path is kept -> the fork read.
+
+    PR #2817 review finding: the route-exists tests must not depend on the
+    host's admin-share loopback. Here every ``\\\\localhost\\`` exists() is
+    False, so ``fleet_dir()`` returns the literal path (the #624 fallback)
+    and ``_load_fleet_roots`` reads the stale forked registry -- the exact
+    degraded behavior a packaged session on a share-less host gets.
+    """
+    real_registry = _registry(tmp_path / "roots", _FLEET_REPOS)
+    (tmp_path / "roots").mkdir()
+    _virtualized_fleet_dir_with_route(monkeypatch, tmp_path, real_registry, route_exists=False)
+
+    from charlie_work.fleet_paths import fleet_dir
+
+    routed = fleet_dir()
+    assert routed == Path(os.environ["LOCALAPPDATA"]) / "charlie-work"
+    assert not str(routed).lower().startswith("\\\\localhost\\")
+
+    roots = hook._load_fleet_roots()
+    assert roots is not None
+    assert set(roots) == {f"senkichi/{name}" for name in tuple(_FLEET_REPOS[:3])}
+    assert "senkichi/fleet-delta" not in roots
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows-only test")
 def test_decide_bash_fleet_repo_merge_reaches_merge_check_despite_fork(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A ``gh pr merge 5 --repo Senkichi/empericus`` runs merge-check, not pass-through.
+    """A ``gh pr merge 5 --repo Senkichi/fleet-delta`` runs merge-check, not pass-through.
 
-    Before #2806 the forked registry listed 3 repos, so empericus looked
+    Before #2806 the forked registry listed 3 repos, so fleet-delta looked
     "outside the fleet" and the hook left the call undecided — merging
     without a preflight on 6 of 9 fleet repos.
     """
@@ -305,6 +369,8 @@ def test_decide_bash_fleet_repo_merge_reaches_merge_check_despite_fork(
 
     monkeypatch.setattr(hook, "_run_merge_check", _recorded_merge_check)
 
-    reason = hook._decide("Bash", {"command": "gh pr merge 5 --repo Senkichi/empericus"}, tmp_path)
+    reason = hook._decide(
+        "Bash", {"command": "gh pr merge 5 --repo Senkichi/fleet-delta"}, tmp_path
+    )
     assert reason is None
-    assert called == [(Path(str(tmp_path / "roots" / "empericus")), 5)]
+    assert called == [(Path(str(tmp_path / "roots" / "fleet-delta")), 5)]

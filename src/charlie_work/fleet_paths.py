@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import time
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -65,6 +66,18 @@ def detect_path_virtualization(literal: Path) -> tuple[Path, Path] | None:
 
 
 _ADMIN_SHARE_WARNED: set[str] = set()
+
+# The routing decision below is cached per process, keyed on the literal dir,
+# until this TTL expires (review finding on PR #2817): reworking PR #2817
+# measured the uncached per-call probe at 13.0-21.2 ms (median 15.1 ms)
+# against this host's 95-file default fleet dir — the PR #2817 review
+# measured 25-32 ms at 96 files — and fleet_dir() runs on every fleet read.
+# A deliberately short TTL keeps mid-session fork detection: a fork written
+# after the cached decision is noticed at the next TTL refresh.
+# (With the cache warm the same call measured ~0.002 ms.)
+_ROUTE_CACHE_TTL_SECONDS = 30.0
+_ROUTE_CACHE: dict[str, tuple[float, Path]] = {}
+_MONOTONIC = time.monotonic
 
 
 def _fleet_file_findings(literal: Path) -> list[tuple[Path, Path]]:
@@ -175,10 +188,25 @@ def _route_around_fork(literal: Path) -> Path:
     Never routes an explicit ``override`` or the ``CHARLIE_WORK_FLEET_DIR``
     env var -- callers that pin a path mean it. Never raises: the probe is
     best-effort and any failure degrades to returning ``literal``.
+
+    The probe is cached per process for ``_ROUTE_CACHE_TTL_SECONDS``, keyed
+    on the literal dir (review finding on PR #2817): reworking PR #2817
+    measured the uncached per-call probe at 13.0-21.2 ms (median 15.1 ms)
+    against this host's 95-file default fleet dir, and :func:`fleet_dir`
+    runs on every fleet read. The cached value is the post-routing choice
+    for that dir -- a fork written after the decision is picked up at the
+    next TTL refresh rather than on every call.
     """
+    key = os.path.normcase(os.path.abspath(str(literal)))
+    now = _MONOTONIC()
+    cached = _ROUTE_CACHE.get(key)
+    if cached is not None and (now - cached[0]) < _ROUTE_CACHE_TTL_SECONDS:
+        return cached[1]
     findings = _fleet_file_findings(literal)
     if not findings:
-        return literal
+        result = literal
+        _ROUTE_CACHE[key] = (now, result)
+        return result
     admin = _administrative_share_form(literal)
     route: Path | None = None
     if admin is not None:
@@ -209,7 +237,9 @@ def _route_around_fork(literal: Path) -> Path:
                 names,
                 literal,
             )
-    return route if route is not None else literal
+    result = route if route is not None else literal
+    _ROUTE_CACHE[key] = (now, result)
+    return result
 
 
 def warn_fleet_dir_virtualization_on_write(literal: Path, *, context: str) -> None:
@@ -275,11 +305,13 @@ def fleet_dir(*, override: str | None = None) -> Path:
     host-wide state reads and writes reach the daemon-visible copies; when
     the route does not exist, the literal path is returned unchanged (the
     #624 behavior) and the condition is logged as a warning. Overrides and
-    the env var are returned unchanged — the caller pinned that path. A
-    packaged session that forks fleet state mid-session will not see its
-    own forks until restart; scheduled tasks, daemons, and unpackaged
-    terminals are unaffected, since their fleet dir has no virtualized files
-    and the probe finds nothing.
+    the env var are returned unchanged — the caller pinned that path. The
+    probe is keyed on the literal default dir and cached for
+    ``_ROUTE_CACHE_TTL_SECONDS`` per process (see
+    :func:`_route_around_fork`), so a fork written mid-session is detected
+    at the next TTL refresh, not only at process start; scheduled tasks,
+    daemons, and unpackaged terminals are unaffected, since their fleet dir
+    has no virtualized files and the probe finds nothing.
 
     Args:
         override: Optional path string to use instead of the platform default.
