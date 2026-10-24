@@ -165,7 +165,10 @@ def _fleet_probe_cached(
     regardless of how often it is called (:func:`_route_around_fork` runs on
     every fleet read). If only the write guard has refreshed this generation
     so far, the route slot holds ``_ROUTE_UNPROBED`` and this computes — and
-    stores — the decision exactly once for the generation.
+    stores — the decision exactly once for the generation. An unforked entry
+    (empty findings) stores ``None`` without touching the share: the route
+    only applies when a fork exists, so ``_administrative_route`` is never
+    called for one (PR #2817 rework round 8).
     """
     key = os.path.normcase(os.path.abspath(str(literal)))
     now = _MONOTONIC()
@@ -173,11 +176,11 @@ def _fleet_probe_cached(
     if cached is not None and (now - cached[0]) < _FLEET_PROBE_CACHE_TTL_SECONDS:
         _stamp, findings, route = cached
         if route is _ROUTE_UNPROBED:
-            route = _administrative_route(literal)
+            route = _administrative_route(literal) if findings else None
             _FLEET_PROBE_CACHE[key] = (cached[0], cached[1], route)
         return findings, route
     findings = _fleet_file_findings(literal)
-    route = _administrative_route(literal) if findings else None
+    route = _administrative_route(literal)
     _FLEET_PROBE_CACHE[key] = (now, findings, route)
     return findings, route
 

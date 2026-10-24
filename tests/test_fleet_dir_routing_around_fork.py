@@ -557,3 +557,106 @@ def test_warn_on_write_swallows_is_dir_oserror(tmp_path: Path, monkeypatch: Any)
     monkeypatch.setattr(pathlib.Path, "is_dir", raising_is_dir)
 
     warn_fleet_dir_virtualization_on_write(guarded_dir, context="writing guarded state")
+
+
+# ---------------------------------------------------------------------------
+# sentinel branch of _fleet_probe_cached (PR #2817 rework round 8)
+# ---------------------------------------------------------------------------
+
+
+def _default_dir_fixture(monkeypatch: Any, tmp_path: Path, forked: bool) -> Path:
+    """The win32 default fleet dir, forked with ``fleet.json`` when asked.
+
+    Returns the literal dir. With ``forked`` the dir holds a ``fleet.json``
+    whose ``resolve()`` diverges to a package LocalCache copy (the same
+    packaged-session shape the routing tests inject); without it the dir
+    holds only an unforked ``notes.txt`` on the real path.
+    """
+    localappdata = tmp_path / "AppData" / "Local"
+    literal = localappdata / "charlie-work"
+    literal.mkdir(parents=True)
+    if forked:
+        fleet_json = literal / "fleet.json"
+        fleet_json.write_text("{}", encoding="utf-8")
+        redirected = (
+            localappdata / "Packages" / "app" / "LocalCache" / "charlie-work" / "fleet.json"
+        )
+        _patch_resolve_to_diverge(monkeypatch, fleet_json, redirected)
+    else:
+        (literal / "notes.txt").write_text("x", encoding="utf-8")
+    monkeypatch.setenv("LOCALAPPDATA", str(localappdata))
+    monkeypatch.delenv("CHARLIE_WORK_FLEET_DIR", raising=False)
+    monkeypatch.setattr(sys, "platform", "win32")
+    return literal
+
+
+def _fake_fleet_clock_and_probes(
+    monkeypatch: Any, fleet_paths: Any
+) -> "tuple[list[Path], list[float]]":
+    """Count ``\\\\localhost\\`` ``exists()`` probes and fake ``_MONOTONIC``.
+
+    Every localhost probe is answered False, so the route always degrades to
+    the literal path and the count never depends on the host's admin-share
+    loopback. Returns ``(probes, clock)``.
+    """
+    probes: list[Path] = []
+    real_exists = pathlib.Path.exists
+
+    def fake_exists(self: Path) -> bool:
+        if str(self).lower().startswith("\\\\localhost\\"):
+            probes.append(self)
+            return False
+        return real_exists(self)
+
+    monkeypatch.setattr(pathlib.Path, "exists", fake_exists)
+    clock = [1000.0]
+
+    def fake_monotonic() -> float:
+        return clock[0]
+
+    monkeypatch.setattr(fleet_paths, "_MONOTONIC", fake_monotonic)
+    return probes, clock
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows-only test")
+def test_fleet_dir_after_write_guard_makes_no_route_stat_without_fork(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """The write guard refreshing a generation first must not add a route
+    stat with no fork, and exactly one with a fork inside the TTL.
+
+    PR #2817 rework round 8: ``_fleet_probe_cached`` computed
+    ``_administrative_route`` — the ``exists()`` stat on the
+    ``\\localhost\\`` admin share — whenever the generation's route slot
+    still held ``_ROUTE_UNPROBED``, even when the entry's findings were
+    empty (no fork), so a write-guard call before the first ``fleet_dir()``
+    cost one spurious stat the reverse call order did not. Now an unforked
+    entry resolves (and stores) ``None`` without touching the share. The
+    call order inside the test is the point: the write guard populates the
+    cache first, ``fleet_dir()`` consumes the sentinel.
+    """
+    from charlie_work import fleet_paths
+    from charlie_work.fleet_paths import warn_fleet_dir_virtualization_on_write
+
+    # No fork: write guard first, then fleet_dir() -> zero localhost probes.
+    unforked = _default_dir_fixture(monkeypatch, tmp_path / "unforked", forked=False)
+    probes, _clock = _fake_fleet_clock_and_probes(monkeypatch, fleet_paths)
+    warn_fleet_dir_virtualization_on_write(unforked, context="writing unforked")
+    assert fleet_paths.fleet_dir() == unforked
+    assert probes == [], (
+        "an unforked generation must resolve an unprobed route slot to None "
+        "without statting the localhost admin share"
+    )
+
+    # With a fork: write guard first, then fleet_dir() -> exactly one probe
+    # on the share, and a second fleet_dir() inside the TTL adds none.
+    forked = _default_dir_fixture(monkeypatch, tmp_path / "forked", forked=True)
+    count_before = len(probes)
+    warn_fleet_dir_virtualization_on_write(forked, context="writing forked")
+    assert fleet_paths.fleet_dir() == forked
+    assert len(probes) - count_before == 1, (
+        "a forked generation refreshed by the write guard first must stat the "
+        "localhost admin share exactly once on the first fleet_dir() call"
+    )
+    assert fleet_paths.fleet_dir() == forked
+    assert len(probes) - count_before == 1, "a second fleet_dir() inside the TTL adds no probe"
