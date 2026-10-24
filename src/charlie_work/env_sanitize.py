@@ -158,7 +158,7 @@ def provider_api_key_env_vars(config: "OrchestratorConfig | None") -> tuple[str,
 
     Scope note (issue #2795): sanitize_env covers worker/reviewer SESSION
     launches, and :func:`build_local_gate_env` additionally covers the local
-    merge-gate suite launch (``env_sanitize`` ->
+    merge-gate suite launch (``orchestration.local_merge_gate`` ->
     ``local_suite_runner.launch_suite_gate``), which runs the PR branch's
     worker-authored test suite. Other children of the orchestrator or
     supervisor process inherit ``os.environ`` raw —

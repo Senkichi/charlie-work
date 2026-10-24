@@ -1105,8 +1105,10 @@ remaining surfaces, documented here as **accepted** for this repo, are:
   `PIP_`/`CLAUDE` prefixes, so the runner listeners the allocator starts — and,
   transitively, every self-hosted CI job step — still inherit the configured
   provider key. Mitigation belongs at the allocator's env boundary in
-  `ci_fleet`, stripping the same config-derived provider-key names; that is a
-  `ci_fleet`-repo change, outside this branch's diff.
+  `ci_fleet`, stripping the same config-derived provider-key names; it is
+  tracked in [Senkichi/ci_runners#355](https://github.com/Senkichi/ci_runners/issues/355),
+  which adds the strip behind a seam that charlie-work then installs with
+  `env_sanitize.provider_api_key_env_vars`.
 - **Raw `run_captured` children**: `charlie_work.subprocess_runner.run_captured`
   builds its env as `{**os.environ, ...}`, so every child the supervisor or
   orchestrator spawns through it also sees the key. That includes
