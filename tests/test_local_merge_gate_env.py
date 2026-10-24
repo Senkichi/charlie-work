@@ -56,50 +56,51 @@ def _config_with_provider(repo_root: Path, issues_dir: Path) -> Any:
     )
 
 
+@pytest.fixture
+def lane_repo() -> Path:
+    """Real git repo under the system temp dir (``$GIT_DIR``-path headroom --
+    same fixture shape as ``test_local_merge_gate_async.lane_repo``)."""
+    return Path(tempfile.mkdtemp(prefix="cw-gate-env-"))
+
+
 def test_merge_gate_launch_env_lacks_configured_provider_api_key(
+    lane_repo: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    repo_root = Path(tempfile.mkdtemp(prefix="cw-gate-env-"))
-    try:
-        _init_repo(repo_root)
-        issues_dir = repo_root / "docs" / "issues"
-        head = _make_branch(repo_root, "agent/issue-2795-x", "a.py", "a = 1\n")
-        app = _lane_app(repo_root, issues_dir, config=_config_with_provider(repo_root, issues_dir))
-        _adopt_and_approve(app, issues_dir, 2795, "agent/issue-2795-x", head)
+    _init_repo(lane_repo)
+    issues_dir = lane_repo / "docs" / "issues"
+    head = _make_branch(lane_repo, "agent/issue-2795-x", "a.py", "a = 1\n")
+    app = _lane_app(lane_repo, issues_dir, config=_config_with_provider(lane_repo, issues_dir))
+    _adopt_and_approve(app, issues_dir, 2795, "agent/issue-2795-x", head)
 
-        monkeypatch.setenv(GATE_KEY_ENV, "super-secret-value")
-        monkeypatch.setenv(GATE_CONTROL_ENV, "control-value")
+    monkeypatch.setenv(GATE_KEY_ENV, "super-secret-value")
+    monkeypatch.setenv(GATE_CONTROL_ENV, "control-value")
 
-        captured: dict[str, Any] = {}
+    captured: dict[str, Any] = {}
 
-        def fake_launch_suite_gate(
-            worktree_path: Path,
-            suite_argv: list[str],
-            *,
-            paths: Any,
-            head_sha: str,
-            base_sha: str | None,
-            env: dict[str, str] | None = None,
-        ) -> SuiteGateLaunch:
-            captured["env"] = dict(env or {})
-            # The pid is unallocatable on every OS, so no real suite child and
-            # no kill-tree teardown pressure follow from this fake launch.
-            return SuiteGateLaunch(pid=UNALLOCATABLE_PID, process_start_time=None, paths=paths)
+    def fake_launch_suite_gate(
+        worktree_path: Path,
+        suite_argv: list[str],
+        *,
+        paths: Any,
+        head_sha: str,
+        base_sha: str | None,
+        env: dict[str, str] | None = None,
+    ) -> SuiteGateLaunch:
+        captured["env"] = dict(env or {})
+        # The pid is unallocatable on every OS, so no real suite child and
+        # no kill-tree teardown pressure follow from this fake launch.
+        return SuiteGateLaunch(pid=UNALLOCATABLE_PID, process_start_time=None, paths=paths)
 
-        monkeypatch.setattr(
-            "charlie_work.local_suite_runner.launch_suite_gate", fake_launch_suite_gate
-        )
+    monkeypatch.setattr(
+        "charlie_work.local_suite_runner.launch_suite_gate", fake_launch_suite_gate
+    )
 
-        outcomes = app._local_merge_approved()
-        assert outcomes and outcomes[0].get("outcome") == "suite_launched", outcomes
-        assert captured["env"] is not None
-        assert GATE_KEY_ENV not in captured["env"], (
-            "the gate suite env inherited the configured provider key"
-        )
-        # Control: the ambient copy itself works, so the strip above is not
-        # vacuously green because the var never entered the env at all.
-        assert captured["env"].get(GATE_CONTROL_ENV) == "control-value"
-    finally:
-        # Unallocatable pid: the usual gate-kill teardown is a no-op, but keep
-        # the shared helper in the path by contract.
-        pass
+    outcomes = app._local_merge_approved()
+    assert outcomes and outcomes[0].get("outcome") == "suite_launched", outcomes
+    assert GATE_KEY_ENV not in captured["env"], (
+        "the gate suite env inherited the configured provider key"
+    )
+    # Control: the ambient copy itself works, so the strip above is not
+    # vacuously green because the var never entered the env at all.
+    assert captured["env"].get(GATE_CONTROL_ENV) == "control-value"
