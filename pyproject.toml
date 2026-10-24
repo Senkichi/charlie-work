@@ -14,8 +14,11 @@ dependencies = [
 
 [project.scripts]
 # `charlie` is the hero command; `charlie-work` is a formal alias to the same entry point.
-charlie = "charlie_work.cli:main"
-charlie-work = "charlie_work.cli:main"
+# Both enter through _entry, which checks the declared requirements BEFORE importing
+# cli (issue #2808: a stale editable uv tool env died with a bare ModuleNotFoundError
+# at import time, so even `charlie --help` was unusable).
+charlie = "charlie_work._entry:main"
+charlie-work = "charlie_work._entry:main"
 
 [project.optional-dependencies]
 dev = [

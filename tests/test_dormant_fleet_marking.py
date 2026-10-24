@@ -22,7 +22,8 @@ silently becomes a lie.
 
 So the dormant set is **derived from the import graph**, never written down:
 a module is live if it is reachable from either package entry point --
-``[project.scripts]``'s ``charlie_work.cli:main``, or ``__main__`` for
+``[project.scripts]``'s ``charlie_work._entry:main`` (the entry module, which
+lazily imports ``cli`` so it stays reachable), or ``__main__`` for
 ``python -m charlie_work`` -- and dormant otherwise. The marker set is then
 asserted to match exactly, which makes both directions loud:
 
@@ -75,7 +76,8 @@ SRC = REPO_ROOT / "src" / "charlie_work"
 TESTS = REPO_ROOT / "tests"
 
 # Ways into the package: `[project.scripts]` in pyproject.toml declares
-# charlie = "charlie_work.cli:main", and `python -m charlie_work` enters through
+# charlie = "charlie_work._entry:main" (a dependency guard that lazily imports
+# cli, so cli stays reachable), and `python -m charlie_work` enters through
 # __main__. Omitting the second classified __main__ itself as dormant, which is
 # how this list got checked rather than assumed. merge_preflight_hook is a
 # third entry point: `.claude/settings.json` registers it as a PreToolUse
