@@ -697,10 +697,23 @@ def classify_worker_health(
         lines = log_text.splitlines()
         if lines:
             last_log_line = lines[-1].strip()
-            for pattern in terminal_error_markers:
-                if pattern in last_log_line:
-                    has_terminal_error = True
-                    break
+            # Issue #2814: with the stream-json tee (now the default for
+            # claude-code workers), the log's last line is routinely a JSON
+            # event. The markers are CLI-fatal signatures; a ``tool_result``
+            # (or an assistant turn) that *quotes* one is the worker
+            # observing an error, not the CLI dying — so a stream-json event
+            # line never trips this scan. A plain (non-JSON) last line —
+            # merged stderr, or a non-tee plain-text log — keeps the
+            # anchored substring scan unchanged. Cf.
+            # ``failure_classifier._stream_json_emission_anchor`` for the
+            # same shape rule in the post-exit classifier.
+            from .failure_classifier import _parse_event
+
+            if _parse_event(last_log_line) is None:
+                for pattern in terminal_error_markers:
+                    if pattern in last_log_line:
+                        has_terminal_error = True
+                        break
         if view.adapter_kind == "api":
             from .failure_classifier import _provider_suspension_in_tail
 

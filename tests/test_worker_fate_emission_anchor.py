@@ -148,8 +148,9 @@ def test_stream_json_result_without_timestamp_anchors_at_mtime_not_earlier_turn(
 
 
 def test_claude_code_plain_text_log_anchors_at_mtime(tmp_path: Path) -> None:
-    # tee_stream_json defaults to False: a default claude-code log is prose.
-    # It must keep the #1997 mtime anchor, not fall to classification time.
+    # A non-tee claude-code log (``tee_stream_json: false`` in config) is
+    # prose. It must keep the #1997 mtime anchor, not fall to classification
+    # time.
     log_path = _copy_fixture(
         tmp_path,
         "claude_plain_text_throttle.log",
