@@ -136,12 +136,14 @@ def _parse_event(line: str) -> dict | None:
 def _is_stream_json(tail: str) -> bool:
     """True when the log's shape is stream-json: ANY whole tail line parses as
     a stream-json event. The shape is read off the log itself, not the
-    harness: ``ClaudeCodeConfig.tee_stream_json`` defaults to False, so a
-    claude-code ``.log`` is plain CLI prose unless the tee is on, while api
-    and the reviewers always write stream-json. The LAST line must not decide:
-    ``claude_code`` merges stderr into the same ``.log`` (``stderr=STDOUT``),
-    so a stream-json log routinely ends on a non-JSON line (a SessionEnd hook
-    failure). Only the tail's first line can be a partial event.
+    harness: since #2814 ``ClaudeCodeConfig.tee_stream_json`` defaults to
+    True, but ``tee_stream_json: false`` is the kill switch, so a
+    claude-code ``.log`` from a non-tee session is still plain CLI prose,
+    while api sessions and the reviewers always write stream-json. The LAST
+    line must not decide: ``claude_code`` merges stderr into the same
+    ``.log`` (``stderr=STDOUT``), so a stream-json log routinely ends on a
+    non-JSON line (a SessionEnd hook failure). Only the tail's first line can
+    be a partial event.
     """
     return any(_parse_event(line) is not None for line in tail.splitlines())
 

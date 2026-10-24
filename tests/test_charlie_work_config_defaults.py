@@ -54,10 +54,12 @@ def test_default_config_require_current_base() -> None:
     assert config.auto_merge.require_current_base is True
 
 
-def test_default_config_tee_stream_json_disabled() -> None:
-    """ClaudeCodeConfig.tee_stream_json defaults to False (issue #160)."""
+def test_default_config_tee_stream_json_enabled() -> None:
+    """ClaudeCodeConfig.tee_stream_json defaults to True (issue #2814: the
+    watchdog needs the tee'd stream-json log/events to tell a healthy
+    session apart from a stall). Config is the kill switch."""
     config = load_config()
-    assert config.claude_code.tee_stream_json is False
+    assert config.claude_code.tee_stream_json is True
 
 
 def test_default_config_runner_scaling_disabled() -> None:
