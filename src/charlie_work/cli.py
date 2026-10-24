@@ -60,11 +60,12 @@ from .dashboard_command import (
     register_dashboard_subparsers,
     run_dashboard_command,
 )
-from .fleet_registry import _load_registry, touch_repo, count_fleet_runners
+from .fleet_registry import _load_registry, _select_repos, touch_repo, count_fleet_runners
 from .fleet_status import (  # noqa: F401  (deliberate re-export)
     FLEET_STATUS_REPO_TIMEOUT_SECONDS,
     run_fleet_status,
 )
+from .fleet_retire import run_fleet_retire, run_fleet_unretire
 from .fleet_stop import register_fleet_stop_subparser, run_fleet_stop
 from .global_config import load_fleet_global_config, load_layered_config
 from .github import (
@@ -402,6 +403,20 @@ def build_parser() -> argparse.ArgumentParser:
     fleet_sub = fleet.add_subparsers(dest="fleet_command", required=True)
     fleet_status_parser = fleet_sub.add_parser("status")
     _add_no_cache_arg(fleet_status_parser)
+    fleet_retire_parser = fleet_sub.add_parser(
+        "retire",
+        help=(
+            "Set fleet.retired: true in this repo's own orchestrator.config.yaml "
+            "(issue #2754). The registry entry is kept; the repo winds down on "
+            "the next pass and is then skipped."
+        ),
+    )
+    _add_dry_run(fleet_retire_parser)
+    fleet_unretire_parser = fleet_sub.add_parser(
+        "unretire",
+        help="Set fleet.retired: false in this repo's own orchestrator.config.yaml.",
+    )
+    _add_dry_run(fleet_unretire_parser)
     fleet_sub.add_parser("review-queue")
     fleet_sub.add_parser("operator-queue")
 
@@ -1444,7 +1459,10 @@ def run_fleet_review_queue(args: argparse.Namespace) -> CommandResult:
     per_repo: dict[str, Any] = {}
     errors: list[dict[str, str]] = []
 
-    for repo_key, entry in sorted(registry.get("repos", {}).items()):
+    for repo_key, entry in _select_repos(registry, None):
+        # Issue #2754: retired repos are not part of fleet-wide enumeration.
+        if entry.get("retired"):
+            continue
         try:
             repo_root = Path(entry.get("repo_root"))
             if not repo_root.exists():
@@ -1480,7 +1498,10 @@ def run_fleet_operator_queue(args: argparse.Namespace) -> CommandResult:
     per_repo: dict[str, Any] = {}
     errors: list[dict[str, str]] = []
 
-    for repo_key, entry in sorted(registry.get("repos", {}).items()):
+    for repo_key, entry in _select_repos(registry, None):
+        # Issue #2754: retired repos are not part of fleet-wide enumeration.
+        if entry.get("retired"):
+            continue
         try:
             repo_root = Path(entry.get("repo_root"))
             if not repo_root.exists():
@@ -2574,6 +2595,10 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "fleet":
             if args.fleet_command == "status":
                 result = run_fleet_status(args)
+            elif args.fleet_command == "retire":
+                result = run_fleet_retire(args)
+            elif args.fleet_command == "unretire":
+                result = run_fleet_unretire(args)
             elif args.fleet_command == "review-queue":
                 result = run_fleet_review_queue(args)
             elif args.fleet_command == "operator-queue":
