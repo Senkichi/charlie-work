@@ -293,7 +293,7 @@ def _loop_body(
     # Issue #1948: the last fetch-gated boundary before the per-PR scan --
     # once the budget is spent the scan runs on an empty list rather than
     # starting a new review/merge round on the tail end of a dead budget.
-    prs = deadline.call(self.gh.pr_list, [])
+    prs = _wf.host_local_prs(self, deadline.call(self.gh.pr_list, []))
     # Snapshot for foreign-PR markers only: markers change at most once
     # per PR, so a single point-in-time read at loop start is sufficient.
     state_snapshot = _wf.load_state_locked(self.paths.state_file)
