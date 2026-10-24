@@ -17,6 +17,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from typing import Any
 
+import charlie_work.host_routing as host_routing
 import charlie_work.workflow as _wf
 
 # Issue #1505: single source for the refusal kind shared by the emitter
@@ -529,6 +530,8 @@ def _is_dispatchable(
     if names & self.config.labels.terminal:
         return False
     if names & self.config.labels.active:
+        return False
+    if not host_routing.owned_here(names, self.config):
         return False
     if operator_claimed is None:
         state = _wf.load_state_locked(self.paths.state_file)
