@@ -273,6 +273,12 @@ def warn_fleet_dir_virtualization_on_write(literal: Path, *, context: str) -> No
     directory is already a UNC/routed path (its drive starts with ``\\``):
     the administrative-share route is non-redirected by construction, so the
     scan (which costs seconds on a UNC path) would always find nothing.
+
+    ``Path.is_dir`` re-raises non-ENOENT ``OSError``s on Python >= 3.11 (for
+    example a permission error or a bad reparse point), so the check is
+    wrapped: a guard that crashed the writer would contradict the "never
+    raises" contract, since :mod:`charlie_work.fleet_dispatch` and the other
+    writers below call it unwrapped around the real write.
     """
     diverged = detect_path_virtualization(literal)
     if diverged is not None:
@@ -288,7 +294,10 @@ def warn_fleet_dir_virtualization_on_write(literal: Path, *, context: str) -> No
             resolved,
         )
         return
-    if not literal.is_dir():
+    try:
+        if not literal.is_dir():
+            return
+    except OSError:
         return
     if literal.drive.startswith("\\"):
         return

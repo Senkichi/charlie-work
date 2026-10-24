@@ -61,6 +61,38 @@ def _patch_resolve_to_diverge(monkeypatch: Any, literal: Path, redirected: Path)
 
 
 # ---------------------------------------------------------------------------
+# _administrative_share_form: the literal route form (#2806 rework round 5)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows-only test")
+def test_administrative_share_form_pins_literal_route_strings() -> None:
+    """Pin the exact ``\\\\localhost\\<drive>$\\<rest>`` route strings.
+
+    Every other routing test derives its expected route by calling
+    :func:`fleet_paths._administrative_share_form` itself, so a mutation to
+    the route construction (for example dropping the ``$``) leaves all of
+    them green -- this test pins the literal expected strings instead, and
+    asserts ``None`` for the non-routeable inputs (a UNC path, a drive
+    root, a relative path, and a driveless rooted path).
+    """
+    from charlie_work import fleet_paths
+
+    pinned = fleet_paths._administrative_share_form(Path(r"C:\Users\x\AppData\Local\charlie-work"))
+    assert pinned is not None
+    assert pinned == Path(r"\\localhost\C$\Users\x\AppData\Local\charlie-work")
+
+    unc_input = Path(r"\\otherhost\share\charlie-work")
+    assert fleet_paths._administrative_share_form(unc_input) is None
+    drive_root = Path(r"C:\\")
+    assert fleet_paths._administrative_share_form(drive_root) is None
+    relative = Path(r"charlie-work")
+    assert fleet_paths._administrative_share_form(relative) is None
+    driveless_rooted = Path(r"\AppData\Local\charlie-work")
+    assert fleet_paths._administrative_share_form(driveless_rooted) is None
+
+
+# ---------------------------------------------------------------------------
 # fleet_dir() routing around a per-file fork (#2806)
 # ---------------------------------------------------------------------------
 
@@ -146,11 +178,10 @@ def test_fleet_dir_returns_literal_when_administrative_share_absent(
 def test_fleet_dir_env_and_override_bypass_routing(tmp_path: Path, monkeypatch: Any) -> None:
     """A forked pinned dir with an available route is still returned unchanged.
 
-    Both pinned dirs hold a forked file AND an existing admin-share route,
-    so this test fails if ``fleet_dir()`` ever routes an override or the
-    ``CHARLIE_WORK_FLEET_DIR`` env var. Mutation check output is in the PR
-    body: applying routing to the override/env branches makes both
-    assertions fail.
+    Invariant under test: an explicit ``override`` and the
+    ``CHARLIE_WORK_FLEET_DIR`` env var are never routed, even when the
+    pinned dir holds a forked file AND its admin-share route exists —
+    callers that pin a path mean it.
     """
     from charlie_work import fleet_paths
 
@@ -429,3 +460,24 @@ def test_warn_on_write_skips_per_file_probe_for_unc_directory(
     warn_fleet_dir_virtualization_on_write(unc_dir, context="writing routed state")
 
     assert probe_calls == [], "the per-file probe must be skipped for a UNC directory"
+
+
+def test_warn_on_write_swallows_is_dir_oserror(tmp_path: Path, monkeypatch: Any) -> None:
+    """A non-ENOENT ``OSError`` from ``Path.is_dir`` is swallowed, not raised.
+
+    ``fleet_dispatch`` and the other fleet writers call the guard unwrapped
+    around the real write, so a guard that re-raises (Python >= 3.11
+    re-raises non-ENOENT OSErrors from ``is_dir``) would crash the write it
+    was only supposed to sit beside.
+    """
+    from charlie_work.fleet_paths import warn_fleet_dir_virtualization_on_write
+
+    guarded_dir = tmp_path / "charlie-work"
+    guarded_dir.mkdir()
+
+    def raising_is_dir(self: Path, *args: Any, **kwargs: Any) -> bool:
+        raise OSError("simulated access denied / bad reparse point")
+
+    monkeypatch.setattr(pathlib.Path, "is_dir", raising_is_dir)
+
+    warn_fleet_dir_virtualization_on_write(guarded_dir, context="writing guarded state")
