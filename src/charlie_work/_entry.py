@@ -27,6 +27,7 @@ import os
 import platform
 import re
 import sys
+import tomllib
 from pathlib import Path
 
 _DIST_NAME = "charlie-work"
@@ -45,22 +46,25 @@ except ImportError:  # pragma: no cover - depends on the environment's packaging
     _PackagingRequirement = None
 
 
-def _stdlib_version_key(version: str) -> tuple[int, ...]:
-    """Numeric release segments of a version string, for fallback ordering.
+def _stdlib_version_key(version: str) -> tuple[int, ...] | None:
+    """Numeric release segments of a fully parseable version string.
 
-    Pre-release and post-release decorations (``rc1``, ``.post1``, ``+local``)
-    are dropped rather than compared, so ``1.0.0rc1`` sorts equal to ``1.0.0``.
-    Deliberate looseness: the fallback only runs where ``packaging`` is absent,
-    and ordering release segments never reports a satisfying version as unmet
-    below a real version boundary for the ``>=`` floors charlie-work declares.
+    The version is fully parsed only when every ``[._-]``-separated chunk of
+    its release part (the text before any ``+local`` segment) is pure digits:
+    anything else -- ``0.7.*``, ``1.0.0rc1``, ``1.0.post1``, an empty string --
+    is NOT knowably comparable under PEP 440, so ``None`` is returned and
+    callers fail open. Guessing an ordering to complete a comparison is
+    exactly the false verdict this module refuses to produce.
     """
+    source = version.split("+", 1)[0].strip().lower()
+    if not source:
+        return None
     segments: list[int] = []
-    for chunk in re.split(r"[._-]", version.split("+", 1)[0].lower()):
-        match = re.match(r"\d+", chunk)
-        if match is None:
-            break
-        segments.append(int(match.group()))
-    return tuple(segments) or (0,)
+    for chunk in re.split(r"[._-]", source):
+        if not re.fullmatch(r"\d+", chunk):
+            return None
+        segments.append(int(chunk))
+    return tuple(segments)
 
 
 def _stdlib_spec_satisfied(installed: str, op: str, spec_version: str) -> bool | None:
@@ -69,11 +73,21 @@ def _stdlib_spec_satisfied(installed: str, op: str, spec_version: str) -> bool |
     Pure stdlib, no ``packaging``. Comparisons zero-pad the numeric release
     segments so ``0.7`` equals ``0.7.0`` the way PEP 440 says. ``~=`` is
     evaluated as its PEP 440 expansion (``>= X.Y.Z, == X.Y.*``) and needs at
-    least two release segments; a one-segment ``~=X`` is unjudgeable. Any
-    unjudgeable comparison fails open (callers treat ``None`` as satisfied).
+    least two release segments; a one-segment ``~=X`` is unjudgeable. Extreme
+    precision (``===``), wildcard specifiers (``0.7.*``), and any version
+    ``_stdlib_version_key`` cannot fully parse are equally unjudgeable:
+    ``None``. Any unjudgeable comparison fails open (callers treat ``None``
+    as satisfied) -- a fallback guess must never report a satisfying version
+    as unmet, and must never dress a truncated parse up as a verdict.
     """
+    if op == "===":
+        return None  # arbitrary-precision equality is not judgeable without packaging
+    if "*" in installed or "*" in spec_version:
+        return None
     left_raw = _stdlib_version_key(installed)
     right_raw = _stdlib_version_key(spec_version)
+    if left_raw is None or right_raw is None:
+        return None
     width = max(len(left_raw), len(right_raw))
     left = left_raw + (0,) * (width - len(left_raw))
     right = right_raw + (0,) * (width - len(right_raw))
@@ -318,15 +332,39 @@ def _project_root() -> Path | None:
     """The checkout an editable install points at, when discoverable.
 
     An editable install resolves this module to the real source tree, so
-    walking up from the package directory to the first parent holding
-    ``pyproject.toml`` finds the project root ``uv tool install --editable``
-    needs. In a non-editable install the package is copied into
-    site-packages and no parent qualifies; callers fall back.
+    walking up from the package directory to the first parent whose
+    ``pyproject.toml`` declares ``[project].name == 'charlie-work'`` finds the
+    project root ``uv tool install --editable`` needs. Verifying the name is
+    what stops a stray ``pyproject.toml`` above the checkout (some host tool's
+    config file, an unrelated project) from being handed to the recovery
+    command: installing *that* project would not repair charlie-work. In a
+    non-editable install the package is copied into site-packages and no
+    parent qualifies; callers fall back.
     """
-    for parent in Path(__file__).resolve().parents:
-        if (parent / "pyproject.toml").is_file():
-            return parent
+    return _project_root_from(Path(__file__).resolve().parent)
+
+
+def _project_root_from(start: Path) -> Path | None:
+    """``_project_root`` over an explicit starting directory (test seam)."""
+    for directory in (start, *start.parents):
+        pyproject = directory / "pyproject.toml"
+        if not pyproject.is_file():
+            continue
+        try:
+            declared = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, tomllib.TOMLDecodeError):
+            continue
+        if declared.get("project", {}).get("name") == _DIST_NAME:
+            return directory
     return None
+
+
+# The recovery command must not guess its target: with no discoverable project
+# root, naming the tool environment directory (``uv tool install <dirname>``)
+# would resolve through the package index to the *published* distribution, not
+# the checkout an editable install tracks -- wrong project, wrong supply
+# chain. The placeholder makes the operator fill in the one thing uv needs.
+_RECOVERY_CHECKOUT_PLACEHOLDER = "<path to your charlie-work checkout>"
 
 
 def _recovery_command(unmet: list[tuple[str, str, str | None]]) -> str:
@@ -336,15 +374,15 @@ def _recovery_command(unmet: list[tuple[str, str, str | None]]) -> str:
     per unmet requirement -- the observed shape of the 2026-10-23 recovery:
     ``uv tool install --editable <checkout> --force --refresh-package
     ci-fleet``) is what makes uv re-resolve a dependency it would otherwise
-    leave as-is. When no project root is discoverable the install is not
-    editable, so the command re-installs the tool under its registry name
-    (the tool name is the tool environment directory's name).
+    leave as-is. The install is always the editable one against the real
+    checkout: when no project root is discoverable the checkout path is
+    printed as an explicit placeholder instead of guessed from the
+    environment's own directory name.
     """
     refresh = " ".join(f"--refresh-package {name}" for name, _, _ in unmet)
     root = _project_root()
-    if root is not None:
-        return f"uv tool install --editable {root} --force {refresh}"
-    return f"uv tool install {Path(sys.prefix).name} --force {refresh}"
+    path = root if root is not None else _RECOVERY_CHECKOUT_PLACEHOLDER
+    return f"uv tool install --editable {path} --force {refresh}".rstrip()
 
 
 def _failure_message(unmet: list[tuple[str, str, str | None]]) -> str:

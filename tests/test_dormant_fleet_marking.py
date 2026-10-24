@@ -22,7 +22,8 @@ silently becomes a lie.
 
 So the dormant set is **derived from the import graph**, never written down:
 a module is live if it is reachable from either package entry point --
-``[project.scripts]``'s ``charlie_work.cli:main``, or ``__main__`` for
+``[project.scripts]``'s ``charlie_work._entry:main`` (the entry module, which
+lazily imports ``cli`` so it stays reachable), or ``__main__`` for
 ``python -m charlie_work`` -- and dormant otherwise. The marker set is then
 asserted to match exactly, which makes both directions loud:
 
