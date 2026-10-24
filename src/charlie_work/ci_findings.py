@@ -353,6 +353,14 @@ def check_dispatch_staleness(
             result["reason"] = "empty_backlog"
         return result
 
+    # Spec C2 (host_routing): the repo-wide stall alarm belongs to the default
+    # host. A host that is not the default owns only its ``host:<name>``
+    # issues, so a pass with none of them dispatchable is idle by design.
+    if config.host is not None and not config.default_host:
+        if result["backlog_dispatchable"] == 0:
+            result["reason"] = "not_default_host"
+            return result
+
     # Issue #1110: when every ready issue is blocked by an open dependency,
     # dispatch is permanently (and correctly) idle -- there is nothing to
     # dispatch and nothing wrong with the dispatcher. Firing a cadence alarm
