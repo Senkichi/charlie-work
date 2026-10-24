@@ -1327,7 +1327,7 @@ def launch_claude_worker(
     # on a shared temp path (issue #1767). To give workers a scoped GitHub
     # token, set claude_code.worker_env={"GH_TOKEN": "<scoped-PAT>"}.
     try:
-        sanitized_env = sanitize_env(worktree.path)
+        sanitized_env = sanitize_env(worktree.path, config=config)
     except OSError as exc:
         _teardown_on_launch_failure()
         record = _error_record(
