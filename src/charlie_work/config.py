@@ -306,6 +306,8 @@ class LabelConfig:
     # whoever files the issue creates the label, so it is not a member of
     # ``all`` or ``workflow_labels``. An empty prefix turns the routing off.
     model_tier_prefix: str = "model:"
+    # Spec C2 (host_routing): ``<prefix><host>`` names the orchestrator that owns an issue.
+    host_prefix: str = "host:"
 
     @property
     def terminal(self) -> set[str]:
@@ -381,6 +383,9 @@ class DispatchConfig:
     # so an operator adding or removing the label mid-flight takes effect on
     # the next pass.
     human_merge_labels: Annotated[tuple[str, ...], Typed, NotNull] = ()
+    # Spec C2 (host_routing): this orchestrator's host name; None = every issue is local.
+    host: Annotated[str | None, Typed, NonEmpty] = None
+    default_host: Annotated[bool, Typed, NotNull] = True
     # Package template rendered for worker prompts. "worker.md" targets Devin
     # sessions (skills-based loop); "worker_claude_code.md" targets Claude Code
     # workers (direct shell loop). A repo-local prompts dir overrides by filename.

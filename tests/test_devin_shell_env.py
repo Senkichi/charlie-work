@@ -16,6 +16,7 @@ import pytest
 from _devin_shell_fixtures import _install_fake_create_worktree
 
 from charlie_work import layout
+from charlie_work.config import ApiProviderConfig, ApiWorkerConfig, OrchestratorConfig
 from charlie_work.devin_shell import launch_devin_session
 from charlie_work.env_sanitize import sanitize_env
 
@@ -336,4 +337,106 @@ def test_launch_passes_operator_scoped_gh_token_through(
 
     assert log_text == "scoped-worker-pat", (
         f"worker_env GH_TOKEN must survive sanitization, worker saw {log_text!r}"
+    )
+
+
+def _provider_orchestrator_config(api_key_env: str = "MOONSHOT_API_KEY") -> OrchestratorConfig:
+    """One enabled api provider whose key env var the launch must strip (#2795)."""
+    return OrchestratorConfig(
+        api_worker=ApiWorkerConfig(
+            enabled=True,
+            provider="kimi-k3",
+            max_concurrent_sessions=1,
+            providers={
+                "kimi-k3": ApiProviderConfig(
+                    base_url="https://api.moonshot.ai/anthropic",
+                    api_key_env=api_key_env,
+                    model="kimi-k3",
+                    input_usd_per_mtok=3.0,
+                    output_usd_per_mtok=15.0,
+                    cached_input_usd_per_mtok=0.30,
+                )
+            },
+        )
+    )
+
+
+def test_launch_devin_session_strips_configured_provider_key_from_child_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The devin child must not inherit the orchestrator's api provider key.
+
+    The provider key sits in the supervisor's own ambient environment (that is
+    where the api adapter resolves it from), and devin_shell sessions inherit
+    the supervisor's env — so the env actually handed to the child must have
+    the configured ``api_key_env`` popped. Config comes in through
+    ``launch_devin_session(config=...)``; reverting devin_shell.py's
+    ``sanitize_env(worktree.path, config=config)`` wiring to the pre-#2795
+    no-config call makes this fail (the child logs the key value).
+    """
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    prompt_path = tmp_path / "prompt.md"
+    prompt_path.write_text("x", encoding="utf-8")
+
+    env_script = tmp_path / "echo_provider_key.py"
+    env_script.write_text(
+        "import os, sys\n"
+        "sys.stdout.write(os.environ.get('MOONSHOT_API_KEY', 'UNSET') + '\\n')\n"
+        "sys.stdout.flush()\n",
+        encoding="utf-8",
+    )
+
+    _install_fake_create_worktree(monkeypatch, tmp_path)
+    monkeypatch.setenv("MOONSHOT_API_KEY", "sk-configured-provider-key")
+
+    config = _provider_orchestrator_config()
+    record = launch_devin_session(
+        58,
+        "agent/issue-58-provider-key",
+        prompt_path,
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        command_template=(sys.executable, str(env_script)),
+        config=config,
+    )
+
+    assert record.error is None, record.error
+    assert record.pid is not None
+
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        log_text = Path(record.log_path).read_text(encoding="utf-8")
+        if log_text.strip():
+            break
+        time.sleep(0.05)
+    log_text = Path(record.log_path).read_text(encoding="utf-8").strip()
+
+    assert log_text == "UNSET", (
+        f"devin worker inherited the configured provider key "
+        f"(MOONSHOT_API_KEY={log_text!r}); config= wiring must strip it "
+        f"(issue #2795)"
+    )
+
+    # No-resumed-env corollary: the same launch with no config keeps the key —
+    # the strip is config-driven, not a hardcoded name.
+    record2 = launch_devin_session(
+        59,
+        "agent/issue-59-provider-key-unset",
+        prompt_path,
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        command_template=(sys.executable, str(env_script)),
+    )
+    assert record2.error is None, record2.error
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        log_text2 = Path(record2.log_path).read_text(encoding="utf-8")
+        if log_text2.strip():
+            break
+        time.sleep(0.05)
+    assert log_text2.strip() == "sk-configured-provider-key", (
+        "without config= no provider key may be stripped (the name comes from "
+        "config, not a hardcoded list)"
     )
