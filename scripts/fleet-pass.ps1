@@ -140,5 +140,37 @@ $env:PYTHONIOENCODING = 'utf-8:surrogateescape'
 #
 # Everything after `--` is forwarded to `fleet supervise` verbatim.
 $cmdLine = "uv run --no-sync --project `"$root`" --directory `"$root`" python -m charlie_work fleet supervise-loop -- --max-runtime 0 >> `"$log`" 2>&1"
-& cmd /c $cmdLine
+
+# Issue #2795: inject the secretenv-stored provider key into the supervisor's
+# env for api-harness launches. The `api` adapter (api_worker.launch_api_worker)
+# resolves the provider key via os.environ.get(provider.api_key_env) in the
+# ORCHESTRATOR process -- the supervisor itself -- then injects it into the
+# worker child env as ANTHROPIC_AUTH_TOKEN. The configured api_key_env for the
+# anthropic provider is EMPERICUS_ANTHROPIC_API_KEY, which lives only in the
+# DPAPI secretenv store, not in User/Machine env. The scheduled task's env
+# therefore does not include the key, and any `harness: api` launch from a
+# task-spawned supervisor fails with a missing-key error record.
+#
+# secretenv injects the secret into the child process env only; the value is
+# never printed, logged, or written here. The guards exist so the supervisor
+# still starts WITHOUT the key when the secret is absent or undecryptable:
+# api launches self-limit with an error record, and a missing secret must
+# never strand the whole fleet.
+$secretenv = Join-Path $env:USERPROFILE '.local\bin\secretenv.exe'
+# All three guards must hold to wrap the launch: the key is absent from the
+# process env (never double-wrap), the per-user secretenv.exe exists, and the
+# secret is stored/decryptable. Note: a native redirect (`*> $null`) cannot
+# appear inside a parenthesized expression under PS 5.1, so the verify run and
+# its exit-code read are separate statements.
+$secretenvOk = $false
+if (-not [Environment]::GetEnvironmentVariable('EMPERICUS_ANTHROPIC_API_KEY') -and
+    (Test-Path -LiteralPath $secretenv)) {
+    & $secretenv verify EMPERICUS_ANTHROPIC_API_KEY *> $null
+    $secretenvOk = ($LASTEXITCODE -eq 0)
+}
+if ($secretenvOk) {
+    & $secretenv run EMPERICUS_ANTHROPIC_API_KEY -- cmd /c $cmdLine
+} else {
+    & cmd /c $cmdLine
+}
 "--- fleet supervise-loop exit=$LASTEXITCODE $(Get-Date -Format o) ---" | Out-File -FilePath $log -Append -Encoding utf8

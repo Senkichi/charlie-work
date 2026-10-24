@@ -26,10 +26,14 @@ import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from . import markdown_fence, markdown_guard
 from .env_sanitize import sanitize_env
 from .subprocess_runner import no_console_window_kwargs
+
+if TYPE_CHECKING:
+    from .config import OrchestratorConfig
 
 logger = logging.getLogger(__name__)
 
@@ -211,6 +215,7 @@ def run_cross_family_review(
     sleep: Callable[[float], None] = time.sleep,
     head_ref_oid: str | None = None,
     tmp_dir: Path | None = None,
+    config: "OrchestratorConfig | None" = None,
 ) -> CrossFamilyResult:
     """Write ``prompt_text`` to ``prompt_path``, run the cross-family model from
     ``repo_root`` (so it can read the real code), and capture stdout to
@@ -234,6 +239,11 @@ def run_cross_family_review(
     back to ``sanitize_env``'s own default (keyed on ``repo_root``), which
     is intentionally not reclaimed here since the caller did not ask for it
     to be -- pass ``tmp_dir`` for a caller that wants ownership of cleanup.
+
+    ``config``, when given, flows into ``sanitize_env`` so the provider-key
+    variable names configured under ``api_worker.providers`` are stripped from
+    the review subprocess env too (issue #2795) — the rescue reviewer runs
+    from the shared main checkout whose ambient env the supervisor carries.
     """
     if dry_run:
         # Deliberately NOT routed through _fail(): that helper mkdirs and
@@ -279,7 +289,7 @@ def run_cross_family_review(
     # Sanitize environment to prevent VIRTUAL_ENV leaks from the orchestrator,
     # and to give this call its own TMP/TEMP/TMPDIR (issue #1767).
     try:
-        env = sanitize_env(repo_root, tmp_dir=tmp_dir)
+        env = sanitize_env(repo_root, tmp_dir=tmp_dir, config=config)
     except OSError as exc:
         return _fail(report_path, model, f"failed to prepare review environment: {exc}")
 
