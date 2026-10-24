@@ -209,3 +209,49 @@ def test_default_host_keeps_the_repo_wide_stall_alarm() -> None:
     result = check_dispatch_staleness(state, config, backlog, now=now)
 
     assert result["stale"] is True
+
+
+def test_host_unset_with_default_host_false_keeps_the_stall_alarm() -> None:
+    """The ``config.host is not None`` kill-switch clause in
+    ``check_dispatch_staleness`` (issue #2821 review). With no host
+    configured, routing is off entirely -- every issue is local -- so
+    ``default_host`` alone must not trigger the not_default_host exemption:
+    the repo-wide stall alarm applies exactly as before."""
+    now = datetime.now(UTC).replace(microsecond=0)
+    state, backlog = _stale_inputs(now)
+    config = DispatchConfig(dispatch_staleness_minutes=60, host=None, default_host=False)
+
+    result = check_dispatch_staleness(state, config, backlog, now=now)
+
+    assert result["stale"] is True
+    assert result["reason"] == "dispatch_stale"
+
+
+def test_non_default_host_wedged_dependency_chain_still_alarms() -> None:
+    """Issue #2821 review: the not_default_host exemption must not swallow the
+    #1110/#1682 dependency arm. A non-default host whose ready issues are all
+    dependency-blocked on an idle root is wedged, not idle-by-design -- the
+    dependency_root_blocker_idle alarm still raises for its own backlog."""
+    now = datetime.now(UTC).replace(microsecond=0)
+    old = (now - timedelta(minutes=180)).isoformat().replace("+00:00", "Z")
+    state = record_non_empty_dispatch({}, old, [1])
+    backlog: dict[str, Any] = {
+        "observed": True,
+        "open_total": 2,
+        "dispatchable": 0,
+        "other_host": 0,
+        "blocked_by_open_dependency": 2,
+        "dependency_root_blockers": [{"number": 2, "updated_at": old}],
+    }
+    config = DispatchConfig(
+        dispatch_staleness_minutes=60,
+        dependency_stall_minutes=60,
+        host="macbook",
+        default_host=False,
+    )
+
+    result = check_dispatch_staleness(state, config, backlog, now=now)
+
+    assert result["stale"] is True
+    assert result["reason"] == "dependency_root_blocker_idle"
+    assert [r["issue"] for r in result["dependency_root_blockers"]] == [2]

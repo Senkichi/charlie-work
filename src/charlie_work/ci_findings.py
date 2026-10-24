@@ -355,9 +355,16 @@ def check_dispatch_staleness(
 
     # Spec C2 (host_routing): the repo-wide stall alarm belongs to the default
     # host. A host that is not the default owns only its ``host:<name>``
-    # issues, so a pass with none of them dispatchable is idle by design.
+    # issues, so a pass with none of them dispatchable is idle by design --
+    # but a wedged dependency chain is not idle-by-design: when the ready
+    # issues are dependency-blocked, leave the decision to the #1110/#1682
+    # arm below so ``dependency_root_blocker_idle`` still raises for the
+    # non-default host's own backlog (issue #2821 review, following #1682).
     if config.host is not None and not config.default_host:
-        if result["backlog_dispatchable"] == 0:
+        if (
+            result["backlog_dispatchable"] == 0
+            and result["backlog_blocked_by_open_dependency"] == 0
+        ):
             result["reason"] = "not_default_host"
             return result
 
