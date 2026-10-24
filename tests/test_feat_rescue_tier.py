@@ -36,6 +36,7 @@ from charlie_work.state import load_state, save_state, state_lock
 from charlie_work.workflow import OrchestratorApp
 
 from _fakes_github import FakeGitHub
+from _rescue_review_helpers import _rescue_marked_app
 
 
 def _events(state, kind: str) -> list[dict]:
@@ -374,15 +375,6 @@ def test_dispatch_rework_normal_issue_unaffected_by_rescue_config(
 
 
 # --- Rescue review exit semantics: _process_rescue_review ---
-
-
-def _rescue_marked_app(tmp_path: Path, **config_kwargs) -> OrchestratorApp:
-    config = OrchestratorConfig(rescue=RescueConfig(enabled=True), **config_kwargs)
-    paths = runtime_paths(tmp_path, config.runtime.state_dir)
-    fake_gh = FakeGitHub()
-    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    _seed_pr_state(paths, 456, 123, rescue_attempted=True, rescue_cause="rework_cycle_cap")
-    return app
 
 
 def _fake_cross_family_review(decision: str, summary: str):
