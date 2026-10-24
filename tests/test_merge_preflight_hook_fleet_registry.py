@@ -35,10 +35,10 @@ def _fresh_fleet_route_cache() -> Iterator[None]:
     """
     from charlie_work import fleet_paths
 
-    fleet_paths._ROUTE_CACHE.clear()
+    fleet_paths._FLEET_PROBE_CACHE.clear()
     fleet_paths._ADMIN_SHARE_WARNED.clear()
     yield
-    fleet_paths._ROUTE_CACHE.clear()
+    fleet_paths._FLEET_PROBE_CACHE.clear()
     fleet_paths._ADMIN_SHARE_WARNED.clear()
 
 

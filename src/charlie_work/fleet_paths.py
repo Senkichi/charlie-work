@@ -67,16 +67,18 @@ def detect_path_virtualization(literal: Path) -> tuple[Path, Path] | None:
 
 _ADMIN_SHARE_WARNED: set[str] = set()
 
-# The routing decision below is cached per process, keyed on the literal dir,
-# until this TTL expires (review finding on PR #2817): reworking PR #2817
-# measured the uncached per-call probe at 13.0-21.2 ms (median 15.1 ms)
-# against this host's 95-file default fleet dir — the PR #2817 review
-# measured 25-32 ms at 96 files — and fleet_dir() runs on every fleet read.
-# A deliberately short TTL keeps mid-session fork detection: a fork written
-# after the cached decision is noticed at the next TTL refresh.
-# (With the cache warm the same call measured ~0.002 ms.)
-_ROUTE_CACHE_TTL_SECONDS = 30.0
-_ROUTE_CACHE: dict[str, tuple[float, Path]] = {}
+# The per-file probe below is cached per process, keyed on the normalized
+# literal dir, until this TTL expires: per-file MSIX detection is a directory
+# scan plus one ``Path.resolve()`` per file, which this host measured at
+# 13-32 ms against a ~95-file fleet dir (and seconds against the UNC route),
+# and the callers (:func:`_route_around_fork` and
+# :func:`warn_fleet_dir_virtualization_on_write`) run on every fleet read and
+# every fleet write. A deliberately short TTL keeps mid-session fork
+# detection: a fork written after the cached scan is noticed at the next TTL
+# refresh. :func:`fleet_dir_virtualization` (the ``charlie doctor`` probe)
+# deliberately bypasses this cache and reads fresh.
+_FLEET_PROBE_CACHE_TTL_SECONDS = 30.0
+_FLEET_PROBE_CACHE: dict[str, tuple[float, list[tuple[Path, Path]]]] = {}
 _MONOTONIC = time.monotonic
 
 
@@ -104,6 +106,25 @@ def _fleet_file_findings(literal: Path) -> list[tuple[Path, Path]]:
         diverged = detect_path_virtualization(entry)
         if diverged is not None:
             findings.append(diverged)
+    return findings
+
+
+def _fleet_file_findings_cached(literal: Path) -> list[tuple[Path, Path]]:
+    """TTL-cached :func:`_fleet_file_findings`, keyed on the normalized dir.
+
+    Shared by :func:`_route_around_fork` and the write guard, which run per
+    read/per write and therefore cannot afford a fresh directory scan per
+    call. :func:`fleet_dir_virtualization` (``charlie doctor``) calls
+    :func:`_fleet_file_findings` directly so the doctor always reports fresh
+    state.
+    """
+    key = os.path.normcase(os.path.abspath(str(literal)))
+    now = _MONOTONIC()
+    cached = _FLEET_PROBE_CACHE.get(key)
+    if cached is not None and (now - cached[0]) < _FLEET_PROBE_CACHE_TTL_SECONDS:
+        return cached[1]
+    findings = _fleet_file_findings(literal)
+    _FLEET_PROBE_CACHE[key] = (now, findings)
     return findings
 
 
@@ -189,24 +210,14 @@ def _route_around_fork(literal: Path) -> Path:
     env var -- callers that pin a path mean it. Never raises: the probe is
     best-effort and any failure degrades to returning ``literal``.
 
-    The probe is cached per process for ``_ROUTE_CACHE_TTL_SECONDS``, keyed
-    on the literal dir (review finding on PR #2817): reworking PR #2817
-    measured the uncached per-call probe at 13.0-21.2 ms (median 15.1 ms)
-    against this host's 95-file default fleet dir, and :func:`fleet_dir`
-    runs on every fleet read. The cached value is the post-routing choice
-    for that dir -- a fork written after the decision is picked up at the
-    next TTL refresh rather than on every call.
+    The per-file probe behind the routing decision is cached per process for
+    ``_FLEET_PROBE_CACHE_TTL_SECONDS``, keyed on the literal dir: a fork
+    written after the cached scan is picked up at the next TTL refresh rather
+    than on every call.
     """
-    key = os.path.normcase(os.path.abspath(str(literal)))
-    now = _MONOTONIC()
-    cached = _ROUTE_CACHE.get(key)
-    if cached is not None and (now - cached[0]) < _ROUTE_CACHE_TTL_SECONDS:
-        return cached[1]
-    findings = _fleet_file_findings(literal)
+    findings = _fleet_file_findings_cached(literal)
     if not findings:
-        result = literal
-        _ROUTE_CACHE[key] = (now, result)
-        return result
+        return literal
     admin = _administrative_share_form(literal)
     route: Path | None = None
     if admin is not None:
@@ -238,7 +249,6 @@ def _route_around_fork(literal: Path) -> Path:
                 literal,
             )
     result = route if route is not None else literal
-    _ROUTE_CACHE[key] = (now, result)
     return result
 
 
@@ -257,6 +267,12 @@ def warn_fleet_dir_virtualization_on_write(literal: Path, *, context: str) -> No
     about to replace is already forked. Callers that pass the target's
     parent directory get a per-file probe of that directory; a caller that
     passes the file itself is covered by the direct probe.
+
+    The directory-branch probe is TTL-cached (:func:`_fleet_file_findings_cached`)
+    — this guard runs on every fleet write — and skipped entirely when the
+    directory is already a UNC/routed path (its drive starts with ``\\``):
+    the administrative-share route is non-redirected by construction, so the
+    scan (which costs seconds on a UNC path) would always find nothing.
     """
     diverged = detect_path_virtualization(literal)
     if diverged is not None:
@@ -274,7 +290,9 @@ def warn_fleet_dir_virtualization_on_write(literal: Path, *, context: str) -> No
         return
     if not literal.is_dir():
         return
-    for file_literal, resolved in _fleet_file_findings(literal):
+    if literal.drive.startswith("\\"):
+        return
+    for file_literal, resolved in _fleet_file_findings_cached(literal):
         logger.warning(
             "Fleet dir virtualization detected while %s: %s resolves to %s — "
             "a per-file MSIX fork (#2806): reading this path returns the private "
@@ -307,7 +325,7 @@ def fleet_dir(*, override: str | None = None) -> Path:
     #624 behavior) and the condition is logged as a warning. Overrides and
     the env var are returned unchanged — the caller pinned that path. The
     probe is keyed on the literal default dir and cached for
-    ``_ROUTE_CACHE_TTL_SECONDS`` per process (see
+    ``_FLEET_PROBE_CACHE_TTL_SECONDS`` per process (see
     :func:`_route_around_fork`), so a fork written mid-session is detected
     at the next TTL refresh, not only at process start; scheduled tasks,
     daemons, and unpackaged terminals are unaffected, since their fleet dir
@@ -331,5 +349,4 @@ def fleet_dir(*, override: str | None = None) -> Path:
     if sys.platform == "win32":
         return _route_around_fork(_default_fleet_dir_literal())
 
-    base = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state"))
-    return base / "charlie-work"
+    return _default_fleet_dir_literal()

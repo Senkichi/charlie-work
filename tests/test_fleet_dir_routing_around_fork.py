@@ -2,8 +2,7 @@
 
 Split out of ``tests/test_fleet_dir_virtualization.py`` so neither test
 module grows past the file-size ratchet's 800-line high-water mark
-(issue #1442) while the PR #2817 rework adds TTL-cache and hermeticity
-coverage. The probe itself is in ``charlie_work.fleet_paths``.
+(issue #1442). The probe itself is in ``charlie_work.fleet_paths``.
 
 Issue #2806: MSIX/container redirection forks individual *files*, never the
 directory, so a packaged session reads a stale private registry while the
@@ -35,10 +34,10 @@ def _fresh_fleet_route_cache() -> Iterator[None]:
     """
     from charlie_work import fleet_paths
 
-    fleet_paths._ROUTE_CACHE.clear()
+    fleet_paths._FLEET_PROBE_CACHE.clear()
     fleet_paths._ADMIN_SHARE_WARNED.clear()
     yield
-    fleet_paths._ROUTE_CACHE.clear()
+    fleet_paths._FLEET_PROBE_CACHE.clear()
     fleet_paths._ADMIN_SHARE_WARNED.clear()
 
 
@@ -98,10 +97,9 @@ def test_fleet_dir_routes_to_administrative_share_when_route_exists(
     route exists, ``fleet_dir()`` returns the route.
 
     Hermetic by construction: ``Path.exists`` is faked for the admin-share
-    DIRECTORY itself (the path the code actually probes, per the PR #2817
-    review finding -- the earlier fixture faked only ``<share>/fleet.json``),
-    and every other ``\\\\localhost\\`` probe is False, so the result cannot
-    depend on the host's admin-share loopback being up.
+    DIRECTORY (the path the code actually probes) and every other
+    ``\\\\localhost\\`` probe is False, so the result cannot depend on the
+    host's admin-share loopback being up.
     """
     from charlie_work import fleet_paths
 
@@ -148,12 +146,11 @@ def test_fleet_dir_returns_literal_when_administrative_share_absent(
 def test_fleet_dir_env_and_override_bypass_routing(tmp_path: Path, monkeypatch: Any) -> None:
     """A forked pinned dir with an available route is still returned unchanged.
 
-    Both pinned dirs hold a forked file AND an existing admin-share route, so
-    this test fails if ``fleet_dir()`` ever routes an override or the
-    ``CHARLIE_WORK_FLEET_DIR`` env var (the earlier fixture left the pinned
-    dirs fork-free and route-less, so the invariant could not fail -- the PR
-    #2817 review finding). Mutation check output is in the PR body: applying
-    routing to the override/env branches makes both assertions fail.
+    Both pinned dirs hold a forked file AND an existing admin-share route,
+    so this test fails if ``fleet_dir()`` ever routes an override or the
+    ``CHARLIE_WORK_FLEET_DIR`` env var. Mutation check output is in the PR
+    body: applying routing to the override/env branches makes both
+    assertions fail.
     """
     from charlie_work import fleet_paths
 
@@ -231,14 +228,9 @@ def test_fleet_dir_route_warning_logged_once_per_process(
 def test_fleet_dir_route_probe_scans_once_within_ttl_and_reprobes_after_expiry(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
-    """Two calls inside the TTL scan the dir once; one after expiry re-probes.
-
-    PR #2817 review finding: the uncached per-call probe cost 13.0-21.2 ms
-    (median 15.1 ms) against this host's 95-file default fleet dir (reviewer
-    measured 25-32 ms at 96 files), and fleet_dir() runs on every fleet read.
-    The result is cached per literal dir for ``_ROUTE_CACHE_TTL_SECONDS``;
-    the clock here is faked, so the expiry branch is deterministic.
-    """
+    """Two fleet_dir() calls inside the TTL scan the dir once; a call after
+    expiry re-probes. The cache keeps the per-file probe off every fleet
+    read; the clock is faked so the expiry branch is deterministic."""
     from charlie_work import fleet_paths
 
     literal, _fleet_json, _redirected = _routing_fixture(monkeypatch, tmp_path)
@@ -277,7 +269,7 @@ def test_fleet_dir_route_probe_scans_once_within_ttl_and_reprobes_after_expiry(
     assert second == first
     assert len(scans) == 1, "two fleet_dir() calls inside the TTL must scan once"
 
-    clock[0] = 1000.0 + fleet_paths._ROUTE_CACHE_TTL_SECONDS + 0.001
+    clock[0] = 1000.0 + fleet_paths._FLEET_PROBE_CACHE_TTL_SECONDS + 0.001
     third = fleet_paths.fleet_dir()
     assert third == first
     assert len(scans) == 2, "a call after TTL expiry must re-probe the fleet dir"
@@ -331,7 +323,7 @@ def test_fleet_dir_route_cache_reprobes_after_mid_session_fork_appears(
     still_cached = fleet_paths.fleet_dir()
     assert still_cached == literal, "inside the TTL the old decision is kept"
 
-    clock[0] = 1000.0 + fleet_paths._ROUTE_CACHE_TTL_SECONDS + 0.001
+    clock[0] = 1000.0 + fleet_paths._FLEET_PROBE_CACHE_TTL_SECONDS + 0.001
     refreshed = fleet_paths.fleet_dir()
     assert refreshed == literal, "no route on this host: literal kept, but re-probed"
 
@@ -344,6 +336,96 @@ def test_fleet_dir_route_cache_reprobes_after_mid_session_fork_appears(
 
     monkeypatch.setattr(pathlib.Path, "exists", routable_exists)
 
-    clock[0] += fleet_paths._ROUTE_CACHE_TTL_SECONDS + 0.001
+    clock[0] += fleet_paths._FLEET_PROBE_CACHE_TTL_SECONDS + 0.001
     routed_later = fleet_paths.fleet_dir()
     assert os.path.normcase(str(routed_later)) == os.path.normcase(str(admin_dir))
+
+
+# ---------------------------------------------------------------------------
+# write guard: TTL-cached directory probe (#2806, PR #2817 rework round 3)
+# ---------------------------------------------------------------------------
+
+
+def test_warn_on_write_directory_probe_scans_once_within_ttl_and_reprobes_after_expiry(
+    tmp_path: Path, monkeypatch: Any, caplog: Any
+) -> None:
+    """Two write-guard calls with a directory argument inside the TTL scan
+    the dir once; a call after the clock expires re-probes."""
+    from charlie_work import fleet_paths
+    from charlie_work.fleet_paths import warn_fleet_dir_virtualization_on_write
+
+    fleet = tmp_path / "charlie-work"
+    fleet.mkdir(parents=True)
+    fleet_json = fleet / "fleet.json"
+    fleet_json.write_text("{}", encoding="utf-8")
+    redirected = (
+        tmp_path / "Packages" / "app" / "LocalCache" / "Local" / "charlie-work" / "fleet.json"
+    )
+    _patch_resolve_to_diverge(monkeypatch, fleet_json, redirected)
+
+    scans: list[Path] = []
+    real_findings = fleet_paths._fleet_file_findings
+
+    def counting_findings(literal_: Path) -> "list[tuple[Path, Path]]":
+        scans.append(literal_)
+        return real_findings(literal_)
+
+    monkeypatch.setattr(fleet_paths, "_fleet_file_findings", counting_findings)
+
+    clock = [1000.0]
+
+    def fake_monotonic() -> float:
+        return clock[0]
+
+    monkeypatch.setattr(fleet_paths, "_MONOTONIC", fake_monotonic)
+
+    with caplog.at_level(logging.WARNING, logger="charlie_work.fleet_paths"):
+        warn_fleet_dir_virtualization_on_write(fleet, context="writing test-a")
+        warn_fleet_dir_virtualization_on_write(fleet, context="writing test-b")
+
+    assert len(scans) == 1, "two write-guard calls inside the TTL must scan once"
+    assert len(caplog.records) == 2, "the cache skips the scan, not the warning"
+
+    clock[0] = 1000.0 + fleet_paths._FLEET_PROBE_CACHE_TTL_SECONDS + 0.001
+    with caplog.at_level(logging.WARNING, logger="charlie_work.fleet_paths"):
+        warn_fleet_dir_virtualization_on_write(fleet, context="writing test-c")
+
+    assert len(scans) == 2, "a write-guard call after TTL expiry must re-probe the fleet dir"
+    assert any("test-c" in record.message for record in caplog.records)
+
+
+def test_warn_on_write_skips_per_file_probe_for_unc_directory(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """A UNC/routed directory argument triggers zero per-file resolve() calls.
+
+    The administrative-share route is non-redirected by construction, so the
+    per-file probe there would be seconds of I/O that finds nothing. The
+    UNC dir is made to exist and resolve cleanly so this test fails if the
+    UNC skip is dropped (the probe spy would be called) regardless of
+    whether this host's admin-share loopback is up.
+    """
+    from charlie_work import fleet_paths
+    from charlie_work.fleet_paths import warn_fleet_dir_virtualization_on_write
+
+    unc_dir = fleet_paths._administrative_share_form(tmp_path / "charlie-work")
+    assert unc_dir is not None
+
+    def raising_resolve(self, *args, **kwargs):
+        raise OSError("simulated unresolvable path")
+
+    monkeypatch.setattr(pathlib.Path, "resolve", raising_resolve)
+    monkeypatch.setattr(pathlib.Path, "is_dir", lambda self, *args, **kwargs: True, raising=True)
+
+    probe_calls: list[Path] = []
+
+    def spy_findings(literal_: Path) -> "list[tuple[Path, Path]]":
+        probe_calls.append(literal_)
+        return []
+
+    monkeypatch.setattr(fleet_paths, "_fleet_file_findings", spy_findings)
+
+    # Must skip the per-file probe (and never raise: no real I/O happens).
+    warn_fleet_dir_virtualization_on_write(unc_dir, context="writing routed state")
+
+    assert probe_calls == [], "the per-file probe must be skipped for a UNC directory"

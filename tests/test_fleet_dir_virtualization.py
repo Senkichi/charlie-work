@@ -34,10 +34,10 @@ def _fresh_fleet_route_cache() -> Iterator[None]:
     """
     from charlie_work import fleet_paths
 
-    fleet_paths._ROUTE_CACHE.clear()
+    fleet_paths._FLEET_PROBE_CACHE.clear()
     fleet_paths._ADMIN_SHARE_WARNED.clear()
     yield
-    fleet_paths._ROUTE_CACHE.clear()
+    fleet_paths._FLEET_PROBE_CACHE.clear()
     fleet_paths._ADMIN_SHARE_WARNED.clear()
 
 
@@ -304,7 +304,7 @@ def test_allocation_prologue_warns_when_fleet_dir_is_virtualized(
             _run_fleet_allocation_prologue(str(fleet), config, dry_run=False)
 
     # The guard was invoked with resolved_fleet_dir (the fleet_dir() path) and
-    # the allocation-events context â€” proving the call site is wired.
+    # the allocation-events context — proving the call site is wired.
     warn_spy.assert_called_once_with(fleet, context="writing fleet allocation events")
     # The real guard fired (via wraps), so the warning reached the logger.
     assert any(
