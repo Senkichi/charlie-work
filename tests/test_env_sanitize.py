@@ -126,6 +126,24 @@ def test_sanitize_env_drops_inherited_pwd(tmp_path: Path, monkeypatch: pytest.Mo
     assert "OLDPWD" not in env
 
 
+def test_sanitize_env_drops_inherited_acp_backend(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An ambient ACP_BACKEND (the Devin Desktop integrated terminal's ACP
+    session marker, issue #2784) must never reach a worker subprocess.
+
+    With ACP_BACKEND present, devin.exe --print enforces the ACP server
+    credential policy and exits 1 with "Error: Not logged in" instead of using
+    the local CLI credentials. sanitize_env must drop it so devin-shell
+    launches from inside Devin Desktop fall back to those credentials.
+    """
+    monkeypatch.setenv("ACP_BACKEND", "devin-desktop")
+
+    env = sanitize_env(tmp_path)
+
+    assert "ACP_BACKEND" not in env
+
+
 def test_resolve_pytest_cap_default(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     worktree_path = tmp_path / "worktree"
     worktree_path.mkdir()

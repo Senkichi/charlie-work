@@ -4,7 +4,10 @@ Provides a single implementation of environment sanitization to prevent
 VIRTUAL_ENV and UV_PROJECT_ENVIRONMENT leaks from the orchestrator into
 worker sessions, and to isolate GitHub CLI authentication so workers cannot
 use the orchestrator's stored credentials. Used by claude_code, devin_shell,
-and rescue_review's cross-family adapter.
+and rescue_review's cross-family adapter. It also strips an ambient
+``ACP_BACKEND`` (issue #2784): set by the Devin Desktop integrated terminal,
+it makes devin.exe's credential loader enforce the ACP server policy and fail
+"Error: Not logged in" instead of using local CLI credentials.
 
 Security (issue #502): workers must not inherit the orchestrator's
 admin-scoped ``GH_TOKEN``/``GITHUB_TOKEN`` (or the GHES equivalents
@@ -224,6 +227,11 @@ def sanitize_env(target_path: Path, *, tmp_dir: Path | None = None) -> dict[str,
     # every shell/runtime derive PWD from the actual cwd.
     env.pop("PWD", None)
     env.pop("OLDPWD", None)
+    # Issue #2784: strip an IDE ACP session marker from the invoking terminal
+    # (e.g. a Devin Desktop integrated terminal). With ACP_BACKEND present,
+    # devin.exe --print enforces the ACP server credential policy and exits 1
+    # with "Error: Not logged in" even when local CLI credentials are valid.
+    env.pop("ACP_BACKEND", None)
 
     # A .venv reparse point (junction/symlink) is a view into a shared venv,
     # not an owned local venv. Unlink it inside a worktree so uv cannot
