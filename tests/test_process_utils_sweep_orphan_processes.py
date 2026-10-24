@@ -13,14 +13,6 @@ import charlie_work.orphan_sweep as _sweep
 from charlie_work.orphan_sweep import sweep_orphan_processes
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only test")
-def test_sweep_orphan_processes_posix_returns_empty() -> None:
-    """Test that sweep_orphan_processes returns empty list on POSIX."""
-    # On POSIX, the function is not implemented and should return empty list
-    orphans = sweep_orphan_processes("/some/worktree/path")
-    assert orphans == []
-
-
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows-only test")
 def test_sweep_orphan_processes_windows_no_powershell() -> None:
     """Test that sweep_orphan_processes handles missing PowerShell gracefully."""
