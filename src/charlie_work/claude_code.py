@@ -59,6 +59,7 @@ from .throttle_signatures import (
     match_throttle_tail,
 )
 from .attempt_resume import apply_resume_notice
+from .iso_timestamp import parse_iso_timestamp
 from .worktree import (
     LiveWorkerRedispatchError,
     ReworkBranchConflictError,
@@ -547,6 +548,51 @@ def parse_claude_events(events_path: Path) -> ClaudeProgress | None:
         tokens=tokens,
         cost_usd=cost_usd,
     )
+
+
+def last_tool_call_timestamp(events_path: Path) -> datetime | None:
+    """Timestamp of the most recent tool call in a Claude Code events file.
+
+    One parser for the ``--output-format stream-json`` schema, beside
+    ``parse_claude_events`` (the two agree on what a tool call is: real
+    stream-json emits no ``tool_call`` event type — a tool call is an
+    ``assistant`` event carrying at least one ``tool_use`` content block,
+    timed by that event's top-level ISO ``timestamp``, which only
+    ``assistant`` and ``user`` events carry). The legacy simplified shape
+    ``{"type": "tool_call", "timestamp": ...}`` is still accepted so
+    adapters that emit it keep working.
+
+    Reads through ``iter_claude_events`` (the shared tolerant line-by-line
+    primitive): non-JSON and partial trailing lines — a session that is
+    still writing the file — are skipped, never raised. The last valid
+    tool-call timestamp in file order wins (the file is append-only).
+
+    Returns None for a missing file (absence is a valid, non-error state
+    matching ``parse_claude_events``), an unreadable one, or one with no
+    tool call.
+
+    Args:
+        events_path: Path to the events.jsonl file
+    """
+    last: datetime | None = None
+    for event in iter_claude_events(events_path):
+        if event.get("type") == "tool_call":
+            parsed = parse_iso_timestamp(event.get("timestamp"))
+            if parsed is not None:
+                last = parsed
+            continue
+        if event.get("type") != "assistant":
+            continue
+        message = event.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list) or not any(
+            isinstance(block, dict) and block.get("type") == "tool_use" for block in content
+        ):
+            continue
+        parsed = parse_iso_timestamp(event.get("timestamp"))
+        if parsed is not None:
+            last = parsed
+    return last
 
 
 def _write_json_atomic(path: Path, value: dict[str, Any]) -> None:
@@ -1706,5 +1752,6 @@ __all__ = [
     "ClaudeProgress",
     "parse_claude_events",
     "iter_claude_events",
+    "last_tool_call_timestamp",
     "_events_path",
 ]
