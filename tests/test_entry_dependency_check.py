@@ -35,6 +35,8 @@ import types
 
 import pytest
 
+from charlie_work.supervise_loop import EXIT_RESTART_REQUESTED, PREFLIGHT_REFUSAL_EXIT_CODE
+
 _ENTRY = importlib.import_module("charlie_work._entry")
 _MODULE_MAIN = importlib.import_module("charlie_work.__main__")
 
@@ -90,11 +92,11 @@ def _install_metadata(
     return looked_up
 
 
-def _stub_cli(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+def _stub_cli(monkeypatch: pytest.MonkeyPatch, return_value: int = 0) -> list[int]:
     """Plant ``charlie_work.cli`` in sys.modules without importing the real one."""
     calls: list[int] = []
     stub = types.ModuleType("charlie_work.cli")
-    stub.main = lambda: calls.append(1) or 0  # type: ignore[attr-defined]
+    stub.main = lambda: calls.append(1) or return_value  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "charlie_work.cli", stub)
     return calls
 
@@ -189,6 +191,34 @@ def test_satisfied_requirements_reach_cli_main(monkeypatch: pytest.MonkeyPatch) 
     calls = _stub_cli(monkeypatch)
 
     assert _ENTRY.main() == 0
+    assert calls == [1], "cli.main was never reached despite a satisfied environment"
+
+
+@pytest.mark.parametrize(
+    "cli_exit_code",
+    [0, EXIT_RESTART_REQUESTED, PREFLIGHT_REFUSAL_EXIT_CODE],
+    ids=["clean-exit-0", "restart-requested", "preflight-refusal"],
+)
+def test_main_returns_cli_exit_code_unchanged(
+    monkeypatch: pytest.MonkeyPatch, cli_exit_code: int
+) -> None:
+    """``_entry.main()`` returns whatever ``cli.main()`` returned, unchanged.
+
+    ``cli.main`` returns more than 0 and success: ``EXIT_RESTART_REQUESTED``
+    is a cross-version wire contract (ADR-0004, #862) the supervise-loop
+    wrapper reads to decide to relaunch, and ``PREFLIGHT_REFUSAL_EXIT_CODE``
+    (#1363) is a distinct refusal the operator must be able to tell apart
+    from a clean exit. ``_entry.main`` is the new console entry point, so a
+    ``return 0`` there -- or any code between cli and the caller -- would
+    make a restart request read as a clean exit: #862, reintroduced through
+    the very seam this PR adds. The stubbed return is parametrized over both
+    constants (imported, never hard-coded, so a renumber turns this loud)
+    plus plain 0, and each must come back through ``_entry.main`` verbatim.
+    """
+    _install_metadata(monkeypatch, _SATISFYING)
+    calls = _stub_cli(monkeypatch, return_value=cli_exit_code)
+
+    assert _ENTRY.main() == cli_exit_code
     assert calls == [1], "cli.main was never reached despite a satisfied environment"
 
 
