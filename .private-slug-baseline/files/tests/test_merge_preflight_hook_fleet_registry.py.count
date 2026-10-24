@@ -1,0 +1,3 @@
+2
+# issue #2806: new test file simulating a virtualized fleet dir mentions both private sibling repos in its _FLEET_REPOS fixture tuple.
+
