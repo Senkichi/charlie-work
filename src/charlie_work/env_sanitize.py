@@ -93,6 +93,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from . import layout
+from .ledger_context import ledger_env
+from .test_slots import ROLE_GATE, arm_env
 from .worktree import _unlink_reparse_point, is_junction
 
 # Issue #646: box-wide dispatch parallelism cap. A consuming repo's own
@@ -131,6 +133,7 @@ _UV_NO_SYNC_DEFAULT = "1"
 
 if TYPE_CHECKING:
     from .config import OrchestratorConfig
+    from .test_slots import SlotPoolConfig
 
 
 def provider_api_key_env_vars(config: "OrchestratorConfig | None") -> tuple[str, ...]:
@@ -154,8 +157,8 @@ def provider_api_key_env_vars(config: "OrchestratorConfig | None") -> tuple[str,
     strip identically.
 
     Scope note (issue #2795): sanitize_env covers worker/reviewer SESSION
-    launches, and :func:`strip_provider_api_keys` additionally covers the local
-    merge-gate suite launch (``orchestration.local_merge_gate`` ->
+    launches, and :func:`build_local_gate_env` additionally covers the local
+    merge-gate suite launch (``env_sanitize`` ->
     ``local_suite_runner.launch_suite_gate``), which runs the PR branch's
     worker-authored test suite. Other children of the orchestrator or
     supervisor process inherit ``os.environ`` raw —
@@ -210,8 +213,8 @@ def strip_provider_api_keys(
     The one implementation every env-construction site that copies the
     supervisor's ambient environment into a child process must run through
     (issue #2795): :func:`sanitize_env` for worker/reviewer session launches
-    and the local merge-gate suite launch (``orchestration.local_merge_gate``
-    -> ``local_suite_runner.launch_suite_gate``) for the gate env built from
+    and :func:`build_local_gate_env` for the local merge-gate suite launch
+    (-> ``local_suite_runner.launch_suite_gate``) built from
     ``{**os.environ, ...}`` — that child runs the PR branch's worker-authored
     test suite, so it must not inherit the supervisor's provider key either.
 
@@ -235,6 +238,29 @@ def strip_provider_api_keys(
         for env_key in key_vars:
             env.pop(env_key, None)
     return env
+
+
+def build_local_gate_env(
+    test_slots: "SlotPoolConfig",
+    issue_number: int,
+    config: "OrchestratorConfig | None",
+) -> dict[str, str]:
+    """Build the local merge-gate suite launch env (issue #2795).
+
+    The gate suite runs the PR branch's worker-authored tests, so its env is
+    the supervisor's ambient environment with the gate slot plugin armed and
+    the test ledger tagged, then the config-derived provider-key strip applied
+    AFTER the ``os.environ`` copy and BEFORE the spawn. Extracted from
+    ``orchestration.local_merge_gate`` to keep that file within its size cap;
+    ``tests/test_local_merge_gate_env.py`` drives the real gate launch path
+    through this helper.
+    """
+    gate_env = {
+        **os.environ,
+        **arm_env(test_slots, role=ROLE_GATE),
+        **ledger_env("gate", issue_number),
+    }
+    return strip_provider_api_keys(gate_env, config)
 
 
 # Env every claude-code worker launches with unless `worker_env` overrides it

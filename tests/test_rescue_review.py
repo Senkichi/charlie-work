@@ -11,14 +11,17 @@ coverage in test_feat_rescue_tier.py instead.
 
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
 import pytest
 
 from _helpers import VALID_CROSS_FAMILY_REPORT
+from _rescue_review_helpers import _rescue_marked_app
 from charlie_work import layout
 from charlie_work.rescue_review import (
+    CrossFamilyResult,
     CrossFamilyVerdict,
     run_cross_family_review,
 )
@@ -540,3 +543,40 @@ def test_dry_run_skips_cross_family_review(monkeypatch, tmp_path: Path) -> None:
     assert result.ok is False
     assert result.error == "DRY-RUN: cross-family review not executed"
     assert len(subprocess_calls) == 0  # No subprocess should be invoked
+
+
+def test_process_rescue_review_passes_config_to_run_cross_family_review(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #2795 review finding: _process_rescue_review must thread
+    ``self.config`` into run_cross_family_review so the rescue reviewer's
+    sanitized spawn env strips the api provider-key variable names configured
+    under api_worker.providers (the rescue reviewer runs from the shared main
+    checkout, whose ambient env is the supervisor's). Reverting
+    orchestration/state_rescue.py's ``config=self.config`` kwarg makes this
+    fail: the captured kwargs carry no config.
+    """
+    app = _rescue_marked_app(tmp_path)
+    captured: dict[str, object] = {}
+
+    def fake(*, config=None, **kwargs):
+        captured["config"] = config
+        kwargs["report_path"].parent.mkdir(parents=True, exist_ok=True)
+        verdict = {"decision": "approved", "summary": "ok", "required_changes": []}
+        kwargs["report_path"].write_text(
+            "# Cross-family adversarial review\n\n---\n\n"
+            f"analysis text\n\n```json\n{json.dumps(verdict)}\n```\n",
+            encoding="utf-8",
+        )
+        return CrossFamilyResult(
+            ok=True, report_path=str(kwargs["report_path"]), model=kwargs["model"], returncode=0
+        )
+
+    monkeypatch.setattr("charlie_work.workflow.run_cross_family_review", fake)
+
+    app._process_rescue_review({"pr": 456, "issue": 123})
+
+    assert captured["config"] is app.config, (
+        "_process_rescue_review must pass self.config so sanitize_env can "
+        "strip the configured api provider keys (issue #2795)"
+    )

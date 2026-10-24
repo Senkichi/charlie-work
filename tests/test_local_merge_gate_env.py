@@ -1,13 +1,14 @@
 """Issue #2795: the local merge gate's suite launch env omits provider keys.
 
-The gate env is built by copying the supervisor's ambient environment
-(``{**os.environ, ...}``) and handed to ``local_suite_runner.launch_suite_gate``,
-which executes the PR branch's worker-authored test suite. This test drives the
-real gate launch path for an approved record and asserts the env it spawns with
-lacks the configured ``api_worker.providers[*].api_key_env`` variable, while a
-control variable the supervisor sets does flow through -- so reverting the
-``strip_provider_api_keys`` call in ``orchestration.local_merge_gate`` makes it
-fail.
+The gate env is built by ``env_sanitize.build_local_gate_env``, which copies
+the supervisor's ambient environment (``{**os.environ, ...}``) and is handed
+to ``local_suite_runner.launch_suite_gate``, which executes the PR branch's
+worker-authored test suite. This test drives the real gate launch path for an
+approved record and asserts the env it spawns with lacks the configured
+``api_worker.providers[*].api_key_env`` variable, while a control variable the
+supervisor sets does flow through -- so removing the
+``strip_provider_api_keys`` call inside ``env_sanitize.build_local_gate_env``
+makes it fail.
 """
 
 from __future__ import annotations

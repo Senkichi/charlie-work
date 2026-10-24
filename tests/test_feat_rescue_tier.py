@@ -36,6 +36,7 @@ from charlie_work.state import load_state, save_state, state_lock
 from charlie_work.workflow import OrchestratorApp
 
 from _fakes_github import FakeGitHub
+from _rescue_review_helpers import _rescue_marked_app
 
 
 def _events(state, kind: str) -> list[dict]:
@@ -376,15 +377,6 @@ def test_dispatch_rework_normal_issue_unaffected_by_rescue_config(
 # --- Rescue review exit semantics: _process_rescue_review ---
 
 
-def _rescue_marked_app(tmp_path: Path, **config_kwargs) -> OrchestratorApp:
-    config = OrchestratorConfig(rescue=RescueConfig(enabled=True), **config_kwargs)
-    paths = runtime_paths(tmp_path, config.runtime.state_dir)
-    fake_gh = FakeGitHub()
-    app = OrchestratorApp(tmp_path, paths, config, fake_gh)
-    _seed_pr_state(paths, 456, 123, rescue_attempted=True, rescue_cause="rework_cycle_cap")
-    return app
-
-
 def _fake_cross_family_review(decision: str, summary: str):
     def fake(
         *,
@@ -450,43 +442,6 @@ def test_process_rescue_review_passes_a_pr_scoped_reclaimable_tmp_dir(
     # reported.
     assert captured["tmp_dir"] != app.repo_root
     assert captured["tmp_dir"] != layout.worker_tmp_dir(app.repo_root)
-
-
-def test_process_rescue_review_passes_config_to_run_cross_family_review(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Issue #2795 review finding: _process_rescue_review must thread
-    ``self.config`` into run_cross_family_review so the rescue reviewer's
-    sanitized spawn env strips the api provider-key variable names configured
-    under api_worker.providers (the rescue reviewer runs from the shared main
-    checkout, whose ambient env is the supervisor's). Reverting
-    orchestration/state_rescue.py's ``config=self.config`` kwarg makes this
-    fail: the captured kwargs carry no config.
-    """
-    app = _rescue_marked_app(tmp_path)
-    captured: dict[str, object] = {}
-
-    def fake(*, config=None, **kwargs):
-        captured["config"] = config
-        kwargs["report_path"].parent.mkdir(parents=True, exist_ok=True)
-        verdict = {"decision": "approved", "summary": "ok", "required_changes": []}
-        kwargs["report_path"].write_text(
-            "# Cross-family adversarial review\n\n---\n\n"
-            f"analysis text\n\n```json\n{json.dumps(verdict)}\n```\n",
-            encoding="utf-8",
-        )
-        return CrossFamilyResult(
-            ok=True, report_path=str(kwargs["report_path"]), model=kwargs["model"], returncode=0
-        )
-
-    monkeypatch.setattr("charlie_work.workflow.run_cross_family_review", fake)
-
-    app._process_rescue_review({"pr": 456, "issue": 123})
-
-    assert captured["config"] is app.config, (
-        "_process_rescue_review must pass self.config so sanitize_env can "
-        "strip the configured api provider keys (issue #2795)"
-    )
 
 
 def test_process_rescue_review_request_changes_escalates_with_both_artifacts(
