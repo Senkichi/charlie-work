@@ -140,9 +140,10 @@ def _fleet_file_findings_cached(literal: Path) -> list[tuple[Path, Path]]:
 def _administrative_route(literal: Path) -> Path | None:
     """The admin-share route for ``literal`` when it exists, else ``None``.
 
-    Pure decision, uncached: the caller (:func:`_fleet_probe_cached`) owns the
-    TTL so the ``exists()`` stat on the localhost admin share runs at most
-    once per TTL per dir, not on every fleet read.
+    Pure decision, uncached: the caller (:func:`_route_for`, reached from
+    :func:`_fleet_probe_cached`) owns the TTL and the findings gate so the
+    ``exists()`` stat on the localhost admin share runs at most once per TTL
+    per forked dir, not on every fleet read, and never for an unforked dir.
     """
     admin = _administrative_share_form(literal)
     if admin is None:
@@ -151,6 +152,24 @@ def _administrative_route(literal: Path) -> Path | None:
         return admin if admin.exists() else None
     except OSError:
         return None
+
+
+def _route_for(literal: Path, findings: list[tuple[Path, Path]]) -> Path | None:
+    """The route decision for one TTL generation's findings.
+
+    The single place both branches of :func:`_fleet_probe_cached` — the cold
+    freshly-scanned branch and the sentinel branch — get their route from, so
+    the "no fork: no admin-share stat" finding cannot be re-fixed on one
+    branch and silently regressed on the other (which is exactly how PR
+    #2817 rework round 8 removed the gate the cold branch already had). An
+    unforked entry (empty findings) gets ``None`` without touching the share:
+    the route only applies when a fork exists, so ``_administrative_route``
+    — and its ``exists()`` stat on the ``\\localhost\\C$`` admin share — is
+    never called for one.
+    """
+    if not findings:
+        return None
+    return _administrative_route(literal)
 
 
 def _fleet_probe_cached(
@@ -167,8 +186,9 @@ def _fleet_probe_cached(
     so far, the route slot holds ``_ROUTE_UNPROBED`` and this computes — and
     stores — the decision exactly once for the generation. An unforked entry
     (empty findings) stores ``None`` without touching the share: the route
-    only applies when a fork exists, so ``_administrative_route`` is never
-    called for one (PR #2817 rework round 8).
+    only applies when a fork exists, so ``_route_for`` (and therefore
+    ``_administrative_route``) is never called for one, on either branch
+    (PR #2817 rework round 8, gate unified in round 9).
     """
     key = os.path.normcase(os.path.abspath(str(literal)))
     now = _MONOTONIC()
@@ -176,11 +196,11 @@ def _fleet_probe_cached(
     if cached is not None and (now - cached[0]) < _FLEET_PROBE_CACHE_TTL_SECONDS:
         _stamp, findings, route = cached
         if route is _ROUTE_UNPROBED:
-            route = _administrative_route(literal) if findings else None
+            route = _route_for(literal, findings)
             _FLEET_PROBE_CACHE[key] = (cached[0], cached[1], route)
         return findings, route
     findings = _fleet_file_findings(literal)
-    route = _administrative_route(literal)
+    route = _route_for(literal, findings)
     _FLEET_PROBE_CACHE[key] = (now, findings, route)
     return findings, route
 

@@ -660,3 +660,44 @@ def test_fleet_dir_after_write_guard_makes_no_route_stat_without_fork(
     )
     assert fleet_paths.fleet_dir() == forked
     assert len(probes) - count_before == 1, "a second fleet_dir() inside the TTL adds no probe"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows-only test")
+def test_fleet_dir_cold_probe_makes_no_route_stat_without_fork(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """A cold ``fleet_dir()`` — no write-guard call first — makes zero
+    ``\\\\localhost\\`` ``exists()`` probes without a fork (across TTL
+    generations too) and exactly one with a fork (none more inside the TTL).
+
+    PR #2817 rework round 9: round 8 gated the sentinel branch but removed
+    the gate from the cold (freshly scanned) branch of ``_fleet_probe_cached``
+    — its commit message wrongly said that branch already had one — so every
+    cold unforked fleet_dir() per TTL stat on the admin share. The clock is
+    advanced past the TTL for the unforked case so the regression is caught
+    on both branches (round 8's sentinel test only covers the write-guard-
+    first order; this test covers the cold order).
+    """
+    from charlie_work import fleet_paths
+
+    # No fork: a cold fleet_dir() makes zero localhost probes, even after the
+    # fake clock passes the TTL (a new cold generation re-probes findings,
+    # which stay empty, so the route is still derived from an empty set).
+    unforked = _default_dir_fixture(monkeypatch, tmp_path / "unforked", forked=False)
+    probes, clock = _fake_fleet_clock_and_probes(monkeypatch, fleet_paths)
+    assert fleet_paths.fleet_dir() == unforked
+    assert probes == [], "a cold unforked fleet_dir() must not stat the localhost admin share"
+    clock[0] = 1000.0 + fleet_paths._FLEET_PROBE_CACHE_TTL_SECONDS + 0.001
+    assert fleet_paths.fleet_dir() == unforked
+    assert probes == [], "an unforked fleet_dir() after TTL expiry must still make zero probes"
+
+    # With a fork: a cold fleet_dir() makes exactly one localhost probe, and
+    # a second fleet_dir() inside the TTL adds none.
+    forked = _default_dir_fixture(monkeypatch, tmp_path / "forked", forked=True)
+    count_before = len(probes)
+    assert fleet_paths.fleet_dir() == forked
+    assert len(probes) - count_before == 1, (
+        "a cold forked fleet_dir() must stat the localhost admin share exactly once"
+    )
+    assert fleet_paths.fleet_dir() == forked
+    assert len(probes) - count_before == 1, "a second fleet_dir() inside the TTL adds no probe"
