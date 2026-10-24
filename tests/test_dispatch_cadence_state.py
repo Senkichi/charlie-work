@@ -150,6 +150,18 @@ def test_clear_dispatch_stale_alert_resets_on_current_pass_dispatched() -> None:
     assert cleared["dispatch_cadence"]["last_stale_alert_at"] is None
 
 
+def test_clear_dispatch_stale_alert_resets_on_not_default_host() -> None:
+    """Spec C2 host routing (issue #2821): ``not_default_host`` is an
+    observed, genuinely-idle reading -- the non-default host's own ``host:``
+    issues are simply absent. Dropping the entry from
+    ``_DISPATCH_STALE_RESOLVED_REASONS`` fails this test."""
+    state = arm_dispatch_stale_alert({}, "2026-09-21T00:00:00Z")
+
+    cleared = clear_dispatch_stale_alert(state, reason="not_default_host")
+
+    assert cleared["dispatch_cadence"]["last_stale_alert_at"] is None
+
+
 def test_clear_dispatch_stale_alert_leaves_marker_when_reason_unknown() -> None:
     """Review finding #4 (BLOCKER-adjacent MAJOR): a failed/unknown reading
     (a GitHub API blip surfacing as ``backlog_not_observed``) must not be

@@ -548,6 +548,16 @@ def test_ci_findings_header_ratio_still_matches_the_bands_own_justification() ->
     Issue #2005 added the foreign-root guard (``has_foreign_root``) inside
     ``check_dispatch_staleness`` -- body growth within an existing unit, header
     unchanged at 56 -- bringing the total to 739.
+
+    Spec C2 host routing added the ``not_default_host`` exemption arm inside
+    ``check_dispatch_staleness`` -- body growth within an existing unit, header
+    unchanged at 56 -- bringing the total to 747.
+
+    Issue #2821's review rework narrowed that arm so a non-default host's own
+    dependency-blocked backlog keeps falling through to the #1110/#1682
+    ``dependency_root_blocker_idle`` arm -- body growth (comment + a
+    parenthesised condition) within the same unit, header unchanged at 56 --
+    bringing the total to 754.
     """
     ci_findings_source = source_text(_CI_FINDINGS_PATH)
     ci_findings_lines = ci_findings_source.splitlines()
@@ -568,8 +578,8 @@ def test_ci_findings_header_ratio_still_matches_the_bands_own_justification() ->
         "ci_findings.py has genuinely changed shape, the band needs re-deriving, not "
         "this guard silently loosened"
     )
-    assert len(ci_findings_lines) == 739, (
-        f"ci_findings.py is now {len(ci_findings_lines)} lines total, expected 739 -- "
+    assert len(ci_findings_lines) == 754, (
+        f"ci_findings.py is now {len(ci_findings_lines)} lines total, expected 754 -- "
         "same drift-guard rationale as the header-length assertion above"
     )
 
