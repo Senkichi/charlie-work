@@ -305,32 +305,32 @@ def _payload(result: RepoSyncResult) -> dict[str, object]:
 # Each emitter passes a literal kind: tests/_instrumentation_kind_scanner.py reads them.
 def _emit_advanced(ctx: SyncContext, result: RepoSyncResult, *, commits: int) -> None:
     payload = {**_payload(result), "ref_only": result.ref_only, "commits": commits}
-    ctx.write_gate.log_event("main_sync_advanced", payload)
+    ctx.write_gate.log_event(kind="main_sync_advanced", payload=payload)
 
 
 def _emit_skipped(ctx: SyncContext, result: RepoSyncResult) -> None:
     payload = {**_payload(result), "paths": list(result.paths), "detail": result.detail}
-    ctx.write_gate.log_event("main_sync_skipped", payload)
+    ctx.write_gate.log_event(kind="main_sync_skipped", payload=payload)
 
 
 def _emit_deferred(ctx: SyncContext, result: RepoSyncResult, retry_at: float) -> None:
     payload = {**_payload(result), "retry_at": _iso(retry_at)}
-    ctx.write_gate.log_event("main_sync_deferred", payload)
+    ctx.write_gate.log_event(kind="main_sync_deferred", payload=payload)
 
 
 def _emit_failed(ctx: SyncContext, result: RepoSyncResult) -> None:
     payload = {**_payload(result), "stderr_tail": result.detail}
-    ctx.write_gate.log_event("main_sync_failed", payload)
+    ctx.write_gate.log_event(kind="main_sync_failed", payload=payload)
 
 
 def _emit_rolled_back(ctx: SyncContext, start: str, target: str) -> None:
     payload = {"repo": ctx.repo, "from_sha": start, "to_sha": target, "reset_to": start}
-    ctx.write_gate.log_event("main_sync_rolled_back", payload)
+    ctx.write_gate.log_event(kind="main_sync_rolled_back", payload=payload)
 
 
 def _emit_rollback_refused(ctx: SyncContext, start: str, target: str, tail: str) -> None:
     payload = {"repo": ctx.repo, "from_sha": start, "to_sha": target, "stderr_tail": tail}
-    ctx.write_gate.log_event("main_sync_rollback_refused", payload)
+    ctx.write_gate.log_event(kind="main_sync_rollback_refused", payload=payload)
 
 
 def _alarm(ctx: SyncContext, reason: str, detail: str) -> str | None:
@@ -338,5 +338,5 @@ def _alarm(ctx: SyncContext, reason: str, detail: str) -> str | None:
     if ctx.dry_run:
         return None
     payload = {"repo": ctx.repo, "reason": reason, "detail": detail}
-    ctx.write_gate.log_event("main_sync_alarm", payload)
+    ctx.write_gate.log_event(kind="main_sync_alarm", payload=payload)
     return reason
