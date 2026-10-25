@@ -50,7 +50,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from . import role_quota_ledger
+from . import layout, role_quota_ledger
 from .env_sanitize import sanitize_env
 from .instrumentation import log_event
 from .notify import emit_digest, harness_auth_alert_digest
@@ -91,22 +91,51 @@ def probe_key(harness: str) -> str:
     return f"{PROBE_KEY_PREFIX}{harness}"
 
 
+def _repo_from_worktree_path(worktree_path: str) -> str | None:
+    """The repo name a worker worktree path belongs to, or ``None`` for an unknown shape.
+
+    Two layouts put a ``worktrees`` directory in the path (``paths.worktree_roots``):
+
+    * the default, ``<repo>/.var/<state dir>/worktrees/<slug>`` -- the repo is the
+      directory that owns the ``.var`` root, *not* the state dir (``charlie-work``)
+      that sits right above ``worktrees``;
+    * the host I/O volume, ``<worker_root>/<repo name>/worktrees/<slug>`` -- the
+      repo is the component right above ``worktrees``.
+
+    ``.var`` only counts as the repo's state root when it is one or two
+    components above ``worktrees`` (``.var/worktrees`` or ``.var/<state dir>/
+    worktrees``), so a host I/O ``worker_root`` that merely contains a ``.var``
+    directory further up is not mistaken for one.
+    """
+    parts = Path(worktree_path).parts
+    for index in range(len(parts) - 1, 0, -1):
+        if parts[index] != layout.WORKTREES_DIRNAME:
+            continue
+        for var_index in (index - 1, index - 2):
+            if var_index >= 1 and parts[var_index] == ".var":
+                return parts[var_index - 1] or None
+        return parts[index - 1] or None
+    return None
+
+
 def session_repo_label(payload: Mapping[str, Any], sessions_dir: Path) -> str | None:
     """Best-effort repo name of a dead session, for the alert's "affected" list.
 
-    The sidecar carries no repo field, so it is read off the layout: the
-    component before ``worktrees`` in the session's ``worktree_path``, else the
-    directory that owns the ``.var`` state root ``sessions_dir`` lives under.
-    ``None`` when neither shape fits (the issue number is still recorded by the
-    caller's ledger write only when a repo is known).
+    The sidecar carries no repo field, so it is read off the layout: the repo
+    owning the session's ``worktree_path`` (:func:`_repo_from_worktree_path`),
+    else the directory that owns the ``.var`` state root ``sessions_dir`` lives
+    under. ``None`` when neither shape fits (the issue number is still recorded
+    by the caller's ledger write only when a repo is known).
     """
-    for raw, marker in ((payload.get("worktree_path"), "worktrees"), (str(sessions_dir), ".var")):
-        if not isinstance(raw, str) or not raw:
-            continue
-        parts = Path(raw).parts
-        for index in range(len(parts) - 1, 0, -1):
-            if parts[index] == marker:
-                return parts[index - 1] or None
+    worktree_path = payload.get("worktree_path")
+    if isinstance(worktree_path, str) and worktree_path:
+        label = _repo_from_worktree_path(worktree_path)
+        if label is not None:
+            return label
+    parts = Path(sessions_dir).parts
+    for index in range(len(parts) - 1, 0, -1):
+        if parts[index] == ".var":
+            return parts[index - 1] or None
     return None
 
 

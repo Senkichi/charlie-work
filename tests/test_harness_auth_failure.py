@@ -162,6 +162,59 @@ def test_a_dead_devin_session_is_classified_and_blocks_the_harness(tmp_path: Pat
     assert "devin-shell|*" in ledger._read_raw(ledger.ledger_path())["restrictions"]
 
 
+def test_a_host_io_worktree_death_is_attributed_to_its_repo(tmp_path: Path) -> None:
+    volume = tmp_path / "volume" / "repo" / layout.WORKTREES_DIRNAME
+
+    (kind, _), _ = _death(tmp_path, worktrees_root=volume)
+
+    assert kind == HARNESS_AUTH_FAILED_KIND
+    assert block().affected == (("repo", 123),)
+
+
+@pytest.mark.parametrize(
+    ("worktree", "expected"),
+    [
+        pytest.param(
+            Path("r") / "myrepo" / ".var" / "charlie-work" / "worktrees" / "agent-issue-9",
+            "myrepo",
+            id="default-layout-state-dir-leaf-is-not-the-repo",
+        ),
+        pytest.param(
+            Path("r") / "myrepo" / ".var" / "worktrees" / "agent-issue-9",
+            "myrepo",
+            id="default-layout-with-state-dir-var",
+        ),
+        pytest.param(
+            Path("v") / "fleet" / "myrepo" / "worktrees" / "agent-issue-9",
+            "myrepo",
+            id="host-io-volume",
+        ),
+        pytest.param(
+            Path("v") / ".var" / "fleet" / "myrepo" / "worktrees" / "agent-issue-9",
+            "myrepo",
+            id="host-io-volume-under-a-var-directory",
+        ),
+        pytest.param(Path("v") / "elsewhere" / "agent-issue-9", None, id="no-worktrees-dir"),
+        pytest.param(None, None, id="no-worktree-path"),
+    ],
+)
+def test_the_repo_label_is_read_off_each_worktree_layout(
+    tmp_path: Path, worktree: Path | None, expected: str | None
+) -> None:
+    payload = {} if worktree is None else {"worktree_path": str(tmp_path / worktree)}
+    unlabelled_sessions = tmp_path / "elsewhere" / "sessions"  # nothing to fall back on
+
+    assert harness_auth_block.session_repo_label(payload, unlabelled_sessions) == expected
+
+
+def test_the_repo_label_falls_back_to_the_var_root_the_sessions_live_under(tmp_path: Path) -> None:
+    sessions = layout.sessions_dir_default(layout.default_state_root(tmp_path / "myrepo"))
+    unknown_worktree = {"worktree_path": str(tmp_path / "scratch" / "agent-issue-9")}
+
+    assert harness_auth_block.session_repo_label(unknown_worktree, sessions) == "myrepo"
+    assert harness_auth_block.session_repo_label({}, sessions) == "myrepo"
+
+
 @pytest.mark.parametrize(
     ("terminal", "terminal_pid", "classified"),
     [
@@ -192,6 +245,56 @@ def test_a_completion_transcript_quoting_the_error_never_blocks(tmp_path: Path) 
     )
     assert control == HARNESS_AUTH_FAILED_KIND, "control: with no terminal record the line counts"
     assert kind is None
+
+
+@pytest.mark.parametrize(
+    ("prior_age", "hits"),
+    [
+        pytest.param(None, 1, id="arming-pass"),
+        pytest.param(LAPSED, 2, id="control-lapsed-window-is-another-hit"),
+    ],
+)
+def test_a_wave_dying_together_is_one_hit_charged_to_no_issue(
+    tmp_path: Path,
+    fleet: Path,
+    launched: list,
+    prior_age: timedelta | None,
+    hits: int,
+) -> None:
+    """Three workers launched in one pass all die of the auth line: the first death
+    arms the block, the other two land inside its live window -- one hit, three
+    affected issues, and none of the three deaths is charged to a cap. A block whose
+    window had already lapsed is the control: the same wave is then a second hit."""
+    app, paths = make_app(tmp_path, "a", fleet)
+    register(fleet, paths)
+    app.dispatch(limit=3)
+    assert sorted(n for n, _ in launched) == list(ISSUES), "the whole wave launched together"
+    if prior_age is not None:
+        arm(age=prior_age, repo=None, issue=None)
+
+    kinds = [
+        classify_devin_death(
+            dead_devin_session(tmp_path, NOT_LOGGED_IN + "\n", issue=n, pid=4000 + n),
+            n,
+            config=app.config,
+        )[0]
+        for n in ISSUES
+    ]
+
+    assert kinds == [HARNESS_AUTH_FAILED_KIND] * len(ISSUES)
+    for kind in kinds:
+        assert is_provider_throttle_failure(kind)
+        assert is_provider_throttle_rework_death(kind)
+        assert kind in PROVIDER_THROTTLE_EXEMPT_KINDS
+        assert persisted_failure({"dead_worker_failure_kind": kind}).is_throttle
+        verdict = redispatch_verdict(
+            ("a", "b", "c"), kind, now=datetime.now(UTC), max_auto_redispatch=3
+        )
+        assert not verdict.escalate and len(verdict.redispatch_at) == 3
+    got = block()
+    assert got.consecutive_hits == hits
+    assert got.affected == tuple(("repo", n) for n in ISSUES)
+    assert got.evidence == NOT_LOGGED_IN
 
 
 # --- accounting: charged to no cap, in any lane ----------------------------------------
@@ -304,6 +407,10 @@ def test_a_blocked_worker_chain_defers_with_no_claim(
     register(fleet, paths)
     _lane(app, lane)
     assert len(launched) == len(ISSUES), "control: unblocked, the lane launches"
+    in_progress = app.config.labels.in_progress
+    assert {n for n, label in app.gh.labels_added if label == in_progress} == set(ISSUES), (
+        "control: an unblocked launch claims each issue with the in-progress label"
+    )
     launched.clear()
     app, paths = make_app(tmp_path, "b", fleet, rework=lane == "rework")
     arm()
@@ -315,6 +422,7 @@ def test_a_blocked_worker_chain_defers_with_no_claim(
     assert result.data["chain_retry_at"]
     statuses = {i.get("status") for i in load_state(paths.state_file)["issues"].values()}
     assert statuses <= {"rework_requested"}, "no issue was claimed"
+    assert app.gh.labels_added == [], "no agent:in-progress label was written"
     assert not layout.fleet_pause_path(override=str(fleet)).exists(), "fleet pause is not used"
 
 

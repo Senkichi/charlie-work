@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from _fakes_github import FakeGitHub
-from charlie_work import role_quota_ledger
+from charlie_work import layout, role_quota_ledger
 from charlie_work.adapters import SessionDispatchResult
 from charlie_work.config import (
     DevinConfig,
@@ -190,13 +190,19 @@ def dead_devin_session(
     terminal: dict[str, Any] | None = None,
     terminal_pid: int | None = None,
     issue: int = 123,
+    worktrees_root: Path | None = None,
 ) -> Path:
     """Lay out an exited devin session; returns its ``sessions_dir``.
 
     ``terminal`` is the terminal-status record's body (``exit_code`` /
     ``worker_outcome``); it is written for ``terminal_pid`` (default: ``pid``).
+    ``worktrees_root`` is where the session's worktree lives; by default the
+    repo's real default-layout root, ``<repo>/.var/charlie-work/worktrees``
+    (what ``paths.runtime_paths`` hands dispatch), not a shape no launch produces.
     """
-    sessions_dir = tmp_path / "repo" / ".var" / "charlie-work" / "dispatches" / "sessions"
+    state_root = layout.default_state_root(tmp_path / "repo")
+    worktrees_root = worktrees_root or layout.worktrees_dir(state_root)
+    sessions_dir = layout.sessions_dir_default(state_root)
     sessions_dir.mkdir(parents=True, exist_ok=True)
     log = sessions_dir / f"issue-{issue}.log"
     log.write_text(log_text, encoding="utf-8")
@@ -206,7 +212,7 @@ def dead_devin_session(
                 "issue_number": issue,
                 "pid": pid,
                 "log_path": str(log),
-                "worktree_path": str(tmp_path / "repo" / "worktrees" / f"agent-issue-{issue}"),
+                "worktree_path": str(worktrees_root / f"agent-issue-{issue}"),
                 "role_entry": role_quota_ledger.session_stamp("worker", HARNESS, "swe-2", 0),
             }
         ),
