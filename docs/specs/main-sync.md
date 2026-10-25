@@ -14,7 +14,7 @@ A stale local main hurts in four ways:
 
 Two mechanisms exist today, and neither covers this:
 
-- **`supervise.self_deploy`** fast-forwards the checkout the supervisor runs from (`orchestrator_root()`, on the operator host `C:\Users\senki\srv\charlie-work-daemon`) once per pass, with its own restart semantics.
+- **`supervise.self_deploy`** fast-forwards the checkout the supervisor runs from (`orchestrator_root()`, on the operator host a dedicated deploy checkout) once per pass, with its own restart semantics.
 - **The operator's SessionStart `ff-sync` hook** fast-forwards a checkout once, when a session opens in it.
 
 Workers never read a local main. Each worktree branches from a freshly fetched `origin/<default>`, so fleet correctness does not depend on this feature.
@@ -58,10 +58,10 @@ It has one job: bring one registered repo's primary checkout up to `origin/<defa
 ### Trigger and scope
 
 - It runs once per full supervisor pass (the `full_pass_interval_seconds` fallback, or a local change), never on the 20-second poll.
-- It iterates the same registry the pass uses (`fleet.json` through `_select_repos`), and takes each entry's `repo_root` and `state_dir` from there. No other list of repos exists.
+- It iterates the same registry the pass uses (`fleet.json` through `fleet_registry._iter_registered_repo_contexts`, the resolver the fleet walkers share), and takes each entry's `repo_root`, `state_dir` and layered config from there. No other list of repos exists.
 - **It excludes the supervisor's own checkout, compared by resolved path** to `orchestrator_root()`, not by repo key, because `self_deploy` owns that checkout. On the operator host the `Senkichi/charlie-work` registry entry is the operator's dev checkout, a different path, so it is synced.
 - It skips repos with no `origin` remote, because the local lane owns their main.
-- Kill switches: the global `main_sync.enabled` and the per-repo `main_sync.enabled`, both defaulting to true.
+- Kill switches: `main_sync.enabled`, defaulting to true. Set it in the fleet-wide `<fleet_dir>/config.yaml` layer to turn it off everywhere, or in one repo's `orchestrator.config.yaml` for that repo; the registry walker merges both layers.
 - A wall-clock budget covers the whole step. When it runs out, the remaining repos are skipped with `budget_exhausted` and go first on the next pass.
 
 ### Classification
@@ -72,7 +72,7 @@ After `git fetch origin <default>` (through `run_git_with_retry`, with a short t
 |---|---|---|
 | Up to date | none | none |
 | On the default branch, behind, worktree clean or dirty only in paths the incoming range does not touch | `git merge --ff-only origin/<default>` | `main_sync_advanced` |
-| On another branch, and local `<default>` behind and not ahead | `git fetch origin <default>:<default>` (moves the ref, working tree untouched) | `main_sync_advanced` with `ref_only: true` |
+| On another branch, and local `<default>` behind and not ahead | `git update-ref refs/heads/<default> <origin sha> <local sha>`, a compare-and-swap against the sha just classified (moves the ref, working tree untouched). Skipped as `checked_out_elsewhere` when a linked worktree has `<default>` checked out | `main_sync_advanced` with `ref_only: true` |
 | No merge-base between local `<default>` and origin | skip | `main_sync_skipped` reason `unrelated_history`, plus an alarm on first sight |
 | Local `<default>` ahead or diverged, with a merge-base | skip | `main_sync_skipped` reason `diverged` |
 | Dirty tracked files overlap the incoming paths, or untracked files would be overwritten | skip, listing the paths | `main_sync_skipped` reason `blocked` |
@@ -90,24 +90,23 @@ This is opt-in, set per repo in that repo's `orchestrator.config.yaml`:
 ```yaml
 main_sync:
   enabled: true
-  post_sync:
-    command: ["uv", "sync", "--locked"]          # argv list, run with cwd = checkout root
-    when_paths: ["uv.lock", "pyproject.toml"]   # optional; default: run on every advance
-    timeout_seconds: 300
+  post_sync_command: ["uv", "sync", "--locked"]       # argv list, run with cwd = checkout root
+  post_sync_when_paths: ["uv.lock", "pyproject.toml"]  # fnmatch patterns; empty: run on every advance
+  post_sync_timeout_seconds: 300
 ```
 
-- It is parsed into a frozen dataclass, like all config. `command` is an argv list and never goes through a shell.
+- It is parsed into a frozen dataclass (`MainSyncConfig`), like all config. Config sections do not nest, so the keys are flat. `post_sync_command` is an argv list and never goes through a shell. An empty `post_sync_command` means no `post_sync`.
 - It runs only after a successful working-tree fast-forward (never after a ref-only update, where the working tree did not change), and only when the incoming range touches `when_paths`.
 - **Exit 0:** the advance is final.
 - **Partial fast-forward.** When the incoming range touches `when_paths`, main_sync first fast-forwards to the last commit *before* the first commit that touches them. That step needs no `post_sync`, so commits that don't change deps keep landing while a deferred one waits. Only the remainder of the range goes through `post_sync`.
-- **Exit 75 (`EX_TEMPFAIL`, "not now", e.g. the repo's venv is in use):** roll back the remainder with `git reset --keep <from_sha>`. A defer does not count as a failure. Retries back off, doubling from one pass to at most 60 minutes, so a checkout under a live session does not flip back and forth every pass. After 4h of continuous deferral, raise an alarm once, and never force the command.
-- **Any other exit, or a timeout:** roll back the same way. Event `main_sync_failed` with the stderr tail. Three consecutive failures raise an alarm once, and a success resets the count.
-- **Rollback refused** (`--keep` refuses to discard local changes): event `main_sync_rollback_refused` and an immediate alarm.
+- **Exit 75 (`EX_TEMPFAIL`, "not now", e.g. the repo's venv is in use):** roll back the remainder with `git reset --keep <from_sha>`. A defer does not count as a failure. Retries back off, doubling from 5 minutes to at most 60 minutes, so a checkout under a live session does not flip back and forth every pass. After 4h of continuous deferral, raise an alarm once, and never force the command.
+- **Any other exit, or a timeout:** roll back the same way. Event `main_sync_failed` with the stderr tail. Retries back off on the same schedule (keyed on the failure count), so a broken `post_sync` does not advance and roll back every pass. Three consecutive failures raise an alarm once, and a success resets the count.
+- **Rollback refused** (`--keep` refuses to discard local changes): event `main_sync_rollback_refused` and an immediate alarm. The tree stays at the new sha, so the marker is written for it.
 - **Why roll back:** #2312. For a repo that declares a runtime, the committed tree and that runtime must never disagree. Otherwise the next unrelated restart of that runtime starts on a tree its environment cannot run.
 
 ### Telling live sessions
 
-**Marker, written by charlie-work.** Path: `<git-common-dir>/charlie-main-sync.json`. It is written through `atomic_write.write_json_atomic` only once an advance is final: after `post_sync` exits 0, or right after the fast-forward when no `post_sync` applies. A rolled-back advance never writes it. It is overwritten on each advance and never deleted.
+**Marker, written by charlie-work.** Path: `<git-common-dir>/charlie-main-sync.json`. It is written through `atomic_write.write_json_atomic` only once a working-tree advance is final: after `post_sync` exits 0, or right after the fast-forward when no `post_sync` applies. A partial fast-forward and its remainder produce one marker, covering the full move. When the remainder is deferred or rolled back, the marker covers the partial move that stands. A rolled-back range never appears in one, and a ref-only update writes none, because the files on disk did not change. It is overwritten on each advance and never deleted.
 
 ```json
 {"schema": 1, "from": "<sha>", "to": "<sha>", "commits": 4,
@@ -130,15 +129,15 @@ main_sync:
 
 ### Observability and alarms
 
-- **Events** go to the repo's own `events.db`, under `state_dir` from the registry, through `log_event`: `main_sync_advanced`, `main_sync_skipped`, `main_sync_deferred`, `main_sync_failed`, `main_sync_rolled_back`, `main_sync_rollback_refused` and `main_sync_alarm`. Each carries `repo`, `from_sha`, `to_sha` and, where relevant, `reason`, `paths` and `stderr_tail`.
+- **Events** go to the repo's own `events.db`, under `state_dir` from the registry, through a per-repo `WriteGate` (`write_gate.log_event`, whose dry-run path writes nothing): `main_sync_advanced`, `main_sync_skipped`, `main_sync_deferred`, `main_sync_failed`, `main_sync_rolled_back`, `main_sync_rollback_refused` and `main_sync_alarm`. Each carries `repo`, `from_sha`, `to_sha` and, where relevant, `reason`, `paths` and `stderr_tail`.
 - **Alarm counters**, one per repo and stored in the fleet dir through atomic writes, follow the `_record_self_deploy_failure_streak` pattern:
   - 3 consecutive failures;
   - 4h of deferral;
   - unrelated history, on first sight;
   - a refused rollback, at once.
 
-  Each alarm fires once and resets on the next success.
-- **Dry run:** under `--dry-run` main_sync classifies and logs what it would do. It never fetches into local refs, fast-forwards, runs `post_sync` or writes the marker (#613).
+  Each alarm fires once and resets on the next success. An alarm also reaches the operator as an `ERROR` fleet attention entry (`adapter_kind` `main-sync <repo>`). The success that clears it emits `OK` for the same key, so the transition baseline does not latch (#817).
+- **Dry run:** under `--dry-run` main_sync skips the fetch, classifies against the remote-tracking ref as it already is, and prints what it would do. It never fetches, fast-forwards, updates a ref, runs `post_sync`, writes the marker, or writes events or state (#613).
 
 ## Testing
 
@@ -163,7 +162,7 @@ main_sync:
 ## Rollout
 
 - Ships ON, as a pass step after `self_deploy`. The fleet is paused today (`fleet-pause.json`), so nothing changes until `fleet resume`.
-- **Live check:** after the first full pass, expect one `main_sync_advanced` or `main_sync_skipped` row in the `events.db` of each non-supervisor registry repo (`claude-config`, `job-cannon`, `swole`, and the charlie-work dev checkout). The dev checkout should report `unrelated_history` until the operator resets it.
+- **Live check:** after the first full pass, expect one `main_sync_advanced` or `main_sync_skipped` row in the `events.db` of each non-supervisor registry repo, the charlie-work dev checkout included. The dev checkout should report `unrelated_history` until the operator resets it.
 
 ## Out of scope
 
