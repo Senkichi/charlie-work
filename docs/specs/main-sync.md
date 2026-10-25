@@ -162,7 +162,7 @@ main_sync:
 ## Rollout
 
 - Ships ON, as a pass step after `self_deploy`. The fleet is paused today (`fleet-pause.json`), so nothing changes until `fleet resume`.
-- **Live check:** after the first full pass, expect one `main_sync_advanced` or `main_sync_skipped` row in the `events.db` of each non-supervisor registry repo, the charlie-work dev checkout included. The dev checkout should report `unrelated_history` until the operator resets it.
+- **Live check:** after the first full pass, expect a `main_sync_advanced` or `main_sync_skipped` row in the `events.db` of each non-supervisor registry repo that was behind origin (an up-to-date repo is silent), the charlie-work dev checkout included. The dev checkout should report `unrelated_history` until the operator resets it.
 
 ## Out of scope
 
