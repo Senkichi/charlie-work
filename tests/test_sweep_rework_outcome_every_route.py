@@ -4,7 +4,7 @@ The rework brief promises "the orchestrator applies them to the PR for you", but
 sweep queued the apply only inside ``_completed_outcome`` -- reached solely from the
 same-head branches. The head-changed route, the unreviewed route and the drift
 fallback never read the outcome, so the edit was dropped without an event and the
-reviewer read the stale body (Senkichi/ci_runners#336 / PR 339).
+reviewer read the stale body (the sibling-repo incident that motivated #2826).
 
 Beds are the shared ``_dead_worker_rework_bed`` family; the helper below only adds the
 head-changed / unreviewed / drift variants the existing characterization module keeps
@@ -455,11 +455,11 @@ def test_kill_switch_off_same_head_route_still_applies_once(
 
 
 # ---------------------------------------------------------------------------
-# Criterion 12: replay of the ci_runners#336 shapes on one issue, in order
+# Criterion 12: replay of the #2826 incident shapes on one issue, in order
 # ---------------------------------------------------------------------------
 
 
-def test_replay_ci_runners_336_three_rounds_apply_once_per_distinct_head(
+def test_replay_incident_three_rounds_apply_once_per_distinct_head(
     tmp_path: Path, monkeypatch
 ) -> None:
     """Round 1 head-changed, rounds 2 and 3 unreviewed: three applies, one per head."""
