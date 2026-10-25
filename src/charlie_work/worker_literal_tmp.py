@@ -73,9 +73,10 @@ def literal_tmp_shell_commands(events_source: Path | str) -> list[str]:
     ``events_source`` is anything :func:`iter_claude_events` can read -- a
     tee'd ``.events.jsonl`` sidecar, or the session's ``.claude.log``,
     which carries the identical stream-json when ``tee_stream_json`` is
-    enabled (always true for api sessions). A plain-text log from a
-    non-tee session yields no events, so the scan is a silent no-op there;
-    the prompt instruction is the primary mitigation for that gap.
+    enabled (the default for claude-code workers since #2814, and always
+    for api sessions). A non-tee log (``tee_stream_json: false``) yields
+    no events, so the scan is a silent no-op there; the prompt
+    instruction is the primary mitigation for that gap.
 
     Only ``assistant`` events' ``tool_use`` blocks carrying an
     ``input.command`` string are inspected -- the shell-command surface
@@ -126,12 +127,12 @@ def emit_literal_tmp_path_warning(
     Git-Bash shell-command surface the hazard applies to, and the only
     adapters whose logs carry stream-json. The scan reads the session's
     own log via :func:`iter_claude_events`: api sessions always tee
-    stream-json (claude-code sessions when ``tee_stream_json`` is
-    configured), exposing the Bash ``tool_use`` commands; a non-tee
-    plain-text log yields no tool calls and the scan is a silent no-op
-    there — the prompt instruction is the primary mitigation for that
-    gap. The scan never raises (unusable input is an empty result), so it
-    cannot break the reap pass.
+    stream-json and claude-code sessions tee by default (#2814, kill
+    switch ``tee_stream_json: false``), exposing the Bash ``tool_use``
+    commands; a non-tee plain-text log yields no tool calls and the scan
+    is a silent no-op there — the prompt instruction is the primary
+    mitigation for that gap. The scan never raises (unusable input is an
+    empty result), so it cannot break the reap pass.
 
     The event is warning-level, not error: the reaped session's own work
     may be fine — the hazard is cross-session scratch-file corruption on
