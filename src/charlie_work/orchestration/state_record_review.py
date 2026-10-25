@@ -20,6 +20,7 @@ from charlie_work.review_decision import (
     record_decision,
     reclassify_human_call_verdict,
 )
+import charlie_work.review_interdiff as _review_interdiff
 import charlie_work.workflow as _wf
 from charlie_work.command_result import CommandResult
 
@@ -639,6 +640,19 @@ def record_review(
         # other three record_decision sites), not the _wf. attribute form --
         # all four sites share one binding style by convention.
         record_decision(pr_dir, decision_payload, None)
+        # Issue #2837: archive this round's diff.patch alongside the decision,
+        # so the next packet can build a PR-relative interdiff from it. The
+        # live pr_dir/diff.patch belongs to the packet the reviewer just read
+        # (record_review's head CAS guard proves it matches this verdict's
+        # head), and the next review() call overwrites it in place -- so the
+        # copy MUST land now, in the same round directory. The #1695
+        # void-archive path (record_decision with a carried-forward payload)
+        # deliberately does NOT copy: there diff.patch was already overwritten
+        # with the NEW head's diff, and pairing them would fabricate evidence.
+        # Legacy rounds (recorded before #2837) have no diff.patch; the packet
+        # builder then falls back to ``gh.compare_diff``,
+        # emitting a ``review_interdiff_fallback`` event.
+        _review_interdiff.archive_round_diff(pr_dir, round_dir)
         if decision == "request_changes" and not escalated:
             rework_path = str(self._write_rework_prompt(pr, issue_number, rework_summary))
             # Archived alongside the decision above, same round_dir: this
