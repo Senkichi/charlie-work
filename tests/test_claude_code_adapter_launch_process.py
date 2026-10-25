@@ -237,30 +237,25 @@ def test_launch_claude_worker_tee_stream_json_writes_to_both_files(
 def test_launch_claude_worker_tee_stream_json_popen_failure_closes_handles(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Regression test: in the tee_stream_json branch, log_handle/events_handle
-    are opened without a `with` block so the background tee thread can own their
-    lifecycle (closing them itself once the process exits). But if
-    subprocess.Popen raises before the thread ever starts, nobody closes them.
-    Popen failure must close both handles before the OSError propagates.
-    """
-    from unittest.mock import patch
+    """Regression test (issue #2814 rework): the tee is now a splitter child
+    process whose stdin the launcher owns until the worker spawn hands it
+    over. When Popen raises, launch still returns an error record (never
+    raises) and the splitter's stdin is closed so the splitter reads EOF and
+    exits instead of lingering on a pipe nobody will ever write to."""
+    from unittest.mock import MagicMock, patch
+
+    class FakeStdin:
+        closed = False
+
+        def close(self):
+            self.closed = True
 
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     sessions_dir = tmp_path / "sessions"
     _install_fake_create_worktree(monkeypatch, tmp_path)
 
-    opened_handles: list = []
-    original_open = Path.open
-
-    def tracking_open(self, *args, **kwargs):
-        handle = original_open(self, *args, **kwargs)
-        if self.name.endswith((".claude.log", ".events.jsonl")):
-            opened_handles.append(handle)
-        return handle
-
-    monkeypatch.setattr(Path, "open", tracking_open)
-
+    # Splitter spawn fails: the error record must name the splitter.
     with patch("subprocess.Popen", side_effect=OSError("mock spawn failure")):
         record = launch_claude_worker(
             161,
@@ -274,9 +269,33 @@ def test_launch_claude_worker_tee_stream_json_popen_failure_closes_handles(
 
     assert not record.ok
     assert record.error is not None
-    assert "failed to launch claude" in record.error
+    assert "failed to launch tee splitter" in record.error
+    assert "failed to launch claude" not in record.error
 
-    assert len(opened_handles) == 2, "expected exactly log_handle and events_handle to be opened"
-    assert all(handle.closed for handle in opened_handles), (
-        "log_handle/events_handle must be closed when Popen fails, not leaked"
-    )
+    # Splitter up but the Worker spawn fails: the splitter's stdin is closed
+    # so it exits on EOF.
+    fake_stdin = FakeStdin()
+    fake_splitter = MagicMock(spec=["stdin", "pid"], stdin=fake_stdin, pid=4242)
+    popen_calls: list[int] = []
+
+    def first_popen_fails(*args, **kwargs):
+        popen_calls.append(1)
+        if len(popen_calls) == 1:
+            return fake_splitter
+        raise OSError("mock worker spawn failure")
+
+    with patch("subprocess.Popen", side_effect=first_popen_fails):
+        record = launch_claude_worker(
+            162,
+            "agent/issue-162-worker-popen-failure",
+            "prompt text",
+            repo_root=repo_root,
+            sessions_dir=sessions_dir,
+            command_template=("claude",),
+            tee_stream_json=True,
+        )
+
+    assert not record.ok
+    assert record.error is not None
+    assert "failed to launch claude" in record.error
+    assert fake_stdin.closed

@@ -53,6 +53,7 @@ from typing import TYPE_CHECKING, Any
 
 from .atomic_write import write_json_atomic
 from .config import OrchestratorConfig, PostMortemConfig, SignatureRule, WatchdogConfig
+from .failure_classifier import signature_match_text
 
 if TYPE_CHECKING:
     from .attempt_refs import AttemptSnapshot
@@ -1378,7 +1379,8 @@ def _classify_worker_blocked_from_log_tail(
     ``kind == "worker_blocked"``) rather than adding a parallel config
     surface — see that field's docstring. Matches against the last 2KB of
     the log, mirroring ``worker_fate.classify_for``'s tail
-    window.
+    window, through ``failure_classifier.signature_match_text`` (stream-json
+    event bodies excluded — issue #2814 rework).
 
     A ``worker_blocked`` verdict from this function must never carry
     throttle retry semantics (no ``throttled_until``) — provider-throttle
@@ -1394,11 +1396,16 @@ def _classify_worker_blocked_from_log_tail(
     except OSError:
         return False
     tail = log_text[-2048:] if len(log_text) > 2048 else log_text
+    # Stream-json-aware matching (issue #2814 rework): a ``tool_result`` that
+    # merely quotes a block signature is the worker observing a block, not
+    # the Devin CLI surfacing one — match the rules against
+    # ``signature_match_text`` so event bodies are excluded.
+    match_text = signature_match_text(tail)
     for rule in signature_rules:
         if rule.kind != "worker_blocked":
             continue
         try:
-            if re.search(rule.pattern, tail, re.IGNORECASE):
+            if re.search(rule.pattern, match_text, re.IGNORECASE):
                 return True
         except re.error:
             # A malformed pattern would already have been rejected at

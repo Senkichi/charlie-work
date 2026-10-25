@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import subprocess
+import sys
 import uuid
 from collections.abc import Callable, Iterator
 from dataclasses import asdict, dataclass
@@ -78,6 +79,19 @@ from .worktree import (
 PROMPT_FILENAME = CLAUDE_CODE_PROMPT_FILENAME
 
 logger = logging.getLogger(__name__)
+
+# The tee-splitter child script spawned by ``launch_claude_worker`` when
+# ``tee_stream_json`` is on: it owns the read end of the worker's stdout pipe
+# so the log and the events.jsonl keep being written even after the launching
+# supervisor exits (issue #2814 rework).
+_TEE_SPLITTER_PATH = Path(__file__).with_name("tee_splitter.py")
+
+
+def tee_splitter_path() -> Path:
+    """Path to the tee-splitter script ``launch_claude_worker`` spawns as the
+    tee child (tests spawn it directly to pin its pipe-survival contract)."""
+    return _TEE_SPLITTER_PATH
+
 
 # Provider authentication failures (issue #484): matched against the log tail
 # of api-kind sessions only — a dead/invalid API key against a custom
@@ -1359,14 +1373,48 @@ def launch_claude_worker(
     uv_no_sync, uv_no_sync_source = resolve_uv_no_sync(worktree.path, sanitized_env, env)
 
     try:
-        # If tee_stream_json is enabled, we need to tee stdout to both log and events file
-        # Use subprocess.PIPE and a thread to write to both files
+        # If tee_stream_json is enabled, we need to tee stdout to both the log
+        # and the events file. The tee is a separate child process
+        # (``tee_splitter.py``) that owns the pipe's read end: the worker CLI's
+        # stdout is wired to the splitter's stdin, so the pipe survives the
+        # launching supervisor process exiting (self-deploy restart, fleet
+        # pause). Issue #2814 rework: with the previous
+        # ``subprocess.PIPE`` + launcher daemon-thread drain, every tee'd
+        # worker was a restart casualty — the supervisor's exit closed the
+        # pipe and the worker's next stdout write failed (measured on this
+        # host: ``OSError: [Errno 22] Invalid argument`` on Windows, a broken
+        # pipe on POSIX), killing any session unlucky enough to print.
         if tee_stream_json and events_path:
-            # Open handles without 'with' blocks - the thread will manage their lifecycle
-            # This is necessary because the thread runs as a daemon and must keep handles
-            # open for the entire worker lifetime, not just during launch
-            log_handle = log_path.open("w", encoding="utf-8", errors="replace")
-            events_handle = events_path.open("w", encoding="utf-8", errors="replace")
+            try:
+                tee_splitter = popen_worker(
+                    (
+                        sys.executable,
+                        str(_TEE_SPLITTER_PATH),
+                        str(log_path),
+                        str(events_path),
+                    ),
+                    priority=CpuPriority.NORMAL,
+                    stdin=subprocess.PIPE,
+                    env=worker_env,
+                )
+            except OSError as exc:
+                _teardown_on_launch_failure()
+                record = _error_record(
+                    issue_number=issue_number,
+                    branch=branch,
+                    worktree_path=str(worktree.path),
+                    prompt_path=str(prompt_path),
+                    command=command_template,
+                    log_path=str(log_path),
+                    error=f"failed to launch tee splitter: {exc}",
+                    adapter_kind=adapter_kind,
+                    provider=provider,
+                    state_path=launch_state_path,
+                    role=launch_role,
+                    model=pinned_model,
+                    error_class=launch_events.LAUNCH_ERR_SPAWN,
+                )
+                return _write_record(sessions_dir, record)
 
             try:
                 if feed_stdin:
@@ -1377,11 +1425,10 @@ def launch_claude_worker(
                             priority=CpuPriority.BELOW_NORMAL,
                             cwd=str(worktree.path),
                             stdin=prompt_handle,
-                            stdout=subprocess.PIPE,
+                            stdout=tee_splitter.stdin,
                             stderr=subprocess.STDOUT,
                             env=worker_env,
                             start_new_session=(os.name != "nt"),
-                            text=True,
                         )
                     finally:
                         prompt_handle.close()
@@ -1391,47 +1438,23 @@ def launch_claude_worker(
                         priority=CpuPriority.BELOW_NORMAL,
                         cwd=str(worktree.path),
                         stdin=subprocess.DEVNULL,
-                        stdout=subprocess.PIPE,
+                        stdout=tee_splitter.stdin,
                         stderr=subprocess.STDOUT,
                         env=worker_env,
                         start_new_session=(os.name != "nt"),
-                        text=True,
                     )
             except OSError:
-                # Popen failed before the tee thread could start — nobody else
-                # will ever close these, so close them here. The outer
+                # Worker spawn failed after the splitter was up: release the
+                # splitter's stdin so it reads EOF and exits; the outer
                 # `except OSError` below still handles worktree cleanup and
                 # the error record.
-                log_handle.close()
-                events_handle.close()
+                tee_splitter.stdin.close()
                 raise
 
-            # Start a thread to tee output to both files
-            def _tee_output():
-                try:
-                    for line in process.stdout:
-                        log_handle.write(line)
-                        log_handle.flush()
-                        events_handle.write(line)
-                        events_handle.flush()
-                except Exception:
-                    # Thread dies if process terminates or pipe breaks
-                    pass
-                finally:
-                    # Close handles when thread exits
-                    try:
-                        log_handle.close()
-                    except Exception:
-                        pass
-                    try:
-                        events_handle.close()
-                    except Exception:
-                        pass
-
-            import threading
-
-            tee_thread = threading.Thread(target=_tee_output, daemon=True)
-            tee_thread.start()
+            # Hand the pipe write end to the worker process entirely: only
+            # the worker holds it now, so the splitter keeps draining for the
+            # worker's whole lifetime regardless of our lifecycle.
+            tee_splitter.stdin.close()
         else:
             # Original behavior: direct stdout to log file
             with log_path.open("w", encoding="utf-8", errors="replace") as log_handle:

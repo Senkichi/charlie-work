@@ -50,6 +50,7 @@ from typing import TYPE_CHECKING, Any
 
 from . import role_quota_ledger, worker_fate
 from .dispatch_selection import _credit_worker_death
+from .failure_classifier import signature_match_text
 from .rework_attempt_exemption import (
     exempt_provider_throttle_rework_death,
     is_provider_throttle_rework_death,
@@ -281,17 +282,22 @@ def _terminal_is_throttle_error(
 
     Covers every family ``PROVIDER_THROTTLE_EXEMPT_KINDS`` admits: provider auth
     errors only for the adapter whose profile detects account errors (api), the
-    quota signature, then the generic throttle markers.
+    quota signature, then the generic throttle markers. Matching runs over
+    ``failure_classifier.signature_match_text`` (issue #2814 rework): in a
+    stream-json terminal window only non-event lines (merged stderr) and the
+    CLI's own error output may carry a signature — a ``tool_result`` quoting
+    one is the worker observing an error, not a throttle death.
     """
+    match_text = signature_match_text(terminal)
     if (
         profile is not None
         and profile.account_error_detection
-        and is_provider_auth_failure(terminal)
+        and is_provider_auth_failure(match_text)
     ):
         return True
-    if match_quota_tail(terminal, config.runtime.quota_error_markers):
+    if match_quota_tail(match_text, config.runtime.quota_error_markers):
         return True
-    matched, _ = match_throttle_tail(terminal, config.runtime.throttle_error_markers)
+    matched, _ = match_throttle_tail(match_text, config.runtime.throttle_error_markers)
     return matched
 
 

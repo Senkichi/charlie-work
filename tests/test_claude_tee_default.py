@@ -22,7 +22,9 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
+import textwrap
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -124,7 +126,7 @@ def test_default_settings_launch_command_carry_stream_json_flags(
     assert "stream-json" in result.command
     assert "--verbose" in result.command
     assert result.pid is not None
-    assert events_path.exists()
+    assert _await_events_sidecar(events_path)
 
 
 def test_tee_off_config_launches_without_stream_json_flags(tmp_path: Path, monkeypatch) -> None:
@@ -152,6 +154,17 @@ claude_code:
     assert "--verbose" not in result.command
     assert not events_path.exists()
     assert sessions_dir is not None
+
+
+def _await_events_sidecar(events_path: Path, timeout_seconds: float = 10.0) -> bool:
+    """Poll until the tee splitter child has created the events sidecar (it
+    opens the files itself, stream-side, not inside the launcher)."""
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if events_path.exists():
+            return True
+        time.sleep(0.05)
+    return False
 
 
 def _dispatch_claude(
@@ -364,27 +377,52 @@ def test_signal2_plain_text_clean_log_stays_healthy(tmp_path: Path) -> None:
 
 
 def test_failure_classification_stream_json_matches_plain_text(tmp_path: Path) -> None:
-    """``classify_failure`` (post-exit reader) answers with the same failure
-    kind for a tee'd stream-json log as for the equivalent plain-text log
-    carrying the same throttle signature."""
+    """``classify_failure`` is stream-json-aware (issue #2814 rework): a
+    tee'd stream-json log where a ``tool_result`` merely *quotes* a throttle
+    signature classifies as no failure — the worker observed an error, the
+    CLI did not die (the issue's acceptance example). The equivalent plain
+    text when the CLI itself dies is still classified, in either shape: the
+    merged-stderr last line in the plain-text log and a real CLI error
+    (``result`` event with ``is_error``) in the stream-json log answer with
+    the same ``rate_limited`` kind."""
     throttle_markers = OrchestratorConfig().runtime.throttle_error_markers
     signature = "Rate limit exceeded. Resets in 15 minutes."
 
-    plain = tmp_path / "plain.log"
-    plain.write_text(f"shim\n{signature}\n", encoding="utf-8")
-    stream = tmp_path / "stream.log"
-    stream.write_text(
+    quoted = tmp_path / "quoted-stream.log"
+    quoted.write_text(
         _dumps({"type": "system", "subtype": "init"})
         + "\n"
         + _tool_result_event(signature)
         + "\n",
         encoding="utf-8",
     )
+    assert classify_failure(quoted, throttle_markers) == (None, None)
 
-    plain_kind, _ = classify_failure(plain, throttle_markers)
-    stream_kind, _ = classify_failure(stream, throttle_markers)
+    plain = tmp_path / "plain.log"
+    plain.write_text(f"shim\n{signature}\n", encoding="utf-8")
+    stream_death = tmp_path / "stream-death.log"
+    stream_death.write_text(
+        _dumps({"type": "system", "subtype": "init"})
+        + "\n"
+        + _dumps(
+            {
+                "type": "result",
+                "subtype": "error_during_execution",
+                "is_error": True,
+                "result": signature,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    plain_kind, plain_throttled = classify_failure(plain, throttle_markers)
+    stream_kind, stream_throttled = classify_failure(stream_death, throttle_markers)
+    assert plain_kind == "rate_limited"
     assert stream_kind == "rate_limited"
     assert stream_kind == plain_kind
+    assert plain_throttled is not None
+    assert stream_throttled is not None
 
 
 def test_failure_classification_clean_stream_json_log_not_failure(tmp_path: Path) -> None:
@@ -414,16 +452,24 @@ def test_failure_classification_clean_stream_json_log_not_failure(tmp_path: Path
 
 
 def test_post_mortem_log_tail_worker_blocked_stream_json_parity(tmp_path: Path) -> None:
-    """``_classify_worker_blocked_from_log_tail`` answers with the same result
-    for a tee'd stream-json log as for the equivalent plain-text log: the raw
-    tail carries the same escaped substring, so a ``tool_result`` quoting a
-    block signature matches and a clean log does not."""
+    """``_classify_worker_blocked_from_log_tail`` is stream-json-aware (issue
+    #2814 rework): a tee'd stream-json log where a ``tool_result`` merely
+    *quotes* a block signature is NOT worker_blocked (the issue's acceptance
+    example) — the worker observed a block, the CLI did not surface one. A
+    real CLI surfacing of the block is still classified in either shape: a
+    plain (non-event) line in the stream-json log (its own prose) and the
+    equivalent plain-text log answer with the same True."""
     rules = (SignatureRule(pattern=r"Tool blocked:", kind="worker_blocked"),)
 
     plain_hit = tmp_path / "hit-plain.log"
     plain_hit.write_text("shim\nTool blocked: push not allowed\n", encoding="utf-8")
     stream_hit = tmp_path / "hit-stream.log"
     stream_hit.write_text(
+        _dumps({"type": "system", "subtype": "init"}) + "\n" + "Tool blocked: push not allowed\n",
+        encoding="utf-8",
+    )
+    stream_quote = tmp_path / "quote-stream.log"
+    stream_quote.write_text(
         _dumps({"type": "system", "subtype": "init"})
         + "\n"
         + _tool_result_event("Tool blocked: push not allowed")
@@ -435,6 +481,7 @@ def test_post_mortem_log_tail_worker_blocked_stream_json_parity(tmp_path: Path) 
     stream_miss = tmp_path / "miss-stream.log"
     stream_miss.write_text(_dumps({"type": "system", "subtype": "init"}) + "\n", encoding="utf-8")
 
+    assert _classify_worker_blocked_from_log_tail(stream_quote, rules) is False
     assert _classify_worker_blocked_from_log_tail(stream_hit, rules) is True
     assert _classify_worker_blocked_from_log_tail(stream_hit, rules) == (
         _classify_worker_blocked_from_log_tail(plain_hit, rules)
@@ -518,3 +565,168 @@ def test_completed_session_stream_json_log_records_no_failure(tmp_path: Path) ->
         assert payload.get("failure_kind") is None
         # Reset for the second log shape.
         record_path.unlink(missing_ok=True)
+
+
+# --- the tee survives the launching supervisor exiting ------------------------
+#
+# Recorded experiment (issue #2814 rework): the old tee drained a
+# ``subprocess.PIPE`` with a daemon thread INSIDE the launching supervisor.
+# Killing the launcher after 0.4s while the worker printed every 50ms ended
+# the worker's 7th line with ``OSError: [Errno 22] Invalid argument``
+# (Windows broken pipe; POSIX would raise BrokenPipeError). Both the
+# positive and the negative control below reproduce that experiment as
+# tests: launcher-thread mode loses output and errors the worker;
+# splitter-child mode (what ``launch_claude_worker`` now runs) keeps the
+# worker alive and both files complete.
+
+
+# --- the tee splitter child itself ---------------------------------------------
+
+
+def test_tee_splitter_script_writes_all_lines_to_both_files(tmp_path: Path) -> None:
+    """Unit contract for ``tee_splitter.py`` standalone: every stdin line is
+    flushed to both destinations, byte-for-byte."""
+    log = tmp_path / "log.txt"
+    events = tmp_path / "events.txt"
+    subprocess.run(
+        [
+            sys.executable,
+            str(claude_code.tee_splitter_path()),
+            str(log),
+            str(events),
+        ],
+        input="line-a\nline-b\nline-c\n",
+        encoding="utf-8",
+        check=True,
+        timeout=30,
+    )
+    assert log.read_text(encoding="utf-8").splitlines() == ["line-a", "line-b", "line-c"]
+    assert log.read_bytes() == events.read_bytes()
+
+
+def _run_tee_survival_experiment(tmp_path: Path, *, mode: str) -> tuple[str, str]:
+    """One launcher child process that spawns the worker (and, in splitter
+    mode, the tee splitter), then exits 0.4s in. The worker prints a line
+    every 50ms for 3s and records every stdout failure to a status file.
+    Returns (worker status text, launcher log text)."""
+    launcher = tmp_path / "exp_launcher.py"
+    worker = tmp_path / "exp_worker.py"
+    splitter_path = claude_code.tee_splitter_path()
+
+    worker.write_text(
+        textwrap.dedent(
+            """
+            import sys
+            import time
+
+            status = open(sys.argv[1], "w", encoding="utf-8")
+            status.write("start\\n")
+            status.flush()
+            n = 0
+            deadline = time.time() + 3.0
+            while time.time() < deadline:
+                try:
+                    sys.stdout.write(f"line {n} {time.time():.2f}\\n")
+                    sys.stdout.flush()
+                    status.write(f"wrote {n + 1}\\n")
+                    status.flush()
+                    n += 1
+                except BaseException as exc:
+                    status.write(f"ERROR {type(exc).__name__}: {exc}\\n")
+                    status.flush()
+                    break
+                time.sleep(0.05)
+            status.write(f"final lines {n}\\n")
+            """
+        ),
+        encoding="utf-8",
+    )
+    launcher.write_text(
+        textwrap.dedent(
+            f"""
+            import os
+            import subprocess
+            import sys
+            import threading
+            import time
+
+            here = {str(tmp_path)!r}
+            mode = {mode!r}
+            worker_argv = [sys.executable, {str(worker)!r}, {str(tmp_path / "status.txt")!r}]
+
+            splitter = None
+            if mode == "splitter":
+                splitter = subprocess.Popen(
+                    [sys.executable, {str(splitter_path)!r},
+                     {str(tmp_path / "log.txt")!r}, {str(tmp_path / "events.txt")!r}],
+                    stdin=subprocess.PIPE,
+                )
+                proc_argv = [*worker_argv]
+                stdout = splitter.stdin
+            else:
+                proc_argv = [*worker_argv]
+                stdout = subprocess.PIPE
+
+            proc = subprocess.Popen(proc_argv, stdout=stdout, stderr=subprocess.STDOUT, text=True)
+
+            if mode == "thread":
+                def drain():
+                    try:
+                        for _ in proc.stdout:
+                            pass
+                    except Exception:
+                        pass
+
+                threading.Thread(target=drain, daemon=True).start()
+            if splitter is not None:
+                splitter.stdin.close()
+
+            time.sleep(0.4)
+            os._exit(0)
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    subprocess.run(
+        [sys.executable, str(launcher)],
+        check=False,
+        timeout=30,
+        capture_output=True,
+    )
+    status = tmp_path / "status.txt"
+    deadline = time.monotonic() + 10.0
+    status_text = ""
+    while time.monotonic() < deadline:
+        if status.exists() and "final" in status.read_text(encoding="utf-8"):
+            break
+        time.sleep(0.1)
+    status_text = status.read_text(encoding="utf-8") if status.exists() else ""
+    log = (
+        (tmp_path / "log.txt").read_text(encoding="utf-8")
+        if (tmp_path / "log.txt").exists()
+        else ""
+    )
+    return status_text, log
+
+
+def test_tee_splitter_child_worker_survives_launcher_exit(tmp_path: Path) -> None:
+    """Mitigation (issue #2814 rework): with the tee running as a splitter
+    CHILD process, a tee'd worker survives the launching supervisor exiting —
+    it keeps printing for its whole window with no stdout error, and both the
+    log and the events sidecar carry every line."""
+    status_text, log = _run_tee_survival_experiment(tmp_path, mode="splitter")
+
+    assert "ERROR" not in status_text, status_text
+    assert "final lines" in status_text, status_text
+    assert log.count("line ") >= 50, log
+
+
+def test_tee_launcher_thread_pipe_worker_dies_on_launcher_exit(tmp_path: Path) -> None:
+    """Negative control / recorded experiment: with the tee drained by a
+    daemon thread holding ``subprocess.PIPE`` in the launcher (the pre-rework
+    shape), the launching supervisor's exit breaks the pipe and the tee'd
+    worker's stdout errors out within the same window."""
+    status_text, _ = _run_tee_survival_experiment(tmp_path, mode="thread")
+
+    assert "ERROR" in status_text, status_text

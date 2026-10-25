@@ -140,12 +140,58 @@ def _is_stream_json(tail: str) -> bool:
     True, but ``tee_stream_json: false`` is the kill switch, so a
     claude-code ``.log`` from a non-tee session is still plain CLI prose,
     while api sessions and the reviewers always write stream-json. The LAST
-    line must not decide: ``claude_code`` merges stderr into the same
-    ``.log`` (``stderr=STDOUT``), so a stream-json log routinely ends on a
-    non-JSON line (a SessionEnd hook failure). Only the tail's first line can
-    be a partial event.
+    line must not decide:
+    ``claude_code`` merges stderr into the same ``.log`` (``stderr=STDOUT``),
+    so a stream-json log routinely ends on a non-JSON line (a SessionEnd hook
+    failure). Only the tail's first line can be a partial event.
     """
     return any(_parse_event(line) is not None for line in tail.splitlines())
+
+
+# Issue #2814 rework: inside a stream-json tail, the ``user`` and ``assistant``
+# event bodies are the session's OWN tool output and turns — a ``tool_result``
+# (or an assistant turn) that *quotes* a provider-throttle/permission/block
+# signature is the worker observing an error, not the CLI dying. Only the
+# CLI's own output — ``result`` events with ``is_error``, ``rate_limit_event``,
+# ``system`` events, and the non-event lines (merged ``stderr=STDOUT`` prose) —
+# is fatal evidence.
+_CLI_ERROR_EVENT_TYPES = frozenset({"system", "rate_limit_event"})
+
+
+def _event_is_cli_error_output(event: dict) -> bool:
+    """True when ``event`` is the stream-json CLI's own error output (a fatal
+    signature on this event is the CLI dying, not a tool observing one)."""
+    if event.get("type") == "result" and bool(event.get("is_error")):
+        return True
+    return event.get("type") in _CLI_ERROR_EVENT_TYPES
+
+
+def signature_match_text(tail: str) -> str:
+    """The text of ``tail`` that failure signatures may be matched against.
+
+    Single shared helper (issue #2814 rework) for every raw-tail signature
+    matcher over a worker log:
+    ``failure_classifier.classify_failure``,
+    ``post_mortem._classify_worker_blocked_from_log_tail``, and
+    ``dead_worker_classification._terminal_is_throttle_error`` (which backs
+    ``classify_clean_exit_throttle``).
+
+    - A plain (non-stream-json) tail is matched whole, exactly as before.
+    - In a stream-json tail the event bodies are excluded: matching keeps the
+      non-event lines (merged stderr / plain CLI prose) and the CLI's own
+      error output (``result`` with ``is_error``, ``rate_limit_event``,
+      ``system`` — see ``_event_is_cli_error_output``), and drops the
+      ``user``/``assistant`` event bodies. A ``tool_result`` that merely
+      quotes "Rate limit exceeded" must never re-arm a cooldown or escalate
+      a blocked worker.
+    """
+    if not _is_stream_json(tail):
+        return tail
+    return "\n".join(
+        line
+        for line in tail.splitlines()
+        if (event := _parse_event(line)) is None or _event_is_cli_error_output(event)
+    )
 
 
 def _event_timestamp(event: dict) -> datetime | None:
@@ -275,6 +321,12 @@ def classify_failure(
     ``permission_denied`` check. It is checked LAST so throttle/auth
     signatures still win.
 
+    All signature matching (throttle, quota, auth, suspension, permission)
+    runs over ``signature_match_text(tail)`` (issue #2814 rework): in a
+    stream-json tail only non-event lines (merged stderr) and the CLI's own
+    error output may carry a failure signature — a ``tool_result`` quoting a
+    marker is the worker observing an error, not one.
+
     The emission time is read out of the log according to the log's own
     shape (N9 -- see ``_throttle_emission_anchor``), not the harness.
     Callers normally reach this through ``classify_for``, which reads the two
@@ -311,11 +363,14 @@ def classify_failure(
     resolved_now = now if now is not None else datetime.now(UTC)
     # Check the last 2KB of the log (where error messages appear).
     tail = log_text[-2048:] if len(log_text) > 2048 else log_text
+    whole_lines = tail.partition("\n")[2]
+    # Stream-json-aware matching (#2814 rework): see ``signature_match_text``.
+    match_tail = signature_match_text(tail)
 
-    if account_error_detection and _provider_suspension_in_tail(tail):
+    if account_error_detection and _provider_suspension_in_tail(match_tail):
         return "provider_suspended", None
 
-    if account_error_detection and is_provider_auth_failure(tail):
+    if account_error_detection and is_provider_auth_failure(match_tail):
         cooldown = timedelta(hours=_DEFAULT_QUOTA_COOLDOWN_HOURS, seconds=resume_margin_seconds)
         throttled_until = resolved_now + cooldown
         return "provider_auth", throttled_until.replace(microsecond=0).isoformat().replace(
@@ -327,8 +382,8 @@ def classify_failure(
         if quota_error_markers is not None
         else _CLASSIFY_DEFAULT_QUOTA_ERROR_MARKERS
     )
-    if match_quota_tail(tail, quota_markers):
-        reset = quota_reset(tail) if quota_reset is not None else None
+    if match_quota_tail(match_tail, quota_markers):
+        reset = quota_reset(match_tail) if quota_reset is not None else None
         if reset is None:
             reset = timedelta(hours=_DEFAULT_QUOTA_COOLDOWN_HOURS)
         cooldown = reset + timedelta(seconds=resume_margin_seconds)
@@ -342,7 +397,7 @@ def classify_failure(
         if throttle_error_markers is not None
         else _CLASSIFY_DEFAULT_THROTTLE_ERROR_MARKERS
     )
-    matched, reset_minutes = match_throttle_tail(tail, markers)
+    matched, reset_minutes = match_throttle_tail(match_tail, markers)
     if matched:
         cooldown = timedelta(
             minutes=reset_minutes
@@ -360,7 +415,7 @@ def classify_failure(
         else:
             # The byte slice can cut the first line mid-event: its embedded
             # timestamps are not emission times, so the anchor never reads it.
-            whole_lines = tail.partition("\n")[2] if len(log_text) > len(tail) else tail
+            whole_lines = whole_lines if len(log_text) > len(tail) else tail
             emitted_at = _throttle_emission_anchor(
                 log_path, whole_lines, now=resolved_now, throttle_markers=markers
             )
@@ -370,7 +425,7 @@ def classify_failure(
         )
 
     # Issue #2010: last, so throttle/auth signatures still win.
-    if headless_permission_detection and is_headless_permission_denial(tail):
+    if headless_permission_detection and is_headless_permission_denial(match_tail):
         return PERMISSION_DENIED_FAILURE_KIND, None
 
     return None, None

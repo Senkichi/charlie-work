@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import sys
 import textwrap
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -222,10 +223,15 @@ def test_launch_api_worker_force_enables_tee_stream_json(
     assert captured["adapter_kind"] == "api"
     assert captured["provider"] == "kimi-k3"
 
-    # tee_stream_json=True opens issue-<n>.events.jsonl at launch time, so it
-    # must exist on disk (independent of whether the fake worker has written
-    # any stream-json events yet).
-    assert (sessions_dir / "issue-7.events.jsonl").exists()
+    # tee_stream_json=True spawns the tee splitter child at launch time, which
+    # opens issue-<n>.events.jsonl stream-side — so it must exist on disk
+    # (independent of whether the fake worker has written any stream-json
+    # events yet).
+    events_path = sessions_dir / "issue-7.events.jsonl"
+    deadline = time.monotonic() + 10.0
+    while not events_path.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert events_path.exists()
 
 
 def test_launch_api_worker_injects_provider_env(
