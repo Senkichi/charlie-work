@@ -263,6 +263,11 @@ def test_dispatch_reviews_records_review_effort_arm_on_state_and_event(
             "review_effort_arm": "treatment",
             "review_effort_used": "high",
             "review_turn_cap": config.review_dispatch.review_max_turns,
+            # Issue #2837: the round kind + measured interdiff size ride the
+            # same assignment record (both None/0 on a legacy packet).
+            "review_round_kind": None,
+            "review_interdiff_files": 0,
+            "review_interdiff_lines": 0,
         }
     ]
 

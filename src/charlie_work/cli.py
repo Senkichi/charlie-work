@@ -2543,6 +2543,7 @@ def _render_backlog_reachability(reachability: Any) -> str:
                 "parked_unready",
                 "terminal_label",
                 "active_label",
+                "other_host",
                 "operator_claimed",
                 "blocked_by_open_dependency",
                 "mention_covered_awaiting_operator",

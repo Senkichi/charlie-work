@@ -88,7 +88,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from charlie_work import layout, process_chain, quiesce
+from charlie_work import layout, posix_processes, process_chain, quiesce
 from charlie_work.instrumentation import log_event, query_events
 
 logger = logging.getLogger(__name__)
@@ -324,6 +324,9 @@ def list_host_processes() -> tuple[Sequence[quiesce.ProcessInfo], str | None]:
     """
     if sys.platform == "win32":
         return quiesce.list_processes()
+    if sys.platform == "darwin":
+        # No procfs on macOS (spec C2).
+        return posix_processes.list_processes_ps()
     return _list_processes_posix()
 
 

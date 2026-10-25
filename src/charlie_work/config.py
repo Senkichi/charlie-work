@@ -306,6 +306,8 @@ class LabelConfig:
     # whoever files the issue creates the label, so it is not a member of
     # ``all`` or ``workflow_labels``. An empty prefix turns the routing off.
     model_tier_prefix: str = "model:"
+    # Spec C2 (host_routing): ``<prefix><host>`` names the orchestrator that owns an issue.
+    host_prefix: str = "host:"
 
     @property
     def terminal(self) -> set[str]:
@@ -381,6 +383,9 @@ class DispatchConfig:
     # so an operator adding or removing the label mid-flight takes effect on
     # the next pass.
     human_merge_labels: Annotated[tuple[str, ...], Typed, NotNull] = ()
+    # Spec C2 (host_routing): this orchestrator's host name; None = every issue is local.
+    host: Annotated[str | None, Typed, NonEmpty] = None
+    default_host: Annotated[bool, Typed, NotNull] = True
     # Package template rendered for worker prompts. "worker.md" targets Devin
     # sessions (skills-based loop); "worker_claude_code.md" targets Claude Code
     # workers (direct shell loop). A repo-local prompts dir overrides by filename.
@@ -396,6 +401,13 @@ class DispatchConfig:
     # tells the worker to use the command the repository documents in CLAUDE.md.
     # See prompt_test_command.
     test_command: Annotated[str, Typed, NullIsDefault] = ""
+    # Kill switch for the selector probe. On (default), a worker or rework prompt asks
+    # ``ci-fleet select`` whether it can narrow anything before it tells the worker to
+    # run ``ci-fleet test``; a selector that can only answer ``full`` (stale or missing
+    # selection map) leaves the hand-picked targeted command in place, so the worker is
+    # not handed a serial run of the whole suite. Off skips the probe: the prompt trusts
+    # the static preconditions alone. See selection_wrapper.probe_selection.
+    worker_selection_probe: Annotated[bool, Typed, NullIsDefault] = True
     # Global concurrency governor: cap total live worker sessions across fresh,
     # rework, and recovery dispatch. Unset/0 preserves current unlimited behavior.
     max_concurrent_sessions: int = 0
@@ -1000,6 +1012,26 @@ class ReviewDispatchConfig:
     # a review (read diff, read tests, read a few source files, write verdict)
     # but prevents unbounded codebase exploration.
     review_max_turns: Annotated[int, Typed, NonNeg] = 40
+    # Issue #2837: incremental re-reviews. When a reviewed PR's head moves
+    # with a rework push, the next review is an incremental round: the packet
+    # carries a PR-relative interdiff built from the last round's archived
+    # diff.patch (files whose per-file patch changed since that round -- no
+    # base-merge noise, unlike the three-dot ``gh.compare_diff`` interdiff) and
+    # the reviewer is asked to re-check every prior finding, review the
+    # interdiff files in full, and open the full diff only for dependent
+    # context. False is the kill switch for the whole feature (the archived
+    # interdiff, the incremental prompt procedure, and the smaller turn
+    # budget below): today's full-diff prompt, three-dot interdiff, and flat
+    # ``review_max_turns`` budget come back.
+    incremental_review: Annotated[bool, Typed] = True
+    # Issue #2837: agentic turn cap for an incremental review round, used
+    # whenever the incremental procedure is rendered (a moved-head rework with
+    # an archived last-round diff). The #1439 structure/miss-streak escalation
+    # still applies on top of this base. 0 falls back to the flat
+    # ``review_max_turns`` budget (today's behaviour); setting it equal to
+    # ``review_max_turns`` does the same. Legacy ``fallback`` rounds and
+    # first reviews always use ``review_max_turns``.
+    incremental_review_max_turns: Annotated[int, Typed, NonNeg] = 20
     # Diff line count above which the review prompt includes a diff-size
     # warning and a per-file summary instead of encouraging the reviewer to
     # read the entire diff in one shot. 0 disables the threshold (always
@@ -1643,12 +1675,37 @@ class ClaudeCodeConfig:
     # reintroduces VIRTUAL_ENV even though sanitize_env strips it). This is
     # intentional: explicit operator overrides win over sanitization.
     worker_env: Annotated[dict[str, str], Coerced] = field(default_factory=dict)
-    # Opt-in: tee Claude Code's --output-format stream-json to a separate events.jsonl file.
-    # When enabled, the worker launch command is extended with --output-format stream-json
-    # and the structured JSONL output is written to issue-<n>.events.jsonl alongside the
-    # plaintext log. This enables downstream parsing of tool_call_count, turn_count, tokens,
-    # and cost_usd for tripwires and progress reporting. Default False until #162/#163 land.
-    tee_stream_json: bool = False
+    # Ship ON (issue #2814): tee Claude Code's --output-format stream-json to a
+    # separate events.jsonl file. With the tee, the worker launch command is
+    # extended with --output-format stream-json --verbose and the structured
+    # JSONL output is written to issue-<n>.events.jsonl (and into) the sidecar
+    # log stream-side, so signal 3's log mtime and the real-activity probe's
+    # events.jsonl source both see live activity while the session reads and
+    # plans. This enables downstream parsing of tool_call_count, turn_count,
+    # tokens, and cost_usd for tripwires and progress reporting. The tee is the
+    # default; ``tee_stream_json: false`` in config is the kill switch and
+    # restores the pre-#2814 behaviour (plain-text log, no events.jsonl).
+    tee_stream_json: bool = True
+    # Issue #2836: tool allowlist pinned via ``--tools`` on every worker
+    # launch (comma-separated tool names). Empty string is the kill switch:
+    # no ``--tools`` flag is added and the CLI default tool set applies —
+    # which re-reads tens of thousands of unused tool-schema tokens on every
+    # API call (Artifact/Skill/Workflow/Agent etc. measured ~57k-65k first-
+    # call context vs ~17k allowlisted) and inherits the operator's whole
+    # interactive tool surface a prompt injection could reach.
+    worker_tools: Annotated[str, Typed] = "Bash,Read,Edit,Write,Grep,Glob,Monitor,TaskStop"
+    # Issue #2836: same pin for reviewer sessions (read-only reviews need far
+    # fewer tools). Empty string = kill switch, CLI default applies.
+    reviewer_tools: Annotated[str, Typed] = "Bash,Read,Grep,Glob,Write"
+    # Issue #2836: when true (the default), worker/reviewer launches append
+    # ``--strict-mcp-config --mcp-config {"mcpServers":{}}`` (no MCP servers)
+    # and ``sanitize_env`` sets ``ENABLE_CLAUDEAI_MCP_SERVERS=false`` so
+    # claude.ai connectors never load in a headless session. This strips the
+    # operator's user-scope MCP servers (GitHub remote MCP *write* tools,
+    # Gmail, Drive, ...) from sessions that read attacker-controlled issue
+    # text under ``bypassPermissions`` — the ``gh`` CLI in Bash covers every
+    # read they actually make. ``false`` restores ambient MCP loading.
+    isolate_mcp: Annotated[bool, Typed] = True
 
 
 @dataclass(frozen=True)

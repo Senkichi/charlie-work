@@ -55,9 +55,14 @@ def test_default_config_require_current_base() -> None:
 
 
 def test_default_config_tee_stream_json_disabled() -> None:
-    """ClaudeCodeConfig.tee_stream_json defaults to False (issue #160)."""
+    """Name kept verbatim: the collect-only gate (#1538) treats a leaf rename
+    as a deletion and fails a required check; the body was re-recorded in
+    #2814. ClaudeCodeConfig.tee_stream_json now defaults to True (the
+    watchdog needs the tee'd stream-json log/events to tell a healthy
+    session apart from a stall) and ``tee_stream_json: false`` in config is
+    the typed kill switch reproducing the old default-off behaviour."""
     config = load_config()
-    assert config.claude_code.tee_stream_json is False
+    assert config.claude_code.tee_stream_json is True
 
 
 def test_default_config_runner_scaling_disabled() -> None:

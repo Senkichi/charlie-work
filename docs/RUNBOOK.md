@@ -475,6 +475,42 @@ and `host_load_term` naming the binding term) to the repo's `events.db`, and a
 failed measurement fails *open* — dispatch proceeds — with a rate-limited
 `host_load_unavailable` warning instead of a silent missing clamp.
 
+### Tool allowlist and MCP isolation (claude_code, #2836)
+
+Every Claude Code session the fleet launches (workers and reviewers) launches
+with a hostile-adjacent tool surface reduced to what its role actually used:
+
+- `claude_code.worker_tools` — default `Bash,Read,Edit,Write,Grep,Glob,Monitor,TaskStop`,
+  pinned via `--tools` on every worker launch.
+- `claude_code.reviewer_tools` — default `Bash,Read,Grep,Glob,Write`, pinned on
+  every reviewer launch (and on the quota probe).
+- `claude_code.isolate_mcp` — default `true`. Appends `--strict-mcp-config
+  --mcp-config {"mcpServers":{}}` (no MCP servers) to the launch argv and sets
+  `ENABLE_CLAUDEAI_MCP_SERVERS=false` in every sanitized worker environment, so
+  claude.ai connectors never load either.
+
+Together this removes the operator's user-scope MCP servers (GitHub remote-MCP
+*write* tools, Gmail's `create_draft`, Drive, Calendar) from sessions that read
+attacker-controlled issue text under `bypassPermissions`, and cuts the unused
+tool-schema block (~40k of the ~57k default first-call context) off every API
+call. Workers and reviewers do their GitHub reads through `gh` in Bash; no
+prompt references MCP tools. Dropped *built-in* tools reviewers had used but
+no longer get: **PowerShell, WebFetch and Agent** — a review that genuinely
+needs one of them must argue for it in code, not widen the pin silently.
+
+**Kill switches.** Setting `claude_code.worker_tools` (resp.
+`claude_code.reviewer_tools`) to the empty string `""` removes the `--tools`
+pin (the CLI default tool set loads); `isolate_mcp: false` restores ambient
+MCP/connector loading and leaves `ENABLE_CLAUDEAI_MCP_SERVERS` unset. The
+doctor's "claude-code worker tool scope" check reports the effective worker
+scope and warns on the two worker-side opt-outs (`worker_tools: ""` and
+`isolate_mcp: false`); it inspects only the worker launch, so
+`reviewer_tools: ""` is **not** reported. A caller-supplied
+`claude_code.command` cannot widen the scope: any `--tools`/`--mcp-config` it
+carries is stripped and the configured scope re-pinned. The
+`merge_preflight_hook.py` `mcp__github__merge_pull_request` guard stays in
+place unchanged.
+
 ### Host test-slot pool (`test_slots`, issue #2124)
 
 Dispatch admission only bounds how many sessions *start*; after that each worker
@@ -1082,6 +1118,49 @@ via `os.environ.get(provider.api_key_env)`; a missing/empty var is an error
 travels only in the child process env — it is never written to a sidecar, log,
 prompt, or command argv. `doctor`'s launched-sessions probe surfaces
 `provider-auth` and `budget-exceeded` failure kinds on dead sidecars.
+
+**Where the key is stripped — and the residual exposure (issue #2795).** Because
+the key value sits in the supervisor process's own environment, every
+worker/reviewer *session* env is sanitized of it: `sanitize_env()` pops each
+configured provider's `api_key_env` name (derived from `api_worker.providers`,
+never hardcoded) for the `claude-code`, `devin-shell`, resumed-review, and
+cross-family rescue launches; the api adapter keeps working because its
+routing env (`ANTHROPIC_AUTH_TOKEN` et al.) is merged *after* sanitization.
+
+The strip does **not** cover every child process the supervisor or
+orchestrator spawns. A dedicated helper, `env_sanitize.strip_provider_api_keys`,
+applies the same config-derived pop to any env built by copying the
+supervisor's ambient environment; it runs in `sanitize_env()` and in the local
+merge gate's suite launch (`orchestration.local_merge_gate` ->
+`local_suite_runner.launch_suite_gate`), which executes the PR branch's
+worker-authored test suite, so that child no longer inherits the key. The
+remaining surfaces, documented here as **accepted** for this repo, are:
+
+- **ci_runner listeners and CI job steps** (owned by `ci_fleet`, not here):
+  `ci_fleet.runners._sanitize_env` strips only `UV_`/`VIRTUAL_ENV`/`PYTHON`/
+  `PIP_`/`CLAUDE` prefixes, so the runner listeners the allocator starts — and,
+  transitively, every self-hosted CI job step — still inherit the configured
+  provider key. Mitigation belongs at the allocator's env boundary in
+  `ci_fleet`, stripping the same config-derived provider-key names. That fix
+  is tracked in `ci_fleet`'s own issue tracker: it adds the strip behind a seam,
+  which charlie-work then installs with
+  `env_sanitize.provider_api_key_env_vars`.
+- **Raw `run_captured` children**: `charlie_work.subprocess_runner.run_captured`
+  builds its env as `{**os.environ, ...}`, so every child the supervisor or
+  orchestrator spawns through it also sees the key. That includes
+  `claude_code.run_quota_probe` (a real Claude CLI session launched via
+  `run_captured` with a raw `os.environ`), self-deploy/pending-sync `uv sync`
+  runs (whose build backends are third-party tooling), and the first-party
+  git/GitHub/doctor/housekeeping commands. These children run first-party,
+  reviewed command lines against in-repo targets for seconds, not minutes —
+  narrower than a worker session, but still external code running under the
+  supervisor's credential, so the exposure remains recorded rather than
+  dismissed.
+
+Operators who consider either surface provider key-sensitive should treat the
+fleet host as holding the key in the clear (it does — the whole point of
+`secretenv`'s DPAPI storage is lost the moment any child inherits it) and scope
+`api_worker.enabled` / self-hosted CI accordingly.
 
 **Validation at config load** (`ApiWorkerConfig.__post_init__`): when
 `enabled: true`, `provider` must be a non-empty string naming a key in

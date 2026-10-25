@@ -16,6 +16,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import psutil
+
 from .atomic_write import write_json_atomic
 from .orphan_sweep import (  # noqa: F401  (deliberate re-export)
     _enumerate_fingerprinted_children,
@@ -23,6 +25,7 @@ from .orphan_sweep import (  # noqa: F401  (deliberate re-export)
     _self_ancestor_pids,
     sweep_orphan_processes,
 )
+from .posix_processes import list_processes_ps
 from .subprocess_runner import no_console_window_kwargs, run_captured
 from .worker_launch import CpuPriority, popen_worker  # noqa: F401 (deliberate re-export)
 
@@ -191,7 +194,8 @@ def _enumerate_child_pids(pid: int) -> list[int]:
         try:
             proc_path = Path("/proc")
             if not proc_path.exists():
-                return children
+                # macOS has no procfs (spec C2): read the ppid column from ps.
+                return [row.pid for row in list_processes_ps()[0] if row.ppid == pid]
 
             for entry in proc_path.iterdir():
                 if not entry.name.isdigit():
@@ -255,6 +259,12 @@ def get_process_start_time(pid: int) -> float | None:
             return None
         finally:
             kernel32.CloseHandle(handle)
+    elif sys.platform == "darwin":
+        # No procfs on macOS (spec C2); psutil reads the kernel's start time.
+        try:
+            return psutil.Process(pid).create_time()
+        except (psutil.Error, OSError):
+            return None
     else:
         # POSIX: read /proc/<pid>/stat
         try:
@@ -533,8 +543,8 @@ def start_terminal_status_watcher(
     no such call to move. Never raises: a failure inside the thread (a
     poll() error, or a write failure) is swallowed, since this is best-effort
     telemetry that must not crash the orchestrator or the worker's own I/O
-    threads (e.g. the tee_stream_json reader thread also draining
-    ``process.stdout`` concurrently in ``claude_code.launch_claude_worker``).
+    (drained by the tee splitter child process spawned by
+    ``claude_code.launch_claude_worker`` — not by a reader thread here).
     """
     pid = process.pid
     started_monotonic = time.monotonic()

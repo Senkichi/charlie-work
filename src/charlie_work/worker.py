@@ -20,6 +20,7 @@ from .claude_code import (
     CLAUDE_RECORD_KINDS,
     ClaudeWorkerRecord,
     _sidecar_path as claude_sidecar_path,
+    last_tool_call_timestamp,
     read_worker_records,
 )
 from .config import WRITER_MARKER_FILENAME, OrchestratorConfig
@@ -483,50 +484,6 @@ class WorkerView:
             return 0.0
 
 
-def _tail_last_tool_call_timestamp(events_path: Path) -> datetime | None:
-    """Extract the timestamp of the last tool_call event from an events.jsonl file.
-
-    Reads the events.jsonl file line by line and returns the timestamp of the most
-    recent event with type="tool_call". Returns None if the file doesn't exist,
-    can't be read, or contains no tool_call events.
-
-    Args:
-        events_path: Path to the events.jsonl file
-
-    Returns:
-        datetime of the last tool_call event, or None if not found
-    """
-    from datetime import UTC
-
-    if not events_path.exists():
-        return None
-
-    try:
-        last_tool_call_at: datetime | None = None
-        with events_path.open("r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    event = json.loads(line)
-                    if isinstance(event, dict) and event.get("type") == "tool_call":
-                        timestamp_str = event.get("timestamp")
-                        if timestamp_str:
-                            try:
-                                timestamp = datetime.fromisoformat(timestamp_str)
-                                if timestamp.tzinfo is None:
-                                    timestamp = timestamp.replace(tzinfo=UTC)
-                                last_tool_call_at = timestamp
-                            except (ValueError, TypeError):
-                                continue
-                except (JSONDecodeError, TypeError):
-                    continue
-        return last_tool_call_at
-    except OSError:
-        return None
-
-
 def _parse_started_at(value: str) -> datetime | None:
     try:
         parsed = datetime.fromisoformat(value)
@@ -740,10 +697,23 @@ def classify_worker_health(
         lines = log_text.splitlines()
         if lines:
             last_log_line = lines[-1].strip()
-            for pattern in terminal_error_markers:
-                if pattern in last_log_line:
-                    has_terminal_error = True
-                    break
+            # Issue #2814: with the stream-json tee (now the default for
+            # claude-code workers), the log's last line is routinely a JSON
+            # event. The markers are CLI-fatal signatures; a ``tool_result``
+            # (or an assistant turn) that *quotes* one is the worker
+            # observing an error, not the CLI dying — so a stream-json event
+            # line never trips this scan. A plain (non-JSON) last line —
+            # merged stderr, or a non-tee plain-text log — keeps the
+            # anchored substring scan unchanged. Cf.
+            # ``failure_classifier._stream_json_emission_anchor`` for the
+            # same shape rule in the post-exit classifier.
+            from .failure_classifier import _parse_event
+
+            if _parse_event(last_log_line) is None:
+                for pattern in terminal_error_markers:
+                    if pattern in last_log_line:
+                        has_terminal_error = True
+                        break
         if view.adapter_kind == "api":
             from .failure_classifier import _provider_suspension_in_tail
 
@@ -816,7 +786,7 @@ def classify_worker_health(
         # Check for events.jsonl file (sibling to log_path)
         events_path = _events_path_from_log(log_path)
         if events_path.exists():
-            last_tool_call_at = _tail_last_tool_call_timestamp(events_path)
+            last_tool_call_at = last_tool_call_timestamp(events_path)
             log_stat = view.log_stat()
             if log_stat is not None:
                 log_mtime = datetime.fromtimestamp(log_stat.st_mtime, tz=UTC)

@@ -67,7 +67,7 @@ from .fleet_stop import (
     fleet_stop_pending,
     supervise_loop_interrupted_result,
 )
-from . import layout
+from . import launchd_probe, layout
 from .github import GitHub, GitHubError
 from .global_config import (
     describe_config_file,
@@ -2783,6 +2783,12 @@ def probe_fleet_watchdog(
     while "Scheduled Task State" is exactly the Enabled/Disabled flag the
     restart exit depends on.
     """
+    if sys.platform == "darwin":
+        # Spec C2: on the Mac the watchdog is a launchd job (see launchd_probe).
+        armed, detail = launchd_probe.probe_launchd_job(
+            run_command=run_command, timeout_seconds=timeout_seconds
+        )
+        return WatchdogProbe(armed, detail)
     if sys.platform != "win32":
         return WatchdogProbe(
             None, f"not probed (schtasks is Windows-only; platform={sys.platform})"

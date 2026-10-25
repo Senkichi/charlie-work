@@ -116,8 +116,16 @@ def test_classify_for_opencode_ignores_usage_limit_in_tool_output(tmp_path: Path
     log = _log(tmp_path, TOOL_OUTPUT_ONLY)
     markers = RuntimeConfig().quota_error_markers
     assert worker_fate.classify_for("opencode", log, quota_error_markers=markers) == (None, None)
-    # Positive control: the same raw tail DOES classify for a harness with no digest.
-    kind, _ = worker_fate.classify_for("claude-code", log, quota_error_markers=markers)
+    # Issue #2814 rework: a tool event body merely quoting the limit likewise
+    # classifies as no failure for a stream-json-shaped raw tail (claude-code).
+    assert worker_fate.classify_for("claude-code", log, quota_error_markers=markers) == (
+        None,
+        None,
+    )
+    # Positive control: the signature as a non-event tail line (merged stderr)
+    # still classifies for a harness with no digest.
+    stderr_log = _log(tmp_path, TOOL_OUTPUT_ONLY + "\nusage quota has been exhausted\n")
+    kind, _ = worker_fate.classify_for("claude-code", stderr_log, quota_error_markers=markers)
     assert kind is not None
 
 

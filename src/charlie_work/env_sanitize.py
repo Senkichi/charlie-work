@@ -4,7 +4,10 @@ Provides a single implementation of environment sanitization to prevent
 VIRTUAL_ENV and UV_PROJECT_ENVIRONMENT leaks from the orchestrator into
 worker sessions, and to isolate GitHub CLI authentication so workers cannot
 use the orchestrator's stored credentials. Used by claude_code, devin_shell,
-and rescue_review's cross-family adapter.
+and rescue_review's cross-family adapter. It also strips an ambient
+``ACP_BACKEND`` (issue #2784): set by the Devin Desktop integrated terminal,
+it makes devin.exe's credential loader enforce the ACP server policy and fail
+"Error: Not logged in" instead of using local CLI credentials.
 
 Security (issue #502): workers must not inherit the orchestrator's
 admin-scoped ``GH_TOKEN``/``GITHUB_TOKEN`` (or the GHES equivalents
@@ -18,7 +21,13 @@ merges ``worker_env`` AFTER sanitization, so an explicit scoped ``GH_TOKEN``
 wins and the orchestrator's config/token never reaches the worker process.
 
 Dispatch parallelism cap (issue #646): the same "sanitize once, merge
-worker_env after" chokepoint also injects a safe-default
+worker_env after" pass (the chokepoint every WORKER/REVIEWER SESSION goes
+through; since #2795, ``strip_provider_api_keys`` also covers the local
+merge-gate suite launch -- but this is still not the only child-process env
+path on this host: raw
+``run_captured`` children and ci_fleet runner listeners/job steps inherit
+``os.environ`` untouched; issue #2795 documents the accepted residual
+exposure) also injects a safe-default
 ``PYTEST_XDIST_AUTO_NUM_WORKERS`` and, when the target has a real local
 ``.venv`` (not a reparse point), ``UV_NO_SYNC=1`` — both via ``dict.setdefault``,
 so an ambient value already present in the orchestrator's own environment, or
@@ -84,8 +93,11 @@ import os
 import shutil
 from collections.abc import Mapping
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from . import layout
+from .ledger_context import ledger_env
+from .test_slots import ROLE_GATE, arm_env
 from .worktree import _unlink_reparse_point, is_junction
 
 # Issue #646: box-wide dispatch parallelism cap. A consuming repo's own
@@ -122,6 +134,71 @@ DEFAULT_PYTEST_XDIST_AUTO_NUM_WORKERS = "2"
 UV_NO_SYNC_VAR = "UV_NO_SYNC"
 _UV_NO_SYNC_DEFAULT = "1"
 
+# Issue #2836: with this set to "false" by sanitize_env, a `claude -p` session
+# loads no claude.ai connectors (verified 2026-10-24: every mcp__claude_ai_*
+# tool, including Gmail create_draft, disappears from the tool list). It pairs
+# with the argv-side --strict-mcp-config --mcp-config {"mcpServers":{}} pin in
+# tool_scope._apply_tool_scope: the argv flag drops project/user-scope MCP
+# servers, this environment gate drops claude.ai connectors.
+ENABLE_CLAUDEAI_MCP_SERVERS_VAR = "ENABLE_CLAUDEAI_MCP_SERVERS"
+
+if TYPE_CHECKING:
+    from .config import OrchestratorConfig
+    from .test_slots import SlotPoolConfig
+
+
+def provider_api_key_env_vars(config: "OrchestratorConfig | None") -> tuple[str, ...]:
+    """Return the provider-key *variable names* configured under
+    ``api_worker.providers``, derived from config (issue #2795) — never a
+    hardcoded list, so a repo that re-keys its providers stays in step.
+
+    The api adapter resolves the provider key from the ORCHESTRATOR process's
+    own env (``api_worker.launch_api_worker``: ``os.environ.get(provider.api_key_env)``),
+    which means the key value sits in the supervisor's ambient environment.
+    Every other worker launch goes through ``sanitize_env``, so the names
+    returned here must be popped there — otherwise every claude_code /
+    devin_shell / devin_review_resume / rescue_review session inherits the
+    orchestrator's provider key ambiently. The api adapter keeps working
+    because its routing env (``ANTHROPIC_AUTH_TOKEN`` et al., built by
+    ``api_worker._provider_env``) is merged AFTER sanitization.
+
+    Only the variable NAMES are handled here; the key VALUE never passes
+    through this module's return value (it is popped, not copied). Names are
+    de-duplicated and sorted so several providers sharing one env var name
+    strip identically.
+
+    Scope note (issue #2795): sanitize_env covers worker/reviewer SESSION
+    launches, and :func:`build_local_gate_env` additionally covers the local
+    merge-gate suite launch (``orchestration.local_merge_gate`` ->
+    ``local_suite_runner.launch_suite_gate``), which runs the PR branch's
+    worker-authored test suite. Other children of the orchestrator or
+    supervisor process inherit ``os.environ`` raw —
+    ``subprocess_runner.run_captured`` children
+    (``env = {**os.environ, ...}``) and, via ci_fleet's own
+    ``runners._sanitize_env`` (which strips only ``UV_/VIRTUAL_ENV/PYTHON/
+    PIP_/CLAUDE`` prefixes), every runner listener the allocator starts and
+    every self-hosted CI job step. That residual ambient exposure is
+    documented as accepted in docs/RUNBOOK.md's API-worker section; stripping
+    those surfaces is a ci_fleet-side or future charlie-work change keyed on
+    the same config-derived names this function returns.
+    """
+    if config is None:
+        return ()
+    api_worker = getattr(config, "api_worker", None)
+    if api_worker is None:
+        return ()
+    providers = getattr(api_worker, "providers", None) or {}
+    return tuple(
+        sorted(
+            {
+                provider.api_key_env
+                for provider in providers.values()
+                if provider is not None and getattr(provider, "api_key_env", "")
+            }
+        )
+    )
+
+
 # Issue #502/#1001: the GitHub token variable names sanitize_env() strips from
 # every worker subprocess's environment. The single source of truth for both
 # sanitize_env's strip loop and the worker-github-token predicate shared by
@@ -135,6 +212,66 @@ STRIPPED_GH_TOKEN_VARS = (
     "GH_ENTERPRISE_TOKEN",
     "GITHUB_ENTERPRISE_TOKEN",
 )
+
+
+def strip_provider_api_keys(
+    env: dict[str, str],
+    config: "OrchestratorConfig | None",
+) -> dict[str, str]:
+    """Pop the configured provider-key variable *names* from ``env`` in place,
+    and return ``env`` for chaining.
+
+    The one implementation every env-construction site that copies the
+    supervisor's ambient environment into a child process must run through
+    (issue #2795): :func:`sanitize_env` for worker/reviewer session launches
+    and :func:`build_local_gate_env` for the local merge-gate suite launch
+    (-> ``local_suite_runner.launch_suite_gate``) built from
+    ``{**os.environ, ...}`` — that child runs the PR branch's worker-authored
+    test suite, so it must not inherit the supervisor's provider key either.
+
+    See :func:`provider_api_key_env_vars` for where the names come from and
+    which surfaces still carry the residual exposure.
+    """
+    key_vars = provider_api_key_env_vars(config)
+    if key_vars and os.name == "nt":
+        # Windows casefolds environment-variable KEYS: dict(os.environ) hands
+        # back upper-cased keys, so an exact env.pop("Mixed_Case") silently
+        # fails open — while the api adapter's own os.environ.get() lookup
+        # would still FIND the value (os.environ.get is case-insensitive on
+        # Windows). Match case-insensitively so the strip keeps up with the
+        # api adapter's read; the pop still deletes whatever key casing the
+        # dict actually carries.
+        wanted = {name.upper() for name in key_vars}
+        for env_key in [k for k in env if k.upper() in wanted]:
+            del env[env_key]
+    else:
+        # POSIX keeps case-sensitive env keys, so the exact-name pop is exact.
+        for env_key in key_vars:
+            env.pop(env_key, None)
+    return env
+
+
+def build_local_gate_env(
+    test_slots: "SlotPoolConfig",
+    issue_number: int,
+    config: "OrchestratorConfig | None",
+) -> dict[str, str]:
+    """Build the local merge-gate suite launch env (issue #2795).
+
+    The gate suite runs the PR branch's worker-authored tests, so its env is
+    the supervisor's ambient environment with the gate slot plugin armed and
+    the test ledger tagged, then the config-derived provider-key strip applied
+    AFTER the ``os.environ`` copy and BEFORE the spawn. Extracted from
+    ``orchestration.local_merge_gate`` to keep that file within its size cap;
+    ``tests/test_local_merge_gate_env.py`` drives the real gate launch path
+    through this helper.
+    """
+    gate_env = {
+        **os.environ,
+        **arm_env(test_slots, role=ROLE_GATE),
+        **ledger_env("gate", issue_number),
+    }
+    return strip_provider_api_keys(gate_env, config)
 
 
 # Env every claude-code worker launches with unless `worker_env` overrides it
@@ -171,7 +308,12 @@ def _is_git_worktree(path: Path) -> bool:
     return git_meta.exists() and not git_meta.is_dir()
 
 
-def sanitize_env(target_path: Path, *, tmp_dir: Path | None = None) -> dict[str, str]:
+def sanitize_env(
+    target_path: Path,
+    *,
+    tmp_dir: Path | None = None,
+    config: "OrchestratorConfig | None" = None,
+) -> dict[str, str]:
     """Return a sanitized environment for worker subprocesses.
 
     Drops VIRTUAL_ENV and UV_PROJECT_ENVIRONMENT from the parent environment
@@ -207,6 +349,14 @@ def sanitize_env(target_path: Path, *, tmp_dir: Path | None = None) -> dict[str,
             directory. See :func:`layout.worker_tmp_dir` for the default
             derivation.
 
+        config: The orchestrator config, so the provider-key variable names
+            configured under ``api_worker.providers`` are popped too
+            (issue #2795) — see :func:`provider_api_key_env_vars`. The default
+            of ``None`` fails open (strips nothing extra) for out-of-tree
+            callers; every in-tree launch site must pass it explicitly — an
+            AST guard test (``tests/test_env_sanitize.py``) fails when a
+            ``sanitize_env(`` call in ``src/`` omits ``config=``.
+
     Returns:
         A sanitized environment dictionary.
     """
@@ -224,6 +374,22 @@ def sanitize_env(target_path: Path, *, tmp_dir: Path | None = None) -> dict[str,
     # every shell/runtime derive PWD from the actual cwd.
     env.pop("PWD", None)
     env.pop("OLDPWD", None)
+    # Issue #2784: strip an IDE ACP session marker from the invoking terminal
+    # (e.g. a Devin Desktop integrated terminal). With ACP_BACKEND present,
+    # devin.exe --print enforces the ACP server credential policy and exits 1
+    # with "Error: Not logged in" even when local CLI credentials are valid.
+    env.pop("ACP_BACKEND", None)
+
+    # Issue #2836: gate claude.ai connectors out of every Claude child when MCP
+    # isolation is on (the config default). This is the one place it is set so
+    # every launch through sanitize_env gets it. config=None resolves to the
+    # defaults, which isolate (matching OrchestratorConfig's own default).
+    _claude_code_cfg = getattr(config, "claude_code", None)
+    isolate_mcp = True if _claude_code_cfg is None else _claude_code_cfg.isolate_mcp
+    if isolate_mcp:
+        env[ENABLE_CLAUDEAI_MCP_SERVERS_VAR] = "false"
+    else:
+        env.pop(ENABLE_CLAUDEAI_MCP_SERVERS_VAR, None)
 
     # A .venv reparse point (junction/symlink) is a view into a shared venv,
     # not an owned local venv. Unlink it inside a worktree so uv cannot
@@ -254,6 +420,14 @@ def sanitize_env(target_path: Path, *, tmp_dir: Path | None = None) -> dict[str,
     # fall back on an enterprise-scoped credential to run ``gh pr merge``.
     for token_var in STRIPPED_GH_TOKEN_VARS:
         env.pop(token_var, None)
+
+    # Issue #2795: never let the orchestrator's api-provider keys reach a
+    # worker session ambiently. The api adapter resolves the key from the
+    # supervisor's own env, which is why the supervisor carries it here —
+    # see strip_provider_api_keys() for the full invariant. config=None
+    # fails open (strips nothing); every in-tree launch site passes config
+    # under the AST guard test, so None only ever reaches out-of-tree callers.
+    strip_provider_api_keys(env, config)
 
     # Issue #502: isolate gh's config directory so the worker cannot fall back
     # to the orchestrator's stored ``gh auth login`` credentials. A
@@ -378,10 +552,13 @@ def resolve_uv_no_sync(
 
 __all__ = [
     "sanitize_env",
+    "provider_api_key_env_vars",
+    "strip_provider_api_keys",
     "resolve_pytest_cap",
     "resolve_uv_no_sync",
     "PYTEST_XDIST_AUTO_NUM_WORKERS_VAR",
     "DEFAULT_PYTEST_XDIST_AUTO_NUM_WORKERS",
     "UV_NO_SYNC_VAR",
+    "ENABLE_CLAUDEAI_MCP_SERVERS_VAR",
     "STRIPPED_GH_TOKEN_VARS",
 ]
