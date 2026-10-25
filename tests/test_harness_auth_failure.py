@@ -281,6 +281,21 @@ def test_length_one_and_exhausted_chains_report_the_block() -> None:
     assert not role_selection.select_for_launch(claude).exhausted, "other harnesses unaffected"
 
 
+@pytest.mark.parametrize("cores", [2, 4, 8])
+def test_the_fixture_repo_launches_every_issue_whatever_the_hosts_core_count(
+    tmp_path: Path, fleet: Path, launched: list, monkeypatch: pytest.MonkeyPatch, cores: int
+) -> None:
+    """The host-load cap defaults to ``cpu_count // 2``: a 4-vCPU CI runner clamped the
+    three-issue wave to two launches while a 16-core workstation never noticed. 8 cores
+    (cap 4, above the wave) is the control."""
+    monkeypatch.setattr(os, "cpu_count", lambda: cores)
+    app, _ = make_app(tmp_path, "a", fleet)
+
+    app.dispatch(limit=3)
+
+    assert len(launched) == len(ISSUES)
+
+
 @LANES
 def test_a_blocked_worker_chain_defers_with_no_claim(
     tmp_path: Path, fleet: Path, launched: list, lane: str

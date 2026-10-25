@@ -68,7 +68,13 @@ def make_config(
     worker: WorkerRoleConfig | None = None, *, enabled: bool = True
 ) -> OrchestratorConfig:
     return OrchestratorConfig(
-        dispatch=DispatchConfig(default_limit=3),
+        # The host-load terms default to a function of ``os.cpu_count()`` (trees =
+        # cpu // 2): on a 4-vCPU runner that is 2, which clamps a 3-issue wave to 2
+        # launches and fails every "all three launched" assertion. Off, the launch
+        # count is the host-independent one these tests mean to pin.
+        dispatch=DispatchConfig(
+            default_limit=3, host_load_max_pytest_processes=0, host_load_max_pytest_trees=0
+        ),
         devin=DevinConfig(),
         worker=worker or WorkerRoleConfig(harness=HARNESS),
         fleet=FleetConfig(harness_auth_block_enabled=enabled),
