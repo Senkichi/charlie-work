@@ -117,8 +117,6 @@ from .review_interdiff import (
     base_turn_cap,
     packet_round_facts,
     round_info_from_record,
-    round_kind_from_record,
-    round_kind_stamp,
 )
 from .worktree import (
     _reap_idle_foreign_writer,
@@ -3685,13 +3683,8 @@ class OrchestratorApp:
         # dispatch side can pin the incremental turn budget, mirror the kind
         # into the dispatch events, and stamp the record. None (unstamped)
         # under the incremental_review kill switch.
-        round_kind, interdiff_files, interdiff_lines, incremental_review_procedure = (
-            packet_round_facts(
-                pr_dir,
-                existing_decision,
-                pr.get("headRefOid"),
-                cfg=self.config.review_dispatch,
-            )
+        round_facts = packet_round_facts(
+            pr_dir, existing_decision, pr.get("headRefOid"), cfg=self.config.review_dispatch
         )
 
         prompt = self._render(
@@ -3716,7 +3709,7 @@ class OrchestratorApp:
                 "prior_review_section": prior_review_section,
                 # Issue #2837: the incremental procedure for a round-2+ packet
                 # with an archive-built interdiff; "" (renders away) otherwise.
-                "incremental_review_procedure": incremental_review_procedure,
+                "incremental_review_procedure": round_facts.procedure,
             },
         )
         prompt_path.write_text(prompt, encoding="utf-8")
@@ -3928,8 +3921,8 @@ class OrchestratorApp:
                 "no_op_rework_attempts_last_head": None,
                 # Issue #2837: this packet's round kind + interdiff size, for
                 # the dispatch-side turn-budget pin and the event mirror;
-                # absent under the kill switch (round_kind None).
-                **round_kind_stamp(round_kind, interdiff_files, interdiff_lines),
+                # absent under the kill switch (round_facts.kind None).
+                **round_facts.stamp,
                 # The conflict epoch resets only on an AFFIRMATIVE mergeable
                 # signal: GitHub reports mergeable UNKNOWN/null for a window
                 # after every push while it recomputes, and the janitor's
@@ -3975,7 +3968,7 @@ class OrchestratorApp:
                     ),
                     # Issue #2837: the round kind + measured interdiff size,
                     # per-packet audit mirror of the dispatch-side event.
-                    **round_kind_stamp(round_kind, interdiff_files, interdiff_lines),
+                    **round_facts.stamp,
                 },
                 state_path=self.paths.state_file,
             )
@@ -4819,11 +4812,9 @@ class OrchestratorApp:
                 # archive-built PR-relative interdiff and its procedure) runs
                 # the smaller base budget; every other kind keeps the flat
                 # ``review_max_turns``. The #1439 escalation multiplies on top.
-                _round_kind = round_kind_from_record(pr_state)
-                _base_cap = base_turn_cap(_round_kind, self.config.review_dispatch)
                 resolved_round_info[pr_number] = round_info_from_record(pr_state)
                 _resolved_cap = resolve_review_turn_cap(
-                    _base_cap,
+                    base_turn_cap(pr_state, self.config.review_dispatch),
                     _structure_mult,
                     _miss_streak,
                     self.config.review_dispatch,

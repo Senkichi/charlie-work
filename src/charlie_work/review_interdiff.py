@@ -34,7 +34,7 @@ of blocking packet generation.
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -146,46 +146,112 @@ def build_pr_interdiff(prior_diff: str, new_diff: str) -> PRInterdiff:
 
 
 def read_optional(path: Path) -> str | None:
-    """Read ``path`` as text, or ``None`` when it is missing/unreadable."""
+    """Read ``path`` as text, or ``None`` when it is missing/unreadable.
+
+    "Unreadable" covers an OS error and bytes that are not valid UTF-8 -- a
+    torn or foreign-encoded ``diff.patch`` degrades the caller to the legacy
+    fallback instead of raising out of packet generation.
+    """
     if not path.exists():
         return None
     try:
         return path.read_text(encoding="utf-8")
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return None
 
 
 def archive_round_diff(pr_dir: Path, round_dir: Path) -> Path | None:
     """Copy the packet's live ``diff.patch`` into a round's archive dir.
 
-    Returns the archived path, or ``None`` when the packet has no diff of its
-    own (legacy round). Atomic via rework_prompts' helper -- the archive dir
-    is polled by readers (import inside the function to avoid the workflow-
-    package cycle).
+    Returns the archived path, or ``None`` when the packet has no readable
+    diff of its own (legacy round) or the archive write fails -- both degrade
+    the next packet to the ``gh.compare_diff`` fallback, and neither may abort
+    ``record_review`` after the verdict has already been recorded. Atomic via
+    rework_prompts' helper -- the archive dir is polled by readers (import
+    inside the function to avoid the workflow-package cycle).
     """
-    live_diff = pr_dir / "diff.patch"
-    if not live_diff.exists():
+    live_diff = read_optional(pr_dir / "diff.patch")
+    if live_diff is None:
         return None
     from .rework_prompts import _write_text_atomic
 
-    _write_text_atomic(round_dir / "diff.patch", live_diff.read_text(encoding="utf-8"))
+    try:
+        _write_text_atomic(round_dir / "diff.patch", live_diff)
+    except OSError:
+        return None
     return round_dir / "diff.patch"
 
 
-def prior_round_diff_path(pr_dir: Path, prior_decision: dict[str, Any]) -> Path | None:
-    """Return the latest archived round's ``diff.patch``, or ``None``.
+def has_terminal_decision(prior_decision: Mapping[str, Any] | None) -> bool:
+    """Whether ``prior_decision`` is a recorded verdict, not a stub.
 
-    Reads only the ``rounds/`` archive (the same source
-    ``_round_history_entries`` renders the prior-review section from), never
-    ``state.json``. Legacy rounds (archived before issue #2837) and the
-    synthetic-fallback round have no ``diff.patch``; ``None`` is the caller's
-    signal to fall back to ``gh.compare_diff``.
+    ``pending`` / ``missing`` / absent are the non-terminal shapes
+    ``OrchestratorApp._review_decision`` resolves a never-reviewed (or
+    corrupt) packet to; none of them is a prior review.
     """
-    entries = _round_history_entries(pr_dir / "rounds", fallback_decision=prior_decision)
+    return isinstance(prior_decision, Mapping) and prior_decision.get("decision") not in (
+        "pending",
+        None,
+        "missing",
+    )
+
+
+def is_round2_review(prior_decision: Mapping[str, Any] | None) -> bool:
+    """Whether a packet build is a round-2+ review (``review()``'s gate).
+
+    A terminal prior verdict that recorded the head it reviewed. Every packet
+    builder (remote and local) gates its prior-review section on this same
+    predicate; ``packet_round_facts`` uses it to resolve the round kind.
+    """
+    return has_terminal_decision(prior_decision) and bool(
+        prior_decision and prior_decision.get("reviewed_head_sha")
+    )
+
+
+@dataclass(frozen=True)
+class IncrementalInputs:
+    """The two PR diffs an incremental interdiff is built from, or why not.
+
+    ``fallback_reason`` is ``None`` exactly when both diffs were read; it is
+    otherwise the ``review_interdiff_fallback`` event's ``reason``. The
+    packet builder and the round-kind classifier both consume this one
+    result, so they cannot disagree about whether the round is incremental.
+    """
+
+    prior_diff: str = ""
+    new_diff: str = ""
+    fallback_reason: str | None = None
+
+    @property
+    def usable(self) -> bool:
+        return self.fallback_reason is None
+
+
+FALLBACK_NO_ARCHIVED_DIFF = "no_archived_diff"
+FALLBACK_ARCHIVE_READ_FAILED = "archive_read_failed"
+
+
+def load_incremental_inputs(
+    pr_dir: Path, entries: list[tuple[int, dict[str, Any]]]
+) -> IncrementalInputs:
+    """Read the latest archived round's diff and the packet's live diff.
+
+    ``entries`` is ``_round_history_entries``' result (oldest first); only the
+    latest round's ``diff.patch`` matters. Legacy rounds (archived before
+    issue #2837) and the synthetic-fallback round have no ``diff.patch``
+    (``no_archived_diff``); an archive or live diff that exists but cannot be
+    read is ``archive_read_failed``.
+    """
     if not entries:
-        return None
-    candidate = pr_dir / "rounds" / f"round-{entries[-1][0]}" / "diff.patch"
-    return candidate if candidate.exists() else None
+        return IncrementalInputs(fallback_reason=FALLBACK_NO_ARCHIVED_DIFF)
+    archived_diff_path = pr_dir / "rounds" / f"round-{entries[-1][0]}" / "diff.patch"
+    if not archived_diff_path.exists():
+        return IncrementalInputs(fallback_reason=FALLBACK_NO_ARCHIVED_DIFF)
+    prior_diff = read_optional(archived_diff_path)
+    new_diff = read_optional(pr_dir / "diff.patch")
+    if prior_diff is None or new_diff is None:
+        return IncrementalInputs(fallback_reason=FALLBACK_ARCHIVE_READ_FAILED)
+    return IncrementalInputs(prior_diff=prior_diff, new_diff=new_diff)
 
 
 def classify_review_round_kind(
@@ -203,21 +269,23 @@ def classify_review_round_kind(
     ``"incremental"`` when the moved-head packet can build the PR-relative
     interdiff from the latest archived round's diff. ``"fallback"`` when a
     prior review exists but the packet cannot operate incrementally: no
-    archived diff (legacy round), an unreadable archive, or a same-head
-    re-review (no interdiff exists at all).
+    archived diff (legacy round), an archive or live diff that cannot be
+    read, or a same-head re-review (no interdiff exists at all).
+
+    The prior head is the latest *archived* round's -- the same source
+    ``_build_prior_review_section`` compares the live head against -- not the
+    flat ``prior_decision`` mirror, so the two cannot classify one packet
+    differently.
     """
     if not incremental_enabled:
         return None
     if not is_round2_review:
         return "first"
-    prior_head_sha = (
-        str(prior_decision.get("reviewed_head_sha")) if isinstance(prior_decision, dict) else ""
-    )
+    entries = _round_history_entries(pr_dir / "rounds", fallback_decision=prior_decision)
+    prior_head_sha = str(entries[-1][1].get("reviewed_head_sha") or "") if entries else ""
     if prior_head_sha and new_head_sha and prior_head_sha == new_head_sha:
         return "fallback"
-    if prior_round_diff_path(pr_dir, prior_decision or {}) is not None:
-        return "incremental"
-    return "fallback"
+    return "incremental" if load_incremental_inputs(pr_dir, entries).usable else "fallback"
 
 
 def count_interdiff(pr_dir: Path) -> tuple[int, int]:
@@ -300,8 +368,15 @@ def round_kind_stamp(
     }
 
 
-def base_turn_cap(round_kind: str | None, cfg: Any) -> int:
-    """Base reviewer turn budget for one round kind (issue #2837).
+def round_kinds_for(
+    prs: Mapping[str, Mapping[str, Any]], pr_numbers: Iterable[int]
+) -> dict[str, str | None]:
+    """The stamped round kind per PR number (string keys, as event payloads carry them)."""
+    return {str(pr): round_kind_from_record(prs.get(str(pr), {})) for pr in pr_numbers}
+
+
+def base_turn_cap(pr_state: Mapping[str, Any], cfg: Any) -> int:
+    """Base reviewer turn budget for a PR record's stamped round kind (issue #2837).
 
     An incremental round runs ``cfg.incremental_review_max_turns``; ``0`` in
     that knob, a ``fallback``/``first``/unstamped kind, or the kill switch,
@@ -309,12 +384,32 @@ def base_turn_cap(round_kind: str | None, cfg: Any) -> int:
     escalation multiplies on top at the claim site.
     """
     if (
-        round_kind == "incremental"
+        round_kind_from_record(pr_state) == "incremental"
         and bool(cfg.incremental_review)
         and int(cfg.incremental_review_max_turns) > 0
     ):
         return int(cfg.incremental_review_max_turns)
     return int(cfg.review_max_turns)
+
+
+@dataclass(frozen=True)
+class PacketRoundFacts:
+    """One packet build's round facts (issue #2837).
+
+    ``kind`` is ``None`` when the ``incremental_review`` kill switch is off (the
+    packet stamps nothing); ``procedure`` is the ``$incremental_review_
+    procedure`` render, non-empty only for an ``incremental`` kind.
+    """
+
+    kind: str | None = None
+    interdiff_files: int = 0
+    interdiff_lines: int = 0
+    procedure: str = ""
+
+    @property
+    def stamp(self) -> dict[str, Any]:
+        """The PR-record / ``review_packet`` event fields (empty when unstamped)."""
+        return round_kind_stamp(self.kind, self.interdiff_files, self.interdiff_lines)
 
 
 def packet_round_facts(
@@ -323,29 +418,26 @@ def packet_round_facts(
     new_head_sha: str | None,
     *,
     cfg: Any,
-) -> tuple[str | None, int, int, str]:
-    """Resolve one packet build's round fact tuple and
-    ``(kind, interdiff_files, interdiff_lines, procedure_text)``.
+) -> PacketRoundFacts:
+    """Resolve one packet build's round kind, measured interdiff and procedure.
 
-    ``procedure_text`` is the ``$incremental_review_procedure`` render (its
-    ``diff_path`` argument resolved by the caller's template convention) --
-    non-empty only for an ``incremental`` kind.
+    Called after the prior-review section was built, so ``interdiff.patch`` is
+    this packet's own (or absent). The procedure's ``diff_path`` is the packet's
+    ``diff.patch``.
     """
     round_kind = classify_review_round_kind(
         pr_dir,
         prior_decision,
         new_head_sha,
         incremental_enabled=bool(cfg.incremental_review),
-        is_round2_review=isinstance(prior_decision, dict)
-        and prior_decision.get("decision") not in ("pending", None, "missing")
-        and bool(prior_decision.get("reviewed_head_sha")),
+        is_round2_review=is_round2_review(prior_decision),
     )
     if round_kind is None:
-        return (None, 0, 0, "")
+        return PacketRoundFacts()
     interdiff_files, interdiff_lines = count_interdiff(pr_dir)
     procedure = (
         render_incremental_review_procedure(str(pr_dir / "diff.patch"))
         if round_kind == "incremental"
         else ""
     )
-    return (round_kind, interdiff_files, interdiff_lines, procedure)
+    return PacketRoundFacts(round_kind, interdiff_files, interdiff_lines, procedure)
