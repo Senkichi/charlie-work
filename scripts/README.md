@@ -23,6 +23,13 @@ stdlib-only; see the notes below before "fixing" one.
   `cmd`-redirect workaround (native stderr reordering/dropping under
   PowerShell — see the inline comments) are load-bearing; do not touch them
   when editing this file.
+- **`fleet-pass.sh`** — the POSIX port of `fleet-pass.ps1` for the Mac host (spec C2
+  of the hosts repo's Mac host adoption design). Same contract: repo root from the
+  script's location, the same log file and markers, the same pause flag
+  (`fleet-pause.json` under `CHARLIE_WORK_FLEET_DIR`, else
+  `${XDG_STATE_HOME:-~/.local/state}/charlie-work`), exit 0 when paused. A launchd
+  LaunchDaemon with a 300 s `StartInterval` runs it; launchd never starts a second
+  instance while one runs. bash 3.2 and BSD-userland safe.
 - **`fleet-pass-hidden.vbs`** — windowless launcher for `fleet-pass.ps1`,
   invoked by the scheduled task via `wscript.exe` so no console window
   flashes. Already self-locating (derives `fleet-pass.ps1`'s path from its
