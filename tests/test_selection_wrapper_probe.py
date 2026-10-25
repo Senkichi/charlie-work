@@ -248,6 +248,28 @@ def test_a_full_verdict_without_a_reason_still_falls_back(
     assert "none given" in unavailable.detail
 
 
+def test_the_real_full_payload_is_recognised(
+    widget: Path, fake_exe: Path, answering: Callable[[RunResult], ExeCalls]
+) -> None:
+    """``tests/fixtures/ci_fleet_select_full.json`` is ``ci-fleet select --format json``'s output.
+
+    Captured live against this repository (empty diff, stale selection map); the
+    unit tests above use the two keys the probe reads, this one pins them to the
+    selector's real shape.
+    """
+    payload = (Path(__file__).parent / "fixtures" / "ci_fleet_select_full.json").read_text(
+        encoding="utf-8"
+    )
+    reason = json.loads(payload)["reason"]
+    answering(_ok(payload))
+    unavailable = selection_wrapper.probe_selection(
+        SelectionTarget(fake_exe, "local/widget", "main"), widget
+    )
+    assert isinstance(unavailable, SelectionUnavailable)
+    assert unavailable.reason == SELECTION_FULL
+    assert reason in unavailable.detail
+
+
 # ---------------------------------------------------------------------------
 # 4. Everything else fails open
 # ---------------------------------------------------------------------------
