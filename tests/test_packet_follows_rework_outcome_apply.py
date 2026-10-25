@@ -71,8 +71,14 @@ def _verdictless_packet_app(tmp_path: Path, *, every_route: bool = True) -> tupl
     return app, gh
 
 
-def _apply_outcome(app: Any, gh: FakeGitHub, tmp_path: Path, body: str) -> None:
-    """Run the real outcome apply: edits the PR body and records the applied body."""
+def _apply_outcome(
+    app: Any, gh: FakeGitHub, tmp_path: Path, body: str, *, server_body: str | None = None
+) -> None:
+    """Run the real outcome apply: edits the PR body and records the applied body.
+
+    ``server_body`` is what GitHub then echoes back when it normalized the text the
+    apply wrote (e.g. trimmed a trailing newline); the live PR carries it afterwards.
+    """
     state = load_state(app.paths.state_file)
     state["issues"]["123"] = {"status": "pr_open", "branch_name": _BRANCH}
     save_state(app.paths.state_file, state)
@@ -96,6 +102,8 @@ def _apply_outcome(app: Any, gh: FakeGitHub, tmp_path: Path, body: str) -> None:
             pr_number=456,
         )
     assert gh.prs[0]["body"] == body
+    if server_body is not None:
+        gh.prs[0]["body"] = server_body
 
 
 def _loop_reviews(app: Any) -> tuple[list[int], Any]:
@@ -165,6 +173,50 @@ def test_third_party_edit_after_the_apply_does_not_rebuild(tmp_path: Path) -> No
     assert result.data["skipped_reviews"] == 1
 
 
+@pytest.mark.parametrize(
+    ("applied_body", "server_body"),
+    [
+        pytest.param(_NEW_BODY + "\n", _NEW_BODY, id="server-trims-trailing-newline"),
+        pytest.param(_NEW_BODY + "  ", _NEW_BODY, id="server-trims-trailing-space"),
+        pytest.param("\n" + _NEW_BODY + "\n\n", _NEW_BODY, id="server-trims-both-ends"),
+        pytest.param(_NEW_BODY, _NEW_BODY + "\n", id="server-adds-trailing-newline"),
+        pytest.param(_NEW_BODY, _NEW_BODY + " ", id="server-adds-trailing-space"),
+    ],
+)
+def test_server_side_whitespace_normalization_still_rebuilds_then_converges(
+    tmp_path: Path, applied_body: str, server_body: str
+) -> None:
+    app, gh = _verdictless_packet_app(tmp_path)
+    _apply_outcome(app, gh, tmp_path, applied_body, server_body=server_body)
+
+    calls, _ = _loop_reviews(app)
+
+    assert calls == [456]  # the apply's own record still matches the echoed body
+    assert _packet_body(app) == server_body
+
+    calls, result = _loop_reviews(app)
+
+    assert calls == []  # and the rebuilt packet reads as current
+    assert result.data["skipped_reviews"] == 1
+
+
+def test_whitespace_only_difference_is_not_a_content_edit(tmp_path: Path) -> None:
+    """The strip must not widen the trigger: a real edit by someone else still never rebuilds."""
+    app, gh = _verdictless_packet_app(tmp_path)
+    _apply_outcome(app, gh, tmp_path, _NEW_BODY + "\n", server_body=_NEW_BODY + "\n\nHuman edit.")
+
+    calls, result = _loop_reviews(app)
+
+    assert calls == []
+    assert result.data["skipped_reviews"] == 1
+
+
+def test_no_op_gate_hash_stays_whitespace_sensitive() -> None:
+    """``_body_content_sha256`` feeds the #1939 gate, where whitespace is content: unchanged."""
+    assert _body_content_sha256("body\n") != _body_content_sha256("body")
+    assert _body_content_sha256("a\r\nb") == _body_content_sha256("a\nb")  # CRLF still folded
+
+
 def test_kill_switch_off_leaves_the_packet_alone(tmp_path: Path) -> None:
     app, gh = _verdictless_packet_app(tmp_path, every_route=False)
     _apply_outcome(app, gh, tmp_path, _NEW_BODY)
@@ -182,7 +234,9 @@ def test_kill_switch_off_leaves_the_packet_alone(tmp_path: Path) -> None:
 
 
 def _state_with_applied(pr_number: int, body: str) -> dict[str, Any]:
-    return {APPLIED_BODIES_KEY: {str(pr_number): _body_content_sha256(body)}}
+    # The apply records the hash of the STRIPPED text, so a padded ``body`` records
+    # the same value as its trimmed form.
+    return {APPLIED_BODIES_KEY: {str(pr_number): _body_content_sha256(body.strip())}}
 
 
 @pytest.mark.parametrize(
@@ -199,6 +253,41 @@ def _state_with_applied(pr_number: int, body: str) -> dict[str, Any]:
             _NEW_BODY,
             False,
             id="crlf-normalized",
+        ),
+        pytest.param(
+            _state_with_applied(456, _NEW_BODY + "\n"),
+            _NEW_BODY,
+            _OLD_BODY,
+            True,
+            id="record-from-padded-body",
+        ),
+        pytest.param(
+            _state_with_applied(456, _NEW_BODY),
+            _NEW_BODY + "\n",
+            _OLD_BODY,
+            True,
+            id="live-trailing-newline-stale",
+        ),
+        pytest.param(
+            _state_with_applied(456, _NEW_BODY),
+            _NEW_BODY + " ",
+            _OLD_BODY,
+            True,
+            id="live-trailing-space-stale",
+        ),
+        pytest.param(
+            _state_with_applied(456, _NEW_BODY),
+            _NEW_BODY + "\n",
+            _NEW_BODY,
+            False,
+            id="live-trailing-newline-packet-current",
+        ),
+        pytest.param(
+            _state_with_applied(456, _NEW_BODY),
+            _NEW_BODY,
+            _NEW_BODY + "  \n",
+            False,
+            id="packet-trailing-whitespace-current",
         ),
         pytest.param({}, _NEW_BODY, _OLD_BODY, False, id="never-applied"),
         pytest.param(

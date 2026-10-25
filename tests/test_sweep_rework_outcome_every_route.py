@@ -38,6 +38,8 @@ from charlie_work.config import (
     WatchdogConfig,
     WorkerRoleConfig,
 )
+from charlie_work.host.clock import format_utc
+from charlie_work.host.fakes import FakeClock
 from charlie_work.instrumentation import query_events
 from charlie_work.state import PASSIVE_OPEN_STATUS, load_state, save_state
 
@@ -381,6 +383,84 @@ def test_transient_edit_failure_holds_the_review_route_until_the_apply_lands(
     assert spy.seen == [{"pr_edits": 1, "pr_comments": 1, "applied_head": head}]
     assert issue_entry(paths, 207)["status"] == "reviewing"
     assert len(events_of(paths, "rework_outcome_apply_failed")) == 1
+
+
+def _fail_every_pr_edit(gh: Any) -> None:
+    def failing_edit(number: int, body_file: Path) -> None:
+        raise RuntimeError("gh: 502 Bad Gateway")
+
+    gh.pr_edit = failing_edit  # type: ignore[method-assign]
+
+
+# ---------------------------------------------------------------------------
+# Criterion 6b: a held head-changed route is bounded by the #654 backstop
+# ---------------------------------------------------------------------------
+
+
+def test_held_head_changed_route_anchors_the_dead_dispatched_backstop(
+    tmp_path: Path, monkeypatch, fake_host
+) -> None:
+    """An apply that can never land ends in the reap; it does not hold the issue forever.
+
+    A held route writes no drift of its own, so ``_head_changed`` anchors
+    ``orphan_drift_at`` itself. Time moves only through the clock port: the anchor is
+    written by the sweep (never seeded here), is not re-armed by a later pass, and the
+    reap fires once ``dead_dispatched_reap_minutes`` have passed since it.
+    """
+    clock = FakeClock(datetime.now(UTC))
+    fake_host(clock=clock)
+    anchored_at = format_utc(clock.now())
+    config, paths, gh, head = _bed(tmp_path, "head_changed")
+    _write_outcome(paths, tmp_path, _payload(head))
+    _fail_every_pr_edit(gh)
+    spy = ReviewSpy(gh, paths)
+
+    _sweep(tmp_path, paths, config, gh, monkeypatch, remote_head=head, review=spy)
+
+    assert spy.calls == []  # held: the apply failed, the reviewer must not see the stale body
+    entry = issue_entry(paths, 207)
+    assert entry["status"] == "dispatched"
+    assert entry["orphan_drift_at"] == anchored_at
+
+    clock.advance(5 * 60)
+    _sweep(tmp_path, paths, config, gh, monkeypatch, remote_head=head, review=spy)
+
+    assert spy.calls == []
+    assert len(events_of(paths, "rework_outcome_apply_failed")) == 2  # still held, retried
+    assert issue_entry(paths, 207)["orphan_drift_at"] == anchored_at  # not re-stamped
+    assert events_of(paths, "dead_dispatched_worker_reaped") == []  # inside the window
+
+    clock.advance(config.watchdog.dead_dispatched_reap_minutes * 60)
+    _sweep(tmp_path, paths, config, gh, monkeypatch, remote_head=head, review=spy)
+
+    (reaped,) = events_of(paths, "dead_dispatched_worker_reaped")
+    assert reaped["payload"]["issue_number"] == 207
+    assert reaped["payload"]["orphan_drift_at"] == anchored_at
+    entry = issue_entry(paths, 207)
+    assert entry["status"] == "escalated"
+    assert entry["escalation_reason"] == "dead_dispatched_worker_reap"
+    assert spy.calls == []  # never reviewed the stale body
+
+
+@pytest.mark.parametrize("control", ["kill_switch_off", "no_outcome"])
+def test_head_changed_route_that_is_not_held_stamps_no_anchor(
+    tmp_path: Path, monkeypatch, control: str
+) -> None:
+    """The anchor belongs to a HELD route only: a review that proceeds writes no drift."""
+    config, paths, gh, head = _bed(
+        tmp_path, "head_changed", every_route=control != "kill_switch_off"
+    )
+    if control == "kill_switch_off":
+        _write_outcome(paths, tmp_path, _payload(head))
+    spy = ReviewSpy(gh, paths)
+
+    _sweep(tmp_path, paths, config, gh, monkeypatch, remote_head=head, review=spy)
+
+    assert spy.calls == [100]  # not held
+    entry = issue_entry(paths, 207)
+    assert entry["status"] == "reviewing"
+    assert entry.get("orphan_drift_at") is None
+    assert gh.pr_edits == []
 
 
 # ---------------------------------------------------------------------------

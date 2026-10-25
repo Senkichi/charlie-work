@@ -58,11 +58,25 @@ logger = logging.getLogger(__name__)
 # makes outcome application exactly-once per reported head.
 APPLIED_HEADS_KEY = "rework_outcome_applied_heads"
 
-# State key holding {pr_number: body_content_sha256} — the body an apply last wrote
+# State key holding {pr_number: _applied_body_sha256} — the body an apply last wrote
 # to each PR (only recorded when a ``pr_body`` was actually pushed). It lets the
 # reviewer-packet currency check tell "the body changed because of an apply" (rebuild
 # the verdictless packet, issue #2826) from "someone edited the body" (no new trigger).
 APPLIED_BODIES_KEY = "rework_outcome_applied_bodies"
+
+
+def _applied_body_sha256(body: object) -> str:
+    """Hash of a PR body as the apply record and its currency check compare it (#2826).
+
+    The record is written from the worker-authored ``pr_body`` but compared with the
+    body GitHub echoes back, and the server may trim leading/trailing whitespace (a
+    trailing newline from the worker's file, say). Both sides are stripped here, in one
+    place, so that artifact never reads as "the body changed" -- the recorded hash and
+    the live hash must agree on exactly the apply's own text. This is deliberately NOT
+    ``_body_content_sha256`` itself: that hash feeds the no-op-rework gate (#1939),
+    where whitespace is real content, so it stays whitespace-sensitive.
+    """
+    return _body_content_sha256(body.strip() if isinstance(body, str) else body)
 
 
 def _emit_event(
@@ -549,7 +563,7 @@ def apply_rework_worker_outcome(
         if body_updated and pr_body:
             applied_bodies = state.setdefault(APPLIED_BODIES_KEY, {})
             if isinstance(applied_bodies, dict):
-                applied_bodies[str(pr_number)] = _body_content_sha256(pr_body)
+                applied_bodies[str(pr_number)] = _applied_body_sha256(pr_body)
         state = write_gate.append_event(
             state,
             "rework_outcome_applied",
@@ -575,7 +589,8 @@ def applied_body_outdates_packet(
     on the body only for ``request_changes`` drift (#1983), so a verdictless packet built
     from the OLD body is served to the reviewer after the apply edits the body -- the
     reviewer then asks for a body fix no worker can make. The trigger is deliberately
-    narrow: it needs a recorded apply for this PR whose body hash EQUALS the live body's.
+    narrow: it needs a recorded apply for this PR whose body hash EQUALS the live body's
+    (both whitespace-stripped, so a server-side trim of the applied text still matches).
     A body edited by anyone else since (or never applied) matches no record, so it
     never rebuilds a packet. A packet with no readable body cannot show it carries the
     applied text, so it reads as outdated (rebuilt once; the rebuilt packet stores the body).
@@ -584,10 +599,10 @@ def applied_body_outdates_packet(
     if not isinstance(recorded_bodies, Mapping):
         return False
     recorded = recorded_bodies.get(str(pr_number))
-    live_sha = _body_content_sha256(live_body)
+    live_sha = _applied_body_sha256(live_body)
     if not isinstance(recorded, str) or not recorded or recorded != live_sha:
         return False
-    return packet_body is None or _body_content_sha256(packet_body) != live_sha
+    return packet_body is None or _applied_body_sha256(packet_body) != live_sha
 
 
 def apply_collected_rework_outcomes(
