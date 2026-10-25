@@ -76,6 +76,46 @@ def reviewer_quota_alert_digest(
     )
 
 
+def harness_auth_alert_digest(
+    generated_at: str,
+    harness: str,
+    *,
+    evidence: str,
+    affected: Mapping[str, Any],
+    next_probe_at: str,
+) -> AttentionDigest:
+    """The once-per-episode HARNESS_AUTH_BLOCKED digest (issue #2810).
+
+    ``affected`` maps each repo whose launch died of the dead credential to its
+    issue numbers; the digest names them and the next probe time so the
+    operator can fix the credential knowing the fleet resumes by itself. The
+    fleet is the subject, so ``repo`` is ``"fleet"`` and ``issue_number`` is 0.
+    """
+    affected_text = "; ".join(
+        f"{repo}: {', '.join(f'#{n}' for n in issues)}"
+        for repo, issues in sorted(affected.items())
+    )
+    return AttentionDigest(
+        generated_at=generated_at,
+        repo="fleet",
+        transitions=(
+            AttentionEntry(
+                issue_number=0,
+                adapter_kind=harness,
+                health="HARNESS_AUTH_BLOCKED",
+                previous_health=None,
+                last_log_line=evidence or None,
+                pid=None,
+                terminal_tool=None,
+                terminal_reason=(
+                    f"launches on {harness} are blocked fleet-wide; next probe {next_probe_at}"
+                    + (f"; affected {affected_text}" if affected_text else "")
+                ),
+            ),
+        ),
+    )
+
+
 @dataclass(frozen=True)
 class DigestFileStatus:
     """Probe result for the file sink's digest file (issue #1859).
@@ -174,6 +214,9 @@ _DESKTOP_SEVERITIES = frozenset(
         "RUNAWAY",
         "DEAD",
         "ERROR",
+        # Issue #2810: a harness whose credential is dead stops every launch on
+        # it fleet-wide; the alert is once per episode, so it is toast-worthy.
+        "HARNESS_AUTH_BLOCKED",
         # Issue #1768: the operator-queue-impact edge-triggered alert
         # (``AttentionEntry(issue_number=0, adapter_kind="operator_queue",
         # health="OPERATOR_QUEUE_IMPACT", ...)``) is genuinely rare by

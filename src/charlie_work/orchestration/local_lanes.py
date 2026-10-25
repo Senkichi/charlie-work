@@ -805,7 +805,9 @@ def _local_dispatch_reviewers(self, *, now: Any = None, launch_lock: Any = None)
     if not selected:
         return result
     # Issue #2086: the reviewer role chain, resolved against the fleet ledger.
-    role_sel = role_selection.select_for_launch(self.config.reviewer.chain)
+    role_sel = role_selection.select_for_launch(
+        self.config.reviewer.chain, harness_auth=role_selection.harness_auth_enabled(self.config)
+    )
     if role_sel.exhausted:
         # ``result["skipped"]`` is a list of PR numbers; the chain's
         # SkippedEntry payloads go under ``chain_skipped`` so neither clobbers
@@ -814,7 +816,9 @@ def _local_dispatch_reviewers(self, *, now: Any = None, launch_lock: Any = None)
         chain_fields["chain_skipped"] = chain_fields.pop("skipped")
         return {
             **result,
-            "deferred_reason": "reviewer_chain_exhausted",
+            "deferred_reason": role_selection.REASON_HARNESS_AUTH_BLOCKED
+            if role_sel.harness_auth_blocked
+            else "reviewer_chain_exhausted",
             **chain_fields,
             "skipped": [*result["skipped"], *selected],
         }

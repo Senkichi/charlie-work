@@ -7,7 +7,13 @@ skipped. Every worker and reviewer launch site calls it through
 :func:`select_for_launch`.
 
 A chain of length 1 (no ``fallbacks:`` configured) short-circuits to its
-primary without reading the ledger -- the pre-#2086 behavior, byte for byte.
+primary without reading the per-model ledger -- the pre-#2086 behavior, byte
+for byte. The one thing it does read is the harness-wide block (issue #2810):
+a dead harness credential fails every launch on that harness, so a chain with
+no fallback must stop too, and a chain with one on another harness must move to
+it. Selection routes around a block exactly as around a quota window; an
+exhausted chain is a ``harness_auth_blocked`` deferral, not ``provider_throttled``.
+``fleet.harness_auth_block_enabled: false`` removes the block from every read.
 
 The per-repo throttle windows (``state["throttled_until"]`` for workers,
 ``state["reviewer_quota"]`` for reviewers) keep their meaning of "this repo
@@ -61,6 +67,11 @@ logger = logging.getLogger(__name__)
 
 EVENT_ROLE_FALLBACK_SELECTED = "role_fallback_selected"
 
+# Why an exhausted chain defers a launch (issue #2810 split the second out of the first):
+# a quota window the ledger holds, or a harness whose CLI cannot authenticate.
+REASON_PROVIDER_THROTTLED = "provider_throttled"
+REASON_HARNESS_AUTH_BLOCKED = "harness_auth_blocked"
+
 # Shared immutable default for ``RoleSelection.restrictions``.
 _EMPTY_RESTRICTIONS: Mapping[tuple[str, str], datetime] = MappingProxyType({})
 
@@ -72,12 +83,18 @@ def _format_z(moment: datetime) -> str:
 
 @dataclass(frozen=True)
 class SkippedEntry:
+    """A chain entry selection passed over; ``harness_auth`` marks a harness-wide block."""
+
     index: int
     entry: RoleEntry
     until: datetime
+    harness_auth: bool = False
 
     def to_payload(self) -> dict[str, Any]:
-        return {**self.entry.to_payload(), "index": self.index, "until": _format_z(self.until)}
+        payload = {**self.entry.to_payload(), "index": self.index, "until": _format_z(self.until)}
+        if self.harness_auth:
+            payload["harness_auth"] = True
+        return payload
 
 
 @dataclass(frozen=True)
@@ -134,6 +151,18 @@ class RoleSelection:
         return self.entry is None
 
     @property
+    def harness_auth_blocked(self) -> bool:
+        """Exhausted, and at least one entry was passed over for a dead harness credential."""
+        return self.exhausted and any(item.harness_auth for item in self.skipped)
+
+    @property
+    def exhausted_reason(self) -> str:
+        """The deferral reason for an exhausted chain (meaningful only when ``exhausted``)."""
+        return (
+            REASON_HARNESS_AUTH_BLOCKED if self.harness_auth_blocked else REASON_PROVIDER_THROTTLED
+        )
+
+    @property
     def earliest_until(self) -> datetime | None:
         """When the first restricted entry frees up (the all-exhausted retry time)."""
         return min((item.until for item in self.skipped), default=None)
@@ -171,13 +200,19 @@ def select_role_entry(
     """First chain entry not restricted at ``now``, and the restricted ones before it.
 
     Pure. A ledger ``until`` at or before ``now`` has expired and restricts
-    nothing. Returns ``(None, skipped)`` when every entry is restricted.
+    nothing. An entry is also restricted by its harness's wide block (issue
+    #2810, :func:`role_quota_ledger.effective_restriction`). Returns
+    ``(None, skipped)`` when every entry is restricted.
     """
     skipped: list[SkippedEntry] = []
     for index, entry in enumerate(chain):
-        until = ledger.get(entry.key)
-        if until is not None and until > now:
-            skipped.append(SkippedEntry(index=index, entry=entry, until=until))
+        until, harness_wide = role_quota_ledger.effective_restriction(
+            ledger, entry.harness, entry.model, now
+        )
+        if until is not None:
+            skipped.append(
+                SkippedEntry(index=index, entry=entry, until=until, harness_auth=harness_wide)
+            )
             continue
         return entry, tuple(skipped)
     return None, tuple(skipped)
@@ -197,16 +232,46 @@ def build_selection(
     )
 
 
-def select_for_launch(chain: Sequence[RoleEntry], now: datetime | None = None) -> RoleSelection:
-    """Selection for a real launch: reads the fleet ledger for chains longer than 1.
+def harness_auth_enabled(config: Any) -> bool:
+    """``fleet.harness_auth_block_enabled`` of ``config`` (True when the section is absent)."""
+    return bool(getattr(getattr(config, "fleet", None), "harness_auth_block_enabled", True))
 
-    Never raises -- ``load_restrictions`` degrades to an empty ledger.
+
+def ledger_for_chain(
+    chain: Sequence[RoleEntry], *, harness_auth: bool = True
+) -> dict[tuple[str, str], datetime]:
+    """The ledger snapshot a selection over ``chain`` runs against. Never raises.
+
+    A chain longer than 1 reads the whole ledger; a length-1 chain reads only
+    the harness-wide blocks (see the module docstring) and, with
+    ``harness_auth=False`` (the kill switch), nothing at all -- the pre-#2810
+    behaviour byte for byte.
+    """
+    if len(chain) > 1:
+        return role_quota_ledger.load_restrictions(harness_auth=harness_auth)
+    return role_quota_ledger.load_harness_restrictions() if harness_auth else {}
+
+
+def select_for_launch(
+    chain: Sequence[RoleEntry], now: datetime | None = None, *, harness_auth: bool = True
+) -> RoleSelection:
+    """Selection for a real launch: reads the fleet ledger (see :func:`ledger_for_chain`).
+
+    Never raises -- the ledger readers degrade to an empty ledger.
     """
     chain_tuple = tuple(chain)
-    if len(chain_tuple) <= 1:
+    ledger = ledger_for_chain(chain_tuple, harness_auth=harness_auth)
+    if not ledger and len(chain_tuple) <= 1:
         return RoleSelection(chain=chain_tuple, entry=chain_tuple[0], index=0, skipped=())
     resolved_now = now if now is not None else datetime.now(UTC)
-    return build_selection(chain_tuple, role_quota_ledger.load_restrictions(), resolved_now)
+    return build_selection(chain_tuple, ledger, resolved_now)
+
+
+def select_for_config(
+    chain: Sequence[RoleEntry], config: Any, now: datetime | None = None
+) -> RoleSelection:
+    """:func:`select_for_launch` honoring ``config``'s harness-auth kill switch."""
+    return select_for_launch(chain, now, harness_auth=harness_auth_enabled(config))
 
 
 def reselect_within_harness_caps(
@@ -235,9 +300,13 @@ def reselect_within_harness_caps(
     skipped: list[SkippedEntry] = []
     capped: list[CappedEntry] = []
     for index, entry in enumerate(selection.chain):
-        until = selection.restrictions.get(entry.key)
-        if until is not None and until > resolved_now:
-            skipped.append(SkippedEntry(index=index, entry=entry, until=until))
+        until, harness_wide = role_quota_ledger.effective_restriction(
+            selection.restrictions, entry.harness, entry.model, resolved_now
+        )
+        if until is not None:
+            skipped.append(
+                SkippedEntry(index=index, entry=entry, until=until, harness_auth=harness_wide)
+            )
             continue
         if free_slots(entry.harness) == 0:
             capped.append(CappedEntry(index=index, entry=entry))
@@ -323,7 +392,7 @@ def reviewer_window_covered(state: Mapping[str, Any], selection: RoleSelection) 
 
 def resolve_reviewer(config: Any) -> tuple[RoleSelection, Any]:
     """Select the reviewer chain entry and the config derived for it (issue #2086)."""
-    selection = select_for_launch(config.reviewer.chain)
+    selection = select_for_config(config.reviewer.chain, config)
     return selection, reviewer_config_for(config, selection)
 
 

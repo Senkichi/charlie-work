@@ -18,6 +18,7 @@ from pathlib import Path
 
 from .config import OrchestratorConfig
 from .throttle_signatures import (
+    HARNESS_AUTH_FAILED_KIND,
     PERMISSION_DENIED_FAILURE_KIND,
     is_headless_permission_denial,
     is_provider_auth_failure,
@@ -360,6 +361,34 @@ def _throttle_emission_anchor(
     return min(anchor, now)
 
 
+def harness_auth_evidence_from_log(
+    log_path: Path,
+    harness_auth_evidence: Callable[[str], str | None],
+    *,
+    log_digest: Callable[[str], str] | None = None,
+) -> str | None:
+    """The evidence line ``classify_failure`` matched for ``harness_auth_failed``.
+
+    Re-reads the same 2KB tail through the same ``signature_match_text`` filter
+    and hands it to the harness's own matcher, so the evidence carried on the
+    ``harness_auth_blocked`` alert is exactly the line the classification fired
+    on -- ``classify_failure``'s ``(kind, throttled_until)`` return shape stays
+    untouched (many callers and tests unpack it). ``None`` when the log is
+    missing/unreadable or does not match. Never raises.
+    """
+    try:
+        log_text = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    if log_digest is not None:
+        log_text = log_digest(log_text)
+    tail = log_text[-2048:] if len(log_text) > 2048 else log_text
+    match_tail = signature_match_text(
+        tail, cut=len(log_text) > len(tail), stream_json=log_is_stream_json(log_text)
+    )
+    return harness_auth_evidence(match_tail)
+
+
 def classify_failure(
     log_path: Path,
     throttle_error_markers: Sequence[str] | None = None,
@@ -371,19 +400,27 @@ def classify_failure(
     now: datetime | None = None,
     log_digest: Callable[[str], str] | None = None,
     quota_reset: Callable[[str], timedelta | None] | None = None,
+    harness_auth_evidence: Callable[[str], str | None] | None = None,
 ) -> tuple[str | None, str | None]:
     """Classify a session failure by matching the log tail against provider
     throttle/auth/suspension signatures. Called after a session exits.
 
     Returns (failure_kind, throttled_until_iso):
     - failure_kind: "provider_suspended" | "provider_auth" | "rate_limited" |
-      "quota_exhausted" | "permission_denied" | None
+      "quota_exhausted" | "harness_auth_failed" | "permission_denied" | None
     - throttled_until_iso: ISO timestamp the cooldown ends, or None (always
-      None for "provider_suspended" -- terminal, no cooldown)
+      None for "provider_suspended" -- terminal, no cooldown -- and for
+      "harness_auth_failed", whose fleet-wide block lives in the quota ledger)
 
     ``account_error_detection`` (api only) enables the ``provider_suspended``
     (#1342) and ``provider_auth`` (#484) checks, both checked before
     quota/throttle so neither masquerades as a transient issue.
+
+    ``harness_auth_evidence`` (``AdapterFateProfile.harness_auth_evidence``,
+    issue #2810) is the harness's own matcher for "the CLI could not
+    authenticate"; ``None`` (every harness but devin-shell) disables the
+    check. A hit is ``harness_auth_failed``, checked before quota/throttle so
+    a dead credential never masquerades as a transient limit.
 
     ``headless_permission_detection`` (claude-code, issue #2010) enables the
     ``permission_denied`` check. It is checked LAST so throttle/auth
@@ -470,6 +507,9 @@ def classify_failure(
         return "provider_auth", throttled_until.replace(microsecond=0).isoformat().replace(
             "+00:00", "Z"
         )
+
+    if harness_auth_evidence is not None and harness_auth_evidence(match_tail) is not None:
+        return HARNESS_AUTH_FAILED_KIND, None
 
     quota_markers = (
         quota_error_markers

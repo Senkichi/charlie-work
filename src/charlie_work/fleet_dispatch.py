@@ -67,7 +67,7 @@ from .fleet_stop import (
     fleet_stop_pending,
     supervise_loop_interrupted_result,
 )
-from . import launchd_probe, layout
+from . import harness_auth_block, launchd_probe, layout
 from .github import GitHub, GitHubError
 from .global_config import (
     describe_config_file,
@@ -1984,6 +1984,16 @@ def fleet_loop(
     # Allocation first: moving an idle slot to a starved repo is free, so it
     # runs before autoscale decides the host needs more runners registered.
     if not work_only:
+        # Issue #2810: harness-auth episodes -- alert once, run the cheap
+        # credential check once the block lapses, end the episode when the
+        # single probe launch survived. A no-op with no block recorded.
+        harness_auth_block.run_fleet_pass(
+            global_config,
+            fleet_dir_override=fleet_dir_override,
+            fleet_state_path=fleet_state_path,
+            notify_config=notify_config,
+            dry_run=dry_run,
+        )
         allocation_lane_start = pass_clock()
         attention_events.extend(
             _run_fleet_allocation_prologue(fleet_dir_override, global_config, dry_run)

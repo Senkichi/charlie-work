@@ -287,6 +287,10 @@ KNOWN_IGNORED: dict[str, str] = {
     "local_work_ready": "local (no-remote) lane bookkeeping",
     "worktree_unsafe_stranded_salvaged": "stranded-commit salvage record",
     "worktree_unsafe_stranded_salvage_failed": "stranded-commit salvage record",
+    # -- Harness-auth episode (issue #2810): fleet-level, written to the fleet events.db;
+    #    no per-issue flow fact (the affected issues ride in the payload for the operator).
+    "harness_auth_blocked": "fleet-level harness-auth episode start; no per-issue rollup fact",
+    "harness_auth_resumed": "fleet-level harness-auth episode end; no per-issue rollup fact",
     # -- Registered kinds the static emit scan cannot see (dynamic or allow-listed
     #    emit sites, or kinds retained for older events DBs): same bookkeeping class.
     "api_worker_provider_suspended": "provider-suspension record for API workers",

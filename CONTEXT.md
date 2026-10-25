@@ -90,8 +90,12 @@ The ordered list of (harness, model) entries a role may launch on: the configure
 _Avoid_: Waterfall (only in prose about the feature), fallback list, model rotation
 
 **Quota ledger**:
-The fleet-wide record of which (harness, model) pairs are restricted by a provider quota or rate limit, and until when. Entries are learned from a classified worker or reviewer death and keyed by what that session actually ran on, never by config. They only expire; nothing clears them early.
+The fleet-wide record of which (harness, model) pairs are restricted by a provider quota or rate limit, and until when. Entries are learned from a classified worker or reviewer death and keyed by what that session actually ran on, never by config. They only expire; nothing clears them early. The one exception is a **Harness block**, which a probe clears.
 _Avoid_: Throttle (the per-repo window), rate-limit cache
+
+**Harness block**:
+A quota-ledger record (key `<harness>|*`) that a harness's CLI cannot authenticate, so every launch on it fails the same way whatever the issue, repo or model. It is learned from a `harness_auth_failed` death (distinct from `provider_auth`, the api harness's own failure), charged to no cap, alerted once per episode, and cleared by proof: a credential check, then one real launch that outlives the survival period. `fleet.harness_auth_block_enabled` is its kill switch.
+_Avoid_: Auth throttle, login window
 
 **Rework**:
 A new worker run against an existing PR to address review findings or conflicts.
