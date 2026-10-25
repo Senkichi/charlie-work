@@ -64,7 +64,7 @@ def _valid(name: str, value: object, default: object) -> bool:
     return isinstance(value, type(default))
 
 
-def load_state(fleet_dir: Path, repo: str) -> RepoSyncState:
+def load_sync_state(fleet_dir: Path, repo: str) -> RepoSyncState:
     try:
         raw = json.loads(state_path(fleet_dir, repo).read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -78,7 +78,7 @@ def load_state(fleet_dir: Path, repo: str) -> RepoSyncState:
     return RepoSyncState(**values)
 
 
-def save_state(fleet_dir: Path, repo: str, state: RepoSyncState) -> None:
+def save_sync_state(fleet_dir: Path, repo: str, state: RepoSyncState) -> None:
     path = state_path(fleet_dir, repo)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)

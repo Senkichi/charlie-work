@@ -6,7 +6,12 @@ from pathlib import Path
 
 import pytest
 
-from charlie_work.main_sync_state import RepoSyncState, load_state, save_state, state_path
+from charlie_work.main_sync_state import (
+    RepoSyncState,
+    load_sync_state,
+    save_sync_state,
+    state_path,
+)
 
 
 def test_round_trip(tmp_path: Path) -> None:
@@ -19,13 +24,13 @@ def test_round_trip(tmp_path: Path) -> None:
         history_alarmed=True,
         budget_skipped=True,
     )
-    save_state(tmp_path, "owner/repo", state)
+    save_sync_state(tmp_path, "owner/repo", state)
     assert state_path(tmp_path, "owner/repo") == tmp_path / "main-sync" / "owner__repo.json"
-    assert load_state(tmp_path, "owner/repo") == state
+    assert load_sync_state(tmp_path, "owner/repo") == state
 
 
 def test_missing_file_is_fresh(tmp_path: Path) -> None:
-    assert load_state(tmp_path, "o/r") == RepoSyncState()
+    assert load_sync_state(tmp_path, "o/r") == RepoSyncState()
 
 
 @pytest.mark.parametrize(
@@ -42,20 +47,20 @@ def test_corrupt_or_mistyped_file_is_fresh(tmp_path: Path, text: str) -> None:
     path = state_path(tmp_path, "o/r")
     path.parent.mkdir(parents=True)
     path.write_text(text, encoding="utf-8")
-    assert load_state(tmp_path, "o/r") == RepoSyncState()
+    assert load_sync_state(tmp_path, "o/r") == RepoSyncState()
 
 
 def test_unknown_keys_are_ignored(tmp_path: Path) -> None:
     path = state_path(tmp_path, "o/r")
     path.parent.mkdir(parents=True)
     path.write_text('{"failure_streak": 1, "from_the_future": 9}', encoding="utf-8")
-    assert load_state(tmp_path, "o/r") == RepoSyncState(failure_streak=1)
+    assert load_sync_state(tmp_path, "o/r") == RepoSyncState(failure_streak=1)
 
 
 def test_save_never_raises(tmp_path: Path) -> None:
     blocker = tmp_path / "main-sync"
     blocker.write_text("a file where the directory should be", encoding="utf-8")
-    save_state(tmp_path, "o/r", RepoSyncState(failure_streak=1))  # logs, does not raise
+    save_sync_state(tmp_path, "o/r", RepoSyncState(failure_streak=1))  # logs, does not raise
 
 
 def test_alarmed_property() -> None:
