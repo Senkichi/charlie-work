@@ -425,11 +425,16 @@ def _load_layered_config(
         # that was rolled back. This is the case the field earns its keep
         # on -- the warning below scrolls away, the value does not.
         repo_only = replace(load_config(repo_config_path), sources=(str(repo_config_path),))
+        # ``exc`` is the validation error that triggered the discard and names the
+        # section and key (``claude_code: expected known keys ..., got unknown
+        # key(s) ...``); without it the warning and the wrong effective values
+        # are the only symptoms (issue #2850).
         logger.warning(
             "Layered config: merged load failed validation; the global "
             "layer was discarded and the per-repo config used alone. "
-            "global path=%s",
+            "global path=%s: %s",
             global_config_path,
+            exc,
         )
         return repo_only
 
