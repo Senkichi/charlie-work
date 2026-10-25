@@ -48,9 +48,17 @@ from .config import (
     _DEFAULT_CLAUDE_MODEL,
 )
 from .env_sanitize import build_worker_env, resolve_pytest_cap, resolve_uv_no_sync, sanitize_env
+from .failure_classifier import log_is_stream_json, signature_match_text
 from .post_mortem import merge_attempt_snapshot
 from .state import _canonical_started_at, utc_now
 from .subprocess_runner import RunResult, resolve_cli_binary, run_captured
+from .tee_launch import TeeLaunchError, launch_tee
+
+# Facade re-export (issue #2836 review): the tool-scope pin lives in its own
+# domain module (``tool_scope``) so new code never lands in this over-cap
+# monolith; every existing consumer (tests, doctor, sibling adapters) imports
+# it from here.
+from .tool_scope import _apply_tool_scope  # noqa: F401
 from .throttle_signatures import (
     PERMISSION_DENIED_FAILURE_KIND,
     is_headless_permission_denial,
@@ -79,6 +87,7 @@ PROMPT_FILENAME = CLAUDE_CODE_PROMPT_FILENAME
 
 logger = logging.getLogger(__name__)
 
+
 # Provider authentication failures (issue #484): matched against the log tail
 # of api-kind sessions only — a dead/invalid API key against a custom
 # Anthropic-compatible endpoint surfaces as 401/403 or an explicit
@@ -96,7 +105,18 @@ logger = logging.getLogger(__name__)
 
 def worker_permission_denied(sessions_dir: Path, issue_number: int, detail: str = "") -> bool:
     """Whether a dead claude-code worker's outcome ``detail`` or log tail shows
-    the headless permission-denial signature (issue #2010). Never raises."""
+    the headless permission-denial signature (issue #2010). Never raises.
+
+    The log-tail check runs through
+    ``failure_classifier.signature_match_text`` (issue #2814 rework), in
+    permission mode (round 4): in a tee'd stream-json log a ``tool_result``
+    merely *quoting* "requires approval" / "command was denied" is the worker
+    observing a denial, not the CLI surfacing one — matching it raw would
+    both suppress a real deny and manufacture a fake one. But a REAL headless
+    denial reports ``is_error: false`` in the terminal ``result`` event (and
+    the assistant's final turn), so unlike the throttle/quota matchers this
+    one admits those lines. The tail's shape comes off the whole log head and
+    the cut flag drops the slice's partial first line."""
     if is_headless_permission_denial(detail):
         return True
     try:
@@ -108,7 +128,15 @@ def worker_permission_denied(sessions_dir: Path, issue_number: int, detail: str 
         )
     except (OSError, ValueError, AttributeError):
         return False
-    return is_headless_permission_denial(log_text[-2048:])
+    tail = log_text[-2048:] if len(log_text) > 2048 else log_text
+    return is_headless_permission_denial(
+        signature_match_text(
+            tail,
+            cut=len(log_text) > len(tail),
+            stream_json=log_is_stream_json(log_text),
+            permission=True,
+        )
+    )
 
 
 # N3 (wf-review-opus.md, wf-8-review-fixes): the matching pattern itself now
@@ -880,6 +908,12 @@ def run_quota_probe(*, repo_root: Path, config: OrchestratorConfig) -> bool:
     probe = config.quota_probe
     command = _apply_model_pin(_REVIEW_COMMAND_TEMPLATE, probe.model)
     command = _apply_max_turns_pin(command, 1)
+    # Issue #2836: the probe gets the reviewer's tool scope so it does not pay
+    # the full default tool-schema block on a call that only exists to look
+    # at a throttle signature.
+    command = _apply_tool_scope(
+        command, config.claude_code.reviewer_tools, config.claude_code.isolate_mcp
+    )
     # Load no settings files: quota is account-level, so the probe needs none, and
     # running in ``repo_root`` would otherwise fire the operator's SessionStart
     # hooks (a git fetch + fast-forward) inside the probe's timeout.
@@ -912,12 +946,21 @@ def _render_command(
 ) -> tuple[str, ...]:
     # Same placeholder set as devin_shell so the two adapters' command
     # templates are drop-in compatible: {prompt_path} {issue_number} {branch}.
+    # One literal allowance (issue #2836): the inline ``--mcp-config
+    # {"mcpServers":{}}`` token _apply_tool_scope appends carries literal
+    # braces and must pass through byte-identical, not through str.format
+    # (which would raise KeyError on `"mcpServers"` treated as field name).
+    # Everything else keeps the old format-everything behavior, including an
+    # unknown placeholder raising into the render-error record path.
     values = {
         "prompt_path": str(prompt_path),
         "issue_number": str(issue_number),
         "branch": branch,
     }
-    return tuple(part.format(**values) for part in command_template)
+    return tuple(
+        part if part.startswith('{"mcpServers"') else part.format(**values)
+        for part in command_template
+    )
 
 
 def launch_claude_worker(
@@ -1103,6 +1146,16 @@ def launch_claude_worker(
         effort = resolved_config.claude_code.effort
     if cli_pins is None:
         command_template = _apply_effort_pin(command_template, effort)
+        # Issue #2836: narrow the tool surface and (by default) drop MCP
+        # servers for every Claude launch. Skipped on the cli_pins path — that
+        # is the non-Claude CLI (opencode), where these flags are invalid and
+        # the caller owns the argv.
+        _claude_code_cfg = resolved_config.claude_code
+        command_template = _apply_tool_scope(
+            command_template,
+            _claude_code_cfg.reviewer_tools if review else _claude_code_cfg.worker_tools,
+            _claude_code_cfg.isolate_mcp,
+        )
     if review:
         # Cap agentic turns for reviewer sessions to prevent unbounded
         # codebase exploration and runaway token spend. 0 = unlimited.
@@ -1359,79 +1412,45 @@ def launch_claude_worker(
     uv_no_sync, uv_no_sync_source = resolve_uv_no_sync(worktree.path, sanitized_env, env)
 
     try:
-        # If tee_stream_json is enabled, we need to tee stdout to both log and events file
-        # Use subprocess.PIPE and a thread to write to both files
+        # If tee_stream_json is enabled, the tee is a separate splitter child
+        # process (``tee_splitter.py``) that owns the pipe's read end: the
+        # worker CLI's stdout is wired to the splitter's stdin, so the pipe
+        # survives the launching supervisor process exiting (self-deploy
+        # restart, fleet pause). Destination pre-create, splitter spawn, and
+        # the stdin handoff live in ``tee_launch.launch_tee`` (issue #2814
+        # rework round 4 extraction); a TeeLaunchError here is the same
+        # pre-spawn launch error record every other launch step produces,
+        # while the WORKER spawn's OSError is re-raised into the shared
+        # handler below.
         if tee_stream_json and events_path:
-            # Open handles without 'with' blocks - the thread will manage their lifecycle
-            # This is necessary because the thread runs as a daemon and must keep handles
-            # open for the entire worker lifetime, not just during launch
-            log_handle = log_path.open("w", encoding="utf-8", errors="replace")
-            events_handle = events_path.open("w", encoding="utf-8", errors="replace")
-
-            try:
-                if feed_stdin:
-                    prompt_handle = prompt_path.open("r", encoding="utf-8")
-                    try:
-                        process = popen_worker(
-                            command,
-                            priority=CpuPriority.BELOW_NORMAL,
-                            cwd=str(worktree.path),
-                            stdin=prompt_handle,
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT,
-                            env=worker_env,
-                            start_new_session=(os.name != "nt"),
-                            text=True,
-                        )
-                    finally:
-                        prompt_handle.close()
-                else:
-                    process = popen_worker(
-                        command,
-                        priority=CpuPriority.BELOW_NORMAL,
-                        cwd=str(worktree.path),
-                        stdin=subprocess.DEVNULL,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.STDOUT,
-                        env=worker_env,
-                        start_new_session=(os.name != "nt"),
-                        text=True,
-                    )
-            except OSError:
-                # Popen failed before the tee thread could start — nobody else
-                # will ever close these, so close them here. The outer
-                # `except OSError` below still handles worktree cleanup and
-                # the error record.
-                log_handle.close()
-                events_handle.close()
-                raise
-
-            # Start a thread to tee output to both files
-            def _tee_output():
-                try:
-                    for line in process.stdout:
-                        log_handle.write(line)
-                        log_handle.flush()
-                        events_handle.write(line)
-                        events_handle.flush()
-                except Exception:
-                    # Thread dies if process terminates or pipe breaks
-                    pass
-                finally:
-                    # Close handles when thread exits
-                    try:
-                        log_handle.close()
-                    except Exception:
-                        pass
-                    try:
-                        events_handle.close()
-                    except Exception:
-                        pass
-
-            import threading
-
-            tee_thread = threading.Thread(target=_tee_output, daemon=True)
-            tee_thread.start()
+            tee_result = launch_tee(
+                command=command,
+                cwd=str(worktree.path),
+                prompt_path=prompt_path,
+                feed_stdin=feed_stdin,
+                log_path=log_path,
+                events_path=events_path,
+                worker_env=worker_env,
+            )
+            if isinstance(tee_result, TeeLaunchError):
+                _teardown_on_launch_failure()
+                record = _error_record(
+                    issue_number=issue_number,
+                    branch=branch,
+                    worktree_path=str(worktree.path),
+                    prompt_path=str(prompt_path),
+                    command=command,
+                    log_path=str(log_path),
+                    error=tee_result.error,
+                    adapter_kind=adapter_kind,
+                    provider=provider,
+                    state_path=launch_state_path,
+                    role=launch_role,
+                    model=pinned_model,
+                    error_class=launch_events.LAUNCH_ERR_SPAWN,
+                )
+                return _write_record(sessions_dir, record)
+            process = tee_result.process
         else:
             # Original behavior: direct stdout to log file
             with log_path.open("w", encoding="utf-8", errors="replace") as log_handle:

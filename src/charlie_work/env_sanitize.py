@@ -134,6 +134,14 @@ DEFAULT_PYTEST_XDIST_AUTO_NUM_WORKERS = "2"
 UV_NO_SYNC_VAR = "UV_NO_SYNC"
 _UV_NO_SYNC_DEFAULT = "1"
 
+# Issue #2836: with this set to "false" by sanitize_env, a `claude -p` session
+# loads no claude.ai connectors (verified 2026-10-24: every mcp__claude_ai_*
+# tool, including Gmail create_draft, disappears from the tool list). It pairs
+# with the argv-side --strict-mcp-config --mcp-config {"mcpServers":{}} pin in
+# tool_scope._apply_tool_scope: the argv flag drops project/user-scope MCP
+# servers, this environment gate drops claude.ai connectors.
+ENABLE_CLAUDEAI_MCP_SERVERS_VAR = "ENABLE_CLAUDEAI_MCP_SERVERS"
+
 if TYPE_CHECKING:
     from .config import OrchestratorConfig
     from .test_slots import SlotPoolConfig
@@ -372,6 +380,17 @@ def sanitize_env(
     # with "Error: Not logged in" even when local CLI credentials are valid.
     env.pop("ACP_BACKEND", None)
 
+    # Issue #2836: gate claude.ai connectors out of every Claude child when MCP
+    # isolation is on (the config default). This is the one place it is set so
+    # every launch through sanitize_env gets it. config=None resolves to the
+    # defaults, which isolate (matching OrchestratorConfig's own default).
+    _claude_code_cfg = getattr(config, "claude_code", None)
+    isolate_mcp = True if _claude_code_cfg is None else _claude_code_cfg.isolate_mcp
+    if isolate_mcp:
+        env[ENABLE_CLAUDEAI_MCP_SERVERS_VAR] = "false"
+    else:
+        env.pop(ENABLE_CLAUDEAI_MCP_SERVERS_VAR, None)
+
     # A .venv reparse point (junction/symlink) is a view into a shared venv,
     # not an owned local venv. Unlink it inside a worktree so uv cannot
     # resolve/rewrite the shared venv through it.
@@ -540,5 +559,6 @@ __all__ = [
     "PYTEST_XDIST_AUTO_NUM_WORKERS_VAR",
     "DEFAULT_PYTEST_XDIST_AUTO_NUM_WORKERS",
     "UV_NO_SYNC_VAR",
+    "ENABLE_CLAUDEAI_MCP_SERVERS_VAR",
     "STRIPPED_GH_TOKEN_VARS",
 ]

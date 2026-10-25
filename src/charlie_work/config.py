@@ -1668,12 +1668,37 @@ class ClaudeCodeConfig:
     # reintroduces VIRTUAL_ENV even though sanitize_env strips it). This is
     # intentional: explicit operator overrides win over sanitization.
     worker_env: Annotated[dict[str, str], Coerced] = field(default_factory=dict)
-    # Opt-in: tee Claude Code's --output-format stream-json to a separate events.jsonl file.
-    # When enabled, the worker launch command is extended with --output-format stream-json
-    # and the structured JSONL output is written to issue-<n>.events.jsonl alongside the
-    # plaintext log. This enables downstream parsing of tool_call_count, turn_count, tokens,
-    # and cost_usd for tripwires and progress reporting. Default False until #162/#163 land.
-    tee_stream_json: bool = False
+    # Ship ON (issue #2814): tee Claude Code's --output-format stream-json to a
+    # separate events.jsonl file. With the tee, the worker launch command is
+    # extended with --output-format stream-json --verbose and the structured
+    # JSONL output is written to issue-<n>.events.jsonl (and into) the sidecar
+    # log stream-side, so signal 3's log mtime and the real-activity probe's
+    # events.jsonl source both see live activity while the session reads and
+    # plans. This enables downstream parsing of tool_call_count, turn_count,
+    # tokens, and cost_usd for tripwires and progress reporting. The tee is the
+    # default; ``tee_stream_json: false`` in config is the kill switch and
+    # restores the pre-#2814 behaviour (plain-text log, no events.jsonl).
+    tee_stream_json: bool = True
+    # Issue #2836: tool allowlist pinned via ``--tools`` on every worker
+    # launch (comma-separated tool names). Empty string is the kill switch:
+    # no ``--tools`` flag is added and the CLI default tool set applies —
+    # which re-reads tens of thousands of unused tool-schema tokens on every
+    # API call (Artifact/Skill/Workflow/Agent etc. measured ~57k-65k first-
+    # call context vs ~17k allowlisted) and inherits the operator's whole
+    # interactive tool surface a prompt injection could reach.
+    worker_tools: Annotated[str, Typed] = "Bash,Read,Edit,Write,Grep,Glob,Monitor,TaskStop"
+    # Issue #2836: same pin for reviewer sessions (read-only reviews need far
+    # fewer tools). Empty string = kill switch, CLI default applies.
+    reviewer_tools: Annotated[str, Typed] = "Bash,Read,Grep,Glob,Write"
+    # Issue #2836: when true (the default), worker/reviewer launches append
+    # ``--strict-mcp-config --mcp-config {"mcpServers":{}}`` (no MCP servers)
+    # and ``sanitize_env`` sets ``ENABLE_CLAUDEAI_MCP_SERVERS=false`` so
+    # claude.ai connectors never load in a headless session. This strips the
+    # operator's user-scope MCP servers (GitHub remote MCP *write* tools,
+    # Gmail, Drive, ...) from sessions that read attacker-controlled issue
+    # text under ``bypassPermissions`` — the ``gh`` CLI in Bash covers every
+    # read they actually make. ``false`` restores ambient MCP loading.
+    isolate_mcp: Annotated[bool, Typed] = True
 
 
 @dataclass(frozen=True)

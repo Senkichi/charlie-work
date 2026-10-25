@@ -11,6 +11,7 @@ from __future__ import annotations
 from charlie_work.claude_code import (
     _apply_model_pin,
     _apply_effort_pin,
+    _apply_tool_scope,
     _sanitize_review_command_template,
 )
 
@@ -197,3 +198,91 @@ def test_apply_effort_pin_preserves_lookalike_token() -> None:
 
 def test_apply_effort_pin_handles_empty_template() -> None:
     assert _apply_effort_pin((), "medium") == ("--effort", "medium")
+
+
+# Issue #2836: _apply_tool_scope -- the tool-allowlist + MCP-isolation pin.
+
+_WORKER_TOOLS = "Bash,Read,Edit,Write,Grep,Glob,Monitor,TaskStop"
+_REVIEWER_TOOLS = "Bash,Read,Grep,Glob,Write"
+_ISOLATED_MCP_FLAGS = ("--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}')
+
+
+def test_apply_tool_scope_appends_tools_and_mcp_isolation() -> None:
+    template = ("claude", "-p", "--permission-mode", "bypassPermissions")
+
+    result = _apply_tool_scope(template, _WORKER_TOOLS, True)
+
+    assert result == template + ("--tools", _WORKER_TOOLS) + _ISOLATED_MCP_FLAGS
+
+
+def test_apply_tool_scope_reviewer_tools() -> None:
+    result = _apply_tool_scope(("claude", "-p"), _REVIEWER_TOOLS, True)
+
+    assert result.count("--tools") == 1
+    assert result[-5:-3] == ("--tools", _REVIEWER_TOOLS)
+    assert result[-3:] == _ISOLATED_MCP_FLAGS
+
+
+def test_apply_tool_scope_empty_tools_is_kill_switch() -> None:
+    """An empty *_tools string adds no --tools flag: CLI default applies."""
+    template = ("claude", "-p")
+
+    result = _apply_tool_scope(template, "", True)
+
+    assert result == template + _ISOLATED_MCP_FLAGS
+    assert not any(tok.startswith("--tools") for tok in result)
+
+
+def test_apply_tool_scope_isolate_mcp_false_adds_no_mcp_flags() -> None:
+    template = ("claude", "-p")
+
+    result = _apply_tool_scope(template, _WORKER_TOOLS, False)
+
+    assert result == template + ("--tools", _WORKER_TOOLS)
+    assert "--strict-mcp-config" not in result
+    assert "--mcp-config" not in result
+
+
+def test_apply_tool_scope_strips_caller_space_form_tools() -> None:
+    template = ("claude", "-p", "--tools", "Artifact,Workflow")
+
+    result = _apply_tool_scope(template, _WORKER_TOOLS, True)
+
+    assert "Artifact" not in result
+    assert result.count("--tools") == 1
+    assert result[result.index("--tools") + 1] == _WORKER_TOOLS
+
+
+def test_apply_tool_scope_strips_equals_joined_tools() -> None:
+    template = ("claude", "-p", "--tools=Artifact,Workflow")
+
+    result = _apply_tool_scope(template, _WORKER_TOOLS, True)
+
+    assert not any(tok.startswith("--tools=") for tok in result)
+    assert "Artifact" not in result
+    assert result.count("--tools") == 1
+
+
+def test_apply_tool_scope_strips_caller_mcp_config() -> None:
+    for template in (
+        ("claude", "-p", "--mcp-config", "other.json"),
+        ("claude", "-p", "--mcp-config=other.json"),
+        ("claude", "-p", "--strict-mcp-config"),
+    ):
+        result = _apply_tool_scope(template, _REVIEWER_TOOLS, True)
+
+        assert "other.json" not in result
+        assert result.count("--strict-mcp-config") == 1
+        assert result.count("--mcp-config") == 1
+        assert result[result.index("--mcp-config") + 1] == '{"mcpServers":{}}'
+
+
+def test_apply_tool_scope_strips_mcp_flag_from_isolate_off_template() -> None:
+    """A caller-supplied --mcp-config is stripped even with isolation off —
+    the config decision is authoritative, not a smuggled old value."""
+    template = ("claude", "-p", "--mcp-config=other.json")
+
+    result = _apply_tool_scope(template, _REVIEWER_TOOLS, False)
+
+    assert "other.json" not in result
+    assert "--mcp-config" not in result
