@@ -769,6 +769,55 @@ def _apply_effort_pin(command_template: tuple[str, ...], effort: str) -> tuple[s
     return tuple(filtered) + ("--effort", effort)
 
 
+def _apply_tool_scope(
+    command_template: tuple[str, ...],
+    tools: str,
+    isolate_mcp: bool,
+) -> tuple[str, ...]:
+    """Hard-pin the tool scope and MCP isolation onto ``command_template``.
+
+    Issue #2836: fleet Claude sessions (workers and reviewers) used to launch
+    with the operator's whole interactive tool surface — every user-scope MCP
+    server, every claude.ai connector, and the full built-in tool schema block
+    (Artifact/Skill/Workflow/Agent measured ~40k of ~57k first-call context
+    tokens, then re-read from cache on every call for the session's lifetime).
+    Both worker and reviewer tool usage over the prior 48 h was fully covered
+    by the allowlists this pin carries.
+
+    Shaped like ``_apply_model_pin``: every occurrence of ``--tools`` (bare
+    flag + value, or ``--tools=value``), ``--mcp-config`` (both forms), and
+    the valueless ``--strict-mcp-config`` is stripped first — a
+    caller-supplied ``command_template`` (``ClaudeCodeConfig.command``) must
+    not be able to widen the scope, the same way
+    ``_sanitize_review_command_template`` defeats ``--permission-mode``
+    overrides. Then a single authoritative ``--tools <csv>`` is appended when
+    ``tools`` is non-empty (an empty string is the operator kill switch: no
+    flag, CLI default applies), and ``--strict-mcp-config --mcp-config
+    {"mcpServers":{}}`` is appended when ``isolate_mcp`` is true (inline
+    empty-server JSON; the CLI accepts a JSON string). Safe to apply uniformly
+    to both roles: it only ever narrows.
+    """
+    filtered: list[str] = []
+    skip_next = False
+    for token in command_template:
+        if skip_next:
+            skip_next = False
+            continue
+        if token in ("--tools", "--mcp-config"):
+            skip_next = True
+            continue
+        if token == "--strict-mcp-config":
+            continue
+        if token.startswith("--tools=") or token.startswith("--mcp-config="):
+            continue
+        filtered.append(token)
+    if tools:
+        filtered.extend(("--tools", tools))
+    if isolate_mcp:
+        filtered.extend(("--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}'))
+    return tuple(filtered)
+
+
 def _review_effort_arm(pr_number: int, fraction: float, salt: str) -> bool:
     """Deterministically assign a PR to the review_effort experiment's
     treatment arm.
@@ -880,6 +929,12 @@ def run_quota_probe(*, repo_root: Path, config: OrchestratorConfig) -> bool:
     probe = config.quota_probe
     command = _apply_model_pin(_REVIEW_COMMAND_TEMPLATE, probe.model)
     command = _apply_max_turns_pin(command, 1)
+    # Issue #2836: the probe gets the reviewer's tool scope so it does not pay
+    # the full default tool-schema block on a call that only exists to look
+    # at a throttle signature.
+    command = _apply_tool_scope(
+        command, config.claude_code.reviewer_tools, config.claude_code.isolate_mcp
+    )
     # Load no settings files: quota is account-level, so the probe needs none, and
     # running in ``repo_root`` would otherwise fire the operator's SessionStart
     # hooks (a git fetch + fast-forward) inside the probe's timeout.
@@ -912,12 +967,21 @@ def _render_command(
 ) -> tuple[str, ...]:
     # Same placeholder set as devin_shell so the two adapters' command
     # templates are drop-in compatible: {prompt_path} {issue_number} {branch}.
+    # One literal allowance (issue #2836): the inline ``--mcp-config
+    # {"mcpServers":{}}`` token _apply_tool_scope appends carries literal
+    # braces and must pass through byte-identical, not through str.format
+    # (which would raise KeyError on `"mcpServers"` treated as field name).
+    # Everything else keeps the old format-everything behavior, including an
+    # unknown placeholder raising into the render-error record path.
     values = {
         "prompt_path": str(prompt_path),
         "issue_number": str(issue_number),
         "branch": branch,
     }
-    return tuple(part.format(**values) for part in command_template)
+    return tuple(
+        part if part.startswith('{"mcpServers"') else part.format(**values)
+        for part in command_template
+    )
 
 
 def launch_claude_worker(
@@ -1103,6 +1167,16 @@ def launch_claude_worker(
         effort = resolved_config.claude_code.effort
     if cli_pins is None:
         command_template = _apply_effort_pin(command_template, effort)
+        # Issue #2836: narrow the tool surface and (by default) drop MCP
+        # servers for every Claude launch. Skipped on the cli_pins path — that
+        # is the non-Claude CLI (opencode), where these flags are invalid and
+        # the caller owns the argv.
+        _claude_code_cfg = resolved_config.claude_code
+        command_template = _apply_tool_scope(
+            command_template,
+            _claude_code_cfg.reviewer_tools if review else _claude_code_cfg.worker_tools,
+            _claude_code_cfg.isolate_mcp,
+        )
     if review:
         # Cap agentic turns for reviewer sessions to prevent unbounded
         # codebase exploration and runaway token spend. 0 = unlimited.

@@ -28,7 +28,9 @@ _classify_session_failure = partial(worker_fate.classify_for, "claude-code")
 def _run_check(repo: Path, config: OrchestratorConfig) -> list[tuple[str, bool, str]]:
     out: list[tuple[str, bool, str]] = []
     _check_claude_worker_permissions(lambda n, ok, d, **_: out.append((n, ok, d)), repo, config)
-    return out
+    # Issue #2836 added a second finding ("claude-code worker tool scope") to
+    # this check's output; these tests see only the permission finding.
+    return [(n, ok, d) for (n, ok, d) in out if n == "claude-code worker permissions"]
 
 
 def _cc_config(command: tuple[str, ...] = ()) -> OrchestratorConfig:

@@ -147,3 +147,86 @@ def test_doctor_role_config_summary_reports_cross_family_yes_when_models_differ(
 
     by_name = {check.name: check for check in checks}
     assert "cross-family: yes" in by_name["role config"].detail
+
+
+# ---------------------------------------------------------------------------
+# claude-code worker tool scope / MCP isolation (issue #2836)
+# ---------------------------------------------------------------------------
+
+
+def _doctor_checks_for(tmp_path: Path, config) -> dict:
+    paths = runtime_paths(tmp_path, config.runtime.state_dir)
+    gh = FakeDoctorGitHub(labels=config.labels.all)
+    _ok, checks = run_doctor(tmp_path, paths, config, tmp_path / "c.yaml", gh)
+    return {check.name: check for check in checks}
+
+
+def test_doctor_reports_claude_code_tool_scope_defaults(tmp_path: Path) -> None:
+    from charlie_work.config import ClaudeCodeConfig
+
+    config = _config(
+        auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
+        devin=DevinConfig(sessions_dir="sessions"),
+        worker=WorkerRoleConfig(harness="claude-code"),
+        claude_code=ClaudeCodeConfig(),
+    )
+
+    by_name = _doctor_checks_for(tmp_path, config)
+
+    check = by_name["claude-code worker tool scope"]
+    assert check.ok is True
+    assert "--tools Bash,Read,Edit,Write,Grep,Glob,Monitor,TaskStop" in check.detail
+    assert "MCP isolation: on" in check.detail
+
+
+def test_doctor_warns_when_isolate_mcp_off(tmp_path: Path) -> None:
+    from charlie_work.config import ClaudeCodeConfig
+
+    config = _config(
+        auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
+        devin=DevinConfig(sessions_dir="sessions"),
+        worker=WorkerRoleConfig(harness="claude-code"),
+        claude_code=ClaudeCodeConfig(isolate_mcp=False),
+    )
+
+    by_name = _doctor_checks_for(tmp_path, config)
+
+    check = by_name["claude-code worker tool scope"]
+    assert check.ok is False
+    assert check.severity == "warning"
+    assert "isolate_mcp is false" in check.detail
+
+
+def test_doctor_warns_when_worker_tools_empty(tmp_path: Path) -> None:
+    from charlie_work.config import ClaudeCodeConfig
+
+    config = _config(
+        auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
+        devin=DevinConfig(sessions_dir="sessions"),
+        worker=WorkerRoleConfig(harness="claude-code"),
+        claude_code=ClaudeCodeConfig(worker_tools=""),
+    )
+
+    by_name = _doctor_checks_for(tmp_path, config)
+
+    check = by_name["claude-code worker tool scope"]
+    assert check.ok is False
+    assert check.severity == "warning"
+    assert "worker_tools is empty" in check.detail
+
+
+def test_doctor_tool_scope_reports_command_template_pin(tmp_path: Path) -> None:
+    from charlie_work.config import ClaudeCodeConfig
+
+    config = _config(
+        auto_merge=AutoMergeConfig(required_checks=(), enabled=False),
+        devin=DevinConfig(sessions_dir="sessions"),
+        worker=WorkerRoleConfig(harness="claude-code"),
+        claude_code=ClaudeCodeConfig(command=("claude", "-p", "--tools", "Bash,Read")),
+    )
+
+    by_name = _doctor_checks_for(tmp_path, config)
+
+    check = by_name["claude-code worker tool scope"]
+    assert check.ok is True
+    assert "--tools Bash,Read" in check.detail
