@@ -87,12 +87,15 @@ class AdapterSettings:
     # rate limit when launched back-to-back). 0 disables the stagger. Mirrors
     # config.DispatchConfig.launch_stagger_seconds.
     launch_stagger_seconds: int = 0
-    # Opt-in: tee Claude Code's --output-format stream-json to a separate events.jsonl file.
-    # When enabled, the worker launch command is extended with --output-format stream-json
-    # and the structured JSONL output is written to issue-<n>.events.jsonl alongside the
-    # plaintext log. This enables downstream parsing of tool_call_count, turn_count, tokens,
-    # and cost_usd for tripwires and progress reporting. Default False until #162/#163 land.
-    tee_stream_json: bool = False
+    # Ship ON (issue #2814): tee Claude Code's --output-format stream-json to a
+    # separate events.jsonl file. When enabled, the worker launch command is
+    # extended with --output-format stream-json --verbose and the structured
+    # JSONL output is written to issue-<n>.events.jsonl (and into the log)
+    # stream-side, so the watchdog sees live activity while the session reads
+    # and plans (signals 3/5, the real-activity probe, cost/token tripwires).
+    # ``tee_stream_json: false`` in config is the kill switch and keeps the
+    # pre-#2814 behaviour (plain-text log, no events.jsonl).
+    tee_stream_json: bool = True
     # api-worker adapter: the resolved ApiWorkerConfig registry section. Carried
     # through AdapterSettings the same way claude_command/worker_env carry the
     # claude-code settings. None for non-api adapters; required for the "api"

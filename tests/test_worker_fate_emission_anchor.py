@@ -39,7 +39,7 @@ def test_stream_json_anchor_is_the_throttle_events_own_timestamp(tmp_path: Path)
     # mtime deliberately disagrees with the event's own timestamp.
     log_path = _copy_fixture(
         tmp_path,
-        "claude_stream_json_throttle_assistant_ts.jsonl",
+        "claude_stream_json_throttle_cli_event_ts.jsonl",
         mtime=NOW - timedelta(minutes=3),
     )
 
@@ -120,7 +120,7 @@ def test_unstated_reset_rate_limit_anchors_at_now_not_stale_mtime(tmp_path: Path
 def test_classify_for_unknown_adapter_kind_classifies_nothing(tmp_path: Path) -> None:
     log_path = _copy_fixture(
         tmp_path,
-        "claude_stream_json_throttle_assistant_ts.jsonl",
+        "claude_stream_json_throttle_cli_event_ts.jsonl",
         mtime=EMITTED,
     )
 
@@ -148,8 +148,9 @@ def test_stream_json_result_without_timestamp_anchors_at_mtime_not_earlier_turn(
 
 
 def test_claude_code_plain_text_log_anchors_at_mtime(tmp_path: Path) -> None:
-    # tee_stream_json defaults to False: a default claude-code log is prose.
-    # It must keep the #1997 mtime anchor, not fall to classification time.
+    # A non-tee claude-code log (``tee_stream_json: false`` in config) is
+    # prose. It must keep the #1997 mtime anchor, not fall to classification
+    # time.
     log_path = _copy_fixture(
         tmp_path,
         "claude_plain_text_throttle.log",
@@ -217,7 +218,7 @@ def test_trailing_stderr_keeps_a_quoted_timestamp_from_becoming_the_anchor(
 def test_stream_json_event_timestamp_wins_over_trailing_stderr(tmp_path: Path) -> None:
     log_path = _with_trailing_stderr(
         tmp_path,
-        "claude_stream_json_throttle_assistant_ts.jsonl",
+        "claude_stream_json_throttle_cli_event_ts.jsonl",
         mtime=NOW - timedelta(minutes=3),
     )
 
