@@ -501,9 +501,11 @@ needs one of them must argue for it in code, not widen the pin silently.
 **Kill switches.** Setting `claude_code.worker_tools` (resp.
 `claude_code.reviewer_tools`) to the empty string `""` removes the `--tools`
 pin (the CLI default tool set loads); `isolate_mcp: false` restores ambient
-MCP/connector loading and leaves `ENABLE_CLAUDEAI_MCP_SERVERS` unset. Both
-opt-outs are reported as doctor warnings under "claude-code worker tool
-scope", along with the effective scope otherwise. A caller-supplied
+MCP/connector loading and leaves `ENABLE_CLAUDEAI_MCP_SERVERS` unset. The
+doctor's "claude-code worker tool scope" check reports the effective worker
+scope and warns on the two worker-side opt-outs (`worker_tools: ""` and
+`isolate_mcp: false`); it inspects only the worker launch, so
+`reviewer_tools: ""` is **not** reported. A caller-supplied
 `claude_code.command` cannot widen the scope: any `--tools`/`--mcp-config` it
 carries is stripped and the configured scope re-pinned. The
 `merge_preflight_hook.py` `mcp__github__merge_pull_request` guard stays in
