@@ -39,6 +39,7 @@ from .config_validation import (
     Coerced,
     CoercedLenient,
     CommandTemplate,
+    Entries,
     FieldError,
     Check,
     FieldRules,
@@ -2728,6 +2729,7 @@ class OrchestratorConfig:
             leak_drain=Typed,
             leak_probe_path=Typed,
             host_io_auto_exclusions=Typed,
+            deferred_demand=Entries(after_seconds=(Typed, Positive)),
         ),
         Check(_runner_floors_agree),
     ] = field(default_factory=RunnerAllocationConfig)
