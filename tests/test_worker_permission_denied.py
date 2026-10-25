@@ -93,3 +93,61 @@ def test_worker_permission_denied_from_log_or_detail(tmp_path: Path) -> None:
     assert not worker_permission_denied(tmp_path / "none", 8, "cross-repo scope")
     log.write_text("all good", encoding="utf-8")
     assert not worker_permission_denied(sessions, 7)
+
+
+# Issue #2814 rework round 3: the stream-json tee is the default, so the
+# log-tail check must not read a ``tool_result``'s QUOTE of the denial
+# signature as a denial — event bodies are excluded via
+# ``failure_classifier.signature_match_text``, exactly as in the other
+# log-tail signature matchers.
+
+
+def _stream_json_line(top_level: dict) -> str:
+    return json.dumps(top_level)
+
+
+def _quoted_denial_stream_log(quoting_text: str) -> str:
+    """A stream-json log tail whose last line is a huge ``user`` event
+    carrying a ``tool_result`` that merely quotes a denial signature inside a
+    >2KB log (the quote survives into the 2KB byte slice, and — because the
+    slice cuts the line — matches only through the cut fragment before the
+    fix)."""
+    tool_result = _stream_json_line(
+        {
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tu_1",
+                        "content": "x" * 3400 + quoting_text,
+                    }
+                ],
+            },
+        }
+    )
+    return _stream_json_line({"type": "system", "subtype": "init"}) + "\n" + tool_result + "\n"
+
+
+def test_worker_permission_denied_stream_json_quote_not_denied(tmp_path: Path) -> None:
+    """A tee'd stream-json tail quoting 'requires your approval' inside a
+    ``tool_result`` (>2KB log, the quote survives the slice) is NOT a denial —
+    the worker observed a denial, the CLI did not surface one."""
+    sessions = tmp_path / "s"
+    log = tmp_path / "w.log"
+    log.write_text(_quoted_denial_stream_log(DENIAL), encoding="utf-8")
+    _seed_sidecar(sessions, log)
+    assert not worker_permission_denied(sessions, 7)
+
+
+def test_worker_permission_denied_stream_json_stderr_denial_is_denied(
+    tmp_path: Path,
+) -> None:
+    """Real-death control: the CLI's own denial surfaced as a plain (merged-
+    stderr) line in the same stream-json log tail still reads as a denial."""
+    sessions = tmp_path / "s"
+    log = tmp_path / "w.log"
+    log.write_text(_quoted_denial_stream_log("") + DENIAL + "\n", encoding="utf-8")
+    _seed_sidecar(sessions, log)
+    assert worker_permission_denied(sessions, 7)

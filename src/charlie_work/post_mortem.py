@@ -53,7 +53,7 @@ from typing import TYPE_CHECKING, Any
 
 from .atomic_write import write_json_atomic
 from .config import OrchestratorConfig, PostMortemConfig, SignatureRule, WatchdogConfig
-from .failure_classifier import signature_match_text
+from .failure_classifier import log_is_stream_json, signature_match_text
 
 if TYPE_CHECKING:
     from .attempt_refs import AttemptSnapshot
@@ -1399,8 +1399,15 @@ def _classify_worker_blocked_from_log_tail(
     # Stream-json-aware matching (issue #2814 rework): a ``tool_result`` that
     # merely quotes a block signature is the worker observing a block, not
     # the Devin CLI surfacing one — match the rules against
-    # ``signature_match_text`` so event bodies are excluded.
-    match_text = signature_match_text(tail)
+    # ``signature_match_text`` so event bodies are excluded. Round 3: the
+    # shape comes off the whole log head and the cut flag drops the tail's
+    # partial first line (a >2KB event straddling the slice boundary must
+    # not leak its quoted signature through the byte fragment).
+    match_text = signature_match_text(
+        tail,
+        cut=len(log_text) > len(tail),
+        stream_json=log_is_stream_json(log_text),
+    )
     for rule in signature_rules:
         if rule.kind != "worker_blocked":
             continue

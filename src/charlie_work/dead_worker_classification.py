@@ -50,7 +50,7 @@ from typing import TYPE_CHECKING, Any
 
 from . import role_quota_ledger, worker_fate
 from .dispatch_selection import _credit_worker_death
-from .failure_classifier import signature_match_text
+from .failure_classifier import log_is_stream_json, signature_match_text
 from .rework_attempt_exemption import (
     exempt_provider_throttle_rework_death,
     is_provider_throttle_rework_death,
@@ -276,7 +276,12 @@ def classify_dead_worker_log(
 
 
 def _terminal_is_throttle_error(
-    terminal: str, profile: AdapterFateProfile | None, config: OrchestratorConfig
+    terminal: str,
+    profile: AdapterFateProfile | None,
+    config: OrchestratorConfig,
+    *,
+    cut: bool = False,
+    stream_json: bool | None = None,
 ) -> bool:
     """True when the log's trailing non-blank lines carry a throttle signature.
 
@@ -287,8 +292,15 @@ def _terminal_is_throttle_error(
     stream-json terminal window only non-event lines (merged stderr) and the
     CLI's own error output may carry a signature — a ``tool_result`` quoting
     one is the worker observing an error, not a throttle death.
+
+    ``cut`` and ``stream_json`` (issue #2814 rework round 3) come from the
+    caller that owns the 2KB byte slice: ``cut`` is True only when the
+    slice's partial first line actually sits inside this terminal window
+    (the tail had never more window lines than the window itself), and
+    ``stream_json`` is the shape read off the whole log head — a window that
+    is pure merged stderr must not re-derive a plain-text shape from itself.
     """
-    match_text = signature_match_text(terminal)
+    match_text = signature_match_text(terminal, cut=cut, stream_json=stream_json)
     if (
         profile is not None
         and profile.account_error_detection
@@ -342,11 +354,28 @@ def classify_clean_exit_throttle(
     except OSError:
         return None
     tail = log_text[-2048:] if len(log_text) > 2048 else log_text
-    terminal_lines = [line for line in tail.splitlines() if line.strip()][
-        -_TERMINAL_THROTTLE_LINES:
-    ]
-    if not terminal_lines or not _terminal_is_throttle_error(
-        "\n".join(terminal_lines), profile, config
+    # Issue #2814 rework round 3: the 2KB slice can cut the first line
+    # mid-event, and the log's shape belongs to the whole log head, not this
+    # window — so the cut flag and the log-head shape are derived here and
+    # handed to ``_terminal_is_throttle_error`` (whose inner
+    # ``signature_match_text`` call would otherwise derive both from the
+    # window alone and leak a cut fragment's quoted signature). ``cut`` is
+    # threaded only when the slice's partial first line actually reaches
+    # this window (the tail never had more non-blank lines than the window
+    # holds); a first line further back is complete and must not be dropped.
+    cut = len(log_text) > len(tail)
+    stream_json = log_is_stream_json(log_text)
+    non_blank = [line for line in tail.splitlines() if line.strip()]
+    if not non_blank:
+        return None
+    cut_reaches_window = cut and len(non_blank) <= _TERMINAL_THROTTLE_LINES
+    terminal_lines = non_blank[-_TERMINAL_THROTTLE_LINES:]
+    if not _terminal_is_throttle_error(
+        "\n".join(terminal_lines),
+        profile,
+        config,
+        cut=cut_reaches_window,
+        stream_json=stream_json,
     ):
         return None
     # The terminal gate already proved the signature sits at the end, so the

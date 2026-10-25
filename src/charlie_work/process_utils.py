@@ -543,8 +543,8 @@ def start_terminal_status_watcher(
     no such call to move. Never raises: a failure inside the thread (a
     poll() error, or a write failure) is swallowed, since this is best-effort
     telemetry that must not crash the orchestrator or the worker's own I/O
-    threads (e.g. the tee_stream_json reader thread also draining
-    ``process.stdout`` concurrently in ``claude_code.launch_claude_worker``).
+    processes (e.g. the tee splitter child process, not a reader thread here,
+    that drains the worker's stdout pipe in ``claude_code.launch_claude_worker``).
     """
     pid = process.pid
     started_monotonic = time.monotonic()

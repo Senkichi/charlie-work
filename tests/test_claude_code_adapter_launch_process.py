@@ -194,12 +194,25 @@ def test_launch_claude_worker_tee_stream_json_writes_to_both_files(
     marker_path = worktree_path / "worker-ran.txt"
     read_worker_marker(marker_path)
 
-    # Give the tee thread a moment to finish writing
-    time.sleep(0.2)
-
-    # Verify both files exist and have content
+    # Wait for the tee splitter child to drain its buffered input: the
+    # launcher pre-creates both files synchronously (round 3), so the path
+    # checks below are already instant — poll for CONTENT with a bounded
+    # deadline instead of a fixed sleep (the original 0.2s startup reliance
+    # flaked under -n auto).
     log_path = Path(record.log_path)
     events_path = sessions_dir / "issue-160.events.jsonl"
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        try:
+            if "line 3" in log_path.read_text(encoding="utf-8") and "line 3" in events_path.read_text(
+                encoding="utf-8"
+            ):
+                break
+        except OSError:
+            pass
+        time.sleep(0.05)
+
+    # Verify both files exist and have content
 
     assert log_path.exists(), "Log file should exist"
     assert events_path.exists(), "Events file should exist"
@@ -299,3 +312,73 @@ def test_launch_claude_worker_tee_stream_json_popen_failure_closes_handles(
     assert record.error is not None
     assert "failed to launch claude" in record.error
     assert fake_stdin.closed
+
+
+def test_launch_claude_worker_tee_stream_json_precreates_both_files(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Round 3: with the tee on, the launcher pre-creates/truncates BOTH tee
+    destinations synchronously BEFORE the splitter child exists — both paths
+    already exist (empty) the moment launch returns, while a sleeping worker
+    has not printed anything yet. Never a silently dead worker whose files
+    appear only stream-side."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    _install_fake_create_worktree(monkeypatch, tmp_path)
+
+    record = launch_claude_worker(
+        163,
+        "agent/issue-163-tee-precreate",
+        "prompt text",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        command_template=(sys.executable, "-c", "import time; time.sleep(2)"),
+        tee_stream_json=True,
+    )
+
+    assert record.ok, record.error
+    assert Path(record.log_path).exists()
+    events_path = sessions_dir / "issue-163.events.jsonl"
+    assert events_path.exists()
+    # Truncated, not pre-populated: the worker has not printed yet.
+    assert Path(record.log_path).stat().st_size == 0
+    assert events_path.stat().st_size == 0
+
+
+def test_launch_claude_worker_tee_unopenable_log_files_error_record(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Round 3: an unopenable tee destination (the events path is an
+    occupied directory no launch step can rotate away) surfaces BEFORE the
+    splitter child exists as a launch error record — never a silently dead
+    worker wired to a splitter that died opening its files."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    _install_fake_create_worktree(monkeypatch, tmp_path)
+
+    blocking = sessions_dir / "issue-164.events.jsonl"
+    blocking.mkdir()
+    (blocking / "occupied.txt").write_text("make unlink in the rotation fail", encoding="utf-8")
+    # Block the rotation: the ``.1`` slot is a non-empty directory too, so
+    # _rotate_old_log's unlink raises and the occupied dir cannot be moved.
+    (sessions_dir / "issue-164.events.jsonl.1").mkdir()
+    (sessions_dir / "issue-164.events.jsonl.1" / "occupied.txt").write_text(
+        "rotation block", encoding="utf-8"
+    )
+
+    record = launch_claude_worker(
+        164,
+        "agent/issue-164-tee-unopenable",
+        "prompt text",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        command_template=("claude",),
+        tee_stream_json=True,
+    )
+
+    assert not record.ok
+    assert record.error is not None
+    assert "failed to create tee log files" in record.error

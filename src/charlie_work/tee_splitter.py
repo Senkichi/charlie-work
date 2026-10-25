@@ -23,20 +23,45 @@ old thread-based tee provided.
 from __future__ import annotations
 
 import sys
+from typing import IO
 
 
 def main(argv: list[str]) -> None:
     # Two destinations: the plaintext .log, then the events.jsonl sidecar.
-    # Opened without a `with` so both stay available for the whole stream —
-    # they are closed together in the finally below. Binary passthrough,
-    # like the non-tee path writes the .log: never re-encode the CLI's
-    # bytes.
-    destinations = [open(path, mode="wb") for path in argv[:2]]  # noqa: SIM115
+    # Opened append (issue #2814 round 3): the launcher
+    # (``claude_code.launch_claude_worker``) pre-creates and truncates both
+    # files synchronously BEFORE spawning this child, so truncate-then-append
+    # the stream is exactly as before, while a child-side open can no longer
+    # rewind a file the launcher's own bookkeeping already saw. Opened
+    # without a `with` so both stay available for the whole stream — they
+    # are closed together in the finally below. Binary passthrough, like
+    # the non-tee path writes the .log: never re-encode the CLI's bytes.
+    destinations: list[IO[bytes]] = []
+    for path in argv[:2]:
+        try:
+            destinations.append(open(path, mode="ab"))  # noqa: SIM115
+        except OSError:
+            # Unopenable destination: DROP it and keep draining stdin (issue
+            # #2814 round 3): the tee must never become the process that
+            # stops the worker's stdout from flowing — this process dying on
+            # a bad path closes the pipe read end and breaks the worker's
+            # next stdout write, killing the session. The remaining (and any
+            # later-writable) destination keeps receiving the stream.
+            continue
     try:
         for line in sys.stdin.buffer:
+            # Per-destination write/flush failure (disk full, handle gone):
+            # drop THAT destination and keep draining stdin -- the pipe to
+            # the worker must keep moving regardless of any one file.
+            live: list[IO[bytes]] = []
             for destination in destinations:
-                destination.write(line)
-                destination.flush()
+                try:
+                    destination.write(line)
+                    destination.flush()
+                except OSError:
+                    continue
+                live.append(destination)
+            destinations = live
     finally:
         for destination in destinations:
             try:

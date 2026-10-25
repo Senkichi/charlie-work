@@ -33,8 +33,9 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
-from charlie_work import claude_code
+from charlie_work import claude_code, tee_splitter
 from charlie_work.adapters import AdapterSettings, SessionRequest, dispatch_sessions
+from charlie_work.adapter_fate_profile import profile_for
 from charlie_work.config import (
     ClaudeCodeConfig,
     OrchestratorConfig,
@@ -44,7 +45,15 @@ from charlie_work.config import (
     load_config,
 )
 from charlie_work.claude_code import update_worker_record_with_failure_classification
-from charlie_work.failure_classifier import classify_failure
+from charlie_work.dead_worker_classification import (
+    _terminal_is_throttle_error,
+    classify_clean_exit_throttle,
+)
+from charlie_work.failure_classifier import (
+    classify_failure,
+    log_is_stream_json,
+    signature_match_text,
+)
 from charlie_work.post_mortem import _classify_worker_blocked_from_log_tail
 from charlie_work.process_utils import worker_terminal_status_path
 from charlie_work.worker import (
@@ -594,7 +603,7 @@ def test_tee_splitter_script_writes_all_lines_to_both_files(tmp_path: Path) -> N
     subprocess.run(
         [
             sys.executable,
-            str(claude_code.tee_splitter_path()),
+            str(Path(tee_splitter.__file__)),
             str(log),
             str(events),
         ],
@@ -614,7 +623,7 @@ def _run_tee_survival_experiment(tmp_path: Path, *, mode: str) -> tuple[str, str
     Returns (worker status text, launcher log text)."""
     launcher = tmp_path / "exp_launcher.py"
     worker = tmp_path / "exp_worker.py"
-    splitter_path = claude_code.tee_splitter_path()
+    splitter_path = Path(tee_splitter.__file__)
 
     worker.write_text(
         textwrap.dedent(
@@ -722,7 +731,11 @@ def test_tee_splitter_child_worker_survives_launcher_exit(tmp_path: Path) -> Non
 
     assert "ERROR" not in status_text, status_text
     assert "final lines" in status_text, status_text
-    assert log.count("line ") >= 50, log
+    # Contract-level threshold (round 3 review): the launcher exits at 0.4s
+    # (≈8 lines printed by then) while the worker keeps running to 3s
+    # (≈59 lines max) — asserting close to the max flakes under -n auto
+    # scheduler jitter, so pin well above the pre-exit count but below max.
+    assert log.count("line ") >= 20, log
 
 
 def test_tee_launcher_thread_pipe_worker_dies_on_launcher_exit(tmp_path: Path) -> None:
@@ -733,3 +746,306 @@ def test_tee_launcher_thread_pipe_worker_dies_on_launcher_exit(tmp_path: Path) -
     status_text, _ = _run_tee_survival_experiment(tmp_path, mode="thread")
 
     assert "ERROR" in status_text, status_text
+
+
+# --- signature_match_text: direct units ----------------------------------------
+
+
+def test_signature_match_text_keeps_cli_own_error_output() -> None:
+    """Direct units (round 3 review): ``system`` and ``rate_limit_event`` are
+    the CLI's own output — kept; a ``result`` with ``is_error`` true is kept,
+    false dropped."""
+    signature = "Rate limit exceeded. Resets in 15 minutes."
+    system_line = _dumps({"type": "system", "subtype": "init", "message": signature})
+    rate_line = _dumps({"type": "rate_limit_event", "message": signature})
+    kept = signature_match_text(f"{system_line}\n{rate_line}\n")
+    assert system_line in kept
+    assert rate_line in kept
+
+    error_result = _dumps(
+        {"type": "result", "subtype": "error_during_execution", "is_error": True, "result": signature}
+    )
+    assert signature_match_text(f"{error_result}\n") == error_result
+
+    success_result = _dumps(
+        {"type": "result", "subtype": "success", "is_error": False, "result": signature}
+    )
+    assert signature_match_text(f"{success_result}\n") == ""
+
+
+def test_signature_match_text_drops_assistant_and_user_bodies() -> None:
+    """A stream-json log whose ONLY signature-bearing lines are ``assistant``/
+    ``user`` event bodies (e.g. a ``tool_result`` quoting a throttle message)
+    matches as nothing — the CLI did not produce the text."""
+    text = (
+        _assistant_tool_use_event(minutes_ago=1)
+        + "\n"
+        + _tool_result_event("Rate limit exceeded. Resets in 15 minutes.")
+        + "\n"
+    )
+    assert signature_match_text(text) == ""
+
+
+def test_signature_match_text_plain_tail_passthrough() -> None:
+    """A plain (non-stream-json) tail is returned whole, byte-identical —
+    the shape filter changes nothing for it."""
+    plain = "shim started\nRate limit exceeded. Resets in 15 minutes.\n"
+    assert signature_match_text(plain) == plain
+
+
+def test_signature_match_text_cut_drops_partial_first_line() -> None:
+    """``cut=True`` drops the byte-slice's partial first line: the fragment of
+    a >2KB event line parses as no event (so it would be treated as merged
+    stderr and matched raw), and its surviving half can carry a whole
+    signature string. Control: the same tail without the cut flag still
+    leaks ``signature`` (the pre-round-3 behaviour the flag closes)."""
+    signature = "Rate limit exceeded. Resets in 15 minutes."
+    fragment = signature + " (the 2KB slice cut this event line)"
+    tail = f"{fragment}\nWorker still healthy.\n"
+    assert fragment in signature_match_text(tail)
+    assert signature_match_text(tail, cut=True) == "Worker still healthy."
+
+
+# --- the >2KB tool_result straddling the 2KB window -----------------------------
+
+
+def _straddle_log(tmp_path: Path, tail_line: str, signature: str) -> Path:
+    """A stream-json log whose total length exceeds 2KB and whose ``tail_line``
+    (the last line) makes the 2KB slice start INSIDE the previous line — a
+    >2KB ``tool_result`` quoting ``signature`` straddles the window, so the
+    slice's first line is a partial event fragment (the shape is stream-json
+    by the log head, not the window)."""
+    log_text = _test_straddle_text(tail_line, signature)
+    path = tmp_path / "straddle.log"
+    path.write_text(log_text, encoding="utf-8")
+    text = log_text[-2048:]
+    # Guard the preconditions: the log ends past the 2KB slice with the slice's
+    # first line CUT (a partial fragment, not the whole tool_result line), and
+    # the shape is stream-json.
+    assert len(text) < len(log_text)
+    assert text.startswith("x")
+    assert signature in text
+    assert log_is_stream_json(log_text)
+    return path
+
+
+def test_classify_failure_large_tool_result_straddling_window_not_failure(
+    tmp_path: Path,
+) -> None:
+    """Round 3 regression (issue #2814 rework): a ~3.5KB ``tool_result``
+    quoting 'Rate limit exceeded. Resets in 15 minutes' STRADDLES the 2KB tail
+    slice — before the fix, the byte fragment's surviving half matched the
+    signature (verified loss: the tail's cut first line was treated as merged
+    stderr). With the cut flag the fragment is dropped and the trailing
+    non-error ``result`` event means NO failure."""
+    throttled = OrchestratorConfig().runtime.throttle_error_markers
+    quoted = _straddle_log(
+        tmp_path,
+        _dumps({"type": "result", "subtype": "success", "is_error": False, "result": "All done."}),
+        "Rate limit exceeded. Resets in 15 minutes.",
+    )
+    assert classify_failure(quoted, throttled) == (None, None)
+
+
+def test_classify_failure_straddle_window_error_result_control(tmp_path: Path) -> None:
+    """Positive control for the straddling window: a real CLI death — an error
+    ``result`` event — still classifies as ``rate_limited`` with a 15-minute
+    stated reset even when a >2KB tool_result straddles the 2KB slice."""
+    throttled = OrchestratorConfig().runtime.throttle_error_markers
+    death = _straddle_log(
+        tmp_path,
+        _dumps(
+            {
+                "type": "result",
+                "subtype": "error_during_execution",
+                "is_error": True,
+                "result": "Rate limit exceeded. Resets in 15 minutes",
+            }
+        ),
+        "",
+    )
+    kind, throttled_until = classify_failure(death, throttled)
+    assert kind == "rate_limited"
+    assert throttled_until is not None
+
+
+def test_classify_failure_straddle_window_stderr_control(tmp_path: Path) -> None:
+    """Positive control: a merged-stderr line carrying the throttle still
+    classifies through a straddling window — non-event lines are kept by
+    ``signature_match_text`` even when the slice cut the event before it."""
+    throttled = OrchestratorConfig().runtime.throttle_error_markers
+    death = _straddle_log(
+        tmp_path,
+        "Error: Rate limit exceeded. Resets in 15 minutes",
+        "Rate limit exceeded. Resets in 15 minutes",
+    )
+    kind, throttled_until = classify_failure(death, throttled)
+    assert kind == "rate_limited"
+    assert throttled_until is not None
+
+
+def test_post_mortem_log_tail_large_tool_result_straddling_not_blocked(
+    tmp_path: Path,
+) -> None:
+    """Round 3 regression: the post-mortem log-tail fallback with a >2KB
+    ``tool_result`` quoting a block signature straddling the 2KB slice —
+    the cut fragment must not classify ``worker_blocked``. The trailing
+    non-event (stderr) line carrying the signature is the positive control."""
+    rules = (SignatureRule(pattern=r"Tool blocked:", kind="worker_blocked"),)
+    signature = "Tool blocked: push not allowed"
+
+    quoted = _straddle_log(
+        tmp_path,
+        _dumps({"type": "result", "subtype": "success", "is_error": False, "result": "All done."}),
+        signature,
+    )
+    assert _classify_worker_blocked_from_log_tail(quoted, rules) is False
+
+    hit = _straddle_log(tmp_path, f"{signature}\n", signature)
+    assert _classify_worker_blocked_from_log_tail(hit, rules) is True
+
+    plain = tmp_path / "hit-plain.log"
+    plain.write_text(f"shim\n{signature}\n", encoding="utf-8")
+    assert _classify_worker_blocked_from_log_tail(hit, rules) == (
+        _classify_worker_blocked_from_log_tail(plain, rules)
+    )
+
+
+# --- clean-exit throttle check: cut window + stream-json units -------------------
+
+
+def test_terminal_is_throttle_error_cut_and_stream_json_quote_not_throttle() -> None:
+    """Direct unit (round 3 review; this is the test that fails if the
+    ``dead_worker_classification`` ``signature_match_text`` routing is
+    reverted): a terminal window whose first line is a cut fragment of a huge
+    ``user`` event quoting a throttle signature, followed by a non-error
+    ``result`` event, is NOT a throttle; the same window ending on a REAL
+    stderr throttle line still is."""
+    profile = profile_for("claude-code")
+    signature = "Rate limit exceeded. Resets in 15 minutes."
+    fragment = ("x" * 2048) + signature
+
+    quoted_window = f"{fragment}\n{_dumps({'type': 'result', 'is_error': False, 'result': 'all done'})}"
+    assert (
+        _terminal_is_throttle_error(
+            quoted_window, profile, OrchestratorConfig(), cut=True, stream_json=True
+        )
+        is False
+    )
+
+    stderr_window = f"{fragment}\nError: {signature}"
+    assert (
+        _terminal_is_throttle_error(
+            stderr_window, profile, OrchestratorConfig(), cut=True, stream_json=True
+        )
+        is True
+    )
+
+
+def _clean_exit_sessions(tmp_path: Path, log_text: str) -> tuple[Path, Path]:
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    log_path = sessions_dir / "issue-11.claude.log"
+    log_path.write_text(log_text, encoding="utf-8")
+    (sessions_dir / "issue-11.claude.json").write_text(
+        _dumps(
+            {
+                "issue_number": 11,
+                "branch": "agent/issue-11",
+                "worktree_path": "",
+                "prompt_path": "",
+                "command": [],
+                "pid": 5,
+                "started_at": datetime.now(UTC).isoformat(),
+                "log_path": str(log_path),
+            }
+        ),
+        encoding="utf-8",
+    )
+    return sessions_dir, log_path
+
+
+def test_clean_exit_throttle_large_tool_result_straddling_window_none(
+    tmp_path: Path,
+) -> None:
+    """``classify_clean_exit_throttle`` end-to-end round 3 regression: a log
+    whose >2KB ``tool_result`` quote straddles the 2KB slice and ends on a
+    NON-error ``result`` event is not a throttle death despite the quote."""
+    sessions_dir, _ = _clean_exit_sessions(
+        tmp_path,
+        _test_straddle_text(
+            _dumps({"type": "result", "subtype": "success", "is_error": False, "result": "All done."}),
+            "Rate limit exceeded. Resets in 15 minutes",
+        ),
+    )
+    assert classify_clean_exit_throttle({}, sessions_dir, 11, OrchestratorConfig()) is None
+
+
+def test_clean_exit_throttle_stream_stderr_terminal_control(tmp_path: Path) -> None:
+    """Positive control: the same straddling log cut by a REAL terminal
+    stderr throttle line classifies a clean-exit ``rate_limited`` death."""
+    sessions_dir, _ = _clean_exit_sessions(
+        tmp_path,
+        _test_straddle_text("Error: Rate limit exceeded. Resets in 15 minutes", ""),
+    )
+    resolved = classify_clean_exit_throttle({}, sessions_dir, 11, OrchestratorConfig())
+    assert resolved is not None
+    adapter_kind, evidence = resolved
+    assert adapter_kind == "claude-code"
+    assert evidence.kind == "rate_limited"
+
+
+def _test_straddle_text(tail_line: str, signature: str) -> str:
+    """The >-2KB text ``_straddle_log`` writes (shared by the clean-exit tests)."""
+    big_result_line = _dumps(
+        {
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tu_1",
+                        "content": "x" * 3400 + signature,
+                    }
+                ],
+            },
+        }
+    )
+    return (
+        _dumps({"type": "system", "subtype": "init"})
+        + "\n"
+        + big_result_line
+        + "\n"
+        + tail_line
+        + "\n"
+    )
+
+
+# --- tee splitter hardening ------------------------------------------------------
+
+
+def test_tee_splitter_drops_unopenable_destination_and_keeps_draining(
+    tmp_path: Path,
+) -> None:
+    """Round 3: a destination that cannot be opened (events inside a missing
+    directory) is DROPPED — the splitter still drains stdin to EOF, exits 0,
+    and the openable destination receives the whole stream."""
+    log = tmp_path / "log.txt"
+    events = tmp_path / "missing-dir" / "events.txt"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(Path(tee_splitter.__file__)),
+            str(log),
+            str(events),
+        ],
+        input="line-a\nline-b\n",
+        encoding="utf-8",
+        check=False,
+        timeout=30,
+        capture_output=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert log.read_text(encoding="utf-8").splitlines() == ["line-a", "line-b"]
+    assert not events.exists()

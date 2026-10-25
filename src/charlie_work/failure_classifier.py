@@ -166,7 +166,32 @@ def _event_is_cli_error_output(event: dict) -> bool:
     return event.get("type") in _CLI_ERROR_EVENT_TYPES
 
 
-def signature_match_text(tail: str) -> str:
+# Issue #2814 rework round 3: the log's SHAPE is a whole-log property, not a
+# tail-window property — a 2KB byte slice bounded by stderr prose (or by one
+# huge event line) can carry no single whole event of its own, but the log is
+# still stream-json. The shape probe therefore reads the log's head (bounded,
+# so huge logs stay cheap) instead of whatever slice the caller matched.
+_STREAM_JSON_SHAPE_PROBE_CHARS = 64 * 1024
+
+
+def log_is_stream_json(log_text: str) -> bool:
+    """Whether a worker log's shape is stream-json, read off the log's head.
+
+    Issue #2814 rework round 3: callers that classically match a 2KB byte
+    slice (``classify_failure``, ``post_mortem._classify_worker_blocked_from_log_tail``,
+    ``dead_worker_classification``'s clean-exit throttle check) must hand the
+    shape read from the WHOLE log (this head probe) to
+    :func:`signature_match_text`, never re-derive it from the slice alone —
+    a slice that happens to contain no whole event line would otherwise be
+    matched as plain prose and re-admit every quoted ``tool_result``
+    signature the stream-json filter excludes.
+    """
+    return _is_stream_json(log_text[:_STREAM_JSON_SHAPE_PROBE_CHARS])
+
+
+def signature_match_text(
+    tail: str, *, cut: bool = False, stream_json: bool | None = None
+) -> str:
     """The text of ``tail`` that failure signatures may be matched against.
 
     Single shared helper (issue #2814 rework) for every raw-tail signature
@@ -184,12 +209,28 @@ def signature_match_text(tail: str) -> str:
       ``user``/``assistant`` event bodies. A ``tool_result`` that merely
       quotes "Rate limit exceeded" must never re-arm a cooldown or escalate
       a blocked worker.
+    - ``stream_json`` is the log's shape when the caller already read it off
+      the whole log head (``log_is_stream_json``); ``None`` derives it from
+      ``tail`` itself (the pre-round-3 behaviour, kept for direct unit
+      tests).
+    - ``cut`` is True when ``tail`` is a byte slice whose first line was cut
+      mid-line (the log is longer than the tail window). The partial
+      fragment is dropped before matching, and only lines after it are kept:
+      a fragment of an event line parses as no event, so it would be treated
+      as merged stderr and matched raw, and its surviving half can carry a
+      whole signature string (a >2KB ``tool_result`` quoting a throttle
+      message straddles the slice boundary — the bug the flag closes).
     """
-    if not _is_stream_json(tail):
-        return tail
+    if stream_json is None:
+        stream_json = _is_stream_json(tail)
+    lines = tail.splitlines()
+    if cut and lines:
+        lines = lines[1:]
+    if not stream_json:
+        return "\n".join(lines) if cut else tail
     return "\n".join(
         line
-        for line in tail.splitlines()
+        for line in lines
         if (event := _parse_event(line)) is None or _event_is_cli_error_output(event)
     )
 
@@ -365,7 +406,16 @@ def classify_failure(
     tail = log_text[-2048:] if len(log_text) > 2048 else log_text
     whole_lines = tail.partition("\n")[2]
     # Stream-json-aware matching (#2814 rework): see ``signature_match_text``.
-    match_tail = signature_match_text(tail)
+    # The shape comes off the whole log head (round 3: a tail bounded by one
+    # huge event line carries no whole event on its own), and the cut flag
+    # drops the tail's partial first line so a >2KB event straddling the
+    # slice boundary cannot leak its quoted signature through the byte
+    # fragment.
+    match_tail = signature_match_text(
+        tail,
+        cut=len(log_text) > len(tail),
+        stream_json=log_is_stream_json(log_text),
+    )
 
     if account_error_detection and _provider_suspension_in_tail(match_tail):
         return "provider_suspended", None
