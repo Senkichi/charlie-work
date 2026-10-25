@@ -55,6 +55,7 @@ KNOWN_IGNORED: dict[str, str] = {
     "orphaned_worker_drift": "dead-worker sweep drift record; the corrective transition is its own event",
     "orphaned_worker_drift_sweep": "batch form of orphaned_worker_drift",
     "review_dispatch_stalled": "a stalled review claim was reset for retry; recovery bookkeeping",
+    "review_interdiff_fallback": "a re-review fell back to the three-dot interdiff (issue #2837 measurement); no rollup fact",
     "review_dispatch_stalled_sweep": "batch form of review_dispatch_stalled",
     "review_dispatch_lifecycle_reaped": "names a merged/closed PR only; deliberately not merge evidence (see rollup_flow_handlers docstring)",
     "review_dispatch_lifecycle_reaped_sweep": "batch form of review_dispatch_lifecycle_reaped",

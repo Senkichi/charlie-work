@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 import charlie_work.workflow as _wf
+from charlie_work import review_interdiff
 from charlie_work.rework_prompts import _render_round_findings, _round_history_entries
 
 
@@ -71,9 +72,61 @@ def _build_prior_review_section(
     never raises, so a failed/unavailable comparison (404, GC'd SHA,
     rebase/divergence, gh failure) just omits the interdiff and says so
     -- it never blocks packet generation.
+
+    Issue #2837: with ``review_dispatch.incremental_review`` on (default), the
+    interdiff for a moved head is built PR-relative from the latest archived
+    round's ``diff.patch`` (archived by ``record_review``) instead of GitHub's
+    three-dot ``compare_diff`` -- so a rework that also merges the base can no
+    longer flood the interdiff with base commits, and the unchanged files are
+    named so the reviewer (guided by the ``$incremental_review_procedure``
+    template section) works incrementally. When no archived diff exists
+    (legacy rounds) or it cannot be compared, the ``compare_diff`` interdiff
+    comes back exactly as before and one ``review_interdiff_fallback`` event
+    records why. With the kill switch off, today's packet text returns
+    byte-verbatim, including no fallback event and no round-kind stamping.
+
+    A stale ``interdiff.patch`` from an earlier moved-head round never
+    survives into a packet that has no interdiff of its own (same head, an
+    all-unchanged incremental round, or a failed comparison): it is removed
+    in every mode, so ``count_interdiff`` cannot measure a prior round's file.
+
+    A non-terminal (``pending``/``missing``) ``prior_decision`` with no
+    archived rounds is not a prior review: it returns ``""`` -- no section
+    and no ``review_interdiff_fallback`` event -- so a caller that builds the
+    section unconditionally cannot fabricate a "Round 1 (decision: missing)"
+    review or a false fallback measurement.
     """
+
+    def _discard_stale_interdiff() -> None:
+        try:
+            (pr_dir / "interdiff.patch").unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def _emit_interdiff_fallback(reason: str) -> None:
+        payload: dict[str, Any] = {
+            "pr_number": (
+                int(pr_dir.name.removeprefix("pr-"))
+                if pr_dir.name.startswith("pr-") and pr_dir.name[3:].isdigit()
+                else None
+            ),
+            "prior_head_sha": prior_head_sha,
+            "new_head_sha": new_head_sha,
+            "reason": reason,
+        }
+        with _wf.state_lock(self.paths.state_file):
+            state = _wf.load_state(self.paths.state_file)
+            state = self._record_event(state, "review_interdiff_fallback", payload)
+            # write-gate-exempt(issue=2837): the same raw state write shape as review()'s packet-block events -- a packet-build-time diagnostic outside any in-flight lane.
+            _wf.save_state(self.paths.state_file, state)
+
     rounds_dir = pr_dir / "rounds"
-    entries = _round_history_entries(rounds_dir, fallback_decision=prior_decision)
+    entries = _round_history_entries(
+        rounds_dir,
+        fallback_decision=(
+            prior_decision if review_interdiff.has_terminal_decision(prior_decision) else None
+        ),
+    )
     if not entries:
         return ""
 
@@ -127,6 +180,9 @@ def _build_prior_review_section(
     lines.append("")
 
     if same_head:
+        # An earlier moved-head round may have left its interdiff.patch beside
+        # this packet's diff; it describes a different head pair.
+        _discard_stale_interdiff()
         lines.append(
             "No interdiff is needed -- the head is unchanged. Re-examine "
             "the full diff and confirm or overturn the prior verdict."
@@ -134,11 +190,51 @@ def _build_prior_review_section(
         lines.append("")
         return "\n".join(lines)
 
+    interdiff_path = pr_dir / "interdiff.patch"
+    fallback_reason: str | None = None
+    if self.config.review_dispatch.incremental_review:
+        inputs = review_interdiff.load_incremental_inputs(pr_dir, entries)
+        fallback_reason = inputs.fallback_reason
+        if inputs.usable:
+            built = review_interdiff.build_pr_interdiff(inputs.prior_diff, inputs.new_diff)
+            prior_round = entries[-1][0]
+            if built.text:
+                interdiff_path.write_text(built.text, encoding="utf-8")
+                lines.append(
+                    f"PR-relative interdiff (files whose changes differ from round "
+                    f"{prior_round}): `{interdiff_path}` ({built.file_count} file(s), "
+                    f"{built.line_count} lines). Verify the findings above are "
+                    "addressed there first."
+                )
+            else:
+                _discard_stale_interdiff()
+                lines.append(
+                    f"No file's patch changed between round {prior_round} and this "
+                    "head (the moved head is base-merge noise only)."
+                )
+            if built.unchanged:
+                unchanged_list = ", ".join(f"`{name}`" for name in built.unchanged)
+                lines.append(
+                    f"Files unchanged since round {prior_round} (keep the "
+                    f"round-{prior_round} assessment; open one only if a changed "
+                    f"file affects it): {unchanged_list}."
+                )
+            if built.removed:
+                removed_list = ", ".join(f"`{name}`" for name in built.removed)
+                lines.append(
+                    f"Files removed from the PR since round {prior_round}: {removed_list}."
+                )
+            lines.append("")
+            return "\n".join(lines)
+    if fallback_reason is not None:
+        _emit_interdiff_fallback(fallback_reason)
+    # Legacy path (issue #2837 fallback, or the kill switch): the three-dot
+    # compare, or the no-comparison message when even that fails. A stale
+    # interdiff.patch left by a previous round must not survive into this packet.
     interdiff_text = None
     if prior_head_sha and new_head_sha:
         interdiff_text = self.gh.compare_diff(str(prior_head_sha), str(new_head_sha))
     if interdiff_text and interdiff_text.strip():
-        interdiff_path = pr_dir / "interdiff.patch"
         interdiff_path.write_text(interdiff_text, encoding="utf-8")
         lines.append(
             f"Interdiff (most recent reviewed head to this head): `{interdiff_path}`. "
@@ -147,6 +243,7 @@ def _build_prior_review_section(
             "are still in scope."
         )
     else:
+        _discard_stale_interdiff()
         lines.append(
             "Prior-head comparison was unavailable (rebase, divergence, or an "
             "API error) -- no interdiff could be generated. Review the full "

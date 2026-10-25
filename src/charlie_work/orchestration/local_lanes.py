@@ -39,6 +39,7 @@ from typing import Any, Sequence
 
 import charlie_work.superseded_worker_reap as superseded_worker_reap
 import charlie_work.workflow as _wf
+from charlie_work import review_interdiff as _review_interdiff
 from charlie_work.command_result import CommandResult
 from charlie_work.worker_pid_stamp import stamp_worker_process
 from charlie_work.adapters import SessionRequest
@@ -517,8 +518,16 @@ def _local_build_packet(
         )
     attachment_budget_section = self._build_attachment_budget_section(diff, pr_number)
     existing_decision = self._review_decision(pr_number)
-    prior_review_section = self._build_prior_review_section(pr_dir, existing_decision, head)
-
+    # Same round-2 gate as the remote builder (workflow.py ``review()``): a
+    # never-reviewed packet has no prior review to render or measure.
+    prior_review_section = (
+        self._build_prior_review_section(pr_dir, existing_decision, head)
+        if _review_interdiff.is_round2_review(existing_decision)
+        else ""
+    )
+    round_facts = _review_interdiff.packet_round_facts(
+        pr_dir, existing_decision, head, cfg=self.config.review_dispatch
+    )
     prompt = self._render(
         "review_local.md",
         {
@@ -539,6 +548,7 @@ def _local_build_packet(
             "over_cap_section": over_cap_section,
             "attachment_budget_section": attachment_budget_section,
             "prior_review_section": prior_review_section,
+            "incremental_review_procedure": round_facts.procedure,
         },
     )
     prompt_path.write_text(prompt, encoding="utf-8")
@@ -667,6 +677,8 @@ def _local_build_packet(
             ),
             "no_op_rework_attempts": 0,
             "no_op_rework_attempts_last_head": None,
+            # Issue #2837: round kind + interdiff size stamp (remote mirror).
+            **round_facts.stamp,
             "conflict_rework_attempts": 0,
             "conflict_rework_attempts_last_head": None,
         }
@@ -689,6 +701,8 @@ def _local_build_packet(
                     "review_turn_cap_structure_multiplier"
                 ],
                 "review_turn_cap_max_touched_lines": pr_json["review_turn_cap_max_touched_lines"],
+                # Issue #2837: per-packet audit mirror (as the remote lane's event).
+                **round_facts.stamp,
             },
         )
         self.write_gate.save_state(state)
@@ -851,8 +865,9 @@ def _local_dispatch_reviewers(self, *, now: Any = None, launch_lock: Any = None)
                 pr_number, role_cfg.reviewer, self.config.claude_code
             )
             resolved_efforts[pr_number] = review_effort_used
+            # Issue #2837: smaller base budget for an incremental round.
             resolved_cap = _wf.resolve_review_turn_cap(
-                cfg.review_max_turns,
+                _review_interdiff.base_turn_cap(record, cfg),
                 self._read_packet_turn_cap_multiplier(pr_number),
                 int(record.get("review_turn_limit_miss_streak", 0)),
                 cfg,
@@ -881,6 +896,8 @@ def _local_dispatch_reviewers(self, *, now: Any = None, launch_lock: Any = None)
                 "pr_numbers": selected,
                 "count": len(selected),
                 "local": True,
+                # Issue #2837: round kinds for the incrementality measurement.
+                "review_round_kinds": _review_interdiff.round_kinds_for(state["prs"], selected),
             },
         )
         self.write_gate.save_state(state)
@@ -1282,6 +1299,9 @@ def record_local_review(
         round_number = _wf._next_round_number(rounds_dir, decision_payload)
         round_dir = rounds_dir / f"round-{round_number}"
         record_decision(pr_dir, decision_payload, None)
+        # Issue #2837: archive this round's diff.patch (the live packet diff is
+        # the one this verdict was recorded against; the next packet overwrites it).
+        _review_interdiff.archive_round_diff(pr_dir, round_dir)
         if decision == "request_changes" and not escalated:
             rework_path = str(
                 self._write_rework_prompt(
