@@ -150,10 +150,10 @@ def read_optional(path: Path) -> str | None:
 
     "Unreadable" covers an OS error and bytes that are not valid UTF-8 -- a
     torn or foreign-encoded ``diff.patch`` degrades the caller to the legacy
-    fallback instead of raising out of packet generation.
+    fallback instead of raising out of packet generation. There is no
+    ``exists()`` pre-check: it re-raises anything but ENOENT-class errors
+    (e.g. ``EACCES``), and a missing file is already a ``FileNotFoundError``.
     """
-    if not path.exists():
-        return None
     try:
         return path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
@@ -245,7 +245,13 @@ def load_incremental_inputs(
     if not entries:
         return IncrementalInputs(fallback_reason=FALLBACK_NO_ARCHIVED_DIFF)
     archived_diff_path = pr_dir / "rounds" / f"round-{entries[-1][0]}" / "diff.patch"
-    if not archived_diff_path.exists():
+    try:
+        archived_present = archived_diff_path.exists()
+    except OSError:
+        # ``exists()`` re-raises e.g. EACCES: the archive may be there but is
+        # not accessible -- a read failure (below), not a legacy round.
+        archived_present = True
+    if not archived_present:
         return IncrementalInputs(fallback_reason=FALLBACK_NO_ARCHIVED_DIFF)
     prior_diff = read_optional(archived_diff_path)
     new_diff = read_optional(pr_dir / "diff.patch")

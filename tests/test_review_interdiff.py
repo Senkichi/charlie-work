@@ -48,6 +48,26 @@ def test_read_optional_returns_none_for_missing_undecodable_and_unreadable(
     assert ri.read_optional(tmp_path) is None
 
 
+def test_read_optional_survives_a_path_exists_that_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``Path.exists()`` re-raises EACCES-class errors (only ENOENT-class ones
+    become ``False``), so ``read_optional`` must not route through it."""
+    target = tmp_path / "ok.patch"
+    target.write_text("diff\n", encoding="utf-8")
+    real_exists = Path.exists
+
+    def _stat_denied(self: Path, **kwargs: Any) -> bool:
+        if self.parent == tmp_path:
+            raise PermissionError("stat denied")
+        return real_exists(self, **kwargs)
+
+    monkeypatch.setattr(Path, "exists", _stat_denied)
+
+    assert ri.read_optional(target) == "diff\n"
+    assert ri.read_optional(tmp_path / "missing.patch") is None
+
+
 def test_archive_round_diff_copies_the_live_diff(tmp_path: Path) -> None:
     (tmp_path / "diff.patch").write_text(ROUND1_PR_DIFF, encoding="utf-8")
     round_dir = tmp_path / "rounds" / "round-1"
@@ -227,6 +247,36 @@ def test_classify_fallback_when_the_live_diff_cannot_be_read(tmp_path: Path) -> 
     (pr_dir / "diff.patch").unlink()
     prior = {"decision": "request_changes", "reviewed_head_sha": ROUND1_HEAD}
 
+    assert _classify(pr_dir, prior_decision=prior) == "fallback"
+
+
+def test_inaccessible_archive_is_a_read_failure_not_a_legacy_round(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``Path.exists()`` re-raises EACCES-class errors. An archived diff whose
+    stat/read is denied is ``archive_read_failed`` (and classifies as fallback);
+    it must neither raise out of packet generation nor read as a legacy round."""
+    pr_dir = _round2_dir(tmp_path)
+    archived = pr_dir / "rounds" / "round-1" / "diff.patch"
+    real_exists, real_read_text = Path.exists, Path.read_text
+
+    def _stat_denied(self: Path, **kwargs: Any) -> bool:
+        if self == archived:
+            raise PermissionError("stat denied")
+        return real_exists(self, **kwargs)
+
+    def _read_denied(self: Path, *args: Any, **kwargs: Any) -> str:
+        if self == archived:
+            raise PermissionError("read denied")
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "exists", _stat_denied)
+    monkeypatch.setattr(Path, "read_text", _read_denied)
+    prior = {"decision": "request_changes", "reviewed_head_sha": ROUND1_HEAD}
+
+    loaded = ri.load_incremental_inputs(pr_dir, _entries(pr_dir))
+
+    assert loaded.fallback_reason == ri.FALLBACK_ARCHIVE_READ_FAILED
     assert _classify(pr_dir, prior_decision=prior) == "fallback"
 
 
