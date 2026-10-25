@@ -18,9 +18,7 @@ import pytest
 
 from _claude_adapter_fixtures import (
     _fake_claude_script,
-    _init_real_repo,
     _install_fake_create_worktree,
-    _repo_head_sha,
 )
 
 from charlie_work import claude_code
@@ -30,15 +28,48 @@ from charlie_work.config import (
     OrchestratorConfig,
     QuotaProbeConfig,
 )
+from charlie_work.worktree import WorktreeInfo
 
 _WORKER_TOOLS = "Bash,Read,Edit,Write,Grep,Glob,Monitor,TaskStop"
 _REVIEWER_TOOLS = "Bash,Read,Grep,Glob,Write"
 _ISOLATED_MCP_FLAGS = ("--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}')
+_HEAD_SHA = "a" * 40
 
 
 def _assert_isolated(argv: tuple[str, ...]) -> None:
     for flag in _ISOLATED_MCP_FLAGS:
         assert flag in argv
+
+
+@pytest.fixture(autouse=True)
+def _no_real_spawn(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, ...]]:
+    """Keep every test in this module off real subprocess spawns (issue #2689).
+
+    These tests assert only on the rendered argv. A review launch with the
+    default template (or a template whose argv[0] is the literal ``claude``)
+    resolves to the real binary on a host that has the CLI installed and
+    spawns a live agent session -- and fails with WinError 2 on a CI runner
+    that does not. Faking the two seams -- ``popen_worker`` and
+    ``create_review_checkout`` -- makes the result independent of the host.
+    Returns the argv list of every (faked) spawn so a test can prove the
+    launch reached the spawn seam.
+    """
+    spawned: list[tuple[str, ...]] = []
+
+    def fake_popen_worker(command, *args, **kwargs):
+        spawned.append(tuple(command))
+        return SimpleNamespace(pid=4242)
+
+    def fake_create_review_checkout(
+        repo_root: Path, pr_number: int, head_sha: str, *, reviews_dir: Path
+    ) -> WorktreeInfo:
+        checkout_path = reviews_dir / f"pr-{pr_number}"
+        checkout_path.mkdir(parents=True, exist_ok=True)
+        return WorktreeInfo(path=checkout_path, branch=head_sha, venv_junction=None)
+
+    monkeypatch.setattr(claude_code, "popen_worker", fake_popen_worker)
+    monkeypatch.setattr(claude_code, "create_review_checkout", fake_create_review_checkout)
+    return spawned
 
 
 def test_launch_claude_worker_argv_pins_worker_tool_scope(
@@ -65,11 +96,12 @@ def test_launch_claude_worker_argv_pins_worker_tool_scope(
     _assert_isolated(record.command)
 
 
-def test_launch_claude_worker_review_argv_pins_reviewer_tool_scope(tmp_path: Path) -> None:
+def test_launch_claude_worker_review_argv_pins_reviewer_tool_scope(
+    tmp_path: Path, _no_real_spawn: list[tuple[str, ...]]
+) -> None:
     repo_root = tmp_path / "repo"
-    _init_real_repo(repo_root)
+    repo_root.mkdir()
     sessions_dir = tmp_path / "reviews"
-    head_sha = _repo_head_sha(repo_root)
 
     record = launch_claude_worker(
         2837,
@@ -78,9 +110,11 @@ def test_launch_claude_worker_review_argv_pins_reviewer_tool_scope(tmp_path: Pat
         repo_root=repo_root,
         sessions_dir=sessions_dir,
         review=True,
-        head_sha=head_sha,
+        head_sha=_HEAD_SHA,
     )
 
+    assert record.ok, record.error
+    assert _no_real_spawn == [record.command]
     assert record.command.count("--tools") == 1
     idx = record.command.index("--tools")
     assert record.command[idx + 1] == _REVIEWER_TOOLS
@@ -93,9 +127,8 @@ def test_launch_claude_worker_command_template_tool_override_stripped_for_both_r
     """A caller-supplied command_template carrying its own wider --tools /
     --mcp-config comes out with only the configured scope, both roles."""
     repo_root = tmp_path / "repo"
-    _init_real_repo(repo_root)
+    repo_root.mkdir()
     sessions_dir = tmp_path / "reviews"
-    head_sha = _repo_head_sha(repo_root)
     sneaky_template = (
         "claude",
         "-p",
@@ -134,9 +167,10 @@ def test_launch_claude_worker_command_template_tool_override_stripped_for_both_r
         sessions_dir=sessions_dir,
         command_template=sneaky_template,
         review=True,
-        head_sha=head_sha,
+        head_sha=_HEAD_SHA,
     )
 
+    assert review_record.ok, review_record.error
     assert review_record.command.count("--tools") == 1
     idx = review_record.command.index("--tools")
     assert review_record.command[idx + 1] == _REVIEWER_TOOLS
@@ -181,9 +215,6 @@ def test_launch_claude_worker_cli_pins_path_argv_has_no_tool_scope_flags(
     repo_root.mkdir()
     sessions_dir = tmp_path / "sessions"
     _install_fake_create_worktree(monkeypatch, tmp_path)
-    monkeypatch.setattr(
-        claude_code, "popen_worker", lambda *args, **kwargs: SimpleNamespace(pid=4242)
-    )
     base_template = ("somecli", "-p")
 
     def cli_pins(template: tuple[str, ...]) -> tuple[str, ...]:
