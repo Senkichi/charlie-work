@@ -114,6 +114,7 @@ from .fleet_supervisor_config import (  # noqa: F401  (deliberate re-export)
 from . import layout
 from .fleet_harness_caps import freeze_harness_caps
 from .harnesses import REVIEWER_HARNESSES, WORKER_HARNESSES
+from .main_sync_config import MainSyncConfig
 from .opencode_config import OpenCodeConfig
 from .role_chain import (
     RoleEntry,
@@ -2652,6 +2653,7 @@ class OrchestratorConfig:
     claude_code: ClaudeCodeConfig = field(default_factory=ClaudeCodeConfig)
     api_worker: ApiWorkerConfig = field(default_factory=ApiWorkerConfig)
     opencode: OpenCodeConfig = field(default_factory=OpenCodeConfig)
+    main_sync: MainSyncConfig = field(default_factory=MainSyncConfig)
     rescue: RescueConfig = field(default_factory=RescueConfig)
     worker: Annotated[
         WorkerRoleConfig,
