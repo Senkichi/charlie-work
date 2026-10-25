@@ -160,6 +160,7 @@ def _claim_attempt(state_file: Path, issue_number: int, branch: str, limit: int)
         attempt = _attempts_used(state, issue_number) + 1
         if attempt > limit:
             return None
+        # write-gate-exempt(issue=2847): no write_gate receiver in create_worktree (config + state_file only); the preflight runs only on a real launch, which also creates the worktree
         _state.save_state(
             state_file, _with_issue_fields(state, issue_number, **{RETRY_COUNT_FIELD: attempt})
         )
@@ -204,7 +205,9 @@ def _record_outcome(
         # unrelated stranding gets a fresh budget.
         if result.pushed:
             state = _with_issue_fields(state, issue_number, **{RETRY_COUNT_FIELD: None})
+        # write-gate-exempt(issue=2847): no write_gate receiver in create_worktree (config + state_file only); the preflight runs only on a real launch, which also creates the worktree
         state = _state.append_event(state, kind, payload, state_path=state_file)
+        # write-gate-exempt(issue=2847): same preflight bookkeeping as the append_event above
         _state.save_state(state_file, state)
 
 
