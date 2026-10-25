@@ -763,7 +763,12 @@ def test_signature_match_text_keeps_cli_own_error_output() -> None:
     assert rate_line in kept
 
     error_result = _dumps(
-        {"type": "result", "subtype": "error_during_execution", "is_error": True, "result": signature}
+        {
+            "type": "result",
+            "subtype": "error_during_execution",
+            "is_error": True,
+            "result": signature,
+        }
     )
     assert signature_match_text(f"{error_result}\n") == error_result
 
@@ -925,7 +930,9 @@ def test_terminal_is_throttle_error_cut_and_stream_json_quote_not_throttle() -> 
     signature = "Rate limit exceeded. Resets in 15 minutes."
     fragment = ("x" * 2048) + signature
 
-    quoted_window = f"{fragment}\n{_dumps({'type': 'result', 'is_error': False, 'result': 'all done'})}"
+    quoted_window = (
+        f"{fragment}\n{_dumps({'type': 'result', 'is_error': False, 'result': 'all done'})}"
+    )
     assert (
         _terminal_is_throttle_error(
             quoted_window, profile, OrchestratorConfig(), cut=True, stream_json=True
@@ -974,7 +981,9 @@ def test_clean_exit_throttle_large_tool_result_straddling_window_none(
     sessions_dir, _ = _clean_exit_sessions(
         tmp_path,
         _test_straddle_text(
-            _dumps({"type": "result", "subtype": "success", "is_error": False, "result": "All done."}),
+            _dumps(
+                {"type": "result", "subtype": "success", "is_error": False, "result": "All done."}
+            ),
             "Rate limit exceeded. Resets in 15 minutes",
         ),
     )

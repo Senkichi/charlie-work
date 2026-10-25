@@ -141,12 +141,14 @@ def test_launch_claude_worker_routes_creationflags_through_hidden_console_kwargs
 def test_launch_claude_worker_tee_stream_json_writes_to_both_files(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Regression test for issue #160: tee thread must write to both log and events files.
+    """Regression test for issue #160: the tee must write to both log and events files.
 
-    This test verifies that when tee_stream_json=True, the background tee thread
-    successfully writes output to both the plaintext log file and the events.jsonl file.
-    The original bug closed file handles immediately after starting the thread,
-    causing all writes to fail silently and leaving both files empty.
+    This test verifies that when tee_stream_json=True, the tee splitter child
+    process successfully writes output to both the plaintext log file and the
+    events.jsonl file (the launcher now pre-creates both files synchronously;
+    the historical bug was a tee thread closing file handles right after the
+    thread started, causing all writes to fail silently and leaving both
+    files empty).
 
     This test would fail against the buggy code (empty files) and pass after the fix.
     """
@@ -204,9 +206,9 @@ def test_launch_claude_worker_tee_stream_json_writes_to_both_files(
     deadline = time.monotonic() + 10.0
     while time.monotonic() < deadline:
         try:
-            if "line 3" in log_path.read_text(encoding="utf-8") and "line 3" in events_path.read_text(
+            if "line 3" in log_path.read_text(
                 encoding="utf-8"
-            ):
+            ) and "line 3" in events_path.read_text(encoding="utf-8"):
                 break
         except OSError:
             pass

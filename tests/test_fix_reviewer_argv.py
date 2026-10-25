@@ -120,9 +120,10 @@ def test_tee_stream_json_enabled_pairs_verbose_flag(
 def test_tee_stream_json_disabled_injects_neither_flag(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Ordinary worker dispatch defaults tee_stream_json to False
-    (config.py ClaudeCodeConfig.tee_stream_json) and must not pick up either
-    flag as a side effect of the reviewer fix."""
+    """Ordinary worker dispatch passes tee_stream_json=False explicitly
+    (config.py ClaudeCodeConfig.tee_stream_json now defaults to True;
+    ``tee_stream_json: false`` in config is the kill switch) and must not
+    pick up either flag as a side effect of the reviewer fix."""
     record = _launch(
         monkeypatch,
         tmp_path,

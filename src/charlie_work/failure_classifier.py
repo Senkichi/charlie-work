@@ -189,9 +189,7 @@ def log_is_stream_json(log_text: str) -> bool:
     return _is_stream_json(log_text[:_STREAM_JSON_SHAPE_PROBE_CHARS])
 
 
-def signature_match_text(
-    tail: str, *, cut: bool = False, stream_json: bool | None = None
-) -> str:
+def signature_match_text(tail: str, *, cut: bool = False, stream_json: bool | None = None) -> str:
     """The text of ``tail`` that failure signatures may be matched against.
 
     Single shared helper (issue #2814 rework) for every raw-tail signature
