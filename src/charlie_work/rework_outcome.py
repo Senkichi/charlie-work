@@ -30,7 +30,7 @@ and no PR mutation, so a malformed outcome cannot wedge the dispatch pass.
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -38,6 +38,7 @@ from typing import TYPE_CHECKING, Any
 from . import worker_fate
 from .config import WORKER_OUTCOME_FILENAME
 from .instrumentation import log_event
+from .no_op_rework_body import _body_content_sha256
 from .process_utils import find_worker_terminal_status
 from .rework_prompts import _write_text_atomic
 from .state import load_state, state_lock
@@ -56,6 +57,12 @@ logger = logging.getLogger(__name__)
 # State key holding {issue_number: applied_head_sha} — the dedup record that
 # makes outcome application exactly-once per reported head.
 APPLIED_HEADS_KEY = "rework_outcome_applied_heads"
+
+# State key holding {pr_number: body_content_sha256} — the body an apply last wrote
+# to each PR (only recorded when a ``pr_body`` was actually pushed). It lets the
+# reviewer-packet currency check tell "the body changed because of an apply" (rebuild
+# the verdictless packet, issue #2826) from "someone edited the body" (no new trigger).
+APPLIED_BODIES_KEY = "rework_outcome_applied_bodies"
 
 
 def _emit_event(
@@ -426,7 +433,9 @@ def apply_rework_worker_outcome(
     head that advanced past the last verdict is routed back to review — so
     the edits land before the review packet is regenerated, and still land
     when the packet itself is blocked (a rerouted-but-blocked review must
-    not drop the worker's body/comment updates).
+    not drop the worker's body/comment updates). The dead-worker sweep reaches
+    it through ``apply_collected_rework_outcomes`` on every with-PR route that
+    saw a fresh outcome (issue #2826), not only the completed-outcome one.
 
     Never raises; never mutates the PR unless the live remote head equals
     the worker-reported ``head_sha``.
@@ -537,6 +546,10 @@ def apply_rework_worker_outcome(
         applied_heads = state.setdefault(APPLIED_HEADS_KEY, {})
         if isinstance(applied_heads, dict):
             applied_heads[str(issue_number)] = head_sha
+        if body_updated and pr_body:
+            applied_bodies = state.setdefault(APPLIED_BODIES_KEY, {})
+            if isinstance(applied_bodies, dict):
+                applied_bodies[str(pr_number)] = _body_content_sha256(pr_body)
         state = write_gate.append_event(
             state,
             "rework_outcome_applied",
@@ -548,6 +561,33 @@ def apply_rework_worker_outcome(
             },
         )
         write_gate.save_state(state)
+
+
+def applied_body_outdates_packet(
+    state: Mapping[str, Any],
+    pr_number: int,
+    live_body: object,
+    packet_body: str | None,
+) -> bool:
+    """True when an outcome apply wrote the live PR body and the packet predates it (issue #2826).
+
+    The reviewer-packet currency check keys staleness on the head and the template, and
+    on the body only for ``request_changes`` drift (#1983), so a verdictless packet built
+    from the OLD body is served to the reviewer after the apply edits the body -- the
+    reviewer then asks for a body fix no worker can make. The trigger is deliberately
+    narrow: it needs a recorded apply for this PR whose body hash EQUALS the live body's.
+    A body edited by anyone else since (or never applied) matches no record, so it
+    never rebuilds a packet. A packet with no readable body cannot show it carries the
+    applied text, so it reads as outdated (rebuilt once; the rebuilt packet stores the body).
+    """
+    recorded_bodies = state.get(APPLIED_BODIES_KEY)
+    if not isinstance(recorded_bodies, Mapping):
+        return False
+    recorded = recorded_bodies.get(str(pr_number))
+    live_sha = _body_content_sha256(live_body)
+    if not isinstance(recorded, str) or not recorded or recorded != live_sha:
+        return False
+    return packet_body is None or _body_content_sha256(packet_body) != live_sha
 
 
 def apply_collected_rework_outcomes(
@@ -615,7 +655,9 @@ def apply_collected_rework_outcomes(
 
 
 __all__ = [
+    "APPLIED_BODIES_KEY",
     "APPLIED_HEADS_KEY",
+    "applied_body_outdates_packet",
     "apply_collected_rework_outcomes",
     "apply_rework_worker_outcome",
     "fresh_completed_worker_outcome",
