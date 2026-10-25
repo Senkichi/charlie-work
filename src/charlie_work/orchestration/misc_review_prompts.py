@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 import charlie_work.workflow as _wf
+from charlie_work import review_interdiff
 from charlie_work.rework_prompts import _render_round_findings, _round_history_entries
 
 
@@ -66,12 +67,41 @@ def _build_prior_review_section(
       case).
 
     Fail-safe posture mirrors janitor.py's patch-id carry-forward
-    (``_calculate_patch_id``/``_check_no_op_rework``): every I/O call
-    here (``compare_diff``) already returns errors as values (``None``),
-    never raises, so a failed/unavailable comparison (404, GC'd SHA,
+    (``_calculate_patch_id``/``_check_no_op_rework``): every I/O call here
+    (``compare_diff``) already returns errors as values (``None``), never raises, so a failed/unavailable comparison (404, GC'd SHA,
     rebase/divergence, gh failure) just omits the interdiff and says so
     -- it never blocks packet generation.
+
+    Issue #2837: with ``review_dispatch.incremental_review`` on (default), the
+    interdiff for a moved head is built PR-relative from the latest archived
+    round's ``diff.patch`` (archived by ``record_review``) instead of GitHub's
+    three-dot ``compare_diff`` -- so a rework that also merges the base can no
+    longer flood the interdiff with base commits, and the unchanged files are
+    named so the reviewer (guided by the ``$incremental_review_procedure``
+    template section) works incrementally. When no archived diff exists
+    (legacy rounds) or it cannot be compared, the ``compare_diff`` interdiff
+    comes back exactly as before and one ``review_interdiff_fallback`` event
+    records why. With the kill switch off, today's behaviour returns
+    byte-verbatim, including no fallback event and no round-kind stamping.
     """
+
+    def _emit_interdiff_fallback(reason: str) -> None:
+        payload: dict[str, Any] = {
+            "pr_number": (
+                int(pr_dir.name.removeprefix("pr-"))
+                if pr_dir.name.startswith("pr-") and pr_dir.name[3:].isdigit()
+                else None
+            ),
+            "prior_head_sha": prior_head_sha,
+            "new_head_sha": new_head_sha,
+            "reason": reason,
+        }
+        with _wf.state_lock(self.paths.state_file):
+            state = _wf.load_state(self.paths.state_file)
+            state = self._record_event(state, "review_interdiff_fallback", payload)
+            # write-gate-exempt(issue=2837): the same raw state write shape as review()'s packet-block events -- a packet-build-time diagnostic outside any in-flight lane.
+            _wf.save_state(self.paths.state_file, state)
+
     rounds_dir = pr_dir / "rounds"
     entries = _round_history_entries(rounds_dir, fallback_decision=prior_decision)
     if not entries:
@@ -134,24 +164,83 @@ def _build_prior_review_section(
         lines.append("")
         return "\n".join(lines)
 
-    interdiff_text = None
-    if prior_head_sha and new_head_sha:
-        interdiff_text = self.gh.compare_diff(str(prior_head_sha), str(new_head_sha))
-    if interdiff_text and interdiff_text.strip():
-        interdiff_path = pr_dir / "interdiff.patch"
-        interdiff_path.write_text(interdiff_text, encoding="utf-8")
-        lines.append(
-            f"Interdiff (most recent reviewed head to this head): `{interdiff_path}`. "
-            "Verify the findings above are addressed there first -- but the "
-            "full diff remains authoritative; findings outside the interdiff "
-            "are still in scope."
-        )
-    else:
-        lines.append(
-            "Prior-head comparison was unavailable (rebase, divergence, or an "
-            "API error) -- no interdiff could be generated. Review the full "
-            "diff as usual, with the findings above in mind."
-        )
+    incremental_enabled = bool(self.config.review_dispatch.incremental_review)
+    interdiff_path = pr_dir / "interdiff.patch"
+    incremental_built = False
+    if incremental_enabled:
+        archived_diff_path = review_interdiff.prior_round_diff_path(pr_dir, prior_decision)
+        if archived_diff_path is not None:
+            prior_diff = review_interdiff.read_optional(archived_diff_path)
+            new_diff = review_interdiff.read_optional(pr_dir / "diff.patch")
+            if prior_diff is not None and new_diff is not None:
+                built = review_interdiff.build_pr_interdiff(prior_diff, new_diff)
+                prior_round = entries[-1][0]
+                if built.text:
+                    interdiff_path.write_text(built.text, encoding="utf-8")
+                    lines.append(
+                        f"PR-relative interdiff (files whose changes differ from round "
+                        f"{prior_round}): `{interdiff_path}` ({built.file_count} file(s), "
+                        f"{built.line_count} lines). Verify the findings above are "
+                        "addressed there first."
+                    )
+                else:
+                    try:
+                        interdiff_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    lines.append(
+                        f"No file's patch changed between round {prior_round} and this "
+                        "head (the moved head is base-merge noise only)."
+                    )
+                if built.unchanged:
+                    unchanged_list = ", ".join(f"`{name}`" for name in built.unchanged)
+                    lines.append(
+                        f"Files unchanged since round {prior_round} (keep the "
+                        f"round-{prior_round} assessment; open one only if a changed "
+                        f"file affects it): {unchanged_list}."
+                    )
+                if built.removed:
+                    removed_list = ", ".join(f"`{name}`" for name in built.removed)
+                    lines.append(
+                        f"Files removed from the PR since round {prior_round}: {removed_list}."
+                    )
+                incremental_built = True
+    if not incremental_built:
+        if incremental_enabled:
+            _emit_interdiff_fallback(
+                "no_archived_diff"
+                if (
+                    archived_diff_path := review_interdiff.prior_round_diff_path(
+                        pr_dir, prior_decision
+                    )
+                )
+                is None
+                else "archive_read_failed"
+            )
+        # Legacy path (issue #2837 fallback): the three-dot compare, or the
+        # no-comparison message when even that fails. A stale interdiff.patch
+        # left by a previous round must not survive into this packet.
+        interdiff_text = None
+        if prior_head_sha and new_head_sha:
+            interdiff_text = self.gh.compare_diff(str(prior_head_sha), str(new_head_sha))
+        if interdiff_text and interdiff_text.strip():
+            interdiff_path.write_text(interdiff_text, encoding="utf-8")
+            lines.append(
+                f"Interdiff (most recent reviewed head to this head): `{interdiff_path}`. "
+                "Verify the findings above are addressed there first -- but the "
+                "full diff remains authoritative; findings outside the interdiff "
+                "are still in scope."
+            )
+        else:
+            try:
+                interdiff_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            lines.append(
+                "Prior-head comparison was unavailable (rebase, divergence, or an "
+                "API error) -- no interdiff could be generated. Review the full "
+                "diff as usual, with the findings above in mind."
+            )
     lines.append("")
     return "\n".join(lines)
 

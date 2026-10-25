@@ -1005,6 +1005,26 @@ class ReviewDispatchConfig:
     # a review (read diff, read tests, read a few source files, write verdict)
     # but prevents unbounded codebase exploration.
     review_max_turns: Annotated[int, Typed, NonNeg] = 40
+    # Issue #2837: incremental re-reviews. When a reviewed PR's head moves
+    # with a rework push, the next review is an incremental round: the packet
+    # carries a PR-relative interdiff built from the last round's archived
+    # diff.patch (files whose per-file patch changed since that round -- no
+    # base-merge noise, unlike the three-dot ``gh.compare_diff`` interdiff) and
+    # the reviewer is asked to re-check every prior finding, review the
+    # interdiff files in full, and open the full diff only for dependent
+    # context. False is the kill switch for the whole feature (the archived
+    # interdiff, the incremental prompt procedure, and the smaller turn
+    # budget below): today's full-diff prompt, three-dot interdiff, and flat
+    # ``review_max_turns`` budget come back.
+    incremental_review: Annotated[bool, Typed] = True
+    # Issue #2837: agentic turn cap for an incremental review round, used
+    # whenever the incremental procedure is rendered (a moved-head rework with
+    # an archived last-round diff). The #1439 structure/miss-streak escalation
+    # still applies on top of this base. 0 falls back to the flat
+    # ``review_max_turns`` budget (today's behaviour); setting it equal to
+    # ``review_max_turns`` does the same. Legacy ``fallback`` rounds and
+    # first reviews always use ``review_max_turns``.
+    incremental_review_max_turns: Annotated[int, Typed, NonNeg] = 20
     # Diff line count above which the review prompt includes a diff-size
     # warning and a per-file summary instead of encouraging the reviewer to
     # read the entire diff in one shot. 0 disables the threshold (always
