@@ -1393,7 +1393,7 @@ def launch_claude_worker(
                         str(log_path),
                         str(events_path),
                     ),
-                    priority=CpuPriority.NORMAL,
+                    priority=CpuPriority.BELOW_NORMAL,
                     stdin=subprocess.PIPE,
                     env=worker_env,
                 )

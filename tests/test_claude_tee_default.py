@@ -12,10 +12,13 @@ The module covers:
 * ``classify_worker_health`` distinguishing a 30-minute-old default-tee
   worker (fresh ``tool_use`` event, untouched worktree) from the same
   worker with the tee off, which IS stalled;
-* every log reader of a claude-code worker log answering a tee'd
-  stream-json log exactly as it answers the equivalent plain-text log:
-  signal 2's terminal-marker scan, failure classification, the
-  post-mortem log-tail fallback, and completion detection.
+* every log reader of a claude-code worker log being stream-json-aware on a
+  tee'd stream-json log (issue #2814 rework): signal 2's terminal-marker
+  scan, failure classification, the post-mortem log-tail fallback — a
+  ``tool_result`` merely *quoting* a signature never matches, while a real
+  CLI death (an error ``result`` event or a merged-stderr line) still
+  classifies the same as the equivalent plain-text log — and completion
+  detection.
 """
 
 from __future__ import annotations
