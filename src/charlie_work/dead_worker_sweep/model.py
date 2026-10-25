@@ -504,6 +504,11 @@ class ReviewRoute:
     live_head_sha: str | None
     fingerprint: str
     reason: str
+    # Issue #2826: the route carries a fresh completed outcome, so the post phase
+    # holds the review until the live head is recorded in ``APPLIED_HEADS_KEY``
+    # (a transient apply failure then retries next pass instead of reviewing the
+    # stale body). ``dead_worker_completed_outcome`` routes always hold.
+    awaits_applied_head: bool = False
 
 
 @dataclass(frozen=True)

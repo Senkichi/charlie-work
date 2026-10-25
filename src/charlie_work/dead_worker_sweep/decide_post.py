@@ -38,7 +38,9 @@ def _route_flow(
     facts: SweepFacts, route: ReviewRoute, no_op: list[NoOpRoute], recovered: list[int]
 ) -> Flow:
     number = route.issue_number
-    if route.reason == "dead_worker_completed_outcome":
+    if route.reason == "dead_worker_completed_outcome" or route.awaits_applied_head:
+        # Hold until the outcome's head is recorded applied: a transient apply
+        # failure retries next pass instead of reviewing the stale body (#1915, #2826).
         applied = yield ReadAppliedHeads(number)
         if not (isinstance(applied, dict) and applied.get(str(number)) == route.live_head_sha):
             return

@@ -2102,6 +2102,18 @@ class WatchdogConfig:
     # to exit leaves the pushed branch and its drafted PR stranded for as long
     # as the PID lingers (the swole #163 incident: PR unopened ~2h).
     worker_outcome_finalize_minutes: Annotated[int, Typed, NonNeg] = 15
+    # Issue #2826: the rework brief promises "the orchestrator applies your
+    # ``pr_body``/``pr_comment`` for you", but the dead-worker sweep only queued
+    # that apply on the completed-outcome route (reviewed head == live head). The
+    # head-changed route, the unreviewed ``pr-open`` advance and the drift
+    # fall-through never read the outcome, so the edit was dropped with no event
+    # and the reviewer kept asking for a body fix no worker could make. True
+    # (default) resolves the completed outcome once, ahead of the route fan-out,
+    # queues the apply for every with-PR route, holds a head-changed review route
+    # until the head is recorded as applied, and rebuilds a verdictless packet
+    # that predates an applied body. False restores the routing-conditional
+    # behaviour exactly (kill switch).
+    apply_rework_outcome_on_every_route: Annotated[bool, Typed] = True
 
 
 @dataclass(frozen=True)
