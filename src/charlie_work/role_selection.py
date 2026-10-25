@@ -158,9 +158,15 @@ class RoleSelection:
     @property
     def exhausted_reason(self) -> str:
         """The deferral reason for an exhausted chain (meaningful only when ``exhausted``)."""
-        return (
-            REASON_HARNESS_AUTH_BLOCKED if self.harness_auth_blocked else REASON_PROVIDER_THROTTLED
-        )
+        return self.exhausted_reason_or(REASON_PROVIDER_THROTTLED)
+
+    def exhausted_reason_or(self, quota_reason: str) -> str:
+        """``REASON_HARNESS_AUTH_BLOCKED`` for a dead-credential exhaustion, else ``quota_reason``.
+
+        For a lane that keeps its own quota-deferral label (the local reviewer lane's
+        ``reviewer_chain_exhausted``) but must still name a dead credential as its own cause.
+        """
+        return REASON_HARNESS_AUTH_BLOCKED if self.harness_auth_blocked else quota_reason
 
     @property
     def earliest_until(self) -> datetime | None:

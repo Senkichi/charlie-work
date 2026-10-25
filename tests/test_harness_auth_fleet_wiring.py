@@ -1,6 +1,6 @@
 """Issue #2810, L3: ``fleet_loop`` really runs the harness-auth episode step.
 
-``tests/test_harness_auth_failure.py`` drives ``harness_auth_block.run_fleet_pass``
+``tests/test_harness_auth_resume.py`` drives ``harness_auth_block.run_fleet_pass``
 directly. This file proves the *consumer*: the fleet pass calls it on a full pass, so
 an armed block is alerted without any operator action, and does not call it on a
 dispatch-only (``work_only``) pass. Kept apart because importing the fleet fixtures

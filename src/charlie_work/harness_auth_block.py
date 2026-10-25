@@ -320,7 +320,7 @@ def _emit_blocked(
     }
     try:
         # write-gate-exempt(issue=2810): fleet-level event on the fleet events.db, no repo write_gate receiver.
-        log_event(  # event-consumer: audit-only -- the operator-facing signal is the notify digest sent beside it; the block itself is enforced from the quota ledger (role_selection / worker_launch_gate), pinned by tests/test_harness_auth_failure.py.
+        log_event(  # event-consumer: audit-only -- the operator-facing signal is the notify digest sent beside it; the block itself is enforced from the quota ledger (role_selection / worker_launch_gate), pinned by tests/test_harness_auth_failure.py and tests/test_harness_auth_resume.py.
             fleet_state_path, "harness_auth_blocked", payload, level="error"
         )
     except Exception:  # noqa: BLE001 - an alert must never break the pass
@@ -356,7 +356,7 @@ def _emit_resumed(
     }
     try:
         # write-gate-exempt(issue=2810): fleet-level event on the fleet events.db, no repo write_gate receiver.
-        log_event(  # event-consumer: audit-only -- closes the episode opened by harness_auth_blocked for the operator; the reopening itself is the ledger stamp (role_quota_ledger.mark_harness_resumed), pinned by tests/test_harness_auth_failure.py.
+        log_event(  # event-consumer: audit-only -- closes the episode opened by harness_auth_blocked for the operator; the reopening itself is the ledger stamp (role_quota_ledger.mark_harness_resumed), pinned by tests/test_harness_auth_resume.py.
             fleet_state_path, "harness_auth_resumed", payload, level="info"
         )
     except Exception:  # noqa: BLE001 - an alert must never break the pass

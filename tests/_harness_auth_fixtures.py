@@ -1,4 +1,5 @@
-"""Shared builders for ``tests/test_harness_auth_failure.py`` (issue #2810).
+"""Shared builders for ``tests/test_harness_auth_failure.py`` and
+``tests/test_harness_auth_resume.py`` (issue #2810).
 
 A three-issue fake repo whose worker harness is ``devin-shell`` (so a harness
 block on it is what the launch gate must react to), a registry helper, the
@@ -16,6 +17,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import pytest
 from _fakes_github import FakeGitHub
 from charlie_work import layout, role_quota_ledger
 from charlie_work.adapters import SessionDispatchResult
@@ -35,6 +37,7 @@ HARNESS = "devin-shell"
 ISSUES = (123, 124, 125)
 DEVIN_PRIMARY = RoleEntry(HARNESS, "swe-2")
 CLAUDE_FALLBACK = RoleEntry("claude-code", "claude-sonnet-5-5")
+CHAIN = (DEVIN_PRIMARY, CLAUDE_FALLBACK)
 NOT_LOGGED_IN = "Error: Not logged in. Run `devin auth login` to authenticate"
 INVALID_KEY = "Error: Authentication required: invalid api key"
 EVIDENCE = NOT_LOGGED_IN
@@ -127,6 +130,13 @@ def register(fleet: Path, *paths_list: Any) -> None:
     fleet.mkdir(parents=True, exist_ok=True)
     repos = {f"o/r{i}": {"state_dir": str(p.state_file.parent)} for i, p in enumerate(paths_list)}
     (fleet / "fleet.json").write_text(json.dumps({"repos": repos}), encoding="utf-8")
+
+
+def run_lane(app: Any, lane: str) -> Any:
+    return app.dispatch(limit=3) if lane == "dispatch" else app.dispatch_rework(limit=3)
+
+
+LANES = pytest.mark.parametrize("lane", ["dispatch", "rework"])
 
 
 def fake_launch(launched: list[tuple[int, str]]):
