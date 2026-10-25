@@ -848,6 +848,7 @@ def _render_rework_prompt(
                     config.dispatch.base_ref,
                     state_file=state_file,
                     payload={"pr_number": pr.get("number"), "issue_number": issue_number},
+                    probe=config.dispatch.worker_selection_probe,
                 ),
             ),
         },
