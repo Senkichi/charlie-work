@@ -116,7 +116,7 @@ main_sync:
 - `instruction_paths` lists the changed paths matching `CLAUDE.md` or `AGENTS.md` at any depth, or anything under `.claude/`.
 - The marker schema is a cross-repo contract with the operator's hook. It is versioned by `schema` and documented in `docs/RUNBOOK.md`.
 
-**Hook, in the operator's claude-config repo.** Stdlib only, registered as a `UserPromptSubmit` hook:
+**Hook, in the operator's config repo.** Stdlib only, registered as a `UserPromptSubmit` hook:
 
 1. Find the git common dir using file reads only. Walk up from the cwd to `.git`. If `.git` is a file (a worktree), follow its `gitdir:` line, then that directory's `commondir`. No subprocess, no git, no network.
 2. Inject only when both hold:
@@ -157,7 +157,7 @@ main_sync:
   - skip events deduplicated per sha pair;
   - marker written only for a final advance;
   - the supervisor's own checkout excluded by resolved path.
-- **Hook** (claude-config): marker lookup from a primary checkout and from a worktree; per-session dedupe; a session started after the marker's `ts` stays silent; a missing or corrupt marker stays silent.
+- **Hook** (operator's config repo): marker lookup from a primary checkout and from a worktree; per-session dedupe; a session started after the marker's `ts` stays silent; a missing or corrupt marker stays silent.
 
 ## Rollout
 
