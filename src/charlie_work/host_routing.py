@@ -21,7 +21,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from typing import TYPE_CHECKING, Any
 
-from .github import GitHubError
+from .github import GitHubError, build_branch_issue_validator_from_issues
 from .issue_linking import linked_issue_number
 
 if TYPE_CHECKING:
@@ -92,6 +92,14 @@ def local_prs(app: Any, prs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     keeps it. When the open-issue fetch fails the default host keeps every PR,
     which is today's behaviour, and any other host keeps none: it never reviews
     or merges a PR it cannot prove it owns.
+
+    Linkage resolves identically to reap_loop's per-PR scan (issue #2822
+    review): the stale-branch guard ``branch_issue_validator`` is built from
+    the already-fetched open-issue list, so a stale ``agent/issue-<n>`` branch
+    naming a closed issue N is not keyed to N — the resolver falls through to
+    the PR body's closing keyword. Without it the two surfaces could disagree
+    and the default host could review or merge a PR whose body closes another
+    host's issue while the owning host drops it.
     """
     config = app.config
     if config.dispatch.host is None or not prs:
@@ -105,12 +113,14 @@ def local_prs(app: Any, prs: list[dict[str, Any]]) -> list[dict[str, Any]]:
         for issue in open_issues
         if issue.get("number") is not None
     }
+    branch_issue_validator = build_branch_issue_validator_from_issues(open_issues)
     kept = []
     for pr in prs:
         number = linked_issue_number(
             pr,
             is_cross_repository=pr.get("isCrossRepository"),
             branch_prefix=config.dispatch.branch_prefix,
+            branch_issue_validator=branch_issue_validator,
         )
         if owned_here(labels_by_issue.get(number, set()), config):
             kept.append(pr)
