@@ -846,6 +846,60 @@ console — Ctrl+C there is handled cleanly: the wrapper logs one line and
 exits without a traceback, leaving its supervisor child (and any workers)
 running; follow with `charlie fleet stop` to stop the child too.
 
+## Main sync: local mains follow origin
+
+Once per full supervisor pass (after `self_deploy`, skipped while draining), the
+supervisor brings every `fleet.json` repo's **primary checkout** up to
+`origin/<default>`, except its own checkout (`orchestrator_root()`, owned by
+`self_deploy`). Design: `docs/specs/main-sync.md`.
+
+- **What it does:** a working-tree `merge --ff-only` when the default branch is
+  checked out, or a compare-and-swap `update-ref` when another branch is. Anything
+  unsafe is skipped with a reason in that repo's `events.db` (`main_sync_skipped`:
+  `blocked`, `diverged`, `unrelated_history`, `checked_out_elsewhere`,
+  `rebase_in_progress`, `index_locked`, `detached_head`, ...), logged once per sha pair.
+- **Kill switch:** `main_sync: {enabled: false}` in `<fleet_dir>/config.yaml`
+  (everywhere) or in one repo's `orchestrator.config.yaml`.
+- **Dependencies:** never touched unless the repo opts in:
+
+  ```yaml
+  main_sync:
+    post_sync_command: ["uv", "sync", "--locked"]
+    post_sync_when_paths: ["uv.lock", "pyproject.toml"]
+    post_sync_timeout_seconds: 300
+  ```
+
+  The command must exit 0 for the advance to stand. It should exit 75 to mean "not
+  now", for example while its venv is in use. Any other exit rolls back with
+  `git reset --keep` and backs off up to 60 minutes.
+- **Alarms** (`main_sync_alarm`, also an `ERROR` fleet attention entry
+  `main-sync <repo>`):
+  - `unrelated_history`: origin was re-rooted; reset the checkout by hand after
+    checking nothing local is lost;
+  - `post_sync_failing`: 3 consecutive failures;
+  - `deferred_4h`: 4h of deferral;
+  - `rollback_refused`: the tree was left at the new sha with a failed post_sync.
+- **Counters:** `<fleet_dir>/main-sync/<owner>__<repo>.json`; deleting one resets it.
+
+### Marker contract (schema 1)
+
+After a working-tree advance stands, main-sync writes
+`<git-common-dir>/charlie-main-sync.json` atomically:
+
+```json
+{"schema": 1, "from": "<sha>", "to": "<sha>", "commits": 4,
+ "instruction_paths": ["CLAUDE.md", ".claude/settings.json"],
+ "ts": "2026-10-25T17:00:00+00:00"}
+```
+
+- `instruction_paths` lists the changed paths that a live agent session loaded as
+  instructions: `CLAUDE.md`/`AGENTS.md` at any depth, or anything under a `.claude/`
+  directory.
+- The file is overwritten on each advance and never deleted. A ref-only update never
+  writes it.
+- Consumers (for example a prompt-submit hook) must treat unknown `schema` values as
+  absent. Adding keys keeps `schema: 1`; renaming or removing a key bumps it.
+
 ## Supervisor: worker health & escalation
 
 The supervisor layer runs as a sweep nested inside each pass (it generalizes

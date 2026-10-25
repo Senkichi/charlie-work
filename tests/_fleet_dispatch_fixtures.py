@@ -24,6 +24,7 @@ from charlie_work.config import (
     RunnerScalingConfig,
 )
 from charlie_work.fleet_dispatch import _CiFleetDirtyCheck
+from charlie_work.main_sync import MainSyncPassResult
 from charlie_work.notify import NotifyResult
 from charlie_work.pending_sync import BootSyncRepair
 from charlie_work.supervise import SelfDeployResult
@@ -115,6 +116,12 @@ def _patch_self_deploy_for_fleet_tests(monkeypatch: Any, tmp_path: Path) -> dict
     monkeypatch.setattr(
         "charlie_work.fleet_dispatch.heal_pending_sync_at_boot",
         lambda *a, **k: BootSyncRepair(),
+    )
+    # docs/specs/main-sync.md: main-sync fetches and fast-forwards real registered
+    # checkouts; default it to an empty pass. Wiring tests patch it themselves.
+    monkeypatch.setattr(
+        "charlie_work.fleet_dispatch.run_main_sync_pass",
+        lambda **_kwargs: MainSyncPassResult(),
     )
     mocks: dict[str, MagicMock] = {}
     for name in (
