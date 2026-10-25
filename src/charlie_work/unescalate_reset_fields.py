@@ -19,6 +19,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from .dead_dispatched_timer import LOCAL_PARK_DEFER_FIELDS
+from .salvage_retry import RETRY_COUNT_FIELD
 
 # PR-record bookkeeping that must not survive an operator re-arm: attempt
 # counters and caches that would otherwise instantly re-escalate the PR
@@ -223,6 +224,11 @@ UNESCALATE_ISSUE_RESET_FIELDS = (
     # ``escalation_deferred_live_worker`` instead of being deduped against
     # a stale marker.
     "escalation_deferred_live_worker",
+    # Issue #2847: the salvage-push retry budget is per stranding episode. It
+    # is spent when an attempt starts and only dropped when a push lands, so
+    # an episode that ends in escalation leaves it at the cap; a re-arm must
+    # clear it or a later stranding on the same issue gets no retry at all.
+    RETRY_COUNT_FIELD,
 )
 
 # Issue #1477 (Option A -- identical-cause recurrence is sticky): the marker

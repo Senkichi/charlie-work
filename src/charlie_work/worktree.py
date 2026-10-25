@@ -56,6 +56,7 @@ from .worktree_archive import (
 from .worktree_closed_reclaim import issue_confirmed_closed, reclaim_closed_issue_worktree
 from .worktree_pr_lanes import pr_lane_verdict
 from .worktree_pr_lookup import WorktreeCleanGH, _pr_number_for_head_branch
+from .salvage_retry import retry_failed_salvage_push
 from .rescue_capture_exclusions import (  # noqa: F401  (deliberate re-export)
     _build_rescue_capture_exclusions,
     _filter_redundant_add_exclusions,
@@ -3418,6 +3419,41 @@ def create_worktree(
                 else None
             ),
         )
+
+    # Issue #2847: a dead worker's commit stranded by ONE transient failure of
+    # the sweep's salvage push is re-pushed (bounded, see ``salvage_retry``)
+    # before any guard below can read it as divergent local work
+    # (``worktree_unsafe_local_commits``, a judgment escalation). Once it is on
+    # origin, recovery and rework attach to it instead of resetting. A failed
+    # attempt with budget left defers this launch through the ordinary
+    # redispatch path; anything else (budget spent, rejection, a remote that
+    # moved) falls through to the guards unchanged. The push itself refuses a
+    # live or operator writer marker and only ever fast-forwards.
+    #
+    # The result is handled by cause: work on origin (pushed now, or already
+    # there) attaches; a push timeout or an unanswered probe defers while
+    # attempts remain; everything else -- a refusal, a moved remote, a live or
+    # operator writer -- falls through to the guards unchanged.
+    if config is not None and state_file is not None and issue_number is not None:
+        salvage_retry = retry_failed_salvage_push(
+            state_file,
+            issue_number,
+            branch,
+            limit=config.dispatch.salvage_push_retries,
+            push=lambda: salvage_push_stranded_commits(
+                repo_root, branch, worktree_path, base_ref=base_ref
+            ),
+        )
+        if salvage_retry.on_origin and recovery is None:
+            # Recovery attaches to a branch with commits on its own; a plain
+            # fresh dispatch would reset to base and fork from the pushed work.
+            rework = True
+        elif salvage_retry.defer:
+            raise WorktreeProbeFailedError(
+                f"salvage push retry {salvage_retry.attempt}/{salvage_retry.limit} for "
+                f"{branch!r} did not land ({salvage_retry.reason}); the commits stay in the "
+                f"worktree and are re-pushed on the next redispatch"
+            )
 
     if recovery is not None:
         # Validate that the recovery record matches the requested branch

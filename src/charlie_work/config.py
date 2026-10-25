@@ -587,6 +587,17 @@ class DispatchConfig:
     # default; set to false to restore the always-clean-base behavior. Any
     # conflict or error falls back to the clean base either way.
     resume_throttled_attempts: Annotated[bool, Typed] = True
+    # Issue #2847: a dead worker's committed work can be stranded by ONE
+    # transient failure of the sweep's salvage push (e.g. ``push_failed:
+    # command timed out after 60s`` through a pre-push gate on a loaded host).
+    # Left alone, the next redispatch reads that commit as divergent local work
+    # and escalates ``worktree_unsafe_local_commits`` to a human. This many
+    # attempts per issue re-push it first (``salvage_retry``); an attempt is
+    # spent when it starts and is visible at
+    # ``state["issues"][n]["salvage_push_retries"]``. A rejected push, or a
+    # remote that moved, still escalates at once -- the retry only ever
+    # fast-forwards. 0 restores the escalate-on-first-sight behavior.
+    salvage_push_retries: Annotated[int, Typed, NonNeg] = 3
 
     def __post_init__(self) -> None:
         # Normalize to a tuple of forward-slash strings. The writer marker is
