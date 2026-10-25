@@ -57,6 +57,7 @@ from .github import (
     label_names,
     parse_blockers,  # noqa: F401  (deliberate re-export; used by moved delegates via _wf.)
 )
+from .host_routing import local_prs as host_local_prs  # noqa: F401  (reap_loop seam)
 from .issue_linking import linked_issue_number
 from .pr_body_closing_autofix_flow import autofix_body_closing_kw
 from .pr_unlinked_visibility import summarize_unlinked_prs

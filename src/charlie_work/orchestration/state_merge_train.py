@@ -11,6 +11,7 @@ from dataclasses import asdict
 from typing import Any
 
 from charlie_work.github import GitHubError
+import charlie_work.host_routing as host_routing
 import charlie_work.workflow as _wf
 from charlie_work.command_result import CommandResult
 
@@ -192,6 +193,8 @@ def _finalize_externally_merged_issues(
             labels=[self.config.labels.ready],
             state="all",
         )
+    # Spec C2: another host finalizes the issues it owns.
+    ready_issues = host_routing.local_issues(ready_issues, self.config)
     closed_ready = [
         issue for issue in ready_issues if str(issue.get("state") or "OPEN").upper() == "CLOSED"
     ]
