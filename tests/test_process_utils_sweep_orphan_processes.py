@@ -4,13 +4,35 @@ import os
 import shutil
 import subprocess
 import sys
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from _run_captured_fakes import monkeypatch_run_captured, patch_run_captured
 
 import charlie_work.orphan_sweep as _sweep
+import charlie_work.posix_processes as posix_processes
 from charlie_work.orphan_sweep import sweep_orphan_processes
+from charlie_work.quiesce import ProcessInfo
+
+
+def test_sweep_orphan_processes_posix_returns_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    """POSIX sweep (issue #2823): substring match over ``ps`` output.
+
+    With a listing where no process's command line names the worktree, the
+    sweep returns an empty list instead of raising -- the same never-raises
+    contract the Windows side has.
+    """
+    fake_listing = (
+        (
+            ProcessInfo(pid=10, ppid=1, name="python3", command_line="/usr/bin/python3 -m idle"),
+            ProcessInfo(pid=11, ppid=1, name="sh", command_line="/bin/sh /other/worktree/run.sh"),
+        ),
+        None,
+    )
+    monkeypatch.setattr(posix_processes, "list_processes_ps", lambda: fake_listing)
+    monkeypatch.setattr(_sweep, "os", SimpleNamespace(name="posix", getpid=lambda: 12345))
+    assert sweep_orphan_processes("/some/worktree/path") == []
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows-only test")
