@@ -679,6 +679,63 @@ def test_sanitize_env_provider_key_pop_is_case_insensitive_on_windows(
     )
 
 
+# ---------------------------------------------------------------------------
+# sanitize_env: ENABLE_CLAUDEAI_MCP_SERVERS gate (issue #2836)
+# ---------------------------------------------------------------------------
+
+
+def test_sanitize_env_sets_claudeai_mcp_gate_false_by_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With the default config (isolate_mcp: true), sanitize_env must set
+    ENABLE_CLAUDEAI_MCP_SERVERS=false so claude.ai connectors never load."""
+    from charlie_work.env_sanitize import ENABLE_CLAUDEAI_MCP_SERVERS_VAR
+
+    worktree_path = tmp_path / "worktree"
+    worktree_path.mkdir()
+    monkeypatch.delenv(ENABLE_CLAUDEAI_MCP_SERVERS_VAR, raising=False)
+
+    env = sanitize_env(worktree_path, config=OrchestratorConfig())
+
+    assert env[ENABLE_CLAUDEAI_MCP_SERVERS_VAR] == "false"
+
+
+def test_sanitize_env_overrides_planted_true_mcp_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A parent-exported true value must be overridden to false: isolation
+    wins over ambient state."""
+    from charlie_work.env_sanitize import ENABLE_CLAUDEAI_MCP_SERVERS_VAR
+
+    worktree_path = tmp_path / "worktree"
+    worktree_path.mkdir()
+    monkeypatch.setenv(ENABLE_CLAUDEAI_MCP_SERVERS_VAR, "true")
+
+    env = sanitize_env(worktree_path, config=OrchestratorConfig())
+
+    assert env[ENABLE_CLAUDEAI_MCP_SERVERS_VAR] == "false"
+
+
+def test_sanitize_env_isolate_mcp_false_leaves_gate_unset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """isolate_mcp: false leaves ENABLE_CLAUDEAI_MCP_SERVERS unset (an
+    operator's deliberate opt-out; no planted default may survive either)."""
+    from charlie_work.env_sanitize import ENABLE_CLAUDEAI_MCP_SERVERS_VAR
+    from charlie_work.config import ClaudeCodeConfig
+
+    worktree_path = tmp_path / "worktree"
+    worktree_path.mkdir()
+    monkeypatch.setenv(ENABLE_CLAUDEAI_MCP_SERVERS_VAR, "true")
+
+    env = sanitize_env(
+        worktree_path,
+        config=OrchestratorConfig(claude_code=ClaudeCodeConfig(isolate_mcp=False)),
+    )
+
+    assert ENABLE_CLAUDEAI_MCP_SERVERS_VAR not in env
+
+
 def test_sanitize_env_call_sites_in_src_all_pass_config() -> None:
     """AST guard: every ``sanitize_env(`` call in src/ must pass ``config=``.
 

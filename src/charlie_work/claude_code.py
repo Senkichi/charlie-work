@@ -53,6 +53,12 @@ from .post_mortem import merge_attempt_snapshot
 from .state import _canonical_started_at, utc_now
 from .subprocess_runner import RunResult, resolve_cli_binary, run_captured
 from .tee_launch import TeeLaunchError, launch_tee
+
+# Facade re-export (issue #2836 review): the tool-scope pin lives in its own
+# domain module (``tool_scope``) so new code never lands in this over-cap
+# monolith; every existing consumer (tests, doctor, sibling adapters) imports
+# it from here.
+from .tool_scope import _apply_tool_scope  # noqa: F401
 from .throttle_signatures import (
     PERMISSION_DENIED_FAILURE_KIND,
     is_headless_permission_denial,
@@ -902,6 +908,12 @@ def run_quota_probe(*, repo_root: Path, config: OrchestratorConfig) -> bool:
     probe = config.quota_probe
     command = _apply_model_pin(_REVIEW_COMMAND_TEMPLATE, probe.model)
     command = _apply_max_turns_pin(command, 1)
+    # Issue #2836: the probe gets the reviewer's tool scope so it does not pay
+    # the full default tool-schema block on a call that only exists to look
+    # at a throttle signature.
+    command = _apply_tool_scope(
+        command, config.claude_code.reviewer_tools, config.claude_code.isolate_mcp
+    )
     # Load no settings files: quota is account-level, so the probe needs none, and
     # running in ``repo_root`` would otherwise fire the operator's SessionStart
     # hooks (a git fetch + fast-forward) inside the probe's timeout.
@@ -934,12 +946,21 @@ def _render_command(
 ) -> tuple[str, ...]:
     # Same placeholder set as devin_shell so the two adapters' command
     # templates are drop-in compatible: {prompt_path} {issue_number} {branch}.
+    # One literal allowance (issue #2836): the inline ``--mcp-config
+    # {"mcpServers":{}}`` token _apply_tool_scope appends carries literal
+    # braces and must pass through byte-identical, not through str.format
+    # (which would raise KeyError on `"mcpServers"` treated as field name).
+    # Everything else keeps the old format-everything behavior, including an
+    # unknown placeholder raising into the render-error record path.
     values = {
         "prompt_path": str(prompt_path),
         "issue_number": str(issue_number),
         "branch": branch,
     }
-    return tuple(part.format(**values) for part in command_template)
+    return tuple(
+        part if part.startswith('{"mcpServers"') else part.format(**values)
+        for part in command_template
+    )
 
 
 def launch_claude_worker(
@@ -1125,6 +1146,16 @@ def launch_claude_worker(
         effort = resolved_config.claude_code.effort
     if cli_pins is None:
         command_template = _apply_effort_pin(command_template, effort)
+        # Issue #2836: narrow the tool surface and (by default) drop MCP
+        # servers for every Claude launch. Skipped on the cli_pins path — that
+        # is the non-Claude CLI (opencode), where these flags are invalid and
+        # the caller owns the argv.
+        _claude_code_cfg = resolved_config.claude_code
+        command_template = _apply_tool_scope(
+            command_template,
+            _claude_code_cfg.reviewer_tools if review else _claude_code_cfg.worker_tools,
+            _claude_code_cfg.isolate_mcp,
+        )
     if review:
         # Cap agentic turns for reviewer sessions to prevent unbounded
         # codebase exploration and runaway token spend. 0 = unlimited.
