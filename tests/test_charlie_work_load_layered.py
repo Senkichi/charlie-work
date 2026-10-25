@@ -210,6 +210,45 @@ def test_load_layered_config_require_global_present_but_invalid_keeps_per_repo(
     assert str(global_config_path) in warning, "the warning must name the global path"
 
 
+def test_load_layered_config_discard_warning_names_the_failing_key(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The discard warning must carry the validation error, not just the fact of a discard.
+
+    Issue #2850: a global layer with one unknown key (``claude_code.
+    max_concurrent_sessions``) was discarded with a warning that never said which
+    section or key failed, so finding the cause meant rebuilding the merge by hand.
+    The ``FieldError`` raised by the merged load already names both; the warning
+    must pass it through. Discard behaviour itself is unchanged: the per-repo value
+    survives.
+    """
+    from charlie_work.global_config import load_layered_config
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir(parents=True, exist_ok=True)
+    fleet_dir_path = tmp_path / "fleet"
+    fleet_dir_path.mkdir(parents=True, exist_ok=True)
+
+    global_config_path = fleet_dir_path / "config.yaml"
+    global_config_path.write_text("claude_code:\n  max_concurrent_sessions: 3\n", encoding="utf-8")
+    (repo_root / "orchestrator.config.yaml").write_text(
+        "dispatch:\n  max_concurrent_sessions: 7\n", encoding="utf-8"
+    )
+
+    with caplog.at_level(logging.WARNING, logger="charlie_work.global_config"):
+        config = load_layered_config(repo_root, None, fleet_dir_override=str(fleet_dir_path))
+
+    assert config.dispatch.max_concurrent_sessions == 7
+
+    warnings = [r for r in caplog.records if "global layer was discarded" in r.getMessage()]
+    assert len(warnings) == 1, "the discard must still be reported exactly once"
+    warning = warnings[0].getMessage()
+    assert warning.startswith("Layered config: merged load failed validation;")
+    assert str(global_config_path) in warning, "the warning must still name the global path"
+    assert "claude_code" in warning, "the failing section must be named"
+    assert "unknown key(s) max_concurrent_sessions" in warning, "the failing key must be named"
+
+
 def test_layered_config_logs_whether_global_layer_was_read(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
