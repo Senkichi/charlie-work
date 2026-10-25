@@ -1,0 +1,15 @@
+{
+  "base_sha": "3a43137b60447753a31749264aff4b0151a3eaed",
+  "deselect": [],
+  "dirty": false,
+  "fraction": null,
+  "head_sha": "3a43137b60447753a31749264aff4b0151a3eaed",
+  "head_tree": "aad6cef9bac23458de54fdbf09e0737b6e020c0c",
+  "level": 0,
+  "map_sha": "9d0a9444792782f6ec59547a4104a91c45c230b9",
+  "mode": "full",
+  "reason": "unmapped:.gitattributes",
+  "reasons": [],
+  "shadow_lower": null,
+  "tests": []
+}
