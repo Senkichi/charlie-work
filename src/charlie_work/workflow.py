@@ -113,6 +113,11 @@ from .review_decision import (
     record_decision,
     review_decision,
 )
+from .review_interdiff import (
+    base_turn_cap,
+    packet_round_facts,
+    round_info_from_record,
+)
 from .worktree import (
     _reap_idle_foreign_writer,
     remote_branch_ahead_count,  # noqa: F401  (deliberate re-export; dead_worker_sweep.ports resolves it here at call time)
@@ -3673,6 +3678,14 @@ class OrchestratorApp:
             if is_round2_review
             else ""
         )
+        # Issue #2837: resolve this packet's round kind (first / incremental /
+        # fallback) and measure the interdiff the builder just wrote, so the
+        # dispatch side can pin the incremental turn budget, mirror the kind
+        # into the dispatch events, and stamp the record. None (unstamped)
+        # under the incremental_review kill switch.
+        round_facts = packet_round_facts(
+            pr_dir, existing_decision, pr.get("headRefOid"), cfg=self.config.review_dispatch
+        )
 
         prompt = self._render(
             "review.md",
@@ -3694,6 +3707,9 @@ class OrchestratorApp:
                 "over_cap_section": over_cap_section,
                 "attachment_budget_section": attachment_budget_section,
                 "prior_review_section": prior_review_section,
+                # Issue #2837: the incremental procedure for a round-2+ packet
+                # with an archive-built interdiff; "" (renders away) otherwise.
+                "incremental_review_procedure": round_facts.procedure,
             },
         )
         prompt_path.write_text(prompt, encoding="utf-8")
@@ -3903,6 +3919,10 @@ class OrchestratorApp:
                 # this record).
                 "no_op_rework_attempts": 0,
                 "no_op_rework_attempts_last_head": None,
+                # Issue #2837: this packet's round kind + interdiff size, for
+                # the dispatch-side turn-budget pin and the event mirror;
+                # absent under the kill switch (round_facts.kind None).
+                **round_facts.stamp,
                 # The conflict epoch resets only on an AFFIRMATIVE mergeable
                 # signal: GitHub reports mergeable UNKNOWN/null for a window
                 # after every push while it recomputes, and the janitor's
@@ -3946,6 +3966,9 @@ class OrchestratorApp:
                     "review_turn_cap_max_touched_lines": pr_json.get(
                         "review_turn_cap_max_touched_lines", 0
                     ),
+                    # Issue #2837: the round kind + measured interdiff size,
+                    # per-packet audit mirror of the dispatch-side event.
+                    **round_facts.stamp,
                 },
                 state_path=self.paths.state_file,
             )
@@ -4766,6 +4789,10 @@ class OrchestratorApp:
             # with is the cap recorded on the claim -- not a re-derivation that
             # could diverge if the miss streak changes between claim and launch.
             resolved_review_turn_caps: dict[int, int] = {}
+            # Issue #2837: this packet's round kind + measured interdiff
+            # size, resolved once at claim time (mirroring the effort/cap
+            # resolution above) and threaded through the claim event.
+            resolved_round_info: dict[int, dict[str, Any]] = {}
             for candidate in selected:
                 pr_number = candidate["pr"]
                 pr_state = state["prs"].get(str(pr_number), {})
@@ -4781,8 +4808,13 @@ class OrchestratorApp:
                 # cap, preserving the pre-fix flat budget.
                 _structure_mult = self._read_packet_turn_cap_multiplier(pr_number)
                 _miss_streak = int(pr_state.get("review_turn_limit_miss_streak", 0))
+                # Issue #2837: an incremental round (the packet rendered the
+                # archive-built PR-relative interdiff and its procedure) runs
+                # the smaller base budget; every other kind keeps the flat
+                # ``review_max_turns``. The #1439 escalation multiplies on top.
+                resolved_round_info[pr_number] = round_info_from_record(pr_state)
                 _resolved_cap = resolve_review_turn_cap(
-                    self.config.review_dispatch.review_max_turns,
+                    base_turn_cap(pr_state, self.config.review_dispatch),
                     _structure_mult,
                     _miss_streak,
                     self.config.review_dispatch,
@@ -4814,6 +4846,10 @@ class OrchestratorApp:
                         "review_effort_arm": review_effort_arm,
                         "review_effort_used": review_effort_used,
                         "review_turn_cap": _resolved_cap,
+                        # Issue #2837: round kind + measured interdiff size,
+                        # so each dispatch is splittable by kind and the
+                        # incremental saving is measurable.
+                        **resolved_round_info[pr_number],
                     }
                 )
             if selected:
@@ -5109,6 +5145,20 @@ class OrchestratorApp:
                     "launched": [x["pr"] for x in launched],
                     "failed": [x["pr"] for x in failed],
                     "quota_hit": quota_hit,
+                    # Issue #2837: per-selected-PR round kind + measured
+                    # interdiff size, the dispatch-side measurement pair for
+                    # the incremental-review saving.
+                    "review_round_kinds": {
+                        str(pr): info["review_round_kind"]
+                        for pr, info in resolved_round_info.items()
+                    },
+                    "review_interdiff_counts": {
+                        str(pr): {
+                            "files": info["review_interdiff_files"],
+                            "lines": info["review_interdiff_lines"],
+                        }
+                        for pr, info in resolved_round_info.items()
+                    },
                     **selection.fleet_report_fields(),
                 },
             )

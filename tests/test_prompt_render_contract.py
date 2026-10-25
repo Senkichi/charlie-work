@@ -611,6 +611,7 @@ REVIEW_MD_SUPPLIED_KEYS = {
     "over_cap_section",
     "attachment_budget_section",
     "prior_review_section",
+    "incremental_review_procedure",
 }
 
 # orchestration/local_lanes.py::_local_build_packet, the literal values dict
@@ -634,6 +635,7 @@ REVIEW_LOCAL_MD_SUPPLIED_KEYS = {
     "over_cap_section",
     "attachment_budget_section",
     "prior_review_section",
+    "incremental_review_procedure",
 }
 
 _PINNED_KEY_SETS = {
@@ -712,6 +714,7 @@ def test_review_md_renders_with_production_paths_and_no_state_dir_literal(
         "over_cap_section": "",
         "attachment_budget_section": "",
         "prior_review_section": "",
+        "incremental_review_procedure": "",
     }
     assert set(values) == REVIEW_MD_SUPPLIED_KEYS
 
@@ -778,6 +781,7 @@ def test_review_md_repo_local_override_render_with_no_state_dir_literal(
         "over_cap_section": "",
         "attachment_budget_section": "",
         "prior_review_section": "",
+        "incremental_review_procedure": "",
     }
     assert set(values) == REVIEW_MD_SUPPLIED_KEYS
 

@@ -207,6 +207,7 @@ _REVIEW_MD_VALUES = {
     "over_cap_section": "",
     "attachment_budget_section": "",
     "prior_review_section": "",
+    "incremental_review_procedure": "",
 }
 
 
