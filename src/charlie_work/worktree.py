@@ -3429,6 +3429,11 @@ def create_worktree(
     # redispatch path; anything else (budget spent, rejection, a remote that
     # moved) falls through to the guards unchanged. The push itself refuses a
     # live or operator writer marker and only ever fast-forwards.
+    #
+    # The result is handled by cause: work on origin (pushed now, or already
+    # there) attaches; a push timeout or an unanswered probe defers while
+    # attempts remain; everything else -- a refusal, a moved remote, a live or
+    # operator writer -- falls through to the guards unchanged.
     if config is not None and state_file is not None and issue_number is not None:
         salvage_retry = retry_failed_salvage_push(
             state_file,
@@ -3439,14 +3444,14 @@ def create_worktree(
                 repo_root, branch, worktree_path, base_ref=base_ref
             ),
         )
-        if salvage_retry.pushed and recovery is None:
+        if salvage_retry.on_origin and recovery is None:
             # Recovery attaches to a branch with commits on its own; a plain
             # fresh dispatch would reset to base and fork from the pushed work.
             rework = True
         elif salvage_retry.defer:
             raise WorktreeProbeFailedError(
                 f"salvage push retry {salvage_retry.attempt}/{salvage_retry.limit} for "
-                f"{branch!r} failed ({salvage_retry.error}); the commits stay in the "
+                f"{branch!r} did not land ({salvage_retry.reason}); the commits stay in the "
                 f"worktree and are re-pushed on the next redispatch"
             )
 
