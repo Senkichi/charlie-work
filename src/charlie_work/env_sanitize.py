@@ -138,7 +138,7 @@ _UV_NO_SYNC_DEFAULT = "1"
 # loads no claude.ai connectors (verified 2026-10-24: every mcp__claude_ai_*
 # tool, including Gmail create_draft, disappears from the tool list). It pairs
 # with the argv-side --strict-mcp-config --mcp-config {"mcpServers":{}} pin in
-# claude_code._apply_tool_scope: the argv flag drops project/user-scope MCP
+# tool_scope._apply_tool_scope: the argv flag drops project/user-scope MCP
 # servers, this environment gate drops claude.ai connectors.
 ENABLE_CLAUDEAI_MCP_SERVERS_VAR = "ENABLE_CLAUDEAI_MCP_SERVERS"
 

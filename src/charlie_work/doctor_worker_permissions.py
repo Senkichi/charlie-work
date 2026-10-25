@@ -18,6 +18,7 @@ from typing import Any
 
 from .claude_code import _WORKER_COMMAND_TEMPLATE, PROMPTING_PERMISSION_MODES
 from .config import OrchestratorConfig
+from .tool_scope import _apply_tool_scope
 
 
 def effective_permission_mode(command: tuple[str, ...]) -> str | None:
@@ -73,21 +74,31 @@ def effective_tool_scope(command: tuple[str, ...], config: OrchestratorConfig) -
     """Resolve the effective tool allowlist and MCP isolation for a
     claude-code worker launch (issue #2836).
 
-    The argv-side pin (``claude_code._apply_tool_scope``) is appended by the
-    adapter, not present in ``command`` — so a configured ``--tools`` in
-    ``claude_code.command`` is the caller-tuned source, otherwise the config's
-    ``worker_tools`` applies. Returns ``(tools, isolate_mcp)``: ``tools`` is
-    the comma-separated allowlist, empty when the CLI default applies.
+    Derived from the same logic the launch uses, not from reading
+    ``command`` directly: a ``--tools`` (or ``--mcp-config``/
+    ``--strict-mcp-config``) token carried in ``claude_code.command`` is
+    *stripped* by ``tool_scope._apply_tool_scope`` at launch before the
+    configured scope is re-pinned, so it must not be reported as effective
+    here either. Running the pin over the command with the config's
+    ``worker_tools``/``isolate_mcp`` reproduces the launch argv-side scope
+    exactly — including the kill-switch behavior: ``worker_tools: ""`` with
+    a command-carried ``--tools`` still yields ``("", …)`` (CLI default),
+    which the check reports as a warning.
+
+    Returns ``(tools, isolate_mcp)``: ``tools`` is the effective
+    comma-separated allowlist, empty when the CLI default applies;
+    ``isolate_mcp`` is whether the strict-MCP flags are appended.
     """
+    pinned = _apply_tool_scope(
+        command, config.claude_code.worker_tools, config.claude_code.isolate_mcp
+    )
     tools = ""
-    for index, token in enumerate(command):
-        if token == "--tools" and index + 1 < len(command):
-            tools = command[index + 1]
+    for index, token in enumerate(pinned):
+        if token == "--tools" and index + 1 < len(pinned):
+            tools = pinned[index + 1]
         elif token.startswith("--tools="):
             tools = token.split("=", 1)[1]
-    if not tools:
-        tools = config.claude_code.worker_tools
-    return tools, bool(config.claude_code.isolate_mcp)
+    return tools, "--strict-mcp-config" in pinned
 
 
 def _check_claude_worker_tool_scope(

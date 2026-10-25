@@ -51,6 +51,12 @@ from .env_sanitize import build_worker_env, resolve_pytest_cap, resolve_uv_no_sy
 from .post_mortem import merge_attempt_snapshot
 from .state import _canonical_started_at, utc_now
 from .subprocess_runner import RunResult, resolve_cli_binary, run_captured
+
+# Facade re-export (issue #2836 review): the tool-scope pin lives in its own
+# domain module (``tool_scope``) so new code never lands in this over-cap
+# monolith; every existing consumer (tests, doctor, sibling adapters) imports
+# it from here.
+from .tool_scope import _apply_tool_scope  # noqa: F401
 from .throttle_signatures import (
     PERMISSION_DENIED_FAILURE_KIND,
     is_headless_permission_denial,
@@ -767,55 +773,6 @@ def _apply_effort_pin(command_template: tuple[str, ...], effort: str) -> tuple[s
             continue
         filtered.append(token)
     return tuple(filtered) + ("--effort", effort)
-
-
-def _apply_tool_scope(
-    command_template: tuple[str, ...],
-    tools: str,
-    isolate_mcp: bool,
-) -> tuple[str, ...]:
-    """Hard-pin the tool scope and MCP isolation onto ``command_template``.
-
-    Issue #2836: fleet Claude sessions (workers and reviewers) used to launch
-    with the operator's whole interactive tool surface — every user-scope MCP
-    server, every claude.ai connector, and the full built-in tool schema block
-    (Artifact/Skill/Workflow/Agent measured ~40k of ~57k first-call context
-    tokens, then re-read from cache on every call for the session's lifetime).
-    Both worker and reviewer tool usage over the prior 48 h was fully covered
-    by the allowlists this pin carries.
-
-    Shaped like ``_apply_model_pin``: every occurrence of ``--tools`` (bare
-    flag + value, or ``--tools=value``), ``--mcp-config`` (both forms), and
-    the valueless ``--strict-mcp-config`` is stripped first — a
-    caller-supplied ``command_template`` (``ClaudeCodeConfig.command``) must
-    not be able to widen the scope, the same way
-    ``_sanitize_review_command_template`` defeats ``--permission-mode``
-    overrides. Then a single authoritative ``--tools <csv>`` is appended when
-    ``tools`` is non-empty (an empty string is the operator kill switch: no
-    flag, CLI default applies), and ``--strict-mcp-config --mcp-config
-    {"mcpServers":{}}`` is appended when ``isolate_mcp`` is true (inline
-    empty-server JSON; the CLI accepts a JSON string). Safe to apply uniformly
-    to both roles: it only ever narrows.
-    """
-    filtered: list[str] = []
-    skip_next = False
-    for token in command_template:
-        if skip_next:
-            skip_next = False
-            continue
-        if token in ("--tools", "--mcp-config"):
-            skip_next = True
-            continue
-        if token == "--strict-mcp-config":
-            continue
-        if token.startswith("--tools=") or token.startswith("--mcp-config="):
-            continue
-        filtered.append(token)
-    if tools:
-        filtered.extend(("--tools", tools))
-    if isolate_mcp:
-        filtered.extend(("--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}'))
-    return tuple(filtered)
 
 
 def _review_effort_arm(pr_number: int, fraction: float, salt: str) -> bool:

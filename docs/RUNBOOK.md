@@ -441,36 +441,6 @@ Mitigations (the fleet is charlie-work's, but the test config is the
   cleanup hazard described above; bound parallelism with `PYTEST_XDIST_AUTO_NUM_WORKERS`
   instead of disabling isolation.
 
-### Tool allowlist and MCP isolation (claude_code, #2836)
-
-Every Claude Code session the fleet launches (workers and reviewers) launches
-with a hostile-adjacent tool surface reduced to what its role actually used:
-
-- `claude_code.worker_tools` — default `Bash,Read,Edit,Write,Grep,Glob,Monitor,TaskStop`,
-  pinned via `--tools` on every worker launch.
-- `claude_code.reviewer_tools` — default `Bash,Read,Grep,Glob,Write`, pinned on
-  every reviewer launch (and on the quota probe).
-- `claude_code.isolate_mcp` — default `true`. Appends `--strict-mcp-config
-  --mcp-config {"mcpServers":{}}` (no MCP servers) to the launch argv and sets
-  `ENABLE_CLAUDEAI_MCP_SERVERS=false` in every sanitized worker environment, so
-  claude.ai connectors never load either.
-
-Together this removes the operator's user-scope MCP servers (GitHub remote-MCP
-*write* tools, Gmail's `create_draft`, Drive, Calendar) from sessions that read
-attacker-controlled issue text under `bypassPermissions`, and cuts the unused
-tool-schema block (~40k of the ~57k default first-call context) off every API
-call. Workers and reviewers do their GitHub reads through `gh` in Bash; no
-prompt references MCP tools.
-
-**Kill switches.** Setting `${*_tools}: ""` removes the `--tools` pin (the CLI
-default tool set loads); `isolate_mcp: false` restores ambient MCP/connector
-loading and leaves `ENABLE_CLAUDEAI_MCP_SERVERS` unset. Both opt-outs are
-reported as doctor warnings under "claude-code worker tool scope", along with
-the effective scope otherwise. A caller-supplied `claude_code.command` cannot
-widen the scope: any `--tools`/`--mcp-config` it carries is stripped and the
-configured scope re-pinned. The `merge_preflight_hook.py`
-`mcp__github__merge_pull_request` guard stays in place unchanged.
-
 Those are *static* bounds — they shape how much load each worker adds, but a
 worker-count budget alone cannot see load the fleet did not create (CI runs on
 the same box, other repos' fleets, a sibling repo's test suite). Issue #1843 added the
@@ -504,6 +474,40 @@ entirely. A deferred launch writes a `dispatch_backpressure` event
 and `host_load_term` naming the binding term) to the repo's `events.db`, and a
 failed measurement fails *open* — dispatch proceeds — with a rate-limited
 `host_load_unavailable` warning instead of a silent missing clamp.
+
+### Tool allowlist and MCP isolation (claude_code, #2836)
+
+Every Claude Code session the fleet launches (workers and reviewers) launches
+with a hostile-adjacent tool surface reduced to what its role actually used:
+
+- `claude_code.worker_tools` — default `Bash,Read,Edit,Write,Grep,Glob,Monitor,TaskStop`,
+  pinned via `--tools` on every worker launch.
+- `claude_code.reviewer_tools` — default `Bash,Read,Grep,Glob,Write`, pinned on
+  every reviewer launch (and on the quota probe).
+- `claude_code.isolate_mcp` — default `true`. Appends `--strict-mcp-config
+  --mcp-config {"mcpServers":{}}` (no MCP servers) to the launch argv and sets
+  `ENABLE_CLAUDEAI_MCP_SERVERS=false` in every sanitized worker environment, so
+  claude.ai connectors never load either.
+
+Together this removes the operator's user-scope MCP servers (GitHub remote-MCP
+*write* tools, Gmail's `create_draft`, Drive, Calendar) from sessions that read
+attacker-controlled issue text under `bypassPermissions`, and cuts the unused
+tool-schema block (~40k of the ~57k default first-call context) off every API
+call. Workers and reviewers do their GitHub reads through `gh` in Bash; no
+prompt references MCP tools. Dropped *built-in* tools reviewers had used but
+no longer get: **PowerShell, WebFetch and Agent** — a review that genuinely
+needs one of them must argue for it in code, not widen the pin silently.
+
+**Kill switches.** Setting `claude_code.worker_tools` (resp.
+`claude_code.reviewer_tools`) to the empty string `""` removes the `--tools`
+pin (the CLI default tool set loads); `isolate_mcp: false` restores ambient
+MCP/connector loading and leaves `ENABLE_CLAUDEAI_MCP_SERVERS` unset. Both
+opt-outs are reported as doctor warnings under "claude-code worker tool
+scope", along with the effective scope otherwise. A caller-supplied
+`claude_code.command` cannot widen the scope: any `--tools`/`--mcp-config` it
+carries is stripped and the configured scope re-pinned. The
+`merge_preflight_hook.py` `mcp__github__merge_pull_request` guard stays in
+place unchanged.
 
 ### Host test-slot pool (`test_slots`, issue #2124)
 
