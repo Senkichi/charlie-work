@@ -162,8 +162,10 @@ claude_code:
 
 
 def _await_events_sidecar(events_path: Path, timeout_seconds: float = 10.0) -> bool:
-    """Poll until the tee splitter child has created the events sidecar (it
-    opens the files itself, stream-side, not inside the launcher)."""
+    """Poll until the events sidecar exists. The launcher pre-creates both
+    tee destinations synchronously (round 3), so the path appears at launch
+    itself; the poll just absorbs any concurrency between the launch call
+    returning and the file being observable on this host."""
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
         if events_path.exists():

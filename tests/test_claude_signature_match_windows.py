@@ -119,16 +119,53 @@ def test_signature_match_text_plain_tail_passthrough() -> None:
 
 
 def test_signature_match_text_cut_drops_partial_first_line() -> None:
-    """``cut=True`` drops the byte-slice's partial first line: the fragment of
-    a >2KB event line parses as no event (so it would be treated as merged
-    stderr and matched raw), and its surviving half can carry a whole
-    signature string. Control: the same tail without the cut flag still
-    leaks ``signature`` (the pre-round-3 behaviour the flag closes)."""
+    """``cut=True`` drops the byte-slice's partial first line of a STREAM-JSON
+    tail: the fragment of a >2KB event line parses as no event (so it would
+    be treated as merged stderr and matched raw), and its surviving half can
+    carry a whole signature string. Control: the same tail without the cut
+    flag still leaks ``signature`` (the pre-round-3 behaviour the flag
+    closes). Round 4: the drop applies ONLY to a stream-json tail — a plain
+    tail is returned whole even when cut (the tee-off kill-switch promise:
+    plain-text matching is byte-identical to the pre-rework behaviour)."""
     signature = "Rate limit exceeded. Resets in 15 minutes."
     fragment = signature + " (the 2KB slice cut this event line)"
-    tail = f"{fragment}\nWorker still healthy.\n"
-    assert fragment in signature_match_text(tail)
-    assert signature_match_text(tail, cut=True) == "Worker still healthy."
+    tail = f"{fragment}\n{_dumps({'type': 'result', 'is_error': True, 'result': 'fatal line'})}\n"
+    assert signature in signature_match_text(tail, stream_json=True)
+    assert signature_match_text(tail, cut=True, stream_json=True) == _dumps(
+        {"type": "result", "is_error": True, "result": "fatal line"}
+    )
+
+    plain = f"{fragment}\nWorker still healthy.\n"
+    assert signature_match_text(plain, cut=True) == plain
+    assert signature_match_text(plain) == plain
+
+
+def test_classify_failure_plain_last_line_over_2kb_still_classifies(tmp_path: Path) -> None:
+    """Round 4 regression (tee-off kill switch): a PLAIN-text log whose LAST
+    line is longer than 2KB and carries the signature — the 2KB slice starts
+    inside that line, and the un-cut behaviour must still match through the
+    raw slice, byte-identical to the pre-rework classifier. Both a throttle
+    and a permission signature variant."""
+    throttle = ("x" * 2200) + "Rate limit exceeded. Resets in 15 minutes."
+    throttle_log = tmp_path / "plain-throttle.log"
+    throttle_log.write_text(f"shim started\n{throttle}", encoding="utf-8")
+    kind, until = classify_failure(
+        throttle_log, OrchestratorConfig().runtime.throttle_error_markers
+    )
+    assert kind == "rate_limited"
+    assert until is not None
+
+    denial = ("x" * 2200) + DENIAL_TEXT
+    denial_log = tmp_path / "plain-denial.log"
+    denial_log.write_text(f"shim started\n{denial}", encoding="utf-8")
+    kind, until = classify_failure(denial_log, headless_permission_detection=True)
+    assert kind == "permission_denied"
+    assert until is None
+
+
+DENIAL_TEXT = (
+    "I could not run the tests. If you approve command execution, I can finish these steps."
+)
 
 
 # --- the >2KB tool_result straddling the 2KB window -----------------------------

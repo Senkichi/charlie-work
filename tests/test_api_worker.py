@@ -223,10 +223,10 @@ def test_launch_api_worker_force_enables_tee_stream_json(
     assert captured["adapter_kind"] == "api"
     assert captured["provider"] == "kimi-k3"
 
-    # tee_stream_json=True spawns the tee splitter child at launch time, which
-    # opens issue-<n>.events.jsonl stream-side — so it must exist on disk
-    # (independent of whether the fake worker has written any stream-json
-    # events yet).
+    # tee_stream_json=True pre-creates both tee destinations in the launcher
+    # and spawns the tee splitter child at launch time — so it must exist on
+    # disk (independent of whether the fake worker has written any
+    # stream-json events yet).
     events_path = sessions_dir / "issue-7.events.jsonl"
     deadline = time.monotonic() + 10.0
     while not events_path.exists() and time.monotonic() < deadline:

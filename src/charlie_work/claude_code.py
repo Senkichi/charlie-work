@@ -22,7 +22,6 @@ import json
 import logging
 import os
 import subprocess
-import sys
 import uuid
 from collections.abc import Callable, Iterator
 from dataclasses import asdict, dataclass
@@ -53,6 +52,7 @@ from .failure_classifier import log_is_stream_json, signature_match_text
 from .post_mortem import merge_attempt_snapshot
 from .state import _canonical_started_at, utc_now
 from .subprocess_runner import RunResult, resolve_cli_binary, run_captured
+from .tee_launch import TeeLaunchError, launch_tee
 from .throttle_signatures import (
     PERMISSION_DENIED_FAILURE_KIND,
     is_headless_permission_denial,
@@ -81,14 +81,6 @@ PROMPT_FILENAME = CLAUDE_CODE_PROMPT_FILENAME
 
 logger = logging.getLogger(__name__)
 
-# The tee-splitter child script spawned by ``launch_claude_worker`` when
-# ``tee_stream_json`` is on: it owns the read end of the worker's stdout pipe
-# so the log and the events.jsonl keep being written even after the launching
-# supervisor exits (issue #2814 rework). Tests that spawn the script directly
-# resolve it from ``charlie_work.tee_splitter.__file__`` (round 3 review:
-# this module carried no test-only public accessor for it).
-_TEE_SPLITTER_PATH = Path(__file__).with_name("tee_splitter.py")
-
 
 # Provider authentication failures (issue #484): matched against the log tail
 # of api-kind sessions only — a dead/invalid API key against a custom
@@ -110,13 +102,15 @@ def worker_permission_denied(sessions_dir: Path, issue_number: int, detail: str 
     the headless permission-denial signature (issue #2010). Never raises.
 
     The log-tail check runs through
-    ``failure_classifier.signature_match_text`` (issue #2814 rework round 3):
-    in a tee'd stream-json log a ``tool_result`` (or assistant turn) merely
-    *quoting* "requires approval" / "command was denied" is the worker
+    ``failure_classifier.signature_match_text`` (issue #2814 rework), in
+    permission mode (round 4): in a tee'd stream-json log a ``tool_result``
+    merely *quoting* "requires approval" / "command was denied" is the worker
     observing a denial, not the CLI surfacing one — matching it raw would
-    both suppress a real deny and manufacture a fake one. The tail's shape
-    comes off the whole log head and the cut flag drops the slice's partial
-    first line."""
+    both suppress a real deny and manufacture a fake one. But a REAL headless
+    denial reports ``is_error: false`` in the terminal ``result`` event (and
+    the assistant's final turn), so unlike the throttle/quota matchers this
+    one admits those lines. The tail's shape comes off the whole log head and
+    the cut flag drops the slice's partial first line."""
     if is_headless_permission_denial(detail):
         return True
     try:
@@ -134,6 +128,7 @@ def worker_permission_denied(sessions_dir: Path, issue_number: int, detail: str 
             tail,
             cut=len(log_text) > len(tail),
             stream_json=log_is_stream_json(log_text),
+            permission=True,
         )
     )
 
@@ -1386,30 +1381,27 @@ def launch_claude_worker(
     uv_no_sync, uv_no_sync_source = resolve_uv_no_sync(worktree.path, sanitized_env, env)
 
     try:
-        # If tee_stream_json is enabled, we need to tee stdout to both the log
-        # and the events file. The tee is a separate child process
-        # (``tee_splitter.py``) that owns the pipe's read end: the worker CLI's
-        # stdout is wired to the splitter's stdin, so the pipe survives the
-        # launching supervisor process exiting (self-deploy restart, fleet
-        # pause). Issue #2814 rework: with the previous
-        # ``subprocess.PIPE`` + launcher daemon-thread drain, every tee'd
-        # worker was a restart casualty — the supervisor's exit closed the
-        # pipe and the worker's next stdout write failed (measured on this
-        # host: ``OSError: [Errno 22] Invalid argument`` on Windows, a broken
-        # pipe on POSIX), killing any session unlucky enough to print.
+        # If tee_stream_json is enabled, the tee is a separate splitter child
+        # process (``tee_splitter.py``) that owns the pipe's read end: the
+        # worker CLI's stdout is wired to the splitter's stdin, so the pipe
+        # survives the launching supervisor process exiting (self-deploy
+        # restart, fleet pause). Destination pre-create, splitter spawn, and
+        # the stdin handoff live in ``tee_launch.launch_tee`` (issue #2814
+        # rework round 4 extraction); a TeeLaunchError here is the same
+        # pre-spawn launch error record every other launch step produces,
+        # while the WORKER spawn's OSError is re-raised into the shared
+        # handler below.
         if tee_stream_json and events_path:
-            # Pre-create/truncate BOTH tee destinations here, synchronously,
-            # before the splitter child exists (issue #2814 rework round 3):
-            # previously only the splitter child opened the files stream-side,
-            # so an unopenable destination (permissions, path shape) failed
-            # inside the child AFTER the worker was already wired to its
-            # stdin — a silently dead worker, no log, nothing to drain, and
-            # no error record. An OSError surfaces here as the same launch
-            # error record every other pre-spawn failure produces.
-            try:
-                for tee_dest in (log_path, events_path):
-                    tee_dest.open("w", encoding="utf-8").close()
-            except OSError as exc:
+            tee_result = launch_tee(
+                command=command,
+                cwd=str(worktree.path),
+                prompt_path=prompt_path,
+                feed_stdin=feed_stdin,
+                log_path=log_path,
+                events_path=events_path,
+                worker_env=worker_env,
+            )
+            if isinstance(tee_result, TeeLaunchError):
                 _teardown_on_launch_failure()
                 record = _error_record(
                     issue_number=issue_number,
@@ -1418,7 +1410,7 @@ def launch_claude_worker(
                     prompt_path=str(prompt_path),
                     command=command,
                     log_path=str(log_path),
-                    error=f"failed to create tee log files: {exc}",
+                    error=tee_result.error,
                     adapter_kind=adapter_kind,
                     provider=provider,
                     state_path=launch_state_path,
@@ -1427,76 +1419,7 @@ def launch_claude_worker(
                     error_class=launch_events.LAUNCH_ERR_SPAWN,
                 )
                 return _write_record(sessions_dir, record)
-            try:
-                tee_splitter = popen_worker(
-                    (
-                        sys.executable,
-                        str(_TEE_SPLITTER_PATH),
-                        str(log_path),
-                        str(events_path),
-                    ),
-                    priority=CpuPriority.BELOW_NORMAL,
-                    stdin=subprocess.PIPE,
-                    env=worker_env,
-                )
-            except OSError as exc:
-                _teardown_on_launch_failure()
-                record = _error_record(
-                    issue_number=issue_number,
-                    branch=branch,
-                    worktree_path=str(worktree.path),
-                    prompt_path=str(prompt_path),
-                    command=command_template,
-                    log_path=str(log_path),
-                    error=f"failed to launch tee splitter: {exc}",
-                    adapter_kind=adapter_kind,
-                    provider=provider,
-                    state_path=launch_state_path,
-                    role=launch_role,
-                    model=pinned_model,
-                    error_class=launch_events.LAUNCH_ERR_SPAWN,
-                )
-                return _write_record(sessions_dir, record)
-
-            try:
-                if feed_stdin:
-                    prompt_handle = prompt_path.open("r", encoding="utf-8")
-                    try:
-                        process = popen_worker(
-                            command,
-                            priority=CpuPriority.BELOW_NORMAL,
-                            cwd=str(worktree.path),
-                            stdin=prompt_handle,
-                            stdout=tee_splitter.stdin,
-                            stderr=subprocess.STDOUT,
-                            env=worker_env,
-                            start_new_session=(os.name != "nt"),
-                        )
-                    finally:
-                        prompt_handle.close()
-                else:
-                    process = popen_worker(
-                        command,
-                        priority=CpuPriority.BELOW_NORMAL,
-                        cwd=str(worktree.path),
-                        stdin=subprocess.DEVNULL,
-                        stdout=tee_splitter.stdin,
-                        stderr=subprocess.STDOUT,
-                        env=worker_env,
-                        start_new_session=(os.name != "nt"),
-                    )
-            except OSError:
-                # Worker spawn failed after the splitter was up: release the
-                # splitter's stdin so it reads EOF and exits; the outer
-                # `except OSError` below still handles worktree cleanup and
-                # the error record.
-                tee_splitter.stdin.close()
-                raise
-
-            # Hand the pipe write end to the worker process entirely: only
-            # the worker holds it now, so the splitter keeps draining for the
-            # worker's whole lifetime regardless of our lifecycle.
-            tee_splitter.stdin.close()
+            process = tee_result.process
         else:
             # Original behavior: direct stdout to log file
             with log_path.open("w", encoding="utf-8", errors="replace") as log_handle:

@@ -189,7 +189,9 @@ def log_is_stream_json(log_text: str) -> bool:
     return _is_stream_json(log_text[:_STREAM_JSON_SHAPE_PROBE_CHARS])
 
 
-def signature_match_text(tail: str, *, cut: bool = False, stream_json: bool | None = None) -> str:
+def signature_match_text(
+    tail: str, *, cut: bool = False, stream_json: bool | None = None, permission: bool = False
+) -> str:
     """The text of ``tail`` that failure signatures may be matched against.
 
     Single shared helper (issue #2814 rework) for every raw-tail signature
@@ -199,7 +201,12 @@ def signature_match_text(tail: str, *, cut: bool = False, stream_json: bool | No
     ``dead_worker_classification._terminal_is_throttle_error`` (which backs
     ``classify_clean_exit_throttle``).
 
-    - A plain (non-stream-json) tail is matched whole, exactly as before.
+    - A plain (non-stream-json) tail matched whole, byte-identical to the
+      pre-rework behaviour: ``cut`` only ever drops a line from a STREAM-JSON
+      tail. Round 4 review: the ``tee_stream_json: false`` kill switch
+      promises the exact plain-text behaviour, so the partial-first-line drop
+      must not leak into a tee-off log's matching either (a plain tail's
+      slice-fragment first line was always matched raw and stays that way).
     - In a stream-json tail the event bodies are excluded: matching keeps the
       non-event lines (merged stderr / plain CLI prose) and the CLI's own
       error output (``result`` with ``is_error``, ``rate_limit_event``,
@@ -207,6 +214,18 @@ def signature_match_text(tail: str, *, cut: bool = False, stream_json: bool | No
       ``user``/``assistant`` event bodies. A ``tool_result`` that merely
       quotes "Rate limit exceeded" must never re-arm a cooldown or escalate
       a blocked worker.
+    - ``permission`` is the headless-denial mode (issue #2010/#2814 rework
+      round 4), used only for ``is_headless_permission_denial`` matching by
+      ``classify_failure``'s ``permission_denied`` check and
+      ``claude_code.worker_permission_denied``. A real headless denial is
+      NOT an error result: the CLI ends the session reporting it was denied
+      with ``is_error: false`` (the ask rides the terminal ``result`` event
+      and the assistant's final turn), so the strict is_error filter made
+      tee'd denials invisible. With ``permission=True`` a stream-json tail
+      also keeps ``result`` event lines regardless of ``is_error`` and the
+      ``assistant`` event bodies. ``user``/``tool_result`` event bodies stay
+      excluded in every mode: a tool result that merely quotes the phrase is
+      the worker observing a denial, not the CLI surfacing one.
     - ``stream_json`` is the log's shape when the caller already read it off
       the whole log head (``log_is_stream_json``); ``None`` derives it from
       ``tail`` itself (the pre-round-3 behaviour, kept for direct unit
@@ -221,16 +240,26 @@ def signature_match_text(tail: str, *, cut: bool = False, stream_json: bool | No
     """
     if stream_json is None:
         stream_json = _is_stream_json(tail)
+    if not stream_json:
+        return tail
     lines = tail.splitlines()
     if cut and lines:
         lines = lines[1:]
-    if not stream_json:
-        return "\n".join(lines) if cut else tail
     return "\n".join(
         line
         for line in lines
-        if (event := _parse_event(line)) is None or _event_is_cli_error_output(event)
+        if (event := _parse_event(line)) is None
+        or _event_is_matchable(event, permission=permission)
     )
+
+
+def _event_is_matchable(event: dict, *, permission: bool) -> bool:
+    """Whether a stream-json event's text is matchable ground: the CLI's own
+    error output always, plus (permission mode) every ``result`` event and
+    ``assistant`` body — see :func:`signature_match_text`."""
+    if permission and event.get("type") in ("result", "assistant"):
+        return True
+    return _event_is_cli_error_output(event)
 
 
 def _event_timestamp(event: dict) -> datetime | None:
@@ -360,11 +389,15 @@ def classify_failure(
     ``permission_denied`` check. It is checked LAST so throttle/auth
     signatures still win.
 
-    All signature matching (throttle, quota, auth, suspension, permission)
-    runs over ``signature_match_text(tail)`` (issue #2814 rework): in a
-    stream-json tail only non-event lines (merged stderr) and the CLI's own
-    error output may carry a failure signature — a ``tool_result`` quoting a
-    marker is the worker observing an error, not one.
+    All signature matching (throttle, quota, auth, suspension) runs over
+    ``signature_match_text(tail)`` (issue #2814 rework): in a stream-json
+    tail only non-event lines (merged stderr) and the CLI's own error output
+    may carry a failure signature — a ``tool_result`` quoting a marker is the
+    worker observing an error, not one. The ``permission_denied`` check runs
+    over ``signature_match_text(tail, permission=True)`` instead (round 4): a
+    real headless denial reports ``is_error: false`` in the terminal
+    ``result`` event and the assistant's final turn, which the strict filter
+    would hide.
 
     The emission time is read out of the log according to the log's own
     shape (N9 -- see ``_throttle_emission_anchor``), not the harness.
@@ -413,6 +446,19 @@ def classify_failure(
         tail,
         cut=len(log_text) > len(tail),
         stream_json=log_is_stream_json(log_text),
+    )
+    # Round 4: the permission check's mode admits the terminal ``result``
+    # event and the assistant text regardless of ``is_error`` — computed only
+    # when the check is enabled (the claude-code/api profiles).
+    permission_match_tail = (
+        signature_match_text(
+            tail,
+            cut=len(log_text) > len(tail),
+            stream_json=log_is_stream_json(log_text),
+            permission=True,
+        )
+        if headless_permission_detection
+        else None
     )
 
     if account_error_detection and _provider_suspension_in_tail(match_tail):
@@ -472,8 +518,14 @@ def classify_failure(
             "+00:00", "Z"
         )
 
-    # Issue #2010: last, so throttle/auth signatures still win.
-    if headless_permission_detection and is_headless_permission_denial(match_tail):
+    # Issue #2010: last, so throttle/auth signatures still win. Round 4:
+    # matching runs in permission mode (see ``permission_match_tail``) so the
+    # real is_error-false denial shape is visible on a tee'd log.
+    if (
+        headless_permission_detection
+        and permission_match_tail is not None
+        and is_headless_permission_denial(permission_match_tail)
+    ):
         return PERMISSION_DENIED_FAILURE_KIND, None
 
     return None, None
