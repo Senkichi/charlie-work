@@ -130,6 +130,19 @@ def test_unrelated_history_alarms_once(tmp_path: Path) -> None:
     assert alarm["payload"]["reason"] == "unrelated_history"
 
 
+def test_shallow_graft_fast_forwards_without_alarm(tmp_path: Path) -> None:
+    repos = make_sync_repos(tmp_path)
+    tip = repos.graft_origin_tip()
+
+    previewed = sync_repo(_ctx(tmp_path, repos.clone, dry_run=True))
+    result = sync_repo(_ctx(tmp_path, repos.clone))
+
+    assert (previewed.reason, previewed.alarm) == ("shallow_history", None)
+    assert (result.outcome, result.alarm) == ("advanced", None)
+    assert repos.head() == tip
+    assert _events(tmp_path, "main_sync_alarm") == []
+
+
 def test_ref_only_update_on_feature_branch(tmp_path: Path) -> None:
     repos = make_sync_repos(tmp_path)
     seed = repos.head()

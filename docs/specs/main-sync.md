@@ -73,13 +73,15 @@ After `git fetch origin <default>` (through `run_git_with_retry`, with a short t
 | Up to date | none | none |
 | On the default branch, behind, worktree clean or dirty only in paths the incoming range does not touch | `git merge --ff-only origin/<default>` | `main_sync_advanced` |
 | On another branch, and local `<default>` behind and not ahead | `git update-ref refs/heads/<default> <origin sha> <local sha>`, a compare-and-swap against the sha just classified (moves the ref, working tree untouched). Skipped as `checked_out_elsewhere` when a linked worktree has `<default>` checked out | `main_sync_advanced` with `ref_only: true` |
-| No merge-base between local `<default>` and origin | skip | `main_sync_skipped` reason `unrelated_history`, plus an alarm on first sight |
+| No merge-base between local `<default>` and origin in a full clone | skip | `main_sync_skipped` reason `unrelated_history`, plus an alarm on first sight |
+| No merge-base in a shallow clone (only seen in dry run: the fetch unshallows first) | skip | `main_sync_skipped` reason `shallow_history`, no alarm |
 | Local `<default>` ahead or diverged, with a merge-base | skip | `main_sync_skipped` reason `diverged` |
 | Dirty tracked files overlap the incoming paths, or untracked files would be overwritten | skip, listing the paths | `main_sync_skipped` reason `blocked` |
 | Merge, rebase, cherry-pick or revert in progress, stale `index.lock`, or detached HEAD | skip | `main_sync_skipped` with that reason |
 | Not a primary checkout, no `origin`, or kill switch off | skip | none |
 
-- **`unrelated_history` alarms at once** because waiting never resolves it: origin was re-rooted, for example by a history rewrite. As of 2026-10-25 the operator's dev checkout is in this state: local `main` at `61fdfe509` (#2785), and `origin/main` re-rooted at `656ed3cf3` (#2812) on 2026-10-23.
+- **`unrelated_history` alarms at once** because waiting never resolves it: origin was re-rooted, for example by a history rewrite.
+- **A shallow clone is unshallowed by the fetch.** Its grafts make the merge-base, the ahead/behind counts and the incoming-commit list wrong. A stray `git fetch --depth 1` in a full clone is enough: it grafts origin's new tip and hides the merge base with local `main`. That happened to the operator's dev checkout on 2026-10-23 (graft at `656ed3cf3`, #2812), and the first live pass misreported it as `unrelated_history`. GitHub showed the history linear.
 - **Skip events are deduplicated** per `(repo, local sha, origin sha, reason)`. A checkout that stays blocked or diverged logs once, not once per pass.
 - **There is no blocker repair here.** Lossless pull-blocker repair (`_repair_lossless_pull_blockers`) stays specific to `self_deploy`, which owns its checkout. main_sync owns no checkout, so it reports blockers and touches nothing.
 
@@ -162,7 +164,7 @@ main_sync:
 ## Rollout
 
 - Ships ON, as a pass step after `self_deploy`. The fleet is paused today (`fleet-pause.json`), so nothing changes until `fleet resume`.
-- **Live check:** after the first full pass, expect a `main_sync_advanced` or `main_sync_skipped` row in the `events.db` of each non-supervisor registry repo that was behind origin (an up-to-date repo is silent), the charlie-work dev checkout included. The dev checkout should report `unrelated_history` until the operator resets it.
+- **Live check:** after the first full pass, expect a `main_sync_advanced` or `main_sync_skipped` row in the `events.db` of each non-supervisor registry repo that was behind origin (an up-to-date repo is silent), the charlie-work dev checkout included.
 
 ## Out of scope
 

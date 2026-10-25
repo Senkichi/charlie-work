@@ -17,6 +17,7 @@ from .subprocess_runner import RunResult, run_captured
 
 GIT_TIMEOUT_SECONDS = 30
 NETWORK_TIMEOUT_SECONDS = 60
+UNSHALLOW_TIMEOUT_SECONDS = 300
 _OPERATIONS = (
     ("MERGE_HEAD", "merge_in_progress"),
     ("rebase-merge", "rebase_in_progress"),
@@ -86,12 +87,22 @@ def resolve_default_branch(repo_root: Path, *, dry_run: bool) -> str | None:
     return ref.removeprefix("origin/")
 
 
+def is_shallow(repo_root: Path) -> bool:
+    return _line(repo_root, "rev-parse", "--is-shallow-repository") == "true"
+
+
 def fetch_default(repo_root: Path, branch: str) -> RunResult:
-    """``git fetch origin <branch>``: moves only ``refs/remotes/origin/<branch>``."""
+    """``git fetch origin <branch>``: moves only ``refs/remotes/origin/<branch>``.
+
+    A shallow repo is unshallowed on the way: its grafts make merge-base, ahead/behind
+    and the incoming-commit list wrong, and a stray ``fetch --depth 1`` in a full clone
+    is enough to graft origin's tip and hide the merge base with local main. In a
+    mostly-full clone that fetches only the missing ancestry, once."""
+    unshallow = is_shallow(repo_root)
     return run_git_with_retry(
-        ["git", "fetch", "--quiet", "origin", branch],
+        ["git", "fetch", "--quiet", *(["--unshallow"] if unshallow else []), "origin", branch],
         cwd=repo_root,
-        timeout_seconds=NETWORK_TIMEOUT_SECONDS,
+        timeout_seconds=UNSHALLOW_TIMEOUT_SECONDS if unshallow else NETWORK_TIMEOUT_SECONDS,
     )
 
 
@@ -112,12 +123,15 @@ def read_checkout_state(repo_root: Path, branch: str) -> CheckoutState | str:
     if dirs is None:
         return "git_error"
     git_dir = dirs[0]
+    merge_base = local if local == origin else _line(repo_root, "merge-base", local, origin)
+    if merge_base is None and is_shallow(repo_root):
+        return "shallow_history"  # a graft, not a re-root: never the unrelated_history alarm
     state = CheckoutState(
         default_branch=branch,
         current_branch=_line(repo_root, "symbolic-ref", "--quiet", "--short", "HEAD"),
         local_sha=local,
         origin_sha=origin,
-        merge_base=local if local == origin else _line(repo_root, "merge-base", local, origin),
+        merge_base=merge_base,
         ahead=ahead,
         behind=behind,
         operation_in_progress=next(

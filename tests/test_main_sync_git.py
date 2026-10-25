@@ -94,6 +94,24 @@ def test_missing_remote_branch_is_a_reason(tmp_path: Path) -> None:
     assert msg.read_checkout_state(repos.clone, "nope") == "no_remote_branch"
 
 
+def test_shallow_graft_is_not_unrelated_history(tmp_path: Path) -> None:
+    repos = make_sync_repos(tmp_path)
+    repos.graft_origin_tip()
+    assert git(repos.clone, "rev-parse", "--is-shallow-repository") == "true"
+    assert msg.read_checkout_state(repos.clone, "main") == "shallow_history"
+
+
+def test_fetch_unshallows_so_the_merge_base_is_found(tmp_path: Path) -> None:
+    repos = make_sync_repos(tmp_path)
+    seed = repos.head()
+    repos.graft_origin_tip()
+    assert msg.fetch_default(repos.clone, "main").ok
+    assert git(repos.clone, "rev-parse", "--is-shallow-repository") == "false"
+    state = msg.read_checkout_state(repos.clone, "main")
+    assert isinstance(state, CheckoutState)
+    assert (state.merge_base, state.behind) == (seed, 2)
+
+
 def test_incoming_commits_oldest_first_with_paths(tmp_path: Path) -> None:
     repos = make_sync_repos(tmp_path)
     seed = repos.head()
