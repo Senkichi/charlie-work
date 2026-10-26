@@ -350,6 +350,55 @@ def test_venv_identity_fails_on_wrong_checkout(tmp_path: Path) -> None:
     assert str(paths.repo_root.resolve()) in venv_check.detail
 
 
+def _symlink_or_skip(link: Path, target: Path) -> None:
+    link.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        link.symlink_to(target)
+    except OSError:
+        pytest.skip("symlinks are unavailable on this host")
+
+
+def test_venv_identity_ok_when_venv_python_symlinks_to_base_interpreter(tmp_path: Path) -> None:
+    # A POSIX venv (uv or ``python -m venv``) makes bin/python a symlink to
+    # the base interpreter, so resolving the executable itself lands outside
+    # the venv. The Mac LaunchDaemon was refused on every pass by exactly this.
+    paths = _paths(tmp_path)
+    base_python = tmp_path / "uv-python" / "cpython-3.14" / "bin" / "python3.14"
+    base_python.parent.mkdir(parents=True)
+    base_python.write_text("", encoding="utf-8")
+    venv_python = paths.venv_dir / "bin" / "python"
+    _symlink_or_skip(venv_python, base_python)
+    result = run_preflight(
+        paths,
+        PreflightConfig(),
+        disk_usage=_disk_usage_free(50 * 1024**3),
+        sys_executable=str(venv_python),
+        package_file=str(paths.repo_root / "src" / "charlie_work" / "preflight.py"),
+    )
+    venv_check = next(c for c in result.checks if c.name == "venv_identity")
+    assert venv_check.ok is True, venv_check.detail
+
+
+def test_venv_identity_fails_on_outside_symlink_to_venv_python(tmp_path: Path) -> None:
+    # Only the executable's own name is left unresolved: a link elsewhere that
+    # points into the expected venv is still a different install.
+    paths = _paths(tmp_path)
+    venv_python = paths.venv_dir / "bin" / "python"
+    venv_python.parent.mkdir(parents=True)
+    venv_python.write_text("", encoding="utf-8")
+    outside_link = tmp_path / "other-repo" / ".venv" / "bin" / "python"
+    _symlink_or_skip(outside_link, venv_python)
+    result = run_preflight(
+        paths,
+        PreflightConfig(),
+        disk_usage=_disk_usage_free(50 * 1024**3),
+        sys_executable=str(outside_link),
+        package_file=str(paths.repo_root / "src" / "charlie_work" / "preflight.py"),
+    )
+    venv_check = next(c for c in result.checks if c.name == "venv_identity")
+    assert venv_check.ok is False
+
+
 def test_venv_identity_respects_config_fatal_override(tmp_path: Path) -> None:
     paths = _paths(tmp_path)
     result = run_preflight(
