@@ -201,10 +201,18 @@ jobs:
       # `uv run` would sync the venv back to the lock). Map mode itself is
       # switched on inside "Run test shard" only, so no later step starts a
       # coverage tracer (gap 47).
+      #
+      # The extra is installed WITHOUT a version constraint: `uv sync
+      # --frozen` above installed the locked ci-fleet, whose version
+      # tests/test_ci_fleet_floor_guard.py pins the whole suite to. A `~=0.7.0`
+      # pin here would downgrade that venv below the lock (break 10: the
+      # installed-ci-fleet guards see 0.7.x and fail, nightly only). `uv pip
+      # install "ci-fleet[map]"` keeps the installed wheel and only adds the
+      # extra, so it stays version-agnostic across lock bumps.
       - name: Map mode
         if: github.event_name == 'schedule' || inputs.map
         shell: bash
-        run: uv pip install "ci-fleet[map]~=0.7.0"
+        run: uv pip install "ci-fleet[map]"
       - name: Restore test durations
         # Saved by the nightly `schedule` run on main (ubuntu), restored here
         # on windows: enableCrossOsArchive on both sides. A miss is fine:
