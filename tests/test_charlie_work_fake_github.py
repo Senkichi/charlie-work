@@ -58,8 +58,8 @@ def test_fake_github_merge_base_criss_cross_is_deterministic() -> None:
     each child base64-encoded, executed on a stub class under ``python -S``
     (no venv/site processing -- the child needs only stdlib). The
     determinism question is still asked of the production fake's actual
-    implementation; parity with the real ``FakeGitHub`` is pinned by one
-    in-process check below.
+    implementation; the expected answer is pinned literally below, and parity
+    with the real ``FakeGitHub`` is pinned by an in-process check.
     """
     tests_dir = Path(__file__).parent
     source = (tests_dir / "_fakes_github.py").read_text(encoding="utf-8")
@@ -68,13 +68,16 @@ def test_fake_github_merge_base_criss_cross_is_deterministic() -> None:
         node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "FakeGitHub"
     )
     wanted = {"_ancestors", "_merge_base"}
-    segments = [
-        ast.get_source_segment(source, node)
+    found = {
+        node.name: ast.get_source_segment(source, node)
         for node in klass.body
         if isinstance(node, ast.FunctionDef) and node.name in wanted
-    ]
-    assert all(segments), "merge-base harness methods missing from _fakes_github.py"
-    methods = "\n".join(textwrap.dedent(seg) for seg in segments)
+    }
+    missing = wanted - found.keys()
+    assert not missing, (
+        f"merge-base harness methods missing from _fakes_github.py: {sorted(missing)}"
+    )
+    methods = "\n".join(textwrap.dedent(seg) for seg in found.values())
     payload = base64.b64encode(methods.encode("utf-8")).decode("ascii")
     graph = (
         '{"R": {"parents": []},'
@@ -115,8 +118,12 @@ def test_fake_github_merge_base_criss_cross_is_deterministic() -> None:
     distinct = set(results.values())
     assert len(distinct) == 1, f"merge_base varied across hash seeds (seed -> result): {results}"
 
-    # Parity pin (issue #2860): the extracted-and-exec'd stub must agree with
-    # the real FakeGitHub on the same graph.
+    # Parity pins (issue #2860): the extracted-and-exec'd stub must return the
+    # literal expected answer -- A1 and B1 tie on BFS distance from both tips,
+    # so the sha tie-break must pick A1 -- and must agree with the real
+    # FakeGitHub on the same graph.
+    stub_result = next(iter(distinct))
+    assert stub_result == "A1", f"expected merge base A1, got {stub_result!r}"
     real_gh = FakeGitHub()
     real_gh.commits = {
         "R": {"parents": []},
@@ -126,8 +133,7 @@ def test_fake_github_merge_base_criss_cross_is_deterministic() -> None:
         "B2": {"parents": [{"sha": "B1"}, {"sha": "A1"}]},
     }
     real_gh.base_head_sha = "A2"
-    assert [int(k) for k in results] == list(range(5))
-    assert next(iter(distinct)) == real_gh._merge_base("A2", "B2")
+    assert stub_result == real_gh._merge_base("A2", "B2")
 
 
 def test_base_fake_github_merged_prs_for_issue_returns_typed_result() -> None:
