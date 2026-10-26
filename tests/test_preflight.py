@@ -10,6 +10,7 @@ module stays under the 800-line file-size cap.
 
 from __future__ import annotations
 
+import ast
 import io
 from dataclasses import FrozenInstanceError, fields
 from datetime import datetime, timedelta, timezone
@@ -28,6 +29,7 @@ from charlie_work.preflight import (
     emit_preflight_refusal,
     run_preflight,
 )
+from _src_ast import parsed
 
 UTC = timezone.utc
 
@@ -611,3 +613,32 @@ def test_preflight_config_field_names_match_defaults_in_issue() -> None:
         "config_freshness_fatal",
         "git_identity_fatal",
     }
+
+
+# ---------------------------------------------------------------------------
+# conftest's autouse preflight stub must not lazy-import its patch targets
+# (issue #2864)
+# ---------------------------------------------------------------------------
+
+
+def test_default_healthy_preflight_imports_are_at_collection_time() -> None:
+    """``_default_healthy_preflight`` (tests/conftest.py) patches
+    ``charlie_work.workflow.run_preflight`` and
+    ``charlie_work.fleet_dispatch.run_preflight`` on every test. Its imports of
+    both modules must sit at conftest module level -- collection time -- not be
+    resolved lazily from the fixture body: a lazy import charges the modules'
+    ~1 s module import to the first test that runs in the process. In small
+    selected runs ``tests/test_attempt_resume.py`` is often the
+    alphabetically-first selected file, so
+    ``test_non_throttle_death_starts_clean[stalled]`` absorbed the whole cost
+    in its setup phase (2.3x ledger regression, issue #2864)."""
+    conftest = Path(__file__).parent / "conftest.py"
+    tree = parsed(conftest)
+    imported: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            imported.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported.update(f"{node.module}.{alias.name}" for alias in node.names)
+    assert "charlie_work.workflow" in imported
+    assert "charlie_work.fleet_dispatch" in imported
