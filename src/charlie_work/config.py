@@ -39,6 +39,7 @@ from .config_validation import (
     Coerced,
     CoercedLenient,
     CommandTemplate,
+    Entries,
     FieldError,
     Check,
     FieldRules,
@@ -2712,6 +2713,13 @@ class OrchestratorConfig:
     # ``max_running_per_repo``) still raises -- construction errors stay loud, and a
     # use-site ``NotNull`` on this section would make the failure a rescuable
     # ``FieldError`` silently discarding the global layer (cfg review R2-B1).
+    # ``deferred_demand`` is the deliberate exception: its use-site ``Entries`` rule makes a
+    # bad ``after_seconds`` (non-int, <= 0) a rescuable ``FieldError``, so with a per-repo
+    # config present the #665 rescue discards the global layer (the warning names the key)
+    # and ``deferred_demand`` falls back to ``()`` -- the same outcome as the bounded
+    # scalars above (``NonNeg``). A bad ``labels`` has no use-site rule, so ``ci_fleet``'s
+    # ``DeferredDemand.__post_init__`` rejects it as a loud ``ConstructionError``. Both
+    # outcomes are pinned in tests/test_runner_allocation_deferred_demand.py.
     runner_allocation: Annotated[
         RunnerAllocationConfig,
         HostWideOnly,
@@ -2728,6 +2736,7 @@ class OrchestratorConfig:
             leak_drain=Typed,
             leak_probe_path=Typed,
             host_io_auto_exclusions=Typed,
+            deferred_demand=Entries(after_seconds=(Typed, Positive)),
         ),
         Check(_runner_floors_agree),
     ] = field(default_factory=RunnerAllocationConfig)
