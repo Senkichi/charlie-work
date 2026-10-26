@@ -7,6 +7,8 @@ no retries at a primary rate limit, and the one event per window. Driven at the
 
 from __future__ import annotations
 
+import re
+import sys
 import ast
 import json
 from dataclasses import dataclass
@@ -47,9 +49,16 @@ from charlie_work.orchestration.misc_review_verdicts import _run_review_reap_swe
 from charlie_work.pass_deadline import PassDeadline
 
 from _fake_transport import FakeAdapter, Runtime, Sleeps, ok
-from _src_ast import parsed, source_files
+from _src_ast import parsed, source_files, source_text
 
 SRC = Path(__file__).resolve().parents[1] / "src" / "charlie_work"
+# The derivation below only matches AST shapes whose source text carries one of
+# these tokens (`X.phase(...)`, a `lane=` call keyword, or a `budget_deferral(`
+# call), so the scan can prune every file the regex cannot reach instead of
+# parsing the whole tree. A cold full-tree parse costs seconds and this test is
+# often the first src-scanner a small selected run or a fresh xdist worker
+# reaches (issue #2861): nine of ~490 package files carry every gate call.
+LANE_CALL_RE = re.compile(r"\.phase\b|\blane\s*=|\bbudget_deferral\b")
 NOW = 1000.0
 RESET = 4600
 GET_PR = RestRequest.of("GET", "repos/{owner}/{repo}/pulls/7")
@@ -165,9 +174,17 @@ def test_a_disabled_governor_never_defers() -> None:
 
 
 def _lane_names_in_source() -> set[str]:
-    """Every lane name a source file hands the gate, derived from the AST."""
+    """Every lane name a source file hands the gate, derived from the AST.
+
+    The walk starts from the ``LANE_CALL_RE`` source-text match, not from the
+    whole tree: every call shape the AST pass below matches is written as
+    ``.phase(``, ``lane=`` or ``budget_deferral(`` in the file text, so parsing
+    a file the candidate regex cannot reach cannot add a lane name.
+    """
     names: set[str] = set()
     for path in source_files(SRC):
+        if not LANE_CALL_RE.search(source_text(path)):
+            continue
         for node in ast.walk(parsed(path)):
             if not isinstance(node, ast.Call):
                 continue
@@ -189,11 +206,41 @@ def _lane_names_in_source() -> set[str]:
     return names
 
 
-def test_every_gated_lane_in_the_source_is_mapped_and_none_is_essential() -> None:
-    gated = _lane_names_in_source()
+def test_every_gated_lane_in_the_source_is_mapped_and_none_is_essential(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Count every `parsed()` call the derivation makes (issue #2861): the scan
+    # must parse only the files the candidate regex reaches, not the whole tree.
+    visited: list[Path] = []
+    tree_parsed = parsed
+
+    def counted(path: Path) -> ast.Module:
+        visited.append(Path(path))
+        return tree_parsed(path)
+
+    here = sys.modules[__name__]
+    monkeypatch.setattr(here, "parsed", counted)
+    try:
+        gated = _lane_names_in_source()
+    finally:
+        monkeypatch.undo()
+
     assert {"intake", "dispatch", "review_reap", "quota_probe", "ci_reclaim"} <= gated
     assert gated <= set(LANE_TIERS), gated - set(LANE_TIERS)
     assert not {n for n in gated if tier_of(n) is Tier.ESSENTIAL}
+    # Every AST shape the derivation matches must be reachable by the candidate
+    # regex (spaced and unspaced forms alike), so pruning cannot miss a gate.
+    for shape in (
+        "deadline.phase('merge', lambda: None)",
+        "deadline.phase ('merge', lambda: None)",
+        "gate.check(1, lane='quota_probe')",
+        "gate.check(1, lane = 'review_reap')",
+        "budget_deferral(app, 'ci_reclaim')",
+    ):
+        assert LANE_CALL_RE.search(shape), shape
+    candidates = [p for p in source_files(SRC) if LANE_CALL_RE.search(source_text(p))]
+    assert visited == candidates
+    assert candidates and len(candidates) <= len(source_files(SRC)) // 4
 
 
 def test_the_loop_body_arms_the_gate_on_its_pass_deadline() -> None:
