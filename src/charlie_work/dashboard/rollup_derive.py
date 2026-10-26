@@ -41,6 +41,8 @@ KNOWN_IGNORED: dict[str, str] = {
     "host_reboot_due": "ci-fleet host-level event; no per-issue rollup fact",
     "host_leak_warn": "ci-fleet host-level event; no per-issue rollup fact",
     "host_io_fallback": "ci-fleet host-level event; no per-issue rollup fact",
+    "deferred_demand_spilled": "ci-fleet host-level event; no per-issue rollup fact",
+    "platform_feature_skipped": "ci-fleet host-level event; no per-issue rollup fact",
     "host_io_hold": "ci-fleet host-level event; no per-issue rollup fact",
     "host_io_exclusions_applied": "ci-fleet host-level event; no per-issue rollup fact",
     "host_io_exclusions_failed": "ci-fleet host-level event; no per-issue rollup fact",
