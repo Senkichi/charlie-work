@@ -29,6 +29,7 @@ from charlie_work.preflight import (
     emit_preflight_refusal,
     run_preflight,
 )
+from _src_ast import parsed
 
 UTC = timezone.utc
 
@@ -632,7 +633,7 @@ def test_default_healthy_preflight_imports_are_at_collection_time() -> None:
     ``test_non_throttle_death_starts_clean[stalled]`` absorbed the whole cost
     in its setup phase (2.3x ledger regression, issue #2864)."""
     conftest = Path(__file__).parent / "conftest.py"
-    tree = ast.parse(conftest.read_text(encoding="utf-8"))
+    tree = parsed(conftest)
     imported: set[str] = set()
     for node in tree.body:
         if isinstance(node, ast.Import):
