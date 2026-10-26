@@ -11,6 +11,17 @@ from unittest.mock import create_autospec
 
 import pytest
 
+# The autouse ``_default_healthy_preflight`` stub below patches these two
+# modules on every test. Imported here -- at conftest import (collection)
+# time -- rather than lazily at the stub's first patch: the two modules cost
+# ~1 s to import, and a lazy import inside the fixture charged that cost to
+# the first test that ran in the process. In small selected runs
+# ``tests/test_attempt_resume.py`` is often the alphabetically-first selected
+# file, so ``test_non_throttle_death_starts_clean[stalled]`` absorbed the
+# whole import in its setup phase -- a 2.3x ledger regression (issue #2864).
+# At collection time the cost is paid once per process and attributed to no
+# test.
+from charlie_work import fleet_dispatch, workflow
 from charlie_work.preflight import PreflightResult
 
 _UNSET = object()
@@ -595,9 +606,13 @@ def _default_healthy_preflight(monkeypatch: pytest.MonkeyPatch) -> None:
     that one test (`test_charlie_work.py`'s two dedicated wiring tests;
     `test_supervise_loop.py`'s tests script the subprocess boundary directly
     and never import either module).
+
+    Both modules are imported at conftest module level (see the import's
+    comment, issue #2864): a lazy import here would charge their ~1 s import
+    cost to the first test that ran in the process.
     """
-    monkeypatch.setattr("charlie_work.workflow.run_preflight", _healthy_preflight)
-    monkeypatch.setattr("charlie_work.fleet_dispatch.run_preflight", _healthy_preflight)
+    monkeypatch.setattr(workflow, "run_preflight", _healthy_preflight)
+    monkeypatch.setattr(fleet_dispatch, "run_preflight", _healthy_preflight)
 
 
 @pytest.fixture(autouse=True)
