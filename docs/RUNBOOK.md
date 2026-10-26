@@ -856,8 +856,10 @@ supervisor brings every `fleet.json` repo's **primary checkout** up to
 - **What it does:** a working-tree `merge --ff-only` when the default branch is
   checked out, or a compare-and-swap `update-ref` when another branch is. Anything
   unsafe is skipped with a reason in that repo's `events.db` (`main_sync_skipped`:
-  `blocked`, `diverged`, `unrelated_history`, `checked_out_elsewhere`,
-  `rebase_in_progress`, `index_locked`, `detached_head`, ...), logged once per sha pair.
+  `blocked`, `diverged`, `unrelated_history`, `shallow_history` (dry run only),
+  `checked_out_elsewhere`, `rebase_in_progress`, `index_locked`, `detached_head`,
+  ...), logged once per sha pair.
+  A shallow clone is unshallowed by main-sync's fetch, once.
 - **Kill switch:** `main_sync: {enabled: false}` in `<fleet_dir>/config.yaml`
   (everywhere) or in one repo's `orchestrator.config.yaml`.
 - **Dependencies:** never touched unless the repo opts in:
@@ -874,8 +876,9 @@ supervisor brings every `fleet.json` repo's **primary checkout** up to
   `git reset --keep` and backs off up to 60 minutes.
 - **Alarms** (`main_sync_alarm`, also an `ERROR` fleet attention entry
   `main-sync <repo>`):
-  - `unrelated_history`: origin was re-rooted; reset the checkout by hand after
-    checking nothing local is lost;
+  - `unrelated_history`: origin was re-rooted (full clone only; a shallow graft is
+    unshallowed instead); reset the checkout by hand after checking nothing local
+    is lost;
   - `post_sync_failing`: 3 consecutive failures;
   - `deferred_4h`: 4h of deferral;
   - `rollback_refused`: the tree was left at the new sha with a failed post_sync.

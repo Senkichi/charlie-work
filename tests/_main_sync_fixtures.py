@@ -45,6 +45,15 @@ class SyncRepos:
     def fetch(self) -> None:
         git(self.clone, "fetch", "-q", "origin")
 
+    def graft_origin_tip(self) -> str:
+        """Push two commits, then ``fetch --depth 1``: the full clone turns shallow at
+        origin's new tip, which hides the merge base with local main (cw#2849 live)."""
+        self.push_commit("graft-a.txt", "a\n")
+        tip = self.push_commit("graft-b.txt", "b\n")
+        git(self.clone, "fetch", "-q", "--depth", "1", f"file://{self.origin.as_posix()}", "main")
+        git(self.clone, "update-ref", "refs/remotes/origin/main", tip)
+        return tip
+
 
 def make_sync_repos(tmp_path: Path) -> SyncRepos:
     tmp_path.mkdir(parents=True, exist_ok=True)
