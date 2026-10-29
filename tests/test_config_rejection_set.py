@@ -458,8 +458,11 @@ def place(path: list, value: object, seed: dict) -> dict:
     return raw
 
 
-def _changed(cfg: typing.Any) -> list[tuple[str, str, str]]:
-    default = _default_config()
+def _changed(
+    cfg: typing.Any, default: OrchestratorConfig | None = None
+) -> list[tuple[str, str, str]]:
+    if default is None:
+        default = _default_config()
     rows = []
     for f in dataclasses.fields(cfg):
         if f.metadata.get("provenance"):
@@ -481,28 +484,32 @@ def _changed(cfg: typing.Any) -> list[tuple[str, str, str]]:
 # The fixture was recorded on a 16-CPU host; recording and replay both pin to it.
 RECORDED_CPU_COUNT = 16
 
-# Every accepted cell diffs its build against the pinned default config and that
-# diff basis never varies across a replay, so it is built once instead of once per
-# cell (issue #2884: the 252-cell sections replay alone rebuilt all 36 sections
-# 252 times). The value is deterministic under the RECORDED_CPU_COUNT pin, so the
-# memo cannot change a recorded code, only the replay's cost.
+# ``_changed``'s diff basis is one deterministic default: the value does not vary
+# under the ``RECORDED_CPU_COUNT`` pin, so one build serves every call and the memo
+# cannot change a recorded code, only the replay's cost. The streaming replays thread
+# the module-scoped ``default_cfg`` fixture (issue #2883, base branch); this memo
+# covers ``_changed``'s ``default=None`` fallback -- single-shot ``code_of`` callers
+# such as ``scripts/record_config_rejection_rows.py``, which were rebuilding the
+# default on every recorded cell (issue #2884). ``_default_config`` makes its own
+# build under the pin, so the cached basis is pinned whoever warms it.
 _DEFAULT_CONFIG: typing.Any | None = None
 
 
 def _default_config() -> typing.Any:
-    """The pinned default config, memoized for ``_changed``'s diff basis."""
+    """The pinned default config, memoized for ``_changed``'s ``default=None`` basis."""
     global _DEFAULT_CONFIG
     if _DEFAULT_CONFIG is None:
-        _DEFAULT_CONFIG = build_config_from_data({})
+        with mock.patch("os.cpu_count", return_value=RECORDED_CPU_COUNT):
+            _DEFAULT_CONFIG = build_config_from_data({})
     return _DEFAULT_CONFIG
 
 
-def code_of(raw: dict) -> str:
+def code_of(raw: dict, default: OrchestratorConfig | None = None) -> str:
     with mock.patch("os.cpu_count", return_value=RECORDED_CPU_COUNT):
-        return _code_of(raw)
+        return _code_of(raw, default)
 
 
-def _code_of(raw: dict) -> str:
+def _code_of(raw: dict, default: OrchestratorConfig | None = None) -> str:
     try:
         cfg = build_config_from_data(copy.deepcopy(raw))
     except ConstructionError:
@@ -516,7 +523,7 @@ def _code_of(raw: dict) -> str:
         return "RC"
     except Exception:  # noqa: BLE001 - recorded as a crash class, not hidden
         return "X"
-    return "A" + hashlib.md5(repr(_changed(cfg)).encode()).hexdigest()[:4]
+    return "A" + hashlib.md5(repr(_changed(cfg, default)).encode()).hexdigest()[:4]
 
 
 def same(recorded: str, now: str) -> bool:
@@ -559,6 +566,27 @@ def recorded() -> dict:
     return json.loads(FIXTURE.read_text(encoding="utf-8"))
 
 
+@pytest.fixture(scope="module")
+def default_cfg() -> OrchestratorConfig:
+    """The default config, built once per pytest process (issue #2883).
+
+    Every accepted cell's code hashes its fields' diff against a default config;
+    building that default again for each cell paid a second full
+    ``build_config_from_data`` per accepted probe, which alone was ~35% of the
+    matrix replay's call phase on CI-runner hardware. The build must happen under
+    the same ``RECORDED_CPU_COUNT`` pin as every cell, since cpu-derived defaults
+    feed the recorded hashes.
+
+    The streaming tests below ``with``-wrap their replay loops in the same pin and
+    call ``_code_of`` directly: ``code_of`` re-pins per call (~0.03 ms per cell,
+    ~7% of the replay), so the loops hoist it out one level. ``code_of`` itself
+    keeps the per-call pin and stays the pin-safe entry point for single-shot
+    callers (e.g. ``scripts/record_config_rejection_rows.py``).
+    """
+    with mock.patch("os.cpu_count", return_value=RECORDED_CPU_COUNT):
+        return build_config_from_data({})
+
+
 def test_probe_matrix_is_nontrivial(recorded):
     """Positive control: the fixture contains both rejections and acceptances, broadly,
     and both rescue classes among the rejections."""
@@ -573,7 +601,7 @@ def test_probe_matrix_is_nontrivial(recorded):
     assert recorded["cases"]["no_deadlock"].startswith("A")
 
 
-def test_probe_replay_detects_a_loosened_validator(recorded, monkeypatch):
+def test_probe_replay_detects_a_loosened_validator(recorded, default_cfg, monkeypatch):
     """Neuter control: a build that never rejects must NOT replay equal to the fixture."""
     import charlie_work.config as config_module
 
@@ -586,18 +614,24 @@ def test_probe_replay_detects_a_loosened_validator(recorded, monkeypatch):
             return real({})
 
     monkeypatch.setitem(globals(), "build_config_from_data", lax)
-    mismatches = [
-        tid
-        for tid, row in recorded["cells"].items()
-        if not all(
-            same(rec, code_of(place(recorded["targets"][tid], v, recorded["seeds"][tid])))
-            for rec, (_, v) in zip(row, PROBES, strict=True)
-        )
-    ]
+    with mock.patch("os.cpu_count", return_value=RECORDED_CPU_COUNT):
+        mismatches = [
+            tid
+            for tid, row in recorded["cells"].items()
+            if not all(
+                same(
+                    rec,
+                    _code_of(
+                        place(recorded["targets"][tid], v, recorded["seeds"][tid]), default_cfg
+                    ),
+                )
+                for rec, (_, v) in zip(row, PROBES, strict=True)
+            )
+        ]
     assert len(mismatches) > 100
 
 
-def test_probe_replay_detects_a_rescuable_flip(recorded, monkeypatch):
+def test_probe_replay_detects_a_rescuable_flip(recorded, default_cfg, monkeypatch):
     """Specificity control: an RC-class change must surface, not only a loosened
     validator. A use-site ``NotNull`` on ``runner_allocation.reserved_threads``
     (cfg review R2-B1): the NotNull rule fires inside ``validate_section`` and
@@ -620,7 +654,7 @@ def test_probe_replay_detects_a_rescuable_flip(recorded, monkeypatch):
     with pytest.raises(
         AssertionError, match=r"runner_allocation\.reserved_threads <- none: recorded Ad751, now R"
     ):
-        test_key_probe_matrix_unchanged(recorded)
+        test_key_probe_matrix_unchanged(recorded, default_cfg)
 
 
 def test_same_on_non_equal_pairs():
@@ -651,44 +685,67 @@ def test_code_of_records_raw_valueerror_and_typeerror_as_rc(monkeypatch):
     assert _code_of({}) == "RC"
 
 
-def test_key_probe_matrix_unchanged(recorded):
-    bad = []
-    for tid, row in recorded["cells"].items():
-        path, seed = recorded["targets"][tid], recorded["seeds"][tid]
-        for rec, (name, value) in zip(row, PROBES, strict=True):
-            now = code_of(place(path, value, seed))
-            if not same(rec, now):
-                bad.append(f"{tid} <- {name}: recorded {rec}, now {now}")
+def test_changed_fallback_builds_the_default_once(monkeypatch):
+    """The ``default=None`` fallback shares the memo (issue #2884): one pinned build
+    serves the cold warm-up, a warm call reuses that same object, and the fallback
+    diff itself triggers no further build."""
+    calls: list[dict] = []
+    real = build_config_from_data
+
+    def counting(data):
+        calls.append(data)
+        return real(data)
+
+    monkeypatch.setitem(globals(), "build_config_from_data", counting)
+    monkeypatch.setitem(globals(), "_DEFAULT_CONFIG", None)
+    with mock.patch("os.cpu_count", return_value=RECORDED_CPU_COUNT):
+        assert _default_config() is _default_config()
+    assert _changed(_default_config()) == []
+    assert calls == [{}]
+
+
+def test_key_probe_matrix_unchanged(recorded, default_cfg):
+    with mock.patch("os.cpu_count", return_value=RECORDED_CPU_COUNT):
+        bad = []
+        for tid, row in recorded["cells"].items():
+            path, seed = recorded["targets"][tid], recorded["seeds"][tid]
+            for rec, (name, value) in zip(row, PROBES, strict=True):
+                now = _code_of(place(path, value, seed), default_cfg)
+                if not same(rec, now):
+                    bad.append(f"{tid} <- {name}: recorded {rec}, now {now}")
     assert not bad, "rejection set changed:\n" + "\n".join(bad[:60]) + f"\n({len(bad)} total)"
 
 
-def test_section_level_probes_unchanged(recorded):
-    bad = []
-    for tid, row in recorded["sections"].items():
-        for rec, name in zip(row, recorded["section_probes"], strict=True):
-            now = code_of({tid: PROBE_MAP[name]})
-            if not same(rec, now):
-                bad.append(f"{tid} = {name}: recorded {rec}, now {now}")
+def test_section_level_probes_unchanged(recorded, default_cfg):
+    with mock.patch("os.cpu_count", return_value=RECORDED_CPU_COUNT):
+        bad = []
+        for tid, row in recorded["sections"].items():
+            for rec, name in zip(row, recorded["section_probes"], strict=True):
+                now = _code_of({tid: PROBE_MAP[name]}, default_cfg)
+                if not same(rec, now):
+                    bad.append(f"{tid} = {name}: recorded {rec}, now {now}")
     assert not bad, "\n".join(bad)
 
 
-def test_unknown_key_probes_unchanged(recorded):
-    bad = []
-    for tid, rec in recorded["unknown"].items():
-        path, seed = recorded["targets"][tid], recorded["seeds"][tid]
-        now = code_of(place([*path, "zzz_unknown"], 1, seed))
-        if not same(rec, now):
-            bad.append(f"{tid}: recorded {rec}, now {now}")
+def test_unknown_key_probes_unchanged(recorded, default_cfg):
+    with mock.patch("os.cpu_count", return_value=RECORDED_CPU_COUNT):
+        bad = []
+        for tid, rec in recorded["unknown"].items():
+            path, seed = recorded["targets"][tid], recorded["seeds"][tid]
+            now = _code_of(place([*path, "zzz_unknown"], 1, seed), default_cfg)
+            if not same(rec, now):
+                bad.append(f"{tid}: recorded {rec}, now {now}")
     assert not bad, "\n".join(bad)
     assert all(v == "R" or v.startswith("A") for v in recorded["unknown"].values())
 
 
-def test_whole_config_cases_unchanged(recorded):
-    bad = [
-        f"{name}: recorded {recorded['cases'].get(name)}, now {code_of(raw)}"
-        for name, raw in CASES.items()
-        if not same(recorded["cases"].get(name, "?"), code_of(raw))
-    ]
+def test_whole_config_cases_unchanged(recorded, default_cfg):
+    with mock.patch("os.cpu_count", return_value=RECORDED_CPU_COUNT):
+        bad = [
+            f"{name}: recorded {recorded['cases'].get(name)}, now {_code_of(raw, default_cfg)}"
+            for name, raw in CASES.items()
+            if not same(recorded["cases"].get(name, "?"), _code_of(raw, default_cfg))
+        ]
     assert not bad, "\n".join(bad)
 
 
