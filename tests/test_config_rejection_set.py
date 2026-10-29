@@ -459,7 +459,7 @@ def place(path: list, value: object, seed: dict) -> dict:
 
 
 def _changed(cfg: typing.Any) -> list[tuple[str, str, str]]:
-    default = build_config_from_data({})
+    default = _default_config()
     rows = []
     for f in dataclasses.fields(cfg):
         if f.metadata.get("provenance"):
@@ -480,6 +480,21 @@ def _changed(cfg: typing.Any) -> list[tuple[str, str, str]]:
 # hash host-dependent (a 4-CPU runner's default of 2 trees erased the "<- 2" probe's diff).
 # The fixture was recorded on a 16-CPU host; recording and replay both pin to it.
 RECORDED_CPU_COUNT = 16
+
+# Every accepted cell diffs its build against the pinned default config and that
+# diff basis never varies across a replay, so it is built once instead of once per
+# cell (issue #2884: the 252-cell sections replay alone rebuilt all 36 sections
+# 252 times). The value is deterministic under the RECORDED_CPU_COUNT pin, so the
+# memo cannot change a recorded code, only the replay's cost.
+_DEFAULT_CONFIG: typing.Any | None = None
+
+
+def _default_config() -> typing.Any:
+    """The pinned default config, memoized for ``_changed``'s diff basis."""
+    global _DEFAULT_CONFIG
+    if _DEFAULT_CONFIG is None:
+        _DEFAULT_CONFIG = build_config_from_data({})
+    return _DEFAULT_CONFIG
 
 
 def code_of(raw: dict) -> str:
