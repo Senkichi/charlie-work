@@ -61,8 +61,10 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import pytest
+
 from _dws_emit_scan import is_decide_module, sweep_emit_kind
-from _src_ast import parsed
+from _src_ast import parsed, source_text
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC = REPO_ROOT / "src" / "charlie_work"
@@ -141,6 +143,29 @@ SWEEP_APPEND_RECEIVER = "sweep_events"
 MARKER_PREFIX = "# event-consumer:"
 _MARKER_RE = re.compile(re.escape(MARKER_PREFIX) + r"\s*(?P<body>.+?)\s*$")
 _PENDING_RE = re.compile(r"^pending(?:\s+#(?P<num>\d+))?\b")
+
+# The per-file emit walk is the scanner's dominant cost: it visits every AST
+# node of every package file and re-walks each function body it enters. A file
+# whose text cannot contain a flagged site skips the walk: every site the walk
+# can report names one of the tokens below in its own source (a flagged call's
+# func name, the sweep receiver, or an ``# event-consumer:`` marker), so an
+# absence yields zero sites. Over-matching is free -- the walk merely runs on
+# the file. The name tokens are derived from the scanner's own flag tables so
+# a future form added there enters this prefilter automatically; the marker
+# token keeps every marker-bearing file in the walked set so the orphan check
+# in ``_analyze`` sees the same file set it always did; and decide modules are
+# always walked because their keyword forms (``event_kind=``,
+# ``event=(kind, payload)``) are not cheaply reducible to a token.
+_PRESENCE_TOKENS: frozenset[str] = frozenset(
+    [*ALL_EMIT_LIKE_NAMES, SWEEP_APPEND_RECEIVER, MARKER_PREFIX]
+)
+
+
+def _needs_emit_walk(rel_path: str, text: str) -> bool:
+    """Whether ``_scan_emit_sites_in_tree`` can find a site in a file this shape."""
+    if is_decide_module(rel_path):
+        return True
+    return any(token in text for token in _PRESENCE_TOKENS)
 
 
 # ---------------------------------------------------------------------------
@@ -620,11 +645,14 @@ def _record_site(
 def _scan_emit_sites(root: Path) -> list[EmitSite]:
     sites: list[EmitSite] = []
     for path in _src_py_files(root):
+        rel_path = path.relative_to(root).as_posix()
+        if not _needs_emit_walk(rel_path, source_text(path)):
+            continue
         try:
             tree = parsed(path)
         except SyntaxError:
             continue
-        file_sites, _, _ = _scan_emit_sites_in_tree(tree, path.relative_to(root).as_posix())
+        file_sites, _, _ = _scan_emit_sites_in_tree(tree, rel_path)
         sites.extend(file_sites)
     return sites
 
@@ -834,7 +862,13 @@ def _analyze(
             tree = parsed(path)
         except SyntaxError:
             continue
-        sites, _, _ = _scan_emit_sites_in_tree(tree, rel_path)
+        if _needs_emit_walk(rel_path, source_text(path)):
+            sites, _, _ = _scan_emit_sites_in_tree(tree, rel_path)
+        else:
+            # No flagged form in the text, so no site can hide here (see
+            # ``_needs_emit_walk``); the marker scan below still runs so the
+            # orphan-marker accounting behaves exactly as before.
+            sites = []
         emit_sites.extend(sites)
         file_sites[rel_path] = sites
         file_markers[rel_path] = _scan_markers(path)
@@ -1182,6 +1216,105 @@ def test_the_real_sweep_decide_modules_yield_emit_sites() -> None:
     sites = [s for s in _scan_emit_sites(SRC) if s.func_name in {"emit", "event_kind"}]
     assert len(sites) > 10, f"only {len(sites)} sweep emit sites found -- the walk is broken"
     assert all(is_decide_module(s.path) for s in sites)
+
+
+def _fixture_root_containing(tmp_path: Path, rel_path: str, body: str) -> Path:
+    root = tmp_path / "src"
+    parent = rel_path.rpartition("/")[0]
+    if parent:
+        package = root / parent
+        package.mkdir(parents=True)
+        (package / "__init__.py").write_text("", encoding="utf-8")
+    else:
+        root.mkdir()
+    (root / rel_path).write_text(body, encoding="utf-8")
+    return root
+
+
+@pytest.mark.parametrize(
+    ("rel_path", "body", "expected_func"),
+    [
+        (
+            "file.py",
+            'def go(path, payload):\n    log_event(path, "fixture_unconsumed_kind", payload)\n',
+            "log_event",
+        ),
+        (
+            "file.py",
+            'def go(path, payload):\n    log_event (path, "fixture_unconsumed_kind", payload)\n',
+            "log_event",
+        ),
+        (
+            "file.py",
+            'def go(path):\n    append_event(path, "fixture_unconsumed_kind", {})\n',
+            "append_event",
+        ),
+        (
+            "file.py",
+            'def go():\n    _record_event({}, "fixture_unconsumed_kind")\n',
+            "_record_event",
+        ),
+        (
+            "file.py",
+            'def go():\n    record_event({}, "fixture_unconsumed_kind")\n',
+            "record_event",
+        ),
+        (
+            "file.py",
+            'def go(pr, a, b, c):\n    _route_to_rework(pr, a, b, c, "fixture_unconsumed_kind")\n',
+            "_route_to_rework",
+        ),
+        (
+            "file.py",
+            'def flush():\n    sweep_events.append(("fixture_unconsumed_kind", {}))\n',
+            "sweep_events.append",
+        ),
+        (
+            "dead_worker_sweep/decide_fixture.py",
+            'def decide():\n    return emit("fixture_unconsumed_kind", {})\n',
+            "emit",
+        ),
+        (
+            "dead_worker_sweep/decide_fixture.py",
+            'def decide():\n    return StateTxn(event_kind="fixture_unconsumed_kind")\n',
+            "event_kind",
+        ),
+        (
+            "dead_worker_sweep/decide_fixture.py",
+            'def decide():\n    return GuardedUpdate(event=("fixture_unconsumed_kind", {}))\n',
+            "event_kind",
+        ),
+    ],
+    ids=[
+        "flagged_call",
+        "flagged_call_name_paren_gap",
+        "append_event",
+        "record_event_underscored",
+        "record_event_bare",
+        "route_to_rework",
+        "sweep_events_receiver",
+        "decide_emit_call",
+        "decide_event_kind_keyword",
+        "decide_event_tuple_keyword",
+    ],
+)
+def test_every_flagged_emit_form_reaches_the_presence_prefilter(
+    tmp_path: Path, rel_path: str, body: str, expected_func: str
+) -> None:
+    """Each form ``_scan_emit_sites_in_tree`` can flag passes ``_needs_emit_walk``.
+
+    The prefilter skips any file whose text contains none of ``_PRESENCE_TOKENS``;
+    its soundness there is by construction (the tokens are derived from the
+    scanner's own flag tables plus the marker prefix), so this test is a
+    reachability control, not a re-derivation: a file whose ONLY trigger is a
+    form must still be walked. The ``log_event (`` spelled-with-a-gap param
+    pins the one spelling a ``name(``-shaped token match would silently drop.
+    """
+    root = _fixture_root_containing(tmp_path, rel_path, body)
+    sites = [s for s in _scan_emit_sites(root) if s.func_name == expected_func]
+    assert sites, f"{expected_func} form not reached by the walk (file: {rel_path})"
+    assert len(sites) == 1, f"unexpected extra sites: {[(s.path, s.lineno) for s in sites]}"
+    assert "fixture_unconsumed_kind" in sites[0].kind_source
 
 
 def test_non_literal_kind_argument_without_marker_fails(tmp_path: Path) -> None:
