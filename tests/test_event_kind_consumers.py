@@ -61,6 +61,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import pytest
+
 from _dws_emit_scan import is_decide_module, sweep_emit_kind
 from _src_ast import parsed
 
@@ -965,7 +967,34 @@ def _analyze(
 # ---------------------------------------------------------------------------
 
 
-def test_the_extractor_actually_reaches_things() -> None:
+@pytest.fixture(scope="module")
+def _real_tree_report() -> Report:
+    """Own the full-tree extractor scan so the measured call stays the assertion.
+
+    The three real-tree tests below (`test_the_extractor_actually_reaches_things`,
+    `test_every_emitted_kind_is_consumed_or_declared`, and the #1895 regression
+    pin) each used to run the whole `_analyze(SRC, TESTS_DIR, HEARTBEAT)` walk in
+    their own call phase. One walk costs the per-process cold `ast.parse` of every
+    top-level ``test_*.py`` under ``tests/`` (~850 files -- ``tests/`` is
+    deliberately outside the ``_src_ast`` cache) plus two full AST passes over the
+    888-module ``src/charlie_work`` tree -- what the ledger flagged 2.1x on the
+    canary (issue #2885: recent median 14.126 s / n=10 vs baseline 6.886 s / n=499).
+
+    One module-scoped fixture computes the report ONCE per pytest process and
+    hands the same :class:`Report` to every consumer: the assertions stay in the
+    tests, verbatim, while the shared scaffold charges to fixture setup where
+    ``ci-fleet ledger report --section slow-fixtures`` owns it (the accepted
+    #2662/#2867/#2875/#2882 remedy family). Sharing also removes the two
+    redundant whole-tree walks a module run used to pay after the first
+    consumer's call. The ``Report`` is frozen, derived, read-only scan data --
+    same discipline as the ``_src_ast`` shared trees ("shared trees must not be
+    mutated"); the consumers only read/iterate, and the synthetic-tmp-tree tests
+    below keep building their own reports.
+    """
+    return _analyze(SRC, TESTS_DIR, HEARTBEAT)
+
+
+def test_the_extractor_actually_reaches_things(_real_tree_report: Report) -> None:
     """Positive control / canary (AC1).
 
     An empty or near-empty emitted set would mean the extractor is broken,
@@ -977,7 +1006,7 @@ def test_the_extractor_actually_reaches_things() -> None:
     resolution ``self_deploy_{failed,succeeded}`` specifically exercises)
     fails loudly instead of silently under-collecting.
     """
-    report = _analyze(SRC, TESTS_DIR, HEARTBEAT)
+    report = _real_tree_report
     assert len(report.emitted_kinds) > 100, (
         f"emitted-kind extraction found only {len(report.emitted_kinds)} kinds -- "
         "the AST walk is broken"
@@ -994,7 +1023,9 @@ def test_the_extractor_actually_reaches_things() -> None:
     assert not missing, f"canary kinds not found by the extractor: {sorted(missing)}"
 
 
-def test_every_emitted_kind_is_consumed_or_declared(request: object) -> None:
+def test_every_emitted_kind_is_consumed_or_declared(
+    _real_tree_report: Report, request: object
+) -> None:
     """The core assertion (AC5/AC6): the real repo's current inventory.
 
     Every literal emitted kind is either consumed (src/heartbeat/tests) or
@@ -1004,7 +1035,7 @@ def test_every_emitted_kind_is_consumed_or_declared(request: object) -> None:
     add a consumer, or mark it (audit-only with a justification, or
     ``pending #NNNN`` pointing at a real tracking issue).
     """
-    report = _analyze(SRC, TESTS_DIR, HEARTBEAT)
+    report = _real_tree_report
 
     if report.unaccounted:
         lines = []
@@ -1054,7 +1085,7 @@ def test_every_emitted_kind_is_consumed_or_declared(request: object) -> None:
     )
 
 
-def test_extracted_alarms_module_consumers_are_scanned() -> None:
+def test_extracted_alarms_module_consumers_are_scanned(_real_tree_report: Report) -> None:
     """Regression pin for the #1895 extraction blind spot (PR #1908 review).
 
     The events.db anomaly checks physically moved out of
@@ -1068,7 +1099,7 @@ def test_extracted_alarms_module_consumers_are_scanned() -> None:
     exists to flag. Pin that each kind is found in the scanned heartbeat
     literals and absent from ``report.test_only_consumed``.
     """
-    report = _analyze(SRC, TESTS_DIR, HEARTBEAT)
+    report = _real_tree_report
     moved_kinds = {
         "ci_headroom_unavailable",
         "draft_pr_blocked",
