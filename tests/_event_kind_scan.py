@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from _dws_emit_scan import is_decide_module, sweep_emit_kind
-from _src_ast import parsed
+from _src_ast import parsed, source_text
 from _event_kind_resolve import (
     _collect_local_assignments,
     _collect_module_functions,
@@ -99,6 +99,30 @@ SWEEP_APPEND_RECEIVER = "sweep_events"
 MARKER_PREFIX = "# event-consumer:"
 _MARKER_RE = re.compile(re.escape(MARKER_PREFIX) + r"\s*(?P<body>.+?)\s*$")
 _PENDING_RE = re.compile(r"^pending(?:\s+#(?P<num>\d+))?\b")
+
+# Issue #2886: the per-file emit walk is the scanner's dominant cost -- it visits
+# every AST node of every package file and re-walks each function body it
+# enters. A file whose text cannot contain a flagged site skips the walk:
+# every site the walk can report names one of the tokens below in its own
+# source (a flagged call's func name, the sweep receiver, or an
+# ``# event-consumer:`` marker), so an absence yields zero sites.
+# Over-matching is free -- the walk merely runs on the file. The name tokens
+# are derived from the scanner's own flag tables so a future form added there
+# enters this prefilter automatically; the marker token keeps every
+# marker-bearing file in the walked set so the orphan check in ``_analyze``
+# sees the same file set it always did; and decide modules are always walked
+# because their keyword forms (``event_kind=``, ``event=(kind, payload)``)
+# are not cheaply reducible to a token.
+_PRESENCE_TOKENS: frozenset[str] = frozenset(
+    [*ALL_EMIT_LIKE_NAMES, SWEEP_APPEND_RECEIVER, MARKER_PREFIX]
+)
+
+
+def needs_emit_walk(rel_path: str, text: str) -> bool:
+    """Whether ``_scan_emit_sites_in_tree`` can find a site in a file this shape."""
+    if is_decide_module(rel_path):
+        return True
+    return any(token in text for token in _PRESENCE_TOKENS)
 
 
 def _locate_arg(call: ast.Call, position: int, keyword: str) -> ast.expr | None:
@@ -319,11 +343,14 @@ def _record_site(
 def _scan_emit_sites(root: Path) -> list[EmitSite]:
     sites: list[EmitSite] = []
     for path in _src_py_files(root):
+        rel_path = path.relative_to(root).as_posix()
+        if not needs_emit_walk(rel_path, source_text(path)):
+            continue
         try:
             tree = parsed(path)
         except SyntaxError:
             continue
-        file_sites, _, _ = _scan_emit_sites_in_tree(tree, path.relative_to(root).as_posix())
+        file_sites, _, _ = _scan_emit_sites_in_tree(tree, rel_path)
         sites.extend(file_sites)
     return sites
 
@@ -533,7 +560,13 @@ def _analyze(
             tree = parsed(path)
         except SyntaxError:
             continue
-        sites, _, _ = _scan_emit_sites_in_tree(tree, rel_path)
+        if needs_emit_walk(rel_path, source_text(path)):
+            sites, _, _ = _scan_emit_sites_in_tree(tree, rel_path)
+        else:
+            # No flagged form in the text, so no site can hide here (see
+            # ``needs_emit_walk``); the marker scan below still runs so the
+            # orphan-marker accounting behaves exactly as before.
+            sites = []
         emit_sites.extend(sites)
         file_sites[rel_path] = sites
         file_markers[rel_path] = _scan_markers(path)
