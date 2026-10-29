@@ -462,7 +462,7 @@ def _changed(
     cfg: typing.Any, default: OrchestratorConfig | None = None
 ) -> list[tuple[str, str, str]]:
     if default is None:
-        default = build_config_from_data({})
+        default = _default_config()
     rows = []
     for f in dataclasses.fields(cfg):
         if f.metadata.get("provenance"):
@@ -483,6 +483,25 @@ def _changed(
 # hash host-dependent (a 4-CPU runner's default of 2 trees erased the "<- 2" probe's diff).
 # The fixture was recorded on a 16-CPU host; recording and replay both pin to it.
 RECORDED_CPU_COUNT = 16
+
+# ``_changed``'s diff basis is one deterministic default: the value does not vary
+# under the ``RECORDED_CPU_COUNT`` pin, so one build serves every call and the memo
+# cannot change a recorded code, only the replay's cost. The streaming replays thread
+# the module-scoped ``default_cfg`` fixture (issue #2883, base branch); this memo
+# covers ``_changed``'s ``default=None`` fallback -- single-shot ``code_of`` callers
+# such as ``scripts/record_config_rejection_rows.py``, which were rebuilding the
+# default on every recorded cell (issue #2884). ``_default_config`` makes its own
+# build under the pin, so the cached basis is pinned whoever warms it.
+_DEFAULT_CONFIG: typing.Any | None = None
+
+
+def _default_config() -> typing.Any:
+    """The pinned default config, memoized for ``_changed``'s ``default=None`` basis."""
+    global _DEFAULT_CONFIG
+    if _DEFAULT_CONFIG is None:
+        with mock.patch("os.cpu_count", return_value=RECORDED_CPU_COUNT):
+            _DEFAULT_CONFIG = build_config_from_data({})
+    return _DEFAULT_CONFIG
 
 
 def code_of(raw: dict, default: OrchestratorConfig | None = None) -> str:
@@ -664,6 +683,25 @@ def test_code_of_records_raw_valueerror_and_typeerror_as_rc(monkeypatch):
     assert _code_of({}) == "RC"
     monkeypatch.setitem(globals(), "build_config_from_data", raise_typeerror)
     assert _code_of({}) == "RC"
+
+
+def test_changed_fallback_builds_the_default_once(monkeypatch):
+    """The ``default=None`` fallback shares the memo (issue #2884): one pinned build
+    serves the cold warm-up, a warm call reuses that same object, and the fallback
+    diff itself triggers no further build."""
+    calls: list[dict] = []
+    real = build_config_from_data
+
+    def counting(data):
+        calls.append(data)
+        return real(data)
+
+    monkeypatch.setitem(globals(), "build_config_from_data", counting)
+    monkeypatch.setitem(globals(), "_DEFAULT_CONFIG", None)
+    with mock.patch("os.cpu_count", return_value=RECORDED_CPU_COUNT):
+        assert _default_config() is _default_config()
+    assert _changed(_default_config()) == []
+    assert calls == [{}]
 
 
 def test_key_probe_matrix_unchanged(recorded, default_cfg):
