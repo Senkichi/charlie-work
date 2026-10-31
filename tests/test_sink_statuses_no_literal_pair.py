@@ -64,28 +64,12 @@ def _source_files() -> list[Path]:
     return sorted(SRC_ROOT.rglob("*.py"))
 
 
-# Source modules deleted by ADR-0006 (GitHub transport) and issue #2479 (the
-# History-redesign chart cleanup). Their parametrize ids are kept as skipped
-# leaves so the collect-only gate sees no removed leaf.
-_RETIRED_MODULES = (
-    "github_capabilities/http_translate.py",
-    "github_capabilities/http_transport.py",
-    "dashboard/charts/bullet.py",
-    "dashboard/charts/line.py",
-    "dashboard/charts/model.py",
-    "dashboard/charts/multiples.py",
-    "dashboard/charts/strip.py",
-)
-
-
 @pytest.mark.parametrize(
     "path",
-    [*_source_files(), *(SRC_ROOT / rel for rel in _RETIRED_MODULES)],
+    _source_files(),
     ids=lambda p: str(p.relative_to(SRC_ROOT)),
 )
 def test_no_hardcoded_escalated_blocked_pair(path: Path) -> None:
-    if not path.exists():
-        pytest.skip(f"{path.name} was deleted; id kept for the collect-only gate")
     if path.name in _ALLOWED_BASENAMES:
         pytest.skip(f"{path.name} defines SINK_STATUSES itself")
     findings = _literal_pair_findings(path)
