@@ -462,3 +462,117 @@ def test_verify_literal_path_still_ok_when_it_exists(tmp_path: Path) -> None:
     assert len(verdicts) == 1
     assert verdicts[0].status is CitationStatus.OK
     assert verdicts[0].resolved_path is None
+
+
+# --------------------------------------------------------------------------- #
+# same-body sibling disambiguation: RESOLVED_BY_SIBLING (issue #1881)
+# --------------------------------------------------------------------------- #
+
+
+def test_verify_sibling_citation_disambiguates_ambiguous_basename(
+    tmp_path: Path,
+) -> None:
+    # Issue #1881 scenario (from Senkichi/jobcannon#419): the body cites bare
+    # ``config.py:259`` alongside an already-qualified
+    # ``jobcannon/host/config.py:180-182``. The basename ``config.py`` matches
+    # more than one tracked file, but the qualified sibling's resolved path
+    # picks out exactly one candidate, so the ambiguous citation resolves
+    # deterministically. The bare citation reports info-level
+    # ``RESOLVED_BY_SIBLING`` -- NOT ``AMBIGUOUS_BASENAME`` -- so it stays out
+    # of ``drifted_verdicts`` and produces an empty fingerprint. The qualified
+    # sibling is cited BEFORE the ambiguous one in the body: the evidence
+    # pre-pass must collect siblings appearing after the ambiguous citation
+    # too.
+    _write(tmp_path, "jobcannon/host/config.py", ["a", "def f():", "    pass"])
+    _write(tmp_path, "dashboard/config.py", ["b", "OTHER"])
+
+    verdicts = verify_citations(
+        "resolves config.py:2 from the sibling jobcannon/host/config.py:1-3",
+        tmp_path,
+    )
+
+    assert len(verdicts) == 2
+    sibling_verdict = verdicts[0]
+    assert sibling_verdict.status is CitationStatus.RESOLVED_BY_SIBLING
+    assert sibling_verdict.resolved_path is not None
+    assert sibling_verdict.resolved_path.replace("\\", "/").endswith("jobcannon/host/config.py")
+    assert sibling_verdict.candidates is None
+    assert verdicts[1].status is CitationStatus.OK
+    assert drifted_verdicts(verdicts) == []
+    assert drift_fingerprint(verdicts) == ""
+
+
+def test_verify_sibling_evidence_requires_exactly_one_candidate(
+    tmp_path: Path,
+) -> None:
+    # Two qualified siblings in different directories both match the
+    # ambiguous basename's candidates -- no deterministic disambiguation
+    # exists, so the citation falls back to ``AMBIGUOUS_BASENAME``.
+    _write(tmp_path, "a/config.py", ["x"])
+    _write(tmp_path, "b/config.py", ["y"])
+
+    verdicts = verify_citations("config.py:2 with siblings a/config.py:1 b/config.py:1", tmp_path)
+
+    assert len(verdicts) == 3
+    ambiguous = [v for v in verdicts if v.status is CitationStatus.AMBIGUOUS_BASENAME]
+    assert len(ambiguous) == 1
+    candidates = ambiguous[0].candidates
+    assert candidates is not None
+    assert sorted(candidates) == ["a/config.py", "b/config.py"]
+    assert len(drifted_verdicts(verdicts)) == 1
+
+
+def test_verify_ambiguous_basenames_do_not_disambiguate_each_other(
+    tmp_path: Path,
+) -> None:
+    # Self-disambiguation guard: two bare citations of the same ambiguous
+    # basename must NOT resolve each other -- sibling evidence comes only
+    # from citations whose asserted literal path exists in the tree. Both
+    # stay ``AMBIGUOUS_BASENAME``.
+    _write(tmp_path, "a/config.py", ["x"])
+    _write(tmp_path, "b/config.py", ["y"])
+
+    verdicts = verify_citations("config.py:1 and config.py:2 drift", tmp_path)
+
+    assert len(verdicts) == 2
+    assert all(v.status is CitationStatus.AMBIGUOUS_BASENAME for v in verdicts)
+
+
+def test_verify_prefixed_ambiguous_sibling_resolves_to_stale_prefix(
+    tmp_path: Path,
+) -> None:
+    # A prefixed citation whose asserted prefix is wrong resolves
+    # deterministically via sibling evidence, but the false prefix is still
+    # asserted: ``STALE_PREFIX`` (not ``RESOLVED_BY_SIBLING`) with
+    # ``resolved_path`` pointing at the sibling-selected candidate.
+    _write(tmp_path, "jobcannon/host/config.py", ["a", "b"])
+    _write(tmp_path, "dashboard/config.py", ["c", "d"])
+
+    verdicts = verify_citations(
+        "wrong_dir/config.py:2 is stale; jobcannon/host/config.py:1 is right",
+        tmp_path,
+    )
+
+    assert len(verdicts) == 2
+    stale = verdicts[0]
+    assert stale.status is CitationStatus.STALE_PREFIX
+    assert stale.resolved_path is not None
+    assert stale.resolved_path.replace("\\", "/").endswith("jobcannon/host/config.py")
+
+
+def test_verify_sibling_resolved_line_range_still_validates(tmp_path: Path) -> None:
+    # Sibling disambiguation picks the candidate; the line range then
+    # validates against it like any other resolution. A range beyond the
+    # resolved file's EOF is still ``OUT_OF_RANGE`` -- the coordinate defect
+    # takes precedence over the info-level resolution.
+    _write(tmp_path, "jobcannon/host/config.py", ["a", "b"])
+    _write(tmp_path, "dashboard/config.py", ["c", "d"])
+
+    verdicts = verify_citations(
+        "config.py:99 out of range; jobcannon/host/config.py:1 qualified",
+        tmp_path,
+    )
+
+    assert len(verdicts) == 2
+    assert verdicts[0].status is CitationStatus.OUT_OF_RANGE
+    assert len(drifted_verdicts(verdicts)) == 1
