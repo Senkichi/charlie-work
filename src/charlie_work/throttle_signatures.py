@@ -98,9 +98,21 @@ _PROVIDER_AUTH_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# Harness-level credential failure (issue #2810): the harness CLI itself could
+# not authenticate, so *every* launch on that harness fails the same way no
+# matter the issue, repo or model. Distinct from ``provider_auth`` (the api
+# harness's per-repo 24h cooldown on a 401/403 in the model call): this kind
+# arms no per-repo ``throttled_until`` at all -- ``role_quota_ledger`` records
+# a fleet-wide harness block instead, and ``harness_auth_block`` probes it back
+# open. It joins ``PROVIDER_THROTTLE_FAILURE_KINDS`` below purely for the cap
+# exemption (the death is not the worker's fault).
+HARNESS_AUTH_FAILED_KIND = "harness_auth_failed"
+
 # The ``failure_kind`` values that represent a provider-side throttle
 # condition — the kinds for which ``worker_fate.classify_for`` arms
-# ``throttled_until``. Cap accounting uses this set so a zero-turn death
+# ``throttled_until`` (``harness_auth_failed`` is the one member that arms
+# none: its fleet-wide block lives in the quota ledger). Cap accounting uses
+# this set so a zero-turn death
 # caused by a global provider condition (quota wall, rate limit, dead
 # API key) is never charged against the issue's redispatch/rework caps
 # (issue #1684): those caps exist to bound retries of *worker* failures,
@@ -109,7 +121,7 @@ _PROVIDER_AUTH_PATTERN = re.compile(
 # cooldown) and escalates deterministically on first occurrence via
 # ``DETERMINISTIC_ESCALATION_FAILURE_KINDS``.
 PROVIDER_THROTTLE_FAILURE_KINDS: frozenset[str] = frozenset(
-    {"quota_exhausted", "rate_limited", "provider_auth"}
+    {"quota_exhausted", "rate_limited", "provider_auth", HARNESS_AUTH_FAILED_KIND}
 )
 
 
@@ -149,6 +161,58 @@ def is_provider_auth_failure(tail: str) -> bool:
     compiled copy of ``_PROVIDER_AUTH_PATTERN``.
     """
     return _PROVIDER_AUTH_PATTERN.search(tail) is not None
+
+
+# devin-shell harness-auth signatures (issue #2810). Each is matched against the
+# body of a line that BEGINS ``Error:`` -- the CLI's own error output -- never
+# against prose mid-line, so a worker's transcript that merely quotes the
+# message (an issue about this very failure) cannot classify. The first two
+# were captured verbatim from the operator host's worker logs; the command
+# spelling in the "Not logged in" hint varies (``devin`` in worker logs,
+# ``devin.exe`` quoted in issue #2784), so the hint is deliberately not part of
+# the match. The third is the invalid-key variant that replaces "Not logged in"
+# once the on-disk key is rejected server-side.
+_DEVIN_NOT_LOGGED_IN = re.compile(r"Not logged in\b", re.IGNORECASE)
+_DEVIN_INVALID_API_KEY = re.compile(r"Authentication required:\s*invalid api key\b", re.IGNORECASE)
+# "Unknown model: 'x'" is an auth fault ONLY when the model list is empty -- the
+# list comes from the same team-settings fetch the invalid key fails. With a
+# non-empty list it is a config error (a typo'd model name) and must not match.
+_DEVIN_UNKNOWN_MODEL = re.compile(r"Unknown model:\s*'[^'\n]*'\s*$", re.IGNORECASE)
+_DEVIN_AVAILABLE_HEADER = re.compile(r"Available:\s*$", re.IGNORECASE)
+_HARNESS_AUTH_EVIDENCE_MAX_CHARS = 300
+
+
+def devin_harness_auth_evidence(text: str) -> str | None:
+    """The evidence line when ``text`` shows a devin-shell harness-auth failure.
+
+    Returns the matching ``Error:`` line (clipped, stripped) -- the operator
+    evidence carried on ``harness_auth_blocked`` -- or ``None``. Matches:
+
+    - ``Error: Not logged in. Run `devin auth login` ...`` (``devin.exe`` too);
+    - ``Error: ... Authentication required: invalid api key ...``;
+    - ``Error: Unknown model: '<m>'`` whose following ``Available:`` list is
+      EMPTY (nothing but whitespace after the header). An unknown model with a
+      non-empty list is a config error and returns ``None``.
+
+    The line must begin ``Error:`` (no leading text), so the phrase inside a
+    quoted transcript line or log prose never classifies.
+    """
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        if not line.startswith("Error:"):
+            continue
+        body = line[len("Error:") :].strip()
+        if _DEVIN_NOT_LOGGED_IN.match(body) or _DEVIN_INVALID_API_KEY.search(body):
+            return line.strip()[:_HARNESS_AUTH_EVIDENCE_MAX_CHARS]
+        if _DEVIN_UNKNOWN_MODEL.match(body):
+            rest = lines[index + 1 :]
+            if (
+                rest
+                and _DEVIN_AVAILABLE_HEADER.match(rest[0].strip())
+                and not any(tail_line.strip() for tail_line in rest[1:])
+            ):
+                return f"{line.strip()} | Available: (empty)"[:_HARNESS_AUTH_EVIDENCE_MAX_CHARS]
+    return None
 
 
 # Headless permission-denial signature (issue #2010): a ``claude -p`` session
@@ -262,7 +326,9 @@ def parse_reset_clock_time(tail: str, now: datetime) -> datetime | None:
 
 
 __all__ = [
+    "HARNESS_AUTH_FAILED_KIND",
     "PROVIDER_THROTTLE_FAILURE_KINDS",
+    "devin_harness_auth_evidence",
     "is_provider_auth_failure",
     "is_provider_throttle_failure",
     "match_quota_tail",

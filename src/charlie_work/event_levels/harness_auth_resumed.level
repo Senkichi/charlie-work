@@ -1,0 +1,3 @@
+info
+# The harness-auth block ended: the single probe launch outlived the survival period
+# (issue #2810). Closes the episode opened by harness_auth_blocked.

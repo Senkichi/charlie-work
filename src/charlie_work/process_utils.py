@@ -435,6 +435,29 @@ def write_worker_terminal_status(
     write_json_atomic(path, payload)
 
 
+def terminal_record_for_pid(
+    sessions_dir: Path, issue_number: int, sidecar_suffix: str, pid: Any
+) -> dict[str, Any] | None:
+    """The worker's terminal-status record when it describes exactly this ``pid``.
+
+    ``None`` when there is no record, it is unreadable, or it belongs to a
+    different process -- a stale record from an earlier attempt must never speak
+    for this one. Never raises.
+    """
+    path = worker_terminal_status_path(sessions_dir, issue_number, sidecar_suffix)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or pid is None:
+        return None
+    try:
+        same_process = int(data.get("pid")) == int(pid)
+    except (TypeError, ValueError):
+        return None
+    return data if same_process else None
+
+
 def terminal_record_proves_completion(
     sessions_dir: Path, issue_number: int, sidecar_suffix: str, pid: Any
 ) -> bool:
@@ -450,19 +473,9 @@ def terminal_record_proves_completion(
     ``worker_outcome`` dict (exit 0 alone is not enough -- the CLI's own exit
     status on a provider limit is not a contract we control). Never raises.
     """
-    path = worker_terminal_status_path(sessions_dir, issue_number, sidecar_suffix)
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return False
-    if not isinstance(data, dict) or pid is None:
-        return False
-    try:
-        same_process = int(data.get("pid")) == int(pid)
-    except (TypeError, ValueError):
-        return False
+    data = terminal_record_for_pid(sessions_dir, issue_number, sidecar_suffix, pid)
     return (
-        same_process
+        data is not None
         and data.get("exit_code") == 0
         and isinstance(data.get("worker_outcome"), dict)
     )

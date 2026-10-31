@@ -26,10 +26,11 @@ import re
 from collections.abc import Iterable, Mapping, Sequence
 from datetime import UTC, datetime
 from types import MappingProxyType
+from typing import Any
 
 from . import role_quota_ledger
 from .role_chain import RoleEntry
-from .role_selection import RoleSelection
+from .role_selection import RoleSelection, harness_auth_enabled, ledger_for_chain
 from .write_gate import WriteGate, require_write_gate
 
 logger = logging.getLogger(__name__)
@@ -99,8 +100,10 @@ def select_tier_entry(
     if not family:
         return None, NO_ENTRY
     for index, entry in family:
-        until = ledger.get(entry.key)
-        if until is None or until <= now:
+        until, _harness_wide = role_quota_ledger.effective_restriction(
+            ledger, entry.harness, entry.model, now
+        )
+        if until is None:
             selection = RoleSelection(
                 chain=chain_tuple,
                 entry=entry,
@@ -113,16 +116,29 @@ def select_tier_entry(
 
 
 def select_tier_for_launch(
-    chain: Sequence[RoleEntry], tier: str, now: datetime | None = None
+    chain: Sequence[RoleEntry],
+    tier: str,
+    now: datetime | None = None,
+    *,
+    harness_auth: bool = True,
 ) -> tuple[RoleSelection | None, str | None]:
     """:func:`select_tier_entry` against the fleet quota ledger. Never raises.
 
-    A length-1 chain is checked against an empty ledger, the way
-    ``role_selection.select_for_launch`` never reads the ledger for one.
+    The ledger is the one ``role_selection.select_for_launch`` reads
+    (:func:`role_selection.ledger_for_chain`): a length-1 chain sees only the
+    harness-wide blocks, so a tier never launches on a harness whose
+    credential is dead (issue #2810).
     """
     chain_tuple = tuple(chain)
-    ledger = role_quota_ledger.load_restrictions() if len(chain_tuple) > 1 else {}
+    ledger = ledger_for_chain(chain_tuple, harness_auth=harness_auth)
     return select_tier_entry(chain_tuple, tier, ledger, now or datetime.now(UTC))
+
+
+def select_for_config(
+    chain: Sequence[RoleEntry], tier: str, config: Any, now: datetime | None = None
+) -> tuple[RoleSelection | None, str | None]:
+    """:func:`select_tier_for_launch` honoring ``config``'s harness-auth kill switch."""
+    return select_tier_for_launch(chain, tier, now, harness_auth=harness_auth_enabled(config))
 
 
 def emit_tier_selected(

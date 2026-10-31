@@ -1,0 +1,4 @@
+error
+# A harness CLI cannot authenticate (issue #2810): every launch on it fails the same way,
+# so the fleet stops launching there until a probe proves the credential works. The
+# operator must act (log in / fix the credential); error so it is never filtered out.
