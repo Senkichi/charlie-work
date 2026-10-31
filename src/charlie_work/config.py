@@ -2304,6 +2304,10 @@ class FleetConfig:
 
     ``max_concurrent_sessions_by_harness`` (issue #2757): per-harness ceilings; see
     :mod:`charlie_work.fleet_harness_caps` for the shape and semantics.
+
+    ``retired`` (issue #2754) is read from the repo's own config file only.
+    ``global_config.load_layered_config`` strips it from the fleet-wide
+    layer, so a global value cannot retire every repo in the fleet.
     """
 
     global_max_concurrent_sessions: Annotated[int, Typed, BoolTolerant] = 0
@@ -2312,6 +2316,9 @@ class FleetConfig:
     global_max_concurrent_reviews: Annotated[int, Typed, NonNeg] = 0
     launch_lock_wait_seconds: Annotated[float, Typed, NonNeg, Finite] = 10.0
     max_concurrent_sessions_by_harness: Mapping[str, int] = field(default_factory=dict)
+    # Issue #2754: per-repo retirement. The layered loader removes this key
+    # from the user-global layer; see repo_retirement.
+    retired: Annotated[bool, Typed] = False
 
     def __post_init__(self) -> None:  # validate + freeze: one point for parsed and hand-built
         key = "max_concurrent_sessions_by_harness"

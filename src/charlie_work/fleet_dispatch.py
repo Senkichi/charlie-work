@@ -86,6 +86,7 @@ from .notify_freshness import (
 )
 from .paths import runtime_paths, worktree_roots
 from .pending_sync import heal_pending_sync_at_boot
+from .repo_retirement import entry_is_retired, retired_pass_disposition
 from .venv_anchor import verify_interpreter_anchored_editables
 from .ci_fleet_anchor import ci_fleet_provenance_payload, ci_fleet_provenance_snapshot
 from .supervise import (
@@ -1749,6 +1750,7 @@ def _touch_registry_last_seen(
     fleet_json_path: Path,
     touched_keys: list[str],
     now: datetime.datetime,
+    retired_by_key: dict[str, bool] | None = None,
 ) -> None:
     """Bump ``last_seen`` for every repo actually attempted this fleet pass.
 
@@ -1790,6 +1792,9 @@ def _touch_registry_last_seen(
                 if entry is None:
                     continue
                 entry["last_seen"] = stamp
+                # Issue #2754: persist the derived flag for raw readers.
+                if retired_by_key is not None and key in retired_by_key:
+                    entry["retired"] = bool(retired_by_key[key])
                 changed = True
             if changed:
                 data["repos"] = repos
@@ -1931,6 +1936,8 @@ def fleet_loop(
     # The raw config is captured before the notify-silencing replace() below;
     # the report only reads api_worker fields, which that replace never touches.
     loaded_configs: dict[str, OrchestratorConfig] = {}
+    retired_by_key: dict[str, bool] = {}
+    retired_quiescent_keys: list[str] = []
 
     # Issue #1078: fleet-level state path for per-repo lane liveness events.
     # Each repo's lane completion is recorded here so an operator can query the
@@ -2268,6 +2275,14 @@ def fleet_loop(
                     config = apply_fleet_drain_config(config)
                 paths = runtime_paths(repo_root, config.runtime.state_dir)
 
+                # Issue #2754: a retired repo with live work runs wind-down
+                # only; once quiescent it is skipped with no lane or event.
+                if retired_pass_disposition(
+                    repo_key, repo_root, config, paths.root, retired_by_key
+                ):
+                    retired_quiescent_keys.append(repo_key)
+                    continue
+
                 # Non-blocking supervisor lock: fleet passes must be mutually exclusive
                 # with a supervised bash-rats loop on the same repo to avoid double-
                 # dispatching through the governor's read-then-launch window.
@@ -2311,6 +2326,7 @@ def fleet_loop(
                         # Issue #1948: thread the pass deadline into the lane.
                         deadline_exceeded=_deadline_exceeded,
                         fleet_state_path=fleet_state_path,
+                        retired=retired_by_key.get(repo_key, False),
                     )
                 except Exception:
                     lock.release()
@@ -2399,7 +2415,7 @@ def fleet_loop(
     # so oldest-last_seen-first ordering rotates instead of staying static --
     # a deferred repo's last_seen is left untouched, so it sorts first next
     # pass (see _touch_registry_last_seen).
-    _touch_registry_last_seen(fleet_json_path, touched_repo_keys, now)
+    _touch_registry_last_seen(fleet_json_path, touched_repo_keys, now, retired_by_key)
 
     # Issue #1832: the pass hit its cooperative deadline and pushed work to
     # the next pass instead of running unboundedly until an external watchdog
@@ -2531,6 +2547,8 @@ def fleet_loop(
             "digest": digest,
             "stale": stale_keys,
             "pruned": pruned_keys,
+            "retired": sorted(key for key, flag in retired_by_key.items() if flag),
+            "retired_quiescent": retired_quiescent_keys,
             "deferred": deferred_repo_keys,
             "deferred_autoscale_prologue": deferred_autoscale_prologue,
             "deadline_partial_repo_keys": deadline_partial_repo_keys,
@@ -2625,6 +2643,8 @@ def _take_fleet_snapshot(
 
     repo_snapshots: set[tuple[str, LocalSnapshot]] = set()
     for repo_key, entry in repos.items():
+        if bool(entry.get("retired")) or entry_is_retired(entry):
+            continue
         state_dir_str = entry.get("state_dir")
         if not state_dir_str:
             continue
@@ -2671,7 +2691,8 @@ def _fleet_has_configured_repos(
     *before* ``fleet_loop`` is ever called.
     """
     registry = _load_registry(layout.fleet_registry_path(override=fleet_dir_override))
-    return bool(_select_repos(registry, repos))
+    # Issue #2754: retired repos do not count as configured fleet work.
+    return any(not entry.get("retired") for _key, entry in _select_repos(registry, repos))
 
 
 # Exit reasons that mean "the code on disk changed underneath this process", so

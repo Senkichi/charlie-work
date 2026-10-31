@@ -363,6 +363,9 @@ class RepoInfo:
     config_path: Path
     # Resolved by load_repos via heartbeat_local_repo (#1861); False = GitHub-backed.
     local_issues_enabled: bool = False
+    # Issue #2754: fleet.retired from the repo's OWN config. A retired repo
+    # gets no per-repo health checks (notably no pass-freshness anomaly).
+    retired: bool = False
 
 
 @dataclass(frozen=True)
@@ -600,6 +603,12 @@ def state_file() -> Path:
     return fleet_dir() / "heartbeat-state.json"
 
 
+def _repo_retired(repo_config: dict[str, Any]) -> bool:
+    """``fleet.retired`` from the repo's own layer only (issue #2754)."""
+    fleet = repo_config.get("fleet")
+    return isinstance(fleet, dict) and fleet.get("retired") is True
+
+
 def load_repos() -> tuple[list[RepoInfo], str | None]:
     """Load registered repos from fleet.json. Returns (repos, error)."""
     fleet_json = fleet_dir() / "fleet.json"
@@ -623,6 +632,7 @@ def load_repos() -> tuple[list[RepoInfo], str | None]:
                     state_dir=Path(entry["state_dir"]),
                     config_path=config_path,
                     local_issues_enabled=_local_issues_enabled(repo_config, fleet_config),
+                    retired=_repo_retired(repo_config),
                 )
             )
         except KeyError:
@@ -1666,6 +1676,9 @@ def check_log_freshness(report: Report, repo: RepoInfo, *, now: datetime | None 
     verdict is ``heartbeat_alarms_fleet.eval_log_freshness``.
     """
     check = f"log-freshness {repo.slug}"
+    if repo.retired:
+        report.ok(check, "retired; no log-freshness check")
+        return
     if _haf is None:
         report.anom(check, _ALARMS_UNAVAILABLE)
         return
@@ -1711,6 +1724,11 @@ def check_loop_pass_freshness(
     ``heartbeat_alarms_fleet.eval_loop_pass_freshness``.
     """
     check = f"loop-pass-freshness {repo.slug}"
+    # Issue #2754: a retired repo intentionally stops running loop passes, so
+    # the absence of ``loop_started`` rows is the desired state, not an alarm.
+    if repo.retired:
+        report.ok(check, "retired; no pass-freshness check")
+        return
     db_path = repo.state_dir / "events.db"
     if not db_path.exists():
         report.ok(check, "no events.db (fresh install or pre-instrumentation state dir)")
@@ -2464,10 +2482,17 @@ def main() -> int:
 
     blocked_by_repo: dict[str, set[int]] = {}
     blocked_err = ""
-    if repos:
-        blocked_by_repo, blocked_err = get_blocked_issue_numbers(repos[0].repo_root)
+    active_repos = [repo for repo in repos if not repo.retired]
+    if active_repos:
+        blocked_by_repo, blocked_err = get_blocked_issue_numbers(active_repos[0].repo_root)
 
     for repo in repos:
+        # Issue #2754: a retired repo is out of the fleet. Silencing every
+        # per-repo check (not just pass-freshness) keeps retirement from
+        # generating a standing wall of stale-log/coverage anomalies.
+        if repo.retired:
+            report.ok(f"retired {repo.slug}", "retired; per-repo checks skipped")
+            continue
         prev_repo_state = prev_state.get("repos", {}).get(repo.slug, {})
         new_repo_state: dict[str, Any] = {}
         check_orchestrator_config(report, repo)

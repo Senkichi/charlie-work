@@ -193,6 +193,13 @@ def test_parametrization_covers_every_argparse_fleet_choice() -> None:
     # Names actually known not to read the registry (each launches a worker /
     # mutates fleet-dir state / is purely local). Additions here must cite the
     # new subcommand in the test docstring.
+    #
+    # ``retire`` / ``unretire`` (issue #2754) edit ``fleet.retired`` in the
+    # repo's own ``orchestrator.config.yaml`` and deliberately leave the
+    # fleet registry alone: ``fleet_retire.py`` never imports or calls
+    # ``fleet_registry``, and the registry's ``retired`` field is derived on
+    # the next ``touch_repo``. They are covered by
+    # ``tests/test_fleet_retire_render.py``.
     ACCOUNTED = {
         "work",
         "bash-rats",
@@ -201,6 +208,8 @@ def test_parametrization_covers_every_argparse_fleet_choice() -> None:
         "stop",
         "pause",
         "resume",
+        "retire",
+        "unretire",
     }
     assert non_registry <= ACCOUNTED, (
         f"new fleet subcommand(s) {sorted(non_registry - ACCOUNTED)} were added to "
