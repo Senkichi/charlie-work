@@ -8,7 +8,7 @@ import sqlite3
 from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
-from _dashboard_rollup_fixtures import ALPHA, BETA, fleet  # noqa: F401  (pytest fixture)
+from _dashboard_rollup_fixtures import ALPHA, BETA, NOW, fleet  # noqa: F401  (pytest fixture)
 
 from charlie_work import cli
 from charlie_work.dashboard.timeutil import local_iso
@@ -96,7 +96,13 @@ def test_local_iso_renders_the_same_instant_in_the_given_zone() -> None:
 
 def test_history_carries_local_bucket_times_alongside_utc(fleet, capsys) -> None:
     assert _run(capsys, "--fleet-dir", str(fleet.dir), "dashboard", "rollup")[0] == 0
-    _, out = _run(capsys, "--fleet-dir", str(fleet.dir), "dashboard", "history", "--days", "30")
+    # The fixture's event clock is pinned, so `--days` must be sized from the
+    # real clock's drift behind it: a hardcoded window rots once it no longer
+    # reaches the pinned events and the catalogue goes empty (nightly break 13).
+    drift_days = (datetime.now(UTC) - NOW).days + 2
+    _, out = _run(
+        capsys, "--fleet-dir", str(fleet.dir), "dashboard", "history", "--days", str(drift_days)
+    )
     checked = 0
     for metrics in out["data"]["tabs"].values():
         for series_list in metrics.values():
