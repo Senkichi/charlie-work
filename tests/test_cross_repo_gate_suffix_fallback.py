@@ -321,3 +321,85 @@ def test_listing_computed_once_per_gate_call(
     assert result.passed is True
     assert result.missing_paths == ()
     assert call_count == 1
+
+
+def _record_listing_calls(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
+    """Wrap ``_repo_tracked_files`` and return the list it appends each
+    ``repo_root`` to -- an empty list afterwards proves no listing was ever
+    computed."""
+    calls: list[Path] = []
+    real_repo_tracked_files = cross_repo_gate_module._repo_tracked_files
+
+    def _recording_repo_tracked_files(repo_root: Path) -> list[str]:
+        calls.append(repo_root)
+        return real_repo_tracked_files(repo_root)
+
+    monkeypatch.setattr(
+        cross_repo_gate_module, "_repo_tracked_files", _recording_repo_tracked_files
+    )
+    return calls
+
+
+@pytest.mark.parametrize(
+    "candidate",
+    [
+        pytest.param("/schemas/coach.py", id="posix-absolute"),
+        pytest.param(r"\schemas\coach.py", id="backslash-absolute"),
+        pytest.param("../outside/coach.py", id="dotdot-escape"),
+    ],
+)
+def test_uncontained_candidates_never_reach_the_suffix_fallback(
+    candidate: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Containment gates the suffix fallback: a candidate that does not
+    resolve inside ``root`` is "not in this repo" even though ``root``
+    really does hold ``server/src/swole/schemas/coach.py``.
+
+    ``_segment_boundary_suffix_match`` strips leading separators, so without
+    the gate ``/schemas/coach.py`` (an absolute path OUTSIDE the repo) is
+    re-read as the module-relative ``schemas/coach.py`` and resolves to the
+    nested in-repo file -- which would also hide a genuinely foreign
+    absolute path from ``_is_confirmed_foreign_absolute_path`` (the
+    founding #1010/#953 protection). The ``..``-escaping candidate must not
+    even trigger the listing, shared cache included."""
+    root = tmp_path / "swole"
+    _swole_layout(root)
+    listing_calls = _record_listing_calls(monkeypatch)
+    cache: dict[Path, list[str]] = {}
+
+    assert cross_repo_gate_module._path_exists_in_repo(candidate, root) is False
+    assert cross_repo_gate_module._path_exists_in_repo(candidate, root, cache) is False
+
+    assert listing_calls == []
+    assert cache == {}
+
+
+def test_contained_absolute_candidate_that_misses_directly_is_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The suffix fallback is for module-relative citations only: an
+    absolute candidate that IS contained in ``root`` but absent on disk is
+    anchored, so it is "missing" -- it never reaches the tracked-file
+    listing, even when ``root`` holds a same-named file elsewhere."""
+    root = tmp_path / "swole"
+    _swole_layout(root)
+    listing_calls = _record_listing_calls(monkeypatch)
+    absent_but_contained = (root / "schemas" / "coach.py").as_posix()
+
+    assert cross_repo_gate_module._path_exists_in_repo(absent_but_contained, root) is False
+    assert listing_calls == []
+
+
+def test_contained_absolute_candidate_that_exists_still_resolves_directly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Control for the two tests above: the guards must not break the
+    direct arm -- an absolute candidate that is contained AND exists is
+    still found, without computing a listing."""
+    root = tmp_path / "swole"
+    _swole_layout(root)
+    listing_calls = _record_listing_calls(monkeypatch)
+    real_file = (root / "server" / "src" / "swole" / "schemas" / "coach.py").as_posix()
+
+    assert cross_repo_gate_module._path_exists_in_repo(real_file, root) is True
+    assert listing_calls == []
