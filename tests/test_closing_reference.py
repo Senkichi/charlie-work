@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from _src_ast import parsed, source_files
+from _src_ast import parsed, source_files, source_text
 
 from charlie_work.closing_reference import (
     ValidationResult,
@@ -418,6 +418,12 @@ def test_every_pr_create_call_site_routes_through_the_validator() -> None:
     # a module that forwards an already-built body and has no closing-ref
     # concern of its own.
     for path in source_files(_SRC_ROOT):
+        # A call site of ``create_pr_with_retry`` requires the literal name
+        # in the file's source text; skip empty files before parsed() so the
+        # scan only fills the shared-cache parse for call-site candidates
+        # (issue #2578; same filter shape as #2422/#2548).
+        if "create_pr_with_retry" not in source_text(path):
+            continue
         tree = parsed(path)
         if not _has_create_pr_with_retry_call_site(tree):
             continue
@@ -457,6 +463,15 @@ def test_every_pr_create_call_site_routes_through_the_retry_wrapper() -> None:
     wrapper_consumers: list[str] = []
 
     for path in source_files(_SRC_ROOT):
+        # Both detectors below need the literal token: a raw ``.pr_create``
+        # attribute call, a ``"pr_create"`` constant (the getattr shape), the
+        # ``def pr_create`` definition name, or a ``create_pr_with_retry``
+        # call all spell their identifier in the source text. Files with
+        # neither token are skipped before parsed() (issue #2578; same
+        # filter shape as #2422/#2548).
+        text = source_text(path)
+        if "pr_create" not in text and "create_pr_with_retry" not in text:
+            continue
         tree = parsed(path)
         # pr_create_retry.py's own body is the one legitimate place a raw
         # `.pr_create(` call may live -- it *is* the routing target every

@@ -63,22 +63,42 @@ def _no_op_route(ctx: _Ctx, entry: Mapping[str, Any]) -> NoOpRoute:
     )
 
 
-def _completed_outcome(
-    facts: SweepFacts, draft: Draft, acc: LockAcc, ctx: _Ctx, extra: Mapping[str, Any]
-) -> Flow:
-    """True when a fresh, on-target completed outcome exists (and was routed)."""
-    entry = draft.work
+def _resolve_outcome(facts: SweepFacts, draft: Draft, ctx: _Ctx) -> Flow:
+    """The fresh, on-target completed outcome for this dead worker, or ``None``.
+
+    A request is keyed by value, so the second caller on a pass (the same-head
+    route re-resolves it for routing) is served from ``observed`` -- one read.
+    """
     if not ctx.live:
-        return False
-    branch = ctx.pr.get("headRefName") or entry.get("branch_name")
+        return None
+    branch = ctx.pr.get("headRefName") or draft.work.get("branch_name")
     if not branch or not facts.repo.repo_root_is_path or not facts.repo.has_worktrees:
-        return False
-    outcome = yield ReadCompletedOutcome(ctx.number, ctx.pr_number, ctx.live, branch)
-    if outcome is None:
-        return False
+        return None
+    return (yield ReadCompletedOutcome(ctx.number, ctx.pr_number, ctx.live, branch))
+
+
+def _queue_apply(facts: SweepFacts, acc: LockAcc, ctx: _Ctx, outcome: Mapping[str, Any]) -> None:
+    """Queue the post-lock apply unless this outcome's head is already recorded applied."""
     applied = (facts.locked or {}).get(APPLIED_HEADS_KEY) or {}
     if applied.get(str(ctx.number)) != outcome["head_sha"]:
         acc.outcome_apply_routes.append((ctx.number, ctx.pr_number))
+
+
+def _completed_outcome(
+    facts: SweepFacts, draft: Draft, acc: LockAcc, ctx: _Ctx, extra: Mapping[str, Any]
+) -> Flow:
+    """True when a fresh, on-target completed outcome exists (and was routed).
+
+    Routing only: with ``apply_rework_outcome_on_every_route`` the apply was already
+    queued ahead of the route fan-out (issue #2826), so queueing here too would
+    double-queue it. With the switch off this is the only queueing site, as before.
+    """
+    entry = draft.work
+    outcome = yield from _resolve_outcome(facts, draft, ctx)
+    if outcome is None:
+        return False
+    if not facts.config.watchdog.apply_rework_outcome_on_every_route:
+        _queue_apply(facts, acc, ctx, outcome)
     fingerprint = drift_fingerprint(
         reason="dead_worker_completed_outcome", reviewed_head_sha=ctx.reviewed
     )
@@ -213,8 +233,16 @@ def _same_head(
 
 
 def _head_changed(
-    facts: SweepFacts, draft: Draft, acc: LockAcc, ctx: _Ctx, last_decision: str | None
+    facts: SweepFacts,
+    draft: Draft,
+    acc: LockAcc,
+    ctx: _Ctx,
+    last_decision: str | None,
+    *,
+    carries_apply: bool,
 ) -> Flow:
+    """Reviewed head != live head. ``carries_apply``: a completed outcome was queued
+    for apply, so the review route must hold until its head is recorded applied."""
     entry = draft.work
     fingerprint = drift_fingerprint(
         reason="dead_worker_with_head_change",
@@ -227,6 +255,11 @@ def _head_changed(
     if entry.get("orphan_drift_fingerprint") == fingerprint:
         return
     if facts.review_available:
+        if carries_apply and entry.get("orphan_drift_at") is None:
+            # A held route writes no drift of its own, so anchor the #654 backstop
+            # here (as the completed-outcome route does): an apply that can never
+            # land must end in the dead-dispatched reap, not hold the issue forever.
+            entry["orphan_drift_at"] = facts.stamp
         acc.review_routes.append(
             ReviewRoute(
                 ctx.number,
@@ -235,6 +268,7 @@ def _head_changed(
                 ctx.live,
                 fingerprint,
                 "dead_worker_with_head_change",
+                awaits_applied_head=carries_apply,
             )
         )
         return
@@ -309,13 +343,24 @@ def with_pr_flow(
     )
     last_decision = resolved.decision
 
+    # Issue #2826: a rework worker's ``pr_body``/``pr_comment`` is applied whenever it
+    # left a fresh outcome, not only on the routes that happened to read one. Resolved
+    # once here, ahead of the fan-out, so a branch added later cannot skip the apply.
+    outcome = None
+    if facts.config.watchdog.apply_rework_outcome_on_every_route:
+        outcome = yield from _resolve_outcome(facts, draft, ctx)
+        if outcome is not None:
+            _queue_apply(facts, acc, ctx, outcome)
+
     # An issue can only be ``dispatched`` while its PR's verdict is ``approved`` if
     # that dispatch is a post-approval rework (check failure or conflict), so the
     # PR ``status`` is not consulted: carry-forward (#2135) can rewrite it back to
     # ``approved`` mid-rework, and enumerating writers would rot.
     if last_decision in ("request_changes", "approved") and ctx.reviewed and ctx.live:
         if ctx.reviewed != ctx.live:
-            yield from _head_changed(facts, draft, acc, ctx, last_decision)
+            yield from _head_changed(
+                facts, draft, acc, ctx, last_decision, carries_apply=outcome is not None
+            )
         elif last_decision == "approved":
             yield from _same_head(
                 facts,

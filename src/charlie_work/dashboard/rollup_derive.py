@@ -29,10 +29,20 @@ from .rollup_schema import JOB_TABLE
 # ``test_every_emitted_kind_is_rollup_classified``, so a new writer kind cannot land
 # without someone deciding what it means for the dashboard.
 KNOWN_IGNORED: dict[str, str] = {
+    # -- main-sync (docs/specs/main-sync.md): local-checkout hygiene, no per-issue flow fact.
+    "main_sync_advanced": "local checkout hygiene; no per-issue rollup fact",
+    "main_sync_skipped": "local checkout hygiene; no per-issue rollup fact",
+    "main_sync_deferred": "local checkout hygiene; no per-issue rollup fact",
+    "main_sync_failed": "local checkout hygiene; no per-issue rollup fact",
+    "main_sync_rolled_back": "local checkout hygiene; no per-issue rollup fact",
+    "main_sync_rollback_refused": "local checkout hygiene; no per-issue rollup fact",
+    "main_sync_alarm": "surfaced as a fleet attention entry, not a rollup fact",
     # -- ci-fleet host kinds (host I/O, leak drain): host-level signals with no per-issue flow fact.
     "host_reboot_due": "ci-fleet host-level event; no per-issue rollup fact",
     "host_leak_warn": "ci-fleet host-level event; no per-issue rollup fact",
     "host_io_fallback": "ci-fleet host-level event; no per-issue rollup fact",
+    "deferred_demand_spilled": "ci-fleet host-level event; no per-issue rollup fact",
+    "platform_feature_skipped": "ci-fleet host-level event; no per-issue rollup fact",
     "host_io_hold": "ci-fleet host-level event; no per-issue rollup fact",
     "host_io_exclusions_applied": "ci-fleet host-level event; no per-issue rollup fact",
     "host_io_exclusions_failed": "ci-fleet host-level event; no per-issue rollup fact",
@@ -55,6 +65,7 @@ KNOWN_IGNORED: dict[str, str] = {
     "orphaned_worker_drift": "dead-worker sweep drift record; the corrective transition is its own event",
     "orphaned_worker_drift_sweep": "batch form of orphaned_worker_drift",
     "review_dispatch_stalled": "a stalled review claim was reset for retry; recovery bookkeeping",
+    "review_interdiff_fallback": "a re-review fell back to the three-dot interdiff (issue #2837 measurement); no rollup fact",
     "review_dispatch_stalled_sweep": "batch form of review_dispatch_stalled",
     "review_dispatch_lifecycle_reaped": "names a merged/closed PR only; deliberately not merge evidence (see rollup_flow_handlers docstring)",
     "review_dispatch_lifecycle_reaped_sweep": "batch form of review_dispatch_lifecycle_reaped",
@@ -159,6 +170,7 @@ KNOWN_IGNORED: dict[str, str] = {
     "intake": "intake-lane bookkeeping",
     "intake_failed": "intake-lane bookkeeping",
     "intake_prose_only_deps": "intake-lane bookkeeping",
+    "intake_prose_only_deps_cleared": "intake-lane bookkeeping",
     "blocker_cycle": "dependency-graph diagnostic",
     "dispatch_skip_blocked": "dispatch-skip record; dispatchable counts come from pass_samples",
     "dispatch_skip_operator_claimed": "dispatch-skip record; dispatchable counts come from pass_samples",
@@ -244,6 +256,8 @@ KNOWN_IGNORED: dict[str, str] = {
     "mergequeue_stalled": "merge-queue dwell alarm record; the heartbeat surfaces it",
     "mergequeue_requeue_capped": "merge-queue re-add cap record; the heartbeat surfaces it",
     "mergequeue_stall_alarm_failed": "advisory stall-alarm failure record (audit-only)",
+    "post_merge_followup_attribution": "experiment outcome record; the experiment report reads events live",
+    "post_merge_main_ci_failure": "experiment outcome record; the experiment report reads events live",
     "human_merge_required": "human-merge hand-off record (audit-only per its emit site)",
     "human_merge_label_removed": "human-merge bookkeeping",
     "unauthorized_merge_queue_sync_covered": "repeated every pass for the same PR; recon section 4 noise",
@@ -357,6 +371,7 @@ KNOWN_IGNORED: dict[str, str] = {
     "operator_rework_rearmed": "operator rework-rearm audit record (legacy kind); no flow fact",
     "operator_state_correction": "operator state-correction audit record (legacy kind); no flow fact",
     "review_packet_discarded_head_moved": "review-packet bookkeeping: PR head moved, packet re-made",
+    "review_packet_diff_unavailable": "review-packet bookkeeping: diff fetch unavailable (issue #1807 event); the packet/build retry carries the outcome",
     "rework_label_skipped_issue_closed": "rework-label bookkeeping: issue already closed",
     "unauthorized_merge_ack_revoked": "unauthorized-merge bookkeeping",
     "worker_token_missing": "retired worker-token gate (#1877); kept for older events DBs",

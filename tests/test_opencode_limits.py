@@ -208,3 +208,22 @@ def test_classify_for_other_harnesses_never_probe(go, tmp_path: Path) -> None:
     )
     assert kind == "quota_exhausted"
     assert fake.requests == []
+
+
+def test_classify_for_zen_free_rate_limit_skips_go_probe_and_uses_1h_cooldown(
+    go, tmp_path: Path
+) -> None:
+    """Issue #2767: a Zen free-tier stream rate-limit death classifies
+    quota_exhausted on a fixed 1h cooldown with zero Go API probe calls."""
+    fake = go(_http_429(GO_429_BODY, retry_after="60"))
+    line = (
+        "timestamp=2026-10-07T11:00:00Z level=ERROR "
+        'message="stream error" providerID=opencode modelID=deepseek-v4.1-flash-free '
+        "session.id=ses_1 small=false agent=build mode=primary "
+        'error.error="AI_APICallError: Rate limit exceeded. Please try again later."'
+    )
+    log = tmp_path / "issue-1.log"
+    log.write_text('{"type":"step_start"}\n' + line + "\n", encoding="utf-8")
+    now = datetime(2026, 10, 7, 12, 0, tzinfo=UTC)
+    assert _classify(log, now) == ("quota_exhausted", "2026-10-07T13:00:00Z")
+    assert fake.requests == []

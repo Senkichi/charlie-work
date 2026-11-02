@@ -39,6 +39,7 @@ from .config_validation import (
     Coerced,
     CoercedLenient,
     CommandTemplate,
+    Entries,
     FieldError,
     Check,
     FieldRules,
@@ -114,6 +115,7 @@ from .fleet_supervisor_config import (  # noqa: F401  (deliberate re-export)
 from . import layout
 from .fleet_harness_caps import freeze_harness_caps
 from .harnesses import REVIEWER_HARNESSES, WORKER_HARNESSES
+from .main_sync_config import MainSyncConfig
 from .opencode_config import OpenCodeConfig
 from .role_chain import (
     RoleEntry,
@@ -257,7 +259,8 @@ class LabelConfig:
     # Issue #1266: mechanical escalations (reason_class == "mechanical") land
     # here instead of ``human_needed``, so human attention is reserved for
     # judgment calls. Unlike ``prose_only_deps`` -- the only other
-    # terminal-but-not-workflow_labels label -- this one IS actively
+    # terminal-but-not-workflow_labels label (intake adds it and strips it
+    # again via issue #1902's re-check) -- this one IS actively
     # added/removed by automated ``labels.py`` transitions (the
     # "operator_queued"/"redispatch_operator_queued" edges and the
     # de-escalation cap-exhaustion path), so it must be a member of
@@ -305,6 +308,8 @@ class LabelConfig:
     # whoever files the issue creates the label, so it is not a member of
     # ``all`` or ``workflow_labels``. An empty prefix turns the routing off.
     model_tier_prefix: str = "model:"
+    # Spec C2 (host_routing): ``<prefix><host>`` names the orchestrator that owns an issue.
+    host_prefix: str = "host:"
 
     @property
     def terminal(self) -> set[str]:
@@ -380,6 +385,9 @@ class DispatchConfig:
     # so an operator adding or removing the label mid-flight takes effect on
     # the next pass.
     human_merge_labels: Annotated[tuple[str, ...], Typed, NotNull] = ()
+    # Spec C2 (host_routing): this orchestrator's host name; None = every issue is local.
+    host: Annotated[str | None, Typed, NonEmpty] = None
+    default_host: Annotated[bool, Typed, NotNull] = True
     # Package template rendered for worker prompts. "worker.md" targets Devin
     # sessions (skills-based loop); "worker_claude_code.md" targets Claude Code
     # workers (direct shell loop). A repo-local prompts dir overrides by filename.
@@ -395,6 +403,13 @@ class DispatchConfig:
     # tells the worker to use the command the repository documents in CLAUDE.md.
     # See prompt_test_command.
     test_command: Annotated[str, Typed, NullIsDefault] = ""
+    # Kill switch for the selector probe. On (default), a worker or rework prompt asks
+    # ``ci-fleet select`` whether it can narrow anything before it tells the worker to
+    # run ``ci-fleet test``; a selector that can only answer ``full`` (stale or missing
+    # selection map) leaves the hand-picked targeted command in place, so the worker is
+    # not handed a serial run of the whole suite. Off skips the probe: the prompt trusts
+    # the static preconditions alone. See selection_wrapper.probe_selection.
+    worker_selection_probe: Annotated[bool, Typed, NullIsDefault] = True
     # Global concurrency governor: cap total live worker sessions across fresh,
     # rework, and recovery dispatch. Unset/0 preserves current unlimited behavior.
     max_concurrent_sessions: int = 0
@@ -574,6 +589,17 @@ class DispatchConfig:
     # default; set to false to restore the always-clean-base behavior. Any
     # conflict or error falls back to the clean base either way.
     resume_throttled_attempts: Annotated[bool, Typed] = True
+    # Issue #2847: a dead worker's committed work can be stranded by ONE
+    # transient failure of the sweep's salvage push (e.g. ``push_failed:
+    # command timed out after 60s`` through a pre-push gate on a loaded host).
+    # Left alone, the next redispatch reads that commit as divergent local work
+    # and escalates ``worktree_unsafe_local_commits`` to a human. This many
+    # attempts per issue re-push it first (``salvage_retry``); an attempt is
+    # spent when it starts and is visible at
+    # ``state["issues"][n]["salvage_push_retries"]``. A rejected push, or a
+    # remote that moved, still escalates at once -- the retry only ever
+    # fast-forwards. 0 restores the escalate-on-first-sight behavior.
+    salvage_push_retries: Annotated[int, Typed, NonNeg] = 3
 
     def __post_init__(self) -> None:
         # Normalize to a tuple of forward-slash strings. The writer marker is
@@ -999,6 +1025,26 @@ class ReviewDispatchConfig:
     # a review (read diff, read tests, read a few source files, write verdict)
     # but prevents unbounded codebase exploration.
     review_max_turns: Annotated[int, Typed, NonNeg] = 40
+    # Issue #2837: incremental re-reviews. When a reviewed PR's head moves
+    # with a rework push, the next review is an incremental round: the packet
+    # carries a PR-relative interdiff built from the last round's archived
+    # diff.patch (files whose per-file patch changed since that round -- no
+    # base-merge noise, unlike the three-dot ``gh.compare_diff`` interdiff) and
+    # the reviewer is asked to re-check every prior finding, review the
+    # interdiff files in full, and open the full diff only for dependent
+    # context. False is the kill switch for the whole feature (the archived
+    # interdiff, the incremental prompt procedure, and the smaller turn
+    # budget below): today's full-diff prompt, three-dot interdiff, and flat
+    # ``review_max_turns`` budget come back.
+    incremental_review: Annotated[bool, Typed] = True
+    # Issue #2837: agentic turn cap for an incremental review round, used
+    # whenever the incremental procedure is rendered (a moved-head rework with
+    # an archived last-round diff). The #1439 structure/miss-streak escalation
+    # still applies on top of this base. 0 falls back to the flat
+    # ``review_max_turns`` budget (today's behaviour); setting it equal to
+    # ``review_max_turns`` does the same. Legacy ``fallback`` rounds and
+    # first reviews always use ``review_max_turns``.
+    incremental_review_max_turns: Annotated[int, Typed, NonNeg] = 20
     # Diff line count above which the review prompt includes a diff-size
     # warning and a per-file summary instead of encouraging the reviewer to
     # read the entire diff in one shot. 0 disables the threshold (always
@@ -1642,12 +1688,37 @@ class ClaudeCodeConfig:
     # reintroduces VIRTUAL_ENV even though sanitize_env strips it). This is
     # intentional: explicit operator overrides win over sanitization.
     worker_env: Annotated[dict[str, str], Coerced] = field(default_factory=dict)
-    # Opt-in: tee Claude Code's --output-format stream-json to a separate events.jsonl file.
-    # When enabled, the worker launch command is extended with --output-format stream-json
-    # and the structured JSONL output is written to issue-<n>.events.jsonl alongside the
-    # plaintext log. This enables downstream parsing of tool_call_count, turn_count, tokens,
-    # and cost_usd for tripwires and progress reporting. Default False until #162/#163 land.
-    tee_stream_json: bool = False
+    # Ship ON (issue #2814): tee Claude Code's --output-format stream-json to a
+    # separate events.jsonl file. With the tee, the worker launch command is
+    # extended with --output-format stream-json --verbose and the structured
+    # JSONL output is written to issue-<n>.events.jsonl (and into) the sidecar
+    # log stream-side, so signal 3's log mtime and the real-activity probe's
+    # events.jsonl source both see live activity while the session reads and
+    # plans. This enables downstream parsing of tool_call_count, turn_count,
+    # tokens, and cost_usd for tripwires and progress reporting. The tee is the
+    # default; ``tee_stream_json: false`` in config is the kill switch and
+    # restores the pre-#2814 behaviour (plain-text log, no events.jsonl).
+    tee_stream_json: bool = True
+    # Issue #2836: tool allowlist pinned via ``--tools`` on every worker
+    # launch (comma-separated tool names). Empty string is the kill switch:
+    # no ``--tools`` flag is added and the CLI default tool set applies —
+    # which re-reads tens of thousands of unused tool-schema tokens on every
+    # API call (Artifact/Skill/Workflow/Agent etc. measured ~57k-65k first-
+    # call context vs ~17k allowlisted) and inherits the operator's whole
+    # interactive tool surface a prompt injection could reach.
+    worker_tools: Annotated[str, Typed] = "Bash,Read,Edit,Write,Grep,Glob,Monitor,TaskStop"
+    # Issue #2836: same pin for reviewer sessions (read-only reviews need far
+    # fewer tools). Empty string = kill switch, CLI default applies.
+    reviewer_tools: Annotated[str, Typed] = "Bash,Read,Grep,Glob,Write"
+    # Issue #2836: when true (the default), worker/reviewer launches append
+    # ``--strict-mcp-config --mcp-config {"mcpServers":{}}`` (no MCP servers)
+    # and ``sanitize_env`` sets ``ENABLE_CLAUDEAI_MCP_SERVERS=false`` so
+    # claude.ai connectors never load in a headless session. This strips the
+    # operator's user-scope MCP servers (GitHub remote MCP *write* tools,
+    # Gmail, Drive, ...) from sessions that read attacker-controlled issue
+    # text under ``bypassPermissions`` — the ``gh`` CLI in Bash covers every
+    # read they actually make. ``false`` restores ambient MCP loading.
+    isolate_mcp: Annotated[bool, Typed] = True
 
 
 @dataclass(frozen=True)
@@ -1770,10 +1841,20 @@ class WorkerRoleConfig:
     """
 
     harness: str = "manual"
-    model: str = ""
+    # Issue #2117: reject a non-string model at the boundary as a FieldError.
+    # Without the ``Typed`` marker the raw value (e.g. ``model: 5``) is stored
+    # as-is and later crashes ``role_chain.model_family`` with a bare
+    # ``AttributeError`` on ``.strip()`` -- not a ``ConfigError``, so callers
+    # that catch ``ConfigError`` keep going. ``model`` is a plain string on
+    # every use site of this class (top-level worker and rescue.worker /
+    # rescue.reviewer), so the check can live here, on the field itself,
+    # unlike ``harness`` which diverges per use site. ``NotNull``: only
+    # ``""`` means "harness default"; null stays the crash it always was.
+    model: Annotated[str, Typed, NotNull] = ""
     # Issue #2086: role chain, see role_chain.py. ``Verbatim`` because rescue.worker /
-    # rescue.reviewer reuse this class and never parsed ``fallbacks`` (main stores the raw
-    # value); the top-level ``worker:`` section opts in with a use-site ``Entries``.
+    # rescue.reviewer reuse this class and treat ``fallbacks`` as a forbidden key turned
+    # away by RescueConfig.validate (issue #2118); the top-level ``worker:`` section opts
+    # in with a use-site ``Entries`` (which overrides ``Verbatim``).
     fallbacks: Annotated[tuple[RoleEntry, ...], Verbatim] = ()
     chain = property(chain_of)
 
@@ -1797,7 +1878,12 @@ class ReviewerRoleConfig:
     """
 
     harness: Annotated[str, Typed, NotNull, OneOf(*sorted(REVIEWER_HARNESSES))] = "claude-code"
-    model: str = _DEFAULT_CLAUDE_MODEL
+    # Issue #2117: a non-string model is a FieldError here too; without the
+    # marker ``reviewer.model: 5`` / ``model: null`` were silently stored and
+    # only crashed ``role_chain.model_family`` once the worker side had a
+    # known family. The fallbacks entries' ``model`` is checked separately by
+    # ``RoleEntry.model`` (role_chain.py).
+    model: Annotated[str, Typed, NotNull] = _DEFAULT_CLAUDE_MODEL
     effort: Annotated[str, Typed, NotNull] = ""
     effort_experiment_fraction: Annotated[float, Typed, NotNull, InRange(0.0, 1.0)] = 0.0
     effort_experiment_salt: Annotated[str, Typed, NotNull] = ""
@@ -1873,6 +1959,13 @@ class RescueConfig:
     ``claude_code.launch_claude_worker`` -- so ``ReviewerRoleConfig``'s
     claude-code-only harness restriction and its effort/experiment fields
     would both be wrong here.
+
+    Issue #2118: ``fallbacks`` is a forbidden key at both rescue use-sites
+    (``validate()`` below). Rescue dispatch consumes only the flat fields
+    above -- no consumer reads the nested roles or their ``fallbacks`` --
+    so option (a) (parse + ``check_role_chain``) would validate config that
+    is never launched, while option (b) (reject the key, like an unknown
+    one) matches how rescue dispatch actually consumes roles.
     """
 
     enabled: Annotated[bool, Typed] = False
@@ -1899,6 +1992,25 @@ class RescueConfig:
     reviewer: Annotated[WorkerRoleConfig, LenientMapping] = field(
         default_factory=lambda: WorkerRoleConfig(harness="devin", model="codex")
     )
+
+    def validate(self, config: OrchestratorConfig) -> None:
+        """``fallbacks`` is a forbidden key at both rescue use-sites (issue #2118).
+
+        Rejected exactly like an unknown key whenever the key appears at all:
+        absent builds the field default ``()``; an explicit ``fallbacks: null``
+        is preserved as ``None`` (design P2); anything else is kept as written
+        by the class's ``Verbatim`` annotation and lands here unchecked. Field
+        keys are relative -- ``run_section_hooks`` adds the ``rescue.`` prefix.
+        """
+        for name in ("worker", "reviewer"):
+            fallbacks = getattr(getattr(self, name), "fallbacks")
+            if fallbacks != ():
+                raise FieldError(
+                    f"{name}.fallbacks",
+                    f"absent ({name} takes no fallbacks)",
+                    fallbacks,
+                    "raw",
+                )
 
 
 @dataclass(frozen=True)
@@ -2003,6 +2115,18 @@ class WatchdogConfig:
     # to exit leaves the pushed branch and its drafted PR stranded for as long
     # as the PID lingers (the swole #163 incident: PR unopened ~2h).
     worker_outcome_finalize_minutes: Annotated[int, Typed, NonNeg] = 15
+    # Issue #2826: the rework brief promises "the orchestrator applies your
+    # ``pr_body``/``pr_comment`` for you", but the dead-worker sweep only queued
+    # that apply on the completed-outcome route (reviewed head == live head). The
+    # head-changed route, the unreviewed ``pr-open`` advance and the drift
+    # fall-through never read the outcome, so the edit was dropped with no event
+    # and the reviewer kept asking for a body fix no worker could make. True
+    # (default) resolves the completed outcome once, ahead of the route fan-out,
+    # queues the apply for every with-PR route, holds a head-changed review route
+    # until the head is recorded as applied, and rebuilds a verdictless packet
+    # that predates an applied body. False restores the routing-conditional
+    # behaviour exactly (kill switch).
+    apply_rework_outcome_on_every_route: Annotated[bool, Typed] = True
 
 
 @dataclass(frozen=True)
@@ -2530,6 +2654,7 @@ class OrchestratorConfig:
     claude_code: ClaudeCodeConfig = field(default_factory=ClaudeCodeConfig)
     api_worker: ApiWorkerConfig = field(default_factory=ApiWorkerConfig)
     opencode: OpenCodeConfig = field(default_factory=OpenCodeConfig)
+    main_sync: MainSyncConfig = field(default_factory=MainSyncConfig)
     rescue: RescueConfig = field(default_factory=RescueConfig)
     worker: Annotated[
         WorkerRoleConfig,
@@ -2581,10 +2706,20 @@ class OrchestratorConfig:
     ] = field(default_factory=RunnerScalingConfig)
     # Host-wide (#600, #763): one physical machine, so a per-repo layer must not hold its
     # own opinion. ``ci_fleet``'s own ``__post_init__`` owns the remaining rules
-    # (per-repo ceilings, affinity), including ``key: null`` on the four fields it cannot
-    # compare against ``None``: that ``TypeError`` becomes a ``ConstructionError``, which the
-    # #665 layered rescue re-raises (a use-site ``NotNull`` would make it a rescuable
-    # ``FieldError`` and silently discard the global layer -- cfg review R2-B1).
+    # (per-repo ceilings, affinity). Since issue #2116 the validator's class-level
+    # null rule defaults a scalar ``key: null`` back to the field's declared default
+    # before the constructed value reaches those comparisons (it used to surface as a
+    # ``ConstructionError`` the #665 rescue re-raised); a non-scalar ``null`` (e.g.
+    # ``max_running_per_repo``) still raises -- construction errors stay loud, and a
+    # use-site ``NotNull`` on this section would make the failure a rescuable
+    # ``FieldError`` silently discarding the global layer (cfg review R2-B1).
+    # ``deferred_demand`` is the deliberate exception: its use-site ``Entries`` rule makes a
+    # bad ``after_seconds`` (non-int, <= 0) a rescuable ``FieldError``, so with a per-repo
+    # config present the #665 rescue discards the global layer (the warning names the key)
+    # and ``deferred_demand`` falls back to ``()`` -- the same outcome as the bounded
+    # scalars above (``NonNeg``). A bad ``labels`` has no use-site rule, so ``ci_fleet``'s
+    # ``DeferredDemand.__post_init__`` rejects it as a loud ``ConstructionError``. Both
+    # outcomes are pinned in tests/test_runner_allocation_deferred_demand.py.
     runner_allocation: Annotated[
         RunnerAllocationConfig,
         HostWideOnly,
@@ -2601,6 +2736,7 @@ class OrchestratorConfig:
             leak_drain=Typed,
             leak_probe_path=Typed,
             host_io_auto_exclusions=Typed,
+            deferred_demand=Entries(after_seconds=(Typed, Positive)),
         ),
         Check(_runner_floors_agree),
     ] = field(default_factory=RunnerAllocationConfig)

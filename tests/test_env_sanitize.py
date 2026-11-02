@@ -17,6 +17,12 @@ from pathlib import Path
 
 import pytest
 
+from charlie_work import claude_code
+from charlie_work.config import (
+    ApiProviderConfig,
+    ApiWorkerConfig,
+    OrchestratorConfig,
+)
 from charlie_work.env_sanitize import (
     DEFAULT_PYTEST_XDIST_AUTO_NUM_WORKERS,
     PYTEST_XDIST_AUTO_NUM_WORKERS_VAR,
@@ -25,7 +31,7 @@ from charlie_work.env_sanitize import (
     resolve_uv_no_sync,
     sanitize_env,
 )
-from charlie_work.worktree import _create_junction_or_symlink, is_junction
+from charlie_work.worktree import WorktreeInfo, _create_junction_or_symlink, is_junction
 
 # ---------------------------------------------------------------------------
 # sanitize_env: safe-default injection
@@ -124,6 +130,24 @@ def test_sanitize_env_drops_inherited_pwd(tmp_path: Path, monkeypatch: pytest.Mo
 
     assert "PWD" not in env
     assert "OLDPWD" not in env
+
+
+def test_sanitize_env_drops_inherited_acp_backend(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An ambient ACP_BACKEND (the Devin Desktop integrated terminal's ACP
+    session marker, issue #2784) must never reach a worker subprocess.
+
+    With ACP_BACKEND present, devin.exe --print enforces the ACP server
+    credential policy and exits 1 with "Error: Not logged in" instead of using
+    the local CLI credentials. sanitize_env must drop it so devin-shell
+    launches from inside Devin Desktop fall back to those credentials.
+    """
+    monkeypatch.setenv("ACP_BACKEND", "devin-desktop")
+
+    env = sanitize_env(tmp_path)
+
+    assert "ACP_BACKEND" not in env
 
 
 def test_resolve_pytest_cap_default(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -441,3 +465,307 @@ def test_sanitize_env_does_not_unlink_repo_root_venv_junction(
 
     assert "VIRTUAL_ENV" not in env
     assert "UV_PROJECT_ENVIRONMENT" not in env
+
+
+def _api_orchestrator_config(
+    *,
+    provider_name: str = "kimi-k3",
+    api_key_env: str = "MOONSHOT_API_KEY",
+) -> OrchestratorConfig:
+    """Build an OrchestratorConfig directly (the pattern
+    test_charlie_work_dispatch_adapters.py uses) with one enabled api provider
+    whose key env var is the modern default test name."""
+    provider = ApiProviderConfig(
+        base_url="https://api.moonshot.ai/anthropic",
+        api_key_env=api_key_env,
+        model="kimi-k3",
+        input_usd_per_mtok=3.0,
+        output_usd_per_mtok=15.0,
+        cached_input_usd_per_mtok=0.30,
+    )
+    api_cfg = ApiWorkerConfig(
+        enabled=True,
+        provider=provider_name,
+        max_concurrent_sessions=1,
+        providers={provider_name: provider},
+    )
+    return OrchestratorConfig(api_worker=api_cfg)
+
+
+def test_sanitize_env_pops_configured_provider_api_key_env_vars(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #2795: the provider-key variable names configured under
+    ``api_worker.providers`` must be popped from the sanitized worker env.
+
+    The supervisor carries the provider key in its own env (the api adapter
+    resolves it there), and every claude_code/devin_shell/devin_review_resume/
+    rescue_review launch passes through sanitize_env — so a key left in the
+    sanitized base reaches those worker sessions ambiently. With
+    ``config=None`` nothing extra is stripped, preserving every caller that
+    has no config in scope.
+    """
+    config = _api_orchestrator_config()
+    monkeypatch.setenv("MOONSHOT_API_KEY", "sk-configured-provider-key")
+
+    env_without_config = sanitize_env(tmp_path)
+    assert env_without_config["MOONSHOT_API_KEY"] == "sk-configured-provider-key"
+
+    env = sanitize_env(tmp_path, config=config)
+    assert "MOONSHOT_API_KEY" not in env, (
+        "a configured apiKeyName under api_worker.providers must be popped from "
+        "the sanitized worker env (issue #2795)"
+    )
+
+
+def test_sanitize_env_strips_every_providers_env_name_not_only_the_active_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """All configured providers' key env names are stripped, not just the
+    active provider's: the supervisor's env carries whatever the operator
+    stored, and a worker must not inherit any of them."""
+    provider = ApiProviderConfig(
+        base_url="https://api.example.com/anthropic",
+        api_key_env="EXAMPLE_API_KEY",
+        model="example-m",
+        input_usd_per_mtok=3.0,
+        output_usd_per_mtok=15.0,
+    )
+    api_cfg = ApiWorkerConfig(
+        enabled=True,
+        provider="shared",
+        providers={
+            "shared": provider,
+            "alt": ApiProviderConfig(
+                base_url="https://api.example.com/anthropic",
+                api_key_env="ALT_EXAMPLE_API_KEY",
+                model="example-m",
+                input_usd_per_mtok=3.0,
+                output_usd_per_mtok=15.0,
+            ),
+        },
+    )
+    config = OrchestratorConfig(api_worker=api_cfg)
+    monkeypatch.setenv("EXAMPLE_API_KEY", "sk-active")
+    monkeypatch.setenv("ALT_EXAMPLE_API_KEY", "sk-alt")
+
+    env = sanitize_env(tmp_path, config=config)
+
+    assert "EXAMPLE_API_KEY" not in env
+    assert "ALT_EXAMPLE_API_KEY" not in env
+
+
+def test_api_worker_launch_strips_provider_key_but_routes_auth_token(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Unset: the api adapter keeps working while the ambient key is stripped.
+
+    A sanitized launch env (sanitize_env(..., config=cfg) pops MOONSHOT_API_KEY)
+    must not lose the api path's routing: launch_api_worker merges provider_env
+    (ANTHROPIC_AUTH_TOKEN etc.) AFTER sanitization, so the child still receives
+    ANTHROPIC_AUTH_TOKEN even though the provider-key variable name itself is
+    gone from the worker session's env.
+    """
+    import sys
+    import textwrap
+
+    from _worker_marker_wait import read_worker_marker
+
+    from charlie_work.api_worker import launch_api_worker
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    worktrees_dir = tmp_path / "worktrees"
+    worktree_path = worktrees_dir / "worktree"
+    worktree_path.mkdir(parents=True)
+    sessions_dir = tmp_path / "sessions"
+
+    def fake_create_worktree(
+        repo_root,
+        branch,
+        *,
+        base_ref="HEAD",
+        worktrees_dir=None,
+        venv_source=None,
+        materialize_dirs=(),
+        rework=False,
+        recovery=None,
+        issue_number=None,
+        config=None,
+        sessions_dir=None,
+    ):
+        return WorktreeInfo(path=worktree_path, branch=branch, venv_junction=None)
+
+    monkeypatch.setattr(claude_code, "create_worktree", fake_create_worktree)
+    monkeypatch.setenv("MOONSHOT_API_KEY", "sk-test-key-value-1234")
+
+    script_path = tmp_path / "env_probe.py"
+    script_path.write_text(
+        textwrap.dedent(
+            """
+            import os
+            from pathlib import Path
+
+            Path("env-probe.txt").write_text(
+                "|".join(
+                    [
+                        os.environ.get("ANTHROPIC_AUTH_TOKEN", "<unset>"),
+                        os.environ.get("MOONSHOT_API_KEY", "<unset>"),
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    config = _api_orchestrator_config()
+    record = launch_api_worker(
+        100,
+        "agent/issue-100-sanitize",
+        "prompt",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        api_worker_config=config.api_worker,
+        command_template=(sys.executable, str(script_path)),
+        config=config,
+    )
+
+    assert record.ok, record.error
+    probe_path = Path(record.worktree_path) / "env-probe.txt"
+    auth_token, provider_key = read_worker_marker(
+        probe_path,
+        expected="sk-test-key-value-1234|<unset>",
+        reason=(
+            "issue #2795: the api child receives ANTHROPIC_AUTH_TOKEN (provider "
+            "env merged after sanitization) but NOT the ambient provider key "
+            "variable itself"
+        ),
+    ).split("|")
+    assert auth_token == "sk-test-key-value-1234"
+    assert provider_key == "<unset>"
+
+
+def test_sanitize_env_provider_key_pop_is_case_insensitive_on_windows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Windows casefolds env KEYS — the pop must keep up (issue #2795 review).
+
+    ``dict(os.environ)`` upper-cases keys on Windows, so the pre-fix exact
+    ``env.pop("Mixed_Case")`` failed open (the key survived sanitization) while
+    the api adapter's ``os.environ.get()`` lookup is case-insensitive and would
+    still have FOUND the value. The strip must therefore match
+    case-insensitively on Windows so both halves of the api path agree.
+
+    The configured name (and the value monkeypatch.setenv plants) is
+    mixed-case; on
+    Windows ``os.environ`` stores it under whatever casing the platform
+    normalizes to, and on POSIX the exact-case name is stored verbatim — the
+    assertion (no case-variant of the name survives sanitization) is
+    platform-agnostic and fails on the pre-fix code on Windows.
+    """
+    config = _api_orchestrator_config(
+        provider_name="mixed-provider", api_key_env="Empericus_Anthropic_Api_Key"
+    )
+    monkeypatch.setenv("Empericus_Anthropic_Api_Key", "sk-mixed-case-key")
+
+    env = sanitize_env(tmp_path, config=config)
+
+    leaked = [k for k in env if k.upper() == "EMPERICUS_ANTHROPIC_API_KEY"]
+    assert not leaked, (
+        f"a configured provider key env var must not survive sanitization under "
+        f"any casing on this platform: {leaked} (issue #2795)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# sanitize_env: ENABLE_CLAUDEAI_MCP_SERVERS gate (issue #2836)
+# ---------------------------------------------------------------------------
+
+
+def test_sanitize_env_sets_claudeai_mcp_gate_false_by_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With the default config (isolate_mcp: true), sanitize_env must set
+    ENABLE_CLAUDEAI_MCP_SERVERS=false so claude.ai connectors never load."""
+    from charlie_work.env_sanitize import ENABLE_CLAUDEAI_MCP_SERVERS_VAR
+
+    worktree_path = tmp_path / "worktree"
+    worktree_path.mkdir()
+    monkeypatch.delenv(ENABLE_CLAUDEAI_MCP_SERVERS_VAR, raising=False)
+
+    env = sanitize_env(worktree_path, config=OrchestratorConfig())
+
+    assert env[ENABLE_CLAUDEAI_MCP_SERVERS_VAR] == "false"
+
+
+def test_sanitize_env_overrides_planted_true_mcp_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A parent-exported true value must be overridden to false: isolation
+    wins over ambient state."""
+    from charlie_work.env_sanitize import ENABLE_CLAUDEAI_MCP_SERVERS_VAR
+
+    worktree_path = tmp_path / "worktree"
+    worktree_path.mkdir()
+    monkeypatch.setenv(ENABLE_CLAUDEAI_MCP_SERVERS_VAR, "true")
+
+    env = sanitize_env(worktree_path, config=OrchestratorConfig())
+
+    assert env[ENABLE_CLAUDEAI_MCP_SERVERS_VAR] == "false"
+
+
+def test_sanitize_env_isolate_mcp_false_leaves_gate_unset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """isolate_mcp: false leaves ENABLE_CLAUDEAI_MCP_SERVERS unset (an
+    operator's deliberate opt-out; no planted default may survive either)."""
+    from charlie_work.env_sanitize import ENABLE_CLAUDEAI_MCP_SERVERS_VAR
+    from charlie_work.config import ClaudeCodeConfig
+
+    worktree_path = tmp_path / "worktree"
+    worktree_path.mkdir()
+    monkeypatch.setenv(ENABLE_CLAUDEAI_MCP_SERVERS_VAR, "true")
+
+    env = sanitize_env(
+        worktree_path,
+        config=OrchestratorConfig(claude_code=ClaudeCodeConfig(isolate_mcp=False)),
+    )
+
+    assert ENABLE_CLAUDEAI_MCP_SERVERS_VAR not in env
+
+
+def test_sanitize_env_call_sites_in_src_all_pass_config() -> None:
+    """AST guard: every ``sanitize_env(`` call in src/ must pass ``config=``.
+
+    ``sanitize_env``'s ``config`` default is None, which fails OPEN — a call
+    site that forgets it hands the worker a base env that still carries the
+    orchestrator's api-provider keys (issue #2795). Because every in-tree launch
+    site plausibly has the orchestrator config in scope, forgetting ``config=``
+    is always a bug, never a deliberate choice, so instead of relying on a
+    reviewer noticing at diff time this test mechanically fails whenever a
+    ``src/`` call site omits the keyword (or a new call site appears without
+    it).
+    """
+    import ast
+    from _src_ast import parsed, source_files
+
+    src_root = Path(__file__).resolve().parent.parent / "src"
+    bad: list[str] = []
+    for py_file in source_files(src_root):
+        tree = parsed(py_file)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            called = (isinstance(func, ast.Name) and func.id == "sanitize_env") or (
+                isinstance(func, ast.Attribute) and func.attr == "sanitize_env"
+            )
+            if called and not any(kw.arg == "config" for kw in node.keywords):
+                bad.append(f"{py_file.relative_to(src_root.parent)}:{node.lineno}")
+    assert not bad, (
+        "every sanitize_env( call in src/ must pass config= (the None default "
+        f"fails open and would leave api-provider keys in the worker base env): "
+        f"{bad}"
+    )

@@ -521,7 +521,7 @@ def launch_devin_session(
     # collide on a shared temp path (issue #1767). To give workers a scoped
     # GitHub token, set worker_env={"GH_TOKEN": "<scoped-PAT>"} in the adapter config.
     try:
-        sanitized_env = sanitize_env(worktree.path)
+        sanitized_env = sanitize_env(worktree.path, config=config)
     except OSError as exc:
         _teardown_worktree()
         return _fail(

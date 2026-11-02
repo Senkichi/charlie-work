@@ -39,7 +39,7 @@ def test_stream_json_anchor_is_the_throttle_events_own_timestamp(tmp_path: Path)
     # mtime deliberately disagrees with the event's own timestamp.
     log_path = _copy_fixture(
         tmp_path,
-        "claude_stream_json_throttle_assistant_ts.jsonl",
+        "claude_stream_json_throttle_cli_event_ts.jsonl",
         mtime=NOW - timedelta(minutes=3),
     )
 
@@ -94,10 +94,33 @@ def test_devin_plain_text_without_timestamp_still_anchors_at_log_mtime(tmp_path:
     assert throttled_until == _iso(EMITTED + timedelta(minutes=30))
 
 
+def test_unstated_reset_rate_limit_anchors_at_now_not_stale_mtime(tmp_path: Path) -> None:
+    # No "resets in N minutes": the 15-minute default is a synthetic
+    # post-classification cooldown, not a countdown that started at the
+    # emission time. Anchoring it at a stale mtime (a stall-reaped worker's
+    # log can be 45+ minutes old) would clamp max(now, emitted_at+15m) to
+    # `now` -- a zero-length window. The anchor is classification time.
+    from charlie_work.devin_failure_classification import get_rate_limit_defer_until
+
+    log_path = tmp_path / "session.log"
+    log_path.write_text(
+        "Error: Rate limit exceeded. Please try again later.\n",
+        encoding="utf-8",
+    )
+    os.utime(log_path, (EMITTED.timestamp(), EMITTED.timestamp()))
+
+    failure_kind, throttled_until = worker_fate.classify_for("devin", log_path, now=NOW)
+    defer_until = get_rate_limit_defer_until(log_path, slack_minutes=5, now=NOW)
+
+    assert failure_kind == "rate_limited"
+    assert throttled_until == _iso(NOW + timedelta(minutes=15))
+    assert defer_until == _iso(NOW + timedelta(minutes=20))
+
+
 def test_classify_for_unknown_adapter_kind_classifies_nothing(tmp_path: Path) -> None:
     log_path = _copy_fixture(
         tmp_path,
-        "claude_stream_json_throttle_assistant_ts.jsonl",
+        "claude_stream_json_throttle_cli_event_ts.jsonl",
         mtime=EMITTED,
     )
 
@@ -125,8 +148,9 @@ def test_stream_json_result_without_timestamp_anchors_at_mtime_not_earlier_turn(
 
 
 def test_claude_code_plain_text_log_anchors_at_mtime(tmp_path: Path) -> None:
-    # tee_stream_json defaults to False: a default claude-code log is prose.
-    # It must keep the #1997 mtime anchor, not fall to classification time.
+    # A non-tee claude-code log (``tee_stream_json: false`` in config) is
+    # prose. It must keep the #1997 mtime anchor, not fall to classification
+    # time.
     log_path = _copy_fixture(
         tmp_path,
         "claude_plain_text_throttle.log",
@@ -194,7 +218,7 @@ def test_trailing_stderr_keeps_a_quoted_timestamp_from_becoming_the_anchor(
 def test_stream_json_event_timestamp_wins_over_trailing_stderr(tmp_path: Path) -> None:
     log_path = _with_trailing_stderr(
         tmp_path,
-        "claude_stream_json_throttle_assistant_ts.jsonl",
+        "claude_stream_json_throttle_cli_event_ts.jsonl",
         mtime=NOW - timedelta(minutes=3),
     )
 

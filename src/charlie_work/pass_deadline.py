@@ -428,6 +428,17 @@ def run_deadline_guarded_maintenance(
     # free. See _maybe_reclaim_superseded_main_ci's docstring.
     deadline.call(lambda: app._maybe_reclaim_superseded_main_ci(), None, lane="ci_reclaim")
 
+    # Issue #1717: post-merge outcome attribution for the reviewer-effort
+    # experiment (#1701) -- turn the two previously not-derivable outcome
+    # candidates (a main-branch CI failure after a merge; a follow-up
+    # fix/revert PR naming the merged PR) into recorded events. See
+    # _maybe_post_merge_attribution's docstring.
+    deadline.call(
+        lambda: app._maybe_post_merge_attribution(now=now),
+        None,
+        lane="post_merge_attribution",
+    )
+
     # Issue #783: periodic re-evaluation of `mechanical` escalations --
     # the only automated re-entry from `agent:human-needed` for pure
     # process failures (a dead rework worker, a redispatch cap, a

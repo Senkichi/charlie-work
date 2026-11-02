@@ -141,12 +141,14 @@ def test_launch_claude_worker_routes_creationflags_through_hidden_console_kwargs
 def test_launch_claude_worker_tee_stream_json_writes_to_both_files(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Regression test for issue #160: tee thread must write to both log and events files.
+    """Regression test for issue #160: the tee must write to both log and events files.
 
-    This test verifies that when tee_stream_json=True, the background tee thread
-    successfully writes output to both the plaintext log file and the events.jsonl file.
-    The original bug closed file handles immediately after starting the thread,
-    causing all writes to fail silently and leaving both files empty.
+    This test verifies that when tee_stream_json=True, the tee splitter child
+    process successfully writes output to both the plaintext log file and the
+    events.jsonl file (the launcher now pre-creates both files synchronously;
+    the historical bug was a tee thread closing file handles right after the
+    thread started, causing all writes to fail silently and leaving both
+    files empty).
 
     This test would fail against the buggy code (empty files) and pass after the fix.
     """
@@ -194,12 +196,25 @@ def test_launch_claude_worker_tee_stream_json_writes_to_both_files(
     marker_path = worktree_path / "worker-ran.txt"
     read_worker_marker(marker_path)
 
-    # Give the tee thread a moment to finish writing
-    time.sleep(0.2)
-
-    # Verify both files exist and have content
+    # Wait for the tee splitter child to drain its buffered input: the
+    # launcher pre-creates both files synchronously (round 3), so the path
+    # checks below are already instant — poll for CONTENT with a bounded
+    # deadline instead of a fixed sleep (the original 0.2s startup reliance
+    # flaked under -n auto).
     log_path = Path(record.log_path)
     events_path = sessions_dir / "issue-160.events.jsonl"
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        try:
+            if "line 3" in log_path.read_text(
+                encoding="utf-8"
+            ) and "line 3" in events_path.read_text(encoding="utf-8"):
+                break
+        except OSError:
+            pass
+        time.sleep(0.05)
+
+    # Verify both files exist and have content
 
     assert log_path.exists(), "Log file should exist"
     assert events_path.exists(), "Events file should exist"
@@ -237,30 +252,25 @@ def test_launch_claude_worker_tee_stream_json_writes_to_both_files(
 def test_launch_claude_worker_tee_stream_json_popen_failure_closes_handles(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Regression test: in the tee_stream_json branch, log_handle/events_handle
-    are opened without a `with` block so the background tee thread can own their
-    lifecycle (closing them itself once the process exits). But if
-    subprocess.Popen raises before the thread ever starts, nobody closes them.
-    Popen failure must close both handles before the OSError propagates.
-    """
-    from unittest.mock import patch
+    """Regression test (issue #2814 rework): the tee is now a splitter child
+    process whose stdin the launcher owns until the worker spawn hands it
+    over. When Popen raises, launch still returns an error record (never
+    raises) and the splitter's stdin is closed so the splitter reads EOF and
+    exits instead of lingering on a pipe nobody will ever write to."""
+    from unittest.mock import MagicMock, patch
+
+    class FakeStdin:
+        closed = False
+
+        def close(self):
+            self.closed = True
 
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     sessions_dir = tmp_path / "sessions"
     _install_fake_create_worktree(monkeypatch, tmp_path)
 
-    opened_handles: list = []
-    original_open = Path.open
-
-    def tracking_open(self, *args, **kwargs):
-        handle = original_open(self, *args, **kwargs)
-        if self.name.endswith((".claude.log", ".events.jsonl")):
-            opened_handles.append(handle)
-        return handle
-
-    monkeypatch.setattr(Path, "open", tracking_open)
-
+    # Splitter spawn fails: the error record must name the splitter.
     with patch("subprocess.Popen", side_effect=OSError("mock spawn failure")):
         record = launch_claude_worker(
             161,
@@ -274,9 +284,103 @@ def test_launch_claude_worker_tee_stream_json_popen_failure_closes_handles(
 
     assert not record.ok
     assert record.error is not None
-    assert "failed to launch claude" in record.error
+    assert "failed to launch tee splitter" in record.error
+    assert "failed to launch claude" not in record.error
 
-    assert len(opened_handles) == 2, "expected exactly log_handle and events_handle to be opened"
-    assert all(handle.closed for handle in opened_handles), (
-        "log_handle/events_handle must be closed when Popen fails, not leaked"
+    # Splitter up but the Worker spawn fails: the splitter's stdin is closed
+    # so it exits on EOF.
+    fake_stdin = FakeStdin()
+    fake_splitter = MagicMock(spec=["stdin", "pid"], stdin=fake_stdin, pid=4242)
+    popen_calls: list[int] = []
+
+    def first_popen_fails(*args, **kwargs):
+        popen_calls.append(1)
+        if len(popen_calls) == 1:
+            return fake_splitter
+        raise OSError("mock worker spawn failure")
+
+    with patch("subprocess.Popen", side_effect=first_popen_fails):
+        record = launch_claude_worker(
+            162,
+            "agent/issue-162-worker-popen-failure",
+            "prompt text",
+            repo_root=repo_root,
+            sessions_dir=sessions_dir,
+            command_template=("claude",),
+            tee_stream_json=True,
+        )
+
+    assert not record.ok
+    assert record.error is not None
+    assert "failed to launch claude" in record.error
+    assert fake_stdin.closed
+
+
+def test_launch_claude_worker_tee_stream_json_precreates_both_files(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Round 3: with the tee on, the launcher pre-creates/truncates BOTH tee
+    destinations synchronously BEFORE the splitter child exists — both paths
+    already exist (empty) the moment launch returns, while a sleeping worker
+    has not printed anything yet. Never a silently dead worker whose files
+    appear only stream-side."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    _install_fake_create_worktree(monkeypatch, tmp_path)
+
+    record = launch_claude_worker(
+        163,
+        "agent/issue-163-tee-precreate",
+        "prompt text",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        command_template=(sys.executable, "-c", "import time; time.sleep(2)"),
+        tee_stream_json=True,
     )
+
+    assert record.ok, record.error
+    assert Path(record.log_path).exists()
+    events_path = sessions_dir / "issue-163.events.jsonl"
+    assert events_path.exists()
+    # Truncated, not pre-populated: the worker has not printed yet.
+    assert Path(record.log_path).stat().st_size == 0
+    assert events_path.stat().st_size == 0
+
+
+def test_launch_claude_worker_tee_unopenable_log_files_error_record(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Round 3: an unopenable tee destination (the events path is an
+    occupied directory no launch step can rotate away) surfaces BEFORE the
+    splitter child exists as a launch error record — never a silently dead
+    worker wired to a splitter that died opening its files."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    _install_fake_create_worktree(monkeypatch, tmp_path)
+
+    blocking = sessions_dir / "issue-164.events.jsonl"
+    blocking.mkdir()
+    (blocking / "occupied.txt").write_text("make unlink in the rotation fail", encoding="utf-8")
+    # Block the rotation: the ``.1`` slot is a non-empty directory too, so
+    # _rotate_old_log's unlink raises and the occupied dir cannot be moved.
+    (sessions_dir / "issue-164.events.jsonl.1").mkdir()
+    (sessions_dir / "issue-164.events.jsonl.1" / "occupied.txt").write_text(
+        "rotation block", encoding="utf-8"
+    )
+
+    record = launch_claude_worker(
+        164,
+        "agent/issue-164-tee-unopenable",
+        "prompt text",
+        repo_root=repo_root,
+        sessions_dir=sessions_dir,
+        command_template=("claude",),
+        tee_stream_json=True,
+    )
+
+    assert not record.ok
+    assert record.error is not None
+    assert "failed to create tee log files" in record.error

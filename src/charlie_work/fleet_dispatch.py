@@ -67,7 +67,7 @@ from .fleet_stop import (
     fleet_stop_pending,
     supervise_loop_interrupted_result,
 )
-from . import layout
+from . import launchd_probe, layout
 from .github import GitHub, GitHubError
 from .global_config import (
     describe_config_file,
@@ -77,6 +77,7 @@ from .global_config import (
 )
 from .instrumentation import log_event
 from .local_issues import github_client_for
+from .main_sync import format_pass_lines, health_entries, run_main_sync_pass
 from .notify import AttentionDigest, AttentionEntry, emit_digest
 from .notify_freshness import (
     check_notify_digest_freshness,
@@ -2762,6 +2763,12 @@ def probe_fleet_watchdog(
     while "Scheduled Task State" is exactly the Enabled/Disabled flag the
     restart exit depends on.
     """
+    if sys.platform == "darwin":
+        # Spec C2: on the Mac the watchdog is a launchd job (see launchd_probe).
+        armed, detail = launchd_probe.probe_launchd_job(
+            run_command=run_command, timeout_seconds=timeout_seconds
+        )
+        return WatchdogProbe(armed, detail)
     if sys.platform != "win32":
         return WatchdogProbe(
             None, f"not probed (schtasks is Windows-only; platform={sys.platform})"
@@ -3499,6 +3506,17 @@ def run_fleet_supervise(
                         now_str=now_str,
                     )
                 break
+
+            if not drain_state.draining:  # docs/specs/main-sync.md; never raises
+                synced = run_main_sync_pass(
+                    fleet_dir_override=fleet_dir_override,
+                    exclude_root=orchestrator_root(),
+                    dry_run=dry_run,
+                )
+                for line in format_pass_lines(synced):
+                    print(f"[{now_str}] main-sync: {line}", flush=True)
+                for entry in health_entries(synced) if notify_enabled else ():
+                    _emit_fleet_transition(notify_config, entry, fleet_dir_override)
 
             pass_result = fleet_loop(
                 fleet_dir_override=fleet_dir_override,

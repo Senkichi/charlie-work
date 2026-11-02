@@ -35,4 +35,4 @@ def test_every_launcher_exports_the_ledger_context() -> None:
     # One assertion per launch path: claude-code and api share launch_claude_worker.
     assert _calls_ledger_env(SRC / "claude_code.py", "worker")
     assert _calls_ledger_env(SRC / "devin_shell.py", "worker")
-    assert _calls_ledger_env(SRC / "orchestration" / "local_merge_gate.py", "gate")
+    assert _calls_ledger_env(SRC / "env_sanitize.py", "gate")
