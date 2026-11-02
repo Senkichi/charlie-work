@@ -159,9 +159,10 @@ def test_importing_charlie_work_installs_the_env_strip_source() -> None:
     import charlie_work.instrumentation  # noqa: F401
     from charlie_work.ci_fleet_env_strip import fleet_provider_key_names
 
-    env_strip = pytest.importorskip("ci_fleet.env_strip")
+    pytest.importorskip("ci_fleet", minversion="0.8.3")
+    from ci_fleet.env_strip import get_env_strip_source
 
-    assert env_strip.get_env_strip_source() is fleet_provider_key_names
+    assert get_env_strip_source() is fleet_provider_key_names
 
 
 def test_an_older_ci_fleet_warns_instead_of_killing_the_import() -> None:

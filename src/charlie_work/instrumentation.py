@@ -1114,7 +1114,7 @@ def close_db(state_path: Path) -> None:
 # keys. See ci_fleet_env_strip (issue #2902).
 #
 # It is the one seam whose import is optional, because this source can run on
-# an older ci-fleet: the daemon after a failed deferred sync, or a tool or dev
+# an older ci-fleet: the daemon after a failed sync, or a tool or dev
 # environment that moved with the checkout and never synced. A hard import kills
 # every one of those at startup, and nothing relaunches a daemon that dies
 # there. An older ci-fleet has no strip to configure, so listeners launched from
@@ -1134,7 +1134,8 @@ try:
 except ImportError:
     logger.warning(
         "the installed ci-fleet has no env_strip module (it needs >=0.8.3): listeners "
-        "launched from this process keep provider API keys until it is synced"
+        "launched from this process keep provider API keys until it is synced and "
+        "this process restarts"
     )
 else:
     set_env_strip_source(fleet_provider_key_names)

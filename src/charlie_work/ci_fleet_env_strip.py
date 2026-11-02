@@ -89,12 +89,14 @@ def _registered_repos(registry_path: Path) -> dict[str, Any]:
 def _load_repo_config(entry: dict[str, Any], fleet_dir_override: str | None) -> OrchestratorConfig:
     from .global_config import load_layered_config
 
-    explicit = entry.get("config_path")
-    return load_layered_config(
-        Path(entry["repo_root"]),
-        Path(explicit) if explicit else None,
-        fleet_dir_override=fleet_dir_override,
-    )
+    root = Path(entry["repo_root"])
+    explicit = Path(entry["config_path"]) if entry.get("config_path") else None
+    # A missing path loads as plain defaults, which would look like a repo that
+    # configures no keys rather than one whose names couldn't be read.
+    for path in (root, explicit):
+        if path is not None and not path.exists():
+            raise FileNotFoundError(path)
+    return load_layered_config(root, explicit, fleet_dir_override=fleet_dir_override)
 
 
 def fleet_provider_key_names(fleet_dir_override: str | None = None) -> frozenset[str]:

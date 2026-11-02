@@ -19,9 +19,12 @@ from ci_fleet import runners
 from charlie_work import layout
 from charlie_work.ci_fleet_env_strip import fleet_provider_key_names
 
-# An install older than ci-fleet 0.8.3 has no strip to test. The import seam test
-# in test_ci_fleet_seams.py covers what happens on one.
-env_strip = pytest.importorskip("ci_fleet.env_strip")
+# An install older than ci-fleet 0.8.3 has no strip to test, and the import seam
+# test in test_ci_fleet_seams.py covers what happens on one. This skips on the
+# version, not the module, so a later release that drops the module fails here.
+pytest.importorskip("ci_fleet", minversion="0.8.3")
+
+from ci_fleet import env_strip  # noqa: E402
 
 
 def _provider_yaml(key_name: str) -> str:
@@ -134,6 +137,11 @@ def test_the_global_layer_counts_when_no_repo_can_be_read(tmp_path: Path) -> Non
         pytest.param(b'{"repos": {"owner/x": "text"}}', id="entry-is-not-a-mapping"),
         pytest.param(b"\xff\xfe not text", id="not-utf8"),
         pytest.param(b'{"repos": {', id="truncated"),
+        pytest.param(b'{"repos": {"owner/x": {"repo_root": "no/such/repo"}}}', id="root-is-gone"),
+        pytest.param(
+            b'{"repos": {"owner/x": {"repo_root": ".", "config_path": "no/such.yaml"}}}',
+            id="config-path-is-gone",
+        ),
     ],
 )
 def test_a_bad_registry_keeps_the_global_names_and_says_so(
