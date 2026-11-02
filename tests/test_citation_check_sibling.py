@@ -19,6 +19,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from charlie_work.citation_check import (
     CitationStatus,
     drift_fingerprint,
@@ -226,19 +228,30 @@ def test_verify_same_directory_evidence_matching_two_candidates_stays_ambiguous(
     assert sorted(verdicts[0].candidates) == ["a/config.py", "b/config.py"]
 
 
+@pytest.mark.parametrize(
+    ("candidate", "sibling"),
+    [
+        # The sibling sits in a *subdirectory* of the candidate's directory.
+        ("a/config.py", "a/sub/x.py"),
+        # The candidate sits in a *subdirectory* of the sibling's directory.
+        ("a/sub/config.py", "a/x.py"),
+    ],
+)
 def test_verify_same_directory_requires_the_same_directory_not_a_subdirectory(
-    tmp_path: Path,
+    tmp_path: Path, candidate: str, sibling: str
 ) -> None:
-    # "Same directory" is exact parent equality: a sibling citation in a
-    # *subdirectory* of a candidate's directory (``a/sub/x.py``) is not
-    # evidence for ``a/config.py``.
-    _write(tmp_path, "a/config.py", ["x"])
+    # "Same directory" is exact parent equality in both directions: a sibling
+    # citation in a subdirectory of a candidate's directory, or in a parent
+    # directory of it, is not evidence for that candidate.
+    _write(tmp_path, candidate, ["x"])
     _write(tmp_path, "b/config.py", ["y"])
-    _write(tmp_path, "a/sub/x.py", ["1"])
+    _write(tmp_path, sibling, ["1"])
 
-    verdicts = verify_citations("config.py:1 with a/sub/x.py:1", tmp_path)
+    verdicts = verify_citations(f"config.py:1 with {sibling}:1", tmp_path)
 
     assert verdicts[0].status is CitationStatus.AMBIGUOUS_BASENAME
+    assert verdicts[0].candidates is not None
+    assert sorted(verdicts[0].candidates) == sorted([candidate, "b/config.py"])
 
 
 def test_verify_repo_root_sibling_is_not_directory_evidence(tmp_path: Path) -> None:

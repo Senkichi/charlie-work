@@ -323,8 +323,9 @@ def _sibling_evidence(
       (tier 1: the *same file* is cited elsewhere in the body).
     * ``dirs`` -- the repo-root-relative POSIX parent directory of every such
       citation that is directory-qualified (tier 2: a *different file in the
-      same directory* is cited elsewhere in the body). The bare repo root
-      (``"."``) is excluded: a root-level file says nothing about which
+      same directory* is cited elsewhere in the body). The bare repo root (a
+      root-level file, which has no directory component) is excluded here --
+      the single enforcement point: a root-level file says nothing about which
       directory the body is discussing, and it would match every root-level
       candidate.
     """
@@ -370,10 +371,11 @@ def _pick_sibling_candidate(
     by_path = [m for m, rel in rel_by_match if rel is not None and rel in sibling_paths]
     if len(by_path) == 1:
         return by_path[0]
+    # The repo root is excluded from ``sibling_dirs`` at the single point where
+    # that set is built (``_sibling_evidence``), so a root-level candidate's
+    # empty parent can never match here.
     by_dir = [
-        m
-        for m, rel in rel_by_match
-        if rel is not None and (parent := rel.rpartition("/")[0]) and parent in sibling_dirs
+        m for m, rel in rel_by_match if rel is not None and rel.rpartition("/")[0] in sibling_dirs
     ]
     if len(by_dir) == 1:
         return by_dir[0]
