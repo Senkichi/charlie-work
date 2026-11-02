@@ -37,12 +37,14 @@ It mechanically detects **coordinate drift**:
   ``drifted_verdicts`` so it surfaces without raising a false alarm.
 * ``RESOLVED_BY_SIBLING`` — info-level (not drift, issue #1881): the cited
   literal path does not exist, more than one tracked file shares the basename,
-  but exactly one candidate's repo-root-relative path matches a
-  *qualified* citation elsewhere in the same body (a citation whose asserted
-  literal path exists in the working tree). The sibling citation
-  deterministically disambiguates the basename, so the verdict surfaces
-  ``resolved_path`` without raising a false alarm -- ``AMBIGUOUS_BASENAME``
-  only when no sibling citation in the same body disambiguates.
+  but a *qualified* citation elsewhere in the same body (a citation whose
+  asserted literal path exists in the working tree) picks out exactly one
+  candidate. Two tiers, strongest first: the sibling cites that exact file, or
+  the sibling cites a different file in the same (non-root) directory as
+  exactly one candidate. The sibling citation deterministically disambiguates
+  the basename, so the verdict surfaces ``resolved_path`` without raising a
+  false alarm -- ``AMBIGUOUS_BASENAME`` only when no sibling citation in the
+  same body disambiguates.
 * ``AMBIGUOUS_BASENAME`` — the cited literal path does not exist and more
   than one tracked file shares the basename, with no same-body sibling
   citation picking out one candidate. This is a real citation defect:
@@ -100,8 +102,8 @@ class CitationStatus(str, Enum):
     (a bare basename rather than a full path). ``RESOLVED_BY_SIBLING`` is
     info-level for the ambiguous case (issue #1881): several tracked files
     share the basename, but a qualified citation elsewhere in the same body
-    matches exactly one candidate, so the citation is deterministically
-    usable. Both surface the citation-quality issue without a false
+    matches exactly one candidate -- by exact path or by sharing its
+    directory -- so the citation is deterministically usable. Both surface the citation-quality issue without a false
     missing-file claim, and are excluded from ``drifted_verdicts`` so they do
     not raise a drift alarm.
     """
@@ -294,6 +296,90 @@ def _read_lines(path: Path) -> list[str]:
         return []
 
 
+def _repo_relative_posix(path: Path, repo_root: Path) -> str | None:
+    """Return ``path`` as a repo-root-relative POSIX string, or ``None`` if outside.
+
+    POSIX separators keep comparisons and comments identical on Windows and
+    POSIX. A path outside ``repo_root`` has no repo-relative form, so it can
+    neither be a basename candidate nor disambiguate one.
+    """
+    try:
+        return str(path.relative_to(repo_root)).replace("\\", "/")
+    except ValueError:
+        return None
+
+
+def _sibling_evidence(
+    literal_resolves: list[Path | None], repo_root: Path
+) -> tuple[frozenset[str], frozenset[str]]:
+    """Collect same-body sibling evidence for basename disambiguation (issue #1881).
+
+    ``literal_resolves`` holds, per citation, the file its asserted literal path
+    resolved to (``None`` when that path does not exist). Only citations whose
+    literal path exists contribute -- an ambiguous or missing citation never
+    vouches for another one. Returns ``(paths, dirs)``:
+
+    * ``paths`` -- the repo-root-relative POSIX path of every such citation
+      (tier 1: the *same file* is cited elsewhere in the body).
+    * ``dirs`` -- the repo-root-relative POSIX parent directory of every such
+      citation that is directory-qualified (tier 2: a *different file in the
+      same directory* is cited elsewhere in the body). The bare repo root
+      (``"."``) is excluded: a root-level file says nothing about which
+      directory the body is discussing, and it would match every root-level
+      candidate.
+    """
+    paths: set[str] = set()
+    dirs: set[str] = set()
+    for lit in literal_resolves:
+        if lit is None:
+            continue
+        rel = _repo_relative_posix(lit, repo_root)
+        if rel is None:
+            continue
+        paths.add(rel)
+        parent = rel.rpartition("/")[0]
+        if parent:
+            dirs.add(parent)
+    return frozenset(paths), frozenset(dirs)
+
+
+def _pick_sibling_candidate(
+    matches: list[Path],
+    repo_root: Path,
+    sibling_paths: frozenset[str],
+    sibling_dirs: frozenset[str],
+) -> Path | None:
+    """Pick the one basename candidate that same-body sibling evidence selects.
+
+    Evidence is tiered, strongest first, and each tier must pick out *exactly
+    one* candidate or it is not used:
+
+    1. **Exact path** -- the candidate's repo-relative path equals a sibling
+       citation's path (the same file is cited elsewhere in the body).
+    2. **Same directory** -- the candidate's repo-relative parent directory
+       equals the parent directory of a directory-qualified sibling citation
+       (a different file in the same directory is cited elsewhere). A root-level
+       candidate has no directory to match and never qualifies.
+
+    Tier 2 is consulted only when tier 1 did not uniquely resolve, so a body
+    that cites the exact file keeps winning even if another sibling happens to
+    sit in a second candidate's directory. Returns ``None`` when neither tier
+    is unique -- the caller then reports ``AMBIGUOUS_BASENAME``.
+    """
+    rel_by_match = [(m, _repo_relative_posix(m, repo_root)) for m in matches]
+    by_path = [m for m, rel in rel_by_match if rel is not None and rel in sibling_paths]
+    if len(by_path) == 1:
+        return by_path[0]
+    by_dir = [
+        m
+        for m, rel in rel_by_match
+        if rel is not None and (parent := rel.rpartition("/")[0]) and parent in sibling_dirs
+    ]
+    if len(by_dir) == 1:
+        return by_dir[0]
+    return None
+
+
 def verify_citations(
     body: str,
     repo_root: Path,
@@ -327,38 +413,32 @@ def verify_citations(
     * **Multiple** tracked files share the basename -> sibling
       disambiguation first (issue #1881): a *qualified* citation elsewhere in
       the same body -- one whose asserted literal path exists in the working
-      tree -- supplies its repo-root-relative path as evidence. Exactly one
-      candidate matches that evidence -> resolve against it and validate the
-      line range there; a bare citation that validates reports
-      ``RESOLVED_BY_SIBLING`` (info-level), a prefixed one reports
+      tree -- supplies evidence in two tiers: (1) its repo-root-relative path
+      equals exactly one candidate's (the same file is cited elsewhere), else
+      (2) its parent directory, when directory-qualified (not the bare repo
+      root), equals exactly one candidate's parent directory (a different file
+      in the same directory is cited elsewhere). Tier 2 is consulted only when
+      tier 1 did not uniquely resolve. A unique candidate -> resolve against it
+      and validate the line range there; a bare citation that validates
+      reports ``RESOLVED_BY_SIBLING`` (info-level), a prefixed one reports
       ``STALE_PREFIX`` (the asserted prefix is still false). No sibling
-      evidence, or more than one candidate matching it -> fall back to
-      ``AMBIGUOUS_BASENAME`` with the candidate list. This is a real citation
-      defect the author must fix (disambiguate with a directory prefix); it
-      is not a false alarm.
+      evidence, or more than one candidate matching in both tiers -> fall back
+      to ``AMBIGUOUS_BASENAME`` with the candidate list. This is a real
+      citation defect the author must fix (disambiguate with a directory
+      prefix); it is not a false alarm.
 
     Never raises on a missing/unreadable file; that is a verdict, not an error.
     """
     citations = parse_citations(body)
-    # Evidence for same-body sibling disambiguation (issue #1881): the
-    # repo-root-relative POSIX path of every citation whose asserted literal
-    # path exists in the working tree. An ambiguous basename citation
-    # consults this set before flagging: if exactly one basename candidate
-    # matches a sibling's resolved path, the sibling deterministically
-    # disambiguates the citation. Solving both halves in one pre-pass keeps
-    # the per-citation loop single-pass and captures qualified siblings that
-    # appear *after* the ambiguous citation in the body.
-    sibling_paths: set[str] = set()
+    # Evidence for same-body sibling disambiguation (issue #1881): the exact
+    # paths and the parent directories of every citation whose asserted
+    # literal path exists in the working tree. An ambiguous basename citation
+    # consults this evidence before flagging (see ``_pick_sibling_candidate``).
+    # Computing it in one pre-pass keeps the per-citation loop single-pass and
+    # captures qualified siblings that appear *after* the ambiguous citation
+    # in the body.
     literal_resolves: list[Path | None] = [_literal_resolve(c.path, repo_root) for c in citations]
-    for lit in literal_resolves:
-        if lit is None:
-            continue
-        try:
-            sibling_paths.add(str(lit.relative_to(repo_root)).replace("\\", "/"))
-        except ValueError:
-            # A citation resolving outside ``repo_root`` cannot disambiguate
-            # a repo-relative basename candidate.
-            pass
+    sibling_paths, sibling_dirs = _sibling_evidence(literal_resolves, repo_root)
     verdicts: list[CitationVerdict] = []
     # Cache file reads (current and at-commit) by path so a file cited many
     # times is read once.
@@ -392,19 +472,17 @@ def verify_citations(
                 # Ambiguous: the author cited a bare basename (or a wrong
                 # prefix) that matches more than one tracked file. Before
                 # flagging (issue #1881), try same-body sibling
-                # disambiguation: a qualified citation's resolved path picking
-                # out exactly one candidate resolves the basename
-                # deterministically. No sibling evidence, or more than one
-                # candidate matching it, keeps today's ambiguous flag --
-                # repo-root-relative POSIX strings keep the comment readable
-                # on both Windows and POSIX.
-                sibling_hits = {
-                    p
-                    for p in matches
-                    if str(p.relative_to(repo_root)).replace("\\", "/") in sibling_paths
-                }
-                if len(sibling_hits) == 1:
-                    resolved = next(iter(sibling_hits))
+                # disambiguation: a qualified citation elsewhere in the body
+                # picking out exactly one candidate -- by exact path, else by
+                # shared directory -- resolves the basename deterministically.
+                # No sibling evidence, or more than one candidate matching it,
+                # keeps today's ambiguous flag -- repo-root-relative POSIX
+                # strings keep the comment readable on both Windows and POSIX.
+                sibling_pick = _pick_sibling_candidate(
+                    matches, repo_root, sibling_paths, sibling_dirs
+                )
+                if sibling_pick is not None:
+                    resolved = sibling_pick
                     # The basename is disambiguated, but no per-candidate
                     # fallback happened -- remember it so the status line
                     # reports ``RESOLVED_BY_SIBLING``, not
