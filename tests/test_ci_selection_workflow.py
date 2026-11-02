@@ -243,7 +243,16 @@ def test_the_nightly_shards_build_their_maps() -> None:
     for name in ("Map mode", "Build the shard map"):
         assert "github.event_name == 'schedule'" in _step(shard, name)["if"]
     install = _step(shard, "Map mode")["run"]
-    assert 'uv pip install "ci-fleet[map]~=0.7.0"' in install
+    # No version constraint (ci-fleet break 10): `uv sync --frozen` above
+    # installed the locked ci-fleet, and the two installed-ci-fleet guards in
+    # tests/test_ci_fleet_floor_guard.py and
+    # tests/test_runner_allocation_deferred_demand.py pin the suite to it. A
+    # pin like `~=0.7.0` downgrades that venv below the lock only in the
+    # nightly (0.8.0 -> 0.7.8: `version("ci-fleet") != _locked()`, and 0.7.x
+    # ships no `ci_fleet.spill`); the constraint-free install adds just the
+    # map extra and keeps the locked wheel.
+    assert 'uv pip install "ci-fleet[map]"' in install
+    assert "~=" not in install and "==" not in install
     # Map mode never leaves the shard step (gap 47): no `--github-env` anywhere.
     assert "map prepare" not in install
     run = _step(shard, "Run test shard")["run"]

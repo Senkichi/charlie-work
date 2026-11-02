@@ -637,10 +637,10 @@ def _check_provenance_refusal_streak(add: Any, fleet_dir_override: str | None = 
 
 
 def _check_fleet_dir_virtualization(add: Any, fleet_dir_override: str | None = None) -> None:
-    """Warn when the fleet directory is per-process virtualized (issue #624).
+    """Warn when the fleet directory or its files are virtualized (issues #624, #2806).
 
-    MSIX/container copy-on-write redirection makes the literal fleet-dir path
-    string identical in both the container and the host while naming different
+    MSIX/container copy-on-write redirection makes the literal path string
+    identical in both the container and the host while naming different
     files: reads pass through to the real file, but the first write forks a
     private copy that daemons reading the same path string never see. This
     cost a full day on #590 — ``runner_allocation`` was believed deployed and
@@ -649,31 +649,45 @@ def _check_fleet_dir_virtualization(add: Any, fleet_dir_override: str | None = N
 
     The signal is that the literal path and its resolved form disagree — never
     a hardcoded package moniker (which would rot on the next app update, only
-    cover one container, and violate the no-hardcoded-lists rule). A
-    virtualized fleet dir is not fatal for an interactive human running
+    cover one container, and violate the no-hardcoded-lists rule). Since
+    #2806 the probe covers files, not only the directory: MSIX redirection is
+    per file and the directory always resolves to itself, so a state file
+    forked by an earlier packaged-session write was invisible here (e.g. a
+    stale private ``fleet.json`` of 3 repos while the real one lists 9,
+    silently bypassing the merge-preflight hook for the missing repos, and a
+    stale private ``config.yaml`` layered over every repo-scoped command).
+
+    A diverged fleet directory is not fatal for an interactive human running
     ``charlie doctor`` from a packaged terminal — reads still pass through
-    until something writes — so this is a warning, not an error. It names both
-    paths and states plainly that any write forks a private copy daemons will
-    never see, referencing #590 for the failure it produced.
+    until something writes — so it is a warning. A diverged state file the
+    fleet machinery actually depends on (``fleet.json``: the merge guard and
+    the registry readers; ``config.yaml``: the config layering) is an error:
+    those reads are already wrong before anything writes. Each finding names
+    both paths and states plainly that any write forks a private copy
+    daemons will never see, referencing #590 for the failure it produced.
 
     Repo-agnostic by construction: the fleet dir is a host-wide per-process
     property, so the same probe fires regardless of which registered repo the
     operator ran ``charlie doctor`` from.
     """
-    diverged = fleet_dir_virtualization(override=fleet_dir_override)
-    if diverged is None:
+    findings = fleet_dir_virtualization(override=fleet_dir_override)
+    if not findings:
         return
-    literal, resolved = diverged
-    add(
-        "fleet dir virtualization",
-        False,
-        f"fleet dir {literal} resolves to {resolved} — host-wide state written "
-        f"here is invisible to scheduled tasks and daemons reading the same "
-        f"path string: the first write forks a private copy they will never "
-        f"see (this is the exact shape of the #590 failure). Daemon-visible "
-        f"state must be written via a non-redirected route (e.g. a UNC path).",
-        severity="warning",
-    )
+    pairs: list[tuple[Path, Path]] = [findings] if isinstance(findings, tuple) else list(findings)
+    state_file_names = frozenset({layout.FLEET_REGISTRY_FILENAME, layout.GLOBAL_CONFIG_FILENAME})
+    for literal, resolved in pairs:
+        add(
+            "fleet dir virtualization",
+            False,
+            f"fleet {'file' if literal.name in state_file_names else 'dir'} "
+            f"{literal} resolves to {resolved} — host-wide state written here "
+            f"is invisible to scheduled tasks and daemons reading the same "
+            f"path string: the first write forks a private copy they will "
+            f"never see (this is the exact shape of the #590 failure). "
+            f"Daemon-visible state must be written via a non-redirected route "
+            f"(e.g. a UNC path).",
+            severity=("error" if literal.name in state_file_names else "warning"),
+        )
 
 
 def _check_fleet_supervisor(add: Any, fleet_dir_override: str | None = None) -> None:

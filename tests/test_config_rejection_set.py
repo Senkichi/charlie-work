@@ -8,7 +8,16 @@ automatic signal: a probe matrix recorded against the pre-migration build code
 Each cell is one ``build_config_from_data`` call with one probe value placed at
 one key path, recorded as:
 
-* ``R``   -- rejected (``ValueError``/``TypeError``; ``ConfigError`` is a ``ValueError``)
+* ``R``   -- rejected by a rescuable ``ConfigError`` (a ``FieldError``; any
+  ConfigError that is not a ``ConstructionError``)
+* ``RC``  -- rejected by a non-rescuable class: a ``ConstructionError``, or a
+  raw ``ValueError``/``TypeError`` that escaped before the wrap. Both are
+  ``ValueError``, so an unqualified ``except`` cannot tell them apart -- but
+  the #665 layered-load rescue discards the global layer on ``ConfigError``
+  and re-raises a ``ConstructionError``, so turning an ``RC`` into an ``R``
+  (e.g. a use-site ``NotNull`` on a ``runner_allocation`` field) flips
+  layered-rescue behaviour from fail-loud to silently-discarding-global
+  (the #623 shape) while this matrix would have shown only ``R`` either way.
 * ``X``   -- crashed with some other exception (a clean rejection now also passes)
 * ``A<h>`` -- accepted; ``h`` digests the fields that differ from the default
   config, so a change in coercion (``str(item)``, ``float(x)``, ``.strip()``)
@@ -37,6 +46,7 @@ from unittest import mock
 import pytest
 
 from charlie_work.config import OrchestratorConfig, build_config_from_data
+from charlie_work.config_validation import ConfigError, ConstructionError, NotNull
 
 FIXTURE = Path(__file__).parent / "fixtures" / "config_rejection_matrix.json"
 
@@ -181,8 +191,10 @@ CASES: dict[str, dict] = {
     "reviewer_fallbacks_devin_primary": {
         "reviewer": {"harness": "devin", "fallbacks": [_FB]}
     },
-    # rescue.worker / rescue.reviewer reuse WorkerRoleConfig and store ``fallbacks`` unparsed
-    # (main's known gap): anything is accepted, verbatim, and a null stays ``None``.
+    # Issue #2118: rescue.worker / rescue.reviewer reuse WorkerRoleConfig, but the
+    # nested roles are never read at runtime, so ``fallbacks`` is a forbidden key at
+    # both rescue use-sites (RescueConfig.validate): every spelling rejects.
+    "rescue_worker_fallbacks_int": {"rescue": {"worker": {"fallbacks": 5}}},
     "rescue_worker_fallbacks_raw": {"rescue": {"worker": {"fallbacks": [{"harness": "bogus"}]}}},
     "rescue_worker_fallbacks_str": {"rescue": {"worker": {"fallbacks": "zz"}}},
     "rescue_reviewer_fallbacks_null": {"rescue": {"reviewer": {"fallbacks": None}}},
@@ -446,8 +458,11 @@ def place(path: list, value: object, seed: dict) -> dict:
     return raw
 
 
-def _changed(cfg: typing.Any) -> list[tuple[str, str, str]]:
-    default = build_config_from_data({})
+def _changed(
+    cfg: typing.Any, default: OrchestratorConfig | None = None
+) -> list[tuple[str, str, str]]:
+    if default is None:
+        default = _default_config()
     rows = []
     for f in dataclasses.fields(cfg):
         if f.metadata.get("provenance"):
@@ -469,26 +484,52 @@ def _changed(cfg: typing.Any) -> list[tuple[str, str, str]]:
 # The fixture was recorded on a 16-CPU host; recording and replay both pin to it.
 RECORDED_CPU_COUNT = 16
 
+# ``_changed``'s diff basis is one deterministic default: the value does not vary
+# under the ``RECORDED_CPU_COUNT`` pin, so one build serves every call and the memo
+# cannot change a recorded code, only the replay's cost. The streaming replays thread
+# the module-scoped ``default_cfg`` fixture (issue #2883, base branch); this memo
+# covers ``_changed``'s ``default=None`` fallback -- single-shot ``code_of`` callers
+# such as ``scripts/record_config_rejection_rows.py``, which were rebuilding the
+# default on every recorded cell (issue #2884). ``_default_config`` makes its own
+# build under the pin, so the cached basis is pinned whoever warms it.
+_DEFAULT_CONFIG: typing.Any | None = None
 
-def code_of(raw: dict) -> str:
+
+def _default_config() -> typing.Any:
+    """The pinned default config, memoized for ``_changed``'s ``default=None`` basis."""
+    global _DEFAULT_CONFIG
+    if _DEFAULT_CONFIG is None:
+        with mock.patch("os.cpu_count", return_value=RECORDED_CPU_COUNT):
+            _DEFAULT_CONFIG = build_config_from_data({})
+    return _DEFAULT_CONFIG
+
+
+def code_of(raw: dict, default: OrchestratorConfig | None = None) -> str:
     with mock.patch("os.cpu_count", return_value=RECORDED_CPU_COUNT):
-        return _code_of(raw)
+        return _code_of(raw, default)
 
 
-def _code_of(raw: dict) -> str:
+def _code_of(raw: dict, default: OrchestratorConfig | None = None) -> str:
     try:
         cfg = build_config_from_data(copy.deepcopy(raw))
-    except (ValueError, TypeError):
+    except ConstructionError:
+        return "RC"
+    except ConfigError:
         return "R"
+    except (ValueError, TypeError):
+        # ConstructionError subclasses ConfigError, so a raw ValueError here is
+        # either a build failure that slipped past validate_section's wrap or an
+        # earlier structural escape -- not rescuable either way.
+        return "RC"
     except Exception:  # noqa: BLE001 - recorded as a crash class, not hidden
         return "X"
-    return "A" + hashlib.md5(repr(_changed(cfg)).encode()).hexdigest()[:4]
+    return "A" + hashlib.md5(repr(_changed(cfg, default)).encode()).hexdigest()[:4]
 
 
 def same(recorded: str, now: str) -> bool:
     if recorded == now:
         return True
-    return {recorded, now} <= {"R", "X"}  # a clean rejection replacing a crash is fine
+    return recorded == "X" and now in {"R", "RC"}  # a clean rejection replacing a crash is fine
 
 
 def compute() -> dict:
@@ -525,19 +566,42 @@ def recorded() -> dict:
     return json.loads(FIXTURE.read_text(encoding="utf-8"))
 
 
+@pytest.fixture(scope="module")
+def default_cfg() -> OrchestratorConfig:
+    """The default config, built once per pytest process (issue #2883).
+
+    Every accepted cell's code hashes its fields' diff against a default config;
+    building that default again for each cell paid a second full
+    ``build_config_from_data`` per accepted probe, which alone was ~35% of the
+    matrix replay's call phase on CI-runner hardware. The build must happen under
+    the same ``RECORDED_CPU_COUNT`` pin as every cell, since cpu-derived defaults
+    feed the recorded hashes.
+
+    The streaming tests below ``with``-wrap their replay loops in the same pin and
+    call ``_code_of`` directly: ``code_of`` re-pins per call (~0.03 ms per cell,
+    ~7% of the replay), so the loops hoist it out one level. ``code_of`` itself
+    keeps the per-call pin and stays the pin-safe entry point for single-shot
+    callers (e.g. ``scripts/record_config_rejection_rows.py``).
+    """
+    with mock.patch("os.cpu_count", return_value=RECORDED_CPU_COUNT):
+        return build_config_from_data({})
+
+
 def test_probe_matrix_is_nontrivial(recorded):
-    """Positive control: the fixture contains both rejections and acceptances, broadly."""
+    """Positive control: the fixture contains both rejections and acceptances, broadly,
+    and both rescue classes among the rejections."""
     flat = [c for row in recorded["cells"].values() for c in row]
-    rejected = sum(1 for c in flat if c == "R")
+    rejected = sum(1 for c in flat if c in {"R", "RC"})
     accepted = sum(1 for c in flat if c.startswith("A"))
     assert len(recorded["targets"]) > 300
     assert rejected > 2000
     assert accepted > 5000
+    assert sum(1 for c in flat if c == "RC") > 0
     assert recorded["cases"]["deadlock"] == "R"
     assert recorded["cases"]["no_deadlock"].startswith("A")
 
 
-def test_probe_replay_detects_a_loosened_validator(recorded, monkeypatch):
+def test_probe_replay_detects_a_loosened_validator(recorded, default_cfg, monkeypatch):
     """Neuter control: a build that never rejects must NOT replay equal to the fixture."""
     import charlie_work.config as config_module
 
@@ -550,55 +614,138 @@ def test_probe_replay_detects_a_loosened_validator(recorded, monkeypatch):
             return real({})
 
     monkeypatch.setitem(globals(), "build_config_from_data", lax)
-    mismatches = [
-        tid
-        for tid, row in recorded["cells"].items()
-        if not all(
-            same(rec, code_of(place(recorded["targets"][tid], v, recorded["seeds"][tid])))
-            for rec, (_, v) in zip(row, PROBES, strict=True)
-        )
-    ]
+    with mock.patch("os.cpu_count", return_value=RECORDED_CPU_COUNT):
+        mismatches = [
+            tid
+            for tid, row in recorded["cells"].items()
+            if not all(
+                same(
+                    rec,
+                    _code_of(
+                        place(recorded["targets"][tid], v, recorded["seeds"][tid]), default_cfg
+                    ),
+                )
+                for rec, (_, v) in zip(row, PROBES, strict=True)
+            )
+        ]
     assert len(mismatches) > 100
 
 
-def test_key_probe_matrix_unchanged(recorded):
-    bad = []
-    for tid, row in recorded["cells"].items():
-        path, seed = recorded["targets"][tid], recorded["seeds"][tid]
-        for rec, (name, value) in zip(row, PROBES, strict=True):
-            now = code_of(place(path, value, seed))
-            if not same(rec, now):
-                bad.append(f"{tid} <- {name}: recorded {rec}, now {now}")
+def test_probe_replay_detects_a_rescuable_flip(recorded, default_cfg, monkeypatch):
+    """Specificity control: an RC-class change must surface, not only a loosened
+    validator. A use-site ``NotNull`` on ``runner_allocation.reserved_threads``
+    (cfg review R2-B1): the NotNull rule fires inside ``validate_section`` and
+    raises a rescuable ``FieldError`` (R). Since #2116 a null on the knob builds
+    the default (so the mutated replay flips an accepted A code to R rather than
+    the pre-#2116 RC), and that rescuable-class change would flip the #665
+    layered rescue to silently-discarding-global with no signal, if the replay
+    missed it."""
+    import charlie_work.config as config_module
+
+    real = config_module.field_rules
+
+    def notnull_on_reserved_threads(cls, name):
+        rules = real(cls, name)
+        if cls is OrchestratorConfig and name == "runner_allocation":
+            return {**rules, "reserved_threads": (*rules.get("reserved_threads", ()), NotNull)}
+        return rules
+
+    monkeypatch.setattr(config_module, "field_rules", notnull_on_reserved_threads)
+    with pytest.raises(
+        AssertionError, match=r"runner_allocation\.reserved_threads <- none: recorded Ad751, now R"
+    ):
+        test_key_probe_matrix_unchanged(recorded, default_cfg)
+
+
+def test_same_on_non_equal_pairs():
+    """Pin every non-equal code pair: only exact equality and the documented
+    X -> clean-rejection upgrade are true; anything else (in particular RC <-> R,
+    the two rescue classes) must be False or the replay could hide a flip."""
+    assert not same("RC", "R")
+    assert not same("R", "RC")
+    assert same("X", "R")  # documented: a clean rejection replacing a crash is fine
+    assert same("X", "RC")
+    assert not same("R", "X")
+    assert not same("RC", "X")
+
+
+def test_code_of_records_raw_valueerror_and_typeerror_as_rc(monkeypatch):
+    """A raw ``ValueError``/``TypeError`` that escaped before the wrap is recorded
+    RC (docstring's third class), not R and not X."""
+
+    def raise_valueerror(data):
+        raise ValueError("boom")
+
+    def raise_typeerror(data):
+        raise TypeError("boom")
+
+    monkeypatch.setitem(globals(), "build_config_from_data", raise_valueerror)
+    assert _code_of({}) == "RC"
+    monkeypatch.setitem(globals(), "build_config_from_data", raise_typeerror)
+    assert _code_of({}) == "RC"
+
+
+def test_changed_fallback_builds_the_default_once(monkeypatch):
+    """The ``default=None`` fallback shares the memo (issue #2884): one pinned build
+    serves the cold warm-up, a warm call reuses that same object, and the fallback
+    diff itself triggers no further build."""
+    calls: list[dict] = []
+    real = build_config_from_data
+
+    def counting(data):
+        calls.append(data)
+        return real(data)
+
+    monkeypatch.setitem(globals(), "build_config_from_data", counting)
+    monkeypatch.setitem(globals(), "_DEFAULT_CONFIG", None)
+    with mock.patch("os.cpu_count", return_value=RECORDED_CPU_COUNT):
+        assert _default_config() is _default_config()
+    assert _changed(_default_config()) == []
+    assert calls == [{}]
+
+
+def test_key_probe_matrix_unchanged(recorded, default_cfg):
+    with mock.patch("os.cpu_count", return_value=RECORDED_CPU_COUNT):
+        bad = []
+        for tid, row in recorded["cells"].items():
+            path, seed = recorded["targets"][tid], recorded["seeds"][tid]
+            for rec, (name, value) in zip(row, PROBES, strict=True):
+                now = _code_of(place(path, value, seed), default_cfg)
+                if not same(rec, now):
+                    bad.append(f"{tid} <- {name}: recorded {rec}, now {now}")
     assert not bad, "rejection set changed:\n" + "\n".join(bad[:60]) + f"\n({len(bad)} total)"
 
 
-def test_section_level_probes_unchanged(recorded):
-    bad = []
-    for tid, row in recorded["sections"].items():
-        for rec, name in zip(row, recorded["section_probes"], strict=True):
-            now = code_of({tid: PROBE_MAP[name]})
-            if not same(rec, now):
-                bad.append(f"{tid} = {name}: recorded {rec}, now {now}")
+def test_section_level_probes_unchanged(recorded, default_cfg):
+    with mock.patch("os.cpu_count", return_value=RECORDED_CPU_COUNT):
+        bad = []
+        for tid, row in recorded["sections"].items():
+            for rec, name in zip(row, recorded["section_probes"], strict=True):
+                now = _code_of({tid: PROBE_MAP[name]}, default_cfg)
+                if not same(rec, now):
+                    bad.append(f"{tid} = {name}: recorded {rec}, now {now}")
     assert not bad, "\n".join(bad)
 
 
-def test_unknown_key_probes_unchanged(recorded):
-    bad = []
-    for tid, rec in recorded["unknown"].items():
-        path, seed = recorded["targets"][tid], recorded["seeds"][tid]
-        now = code_of(place([*path, "zzz_unknown"], 1, seed))
-        if not same(rec, now):
-            bad.append(f"{tid}: recorded {rec}, now {now}")
+def test_unknown_key_probes_unchanged(recorded, default_cfg):
+    with mock.patch("os.cpu_count", return_value=RECORDED_CPU_COUNT):
+        bad = []
+        for tid, rec in recorded["unknown"].items():
+            path, seed = recorded["targets"][tid], recorded["seeds"][tid]
+            now = _code_of(place([*path, "zzz_unknown"], 1, seed), default_cfg)
+            if not same(rec, now):
+                bad.append(f"{tid}: recorded {rec}, now {now}")
     assert not bad, "\n".join(bad)
     assert all(v == "R" or v.startswith("A") for v in recorded["unknown"].values())
 
 
-def test_whole_config_cases_unchanged(recorded):
-    bad = [
-        f"{name}: recorded {recorded['cases'].get(name)}, now {code_of(raw)}"
-        for name, raw in CASES.items()
-        if not same(recorded["cases"].get(name, "?"), code_of(raw))
-    ]
+def test_whole_config_cases_unchanged(recorded, default_cfg):
+    with mock.patch("os.cpu_count", return_value=RECORDED_CPU_COUNT):
+        bad = [
+            f"{name}: recorded {recorded['cases'].get(name)}, now {_code_of(raw, default_cfg)}"
+            for name, raw in CASES.items()
+            if not same(recorded["cases"].get(name, "?"), _code_of(raw, default_cfg))
+        ]
     assert not bad, "\n".join(bad)
 
 

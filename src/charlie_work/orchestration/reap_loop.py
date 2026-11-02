@@ -44,7 +44,7 @@ from charlie_work.instrumentation import log_event
 from charlie_work.merge_path.queue_skip import merge_ready_unless_queued
 from charlie_work.mergequeue_stall import alarm_best_effort
 from charlie_work.notify import AttentionDigest, AttentionEntry
-from charlie_work.no_op_rework_body import _request_changes_body_drifted
+from charlie_work.packet_currency import packet_body_current_for_skip
 from charlie_work.pass_deadline import (
     PassDeadline,
     PassDeadlineExceeded,
@@ -293,7 +293,7 @@ def _loop_body(
     # Issue #1948: the last fetch-gated boundary before the per-PR scan --
     # once the budget is spent the scan runs on an empty list rather than
     # starting a new review/merge round on the tail end of a dead budget.
-    prs = deadline.call(self.gh.pr_list, [])
+    prs = _wf.host_local_prs(self, deadline.call(self.gh.pr_list, []))
     # Snapshot for foreign-PR markers only: markers change at most once
     # per PR, so a single point-in-time read at loop start is sufficient.
     state_snapshot = _wf.load_state_locked(self.paths.state_file)
@@ -526,10 +526,10 @@ def _loop_body(
                 template_current = packet_template_sha is None or (
                     packet_template_sha == current_template_sha
                 )
-                # #1983: drifted request_changes re-reviews at same head; packet needs live body.
-                body_current = not _request_changes_body_drifted(
-                    self._review_decision(pr_number), pr
-                ) or self._packet_body_current(pr_number, pr)
+                # #1983 drifted request_changes / #2826 applied body: the packet needs the live body.
+                body_current = packet_body_current_for_skip(
+                    self, state, pr_number, pr, resolved_decision
+                )
                 if head_current and template_current and body_current:
                     # Packet is current — skip regenerating it. The
                     # already_approved branch above is evaluated earlier

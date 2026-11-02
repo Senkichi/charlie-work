@@ -137,7 +137,7 @@ ACCEPT = [
     {"maybe": "s"},
     {"maybe": False},
     {"names": ["a", "b"]},
-    {"count": None},  # key: null behaves like an absent key
+    {"count": None},  # non-Optional scalar null: the derived class-level rule applies
     {"limit": None},
 ]
 
@@ -233,12 +233,30 @@ class NullSec:
 
 
 def test_none_is_omitted_so_default_applies():
-    """Despite the name (kept: the collect-only gate keys on it): ``key: null`` is preserved
-    as ``None`` (design P2, a falsy None differs from a default True) unless the field is
-    ``NullIsDefault``; an ABSENT key still takes the default."""
-    assert build(count=None).count is None and build(limit=None).limit is None
+    """Name pinned (kept: the collect-only gate keys on it). Body since #2116
+    (issue #2116): a non-Optional scalar knob never builds ``None``.
+
+    Derived class-level rule (single enforcement point in ``validate_section``):
+    an explicit ``key: null`` on a scalar field whose annotation has no ``None``
+    member builds the field's declared default, as if ``NullIsDefault`` were
+    derived from the annotation. A consumer such as
+    ``resume_exec_rejected_review`` (``review_exec_rejection_max_resumes``)
+    therefore cannot compare ``None`` against an ``int``. Optional scalars
+    (``maybe``) and non-scalar kinds keep design P2's preserved ``None``.
+    """
+    assert build(count=None).count == 0  # Annotated[int, NonNeg] = 0
+    assert build(limit=None).limit == 1  # Positive = 1 (falsy-default never built None either)
+    assert build(flag=None).flag is False and build(label=None).label == "x"
+    assert build(maybe=None).maybe is None  # Optional scalar: null stays None
+    assert build(inner=None).inner is None  # nested section field: null stays None
+    assert build(env=None).env is None  # non-scalar mapping kind: null stays None
+
+
+def test_derived_null_rule_yields_to_explicit_markers():
+    """An explicit ``NotNull``/``NullIsDefault`` marker keeps precedence over the
+    class-level derivation; an absent key still builds the default (unchanged)."""
     built = validate_section(NullSec, {"plain": None, "normalized": None}, path="sec")
-    assert built.plain is None and built.normalized == 7
+    assert built.plain is True and built.normalized == 7  # both take the default
     assert validate_section(NullSec, {}, path="sec") == NullSec()
 
 

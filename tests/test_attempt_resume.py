@@ -118,12 +118,29 @@ def test_throttle_death_resumes_from_attempt_ref_commits(repo: Path) -> None:
     assert event["payload"]["ref_kind"] == "attempt"
 
 
-@pytest.mark.parametrize("failure_kind", ["stalled", "worker_crash", None])
-def test_non_throttle_death_starts_clean(repo: Path, failure_kind: str | None) -> None:
+@pytest.fixture
+def non_throttle_death(repo: Path, request: pytest.FixtureRequest) -> OrchestratorConfig:
+    """Own the non-throttle-death scaffold so the measured call stays the property.
+
+    The ledger's slow-tests section medians the ``call`` phase only
+    (``ci_fleet/ledger/report.py`` -> ``_top_by_phase``). The scaffold -- worktree
+    add, the death event, the real rescue-capture and its worktree-removal -- pays
+    ~11 git spawns that drift with runner load (issue #2872 flagged this call at
+    2.4x), so it charges to fixture setup where ``slow-fixtures`` owns it, same
+    remedy as #2624/#2662/#2749/#2750.
+    """
     config = OrchestratorConfig()
     wt = _worker_dirty_tree(repo)
-    _die(repo, config, failure_kind)
+    _die(repo, config, request.param)
     _rescue(repo, wt)
+    return config
+
+
+@pytest.mark.parametrize("non_throttle_death", ["stalled", "worker_crash", None], indirect=True)
+def test_non_throttle_death_starts_clean(
+    repo: Path, non_throttle_death: OrchestratorConfig
+) -> None:
+    config = non_throttle_death
 
     info = create_worktree(repo, BRANCH, base_ref="HEAD", issue_number=ISSUE, config=config)
 

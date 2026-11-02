@@ -5,8 +5,12 @@ Every test here runs the real lanes. ``OrchestratorApp.dispatch_rework`` stamps
 (``_detect_and_handle_orphaned_workers``) recovers the dead rework session and
 classifies its death. Nothing calls a credit or record helper directly. The
 only things faked are the process launch (``dispatch_sessions``), PID liveness,
-and the provider window expiring between waves (``throttled_until`` is cleared
-so the next dispatch is not held by the cooldown the death armed).
+the provider window expiring between waves (``throttled_until`` is cleared
+so the next dispatch is not held by the cooldown the death armed), and the
+kill lane's child-tree probe (``process_utils._enumerate_child_pids``: the
+stalled-session lane stops the fake pid through the real ``kill_process_tree``,
+so enumerating the children of a process that never existed would only
+measure another PowerShell spawn).
 
 Before the fix, a throttle death was not credited to ``worker_death_at``, but
 its dispatch stamp stayed in ``redispatch_at``. Every redispatch cap then read
@@ -106,7 +110,15 @@ class _Bed:
         return [e for e in load_state(self.paths.state_file)["events"] if e.get("kind") == kind]
 
     def dispatch(self) -> Any:
-        """One real ``dispatch_rework`` pass; only the process launch is faked."""
+        """One real ``dispatch_rework`` pass; only the process launch is faked.
+
+        The stalled-session lane's stop step walks the fake dead pid's child
+        tree through a real PowerShell CIM probe the sweep runs against a process
+        that never existed -- kill mechanics, not the property any test here
+        pins -- so the child-enumeration probe reports no children. What stays
+        real is everything the assertions read: the sweep's classification, the
+        cap arithmetic, and the state/event writes.
+        """
         import dataclasses
 
         import charlie_work.host as host_pkg
@@ -131,7 +143,10 @@ class _Bed:
         ports = dataclasses.replace(
             host_pkg.current(), worker_launch=FakeWorkerLauncher([fake_dispatch_sessions])
         )
-        with patch.object(host_pkg, "_ACTIVE", ports):
+        with (
+            patch.object(host_pkg, "_ACTIVE", ports),
+            patch("charlie_work.process_utils._enumerate_child_pids", lambda _pid: []),
+        ):
             return self.app.dispatch_rework()
 
     def die(

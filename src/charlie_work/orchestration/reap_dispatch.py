@@ -237,28 +237,36 @@ def _apply_concurrency_governor(
             clamped = True
             clamped_by = "max_concurrent"
 
-    if fleet_max > 0:
-        fleet_live_count, _skipped_repos = self.host.sessions.fleet_live_workers(
-            self.fleet_dir_override
+    # Issue #2757: per-harness live counts for ``fleet.max_concurrent_sessions_by_harness``.
+    # Measured here -- under the fleet launch lock -- but NOT enforced: which
+    # harness a launch lands on is decided by the role-chain selection in
+    # ``worker_launch_gate.issue_worker_launch_permit``, which reads these back
+    # off the result. Skipped entirely (no registry walk, empty fields, an
+    # unchanged report) when the map is unset AND the fleet total cap is off.
+    #
+    # Issue #2764: one registry walk for both numbers. The fleet total and the
+    # per-``adapter_kind`` breakdown used to be two separate walks over every
+    # registered repo (each loading its config and reading its sessions dir)
+    # while the fleet launch lock was held -- a lock other repos wait on, with
+    # observed ``fleet_lock_held`` deferrals of 15-111s when several repos
+    # launch together. The combined walker supplies both from one walk; the
+    # transient ``live_by_kind`` below is empty unless that call happened.
+    harness_caps = self.config.fleet.max_concurrent_sessions_by_harness
+    harness_live_counts: dict[str, int] = {}
+    live_by_kind: dict[str, int] = {}
+    if fleet_max > 0 or harness_caps:
+        fleet_live_count, live_by_kind, _skipped_repos = (
+            self.host.sessions.fleet_live_workers_with_adapter_kinds(self.fleet_dir_override)
         )
+
+    if fleet_max > 0:
         fleet_available = max(0, fleet_max - fleet_live_count)
         if fleet_available < dispatch_limit:
             dispatch_limit = fleet_available
             clamped = True
             clamped_by = "fleet_max"
 
-    # Issue #2757: per-harness live counts for ``fleet.max_concurrent_sessions_by_harness``.
-    # Measured here -- under the same fleet lock and registry walk the fleet count
-    # above uses -- but NOT enforced: which harness a launch lands on is decided by
-    # the role-chain selection in ``worker_launch_gate.issue_worker_launch_permit``,
-    # which reads these back off the result. Skipped entirely (no registry walk, empty
-    # fields, an unchanged report) when the map is unset.
-    harness_caps = self.config.fleet.max_concurrent_sessions_by_harness
-    harness_live_counts: dict[str, int] = {}
     if harness_caps:
-        live_by_kind, _skipped = self.host.sessions.fleet_live_workers_by_adapter_kind(
-            self.fleet_dir_override
-        )
         harness_live_counts = {
             harness: live_by_kind.get(HARNESS_REGISTRY[harness].adapter_kind, 0)
             for harness in harness_caps

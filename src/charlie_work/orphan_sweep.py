@@ -29,10 +29,13 @@ import logging
 import os
 import shutil
 import signal
+import sys
 import time
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
+
+import charlie_work.posix_processes as posix_processes
 
 from . import host as _host
 from .process_chain import ancestor_chain_pids
@@ -91,7 +94,8 @@ def _self_ancestor_pids() -> frozenset[int]:
     """
     self_pid = os.getpid()
     try:
-        if os.name == "nt":
+        if os.name == "nt" or sys.platform == "darwin":
+            # macOS has no procfs, so it takes the same psutil walk (spec C2).
             # Chain-scoped, not host-wide: the guard pays one ``ppid_map()``
             # enumeration plus a handle open per ancestor hop instead of the
             # enumeration-plus-handle-open pair per process on the box
@@ -140,8 +144,9 @@ def sweep_orphan_processes(worktree_path: str) -> list[dict[str, Any]]:
     whose CommandLine contains the worktree path. This catches detached/daemonized
     processes that survived a process tree kill (e.g., nohup-style background processes).
 
-    On POSIX: Not implemented (returns empty list). POSIX process groups handle
-    detachment better via killpg, and /proc enumeration is more complex.
+    On POSIX: the same substring match over ``ps`` output
+    (``posix_processes.list_processes_ps``, spec C2). Workers start in their
+    own session, so a survivor is one that left the worker's process group.
 
     This is a read-only detection function. Callers should decide whether to kill
     the returned processes based on policy (e.g., janitor warnings vs. automatic cleanup).
@@ -158,7 +163,7 @@ def sweep_orphan_processes(worktree_path: str) -> list[dict[str, Any]]:
     Returns:
         A list of dicts describing processes whose CommandLine references the
         worktree path. Each dict contains ``pid`` (int), ``name`` (str), and
-        ``command_line`` (str). POSIX callers always get an empty list.
+        ``command_line`` (str). An empty list when the listing fails.
     """
     orphans: list[dict[str, Any]] = []
 
@@ -176,8 +181,12 @@ def sweep_orphan_processes(worktree_path: str) -> list[dict[str, Any]]:
         return orphans
 
     if os.name != "nt":
-        # POSIX: not implemented - process groups handle detachment better
-        return orphans
+        rows, _error = posix_processes.list_processes_ps()
+        return [
+            {"pid": row.pid, "name": row.name, "command_line": row.command_line}
+            for row in rows
+            if row.pid > 0 and needle in row.command_line
+        ]
 
     if not shutil.which("powershell"):
         return orphans

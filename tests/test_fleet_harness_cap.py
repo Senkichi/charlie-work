@@ -10,6 +10,7 @@ unset-map no-op.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Mapping
 from pathlib import Path
 from types import MappingProxyType
@@ -210,9 +211,13 @@ def _live(
     fake_host, *, devin: int = 0, opencode: int = 0, total: int | None = None
 ) -> FakeSessionCounter:
     by_kind = {k: v for k, v in {"devin": devin, "opencode": opencode}.items() if v}
+    live_total = devin + opencode if total is None else total
     counter = FakeSessionCounter(
-        fleet_workers=(devin + opencode if total is None else total, []),
-        fleet_workers_by_adapter_kind=(by_kind, []),
+        fleet_workers=(live_total, []),
+        # The combined one-walk tuple is scripted explicitly: the fake's default
+        # derives it from fleet_workers alone (empty kinds), and the governor
+        # now reads only this one surface (issue #2764).
+        fleet_workers_with_adapter_kinds=(live_total, by_kind, []),
     )
     fake_host(sessions=counter)
     return counter
@@ -235,8 +240,25 @@ def test_unset_map_changes_nothing(tmp_path: Path, fake_host) -> None:
         assert not permit.governor.harness_enabled
         assert "harness_concurrency_limits" not in permit.governor.report_fields()
         assert permit._ledger.harness_free == {}
-    # No registry walk for per-harness counts when nothing is configured.
-    assert not any(name == "fleet_live_workers_by_adapter_kind" for name, _ in counter.calls)
+    # The combined one-walk port is engaged exactly once by the total cap; the
+    # unset map only suppresses the per-harness report fields.
+    assert sum(name == "fleet_live_workers_with_adapter_kinds" for name, _ in counter.calls) == 1
+
+
+def test_no_total_cap_and_no_map_never_walks_the_fleet(tmp_path: Path, fake_host) -> None:
+    """Issue #2764 mutation gate: with ``fleet.global_max_concurrent_sessions = 0``
+    and no harness map, the governor has no fleet reason to measure and the
+    combined one-walk port method is NOT called.
+
+    Mutating the guard ``if fleet_max > 0 or harness_caps:`` to a blind
+    ``if True:`` (orchestration/reap_dispatch.py) calls it and fails this test.
+    """
+    counter = _live(fake_host, devin=1)
+    app = _app(tmp_path, DEVIN)
+    with _permit(app) as permit:
+        assert permit.max_launches == 5
+        assert not permit.governor.harness_enabled
+    assert not any(name == "fleet_live_workers_with_adapter_kinds" for name, _ in counter.calls)
 
 
 def test_devin_selected_launch_is_clamped_at_the_harness_cap(tmp_path: Path, fake_host) -> None:
@@ -420,8 +442,9 @@ def test_tier_routing_is_untouched_when_the_map_is_unset(tmp_path: Path, fake_ho
 
 
 class _View:
-    def __init__(self, adapter_kind: str, alive: bool = True) -> None:
+    def __init__(self, adapter_kind: str, alive: bool = True, issue_number: int = 0) -> None:
         self.adapter_kind = adapter_kind
+        self.issue_number = issue_number
         self._alive = alive
 
     def is_alive(self) -> bool:
@@ -435,7 +458,11 @@ def test_live_counts_by_adapter_kind_count_only_live_sidecars(
 
     views = [_View("devin"), _View("devin"), _View("devin", alive=False), _View("opencode")]
     monkeypatch.setattr("charlie_work.worker.iter_workers", lambda _dir: views)
-    assert live_session_count.count_live_sessions_by_adapter_kind(tmp_path) == {
+    total, counts = live_session_count.count_live_sessions_with_adapter_kinds(
+        tmp_path, None, live_session_count.WORKER_LANE
+    )
+    assert total == 3  # dead sidecar counted against the total, not any kind
+    assert counts == {
         "devin": 2,
         "opencode": 1,
     }
@@ -447,7 +474,7 @@ def test_fleet_live_counts_by_adapter_kind_sum_across_repos(
     import json
 
     from charlie_work import layout
-    from charlie_work.fleet_registry import count_fleet_live_sessions_by_adapter_kind
+    from charlie_work.fleet_registry import count_fleet_live_sessions_with_adapter_kinds
 
     fleet_dir = tmp_path / ".fleet"
     fleet_dir.mkdir(parents=True)
@@ -477,7 +504,121 @@ def test_fleet_live_counts_by_adapter_kind_sum_across_repos(
     monkeypatch.setenv("CHARLIE_WORK_FLEET_DIR", str(fleet_dir))
     monkeypatch.setattr("charlie_work.worker.iter_workers", lambda d: views_by_dir[Path(d)])
 
-    counts, skipped = count_fleet_live_sessions_by_adapter_kind(None)
+    total, counts, skipped = count_fleet_live_sessions_with_adapter_kinds(None)
 
     assert counts == {"devin": 3, "opencode": 1}
+    assert total == 4
     assert skipped == []
+
+
+# --- one registry walk per governor call (issue #2764) -------------------------
+
+
+def _register_repo(
+    tmp_path: Path,
+    fleet_dir: Path,
+    *,
+    ghost_issue: int | None = None,
+) -> None:
+    """Register one repo in ``fleet_dir``'s fleet.json, optionally with a ghost.
+
+    The repo is a bare ``.git``-rooted tree whose ``state.json`` may record a
+    dispatched issue with a live ``worker_pid`` (this test process, with a
+    ``None`` start time that fails open) but no session sidecar -- the ghost
+    shape ``test_count_fleet_live_sessions_corroborates_ghost_worker`` uses.
+    """
+    import json
+
+    from charlie_work import layout
+
+    root = tmp_path / "repo"
+    (root / ".git").mkdir(parents=True)
+    state_dir = root / ".var" / "charlie-work"
+    layout.sessions_dir_default(state_dir).mkdir(parents=True)
+    issues: dict[str, Any] = {}
+    if ghost_issue is not None:
+        issues[str(ghost_issue)] = {
+            "status": "dispatched",
+            "worker_pid": os.getpid(),
+            "worker_process_start_time": None,
+        }
+    (state_dir / "state.json").write_text(
+        json.dumps({"version": 1, "issues": issues, "prs": {}, "events": []}),
+        encoding="utf-8",
+    )
+    (fleet_dir / "fleet.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "repos": {
+                    "owner/repo": {
+                        "repo_root": str(root),
+                        "name_with_owner": "owner/repo",
+                        "config_path": str(root / "orchestrator.config.yaml"),
+                        "state_dir": str(state_dir),
+                        "first_seen": "2024-01-01T00:00:00Z",
+                        "last_seen": "2024-01-01T00:00:00Z",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def _count_registry_walks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[int]:
+    """Wrap ``fleet_registry._iter_registered_repo_contexts`` with an invocation counter."""
+    import charlie_work.fleet_registry as fleet_registry
+
+    walks = [0]
+    real_iter = fleet_registry._iter_registered_repo_contexts
+
+    def _counting_iter(fleet_dir_override, skipped_repos):
+        walks[0] += 1
+        yield from real_iter(fleet_dir_override, skipped_repos)
+
+    monkeypatch.setattr(fleet_registry, "_iter_registered_repo_contexts", _counting_iter)
+    return walks
+
+
+def test_governor_walks_the_registry_once_with_the_map_set(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Issue #2764: with the harness map set, ONE registry walk per governor call.
+
+    The pre-fix governor walked the fleet registry twice under the fleet launch
+    lock -- once via ``count_fleet_live_sessions`` for the total, once for the
+    per-``adapter_kind`` breakdown -- and each
+    walk loads every registered repo's config and reads its sessions dir, so
+    the doubled walk lengthens a lock other repos wait on
+    (``fleet_lock_held`` deferrals of 15-111s when several launch together).
+
+    MUTATION GATE: reverting ``_apply_concurrency_governor`` (in
+    ``orchestration/reap_dispatch.py``) to the two-call pre-fix body makes this
+    test fail -- the walk count reverts to 2.
+    """
+    fleet_dir = tmp_path / "fleet"
+    fleet_dir.mkdir(parents=True)
+    _register_repo(tmp_path, fleet_dir, ghost_issue=7)
+
+    views = [
+        _View("devin", issue_number=1),
+        _View("devin", issue_number=2),
+        _View("opencode", issue_number=3),
+        _View("devin", issue_number=4, alive=False),
+    ]
+    monkeypatch.setattr("charlie_work.worker.iter_workers", lambda _dir: views)
+    walks = _count_registry_walks(monkeypatch)
+
+    # No fake host: the Real session counter resolves the combined walker, so
+    # the governor walks the live fleet registry.
+    app = _app(tmp_path, DEVIN, caps={"devin-shell": 3}, total_cap=10)
+    gov = app._apply_concurrency_governor(5)
+
+    assert walks == [1], f"expected exactly one registry walk, got {walks[0]}"
+    # Total: 3 live sidecars + the state.json ghost; kinds: sidecars only.
+    assert gov.fleet_live_count == 4
+    assert dict(gov.harness_live_counts) == {"devin-shell": 2}
+    assert not gov.clamped  # 10-4 = 6 free slots, 3 asked for

@@ -13,12 +13,32 @@ import logging
 import os
 import pathlib
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
+
+import pytest
 
 from charlie_work.fleet_paths import (
     detect_path_virtualization,
     warn_fleet_dir_virtualization_on_write,
 )
+
+
+@pytest.fixture(autouse=True)
+def _fresh_fleet_route_cache() -> Iterator[None]:
+    """Start and end every test with an empty route cache / warn set.
+
+    ``_route_around_fork`` caches its per-file probe per literal dir for a TTL
+    and its warning once per process; without this reset, one test's decision
+    would leak into another test built on a different fixture for the same
+    default-dir spelling.
+    """
+    from charlie_work import fleet_paths
+
+    fleet_paths._FLEET_PROBE_CACHE.clear()
+    fleet_paths._ADMIN_SHARE_WARNED.clear()
+    yield
+    fleet_paths._FLEET_PROBE_CACHE.clear()
+    fleet_paths._ADMIN_SHARE_WARNED.clear()
 
 
 def _patch_resolve_to_diverge(monkeypatch: Any, literal: Path, redirected: Path) -> None:
@@ -331,3 +351,178 @@ def test_paths_equal_still_reports_genuine_divergence(tmp_path: Path) -> None:
     from charlie_work.fleet_paths import _paths_equal
 
     assert not _paths_equal(tmp_path / "literal", tmp_path / "redirected")
+
+
+# ---------------------------------------------------------------------------
+# per-file probe (#2806): MSIX redirection forks files, never the directory
+# ---------------------------------------------------------------------------
+
+
+def test_fleet_dir_virtualization_reports_virtualized_fleet_json(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """A forked file inside the (self-resolving) dir is reported.
+
+    The #2806 fixture: the directory resolves to itself (MSIX never
+    redirects directories), while ``fleet.json`` inside it resolves to the
+    package's private copy -- exactly how a packaged session reads a stale
+    registry while ``detect_path_virtualization(dir)`` says all is well.
+    """
+    from charlie_work.fleet_paths import fleet_dir_virtualization
+
+    fleet = tmp_path / "charlie-work"
+    fleet.mkdir(parents=True)
+    fleet_json = fleet / "fleet.json"
+    fleet_json.write_text("{}", encoding="utf-8")
+    redirected = (
+        tmp_path / "Packages" / "app" / "LocalCache" / "Local" / "charlie-work" / "fleet.json"
+    )
+    _patch_resolve_to_diverge(monkeypatch, fleet_json, redirected)
+
+    findings = fleet_dir_virtualization(override=str(fleet))
+    assert findings is not None
+    assert [pair[0] for pair in findings] == [fleet_json]
+    assert [pair[1] for pair in findings] == [redirected]
+
+
+def test_fleet_dir_virtualization_no_findings_without_diverging_file(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """Planted control: every file resolving to itself -> no findings."""
+    from charlie_work.fleet_paths import fleet_dir_virtualization
+
+    fleet = tmp_path / "charlie-work"
+    fleet.mkdir(parents=True)
+    (fleet / "fleet.json").write_text("{}", encoding="utf-8")
+    (fleet / "config.yaml").write_text("b: 1", encoding="utf-8")
+
+    # No divergence patch: every path resolves to itself.
+    assert fleet_dir_virtualization(override=str(fleet)) is None
+
+
+def test_warn_on_write_reports_virtualized_file_inside_directory(
+    tmp_path: Path, monkeypatch: Any, caplog: Any
+) -> None:
+    """A directory-level write guard must still catch an already-forked file.
+
+    MSIX forks the file the first packaged write creates; from then on the
+    probe-on-the-directory the #624 writers originally used reports nothing
+    even though every subsequent write of ``fleet.json`` lands in the fork.
+    """
+    fleet = tmp_path / "charlie-work"
+    fleet.mkdir(parents=True)
+    fleet_json = fleet / "fleet.json"
+    fleet_json.write_text("{}", encoding="utf-8")
+    redirected = (
+        tmp_path / "Packages" / "app" / "LocalCache" / "Local" / "charlie-work" / "fleet.json"
+    )
+    _patch_resolve_to_diverge(monkeypatch, fleet_json, redirected)
+
+    with caplog.at_level(logging.WARNING, logger="charlie_work.fleet_paths"):
+        warn_fleet_dir_virtualization_on_write(fleet, context="writing fleet.json")
+
+    joined = " ".join(record.message for record in caplog.records)
+    assert "#2806" in joined
+    assert str(fleet_json) in joined
+    assert str(redirected) in joined
+
+
+# ---------------------------------------------------------------------------
+# charlie doctor check (#2806): state-file divergence is an error
+# ---------------------------------------------------------------------------
+
+
+def test_doctor_virtualization_check_is_error_for_forked_state_file(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """The check names ``fleet.json`` and fails as an error.
+
+    The merge-preflight hook and the config layering depend on ``fleet.json``
+    being the daemon-visible copy; a forked one is not a "your writes are
+    private" caveat but a silently wrong read, hence error severity.
+    """
+    from charlie_work import doctor
+
+    fleet = tmp_path / "charlie-work"
+    fleet.mkdir(parents=True)
+    fleet_json = fleet / "fleet.json"
+    fleet_json.write_text("{}", encoding="utf-8")
+    redirected = (
+        tmp_path / "Packages" / "app" / "LocalCache" / "Local" / "charlie-work" / "fleet.json"
+    )
+    _patch_resolve_to_diverge(monkeypatch, fleet_json, redirected)
+
+    checks: list[tuple[str, bool, str, str]] = []
+
+    def add(name: str, ok: bool, detail: str, *, severity: str = "error") -> None:
+        checks.append((name, ok, detail, severity))
+
+    doctor._check_fleet_dir_virtualization(add, fleet_dir_override=str(fleet))
+
+    assert [c[0] for c in checks] == ["fleet dir virtualization"]
+    assert checks[0][1] is False
+    assert checks[0][3] == "error"
+    assert "fleet.json" in checks[0][2]
+    assert str(redirected) in checks[0][2]
+
+
+def test_doctor_virtualization_check_stays_warning_for_dir_divergence(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """The #624 directory-level case keeps its warning severity."""
+    from charlie_work import doctor
+
+    fleet = tmp_path / "fleet"
+    fleet.mkdir(parents=True)
+    redirected = tmp_path / "Packages" / "app" / "LocalCache" / "Local" / "charlie-work"
+    _patch_resolve_to_diverge(monkeypatch, fleet, redirected)
+
+    checks: list[tuple[str, str]] = []
+
+    def add(name: str, ok: bool, detail: str, *, severity: str = "error") -> None:
+        checks.append((name, severity))
+
+    doctor._check_fleet_dir_virtualization(add, fleet_dir_override=str(fleet))
+
+    assert len(checks) == 1
+    assert checks[0][1] == "warning"
+
+
+def _assert_severity(tmp_path: Path, monkeypatch: Any, filename: str, expected: str) -> str:
+    """Run the doctor check with one forked file named *filename*; return detail."""
+    from charlie_work import doctor
+
+    fleet = tmp_path / "charlie-work"
+    fleet.mkdir(parents=True)
+    victim = fleet / filename
+    content = "{}" if filename.endswith(".json") else "b: 1"
+    victim.write_text(content, encoding="utf-8")
+    redirected = tmp_path / "Packages" / "app" / "LocalCache" / "Local" / "charlie-work" / filename
+    _patch_resolve_to_diverge(monkeypatch, victim, redirected)
+
+    checks: list[tuple[bool, str, str]] = []
+
+    def add(name: str, ok: bool, detail: str, *, severity: str = "error") -> None:
+        checks.append((ok, detail, severity))
+
+    doctor._check_fleet_dir_virtualization(add, fleet_dir_override=str(fleet))
+
+    assert len(checks) == 1
+    assert filename in checks[0][1]
+    assert checks[0][2] == expected, f"{filename}: expected {expected}, got {checks[0][2]}"
+    return checks[0][1]
+
+
+def test_doctor_fleet_dir_check_is_error_for_forked_config_yaml(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """config.yaml (the global config layering) is a state file: error."""
+    detail = _assert_severity(tmp_path, monkeypatch, "config.yaml", "error")
+    assert "fleet file" in detail
+
+
+def test_doctor_fleet_dir_check_is_warning_for_forked_non_state_file(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """A forked file the fleet machinery does not read as state stays warning."""
+    _assert_severity(tmp_path, monkeypatch, "notes.txt", "warning")

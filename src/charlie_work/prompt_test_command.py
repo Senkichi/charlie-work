@@ -100,7 +100,7 @@ def _selected_contract(full_suite: str) -> str:
         "function signature, return shape or exception selects every test that ran the "
         "changed file, and a module-level or re-export change selects every test that "
         "imports the module. It runs the **FULL suite** itself whenever the change needs "
-        "it (it prints `full` and the reason), so do not run a separate full suite "
+        "it, so do not run a separate full suite "
         f"({full_suite}) unless that command could not start. {_CI_SENTENCE}"
     )
 

@@ -29,10 +29,20 @@ from .rollup_schema import JOB_TABLE
 # ``test_every_emitted_kind_is_rollup_classified``, so a new writer kind cannot land
 # without someone deciding what it means for the dashboard.
 KNOWN_IGNORED: dict[str, str] = {
+    # -- main-sync (docs/specs/main-sync.md): local-checkout hygiene, no per-issue flow fact.
+    "main_sync_advanced": "local checkout hygiene; no per-issue rollup fact",
+    "main_sync_skipped": "local checkout hygiene; no per-issue rollup fact",
+    "main_sync_deferred": "local checkout hygiene; no per-issue rollup fact",
+    "main_sync_failed": "local checkout hygiene; no per-issue rollup fact",
+    "main_sync_rolled_back": "local checkout hygiene; no per-issue rollup fact",
+    "main_sync_rollback_refused": "local checkout hygiene; no per-issue rollup fact",
+    "main_sync_alarm": "surfaced as a fleet attention entry, not a rollup fact",
     # -- ci-fleet host kinds (host I/O, leak drain): host-level signals with no per-issue flow fact.
     "host_reboot_due": "ci-fleet host-level event; no per-issue rollup fact",
     "host_leak_warn": "ci-fleet host-level event; no per-issue rollup fact",
     "host_io_fallback": "ci-fleet host-level event; no per-issue rollup fact",
+    "deferred_demand_spilled": "ci-fleet host-level event; no per-issue rollup fact",
+    "platform_feature_skipped": "ci-fleet host-level event; no per-issue rollup fact",
     "host_io_hold": "ci-fleet host-level event; no per-issue rollup fact",
     "host_io_exclusions_applied": "ci-fleet host-level event; no per-issue rollup fact",
     "host_io_exclusions_failed": "ci-fleet host-level event; no per-issue rollup fact",
@@ -55,6 +65,7 @@ KNOWN_IGNORED: dict[str, str] = {
     "orphaned_worker_drift": "dead-worker sweep drift record; the corrective transition is its own event",
     "orphaned_worker_drift_sweep": "batch form of orphaned_worker_drift",
     "review_dispatch_stalled": "a stalled review claim was reset for retry; recovery bookkeeping",
+    "review_interdiff_fallback": "a re-review fell back to the three-dot interdiff (issue #2837 measurement); no rollup fact",
     "review_dispatch_stalled_sweep": "batch form of review_dispatch_stalled",
     "review_dispatch_lifecycle_reaped": "names a merged/closed PR only; deliberately not merge evidence (see rollup_flow_handlers docstring)",
     "review_dispatch_lifecycle_reaped_sweep": "batch form of review_dispatch_lifecycle_reaped",
