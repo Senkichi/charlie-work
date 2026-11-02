@@ -43,6 +43,8 @@ That is exactly the shape of bug that a test, and only a test, catches.
 from __future__ import annotations
 
 import sqlite3
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -146,6 +148,43 @@ def test_config_instances_compare_equal_across_the_seam() -> None:
 # ---------------------------------------------------------------------------
 # The injected event sink (verification ladder L3 -> L4)
 # ---------------------------------------------------------------------------
+
+
+def test_importing_charlie_work_installs_the_env_strip_source() -> None:
+    """Without this source, listeners start with the supervisor's provider keys.
+
+    ``_sanitize_env`` keeps working with no source installed, so nothing else
+    fails when this registration goes missing (issue #2902).
+    """
+    import charlie_work.instrumentation  # noqa: F401
+    from charlie_work.ci_fleet_env_strip import fleet_provider_key_names
+
+    pytest.importorskip("ci_fleet", minversion="0.8.3")
+    from ci_fleet.env_strip import get_env_strip_source
+
+    assert get_env_strip_source() is fleet_provider_key_names
+
+
+def test_an_older_ci_fleet_warns_instead_of_killing_the_import() -> None:
+    """This source can run on an install older than the ``env_strip`` module.
+
+    A failed deferred sync leaves the daemon there, and a daemon that dies at
+    import doesn't come back. The import has to survive, and the warning is the
+    only sign that listeners launched from this process keep their keys.
+    """
+    # A current ci_fleet imports env_strip itself, so it loads first and the module
+    # is hidden from charlie-work's import only.
+    probe = (
+        "import sys, ci_fleet.runners; sys.modules['ci_fleet.env_strip'] = None; "
+        "import charlie_work.cli"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", probe], capture_output=True, text=True, timeout=120
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "no env_strip module" in result.stderr
 
 
 def test_importing_charlie_work_installs_the_event_sink() -> None:
