@@ -326,6 +326,10 @@ def test_unescalate_clears_conflict_cap_escalation_and_merge_ready_redispatches(
             "escalation_reason": "conflict_rework_attempts_cap_exceeded",
             "escalation_reasons_seen": ["conflict_rework_attempts_cap_exceeded"],
             "conflict_rework_attempts": 3,
+            # Issue #2900: the skip anchor the cap escalation stamps (the
+            # FakeGitHub default head for PR #456), so the slow re-gating is
+            # actually exercised here instead of only the routing guard.
+            "conflict_rework_attempts_escalated_head": "sha-abc123",
         }
         state["issues"]["123"] = {
             **state["issues"]["123"],
@@ -341,6 +345,10 @@ def test_unescalate_clears_conflict_cap_escalation_and_merge_ready_redispatches(
     # undo).
     precheck = app.merge_ready(456, merge=False)
     assert precheck.ok is True
+    # Issue #2900: the merge lane stops re-gating the escalated PR outright
+    # on the anchored head -- no rework routing, no per-pass merge_ready row.
+    assert precheck.data.get("conflict_cap_stop") is True
+    assert "merge_conflict_rework_requested" not in precheck.message
     state = load_state(paths.state_file)
     assert state["issues"]["123"]["status"] == "escalated"
     assert state["prs"]["456"]["conflict_rework_attempts"] == 3
@@ -352,6 +360,9 @@ def test_unescalate_clears_conflict_cap_escalation_and_merge_ready_redispatches(
     state = load_state(paths.state_file)
     assert "escalation_reason" not in state["prs"]["456"]
     assert "escalation_reason" not in state["issues"]["123"]
+    # Issue #2900: the skip anchor is cleared by the same re-arm, so the
+    # merge lane lets the PR through again.
+    assert "conflict_rework_attempts_escalated_head" not in state["prs"]["456"]
     assert "conflict_rework_attempts" not in state["prs"]["456"]
     assert state["prs"]["456"]["status"] == PASSIVE_OPEN_STATUS
 

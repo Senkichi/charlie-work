@@ -7,7 +7,8 @@ from typing import Any
 import _merge_path_facts as mf
 import pytest
 from charlie_work.merge_path import FactNotGathered, PlanKind, SyncOutcome, decide_branch
-from charlie_work.merge_path.model import UNAVAILABLE, BranchStop, StageKind
+from charlie_work.merge_path.rules import conflict_cap_stop
+from charlie_work.merge_path.model import PersistedPr, UNAVAILABLE, BranchStop, StageKind
 
 
 def test_unapproved_short_circuits_with_no_reads() -> None:
@@ -20,6 +21,93 @@ def test_unapproved_short_circuits_with_no_reads() -> None:
     gate = decide_branch(f)
     assert gate.kind == StageKind.PROCEED
     assert (gate.merge_conflict, gate.sync_failed, gate.request_sync) == (False, False, False)
+
+
+@pytest.mark.parametrize(
+    ("persisted", "live_head", "stop"),
+    [
+        pytest.param(
+            PersistedPr(conflict_cap_escalated=True),
+            mf.HEAD,
+            False,
+            id="no-anchor-evaluates-open",
+        ),
+        pytest.param(
+            PersistedPr(conflict_cap_escalated=True),
+            None,
+            False,
+            id="no-live-head-evaluates-open",
+        ),
+        pytest.param(
+            PersistedPr(conflict_cap_escalated=True, conflict_rework_attempts_last_head=mf.HEAD),
+            mf.HEAD,
+            True,
+            id="legacy-baseline-anchor",
+        ),
+        pytest.param(
+            PersistedPr(conflict_cap_escalated=True),
+            mf.NEW_HEAD,
+            False,
+            id="no-anchor-head-moved",
+        ),
+        pytest.param(
+            PersistedPr(
+                conflict_cap_escalated=True, conflict_rework_attempts_escalated_head=mf.HEAD
+            ),
+            mf.HEAD,
+            True,
+            id="stamped-anchor",
+        ),
+        pytest.param(
+            PersistedPr(
+                conflict_cap_escalated=True, conflict_rework_attempts_escalated_head=mf.HEAD
+            ),
+            mf.NEW_HEAD,
+            False,
+            id="stamped-anchor-head-moved",
+        ),
+        pytest.param(
+            PersistedPr(),
+            mf.HEAD,
+            False,
+            id="not-escalated",
+        ),
+    ],
+)
+def test_conflict_cap_stop_predicate_2900(
+    persisted: PersistedPr, live_head: str | None, stop: bool
+) -> None:
+    """Issue #2900: escalated for the conflict lane's cap and the live head
+    equals the escalation-time anchor (stamped, or the pre-#2900 routing
+    baseline) -- everything else evaluates as before."""
+    assert conflict_cap_stop(persisted, live_head) is stop
+
+
+def test_conflict_cap_stop_ends_the_pass_before_every_other_gate() -> None:
+    """The armed stop wins over the conflict-in-flight gate and the train
+    head; no base-currency fact is demanded."""
+    f = mf.branch_facts(
+        merge_conflict=True,
+        issue_status="dispatched",
+        conflict_cap_stop=True,
+        train_head_param=999,
+        base_currency_gated=None,
+    )
+    gate = decide_branch(f)
+    assert (gate.kind, gate.stop, gate.sync_failed) == (
+        PlanKind.HOLD,
+        BranchStop.CONFLICT_CAP_EXCEEDED,
+        False,
+    )
+    assert gate.merge_conflict is True
+
+
+def test_unarmed_conflict_cap_stop_keeps_the_776_route() -> None:
+    """Issue #776 stands below the cap: an escalated PR without the armed
+    stop still routes through the conflict stage."""
+    gate = decide_branch(mf.branch_facts(merge_conflict=True, issue_status="escalated"))
+    assert gate.stop is None
+    assert gate.sync_failed is True
 
 
 @pytest.mark.parametrize(

@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any
 
 from ..checks import CheckSummary
 from ..dead_worker_sweep.effects_rework import _is_pr_updated_at_older_than
+from .model import PersistedPr
 
 if TYPE_CHECKING:
     from ..config import AutoMergeConfig
@@ -40,6 +41,42 @@ CONFLICT_REWORK_IN_FLIGHT_STATUSES = ("dispatched", "dispatch_pending", "manifes
 # #776): an unrelated-cause escalation must not wall a PR off from its own
 # capped remediation. Only a queued manifest or a human decision excludes it.
 CONFLICT_ROUTE_EXCLUDED_STATUSES = ("manifest_written", "blocked")
+
+# Issue #2900: the conflict lane's own cap-exceeded escalation reason, as
+# composed by ``_route_janitor_gate_failure_to_rework`` for its
+# ``conflict_rework_attempts`` lane (``f"{attempts_key}_cap_exceeded"``).
+# The merge lane reads a PR whose escalation history contains it as "past
+# this lane's cap" and skips re-gating while the head is anchored (the
+# branch-precheck conflict-cap stop). Once the operator unescalates, the
+# reset field sets clear the escalation history and the skip lifts.
+CONFLICT_REWORK_CAP_EXCEEDED = "conflict_rework_attempts_cap_exceeded"
+
+
+def conflict_cap_stop(persisted: PersistedPr | None, live_head_sha: str | None) -> bool:
+    """The conflict lane's rework cap escalated this PR, and the head is still the one it escalated at (issue #2900).
+
+    The merge lane turns this into a ``branch_precheck`` ``CONFLICT_CAP_EXCEEDED``
+    stop, so a PR the cap cannot help anymore produces no per-pass
+    ``merge_ready`` rows and costs no base-currency or check reads. The
+    comparison anchor is the head the cap escalation stamped
+    (``conflict_rework_attempts_escalated_head``), falling back to the lane's
+    routing baseline (``conflict_rework_attempts_last_head``) for records
+    escalated by the pre-#2900 code, which stamped no ceiling head. A moved
+    head -- or the escalation history an operator ``unescalate`` clears --
+    lifts the stop: the PR simply re-enters the merge lane it was evaluated
+    by before. Escalations below the cap (issue #776) and the same lane's
+    stall escalation flag nothing and are unaffected; a PR with no readable
+    anchor and no recorded head evaluates open (the pre-#2900 behaviour)
+    rather than guessing that the head is unchanged.
+    """
+    if persisted is None or not persisted.conflict_cap_escalated:
+        return False
+    anchor = (
+        persisted.conflict_rework_attempts_escalated_head
+        or persisted.conflict_rework_attempts_last_head
+    )
+    return bool(anchor) and bool(live_head_sha) and anchor == live_head_sha
+
 
 # The readiness-no-CI stall and the check-failure route exclude exactly the
 # statuses that already have rework routed or a human in the loop.

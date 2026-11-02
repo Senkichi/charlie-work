@@ -31,6 +31,7 @@ from .ports import MergePathPorts, ports_from_workflow
 from .render import (
     PreviewFinal,
     render_not_found,
+    render_preview_conflict_cap_stop,
     render_preview_final,
     render_preview_head_moved,
     render_preview_skip,
@@ -77,6 +78,13 @@ def preview_merge_ready(
 
     branch = gather_branch(app, ports, opening, train_head_param=merge_train_head, mode="preview")
     gate = branch.gate
+    if gate.stop is BranchStop.CONFLICT_CAP_EXCEEDED:
+        # Issue #2900: dry-run parity with the live stop -- the cap is
+        # exhausted and the head is anchored, so the preview reports the same
+        # skip instead of projecting a remediation that will never run.
+        return render_preview_conflict_cap_stop(
+            ports, pr_number, issue_number, decision, persisted.failed_attempts
+        )
     if gate.stop is BranchStop.NOT_TRAIN_HEAD:
         return render_train_not_head(
             ports, cfg, pr_number, issue_number, decision, persisted.failed_attempts
