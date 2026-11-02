@@ -1108,11 +1108,18 @@ def close_db(state_path: Path) -> None:
 # until something else has already gone wrong. See ci_fleet_anchor for why the
 # declaration is read from pyproject.toml rather than from the install
 # artifacts it is supposed to be checking.
+#
+# The env-strip source is the fourth, and its absence is silent in the worst
+# way: listeners keep launching, each with a copy of the supervisor's provider
+# keys. See ci_fleet_env_strip (issue #2902).
+from ci_fleet.env_strip import set_env_strip_source  # noqa: E402
 from ci_fleet.observability import set_event_query, set_event_sink  # noqa: E402
 from ci_fleet.provenance import set_provenance_anchor  # noqa: E402
 
 from charlie_work.ci_fleet_anchor import declared_ci_fleet_root  # noqa: E402
+from charlie_work.ci_fleet_env_strip import fleet_provider_key_names  # noqa: E402
 
 set_event_sink(log_event)
 set_event_query(query_events)
 set_provenance_anchor(declared_ci_fleet_root)
+set_env_strip_source(fleet_provider_key_names)

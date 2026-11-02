@@ -148,6 +148,20 @@ def test_config_instances_compare_equal_across_the_seam() -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_importing_charlie_work_installs_the_env_strip_source() -> None:
+    """Without this source, listeners start with the supervisor's provider keys.
+
+    ``_sanitize_env`` keeps working with no source installed, so nothing else
+    fails when this registration goes missing (issue #2902).
+    """
+    import charlie_work.instrumentation  # noqa: F401
+    from ci_fleet.env_strip import get_env_strip_source
+
+    from charlie_work.ci_fleet_env_strip import fleet_provider_key_names
+
+    assert get_env_strip_source() is fleet_provider_key_names
+
+
 def test_importing_charlie_work_installs_the_event_sink() -> None:
     """Weak form: a sink is registered, and it is charlie-work's.
 

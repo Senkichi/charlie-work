@@ -1190,18 +1190,28 @@ applies the same config-derived pop to any env built by copying the
 supervisor's ambient environment; it runs in `sanitize_env()` and in the local
 merge gate's suite launch (`orchestration.local_merge_gate` ->
 `local_suite_runner.launch_suite_gate`), which executes the PR branch's
-worker-authored test suite, so that child no longer inherits the key. The
-remaining surfaces, documented here as **accepted** for this repo, are:
+worker-authored test suite, so that child no longer inherits the key.
 
-- **ci_runner listeners and CI job steps** (owned by `ci_fleet`, not here):
-  `ci_fleet.runners._sanitize_env` strips only `UV_`/`VIRTUAL_ENV`/`PYTHON`/
-  `PIP_`/`CLAUDE` prefixes, so the runner listeners the allocator starts — and,
-  transitively, every self-hosted CI job step — still inherit the configured
-  provider key. Mitigation belongs at the allocator's env boundary in
-  `ci_fleet`, stripping the same config-derived provider-key names. That fix
-  is tracked in `ci_fleet`'s own issue tracker: it adds the strip behind a seam,
-  which charlie-work then installs with
-  `env_sanitize.provider_api_key_env_vars`.
+Runner listeners, and so every self-hosted CI job step, are covered too:
+`ci_fleet_env_strip.fleet_provider_key_names` hands `ci_fleet` the configured
+names from every registered repo and the global layer, and `ci_fleet` removes
+them when it launches a listener (issue #2902). `CI_FLEET_ENV_STRIP=off` turns
+that off.
+
+A running listener keeps the environment it started with. After adding a
+provider key to the supervisor's environment, or after the first deploy of this
+strip, restart listeners with a timed drain. `charlie runners allocate` alone
+leaves a running listener alone while demand holds, and starting or stopping
+one by hand is a second controller:
+
+```powershell
+ci-fleet drain --start --reason manual --for 15m   # idle listeners park; busy ones finish
+ci-fleet drain --status
+ci-fleet drain --clear                             # the allocator starts them again
+```
+
+The remaining surface, documented here as **accepted** for this repo, is:
+
 - **Raw `run_captured` children**: `charlie_work.subprocess_runner.run_captured`
   builds its env as `{**os.environ, ...}`, so every child the supervisor or
   orchestrator spawns through it also sees the key. That includes
